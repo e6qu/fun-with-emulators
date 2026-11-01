@@ -101,6 +101,23 @@ interpreter's load base), `AT_ENTRY` (the executable's entry), and
 The interpreter maps the executable's shared libraries itself through our
 `openat` and file-backed `mmap`.
 
+## Signals
+
+The kernel stores each signal's `sigaction`, the blocked mask and the
+alternate stack. When a guest raises a signal against itself (`kill`,
+`tgkill`, `raise`) it is marked pending and delivered on return to the guest;
+synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`) are offered to a
+handler at the point of the fault. Delivery builds an arm64 `rt_sigframe` on
+the guest stack (or the alternate stack under `SA_ONSTACK`), points the
+registers at the handler with `x0`/`x1`/`x2` set per `SA_SIGINFO`, and sets
+the return address to the handler's `sa_restorer` or, lacking one, a
+`rt_sigreturn` trampoline the backend maps at startup. `rt_sigreturn`
+restores the saved registers, mask and alternate stack. The backend exposes
+the guest register file to the kernel for the duration of a trap as a
+`Regs` value (copied from and back to the host signal context), which the
+coming thread support reuses. Floating-point and vector state is not yet
+saved across a handler.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -112,7 +129,8 @@ errno values are generated from the Linux UAPI headers by `tools/gen-abi.py`.
 
 These are tracked on the roadmap:
 
-- Single-threaded guests only; signals are recorded but not delivered.
+- Single-threaded guests only (no `clone` thread creation yet).
+- Floating-point/vector registers are not saved across a signal handler.
 - Executables linked below 4 GiB are rejected (see above).
 - x18 is not preserved before macOS 26.4 (see above).
 - A data word equal to `svc #0` inside an executable segment would be
