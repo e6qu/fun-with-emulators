@@ -9,7 +9,6 @@ use crate::rewrite::TRAP;
 use crate::{KERNEL, NativePlatform, X18Abi};
 use fwe_kernel::{Kernel, Regs};
 use std::sync::MutexGuard;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// `__darwin_arm_thread_state64`.
 #[repr(C)]
@@ -59,9 +58,6 @@ pub struct Ucontext {
 }
 
 const SIGNAL_STACK_SIZE: usize = 1 << 20;
-
-/// Traps whose register state has been logged (with `--strace`).
-static TRAPS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 fn kernel() -> MutexGuard<'static, Option<Kernel<NativePlatform>>> {
     KERNEL.lock().unwrap_or_else(|e| e.into_inner())
@@ -136,24 +132,28 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
         return;
     }
     let mut regs = regs_from(ss);
-    match kernel().as_mut() {
-        Some(k) => {
-            if k.tracer.enabled && TRAPS_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
-                let tpidr: u64;
-                // SAFETY: reading the EL0 thread pointer register.
-                unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr) };
-                k.tracer.note(&format!(
-                    "trap at {:#x}: saved x18 {:#x}, live tpidr_el0 {tpidr:#x}",
-                    ss.pc, ss.x[18]
-                ));
-            }
-            k.enter_syscall(&mut regs);
-        }
-        None => {
-            report("fwe: system call before the kernel was initialized\n");
-            // SAFETY: terminating the process.
-            unsafe { libc::_exit(127) }
-        }
+    if kernel().is_none() {
+        report("fwe: system call before the kernel was initialized\n");
+        // SAFETY: terminating the process.
+        unsafe { libc::_exit(127) }
+    }
+    let nr = regs.x[8];
+    let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+
+    // `clone` and the blocking system calls run without holding the kernel
+    // lock, so a blocked or spawning thread does not stall the others; the
+    // kernel is then locked only briefly to record the result and deliver a
+    // pending signal.
+    if nr == fwe_abi::nr::CLONE {
+        let r = crate::threads::do_clone(&regs);
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else if let Some(r) = {
+        // SAFETY: guest pointers in `args` reference guest memory.
+        unsafe { fwe_kernel::blocking_syscall(nr, args) }
+    } {
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else {
+        kernel().as_mut().unwrap().enter_syscall(&mut regs);
     }
     regs_to(ss, &regs);
 }
@@ -293,11 +293,12 @@ fn install(
     }
 }
 
-/// Install the signal stack and handlers for running guest code on this
-/// thread.
-pub fn install_handlers() {
+/// Give this host thread its own signal stack. Signal dispositions are
+/// process-wide, but the alternate stack is per thread, so every thread that
+/// runs guest code needs one before it can trap.
+pub fn install_thread_altstack() {
     // SAFETY: a fresh mapping for the signal stack, leaked for the life of
-    // the process.
+    // the thread (which runs until the process or the thread exits).
     unsafe {
         let stack = libc::mmap(
             std::ptr::null_mut(),
@@ -311,10 +312,63 @@ pub fn install_handlers() {
         let ss = libc::stack_t { ss_sp: stack, ss_size: SIGNAL_STACK_SIZE, ss_flags: 0 };
         assert_eq!(libc::sigaltstack(&ss, std::ptr::null_mut()), 0, "sigaltstack failed");
     }
+}
+
+/// Install the per-thread signal stack and the process-wide handlers for
+/// running guest code (called once on the main thread).
+pub fn install_handlers() {
+    install_thread_altstack();
     install(libc::SIGTRAP, on_sigtrap);
     for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
         install(sig, on_fault);
     }
+}
+
+/// Enter the guest with a full register state (used for a cloned thread).
+/// Restores `x0`–`x15` and `x17`–`x30`, the stack pointer, and jumps to `pc`;
+/// `x16` is used as the branch scratch and its guest value is not restored
+/// (it is a caller-saved temporary a thread entry does not rely on).
+///
+/// # Safety
+/// `regs` must point to a valid [`Regs`] describing a runnable guest context.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_guest_full(regs: *const Regs) -> ! {
+    core::arch::naked_asm!(
+        "ldr x1, [x0, #248]", // sp
+        "mov sp, x1",
+        "ldr x2,  [x0, #16]",
+        "ldr x3,  [x0, #24]",
+        "ldr x4,  [x0, #32]",
+        "ldr x5,  [x0, #40]",
+        "ldr x6,  [x0, #48]",
+        "ldr x7,  [x0, #56]",
+        "ldr x8,  [x0, #64]",
+        "ldr x9,  [x0, #72]",
+        "ldr x10, [x0, #80]",
+        "ldr x11, [x0, #88]",
+        "ldr x12, [x0, #96]",
+        "ldr x13, [x0, #104]",
+        "ldr x14, [x0, #112]",
+        "ldr x15, [x0, #120]",
+        "ldr x17, [x0, #136]",
+        "ldr x18, [x0, #144]",
+        "ldr x19, [x0, #152]",
+        "ldr x20, [x0, #160]",
+        "ldr x21, [x0, #168]",
+        "ldr x22, [x0, #176]",
+        "ldr x23, [x0, #184]",
+        "ldr x24, [x0, #192]",
+        "ldr x25, [x0, #200]",
+        "ldr x26, [x0, #208]",
+        "ldr x27, [x0, #216]",
+        "ldr x28, [x0, #224]",
+        "ldr x29, [x0, #232]",
+        "ldr x30, [x0, #240]",
+        "ldr x16, [x0, #256]", // pc -> branch scratch
+        "ldr x1,  [x0, #8]",
+        "ldr x0,  [x0, #0]",
+        "br x16",
+    )
 }
 
 /// Switch this thread to the guest: set `sp`, clear the general-purpose

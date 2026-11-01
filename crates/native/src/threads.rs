@@ -1,0 +1,135 @@
+//! Thread creation (`clone`) for the native backend.
+//!
+//! A guest thread is a host thread that runs guest code directly. The child
+//! shares the whole address space and the single global kernel; the kernel's
+//! per-thread state (tid, `set_tid_address` word) lives in host thread-locals.
+
+use crate::{LIVE_THREADS, thread_pointer_slot, trap};
+use fwe_abi::{clone as cl, err, errno};
+use fwe_kernel::{Regs, thread};
+use std::sync::atomic::Ordering;
+
+/// What a freshly spawned host thread needs to become a guest thread.
+struct Spawn {
+    regs: Regs,
+    tid: i32,
+    /// Guest thread pointer (`CLONE_SETTLS`), or `None` to inherit.
+    tls: Option<u64>,
+    /// `set_tid_address` word (`CLONE_CHILD_CLEARTID`), or 0.
+    clear_child_tid: u64,
+}
+
+/// Flags fwe supports for `clone`: the thread-creation set used by pthreads.
+const SUPPORTED: u64 = cl::CLONE_VM
+    | cl::CLONE_FS
+    | cl::CLONE_FILES
+    | cl::CLONE_SIGHAND
+    | cl::CLONE_THREAD
+    | cl::CLONE_SYSVSEM
+    | cl::CLONE_SETTLS
+    | cl::CLONE_PARENT_SETTID
+    | cl::CLONE_CHILD_CLEARTID
+    | cl::CLONE_CHILD_SETTID
+    | cl::CLONE_DETACHED;
+
+/// Handle a guest `clone(flags, stack, parent_tid, tls, child_tid)`.
+/// Returns the child tid to the parent, or a negative errno.
+pub fn do_clone(parent: &Regs) -> i64 {
+    let flags = parent.x[0];
+    let child_stack = parent.x[1];
+    let parent_tid = parent.x[2];
+    let tls = parent.x[3];
+    let child_tid = parent.x[4];
+
+    // Only thread creation is supported; fork and new namespaces are not.
+    if flags & cl::CLONE_THREAD == 0 || flags & cl::CLONE_VM == 0 {
+        return err(errno::ENOSYS);
+    }
+    if flags & !SUPPORTED & !cl::CSIGNAL != 0 {
+        return err(errno::ENOSYS);
+    }
+    if child_stack == 0 {
+        return err(errno::EINVAL);
+    }
+
+    let tid = thread::alloc_tid();
+    if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+        // SAFETY: the guest supplied a writable int pointer.
+        unsafe { (parent_tid as *mut i32).write(tid) };
+    }
+    if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
+        // SAFETY: shared address space; the guest supplied a writable pointer.
+        unsafe { (child_tid as *mut i32).write(tid) };
+    }
+
+    // The child resumes just after the clone, with x0 = 0 and its own stack.
+    let mut regs = *parent;
+    regs.x[0] = 0;
+    regs.sp = child_stack;
+    regs.pc = parent.pc.wrapping_add(4);
+
+    let spawn = Box::new(Spawn {
+        regs,
+        tid,
+        tls: (flags & cl::CLONE_SETTLS != 0).then_some(tls),
+        clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
+    });
+
+    LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
+    if spawn_host_thread(spawn) {
+        tid as i64
+    } else {
+        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+        err(errno::EAGAIN)
+    }
+}
+
+/// Create a detached host thread that becomes the guest thread.
+fn spawn_host_thread(spawn: Box<Spawn>) -> bool {
+    let arg = Box::into_raw(spawn).cast::<libc::c_void>();
+    // SAFETY: a detached pthread with the default stack; `child_main` takes
+    // ownership of the boxed `Spawn` passed as its argument.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        libc::pthread_attr_init(&mut attr);
+        libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+        let mut handle: libc::pthread_t = 0;
+        let r = libc::pthread_create(&mut handle, &attr, child_main, arg);
+        libc::pthread_attr_destroy(&mut attr);
+        if r != 0 {
+            // Reclaim the box the thread never received.
+            drop(Box::from_raw(arg.cast::<Spawn>()));
+            return false;
+        }
+    }
+    true
+}
+
+extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
+    // SAFETY: `arg` is the `Spawn` box handed to `pthread_create`.
+    let spawn = unsafe { Box::from_raw(arg.cast::<Spawn>()) };
+
+    trap::install_thread_altstack();
+    thread::set_tid(spawn.tid);
+    thread::set_clear_child_tid(spawn.clear_child_tid);
+    if let Some(tls) = spawn.tls {
+        set_thread_pointer(tls);
+    }
+    if let Some(abi) = crate::X18Abi::get() {
+        // This thread now runs guest code and may use x18 freely.
+        abi.set_enabled(true);
+    }
+
+    let regs = spawn.regs;
+    drop(spawn);
+    // SAFETY: `regs` describes a runnable guest context on the child stack.
+    unsafe { trap::enter_guest_full(&regs) }
+}
+
+/// Set this thread's guest thread pointer into its TSD slot, where the
+/// rewritten `TPIDR_EL0` accesses read and write it.
+fn set_thread_pointer(tls: u64) {
+    let key = (thread_pointer_slot() / 8) as libc::pthread_key_t;
+    // SAFETY: `key` is the process-wide key fwe allocated for the slot.
+    unsafe { libc::pthread_setspecific(key, tls as *const libc::c_void) };
+}
