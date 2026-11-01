@@ -8,9 +8,10 @@ milestones.
 
 ## Status
 
-Milestone M0: static Linux arm64 executables (ET_EXEC and static PIE) run,
-with a first set of system calls. Dynamically linked executables are next
-(M1).
+Milestone M0: static Linux arm64 executables run (static PIE, and ET_EXEC
+linked above 4 GiB), with a first set of system calls. Dynamically linked
+executables are next (M1). Executables linked below 4 GiB need the planned
+hypervisor backend.
 
 ## Usage
 
@@ -22,9 +23,9 @@ target/release/fwe --strace ./hello   # trace its system calls
 
 ## How it works
 
-`fwe` loads the ELF image into its own address space at the guest's
-addresses, rewrites each `svc #0` (Linux system call) into a trapping `brk`,
-sets up a Linux initial stack and jumps to the entry point. Guest code runs
+`fwe` loads the ELF image into its own address space, rewrites each `svc #0`
+(Linux system call) into a trapping `brk`, sets up a Linux initial stack and
+jumps to the entry point. Guest code runs
 directly on the CPU. Each system call traps into `fwe`'s signal handler, which
 runs the Linux system call in the kernel layer and resumes the guest.
 See [docs/architecture.md](docs/architecture.md).

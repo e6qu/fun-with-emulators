@@ -21,6 +21,8 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [ ] Signals
 - [ ] Pipes
 - [ ] Dynamic linking with glibc and musl
+- [ ] Hypervisor backend for executables linked below 4 GiB (static non-PIE,
+  Go), sharing the kernel layer
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 

@@ -24,6 +24,11 @@ pub enum LoadError {
         start: u64,
         len: u64,
     },
+    /// The image is linked below 4 GiB, which macOS reserves in every arm64
+    /// process (`__PAGEZERO`).
+    BelowHostMinimum {
+        start: u64,
+    },
     Map(std::io::Error),
     Protect {
         start: u64,
@@ -40,6 +45,12 @@ impl fmt::Display for LoadError {
                 f,
                 "address range {start:#x}-{:#x} required by the executable is not available",
                 start + len
+            ),
+            LoadError::BelowHostMinimum { start } => write!(
+                f,
+                "executable is linked at {start:#x}, below 4 GiB, which macOS reserves; \
+                 position-independent executables run, and executables linked at low \
+                 addresses need the hypervisor backend (not available yet)"
             ),
             LoadError::Map(e) => write!(f, "mapping the image failed: {e}"),
             LoadError::Protect { start, len, prot, error } => write!(
@@ -73,6 +84,11 @@ fn host_prot(p: u32) -> libc::c_int {
     h
 }
 
+/// Lowest address a process may map: macOS arm64 reserves the low 4 GiB.
+pub fn host_min_address() -> u64 {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 1 << 32 } else { 0 }
+}
+
 /// Map `elf` for host pages of `page_size` bytes. `prepare_exec` is called
 /// on every executable range while it is still writable.
 pub fn load(
@@ -81,6 +97,9 @@ pub fn load(
     mut prepare_exec: impl FnMut(u64, u64),
 ) -> Result<Loaded, LoadError> {
     let plan = LoadPlan::new(elf, page_size);
+    if !elf.is_pie() && plan.start < host_min_address() {
+        return Err(LoadError::BelowHostMinimum { start: plan.start });
+    }
 
     // Reserve the whole range first so segments land at fixed offsets from
     // each other and gaps between them stay inaccessible.

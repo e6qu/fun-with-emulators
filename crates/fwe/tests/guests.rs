@@ -2,9 +2,10 @@
 //! under `fwe`.
 //!
 //! Assembly guests are assembled with `clang` and linked with the toolchain's
-//! `rust-lld`, both as static executables at the default (low) link address
-//! and as static position-independent executables. Rust guests are built for
-//! `aarch64-unknown-linux-musl`.
+//! `rust-lld` three ways: as static executables above 4 GiB, as static
+//! position-independent executables, and (`-low`) at the default low link
+//! address, which the native backend must reject cleanly. Rust guests are
+//! built for `aarch64-unknown-linux-musl`.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -59,8 +60,14 @@ fn build_guests() -> &'static Path {
             );
             run_checked(
                 Command::new(&lld)
-                    .args(["-flavor", "gnu", "-static", "-o"])
+                    .args(["-flavor", "gnu", "-static", "--image-base=0x2000000000", "-o"])
                     .arg(asm.join(name))
+                    .arg(&obj),
+            );
+            run_checked(
+                Command::new(&lld)
+                    .args(["-flavor", "gnu", "-static", "-o"])
+                    .arg(asm.join(format!("{name}-low")))
                     .arg(&obj),
             );
             run_checked(
@@ -173,6 +180,13 @@ fn rust_runtime_services() {
         "heap ok: 10000 entries, 314616 bytes\nsleep ok: true\nclock ok: true\nlarge allocation ok: true\n"
     );
     assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn low_link_address_is_rejected_cleanly() {
+    let out = fwe(&asm_guest("hello-low"), &[]);
+    assert_eq!(out.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("below 4 GiB"));
 }
 
 #[test]

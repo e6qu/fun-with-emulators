@@ -28,8 +28,13 @@ system calls, which validate them. Future backends keep this property.
 The guest sees the host page size (16K on Apple Silicon) through `AT_PAGESZ`,
 which the arm64 Linux ABI permits.
 
-`fwe` is linked with a one-page `__PAGEZERO` so the low 4 GiB, where many
-Linux executables are linked, is available to guests.
+macOS reserves the low 4 GiB of every arm64 process: the kernel refuses to
+start an executable with a smaller `__PAGEZERO`. Position-independent
+executables (the norm for distribution packages) are loaded anywhere, and
+ET_EXEC images linked above 4 GiB at their addresses. ET_EXEC images linked
+below 4 GiB (static non-PIE C and Rust builds at 0x200000 or 0x400000, Go at
+0x10000) need guest-controlled address translation: the planned hypervisor
+backend, which shares the kernel layer.
 
 ## System call path
 
@@ -57,6 +62,7 @@ errno values are generated from the Linux UAPI headers by `tools/gen-abi.py`.
 These are tracked on the roadmap:
 
 - Single-threaded guests only; signals are recorded but not delivered.
+- Executables linked below 4 GiB are rejected (see above).
 - Static executables only (no dynamic loader yet).
 - The guest sees the host filesystem directly (no root filesystem yet).
 - A data word equal to `svc #0` inside an executable segment would be
