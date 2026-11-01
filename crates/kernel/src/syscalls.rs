@@ -533,8 +533,9 @@ mod tests {
     }
 
     impl Platform for TestPlatform {
-        fn prepare_exec(&mut self, addr: u64, len: u64) {
+        fn prepare_exec(&mut self, addr: u64, len: u64) -> Result<(), i32> {
             self.exec.push((addr, len));
+            Ok(())
         }
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")

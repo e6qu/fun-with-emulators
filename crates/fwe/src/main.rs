@@ -12,6 +12,7 @@ Run a Linux arm64 executable.
 
 options:
   --strace     trace system calls to standard error
+  --host-info  show host features that affect compatibility
   -h, --help   show this help
   -V, --version
 ";
@@ -24,6 +25,10 @@ fn main() -> ExitCode {
             b"--strace" => options.strace = true,
             b"-h" | b"--help" => {
                 print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            b"--host-info" => {
+                println!("{}", fwe_native::host_support());
                 return ExitCode::SUCCESS;
             }
             b"-V" | b"--version" => {

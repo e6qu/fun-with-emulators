@@ -13,7 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
-const ASM_GUESTS: &[&str] = &["hello", "exit42", "enosys", "regs", "x18spin", "tpidr"];
+const ASM_GUESTS: &[&str] = &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin"];
+
+/// Link address of the fixed-address (ET_EXEC) guests, above macOS's
+/// reserved low 4 GiB.
+const IMAGE_BASE: &str = "--image-base=0x10000000000";
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
@@ -60,7 +64,7 @@ fn build_guests() -> &'static Path {
             );
             run_checked(
                 Command::new(&lld)
-                    .args(["-flavor", "gnu", "-static", "--image-base=0x2000000000", "-o"])
+                    .args(["-flavor", "gnu", "-static", IMAGE_BASE, "-o"])
                     .arg(asm.join(name))
                     .arg(&obj),
             );
@@ -143,27 +147,52 @@ fn asm_unknown_syscall_is_enosys() {
 
 #[test]
 fn asm_registers_preserved() {
-    let code = fwe(&asm_guest("regs-pie"), &[]).status.code();
-    let meaning = match code {
-        Some(0) => "preserved",
-        Some(1) => "x18 lost",
-        Some(2) => "TPIDR_EL0 lost",
-        Some(3) => "a general-purpose register lost",
-        _ => "crashed",
-    };
-    assert_eq!(code, Some(0), "register state: {meaning}");
+    for name in ["regs", "regs-pie"] {
+        let code = fwe(&asm_guest(name), &[]).status.code();
+        let meaning = match code {
+            Some(0) => "preserved",
+            Some(2) => "TPIDR_EL0 lost",
+            Some(3) => "a general-purpose register lost",
+            _ => "crashed",
+        };
+        assert_eq!(code, Some(0), "{name}: register state: {meaning}");
+    }
 }
 
-/// x18 across preemption alone, with no system calls in the loop.
+/// Whether this host preserves x18, as reported by `fwe --host-info`.
+fn host_preserves_x18() -> bool {
+    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg("--host-info").output().unwrap();
+    let info = String::from_utf8_lossy(&out.stdout).into_owned();
+    eprintln!("host info: {info}");
+    info.contains("x18 preserved: yes")
+}
+
+/// x18 across trapped system calls, where the host supports preserving it.
+#[test]
+fn asm_x18_survives_syscalls() {
+    if !host_preserves_x18() {
+        eprintln!("skipped: host does not preserve x18");
+        return;
+    }
+    assert_eq!(fwe(&asm_guest("x18-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 across preemption alone, where the host supports preserving it.
 #[test]
 fn asm_x18_survives_preemption() {
+    if !host_preserves_x18() {
+        eprintln!("skipped: host does not preserve x18");
+        return;
+    }
     assert_eq!(fwe(&asm_guest("x18spin-pie"), &[]).status.code(), Some(0));
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.
 #[test]
 fn asm_tpidr_survives_syscalls() {
-    assert_eq!(fwe(&asm_guest("tpidr-pie"), &[]).status.code(), Some(0));
+    for name in ["tpidr", "tpidr-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
 
 #[test]

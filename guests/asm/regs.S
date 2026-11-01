@@ -1,11 +1,10 @@
-// Register state that Linux preserves across system calls and preemption.
-// Exit status: 0 = all preserved, 1 = x18 lost, 2 = TPIDR_EL0 lost,
-// 3 = another register lost.
+// Register state that Linux preserves across system calls and preemption
+// (x18 is checked separately by x18.S and x18spin.S).
+// Exit status: 0 = all preserved, 2 = TPIDR_EL0 lost, 3 = another register
+// lost.
     .text
     .globl _start
 _start:
-    movz    x18, #0x1818
-    movk    x18, #0x1818, lsl #48
     movz    x9, #0x7e57
     movk    x9, #0xcafe, lsl #32
     msr     tpidr_el0, x9
@@ -25,10 +24,6 @@ loop:
     mov     x8, #124                // sched_yield
     svc     #0
 
-    movz    x10, #0x1818
-    movk    x10, #0x1818, lsl #48
-    cmp     x18, x10
-    b.ne    lost_x18
     mrs     x10, tpidr_el0
     movz    x11, #0x7e57
     movk    x11, #0xcafe, lsl #32
@@ -51,9 +46,6 @@ loop:
     b.ne    loop
 
     mov     x0, #0
-    b       exit
-lost_x18:
-    mov     x0, #1
     b       exit
 lost_tpidr:
     mov     x0, #2

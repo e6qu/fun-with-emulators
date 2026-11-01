@@ -31,6 +31,10 @@ pub enum LoadError {
         start: u64,
     },
     Map(std::io::Error),
+    Prepare {
+        start: u64,
+        reason: String,
+    },
     Protect {
         start: u64,
         len: u64,
@@ -55,6 +59,9 @@ impl fmt::Display for LoadError {
                  addresses need the hypervisor backend (not available yet)"
             ),
             LoadError::Map(e) => write!(f, "mapping the image failed: {e}"),
+            LoadError::Prepare { start, reason } => {
+                write!(f, "preparing code at {start:#x} failed: {reason}")
+            }
             LoadError::Protect { start, len, prot, error } => write!(
                 f,
                 "setting protections {} on {start:#x}-{:#x} failed: {error}",
@@ -96,7 +103,7 @@ pub fn host_min_address() -> u64 {
 pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
-    mut prepare_exec: impl FnMut(u64, u64),
+    mut prepare_exec: impl FnMut(u64, u64) -> Result<(), String>,
 ) -> Result<Loaded, LoadError> {
     let plan = LoadPlan::new(elf, page_size);
     if !elf.is_pie() && plan.start < host_min_address() {
@@ -156,7 +163,8 @@ pub fn load(
     }
 
     for run in plan.runs.iter().filter(|r| r.prot & PF_X != 0) {
-        prepare_exec(run.start + bias, run.len);
+        prepare_exec(run.start + bias, run.len)
+            .map_err(|reason| LoadError::Prepare { start: run.start + bias, reason })?;
     }
 
     for run in &plan.runs {

@@ -36,4 +36,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sw_vers && uname -m && clang --version
       - run: cargo build
+      - run: target/debug/fwe --host-info
+      - run: cargo test -p fwe-native --test host -- --nocapture
       - run: cargo test

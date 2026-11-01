@@ -25,8 +25,8 @@ pub trait Platform {
     /// Make guest code in `[addr, addr + len)` safe to execute.
     ///
     /// The memory is readable and writable when this is called; the kernel
-    /// applies the final protections afterwards.
-    fn prepare_exec(&mut self, addr: u64, len: u64);
+    /// applies the final protections afterwards. Fails with a Linux errno.
+    fn prepare_exec(&mut self, addr: u64, len: u64) -> Result<(), i32>;
 
     /// Terminate the guest with `code` as its exit status.
     fn exit(&mut self, code: i32) -> !;

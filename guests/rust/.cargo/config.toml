@@ -9,8 +9,8 @@ rustflags = [
     "-C", "linker-flavor=ld.lld",
     "-C", "link-self-contained=yes",
     "-C", "target-feature=+crt-static",
-    "-C", "link-arg=--image-base=0x2000000000",
+    "-C", "link-arg=--image-base=0x10000000000",
     # musl's non-PIE crt1 takes the address of a weak _DYNAMIC with adrp but
     # never uses it; undefined (0) it is out of adrp range from the image.
-    "-C", "link-arg=--defsym=_DYNAMIC=0x2000000000",
+    "-C", "link-arg=--defsym=_DYNAMIC=0x10000000000",
 ]

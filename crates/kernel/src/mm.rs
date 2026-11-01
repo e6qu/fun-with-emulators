@@ -151,7 +151,11 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EEXIST);
         }
         if exec {
-            self.platform.prepare_exec(p, self.page_up(len));
+            if let Err(e) = self.platform.prepare_exec(p, self.page_up(len)) {
+                // SAFETY: unmapping the mapping just created.
+                unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+                return err(e);
+            }
             // SAFETY: changing protections of the mapping just created.
             if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, host_prot(prot)) } != 0
             {
@@ -176,7 +180,9 @@ impl<P: Platform> Kernel<P> {
             if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
                 return last_error();
             }
-            self.platform.prepare_exec(addr, self.page_up(len));
+            if let Err(e) = self.platform.prepare_exec(addr, self.page_up(len)) {
+                return err(e);
+            }
         }
         // SAFETY: guest-requested protection change of guest memory.
         ret(unsafe { libc::mprotect(a, len as usize, host_prot(prot)) })
