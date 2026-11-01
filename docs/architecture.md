@@ -65,7 +65,11 @@ backend, which shares the kernel layer.
   trap handlers leave it while running host code. On older macOS, guest x18
   uses still need to be rewritten (roadmap); until then programs that keep
   values in x18 across a page fault can fail. `fwe --host-info` reports
-  whether x18 is preserved on the current host.
+  whether x18 is preserved on the current host. On macOS 26.6 virtual
+  machines (GitHub's runners) the host was observed to leave the mode on its
+  own when the thread is preempted; `fwe` detects this, never switches the
+  mode off when it is already off (which aborts), and treats x18 as not
+  preserved.
 
 ## Translation
 

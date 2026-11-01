@@ -119,6 +119,8 @@ pub fn thread_pointer_slot() -> u32 {
 pub struct HostSupport {
     /// The host offers an opt-in to preserve x18, and it was requested.
     pub x18_opt_in: bool,
+    /// The host left the opt-in mode on its own while the thread waited.
+    pub x18_opt_in_dropped: bool,
     /// x18 was observed to survive kernel entry and preemption.
     pub x18_preserved: bool,
 }
@@ -126,7 +128,13 @@ pub struct HostSupport {
 impl fmt::Display for HostSupport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let yn = |b: bool| if b { "yes" } else { "no" };
-        write!(f, "x18 opt-in: {}, x18 preserved: {}", yn(self.x18_opt_in), yn(self.x18_preserved))
+        write!(
+            f,
+            "x18 opt-in: {}{}, x18 preserved: {}",
+            yn(self.x18_opt_in),
+            if self.x18_opt_in_dropped { " (dropped by the host)" } else { "" },
+            yn(self.x18_preserved)
+        )
     }
 }
 
@@ -153,6 +161,20 @@ impl X18Abi {
 
     pub fn enabled(&self) -> bool {
         (self.get)()
+    }
+
+    /// Run `f` with the custom ABI on and switch it off again, unless the
+    /// host already did (switching to the current state aborts). Returns
+    /// `f`'s result and whether the mode was still on. `f` must not call
+    /// macOS library code.
+    pub fn run<R>(&self, f: impl FnOnce() -> R) -> (R, bool) {
+        self.set_enabled(true);
+        let r = f();
+        let still_on = self.enabled();
+        if still_on {
+            self.set_enabled(false);
+        }
+        (r, still_on)
     }
 }
 
@@ -189,18 +211,16 @@ pub fn host_support() -> HostSupport {
     static SUPPORT: OnceLock<HostSupport> = OnceLock::new();
     *SUPPORT.get_or_init(|| {
         let abi = X18Abi::get();
-        let x18_preserved = match abi {
+        let (x18_preserved, dropped) = match abi {
+            // No macOS library calls or system calls while the custom ABI is
+            // on; preemption alone exercises the context switch.
             Some(abi) => {
-                abi.set_enabled(true);
-                // No macOS library calls (or system calls) while the custom
-                // ABI is on; preemption alone exercises the context switch.
-                let ok = x18_survives(false);
-                abi.set_enabled(false);
-                ok
+                let (survived, still_on) = abi.run(|| x18_survives(false));
+                (survived && still_on, !still_on)
             }
-            None => x18_survives_kernel_entry(),
+            None => (x18_survives_kernel_entry(), false),
         };
-        HostSupport { x18_opt_in: abi.is_some(), x18_preserved }
+        HostSupport { x18_opt_in: abi.is_some(), x18_opt_in_dropped: dropped, x18_preserved }
     })
 }
 
@@ -280,10 +300,10 @@ pub fn probe(name: &str) -> Result<String, String> {
     trap::install_probe_reporter();
     let with_mode = |f: &dyn Fn() -> bool| -> Result<bool, String> {
         let abi = X18Abi::get().ok_or("no custom x18 ABI on this host")?;
-        abi.set_enabled(true);
-        let r = f();
-        abi.set_enabled(false);
-        Ok(r)
+        match abi.run(f) {
+            (r, true) => Ok(r),
+            (_, false) => Err("the host left the custom x18 ABI on its own".into()),
+        }
     };
     let yn = |b: bool| if b { "preserved" } else { "lost" }.to_string();
     match name {
