@@ -196,6 +196,36 @@ impl Fs {
         Ok(Resolved { dir, name: b".".to_vec() })
     }
 
+    /// Resolve and read a whole file under the root (following symlinks).
+    /// Used to load the dynamic linker named by a guest executable.
+    pub fn read(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        let name = resolved.name_c()?;
+        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+        let fd = unsafe {
+            libc::openat(resolved.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(e());
+        }
+        // SAFETY: `fd` is a fresh owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut data = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            // SAFETY: reading into a valid local buffer.
+            let n = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                return Err(e());
+            }
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&chunk[..n as usize]);
+        }
+        Ok(data)
+    }
+
     /// Translate a host path under the root to a guest path.
     pub fn host_to_guest(&self, host: &[u8]) -> Option<Vec<u8>> {
         if self.root_host == b"/" {

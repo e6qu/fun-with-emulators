@@ -356,12 +356,7 @@ fn start(
 ) -> Result<std::convert::Infallible, Error> {
     let data = std::fs::read(path).map_err(Error::Read)?;
     let elf = Elf::parse(&data).map_err(Error::Elf)?;
-    if let Some(interp) = elf.interpreter().map_err(Error::Elf)? {
-        return Err(Error::Unsupported(format!(
-            "dynamically linked executables are not supported yet (interpreter {})",
-            String::from_utf8_lossy(interp)
-        )));
-    }
+    let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Err(Error::Unsupported(
             "the native backend runs only on macOS on Apple Silicon".into(),
@@ -375,18 +370,54 @@ fn start(
         tracer.note(&format!("host: {host}"));
     }
     let platform = NativePlatform { tp_slot: thread_pointer_slot(), page_size: page };
-    let loaded = loader::load(&elf, page, |a, l, arena| {
-        let stats = platform.prepare(a, l, Some(arena)).map_err(|e| e.to_string())?;
-        if options.strace {
-            tracer.note(&format!(
-                "prepared {a:#x}+{l:#x}: {} system calls, {} thread pointer accesses",
-                stats.syscalls, stats.stubs
-            ));
+
+    // The root filesystem; also used to find the dynamic linker.
+    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
+    let fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
+        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
+    })?;
+
+    let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
+        loader::load(elf, page, |a, l, arena| {
+            let stats = platform.prepare(a, l, Some(arena)).map_err(|e| e.to_string())?;
+            if options.strace {
+                tracer.note(&format!(
+                    "prepared {what} {a:#x}+{l:#x}: {} system calls, {} thread pointer accesses",
+                    stats.syscalls, stats.stubs
+                ));
+            }
+            Ok(())
+        })
+        .map_err(Error::Load)
+    };
+
+    let loaded = load_object(&elf, "exe")?;
+
+    // A dynamically linked executable names an interpreter (the dynamic
+    // linker); load it too and start the guest there. It maps the executable's
+    // libraries itself through our mmap and openat.
+    let interp = match &interp_path {
+        Some(ip) => {
+            let idata = fs.read(ip).map_err(|e| {
+                Error::Unsupported(format!(
+                    "loading the dynamic linker {}: errno {e}",
+                    String::from_utf8_lossy(ip)
+                ))
+            })?;
+            let ielf = Elf::parse(&idata).map_err(Error::Elf)?;
+            if !ielf.is_pie() {
+                return Err(Error::Unsupported(
+                    "the dynamic linker is not position-independent".into(),
+                ));
+            }
+            Some(load_object(&ielf, "interp")?)
         }
-        Ok(())
-    })
-    .map_err(Error::Load)?;
-    // The break starts after the image and its stub space.
+        None => None,
+    };
+    let entry = interp.map_or(loaded.entry, |i| i.entry);
+    let interp_base = interp.map_or(0, |i| i.load_base);
+
+    // The break starts after the main image and its stub space.
     let brk = Brk::reserve(
         loaded.stub_arena.end.max((loaded.end + page - 1) & !(page - 1)),
         Brk::RESERVATION,
@@ -419,7 +450,7 @@ fn start(
         (auxv::AT_CLKTCK, 100),
         (auxv::AT_PHENT, loaded.phent as u64),
         (auxv::AT_PHNUM, loaded.phnum as u64),
-        (auxv::AT_BASE, 0),
+        (auxv::AT_BASE, interp_base),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, loaded.entry),
         (auxv::AT_UID, uid as u64),
@@ -454,7 +485,8 @@ fn start(
 
     if options.strace {
         tracer.note(&format!(
-            "loaded {} at bias {:#x}, entry {:#x}, brk {:#x}, stack top {stack_top:#x}",
+            "loaded {} at bias {:#x}, exe entry {:#x}, interp base {interp_base:#x}, \
+             start entry {entry:#x}, brk {:#x}, stack top {stack_top:#x}",
             path.display(),
             loaded.bias,
             loaded.entry,
@@ -462,12 +494,8 @@ fn start(
         ));
     }
 
-    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-    let fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
-        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
-    })?;
     *KERNEL.lock().unwrap() = Some(Kernel::new(platform, page, brk, Some(fs), tracer));
-    enter(image.sp, loaded.entry)
+    enter(image.sp, entry)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
