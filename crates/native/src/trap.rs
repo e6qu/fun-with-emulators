@@ -185,6 +185,51 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     restore_default(sig);
 }
 
+extern "C" fn on_probe_signal(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+) {
+    let mode_was_on = X18Abi::get().is_some_and(|abi| abi.enabled());
+    let _host = HostCode::enter();
+    // SAFETY: the kernel passes valid siginfo and ucontext for SA_SIGINFO
+    // handlers.
+    let (code, addr, mc) = unsafe {
+        ((*info).si_code, (*info).si_addr() as u64, &*(*(ctx as *mut Ucontext)).uc_mcontext)
+    };
+    // SAFETY: the thread was executing at `pc`, so it is mapped.
+    let word = unsafe { insn(mc.ss.pc) }.map_or(String::from("?"), |w| format!("{w:#010x}"));
+    report(&format!(
+        "probe: signal {sig} code {code} at pc {:#x} (insn {word}), address {addr:#x}, \
+         esr {:#x}, far {:#x}, x18 {:#x}, lr {:#x}, custom x18 ABI on: {mode_was_on}\n",
+        mc.ss.pc, mc.es.esr, mc.es.far, mc.ss.x[18], mc.ss.lr
+    ));
+    // SAFETY: terminating the probe process.
+    unsafe { libc::_exit(99) }
+}
+
+/// Report synchronous signals during host probes instead of dying silently.
+pub fn install_probe_reporter() {
+    // SAFETY: a fresh mapping for the signal stack, leaked for the life of
+    // the process.
+    unsafe {
+        let stack = libc::mmap(
+            std::ptr::null_mut(),
+            SIGNAL_STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        assert_ne!(stack, libc::MAP_FAILED, "allocating the signal stack failed");
+        let ss = libc::stack_t { ss_sp: stack, ss_size: SIGNAL_STACK_SIZE, ss_flags: 0 };
+        assert_eq!(libc::sigaltstack(&ss, std::ptr::null_mut()), 0, "sigaltstack failed");
+    }
+    for sig in [libc::SIGTRAP, libc::SIGILL, libc::SIGSEGV, libc::SIGBUS, libc::SIGSYS] {
+        install(sig, on_probe_signal);
+    }
+}
+
 fn restore_default(sig: libc::c_int) {
     // SAFETY: resetting a signal disposition.
     unsafe { libc::signal(sig, libc::SIG_DFL) };

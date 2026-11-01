@@ -276,6 +276,8 @@ fn x18_survives_kernel_entry() -> bool {
 /// Diagnostic probes of host behaviour, run one per process with
 /// `fwe --probe <name>`. Prints the result; a crash identifies the step.
 pub fn probe(name: &str) -> Result<String, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    trap::install_probe_reporter();
     let with_mode = |f: &dyn Fn() -> bool| -> Result<bool, String> {
         let abi = X18Abi::get().ok_or("no custom x18 ABI on this host")?;
         abi.set_enabled(true);
