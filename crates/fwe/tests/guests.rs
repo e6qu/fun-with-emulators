@@ -150,6 +150,50 @@ fn root_filesystem_confines_writes() {
     }
 }
 
+/// Build one assembly guest object and link it with the given extra flags.
+fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
+    let out = out_dir().join("asm");
+    std::fs::create_dir_all(&out).unwrap();
+    let obj = out.join(format!("{name}.o"));
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-c", "-o"])
+            .arg(&obj)
+            .arg(repo().join("guests/asm").join(format!("{name}.S"))),
+    );
+    let bin = out.join(name);
+    let mut cmd = Command::new(rust_lld());
+    cmd.args(["-flavor", "gnu"]).args(link_args).arg("-o").arg(&bin).arg(&obj);
+    run_checked(&mut cmd);
+    bin
+}
+
+/// The dynamic loader: a PIE executable names an interpreter via PT_INTERP;
+/// fwe must load the interpreter (from the rootfs) and hand control to it
+/// with AT_ENTRY pointing at the executable, which the interpreter jumps to.
+#[test]
+fn dynamic_loader_hands_off_to_interpreter() {
+    let interp = build_asm("interp", &["-pie", "--no-dynamic-linker"]);
+    let dynprog = build_asm("dynprog", &["-pie", "--dynamic-linker=/interp"]);
+
+    let root = std::env::temp_dir().join(format!("fwe-dyn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(&interp, root.join("interp")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+        .arg("--strace")
+        .arg("--root")
+        .arg(&root)
+        .arg(&dynprog)
+        .output()
+        .unwrap();
+    eprintln!("--- dynprog stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "dynamic handoff ok\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn asm_hello() {
     for name in ["hello", "hello-pie"] {
