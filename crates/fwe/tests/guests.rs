@@ -13,8 +13,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
-const ASM_GUESTS: &[&str] =
-    &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin", "fileio", "sigtest"];
+const ASM_GUESTS: &[&str] = &[
+    "hello",
+    "exit42",
+    "enosys",
+    "regs",
+    "tpidr",
+    "x18",
+    "x18spin",
+    "fileio",
+    "sigtest",
+    "threadtest",
+];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
 /// reserved low 4 GiB.
@@ -166,6 +176,15 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     cmd.args(["-flavor", "gnu"]).args(link_args).arg("-o").arg(&bin).arg(&obj);
     run_checked(&mut cmd);
     bin
+}
+
+/// Threads: a guest clones a child that writes a shared counter and exits;
+/// the parent joins via the CLONE_CHILD_CLEARTID futex and checks the counter.
+#[test]
+fn clone_thread_runs_and_joins() {
+    for name in ["threadtest", "threadtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
 
 /// Signal delivery: a guest installs a SIGUSR1 handler, raises it, and the
