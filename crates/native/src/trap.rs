@@ -6,7 +6,7 @@
 //! resumes the guest after the trap with `x0` holding the result.
 
 use crate::rewrite::TRAP;
-use crate::{KERNEL, NativePlatform};
+use crate::{KERNEL, NativePlatform, X18Abi};
 use fwe_kernel::Kernel;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -82,7 +82,31 @@ unsafe fn insn(addr: u64) -> Option<u32> {
     (addr % 4 == 0).then(|| unsafe { (addr as *const u32).read() })
 }
 
+/// Leaves the custom x18 ABI for the duration of a handler, so host code may
+/// call macOS libraries, and re-enters it on drop. The guest's x18 is part of
+/// the saved signal context and is restored when the handler returns.
+struct HostCode(Option<X18Abi>);
+
+impl HostCode {
+    fn enter() -> HostCode {
+        let abi = X18Abi::get().filter(|abi| abi.enabled());
+        if let Some(abi) = abi {
+            abi.set_enabled(false);
+        }
+        HostCode(abi)
+    }
+}
+
+impl Drop for HostCode {
+    fn drop(&mut self) {
+        if let Some(abi) = self.0 {
+            abi.set_enabled(true);
+        }
+    }
+}
+
 extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
     // The saved pc is the trapping instruction for `brk`.
@@ -118,6 +142,7 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
 }
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &*(*(ctx as *mut Ucontext)).uc_mcontext };
     let tracing = kernel().as_ref().is_some_and(|k| k.tracer.enabled);

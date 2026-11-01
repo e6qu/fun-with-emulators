@@ -50,6 +50,23 @@ backend, which shares the kernel layer.
 4. The result goes into `x0`, `pc` advances past the `brk`, and returning
    from the handler resumes the guest. All other registers are preserved.
 
+## Registers macOS treats differently
+
+- **TPIDR_EL0** holds the Linux thread pointer, but macOS does not preserve
+  it for user code (it stores per-CPU data there). Every `mrs`/`msr` of
+  `TPIDR_EL0` is rewritten into a branch to a stub that reads or writes a
+  slot in the host thread's TSD instead, located through `TPIDRRO_EL0`
+  (per-thread, read-only to user code). Stubs live in space reserved right
+  after the image, within branch range.
+- **x18** is a scratch register for Linux code, but macOS reserves it and
+  clears it on every exception return (system calls, page faults,
+  preemption). On macOS 26.4 and later, `fwe` switches the guest thread into
+  the custom x18 ABI (`<os/arch/arm64.h>`) when entering guest code, and the
+  trap handlers leave it while running host code. On older macOS, guest x18
+  uses still need to be rewritten (roadmap); until then programs that keep
+  values in x18 across a page fault can fail. `fwe --host-info` reports
+  whether x18 is preserved on the current host.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -63,6 +80,7 @@ These are tracked on the roadmap:
 
 - Single-threaded guests only; signals are recorded but not delivered.
 - Executables linked below 4 GiB are rejected (see above).
+- x18 is not preserved before macOS 26.4 (see above).
 - Static executables only (no dynamic loader yet).
 - The guest sees the host filesystem directly (no root filesystem yet).
 - A data word equal to `svc #0` inside an executable segment would be

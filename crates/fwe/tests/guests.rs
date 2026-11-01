@@ -216,8 +216,16 @@ fn rust_args_env_and_exit_status() {
     assert_eq!(out.status.code(), Some(7));
 }
 
+/// Compiled Linux code uses x18 as a scratch register, and macOS clears x18
+/// on exception return (page faults, preemption) unless the custom x18 ABI
+/// keeps it. Without that, heavier programs fail at random; rewriting x18
+/// uses for older macOS is on the roadmap.
 #[test]
 fn rust_runtime_services() {
+    if !host_preserves_x18() {
+        eprintln!("skipped: host does not preserve x18");
+        return;
+    }
     let out = fwe(&rust_guest("sysinfo"), &[]);
     assert_eq!(
         stdout(&out),

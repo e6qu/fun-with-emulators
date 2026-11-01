@@ -130,36 +130,77 @@ impl fmt::Display for HostSupport {
     }
 }
 
-/// Opt in to host features guests need and report what is available.
-///
-/// macOS reserves x18 and clears it on context switches. Newer releases let
-/// a process opt in to a custom x18 ABI, under which x18 is preserved.
-pub fn host_support() -> HostSupport {
-    static SUPPORT: OnceLock<HostSupport> = OnceLock::new();
-    *SUPPORT.get_or_init(|| {
-        let x18_opt_in = enable_custom_x18_abi();
-        HostSupport { x18_opt_in, x18_preserved: x18_survives_kernel_entry() }
-    })
+/// The macOS custom x18 ABI (macOS 26.4 and later): a per-thread mode in
+/// which x18 is saved and restored like any other register. While it is on,
+/// the thread must not call macOS library code; see `<os/arch/arm64.h>`.
+#[derive(Clone, Copy)]
+pub struct X18Abi {
+    set: extern "C" fn(bool),
+    get: extern "C" fn() -> bool,
+}
+
+impl X18Abi {
+    /// The host's custom x18 ABI, if it has one.
+    pub fn get() -> Option<X18Abi> {
+        static ABI: OnceLock<Option<X18Abi>> = OnceLock::new();
+        *ABI.get_or_init(lookup_x18_abi)
+    }
+
+    /// Switch this thread into or out of the custom x18 ABI.
+    pub fn set_enabled(&self, on: bool) {
+        (self.set)(on)
+    }
+
+    pub fn enabled(&self) -> bool {
+        (self.get)()
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn enable_custom_x18_abi() -> bool {
-    let name = c"os_set_custom_x18_abi_enabled";
-    // SAFETY: looking up a symbol in the already-loaded system libraries.
-    let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    if f.is_null() {
-        return false;
+fn lookup_x18_abi() -> Option<X18Abi> {
+    // SAFETY: looking up symbols in the already-loaded system libraries.
+    let (set, get) = unsafe {
+        (
+            libc::dlsym(libc::RTLD_DEFAULT, c"os_set_custom_x18_abi_enabled".as_ptr()),
+            libc::dlsym(libc::RTLD_DEFAULT, c"os_custom_x18_abi_enabled".as_ptr()),
+        )
+    };
+    if set.is_null() || get.is_null() {
+        return None;
     }
-    // SAFETY: the libSystem function takes a bool enabling the custom x18
-    // ABI for this process.
-    let set: extern "C" fn(bool) = unsafe { std::mem::transmute(f) };
-    set(true);
-    true
+    // SAFETY: the libSystem functions declared in <os/arch/arm64.h> as
+    // `void os_set_custom_x18_abi_enabled(bool)` and
+    // `bool os_custom_x18_abi_enabled(void)`.
+    unsafe {
+        Some(X18Abi {
+            set: std::mem::transmute::<*mut libc::c_void, extern "C" fn(bool)>(set),
+            get: std::mem::transmute::<*mut libc::c_void, extern "C" fn() -> bool>(get),
+        })
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn enable_custom_x18_abi() -> bool {
-    false
+fn lookup_x18_abi() -> Option<X18Abi> {
+    None
+}
+
+/// Report host features that affect guest compatibility.
+pub fn host_support() -> HostSupport {
+    static SUPPORT: OnceLock<HostSupport> = OnceLock::new();
+    *SUPPORT.get_or_init(|| {
+        let abi = X18Abi::get();
+        let x18_preserved = match abi {
+            Some(abi) => {
+                abi.set_enabled(true);
+                // No macOS library calls while the custom ABI is on.
+                let ok = x18_survives_kernel_entry();
+                abi.set_enabled(false);
+                ok
+            }
+            None => x18_survives_kernel_entry(),
+        };
+        HostSupport { x18_opt_in: abi.is_some(), x18_preserved }
+    })
 }
 
 /// Set x18, make host system calls and spin long enough to be preempted,
@@ -346,6 +387,11 @@ fn start(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     trap::install_handlers();
+    if let Some(abi) = X18Abi::get() {
+        // From here on this thread runs guest code, which may use x18 freely;
+        // the trap handlers leave the mode while they run host code.
+        abi.set_enabled(true);
+    }
     trap::enter_guest(sp, entry)
 }
 

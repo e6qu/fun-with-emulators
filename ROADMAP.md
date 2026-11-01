@@ -23,6 +23,8 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [ ] Dynamic linking with glibc and musl
 - [ ] Hypervisor backend for executables linked below 4 GiB (static non-PIE,
   Go), sharing the kernel layer
+- [ ] Rewrite guest uses of x18 on macOS before 26.4, which clears x18 on
+  every exception return (26.4 and later preserve it via the custom x18 ABI)
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 
