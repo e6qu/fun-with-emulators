@@ -9,6 +9,7 @@ use crate::rewrite::TRAP;
 use crate::{KERNEL, NativePlatform};
 use fwe_kernel::Kernel;
 use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// `__darwin_arm_thread_state64`.
 #[repr(C)]
@@ -59,6 +60,9 @@ pub struct Ucontext {
 
 const SIGNAL_STACK_SIZE: usize = 1 << 20;
 
+/// Traps whose register state has been logged (with `--strace`).
+static TRAPS_LOGGED: AtomicU32 = AtomicU32::new(0);
+
 fn kernel() -> MutexGuard<'static, Option<Kernel<NativePlatform>>> {
     KERNEL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -91,7 +95,18 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     let nr = ss.x[8];
     let args = [ss.x[0], ss.x[1], ss.x[2], ss.x[3], ss.x[4], ss.x[5]];
     let result = match kernel().as_mut() {
-        Some(k) => k.syscall(nr, args),
+        Some(k) => {
+            if k.tracer.enabled && TRAPS_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+                let tpidr: u64;
+                // SAFETY: reading the EL0 thread pointer register.
+                unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr) };
+                k.tracer.note(&format!(
+                    "trap at {:#x}: saved x18 {:#x}, live tpidr_el0 {tpidr:#x}",
+                    ss.pc, ss.x[18]
+                ));
+            }
+            k.syscall(nr, args)
+        }
         None => {
             report("fwe: system call before the kernel was initialized\n");
             // SAFETY: terminating the process.

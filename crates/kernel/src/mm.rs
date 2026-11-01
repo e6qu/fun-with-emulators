@@ -23,27 +23,10 @@ impl Brk {
     /// If the range is not available the break cannot grow; allocators then
     /// fall back to `mmap`, as they do on Linux when `brk` fails.
     pub fn reserve(start: u64, size: u64) -> Brk {
-        // SAFETY: reserving fresh inaccessible address space; the hint is not
-        // MAP_FIXED, so nothing existing is replaced.
-        let p = unsafe {
-            libc::mmap(
-                start as *mut libc::c_void,
-                size as usize,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            return Brk { start, current: start, limit: start };
+        match crate::host::reserve_fixed(start, size) {
+            Ok(()) => Brk { start, current: start, limit: start + size },
+            Err(_) => Brk { start, current: start, limit: start },
         }
-        if p as u64 != start {
-            // SAFETY: unmapping the reservation just created at `p`.
-            unsafe { libc::munmap(p, size as usize) };
-            return Brk { start, current: start, limit: start };
-        }
-        Brk { start, current: start, limit: start + size }
     }
 }
 

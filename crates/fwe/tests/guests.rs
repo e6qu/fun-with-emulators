@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
-const ASM_GUESTS: &[&str] = &["hello", "exit42", "enosys", "regs"];
+const ASM_GUESTS: &[&str] = &["hello", "exit42", "enosys", "regs", "x18spin", "tpidr"];
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
@@ -154,6 +154,18 @@ fn asm_registers_preserved() {
     assert_eq!(code, Some(0), "register state: {meaning}");
 }
 
+/// x18 across preemption alone, with no system calls in the loop.
+#[test]
+fn asm_x18_survives_preemption() {
+    assert_eq!(fwe(&asm_guest("x18spin-pie"), &[]).status.code(), Some(0));
+}
+
+/// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.
+#[test]
+fn asm_tpidr_survives_syscalls() {
+    assert_eq!(fwe(&asm_guest("tpidr-pie"), &[]).status.code(), Some(0));
+}
+
 #[test]
 fn rust_hello() {
     let out = fwe(&rust_guest("hello"), &[]);
@@ -191,7 +203,8 @@ fn low_link_address_is_rejected_cleanly() {
 
 #[test]
 fn rejects_non_elf() {
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(file!()).output().unwrap();
+    let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/guests.rs");
+    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(this_file).output().unwrap();
     assert_eq!(out.status.code(), Some(126));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an ELF file"));
 }

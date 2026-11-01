@@ -254,6 +254,79 @@ pub fn fill_random(out: &mut [u8]) {
     }
 }
 
+/// Why an exact-address reservation failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveError {
+    /// Something is already mapped in the range.
+    Occupied,
+    /// The range is outside the addresses the host lets this process use.
+    OutOfRange,
+    /// Another host error (Mach `kern_return_t` or errno).
+    Other(i32),
+}
+
+impl std::fmt::Display for ReserveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReserveError::Occupied => write!(f, "already in use"),
+            ReserveError::OutOfRange => write!(f, "outside the process address space"),
+            ReserveError::Other(code) => write!(f, "host error {code}"),
+        }
+    }
+}
+
+/// Reserve `[addr, addr + len)` as inaccessible memory, exactly at `addr`,
+/// without disturbing anything already mapped.
+#[cfg(target_os = "macos")]
+pub fn reserve_fixed(addr: u64, len: u64) -> Result<(), ReserveError> {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
+    }
+    const VM_FLAGS_FIXED: i32 = 0;
+    const KERN_INVALID_ADDRESS: i32 = 1;
+    const KERN_NO_SPACE: i32 = 3;
+    let mut at = addr;
+    // SAFETY: allocating fresh memory in our own task; VM_FLAGS_FIXED without
+    // VM_FLAGS_OVERWRITE fails rather than replacing existing mappings.
+    let kr = unsafe { mach_vm_allocate(mach_task_self_, &mut at, len, VM_FLAGS_FIXED) };
+    match kr {
+        0 => {
+            // SAFETY: the range was just allocated by us.
+            unsafe { libc::mprotect(addr as *mut libc::c_void, len as usize, libc::PROT_NONE) };
+            Ok(())
+        }
+        KERN_NO_SPACE => Err(ReserveError::Occupied),
+        KERN_INVALID_ADDRESS => Err(ReserveError::OutOfRange),
+        other => Err(ReserveError::Other(other)),
+    }
+}
+
+/// Reserve `[addr, addr + len)` as inaccessible memory, exactly at `addr`,
+/// without disturbing anything already mapped.
+#[cfg(not(target_os = "macos"))]
+pub fn reserve_fixed(addr: u64, len: u64) -> Result<(), ReserveError> {
+    // SAFETY: MAP_FIXED_NOREPLACE never replaces existing mappings.
+    let p = unsafe {
+        libc::mmap(
+            addr as *mut libc::c_void,
+            len as usize,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return Err(match last_errno() {
+            libc::EEXIST => ReserveError::Occupied,
+            libc::ENOMEM | libc::EINVAL => ReserveError::OutOfRange,
+            e => ReserveError::Other(e),
+        });
+    }
+    Ok(())
+}
+
 pub fn getpid() -> i64 {
     // SAFETY: plain host call.
     unsafe { libc::getpid() as i64 }

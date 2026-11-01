@@ -23,6 +23,7 @@ pub enum LoadError {
     AddressUnavailable {
         start: u64,
         len: u64,
+        reason: fwe_kernel::host::ReserveError,
     },
     /// The image is linked below 4 GiB, which macOS reserves in every arm64
     /// process (`__PAGEZERO`).
@@ -41,9 +42,10 @@ pub enum LoadError {
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoadError::AddressUnavailable { start, len } => write!(
+            LoadError::AddressUnavailable { start, len, reason } => write!(
                 f,
-                "address range {start:#x}-{:#x} required by the executable is not available",
+                "address range {start:#x}-{:#x} required by the executable is not available \
+                 ({reason})",
                 start + len
             ),
             LoadError::BelowHostMinimum { start } => write!(
@@ -103,27 +105,28 @@ pub fn load(
 
     // Reserve the whole range first so segments land at fixed offsets from
     // each other and gaps between them stay inaccessible.
-    let hint = if elf.is_pie() { std::ptr::null_mut() } else { plan.start as *mut libc::c_void };
-    // SAFETY: a fresh inaccessible reservation; not MAP_FIXED.
-    let base = unsafe {
-        libc::mmap(
-            hint,
-            plan.len as usize,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        )
+    let base = if elf.is_pie() {
+        // SAFETY: a fresh inaccessible reservation anywhere; not MAP_FIXED.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                plan.len as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(LoadError::Map(std::io::Error::last_os_error()));
+        }
+        p as u64
+    } else {
+        fwe_kernel::host::reserve_fixed(plan.start, plan.len).map_err(|reason| {
+            LoadError::AddressUnavailable { start: plan.start, len: plan.len, reason }
+        })?;
+        plan.start
     };
-    if base == libc::MAP_FAILED {
-        return Err(LoadError::Map(std::io::Error::last_os_error()));
-    }
-    let base = base as u64;
-    if !elf.is_pie() && base != plan.start {
-        // SAFETY: releasing the reservation just made.
-        unsafe { libc::munmap(base as *mut libc::c_void, plan.len as usize) };
-        return Err(LoadError::AddressUnavailable { start: plan.start, len: plan.len });
-    }
     let bias = base - plan.start;
 
     for run in &plan.runs {
