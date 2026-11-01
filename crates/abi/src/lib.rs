@@ -326,6 +326,36 @@ pub mod signal {
 
     /// Minimum signal stack size reported via `AT_MINSIGSTKSZ` (no SVE/SME).
     pub const MINSIGSTKSZ: u64 = 5120;
+
+    /// Handler sentinels.
+    pub const SIG_DFL: u64 = 0;
+    pub const SIG_IGN: u64 = 1;
+
+    /// `sa_flags` bits (`asm-generic/signal.h`).
+    pub const SA_NOCLDSTOP: u64 = 1;
+    pub const SA_NOCLDWAIT: u64 = 2;
+    pub const SA_SIGINFO: u64 = 4;
+    pub const SA_RESTORER: u64 = 0x0400_0000;
+    pub const SA_ONSTACK: u64 = 0x0800_0000;
+    pub const SA_RESTART: u64 = 0x1000_0000;
+    pub const SA_NODEFER: u64 = 0x4000_0000;
+    pub const SA_RESETHAND: u64 = 0x8000_0000;
+
+    /// `ss_flags` bits.
+    pub const SS_ONSTACK: i32 = 1;
+    pub const SS_DISABLE: i32 = 2;
+
+    /// `si_code` values shared across signals.
+    pub const SI_USER: i32 = 0;
+    pub const SI_KERNEL: i32 = 0x80;
+
+    /// Default action of each signal, for signals with no handler.
+    pub fn default_is_terminate(sig: u64) -> bool {
+        !matches!(
+            sig,
+            SIGCHLD | SIGURG | SIGWINCH | SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU
+        )
+    }
 }
 
 /// Terminal ioctls (`asm-generic/ioctls.h`).
