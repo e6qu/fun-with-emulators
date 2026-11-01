@@ -13,10 +13,13 @@ ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26.
 
 M1 is in progress. Landed: a root filesystem with the file and directory
 system calls (`openat`, the `stat` family, `getdents64`, `renameat2`,
-symlinks with rootfs containment, and more). Next: the dynamic loader,
-threads, and signal delivery. x18 rewriting and executables linked below
-4 GiB are deferred to the hypervisor backend; run `fwe --host-info` to see
-how the current host treats registers that matter to Linux code.
+symlinks with rootfs containment, and more), and the **dynamic loader**
+(`PT_INTERP` interpreters are loaded from the rootfs and handed control with
+the right auxiliary vector). Next: threads and signal delivery. Running real
+glibc/musl programs end to end also needs the x18 fix, which — together with
+executables linked below 4 GiB — is deferred to the hypervisor backend; run
+`fwe --host-info` to see how the current host treats registers that matter
+to Linux code.
 
 ## Usage
 
