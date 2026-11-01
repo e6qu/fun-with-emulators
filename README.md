@@ -8,10 +8,12 @@ milestones.
 
 ## Status
 
-Milestone M0: static Linux arm64 executables run (static PIE, and ET_EXEC
-linked above 4 GiB), with a first set of system calls. Dynamically linked
-executables are next (M1). Executables linked below 4 GiB need the planned
-hypervisor backend.
+Milestone M0 is done: static Linux arm64 executables (static PIE, and
+ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26, with a first
+set of system calls. Next (M1): x18 rewriting, threads and signals, the
+dynamic loader, and a root filesystem. Executables linked below 4 GiB need
+the planned hypervisor backend. Run `fwe --host-info` to see how the
+current host treats registers that matter to Linux code.
 
 ## Usage
 

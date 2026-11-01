@@ -35,10 +35,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: sw_vers && uname -m && clang --version
-      - name: Look for the custom x18 ABI in the SDK
-        run: |
-          h="$(xcrun --show-sdk-path)/usr/include/os/arch/arm64.h"
-          if [ -f "$h" ]; then cat "$h"; else echo "not declared in this SDK"; fi
       - run: cargo build
       - name: Probe host register behaviour
         run: |
@@ -46,19 +42,5 @@ jobs:
             printf '%s: ' "$p"; target/debug/fwe --probe "$p" 2>&1 || echo "(exit $?)"
           done
           target/debug/fwe --host-info || echo "(host-info exit $?)"
-      - name: Crash reports
-        if: matrix.os == 'macos-26'
-        run: |
-          sleep 5
-          for f in $(ls -t ~/Library/Logs/DiagnosticReports/fwe* /Library/Logs/DiagnosticReports/fwe* 2>/dev/null | head -2); do
-            echo "== $f"; head -c 6000 "$f"; echo
-          done
-      - name: Debug the custom x18 ABI under lldb
-        if: matrix.os == 'macos-26'
-        run: |
-          lldb --batch -o run -o bt -o "register read" -o "disassemble -p -c 12" \
-            -o "disassemble -n os_set_custom_x18_abi_enabled" \
-            -o "disassemble -n os_custom_x18_abi_enabled" \
-            -- target/debug/fwe --probe x18-mode-spin || true
       - run: cargo test -p fwe-native --test host -- --nocapture
       - run: cargo test
