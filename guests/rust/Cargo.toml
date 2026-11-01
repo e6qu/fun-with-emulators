@@ -1,0 +1,12 @@
+# Linux arm64 test programs written in Rust, built for
+# aarch64-unknown-linux-musl as static executables.
+[package]
+name = "guests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[profile.release]
+debug = 1
