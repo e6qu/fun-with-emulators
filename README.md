@@ -9,18 +9,22 @@ milestones.
 ## Status
 
 Milestone M0 is done: static Linux arm64 executables (static PIE, and
-ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26, with a first
-set of system calls. Next (M1): x18 rewriting, threads and signals, the
-dynamic loader, and a root filesystem. Executables linked below 4 GiB need
-the planned hypervisor backend. Run `fwe --host-info` to see how the
-current host treats registers that matter to Linux code.
+ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26.
+
+M1 is in progress. Landed: a root filesystem with the file and directory
+system calls (`openat`, the `stat` family, `getdents64`, `renameat2`,
+symlinks with rootfs containment, and more). Next: the dynamic loader,
+threads, and signal delivery. x18 rewriting and executables linked below
+4 GiB are deferred to the hypervisor backend; run `fwe --host-info` to see
+how the current host treats registers that matter to Linux code.
 
 ## Usage
 
 ```sh
 cargo build --release
-target/release/fwe ./hello            # run a Linux arm64 static executable
-target/release/fwe --strace ./hello   # trace its system calls
+target/release/fwe ./hello                 # run a Linux arm64 static executable
+target/release/fwe --strace ./hello        # trace its system calls
+target/release/fwe --root ./rootfs ./hello # run with ./rootfs as /
 ```
 
 ## How it works

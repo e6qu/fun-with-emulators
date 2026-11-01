@@ -71,6 +71,23 @@ backend, which shares the kernel layer.
   mode off when it is already off (which aborts), and treats x18 as not
   preserved.
 
+## Filesystem
+
+The guest sees a filesystem rooted at a host directory (the rootfs), set with
+`fwe --root DIR`; with no `--root` the root is the host `/`, reproducing
+pass-through behaviour. Guest paths are resolved under the root in
+`crates/kernel/src/fs.rs`, one component at a time, following symlinks
+ourselves and clamping `..` so a path can never escape the root — the
+containment `openat2(RESOLVE_IN_ROOT)` gives on Linux, done by hand so it
+works on macOS too. Absolute symlink targets re-root at the rootfs rather
+than the host `/`.
+
+Guest file descriptors are host file descriptors: an opened file's host fd is
+returned to the guest unchanged, so `read`, `write`, `lseek`, `fstat` and the
+rest act on it directly. `getdents64` passes through on a Linux host (the
+kernel already produces the arm64 layout) and is translated from
+`getdirentries` on macOS. Creation modes have the umask applied by the kernel.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -86,7 +103,6 @@ These are tracked on the roadmap:
 - Executables linked below 4 GiB are rejected (see above).
 - x18 is not preserved before macOS 26.4 (see above).
 - Static executables only (no dynamic loader yet).
-- The guest sees the host filesystem directly (no root filesystem yet).
 - A data word equal to `svc #0` inside an executable segment would be
   rewritten too.
 - Guest pointers the kernel reads itself are not yet fault-checked; a bad

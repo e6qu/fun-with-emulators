@@ -81,6 +81,47 @@ impl<P: Platform> Kernel<P> {
             nr::IOCTL => self.sys_ioctl(a[0], a[1], a[2]),
             nr::PPOLL => self.sys_ppoll(a[0], a[1], a[2]),
 
+            // Files and directories.
+            nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),
+            nr::FACCESSAT => self.sys_faccessat(a[0], a[1], a[2], 0),
+            nr::FACCESSAT2 => self.sys_faccessat(a[0], a[1], a[2], a[3]),
+            nr::NEWFSTATAT => self.sys_newfstatat(a[0], a[1], a[2], a[3]),
+            nr::FSTAT => self.sys_fstat(a[0], a[1]),
+            nr::STATX => self.sys_statx(a[0], a[1], a[2], a[3], a[4]),
+            nr::GETDENTS64 => self.sys_getdents64(a[0], a[1], a[2]),
+            nr::GETCWD => self.sys_getcwd(a[0], a[1]),
+            nr::CHDIR => self.sys_chdir(a[0]),
+            nr::FCHDIR => self.sys_fchdir(a[0]),
+            nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
+            nr::MKDIRAT => self.sys_mkdirat(a[0], a[1], a[2]),
+            nr::UNLINKAT => self.sys_unlinkat(a[0], a[1], a[2]),
+            nr::RENAMEAT2 => self.sys_renameat2(a[0], a[1], a[2], a[3], a[4]),
+            nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
+            nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
+            nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
+            nr::FCHMOD => {
+                // SAFETY: plain host call on a guest fd.
+                ret(unsafe { libc::fchmod(a[0] as i32, a[1] as libc::mode_t) })
+            }
+            nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
+            nr::FCHOWN => {
+                // SAFETY: plain host call on a guest fd.
+                ret(unsafe { libc::fchown(a[0] as i32, a[1] as libc::uid_t, a[2] as libc::gid_t) })
+            }
+            nr::TRUNCATE => self.sys_truncate(a[0], a[1]),
+            nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
+            nr::UMASK => self.sys_umask(a[0]),
+            nr::PIPE2 => self.sys_pipe2(a[0], a[1]),
+            nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
+            nr::FSYNC => {
+                // SAFETY: plain host call on a guest fd.
+                ret(unsafe { libc::fsync(a[0] as i32) })
+            }
+            nr::FDATASYNC => {
+                // SAFETY: plain host call on a guest fd.
+                ret(unsafe { libc::fsync(a[0] as i32) })
+            }
+
             // Memory.
             nr::BRK => self.sys_brk(a[0]),
             nr::MMAP => self.sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
@@ -552,6 +593,7 @@ mod tests {
             TestPlatform { exec: vec![] },
             page,
             Brk { start: 0, current: 0, limit: 0 },
+            None,
             Tracer::default(),
         )
     }

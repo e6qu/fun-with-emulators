@@ -210,6 +210,60 @@ pub mod fcntl {
     pub const FD_CLOEXEC: u64 = 1;
 
     pub const AT_FDCWD: i64 = -100;
+    pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    pub const AT_REMOVEDIR: u64 = 0x200;
+    pub const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    pub const AT_NO_AUTOMOUNT: u64 = 0x800;
+    pub const AT_EMPTY_PATH: u64 = 0x1000;
+
+    /// `faccessat` mode bits.
+    pub const F_OK: u64 = 0;
+    pub const X_OK: u64 = 1;
+    pub const W_OK: u64 = 2;
+    pub const R_OK: u64 = 4;
+
+    /// `lseek` whence values.
+    pub const SEEK_SET: u64 = 0;
+    pub const SEEK_CUR: u64 = 1;
+    pub const SEEK_END: u64 = 2;
+}
+
+/// File type and mode bits (`st_mode`, `S_IF*`).
+pub mod stat {
+    pub const S_IFMT: u32 = 0o170000;
+    pub const S_IFSOCK: u32 = 0o140000;
+    pub const S_IFLNK: u32 = 0o120000;
+    pub const S_IFREG: u32 = 0o100000;
+    pub const S_IFBLK: u32 = 0o060000;
+    pub const S_IFDIR: u32 = 0o040000;
+    pub const S_IFCHR: u32 = 0o020000;
+    pub const S_IFIFO: u32 = 0o010000;
+
+    /// `d_type` values for `getdents64` and the high nibble of `st_mode`.
+    pub const DT_UNKNOWN: u8 = 0;
+    pub const DT_FIFO: u8 = 1;
+    pub const DT_CHR: u8 = 2;
+    pub const DT_DIR: u8 = 4;
+    pub const DT_BLK: u8 = 6;
+    pub const DT_REG: u8 = 8;
+    pub const DT_LNK: u8 = 10;
+    pub const DT_SOCK: u8 = 12;
+}
+
+/// `statx` field-mask bits (`linux/stat.h`).
+pub mod statx_mask {
+    pub const STATX_TYPE: u32 = 0x0001;
+    pub const STATX_MODE: u32 = 0x0002;
+    pub const STATX_NLINK: u32 = 0x0004;
+    pub const STATX_UID: u32 = 0x0008;
+    pub const STATX_GID: u32 = 0x0010;
+    pub const STATX_ATIME: u32 = 0x0020;
+    pub const STATX_MTIME: u32 = 0x0040;
+    pub const STATX_CTIME: u32 = 0x0080;
+    pub const STATX_INO: u32 = 0x0100;
+    pub const STATX_SIZE: u32 = 0x0200;
+    pub const STATX_BLOCKS: u32 = 0x0400;
+    pub const STATX_BASIC_STATS: u32 = 0x07ff;
 }
 
 /// Clock identifiers (`linux/time.h`).
@@ -397,6 +451,84 @@ pub struct Stack {
     pub ss_size: u64,
 }
 
+/// Kernel `struct stat` on arm64 (`asm-generic/stat.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub __pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub __pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: u64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: u64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: u64,
+    pub __unused4: u32,
+    pub __unused5: u32,
+}
+
+/// `struct statx_timestamp`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __reserved: i32,
+}
+
+/// `struct statx` (`linux/stat.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub __spare0: u16,
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    pub __spare3: [u64; 12],
+}
+
+/// Fixed-size head of `struct linux_dirent64`; the name follows inline.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dirent64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+}
+
+/// Bytes of a `linux_dirent64` header before the name.
+pub const DIRENT64_HEADER: usize = 19;
+
 /// Encode a negative errno as a raw syscall return value.
 pub const fn err(errno: i32) -> i64 {
     -(errno as i64)
@@ -430,6 +562,12 @@ mod tests {
         assert_eq!(size_of::<Utsname>(), 390);
         assert_eq!(size_of::<Sigaction>(), 32);
         assert_eq!(size_of::<Stack>(), 24);
+        assert_eq!(size_of::<Stat>(), 128);
+        assert_eq!(size_of::<StatxTimestamp>(), 16);
+        assert_eq!(size_of::<Statx>(), 256);
+        // The header is packed in the kernel ABI; our struct is naturally
+        // aligned, so we serialize its first DIRENT64_HEADER bytes by hand.
+        assert_eq!(DIRENT64_HEADER, 19);
     }
 
     #[test]

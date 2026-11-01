@@ -10,11 +10,14 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod fs;
+mod fsops;
 pub mod host;
 mod mm;
 mod syscalls;
 mod trace;
 
+pub use fs::Fs;
 pub use mm::Brk;
 pub use trace::Tracer;
 
@@ -42,6 +45,8 @@ pub struct Kernel<P: Platform> {
     /// Host page size; guest-visible page size is the same.
     pub page_size: u64,
     pub brk: Brk,
+    /// The guest's filesystem, when configured.
+    pub fs: Option<Fs>,
     pub(crate) sigactions: [Sigaction; signal::NSIG as usize],
     pub(crate) sigmask: u64,
     pub(crate) altstack: Stack,
@@ -50,12 +55,13 @@ pub struct Kernel<P: Platform> {
 }
 
 impl<P: Platform> Kernel<P> {
-    pub fn new(platform: P, page_size: u64, brk: Brk, tracer: Tracer) -> Self {
+    pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
         Kernel {
             platform,
             tracer,
             page_size,
             brk,
+            fs,
             sigactions: [Sigaction::default(); signal::NSIG as usize],
             sigmask: 0,
             altstack: Stack { ss_flags: libc::SS_DISABLE, ..Stack::default() },

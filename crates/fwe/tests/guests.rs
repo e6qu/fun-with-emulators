@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
-const ASM_GUESTS: &[&str] = &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin"];
+const ASM_GUESTS: &[&str] =
+    &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin", "fileio"];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
 /// reserved low 4 GiB.
@@ -125,6 +126,28 @@ fn fwe(program: &Path, args: &[&str]) -> Output {
 
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The root filesystem: an assembly guest writes `/probe` under a `--root`
+/// directory, which must land in the host directory and nowhere else.
+#[test]
+fn root_filesystem_confines_writes() {
+    for name in ["fileio", "fileio-pie"] {
+        let root = std::env::temp_dir().join(format!("fwe-root-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+            .arg("--strace")
+            .arg("--root")
+            .arg(&root)
+            .arg(asm_guest(name))
+            .output()
+            .unwrap();
+        eprintln!("--- {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{name}");
+        assert_eq!(std::fs::read(root.join("probe")).unwrap(), b"ok\n", "{name}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[test]
