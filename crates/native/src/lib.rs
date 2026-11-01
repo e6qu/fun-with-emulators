@@ -75,6 +75,8 @@ impl Platform for NativePlatform {
 pub struct Options {
     /// Trace system calls to standard error.
     pub strace: bool,
+    /// Root filesystem directory; the host `/` when `None`.
+    pub root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -460,7 +462,11 @@ fn start(
         ));
     }
 
-    *KERNEL.lock().unwrap() = Some(Kernel::new(platform, page, brk, tracer));
+    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
+    let fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
+        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
+    })?;
+    *KERNEL.lock().unwrap() = Some(Kernel::new(platform, page, brk, Some(fs), tracer));
     enter(image.sp, loaded.entry)
 }
 

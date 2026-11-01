@@ -12,6 +12,7 @@ Run a Linux arm64 executable.
 
 options:
   --strace     trace system calls to standard error
+  --root DIR   use DIR as the guest root filesystem
   --host-info  show host features that affect compatibility
   -h, --help   show this help
   -V, --version
@@ -23,6 +24,17 @@ fn main() -> ExitCode {
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {
             b"--strace" => options.strace = true,
+            b"--root" => {
+                args.next();
+                match args.next() {
+                    Some(dir) => options.root = Some(PathBuf::from(dir)),
+                    None => {
+                        eprintln!("fwe: --root needs a directory\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+                continue;
+            }
             b"-h" | b"--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
