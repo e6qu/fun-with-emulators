@@ -33,16 +33,21 @@ pub struct NativePlatform {
 }
 
 impl NativePlatform {
-    fn prepare(&self, addr: u64, len: u64) -> Result<prepare::Prepared, prepare::NoStubSpace> {
+    fn prepare(
+        &self,
+        addr: u64,
+        len: u64,
+        arena: Option<&mut prepare::StubArena>,
+    ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
-        unsafe { prepare::prepare(addr, len, self.tp_slot, self.page_size) }
+        unsafe { prepare::prepare(addr, len, self.tp_slot, self.page_size, arena) }
     }
 }
 
 impl Platform for NativePlatform {
     fn prepare_exec(&mut self, addr: u64, len: u64) -> Result<(), i32> {
-        self.prepare(addr, len).map(|_| ()).map_err(|_| fwe_abi::errno::ENOMEM)
+        self.prepare(addr, len, None).map(|_| ()).map_err(|_| fwe_abi::errno::ENOMEM)
     }
 
     fn exit(&mut self, code: i32) -> ! {
@@ -112,13 +117,16 @@ pub fn thread_pointer_slot() -> u32 {
 /// Host features that affect guest compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostSupport {
-    /// The host preserves x18 for this process.
+    /// The host offers an opt-in to preserve x18, and it was requested.
+    pub x18_opt_in: bool,
+    /// x18 was observed to survive kernel entry and preemption.
     pub x18_preserved: bool,
 }
 
 impl fmt::Display for HostSupport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "x18 preserved: {}", if self.x18_preserved { "yes" } else { "no" })
+        let yn = |b: bool| if b { "yes" } else { "no" };
+        write!(f, "x18 opt-in: {}, x18 preserved: {}", yn(self.x18_opt_in), yn(self.x18_preserved))
     }
 }
 
@@ -128,7 +136,10 @@ impl fmt::Display for HostSupport {
 /// a process opt in to a custom x18 ABI, under which x18 is preserved.
 pub fn host_support() -> HostSupport {
     static SUPPORT: OnceLock<HostSupport> = OnceLock::new();
-    *SUPPORT.get_or_init(|| HostSupport { x18_preserved: enable_custom_x18_abi() })
+    *SUPPORT.get_or_init(|| {
+        let x18_opt_in = enable_custom_x18_abi();
+        HostSupport { x18_opt_in, x18_preserved: x18_survives_kernel_entry() }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -148,6 +159,49 @@ fn enable_custom_x18_abi() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn enable_custom_x18_abi() -> bool {
+    false
+}
+
+/// Set x18, make host system calls and spin long enough to be preempted,
+/// and check whether x18 kept its value.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn x18_survives_kernel_entry() -> bool {
+    let lost: u64;
+    // SAFETY: self-contained register test. x18 is reserved on macOS and not
+    // used by compiled code, so it is free to clobber; it is zeroed again
+    // afterwards. All other registers used are declared.
+    unsafe {
+        core::arch::asm!(
+            "movz x18, #0x1818",
+            "movk x18, #0x1818, lsl #48",
+            "mov x10, x18",
+            "mov x9, #200",
+            "2:",
+            "mov x16, #20", // getpid
+            "svc #0x80",
+            "movz x11, #0x8, lsl #16",
+            "3:",
+            "subs x11, x11, #1",
+            "b.ne 3b",
+            "subs x9, x9, #1",
+            "b.ne 2b",
+            "eor {lost}, x18, x10",
+            "mov x18, xzr",
+            lost = out(reg) lost,
+            out("x0") _,
+            out("x1") _,
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            out("x16") _,
+            options(nostack),
+        )
+    }
+    lost == 0
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn x18_survives_kernel_entry() -> bool {
     false
 }
 
@@ -198,10 +252,8 @@ fn start(
         tracer.note(&format!("host: {host}"));
     }
     let platform = NativePlatform { tp_slot: thread_pointer_slot(), page_size: page };
-    let loaded = loader::load(&elf, page, |a, l| {
-        let stats = platform
-            .prepare(a, l)
-            .map_err(|e| format!("no room for code stubs near {:#x}", e.near))?;
+    let loaded = loader::load(&elf, page, |a, l, arena| {
+        let stats = platform.prepare(a, l, Some(arena)).map_err(|e| e.to_string())?;
         if options.strace {
             tracer.note(&format!(
                 "prepared {a:#x}+{l:#x}: {} system calls, {} thread pointer accesses",
@@ -211,7 +263,11 @@ fn start(
         Ok(())
     })
     .map_err(Error::Load)?;
-    let brk = Brk::reserve((loaded.end + page - 1) & !(page - 1), Brk::RESERVATION);
+    // The break starts after the image and its stub space.
+    let brk = Brk::reserve(
+        loaded.stub_arena.end.max((loaded.end + page - 1) & !(page - 1)),
+        Brk::RESERVATION,
+    );
 
     // The main thread stack, with an inaccessible guard page below it.
     // SAFETY: a fresh mapping owned by the guest.

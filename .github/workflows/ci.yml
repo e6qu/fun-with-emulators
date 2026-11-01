@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: sw_vers && uname -m && clang --version
+      - name: Look for the custom x18 ABI in the SDK
+        run: grep -rn "custom_x18" "$(xcrun --show-sdk-path)/usr/include" || echo "not declared in this SDK"
       - run: cargo build
       - run: target/debug/fwe --host-info
       - run: cargo test -p fwe-native --test host -- --nocapture

@@ -101,6 +101,14 @@ pub fn patch(code: &mut [u8]) -> Patched {
     out
 }
 
+/// Number of instructions in `code` that [`patch`] would redirect to stubs.
+pub fn count_sites(code: &[u8]) -> usize {
+    code.chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .filter(|&i| (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31) || i & !RT_MASK == MSR_TPIDR)
+        .count()
+}
+
 /// `b` from `from` to `to`, if in range.
 pub fn branch(from: u64, to: u64) -> Option<u32> {
     let offset = to.wrapping_sub(from) as i64;

@@ -87,7 +87,10 @@ fn build_guests() -> &'static Path {
             .args(["build", "--release", "--manifest-path"])
             .arg(repo().join("guests/rust/Cargo.toml"))
             .arg("--target-dir")
-            .arg(out.join("rust"));
+            .arg(out.join("rust"))
+            // Cargo reads guests/rust/.cargo/config.toml from the working
+            // directory.
+            .current_dir(repo().join("guests/rust"));
         // Do not inherit the outer build's flags or target settings.
         for (key, _) in std::env::vars() {
             if key.starts_with("CARGO_") || key == "RUSTFLAGS" || key == "RUSTC_WRAPPER" {

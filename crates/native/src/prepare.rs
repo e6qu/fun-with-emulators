@@ -13,9 +13,47 @@ pub struct Prepared {
 }
 
 /// No stub region could be placed within branch range of some sites.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoStubSpace {
     pub near: u64,
+    /// Why the last placement attempt failed.
+    pub last_error: String,
+}
+
+impl std::fmt::Display for NoStubSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no room for code stubs near {:#x} ({})", self.near, self.last_error)
+    }
+}
+
+/// Address space reserved (inaccessible) in advance for stubs, typically
+/// right after a loaded image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StubArena {
+    pub next: u64,
+    pub end: u64,
+}
+
+impl StubArena {
+    /// Take `size` bytes if they are reachable according to `reachable`.
+    fn take(&mut self, size: u64, reachable: impl Fn(u64) -> bool) -> Option<u64> {
+        let at = self.next;
+        (at + size <= self.end && reachable(at)).then(|| {
+            self.next += size;
+            at
+        })
+    }
+}
+
+/// Bytes of stub space needed for the code in `code`, rounded for the
+/// per-group page rounding in [`prepare`].
+pub fn stub_space(code: &[u8], page: u64) -> u64 {
+    let sites = rewrite::count_sites(code) as u64;
+    if sites == 0 {
+        return 0;
+    }
+    let groups = (code.len() as u64).div_ceil(GROUP_SPAN);
+    (sites * (STUB_WORDS as u64) * 4).div_ceil(page) * page + groups * page
 }
 
 /// Distance between candidate stub region placements.
@@ -29,7 +67,13 @@ const GROUP_SPAN: u64 = BRANCH_RANGE / 4;
 /// # Safety
 /// The range must be readable and writable guest memory that no thread is
 /// executing.
-pub unsafe fn prepare(addr: u64, len: u64, slot: u32, page: u64) -> Result<Prepared, NoStubSpace> {
+pub unsafe fn prepare(
+    addr: u64,
+    len: u64,
+    slot: u32,
+    page: u64,
+    mut arena: Option<&mut StubArena>,
+) -> Result<Prepared, NoStubSpace> {
     let start = addr & !3;
     let len = (len + (addr - start)) & !3;
     // SAFETY: guaranteed by the caller.
@@ -42,7 +86,7 @@ pub unsafe fn prepare(addr: u64, len: u64, slot: u32, page: u64) -> Result<Prepa
         let n = sites.iter().take_while(|(off, _)| off - first < GROUP_SPAN).count();
         let (group, rest) = sites.split_at(n);
         // SAFETY: the sites lie inside the caller's range.
-        unsafe { redirect(start, group, slot, page, start, start + len) }?;
+        unsafe { redirect(start, group, slot, page, start, start + len, arena.as_deref_mut()) }?;
         sites = rest;
     }
     if stats.syscalls + stats.stubs > 0 {
@@ -66,20 +110,18 @@ unsafe fn redirect(
     page: u64,
     lo: u64,
     hi: u64,
+    arena: Option<&mut StubArena>,
 ) -> Result<(), NoStubSpace> {
     let first = base + group[0].0;
     let last = base + group[group.len() - 1].0;
     let size = ((group.len() * STUB_WORDS * 4) as u64).div_ceil(page) * page;
     let reachable =
         |region: u64| region + size <= first + BRANCH_RANGE && region + BRANCH_RANGE > last + size;
-    let after = (hi + page - 1) & !(page - 1);
-    let before = (lo & !(page - 1)).saturating_sub(size);
-    let candidates = (0..64u64)
-        .flat_map(|k| [after + k * PLACEMENT_STEP, before.saturating_sub(k * PLACEMENT_STEP)]);
-    let region = candidates
-        .filter(|&r| r != 0 && reachable(r))
-        .find(|&r| reserve_fixed(r, size).is_ok())
-        .ok_or(NoStubSpace { near: first })?;
+    let region = match arena.and_then(|a| a.take(size, reachable)) {
+        Some(r) => r,
+        None => find_region(size, page, lo, hi, reachable)
+            .map_err(|last_error| NoStubSpace { near: first, last_error })?,
+    };
 
     // SAFETY: the region was just reserved by us.
     unsafe {
@@ -114,6 +156,51 @@ unsafe fn redirect(
     Ok(())
 }
 
+/// Reserve `size` bytes near `[lo, hi)` satisfying `reachable`.
+fn find_region(
+    size: u64,
+    page: u64,
+    lo: u64,
+    hi: u64,
+    reachable: impl Fn(u64) -> bool,
+) -> Result<u64, String> {
+    let mut last_error = String::from("no candidate in range");
+    let after = (hi + page - 1) & !(page - 1);
+    let before = (lo & !(page - 1)).saturating_sub(size);
+    let candidates = (0..64u64)
+        .flat_map(|k| [after + k * PLACEMENT_STEP, before.saturating_sub(k * PLACEMENT_STEP)]);
+    for r in candidates.filter(|&r| r != 0 && reachable(r)) {
+        match reserve_fixed(r, size) {
+            Ok(()) => return Ok(r),
+            Err(e) => last_error = format!("{r:#x}: {e}"),
+        }
+    }
+    // Let the host pick a spot near the code.
+    for hint in [after, before] {
+        // SAFETY: a fresh inaccessible mapping; the address is only a hint.
+        let p = unsafe {
+            libc::mmap(
+                hint as *mut libc::c_void,
+                size as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            continue;
+        }
+        if reachable(p as u64) {
+            return Ok(p as u64);
+        }
+        last_error = format!("host placed stubs at {:#x}, out of range", p as u64);
+        // SAFETY: releasing the mapping just made.
+        unsafe { libc::munmap(p, size as usize) };
+    }
+    Err(last_error)
+}
+
 /// Invalidate the instruction cache for freshly written code.
 ///
 /// # Safety
@@ -137,6 +224,23 @@ pub unsafe fn flush_icache(_addr: u64, _len: u64) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stub_space_estimate() {
+        let page = 0x4000;
+        assert_eq!(stub_space(&[0u8; 64], page), 0);
+        let one = 0xd53b_d049u32.to_le_bytes(); // mrs x9, tpidr_el0
+        assert_eq!(stub_space(&one, page), 2 * page);
+    }
+
+    #[test]
+    fn arena_hands_out_reachable_space() {
+        let mut arena = StubArena { next: 0x1000, end: 0x3000 };
+        assert_eq!(arena.take(0x1000, |_| true), Some(0x1000));
+        assert_eq!(arena.take(0x1000, |_| false), None);
+        assert_eq!(arena.take(0x1000, |_| true), Some(0x2000));
+        assert_eq!(arena.take(0x1000, |_| true), None);
+    }
 
     fn page() -> u64 {
         // SAFETY: plain host call.
@@ -163,7 +267,7 @@ mod tests {
             unsafe { ((code + 4 * i as u64) as *mut u32).write(*w) };
         }
         // SAFETY: the mapping is ours, writable and not executing.
-        let stats = unsafe { prepare(code, 12, 8, page) }.unwrap();
+        let stats = unsafe { prepare(code, 12, 8, page, None) }.unwrap();
         assert_eq!(stats, Prepared { syscalls: 1, stubs: 2 });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };

@@ -1,5 +1,6 @@
 //! Mapping an ELF image into the host process at its guest addresses.
 
+use crate::prepare::{StubArena, stub_space};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
 use std::fmt;
 
@@ -15,6 +16,8 @@ pub struct Loaded {
     pub phent: u16,
     /// End of the highest segment.
     pub end: u64,
+    /// What is left of the stub space reserved after the image.
+    pub stub_arena: StubArena,
 }
 
 #[derive(Debug)]
@@ -103,12 +106,23 @@ pub fn host_min_address() -> u64 {
 pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
-    mut prepare_exec: impl FnMut(u64, u64) -> Result<(), String>,
+    mut prepare_exec: impl FnMut(u64, u64, &mut StubArena) -> Result<(), String>,
 ) -> Result<Loaded, LoadError> {
     let plan = LoadPlan::new(elf, page_size);
     if !elf.is_pie() && plan.start < host_min_address() {
         return Err(LoadError::BelowHostMinimum { start: plan.start });
     }
+
+    // Space for code stubs right after the image, so they are within branch
+    // range of the code that needs them.
+    let stub_len: u64 = elf
+        .loads()
+        .filter(|ph| ph.executable())
+        .map(|ph| {
+            stub_space(&elf.data[ph.offset as usize..(ph.offset + ph.filesz) as usize], page_size)
+        })
+        .sum();
+    let total = plan.len + stub_len;
 
     // Reserve the whole range first so segments land at fixed offsets from
     // each other and gaps between them stay inaccessible.
@@ -117,7 +131,7 @@ pub fn load(
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                plan.len as usize,
+                total as usize,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
@@ -129,12 +143,13 @@ pub fn load(
         }
         p as u64
     } else {
-        fwe_kernel::host::reserve_fixed(plan.start, plan.len).map_err(|reason| {
-            LoadError::AddressUnavailable { start: plan.start, len: plan.len, reason }
+        fwe_kernel::host::reserve_fixed(plan.start, total).map_err(|reason| {
+            LoadError::AddressUnavailable { start: plan.start, len: total, reason }
         })?;
         plan.start
     };
     let bias = base - plan.start;
+    let mut arena = StubArena { next: base + plan.len, end: base + total };
 
     for run in &plan.runs {
         // SAFETY: replacing part of our own reservation.
@@ -163,7 +178,7 @@ pub fn load(
     }
 
     for run in plan.runs.iter().filter(|r| r.prot & PF_X != 0) {
-        prepare_exec(run.start + bias, run.len)
+        prepare_exec(run.start + bias, run.len, &mut arena)
             .map_err(|reason| LoadError::Prepare { start: run.start + bias, reason })?;
     }
 
@@ -182,6 +197,7 @@ pub fn load(
 
     let (_, hi) = elf.bounds();
     Ok(Loaded {
+        stub_arena: arena,
         bias,
         entry: elf.entry + bias,
         phdr: elf.phdr_vaddr().map(|a| a + bias),
