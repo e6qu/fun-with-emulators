@@ -1,10 +1,10 @@
 //! System call dispatch and the non-memory system calls.
 
 use crate::host::{self, last_error, ret};
-use crate::{Kernel, Platform};
+use crate::{Kernel, Platform, thread};
 use fwe_abi::{
     Pollfd, Rlimit, Sigaction, Stack, Timespec, UTSNAME_LEN, Utsname, Winsize, clock, err, errno,
-    fcntl, futex, ioctl, nr, resource, signal,
+    fcntl, ioctl, nr, resource, signal,
 };
 use std::mem::size_of;
 
@@ -32,6 +32,53 @@ unsafe fn write<T: Copy>(addr: u64, value: T) {
 fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
     let n = s.len().min(UTSNAME_LEN - 1);
     field[..n].copy_from_slice(&s[..n]);
+}
+
+/// `clock_nanosleep`, as a free function so the backend can run it without
+/// the kernel lock (it blocks).
+///
+/// # Safety
+/// `req` and, when non-zero, `rem` must point to valid guest `Timespec`s.
+pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> i64 {
+    const TIMER_ABSTIME: u64 = 1;
+    if matches!(id, clock::CLOCK_THREAD_CPUTIME_ID) {
+        return err(errno::EINVAL);
+    }
+    let Some(hid) = host::clock_to_host(id) else {
+        return err(errno::EINVAL);
+    };
+    // SAFETY: the caller guarantees a valid request pointer.
+    let mut ts: Timespec = unsafe { read(req) };
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return err(errno::EINVAL);
+    }
+    if flags & TIMER_ABSTIME != 0 {
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `now` is a valid out-parameter.
+        unsafe { libc::clock_gettime(hid, &mut now) };
+        let mut sec = ts.tv_sec - now.tv_sec;
+        let mut nsec = ts.tv_nsec - now.tv_nsec;
+        if nsec < 0 {
+            nsec += 1_000_000_000;
+            sec -= 1;
+        }
+        if sec < 0 {
+            return 0;
+        }
+        ts = Timespec { tv_sec: sec, tv_nsec: nsec };
+    }
+    let host_ts = libc::timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec };
+    let mut left = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid in- and out-parameters.
+    if unsafe { libc::nanosleep(&host_ts, &mut left) } == 0 {
+        return 0;
+    }
+    let e = last_error();
+    if rem != 0 && flags & TIMER_ABSTIME == 0 {
+        // SAFETY: the caller guarantees a valid remain buffer.
+        unsafe { write(rem, Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec }) };
+    }
+    e
 }
 
 impl<P: Platform> Kernel<P> {
@@ -131,22 +178,27 @@ impl<P: Platform> Kernel<P> {
             nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3]),
 
             // Process and thread identity.
-            nr::EXIT | nr::EXIT_GROUP => self.platform.exit(a[0] as i32),
-            nr::GETPID | nr::GETTID => host::getpid(),
+            nr::EXIT_GROUP => self.platform.exit(a[0] as i32),
+            nr::EXIT => {
+                self.thread_cleanup();
+                self.platform.exit_thread(a[0] as i32)
+            }
+            nr::GETPID => thread::tgid() as i64,
+            nr::GETTID => thread::tid() as i64,
             nr::GETPPID => host::getppid(),
             nr::GETUID => host::ids().0,
             nr::GETEUID => host::ids().1,
             nr::GETGID => host::ids().2,
             nr::GETEGID => host::ids().3,
             nr::SET_TID_ADDRESS => {
-                self.clear_child_tid = a[0];
-                host::getpid()
+                thread::set_clear_child_tid(a[0]);
+                thread::tid() as i64
             }
             nr::SET_ROBUST_LIST => {
                 if a[1] != 24 {
                     return err(errno::EINVAL);
                 }
-                self.robust_list = (a[0], a[1]);
+                thread::set_robust_list(a[0], a[1]);
                 0
             }
             nr::UNAME => self.sys_uname(a[0]),
@@ -180,8 +232,9 @@ impl<P: Platform> Kernel<P> {
             nr::TKILL => self.sys_kill_self(0, a[1]),
             nr::TGKILL => self.sys_kill_self(a[0] as i64, a[2]),
 
-            // Synchronization.
-            nr::FUTEX => self.sys_futex(a[0], a[1], a[2]),
+            // futex and the sleeps can block, so the backend runs them
+            // outside the kernel lock via `blocking_syscall`; reaching them
+            // here (e.g. through the plain `syscall` helper) is unsupported.
 
             // Randomness.
             nr::GETRANDOM => self.sys_getrandom(a[0], a[1]),
@@ -392,45 +445,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_clock_nanosleep(&mut self, id: u64, flags: u64, req: u64, rem: u64) -> i64 {
-        const TIMER_ABSTIME: u64 = 1;
-        if matches!(id, clock::CLOCK_THREAD_CPUTIME_ID) {
-            return err(errno::EINVAL);
-        }
-        let Some(hid) = host::clock_to_host(id) else {
-            return err(errno::EINVAL);
-        };
-        // SAFETY: the guest passed a pointer to its request.
-        let mut ts: Timespec = unsafe { read(req) };
-        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-            return err(errno::EINVAL);
-        }
-        if flags & TIMER_ABSTIME != 0 {
-            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            // SAFETY: `now` is a valid out-parameter.
-            unsafe { libc::clock_gettime(hid, &mut now) };
-            let mut sec = ts.tv_sec - now.tv_sec;
-            let mut nsec = ts.tv_nsec - now.tv_nsec;
-            if nsec < 0 {
-                nsec += 1_000_000_000;
-                sec -= 1;
-            }
-            if sec < 0 {
-                return 0;
-            }
-            ts = Timespec { tv_sec: sec, tv_nsec: nsec };
-        }
-        let host_ts = libc::timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec };
-        let mut left = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: valid in- and out-parameters.
-        if unsafe { libc::nanosleep(&host_ts, &mut left) } == 0 {
-            return 0;
-        }
-        let e = last_error();
-        if rem != 0 && flags & TIMER_ABSTIME == 0 {
-            // SAFETY: the guest passed a buffer for the remaining time.
-            unsafe { write(rem, Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec }) };
-        }
-        e
+        // SAFETY: the guest passed valid request/remain pointers.
+        unsafe { clock_nanosleep(id, flags, req, rem) }
     }
 
     fn sys_clock_getres(&mut self, id: u64, tp: u64) -> i64 {
@@ -528,23 +544,6 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    fn sys_futex(&mut self, uaddr: u64, op: u64, val: u64) -> i64 {
-        match op & futex::FUTEX_CMD_MASK {
-            futex::FUTEX_WAKE => 0,
-            futex::FUTEX_WAIT => {
-                // SAFETY: the guest passed a pointer to its futex word.
-                let current: u32 = unsafe { read(uaddr) };
-                if current != val as u32 {
-                    err(errno::EAGAIN)
-                } else {
-                    // With a single thread nothing can wake us.
-                    err(errno::ENOSYS)
-                }
-            }
-            _ => err(errno::ENOSYS),
-        }
-    }
-
     fn sys_getrandom(&mut self, buf: u64, len: u64) -> i64 {
         let len = len.min(i32::MAX as u64) as usize;
         // SAFETY: the guest passed a buffer of `len` bytes.
@@ -570,6 +569,9 @@ mod tests {
         }
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")
+        }
+        fn exit_thread(&mut self, code: i32) -> ! {
+            panic!("exit_thread({code})")
         }
         fn kill_self(&mut self, sig: libc::c_int) -> ! {
             panic!("killed by {sig}")

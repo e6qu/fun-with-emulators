@@ -12,10 +12,12 @@
 
 pub mod fs;
 mod fsops;
+pub mod futex;
 pub mod host;
 mod mm;
 mod signal;
 mod syscalls;
+pub mod thread;
 mod trace;
 
 pub use fs::Fs;
@@ -44,8 +46,13 @@ pub trait Platform {
     /// applies the final protections afterwards. Fails with a Linux errno.
     fn prepare_exec(&mut self, addr: u64, len: u64) -> Result<(), i32>;
 
-    /// Terminate the guest with `code` as its exit status.
+    /// Terminate the whole process with `code` as its exit status
+    /// (`exit_group`).
     fn exit(&mut self, code: i32) -> !;
+
+    /// Terminate just the calling thread (`exit`); ends the process when it is
+    /// the last thread.
+    fn exit_thread(&mut self, code: i32) -> !;
 
     /// Terminate the guest as if killed by host signal `sig`.
     fn kill_self(&mut self, sig: libc::c_int) -> !;
@@ -67,8 +74,6 @@ pub struct Kernel<P: Platform> {
     pub(crate) pending: u64,
     /// Guest address of the `rt_sigreturn` trampoline, set by the backend.
     pub(crate) sigreturn_tramp: u64,
-    pub(crate) clear_child_tid: u64,
-    pub(crate) robust_list: (u64, u64),
 }
 
 impl<P: Platform> Kernel<P> {
@@ -84,8 +89,6 @@ impl<P: Platform> Kernel<P> {
             altstack: Stack { ss_flags: libc::SS_DISABLE, ..Stack::default() },
             pending: 0,
             sigreturn_tramp: 0,
-            clear_child_tid: 0,
-            robust_list: (0, 0),
         }
     }
 
@@ -130,4 +133,54 @@ impl<P: Platform> Kernel<P> {
     pub fn deliver_fault(&mut self, regs: &mut Regs, sig: u64, addr: u64) -> bool {
         self.deliver_to_handler(regs, sig, fwe_abi::signal::SI_KERNEL, addr)
     }
+
+    /// Record the result of a system call for `--strace`, then store it into
+    /// `regs` and advance past the trap. Used by the backend for system calls
+    /// it runs outside the kernel lock (the blocking ones and `clone`).
+    pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
+        self.tracer.syscall(nr, args, result);
+        regs.x[0] = result as u64;
+        regs.pc = regs.pc.wrapping_add(4);
+        self.deliver_pending(regs);
+    }
+
+    /// Per-thread cleanup when a thread exits: clear and wake the
+    /// `set_tid_address` futex word so `pthread_join` completes.
+    pub fn thread_cleanup(&mut self) {
+        let addr = thread::clear_child_tid();
+        if addr != 0 {
+            // SAFETY: the guest registered this address with set_tid_address.
+            unsafe { (addr as *mut u32).write(0) };
+            wake_futex(addr, 1);
+        }
+    }
+}
+
+/// Wake up to `count` waiters on the futex word at `addr`.
+pub fn wake_futex(addr: u64, count: u32) {
+    // SAFETY: `addr` is a guest futex word; wake only reads waiter counts.
+    unsafe {
+        futex::op(addr, fwe_abi::futex::FUTEX_WAKE, count, 0);
+    }
+}
+
+/// Run a system call that must not hold the kernel lock because it can block
+/// (`futex`, `nanosleep`, `clock_nanosleep`). Returns `None` for any other
+/// call, which the backend runs under the lock through [`Kernel::enter_syscall`].
+///
+/// # Safety
+/// Pointer arguments must reference valid guest memory for the call.
+pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    use fwe_abi::nr as n;
+    Some(match nr {
+        // SAFETY: caller guarantees the futex word and timeout are valid.
+        n::FUTEX => unsafe { futex::op(a[0], a[1], a[2] as u32, a[3]) },
+        n::NANOSLEEP => {
+            // SAFETY: `struct timespec` has the same layout; the host validates it.
+            host::ret(unsafe { libc::nanosleep(a[0] as *const _, a[1] as *mut _) })
+        }
+        // SAFETY: caller guarantees the request/remain pointers are valid.
+        n::CLOCK_NANOSLEEP => unsafe { syscalls::clock_nanosleep(a[0], a[1], a[2], a[3]) },
+        _ => return None,
+    })
 }

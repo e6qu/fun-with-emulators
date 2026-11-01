@@ -637,6 +637,9 @@ mod tests {
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")
         }
+        fn exit_thread(&mut self, code: i32) -> ! {
+            panic!("exit_thread({code})")
+        }
         fn kill_self(&mut self, sig: libc::c_int) -> ! {
             panic!("killed by {sig}")
         }
