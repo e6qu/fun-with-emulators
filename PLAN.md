@@ -62,6 +62,27 @@ Out of scope:
   suites that must pass.
 - **Performance:** benchmarks against native macOS tools and a Linux VM.
 
+## Development process
+
+The project is built with agentic coding, so work is packed into large,
+outcome-sized pull requests rather than small granular ones:
+
+- **One PR per testable outcome** — usually a milestone, or a large slice of
+  one. Many logical commits, one PR.
+- **Tests decide when it is done.** A PR is ready when its "Done when"
+  criteria pass in CI; conformance tests, real binaries and benchmarks prove
+  it, not line-by-line review.
+- **Self-reviewed before opening.** Builds, tests and a review pass happen
+  before the PR goes up.
+- **Descriptions for skimming:** what it delivers, how it was verified, what
+  is left for later.
+- **No preparatory PRs.** Refactors, scaffolding and dependency changes go
+  into the PR that needs them.
+- **Split only** for parallel workstreams that touch separate areas, or for a
+  shared foundation other in-flight work depends on.
+
+Details for contributors and agents are in [AGENTS.md](AGENTS.md).
+
 ## Workstreams
 
 Once the core userland runs, work proceeds in parallel across:

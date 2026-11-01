@@ -1,0 +1,16 @@
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+# Linked above 4 GiB: macOS reserves the low 4 GiB of arm64 processes, so the
+# native backend cannot place code there (see docs/architecture.md).
+rustflags = [
+    "-C", "linker-flavor=ld.lld",
+    "-C", "link-self-contained=yes",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=--image-base=0x10000000000",
+    # musl's non-PIE crt1 takes the address of a weak _DYNAMIC with adrp but
+    # never uses it; undefined (0) it is out of adrp range from the image.
+    "-C", "link-arg=--defsym=_DYNAMIC=0x10000000000",
+]

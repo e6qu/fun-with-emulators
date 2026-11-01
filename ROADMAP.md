@@ -5,11 +5,11 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 ## M0 — Foundation
 
-- [ ] Rust project skeleton and build
-- [ ] CI running on Apple Silicon macOS
-- [ ] ELF loader for static binaries
-- [ ] System call redirection to our implementation
-- [ ] Test harness
+- [x] Rust project skeleton and build
+- [x] CI running on Apple Silicon macOS
+- [x] ELF loader for static binaries
+- [x] System call redirection to our implementation
+- [x] Test harness
 
 **Done when:** a static Linux arm64 binary runs and prints "hello".
 
@@ -21,6 +21,11 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [ ] Signals
 - [ ] Pipes
 - [ ] Dynamic linking with glibc and musl
+- [ ] Hypervisor backend for executables linked below 4 GiB (static non-PIE,
+  Go), sharing the kernel layer
+- [ ] Rewrite guest uses of x18: macOS clears x18 on every exception return,
+  and the custom x18 ABI (macOS 26.4+) was observed being dropped on
+  preemption, so rewriting is the general fix
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 

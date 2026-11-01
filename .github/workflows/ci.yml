@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint and unit tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+      - run: cargo test
+
+  macos:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: sw_vers && uname -m && clang --version
+      - run: cargo build
+      - name: Probe host register behaviour
+        run: |
+          for p in x18-spin x18-syscall x18-mode x18-mode-write x18-mode-wait x18-mode-spin x18-mode-syscall; do
+            printf '%s: ' "$p"; target/debug/fwe --probe "$p" 2>&1 || echo "(exit $?)"
+          done
+          target/debug/fwe --host-info || echo "(host-info exit $?)"
+      - run: cargo test -p fwe-native --test host -- --nocapture
+      - run: cargo test

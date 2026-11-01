@@ -1,0 +1,16 @@
+[package]
+name = "fwe-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fwe-abi.workspace = true
+fwe-elf.workspace = true
+fwe-kernel.workspace = true
+libc.workspace = true
