@@ -192,8 +192,9 @@ pub fn host_support() -> HostSupport {
         let x18_preserved = match abi {
             Some(abi) => {
                 abi.set_enabled(true);
-                // No macOS library calls while the custom ABI is on.
-                let ok = x18_survives_kernel_entry();
+                // No macOS library calls (or system calls) while the custom
+                // ABI is on; preemption alone exercises the context switch.
+                let ok = x18_survives(false);
                 abi.set_enabled(false);
                 ok
             }
@@ -203,11 +204,12 @@ pub fn host_support() -> HostSupport {
     })
 }
 
-/// Set x18, make host system calls and spin long enough to be preempted,
-/// and check whether x18 kept its value.
+/// Set x18, optionally make host system calls, spin long enough to be
+/// preempted, and check whether x18 kept its value.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn x18_survives_kernel_entry() -> bool {
+fn x18_survives(syscalls: bool) -> bool {
     let lost: u64;
+    let rounds: u64 = 200;
     // SAFETY: self-contained register test. x18 is reserved on macOS and not
     // used by compiled code, so it is free to clobber; it is zeroed again
     // afterwards. All other registers used are declared.
@@ -216,10 +218,11 @@ fn x18_survives_kernel_entry() -> bool {
             "movz x18, #0x1818",
             "movk x18, #0x1818, lsl #48",
             "mov x10, x18",
-            "mov x9, #200",
             "2:",
+            "cbz {syscalls}, 4f",
             "mov x16, #20", // getpid
             "svc #0x80",
+            "4:",
             "movz x11, #0x8, lsl #16",
             "3:",
             "subs x11, x11, #1",
@@ -228,10 +231,11 @@ fn x18_survives_kernel_entry() -> bool {
             "b.ne 2b",
             "eor {lost}, x18, x10",
             "mov x18, xzr",
-            lost = out(reg) lost,
+            syscalls = in(reg) syscalls as u64,
+            lost = lateout(reg) lost,
+            inout("x9") rounds => _,
             out("x0") _,
             out("x1") _,
-            out("x9") _,
             out("x10") _,
             out("x11") _,
             out("x16") _,
@@ -242,8 +246,33 @@ fn x18_survives_kernel_entry() -> bool {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn x18_survives_kernel_entry() -> bool {
+fn x18_survives(_syscalls: bool) -> bool {
     false
+}
+
+fn x18_survives_kernel_entry() -> bool {
+    x18_survives(true)
+}
+
+/// Diagnostic probes of host behaviour, run one per process with
+/// `fwe --probe <name>`. Prints the result; a crash identifies the step.
+pub fn probe(name: &str) -> Result<String, String> {
+    let with_mode = |f: &dyn Fn() -> bool| -> Result<bool, String> {
+        let abi = X18Abi::get().ok_or("no custom x18 ABI on this host")?;
+        abi.set_enabled(true);
+        let r = f();
+        abi.set_enabled(false);
+        Ok(r)
+    };
+    let yn = |b: bool| if b { "preserved" } else { "lost" }.to_string();
+    match name {
+        "x18-mode" => with_mode(&|| true).map(|_| "mode toggled".into()),
+        "x18-spin" => Ok(yn(x18_survives(false))),
+        "x18-syscall" => Ok(yn(x18_survives(true))),
+        "x18-mode-spin" => with_mode(&|| x18_survives(false)).map(yn),
+        "x18-mode-syscall" => with_mode(&|| x18_survives(true)).map(yn),
+        _ => Err(format!("unknown probe {name}")),
+    }
 }
 
 fn page_size() -> u64 {

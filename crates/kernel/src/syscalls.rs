@@ -593,21 +593,28 @@ mod tests {
     fn brk_grows_and_shrinks() {
         let mut k = kernel();
         let size = 64 * k.page_size;
-        // Find free address space for the reservation.
-        // SAFETY: plain host calls on a fresh mapping.
-        let probe = unsafe {
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                size as usize,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
-            libc::munmap(p, size as usize);
-            p as u64
-        };
-        k.brk = Brk::reserve(probe, size);
+        // Find free address space for the reservation. Other tests map memory
+        // concurrently, so the range can be taken in between; try again.
+        let mut probe = 0;
+        for _ in 0..20 {
+            // SAFETY: plain host calls on a fresh mapping.
+            probe = unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    size as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                libc::munmap(p, size as usize);
+                p as u64
+            };
+            k.brk = Brk::reserve(probe, size);
+            if k.brk.limit != k.brk.start {
+                break;
+            }
+        }
         assert_eq!(k.brk.limit, probe + size);
         assert_eq!(k.syscall(nr::BRK, [0; 6]), probe as i64);
         let top = probe + 3 * k.page_size + 5;

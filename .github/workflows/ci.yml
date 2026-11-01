@@ -40,6 +40,11 @@ jobs:
           h="$(xcrun --show-sdk-path)/usr/include/os/arch/arm64.h"
           if [ -f "$h" ]; then cat "$h"; else echo "not declared in this SDK"; fi
       - run: cargo build
-      - run: target/debug/fwe --host-info
+      - name: Probe host register behaviour
+        run: |
+          for p in x18-spin x18-syscall x18-mode x18-mode-spin x18-mode-syscall; do
+            printf '%s: ' "$p"; target/debug/fwe --probe "$p" 2>&1 || echo "(exit $?)"
+          done
+          target/debug/fwe --host-info || echo "(host-info exit $?)"
       - run: cargo test -p fwe-native --test host -- --nocapture
       - run: cargo test

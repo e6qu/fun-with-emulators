@@ -27,6 +27,20 @@ fn main() -> ExitCode {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
+            b"--probe" => {
+                args.next();
+                let name = args.next().unwrap_or_default();
+                return match fwe_native::probe(&name.to_string_lossy()) {
+                    Ok(r) => {
+                        println!("{r}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("fwe: {e}");
+                        ExitCode::from(2)
+                    }
+                };
+            }
             b"--host-info" => {
                 println!("{}", fwe_native::host_support());
                 return ExitCode::SUCCESS;
