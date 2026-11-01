@@ -16,6 +16,8 @@ pub struct Loaded {
     pub phent: u16,
     /// End of the highest segment.
     pub end: u64,
+    /// Address of the lowest loaded segment (the ELF load base, for `AT_BASE`).
+    pub load_base: u64,
     /// What is left of the stub space reserved after the image.
     pub stub_arena: StubArena,
 }
@@ -195,7 +197,7 @@ pub fn load(
         }
     }
 
-    let (_, hi) = elf.bounds();
+    let (lo, hi) = elf.bounds();
     Ok(Loaded {
         stub_arena: arena,
         bias,
@@ -204,5 +206,6 @@ pub fn load(
         phnum: elf.phnum,
         phent: elf.phentsize,
         end: hi + bias,
+        load_base: lo + bias,
     })
 }

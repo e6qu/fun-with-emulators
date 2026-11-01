@@ -88,6 +88,19 @@ rest act on it directly. `getdents64` passes through on a Linux host (the
 kernel already produces the arm64 layout) and is translated from
 `getdirentries` on macOS. Creation modes have the umask applied by the kernel.
 
+## Dynamic linking
+
+A dynamically linked executable names an interpreter (the dynamic linker,
+e.g. `/lib/ld-linux-aarch64.so.1` or `/lib/ld-musl-aarch64.so.1`) in a
+`PT_INTERP` segment. The loader maps the executable, then resolves the
+interpreter path **through the rootfs**, maps it too (it is a PIE, loaded at
+an arbitrary base), and starts the guest at the interpreter's entry point
+rather than the executable's. The auxiliary vector carries `AT_BASE` (the
+interpreter's load base), `AT_ENTRY` (the executable's entry), and
+`AT_PHDR`/`AT_PHENT`/`AT_PHNUM` for the executable, as Linux provides them.
+The interpreter maps the executable's shared libraries itself through our
+`openat` and file-backed `mmap`.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -102,7 +115,6 @@ These are tracked on the roadmap:
 - Single-threaded guests only; signals are recorded but not delivered.
 - Executables linked below 4 GiB are rejected (see above).
 - x18 is not preserved before macOS 26.4 (see above).
-- Static executables only (no dynamic loader yet).
 - A data word equal to `svc #0` inside an executable segment would be
   rewritten too.
 - Guest pointers the kernel reads itself are not yet fault-checked; a bad
