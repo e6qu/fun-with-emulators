@@ -398,9 +398,32 @@ pub mod resource {
 pub mod futex {
     pub const FUTEX_WAIT: u64 = 0;
     pub const FUTEX_WAKE: u64 = 1;
+    pub const FUTEX_REQUEUE: u64 = 3;
+    pub const FUTEX_WAIT_BITSET: u64 = 9;
+    pub const FUTEX_WAKE_BITSET: u64 = 10;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
     pub const FUTEX_CLOCK_REALTIME: u64 = 256;
     pub const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+}
+
+/// `clone` flags (`linux/sched.h`); the low byte is the exit signal.
+pub mod clone {
+    pub const CSIGNAL: u64 = 0x0000_00ff;
+    pub const CLONE_VM: u64 = 0x0000_0100;
+    pub const CLONE_FS: u64 = 0x0000_0200;
+    pub const CLONE_FILES: u64 = 0x0000_0400;
+    pub const CLONE_SIGHAND: u64 = 0x0000_0800;
+    pub const CLONE_PIDFD: u64 = 0x0000_1000;
+    pub const CLONE_VFORK: u64 = 0x0000_4000;
+    pub const CLONE_PARENT: u64 = 0x0000_8000;
+    pub const CLONE_THREAD: u64 = 0x0001_0000;
+    pub const CLONE_NEWNS: u64 = 0x0002_0000;
+    pub const CLONE_SYSVSEM: u64 = 0x0004_0000;
+    pub const CLONE_SETTLS: u64 = 0x0008_0000;
+    pub const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    pub const CLONE_DETACHED: u64 = 0x0040_0000;
+    pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 }
 
 /// `struct timespec`.
