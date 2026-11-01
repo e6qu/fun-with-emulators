@@ -3,8 +3,6 @@
 use crate::fs::Fs;
 use crate::host::{self, last_error, ret};
 use crate::{Kernel, Platform};
-#[cfg(target_os = "macos")]
-use fwe_abi::Dirent64;
 use fwe_abi::{Stat, Statx, err, errno, fcntl, statx_mask};
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
@@ -551,7 +549,7 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
 
 #[cfg(target_os = "macos")]
 fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
-    use fwe_abi::{DIRENT64_HEADER, stat as st};
+    use fwe_abi::DIRENT64_HEADER;
 
     // Not bound by the `libc` crate. On arm64 macOS the entries always use
     // 64-bit inodes: struct dirent { u64 d_ino; u64 d_seekoff; u16 d_reclen;
@@ -564,8 +562,8 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
             basep: *mut libc::c_long,
         ) -> libc::c_int;
     }
+    const BSD_HEADER: usize = 21;
 
-    // BSD directory entries, translated into Linux `linux_dirent64`.
     let mut bsd = vec![0u8; count.max(4096)];
     let mut basep: libc::c_long = 0;
     // SAFETY: `bsd` is a valid buffer; getdirentries advances the fd offset.
@@ -575,52 +573,49 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
     }
     let n = n as usize;
     let mut src = 0usize;
-    let mut dst = 0u64;
-    let end = buf + count as u64;
-    while src < n {
-        // struct dirent { u64 d_ino; u64 d_seekoff; u16 d_reclen; u16 d_namlen; u8 d_type; char d_name[]; }
-        let base = &bsd[src..];
-        let d_ino = u64::from_ne_bytes(base[0..8].try_into().unwrap());
-        let d_seekoff = u64::from_ne_bytes(base[8..16].try_into().unwrap());
-        let d_reclen = u16::from_ne_bytes(base[16..18].try_into().unwrap()) as usize;
-        let d_namlen = u16::from_ne_bytes(base[18..20].try_into().unwrap()) as usize;
-        let d_type = base[20];
-        let name = &base[21..21 + d_namlen];
+    let mut written = 0u64;
+    while src + BSD_HEADER <= n {
+        let rec = &bsd[src..];
+        let d_ino = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+        let d_seekoff = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+        let d_reclen = u16::from_ne_bytes(rec[16..18].try_into().unwrap()) as usize;
+        let d_namlen = u16::from_ne_bytes(rec[18..20].try_into().unwrap()) as usize;
+        let d_type = rec[20];
+        if d_reclen == 0 || src + BSD_HEADER + d_namlen > n {
+            break;
+        }
+        let name = &rec[BSD_HEADER..BSD_HEADER + d_namlen];
 
-        let rec = (DIRENT64_HEADER + d_namlen + 1).div_ceil(8) * 8;
-        if dst + rec as u64 > end {
+        let out_len = (DIRENT64_HEADER + d_namlen + 1).div_ceil(8) * 8;
+        if written + out_len as u64 > count as u64 {
             // Re-read this entry next time by rewinding the fd.
             // SAFETY: plain host call on a guest fd.
             unsafe { libc::lseek(fd, d_seekoff as libc::off_t, libc::SEEK_SET) };
             break;
         }
-        let out = Dirent64 {
-            d_ino,
-            d_off: d_seekoff as i64,
-            d_reclen: rec as u16,
-            d_type: if d_type == 0 { st::DT_UNKNOWN } else { d_type },
-        };
-        // SAFETY: `[dst, dst+rec)` is inside the guest buffer.
+
+        // Serialize the linux_dirent64 header and name directly into the
+        // guest buffer, field by field (the header is packed in the ABI).
+        let at = buf + written;
+        // SAFETY: `[at, at + out_len)` lies within the guest buffer.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                &out as *const _ as *const u8,
-                dst as *mut u8,
-                DIRENT64_HEADER,
-            );
-            std::ptr::copy_nonoverlapping(
-                name.as_ptr(),
-                (dst as *mut u8).add(DIRENT64_HEADER),
-                d_namlen,
-            );
-            (dst as *mut u8).add(DIRENT64_HEADER + d_namlen).write(0);
+            let p = at as *mut u8;
+            p.copy_from(d_ino.to_ne_bytes().as_ptr(), 8);
+            p.add(8).copy_from((d_seekoff as i64).to_ne_bytes().as_ptr(), 8);
+            p.add(16).copy_from((out_len as u16).to_ne_bytes().as_ptr(), 2);
+            p.add(18).write(d_type);
+            for (i, &b) in name.iter().enumerate() {
+                p.add(DIRENT64_HEADER + i).write(b);
+            }
+            p.add(DIRENT64_HEADER + d_namlen).write(0);
         }
-        dst += rec as u64;
+        written += out_len as u64;
         src += d_reclen;
     }
-    if dst == buf && n > 0 {
+    if written == 0 && n > 0 {
         return err(errno::EINVAL);
     }
-    (dst - buf) as i64
+    written as i64
 }
 
 #[cfg(test)]
