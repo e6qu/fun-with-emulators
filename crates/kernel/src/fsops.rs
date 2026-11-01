@@ -551,23 +551,26 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
 fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
     use fwe_abi::DIRENT64_HEADER;
 
-    // Not bound by the `libc` crate. On arm64 macOS the entries always use
-    // 64-bit inodes: struct dirent { u64 d_ino; u64 d_seekoff; u16 d_reclen;
-    // u16 d_namlen; u8 d_type; char d_name[]; }.
-    unsafe extern "C" {
-        fn getdirentries(
-            fd: libc::c_int,
-            buf: *mut libc::c_char,
-            nbytes: libc::c_int,
-            basep: *mut libc::c_long,
-        ) -> libc::c_int;
-    }
+    // The `__getdirentries64` syscall produces the 64-bit-inode layout (the
+    // plain `getdirentries` C symbol is the legacy 32-bit variant). Entries:
+    // struct dirent { u64 d_ino; u64 d_seekoff; u16 d_reclen; u16 d_namlen;
+    // u8 d_type; char d_name[]; }.
+    const SYS___GETDIRENTRIES64: libc::c_int = 344;
     const BSD_HEADER: usize = 21;
 
     let mut bsd = vec![0u8; count.max(4096)];
-    let mut basep: libc::c_long = 0;
-    // SAFETY: `bsd` is a valid buffer; getdirentries advances the fd offset.
-    let n = unsafe { getdirentries(fd, bsd.as_mut_ptr().cast(), bsd.len() as i32, &mut basep) };
+    let mut position: libc::off_t = 0;
+    // SAFETY: `bsd` is a valid buffer; the syscall advances the fd offset and
+    // writes the new position through `position`.
+    let n = unsafe {
+        libc::syscall(
+            SYS___GETDIRENTRIES64,
+            fd,
+            bsd.as_mut_ptr(),
+            bsd.len(),
+            &mut position as *mut libc::off_t,
+        )
+    };
     if n < 0 {
         return last_error();
     }
