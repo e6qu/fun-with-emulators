@@ -16,10 +16,10 @@ See [PLAN.md](PLAN.md) for the overall plan.
 ## M1 — Core userland
 
 - [ ] Processes and threads (`clone`, `fork`, `execve`, `wait`)
-- [ ] Memory management (`mmap`, `mprotect`, `brk`, and friends)
-- [ ] Files and directories, with a Linux root filesystem
+- [x] Memory management (`mmap`, `mprotect`, `brk`, and friends)
+- [x] Files and directories, with a Linux root filesystem
 - [ ] Signals
-- [ ] Pipes
+- [x] Pipes
 - [ ] Dynamic linking with glibc and musl
 - [ ] Hypervisor backend for executables linked below 4 GiB (static non-PIE,
   Go), sharing the kernel layer
