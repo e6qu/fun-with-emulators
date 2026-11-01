@@ -250,6 +250,25 @@ fn x18_survives(_syscalls: bool) -> bool {
     false
 }
 
+/// Write x18 and nothing else.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_x18(value: u64) {
+    // SAFETY: x18 is not used by compiled code on macOS.
+    unsafe { core::arch::asm!("mov x18, {}", in(reg) value, options(nostack)) }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn write_x18(_value: u64) {}
+
+/// Spin long enough to be preempted without touching x18.
+fn spin_without_x18() {
+    let mut x = 0u64;
+    for i in 0..100_000_000u64 {
+        x = std::hint::black_box(x.wrapping_add(i));
+    }
+    std::hint::black_box(x);
+}
+
 fn x18_survives_kernel_entry() -> bool {
     x18_survives(true)
 }
@@ -271,6 +290,16 @@ pub fn probe(name: &str) -> Result<String, String> {
         "x18-syscall" => Ok(yn(x18_survives(true))),
         "x18-mode-spin" => with_mode(&|| x18_survives(false)).map(yn),
         "x18-mode-syscall" => with_mode(&|| x18_survives(true)).map(yn),
+        "x18-mode-write" => with_mode(&|| {
+            write_x18(0x1818_0000_0000_1818);
+            true
+        })
+        .map(|_| "x18 written in mode".into()),
+        "x18-mode-wait" => with_mode(&|| {
+            spin_without_x18();
+            true
+        })
+        .map(|_| "waited in mode".into()),
         _ => Err(format!("unknown probe {name}")),
     }
 }

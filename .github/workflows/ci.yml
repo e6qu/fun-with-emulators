@@ -42,9 +42,16 @@ jobs:
       - run: cargo build
       - name: Probe host register behaviour
         run: |
-          for p in x18-spin x18-syscall x18-mode x18-mode-spin x18-mode-syscall; do
+          for p in x18-spin x18-syscall x18-mode x18-mode-write x18-mode-wait x18-mode-spin x18-mode-syscall; do
             printf '%s: ' "$p"; target/debug/fwe --probe "$p" 2>&1 || echo "(exit $?)"
           done
           target/debug/fwe --host-info || echo "(host-info exit $?)"
+      - name: Debug the custom x18 ABI under lldb
+        if: matrix.os == 'macos-26'
+        run: |
+          lldb --batch -o run -o bt -o "register read" -o "disassemble -p -c 12" \
+            -o "disassemble -n os_set_custom_x18_abi_enabled" \
+            -o "disassemble -n os_custom_x18_abi_enabled" \
+            -- target/debug/fwe --probe x18-mode-spin || true
       - run: cargo test -p fwe-native --test host -- --nocapture
       - run: cargo test
