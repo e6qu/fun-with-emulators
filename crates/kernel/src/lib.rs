@@ -147,12 +147,19 @@ impl<P: Platform> Kernel<P> {
     /// Per-thread cleanup when a thread exits: clear and wake the
     /// `set_tid_address` futex word so `pthread_join` completes.
     pub fn thread_cleanup(&mut self) {
-        let addr = thread::clear_child_tid();
-        if addr != 0 {
-            // SAFETY: the guest registered this address with set_tid_address.
-            unsafe { (addr as *mut u32).write(0) };
-            wake_futex(addr, 1);
-        }
+        thread_exit_cleanup();
+    }
+}
+
+/// Clear and wake this thread's `set_tid_address` futex word, so a joiner
+/// wakes. Touches only thread-local state and guest memory, so the backend
+/// calls it on thread exit without holding the kernel lock.
+pub fn thread_exit_cleanup() {
+    let addr = thread::clear_child_tid();
+    if addr != 0 {
+        // SAFETY: the guest registered this address with set_tid_address.
+        unsafe { (addr as *mut u32).write(0) };
+        wake_futex(addr, 1);
     }
 }
 

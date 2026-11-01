@@ -144,6 +144,12 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     // lock, so a blocked or spawning thread does not stall the others; the
     // kernel is then locked only briefly to record the result and deliver a
     // pending signal.
+    if nr == fwe_abi::nr::EXIT {
+        // A thread exits without the kernel lock: pthread_exit never returns,
+        // so a held lock would never be released.
+        fwe_kernel::thread_exit_cleanup();
+        crate::exit_current_thread(regs.x[0] as i32);
+    }
     if nr == fwe_abi::nr::CLONE {
         let r = crate::threads::do_clone(&regs);
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
