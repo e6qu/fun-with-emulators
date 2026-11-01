@@ -130,6 +130,31 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             "[fwe] guest fault: signal {sig} at pc {:#x} (insn {word}), address {addr:#x}, esr {:#x}\n",
             mc.ss.pc, mc.es.esr
         ));
+        let mut regs = String::from("[fwe] registers:");
+        for (i, x) in mc.ss.x.iter().enumerate() {
+            if i % 4 == 0 {
+                regs.push_str("\n[fwe]  ");
+            }
+            regs.push_str(&format!(" x{i:<2}={x:#018x}"));
+        }
+        regs.push_str(&format!(
+            "\n[fwe]   fp={:#018x} lr={:#018x} sp={:#018x}\n",
+            mc.ss.fp, mc.ss.lr, mc.ss.sp
+        ));
+        report(&regs);
+        let mut code = String::from("[fwe] code before pc:");
+        for back in (1..=8u64).rev() {
+            let at = mc.ss.pc.wrapping_sub(4 * back);
+            // Only read within the faulting instruction's page.
+            if at & !0x3fff == mc.ss.pc & !0x3fff {
+                // SAFETY: same page as the mapped pc.
+                if let Some(w) = unsafe { insn(at) } {
+                    code.push_str(&format!(" {w:08x}"));
+                }
+            }
+        }
+        code.push('\n');
+        report(&code);
     }
     // Returning re-executes the faulting instruction under the default action.
     restore_default(sig);

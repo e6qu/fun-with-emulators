@@ -36,7 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sw_vers && uname -m && clang --version
       - name: Look for the custom x18 ABI in the SDK
-        run: grep -rn "custom_x18" "$(xcrun --show-sdk-path)/usr/include" || echo "not declared in this SDK"
+        run: |
+          h="$(xcrun --show-sdk-path)/usr/include/os/arch/arm64.h"
+          if [ -f "$h" ]; then cat "$h"; else echo "not declared in this SDK"; fi
       - run: cargo build
       - run: target/debug/fwe --host-info
       - run: cargo test -p fwe-native --test host -- --nocapture
