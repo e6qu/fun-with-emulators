@@ -234,6 +234,37 @@ pub fn settable_flags_to_host(linux: u64) -> libc::c_int {
     f
 }
 
+/// Translate Linux `open` flags to host flags.
+///
+/// Symlinks are resolved by the filesystem layer, so the final open always
+/// uses the host `O_NOFOLLOW`. Flags with no host equivalent (`O_PATH`,
+/// `O_TMPFILE`, `O_DIRECT`, `O_NOATIME`, `O_LARGEFILE`) are dropped.
+pub fn open_flags_to_host(linux: u64) -> libc::c_int {
+    let mut f = match linux & fcntl::O_ACCMODE {
+        fcntl::O_WRONLY => libc::O_WRONLY,
+        fcntl::O_RDWR => libc::O_RDWR,
+        _ => libc::O_RDONLY,
+    };
+    f |= libc::O_NOFOLLOW;
+    for (l, h) in [
+        (fcntl::O_CREAT, libc::O_CREAT),
+        (fcntl::O_EXCL, libc::O_EXCL),
+        (fcntl::O_NOCTTY, libc::O_NOCTTY),
+        (fcntl::O_TRUNC, libc::O_TRUNC),
+        (fcntl::O_APPEND, libc::O_APPEND),
+        (fcntl::O_NONBLOCK, libc::O_NONBLOCK),
+        (fcntl::O_DSYNC, libc::O_DSYNC),
+        (fcntl::O_SYNC, libc::O_SYNC),
+        (fcntl::O_DIRECTORY, libc::O_DIRECTORY),
+        (fcntl::O_CLOEXEC, libc::O_CLOEXEC),
+    ] {
+        if linux & l == l {
+            f |= h;
+        }
+    }
+    f
+}
+
 /// Fill `out` with cryptographically secure random bytes.
 #[cfg(target_os = "macos")]
 pub fn fill_random(out: &mut [u8]) {
