@@ -3,8 +3,8 @@
 use crate::host::{self, last_error, ret};
 use crate::{Kernel, Platform};
 use fwe_abi::{
-    Pollfd, Rlimit, Sigaction, Stack, Timespec, UTSNAME_LEN, Utsname, Winsize, err, errno, fcntl,
-    futex, ioctl, nr, resource, signal,
+    Pollfd, Rlimit, Sigaction, Stack, Timespec, UTSNAME_LEN, Utsname, Winsize, clock, err, errno,
+    fcntl, futex, ioctl, nr, resource, signal,
 };
 use std::mem::size_of;
 
@@ -129,6 +129,7 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: `struct timespec` has the same layout; the host validates it.
                 ret(unsafe { libc::nanosleep(a[0] as *const _, a[1] as *mut _) })
             }
+            nr::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a[0], a[1], a[2], a[3]),
 
             // Signals.
             nr::RT_SIGACTION => self.sys_rt_sigaction(a[0], a[1], a[2], a[3]),
@@ -347,6 +348,48 @@ impl<P: Platform> Kernel<P> {
         };
         // SAFETY: `struct timespec` has the same layout; the host validates it.
         ret(unsafe { libc::clock_gettime(hid, tp as *mut libc::timespec) })
+    }
+
+    fn sys_clock_nanosleep(&mut self, id: u64, flags: u64, req: u64, rem: u64) -> i64 {
+        const TIMER_ABSTIME: u64 = 1;
+        if matches!(id, clock::CLOCK_THREAD_CPUTIME_ID) {
+            return err(errno::EINVAL);
+        }
+        let Some(hid) = host::clock_to_host(id) else {
+            return err(errno::EINVAL);
+        };
+        // SAFETY: the guest passed a pointer to its request.
+        let mut ts: Timespec = unsafe { read(req) };
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return err(errno::EINVAL);
+        }
+        if flags & TIMER_ABSTIME != 0 {
+            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: `now` is a valid out-parameter.
+            unsafe { libc::clock_gettime(hid, &mut now) };
+            let mut sec = ts.tv_sec - now.tv_sec;
+            let mut nsec = ts.tv_nsec - now.tv_nsec;
+            if nsec < 0 {
+                nsec += 1_000_000_000;
+                sec -= 1;
+            }
+            if sec < 0 {
+                return 0;
+            }
+            ts = Timespec { tv_sec: sec, tv_nsec: nsec };
+        }
+        let host_ts = libc::timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec };
+        let mut left = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: valid in- and out-parameters.
+        if unsafe { libc::nanosleep(&host_ts, &mut left) } == 0 {
+            return 0;
+        }
+        let e = last_error();
+        if rem != 0 && flags & TIMER_ABSTIME == 0 {
+            // SAFETY: the guest passed a buffer for the remaining time.
+            unsafe { write(rem, Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec }) };
+        }
+        e
     }
 
     fn sys_clock_getres(&mut self, id: u64, tp: u64) -> i64 {
@@ -598,6 +641,23 @@ mod tests {
         let r = k.syscall(nr::SCHED_GETAFFINITY, [0, 128, mask.as_mut_ptr() as u64, 0, 0, 0]);
         assert!(r >= 8);
         assert_ne!(mask[0], 0);
+    }
+
+    #[test]
+    fn clock_nanosleep_relative_and_absolute() {
+        let mut k = kernel();
+        let req = Timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+        let start = std::time::Instant::now();
+        let a = [clock::CLOCK_MONOTONIC, 0, &req as *const _ as u64, 0, 0, 0];
+        assert_eq!(k.syscall(nr::CLOCK_NANOSLEEP, a), 0);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(5));
+        // An absolute time in the past returns immediately.
+        let past = Timespec { tv_sec: 1, tv_nsec: 0 };
+        let a = [clock::CLOCK_MONOTONIC, 1, &past as *const _ as u64, 0, 0, 0];
+        assert_eq!(k.syscall(nr::CLOCK_NANOSLEEP, a), 0);
+        let bad = Timespec { tv_sec: 0, tv_nsec: 2_000_000_000 };
+        let a = [clock::CLOCK_MONOTONIC, 0, &bad as *const _ as u64, 0, 0, 0];
+        assert_eq!(k.syscall(nr::CLOCK_NANOSLEEP, a), err(errno::EINVAL));
     }
 
     #[test]
