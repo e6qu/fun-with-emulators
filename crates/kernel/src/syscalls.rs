@@ -518,24 +518,14 @@ impl<P: Platform> Kernel<P> {
         if sig > signal::NSIG {
             return err(errno::EINVAL);
         }
-        let action = self.sigactions[(sig - 1) as usize];
-        const SIG_IGN: u64 = 1;
-        if action.handler == SIG_IGN || self.sigmask & (1 << (sig - 1)) != 0 {
-            return 0;
+        // SIGKILL and SIGSTOP cannot be caught; act now.
+        if sig == signal::SIGKILL {
+            self.terminate_by(sig);
         }
-        // Signals whose default action is to be ignored.
-        if action.handler == 0
-            && matches!(sig, signal::SIGCHLD | signal::SIGURG | signal::SIGWINCH | signal::SIGCONT)
-        {
-            return 0;
-        }
-        if action.handler != 0 {
-            self.tracer.note("signal handlers are not delivered yet; using the default action");
-        }
-        match host::signal_to_host(sig) {
-            Some(h) => self.platform.kill_self(h),
-            None => self.platform.exit(128 + sig as i32),
-        }
+        // Record it; delivery happens on return to the guest, after this
+        // system call, in `deliver_pending`.
+        self.raise_pending(sig);
+        0
     }
 
     fn sys_futex(&mut self, uaddr: u64, op: u64, val: u64) -> i64 {
