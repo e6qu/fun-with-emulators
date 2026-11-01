@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["guests"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/e6qu/fun-with-emulators"
+rust-version = "1.85"
+
+[workspace.dependencies]
+fwe-abi = { path = "crates/abi" }
+fwe-elf = { path = "crates/elf" }
+fwe-kernel = { path = "crates/kernel" }
+fwe-native = { path = "crates/native" }
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = 1
