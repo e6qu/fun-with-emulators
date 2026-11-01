@@ -7,7 +7,7 @@
 
 use crate::rewrite::TRAP;
 use crate::{KERNEL, NativePlatform, X18Abi};
-use fwe_kernel::Kernel;
+use fwe_kernel::{Kernel, Regs};
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -105,6 +105,25 @@ impl Drop for HostCode {
     }
 }
 
+/// Read the backend thread state into the kernel's register view.
+fn regs_from(ss: &ThreadState) -> Regs {
+    let mut regs = Regs { sp: ss.sp, pc: ss.pc, pstate: ss.cpsr as u64, ..Regs::default() };
+    regs.x[..29].copy_from_slice(&ss.x);
+    regs.x[29] = ss.fp;
+    regs.x[30] = ss.lr;
+    regs
+}
+
+/// Write the kernel's register view back into the backend thread state.
+fn regs_to(ss: &mut ThreadState, regs: &Regs) {
+    ss.x.copy_from_slice(&regs.x[..29]);
+    ss.fp = regs.x[29];
+    ss.lr = regs.x[30];
+    ss.sp = regs.sp;
+    ss.pc = regs.pc;
+    ss.cpsr = regs.pstate as u32;
+}
+
 extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
@@ -116,9 +135,8 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
         restore_default(libc::SIGTRAP);
         return;
     }
-    let nr = ss.x[8];
-    let args = [ss.x[0], ss.x[1], ss.x[2], ss.x[3], ss.x[4], ss.x[5]];
-    let result = match kernel().as_mut() {
+    let mut regs = regs_from(ss);
+    match kernel().as_mut() {
         Some(k) => {
             if k.tracer.enabled && TRAPS_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
                 let tpidr: u64;
@@ -129,22 +147,46 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
                     ss.pc, ss.x[18]
                 ));
             }
-            k.syscall(nr, args)
+            k.enter_syscall(&mut regs);
         }
         None => {
             report("fwe: system call before the kernel was initialized\n");
             // SAFETY: terminating the process.
             unsafe { libc::_exit(127) }
         }
-    };
-    ss.x[0] = result as u64;
-    ss.pc += 4;
+    }
+    regs_to(ss, &regs);
+}
+
+/// The Linux signal number for a host synchronous fault.
+fn fault_signal(host: libc::c_int) -> u64 {
+    use fwe_abi::signal::*;
+    match host {
+        libc::SIGSEGV => SIGSEGV,
+        libc::SIGBUS => SIGBUS,
+        libc::SIGILL => SIGILL,
+        libc::SIGFPE => SIGFPE,
+        libc::SIGTRAP => SIGTRAP,
+        _ => SIGSEGV,
+    }
 }
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
-    let mc = unsafe { &*(*(ctx as *mut Ucontext)).uc_mcontext };
+    let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+    // SAFETY: `info` is valid for SA_SIGINFO handlers.
+    let addr = unsafe { (*info).si_addr() } as u64;
+
+    // Offer the fault to a guest handler; if one is installed, enter it.
+    let mut regs = regs_from(&mc.ss);
+    let delivered =
+        kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, fault_signal(sig), addr));
+    if delivered {
+        regs_to(&mut mc.ss, &regs);
+        return;
+    }
+
     let tracing = kernel().as_ref().is_some_and(|k| k.tracer.enabled);
     if tracing {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.

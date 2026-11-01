@@ -18,7 +18,7 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [ ] Processes and threads (`clone`, `fork`, `execve`, `wait`)
 - [x] Memory management (`mmap`, `mprotect`, `brk`, and friends)
 - [x] Files and directories, with a Linux root filesystem
-- [ ] Signals
+- [x] Signals
 - [x] Pipes
 - [ ] Dynamic linking with glibc and musl
 - [ ] Hypervisor backend for executables linked below 4 GiB (static non-PIE,

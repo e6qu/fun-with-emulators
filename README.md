@@ -12,14 +12,13 @@ Milestone M0 is done: static Linux arm64 executables (static PIE, and
 ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26.
 
 M1 is in progress. Landed: a root filesystem with the file and directory
-system calls (`openat`, the `stat` family, `getdents64`, `renameat2`,
-symlinks with rootfs containment, and more), and the **dynamic loader**
-(`PT_INTERP` interpreters are loaded from the rootfs and handed control with
-the right auxiliary vector). Next: threads and signal delivery. Running real
-glibc/musl programs end to end also needs the x18 fix, which — together with
-executables linked below 4 GiB — is deferred to the hypervisor backend; run
-`fwe --host-info` to see how the current host treats registers that matter
-to Linux code.
+system calls, the **dynamic loader** (`PT_INTERP` interpreters loaded from
+the rootfs), and **signal delivery** (guest handlers run, with `rt_sigframe`
+build and `rt_sigreturn` restore, for raised and faulting signals). Next:
+threads (`clone`). Running real glibc/musl programs end to end also needs the
+x18 fix, which — together with executables linked below 4 GiB — is deferred
+to the hypervisor backend; run `fwe --host-info` to see how the current host
+treats registers that matter to Linux code.
 
 ## Usage
 

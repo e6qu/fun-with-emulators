@@ -333,6 +333,40 @@ fn page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
 
+/// `movz x8, #139` (rt_sigreturn).
+const MOVZ_X8_139: u32 = 0xd280_1168;
+
+/// Map a one-page `rt_sigreturn` trampoline (`movz x8, #139; svc #0`), with
+/// the `svc` rewritten to a trap like any other guest code.
+fn make_sigreturn_trampoline(platform: &NativePlatform, page: u64) -> Result<u64, Error> {
+    // SAFETY: a fresh writable mapping.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return Err(Error::Load(loader::LoadError::Map(std::io::Error::last_os_error())));
+    }
+    let addr = p as u64;
+    // SAFETY: writing two instruction words into the fresh page.
+    unsafe {
+        (addr as *mut u32).write(MOVZ_X8_139);
+        ((addr + 4) as *mut u32).write(rewrite::SVC0);
+    }
+    platform
+        .prepare(addr, 8, None)
+        .map_err(|e| Error::Unsupported(format!("preparing the sigreturn trampoline: {e}")))?;
+    // SAFETY: making the trampoline executable.
+    unsafe { libc::mprotect(p, page as usize, libc::PROT_READ | libc::PROT_EXEC) };
+    Ok(addr)
+}
+
 fn random16() -> [u8; 16] {
     let mut r = [0u8; 16];
     fwe_kernel::host::fill_random(&mut r);
@@ -494,7 +528,13 @@ fn start(
         ));
     }
 
-    *KERNEL.lock().unwrap() = Some(Kernel::new(platform, page, brk, Some(fs), tracer));
+    // A trampoline used as the return address for signal handlers that have
+    // no sa_restorer: it issues the rt_sigreturn system call.
+    let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
+
+    let mut kernel = Kernel::new(platform, page, brk, Some(fs), tracer);
+    kernel.set_sigreturn_trampoline(sigreturn_tramp);
+    *KERNEL.lock().unwrap() = Some(kernel);
     enter(image.sp, entry)
 }
 

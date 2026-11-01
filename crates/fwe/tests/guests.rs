@@ -14,7 +14,7 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 const ASM_GUESTS: &[&str] =
-    &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin", "fileio"];
+    &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin", "fileio", "sigtest"];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
 /// reserved low 4 GiB.
@@ -166,6 +166,16 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     cmd.args(["-flavor", "gnu"]).args(link_args).arg("-o").arg(&bin).arg(&obj);
     run_checked(&mut cmd);
     bin
+}
+
+/// Signal delivery: a guest installs a SIGUSR1 handler, raises it, and the
+/// handler (returning through fwe's rt_sigreturn trampoline) sets a flag the
+/// program checks before exiting 0.
+#[test]
+fn signal_handler_runs() {
+    for name in ["sigtest", "sigtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
 
 /// The dynamic loader: a PIE executable names an interpreter via PT_INTERP;
