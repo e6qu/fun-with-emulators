@@ -180,6 +180,29 @@ outside the kernel lock like `futex` and the sleeps. Readiness edge cases
 (`EEXIST`/`ENOENT` for redundant `ADD`/`MOD`, and the signal mask) are not yet
 emulated precisely on macOS.
 
+## eventfd and timerfd
+
+`eventfd` and `timerfd` live in `crates/kernel/src/specialfd.rs`. On Linux they
+pass through to the host kernel. macOS has neither, so they are emulated and
+tracked in a process-global registry keyed by descriptor, which `read`, `write`
+and `close` consult:
+
+- **eventfd** is a pipe plus a 64-bit counter. The pipe holds exactly one byte
+  while the counter is non-zero, so the read end — the fd handed to the guest —
+  is readable, and pollable by `kqueue` (hence by our `epoll`), precisely when a
+  read would succeed. `read` returns and clears the counter (or returns 1 and
+  decrements it under `EFD_SEMAPHORE`); `write` adds to it.
+- **timerfd** is a `kqueue` holding one `EVFILT_TIMER`; `read` collects the
+  expiration count with `kevent`, and the kqueue fd is pollable by our `epoll`.
+  Millisecond resolution; a periodic timer's distinct initial `it_value` and
+  the realtime/monotonic clock distinction are not modelled.
+
+`read` and `write` can block, so the backend routes every `read`/`write`
+through the lock-free `blocking_syscall` path first: a consumer blocking under
+the kernel lock while the producer needs that same lock to post would deadlock.
+The registry returns "not mine" for ordinary descriptors, which fall back to the
+normal host `read`/`write`. `signalfd` is not implemented yet.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are

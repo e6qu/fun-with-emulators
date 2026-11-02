@@ -34,7 +34,7 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 - [ ] Networking (sockets, DNS)
 - [ ] Terminals and job control
-- [~] Event APIs (`epoll` done; `eventfd`, `timerfd`, `signalfd` pending)
+- [~] Event APIs (`epoll`, `eventfd`, `timerfd` done; `signalfd` pending)
 - [~] `/proc` and `/sys` (startup files served; directory listing pending)
 - [ ] Users, permissions and ownership
 

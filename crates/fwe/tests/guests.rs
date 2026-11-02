@@ -80,6 +80,8 @@ const ASM_GUESTS: &[&str] = &[
     "forktest",
     "procread",
     "epolltest",
+    "eventfdtest",
+    "timerfdtest",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -241,6 +243,27 @@ fn reads_synthetic_proc() {
 #[test]
 fn epoll_round_trip() {
     for name in ["epolltest", "epolltest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// eventfd: a guest registers a non-blocking eventfd in epoll, confirms it is
+/// not ready at count 0, writes 5, sees epoll report it readable with the
+/// registered data, and reads the counter back as 5. Covers the pipe-backed
+/// counter emulation on macOS and passthrough on Linux.
+#[test]
+fn eventfd_through_epoll() {
+    for name in ["eventfdtest", "eventfdtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// timerfd: a guest arms a one-shot timer, blocks in `read`, and gets at least
+/// one expiration. Covers the kqueue-timer emulation on macOS and passthrough
+/// on Linux.
+#[test]
+fn timerfd_fires() {
+    for name in ["timerfdtest", "timerfdtest-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }
