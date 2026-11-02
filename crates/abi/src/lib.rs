@@ -370,6 +370,8 @@ pub mod ioctl {
     pub const TIOCSWINSZ: u64 = 0x5414;
     pub const TIOCSCTTY: u64 = 0x540e;
     pub const TIOCNOTTY: u64 = 0x5422;
+    pub const TIOCGPTN: u64 = 0x8004_5430;
+    pub const TIOCSPTLCK: u64 = 0x4004_5431;
     pub const FIONREAD: u64 = 0x541b;
     pub const FIONBIO: u64 = 0x5421;
     pub const FIOCLEX: u64 = 0x5451;

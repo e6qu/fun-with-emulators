@@ -201,7 +201,33 @@ and `close` consult:
 through the lock-free `blocking_syscall` path first: a consumer blocking under
 the kernel lock while the producer needs that same lock to post would deadlock.
 The registry returns "not mine" for ordinary descriptors, which fall back to the
-normal host `read`/`write`. `signalfd` is not implemented yet.
+normal host `read`/`write`.
+
+## signalfd
+
+`signalfd` lives in `crates/kernel/src/signalfd.rs`. The guest's signals are
+virtual — the kernel tracks them itself rather than as host signals — so
+`signalfd` is emulated on both hosts rather than delegated. Each signalfd is a
+readiness pipe (so it is pollable by `epoll`) plus a queue of
+`signalfd_siginfo` records and the set of signals it watches. When the guest
+raises a signal that is blocked and some signalfd watches it, the kernel queues
+a record on that descriptor instead of leaving the signal pending; a reaped
+child likewise queues a `SIGCHLD` record. `read` returns the queued records and
+blocks lock-free like the other event descriptors.
+
+## Credentials
+
+The guest has a virtual user and group identity in `crates/kernel/src/creds.rs`,
+independent of the host process. Changing the host process's real credentials
+would be wrong (one host process backs the guest) and would fail unless `fwe`
+ran as root, so `getuid`/`geteuid`/`getgid`/`getegid`, the `set*uid`/`set*gid`
+family (`setresuid`, `setreuid`, `setfsuid` and the group equivalents) and
+`getgroups`/`setgroups` act on this identity with Linux permission semantics.
+The default is root (uid 0), the usual identity inside a container image, so a
+program that drops privileges can do so and cannot regain them. Because the
+identity is virtual, `chown` as root is accepted but does not change host file
+ownership (shadow ownership is not tracked), and `access` under a virtual root
+bypasses the permission bits as Linux root does.
 
 ## Sockets
 
@@ -231,10 +257,14 @@ waiting in `accept` or `recv` does not stall the threads meant to feed it. DNS
 needs no special support: the guest's resolver reads `/etc/resolv.conf` and
 `/etc/hosts` from the rootfs and talks to nameservers over these sockets.
 
-Only `AF_INET`, `AF_INET6` and unnamed `AF_UNIX` (`socketpair`) are handled.
-Pathed `AF_UNIX` sockets (whose addresses would need rooting under the rootfs),
-`SCM_RIGHTS` ancillary data (file-descriptor passing) and `AF_NETLINK` are not
-translated yet.
+`AF_UNIX` is fully handled: socket paths are rooted under the rootfs like every
+other path, and abstract-namespace names (a leading NUL) are mapped to files
+under a per-host temporary directory, since macOS has no abstract namespace.
+`SCM_RIGHTS` ancillary data (file-descriptor passing over `AF_UNIX`) is
+translated too — on macOS the control-message layout differs (`cmsg_len` is
+64-bit on Linux, 32-bit on macOS), so `sendmsg`/`recvmsg` re-encode it. The
+passed descriptors are host descriptors, so they work in the receiver directly.
+`AF_NETLINK` and raw sockets are deferred to M4.
 
 ## Terminals and job control
 
@@ -254,9 +284,12 @@ sessions. A guest "pid" argument of 0 (self) always works, and child pids
 returned by `fork` are host pids, so `setpgid(child, …)` works too; passing a
 guest's virtual `getpid` value for another process does not.
 
-Allocating a new pty (Linux `/dev/ptmx` with `TIOCGPTN`/`TIOCSPTLCK`, versus
-macOS `posix_openpt`/`grantpt`/`ptsname`) is not implemented yet, so a guest
-cannot create its own controlling terminal; it can drive one it is given.
+Pty allocation is handled in `crates/kernel/src/pty.rs`. Opening `/dev/ptmx`
+allocates a master with `posix_openpt`/`grantpt`/`unlockpt` (available on both
+hosts) and remembers a guest-facing slave number; `TIOCGPTN` returns it,
+`TIOCSPTLCK` is accepted, and opening `/dev/pts/<n>` maps that number to the
+host slave device (`/dev/pts/<n>` on Linux, `/dev/ttys<nnn>` on macOS). So a
+guest can allocate and drive its own pty.
 
 ## Translation
 

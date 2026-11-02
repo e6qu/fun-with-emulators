@@ -84,6 +84,8 @@ const ASM_GUESTS: &[&str] = &[
     "timerfdtest",
     "socketpairtest",
     "jobctl",
+    "credtest",
+    "signalfdtest",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -276,6 +278,25 @@ fn timerfd_fires() {
 #[test]
 fn socketpair_message() {
     for name in ["socketpairtest", "socketpairtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// credentials: starting as virtual root, a guest drops to uid 1000, confirms
+/// `getuid`/`geteuid` report it, and confirms it can no longer regain root.
+#[test]
+fn virtual_credentials() {
+    for name in ["credtest", "credtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// signalfd: a guest blocks SIGUSR1, creates a signalfd for it, raises it, and
+/// reads the queued `signalfd_siginfo` back, exercising the virtual-signal to
+/// signalfd path end to end.
+#[test]
+fn signalfd_delivers() {
+    for name in ["signalfdtest", "signalfdtest-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }

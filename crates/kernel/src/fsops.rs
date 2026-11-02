@@ -95,6 +95,15 @@ fn statx_from(s: &libc::stat) -> Statx {
     }
 }
 
+/// If `path` is `/dev/pts/<n>` with a decimal `<n>`, return `n`.
+fn pts_number(path: &[u8]) -> Option<u32> {
+    let rest = path.strip_prefix(b"/dev/pts/")?;
+    if rest.is_empty() || !rest.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(rest).ok()?.parse().ok()
+}
+
 fn major(dev: u64) -> u32 {
     (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff)) as u32
 }
@@ -120,6 +129,13 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_openat(&mut self, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
         // SAFETY: the guest passed a path pointer.
         let path = unsafe { read_cstr(path) };
+        // Pseudo-terminal devices are synthesized, not served from the rootfs.
+        if path == b"/dev/ptmx" {
+            return crate::pty::open_master(flags);
+        }
+        if let Some(n) = pts_number(&path) {
+            return crate::pty::open_slave(n, host::open_flags_to_host(flags));
+        }
         // Synthetic /proc and /sys files take priority over the host rootfs.
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
@@ -169,6 +185,21 @@ impl<P: Platform> Kernel<P> {
             Ok(v) => v,
             Err(e) => return err(e),
         };
+        // A virtual root bypasses the permission bits, as Linux root does: any
+        // existing file is accessible, and X_OK needs only one execute bit set.
+        const X_OK: u64 = 1;
+        if self.creds.euid == 0 {
+            // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: valid dirfd, path and stat out-parameter.
+            if unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, 0) } < 0 {
+                return last_error();
+            }
+            if mode & X_OK != 0 && (st.st_mode & 0o111) == 0 {
+                return err(errno::EACCES);
+            }
+            return 0;
+        }
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         ret(unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode as i32, 0) })
     }
@@ -444,20 +475,12 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: the guest passed a path pointer.
         let path = unsafe { read_cstr(path) };
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        // SAFETY: `name` NUL-terminated; `dir` live.
-        ret(unsafe {
-            libc::fchownat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                uid as libc::uid_t,
-                gid as libc::gid_t,
-                0,
-            )
-        })
+        // Resolve for existence/permission errors, then apply the virtual
+        // ownership policy (ownership is not reflected to the host file).
+        match self.resolve_c(dirfd, &path, follow) {
+            Ok(_) => self.chown_check(uid as u32, gid as u32),
+            Err(e) => err(e),
+        }
     }
 
     pub(crate) fn sys_truncate(&mut self, path: u64, len: u64) -> i64 {

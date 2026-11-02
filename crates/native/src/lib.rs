@@ -605,6 +605,7 @@ fn start(
         options.strace,
     )?;
     fs.set_proc_info(path.as_os_str().as_bytes().to_vec(), cmdline(&arg_bytes), ncpu(), hostname());
+    fwe_kernel::net::set_rootfs(fs.root_host_path());
 
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
