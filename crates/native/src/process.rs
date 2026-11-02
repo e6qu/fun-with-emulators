@@ -82,6 +82,9 @@ pub fn do_execve(regs: &Regs) -> i64 {
 
     k.exec_reset();
     k.brk = out.brk;
+    if let Some(fs) = k.fs.as_mut() {
+        fs.set_proc_info(path.clone(), crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+    }
     let (sp, entry) = (out.sp, out.entry);
     drop(guard);
 

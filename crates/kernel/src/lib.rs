@@ -15,6 +15,7 @@ mod fsops;
 pub mod futex;
 pub mod host;
 mod mm;
+pub mod procfs;
 mod signal;
 mod syscalls;
 pub mod thread;

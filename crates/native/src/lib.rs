@@ -396,6 +396,33 @@ fn random16() -> [u8; 16] {
     r
 }
 
+/// `argv` joined by NUL with a trailing NUL, for `/proc/self/cmdline`.
+pub fn cmdline(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for a in args {
+        out.extend_from_slice(a);
+        out.push(0);
+    }
+    out
+}
+
+/// Online CPU count.
+pub fn ncpu() -> u32 {
+    // SAFETY: plain host call.
+    (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as u32
+}
+
+/// The host name, without a trailing NUL.
+pub fn hostname() -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid buffer of its length.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return b"localhost".to_vec();
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    buf[..end].to_vec()
+}
+
 /// Load the Linux executable at `path` and run it with `args` (including
 /// `argv[0]`) and `env`. Returns only on failure to start the program.
 pub fn run(path: &Path, args: &[OsString], env: &[OsString], options: &Options) -> Error {
@@ -561,7 +588,7 @@ fn start(
 
     // The root filesystem; also used to find the dynamic linker.
     let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-    let fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
+    let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
         Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
     })?;
 
@@ -577,6 +604,7 @@ fn start(
         page,
         options.strace,
     )?;
+    fs.set_proc_info(path.as_os_str().as_bytes().to_vec(), cmdline(&arg_bytes), ncpu(), hostname());
 
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.

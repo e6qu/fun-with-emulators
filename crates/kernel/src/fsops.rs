@@ -120,9 +120,27 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_openat(&mut self, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
         // SAFETY: the guest passed a path pointer.
         let path = unsafe { read_cstr(path) };
+        // Synthetic /proc and /sys files take priority over the host rootfs.
+        if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
+            return match entry {
+                crate::procfs::Entry::File(content) => anon_fd(&content),
+                crate::procfs::Entry::Symlink(target) => {
+                    if flags & fcntl::O_NOFOLLOW != 0 {
+                        return err(errno::ELOOP);
+                    }
+                    // Follow the link through the normal path.
+                    self.sys_openat_bytes(dirfd, &target, flags, mode)
+                }
+                crate::procfs::Entry::Missing => err(errno::ENOENT),
+            };
+        }
+        self.sys_openat_bytes(dirfd, &path, flags, mode)
+    }
+
+    fn sys_openat_bytes(&mut self, dirfd: u64, path: &[u8], flags: u64, mode: u64) -> i64 {
         let follow_final = flags & fcntl::O_NOFOLLOW == 0
             && flags & (fcntl::O_CREAT | fcntl::O_EXCL) != fcntl::O_CREAT | fcntl::O_EXCL;
-        let resolved = match self.fs().resolve(dirfd as i32, &path, follow_final) {
+        let resolved = match self.fs().resolve(dirfd as i32, path, follow_final) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -162,7 +180,43 @@ impl<P: Platform> Kernel<P> {
             return self.sys_fstat(dirfd, buf);
         }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
+        if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
+            use fwe_abi::stat as st;
+            let s = match entry {
+                crate::procfs::Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
+                crate::procfs::Entry::Symlink(_) if follow => {
+                    // /proc/self/exe and the like follow to the real target.
+                    let target = match self.fs().synthetic(dirfd as i32, &path) {
+                        Some(crate::procfs::Entry::Symlink(t)) => t,
+                        _ => return err(errno::ENOENT),
+                    };
+                    return self.stat_path(dirfd, &target, buf, flags);
+                }
+                crate::procfs::Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
+                crate::procfs::Entry::Missing => return err(errno::ENOENT),
+            };
+            // SAFETY: the guest passed a buffer for a `struct stat`.
+            unsafe { write(buf, s) };
+            return 0;
+        }
         let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        match stat_at(dir.as_raw_fd(), &name) {
+            Ok(s) => {
+                // SAFETY: the guest passed a buffer for a `struct stat`.
+                unsafe { write(buf, stat_to_linux(&s)) };
+                0
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    /// `stat` a path given as bytes, following a final symlink per `flags`.
+    fn stat_path(&mut self, dirfd: u64, path: &[u8], buf: u64, flags: u64) -> i64 {
+        let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
+        let (dir, name) = match self.resolve_c(dirfd, path, follow) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
@@ -225,6 +279,18 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
         // SAFETY: the guest passed a path pointer.
         let path = unsafe { read_cstr(path) };
+        if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
+            return match entry {
+                crate::procfs::Entry::Symlink(target) => {
+                    let n = target.len().min(size as usize);
+                    // SAFETY: the guest passed a buffer of `size` bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n) };
+                    n as i64
+                }
+                crate::procfs::Entry::File(_) => err(errno::EINVAL),
+                crate::procfs::Entry::Missing => err(errno::ENOENT),
+            };
+        }
         let (dir, name) = match self.resolve_c(dirfd, &path, false) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -621,6 +687,46 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
     written as i64
 }
 
+/// Build a synthetic `struct stat` for a `/proc` or `/sys` entry.
+fn synth_stat(mode: u32, size: u64) -> Stat {
+    Stat {
+        st_mode: mode,
+        st_nlink: 1,
+        st_size: size as i64,
+        st_blksize: 4096,
+        st_blocks: size.div_ceil(512) as i64,
+        ..Stat::default()
+    }
+}
+
+/// An anonymous, seekable, readable fd preloaded with `content`, used to serve
+/// a synthetic `/proc` or `/sys` file. Backed by an immediately-unlinked temp
+/// file so it works on both Linux and macOS.
+fn anon_fd(content: &[u8]) -> i64 {
+    let mut template = *b"/tmp/fwe-proc-XXXXXX\0";
+    // SAFETY: `template` is a NUL-terminated mutable buffer for mkstemp.
+    let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+    if fd < 0 {
+        return last_error();
+    }
+    // SAFETY: `template` is the NUL-terminated name just created.
+    unsafe { libc::unlink(template.as_ptr().cast()) };
+    let mut off = 0usize;
+    while off < content.len() {
+        // SAFETY: writing the remaining content to the temp fd.
+        let n = unsafe { libc::write(fd, content[off..].as_ptr().cast(), content.len() - off) };
+        if n <= 0 {
+            // SAFETY: closing the fd we created.
+            unsafe { libc::close(fd) };
+            return last_error();
+        }
+        off += n as usize;
+    }
+    // SAFETY: rewinding to the start for the guest's reads.
+    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+    fd as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +985,60 @@ mod tests {
             ),
             err(errno::ENOENT)
         );
+    }
+
+    #[test]
+    fn synthetic_proc_and_sys() {
+        use fwe_abi::stat as st;
+        let (mut k, _d) = rooted();
+        k.fs.as_mut().unwrap().set_proc_info(
+            b"/bin/prog".to_vec(),
+            b"prog\0-x\0".to_vec(),
+            4,
+            b"host".to_vec(),
+        );
+
+        // Read a known /proc file.
+        let fd = open(&mut k, &cstr("/proc/sys/kernel/ostype"), 0, 0);
+        assert!(fd >= 0, "open: {fd}");
+        let mut buf = [0u8; 64];
+        let n = k.syscall(nr::READ, [fd as u64, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
+        assert_eq!(&buf[..n as usize], b"Linux\n");
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+
+        // cmdline round-trips the NUL-joined argv.
+        let fd = open(&mut k, &cstr("/proc/self/cmdline"), 0, 0);
+        assert!(fd >= 0);
+        let n = k.syscall(nr::READ, [fd as u64, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
+        assert_eq!(&buf[..n as usize], b"prog\0-x\0");
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+
+        // /proc/self/exe is a symlink to the program.
+        let n = k.syscall(
+            nr::READLINKAT,
+            [AT_FDCWD, cstr("/proc/self/exe").as_ptr() as u64, buf.as_mut_ptr() as u64, 64, 0, 0],
+        );
+        assert_eq!(&buf[..n as usize], b"/bin/prog");
+
+        // A /proc file stats as a regular file; an unknown one is ENOENT.
+        let mut stbuf = Stat::default();
+        assert_eq!(
+            k.syscall(
+                nr::NEWFSTATAT,
+                [
+                    AT_FDCWD,
+                    cstr("/proc/cpuinfo").as_ptr() as u64,
+                    &mut stbuf as *mut _ as u64,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            0
+        );
+        assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
+        assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
     }
 }
