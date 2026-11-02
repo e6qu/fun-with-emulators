@@ -45,12 +45,18 @@ const PUSH: u32 = 0xf81f_0fe0;
 const POP: u32 = 0xf841_07e0;
 /// `b <label>`
 const B: u32 = 0x1400_0000;
+/// `br xN` (indirect branch); `| (n << 5)`.
+const BR: u32 = 0xd61f_0000;
+/// `movz xN, #imm16` base; `| (hw << 21) | (imm16 << 5) | n`.
+const MOVZ: u32 = 0xd280_0000;
+/// `movk xN, #imm16` base.
+const MOVK: u32 = 0xf280_0000;
 
 /// Largest stub, in instructions. The `x18` branch stub is the biggest: save
 /// two scratch registers, load the TSD base and `x18`, test it, and restore the
 /// scratch registers down each of the taken and not-taken paths before a
 /// full-range branch.
-pub const STUB_WORDS: usize = 12;
+pub const STUB_WORDS: usize = 14;
 
 /// Reach of a `b` instruction.
 pub const BRANCH_RANGE: u64 = 128 << 20;
@@ -66,10 +72,22 @@ pub enum Site {
     X18 { insn: u32 },
 }
 
-/// Whether `insn` names `x18` in a form this pass can rewrite to a stub.
+/// Whether `insn` names `x18` in an operand position this pass can rewrite by
+/// substituting a scratch register.
 fn rewritable_x18(insn: u32) -> bool {
     crate::decode::operands(insn)
         .is_some_and(|ops| ops.iter().any(|f| (insn >> f.shift) & 0x1f == 18))
+}
+
+/// Whether `insn` is any instruction naming `x18` that this pass rewrites —
+/// operand substitution, a PC-relative form, a branch, or an indirect branch.
+fn x18_site(insn: u32) -> bool {
+    use crate::decode::*;
+    rewritable_x18(insn)
+        || x18_branch(insn)
+        || x18_adr(insn).is_some()
+        || x18_ldr_literal(insn)
+        || x18_indirect(insn).is_some()
 }
 
 /// Result of rewriting a block of code in place.
@@ -112,7 +130,7 @@ pub fn patch(code: &mut [u8]) -> Patched {
         } else if insn & !RT_MASK == MSR_TPIDR {
             out.sites.push((i as u64 * 4, Site::WriteThreadPointer { rt: insn & RT_MASK }));
             None
-        } else if rewritable_x18(insn) || crate::decode::x18_branch(insn) {
+        } else if x18_site(insn) {
             out.sites.push((i as u64 * 4, Site::X18 { insn }));
             None
         } else {
@@ -156,8 +174,7 @@ pub fn count_sites(code: &[u8]) -> usize {
         .filter(|&i| {
             (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31)
                 || i & !RT_MASK == MSR_TPIDR
-                || rewritable_x18(i)
-                || crate::decode::x18_branch(i)
+                || x18_site(i)
         })
         .count()
 }
@@ -197,10 +214,22 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
                 POP | s,
             ]
         }
-        // A compare/test branch that reads x18 builds its own complete stub,
-        // including its outgoing branches.
+        // An indirect branch through x18 builds a complete, self-terminating
+        // stub (it ends in `br`), so it is returned directly.
+        Site::X18 { insn } if crate::decode::x18_indirect(insn).is_some() => {
+            return x18_indirect_stub(insn, imm(x18_slot), ret);
+        }
+        // A compare/test branch that reads x18 also builds its own complete
+        // stub, including its outgoing branches.
         Site::X18 { insn } if crate::decode::x18_branch(insn) => {
             return x18_branch_stub(insn, imm(x18_slot), stub, ret);
+        }
+        // PC-relative forms materialize the value computed from the original pc.
+        Site::X18 { insn } if crate::decode::x18_adr(insn).is_some() => {
+            x18_adr_stub(insn, imm(x18_slot), ret)
+        }
+        Site::X18 { insn } if crate::decode::x18_ldr_literal(insn) => {
+            x18_ldr_literal_stub(insn, imm(x18_slot), ret)
         }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
     };
@@ -247,6 +276,98 @@ fn x18_branch_stub(insn: u32, imm: u32, stub: u64, ret: u64) -> Vec<u32> {
         POP | s1,                                                    // 10: restore x0
         branch(at(11), target).expect("branch target within range"), // 11
     ]
+}
+
+/// Instructions that load the 64-bit `val` into GPR `reg` (`movz` + three
+/// `movk`, fixed length).
+fn materialize(reg: u32, val: u64) -> [u32; 4] {
+    let h = |i: u32| (((val >> (16 * i)) & 0xffff) as u32) << 5;
+    [
+        MOVZ | h(0) | reg,
+        MOVK | (1 << 21) | h(1) | reg,
+        MOVK | (2 << 21) | h(2) | reg,
+        MOVK | (3 << 21) | h(3) | reg,
+    ]
+}
+
+/// Stub for `adr`/`adrp` writing `x18`: compute the value from the *original*
+/// pc, materialize it into a scratch, and store it to the slot. `imm` is the
+/// slot `str` immediate.
+fn x18_adr_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
+    let site = ret.wrapping_sub(4);
+    let immlo = (insn >> 29) & 0b11;
+    let immhi = (insn >> 5) & 0x7_ffff;
+    let imm21 = (((immhi << 2) | immlo) as i64) << 43 >> 43; // sign-extend 21 bits
+    let target = if (insn >> 31) & 1 == 1 {
+        (site & !0xfff).wrapping_add((imm21 << 12) as u64) // adrp
+    } else {
+        site.wrapping_add(imm21 as u64) // adr
+    };
+    let (s1, s2) = (0u32, 1u32); // adr/adrp name only Rd = x18
+    let m = materialize(s1, target);
+    vec![
+        PUSH | s1,
+        PUSH | s2,
+        MRS_TPIDRRO | s2,
+        AND_NOT7 | (s2 << 5) | s2,
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        STR_UIMM | imm | (s2 << 5) | s1,
+        POP | s2,
+        POP | s1,
+    ]
+}
+
+/// Stub for a general-purpose `ldr`-literal into `x18`: materialize the literal
+/// address (from the original pc), load from it, and store to the slot.
+fn x18_ldr_literal_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
+    let site = ret.wrapping_sub(4);
+    let imm19 = (((insn >> 5) & 0x7_ffff) as i64) << 45 >> 45;
+    let lit = site.wrapping_add((imm19 * 4) as u64);
+    let (s1, s2) = (0u32, 1u32);
+    let m = materialize(s1, lit);
+    // opc: 00 = ldr w (zero-extend), 01 = ldr x, 10 = ldrsw.
+    let load = match (insn >> 30) & 0b11 {
+        0b01 => LDR_UIMM,    // ldr x(s1), [s1]
+        0b10 => 0xb980_0000, // ldrsw x(s1), [s1]
+        _ => 0xb940_0000,    // ldr w(s1), [s1]
+    } | (s1 << 5)
+        | s1;
+    vec![
+        PUSH | s1,
+        PUSH | s2,
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        load,
+        MRS_TPIDRRO | s2,
+        AND_NOT7 | (s2 << 5) | s2,
+        STR_UIMM | imm | (s2 << 5) | s1,
+        POP | s2,
+        POP | s1,
+    ]
+}
+
+/// Stub for an indirect branch (`br`/`blr`/`ret`) through `x18`. Loads the
+/// target from the slot into `x16` and jumps; `x16`/`x17` are the
+/// intra-procedure-call scratch registers, dead at any branch, so no save is
+/// needed. For `blr` the link register is set to the instruction after the
+/// original branch. Self-terminating (ends in `br`).
+fn x18_indirect_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
+    let sets_link = crate::decode::x18_indirect(insn) == Some(true);
+    let mut v = vec![
+        MRS_TPIDRRO | 17,
+        AND_NOT7 | (17 << 5) | 17,
+        LDR_UIMM | imm | (17 << 5) | 16, // x16 = x18 (the target)
+    ];
+    if sets_link {
+        v.extend(materialize(30, ret)); // lr = site + 4
+    }
+    v.push(BR | (16 << 5)); // br x16
+    v
 }
 
 /// Body of the stub for an `x18`-naming instruction (without the final branch
@@ -436,6 +557,48 @@ mod tests {
     }
 
     #[test]
+    fn x18_adr_stub_materializes_value() {
+        // adr x18, . at site 0x1000 -> target 0x1000. s1=x0, s2=x1.
+        let s = stub(Site::X18 { insn: 0x10000012 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe0, // str x0, [sp, #-16]!
+                0xf81f_0fe1, // str x1, [sp, #-16]!
+                0xd53b_d061, // mrs x1, tpidrro_el0
+                0x927d_f021, // and x1, x1, #~7
+                0xd282_0000, // movz x0, #0x1000
+                0xf2a0_0000, // movk x0, #0, lsl #16
+                0xf2c0_0000, // movk x0, #0, lsl #32
+                0xf2e0_0000, // movk x0, #0, lsl #48
+                0xf900_0c20, // str x0, [x1, #24]
+                0xf841_07e1, // ldr x1, [sp], #16
+                0xf841_07e0, // ldr x0, [sp], #16
+                branch(0x2000 + 11 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn x18_indirect_blr_stub() {
+        // blr x18 at site 0x1000: target from slot into x16, lr = 0x1004, br x16.
+        let s = stub(Site::X18 { insn: 0xd63f0240 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xd53b_d071, // mrs x17, tpidrro_el0
+                0x927d_f231, // and x17, x17, #~7
+                0xf940_0e30, // ldr x16, [x17, #24]
+                0xd282_009e, // movz x30, #0x1004
+                0xf2a0_001e, // movk x30, #0, lsl #16
+                0xf2c0_001e, // movk x30, #0, lsl #32
+                0xf2e0_001e, // movk x30, #0, lsl #48
+                0xd61f_0200, // br x16
+            ]
+        );
+    }
+
+    #[test]
     fn x18_compare_branch_stub() {
         // cbnz x18, #8 at site 0x1000 (target 0x1008). s1=x0, s2=x1.
         let s = stub(Site::X18 { insn: 0xb5000052 }, 0, 24, 0x2000, 0x1004);
@@ -544,14 +707,15 @@ mod tests {
     #[test]
     fn x18_sites_and_deferrals_counted() {
         let mut code = words(&[
-            0xd2830312, // movz x18, #0x1818  -> rewritable site
-            0xaa1203ea, // mov x10, x18       -> rewritable site
-            0xf9400012, // ldr x18, [x0]      -> rewritable site (load/store)
-            0x90000012, // adrp x18, .        -> deferred (PC-relative)
-            0xd2800000, // movz x0, #0        -> untouched
+            0xd2830312, // movz x18, #0x1818   -> rewritable site
+            0xaa1203ea, // mov x10, x18        -> rewritable site
+            0xf9400012, // ldr x18, [x0]       -> rewritable site (load/store)
+            0x90000012, // adrp x18, .         -> site (PC-relative)
+            0xf8010ff2, // str x18, [sp, #16]! -> deferred (sp writeback)
+            0xd2800000, // movz x0, #0         -> untouched
         ]);
         let p = patch(&mut code);
-        assert_eq!(p.sites.len(), 3);
+        assert_eq!(p.sites.len(), 4);
         assert_eq!(p.x18_deferred, 1);
         assert!(matches!(p.sites[0].1, Site::X18 { insn: 0xd2830312 }));
     }

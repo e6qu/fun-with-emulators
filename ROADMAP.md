@@ -30,9 +30,10 @@ See [PLAN.md](PLAN.md) for the overall plan.
   classes and all the load/store forms (unsigned/unscaled/register-offset/
   pre-post-index/pair, general-purpose and SIMD base) are handled, with stack
   spills adjusted for the stub's push and literal pools protected from the
-  scan — enough to run a compiled Rust/musl binary unmodified. PC-relative
-  forms, branches through `x18`, and recursive-descent code discovery remain.
-  This
+  scan, as are the PC-relative forms (`adr`/`adrp`/`ldr`-literal) and the
+  compare/test/indirect branches through `x18` — enough to run a compiled
+  Rust/musl binary unmodified. Only `sp`-writeback spills and recursive-descent
+  code discovery remain. This
   keeps execution in-process at native speed; **no hypervisor or VM is used**
   (that is a non-goal of this project — see PLAN.md).
 - [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS
