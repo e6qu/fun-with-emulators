@@ -74,9 +74,13 @@ rewrites the special instructions — still in-process, with no VM.
   *except* `x18` across preemption, an ordinary scratch register is safe.
   `crates/native/src/decode.rs` decides which instructions this covers: the
   register-only data-processing classes (moves, logical and add/sub, bitfield,
-  extract, conditional select/compare, one-/two-/three-source) and load/store
-  register with an unsigned immediate offset, including an `sp` base — a stack
-  spill of `x18`. For an `sp` base the stub adds the 32
+  extract, conditional select/compare, one-/two-/three-source) and all the
+  load/store forms — unsigned immediate, unscaled, register offset, pre/post
+  index, and pair — for both general-purpose and (for the base register) SIMD
+  variants. An `sp` base, a stack spill of `x18`, is handled by bumping the
+  access offset by the 32 bytes the stub pushes (`sp_fixup`), in whichever
+  immediate the addressing form uses; writeback onto `sp` and register-offset
+  onto `sp` cannot be compensated and are deferred. For an `sp` base the stub adds the 32
   bytes it pushed to the access's immediate so it still reaches the caller's
   slot. Pair, pre/post-index and register-offset loads, PC-relative forms,
   branches, and `sp` forms of the data-processing classes are left for a later
@@ -327,14 +331,14 @@ These are tracked on the roadmap:
 - Floating-point/vector registers are not saved across a signal handler.
 - Executables linked below 4 GiB are rejected for now; load-time relocation
   (see above) is the planned fix, not a VM.
-- Guest uses of `x18` in the register-only data-processing classes and
-  unsigned-immediate loads/stores (including stack spills) are rewritten to a
-  per-thread slot (see above) and survive preemption; pair/pre-index/
-  register-offset/unscaled loads, SIMD loads that use `x18` as a base,
-  PC-relative forms and branches that name `x18` are not rewritten yet (an
-  analysis of a compiled musl binary enumerated exactly these remaining
-  forms). Extending the pass to them, plus recursive-descent code discovery,
-  is what remains before unmodified compiled binaries run.
+- Guest uses of `x18` across the data-processing and load/store classes are
+  rewritten to a per-thread slot (see above) and survive preemption, which is
+  enough to run a compiled Rust/musl binary unmodified. Still not rewritten:
+  PC-relative forms (`adr`/`adrp`/`ldr`-literal into `x18`), branches through
+  `x18` (`br`/`blr x18`), and `sp` writeback/register-offset loads — a program
+  using one of those for live `x18` state could still lose it, and
+  recursive-descent code discovery (versus the current scan plus literal-pool
+  exclusion) is the remaining general-correctness step.
 - The rewrite pass scans every aligned word of an executable segment, so a
   data word that happens to encode a rewritten instruction is rewritten too.
   Literal pools (the targets of `ldr`-literal) are detected and skipped, and

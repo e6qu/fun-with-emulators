@@ -226,17 +226,19 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let reads = ops.iter().any(|f| field_reg(f) == 18 && f.read);
     let writes = ops.iter().any(|f| field_reg(f) == 18 && f.write);
 
-    // The instruction with every x18 operand replaced by s1.
-    let mut rewritten = insn;
+    // Start from the instruction with any `sp`-relative offset bumped past the
+    // 32 bytes the stub pushes, then replace every x18 operand with s1. The
+    // offset fix-up touches only immediate bits, the substitution only the
+    // register fields that hold x18 in the original instruction, so the two are
+    // independent.
+    let mut rewritten = match crate::decode::sp_fixup(insn) {
+        crate::decode::SpFixup::Adjusted(a) => a,
+        _ => insn,
+    };
     for f in &ops {
         if field_reg(f) == 18 {
             rewritten = (rewritten & !(0x1f << f.shift)) | (s1 << f.shift);
         }
-    }
-    // An `sp`-based load/store must reach past the 32 bytes the stub pushes.
-    if let Some(delta) = crate::decode::sp_adjust(insn) {
-        let imm12 = ((insn >> 10) & 0xfff) + delta;
-        rewritten = (rewritten & !(0xfff << 10)) | (imm12 << 10);
     }
 
     let mut words = vec![PUSH | s1, PUSH | s2, MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2];
