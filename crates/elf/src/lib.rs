@@ -26,6 +26,8 @@ pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
 
+/// Section occupies memory during execution (`SHF_ALLOC`).
+pub const SHF_ALLOC: u64 = 2;
 /// Section holds executable machine instructions (`SHF_EXECINSTR`).
 pub const SHF_EXECINSTR: u64 = 4;
 
@@ -248,14 +250,26 @@ impl<'a> Elf<'a> {
         if let Some(sections) = self.exec_sections()
             && !sections.is_empty()
         {
-            return sections;
+            return sections.into_iter().map(|s| (s.addr, s.size)).collect();
         }
         self.loads().filter(|ph| ph.executable()).map(|ph| (ph.vaddr, ph.filesz)).collect()
     }
 
-    /// The allocated `SHF_EXECINSTR` sections as `(vaddr, size)`, or `None`
-    /// when the section header table is absent or unreadable.
-    fn exec_sections(&self) -> Option<Vec<(u64, u64)>> {
+    /// File-offset ranges `(offset, size)` of the executable sections, for a
+    /// mapping made straight from the file (`mmap` with `PROT_EXEC`), where
+    /// positions are file offsets rather than virtual addresses. `None` when
+    /// there are no section headers, so the caller falls back to translating
+    /// the whole mapped region. The dynamic linker maps a shared library's
+    /// code segment this way, and for a library whose code segment also holds
+    /// its symbol and string tables (as glibc's `libc.so.6` does) this keeps
+    /// the rewrite off those tables.
+    pub fn exec_file_ranges(&self) -> Option<Vec<(u64, u64)>> {
+        self.exec_sections().map(|s| s.into_iter().map(|s| (s.offset, s.size)).collect())
+    }
+
+    /// The allocated `SHF_EXECINSTR` sections, or `None` when the section
+    /// header table is absent or unreadable.
+    fn exec_sections(&self) -> Option<Vec<Section>> {
         let d = self.data;
         if d.len() < EHDR_SIZE {
             return None;
@@ -270,18 +284,26 @@ impl<'a> Elf<'a> {
         if table > d.len() as u64 {
             return None;
         }
-        let mut ranges = Vec::new();
+        let mut sections = Vec::new();
         for i in 0..shnum {
             let o = shoff as usize + i * shentsize;
             let sh_flags = u64_at(d, o + 8);
             let sh_addr = u64_at(d, o + 16);
+            let sh_offset = u64_at(d, o + 24);
             let sh_size = u64_at(d, o + 32);
-            if sh_flags & SHF_EXECINSTR != 0 && sh_addr != 0 && sh_size != 0 {
-                ranges.push((sh_addr, sh_size));
+            if sh_flags & (SHF_ALLOC | SHF_EXECINSTR) == SHF_ALLOC | SHF_EXECINSTR && sh_size != 0 {
+                sections.push(Section { offset: sh_offset, addr: sh_addr, size: sh_size });
             }
         }
-        Some(ranges)
+        Some(sections)
     }
+}
+
+/// One `SHF_EXECINSTR` section: its file offset, virtual address and size.
+struct Section {
+    offset: u64,
+    addr: u64,
+    size: u64,
 }
 
 /// Host page protections, as a combination of `PF_*` bits.
@@ -484,17 +506,18 @@ mod tests {
     }
 
     /// Attach a section header table to an image: each entry is
-    /// `(sh_flags, sh_addr, sh_size)`. Only the fields `exec_sections` reads
-    /// are written.
-    fn with_sections(mut d: Vec<u8>, shoff: usize, sections: &[(u64, u64, u64)]) -> Vec<u8> {
+    /// `(sh_flags, sh_offset, sh_addr, sh_size)`. Only the fields
+    /// `exec_sections` reads are written.
+    fn with_sections(mut d: Vec<u8>, shoff: usize, sections: &[(u64, u64, u64, u64)]) -> Vec<u8> {
         let end = shoff + sections.len() * SHDR_SIZE;
         if d.len() < end {
             d.resize(end, 0);
         }
-        for (i, &(flags, addr, size)) in sections.iter().enumerate() {
+        for (i, &(flags, offset, addr, size)) in sections.iter().enumerate() {
             let o = shoff + i * SHDR_SIZE;
             d[o + 8..o + 16].copy_from_slice(&flags.to_le_bytes());
             d[o + 16..o + 24].copy_from_slice(&addr.to_le_bytes());
+            d[o + 24..o + 32].copy_from_slice(&offset.to_le_bytes());
             d[o + 32..o + 40].copy_from_slice(&size.to_le_bytes());
         }
         d[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
@@ -503,29 +526,44 @@ mod tests {
         d
     }
 
-    /// With section headers, only the `SHF_EXECINSTR` sections are translated,
-    /// so data (symbol/string/hash tables) sharing an executable segment with
-    /// the code — as in musl's `ld-musl` — is left untouched.
-    #[test]
-    fn exec_ranges_restricts_to_executable_sections() {
-        // One R-X segment [0, 0x400); the tables live at [0, 0x200) and the
-        // code (.text) at [0x200, 0x300), all inside that one segment.
-        let d = image(ET_DYN, &[load(PF_R | PF_X, 0, 0, 0x400, 0x400)], 0x800);
-        let d = with_sections(
+    /// One R-X segment holding tables (ALLOC) ahead of the code
+    /// (ALLOC|EXECINSTR), with distinct file offsets and virtual addresses, as
+    /// in a dynamic linker or glibc's `libc.so.6`.
+    fn packed_code_image() -> Vec<u8> {
+        let d = image(ET_DYN, &[load(PF_R | PF_X, 0, 0x10000, 0x400, 0x400)], 0x800);
+        with_sections(
             d,
             0x400,
             &[
-                (0, 0, 0),                         // null section
-                (2, 0x0, 0x200),                   // ALLOC data (e.g. .dynstr)
-                (SHF_EXECINSTR | 2, 0x200, 0x100), // ALLOC|EXECINSTR (.text)
+                (0, 0, 0, 0),                                       // null section
+                (SHF_ALLOC, 0x0, 0x10000, 0x200),                   // data (e.g. .dynstr)
+                (SHF_ALLOC | SHF_EXECINSTR, 0x200, 0x10200, 0x100), // .text
+                (SHF_EXECINSTR, 0x300, 0, 0x40),                    // non-ALLOC code (e.g. debug)
             ],
-        );
+        )
+    }
+
+    /// With section headers, only the allocated `SHF_EXECINSTR` sections are
+    /// translated (by virtual address), so data sharing an executable segment
+    /// with the code — as in musl's `ld-musl` — is left untouched.
+    #[test]
+    fn exec_ranges_restricts_to_executable_sections() {
+        let d = packed_code_image();
         let elf = Elf::parse(&d).unwrap();
-        assert_eq!(elf.exec_ranges(), vec![(0x200, 0x100)]);
+        assert_eq!(elf.exec_ranges(), vec![(0x10200, 0x100)]);
+    }
+
+    /// For a mapping made from the file, the same sections are reported by
+    /// file offset instead of virtual address.
+    #[test]
+    fn exec_file_ranges_reports_file_offsets() {
+        let d = packed_code_image();
+        let elf = Elf::parse(&d).unwrap();
+        assert_eq!(elf.exec_file_ranges(), Some(vec![(0x200, 0x100)]));
     }
 
     /// With no section headers (fully stripped), the whole executable load
-    /// segments are translated.
+    /// segments are translated, and the file-offset query signals a fallback.
     #[test]
     fn exec_ranges_falls_back_without_sections() {
         let d = image(
@@ -538,5 +576,6 @@ mod tests {
         );
         let elf = Elf::parse(&d).unwrap();
         assert_eq!(elf.exec_ranges(), vec![(0, 0x200)]);
+        assert_eq!(elf.exec_file_ranges(), None);
     }
 }

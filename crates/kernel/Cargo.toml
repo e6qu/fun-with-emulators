@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 fwe-abi.workspace = true
+fwe-elf.workspace = true
 libc.workspace = true

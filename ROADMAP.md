@@ -21,16 +21,18 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [x] Files and directories, with a Linux root filesystem
 - [x] Signals
 - [x] Pipes
-- [~] Dynamic linking with glibc and musl: musl works end to end — the loader
+- [x] Dynamic linking with glibc and musl: both work end to end. The loader
   maps the program and the interpreter named in `PT_INTERP`, hands off at the
   interpreter's entry with `AT_BASE`/`AT_ENTRY`/`AT_PHDR` set, and the real
-  `ld-musl-aarch64.so.1` self-relocates, resolves the program's relocations
-  against the shared libc, sets up the thread pointer and starts it. Libraries
-  the linker maps at run time are translated through the `mmap`/`mprotect`
-  `PROT_EXEC` path, the same as the initial image. End-to-end tests run genuine
-  dynamic binaries (a minimal `_start` and a full crt/`__libc_start_main`/stdio
-  program) against a vendored musl build. glibc (needed for a Debian rootfs) is
-  next.
+  dynamic linker self-relocates, resolves the program's relocations against the
+  shared libc, sets up the thread pointer and starts it. glibc's linker is a
+  separate object from `libc.so.6` and maps it at run time; that mapping goes
+  through the `mmap` `PROT_EXEC` path, which translates only the file's
+  executable sections so the symbol and string tables sharing `libc.so.6`'s
+  code segment are left intact. End-to-end tests run genuine dynamic binaries
+  against vendored musl and glibc builds: a minimal `_start`, a `_exit`-only
+  program that forces the glibc shared-libc mapping, and a full
+  crt/`__libc_start_main`/stdio program.
 - [~] Binary translation of `x18` (and the other registers macOS treats
   specially): macOS clears `x18` on every exception return — including
   involuntary preemption, where the custom x18 ABI was observed being dropped —

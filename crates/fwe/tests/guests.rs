@@ -239,28 +239,51 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     bin
 }
 
-/// The vendored musl runtime (see `guests/musl/README.md`): the dynamic
-/// linker / shared libc and the C-runtime startup objects.
-fn musl_lib() -> PathBuf {
-    repo().join("guests/musl/lib")
+/// A vendored real libc the dynamic C guests are built and run against.
+#[derive(Clone, Copy)]
+enum Libc {
+    /// musl: the dynamic linker is itself the shared libc, one self-contained
+    /// file (`guests/musl`).
+    Musl,
+    /// glibc: a separate dynamic linker and shared libc, so the linker maps
+    /// `libc.so.6` itself at run time (`guests/glibc`).
+    Glibc,
 }
 
-/// The musl dynamic linker, which is also the shared libc. Used both to link
-/// the dynamic C guests and, copied into a root filesystem, as the interpreter
-/// they load at run time.
-fn musl_ld() -> PathBuf {
-    musl_lib().join("ld-musl-aarch64.so.1")
+impl Libc {
+    fn lib_dir(self) -> PathBuf {
+        repo().join(match self {
+            Libc::Musl => "guests/musl/lib",
+            Libc::Glibc => "guests/glibc/lib",
+        })
+    }
+
+    /// The interpreter path the guest names via PT_INTERP.
+    fn interp(self) -> &'static str {
+        match self {
+            Libc::Musl => "/lib/ld-musl-aarch64.so.1",
+            Libc::Glibc => "/lib/ld-linux-aarch64.so.1",
+        }
+    }
+
+    /// The shared libc object to link the guests against.
+    fn libc_so(self) -> PathBuf {
+        self.lib_dir().join(match self {
+            Libc::Musl => "ld-musl-aarch64.so.1",
+            Libc::Glibc => "libc.so.6",
+        })
+    }
 }
 
-/// Build one C guest and link it as a dynamic PIE against the real musl shared
-/// libc. With `crt`, musl's C-runtime startup objects are linked in (for a
-/// guest with a normal `main`); without them the guest provides its own
-/// `_start`. The guest is compiled freestanding with no host headers, like the
-/// assembly guests, so only a bare cross `clang` is needed.
-fn build_c_dynamic(name: &str, crt: bool) -> PathBuf {
+/// Build one C guest and link it as a dynamic PIE against the given real libc.
+/// With `crt`, the libc's C-runtime startup objects are linked in (for a guest
+/// with a normal `main`); without them the guest provides its own `_start`.
+/// The guest is compiled freestanding with no host headers, like the assembly
+/// guests, so only a bare cross `clang` is needed.
+fn build_c_dynamic(name: &str, libc: Libc, crt: bool) -> PathBuf {
     let out = out_dir().join("c");
     std::fs::create_dir_all(&out).unwrap();
-    let obj = out.join(format!("{name}.o"));
+    let obj = out.join(format!("{name}-{}.o", name_suffix(libc)));
     run_checked(
         Command::new("clang")
             .args([
@@ -275,32 +298,59 @@ fn build_c_dynamic(name: &str, crt: bool) -> PathBuf {
             .arg(&obj)
             .arg(repo().join("guests/c").join(format!("{name}.c"))),
     );
-    let bin = out.join(name);
-    let lib = musl_lib();
+    let bin = out.join(format!("{name}-{}", name_suffix(libc)));
+    let lib = libc.lib_dir();
+    let interp = format!("--dynamic-linker={}", libc.interp());
     let mut cmd = Command::new(rust_lld());
-    cmd.args(["-flavor", "gnu", "-pie", "--dynamic-linker=/lib/ld-musl-aarch64.so.1", "-o"])
-        .arg(&bin);
+    cmd.args(["-flavor", "gnu", "-pie"]).arg(&interp);
+    // A run-time search path so the glibc linker finds libc.so.6 in the
+    // rootfs's /lib; harmless for musl, whose interpreter is the libc itself.
+    cmd.args(["-rpath=/lib", "-o"]).arg(&bin);
     if crt {
         cmd.arg(lib.join("Scrt1.o")).arg(lib.join("crti.o"));
     }
-    cmd.arg(&obj);
-    // Linking against the shared libc records a NEEDED of its soname
-    // (libc.musl-aarch64.so.1), which the interpreter satisfies from itself.
-    cmd.arg(musl_ld());
+    // Linking against the shared libc records a NEEDED of its soname, which
+    // the interpreter satisfies (musl from itself, glibc by mapping libc.so.6).
+    cmd.arg(&obj).arg(libc.libc_so());
     if crt {
+        if matches!(libc, Libc::Glibc) {
+            // glibc links a small static companion beside the shared libc.
+            cmd.arg(lib.join("libc_nonshared.a"));
+        }
         cmd.arg(lib.join("crtn.o"));
     }
     run_checked(&mut cmd);
     bin
 }
 
-/// A temporary root filesystem holding the musl dynamic linker at the path
-/// dynamic guests name via PT_INTERP (`/lib/ld-musl-aarch64.so.1`).
-fn musl_rootfs(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("fwe-musl-{}-{tag}", std::process::id()));
+fn name_suffix(libc: Libc) -> &'static str {
+    match libc {
+        Libc::Musl => "musl",
+        Libc::Glibc => "glibc",
+    }
+}
+
+/// A temporary root filesystem holding the libc's dynamic linker (and, for
+/// glibc, the shared libc) at the paths the guests expect.
+fn libc_rootfs(libc: Libc, tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("fwe-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("lib")).unwrap();
-    std::fs::copy(musl_ld(), root.join("lib/ld-musl-aarch64.so.1")).unwrap();
+    let lib = libc.lib_dir();
+    match libc {
+        Libc::Musl => {
+            std::fs::copy(lib.join("ld-musl-aarch64.so.1"), root.join("lib/ld-musl-aarch64.so.1"))
+                .unwrap();
+        }
+        Libc::Glibc => {
+            std::fs::copy(
+                lib.join("ld-linux-aarch64.so.1"),
+                root.join("lib/ld-linux-aarch64.so.1"),
+            )
+            .unwrap();
+            std::fs::copy(lib.join("libc.so.6"), root.join("lib/libc.so.6")).unwrap();
+        }
+    }
     root
 }
 
@@ -468,8 +518,8 @@ fn dynamic_loader_hands_off_to_interpreter() {
 /// thread pointer, and transfers control — with no C runtime in the way.
 #[test]
 fn dynamic_min_resolves_libc_symbols() {
-    let prog = build_c_dynamic("dynmin", false);
-    let root = musl_rootfs("min");
+    let prog = build_c_dynamic("dynmin", Libc::Musl, false);
+    let root = libc_rootfs(Libc::Musl, "musl-min");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
     let out = run_bounded(cmd);
@@ -486,12 +536,50 @@ fn dynamic_min_resolves_libc_symbols() {
 /// musl build, the way a real dynamically linked program starts.
 #[test]
 fn dynamic_hello_runs_through_musl_startup() {
-    let prog = build_c_dynamic("dynhello", true);
-    let root = musl_rootfs("hello");
+    let prog = build_c_dynamic("dynhello", Libc::Musl, true);
+    let root = libc_rootfs(Libc::Musl, "musl-hello");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace").arg("--root").arg(&root).arg(&prog).arg("fun-with-emulators");
     let out = run_bounded(cmd);
     eprintln!("--- dynhello stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Real glibc dynamic linking, minimal case: a PIE with its own `_start`
+/// calling only `_exit` (a plain syscall wrapper, so no thread-control-block
+/// setup is needed). glibc's dynamic linker is a separate object from the
+/// shared libc, so this drives the path musl never did: load `ld-linux`, have
+/// it map `libc.so.6` itself at run time (translated through the section-aware
+/// `mmap` path, since libc.so.6's code segment also holds its symbol and
+/// string tables), resolve `_exit`, and hand off.
+#[test]
+fn dynamic_glibc_exit_maps_shared_libc() {
+    let prog = build_c_dynamic("dynexit", Libc::Glibc, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-exit");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- dynexit(glibc) stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(42));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Real glibc dynamic linking, full startup: a normal `main` linked through
+/// glibc's crt objects, using the heap and buffered stdio from the shared
+/// libc. Covers the complete path — `ld-linux` maps and relocates `libc.so.6`,
+/// crt `_start`, `__libc_start_main` (thread-control-block and TLS setup),
+/// `main`, then `malloc`/`printf` — against a genuine glibc, the way a Debian
+/// program starts.
+#[test]
+fn dynamic_glibc_hello_runs_through_libc_startup() {
+    let prog = build_c_dynamic("dynhello", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "glibc-hello");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog).arg("fun-with-emulators");
+    let out = run_bounded(cmd);
+    eprintln!("--- dynhello(glibc) stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
