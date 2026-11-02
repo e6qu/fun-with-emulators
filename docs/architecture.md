@@ -123,7 +123,18 @@ rather than the executable's. The auxiliary vector carries `AT_BASE` (the
 interpreter's load base), `AT_ENTRY` (the executable's entry), and
 `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` for the executable, as Linux provides them.
 The interpreter maps the executable's shared libraries itself through our
-`openat` and file-backed `mmap`.
+`openat` and file-backed `mmap`; each executable segment it maps (or turns
+executable with `mprotect`) is translated by the same `PROT_EXEC` path as the
+initial image, so the dynamic linker's own code and every library it loads get
+the `x18`/`svc`/`TPIDR_EL0` rewrite.
+
+This runs a real, unmodified musl: the end-to-end tests load the genuine
+`ld-musl-aarch64.so.1`, which self-relocates, resolves the program's
+`R_AARCH64_JUMP_SLOT`/`R_AARCH64_RELATIVE` relocations against the shared libc,
+installs the thread pointer and starts the program — covering both a minimal
+program with its own `_start` and a normal one that starts through musl's crt
+objects and `__libc_start_main` and then uses the heap and stdio. glibc, whose
+`ld-linux-aarch64.so.1` a Debian rootfs needs, is the next target.
 
 ## Processes
 
@@ -348,14 +359,17 @@ These are tracked on the roadmap:
   setting the link register for `blr`). The only `x18` forms still deferred are
   `sp`-writeback and `sp`-register-offset loads (a prologue spilling `x18`
   through `sp` with writeback), which are rare for a caller-saved register.
-  Recursive-descent code discovery (versus the current scan plus literal-pool
-  exclusion) remains the general-correctness step for data embedded in code.
-- The rewrite pass scans every aligned word of an executable segment, so a
-  data word that happens to encode a rewritten instruction is rewritten too.
-  Literal pools (the targets of `ldr`-literal) are detected and skipped, and
-  strings and other read-only data live in a non-executable `.rodata` segment
-  that is not scanned. Other inline data in executable memory (e.g. jump
-  tables) remains a hazard; recursive descent over reachable code only is the
-  planned general fix.
+- The rewrite pass scans aligned words and patches instructions, so a data
+  word that happens to encode a rewritten instruction would be patched too.
+  The scan is therefore confined to the executable code: `Elf::exec_ranges`
+  reports the `SHF_EXECINSTR` sections from the section headers, so symbol,
+  string, hash and relocation tables that share an executable segment with the
+  code — as the whole R-X segment of musl's `ld-musl` does — are never
+  scanned. Within a code section, literal pools (the targets of `ldr`-literal)
+  are detected and skipped. Two gaps remain: inline data in a code section
+  other than a literal pool (e.g. a jump table), and a binary fully stripped of
+  its section headers, where the scan falls back to the whole executable
+  segment. Recursive descent over reachable code only is the planned general
+  fix for both.
 - Guest pointers the kernel reads itself are not yet fault-checked; a bad
   pointer crashes `fwe` instead of returning `EFAULT`.

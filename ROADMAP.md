@@ -21,7 +21,16 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [x] Files and directories, with a Linux root filesystem
 - [x] Signals
 - [x] Pipes
-- [ ] Dynamic linking with glibc and musl
+- [~] Dynamic linking with glibc and musl: musl works end to end — the loader
+  maps the program and the interpreter named in `PT_INTERP`, hands off at the
+  interpreter's entry with `AT_BASE`/`AT_ENTRY`/`AT_PHDR` set, and the real
+  `ld-musl-aarch64.so.1` self-relocates, resolves the program's relocations
+  against the shared libc, sets up the thread pointer and starts it. Libraries
+  the linker maps at run time are translated through the `mmap`/`mprotect`
+  `PROT_EXEC` path, the same as the initial image. End-to-end tests run genuine
+  dynamic binaries (a minimal `_start` and a full crt/`__libc_start_main`/stdio
+  program) against a vendored musl build. glibc (needed for a Debian rootfs) is
+  next.
 - [~] Binary translation of `x18` (and the other registers macOS treats
   specially): macOS clears `x18` on every exception return — including
   involuntary preemption, where the custom x18 ABI was observed being dropped —
@@ -32,8 +41,12 @@ See [PLAN.md](PLAN.md) for the overall plan.
   spills adjusted for the stub's push and literal pools protected from the
   scan, as are the PC-relative forms (`adr`/`adrp`/`ldr`-literal) and the
   compare/test/indirect branches through `x18` — enough to run a compiled
-  Rust/musl binary unmodified. Only `sp`-writeback spills and recursive-descent
-  code discovery remain. This
+  Rust/musl binary and a real `ld-musl` unmodified. Only executable code is
+  rewritten: code extents come from the section headers (the `SHF_EXECINSTR`
+  sections), so data that shares an executable segment with the code — a
+  dynamic linker's symbol, string and hash tables, for instance — is left
+  intact. Only `sp`-writeback spills and code discovery for fully stripped
+  binaries without section headers remain. This
   keeps execution in-process at native speed; **no hypervisor or VM is used**
   (that is a non-goal of this project — see PLAN.md).
 - [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS

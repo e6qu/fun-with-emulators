@@ -239,6 +239,71 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     bin
 }
 
+/// The vendored musl runtime (see `guests/musl/README.md`): the dynamic
+/// linker / shared libc and the C-runtime startup objects.
+fn musl_lib() -> PathBuf {
+    repo().join("guests/musl/lib")
+}
+
+/// The musl dynamic linker, which is also the shared libc. Used both to link
+/// the dynamic C guests and, copied into a root filesystem, as the interpreter
+/// they load at run time.
+fn musl_ld() -> PathBuf {
+    musl_lib().join("ld-musl-aarch64.so.1")
+}
+
+/// Build one C guest and link it as a dynamic PIE against the real musl shared
+/// libc. With `crt`, musl's C-runtime startup objects are linked in (for a
+/// guest with a normal `main`); without them the guest provides its own
+/// `_start`. The guest is compiled freestanding with no host headers, like the
+/// assembly guests, so only a bare cross `clang` is needed.
+fn build_c_dynamic(name: &str, crt: bool) -> PathBuf {
+    let out = out_dir().join("c");
+    std::fs::create_dir_all(&out).unwrap();
+    let obj = out.join(format!("{name}.o"));
+    run_checked(
+        Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-O2",
+                "-fno-stack-protector",
+                "-fPIC",
+                "-ffreestanding",
+                "-c",
+                "-o",
+            ])
+            .arg(&obj)
+            .arg(repo().join("guests/c").join(format!("{name}.c"))),
+    );
+    let bin = out.join(name);
+    let lib = musl_lib();
+    let mut cmd = Command::new(rust_lld());
+    cmd.args(["-flavor", "gnu", "-pie", "--dynamic-linker=/lib/ld-musl-aarch64.so.1", "-o"])
+        .arg(&bin);
+    if crt {
+        cmd.arg(lib.join("Scrt1.o")).arg(lib.join("crti.o"));
+    }
+    cmd.arg(&obj);
+    // Linking against the shared libc records a NEEDED of its soname
+    // (libc.musl-aarch64.so.1), which the interpreter satisfies from itself.
+    cmd.arg(musl_ld());
+    if crt {
+        cmd.arg(lib.join("crtn.o"));
+    }
+    run_checked(&mut cmd);
+    bin
+}
+
+/// A temporary root filesystem holding the musl dynamic linker at the path
+/// dynamic guests name via PT_INTERP (`/lib/ld-musl-aarch64.so.1`).
+fn musl_rootfs(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("fwe-musl-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::copy(musl_ld(), root.join("lib/ld-musl-aarch64.so.1")).unwrap();
+    root
+}
+
 /// Synthetic /proc: a guest reads /proc/sys/kernel/ostype and gets "Linux".
 #[test]
 fn reads_synthetic_proc() {
@@ -392,6 +457,42 @@ fn dynamic_loader_hands_off_to_interpreter() {
     let out = run_bounded(cmd);
     eprintln!("--- dynprog stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "dynamic handoff ok\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Real dynamic linking, minimal case: a PIE with its own `_start` that calls
+/// `write` and `_exit` resolved from a genuine musl shared libc. This drives
+/// the real musl dynamic linker end to end — it maps and self-relocates,
+/// applies this program's jump-slot relocations against libc, sets up the
+/// thread pointer, and transfers control — with no C runtime in the way.
+#[test]
+fn dynamic_min_resolves_libc_symbols() {
+    let prog = build_c_dynamic("dynmin", false);
+    let root = musl_rootfs("min");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- dynmin stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "dynamic-min: hello from musl\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Real dynamic linking, full startup: a normal `main` linked through musl's
+/// crt objects, using the heap and buffered stdio from the shared libc. Covers
+/// the complete path — `ld-musl` self-relocation, `crt` `_start`,
+/// `__libc_start_main`, `main`, then `malloc`/`printf` — against a genuine
+/// musl build, the way a real dynamically linked program starts.
+#[test]
+fn dynamic_hello_runs_through_musl_startup() {
+    let prog = build_c_dynamic("dynhello", true);
+    let root = musl_rootfs("hello");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog).arg("fun-with-emulators");
+    let out = run_bounded(cmd);
+    eprintln!("--- dynhello stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
 }
