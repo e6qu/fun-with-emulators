@@ -51,9 +51,17 @@ See [PLAN.md](PLAN.md) for the overall plan.
   binaries without section headers remain. This
   keeps execution in-process at native speed; **no hypervisor or VM is used**
   (that is a non-goal of this project — see PLAN.md).
-- [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS
-  reserves the low 4 GiB, so these are handled by load-time relocation in the
-  same translation pass, not by a VM.
+- [~] Executables linked below 4 GiB (non-PIE `ET_EXEC`: Debian's
+  `python3.11` at `0x400000`, static Go at `0x10000`): macOS reserves the low
+  4 GiB with a mandatory `__PAGEZERO` that cannot be shrunk on Apple Silicon,
+  and a non-PIE image has no relocation information to move elsewhere, so the
+  native backend cannot run these — an OS limitation confirmed in practice.
+  The path forward is a **minimalistic Hypervisor.framework backend**, where
+  the guest's own address space supplies the low addresses and `svc` traps
+  into the existing kernel. A feasibility spike (`fwe --hv-spike`, see
+  `docs/hypervisor-spike.md`) runs a low-address guest in a VM end to end; it
+  needs the hypervisor entitlement (no root) and so is validated by hand on
+  Apple Silicon rather than in CI.
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 Progress: unmodified Debian `aarch64` coreutils (`true`, `false`, `echo`,
