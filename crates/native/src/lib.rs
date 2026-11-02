@@ -4,6 +4,8 @@
 pub mod hwcap;
 pub mod loader;
 pub mod prepare;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod process;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

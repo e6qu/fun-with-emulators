@@ -75,6 +75,8 @@ const ASM_GUESTS: &[&str] = &[
     "fileio",
     "sigtest",
     "threadtest",
+    "execer",
+    "execee",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -219,6 +221,24 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     cmd.args(["-flavor", "gnu"]).args(link_args).arg("-o").arg(&bin).arg(&obj);
     run_checked(&mut cmd);
     bin
+}
+
+/// execve: a guest replaces its image with a second program (from the rootfs)
+/// and the new program runs.
+#[test]
+fn execve_replaces_program() {
+    let root = std::env::temp_dir().join(format!("fwe-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(asm_guest("execee-pie"), root.join("execee")).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(asm_guest("execer-pie"));
+    let out = run_bounded(cmd);
+    eprintln!("--- execer stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "exec target ran\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Threads: a guest clones a child that writes a shared counter and exits;

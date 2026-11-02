@@ -150,6 +150,14 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
         fwe_kernel::thread_exit_cleanup();
         crate::exit_current_thread(regs.x[0] as i32);
     }
+    if nr == fwe_abi::nr::EXECVE {
+        // On success this enters the new program and never returns; on
+        // failure it reports an errno the guest can handle.
+        let r = crate::process::do_execve(&regs);
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        regs_to(ss, &regs);
+        return;
+    }
     if nr == fwe_abi::nr::CLONE {
         let r = crate::threads::do_clone(&regs);
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
