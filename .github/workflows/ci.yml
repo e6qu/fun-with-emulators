@@ -36,6 +36,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sw_vers && uname -m && clang --version
       - run: cargo build
+      - name: Report hypervisor availability (informational)
+        run: |
+          echo "kern.hv_support:"; sysctl kern.hv_support 2>&1 || true
+          codesign --sign - --entitlements hv-spike.entitlements --force target/debug/fwe || true
+          if target/debug/fwe --hv-spike; then
+            echo "hypervisor: AVAILABLE on this runner"
+          else
+            echo "hypervisor: unavailable here (expected on GitHub-hosted runners," \
+                 "which are VMs without nested virtualization)"
+          fi
       - name: Probe host register behaviour
         run: |
           for p in x18-spin x18-syscall x18-mode x18-mode-write x18-mode-wait x18-mode-spin x18-mode-syscall; do
@@ -44,3 +54,25 @@ jobs:
           target/debug/fwe --host-info || echo "(host-info exit $?)"
       - run: cargo test -p fwe-native --test host -- --nocapture
       - run: cargo test
+
+  # Real execution of the Hypervisor.framework spike. GitHub's hosted macOS
+  # runners are VMs without nested virtualization (kern.hv_support = 0), so HVF
+  # cannot run there; this job targets a self-hosted Apple Silicon runner where
+  # it can. It stays skipped until the repository variable FWE_HV_SELF_HOSTED
+  # is set to "true" (set it once a runner is registered — see
+  # docs/hypervisor-spike.md), so it never blocks when no such runner exists.
+  hypervisor:
+    name: Hypervisor spike (self-hosted Apple Silicon)
+    if: ${{ vars.FWE_HV_SELF_HOSTED == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sysctl kern.hv_support
+      - run: cargo build --release -p fwe
+      - name: Codesign and run the hypervisor spike
+        run: |
+          codesign --sign - --entitlements hv-spike.entitlements --force target/release/fwe
+          out="$(target/release/fwe --hv-spike)"
+          echo "$out"
+          echo "$out" | grep -qx "hv: hello from the guest"
+          echo "$out" | grep -q "guest exited with status 42"

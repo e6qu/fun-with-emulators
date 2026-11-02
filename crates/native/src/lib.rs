@@ -2,6 +2,7 @@
 //! this macOS process, with system calls redirected to the kernel layer.
 
 pub mod decode;
+pub mod hv;
 pub mod hwcap;
 pub mod loader;
 pub mod prepare;

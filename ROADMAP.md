@@ -49,18 +49,32 @@ See [PLAN.md](PLAN.md) for the overall plan.
   dynamic linker's symbol, string and hash tables, for instance — is left
   intact. Only `sp`-writeback spills and code discovery for fully stripped
   binaries without section headers remain. This
-  keeps execution in-process at native speed; **no hypervisor or VM is used**
-  (that is a non-goal of this project — see PLAN.md).
-- [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS
-  reserves the low 4 GiB, so these are handled by load-time relocation in the
-  same translation pass, not by a VM.
+  keeps execution in-process at native speed; the native path uses no VM, and a
+  thin hypervisor backend is reserved only for binaries it cannot map (the
+  low-address non-PIE case below — see PLAN.md).
+- [~] Executables linked below 4 GiB (non-PIE `ET_EXEC`: Debian's
+  `python3.11` at `0x400000`, static Go at `0x10000`): macOS reserves the low
+  4 GiB with a mandatory `__PAGEZERO` that cannot be shrunk on Apple Silicon,
+  and a non-PIE image has no relocation information to move elsewhere, so the
+  native backend cannot run these — an OS limitation confirmed in practice.
+  The path forward is a **minimalistic Hypervisor.framework backend**, where
+  the guest's own address space supplies the low addresses and `svc` traps
+  into the existing kernel. A feasibility spike (`fwe --hv-spike`, see
+  `docs/hypervisor-spike.md`) runs a low-address guest in a VM end to end; it
+  needs the hypervisor entitlement (no root) and so is validated by hand on
+  Apple Silicon rather than in CI — no GitHub-hosted runner provides a
+  hardware VM for an aarch64 guest (macOS HVF is unavailable there, measured,
+  and the arm64 Linux runners expose no `/dev/kvm`), so a self-hosted Apple
+  Silicon runner is wired behind a gate for that coverage.
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 Progress: unmodified Debian `aarch64` coreutils (`true`, `false`, `echo`,
 `seq`, `env`, `cat`, `sort`), `ls` (with its `libselinux` → `libpcre2`
 dependency graph) and `bash` (shell startup, builtins, arithmetic and loops,
 linked against `libtinfo`) run against the vendored glibc runtime, with their
-output checked end to end. Python is next.
+output checked end to end. Python remains: Debian's `python3.11` is a non-PIE
+executable linked at `0x400000`, so it needs the hypervisor backend above (the
+rest of the Debian userland that is position-independent already runs).
 
 ## M2 — Everyday software
 

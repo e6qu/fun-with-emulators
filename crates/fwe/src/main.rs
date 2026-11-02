@@ -14,6 +14,8 @@ options:
   --strace     trace system calls to standard error
   --root DIR   use DIR as the guest root filesystem
   --host-info  show host features that affect compatibility
+  --hv-spike   run the hypervisor-backend feasibility spike (see
+               docs/hypervisor-spike.md; Apple Silicon, needs the entitlement)
   -h, --help   show this help
   -V, --version
 ";
@@ -56,6 +58,25 @@ fn main() -> ExitCode {
             b"--host-info" => {
                 println!("{}", fwe_native::host_support());
                 return ExitCode::SUCCESS;
+            }
+            b"--hv-spike" => {
+                // Feasibility spike for the hypervisor backend; see
+                // docs/hypervisor-spike.md. Not part of normal operation.
+                return match fwe_native::hv::spike() {
+                    Ok(out) => {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&out.stdout);
+                        // The spike itself succeeded; the guest's own status is
+                        // reported in text (it is 42 when the guest ran fully),
+                        // so the process exits 0 for a clean CI assertion.
+                        println!("fwe: hv spike guest exited with status {}", out.exit_code);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("fwe: hv spike failed: {e}");
+                        ExitCode::from(2)
+                    }
+                };
             }
             b"-V" | b"--version" => {
                 println!("fwe {}", env!("CARGO_PKG_VERSION"));
