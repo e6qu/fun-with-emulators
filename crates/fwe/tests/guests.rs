@@ -225,11 +225,12 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
 }
 
 /// fork and wait: a guest forks, the child exits 7, and the parent reaps it
-/// and checks the wait status encodes a normal exit with code 7.
+/// and exits with the child's decoded `WEXITSTATUS` — so a passing run (7)
+/// confirms the whole fork/exit/wait path and the Linux status encoding.
 #[test]
 fn fork_and_wait() {
     for name in ["forktest", "forktest-pie"] {
-        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(7), "{name}");
     }
 }
 

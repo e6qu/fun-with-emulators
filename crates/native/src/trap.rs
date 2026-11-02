@@ -314,6 +314,20 @@ fn install(
 /// Give this host thread its own signal stack. Signal dispositions are
 /// process-wide, but the alternate stack is per thread, so every thread that
 /// runs guest code needs one before it can trap.
+/// Unblock all host signals on the calling thread. Needed whenever guest
+/// execution begins or resumes from a context where a signal is still blocked
+/// — e.g. entering a new program (`execve`) or a forked child from inside the
+/// trap handler, where the handled SIGTRAP is masked — so the guest's own
+/// traps and faults are delivered.
+pub fn unblock_all_signals() {
+    // SAFETY: resetting this thread's signal mask to empty.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+}
+
 pub fn install_thread_altstack() {
     // SAFETY: a fresh mapping for the signal stack, leaked for the life of
     // the thread (which runs until the process or the thread exits).

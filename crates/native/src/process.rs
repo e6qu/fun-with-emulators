@@ -85,6 +85,10 @@ pub fn do_execve(regs: &Regs) -> i64 {
     let (sp, entry) = (out.sp, out.entry);
     drop(guard);
 
+    // We jump straight into the new program instead of returning through the
+    // signal handler, so the handled SIGTRAP is still masked; unblock it (and
+    // everything else) so the new program's traps are delivered.
+    trap::unblock_all_signals();
     // Enter the new program with a fresh register state.
     trap::enter_guest(sp, entry)
 }
@@ -109,8 +113,11 @@ pub fn do_fork(parent: &Regs) -> i64 {
         return fwe_kernel::host::last_error();
     }
     if pid == 0 {
-        // Child: a new process. Reset identity and the live-thread count, and
-        // honor the child tid flags into the (copied) guest memory.
+        // Child: a new process. It returns through the signal handler, which
+        // restores the mask, but reset it explicitly to be safe. Reset
+        // identity and the live-thread count, and honor the child tid flags
+        // into the (copied) guest memory.
+        trap::unblock_all_signals();
         thread::init_main(host::getpid() as i32);
         LIVE_THREADS.store(1, Ordering::SeqCst);
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {

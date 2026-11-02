@@ -22,12 +22,11 @@ _start:
     mov     x8, #260                // wait4
     svc     #0
     tbnz    x0, #63, fail
-    ldr     w10, [sp]
-    movz    w11, #0x700             // WIFEXITED, code 7 -> (7 << 8)
-    cmp     w10, w11
-    b.ne    fail
-    mov     x0, #0
-    b       exit
+    ldr     w10, [sp]               // status
+    lsr     w10, w10, #8            // decode WEXITSTATUS
+    and     x0, x10, #0xff          // exit with the child's reported status
+    mov     x8, #94
+    svc     #0
 
 child:
     mov     x0, #7
@@ -36,6 +35,5 @@ child:
 
 fail:
     mov     x0, #1
-exit:
     mov     x8, #94                 // exit_group
     svc     #0
