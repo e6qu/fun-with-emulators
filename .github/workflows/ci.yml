@@ -36,6 +36,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sw_vers && uname -m && clang --version
       - run: cargo build
+      - name: Probe hypervisor backend (informational)
+        continue-on-error: true
+        run: |
+          echo "kern.hv_support:"; sysctl kern.hv_support || true
+          echo "--- codesign with hypervisor entitlement ---"
+          codesign --sign - --entitlements hv-spike.entitlements --force target/debug/fwe \
+            && codesign -d --entitlements - target/debug/fwe 2>&1 || echo "(codesign failed)"
+          echo "--- fwe --hv-spike ---"
+          target/debug/fwe --hv-spike; echo "spike exit: $?"
       - name: Probe host register behaviour
         run: |
           for p in x18-spin x18-syscall x18-mode x18-mode-write x18-mode-wait x18-mode-spin x18-mode-syscall; do
