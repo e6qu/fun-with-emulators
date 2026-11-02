@@ -62,7 +62,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Deliver one ready pending signal, if any, before returning to the guest.
-    pub(crate) fn deliver_pending(&mut self, regs: &mut Regs) {
+    pub fn deliver_pending(&mut self, regs: &mut Regs) {
         let ready = self.pending & !self.sigmask;
         if ready == 0 {
             return;
@@ -208,6 +208,9 @@ mod tests {
         }
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")
+        }
+        fn exit_thread(&mut self, code: i32) -> ! {
+            panic!("exit_thread({code})")
         }
         fn kill_self(&mut self, sig: libc::c_int) -> ! {
             panic!("killed by {sig}")

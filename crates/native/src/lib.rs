@@ -7,7 +7,24 @@ pub mod prepare;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod threads;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod trap;
+
+/// Live guest threads, so the last one to exit ends the process.
+static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// End the calling guest thread: the last thread ends the process, any other
+/// ends just its host thread. Must be called without the kernel lock held,
+/// since `pthread_exit` does not return and would never release it.
+pub(crate) fn exit_current_thread(code: i32) -> ! {
+    if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        // SAFETY: terminating the process.
+        unsafe { libc::_exit(code) }
+    }
+    // SAFETY: ends the calling host thread; the process keeps running.
+    unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+}
 
 use fwe_abi::auxv;
 use fwe_elf::Elf;
@@ -53,6 +70,10 @@ impl Platform for NativePlatform {
     fn exit(&mut self, code: i32) -> ! {
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
+    }
+
+    fn exit_thread(&mut self, code: i32) -> ! {
+        exit_current_thread(code)
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
@@ -531,6 +552,9 @@ fn start(
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
+
+    // The main thread's id equals the process id, as on Linux.
+    fwe_kernel::thread::init_main(fwe_kernel::host::getpid() as i32);
 
     let mut kernel = Kernel::new(platform, page, brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);

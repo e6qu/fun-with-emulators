@@ -118,6 +118,28 @@ the guest register file to the kernel for the duration of a trap as a
 coming thread support reuses. Floating-point and vector state is not yet
 saved across a handler.
 
+## Threads and concurrency
+
+A guest thread is a host thread running guest code directly; all threads
+share the single global kernel, so each trap briefly locks it. `clone` with
+the pthread flag set (`CLONE_THREAD | CLONE_VM | ...`) spawns a detached host
+thread that enters the guest with the parent's registers, `x0` = 0 and its
+own stack; `CLONE_SETTLS` sets the new thread's pointer in its TSD slot, and
+`CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID` update the
+tid words. Thread id, the `set_tid_address` word and the robust-list live in
+host thread-locals. A thread's `exit` clears and wakes its `clear_child_tid`
+futex (so `pthread_join` completes) and ends that host thread; the last
+thread, or `exit_group`, ends the process. `fork`, `execve` and `wait` are
+not implemented yet.
+
+Blocking system calls — `futex`, `nanosleep`, `clock_nanosleep` — must not
+hold the kernel lock while they block, or a waiting thread would stall the
+threads meant to wake it. The backend runs them outside the lock (the futex
+wait queues are a separate process-global structure operating on raw guest
+memory), then re-locks only to record the result and deliver a pending
+signal. Per-thread signal masks and alternate stacks are not yet separated
+(the mask and altstack are process-wide).
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -129,7 +151,8 @@ errno values are generated from the Linux UAPI headers by `tools/gen-abi.py`.
 
 These are tracked on the roadmap:
 
-- Single-threaded guests only (no `clone` thread creation yet).
+- `fork`, `execve` and `wait` are not implemented (threads via `clone` are).
+- Signal mask and alternate stack are process-wide, not per thread.
 - Floating-point/vector registers are not saved across a signal handler.
 - Executables linked below 4 GiB are rejected (see above).
 - x18 is not preserved before macOS 26.4 (see above).

@@ -10,11 +10,72 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
-const ASM_GUESTS: &[&str] =
-    &["hello", "exit42", "enosys", "regs", "tpidr", "x18", "x18spin", "fileio", "sigtest"];
+/// How long a guest may run before the harness kills it. A guest should
+/// finish in well under a second; a hang (e.g. a thread that never wakes)
+/// becomes a fast, visible failure instead of hanging CI.
+const GUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run a command, killing it if it exceeds [`GUEST_TIMEOUT`]. The returned
+/// `Output` has a non-success status on timeout, and its captured output is
+/// preserved for the failure message.
+///
+/// stdout and stderr are drained on their own threads, so a guest that writes
+/// a lot (e.g. many `--strace` lines) never blocks on a full pipe.
+fn run_bounded(mut cmd: Command) -> Output {
+    use std::io::Read;
+    let mut child =
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > GUEST_TIMEOUT {
+            let _ = child.kill();
+            timed_out = true;
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if timed_out {
+        eprintln!("--- guest timed out after {GUEST_TIMEOUT:?} (killed)");
+    }
+    // Readers finish once the pipes close (at process exit).
+    let stdout = out_reader.join().unwrap();
+    let stderr = err_reader.join().unwrap();
+    Output { status, stdout, stderr }
+}
+
+const ASM_GUESTS: &[&str] = &[
+    "hello",
+    "exit42",
+    "enosys",
+    "regs",
+    "tpidr",
+    "x18",
+    "x18spin",
+    "fileio",
+    "sigtest",
+    "threadtest",
+];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
 /// reserved low 4 GiB.
@@ -112,13 +173,9 @@ fn rust_guest(name: &str) -> PathBuf {
 }
 
 fn fwe(program: &Path, args: &[&str]) -> Output {
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-        .arg("--strace")
-        .arg(program)
-        .args(args)
-        .env("FWE_GUEST_VAR", "from-host")
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
+    let out = run_bounded(cmd);
     // Shown when a test fails.
     eprintln!("--- {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     out
@@ -136,13 +193,9 @@ fn root_filesystem_confines_writes() {
         let root = std::env::temp_dir().join(format!("fwe-root-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-            .arg("--strace")
-            .arg("--root")
-            .arg(&root)
-            .arg(asm_guest(name))
-            .output()
-            .unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace").arg("--root").arg(&root).arg(asm_guest(name));
+        let out = run_bounded(cmd);
         eprintln!("--- {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(out.status.code(), Some(0), "{name}");
         assert_eq!(std::fs::read(root.join("probe")).unwrap(), b"ok\n", "{name}");
@@ -168,6 +221,15 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     bin
 }
 
+/// Threads: a guest clones a child that writes a shared counter and exits;
+/// the parent joins via the CLONE_CHILD_CLEARTID futex and checks the counter.
+#[test]
+fn clone_thread_runs_and_joins() {
+    for name in ["threadtest", "threadtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
 /// Signal delivery: a guest installs a SIGUSR1 handler, raises it, and the
 /// handler (returning through fwe's rt_sigreturn trampoline) sets a flag the
 /// program checks before exiting 0.
@@ -191,13 +253,9 @@ fn dynamic_loader_hands_off_to_interpreter() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::copy(&interp, root.join("interp")).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-        .arg("--strace")
-        .arg("--root")
-        .arg(&root)
-        .arg(&dynprog)
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&dynprog);
+    let out = run_bounded(cmd);
     eprintln!("--- dynprog stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "dynamic handoff ok\n");
     assert_eq!(out.status.code(), Some(0));

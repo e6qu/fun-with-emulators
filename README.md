@@ -13,12 +13,13 @@ ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26.
 
 M1 is in progress. Landed: a root filesystem with the file and directory
 system calls, the **dynamic loader** (`PT_INTERP` interpreters loaded from
-the rootfs), and **signal delivery** (guest handlers run, with `rt_sigframe`
-build and `rt_sigreturn` restore, for raised and faulting signals). Next:
-threads (`clone`). Running real glibc/musl programs end to end also needs the
-x18 fix, which — together with executables linked below 4 GiB — is deferred
-to the hypervisor backend; run `fwe --host-info` to see how the current host
-treats registers that matter to Linux code.
+the rootfs), **signal delivery** (guest handlers with `rt_sigframe` build and
+`rt_sigreturn` restore), and **threads** (`clone` thread creation with a real
+blocking futex and tid/TLS handling). Remaining in M1: `fork`/`execve`/`wait`.
+Running real glibc/musl programs end to end also needs the x18 fix, which —
+with executables linked below 4 GiB — is deferred to the hypervisor backend;
+run `fwe --host-info` to see how the current host treats registers that
+matter to Linux code.
 
 ## Usage
 
