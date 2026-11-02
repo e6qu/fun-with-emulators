@@ -114,8 +114,12 @@ impl<P: Platform> Kernel<P> {
                 } as i64)
             }
             nr::LSEEK => {
-                // SAFETY: plain host call; SEEK_SET/CUR/END match.
-                ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
+                if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
+                    r
+                } else {
+                    // SAFETY: plain host call; SEEK_SET/CUR/END match.
+                    ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
+                }
             }
             nr::CLOSE => {
                 let fd = a[0] as i32;
@@ -124,6 +128,8 @@ impl<P: Platform> Kernel<P> {
                 } else if let Some(r) = crate::signalfd::try_close(fd) {
                     r
                 } else if let Some(r) = crate::pty::try_close(fd) {
+                    r
+                } else if let Some(r) = crate::synthdir::try_close(fd) {
                     r
                 } else {
                     // SAFETY: plain host call.

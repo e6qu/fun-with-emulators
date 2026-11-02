@@ -143,6 +143,19 @@ impl Fs {
         crate::procfs::lookup(&absolute, &self.proc)
     }
 
+    /// The entries of a synthetic `/proc` or `/sys` directory `path`, if it is
+    /// one. Normalizes like [`synthetic`](Self::synthetic).
+    pub fn synth_children(&self, dirfd: i32, path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
+        let absolute = if path.first() == Some(&b'/') {
+            normalize(b"/", path)
+        } else if dirfd as i64 == fcntl::AT_FDCWD {
+            normalize(&self.cwd, path)
+        } else {
+            return None;
+        };
+        crate::procfs::children(&absolute)
+    }
+
     pub fn cwd(&self) -> &[u8] {
         &self.cwd
     }
