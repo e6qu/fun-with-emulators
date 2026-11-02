@@ -30,14 +30,16 @@ system calls, which validate them. Future backends keep this property.
 The guest sees the host page size (16K on Apple Silicon) through `AT_PAGESZ`,
 which the arm64 Linux ABI permits.
 
-macOS reserves the low 4 GiB of every arm64 process: the kernel refuses to
-start an executable with a smaller `__PAGEZERO`. Position-independent
-executables (the norm for distribution packages) are loaded anywhere, and
-ET_EXEC images linked above 4 GiB at their addresses. ET_EXEC images linked
-below 4 GiB (static non-PIE C and Rust builds at 0x200000 or 0x400000, Go at
-0x10000) are relocated to a higher base at load time and their
-position-dependent references fixed up in the same translation pass that
-rewrites the special instructions — still in-process, with no VM.
+macOS gives every arm64 process a 4 GiB `__PAGEZERO` by default, reserving the
+low 4 GiB. We link our own binary with a one-page `__PAGEZERO` instead (a
+linker flag in `.cargo/config.toml`), which frees that low address space while
+still faulting null-pointer dereferences on the first page. Position-independent
+executables (the norm for distribution packages) are then loaded anywhere, and
+ET_EXEC images — whether linked above 4 GiB or at the low fixed addresses a
+non-PIE build uses (static C and Rust at 0x200000 or 0x400000, Go at 0x10000,
+Debian's `python3.11` at 0x400000) — are mapped at their own addresses
+unchanged. Nothing is relocated and there is no VM; the usual translation pass
+still rewrites the special instructions.
 
 ## System call path
 
@@ -353,8 +355,6 @@ These are tracked on the roadmap:
   implemented; `execve` does not reclaim the old address space.
 - Signal mask and alternate stack are process-wide, not per thread.
 - Floating-point/vector registers are not saved across a signal handler.
-- Executables linked below 4 GiB are rejected for now; load-time relocation
-  (see above) is the planned fix, not a VM.
 - Guest uses of `x18` across the data-processing and load/store classes are
   rewritten to a per-thread slot (see above) and survive preemption, which is
   enough to run a compiled Rust/musl binary unmodified, including the

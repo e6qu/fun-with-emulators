@@ -1,0 +1,8 @@
+# Shrink the macOS __PAGEZERO of our own binaries from the arm64 default of
+# 4 GiB to a single 16 KiB page. That frees the low 4 GiB of the address space
+# so we can map guest executables linked at fixed low addresses (non-PIE
+# ET_EXEC, e.g. Debian's /usr/bin/python3.11 at 0x400000) at their own
+# addresses, while still trapping null-pointer dereferences on the first page.
+# `crates/native/src/loader.rs` (`host_min_address`) must agree with this size.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-pagezero_size,0x4000"]

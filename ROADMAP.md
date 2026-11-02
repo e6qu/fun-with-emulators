@@ -51,9 +51,13 @@ See [PLAN.md](PLAN.md) for the overall plan.
   binaries without section headers remain. This
   keeps execution in-process at native speed; **no hypervisor or VM is used**
   (that is a non-goal of this project — see PLAN.md).
-- [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS
-  reserves the low 4 GiB, so these are handled by load-time relocation in the
-  same translation pass, not by a VM.
+- [x] Executables linked below 4 GiB (non-PIE `ET_EXEC`, e.g. Debian's
+  `python3.11` at `0x400000`, and static C/Rust/Go): macOS reserves the low
+  4 GiB of every arm64 process with a 4 GiB `__PAGEZERO`, so we link our own
+  binary with a one-page `__PAGEZERO` instead. That frees the low address
+  space, and the image is mapped at its own fixed address unchanged — no
+  relocation and no VM — while the first page stays reserved to catch
+  null-pointer dereferences.
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 Progress: unmodified Debian `aarch64` coreutils (`true`, `false`, `echo`,

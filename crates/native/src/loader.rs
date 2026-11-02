@@ -30,8 +30,8 @@ pub enum LoadError {
         len: u64,
         reason: fwe_kernel::host::ReserveError,
     },
-    /// The image is linked below 4 GiB, which macOS reserves in every arm64
-    /// process (`__PAGEZERO`).
+    /// The image is linked below the lowest address the host can map (the
+    /// first page, kept inaccessible to catch null-pointer dereferences).
     BelowHostMinimum {
         start: u64,
     },
@@ -59,9 +59,8 @@ impl fmt::Display for LoadError {
             ),
             LoadError::BelowHostMinimum { start } => write!(
                 f,
-                "executable is linked at {start:#x}, below 4 GiB, which macOS reserves; \
-                 position-independent executables run, and executables linked at low \
-                 addresses need the hypervisor backend (not available yet)"
+                "executable is linked at {start:#x}, below the first page, which is kept \
+                 inaccessible to catch null-pointer dereferences"
             ),
             LoadError::Map(e) => write!(f, "mapping the image failed: {e}"),
             LoadError::Prepare { start, reason } => {
@@ -98,9 +97,13 @@ fn host_prot(p: u32) -> libc::c_int {
     h
 }
 
-/// Lowest address a process may map: macOS arm64 reserves the low 4 GiB.
+/// Lowest address a guest image may be mapped at. We link our own binary with
+/// a one-page `__PAGEZERO` (see `.cargo/config.toml`), so the whole address
+/// space above the first page is available — including the low addresses a
+/// non-PIE `ET_EXEC` is linked at. The first page stays reserved so a guest
+/// null-pointer dereference faults rather than hitting real memory.
 pub fn host_min_address() -> u64 {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 1 << 32 } else { 0 }
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 0x4000 } else { 0 }
 }
 
 /// Map `elf` for host pages of `page_size` bytes. `prepare_exec` is called

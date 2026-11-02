@@ -873,11 +873,16 @@ fn rust_runtime_services() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A non-PIE executable linked at a fixed low address (below the 4 GiB macOS
+/// reserves by default) runs: we shrink our own `__PAGEZERO` to one page so
+/// the low address space is available, and map the image there unchanged. This
+/// is what Debian's non-PIE `python3.11` (linked at 0x400000) needs.
 #[test]
-fn low_link_address_is_rejected_cleanly() {
+fn low_link_address_runs() {
     let out = fwe(&asm_guest("hello-low"), &[]);
-    assert_eq!(out.status.code(), Some(126));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("below 4 GiB"));
+    assert_eq!(stdout(&out), "hello from linux\n");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(fwe(&asm_guest("exit42-low"), &[]).status.code(), Some(42));
 }
 
 #[test]
