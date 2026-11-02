@@ -113,10 +113,12 @@ pub fn do_fork(parent: &Regs) -> i64 {
         return fwe_kernel::host::last_error();
     }
     if pid == 0 {
-        // Child: a new process. It returns through the signal handler, which
-        // restores the mask, but reset it explicitly to be safe. Reset
-        // identity and the live-thread count, and honor the child tid flags
-        // into the (copied) guest memory.
+        // Child: a new process. Returning through the signal handler would
+        // rely on sigreturn restoring the mask, but a forked child never
+        // actually took the signal, so SIGTRAP stays blocked and its own
+        // traps are then fatal. Instead unblock signals and enter the guest
+        // directly with the parent's register state (x0 = 0), as a cloned
+        // thread does.
         trap::unblock_all_signals();
         thread::init_main(host::getpid() as i32);
         LIVE_THREADS.store(1, Ordering::SeqCst);
@@ -127,7 +129,11 @@ pub fn do_fork(parent: &Regs) -> i64 {
         if flags & cl::CLONE_CHILD_CLEARTID != 0 && child_tid != 0 {
             thread::set_clear_child_tid(child_tid);
         }
-        0
+        let mut regs = *parent;
+        regs.x[0] = 0;
+        regs.pc = parent.pc.wrapping_add(4);
+        // SAFETY: `regs` is the parent's runnable context with x0 cleared.
+        unsafe { trap::enter_guest_full(&regs) }
     } else {
         // Parent: the child's pid.
         if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
