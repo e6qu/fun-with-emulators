@@ -83,6 +83,7 @@ const ASM_GUESTS: &[&str] = &[
     "eventfdtest",
     "timerfdtest",
     "socketpairtest",
+    "jobctl",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -275,6 +276,16 @@ fn timerfd_fires() {
 #[test]
 fn socketpair_message() {
     for name in ["socketpairtest", "socketpairtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// job control: a forked child starts a new session with `setsid` and confirms
+/// `getsid(0)` and `getpgid(0)` agree, exercising the session/process-group
+/// syscalls end to end.
+#[test]
+fn session_and_process_groups() {
+    for name in ["jobctl", "jobctl-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }

@@ -34,7 +34,8 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 - [~] Networking (TCP/UDP over IPv4/IPv6 and `socketpair`; pathed `AF_UNIX`,
   `SCM_RIGHTS` and netlink pending)
-- [ ] Terminals and job control
+- [~] Terminals and job control (`termios`, window size, tty process group,
+  sessions; pty device allocation pending)
 - [~] Event APIs (`epoll`, `eventfd`, `timerfd` done; `signalfd` pending)
 - [~] `/proc` and `/sys` (startup files served; directory listing pending)
 - [ ] Users, permissions and ownership

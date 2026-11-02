@@ -236,6 +236,28 @@ Pathed `AF_UNIX` sockets (whose addresses would need rooting under the rootfs),
 `SCM_RIGHTS` ancillary data (file-descriptor passing) and `AF_NETLINK` are not
 translated yet.
 
+## Terminals and job control
+
+Terminal `ioctl`s are handled in `crates/kernel/src/syscalls.rs`, with the
+`termios` translation in `crates/kernel/src/term.rs`. On Linux `TCGETS`/`TCSETS`
+pass through, since the guest `termios` is the host's. On macOS the structure
+differs — `tcflag_t` is 64-bit, the control characters are ordered differently,
+and almost every flag sits in a different bit — so each field is translated with
+`tcgetattr`/`tcsetattr` through per-field bit tables and a control-character
+index map. Baud is reported as a fixed `B38400`; a pty has no meaningful line
+rate. `TIOCGWINSZ`/`TIOCSWINSZ` share a layout and pass through; `TIOCGPGRP`/
+`TIOCSPGRP` map to `tcgetpgrp`/`tcsetpgrp`, and `TIOCSCTTY`/`TIOCNOTTY` pass
+through.
+
+`setpgid`, `getpgid`, `setsid` and `getsid` act on host process groups and
+sessions. A guest "pid" argument of 0 (self) always works, and child pids
+returned by `fork` are host pids, so `setpgid(child, …)` works too; passing a
+guest's virtual `getpid` value for another process does not.
+
+Allocating a new pty (Linux `/dev/ptmx` with `TIOCGPTN`/`TIOCSPTLCK`, versus
+macOS `posix_openpt`/`grantpt`/`ptsname`) is not implemented yet, so a guest
+cannot create its own controlling terminal; it can drive one it is given.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
