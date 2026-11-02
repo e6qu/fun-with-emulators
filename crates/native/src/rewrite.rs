@@ -46,8 +46,10 @@ const POP: u32 = 0xf841_07e0;
 /// `b <label>`
 const B: u32 = 0x1400_0000;
 
-/// Largest stub, in instructions.
-pub const STUB_WORDS: usize = 6;
+/// Largest stub, in instructions. The `x18` stub is the biggest: save two
+/// scratch registers, load the TSD base, load `x18`, run the instruction,
+/// store `x18`, restore the two scratch registers, branch back.
+pub const STUB_WORDS: usize = 10;
 
 /// Reach of a `b` instruction.
 pub const BRANCH_RANGE: u64 = 128 << 20;
@@ -59,6 +61,14 @@ pub enum Site {
     ReadThreadPointer { rt: u32 },
     /// `msr tpidr_el0, xN` (N = 31 is `xzr`)
     WriteThreadPointer { rt: u32 },
+    /// An instruction that names `x18`; the stub keeps `x18` in a slot.
+    X18 { insn: u32 },
+}
+
+/// Whether `insn` names `x18` in a form this pass can rewrite to a stub.
+fn rewritable_x18(insn: u32) -> bool {
+    crate::decode::operands(insn)
+        .is_some_and(|ops| ops.iter().any(|f| (insn >> f.shift) & 0x1f == 18))
 }
 
 /// Result of rewriting a block of code in place.
@@ -68,6 +78,10 @@ pub struct Patched {
     /// Offsets (from the start of the block) of instructions that must be
     /// redirected to stubs.
     pub sites: Vec<(u64, Site)>,
+    /// Count of instructions that name `x18` but are not yet rewritable
+    /// (loads/stores, PC-relative forms, branches, `sp` forms). Diagnostic
+    /// only; those instructions are left untouched.
+    pub x18_deferred: usize,
 }
 
 /// Rewrite what can be rewritten in place and collect the rest. `code`
@@ -91,7 +105,13 @@ pub fn patch(code: &mut [u8]) -> Patched {
         } else if insn & !RT_MASK == MSR_TPIDR {
             out.sites.push((i as u64 * 4, Site::WriteThreadPointer { rt: insn & RT_MASK }));
             None
+        } else if rewritable_x18(insn) {
+            out.sites.push((i as u64 * 4, Site::X18 { insn }));
+            None
         } else {
+            if crate::decode::names_x18(insn) {
+                out.x18_deferred += 1;
+            }
             None
         };
         if let Some(r) = replacement {
@@ -105,7 +125,11 @@ pub fn patch(code: &mut [u8]) -> Patched {
 pub fn count_sites(code: &[u8]) -> usize {
     code.chunks_exact(4)
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-        .filter(|&i| (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31) || i & !RT_MASK == MSR_TPIDR)
+        .filter(|&i| {
+            (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31)
+                || i & !RT_MASK == MSR_TPIDR
+                || rewritable_x18(i)
+        })
         .count()
 }
 
@@ -118,18 +142,23 @@ pub fn branch(from: u64, to: u64) -> Option<u32> {
     Some(B | ((offset >> 2) as u32 & 0x03ff_ffff))
 }
 
-/// The stub for `site`, placed at `stub`, returning to `ret`. `slot` is the
-/// byte offset of the guest thread pointer in the host TSD.
-pub fn stub(site: Site, slot: u32, stub: u64, ret: u64) -> Vec<u32> {
-    assert!(slot % 8 == 0 && slot / 8 < 4096, "slot offset must fit an ldr/str immediate");
-    let imm = (slot / 8) << 10;
+/// The stub for `site`, placed at `stub`, returning to `ret`. `tp_slot` and
+/// `x18_slot` are the byte offsets of the guest thread pointer and of the guest
+/// `x18` in the host TSD.
+pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec<u32> {
+    let imm = |slot: u32| {
+        assert!(slot % 8 == 0 && slot / 8 < 4096, "slot offset must fit an ldr/str immediate");
+        (slot / 8) << 10
+    };
     let mut words = match site {
         Site::ReadThreadPointer { rt } => {
+            let imm = imm(tp_slot);
             vec![MRS_TPIDRRO | rt, AND_NOT7 | (rt << 5) | rt, LDR_UIMM | imm | (rt << 5) | rt]
         }
         Site::WriteThreadPointer { rt } => {
             // A scratch register, saved below sp (Linux arm64 has no red zone,
             // so memory below sp is not live).
+            let imm = imm(tp_slot);
             let s = if rt == 16 { 17 } else { 16 };
             vec![
                 PUSH | s,
@@ -139,9 +168,55 @@ pub fn stub(site: Site, slot: u32, stub: u64, ret: u64) -> Vec<u32> {
                 POP | s,
             ]
         }
+        Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
     };
     let at = stub + 4 * words.len() as u64;
     words.push(branch(at, ret).expect("stub placed within branch range of its site"));
+    words
+}
+
+/// Body of the stub for an `x18`-naming instruction (without the final branch
+/// back). `x18` lives in the TSD slot whose `ldr`/`str` immediate is `imm`.
+fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
+    let ops = crate::decode::operands(insn).expect("x18 site must decode");
+    let field_reg = |f: &crate::decode::Field| (insn >> f.shift) & 0x1f;
+
+    // Registers the instruction already uses (real GPRs, not xzr), plus x18.
+    let mut used = 1u32 << 18;
+    for f in &ops {
+        let r = field_reg(f);
+        if r != 31 {
+            used |= 1 << r;
+        }
+    }
+    // Two scratch registers the instruction does not use: s1 stands in for x18,
+    // s2 holds the TSD base. macOS preserves every register but x18 across
+    // preemption, so ordinary scratch registers are safe to rely on.
+    let pick = |used: u32| (0u32..=30).find(|&r| used & (1 << r) == 0).expect("a free register");
+    let s1 = pick(used);
+    let s2 = pick(used | (1 << s1));
+
+    let reads = ops.iter().any(|f| field_reg(f) == 18 && f.read);
+    let writes = ops.iter().any(|f| field_reg(f) == 18 && f.write);
+
+    // The instruction with every x18 operand replaced by s1.
+    let mut rewritten = insn;
+    for f in &ops {
+        if field_reg(f) == 18 {
+            rewritten = (rewritten & !(0x1f << f.shift)) | (s1 << f.shift);
+        }
+    }
+
+    let mut words = vec![PUSH | s1, PUSH | s2, MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2];
+    if reads {
+        words.push(LDR_UIMM | imm | (s2 << 5) | s1);
+    }
+    words.push(rewritten);
+    if writes {
+        words.push(STR_UIMM | imm | (s2 << 5) | s1);
+    }
+    words.push(POP | s2);
+    words.push(POP | s1);
     words
 }
 
@@ -207,7 +282,7 @@ mod tests {
     // Encodings checked against llvm-mc.
     #[test]
     fn read_stub_encoding() {
-        let s = stub(Site::ReadThreadPointer { rt: 5 }, 16, 0x2000, 0x1004);
+        let s = stub(Site::ReadThreadPointer { rt: 5 }, 16, 24, 0x2000, 0x1004);
         assert_eq!(
             s,
             vec![
@@ -221,7 +296,7 @@ mod tests {
 
     #[test]
     fn write_stub_encoding() {
-        let s = stub(Site::WriteThreadPointer { rt: 0 }, 8, 0x2000, 0x1004);
+        let s = stub(Site::WriteThreadPointer { rt: 0 }, 8, 24, 0x2000, 0x1004);
         assert_eq!(
             s,
             vec![
@@ -234,7 +309,62 @@ mod tests {
             ]
         );
         // Writing x16 uses x17 as scratch.
-        let s = stub(Site::WriteThreadPointer { rt: 16 }, 8, 0x2000, 0x1004);
+        let s = stub(Site::WriteThreadPointer { rt: 16 }, 8, 24, 0x2000, 0x1004);
         assert_eq!(s[0], 0xf81f_0ff1);
+    }
+
+    #[test]
+    fn x18_read_stub() {
+        // mov x10, x18 (orr x10, xzr, x18): reads x18 via Rm. x0/x1 are free,
+        // so s1=x0 (stands in for x18), s2=x1 (TSD base). x18 slot 24 -> imm 3.
+        let s = stub(Site::X18 { insn: 0xaa1203ea }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe0, // str x0, [sp, #-16]!
+                0xf81f_0fe1, // str x1, [sp, #-16]!
+                0xd53b_d061, // mrs x1, tpidrro_el0
+                0x927d_f021, // and x1, x1, #~7
+                0xf940_0c20, // ldr x0, [x1, #24]
+                0xaa00_03ea, // orr x10, xzr, x0  (x18 -> x0)
+                0xf841_07e1, // ldr x1, [sp], #16
+                0xf841_07e0, // ldr x0, [sp], #16
+                branch(0x2000 + 8 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn x18_write_stub() {
+        // movz x18, #0x1818: writes x18 via Rd. s1=x0, s2=x1.
+        let s = stub(Site::X18 { insn: 0xd2830312 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe0, // str x0, [sp, #-16]!
+                0xf81f_0fe1, // str x1, [sp, #-16]!
+                0xd53b_d061, // mrs x1, tpidrro_el0
+                0x927d_f021, // and x1, x1, #~7
+                0xd283_0300, // movz x0, #0x1818  (x18 -> x0)
+                0xf900_0c20, // str x0, [x1, #24]
+                0xf841_07e1, // ldr x1, [sp], #16
+                0xf841_07e0, // ldr x0, [sp], #16
+                branch(0x2000 + 8 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn x18_sites_and_deferrals_counted() {
+        let mut code = words(&[
+            0xd2830312, // movz x18, #0x1818  -> rewritable site
+            0xaa1203ea, // mov x10, x18       -> rewritable site
+            0xf9400012, // ldr x18, [x0]      -> deferred (load/store)
+            0xd2800000, // movz x0, #0        -> untouched
+        ]);
+        let p = patch(&mut code);
+        assert_eq!(p.sites.len(), 2);
+        assert_eq!(p.x18_deferred, 1);
+        assert!(matches!(p.sites[0].1, Site::X18 { insn: 0xd2830312 }));
     }
 }

@@ -433,23 +433,17 @@ fn host_preserves_x18() -> bool {
     info.contains("x18 preserved: yes")
 }
 
-/// x18 across trapped system calls, where the host supports preserving it.
+/// x18 across trapped system calls. Guest uses of x18 are rewritten to a
+/// per-thread slot, so this holds regardless of whether the host preserves x18.
 #[test]
 fn asm_x18_survives_syscalls() {
-    if !host_preserves_x18() {
-        eprintln!("skipped: host does not preserve x18");
-        return;
-    }
     assert_eq!(fwe(&asm_guest("x18-pie"), &[]).status.code(), Some(0));
 }
 
-/// x18 across preemption alone, where the host supports preserving it.
+/// x18 across preemption alone — the case the custom x18 ABI could not cover on
+/// the CI VMs. The rewrite keeps x18 in a slot, so it survives preemption.
 #[test]
 fn asm_x18_survives_preemption() {
-    if !host_preserves_x18() {
-        eprintln!("skipped: host does not preserve x18");
-        return;
-    }
     assert_eq!(fwe(&asm_guest("x18spin-pie"), &[]).status.code(), Some(0));
 }
 

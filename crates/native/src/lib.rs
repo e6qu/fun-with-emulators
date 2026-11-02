@@ -1,6 +1,7 @@
 //! The native execution backend: Linux code runs directly on the CPU inside
 //! this macOS process, with system calls redirected to the kernel layer.
 
+pub mod decode;
 pub mod hwcap;
 pub mod loader;
 pub mod prepare;
@@ -48,6 +49,8 @@ static KERNEL: Mutex<Option<Kernel<NativePlatform>>> = Mutex::new(None);
 pub struct NativePlatform {
     /// Byte offset of the guest thread pointer in the host TSD.
     pub tp_slot: u32,
+    /// Byte offset of the guest `x18` in the host TSD.
+    pub x18_slot: u32,
     pub page_size: u64,
 }
 
@@ -60,7 +63,7 @@ impl NativePlatform {
     ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
-        unsafe { prepare::prepare(addr, len, self.tp_slot, self.page_size, arena) }
+        unsafe { prepare::prepare(addr, len, self.tp_slot, self.x18_slot, self.page_size, arena) }
     }
 }
 
@@ -135,6 +138,20 @@ pub fn thread_pointer_slot() -> u32 {
         // On Linux the thread pointer starts out as zero.
         // SAFETY: setting this thread's value for the key just created.
         unsafe { libc::pthread_setspecific(key, std::ptr::null()) };
+        (key as u32) * 8
+    })
+}
+
+/// The host TSD slot holding the guest `x18`, as a byte offset from the TSD
+/// base. Every thread's slot defaults to zero (a fresh pthread key reads NULL),
+/// which matches the guest's initial `x18`, so no per-thread setup is needed.
+pub fn x18_slot() -> u32 {
+    static SLOT: OnceLock<u32> = OnceLock::new();
+    *SLOT.get_or_init(|| {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: creating a key without destructor; it lives forever.
+        let r = unsafe { libc::pthread_key_create(&mut key, None) };
+        assert_eq!(r, 0, "pthread_key_create failed");
         (key as u32) * 8
     })
 }
@@ -584,7 +601,8 @@ fn start(
     if options.strace {
         tracer.note(&format!("host: {host}"));
     }
-    let platform = NativePlatform { tp_slot: thread_pointer_slot(), page_size: page };
+    let platform =
+        NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
 
     // The root filesystem; also used to find the dynamic linker.
     let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
