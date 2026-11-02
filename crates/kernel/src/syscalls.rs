@@ -207,6 +207,14 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::GETRUSAGE => {
+                // `struct rusage` is 144 bytes on arm64; report it zeroed.
+                if a[1] != 0 {
+                    // SAFETY: the guest passed a buffer for a `struct rusage`.
+                    unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) };
+                }
+                0
+            }
             nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
             nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
             nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),

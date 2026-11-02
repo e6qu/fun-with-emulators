@@ -101,6 +101,17 @@ interpreter's load base), `AT_ENTRY` (the executable's entry), and
 The interpreter maps the executable's shared libraries itself through our
 `openat` and file-backed `mmap`.
 
+## Processes
+
+`execve` loads a new program with the shared `load_image` and enters it with
+a fresh register set, resetting signal and per-thread state; the old image's
+mappings are not reclaimed yet, so it suits fork-then-exec and exec chains.
+`fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
+`fork` and is supported for single-threaded guests only, since another
+thread could hold a lock across the fork. `wait4` reaps a child through the
+host and translates the status into the Linux encoding. `execve`, `fork` and
+`wait4` all run without the kernel lock.
+
 ## Signals
 
 The kernel stores each signal's `sigaction`, the blocked mask and the
@@ -151,7 +162,8 @@ errno values are generated from the Linux UAPI headers by `tools/gen-abi.py`.
 
 These are tracked on the roadmap:
 
-- `fork`, `execve` and `wait` are not implemented (threads via `clone` are).
+- `fork` is single-threaded only; `vfork`, `waitid` and `execveat` are not
+  implemented; `execve` does not reclaim the old address space.
 - Signal mask and alternate stack are process-wide, not per thread.
 - Floating-point/vector registers are not saved across a signal handler.
 - Executables linked below 4 GiB are rejected (see above).
