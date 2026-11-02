@@ -151,6 +151,19 @@ memory), then re-locks only to record the result and deliver a pending
 signal. Per-thread signal masks and alternate stacks are not yet separated
 (the mask and altstack are process-wide).
 
+## Synthetic /proc and /sys
+
+The guest rootfs has no real `/proc` or `/sys`, so the filesystem layer
+checks `crates/kernel/src/procfs.rs` before the host rootfs and generates the
+entries programs read at startup: `/proc/self/exe` (a symlink) and
+`/proc/self/cmdline`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
+`/proc/uptime`, `/proc/loadavg`, `/proc/sys/kernel/*`, `/proc/sys/vm/*` and
+`/sys/devices/system/cpu/*`. File content is served from an anonymous,
+seekable fd (an immediately-unlinked temp file). The per-process values
+(exe, cmdline, cpu count, host name) are set at program load and `execve`.
+An unknown path under `/proc` or `/sys` is `ENOENT`; directory listing of
+`/proc` and `/sys` is not provided yet.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are

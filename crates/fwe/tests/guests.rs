@@ -78,6 +78,7 @@ const ASM_GUESTS: &[&str] = &[
     "execer",
     "execee",
     "forktest",
+    "procread",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -222,6 +223,14 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     cmd.args(["-flavor", "gnu"]).args(link_args).arg("-o").arg(&bin).arg(&obj);
     run_checked(&mut cmd);
     bin
+}
+
+/// Synthetic /proc: a guest reads /proc/sys/kernel/ostype and gets "Linux".
+#[test]
+fn reads_synthetic_proc() {
+    for name in ["procread", "procread-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
 
 /// fork and wait: a guest forks, the child exits 7, and the parent reaps it
