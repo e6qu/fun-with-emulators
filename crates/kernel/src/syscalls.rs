@@ -117,8 +117,11 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call; SEEK_SET/CUR/END match.
                 ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
             }
-            // SAFETY: plain host call.
-            nr::CLOSE => ret(unsafe { libc::close(a[0] as i32) }),
+            nr::CLOSE => match crate::specialfd::try_close(a[0] as i32) {
+                Some(r) => r,
+                // SAFETY: plain host call.
+                None => ret(unsafe { libc::close(a[0] as i32) }),
+            },
             nr::DUP => {
                 // SAFETY: plain host call.
                 ret(unsafe { libc::dup(a[0] as i32) })
@@ -127,6 +130,20 @@ impl<P: Platform> Kernel<P> {
             nr::FCNTL => self.sys_fcntl(a[0], a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(a[0], a[1], a[2]),
             nr::PPOLL => self.sys_ppoll(a[0], a[1], a[2]),
+            // SAFETY: epoll_create1 takes no pointers.
+            nr::EPOLL_CREATE1 => unsafe { crate::epoll::create1(a[0]) },
+            // SAFETY: the host validates the epoll_event pointer.
+            nr::EPOLL_CTL => unsafe { crate::epoll::ctl(a[0], a[1], a[2], a[3]) },
+            // SAFETY: eventfd2 takes no pointers.
+            nr::EVENTFD2 => unsafe { crate::specialfd::eventfd2(a[0], a[1]) },
+            // SAFETY: timerfd_create takes no pointers.
+            nr::TIMERFD_CREATE => unsafe { crate::specialfd::timerfd_create(a[0], a[1]) },
+            // SAFETY: the itimerspec pointers are validated by the host/impl.
+            nr::TIMERFD_SETTIME => unsafe {
+                crate::specialfd::timerfd_settime(a[0], a[1], a[2], a[3])
+            },
+            // SAFETY: the itimerspec pointer is validated by the host/impl.
+            nr::TIMERFD_GETTIME => unsafe { crate::specialfd::timerfd_gettime(a[0], a[1]) },
 
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),

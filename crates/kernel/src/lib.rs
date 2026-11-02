@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod epoll;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -17,6 +18,7 @@ pub mod host;
 mod mm;
 pub mod procfs;
 mod signal;
+pub mod specialfd;
 mod syscalls;
 pub mod thread;
 mod trace;
@@ -201,6 +203,15 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
         // SAFETY: caller guarantees the request/remain pointers are valid.
         n::CLOCK_NANOSLEEP => unsafe { syscalls::clock_nanosleep(a[0], a[1], a[2], a[3]) },
+        // SAFETY: caller guarantees the events and sigmask pointers are valid.
+        n::EPOLL_PWAIT => unsafe { epoll::pwait(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        // read/write on an eventfd/timerfd can block and must not hold the
+        // kernel lock; `try_*` returns None for any other descriptor, so a
+        // normal read/write falls through to the locked host path.
+        // SAFETY: caller guarantees the buffer spans the length.
+        n::READ => return unsafe { specialfd::try_read(a[0] as i32, a[1], a[2]) },
+        // SAFETY: caller guarantees the buffer spans the length.
+        n::WRITE => return unsafe { specialfd::try_write(a[0] as i32, a[1], a[2]) },
         _ => return None,
     })
 }
