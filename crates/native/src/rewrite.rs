@@ -46,10 +46,11 @@ const POP: u32 = 0xf841_07e0;
 /// `b <label>`
 const B: u32 = 0x1400_0000;
 
-/// Largest stub, in instructions. The `x18` stub is the biggest: save two
-/// scratch registers, load the TSD base, load `x18`, run the instruction,
-/// store `x18`, restore the two scratch registers, branch back.
-pub const STUB_WORDS: usize = 10;
+/// Largest stub, in instructions. The `x18` branch stub is the biggest: save
+/// two scratch registers, load the TSD base and `x18`, test it, and restore the
+/// scratch registers down each of the taken and not-taken paths before a
+/// full-range branch.
+pub const STUB_WORDS: usize = 12;
 
 /// Reach of a `b` instruction.
 pub const BRANCH_RANGE: u64 = 128 << 20;
@@ -111,7 +112,7 @@ pub fn patch(code: &mut [u8]) -> Patched {
         } else if insn & !RT_MASK == MSR_TPIDR {
             out.sites.push((i as u64 * 4, Site::WriteThreadPointer { rt: insn & RT_MASK }));
             None
-        } else if rewritable_x18(insn) {
+        } else if rewritable_x18(insn) || crate::decode::x18_branch(insn) {
             out.sites.push((i as u64 * 4, Site::X18 { insn }));
             None
         } else {
@@ -156,6 +157,7 @@ pub fn count_sites(code: &[u8]) -> usize {
             (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31)
                 || i & !RT_MASK == MSR_TPIDR
                 || rewritable_x18(i)
+                || crate::decode::x18_branch(i)
         })
         .count()
 }
@@ -195,11 +197,56 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
                 POP | s,
             ]
         }
+        // A compare/test branch that reads x18 builds its own complete stub,
+        // including its outgoing branches.
+        Site::X18 { insn } if crate::decode::x18_branch(insn) => {
+            return x18_branch_stub(insn, imm(x18_slot), stub, ret);
+        }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
     };
     let at = stub + 4 * words.len() as u64;
     words.push(branch(at, ret).expect("stub placed within branch range of its site"));
     words
+}
+
+/// Stub for a `cbz`/`cbnz`/`tbz`/`tbnz` that tests `x18`. It loads `x18` into a
+/// scratch, runs the branch against the scratch to a local label, then restores
+/// the scratch registers down both paths and branches (full range) to the real
+/// target or the fall-through. `x0`/`x1` are free here — these branches read no
+/// register other than `x18` — and are saved and restored, so they are intact
+/// at both destinations.
+fn x18_branch_stub(insn: u32, imm: u32, stub: u64, ret: u64) -> Vec<u32> {
+    let site = ret.wrapping_sub(4);
+    let (s1, s2) = (0u32, 1u32);
+    let tb = (insn >> 25) & 0x3f == 0b011011; // tbz/tbnz (vs cbz/cbnz)
+    let imm_bits = if tb {
+        (((insn >> 5) & 0x3fff) as i64) << 50 >> 50
+    } else {
+        (((insn >> 5) & 0x7ffff) as i64) << 45 >> 45
+    };
+    let off = imm_bits * 4;
+    let target = (site as i64).wrapping_add(off) as u64;
+
+    // The conditional branch with Rt -> s1 and its offset retargeted to the
+    // local `taken` label, which sits 4 words after the branch.
+    let mut cond = (insn & !0x1f) | s1;
+    cond =
+        if tb { (cond & !(0x3fff << 5)) | (4 << 5) } else { (cond & !(0x7ffff << 5)) | (4 << 5) };
+    let at = |i: u64| stub + 4 * i;
+    vec![
+        PUSH | s1,                                                   // 0: save x0
+        PUSH | s2,                                                   // 1: save x1
+        MRS_TPIDRRO | s2,                                            // 2
+        AND_NOT7 | (s2 << 5) | s2,                                   // 3: s2 = TSD base
+        LDR_UIMM | imm | (s2 << 5) | s1,                             // 4: s1 = x18
+        cond,                                                        // 5: if taken -> word 9
+        POP | s2,                                                    // 6: not taken: restore x1
+        POP | s1,                                                    // 7: restore x0
+        branch(at(8), ret).expect("fall-through within range"),      // 8
+        POP | s2,                                                    // 9: taken: restore x1
+        POP | s1,                                                    // 10: restore x0
+        branch(at(11), target).expect("branch target within range"), // 11
+    ]
 }
 
 /// Body of the stub for an `x18`-naming instruction (without the final branch
@@ -226,17 +273,19 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let reads = ops.iter().any(|f| field_reg(f) == 18 && f.read);
     let writes = ops.iter().any(|f| field_reg(f) == 18 && f.write);
 
-    // The instruction with every x18 operand replaced by s1.
-    let mut rewritten = insn;
+    // Start from the instruction with any `sp`-relative offset bumped past the
+    // 32 bytes the stub pushes, then replace every x18 operand with s1. The
+    // offset fix-up touches only immediate bits, the substitution only the
+    // register fields that hold x18 in the original instruction, so the two are
+    // independent.
+    let mut rewritten = match crate::decode::sp_fixup(insn) {
+        crate::decode::SpFixup::Adjusted(a) => a,
+        _ => insn,
+    };
     for f in &ops {
         if field_reg(f) == 18 {
             rewritten = (rewritten & !(0x1f << f.shift)) | (s1 << f.shift);
         }
-    }
-    // An `sp`-based load/store must reach past the 32 bytes the stub pushes.
-    if let Some(delta) = crate::decode::sp_adjust(insn) {
-        let imm12 = ((insn >> 10) & 0xfff) + delta;
-        rewritten = (rewritten & !(0xfff << 10)) | (imm12 << 10);
     }
 
     let mut words = vec![PUSH | s1, PUSH | s2, MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2];
@@ -382,6 +431,29 @@ mod tests {
                 0xf841_07e1, // ldr x1, [sp], #16
                 0xf841_07e0, // ldr x0, [sp], #16
                 branch(0x2000 + 8 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn x18_compare_branch_stub() {
+        // cbnz x18, #8 at site 0x1000 (target 0x1008). s1=x0, s2=x1.
+        let s = stub(Site::X18 { insn: 0xb5000052 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe0,                              // str x0, [sp, #-16]!
+                0xf81f_0fe1,                              // str x1, [sp, #-16]!
+                0xd53b_d061,                              // mrs x1, tpidrro_el0
+                0x927d_f021,                              // and x1, x1, #~7
+                0xf940_0c20,                              // ldr x0, [x1, #24]   (x18)
+                0xb500_0080,                              // cbnz x0, #16        (-> taken, word 9)
+                0xf841_07e1,                              // ldr x1, [sp], #16   (not taken)
+                0xf841_07e0,                              // ldr x0, [sp], #16
+                branch(0x2000 + 8 * 4, 0x1004).unwrap(),  // b site+4
+                0xf841_07e1,                              // ldr x1, [sp], #16   (taken)
+                0xf841_07e0,                              // ldr x0, [sp], #16
+                branch(0x2000 + 11 * 4, 0x1008).unwrap(), // b target
             ]
         );
     }

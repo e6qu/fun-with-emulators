@@ -74,6 +74,9 @@ const ASM_GUESTS: &[&str] = &[
     "x18spin",
     "x18mem",
     "x18dp",
+    "x18ldst",
+    "x18br",
+    "x18fp",
     "fileio",
     "sigtest",
     "threadtest",
@@ -427,14 +430,6 @@ fn asm_registers_preserved() {
     }
 }
 
-/// Whether this host preserves x18, as reported by `fwe --host-info`.
-fn host_preserves_x18() -> bool {
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg("--host-info").output().unwrap();
-    let info = String::from_utf8_lossy(&out.stdout).into_owned();
-    eprintln!("host info: {info}");
-    info.contains("x18 preserved: yes")
-}
-
 /// x18 across trapped system calls. Guest uses of x18 are rewritten to a
 /// per-thread slot, so this holds regardless of whether the host preserves x18.
 #[test]
@@ -464,6 +459,28 @@ fn asm_x18_survives_data_processing() {
     assert_eq!(fwe(&asm_guest("x18dp-pie"), &[]).status.code(), Some(0));
 }
 
+/// x18 through the remaining load/store addressing modes (unscaled, register
+/// offset, pre/post-index, and load/store pair including an sp base), across
+/// preemption.
+#[test]
+fn asm_x18_survives_load_store_addressing() {
+    assert_eq!(fwe(&asm_guest("x18ldst-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz), across preemption:
+/// the branch stub tests the preserved value rather than the hardware x18.
+#[test]
+fn asm_x18_survives_compare_branches() {
+    assert_eq!(fwe(&asm_guest("x18br-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 moved to/from floating-point registers (fmov, scvtf, fcvtzs), across
+/// preemption — the form a compiled SIMD scan loop uses.
+#[test]
+fn asm_x18_survives_fp_moves() {
+    assert_eq!(fwe(&asm_guest("x18fp-pie"), &[]).status.code(), Some(0));
+}
+
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.
 #[test]
 fn asm_tpidr_survives_syscalls() {
@@ -490,16 +507,13 @@ fn rust_args_env_and_exit_status() {
     assert_eq!(out.status.code(), Some(7));
 }
 
-/// Compiled Linux code uses x18 as a scratch register, and macOS clears x18
-/// on exception return (page faults, preemption) unless the custom x18 ABI
-/// keeps it. Without that, heavier programs fail at random; rewriting x18
-/// uses for older macOS is on the roadmap.
+/// A compiled Rust/musl binary exercising heap, sleep, clock and a large
+/// allocation. Compiled code uses x18 as a scratch register throughout; the
+/// x18 rewrite (every x18-naming instruction in this binary is covered) keeps
+/// it correct across preemption and faults with no reliance on the host, so
+/// this runs unconditionally.
 #[test]
 fn rust_runtime_services() {
-    if !host_preserves_x18() {
-        eprintln!("skipped: host does not preserve x18");
-        return;
-    }
     let out = fwe(&rust_guest("sysinfo"), &[]);
     assert_eq!(
         stdout(&out),

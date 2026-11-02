@@ -47,10 +47,12 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         return Some(vec![Field { shift: RD, read: movk, write: true }]);
     }
 
-    // Add/subtract (immediate): op[28:24] = 10001. Here register 31 is `sp` in
-    // both the Rd and Rn fields, so defer when either is 31.
+    // Add/subtract (immediate): op[28:24] = 10001. Rn 31 is `sp`. Rd 31 is `sp`
+    // for plain ADD/SUB but `xzr` for the flag-setting ADDS/SUBS (bit 29 = S),
+    // i.e. `cmp`/`cmn` — those must still be rewritten when they read x18.
     if (insn >> 24) & 0x1f == 0b10001 {
-        if reg(insn, RD) == 31 || reg(insn, RN) == 31 {
+        let flag_setting = (insn >> 29) & 1 == 1;
+        if reg(insn, RN) == 31 || (!flag_setting && reg(insn, RD) == 31) {
             return None;
         }
         return Some(vec![
@@ -59,10 +61,11 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         ]);
     }
 
-    // Logical (immediate): op[28:23] = 100100. Rd is `sp` when 31 in this
-    // class; Rn 31 is `xzr`.
+    // Logical (immediate): op[28:23] = 100100. Rn 31 is `xzr`. Rd 31 is `sp`
+    // except for ANDS (opc = 11, i.e. `tst`), where it is `xzr`.
     if (insn >> 23) & 0x3f == 0b100100 {
-        if reg(insn, RD) == 31 {
+        let ands = (insn >> 29) & 0b11 == 0b11;
+        if reg(insn, RD) == 31 && !ands {
             return None;
         }
         return Some(vec![
@@ -155,37 +158,146 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         ]);
     }
 
-    // Load/store register, unsigned immediate offset, general-purpose. This
-    // excludes the pair, pre/post-index, register-offset and literal forms and
-    // the SIMD variants. Rt is written by a load and read by a store; the base
-    // Rn is read (31 is `sp`). An `sp` base is allowed only when the stub's
-    // 32-byte push can be compensated in the immediate (see `sp_adjust`).
-    if insn & 0x3f00_0000 == 0x3900_0000 {
-        if reg(insn, RN) == 31 && sp_adjust(insn).is_none() {
-            return None;
-        }
-        let is_load = (insn >> 22) & 1 == 1;
-        return Some(vec![
-            Field { shift: RD, read: !is_load, write: is_load }, // Rt
-            Field { shift: RN, read: true, write: false },       // base
-        ]);
+    // Conversions between floating-point and integer (FMOV to/from a GPR,
+    // FCVT*, SCVTF/UCVTF). These are the only FP instructions that touch a GPR;
+    // the FP operand is a vector register (which macOS does not clear) and is
+    // left alone. op[28:24] = 11110, bit 21 = 1, bits[15:10] = 0 (which
+    // excludes FP arithmetic and compares). The "from general register" ops
+    // (SCVTF/UCVTF and FMOV into FP, opcode 010/011/111) read Rn; the rest
+    // write Rd.
+    if (insn >> 24) & 0x1f == 0b11110 && (insn >> 21) & 1 == 1 && (insn >> 10) & 0x3f == 0 {
+        let opcode = (insn >> 16) & 0b111;
+        let from_gpr = matches!(opcode, 0b010 | 0b011 | 0b111);
+        return Some(if from_gpr {
+            vec![Field { shift: RN, read: true, write: false }]
+        } else {
+            vec![Field { shift: RD, read: false, write: true }]
+        });
     }
 
+    load_store(insn)
+}
+
+/// GPR operand fields of a load/store instruction, or `None` to defer. For
+/// SIMD variants only the base (and a register offset) are GPRs — the
+/// transfer registers are vectors, which macOS does not clear. An `sp` base is
+/// kept only when the stub's 32-byte push can be compensated (see [`sp_fixup`]).
+fn load_store(insn: u32) -> Option<Vec<Field>> {
+    let v = (insn >> 26) & 1 == 1; // SIMD?
+    let is_load = (insn >> 22) & 1 == 1;
+    let rt = |shift| Field { shift, read: !is_load, write: is_load };
+    let base = |write| Field { shift: RN, read: true, write };
+    let rr = |shift| Field { shift, read: true, write: false };
+    let sp_defer = reg(insn, RN) == 31 && !v && matches!(sp_fixup(insn), SpFixup::Defer);
+
+    // Single register, unsigned immediate offset.
+    if insn & 0x3b00_0000 == 0x3900_0000 {
+        if sp_defer {
+            return None;
+        }
+        return Some(if v { vec![base(false)] } else { vec![rt(RD), base(false)] });
+    }
+    // Single register: unscaled / unprivileged / pre- or post-index / register
+    // offset.
+    if insn & 0x3b00_0000 == 0x3800_0000 {
+        if (insn >> 21) & 1 == 1 {
+            // Register offset: a register offset cannot absorb the stub's push,
+            // so an `sp` base is deferred.
+            if reg(insn, RN) == 31 {
+                return None;
+            }
+            return Some(if v {
+                vec![base(false), rr(RM)]
+            } else {
+                vec![rt(RD), base(false), rr(RM)]
+            });
+        }
+        let idx = (insn >> 10) & 3; // 01 post-index, 11 pre-index write back
+        let writeback = idx == 0b01 || idx == 0b11;
+        if sp_defer {
+            return None;
+        }
+        return Some(if v { vec![base(writeback)] } else { vec![rt(RD), base(writeback)] });
+    }
+    // Load/store pair.
+    if insn & 0x3a00_0000 == 0x2800_0000 {
+        let mode = (insn >> 23) & 3; // 01 post, 10 offset, 11 pre, 00 no-alloc
+        let writeback = mode == 0b01 || mode == 0b11;
+        if sp_defer {
+            return None;
+        }
+        return Some(if v {
+            vec![base(writeback)]
+        } else {
+            vec![rt(RD), rt(10), base(writeback)] // Rt, Rt2, base
+        });
+    }
     None
 }
 
-/// For a load/store (unsigned immediate) with an `sp` base, the amount to add
-/// to the scaled `imm12` so the access still reaches the caller's data after
-/// the stub pushes 32 bytes below `sp`. `None` if `insn` is not such an
-/// instruction or the adjusted immediate would not fit.
-pub fn sp_adjust(insn: u32) -> Option<u32> {
-    if insn & 0x3f00_0000 != 0x3900_0000 || reg(insn, RN) != 31 {
-        return None;
+/// What to do with the `sp`-relative offset of a load/store when the stub has
+/// pushed 32 bytes below `sp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpFixup {
+    /// Base is not `sp`; the instruction runs unchanged.
+    NotSp,
+    /// Base is `sp`; run this instruction (offset bumped by 32 bytes) instead.
+    Adjusted(u32),
+    /// Base is `sp` but the bump cannot be encoded (or is a writeback form);
+    /// do not rewrite.
+    Defer,
+}
+
+/// Compute the [`SpFixup`] for a general-purpose load/store. Only called for
+/// GPR forms (`V == 0`); SIMD forms never name `x18` as a transfer register.
+pub fn sp_fixup(insn: u32) -> SpFixup {
+    if reg(insn, RN) != 31 {
+        return SpFixup::NotSp;
     }
-    let scale = 1u32 << (insn >> 30); // size field: log2 of the access width
-    let delta = 32 / scale;
-    let imm12 = (insn >> 10) & 0xfff;
-    (imm12 + delta <= 0xfff).then_some(delta)
+    // Unsigned immediate: scaled imm12.
+    if insn & 0x3b00_0000 == 0x3900_0000 {
+        let scale = 1u32 << (insn >> 30);
+        let imm12 = (insn >> 10) & 0xfff;
+        let n = imm12 + 32 / scale;
+        return if n <= 0xfff {
+            SpFixup::Adjusted((insn & !(0xfff << 10)) | (n << 10))
+        } else {
+            SpFixup::Defer
+        };
+    }
+    // Unscaled / index / register-offset family.
+    if insn & 0x3b00_0000 == 0x3800_0000 {
+        if (insn >> 21) & 1 == 1 {
+            return SpFixup::Defer; // register offset
+        }
+        let idx = (insn >> 10) & 3;
+        if idx == 0b01 || idx == 0b11 {
+            return SpFixup::Defer; // writeback onto sp
+        }
+        let imm9 = (((insn >> 12) & 0x1ff) as i32) << 23 >> 23; // signed byte offset
+        let n = imm9 + 32;
+        return if (-256..=255).contains(&n) {
+            SpFixup::Adjusted((insn & !(0x1ff << 12)) | (((n as u32) & 0x1ff) << 12))
+        } else {
+            SpFixup::Defer
+        };
+    }
+    // Pair.
+    if insn & 0x3a00_0000 == 0x2800_0000 {
+        let mode = (insn >> 23) & 3;
+        if mode == 0b01 || mode == 0b11 {
+            return SpFixup::Defer; // writeback onto sp
+        }
+        let scale = 4i32 << ((insn >> 31) & 1); // 4 (w) or 8 (x)
+        let imm7 = (((insn >> 15) & 0x7f) as i32) << 25 >> 25; // signed count of `scale`
+        let n = imm7 + 32 / scale;
+        return if (-64..=63).contains(&n) {
+            SpFixup::Adjusted((insn & !(0x7f << 15)) | (((n as u32) & 0x7f) << 15))
+        } else {
+            SpFixup::Defer
+        };
+    }
+    SpFixup::NotSp
 }
 
 /// If `insn` is a `ldr`-literal (PC-relative load), the byte offset of its
@@ -209,6 +321,16 @@ pub fn literal_target(insn: u32) -> Option<(i64, usize)> {
         _ => return None, // prefetch / reserved: no data load
     };
     Some((off, size))
+}
+
+/// Whether `insn` is a compare-and-branch (`cbz`/`cbnz`) or test-branch
+/// (`tbz`/`tbnz`) that reads `x18`. These are branches, so they cannot be moved
+/// to a stub naively; the branch stub loads `x18` into a scratch, tests it, and
+/// jumps to the real target or the fall-through. The tested register is `Rt`
+/// (bits 4:0).
+pub fn x18_branch(insn: u32) -> bool {
+    let family = (insn >> 25) & 0x3f;
+    (family == 0b011010 || family == 0b011011) && insn & 0x1f == 18
 }
 
 /// Whether `insn` names `x18` in any standard register-operand position. This
@@ -252,8 +374,24 @@ mod tests {
     fn add_sub_immediate_defers_on_sp() {
         // add x1, x2, #4 -> Rd write, Rn read
         assert_eq!(operands(0x91001041), Some(vec![rd(RD), rr(RN)]));
-        // add x18, sp, #0 (mov x18, sp) -> names sp, deferred
+        // add x18, sp, #0 (mov x18, sp) -> Rn is sp, deferred
         assert_eq!(operands(0x910003f2), None);
+        // add sp, x18, #8 -> Rd is sp, deferred
+        assert_eq!(operands(0x9100225f), None);
+        // cmp x18, #42 == subs xzr, x18, #42 -> Rd is xzr; read x18
+        assert_eq!(operands(0xf100aa5f), Some(vec![rd(RD), rr(RN)]));
+        // cmn x18, #1 == adds xzr, x18, #1 -> read x18
+        assert_eq!(operands(0xb100065f), Some(vec![rd(RD), rr(RN)]));
+        // subs x18, x19, #1 -> write x18, read x19
+        assert_eq!(operands(0xf1000672), Some(vec![rd(RD), rr(RN)]));
+    }
+
+    #[test]
+    fn logical_immediate_tst_reads_x18() {
+        // tst x18, #0xff == ands xzr, x18, #0xff -> Rd is xzr; read x18
+        assert_eq!(operands(0xf2401e5f), Some(vec![rd(RD), rr(RN)]));
+        // ands x18, x0, #0xff -> write x18, read x0
+        assert_eq!(operands(0xf2401c12), Some(vec![rd(RD), rr(RN)]));
     }
 
     #[test]
@@ -305,13 +443,68 @@ mod tests {
     }
 
     #[test]
-    fn sp_adjust_scales_by_access_size() {
-        // ldr x18, [sp, #16] (64-bit): +32 bytes = +4 in the scaled imm12
-        assert_eq!(sp_adjust(0xf9400bf2), Some(4));
-        // ldr w18, [sp, #4] (32-bit): +32 bytes = +8
-        assert_eq!(sp_adjust(0xb94007f2), Some(8));
-        // a non-sp base is not adjusted
-        assert_eq!(sp_adjust(0xf9400012), None);
+    fn sp_fixup_bumps_the_offset() {
+        // ldr x18, [sp, #16] (64-bit): +32 bytes = +4 scaled -> ldr x18,[sp,#48]
+        assert_eq!(sp_fixup(0xf9400bf2), SpFixup::Adjusted(0xf9401bf2));
+        // a non-sp base is left unchanged
+        assert_eq!(sp_fixup(0xf9400012), SpFixup::NotSp);
+    }
+
+    #[test]
+    fn load_store_addressing_forms() {
+        // ldur x18, [x0, #-8]: unscaled, Rt write (load), base read
+        assert_eq!(operands(0xf85f8012), Some(vec![rd(RD), rr(RN)]));
+        // ldr x18, [x0, #8]! : pre-index, base read+write
+        assert_eq!(
+            operands(0xf8408c12),
+            Some(vec![rd(RD), Field { shift: RN, read: true, write: true }])
+        );
+        // ldr x18, [x0], #8  : post-index, base read+write
+        assert_eq!(
+            operands(0xf8408412),
+            Some(vec![rd(RD), Field { shift: RN, read: true, write: true }])
+        );
+        // str x18, [sp, #16]! : pre-index onto sp -> deferred
+        assert_eq!(operands(0xf8010ff2), None);
+        // ldr x18, [x0, x1]  : register offset, Rt write, base read, Rm read
+        assert_eq!(operands(0xf8616812), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // ldp x18, x19, [x0, #16] : pair offset, Rt/Rt2 write, base read
+        assert_eq!(operands(0xa9414c12), Some(vec![rd(RD), rd(10), rr(RN)]));
+        // ldp x18, x19, [sp, #16] : pair offset onto sp -> allowed (imm7 adjusts)
+        assert_eq!(operands(0xa9414ff2), Some(vec![rd(RD), rd(10), rr(RN)]));
+        // ldp x18, x19, [x0], #16 : pair post-index, base read+write
+        assert_eq!(
+            operands(0xa8c14c12),
+            Some(vec![rd(RD), rd(10), Field { shift: RN, read: true, write: true }])
+        );
+    }
+
+    #[test]
+    fn fp_integer_conversions() {
+        // fmov x18, d0 (to GPR): Rd write
+        assert_eq!(operands(0x9e660012), Some(vec![rd(RD)]));
+        // fcvtzs x18, d0 (to GPR): Rd write
+        assert_eq!(operands(0x9e780012), Some(vec![rd(RD)]));
+        // fmov x18, v0.d[1] (to GPR): Rd write
+        assert_eq!(operands(0x9eae0012), Some(vec![rd(RD)]));
+        // fmov d0, x18 (from GPR): Rn read
+        assert_eq!(operands(0x9e670240), Some(vec![rr(RN)]));
+        // scvtf d0, x18 (from GPR): Rn read
+        assert_eq!(operands(0x9e620240), Some(vec![rr(RN)]));
+        // ucvtf s0, w18 (from GPR): Rn read
+        assert_eq!(operands(0x1e230240), Some(vec![rr(RN)]));
+        // fadd d0, d1, d2 (FP arithmetic, no GPR): deferred
+        assert_eq!(operands(0x1e622820), None);
+    }
+
+    #[test]
+    fn simd_load_store_only_exposes_the_base() {
+        // ldr q0, [x18]: SIMD, base read only (q0 is a vector, not x18)
+        assert_eq!(operands(0x3dc00240), Some(vec![rr(RN)]));
+        // ldp q0, q1, [x18]: SIMD pair, base read only
+        assert_eq!(operands(0xad400640), Some(vec![rr(RN)]));
+        // str d0, [x18, x1]: SIMD register offset, base + Rm
+        assert_eq!(operands(0xfc216a40), Some(vec![rr(RN), rr(RM)]));
     }
 
     #[test]
@@ -324,16 +517,26 @@ mod tests {
 
     #[test]
     fn unhandled_classes_defer() {
-        // ldp x18, x19, [sp] -> pair form, deferred
-        assert_eq!(operands(0xa9404ff2), None);
-        // str x18, [x0, #8]! -> pre-index writeback, deferred
-        assert_eq!(operands(0xf8008c12), None);
         // adrp x18, . -> PC-relative, deferred
         assert_eq!(operands(0x90000012), None);
         // ret -> branch, deferred
         assert_eq!(operands(0xd65f03c0), None);
         // svc #0 -> deferred (handled elsewhere)
         assert_eq!(operands(0xd4000001), None);
+        // str x18, [sp, #16]! -> pre-index writeback onto sp, deferred
+        assert_eq!(operands(0xf8010ff2), None);
+    }
+
+    #[test]
+    fn x18_branches_detected() {
+        assert!(x18_branch(0xb5000012)); // cbnz x18
+        assert!(x18_branch(0xb4000012)); // cbz x18
+        assert!(x18_branch(0x37280012)); // tbnz x18, #5
+        assert!(x18_branch(0x36180012)); // tbz w18, #3
+        assert!(!x18_branch(0xb5000000)); // cbnz x0
+        assert!(!x18_branch(0x14000000)); // b
+        // these are branches, so the register decoder leaves them alone
+        assert_eq!(operands(0xb5000012), None);
     }
 
     #[test]

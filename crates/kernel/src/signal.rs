@@ -110,7 +110,14 @@ impl<P: Platform> Kernel<P> {
             && self.altstack.ss_flags & fwe_abi::signal::SS_DISABLE == 0;
         let base_sp =
             if on_altstack { self.altstack.ss_sp + self.altstack.ss_size } else { regs.sp };
-        let frame = align_down(base_sp - FRAME_SIZE, 16);
+        // If there is no room for a frame (e.g. a stack-overflow fault leaves sp
+        // below FRAME_SIZE, or the chosen stack base is tiny), we cannot deliver
+        // on this stack. Report it as undelivered rather than crashing `fwe`;
+        // the caller then takes the default action and prints diagnostics.
+        let frame = match base_sp.checked_sub(FRAME_SIZE) {
+            Some(v) => align_down(v, 16),
+            None => return false,
+        };
 
         let old_mask = self.sigmask;
         // SAFETY: `frame` is a writable region on the guest stack.
