@@ -72,6 +72,7 @@ const ASM_GUESTS: &[&str] = &[
     "tpidr",
     "x18",
     "x18spin",
+    "x18mem",
     "fileio",
     "sigtest",
     "threadtest",
@@ -445,6 +446,14 @@ fn asm_x18_survives_syscalls() {
 #[test]
 fn asm_x18_survives_preemption() {
     assert_eq!(fwe(&asm_guest("x18spin-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 spilled to memory (a register-based buffer and a stack slot) and
+/// reloaded, across preemption. Exercises the x18 load/store rewrite including
+/// the sp-offset adjustment.
+#[test]
+fn asm_x18_survives_memory_spill() {
+    assert_eq!(fwe(&asm_guest("x18mem-pie"), &[]).status.code(), Some(0));
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.
