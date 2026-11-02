@@ -119,6 +119,17 @@ impl Fs {
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname };
     }
 
+    /// The host path of the rootfs, or `None` when the root is the host `/`
+    /// (pass-through). Used to root `AF_UNIX` socket paths.
+    pub fn root_host_path(&self) -> Option<std::path::PathBuf> {
+        if self.root_host == b"/" {
+            None
+        } else {
+            use std::os::unix::ffi::OsStrExt;
+            Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&self.root_host)))
+        }
+    }
+
     /// A synthetic `/proc` or `/sys` entry for `path`, if it names one. Only
     /// absolute paths and `AT_FDCWD`-relative paths are considered.
     pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {

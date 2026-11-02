@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod creds;
 pub mod epoll;
 pub mod fs;
 mod fsops;
@@ -18,7 +19,9 @@ pub mod host;
 mod mm;
 pub mod net;
 pub mod procfs;
+pub mod pty;
 mod signal;
+pub mod signalfd;
 pub mod specialfd;
 mod syscalls;
 pub mod term;
@@ -72,6 +75,8 @@ pub struct Kernel<P: Platform> {
     pub brk: Brk,
     /// The guest's filesystem, when configured.
     pub fs: Option<Fs>,
+    /// The guest's virtual user/group identity.
+    pub creds: creds::Creds,
     pub(crate) sigactions: [Sigaction; absig::NSIG as usize],
     pub(crate) sigmask: u64,
     pub(crate) altstack: Stack,
@@ -89,6 +94,7 @@ impl<P: Platform> Kernel<P> {
             page_size,
             brk,
             fs,
+            creds: creds::Creds::default(),
             sigactions: [Sigaction::default(); absig::NSIG as usize],
             sigmask: 0,
             altstack: Stack { ss_flags: libc::SS_DISABLE, ..Stack::default() },
@@ -207,11 +213,18 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::CLOCK_NANOSLEEP => unsafe { syscalls::clock_nanosleep(a[0], a[1], a[2], a[3]) },
         // SAFETY: caller guarantees the events and sigmask pointers are valid.
         n::EPOLL_PWAIT => unsafe { epoll::pwait(a[0], a[1], a[2], a[3], a[4], a[5]) },
-        // read/write on an eventfd/timerfd can block and must not hold the
-        // kernel lock; `try_*` returns None for any other descriptor, so a
+        // read/write on an eventfd/timerfd/signalfd can block and must not hold
+        // the kernel lock; `try_*` returns None for any other descriptor, so a
         // normal read/write falls through to the locked host path.
-        // SAFETY: caller guarantees the buffer spans the length.
-        n::READ => return unsafe { specialfd::try_read(a[0] as i32, a[1], a[2]) },
+        n::READ => {
+            let (fd, buf, len) = (a[0] as i32, a[1], a[2]);
+            // SAFETY: caller guarantees the buffer spans the length.
+            if let Some(r) = unsafe { specialfd::try_read(fd, buf, len) } {
+                return Some(r);
+            }
+            // SAFETY: caller guarantees the buffer spans the length.
+            return unsafe { signalfd::try_read(fd, buf, len) };
+        }
         // SAFETY: caller guarantees the buffer spans the length.
         n::WRITE => return unsafe { specialfd::try_write(a[0] as i32, a[1], a[2]) },
         // Socket calls that can block run without the kernel lock, so a thread

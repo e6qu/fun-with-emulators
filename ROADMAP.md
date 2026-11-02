@@ -32,13 +32,13 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 ## M2 — Everyday software
 
-- [~] Networking (TCP/UDP over IPv4/IPv6 and `socketpair`; pathed `AF_UNIX`,
-  `SCM_RIGHTS` and netlink pending)
-- [~] Terminals and job control (`termios`, window size, tty process group,
-  sessions; pty device allocation pending)
-- [~] Event APIs (`epoll`, `eventfd`, `timerfd` done; `signalfd` pending)
+- [x] Networking (TCP/UDP over IPv4/IPv6, `socketpair`, pathed and abstract
+  `AF_UNIX`, `SCM_RIGHTS` descriptor passing; netlink and raw sockets are M4)
+- [x] Terminals and job control (`termios`, window size, tty process group,
+  sessions, pty allocation via `/dev/ptmx` + `/dev/pts`)
+- [x] Event APIs (`epoll`, `eventfd`, `timerfd`, `signalfd`)
 - [~] `/proc` and `/sys` (startup files served; directory listing pending)
-- [ ] Users, permissions and ownership
+- [x] Users, permissions and ownership (virtual credentials)
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.

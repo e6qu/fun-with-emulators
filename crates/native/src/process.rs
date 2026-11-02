@@ -84,6 +84,7 @@ pub fn do_execve(regs: &Regs) -> i64 {
     k.brk = out.brk;
     if let Some(fs) = k.fs.as_mut() {
         fs.set_proc_info(path.clone(), crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+        fwe_kernel::net::set_rootfs(fs.root_host_path());
     }
     let (sp, entry) = (out.sp, out.entry);
     drop(guard);
@@ -187,6 +188,12 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         // `struct rusage` is 144 bytes on arm64 Linux; zero it for now.
         // SAFETY: the guest passed a buffer for a `struct rusage`.
         unsafe { std::ptr::write_bytes(rusage as *mut u8, 0, 144) };
+    }
+    if r > 0 {
+        // A reaped child yields SIGCHLD; hand it to any watching signalfd.
+        const SIGCHLD: u64 = 17;
+        let info = fwe_kernel::signalfd::siginfo(SIGCHLD as u32, r as u32, linux_wstatus(status));
+        fwe_kernel::signalfd::deliver(SIGCHLD, info);
     }
     r as i64
 }

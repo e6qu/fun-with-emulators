@@ -117,11 +117,19 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call; SEEK_SET/CUR/END match.
                 ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
             }
-            nr::CLOSE => match crate::specialfd::try_close(a[0] as i32) {
-                Some(r) => r,
-                // SAFETY: plain host call.
-                None => ret(unsafe { libc::close(a[0] as i32) }),
-            },
+            nr::CLOSE => {
+                let fd = a[0] as i32;
+                if let Some(r) = crate::specialfd::try_close(fd) {
+                    r
+                } else if let Some(r) = crate::signalfd::try_close(fd) {
+                    r
+                } else if let Some(r) = crate::pty::try_close(fd) {
+                    r
+                } else {
+                    // SAFETY: plain host call.
+                    ret(unsafe { libc::close(fd) })
+                }
+            }
             nr::DUP => {
                 // SAFETY: plain host call.
                 ret(unsafe { libc::dup(a[0] as i32) })
@@ -130,6 +138,7 @@ impl<P: Platform> Kernel<P> {
             nr::FCNTL => self.sys_fcntl(a[0], a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(a[0], a[1], a[2]),
             nr::PPOLL => self.sys_ppoll(a[0], a[1], a[2]),
+            nr::SIGNALFD4 => self.sys_signalfd4(a[0], a[1], a[2], a[3]),
             // SAFETY: epoll_create1 takes no pointers.
             nr::EPOLL_CREATE1 => unsafe { crate::epoll::create1(a[0]) },
             // SAFETY: the host validates the epoll_event pointer.
@@ -189,10 +198,9 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::fchmod(a[0] as i32, a[1] as libc::mode_t) })
             }
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
-            nr::FCHOWN => {
-                // SAFETY: plain host call on a guest fd.
-                ret(unsafe { libc::fchown(a[0] as i32, a[1] as libc::uid_t, a[2] as libc::gid_t) })
-            }
+            // Ownership is virtual: honor the guest's credentials rather than
+            // changing the backing host file (fwe does not run as root).
+            nr::FCHOWN => self.chown_check(a[1] as u32, a[2] as u32),
             nr::TRUNCATE => self.sys_truncate(a[0], a[1]),
             nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
             nr::UMASK => self.sys_umask(a[0]),
@@ -235,10 +243,23 @@ impl<P: Platform> Kernel<P> {
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
             nr::GETPPID => host::getppid(),
-            nr::GETUID => host::ids().0,
-            nr::GETEUID => host::ids().1,
-            nr::GETGID => host::ids().2,
-            nr::GETEGID => host::ids().3,
+            // Virtual credentials (see crates/kernel/src/creds.rs).
+            nr::GETUID => self.creds.getuid(),
+            nr::GETEUID => self.creds.geteuid(),
+            nr::GETGID => self.creds.getgid(),
+            nr::GETEGID => self.creds.getegid(),
+            nr::SETUID => self.creds.setuid(a[0] as u32),
+            nr::SETREUID => self.creds.setreuid(a[0] as u32, a[1] as u32),
+            nr::SETRESUID => self.creds.setresuid(a[0] as u32, a[1] as u32, a[2] as u32),
+            nr::SETFSUID => self.creds.setfsuid(a[0] as u32),
+            nr::GETRESUID => self.sys_getresuid(a[0], a[1], a[2]),
+            nr::SETGID => self.creds.setgid(a[0] as u32),
+            nr::SETREGID => self.creds.setregid(a[0] as u32, a[1] as u32),
+            nr::SETRESGID => self.creds.setresgid(a[0] as u32, a[1] as u32, a[2] as u32),
+            nr::SETFSGID => self.creds.setfsgid(a[0] as u32),
+            nr::GETRESGID => self.sys_getresgid(a[0], a[1], a[2]),
+            nr::GETGROUPS => self.sys_getgroups(a[0], a[1]),
+            nr::SETGROUPS => self.sys_setgroups(a[0], a[1]),
             nr::SET_TID_ADDRESS => {
                 thread::set_clear_child_tid(a[0]);
                 thread::tid() as i64
@@ -302,6 +323,74 @@ impl<P: Platform> Kernel<P> {
                 err(errno::ENOSYS)
             }
         }
+    }
+
+    /// Shared `chown` policy against the virtual credentials. `chown(-1, -1)`
+    /// is always a no-op; otherwise only a virtual root may change ownership,
+    /// and it is a no-op on the host file (we do not run as root, and tracking
+    /// shadow ownership is not yet implemented).
+    pub(crate) fn chown_check(&self, uid: u32, gid: u32) -> i64 {
+        if uid == u32::MAX && gid == u32::MAX {
+            return 0;
+        }
+        if self.creds.euid == 0 { 0 } else { err(errno::EPERM) }
+    }
+
+    fn sys_getresuid(&self, rp: u64, ep: u64, sp: u64) -> i64 {
+        if rp == 0 || ep == 0 || sp == 0 {
+            return err(errno::EFAULT);
+        }
+        let (r, e, s) = self.creds.resuid();
+        // SAFETY: the three pointers are non-null guest words.
+        unsafe {
+            write(rp, r);
+            write(ep, e);
+            write(sp, s);
+        }
+        0
+    }
+
+    fn sys_getresgid(&self, rp: u64, ep: u64, sp: u64) -> i64 {
+        if rp == 0 || ep == 0 || sp == 0 {
+            return err(errno::EFAULT);
+        }
+        let (r, e, s) = self.creds.resgid();
+        // SAFETY: the three pointers are non-null guest words.
+        unsafe {
+            write(rp, r);
+            write(ep, e);
+            write(sp, s);
+        }
+        0
+    }
+
+    fn sys_getgroups(&self, size: u64, list: u64) -> i64 {
+        let groups = self.creds.groups();
+        let n = groups.len();
+        if size == 0 {
+            return n as i64;
+        }
+        if (size as usize) < n {
+            return err(errno::EINVAL);
+        }
+        for (i, &g) in groups.iter().enumerate() {
+            // SAFETY: `list` has room for `size >= n` u32s.
+            unsafe { write(list + (i * 4) as u64, g) };
+        }
+        n as i64
+    }
+
+    fn sys_setgroups(&mut self, size: u64, list: u64) -> i64 {
+        let n = size as usize;
+        if n > 65536 {
+            return err(errno::EINVAL);
+        }
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            // SAFETY: the guest provided `size` u32s at `list`.
+            v.push(unsafe { read::<u32>(list + (i * 4) as u64) });
+        }
+        self.creds.setgroups(v)
     }
 
     fn sys_dup3(&mut self, old: u64, new: u64, flags: u64) -> i64 {
@@ -397,6 +486,15 @@ impl<P: Platform> Kernel<P> {
                 }
                 ioctl::TIOCSCTTY => ret(libc::ioctl(fd, libc::TIOCSCTTY as _, arg as libc::c_int)),
                 ioctl::TIOCNOTTY => ret(libc::ioctl(fd, libc::TIOCNOTTY as _)),
+                ioctl::TIOCGPTN => match crate::pty::ptsnum(fd) {
+                    Some(n) => {
+                        (arg as *mut u32).write_unaligned(n);
+                        0
+                    }
+                    None => err(errno::ENOTTY),
+                },
+                // The slave is unlocked at allocation; accept the lock request.
+                ioctl::TIOCSPTLCK => 0,
                 ioctl::FIONREAD => ret(libc::ioctl(fd, libc::FIONREAD, arg as *mut libc::c_int)),
                 ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
                 ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),
@@ -622,10 +720,27 @@ impl<P: Platform> Kernel<P> {
         if sig == signal::SIGKILL {
             self.terminate_by(sig);
         }
+        // A blocked signal that a signalfd watches is delivered through that
+        // descriptor instead of being left pending.
+        if self.sigmask & (1 << (sig - 1)) != 0 {
+            let info = crate::signalfd::siginfo(sig as u32, me as u32, 0);
+            if crate::signalfd::deliver(sig, info) {
+                return 0;
+            }
+        }
         // Record it; delivery happens on return to the guest, after this
         // system call, in `deliver_pending`.
         self.raise_pending(sig);
         0
+    }
+
+    fn sys_signalfd4(&mut self, fd: u64, mask: u64, sizemask: u64, flags: u64) -> i64 {
+        if sizemask < 8 {
+            return err(errno::EINVAL);
+        }
+        // SAFETY: the guest passed a pointer to an 8-byte signal set.
+        let set = unsafe { read::<u64>(mask) };
+        crate::signalfd::signalfd4(fd as i32, set, flags)
     }
 
     fn sys_getrandom(&mut self, buf: u64, len: u64) -> i64 {
