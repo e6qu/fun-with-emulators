@@ -2,6 +2,7 @@
 
 use crate::{
     KERNEL, LIVE_THREADS, NativePlatform, load_image, page_size, thread_pointer_slot, trap,
+    x18_slot,
 };
 use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::{Regs, host, thread};
@@ -64,7 +65,8 @@ pub fn do_execve(regs: &Regs) -> i64 {
     let k = guard.as_mut().unwrap();
     let page = page_size();
     let strace = k.tracer.enabled;
-    let platform = NativePlatform { tp_slot: thread_pointer_slot(), page_size: page };
+    let platform =
+        NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
     let fs = k.fs.as_ref().expect("filesystem configured");
 
     let file = match fs.read(&path) {

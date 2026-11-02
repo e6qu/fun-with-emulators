@@ -62,17 +62,23 @@ rewrites the special instructions — still in-process, with no VM.
   (per-thread, read-only to user code). Stubs live in space reserved right
   after the image, within branch range.
 - **x18** is a scratch register for Linux code, but macOS reserves it and
-  clears it on every exception return (system calls, page faults,
-  preemption). On macOS 26.4 and later, `fwe` switches the guest thread into
-  the custom x18 ABI (`<os/arch/arm64.h>`) when entering guest code, and the
-  trap handlers leave it while running host code. On older macOS, guest x18
-  uses still need to be rewritten (roadmap); until then programs that keep
-  values in x18 across a page fault can fail. `fwe --host-info` reports
-  whether x18 is preserved on the current host. On macOS 26.6 virtual
-  machines (GitHub's runners) the host was observed to leave the mode on its
-  own when the thread is preempted; `fwe` detects this, never switches the
-  mode off when it is already off (which aborts), and treats x18 as not
-  preserved.
+  clears it on every exception return (system calls, page faults, and — the
+  case nothing can intercept — involuntary preemption). So guest state must
+  never live in the hardware `x18` between instructions. Each instruction that
+  names `x18` is redirected to a stub (the same out-of-line mechanism as
+  `TPIDR_EL0`) that keeps the guest's `x18` in a per-thread TSD slot: the stub
+  saves two scratch registers below `sp` (Linux arm64 has no red zone), reads
+  the slot into one of them, runs the instruction with `x18` replaced by that
+  scratch, writes the slot back if the instruction wrote `x18`, restores the
+  scratch registers and branches back. Because macOS preserves every register
+  *except* `x18` across preemption, an ordinary scratch register is safe.
+  `crates/native/src/decode.rs` decides which instructions this covers; the
+  current pass handles the data-processing classes (moves, logical and
+  add/sub, immediate and register forms) and leaves loads/stores, PC-relative
+  forms, branches and `sp` forms for a later pass (counted, not rewritten).
+  The custom x18 ABI (`<os/arch/arm64.h>`, macOS 26.4+) and `fwe --host-info`
+  remain only as a host probe; correctness no longer depends on the host
+  preserving `x18`.
 
 ## Filesystem
 
@@ -315,10 +321,17 @@ These are tracked on the roadmap:
 - Floating-point/vector registers are not saved across a signal handler.
 - Executables linked below 4 GiB are rejected for now; load-time relocation
   (see above) is the planned fix, not a VM.
-- Guest uses of `x18` are not yet rewritten, so a value kept in `x18` across a
-  preemption or fault can be lost; binary translation of `x18` is the planned
-  fix (see above). No hypervisor fallback is planned.
-- A data word equal to `svc #0` inside an executable segment would be
-  rewritten too.
+- Guest uses of `x18` in data-processing instructions are rewritten to a
+  per-thread slot (see above) and survive preemption; loads/stores,
+  PC-relative forms, branches and `sp` forms that name `x18` are not rewritten
+  yet, so a program that keeps a value in `x18` across one of those can still
+  lose it. Extending the pass to those forms is the next step.
+- The rewrite pass scans every aligned word of an executable segment, so a
+  data word that happens to encode `svc #0`, a `TPIDR_EL0` access or an
+  `x18`-naming data-processing instruction is rewritten too. `x18` encodings
+  are dense, so this is a real hazard for data embedded in executable memory
+  (literal pools, jump tables). Compiled programs and the test guests keep such
+  data in a non-executable `.rodata` segment, which is not scanned; recursive
+  descent over reachable code only is the planned general fix.
 - Guest pointers the kernel reads itself are not yet fault-checked; a bad
   pointer crashes `fwe` instead of returning `EFAULT`.

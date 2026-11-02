@@ -71,6 +71,7 @@ pub unsafe fn prepare(
     addr: u64,
     len: u64,
     slot: u32,
+    x18_slot: u32,
     page: u64,
     mut arena: Option<&mut StubArena>,
 ) -> Result<Prepared, NoStubSpace> {
@@ -86,7 +87,9 @@ pub unsafe fn prepare(
         let n = sites.iter().take_while(|(off, _)| off - first < GROUP_SPAN).count();
         let (group, rest) = sites.split_at(n);
         // SAFETY: the sites lie inside the caller's range.
-        unsafe { redirect(start, group, slot, page, start, start + len, arena.as_deref_mut()) }?;
+        unsafe {
+            redirect(start, group, slot, x18_slot, page, start, start + len, arena.as_deref_mut())
+        }?;
         sites = rest;
     }
     if stats.syscalls + stats.stubs > 0 {
@@ -103,10 +106,12 @@ pub unsafe fn prepare(
 ///
 /// # Safety
 /// The sites must be writable guest code.
+#[allow(clippy::too_many_arguments)]
 unsafe fn redirect(
     base: u64,
     group: &[(u64, Site)],
     slot: u32,
+    x18_slot: u32,
     page: u64,
     lo: u64,
     hi: u64,
@@ -134,7 +139,7 @@ unsafe fn redirect(
     let mut cursor = region;
     for &(offset, site) in group {
         let at = base + offset;
-        let words = rewrite::stub(site, slot, cursor, at + 4);
+        let words = rewrite::stub(site, slot, x18_slot, cursor, at + 4);
         for (i, w) in words.iter().enumerate() {
             // SAFETY: inside the region, which is writable.
             unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
@@ -267,7 +272,7 @@ mod tests {
             unsafe { ((code + 4 * i as u64) as *mut u32).write(*w) };
         }
         // SAFETY: the mapping is ours, writable and not executing.
-        let stats = unsafe { prepare(code, 12, 8, page, None) }.unwrap();
+        let stats = unsafe { prepare(code, 12, 8, 16, page, None) }.unwrap();
         assert_eq!(stats, Prepared { syscalls: 1, stubs: 2 });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };

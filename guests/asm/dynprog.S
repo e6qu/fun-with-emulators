@@ -12,6 +12,7 @@ _start:
     mov     x0, #0
     mov     x8, #94                 // exit_group
     svc     #0
+    .section .rodata
 message:
     .ascii  "dynamic handoff ok\n"
 message_end:
