@@ -35,7 +35,7 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [ ] Networking (sockets, DNS)
 - [ ] Terminals and job control
 - [ ] Event APIs (`epoll`, `eventfd`, `timerfd`, `signalfd`)
-- [ ] `/proc` and `/sys`
+- [~] `/proc` and `/sys` (startup files served; directory listing pending)
 - [ ] Users, permissions and ownership
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web

@@ -88,6 +88,7 @@ pub struct Fs {
     /// Host path of the root directory, for translating fd paths back.
     root_host: Vec<u8>,
     umask: u32,
+    proc: crate::procfs::ProcInfo,
 }
 
 impl Fs {
@@ -104,7 +105,31 @@ impl Fs {
         // SAFETY: `fd` is a fresh owned directory descriptor.
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
-        Ok(Fs { root, cwd: b"/".to_vec(), root_host, umask: 0o022 })
+        Ok(Fs {
+            root,
+            cwd: b"/".to_vec(),
+            root_host,
+            umask: 0o022,
+            proc: crate::procfs::ProcInfo::default(),
+        })
+    }
+
+    /// Set the per-process information the synthetic `/proc` files draw on.
+    pub fn set_proc_info(&mut self, exe: Vec<u8>, cmdline: Vec<u8>, ncpu: u32, hostname: Vec<u8>) {
+        self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname };
+    }
+
+    /// A synthetic `/proc` or `/sys` entry for `path`, if it names one. Only
+    /// absolute paths and `AT_FDCWD`-relative paths are considered.
+    pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
+        let absolute = if path.first() == Some(&b'/') {
+            normalize(b"/", path)
+        } else if dirfd as i64 == fcntl::AT_FDCWD {
+            normalize(&self.cwd, path)
+        } else {
+            return None;
+        };
+        crate::procfs::lookup(&absolute, &self.proc)
     }
 
     pub fn cwd(&self) -> &[u8] {
