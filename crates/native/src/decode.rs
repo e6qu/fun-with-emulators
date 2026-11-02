@@ -303,6 +303,16 @@ pub fn literal_target(insn: u32) -> Option<(i64, usize)> {
     Some((off, size))
 }
 
+/// Whether `insn` is a compare-and-branch (`cbz`/`cbnz`) or test-branch
+/// (`tbz`/`tbnz`) that reads `x18`. These are branches, so they cannot be moved
+/// to a stub naively; the branch stub loads `x18` into a scratch, tests it, and
+/// jumps to the real target or the fall-through. The tested register is `Rt`
+/// (bits 4:0).
+pub fn x18_branch(insn: u32) -> bool {
+    let family = (insn >> 25) & 0x3f;
+    (family == 0b011010 || family == 0b011011) && insn & 0x1f == 18
+}
+
 /// Whether `insn` names `x18` in any standard register-operand position. This
 /// over-approximates (it looks at the fixed Rd/Rn/Rm/Rt positions regardless of
 /// class) and is used only to *count* `x18` uses this pass does not yet
@@ -461,6 +471,18 @@ mod tests {
         assert_eq!(operands(0xd4000001), None);
         // str x18, [sp, #16]! -> pre-index writeback onto sp, deferred
         assert_eq!(operands(0xf8010ff2), None);
+    }
+
+    #[test]
+    fn x18_branches_detected() {
+        assert!(x18_branch(0xb5000012)); // cbnz x18
+        assert!(x18_branch(0xb4000012)); // cbz x18
+        assert!(x18_branch(0x37280012)); // tbnz x18, #5
+        assert!(x18_branch(0x36180012)); // tbz w18, #3
+        assert!(!x18_branch(0xb5000000)); // cbnz x0
+        assert!(!x18_branch(0x14000000)); // b
+        // these are branches, so the register decoder leaves them alone
+        assert_eq!(operands(0xb5000012), None);
     }
 
     #[test]

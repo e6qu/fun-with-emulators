@@ -75,6 +75,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18mem",
     "x18dp",
     "x18ldst",
+    "x18br",
     "fileio",
     "sigtest",
     "threadtest",
@@ -463,6 +464,13 @@ fn asm_x18_survives_data_processing() {
 #[test]
 fn asm_x18_survives_load_store_addressing() {
     assert_eq!(fwe(&asm_guest("x18ldst-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz), across preemption:
+/// the branch stub tests the preserved value rather than the hardware x18.
+#[test]
+fn asm_x18_survives_compare_branches() {
+    assert_eq!(fwe(&asm_guest("x18br-pie"), &[]).status.code(), Some(0));
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.

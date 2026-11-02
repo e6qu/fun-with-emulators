@@ -80,7 +80,12 @@ rewrites the special instructions — still in-process, with no VM.
   variants. An `sp` base, a stack spill of `x18`, is handled by bumping the
   access offset by the 32 bytes the stub pushes (`sp_fixup`), in whichever
   immediate the addressing form uses; writeback onto `sp` and register-offset
-  onto `sp` cannot be compensated and are deferred. For an `sp` base the stub adds the 32
+  onto `sp` cannot be compensated and are deferred. Compare- and test-branches
+  that read `x18` (`cbz`/`cbnz`/`tbz`/`tbnz`) cannot simply move to a stub
+  (their branch target is PC-relative), so they get a branch stub: it loads
+  `x18` into a scratch, runs the branch against the scratch to a local label,
+  then restores the scratch down both the taken and not-taken paths and uses a
+  full-range branch to the real target or the fall-through. For an `sp` base the stub adds the 32
   bytes it pushed to the access's immediate so it still reaches the caller's
   slot. Pair, pre/post-index and register-offset loads, PC-relative forms,
   branches, and `sp` forms of the data-processing classes are left for a later
@@ -333,12 +338,13 @@ These are tracked on the roadmap:
   (see above) is the planned fix, not a VM.
 - Guest uses of `x18` across the data-processing and load/store classes are
   rewritten to a per-thread slot (see above) and survive preemption, which is
-  enough to run a compiled Rust/musl binary unmodified. Still not rewritten:
-  PC-relative forms (`adr`/`adrp`/`ldr`-literal into `x18`), branches through
-  `x18` (`br`/`blr x18`), and `sp` writeback/register-offset loads — a program
-  using one of those for live `x18` state could still lose it, and
-  recursive-descent code discovery (versus the current scan plus literal-pool
-  exclusion) is the remaining general-correctness step.
+  enough to run a compiled Rust/musl binary unmodified, including the
+  compare/test branches (`cbz`/`cbnz`/`tbz`/`tbnz`) that read `x18`. Still not
+  rewritten: PC-relative forms (`adr`/`adrp`/`ldr`-literal into `x18`), indirect
+  branches through `x18` (`br`/`blr x18`), and `sp` writeback/register-offset
+  loads — a program using one of those for live `x18` state could still lose
+  it, and recursive-descent code discovery (versus the current scan plus
+  literal-pool exclusion) is the remaining general-correctness step.
 - The rewrite pass scans every aligned word of an executable segment, so a
   data word that happens to encode a rewritten instruction is rewritten too.
   Literal pools (the targets of `ldr`-literal) are detected and skipped, and
