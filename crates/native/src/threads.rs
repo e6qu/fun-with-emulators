@@ -41,8 +41,15 @@ pub fn do_clone(parent: &Regs) -> i64 {
     let tls = parent.x[3];
     let child_tid = parent.x[4];
 
-    // Only thread creation is supported; fork and new namespaces are not.
-    if flags & cl::CLONE_THREAD == 0 || flags & cl::CLONE_VM == 0 {
+    // A clone without CLONE_THREAD is a new process (fork); CLONE_VM without
+    // CLONE_THREAD (vfork-style sharing) is not supported.
+    if flags & cl::CLONE_THREAD == 0 {
+        if flags & cl::CLONE_VM != 0 {
+            return err(errno::ENOSYS);
+        }
+        return crate::process::do_fork(parent);
+    }
+    if flags & cl::CLONE_VM == 0 {
         return err(errno::ENOSYS);
     }
     if flags & !SUPPORTED & !cl::CSIGNAL != 0 {
@@ -111,14 +118,9 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
 
     // The child is spawned from inside the clone SIGTRAP handler, where
     // SIGTRAP is blocked, and pthread_create inherits that mask. Unblock all
-    // signals so this thread's own guest traps and faults are delivered;
-    // the guest's own signal mask is tracked separately in the kernel.
-    // SAFETY: resetting this thread's signal mask to empty.
-    unsafe {
-        let mut empty: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut empty);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-    }
+    // signals so this thread's own guest traps and faults are delivered; the
+    // guest's own signal mask is tracked separately in the kernel.
+    trap::unblock_all_signals();
     trap::install_thread_altstack();
     thread::set_tid(spawn.tid);
     thread::set_clear_child_tid(spawn.clear_child_tid);

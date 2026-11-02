@@ -14,8 +14,9 @@ ET_EXEC linked above 4 GiB) run natively on macOS 15 and 26.
 M1 is in progress. Landed: a root filesystem with the file and directory
 system calls, the **dynamic loader** (`PT_INTERP` interpreters loaded from
 the rootfs), **signal delivery** (guest handlers with `rt_sigframe` build and
-`rt_sigreturn` restore), and **threads** (`clone` thread creation with a real
-blocking futex and tid/TLS handling). Remaining in M1: `fork`/`execve`/`wait`.
+`rt_sigreturn` restore), **threads** (`clone` with a blocking
+futex), and the **process calls** `fork`, `execve` and `wait4`. M1's core
+userland is now in place.
 Running real glibc/musl programs end to end also needs the x18 fix, which —
 with executables linked below 4 GiB — is deferred to the hypervisor backend;
 run `fwe --host-info` to see how the current host treats registers that

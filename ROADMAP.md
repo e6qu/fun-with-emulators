@@ -15,8 +15,8 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 ## M1 — Core userland
 
-- [~] Processes and threads: `clone` thread creation and a blocking futex
-  done; `fork`, `execve` and `wait` still pending
+- [x] Processes and threads: `clone` threads + futex, `fork`, `execve`, `wait4`
+  (single-threaded `fork`; address-space teardown on `execve` is partial)
 - [x] Memory management (`mmap`, `mprotect`, `brk`, and friends)
 - [x] Files and directories, with a Linux root filesystem
 - [x] Signals

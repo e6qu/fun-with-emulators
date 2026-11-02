@@ -108,6 +108,18 @@ impl<P: Platform> Kernel<P> {
         result
     }
 
+    /// Reset the signal and per-thread state across a successful `execve`:
+    /// handlers return to default, pending signals and the alternate stack are
+    /// cleared, and the `set_tid_address`/robust-list words are forgotten. The
+    /// blocked mask is preserved, as Linux does.
+    pub fn exec_reset(&mut self) {
+        self.sigactions = [Sigaction::default(); absig::NSIG as usize];
+        self.pending = 0;
+        self.altstack = Stack { ss_flags: libc::SS_DISABLE, ..Stack::default() };
+        thread::set_clear_child_tid(0);
+        thread::set_robust_list(0, 0);
+    }
+
     /// Run the system call named in `regs` (number in `x8`, arguments in
     /// `x0`–`x5`), store its result and advance past the trap, then deliver a
     /// pending signal if one is ready. `rt_sigreturn` restores `regs` from the

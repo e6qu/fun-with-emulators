@@ -4,6 +4,8 @@
 pub mod hwcap;
 pub mod loader;
 pub mod prepare;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod process;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -403,39 +405,35 @@ pub fn run(path: &Path, args: &[OsString], env: &[OsString], options: &Options) 
     }
 }
 
-fn start(
-    path: &Path,
-    args: &[OsString],
-    env: &[OsString],
-    options: &Options,
-) -> Result<std::convert::Infallible, Error> {
-    let data = std::fs::read(path).map_err(Error::Read)?;
-    let elf = Elf::parse(&data).map_err(Error::Elf)?;
+/// The result of loading a program image: where to start it.
+pub struct Loadout {
+    pub entry: u64,
+    pub sp: u64,
+    pub brk: Brk,
+}
+
+/// Load an ELF image (and its dynamic linker) and build the initial stack,
+/// returning where to start the guest. Shared by process startup and
+/// `execve`. Does not touch the kernel; the caller installs or updates it.
+#[allow(clippy::too_many_arguments)]
+pub fn load_image(
+    file: &[u8],
+    execfn: &[u8],
+    args: &[&[u8]],
+    env: &[&[u8]],
+    fs: &fwe_kernel::Fs,
+    platform: &NativePlatform,
+    page: u64,
+    strace: bool,
+) -> Result<Loadout, Error> {
+    let elf = Elf::parse(file).map_err(Error::Elf)?;
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        return Err(Error::Unsupported(
-            "the native backend runs only on macOS on Apple Silicon".into(),
-        ));
-    }
 
-    let page = page_size();
-    let tracer = Tracer { enabled: options.strace };
-    let host = host_support();
-    if options.strace {
-        tracer.note(&format!("host: {host}"));
-    }
-    let platform = NativePlatform { tp_slot: thread_pointer_slot(), page_size: page };
-
-    // The root filesystem; also used to find the dynamic linker.
-    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-    let fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
-        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
-    })?;
-
+    let tracer = Tracer { enabled: strace };
     let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
         loader::load(elf, page, |a, l, arena| {
             let stats = platform.prepare(a, l, Some(arena)).map_err(|e| e.to_string())?;
-            if options.strace {
+            if strace {
                 tracer.note(&format!(
                     "prepared {what} {a:#x}+{l:#x}: {} system calls, {} thread pointer accesses",
                     stats.syscalls, stats.stubs
@@ -478,7 +476,7 @@ fn start(
         Brk::RESERVATION,
     );
 
-    // The main thread stack, with an inaccessible guard page below it.
+    // A fresh thread stack, with an inaccessible guard page below it.
     // SAFETY: a fresh mapping owned by the guest.
     let stack_base = unsafe {
         libc::mmap(
@@ -520,16 +518,8 @@ fn start(
         aux.push((auxv::AT_PHDR, phdr));
     }
 
-    let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
-    let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
-    let image = stack::InitialStack {
-        args: &arg_bytes,
-        env: &env_bytes,
-        execfn: path.as_os_str().as_bytes(),
-        auxv: &aux,
-        random: random16(),
-    }
-    .build(stack_top);
+    let image =
+        stack::InitialStack { args, env, execfn, auxv: &aux, random: random16() }.build(stack_top);
     if stack_top - image.sp > STACK_SIZE / 2 {
         return Err(Error::Unsupported("argument list too long".into()));
     }
@@ -538,16 +528,55 @@ fn start(
         std::ptr::copy_nonoverlapping(image.bytes.as_ptr(), image.sp as *mut u8, image.bytes.len())
     };
 
-    if options.strace {
+    if strace {
         tracer.note(&format!(
-            "loaded {} at bias {:#x}, exe entry {:#x}, interp base {interp_base:#x}, \
-             start entry {entry:#x}, brk {:#x}, stack top {stack_top:#x}",
-            path.display(),
-            loaded.bias,
-            loaded.entry,
-            brk.start
+            "loaded exe entry {:#x}, interp base {interp_base:#x}, start entry {entry:#x}, \
+             brk {:#x}, stack top {stack_top:#x}",
+            loaded.entry, brk.start
         ));
     }
+    Ok(Loadout { entry, sp: image.sp, brk })
+}
+
+fn start(
+    path: &Path,
+    args: &[OsString],
+    env: &[OsString],
+    options: &Options,
+) -> Result<std::convert::Infallible, Error> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(Error::Unsupported(
+            "the native backend runs only on macOS on Apple Silicon".into(),
+        ));
+    }
+    let data = std::fs::read(path).map_err(Error::Read)?;
+
+    let page = page_size();
+    let tracer = Tracer { enabled: options.strace };
+    let host = host_support();
+    if options.strace {
+        tracer.note(&format!("host: {host}"));
+    }
+    let platform = NativePlatform { tp_slot: thread_pointer_slot(), page_size: page };
+
+    // The root filesystem; also used to find the dynamic linker.
+    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
+    let fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
+        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
+    })?;
+
+    let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+    let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
+    let out = load_image(
+        &data,
+        path.as_os_str().as_bytes(),
+        &arg_bytes,
+        &env_bytes,
+        &fs,
+        &platform,
+        page,
+        options.strace,
+    )?;
 
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
@@ -556,10 +585,10 @@ fn start(
     // The main thread's id equals the process id, as on Linux.
     fwe_kernel::thread::init_main(fwe_kernel::host::getpid() as i32);
 
-    let mut kernel = Kernel::new(platform, page, brk, Some(fs), tracer);
+    let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
     *KERNEL.lock().unwrap() = Some(kernel);
-    enter(image.sp, entry)
+    enter(out.sp, out.entry)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
