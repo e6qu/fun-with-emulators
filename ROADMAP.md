@@ -32,7 +32,8 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 ## M2 — Everyday software
 
-- [ ] Networking (sockets, DNS)
+- [~] Networking (TCP/UDP over IPv4/IPv6 and `socketpair`; pathed `AF_UNIX`,
+  `SCM_RIGHTS` and netlink pending)
 - [ ] Terminals and job control
 - [~] Event APIs (`epoll`, `eventfd`, `timerfd` done; `signalfd` pending)
 - [~] `/proc` and `/sys` (startup files served; directory listing pending)

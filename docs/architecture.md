@@ -203,6 +203,39 @@ the kernel lock while the producer needs that same lock to post would deadlock.
 The registry returns "not mine" for ordinary descriptors, which fall back to the
 normal host `read`/`write`. `signalfd` is not implemented yet.
 
+## Sockets
+
+Socket calls live in `crates/kernel/src/net.rs`. On Linux they pass through to
+the host kernel, whose ABI the guest already speaks. macOS has the BSD socket
+API, close but not identical, so the module translates:
+
+- **address families:** `AF_INET6` is 10 on Linux but 30 on macOS; `AF_INET`
+  and `AF_UNIX` match.
+- **`sockaddr` layout:** Linux leads with a 2-byte `sa_family`; macOS leads
+  with a 1-byte length and a 1-byte family. The port and address that follow
+  are identical, so the conversion is a small header fix-up, done in place on
+  the guest buffer's bytes.
+- **socket type flags:** Linux packs `SOCK_NONBLOCK`/`SOCK_CLOEXEC` into the
+  `type` argument; macOS has no such bits, so they are stripped and applied
+  with `fcntl`.
+- **`setsockopt`:** `SOL_SOCKET` is 1 on Linux, `0xffff` on macOS, and the
+  option numbers differ; a table maps the common ones, and `TCP_NODELAY`.
+- **`send`/`recv` flags:** reordered bits, mapped individually. `MSG_NOSIGNAL`
+  has no macOS equivalent, so every socket gets `SO_NOSIGPIPE` and a broken
+  pipe returns `EPIPE` rather than raising a signal.
+
+Guest file descriptors are host socket descriptors, as everywhere else. The
+calls that can block — `connect`, `accept`, `recvfrom`, `recvmsg`, `sendto`,
+`sendmsg` — run outside the kernel lock through `blocking_syscall`, so a thread
+waiting in `accept` or `recv` does not stall the threads meant to feed it. DNS
+needs no special support: the guest's resolver reads `/etc/resolv.conf` and
+`/etc/hosts` from the rootfs and talks to nameservers over these sockets.
+
+Only `AF_INET`, `AF_INET6` and unnamed `AF_UNIX` (`socketpair`) are handled.
+Pathed `AF_UNIX` sockets (whose addresses would need rooting under the rootfs),
+`SCM_RIGHTS` ancillary data (file-descriptor passing) and `AF_NETLINK` are not
+translated yet.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are

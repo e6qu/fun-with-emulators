@@ -145,6 +145,27 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: the itimerspec pointer is validated by the host/impl.
             nr::TIMERFD_GETTIME => unsafe { crate::specialfd::timerfd_gettime(a[0], a[1]) },
 
+            // Sockets. The blocking calls (connect, accept, send*, recv*) are
+            // handled lock-free in `blocking_syscall`; these set up or query.
+            // SAFETY: socket takes no pointers.
+            nr::SOCKET => unsafe { crate::net::socket(a[0], a[1], a[2]) },
+            // SAFETY: the sv pointer is validated by the host/impl.
+            nr::SOCKETPAIR => unsafe { crate::net::socketpair(a[0], a[1], a[2], a[3]) },
+            // SAFETY: the sockaddr pointer is validated by the host/impl.
+            nr::BIND => unsafe { crate::net::bind(a[0], a[1], a[2]) },
+            // SAFETY: no pointers.
+            nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
+            // SAFETY: the out pointers are validated by the host/impl.
+            nr::GETSOCKNAME => unsafe { crate::net::getname(a[0], a[1], a[2], false) },
+            // SAFETY: the out pointers are validated by the host/impl.
+            nr::GETPEERNAME => unsafe { crate::net::getname(a[0], a[1], a[2], true) },
+            // SAFETY: the option buffer is validated by the host/impl.
+            nr::SETSOCKOPT => unsafe { crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4]) },
+            // SAFETY: the out buffers are validated by the host/impl.
+            nr::GETSOCKOPT => unsafe { crate::net::getsockopt(a[0], a[1], a[2], a[3], a[4]) },
+            // SAFETY: no pointers.
+            nr::SHUTDOWN => unsafe { crate::net::shutdown(a[0], a[1]) },
+
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),
             nr::FACCESSAT => self.sys_faccessat(a[0], a[1], a[2], 0),

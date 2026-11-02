@@ -16,6 +16,7 @@ mod fsops;
 pub mod futex;
 pub mod host;
 mod mm;
+pub mod net;
 pub mod procfs;
 mod signal;
 pub mod specialfd;
@@ -212,6 +213,22 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::READ => return unsafe { specialfd::try_read(a[0] as i32, a[1], a[2]) },
         // SAFETY: caller guarantees the buffer spans the length.
         n::WRITE => return unsafe { specialfd::try_write(a[0] as i32, a[1], a[2]) },
+        // Socket calls that can block run without the kernel lock, so a thread
+        // waiting in accept/recv does not stall the threads meant to feed it.
+        // SAFETY: caller guarantees the sockaddr pointer.
+        n::CONNECT => unsafe { net::connect(a[0], a[1], a[2]) },
+        // SAFETY: caller guarantees the out pointers.
+        n::ACCEPT => unsafe { net::accept4(a[0], a[1], a[2], 0) },
+        // SAFETY: caller guarantees the out pointers.
+        n::ACCEPT4 => unsafe { net::accept4(a[0], a[1], a[2], a[3]) },
+        // SAFETY: caller guarantees the buffer and sockaddr.
+        n::SENDTO => unsafe { net::sendto(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        // SAFETY: caller guarantees the buffer and out pointers.
+        n::RECVFROM => unsafe { net::recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        // SAFETY: caller guarantees the msghdr.
+        n::SENDMSG => unsafe { net::sendmsg(a[0], a[1], a[2]) },
+        // SAFETY: caller guarantees the msghdr.
+        n::RECVMSG => unsafe { net::recvmsg(a[0], a[1], a[2]) },
         _ => return None,
     })
 }
