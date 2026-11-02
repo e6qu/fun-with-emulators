@@ -126,14 +126,7 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
     // The saved pc is the trapping instruction for `brk`.
     // SAFETY: the guest was executing at `pc`, so it is mapped.
-    let word = unsafe { insn(ss.pc) };
-    crate::dbg(&format!(
-        "sigtrap tid={} pc={:#x} insn={word:?} x8={:#x}",
-        fwe_kernel::thread::tid(),
-        ss.pc,
-        ss.x[8]
-    ));
-    if word != Some(TRAP) {
+    if unsafe { insn(ss.pc) } != Some(TRAP) {
         // Not one of our system call traps: let it take its default action.
         restore_default(libc::SIGTRAP);
         return;
@@ -146,7 +139,6 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     }
     let nr = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
-    crate::dbg(&format!("trap tid={} nr={nr} pc={:#x}", fwe_kernel::thread::tid(), regs.pc));
 
     // `clone` and the blocking system calls run without holding the kernel
     // lock, so a blocked or spawning thread does not stall the others; the
@@ -155,9 +147,7 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     if nr == fwe_abi::nr::EXIT {
         // A thread exits without the kernel lock: pthread_exit never returns,
         // so a held lock would never be released.
-        crate::dbg(&format!("exit tid={} code={}", fwe_kernel::thread::tid(), regs.x[0] as i32));
         fwe_kernel::thread_exit_cleanup();
-        crate::dbg("exit: cleanup done, ending thread");
         crate::exit_current_thread(regs.x[0] as i32);
     }
     if nr == fwe_abi::nr::CLONE {
@@ -193,11 +183,6 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let addr = unsafe { (*info).si_addr() } as u64;
-    crate::dbg(&format!(
-        "fault tid={} sig={sig} pc={:#x} addr={addr:#x}",
-        fwe_kernel::thread::tid(),
-        mc.ss.pc
-    ));
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(&mc.ss);

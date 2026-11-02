@@ -76,12 +76,10 @@ pub fn do_clone(parent: &Regs) -> i64 {
     });
 
     LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
-    crate::dbg(&format!("clone: spawning tid {tid} stack {child_stack:#x} pc {:#x}", regs.pc));
     if spawn_host_thread(spawn) {
         tid as i64
     } else {
         LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
-        crate::dbg("clone: pthread_create failed");
         err(errno::EAGAIN)
     }
 }
@@ -111,7 +109,16 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     // SAFETY: `arg` is the `Spawn` box handed to `pthread_create`.
     let spawn = unsafe { Box::from_raw(arg.cast::<Spawn>()) };
 
-    crate::dbg(&format!("child {} started", spawn.tid));
+    // The child is spawned from inside the clone SIGTRAP handler, where
+    // SIGTRAP is blocked, and pthread_create inherits that mask. Unblock all
+    // signals so this thread's own guest traps and faults are delivered;
+    // the guest's own signal mask is tracked separately in the kernel.
+    // SAFETY: resetting this thread's signal mask to empty.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
     trap::install_thread_altstack();
     thread::set_tid(spawn.tid);
     thread::set_clear_child_tid(spawn.clear_child_tid);
@@ -125,7 +132,6 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
 
     let regs = spawn.regs;
     drop(spawn);
-    crate::dbg(&format!("child entering guest pc={:#x} sp={:#x}", regs.pc, regs.sp));
     // SAFETY: `regs` describes a runnable guest context on the child stack.
     unsafe { trap::enter_guest_full(&regs) }
 }

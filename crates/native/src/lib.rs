@@ -14,21 +14,6 @@ mod trap;
 /// Live guest threads, so the last one to exit ends the process.
 static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
-/// Whether to emit backend diagnostics to stderr (set from `--strace`).
-pub(crate) static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Emit a backend diagnostic line to stderr when `--strace` is on. Safe to
-/// call from any thread or a signal handler (one `write`, no allocation lock
-/// beyond the format buffer).
-#[allow(dead_code)] // used only by the macOS-gated thread code
-pub(crate) fn dbg(msg: &str) {
-    if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
-        let line = format!("[fwe] {msg}\n");
-        // SAFETY: writing a local buffer to stderr.
-        unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-    }
-}
-
 /// End the calling guest thread: the last thread ends the process, any other
 /// ends just its host thread. Must be called without the kernel lock held,
 /// since `pthread_exit` does not return and would never release it.
@@ -435,7 +420,6 @@ fn start(
 
     let page = page_size();
     let tracer = Tracer { enabled: options.strace };
-    DEBUG.store(options.strace, std::sync::atomic::Ordering::Relaxed);
     let host = host_support();
     if options.strace {
         tracer.note(&format!("host: {host}"));
