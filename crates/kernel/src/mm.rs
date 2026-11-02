@@ -46,6 +46,48 @@ fn map_fixed_anon(addr: u64, len: u64, prot: libc::c_int) -> bool {
     p != libc::MAP_FAILED
 }
 
+/// Largest backing file read to find its executable sections.
+const MAX_EXEC_FILE: usize = 128 << 20;
+
+/// The executable sections of the ELF file open at `fd`, as file-offset
+/// ranges, or `None` if it is not a readable regular ELF with section headers
+/// (then the caller translates the whole mapped region instead). Reads with
+/// `pread`, so the guest's file position is untouched.
+fn exec_file_ranges(fd: i32) -> Option<Vec<(u64, u64)>> {
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: zeroing a stat value, which is plain data.
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    // SAFETY: fstat on a borrowed fd, writing into the stat just created.
+    let fstat_ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+    if !fstat_ok || st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    let size = st.st_size as usize;
+    if !(64..=MAX_EXEC_FILE).contains(&size) {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let mut done = 0usize;
+    while done < size {
+        // SAFETY: pread into the owned buffer at an explicit offset.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[done..].as_mut_ptr() as *mut libc::c_void,
+                size - done,
+                done as libc::off_t,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        done += n as usize;
+    }
+    fwe_elf::Elf::parse(&buf).ok()?.exec_file_ranges()
+}
+
 fn host_prot(prot: u64) -> libc::c_int {
     let mut p = libc::PROT_NONE;
     if prot & mman::PROT_READ != 0 {
@@ -151,10 +193,29 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EEXIST);
         }
         if exec {
-            if let Err(e) = self.platform.prepare_exec(p, self.page_up(len)) {
-                // SAFETY: unmapping the mapping just created.
-                unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
-                return err(e);
+            // Translate the code. For a file-backed mapping, confine the
+            // rewrite to the file's executable sections, so data mapped into
+            // the same region — the symbol, string and hash tables that a
+            // shared library's code segment can hold, as glibc's `libc.so.6`
+            // does — is left untouched. Without section headers, or for an
+            // anonymous mapping, the whole region is translated as before.
+            let prep = match if anonymous { None } else { exec_file_ranges(host_fd) } {
+                Some(sections) => sections
+                    .into_iter()
+                    .filter_map(|(foff, fsize)| {
+                        let start = foff.max(offset);
+                        let end = (foff + fsize).min(offset + len);
+                        (start < end).then_some((p + (start - offset), end - start))
+                    })
+                    .collect(),
+                None => vec![(p, self.page_up(len))],
+            };
+            for (a, l) in prep {
+                if let Err(e) = self.platform.prepare_exec(a, l) {
+                    // SAFETY: unmapping the mapping just created.
+                    unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+                    return err(e);
+                }
             }
             // SAFETY: changing protections of the mapping just created.
             if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, host_prot(prot)) } != 0
