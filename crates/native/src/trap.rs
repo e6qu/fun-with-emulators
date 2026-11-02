@@ -227,14 +227,15 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             mc.ss.fp, mc.ss.lr, mc.ss.sp
         ));
         report(&regs);
-        let mut code = String::from("[fwe] code before pc:");
-        for back in (1..=8u64).rev() {
-            let at = mc.ss.pc.wrapping_sub(4 * back);
+        let mut code = String::from("[fwe] code near pc (pc marked *):");
+        for off in (-24i64..=8).map(|k| k * 4) {
+            let at = mc.ss.pc.wrapping_add(off as u64);
             // Only read within the faulting instruction's page.
             if at & !0x3fff == mc.ss.pc & !0x3fff {
                 // SAFETY: same page as the mapped pc.
                 if let Some(w) = unsafe { insn(at) } {
-                    code.push_str(&format!(" {w:08x}"));
+                    let mark = if off == 0 { "*" } else { "" };
+                    code.push_str(&format!(" {mark}{w:08x}"));
                 }
             }
         }
