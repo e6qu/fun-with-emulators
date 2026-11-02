@@ -404,7 +404,10 @@ fn run_debian(name: &str, args: &[&str], input: &[u8]) -> Output {
         .arg(debian_root())
         .arg(debian_bin(name))
         .args(args)
+        .env_clear()
         .env("LD_LIBRARY_PATH", "/lib")
+        .env("HOME", "/")
+        .env("PATH", "/bin")
         .env("FOO", "bar");
     let out = run_bounded_with_stdin(cmd, input);
     eprintln!("--- debian {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
@@ -703,6 +706,36 @@ fn debian_coreutils_ls_lists_directory() {
     }
     let out = run_debian("ls", &["/lsdir"], &[]);
     assert_eq!(stdout(&out), "alpha\nbeta\ngamma\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Real Debian bash (run with `-c`, non-interactively): the shell itself, a
+/// large glibc program linked against libtinfo. It has to start up, parse, and
+/// run builtins, arithmetic and loops in the shell process — covering far more
+/// of libc than the coreutils programs do.
+#[test]
+fn debian_bash_runs_a_command() {
+    let out = run_debian("bash", &["-c", "echo hello world"], &[]);
+    assert_eq!(stdout(&out), "hello world\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn debian_bash_propagates_exit_status() {
+    assert_eq!(run_debian("bash", &["-c", "exit 7"], &[]).status.code(), Some(7));
+}
+
+#[test]
+fn debian_bash_evaluates_arithmetic() {
+    let out = run_debian("bash", &["-c", "x=3; y=4; echo $((x*x + y*y))"], &[]);
+    assert_eq!(stdout(&out), "25\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn debian_bash_runs_a_loop() {
+    let out = run_debian("bash", &["-c", "for w in a b c; do echo -n \"$w\"; done; echo"], &[]);
+    assert_eq!(stdout(&out), "abc\n");
     assert_eq!(out.status.code(), Some(0));
 }
 

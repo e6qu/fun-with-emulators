@@ -57,9 +57,10 @@ See [PLAN.md](PLAN.md) for the overall plan.
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 Progress: unmodified Debian `aarch64` coreutils (`true`, `false`, `echo`,
-`seq`, `env`, `cat`, `sort`) run against the vendored glibc runtime, with their
-output checked end to end. bash and Python, and the extra shared libraries they
-and `ls` pull in, are next.
+`seq`, `env`, `cat`, `sort`), `ls` (with its `libselinux` → `libpcre2`
+dependency graph) and `bash` (shell startup, builtins, arithmetic and loops,
+linked against `libtinfo`) run against the vendored glibc runtime, with their
+output checked end to end. Python is next.
 
 ## M2 — Everyday software
 
