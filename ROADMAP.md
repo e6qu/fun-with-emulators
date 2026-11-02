@@ -41,8 +41,12 @@ See [PLAN.md](PLAN.md) for the overall plan.
   spills adjusted for the stub's push and literal pools protected from the
   scan, as are the PC-relative forms (`adr`/`adrp`/`ldr`-literal) and the
   compare/test/indirect branches through `x18` — enough to run a compiled
-  Rust/musl binary unmodified. Only `sp`-writeback spills and recursive-descent
-  code discovery remain. This
+  Rust/musl binary and a real `ld-musl` unmodified. Only executable code is
+  rewritten: code extents come from the section headers (the `SHF_EXECINSTR`
+  sections), so data that shares an executable segment with the code — a
+  dynamic linker's symbol, string and hash tables, for instance — is left
+  intact. Only `sp`-writeback spills and code discovery for fully stripped
+  binaries without section headers remain. This
   keeps execution in-process at native speed; **no hypervisor or VM is used**
   (that is a non-goal of this project — see PLAN.md).
 - [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS

@@ -26,8 +26,12 @@ pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
 
+/// Section holds executable machine instructions (`SHF_EXECINSTR`).
+pub const SHF_EXECINSTR: u64 = 4;
+
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
+const SHDR_SIZE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -229,6 +233,55 @@ impl<'a> Elf<'a> {
             .find(|ph| ph.offset <= self.phoff && self.phoff < ph.offset + ph.filesz)
             .map(|ph| ph.vaddr + (self.phoff - ph.offset))
     }
+
+    /// Virtual-address ranges `(vaddr, size)` of executable code to translate.
+    ///
+    /// When section headers are present, only the `SHF_EXECINSTR` sections are
+    /// returned, so data that shares an executable segment with the code is
+    /// left untouched. This matters for a dynamic linker such as musl's
+    /// `ld-musl`, whose single R-X segment holds its symbol, string and hash
+    /// tables and read-only constants right alongside `.text`: translating the
+    /// whole segment would corrupt those tables. With no section headers
+    /// (fully stripped), the whole executable load segments are returned, as
+    /// before.
+    pub fn exec_ranges(&self) -> Vec<(u64, u64)> {
+        if let Some(sections) = self.exec_sections()
+            && !sections.is_empty()
+        {
+            return sections;
+        }
+        self.loads().filter(|ph| ph.executable()).map(|ph| (ph.vaddr, ph.filesz)).collect()
+    }
+
+    /// The allocated `SHF_EXECINSTR` sections as `(vaddr, size)`, or `None`
+    /// when the section header table is absent or unreadable.
+    fn exec_sections(&self) -> Option<Vec<(u64, u64)>> {
+        let d = self.data;
+        if d.len() < EHDR_SIZE {
+            return None;
+        }
+        let shoff = u64_at(d, 40);
+        let shentsize = u16_at(d, 58) as usize;
+        let shnum = u16_at(d, 60) as usize;
+        if shoff == 0 || shnum == 0 || shentsize < SHDR_SIZE {
+            return None;
+        }
+        let table = (shnum as u64).checked_mul(shentsize as u64)?.checked_add(shoff)?;
+        if table > d.len() as u64 {
+            return None;
+        }
+        let mut ranges = Vec::new();
+        for i in 0..shnum {
+            let o = shoff as usize + i * shentsize;
+            let sh_flags = u64_at(d, o + 8);
+            let sh_addr = u64_at(d, o + 16);
+            let sh_size = u64_at(d, o + 32);
+            if sh_flags & SHF_EXECINSTR != 0 && sh_addr != 0 && sh_size != 0 {
+                ranges.push((sh_addr, sh_size));
+            }
+        }
+        Some(ranges)
+    }
 }
 
 /// Host page protections, as a combination of `PF_*` bits.
@@ -428,5 +481,62 @@ mod tests {
                 PageRun { start: 0x30000, len: 0x4000, prot: PF_R | PF_W },
             ]
         );
+    }
+
+    /// Attach a section header table to an image: each entry is
+    /// `(sh_flags, sh_addr, sh_size)`. Only the fields `exec_sections` reads
+    /// are written.
+    fn with_sections(mut d: Vec<u8>, shoff: usize, sections: &[(u64, u64, u64)]) -> Vec<u8> {
+        let end = shoff + sections.len() * SHDR_SIZE;
+        if d.len() < end {
+            d.resize(end, 0);
+        }
+        for (i, &(flags, addr, size)) in sections.iter().enumerate() {
+            let o = shoff + i * SHDR_SIZE;
+            d[o + 8..o + 16].copy_from_slice(&flags.to_le_bytes());
+            d[o + 16..o + 24].copy_from_slice(&addr.to_le_bytes());
+            d[o + 32..o + 40].copy_from_slice(&size.to_le_bytes());
+        }
+        d[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        d[58..60].copy_from_slice(&(SHDR_SIZE as u16).to_le_bytes());
+        d[60..62].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        d
+    }
+
+    /// With section headers, only the `SHF_EXECINSTR` sections are translated,
+    /// so data (symbol/string/hash tables) sharing an executable segment with
+    /// the code — as in musl's `ld-musl` — is left untouched.
+    #[test]
+    fn exec_ranges_restricts_to_executable_sections() {
+        // One R-X segment [0, 0x400); the tables live at [0, 0x200) and the
+        // code (.text) at [0x200, 0x300), all inside that one segment.
+        let d = image(ET_DYN, &[load(PF_R | PF_X, 0, 0, 0x400, 0x400)], 0x800);
+        let d = with_sections(
+            d,
+            0x400,
+            &[
+                (0, 0, 0),                         // null section
+                (2, 0x0, 0x200),                   // ALLOC data (e.g. .dynstr)
+                (SHF_EXECINSTR | 2, 0x200, 0x100), // ALLOC|EXECINSTR (.text)
+            ],
+        );
+        let elf = Elf::parse(&d).unwrap();
+        assert_eq!(elf.exec_ranges(), vec![(0x200, 0x100)]);
+    }
+
+    /// With no section headers (fully stripped), the whole executable load
+    /// segments are translated.
+    #[test]
+    fn exec_ranges_falls_back_without_sections() {
+        let d = image(
+            ET_DYN,
+            &[
+                load(PF_R | PF_X, 0, 0, 0x200, 0x200),
+                load(PF_R | PF_W, 0x200, 0x4000, 0x100, 0x100),
+            ],
+            0x400,
+        );
+        let elf = Elf::parse(&d).unwrap();
+        assert_eq!(elf.exec_ranges(), vec![(0, 0x200)]);
     }
 }

@@ -179,9 +179,13 @@ pub fn load(
         };
     }
 
-    for run in plan.runs.iter().filter(|r| r.prot & PF_X != 0) {
-        prepare_exec(run.start + bias, run.len, &mut arena)
-            .map_err(|reason| LoadError::Prepare { start: run.start + bias, reason })?;
+    // Translate only the executable code, not every byte of an executable
+    // segment: a segment can hold data (symbol/string/hash tables, read-only
+    // constants) that must not be rewritten. `exec_ranges` reports the real
+    // code extents from the section headers when present.
+    for (vaddr, size) in elf.exec_ranges() {
+        prepare_exec(vaddr + bias, size, &mut arena)
+            .map_err(|reason| LoadError::Prepare { start: vaddr + bias, reason })?;
     }
 
     for run in &plan.runs {
