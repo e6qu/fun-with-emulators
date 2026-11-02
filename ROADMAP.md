@@ -26,11 +26,12 @@ See [PLAN.md](PLAN.md) for the overall plan.
   specially): macOS clears `x18` on every exception return — including
   involuntary preemption, where the custom x18 ABI was observed being dropped —
   so guest uses of `x18` are rewritten to a per-thread slot before the code
-  runs, exactly as `svc #0` and `TPIDR_EL0` already are. Data-processing forms
-  (moves/logical/add-sub, immediate and register) and unsigned-immediate
-  loads/stores including stack spills are handled, and literal pools are
-  protected from the scan; pair/pre-index/register-offset loads, PC-relative
-  forms, branches and recursive-descent code discovery are the next step. This
+  runs, exactly as `svc #0` and `TPIDR_EL0` already are. The register-only
+  data-processing classes (moves/logical/add-sub/bitfield/extract/conditional/
+  1-2-3-source) and unsigned-immediate loads/stores including stack spills are
+  handled, and literal pools are protected from the scan; pair/pre-index/
+  register-offset/unscaled and SIMD-base loads, PC-relative forms, branches and
+  recursive-descent code discovery are the next step. This
   keeps execution in-process at native speed; **no hypervisor or VM is used**
   (that is a non-goal of this project — see PLAN.md).
 - [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS

@@ -91,6 +91,70 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         ]);
     }
 
+    // Bitfield (SBFM/BFM/UBFM, and their aliases lsl/lsr/asr/ubfx/sbfiz/...).
+    // op[28:23] = 100110. BFM (opc 01) preserves the untouched bits of Rd, so
+    // it reads Rd as well as writing it.
+    if (insn >> 23) & 0x3f == 0b100110 {
+        let bfm = (insn >> 29) & 0b11 == 0b01;
+        return Some(vec![
+            Field { shift: RD, read: bfm, write: true },
+            Field { shift: RN, read: true, write: false },
+        ]);
+    }
+
+    // Extract (EXTR / ROR immediate): op[28:23] = 100111.
+    if (insn >> 23) & 0x3f == 0b100111 {
+        return Some(vec![
+            Field { shift: RD, read: false, write: true },
+            Field { shift: RN, read: true, write: false },
+            Field { shift: RM, read: true, write: false },
+        ]);
+    }
+
+    // Conditional select (CSEL/CSINC/CSINV/CSNEG): op[28:21] = 11010100.
+    if (insn >> 21) & 0xff == 0b1101_0100 {
+        return Some(vec![
+            Field { shift: RD, read: false, write: true },
+            Field { shift: RN, read: true, write: false },
+            Field { shift: RM, read: true, write: false },
+        ]);
+    }
+
+    // Conditional compare (CCMP/CCMN): op[28:21] = 11010010. No GPR result;
+    // the register form (bit 11 = 0) has Rm, the immediate form does not.
+    if (insn >> 21) & 0xff == 0b1101_0010 {
+        let mut f = vec![Field { shift: RN, read: true, write: false }];
+        if (insn >> 11) & 1 == 0 {
+            f.push(Field { shift: RM, read: true, write: false });
+        }
+        return Some(f);
+    }
+
+    // Data-processing (1- and 2-source): op[28:21] = 11010110. Bit 30 = 1 is a
+    // one-source op (RBIT/CLZ/REV, Rd/Rn); bit 30 = 0 is two-source
+    // (UDIV/LSLV/..., Rd/Rn/Rm).
+    if (insn >> 21) & 0xff == 0b1101_0110 {
+        let mut f = vec![
+            Field { shift: RD, read: false, write: true },
+            Field { shift: RN, read: true, write: false },
+        ];
+        if (insn >> 30) & 1 == 0 {
+            f.push(Field { shift: RM, read: true, write: false });
+        }
+        return Some(f);
+    }
+
+    // Data-processing (3-source): op[28:24] = 11011 (MADD/MSUB/SMULH/...).
+    // Rd/Rn/Rm and the accumulator Ra at bit 10.
+    if (insn >> 24) & 0x1f == 0b11011 {
+        return Some(vec![
+            Field { shift: RD, read: false, write: true },
+            Field { shift: RN, read: true, write: false },
+            Field { shift: 10, read: true, write: false }, // Ra
+            Field { shift: RM, read: true, write: false },
+        ]);
+    }
+
     // Load/store register, unsigned immediate offset, general-purpose. This
     // excludes the pair, pre/post-index, register-offset and literal forms and
     // the SIMD variants. Rt is written by a load and read by a store; the base
@@ -190,6 +254,42 @@ mod tests {
         assert_eq!(operands(0x91001041), Some(vec![rd(RD), rr(RN)]));
         // add x18, sp, #0 (mov x18, sp) -> names sp, deferred
         assert_eq!(operands(0x910003f2), None);
+    }
+
+    #[test]
+    fn register_only_data_processing() {
+        // ubfx x18, x0, #4, #8 (bitfield, UBFM): Rd write, Rn read
+        assert_eq!(operands(0xd3442c12), Some(vec![rd(RD), rr(RN)]));
+        // sbfiz x18, x1, #3, #5 (SBFM): Rd write only
+        assert_eq!(operands(0x937d1032), Some(vec![rd(RD), rr(RN)]));
+        // extr x18, x0, x1, #8: Rd write, Rn/Rm read
+        assert_eq!(operands(0x93c12012), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // csel x18, x0, x1, eq: Rd write, Rn/Rm read
+        assert_eq!(operands(0x9a810012), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // ccmp x18, x0, #0, eq (register form): Rn/Rm read, no Rd
+        assert_eq!(operands(0xfa400240), Some(vec![rr(RN), rr(RM)]));
+        // ccmp x18, #3, #0, eq (immediate form): Rn read only
+        assert_eq!(operands(0xfa430a40), Some(vec![rr(RN)]));
+        // udiv x18, x0, x1 (two-source): Rd write, Rn/Rm read
+        assert_eq!(operands(0x9ac10812), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // rbit x18, x0 (one-source): Rd write, Rn read
+        assert_eq!(operands(0xdac00012), Some(vec![rd(RD), rr(RN)]));
+        // madd x18, x0, x1, x2 (three-source): Rd write, Rn/Ra/Rm read
+        assert_eq!(operands(0x9b010812), Some(vec![rd(RD), rr(RN), rr(10), rr(RM)]));
+    }
+
+    #[test]
+    fn bfm_reads_its_destination() {
+        // bfxil x18, x0, #8, #8 (BFM, opc=01) reads and writes Rd.
+        assert_eq!(
+            operands(0xb3483c12).map(|v| v[0]),
+            Some(Field { shift: RD, read: true, write: true })
+        );
+        // bfi x18, x0, #0, #8 (also BFM)
+        assert_eq!(
+            operands(0xb3401c12).map(|v| v[0]),
+            Some(Field { shift: RD, read: true, write: true })
+        );
     }
 
     #[test]
