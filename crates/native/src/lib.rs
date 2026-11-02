@@ -20,6 +20,7 @@ pub(crate) static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// Emit a backend diagnostic line to stderr when `--strace` is on. Safe to
 /// call from any thread or a signal handler (one `write`, no allocation lock
 /// beyond the format buffer).
+#[allow(dead_code)] // used only by the macOS-gated thread code
 pub(crate) fn dbg(msg: &str) {
     if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
         let line = format!("[fwe] {msg}\n");
