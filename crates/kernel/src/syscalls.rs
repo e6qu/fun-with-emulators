@@ -127,6 +127,10 @@ impl<P: Platform> Kernel<P> {
             nr::FCNTL => self.sys_fcntl(a[0], a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(a[0], a[1], a[2]),
             nr::PPOLL => self.sys_ppoll(a[0], a[1], a[2]),
+            // SAFETY: epoll_create1 takes no pointers.
+            nr::EPOLL_CREATE1 => unsafe { crate::epoll::create1(a[0]) },
+            // SAFETY: the host validates the epoll_event pointer.
+            nr::EPOLL_CTL => unsafe { crate::epoll::ctl(a[0], a[1], a[2], a[3]) },
 
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),

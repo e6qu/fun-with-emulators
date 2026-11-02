@@ -79,6 +79,7 @@ const ASM_GUESTS: &[&str] = &[
     "execee",
     "forktest",
     "procread",
+    "epolltest",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -229,6 +230,17 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
 #[test]
 fn reads_synthetic_proc() {
     for name in ["procread", "procread-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// epoll: a guest registers a pipe's read end for EPOLLIN, writes a byte, and
+/// `epoll_pwait` returns exactly one event carrying EPOLLIN and the registered
+/// data word. Exercises the kqueue translation on macOS and passthrough on
+/// Linux end to end.
+#[test]
+fn epoll_round_trip() {
+    for name in ["epolltest", "epolltest-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }

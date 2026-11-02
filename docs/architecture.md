@@ -164,6 +164,22 @@ seekable fd (an immediately-unlinked temp file). The per-process values
 An unknown path under `/proc` or `/sys` is `ENOENT`; directory listing of
 `/proc` and `/sys` is not provided yet.
 
+## epoll
+
+`epoll_create1`, `epoll_ctl` and `epoll_pwait` live in
+`crates/kernel/src/epoll.rs`. On Linux they pass straight through to the host
+kernel, which already speaks the arm64 Linux ABI. On macOS they are translated
+to `kqueue`: the epoll descriptor is a kqueue fd, each watched fd becomes an
+`EVFILT_READ` filter for `EPOLLIN` and an `EVFILT_WRITE` filter for `EPOLLOUT`,
+`EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`, and the
+caller's `epoll_event.data` word rides in the kevent `udata`. A control change
+uses `EV_RECEIPT` so registration errors surface without reporting readiness;
+`epoll_pwait` translates returned kevents back into the packed 12-byte arm64
+`epoll_event` array in place. `epoll_pwait` can block, so the backend runs it
+outside the kernel lock like `futex` and the sleeps. Readiness edge cases
+(`EEXIST`/`ENOENT` for redundant `ADD`/`MOD`, and the signal mask) are not yet
+emulated precisely on macOS.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are

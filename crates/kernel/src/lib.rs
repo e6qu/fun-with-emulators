@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod epoll;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -201,6 +202,8 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
         // SAFETY: caller guarantees the request/remain pointers are valid.
         n::CLOCK_NANOSLEEP => unsafe { syscalls::clock_nanosleep(a[0], a[1], a[2], a[3]) },
+        // SAFETY: caller guarantees the events and sigmask pointers are valid.
+        n::EPOLL_PWAIT => unsafe { epoll::pwait(a[0], a[1], a[2], a[3], a[4], a[5]) },
         _ => return None,
     })
 }

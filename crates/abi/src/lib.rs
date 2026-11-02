@@ -426,6 +426,34 @@ pub mod clone {
     pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 }
 
+/// `epoll` control ops, flags and event bits (`linux/eventpoll.h`).
+pub mod epoll {
+    /// `epoll_create1` flag; the value of `O_CLOEXEC`.
+    pub const EPOLL_CLOEXEC: u64 = 0o2000000;
+
+    pub const EPOLL_CTL_ADD: u64 = 1;
+    pub const EPOLL_CTL_DEL: u64 = 2;
+    pub const EPOLL_CTL_MOD: u64 = 3;
+
+    pub const EPOLLIN: u32 = 0x001;
+    pub const EPOLLPRI: u32 = 0x002;
+    pub const EPOLLOUT: u32 = 0x004;
+    pub const EPOLLERR: u32 = 0x008;
+    pub const EPOLLHUP: u32 = 0x010;
+    pub const EPOLLRDHUP: u32 = 0x2000;
+    pub const EPOLLONESHOT: u32 = 1 << 30;
+    pub const EPOLLET: u32 = 1 << 31;
+}
+
+/// `struct epoll_event`. On arm64 it is packed (no padding), 12 bytes, like
+/// x86-64, so the `data` word sits at offset 4.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EpollEvent {
+    pub events: u32,
+    pub data: u64,
+}
+
 /// `struct timespec`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -610,6 +638,7 @@ mod tests {
         assert_eq!(size_of::<Timespec>(), 16);
         assert_eq!(size_of::<Iovec>(), 16);
         assert_eq!(size_of::<Pollfd>(), 8);
+        assert_eq!(size_of::<EpollEvent>(), 12);
         assert_eq!(size_of::<Winsize>(), 8);
         assert_eq!(size_of::<Rlimit>(), 16);
         assert_eq!(size_of::<Utsname>(), 390);
