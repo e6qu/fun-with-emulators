@@ -126,7 +126,14 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
     // The saved pc is the trapping instruction for `brk`.
     // SAFETY: the guest was executing at `pc`, so it is mapped.
-    if unsafe { insn(ss.pc) } != Some(TRAP) {
+    let word = unsafe { insn(ss.pc) };
+    crate::dbg(&format!(
+        "sigtrap tid={} pc={:#x} insn={word:?} x8={:#x}",
+        fwe_kernel::thread::tid(),
+        ss.pc,
+        ss.x[8]
+    ));
+    if word != Some(TRAP) {
         // Not one of our system call traps: let it take its default action.
         restore_default(libc::SIGTRAP);
         return;
