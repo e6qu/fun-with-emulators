@@ -26,9 +26,28 @@ const GUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// stdout and stderr are drained on their own threads, so a guest that writes
 /// a lot (e.g. many `--strace` lines) never blocks on a full pipe.
 fn run_bounded(mut cmd: Command) -> Output {
-    use std::io::Read;
-    let mut child =
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    cmd.stdin(Stdio::null());
+    run_bounded_with_stdin(cmd, &[])
+}
+
+/// Like [`run_bounded`], but feeds `input` to the guest's standard input
+/// (written on its own thread so a guest that does not read it cannot wedge
+/// the test).
+fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
+    use std::io::{Read, Write};
+    let feed = !input.is_empty();
+    if feed {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    if feed {
+        let mut stdin = child.stdin.take().unwrap();
+        let data = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+            // Dropping `stdin` closes it, signalling EOF to the guest.
+        });
+    }
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let out_reader = std::thread::spawn(move || {
@@ -354,6 +373,35 @@ fn libc_rootfs(libc: Libc, tag: &str) -> PathBuf {
     root
 }
 
+/// A shared glibc root filesystem for running the vendored Debian programs:
+/// the dynamic linker and shared libc under `/lib`, built once.
+fn debian_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| libc_rootfs(Libc::Glibc, "debian"))
+}
+
+/// A vendored Debian coreutils program (see `guests/debian/README.md`).
+fn debian_bin(name: &str) -> PathBuf {
+    repo().join("guests/debian/bin").join(name)
+}
+
+/// Run a vendored Debian program under `fwe` against the glibc root
+/// filesystem, feeding `input` to its standard input. `LD_LIBRARY_PATH` points
+/// the dynamic linker at the shared libc in the rootfs's `/lib`.
+fn run_debian(name: &str, args: &[&str], input: &[u8]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace")
+        .arg("--root")
+        .arg(debian_root())
+        .arg(debian_bin(name))
+        .args(args)
+        .env("LD_LIBRARY_PATH", "/lib")
+        .env("FOO", "bar");
+    let out = run_bounded_with_stdin(cmd, input);
+    eprintln!("--- debian {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    out
+}
+
 /// Synthetic /proc: a guest reads /proc/sys/kernel/ostype and gets "Linux".
 #[test]
 fn reads_synthetic_proc() {
@@ -583,6 +631,51 @@ fn dynamic_glibc_hello_runs_through_libc_startup() {
     assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Real Debian coreutils: unmodified glibc programs from a Debian rootfs run
+/// and produce correct output. These are genuine distribution binaries, not
+/// built here — the whole chain (glibc dynamic linking, process startup, file
+/// and terminal syscalls, exit status) has to work for them to behave.
+#[test]
+fn debian_coreutils_true_and_false_exit_status() {
+    assert_eq!(run_debian("true", &[], &[]).status.code(), Some(0));
+    assert_eq!(run_debian("false", &[], &[]).status.code(), Some(1));
+}
+
+#[test]
+fn debian_coreutils_echo_prints_arguments() {
+    let out = run_debian("echo", &["hello", "world"], &[]);
+    assert_eq!(stdout(&out), "hello world\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn debian_coreutils_seq_counts() {
+    let out = run_debian("seq", &["1", "5"], &[]);
+    assert_eq!(stdout(&out), "1\n2\n3\n4\n5\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn debian_coreutils_env_shows_environment() {
+    let out = run_debian("env", &[], &[]);
+    assert!(stdout(&out).lines().any(|l| l == "FOO=bar"), "env output: {:?}", stdout(&out));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn debian_coreutils_cat_echoes_stdin() {
+    let out = run_debian("cat", &[], b"one\ntwo\n");
+    assert_eq!(stdout(&out), "one\ntwo\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn debian_coreutils_sort_orders_lines() {
+    let out = run_debian("sort", &[], b"banana\napple\ncherry\n");
+    assert_eq!(stdout(&out), "apple\nbanana\ncherry\n");
+    assert_eq!(out.status.code(), Some(0));
 }
 
 #[test]
