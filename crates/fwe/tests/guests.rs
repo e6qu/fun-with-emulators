@@ -77,6 +77,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18ldst",
     "x18br",
     "x18fp",
+    "x18pc",
     "fileio",
     "sigtest",
     "threadtest",
@@ -479,6 +480,13 @@ fn asm_x18_survives_compare_branches() {
 #[test]
 fn asm_x18_survives_fp_moves() {
     assert_eq!(fwe(&asm_guest("x18fp-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 as a PC-relative destination (`adr`) and an indirect-branch target
+/// (`blr`/`br`), across preemption.
+#[test]
+fn asm_x18_pc_relative_and_indirect() {
+    assert_eq!(fwe(&asm_guest("x18pc-pie"), &[]).status.code(), Some(0));
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.

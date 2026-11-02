@@ -323,6 +323,32 @@ pub fn literal_target(insn: u32) -> Option<(i64, usize)> {
     Some((off, size))
 }
 
+/// If `insn` is `adr`/`adrp` writing `x18`, returns `Some(is_adrp)`. These are
+/// PC-relative, so moving them to a stub would change the result; the stub
+/// instead materializes the value computed from the original pc.
+pub fn x18_adr(insn: u32) -> Option<bool> {
+    ((insn >> 24) & 0x1f == 0b10000 && insn & 0x1f == 18).then_some((insn >> 31) & 1 == 1)
+}
+
+/// Whether `insn` is a general-purpose `ldr`-literal loading into `x18` (also
+/// PC-relative). SIMD literal loads target a vector register, not `x18`.
+pub fn x18_ldr_literal(insn: u32) -> bool {
+    insn & 0x3b00_0000 == 0x1800_0000 && (insn >> 26) & 1 == 0 && insn & 0x1f == 18
+}
+
+/// If `insn` is an indirect branch (`br`/`blr`/`ret`) through `x18`, returns
+/// `Some(sets_link)` — true for `blr`. The target register is `Rn` (bits 9:5).
+pub fn x18_indirect(insn: u32) -> Option<bool> {
+    if (insn >> 25) & 0x7f != 0b1101011 || (insn >> 5) & 0x1f != 18 {
+        return None;
+    }
+    match (insn >> 21) & 0xf {
+        0b0000 | 0b0010 => Some(false), // br, ret
+        0b0001 => Some(true),           // blr
+        _ => None,                      // authenticated variants: not handled
+    }
+}
+
 /// Whether `insn` is a compare-and-branch (`cbz`/`cbnz`) or test-branch
 /// (`tbz`/`tbnz`) that reads `x18`. These are branches, so they cannot be moved
 /// to a stub naively; the branch stub loads `x18` into a scratch, tests it, and
@@ -525,6 +551,22 @@ mod tests {
         assert_eq!(operands(0xd4000001), None);
         // str x18, [sp, #16]! -> pre-index writeback onto sp, deferred
         assert_eq!(operands(0xf8010ff2), None);
+    }
+
+    #[test]
+    fn pc_relative_and_indirect_x18() {
+        assert_eq!(x18_adr(0x10000012), Some(false)); // adr x18
+        assert_eq!(x18_adr(0x90000012), Some(true)); // adrp x18
+        assert_eq!(x18_adr(0x10000000), None); // adr x0
+        assert!(x18_ldr_literal(0x58000012)); // ldr x18, <lit>
+        assert!(!x18_ldr_literal(0x58000000)); // ldr x0, <lit>
+        assert_eq!(x18_indirect(0xd61f0240), Some(false)); // br x18
+        assert_eq!(x18_indirect(0xd63f0240), Some(true)); // blr x18
+        assert_eq!(x18_indirect(0xd65f0240), Some(false)); // ret x18
+        assert_eq!(x18_indirect(0xd61f0000), None); // br x0
+        // these are all left out of the operand decoder
+        assert_eq!(operands(0x90000012), None);
+        assert_eq!(operands(0xd61f0240), None);
     }
 
     #[test]

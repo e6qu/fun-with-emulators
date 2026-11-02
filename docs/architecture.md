@@ -340,13 +340,16 @@ These are tracked on the roadmap:
   rewritten to a per-thread slot (see above) and survive preemption, which is
   enough to run a compiled Rust/musl binary unmodified, including the
   compare/test branches (`cbz`/`cbnz`/`tbz`/`tbnz`) that read `x18` and the
-  floating-point↔integer conversions (`fmov`/`fcvt*`/`scvtf`/`ucvtf`) that move
-  a value between `x18` and an FP register. Still not
-  rewritten: PC-relative forms (`adr`/`adrp`/`ldr`-literal into `x18`), indirect
-  branches through `x18` (`br`/`blr x18`), and `sp` writeback/register-offset
-  loads — a program using one of those for live `x18` state could still lose
-  it, and recursive-descent code discovery (versus the current scan plus
-  literal-pool exclusion) is the remaining general-correctness step.
+  floating-point↔integer conversions (`fmov`/`fcvt*`/`scvtf`/`ucvtf`), the
+  PC-relative forms (`adr`/`adrp` and `ldr`-literal into `x18`, where the stub
+  materializes the value computed from the original pc), and indirect branches
+  through `x18` (`br`/`blr`/`ret x18`, where the stub loads the target from the
+  slot into the `x16`/`x17` scratch registers — dead at any branch — and jumps,
+  setting the link register for `blr`). The only `x18` forms still deferred are
+  `sp`-writeback and `sp`-register-offset loads (a prologue spilling `x18`
+  through `sp` with writeback), which are rare for a caller-saved register.
+  Recursive-descent code discovery (versus the current scan plus literal-pool
+  exclusion) remains the general-correctness step for data embedded in code.
 - The rewrite pass scans every aligned word of an executable segment, so a
   data word that happens to encode a rewritten instruction is rewritten too.
   Literal pools (the targets of `ldr`-literal) are detected and skipped, and
