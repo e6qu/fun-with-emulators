@@ -77,6 +77,7 @@ const ASM_GUESTS: &[&str] = &[
     "threadtest",
     "execer",
     "execee",
+    "forktest",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -221,6 +222,15 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     cmd.args(["-flavor", "gnu"]).args(link_args).arg("-o").arg(&bin).arg(&obj);
     run_checked(&mut cmd);
     bin
+}
+
+/// fork and wait: a guest forks, the child exits 7, and the parent reaps it
+/// and checks the wait status encodes a normal exit with code 7.
+#[test]
+fn fork_and_wait() {
+    for name in ["forktest", "forktest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
 
 /// execve: a guest replaces its image with a second program (from the rootfs)

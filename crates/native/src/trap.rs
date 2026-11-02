@@ -161,6 +161,10 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     if nr == fwe_abi::nr::CLONE {
         let r = crate::threads::do_clone(&regs);
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else if nr == fwe_abi::nr::WAIT4 {
+        // wait4 blocks; run it without the kernel lock.
+        let r = crate::process::do_wait4(&regs);
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
     } else if let Some(r) = {
         // SAFETY: guest pointers in `args` reference guest memory.
         unsafe { fwe_kernel::blocking_syscall(nr, args) }

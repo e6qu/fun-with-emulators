@@ -198,6 +198,17 @@ pub fn signal_to_host(sig: u64) -> Option<libc::c_int> {
     })
 }
 
+/// Linux signal number for a host signal, if there is an equivalent. The
+/// inverse of [`signal_to_host`], used to translate a child's `wait` status.
+pub fn signal_to_linux(host: libc::c_int) -> u64 {
+    for sig in 1..=signal::NSIG {
+        if signal_to_host(sig) == Some(host) {
+            return sig;
+        }
+    }
+    signal::SIGABRT
+}
+
 /// File status flags (`F_GETFL`) from host to Linux.
 pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
     let mut f = match host & libc::O_ACCMODE {

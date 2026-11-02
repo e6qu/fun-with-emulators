@@ -1,8 +1,11 @@
 //! Process system calls for the native backend: `execve`, `fork` and `wait`.
 
-use crate::{KERNEL, NativePlatform, load_image, page_size, thread_pointer_slot, trap};
-use fwe_abi::{err, errno};
-use fwe_kernel::Regs;
+use crate::{
+    KERNEL, LIVE_THREADS, NativePlatform, load_image, page_size, thread_pointer_slot, trap,
+};
+use fwe_abi::{clone as cl, err, errno};
+use fwe_kernel::{Regs, host, thread};
+use std::sync::atomic::Ordering;
 
 /// Read a NUL-terminated string from guest memory.
 ///
@@ -84,4 +87,90 @@ pub fn do_execve(regs: &Regs) -> i64 {
 
     // Enter the new program with a fresh register state.
     trap::enter_guest(sp, entry)
+}
+
+/// `fork` (a non-thread `clone`): duplicate the process with host `fork`.
+/// The child continues with `x0` = 0; the parent gets the child pid. Only a
+/// single-threaded guest can fork safely (another thread could hold a lock
+/// across the fork), so a multithreaded fork returns `ENOSYS`.
+pub fn do_fork(parent: &Regs) -> i64 {
+    let flags = parent.x[0];
+    let parent_tid = parent.x[2];
+    let child_tid = parent.x[4];
+
+    if LIVE_THREADS.load(Ordering::SeqCst) != 1 {
+        return err(errno::ENOSYS);
+    }
+
+    // SAFETY: fork with no kernel lock held; the child re-initializes its
+    // process-global state below before running any guest code.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return fwe_kernel::host::last_error();
+    }
+    if pid == 0 {
+        // Child: a new process. Reset identity and the live-thread count, and
+        // honor the child tid flags into the (copied) guest memory.
+        thread::init_main(host::getpid() as i32);
+        LIVE_THREADS.store(1, Ordering::SeqCst);
+        if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
+            // SAFETY: the guest supplied a writable int pointer.
+            unsafe { (child_tid as *mut i32).write(thread::tid()) };
+        }
+        if flags & cl::CLONE_CHILD_CLEARTID != 0 && child_tid != 0 {
+            thread::set_clear_child_tid(child_tid);
+        }
+        0
+    } else {
+        // Parent: the child's pid.
+        if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+            // SAFETY: the guest supplied a writable int pointer.
+            unsafe { (parent_tid as *mut i32).write(pid) };
+        }
+        pid as i64
+    }
+}
+
+/// Encode a host `wait` status into the Linux layout a guest expects.
+fn linux_wstatus(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        (libc::WEXITSTATUS(status) & 0xff) << 8
+    } else if libc::WIFSIGNALED(status) {
+        let sig = host::signal_to_linux(libc::WTERMSIG(status)) as i32;
+        let core = if libc::WCOREDUMP(status) { 0x80 } else { 0 };
+        sig | core
+    } else if libc::WIFSTOPPED(status) {
+        (host::signal_to_linux(libc::WSTOPSIG(status)) as i32) << 8 | 0x7f
+    } else {
+        0xffff // continued
+    }
+}
+
+/// `wait4(pid, wstatus, options, rusage)`: reap a child. Blocks, so it runs
+/// without the kernel lock. `rusage` is zero-filled (not yet translated).
+pub fn do_wait4(regs: &Regs) -> i64 {
+    let pid = regs.x[0] as i32;
+    let wstatus = regs.x[1];
+    let options = regs.x[2] as libc::c_int;
+    let rusage = regs.x[3];
+
+    // WNOHANG | WUNTRACED | WCONTINUED share values with Linux.
+    let host_options = options & (libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED);
+    let mut status: libc::c_int = 0;
+    // SAFETY: `status` is a valid out-parameter; no guest rusage is passed to
+    // the host (layouts differ), so pass null and zero the guest copy below.
+    let r = unsafe { libc::wait4(pid, &mut status, host_options, std::ptr::null_mut()) };
+    if r < 0 {
+        return fwe_kernel::host::last_error();
+    }
+    if r > 0 && wstatus != 0 {
+        // SAFETY: the guest passed a writable int for the status.
+        unsafe { (wstatus as *mut i32).write(linux_wstatus(status)) };
+    }
+    if r > 0 && rusage != 0 {
+        // `struct rusage` is 144 bytes on arm64 Linux; zero it for now.
+        // SAFETY: the guest passed a buffer for a `struct rusage`.
+        unsafe { std::ptr::write_bytes(rusage as *mut u8, 0, 144) };
+    }
+    r as i64
 }

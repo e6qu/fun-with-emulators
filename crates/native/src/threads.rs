@@ -41,8 +41,15 @@ pub fn do_clone(parent: &Regs) -> i64 {
     let tls = parent.x[3];
     let child_tid = parent.x[4];
 
-    // Only thread creation is supported; fork and new namespaces are not.
-    if flags & cl::CLONE_THREAD == 0 || flags & cl::CLONE_VM == 0 {
+    // A clone without CLONE_THREAD is a new process (fork); CLONE_VM without
+    // CLONE_THREAD (vfork-style sharing) is not supported.
+    if flags & cl::CLONE_THREAD == 0 {
+        if flags & cl::CLONE_VM != 0 {
+            return err(errno::ENOSYS);
+        }
+        return crate::process::do_fork(parent);
+    }
+    if flags & cl::CLONE_VM == 0 {
         return err(errno::ENOSYS);
     }
     if flags & !SUPPORTED & !cl::CSIGNAL != 0 {
