@@ -39,9 +39,11 @@ Out of scope:
 1. **Loader** — starts Linux binaries as macOS processes.
 2. **Linux kernel layer** — the Rust core implementing Linux behaviour on top
    of macOS.
-3. **Execution backends** — native in-process execution by default, with a
-   lightweight hypervisor-based mode for anything that needs it. Both share
-   the same core.
+3. **Execution** — guest code runs in-process at native speed. Instructions
+   macOS cannot let a Linux process run unchanged (`svc`, `TPIDR_EL0`, and
+   `x18` uses) are rewritten before execution. There is **no hypervisor or
+   virtual machine**: a VM is an explicit non-goal, because it would cost the
+   performance and the namespace/cgroup reach this project exists to provide.
 4. **Linux environment** — a root filesystem with synthesized `/proc`, `/sys`
    and `/dev`.
 

@@ -147,6 +147,10 @@ impl<P: Platform> Kernel<P> {
                     // Follow the link through the normal path.
                     self.sys_openat_bytes(dirfd, &target, flags, mode)
                 }
+                crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
+                    Some(entries) => crate::synthdir::open(entries),
+                    None => err(errno::ENOENT),
+                },
                 crate::procfs::Entry::Missing => err(errno::ENOENT),
             };
         }
@@ -224,6 +228,7 @@ impl<P: Platform> Kernel<P> {
                     return self.stat_path(dirfd, &target, buf, flags);
                 }
                 crate::procfs::Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
+                crate::procfs::Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
                 crate::procfs::Entry::Missing => return err(errno::ENOENT),
             };
             // SAFETY: the guest passed a buffer for a `struct stat`.
@@ -262,6 +267,12 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
+        if crate::synthdir::fstat_is_dir(fd as i32) {
+            use fwe_abi::stat as st;
+            // SAFETY: the guest passed a buffer for a `struct stat`.
+            unsafe { write(buf, synth_stat(st::S_IFDIR | 0o555, 0)) };
+            return 0;
+        }
         // SAFETY: `out` is a valid out-parameter.
         let mut out = unsafe { std::mem::zeroed::<libc::stat>() };
         // SAFETY: plain host call on a guest fd.
@@ -318,7 +329,7 @@ impl<P: Platform> Kernel<P> {
                     unsafe { std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n) };
                     n as i64
                 }
-                crate::procfs::Entry::File(_) => err(errno::EINVAL),
+                crate::procfs::Entry::File(_) | crate::procfs::Entry::Dir => err(errno::EINVAL),
                 crate::procfs::Entry::Missing => err(errno::ENOENT),
             };
         }
@@ -518,6 +529,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_getdents64(&mut self, fd: u64, buf: u64, count: u64) -> i64 {
+        // SAFETY: the guest passed a buffer of `count` bytes.
+        if let Some(r) = unsafe { crate::synthdir::getdents64(fd as i32, buf, count) } {
+            return r;
+        }
         getdents64(fd as i32, buf, count as usize)
     }
 

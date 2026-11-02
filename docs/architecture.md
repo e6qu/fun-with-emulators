@@ -14,9 +14,11 @@ fwe (CLI)
  └── ABI (crates/abi), ELF (crates/elf)
 ```
 
-The kernel layer does not depend on how guest code runs. Backends implement
-`fwe_kernel::Platform`. A hypervisor backend can be added beside the native
-one and share the kernel.
+The kernel layer does not depend on how guest code runs; it sits behind the
+`fwe_kernel::Platform` trait. Guest code always runs **in-process and natively**
+— there is no hypervisor or virtual machine, by design (a VM is a non-goal; see
+PLAN.md). Instructions macOS cannot let a Linux process run as-is are rewritten
+before execution (see below), not trapped by a VM.
 
 ## Memory model
 
@@ -33,8 +35,9 @@ start an executable with a smaller `__PAGEZERO`. Position-independent
 executables (the norm for distribution packages) are loaded anywhere, and
 ET_EXEC images linked above 4 GiB at their addresses. ET_EXEC images linked
 below 4 GiB (static non-PIE C and Rust builds at 0x200000 or 0x400000, Go at
-0x10000) need guest-controlled address translation: the planned hypervisor
-backend, which shares the kernel layer.
+0x10000) are relocated to a higher base at load time and their
+position-dependent references fixed up in the same translation pass that
+rewrites the special instructions — still in-process, with no VM.
 
 ## System call path
 
@@ -161,8 +164,12 @@ entries programs read at startup: `/proc/self/exe` (a symlink) and
 `/sys/devices/system/cpu/*`. File content is served from an anonymous,
 seekable fd (an immediately-unlinked temp file). The per-process values
 (exe, cmdline, cpu count, host name) are set at program load and `execve`.
-An unknown path under `/proc` or `/sys` is `ENOENT`; directory listing of
-`/proc` and `/sys` is not provided yet.
+An unknown path under `/proc` or `/sys` is `ENOENT`. The directories
+themselves can be opened and listed: `crates/kernel/src/synthdir.rs` tracks an
+opened synthetic directory fd and serves `getdents64`, `lseek`, `fstat` and
+`close` from an in-memory entry list (the tree in `procfs::children`), so
+`opendir`/`readdir` over `/proc`, `/proc/self`, `/proc/sys`, `/sys` and their
+synthetic subdirectories work.
 
 ## epoll
 
@@ -306,8 +313,11 @@ These are tracked on the roadmap:
   implemented; `execve` does not reclaim the old address space.
 - Signal mask and alternate stack are process-wide, not per thread.
 - Floating-point/vector registers are not saved across a signal handler.
-- Executables linked below 4 GiB are rejected (see above).
-- x18 is not preserved before macOS 26.4 (see above).
+- Executables linked below 4 GiB are rejected for now; load-time relocation
+  (see above) is the planned fix, not a VM.
+- Guest uses of `x18` are not yet rewritten, so a value kept in `x18` across a
+  preemption or fault can be lost; binary translation of `x18` is the planned
+  fix (see above). No hypervisor fallback is planned.
 - A data word equal to `svc #0` inside an executable segment would be
   rewritten too.
 - Guest pointers the kernel reads itself are not yet fault-checked; a bad

@@ -23,6 +23,7 @@ pub mod pty;
 mod signal;
 pub mod signalfd;
 pub mod specialfd;
+pub mod synthdir;
 mod syscalls;
 pub mod term;
 pub mod thread;

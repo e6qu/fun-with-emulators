@@ -86,6 +86,7 @@ const ASM_GUESTS: &[&str] = &[
     "jobctl",
     "credtest",
     "signalfdtest",
+    "procdir",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -278,6 +279,15 @@ fn timerfd_fires() {
 #[test]
 fn socketpair_message() {
     for name in ["socketpairtest", "socketpairtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// synthetic directory listing: a guest opens `/proc` and finds the `cpuinfo`
+/// entry via `getdents64`, exercising the synthetic directory fd.
+#[test]
+fn lists_proc_directory() {
+    for name in ["procdir", "procdir-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }

@@ -25,8 +25,66 @@ pub enum Entry {
     File(Vec<u8>),
     /// A symlink to this target.
     Symlink(Vec<u8>),
+    /// A synthetic directory (its entries come from [`children`]).
+    Dir,
     /// A path under `/proc` or `/sys` that is not provided (maps to ENOENT).
     Missing,
+}
+
+/// Linux `d_type` values used in directory listings.
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
+
+/// One listed entry: `(name, d_type)`.
+type Child = (&'static [u8], u8);
+/// One synthetic directory: `(path, entries)`.
+type DirDef = (&'static [u8], &'static [Child]);
+
+/// The synthetic directory tree: each directory and the entries it lists.
+const DIRS: &[DirDef] = &[
+    (
+        b"/proc",
+        &[
+            (b"self", DT_DIR),
+            (b"cpuinfo", DT_REG),
+            (b"meminfo", DT_REG),
+            (b"stat", DT_REG),
+            (b"uptime", DT_REG),
+            (b"loadavg", DT_REG),
+            (b"sys", DT_DIR),
+        ],
+    ),
+    (b"/proc/self", &[(b"exe", DT_LNK), (b"cmdline", DT_REG)]),
+    (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR)]),
+    (
+        b"/proc/sys/kernel",
+        &[
+            (b"ostype", DT_REG),
+            (b"osrelease", DT_REG),
+            (b"version", DT_REG),
+            (b"hostname", DT_REG),
+            (b"pid_max", DT_REG),
+        ],
+    ),
+    (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
+    (b"/sys", &[(b"devices", DT_DIR)]),
+    (b"/sys/devices", &[(b"system", DT_DIR)]),
+    (b"/sys/devices/system", &[(b"cpu", DT_DIR)]),
+    (b"/sys/devices/system/cpu", &[(b"online", DT_REG), (b"possible", DT_REG)]),
+];
+
+/// The entries of a synthetic directory `path`, including `.` and `..`, or
+/// `None` if `path` is not a synthetic directory.
+pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
+    let entries = DIRS.iter().find(|(p, _)| *p == path)?.1;
+    let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
+    out.extend(entries.iter().map(|(n, t)| (n.to_vec(), *t)));
+    Some(out)
+}
+
+fn is_dir(path: &[u8]) -> bool {
+    DIRS.iter().any(|(p, _)| *p == path)
 }
 
 /// Look up `path` (an absolute, normalized guest path). Returns `None` if the
@@ -55,6 +113,7 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {
             Entry::File(cpu_range(info.ncpu))
         }
+        p if is_dir(p) => Entry::Dir,
         _ => Entry::Missing,
     })
 }

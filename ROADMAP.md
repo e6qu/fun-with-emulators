@@ -22,11 +22,16 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [x] Signals
 - [x] Pipes
 - [ ] Dynamic linking with glibc and musl
-- [ ] Hypervisor backend for executables linked below 4 GiB (static non-PIE,
-  Go), sharing the kernel layer
-- [ ] Rewrite guest uses of x18: macOS clears x18 on every exception return,
-  and the custom x18 ABI (macOS 26.4+) was observed being dropped on
-  preemption, so rewriting is the general fix
+- [ ] Binary translation of `x18` (and the other registers macOS treats
+  specially): macOS clears `x18` on every exception return — including
+  involuntary preemption, where the custom x18 ABI was observed being dropped —
+  so guest uses of `x18` are rewritten to a reserved slot before the code runs,
+  exactly as `svc #0` and `TPIDR_EL0` already are. This keeps execution
+  in-process at native speed; **no hypervisor or VM is used** (that is a
+  non-goal of this project — see PLAN.md).
+- [ ] Executables linked below 4 GiB (static non-PIE C/Rust, Go): macOS
+  reserves the low 4 GiB, so these are handled by load-time relocation in the
+  same translation pass, not by a VM.
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
 
@@ -37,7 +42,8 @@ See [PLAN.md](PLAN.md) for the overall plan.
 - [x] Terminals and job control (`termios`, window size, tty process group,
   sessions, pty allocation via `/dev/ptmx` + `/dev/pts`)
 - [x] Event APIs (`epoll`, `eventfd`, `timerfd`, `signalfd`)
-- [~] `/proc` and `/sys` (startup files served; directory listing pending)
+- [x] `/proc` and `/sys` (startup files served and the directories are
+  listable with `getdents64`)
 - [x] Users, permissions and ownership (virtual credentials)
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
