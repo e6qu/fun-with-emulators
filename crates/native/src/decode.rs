@@ -47,10 +47,12 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         return Some(vec![Field { shift: RD, read: movk, write: true }]);
     }
 
-    // Add/subtract (immediate): op[28:24] = 10001. Here register 31 is `sp` in
-    // both the Rd and Rn fields, so defer when either is 31.
+    // Add/subtract (immediate): op[28:24] = 10001. Rn 31 is `sp`. Rd 31 is `sp`
+    // for plain ADD/SUB but `xzr` for the flag-setting ADDS/SUBS (bit 29 = S),
+    // i.e. `cmp`/`cmn` — those must still be rewritten when they read x18.
     if (insn >> 24) & 0x1f == 0b10001 {
-        if reg(insn, RD) == 31 || reg(insn, RN) == 31 {
+        let flag_setting = (insn >> 29) & 1 == 1;
+        if reg(insn, RN) == 31 || (!flag_setting && reg(insn, RD) == 31) {
             return None;
         }
         return Some(vec![
@@ -59,10 +61,11 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         ]);
     }
 
-    // Logical (immediate): op[28:23] = 100100. Rd is `sp` when 31 in this
-    // class; Rn 31 is `xzr`.
+    // Logical (immediate): op[28:23] = 100100. Rn 31 is `xzr`. Rd 31 is `sp`
+    // except for ANDS (opc = 11, i.e. `tst`), where it is `xzr`.
     if (insn >> 23) & 0x3f == 0b100100 {
-        if reg(insn, RD) == 31 {
+        let ands = (insn >> 29) & 0b11 == 0b11;
+        if reg(insn, RD) == 31 && !ands {
             return None;
         }
         return Some(vec![
@@ -371,8 +374,24 @@ mod tests {
     fn add_sub_immediate_defers_on_sp() {
         // add x1, x2, #4 -> Rd write, Rn read
         assert_eq!(operands(0x91001041), Some(vec![rd(RD), rr(RN)]));
-        // add x18, sp, #0 (mov x18, sp) -> names sp, deferred
+        // add x18, sp, #0 (mov x18, sp) -> Rn is sp, deferred
         assert_eq!(operands(0x910003f2), None);
+        // add sp, x18, #8 -> Rd is sp, deferred
+        assert_eq!(operands(0x9100225f), None);
+        // cmp x18, #42 == subs xzr, x18, #42 -> Rd is xzr; read x18
+        assert_eq!(operands(0xf100aa5f), Some(vec![rd(RD), rr(RN)]));
+        // cmn x18, #1 == adds xzr, x18, #1 -> read x18
+        assert_eq!(operands(0xb100065f), Some(vec![rd(RD), rr(RN)]));
+        // subs x18, x19, #1 -> write x18, read x19
+        assert_eq!(operands(0xf1000672), Some(vec![rd(RD), rr(RN)]));
+    }
+
+    #[test]
+    fn logical_immediate_tst_reads_x18() {
+        // tst x18, #0xff == ands xzr, x18, #0xff -> Rd is xzr; read x18
+        assert_eq!(operands(0xf2401e5f), Some(vec![rd(RD), rr(RN)]));
+        // ands x18, x0, #0xff -> write x18, read x0
+        assert_eq!(operands(0xf2401c12), Some(vec![rd(RD), rr(RN)]));
     }
 
     #[test]
