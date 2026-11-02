@@ -221,6 +221,17 @@ impl<P: Platform> Kernel<P> {
                 self.thread_cleanup();
                 self.platform.exit_thread(a[0] as i32)
             }
+            // Job control / sessions. These act on host process groups and
+            // sessions; a guest "pid" of 0 (self) always works, and child pids
+            // from fork are host pids, so setpgid(child, ...) works too.
+            // SAFETY: plain host calls.
+            nr::SETPGID => ret(unsafe { libc::setpgid(a[0] as libc::pid_t, a[1] as libc::pid_t) }),
+            // SAFETY: plain host call.
+            nr::GETPGID => ret(unsafe { libc::getpgid(a[0] as libc::pid_t) } as i64),
+            // SAFETY: plain host call.
+            nr::GETSID => ret(unsafe { libc::getsid(a[0] as libc::pid_t) } as i64),
+            // SAFETY: plain host call.
+            nr::SETSID => ret(unsafe { libc::setsid() } as i64),
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
             nr::GETPPID => host::getppid(),
@@ -359,6 +370,33 @@ impl<P: Platform> Kernel<P> {
                     );
                     0
                 }
+                ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
+                ioctl::TCSETS | ioctl::TCSETSW | ioctl::TCSETSF => {
+                    crate::term::tcsetattr(fd, req, arg)
+                }
+                ioctl::TIOCSWINSZ => {
+                    let ws: Winsize = read(arg);
+                    let mut h: libc::winsize = std::mem::zeroed();
+                    h.ws_row = ws.ws_row;
+                    h.ws_col = ws.ws_col;
+                    h.ws_xpixel = ws.ws_xpixel;
+                    h.ws_ypixel = ws.ws_ypixel;
+                    ret(libc::ioctl(fd, libc::TIOCSWINSZ, &h))
+                }
+                ioctl::TIOCGPGRP => {
+                    let pg = libc::tcgetpgrp(fd);
+                    if pg < 0 {
+                        return last_error();
+                    }
+                    (arg as *mut i32).write_unaligned(pg);
+                    0
+                }
+                ioctl::TIOCSPGRP => {
+                    let pg = (arg as *const i32).read_unaligned();
+                    ret(libc::tcsetpgrp(fd, pg))
+                }
+                ioctl::TIOCSCTTY => ret(libc::ioctl(fd, libc::TIOCSCTTY as _, arg as libc::c_int)),
+                ioctl::TIOCNOTTY => ret(libc::ioctl(fd, libc::TIOCNOTTY as _)),
                 ioctl::FIONREAD => ret(libc::ioctl(fd, libc::FIONREAD, arg as *mut libc::c_int)),
                 ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
                 ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),

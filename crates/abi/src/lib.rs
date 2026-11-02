@@ -362,14 +362,104 @@ pub mod signal {
 pub mod ioctl {
     pub const TCGETS: u64 = 0x5401;
     pub const TCSETS: u64 = 0x5402;
+    pub const TCSETSW: u64 = 0x5403;
+    pub const TCSETSF: u64 = 0x5404;
     pub const TIOCGPGRP: u64 = 0x540f;
     pub const TIOCSPGRP: u64 = 0x5410;
     pub const TIOCGWINSZ: u64 = 0x5413;
     pub const TIOCSWINSZ: u64 = 0x5414;
+    pub const TIOCSCTTY: u64 = 0x540e;
+    pub const TIOCNOTTY: u64 = 0x5422;
     pub const FIONREAD: u64 = 0x541b;
     pub const FIONBIO: u64 = 0x5421;
     pub const FIOCLEX: u64 = 0x5451;
     pub const FIONCLEX: u64 = 0x5450;
+}
+
+/// `struct termios` fields (Linux asm-generic, arm64). The guest layout is
+/// `c_iflag, c_oflag, c_cflag, c_lflag` (4 × u32), `c_line` (u8), then
+/// `c_cc[NCCS]`; baud is encoded in `c_cflag`. `crates/kernel/src/term.rs`
+/// translates to the host `termios` on macOS and passes through on Linux.
+pub mod term {
+    /// Byte size of the Linux `struct termios` (16 + 1 + 19).
+    pub const TERMIOS_SIZE: usize = 36;
+    /// Number of control characters.
+    pub const NCCS: usize = 19;
+
+    // c_iflag
+    pub const IGNBRK: u32 = 0x0001;
+    pub const BRKINT: u32 = 0x0002;
+    pub const IGNPAR: u32 = 0x0004;
+    pub const PARMRK: u32 = 0x0008;
+    pub const INPCK: u32 = 0x0010;
+    pub const ISTRIP: u32 = 0x0020;
+    pub const INLCR: u32 = 0x0040;
+    pub const IGNCR: u32 = 0x0080;
+    pub const ICRNL: u32 = 0x0100;
+    pub const IXON: u32 = 0x0400;
+    pub const IXANY: u32 = 0x0800;
+    pub const IXOFF: u32 = 0x1000;
+    pub const IMAXBEL: u32 = 0x2000;
+    pub const IUTF8: u32 = 0x4000;
+
+    // c_oflag
+    pub const OPOST: u32 = 0x0001;
+    pub const ONLCR: u32 = 0x0004;
+    pub const OCRNL: u32 = 0x0008;
+    pub const ONOCR: u32 = 0x0010;
+    pub const ONLRET: u32 = 0x0020;
+    pub const OFILL: u32 = 0x0040;
+    pub const OFDEL: u32 = 0x0080;
+
+    // c_cflag
+    pub const CSIZE: u32 = 0x0030;
+    pub const CS5: u32 = 0x0000;
+    pub const CS6: u32 = 0x0010;
+    pub const CS7: u32 = 0x0020;
+    pub const CS8: u32 = 0x0030;
+    pub const CSTOPB: u32 = 0x0040;
+    pub const CREAD: u32 = 0x0080;
+    pub const PARENB: u32 = 0x0100;
+    pub const PARODD: u32 = 0x0200;
+    pub const HUPCL: u32 = 0x0400;
+    pub const CLOCAL: u32 = 0x0800;
+    /// `B38400`, the fixed baud reported on macOS.
+    pub const B38400: u32 = 0x000f;
+
+    // c_lflag
+    pub const ISIG: u32 = 0x0001;
+    pub const ICANON: u32 = 0x0002;
+    pub const ECHO: u32 = 0x0008;
+    pub const ECHOE: u32 = 0x0010;
+    pub const ECHOK: u32 = 0x0020;
+    pub const ECHONL: u32 = 0x0040;
+    pub const NOFLSH: u32 = 0x0080;
+    pub const TOSTOP: u32 = 0x0100;
+    pub const ECHOCTL: u32 = 0x0200;
+    pub const ECHOPRT: u32 = 0x0400;
+    pub const ECHOKE: u32 = 0x0800;
+    pub const FLUSHO: u32 = 0x1000;
+    pub const PENDIN: u32 = 0x4000;
+    pub const IEXTEN: u32 = 0x8000;
+    pub const EXTPROC: u32 = 0x10000;
+
+    // c_cc indices (Linux).
+    pub const VINTR: usize = 0;
+    pub const VQUIT: usize = 1;
+    pub const VERASE: usize = 2;
+    pub const VKILL: usize = 3;
+    pub const VEOF: usize = 4;
+    pub const VTIME: usize = 5;
+    pub const VMIN: usize = 6;
+    pub const VSTART: usize = 8;
+    pub const VSTOP: usize = 9;
+    pub const VSUSP: usize = 10;
+    pub const VEOL: usize = 11;
+    pub const VREPRINT: usize = 12;
+    pub const VDISCARD: usize = 13;
+    pub const VWERASE: usize = 14;
+    pub const VLNEXT: usize = 15;
+    pub const VEOL2: usize = 16;
 }
 
 /// Resource limits (`asm-generic/resource.h`).

@@ -21,6 +21,7 @@ pub mod procfs;
 mod signal;
 pub mod specialfd;
 mod syscalls;
+pub mod term;
 pub mod thread;
 mod trace;
 
