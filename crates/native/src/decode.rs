@@ -11,9 +11,12 @@
 //! fields it has and whether each is read or written. [`operands`] returns that
 //! for the instruction classes this pass handles, and `None` for everything
 //! else — the conservative answer, since an undecoded instruction is simply
-//! left alone rather than risk a wrong rewrite. Classes left for later
-//! (loads/stores, PC-relative forms, branches, anything touching `sp`) are
-//! reported by [`names_x18`] so they can be counted.
+//! left alone rather than risk a wrong rewrite. The PC-relative forms,
+//! compare/test branches and indirect branches through `x18` have their own
+//! decoders here, since their stubs differ. What is still left alone — a
+//! load/store with writeback onto `sp` or a register offset from `sp`, and a
+//! data-processing form whose operand is `sp` — is reported by
+//! [`names_x18`] so it can be counted.
 
 /// A register operand: its field position (low bit) and access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,8 +364,8 @@ pub fn x18_branch(insn: u32) -> bool {
 
 /// Whether `insn` names `x18` in any standard register-operand position. This
 /// over-approximates (it looks at the fixed Rd/Rn/Rm/Rt positions regardless of
-/// class) and is used only to *count* `x18` uses this pass does not yet
-/// rewrite, so a false positive inflates a diagnostic but changes no code.
+/// class) and is used only to *count* `x18` uses this pass leaves alone (the
+/// `sp` forms), so a false positive inflates a diagnostic but changes no code.
 pub fn names_x18(insn: u32) -> bool {
     [RD, RN, RM, 10].iter().any(|&s| reg(insn, s) == 18)
 }

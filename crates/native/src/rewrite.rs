@@ -11,10 +11,14 @@
 //!   short stub that reads or writes the guest thread pointer in a per-thread
 //!   slot instead. The slot lives in the host thread's TSD, which macOS points
 //!   `TPIDRRO_EL0` at; that register is per-thread and read-only to us.
+//! - Any instruction naming `x18`: macOS clears `x18` on every exception
+//!   return, so each such instruction becomes a branch to a stub that keeps
+//!   the guest's `x18` in another TSD slot (see [`crate::decode`]).
 //!
 //! arm64 instructions are 4 bytes and 4-byte aligned, so scanning aligned
-//! words finds every instruction exactly. A data word inside an executable
-//! segment that happens to match one of these encodings is rewritten too.
+//! words finds every instruction exactly. A data word that happens to match
+//! one of these encodings would be rewritten too, so callers pass only
+//! executable sections, and literal pools inside them are skipped.
 
 /// `svc #0`.
 pub const SVC0: u32 = 0xd400_0001;
@@ -97,9 +101,9 @@ pub struct Patched {
     /// Offsets (from the start of the block) of instructions that must be
     /// redirected to stubs.
     pub sites: Vec<(u64, Site)>,
-    /// Count of instructions that name `x18` but are not yet rewritable
-    /// (loads/stores, PC-relative forms, branches, `sp` forms). Diagnostic
-    /// only; those instructions are left untouched.
+    /// Count of instructions that name `x18` but are left alone (the `sp`
+    /// writeback and `sp` register-offset load/store forms, and data-processing
+    /// forms with an `sp` operand). Diagnostic only.
     pub x18_deferred: usize,
 }
 

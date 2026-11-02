@@ -17,10 +17,11 @@
 //! a guest EL0 through an EL1 vector is the next step, not part of the
 //! feasibility question.
 //!
-//! It cannot run in CI (GitHub's hosted macOS runners are themselves VMs, and
-//! nested virtualization is unavailable on their hardware), so it is driven by
-//! hand: `fwe --hv-spike` on an Apple Silicon Mac, with the binary ad-hoc
-//! codesigned with the hypervisor entitlement. See `docs/hypervisor-spike.md`.
+//! GitHub's hosted macOS runners are themselves VMs without nested
+//! virtualization, so it cannot run there; it runs by hand (`fwe --hv-spike`
+//! on an Apple Silicon Mac, with the binary ad-hoc codesigned with the
+//! hypervisor entitlement) and in the self-hosted CI job. See
+//! `docs/hypervisor-spike.md`.
 
 /// What the spike guest produced: what it wrote to fd 1 and the status it
 /// exited with.

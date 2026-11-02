@@ -3,388 +3,373 @@
 ## Components
 
 ```
-fwe (CLI)
- └── native backend (crates/native)
-      ├── loader      ELF image → host mappings at guest addresses
-      ├── rewrite     svc #0 → brk #0x4c58 before code becomes executable
-      ├── stack       Linux initial stack: argc, argv, envp, auxv
-      └── trap        SIGTRAP handler → kernel → resume guest
- └── kernel layer (crates/kernel)
-      Linux system call semantics on top of macOS, behind a Platform trait
- └── ABI (crates/abi), ELF (crates/elf)
+fwe (crates/fwe)            the command line; end-to-end tests
+ ├── native backend (crates/native)
+ │    ├── loader       ELF image → host mappings at the guest's addresses
+ │    ├── rewrite      in-place patching: svc #0 → brk; sites that need stubs
+ │    ├── decode       just enough AArch64 decoding to rewrite x18 uses
+ │    ├── prepare      applies rewrite to guest memory, places stubs, flushes caches
+ │    ├── stack        the Linux initial stack: argc, argv, envp, auxv
+ │    ├── trap         SIGTRAP/fault handlers → kernel → resume guest
+ │    ├── threads      clone: a host thread per guest thread
+ │    ├── process      fork, execve, wait4
+ │    ├── hwcap        AT_HWCAP/AT_HWCAP2 from the host CPU
+ │    └── hv           the hypervisor backend feasibility spike
+ ├── kernel layer (crates/kernel)
+ │    Linux system call semantics on top of the host, behind `Platform`
+ ├── elf (crates/elf)   ELF64 parsing and load planning, host-independent
+ └── abi (crates/abi)   Linux arm64 ABI numbers and layouts (partly generated)
 ```
 
-The kernel layer does not depend on how guest code runs; it sits behind the
-`fwe_kernel::Platform` trait. Guest code runs **in-process and natively** by
-default: instructions macOS cannot let a Linux process run as-is are rewritten
-before execution (see below), not trapped by a VM. The one class the
-in-process path cannot handle — a non-PIE `ET_EXEC` linked into the low 4 GiB
-macOS reserves — is served by a second `Platform` implementation, a
-minimalistic Hypervisor.framework backend (see PLAN.md and
-`docs/hypervisor-spike.md`); the same kernel layer sits behind both. A full
-virtual machine with its own Linux kernel remains a non-goal.
+The kernel layer does not depend on how guest code runs. An execution backend
+traps guest system calls, calls `Kernel::enter_syscall` with the guest's
+register file, and provides the few services the kernel needs through the
+`fwe_kernel::Platform` trait (preparing code for execution, ending a thread
+or the process). Two backends share it:
+
+- The **native backend** runs guest code in-process, directly on the CPU,
+  after rewriting the instructions macOS cannot let a Linux process execute
+  unchanged. It carries every position-independent binary.
+- The **hypervisor backend** (a feasibility spike today, see
+  [hypervisor-spike.md](hypervisor-spike.md)) runs the guest in a
+  Hypervisor.framework VM. It exists only for non-PIE executables linked
+  into the low 4 GiB that macOS reserves, which the native backend cannot
+  map. A full virtual machine with its own Linux kernel is a non-goal.
+
+## Hosts
+
+The kernel, ELF and ABI crates build on any Unix host; the `libc` crate
+supplies host values, and on a Linux host most translations are the identity
+(system calls that take the same arguments pass straight through). CI runs
+the unit tests on Linux as well as macOS. The native backend, and so the
+`fwe` command, runs only on macOS on Apple Silicon.
 
 ## Memory model
 
 Guest addresses are host addresses. The native backend maps guest memory at
 the guest's own virtual addresses inside the `fwe` process, so guest pointers
-are used directly. Where layouts match, they are passed straight to macOS
-system calls, which validate them. Future backends keep this property.
+are used directly and, where layouts match, handed straight to macOS system
+calls, which validate them. The hypervisor backend keeps this property by
+mapping the VM's memory at the same addresses in the host process.
 
-The guest sees the host page size (16K on Apple Silicon) through `AT_PAGESZ`,
-which the arm64 Linux ABI permits.
+The guest sees the host page size (16 KiB on Apple Silicon) through
+`AT_PAGESZ`, which the arm64 Linux ABI permits.
 
-macOS reserves the low 4 GiB of every arm64 process with a mandatory 4 GiB
-`__PAGEZERO`; on Apple Silicon the kernel refuses to launch a process with a
-smaller one. Position-independent executables (the norm for distribution
-packages) are loaded anywhere, and ET_EXEC images linked above 4 GiB at their
-addresses. ET_EXEC images linked *below* 4 GiB (non-PIE C and Rust at 0x200000
-or 0x400000, Go at 0x10000, Debian's `python3.11` at 0x400000) cannot be
-mapped at their own addresses in-process, and a non-PIE image carries no
-relocation information to move elsewhere. These run on the hypervisor backend
-instead, whose guest address space has no `__PAGEZERO` (see
-`docs/hypervisor-spike.md`).
+macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO`; on Apple
+Silicon the kernel refuses to launch a process with a smaller one.
+Position-independent executables are loaded anywhere, and `ET_EXEC` images
+linked above 4 GiB at their own addresses. An `ET_EXEC` image linked below
+4 GiB (non-PIE C and Rust at `0x200000` or `0x400000`, Go at `0x10000`,
+Debian's `python3.11` at `0x400000`) cannot be mapped at its address
+in-process, and carries no relocation information to move elsewhere. The
+loader rejects it with a clear error; the hypervisor backend is the path for
+it.
+
+## Loading
+
+The loader parses the ELF image, plans each `PT_LOAD` segment onto host pages
+and maps them at the guest's addresses (a PIE at a base the host picks). Code
+is mapped writable first, rewritten (below), and then given its final
+protections. Space for out-of-line stubs is reserved right after the image,
+within branch range of it.
+
+A dynamically linked executable names an interpreter in `PT_INTERP`
+(`/lib/ld-linux-aarch64.so.1` for glibc, `/lib/ld-musl-aarch64.so.1` for
+musl). The path is resolved through the rootfs, the interpreter is loaded
+too, and the guest starts at the interpreter's entry. The auxiliary vector
+carries `AT_BASE` (the interpreter's load base), `AT_ENTRY` (the executable's
+entry) and `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, as Linux provides them, plus
+`AT_HWCAP`/`AT_HWCAP2` from the host CPU, `AT_PAGESZ`, `AT_RANDOM`, the ids
+and `AT_MINSIGSTKSZ`. The interpreter maps the program's shared libraries
+itself through our `openat` and file-backed `mmap`, and self-relocates,
+resolves relocations and sets up the thread pointer exactly as on Linux. This
+runs real, unmodified glibc and musl: musl's linker is itself the libc, one
+object; glibc's `ld-linux-aarch64.so.1` is separate and maps `libc.so.6` at
+run time.
+
+The initial stack is laid out as the Linux kernel does at `execve`: the
+strings, the random bytes, the auxiliary vector, `envp`, `argv` and `argc`,
+16-byte aligned, on a fresh 8 MiB stack with a guard page.
+
+## Rewriting guest code
+
+Before any guest code becomes executable — the loader's images, and every
+`mmap`/`mprotect` with `PROT_EXEC` — the native backend rewrites three
+things. arm64 instructions are 4-byte aligned words, so scanning aligned
+words finds every instruction exactly.
+
+- **`svc #0`** (a Linux system call) would enter the macOS kernel. It becomes
+  `brk #0x4c58`, whose `SIGTRAP` our handler services.
+- **`mrs`/`msr` of `TPIDR_EL0`** (the Linux thread pointer): macOS keeps
+  its own per-thread data there and does not preserve it for user code. Each
+  access becomes a branch to a short stub that reads or writes the guest
+  thread pointer in a slot of the host thread's TSD, located through
+  `TPIDRRO_EL0` (per-thread and read-only to user code).
+- **Any instruction naming `x18`.** Linux treats `x18` as a scratch
+  register; macOS reserves it and clears it on every exception return,
+  including involuntary preemption, which nothing can intercept. So guest
+  state must never live in the hardware `x18` between instructions. Each
+  such instruction is redirected to a stub that keeps the guest's `x18` in a
+  per-thread TSD slot: the stub saves two scratch registers below `sp`
+  (Linux arm64 has no red zone), reads the slot into one, runs the
+  instruction with `x18` replaced by that scratch, writes the slot back if
+  the instruction wrote `x18`, restores the scratch registers and branches
+  back. macOS preserves every other register across preemption, so an
+  ordinary scratch register is safe.
+
+  `crates/native/src/decode.rs` decides which instructions are covered:
+  the register-only data-processing classes (move wide, add/sub, logical,
+  bitfield, extract, conditional select and compare, one-, two- and
+  three-source), the floating-point↔integer moves and conversions, all the
+  load/store forms (unsigned and unscaled immediate, register offset, pre-
+  and post-index, pair, with general-purpose and SIMD transfer registers),
+  the PC-relative forms (`adr`, `adrp`, `ldr` literal, where the stub
+  materialises the value computed from the original pc), the compare- and
+  test-branches (`cbz`/`cbnz`/`tbz`/`tbnz`, which get a branch stub that
+  tests the preserved value and takes a full-range branch to the real
+  target or the fall-through) and indirect branches (`br`/`blr`/`ret`
+  through `x18`, which load the target into `x16`/`x17`, dead at any branch).
+  A stack spill of `x18` through `sp` has its offset bumped by the 32 bytes
+  the stub pushed. What is still left alone, and counted as deferred: a
+  load/store with writeback onto `sp` or a register offset from `sp`, and
+  the data-processing forms whose operand is `sp` rather than `xzr`. These
+  are rare for a caller-saved register and have not appeared in the
+  binaries run so far.
+
+  The macOS custom x18 ABI (`<os/arch/arm64.h>`, macOS 26.4 and later) and
+  `fwe --host-info` remain only as host probes; correctness no longer
+  depends on the host preserving `x18`.
+
+Only executable code is scanned, since a data word that happens to encode a
+rewritten instruction would otherwise be patched too. `Elf::exec_ranges`
+reports the `SHF_EXECINSTR` sections from the section headers, so the
+symbol, string, hash and relocation tables that share an executable segment
+with the code — the whole R-X segment of musl's `ld-musl`, the code segment
+of glibc's `libc.so.6` — are never scanned. For a file-backed `mmap` the
+kernel reads the backing file's section headers (`Elf::exec_file_ranges`)
+and translates only its executable sections. Within a code section, literal
+pools (the targets of `ldr` literal) are detected and skipped. Two gaps
+remain: inline data in a code section that is not a literal pool (a jump
+table), and a binary fully stripped of section headers, where the scan falls
+back to the whole executable segment. Recursive descent over reachable code
+is the general fix for both.
+
+Stubs are placed in regions within `b` range (128 MiB) of their sites: the
+arena reserved after the loaded image, or, for code mapped later, regions
+found by probing near the code.
 
 ## System call path
 
-1. The loader, and `mmap`/`mprotect` with `PROT_EXEC`, map code writable
-   first and call `Platform::prepare_exec`, which rewrites every aligned
-   `svc #0` into `brk #0x4c58` and flushes the instruction cache. Then the
-   final protections are applied.
-2. The guest executes the `brk`. macOS delivers `SIGTRAP` on a dedicated
-   signal stack.
-3. The handler checks that the trapping instruction is ours, reads the
-   system call number from `x8` and arguments from `x0`–`x5`, and calls
-   `Kernel::syscall`.
-4. The result goes into `x0`, `pc` advances past the `brk`, and returning
-   from the handler resumes the guest. All other registers are preserved.
+1. The guest executes a rewritten `brk`. macOS delivers `SIGTRAP` on the
+   thread's dedicated signal stack.
+2. The handler checks that the trapping instruction is ours, copies the
+   saved thread state into a `Regs` value (the kernel's view of the guest
+   register file), and dispatches on the number in `x8`.
+3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `wait4`, the
+   blocking socket calls, `read`/`write` on an event descriptor — run
+   **without** the kernel lock, so a waiting thread never stalls the threads
+   meant to wake it; `clone`, `execve` and `exit` are handled by the backend
+   for the same reason. Everything else runs under the single kernel lock
+   through `Kernel::enter_syscall`.
+4. The result goes into `x0`, `pc` advances past the `brk`, a pending signal
+   is delivered if one is ready, and returning from the handler resumes the
+   guest. All other registers are preserved.
 
-## Registers macOS treats differently
-
-- **TPIDR_EL0** holds the Linux thread pointer, but macOS does not preserve
-  it for user code (it stores per-CPU data there). Every `mrs`/`msr` of
-  `TPIDR_EL0` is rewritten into a branch to a stub that reads or writes a
-  slot in the host thread's TSD instead, located through `TPIDRRO_EL0`
-  (per-thread, read-only to user code). Stubs live in space reserved right
-  after the image, within branch range.
-- **x18** is a scratch register for Linux code, but macOS reserves it and
-  clears it on every exception return (system calls, page faults, and — the
-  case nothing can intercept — involuntary preemption). So guest state must
-  never live in the hardware `x18` between instructions. Each instruction that
-  names `x18` is redirected to a stub (the same out-of-line mechanism as
-  `TPIDR_EL0`) that keeps the guest's `x18` in a per-thread TSD slot: the stub
-  saves two scratch registers below `sp` (Linux arm64 has no red zone), reads
-  the slot into one of them, runs the instruction with `x18` replaced by that
-  scratch, writes the slot back if the instruction wrote `x18`, restores the
-  scratch registers and branches back. Because macOS preserves every register
-  *except* `x18` across preemption, an ordinary scratch register is safe.
-  `crates/native/src/decode.rs` decides which instructions this covers: the
-  register-only data-processing classes (moves, logical and add/sub, bitfield,
-  extract, conditional select/compare, one-/two-/three-source) and all the
-  load/store forms — unsigned immediate, unscaled, register offset, pre/post
-  index, and pair — for both general-purpose and (for the base register) SIMD
-  variants. An `sp` base, a stack spill of `x18`, is handled by bumping the
-  access offset by the 32 bytes the stub pushes (`sp_fixup`), in whichever
-  immediate the addressing form uses; writeback onto `sp` and register-offset
-  onto `sp` cannot be compensated and are deferred. Compare- and test-branches
-  that read `x18` (`cbz`/`cbnz`/`tbz`/`tbnz`) cannot simply move to a stub
-  (their branch target is PC-relative), so they get a branch stub: it loads
-  `x18` into a scratch, runs the branch against the scratch to a local label,
-  then restores the scratch down both the taken and not-taken paths and uses a
-  full-range branch to the real target or the fall-through. For an `sp` base the stub adds the 32
-  bytes it pushed to the access's immediate so it still reaches the caller's
-  slot. Pair, pre/post-index and register-offset loads, PC-relative forms,
-  branches, and `sp` forms of the data-processing classes are left for a later
-  pass (counted, not rewritten). Literal pools are excluded from the scan
-  (below), so constants are never mistaken for `x18` instructions.
-  The custom x18 ABI (`<os/arch/arm64.h>`, macOS 26.4+) and `fwe --host-info`
-  remain only as a host probe; correctness no longer depends on the host
-  preserving `x18`.
+`--strace` prints each call with its arguments and result, plus the
+backend's notes (what was loaded and prepared), to standard error.
 
 ## Filesystem
 
-The guest sees a filesystem rooted at a host directory (the rootfs), set with
-`fwe --root DIR`; with no `--root` the root is the host `/`, reproducing
-pass-through behaviour. Guest paths are resolved under the root in
-`crates/kernel/src/fs.rs`, one component at a time, following symlinks
-ourselves and clamping `..` so a path can never escape the root — the
-containment `openat2(RESOLVE_IN_ROOT)` gives on Linux, done by hand so it
-works on macOS too. Absolute symlink targets re-root at the rootfs rather
-than the host `/`.
+The guest sees a filesystem rooted at a host directory, set with
+`fwe --root DIR`; with no `--root` the root is the host `/`. Guest paths are
+resolved under the root in `crates/kernel/src/fs.rs` one component at a time,
+following symlinks ourselves and clamping `..` so a path can never escape the
+root — the containment `openat2(RESOLVE_IN_ROOT)` gives on Linux, done by
+hand so it works on macOS too. Absolute symlink targets re-root at the
+rootfs. `*at` calls resolve relative to their directory descriptor.
 
 Guest file descriptors are host file descriptors: an opened file's host fd is
 returned to the guest unchanged, so `read`, `write`, `lseek`, `fstat` and the
-rest act on it directly. `getdents64` passes through on a Linux host (the
-kernel already produces the arm64 layout) and is translated from
-`getdirentries` on macOS. Creation modes have the umask applied by the kernel.
+rest act on it directly. `stat` results are translated into the arm64 Linux
+layout (`statx` too); `getdents64` is built from `getdirentries` on macOS.
+Creation modes have the umask applied by the kernel. `fcntl` translates the
+descriptor and status flags; `ioctl` covers the terminal, pty and `FIO*`
+requests.
 
-## Dynamic linking
+## Synthetic /proc and /sys
 
-A dynamically linked executable names an interpreter (the dynamic linker,
-e.g. `/lib/ld-linux-aarch64.so.1` or `/lib/ld-musl-aarch64.so.1`) in a
-`PT_INTERP` segment. The loader maps the executable, then resolves the
-interpreter path **through the rootfs**, maps it too (it is a PIE, loaded at
-an arbitrary base), and starts the guest at the interpreter's entry point
-rather than the executable's. The auxiliary vector carries `AT_BASE` (the
-interpreter's load base), `AT_ENTRY` (the executable's entry), and
-`AT_PHDR`/`AT_PHENT`/`AT_PHNUM` for the executable, as Linux provides them.
-The interpreter maps the executable's shared libraries itself through our
-`openat` and file-backed `mmap`; each executable region it maps (or turns
-executable with `mprotect`) is translated by the same `PROT_EXEC` path as the
-initial image, so the dynamic linker's own code and every library it loads get
-the `x18`/`svc`/`TPIDR_EL0` rewrite. For a file-backed mapping the kernel reads
-the backing file's section headers and translates only its executable
-sections, so a library whose code segment also carries its symbol and string
-tables — as glibc's `libc.so.6` does — keeps those tables intact (the same
-protection the loader applies to the initial image, here driven from the file
-rather than the in-memory image).
-
-This runs real, unmodified musl and glibc. The end-to-end tests load the
-genuine dynamic linker, which self-relocates, resolves the program's
-`R_AARCH64_JUMP_SLOT`/`R_AARCH64_RELATIVE` relocations against the shared libc,
-installs the thread pointer and starts the program. musl's linker is itself the
-libc, one self-contained object; glibc's `ld-linux-aarch64.so.1` is separate
-and maps `libc.so.6` at run time, exercising the file-backed translation path.
-The tests cover a minimal program with its own `_start`, a `_exit`-only program
-that forces the glibc shared-libc mapping without needing C runtime startup,
-and a normal program that starts through the libc's crt objects and
-`__libc_start_main` and then uses the heap and stdio.
+The rootfs has no real `/proc` or `/sys`, so the filesystem layer consults
+`crates/kernel/src/procfs.rs` before the host rootfs and generates what
+programs read at startup: `/proc/self/exe` (a symlink) and
+`/proc/self/cmdline`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
+`/proc/uptime`, `/proc/loadavg`, `/proc/sys/kernel/{ostype,osrelease,
+version,hostname,pid_max}`, `/proc/sys/vm/{overcommit_memory,mmap_min_addr}`
+and `/sys/devices/system/cpu/{online,possible}`. File content is served from
+an anonymous, seekable fd. The per-process values (exe, cmdline, cpu count,
+host name) are set at program load and `execve`. The directories can be
+opened and listed: `crates/kernel/src/synthdir.rs` serves `getdents64`,
+`lseek`, `fstat` and `close` on an opened synthetic directory from an
+in-memory entry list. An unknown path under `/proc` or `/sys` is `ENOENT`.
 
 ## Processes
 
-`execve` loads a new program with the shared `load_image` and enters it with
-a fresh register set, resetting signal and per-thread state; the old image's
-mappings are not reclaimed yet, so it suits fork-then-exec and exec chains.
-`fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
-`fork` and is supported for single-threaded guests only, since another
-thread could hold a lock across the fork. `wait4` reaps a child through the
-host and translates the status into the Linux encoding. `execve`, `fork` and
-`wait4` all run without the kernel lock.
-
-## Signals
-
-The kernel stores each signal's `sigaction`, the blocked mask and the
-alternate stack. When a guest raises a signal against itself (`kill`,
-`tgkill`, `raise`) it is marked pending and delivered on return to the guest;
-synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`) are offered to a
-handler at the point of the fault. Delivery builds an arm64 `rt_sigframe` on
-the guest stack (or the alternate stack under `SA_ONSTACK`), points the
-registers at the handler with `x0`/`x1`/`x2` set per `SA_SIGINFO`, and sets
-the return address to the handler's `sa_restorer` or, lacking one, a
-`rt_sigreturn` trampoline the backend maps at startup. `rt_sigreturn`
-restores the saved registers, mask and alternate stack. The backend exposes
-the guest register file to the kernel for the duration of a trap as a
-`Regs` value (copied from and back to the host signal context), which the
-coming thread support reuses. Floating-point and vector state is not yet
-saved across a handler.
+`execve` loads the new program with the same `load_image` the startup path
+uses and enters it with a fresh register set, after resetting the signal
+dispositions, the alternate stack and the per-thread words (the blocked mask
+is kept, as on Linux). The old image's mappings are not reclaimed yet, so
+this suits fork-then-exec and exec chains. `fork` (a `clone` without
+`CLONE_THREAD`) duplicates the process with host `fork`; the child
+re-initialises its thread state and enters the guest with `x0` = 0. It is
+supported for single-threaded guests only, since another thread could hold
+a lock across the fork. `wait4` reaps a child through the host and
+translates the status into the Linux encoding (and queues `SIGCHLD` to a
+watching `signalfd`); `rusage` is zero-filled. `getpid` is the main thread's
+tid; child pids are host pids, so `setpgid(child, …)` works. Sending a
+signal to another process is not implemented: `kill` of any pid but the
+caller's own returns `ESRCH`.
 
 ## Threads and concurrency
 
 A guest thread is a host thread running guest code directly; all threads
 share the single global kernel, so each trap briefly locks it. `clone` with
-the pthread flag set (`CLONE_THREAD | CLONE_VM | ...`) spawns a detached host
+the pthread flag set (`CLONE_THREAD | CLONE_VM | …`) spawns a detached host
 thread that enters the guest with the parent's registers, `x0` = 0 and its
 own stack; `CLONE_SETTLS` sets the new thread's pointer in its TSD slot, and
 `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID` update the
-tid words. Thread id, the `set_tid_address` word and the robust-list live in
-host thread-locals. A thread's `exit` clears and wakes its `clear_child_tid`
-futex (so `pthread_join` completes) and ends that host thread; the last
-thread, or `exit_group`, ends the process. `fork`, `execve` and `wait` are
-not implemented yet.
+tid words. The thread id, the `set_tid_address` word and the robust list live
+in host thread-locals. A thread's `exit` clears and wakes its
+`clear_child_tid` futex (so `pthread_join` completes) and ends that host
+thread; the last thread, or `exit_group`, ends the process.
 
-Blocking system calls — `futex`, `nanosleep`, `clock_nanosleep` — must not
-hold the kernel lock while they block, or a waiting thread would stall the
-threads meant to wake it. The backend runs them outside the lock (the futex
-wait queues are a separate process-global structure operating on raw guest
-memory), then re-locks only to record the result and deliver a pending
-signal. Per-thread signal masks and alternate stacks are not yet separated
-(the mask and altstack are process-wide).
+The futex wait queues are a process-global structure operating on raw guest
+memory, outside the kernel lock, so `FUTEX_WAIT` blocks without holding it.
+`clone3` is not implemented (glibc falls back to `clone`).
 
-## Synthetic /proc and /sys
+## Signals
 
-The guest rootfs has no real `/proc` or `/sys`, so the filesystem layer
-checks `crates/kernel/src/procfs.rs` before the host rootfs and generates the
-entries programs read at startup: `/proc/self/exe` (a symlink) and
-`/proc/self/cmdline`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
-`/proc/uptime`, `/proc/loadavg`, `/proc/sys/kernel/*`, `/proc/sys/vm/*` and
-`/sys/devices/system/cpu/*`. File content is served from an anonymous,
-seekable fd (an immediately-unlinked temp file). The per-process values
-(exe, cmdline, cpu count, host name) are set at program load and `execve`.
-An unknown path under `/proc` or `/sys` is `ENOENT`. The directories
-themselves can be opened and listed: `crates/kernel/src/synthdir.rs` tracks an
-opened synthetic directory fd and serves `getdents64`, `lseek`, `fstat` and
-`close` from an in-memory entry list (the tree in `procfs::children`), so
-`opendir`/`readdir` over `/proc`, `/proc/self`, `/proc/sys`, `/sys` and their
-synthetic subdirectories work.
+The kernel stores each signal's `sigaction`, the blocked mask and the
+alternate stack. A signal the guest raises against itself (`kill`, `tkill`,
+`tgkill`) is marked pending and delivered on the way back to the guest;
+synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGILL`) are offered to a
+handler at the point of the fault, and take the default action (the process
+dies with that signal, after a register and code dump under `--strace`) if
+none is installed. Delivery builds an arm64 `rt_sigframe` on the guest stack
+(or the alternate stack under `SA_ONSTACK`), points the registers at the
+handler with `x0`/`x1`/`x2` set per `SA_SIGINFO`, and sets the return
+address to the handler's `sa_restorer` or, lacking one, an `rt_sigreturn`
+trampoline the backend maps at startup. `rt_sigreturn` restores the saved
+registers, mask and alternate stack. Only the general-purpose registers, `sp`,
+`pc` and `pstate` are saved across a handler; the signal mask and alternate
+stack are process-wide rather than per thread.
 
-## epoll
+## Event descriptors
 
-`epoll_create1`, `epoll_ctl` and `epoll_pwait` live in
-`crates/kernel/src/epoll.rs`. On Linux they pass straight through to the host
-kernel, which already speaks the arm64 Linux ABI. On macOS they are translated
-to `kqueue`: the epoll descriptor is a kqueue fd, each watched fd becomes an
-`EVFILT_READ` filter for `EPOLLIN` and an `EVFILT_WRITE` filter for `EPOLLOUT`,
-`EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`, and the
-caller's `epoll_event.data` word rides in the kevent `udata`. A control change
-uses `EV_RECEIPT` so registration errors surface without reporting readiness;
-`epoll_pwait` translates returned kevents back into the packed 12-byte arm64
-`epoll_event` array in place. `epoll_pwait` can block, so the backend runs it
-outside the kernel lock like `futex` and the sleeps. Readiness edge cases
-(`EEXIST`/`ENOENT` for redundant `ADD`/`MOD`, and the signal mask) are not yet
-emulated precisely on macOS.
+`epoll_create1`, `epoll_ctl` and `epoll_pwait` (`crates/kernel/src/epoll.rs`)
+pass through on Linux and are translated to `kqueue` on macOS: the epoll
+descriptor is a kqueue, each watched fd becomes an `EVFILT_READ` filter for
+`EPOLLIN` and an `EVFILT_WRITE` filter for `EPOLLOUT`, `EPOLLET` maps to
+`EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`, and the caller's data word
+rides in the kevent `udata`. `epoll_pwait` writes the packed 12-byte arm64
+`epoll_event` array in place. The `EEXIST`/`ENOENT` edge cases of redundant
+`ADD`/`MOD` and the signal mask are not emulated precisely on macOS.
 
-## eventfd and timerfd
+`eventfd` and `timerfd` (`crates/kernel/src/specialfd.rs`) have no macOS
+equivalent and are emulated in a process-global registry keyed by descriptor,
+which `read`, `write` and `close` consult first. An eventfd is a pipe plus a
+64-bit counter: the pipe holds one byte exactly while the counter is
+non-zero, so the read end handed to the guest is readable, and pollable by
+`kqueue` and hence by our `epoll`, precisely when a read would succeed. A
+timerfd is a `kqueue` holding one `EVFILT_TIMER`, with millisecond
+resolution; a periodic timer's distinct initial `it_value` and the
+realtime/monotonic distinction are not modelled.
 
-`eventfd` and `timerfd` live in `crates/kernel/src/specialfd.rs`. On Linux they
-pass through to the host kernel. macOS has neither, so they are emulated and
-tracked in a process-global registry keyed by descriptor, which `read`, `write`
-and `close` consult:
-
-- **eventfd** is a pipe plus a 64-bit counter. The pipe holds exactly one byte
-  while the counter is non-zero, so the read end — the fd handed to the guest —
-  is readable, and pollable by `kqueue` (hence by our `epoll`), precisely when a
-  read would succeed. `read` returns and clears the counter (or returns 1 and
-  decrements it under `EFD_SEMAPHORE`); `write` adds to it.
-- **timerfd** is a `kqueue` holding one `EVFILT_TIMER`; `read` collects the
-  expiration count with `kevent`, and the kqueue fd is pollable by our `epoll`.
-  Millisecond resolution; a periodic timer's distinct initial `it_value` and
-  the realtime/monotonic clock distinction are not modelled.
-
-`read` and `write` can block, so the backend routes every `read`/`write`
-through the lock-free `blocking_syscall` path first: a consumer blocking under
-the kernel lock while the producer needs that same lock to post would deadlock.
-The registry returns "not mine" for ordinary descriptors, which fall back to the
-normal host `read`/`write`.
-
-## signalfd
-
-`signalfd` lives in `crates/kernel/src/signalfd.rs`. The guest's signals are
-virtual — the kernel tracks them itself rather than as host signals — so
-`signalfd` is emulated on both hosts rather than delegated. Each signalfd is a
-readiness pipe (so it is pollable by `epoll`) plus a queue of
-`signalfd_siginfo` records and the set of signals it watches. When the guest
-raises a signal that is blocked and some signalfd watches it, the kernel queues
-a record on that descriptor instead of leaving the signal pending; a reaped
-child likewise queues a `SIGCHLD` record. `read` returns the queued records and
-blocks lock-free like the other event descriptors.
-
-## Credentials
-
-The guest has a virtual user and group identity in `crates/kernel/src/creds.rs`,
-independent of the host process. Changing the host process's real credentials
-would be wrong (one host process backs the guest) and would fail unless `fwe`
-ran as root, so `getuid`/`geteuid`/`getgid`/`getegid`, the `set*uid`/`set*gid`
-family (`setresuid`, `setreuid`, `setfsuid` and the group equivalents) and
-`getgroups`/`setgroups` act on this identity with Linux permission semantics.
-The default is root (uid 0), the usual identity inside a container image, so a
-program that drops privileges can do so and cannot regain them. Because the
-identity is virtual, `chown` as root is accepted but does not change host file
-ownership (shadow ownership is not tracked), and `access` under a virtual root
-bypasses the permission bits as Linux root does.
+`signalfd` (`crates/kernel/src/signalfd.rs`) is emulated on both hosts, since
+the guest's signals are virtual: each signalfd is a readiness pipe plus a
+queue of `signalfd_siginfo` records. When the guest raises a signal that is
+blocked and some signalfd watches it, the record is queued there instead of
+leaving the signal pending; a reaped child queues `SIGCHLD` likewise.
 
 ## Sockets
 
-Socket calls live in `crates/kernel/src/net.rs`. On Linux they pass through to
-the host kernel, whose ABI the guest already speaks. macOS has the BSD socket
-API, close but not identical, so the module translates:
+Socket calls (`crates/kernel/src/net.rs`) pass through on Linux. macOS has
+the BSD socket API, close but not identical, so the module translates:
+address families (`AF_INET6` is 10 on Linux, 30 on macOS), the `sockaddr`
+header (Linux leads with a 2-byte family, macOS with a length byte and a
+family byte; the port and address that follow are identical, so it is an
+in-place header fix-up), the `SOCK_NONBLOCK`/`SOCK_CLOEXEC` type flags
+(applied with `fcntl`), `setsockopt` levels and the common option numbers,
+and the `send`/`recv` flags. `MSG_NOSIGNAL` has no macOS equivalent, so every
+socket gets `SO_NOSIGPIPE` and a broken pipe returns `EPIPE`.
 
-- **address families:** `AF_INET6` is 10 on Linux but 30 on macOS; `AF_INET`
-  and `AF_UNIX` match.
-- **`sockaddr` layout:** Linux leads with a 2-byte `sa_family`; macOS leads
-  with a 1-byte length and a 1-byte family. The port and address that follow
-  are identical, so the conversion is a small header fix-up, done in place on
-  the guest buffer's bytes.
-- **socket type flags:** Linux packs `SOCK_NONBLOCK`/`SOCK_CLOEXEC` into the
-  `type` argument; macOS has no such bits, so they are stripped and applied
-  with `fcntl`.
-- **`setsockopt`:** `SOL_SOCKET` is 1 on Linux, `0xffff` on macOS, and the
-  option numbers differ; a table maps the common ones, and `TCP_NODELAY`.
-- **`send`/`recv` flags:** reordered bits, mapped individually. `MSG_NOSIGNAL`
-  has no macOS equivalent, so every socket gets `SO_NOSIGPIPE` and a broken
-  pipe returns `EPIPE` rather than raising a signal.
-
-Guest file descriptors are host socket descriptors, as everywhere else. The
-calls that can block — `connect`, `accept`, `recvfrom`, `recvmsg`, `sendto`,
-`sendmsg` — run outside the kernel lock through `blocking_syscall`, so a thread
-waiting in `accept` or `recv` does not stall the threads meant to feed it. DNS
-needs no special support: the guest's resolver reads `/etc/resolv.conf` and
-`/etc/hosts` from the rootfs and talks to nameservers over these sockets.
-
-`AF_UNIX` is fully handled: socket paths are rooted under the rootfs like every
-other path, and abstract-namespace names (a leading NUL) are mapped to files
-under a per-host temporary directory, since macOS has no abstract namespace.
-`SCM_RIGHTS` ancillary data (file-descriptor passing over `AF_UNIX`) is
-translated too — on macOS the control-message layout differs (`cmsg_len` is
-64-bit on Linux, 32-bit on macOS), so `sendmsg`/`recvmsg` re-encode it. The
-passed descriptors are host descriptors, so they work in the receiver directly.
-`AF_NETLINK` and raw sockets are deferred to M4.
+`AF_UNIX` socket paths are rooted under the rootfs like every other path, and
+abstract-namespace names (a leading NUL) map to files under a per-host
+temporary directory, since macOS has no abstract namespace. `SCM_RIGHTS`
+ancillary data is re-encoded, since `cmsg_len` is 64-bit on Linux and 32-bit
+on macOS; the passed descriptors are host descriptors and work in the
+receiver directly. DNS needs no special support: the guest's resolver reads
+`/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
+over these sockets. `AF_NETLINK` and raw sockets are M4.
 
 ## Terminals and job control
 
 Terminal `ioctl`s are handled in `crates/kernel/src/syscalls.rs`, with the
-`termios` translation in `crates/kernel/src/term.rs`. On Linux `TCGETS`/`TCSETS`
-pass through, since the guest `termios` is the host's. On macOS the structure
-differs — `tcflag_t` is 64-bit, the control characters are ordered differently,
-and almost every flag sits in a different bit — so each field is translated with
-`tcgetattr`/`tcsetattr` through per-field bit tables and a control-character
-index map. Baud is reported as a fixed `B38400`; a pty has no meaningful line
-rate. `TIOCGWINSZ`/`TIOCSWINSZ` share a layout and pass through; `TIOCGPGRP`/
-`TIOCSPGRP` map to `tcgetpgrp`/`tcsetpgrp`, and `TIOCSCTTY`/`TIOCNOTTY` pass
-through.
+`termios` translation in `crates/kernel/src/term.rs`. On macOS the structure
+differs — `tcflag_t` is 64-bit, the control characters are ordered
+differently, and almost every flag sits in a different bit — so each field is
+translated through per-field bit tables and a control-character index map.
+Baud is reported as a fixed `B38400`. `TIOCGWINSZ`/`TIOCSWINSZ` share a layout
+and pass through; `TIOCGPGRP`/`TIOCSPGRP` map to `tcgetpgrp`/`tcsetpgrp`;
+`TIOCSCTTY`/`TIOCNOTTY` pass through. `setpgid`, `getpgid`, `setsid` and
+`getsid` act on host process groups and sessions.
 
-`setpgid`, `getpgid`, `setsid` and `getsid` act on host process groups and
-sessions. A guest "pid" argument of 0 (self) always works, and child pids
-returned by `fork` are host pids, so `setpgid(child, …)` works too; passing a
-guest's virtual `getpid` value for another process does not.
+Pty allocation (`crates/kernel/src/pty.rs`): opening `/dev/ptmx` allocates a
+master with `posix_openpt`/`grantpt`/`unlockpt` and remembers a guest-facing
+slave number; `TIOCGPTN` returns it, `TIOCSPTLCK` is accepted, and opening
+`/dev/pts/<n>` maps that number to the host slave device.
 
-Pty allocation is handled in `crates/kernel/src/pty.rs`. Opening `/dev/ptmx`
-allocates a master with `posix_openpt`/`grantpt`/`unlockpt` (available on both
-hosts) and remembers a guest-facing slave number; `TIOCGPTN` returns it,
-`TIOCSPTLCK` is accepted, and opening `/dev/pts/<n>` maps that number to the
-host slave device (`/dev/pts/<n>` on Linux, `/dev/ttys<nnn>` on macOS). So a
-guest can allocate and drive its own pty.
+## Credentials
+
+The guest has a virtual user and group identity (`crates/kernel/src/creds.rs`)
+independent of the host process, since changing the host's real credentials
+would be wrong (one host process backs the guest) and would need root. The
+`get*id`/`set*id` family, `getgroups`/`setgroups` and `getresuid`/`getresgid`
+act on it with Linux permission semantics. The default is root (uid 0), the
+usual identity inside a container image; a program that drops privileges
+cannot regain them. `chown` as virtual root is accepted but does not change
+host ownership (shadow ownership is not tracked), and `access` under a
+virtual root bypasses the permission bits as Linux root does.
 
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
-translated to macOS values in `crates/kernel/src/host.rs`, using the `libc`
-crate for host values. `crates/abi` holds the Linux side. Syscall numbers and
-errno values are generated from the Linux UAPI headers by `tools/gen-abi.py`.
+translated to host values in `crates/kernel/src/host.rs`, using the `libc`
+crate. `crates/abi` holds the Linux side; syscall numbers and errno values are
+generated from the Linux UAPI headers by `tools/gen-abi.py`.
 
-## Known limitations in M0
+## Known limitations
 
-These are tracked on the roadmap:
+Each of these is on the [roadmap](../ROADMAP.md); this is the detail behind
+those items.
 
-- `fork` is single-threaded only; `vfork`, `waitid` and `execveat` are not
-  implemented; `execve` does not reclaim the old address space.
-- Signal mask and alternate stack are process-wide, not per thread.
-- Floating-point/vector registers are not saved across a signal handler.
-- Non-PIE executables linked below 4 GiB cannot run in-process (the mandatory
-  `__PAGEZERO`); the minimalistic hypervisor backend (see above and
-  `docs/hypervisor-spike.md`) is the path for them, not load-time relocation.
-- Guest uses of `x18` across the data-processing and load/store classes are
-  rewritten to a per-thread slot (see above) and survive preemption, which is
-  enough to run a compiled Rust/musl binary unmodified, including the
-  compare/test branches (`cbz`/`cbnz`/`tbz`/`tbnz`) that read `x18` and the
-  floating-point↔integer conversions (`fmov`/`fcvt*`/`scvtf`/`ucvtf`), the
-  PC-relative forms (`adr`/`adrp` and `ldr`-literal into `x18`, where the stub
-  materializes the value computed from the original pc), and indirect branches
-  through `x18` (`br`/`blr`/`ret x18`, where the stub loads the target from the
-  slot into the `x16`/`x17` scratch registers — dead at any branch — and jumps,
-  setting the link register for `blr`). The only `x18` forms still deferred are
-  `sp`-writeback and `sp`-register-offset loads (a prologue spilling `x18`
-  through `sp` with writeback), which are rare for a caller-saved register.
-- The rewrite pass scans aligned words and patches instructions, so a data
-  word that happens to encode a rewritten instruction would be patched too.
-  The scan is therefore confined to the executable code: `Elf::exec_ranges`
-  reports the `SHF_EXECINSTR` sections from the section headers, so symbol,
-  string, hash and relocation tables that share an executable segment with the
-  code — as the whole R-X segment of musl's `ld-musl` does — are never
-  scanned. Within a code section, literal pools (the targets of `ldr`-literal)
-  are detected and skipped. Two gaps remain: inline data in a code section
-  other than a literal pool (e.g. a jump table), and a binary fully stripped of
-  its section headers, where the scan falls back to the whole executable
-  segment. Recursive descent over reachable code only is the planned general
-  fix for both.
-- Guest pointers the kernel reads itself are not yet fault-checked; a bad
-  pointer crashes `fwe` instead of returning `EFAULT`.
+- **Execution:** a non-PIE executable linked below 4 GiB cannot run
+  in-process (the mandatory `__PAGEZERO`); the hypervisor backend is the path
+  for it, and exists as a spike. `x18` in a load/store with writeback onto
+  `sp` or a register offset from `sp`, and in a data-processing form whose
+  operand is `sp`, is left unrewritten (counted under `--strace`). Code
+  discovery relies on section headers; a stripped binary has its whole
+  executable segment scanned, and an inline jump table in a code section
+  could be patched.
+- **Processes:** `execve` does not reclaim the old address space; `fork` is
+  single-threaded only; `vfork`, `waitid`, `execveat` and `clone3` are not
+  implemented; `rusage` is zero-filled.
+- **Signals:** `kill` reaches only the calling process (another pid gets
+  `ESRCH`), so a shell cannot signal its children; the mask and alternate
+  stack are process-wide, not per thread; floating-point and vector
+  registers are not saved across a handler.
+- **Memory safety:** guest pointers the kernel reads itself are not
+  fault-checked; a bad pointer crashes `fwe` instead of returning `EFAULT`.
+- **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases and the
+  `epoll_pwait` signal mask; `timerfd` resolution and clock distinctions.
+- **Not implemented:** `rseq`, `membarrier` (optional for libc), and any
+  system call not listed in `crates/kernel/src/syscalls.rs` returns `ENOSYS`
+  and is noted under `--strace`.

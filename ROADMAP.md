@@ -1,91 +1,103 @@
 # Roadmap
 
-Milestones are sequential; each is done when its exit criteria are met.
-See [PLAN.md](PLAN.md) for the overall plan.
+Milestones are ordered by what each one unlocks. A milestone is done when its
+**Done when** criteria pass as end-to-end tests in CI; checklist items are
+the work that gets there. Work for a later milestone may land early when it
+is independent (most of M2's system-call surface did), but a milestone is
+only ticked off against its criteria.
 
-## M0 — Foundation
+[PLAN.md](PLAN.md) states the goal and scope; [docs/architecture.md](docs/architecture.md)
+describes how the pieces work and lists the current limitations in detail.
 
-- [x] Rust project skeleton and build
-- [x] CI running on Apple Silicon macOS
-- [x] ELF loader for static binaries
-- [x] System call redirection to our implementation
-- [x] Test harness
+**Status (November 2026):** M0 and M1 are done. M2 is in progress: its
+system-call surface is implemented, and what remains is the hypervisor
+backend for low-address executables and running the listed software end to
+end.
 
-**Done when:** a static Linux arm64 binary runs and prints "hello".
+## M0 — Foundation (done)
 
-## M1 — Core userland
+- [x] Rust workspace, CI on Apple Silicon macOS (15 and 26) plus a Linux
+  lint and unit-test job
+- [x] ELF loader for static executables
+- [x] System calls redirected to our implementation (`svc #0` rewritten to a
+  trap)
+- [x] End-to-end test harness: assembly and Rust guests built and run under
+  `fwe`
 
-- [x] Processes and threads: `clone` threads + futex, `fork`, `execve`, `wait4`
-  (single-threaded `fork`; address-space teardown on `execve` is partial)
-- [x] Memory management (`mmap`, `mprotect`, `brk`, and friends)
-- [x] Files and directories, with a Linux root filesystem
-- [x] Signals
+**Done when:** a static Linux arm64 binary runs and prints "hello". ✔
+
+## M1 — Core userland (done)
+
+- [x] Processes and threads: `clone` threads with futexes, `fork`, `execve`,
+  `wait4`
+- [x] Memory: `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `brk`
+- [x] Files and directories on a Linux root filesystem (`--root`), with
+  path resolution confined to it
+- [x] Signals: `sigaction`, masks, alternate stacks, delivery through an
+  arm64 `rt_sigframe`, `rt_sigreturn`
 - [x] Pipes
-- [x] Dynamic linking with glibc and musl: both work end to end. The loader
-  maps the program and the interpreter named in `PT_INTERP`, hands off at the
-  interpreter's entry with `AT_BASE`/`AT_ENTRY`/`AT_PHDR` set, and the real
-  dynamic linker self-relocates, resolves the program's relocations against the
-  shared libc, sets up the thread pointer and starts it. glibc's linker is a
-  separate object from `libc.so.6` and maps it at run time; that mapping goes
-  through the `mmap` `PROT_EXEC` path, which translates only the file's
-  executable sections so the symbol and string tables sharing `libc.so.6`'s
-  code segment are left intact. End-to-end tests run genuine dynamic binaries
-  against vendored musl and glibc builds: a minimal `_start`, a `_exit`-only
-  program that forces the glibc shared-libc mapping, and a full
-  crt/`__libc_start_main`/stdio program.
-- [~] Binary translation of `x18` (and the other registers macOS treats
-  specially): macOS clears `x18` on every exception return — including
-  involuntary preemption, where the custom x18 ABI was observed being dropped —
-  so guest uses of `x18` are rewritten to a per-thread slot before the code
-  runs, exactly as `svc #0` and `TPIDR_EL0` already are. The data-processing
-  classes and all the load/store forms (unsigned/unscaled/register-offset/
-  pre-post-index/pair, general-purpose and SIMD base) are handled, with stack
-  spills adjusted for the stub's push and literal pools protected from the
-  scan, as are the PC-relative forms (`adr`/`adrp`/`ldr`-literal) and the
-  compare/test/indirect branches through `x18` — enough to run a compiled
-  Rust/musl binary and a real `ld-musl` unmodified. Only executable code is
-  rewritten: code extents come from the section headers (the `SHF_EXECINSTR`
-  sections), so data that shares an executable segment with the code — a
-  dynamic linker's symbol, string and hash tables, for instance — is left
-  intact. Only `sp`-writeback spills and code discovery for fully stripped
-  binaries without section headers remain. This
-  keeps execution in-process at native speed; the native path uses no VM, and a
-  thin hypervisor backend is reserved only for binaries it cannot map (the
-  low-address non-PIE case below — see PLAN.md).
-- [~] Executables linked below 4 GiB (non-PIE `ET_EXEC`: Debian's
-  `python3.11` at `0x400000`, static Go at `0x10000`): macOS reserves the low
-  4 GiB with a mandatory `__PAGEZERO` that cannot be shrunk on Apple Silicon,
-  and a non-PIE image has no relocation information to move elsewhere, so the
-  native backend cannot run these — an OS limitation confirmed in practice.
-  The path forward is a **minimalistic Hypervisor.framework backend**, where
-  the guest's own address space supplies the low addresses and `svc` traps
-  into the existing kernel. A feasibility spike (`fwe --hv-spike`, see
-  `docs/hypervisor-spike.md`) runs a low-address guest in a VM end to end; it
-  needs the hypervisor entitlement (no root) and so is validated by hand on
-  Apple Silicon rather than in CI — no GitHub-hosted runner provides a
-  hardware VM for an aarch64 guest (macOS HVF is unavailable there, measured,
-  and the arm64 Linux runners expose no `/dev/kvm`), so a self-hosted Apple
-  Silicon runner is wired behind a gate for that coverage.
+- [x] Binary translation of what macOS cannot let a Linux process run
+  unchanged: `svc #0`, `TPIDR_EL0`, and every use of `x18` in the
+  data-processing, load/store, PC-relative and branch classes, confined to
+  the executable sections so data is never patched
+- [x] Dynamic linking with real, unmodified glibc and musl: the loader hands
+  off to the dynamic linker named in `PT_INTERP`; libraries it maps are
+  translated through the `PROT_EXEC` `mmap`/`mprotect` path
+- [x] Unmodified Debian 12 `aarch64` programs run with their output checked:
+  coreutils (`true`, `false`, `echo`, `seq`, `env`, `cat`, `sort`), `ls`
+  (through `libselinux` and `libpcre2`) and `bash` (startup, builtins,
+  arithmetic, loops)
 
-**Done when:** bash, coreutils and Python run from a Debian rootfs.
-Progress: unmodified Debian `aarch64` coreutils (`true`, `false`, `echo`,
-`seq`, `env`, `cat`, `sort`), `ls` (with its `libselinux` → `libpcre2`
-dependency graph) and `bash` (shell startup, builtins, arithmetic and loops,
-linked against `libtinfo`) run against the vendored glibc runtime, with their
-output checked end to end. Python remains: Debian's `python3.11` is a non-PIE
-executable linked at `0x400000`, so it needs the hypervisor backend above (the
-rest of the Debian userland that is position-independent already runs).
+**Done when:** bash and coreutils run from a Debian rootfs. ✔
 
-## M2 — Everyday software
+Python was originally part of this criterion. Debian's `python3.11` is a
+non-PIE executable linked at `0x400000`, inside the 4 GiB that macOS
+reserves in every arm64 process, so the in-process backend cannot map it at
+all; that is an OS limit, not a gap in the userland. It moves to M2, where
+the hypervisor backend that serves such executables is built (static Go
+binaries, also on the M2 list, need it for the same reason).
 
-- [x] Networking (TCP/UDP over IPv4/IPv6, `socketpair`, pathed and abstract
-  `AF_UNIX`, `SCM_RIGHTS` descriptor passing; netlink and raw sockets are M4)
-- [x] Terminals and job control (`termios`, window size, tty process group,
-  sessions, pty allocation via `/dev/ptmx` + `/dev/pts`)
-- [x] Event APIs (`epoll`, `eventfd`, `timerfd`, `signalfd`)
-- [x] `/proc` and `/sys` (startup files served and the directories are
-  listable with `getdents64`)
-- [x] Users, permissions and ownership (virtual credentials)
+## M2 — Everyday software (in progress)
+
+System-call surface, implemented and covered by end-to-end tests:
+
+- [x] Networking: TCP and UDP over IPv4 and IPv6, `socketpair`, pathed and
+  abstract `AF_UNIX`, `SCM_RIGHTS` descriptor passing
+- [x] Terminals and job control: `termios`, window size, tty process group,
+  sessions, pty allocation through `/dev/ptmx` and `/dev/pts`
+- [x] Event APIs: `epoll`, `eventfd`, `timerfd`, `signalfd`
+- [x] `/proc` and `/sys`: the files programs read at startup, and the
+  directories listable with `getdents64`
+- [x] Users, permissions and ownership as virtual credentials
+
+Remaining:
+
+- [ ] **Hypervisor backend** for executables linked below 4 GiB (non-PIE
+  `ET_EXEC`: Debian's `python3.11` at `0x400000`, static Go at `0x10000`).
+  The feasibility spike (`fwe --hv-spike`, see
+  [docs/hypervisor-spike.md](docs/hypervisor-spike.md)) runs a low-address
+  guest in a Hypervisor.framework VM and services its traps. The backend
+  itself: run the guest at EL0 under a minimal EL1 vector so `svc #0` traps
+  as is (no rewrite needed), keep guest addresses equal to host addresses by
+  mapping the VM's memory at the same addresses in the host so the kernel
+  layer is shared unchanged, implement `Platform` for it, and have the loader
+  pick it automatically for images the native backend cannot map. CI
+  coverage runs on the self-hosted Apple Silicon runner (the `hypervisor`
+  job); hosted runners cannot run a VM.
+- [ ] Python from the Debian rootfs (carried over from M1)
+- [ ] Process model gaps that shells and build tools hit: `kill` to another
+  process (today only the caller's own pid is accepted); reclaim the old
+  address space on `execve`; `fork` from a multithreaded process; `vfork`,
+  `waitid`, `execveat`; `rusage` from `wait4`/`getrusage`
+- [ ] Per-thread signal masks and alternate stacks; floating-point and SIMD
+  state saved across a signal handler
+- [ ] `EFAULT` for bad guest pointers the kernel reads itself, instead of a
+  crash
+- [ ] The remaining `x18` forms (`sp`-writeback and `sp`-register-offset
+  loads and stores) and code discovery for binaries without section headers
+- [ ] Each of the target programs vendored or fetched as a test with checked
+  output: git, a C compiler, Node, Go, the Rust toolchain, `apt`, a database,
+  a web server
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.
@@ -105,7 +117,7 @@ servers run unmodified.
 - [ ] ptrace and debuggers (gdb, strace)
 - [ ] io_uring
 - [ ] Advanced networking (netlink, firewalling, raw sockets, TUN)
-- [ ] High pass rates on gVisor syscall tests, LTP and kselftests
+- [ ] High pass rates on gVisor's syscall tests, LTP and kselftests
 
 **Done when:** real-world workloads run unmodified and conformance suites
 pass at high rates.
