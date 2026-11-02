@@ -56,6 +56,10 @@ See [PLAN.md](PLAN.md) for the overall plan.
   same translation pass, not by a VM.
 
 **Done when:** bash, coreutils and Python run from a Debian rootfs.
+Progress: unmodified Debian `aarch64` coreutils (`true`, `false`, `echo`,
+`seq`, `env`, `cat`, `sort`) run against the vendored glibc runtime, with their
+output checked end to end. bash and Python, and the extra shared libraries they
+and `ls` pull in, are next.
 
 ## M2 — Everyday software
 
