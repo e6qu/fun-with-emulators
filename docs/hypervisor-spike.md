@@ -58,10 +58,37 @@ first; if it is `0` the machine has no hypervisor support. Without the
 entitlement, `hv_vm_create` fails and `fwe` reports
 `hv spike failed: hv_vm_create failed: ...` rather than crashing.
 
-## Why it is not in CI
+## CI: hosted runners can't, a self-hosted runner can
 
-GitHub's hosted macOS runners are themselves virtual machines, and nested
-virtualization is unavailable on their hardware, so `hv_vm_create` cannot
-succeed there. The spike therefore is not exercised by the end-to-end test
-suite; it is validated by hand on real Apple Silicon. The code is still
-compiled and lint-checked for `aarch64-apple-darwin` in CI so it cannot rot.
+GitHub's hosted macOS runners are themselves virtual machines without nested
+virtualization, so HVF is unavailable there. This is measured, not assumed —
+the `macos` jobs run an informational step that reports it:
+
+- `macos-15`: `kern.hv_support` OID does not exist.
+- `macos-26`: `kern.hv_support: 0`.
+- Both: `hv_vm_create` returns `0xfae9400f` (`HV_UNSUPPORTED`), even though the
+  binary is correctly codesigned with the entitlement.
+
+So the code is always compiled and lint-checked for `aarch64-apple-darwin` in
+CI (it cannot rot), and the informational step keeps reporting availability in
+case a hosted runner ever gains it — but the spike is actually *run* on a
+**self-hosted Apple Silicon runner**, where `kern.hv_support` is `1`.
+
+### Registering the self-hosted runner (one time)
+
+On an Apple Silicon Mac (bare metal, not a VM), confirm `sysctl
+kern.hv_support` is `1`, then register it as a repository runner:
+`Settings → Actions → Runners → New self-hosted runner`, choose macOS/ARM64,
+and follow the shown `./config.sh` / `./run.sh` steps. GitHub labels it
+`self-hosted`, `macOS`, `ARM64` automatically. Install a Rust toolchain for
+the runner user (`rustup`), since the job builds with `cargo`.
+
+Then set the repository variable that enables the job:
+`Settings → Secrets and variables → Actions → Variables → New variable`,
+name `FWE_HV_SELF_HOSTED`, value `true`. The `hypervisor` job stays skipped
+until this is set, so it never blocks PRs when no runner exists. Once set, the
+job codesigns `fwe` with the entitlement and runs `fwe --hv-spike` on every
+push, asserting the guest prints its message and exits with status 42 — real
+CI coverage of the hypervisor path.
+
+Until then, validate by hand with the steps above.
