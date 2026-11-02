@@ -123,7 +123,18 @@ rather than the executable's. The auxiliary vector carries `AT_BASE` (the
 interpreter's load base), `AT_ENTRY` (the executable's entry), and
 `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` for the executable, as Linux provides them.
 The interpreter maps the executable's shared libraries itself through our
-`openat` and file-backed `mmap`.
+`openat` and file-backed `mmap`; each executable segment it maps (or turns
+executable with `mprotect`) is translated by the same `PROT_EXEC` path as the
+initial image, so the dynamic linker's own code and every library it loads get
+the `x18`/`svc`/`TPIDR_EL0` rewrite.
+
+This runs a real, unmodified musl: the end-to-end tests load the genuine
+`ld-musl-aarch64.so.1`, which self-relocates, resolves the program's
+`R_AARCH64_JUMP_SLOT`/`R_AARCH64_RELATIVE` relocations against the shared libc,
+installs the thread pointer and starts the program — covering both a minimal
+program with its own `_start` and a normal one that starts through musl's crt
+objects and `__libc_start_main` and then uses the heap and stdio. glibc, whose
+`ld-linux-aarch64.so.1` a Debian rootfs needs, is the next target.
 
 ## Processes
 
