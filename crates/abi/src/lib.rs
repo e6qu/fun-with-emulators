@@ -445,6 +445,56 @@ pub mod epoll {
     pub const EPOLLET: u32 = 1 << 31;
 }
 
+/// Socket constants (Linux `sys/socket.h`, arm64 values). These are the
+/// guest-facing numbers; `crates/kernel/src/net.rs` maps them to host values on
+/// macOS and passes them through on Linux.
+pub mod socket {
+    // Address families.
+    pub const AF_UNIX: u64 = 1;
+    pub const AF_INET: u64 = 2;
+    pub const AF_INET6: u64 = 10;
+
+    // Socket types, and the flags Linux packs into the `type` argument.
+    pub const SOCK_STREAM: u64 = 1;
+    pub const SOCK_DGRAM: u64 = 2;
+    pub const SOCK_RAW: u64 = 3;
+    pub const SOCK_SEQPACKET: u64 = 5;
+    pub const SOCK_TYPE_MASK: u64 = 0xf;
+    /// `O_NONBLOCK`.
+    pub const SOCK_NONBLOCK: u64 = 0o4000;
+    /// `O_CLOEXEC`.
+    pub const SOCK_CLOEXEC: u64 = 0o2000000;
+
+    pub const SOL_SOCKET: u64 = 1;
+
+    // `SOL_SOCKET` options.
+    pub const SO_REUSEADDR: u64 = 2;
+    pub const SO_TYPE: u64 = 3;
+    pub const SO_ERROR: u64 = 4;
+    pub const SO_DONTROUTE: u64 = 5;
+    pub const SO_BROADCAST: u64 = 6;
+    pub const SO_SNDBUF: u64 = 7;
+    pub const SO_RCVBUF: u64 = 8;
+    pub const SO_KEEPALIVE: u64 = 9;
+    pub const SO_OOBINLINE: u64 = 10;
+    pub const SO_LINGER: u64 = 13;
+    pub const SO_REUSEPORT: u64 = 15;
+    pub const SO_RCVTIMEO: u64 = 20;
+    pub const SO_SNDTIMEO: u64 = 21;
+    pub const SO_ACCEPTCONN: u64 = 30;
+
+    // `send`/`recv` flags.
+    pub const MSG_OOB: u64 = 0x01;
+    pub const MSG_PEEK: u64 = 0x02;
+    pub const MSG_DONTROUTE: u64 = 0x04;
+    pub const MSG_CTRUNC: u64 = 0x08;
+    pub const MSG_TRUNC: u64 = 0x20;
+    pub const MSG_DONTWAIT: u64 = 0x40;
+    pub const MSG_EOR: u64 = 0x80;
+    pub const MSG_WAITALL: u64 = 0x100;
+    pub const MSG_NOSIGNAL: u64 = 0x4000;
+}
+
 /// `eventfd2` flags (`sys/eventfd.h`).
 pub mod eventfd {
     pub const EFD_SEMAPHORE: u64 = 1;

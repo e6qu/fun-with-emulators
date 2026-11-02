@@ -82,6 +82,7 @@ const ASM_GUESTS: &[&str] = &[
     "epolltest",
     "eventfdtest",
     "timerfdtest",
+    "socketpairtest",
 ];
 
 /// Link address of the fixed-address (ET_EXEC) guests, above macOS's
@@ -264,6 +265,16 @@ fn eventfd_through_epoll() {
 #[test]
 fn timerfd_fires() {
     for name in ["timerfdtest", "timerfdtest-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// sockets: a guest creates a connected AF_UNIX stream pair with `socketpair`
+/// and passes a message through it, exercising the socket syscall path end to
+/// end (socketpair on macOS applies the type flags and translates the family).
+#[test]
+fn socketpair_message() {
+    for name in ["socketpairtest", "socketpairtest-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }
