@@ -88,7 +88,13 @@ pub struct Patched {
 /// must start at a 4-byte aligned address.
 pub fn patch(code: &mut [u8]) -> Patched {
     let mut out = Patched::default();
+    let data = literal_pool_words(code);
     for (i, word) in code.chunks_exact_mut(4).enumerate() {
+        // Words that belong to a literal pool are data, not instructions, and a
+        // constant can encode anything — never rewrite them.
+        if data[i] {
+            continue;
+        }
         let insn = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         let replacement = if insn == SVC0 {
             out.syscalls += 1;
@@ -119,6 +125,27 @@ pub fn patch(code: &mut [u8]) -> Patched {
         }
     }
     out
+}
+
+/// Mark, for each word of `code`, whether it is the target of a `ldr`-literal
+/// (so part of a literal pool) and therefore data rather than an instruction.
+fn literal_pool_words(code: &[u8]) -> Vec<bool> {
+    let n = code.len() / 4;
+    let mut data = vec![false; n];
+    for (i, w) in code.chunks_exact(4).enumerate() {
+        let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        if let Some((off, size)) = crate::decode::literal_target(insn) {
+            let target = i as i64 * 4 + off;
+            if target >= 0 {
+                let start = target as usize / 4;
+                let end = (target as usize + size).div_ceil(4);
+                for d in data.iter_mut().take(end.min(n)).skip(start) {
+                    *d = true;
+                }
+            }
+        }
+    }
+    data
 }
 
 /// Number of instructions in `code` that [`patch`] would redirect to stubs.
@@ -205,6 +232,11 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
         if field_reg(f) == 18 {
             rewritten = (rewritten & !(0x1f << f.shift)) | (s1 << f.shift);
         }
+    }
+    // An `sp`-based load/store must reach past the 32 bytes the stub pushes.
+    if let Some(delta) = crate::decode::sp_adjust(insn) {
+        let imm12 = ((insn >> 10) & 0xfff) + delta;
+        rewritten = (rewritten & !(0xfff << 10)) | (imm12 << 10);
     }
 
     let mut words = vec![PUSH | s1, PUSH | s2, MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2];
@@ -355,15 +387,77 @@ mod tests {
     }
 
     #[test]
+    fn x18_load_from_sp_stub() {
+        // ldr x18, [sp, #16]: load into x18 from the stack. s1=x0, s2=x1. The
+        // stub pushes 32 bytes, so the reload becomes ldr x0, [sp, #48], and
+        // the result is stored to the x18 slot.
+        let s = stub(Site::X18 { insn: 0xf9400bf2 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe0, // str x0, [sp, #-16]!
+                0xf81f_0fe1, // str x1, [sp, #-16]!
+                0xd53b_d061, // mrs x1, tpidrro_el0
+                0x927d_f021, // and x1, x1, #~7
+                0xf940_1be0, // ldr x0, [sp, #48]   (16 + 32)
+                0xf900_0c20, // str x0, [x1, #24]   (x18 slot)
+                0xf841_07e1, // ldr x1, [sp], #16
+                0xf841_07e0, // ldr x0, [sp], #16
+                branch(0x2000 + 8 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn x18_store_to_base_stub() {
+        // str x18, [x1, #8]: store x18 through x1. x0 and x1 are used, so
+        // s1=x0 (stands in for x18), s2=x2 (TSD base). x18 is loaded from the
+        // slot and stored via the rewritten str x0, [x1, #8].
+        let s = stub(Site::X18 { insn: 0xf9000432 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe0, // str x0, [sp, #-16]!
+                0xf81f_0fe2, // str x2, [sp, #-16]!
+                0xd53b_d062, // mrs x2, tpidrro_el0
+                0x927d_f042, // and x2, x2, #~7
+                0xf940_0c40, // ldr x0, [x2, #24]   (x18 slot)
+                0xf900_0420, // str x0, [x1, #8]
+                0xf841_07e2, // ldr x2, [sp], #16
+                0xf841_07e0, // ldr x0, [sp], #16
+                branch(0x2000 + 8 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_pool_words_are_not_rewritten() {
+        // ldr x0, <+8> makes the two words at offset 8 a literal pool. The
+        // first pool word encodes `movz x18` but must be left as data.
+        let mut code = words(&[
+            0x5800_0040, // ldr x0, #8  (target = this + 8)
+            0xd280_0000, // movz x0, #0 (filler)
+            0xd283_0312, // data that looks like movz x18
+            0x0000_0000, // data
+        ]);
+        let p = patch(&mut code);
+        assert!(p.sites.is_empty(), "literal-pool data must not become a site");
+        assert_eq!(p.x18_deferred, 0);
+        // The data word is untouched.
+        assert_eq!(&code[8..12], &0xd283_0312u32.to_le_bytes());
+    }
+
+    #[test]
     fn x18_sites_and_deferrals_counted() {
         let mut code = words(&[
             0xd2830312, // movz x18, #0x1818  -> rewritable site
             0xaa1203ea, // mov x10, x18       -> rewritable site
-            0xf9400012, // ldr x18, [x0]      -> deferred (load/store)
+            0xf9400012, // ldr x18, [x0]      -> rewritable site (load/store)
+            0x90000012, // adrp x18, .        -> deferred (PC-relative)
             0xd2800000, // movz x0, #0        -> untouched
         ]);
         let p = patch(&mut code);
-        assert_eq!(p.sites.len(), 2);
+        assert_eq!(p.sites.len(), 3);
         assert_eq!(p.x18_deferred, 1);
         assert!(matches!(p.sites[0].1, Site::X18 { insn: 0xd2830312 }));
     }
