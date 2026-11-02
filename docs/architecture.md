@@ -339,7 +339,9 @@ These are tracked on the roadmap:
 - Guest uses of `x18` across the data-processing and load/store classes are
   rewritten to a per-thread slot (see above) and survive preemption, which is
   enough to run a compiled Rust/musl binary unmodified, including the
-  compare/test branches (`cbz`/`cbnz`/`tbz`/`tbnz`) that read `x18`. Still not
+  compare/test branches (`cbz`/`cbnz`/`tbz`/`tbnz`) that read `x18` and the
+  floating-point↔integer conversions (`fmov`/`fcvt*`/`scvtf`/`ucvtf`) that move
+  a value between `x18` and an FP register. Still not
   rewritten: PC-relative forms (`adr`/`adrp`/`ldr`-literal into `x18`), indirect
   branches through `x18` (`br`/`blr x18`), and `sp` writeback/register-offset
   loads — a program using one of those for live `x18` state could still lose

@@ -155,6 +155,23 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         ]);
     }
 
+    // Conversions between floating-point and integer (FMOV to/from a GPR,
+    // FCVT*, SCVTF/UCVTF). These are the only FP instructions that touch a GPR;
+    // the FP operand is a vector register (which macOS does not clear) and is
+    // left alone. op[28:24] = 11110, bit 21 = 1, bits[15:10] = 0 (which
+    // excludes FP arithmetic and compares). The "from general register" ops
+    // (SCVTF/UCVTF and FMOV into FP, opcode 010/011/111) read Rn; the rest
+    // write Rd.
+    if (insn >> 24) & 0x1f == 0b11110 && (insn >> 21) & 1 == 1 && (insn >> 10) & 0x3f == 0 {
+        let opcode = (insn >> 16) & 0b111;
+        let from_gpr = matches!(opcode, 0b010 | 0b011 | 0b111);
+        return Some(if from_gpr {
+            vec![Field { shift: RN, read: true, write: false }]
+        } else {
+            vec![Field { shift: RD, read: false, write: true }]
+        });
+    }
+
     load_store(insn)
 }
 
@@ -441,6 +458,24 @@ mod tests {
             operands(0xa8c14c12),
             Some(vec![rd(RD), rd(10), Field { shift: RN, read: true, write: true }])
         );
+    }
+
+    #[test]
+    fn fp_integer_conversions() {
+        // fmov x18, d0 (to GPR): Rd write
+        assert_eq!(operands(0x9e660012), Some(vec![rd(RD)]));
+        // fcvtzs x18, d0 (to GPR): Rd write
+        assert_eq!(operands(0x9e780012), Some(vec![rd(RD)]));
+        // fmov x18, v0.d[1] (to GPR): Rd write
+        assert_eq!(operands(0x9eae0012), Some(vec![rd(RD)]));
+        // fmov d0, x18 (from GPR): Rn read
+        assert_eq!(operands(0x9e670240), Some(vec![rr(RN)]));
+        // scvtf d0, x18 (from GPR): Rn read
+        assert_eq!(operands(0x9e620240), Some(vec![rr(RN)]));
+        // ucvtf s0, w18 (from GPR): Rn read
+        assert_eq!(operands(0x1e230240), Some(vec![rr(RN)]));
+        // fadd d0, d1, d2 (FP arithmetic, no GPR): deferred
+        assert_eq!(operands(0x1e622820), None);
     }
 
     #[test]

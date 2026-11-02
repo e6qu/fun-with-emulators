@@ -76,6 +76,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18dp",
     "x18ldst",
     "x18br",
+    "x18fp",
     "fileio",
     "sigtest",
     "threadtest",
@@ -471,6 +472,13 @@ fn asm_x18_survives_load_store_addressing() {
 #[test]
 fn asm_x18_survives_compare_branches() {
     assert_eq!(fwe(&asm_guest("x18br-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 moved to/from floating-point registers (fmov, scvtf, fcvtzs), across
+/// preemption — the form a compiled SIMD scan loop uses.
+#[test]
+fn asm_x18_survives_fp_moves() {
+    assert_eq!(fwe(&asm_guest("x18fp-pie"), &[]).status.code(), Some(0));
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.
