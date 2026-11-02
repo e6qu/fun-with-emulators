@@ -15,10 +15,14 @@ fwe (CLI)
 ```
 
 The kernel layer does not depend on how guest code runs; it sits behind the
-`fwe_kernel::Platform` trait. Guest code always runs **in-process and natively**
-— there is no hypervisor or virtual machine, by design (a VM is a non-goal; see
-PLAN.md). Instructions macOS cannot let a Linux process run as-is are rewritten
-before execution (see below), not trapped by a VM.
+`fwe_kernel::Platform` trait. Guest code runs **in-process and natively** by
+default: instructions macOS cannot let a Linux process run as-is are rewritten
+before execution (see below), not trapped by a VM. The one class the
+in-process path cannot handle — a non-PIE `ET_EXEC` linked into the low 4 GiB
+macOS reserves — is served by a second `Platform` implementation, a
+minimalistic Hypervisor.framework backend (see PLAN.md and
+`docs/hypervisor-spike.md`); the same kernel layer sits behind both. A full
+virtual machine with its own Linux kernel remains a non-goal.
 
 ## Memory model
 
@@ -30,14 +34,16 @@ system calls, which validate them. Future backends keep this property.
 The guest sees the host page size (16K on Apple Silicon) through `AT_PAGESZ`,
 which the arm64 Linux ABI permits.
 
-macOS reserves the low 4 GiB of every arm64 process: the kernel refuses to
-start an executable with a smaller `__PAGEZERO`. Position-independent
-executables (the norm for distribution packages) are loaded anywhere, and
-ET_EXEC images linked above 4 GiB at their addresses. ET_EXEC images linked
-below 4 GiB (static non-PIE C and Rust builds at 0x200000 or 0x400000, Go at
-0x10000) are relocated to a higher base at load time and their
-position-dependent references fixed up in the same translation pass that
-rewrites the special instructions — still in-process, with no VM.
+macOS reserves the low 4 GiB of every arm64 process with a mandatory 4 GiB
+`__PAGEZERO`; on Apple Silicon the kernel refuses to launch a process with a
+smaller one. Position-independent executables (the norm for distribution
+packages) are loaded anywhere, and ET_EXEC images linked above 4 GiB at their
+addresses. ET_EXEC images linked *below* 4 GiB (non-PIE C and Rust at 0x200000
+or 0x400000, Go at 0x10000, Debian's `python3.11` at 0x400000) cannot be
+mapped at their own addresses in-process, and a non-PIE image carries no
+relocation information to move elsewhere. These run on the hypervisor backend
+instead, whose guest address space has no `__PAGEZERO` (see
+`docs/hypervisor-spike.md`).
 
 ## System call path
 
@@ -353,8 +359,9 @@ These are tracked on the roadmap:
   implemented; `execve` does not reclaim the old address space.
 - Signal mask and alternate stack are process-wide, not per thread.
 - Floating-point/vector registers are not saved across a signal handler.
-- Executables linked below 4 GiB are rejected for now; load-time relocation
-  (see above) is the planned fix, not a VM.
+- Non-PIE executables linked below 4 GiB cannot run in-process (the mandatory
+  `__PAGEZERO`); the minimalistic hypervisor backend (see above and
+  `docs/hypervisor-spike.md`) is the path for them, not load-time relocation.
 - Guest uses of `x18` across the data-processing and load/store classes are
   rewritten to a per-thread slot (see above) and survive preemption, which is
   enough to run a compiled Rust/musl binary unmodified, including the

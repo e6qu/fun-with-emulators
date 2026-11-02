@@ -2,8 +2,11 @@
 
 ## Goal
 
-Run unmodified Linux arm64 binaries natively on macOS (Apple Silicon), with no
-virtual machine and no Linux kernel — in the spirit of Wine, but for Linux.
+Run unmodified Linux arm64 binaries natively on macOS (Apple Silicon),
+in-process and without a Linux kernel — in the spirit of Wine, but for Linux.
+(A thin hypervisor backend covers the few binaries the in-process path cannot
+map; see Architecture. A full virtual machine with its own Linux kernel is a
+non-goal.)
 
 The project is written in Rust.
 
