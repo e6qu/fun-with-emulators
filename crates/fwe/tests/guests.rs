@@ -10,8 +10,35 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// How long a guest may run before the harness kills it. A guest should
+/// finish in well under a second; a hang (e.g. a thread that never wakes)
+/// becomes a fast, visible failure instead of hanging CI.
+const GUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run a command, killing it if it exceeds [`GUEST_TIMEOUT`]. The returned
+/// `Output` has a non-success status on timeout, and its captured output is
+/// preserved for the failure message.
+fn run_bounded(mut cmd: Command) -> Output {
+    let mut child =
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let start = Instant::now();
+    loop {
+        if let Some(_status) = child.try_wait().unwrap() {
+            return child.wait_with_output().unwrap();
+        }
+        if start.elapsed() > GUEST_TIMEOUT {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            eprintln!("--- guest timed out after {GUEST_TIMEOUT:?} (killed)");
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 const ASM_GUESTS: &[&str] = &[
     "hello",
@@ -122,13 +149,9 @@ fn rust_guest(name: &str) -> PathBuf {
 }
 
 fn fwe(program: &Path, args: &[&str]) -> Output {
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-        .arg("--strace")
-        .arg(program)
-        .args(args)
-        .env("FWE_GUEST_VAR", "from-host")
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
+    let out = run_bounded(cmd);
     // Shown when a test fails.
     eprintln!("--- {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     out
@@ -146,13 +169,9 @@ fn root_filesystem_confines_writes() {
         let root = std::env::temp_dir().join(format!("fwe-root-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-            .arg("--strace")
-            .arg("--root")
-            .arg(&root)
-            .arg(asm_guest(name))
-            .output()
-            .unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace").arg("--root").arg(&root).arg(asm_guest(name));
+        let out = run_bounded(cmd);
         eprintln!("--- {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(out.status.code(), Some(0), "{name}");
         assert_eq!(std::fs::read(root.join("probe")).unwrap(), b"ok\n", "{name}");
@@ -210,13 +229,9 @@ fn dynamic_loader_hands_off_to_interpreter() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::copy(&interp, root.join("interp")).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-        .arg("--strace")
-        .arg("--root")
-        .arg(&root)
-        .arg(&dynprog)
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&dynprog);
+    let out = run_bounded(cmd);
     eprintln!("--- dynprog stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "dynamic handoff ok\n");
     assert_eq!(out.status.code(), Some(0));
