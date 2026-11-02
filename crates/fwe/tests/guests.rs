@@ -374,10 +374,19 @@ fn libc_rootfs(libc: Libc, tag: &str) -> PathBuf {
 }
 
 /// A shared glibc root filesystem for running the vendored Debian programs:
-/// the dynamic linker and shared libc under `/lib`, built once.
+/// the dynamic linker and shared libc under `/lib`, plus the extra shared
+/// libraries the programs need (e.g. `ls` → `libselinux` → `libpcre2`), built
+/// once.
 fn debian_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| libc_rootfs(Libc::Glibc, "debian"))
+    ROOT.get_or_init(|| {
+        let root = libc_rootfs(Libc::Glibc, "debian");
+        for entry in std::fs::read_dir(repo().join("guests/debian/lib")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), root.join("lib").join(entry.file_name())).unwrap();
+        }
+        root
+    })
 }
 
 /// A vendored Debian coreutils program (see `guests/debian/README.md`).
@@ -675,6 +684,25 @@ fn debian_coreutils_cat_echoes_stdin() {
 fn debian_coreutils_sort_orders_lines() {
     let out = run_debian("sort", &[], b"banana\napple\ncherry\n");
     assert_eq!(stdout(&out), "apple\nbanana\ncherry\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Real Debian `ls`: a program with a transitive shared-library graph
+/// (`ls` → `libselinux` → `libpcre2`, plus `libc`). The dynamic linker must
+/// find and map each library from the rootfs, resolving one against another,
+/// before `ls` lists a directory. With output to a pipe, GNU `ls` prints one
+/// sorted name per line.
+#[test]
+fn debian_coreutils_ls_lists_directory() {
+    // A directory with known contents inside the shared rootfs.
+    let dir = debian_root().join("lsdir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    let out = run_debian("ls", &["/lsdir"], &[]);
+    assert_eq!(stdout(&out), "alpha\nbeta\ngamma\n");
     assert_eq!(out.status.code(), Some(0));
 }
 
