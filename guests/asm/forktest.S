@@ -23,8 +23,14 @@ _start:
     svc     #0
     tbnz    x0, #63, fail
     ldr     w10, [sp]               // status
-    lsr     w10, w10, #8            // decode WEXITSTATUS
-    and     x0, x10, #0xff          // exit with the child's reported status
+    and     w11, w10, #0x7f         // termination signal (0 if exited)
+    cbz     w11, exited
+    orr     x0, x11, #0x40          // signalled: 0x40 | signal
+    b       fin
+exited:
+    lsr     w10, w10, #8            // WEXITSTATUS
+    and     x0, x10, #0xff
+fin:
     mov     x8, #94
     svc     #0
 
