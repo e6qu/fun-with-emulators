@@ -326,7 +326,12 @@ These are tracked on the roadmap:
   PC-relative forms, branches and `sp` forms that name `x18` are not rewritten
   yet, so a program that keeps a value in `x18` across one of those can still
   lose it. Extending the pass to those forms is the next step.
-- A data word equal to `svc #0` inside an executable segment would be
-  rewritten too.
+- The rewrite pass scans every aligned word of an executable segment, so a
+  data word that happens to encode `svc #0`, a `TPIDR_EL0` access or an
+  `x18`-naming data-processing instruction is rewritten too. `x18` encodings
+  are dense, so this is a real hazard for data embedded in executable memory
+  (literal pools, jump tables). Compiled programs and the test guests keep such
+  data in a non-executable `.rodata` segment, which is not scanned; recursive
+  descent over reachable code only is the planned general fix.
 - Guest pointers the kernel reads itself are not yet fault-checked; a bad
   pointer crashes `fwe` instead of returning `EFAULT`.

@@ -16,5 +16,6 @@ _start:
     mov     x0, #1                  // execve returned -> failure
     mov     x8, #94
     svc     #0
+    .section .rodata
 path:
     .asciz  "/execee"

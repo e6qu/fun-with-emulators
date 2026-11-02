@@ -38,6 +38,7 @@ exit:
     mov     x8, #94                 // exit_group
     svc     #0
 
+    .section .rodata
 path:
     .asciz  "/proc/sys/kernel/ostype"
 expect:

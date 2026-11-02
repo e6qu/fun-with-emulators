@@ -10,6 +10,7 @@ _start:
     mov     x0, #0
     mov     x8, #94                 // exit_group
     svc     #0
+    .section .rodata
 msg:
     .ascii  "exec target ran\n"
 msg_end:
