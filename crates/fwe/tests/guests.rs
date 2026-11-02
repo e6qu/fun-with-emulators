@@ -73,6 +73,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18",
     "x18spin",
     "x18mem",
+    "x18dp",
     "fileio",
     "sigtest",
     "threadtest",
@@ -454,6 +455,13 @@ fn asm_x18_survives_preemption() {
 #[test]
 fn asm_x18_survives_memory_spill() {
     assert_eq!(fwe(&asm_guest("x18mem-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 through the wider data-processing classes (extract, conditional select,
+/// multiply-add, divide), across preemption.
+#[test]
+fn asm_x18_survives_data_processing() {
+    assert_eq!(fwe(&asm_guest("x18dp-pie"), &[]).status.code(), Some(0));
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.

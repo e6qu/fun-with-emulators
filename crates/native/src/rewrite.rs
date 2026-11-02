@@ -387,6 +387,28 @@ mod tests {
     }
 
     #[test]
+    fn x18_three_source_stub() {
+        // madd x18, x0, x1, x2: x18 is the destination (Rd). Rn/Rm/Ra = x0/x1/x2
+        // are used, so s1=x3 (stands in for x18), s2=x4 (TSD base). No read of
+        // x18, so the result is just stored to the slot.
+        let s = stub(Site::X18 { insn: 0x9b010812 }, 0, 24, 0x2000, 0x1004);
+        assert_eq!(
+            s,
+            vec![
+                0xf81f_0fe3, // str x3, [sp, #-16]!
+                0xf81f_0fe4, // str x4, [sp, #-16]!
+                0xd53b_d064, // mrs x4, tpidrro_el0
+                0x927d_f084, // and x4, x4, #~7
+                0x9b01_0803, // madd x3, x0, x1, x2   (x18 -> x3)
+                0xf900_0c83, // str x3, [x4, #24]      (x18 slot)
+                0xf841_07e4, // ldr x4, [sp], #16
+                0xf841_07e3, // ldr x3, [sp], #16
+                branch(0x2000 + 8 * 4, 0x1004).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
     fn x18_load_from_sp_stub() {
         // ldr x18, [sp, #16]: load into x18 from the stack. s1=x0, s2=x1. The
         // stub pushes 32 bytes, so the reload becomes ldr x0, [sp, #48], and

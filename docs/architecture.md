@@ -73,9 +73,10 @@ rewrites the special instructions — still in-process, with no VM.
   scratch registers and branches back. Because macOS preserves every register
   *except* `x18` across preemption, an ordinary scratch register is safe.
   `crates/native/src/decode.rs` decides which instructions this covers: the
-  data-processing classes (moves, logical and add/sub, immediate and register
-  forms) and load/store register with an unsigned immediate offset, including
-  an `sp` base — a stack spill of `x18`. For an `sp` base the stub adds the 32
+  register-only data-processing classes (moves, logical and add/sub, bitfield,
+  extract, conditional select/compare, one-/two-/three-source) and load/store
+  register with an unsigned immediate offset, including an `sp` base — a stack
+  spill of `x18`. For an `sp` base the stub adds the 32
   bytes it pushed to the access's immediate so it still reaches the caller's
   slot. Pair, pre/post-index and register-offset loads, PC-relative forms,
   branches, and `sp` forms of the data-processing classes are left for a later
@@ -326,13 +327,14 @@ These are tracked on the roadmap:
 - Floating-point/vector registers are not saved across a signal handler.
 - Executables linked below 4 GiB are rejected for now; load-time relocation
   (see above) is the planned fix, not a VM.
-- Guest uses of `x18` in data-processing instructions and unsigned-immediate
-  loads/stores (including stack spills) are rewritten to a per-thread slot (see
-  above) and survive preemption; pair/pre-index/register-offset loads,
-  PC-relative forms, branches and `sp` forms of the data-processing classes
-  that name `x18` are not rewritten yet. Extending the pass to those, and to
-  recursive-descent code discovery, is what remains before unmodified compiled
-  binaries run.
+- Guest uses of `x18` in the register-only data-processing classes and
+  unsigned-immediate loads/stores (including stack spills) are rewritten to a
+  per-thread slot (see above) and survive preemption; pair/pre-index/
+  register-offset/unscaled loads, SIMD loads that use `x18` as a base,
+  PC-relative forms and branches that name `x18` are not rewritten yet (an
+  analysis of a compiled musl binary enumerated exactly these remaining
+  forms). Extending the pass to them, plus recursive-descent code discovery,
+  is what remains before unmodified compiled binaries run.
 - The rewrite pass scans every aligned word of an executable segment, so a
   data word that happens to encode a rewritten instruction is rewritten too.
   Literal pools (the targets of `ldr`-literal) are detected and skipped, and
