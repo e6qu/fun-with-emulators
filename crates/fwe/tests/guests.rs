@@ -22,22 +22,46 @@ const GUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Run a command, killing it if it exceeds [`GUEST_TIMEOUT`]. The returned
 /// `Output` has a non-success status on timeout, and its captured output is
 /// preserved for the failure message.
+///
+/// stdout and stderr are drained on their own threads, so a guest that writes
+/// a lot (e.g. many `--strace` lines) never blocks on a full pipe.
 fn run_bounded(mut cmd: Command) -> Output {
+    use std::io::Read;
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
     let start = Instant::now();
-    loop {
-        if let Some(_status) = child.try_wait().unwrap() {
-            return child.wait_with_output().unwrap();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if start.elapsed() > GUEST_TIMEOUT {
             let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            eprintln!("--- guest timed out after {GUEST_TIMEOUT:?} (killed)");
-            return out;
+            timed_out = true;
+            break child.wait().unwrap();
         }
         std::thread::sleep(Duration::from_millis(20));
+    };
+    if timed_out {
+        eprintln!("--- guest timed out after {GUEST_TIMEOUT:?} (killed)");
     }
+    // Readers finish once the pipes close (at process exit).
+    let stdout = out_reader.join().unwrap();
+    let stderr = err_reader.join().unwrap();
+    Output { status, stdout, stderr }
 }
 
 const ASM_GUESTS: &[&str] = &[
