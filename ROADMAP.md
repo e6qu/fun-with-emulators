@@ -82,6 +82,9 @@ System-call surface, implemented and covered by end-to-end tests:
   `std::process::Command`), `execve` that discards the old address space
   (so a program can exec itself), `waitid`, and `rusage` from `wait4` and
   `getrusage`
+- [x] fwe's own descriptors out of the guest's reach: a reserved range
+  above a virtual `RLIMIT_NOFILE`, so closing everything from 3 up or
+  `close_range` leaves them alone; `/proc/self/fd`
 
 Remaining:
 
@@ -101,9 +104,6 @@ Remaining:
 - [ ] The rest of the process model: `execve` from a process with other
   live threads, `execveat`, `clone3`; `vfork` sharing memory with its
   parent rather than copying it
-- [ ] A guest↔host descriptor map, so fwe's own descriptors (the rootfs
-  handle, the pipes behind eventfd and signalfd) are out of the guest's
-  reach when it closes everything from 3 up
 - [ ] `EFAULT` for bad guest pointers the kernel reads itself, instead of a
   crash
 - [ ] The remaining `x18` forms (`sp`-writeback and `sp`-register-offset
