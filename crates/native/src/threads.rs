@@ -37,14 +37,11 @@ const SUPPORTED: u64 = cl::CLONE_VM
     | cl::CLONE_CHILD_SETTID
     | cl::CLONE_DETACHED;
 
-/// Handle a guest `clone(flags, stack, parent_tid, tls, child_tid)`.
-/// Returns the child tid to the parent, or a negative errno.
-pub fn do_clone(parent: &Regs) -> i64 {
-    let flags = parent.x[0];
-    let child_stack = parent.x[1];
-    let parent_tid = parent.x[2];
-    let tls = parent.x[3];
-    let child_tid = parent.x[4];
+/// Handle a guest `clone` or `clone3` asking for `a`, from the thread whose
+/// registers are `parent`. Returns the child tid to the parent, or a
+/// negative errno.
+pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
+    let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, tls, child_tid } = a;
 
     // A clone without CLONE_THREAD is a new process (fork). CLONE_VM without
     // CLONE_THREAD shares the address space with a new process; only the
@@ -55,7 +52,7 @@ pub fn do_clone(parent: &Regs) -> i64 {
         if flags & cl::CLONE_VM != 0 && !vfork {
             return err(errno::ENOSYS);
         }
-        return crate::process::do_fork(parent, vfork);
+        return crate::process::do_fork(parent, a, vfork);
     }
     if flags & cl::CLONE_VM == 0 {
         return err(errno::ENOSYS);

@@ -103,10 +103,11 @@ Remaining:
 - [x] In the VM: `fork` and `vfork`: the child is a fresh fwe process given
   the parent's memory copy-on-write and its kernel state
 - [ ] Python from the Debian rootfs (carried over from M1)
-- [ ] The rest of the process model: `execveat`, `clone3`; `vfork` sharing
-  memory with its parent rather than copying it; a native-backend `fork`
-  that stops the parent's other threads while memory is copied; virtual credentials and
-  `RLIMIT_NOFILE` carried across an `execve` that re-executes fwe
+- [x] `execveat` and `clone3`; virtual credentials, `RLIMIT_NOFILE` and the
+  umask carried across an `execve` that re-executes fwe
+- [ ] The rest of the process model: `vfork` sharing memory with its parent
+  rather than copying it; a native-backend `fork` that stops the parent's
+  other threads while memory is copied
 - [ ] Code discovery for binaries without section headers, and the `x18`
   forms no tested binary uses yet (`sp`-writeback and `sp`-register-offset
   loads and stores, flag-setting or extended `sp` arithmetic, `casp`,

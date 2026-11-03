@@ -834,6 +834,27 @@ mod tests {
         )
     }
 
+    /// The credentials survive an `execve` that re-executes fwe, with the
+    /// saved IDs becoming the effective ones, and a bad record is refused.
+    #[test]
+    fn exec_state_carries_credentials() {
+        let mut k = kernel();
+        // Groups first: once the user IDs drop root, they cannot change.
+        assert_eq!(k.creds.setgroups(vec![5, 6]), 0);
+        assert_eq!(k.creds.setresgid(2000, 2001, 2002), 0);
+        assert_eq!(k.creds.setresuid(1000, 1001, 1002), 0);
+        let state = k.exec_state();
+        let mut new = kernel();
+        new.restore_exec_state(&state).unwrap();
+        assert_eq!(new.creds.resuid(), (1000, 1001, 1001));
+        assert_eq!(new.creds.resgid(), (2000, 2001, 2001));
+        assert_eq!(new.creds.groups(), &[5, 6]);
+        let mut bad = kernel();
+        assert!(bad.restore_exec_state(&state[..state.len() - 1]).is_err());
+        assert!(bad.restore_exec_state(b"garbage!").is_err());
+        assert_eq!(bad.creds.resuid(), kernel().creds.resuid());
+    }
+
     #[test]
     fn unknown_syscalls_fail_with_enosys() {
         assert_eq!(kernel().syscall(4000, [0; 6]), err(errno::ENOSYS));

@@ -615,6 +615,122 @@ fn main() {
             unsafe { write(p[1], b"x".as_ptr(), 1) };
             println!("{}", describe(wait_status(pid)));
         }
+        // clone3 in its fork form: no flags, SIGCHLD as the exit signal.
+        "clone3-fork" => {
+            let mut args = [0u64; 11];
+            args[4] = SIGCHLD as u64;
+            // SAFETY: a valid struct clone_args; the child only prints and exits.
+            let pid = unsafe { syscall(435, args.as_ptr(), 88usize) } as i32;
+            assert!(pid >= 0, "clone3 failed: {}", errno());
+            if pid == 0 {
+                println!("clone3 child");
+                // SAFETY: ending the child.
+                unsafe { _exit(3) }
+            }
+            println!("{}", describe(wait_status(pid)));
+        }
+        // execveat: a path relative to a directory descriptor, the open file
+        // itself (AT_EMPTY_PATH), and a symbolic link refused under
+        // AT_SYMLINK_NOFOLLOW.
+        "execveat" => {
+            const AT_FDCWD: i64 = -100;
+            const AT_SYMLINK_NOFOLLOW: i64 = 0x100;
+            const AT_EMPTY_PATH: i64 = 0x1000;
+            unsafe extern "C" {
+                fn open(path: *const u8, flags: i32, ...) -> i32;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let cstr = |p: &std::path::Path| {
+                let mut v = p.as_os_str().as_encoded_bytes().to_vec();
+                v.push(0);
+                v
+            };
+            let dir = cstr(exe.parent().unwrap());
+            let base = cstr(std::path::Path::new(exe.file_name().unwrap()));
+            let whole = cstr(&exe);
+            // SAFETY: NUL-terminated paths; O_RDONLY (with O_DIRECTORY).
+            let (dfd, efd) = unsafe { (open(dir.as_ptr(), 0o200000), open(whole.as_ptr(), 0)) };
+            assert!(dfd >= 0 && efd >= 0);
+            let argv = [whole.as_ptr(), b"spawned\0".as_ptr(), std::ptr::null()];
+            let envp: [*const u8; 1] = [std::ptr::null()];
+            let execveat = |fd: i64, path: *const u8, flags: i64| {
+                // SAFETY: valid NUL-terminated strings and arrays.
+                unsafe { syscall(281, fd, path, argv.as_ptr(), envp.as_ptr(), flags) }
+            };
+            for (label, fd, path, flags) in [
+                ("relative to a directory", dfd as i64, base.as_ptr(), 0),
+                ("the open file itself", efd as i64, b"\0".as_ptr(), AT_EMPTY_PATH),
+            ] {
+                let pid = child(|| {
+                    execveat(fd, path, flags);
+                    127
+                });
+                println!("{label}: {}", describe(wait_status(pid)));
+            }
+            let link = std::env::temp_dir().join(format!("fwe-execveat-{}", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&exe, &link).unwrap();
+            let r = execveat(AT_FDCWD, cstr(&link).as_ptr(), AT_SYMLINK_NOFOLLOW);
+            println!("symlink with AT_SYMLINK_NOFOLLOW: {r}, errno {}", errno());
+            let _ = std::fs::remove_file(&link);
+            println!("unknown flag: {}, errno {}", execveat(dfd as i64, base.as_ptr(), 0x1), errno());
+        }
+        // execve keeps the credentials (the saved IDs becoming the effective
+        // ones), the descriptor limit and the umask, whether the program is
+        // replaced in place or, with another thread alive, fwe re-executes
+        // itself ("threaded").
+        "exec-keeps-ids" => {
+            unsafe extern "C" {
+                fn setgroups(n: usize, list: *const u32) -> i32;
+                fn setresgid(r: u32, e: u32, s: u32) -> i32;
+                fn setresuid(r: u32, e: u32, s: u32) -> i32;
+                fn setrlimit(res: i32, lim: *const [u64; 2]) -> i32;
+                fn umask(mask: u32) -> u32;
+                fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;
+            }
+            // SAFETY: plain calls with valid arguments.
+            unsafe {
+                assert_eq!(setgroups(1, [7u32].as_ptr()), 0);
+                assert_eq!(setresgid(20, 21, 22), 0);
+                assert_eq!(setresuid(10, 11, 12), 0);
+                assert_eq!(setrlimit(7, &[300, 400]), 0); // RLIMIT_NOFILE
+                umask(0o027);
+            }
+            if std::env::args().nth(2).as_deref() == Some("threaded") {
+                std::thread::spawn(|| loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                });
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let mut path = std::env::current_exe().unwrap().into_os_string().into_encoded_bytes();
+            path.push(0);
+            let argv = [path.as_ptr(), b"report-ids\0".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: valid NUL-terminated arrays.
+            unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            println!("execve failed: {}", errno());
+        }
+        "report-ids" => {
+            unsafe extern "C" {
+                fn getresuid(r: *mut u32, e: *mut u32, s: *mut u32) -> i32;
+                fn getresgid(r: *mut u32, e: *mut u32, s: *mut u32) -> i32;
+                fn getgroups(n: i32, list: *mut u32) -> i32;
+                fn getrlimit(res: i32, lim: *mut [u64; 2]) -> i32;
+                fn umask(mask: u32) -> u32;
+            }
+            let (mut u, mut g, mut groups, mut lim) = ([0u32; 3], [0u32; 3], [0u32; 8], [0u64; 2]);
+            // SAFETY: valid out-parameters.
+            let (n, mask) = unsafe {
+                getresuid(&mut u[0], &mut u[1], &mut u[2]);
+                getresgid(&mut g[0], &mut g[1], &mut g[2]);
+                getrlimit(7, &mut lim);
+                (getgroups(8, groups.as_mut_ptr()), umask(0))
+            };
+            println!(
+                "uids {u:?} gids {g:?} groups {:?} nofile {lim:?} umask {mask:o}",
+                &groups[..n.max(0) as usize]
+            );
+        }
         // waitid reports exits and kills as siginfo.
         "waitid" => {
             let pid = child(|| 6);
