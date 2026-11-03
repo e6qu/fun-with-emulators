@@ -34,16 +34,17 @@ impl Platform for HvPlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
-        // SAFETY: terminating the process.
+        teardown();
+        // SAFETY: terminating the process, its VM gone.
         unsafe { libc::_exit(code) }
     }
 
     fn exit_thread(&mut self, code: i32) -> ! {
-        // One guest thread for now: the process ends with it.
-        self.exit(code)
+        exit_thread(code)
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        teardown();
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
@@ -82,9 +83,122 @@ impl Platform for HvPlatform {
     }
 }
 
+// --- Ending a VM process cleanly -----------------------------------------
+//
+// A process must never end, or exec, with its VM alive: the machine this was
+// developed on panicked twice in that situation (a kernel NULL dereference in
+// a kernel thread while a VM process was being torn down, and a watchdog
+// reset two minutes after a VM process was killed by a signal), with another
+// hypervisor client running alongside. So every way out — exit_group, the
+// last thread's exit, a fatal signal's default action, fwe's own fatal errors
+// and panics, execve — first stops and destroys every vCPU and then the VM,
+// and a host fork, which would copy a VM the child cannot own, is refused.
+
+/// Live vCPUs, readable from signal handlers. A slot holds `vcpu + 1`, or 0.
+static VCPU_SLOTS: [std::sync::atomic::AtomicU64; 256] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+/// The VM exists.
+static VM_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The process is ending: every vCPU thread destroys its vCPU and stops.
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// This thread is inside `hv_vcpu_run`.
+    static IN_RUN: Cell<bool> = const { Cell::new(false) };
+}
+
+fn register_vcpu(id: hv_vcpu_t) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    VCPU_SLOTS.iter().any(|s| s.compare_exchange(0, id + 1, SeqCst, SeqCst).is_ok())
+}
+
+/// Destroy the calling thread's vCPU, if it has one. Async-signal-safe.
+fn retire_vcpu() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if let Some(id) = VCPU.with(|c| c.take()) {
+        // SAFETY: destroying this thread's own vCPU, which is not running.
+        unsafe { hv_vcpu_destroy(id) };
+        for s in &VCPU_SLOTS {
+            let _ = s.compare_exchange(id + 1, 0, SeqCst, SeqCst);
+        }
+    }
+}
+
+fn live_vcpus() -> Vec<hv_vcpu_t> {
+    use std::sync::atomic::Ordering::SeqCst;
+    VCPU_SLOTS.iter().map(|s| s.load(SeqCst)).filter(|&v| v != 0).map(|v| v - 1).collect()
+}
+
+/// Stop and destroy every vCPU, then the VM. Idempotent; safe to call from a
+/// signal handler on a thread not inside `hv_vcpu_run`.
+fn teardown() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !VM_LIVE.load(SeqCst) {
+        return;
+    }
+    EXITING.store(true, SeqCst);
+    let own = VCPU.with(Cell::get);
+    let mut others: Vec<hv_vcpu_t> = live_vcpus().into_iter().filter(|&v| Some(v) != own).collect();
+    if !others.is_empty() {
+        // SAFETY: stopping the other threads' vCPUs, which may be running.
+        unsafe { hv_vcpus_exit(others.as_mut_ptr(), others.len() as u32) };
+        // Threads blocked in a system call are interrupted, and destroy their
+        // vCPU from the wake signal's handler.
+        thread::wake_others(host::WAKE_SIGNAL);
+        for _ in 0..2000 {
+            if live_vcpus().iter().all(|&v| Some(v) == own) {
+                break;
+            }
+            // SAFETY: plain host call.
+            unsafe { libc::usleep(500) };
+        }
+    }
+    retire_vcpu();
+    // SAFETY: destroying this process's VM, every vCPU gone.
+    let rc = unsafe { hv_vm_destroy() };
+    if rc == 0 {
+        VM_LIVE.store(false, SeqCst);
+    } else {
+        let msg = b"fwe: the VM could not be destroyed before exit\n";
+        // SAFETY: writing a diagnostic to standard error.
+        unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+    }
+}
+
+/// A guest thread ends: the last one ends the process.
+fn exit_thread(code: i32) -> ! {
+    use std::sync::atomic::Ordering::SeqCst;
+    if crate::LIVE_THREADS.fetch_sub(1, SeqCst) == 1 {
+        teardown();
+        // SAFETY: terminating the process, its VM gone.
+        unsafe { libc::_exit(code) }
+    }
+    retire_vcpu();
+    // SAFETY: ends the calling host thread; the process keeps running.
+    unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+}
+
+/// Park a vCPU thread for good once the process is ending (its vCPU is
+/// already destroyed).
+fn park() -> ! {
+    retire_vcpu();
+    loop {
+        // SAFETY: plain host call.
+        unsafe { libc::pause() };
+    }
+}
+
 /// The handler for every signal the guest catches, and the wake signal:
 /// record it and stop this thread's vCPU, so the run loop delivers it.
 extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
+        // The process is ending: a thread not running guest code gives up
+        // its vCPU now (one inside hv_vcpu_run does as the run returns).
+        if !IN_RUN.with(Cell::get) {
+            retire_vcpu();
+        }
+        return;
+    }
     if sig != host::WAKE_SIGNAL {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let (code, pid, uid, status) =
@@ -114,6 +228,17 @@ fn install(sig: libc::c_int, flags: libc::c_int) {
 
 fn set_host_signal(sig: u64, how: HostSignal) {
     let Some(h) = host::signal_to_host(sig) else { return };
+    // A signal whose default action ends the process is caught all the same,
+    // so the process ends through the kernel's default action, which tears
+    // the VM down first, never by the host's with the VM alive.
+    let how = match how {
+        HostSignal::Default
+            if fwe_abi::signal::default_action(sig) == fwe_abi::signal::Default::Terminate =>
+        {
+            HostSignal::Catch { flags: 0 }
+        }
+        other => other,
+    };
     match how {
         HostSignal::Catch { flags } => {
             let mut f = 0;
@@ -168,6 +293,8 @@ extern "C" fn on_fault(sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut 
         ss.pc = resume;
         return;
     }
+    // A bug in fwe itself: take the VM down before dying of it.
+    teardown();
     // SAFETY: resetting to the default action, which the re-executed
     // instruction then takes.
     unsafe { libc::signal(sig, libc::SIG_DFL) };
@@ -291,7 +418,8 @@ fn start(
     // Hypervisor.framework runs threads of its own, which inherit the mask
     // of the thread that creates them. With every guest signal blocked
     // there, the host delivers signals only to the vCPU threads, whose masks
-    // follow the guest's.
+    // follow the guest's. The mask fwe started with is the guest's own.
+    let inherited_mask = host::blocked_signals();
     block_guest_signals();
     vm::create().map_err(|e| {
         Error::Unsupported(format!(
@@ -301,11 +429,16 @@ fn start(
              on a Mac with hypervisor support"
         ))
     })?;
-    fwe_kernel::fdtable::init();
-    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-    let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
-        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
-    })?;
+    VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    // From here the process has a VM: it must not fork, and a panic in fwe
+    // takes the VM down before the process aborts.
+    fwe_kernel::forbid_fork();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        teardown();
+    }));
+    let mut fs = crate::open_fs(options)?;
 
     let elf = Elf::parse(data).map_err(Error::Elf)?;
     let exe = place(&elf, page, true)?;
@@ -413,6 +546,7 @@ fn start(
         }
     }
     k.adopt_host_signals();
+    thread::set_mask(inherited_mask);
     *kernel() = Some(k);
 
     let regs = Regs { sp: image.sp, pc: entry, ..Regs::default() };
@@ -450,6 +584,10 @@ impl Vcpu {
             v.set_sys(reg, value);
         }
         VCPU.with(|c| c.set(Some(id)));
+        if !register_vcpu(id) {
+            retire_vcpu();
+            return Err("too many vCPUs".into());
+        }
         Ok(v)
     }
 
@@ -521,14 +659,23 @@ impl Vcpu {
     fn run(&self, mut regs: Regs) -> ! {
         self.set_regs(&regs);
         loop {
+            if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
+                park();
+            }
             // The guest's mask is in force on the host while it runs, so the
             // host routes signals as for the native backend.
             let mask = host::host_mask_for(thread::mask());
             // SAFETY: plain host calls; `exit` is HVF's record for this vCPU.
             let (rc, exit) = unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
-                (hv_vcpu_run(self.id), &*self.exit)
+                IN_RUN.with(|r| r.set(true));
+                let rc = hv_vcpu_run(self.id);
+                IN_RUN.with(|r| r.set(false));
+                (rc, &*self.exit)
             };
+            if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
+                park();
+            }
             if rc != 0 {
                 fatal(&format!("hv_vcpu_run failed: {rc:#x}"));
             }
@@ -624,7 +771,7 @@ impl Vcpu {
                 // ELR is past the `svc`; the kernel advances pc past the
                 // trapping instruction itself.
                 regs.pc = elr - 4;
-                syscall(&mut regs);
+                syscall(self, &mut regs);
             }
             EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr),
             EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far),
@@ -654,16 +801,138 @@ fn fault(regs: &mut Regs, sig: u64, addr: u64) {
 
 fn fatal(msg: &str) -> ! {
     let line = format!("fwe: {msg}\n");
-    // SAFETY: writing a diagnostic to standard error, then exiting.
-    unsafe {
-        libc::write(2, line.as_ptr().cast(), line.len());
-        libc::_exit(127)
+    // SAFETY: writing a diagnostic to standard error.
+    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    teardown();
+    // SAFETY: exiting, the VM gone.
+    unsafe { libc::_exit(127) }
+}
+
+/// `execve(path, argv, envp)`: re-execute fwe on the new program, which
+/// may run here in a VM or natively (see [`crate::reexec`]).
+fn execve(args: &[u64; 6]) -> i64 {
+    // Linux's limit on one argument or environment string.
+    const ARG_MAX: usize = 128 * 1024;
+    let path = match uaccess::read_cstr(args[0], uaccess::PATH_MAX) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let (argv, envp) = match (
+        uaccess::read_cstr_array(args[1], ARG_MAX),
+        uaccess::read_cstr_array(args[2], ARG_MAX),
+    ) {
+        (Ok(a), Ok(e)) => (a, e),
+        (Err(e), _) | (_, Err(e)) => return err(e),
+    };
+    let guard = kernel();
+    let k = guard.as_ref().unwrap();
+    let fs = k.fs.as_ref().expect("filesystem configured");
+    // The VM goes before the host exec; once the program is known to be
+    // runnable, there is no way back.
+    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, teardown);
+    if !VM_LIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        fatal(&format!(
+            "execve {} failed after the VM was destroyed: {r}",
+            String::from_utf8_lossy(&path)
+        ));
     }
+    r
+}
+
+/// What a new thread needs to become a guest thread on its own vCPU.
+struct Spawn {
+    regs: Regs,
+    tid: i32,
+    tpidr: u64,
+    clear_child_tid: u64,
+    sigmask: u64,
+    pending: std::sync::Arc<thread::Pending>,
+}
+
+/// `clone(flags, stack, parent_tid, tls, child_tid)` for a thread (the
+/// pthread flags): a new host thread with a vCPU of its own.
+///
+/// A new process (`fork`, `vfork`) is not supported in the VM: a host
+/// `fork` child cannot use Hypervisor.framework at all — the VM belongs to
+/// the parent task, and in the child `hv_vm_destroy` fails with
+/// `HV_NO_DEVICE` and `hv_vm_create` with `HV_BUSY` — so it fails with
+/// `ENOSYS` rather than leave a child that cannot run.
+fn clone(vcpu: &Vcpu, parent: &Regs) -> i64 {
+    use fwe_abi::clone as cl;
+    let (flags, stack, ptid, tls, ctid) =
+        (parent.x[0], parent.x[1], parent.x[2], parent.x[3], parent.x[4]);
+    let tpidr =
+        if flags & cl::CLONE_SETTLS != 0 { tls } else { vcpu.get_sys(HV_SYS_REG_TPIDR_EL0) };
+    if flags & cl::CLONE_THREAD == 0 {
+        return err(errno::ENOSYS);
+    }
+    if flags & cl::CLONE_VM == 0 || stack == 0 {
+        return err(errno::EINVAL);
+    }
+    let tid = thread::alloc_tid();
+    if flags & cl::CLONE_PARENT_SETTID != 0 && ptid != 0 {
+        let _ = uaccess::write(ptid, tid);
+    }
+    if flags & cl::CLONE_CHILD_SETTID != 0 && ctid != 0 {
+        let _ = uaccess::write(ctid, tid);
+    }
+    let mut regs = *parent;
+    regs.x[0] = 0;
+    regs.sp = stack;
+    regs.pc = parent.pc + 4;
+    let pending = thread::register(tid);
+    let spawn = Box::new(Spawn {
+        regs,
+        tid,
+        tpidr,
+        clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
+        sigmask: thread::mask(),
+        pending: pending.clone(),
+    });
+    crate::LIVE_THREADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let arg = Box::into_raw(spawn).cast::<libc::c_void>();
+    let mut handle: libc::pthread_t = 0;
+    // SAFETY: a detached pthread with the default stack; `thread_main` takes
+    // ownership of the boxed `Spawn`.
+    let r = unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        libc::pthread_attr_init(&mut attr);
+        libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+        let r = libc::pthread_create(&mut handle, &attr, thread_main, arg);
+        libc::pthread_attr_destroy(&mut attr);
+        r
+    };
+    if r != 0 {
+        // SAFETY: reclaiming the box the thread never received.
+        drop(unsafe { Box::from_raw(arg.cast::<Spawn>()) });
+        crate::LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        thread::unregister(&pending);
+        return err(errno::EAGAIN);
+    }
+    thread::set_host_thread(&pending, handle);
+    tid as i64
+}
+
+extern "C" fn thread_main(arg: *mut libc::c_void) -> *mut libc::c_void {
+    // SAFETY: `arg` is the `Spawn` box handed to `pthread_create`.
+    let spawn = unsafe { Box::from_raw(arg.cast::<Spawn>()) };
+    thread::set_tid(spawn.tid);
+    thread::adopt(&spawn.pending);
+    thread::set_mask(spawn.sigmask);
+    thread::set_clear_child_tid(spawn.clear_child_tid);
+    let vcpu = match Vcpu::create() {
+        Ok(v) => v,
+        Err(e) => fatal(&e),
+    };
+    vcpu.set_sys(HV_SYS_REG_TPIDR_EL0, spawn.tpidr);
+    let regs = spawn.regs;
+    drop(spawn);
+    vcpu.run(regs)
 }
 
 /// Run the system call in `regs` (number in `x8`), leaving its result and
 /// any signal delivery in `regs`.
-fn syscall(regs: &mut Regs) {
+fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The kernel and the host see host addresses for guest pointers.
@@ -684,11 +953,13 @@ fn syscall(regs: &mut Regs) {
             return;
         }
         nr::EXIT => {
+            let _ = vcpu;
             fwe_kernel::thread_exit_cleanup();
-            // SAFETY: the last (only) guest thread ends the process.
-            unsafe { libc::_exit(args[0] as i32) }
+            exit_thread(args[0] as i32)
         }
-        nr::CLONE | nr::CLONE3 | nr::EXECVE | nr::EXECVEAT => err(errno::ENOSYS),
+        nr::CLONE => clone(vcpu, regs),
+        nr::EXECVE => execve(&host_args),
+        nr::CLONE3 | nr::EXECVEAT => err(errno::ENOSYS),
         nr::WAIT4 => {
             let mut r = *regs;
             r.x[..6].copy_from_slice(&host_args);

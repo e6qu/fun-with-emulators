@@ -56,14 +56,24 @@ fn mappings() -> std::sync::MutexGuard<'static, BTreeMap<u64, (u64, u64, u64)>> 
     MAPPINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Create the VM and its shared structures. Called once per process.
-pub fn create() -> Result<(), String> {
+/// Host address of fwe's tables and vectors, once built.
+static SYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Create this process's VM, with its tables and vectors mapped.
+fn create_vm(sys: *mut libc::c_void) -> Result<(), String> {
     // SAFETY: a fresh configuration object, then a VM for this process.
     unsafe {
         let cfg = hv_vm_config_create();
         check(hv_vm_config_set_ipa_size(cfg, IPA_BITS), "hv_vm_config_set_ipa_size")?;
         check(hv_vm_create(cfg), "hv_vm_create")?;
     }
+    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+    // SAFETY: mapping the tables and vectors at the top of the IPA space.
+    check(unsafe { hv_vm_map(sys, SYS_BASE, SYS_SIZE as usize, flags) }, "hv_vm_map")
+}
+
+/// Create the VM and its shared structures. Called once per process.
+pub fn create() -> Result<(), String> {
     // SAFETY: fresh host memory for the tables and vectors, never freed.
     let sys = unsafe {
         libc::mmap(
@@ -104,10 +114,8 @@ pub fn create() -> Result<(), String> {
             (sys.cast::<u8>().add(at as usize + 4) as *mut u32).write(B_SELF);
         }
     }
-    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
-    // SAFETY: mapping the memory just built at the top of the IPA space.
-    check(unsafe { hv_vm_map(sys, SYS_BASE, SYS_SIZE as usize, flags) }, "hv_vm_map")?;
-    Ok(())
+    SYS.store(sys as u64, std::sync::atomic::Ordering::SeqCst);
+    create_vm(sys)
 }
 
 fn flags(prot: u64) -> u64 {

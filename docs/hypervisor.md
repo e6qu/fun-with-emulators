@@ -53,14 +53,51 @@ The code is in `crates/native/src/hv/`.
   calls too. The framework's own threads are created with every guest signal
   blocked, so the host never hands one to them.
 
+- **Threads.** Each guest thread is a host thread with a vCPU of its own,
+  created on it; all vCPUs share the VM.
+- **`execve`** re-executes fwe on the new program (as the native backend does
+  for a program only the VM can run). The fresh fwe picks the backend the
+  program needs, so a program in the VM can exec a native one and the other
+  way round; the host keeps across its exec what Linux keeps across
+  `execve` — the pid, descriptors not marked close-on-exec, the signal
+  mask — and the root, working directory and `--strace` are passed on.
+
+## Never end a VM process abnormally
+
+On 3 November 2026 the development Mac (macOS 15.6.1, M4 Pro) went down twice
+while this backend was being built: a watchdog reset about two minutes after a
+VM process was killed by a signal, and a kernel panic (a NULL dereference in a
+kernel thread) while a VM process was being torn down. Neither was memory
+pressure. Both times the VM processes ended without destroying their vCPUs and
+VM, the tests ran several of them at once, and another Hypervisor.framework
+client (Podman's `krunkit`) was running. The exact kernel path is Apple's, but
+the backend now rules out everything on its side of it:
+
+- **Every way out tears the VM down first:** `exit_group`, the last thread's
+  `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
+  panics, and `execve`. Teardown stops every vCPU, has each thread destroy its
+  own (the framework requires that), then destroys the VM.
+- **Signals whose default action terminates are caught** in the VM backend,
+  so the process dies through that teardown, never by the host's default
+  action with the VM alive. Only `SIGKILL` from outside cannot be caught.
+- **No host `fork` of a VM process.** A fork child cannot use the parent's VM
+  — `hv_vm_destroy` fails there with `HV_NO_DEVICE` and `hv_vm_create` with
+  `HV_BUSY` — so it would die with a VM it inherited. `fork` and `vfork` in
+  the VM fail with `ENOSYS`, and `fwe_kernel::fork_locked` refuses outright
+  once a VM exists.
+- **The tests run one VM process at a time.**
+
+Keep to these when changing the backend.
+
 ## Status
 
-Programs linked below 4 GiB run in the VM, static and dynamically linked: the
-assembly test programs, Rust/musl programs, and a non-PIE glibc program
-whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the shape of
-Debian's `python3.11`. Not supported in the VM yet: threads (`clone` of a
-thread), `fork`/`vfork` and `execve`, which fail with `ENOSYS`; these are on
-the [roadmap](../ROADMAP.md). A memory call (`mmap` with a fixed address,
+Programs linked below 4 GiB run in the VM, static and dynamically linked, with
+threads: the assembly test programs, Rust/musl programs, and a non-PIE glibc
+program whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the
+shape of Debian's `python3.11`. They can `execve` any program, and a native
+program can `execve` them. Not supported in the VM yet: `fork` and `vfork`,
+which fail with `ENOSYS` (see above); this is on the
+[roadmap](../ROADMAP.md). A memory call (`mmap` with a fixed address,
 `munmap`, `mprotect`, `madvise`, `mremap`) on a range that runs across the
 edge of the executable's image fails with `EINVAL`, since that range has no
 single host address.
@@ -83,8 +120,8 @@ reports the status 42 the guest exits with. `sysctl kern.hv_support` must be
 ## Tests and CI
 
 The end-to-end tests whose names start with `hv_` sign a copy of `fwe` with the
-entitlement and run low-linked programs in the VM. Where the host has no
-hypervisor they report that they were skipped and pass.
+entitlement and run low-linked programs in the VM, one VM process at a time.
+Where the host has no hypervisor they report that they were skipped and pass.
 
 GitHub's hosted macOS runners are themselves virtual machines without nested
 virtualization, so Hypervisor.framework is unavailable there. This is

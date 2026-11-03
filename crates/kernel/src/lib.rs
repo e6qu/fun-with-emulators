@@ -208,6 +208,8 @@ impl<P: Platform> Kernel<P> {
     /// `SIGPIPE` is always reset: the Rust runtime ignores it before `main`,
     /// so its inherited disposition is lost.
     pub fn adopt_host_signals(&mut self) {
+        // The blocked mask survives execve: take the one fwe started with.
+        thread::set_mask(host::blocked_signals());
         for sig in 1..=absig::NSIG {
             if !signal::relayed(sig) || sig == absig::SIGPIPE {
                 continue;
@@ -309,7 +311,30 @@ pub fn thread_exit_cleanup() {
 /// in a multithreaded guest the child cannot inherit one locked by a thread
 /// that does not exist in it. The caller holds the kernel lock itself. The
 /// locks are released in both processes.
+/// Host `fork` is refused (see [`forbid_fork`]).
+static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse every host `fork` from now on: a process running its guest in a
+/// Hypervisor.framework VM must never fork, as the child would inherit a VM
+/// it cannot own.
+pub fn forbid_fork() {
+    NO_FORK.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn fork_locked() -> libc::pid_t {
+    if NO_FORK.load(std::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: setting this thread's errno.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = libc::ENOSYS
+        };
+        // SAFETY: as above.
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            *libc::__errno_location() = libc::ENOSYS
+        };
+        return -1;
+    }
     signalfd::hold(|| {
         specialfd::hold(|| {
             synthdir::hold(|| {

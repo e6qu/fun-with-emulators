@@ -281,6 +281,16 @@ Descriptors marked close-on-exec are closed; handled signals return to their
 default action while ignored ones stay ignored, and the blocked mask and
 pending signals are kept, as on Linux.
 
+Two kinds of `execve` instead re-execute fwe on the new program: one of a
+program only the hypervisor backend can run (linked below 4 GiB), and one
+from a process with other live threads, which Linux ends. The host's own
+exec then does the work: the pid, descriptors not marked close-on-exec, the
+signal mask, pending signals and ignored dispositions survive it as Linux
+requires, and fwe passes on the root filesystem, the working directory, the
+guest's `argv[0]` and `--strace` (`--guest-path`, `--cwd`, `--argv0`); the
+new fwe picks the backend. The hypervisor backend's `execve` always works
+this way.
+
 `fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
 `fork`. In a multithreaded guest the kernel lock and every kernel registry
 lock are held across it, so the child — which, as on Linux, has only the
@@ -472,16 +482,18 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
-  entitlement and a bare-metal Apple Silicon Mac; there, threads, `fork`,
-  `vfork` and `execve` fail with `ENOSYS` so far. A few rare `x18` forms are left
+  entitlement and a bare-metal Apple Silicon Mac; there, `fork` and `vfork`
+  fail with `ENOSYS` so far. `execve` re-executes fwe, so the guest's
+  virtual credentials and `RLIMIT_NOFILE` start over in the new program. A few rare `x18` forms are left
   unrewritten (see Rewriting guest code; `--strace` counts them). Code
   discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
   an inline jump table in a code section could be patched.
 - **Processes:** `vfork` copies the address space instead of sharing it
-  (see Processes); `execve` from a process with other live threads,
-  `execveat` and `clone3` are not implemented; `waitid` reports no
-  `rusage`.
+  (see Processes); `execveat` and `clone3` are not implemented; `waitid`
+  reports no `rusage`. An `execve` from a process with other live threads,
+  or of a program only the VM can run, re-executes fwe, and the guest's
+  virtual credentials and `RLIMIT_NOFILE` start over in the new program.
 - **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
   that opens more descriptors than its limit gets numbers in fwe's range,
   which it cannot use, rather than `EMFILE`; a reopened

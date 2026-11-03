@@ -16,8 +16,9 @@
 //! [`fwe_kernel::uaccess::set_translation`], and guest pointers into it are
 //! translated wherever the kernel or a host call uses them.
 //!
-//! Not yet supported here: threads, `fork` and `execve` (they fail with
-//! `ENOSYS`).
+//! Each guest thread runs on a vCPU of its own; `execve` re-executes fwe.
+//! A VM process never forks and never ends or execs with its VM alive (see
+//! `docs/hypervisor.md`): `fork` and `vfork` fail with `ENOSYS`.
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod backend;

@@ -247,6 +247,24 @@ pub fn host_mask_for(mask: u64) -> libc::sigset_t {
     host_sigset(mask & !crate::signalfd::watched())
 }
 
+/// The relayed signals the calling thread blocks on the host, as a Linux
+/// set.
+pub fn blocked_signals() -> u64 {
+    let mut set = empty_sigset();
+    // SAFETY: `set` is a valid out-parameter; no change is made.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set) };
+    let mut out = 0;
+    for sig in 1..=signal::NSIG {
+        if let Some(h) = signal_to_host(sig).filter(|_| crate::signal::relayed(sig)) {
+            // SAFETY: `set` is an initialized signal set.
+            if unsafe { libc::sigismember(&set, h) } == 1 {
+                out |= 1 << (sig - 1);
+            }
+        }
+    }
+    out
+}
+
 /// Relayed signals pending in the host for the calling thread or process
 /// (those the guest blocks), as a Linux set.
 pub fn pending_signals() -> u64 {
