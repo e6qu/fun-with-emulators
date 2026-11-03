@@ -348,13 +348,33 @@ pub mod signal {
     /// `si_code` values shared across signals.
     pub const SI_USER: i32 = 0;
     pub const SI_KERNEL: i32 = 0x80;
+    pub const SI_QUEUE: i32 = -1;
+    pub const SI_TIMER: i32 = -2;
+    pub const SI_MESGQ: i32 = -3;
+    pub const SI_ASYNCIO: i32 = -4;
+    pub const SI_TKILL: i32 = -6;
 
-    /// Default action of each signal, for signals with no handler.
-    pub fn default_is_terminate(sig: u64) -> bool {
-        !matches!(
-            sig,
-            SIGCHLD | SIGURG | SIGWINCH | SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU
-        )
+    /// Magic and size of the `fpsimd_context` record in a signal frame's
+    /// `__reserved` area.
+    pub const FPSIMD_MAGIC: u32 = 0x4650_8001;
+    pub const FPSIMD_CONTEXT_SIZE: u32 = 528;
+
+    /// What a signal does when its handler is `SIG_DFL`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Default {
+        Terminate,
+        Ignore,
+        Stop,
+        Continue,
+    }
+
+    pub fn default_action(sig: u64) -> Default {
+        match sig {
+            SIGCHLD | SIGURG | SIGWINCH => Default::Ignore,
+            SIGCONT => Default::Continue,
+            SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => Default::Stop,
+            _ => Default::Terminate,
+        }
     }
 }
 
@@ -503,6 +523,32 @@ pub mod wait {
     pub const WNOHANG: u64 = 1;
     pub const WUNTRACED: u64 = 2;
     pub const WCONTINUED: u64 = 8;
+    /// `waitid` options.
+    pub const WSTOPPED: u64 = 2;
+    pub const WEXITED: u64 = 4;
+    pub const WNOWAIT: u64 = 0x0100_0000;
+    /// `waitid` id types.
+    pub const P_ALL: u64 = 0;
+    pub const P_PID: u64 = 1;
+    pub const P_PGID: u64 = 2;
+    /// `si_code` values for `SIGCHLD`.
+    pub const CLD_EXITED: i32 = 1;
+    pub const CLD_KILLED: i32 = 2;
+    pub const CLD_DUMPED: i32 = 3;
+    pub const CLD_STOPPED: i32 = 5;
+    pub const CLD_CONTINUED: i32 = 6;
+}
+
+/// `getrusage` targets and `setitimer` timers.
+pub mod resource_usage {
+    pub const RUSAGE_SELF: i64 = 0;
+    pub const RUSAGE_CHILDREN: i64 = -1;
+    pub const RUSAGE_THREAD: i64 = 1;
+    /// Size of `struct rusage` on 64-bit Linux.
+    pub const RUSAGE_SIZE: usize = 144;
+    pub const ITIMER_REAL: u64 = 0;
+    pub const ITIMER_VIRTUAL: u64 = 1;
+    pub const ITIMER_PROF: u64 = 2;
 }
 
 /// `clone` flags (`linux/sched.h`); the low byte is the exit signal.

@@ -30,8 +30,14 @@ struct Ptys {
 
 static PTYS: Mutex<Option<Ptys>> = Mutex::new(None);
 
+/// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = PTYS.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 fn with<R>(f: impl FnOnce(&mut Ptys) -> R) -> R {
-    let mut g = PTYS.lock().unwrap();
+    let mut g = PTYS.lock().unwrap_or_else(|e| e.into_inner());
     let p =
         g.get_or_insert_with(|| Ptys { masters: HashMap::new(), slaves: HashMap::new(), next: 0 });
     f(p)

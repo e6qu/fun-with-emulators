@@ -10,9 +10,9 @@ fwe (crates/fwe)            the command line; end-to-end tests
  │    ├── decode       just enough AArch64 decoding to rewrite x18 uses
  │    ├── prepare      applies rewrite to guest memory, places stubs, flushes caches
  │    ├── stack        the Linux initial stack: argc, argv, envp, auxv
- │    ├── trap         SIGTRAP/fault handlers → kernel → resume guest
+ │    ├── trap         SIGTRAP/fault/signal handlers → kernel → resume guest
  │    ├── threads      clone: a host thread per guest thread
- │    ├── process      fork, execve, wait4
+ │    ├── process      fork and vfork, execve, wait4, waitid
  │    ├── hwcap        AT_HWCAP/AT_HWCAP2 from the host CPU
  │    └── hv           the hypervisor backend feasibility spike
  ├── kernel layer (crates/kernel)
@@ -25,7 +25,8 @@ The kernel layer does not depend on how guest code runs. An execution backend
 traps guest system calls, calls `Kernel::enter_syscall` with the guest's
 register file, and provides the few services the kernel needs through the
 `fwe_kernel::Platform` trait (preparing code for execution, ending a thread
-or the process). Two backends share it:
+or the process, setting how the host treats a signal). Two backends share
+it:
 
 - The **native backend** runs guest code in-process, directly on the CPU,
   after rewriting the instructions macOS cannot let a Linux process execute
@@ -54,6 +55,12 @@ mapping the VM's memory at the same addresses in the host process.
 
 The guest sees the host page size (16 KiB on Apple Silicon) through
 `AT_PAGESZ`, which the arm64 Linux ABI permits.
+
+Every range of guest memory — the loaded images and their code stubs, the
+stack, the break reservation and whatever the guest maps — is recorded
+(`fwe_kernel::mm::track`), and removed when the guest unmaps it. fwe's own
+memory (its heap, thread and signal stacks, the `rt_sigreturn` trampoline)
+never is, so `execve` can discard exactly the old program.
 
 macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO`; on Apple
 Silicon the kernel refuses to launch a process with a smaller one.
@@ -174,15 +181,24 @@ found by probing near the code.
    saved thread state into a `Regs` value (the kernel's view of the guest
    register file), and dispatches on the number in `x8`.
 3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `ppoll`,
-   `wait4`, the blocking socket calls, and `read`/`write` with their vectored
-   and positioned forms (a pipe or socket blocks until another thread acts)
-   — run **without** the kernel lock, so a waiting thread never stalls the
-   threads meant to wake it; `clone`, `execve` and `exit` are handled by the
-   backend for the same reason. Everything else runs under the single kernel lock
-   through `Kernel::enter_syscall`.
+   `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the blocking
+   socket calls, and `read`/`write` with their vectored and positioned forms
+   (a pipe or socket blocks until another thread acts) — run **without** the
+   kernel lock, so a waiting thread never stalls the threads meant to wake
+   it; `clone`, `execve` and `exit` are handled by the backend for the same
+   reason. Everything else runs under the single kernel lock through
+   `Kernel::enter_syscall`. While a call runs, the thread's guest signal
+   mask is in force on the host, so a signal the guest takes interrupts a
+   blocking host call (`EINTR`).
 4. The result goes into `x0`, `pc` advances past the `brk`, a pending signal
    is delivered if one is ready, and returning from the handler resumes the
-   guest. All other registers are preserved.
+   guest. All other registers are preserved. A call the host interrupted is
+   finished as Linux would: it runs again if the interrupting signal has no
+   guest handler waiting (it was blocked for a `signalfd`, or ignored), or
+   if the handler has `SA_RESTART` and the call is one Linux restarts (I/O,
+   `wait4`/`waitid`, `accept`, `openat`, `ioctl`, `flock`/`fcntl`, a futex
+   wait without a timeout); otherwise it fails with `EINTR` once the handler
+   returns.
 
 `--strace` prints each call with its arguments and result, plus the
 backend's notes (what was loaded and prepared), to standard error.
@@ -226,21 +242,38 @@ in-memory entry list. An unknown path under `/proc` or `/sys` is `ENOENT`.
 
 ## Processes
 
-`execve` loads the new program with the same `load_image` the startup path
-uses and enters it with a fresh register set, after closing the descriptors
-marked close-on-exec and resetting the signal dispositions, the alternate
-stack and the per-thread words (the blocked mask is kept, as on Linux). The
-old image's mappings are not reclaimed yet, so this suits fork-then-exec and
-exec chains. `fork` (a `clone` without
-`CLONE_THREAD`) duplicates the process with host `fork`; the child
-re-initialises its thread state and enters the guest with `x0` = 0. It is
-supported for single-threaded guests only, since another thread could hold
-a lock across the fork. `wait4` reaps a child through the host and
-translates the status into the Linux encoding (and queues `SIGCHLD` to a
-watching `signalfd`); `rusage` is zero-filled. `getpid` is the main thread's
-tid; child pids are host pids, so `setpgid(child, …)` works. Sending a
-signal to another process is not implemented: `kill` of any pid but the
-caller's own returns `ESRCH`.
+`execve` first checks the new program (an arm64 ELF executable that fits the
+address space, with a dynamic linker that exists), so a bad one fails with
+the caller intact. Past that point it unmaps all tracked guest memory, loads
+the new program with the same `load_image` the startup path uses, and
+returns from the trap handler into it with every register zero. A program
+can therefore exec one linked at the addresses it occupies itself — the same
+binary, as `std::process::Command` and `posix_spawn` users often do.
+Descriptors marked close-on-exec are closed; handled signals return to their
+default action while ignored ones stay ignored, and the blocked mask and
+pending signals are kept, as on Linux.
+
+`fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
+`fork`. In a multithreaded guest the kernel lock and every kernel registry
+lock are held across it, so the child — which, as on Linux, has only the
+forking thread — cannot inherit a lock another thread held. The child cannot
+return through the trap handler frame it inherited (macOS does not restore
+the signal mask from a frame the process did not take), so it installs a
+signal stack of its own and enters the guest directly with `x0` = 0. The
+`vfork` form, `CLONE_VM | CLONE_VFORK`, which `posix_spawn`, `vfork` and Go's
+`os/exec` use, runs as a fork: the child gets a copy of the address space,
+not a share of it, and the parent waits until the child has exec'd or exited
+(it holds the write end of a close-on-exec pipe). Spawn helpers only exec or
+exit in the child, so this matches; a child that writes to memory the parent
+reads afterwards (glibc's `posix_spawn` reporting an exec failure) is not
+seen by the parent.
+
+`wait4` reaps a child through the host, translating the status into the
+Linux encoding and the resource usage into Linux units (`ru_maxrss` in KiB);
+`waitid` reports the same as a `siginfo_t` (its `rusage` is zero-filled: the
+host's `waitid` has none). `getrusage` translates likewise. `getpid` is the
+main thread's tid; child pids are host pids, so `kill`, `setpgid` and `wait`
+on them act on the real processes.
 
 ## Threads and concurrency
 
@@ -253,18 +286,56 @@ own stack; `CLONE_SETTLS` sets the new thread's pointer in its TSD slot, and
 tid words. The thread id, the `set_tid_address` word and the robust list live
 in host thread-locals. A thread's `exit` clears and wakes its
 `clear_child_tid` futex (so `pthread_join` completes) and ends that host
-thread; the last thread, or `exit_group`, ends the process.
+thread; the last thread, or `exit_group`, ends the process. A new thread
+inherits its creator's signal mask and starts with no alternate stack.
 
 The futex wait queues are a process-global structure operating on raw guest
 memory, outside the kernel lock, so `FUTEX_WAIT` blocks without holding it.
+A host condition variable is not interrupted by signals, so a waiter checks
+every 20 ms for a signal it should take, and returns `EINTR` for it.
 `clone3` is not implemented (glibc falls back to `clone`).
 
 ## Signals
 
-The kernel stores each signal's `sigaction`, the blocked mask and the
-alternate stack. A signal the guest raises against itself (`kill`, `tkill`,
-`tgkill`) is marked pending and delivered on the way back to the guest;
-synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGILL`) are offered to a
+Dispositions are process-wide and live in the kernel; the blocked mask, the
+alternate stack and the pending set are per thread (`crates/kernel/src/thread.rs`).
+
+Guest signals travel as host signals wherever the host has an equivalent.
+`kill` sends the host signal to whatever the pid names — another process, a
+process group, the caller itself — and `tgkill` sends it to that guest
+thread's host thread. The backend mirrors each disposition onto the host:
+a signal with a guest handler, or one a `signalfd` reads, is caught by the
+backend; `SIG_DFL` and `SIG_IGN` become the host's, whose default actions
+match Linux's (terminate, ignore, stop, continue), so a child killed by a
+signal shows the right status to its parent. At startup a signal fwe
+inherited as ignored stays ignored in the guest (`nohup`, a shell's
+background jobs). Each guest thread runs under a host mask that mirrors its
+guest mask, so the host routes a process-wide signal to a thread that
+accepts it and keeps a blocked one pending, and a signal from anywhere — a
+child exiting (`SIGCHLD`), the terminal, a timer (`setitimer`), another
+process — reaches the guest as it would on Linux. Every fwe handler starts
+and ends with all signals blocked, so the backend always knows whether it
+interrupted guest code or its own.
+
+The backend's handler records the signal pending against the thread it
+landed on, with the sender, code and status from the host's `siginfo`. If it
+interrupted guest code, it delivers the signal at once by rewriting the
+interrupted context, as Linux does on the way back to user space; if it
+interrupted a system call, the call (interrupted itself, if it was blocking)
+delivers it as it returns. The real-time signals, which the host lacks, are
+kept pending in the kernel and only travel within the process; the target
+thread (or, for the process, every thread) is woken with a host signal no
+Linux signal maps to. The fault signals (`SIGTRAP`, `SIGSEGV`, `SIGBUS`,
+`SIGILL`, `SIGFPE`) are handled the same way when a process sends them to
+itself, because macOS's `siginfo` cannot tell a sent one from a fault. A
+waiting call that takes a mask (`ppoll`, `epoll_pwait`) runs under it, as
+`rt_sigsuspend` does. Before a handler returns to guest code it delivers
+anything that became pending while it ran.
+`rt_sigsuspend`, `rt_sigtimedwait` (which has the host catch the awaited
+signals while it waits, so one taken is never handled) and `rt_sigpending`
+work on the same state.
+
+Synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGILL`) are offered to a
 handler at the point of the fault, and take the default action (the process
 dies with that signal, after a register and code dump under `--strace`) if
 none is installed. Delivery builds an arm64 `rt_sigframe` on the guest stack
@@ -276,9 +347,9 @@ registers, mask and alternate stack. The frame uses the kernel's own
 `ucontext`/`sigcontext` layout, so a handler that reads or patches
 `uc_mcontext` (an unwinder, a fault handler that skips an instruction) sees
 the right fields. A handler already running on the alternate stack keeps
-using it from its current `sp`. Only the general-purpose registers, `sp`,
-`pc` and `pstate` are saved across a handler; the signal mask and alternate
-stack are process-wide rather than per thread.
+using it from its current `sp`. The frame carries the floating-point and
+SIMD registers in an `fpsimd_context` record, restored by `rt_sigreturn`, so
+a handler may use them freely.
 
 ## Event descriptors
 
@@ -289,7 +360,7 @@ descriptor is a kqueue, each watched fd becomes an `EVFILT_READ` filter for
 `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`, and the caller's data word
 rides in the kevent `udata`. `epoll_pwait` writes the packed 12-byte arm64
 `epoll_event` array in place. The `EEXIST`/`ENOENT` edge cases of redundant
-`ADD`/`MOD` and the signal mask are not emulated precisely on macOS.
+`ADD`/`MOD` are not emulated precisely on macOS.
 
 `eventfd` and `timerfd` (`crates/kernel/src/specialfd.rs`) have no macOS
 equivalent and are emulated in a process-global registry keyed by descriptor,
@@ -301,11 +372,13 @@ timerfd is a `kqueue` holding one `EVFILT_TIMER`, with millisecond
 resolution; a periodic timer's distinct initial `it_value` and the
 realtime/monotonic distinction are not modelled.
 
-`signalfd` (`crates/kernel/src/signalfd.rs`) is emulated on both hosts, since
-the guest's signals are virtual: each signalfd is a readiness pipe plus a
-queue of `signalfd_siginfo` records. When the guest raises a signal that is
-blocked and some signalfd watches it, the record is queued there instead of
-leaving the signal pending; a reaped child queues `SIGCHLD` likewise.
+`signalfd` (`crates/kernel/src/signalfd.rs`) has no macOS equivalent and is
+emulated: each signalfd is a readiness pipe plus a queue of
+`signalfd_siginfo` records. The host never blocks a watched signal, so it
+reaches the backend's handler and is recorded pending; a pending signal that
+the thread blocks and some signalfd watches is moved onto that signalfd
+instead (including the `SIGCHLD` of a child exiting), and a call it
+interrupted runs again.
 
 ## Sockets
 
@@ -377,9 +450,10 @@ those items.
   unrewritten (reported under `--strace`). Code discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
   an inline jump table in a code section could be patched.
-- **Processes:** `execve` does not reclaim the old address space; `fork` is
-  single-threaded only; `vfork`, `waitid`, `execveat` and `clone3` are not
-  implemented; `rusage` is zero-filled.
+- **Processes:** `vfork` copies the address space instead of sharing it
+  (see Processes); `execve` from a process with other live threads,
+  `execveat` and `clone3` are not implemented; `waitid` reports no
+  `rusage`.
 - **Descriptors:** fwe's own descriptors (the rootfs handle, the pipe ends
   behind eventfd and signalfd) live in the guest's table; a guest that closes
   every descriptor from 3 up, as daemons and `subprocess` do, breaks path
@@ -388,12 +462,20 @@ those items.
   where Linux would restore the file's. Guest pointers the kernel reads
   itself are not fault-checked; a bad pointer crashes `fwe` instead of
   returning `EFAULT`.
-- **Signals:** `kill` reaches only the calling process (another pid gets
-  `ESRCH`), so a shell cannot signal its children; the mask and alternate
-  stack are process-wide, not per thread; floating-point and vector
-  registers are not saved across a handler.
-- **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases and the
-  `epoll_pwait` signal mask; `timerfd` resolution and clock distinctions.
+- **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
+  can only be sent within the process; standard signals are not queued
+  (one pending per signal, as Linux does for them); a signal left pending
+  while blocked loses its sender on macOS, so `rt_sigtimedwait` then
+  reports `si_pid` 0; `rt_sigqueueinfo` is not implemented; a signal that
+  arrives between a blocking call's start and its host wait can be noticed
+  only when the call ends, except for `rt_sigsuspend`, `rt_sigtimedwait`
+  and the masked waits, which close that window; a futex wait notices a
+  signal within 20 ms; a call rerun after an interruption the guest does
+  not see starts its timeout over; a fault signal sent by another process
+  is treated as a fault; a process killed by a real-time signal exits with
+  status 128 + the signal, since the host cannot report one it lacks.
+- **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases; `timerfd`
+  resolution and clock distinctions.
 - **Not implemented:** `rseq`, `membarrier` (optional for libc), and any
   system call not listed in `crates/kernel/src/syscalls.rs` returns `ENOSYS`
   and is noted under `--strace`.

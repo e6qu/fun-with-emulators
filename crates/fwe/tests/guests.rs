@@ -98,6 +98,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18fp",
     "x18pc",
     "x18sig",
+    "fpsig",
     "pipethread",
     "fileio",
     "sigtest",
@@ -907,4 +908,219 @@ fn rejects_non_elf() {
     let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(this_file).output().unwrap();
     assert_eq!(out.status.code(), Some(126));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an ELF file"));
+}
+
+/// FP/SIMD state across a signal handler: the frame carries an
+/// `fpsimd_context` record with the interrupted registers and FPCR, and what
+/// the handler does to them is undone by `rt_sigreturn`.
+#[test]
+fn fp_state_survives_a_signal_handler() {
+    for name in ["fpsig", "fpsig-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
+/// Run one scenario of the `signals` guest and return what it printed.
+fn signals(scenario: &str) -> String {
+    let out = fwe(&rust_guest("signals"), &[scenario]);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {out:?}");
+    stdout(&out)
+}
+
+/// `kill` reaches another process: a parent kills a child blocked in
+/// `pause`, and `wait4` reports the signal.
+#[test]
+fn kill_reaches_another_process() {
+    assert_eq!(signals("kill-child"), "killed by 15\n");
+}
+
+/// A signal from another process reaches a guest handler (through the host),
+/// with the sender's pid in `siginfo`, and wakes `sigsuspend`.
+#[test]
+fn signal_from_child_reaches_parent_handler() {
+    assert_eq!(signals("notify-parent"), "SIGUSR1 from child: true\nexited 0\n");
+}
+
+/// A child's exit raises `SIGCHLD` in the parent, carrying the child's pid
+/// and exit status.
+#[test]
+fn sigchld_reaches_handler_with_status() {
+    assert_eq!(signals("sigchld"), "SIGCHLD from child: true, status 3\nexited 3\n");
+}
+
+/// A timer signal interrupts a blocking `read`: with `SA_RESTART` the read
+/// resumes and returns the data that arrives later; without it, `EINTR`.
+#[test]
+fn interrupted_read_restarts_only_with_sa_restart() {
+    assert_eq!(signals("restart"), "read: 1 byte, handler ran 1 time(s)\n");
+    assert_eq!(signals("no-restart"), "read: errno 4, handler ran 1 time(s)\n");
+}
+
+/// `pause` (a `ppoll` with no descriptors) returns `EINTR` once a handler
+/// ran, here for an `ITIMER_REAL` timer.
+#[test]
+fn pause_returns_after_timer_handler() {
+    assert_eq!(signals("pause"), "pause: -1 errno 4, handler ran: true\n");
+}
+
+/// Signal masks are per thread: a signal sent to the process is handled on
+/// the thread that does not block it.
+#[test]
+fn process_signal_goes_to_unblocked_thread() {
+    assert_eq!(signals("thread-mask"), "handled on the unblocked thread: true\n");
+}
+
+/// `tgkill` aims at one thread and interrupts its blocking call, both for a
+/// signal the host has and for a real-time one it does not.
+#[test]
+fn tgkill_interrupts_one_thread() {
+    assert_eq!(
+        signals("tgkill"),
+        "signal 12: reader EINTR, handled on it: true\nsignal 40: reader EINTR, handled on it: true\n"
+    );
+}
+
+/// A real-time signal (no host equivalent) sent to the process itself.
+#[test]
+fn realtime_signal_to_self() {
+    assert_eq!(signals("rt-self"), "handled: 1, signal 40\n");
+}
+
+/// `SIGSEGV`, `SIGFPE` and `SIGTRAP` that a process sends itself reach its
+/// handlers (the host cannot tell them from faults, so they are emulated),
+/// and an ignored `SIGTRAP` is ignored.
+#[test]
+fn sent_fault_signals_reach_handlers() {
+    assert_eq!(
+        signals("raise-faults"),
+        "signal 11: handled 1\nsignal 8: handled 1\nsignal 5: handled 1\nignored SIGTRAP: still running\n"
+    );
+}
+
+/// A real-time signal sent to the process wakes the thread that waits for
+/// it.
+#[test]
+fn realtime_signal_reaches_waiting_thread() {
+    assert_eq!(signals("rt-to-waiter"), "waiter took 40\n");
+}
+
+/// A signal a signalfd reads gets there even when the host hands it to a
+/// thread blocked on a futex rather than to the reader.
+#[test]
+fn signalfd_gets_signal_landing_on_futex_waiter() {
+    assert_eq!(signals("signalfd-join"), "reader got 128 bytes for signal 10\n");
+}
+
+/// `ppoll` waits under the mask it is given, so a signal blocked outside it
+/// interrupts it and runs the handler.
+#[test]
+fn ppoll_applies_its_signal_mask() {
+    assert_eq!(signals("ppoll-mask"), "ppoll -1 errno 4, handled 1\n");
+}
+
+/// With the default disposition, writing to a pipe without a reader kills
+/// the writer with `SIGPIPE`, as on Linux.
+#[test]
+fn sigpipe_kills_writer_by_default() {
+    use std::os::unix::process::ExitStatusExt;
+    let out = fwe(&rust_guest("signals"), &["sigpipe"]);
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{out:?}");
+    assert_eq!(stdout(&out), "");
+}
+
+/// A signal ignored by whoever started fwe stays ignored in the guest, as an
+/// ignored disposition survives a Linux `execve` (`nohup`, background jobs).
+#[test]
+fn ignored_signals_are_inherited() {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg(rust_guest("signals")).arg("inherited");
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let out = run_bounded(cmd);
+    assert_eq!(stdout(&out), "signal 1: default\nsignal 2: ignored\n", "{out:?}");
+}
+
+/// `sigtimedwait` takes a blocked pending signal without running a handler,
+/// then times out with `EAGAIN`.
+#[test]
+fn sigtimedwait_takes_pending_then_times_out() {
+    assert_eq!(signals("sigtimedwait"), "took 12, code 0\nthen -1 errno EAGAIN\n");
+}
+
+/// `std::process::Command` spawns through musl's `posix_spawn`, a
+/// `CLONE_VM | CLONE_VFORK` clone that execs the same fixed-address binary:
+/// it needs the vfork form of `clone` and an `execve` that discards the old
+/// address space. Both with piped and with inherited standard I/O.
+#[test]
+fn command_spawns_a_child_program() {
+    assert_eq!(
+        signals("spawn"),
+        "child said: hello from the spawned child\nchild exit status: 0\n"
+    );
+    assert_eq!(signals("spawn-status"), "hello from the spawned child\nchild exit status: 0\n");
+}
+
+/// `vfork` then `execve` in the child, and `execve` of the running binary
+/// itself: the new image is loaded where the old one was.
+#[test]
+fn exec_replaces_the_address_space() {
+    assert_eq!(signals("vfork-exec"), "hello from the spawned child\nexited 0\n");
+    assert_eq!(signals("exec-self"), "hello from the spawned child\n");
+}
+
+/// `fork` from a process with a second thread running: the child has just
+/// the forking thread and runs normally.
+#[test]
+fn fork_from_a_threaded_process() {
+    assert_eq!(signals("threaded-fork"), "child of a threaded parent\nexited 5\n");
+}
+
+/// `waitid` reports an exit and a kill as `siginfo`.
+#[test]
+fn waitid_reports_exit_and_kill() {
+    assert_eq!(
+        signals("waitid"),
+        "exited: true, status 6, pid matches: true\nkilled: true, signal 9\n"
+    );
+}
+
+/// `wait4` and `getrusage` report resource usage in Linux units.
+#[test]
+fn rusage_in_linux_units() {
+    assert_eq!(
+        signals("rusage"),
+        "child used cpu: true\nchild maxrss plausible: true\nown maxrss plausible: true\n"
+    );
+}
+
+/// Real Debian bash: `kill` on a background job, and a `trap` handler for a
+/// signal the shell sends itself.
+#[test]
+fn debian_bash_kills_a_background_job() {
+    let out = run_debian(
+        "bash",
+        &["-c", "f() { while :; do :; done; }; f & p=$!; kill $p; wait $p; echo status=$?"],
+        &[],
+    );
+    assert_eq!(stdout(&out), "status=143\n");
+}
+
+#[test]
+fn debian_bash_runs_trap_handlers() {
+    let out = run_debian(
+        "bash",
+        &[
+            "-c",
+            "trap 'echo trapped' USR1; kill -USR1 $$; trap 'echo reaped' CHLD; (exit 0); echo end",
+        ],
+        &[],
+    );
+    assert_eq!(stdout(&out), "trapped\nreaped\nend\n");
 }

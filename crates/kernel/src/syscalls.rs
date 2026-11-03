@@ -284,11 +284,21 @@ impl<P: Platform> Kernel<P> {
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
             nr::GETRUSAGE => {
-                // `struct rusage` is 144 bytes on arm64; report it zeroed.
-                if a[1] != 0 {
-                    // SAFETY: the guest passed a buffer for a `struct rusage`.
-                    unsafe { std::ptr::write_bytes(a[1] as *mut u8, 0, 144) };
+                use fwe_abi::resource_usage as ru;
+                let who = match a[0] as i32 as i64 {
+                    // The host has no per-thread usage; report the process's.
+                    ru::RUSAGE_SELF | ru::RUSAGE_THREAD => libc::RUSAGE_SELF,
+                    ru::RUSAGE_CHILDREN => libc::RUSAGE_CHILDREN,
+                    _ => return err(errno::EINVAL),
+                };
+                // SAFETY: an all-zero rusage is a valid out-parameter.
+                let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+                // SAFETY: `usage` is a valid out-parameter.
+                if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+                    return last_error();
                 }
+                // SAFETY: the guest passed a buffer for a `struct rusage`.
+                unsafe { host::write_rusage(a[1], &usage) };
                 0
             }
             nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
@@ -312,9 +322,19 @@ impl<P: Platform> Kernel<P> {
             nr::RT_SIGACTION => self.sys_rt_sigaction(a[0], a[1], a[2], a[3]),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(a[0], a[1], a[2], a[3]),
             nr::SIGALTSTACK => self.sys_sigaltstack(a[0], a[1]),
-            nr::KILL => self.sys_kill_self(a[0] as i64, a[1]),
-            nr::TKILL => self.sys_kill_self(0, a[1]),
-            nr::TGKILL => self.sys_kill_self(a[0] as i64, a[2]),
+            nr::KILL => self.sys_kill(a[0] as i32 as i64, a[1]),
+            nr::TKILL => self.sys_tgkill(-1, a[0] as i32 as i64, a[1]),
+            nr::TGKILL => self.sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2]),
+            nr::RT_SIGPENDING => self.sys_rt_sigpending(a[0], a[1]),
+            nr::SETITIMER => {
+                // SAFETY: `struct itimerval` has the same layout and timer
+                // numbers on both hosts; the host validates the pointers.
+                ret(unsafe { libc::setitimer(a[0] as i32, a[1] as *const _, a[2] as *mut _) })
+            }
+            nr::GETITIMER => {
+                // SAFETY: as for setitimer.
+                ret(unsafe { libc::getitimer(a[0] as i32, a[1] as *mut _) })
+            }
 
             // futex and the sleeps can block, so the backend runs them
             // outside the kernel lock via `blocking_syscall`; reaching them
@@ -649,6 +669,7 @@ impl<P: Platform> Kernel<P> {
             }
             // SAFETY: the guest passed a pointer to a `struct sigaction`.
             self.sigactions[slot] = unsafe { read::<Sigaction>(act) };
+            self.sync_host_signal(sig);
         }
         0
     }
@@ -657,17 +678,16 @@ impl<P: Platform> Kernel<P> {
         if size != signal::SIGSET_SIZE {
             return err(errno::EINVAL);
         }
-        let previous = self.sigmask;
+        let previous = thread::mask();
         if set != 0 {
             // SAFETY: the guest passed a pointer to a `sigset_t`.
             let s: u64 = unsafe { read(set) };
-            let unblockable = (1 << (signal::SIGKILL - 1)) | (1 << (signal::SIGSTOP - 1));
-            self.sigmask = match how {
+            thread::set_mask(match how {
                 signal::SIG_BLOCK => previous | s,
                 signal::SIG_UNBLOCK => previous & !s,
                 signal::SIG_SETMASK => s,
                 _ => return err(errno::EINVAL),
-            } & !unblockable;
+            });
         }
         if old != 0 {
             // SAFETY: the guest passed a buffer for a `sigset_t`.
@@ -679,7 +699,7 @@ impl<P: Platform> Kernel<P> {
     fn sys_sigaltstack(&mut self, ss: u64, old: u64) -> i64 {
         if old != 0 {
             // SAFETY: the guest passed a buffer for a `stack_t`.
-            unsafe { write(old, self.altstack) };
+            unsafe { write(old, thread::altstack()) };
         }
         if ss != 0 {
             // SAFETY: the guest passed a pointer to a `stack_t`.
@@ -690,39 +710,8 @@ impl<P: Platform> Kernel<P> {
             if s.ss_flags & libc::SS_DISABLE == 0 && s.ss_size < signal::MINSIGSTKSZ {
                 return err(errno::ENOMEM);
             }
-            self.altstack = s;
+            thread::set_altstack(s);
         }
-        0
-    }
-
-    /// `kill`, `tkill` and `tgkill` aimed at the calling process.
-    fn sys_kill_self(&mut self, pid: i64, sig: u64) -> i64 {
-        // SAFETY: plain host call.
-        let me = unsafe { libc::getpid() } as i64;
-        if pid != 0 && pid != me {
-            return err(errno::ESRCH);
-        }
-        if sig == 0 {
-            return 0;
-        }
-        if sig > signal::NSIG {
-            return err(errno::EINVAL);
-        }
-        // SIGKILL and SIGSTOP cannot be caught; act now.
-        if sig == signal::SIGKILL {
-            self.terminate_by(sig);
-        }
-        // A blocked signal that a signalfd watches is delivered through that
-        // descriptor instead of being left pending.
-        if self.sigmask & (1 << (sig - 1)) != 0 {
-            let info = crate::signalfd::siginfo(sig as u32, me as u32, 0);
-            if crate::signalfd::deliver(sig, info) {
-                return 0;
-            }
-        }
-        // Record it; delivery happens on return to the guest, after this
-        // system call, in `deliver_pending`.
-        self.raise_pending(sig);
         0
     }
 
@@ -732,7 +721,11 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: the guest passed a pointer to an 8-byte signal set.
         let set = unsafe { read::<u64>(mask) };
-        crate::signalfd::signalfd4(fd as i32, set, flags)
+        let r = crate::signalfd::signalfd4(fd as i32, set, flags);
+        // A watched signal must reach the backend even when its disposition
+        // would let the host drop it.
+        self.sync_all_host_signals();
+        r
     }
 
     fn sys_getrandom(&mut self, buf: u64, len: u64) -> i64 {
@@ -744,7 +737,7 @@ impl<P: Platform> Kernel<P> {
     }
 }
 
-/// `ppoll(fds, nfds, timeout)`; the signal mask is not applied. Blocks, so
+/// `ppoll(fds, nfds, timeout)`; the caller applies the signal mask. Blocks, so
 /// the backend runs it without the kernel lock through
 /// [`crate::blocking_syscall`]; it touches no kernel state.
 ///

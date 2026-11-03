@@ -115,7 +115,10 @@ impl Fs {
     }
 
     /// Set the per-process information the synthetic `/proc` files draw on.
+    /// Record what `/proc/self` reports. A relative `exe` is taken against
+    /// the guest's working directory: `/proc/self/exe` is always absolute.
     pub fn set_proc_info(&mut self, exe: Vec<u8>, cmdline: Vec<u8>, ncpu: u32, hostname: Vec<u8>) {
+        let exe = if exe.starts_with(b"/") { exe } else { normalize(&self.cwd, &exe) };
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname };
     }
 

@@ -95,6 +95,16 @@ impl Platform for NativePlatform {
             libc::_exit(128 + sig)
         }
     }
+
+    fn stop_self(&mut self) {
+        // SAFETY: plain host call; the process resumes on SIGCONT.
+        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn set_host_signal(&mut self, sig: u64, how: fwe_kernel::HostSignal) {
+        trap::set_host_signal(sig, how);
+    }
 }
 
 /// How to run a guest.
@@ -457,6 +467,27 @@ pub struct Loadout {
     pub brk: Brk,
 }
 
+/// Check that `file` is a program [`load_image`] can start, before `execve`
+/// discards the old one: an arm64 ELF executable that fits the host's
+/// address space, whose dynamic linker (if any) exists and is
+/// position-independent. Fails with the Linux errno `execve` reports.
+pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
+    use fwe_abi::errno;
+    let elf = Elf::parse(file).map_err(|_| errno::ENOEXEC)?;
+    if !elf.is_pie() && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
+    {
+        return Err(errno::ENOEXEC);
+    }
+    if let Some(ip) = elf.interpreter().map_err(|_| errno::ENOEXEC)? {
+        let idata = fs.read(ip)?;
+        let ielf = Elf::parse(&idata).map_err(|_| errno::ELIBBAD)?;
+        if !ielf.is_pie() {
+            return Err(errno::ELIBBAD);
+        }
+    }
+    Ok(())
+}
+
 /// Load an ELF image (and its dynamic linker) and build the initial stack,
 /// returning where to start the guest. Shared by process startup and
 /// `execve`. Does not touch the kernel; the caller installs or updates it.
@@ -537,6 +568,7 @@ pub fn load_image(
     if stack_base == libc::MAP_FAILED {
         return Err(Error::Load(loader::LoadError::Map(std::io::Error::last_os_error())));
     }
+    fwe_kernel::mm::track(stack_base as u64, STACK_SIZE + page);
     // SAFETY: protecting the lowest page of the mapping just made.
     unsafe { libc::mprotect(stack_base, page as usize, libc::PROT_NONE) };
     let stack_top = stack_base as u64 + STACK_SIZE + page;
@@ -624,7 +656,7 @@ fn start(
         page,
         options.strace,
     )?;
-    fs.set_proc_info(path.as_os_str().as_bytes().to_vec(), cmdline(&arg_bytes), ncpu(), hostname());
+    fs.set_proc_info(guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
     fwe_kernel::net::set_rootfs(fs.root_host_path());
 
     // A trampoline used as the return address for signal handlers that have
@@ -640,14 +672,30 @@ fn start(
     enter(out.sp, out.entry)
 }
 
+/// The guest's absolute path of the program fwe was asked to run, for
+/// `/proc/self/exe`: the host path, made relative to the root filesystem when
+/// the program lies inside it.
+fn guest_exe_path(path: &Path, options: &Options) -> Vec<u8> {
+    let Ok(host) = std::fs::canonicalize(path) else {
+        return path.as_os_str().as_bytes().to_vec();
+    };
+    if let Some(root) = options.root.as_ref().and_then(|r| std::fs::canonicalize(r).ok()) {
+        if let Ok(inside) = host.strip_prefix(&root) {
+            return Path::new("/").join(inside).as_os_str().as_bytes().to_vec();
+        }
+    }
+    host.as_os_str().as_bytes().to_vec()
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     trap::install_handlers();
-    if let Some(abi) = X18Abi::get() {
-        // From here on this thread runs guest code, which may use x18 freely;
-        // the trap handlers leave the mode while they run host code.
-        abi.set_enabled(true);
-    }
+    // Signals the guest inherits as ignored stay ignored; the rest go to
+    // their default action until the guest says otherwise.
+    KERNEL.lock().unwrap().as_mut().unwrap().adopt_host_signals();
+    // From here on this thread runs guest code, which may use x18 freely;
+    // the trap handlers leave the mode while they run host code.
+    trap::prepare_guest_entry();
     trap::enter_guest(sp, entry)
 }
 

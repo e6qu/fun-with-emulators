@@ -1,0 +1,585 @@
+//! Signals and processes as shells, build tools and runtimes use them: one
+//! scenario per argument, each printing what it observed.
+//!
+//! The C library calls go straight to the statically linked musl, declared
+//! here, so the guest needs no crates.
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::time::Duration;
+
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGKILL: i32 = 9;
+const SIGUSR1: i32 = 10;
+const SIGUSR2: i32 = 12;
+const SIGTRAP: i32 = 5;
+const SIGFPE: i32 = 8;
+const SIGSEGV: i32 = 11;
+const SIGPIPE: i32 = 13;
+const SIGALRM: i32 = 14;
+const SIGTERM: i32 = 15;
+const SIGCHLD: i32 = 17;
+/// A real-time signal musl does not reserve for itself.
+const SIGRT: i32 = 40;
+
+const SA_SIGINFO: i32 = 4;
+const SA_RESTART: i32 = 0x1000_0000;
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+const EINTR: i32 = 4;
+const EAGAIN: i32 = 11;
+const P_PID: i32 = 1;
+const WEXITED: i32 = 4;
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+const SYS_GETTID: i64 = 178;
+const SYS_TGKILL: i64 = 131;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigSet([u64; 16]);
+
+#[repr(C)]
+struct SigAction {
+    handler: usize,
+    mask: SigSet,
+    flags: i32,
+    restorer: usize,
+}
+
+#[repr(C)]
+struct SigInfo {
+    signo: i32,
+    errno: i32,
+    code: i32,
+    _pad: i32,
+    pid: i32,
+    uid: u32,
+    status: i32,
+    _rest: [u8; 100],
+}
+
+#[repr(C)]
+struct Timeval {
+    sec: i64,
+    usec: i64,
+}
+
+#[repr(C)]
+struct Itimerval {
+    interval: Timeval,
+    value: Timeval,
+}
+
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+
+#[repr(C)]
+struct Rusage {
+    utime: Timeval,
+    stime: Timeval,
+    maxrss: i64,
+    _rest: [i64; 13],
+}
+
+unsafe extern "C" {
+    fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    fn sigprocmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+    fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+    fn sigsuspend(set: *const SigSet) -> i32;
+    fn sigtimedwait(set: *const SigSet, info: *mut SigInfo, timeout: *const Timespec) -> i32;
+    fn fork() -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn getpid() -> i32;
+    fn getppid() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn wait4(pid: i32, status: *mut i32, options: i32, usage: *mut Rusage) -> i32;
+    fn waitid(idtype: i32, id: u32, info: *mut SigInfo, options: i32) -> i32;
+    fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+    fn close(fd: i32) -> i32;
+    fn pause() -> i32;
+    fn setitimer(which: i32, new: *const Itimerval, old: *mut Itimerval) -> i32;
+    fn syscall(n: i64, ...) -> i64;
+    fn raise(sig: i32) -> i32;
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn signalfd(fd: i32, mask: *const SigSet, flags: i32) -> i32;
+    fn ppoll(fds: *mut u8, n: u64, timeout: *const Timespec, mask: *const SigSet) -> i32;
+    fn _exit(code: i32) -> !;
+    fn __errno_location() -> *mut i32;
+}
+
+fn errno() -> i32 {
+    // SAFETY: musl's errno location for this thread.
+    unsafe { *__errno_location() }
+}
+
+fn set(sigs: &[i32]) -> SigSet {
+    let mut s = SigSet([0; 16]);
+    for &sig in sigs {
+        s.0[0] |= 1 << (sig - 1);
+    }
+    s
+}
+
+static HITS: AtomicUsize = AtomicUsize::new(0);
+static LAST_SIG: AtomicI32 = AtomicI32::new(0);
+static LAST_PID: AtomicI32 = AtomicI32::new(0);
+static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
+static LAST_TID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn record(sig: i32, info: *mut SigInfo, _ctx: *mut u8) {
+    LAST_SIG.store(sig, Ordering::SeqCst);
+    // SAFETY: SA_SIGINFO handlers get a valid siginfo.
+    let (pid, status) = unsafe { ((*info).pid, (*info).status) };
+    LAST_PID.store(pid, Ordering::SeqCst);
+    LAST_STATUS.store(status, Ordering::SeqCst);
+    // SAFETY: plain system call.
+    LAST_TID.store(unsafe { syscall(SYS_GETTID) } as i32, Ordering::SeqCst);
+    HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn catch(sig: i32, flags: i32) {
+    let act = SigAction {
+        handler: record as *const () as usize,
+        mask: SigSet([0; 16]),
+        flags: flags | SA_SIGINFO,
+        restorer: 0,
+    };
+    // SAFETY: a valid sigaction.
+    assert_eq!(unsafe { sigaction(sig, &act, std::ptr::null_mut()) }, 0);
+}
+
+fn block(sigs: &[i32]) {
+    // SAFETY: a valid signal set.
+    unsafe { sigprocmask(SIG_BLOCK, &set(sigs), std::ptr::null_mut()) };
+}
+
+fn suspend_until_hit() {
+    let empty = set(&[]);
+    while HITS.load(Ordering::SeqCst) == 0 {
+        // SAFETY: a valid signal set.
+        unsafe { sigsuspend(&empty) };
+    }
+}
+
+fn child(f: impl FnOnce() -> i32) -> i32 {
+    // SAFETY: the child only runs `f` and exits.
+    let pid = unsafe { fork() };
+    assert!(pid >= 0, "fork failed: {}", errno());
+    if pid == 0 {
+        let code = f();
+        // SAFETY: ending the child.
+        unsafe { _exit(code) }
+    }
+    pid
+}
+
+fn wait_status(pid: i32) -> i32 {
+    let mut status = 0;
+    // SAFETY: a valid out-parameter.
+    assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+    status
+}
+
+fn describe(status: i32) -> String {
+    if status & 0x7f == 0 {
+        format!("exited {}", (status >> 8) & 0xff)
+    } else {
+        format!("killed by {}", status & 0x7f)
+    }
+}
+
+fn gettid() -> i32 {
+    // SAFETY: plain system call.
+    unsafe { syscall(SYS_GETTID) as i32 }
+}
+
+fn tgkill(tid: i32, sig: i32) -> i64 {
+    // SAFETY: plain system call.
+    unsafe { syscall(SYS_TGKILL, getpid() as i64, tid as i64, sig as i64) }
+}
+
+/// A thread that blocks in `read` on a pipe nobody writes, and reports how
+/// the read ended. Returns its tid and the reporting channel.
+fn blocked_reader() -> (i32, std::sync::mpsc::Receiver<String>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut fds = [0; 2];
+        // SAFETY: a 2-element array.
+        unsafe { pipe(fds.as_mut_ptr()) };
+        tid_tx.send(gettid()).unwrap();
+        let mut b = 0u8;
+        // SAFETY: a 1-byte buffer.
+        let r = unsafe { read(fds[0], &mut b, 1) };
+        let e = errno();
+        tx.send(if r < 0 && e == EINTR { "EINTR".into() } else { format!("read {r} errno {e}") })
+            .unwrap();
+    });
+    let tid = tid_rx.recv().unwrap();
+    (tid, rx)
+}
+
+fn main() {
+    let scenario = std::env::args().nth(1).unwrap_or_default();
+    match scenario.as_str() {
+        // The parent kills a child that waits forever.
+        "kill-child" => {
+            let pid = child(|| loop {
+                // SAFETY: plain call.
+                unsafe { pause() };
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: plain call.
+            assert_eq!(unsafe { kill(pid, SIGTERM) }, 0);
+            println!("{}", describe(wait_status(pid)));
+        }
+        // A child signals its parent, which learns the sender.
+        "notify-parent" => {
+            catch(SIGUSR1, 0);
+            block(&[SIGUSR1]);
+            let pid = child(|| {
+                // SAFETY: plain calls.
+                unsafe { kill(getppid(), SIGUSR1) };
+                0
+            });
+            suspend_until_hit();
+            println!("SIGUSR1 from child: {}", LAST_PID.load(Ordering::SeqCst) == pid);
+            println!("{}", describe(wait_status(pid)));
+        }
+        // SIGCHLD reaches a handler, with the exit status.
+        "sigchld" => {
+            catch(SIGCHLD, 0);
+            block(&[SIGCHLD]);
+            let pid = child(|| 3);
+            suspend_until_hit();
+            println!(
+                "SIGCHLD from child: {}, status {}",
+                LAST_PID.load(Ordering::SeqCst) == pid,
+                LAST_STATUS.load(Ordering::SeqCst)
+            );
+            println!("{}", describe(wait_status(pid)));
+        }
+        // A timer interrupts a blocking read; SA_RESTART decides whether the
+        // read resumes or fails with EINTR.
+        "restart" | "no-restart" => {
+            catch(SIGALRM, if scenario == "restart" { SA_RESTART } else { 0 });
+            let mut fds = [0; 2];
+            // SAFETY: a 2-element array.
+            unsafe { pipe(fds.as_mut_ptr()) };
+            let writer = fds[1];
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                // SAFETY: a 1-byte buffer.
+                unsafe { write(writer, b"x".as_ptr(), 1) };
+            });
+            let timer =
+                Itimerval { interval: Timeval { sec: 0, usec: 0 }, value: Timeval { sec: 0, usec: 50_000 } };
+            // SAFETY: a valid itimerval.
+            unsafe { setitimer(0, &timer, std::ptr::null_mut()) };
+            let mut b = 0u8;
+            // SAFETY: a 1-byte buffer.
+            let r = unsafe { read(fds[0], &mut b, 1) };
+            let what = if r < 0 { format!("errno {}", errno()) } else { format!("{r} byte") };
+            println!("read: {what}, handler ran {} time(s)", HITS.load(Ordering::SeqCst));
+        }
+        // pause() returns once a handler has run.
+        "pause" => {
+            catch(SIGALRM, 0);
+            let timer =
+                Itimerval { interval: Timeval { sec: 0, usec: 0 }, value: Timeval { sec: 0, usec: 30_000 } };
+            // SAFETY: a valid itimerval.
+            unsafe { setitimer(0, &timer, std::ptr::null_mut()) };
+            // SAFETY: plain call.
+            let r = unsafe { pause() };
+            println!("pause: {r} errno {}, handler ran: {}", errno(), HITS.load(Ordering::SeqCst) == 1);
+        }
+        // A process-wide signal goes to the thread that does not block it.
+        "thread-mask" => {
+            catch(SIGUSR1, 0);
+            // The main thread blocks it; threads spawned now inherit that.
+            // SAFETY: a valid signal set.
+            unsafe { pthread_sigmask(SIG_BLOCK, &set(&[SIGUSR1]), std::ptr::null_mut()) };
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // SAFETY: a valid signal set.
+                unsafe { pthread_sigmask(SIG_UNBLOCK, &set(&[SIGUSR1]), std::ptr::null_mut()) };
+                tid_tx.send(gettid()).unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let worker = tid_rx.recv().unwrap();
+            // SAFETY: plain calls.
+            unsafe { kill(getpid(), SIGUSR1) };
+            while HITS.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            println!("handled on the unblocked thread: {}", LAST_TID.load(Ordering::SeqCst) == worker);
+        }
+        // tgkill interrupts one thread's blocking call: a relayed signal and
+        // a real-time one (which the host does not have).
+        "tgkill" => {
+            for sig in [SIGUSR2, SIGRT] {
+                catch(sig, 0);
+                let (tid, rx) = blocked_reader();
+                // Resend until the read is interrupted: a signal that lands
+                // before the thread reaches `read` only runs the handler.
+                let mut outcome = String::from("stuck");
+                for _ in 0..50 {
+                    assert_eq!(tgkill(tid, sig), 0);
+                    if let Ok(o) = rx.recv_timeout(Duration::from_millis(100)) {
+                        outcome = o;
+                        break;
+                    }
+                }
+                println!(
+                    "signal {sig}: reader {outcome}, handled on it: {}",
+                    LAST_TID.load(Ordering::SeqCst) == tid
+                );
+            }
+        }
+        // A real-time signal sent to the process itself.
+        "rt-self" => {
+            catch(SIGRT, 0);
+            // SAFETY: plain calls.
+            unsafe { kill(getpid(), SIGRT) };
+            println!("handled: {}, signal {}", HITS.load(Ordering::SeqCst), LAST_SIG.load(Ordering::SeqCst));
+        }
+        // Writing to a pipe with no reader kills the writer by default.
+        "sigpipe" => {
+            let act = SigAction { handler: SIG_DFL, mask: SigSet([0; 16]), flags: 0, restorer: 0 };
+            // SAFETY: a valid sigaction (the Rust runtime ignores SIGPIPE).
+            unsafe { sigaction(SIGPIPE, &act, std::ptr::null_mut()) };
+            let mut fds = [0; 2];
+            // SAFETY: plain calls on a fresh pipe.
+            unsafe {
+                pipe(fds.as_mut_ptr());
+                close(fds[0]);
+                write(fds[1], b"x".as_ptr(), 1);
+            }
+            println!("still alive");
+        }
+        // Dispositions inherited as ignored stay ignored.
+        "inherited" => {
+            for sig in [SIGHUP, SIGINT] {
+                let mut old = SigAction { handler: 99, mask: SigSet([0; 16]), flags: 0, restorer: 0 };
+                // SAFETY: querying into a valid sigaction.
+                unsafe { sigaction(sig, std::ptr::null(), &mut old) };
+                let what = match old.handler {
+                    SIG_IGN => "ignored",
+                    SIG_DFL => "default",
+                    _ => "other",
+                };
+                println!("signal {sig}: {what}");
+            }
+        }
+        // sigtimedwait takes a blocked pending signal, then times out.
+        "sigtimedwait" => {
+            block(&[SIGUSR2]);
+            // SAFETY: plain calls.
+            unsafe { kill(getpid(), SIGUSR2) };
+            let mut info: SigInfo = unsafe { std::mem::zeroed() };
+            let ts = Timespec { sec: 1, nsec: 0 };
+            // SAFETY: valid set, info and timeout.
+            let r = unsafe { sigtimedwait(&set(&[SIGUSR2]), &mut info, &ts) };
+            // SAFETY: plain call.
+            println!("took {r}, code {}", info.code);
+            let ts = Timespec { sec: 0, nsec: 50_000_000 };
+            // SAFETY: as above.
+            let r = unsafe { sigtimedwait(&set(&[SIGUSR2]), &mut info, &ts) };
+            println!("then {r} errno {}", if errno() == EAGAIN { "EAGAIN".into() } else { errno().to_string() });
+        }
+        // std::process::Command spawns with posix_spawn (a vfork-style clone).
+        "spawn" => {
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(exe).arg("spawned").output().unwrap();
+            print!("child said: {}", String::from_utf8_lossy(&out.stdout));
+            println!("child {}", out.status);
+        }
+        // The same with the child sharing this process's stdio.
+        "spawn-status" => {
+            let exe = std::env::current_exe().unwrap();
+            let status = std::process::Command::new(exe).arg("spawned").status().unwrap();
+            println!("child {status}");
+        }
+        "exec-self" => {
+            unsafe extern "C" {
+                fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let mut path = exe.into_os_string().into_encoded_bytes();
+            path.push(0);
+            let argv = [path.as_ptr(), b"spawned\0".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: valid NUL-terminated arrays.
+            unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            println!("execve failed: {}", errno());
+        }
+        "vfork-exec" => {
+            unsafe extern "C" {
+                fn vfork() -> i32;
+                fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let mut path = exe.into_os_string().into_encoded_bytes();
+            path.push(0);
+            let argv = [path.as_ptr(), b"spawned\0".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: the child only execs or exits.
+            let pid = unsafe { vfork() };
+            if pid == 0 {
+                // SAFETY: valid NUL-terminated arrays.
+                unsafe {
+                    execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                    _exit(127)
+                }
+            }
+            println!("{}", describe(wait_status(pid)));
+        }
+        "spawned" => println!("hello from the spawned child"),
+        // fork from a process with another thread running.
+        "threaded-fork" => {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let s = stop.clone();
+            let t = std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !s.load(Ordering::Relaxed) {
+                    n = n.wrapping_add(1);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                n
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            let pid = child(|| {
+                println!("child of a threaded parent");
+                5
+            });
+            println!("{}", describe(wait_status(pid)));
+            stop.store(true, Ordering::Relaxed);
+            t.join().unwrap();
+        }
+        // waitid reports exits and kills as siginfo.
+        "waitid" => {
+            let pid = child(|| 6);
+            let mut info: SigInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out-parameter.
+            assert_eq!(unsafe { waitid(P_PID, pid as u32, &mut info, WEXITED) }, 0);
+            println!(
+                "exited: {}, status {}, pid matches: {}",
+                info.code == CLD_EXITED,
+                info.status,
+                info.pid == pid
+            );
+            let pid = child(|| loop {
+                // SAFETY: plain call.
+                unsafe { pause() };
+            });
+            // SAFETY: plain call.
+            unsafe { kill(pid, SIGKILL) };
+            // SAFETY: a valid out-parameter.
+            assert_eq!(unsafe { waitid(P_PID, pid as u32, &mut info, WEXITED) }, 0);
+            println!("killed: {}, signal {}", info.code == CLD_KILLED, info.status);
+        }
+        // Resource usage comes back in Linux units (maxrss in KiB).
+        "rusage" => {
+            let pid = child(|| {
+                let mut x = 0u64;
+                for i in 0..20_000_000u64 {
+                    x = x.wrapping_mul(31).wrapping_add(i);
+                }
+                (x & 1) as i32
+            });
+            let mut usage: Rusage = unsafe { std::mem::zeroed() };
+            let mut status = 0;
+            // SAFETY: valid out-parameters.
+            assert_eq!(unsafe { wait4(pid, &mut status, 0, &mut usage) }, pid);
+            let cpu = usage.utime.sec * 1_000_000 + usage.utime.usec;
+            println!("child used cpu: {}", cpu > 0);
+            let plausible = |kib: i64| (1_000..10_000_000).contains(&kib);
+            println!("child maxrss plausible: {}", plausible(usage.maxrss));
+            // SAFETY: a valid out-parameter.
+            unsafe { getrusage(0, &mut usage) };
+            println!("own maxrss plausible: {}", plausible(usage.maxrss));
+        }
+        // The fault signals sent rather than raised by an instruction reach
+        // their handlers, and an ignored one is ignored.
+        "raise-faults" => {
+            for sig in [SIGSEGV, SIGFPE, SIGTRAP] {
+                HITS.store(0, Ordering::SeqCst);
+                catch(sig, 0);
+                // SAFETY: plain call.
+                unsafe { raise(sig) };
+                println!("signal {sig}: handled {}", HITS.load(Ordering::SeqCst));
+            }
+            // SAFETY: plain calls.
+            unsafe {
+                signal(SIGTRAP, SIG_IGN);
+                raise(SIGTRAP);
+            }
+            println!("ignored SIGTRAP: still running");
+        }
+        // A real-time signal sent to the process wakes a thread waiting for
+        // it in sigtimedwait.
+        "rt-to-waiter" => {
+            block(&[SIGRT]);
+            let t = std::thread::spawn(|| {
+                // SAFETY: a valid set; no info, no timeout.
+                unsafe { sigtimedwait(&set(&[SIGRT]), std::ptr::null_mut(), std::ptr::null()) }
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: plain calls.
+            unsafe { kill(getpid(), SIGRT) };
+            println!("waiter took {}", t.join().unwrap());
+        }
+        // A signal for a signalfd that the host hands to a thread waiting on
+        // a futex (here the main thread, joining the reader) still reaches
+        // the reader.
+        "signalfd-join" => {
+            block(&[SIGUSR1]);
+            // SAFETY: a valid set.
+            let fd = unsafe { signalfd(-1, &set(&[SIGUSR1]), 0) };
+            let reader = std::thread::spawn(move || {
+                let mut b = [0u8; 128];
+                // SAFETY: a 128-byte buffer.
+                let r = unsafe { read(fd, b.as_mut_ptr(), 128) };
+                (r, b[0])
+            });
+            let pid = child(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                // SAFETY: plain calls.
+                unsafe { kill(getppid(), SIGUSR1) };
+                0
+            });
+            let (r, sig) = reader.join().unwrap();
+            println!("reader got {r} bytes for signal {sig}");
+            wait_status(pid);
+        }
+        // ppoll's mask applies while it waits: the blocked signal wakes it.
+        "ppoll-mask" => {
+            catch(SIGUSR1, 0);
+            block(&[SIGUSR1]);
+            let pid = child(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                // SAFETY: plain calls.
+                unsafe { kill(getppid(), SIGUSR1) };
+                0
+            });
+            // SAFETY: no descriptors, no timeout, an empty mask.
+            let r = unsafe { ppoll(std::ptr::null_mut(), 0, std::ptr::null(), &set(&[])) };
+            println!("ppoll {r} errno {}, handled {}", errno(), HITS.load(Ordering::SeqCst));
+            wait_status(pid);
+        }
+        other => {
+            eprintln!("unknown scenario {other:?}");
+            std::process::exit(2);
+        }
+    }
+}

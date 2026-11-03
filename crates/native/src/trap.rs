@@ -4,10 +4,24 @@
 //! raise `SIGTRAP`; the handler runs on its own signal stack, executes the
 //! Linux system call against the guest's saved registers and returns, which
 //! resumes the guest after the trap with `x0` holding the result.
+//!
+//! Signals for the guest arrive as host signals too (see
+//! `fwe_kernel::signal`): [`on_async`] records each one pending for the
+//! guest, and when it interrupted guest code it delivers it at once by
+//! rewriting the interrupted context, as a Linux kernel would on the way
+//! back to user space. Each guest thread runs under a host signal mask that
+//! mirrors its guest mask, so the host routes a process-wide signal to a
+//! thread that accepts it, and leaves a blocked one pending.
+//!
+//! Every handler here runs with all signals blocked on entry and exit, so
+//! [`IN_GUEST`] reliably tells whether an interrupted context is guest code;
+//! in between it unblocks the guest's mask, so a blocking host call made for
+//! the guest is interrupted (`EINTR`) by a signal the guest takes.
 
 use crate::rewrite::TRAP;
 use crate::{KERNEL, NativePlatform, X18Abi};
-use fwe_kernel::{Kernel, Regs};
+use fwe_kernel::{FpRegs, Kernel, Regs, host, thread};
+use std::cell::Cell;
 use std::sync::MutexGuard;
 
 /// `__darwin_arm_thread_state64`.
@@ -78,10 +92,49 @@ unsafe fn insn(addr: u64) -> Option<u32> {
     (addr % 4 == 0).then(|| unsafe { (addr as *const u32).read() })
 }
 
-/// Leaves the custom x18 ABI for the duration of a handler, so host code may
-/// call macOS libraries, and re-enters it on drop. The guest's x18 is part of
-/// the saved signal context and is restored when the handler returns.
-struct HostCode(Option<X18Abi>);
+thread_local! {
+    /// Whether this thread is executing guest code (as opposed to fwe's own
+    /// code, including the handlers here).
+    static IN_GUEST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Block every signal the guest can receive on this thread.
+fn block_async_signals() {
+    let mut all = host::host_sigset(u64::MAX);
+    // SAFETY: `all` is an initialized signal set.
+    unsafe {
+        libc::sigaddset(&mut all, host::WAKE_SIGNAL);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+    }
+}
+
+/// Run under the host mask that mirrors this thread's guest mask.
+fn apply_guest_mask() {
+    let mask = host::host_mask_for(thread::mask());
+    // SAFETY: `mask` is an initialized signal set.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) };
+}
+
+/// Make the guest's current mask the one the host restores when the handler
+/// owning `ctx` returns to guest code.
+///
+/// # Safety
+/// `ctx` is the ucontext passed to the running handler.
+unsafe fn return_with_guest_mask(ctx: *mut libc::c_void) {
+    let mask = host::host_mask_for(thread::mask());
+    // SAFETY: guaranteed by the caller; macOS's sigset_t is a u32.
+    unsafe { (*(ctx as *mut Ucontext)).uc_sigmask = mask };
+}
+
+/// Fwe's own code is running on this thread for the life of the value: it
+/// leaves the custom x18 ABI, so host code may call macOS libraries, and
+/// unblocks the guest's signals so a blocking host call is interruptible. On
+/// drop it blocks signals again and restores both. The guest's x18 is part
+/// of the saved signal context and is restored when the handler returns.
+struct HostCode {
+    abi: Option<X18Abi>,
+    was_in_guest: bool,
+}
 
 impl HostCode {
     fn enter() -> HostCode {
@@ -89,16 +142,32 @@ impl HostCode {
         if let Some(abi) = abi {
             abi.set_enabled(false);
         }
-        HostCode(abi)
+        let was_in_guest = IN_GUEST.with(|g| g.replace(false));
+        apply_guest_mask();
+        HostCode { abi, was_in_guest }
     }
 }
 
 impl Drop for HostCode {
     fn drop(&mut self) {
-        if let Some(abi) = self.0 {
+        block_async_signals();
+        IN_GUEST.with(|g| g.set(self.was_in_guest));
+        if let Some(abi) = self.abi {
             abi.set_enabled(true);
         }
     }
+}
+
+/// Prepare this thread to jump into guest code (a new program, a forked
+/// child, a new thread): it runs guest code from here, under its guest
+/// mask.
+pub fn prepare_guest_entry() {
+    block_async_signals();
+    IN_GUEST.with(|g| g.set(true));
+    if let Some(abi) = X18Abi::get() {
+        abi.set_enabled(true);
+    }
+    apply_guest_mask();
 }
 
 /// The TSD key of the guest `x18` slot (see [`crate::x18_slot`]).
@@ -121,17 +190,20 @@ pub fn set_guest_x18(value: u64) {
 }
 
 /// Read the backend thread state into the kernel's register view.
-fn regs_from(ss: &ThreadState) -> Regs {
+fn regs_from(mc: &Mcontext) -> Regs {
+    let ss = &mc.ss;
     let mut regs = Regs { sp: ss.sp, pc: ss.pc, pstate: ss.cpsr as u64, ..Regs::default() };
     regs.x[..29].copy_from_slice(&ss.x);
     regs.x[18] = guest_x18();
     regs.x[29] = ss.fp;
     regs.x[30] = ss.lr;
+    regs.fp = FpRegs { v: mc.ns.v, fpsr: mc.ns.fpsr, fpcr: mc.ns.fpcr };
     regs
 }
 
 /// Write the kernel's register view back into the backend thread state.
-fn regs_to(ss: &mut ThreadState, regs: &Regs) {
+fn regs_to(mc: &mut Mcontext, regs: &Regs) {
+    let ss = &mut mc.ss;
     ss.x.copy_from_slice(&regs.x[..29]);
     set_guest_x18(regs.x[18]);
     ss.fp = regs.x[29];
@@ -139,20 +211,67 @@ fn regs_to(ss: &mut ThreadState, regs: &Regs) {
     ss.sp = regs.sp;
     ss.pc = regs.pc;
     ss.cpsr = regs.pstate as u32;
+    mc.ns.v = regs.fp.v;
+    mc.ns.fpsr = regs.fp.fpsr;
+    mc.ns.fpcr = regs.fp.fpcr;
 }
 
-extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+/// Whether `word` is a `brk` instruction (any immediate).
+fn is_brk(word: u32) -> bool {
+    word & 0xffe0_001f == 0xd420_0000
+}
+
+/// Deliver what became pending while a handler ran, just before it returns
+/// to guest code. A signal can arrive after the handler's own delivery and
+/// before it blocks signals to return; recorded but not delivered, it would
+/// otherwise wait for the thread's next system call.
+fn settle(regs: &mut Regs) {
+    block_async_signals();
+    if thread::deliverable() != 0 {
+        if let Some(k) = kernel().as_mut() {
+            k.deliver_pending(regs);
+        }
+    }
+}
+
+extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let in_guest = IN_GUEST.with(Cell::get);
+    // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+    let pc = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).ss.pc };
+    // macOS's siginfo does not tell a trap from a sent SIGTRAP (both have
+    // code 0), so look at the instruction: anything but a `brk` means the
+    // signal was sent by another process, a signal for the guest.
+    // SAFETY: the thread was executing at `pc`, so it is mapped.
+    if !unsafe { insn(pc) }.is_some_and(is_brk) {
+        take_async(sig, info, ctx, in_guest);
+        return;
+    }
     let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
-    let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+    let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // The saved pc is the trapping instruction for `brk`.
     // SAFETY: the guest was executing at `pc`, so it is mapped.
-    if unsafe { insn(ss.pc) } != Some(TRAP) {
-        // Not one of our system call traps: let it take its default action.
+    if unsafe { insn(mc.ss.pc) } != Some(TRAP) {
+        // Not one of our system call traps: a guest `brk` is a SIGTRAP for
+        // the guest; one in fwe's own code is fatal.
+        if in_guest {
+            let mut regs = regs_from(mc);
+            let addr = mc.ss.pc;
+            let delivered = kernel()
+                .as_mut()
+                .is_some_and(|k| k.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr));
+            if delivered {
+                settle(&mut regs);
+                regs_to(mc, &regs);
+                // SAFETY: `ctx` is this handler's ucontext.
+                unsafe { return_with_guest_mask(ctx) };
+                return;
+            }
+        }
         restore_default(libc::SIGTRAP);
         return;
     }
-    let mut regs = regs_from(ss);
+    let mut regs = regs_from(mc);
     if kernel().is_none() {
         report("fwe: system call before the kernel was initialized\n");
         // SAFETY: terminating the process.
@@ -174,9 +293,16 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     if nr == fwe_abi::nr::EXECVE {
         // On success this enters the new program and never returns; on
         // failure it reports an errno the guest can handle.
-        let r = crate::process::do_execve(&regs);
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
-        regs_to(ss, &regs);
+        match crate::process::do_execve(&regs) {
+            // Return from the handler into the new program, which also
+            // leaves the signal stack and restores the guest's mask.
+            Ok(new) => regs = new,
+            Err(r) => kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r),
+        }
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
         return;
     }
     if nr == fwe_abi::nr::CLONE {
@@ -186,6 +312,25 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
         // wait4 blocks; run it without the kernel lock.
         let r = crate::process::do_wait4(&regs);
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else if nr == fwe_abi::nr::WAITID {
+        let r = crate::process::do_waitid(&regs);
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else if nr == fwe_abi::nr::RT_SIGTIMEDWAIT {
+        // The awaited signals are caught on the host while the call waits,
+        // without the kernel lock.
+        let want = if args[0] == 0 {
+            0
+        } else {
+            // SAFETY: the guest passed a pointer to a signal set.
+            unsafe { (args[0] as *const u64).read_unaligned() }
+        };
+        kernel().as_mut().unwrap().catch_for_wait(want);
+        // SAFETY: guest pointers in `args` reference guest memory.
+        let r = unsafe { fwe_kernel::signal::sigtimedwait(args[0], args[1], args[2], args[3]) };
+        let mut guard = kernel();
+        let k = guard.as_mut().unwrap();
+        k.end_wait(want);
+        k.finish_syscall(&mut regs, nr, &args, r);
     } else if let Some(r) = {
         // SAFETY: guest pointers in `args` reference guest memory.
         unsafe { fwe_kernel::blocking_syscall(nr, args) }
@@ -194,7 +339,91 @@ extern "C" fn on_sigtrap(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *m
     } else {
         kernel().as_mut().unwrap().enter_syscall(&mut regs);
     }
-    regs_to(ss, &regs);
+    settle(&mut regs);
+    regs_to(mc, &regs);
+    // SAFETY: `ctx` is this handler's ucontext.
+    unsafe { return_with_guest_mask(ctx) };
+}
+
+/// The host handler for every signal the guest catches (and for the wake
+/// signal). It records the signal pending against this thread; if it
+/// interrupted guest code, it delivers it now, as Linux does on the way back
+/// to user space. Otherwise fwe was running a system call for this thread,
+/// and the signal is delivered when that call returns — a blocking call was
+/// interrupted by it.
+extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    take_async(sig, info, ctx, IN_GUEST.with(Cell::get));
+}
+
+/// The body of [`on_async`], also used for a fault signal that was sent
+/// rather than raised by an instruction.
+fn take_async(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+    in_guest: bool,
+) {
+    let _host = HostCode::enter();
+    if sig != host::WAKE_SIGNAL {
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        let (code, pid, uid, status) =
+            unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+        let lsig = host::signal_to_linux(sig);
+        let code = host::si_code_to_linux(code);
+        let status = if lsig == fwe_abi::signal::SIGCHLD
+            && matches!(
+                code,
+                fwe_abi::wait::CLD_KILLED | fwe_abi::wait::CLD_DUMPED | fwe_abi::wait::CLD_STOPPED
+            ) {
+            host::signal_to_linux(status) as i32
+        } else {
+            status
+        };
+        thread::post_self(lsig, thread::SigInfo { code, pid, uid, status });
+    }
+    if !in_guest {
+        return;
+    }
+    // Guest code holds none of fwe's locks, so taking the kernel lock here
+    // cannot deadlock against this thread.
+    let mut guard = kernel();
+    let Some(k) = guard.as_mut() else { return };
+    // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+    let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+    let mut regs = regs_from(mc);
+    k.deliver_pending(&mut regs);
+    drop(guard);
+    settle(&mut regs);
+    regs_to(mc, &regs);
+    // SAFETY: `ctx` is this handler's ucontext.
+    unsafe { return_with_guest_mask(ctx) };
+}
+
+/// Set the host disposition of relayed Linux signal `sig`.
+pub fn set_host_signal(sig: u64, how: fwe_kernel::HostSignal) {
+    let Some(h) = host::signal_to_host(sig) else { return };
+    // SAFETY: installing a fully initialized sigaction.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        libc::sigfillset(&mut sa.sa_mask);
+        match how {
+            fwe_kernel::HostSignal::Default => sa.sa_sigaction = libc::SIG_DFL,
+            fwe_kernel::HostSignal::Ignore => sa.sa_sigaction = libc::SIG_IGN,
+            fwe_kernel::HostSignal::Catch { flags } => {
+                sa.sa_sigaction = on_async as *const () as usize;
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                if sig == fwe_abi::signal::SIGCHLD {
+                    if flags & fwe_abi::signal::SA_NOCLDSTOP != 0 {
+                        sa.sa_flags |= libc::SA_NOCLDSTOP;
+                    }
+                    if flags & fwe_abi::signal::SA_NOCLDWAIT != 0 {
+                        sa.sa_flags |= libc::SA_NOCLDWAIT;
+                    }
+                }
+            }
+        }
+        libc::sigaction(h, &sa, std::ptr::null_mut());
+    }
 }
 
 /// The Linux signal number for a host synchronous fault.
@@ -211,6 +440,14 @@ fn fault_signal(host: libc::c_int) -> u64 {
 }
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    // A process that sends itself one of these signals has it emulated (see
+    // `Kernel::sys_kill`), so here it is a fault, or the rare signal sent by
+    // another process, which macOS's siginfo does not tell apart.
+    if !IN_GUEST.with(Cell::get) {
+        // In fwe's own code (the kernel lock may be held): fatal.
+        restore_default(sig);
+        return;
+    }
     let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
@@ -218,11 +455,14 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     let addr = unsafe { (*info).si_addr() } as u64;
 
     // Offer the fault to a guest handler; if one is installed, enter it.
-    let mut regs = regs_from(&mc.ss);
+    let mut regs = regs_from(mc);
     let delivered =
         kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, fault_signal(sig), addr));
     if delivered {
-        regs_to(&mut mc.ss, &regs);
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
         return;
     }
 
@@ -321,12 +561,13 @@ fn install(
     sig: libc::c_int,
     handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
 ) {
-    // SAFETY: installing a handler with a fully initialized sigaction.
+    // SAFETY: installing a handler with a fully initialized sigaction. All
+    // signals are blocked while it starts (see the module comment).
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler as usize;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigfillset(&mut sa.sa_mask);
         if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
             panic!("sigaction({sig}) failed: {}", std::io::Error::last_os_error());
         }
@@ -336,17 +577,17 @@ fn install(
 /// Give this host thread its own signal stack. Signal dispositions are
 /// process-wide, but the alternate stack is per thread, so every thread that
 /// runs guest code needs one before it can trap.
-/// Unblock all host signals on the calling thread. Needed whenever guest
-/// execution begins or resumes from a context where a signal is still blocked
-/// — e.g. entering a new program (`execve`) or a forked child from inside the
-/// trap handler, where the handled SIGTRAP is masked — so the guest's own
-/// traps and faults are delivered.
-pub fn unblock_all_signals() {
-    // SAFETY: resetting this thread's signal mask to empty.
-    unsafe {
-        let mut empty: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut empty);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+/// Give the calling thread a signal stack if it has none. A forked child's
+/// thread does not inherit the parent thread's: without one, its handlers
+/// would run on the guest stack, which `execve` unmaps.
+pub fn ensure_thread_altstack() {
+    // SAFETY: querying this thread's signal stack into a zeroed stack_t.
+    let disabled = unsafe {
+        let mut old: libc::stack_t = std::mem::zeroed();
+        libc::sigaltstack(std::ptr::null(), &mut old) == 0 && old.ss_flags & libc::SS_DISABLE != 0
+    };
+    if disabled {
+        install_thread_altstack();
     }
 }
 
@@ -373,9 +614,10 @@ pub fn install_thread_altstack() {
 pub fn install_handlers() {
     install_thread_altstack();
     install(libc::SIGTRAP, on_sigtrap);
-    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
+    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
         install(sig, on_fault);
     }
+    install(host::WAKE_SIGNAL, on_async);
 }
 
 /// Enter the guest with a full register state (used for a cloned thread).

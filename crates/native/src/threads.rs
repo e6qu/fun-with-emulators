@@ -2,7 +2,8 @@
 //!
 //! A guest thread is a host thread that runs guest code directly. The child
 //! shares the whole address space and the single global kernel; the kernel's
-//! per-thread state (tid, `set_tid_address` word) lives in host thread-locals.
+//! per-thread state (tid, `set_tid_address` word, signal mask and pending
+//! signals) lives in host thread-locals.
 
 use crate::{LIVE_THREADS, thread_pointer_slot, trap};
 use fwe_abi::{clone as cl, err, errno};
@@ -17,6 +18,10 @@ struct Spawn {
     tls: Option<u64>,
     /// `set_tid_address` word (`CLONE_CHILD_CLEARTID`), or 0.
     clear_child_tid: u64,
+    /// The creating thread's blocked mask, which the new thread inherits.
+    sigmask: u64,
+    /// The thread's pending signals, registered before it starts.
+    pending: std::sync::Arc<thread::Pending>,
 }
 
 /// Flags fwe supports for `clone`: the thread-creation set used by pthreads.
@@ -41,13 +46,16 @@ pub fn do_clone(parent: &Regs) -> i64 {
     let tls = parent.x[3];
     let child_tid = parent.x[4];
 
-    // A clone without CLONE_THREAD is a new process (fork); CLONE_VM without
-    // CLONE_THREAD (vfork-style sharing) is not supported.
+    // A clone without CLONE_THREAD is a new process (fork). CLONE_VM without
+    // CLONE_THREAD shares the address space with a new process; only the
+    // vfork form, where the parent waits for the child to exec or exit, is
+    // supported (as a fork).
     if flags & cl::CLONE_THREAD == 0 {
-        if flags & cl::CLONE_VM != 0 {
+        let vfork = flags & cl::CLONE_VFORK != 0;
+        if flags & cl::CLONE_VM != 0 && !vfork {
             return err(errno::ENOSYS);
         }
-        return crate::process::do_fork(parent);
+        return crate::process::do_fork(parent, vfork);
     }
     if flags & cl::CLONE_VM == 0 {
         return err(errno::ENOSYS);
@@ -80,19 +88,27 @@ pub fn do_clone(parent: &Regs) -> i64 {
         tid,
         tls: (flags & cl::CLONE_SETTLS != 0).then_some(tls),
         clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
+        sigmask: thread::mask(),
+        pending: thread::register(tid),
     });
+    let pending = spawn.pending.clone();
 
     LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
-    if spawn_host_thread(spawn) {
-        tid as i64
-    } else {
-        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
-        err(errno::EAGAIN)
+    match spawn_host_thread(spawn) {
+        Some(handle) => {
+            thread::set_host_thread(&pending, handle);
+            tid as i64
+        }
+        None => {
+            LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+            thread::unregister(&pending);
+            err(errno::EAGAIN)
+        }
     }
 }
 
 /// Create a detached host thread that becomes the guest thread.
-fn spawn_host_thread(spawn: Box<Spawn>) -> bool {
+fn spawn_host_thread(spawn: Box<Spawn>) -> Option<libc::pthread_t> {
     let arg = Box::into_raw(spawn).cast::<libc::c_void>();
     // SAFETY: a detached pthread with the default stack; `child_main` takes
     // ownership of the boxed `Spawn` passed as its argument.
@@ -106,23 +122,20 @@ fn spawn_host_thread(spawn: Box<Spawn>) -> bool {
         if r != 0 {
             // Reclaim the box the thread never received.
             drop(Box::from_raw(arg.cast::<Spawn>()));
-            return false;
+            return None;
         }
+        Some(handle)
     }
-    true
 }
 
 extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     // SAFETY: `arg` is the `Spawn` box handed to `pthread_create`.
     let spawn = unsafe { Box::from_raw(arg.cast::<Spawn>()) };
 
-    // The child is spawned from inside the clone SIGTRAP handler, where
-    // SIGTRAP is blocked, and pthread_create inherits that mask. Unblock all
-    // signals so this thread's own guest traps and faults are delivered; the
-    // guest's own signal mask is tracked separately in the kernel.
-    trap::unblock_all_signals();
     trap::install_thread_altstack();
     thread::set_tid(spawn.tid);
+    thread::adopt(&spawn.pending);
+    thread::set_mask(spawn.sigmask);
     thread::set_clear_child_tid(spawn.clear_child_tid);
     if let Some(tls) = spawn.tls {
         set_thread_pointer(tls);
@@ -130,13 +143,13 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     // The guest's x18 lives in a per-thread slot; the child inherits the
     // parent's value as it would any other register.
     trap::set_guest_x18(spawn.regs.x[18]);
-    if let Some(abi) = crate::X18Abi::get() {
-        // This thread now runs guest code and may use x18 freely.
-        abi.set_enabled(true);
-    }
 
     let regs = spawn.regs;
     drop(spawn);
+    // The child is spawned from inside the clone SIGTRAP handler, where
+    // SIGTRAP is blocked, and pthread_create inherits that mask: switch to
+    // the guest mask (and the x18 ABI) for guest code.
+    trap::prepare_guest_entry();
     // SAFETY: `regs` describes a runnable guest context on the child stack.
     unsafe { trap::enter_guest_full(&regs) }
 }
