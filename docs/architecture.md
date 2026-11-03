@@ -612,7 +612,8 @@ those items.
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a signal left pending
   while blocked loses its sender on macOS, so `rt_sigtimedwait` then
-  reports `si_pid` 0; `rt_sigqueueinfo` is not implemented; a signal that
+  reports `si_pid` 0 (except `SIGCHLD`, whose child fwe looks up with a
+  `waitid` that does not reap it); `rt_sigqueueinfo` is not implemented; a signal that
   arrives between a blocking call's start and its host wait can be noticed
   only when the call ends, except for `rt_sigsuspend`, `rt_sigtimedwait`
   and the masked waits, which close that window; a futex wait notices a

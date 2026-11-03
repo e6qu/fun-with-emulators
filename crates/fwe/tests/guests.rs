@@ -1087,10 +1087,17 @@ fn signal_from_child_reaches_parent_handler() {
 }
 
 /// A child's exit raises `SIGCHLD` in the parent, carrying the child's pid
-/// and exit status.
+/// and exit status — also when the signal waited blocked until after the
+/// child was gone, which macOS reports with an empty `siginfo`.
 #[test]
 fn sigchld_reaches_handler_with_status() {
-    assert_eq!(signals("sigchld"), "SIGCHLD from child: true, status 3\nexited 3\n");
+    for scenario in ["sigchld", "sigchld-late"] {
+        assert_eq!(
+            signals(scenario),
+            "SIGCHLD from child: true, status 3\nexited 3\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// A timer signal interrupts a blocking `read`: with `SA_RESTART` the read

@@ -264,10 +264,15 @@ fn main() {
             println!("{}", describe(wait_status(pid)));
         }
         // SIGCHLD reaches a handler, with the exit status.
-        "sigchld" => {
+        // `sigchld-late`: the child has exited, and its SIGCHLD waited
+        // blocked, before the parent waits for it.
+        "sigchld" | "sigchld-late" => {
             catch(SIGCHLD, 0);
             block(&[SIGCHLD]);
             let pid = child(|| 3);
+            if scenario == "sigchld-late" {
+                std::thread::sleep(Duration::from_millis(300));
+            }
             suspend_until_hit();
             println!(
                 "SIGCHLD from child: {}, status {}",

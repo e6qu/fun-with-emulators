@@ -382,25 +382,8 @@ fn take_async(
     let _host = HostCode::enter();
     if sig != host::WAKE_SIGNAL {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        let (code, pid, uid, status) = unsafe {
-            (
-                (*info).si_code,
-                (*info).si_pid(),
-                host::uid_to_linux((*info).si_uid()),
-                (*info).si_status(),
-            )
-        };
+        let (code, pid, uid, status) = unsafe { host::signal_info(sig, info) };
         let lsig = host::signal_to_linux(sig);
-        let code = host::si_code_to_linux(code);
-        let status = if lsig == fwe_abi::signal::SIGCHLD
-            && matches!(
-                code,
-                fwe_abi::wait::CLD_KILLED | fwe_abi::wait::CLD_DUMPED | fwe_abi::wait::CLD_STOPPED
-            ) {
-            host::signal_to_linux(status) as i32
-        } else {
-            status
-        };
         thread::post_self(lsig, thread::SigInfo { code, pid, uid, status });
     }
     if !in_guest {
