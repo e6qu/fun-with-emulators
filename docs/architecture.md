@@ -50,8 +50,18 @@ the unit tests on Linux as well as macOS. The native backend, and so the
 Guest addresses are host addresses. The native backend maps guest memory at
 the guest's own virtual addresses inside the `fwe` process, so guest pointers
 are used directly and, where layouts match, handed straight to macOS system
-calls, which validate them. The hypervisor backend keeps this property by
-mapping the VM's memory at the same addresses in the host process.
+calls, which validate them.
+
+Whatever the kernel layer reads or writes of guest memory itself goes
+through `crates/kernel/src/uaccess.rs`: typed reads and writes, strings and
+string arrays, raw byte ranges. The copies run in a small assembly routine;
+when one of its accesses faults, the backend's fault handler resumes it at a
+recovery point (the scheme Linux's exception tables use), and the system
+call fails with `EFAULT` instead of crashing fwe. A pointer handed straight
+to a host system call is checked by the host. A few macOS C library
+functions do their work in user space (`clock_gettime`, `gettimeofday`,
+`nanosleep`), so those results go through fwe's memory and the checked
+copies too.
 
 The guest sees the host page size (16 KiB on Apple Silicon) through
 `AT_PAGESZ`, which the arm64 Linux ABI permits.
@@ -472,9 +482,7 @@ those items.
   `/proc/self/fd` entry for a pipe or socket shares the original's file
   description rather than getting a new one.
 - **Memory:** `MADV_DONTNEED` on a private file mapping keeps modified pages
-  where Linux would restore the file's. Guest pointers the kernel reads
-  itself are not fault-checked; a bad pointer crashes `fwe` instead of
-  returning `EFAULT`.
+  where Linux would restore the file's.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a signal left pending

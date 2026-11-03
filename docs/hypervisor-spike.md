@@ -44,10 +44,14 @@ adds over the spike:
   own `svc #0` traps to the VMM as is; no instruction rewriting is needed on
   this path (and `x18`/`TPIDR_EL0` are the guest's, since no macOS code runs
   on the vCPU).
-- Guest memory is mapped so that **guest addresses equal host addresses**,
-  as the native backend guarantees: the VM's RAM is the same host mapping
-  the kernel layer reads and writes, so guest pointers stay usable directly
-  and the kernel is shared unchanged.
+- Guest memory is backed by host mappings the kernel layer reads and
+  writes. Addresses above 4 GiB can be the same in the guest and the host,
+  as the native backend guarantees, but the low range the image needs is
+  exactly what the host process cannot map (the mandatory `__PAGEZERO`), so
+  guest pointers into it are translated to where the host maps it: in the
+  kernel's guest-memory accessors (`crates/kernel/src/uaccess.rs`, the one
+  place it touches guest memory) and for the pointers it passes to host
+  system calls.
 - A `Platform` implementation and a trap loop that feed `Kernel::enter_syscall`
   with the vCPU's register file, the way the native backend's `SIGTRAP`
   handler does.

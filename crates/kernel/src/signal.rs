@@ -15,7 +15,7 @@
 //! SIMD state (an `fpsimd_context` record), as on Linux.
 
 use crate::thread::{self, SigInfo};
-use crate::{HostSignal, Kernel, Platform, Regs, host};
+use crate::{HostSignal, Kernel, Platform, Regs, guest, host, uaccess};
 use fwe_abi::{Sigaction, Stack, err, errno, signal};
 
 // Offsets within `struct rt_sigframe` on arm64 (`siginfo` then `ucontext`).
@@ -61,23 +61,39 @@ const fn bit(sig: u64) -> u64 {
     1 << (sig - 1)
 }
 
-/// Guest addresses are host addresses; callers pass addresses inside the
-/// guest stack frame they are building or reading.
-unsafe fn poke(addr: u64, val: u64) {
-    // SAFETY: the caller guarantees `addr` is a writable guest address.
-    unsafe { (addr as *mut u64).write_unaligned(val) }
+/// A signal frame (or `siginfo`) assembled or parsed in fwe's memory and
+/// copied to or from the guest in one checked access.
+struct Buf(Vec<u8>);
+
+impl Buf {
+    fn zeroed(len: u64) -> Buf {
+        Buf(vec![0; len as usize])
+    }
+    fn put(&mut self, off: u64, val: u64) {
+        self.0[off as usize..off as usize + 8].copy_from_slice(&val.to_ne_bytes());
+    }
+    fn put32(&mut self, off: u64, val: i32) {
+        self.0[off as usize..off as usize + 4].copy_from_slice(&val.to_ne_bytes());
+    }
+    fn get(&self, off: u64) -> u64 {
+        u64::from_ne_bytes(self.0[off as usize..off as usize + 8].try_into().unwrap())
+    }
+    fn get32(&self, off: u64) -> u32 {
+        u32::from_ne_bytes(self.0[off as usize..off as usize + 4].try_into().unwrap())
+    }
 }
-unsafe fn poke32(addr: u64, val: i32) {
-    // SAFETY: the caller guarantees `addr` is a writable guest address.
-    unsafe { (addr as *mut i32).write_unaligned(val) }
-}
-unsafe fn peek(addr: u64) -> u64 {
-    // SAFETY: the caller guarantees `addr` is a readable guest address.
-    unsafe { (addr as *const u64).read_unaligned() }
-}
-unsafe fn peek32(addr: u64) -> u32 {
-    // SAFETY: the caller guarantees `addr` is a readable guest address.
-    unsafe { (addr as *const u32).read_unaligned() }
+
+/// The `siginfo` fields fwe fills in, at offset 0 of `buf`.
+fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
+    buf.put32(0, sig as i32); // si_signo
+    buf.put32(8, info.code); // si_code
+    if fault_addr != 0 {
+        buf.put(SI_ADDR_OFF, fault_addr);
+    } else {
+        buf.put32(SI_PID_OFF, info.pid);
+        buf.put32(SI_UID_OFF, info.uid as i32);
+        buf.put32(SI_STATUS_OFF, info.status);
+    }
 }
 
 fn align_down(x: u64, a: u64) -> u64 {
@@ -245,8 +261,9 @@ impl<P: Platform> Kernel<P> {
                     if self.deliver_to_handler(regs, sig, info, 0) {
                         break;
                     }
-                    // No room for a frame: the signal is fatal.
-                    self.terminate_by(sig);
+                    // No room for a frame, or a stack that cannot take one:
+                    // Linux kills the process with SIGSEGV.
+                    self.terminate_by(signal::SIGSEGV);
                 }
             }
         }
@@ -300,45 +317,40 @@ impl<P: Platform> Kernel<P> {
         // An `rt_sigsuspend` in progress: the frame restores the mask from
         // before the call, and the handler runs with the call's mask.
         let mask = thread::mask();
-        let old_mask = thread::take_saved_mask().unwrap_or(mask);
-        // SAFETY: `frame` is a writable region on the guest stack.
-        unsafe {
-            // zero the whole frame, then fill the fields we define.
-            std::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE as usize);
-            // siginfo
-            poke32(frame, sig as i32); // si_signo
-            poke32(frame + 8, info.code); // si_code
-            if fault_addr != 0 {
-                poke(frame + SI_ADDR_OFF, fault_addr);
-            } else {
-                poke32(frame + SI_PID_OFF, info.pid);
-                poke32(frame + SI_UID_OFF, info.uid as i32);
-                poke32(frame + SI_STATUS_OFF, info.status);
+        let old_mask_restore = thread::take_saved_mask();
+        let old_mask = old_mask_restore.unwrap_or(mask);
+        let mut f = Buf::zeroed(FRAME_SIZE);
+        put_siginfo(&mut f, sig, info, fault_addr);
+        // ucontext
+        f.put(UC_STACK_OFF, altstack.ss_sp);
+        f.put32(UC_STACK_OFF + 8, altstack.ss_flags);
+        f.put(UC_STACK_OFF + 16, altstack.ss_size);
+        f.put(UC_SIGMASK_OFF, old_mask);
+        // sigcontext
+        f.put(UC_MCONTEXT_OFF, fault_addr); // fault_address
+        for (i, &v) in regs.x.iter().enumerate() {
+            f.put(MC_REGS_OFF + i as u64 * 8, v);
+        }
+        f.put(MC_SP_OFF, regs.sp);
+        f.put(MC_PC_OFF, regs.pc);
+        f.put(MC_PSTATE_OFF, regs.pstate);
+        // The FP/SIMD record, then the zero terminator (already zeroed).
+        let fp = MC_RESERVED_OFF;
+        f.put32(fp, signal::FPSIMD_MAGIC as i32);
+        f.put32(fp + 4, signal::FPSIMD_CONTEXT_SIZE as i32);
+        f.put32(fp + FPSIMD_FPSR_OFF, regs.fp.fpsr as i32);
+        f.put32(fp + FPSIMD_FPCR_OFF, regs.fp.fpcr as i32);
+        for (i, v) in regs.fp.v.iter().enumerate() {
+            let at = fp + FPSIMD_VREGS_OFF + i as u64 * 16;
+            f.put(at, *v as u64);
+            f.put(at + 8, (*v >> 64) as u64);
+        }
+        if uaccess::write_from(frame, &f.0).is_err() {
+            // The stack is not writable: Linux kills the process.
+            if let Some(mask) = old_mask_restore {
+                thread::save_mask(mask);
             }
-            // ucontext
-            poke(frame + UC_STACK_OFF, altstack.ss_sp);
-            poke32(frame + UC_STACK_OFF + 8, altstack.ss_flags);
-            poke(frame + UC_STACK_OFF + 16, altstack.ss_size);
-            poke(frame + UC_SIGMASK_OFF, old_mask);
-            // sigcontext
-            poke(frame + UC_MCONTEXT_OFF, fault_addr); // fault_address
-            for (i, &v) in regs.x.iter().enumerate() {
-                poke(frame + MC_REGS_OFF + i as u64 * 8, v);
-            }
-            poke(frame + MC_SP_OFF, regs.sp);
-            poke(frame + MC_PC_OFF, regs.pc);
-            poke(frame + MC_PSTATE_OFF, regs.pstate);
-            // The FP/SIMD record, then the zero terminator (already zeroed).
-            let fp = frame + MC_RESERVED_OFF;
-            poke32(fp, signal::FPSIMD_MAGIC as i32);
-            poke32(fp + 4, signal::FPSIMD_CONTEXT_SIZE as i32);
-            poke32(fp + FPSIMD_FPSR_OFF, regs.fp.fpsr as i32);
-            poke32(fp + FPSIMD_FPCR_OFF, regs.fp.fpcr as i32);
-            for (i, v) in regs.fp.v.iter().enumerate() {
-                let at = fp + FPSIMD_VREGS_OFF + i as u64 * 16;
-                poke(at, *v as u64);
-                poke(at + 8, (*v >> 64) as u64);
-            }
+            return false;
         }
 
         // Mask this and the handler's extra signals while it runs.
@@ -377,32 +389,33 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Restore `regs` from the signal frame at `regs.sp` (the `rt_sigreturn`
-    /// system call).
-    pub(crate) fn sys_rt_sigreturn(&mut self, regs: &mut Regs) {
-        let frame = regs.sp;
-        // SAFETY: the guest's sp points at the frame we built for the handler.
-        unsafe {
-            for i in 0..31 {
-                regs.x[i] = peek(frame + MC_REGS_OFF + i as u64 * 8);
-            }
-            regs.sp = peek(frame + MC_SP_OFF);
-            regs.pc = peek(frame + MC_PC_OFF);
-            regs.pstate = peek(frame + MC_PSTATE_OFF);
-            let fp = frame + MC_RESERVED_OFF;
-            if peek32(fp) == signal::FPSIMD_MAGIC {
-                regs.fp.fpsr = peek32(fp + FPSIMD_FPSR_OFF);
-                regs.fp.fpcr = peek32(fp + FPSIMD_FPCR_OFF);
-                for (i, v) in regs.fp.v.iter_mut().enumerate() {
-                    let at = fp + FPSIMD_VREGS_OFF + i as u64 * 16;
-                    *v = peek(at) as u128 | (peek(at + 8) as u128) << 64;
-                }
-            }
-            thread::set_mask(peek(frame + UC_SIGMASK_OFF));
-            let ss_sp = peek(frame + UC_STACK_OFF);
-            let ss_flags = peek(frame + UC_STACK_OFF + 8) as i32;
-            let ss_size = peek(frame + UC_STACK_OFF + 16);
-            thread::set_altstack(Stack { ss_sp, ss_flags, _pad: 0, ss_size });
+    /// system call). False if the frame is not readable.
+    pub(crate) fn sys_rt_sigreturn(&mut self, regs: &mut Regs) -> bool {
+        let Ok(bytes) = uaccess::read_bytes(regs.sp, (MC_RESERVED_OFF + 528) as usize) else {
+            return false;
+        };
+        let f = Buf(bytes);
+        for i in 0..31 {
+            regs.x[i] = f.get(MC_REGS_OFF + i as u64 * 8);
         }
+        regs.sp = f.get(MC_SP_OFF);
+        regs.pc = f.get(MC_PC_OFF);
+        regs.pstate = f.get(MC_PSTATE_OFF);
+        let fp = MC_RESERVED_OFF;
+        if f.get32(fp) == signal::FPSIMD_MAGIC {
+            regs.fp.fpsr = f.get32(fp + FPSIMD_FPSR_OFF);
+            regs.fp.fpcr = f.get32(fp + FPSIMD_FPCR_OFF);
+            for (i, v) in regs.fp.v.iter_mut().enumerate() {
+                let at = fp + FPSIMD_VREGS_OFF + i as u64 * 16;
+                *v = f.get(at) as u128 | (f.get(at + 8) as u128) << 64;
+            }
+        }
+        thread::set_mask(f.get(UC_SIGMASK_OFF));
+        let ss_sp = f.get(UC_STACK_OFF);
+        let ss_flags = f.get(UC_STACK_OFF + 8) as i32;
+        let ss_size = f.get(UC_STACK_OFF + 16);
+        thread::set_altstack(Stack { ss_sp, ss_flags, _pad: 0, ss_size });
+        true
     }
 
     /// `kill(pid, sig)`. A relayed signal is sent as the host signal to
@@ -505,8 +518,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let pending = (thread::pending() | host::pending_signals()) & thread::mask();
-        // SAFETY: the guest passed a buffer for a `sigset_t`.
-        unsafe { (set as *mut u64).write_unaligned(pending) };
+        guest!(uaccess::write(set, pending));
         0
     }
 }
@@ -523,8 +535,7 @@ pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64
     if set == 0 {
         return call();
     }
-    // SAFETY: the caller guarantees the signal set.
-    let new = unsafe { (set as *const u64).read_unaligned() };
+    let new: u64 = guest!(uaccess::read(set));
     thread::save_mask(thread::mask());
     thread::set_mask(new);
     let mut old = host::empty_sigset();
@@ -553,8 +564,7 @@ pub(crate) unsafe fn sigsuspend(set: u64, size: u64) -> i64 {
     if size != signal::SIGSET_SIZE {
         return err(errno::EINVAL);
     }
-    // SAFETY: the caller guarantees the signal set.
-    let new = unsafe { (set as *const u64).read_unaligned() };
+    let new: u64 = guest!(uaccess::read(set));
     thread::save_mask(thread::mask());
     thread::set_mask(new);
     loop {
@@ -597,14 +607,16 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
     if size != signal::SIGSET_SIZE {
         return err(errno::EINVAL);
     }
-    // SAFETY: the caller guarantees the signal set.
-    let want = unsafe { (set as *const u64).read_unaligned() };
-    let deadline = (timeout != 0).then(|| {
-        // SAFETY: the caller guarantees the timespec.
-        let ts = unsafe { (timeout as *const fwe_abi::Timespec).read_unaligned() };
-        Instant::now()
-            + Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)
-    });
+    let want: u64 = guest!(uaccess::read(set));
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let ts: fwe_abi::Timespec = guest!(uaccess::read(timeout));
+        Some(
+            Instant::now()
+                + Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32),
+        )
+    };
     loop {
         drain_to_signalfd();
         // Block everything while checking, so a signal arriving between the
@@ -620,15 +632,9 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(i) = thread::take_pending(sig) else { continue };
             if info != 0 {
-                // SAFETY: the caller guarantees a `siginfo_t` buffer.
-                unsafe {
-                    std::ptr::write_bytes(info as *mut u8, 0, SIGINFO_SIZE as usize);
-                    poke32(info, sig as i32);
-                    poke32(info + 8, i.code);
-                    poke32(info + SI_PID_OFF, i.pid);
-                    poke32(info + SI_UID_OFF, i.uid as i32);
-                    poke32(info + SI_STATUS_OFF, i.status);
-                }
+                let mut b = Buf::zeroed(SIGINFO_SIZE);
+                put_siginfo(&mut b, sig, i, 0);
+                guest!(uaccess::write_from(info, &b.0));
             }
             return sig as i64;
         }
@@ -844,14 +850,13 @@ mod tests {
         k.raise_pending(signal::SIGUSR2);
         k.deliver_pending(&mut regs);
         let fp = regs.sp + MC_RESERVED_OFF;
-        // SAFETY: reading the frame just built on `stack`.
-        unsafe {
-            assert_eq!(peek32(fp), signal::FPSIMD_MAGIC);
-            assert_eq!(peek32(fp + 4), signal::FPSIMD_CONTEXT_SIZE);
-            assert_eq!(peek(fp + FPSIMD_VREGS_OFF + 16 * 3), saved.v[3] as u64);
-            // The record after it is the terminator.
-            assert_eq!(peek(fp + signal::FPSIMD_CONTEXT_SIZE as u64), 0);
-        }
+        let peek32 = |a: u64| uaccess::read::<u32>(a).unwrap();
+        let peek = |a: u64| uaccess::read::<u64>(a).unwrap();
+        assert_eq!(peek32(fp), signal::FPSIMD_MAGIC);
+        assert_eq!(peek32(fp + 4), signal::FPSIMD_CONTEXT_SIZE);
+        assert_eq!(peek(fp + FPSIMD_VREGS_OFF + 16 * 3), saved.v[3] as u64);
+        // The record after it is the terminator.
+        assert_eq!(peek(fp + signal::FPSIMD_CONTEXT_SIZE as u64), 0);
         // The handler clobbers the FP state.
         regs.fp = crate::FpRegs::default();
         regs.x[8] = fwe_abi::nr::RT_SIGRETURN;

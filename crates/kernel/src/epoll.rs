@@ -16,17 +16,12 @@
 const EVENT_SIZE: usize = 12;
 
 /// Read one guest `epoll_event` at `ptr`.
-///
-/// # Safety
-/// `ptr` must point to a readable 12-byte `epoll_event`.
 #[cfg(not(target_os = "linux"))]
-unsafe fn read_event(ptr: u64) -> (u32, u64) {
-    // SAFETY: the caller guarantees `ptr` spans a valid packed epoll_event.
-    unsafe {
-        let events = (ptr as *const u32).read_unaligned();
-        let data = ((ptr + 4) as *const u64).read_unaligned();
-        (events, data)
-    }
+fn read_event(ptr: u64) -> crate::uaccess::Result<(u32, u64)> {
+    let raw: [u8; EVENT_SIZE] = crate::uaccess::read(ptr)?;
+    let events = u32::from_ne_bytes(raw[0..4].try_into().unwrap());
+    let data = u64::from_ne_bytes(raw[4..12].try_into().unwrap());
+    Ok((events, data))
 }
 
 /// `epoll_create1(flags)`.
@@ -124,12 +119,8 @@ pub unsafe fn pwait(
 unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
     use fwe_abi::epoll::*;
 
-    let (events, data) = if op == EPOLL_CTL_DEL {
-        (0, 0)
-    } else {
-        // SAFETY: the caller guarantees a valid event for ADD/MOD.
-        unsafe { read_event(event) }
-    };
+    let (events, data) =
+        if op == EPOLL_CTL_DEL { (0, 0) } else { crate::guest!(read_event(event)) };
 
     let want_read = events & EPOLLIN != 0;
     let want_write = events & EPOLLOUT != 0;
@@ -241,12 +232,10 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
             bits |= EPOLLERR;
         }
         let dst = events + (i * EVENT_SIZE) as u64;
-        // SAFETY: the caller guarantees space for `maxevents` entries and
-        // `i < n <= maxevents`.
-        unsafe {
-            (dst as *mut u32).write_unaligned(bits);
-            ((dst + 4) as *mut u64).write_unaligned(ev.udata as u64);
-        }
+        let mut out = [0u8; EVENT_SIZE];
+        out[0..4].copy_from_slice(&bits.to_ne_bytes());
+        out[4..12].copy_from_slice(&(ev.udata as u64).to_ne_bytes());
+        crate::guest!(crate::uaccess::write_from(dst, &out));
     }
     n as i64
 }

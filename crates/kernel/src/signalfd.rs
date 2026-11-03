@@ -149,13 +149,13 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
             let mut n = 0;
             while n < max {
                 let Some(rec) = s.queue.pop_front() else { break };
-                // SAFETY: the caller guarantees `max * SIGINFO_SIZE` writable bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        rec.as_ptr(),
-                        (buf + (n * SIGINFO_SIZE) as u64) as *mut u8,
-                        SIGINFO_SIZE,
-                    );
+                if crate::uaccess::write_from(buf + (n * SIGINFO_SIZE) as u64, &rec).is_err() {
+                    // Keep the record for a later read.
+                    s.queue.push_front(rec);
+                    if n == 0 {
+                        return Some(err(errno::EFAULT));
+                    }
+                    break;
                 }
                 n += 1;
             }

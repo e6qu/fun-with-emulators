@@ -65,38 +65,35 @@ pub unsafe fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
     const HEADER: usize = fwe_abi::DIRENT64_HEADER; // 19
     with(|m| {
         let dir = m.get_mut(&fd)?;
-        let mut written = 0usize;
-        while dir.offset < dir.entries.len() {
-            let (name, dtype) = &dir.entries[dir.offset];
+        let mut out = Vec::new();
+        let mut offset = dir.offset;
+        while offset < dir.entries.len() {
+            let (name, dtype) = &dir.entries[offset];
             // d_ino(8) d_off(8) d_reclen(2) d_type(1) name + NUL, padded to 8.
             let reclen = (HEADER + name.len() + 1 + 7) & !7;
-            if written + reclen > count as usize {
+            if out.len() + reclen > count as usize {
                 break;
             }
-            let rec = buf + written as u64;
-            let next_off = (dir.offset + 1) as i64;
-            // SAFETY: `reclen` bytes from `rec` lie within the guest buffer.
-            unsafe {
-                (rec as *mut u64).write_unaligned(1); // d_ino (arbitrary nonzero)
-                ((rec + 8) as *mut i64).write_unaligned(next_off); // d_off
-                ((rec + 16) as *mut u16).write_unaligned(reclen as u16);
-                ((rec + 18) as *mut u8).write_unaligned(*dtype);
-                std::ptr::copy_nonoverlapping(name.as_ptr(), (rec + 19) as *mut u8, name.len());
-                // Zero the name terminator and the alignment padding.
-                std::ptr::write_bytes(
-                    (rec + 19 + name.len() as u64) as *mut u8,
-                    0,
-                    reclen - HEADER - name.len(),
-                );
-            }
-            written += reclen;
-            dir.offset += 1;
+            let start = out.len();
+            out.resize(start + reclen, 0);
+            let rec = &mut out[start..];
+            rec[0..8].copy_from_slice(&1u64.to_ne_bytes()); // d_ino (arbitrary nonzero)
+            rec[8..16].copy_from_slice(&((offset + 1) as i64).to_ne_bytes()); // d_off
+            rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+            rec[18] = *dtype;
+            // The name, then zeros for its terminator and the padding.
+            rec[HEADER..HEADER + name.len()].copy_from_slice(name);
+            offset += 1;
         }
-        if written == 0 && dir.offset < dir.entries.len() {
+        if out.is_empty() && offset < dir.entries.len() {
             // The next entry does not fit in the caller's buffer.
             return Some(err(errno::EINVAL));
         }
-        Some(written as i64)
+        if let Err(e) = crate::uaccess::write_from(buf, &out) {
+            return Some(err(e));
+        }
+        dir.offset = offset;
+        Some(out.len() as i64)
     })
 }
 

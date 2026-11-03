@@ -24,13 +24,9 @@ fn table() -> &'static Table {
     TABLE.get_or_init(|| Table { queues: Mutex::new(HashMap::new()), cv: Condvar::new() })
 }
 
-/// Read the futex word from guest memory.
-///
-/// # Safety
-/// `uaddr` must point to a 4-byte-aligned readable guest word.
-unsafe fn load(uaddr: u64) -> u32 {
-    // SAFETY: the caller guarantees a readable aligned word.
-    unsafe { (uaddr as *const u32).read() }
+/// Read the futex word from guest memory (an aligned single load).
+fn load(uaddr: u64) -> crate::uaccess::Result<u32> {
+    crate::uaccess::read(uaddr)
 }
 
 /// Run a `futex` operation. Returns the raw Linux result. Must be called
@@ -44,19 +40,15 @@ pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
     }
     match op & futex::FUTEX_CMD_MASK {
         futex::FUTEX_WAIT => {
-            // SAFETY: caller guarantees `timeout` is valid when non-null.
-            let deadline = unsafe { wait_deadline(timeout) };
-            // SAFETY: caller guarantees `uaddr` is valid.
-            unsafe { wait(uaddr, val, deadline) }
+            let deadline = crate::guest!(wait_deadline(timeout));
+            wait(uaddr, val, deadline)
         }
         futex::FUTEX_WAIT_BITSET => {
             // Treat the bitset variant as a plain wait. Its timeout is
             // absolute, on CLOCK_MONOTONIC unless FUTEX_CLOCK_REALTIME is set.
             let realtime = op & futex::FUTEX_CLOCK_REALTIME != 0;
-            // SAFETY: caller guarantees `timeout` is valid when non-null.
-            let deadline = unsafe { wait_deadline_abs(timeout, realtime) };
-            // SAFETY: caller guarantees `uaddr` is valid.
-            unsafe { wait(uaddr, val, deadline) }
+            let deadline = crate::guest!(wait_deadline_abs(timeout, realtime));
+            wait(uaddr, val, deadline)
         }
         futex::FUTEX_WAKE | futex::FUTEX_WAKE_BITSET => wake(uaddr, val),
         _ => err(errno::ENOSYS),
@@ -65,40 +57,33 @@ pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
 
 /// Parse a relative `FUTEX_WAIT` timeout into an absolute deadline.
 ///
-/// # Safety
-/// `timeout`, when non-null, must point to a guest `Timespec`.
-unsafe fn wait_deadline(timeout: u64) -> Option<Instant> {
+fn wait_deadline(timeout: u64) -> crate::uaccess::Result<Option<Instant>> {
     if timeout == 0 {
-        return None;
+        return Ok(None);
     }
-    // SAFETY: the caller guarantees a valid pointer.
-    let ts: Timespec = unsafe { (timeout as *const Timespec).read_unaligned() };
-    Some(
+    let ts: Timespec = crate::uaccess::read(timeout)?;
+    Ok(Some(
         Instant::now()
             + Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32),
-    )
+    ))
 }
 
 /// A `FUTEX_WAIT_BITSET` absolute timeout as a deadline. The value is on the
 /// guest's CLOCK_MONOTONIC, or CLOCK_REALTIME when `realtime` is set; it is
 /// read against the same host clock the guest's `clock_gettime` reports, and
 /// the remaining time is carried over to an `Instant`.
-///
-/// # Safety
-/// `timeout`, when non-null, must point to a guest `Timespec`.
-unsafe fn wait_deadline_abs(timeout: u64, realtime: bool) -> Option<Instant> {
+fn wait_deadline_abs(timeout: u64, realtime: bool) -> crate::uaccess::Result<Option<Instant>> {
     if timeout == 0 {
-        return None;
+        return Ok(None);
     }
-    // SAFETY: the caller guarantees a valid pointer.
-    let ts: Timespec = unsafe { (timeout as *const Timespec).read_unaligned() };
+    let ts: Timespec = crate::uaccess::read(timeout)?;
     let clock = if realtime { libc::CLOCK_REALTIME } else { libc::CLOCK_MONOTONIC };
     let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `now` is a valid out-parameter.
     unsafe { libc::clock_gettime(clock, &mut now) };
     let now = Duration::new(now.tv_sec.max(0) as u64, now.tv_nsec.clamp(0, 999_999_999) as u32);
     let target = Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32);
-    Some(Instant::now() + target.saturating_sub(now))
+    Ok(Some(Instant::now() + target.saturating_sub(now)))
 }
 
 /// Run `f` holding the wait-queue lock (see [`crate::fork_locked`]).
@@ -111,21 +96,18 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 const SIGNAL_CHECK: Duration = Duration::from_millis(20);
 
 /// Block while the futex word still equals `val`.
-///
-/// # Safety
-/// `uaddr` must point to a valid guest futex word.
-unsafe fn wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
+fn wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
     let table = table();
-    let mut queues = table.queues.lock().unwrap();
+    let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     // Re-check under the lock: if the value already differs, do not sleep.
-    // SAFETY: caller guarantees `uaddr` is valid.
-    if unsafe { load(uaddr) } != val {
-        return err(errno::EAGAIN);
+    match load(uaddr) {
+        Ok(v) if v == val => {}
+        Ok(_) => return err(errno::EAGAIN),
+        Err(e) => return err(e),
     }
     *queues.entry(uaddr).or_insert(0) += 1;
     loop {
-        // SAFETY: caller guarantees `uaddr` is valid.
-        if unsafe { load(uaddr) } != val {
+        if load(uaddr) != Ok(val) {
             break;
         }
         // A condition variable is not interrupted by host signals, so wait in
@@ -141,7 +123,7 @@ unsafe fn wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
             // registry's) so the reader wakes.
             drop(queues);
             crate::signal::drain_to_signalfd();
-            queues = table.queues.lock().unwrap();
+            queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
         let now = Instant::now();
@@ -153,7 +135,7 @@ unsafe fn wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
             Some(d) => (d - now).min(SIGNAL_CHECK),
             None => SIGNAL_CHECK,
         };
-        queues = table.cv.wait_timeout(queues, slice).unwrap().0;
+        queues = table.cv.wait_timeout(queues, slice).unwrap_or_else(|e| e.into_inner()).0;
     }
     decrement(&mut queues, uaddr);
     0
@@ -172,7 +154,7 @@ fn decrement(queues: &mut HashMap<u64, usize>, uaddr: u64) {
 /// been waiting (an upper bound, as Linux allows).
 fn wake(uaddr: u64, count: u32) -> i64 {
     let table = table();
-    let queues = table.queues.lock().unwrap();
+    let queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     let waiting = queues.get(&uaddr).copied().unwrap_or(0);
     // Wake everyone; each waiter rechecks its own word and re-sleeps if it was
     // not the target.

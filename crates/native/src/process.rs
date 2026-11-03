@@ -9,46 +9,6 @@ use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::{Platform, Regs, host, thread};
 use std::sync::atomic::Ordering;
 
-/// Read a NUL-terminated string from guest memory.
-///
-/// # Safety
-/// `addr` points to a NUL-terminated string in guest memory.
-unsafe fn read_cstr(addr: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut p = addr;
-    loop {
-        // SAFETY: the caller guarantees a NUL-terminated string.
-        let b = unsafe { (p as *const u8).read() };
-        if b == 0 {
-            return out;
-        }
-        out.push(b);
-        p += 1;
-    }
-}
-
-/// Read a NULL-terminated array of string pointers (`argv`/`envp`).
-///
-/// # Safety
-/// `addr` points to a NULL-terminated array of pointers, each to a C string.
-unsafe fn read_cstr_array(addr: u64) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    if addr == 0 {
-        return out;
-    }
-    let mut p = addr;
-    loop {
-        // SAFETY: the caller guarantees a NULL-terminated pointer array.
-        let ptr = unsafe { (p as *const u64).read() };
-        if ptr == 0 {
-            return out;
-        }
-        // SAFETY: each non-null entry points to a C string.
-        out.push(unsafe { read_cstr(ptr) });
-        p += 8;
-    }
-}
-
 /// `execve(path, argv, envp)`: replace the current program image with a new
 /// one and start it. Returns a negative errno on failure; on success it does
 /// not return (it enters the new program).
@@ -61,9 +21,12 @@ unsafe fn read_cstr_array(addr: u64) -> Vec<Vec<u8>> {
 /// Descriptors marked close-on-exec are closed. `execve` in a process with
 /// other live threads is not supported yet.
 pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
-    // SAFETY: the guest passed a path and argv/envp pointers.
-    let (path, args, env) =
-        unsafe { (read_cstr(regs.x[0]), read_cstr_array(regs.x[1]), read_cstr_array(regs.x[2])) };
+    use fwe_kernel::uaccess;
+    // Linux's limit on one argument or environment string.
+    const ARG_MAX: usize = 128 * 1024;
+    let path = uaccess::read_cstr(regs.x[0], uaccess::PATH_MAX).map_err(err)?;
+    let args = uaccess::read_cstr_array(regs.x[1], ARG_MAX).map_err(err)?;
+    let env = uaccess::read_cstr_array(regs.x[2], ARG_MAX).map_err(err)?;
 
     let mut guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     let k = guard.as_mut().unwrap();
@@ -177,8 +140,8 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
         thread::init_main(host::getpid() as i32);
         LIVE_THREADS.store(1, Ordering::SeqCst);
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
-            // SAFETY: the guest supplied a writable int pointer.
-            unsafe { (child_tid as *mut i32).write(thread::tid()) };
+            // Best effort, as for Linux's own write of the word.
+            let _ = fwe_kernel::uaccess::write(child_tid, thread::tid());
         }
         if flags & cl::CLONE_CHILD_CLEARTID != 0 && child_tid != 0 {
             thread::set_clear_child_tid(child_tid);
@@ -195,8 +158,7 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
     }
     // Parent: the child's pid.
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-        // SAFETY: the guest supplied a writable int pointer.
-        unsafe { (parent_tid as *mut i32).write(pid) };
+        let _ = fwe_kernel::uaccess::write(parent_tid, pid);
     }
     if vfork {
         // SAFETY: plain host calls on the pipe opened above.
@@ -255,13 +217,12 @@ pub fn do_wait4(regs: &Regs) -> i64 {
     if r < 0 {
         return fwe_kernel::host::last_error();
     }
-    if r > 0 && wstatus != 0 {
-        // SAFETY: the guest passed a writable int for the status.
-        unsafe { (wstatus as *mut i32).write(linux_wstatus(status)) };
+    if r > 0 && wstatus != 0 && fwe_kernel::uaccess::write(wstatus, linux_wstatus(status)).is_err()
+    {
+        return err(errno::EFAULT);
     }
-    if r > 0 {
-        // SAFETY: the guest passed a buffer for a `struct rusage`, or null.
-        unsafe { host::write_rusage(rusage, &usage) };
+    if r > 0 && host::write_rusage(rusage, &usage).is_err() {
+        return err(errno::EFAULT);
     }
     r as i64
 }
@@ -304,31 +265,30 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         return fwe_kernel::host::last_error();
     }
     if infop != 0 {
-        // SAFETY: the guest passed a buffer for a `siginfo_t` (128 bytes);
-        // `si` was filled by the host.
-        unsafe {
-            std::ptr::write_bytes(infop as *mut u8, 0, 128);
-            if si.si_pid() != 0 {
-                let code = si.si_code;
-                let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {
-                    host::signal_to_linux(si.si_status()) as i32
-                } else {
-                    si.si_status()
-                };
-                let p = infop as *mut i32;
-                p.write(fwe_abi::signal::SIGCHLD as i32); // si_signo
-                p.add(2).write(code); // si_code
-                p.add(4).write(si.si_pid()); // si_pid
-                p.add(5).write(si.si_uid() as i32); // si_uid
-                p.add(6).write(status); // si_status
-            }
+        let mut words = [0i32; 32]; // a 128-byte siginfo_t
+        // SAFETY: `si` was filled by the host.
+        let (pid, uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+        if pid != 0 {
+            let code = si.si_code;
+            let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {
+                host::signal_to_linux(status) as i32
+            } else {
+                status
+            };
+            words[0] = fwe_abi::signal::SIGCHLD as i32; // si_signo
+            words[2] = code; // si_code
+            words[4] = pid; // si_pid
+            words[5] = uid as i32; // si_uid
+            words[6] = status; // si_status
+        }
+        if fwe_kernel::uaccess::write(infop, words).is_err() {
+            return err(errno::EFAULT);
         }
     }
-    if rusage != 0 {
-        // SAFETY: the guest passed a buffer for a `struct rusage`.
-        unsafe {
-            std::ptr::write_bytes(rusage as *mut u8, 0, fwe_abi::resource_usage::RUSAGE_SIZE)
-        };
+    if rusage != 0
+        && fwe_kernel::uaccess::zero(rusage, fwe_abi::resource_usage::RUSAGE_SIZE).is_err()
+    {
+        return err(errno::EFAULT);
     }
     0
 }
