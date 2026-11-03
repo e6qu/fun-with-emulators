@@ -69,6 +69,19 @@ System-call surface, implemented and covered by end-to-end tests:
 - [x] `/proc` and `/sys`: the files programs read at startup, and the
   directories listable with `getdents64`
 - [x] Users, permissions and ownership as virtual credentials
+- [x] Signals between processes: `kill` to any pid or process group,
+  `tgkill` to one thread, guest dispositions mirrored onto the host so
+  signals from children, the terminal, timers and other processes reach
+  guest handlers (with `SA_RESTART` and `EINTR` as on Linux),
+  `rt_sigsuspend`, `rt_sigtimedwait`, `rt_sigpending`, the masks of `ppoll`
+  and `epoll_pwait`, `setitimer`
+- [x] Per-thread signal masks, alternate stacks and pending signals; FP and
+  SIMD registers saved across a handler
+- [x] Process model for shells and spawners: `fork` from a multithreaded
+  process, the `vfork` form of `clone` (`posix_spawn`,
+  `std::process::Command`), `execve` that discards the old address space
+  (so a program can exec itself), `waitid`, and `rusage` from `wait4` and
+  `getrusage`
 
 Remaining:
 
@@ -85,15 +98,12 @@ Remaining:
   coverage runs on the self-hosted Apple Silicon runner (the `hypervisor`
   job); hosted runners cannot run a VM.
 - [ ] Python from the Debian rootfs (carried over from M1)
-- [ ] Process model gaps that shells and build tools hit: `kill` to another
-  process (today only the caller's own pid is accepted); reclaim the old
-  address space on `execve`; `fork` from a multithreaded process; `vfork`,
-  `waitid`, `execveat`; `rusage` from `wait4`/`getrusage`
+- [ ] The rest of the process model: `execve` from a process with other
+  live threads, `execveat`, `clone3`; `vfork` sharing memory with its
+  parent rather than copying it
 - [ ] A guest↔host descriptor map, so fwe's own descriptors (the rootfs
   handle, the pipes behind eventfd and signalfd) are out of the guest's
   reach when it closes everything from 3 up
-- [ ] Per-thread signal masks and alternate stacks; floating-point and SIMD
-  state saved across a signal handler
 - [ ] `EFAULT` for bad guest pointers the kernel reads itself, instead of a
   crash
 - [ ] The remaining `x18` forms (`sp`-writeback and `sp`-register-offset
