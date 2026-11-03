@@ -147,8 +147,33 @@ impl<P: Platform> Kernel<P> {
                     // Follow the link through the normal path.
                     self.sys_openat_bytes(dirfd, &target, flags, mode)
                 }
+                crate::procfs::Entry::Fd { fd, target } => {
+                    if flags & fcntl::O_NOFOLLOW != 0 {
+                        return err(errno::ELOOP);
+                    }
+                    if target.starts_with(b"/") {
+                        // Reopen the file, as Linux does.
+                        return self.sys_openat_bytes(dirfd, &target, flags, mode);
+                    }
+                    // A pipe, socket or the like: a new descriptor for it.
+                    let cmd = if flags & fcntl::O_CLOEXEC != 0 {
+                        libc::F_DUPFD_CLOEXEC
+                    } else {
+                        libc::F_DUPFD
+                    };
+                    // SAFETY: plain host call on an open guest descriptor.
+                    ret(unsafe { libc::fcntl(fd, cmd, 0) })
+                }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
-                    Some(entries) => crate::synthdir::open(entries),
+                    Some(entries) => {
+                        let fd = crate::synthdir::open(entries);
+                        if fd >= 0 && self.fs().lists_fds(dirfd as i32, &path) {
+                            // Linux lists the listing's own descriptor too.
+                            let name = fd.to_string().into_bytes();
+                            crate::synthdir::add(fd as i32, name, crate::procfs::DT_LNK);
+                        }
+                        fd
+                    }
                     None => err(errno::ENOENT),
                 },
                 crate::procfs::Entry::Missing => err(errno::ENOENT),
@@ -228,6 +253,12 @@ impl<P: Platform> Kernel<P> {
                     return self.stat_path(dirfd, &target, buf, flags);
                 }
                 crate::procfs::Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
+                crate::procfs::Entry::Fd { fd, .. } if follow => {
+                    return self.sys_fstat(fd as u64, buf);
+                }
+                crate::procfs::Entry::Fd { target, .. } => {
+                    synth_stat(st::S_IFLNK | 0o700, target.len() as u64)
+                }
                 crate::procfs::Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
                 crate::procfs::Entry::Missing => return err(errno::ENOENT),
             };
@@ -323,7 +354,7 @@ impl<P: Platform> Kernel<P> {
         let path = unsafe { read_cstr(path) };
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
-                crate::procfs::Entry::Symlink(target) => {
+                crate::procfs::Entry::Symlink(target) | crate::procfs::Entry::Fd { target, .. } => {
                     let n = target.len().min(size as usize);
                     // SAFETY: the guest passed a buffer of `size` bytes.
                     unsafe { std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n) };

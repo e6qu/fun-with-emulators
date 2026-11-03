@@ -154,6 +154,18 @@ pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
     }
 }
 
+/// What `/proc/self/fd` shows for an emulated descriptor: `[eventfd]` or
+/// `[timerfd]`.
+pub fn anon_name(fd: i32) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    imp::anon_name(fd)
+}
+
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_os = "linux")]
@@ -162,16 +174,6 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     }
     #[cfg(not(target_os = "linux"))]
     imp::hold(f)
-}
-
-/// Descriptors the emulation holds for itself, which `execve` must keep open.
-pub fn internal_fds() -> Vec<i32> {
-    #[cfg(target_os = "linux")]
-    {
-        Vec::new()
-    }
-    #[cfg(not(target_os = "linux"))]
-    imp::internal_fds()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -210,22 +212,16 @@ mod imp {
         f(g.get_or_insert_with(HashMap::new))
     }
 
+    pub(super) fn anon_name(fd: i32) -> Option<&'static str> {
+        with_reg(|m| match m.get(&fd)? {
+            Special::Event(_) => Some("[eventfd]"),
+            Special::Timer(_) => Some("[timerfd]"),
+        })
+    }
+
     pub(super) fn hold<R>(f: impl FnOnce() -> R) -> R {
         let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
         f()
-    }
-
-    /// Descriptors the emulation holds for itself (the write ends of the
-    /// eventfd readiness pipes), which the guest must never see closed.
-    pub fn internal_fds() -> Vec<i32> {
-        with_reg(|reg| {
-            reg.values()
-                .filter_map(|s| match s {
-                    Special::Event(e) => Some(e.wfd),
-                    Special::Timer(_) => None,
-                })
-                .collect()
-        })
     }
 
     fn set_cloexec(fd: i32) {
@@ -252,11 +248,11 @@ mod imp {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return last_error();
         }
-        let (rfd, wfd) = (fds[0], fds[1]);
+        // The write end is fwe's: out of the guest's reach.
+        let (rfd, wfd) = (fds[0], crate::fdtable::reserve(fds[1]));
         if flags & EFD_CLOEXEC != 0 {
             set_cloexec(rfd);
         }
-        set_cloexec(wfd);
         let ev = EventFd {
             rfd,
             wfd,

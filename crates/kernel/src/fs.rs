@@ -102,6 +102,8 @@ impl Fs {
         if fd < 0 {
             return Err(e());
         }
+        // The root is fwe's: out of the guest's reach.
+        let fd = crate::fdtable::reserve(fd);
         // SAFETY: `fd` is a fresh owned directory descriptor.
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
@@ -143,7 +145,65 @@ impl Fs {
         } else {
             return None;
         };
+        if let Some(n) = absolute.strip_prefix(b"/proc/self/fd/") {
+            let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok());
+            let open = fd.is_some_and(|fd| {
+                // SAFETY: F_GETFD only queries the descriptor.
+                fd >= 0
+                    && crate::fdtable::guest_visible(fd)
+                    && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0
+            });
+            return Some(match fd {
+                Some(fd) if open => crate::procfs::Entry::Fd { fd, target: self.fd_target(fd) },
+                _ => crate::procfs::Entry::Missing,
+            });
+        }
         crate::procfs::lookup(&absolute, &self.proc)
+    }
+
+    /// What `/proc/self/fd/<fd>` links to: the guest path of the open file,
+    /// or Linux's name for an object with none.
+    pub fn fd_target(&self, fd: i32) -> Vec<u8> {
+        if let Some(name) = crate::specialfd::anon_name(fd) {
+            return format!("anon_inode:{name}").into_bytes();
+        }
+        if crate::signalfd::is_signalfd(fd) {
+            return b"anon_inode:[signalfd]".to_vec();
+        }
+        // SAFETY: an all-zero stat is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return b"anon_inode:[unknown]".to_vec();
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFIFO => return format!("pipe:[{}]", st.st_ino).into_bytes(),
+            libc::S_IFSOCK => return format!("socket:[{}]", st.st_ino).into_bytes(),
+            _ => {}
+        }
+        match fd_path(fd) {
+            Some(host) if self.root_host == b"/" => host,
+            Some(host) => match host.strip_prefix(self.root_host.as_slice()) {
+                Some(b"") => b"/".to_vec(),
+                Some(rest) if rest.starts_with(b"/") => rest.to_vec(),
+                _ => host,
+            },
+            // A kqueue (an epoll descriptor) has neither path nor type.
+            None => b"anon_inode:[eventpoll]".to_vec(),
+        }
+    }
+
+    /// Whether `path` names `/proc/self/fd`, whose listing is the open
+    /// descriptors.
+    pub fn lists_fds(&self, dirfd: i32, path: &[u8]) -> bool {
+        let absolute = if path.first() == Some(&b'/') {
+            normalize(b"/", path)
+        } else if dirfd as i64 == fcntl::AT_FDCWD {
+            normalize(&self.cwd, path)
+        } else {
+            return false;
+        };
+        absolute == b"/proc/self/fd"
     }
 
     /// The entries of a synthetic `/proc` or `/sys` directory `path`, if it is
@@ -156,17 +216,23 @@ impl Fs {
         } else {
             return None;
         };
+        if absolute == b"/proc/self/fd" {
+            let mut out = vec![
+                (b".".to_vec(), crate::procfs::DT_DIR),
+                (b"..".to_vec(), crate::procfs::DT_DIR),
+            ];
+            out.extend(
+                crate::fdtable::open_fds()
+                    .into_iter()
+                    .map(|fd| (fd.to_string().into_bytes(), crate::procfs::DT_LNK)),
+            );
+            return Some(out);
+        }
         crate::procfs::children(&absolute)
     }
 
     pub fn cwd(&self) -> &[u8] {
         &self.cwd
-    }
-
-    /// The host descriptor of the rootfs directory, which fwe holds for the
-    /// life of the process.
-    pub fn root_fd(&self) -> i32 {
-        self.root.as_raw_fd()
     }
 
     pub fn umask(&self) -> u32 {

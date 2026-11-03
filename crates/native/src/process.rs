@@ -78,8 +78,14 @@ pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     crate::check_image(&file, fs).map_err(err)?;
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env_refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
-    // The point of no return: the old program's memory goes.
+    // The point of no return: the old program's memory goes, and a vfork
+    // parent may resume.
     fwe_kernel::mm::release_guest_memory();
+    let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
+    if done >= 0 {
+        // SAFETY: closing the pipe end this child holds for its parent.
+        unsafe { libc::close(done) };
+    }
     let out = match load_image(&file, &path, &arg_refs, &env_refs, fs, &platform, page, strace) {
         Ok(out) => out,
         Err(e) => {
@@ -102,25 +108,10 @@ pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     Ok(Regs { sp: out.sp, pc: out.entry, ..Regs::default() })
 }
 
-/// Move host descriptor `fd` to a high number, close-on-exec, so a
-/// descriptor fwe holds for itself in the guest's table stays out of the way
-/// of the numbers the guest expects to get.
-fn high_fd(fd: i32) -> i32 {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: `lim` is a valid out-parameter.
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
-    let floor = (lim.rlim_cur.min(1 << 16) as i32 - 64).max(10);
-    // SAFETY: plain host calls on a descriptor this module opened.
-    unsafe {
-        let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor);
-        if high < 0 {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            return fd;
-        }
-        libc::close(fd);
-        high
-    }
-}
+/// In a `vfork` child, the write end of the pipe its parent waits on
+/// (see [`do_fork`]), or -1. It is fwe's, so close-on-exec does not reach
+/// it; `execve` closes it once the new program is certain to load.
+static VFORK_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 /// `fork` (a non-thread `clone`): duplicate the process with host `fork`.
 /// The child continues with `x0` = 0 (on `child_stack` if one was given);
@@ -150,7 +141,7 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
         if unsafe { libc::pipe(done.as_mut_ptr()) } != 0 {
             return fwe_kernel::host::last_error();
         }
-        done = [high_fd(done[0]), high_fd(done[1])];
+        done = [fwe_kernel::fdtable::reserve(done[0]), fwe_kernel::fdtable::reserve(done[1])];
     }
 
     let pid = {
@@ -179,6 +170,9 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
         if vfork {
             // SAFETY: closing the read end the parent uses.
             unsafe { libc::close(done[0]) };
+            VFORK_DONE.store(done[1], Ordering::SeqCst);
+        } else {
+            VFORK_DONE.store(-1, Ordering::SeqCst);
         }
         thread::init_main(host::getpid() as i32);
         LIVE_THREADS.store(1, Ordering::SeqCst);

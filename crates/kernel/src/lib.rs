@@ -12,6 +12,7 @@
 
 pub mod creds;
 pub mod epoll;
+pub mod fdtable;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -192,24 +193,11 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Close every descriptor marked close-on-exec, as `execve` does before
-    /// entering the new program. fwe's own descriptors — the rootfs handle and
-    /// the pipe ends behind the emulated eventfd and signalfd — carry the flag
-    /// too but belong to the runtime, so they are kept.
+    /// entering the new program. fwe's own descriptors carry the flag too,
+    /// but sit above the guest's range ([`fdtable`]), so they are kept.
     pub fn close_on_exec(&mut self) {
-        let mut keep = specialfd::internal_fds();
-        keep.extend(signalfd::internal_fds());
-        if let Some(fs) = &self.fs {
-            keep.push(fs.root_fd());
-        }
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: `lim` is a valid out-parameter.
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
-        let max = lim.rlim_cur.clamp(1024, 1 << 16) as i32;
-        for fd in 0..max {
-            if keep.contains(&fd) {
-                continue;
-            }
-            // SAFETY: plain host call; an unused descriptor yields EBADF.
+        for fd in fdtable::open_fds() {
+            // SAFETY: plain host call on an open guest descriptor.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
                 self.dispatch(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
@@ -330,6 +318,9 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
+    if let Err(e) = fdtable::check_args(nr, &a) {
+        return Some(e);
+    }
     Some(match nr {
         // SAFETY: caller guarantees the futex word and timeout are valid.
         n::FUTEX => unsafe { futex::op(a[0], a[1], a[2] as u32, a[3]) },

@@ -25,6 +25,11 @@ pub enum Entry {
     File(Vec<u8>),
     /// A symlink to this target.
     Symlink(Vec<u8>),
+    /// `/proc/self/fd/N`: a link to what open descriptor `fd` refers to.
+    /// `target` is a guest path, or a name such as `pipe:[ino]` for
+    /// something without one; opening it reopens the file, or duplicates
+    /// the descriptor when there is no path.
+    Fd { fd: i32, target: Vec<u8> },
     /// A synthetic directory (its entries come from [`children`]).
     Dir,
     /// A path under `/proc` or `/sys` that is not provided (maps to ENOENT).
@@ -55,7 +60,9 @@ const DIRS: &[DirDef] = &[
             (b"sys", DT_DIR),
         ],
     ),
-    (b"/proc/self", &[(b"exe", DT_LNK), (b"cmdline", DT_REG)]),
+    (b"/proc/self", &[(b"exe", DT_LNK), (b"cmdline", DT_REG), (b"fd", DT_DIR)]),
+    // Listed from the open descriptors (see `Fs::synth_children`).
+    (b"/proc/self/fd", &[]),
     (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR)]),
     (
         b"/proc/sys/kernel",
