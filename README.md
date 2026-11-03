@@ -7,8 +7,9 @@ run a Linux kernel. Like Wine, but for Linux. Written in Rust.
 ## Status
 
 Real, unmodified Debian `aarch64` programs run end to end: coreutils, `ls`
-with its shared-library graph, and `bash`, dynamically linked against a
-genuine glibc (musl works too). Processes, threads, memory, signals, files on
+with its shared-library graph, `bash`, and `git` (commits, merges, rebases,
+`gc`, a local clone), dynamically linked against a genuine glibc (musl
+works too). Processes, threads, memory, signals, files on
 a Linux rootfs, networking, terminals, event descriptors and a synthetic
 `/proc` are in place.
 
