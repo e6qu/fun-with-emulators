@@ -414,10 +414,13 @@ impl<P: Platform> Kernel<P> {
         }
         let old_end = self.page_up(b.current);
         let new_end = self.page_up(addr);
+        let rw = mman::PROT_READ | mman::PROT_WRITE;
         let ok = if new_end > old_end {
             map_fixed_anon(old_end, new_end - old_end, libc::PROT_READ | libc::PROT_WRITE)
+                && self.platform.map_guest(old_end, new_end - old_end, rw).is_ok()
         } else if new_end < old_end {
             // Released pages must read as zero if the break grows again.
+            self.platform.unmap_guest(new_end, old_end - new_end);
             map_fixed_anon(new_end, old_end - new_end, libc::PROT_NONE)
         } else {
             true
@@ -493,6 +496,12 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EEXIST);
         }
         track(p, self.page_up(len));
+        if let Err(e) = self.platform.map_guest(p, self.page_up(len), prot) {
+            // SAFETY: unmapping the mapping just created.
+            unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+            untrack(p, self.page_up(len));
+            return err(e);
+        }
         if exec {
             // Translate the code. For a file-backed mapping, confine the
             // rewrite to the file's executable sections, so data mapped into
@@ -533,16 +542,18 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+        let host = crate::uaccess::g2h(addr) as *mut libc::c_void;
         // SAFETY: guest-requested unmapping of guest memory.
-        let r = ret(unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) });
+        let r = ret(unsafe { libc::munmap(host, len as usize) });
         if r == 0 {
             untrack(addr, self.page_up(len));
+            self.platform.unmap_guest(addr, self.page_up(len));
         }
         r
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
-        let a = addr as *mut libc::c_void;
+        let a = crate::uaccess::g2h(addr) as *mut libc::c_void;
         if prot & mman::PROT_EXEC != 0 {
             // SAFETY: guest-requested protection change of guest memory.
             if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
@@ -553,7 +564,11 @@ impl<P: Platform> Kernel<P> {
             }
         }
         // SAFETY: guest-requested protection change of guest memory.
-        ret(unsafe { libc::mprotect(a, len as usize, host_prot(prot)) })
+        let r = ret(unsafe { libc::mprotect(a, len as usize, host_prot(prot)) });
+        if r == 0 {
+            self.platform.protect_guest(addr, self.page_up(len), prot);
+        }
+        r
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
@@ -561,17 +576,25 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let len = self.page_up(len);
+        let host = crate::uaccess::g2h(addr);
         match advice {
-            mman::MADV_DONTNEED => dontneed(addr, len),
+            mman::MADV_DONTNEED => {
+                let r = dontneed(host, len);
+                if r == 0 {
+                    // The host memory behind the range was replaced.
+                    self.platform.remapped_guest(addr, len);
+                }
+                r
+            }
             mman::MADV_FREE => {
                 // SAFETY: advisory call on guest memory.
-                unsafe { libc::madvise(addr as *mut libc::c_void, len as usize, libc::MADV_FREE) };
+                unsafe { libc::madvise(host as *mut libc::c_void, len as usize, libc::MADV_FREE) };
                 0
             }
             mman::MADV_NORMAL | mman::MADV_RANDOM | mman::MADV_SEQUENTIAL | mman::MADV_WILLNEED => {
                 // SAFETY: advisory call on guest memory; values match the host's.
                 ret(unsafe {
-                    libc::madvise(addr as *mut libc::c_void, len as usize, advice as libc::c_int)
+                    libc::madvise(host as *mut libc::c_void, len as usize, advice as libc::c_int)
                 })
             }
             // Other advice (huge pages, dump control, ...) has no host
@@ -588,11 +611,11 @@ impl<P: Platform> Kernel<P> {
         let new_len = self.page_up(new_len);
         if new_len <= old_len {
             if new_len < old_len {
+                let tail = crate::uaccess::g2h(old + new_len);
                 // SAFETY: unmapping the tail of a guest mapping.
-                unsafe {
-                    libc::munmap((old + new_len) as *mut libc::c_void, (old_len - new_len) as usize)
-                };
+                unsafe { libc::munmap(tail as *mut libc::c_void, (old_len - new_len) as usize) };
                 untrack(old + new_len, old_len - new_len);
+                self.platform.unmap_guest(old + new_len, old_len - new_len);
             }
             return old as i64;
         }

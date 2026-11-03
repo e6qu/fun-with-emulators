@@ -77,12 +77,14 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
             nr::READV => {
-                // SAFETY: `struct iovec` has the same layout; the host validates it.
-                ret(unsafe { libc::readv(a[0] as i32, a[1] as *const _, a[2] as i32) } as i64)
+                let iov = guest!(uaccess::host_iovecs(a[1], a[2]));
+                // SAFETY: the iovecs are translated host buffers; the host checks them.
+                ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
             nr::WRITEV => {
-                // SAFETY: `struct iovec` has the same layout; the host validates it.
-                ret(unsafe { libc::writev(a[0] as i32, a[1] as *const _, a[2] as i32) } as i64)
+                let iov = guest!(uaccess::host_iovecs(a[1], a[2]));
+                // SAFETY: the iovecs are translated host buffers; the host checks them.
+                ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
             nr::PREAD64 => {
                 // SAFETY: the host validates the guest buffer.
