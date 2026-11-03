@@ -19,6 +19,23 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 /// Maximum symlinks followed while resolving one path.
 const MAX_SYMLINKS: u32 = 40;
 
+/// The device nodes every Linux system has in `/dev`, which the guest finds
+/// there whatever the rootfs holds: they are the host's own nodes (a rootfs
+/// unpacked without privileges has none, and Linux mounts `/dev` over it).
+const DEVICES: &[&[u8]] = &[b"null", b"zero", b"random", b"urandom", b"tty"];
+
+/// `/dev` entries that are links into `/proc/self/fd`, as on Linux.
+fn dev_link(absolute: &[u8]) -> Option<Vec<u8>> {
+    let fd = match absolute {
+        b"/dev/fd" => return Some(b"/proc/self/fd".to_vec()),
+        b"/dev/stdin" => 0,
+        b"/dev/stdout" => 1,
+        b"/dev/stderr" => 2,
+        _ => return None,
+    };
+    Some(format!("/proc/self/fd/{fd}").into_bytes())
+}
+
 /// The last host errno as a Linux errno.
 fn e() -> i32 {
     errno_to_linux(last_errno())
@@ -173,13 +190,13 @@ impl Fs {
     /// A synthetic `/proc` or `/sys` entry for `path`, if it names one. Only
     /// absolute paths and `AT_FDCWD`-relative paths are considered.
     pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
-        let absolute = if path.first() == Some(&b'/') {
-            normalize(b"/", path)
-        } else if dirfd as i64 == fcntl::AT_FDCWD {
-            normalize(&self.cwd, path)
-        } else {
-            return None;
-        };
+        let mut absolute = self.absolute(dirfd, path)?;
+        if let Some(target) = dev_link(&absolute) {
+            return Some(crate::procfs::Entry::Symlink(target));
+        }
+        if let Some(n) = absolute.strip_prefix(b"/dev/fd/") {
+            absolute = [b"/proc/self/fd/", n].concat();
+        }
         if let Some(n) = absolute.strip_prefix(b"/proc/self/fd/") {
             let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok());
             let open = fd.is_some_and(|fd| {
@@ -295,9 +312,36 @@ impl Fs {
         }
     }
 
+    /// `path` as a normalized absolute guest path, if it is absolute or
+    /// relative to the working directory (not to another directory fd).
+    fn absolute(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
+        if path.first() == Some(&b'/') {
+            Some(normalize(b"/", path))
+        } else if dirfd as i64 == fcntl::AT_FDCWD {
+            Some(normalize(&self.cwd, path))
+        } else {
+            None
+        }
+    }
+
     /// Resolve `path` relative to `dirfd`. Every symlink is followed except,
-    /// when `follow_final` is false, one that is the last component.
+    /// when `follow_final` is false, one that is the last component. The
+    /// standard device nodes ([`DEVICES`]) resolve to the host's.
     pub fn resolve(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
+        let device = self.absolute(dirfd, path).and_then(|a| {
+            a.strip_prefix(b"/dev/").filter(|n| DEVICES.contains(n)).map(<[u8]>::to_vec)
+        });
+        if let Some(name) = device {
+            // SAFETY: plain host call; the result is checked and owned.
+            let dev = unsafe {
+                libc::open(c"/dev".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            };
+            if dev < 0 {
+                return Err(e());
+            }
+            // SAFETY: `dev` is a fresh owned descriptor.
+            return Ok(Resolved { dir: unsafe { OwnedFd::from_raw_fd(dev) }, name });
+        }
         let (mut dir, path) = self.base(dirfd, path)?;
         let mut ancestors: Vec<OwnedFd> = Vec::new();
         let mut pending = components(&path);
@@ -541,6 +585,37 @@ mod tests {
         // "../../../marker" is clamped at the root: /marker, which does not exist.
         let r = fs.resolve(b_fd.as_raw_fd(), b"../../../../marker", true).unwrap();
         assert!(same_file(r.dir.as_raw_fd(), fs.root.as_raw_fd()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A rootfs with no `/dev` still has the standard device nodes (the
+    /// host's) and the links into `/proc/self/fd`; other `/dev` names are
+    /// looked up in the rootfs.
+    #[test]
+    fn dev_has_the_standard_nodes() {
+        let root = std::env::temp_dir().join(format!("fwe-fs-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = Fs::new(Some(root.to_str().unwrap().as_bytes())).unwrap();
+        // SAFETY: opening a host directory for comparison.
+        let dev = unsafe { libc::open(c"/dev".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        // SAFETY: `dev` is a fresh descriptor.
+        let dev = unsafe { OwnedFd::from_raw_fd(dev) };
+        for path in [&b"/dev/null"[..], b"/dev/./zero", b"/tmp/../dev/urandom"] {
+            let r = fs.resolve(fcntl::AT_FDCWD as i32, path, true).unwrap();
+            assert!(same_file(r.dir.as_raw_fd(), dev.as_raw_fd()));
+        }
+        assert!(fs.resolve(fcntl::AT_FDCWD as i32, b"/dev/disk0", true).is_err());
+        let link = |p: &[u8]| match fs.synthetic(fcntl::AT_FDCWD as i32, p) {
+            Some(crate::procfs::Entry::Symlink(t)) => Some(t),
+            _ => None,
+        };
+        assert_eq!(link(b"/dev/stdout").unwrap(), b"/proc/self/fd/1");
+        assert_eq!(link(b"/dev/fd").unwrap(), b"/proc/self/fd");
+        assert!(matches!(
+            fs.synthetic(fcntl::AT_FDCWD as i32, b"/dev/fd/1"),
+            Some(crate::procfs::Entry::Fd { fd: 1, .. })
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

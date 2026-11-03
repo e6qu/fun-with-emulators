@@ -1070,7 +1070,15 @@ mod tests {
             ),
             0
         );
-        assert_eq!(k.syscall(nr::UNLINKAT, [AT_FDCWD, cstr("/y").as_ptr() as u64, 0, 0, 0, 0]), 0);
+        // The flagless renameat, which glibc's `rename` uses on arm64.
+        assert_eq!(
+            k.syscall(
+                nr::RENAMEAT,
+                [AT_FDCWD, cstr("/y").as_ptr() as u64, AT_FDCWD, cstr("/z").as_ptr() as u64, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(k.syscall(nr::UNLINKAT, [AT_FDCWD, cstr("/z").as_ptr() as u64, 0, 0, 0, 0]), 0);
         assert_eq!(
             k.syscall(
                 nr::NEWFSTATAT,
