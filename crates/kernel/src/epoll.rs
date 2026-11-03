@@ -80,15 +80,20 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
             let n = d.count(16);
             (0..n).map(|_| (d.i32(), (d.u32(), d.u64()))).collect::<Interest>()
         });
-        // `lists` iterates in no particular order; `ce` is in fd order.
+        // `lists` iterates in no particular order; `ce` is in fd order. Only
+        // a kqueue made here is filled: a descriptor already open at an
+        // epoll number (a stale record) is left alone.
         let mut eps: Vec<i32> = lists.keys().copied().collect();
         eps.sort();
-        for (epfd, c) in eps.into_iter().zip(ce.into_iter().chain(std::iter::repeat(false))) {
-            crate::snapshot::fresh_kqueue_at(epfd, c);
-        }
+        let fresh: Vec<i32> = eps
+            .into_iter()
+            .zip(ce.into_iter().chain(std::iter::repeat(false)))
+            .filter(|&(epfd, c)| crate::snapshot::fresh_kqueue_at(epfd, c))
+            .map(|(epfd, _)| epfd)
+            .collect();
         // Nested epoll descriptors exist by now, whatever the order.
-        for (&epfd, list) in &lists {
-            for (&fd, &(events, data)) in list {
+        for epfd in fresh {
+            for (&fd, &(events, data)) in &lists[&epfd] {
                 let ev = fwe_abi::EpollEvent { events, data };
                 // SAFETY: a valid event on this stack frame.
                 let _ = unsafe {
@@ -447,40 +452,61 @@ mod tests {
     }
 
     /// A fork child rebuilds an epoll descriptor it did not inherit (a
-    /// kqueue) from the recorded interest list, at the same number.
+    /// kqueue) from the recorded interest list, at the same number. The
+    /// test uses a high number of its own, so tests running alongside never
+    /// open a descriptor there, and restores only its own record.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn interest_list_survives_a_rebuild() {
+        const EP: i32 = 900;
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        // SAFETY: create1 takes no pointers.
-        let ep = unsafe { create1(EPOLL_CLOEXEC) } as i32;
+        // SAFETY: create1 takes no pointers; the kqueue moves to EP.
+        unsafe {
+            let ep = create1(0) as i32;
+            closed(ep);
+            assert_eq!(libc::dup2(ep, EP), EP);
+            libc::close(ep);
+            libc::fcntl(EP, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        interest(|m| m.insert(EP, Interest::new()));
         let reg = fwe_abi::EpollEvent { events: EPOLLIN, data: 77 };
         // SAFETY: a valid event pointer.
-        let r = unsafe { ctl(ep as u64, EPOLL_CTL_ADD, fds[0] as u64, &reg as *const _ as u64) };
+        let r = unsafe { ctl(EP as u64, EPOLL_CTL_ADD, fds[0] as u64, &reg as *const _ as u64) };
         assert_eq!(r, 0);
+        // What save writes, for this descriptor alone.
         let mut e = crate::snapshot::Enc::new();
-        save(&mut e);
+        e.u64(1);
+        e.bool(crate::snapshot::cloexec(EP));
+        let only = std::collections::HashMap::from([(EP, interest(|m| m[&EP].clone()))]);
+        crate::snapshot::fd_map(&mut e, &only, |e, list| {
+            e.u64(list.len() as u64);
+            for (&fd, &(events, data)) in list {
+                e.i32(fd);
+                e.u32(events);
+                e.u64(data);
+            }
+        });
         // As in a child: the kqueue is gone.
         // SAFETY: closing the kqueue behind the record.
-        unsafe { libc::close(ep) };
+        unsafe { libc::close(EP) };
         let bytes = e.into_bytes();
         let mut d = crate::snapshot::Dec::new(&bytes);
         restore(&mut d);
         assert!(d.finish().is_ok());
         // SAFETY: F_GETFD only queries the descriptor.
-        assert_eq!(unsafe { libc::fcntl(ep, libc::F_GETFD) }, libc::FD_CLOEXEC);
+        assert_eq!(unsafe { libc::fcntl(EP, libc::F_GETFD) }, libc::FD_CLOEXEC);
         // SAFETY: writing one byte.
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
         let mut got = [fwe_abi::EpollEvent::default(); 1];
         // SAFETY: room for one event.
-        assert_eq!(unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
+        assert_eq!(unsafe { pwait(EP as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
         assert_eq!({ got[0].data }, 77);
-        closed(ep);
+        closed(EP);
         // SAFETY: plain host cleanup.
         unsafe {
-            libc::close(ep);
+            libc::close(EP);
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
