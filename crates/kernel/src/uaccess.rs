@@ -36,6 +36,15 @@ pub fn set_translation(guest: u64, len: u64, host: u64) {
     HI.store(guest + len, Ordering::SeqCst);
 }
 
+/// Whether `[addr, addr + len)` straddles the edge of the translated range
+/// (partly inside, partly out): such a range has no single host address,
+/// and memory calls on it are refused.
+pub fn crosses(addr: u64, len: u64) -> bool {
+    let (lo, hi) = (LO.load(Ordering::Relaxed), HI.load(Ordering::Relaxed));
+    let end = addr.saturating_add(len);
+    lo < hi && addr < hi && end > lo && (addr < lo || end > hi)
+}
+
 /// The host address of guest address `addr` (itself, outside the translated
 /// range).
 pub fn g2h(addr: u64) -> u64 {
@@ -256,7 +265,8 @@ pub fn pointer_args(nr: u64) -> u8 {
         n::NEWFSTATAT | n::READLINKAT => 0b110,
         n::STATX => 0b1_0010,
         n::FSTAT | n::FSTATFS | n::GETDENTS64 => 0b10,
-        n::STATFS | n::TRUNCATE => 0b1,
+        n::STATFS => 0b11,
+        n::TRUNCATE => 0b1,
         n::SYMLINKAT => 0b101,
         n::LINKAT | n::RENAMEAT | n::RENAMEAT2 => 0b1010,
         n::UTIMENSAT => 0b110,
@@ -271,7 +281,9 @@ pub fn pointer_args(nr: u64) -> u8 {
         n::RT_SIGPENDING | n::RT_SIGSUSPEND => 0b1,
         n::RT_SIGTIMEDWAIT => 0b111,
         n::SIGALTSTACK => 0b11,
-        n::FUTEX => 0b1_1001,
+        // The timeout (argument 3) is a pointer only for the waits; the
+        // backend translates it then (see `futex_pointer_args`).
+        n::FUTEX => 0b1_0001,
         n::PRLIMIT64 => 0b1100,
         n::GETRLIMIT | n::SETRLIMIT => 0b10,
         n::GETRUSAGE => 0b10,
@@ -297,6 +309,16 @@ pub fn pointer_args(nr: u64) -> u8 {
         n::SETSOCKOPT => 0b1000,
         n::GETSOCKOPT => 0b1_1000,
         _ => 0,
+    }
+}
+
+/// [`pointer_args`] for a `futex` call with operation `op`: argument 3 is
+/// a timeout pointer for the waits, a count for the requeues and `WAKE_OP`.
+pub fn futex_pointer_args(op: u64) -> u8 {
+    use fwe_abi::futex::*;
+    match op & FUTEX_CMD_MASK {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => 0b1001,
+        _ => 0b1_0001,
     }
 }
 

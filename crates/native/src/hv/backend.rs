@@ -428,6 +428,8 @@ struct Vcpu {
 
 // Exception classes (ESR bits 31:26).
 const EC_UNKNOWN: u64 = 0x00;
+const EC_WFX: u64 = 0x01;
+const EC_SYSREG: u64 = 0x18;
 const EC_SVC64: u64 = 0x15;
 const EC_HVC64: u64 = 0x16;
 const EC_IABT_LOWER: u64 = 0x20;
@@ -501,8 +503,11 @@ impl Vcpu {
         }
         self.set_sys(HV_SYS_REG_SP_EL0, r.sp);
         self.set(HV_REG_PC, r.pc);
-        // EL0t, with the guest's flags.
-        self.set(HV_REG_CPSR, r.pstate & !0xf);
+        // EL0t with only the flags EL0 may hold (NZCV, SSBS, DIT, TCO,
+        // BTYPE): a signal frame can hold anything, as on Linux, which
+        // sanitises it the same way.
+        const USER_PSTATE: u64 = 0xf000_0000 | (1 << 12) | (1 << 24) | (1 << 25) | 0xc00;
+        self.set(HV_REG_CPSR, r.pstate & USER_PSTATE);
         self.set(HV_REG_FPSR, r.fp.fpsr as u64);
         self.set(HV_REG_FPCR, r.fp.fpcr as u64);
         for (i, v) in r.fp.v.iter().enumerate() {
@@ -542,6 +547,13 @@ impl Vcpu {
                                 exit.exception.virtual_address,
                             );
                         }
+                        // `wfi`/`wfe`, which Linux lets EL0 execute: the
+                        // wait is over.
+                        EC_WFX => {
+                            regs = self.regs(self.get(HV_REG_PC) + 4, self.get(HV_REG_CPSR));
+                        }
+                        // A system register access the hypervisor traps.
+                        EC_SYSREG => regs = self.sysreg(syndrome),
                         ec => fatal(&format!(
                             "unexpected VM exit: EC {ec:#x}, syndrome {syndrome:#x}, pc {:#x}",
                             self.get(HV_REG_PC)
@@ -558,8 +570,44 @@ impl Vcpu {
                 HV_EXIT_REASON_VTIMER_ACTIVATED => continue,
                 other => fatal(&format!("unexpected VM exit reason {other}")),
             }
+            // Whatever the exit, a signal that became deliverable meanwhile
+            // (one a sigreturn just unblocked, or one the kernel queued
+            // itself) is delivered now, not at the next system call.
+            if thread::deliverable() != 0 {
+                if let Some(k) = kernel().as_mut() {
+                    k.deliver_pending(&mut regs);
+                }
+            }
             self.set_regs(&regs);
         }
+    }
+
+    /// A trapped system register access (ESR ISS for EC 0x18): a read of
+    /// `CNTPCT_EL0`, the physical counter Linux lets EL0 read, is emulated
+    /// with the virtual one the guest sees; anything else is `SIGILL`.
+    fn sysreg(&self, syndrome: u64) -> Regs {
+        let pc = self.get(HV_REG_PC);
+        let mut regs = self.regs(pc, self.get(HV_REG_CPSR));
+        let iss = syndrome & 0x1ff_ffff;
+        let read = iss & 1 == 1;
+        let rt = ((iss >> 5) & 0x1f) as usize;
+        let key =
+            (iss >> 10 & 0xf, iss >> 14 & 0x7, iss >> 17 & 0x7, iss >> 20 & 0x3, iss >> 1 & 0xf);
+        // (CRn, Op1, Op2, Op0, CRm) of CNTPCT_EL0 and CNTPCTSS_EL0.
+        if read && (key == (14, 3, 1, 3, 0) || key == (14, 3, 5, 3, 0)) {
+            let mut offset = 0;
+            // SAFETY: reading this thread's vCPU's timer offset.
+            unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut offset) };
+            // SAFETY: plain host call.
+            let now = unsafe { mach_absolute_time() };
+            if rt != 31 {
+                regs.x[rt] = now.wrapping_sub(offset);
+            }
+            regs.pc = pc + 4;
+            return regs;
+        }
+        fault(&mut regs, fwe_abi::signal::SIGILL, pc);
+        regs
     }
 
     /// The guest took an exception at EL0, which our vector turned into
@@ -619,7 +667,11 @@ fn syscall(regs: &mut Regs) {
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The kernel and the host see host addresses for guest pointers.
-    let mask = uaccess::pointer_args(n);
+    let mask = if n == nr::FUTEX {
+        uaccess::futex_pointer_args(args[1])
+    } else {
+        uaccess::pointer_args(n)
+    };
     let mut host_args = args;
     for (i, a) in host_args.iter_mut().enumerate() {
         if mask & (1 << i) != 0 {

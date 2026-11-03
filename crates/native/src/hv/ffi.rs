@@ -63,6 +63,7 @@ unsafe extern "C" {
         config: *mut c_void,
     ) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t;
     pub fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t;
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t;
@@ -87,6 +88,12 @@ pub unsafe extern "C" fn set_simd_fp_reg(
     value: *const u128,
 ) -> hv_return_t {
     core::arch::naked_asm!("ldr q0, [x2]", "b {f}", f = sym hv_vcpu_set_simd_fp_reg)
+}
+
+unsafe extern "C" {
+    /// The host's counter ticks (libSystem), which the guest's virtual
+    /// counter follows less the vCPU's timer offset.
+    pub fn mach_absolute_time() -> u64;
 }
 
 /// `Ok` for `HV_SUCCESS`, else an error naming the call.

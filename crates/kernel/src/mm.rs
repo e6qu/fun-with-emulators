@@ -459,6 +459,14 @@ impl<P: Platform> Kernel<P> {
             hflags |= libc::MAP_NORESERVE;
         }
         let noreplace = flags & mman::MAP_FIXED_NOREPLACE != 0 && flags & mman::MAP_FIXED == 0;
+        // A fixed address in the translated range is placed at its host
+        // address; the guest gets its own address back. (Without a fixed
+        // address, `addr` is only a hint.)
+        let fixed = flags & (mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE) != 0;
+        if fixed && crate::uaccess::crosses(addr, self.page_up(len)) {
+            return err(errno::EINVAL);
+        }
+        let haddr = if fixed { crate::uaccess::g2h(addr) } else { addr };
 
         // Executable mappings are created writable so the backend can prepare
         // the code, then switched to the requested protections. Shared file
@@ -478,7 +486,7 @@ impl<P: Platform> Kernel<P> {
         // which is the guest's own business, exactly as on Linux.
         let p = unsafe {
             libc::mmap(
-                addr as *mut libc::c_void,
+                haddr as *mut libc::c_void,
                 len as usize,
                 initial_prot,
                 hflags,
@@ -490,13 +498,14 @@ impl<P: Platform> Kernel<P> {
             return last_error();
         }
         let p = p as u64;
-        if noreplace && p != addr {
+        if noreplace && p != haddr {
             // SAFETY: unmapping the mapping just created.
             unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
             return err(errno::EEXIST);
         }
+        let guest = if p == haddr { addr } else { p };
         track(p, self.page_up(len));
-        if let Err(e) = self.platform.map_guest(p, self.page_up(len), prot) {
+        if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
             // SAFETY: unmapping the mapping just created.
             unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
             untrack(p, self.page_up(len));
@@ -538,28 +547,34 @@ impl<P: Platform> Kernel<P> {
                 return e;
             }
         }
-        p as i64
+        guest as i64
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+        if crate::uaccess::crosses(addr, self.page_up(len)) {
+            return err(errno::EINVAL);
+        }
         let host = crate::uaccess::g2h(addr) as *mut libc::c_void;
         // SAFETY: guest-requested unmapping of guest memory.
         let r = ret(unsafe { libc::munmap(host, len as usize) });
         if r == 0 {
-            untrack(addr, self.page_up(len));
+            untrack(host as u64, self.page_up(len));
             self.platform.unmap_guest(addr, self.page_up(len));
         }
         r
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        if crate::uaccess::crosses(addr, self.page_up(len)) {
+            return err(errno::EINVAL);
+        }
         let a = crate::uaccess::g2h(addr) as *mut libc::c_void;
         if prot & mman::PROT_EXEC != 0 {
             // SAFETY: guest-requested protection change of guest memory.
             if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
                 return last_error();
             }
-            if let Err(e) = self.platform.prepare_exec(addr, self.page_up(len)) {
+            if let Err(e) = self.platform.prepare_exec(a as u64, self.page_up(len)) {
                 return err(e);
             }
         }
@@ -576,6 +591,9 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let len = self.page_up(len);
+        if crate::uaccess::crosses(addr, len) {
+            return err(errno::EINVAL);
+        }
         let host = crate::uaccess::g2h(addr);
         match advice {
             mman::MADV_DONTNEED => {
@@ -609,12 +627,16 @@ impl<P: Platform> Kernel<P> {
         }
         let old_len = self.page_up(old_len);
         let new_len = self.page_up(new_len);
+        if crate::uaccess::crosses(old, old_len) {
+            return err(errno::EINVAL);
+        }
+        let host = crate::uaccess::g2h(old);
         if new_len <= old_len {
             if new_len < old_len {
-                let tail = crate::uaccess::g2h(old + new_len);
+                let tail = host + new_len;
                 // SAFETY: unmapping the tail of a guest mapping.
                 unsafe { libc::munmap(tail as *mut libc::c_void, (old_len - new_len) as usize) };
-                untrack(old + new_len, old_len - new_len);
+                untrack(tail, old_len - new_len);
                 self.platform.unmap_guest(old + new_len, old_len - new_len);
             }
             return old as i64;
@@ -624,7 +646,7 @@ impl<P: Platform> Kernel<P> {
             // unmapped source range and ENOMEM otherwise.
             // SAFETY: msync only inspects the mapping state of the range.
             let mapped =
-                unsafe { libc::msync(old as *mut libc::c_void, old_len as usize, libc::MS_ASYNC) }
+                unsafe { libc::msync(host as *mut libc::c_void, old_len as usize, libc::MS_ASYNC) }
                     == 0;
             return err(if mapped { errno::ENOMEM } else { errno::EFAULT });
         }

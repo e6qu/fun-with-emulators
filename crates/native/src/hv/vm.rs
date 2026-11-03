@@ -170,22 +170,12 @@ pub fn unmap(guest: u64, len: u64) {
     }
 }
 
-/// Change the protections of guest addresses `[guest, guest + len)`.
+/// Change the protections of guest addresses `[guest, guest + len)`. Any of
+/// it not mapped in the VM yet (the break's reservation above the current
+/// break, say) is mapped now, as the host's `mprotect` of the same memory
+/// made it accessible there.
 pub fn protect(guest: u64, len: u64, prot: u64) {
-    let pieces: Vec<(u64, u64, u64)> = {
-        let m = mappings();
-        m.range(..guest + len)
-            .rev()
-            .take_while(|&(_, &(e, _, _))| e > guest)
-            .map(|(&s, &(e, _, host))| {
-                let (lo, hi) = (s.max(guest), e.min(guest + len));
-                (lo, hi, host + (lo - s))
-            })
-            .collect()
-    };
-    for (lo, hi, host) in pieces {
-        let _ = map(lo, host, hi - lo, prot);
-    }
+    let _ = map(guest, fwe_kernel::uaccess::g2h(guest), len, prot);
 }
 
 /// Map `[guest, guest + len)` again with the same protections, after the
