@@ -1119,6 +1119,27 @@ fn fork_sees_one_instant_of_a_threaded_process() {
     assert_eq!(signals("fork-snapshot"), "consistent snapshots: 8 of 8\n");
 }
 
+/// What a vfork child writes the parent sees: glibc's `posix_spawn` reports
+/// a failed exec through the memory it shares with its child (so it returns
+/// `ENOENT`), and a plain `vfork` child's writes to a global and to the
+/// parent's stack are there once it exits.
+#[test]
+fn vfork_child_shares_memory() {
+    let prog = build_c_dynamic("dynspawn", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "glibc-spawn");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- dynspawn stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), VFORK_SHARES);
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What `dynspawn` prints when the vfork child shares memory.
+const VFORK_SHARES: &str =
+    "posix_spawn of a missing program: 2\nvfork child's writes seen: 42 7, status 0\n";
+
 /// A fork child sees the parent's memory as it was at the fork, and neither
 /// side sees the other's later private writes; shared memory stays shared.
 /// It can use the `epoll` and `timerfd` descriptors it inherited, which on
@@ -1563,9 +1584,10 @@ fn hv_execve_between_backends() {
 /// signals between parent and child, a fork from a threaded process,
 /// resource usage, `posix_spawn` and `vfork` with `execve`, copy-on-write
 /// isolation, a snapshot taken at one instant while another thread writes,
-/// inherited `epoll` and `timerfd` descriptors, and `waitid`, whose child the
+/// inherited `epoll` and `timerfd` descriptors, `waitid`, whose child the
 /// guest ends with `SIGKILL` (relayed, so the child's VM is torn down before
-/// it dies; see docs/hypervisor.md).
+/// it dies; see docs/hypervisor.md), and a `vfork` child sharing its
+/// parent's memory.
 #[test]
 fn hv_fork_and_vfork() {
     let Some(out) = fwe_hv(&asm_guest("forktest-low"), &[]) else { return };
@@ -1595,4 +1617,10 @@ fn hv_fork_and_vfork() {
         assert_eq!(stdout(&out), want, "{scenario}");
         assert_eq!(out.status.code(), Some(0), "{scenario}");
     }
+    let prog = build_c("dynspawn", Libc::Glibc, true, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-spawn-nopie");
+    let out = fwe_hv_in(&root, &prog, &[]).unwrap();
+    assert_eq!(stdout(&out), VFORK_SHARES);
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
 }

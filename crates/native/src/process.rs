@@ -6,6 +6,7 @@ use crate::{
     x18_slot,
 };
 use fwe_abi::{clone as cl, err, errno};
+use fwe_kernel::mm::region;
 use fwe_kernel::{Platform, Regs, host, thread};
 use std::sync::atomic::Ordering;
 
@@ -124,11 +125,11 @@ static VFORK_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::
 /// ([`crate::quiesce`]), so the child sees one instant of memory.
 ///
 /// With `vfork` (`CLONE_VM | CLONE_VFORK`, as `posix_spawn` and `vfork` use)
-/// the child gets a copy of the address space rather than sharing it, and
-/// the parent waits until the child has called `execve` or exited, as Linux
-/// suspends it. That suits the spawn helpers, which only exec or exit in the
-/// child; a child that writes to memory the parent later reads (glibc's
-/// `posix_spawn` reporting an exec failure) is not seen by the parent.
+/// the child shares the guest's memory with the parent, and the parent
+/// waits until the child has called `execve` or exited, as Linux suspends
+/// it; what the child writes before then (glibc's `posix_spawn` reporting an
+/// exec failure, say) the parent sees. Its own mappings are its own: an
+/// `mmap` or `munmap` in the child does not reach the parent.
 pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
@@ -146,10 +147,23 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
     let (pid, kqueues) = {
         let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let kqueues = fwe_kernel::kqueue_state();
+        // A vfork child shares the guest's memory: its private parts are
+        // shared for the fork, then copied again by any later one (in either
+        // process). The kernel lock keeps the guest's mappings as they are.
+        let share =
+            if vfork { region::private_parts(&fwe_kernel::mm::tracked()) } else { Vec::new() };
+        let set_shared = |on: bool| {
+            for &(start, len) in &share {
+                region::set_shared_on_fork(start, len, on);
+            }
+        };
         let pid = fwe_kernel::fork_locked(|| {
+            set_shared(true);
             // SAFETY: plain host call; the child continues with only the
             // calling thread, as on Linux.
-            crate::quiesce::fork_stopped(|| unsafe { libc::fork() })
+            let pid = crate::quiesce::fork_stopped(|| unsafe { libc::fork() });
+            set_shared(false);
+            pid
         });
         (pid, kqueues)
     };

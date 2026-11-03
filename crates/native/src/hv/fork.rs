@@ -32,8 +32,9 @@
 //!
 //! The parent returns once the child has its memory and state and is about
 //! to run (a pipe carries its word); a `vfork` parent waits on, until the
-//! child execs or exits. As for the native backend, the `vfork` child gets a
-//! copy of the parent's memory rather than sharing it.
+//! child execs or exits. A `vfork` child is given every region as a share
+//! (`MAP_MEM_VM_SHARE`), so what it writes before then the parent sees, as
+//! on Linux.
 
 use super::backend::{self, HvPlatform};
 use super::{vm, window};
@@ -195,9 +196,11 @@ struct Region {
 }
 
 /// One memory entry per region of guest memory, with the regions. Private
-/// memory is snapshotted copy-on-write, shared memory shared. A region the
-/// host has made unreadable is made readable for the moment it takes.
-fn take_memory() -> Result<(Vec<Region>, Vec<Port>), String> {
+/// memory is snapshotted copy-on-write, shared memory shared; for a `vfork`
+/// child (`share_all`) private memory is shared too, while each region keeps
+/// its kind for the child's own later forks. A region the host has made
+/// unreadable is made readable for the moment it takes.
+fn take_memory(share_all: bool) -> Result<(Vec<Region>, Vec<Port>), String> {
     // The child can only rebuild a VM whose memory is all in the window.
     let used = window::used_ranges();
     for (guest, len, _, host) in vm::mapping_list() {
@@ -226,7 +229,7 @@ fn take_memory() -> Result<(Vec<Region>, Vec<Port>), String> {
                 // kernel lock held; restored below.
                 unsafe { libc::mprotect(lo as *mut _, (hi - lo) as usize, libc::PROT_READ) };
             }
-            let mode = if shared { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
+            let mode = if shared || share_all { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
             let mut entry = 0;
             let mut max = VM_PROT_READ | VM_PROT_WRITE;
             let mut kr = KERN_SUCCESS;
@@ -393,7 +396,7 @@ pub(super) fn fork(
         // and state are captured. The descriptors stay as captured until
         // the child holds them, as the kernel lock keeps every close out.
         backend::pause_others();
-        let taken = take_memory();
+        let taken = take_memory(vfork);
         let mut e = Enc::new();
         if let Ok((regions, _)) = &taken {
             save_regs(&mut e, parent);
