@@ -209,6 +209,125 @@ pub fn signal_to_linux(host: libc::c_int) -> u64 {
     signal::SIGABRT
 }
 
+/// The host signal the backend uses to interrupt a guest thread blocked in a
+/// host call, so it notices a signal recorded for it (one with no host
+/// equivalent). Never one a Linux signal maps to.
+#[cfg(target_os = "macos")]
+pub const WAKE_SIGNAL: libc::c_int = libc::SIGEMT;
+#[cfg(not(target_os = "macos"))]
+pub const WAKE_SIGNAL: libc::c_int = libc::SIGPWR;
+
+pub fn empty_sigset() -> libc::sigset_t {
+    // SAFETY: an all-zero sigset_t is valid storage; sigemptyset initializes it.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        set
+    }
+}
+
+/// The host signal set holding the relayed signals in Linux set `mask`.
+pub fn host_sigset(mask: u64) -> libc::sigset_t {
+    let mut set = empty_sigset();
+    for sig in 1..=signal::NSIG {
+        if mask & (1 << (sig - 1)) != 0 && crate::signal::relayed(sig) {
+            if let Some(h) = signal_to_host(sig) {
+                // SAFETY: `set` is an initialized signal set.
+                unsafe { libc::sigaddset(&mut set, h) };
+            }
+        }
+    }
+    set
+}
+
+/// The host mask a guest thread with blocked mask `mask` runs under: its
+/// relayed signals, except those a `signalfd` reads, which must reach the
+/// backend's handler to be queued on the descriptor.
+pub fn host_mask_for(mask: u64) -> libc::sigset_t {
+    host_sigset(mask & !crate::signalfd::watched())
+}
+
+/// Relayed signals pending in the host for the calling thread or process
+/// (those the guest blocks), as a Linux set.
+pub fn pending_signals() -> u64 {
+    let mut set = empty_sigset();
+    // SAFETY: `set` is a valid out-parameter.
+    unsafe { libc::sigpending(&mut set) };
+    let mut out = 0;
+    for sig in 1..=signal::NSIG {
+        if let Some(h) = signal_to_host(sig).filter(|_| crate::signal::relayed(sig)) {
+            // SAFETY: `set` is an initialized signal set.
+            if unsafe { libc::sigismember(&set, h) } == 1 {
+                out |= 1 << (sig - 1);
+            }
+        }
+    }
+    out
+}
+
+/// Whether the host currently ignores Linux signal `sig`.
+pub fn signal_is_ignored(sig: u64) -> bool {
+    let Some(h) = signal_to_host(sig) else { return false };
+    // SAFETY: querying a disposition into a zeroed sigaction.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(h, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Translate a host `si_code` into Linux's. The `SIGCHLD` codes and the
+/// fault codes are the same; the codes for user-sent signals differ.
+pub fn si_code_to_linux(code: i32) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        match code {
+            0x10001 => return signal::SI_USER,
+            0x10002 => return signal::SI_QUEUE,
+            0x10003 => return signal::SI_TIMER,
+            0x10004 => return signal::SI_ASYNCIO,
+            0x10005 => return signal::SI_MESGQ,
+            _ => {}
+        }
+    }
+    code
+}
+
+/// Write host resource usage into a guest `struct rusage` (two `timeval`s
+/// and fourteen `long`s on both hosts). macOS reports `ru_maxrss` in bytes,
+/// Linux in kilobytes.
+///
+/// # Safety
+/// `out` must be zero or point to a writable guest `struct rusage`.
+pub unsafe fn write_rusage(out: u64, usage: &libc::rusage) {
+    if out == 0 {
+        return;
+    }
+    let maxrss = if cfg!(target_os = "macos") { usage.ru_maxrss / 1024 } else { usage.ru_maxrss };
+    let words: [i64; 18] = [
+        usage.ru_utime.tv_sec,
+        usage.ru_utime.tv_usec as i64,
+        usage.ru_stime.tv_sec,
+        usage.ru_stime.tv_usec as i64,
+        maxrss,
+        usage.ru_ixrss,
+        usage.ru_idrss,
+        usage.ru_isrss,
+        usage.ru_minflt,
+        usage.ru_majflt,
+        usage.ru_nswap,
+        usage.ru_inblock,
+        usage.ru_oublock,
+        usage.ru_msgsnd,
+        usage.ru_msgrcv,
+        usage.ru_nsignals,
+        usage.ru_nvcsw,
+        usage.ru_nivcsw,
+    ];
+    const _: () = assert!(18 * 8 == fwe_abi::resource_usage::RUSAGE_SIZE);
+    // SAFETY: the caller guarantees 144 writable bytes at `out`.
+    unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out as *mut i64, words.len()) };
+}
+
 /// File status flags (`F_GETFL`) from host to Linux.
 pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
     let mut f = match host & libc::O_ACCMODE {

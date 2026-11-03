@@ -1,16 +1,18 @@
 //! `signalfd`: read pending signals through a file descriptor.
 //!
-//! The guest's signals are virtual — the kernel tracks them itself rather than
-//! as host signals — so `signalfd` cannot be delegated to the host on either
-//! platform. It is emulated here: each signalfd is a pipe (for readiness, so it
-//! is pollable by `epoll`) plus a queue of `signalfd_siginfo` records and the
-//! set of signals it watches. When the guest raises a signal that is blocked
-//! and some signalfd watches it, [`deliver`] queues a record instead of leaving
-//! it pending, and `read` returns the queued records.
+//! The host has no `signalfd`, so it is emulated here: each signalfd is a pipe
+//! (for readiness, so it is pollable by `epoll`) plus a queue of
+//! `signalfd_siginfo` records and the set of signals it watches. The host
+//! never blocks a watched signal, so it always reaches the backend's handler
+//! and is recorded pending; a pending signal that the thread blocks and some
+//! signalfd watches is then moved onto that signalfd
+//! ([`crate::signal::drain_to_signalfd`]), and `read` returns the queued
+//! records.
 
 use fwe_abi::{err, errno};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Size of `struct signalfd_siginfo`.
 pub const SIGINFO_SIZE: usize = 128;
@@ -24,10 +26,26 @@ struct SignalFd {
 }
 
 static REG: Mutex<Option<HashMap<i32, SignalFd>>> = Mutex::new(None);
+/// The union of every signalfd's mask, readable without the lock.
+static WATCHED: AtomicU64 = AtomicU64::new(0);
 
 fn with<R>(f: impl FnOnce(&mut HashMap<i32, SignalFd>) -> R) -> R {
-    let mut g = REG.lock().unwrap();
-    f(g.get_or_insert_with(HashMap::new))
+    let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    let reg = g.get_or_insert_with(HashMap::new);
+    let r = f(reg);
+    WATCHED.store(reg.values().fold(0, |m, s| m | s.mask), Ordering::Release);
+    r
+}
+
+/// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// The signals some signalfd watches (a Linux set).
+pub fn watched() -> u64 {
+    WATCHED.load(Ordering::Acquire)
 }
 
 /// Descriptors the emulation holds for itself (the write ends of the
@@ -38,9 +56,16 @@ pub fn internal_fds() -> Vec<i32> {
 
 /// Build a minimal `signalfd_siginfo` for signal `sig`.
 pub fn siginfo(sig: u32, pid: u32, status: i32) -> [u8; SIGINFO_SIZE] {
+    siginfo_full(sig, 0, pid as i32, 0, status)
+}
+
+/// Build a `signalfd_siginfo` with its code, sender and status.
+pub fn siginfo_full(sig: u32, code: i32, pid: i32, uid: u32, status: i32) -> [u8; SIGINFO_SIZE] {
     let mut b = [0u8; SIGINFO_SIZE];
     b[0..4].copy_from_slice(&sig.to_ne_bytes()); // ssi_signo
+    b[8..12].copy_from_slice(&code.to_ne_bytes()); // ssi_code
     b[12..16].copy_from_slice(&pid.to_ne_bytes()); // ssi_pid
+    b[16..20].copy_from_slice(&uid.to_ne_bytes()); // ssi_uid
     b[48..52].copy_from_slice(&status.to_ne_bytes()); // ssi_status
     b
 }
@@ -147,12 +172,24 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
         match got {
             Some(r) => return Some(r),
             None => {
+                // A signal that interrupted the wait below is pending against
+                // this thread; queue it if it is one of ours.
+                crate::signal::drain_to_signalfd();
+                if with(|m| m.get(&fd).is_some_and(|s| !s.queue.is_empty())) {
+                    continue;
+                }
                 if nonblock {
                     return Some(err(errno::EAGAIN));
                 }
                 let mut pfd = libc::pollfd { fd: rfd, events: libc::POLLIN, revents: 0 };
                 // SAFETY: a valid single-element pollfd; wait indefinitely.
-                unsafe { libc::poll(&mut pfd, 1, -1) };
+                if unsafe { libc::poll(&mut pfd, 1, -1) } < 0
+                    && crate::host::last_errno() == libc::EINTR
+                    && crate::thread::deliverable() != 0
+                {
+                    // A signal the guest handles: let it run.
+                    return Some(err(errno::EINTR));
+                }
             }
         }
     }

@@ -3,6 +3,8 @@
 use crate::host::{last_error, ret};
 use crate::{Kernel, Platform};
 use fwe_abi::{err, errno, mman};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// The program break: a reserved region after the executable image that
 /// `brk` commits and releases.
@@ -12,6 +14,75 @@ pub struct Brk {
     pub current: u64,
     /// End of the reservation; the break cannot grow past it.
     pub limit: u64,
+}
+
+/// Every range of address space that belongs to the guest program: its
+/// images, stack, break, code stubs and everything it maps. `execve` unmaps
+/// them all before loading the new program, as Linux discards the old
+/// address space; fwe's own memory is never in the set.
+static GUEST_MAPS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn guest_maps() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    GUEST_MAPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record `[addr, addr + len)` as guest memory.
+pub fn track(addr: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let mut maps = guest_maps();
+    let (mut start, mut end) = (addr, addr.saturating_add(len));
+    // Absorb every range that overlaps or touches the new one.
+    let touching: Vec<(u64, u64)> =
+        maps.range(..=end).rev().take_while(|&(_, &e)| e >= start).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in touching {
+        maps.remove(&s);
+        start = start.min(s);
+        end = end.max(e);
+    }
+    maps.insert(start, end);
+}
+
+/// Forget `[addr, addr + len)` (the guest unmapped it).
+pub fn untrack(addr: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let mut maps = guest_maps();
+    let end = addr.saturating_add(len);
+    let overlapping: Vec<(u64, u64)> =
+        maps.range(..end).rev().take_while(|&(_, &e)| e > addr).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in overlapping {
+        maps.remove(&s);
+        if s < addr {
+            maps.insert(s, addr);
+        }
+        if e > end {
+            maps.insert(end, e);
+        }
+    }
+}
+
+/// The guest memory ranges, in address order.
+pub fn tracked() -> Vec<(u64, u64)> {
+    guest_maps().iter().map(|(&s, &e)| (s, e - s)).collect()
+}
+
+/// Unmap all guest memory (the old program, at `execve`).
+pub fn release_guest_memory() {
+    let ranges = std::mem::take(&mut *guest_maps());
+    for (start, end) in ranges {
+        // SAFETY: only guest memory is tracked, and the old program is
+        // discarded; fwe runs on its own stacks.
+        unsafe { libc::munmap(start as *mut libc::c_void, (end - start) as usize) };
+    }
+}
+
+/// Run `f` holding the tracking lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = guest_maps();
+    f()
 }
 
 impl Brk {
@@ -24,7 +95,10 @@ impl Brk {
     /// fall back to `mmap`, as they do on Linux when `brk` fails.
     pub fn reserve(start: u64, size: u64) -> Brk {
         match crate::host::reserve_fixed(start, size) {
-            Ok(()) => Brk { start, current: start, limit: start + size },
+            Ok(()) => {
+                track(start, size);
+                Brk { start, current: start, limit: start + size }
+            }
             Err(_) => Brk { start, current: start, limit: start },
         }
     }
@@ -219,6 +293,27 @@ mod tests {
     /// Private anonymous memory reads back as zero after `MADV_DONTNEED`;
     /// shared memory keeps its contents; protections are preserved.
     #[test]
+    fn tracking_merges_and_splits_ranges() {
+        // Far from anything the tests map, so concurrent tests do not
+        // interfere with the ranges checked here.
+        let base = 0x7a00_0000_0000;
+        let here = |t: Vec<(u64, u64)>| -> Vec<(u64, u64)> {
+            t.into_iter().filter(|&(s, _)| (base..base + 0x10_0000).contains(&s)).collect()
+        };
+        track(base, 0x4000);
+        track(base + 0x4000, 0x4000);
+        track(base + 0x10000, 0x4000);
+        assert_eq!(here(tracked()), vec![(base, 0x8000), (base + 0x10000, 0x4000)]);
+        untrack(base + 0x2000, 0x1000);
+        assert_eq!(
+            here(tracked()),
+            vec![(base, 0x2000), (base + 0x3000, 0x5000), (base + 0x10000, 0x4000)]
+        );
+        untrack(base, 0x20000);
+        assert_eq!(here(tracked()), vec![]);
+    }
+
+    #[test]
     fn dontneed_zero_fills_private_and_keeps_shared() {
         let len = 1 << 16;
         let private = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE);
@@ -397,6 +492,7 @@ impl<P: Platform> Kernel<P> {
             unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
             return err(errno::EEXIST);
         }
+        track(p, self.page_up(len));
         if exec {
             // Translate the code. For a file-backed mapping, confine the
             // rewrite to the file's executable sections, so data mapped into
@@ -419,6 +515,7 @@ impl<P: Platform> Kernel<P> {
                 if let Err(e) = self.platform.prepare_exec(a, l) {
                     // SAFETY: unmapping the mapping just created.
                     unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+                    untrack(p, self.page_up(len));
                     return err(e);
                 }
             }
@@ -428,6 +525,7 @@ impl<P: Platform> Kernel<P> {
                 let e = last_error();
                 // SAFETY: unmapping the mapping just created.
                 unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+                untrack(p, self.page_up(len));
                 return e;
             }
         }
@@ -436,7 +534,11 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
         // SAFETY: guest-requested unmapping of guest memory.
-        ret(unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) })
+        let r = ret(unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) });
+        if r == 0 {
+            untrack(addr, self.page_up(len));
+        }
+        r
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
@@ -490,6 +592,7 @@ impl<P: Platform> Kernel<P> {
                 unsafe {
                     libc::munmap((old + new_len) as *mut libc::c_void, (old_len - new_len) as usize)
                 };
+                untrack(old + new_len, old_len - new_len);
             }
             return old as i64;
         }

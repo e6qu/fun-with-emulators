@@ -150,6 +150,7 @@ pub fn load(
         })?;
         plan.start
     };
+    fwe_kernel::mm::track(base, total);
     let bias = base - plan.start;
     let mut arena = StubArena { next: base + plan.len, end: base + total };
 

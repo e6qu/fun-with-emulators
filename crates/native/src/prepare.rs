@@ -182,7 +182,10 @@ fn find_region(
         .flat_map(|k| [after + k * PLACEMENT_STEP, before.saturating_sub(k * PLACEMENT_STEP)]);
     for r in candidates.filter(|&r| r != 0 && reachable(r)) {
         match reserve_fixed(r, size) {
-            Ok(()) => return Ok(r),
+            Ok(()) => {
+                fwe_kernel::mm::track(r, size);
+                return Ok(r);
+            }
             Err(e) => last_error = format!("{r:#x}: {e}"),
         }
     }
@@ -203,6 +206,7 @@ fn find_region(
             continue;
         }
         if reachable(p as u64) {
+            fwe_kernel::mm::track(p as u64, size);
             return Ok(p as u64);
         }
         last_error = format!("host placed stubs at {:#x}, out of range", p as u64);

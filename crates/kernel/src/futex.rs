@@ -101,6 +101,15 @@ unsafe fn wait_deadline_abs(timeout: u64, realtime: bool) -> Option<Instant> {
     Some(Instant::now() + target.saturating_sub(now))
 }
 
+/// Run `f` holding the wait-queue lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = table().queues.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// How often a blocked futex wait checks for a pending signal.
+const SIGNAL_CHECK: Duration = Duration::from_millis(20);
+
 /// Block while the futex word still equals `val`.
 ///
 /// # Safety
@@ -119,24 +128,32 @@ unsafe fn wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
         if unsafe { load(uaddr) } != val {
             break;
         }
-        let timed_out;
-        (queues, timed_out) = match deadline {
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    (queues, true)
-                } else {
-                    let (g, r) = table.cv.wait_timeout(queues, d - now).unwrap();
-                    (g, r.timed_out())
-                }
-            }
-            None => (table.cv.wait(queues).unwrap(), false),
-        };
-        // SAFETY: caller guarantees `uaddr` is valid.
-        if timed_out && unsafe { load(uaddr) } == val {
+        // A condition variable is not interrupted by host signals, so wait in
+        // slices and check for a signal the guest should take, which ends the
+        // wait with EINTR as on Linux.
+        if crate::thread::deliverable() != 0 {
             decrement(&mut queues, uaddr);
-            return err(errno::ETIMEDOUT);
+            return err(errno::EINTR);
         }
+        if crate::thread::pending() & crate::signalfd::watched() != 0 {
+            // A signal for a signalfd landed on this thread; queue it there
+            // (outside the wait-queue lock, which ranks below the signalfd
+            // registry's) so the reader wakes.
+            drop(queues);
+            crate::signal::drain_to_signalfd();
+            queues = table.queues.lock().unwrap();
+            continue;
+        }
+        let now = Instant::now();
+        let slice = match deadline {
+            Some(d) if now >= d => {
+                decrement(&mut queues, uaddr);
+                return err(errno::ETIMEDOUT);
+            }
+            Some(d) => (d - now).min(SIGNAL_CHECK),
+            None => SIGNAL_CHECK,
+        };
+        queues = table.cv.wait_timeout(queues, slice).unwrap().0;
     }
     decrement(&mut queues, uaddr);
     0

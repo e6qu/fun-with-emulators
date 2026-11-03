@@ -33,6 +33,12 @@ use std::sync::Mutex;
 /// (no `--root`).
 static ROOTFS: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// Run `f` holding the rootfs lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = ROOTFS.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// Set the rootfs used to root `AF_UNIX` socket paths. Called at program load.
 pub fn set_rootfs(root: Option<PathBuf>) {
     *ROOTFS.lock().unwrap() = root;

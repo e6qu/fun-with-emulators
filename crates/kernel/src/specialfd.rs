@@ -154,6 +154,16 @@ pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
     }
 }
 
+/// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(target_os = "linux")]
+    {
+        f()
+    }
+    #[cfg(not(target_os = "linux"))]
+    imp::hold(f)
+}
+
 /// Descriptors the emulation holds for itself, which `execve` must keep open.
 pub fn internal_fds() -> Vec<i32> {
     #[cfg(target_os = "linux")]
@@ -196,8 +206,13 @@ mod imp {
     static REG: Mutex<Option<HashMap<i32, Special>>> = Mutex::new(None);
 
     fn with_reg<R>(f: impl FnOnce(&mut HashMap<i32, Special>) -> R) -> R {
-        let mut g = REG.lock().unwrap();
+        let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
         f(g.get_or_insert_with(HashMap::new))
+    }
+
+    pub(super) fn hold<R>(f: impl FnOnce() -> R) -> R {
+        let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
+        f()
     }
 
     /// Descriptors the emulation holds for itself (the write ends of the

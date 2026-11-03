@@ -1,18 +1,31 @@
-//! Signal delivery: building the arm64 `rt_sigframe`, entering a guest
-//! handler, and restoring on `rt_sigreturn`.
+//! Signals: delivery into guest handlers, `rt_sigreturn`, and the system
+//! calls that send, block and wait for signals.
 //!
-//! Only the general-purpose registers, stack pointer, pc and pstate are saved
-//! and restored across a handler. Floating-point and vector state is not yet
-//! preserved, so a handler that clobbers it corrupts the interrupted context;
-//! this is tracked on the roadmap.
+//! Dispositions are process-wide (in [`Kernel`]); the blocked mask, the
+//! alternate stack and pending signals are per thread (in [`crate::thread`]).
+//! Signals with a host equivalent travel as host signals: `kill` and `tgkill`
+//! send the host signal, and the backend mirrors each disposition onto the
+//! host ([`Platform::set_host_signal`]) so a signal from anywhere — another
+//! process, the terminal, a timer, a child exiting — is caught by the backend
+//! and recorded pending for the guest, or takes the host's default action,
+//! which is Linux's. Signals with no host equivalent (the real-time signals)
+//! are kept pending here and only travel within the process.
+//!
+//! A frame carries the general-purpose registers and the floating-point and
+//! SIMD state (an `fpsimd_context` record), as on Linux.
 
-use crate::{Kernel, Platform, Regs};
-use fwe_abi::{Sigaction, Stack, signal};
+use crate::thread::{self, SigInfo};
+use crate::{HostSignal, Kernel, Platform, Regs, host};
+use fwe_abi::{Sigaction, Stack, err, errno, signal};
 
 // Offsets within `struct rt_sigframe` on arm64 (`siginfo` then `ucontext`).
 const SIGINFO_SIZE: u64 = 128;
-/// `si_addr` within `siginfo` (the `_sigfault` member).
+/// `si_addr` within `siginfo` (the `_sigfault` member), and where `si_pid`,
+/// `si_uid` and `si_status` start for the other members.
 const SI_ADDR_OFF: u64 = 16;
+const SI_PID_OFF: u64 = 16;
+const SI_UID_OFF: u64 = 20;
+const SI_STATUS_OFF: u64 = 24;
 /// `ucontext` start.
 const UC_OFF: u64 = SIGINFO_SIZE;
 /// `uc_stack` within `ucontext`.
@@ -34,9 +47,19 @@ const MC_PSTATE_OFF: u64 = MC_PC_OFF + 8;
 const MC_RESERVED_OFF: u64 = UC_MCONTEXT_OFF + 288;
 /// Total frame size: through the 4096-byte `__reserved` area.
 const FRAME_SIZE: u64 = MC_RESERVED_OFF + 4096;
+/// Within the `fpsimd_context` record: `fpsr`, `fpcr`, then `vregs[32]`.
+const FPSIMD_FPSR_OFF: u64 = 8;
+const FPSIMD_FPCR_OFF: u64 = 12;
+const FPSIMD_VREGS_OFF: u64 = 16;
 
-/// FP-context magic that marks the end of the reserved records (none present).
-const FPSIMD_MAGIC_NULL: u64 = 0;
+/// How many `rt_sigtimedwait` calls are waiting for each signal; while any
+/// is, the host catches it whatever its disposition.
+static WAITERS: [std::sync::atomic::AtomicU32; signal::NSIG as usize] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; signal::NSIG as usize];
+
+const fn bit(sig: u64) -> u64 {
+    1 << (sig - 1)
+}
 
 /// Guest addresses are host addresses; callers pass addresses inside the
 /// guest stack frame they are building or reading.
@@ -52,38 +75,183 @@ unsafe fn peek(addr: u64) -> u64 {
     // SAFETY: the caller guarantees `addr` is a readable guest address.
     unsafe { (addr as *const u64).read_unaligned() }
 }
+unsafe fn peek32(addr: u64) -> u32 {
+    // SAFETY: the caller guarantees `addr` is a readable guest address.
+    unsafe { (addr as *const u32).read_unaligned() }
+}
 
 fn align_down(x: u64, a: u64) -> u64 {
     x & !(a - 1)
 }
 
+/// Whether Linux signal `sig` is relayed through the host: it has a host
+/// equivalent and is not one the backend itself owns. `SIGKILL` and
+/// `SIGSTOP` cannot be caught; `SIGTRAP`, `SIGSEGV`, `SIGBUS`, `SIGILL` and
+/// `SIGFPE` are the synchronous faults the backend handles itself.
+pub fn relayed(sig: u64) -> bool {
+    host::signal_to_host(sig).is_some()
+        && !matches!(
+            sig,
+            signal::SIGKILL
+                | signal::SIGSTOP
+                | signal::SIGTRAP
+                | signal::SIGSEGV
+                | signal::SIGBUS
+                | signal::SIGILL
+                | signal::SIGFPE
+        )
+}
+
+/// Whether `sig` is one of the fault signals the backend handles itself
+/// (`SIGTRAP`, `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`). The host cannot say
+/// whether such a signal was raised by an instruction or sent, so when the
+/// process sends one to itself it is emulated, like a real-time signal,
+/// rather than sent through the host.
+fn owned(sig: u64) -> bool {
+    matches!(
+        sig,
+        signal::SIGTRAP | signal::SIGSEGV | signal::SIGBUS | signal::SIGILL | signal::SIGFPE
+    )
+}
+
+/// Whether Linux restarts system call `nr` after a handler with
+/// `SA_RESTART` (the calls that wait for I/O or a child, not those that wait
+/// for time or for a signal).
+pub fn restartable(nr: u64, args: &[u64; 6]) -> bool {
+    use fwe_abi::nr as n;
+    match nr {
+        n::READ
+        | n::WRITE
+        | n::READV
+        | n::WRITEV
+        | n::PREAD64
+        | n::PWRITE64
+        | n::WAIT4
+        | n::WAITID
+        | n::ACCEPT
+        | n::ACCEPT4
+        | n::RECVFROM
+        | n::RECVMSG
+        | n::SENDTO
+        | n::SENDMSG
+        | n::OPENAT
+        | n::IOCTL
+        | n::FLOCK
+        | n::FCNTL => true,
+        // A futex wait without a timeout.
+        n::FUTEX => args[3] == 0,
+        _ => false,
+    }
+}
+
+/// Move pending signals that the calling thread blocks and a `signalfd`
+/// watches onto that `signalfd`, as Linux queues them there.
+pub fn drain_to_signalfd() {
+    let mut ready = thread::pending() & thread::mask() & crate::signalfd::watched();
+    while ready != 0 {
+        let sig = ready.trailing_zeros() as u64 + 1;
+        ready &= !bit(sig);
+        if let Some(info) = thread::take_pending(sig) {
+            let record = crate::signalfd::siginfo_full(
+                sig as u32,
+                info.code,
+                info.pid,
+                info.uid,
+                info.status,
+            );
+            crate::signalfd::deliver(sig, record);
+        }
+    }
+}
+
+fn own_info(code: i32) -> SigInfo {
+    // SAFETY: plain host calls.
+    let pid = unsafe { libc::getpid() };
+    SigInfo { code, pid, uid: 0, status: 0 }
+}
+
 impl<P: Platform> Kernel<P> {
-    /// Mark `sig` pending against this process (a self-directed signal).
+    /// Mark `sig` pending against the calling thread (a signal the kernel
+    /// raises itself).
+    #[cfg(test)]
     pub(crate) fn raise_pending(&mut self, sig: u64) {
-        if (1..=signal::NSIG).contains(&sig) {
-            self.pending |= 1 << (sig - 1);
+        thread::post_self(sig, own_info(signal::SI_KERNEL));
+    }
+
+    /// Tell the host how to treat relayed signal `sig`, from its disposition
+    /// and whether a `signalfd` reads it.
+    pub(crate) fn sync_host_signal(&mut self, sig: u64) {
+        if !relayed(sig) {
+            return;
+        }
+        let action = self.sigactions[(sig - 1) as usize];
+        let watched = crate::signalfd::watched() & bit(sig) != 0
+            || WAITERS[(sig - 1) as usize].load(std::sync::atomic::Ordering::SeqCst) > 0;
+        let how = if watched {
+            HostSignal::Catch { flags: action.flags }
+        } else {
+            match action.handler {
+                signal::SIG_DFL => HostSignal::Default,
+                signal::SIG_IGN => HostSignal::Ignore,
+                _ => HostSignal::Catch { flags: action.flags },
+            }
+        };
+        self.platform.set_host_signal(sig, how);
+    }
+
+    pub(crate) fn sync_all_host_signals(&mut self) {
+        for sig in 1..=signal::NSIG {
+            self.sync_host_signal(sig);
         }
     }
 
-    /// Deliver one ready pending signal, if any, before returning to the guest.
-    pub fn deliver_pending(&mut self, regs: &mut Regs) {
-        let ready = self.pending & !self.sigmask;
-        if ready == 0 {
-            return;
+    /// The handler the next pending signal will enter, if a handler (rather
+    /// than a default action or nothing) is next.
+    pub(crate) fn next_handler(&self) -> Option<Sigaction> {
+        let mut ready = thread::deliverable();
+        while ready != 0 {
+            let sig = ready.trailing_zeros() as u64 + 1;
+            ready &= !bit(sig);
+            let action = self.sigactions[(sig - 1) as usize];
+            if action.handler != signal::SIG_DFL && action.handler != signal::SIG_IGN {
+                return Some(action);
+            }
         }
-        let sig = ready.trailing_zeros() as u64 + 1;
-        self.pending &= !(1 << (sig - 1));
-        let action = self.sigactions[(sig - 1) as usize];
-        match action.handler {
-            h if h == signal::SIG_IGN => {}
-            h if h == signal::SIG_DFL => {
-                if signal::default_is_terminate(sig) {
+        None
+    }
+
+    /// Act on the ready pending signals before returning to the guest:
+    /// ignored ones are dropped, default actions are taken, and the first
+    /// one with a handler enters it. Ends a finished `rt_sigsuspend` by
+    /// restoring the mask it replaced, if no handler did.
+    pub fn deliver_pending(&mut self, regs: &mut Regs) {
+        drain_to_signalfd();
+        loop {
+            let ready = thread::deliverable();
+            if ready == 0 {
+                break;
+            }
+            let sig = ready.trailing_zeros() as u64 + 1;
+            let Some(info) = thread::take_pending(sig) else { continue };
+            let action = self.sigactions[(sig - 1) as usize];
+            match action.handler {
+                signal::SIG_IGN => {}
+                signal::SIG_DFL => match signal::default_action(sig) {
+                    signal::Default::Terminate => self.terminate_by(sig),
+                    signal::Default::Stop => self.platform.stop_self(),
+                    signal::Default::Ignore | signal::Default::Continue => {}
+                },
+                _ => {
+                    if self.deliver_to_handler(regs, sig, info, 0) {
+                        break;
+                    }
+                    // No room for a frame: the signal is fatal.
                     self.terminate_by(sig);
                 }
             }
-            _ => {
-                self.deliver_to_handler(regs, sig, signal::SI_USER, 0);
-            }
+        }
+        if let Some(mask) = thread::take_saved_mask() {
+            thread::set_mask(mask);
         }
     }
 
@@ -96,12 +264,13 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Build a signal frame and point `regs` at the handler for `sig`.
-    /// Returns `false` without changing `regs` if `sig` has no handler.
+    /// Returns `false` without changing `regs` if `sig` has no handler or
+    /// there is no room for a frame.
     pub(crate) fn deliver_to_handler(
         &mut self,
         regs: &mut Regs,
         sig: u64,
-        si_code: i32,
+        info: SigInfo,
         fault_addr: u64,
     ) -> bool {
         let action = self.sigactions[(sig - 1) as usize];
@@ -113,12 +282,11 @@ impl<P: Platform> Kernel<P> {
         // A handler already running on the alternate stack keeps using it
         // from its current sp, as Linux does; starting over from the top would
         // overwrite the live frame beneath it.
-        let on_altstack = action.flags & signal::SA_ONSTACK != 0
-            && self.altstack.ss_flags & fwe_abi::signal::SS_DISABLE == 0;
-        let alt_top = self.altstack.ss_sp.wrapping_add(self.altstack.ss_size);
-        let already_on_alt = self.altstack.ss_flags & fwe_abi::signal::SS_DISABLE == 0
-            && regs.sp >= self.altstack.ss_sp
-            && regs.sp < alt_top;
+        let altstack = thread::altstack();
+        let alt_enabled = altstack.ss_flags & signal::SS_DISABLE == 0;
+        let on_altstack = action.flags & signal::SA_ONSTACK != 0 && alt_enabled;
+        let alt_top = altstack.ss_sp.wrapping_add(altstack.ss_size);
+        let already_on_alt = alt_enabled && regs.sp >= altstack.ss_sp && regs.sp < alt_top;
         let base_sp = if on_altstack && !already_on_alt { alt_top } else { regs.sp };
         // If there is no room for a frame (e.g. a stack-overflow fault leaves sp
         // below FRAME_SIZE, or the chosen stack base is tiny), we cannot deliver
@@ -129,21 +297,28 @@ impl<P: Platform> Kernel<P> {
             None => return false,
         };
 
-        let old_mask = self.sigmask;
+        // An `rt_sigsuspend` in progress: the frame restores the mask from
+        // before the call, and the handler runs with the call's mask.
+        let mask = thread::mask();
+        let old_mask = thread::take_saved_mask().unwrap_or(mask);
         // SAFETY: `frame` is a writable region on the guest stack.
         unsafe {
             // zero the whole frame, then fill the fields we define.
             std::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE as usize);
             // siginfo
             poke32(frame, sig as i32); // si_signo
-            poke32(frame + 8, si_code); // si_code
+            poke32(frame + 8, info.code); // si_code
             if fault_addr != 0 {
                 poke(frame + SI_ADDR_OFF, fault_addr);
+            } else {
+                poke32(frame + SI_PID_OFF, info.pid);
+                poke32(frame + SI_UID_OFF, info.uid as i32);
+                poke32(frame + SI_STATUS_OFF, info.status);
             }
             // ucontext
-            poke(frame + UC_STACK_OFF, self.altstack.ss_sp);
-            poke32(frame + UC_STACK_OFF + 8, self.altstack.ss_flags);
-            poke(frame + UC_STACK_OFF + 16, self.altstack.ss_size);
+            poke(frame + UC_STACK_OFF, altstack.ss_sp);
+            poke32(frame + UC_STACK_OFF + 8, altstack.ss_flags);
+            poke(frame + UC_STACK_OFF + 16, altstack.ss_size);
             poke(frame + UC_SIGMASK_OFF, old_mask);
             // sigcontext
             poke(frame + UC_MCONTEXT_OFF, fault_addr); // fault_address
@@ -153,16 +328,28 @@ impl<P: Platform> Kernel<P> {
             poke(frame + MC_SP_OFF, regs.sp);
             poke(frame + MC_PC_OFF, regs.pc);
             poke(frame + MC_PSTATE_OFF, regs.pstate);
-            poke(frame + MC_RESERVED_OFF, FPSIMD_MAGIC_NULL);
+            // The FP/SIMD record, then the zero terminator (already zeroed).
+            let fp = frame + MC_RESERVED_OFF;
+            poke32(fp, signal::FPSIMD_MAGIC as i32);
+            poke32(fp + 4, signal::FPSIMD_CONTEXT_SIZE as i32);
+            poke32(fp + FPSIMD_FPSR_OFF, regs.fp.fpsr as i32);
+            poke32(fp + FPSIMD_FPCR_OFF, regs.fp.fpcr as i32);
+            for (i, v) in regs.fp.v.iter().enumerate() {
+                let at = fp + FPSIMD_VREGS_OFF + i as u64 * 16;
+                poke(at, *v as u64);
+                poke(at + 8, (*v >> 64) as u64);
+            }
         }
 
         // Mask this and the handler's extra signals while it runs.
-        self.sigmask |= action.mask;
+        let mut new_mask = mask | action.mask;
         if action.flags & signal::SA_NODEFER == 0 {
-            self.sigmask |= 1 << (sig - 1);
+            new_mask |= bit(sig);
         }
+        thread::set_mask(new_mask);
         if action.flags & signal::SA_RESETHAND != 0 {
             self.sigactions[(sig - 1) as usize] = Sigaction::default();
+            self.sync_host_signal(sig);
         }
 
         // Enter the handler.
@@ -181,6 +368,14 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
+    /// Deliver synchronous fault signal `sig` (at `addr`) to a guest handler,
+    /// returning `true` if a handler was entered. When `false`, the caller
+    /// takes the default action (terminate).
+    pub fn deliver_fault(&mut self, regs: &mut Regs, sig: u64, addr: u64) -> bool {
+        let info = SigInfo { code: signal::SI_KERNEL, ..SigInfo::default() };
+        self.deliver_to_handler(regs, sig, info, addr)
+    }
+
     /// Restore `regs` from the signal frame at `regs.sp` (the `rt_sigreturn`
     /// system call).
     pub(crate) fn sys_rt_sigreturn(&mut self, regs: &mut Regs) {
@@ -193,11 +388,282 @@ impl<P: Platform> Kernel<P> {
             regs.sp = peek(frame + MC_SP_OFF);
             regs.pc = peek(frame + MC_PC_OFF);
             regs.pstate = peek(frame + MC_PSTATE_OFF);
-            self.sigmask = peek(frame + UC_SIGMASK_OFF);
+            let fp = frame + MC_RESERVED_OFF;
+            if peek32(fp) == signal::FPSIMD_MAGIC {
+                regs.fp.fpsr = peek32(fp + FPSIMD_FPSR_OFF);
+                regs.fp.fpcr = peek32(fp + FPSIMD_FPCR_OFF);
+                for (i, v) in regs.fp.v.iter_mut().enumerate() {
+                    let at = fp + FPSIMD_VREGS_OFF + i as u64 * 16;
+                    *v = peek(at) as u128 | (peek(at + 8) as u128) << 64;
+                }
+            }
+            thread::set_mask(peek(frame + UC_SIGMASK_OFF));
             let ss_sp = peek(frame + UC_STACK_OFF);
             let ss_flags = peek(frame + UC_STACK_OFF + 8) as i32;
             let ss_size = peek(frame + UC_STACK_OFF + 16);
-            self.altstack = Stack { ss_sp, ss_flags, _pad: 0, ss_size };
+            thread::set_altstack(Stack { ss_sp, ss_flags, _pad: 0, ss_size });
+        }
+    }
+
+    /// `kill(pid, sig)`. A relayed signal is sent as the host signal to
+    /// whatever `pid` names (a process, `0` for the caller's process group,
+    /// `-pgid`, or `-1`); the host delivers it, to this process too. A signal
+    /// with no host equivalent can only be sent within this process.
+    pub(crate) fn sys_kill(&mut self, pid: i64, sig: u64) -> i64 {
+        if sig > signal::NSIG {
+            return err(errno::EINVAL);
+        }
+        if sig == 0 {
+            // SAFETY: plain host call; signal 0 only checks the target.
+            return host::ret(unsafe { libc::kill(pid as libc::pid_t, 0) });
+        }
+        let me = thread::tgid() as i64;
+        let to_self = pid == me || pid == 0 || pid == -1;
+        if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
+            // SAFETY: plain host call.
+            return host::ret(unsafe { libc::kill(pid as libc::pid_t, h) });
+        }
+        if to_self {
+            thread::post_process(sig, own_info(signal::SI_USER));
+            // Any thread may take it: interrupt the others' waits so one that
+            // does not block it notices.
+            thread::wake_others(host::WAKE_SIGNAL);
+            return 0;
+        }
+        // Another process cannot be sent a signal the host does not have.
+        err(errno::EINVAL)
+    }
+
+    /// `tgkill(tgid, tid, sig)`, and `tkill(tid, sig)` as `tgid == -1`: send
+    /// `sig` to one thread of this process. A relayed signal is sent to that
+    /// host thread; any other is recorded pending against the thread, which
+    /// is woken to take it.
+    pub(crate) fn sys_tgkill(&mut self, tgid: i64, tid: i64, sig: u64) -> i64 {
+        if sig > signal::NSIG || tid <= 0 || tgid == 0 || tgid < -1 {
+            return err(errno::EINVAL);
+        }
+        let me = thread::tgid() as i64;
+        if tgid != -1 && tgid != me {
+            // A thread of another process: only its main thread is
+            // reachable, through the process.
+            return if tid == tgid { self.sys_kill(tid, sig) } else { err(errno::ESRCH) };
+        }
+        // A tid not registered here is not a thread of this process (an
+        // exited one's number may already be another process's pid).
+        let Some(host_thread) = thread::host_thread(tid as i32) else {
+            return err(errno::ESRCH);
+        };
+        if sig == 0 {
+            return 0;
+        }
+        let r = match host::signal_to_host(sig).filter(|_| !owned(sig)) {
+            // SAFETY: `host_thread` is a live registered guest thread.
+            Some(h) if host_thread != 0 => unsafe { libc::pthread_kill(host_thread, h) },
+            // Not started yet: it takes the signal at its first system call.
+            Some(_) => {
+                thread::post_thread(tid as i32, sig, own_info(signal::SI_TKILL));
+                0
+            }
+            None => {
+                thread::post_thread(tid as i32, sig, own_info(signal::SI_TKILL));
+                if tid as i32 == thread::tid() || host_thread == 0 {
+                    0
+                } else {
+                    // SAFETY: as above; the wake signal interrupts a blocking
+                    // call so the thread takes the signal promptly.
+                    unsafe { libc::pthread_kill(host_thread, host::WAKE_SIGNAL) }
+                }
+            }
+        };
+        if r == 0 { 0 } else { err(host::errno_to_linux(r)) }
+    }
+
+    /// Have the host catch the relayed signals in `want` for the duration of
+    /// an [`sigtimedwait`]; [`Kernel::end_wait`] puts them back.
+    pub fn catch_for_wait(&mut self, want: u64) {
+        for sig in 1..=signal::NSIG {
+            if want & bit(sig) != 0 {
+                WAITERS[(sig - 1) as usize].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.sync_host_signal(sig);
+            }
+        }
+    }
+
+    /// Restore the host dispositions [`Kernel::catch_for_wait`] changed.
+    pub fn end_wait(&mut self, want: u64) {
+        for sig in 1..=signal::NSIG {
+            if want & bit(sig) != 0 {
+                WAITERS[(sig - 1) as usize].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.sync_host_signal(sig);
+            }
+        }
+    }
+
+    /// `rt_sigpending(set, size)`: the signals pending and blocked.
+    pub(crate) fn sys_rt_sigpending(&mut self, set: u64, size: u64) -> i64 {
+        if size > signal::SIGSET_SIZE {
+            return err(errno::EINVAL);
+        }
+        let pending = (thread::pending() | host::pending_signals()) & thread::mask();
+        // SAFETY: the guest passed a buffer for a `sigset_t`.
+        unsafe { (set as *mut u64).write_unaligned(pending) };
+        0
+    }
+}
+
+/// Run a waiting call that takes a signal mask (`ppoll`, `epoll_pwait`)
+/// with the calling thread's mask replaced by the one at `set`, if non-null,
+/// as Linux does. If a signal interrupts the call, the mask stays replaced
+/// until it is delivered and the frame restores the original (as for
+/// [`sigsuspend`]); otherwise it is restored as the call returns.
+///
+/// # Safety
+/// `set` must be null or point to a guest `sigset_t`.
+pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64 {
+    if set == 0 {
+        return call();
+    }
+    // SAFETY: the caller guarantees the signal set.
+    let new = unsafe { (set as *const u64).read_unaligned() };
+    thread::save_mask(thread::mask());
+    thread::set_mask(new);
+    let mut old = host::empty_sigset();
+    let during = host::host_mask_for(new);
+    // SAFETY: plain host calls on valid signal sets.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &during, &mut old) };
+    let r = if thread::deliverable() != 0 { err(errno::EINTR) } else { call() };
+    // SAFETY: restoring the mask saved above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    if r != err(errno::EINTR) {
+        if let Some(mask) = thread::take_saved_mask() {
+            thread::set_mask(mask);
+        }
+    }
+    r
+}
+
+/// `rt_sigsuspend(set, size)`: replace the mask and wait for a signal.
+/// Returns `EINTR` once one is pending; delivering it then restores the mask
+/// from before the call (see [`Kernel::deliver_pending`]). Runs without the
+/// kernel lock.
+///
+/// # Safety
+/// `set` must point to a guest `sigset_t`.
+pub(crate) unsafe fn sigsuspend(set: u64, size: u64) -> i64 {
+    if size != signal::SIGSET_SIZE {
+        return err(errno::EINVAL);
+    }
+    // SAFETY: the caller guarantees the signal set.
+    let new = unsafe { (set as *const u64).read_unaligned() };
+    thread::save_mask(thread::mask());
+    thread::set_mask(new);
+    loop {
+        drain_to_signalfd();
+        // Block every relayed signal while checking, so one that arrives
+        // between the check and the wait is not lost: sigsuspend unblocks
+        // atomically.
+        let all = host::host_sigset(u64::MAX);
+        let mut old = host::empty_sigset();
+        // SAFETY: plain host calls on valid signal sets.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old) };
+        if thread::deliverable() != 0 {
+            // SAFETY: restoring the mask saved above.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+            return err(errno::EINTR);
+        }
+        let wait = host::host_sigset(thread::mask());
+        // SAFETY: as above; returns after a host handler ran.
+        unsafe {
+            libc::sigsuspend(&wait);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+    }
+}
+
+/// `rt_sigtimedwait(set, info, timeout, size)`: take one pending signal in
+/// `set` (normally blocked), waiting up to `timeout`. Returns the signal, or
+/// `EAGAIN` on timeout. Runs without the kernel lock.
+///
+/// The caller first has the host catch the signals in `set`
+/// ([`Kernel::catch_for_wait`]): they are unblocked on the host while this
+/// waits, so one already pending in the host, or arriving, is recorded with
+/// its sender, and taken here instead of running a handler.
+///
+/// # Safety
+/// `set` must point to a guest `sigset_t`, `info` (if non-null) to a
+/// `siginfo_t`, and `timeout` (if non-null) to a `timespec`.
+pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 {
+    use std::time::{Duration, Instant};
+    if size != signal::SIGSET_SIZE {
+        return err(errno::EINVAL);
+    }
+    // SAFETY: the caller guarantees the signal set.
+    let want = unsafe { (set as *const u64).read_unaligned() };
+    let deadline = (timeout != 0).then(|| {
+        // SAFETY: the caller guarantees the timespec.
+        let ts = unsafe { (timeout as *const fwe_abi::Timespec).read_unaligned() };
+        Instant::now()
+            + Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)
+    });
+    loop {
+        drain_to_signalfd();
+        // Block everything while checking, so a signal arriving between the
+        // check and the wait is not lost: pselect unblocks atomically.
+        let all = host::host_sigset(u64::MAX);
+        let mut old = host::empty_sigset();
+        // SAFETY: plain host calls on valid signal sets.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old) };
+        let ready = thread::pending() & want;
+        if ready != 0 {
+            // SAFETY: restoring the mask saved above.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+            let sig = ready.trailing_zeros() as u64 + 1;
+            let Some(i) = thread::take_pending(sig) else { continue };
+            if info != 0 {
+                // SAFETY: the caller guarantees a `siginfo_t` buffer.
+                unsafe {
+                    std::ptr::write_bytes(info as *mut u8, 0, SIGINFO_SIZE as usize);
+                    poke32(info, sig as i32);
+                    poke32(info + 8, i.code);
+                    poke32(info + SI_PID_OFF, i.pid);
+                    poke32(info + SI_UID_OFF, i.uid as i32);
+                    poke32(info + SI_STATUS_OFF, i.status);
+                }
+            }
+            return sig as i64;
+        }
+        let remaining = match deadline {
+            Some(d) => {
+                let now = Instant::now();
+                if now >= d {
+                    // SAFETY: restoring the mask saved above.
+                    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+                    return err(errno::EAGAIN);
+                }
+                Some(d - now)
+            }
+            None => None,
+        };
+        let ts = remaining.map(|r| libc::timespec {
+            tv_sec: r.as_secs() as libc::time_t,
+            tv_nsec: r.subsec_nanos() as libc::c_long,
+        });
+        let wait = host::host_mask_for(thread::mask() & !want);
+        // SAFETY: valid signal set and timeout; no descriptors are watched.
+        unsafe {
+            libc::pselect(
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                ts.as_ref().map_or(std::ptr::null(), |t| t as *const _),
+                &wait,
+            );
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+        if thread::deliverable() & !want != 0 {
+            // A signal the guest handles arrived instead.
+            return err(errno::EINTR);
         }
     }
 }
@@ -243,6 +709,9 @@ mod tests {
     const TRAMP: u64 = 0x5555_0000;
 
     fn kernel() -> Kernel<NoPlatform> {
+        // Pending signals are per thread; without a registration they would
+        // land in the process-wide set the concurrently running tests share.
+        thread::register_current();
         let mut k = Kernel::new(
             NoPlatform,
             16384,
@@ -280,9 +749,9 @@ mod tests {
         assert_eq!(regs.x[2], frame + UC_OFF); // ucontext
         assert_eq!(regs.x[30], TRAMP); // return to the sigreturn trampoline
         // The handler runs with the signal masked.
-        assert_eq!(k.sigmask, 1 << (signal::SIGUSR1 - 1));
+        assert_eq!(thread::mask(), 1 << (signal::SIGUSR1 - 1));
         // Pending bit cleared.
-        assert_eq!(k.pending, 0);
+        assert_eq!(thread::pending(), 0);
 
         // Now return from the handler.
         regs.x[8] = fwe_abi::nr::RT_SIGRETURN;
@@ -291,7 +760,7 @@ mod tests {
         assert_eq!(regs.sp, top);
         assert_eq!(regs.x[5], 0xdead_beef);
         assert_eq!(regs.x[30], 0xcafe);
-        assert_eq!(k.sigmask, 0);
+        assert_eq!(thread::mask(), 0);
     }
 
     /// A second signal delivered while a handler runs on the alternate stack
@@ -304,7 +773,12 @@ mod tests {
         k.sigactions[(signal::SIGUSR2 - 1) as usize] = act;
         let alt = vec![0u8; 64 * 1024];
         let alt_base = alt.as_ptr() as u64;
-        k.altstack = Stack { ss_sp: alt_base, ss_flags: 0, _pad: 0, ss_size: alt.len() as u64 };
+        thread::set_altstack(Stack {
+            ss_sp: alt_base,
+            ss_flags: 0,
+            _pad: 0,
+            ss_size: alt.len() as u64,
+        });
 
         let mut regs = Regs { sp: 0x9000, pc: 0x1000, ..Regs::default() };
         k.raise_pending(signal::SIGUSR1);
@@ -318,6 +792,8 @@ mod tests {
         k.deliver_pending(&mut regs);
         let second = regs.sp;
         assert!(second + FRAME_SIZE <= first - 256, "second frame {second:#x} overlaps {first:#x}");
+        thread::set_altstack(Stack { ss_flags: signal::SS_DISABLE, ..Stack::default() });
+        thread::set_mask(0);
     }
 
     #[test]
@@ -328,18 +804,113 @@ mod tests {
         k.raise_pending(signal::SIGUSR1);
         k.deliver_pending(&mut regs);
         assert_eq!(regs.pc, 0x1000); // unchanged
-        assert_eq!(k.pending, 0);
+        assert_eq!(thread::pending(), 0);
     }
 
     #[test]
     fn blocked_signal_stays_pending() {
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = HANDLER;
-        k.sigmask = 1 << (signal::SIGUSR1 - 1);
+        thread::set_mask(1 << (signal::SIGUSR1 - 1));
         let mut regs = Regs { sp: 0x9000, pc: 0x1000, ..Regs::default() };
         k.raise_pending(signal::SIGUSR1);
         k.deliver_pending(&mut regs);
         assert_eq!(regs.pc, 0x1000); // not delivered
-        assert_eq!(k.pending, 1 << (signal::SIGUSR1 - 1)); // still pending
+        assert_eq!(thread::pending(), 1 << (signal::SIGUSR1 - 1)); // still pending
+        thread::take_pending(signal::SIGUSR1);
+        thread::set_mask(0);
+    }
+
+    fn stack() -> (Vec<u8>, u64) {
+        let stack = vec![0u8; 64 * 1024];
+        let top = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
+        (stack, top)
+    }
+
+    /// The FP/SIMD registers are saved in an `fpsimd_context` record and
+    /// restored on `rt_sigreturn`, whatever the handler did to them.
+    #[test]
+    fn fp_state_survives_a_handler() {
+        let mut k = kernel();
+        k.sigactions[(signal::SIGUSR2 - 1) as usize].handler = HANDLER;
+        let (_stack, top) = stack();
+        let mut regs = Regs { sp: top, pc: 0x1000, ..Regs::default() };
+        for (i, v) in regs.fp.v.iter_mut().enumerate() {
+            *v = (i as u128 + 1) * 0x0101_0101_0101_0101_0101_0101_0101_0101;
+        }
+        regs.fp.fpsr = 0x10;
+        regs.fp.fpcr = 0x0040_0000;
+        let saved = regs.fp;
+        k.raise_pending(signal::SIGUSR2);
+        k.deliver_pending(&mut regs);
+        let fp = regs.sp + MC_RESERVED_OFF;
+        // SAFETY: reading the frame just built on `stack`.
+        unsafe {
+            assert_eq!(peek32(fp), signal::FPSIMD_MAGIC);
+            assert_eq!(peek32(fp + 4), signal::FPSIMD_CONTEXT_SIZE);
+            assert_eq!(peek(fp + FPSIMD_VREGS_OFF + 16 * 3), saved.v[3] as u64);
+            // The record after it is the terminator.
+            assert_eq!(peek(fp + signal::FPSIMD_CONTEXT_SIZE as u64), 0);
+        }
+        // The handler clobbers the FP state.
+        regs.fp = crate::FpRegs::default();
+        regs.x[8] = fwe_abi::nr::RT_SIGRETURN;
+        k.enter_syscall(&mut regs);
+        assert_eq!(regs.fp, saved);
+        assert_eq!(regs.pc, 0x1000);
+    }
+
+    /// A handler entered from `rt_sigsuspend` runs with the call's mask and
+    /// returns to the mask from before the call.
+    #[test]
+    fn sigsuspend_mask_is_restored_by_sigreturn() {
+        let mut k = kernel();
+        k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = HANDLER;
+        let (_stack, top) = stack();
+        let before = 1 << (signal::SIGUSR1 - 1);
+        thread::save_mask(before);
+        thread::set_mask(1 << (signal::SIGHUP - 1));
+        k.raise_pending(signal::SIGUSR1);
+        let mut regs = Regs { sp: top, pc: 0x1000, ..Regs::default() };
+        k.finish_syscall(&mut regs, fwe_abi::nr::RT_SIGSUSPEND, &[0; 6], err(errno::EINTR));
+        assert_eq!(regs.pc, HANDLER);
+        assert_eq!(thread::mask(), (1 << (signal::SIGHUP - 1)) | before);
+        regs.x[8] = fwe_abi::nr::RT_SIGRETURN;
+        k.enter_syscall(&mut regs);
+        assert_eq!(thread::mask(), before);
+        // sigsuspend is not restarted: it returned EINTR past the trap.
+        assert_eq!(regs.pc, 0x1004);
+        assert_eq!(regs.x[0] as i64, err(errno::EINTR));
+        thread::set_mask(0);
+    }
+
+    /// An interrupted `read` reruns after an `SA_RESTART` handler, and also
+    /// when no handler is waiting (the interruption was not the guest's).
+    #[test]
+    fn interrupted_calls_restart_as_on_linux() {
+        let mut k = kernel();
+        let (_stack, top) = stack();
+        let args = [7, 0, 0, 0, 0, 0];
+        let mut regs = Regs { sp: top, pc: 0x1000, ..Regs::default() };
+        regs.x[0] = 7;
+        k.finish_syscall(&mut regs, fwe_abi::nr::READ, &args, err(errno::EINTR));
+        assert_eq!((regs.pc, regs.x[0]), (0x1000, 7), "nothing to deliver: rerun");
+
+        let act = Sigaction { handler: HANDLER, flags: signal::SA_RESTART, restorer: 0, mask: 0 };
+        k.sigactions[(signal::SIGUSR1 - 1) as usize] = act;
+        k.raise_pending(signal::SIGUSR1);
+        k.finish_syscall(&mut regs, fwe_abi::nr::READ, &args, err(errno::EINTR));
+        assert_eq!(regs.pc, HANDLER);
+        regs.x[8] = fwe_abi::nr::RT_SIGRETURN;
+        k.enter_syscall(&mut regs);
+        assert_eq!((regs.pc, regs.x[0]), (0x1000, 7), "SA_RESTART: rerun after the handler");
+
+        k.sigactions[(signal::SIGUSR1 - 1) as usize].flags = 0;
+        k.raise_pending(signal::SIGUSR1);
+        k.finish_syscall(&mut regs, fwe_abi::nr::READ, &args, err(errno::EINTR));
+        regs.x[8] = fwe_abi::nr::RT_SIGRETURN;
+        k.enter_syscall(&mut regs);
+        assert_eq!(regs.pc, 0x1004);
+        assert_eq!(regs.x[0] as i64, err(errno::EINTR), "no SA_RESTART: EINTR");
     }
 }

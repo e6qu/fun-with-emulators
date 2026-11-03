@@ -21,8 +21,14 @@ struct Dir {
 static REG: Mutex<Option<HashMap<i32, Dir>>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut HashMap<i32, Dir>) -> R) -> R {
-    let mut g = REG.lock().unwrap();
+    let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(HashMap::new))
+}
+
+/// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 /// Open a synthetic directory with the given entries, returning a guest fd.
