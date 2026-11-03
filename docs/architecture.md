@@ -148,13 +148,16 @@ words finds every instruction exactly.
   which get a branch stub that tests the preserved value and takes a
   full-range branch to the real target or the fall-through) and indirect
   branches (`br`/`blr`/`ret` through `x18`, which load the target into
-  `x16`/`x17`, dead at any branch). A stack spill of `x18` through `sp` has
-  its offset bumped by the 32 bytes the stub pushed. What is still left
-  alone, and reported under `--strace` as left unrewritten: a load/store
-  with writeback onto `sp` or a register offset from `sp`, a data-processing
-  form whose operand is `sp` rather than `xzr`, `casp` and the
-  pointer-authenticated loads. These are rare for a caller-saved register
-  and have not appeared in the binaries run so far.
+  `x16`/`x17`, dead at any branch). A stack spill of `x18` through `sp`, and
+  `add`/`sub` of an immediate to `sp` into `x18` (`mov x18, sp`), have the
+  immediate adjusted by the 32 bytes the stub pushed. What is still left
+  alone: a load/store with writeback onto `sp` or a register offset from
+  `sp`, flag-setting, shifted-immediate or extended-register arithmetic
+  from `sp`, `casp` and the pointer-authenticated loads. Scanning the
+  vendored glibc, bash, coreutils and the Rust/musl test programs with the
+  disassembler finds none of these; `--strace` reports, per prepared range,
+  exactly how many `x18` uses were left (a count of real register operands,
+  not of bit patterns).
 
   The backend keeps the slot and the kernel's register view in step: a trap
   reads the guest's `x18` from the slot into `Regs` and writes it back on
@@ -466,10 +469,9 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB cannot run
   in-process (the mandatory `__PAGEZERO`); the hypervisor backend is the path
-  for it, and exists as a spike. `x18` in a load/store with writeback onto
-  `sp` or a register offset from `sp`, in a data-processing form whose
-  operand is `sp`, in `casp` and in the pointer-authenticated loads is left
-  unrewritten (reported under `--strace`). Code discovery relies on section
+  for it, and exists as a spike. A few rare `x18` forms are left
+  unrewritten (see Rewriting guest code; `--strace` counts them). Code
+  discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
   an inline jump table in a code section could be patched.
 - **Processes:** `vfork` copies the address space instead of sharing it
