@@ -132,6 +132,32 @@ impl<P: Platform> Kernel<P> {
         thread::set_robust_list(0, 0);
     }
 
+    /// Close every descriptor marked close-on-exec, as `execve` does before
+    /// entering the new program. fwe's own descriptors — the rootfs handle and
+    /// the pipe ends behind the emulated eventfd and signalfd — carry the flag
+    /// too but belong to the runtime, so they are kept.
+    pub fn close_on_exec(&mut self) {
+        let mut keep = specialfd::internal_fds();
+        keep.extend(signalfd::internal_fds());
+        if let Some(fs) = &self.fs {
+            keep.push(fs.root_fd());
+        }
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `lim` is a valid out-parameter.
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+        let max = lim.rlim_cur.clamp(1024, 1 << 16) as i32;
+        for fd in 0..max {
+            if keep.contains(&fd) {
+                continue;
+            }
+            // SAFETY: plain host call; an unused descriptor yields EBADF.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+                self.dispatch(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+            }
+        }
+    }
+
     /// Run the system call named in `regs` (number in `x8`, arguments in
     /// `x0`–`x5`), store its result and advance past the trap, then deliver a
     /// pending signal if one is ready. `rt_sigreturn` restores `regs` from the
@@ -195,9 +221,12 @@ pub fn wake_futex(addr: u64, count: u32) {
     }
 }
 
-/// Run a system call that must not hold the kernel lock because it can block
-/// (`futex`, `nanosleep`, `clock_nanosleep`). Returns `None` for any other
-/// call, which the backend runs under the lock through [`Kernel::enter_syscall`].
+/// Run a system call that must not hold the kernel lock because it can block:
+/// `futex`, the sleeps, `epoll_pwait`, `ppoll`, the socket calls that wait,
+/// and `read`/`write` and their vectored and positioned forms (a pipe, socket
+/// or terminal blocks until the other side acts, and the other side may be a
+/// guest thread that needs the lock). Returns `None` for any other call,
+/// which the backend runs under the lock through [`Kernel::enter_syscall`].
 ///
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
@@ -224,10 +253,39 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             // SAFETY: caller guarantees the buffer spans the length.
-            return unsafe { signalfd::try_read(fd, buf, len) };
+            if let Some(r) = unsafe { signalfd::try_read(fd, buf, len) } {
+                return Some(r);
+            }
+            // SAFETY: the host validates the guest buffer.
+            host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
         }
-        // SAFETY: caller guarantees the buffer spans the length.
-        n::WRITE => return unsafe { specialfd::try_write(a[0] as i32, a[1], a[2]) },
+        n::WRITE => {
+            let (fd, buf, len) = (a[0] as i32, a[1], a[2]);
+            // SAFETY: caller guarantees the buffer spans the length.
+            if let Some(r) = unsafe { specialfd::try_write(fd, buf, len) } {
+                return Some(r);
+            }
+            // SAFETY: the host validates the guest buffer.
+            host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
+        }
+        n::READV => {
+            // SAFETY: `struct iovec` has the same layout; the host validates it.
+            host::ret(unsafe { libc::readv(a[0] as i32, a[1] as *const _, a[2] as i32) } as i64)
+        }
+        n::WRITEV => {
+            // SAFETY: `struct iovec` has the same layout; the host validates it.
+            host::ret(unsafe { libc::writev(a[0] as i32, a[1] as *const _, a[2] as i32) } as i64)
+        }
+        // SAFETY: the host validates the guest buffer.
+        n::PREAD64 => host::ret(unsafe {
+            libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
+        } as i64),
+        // SAFETY: the host validates the guest buffer.
+        n::PWRITE64 => host::ret(unsafe {
+            libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
+        } as i64),
+        // SAFETY: caller guarantees the pollfd array and timeout pointers.
+        n::PPOLL => unsafe { syscalls::ppoll(a[0], a[1], a[2]) },
         // Socket calls that can block run without the kernel lock, so a thread
         // waiting in accept/recv does not stall the threads meant to feed it.
         // SAFETY: caller guarantees the sockaddr pointer.

@@ -101,10 +101,30 @@ impl Drop for HostCode {
     }
 }
 
+/// The TSD key of the guest `x18` slot (see [`crate::x18_slot`]).
+fn x18_key() -> libc::pthread_key_t {
+    (crate::x18_slot() / 8) as libc::pthread_key_t
+}
+
+/// The calling thread's guest `x18`. Rewritten guest code keeps `x18` in a
+/// per-thread slot rather than the hardware register (which macOS clears), so
+/// the slot, not the saved register, is the guest's value.
+pub fn guest_x18() -> u64 {
+    // SAFETY: reading this thread's value for a key fwe created.
+    unsafe { libc::pthread_getspecific(x18_key()) as u64 }
+}
+
+/// Set the calling thread's guest `x18`.
+pub fn set_guest_x18(value: u64) {
+    // SAFETY: setting this thread's value for a key fwe created.
+    unsafe { libc::pthread_setspecific(x18_key(), value as *const libc::c_void) };
+}
+
 /// Read the backend thread state into the kernel's register view.
 fn regs_from(ss: &ThreadState) -> Regs {
     let mut regs = Regs { sp: ss.sp, pc: ss.pc, pstate: ss.cpsr as u64, ..Regs::default() };
     regs.x[..29].copy_from_slice(&ss.x);
+    regs.x[18] = guest_x18();
     regs.x[29] = ss.fp;
     regs.x[30] = ss.lr;
     regs
@@ -113,6 +133,7 @@ fn regs_from(ss: &ThreadState) -> Regs {
 /// Write the kernel's register view back into the backend thread state.
 fn regs_to(ss: &mut ThreadState, regs: &Regs) {
     ss.x.copy_from_slice(&regs.x[..29]);
+    set_guest_x18(regs.x[18]);
     ss.fp = regs.x[29];
     ss.lr = regs.x[30];
     ss.sp = regs.sp;

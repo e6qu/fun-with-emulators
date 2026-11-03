@@ -97,6 +97,8 @@ const ASM_GUESTS: &[&str] = &[
     "x18br",
     "x18fp",
     "x18pc",
+    "x18sig",
+    "pipethread",
     "fileio",
     "sigtest",
     "threadtest",
@@ -513,7 +515,8 @@ fn fork_and_wait() {
 }
 
 /// execve: a guest replaces its image with a second program (from the rootfs)
-/// and the new program runs.
+/// and the new program runs, finding the descriptor its predecessor left open
+/// and not the one it marked close-on-exec.
 #[test]
 fn execve_replaces_program() {
     let root = std::env::temp_dir().join(format!("fwe-exec-{}", std::process::id()));
@@ -830,6 +833,24 @@ fn asm_x18_survives_fp_moves() {
 #[test]
 fn asm_x18_pc_relative_and_indirect() {
     assert_eq!(fwe(&asm_guest("x18pc-pie"), &[]).status.code(), Some(0));
+}
+
+/// x18 across a signal handler: the handler sees the guest's x18 (which lives
+/// in the per-thread slot, not the hardware register) in `uc_mcontext.regs[18]`
+/// and the resume pc in `uc_mcontext.pc`, at the arm64 frame offsets; it
+/// clobbers x18, and `rt_sigreturn` restores it.
+#[test]
+fn asm_x18_across_signal_handler() {
+    assert_eq!(fwe(&asm_guest("x18sig-pie"), &[]).status.code(), Some(0));
+}
+
+/// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
+/// thread that writes to the pipe could never make its own system call.
+#[test]
+fn blocking_read_does_not_stall_writer_thread() {
+    for name in ["pipethread", "pipethread-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
 
 /// TPIDR_EL0 (the Linux thread pointer) across trapped system calls.

@@ -50,9 +50,11 @@ pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
             unsafe { wait(uaddr, val, deadline) }
         }
         futex::FUTEX_WAIT_BITSET => {
-            // Treat the bitset variant as a plain wait (absolute timeout).
+            // Treat the bitset variant as a plain wait. Its timeout is
+            // absolute, on CLOCK_MONOTONIC unless FUTEX_CLOCK_REALTIME is set.
+            let realtime = op & futex::FUTEX_CLOCK_REALTIME != 0;
             // SAFETY: caller guarantees `timeout` is valid when non-null.
-            let deadline = unsafe { wait_deadline_abs(timeout) };
+            let deadline = unsafe { wait_deadline_abs(timeout, realtime) };
             // SAFETY: caller guarantees `uaddr` is valid.
             unsafe { wait(uaddr, val, deadline) }
         }
@@ -77,21 +79,24 @@ unsafe fn wait_deadline(timeout: u64) -> Option<Instant> {
     )
 }
 
-/// A `FUTEX_WAIT_BITSET` absolute (CLOCK_MONOTONIC) timeout as a deadline.
+/// A `FUTEX_WAIT_BITSET` absolute timeout as a deadline. The value is on the
+/// guest's CLOCK_MONOTONIC, or CLOCK_REALTIME when `realtime` is set; it is
+/// read against the same host clock the guest's `clock_gettime` reports, and
+/// the remaining time is carried over to an `Instant`.
 ///
 /// # Safety
 /// `timeout`, when non-null, must point to a guest `Timespec`.
-unsafe fn wait_deadline_abs(timeout: u64) -> Option<Instant> {
+unsafe fn wait_deadline_abs(timeout: u64, realtime: bool) -> Option<Instant> {
     if timeout == 0 {
         return None;
     }
-    // Approximate: treat the absolute time as a short relative wait from now
-    // bounded by the value, since we cannot map another clock's epoch onto
-    // Instant. A spurious early return is permitted for futexes.
     // SAFETY: the caller guarantees a valid pointer.
     let ts: Timespec = unsafe { (timeout as *const Timespec).read_unaligned() };
-    let now =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let clock = if realtime { libc::CLOCK_REALTIME } else { libc::CLOCK_MONOTONIC };
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `now` is a valid out-parameter.
+    unsafe { libc::clock_gettime(clock, &mut now) };
+    let now = Duration::new(now.tv_sec.max(0) as u64, now.tv_nsec.clamp(0, 999_999_999) as u32);
     let target = Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32);
     Some(Instant::now() + target.saturating_sub(now))
 }
@@ -190,6 +195,33 @@ mod tests {
         let woken = unsafe { op(addr, FUTEX_WAKE, 1, 0) };
         assert_eq!(waiter.join().unwrap(), 0);
         assert!(woken <= 1);
+    }
+
+    /// An absolute `FUTEX_WAIT_BITSET` deadline is on CLOCK_MONOTONIC (the
+    /// guest's clock for it), not the realtime clock: a deadline a little in
+    /// the future must actually be waited for, not reported expired at once.
+    #[test]
+    fn bitset_wait_honours_monotonic_deadline() {
+        use fwe_abi::futex::{FUTEX_CLOCK_REALTIME, FUTEX_WAIT_BITSET};
+        let word = AtomicU32::new(0);
+        let addr = &word as *const _ as u64;
+        for (clock, flags) in
+            [(libc::CLOCK_MONOTONIC, 0), (libc::CLOCK_REALTIME, FUTEX_CLOCK_REALTIME)]
+        {
+            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: `now` is a valid out-parameter.
+            unsafe { libc::clock_gettime(clock, &mut now) };
+            let mut ts = Timespec { tv_sec: now.tv_sec, tv_nsec: now.tv_nsec + 40_000_000 };
+            if ts.tv_nsec >= 1_000_000_000 {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1_000_000_000;
+            }
+            let start = Instant::now();
+            // SAFETY: both pointers are to live locals.
+            let r = unsafe { op(addr, FUTEX_WAIT_BITSET | flags, 0, &ts as *const _ as u64) };
+            assert_eq!(r, err(errno::ETIMEDOUT));
+            assert!(start.elapsed() >= Duration::from_millis(30), "returned early");
+        }
     }
 
     #[test]

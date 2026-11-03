@@ -154,6 +154,16 @@ pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
     }
 }
 
+/// Descriptors the emulation holds for itself, which `execve` must keep open.
+pub fn internal_fds() -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        Vec::new()
+    }
+    #[cfg(not(target_os = "linux"))]
+    imp::internal_fds()
+}
+
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use crate::host::last_error;
@@ -188,6 +198,19 @@ mod imp {
     fn with_reg<R>(f: impl FnOnce(&mut HashMap<i32, Special>) -> R) -> R {
         let mut g = REG.lock().unwrap();
         f(g.get_or_insert_with(HashMap::new))
+    }
+
+    /// Descriptors the emulation holds for itself (the write ends of the
+    /// eventfd readiness pipes), which the guest must never see closed.
+    pub fn internal_fds() -> Vec<i32> {
+        with_reg(|reg| {
+            reg.values()
+                .filter_map(|s| match s {
+                    Special::Event(e) => Some(e.wfd),
+                    Special::Timer(_) => None,
+                })
+                .collect()
+        })
     }
 
     fn set_cloexec(fd: i32) {

@@ -46,6 +46,211 @@ fn map_fixed_anon(addr: u64, len: u64, prot: libc::c_int) -> bool {
     p != libc::MAP_FAILED
 }
 
+/// `MADV_DONTNEED` on a Linux host is the real thing.
+#[cfg(not(target_os = "macos"))]
+fn dontneed(addr: u64, len: u64) -> i64 {
+    // SAFETY: advisory call on guest memory.
+    ret(unsafe { libc::madvise(addr as *mut libc::c_void, len as usize, libc::MADV_DONTNEED) })
+}
+
+/// `MADV_DONTNEED`: Linux zero-fills private anonymous pages on their next
+/// touch, and drops shared or file-backed pages to be refilled from their
+/// backing. macOS's own `MADV_DONTNEED` keeps the contents, so each private
+/// anonymous piece of the range is replaced with a fresh mapping of the same
+/// protection. Memory with other backing is left alone: replacing it would
+/// sever the sharing or the file, and host `MADV_FREE` could lose shared data.
+/// (A private file mapping therefore keeps its modified pages, where Linux
+/// would restore the file's.) A hole in the range is `ENOMEM`, as on Linux,
+/// after the mapped pieces are handled.
+#[cfg(target_os = "macos")]
+fn dontneed(addr: u64, len: u64) -> i64 {
+    let end = addr + len;
+    let mut at = addr;
+    let mut hole = false;
+    while at < end {
+        let Some(r) = region::query(at) else {
+            hole = true;
+            break;
+        };
+        if r.start >= end {
+            hole = true;
+            break;
+        }
+        if r.start > at {
+            hole = true;
+        }
+        let piece = (r.start.max(at), (r.start + r.size).min(end));
+        if r.private_anonymous() {
+            let prot = r.protection & (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
+            if !map_fixed_anon(piece.0, piece.1 - piece.0, prot) {
+                return last_error();
+            }
+        }
+        at = piece.1;
+    }
+    if hole { err(errno::ENOMEM) } else { 0 }
+}
+
+/// What backs a range of the host address space, from Mach.
+#[cfg(target_os = "macos")]
+mod region {
+    use std::os::raw::{c_int, c_uchar, c_uint, c_ushort};
+
+    /// `vm_region_basic_info_64`.
+    #[repr(C)]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct BasicInfo {
+        protection: c_int,
+        max_protection: c_int,
+        inheritance: c_uint,
+        shared: c_uint,
+        reserved: c_uint,
+        offset: u64,
+        behavior: c_int,
+        user_wired_count: c_ushort,
+    }
+
+    /// `vm_region_extended_info`.
+    #[repr(C)]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct ExtendedInfo {
+        protection: c_int,
+        user_tag: c_uint,
+        pages_resident: c_uint,
+        pages_shared_now_private: c_uint,
+        pages_swapped_out: c_uint,
+        pages_dirtied: c_uint,
+        ref_count: c_uint,
+        shadow_depth: c_ushort,
+        external_pager: c_uchar,
+        share_mode: c_uchar,
+        pages_reusable: c_uint,
+    }
+
+    const VM_REGION_BASIC_INFO_64: c_int = 9;
+    const VM_REGION_EXTENDED_INFO: c_int = 13;
+    /// `VM_INHERIT_COPY`: what a `MAP_PRIVATE` mapping gets; `MAP_SHARED`
+    /// mappings inherit by sharing (`VM_INHERIT_SHARE`, 0).
+    const VM_INHERIT_COPY: c_uint = 1;
+
+    unsafe extern "C" {
+        /// This task's port (`mach_task_self()` is a macro over it).
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_region(
+            task: libc::mach_port_t,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: c_int,
+            info: *mut c_int,
+            count: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
+    /// One query for `flavor` at `addr`, into a `T`-shaped info record.
+    fn query_flavor<T: Default>(addr: u64, flavor: c_int) -> Option<(u64, u64, T)> {
+        let mut start = addr;
+        let mut size = 0u64;
+        let mut info = T::default();
+        let mut count = (size_of::<T>() / size_of::<c_int>()) as u32;
+        let mut name: libc::mach_port_t = 0;
+        // SAFETY: querying this task's own address space with valid
+        // out-parameters; `count` bounds what the kernel writes into `info`.
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut start,
+                &mut size,
+                flavor,
+                (&mut info as *mut T).cast(),
+                &mut count,
+                &mut name,
+            )
+        };
+        (kr == 0).then_some((start, size, info))
+    }
+
+    /// The region containing `addr`, or the next one above it.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Region {
+        pub start: u64,
+        pub size: u64,
+        pub protection: c_int,
+        /// A file (an external pager) backs the region.
+        file_backed: bool,
+        /// The mapping is `MAP_PRIVATE` (inherits by copy). A `MAP_SHARED`
+        /// anonymous mapping with a single reference looks private in every
+        /// other respect, so this is what tells them apart.
+        private: bool,
+    }
+
+    impl Region {
+        /// Private anonymous memory: what Linux zero-fills on `MADV_DONTNEED`.
+        pub fn private_anonymous(&self) -> bool {
+            self.private && !self.file_backed
+        }
+    }
+
+    pub fn query(addr: u64) -> Option<Region> {
+        let (start, size, basic) = query_flavor::<BasicInfo>(addr, VM_REGION_BASIC_INFO_64)?;
+        let (_, _, ext) = query_flavor::<ExtendedInfo>(start, VM_REGION_EXTENDED_INFO)?;
+        Some(Region {
+            start,
+            size,
+            protection: basic.protection,
+            file_backed: ext.external_pager != 0,
+            private: basic.inheritance == VM_INHERIT_COPY,
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    fn map(len: usize, prot: libc::c_int, flags: libc::c_int) -> u64 {
+        // SAFETY: a fresh anonymous mapping for the test.
+        let p =
+            unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags | libc::MAP_ANON, -1, 0) };
+        assert_ne!(p, libc::MAP_FAILED);
+        p as u64
+    }
+
+    /// Private anonymous memory reads back as zero after `MADV_DONTNEED`;
+    /// shared memory keeps its contents; protections are preserved.
+    #[test]
+    fn dontneed_zero_fills_private_and_keeps_shared() {
+        let len = 1 << 16;
+        let private = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE);
+        let shared = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED);
+        let none = map(len, libc::PROT_NONE, libc::MAP_PRIVATE);
+        // SAFETY: writing inside the mappings just made.
+        unsafe {
+            (private as *mut u8).write(0xaa);
+            (shared as *mut u8).write(0xbb);
+        }
+        assert_eq!(dontneed(private, len as u64), 0);
+        assert_eq!(dontneed(shared, len as u64), 0);
+        assert_eq!(dontneed(none, len as u64), 0);
+        // SAFETY: reading inside the mappings.
+        unsafe {
+            assert_eq!((private as *const u8).read(), 0);
+            assert_eq!((shared as *const u8).read(), 0xbb);
+        }
+        let r = region::query(none).unwrap();
+        assert_eq!(r.protection & 7, 0, "PROT_NONE must survive");
+        // A hole in the range is ENOMEM.
+        // SAFETY: unmapping the test's own mapping.
+        unsafe { libc::munmap(none as *mut _, len) };
+        assert_eq!(dontneed(none, len as u64), err(errno::ENOMEM));
+        // SAFETY: unmapping the test's own mappings.
+        unsafe {
+            libc::munmap(private as *mut _, len);
+            libc::munmap(shared as *mut _, len);
+        }
+    }
+}
+
 /// Largest backing file read to find its executable sections.
 const MAX_EXEC_FILE: usize = 128 << 20;
 
@@ -255,16 +460,7 @@ impl<P: Platform> Kernel<P> {
         }
         let len = self.page_up(len);
         match advice {
-            // Linux guarantees zero-filled pages on the next access to private
-            // anonymous memory; macOS's MADV_DONTNEED does not, so replace
-            // the pages instead.
-            mman::MADV_DONTNEED => {
-                if map_fixed_anon(addr, len, libc::PROT_READ | libc::PROT_WRITE) {
-                    0
-                } else {
-                    last_error()
-                }
-            }
+            mman::MADV_DONTNEED => dontneed(addr, len),
             mman::MADV_FREE => {
                 // SAFETY: advisory call on guest memory.
                 unsafe { libc::madvise(addr as *mut libc::c_void, len as usize, libc::MADV_FREE) };
