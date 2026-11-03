@@ -243,8 +243,11 @@ fn main() {
         }
         // A child signals its parent, which learns the sender.
         "notify-parent" => {
+            // Not blocked: delivered as it arrives, so its sender is known
+            // (macOS forgets the sender of a signal left pending while
+            // blocked). If it arrives before the wait, the wait returns at
+            // once.
             catch(SIGUSR1, 0);
-            block(&[SIGUSR1]);
             let pid = child(|| {
                 // SAFETY: plain calls.
                 unsafe { kill(getppid(), SIGUSR1) };
