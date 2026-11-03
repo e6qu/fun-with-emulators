@@ -287,9 +287,19 @@ from a process with other live threads, which Linux ends. The host's own
 exec then does the work: the pid, descriptors not marked close-on-exec, the
 signal mask, pending signals and ignored dispositions survive it as Linux
 requires, and fwe passes on the root filesystem, the working directory, the
-guest's `argv[0]` and `--strace` (`--guest-path`, `--cwd`, `--argv0`); the
-new fwe picks the backend. The hypervisor backend's `execve` always works
-this way.
+guest's `argv[0]` and `--strace` (`--guest-path`, `--cwd`, `--argv0`), and
+what only the kernel layer holds — the virtual credentials, the
+`RLIMIT_NOFILE` and the umask — as one encoded `--exec-state`
+(`Kernel::exec_state`); the new fwe picks the backend. The hypervisor
+backend's `execve` always works this way. As on Linux, the saved user and
+group IDs become the effective ones across an `execve`.
+
+`execveat` turns its `dirfd`, path and flags into a guest path and then is
+`execve` (`Kernel::execveat_path`): a relative path is taken from the
+directory `dirfd` is open on, `AT_EMPTY_PATH` runs the file `dirfd` itself
+names, and `AT_SYMLINK_NOFOLLOW` refuses a final symbolic link with
+`ELOOP`. The descriptor is turned into the path of its file, so a file
+renamed or deleted after it was opened is not found.
 
 `fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
 `fork`. In a multithreaded guest the kernel lock and every kernel registry
@@ -358,7 +368,11 @@ The futex wait queues are a process-global structure operating on raw guest
 memory, outside the kernel lock, so `FUTEX_WAIT` blocks without holding it.
 A host condition variable is not interrupted by signals, so a waiter checks
 every 20 ms for a signal it should take, and returns `EINTR` for it.
-`clone3` is not implemented (glibc falls back to `clone`).
+`clone3` reads the guest's `struct clone_args` and then goes the way of the
+`clone` it describes (`crates/kernel/src/cloneargs.rs`): the stack is the
+top of the range given, and the child's other registers are the parent's.
+What fwe has no notion of — a pidfd, chosen tids, a cgroup, clearing the
+handlers — fails with `ENOSYS`, which C libraries take as "use `clone`".
 
 ## Signals
 
@@ -515,8 +529,7 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
-  entitlement and a bare-metal Apple Silicon Mac. `execve` re-executes fwe, so the guest's
-  virtual credentials and `RLIMIT_NOFILE` start over in the new program. A few rare `x18` forms are left
+  entitlement and a bare-metal Apple Silicon Mac. A few rare `x18` forms are left
   unrewritten (see Rewriting guest code; `--strace` counts them). Code
   discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
@@ -531,10 +544,10 @@ those items.
   periodic timerfd restarts its period, and eventfd counters and signalfd
   queues are the child's own copies while their readiness pipes are shared;
   a VM fork that fails after spawning its child can have that child reaped
-  by another thread's `wait4(-1)`; `execveat` and `clone3` are not implemented; `waitid`
-  reports no `rusage`. An `execve` from a process with other live threads,
-  or of a program only the VM can run, re-executes fwe, and the guest's
-  virtual credentials and `RLIMIT_NOFILE` start over in the new program.
+  by another thread's `wait4(-1)`; `execveat` of a descriptor finds its
+  file by path (not one renamed or deleted since it was opened); `clone3`
+  has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
+  `rusage`.
 - **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
   that opens more descriptors than its limit gets numbers in fwe's range,
   which it cannot use, rather than `EMFILE`; a reopened

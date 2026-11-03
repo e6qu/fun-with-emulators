@@ -106,6 +106,7 @@ const ASM_GUESTS: &[&str] = &[
     "fileio",
     "sigtest",
     "threadtest",
+    "clone3test",
     "execer",
     "execee",
     "forktest",
@@ -552,6 +553,16 @@ fn execve_replaces_program() {
 
 /// Threads: a guest clones a child that writes a shared counter and exits;
 /// the parent joins via the CLONE_CHILD_CLEARTID futex and checks the counter.
+/// `clone3`: a thread made from a `struct clone_args` gets the stack, TLS
+/// and tid words it names; a too-small structure is `EINVAL` and a pidfd
+/// request `ENOSYS`.
+#[test]
+fn clone3_makes_a_thread() {
+    for name in ["clone3test", "clone3test-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
 #[test]
 fn clone_thread_runs_and_joins() {
     for name in ["threadtest", "threadtest-pie"] {
@@ -1118,6 +1129,31 @@ fn fork_copies_memory_and_keeps_descriptors() {
     );
 }
 
+/// `clone3` in its fork form, and `execveat` relative to a directory, of the
+/// open file itself, and refusing a symbolic link under
+/// `AT_SYMLINK_NOFOLLOW`.
+#[test]
+fn clone3_fork_and_execveat() {
+    assert_eq!(signals("clone3-fork"), "clone3 child\nexited 3\n");
+    assert_eq!(
+        signals("execveat"),
+        "hello from the spawned child\nrelative to a directory: exited 0\n\
+         hello from the spawned child\nthe open file itself: exited 0\n\
+         symlink with AT_SYMLINK_NOFOLLOW: -1, errno 40\nunknown flag: -1, errno 22\n"
+    );
+}
+
+/// `execve` keeps the virtual credentials (the saved IDs becoming the
+/// effective ones), `RLIMIT_NOFILE` and the umask, both when the program is
+/// replaced in place and when fwe re-executes itself (another thread alive).
+#[test]
+fn exec_keeps_credentials_and_limits() {
+    let want = "uids [10, 11, 11] gids [20, 21, 21] groups [7] nofile [300, 400] umask 27\n";
+    assert_eq!(signals("exec-keeps-ids"), want);
+    let out = fwe(&rust_guest("signals"), &["exec-keeps-ids", "threaded"]);
+    assert_eq!(stdout(&out), want);
+}
+
 /// `waitid` reports an exit and a kill as `siginfo`.
 #[test]
 fn waitid_reports_exit_and_kill() {
@@ -1463,7 +1499,7 @@ fn signal_unblocked_by_sigreturn_and_fixed_mapping() {
 /// real-time one), and a timer interrupting one thread's blocking read.
 #[test]
 fn hv_runs_threads() {
-    for name in ["threadtest-low", "pipethread-low"] {
+    for name in ["threadtest-low", "pipethread-low", "clone3test-low"] {
         let Some(out) = fwe_hv(&asm_guest(name), &[]) else { return };
         assert_eq!(out.status.code(), Some(0), "{name}");
     }
