@@ -304,16 +304,25 @@ impl Libc {
 /// The guest is compiled freestanding with no host headers, like the assembly
 /// guests, so only a bare cross `clang` is needed.
 fn build_c_dynamic(name: &str, libc: Libc, crt: bool) -> PathBuf {
+    build_c(name, libc, crt, true)
+}
+
+/// Like [`build_c_dynamic`], but a non-PIE `ET_EXEC` at the linker's default
+/// low address, as distributions build some programs (Debian's `python3`):
+/// only the hypervisor backend can run it.
+fn build_c(name: &str, libc: Libc, crt: bool, pie: bool) -> PathBuf {
     let out = out_dir().join("c");
     std::fs::create_dir_all(&out).unwrap();
-    let obj = out.join(format!("{name}-{}.o", name_suffix(libc)));
+    let tag =
+        if pie { name_suffix(libc).to_string() } else { format!("{}-nopie", name_suffix(libc)) };
+    let obj = out.join(format!("{name}-{tag}.o"));
     run_checked(
         Command::new("clang")
             .args([
                 "--target=aarch64-linux-gnu",
                 "-O2",
                 "-fno-stack-protector",
-                "-fPIC",
+                if pie { "-fPIC" } else { "-fno-pic" },
                 "-ffreestanding",
                 "-c",
                 "-o",
@@ -321,11 +330,15 @@ fn build_c_dynamic(name: &str, libc: Libc, crt: bool) -> PathBuf {
             .arg(&obj)
             .arg(repo().join("guests/c").join(format!("{name}.c"))),
     );
-    let bin = out.join(format!("{name}-{}", name_suffix(libc)));
+    let bin = out.join(format!("{name}-{tag}"));
     let lib = libc.lib_dir();
     let interp = format!("--dynamic-linker={}", libc.interp());
     let mut cmd = Command::new(rust_lld());
-    cmd.args(["-flavor", "gnu", "-pie"]).arg(&interp);
+    cmd.args(["-flavor", "gnu"]);
+    if pie {
+        cmd.arg("-pie");
+    }
+    cmd.arg(&interp);
     // A run-time search path so the glibc linker finds libc.so.6 in the
     // rootfs's /lib; harmless for musl, whose interpreter is the libc itself.
     cmd.args(["-rpath=/lib", "-o"]).arg(&bin);
@@ -896,11 +909,14 @@ fn rust_runtime_services() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// Without the hypervisor entitlement (the plain test build is unsigned), a
+/// program linked below 4 GiB is refused with an explanation.
 #[test]
-fn low_link_address_is_rejected_cleanly() {
+fn low_link_address_needs_the_hypervisor() {
     let out = fwe(&asm_guest("hello-low"), &[]);
     assert_eq!(out.status.code(), Some(126));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("below 4 GiB"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("below 4 GiB") && err.contains("entitlement"), "{err}");
 }
 
 #[test]
@@ -1193,4 +1209,208 @@ fn bad_pointers_fail_with_efault() {
     for name in ["efault", "efault-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
+}
+
+// --- The hypervisor backend ------------------------------------------------
+//
+// These run only where Hypervisor.framework works: a bare-metal Apple Silicon
+// Mac (not GitHub's hosted runners, which are VMs themselves). There `fwe` is
+// copied and signed with the hypervisor entitlement; elsewhere the tests
+// report that they were skipped and pass.
+
+/// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
+fn hv_fwe() -> Option<&'static Path> {
+    static FWE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FWE.get_or_init(|| {
+        let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
+        if String::from_utf8_lossy(&support.stdout).trim() != "1" {
+            return None;
+        }
+        let signed = out_dir().join("fwe-hv");
+        std::fs::create_dir_all(out_dir()).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_fwe"), &signed).unwrap();
+        let ok = Command::new("codesign")
+            .args(["--sign", "-", "--force", "--entitlements"])
+            .arg(repo().join("hypervisor.entitlements"))
+            .arg(&signed)
+            .status()
+            .is_ok_and(|s| s.success());
+        // A host that has the hypervisor but refuses the VM (no
+        // entitlement honoured) also counts as unavailable.
+        let spike = Command::new(&signed).arg("--hv-spike").output().ok()?;
+        (ok && spike.status.success()).then_some(signed)
+    })
+    .as_deref()
+}
+
+/// The Rust guests linked at the toolchain's default (low) address, which
+/// only the hypervisor backend can run.
+fn rust_low_guest(name: &str) -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        build_guests();
+        let out = out_dir().join("rust-low");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut build = Command::new(cargo);
+        build
+            .args(["build", "--release", "--manifest-path"])
+            .arg(repo().join("guests/rust/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&out)
+            .current_dir(repo().join("guests/rust"));
+        for (key, _) in std::env::vars() {
+            if key.starts_with("CARGO_") || key == "RUSTFLAGS" || key == "RUSTC_WRAPPER" {
+                build.env_remove(key);
+            }
+        }
+        // RUSTFLAGS replaces the config's flags, dropping its high image base.
+        build.env(
+            "RUSTFLAGS",
+            "-C linker-flavor=ld.lld -C link-self-contained=yes -C target-feature=+crt-static",
+        );
+        run_checked(&mut build);
+        out
+    });
+    dir.join("aarch64-unknown-linux-musl/release").join(name)
+}
+
+/// Run `program` under the signed `fwe`, or `None` (test skipped) when this
+/// host cannot run the hypervisor backend.
+fn fwe_hv(program: &Path, args: &[&str]) -> Option<Output> {
+    let Some(fwe) = hv_fwe() else {
+        eprintln!("skipped: no hypervisor on this host");
+        return None;
+    };
+    let mut cmd = Command::new(fwe);
+    cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
+    let out = run_bounded(cmd);
+    eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
+    Some(out)
+}
+
+/// Assembly guests linked below 4 GiB run in the VM: system calls, the
+/// thread pointer, x18 (simply the guest's own register there), signal
+/// handlers with their frames and FP state, the event descriptors, sockets,
+/// /proc, credentials and bad pointers.
+#[test]
+fn hv_runs_low_assembly_guests() {
+    let cases = [
+        ("hello", 0),
+        ("exit42", 42),
+        ("enosys", 0),
+        ("regs", 0),
+        ("tpidr", 0),
+        ("x18", 0),
+        ("x18spin", 0),
+        ("x18mem", 0),
+        ("x18dp", 0),
+        ("x18ldst", 0),
+        ("x18br", 0),
+        ("x18fp", 0),
+        ("x18pc", 0),
+        ("x18sig", 0),
+        ("sigtest", 0),
+        ("fpsig", 0),
+        ("signalfdtest", 0),
+        ("epolltest", 0),
+        ("eventfdtest", 0),
+        ("timerfdtest", 0),
+        ("socketpairtest", 0),
+        ("procread", 0),
+        ("procdir", 0),
+        ("credtest", 0),
+    ];
+    for (name, code) in cases {
+        let low = format!("{name}-low");
+        let Some(out) = fwe_hv(&asm_guest(&low), &[]) else { return };
+        assert_eq!(out.status.code(), Some(code), "{low}");
+    }
+    let out = fwe_hv(&asm_guest("hello-low"), &[]).unwrap();
+    assert_eq!(stdout(&out), "hello from linux\n");
+}
+
+/// Rust programs linked at the default low address (std's runtime, heap,
+/// threads-free sleep, clock, a large allocation, arguments) run in the VM.
+#[test]
+fn hv_runs_low_rust_programs() {
+    let Some(out) = fwe_hv(&rust_low_guest("hello"), &[]) else { return };
+    assert_eq!(stdout(&out), "hello from rust on linux\n");
+    let out = fwe_hv(&rust_low_guest("sysinfo"), &[]).unwrap();
+    assert_eq!(
+        stdout(&out),
+        "heap ok: 10000 entries, 314616 bytes\nsleep ok: true\nclock ok: true\nlarge allocation ok: true\n"
+    );
+    let out = fwe_hv(&rust_low_guest("args"), &["one", "two words"]).unwrap();
+    assert!(
+        stdout(&out).ends_with("arg[1]=one\narg[2]=two words\nFWE_GUEST_VAR=from-host\n"),
+        "{out:?}"
+    );
+}
+
+/// Signals in the VM: handlers for timers, real-time and sent fault signals,
+/// sigtimedwait, default SIGPIPE, and a timer that interrupts a guest
+/// computing without system calls (the backend stops the vCPU).
+#[test]
+fn hv_delivers_signals() {
+    let run = |scenario: &str| fwe_hv(&rust_low_guest("signals"), &[scenario]);
+    let Some(out) = run("busy-alarm") else { return };
+    assert_eq!(stdout(&out), "busy loop interrupted: true\n");
+    for (scenario, want) in [
+        ("pause", "pause: -1 errno 4, handler ran: true\n"),
+        ("rt-self", "handled: 1, signal 40\n"),
+        ("sigtimedwait", "took 12, code 0\nthen -1 errno EAGAIN\n"),
+        (
+            "raise-faults",
+            "signal 11: handled 1\nsignal 8: handled 1\nsignal 5: handled 1\nignored SIGTRAP: still running\n",
+        ),
+    ] {
+        let out = run(scenario).unwrap();
+        assert_eq!(stdout(&out), want, "{scenario}");
+    }
+    use std::os::unix::process::ExitStatusExt;
+    let out = run("sigpipe").unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
+}
+
+/// The kernel's view of guest memory in the VM: /proc/self/fd and the
+/// descriptor limit, and pointers into the translated image (static
+/// buffers) passed to the host.
+#[test]
+fn hv_descriptors_and_translated_pointers() {
+    let Some(out) = fwe_hv(&rust_low_guest("fds"), &["proc-fd"]) else { return };
+    assert_eq!(
+        stdout(&out),
+        "lists the open ones: true\nand nothing else: true\nfile link is its path: true\n\
+         pipe link: true\nreopened pipe reads: 1 z\n"
+    );
+    let out = fwe_hv(&rust_low_guest("fds"), &["limits"]).unwrap();
+    assert!(stdout(&out).contains("dup2 at the hard limit: -1 EBADF"));
+}
+
+/// A dynamically linked, non-PIE glibc program at a low address — the shape
+/// of Debian's `python3.11` — runs in the VM: the image at its link address
+/// (translated), glibc's dynamic linker and `libc.so.6` mapped by the guest
+/// at the same addresses as in the host, relocations and RELRO applied by
+/// the guest's own `ld.so`.
+#[test]
+fn hv_runs_dynamic_non_pie_glibc_program() {
+    let prog = build_c("dynhello", Libc::Glibc, true, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-nopie");
+    let Some(out) = fwe_hv_in(&root, &prog, &["fun-with-emulators"]) else { return };
+    assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [`fwe_hv`] with a root filesystem.
+fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
+    let Some(fwe) = hv_fwe() else {
+        eprintln!("skipped: no hypervisor on this host");
+        return None;
+    };
+    let mut cmd = Command::new(fwe);
+    cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
+    let out = run_bounded(cmd);
+    eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
+    Some(out)
 }
