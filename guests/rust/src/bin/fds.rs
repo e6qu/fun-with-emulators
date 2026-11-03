@@ -110,8 +110,15 @@ fn main() {
             let fd = file.as_raw_fd();
             let expect = [0, 1, 2, fd, p[0], p[1]];
             println!("lists the open ones: {}", expect.iter().all(|f| listed.contains(f)));
-            // The listing's own directory descriptor is the only other.
-            println!("and nothing else: {}", listed.len() == expect.len() + 1);
+            // Exactly what fcntl says is open (inherited descriptors
+            // included), plus the listing's own directory descriptor, which
+            // is closed again by now.
+            let open: Vec<i32> = (0..nofile().max as i32)
+                // SAFETY: F_GETFD only queries the descriptor.
+                .filter(|&f| unsafe { fcntl(f, 1) } >= 0)
+                .collect();
+            let extra: Vec<&i32> = listed.iter().filter(|f| !open.contains(f)).collect();
+            println!("and nothing else: {}", open.iter().all(|f| listed.contains(f)) && extra.len() == 1);
             let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
             println!("file link is its path: {}", link == exe);
             let link = std::fs::read_link(format!("/proc/self/fd/{}", p[0])).unwrap();
