@@ -628,6 +628,16 @@ fn start(
         ));
     }
     let data = std::fs::read(path).map_err(Error::Read)?;
+    // A non-PIE executable linked into the low 4 GiB cannot be mapped in
+    // this process: it runs in a VM instead.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Ok(elf) = Elf::parse(&data) {
+        if !elf.is_pie()
+            && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
+        {
+            return Err(hv::run(path, &data, args, env, options));
+        }
+    }
 
     let page = page_size();
     let tracer = Tracer { enabled: options.strace };

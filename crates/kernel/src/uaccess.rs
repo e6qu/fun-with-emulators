@@ -12,8 +12,49 @@
 //!
 //! Pointers the kernel passes straight to a host system call need none of
 //! this: the host checks them and fails with its own `EFAULT`.
+//!
+//! Guest addresses are host addresses, with one exception: a backend that
+//! runs the guest in a VM can place a program image where the host process
+//! cannot map anything (the low 4 GiB on macOS), backing it with host memory
+//! elsewhere. It registers that range with [`set_translation`], and every
+//! guest address is passed through [`g2h`] before the kernel or the host
+//! touches it.
 
 use fwe_abi::errno;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The one translated guest range `[LO, HI)` and the host address of `LO`.
+static LO: AtomicU64 = AtomicU64::new(0);
+static HI: AtomicU64 = AtomicU64::new(0);
+static HOST: AtomicU64 = AtomicU64::new(0);
+
+/// Back guest addresses `[guest, guest + len)` with host memory at `host`.
+pub fn set_translation(guest: u64, len: u64, host: u64) {
+    HI.store(0, Ordering::SeqCst);
+    LO.store(guest, Ordering::SeqCst);
+    HOST.store(host, Ordering::SeqCst);
+    HI.store(guest + len, Ordering::SeqCst);
+}
+
+/// Whether `[addr, addr + len)` straddles the edge of the translated range
+/// (partly inside, partly out): such a range has no single host address,
+/// and memory calls on it are refused.
+pub fn crosses(addr: u64, len: u64) -> bool {
+    let (lo, hi) = (LO.load(Ordering::Relaxed), HI.load(Ordering::Relaxed));
+    let end = addr.saturating_add(len);
+    lo < hi && addr < hi && end > lo && (addr < lo || end > hi)
+}
+
+/// The host address of guest address `addr` (itself, outside the translated
+/// range).
+pub fn g2h(addr: u64) -> u64 {
+    let lo = LO.load(Ordering::Relaxed);
+    if addr >= lo && addr < HI.load(Ordering::Relaxed) {
+        HOST.load(Ordering::Relaxed) + (addr - lo)
+    } else {
+        addr
+    }
+}
 
 /// The longest path the kernel reads, with its terminator (Linux's
 /// `PATH_MAX`).
@@ -109,13 +150,13 @@ fn check(ok: bool) -> Result<()> {
 /// Copy `dst.len()` bytes from guest address `addr`.
 pub fn read_into(addr: u64, dst: &mut [u8]) -> Result<()> {
     // SAFETY: `dst` is fwe's own buffer; the guest side is checked.
-    check(unsafe { imp::copy(dst.as_mut_ptr(), addr as *const u8, dst.len()) })
+    check(unsafe { imp::copy(dst.as_mut_ptr(), g2h(addr) as *const u8, dst.len()) })
 }
 
 /// Copy `src` to guest address `addr`.
 pub fn write_from(addr: u64, src: &[u8]) -> Result<()> {
     // SAFETY: `src` is fwe's own buffer; the guest side is checked.
-    check(unsafe { imp::copy(addr as *mut u8, src.as_ptr(), src.len()) })
+    check(unsafe { imp::copy(g2h(addr) as *mut u8, src.as_ptr(), src.len()) })
 }
 
 /// Read a `T` from guest address `addr`.
@@ -123,7 +164,7 @@ pub fn read<T: Copy>(addr: u64) -> Result<T> {
     let mut v = std::mem::MaybeUninit::<T>::uninit();
     // SAFETY: `v` is `size_of::<T>()` writable bytes; the guest side is
     // checked.
-    let ok = unsafe { imp::copy(v.as_mut_ptr().cast(), addr as *const u8, size_of::<T>()) };
+    let ok = unsafe { imp::copy(v.as_mut_ptr().cast(), g2h(addr) as *const u8, size_of::<T>()) };
     check(ok)?;
     // SAFETY: fully written by the copy; the kernel only reads plain-data
     // ABI types, for which any bit pattern is valid.
@@ -133,7 +174,7 @@ pub fn read<T: Copy>(addr: u64) -> Result<T> {
 /// Write `value` to guest address `addr`.
 pub fn write<T: Copy>(addr: u64, value: T) -> Result<()> {
     // SAFETY: `value` is a readable `T`; the guest side is checked.
-    let ok = unsafe { imp::copy(addr as *mut u8, (&raw const value).cast(), size_of::<T>()) };
+    let ok = unsafe { imp::copy(g2h(addr) as *mut u8, (&raw const value).cast(), size_of::<T>()) };
     check(ok)
 }
 
@@ -189,6 +230,95 @@ pub fn read_cstr_array(addr: u64, max_each: usize) -> Result<Vec<Vec<u8>>> {
         }
         out.push(read_cstr(ptr, max_each)?);
         p += 8;
+    }
+}
+
+/// A guest `iovec` array of `count` entries at `addr`, with each buffer's
+/// address translated, ready to hand to the host.
+pub fn host_iovecs(addr: u64, count: u64) -> Result<Vec<libc::iovec>> {
+    if count > 1024 {
+        return Err(errno::EINVAL);
+    }
+    let raw = read_bytes(addr, count as usize * 16)?;
+    Ok(raw
+        .chunks_exact(16)
+        .map(|c| libc::iovec {
+            iov_base: g2h(u64::from_ne_bytes(c[0..8].try_into().unwrap())) as *mut libc::c_void,
+            iov_len: u64::from_ne_bytes(c[8..16].try_into().unwrap()) as usize,
+        })
+        .collect())
+}
+
+/// Which arguments of system call `nr` are pointers to guest memory the
+/// call reads or writes, as a bit mask (bit `i` for argument `i`). A backend
+/// with a translated range passes these through [`g2h`] before the call; an
+/// address outside the range is unchanged, so listing a pointer argument is
+/// always safe. Addresses the kernel keeps as guest addresses (`mmap` and
+/// friends, `brk`, `clone`'s stack and tid words) are not listed.
+pub fn pointer_args(nr: u64) -> u8 {
+    use fwe_abi::nr as n;
+    match nr {
+        n::READ | n::WRITE | n::PREAD64 | n::PWRITE64 => 0b10,
+        n::OPENAT | n::MKDIRAT | n::MKNODAT | n::UNLINKAT | n::FCHMODAT | n::FCHOWNAT => 0b10,
+        n::FACCESSAT | n::FACCESSAT2 => 0b10,
+        n::CHDIR | n::CHROOT => 0b1,
+        n::NEWFSTATAT | n::READLINKAT => 0b110,
+        n::STATX => 0b1_0010,
+        n::FSTAT | n::FSTATFS | n::GETDENTS64 => 0b10,
+        n::STATFS => 0b11,
+        n::TRUNCATE => 0b1,
+        n::SYMLINKAT => 0b101,
+        n::LINKAT | n::RENAMEAT | n::RENAMEAT2 => 0b1010,
+        n::UTIMENSAT => 0b110,
+        n::GETCWD | n::UNAME | n::SYSINFO | n::TIMES => 0b1,
+        n::PIPE2 => 0b1,
+        n::IOCTL => 0b100,
+        n::CLOCK_GETTIME | n::CLOCK_GETRES | n::CLOCK_SETTIME => 0b10,
+        n::CLOCK_NANOSLEEP => 0b1100,
+        n::NANOSLEEP | n::GETTIMEOFDAY => 0b11,
+        n::GETRANDOM => 0b1,
+        n::RT_SIGACTION | n::RT_SIGPROCMASK => 0b110,
+        n::RT_SIGPENDING | n::RT_SIGSUSPEND => 0b1,
+        n::RT_SIGTIMEDWAIT => 0b111,
+        n::SIGALTSTACK => 0b11,
+        // The timeout (argument 3) is a pointer only for the waits; the
+        // backend translates it then (see `futex_pointer_args`).
+        n::FUTEX => 0b1_0001,
+        n::PRLIMIT64 => 0b1100,
+        n::GETRLIMIT | n::SETRLIMIT => 0b10,
+        n::GETRUSAGE => 0b10,
+        n::SETITIMER => 0b110,
+        n::GETITIMER => 0b10,
+        n::WAIT4 => 0b1010,
+        n::WAITID => 0b1_0100,
+        n::SCHED_GETAFFINITY | n::SCHED_SETAFFINITY => 0b100,
+        n::GETRESUID | n::GETRESGID => 0b111,
+        n::GETGROUPS | n::SETGROUPS => 0b10,
+        n::PPOLL => 0b1101,
+        n::EPOLL_CTL => 0b1000,
+        n::EPOLL_PWAIT => 0b1_0010,
+        n::SIGNALFD4 => 0b10,
+        n::TIMERFD_SETTIME => 0b1100,
+        n::TIMERFD_GETTIME => 0b10,
+        n::SOCKETPAIR => 0b1000,
+        n::BIND | n::CONNECT => 0b10,
+        n::ACCEPT | n::ACCEPT4 | n::GETSOCKNAME | n::GETPEERNAME => 0b110,
+        n::SENDTO => 0b1_0010,
+        n::RECVFROM => 0b11_0010,
+        n::SENDMSG | n::RECVMSG => 0b10,
+        n::SETSOCKOPT => 0b1000,
+        n::GETSOCKOPT => 0b1_1000,
+        _ => 0,
+    }
+}
+
+/// [`pointer_args`] for a `futex` call with operation `op`: argument 3 is
+/// a timeout pointer for the waits, a count for the requeues and `WAKE_OP`.
+pub fn futex_pointer_args(op: u64) -> u8 {
+    use fwe_abi::futex::*;
+    match op & FUTEX_CMD_MASK {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => 0b1001,
+        _ => 0b1_0001,
     }
 }
 

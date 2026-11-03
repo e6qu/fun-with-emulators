@@ -86,6 +86,25 @@ pub trait Platform {
     /// does, until it is continued.
     fn stop_self(&mut self) {}
 
+    /// The guest now has `[addr, addr + len)` mapped with Linux protections
+    /// `prot`. A backend that runs the guest in an address space of its own
+    /// (a VM) maps the same host memory there; the native backend, where the
+    /// guest's address space is the host process's, has nothing to do. Fails
+    /// with a Linux errno.
+    fn map_guest(&mut self, _addr: u64, _len: u64, _prot: u64) -> Result<(), i32> {
+        Ok(())
+    }
+
+    /// The guest unmapped `[addr, addr + len)`.
+    fn unmap_guest(&mut self, _addr: u64, _len: u64) {}
+
+    /// The guest changed the protections of `[addr, addr + len)` to `prot`.
+    fn protect_guest(&mut self, _addr: u64, _len: u64, _prot: u64) {}
+
+    /// The host memory behind `[addr, addr + len)` was replaced by fresh
+    /// pages (`MADV_DONTNEED`); a VM mapping of it must follow.
+    fn remapped_guest(&mut self, _addr: u64, _len: u64) {}
+
     /// Set how the host treats Linux signal `sig` (one with a host
     /// equivalent; see [`signal::relayed`]) so that signals sent to this
     /// process by other processes, the terminal or the host itself reach
@@ -154,6 +173,13 @@ impl<P: Platform> Kernel<P> {
         let result = self.dispatch(nr, args);
         self.tracer.syscall(nr, &args, result);
         result
+    }
+
+    /// Run system call `nr` with `args` and return its raw result, without
+    /// tracing it or touching registers: for a backend that records the
+    /// result itself with [`Kernel::finish_syscall`].
+    pub fn run_call(&mut self, nr: u64, args: [u64; 6]) -> i64 {
+        self.dispatch(nr, args)
     }
 
     /// Reset the signal and per-thread state across a successful `execve`:
@@ -366,14 +392,23 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
-        n::READV => {
-            // SAFETY: `struct iovec` has the same layout; the host validates it.
-            host::ret(unsafe { libc::readv(a[0] as i32, a[1] as *const _, a[2] as i32) } as i64)
-        }
-        n::WRITEV => {
-            // SAFETY: `struct iovec` has the same layout; the host validates it.
-            host::ret(unsafe { libc::writev(a[0] as i32, a[1] as *const _, a[2] as i32) } as i64)
-        }
+        n::READV => match uaccess::host_iovecs(a[1], a[2]) {
+            Ok(iov) => {
+                // SAFETY: the iovecs are translated host buffers; the host
+                // checks them.
+                let r = unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
+                host::ret(r as i64)
+            }
+            Err(e) => fwe_abi::err(e),
+        },
+        n::WRITEV => match uaccess::host_iovecs(a[1], a[2]) {
+            Ok(iov) => {
+                // SAFETY: as for readv.
+                let r = unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
+                host::ret(r as i64)
+            }
+            Err(e) => fwe_abi::err(e),
+        },
         // SAFETY: the host validates the guest buffer.
         n::PREAD64 => host::ret(unsafe {
             libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)

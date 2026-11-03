@@ -15,8 +15,9 @@ options:
   --root DIR   use DIR as the guest root filesystem
   --host-info  show host features that affect compatibility
   --probe NAME run one host-behaviour probe (diagnostic; used by CI)
-  --hv-spike   run the hypervisor-backend feasibility spike (see
-               docs/hypervisor-spike.md; Apple Silicon, needs the entitlement)
+  --hv-spike   check that the hypervisor backend can run here: a tiny guest
+               in a VM (see docs/hypervisor.md; Apple Silicon, needs the
+               entitlement)
   -h, --help   show this help
   -V, --version
 ";
@@ -61,8 +62,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             b"--hv-spike" => {
-                // Feasibility spike for the hypervisor backend; see
-                // docs/hypervisor-spike.md. Not part of normal operation.
+                // A quick check that a VM runs here (docs/hypervisor.md).
                 return match fwe_native::hv::spike() {
                     Ok(out) => {
                         use std::io::Write;

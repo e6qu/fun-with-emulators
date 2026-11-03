@@ -14,7 +14,7 @@ fwe (crates/fwe)            the command line; end-to-end tests
  │    ├── threads      clone: a host thread per guest thread
  │    ├── process      fork and vfork, execve, wait4, waitid
  │    ├── hwcap        AT_HWCAP/AT_HWCAP2 from the host CPU
- │    └── hv           the hypervisor backend feasibility spike
+ │    └── hv           the hypervisor backend: VM, vCPU loop, loader
  ├── kernel layer (crates/kernel)
  │    Linux system call semantics on top of the host, behind `Platform`
  ├── elf (crates/elf)   ELF64 parsing and load planning, host-independent
@@ -31,11 +31,14 @@ it:
 - The **native backend** runs guest code in-process, directly on the CPU,
   after rewriting the instructions macOS cannot let a Linux process execute
   unchanged. It carries every position-independent binary.
-- The **hypervisor backend** (a feasibility spike today, see
-  [hypervisor-spike.md](hypervisor-spike.md)) runs the guest in a
-  Hypervisor.framework VM. It exists only for non-PIE executables linked
+- The **hypervisor backend** ([hypervisor.md](hypervisor.md)) runs the
+  guest at EL0 in a Hypervisor.framework VM, under a minimal EL1 that only
+  bounces exceptions back to fwe. It exists for non-PIE executables linked
   into the low 4 GiB that macOS reserves, which the native backend cannot
-  map. A full virtual machine with its own Linux kernel is a non-goal.
+  map, and fwe picks it automatically for them. The kernel layer is the same;
+  the executable's image is the one range of guest memory not at the same
+  address in the host, and the kernel translates pointers into it. A full
+  virtual machine with its own Linux kernel is a non-goal.
 
 ## Hosts
 
@@ -467,9 +470,10 @@ generated from the Linux UAPI headers by `tools/gen-abi.py`.
 Each of these is on the [roadmap](../ROADMAP.md); this is the detail behind
 those items.
 
-- **Execution:** a non-PIE executable linked below 4 GiB cannot run
-  in-process (the mandatory `__PAGEZERO`); the hypervisor backend is the path
-  for it, and exists as a spike. A few rare `x18` forms are left
+- **Execution:** a non-PIE executable linked below 4 GiB runs only in the
+  hypervisor backend, which needs `fwe` signed with the hypervisor
+  entitlement and a bare-metal Apple Silicon Mac; there, threads, `fork`,
+  `vfork` and `execve` fail with `ENOSYS` so far. A few rare `x18` forms are left
   unrewritten (see Rewriting guest code; `--strace` counts them). Code
   discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and

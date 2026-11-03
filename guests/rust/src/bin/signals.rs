@@ -243,8 +243,11 @@ fn main() {
         }
         // A child signals its parent, which learns the sender.
         "notify-parent" => {
+            // Not blocked: delivered as it arrives, so its sender is known
+            // (macOS forgets the sender of a signal left pending while
+            // blocked). If it arrives before the wait, the wait returns at
+            // once.
             catch(SIGUSR1, 0);
-            block(&[SIGUSR1]);
             let pid = child(|| {
                 // SAFETY: plain calls.
                 unsafe { kill(getppid(), SIGUSR1) };
@@ -289,6 +292,23 @@ fn main() {
             let r = unsafe { read(fds[0], &mut b, 1) };
             let what = if r < 0 { format!("errno {}", errno()) } else { format!("{r} byte") };
             println!("read: {what}, handler ran {} time(s)", HITS.load(Ordering::SeqCst));
+        }
+        // A timer signal interrupts a loop that makes no system calls; the
+        // handler runs and the loop sees its flag.
+        "busy-alarm" => {
+            catch(SIGALRM, 0);
+            let timer =
+                Itimerval { interval: Timeval { sec: 0, usec: 0 }, value: Timeval { sec: 0, usec: 50_000 } };
+            // SAFETY: a valid itimerval.
+            unsafe { setitimer(0, &timer, std::ptr::null_mut()) };
+            let start = std::time::Instant::now();
+            let mut spins = 0u64;
+            while HITS.load(Ordering::SeqCst) == 0 && spins < 20_000_000_000 {
+                spins += 1;
+                std::hint::spin_loop();
+            }
+            let _ = start;
+            println!("busy loop interrupted: {}", HITS.load(Ordering::SeqCst) == 1);
         }
         // pause() returns once a handler has run.
         "pause" => {

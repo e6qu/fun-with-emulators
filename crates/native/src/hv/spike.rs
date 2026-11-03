@@ -1,27 +1,9 @@
-//! A minimalistic Hypervisor.framework backend — a feasibility spike.
-//!
-//! The native backend runs guest code in our own process, but macOS reserves
-//! the low 4 GiB of every arm64 process with a mandatory 4 GiB `__PAGEZERO`,
-//! so a non-PIE `ET_EXEC` linked at a low fixed address (Debian's
-//! `python3.11` at `0x400000`, static Go at `0x10000`) cannot be mapped at its
-//! own address. A hardware VM sidesteps that: the guest gets its own address
-//! space with no `__PAGEZERO`, so low addresses are available. On macOS the
-//! only userspace API for a hardware VM is `Hypervisor.framework` (HVF),
-//! gated by the `com.apple.security.hypervisor` entitlement — no root needed.
-//!
-//! This spike proves the mechanism end to end: create a VM, map guest RAM at a
-//! **low** guest-physical address, run a tiny guest there at EL1 with the MMU
-//! off, trap its "syscalls" out to us, service them with host system calls,
-//! and let it exit with a status we read back. The guest uses `HVC #0` (which
-//! traps straight to the VMM) rather than Linux's `SVC #0`; wiring `SVC` from
-//! a guest EL0 through an EL1 vector is the next step, not part of the
-//! feasibility question.
-//!
-//! GitHub's hosted macOS runners are themselves VMs without nested
-//! virtualization, so it cannot run there; it runs by hand (`fwe --hv-spike`
-//! on an Apple Silicon Mac, with the binary ad-hoc codesigned with the
-//! hypervisor entitlement) and in the self-hosted CI job. See
-//! `docs/hypervisor-spike.md`.
+//! `fwe --hv-spike`: the smallest possible VM, as a check that the
+//! hypervisor works on a machine. It maps RAM at a low guest-physical
+//! address, runs a tiny guest there at EL1 with the MMU off, services its two
+//! "system calls" (made with `hvc #0`) and reports what it printed and the
+//! status it exited with. The real backend is in the rest of this module;
+//! see `docs/hypervisor.md`.
 
 /// What the spike guest produced: what it wrote to fd 1 and the status it
 /// exited with.
