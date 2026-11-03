@@ -382,8 +382,14 @@ fn take_async(
     let _host = HostCode::enter();
     if sig != host::WAKE_SIGNAL {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        let (code, pid, uid, status) =
-            unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+        let (code, pid, uid, status) = unsafe {
+            (
+                (*info).si_code,
+                (*info).si_pid(),
+                host::uid_to_linux((*info).si_uid()),
+                (*info).si_status(),
+            )
+        };
         let lsig = host::signal_to_linux(sig);
         let code = host::si_code_to_linux(code);
         let status = if lsig == fwe_abi::signal::SIGCHLD

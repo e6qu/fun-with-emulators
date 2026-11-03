@@ -120,6 +120,26 @@ pub fn ret(r: impl Into<i64>) -> i64 {
     if r < 0 { last_error() } else { r }
 }
 
+/// The id Linux reports for an id that has no mapping into a user namespace
+/// (`/proc/sys/kernel/overflowuid`): `nobody`.
+pub const OVERFLOW_ID: u32 = 65534;
+
+/// The guest's view of host user id `uid` (a file's owner, a signal's
+/// sender): as in a rootless container's user namespace, the host user fwe
+/// runs as is root in the guest, whose default identity is root too, and
+/// every other user is [`OVERFLOW_ID`].
+pub fn uid_to_linux(uid: u32) -> u32 {
+    // SAFETY: plain host call.
+    if uid == unsafe { libc::geteuid() } { 0 } else { OVERFLOW_ID }
+}
+
+/// [`uid_to_linux`] for group ids: fwe's own group is the guest's root
+/// group.
+pub fn gid_to_linux(gid: u32) -> u32 {
+    // SAFETY: plain host call.
+    if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID }
+}
+
 /// Host clock for a Linux clock id.
 pub fn clock_to_host(id: u64) -> Option<libc::clockid_t> {
     Some(match id {
