@@ -1124,3 +1124,60 @@ fn debian_bash_runs_trap_handlers() {
     );
     assert_eq!(stdout(&out), "trapped\nreaped\nend\n");
 }
+
+/// Run one scenario of the `fds` guest from inside a root filesystem (so
+/// path resolution depends on fwe's handle on it) and return its output.
+fn fds(scenario: &str) -> String {
+    let root = std::env::temp_dir().join(format!("fwe-fds-{}-{scenario}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(rust_guest("fds"), root.join("fds")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(root.join("fds")).arg(scenario);
+    let out = run_bounded(cmd);
+    eprintln!("--- fds {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out.status.code(), Some(0), "{scenario}");
+    stdout(&out)
+}
+
+/// A guest that closes every descriptor from 3 up to its limit, as daemons
+/// and spawn helpers do, leaves fwe's own descriptors (the rootfs handle,
+/// the pipes behind eventfd and signalfd) untouched: paths still resolve and
+/// both emulated descriptors still work.
+#[test]
+fn closing_every_descriptor_spares_fwes_own() {
+    assert_eq!(
+        fds("close-all"),
+        "soft limit 1024\nread own binary: true\neventfd: 8 bytes, value 3\nsignalfd: 128 bytes, signal 10\n"
+    );
+}
+
+/// `close_range(3, ~0)` closes the guest's descriptors and nothing of fwe's.
+#[test]
+fn close_range_closes_only_the_guests() {
+    assert_eq!(fds("close-range"), "close_range 0, file closed: true\nread own binary: true\n");
+}
+
+/// `/proc/self/fd` lists exactly the guest's open descriptors; each entry
+/// links to the file's guest path or names a pipe, and opening one gives a
+/// working descriptor.
+#[test]
+fn proc_self_fd_lists_and_links_descriptors() {
+    assert_eq!(
+        fds("proc-fd"),
+        "lists the open ones: true\nand nothing else: true\nfile link is its path: true\n\
+         pipe link: true\nreopened pipe reads: 1 z\n"
+    );
+}
+
+/// `RLIMIT_NOFILE` is virtual: its hard limit is where fwe's own range
+/// begins, so `dup2` there fails with `EBADF` and raising it is refused.
+#[test]
+fn descriptor_limit_bounds_the_guest() {
+    assert_eq!(
+        fds("limits"),
+        "hard limit above soft: true\ndup2 at the hard limit: -1 EBADF\ndup2 just below it: true\n\
+         raising past it: -1 EPERM\nsoft limit now 256\n"
+    );
+}
