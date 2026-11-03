@@ -1,5 +1,6 @@
 // x18 must survive through data-processing instructions beyond moves: extract,
-// conditional select, multiply-add and divide, across preemption. Exit 0 if
+// conditional select, multiply-add and divide, add/sub with an sp source,
+// across preemption. Exit 0 if
 // x18 holds its value throughout, 1 otherwise.
     .text
     .globl _start
@@ -29,6 +30,26 @@ _start:
     udiv    x18, x10, x1
     cmp     x18, x10
     b.ne    fail
+
+    // add/sub with sp as the source: the stub runs with sp lower, so the
+    // offset must be compensated for the result to match.
+    mov     x11, sp
+    add     x18, sp, #0x18
+    add     x12, x11, #0x18
+    cmp     x18, x12
+    b.ne    fail
+    sub     x18, sp, #0x40
+    sub     x12, x11, #0x40
+    cmp     x18, x12
+    b.ne    fail
+    sub     x18, sp, #8             // smaller than the stub's push
+    sub     x12, x11, #8
+    cmp     x18, x12
+    b.ne    fail
+    mov     x18, sp
+    cmp     x18, x11
+    b.ne    fail
+    mov     x18, x10                // back to the sentinel
 
     // spin without system calls to be preempted, re-checking x18
     movz    x19, #0x2000, lsl #16

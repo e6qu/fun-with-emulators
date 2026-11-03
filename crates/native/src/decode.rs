@@ -14,10 +14,10 @@
 //! left alone rather than risk a wrong rewrite. The PC-relative forms,
 //! compare/test branches and indirect branches through `x18` have their own
 //! decoders here, since their stubs differ. What is still left alone — a
-//! load/store with writeback onto `sp` or a register offset from `sp`, a
-//! data-processing form whose operand is `sp`, `casp` and the
-//! pointer-authenticated loads — is reported by [`names_x18`] so it can be
-//! counted.
+//! load/store with writeback onto `sp` or a register offset from `sp`,
+//! flag-setting, shifted or extended arithmetic from `sp`, `casp` and the
+//! pointer-authenticated loads — is found by [`names_x18`], which knows the
+//! register fields of every non-SIMD group, so it can be counted exactly.
 
 /// A register operand: its field position (low bit) and access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +56,16 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
     // i.e. `cmp`/`cmn` — those must still be rewritten when they read x18.
     if (insn >> 24) & 0x1f == 0b10001 {
         let flag_setting = (insn >> 29) & 1 == 1;
-        if reg(insn, RN) == 31 || (!flag_setting && reg(insn, RD) == 31) {
+        if reg(insn, RN) == 31 {
+            // `add x18, sp, #imm` and the like (`mov x18, sp`): the stub runs
+            // with `sp` 32 bytes lower, which [`sp_fixup`] folds into the
+            // immediate when it can.
+            if !flag_setting && reg(insn, RD) != 31 && sp_fixup(insn) != SpFixup::Defer {
+                return Some(vec![Field { shift: RD, read: false, write: true }]);
+            }
+            return None;
+        }
+        if !flag_setting && reg(insn, RD) == 31 {
             return None;
         }
         return Some(vec![
@@ -333,7 +342,8 @@ fn exclusive(insn: u32) -> Option<Vec<Field>> {
     }
 }
 
-/// What to do with the `sp`-relative offset of a load/store when the stub has
+/// What to do with the `sp`-relative offset of a load/store, or the immediate
+/// of an `add`/`sub` from `sp`, when the stub has
 /// pushed 32 bytes below `sp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpFixup {
@@ -351,6 +361,24 @@ pub enum SpFixup {
 pub fn sp_fixup(insn: u32) -> SpFixup {
     if reg(insn, RN) != 31 {
         return SpFixup::NotSp;
+    }
+    // Add/subtract immediate with `sp` as the source (not flag-setting, and
+    // with an unshifted immediate): fold the 32 bytes into the immediate. A
+    // `sub` whose immediate is smaller than 32 becomes an `add`.
+    if (insn >> 24) & 0x1f == 0b10001 {
+        if (insn >> 29) & 1 == 1 || (insn >> 22) & 1 == 1 {
+            return SpFixup::Defer;
+        }
+        let imm = (insn >> 10) & 0xfff;
+        let sub = (insn >> 30) & 1 == 1;
+        let (sub, imm) = match (sub, imm) {
+            (false, i) if i + 32 <= 0xfff => (false, i + 32),
+            (true, i) if i >= 32 => (true, i - 32),
+            (true, i) => (false, 32 - i),
+            _ => return SpFixup::Defer,
+        };
+        let base = insn & !((1 << 30) | (0xfff << 10));
+        return SpFixup::Adjusted(base | (u32::from(sub) << 30) | (imm << 10));
     }
     // Unsigned immediate: scaled imm12.
     if insn & 0x3b00_0000 == 0x3900_0000 {
@@ -457,12 +485,82 @@ pub fn x18_branch(insn: u32) -> bool {
     (family == 0b011010 || family == 0b011011) && insn & 0x1f == 18
 }
 
-/// Whether `insn` names `x18` in any standard register-operand position. This
-/// over-approximates (it looks at the fixed Rd/Rn/Rm/Rt positions regardless of
-/// class) and is used only to *count* `x18` uses this pass leaves alone (the
-/// `sp` forms), so a false positive inflates a diagnostic but changes no code.
+/// The bit positions of `insn`'s general-purpose register fields, for the
+/// instruction groups that have them, or `None` for a group this does not
+/// classify (SIMD and floating point other than the GPR conversions).
+/// Unlike [`operands`] it includes the forms the rewrite defers, so the
+/// deferred `x18` uses can be counted precisely.
+fn gpr_fields(insn: u32) -> Option<Vec<u32>> {
+    let v = (insn >> 26) & 1 == 1;
+    let top = (insn >> 25) & 0xf; // op0, bits 28:25
+    match top {
+        // Data processing, immediate.
+        0b1000 | 0b1001 => Some(match (insn >> 23) & 0x7 {
+            0b000 | 0b001 => vec![RD], // adr, adrp
+            0b101 => vec![RD],         // move wide
+            0b111 => vec![RD, RN, RM], // extract
+            _ => vec![RD, RN],         // add/sub, logical, bitfield
+        }),
+        // Branches, exceptions and system instructions.
+        0b1010 | 0b1011 => {
+            if (insn >> 25) & 0x3f == 0b011010 || (insn >> 25) & 0x3f == 0b011011 {
+                Some(vec![RD]) // cbz/cbnz, tbz/tbnz
+            } else if (insn >> 25) & 0x7f == 0b1101011 {
+                Some(vec![RN, RD]) // br/blr/ret and the authenticated forms
+            } else if insn >> 22 == 0b11_0101_0100 {
+                Some(vec![RD]) // mrs/msr/sys: Rt
+            } else {
+                Some(vec![]) // b, bl, b.cond, svc, hints
+            }
+        }
+        // Loads and stores.
+        0b0100 | 0b0110 | 0b1100 | 0b1110 => {
+            let rt = |mut f: Vec<u32>| {
+                if !v {
+                    f.push(RD);
+                }
+                f
+            };
+            if (insn >> 24) & 0x3f == 0b001000 {
+                // Exclusive, ordered, compare-and-swap: Rs, Rt(, Rt2), Rn.
+                return Some(rt(vec![RM, 10, RN]));
+            }
+            if insn & 0x3a00_0000 == 0x2800_0000 {
+                let mut f = vec![RN];
+                if !v {
+                    f.extend([RD, 10]);
+                }
+                return Some(f); // pair
+            }
+            if insn & 0x3b00_0000 == 0x1800_0000 {
+                return Some(rt(vec![])); // literal
+            }
+            if insn & 0x3b00_0000 == 0x3900_0000 {
+                return Some(rt(vec![RN])); // unsigned immediate
+            }
+            if insn & 0x3b00_0000 == 0x3800_0000 {
+                if (insn >> 21) & 1 == 1 && (insn >> 10) & 1 == 0 {
+                    return Some(rt(vec![RN, RM])); // register offset, atomics
+                }
+                return Some(rt(vec![RN])); // immediate forms, PAC loads
+            }
+            Some(vec![RN]) // SIMD structure loads and stores
+        }
+        // Data processing, register.
+        0b0101 | 0b1101 => Some(if (insn >> 24) & 0x1f == 0b11011 {
+            vec![RD, RN, RM, 10] // 3-source
+        } else {
+            vec![RD, RN, RM]
+        }),
+        // SIMD and floating point: only the GPR conversions are known.
+        _ => operands(insn).map(|f| f.into_iter().map(|f| f.shift).collect()),
+    }
+}
+
+/// Whether `insn` names `x18` in a general-purpose register field. Used to
+/// count the `x18` uses the rewrite leaves alone, a diagnostic only.
 pub fn names_x18(insn: u32) -> bool {
-    [RD, RN, RM, 10].iter().any(|&s| reg(insn, s) == 18)
+    gpr_fields(insn).is_some_and(|f| f.iter().any(|&s| reg(insn, s) == 18))
 }
 
 #[cfg(test)]
@@ -495,11 +593,15 @@ mod tests {
     }
 
     #[test]
-    fn add_sub_immediate_defers_on_sp() {
+    fn add_sub_immediate_with_sp() {
         // add x1, x2, #4 -> Rd write, Rn read
         assert_eq!(operands(0x91001041), Some(vec![rd(RD), rr(RN)]));
-        // add x18, sp, #0 (mov x18, sp) -> Rn is sp, deferred
-        assert_eq!(operands(0x910003f2), None);
+        // add x18, sp, #0 (mov x18, sp) -> sp source, folded into the stub
+        assert_eq!(operands(0x910003f2), Some(vec![rd(RD)]));
+        // adds x18, sp, #8 -> flag-setting from sp, deferred
+        assert_eq!(operands(0xb10023f2), None);
+        // add x18, sp, #1, lsl #12 -> shifted immediate, deferred
+        assert_eq!(operands(0x914007f2), None);
         // add sp, x18, #8 -> Rd is sp, deferred
         assert_eq!(operands(0x9100225f), None);
         // cmp x18, #42 == subs xzr, x18, #42 -> Rd is xzr; read x18
@@ -508,6 +610,32 @@ mod tests {
         assert_eq!(operands(0xb100065f), Some(vec![rd(RD), rr(RN)]));
         // subs x18, x19, #1 -> write x18, read x19
         assert_eq!(operands(0xf1000672), Some(vec![rd(RD), rr(RN)]));
+    }
+
+    /// The stub pushes 32 bytes, so an sp-relative add/sub is adjusted by 32.
+    /// Encodings from `clang --target=aarch64-linux-gnu`.
+    #[test]
+    fn sp_source_arithmetic_is_adjusted() {
+        // add x18, sp, #0x18 -> add x18, sp, #0x38
+        assert_eq!(sp_fixup(0x910063f2), SpFixup::Adjusted(0x9100e3f2));
+        // sub x18, sp, #0x40 -> sub x18, sp, #0x20
+        assert_eq!(sp_fixup(0xd10103f2), SpFixup::Adjusted(0xd10083f2));
+        // sub x18, sp, #8 -> add x18, sp, #0x18
+        assert_eq!(sp_fixup(0xd10023f2), SpFixup::Adjusted(0x910063f2));
+        // add x18, sp, #0xff0 -> no room in imm12
+        assert_eq!(sp_fixup(0x913fc3f2), SpFixup::Defer);
+    }
+
+    /// Only real register fields count: immediates and branch offsets whose
+    /// bits happen to read 18 do not.
+    #[test]
+    fn names_x18_is_precise() {
+        assert!(!names_x18(0x94004869)); // bl: an offset, no registers
+        assert!(!names_x18(0x54000240)); // b.eq
+        assert!(!names_x18(0xf9404a60)); // ldr x0, [x19, #0x90]: imm12 bits
+        assert!(names_x18(0x910063f2)); // add x18, sp, #0x18
+        assert!(names_x18(0xa9124bf3)); // stp x19, x18, [sp, #0x120]
+        assert!(names_x18(0xf8616a52)); // ldr x18, [x18, x1]
     }
 
     #[test]
