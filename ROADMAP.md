@@ -97,11 +97,14 @@ Remaining:
   programs, signals included (see [docs/hypervisor.md](docs/hypervisor.md)).
   Its tests run on an Apple Silicon Mac and the self-hosted runner (the
   `hypervisor` job); hosted runners cannot run a VM and skip them
-- [ ] In the VM: threads, `fork`/`vfork` and `execve`
+- [x] In the VM: threads, and `execve` between the VM and the native backend
+  either way (fwe re-executes itself on the new program)
+- [ ] In the VM: `fork` and `vfork` (a host fork child cannot use the
+  parent's VM; the child needs a fresh fwe process given the parent's state)
 - [ ] Python from the Debian rootfs (carried over from M1)
-- [ ] The rest of the process model: `execve` from a process with other
-  live threads, `execveat`, `clone3`; `vfork` sharing memory with its
-  parent rather than copying it
+- [ ] The rest of the process model: `execveat`, `clone3`; `vfork` sharing
+  memory with its parent rather than copying it; virtual credentials and
+  `RLIMIT_NOFILE` carried across an `execve` that re-executes fwe
 - [ ] Code discovery for binaries without section headers, and the `x18`
   forms no tested binary uses yet (`sp`-writeback and `sp`-register-offset
   loads and stores, flag-setting or extended `sp` arithmetic, `casp`,

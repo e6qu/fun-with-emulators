@@ -43,7 +43,8 @@ runners. The end-to-end tests build the guests into `target/guests` and need
 The hypervisor backend needs the hypervisor entitlement and a bare-metal
 Apple Silicon host. Its end-to-end tests (`hv_*`) sign a copy of `fwe`
 themselves and run wherever `cargo test` runs on such a Mac; in the hosted
-CI jobs they skip, and the self-hosted `hypervisor` job runs them. To run a
+CI jobs they skip, and the self-hosted `hypervisor` job runs them; set
+`FWE_NO_HV=1` to skip them on a Mac that could run them. To run a
 low-linked program by hand:
 
 ```sh
@@ -80,3 +81,7 @@ in the code consistent with what the code now does.
 - Vendored binaries under `guests/` are unmodified, with provenance and
   license recorded in that directory's README.
 - Treat implementation problems as things to solve, not as blockers.
+- A process running a Hypervisor.framework VM must never end, exec or fork
+  with the VM alive, and tests run one VM process at a time: abnormal VM
+  teardown took the development machine down twice (see
+  [docs/hypervisor.md](docs/hypervisor.md)).
