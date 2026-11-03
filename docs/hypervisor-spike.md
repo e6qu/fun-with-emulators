@@ -32,10 +32,29 @@ backend.
    buffer out of VM RAM for `write`) and resumes the guest, then reports what
    the guest printed and the status it exited with.
 
-A real backend will run the guest at EL0 under a minimal EL1 vector so that
-Linux's `SVC #0` traps the same way, and will dispatch into the existing
-kernel (`fwe-kernel`) instead of the two hard-coded calls here. The point of
-the spike is only to show that a low-address guest runs and traps cleanly.
+The point of the spike is only to show that a low-address guest runs and
+traps cleanly.
+
+## From spike to backend
+
+The backend itself is an M2 item on the [roadmap](../ROADMAP.md). What it
+adds over the spike:
+
+- The guest runs at **EL0** under a minimal EL1 exception vector, so Linux's
+  own `svc #0` traps to the VMM as is; no instruction rewriting is needed on
+  this path (and `x18`/`TPIDR_EL0` are the guest's, since no macOS code runs
+  on the vCPU).
+- Guest memory is mapped so that **guest addresses equal host addresses**,
+  as the native backend guarantees: the VM's RAM is the same host mapping
+  the kernel layer reads and writes, so guest pointers stay usable directly
+  and the kernel is shared unchanged.
+- A `Platform` implementation and a trap loop that feed `Kernel::enter_syscall`
+  with the vCPU's register file, the way the native backend's `SIGTRAP`
+  handler does.
+- The loader picks this backend automatically for an `ET_EXEC` image linked
+  below 4 GiB, which it rejects today.
+
+Its exit criterion is Debian's `python3.11` running from the rootfs.
 
 ## Running it (Apple Silicon, no root)
 

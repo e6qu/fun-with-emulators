@@ -10,6 +10,10 @@ use fwe_kernel::host::reserve_fixed;
 pub struct Prepared {
     pub syscalls: usize,
     pub stubs: usize,
+    /// Instructions naming `x18` that were left on the hardware register
+    /// (the forms [`crate::decode`] does not cover). Non-zero means the code
+    /// can misbehave under preemption; reported under `--strace`.
+    pub x18_deferred: usize,
 }
 
 /// No stub region could be placed within branch range of some sites.
@@ -80,7 +84,11 @@ pub unsafe fn prepare(
     // SAFETY: guaranteed by the caller.
     let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len as usize) };
     let patched = rewrite::patch(code);
-    let mut stats = Prepared { syscalls: patched.syscalls, stubs: patched.sites.len() };
+    let stats = Prepared {
+        syscalls: patched.syscalls,
+        stubs: patched.sites.len(),
+        x18_deferred: patched.x18_deferred,
+    };
 
     let mut sites = patched.sites.as_slice();
     while let Some(&(first, _)) = sites.first() {
@@ -95,8 +103,6 @@ pub unsafe fn prepare(
     if stats.syscalls + stats.stubs > 0 {
         // SAFETY: the range is mapped.
         unsafe { flush_icache(start, len) };
-    } else {
-        stats = Prepared::default();
     }
     Ok(stats)
 }
@@ -273,7 +279,7 @@ mod tests {
         }
         // SAFETY: the mapping is ours, writable and not executing.
         let stats = unsafe { prepare(code, 12, 8, 16, page, None) }.unwrap();
-        assert_eq!(stats, Prepared { syscalls: 1, stubs: 2 });
+        assert_eq!(stats, Prepared { syscalls: 1, stubs: 2, x18_deferred: 0 });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };
         assert_eq!(read(code + 4), rewrite::TRAP);

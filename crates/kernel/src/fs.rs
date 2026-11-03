@@ -160,6 +160,12 @@ impl Fs {
         &self.cwd
     }
 
+    /// The host descriptor of the rootfs directory, which fwe holds for the
+    /// life of the process.
+    pub fn root_fd(&self) -> i32 {
+        self.root.as_raw_fd()
+    }
+
     pub fn umask(&self) -> u32 {
         self.umask
     }
@@ -196,8 +202,13 @@ impl Fs {
 
         while let Some(comp) = pending.pop() {
             if comp == b".." {
+                // Back to the directory we came through; with none recorded
+                // (a path relative to a directory fd), ascend on the host —
+                // unless this is the root, where `..` stays put.
                 if let Some(parent) = ancestors.pop() {
                     dir = parent;
+                } else if !same_file(dir.as_raw_fd(), self.root.as_raw_fd()) {
+                    dir = open_dir(dir.as_raw_fd(), c"..")?;
                 }
                 continue;
             }
@@ -338,7 +349,21 @@ fn readlink_at(dir: i32, name: &CString) -> Result<Vec<u8>, i32> {
 }
 
 /// Open `name` in `dir` as a directory, not following a final symlink.
-fn open_dir(dir: i32, name: &CString) -> Result<OwnedFd, i32> {
+/// Whether two descriptors name the same file (same device and inode).
+fn same_file(a: i32, b: i32) -> bool {
+    let stat = |fd: i32| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid out-parameter.
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev, st.st_ino))
+    };
+    match (stat(a), stat(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn open_dir(dir: i32, name: &std::ffi::CStr) -> Result<OwnedFd, i32> {
     // SAFETY: opening a directory relative to `dir`.
     let fd = unsafe {
         libc::openat(
@@ -388,6 +413,31 @@ mod tests {
         assert_eq!(normalize(b"/x/y", b"./z/../w"), b"/x/y/w");
         assert_eq!(normalize(b"/x", b"/abs/p"), b"/abs/p");
         assert_eq!(normalize(b"/", b".."), b"/");
+    }
+
+    /// `..` relative to a directory fd ascends to the parent on the host
+    /// (gnulib's fts walks trees this way), but never past the root.
+    #[test]
+    fn dotdot_relative_to_dirfd_ascends_but_stays_in_root() {
+        let root = std::env::temp_dir().join(format!("fwe-fs-dotdot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/marker"), b"x").unwrap();
+        let fs = Fs::new(Some(root.to_str().unwrap().as_bytes())).unwrap();
+
+        let b = fs.resolve(fcntl::AT_FDCWD as i32, b"/a/b", true).unwrap();
+        let b_fd = open_dir(b.dir.as_raw_fd(), &b.name_c().unwrap()).unwrap();
+        // "../marker" from /a/b names /a/marker.
+        let r = fs.resolve(b_fd.as_raw_fd(), b"../marker", true).unwrap();
+        assert_eq!(r.name, b"marker");
+        assert!(same_file(
+            r.dir.as_raw_fd(),
+            open_dir(fs.root.as_raw_fd(), c"a").unwrap().as_raw_fd()
+        ));
+        // "../../../marker" is clamped at the root: /marker, which does not exist.
+        let r = fs.resolve(b_fd.as_raw_fd(), b"../../../../marker", true).unwrap();
+        assert!(same_file(r.dir.as_raw_fd(), fs.root.as_raw_fd()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

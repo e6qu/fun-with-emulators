@@ -662,67 +662,89 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
     const SYS___GETDIRENTRIES64: libc::c_int = 344;
     const BSD_HEADER: usize = 21;
 
-    let mut bsd = vec![0u8; count.max(4096)];
-    let mut position: libc::off_t = 0;
-    // SAFETY: `bsd` is a valid buffer; the syscall advances the fd offset and
-    // writes the new position through `position`.
-    let n = unsafe {
-        libc::syscall(
-            SYS___GETDIRENTRIES64,
-            fd,
-            bsd.as_mut_ptr(),
-            bsd.len(),
-            &mut position as *mut libc::off_t,
-        )
-    };
-    if n < 0 {
+    // Where the stream stands, so entries fetched from the host but not
+    // delivered can be re-read next time. `d_seekoff` is 0 on APFS, so the
+    // position has to come from the descriptor itself.
+    // SAFETY: plain host call on a guest fd.
+    let start = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    if start < 0 {
         return last_error();
     }
-    let n = n as usize;
-    let mut src = 0usize;
-    let mut written = 0u64;
-    while src + BSD_HEADER <= n {
-        let rec = &bsd[src..];
-        let d_ino = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
-        let d_seekoff = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
-        let d_reclen = u16::from_ne_bytes(rec[16..18].try_into().unwrap()) as usize;
-        let d_namlen = u16::from_ne_bytes(rec[18..20].try_into().unwrap()) as usize;
-        let d_type = rec[20];
-        if d_reclen == 0 || src + BSD_HEADER + d_namlen > n {
-            break;
+    // A translated record can be up to 4 bytes longer than the host's (they
+    // round to 8 and 4 bytes), so a host buffer of `count` bytes may yield a
+    // little more than fits. When it does, the stream is rewound and re-read
+    // with exactly the host bytes that did fit.
+    let mut size = count;
+    loop {
+        let mut bsd = vec![0u8; size];
+        let mut position: libc::off_t = 0;
+        // SAFETY: `bsd` is a valid buffer; the syscall advances the fd offset
+        // and writes the new position through `position`.
+        let n = unsafe {
+            libc::syscall(
+                SYS___GETDIRENTRIES64,
+                fd,
+                bsd.as_mut_ptr(),
+                bsd.len(),
+                &mut position as *mut libc::off_t,
+            )
+        };
+        if n < 0 {
+            return last_error();
         }
-        let name = &rec[BSD_HEADER..BSD_HEADER + d_namlen];
-
-        let out_len = (DIRENT64_HEADER + d_namlen + 1).div_ceil(8) * 8;
-        if written + out_len as u64 > count as u64 {
-            // Re-read this entry next time by rewinding the fd.
-            // SAFETY: plain host call on a guest fd.
-            unsafe { libc::lseek(fd, d_seekoff as libc::off_t, libc::SEEK_SET) };
-            break;
-        }
-
-        // Serialize the linux_dirent64 header and name directly into the
-        // guest buffer, field by field (the header is packed in the ABI).
-        let at = buf + written;
-        // SAFETY: `[at, at + out_len)` lies within the guest buffer.
-        unsafe {
-            let p = at as *mut u8;
-            p.copy_from(d_ino.to_ne_bytes().as_ptr(), 8);
-            p.add(8).copy_from((d_seekoff as i64).to_ne_bytes().as_ptr(), 8);
-            p.add(16).copy_from((out_len as u16).to_ne_bytes().as_ptr(), 2);
-            p.add(18).write(d_type);
-            for (i, &b) in name.iter().enumerate() {
-                p.add(DIRENT64_HEADER + i).write(b);
+        let n = n as usize;
+        let mut src = 0usize;
+        let mut written = 0u64;
+        let mut overflow = false;
+        while src + BSD_HEADER <= n {
+            let rec = &bsd[src..];
+            let d_ino = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+            let d_seekoff = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+            let d_reclen = u16::from_ne_bytes(rec[16..18].try_into().unwrap()) as usize;
+            let d_namlen = u16::from_ne_bytes(rec[18..20].try_into().unwrap()) as usize;
+            let d_type = rec[20];
+            if d_reclen == 0 || src + BSD_HEADER + d_namlen > n {
+                break;
             }
-            p.add(DIRENT64_HEADER + d_namlen).write(0);
+            let name = &rec[BSD_HEADER..BSD_HEADER + d_namlen];
+
+            let out_len = (DIRENT64_HEADER + d_namlen + 1).div_ceil(8) * 8;
+            if written + out_len as u64 > count as u64 {
+                overflow = true;
+                break;
+            }
+
+            // Serialize the linux_dirent64 header and name directly into the
+            // guest buffer, field by field (the header is packed in the ABI).
+            let at = buf + written;
+            // SAFETY: `[at, at + out_len)` lies within the guest buffer.
+            unsafe {
+                let p = at as *mut u8;
+                p.copy_from(d_ino.to_ne_bytes().as_ptr(), 8);
+                p.add(8).copy_from((d_seekoff as i64).to_ne_bytes().as_ptr(), 8);
+                p.add(16).copy_from((out_len as u16).to_ne_bytes().as_ptr(), 2);
+                p.add(18).write(d_type);
+                for (i, &b) in name.iter().enumerate() {
+                    p.add(DIRENT64_HEADER + i).write(b);
+                }
+                p.add(DIRENT64_HEADER + d_namlen).write(0);
+            }
+            written += out_len as u64;
+            src += d_reclen;
         }
-        written += out_len as u64;
-        src += d_reclen;
+        if !overflow {
+            return written as i64;
+        }
+        if src == 0 {
+            // Not even the first entry fits: the guest's buffer is too small.
+            return err(errno::EINVAL);
+        }
+        // SAFETY: plain host call on a guest fd, back to where this call began.
+        if unsafe { libc::lseek(fd, start, libc::SEEK_SET) } < 0 {
+            return last_error();
+        }
+        size = src;
     }
-    if written == 0 && n > 0 {
-        return err(errno::EINVAL);
-    }
-    written as i64
 }
 
 /// Build a synthetic `struct stat` for a `/proc` or `/sys` entry.
@@ -855,6 +877,52 @@ mod tests {
             0
         );
         assert_eq!(st2.st_size, data.len() as i64);
+    }
+
+    /// A buffer too small for a whole directory delivers every entry exactly
+    /// once across calls: what the host returned but did not fit is re-read,
+    /// not dropped and not repeated.
+    #[test]
+    fn getdents_small_buffer_delivers_each_entry_once() {
+        use fwe_abi::fcntl::{O_DIRECTORY, O_RDONLY};
+        let (mut k, _d) = rooted();
+        let want: Vec<String> = (0..40).map(|i| format!("entry-number-{i:02}")).collect();
+        for name in &want {
+            let path = cstr(&format!("/{name}"));
+            assert_eq!(k.syscall(nr::MKDIRAT, [AT_FDCWD, path.as_ptr() as u64, 0o755, 0, 0, 0]), 0);
+        }
+        let root = cstr("/");
+        let fd = open(&mut k, &root, O_RDONLY | O_DIRECTORY, 0);
+        assert!(fd >= 0);
+        let mut buf = [0u8; 100];
+        let mut names = Vec::new();
+        for _ in 0..1000 {
+            let n = k.syscall(
+                nr::GETDENTS64,
+                [fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0],
+            );
+            assert!(n >= 0, "getdents64: {n}");
+            if n == 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off < n as usize {
+                let reclen =
+                    u16::from_ne_bytes(buf[off + 16..off + 18].try_into().unwrap()) as usize;
+                let name_bytes = &buf[off + 19..off + reclen];
+                let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+                names.push(String::from_utf8_lossy(&name_bytes[..end]).into_owned());
+                off += reclen;
+            }
+        }
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+        names.retain(|n| n != "." && n != "..");
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "an entry was delivered twice: {names:?}");
+        assert_eq!(sorted, want);
     }
 
     #[test]

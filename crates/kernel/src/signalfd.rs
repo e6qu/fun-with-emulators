@@ -30,6 +30,12 @@ fn with<R>(f: impl FnOnce(&mut HashMap<i32, SignalFd>) -> R) -> R {
     f(g.get_or_insert_with(HashMap::new))
 }
 
+/// Descriptors the emulation holds for itself (the write ends of the
+/// readiness pipes), which the guest must never see closed.
+pub fn internal_fds() -> Vec<i32> {
+    with(|reg| reg.values().map(|s| s.wfd).collect())
+}
+
 /// Build a minimal `signalfd_siginfo` for signal `sig`.
 pub fn siginfo(sig: u32, pid: u32, status: i32) -> [u8; SIGINFO_SIZE] {
     let mut b = [0u8; SIGINFO_SIZE];

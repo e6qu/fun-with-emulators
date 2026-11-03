@@ -3,12 +3,8 @@
 ## Goal
 
 Run unmodified Linux arm64 binaries natively on macOS (Apple Silicon),
-in-process and without a Linux kernel — in the spirit of Wine, but for Linux.
-(A thin hypervisor backend covers the few binaries the in-process path cannot
-map; see Architecture. A full virtual machine with its own Linux kernel is a
-non-goal.)
-
-The project is written in Rust.
+in-process and without a Linux kernel — in the spirit of Wine, but for
+Linux. The project is written in Rust.
 
 ## Approach
 
@@ -20,6 +16,17 @@ A Rust implementation of the Linux userspace ABI that runs on macOS:
   macOS kernel.
 - Our implementation provides Linux behaviour — processes, threads, memory,
   files, signals, networking, namespaces and cgroups — built on top of macOS.
+
+The in-process path carries every position-independent binary, which is the
+norm for distribution packages. The one class it physically cannot run is a
+non-PIE executable linked into the low 4 GiB that macOS reserves in every
+arm64 process (Debian's `python3.11`, static Go binaries): the OS refuses the
+mapping and the image cannot be relocated. For exactly those, a
+**minimalistic Hypervisor.framework backend** supplies a guest address space
+without that reservation — a VM for the CPU and memory only, with system
+calls trapped straight into the same kernel layer. A full virtual machine
+with its own Linux kernel is a non-goal; the hypervisor path is as thin as
+possible and used only where the in-process path cannot reach.
 
 ## Scope
 
@@ -39,23 +46,16 @@ Out of scope:
 
 ## Architecture
 
-1. **Loader** — starts Linux binaries as macOS processes.
-2. **Linux kernel layer** — the Rust core implementing Linux behaviour on top
-   of macOS.
-3. **Execution** — guest code runs in-process at native speed by default.
-   Instructions macOS cannot let a Linux process run unchanged (`svc`,
-   `TPIDR_EL0`, and `x18` uses) are rewritten before execution. This native
-   path is the default and carries the great majority of binaries (everything
-   position-independent). It cannot, however, run a non-PIE `ET_EXEC` linked
-   into the low 4 GiB that macOS reserves with a mandatory `__PAGEZERO` (e.g.
-   Debian's `python3.11`): the OS forbids the mapping and the image cannot be
-   relocated. For exactly those binaries a **minimalistic Hypervisor.framework
-   backend** is under evaluation — a VM only for the CPU and memory, with
-   `svc` trapped straight into the same kernel layer, so the guest's own
-   address space provides the low addresses. A full virtual machine with its
-   own Linux kernel remains a non-goal; the hypervisor fallback is as thin as
-   possible and used only where the native path physically cannot reach. See
-   `docs/hypervisor-spike.md`.
+Four layers, described in [docs/architecture.md](docs/architecture.md):
+
+1. **Loader** — maps a Linux ELF image, and its dynamic linker, into the
+   process and builds the Linux initial stack.
+2. **Execution backend** — runs guest code. The native backend rewrites the
+   few instructions macOS cannot let a Linux process execute unchanged
+   (`svc`, `TPIDR_EL0`, `x18`) and traps system calls; the hypervisor
+   backend runs the guest in a VM and traps `svc` directly.
+3. **Kernel layer** — Linux system call semantics on top of macOS, shared by
+   both backends behind a small `Platform` trait.
 4. **Linux environment** — a root filesystem with synthesized `/proc`, `/sys`
    and `/dev`.
 
@@ -70,36 +70,16 @@ Out of scope:
 
 ## Measuring progress
 
+- **Real workloads:** unmodified distribution binaries run as end-to-end
+  tests with their output checked. This is what milestones are ticked off
+  against today; the list grows with each milestone.
 - **Conformance:** gVisor's syscall test suite, the Linux Test Project (LTP)
-  and kselftests, tracked as pass rates.
-- **Real workloads:** a growing list of applications and distribution test
-  suites that must pass.
-- **Performance:** benchmarks against native macOS tools and a Linux VM.
-
-## Development process
-
-The project is built with agentic coding, so work is packed into large,
-outcome-sized pull requests rather than small granular ones:
-
-- **One PR per testable outcome** — usually a milestone, or a large slice of
-  one. Many logical commits, one PR.
-- **Tests decide when it is done.** A PR is ready when its "Done when"
-  criteria pass in CI; conformance tests, real binaries and benchmarks prove
-  it, not line-by-line review.
-- **Self-reviewed before opening.** Builds, tests and a review pass happen
-  before the PR goes up.
-- **Descriptions for skimming:** what it delivers, how it was verified, what
-  is left for later.
-- **No preparatory PRs.** Refactors, scaffolding and dependency changes go
-  into the PR that needs them.
-- **Split only** for parallel workstreams that touch separate areas, or for a
-  shared foundation other in-flight work depends on.
-
-Details for contributors and agents are in [AGENTS.md](AGENTS.md).
+  and kselftests, tracked as pass rates (from M4).
+- **Performance:** benchmarks against native macOS tools and a Linux VM (M5).
 
 ## Workstreams
 
-Once the core userland runs, work proceeds in parallel across:
+With the core userland running, work proceeds in parallel across:
 
 - Core kernel (processes, memory, signals)
 - Filesystems and VFS
@@ -108,4 +88,6 @@ Once the core userland runs, work proceeds in parallel across:
 - Execution backends and performance
 - Testing and CI infrastructure
 
-See [ROADMAP.md](ROADMAP.md) for milestones.
+Milestones and status are in [ROADMAP.md](ROADMAP.md). How work is
+delivered — large outcome-sized pull requests, tests as the definition of
+done — is in [AGENTS.md](AGENTS.md).

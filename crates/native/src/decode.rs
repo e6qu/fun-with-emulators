@@ -11,9 +11,13 @@
 //! fields it has and whether each is read or written. [`operands`] returns that
 //! for the instruction classes this pass handles, and `None` for everything
 //! else — the conservative answer, since an undecoded instruction is simply
-//! left alone rather than risk a wrong rewrite. Classes left for later
-//! (loads/stores, PC-relative forms, branches, anything touching `sp`) are
-//! reported by [`names_x18`] so they can be counted.
+//! left alone rather than risk a wrong rewrite. The PC-relative forms,
+//! compare/test branches and indirect branches through `x18` have their own
+//! decoders here, since their stubs differ. What is still left alone — a
+//! load/store with writeback onto `sp` or a register offset from `sp`, a
+//! data-processing form whose operand is `sp`, `casp` and the
+//! pointer-authenticated loads — is reported by [`names_x18`] so it can be
+//! counted.
 
 /// A register operand: its field position (low bit) and access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +88,26 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         ]);
     }
 
-    // Add/subtract (shifted register): op[28:24] = 01011 with bit 21 = 0. The
-    // extended-register form (bit 21 = 1) can name `sp`, so defer it.
-    if (insn >> 24) & 0x1f == 0b01011 && (insn >> 21) & 1 == 0 {
+    // Add/subtract (shifted register): op[28:24] = 01011 with bit 21 = 0;
+    // Rd/Rn/Rm are `xzr` when 31. The extended-register form (bit 21 = 1)
+    // names `sp` for Rn = 31 and, unless flag-setting (`cmp`/`cmn`), for
+    // Rd = 31, which the stub cannot substitute.
+    if (insn >> 24) & 0x1f == 0b01011 {
+        if (insn >> 21) & 1 == 1 {
+            let flag_setting = (insn >> 29) & 1 == 1;
+            if reg(insn, RN) == 31 || (!flag_setting && reg(insn, RD) == 31) {
+                return None;
+            }
+        }
+        return Some(vec![
+            Field { shift: RD, read: false, write: true },
+            Field { shift: RN, read: true, write: false },
+            Field { shift: RM, read: true, write: false },
+        ]);
+    }
+
+    // Add/subtract with carry (ADC/ADCS/SBC/SBCS): op[28:21] = 11010000.
+    if (insn >> 21) & 0xff == 0b1101_0000 {
         return Some(vec![
             Field { shift: RD, read: false, write: true },
             Field { shift: RN, read: true, write: false },
@@ -184,48 +205,67 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
 /// kept only when the stub's 32-byte push can be compensated (see [`sp_fixup`]).
 fn load_store(insn: u32) -> Option<Vec<Field>> {
     let v = (insn >> 26) & 1 == 1; // SIMD?
-    let is_load = (insn >> 22) & 1 == 1;
-    let rt = |shift| Field { shift, read: !is_load, write: is_load };
+    let size = insn >> 30;
+    let opc = (insn >> 22) & 3;
     let base = |write| Field { shift: RN, read: true, write };
     let rr = |shift| Field { shift, read: true, write: false };
-    let sp_defer = reg(insn, RN) == 31 && !v && matches!(sp_fixup(insn), SpFixup::Defer);
+    let sp_base = reg(insn, RN) == 31;
+    let sp_defer = sp_base && !v && matches!(sp_fixup(insn), SpFixup::Defer);
 
-    // Single register, unsigned immediate offset.
-    if insn & 0x3b00_0000 == 0x3900_0000 {
-        if sp_defer {
-            return None;
-        }
-        return Some(if v { vec![base(false)] } else { vec![rt(RD), base(false)] });
+    // Load/store exclusive, ordered (acquire/release) and compare-and-swap:
+    // op[29:24] = 001000.
+    if (insn >> 24) & 0x3f == 0b001000 {
+        return exclusive(insn);
     }
-    // Single register: unscaled / unprivileged / pre- or post-index / register
-    // offset.
-    if insn & 0x3b00_0000 == 0x3800_0000 {
-        if (insn >> 21) & 1 == 1 {
-            // Register offset: a register offset cannot absorb the stub's push,
-            // so an `sp` base is deferred.
-            if reg(insn, RN) == 31 {
+
+    // Single register: unsigned immediate offset (op[29:24] = x11001), or the
+    // unscaled / unprivileged / pre- and post-index / register-offset group
+    // (x11000).
+    let unsigned_imm = insn & 0x3b00_0000 == 0x3900_0000;
+    if unsigned_imm || insn & 0x3b00_0000 == 0x3800_0000 {
+        let bit21 = !unsigned_imm && (insn >> 21) & 1 == 1;
+        if bit21 {
+            match (insn >> 10) & 3 {
+                0b10 => {} // register offset
+                // The atomic memory operations.
+                0b00 if !v => return atomic(insn),
+                // Pointer-authenticated loads (x1), SIMD with bits 00: left alone.
+                _ => return None,
+            }
+        }
+        if bit21 {
+            // Register offset: no immediate to absorb the stub's push.
+            if sp_base {
                 return None;
             }
-            return Some(if v {
-                vec![base(false), rr(RM)]
-            } else {
-                vec![rt(RD), base(false), rr(RM)]
-            });
-        }
-        let idx = (insn >> 10) & 3; // 01 post-index, 11 pre-index write back
-        let writeback = idx == 0b01 || idx == 0b11;
-        if sp_defer {
+        } else if sp_defer {
             return None;
         }
-        return Some(if v { vec![base(writeback)] } else { vec![rt(RD), base(writeback)] });
+        let writeback = !unsigned_imm && !bit21 && matches!((insn >> 10) & 3, 0b01 | 0b11);
+        let mut fields = Vec::new();
+        // The transfer register. For the GPR forms opc 00 stores, 01 loads,
+        // and 10/11 are the sign-extending loads (`ldrsb`/`ldrsh`/`ldrsw`) —
+        // except size 11 with opc 10, `prfm`, whose Rt is a prefetch operation
+        // rather than a register. For SIMD forms it is a vector register.
+        if !v && !(size == 0b11 && opc == 0b10) {
+            let load = opc != 0;
+            fields.push(Field { shift: RD, read: !load, write: load });
+        }
+        fields.push(base(writeback));
+        if bit21 {
+            fields.push(rr(RM));
+        }
+        return Some(fields);
     }
-    // Load/store pair.
+    // Load/store pair: the L bit (22) is the direction.
     if insn & 0x3a00_0000 == 0x2800_0000 {
         let mode = (insn >> 23) & 3; // 01 post, 10 offset, 11 pre, 00 no-alloc
         let writeback = mode == 0b01 || mode == 0b11;
         if sp_defer {
             return None;
         }
+        let load = (insn >> 22) & 1 == 1;
+        let rt = |shift| Field { shift, read: !load, write: load };
         return Some(if v {
             vec![base(writeback)]
         } else {
@@ -233,6 +273,64 @@ fn load_store(insn: u32) -> Option<Vec<Field>> {
         });
     }
     None
+}
+
+/// The atomic memory operations (LSE: `ldadd`/`ldclr`/`ldeor`/`ldset`/
+/// `ldsmax`/…, their `st*` aliases, `swp`) and `ldapr`: Rs at the Rm position
+/// is read, Rt written, Rn the base. There is no immediate, so an `sp` base
+/// cannot absorb the stub's push and is left alone.
+fn atomic(insn: u32) -> Option<Vec<Field>> {
+    if reg(insn, RN) == 31 {
+        return None;
+    }
+    let o3 = (insn >> 15) & 1;
+    let opc = (insn >> 12) & 7;
+    let rs = Field { shift: RM, read: true, write: false };
+    let rt = Field { shift: RD, read: false, write: true };
+    let base = Field { shift: RN, read: true, write: false };
+    match (o3, opc) {
+        (0, _) | (1, 0b000) => Some(vec![rs, rt, base]),
+        (1, 0b100) => Some(vec![rt, base]), // ldapr: Rs is 11111
+        _ => None,
+    }
+}
+
+/// Load/store exclusive (`ldxr`/`stxr`, `ldaxr`/`stlxr`, the pairs), the
+/// ordered loads and stores (`ldar`/`stlr`, `ldlar`/`stllr`) and
+/// compare-and-swap (`cas*`). A store-exclusive writes its status to Rs (at
+/// the Rm position); `cas` reads and writes Rs. `casp` names register pairs
+/// and is left alone, as is an `sp` base (no immediate to adjust).
+fn exclusive(insn: u32) -> Option<Vec<Field>> {
+    if reg(insn, RN) == 31 {
+        return None;
+    }
+    let o2 = (insn >> 23) & 1;
+    let load = (insn >> 22) & 1 == 1;
+    let o1 = (insn >> 21) & 1;
+    let status = Field { shift: RM, read: false, write: true };
+    let rt = Field { shift: RD, read: !load, write: load };
+    let rt2 = Field { shift: 10, read: !load, write: load };
+    let base = Field { shift: RN, read: true, write: false };
+    match (o2, o1) {
+        // Exclusive, single register.
+        (0, 0) => Some(if load { vec![rt, base] } else { vec![status, rt, base] }),
+        // Exclusive pair (size 1x); size 0x here is `casp`.
+        (0, 1) => {
+            if insn >> 31 == 0 {
+                return None;
+            }
+            Some(if load { vec![rt, rt2, base] } else { vec![status, rt, rt2, base] })
+        }
+        // Ordered load/store.
+        (1, 0) => Some(vec![rt, base]),
+        // Compare and swap: Rs holds the comparison value and receives the old
+        // one; Rt is the value stored. Bit 22 is acquire here, not a direction.
+        _ => Some(vec![
+            Field { shift: RM, read: true, write: true },
+            Field { shift: RD, read: true, write: false },
+            base,
+        ]),
+    }
 }
 
 /// What to do with the `sp`-relative offset of a load/store when the stub has
@@ -361,8 +459,8 @@ pub fn x18_branch(insn: u32) -> bool {
 
 /// Whether `insn` names `x18` in any standard register-operand position. This
 /// over-approximates (it looks at the fixed Rd/Rn/Rm/Rt positions regardless of
-/// class) and is used only to *count* `x18` uses this pass does not yet
-/// rewrite, so a false positive inflates a diagnostic but changes no code.
+/// class) and is used only to *count* `x18` uses this pass leaves alone (the
+/// `sp` forms), so a false positive inflates a diagnostic but changes no code.
 pub fn names_x18(insn: u32) -> bool {
     [RD, RN, RM, 10].iter().any(|&s| reg(insn, s) == 18)
 }
@@ -503,6 +601,90 @@ mod tests {
             operands(0xa8c14c12),
             Some(vec![rd(RD), rd(10), Field { shift: RN, read: true, write: true }])
         );
+    }
+
+    #[test]
+    fn sign_extending_loads_write_their_destination() {
+        // ldrsw x18, [x1, #4]: opc 10 is a load, not a store
+        assert_eq!(operands(0xb9800432), Some(vec![rd(RD), rr(RN)]));
+        // ldrsb x18, [x1]
+        assert_eq!(operands(0x39800032), Some(vec![rd(RD), rr(RN)]));
+        // ldrsh w18, [x1, #2]: opc 11
+        assert_eq!(operands(0x79c00432), Some(vec![rd(RD), rr(RN)]));
+        // ldursw x18, [x1, #-4]
+        assert_eq!(operands(0xb89fc032), Some(vec![rd(RD), rr(RN)]));
+        // ldrsw x18, [x1, x2]
+        assert_eq!(operands(0xb8a26832), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // ldrsw x18, [x1], #4
+        assert_eq!(
+            operands(0xb8804432),
+            Some(vec![rd(RD), Field { shift: RN, read: true, write: true }])
+        );
+        // prfm pldl1keep, [x18]: Rt is a prefetch operation; only the base is
+        // a register
+        assert_eq!(operands(0xf9800240), Some(vec![rr(RN)]));
+        // prfm pstl2keep, [x0, #8]: its operation field happens to be 18
+        assert_eq!(operands(0xf9800412), Some(vec![rr(RN)]));
+    }
+
+    #[test]
+    fn atomic_memory_operations() {
+        // ldadd x0, x18, [x1]: Rs read, Rt write, base read
+        assert_eq!(operands(0xf8200032), Some(vec![rr(RM), rd(RD), rr(RN)]));
+        // ldadd x18, x0, [x1]
+        assert_eq!(operands(0xf8320020), Some(vec![rr(RM), rd(RD), rr(RN)]));
+        // stadd x18, [x1] (Rt = xzr)
+        assert_eq!(operands(0xf832003f), Some(vec![rr(RM), rd(RD), rr(RN)]));
+        // swp x18, x0, [x1]
+        assert_eq!(operands(0xf8328020), Some(vec![rr(RM), rd(RD), rr(RN)]));
+        // ldapr x18, [x1]
+        assert_eq!(operands(0xf8bfc032), Some(vec![rd(RD), rr(RN)]));
+        // ldaddal x18, x0, [sp]: sp base, deferred
+        assert_eq!(operands(0xf8f203e0), None);
+        // ldraa x18, [x1]: pointer-authenticated load, deferred
+        assert_eq!(operands(0xf8200432), None);
+    }
+
+    #[test]
+    fn exclusive_and_ordered_loads_stores() {
+        let rw = |shift| Field { shift, read: true, write: true };
+        // ldxr x18, [x1]; ldaxr x18, [x1]
+        assert_eq!(operands(0xc85f7c32), Some(vec![rd(RD), rr(RN)]));
+        assert_eq!(operands(0xc85ffc32), Some(vec![rd(RD), rr(RN)]));
+        // stxr w18, x1, [x2]: status write, data read, base read
+        assert_eq!(operands(0xc8127c41), Some(vec![rd(RM), rr(RD), rr(RN)]));
+        // stlxr w2, x18, [x1]
+        assert_eq!(operands(0xc802fc32), Some(vec![rd(RM), rr(RD), rr(RN)]));
+        // ldxp x18, x19, [x1]
+        assert_eq!(operands(0xc87f4c32), Some(vec![rd(RD), rd(10), rr(RN)]));
+        // stxp w18, x1, x2, [x3]
+        assert_eq!(operands(0xc8320861), Some(vec![rd(RM), rr(RD), rr(10), rr(RN)]));
+        // ldar x18, [x1]; stlr x18, [x1]
+        assert_eq!(operands(0xc8dffc32), Some(vec![rd(RD), rr(RN)]));
+        assert_eq!(operands(0xc89ffc32), Some(vec![rr(RD), rr(RN)]));
+        // cas x18, x0, [x1]: Rs is compared and receives the old value
+        assert_eq!(operands(0xc8b27c20), Some(vec![rw(RM), rr(RD), rr(RN)]));
+        // casal x0, x18, [x1]
+        assert_eq!(operands(0xc8e0fc32), Some(vec![rw(RM), rr(RD), rr(RN)]));
+        // casp x0, x1, x2, x3, [x18]: register pairs, deferred
+        assert_eq!(operands(0x48207e42), None);
+        // ldar x18, [sp]: sp base, deferred
+        assert_eq!(operands(0xc8dffff2), None);
+    }
+
+    #[test]
+    fn extended_register_and_carry_arithmetic() {
+        // add x18, x0, w1, sxtw
+        assert_eq!(operands(0x8b21c012), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // cmp x18, w1, uxtw (Rd is xzr)
+        assert_eq!(operands(0xeb21425f), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        // add sp, x18, x1: Rd is sp, deferred
+        assert_eq!(operands(0x8b21625f), None);
+        // add x18, sp, x1: Rn is sp, deferred
+        assert_eq!(operands(0x8b2163f2), None);
+        // adc x18, x0, x1; sbcs x18, x0, x1
+        assert_eq!(operands(0x9a010012), Some(vec![rd(RD), rr(RN), rr(RM)]));
+        assert_eq!(operands(0xfa010012), Some(vec![rd(RD), rr(RN), rr(RM)]));
     }
 
     #[test]

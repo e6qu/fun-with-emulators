@@ -10,7 +10,9 @@ outcome-sized pull requests, not small granular ones:
 - Inside a PR, commits are logical steps; there are no preparatory PRs.
   Refactors, scaffolding and dependency changes go into the PR that needs
   them.
-- A PR is ready when its milestone's "Done when" criteria pass in CI.
+- A PR is ready when its outcome is proven by tests in CI — a milestone's
+  "Done when" criteria, or new end-to-end tests for a slice of one.
+- Self-reviewed before opening: build, lint, tests and a review pass.
 - Split only for parallel workstreams that touch separate areas, or for a
   shared foundation that other in-flight work depends on.
 - PR descriptions state what is delivered, how it was verified and what is
@@ -32,9 +34,39 @@ cargo test                      # end-to-end tests run on macOS arm64 only
 python3 tools/gen-abi.py        # regenerate crates/abi/src/generated.rs
 ```
 
-On a non-macOS host, the macOS-specific code is type-checked with the
-`aarch64-apple-darwin` clippy run; end-to-end behaviour is verified in CI on
-macOS runners.
+These are what CI runs. On a non-macOS host the macOS-specific code is
+type-checked by the `aarch64-apple-darwin` clippy run and the kernel crate's
+unit tests run natively; end-to-end behaviour is verified in CI on macOS
+runners. The end-to-end tests build the guests into `target/guests` and need
+`clang` from the Xcode command line tools.
+
+The hypervisor spike needs the hypervisor entitlement and a bare-metal
+Apple Silicon host, so it is run by hand or on the self-hosted runner, not
+in the hosted CI jobs:
+
+```sh
+cargo build --release -p fwe
+codesign --sign - --entitlements hv-spike.entitlements --force target/release/fwe
+target/release/fwe --hv-spike
+```
+
+## Documents
+
+Each document has one job; do not duplicate content across them.
+
+| Document | Holds |
+|---|---|
+| [README.md](README.md) | What the project is, a short status, how to run and test it |
+| [PLAN.md](PLAN.md) | Goal, approach, scope, principles, how progress is measured |
+| [ROADMAP.md](ROADMAP.md) | Milestones with checklists, "Done when" criteria and status |
+| [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
+| [docs/hypervisor-spike.md](docs/hypervisor-spike.md) | The hypervisor backend spike and its CI arrangement |
+| `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
+
+A PR that changes behaviour updates them in the same PR: tick the roadmap
+item its tests prove, remove a lifted limitation from
+`docs/architecture.md` and the roadmap, and keep module-level doc comments
+in the code consistent with what the code now does.
 
 ## Conventions
 
@@ -43,4 +75,6 @@ macOS runners.
   `crates/kernel/src/host.rs`.
 - New system calls get a unit test in the kernel crate where possible, and a
   guest program plus end-to-end test when behaviour depends on the backend.
+- Vendored binaries under `guests/` are unmodified, with provenance and
+  license recorded in that directory's README.
 - Treat implementation problems as things to solve, not as blockers.

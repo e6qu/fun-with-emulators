@@ -52,10 +52,10 @@ unsafe fn read_cstr_array(addr: u64) -> Vec<Vec<u8>> {
 /// one and start it. Returns a negative errno on failure; on success it does
 /// not return (it enters the new program).
 ///
-/// The old image's mappings are not reclaimed (full address-space teardown
-/// needs mapping tracking), so this suits the common fork-then-exec and
-/// exec-chain cases. `execve` in a process with other live threads is not
-/// supported yet.
+/// Descriptors marked close-on-exec are closed. The old image's mappings are
+/// not reclaimed (full address-space teardown needs mapping tracking), so this
+/// suits the common fork-then-exec and exec-chain cases. `execve` in a process
+/// with other live threads is not supported yet.
 pub fn do_execve(regs: &Regs) -> i64 {
     // SAFETY: the guest passed a path and argv/envp pointers.
     let (path, args, env) =
@@ -82,6 +82,7 @@ pub fn do_execve(regs: &Regs) -> i64 {
         Err(_) => return err(errno::ENOEXEC),
     };
 
+    k.close_on_exec();
     k.exec_reset();
     k.brk = out.brk;
     if let Some(fs) = k.fs.as_mut() {
@@ -170,11 +171,21 @@ fn linux_wstatus(status: libc::c_int) -> i32 {
 pub fn do_wait4(regs: &Regs) -> i64 {
     let pid = regs.x[0] as i32;
     let wstatus = regs.x[1];
-    let options = regs.x[2] as libc::c_int;
+    let options = regs.x[2];
     let rusage = regs.x[3];
 
-    // WNOHANG | WUNTRACED | WCONTINUED share values with Linux.
-    let host_options = options & (libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED);
+    // WNOHANG and WUNTRACED share values with Linux; WCONTINUED does not
+    // (8 on Linux, 0x10 on macOS).
+    let mut host_options = 0;
+    for (linux, host) in [
+        (fwe_abi::wait::WNOHANG, libc::WNOHANG),
+        (fwe_abi::wait::WUNTRACED, libc::WUNTRACED),
+        (fwe_abi::wait::WCONTINUED, libc::WCONTINUED),
+    ] {
+        if options & linux != 0 {
+            host_options |= host;
+        }
+    }
     let mut status: libc::c_int = 0;
     // SAFETY: `status` is a valid out-parameter; no guest rusage is passed to
     // the host (layouts differ), so pass null and zero the guest copy below.

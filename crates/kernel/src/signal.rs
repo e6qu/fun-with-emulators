@@ -19,15 +19,19 @@ const UC_OFF: u64 = SIGINFO_SIZE;
 const UC_STACK_OFF: u64 = UC_OFF + 16;
 /// `uc_sigmask` within `ucontext`.
 const UC_SIGMASK_OFF: u64 = UC_OFF + 40;
-/// `uc_mcontext` (a `struct sigcontext`) within `ucontext`.
-const UC_MCONTEXT_OFF: u64 = UC_OFF + 168;
+/// `uc_mcontext` (a `struct sigcontext`) within `ucontext`: after the
+/// 8-byte `uc_flags`, `uc_link`, the 24-byte `uc_stack`, the 8-byte
+/// `uc_sigmask` and the 120 bytes padding it to 1024 bits, rounded up to the
+/// 16-byte alignment `sigcontext` carries (its `__reserved` is aligned 16).
+const UC_MCONTEXT_OFF: u64 = UC_OFF + 176;
 /// `regs[31]` within `sigcontext` (after `fault_address`).
 const MC_REGS_OFF: u64 = UC_MCONTEXT_OFF + 8;
 const MC_SP_OFF: u64 = MC_REGS_OFF + 31 * 8;
 const MC_PC_OFF: u64 = MC_SP_OFF + 8;
 const MC_PSTATE_OFF: u64 = MC_PC_OFF + 8;
-/// `__reserved` within `sigcontext`, holding FP/SVE records.
-const MC_RESERVED_OFF: u64 = MC_PSTATE_OFF + 8;
+/// `__reserved` within `sigcontext`, holding FP/SVE records: 16-byte aligned,
+/// so 8 bytes of padding follow `pstate`.
+const MC_RESERVED_OFF: u64 = UC_MCONTEXT_OFF + 288;
 /// Total frame size: through the 4096-byte `__reserved` area.
 const FRAME_SIZE: u64 = MC_RESERVED_OFF + 4096;
 
@@ -106,10 +110,16 @@ impl<P: Platform> Kernel<P> {
         }
 
         // Choose the stack: the alternate stack if requested and available.
+        // A handler already running on the alternate stack keeps using it
+        // from its current sp, as Linux does; starting over from the top would
+        // overwrite the live frame beneath it.
         let on_altstack = action.flags & signal::SA_ONSTACK != 0
             && self.altstack.ss_flags & fwe_abi::signal::SS_DISABLE == 0;
-        let base_sp =
-            if on_altstack { self.altstack.ss_sp + self.altstack.ss_size } else { regs.sp };
+        let alt_top = self.altstack.ss_sp.wrapping_add(self.altstack.ss_size);
+        let already_on_alt = self.altstack.ss_flags & fwe_abi::signal::SS_DISABLE == 0
+            && regs.sp >= self.altstack.ss_sp
+            && regs.sp < alt_top;
+        let base_sp = if on_altstack && !already_on_alt { alt_top } else { regs.sp };
         // If there is no room for a frame (e.g. a stack-overflow fault leaves sp
         // below FRAME_SIZE, or the chosen stack base is tiny), we cannot deliver
         // on this stack. Report it as undelivered rather than crashing `fwe`;
@@ -200,12 +210,17 @@ mod tests {
     /// The computed frame offsets match the arm64 kernel layout.
     #[test]
     fn frame_offsets() {
-        assert_eq!(UC_MCONTEXT_OFF, 296);
-        assert_eq!(MC_REGS_OFF, 304);
-        assert_eq!(MC_SP_OFF, 552);
-        assert_eq!(MC_PC_OFF, 560);
-        assert_eq!(MC_PSTATE_OFF, 568);
-        assert_eq!(FRAME_SIZE, 4672);
+        // `offsetof(struct rt_sigframe, uc.uc_mcontext)` and friends on arm64
+        // Linux; glibc's `getcontext` stores `x18`/`x19` at
+        // `uc_mcontext + 8 + 18 * 8` = 328 from `ucontext`, which is 456 here.
+        assert_eq!(UC_MCONTEXT_OFF, 304);
+        assert_eq!(MC_REGS_OFF, 312);
+        assert_eq!(MC_REGS_OFF + 18 * 8 - UC_OFF, 328);
+        assert_eq!(MC_SP_OFF, 560);
+        assert_eq!(MC_PC_OFF, 568);
+        assert_eq!(MC_PSTATE_OFF, 576);
+        assert_eq!(MC_RESERVED_OFF, 592);
+        assert_eq!(FRAME_SIZE, 4688);
     }
 
     struct NoPlatform;
@@ -277,6 +292,32 @@ mod tests {
         assert_eq!(regs.x[5], 0xdead_beef);
         assert_eq!(regs.x[30], 0xcafe);
         assert_eq!(k.sigmask, 0);
+    }
+
+    /// A second signal delivered while a handler runs on the alternate stack
+    /// builds its frame below the running handler's sp, not over it.
+    #[test]
+    fn nested_delivery_stays_below_live_altstack_frame() {
+        let mut k = kernel();
+        let act = Sigaction { handler: HANDLER, flags: signal::SA_ONSTACK, restorer: 0, mask: 0 };
+        k.sigactions[(signal::SIGUSR1 - 1) as usize] = act;
+        k.sigactions[(signal::SIGUSR2 - 1) as usize] = act;
+        let alt = vec![0u8; 64 * 1024];
+        let alt_base = alt.as_ptr() as u64;
+        k.altstack = Stack { ss_sp: alt_base, ss_flags: 0, _pad: 0, ss_size: alt.len() as u64 };
+
+        let mut regs = Regs { sp: 0x9000, pc: 0x1000, ..Regs::default() };
+        k.raise_pending(signal::SIGUSR1);
+        k.deliver_pending(&mut regs);
+        let first = regs.sp;
+        assert!(first >= alt_base && first < alt_base + alt.len() as u64);
+
+        // Pretend the handler used some stack, then a second signal arrives.
+        regs.sp = first - 256;
+        k.raise_pending(signal::SIGUSR2);
+        k.deliver_pending(&mut regs);
+        let second = regs.sp;
+        assert!(second + FRAME_SIZE <= first - 256, "second frame {second:#x} overlaps {first:#x}");
     }
 
     #[test]

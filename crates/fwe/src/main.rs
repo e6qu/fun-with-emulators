@@ -14,6 +14,7 @@ options:
   --strace     trace system calls to standard error
   --root DIR   use DIR as the guest root filesystem
   --host-info  show host features that affect compatibility
+  --probe NAME run one host-behaviour probe (diagnostic; used by CI)
   --hv-spike   run the hypervisor-backend feasibility spike (see
                docs/hypervisor-spike.md; Apple Silicon, needs the entitlement)
   -h, --help   show this help

@@ -498,6 +498,13 @@ pub mod futex {
     pub const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 }
 
+/// `wait4`/`waitid` options (`linux/wait.h`).
+pub mod wait {
+    pub const WNOHANG: u64 = 1;
+    pub const WUNTRACED: u64 = 2;
+    pub const WCONTINUED: u64 = 8;
+}
+
 /// `clone` flags (`linux/sched.h`); the low byte is the exit signal.
 pub mod clone {
     pub const CSIGNAL: u64 = 0x0000_00ff;

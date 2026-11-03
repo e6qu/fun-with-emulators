@@ -480,8 +480,9 @@ pub fn load_image(
             let stats = platform.prepare(a, l, Some(arena)).map_err(|e| e.to_string())?;
             if strace {
                 tracer.note(&format!(
-                    "prepared {what} {a:#x}+{l:#x}: {} system calls, {} thread pointer accesses",
-                    stats.syscalls, stats.stubs
+                    "prepared {what} {a:#x}+{l:#x}: {} system calls, {} stubs, \
+                     {} x18 uses left unrewritten",
+                    stats.syscalls, stats.stubs, stats.x18_deferred
                 ));
             }
             Ok(())

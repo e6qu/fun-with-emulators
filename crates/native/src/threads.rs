@@ -127,6 +127,9 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     if let Some(tls) = spawn.tls {
         set_thread_pointer(tls);
     }
+    // The guest's x18 lives in a per-thread slot; the child inherits the
+    // parent's value as it would any other register.
+    trap::set_guest_x18(spawn.regs.x[18]);
     if let Some(abi) = crate::X18Abi::get() {
         // This thread now runs guest code and may use x18 freely.
         abi.set_enabled(true);

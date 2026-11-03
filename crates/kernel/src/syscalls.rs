@@ -517,22 +517,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_ppoll(&mut self, fds: u64, nfds: u64, timeout: u64) -> i64 {
-        const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
-        let ms = if timeout == 0 {
-            -1
-        } else {
-            // SAFETY: the guest passed a pointer to its timeout.
-            let ts: Timespec = unsafe { read(timeout) };
-            if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-                return err(errno::EINVAL);
-            }
-            let ms =
-                ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
-            ms.min(i32::MAX as i64) as i32
-        };
-        // SAFETY: `struct pollfd` and the POLL* bits match the host's; the host
-        // validates the guest array.
-        ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) })
+        // SAFETY: the guest passed the array and timeout pointers.
+        unsafe { ppoll(fds, nfds, timeout) }
     }
 
     fn sys_uname(&mut self, buf: u64) -> i64 {
@@ -756,6 +742,31 @@ impl<P: Platform> Kernel<P> {
         host::fill_random(out);
         len as i64
     }
+}
+
+/// `ppoll(fds, nfds, timeout)`; the signal mask is not applied. Blocks, so
+/// the backend runs it without the kernel lock through
+/// [`crate::blocking_syscall`]; it touches no kernel state.
+///
+/// # Safety
+/// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
+/// a guest `Timespec`.
+pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
+    const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
+    let ms = if timeout == 0 {
+        -1
+    } else {
+        // SAFETY: the caller guarantees the timeout pointer.
+        let ts: Timespec = unsafe { read(timeout) };
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return err(errno::EINVAL);
+        }
+        let ms = ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
+        ms.min(i32::MAX as i64) as i32
+    };
+    // SAFETY: `struct pollfd` and the POLL* bits match the host's; the host
+    // validates the guest array.
+    ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) })
 }
 
 #[cfg(test)]
