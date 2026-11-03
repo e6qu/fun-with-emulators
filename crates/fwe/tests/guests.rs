@@ -99,6 +99,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18pc",
     "x18sig",
     "fpsig",
+    "efault",
     "pipethread",
     "fileio",
     "sigtest",
@@ -1180,4 +1181,16 @@ fn descriptor_limit_bounds_the_guest() {
         "hard limit above soft: true\ndup2 at the hard limit: -1 EBADF\ndup2 just below it: true\n\
          raising past it: -1 EPERM\nsoft limit now 256\n"
     );
+}
+
+/// A bad pointer makes a system call fail with `EFAULT` instead of crashing
+/// fwe: pointers the kernel layer copies through itself (`uname`, `openat`,
+/// `rt_sigaction`, `getrandom`, `pipe2`, `getcwd`, `execve`, `sigaltstack`,
+/// `newfstatat`, including a write into read-only code) and those the host
+/// checks (`clock_gettime`, `write`).
+#[test]
+fn bad_pointers_fail_with_efault() {
+    for name in ["efault", "efault-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
