@@ -69,12 +69,10 @@ pub fn do_clone(parent: &Regs) -> i64 {
 
     let tid = thread::alloc_tid();
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-        // SAFETY: the guest supplied a writable int pointer.
-        unsafe { (parent_tid as *mut i32).write(tid) };
+        let _ = fwe_kernel::uaccess::write(parent_tid, tid);
     }
     if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
-        // SAFETY: shared address space; the guest supplied a writable pointer.
-        unsafe { (child_tid as *mut i32).write(tid) };
+        let _ = fwe_kernel::uaccess::write(child_tid, tid);
     }
 
     // The child resumes just after the clone, with x0 = 0 and its own stack.

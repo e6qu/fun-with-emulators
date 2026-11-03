@@ -29,6 +29,7 @@ mod syscalls;
 pub mod term;
 pub mod thread;
 mod trace;
+pub mod uaccess;
 
 pub use fs::Fs;
 pub use mm::Brk;
@@ -211,7 +212,10 @@ impl<P: Platform> Kernel<P> {
     /// signal frame instead.
     pub fn enter_syscall(&mut self, regs: &mut Regs) {
         if regs.x[8] == fwe_abi::nr::RT_SIGRETURN {
-            self.sys_rt_sigreturn(regs);
+            if !self.sys_rt_sigreturn(regs) {
+                // A frame the guest cannot read back: Linux kills it.
+                self.terminate_by(absig::SIGSEGV);
+            }
             self.tracer.syscall(regs.x[8], &[0; 6], regs.x[0] as i64);
             return;
         }
@@ -268,9 +272,10 @@ pub fn thread_exit_cleanup() {
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {
-        // SAFETY: the guest registered this address with set_tid_address.
-        unsafe { (addr as *mut u32).write(0) };
-        wake_futex(addr, 1);
+        // Linux ignores a fault here too: the word is simply not cleared.
+        if uaccess::write(addr, 0u32).is_ok() {
+            wake_futex(addr, 1);
+        }
     }
 }
 
@@ -324,10 +329,12 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     Some(match nr {
         // SAFETY: caller guarantees the futex word and timeout are valid.
         n::FUTEX => unsafe { futex::op(a[0], a[1], a[2] as u32, a[3]) },
-        n::NANOSLEEP => {
-            // SAFETY: `struct timespec` has the same layout; the host validates it.
-            host::ret(unsafe { libc::nanosleep(a[0] as *const _, a[1] as *mut _) })
-        }
+        // On macOS `nanosleep` reads and writes its arguments in the C
+        // library, unchecked, so it goes through `clock_nanosleep`'s copies.
+        // SAFETY: the arguments are checked guest pointers.
+        n::NANOSLEEP => unsafe {
+            syscalls::clock_nanosleep(fwe_abi::clock::CLOCK_MONOTONIC, 0, a[0], a[1])
+        },
         // SAFETY: caller guarantees the request/remain pointers are valid.
         n::CLOCK_NANOSLEEP => unsafe { syscalls::clock_nanosleep(a[0], a[1], a[2], a[3]) },
         // SAFETY: caller guarantees the events and sigmask pointers are valid.

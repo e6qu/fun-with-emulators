@@ -2,37 +2,10 @@
 
 use crate::fs::Fs;
 use crate::host::{self, last_error, ret};
-use crate::{Kernel, Platform};
+use crate::{Kernel, Platform, guest, uaccess};
 use fwe_abi::{Stat, Statx, err, errno, fcntl, statx_mask};
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
-
-/// Read a NUL-terminated path from guest memory (without the NUL).
-///
-/// # Safety
-/// `addr` must point to a NUL-terminated byte string in guest memory.
-unsafe fn read_cstr(addr: u64) -> Vec<u8> {
-    const MAX: usize = 1 << 16;
-    let mut out = Vec::new();
-    for i in 0..MAX as u64 {
-        // SAFETY: the caller guarantees a NUL-terminated string at `addr`.
-        let b = unsafe { (addr as *const u8).add(i as usize).read() };
-        if b == 0 {
-            break;
-        }
-        out.push(b);
-    }
-    out
-}
-
-/// Write a POD value to guest memory.
-///
-/// # Safety
-/// `addr` must point to writable guest memory with room for a `T`.
-unsafe fn write<T: Copy>(addr: u64, value: T) {
-    // SAFETY: guaranteed by the caller.
-    unsafe { (addr as *mut T).write_unaligned(value) }
-}
 
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 fn stat_to_linux(s: &libc::stat) -> Stat {
@@ -127,8 +100,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_openat(&mut self, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         // Pseudo-terminal devices are synthesized, not served from the rootfs.
         if path == b"/dev/ptmx" {
             return crate::pty::open_master(flags);
@@ -207,8 +179,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_faccessat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
             Ok(v) => v,
@@ -234,8 +205,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_newfstatat(&mut self, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
             return self.sys_fstat(dirfd, buf);
         }
@@ -262,8 +232,7 @@ impl<P: Platform> Kernel<P> {
                 crate::procfs::Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
                 crate::procfs::Entry::Missing => return err(errno::ENOENT),
             };
-            // SAFETY: the guest passed a buffer for a `struct stat`.
-            unsafe { write(buf, s) };
+            guest!(uaccess::write(buf, s));
             return 0;
         }
         let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
@@ -272,8 +241,7 @@ impl<P: Platform> Kernel<P> {
         };
         match stat_at(dir.as_raw_fd(), &name) {
             Ok(s) => {
-                // SAFETY: the guest passed a buffer for a `struct stat`.
-                unsafe { write(buf, stat_to_linux(&s)) };
+                guest!(uaccess::write(buf, stat_to_linux(&s)));
                 0
             }
             Err(e) => err(e),
@@ -289,8 +257,7 @@ impl<P: Platform> Kernel<P> {
         };
         match stat_at(dir.as_raw_fd(), &name) {
             Ok(s) => {
-                // SAFETY: the guest passed a buffer for a `struct stat`.
-                unsafe { write(buf, stat_to_linux(&s)) };
+                guest!(uaccess::write(buf, stat_to_linux(&s)));
                 0
             }
             Err(e) => err(e),
@@ -300,8 +267,7 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
         if crate::synthdir::fstat_is_dir(fd as i32) {
             use fwe_abi::stat as st;
-            // SAFETY: the guest passed a buffer for a `struct stat`.
-            unsafe { write(buf, synth_stat(st::S_IFDIR | 0o555, 0)) };
+            guest!(uaccess::write(buf, synth_stat(st::S_IFDIR | 0o555, 0)));
             return 0;
         }
         // SAFETY: `out` is a valid out-parameter.
@@ -310,8 +276,7 @@ impl<P: Platform> Kernel<P> {
         if unsafe { libc::fstat(fd as i32, &mut out) } < 0 {
             return last_error();
         }
-        // SAFETY: the guest passed a buffer for a `struct stat`.
-        unsafe { write(buf, stat_to_linux(&out)) };
+        guest!(uaccess::write(buf, stat_to_linux(&out)));
         0
     }
 
@@ -323,8 +288,7 @@ impl<P: Platform> Kernel<P> {
         _mask: u64,
         buf: u64,
     ) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let host = if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
             // SAFETY: `out` is a valid out-parameter.
             let mut out = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -344,20 +308,17 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => return err(e),
             }
         };
-        // SAFETY: the guest passed a buffer for a `struct statx`.
-        unsafe { write(buf, statx_from(&host)) };
+        guest!(uaccess::write(buf, statx_from(&host)));
         0
     }
 
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
                 crate::procfs::Entry::Symlink(target) | crate::procfs::Entry::Fd { target, .. } => {
                     let n = target.len().min(size as usize);
-                    // SAFETY: the guest passed a buffer of `size` bytes.
-                    unsafe { std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n) };
+                    guest!(uaccess::write_from(buf, &target[..n]));
                     n as i64
                 }
                 crate::procfs::Entry::File(_) | crate::procfs::Entry::Dir => err(errno::EINVAL),
@@ -385,17 +346,14 @@ impl<P: Platform> Kernel<P> {
         if (size as usize) < need {
             return err(errno::ERANGE);
         }
-        // SAFETY: the guest passed a buffer of `size >= need` bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(cwd.as_ptr(), buf as *mut u8, cwd.len());
-            (buf as *mut u8).add(cwd.len()).write(0);
-        }
+        let mut out = cwd.to_vec();
+        out.push(0);
+        guest!(uaccess::write_from(buf, &out));
         need as i64
     }
 
     pub(crate) fn sys_chdir(&mut self, path: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let fs = self.fs.as_mut().expect("filesystem configured");
         match fs.chdir(fcntl::AT_FDCWD as i32, &path) {
             Ok(()) => 0,
@@ -412,8 +370,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_mkdirat(&mut self, dirfd: u64, path: u64, mode: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let (dir, name) = match self.resolve_c(dirfd, &path, false) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -424,8 +381,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_unlinkat(&mut self, dirfd: u64, path: u64, flags: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let (dir, name) = match self.resolve_c(dirfd, &path, false) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -436,8 +392,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_symlinkat(&mut self, target: u64, dirfd: u64, path: u64) -> i64 {
-        // SAFETY: the guest passed two string pointers.
-        let (target, path) = unsafe { (read_cstr(target), read_cstr(path)) };
+        let target = guest!(uaccess::read_cstr(target, uaccess::PATH_MAX));
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let target = match CString::new(target) {
             Ok(t) => t,
             Err(_) => return err(errno::EINVAL),
@@ -458,8 +414,8 @@ impl<P: Platform> Kernel<P> {
         newpath: u64,
         flags: u64,
     ) -> i64 {
-        // SAFETY: the guest passed two path pointers.
-        let (oldpath, newpath) = unsafe { (read_cstr(oldpath), read_cstr(newpath)) };
+        let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
+        let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_FOLLOW != 0;
         let (od, on) = match self.resolve_c(olddirfd, &oldpath, follow) {
             Ok(v) => v,
@@ -481,8 +437,8 @@ impl<P: Platform> Kernel<P> {
         newpath: u64,
         flags: u64,
     ) -> i64 {
-        // SAFETY: the guest passed two path pointers.
-        let (oldpath, newpath) = unsafe { (read_cstr(oldpath), read_cstr(newpath)) };
+        let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
+        let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
         let (od, on) = match self.resolve_c(olddirfd, &oldpath, false) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -495,8 +451,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_fchmodat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
             Ok(v) => v,
@@ -514,8 +469,7 @@ impl<P: Platform> Kernel<P> {
         gid: u64,
         flags: u64,
     ) -> i64 {
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         // Resolve for existence/permission errors, then apply the virtual
         // ownership policy (ownership is not reflected to the host file).
@@ -551,10 +505,13 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = make_pipe(&mut fds, flags) {
             return err(e);
         }
-        // SAFETY: the guest passed a buffer for two ints.
-        unsafe {
-            write(buf, fds[0]);
-            write(buf + 4, fds[1]);
+        if uaccess::write(buf, fds).is_err() {
+            // SAFETY: closing the pipe just made.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return err(errno::EFAULT);
         }
         0
     }
@@ -574,8 +531,7 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: valid timespec array pointer or null.
             return ret(unsafe { libc::futimens(dirfd as i32, times_ptr) });
         }
-        // SAFETY: the guest passed a path pointer.
-        let path = unsafe { read_cstr(path) };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
             Ok(v) => v,
@@ -725,7 +681,7 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
         }
         let n = n as usize;
         let mut src = 0usize;
-        let mut written = 0u64;
+        let mut out: Vec<u8> = Vec::with_capacity(count);
         let mut overflow = false;
         while src + BSD_HEADER <= n {
             let rec = &bsd[src..];
@@ -740,31 +696,31 @@ fn getdents64(fd: i32, buf: u64, count: usize) -> i64 {
             let name = &rec[BSD_HEADER..BSD_HEADER + d_namlen];
 
             let out_len = (DIRENT64_HEADER + d_namlen + 1).div_ceil(8) * 8;
-            if written + out_len as u64 > count as u64 {
+            if out.len() + out_len > count {
                 overflow = true;
                 break;
             }
 
-            // Serialize the linux_dirent64 header and name directly into the
-            // guest buffer, field by field (the header is packed in the ABI).
-            let at = buf + written;
-            // SAFETY: `[at, at + out_len)` lies within the guest buffer.
-            unsafe {
-                let p = at as *mut u8;
-                p.copy_from(d_ino.to_ne_bytes().as_ptr(), 8);
-                p.add(8).copy_from((d_seekoff as i64).to_ne_bytes().as_ptr(), 8);
-                p.add(16).copy_from((out_len as u16).to_ne_bytes().as_ptr(), 2);
-                p.add(18).write(d_type);
-                for (i, &b) in name.iter().enumerate() {
-                    p.add(DIRENT64_HEADER + i).write(b);
-                }
-                p.add(DIRENT64_HEADER + d_namlen).write(0);
-            }
-            written += out_len as u64;
+            // The linux_dirent64 header (packed in the ABI), the name, then
+            // zeros for its terminator and the padding.
+            let at = out.len();
+            out.resize(at + out_len, 0);
+            let rec = &mut out[at..];
+            rec[0..8].copy_from_slice(&d_ino.to_ne_bytes());
+            rec[8..16].copy_from_slice(&(d_seekoff as i64).to_ne_bytes());
+            rec[16..18].copy_from_slice(&(out_len as u16).to_ne_bytes());
+            rec[18] = d_type;
+            rec[DIRENT64_HEADER..DIRENT64_HEADER + d_namlen].copy_from_slice(name);
             src += d_reclen;
         }
         if !overflow {
-            return written as i64;
+            if crate::uaccess::write_from(buf, &out).is_err() {
+                // Leave the stream where it was, as if nothing was read.
+                // SAFETY: plain host call on a guest fd.
+                unsafe { libc::lseek(fd, start, libc::SEEK_SET) };
+                return err(errno::EFAULT);
+            }
+            return out.len() as i64;
         }
         if src == 0 {
             // Not even the first entry fits: the guest's buffer is too small.

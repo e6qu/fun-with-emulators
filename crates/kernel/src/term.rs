@@ -114,6 +114,7 @@ mod tests {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
+    use crate::guest;
     use crate::host::{last_error, ret};
     use fwe_abi::term::*;
     use fwe_abi::{err, errno, ioctl};
@@ -252,15 +253,13 @@ mod imp {
         for &(l, h) in CC {
             cc[l] = t.c_cc[h];
         }
-        // SAFETY: the caller guarantees a writable Linux termios at arg.
-        unsafe {
-            (arg as *mut u32).write_unaligned(iflag);
-            ((arg + 4) as *mut u32).write_unaligned(oflag);
-            ((arg + 8) as *mut u32).write_unaligned(cflag);
-            ((arg + 12) as *mut u32).write_unaligned(lflag);
-            ((arg + 16) as *mut u8).write_unaligned(0); // c_line
-            std::ptr::copy_nonoverlapping(cc.as_ptr(), (arg + 17) as *mut u8, NCCS);
+        let mut out = [0u8; TERMIOS_SIZE];
+        for (i, flag) in [iflag, oflag, cflag, lflag].into_iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&flag.to_ne_bytes());
         }
+        // c_line (out[16]) stays 0.
+        out[17..17 + NCCS].copy_from_slice(&cc);
+        guest!(crate::uaccess::write_from(arg, &out));
         0
     }
 
@@ -271,15 +270,9 @@ mod imp {
             ioctl::TCSETSF => libc::TCSAFLUSH,
             _ => return err(errno::EINVAL),
         };
-        // SAFETY: the caller guarantees a readable Linux termios at arg.
-        let (iflag, oflag, cflag, lflag) = unsafe {
-            (
-                (arg as *const u32).read_unaligned(),
-                ((arg + 4) as *const u32).read_unaligned(),
-                ((arg + 8) as *const u32).read_unaligned(),
-                ((arg + 12) as *const u32).read_unaligned(),
-            )
-        };
+        let raw: [u8; TERMIOS_SIZE] = guest!(crate::uaccess::read(arg));
+        let word = |i: usize| u32::from_ne_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+        let (iflag, oflag, cflag, lflag) = (word(0), word(1), word(2), word(3));
         // SAFETY: a zeroed termios is a valid starting point.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         t.c_iflag = l2h(iflag, IFLAG);
@@ -287,8 +280,7 @@ mod imp {
         t.c_cflag = l2h(cflag, CFLAG) | csize_l2h(cflag);
         t.c_lflag = l2h(lflag, LFLAG);
         for &(l, h) in CC {
-            // SAFETY: the caller guarantees NCCS readable control chars.
-            t.c_cc[h] = unsafe { ((arg + 17 + l as u64) as *const u8).read_unaligned() };
+            t.c_cc[h] = raw[17 + l];
         }
         t.c_ispeed = 38400;
         t.c_ospeed = 38400;

@@ -294,19 +294,16 @@ pub fn si_code_to_linux(code: i32) -> i32 {
 
 /// The microseconds of a host `timeval`: `i32` on macOS, `i64` on Linux.
 #[allow(clippy::unnecessary_cast)]
-fn usec(t: libc::timeval) -> i64 {
+pub fn usec(t: libc::timeval) -> i64 {
     t.tv_usec as i64
 }
 
 /// Write host resource usage into a guest `struct rusage` (two `timeval`s
 /// and fourteen `long`s on both hosts). macOS reports `ru_maxrss` in bytes,
-/// Linux in kilobytes.
-///
-/// # Safety
-/// `out` must be zero or point to a writable guest `struct rusage`.
-pub unsafe fn write_rusage(out: u64, usage: &libc::rusage) {
+/// Linux in kilobytes. A zero `out` writes nothing.
+pub fn write_rusage(out: u64, usage: &libc::rusage) -> crate::uaccess::Result<()> {
     if out == 0 {
-        return;
+        return Ok(());
     }
     let maxrss = if cfg!(target_os = "macos") { usage.ru_maxrss / 1024 } else { usage.ru_maxrss };
     let words: [i64; 18] = [
@@ -330,8 +327,7 @@ pub unsafe fn write_rusage(out: u64, usage: &libc::rusage) {
         usage.ru_nivcsw,
     ];
     const _: () = assert!(18 * 8 == fwe_abi::resource_usage::RUSAGE_SIZE);
-    // SAFETY: the caller guarantees 144 writable bytes at `out`.
-    unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out as *mut i64, words.len()) };
+    crate::uaccess::write(out, words)
 }
 
 /// File status flags (`F_GETFL`) from host to Linux.

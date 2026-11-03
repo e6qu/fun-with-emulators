@@ -1,7 +1,7 @@
 //! System call dispatch and the non-memory system calls.
 
 use crate::host::{self, last_error, ret};
-use crate::{Kernel, Platform, thread};
+use crate::{Kernel, Platform, guest, thread, uaccess};
 use fwe_abi::{
     Pollfd, Rlimit, Sigaction, Stack, Timespec, UTSNAME_LEN, Utsname, Winsize, clock, err, errno,
     fcntl, ioctl, nr, resource, signal,
@@ -10,24 +10,6 @@ use std::mem::size_of;
 
 /// Kernel release reported by `uname`.
 pub const RELEASE: &str = "6.12.0-fwe";
-
-/// Read a value from guest memory.
-///
-/// # Safety
-/// `addr` must point to readable guest memory holding a `T`.
-unsafe fn read<T: Copy>(addr: u64) -> T {
-    // SAFETY: guaranteed by the caller.
-    unsafe { (addr as *const T).read_unaligned() }
-}
-
-/// Write a value to guest memory.
-///
-/// # Safety
-/// `addr` must point to writable guest memory with room for a `T`.
-unsafe fn write<T: Copy>(addr: u64, value: T) {
-    // SAFETY: guaranteed by the caller.
-    unsafe { (addr as *mut T).write_unaligned(value) }
-}
 
 fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
     let n = s.len().min(UTSNAME_LEN - 1);
@@ -47,8 +29,7 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
     let Some(hid) = host::clock_to_host(id) else {
         return err(errno::EINVAL);
     };
-    // SAFETY: the caller guarantees a valid request pointer.
-    let mut ts: Timespec = unsafe { read(req) };
+    let mut ts: Timespec = guest!(uaccess::read(req));
     if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
         return err(errno::EINVAL);
     }
@@ -75,8 +56,7 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
     }
     let e = last_error();
     if rem != 0 && flags & TIMER_ABSTIME == 0 {
-        // SAFETY: the caller guarantees a valid remain buffer.
-        unsafe { write(rem, Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec }) };
+        guest!(uaccess::write(rem, Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec }));
     }
     e
 }
@@ -301,8 +281,7 @@ impl<P: Platform> Kernel<P> {
                 if unsafe { libc::getrusage(who, &mut usage) } != 0 {
                     return last_error();
                 }
-                // SAFETY: the guest passed a buffer for a `struct rusage`.
-                unsafe { host::write_rusage(a[1], &usage) };
+                guest!(host::write_rusage(a[1], &usage));
                 0
             }
             nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
@@ -313,12 +292,22 @@ impl<P: Platform> Kernel<P> {
             nr::CLOCK_GETTIME => self.sys_clock_gettime(a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(a[0], a[1]),
             nr::GETTIMEOFDAY => {
-                // SAFETY: `struct timeval` has the same layout on both 64-bit ABIs.
-                ret(unsafe { libc::gettimeofday(a[0] as *mut _, std::ptr::null_mut()) })
+                // The C library fills these in itself, unchecked: copy out.
+                let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+                // SAFETY: `tv` is a valid out-parameter.
+                unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
+                if a[0] != 0 {
+                    guest!(uaccess::write(a[0], [tv.tv_sec, host::usec(tv)]));
+                }
+                if a[1] != 0 {
+                    // struct timezone: always zero, as on Linux today.
+                    guest!(uaccess::write(a[1], [0i32; 2]));
+                }
+                0
             }
             nr::NANOSLEEP => {
-                // SAFETY: `struct timespec` has the same layout; the host validates it.
-                ret(unsafe { libc::nanosleep(a[0] as *const _, a[1] as *mut _) })
+                // SAFETY: the arguments are checked guest pointers.
+                unsafe { clock_nanosleep(clock::CLOCK_MONOTONIC, 0, a[0], a[1]) }
             }
             nr::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a[0], a[1], a[2], a[3]),
 
@@ -371,12 +360,9 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         let (r, e, s) = self.creds.resuid();
-        // SAFETY: the three pointers are non-null guest words.
-        unsafe {
-            write(rp, r);
-            write(ep, e);
-            write(sp, s);
-        }
+        guest!(uaccess::write(rp, r));
+        guest!(uaccess::write(ep, e));
+        guest!(uaccess::write(sp, s));
         0
     }
 
@@ -385,12 +371,9 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         let (r, e, s) = self.creds.resgid();
-        // SAFETY: the three pointers are non-null guest words.
-        unsafe {
-            write(rp, r);
-            write(ep, e);
-            write(sp, s);
-        }
+        guest!(uaccess::write(rp, r));
+        guest!(uaccess::write(ep, e));
+        guest!(uaccess::write(sp, s));
         0
     }
 
@@ -404,8 +387,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         for (i, &g) in groups.iter().enumerate() {
-            // SAFETY: `list` has room for `size >= n` u32s.
-            unsafe { write(list + (i * 4) as u64, g) };
+            guest!(uaccess::write(list + (i * 4) as u64, g));
         }
         n as i64
     }
@@ -417,8 +399,7 @@ impl<P: Platform> Kernel<P> {
         }
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
-            // SAFETY: the guest provided `size` u32s at `list`.
-            v.push(unsafe { read::<u32>(list + (i * 4) as u64) });
+            v.push(guest!(uaccess::read::<u32>(list + (i * 4) as u64)));
         }
         self.creds.setgroups(v)
     }
@@ -506,15 +487,13 @@ impl<P: Platform> Kernel<P> {
                     if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) < 0 {
                         return last_error();
                     }
-                    write(
-                        arg,
-                        Winsize {
-                            ws_row: ws.ws_row,
-                            ws_col: ws.ws_col,
-                            ws_xpixel: ws.ws_xpixel,
-                            ws_ypixel: ws.ws_ypixel,
-                        },
-                    );
+                    let ws = Winsize {
+                        ws_row: ws.ws_row,
+                        ws_col: ws.ws_col,
+                        ws_xpixel: ws.ws_xpixel,
+                        ws_ypixel: ws.ws_ypixel,
+                    };
+                    guest!(uaccess::write(arg, ws));
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
@@ -522,7 +501,7 @@ impl<P: Platform> Kernel<P> {
                     crate::term::tcsetattr(fd, req, arg)
                 }
                 ioctl::TIOCSWINSZ => {
-                    let ws: Winsize = read(arg);
+                    let ws: Winsize = guest!(uaccess::read(arg));
                     let mut h: libc::winsize = std::mem::zeroed();
                     h.ws_row = ws.ws_row;
                     h.ws_col = ws.ws_col;
@@ -535,18 +514,18 @@ impl<P: Platform> Kernel<P> {
                     if pg < 0 {
                         return last_error();
                     }
-                    (arg as *mut i32).write_unaligned(pg);
+                    guest!(uaccess::write(arg, pg));
                     0
                 }
                 ioctl::TIOCSPGRP => {
-                    let pg = (arg as *const i32).read_unaligned();
+                    let pg: i32 = guest!(uaccess::read(arg));
                     ret(libc::tcsetpgrp(fd, pg))
                 }
                 ioctl::TIOCSCTTY => ret(libc::ioctl(fd, libc::TIOCSCTTY as _, arg as libc::c_int)),
                 ioctl::TIOCNOTTY => ret(libc::ioctl(fd, libc::TIOCNOTTY as _)),
                 ioctl::TIOCGPTN => match crate::pty::ptsnum(fd) {
                     Some(n) => {
-                        (arg as *mut u32).write_unaligned(n);
+                        guest!(uaccess::write(arg, n));
                         0
                     }
                     None => err(errno::ENOTTY),
@@ -587,8 +566,7 @@ impl<P: Platform> Kernel<P> {
         fill(&mut u.version, b"#1 SMP PREEMPT");
         fill(&mut u.machine, b"aarch64");
         fill(&mut u.domainname, b"(none)");
-        // SAFETY: the guest passed a buffer for a `struct new_utsname`.
-        unsafe { write(buf, u) };
+        guest!(uaccess::write(buf, u));
         0
     }
 
@@ -606,8 +584,7 @@ impl<P: Platform> Kernel<P> {
         for word in 0..size / 8 {
             let bits = (cpus - word * 64).min(64);
             let value = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            // SAFETY: the guest passed a buffer of `len >= size` bytes.
-            unsafe { write(mask + word * 8, value) };
+            guest!(uaccess::write(mask + word * 8, value));
         }
         size as i64
     }
@@ -624,12 +601,10 @@ impl<P: Platform> Kernel<P> {
             // Virtual: the host's limit also covers fwe's own descriptors.
             let (cur, max) = crate::fdtable::limit();
             if old != 0 {
-                // SAFETY: the guest passed a buffer for a `struct rlimit64`.
-                unsafe { write(old, Rlimit { rlim_cur: cur, rlim_max: max }) };
+                guest!(uaccess::write(old, Rlimit { rlim_cur: cur, rlim_max: max }));
             }
             if new != 0 {
-                // SAFETY: the guest passed a pointer to a `struct rlimit64`.
-                let n: Rlimit = unsafe { read(new) };
+                let n: Rlimit = guest!(uaccess::read(new));
                 if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
                     return err(e);
                 }
@@ -645,8 +620,7 @@ impl<P: Platform> Kernel<P> {
                     resource::RLIMIT_NICE | resource::RLIMIT_RTPRIO => 0,
                     _ => resource::RLIM_INFINITY,
                 };
-                // SAFETY: the guest passed a buffer for a `struct rlimit64`.
-                unsafe { write(old, Rlimit { rlim_cur: v, rlim_max: v }) };
+                guest!(uaccess::write(old, Rlimit { rlim_cur: v, rlim_max: v }));
             }
             return 0;
         };
@@ -660,12 +634,10 @@ impl<P: Platform> Kernel<P> {
                 rlim_cur: host::rlim_to_linux(r.rlim_cur),
                 rlim_max: host::rlim_to_linux(r.rlim_max),
             };
-            // SAFETY: the guest passed a buffer for a `struct rlimit64`.
-            unsafe { write(old, value) };
+            guest!(uaccess::write(old, value));
         }
         if new != 0 {
-            // SAFETY: the guest passed a pointer to a `struct rlimit64`.
-            let n: Rlimit = unsafe { read(new) };
+            let n: Rlimit = guest!(uaccess::read(new));
             let r = libc::rlimit {
                 rlim_cur: host::rlim_to_host(n.rlim_cur),
                 rlim_max: host::rlim_to_host(n.rlim_max),
@@ -682,8 +654,15 @@ impl<P: Platform> Kernel<P> {
         let Some(hid) = host::clock_to_host(id) else {
             return err(errno::EINVAL);
         };
-        // SAFETY: `struct timespec` has the same layout; the host validates it.
-        ret(unsafe { libc::clock_gettime(hid, tp as *mut libc::timespec) })
+        // The C library computes the time itself and writes it unchecked, so
+        // read it into fwe's memory and copy it out.
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid out-parameter.
+        if unsafe { libc::clock_gettime(hid, &mut ts) } != 0 {
+            return last_error();
+        }
+        guest!(uaccess::write(tp, Timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec }));
+        0
     }
 
     fn sys_clock_nanosleep(&mut self, id: u64, flags: u64, req: u64, rem: u64) -> i64 {
@@ -698,8 +677,13 @@ impl<P: Platform> Kernel<P> {
         if tp == 0 {
             return 0;
         }
-        // SAFETY: `struct timespec` has the same layout; the host validates it.
-        ret(unsafe { libc::clock_getres(hid, tp as *mut libc::timespec) })
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid out-parameter.
+        if unsafe { libc::clock_getres(hid, &mut ts) } != 0 {
+            return last_error();
+        }
+        guest!(uaccess::write(tp, Timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec }));
+        0
     }
 
     fn sys_rt_sigaction(&mut self, sig: u64, act: u64, old: u64, size: u64) -> i64 {
@@ -708,15 +692,13 @@ impl<P: Platform> Kernel<P> {
         }
         let slot = (sig - 1) as usize;
         if old != 0 {
-            // SAFETY: the guest passed a buffer for a `struct sigaction`.
-            unsafe { write(old, self.sigactions[slot]) };
+            guest!(uaccess::write(old, self.sigactions[slot]));
         }
         if act != 0 {
             if sig == signal::SIGKILL || sig == signal::SIGSTOP {
                 return err(errno::EINVAL);
             }
-            // SAFETY: the guest passed a pointer to a `struct sigaction`.
-            self.sigactions[slot] = unsafe { read::<Sigaction>(act) };
+            self.sigactions[slot] = guest!(uaccess::read::<Sigaction>(act));
             self.sync_host_signal(sig);
         }
         0
@@ -728,8 +710,7 @@ impl<P: Platform> Kernel<P> {
         }
         let previous = thread::mask();
         if set != 0 {
-            // SAFETY: the guest passed a pointer to a `sigset_t`.
-            let s: u64 = unsafe { read(set) };
+            let s: u64 = guest!(uaccess::read(set));
             thread::set_mask(match how {
                 signal::SIG_BLOCK => previous | s,
                 signal::SIG_UNBLOCK => previous & !s,
@@ -738,20 +719,17 @@ impl<P: Platform> Kernel<P> {
             });
         }
         if old != 0 {
-            // SAFETY: the guest passed a buffer for a `sigset_t`.
-            unsafe { write(old, previous) };
+            guest!(uaccess::write(old, previous));
         }
         0
     }
 
     fn sys_sigaltstack(&mut self, ss: u64, old: u64) -> i64 {
         if old != 0 {
-            // SAFETY: the guest passed a buffer for a `stack_t`.
-            unsafe { write(old, thread::altstack()) };
+            guest!(uaccess::write(old, thread::altstack()));
         }
         if ss != 0 {
-            // SAFETY: the guest passed a pointer to a `stack_t`.
-            let s: Stack = unsafe { read(ss) };
+            let s: Stack = guest!(uaccess::read(ss));
             if s.ss_flags & !libc::SS_DISABLE != 0 {
                 return err(errno::EINVAL);
             }
@@ -767,8 +745,7 @@ impl<P: Platform> Kernel<P> {
         if sizemask < 8 {
             return err(errno::EINVAL);
         }
-        // SAFETY: the guest passed a pointer to an 8-byte signal set.
-        let set = unsafe { read::<u64>(mask) };
+        let set = guest!(uaccess::read::<u64>(mask));
         let r = crate::signalfd::signalfd4(fd as i32, set, flags);
         // A watched signal must reach the backend even when its disposition
         // would let the host drop it.
@@ -777,10 +754,11 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_getrandom(&mut self, buf: u64, len: u64) -> i64 {
-        let len = len.min(i32::MAX as u64) as usize;
-        // SAFETY: the guest passed a buffer of `len` bytes.
-        let out = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len) };
-        host::fill_random(out);
+        // Linux returns at most 32 MiB per call.
+        let len = len.min(32 << 20) as usize;
+        let mut out = vec![0u8; len];
+        host::fill_random(&mut out);
+        guest!(uaccess::write_from(buf, &out));
         len as i64
     }
 }
@@ -797,8 +775,7 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     let ms = if timeout == 0 {
         -1
     } else {
-        // SAFETY: the caller guarantees the timeout pointer.
-        let ts: Timespec = unsafe { read(timeout) };
+        let ts: Timespec = guest!(uaccess::read(timeout));
         if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
             return err(errno::EINVAL);
         }

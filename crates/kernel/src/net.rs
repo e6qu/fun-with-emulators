@@ -23,6 +23,7 @@
 //! `sendto`, `sendmsg` — run outside the kernel lock via `blocking_syscall`.
 
 use crate::host::{last_error, ret};
+use crate::{guest, uaccess};
 use fwe_abi::socket::*;
 use fwe_abi::{err, errno};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -137,65 +138,45 @@ unsafe fn to_host(
     len: u64,
     out: &mut [u8; SOCKADDR_MAX],
 ) -> Result<libc::socklen_t, i64> {
-    if addr == 0 {
+    if addr == 0 || len < 2 {
         return Err(err(errno::EINVAL));
     }
-    // SAFETY: the caller guarantees at least two readable bytes.
-    let fam = unsafe { (addr as *const u16).read_unaligned() } as u64;
-    // SAFETY: each helper has the same contract — `addr` spans `len` bytes.
-    unsafe {
-        match fam {
-            AF_INET => inet_to_host(addr, len, out, 16),
-            AF_INET6 => inet_to_host(addr, len, out, 28),
-            AF_UNIX => unix_to_host(addr, len, out),
-            _ => Err(err(errno::EAFNOSUPPORT)),
-        }
+    let src = uaccess::read_bytes(addr, (len as usize).min(SOCKADDR_MAX)).map_err(err)?;
+    match u16::from_ne_bytes([src[0], src[1]]) as u64 {
+        AF_INET => inet_to_host(&src, out, 16),
+        AF_INET6 => inet_to_host(&src, out, 28),
+        AF_UNIX => unix_to_host(&src, out),
+        _ => Err(err(errno::EAFNOSUPPORT)),
     }
 }
 
-/// # Safety
-/// `addr` must span `len` readable bytes and `total` is the family's size.
-unsafe fn inet_to_host(
-    addr: u64,
-    len: u64,
+/// `src` is the guest's address; `total` is the family's size.
+fn inet_to_host(
+    src: &[u8],
     out: &mut [u8; SOCKADDR_MAX],
     total: usize,
 ) -> Result<libc::socklen_t, i64> {
-    if (len as usize) < total {
+    if src.len() < total {
         return Err(err(errno::EINVAL));
     }
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: both spans are `total` bytes within bounds.
-        unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), total) };
+        out[..total].copy_from_slice(&src[..total]);
     }
     #[cfg(not(target_os = "linux"))]
     {
         let host_fam = if total == 16 { libc::AF_INET } else { libc::AF_INET6 } as u8;
         out[0] = total as u8;
         out[1] = host_fam;
-        // SAFETY: payload after the 2-byte header is identical; fits in `out`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (addr + 2) as *const u8,
-                out.as_mut_ptr().add(2),
-                total - 2,
-            )
-        };
+        // The payload after the 2-byte header is identical.
+        out[2..total].copy_from_slice(&src[2..total]);
     }
     Ok(total as libc::socklen_t)
 }
 
-/// # Safety
-/// `addr` must span `len` readable bytes.
-unsafe fn unix_to_host(
-    addr: u64,
-    len: u64,
-    out: &mut [u8; SOCKADDR_MAX],
-) -> Result<libc::socklen_t, i64> {
-    let plen = (len as usize).saturating_sub(2);
-    // SAFETY: the caller guarantees `len` readable bytes from `addr`.
-    let raw = unsafe { std::slice::from_raw_parts((addr + 2) as *const u8, plen) };
+/// `src` is the guest's address.
+fn unix_to_host(src: &[u8], out: &mut [u8; SOCKADDR_MAX]) -> Result<libc::socklen_t, i64> {
+    let raw = &src[2..];
     let host = root_unix_path(raw)?;
     if host.len() + 1 > UNIX_PATH_MAX {
         return Err(err(errno::ENAMETOOLONG));
@@ -227,15 +208,12 @@ unsafe fn unix_to_host(
 
 /// Write a host `sockaddr` back to a guest buffer in Linux layout, honoring the
 /// guest capacity; returns the full Linux length.
-///
-/// # Safety
-/// `dst`, if non-zero, must be writable for `dst_cap` bytes.
-unsafe fn to_guest(
+fn to_guest(
     host: &[u8; SOCKADDR_MAX],
     host_len: libc::socklen_t,
     dst: u64,
     dst_cap: u32,
-) -> u32 {
+) -> uaccess::Result<u32> {
     let total = host_len as usize;
     #[cfg(target_os = "linux")]
     let host_fam = u16::from_ne_bytes([host[0], host[1]]) as i32;
@@ -274,10 +252,22 @@ unsafe fn to_guest(
     }
     if dst != 0 {
         let n = linux_len.min(dst_cap as usize);
-        // SAFETY: the caller guarantees `dst_cap` writable bytes.
-        unsafe { std::ptr::copy_nonoverlapping(lb.as_ptr(), dst as *mut u8, n) };
+        uaccess::write_from(dst, &lb[..n])?;
     }
-    linux_len as u32
+    Ok(linux_len as u32)
+}
+
+/// Write a host `sockaddr` to the guest's `addr`, with its length in the
+/// guest's `addrlen` word, which holds the buffer's capacity on entry.
+fn name_to_guest(
+    host: &[u8; SOCKADDR_MAX],
+    host_len: libc::socklen_t,
+    addr: u64,
+    addrlen: u64,
+) -> uaccess::Result<()> {
+    let cap: u32 = uaccess::read(addrlen)?;
+    let full = to_guest(host, host_len, addr, cap)?;
+    uaccess::write(addrlen, full)
 }
 
 fn empty_sockaddr() -> [u8; SOCKADDR_MAX] {
@@ -347,10 +337,13 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     }
     apply_sock_flags(fds[0], type_);
     apply_sock_flags(fds[1], type_);
-    // SAFETY: the caller guarantees two writable i32s.
-    unsafe {
-        (sv as *mut i32).write_unaligned(fds[0]);
-        ((sv + 4) as *mut i32).write_unaligned(fds[1]);
+    if uaccess::write(sv, fds).is_err() {
+        // SAFETY: closing the sockets just made.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return err(errno::EFAULT);
     }
     0
 }
@@ -413,13 +406,10 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     if r < 0 {
         return last_error();
     }
-    if want {
-        // SAFETY: the caller guarantees a writable length word.
-        let cap = unsafe { (addrlen as *const u32).read_unaligned() };
-        // SAFETY: `hb` holds `hl` host bytes; `addr`/`addrlen` writable.
-        let full = unsafe { to_guest(&hb, hl, addr, cap) };
-        // SAFETY: writable length word.
-        unsafe { (addrlen as *mut u32).write_unaligned(full) };
+    if want && name_to_guest(&hb, hl, addr, addrlen).is_err() {
+        // SAFETY: closing the connection just accepted.
+        unsafe { libc::close(r) };
+        return err(errno::EFAULT);
     }
     apply_sock_flags(r, flags);
     r as i64
@@ -444,12 +434,7 @@ pub unsafe fn getname(fd: u64, addr: u64, addrlen: u64, peer: bool) -> i64 {
     if r < 0 {
         return last_error();
     }
-    // SAFETY: writable length word.
-    let cap = unsafe { (addrlen as *const u32).read_unaligned() };
-    // SAFETY: `hb` holds `hl` host bytes; `addr`/`addrlen` writable.
-    let full = unsafe { to_guest(&hb, hl, addr, cap) };
-    // SAFETY: writable length word.
-    unsafe { (addrlen as *mut u32).write_unaligned(full) };
+    guest!(name_to_guest(&hb, hl, addr, addrlen));
     0
 }
 
@@ -550,12 +535,7 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
             return last_error();
         }
         if addrlen != 0 {
-            // SAFETY: writable length word.
-            let cap = unsafe { (addrlen as *const u32).read_unaligned() };
-            // SAFETY: `hb` holds `hl` bytes; `addr`/`addrlen` writable.
-            let full = unsafe { to_guest(&hb, hl, addr, cap) };
-            // SAFETY: writable length word.
-            unsafe { (addrlen as *mut u32).write_unaligned(full) };
+            guest!(name_to_guest(&hb, hl, addr, addrlen));
         }
         r as i64
     } else {
@@ -664,22 +644,11 @@ pub unsafe fn shutdown(fd: u64, how: u64) -> i64 {
 
 // --- scatter/gather + ancillary -------------------------------------------
 
-/// Guest `msghdr` fields (64-bit Linux layout).
-///
-/// # Safety
-/// `msg` must point to a valid `msghdr`.
-unsafe fn read_msghdr(msg: u64) -> (u64, u32, u64, u64, u64, u64) {
-    // SAFETY: the caller guarantees a valid msghdr.
-    unsafe {
-        (
-            (msg as *const u64).read_unaligned(),        // msg_name
-            ((msg + 8) as *const u32).read_unaligned(),  // msg_namelen
-            ((msg + 16) as *const u64).read_unaligned(), // msg_iov
-            ((msg + 24) as *const u64).read_unaligned(), // msg_iovlen
-            ((msg + 32) as *const u64).read_unaligned(), // msg_control
-            ((msg + 40) as *const u64).read_unaligned(), // msg_controllen
-        )
-    }
+/// Guest `msghdr` fields (64-bit Linux layout): name, namelen, iov,
+/// iovlen, control, controllen.
+fn read_msghdr(msg: u64) -> uaccess::Result<(u64, u32, u64, u64, u64, u64)> {
+    let w: [u64; 6] = uaccess::read(msg)?;
+    Ok((w[0], w[1] as u32, w[2], w[3], w[4], w[5]))
 }
 
 /// `sendmsg(fd, msg, flags)`.
@@ -687,8 +656,7 @@ unsafe fn read_msghdr(msg: u64) -> (u64, u32, u64, u64, u64, u64) {
 /// # Safety
 /// `msg` must point to a valid `msghdr`.
 pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
-    // SAFETY: the caller guarantees a valid msghdr.
-    let (name, namelen, iov, iovlen, control, controllen) = unsafe { read_msghdr(msg) };
+    let (name, namelen, iov, iovlen, control, controllen) = guest!(read_msghdr(msg));
     let mut hb = empty_sockaddr();
     let (name_ptr, name_len) = if name != 0 && namelen != 0 {
         // SAFETY: the caller guarantees the name spans namelen.
@@ -708,8 +676,7 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let mut macbuf = [0u8; 256];
     #[cfg(not(target_os = "linux"))]
     let (ctl_ptr, ctl_len) = if controllen != 0 {
-        // SAFETY: the caller guarantees `controllen` readable bytes.
-        match unsafe { scm_linux_to_host(control, controllen as usize, &mut macbuf) } {
+        match scm_linux_to_host(control, controllen as usize, &mut macbuf) {
             Ok(0) => (std::ptr::null_mut(), 0),
             Ok(n) => (macbuf.as_mut_ptr() as *mut libc::c_void, n as libc::socklen_t),
             Err(e) => return e,
@@ -736,8 +703,7 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
 /// # Safety
 /// `msg` must point to a valid `msghdr` with writable `iov`/`name`.
 pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
-    // SAFETY: the caller guarantees a valid msghdr.
-    let (name, namelen, iov, iovlen, control, controllen) = unsafe { read_msghdr(msg) };
+    let (name, namelen, iov, iovlen, control, controllen) = guest!(read_msghdr(msg));
     let want_name = name != 0 && namelen != 0;
     let mut hb = empty_sockaddr();
 
@@ -771,35 +737,26 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         return last_error();
     }
     if want_name {
-        // SAFETY: `hb` holds `hmsg.msg_namelen` bytes; `name` is writable.
-        let full = unsafe { to_guest(&hb, hmsg.msg_namelen, name, namelen) };
-        // SAFETY: the msg_namelen field is writable.
-        unsafe { ((msg + 8) as *mut u32).write_unaligned(full) };
+        let full = guest!(to_guest(&hb, hmsg.msg_namelen, name, namelen));
+        guest!(uaccess::write(msg + 8, full));
     }
 
     // Ancillary data back to the guest.
     #[cfg(target_os = "linux")]
     {
         // Host wrote the guest's Linux-layout control buffer directly.
-        // SAFETY: the controllen/flags fields are writable.
-        unsafe {
-            ((msg + 40) as *mut u64).write_unaligned(hmsg.msg_controllen as u64);
-            ((msg + 48) as *mut i32).write_unaligned(msg_flags_from_host(hmsg.msg_flags));
-        }
+        guest!(uaccess::write(msg + 40, hmsg.msg_controllen as u64));
+        guest!(uaccess::write(msg + 48, msg_flags_from_host(hmsg.msg_flags)));
     }
     #[cfg(not(target_os = "linux"))]
     {
         let (clen, ctrunc) = if controllen != 0 && hmsg.msg_controllen != 0 {
-            // SAFETY: `macbuf` holds `hmsg.msg_controllen` bytes; guest control
-            // buffer has `controllen` bytes.
-            unsafe {
-                scm_host_to_linux(
-                    &macbuf,
-                    hmsg.msg_controllen as usize,
-                    control,
-                    controllen as usize,
-                )
-            }
+            guest!(scm_host_to_linux(
+                &macbuf,
+                hmsg.msg_controllen as usize,
+                control,
+                controllen as usize,
+            ))
         } else {
             (0u64, false)
         };
@@ -807,33 +764,24 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         if ctrunc {
             lflags |= MSG_CTRUNC as i32;
         }
-        // SAFETY: the controllen/flags fields are writable.
-        unsafe {
-            ((msg + 40) as *mut u64).write_unaligned(clen);
-            ((msg + 48) as *mut i32).write_unaligned(lflags);
-        }
+        guest!(uaccess::write(msg + 40, clen));
+        guest!(uaccess::write(msg + 48, lflags));
     }
     r as i64
 }
 
 /// Re-encode a guest Linux `SCM_RIGHTS` control buffer into macOS layout in
 /// `out`; returns the macOS control length (0 if no SCM_RIGHTS present).
-///
-/// # Safety
-/// `control` must span `len` readable bytes.
 #[cfg(not(target_os = "linux"))]
-unsafe fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Result<usize, i64> {
+fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Result<usize, i64> {
     // Linux cmsghdr: { u64 cmsg_len; i32 level; i32 type; } then data @16, 8-aligned.
+    let ctl = uaccess::read_bytes(control, len.min(64 * 1024)).map_err(err)?;
+    let len = ctl.len();
+    let u64_at = |o: usize| u64::from_ne_bytes(ctl[o..o + 8].try_into().unwrap());
+    let i32_at = |o: usize| i32::from_ne_bytes(ctl[o..o + 4].try_into().unwrap());
     let mut off = 0usize;
     while off + 16 <= len {
-        // SAFETY: the 16-byte cmsg header lies within the readable buffer.
-        let (clen, level, ctype) = unsafe {
-            (
-                ((control + off as u64) as *const u64).read_unaligned() as usize,
-                ((control + off as u64 + 8) as *const i32).read_unaligned(),
-                ((control + off as u64 + 12) as *const i32).read_unaligned(),
-            )
-        };
+        let (clen, level, ctype) = (u64_at(off) as usize, i32_at(off + 8), i32_at(off + 12));
         if clen < 16 || off + clen > len {
             break;
         }
@@ -850,10 +798,7 @@ unsafe fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Re
             out[4..8].copy_from_slice(&(libc::SOL_SOCKET).to_ne_bytes());
             out[8..12].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
             for i in 0..nfds {
-                // SAFETY: fd ints lie within the cmsg data.
-                let fd = unsafe {
-                    ((control + off as u64 + 16 + (i * 4) as u64) as *const i32).read_unaligned()
-                };
+                let fd = i32_at(off + 16 + i * 4);
                 out[12 + i * 4..16 + i * 4].copy_from_slice(&fd.to_ne_bytes());
             }
             return Ok(maclen);
@@ -866,15 +811,15 @@ unsafe fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Re
 /// Re-encode macOS `SCM_RIGHTS` control data from `host` into the guest Linux
 /// control buffer; returns `(linux_controllen, truncated)`.
 ///
-/// # Safety
-/// `host` holds `host_len` bytes; `dst` has `dst_cap` writable bytes.
+/// `host` holds `host_len` bytes; `dst` is the guest's buffer of `dst_cap`
+/// bytes.
 #[cfg(not(target_os = "linux"))]
-unsafe fn scm_host_to_linux(
+fn scm_host_to_linux(
     host: &[u8; 256],
     host_len: usize,
     dst: u64,
     dst_cap: usize,
-) -> (u64, bool) {
+) -> uaccess::Result<(u64, bool)> {
     let mut off = 0usize;
     while off + 12 <= host_len {
         let clen =
@@ -890,28 +835,22 @@ unsafe fn scm_host_to_linux(
             let nfds = (clen - 12) / 4;
             let linux_len = 16 + nfds * 4;
             if linux_len > dst_cap {
-                return (0, true);
+                return Ok((0, true));
             }
-            // SAFETY: `dst` has `dst_cap >= linux_len` writable bytes.
-            unsafe {
-                (dst as *mut u64).write_unaligned(linux_len as u64);
-                ((dst + 8) as *mut i32).write_unaligned(SOL_SOCKET as i32);
-                ((dst + 12) as *mut i32).write_unaligned(1); // SCM_RIGHTS
-                for i in 0..nfds {
-                    let fd = i32::from_ne_bytes([
-                        host[off + 12 + i * 4],
-                        host[off + 13 + i * 4],
-                        host[off + 14 + i * 4],
-                        host[off + 15 + i * 4],
-                    ]);
-                    ((dst + 16 + (i * 4) as u64) as *mut i32).write_unaligned(fd);
-                }
+            let mut out = vec![0u8; linux_len];
+            out[0..8].copy_from_slice(&(linux_len as u64).to_ne_bytes());
+            out[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+            out[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
+            for i in 0..nfds {
+                out[16 + i * 4..20 + i * 4]
+                    .copy_from_slice(&host[off + 12 + i * 4..off + 16 + i * 4]);
             }
-            return (linux_len as u64, false);
+            uaccess::write_from(dst, &out)?;
+            return Ok((linux_len as u64, false));
         }
         off += (clen + 3) & !3; // CMSG_ALIGN to 4 on macOS
     }
-    (0, false)
+    Ok((0, false))
 }
 
 #[cfg(test)]

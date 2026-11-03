@@ -318,12 +318,8 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     } else if nr == fwe_abi::nr::RT_SIGTIMEDWAIT {
         // The awaited signals are caught on the host while the call waits,
         // without the kernel lock.
-        let want = if args[0] == 0 {
-            0
-        } else {
-            // SAFETY: the guest passed a pointer to a signal set.
-            unsafe { (args[0] as *const u64).read_unaligned() }
-        };
+        // A bad set is reported by the call itself.
+        let want: u64 = fwe_kernel::uaccess::read(args[0]).unwrap_or(0);
         kernel().as_mut().unwrap().catch_for_wait(want);
         // SAFETY: guest pointers in `args` reference guest memory.
         let r = unsafe { fwe_kernel::signal::sigtimedwait(args[0], args[1], args[2], args[3]) };
@@ -444,7 +440,16 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // `Kernel::sys_kill`), so here it is a fault, or the rare signal sent by
     // another process, which macOS's siginfo does not tell apart.
     if !IN_GUEST.with(Cell::get) {
-        // In fwe's own code (the kernel lock may be held): fatal.
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        if let Some(resume) = fwe_kernel::uaccess::fixup(ss.pc) {
+            // A guest pointer the kernel was copying through was bad: the
+            // copy reports EFAULT.
+            ss.pc = resume;
+            return;
+        }
+        // Anywhere else in fwe's own code (the kernel lock may be held):
+        // fatal.
         restore_default(sig);
         return;
     }

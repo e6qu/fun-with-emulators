@@ -179,6 +179,7 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use crate::host::last_error;
+    use crate::{guest, uaccess};
     use fwe_abi::{err, errno};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -296,15 +297,7 @@ mod imp {
         use fwe_abi::timerfd::*;
         let fd = fd as i32;
         // Read the requested interval and value.
-        // SAFETY: the caller guarantees a valid itimerspec.
-        let (iv_s, iv_ns, val_s, val_ns) = unsafe {
-            (
-                (new_value as *const i64).read_unaligned(),
-                ((new_value + 8) as *const i64).read_unaligned(),
-                ((new_value + 16) as *const i64).read_unaligned(),
-                ((new_value + 24) as *const i64).read_unaligned(),
-            )
-        };
+        let [iv_s, iv_ns, val_s, val_ns]: [i64; 4] = guest!(uaccess::read(new_value));
 
         let (prev_iv, prev_val, kq) = match with_reg(|m| match m.get_mut(&fd) {
             Some(Special::Timer(t)) => {
@@ -320,13 +313,7 @@ mod imp {
         };
 
         if old_value != 0 {
-            // SAFETY: the caller guarantees writable space for an itimerspec.
-            unsafe {
-                ((old_value) as *mut i64).write_unaligned(prev_iv.0);
-                ((old_value + 8) as *mut i64).write_unaligned(prev_iv.1);
-                ((old_value + 16) as *mut i64).write_unaligned(prev_val.0);
-                ((old_value + 24) as *mut i64).write_unaligned(prev_val.1);
-            }
+            guest!(uaccess::write(old_value, [prev_iv.0, prev_iv.1, prev_val.0, prev_val.1]));
         }
 
         let value_ms = val_s.saturating_mul(1000) + val_ns / 1_000_000;
@@ -381,13 +368,7 @@ mod imp {
             _ => None,
         }) {
             Some((iv, val)) => {
-                // SAFETY: the caller guarantees writable space for an itimerspec.
-                unsafe {
-                    (curr_value as *mut i64).write_unaligned(iv.0);
-                    ((curr_value + 8) as *mut i64).write_unaligned(iv.1);
-                    ((curr_value + 16) as *mut i64).write_unaligned(val.0);
-                    ((curr_value + 24) as *mut i64).write_unaligned(val.1);
-                }
+                guest!(uaccess::write(curr_value, [iv.0, iv.1, val.0, val.1]));
                 0
             }
             None => err(errno::EINVAL),
@@ -425,9 +406,10 @@ mod imp {
                                 // SAFETY: a byte is present when count drops to 0.
                                 unsafe { drain(e.rfd) };
                             }
-                            // SAFETY: the caller guarantees 8 writable bytes.
-                            unsafe { (buf as *mut u64).write_unaligned(v) };
-                            Some(8)
+                            Some(match uaccess::write(buf, v) {
+                                Ok(()) => 8,
+                                Err(e) => err(e),
+                            })
                         } else if e.nonblock {
                             Some(err(errno::EAGAIN))
                         } else {
@@ -459,9 +441,10 @@ mod imp {
                     return Some(err(errno::EAGAIN));
                 }
                 let count = ev.data.max(1) as u64;
-                // SAFETY: the caller guarantees 8 writable bytes.
-                unsafe { (buf as *mut u64).write_unaligned(count) };
-                8
+                match uaccess::write(buf, count) {
+                    Ok(()) => 8,
+                    Err(e) => err(e),
+                }
             }
         })
     }
@@ -481,8 +464,10 @@ mod imp {
         if len < 8 {
             return Some(err(errno::EINVAL));
         }
-        // SAFETY: the caller guarantees 8 readable bytes.
-        let add = unsafe { (buf as *const u64).read_unaligned() };
+        let add: u64 = match uaccess::read(buf) {
+            Ok(v) => v,
+            Err(e) => return Some(err(e)),
+        };
         if add == u64::MAX {
             return Some(err(errno::EINVAL));
         }
