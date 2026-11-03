@@ -1112,6 +1112,13 @@ fn fork_from_a_threaded_process() {
     assert_eq!(signals("threaded-fork"), "child of a threaded parent\nexited 5\n");
 }
 
+/// A fork while another thread writes sees one instant of the process: the
+/// threads running guest code are stopped while the host fork copies memory.
+#[test]
+fn fork_sees_one_instant_of_a_threaded_process() {
+    assert_eq!(signals("fork-snapshot"), "consistent snapshots: 8 of 8\n");
+}
+
 /// A fork child sees the parent's memory as it was at the fork, and neither
 /// side sees the other's later private writes; shared memory stays shared.
 /// It can use the `epoll` and `timerfd` descriptors it inherited, which on

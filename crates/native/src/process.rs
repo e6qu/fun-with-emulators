@@ -119,7 +119,9 @@ static VFORK_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::
 ///
 /// A multithreaded guest forks with the kernel lock and every kernel
 /// registry lock held ([`fwe_kernel::fork_locked`]), so the child, which has
-/// only the forking thread, cannot inherit a lock another thread held.
+/// only the forking thread, cannot inherit a lock another thread held, and
+/// with the other threads that run guest code stopped
+/// ([`crate::quiesce`]), so the child sees one instant of memory.
 ///
 /// With `vfork` (`CLONE_VM | CLONE_VFORK`, as `posix_spawn` and `vfork` use)
 /// the child gets a copy of the address space rather than sharing it, and
@@ -144,7 +146,12 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
     let (pid, kqueues) = {
         let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let kqueues = fwe_kernel::kqueue_state();
-        (fwe_kernel::fork_locked(), kqueues)
+        let pid = fwe_kernel::fork_locked(|| {
+            // SAFETY: plain host call; the child continues with only the
+            // calling thread, as on Linux.
+            crate::quiesce::fork_stopped(|| unsafe { libc::fork() })
+        });
+        (pid, kqueues)
     };
     if pid < 0 {
         let e = fwe_kernel::host::last_error();

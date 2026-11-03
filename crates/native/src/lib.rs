@@ -8,6 +8,8 @@ pub mod loader;
 pub mod prepare;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod process;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod quiesce;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -26,6 +28,8 @@ pub(crate) fn exit_current_thread(code: i32) -> ! {
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    quiesce::forget_current();
     // SAFETY: ends the calling host thread; the process keeps running.
     unsafe { libc::pthread_exit(std::ptr::null_mut()) }
 }
