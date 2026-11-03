@@ -118,23 +118,31 @@ words finds every instruction exactly.
   ordinary scratch register is safe.
 
   `crates/native/src/decode.rs` decides which instructions are covered:
-  the register-only data-processing classes (move wide, add/sub, logical,
+  the register-only data-processing classes (move wide, add/sub in the
+  immediate, shifted- and extended-register and with-carry forms, logical,
   bitfield, extract, conditional select and compare, one-, two- and
   three-source), the floating-point↔integer moves and conversions, all the
   load/store forms (unsigned and unscaled immediate, register offset, pre-
-  and post-index, pair, with general-purpose and SIMD transfer registers),
-  the PC-relative forms (`adr`, `adrp`, `ldr` literal, where the stub
-  materialises the value computed from the original pc), the compare- and
-  test-branches (`cbz`/`cbnz`/`tbz`/`tbnz`, which get a branch stub that
-  tests the preserved value and takes a full-range branch to the real
-  target or the fall-through) and indirect branches (`br`/`blr`/`ret`
-  through `x18`, which load the target into `x16`/`x17`, dead at any branch).
-  A stack spill of `x18` through `sp` has its offset bumped by the 32 bytes
-  the stub pushed. What is still left alone, and counted as deferred: a
-  load/store with writeback onto `sp` or a register offset from `sp`, and
-  the data-processing forms whose operand is `sp` rather than `xzr`. These
-  are rare for a caller-saved register and have not appeared in the
-  binaries run so far.
+  and post-index, pair, the sign-extending loads, with general-purpose and
+  SIMD transfer registers), the exclusive, acquire/release, compare-and-swap
+  and LSE atomic memory instructions, the PC-relative forms (`adr`, `adrp`,
+  `ldr` literal, where the stub materialises the value computed from the
+  original pc), the compare- and test-branches (`cbz`/`cbnz`/`tbz`/`tbnz`,
+  which get a branch stub that tests the preserved value and takes a
+  full-range branch to the real target or the fall-through) and indirect
+  branches (`br`/`blr`/`ret` through `x18`, which load the target into
+  `x16`/`x17`, dead at any branch). A stack spill of `x18` through `sp` has
+  its offset bumped by the 32 bytes the stub pushed. What is still left
+  alone, and reported under `--strace` as left unrewritten: a load/store
+  with writeback onto `sp` or a register offset from `sp`, a data-processing
+  form whose operand is `sp` rather than `xzr`, `casp` and the
+  pointer-authenticated loads. These are rare for a caller-saved register
+  and have not appeared in the binaries run so far.
+
+  The backend keeps the slot and the kernel's register view in step: a trap
+  reads the guest's `x18` from the slot into `Regs` and writes it back on
+  return, so a signal frame carries the real value and `rt_sigreturn`
+  restores it, and a cloned thread starts with its parent's.
 
   The macOS custom x18 ABI (`<os/arch/arm64.h>`, macOS 26.4 and later) and
   `fwe --host-info` remain only as host probes; correctness no longer
@@ -165,11 +173,12 @@ found by probing near the code.
 2. The handler checks that the trapping instruction is ours, copies the
    saved thread state into a `Regs` value (the kernel's view of the guest
    register file), and dispatches on the number in `x8`.
-3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `wait4`, the
-   blocking socket calls, `read`/`write` on an event descriptor — run
-   **without** the kernel lock, so a waiting thread never stalls the threads
-   meant to wake it; `clone`, `execve` and `exit` are handled by the backend
-   for the same reason. Everything else runs under the single kernel lock
+3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `ppoll`,
+   `wait4`, the blocking socket calls, and `read`/`write` with their vectored
+   and positioned forms (a pipe or socket blocks until another thread acts)
+   — run **without** the kernel lock, so a waiting thread never stalls the
+   threads meant to wake it; `clone`, `execve` and `exit` are handled by the
+   backend for the same reason. Everything else runs under the single kernel lock
    through `Kernel::enter_syscall`.
 4. The result goes into `x0`, `pc` advances past the `brk`, a pending signal
    is delivered if one is ready, and returning from the handler resumes the
@@ -190,8 +199,12 @@ rootfs. `*at` calls resolve relative to their directory descriptor.
 
 Guest file descriptors are host file descriptors: an opened file's host fd is
 returned to the guest unchanged, so `read`, `write`, `lseek`, `fstat` and the
-rest act on it directly. `stat` results are translated into the arm64 Linux
-layout (`statx` too); `getdents64` is built from `getdirentries` on macOS.
+rest act on it directly. The few descriptors fwe keeps for itself (the rootfs
+handle, the write ends of the pipes behind the emulated event descriptors)
+share that table, so a guest that closes every descriptor it did not open can
+take them away; see the limitations. `stat` results are translated into the arm64 Linux
+layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
+directory position when the translated entries outgrow the guest's buffer.
 Creation modes have the umask applied by the kernel. `fcntl` translates the
 descriptor and status flags; `ioctl` covers the terminal, pty and `FIO*`
 requests.
@@ -214,10 +227,11 @@ in-memory entry list. An unknown path under `/proc` or `/sys` is `ENOENT`.
 ## Processes
 
 `execve` loads the new program with the same `load_image` the startup path
-uses and enters it with a fresh register set, after resetting the signal
-dispositions, the alternate stack and the per-thread words (the blocked mask
-is kept, as on Linux). The old image's mappings are not reclaimed yet, so
-this suits fork-then-exec and exec chains. `fork` (a `clone` without
+uses and enters it with a fresh register set, after closing the descriptors
+marked close-on-exec and resetting the signal dispositions, the alternate
+stack and the per-thread words (the blocked mask is kept, as on Linux). The
+old image's mappings are not reclaimed yet, so this suits fork-then-exec and
+exec chains. `fork` (a `clone` without
 `CLONE_THREAD`) duplicates the process with host `fork`; the child
 re-initialises its thread state and enters the guest with `x0` = 0. It is
 supported for single-threaded guests only, since another thread could hold
@@ -258,7 +272,11 @@ none is installed. Delivery builds an arm64 `rt_sigframe` on the guest stack
 handler with `x0`/`x1`/`x2` set per `SA_SIGINFO`, and sets the return
 address to the handler's `sa_restorer` or, lacking one, an `rt_sigreturn`
 trampoline the backend maps at startup. `rt_sigreturn` restores the saved
-registers, mask and alternate stack. Only the general-purpose registers, `sp`,
+registers, mask and alternate stack. The frame uses the kernel's own
+`ucontext`/`sigcontext` layout, so a handler that reads or patches
+`uc_mcontext` (an unwinder, a fault handler that skips an instruction) sees
+the right fields. A handler already running on the alternate stack keeps
+using it from its current `sp`. Only the general-purpose registers, `sp`,
 `pc` and `pstate` are saved across a handler; the signal mask and alternate
 stack are process-wide rather than per thread.
 
@@ -354,20 +372,26 @@ those items.
 - **Execution:** a non-PIE executable linked below 4 GiB cannot run
   in-process (the mandatory `__PAGEZERO`); the hypervisor backend is the path
   for it, and exists as a spike. `x18` in a load/store with writeback onto
-  `sp` or a register offset from `sp`, and in a data-processing form whose
-  operand is `sp`, is left unrewritten (counted under `--strace`). Code
-  discovery relies on section headers; a stripped binary has its whole
-  executable segment scanned, and an inline jump table in a code section
-  could be patched.
+  `sp` or a register offset from `sp`, in a data-processing form whose
+  operand is `sp`, in `casp` and in the pointer-authenticated loads is left
+  unrewritten (reported under `--strace`). Code discovery relies on section
+  headers; a stripped binary has its whole executable segment scanned, and
+  an inline jump table in a code section could be patched.
 - **Processes:** `execve` does not reclaim the old address space; `fork` is
   single-threaded only; `vfork`, `waitid`, `execveat` and `clone3` are not
   implemented; `rusage` is zero-filled.
+- **Descriptors:** fwe's own descriptors (the rootfs handle, the pipe ends
+  behind eventfd and signalfd) live in the guest's table; a guest that closes
+  every descriptor from 3 up, as daemons and `subprocess` do, breaks path
+  resolution. A guest↔host descriptor map is the fix.
+- **Memory:** `MADV_DONTNEED` on a private file mapping keeps modified pages
+  where Linux would restore the file's. Guest pointers the kernel reads
+  itself are not fault-checked; a bad pointer crashes `fwe` instead of
+  returning `EFAULT`.
 - **Signals:** `kill` reaches only the calling process (another pid gets
   `ESRCH`), so a shell cannot signal its children; the mask and alternate
   stack are process-wide, not per thread; floating-point and vector
   registers are not saved across a handler.
-- **Memory safety:** guest pointers the kernel reads itself are not
-  fault-checked; a bad pointer crashes `fwe` instead of returning `EFAULT`.
 - **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases and the
   `epoll_pwait` signal mask; `timerfd` resolution and clock distinctions.
 - **Not implemented:** `rseq`, `membarrier` (optional for libc), and any

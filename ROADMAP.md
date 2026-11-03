@@ -89,12 +89,16 @@ Remaining:
   process (today only the caller's own pid is accepted); reclaim the old
   address space on `execve`; `fork` from a multithreaded process; `vfork`,
   `waitid`, `execveat`; `rusage` from `wait4`/`getrusage`
+- [ ] A guest↔host descriptor map, so fwe's own descriptors (the rootfs
+  handle, the pipes behind eventfd and signalfd) are out of the guest's
+  reach when it closes everything from 3 up
 - [ ] Per-thread signal masks and alternate stacks; floating-point and SIMD
   state saved across a signal handler
 - [ ] `EFAULT` for bad guest pointers the kernel reads itself, instead of a
   crash
 - [ ] The remaining `x18` forms (`sp`-writeback and `sp`-register-offset
-  loads and stores) and code discovery for binaries without section headers
+  loads and stores, `sp`-operand arithmetic, `casp`, pointer-authenticated
+  loads) and code discovery for binaries without section headers
 - [ ] Each of the target programs vendored or fetched as a test with checked
   output: git, a C compiler, Node, Go, the Rust toolchain, `apt`, a database,
   a web server
