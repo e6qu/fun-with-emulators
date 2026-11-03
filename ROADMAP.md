@@ -12,7 +12,7 @@ describes how the pieces work and lists the current limitations in detail.
 **Status (November 2026):** M0 and M1 are done. M2 is in progress: its
 system-call surface is implemented, and the hypervisor backend runs
 low-address executables with threads, `fork` and `execve`; what remains is
-Debian's Python, the rest of the process model and running the listed
+Debian's Python, the `x18` and code-discovery gaps, and running the listed
 software end to end.
 
 ## M0 — Foundation (done)
@@ -105,7 +105,7 @@ Remaining:
 - [ ] Python from the Debian rootfs (carried over from M1)
 - [x] `execveat` and `clone3`; virtual credentials, `RLIMIT_NOFILE` and the
   umask carried across an `execve` that re-executes fwe
-- [ ] The rest of the process model: `vfork` sharing memory with its parent
+- [x] The rest of the process model: `vfork` sharing memory with its parent
   rather than copying it; a native-backend `fork` that stops the parent's
   other threads while memory is copied
 - [ ] Code discovery for binaries without section headers, and the `x18`

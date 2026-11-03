@@ -304,17 +304,26 @@ renamed or deleted after it was opened is not found.
 `fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
 `fork`. In a multithreaded guest the kernel lock and every kernel registry
 lock are held across it, so the child — which, as on Linux, has only the
-forking thread — cannot inherit a lock another thread held. The child cannot
+forking thread — cannot inherit a lock another thread held. A host fork
+copies memory while the other threads run, so a child could see one
+thread's writes torn across pages; instead the threads running guest code
+are suspended for the fork (`crates/native/src/quiesce.rs`). Only those:
+guest code holds none of fwe's or the host libraries' locks, while a thread
+suspended in fwe's code (inside `malloc`, say) could deadlock the fork. A
+thread in fwe's code runs on, and waits before going back into guest code
+until the fork is done. The child cannot
 return through the trap handler frame it inherited (macOS does not restore
 the signal mask from a frame the process did not take), so it installs a
 signal stack of its own and enters the guest directly with `x0` = 0. The
 `vfork` form, `CLONE_VM | CLONE_VFORK`, which `posix_spawn`, `vfork` and Go's
-`os/exec` use, runs as a fork: the child gets a copy of the address space,
-not a share of it, and the parent waits until the child has exec'd or exited
-(it holds the write end of a close-on-exec pipe). Spawn helpers only exec or
-exit in the child, so this matches; a child that writes to memory the parent
-reads afterwards (glibc's `posix_spawn` reporting an exec failure) is not
-seen by the parent. A host fork child does not inherit kqueues (their
+`os/exec` use, is a fork whose child shares the guest's memory: for that
+fork the private guest memory is set to be inherited by sharing
+(`minherit`), then back to being copied, in both processes. The parent waits
+until the child has exec'd or exited (it holds the write end of a
+close-on-exec pipe), and sees what the child wrote meanwhile — glibc's
+`posix_spawn` reports an exec failure that way. fwe's own memory is not
+shared, so the child's kernel state is its own, and so are its mappings: an
+`mmap` or `munmap` in a `vfork` child does not reach the parent. A host fork child does not inherit kqueues (their
 descriptors are closed in it), so the kqueues behind the guest's `epoll` and
 `timerfd` descriptors are recorded before the fork and rebuilt in the child
 at the same numbers (see Event descriptors).
@@ -340,7 +349,8 @@ the state. The child reserves the window, maps each entry at the parent's
 address, restores the kernel, creates its own VM over the same mappings and
 resumes the guest after the `svc` with `x0` = 0. The parent returns once the
 child is about to run; a `vfork` parent waits on until the child execs or
-exits. Neither side pays for memory until it writes to a page. A guest that
+exits, and a `vfork` child is given shares of private memory as well, so its
+writes reach the parent. Neither side pays for memory until it writes to a page. A guest that
 has placed a `MAP_FIXED` mapping outside the window cannot fork (`EAGAIN`).
 
 `wait4` reaps a child through the host, translating the status into the
@@ -534,12 +544,13 @@ those items.
   discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
   an inline jump table in a code section could be patched.
-- **Processes:** `vfork` copies the address space instead of sharing it
-  (see Processes), in both backends; a fork child of a timerfd loses the
-  expirations not yet read; in the native backend a host `fork` copies
-  memory while the parent's other threads keep running, so a child can see
-  one thread's writes torn across pages (the hypervisor backend stops every
-  vCPU for its snapshot); in a fork child, an epoll or timerfd descriptor
+- **Processes:** a `vfork` child shares the guest's memory but not its
+  mappings (an `mmap` or `munmap` in it stays in the child); a fork child
+  of a timerfd loses the expirations not yet read; in the native backend a
+  thread inside fwe's code during a `fork` (in a system call) is not
+  stopped, so a write it makes to guest memory then, such as a `read`
+  completing into a buffer, may or may not reach the child; in a fork
+  child, an epoll or timerfd descriptor
   duplicated with `dup` is gone (only the original number is rebuilt), a
   periodic timerfd restarts its period, and eventfd counters and signalfd
   queues are the child's own copies while their readiness pipes are shared;
