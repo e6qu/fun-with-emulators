@@ -30,10 +30,46 @@ fn run_bounded(mut cmd: Command) -> Output {
     run_bounded_with_stdin(cmd, &[])
 }
 
+/// [`run_bounded`] for a command that runs VM processes (the hypervisor
+/// backend). A VM process must never be killed with its VM alive, so the
+/// command runs in a process group of its own; on timeout the group gets
+/// `SIGTERM`, which every VM process catches to tear its VM down first,
+/// and only a group still alive 5 s later gets `SIGKILL`. Afterwards no
+/// process of the group may be left (a fork child outliving its test would
+/// keep a VM running alongside the next one): the test fails if one is.
+fn run_vm_bounded(mut cmd: Command) -> Output {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(Stdio::null()).process_group(0);
+    let out = run_bounded_inner(cmd, &[], true);
+    // The leader is reaped; anything still in its group outlived it.
+    let pgid = out.1;
+    let lingering = || {
+        // SAFETY: signal 0 only checks whether the group has members.
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    };
+    if lingering() {
+        // SAFETY: asking the leftover processes to end (and tear down).
+        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        let start = Instant::now();
+        while lingering() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("a process of a VM test outlived it (process group {pgid})");
+    }
+    out.0
+}
+
 /// Like [`run_bounded`], but feeds `input` to the guest's standard input
 /// (written on its own thread so a guest that does not read it cannot wedge
 /// the test).
-fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
+fn run_bounded_with_stdin(cmd: Command, input: &[u8]) -> Output {
+    run_bounded_inner(cmd, input, false).0
+}
+
+/// The guest's output and its pid. With `vm`, the command leads its own
+/// process group, and a timeout ends the group gently (see
+/// [`run_vm_bounded`]).
+fn run_bounded_inner(mut cmd: Command, input: &[u8], vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     let feed = !input.is_empty();
     if feed {
@@ -68,8 +104,26 @@ fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
             break status;
         }
         if start.elapsed() > GUEST_TIMEOUT {
-            let _ = child.kill();
             timed_out = true;
+            if vm {
+                let pgid = child.id() as i32;
+                // SAFETY: SIGTERM to the guest's own process group; VM
+                // processes catch it and tear their VM down.
+                unsafe { libc::killpg(pgid, libc::SIGTERM) };
+                let grace = Instant::now();
+                while grace.elapsed() < Duration::from_secs(5) {
+                    if child.try_wait().unwrap().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if child.try_wait().unwrap().is_none() {
+                    eprintln!("--- VM guest ignored SIGTERM for 5 s; killing it");
+                    let _ = child.kill();
+                }
+            } else {
+                let _ = child.kill();
+            }
             break child.wait().unwrap();
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -80,7 +134,7 @@ fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
     // Readers finish once the pipes close (at process exit).
     let stdout = out_reader.join().unwrap();
     let stderr = err_reader.join().unwrap();
-    Output { status, stdout, stderr }
+    (Output { status, stdout, stderr }, child.id() as i32)
 }
 
 const ASM_GUESTS: &[&str] = &[
@@ -218,7 +272,7 @@ fn rust_guest(name: &str) -> PathBuf {
 fn fwe(program: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     // Shown when a test fails.
     eprintln!("--- {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     out
@@ -1237,12 +1291,43 @@ fn bad_pointers_fail_with_efault() {
 // copied and signed with the hypervisor entitlement; elsewhere the tests
 // report that they were skipped and pass.
 
+/// The name of a running process that uses the hypervisor itself (a VM
+/// manager), if any.
+fn other_hypervisor_client() -> Option<String> {
+    const CLIENTS: &[&str] = &[
+        "krunkit",
+        "vfkit",
+        "qemu-system-aarch64",
+        "com.apple.Virtualization.VirtualMachine",
+        "limactl",
+        "UTM",
+        "VirtualBoxVM",
+        "prl_vm_app",
+    ];
+    let ps = Command::new("ps").args(["-axco", "comm="]).output().ok()?;
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|name| CLIENTS.contains(name))
+        .map(str::to_string)
+}
+
 /// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
 fn hv_fwe() -> Option<&'static Path> {
     static FWE: OnceLock<Option<PathBuf>> = OnceLock::new();
     FWE.get_or_init(|| {
         // FWE_NO_HV=1 skips the VM tests on a machine that could run them.
         if std::env::var_os("FWE_NO_HV").is_some() {
+            return None;
+        }
+        // Never alongside another hypervisor client: the machine crashed
+        // three times while one (Podman's krunkit, with nested
+        // virtualization) ran beside these tests (docs/hypervisor.md).
+        if let Some(other) = other_hypervisor_client() {
+            eprintln!(
+                "skipped: another hypervisor client is running ({other}); \
+                 stop it (for Podman: `podman machine stop`) to run the VM tests"
+            );
             return None;
         }
         let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
@@ -1261,7 +1346,9 @@ fn hv_fwe() -> Option<&'static Path> {
         // A host that has the hypervisor but refuses the VM (no
         // entitlement honoured) also counts as unavailable.
         let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
-        let spike = Command::new(&signed).arg("--hv-spike").output().ok()?;
+        let mut spike = Command::new(&signed);
+        spike.arg("--hv-spike");
+        let spike = run_vm_bounded(spike);
         (ok && spike.status.success()).then_some(signed)
     })
     .as_deref()
@@ -1313,7 +1400,7 @@ fn fwe_hv(program: &Path, args: &[&str]) -> Option<Output> {
     let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(fwe);
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     Some(out)
 }
@@ -1443,7 +1530,7 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(fwe);
     cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     Some(out)
 }
@@ -1509,7 +1596,7 @@ fn hv_execve_between_backends() {
         .env_clear()
         .env("LD_LIBRARY_PATH", "/lib")
         .env("PATH", "/bin");
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     eprintln!("--- bash -> vm stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "hello from linux\nstatus=0 cwd=/lib\n");
 }

@@ -198,8 +198,23 @@ pub fn protect(guest: u64, len: u64, prot: u64) {
     let _ = map(guest, fwe_kernel::uaccess::g2h(guest), len, prot);
 }
 
-/// Map `[guest, guest + len)` again with the same protections, after the
-/// host memory behind it was replaced.
+/// Stop mapping `[guest, guest + len)` in the VM while its host memory is
+/// replaced, keeping the records [`refresh`] maps it again from.
+pub fn detach(guest: u64, len: u64) {
+    let end = guest + len;
+    let m = mappings();
+    for (&s, &(e, prot, _)) in m.range(..end).rev().take_while(|&(_, &(e, _, _))| e > guest) {
+        let (lo, hi) = (s.max(guest), e.min(end));
+        if prot != 0 {
+            // SAFETY: removing part of a mapping this module made; the
+            // record stays for `refresh`.
+            unsafe { hv_vm_unmap(lo, (hi - lo) as usize) };
+        }
+    }
+}
+
+/// Map `[guest, guest + len)` again with the same protections, after
+/// [`detach`] and the host replacing the memory behind it.
 pub fn refresh(guest: u64, len: u64) {
     let pieces: Vec<(u64, u64, u64, u64)> = {
         let m = mappings();
@@ -213,7 +228,11 @@ pub fn refresh(guest: u64, len: u64) {
             .collect()
     };
     for (lo, hi, host, prot) in pieces {
-        let _ = map(lo, host, hi - lo, prot);
+        if prot != 0 {
+            // SAFETY: the guest's own memory, at a range `detach` unmapped
+            // (its record kept); mapping it again maps the new pages.
+            unsafe { hv_vm_map(host as *mut _, lo, (hi - lo) as usize, flags(prot)) };
+        }
     }
 }
 

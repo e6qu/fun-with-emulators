@@ -96,11 +96,18 @@ pub trait Platform {
         Ok(())
     }
 
-    /// The guest unmapped `[addr, addr + len)`.
+    /// The guest unmapped `[addr, addr + len)`, or is about to replace it.
+    /// The kernel calls this *before* it unmaps or replaces the host memory
+    /// behind the range, so a VM never maps memory the host is freeing.
     fn unmap_guest(&mut self, _addr: u64, _len: u64) {}
 
     /// The guest changed the protections of `[addr, addr + len)` to `prot`.
     fn protect_guest(&mut self, _addr: u64, _len: u64, _prot: u64) {}
+
+    /// The host memory behind `[addr, addr + len)` is about to be replaced
+    /// by fresh pages (`MADV_DONTNEED`): a VM stops mapping it, keeping the
+    /// mapping's record for [`Platform::remapped_guest`].
+    fn replacing_guest(&mut self, _addr: u64, _len: u64) {}
 
     /// The host memory behind `[addr, addr + len)` was replaced by fresh
     /// pages (`MADV_DONTNEED`); a VM mapping of it must follow.

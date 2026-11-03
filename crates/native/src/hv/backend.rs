@@ -88,6 +88,10 @@ impl Platform for HvPlatform {
         vm::protect(addr, len, prot);
     }
 
+    fn replacing_guest(&mut self, addr: u64, len: u64) {
+        vm::detach(addr, len);
+    }
+
     fn remapped_guest(&mut self, addr: u64, len: u64) {
         vm::refresh(addr, len);
     }

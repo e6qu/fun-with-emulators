@@ -70,8 +70,19 @@ VM process was killed by a signal, and a kernel panic (a NULL dereference in a
 kernel thread) while a VM process was being torn down. Neither was memory
 pressure. Both times the VM processes ended without destroying their vCPUs and
 VM, the tests ran several of them at once, and another Hypervisor.framework
-client (Podman's `krunkit`) was running. The exact kernel path is Apple's, but
-the backend now rules out everything on its side of it:
+client (Podman's `krunkit`) was running.
+
+It went down a third time that day, with a watchdog reset at about 16:18,
+and that time no fwe VM was alive: the last VM test (the fork tests) had
+ended cleanly 23 minutes before, and the one fwe run just before the crash
+failed before creating a VM. Before that day the machine had been up for
+three weeks with `krunkit` (which uses nested virtualization) running, so
+the crashes follow this backend's use of the hypervisor, but can come long
+after it. That points to kernel state left behind rather than the moment of
+teardown; the panic of the second crash, in a kernel thread, lands near the
+kernel's thread-destruction code. The exact path is Apple's, and the panic
+reports are too thin to show it, so the backend rules out everything on its
+side of it:
 
 - **Every way out tears the VM down first:** `exit_group`, the last thread's
   `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
@@ -92,10 +103,22 @@ the backend now rules out everything on its side of it:
   `fork` and `vfork` start a fresh fwe process instead (below), which builds
   a VM of its own and keeps to these same rules; a fork child that fails to
   set up tears down any VM it made before it exits.
+- **The VM lets go of memory before the host changes it.** `munmap`, a
+  shrinking `mremap`, a `MAP_FIXED` mapping over existing memory and
+  `MADV_DONTNEED` remove the range from the VM before the host frees or
+  replaces the memory behind it, and map it again afterwards where needed,
+  so the VM never maps memory the host is freeing.
 - **The tests run one VM test at a time**, never several in parallel. A test
   of `fork` has the parent's and the child's VM processes alive together,
   as any forking program does; each ends through teardown, a guest's
-  `SIGKILL` included.
+  `SIGKILL` included. Each VM test's processes form a process group: a
+  timeout sends it `SIGTERM` (caught, so every VM is torn down) and only a
+  group still alive 5 s later gets `SIGKILL`, and a process outliving its
+  test fails that test.
+- **Never alongside another hypervisor client.** The VM tests skip while one
+  runs (`krunkit`, `vfkit`, QEMU, Virtualization.framework VMs and the
+  like); for Podman, `podman machine stop` first. The same goes for running
+  a VM program by hand.
 
 Keep to these when changing the backend.
 
