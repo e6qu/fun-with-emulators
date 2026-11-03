@@ -550,9 +550,7 @@ fn main() {
         // A fork while another thread writes sees one instant of the
         // process: the thread bumps a counter in the executable's image and
         // then one on the heap, so any instant has them equal or the first
-        // one ahead by one, wherever in memory each lives. (A host fork on
-        // macOS does not stop the other threads while it copies memory, so
-        // only the hypervisor backend's fork passes this.)
+        // one ahead by one, wherever in memory each lives.
         "fork-snapshot" => {
             static FIRST: AtomicU64 = AtomicU64::new(0);
             let second = std::sync::Arc::new(AtomicU64::new(0));

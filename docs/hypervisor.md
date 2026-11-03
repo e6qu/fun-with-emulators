@@ -119,7 +119,7 @@ guest memory lives in one reserved host address window (512–960 GiB, inside
 the VM's 1 TiB address space), so the child can map it at the same
 addresses. With every other vCPU stopped, the parent takes a Mach memory
 entry per region: a copy-on-write snapshot of private memory, a share of
-`MAP_SHARED` memory. A snapshot is cheap (about 2 ms for 1 GiB) and neither
+`MAP_SHARED` memory (and of everything, for a `vfork` child). A snapshot is cheap (about 2 ms for 1 GiB) and neither
 process pays for a page until one of them writes to it. The entries, the
 real bootstrap port and the encoded kernel state reach the child in one Mach
 message, through a receive right the parent gave it as its bootstrap port.

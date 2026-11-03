@@ -217,8 +217,10 @@ pub mod region {
     /// `VM_INHERIT_COPY`: what a `MAP_PRIVATE` mapping gets; `MAP_SHARED`
     /// mappings inherit by sharing (`VM_INHERIT_SHARE`, 0).
     const VM_INHERIT_COPY: c_uint = 1;
+    const VM_INHERIT_SHARE: c_uint = 0;
 
     unsafe extern "C" {
+        fn minherit(addr: *mut libc::c_void, len: usize, inherit: c_int) -> c_int;
         /// This task's port (`mach_task_self()` is a macro over it).
         static mach_task_self_: libc::mach_port_t;
         fn mach_vm_region(
@@ -281,6 +283,37 @@ pub mod region {
         }
     }
 
+    /// The parts of `ranges` (`(start, len)` pairs) mapped `MAP_PRIVATE`,
+    /// as `(start, len)` in address order.
+    pub fn private_parts(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut parts = Vec::new();
+        for &(start, len) in ranges {
+            let end = start + len;
+            let mut at = start;
+            while at < end {
+                let Some(r) = query(at) else { break };
+                if r.start >= end {
+                    break;
+                }
+                let (lo, hi) = (r.start.max(at), (r.start + r.size).min(end));
+                if r.private {
+                    parts.push((lo, hi - lo));
+                }
+                at = hi;
+            }
+        }
+        parts
+    }
+
+    /// Make a host `fork` share `[start, start + len)` with the child
+    /// (`share`) or give it a copy, as `MAP_PRIVATE` memory normally is.
+    pub fn set_shared_on_fork(start: u64, len: u64, share: bool) {
+        let how = if share { VM_INHERIT_SHARE } else { VM_INHERIT_COPY };
+        // SAFETY: changes only what a later fork does with this task's own
+        // memory; the mapping itself is untouched.
+        unsafe { minherit(start as *mut libc::c_void, len as usize, how as c_int) };
+    }
+
     pub fn query(addr: u64) -> Option<Region> {
         let (start, size, basic) = query_flavor::<BasicInfo>(addr, VM_REGION_BASIC_INFO_64)?;
         let (_, _, ext) = query_flavor::<ExtendedInfo>(start, VM_REGION_EXTENDED_INFO)?;
@@ -327,6 +360,45 @@ mod tests {
         );
         untrack(base, 0x20000);
         assert_eq!(here(tracked()), vec![]);
+    }
+
+    /// Private memory set to be shared on fork is written by the child for
+    /// the parent to see (what a `vfork` child does), and goes back to
+    /// being copied; `private_parts` leaves `MAP_SHARED` memory out.
+    #[test]
+    fn private_memory_can_be_shared_with_a_fork_child() {
+        let len = 1 << 15;
+        let private = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE);
+        let shared = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED);
+        let ranges = [(private, len as u64), (shared, len as u64)];
+        assert_eq!(region::private_parts(&ranges), vec![(private, len as u64)]);
+        let child_writes = |value: u8| {
+            // SAFETY: the child only writes into the mapping and exits.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // SAFETY: as above.
+                unsafe {
+                    (private as *mut u8).write(value);
+                    libc::_exit(0)
+                }
+            }
+            assert!(pid > 0);
+            let mut status = 0;
+            // SAFETY: reaping the child just made.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            // SAFETY: reading inside the mapping.
+            unsafe { (private as *const u8).read() }
+        };
+        region::set_shared_on_fork(private, len as u64, true);
+        assert_eq!(child_writes(7), 7);
+        region::set_shared_on_fork(private, len as u64, false);
+        assert_eq!(child_writes(9), 7);
+        assert!(region::query(private).unwrap().private());
+        // SAFETY: unmapping the test's own mappings.
+        unsafe {
+            libc::munmap(private as *mut _, len);
+            libc::munmap(shared as *mut _, len);
+        }
     }
 
     #[test]

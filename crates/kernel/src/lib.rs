@@ -537,10 +537,6 @@ pub fn thread_exit_cleanup() {
     }
 }
 
-/// Host `fork` with every lock the kernel's own registries use held, so that
-/// in a multithreaded guest the child cannot inherit one locked by a thread
-/// that does not exist in it. The caller holds the kernel lock itself. The
-/// locks are released in both processes.
 /// Host `fork` is refused (see [`forbid_fork`]).
 static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -554,7 +550,12 @@ pub fn forbid_fork() {
     NO_FORK.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-pub fn fork_locked() -> libc::pid_t {
+/// Run `fork` (a host `fork`, perhaps wrapped by the backend) with every lock
+/// the kernel's own registries use held, so that in a multithreaded guest
+/// the child cannot inherit one locked by a thread that does not exist in
+/// it. The caller holds the kernel lock itself. The locks are released in
+/// both processes.
+pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     if NO_FORK.load(std::sync::atomic::Ordering::SeqCst) {
         // SAFETY: setting this thread's errno.
         #[cfg(target_os = "macos")]
@@ -571,17 +572,7 @@ pub fn fork_locked() -> libc::pid_t {
     signalfd::hold(|| {
         specialfd::hold(|| {
             synthdir::hold(|| {
-                pty::hold(|| {
-                    net::hold(|| {
-                        futex::hold(|| {
-                            mm::hold(|| {
-                                // SAFETY: plain host call; the child continues
-                                // with only the calling thread, as on Linux.
-                                thread::hold(|| unsafe { libc::fork() })
-                            })
-                        })
-                    })
-                })
+                pty::hold(|| net::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
             })
         })
     })

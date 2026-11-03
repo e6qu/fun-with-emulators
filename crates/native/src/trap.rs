@@ -143,6 +143,7 @@ impl HostCode {
             abi.set_enabled(false);
         }
         let was_in_guest = IN_GUEST.with(|g| g.replace(false));
+        crate::quiesce::leave();
         apply_guest_mask();
         HostCode { abi, was_in_guest }
     }
@@ -152,6 +153,10 @@ impl Drop for HostCode {
     fn drop(&mut self) {
         block_async_signals();
         IN_GUEST.with(|g| g.set(self.was_in_guest));
+        if self.was_in_guest {
+            // Back to guest code, unless a fork is copying memory.
+            crate::quiesce::enter();
+        }
         if let Some(abi) = self.abi {
             abi.set_enabled(true);
         }
@@ -164,6 +169,8 @@ impl Drop for HostCode {
 pub fn prepare_guest_entry() {
     block_async_signals();
     IN_GUEST.with(|g| g.set(true));
+    crate::quiesce::register();
+    crate::quiesce::enter();
     if let Some(abi) = X18Abi::get() {
         abi.set_enabled(true);
     }
