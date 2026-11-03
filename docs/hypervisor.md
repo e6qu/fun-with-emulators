@@ -60,7 +60,10 @@ assembly test programs, Rust/musl programs, and a non-PIE glibc program
 whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the shape of
 Debian's `python3.11`. Not supported in the VM yet: threads (`clone` of a
 thread), `fork`/`vfork` and `execve`, which fail with `ENOSYS`; these are on
-the [roadmap](../ROADMAP.md).
+the [roadmap](../ROADMAP.md). A memory call (`mmap` with a fixed address,
+`munmap`, `mprotect`, `madvise`, `mremap`) on a range that runs across the
+edge of the executable's image fails with `EINVAL`, since that range has no
+single host address.
 
 ## Running it (Apple Silicon, no root)
 

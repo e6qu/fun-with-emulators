@@ -100,6 +100,8 @@ const ASM_GUESTS: &[&str] = &[
     "x18sig",
     "fpsig",
     "efault",
+    "sigmap",
+    "hvsys",
     "pipethread",
     "fileio",
     "sigtest",
@@ -1319,6 +1321,8 @@ fn hv_runs_low_assembly_guests() {
         ("procread", 0),
         ("procdir", 0),
         ("credtest", 0),
+        ("sigmap", 0),
+        ("hvsys", 0),
     ];
     for (name, code) in cases {
         let low = format!("{name}-low");
@@ -1413,4 +1417,14 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     let out = run_bounded(cmd);
     eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     Some(out)
+}
+
+/// A signal blocked while its handler runs is delivered as soon as the
+/// handler returns, even to a program that then makes no system calls; and
+/// MAP_FIXED over the program's own .bss works.
+#[test]
+fn signal_unblocked_by_sigreturn_and_fixed_mapping() {
+    for name in ["sigmap", "sigmap-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
 }
