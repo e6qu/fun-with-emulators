@@ -121,6 +121,33 @@ pub struct Options {
     pub cwd: Option<Vec<u8>>,
     /// The guest's `argv[0]`, when not the program path.
     pub argv0: Option<OsString>,
+    /// What the guest that exec'd this program carries into it
+    /// ([`fwe_kernel::Kernel::exec_state`]), hex-encoded.
+    pub exec_state: Option<Vec<u8>>,
+}
+
+/// Hex-encode `bytes`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hex(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().flat_map(|b| format!("{b:02x}").into_bytes()).collect()
+}
+
+/// Decode [`hex`]'s output.
+fn unhex(text: &[u8]) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
+}
+
+/// Apply [`Options::exec_state`] to a new kernel.
+fn apply_exec_state<P: fwe_kernel::Platform>(
+    k: &mut Kernel<P>,
+    options: &Options,
+) -> Result<(), Error> {
+    let Some(text) = &options.exec_state else { return Ok(()) };
+    let state = unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?;
+    k.restore_exec_state(&state).map_err(Error::Unsupported)
 }
 
 /// Open the guest's root filesystem with its working directory.
@@ -183,6 +210,7 @@ pub(crate) fn reexec(
     env: &[Vec<u8>],
     fs: &fwe_kernel::Fs,
     strace: bool,
+    state: &[u8],
     before_exec: impl FnOnce(),
 ) -> i64 {
     use fwe_abi::{err, errno};
@@ -206,6 +234,8 @@ pub(crate) fn reexec(
     }
     argv.push(b"--cwd".to_vec());
     argv.push(fs.cwd().to_vec());
+    argv.push(b"--exec-state".to_vec());
+    argv.push(hex(state));
     if let Some(a0) = args.first() {
         argv.push(b"--argv0".to_vec());
         argv.push(a0.clone());
@@ -810,6 +840,7 @@ fn start(
 
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
+    apply_exec_state(&mut kernel, options)?;
     *KERNEL.lock().unwrap() = Some(kernel);
     enter(out.sp, out.entry)
 }

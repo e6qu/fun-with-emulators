@@ -47,7 +47,7 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" => {
+            b"--cwd" | b"--argv0" | b"--exec-state" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
@@ -55,6 +55,8 @@ fn main() -> ExitCode {
                 };
                 if flag == "--cwd" {
                     options.cwd = Some(value.as_bytes().to_vec());
+                } else if flag == "--exec-state" {
+                    options.exec_state = Some(value.as_bytes().to_vec());
                 } else {
                     options.argv0 = Some(value);
                 }

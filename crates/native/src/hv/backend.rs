@@ -633,6 +633,7 @@ fn start(
     fwe_kernel::net::set_rootfs(fs.root_host_path());
     thread::init_main(host::getpid() as i32);
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
+    crate::apply_exec_state(&mut k, options)?;
     k.set_sigreturn_trampoline(tramp);
     k.adopt_host_signals();
     thread::set_mask(inherited_mask);
@@ -934,25 +935,43 @@ fn fatal(msg: &str) -> ! {
 /// `execve(path, argv, envp)`: re-execute fwe on the new program, which
 /// may run here in a VM or natively (see [`crate::reexec`]).
 fn execve(args: &[u64; 6]) -> i64 {
-    // Linux's limit on one argument or environment string.
-    const ARG_MAX: usize = 128 * 1024;
-    let path = match uaccess::read_cstr(args[0], uaccess::PATH_MAX) {
+    match uaccess::read_cstr(args[0], uaccess::PATH_MAX) {
+        Ok(path) => exec_program(path, args[1], args[2]),
+        Err(e) => err(e),
+    }
+}
+
+/// `execveat(dirfd, path, argv, envp, flags)`: `execve` of the program
+/// `dirfd`, `path` and `flags` name.
+fn execveat(args: &[u64; 6]) -> i64 {
+    let rel = match uaccess::read_cstr(args[1], uaccess::PATH_MAX) {
         Ok(p) => p,
         Err(e) => return err(e),
     };
-    let (argv, envp) = match (
-        uaccess::read_cstr_array(args[1], ARG_MAX),
-        uaccess::read_cstr_array(args[2], ARG_MAX),
-    ) {
-        (Ok(a), Ok(e)) => (a, e),
-        (Err(e), _) | (_, Err(e)) => return err(e),
+    let path = match kernel().as_ref().unwrap().execveat_path(args[0] as i32, &rel, args[4]) {
+        Ok(p) => p,
+        Err(e) => return err(e),
     };
+    exec_program(path, args[2], args[3])
+}
+
+/// Re-execute fwe on the guest program at `path` with the argument and
+/// environment arrays at `argv` and `envp`.
+fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
+    // Linux's limit on one argument or environment string.
+    const ARG_MAX: usize = 128 * 1024;
+    let (argv, envp) =
+        match (uaccess::read_cstr_array(argv, ARG_MAX), uaccess::read_cstr_array(envp, ARG_MAX)) {
+            (Ok(a), Ok(e)) => (a, e),
+            (Err(e), _) | (_, Err(e)) => return err(e),
+        };
     let guard = kernel();
     let k = guard.as_ref().unwrap();
     let fs = k.fs.as_ref().expect("filesystem configured");
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
-    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, teardown);
+    let state = k.exec_state();
+    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, &state, teardown);
     if !VM_LIVE.load(std::sync::atomic::Ordering::SeqCst) {
         fatal(&format!(
             "execve {} failed after the VM was destroyed: {r}",
@@ -976,14 +995,13 @@ struct Spawn {
 /// pthread flags), a new host thread with a vCPU of its own; for a new
 /// process (`fork`, `vfork`), a fresh fwe process given this one's memory
 /// and state (see [`fork`]).
-fn clone(vcpu: &Vcpu, parent: &Regs) -> i64 {
+fn clone(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     use fwe_abi::clone as cl;
-    let (flags, stack, ptid, tls, ctid) =
-        (parent.x[0], parent.x[1], parent.x[2], parent.x[3], parent.x[4]);
+    let fwe_kernel::CloneArgs { flags, stack, parent_tid: ptid, tls, child_tid: ctid } = a;
     let tpidr =
         if flags & cl::CLONE_SETTLS != 0 { tls } else { vcpu.get_sys(HV_SYS_REG_TPIDR_EL0) };
     if flags & cl::CLONE_THREAD == 0 {
-        return fork::fork(parent, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
+        return fork::fork(parent, a, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
     }
     if flags & cl::CLONE_VM == 0 || stack == 0 {
         return err(errno::EINVAL);
@@ -1076,9 +1094,13 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             fwe_kernel::thread_exit_cleanup();
             exit_thread(args[0] as i32)
         }
-        nr::CLONE => clone(vcpu, regs),
+        nr::CLONE => clone(vcpu, regs, fwe_kernel::CloneArgs::from_clone(&regs.x)),
+        nr::CLONE3 => match fwe_kernel::CloneArgs::from_clone3(host_args[0], host_args[1]) {
+            Ok(a) => clone(vcpu, regs, a),
+            Err(e) => err(e),
+        },
         nr::EXECVE => execve(&host_args),
-        nr::CLONE3 | nr::EXECVEAT => err(errno::ENOSYS),
+        nr::EXECVEAT => execveat(&host_args),
         nr::WAIT4 => {
             let mut r = *regs;
             r.x[..6].copy_from_slice(&host_args);

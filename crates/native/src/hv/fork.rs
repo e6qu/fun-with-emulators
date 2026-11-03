@@ -368,9 +368,14 @@ fn descriptors(skip: i32) -> Vec<(i32, bool)> {
 /// `fork` or `vfork` (a non-thread `clone`) from the guest thread whose
 /// registers are `parent` and thread pointer `tpidr`. Returns the child's
 /// pid or a negated Linux errno.
-pub(super) fn fork(parent: &Regs, tpidr: u64, vtimer_offset: u64, vfork: bool) -> i64 {
-    let (flags, child_stack, parent_tid, child_tid) =
-        (parent.x[0], parent.x[1], parent.x[2], parent.x[4]);
+pub(super) fn fork(
+    parent: &Regs,
+    a: fwe_kernel::CloneArgs,
+    tpidr: u64,
+    vtimer_offset: u64,
+    vfork: bool,
+) -> i64 {
+    let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
     let guard = backend::kernel();
     let Some(k) = guard.as_ref() else { return err(errno::EAGAIN) };
     // The child writes one byte here once it is ready to run; its end is

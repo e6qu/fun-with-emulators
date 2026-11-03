@@ -290,10 +290,15 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         fwe_kernel::thread_exit_cleanup();
         crate::exit_current_thread(regs.x[0] as i32);
     }
-    if nr == fwe_abi::nr::EXECVE {
+    if nr == fwe_abi::nr::EXECVE || nr == fwe_abi::nr::EXECVEAT {
         // On success this enters the new program and never returns; on
         // failure it reports an errno the guest can handle.
-        match crate::process::do_execve(&regs) {
+        let r = if nr == fwe_abi::nr::EXECVE {
+            crate::process::do_execve(&regs)
+        } else {
+            crate::process::do_execveat(&regs)
+        };
+        match r {
             // Return from the handler into the new program, which also
             // leaves the signal stack and restores the guest's mask.
             Ok(new) => regs = new,
@@ -305,8 +310,16 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         unsafe { return_with_guest_mask(ctx) };
         return;
     }
-    if nr == fwe_abi::nr::CLONE {
-        let r = crate::threads::do_clone(&regs);
+    if nr == fwe_abi::nr::CLONE || nr == fwe_abi::nr::CLONE3 {
+        let a = if nr == fwe_abi::nr::CLONE {
+            Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
+        } else {
+            fwe_kernel::CloneArgs::from_clone3(regs.x[0], regs.x[1])
+        };
+        let r = match a {
+            Ok(a) => crate::threads::do_clone(&regs, a),
+            Err(e) => fwe_abi::err(e),
+        };
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
     } else if nr == fwe_abi::nr::WAIT4 {
         // wait4 blocks; run it without the kernel lock.
