@@ -27,8 +27,9 @@ _start:
     tbnz    x0, #63, fail
     mov     x19, x0                 // sfd
 
-    // kill(0, SIGUSR1) -> self
-    mov     x0, #0
+    // kill(getpid(), SIGUSR1)
+    mov     x8, #172                // getpid
+    svc     #0
     mov     x1, #10
     mov     x8, #129                // kill
     svc     #0
