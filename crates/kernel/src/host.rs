@@ -292,6 +292,12 @@ pub fn si_code_to_linux(code: i32) -> i32 {
     code
 }
 
+/// The microseconds of a host `timeval`: `i32` on macOS, `i64` on Linux.
+#[allow(clippy::unnecessary_cast)]
+fn usec(t: libc::timeval) -> i64 {
+    t.tv_usec as i64
+}
+
 /// Write host resource usage into a guest `struct rusage` (two `timeval`s
 /// and fourteen `long`s on both hosts). macOS reports `ru_maxrss` in bytes,
 /// Linux in kilobytes.
@@ -305,9 +311,9 @@ pub unsafe fn write_rusage(out: u64, usage: &libc::rusage) {
     let maxrss = if cfg!(target_os = "macos") { usage.ru_maxrss / 1024 } else { usage.ru_maxrss };
     let words: [i64; 18] = [
         usage.ru_utime.tv_sec,
-        usage.ru_utime.tv_usec as i64,
+        usec(usage.ru_utime),
         usage.ru_stime.tv_sec,
-        usage.ru_stime.tv_usec as i64,
+        usec(usage.ru_stime),
         maxrss,
         usage.ru_ixrss,
         usage.ru_idrss,
