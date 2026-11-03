@@ -43,6 +43,33 @@ fn with<R>(f: impl FnOnce(&mut Ptys) -> R) -> R {
     f(p)
 }
 
+/// Write the registry into a fork snapshot.
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    with(|p| {
+        crate::snapshot::fd_map(e, &p.masters, |e, (n, path)| {
+            e.u32(*n);
+            e.bytes(path);
+        });
+        let mut slaves: Vec<_> = p.slaves.iter().collect();
+        slaves.sort();
+        e.u64(slaves.len() as u64);
+        for (n, path) in slaves {
+            e.u32(*n);
+            e.bytes(path);
+        }
+        e.u32(p.next);
+    })
+}
+
+/// Rebuild the registry in a fork child.
+pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
+    let masters = crate::snapshot::read_fd_map(d, |d| (d.u32(), d.bytes()));
+    let n = d.count(12);
+    let slaves = (0..n).map(|_| (d.u32(), d.bytes())).collect();
+    let next = d.u32();
+    with(|p| *p = Ptys { masters, slaves, next });
+}
+
 fn apply_open_flags(fd: i32, linux_flags: u64) {
     use fwe_abi::fcntl;
     // SAFETY: plain host calls on a fresh descriptor.

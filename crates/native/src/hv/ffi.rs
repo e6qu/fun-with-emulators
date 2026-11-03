@@ -67,6 +67,7 @@ unsafe extern "C" {
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
     pub fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
     pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t;
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t;
     pub fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t;
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t;

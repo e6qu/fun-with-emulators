@@ -227,6 +227,22 @@ pub(crate) fn reexec(
     fwe_kernel::host::last_error()
 }
 
+/// Die of `SIGKILL` on the relayed form of a guest's `SIGKILL`
+/// ([`fwe_kernel::host::KILL_RELAY`]). Installed first thing in every fwe
+/// process; the hypervisor backend replaces it with one that tears the VM
+/// down first.
+pub fn install_kill_relay() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" fn die(_: libc::c_int) {
+            // SAFETY: async-signal-safe calls ending the process.
+            unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        }
+        // SAFETY: installing a handler that only ends the process.
+        unsafe { libc::signal(fwe_kernel::host::KILL_RELAY, die as *const () as usize) };
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Read(std::io::Error),

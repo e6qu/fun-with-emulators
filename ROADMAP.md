@@ -10,9 +10,10 @@ only ticked off against its criteria.
 describes how the pieces work and lists the current limitations in detail.
 
 **Status (November 2026):** M0 and M1 are done. M2 is in progress: its
-system-call surface is implemented, and what remains is the hypervisor
-backend for low-address executables and running the listed software end to
-end.
+system-call surface is implemented, and the hypervisor backend runs
+low-address executables with threads, `fork` and `execve`; what remains is
+Debian's Python, the rest of the process model and running the listed
+software end to end.
 
 ## M0 — Foundation (done)
 
@@ -99,11 +100,12 @@ Remaining:
   `hypervisor` job); hosted runners cannot run a VM and skip them
 - [x] In the VM: threads, and `execve` between the VM and the native backend
   either way (fwe re-executes itself on the new program)
-- [ ] In the VM: `fork` and `vfork` (a host fork child cannot use the
-  parent's VM; the child needs a fresh fwe process given the parent's state)
+- [x] In the VM: `fork` and `vfork`: the child is a fresh fwe process given
+  the parent's memory copy-on-write and its kernel state
 - [ ] Python from the Debian rootfs (carried over from M1)
 - [ ] The rest of the process model: `execveat`, `clone3`; `vfork` sharing
-  memory with its parent rather than copying it; virtual credentials and
+  memory with its parent rather than copying it; a native-backend `fork`
+  that stops the parent's other threads while memory is copied; virtual credentials and
   `RLIMIT_NOFILE` carried across an `execve` that re-executes fwe
 - [ ] Code discovery for binaries without section headers, and the `x18`
   forms no tested binary uses yet (`sp`-writeback and `sp`-register-offset

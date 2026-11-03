@@ -176,6 +176,24 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     imp::hold(f)
 }
 
+/// Write the registry into a fork snapshot.
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    #[cfg(target_os = "linux")]
+    e.u64(0);
+    #[cfg(not(target_os = "linux"))]
+    imp::save(e)
+}
+
+/// Rebuild the registry in a fork child from [`save`]'s record: eventfd pipes
+/// are inherited as they are; each timerfd gets a fresh kqueue at its number,
+/// armed for what was left of its time.
+pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
+    #[cfg(target_os = "linux")]
+    let _ = d.count(1);
+    #[cfg(not(target_os = "linux"))]
+    imp::restore(d)
+}
+
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use crate::host::last_error;
@@ -204,6 +222,92 @@ mod imp {
         nonblock: bool,
         interval: (i64, i64),
         value: (i64, i64),
+        /// How it is armed: the period in milliseconds, whether it repeats,
+        /// and when (monotonic milliseconds) it first fires; 0 when disarmed.
+        period_ms: i64,
+        periodic: bool,
+        first_at_ms: i64,
+    }
+
+    fn now_ms() -> i64 {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: valid timespec out-parameter.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+        t.tv_sec.saturating_mul(1000) + t.tv_nsec / 1_000_000
+    }
+
+    pub(super) fn save(e: &mut crate::snapshot::Enc) {
+        with_reg(|m| {
+            crate::snapshot::fd_map(e, m, |e, s| match s {
+                Special::Event(ev) => {
+                    e.u8(0);
+                    e.i32(ev.rfd);
+                    e.i32(ev.wfd);
+                    e.u64(ev.count);
+                    e.bool(ev.semaphore);
+                    e.bool(ev.nonblock);
+                }
+                Special::Timer(t) => {
+                    e.u8(1);
+                    e.i32(t.kq);
+                    e.bool(crate::snapshot::cloexec(t.kq));
+                    e.bool(t.nonblock);
+                    for v in [t.interval.0, t.interval.1, t.value.0, t.value.1] {
+                        e.i64(v);
+                    }
+                    e.i64(t.period_ms);
+                    e.bool(t.periodic);
+                    e.i64(t.first_at_ms);
+                }
+            })
+        })
+    }
+
+    pub(super) fn restore(d: &mut crate::snapshot::Dec) {
+        let mut cloexec = std::collections::HashMap::new();
+        let reg = crate::snapshot::read_fd_map(d, |d| {
+            if d.u8() == 0 {
+                Special::Event(EventFd {
+                    rfd: d.i32(),
+                    wfd: d.i32(),
+                    count: d.u64(),
+                    semaphore: d.bool(),
+                    nonblock: d.bool(),
+                })
+            } else {
+                let kq = d.i32();
+                cloexec.insert(kq, d.bool());
+                Special::Timer(TimerFd {
+                    kq,
+                    nonblock: d.bool(),
+                    interval: (d.i64(), d.i64()),
+                    value: (d.i64(), d.i64()),
+                    period_ms: d.i64(),
+                    periodic: d.bool(),
+                    first_at_ms: d.i64(),
+                })
+            }
+        });
+        for s in reg.values() {
+            let Special::Timer(t) = s else { continue };
+            let ce = cloexec.get(&t.kq).copied().unwrap_or(false);
+            if !crate::snapshot::fresh_kqueue_at(t.kq, ce) || t.first_at_ms == 0 {
+                continue;
+            }
+            // A one-shot timer fires once what was left of its time is up; a
+            // periodic one keeps its period. Expirations not yet read are lost.
+            let (period, extra) = if t.periodic {
+                (t.period_ms, libc::EV_ENABLE)
+            } else if t.first_at_ms > now_ms() {
+                ((t.first_at_ms - now_ms()).max(1), libc::EV_ENABLE | libc::EV_ONESHOT)
+            } else {
+                continue;
+            };
+            let change = timer_kevent(libc::EV_ADD | extra, period);
+            // SAFETY: single-change kevent with no event list.
+            unsafe { libc::kevent(t.kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        }
+        *REG.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
     }
 
     static REG: Mutex<Option<HashMap<i32, Special>>> = Mutex::new(None);
@@ -287,6 +391,9 @@ mod imp {
                     nonblock: flags & TFD_NONBLOCK != 0,
                     interval: (0, 0),
                     value: (0, 0),
+                    period_ms: 0,
+                    periodic: false,
+                    first_at_ms: 0,
                 }),
             )
         });
@@ -321,6 +428,7 @@ mod imp {
 
         // Disarm when it_value is zero.
         if val_s == 0 && val_ns == 0 {
+            armed(fd, 0, false, 0);
             let change = timer_kevent(libc::EV_DELETE, 0);
             // SAFETY: single-change kevent with no event list.
             unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
@@ -344,10 +452,20 @@ mod imp {
         if !periodic {
             extra |= libc::EV_ONESHOT;
         }
+        armed(fd, period, periodic, now_ms() + first_ms.max(1));
         let change = timer_kevent(libc::EV_ADD | extra, period);
         // SAFETY: single-change kevent with no event list.
         let r = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if r < 0 { last_error() } else { 0 }
+    }
+
+    /// Record how timer `fd` is armed, for a fork child to re-arm it.
+    fn armed(fd: i32, period_ms: i64, periodic: bool, first_at_ms: i64) {
+        with_reg(|m| {
+            if let Some(Special::Timer(t)) = m.get_mut(&fd) {
+                (t.period_ms, t.periodic, t.first_at_ms) = (period_ms, periodic, first_at_ms);
+            }
+        })
     }
 
     fn timer_kevent(flags: u16, period_ms: i64) -> libc::kevent {

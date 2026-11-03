@@ -433,8 +433,7 @@ impl<P: Platform> Kernel<P> {
         let me = thread::tgid() as i64;
         let to_self = pid == me || pid == 0 || pid == -1;
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
-            // SAFETY: plain host call.
-            return host::ret(unsafe { libc::kill(pid as libc::pid_t, h) });
+            return host::kill(pid as libc::pid_t, h);
         }
         if to_self {
             thread::post_process(sig, own_info(signal::SI_USER));
@@ -468,6 +467,10 @@ impl<P: Platform> Kernel<P> {
         };
         if sig == 0 {
             return 0;
+        }
+        if sig == signal::SIGKILL {
+            // It ends the whole process, whichever thread it names.
+            return self.sys_kill(me, sig);
         }
         let r = match host::signal_to_host(sig).filter(|_| !owned(sig)) {
             // SAFETY: `host_thread` is a live registered guest thread.

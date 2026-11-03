@@ -108,6 +108,7 @@ impl<P: Platform> Kernel<P> {
             }
             nr::CLOSE => {
                 let fd = a[0] as i32;
+                crate::epoll::closed(fd);
                 if let Some(r) = crate::specialfd::try_close(fd) {
                     r
                 } else if let Some(r) = crate::signalfd::try_close(fd) {
@@ -409,6 +410,13 @@ impl<P: Platform> Kernel<P> {
     fn sys_dup3(&mut self, old: u64, new: u64, flags: u64) -> i64 {
         if old == new || flags & !fcntl::O_CLOEXEC != 0 {
             return err(errno::EINVAL);
+        }
+        // `new` is closed first, as by `close`, so an emulated descriptor
+        // there leaves its registry (and an epoll interest list); only if
+        // `old` is open, since a failed dup3 leaves `new` alone.
+        // SAFETY: F_GETFD only queries the descriptor.
+        if unsafe { libc::fcntl(old as i32, libc::F_GETFD) } >= 0 {
+            self.dispatch(nr::CLOSE, [new, 0, 0, 0, 0, 0]);
         }
         // SAFETY: plain host calls.
         let r = unsafe { libc::dup2(old as i32, new as i32) };

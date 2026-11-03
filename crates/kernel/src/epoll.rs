@@ -7,9 +7,108 @@
 //! `EPOLLOUT`), and the caller's `epoll_event.data` word rides in the kevent
 //! `udata`. `EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`.
 //!
+//! A kqueue is not passed on to a child process, so each epoll descriptor's
+//! interest list is also recorded here ([`save`], [`restore`]): a fork
+//! child rebuilds its epoll descriptors from it.
+//!
 //! Guest addresses are host addresses, so `epoll_event` arrays are read and
 //! written in place. The packed arm64 layout is `{ u32 events; u64 data; }`
 //! with `data` at offset 4 and a 12-byte stride.
+
+/// Each epoll descriptor's interest list: `fd -> (events, data)`.
+#[cfg(not(target_os = "linux"))]
+type Interest = std::collections::BTreeMap<i32, (u32, u64)>;
+
+#[cfg(not(target_os = "linux"))]
+static INTEREST: std::sync::Mutex<Option<std::collections::HashMap<i32, Interest>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(not(target_os = "linux"))]
+fn interest<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Interest>) -> R) -> R {
+    let mut g = INTEREST.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(Default::default))
+}
+
+/// Descriptor `fd` is being closed: it leaves every interest list (as the
+/// kqueue drops its filters), and if it is an epoll descriptor, its list goes.
+pub fn closed(fd: i32) {
+    #[cfg(target_os = "linux")]
+    let _ = fd;
+    #[cfg(not(target_os = "linux"))]
+    interest(|m| {
+        m.remove(&fd);
+        for list in m.values_mut() {
+            list.remove(&fd);
+        }
+    })
+}
+
+/// Write the interest lists into a fork snapshot.
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    #[cfg(target_os = "linux")]
+    e.u64(0);
+    #[cfg(not(target_os = "linux"))]
+    interest(|m| {
+        let mut eps: Vec<&i32> = m.keys().collect();
+        eps.sort();
+        let ce: Vec<bool> = eps.iter().map(|&&fd| crate::snapshot::cloexec(fd)).collect();
+        e.u64(ce.len() as u64);
+        for c in ce {
+            e.bool(c);
+        }
+        crate::snapshot::fd_map(e, m, |e, list| {
+            e.u64(list.len() as u64);
+            for (&fd, &(events, data)) in list {
+                e.i32(fd);
+                e.u32(events);
+                e.u64(data);
+            }
+        })
+    })
+}
+
+/// Rebuild every epoll descriptor in a fork child: a fresh kqueue at its
+/// number, with its interest list registered again.
+pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
+    #[cfg(target_os = "linux")]
+    let _ = d.count(1);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let n = d.count(1);
+        let ce: Vec<bool> = (0..n).map(|_| d.bool()).collect();
+        let lists = crate::snapshot::read_fd_map(d, |d| {
+            let n = d.count(16);
+            (0..n).map(|_| (d.i32(), (d.u32(), d.u64()))).collect::<Interest>()
+        });
+        // `lists` iterates in no particular order; `ce` is in fd order. Only
+        // a kqueue made here is filled: a descriptor already open at an
+        // epoll number (a stale record) is left alone.
+        let mut eps: Vec<i32> = lists.keys().copied().collect();
+        eps.sort();
+        let fresh: Vec<i32> = eps
+            .into_iter()
+            .zip(ce.into_iter().chain(std::iter::repeat(false)))
+            .filter(|&(epfd, c)| crate::snapshot::fresh_kqueue_at(epfd, c))
+            .map(|(epfd, _)| epfd)
+            .collect();
+        // Nested epoll descriptors exist by now, whatever the order.
+        for epfd in fresh {
+            for (&fd, &(events, data)) in &lists[&epfd] {
+                let ev = fwe_abi::EpollEvent { events, data };
+                // SAFETY: a valid event on this stack frame.
+                let _ = unsafe {
+                    ctl_kqueue(
+                        epfd as u64,
+                        fwe_abi::epoll::EPOLL_CTL_ADD,
+                        fd as u64,
+                        &ev as *const _ as u64,
+                    )
+                };
+            }
+        }
+        interest(|m| *m = lists);
+    }
+}
 
 /// Size of a packed arm64 `struct epoll_event`.
 #[cfg(not(target_os = "linux"))]
@@ -45,6 +144,7 @@ pub unsafe fn create1(flags: u64) -> i64 {
             // SAFETY: plain host call on the descriptor just created.
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
+        interest(|m| m.insert(fd, Interest::new()));
         fd as i64
     }
 }
@@ -68,9 +168,22 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         })
     }
     #[cfg(not(target_os = "linux"))]
-    // SAFETY: the caller guarantees `event` is valid for ADD/MOD.
-    unsafe {
-        ctl_kqueue(epfd, op, fd, event)
+    {
+        // SAFETY: the caller guarantees `event` is valid for ADD/MOD.
+        let r = unsafe { ctl_kqueue(epfd, op, fd, event) };
+        if r == 0 {
+            let entry =
+                if op == fwe_abi::epoll::EPOLL_CTL_DEL { None } else { read_event(event).ok() };
+            interest(|m| {
+                if let Some(list) = m.get_mut(&(epfd as i32)) {
+                    match entry {
+                        Some(ev) => list.insert(fd as i32, ev),
+                        None => list.remove(&(fd as i32)),
+                    };
+                }
+            });
+        }
+        r
     }
 }
 
@@ -281,6 +394,7 @@ mod tests {
         assert_eq!({ ev.events } & EPOLLIN, EPOLLIN);
         assert_eq!({ ev.data }, 0xdead_beef);
 
+        closed(ep as i32);
         // SAFETY: plain host cleanup calls.
         unsafe {
             libc::close(rd);
@@ -328,11 +442,73 @@ mod tests {
         // SAFETY: room for 2 events.
         assert_eq!(unsafe { pwait(ep as u64, gp, 2, 0, 0, 0) }, 0);
 
+        closed(ep as i32);
         // SAFETY: plain host cleanup calls.
         unsafe {
             libc::close(rd);
             libc::close(wr);
             libc::close(ep as i32);
+        }
+    }
+
+    /// A fork child rebuilds an epoll descriptor it did not inherit (a
+    /// kqueue) from the recorded interest list, at the same number. The
+    /// test uses a high number of its own, so tests running alongside never
+    /// open a descriptor there, and restores only its own record.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn interest_list_survives_a_rebuild() {
+        const EP: i32 = 900;
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: create1 takes no pointers; the kqueue moves to EP.
+        unsafe {
+            let ep = create1(0) as i32;
+            closed(ep);
+            assert_eq!(libc::dup2(ep, EP), EP);
+            libc::close(ep);
+            libc::fcntl(EP, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        interest(|m| m.insert(EP, Interest::new()));
+        let reg = fwe_abi::EpollEvent { events: EPOLLIN, data: 77 };
+        // SAFETY: a valid event pointer.
+        let r = unsafe { ctl(EP as u64, EPOLL_CTL_ADD, fds[0] as u64, &reg as *const _ as u64) };
+        assert_eq!(r, 0);
+        // What save writes, for this descriptor alone.
+        let mut e = crate::snapshot::Enc::new();
+        e.u64(1);
+        e.bool(crate::snapshot::cloexec(EP));
+        let only = std::collections::HashMap::from([(EP, interest(|m| m[&EP].clone()))]);
+        crate::snapshot::fd_map(&mut e, &only, |e, list| {
+            e.u64(list.len() as u64);
+            for (&fd, &(events, data)) in list {
+                e.i32(fd);
+                e.u32(events);
+                e.u64(data);
+            }
+        });
+        // As in a child: the kqueue is gone.
+        // SAFETY: closing the kqueue behind the record.
+        unsafe { libc::close(EP) };
+        let bytes = e.into_bytes();
+        let mut d = crate::snapshot::Dec::new(&bytes);
+        restore(&mut d);
+        assert!(d.finish().is_ok());
+        // SAFETY: F_GETFD only queries the descriptor.
+        assert_eq!(unsafe { libc::fcntl(EP, libc::F_GETFD) }, libc::FD_CLOEXEC);
+        // SAFETY: writing one byte.
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        let mut got = [fwe_abi::EpollEvent::default(); 1];
+        // SAFETY: room for one event.
+        assert_eq!(unsafe { pwait(EP as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
+        assert_eq!({ got[0].data }, 77);
+        closed(EP);
+        // SAFETY: plain host cleanup.
+        unsafe {
+            libc::close(EP);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
         }
     }
 
@@ -344,6 +520,7 @@ mod tests {
         // SAFETY: maxevents 0 is rejected before any pointer use.
         let r = unsafe { pwait(ep as u64, 0, 0, 0, 0, 0) };
         assert_eq!(r, fwe_abi::err(fwe_abi::errno::EINVAL));
+        closed(ep as i32);
         // SAFETY: plain host cleanup.
         unsafe { libc::close(ep as i32) };
     }

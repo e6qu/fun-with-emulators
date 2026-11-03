@@ -28,6 +28,12 @@ static LO: AtomicU64 = AtomicU64::new(0);
 static HI: AtomicU64 = AtomicU64::new(0);
 static HOST: AtomicU64 = AtomicU64::new(0);
 
+/// The translated range as `(guest, len, host)`, for a fork child.
+pub fn translation() -> (u64, u64, u64) {
+    let lo = LO.load(Ordering::SeqCst);
+    (lo, HI.load(Ordering::SeqCst).saturating_sub(lo), HOST.load(Ordering::SeqCst))
+}
+
 /// Back guest addresses `[guest, guest + len)` with host memory at `host`.
 pub fn set_translation(guest: u64, len: u64, host: u64) {
     HI.store(0, Ordering::SeqCst);

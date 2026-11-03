@@ -1,7 +1,7 @@
 //! The VMM: loading, the vCPU run loop and the system call path.
 
 use super::ffi::*;
-use super::vm;
+use super::{fork, vm, window};
 use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, page_size, stack};
 use fwe_abi::{auxv, err, errno, mman, nr};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
@@ -15,7 +15,7 @@ use std::sync::{Mutex, MutexGuard};
 /// The kernel of the guest running in this VM.
 static KERNEL: Mutex<Option<Kernel<HvPlatform>>> = Mutex::new(None);
 
-fn kernel() -> MutexGuard<'static, Option<Kernel<HvPlatform>>> {
+pub(super) fn kernel() -> MutexGuard<'static, Option<Kernel<HvPlatform>>> {
     KERNEL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -67,7 +67,17 @@ impl Platform for HvPlatform {
     }
 
     fn map_guest(&mut self, addr: u64, len: u64, prot: u64) -> Result<(), i32> {
-        vm::map(addr, uaccess::g2h(addr), len, prot)
+        let host = uaccess::g2h(addr);
+        window::mark_used(host, len);
+        vm::map(addr, host, len, prot)
+    }
+
+    fn place_mapping(&mut self, len: u64) -> Option<u64> {
+        window::alloc(len)
+    }
+
+    fn release_host(&mut self, addr: u64, len: u64) -> bool {
+        window::release(addr, len)
     }
 
     fn unmap_guest(&mut self, addr: u64, len: u64) {
@@ -107,6 +117,65 @@ thread_local! {
     static IN_RUN: Cell<bool> = const { Cell::new(false) };
 }
 
+// --- Stopping the other vCPUs for a fork ----------------------------------
+
+/// A fork is taking its snapshot: vCPU threads wait before running guest
+/// code again.
+static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Threads inside, or about to enter, `hv_vcpu_run`.
+static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PAUSE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
+/// Count this thread as running guest code, first waiting out a fork's
+/// snapshot.
+fn enter_run() {
+    use std::sync::atomic::Ordering::SeqCst;
+    loop {
+        RUNNING.fetch_add(1, SeqCst);
+        if !PAUSED.load(SeqCst) {
+            return;
+        }
+        RUNNING.fetch_sub(1, SeqCst);
+        let mut g = PAUSE.0.lock().unwrap_or_else(|e| e.into_inner());
+        while PAUSED.load(SeqCst) && !EXITING.load(SeqCst) {
+            g = PAUSE.1.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(g);
+        if EXITING.load(SeqCst) {
+            park();
+        }
+    }
+}
+
+/// Stop every other vCPU and keep them stopped until [`resume_others`]: no
+/// guest code runs meanwhile. Called with the kernel lock held, from a
+/// thread in a system call.
+pub(super) fn pause_others() {
+    use std::sync::atomic::Ordering::SeqCst;
+    PAUSED.store(true, SeqCst);
+    let own = VCPU.with(Cell::get);
+    loop {
+        let mut others: Vec<hv_vcpu_t> =
+            live_vcpus().into_iter().filter(|&v| Some(v) != own).collect();
+        if !others.is_empty() {
+            // SAFETY: stopping the other threads' vCPUs, which may be running.
+            unsafe { hv_vcpus_exit(others.as_mut_ptr(), others.len() as u32) };
+        }
+        if RUNNING.load(SeqCst) == 0 {
+            return;
+        }
+        // SAFETY: plain host call.
+        unsafe { libc::usleep(20) };
+    }
+}
+
+/// Let the vCPUs [`pause_others`] stopped run again.
+pub(super) fn resume_others() {
+    let _g = PAUSE.0.lock().unwrap_or_else(|e| e.into_inner());
+    PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+    PAUSE.1.notify_all();
+}
+
 fn register_vcpu(id: hv_vcpu_t) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     VCPU_SLOTS.iter().any(|s| s.compare_exchange(0, id + 1, SeqCst, SeqCst).is_ok())
@@ -131,7 +200,7 @@ fn live_vcpus() -> Vec<hv_vcpu_t> {
 
 /// Stop and destroy every vCPU, then the VM. Idempotent; safe to call from a
 /// signal handler on a thread not inside `hv_vcpu_run`.
-fn teardown() {
+pub(super) fn teardown() {
     use std::sync::atomic::Ordering::SeqCst;
     if !VM_LIVE.load(SeqCst) {
         return;
@@ -203,7 +272,12 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let (code, pid, uid, status) =
             unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
-        let lsig = host::signal_to_linux(sig);
+        // The relayed form of a guest's SIGKILL (see host::KILL_RELAY).
+        let lsig = if sig == host::KILL_RELAY {
+            fwe_abi::signal::SIGKILL
+        } else {
+            host::signal_to_linux(sig)
+        };
         thread::post_self(
             lsig,
             thread::SigInfo { code: host::si_code_to_linux(code), pid, uid, status },
@@ -300,26 +374,30 @@ extern "C" fn on_fault(sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut 
     unsafe { libc::signal(sig, libc::SIG_DFL) };
 }
 
-/// Block every signal a guest can receive, and the wake signal, on the
-/// calling thread.
+/// Block every signal a guest can receive, the wake signal and the kill
+/// relay, on the calling thread.
 fn block_guest_signals() {
     let mut all = host::host_sigset(u64::MAX);
     // SAFETY: an initialized signal set; changing this thread's mask.
     unsafe {
         libc::sigaddset(&mut all, host::WAKE_SIGNAL);
+        libc::sigaddset(&mut all, host::KILL_RELAY);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }
 }
 
 /// Fresh, zeroed, writable host memory.
 fn host_alloc(len: u64) -> Result<u64, Error> {
-    // SAFETY: a fresh private anonymous mapping.
+    let at = window::alloc(len)
+        .ok_or_else(|| Error::Unsupported("the guest memory window is full".into()))?;
+    // SAFETY: fresh private anonymous memory replacing part of the window's
+    // reservation.
     let p = unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            at as *mut libc::c_void,
             len as usize,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
             -1,
             0,
         )
@@ -392,6 +470,37 @@ fn place(elf: &Elf<'_>, page: u64, translate: bool) -> Result<Placed, Error> {
 /// `movz x8, #139; svc #0`: the `rt_sigreturn` trampoline.
 const SIGRETURN: [u32; 2] = [0xd280_1168, 0xd400_0001];
 
+/// Create this process's VM, and from then on make every way out of the
+/// process tear it down first: no host fork, a panic hook, fwe's own fault
+/// handlers. Hypervisor.framework runs threads of its own, which inherit
+/// the mask of the thread that creates the VM: with every guest signal
+/// blocked there, the host delivers signals only to the vCPU threads, whose
+/// masks follow the guest's.
+pub(super) fn become_vm_process() -> Result<(), String> {
+    block_guest_signals();
+    vm::create()?;
+    VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    fwe_kernel::forbid_fork();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        teardown();
+    }));
+    install(host::WAKE_SIGNAL, 0);
+    install(host::KILL_RELAY, 0);
+    for sig in [libc::SIGSEGV, libc::SIGBUS] {
+        // SAFETY: installing a fully initialized sigaction.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_fault as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+    Ok(())
+}
+
 /// Run `path` (already read into `data`) in the VM. Returns only on failure.
 pub fn run(
     path: &Path,
@@ -420,8 +529,8 @@ fn start(
     // there, the host delivers signals only to the vCPU threads, whose masks
     // follow the guest's. The mask fwe started with is the guest's own.
     let inherited_mask = host::blocked_signals();
-    block_guest_signals();
-    vm::create().map_err(|e| {
+    window::reserve().map_err(Error::Unsupported)?;
+    become_vm_process().map_err(|e| {
         Error::Unsupported(format!(
             "this program is linked below 4 GiB, which needs the hypervisor backend, \
              and creating the VM failed ({e}); fwe must be signed with the \
@@ -429,15 +538,6 @@ fn start(
              on a Mac with hypervisor support"
         ))
     })?;
-    VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    // From here the process has a VM: it must not fork, and a panic in fwe
-    // takes the VM down before the process aborts.
-    fwe_kernel::forbid_fork();
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        teardown();
-    }));
     let mut fs = crate::open_fs(options)?;
 
     let elf = Elf::parse(data).map_err(Error::Elf)?;
@@ -534,17 +634,6 @@ fn start(
     thread::init_main(host::getpid() as i32);
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
     k.set_sigreturn_trampoline(tramp);
-    install(host::WAKE_SIGNAL, 0);
-    for sig in [libc::SIGSEGV, libc::SIGBUS] {
-        // SAFETY: installing a fully initialized sigaction.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_fault as *const () as usize;
-            sa.sa_flags = libc::SA_SIGINFO;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
-        }
-    }
     k.adopt_host_signals();
     thread::set_mask(inherited_mask);
     *kernel() = Some(k);
@@ -554,8 +643,17 @@ fn start(
     vcpu.run(regs)
 }
 
+/// The virtual counter offset all vCPUs share, `u64::MAX` before the first.
+static VTIMER_OFFSET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Make `offset` the process's virtual counter offset (a fork child takes
+/// its parent's), before any vCPU exists.
+pub(super) fn use_vtimer_offset(offset: u64) {
+    VTIMER_OFFSET.store(offset, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// One vCPU, created on and run by the calling host thread.
-struct Vcpu {
+pub(super) struct Vcpu {
     id: hv_vcpu_t,
     exit: *mut hv_vcpu_exit_t,
 }
@@ -573,7 +671,7 @@ const EC_SP_ALIGN: u64 = 0x26;
 const EC_BRK64: u64 = 0x3c;
 
 impl Vcpu {
-    fn create() -> Result<Vcpu, String> {
+    pub(super) fn create() -> Result<Vcpu, String> {
         let mut id = 0;
         let mut exit = std::ptr::null_mut();
         // SAFETY: out-parameters for a vCPU owned by this thread.
@@ -582,6 +680,13 @@ impl Vcpu {
         let v = Vcpu { id, exit };
         for (reg, value) in vm::system_registers() {
             v.set_sys(reg, value);
+        }
+        // Every vCPU of the process reads the same virtual counter: the
+        // first one's offset (or a fork parent's) is everyone's.
+        use std::sync::atomic::Ordering::SeqCst;
+        match VTIMER_OFFSET.load(SeqCst) {
+            u64::MAX => VTIMER_OFFSET.store(v.vtimer_offset(), SeqCst),
+            offset => v.set_vtimer_offset(offset),
         }
         VCPU.with(|c| c.set(Some(id)));
         if !register_vcpu(id) {
@@ -655,8 +760,24 @@ impl Vcpu {
         }
     }
 
+    pub(super) fn set_thread_pointer(&self, tpidr: u64) {
+        self.set_sys(HV_SYS_REG_TPIDR_EL0, tpidr);
+    }
+
+    pub(super) fn vtimer_offset(&self) -> u64 {
+        let mut offset = 0;
+        // SAFETY: reading this thread's vCPU's timer offset.
+        unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut offset) };
+        offset
+    }
+
+    fn set_vtimer_offset(&self, offset: u64) {
+        // SAFETY: setting this thread's vCPU's timer offset.
+        unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
+    }
+
     /// Run the guest from `regs` until the process ends.
-    fn run(&self, mut regs: Regs) -> ! {
+    pub(super) fn run(&self, mut regs: Regs) -> ! {
         self.set_regs(&regs);
         loop {
             if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -665,6 +786,7 @@ impl Vcpu {
             // The guest's mask is in force on the host while it runs, so the
             // host routes signals as for the native backend.
             let mask = host::host_mask_for(thread::mask());
+            enter_run();
             // SAFETY: plain host calls; `exit` is HVF's record for this vCPU.
             let (rc, exit) = unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
@@ -673,6 +795,7 @@ impl Vcpu {
                 IN_RUN.with(|r| r.set(false));
                 (rc, &*self.exit)
             };
+            RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
                 park();
             }
@@ -849,14 +972,10 @@ struct Spawn {
     pending: std::sync::Arc<thread::Pending>,
 }
 
-/// `clone(flags, stack, parent_tid, tls, child_tid)` for a thread (the
-/// pthread flags): a new host thread with a vCPU of its own.
-///
-/// A new process (`fork`, `vfork`) is not supported in the VM: a host
-/// `fork` child cannot use Hypervisor.framework at all — the VM belongs to
-/// the parent task, and in the child `hv_vm_destroy` fails with
-/// `HV_NO_DEVICE` and `hv_vm_create` with `HV_BUSY` — so it fails with
-/// `ENOSYS` rather than leave a child that cannot run.
+/// `clone(flags, stack, parent_tid, tls, child_tid)`: for a thread (the
+/// pthread flags), a new host thread with a vCPU of its own; for a new
+/// process (`fork`, `vfork`), a fresh fwe process given this one's memory
+/// and state (see [`fork`]).
 fn clone(vcpu: &Vcpu, parent: &Regs) -> i64 {
     use fwe_abi::clone as cl;
     let (flags, stack, ptid, tls, ctid) =
@@ -864,7 +983,7 @@ fn clone(vcpu: &Vcpu, parent: &Regs) -> i64 {
     let tpidr =
         if flags & cl::CLONE_SETTLS != 0 { tls } else { vcpu.get_sys(HV_SYS_REG_TPIDR_EL0) };
     if flags & cl::CLONE_THREAD == 0 {
-        return err(errno::ENOSYS);
+        return fork::fork(parent, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
     }
     if flags & cl::CLONE_VM == 0 || stack == 0 {
         return err(errno::EINVAL);

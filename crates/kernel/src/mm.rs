@@ -26,6 +26,17 @@ fn guest_maps() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     GUEST_MAPS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every range of guest memory, `start -> end`.
+pub fn guest_ranges() -> BTreeMap<u64, u64> {
+    guest_maps().clone()
+}
+
+/// Take the guest memory ranges of the parent, in a fork child that has
+/// mapped them.
+pub fn set_guest_ranges(ranges: BTreeMap<u64, u64>) {
+    *guest_maps() = ranges;
+}
+
 /// Record `[addr, addr + len)` as guest memory.
 pub fn track(addr: u64, len: u64) {
     if len == 0 {
@@ -167,7 +178,7 @@ fn dontneed(addr: u64, len: u64) -> i64 {
 
 /// What backs a range of the host address space, from Mach.
 #[cfg(target_os = "macos")]
-mod region {
+pub mod region {
     use std::os::raw::{c_int, c_uchar, c_uint, c_ushort};
 
     /// `vm_region_basic_info_64`.
@@ -259,6 +270,11 @@ mod region {
     }
 
     impl Region {
+        /// The mapping is `MAP_PRIVATE`: a child gets a copy, not a share.
+        pub fn private(&self) -> bool {
+            self.private
+        }
+
         /// Private anonymous memory: what Linux zero-fills on `MADV_DONTNEED`.
         pub fn private_anonymous(&self) -> bool {
             self.private && !self.file_backed
@@ -466,7 +482,15 @@ impl<P: Platform> Kernel<P> {
         if fixed && crate::uaccess::crosses(addr, self.page_up(len)) {
             return err(errno::EINVAL);
         }
-        let haddr = if fixed { crate::uaccess::g2h(addr) } else { addr };
+        let mut haddr = if fixed { crate::uaccess::g2h(addr) } else { addr };
+        let mut placed = false;
+        if !fixed {
+            if let Some(at) = self.platform.place_mapping(self.page_up(len)) {
+                haddr = at;
+                hflags |= libc::MAP_FIXED;
+                placed = true;
+            }
+        }
 
         // Executable mappings are created writable so the backend can prepare
         // the code, then switched to the requested protections. Shared file
@@ -495,19 +519,24 @@ impl<P: Platform> Kernel<P> {
             )
         };
         if p == libc::MAP_FAILED {
-            return last_error();
+            let e = last_error();
+            if placed {
+                // The range chosen for it goes back to the backend.
+                self.platform.release_host(haddr, self.page_up(len));
+            }
+            return e;
         }
         let p = p as u64;
         if noreplace && p != haddr {
             // SAFETY: unmapping the mapping just created.
-            unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+            self.unmap_host(p, len);
             return err(errno::EEXIST);
         }
-        let guest = if p == haddr { addr } else { p };
+        let guest = if p == haddr && fixed { addr } else { p };
         track(p, self.page_up(len));
         if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
             // SAFETY: unmapping the mapping just created.
-            unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+            self.unmap_host(p, len);
             untrack(p, self.page_up(len));
             return err(e);
         }
@@ -532,7 +561,7 @@ impl<P: Platform> Kernel<P> {
             for (a, l) in prep {
                 if let Err(e) = self.platform.prepare_exec(a, l) {
                     // SAFETY: unmapping the mapping just created.
-                    unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+                    self.unmap_host(p, len);
                     untrack(p, self.page_up(len));
                     return err(e);
                 }
@@ -542,12 +571,23 @@ impl<P: Platform> Kernel<P> {
             {
                 let e = last_error();
                 // SAFETY: unmapping the mapping just created.
-                unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
+                self.unmap_host(p, len);
                 untrack(p, self.page_up(len));
                 return e;
             }
         }
         guest as i64
+    }
+
+    /// Unmap guest host memory, or have the backend take it back
+    /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
+    fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
+        if self.platform.release_host(addr, self.page_up(len)) {
+            return 0;
+        }
+        // SAFETY: unmapping guest memory, at the guest's request or a
+        // mapping fwe just made for it.
+        ret(unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) })
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
@@ -556,7 +596,7 @@ impl<P: Platform> Kernel<P> {
         }
         let host = crate::uaccess::g2h(addr) as *mut libc::c_void;
         // SAFETY: guest-requested unmapping of guest memory.
-        let r = ret(unsafe { libc::munmap(host, len as usize) });
+        let r = self.unmap_host(host as u64, len);
         if r == 0 {
             untrack(host as u64, self.page_up(len));
             self.platform.unmap_guest(addr, self.page_up(len));
@@ -634,8 +674,7 @@ impl<P: Platform> Kernel<P> {
         if new_len <= old_len {
             if new_len < old_len {
                 let tail = host + new_len;
-                // SAFETY: unmapping the tail of a guest mapping.
-                unsafe { libc::munmap(tail as *mut libc::c_void, (old_len - new_len) as usize) };
+                self.unmap_host(tail, old_len - new_len);
                 untrack(tail, old_len - new_len);
                 self.platform.unmap_guest(old + new_len, old_len - new_len);
             }

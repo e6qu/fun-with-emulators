@@ -79,6 +79,23 @@ pub fn init() {
         (DEFAULT_SOFT.min(guest_max as u64), guest_max as u64);
 }
 
+/// Write the descriptor-table limits into a fork snapshot.
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    e.i32(GUEST_MAX.load(Ordering::SeqCst));
+    e.i32(NEXT.load(Ordering::SeqCst));
+    let (soft, hard) = limit();
+    e.u64(soft);
+    e.u64(hard);
+}
+
+/// Take the limits [`save`] wrote, in a fork child (which inherits the
+/// parent's host limit, so its reserved range is the parent's).
+pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
+    GUEST_MAX.store(d.i32(), Ordering::SeqCst);
+    NEXT.store(d.i32(), Ordering::SeqCst);
+    *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = (d.u64(), d.u64());
+}
+
 /// One past the highest descriptor the guest may use.
 pub fn guest_max() -> i32 {
     GUEST_MAX.load(Ordering::SeqCst)

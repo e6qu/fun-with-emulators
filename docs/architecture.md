@@ -304,7 +304,34 @@ not a share of it, and the parent waits until the child has exec'd or exited
 (it holds the write end of a close-on-exec pipe). Spawn helpers only exec or
 exit in the child, so this matches; a child that writes to memory the parent
 reads afterwards (glibc's `posix_spawn` reporting an exec failure) is not
-seen by the parent.
+seen by the parent. A host fork child does not inherit kqueues (their
+descriptors are closed in it), so the kqueues behind the guest's `epoll` and
+`timerfd` descriptors are recorded before the fork and rebuilt in the child
+at the same numbers (see Event descriptors).
+
+In the hypervisor backend a host fork is impossible, since a child cannot use
+its parent's VM, so `fork` and `vfork` start a fresh fwe process instead
+(`crates/native/src/hv/fork.rs`, [hypervisor.md](hypervisor.md)). All guest
+memory there lives in one reserved host address window (512–960 GiB). With
+the kernel lock held and every other vCPU stopped, the parent takes a Mach
+memory entry for each region of it — a copy-on-write snapshot
+(`MAP_MEM_VM_COPY`) of private memory, a share (`MAP_MEM_VM_SHARE`) of
+`MAP_SHARED` memory — and encodes the kernel's state
+(`Kernel::save_for_fork`, `crates/kernel/src/snapshot.rs`): signal
+dispositions, the forking thread's mask and alternate stack, the break,
+filesystem view, credentials, descriptor limits and every descriptor
+registry, then the backend's own (registers, thread pointer, the VM's
+mappings). It `posix_spawn`s `fwe --hv-fork-child` with all of its
+descriptors (close-on-exec ones too, the flag cleared for the spawn and set
+back on both sides; kqueues never pass and are rebuilt), and a receive right
+of its own as the child's bootstrap port. The child asks there for its
+state; the answer carries the memory entries, the real bootstrap port and
+the state. The child reserves the window, maps each entry at the parent's
+address, restores the kernel, creates its own VM over the same mappings and
+resumes the guest after the `svc` with `x0` = 0. The parent returns once the
+child is about to run; a `vfork` parent waits on until the child execs or
+exits. Neither side pays for memory until it writes to a page. A guest that
+has placed a `MAP_FIXED` mapping outside the window cannot fork (`EAGAIN`).
 
 `wait4` reaps a child through the host, translating the status into the
 Linux encoding and the resource usage into Linux units (`ru_maxrss` in KiB);
@@ -410,6 +437,12 @@ timerfd is a `kqueue` holding one `EVFILT_TIMER`, with millisecond
 resolution; a periodic timer's distinct initial `it_value` and the
 realtime/monotonic distinction are not modelled.
 
+A kqueue cannot be passed to a child process, so each epoll descriptor's
+interest list is also recorded (and kept up to date by `epoll_ctl` and
+`close`), as is how each timerfd is armed; a fork child rebuilds both at the
+same descriptor numbers. A timer's expirations not yet read when the process
+forks are not carried over.
+
 `signalfd` (`crates/kernel/src/signalfd.rs`) has no macOS equivalent and is
 emulated: each signalfd is a readiness pipe plus a queue of
 `signalfd_siginfo` records. The host never blocks a watched signal, so it
@@ -482,15 +515,23 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
-  entitlement and a bare-metal Apple Silicon Mac; there, `fork` and `vfork`
-  fail with `ENOSYS` so far. `execve` re-executes fwe, so the guest's
+  entitlement and a bare-metal Apple Silicon Mac. `execve` re-executes fwe, so the guest's
   virtual credentials and `RLIMIT_NOFILE` start over in the new program. A few rare `x18` forms are left
   unrewritten (see Rewriting guest code; `--strace` counts them). Code
   discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
   an inline jump table in a code section could be patched.
 - **Processes:** `vfork` copies the address space instead of sharing it
-  (see Processes); `execveat` and `clone3` are not implemented; `waitid`
+  (see Processes), in both backends; a fork child of a timerfd loses the
+  expirations not yet read; in the native backend a host `fork` copies
+  memory while the parent's other threads keep running, so a child can see
+  one thread's writes torn across pages (the hypervisor backend stops every
+  vCPU for its snapshot); in a fork child, an epoll or timerfd descriptor
+  duplicated with `dup` is gone (only the original number is rebuilt), a
+  periodic timerfd restarts its period, and eventfd counters and signalfd
+  queues are the child's own copies while their readiness pipes are shared;
+  a VM fork that fails after spawning its child can have that child reaped
+  by another thread's `wait4(-1)`; `execveat` and `clone3` are not implemented; `waitid`
   reports no `rusage`. An `execve` from a process with other live threads,
   or of a program only the VM can run, re-executes fwe, and the guest's
   virtual credentials and `RLIMIT_NOFILE` start over in the new program.

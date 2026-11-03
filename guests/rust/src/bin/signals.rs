@@ -3,7 +3,7 @@
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const SIGHUP: i32 = 1;
@@ -112,6 +112,12 @@ unsafe extern "C" {
     fn signalfd(fd: i32, mask: *const SigSet, flags: i32) -> i32;
     fn ppoll(fds: *mut u8, n: u64, timeout: *const Timespec, mask: *const SigSet) -> i32;
     fn _exit(code: i32) -> !;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn epoll_create1(flags: i32) -> i32;
+    fn epoll_ctl(ep: i32, op: i32, fd: i32, event: *mut u8) -> i32;
+    fn epoll_wait(ep: i32, events: *mut u8, max: i32, timeout: i32) -> i32;
+    fn timerfd_create(clock: i32, flags: i32) -> i32;
+    fn timerfd_settime(fd: i32, flags: i32, new: *const [Timespec; 2], old: *mut u8) -> i32;
     fn __errno_location() -> *mut i32;
 }
 
@@ -485,6 +491,129 @@ fn main() {
             println!("{}", describe(wait_status(pid)));
             stop.store(true, Ordering::Relaxed);
             t.join().unwrap();
+        }
+        // A fork child gets the parent's memory as it was at the fork, and
+        // neither side sees the other's later writes, except to shared
+        // memory: in the executable's image, the heap and a MAP_SHARED
+        // mapping.
+        "fork-cow" => {
+            static IMAGE: AtomicU8 = AtomicU8::new(b'p');
+            let mut heap = vec![b'p'; 1 << 20];
+            // SAFETY: a fresh shared anonymous mapping.
+            let shared = unsafe { mmap(std::ptr::null_mut(), 1 << 16, 3, 0x21, -1, 0) };
+            assert!(!shared.is_null() && shared as isize != -1);
+            // SAFETY: the mapping is 64 KiB.
+            unsafe { *shared = b'p' };
+            let (mut down, mut up) = ([0i32; 2], [0i32; 2]);
+            // SAFETY: valid two-element arrays.
+            unsafe { assert!(pipe(down.as_mut_ptr()) == 0 && pipe(up.as_mut_ptr()) == 0) };
+            let byte = |fd: i32| {
+                let mut b = 0u8;
+                // SAFETY: one byte into a local.
+                unsafe { read(fd, &mut b, 1) };
+            };
+            let send = |fd: i32| {
+                // SAFETY: one byte from a constant.
+                unsafe { write(fd, b"x".as_ptr(), 1) };
+            };
+            let last = heap.len() - 1;
+            let pid = {
+                let heap = heap.as_mut_ptr();
+                child(move || {
+                    // SAFETY: the heap buffer and the mapping are the
+                    // child's copy (and the shared mapping) after the fork.
+                    unsafe {
+                        let saw = [IMAGE.load(Ordering::Relaxed), *heap, *heap.add(last), *shared];
+                        byte(down[0]);
+                        let unchanged = IMAGE.load(Ordering::Relaxed) == b'p' && *heap == b'p';
+                        IMAGE.store(b'c', Ordering::Relaxed);
+                        *heap = b'c';
+                        *shared = b'c';
+                        println!("child sees the fork-time memory: {}", saw == [b'p'; 4]);
+                        println!("parent's later writes unseen: {unchanged}");
+                    }
+                    send(up[1]);
+                    0
+                })
+            };
+            IMAGE.store(b'P', Ordering::Relaxed);
+            heap[0] = b'P';
+            send(down[1]);
+            byte(up[0]);
+            let status = wait_status(pid);
+            let mine = IMAGE.load(Ordering::Relaxed) == b'P' && heap[0] == b'P';
+            println!("child's writes unseen: {mine}");
+            // SAFETY: the mapping is still there.
+            println!("shared memory shared: {}", unsafe { *shared } == b'c');
+            println!("{}", describe(status));
+        }
+        // A fork while another thread writes sees one instant of the
+        // process: the thread bumps a counter in the executable's image and
+        // then one on the heap, so any instant has them equal or the first
+        // one ahead by one, wherever in memory each lives. (A host fork on
+        // macOS does not stop the other threads while it copies memory, so
+        // only the hypervisor backend's fork passes this.)
+        "fork-snapshot" => {
+            static FIRST: AtomicU64 = AtomicU64::new(0);
+            let second = std::sync::Arc::new(AtomicU64::new(0));
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let (s, st) = (second.clone(), stop.clone());
+            let t = std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !st.load(Ordering::Relaxed) {
+                    n += 1;
+                    FIRST.store(n, Ordering::SeqCst);
+                    s.store(n, Ordering::SeqCst);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(10));
+            let mut consistent = 0;
+            for _ in 0..8 {
+                let second = second.clone();
+                let pid = child(move || {
+                    let (a, b) = (FIRST.load(Ordering::SeqCst), second.load(Ordering::SeqCst));
+                    (a != b && a != b + 1) as i32
+                });
+                if wait_status(pid) == 0 {
+                    consistent += 1;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            t.join().unwrap();
+            println!("consistent snapshots: {consistent} of 8");
+        }
+        // A fork child can use the epoll and timerfd descriptors it
+        // inherited (kqueues on macOS, which a child does not inherit).
+        "fork-epoll" => {
+            let mut p = [0i32; 2];
+            // SAFETY: a valid two-element array.
+            assert_eq!(unsafe { pipe(p.as_mut_ptr()) }, 0);
+            // SAFETY: plain calls; the event is a packed epoll_event.
+            let ep = unsafe { epoll_create1(0) };
+            let mut ev = [0u8; 12];
+            ev[0] = 1; // EPOLLIN
+            ev[4..].copy_from_slice(&42u64.to_ne_bytes());
+            assert_eq!(unsafe { epoll_ctl(ep, 1, p[0], ev.as_mut_ptr()) }, 0);
+            // A one-shot timer 50 ms out.
+            // SAFETY: plain calls with a valid itimerspec.
+            let tfd = unsafe { timerfd_create(1, 0) };
+            let spec = [Timespec { sec: 0, nsec: 0 }, Timespec { sec: 0, nsec: 50_000_000 }];
+            assert_eq!(unsafe { timerfd_settime(tfd, 0, &spec, std::ptr::null_mut()) }, 0);
+            let pid = child(move || {
+                let mut got = [0u8; 12];
+                // SAFETY: room for one event.
+                let n = unsafe { epoll_wait(ep, got.as_mut_ptr(), 1, 5000) };
+                let data = u64::from_ne_bytes(got[4..].try_into().unwrap());
+                println!("child's epoll: {n} event(s), data {data}");
+                let mut count = 0u64;
+                // SAFETY: an 8-byte read into a local.
+                let r = unsafe { read(tfd, (&mut count as *mut u64).cast(), 8) };
+                println!("child's timer fired: {}", r == 8 && count >= 1);
+                0
+            });
+            // SAFETY: one byte from a constant.
+            unsafe { write(p[1], b"x".as_ptr(), 1) };
+            println!("{}", describe(wait_status(pid)));
         }
         // waitid reports exits and kills as siginfo.
         "waitid" => {

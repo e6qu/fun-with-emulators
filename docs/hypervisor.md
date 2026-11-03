@@ -79,13 +79,23 @@ the backend now rules out everything on its side of it:
   own (the framework requires that), then destroys the VM.
 - **Signals whose default action terminates are caught** in the VM backend,
   so the process dies through that teardown, never by the host's default
-  action with the VM alive. Only `SIGKILL` from outside cannot be caught.
+  action with the VM alive. `SIGKILL` cannot be caught, so a guest's
+  `SIGKILL` to an fwe process (`kill`, `tgkill`, to a process, a group or
+  everyone) is sent as `SIGINFO`, which has no Linux counterpart: a VM
+  process takes it as the guest's `SIGKILL`, tears down and then dies of
+  `SIGKILL`, so its parent sees the status Linux gives. Only a `SIGKILL`
+  from outside fwe cannot be intercepted.
 - **No host `fork` of a VM process.** A fork child cannot use the parent's VM
   — `hv_vm_destroy` fails there with `HV_NO_DEVICE` and `hv_vm_create` with
-  `HV_BUSY` — so it would die with a VM it inherited. `fork` and `vfork` in
-  the VM fail with `ENOSYS`, and `fwe_kernel::fork_locked` refuses outright
-  once a VM exists.
-- **The tests run one VM process at a time.**
+  `HV_BUSY` — so it would die with a VM it inherited.
+  `fwe_kernel::fork_locked` refuses outright once a VM exists. A guest's
+  `fork` and `vfork` start a fresh fwe process instead (below), which builds
+  a VM of its own and keeps to these same rules; a fork child that fails to
+  set up tears down any VM it made before it exits.
+- **The tests run one VM test at a time**, never several in parallel. A test
+  of `fork` has the parent's and the child's VM processes alive together,
+  as any forking program does; each ends through teardown, a guest's
+  `SIGKILL` included.
 
 Keep to these when changing the backend.
 
@@ -95,12 +105,28 @@ Programs linked below 4 GiB run in the VM, static and dynamically linked, with
 threads: the assembly test programs, Rust/musl programs, and a non-PIE glibc
 program whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the
 shape of Debian's `python3.11`. They can `execve` any program, and a native
-program can `execve` them. Not supported in the VM yet: `fork` and `vfork`,
-which fail with `ENOSYS` (see above); this is on the
-[roadmap](../ROADMAP.md). A memory call (`mmap` with a fixed address,
+program can `execve` them, and `fork` and `vfork` work as in the native
+backend. A memory call (`mmap` with a fixed address,
 `munmap`, `mprotect`, `madvise`, `mremap`) on a range that runs across the
 edge of the executable's image fails with `EINVAL`, since that range has no
 single host address.
+
+## Fork
+
+The child of a `fork` or `vfork` in the VM is a fresh fwe process,
+`fwe --hv-fork-child`, started with `posix_spawn` — never a host fork. All
+guest memory lives in one reserved host address window (512–960 GiB, inside
+the VM's 1 TiB address space), so the child can map it at the same
+addresses. With every other vCPU stopped, the parent takes a Mach memory
+entry per region: a copy-on-write snapshot of private memory, a share of
+`MAP_SHARED` memory. A snapshot is cheap (about 2 ms for 1 GiB) and neither
+process pays for a page until one of them writes to it. The entries, the
+real bootstrap port and the encoded kernel state reach the child in one Mach
+message, through a receive right the parent gave it as its bootstrap port.
+The child maps the memory, rebuilds the kernel (and the kqueues behind
+`epoll` and `timerfd`, which no child inherits), creates its own VM over the
+same guest mappings and resumes after the `svc` with `x0` = 0. See
+[architecture.md](architecture.md#processes) for the state carried over.
 
 ## Running it (Apple Silicon, no root)
 
@@ -120,7 +146,7 @@ reports the status 42 the guest exits with. `sysctl kern.hv_support` must be
 ## Tests and CI
 
 The end-to-end tests whose names start with `hv_` sign a copy of `fwe` with the
-entitlement and run low-linked programs in the VM, one VM process at a time.
+entitlement and run low-linked programs in the VM, one test at a time.
 Where the host has no hypervisor they report that they were skipped and pass.
 
 GitHub's hosted macOS runners are themselves virtual machines without nested
