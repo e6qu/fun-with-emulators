@@ -466,7 +466,13 @@ impl<P: Platform> Kernel<P> {
         if fixed && crate::uaccess::crosses(addr, self.page_up(len)) {
             return err(errno::EINVAL);
         }
-        let haddr = if fixed { crate::uaccess::g2h(addr) } else { addr };
+        let mut haddr = if fixed { crate::uaccess::g2h(addr) } else { addr };
+        if !fixed {
+            if let Some(at) = self.platform.place_mapping(self.page_up(len)) {
+                haddr = at;
+                hflags |= libc::MAP_FIXED;
+            }
+        }
 
         // Executable mappings are created writable so the backend can prepare
         // the code, then switched to the requested protections. Shared file
@@ -503,7 +509,7 @@ impl<P: Platform> Kernel<P> {
             unsafe { libc::munmap(p as *mut libc::c_void, len as usize) };
             return err(errno::EEXIST);
         }
-        let guest = if p == haddr { addr } else { p };
+        let guest = if p == haddr && fixed { addr } else { p };
         track(p, self.page_up(len));
         if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
             // SAFETY: unmapping the mapping just created.
@@ -560,6 +566,7 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             untrack(host as u64, self.page_up(len));
             self.platform.unmap_guest(addr, self.page_up(len));
+            self.platform.released_guest(host as u64, self.page_up(len));
         }
         r
     }
@@ -638,6 +645,7 @@ impl<P: Platform> Kernel<P> {
                 unsafe { libc::munmap(tail as *mut libc::c_void, (old_len - new_len) as usize) };
                 untrack(tail, old_len - new_len);
                 self.platform.unmap_guest(old + new_len, old_len - new_len);
+                self.platform.released_guest(tail, old_len - new_len);
             }
             return old as i64;
         }

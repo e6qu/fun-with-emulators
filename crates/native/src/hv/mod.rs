@@ -27,6 +27,8 @@ mod ffi;
 pub mod spike;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vm;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod window;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use backend::run;

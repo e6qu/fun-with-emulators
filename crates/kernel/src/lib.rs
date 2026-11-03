@@ -105,6 +105,17 @@ pub trait Platform {
     /// pages (`MADV_DONTNEED`); a VM mapping of it must follow.
     fn remapped_guest(&mut self, _addr: u64, _len: u64) {}
 
+    /// Where to put a guest mapping of `len` bytes the guest did not place
+    /// itself, or `None` to let the host choose. A backend that keeps guest
+    /// memory in a range of its own returns an address there.
+    fn place_mapping(&mut self, _len: u64) -> Option<u64> {
+        None
+    }
+
+    /// The guest unmapped `[addr, addr + len)` for good (`munmap`, a
+    /// shrinking `mremap`), so its address space may be reused.
+    fn released_guest(&mut self, _addr: u64, _len: u64) {}
+
     /// Set how the host treats Linux signal `sig` (one with a host
     /// equivalent; see [`signal::relayed`]) so that signals sent to this
     /// process by other processes, the terminal or the host itself reach

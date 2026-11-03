@@ -1,7 +1,7 @@
 //! The VMM: loading, the vCPU run loop and the system call path.
 
 use super::ffi::*;
-use super::vm;
+use super::{vm, window};
 use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, page_size, stack};
 use fwe_abi::{auxv, err, errno, mman, nr};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
@@ -67,7 +67,17 @@ impl Platform for HvPlatform {
     }
 
     fn map_guest(&mut self, addr: u64, len: u64, prot: u64) -> Result<(), i32> {
-        vm::map(addr, uaccess::g2h(addr), len, prot)
+        let host = uaccess::g2h(addr);
+        window::mark_used(host, len);
+        vm::map(addr, host, len, prot)
+    }
+
+    fn place_mapping(&mut self, len: u64) -> Option<u64> {
+        window::alloc(len)
+    }
+
+    fn released_guest(&mut self, addr: u64, len: u64) {
+        window::release(addr, len);
     }
 
     fn unmap_guest(&mut self, addr: u64, len: u64) {
@@ -313,13 +323,16 @@ fn block_guest_signals() {
 
 /// Fresh, zeroed, writable host memory.
 fn host_alloc(len: u64) -> Result<u64, Error> {
-    // SAFETY: a fresh private anonymous mapping.
+    let at = window::alloc(len)
+        .ok_or_else(|| Error::Unsupported("the guest memory window is full".into()))?;
+    // SAFETY: fresh private anonymous memory replacing part of the window's
+    // reservation.
     let p = unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            at as *mut libc::c_void,
             len as usize,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
             -1,
             0,
         )
@@ -421,6 +434,7 @@ fn start(
     // follow the guest's. The mask fwe started with is the guest's own.
     let inherited_mask = host::blocked_signals();
     block_guest_signals();
+    window::reserve().map_err(Error::Unsupported)?;
     vm::create().map_err(|e| {
         Error::Unsupported(format!(
             "this program is linked below 4 GiB, which needs the hypervisor backend, \
