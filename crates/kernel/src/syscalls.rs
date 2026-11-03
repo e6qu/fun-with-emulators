@@ -83,6 +83,9 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
 
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        if let Err(e) = crate::fdtable::check_args(n, &a) {
+            return e;
+        }
         match n {
             // Files and I/O.
             nr::READ => {
@@ -141,6 +144,7 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::dup(a[0] as i32) })
             }
             nr::DUP3 => self.sys_dup3(a[0], a[1], a[2]),
+            nr::CLOSE_RANGE => self.sys_close_range(a[0] as u32, a[1] as u32, a[2]),
             nr::FCNTL => self.sys_fcntl(a[0], a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(a[0], a[1], a[2]),
             nr::PPOLL => self.sys_ppoll(a[0], a[1], a[2]),
@@ -432,11 +436,39 @@ impl<P: Platform> Kernel<P> {
         ret(r)
     }
 
+    /// `close_range(first, last, flags)`: close (or, with
+    /// `CLOSE_RANGE_CLOEXEC`, mark close-on-exec) the guest's open
+    /// descriptors in `[first, last]`. fwe's own are outside the guest range.
+    fn sys_close_range(&mut self, first: u32, last: u32, flags: u64) -> i64 {
+        const CLOSE_RANGE_UNSHARE: u64 = 2;
+        const CLOSE_RANGE_CLOEXEC: u64 = 4;
+        if first > last || flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+            return err(errno::EINVAL);
+        }
+        for fd in crate::fdtable::open_fds() {
+            if (fd as u32) < first || fd as u32 > last {
+                continue;
+            }
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                // SAFETY: plain host call on an open guest descriptor.
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            } else {
+                self.dispatch(nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+            }
+        }
+        0
+    }
+
     fn sys_fcntl(&mut self, fd: u64, cmd: u64, arg: u64) -> i64 {
         let fd = fd as i32;
         // SAFETY: every arm is a plain host call on a guest descriptor.
         unsafe {
             match cmd {
+                fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC
+                    if !crate::fdtable::guest_visible(arg as i32) =>
+                {
+                    err(errno::EINVAL)
+                }
                 fcntl::F_DUPFD => ret(libc::fcntl(fd, libc::F_DUPFD, arg as i32)),
                 fcntl::F_DUPFD_CLOEXEC => ret(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, arg as i32)),
                 fcntl::F_GETFD => {
@@ -587,6 +619,22 @@ impl<P: Platform> Kernel<P> {
         }
         if res >= resource::RLIM_NLIMITS {
             return err(errno::EINVAL);
+        }
+        if res == resource::RLIMIT_NOFILE {
+            // Virtual: the host's limit also covers fwe's own descriptors.
+            let (cur, max) = crate::fdtable::limit();
+            if old != 0 {
+                // SAFETY: the guest passed a buffer for a `struct rlimit64`.
+                unsafe { write(old, Rlimit { rlim_cur: cur, rlim_max: max }) };
+            }
+            if new != 0 {
+                // SAFETY: the guest passed a pointer to a `struct rlimit64`.
+                let n: Rlimit = unsafe { read(new) };
+                if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
+                    return err(e);
+                }
+            }
+            return 0;
         }
         let Some(hres) = host::rlimit_to_host(res) else {
             // Limits the host does not have: report Linux defaults.

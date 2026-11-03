@@ -638,6 +638,8 @@ fn start(
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
 
+    // fwe's own descriptors go above the guest's range from here on.
+    fwe_kernel::fdtable::init();
     // The root filesystem; also used to find the dynamic linker.
     let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
     let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {

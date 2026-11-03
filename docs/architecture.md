@@ -215,10 +215,17 @@ rootfs. `*at` calls resolve relative to their directory descriptor.
 
 Guest file descriptors are host file descriptors: an opened file's host fd is
 returned to the guest unchanged, so `read`, `write`, `lseek`, `fstat` and the
-rest act on it directly. The few descriptors fwe keeps for itself (the rootfs
-handle, the write ends of the pipes behind the emulated event descriptors)
-share that table, so a guest that closes every descriptor it did not open can
-take them away; see the limitations. `stat` results are translated into the arm64 Linux
+rest act on it directly. The descriptors fwe keeps for itself (the rootfs
+handle, the write ends of the pipes behind the emulated event descriptors,
+the pipe a `vfork` parent waits on) live in a reserved range at the top of
+the host's descriptor space (`crates/kernel/src/fdtable.rs`). At startup fwe
+raises its host soft limit as far as macOS allows and gives the guest a
+virtual `RLIMIT_NOFILE` whose hard limit ends 64 descriptors short of it
+(soft 1024, as on Linux). A guest that closes everything up to its limit,
+calls `close_range(3, ~0)` or walks `/proc/self/fd` never reaches fwe's
+descriptors, and a system call that names one fails with `EBADF`, as for a
+descriptor that is not open; `dup2` onto one fails the same way, and the
+limit cannot be raised into the range. `stat` results are translated into the arm64 Linux
 layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
 directory position when the translated entries outgrow the guest's buffer.
 Creation modes have the umask applied by the kernel. `fcntl` translates the
@@ -229,8 +236,8 @@ requests.
 
 The rootfs has no real `/proc` or `/sys`, so the filesystem layer consults
 `crates/kernel/src/procfs.rs` before the host rootfs and generates what
-programs read at startup: `/proc/self/exe` (a symlink) and
-`/proc/self/cmdline`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
+programs read at startup: `/proc/self/exe` (a symlink),
+`/proc/self/cmdline`, `/proc/self/fd`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
 `/proc/uptime`, `/proc/loadavg`, `/proc/sys/kernel/{ostype,osrelease,
 version,hostname,pid_max}`, `/proc/sys/vm/{overcommit_memory,mmap_min_addr}`
 and `/sys/devices/system/cpu/{online,possible}`. File content is served from
@@ -238,7 +245,12 @@ an anonymous, seekable fd. The per-process values (exe, cmdline, cpu count,
 host name) are set at program load and `execve`. The directories can be
 opened and listed: `crates/kernel/src/synthdir.rs` serves `getdents64`,
 `lseek`, `fstat` and `close` on an opened synthetic directory from an
-in-memory entry list. An unknown path under `/proc` or `/sys` is `ENOENT`.
+in-memory entry list. `/proc/self/fd` lists the guest's open descriptors
+(including the one listing it); each entry links to the file's guest path,
+or to `pipe:[ino]`, `socket:[ino]` or `anon_inode:[eventfd]` and the like,
+and opening one reopens the file or, for an object with no path,
+duplicates the descriptor. An unknown path under `/proc` or `/sys` is
+`ENOENT`.
 
 ## Processes
 
@@ -454,10 +466,11 @@ those items.
   (see Processes); `execve` from a process with other live threads,
   `execveat` and `clone3` are not implemented; `waitid` reports no
   `rusage`.
-- **Descriptors:** fwe's own descriptors (the rootfs handle, the pipe ends
-  behind eventfd and signalfd) live in the guest's table; a guest that closes
-  every descriptor from 3 up, as daemons and `subprocess` do, breaks path
-  resolution. A guest↔host descriptor map is the fix.
+- **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
+  that opens more descriptors than its limit gets numbers in fwe's range,
+  which it cannot use, rather than `EMFILE`; a reopened
+  `/proc/self/fd` entry for a pipe or socket shares the original's file
+  description rather than getting a new one.
 - **Memory:** `MADV_DONTNEED` on a private file mapping keeps modified pages
   where Linux would restore the file's. Guest pointers the kernel reads
   itself are not fault-checked; a bad pointer crashes `fwe` instead of

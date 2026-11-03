@@ -43,15 +43,14 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether `fd` is a signalfd.
+pub fn is_signalfd(fd: i32) -> bool {
+    with(|m| m.contains_key(&fd))
+}
+
 /// The signals some signalfd watches (a Linux set).
 pub fn watched() -> u64 {
     WATCHED.load(Ordering::Acquire)
-}
-
-/// Descriptors the emulation holds for itself (the write ends of the
-/// readiness pipes), which the guest must never see closed.
-pub fn internal_fds() -> Vec<i32> {
-    with(|reg| reg.values().map(|s| s.wfd).collect())
 }
 
 /// Build a minimal `signalfd_siginfo` for signal `sig`.
@@ -89,13 +88,11 @@ pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return crate::host::last_error();
     }
-    let (rfd, wfd) = (fds[0], fds[1]);
-    // SAFETY: plain host calls on fresh descriptors.
-    unsafe {
-        if flags & fcntl::O_CLOEXEC != 0 {
-            libc::fcntl(rfd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        libc::fcntl(wfd, libc::F_SETFD, libc::FD_CLOEXEC);
+    // The write end is fwe's: out of the guest's reach.
+    let (rfd, wfd) = (fds[0], crate::fdtable::reserve(fds[1]));
+    if flags & fcntl::O_CLOEXEC != 0 {
+        // SAFETY: plain host call on a fresh descriptor.
+        unsafe { libc::fcntl(rfd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
     let s = SignalFd {
         rfd,

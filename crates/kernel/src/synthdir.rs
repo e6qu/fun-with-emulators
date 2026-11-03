@@ -43,6 +43,15 @@ pub fn open(entries: Vec<(Vec<u8>, u8)>) -> i64 {
     fd as i64
 }
 
+/// Append an entry to open synthetic directory `fd`.
+pub fn add(fd: i32, name: Vec<u8>, dtype: u8) {
+    with(|m| {
+        if let Some(dir) = m.get_mut(&fd) {
+            dir.entries.push((name, dtype));
+        }
+    });
+}
+
 /// Whether `fd` is a synthetic directory.
 pub fn is_synth(fd: i32) -> bool {
     with(|m| m.contains_key(&fd))
