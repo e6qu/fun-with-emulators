@@ -90,22 +90,14 @@ System-call surface, implemented and covered by end-to-end tests:
 
 Remaining:
 
-- [ ] **Hypervisor backend** for executables linked below 4 GiB (non-PIE
-  `ET_EXEC`: Debian's `python3.11` at `0x400000`, static Go at `0x10000`).
-  The feasibility spike (`fwe --hv-spike`, see
-  [docs/hypervisor-spike.md](docs/hypervisor-spike.md)) runs a low-address
-  guest in a Hypervisor.framework VM and services its traps. The backend
-  itself: run the guest at EL0 under a minimal EL1 vector so `svc #0` traps
-  as is (no rewrite needed), back the VM's memory with host mappings the
-  kernel layer can reach, implement `Platform` for it, and have the loader
-  pick it automatically for images the native backend cannot map. Guest
-  addresses cannot all equal host addresses here — the low 4 GiB the image
-  needs is exactly what the host process cannot map — so guest pointers into
-  that range are translated, in the one place the kernel touches guest
-  memory (`crates/kernel/src/uaccess.rs`) and for the pointers it hands to
-  host calls. CI
-  coverage runs on the self-hosted Apple Silicon runner (the `hypervisor`
-  job); hosted runners cannot run a VM.
+- [x] **Hypervisor backend** for executables linked below 4 GiB (non-PIE
+  `ET_EXEC`, which macOS's `__PAGEZERO` keeps out of the process): the guest
+  runs at EL0 in a Hypervisor.framework VM, its `svc` trapping unchanged;
+  fwe picks the backend automatically. Static and dynamically linked
+  programs, signals included (see [docs/hypervisor.md](docs/hypervisor.md)).
+  Its tests run on an Apple Silicon Mac and the self-hosted runner (the
+  `hypervisor` job); hosted runners cannot run a VM and skip them
+- [ ] In the VM: threads, `fork`/`vfork` and `execve`
 - [ ] Python from the Debian rootfs (carried over from M1)
 - [ ] The rest of the process model: `execve` from a process with other
   live threads, `execveat`, `clone3`; `vfork` sharing memory with its

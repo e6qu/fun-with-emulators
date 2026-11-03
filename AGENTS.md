@@ -40,14 +40,16 @@ unit tests run natively; end-to-end behaviour is verified in CI on macOS
 runners. The end-to-end tests build the guests into `target/guests` and need
 `clang` from the Xcode command line tools.
 
-The hypervisor spike needs the hypervisor entitlement and a bare-metal
-Apple Silicon host, so it is run by hand or on the self-hosted runner, not
-in the hosted CI jobs:
+The hypervisor backend needs the hypervisor entitlement and a bare-metal
+Apple Silicon host. Its end-to-end tests (`hv_*`) sign a copy of `fwe`
+themselves and run wherever `cargo test` runs on such a Mac; in the hosted
+CI jobs they skip, and the self-hosted `hypervisor` job runs them. To run a
+low-linked program by hand:
 
 ```sh
 cargo build --release -p fwe
-codesign --sign - --entitlements hv-spike.entitlements --force target/release/fwe
-target/release/fwe --hv-spike
+codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
+target/release/fwe ./program-linked-low
 ```
 
 ## Documents
@@ -60,7 +62,7 @@ Each document has one job; do not duplicate content across them.
 | [PLAN.md](PLAN.md) | Goal, approach, scope, principles, how progress is measured |
 | [ROADMAP.md](ROADMAP.md) | Milestones with checklists, "Done when" criteria and status |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
-| [docs/hypervisor-spike.md](docs/hypervisor-spike.md) | The hypervisor backend spike and its CI arrangement |
+| [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
 
 A PR that changes behaviour updates them in the same PR: tick the roadmap

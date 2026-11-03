@@ -1,101 +1,101 @@
-# Hypervisor backend — feasibility spike
+# The hypervisor backend
 
-Some Linux binaries are **non-PIE `ET_EXEC` linked at a fixed low address**
-(Debian's `/usr/bin/python3.11` at `0x400000`, static Go at `0x10000`). The
-native backend cannot run these: macOS gives every arm64 process a mandatory
-4 GiB `__PAGEZERO`, so the low address the binary needs is unmappable, and a
-non-PIE image has no relocation information to move it elsewhere. This is an
-OS limitation, not an implementation gap — Apple's loader refuses a smaller
-`__PAGEZERO` on Apple Silicon, and other emulators (FEX) hit the same wall.
+Some Linux binaries are **non-PIE `ET_EXEC` executables linked at a fixed low
+address**: Debian's `/usr/bin/python3.11` at `0x400000`, static Go at
+`0x10000`, anything a toolchain links without `-pie`. The native backend
+cannot run them. macOS gives every arm64 process a mandatory 4 GiB
+`__PAGEZERO`, enforced as the minimum address of the process's map, so the
+address the binary needs is unmappable, and a non-PIE image has no relocation
+information to move it elsewhere. This is an OS limit, not an implementation
+gap: Apple's loader refuses a smaller `__PAGEZERO` on Apple Silicon, and
+other emulators hit the same wall.
 
-A hardware VM sidesteps it: the guest gets its own address space with no
-`__PAGEZERO`, so it can be mapped at its own low address and run there. On
-macOS the only userspace API for a hardware VM is **Hypervisor.framework**
-(HVF). It needs the `com.apple.security.hypervisor` entitlement but **no
-root** — an ad-hoc code signature with the entitlement is enough.
+A hardware VM sidesteps it: the guest gets an address space of its own with no
+`__PAGEZERO`. On macOS the userspace API for one is **Hypervisor.framework**,
+which needs the `com.apple.security.hypervisor` entitlement but no root — an
+ad-hoc signature carrying the entitlement is enough. fwe picks this backend
+automatically for an executable it cannot map in-process.
 
-This spike proves the mechanism end to end, before committing to a full
-backend.
+## How it works
 
-## What the spike does
+The code is in `crates/native/src/hv/`.
 
-`fwe --hv-spike` (see `crates/native/src/hv.rs`):
+- **The VM** (`vm.rs`). A 40-bit guest-physical address space. Stage 1 maps
+  it all as identity 32 MiB blocks of normal memory accessible to EL0, so it
+  never faults; what the guest may touch, and how, is decided at stage 2 by
+  which host memory is mapped where, with the guest's protections. The top
+  block holds fwe's page tables and an exception vector, mapped for EL1 only.
+- **Execution.** The guest runs at EL0. Every exception it takes enters the
+  vector, which executes `hvc #0`, so the vCPU stops and the backend reads
+  `ESR_EL1` to see what happened: an `svc` (a Linux system call, unchanged —
+  nothing is rewritten, and `x18` and `TPIDR_EL0` are simply the guest's), a
+  `brk`, an undefined instruction, an alignment fault. An access to memory the
+  guest has not mapped stops the vCPU with a stage-2 abort, which becomes
+  `SIGSEGV`.
+- **Memory.** Guest memory is host memory mapped into the VM. Everything the
+  guest maps itself — stack, break, `mmap`s, the dynamic linker and the
+  libraries it loads — is placed at the same address in the VM as in the
+  host, so guest pointers are host pointers, as in the native backend. Only
+  the executable's image, at the low address the host cannot map, lives
+  elsewhere in the host: that one range is registered with the kernel layer,
+  which translates guest pointers into it wherever it uses them — in its
+  checked copies of guest memory (`crates/kernel/src/uaccess.rs`), in the
+  pointer arguments it hands to host system calls (a table of which arguments
+  are pointers), and in `iovec`s. The kernel's memory system calls tell the
+  backend about every mapping change (`Platform::map_guest` and friends), so
+  the VM's view follows the host's.
+- **The kernel.** System calls go to the same kernel layer as the native
+  backend's, through a `Platform` of the backend's own.
+- **Signals.** As in the native backend, guest dispositions are mirrored onto
+  the host and the vCPU thread runs under the guest's mask. The handler
+  records the signal and stops the vCPU (`hv_vcpus_exit`), and the run loop
+  delivers it — so a signal reaches a guest busy in a loop without system
+  calls too. The framework's own threads are created with every guest signal
+  blocked, so the host never hands one to them.
 
-1. Creates a VM and a vCPU with Hypervisor.framework.
-2. Maps 2 MiB of RAM at guest-physical **`0x400000`** — deliberately in the
-   low region the native backend is denied.
-3. Loads a tiny guest there and runs it at EL1 with the MMU off (so virtual
-   address == physical address).
-4. The guest issues "system calls" — `write(1, msg, len)` then
-   `exit_group(42)` — using `HVC #0` to trap to the VMM.
-5. The VMM services each trap with a host system call (copying the guest's
-   buffer out of VM RAM for `write`) and resumes the guest, then reports what
-   the guest printed and the status it exited with.
+## Status
 
-The point of the spike is only to show that a low-address guest runs and
-traps cleanly.
-
-## From spike to backend
-
-The backend itself is an M2 item on the [roadmap](../ROADMAP.md). What it
-adds over the spike:
-
-- The guest runs at **EL0** under a minimal EL1 exception vector, so Linux's
-  own `svc #0` traps to the VMM as is; no instruction rewriting is needed on
-  this path (and `x18`/`TPIDR_EL0` are the guest's, since no macOS code runs
-  on the vCPU).
-- Guest memory is backed by host mappings the kernel layer reads and
-  writes. Addresses above 4 GiB can be the same in the guest and the host,
-  as the native backend guarantees, but the low range the image needs is
-  exactly what the host process cannot map (the mandatory `__PAGEZERO`), so
-  guest pointers into it are translated to where the host maps it: in the
-  kernel's guest-memory accessors (`crates/kernel/src/uaccess.rs`, the one
-  place it touches guest memory) and for the pointers it passes to host
-  system calls.
-- A `Platform` implementation and a trap loop that feed `Kernel::enter_syscall`
-  with the vCPU's register file, the way the native backend's `SIGTRAP`
-  handler does.
-- The loader picks this backend automatically for an `ET_EXEC` image linked
-  below 4 GiB, which it rejects today.
-
-Its exit criterion is Debian's `python3.11` running from the rootfs.
+Programs linked below 4 GiB run in the VM, static and dynamically linked: the
+assembly test programs, Rust/musl programs, and a non-PIE glibc program
+whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the shape of
+Debian's `python3.11`. Not supported in the VM yet: threads (`clone` of a
+thread), `fork`/`vfork` and `execve`, which fail with `ENOSYS`; these are on
+the [roadmap](../ROADMAP.md).
 
 ## Running it (Apple Silicon, no root)
 
 ```sh
 cargo build --release -p fwe
-codesign --sign - --entitlements hv-spike.entitlements --force \
-    target/release/fwe
-target/release/fwe --hv-spike
+codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
+target/release/fwe ./program-linked-low
 ```
 
-Expected output:
+Without the entitlement, or on a host without hypervisor support, fwe
+explains that the program needs the hypervisor backend and exits with status
+126. `fwe --hv-spike` runs a tiny guest in a VM — a quick check that the
+hypervisor works on a machine: it prints `hv: hello from the guest` and
+reports the status 42 the guest exits with. `sysctl kern.hv_support` must be
+`1`.
 
-```
-hv: hello from the guest
-fwe: hv spike guest exited with status 42
-```
+## Tests and CI
 
-(The process exits with status 42.) Check `sysctl kern.hv_support` returns `1`
-first; if it is `0` the machine has no hypervisor support. Without the
-entitlement, `hv_vm_create` fails and `fwe` reports
-`hv spike failed: hv_vm_create failed: ...` rather than crashing.
-
-## CI: hosted runners can't, a self-hosted runner can
+The end-to-end tests whose names start with `hv_` sign a copy of `fwe` with the
+entitlement and run low-linked programs in the VM. Where the host has no
+hypervisor they report that they were skipped and pass.
 
 GitHub's hosted macOS runners are themselves virtual machines without nested
-virtualization, so HVF is unavailable there. This is measured, not assumed —
-the `macos` jobs run an informational step that reports it:
+virtualization, so Hypervisor.framework is unavailable there. This is
+measured, not assumed — the `macos` jobs run an informational step that
+reports it:
 
 - `macos-15`: `kern.hv_support` OID does not exist.
 - `macos-26`: `kern.hv_support: 0`.
 - Both: `hv_vm_create` returns `0xfae9400f` (`HV_UNSUPPORTED`), even though the
-  binary is correctly codesigned with the entitlement.
+  binary is correctly signed with the entitlement.
 
-So the code is always compiled and lint-checked for `aarch64-apple-darwin` in
-CI (it cannot rot), and the informational step keeps reporting availability in
-case a hosted runner ever gains it — but the spike is actually *run* on a
-**self-hosted Apple Silicon runner**, where `kern.hv_support` is `1`.
+So in hosted CI the backend is compiled and lint-checked (it cannot rot) but
+its tests skip. They run for real on a **self-hosted Apple Silicon runner**,
+in the `hypervisor` job.
 
 ### Registering the self-hosted runner (one time)
 
@@ -104,14 +104,13 @@ kern.hv_support` is `1`, then register it as a repository runner:
 `Settings → Actions → Runners → New self-hosted runner`, choose macOS/ARM64,
 and follow the shown `./config.sh` / `./run.sh` steps. GitHub labels it
 `self-hosted`, `macOS`, `ARM64` automatically. Install a Rust toolchain for
-the runner user (`rustup`), since the job builds with `cargo`.
+the runner user (`rustup`) and the Xcode command line tools (`clang`).
 
 Then set the repository variable that enables the job:
 `Settings → Secrets and variables → Actions → Variables → New variable`,
-name `FWE_HV_SELF_HOSTED`, value `true`. The `hypervisor` job stays skipped
-until this is set, so it never blocks PRs when no runner exists. Once set, the
-job codesigns `fwe` with the entitlement and runs `fwe --hv-spike` on every
-push, asserting the guest prints its message and exits with status 42 — real
-CI coverage of the hypervisor path.
+name `FWE_HV_SELF_HOSTED`, value `true`. The job stays skipped until this is
+set, so it never blocks PRs when no runner exists. Once set, it runs the
+`hv_` end-to-end tests and `fwe --hv-spike` on every push.
 
-Until then, validate by hand with the steps above.
+Until then, the tests run wherever a developer runs `cargo test` on an Apple
+Silicon Mac.

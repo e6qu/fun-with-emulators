@@ -39,7 +39,7 @@ jobs:
       - name: Report hypervisor availability (informational)
         run: |
           echo "kern.hv_support:"; sysctl kern.hv_support 2>&1 || true
-          codesign --sign - --entitlements hv-spike.entitlements --force target/debug/fwe || true
+          codesign --sign - --entitlements hypervisor.entitlements --force target/debug/fwe || true
           if target/debug/fwe --hv-spike; then
             echo "hypervisor: AVAILABLE on this runner"
           else
@@ -55,14 +55,14 @@ jobs:
       - run: cargo test -p fwe-native --test host -- --nocapture
       - run: cargo test
 
-  # Real execution of the Hypervisor.framework spike. GitHub's hosted macOS
-  # runners are VMs without nested virtualization (kern.hv_support = 0), so HVF
-  # cannot run there; this job targets a self-hosted Apple Silicon runner where
-  # it can. It stays skipped until the repository variable FWE_HV_SELF_HOSTED
+  # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs
+  # without nested virtualization (kern.hv_support = 0), so HVF cannot run
+  # there and the hv_ tests skip; this job targets a self-hosted Apple Silicon
+  # runner where it can. It stays skipped until the repository variable FWE_HV_SELF_HOSTED
   # is set to "true" (set it once a runner is registered — see
-  # docs/hypervisor-spike.md), so it never blocks when no such runner exists.
+  # docs/hypervisor.md), so it never blocks when no such runner exists.
   hypervisor:
-    name: Hypervisor spike (self-hosted Apple Silicon)
+    name: Hypervisor backend (self-hosted Apple Silicon)
     if: ${{ vars.FWE_HV_SELF_HOSTED == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
@@ -71,8 +71,15 @@ jobs:
       - run: cargo build --release -p fwe
       - name: Codesign and run the hypervisor spike
         run: |
-          codesign --sign - --entitlements hv-spike.entitlements --force target/release/fwe
+          codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
           out="$(target/release/fwe --hv-spike)"
           echo "$out"
           echo "$out" | grep -qx "hv: hello from the guest"
           echo "$out" | grep -q "guest exited with status 42"
+      - name: Run the hypervisor backend's end-to-end tests
+        run: |
+          out="$(cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
+          echo "$out"
+          # They skip silently where the VM cannot run; here they must not.
+          if echo "$out" | grep -q "skipped: no hypervisor"; then exit 1; fi
+          echo "$out" | grep -q "test result: ok"
