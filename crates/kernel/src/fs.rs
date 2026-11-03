@@ -92,6 +92,41 @@ pub struct Fs {
 }
 
 impl Fs {
+    /// Write the filesystem view into a fork snapshot. The root directory
+    /// descriptor is inherited, so its number is enough.
+    pub(crate) fn save(&self, e: &mut crate::snapshot::Enc) {
+        use std::os::fd::AsRawFd;
+        e.i32(self.root.as_raw_fd());
+        e.bytes(&self.cwd);
+        e.bytes(&self.root_host);
+        e.u32(self.umask);
+        e.bytes(&self.proc.exe);
+        e.bytes(&self.proc.cmdline);
+        e.u32(self.proc.ncpu);
+        e.bytes(&self.proc.hostname);
+    }
+
+    /// The filesystem view [`Fs::save`] wrote, in a fork child.
+    pub(crate) fn restore(d: &mut crate::snapshot::Dec) -> Fs {
+        use std::os::fd::FromRawFd;
+        let fd = d.i32();
+        // SAFETY: the parent's root descriptor, inherited at the same number
+        // and owned by nothing else in this process.
+        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        Fs {
+            root,
+            cwd: d.bytes(),
+            root_host: d.bytes(),
+            umask: d.u32(),
+            proc: crate::procfs::ProcInfo {
+                exe: d.bytes(),
+                cmdline: d.bytes(),
+                ncpu: d.u32(),
+                hostname: d.bytes(),
+            },
+        }
+    }
+
     /// Open `path` as the rootfs, or the host `/` when `path` is `None`.
     pub fn new(path: Option<&[u8]>) -> Result<Fs, i32> {
         let path = cstr(path.unwrap_or(b"/"))?;

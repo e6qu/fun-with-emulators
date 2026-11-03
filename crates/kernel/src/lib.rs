@@ -23,6 +23,7 @@ pub mod procfs;
 pub mod pty;
 pub mod signal;
 pub mod signalfd;
+pub mod snapshot;
 pub mod specialfd;
 pub mod synthdir;
 mod syscalls;
@@ -112,9 +113,14 @@ pub trait Platform {
         None
     }
 
-    /// The guest unmapped `[addr, addr + len)` for good (`munmap`, a
-    /// shrinking `mremap`), so its address space may be reused.
-    fn released_guest(&mut self, _addr: u64, _len: u64) {}
+    /// Give host memory `[addr, addr + len)` of the guest back (`munmap`, a
+    /// shrinking `mremap`, a failed `mmap`). A backend that keeps guest
+    /// memory in a range of its own turns it back into reserved space there
+    /// in one step, so the host never reuses it, and returns true; with
+    /// false the kernel unmaps it.
+    fn release_host(&mut self, _addr: u64, _len: u64) -> bool {
+        false
+    }
 
     /// Set how the host treats Linux signal `sig` (one with a host
     /// equivalent; see [`signal::relayed`]) so that signals sent to this
@@ -168,6 +174,110 @@ impl<P: Platform> Kernel<P> {
             sigactions: [Sigaction::default(); absig::NSIG as usize],
             sigreturn_tramp: 0,
         }
+    }
+
+    /// Write everything a `fork` child started as a fresh process needs to
+    /// continue as this process's copy: the kernel's fields, the calling
+    /// thread's signal mask and alternate stack, the descriptor registries
+    /// and the guest's address-space bookkeeping. The caller holds the
+    /// kernel lock; each registry is read under its own.
+    pub fn save_for_fork(&self, e: &mut snapshot::Enc) {
+        e.u64(self.page_size);
+        e.u64(self.brk.start);
+        e.u64(self.brk.current);
+        e.u64(self.brk.limit);
+        e.bool(self.tracer.enabled);
+        match &self.fs {
+            Some(fs) => {
+                e.bool(true);
+                fs.save(e);
+            }
+            None => e.bool(false),
+        }
+        let c = &self.creds;
+        for v in [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid] {
+            e.u32(v);
+        }
+        e.u64(c.groups.len() as u64);
+        for &g in &c.groups {
+            e.u32(g);
+        }
+        for a in &self.sigactions {
+            for v in [a.handler, a.flags, a.restorer, a.mask] {
+                e.u64(v);
+            }
+        }
+        e.u64(self.sigreturn_tramp);
+        e.u64(thread::mask());
+        let ss = thread::altstack();
+        e.u64(ss.ss_sp);
+        e.i32(ss.ss_flags);
+        e.u64(ss.ss_size);
+        let (guest, len, host) = uaccess::translation();
+        for v in [guest, len, host] {
+            e.u64(v);
+        }
+        e.map(&mm::guest_ranges());
+        fdtable::save(e);
+        specialfd::save(e);
+        signalfd::save(e);
+        synthdir::save(e);
+        pty::save(e);
+        epoll::save(e);
+    }
+
+    /// The kernel [`Kernel::save_for_fork`] described, in the fork child,
+    /// which has inherited the parent's descriptors and mapped its memory.
+    /// The calling thread takes the parent thread's signal state, and the
+    /// guest's signal dispositions are applied to the host.
+    pub fn restore_for_fork(platform: P, d: &mut snapshot::Dec) -> Kernel<P> {
+        let page_size = d.u64();
+        let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
+        let tracer = Tracer { enabled: d.bool() };
+        let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
+        let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
+        let c = &mut k.creds;
+        for v in [
+            &mut c.uid,
+            &mut c.euid,
+            &mut c.suid,
+            &mut c.fsuid,
+            &mut c.gid,
+            &mut c.egid,
+            &mut c.sgid,
+            &mut c.fsgid,
+        ] {
+            *v = d.u32();
+        }
+        let n = d.count(4);
+        c.groups = (0..n).map(|_| d.u32()).collect();
+        for a in &mut k.sigactions {
+            *a = Sigaction { handler: d.u64(), flags: d.u64(), restorer: d.u64(), mask: d.u64() };
+        }
+        k.sigreturn_tramp = d.u64();
+        thread::set_mask(d.u64());
+        thread::set_altstack(Stack {
+            ss_sp: d.u64(),
+            ss_flags: d.i32(),
+            _pad: 0,
+            ss_size: d.u64(),
+        });
+        let (guest, len, host) = (d.u64(), d.u64(), d.u64());
+        if len != 0 {
+            uaccess::set_translation(guest, len, host);
+        }
+        mm::set_guest_ranges(d.map());
+        fdtable::restore(d);
+        specialfd::restore(d);
+        signalfd::restore(d);
+        synthdir::restore(d);
+        pty::restore(d);
+        epoll::restore(d);
+        if let Some(fs) = &k.fs {
+            net::set_rootfs(fs.root_host_path());
+        }
+        k.sync_all_host_signals();
+        k
     }
 
     /// Point the kernel at the guest `rt_sigreturn` trampoline (a few
@@ -363,6 +473,24 @@ pub fn fork_locked() -> libc::pid_t {
             })
         })
     })
+}
+
+/// The kqueues behind the guest's `epoll` and `timerfd` descriptors, which
+/// the host does not pass on to a child (their descriptors are closed
+/// there), recorded before a host `fork` for [`restore_kqueues`].
+pub fn kqueue_state() -> Vec<u8> {
+    let mut e = snapshot::Enc::new();
+    specialfd::save(&mut e);
+    epoll::save(&mut e);
+    e.into_bytes()
+}
+
+/// In the child of a host `fork`: rebuild the kqueues [`kqueue_state`]
+/// recorded.
+pub fn restore_kqueues(state: &[u8]) {
+    let mut d = snapshot::Dec::new(state);
+    specialfd::restore(&mut d);
+    epoll::restore(&mut d);
 }
 
 /// Wake up to `count` waiters on the futex word at `addr`.

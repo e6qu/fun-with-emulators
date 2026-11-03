@@ -56,6 +56,12 @@ fn mappings() -> std::sync::MutexGuard<'static, BTreeMap<u64, (u64, u64, u64)>> 
     MAPPINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every guest mapping as `(guest, len, Linux prot, host)`, for a fork child
+/// to map again in its own VM.
+pub fn mapping_list() -> Vec<(u64, u64, u64, u64)> {
+    mappings().iter().map(|(&s, &(e, prot, host))| (s, e - s, prot, host)).collect()
+}
+
 /// Host address of fwe's tables and vectors, once built.
 static SYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -69,7 +75,13 @@ fn create_vm(sys: *mut libc::c_void) -> Result<(), String> {
     }
     let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
     // SAFETY: mapping the tables and vectors at the top of the IPA space.
-    check(unsafe { hv_vm_map(sys, SYS_BASE, SYS_SIZE as usize, flags) }, "hv_vm_map")
+    let mapped = check(unsafe { hv_vm_map(sys, SYS_BASE, SYS_SIZE as usize, flags) }, "hv_vm_map");
+    if mapped.is_err() {
+        // No VM is left behind on failure: it has no vCPU yet.
+        // SAFETY: destroying the VM just created.
+        unsafe { hv_vm_destroy() };
+    }
+    mapped
 }
 
 /// Create the VM and its shared structures. Called once per process.

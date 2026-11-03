@@ -43,6 +43,31 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Write the registry into a fork snapshot.
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    with(|m| {
+        crate::snapshot::fd_map(e, m, |e, s| {
+            e.i32(s.rfd);
+            e.i32(s.wfd);
+            e.u64(s.mask);
+            e.bool(s.nonblock);
+            crate::snapshot::queue(e, &s.queue);
+        })
+    })
+}
+
+/// Rebuild the registry in a fork child (its pipes are inherited).
+pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
+    let reg = crate::snapshot::read_fd_map(d, |d| SignalFd {
+        rfd: d.i32(),
+        wfd: d.i32(),
+        mask: d.u64(),
+        nonblock: d.bool(),
+        queue: crate::snapshot::read_queue(d),
+    });
+    with(|m| *m = reg);
+}
+
 /// Whether `fd` is a signalfd.
 pub fn is_signalfd(fd: i32) -> bool {
     with(|m| m.contains_key(&fd))

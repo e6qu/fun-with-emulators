@@ -17,13 +17,17 @@
 //! translated wherever the kernel or a host call uses them.
 //!
 //! Each guest thread runs on a vCPU of its own; `execve` re-executes fwe.
-//! A VM process never forks and never ends or execs with its VM alive (see
-//! `docs/hypervisor.md`): `fork` and `vfork` fail with `ENOSYS`.
+//! A VM process never forks on the host and never ends or execs with its VM
+//! alive (see `docs/hypervisor.md`): a guest `fork` or `vfork` starts a
+//! fresh fwe process that takes the parent's memory copy-on-write (see
+//! [`fork`]).
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod backend;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod fork;
 pub mod spike;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vm;
@@ -32,4 +36,14 @@ mod window;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use backend::run;
+/// The child side of a `fork` in the VM (`fwe --hv-fork-child`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use fork::child as fork_child;
+
+/// The child side of a `fork` in the VM; there is no VM on this host.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn fork_child() -> ! {
+    eprintln!("fwe: --hv-fork-child needs the hypervisor backend");
+    std::process::exit(2)
+}
 pub use spike::{Spike, spike};

@@ -217,6 +217,88 @@ pub const WAKE_SIGNAL: libc::c_int = libc::SIGEMT;
 #[cfg(not(target_os = "macos"))]
 pub const WAKE_SIGNAL: libc::c_int = libc::SIGPWR;
 
+/// What a guest's `SIGKILL` to an fwe process is sent as. `SIGKILL` itself
+/// cannot be caught, and a hypervisor-backend process must never die with
+/// its VM alive, so fwe processes are sent this instead (a host signal with
+/// no Linux counterpart): a VM process takes it as the guest's `SIGKILL`,
+/// tearing its VM down before it dies of `SIGKILL`, and a native one
+/// simply dies of `SIGKILL`. Other processes get the real `SIGKILL`.
+#[cfg(target_os = "macos")]
+pub const KILL_RELAY: libc::c_int = libc::SIGINFO;
+
+/// The executable of process `pid`, if it can be read.
+#[cfg(target_os = "macos")]
+fn exe_of(pid: libc::pid_t) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: a buffer of the size given.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| {
+        buf.truncate(n as usize);
+        buf
+    })
+}
+
+/// The pids of a process group (`pgid` > 0) or, for 0, of every process.
+#[cfg(target_os = "macos")]
+fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
+    // <sys/proc_info.h>: PROC_ALL_PIDS, PROC_PGRP_ONLY.
+    let (kind, arg): (u32, u32) = if pgid > 0 { (2, pgid as u32) } else { (1, 0) };
+    // SAFETY: sizing, then filling, a buffer of pids.
+    unsafe {
+        let n = libc::proc_listpids(kind, arg, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return Vec::new();
+        }
+        let mut pids = vec![0 as libc::pid_t; n as usize / size_of::<libc::pid_t>() + 64];
+        let n = libc::proc_listpids(
+            kind,
+            arg,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * size_of::<libc::pid_t>()) as i32,
+        );
+        pids.truncate(n.max(0) as usize / size_of::<libc::pid_t>());
+        pids.retain(|&p| p > 0);
+        pids
+    }
+}
+
+/// `kill(pid, sig)` for a host signal and a `kill`-style `pid` (a process,
+/// 0 for the caller's group, `-pgid`, or -1 for every process but the
+/// caller and init). A `SIGKILL` reaches fwe processes as [`KILL_RELAY`].
+/// Returns 0 or a negated Linux errno.
+pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
+    #[cfg(target_os = "macos")]
+    if sig == libc::SIGKILL {
+        // SAFETY: plain host calls.
+        let (me, group) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        let mut targets = match pid {
+            p if p > 0 => vec![p],
+            0 => pids_of(group),
+            -1 => pids_of(0).into_iter().filter(|&p| p != me && p != 1).collect(),
+            p => pids_of(-p),
+        };
+        if targets.is_empty() {
+            return fwe_abi::err(fwe_abi::errno::ESRCH);
+        }
+        // This process last: it may be among them.
+        targets.sort_by_key(|&p| p == me);
+        let fwe = exe_of(me);
+        let mut result = fwe_abi::err(fwe_abi::errno::ESRCH);
+        for t in targets {
+            let s = if fwe.is_some() && exe_of(t) == fwe { KILL_RELAY } else { libc::SIGKILL };
+            // SAFETY: plain host call.
+            if unsafe { libc::kill(t, s) } == 0 {
+                result = 0;
+            } else if result != 0 {
+                result = last_error();
+            }
+        }
+        return result;
+    }
+    // SAFETY: plain host call.
+    ret(unsafe { libc::kill(pid, sig) })
+}
+
 pub fn empty_sigset() -> libc::sigset_t {
     // SAFETY: an all-zero sigset_t is valid storage; sigemptyset initializes it.
     unsafe {

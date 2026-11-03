@@ -23,7 +23,12 @@ options:
 ";
 
 fn main() -> ExitCode {
+    fwe_native::install_kill_relay();
     fwe_native::remember_exe();
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--hv-fork-child") {
+        // A fork child of a VM process (see hv::fork); not for direct use.
+        fwe_native::hv::fork_child();
+    }
     let mut args = std::env::args_os().skip(1).peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {

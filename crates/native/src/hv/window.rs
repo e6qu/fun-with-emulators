@@ -5,11 +5,12 @@
 //! memory cannot be wherever the host's allocator happens to put it: the
 //! child's own heap, `dyld` and stacks land unpredictably. Instead fwe
 //! reserves one large window at startup, inaccessible and backed by nothing,
-//! and places every guest mapping inside it — the image's host copy, the
-//! stack, the break, the trampoline and each `mmap` the kernel makes for the
-//! guest. A child reserves the same window first thing, before anything else
-//! could land there. Unmapped guest memory goes back to the reservation, so
-//! the host never reuses it.
+//! and places guest memory inside it — the image's host copy, the stack, the
+//! break, the trampoline and each `mmap` the guest does not place itself. A
+//! child reserves the same window first thing, before anything else could
+//! land there. Unmapped guest memory goes back to the reservation in one
+//! step, so the host never reuses it. A guest's `MAP_FIXED` mapping at an
+//! address outside the window works, but a process holding one cannot fork.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -63,6 +64,16 @@ pub fn reserve() -> Result<(), String> {
     Ok(())
 }
 
+/// The ranges in use, `start -> end`: all of the guest's memory.
+pub fn used_ranges() -> BTreeMap<u64, u64> {
+    used().clone()
+}
+
+/// Take the parent's ranges, in a fork child that has mapped them.
+pub fn set_used(ranges: BTreeMap<u64, u64>) {
+    *used() = ranges;
+}
+
 /// A free page-aligned range of `len` bytes in the window, now marked used.
 pub fn alloc(len: u64) -> Option<u64> {
     let len = len.div_ceil(PAGE) * PAGE;
@@ -99,13 +110,17 @@ pub fn mark_used(addr: u64, len: u64) {
     u.insert(s, e);
 }
 
-/// Give `[addr, addr + len)` back: it becomes reserved space again.
-pub fn release(addr: u64, len: u64) {
-    let (lo, hi) = (addr.max(LO), (addr + len).min(HI));
-    if lo >= hi {
-        return;
+/// Give `[addr, addr + len)` back: it becomes reserved space again, in one
+/// step that replaces whatever was mapped there. False, doing nothing, for
+/// a range not inside the window.
+pub fn release(addr: u64, len: u64) -> bool {
+    if addr < LO || addr.saturating_add(len) > HI || len == 0 {
+        return false;
     }
-    reserve_range(lo, hi - lo);
+    let (lo, hi) = (addr, addr + len);
+    if !reserve_range(lo, hi - lo) {
+        return false;
+    }
     let mut u = used();
     let hit: Vec<(u64, u64)> =
         u.range(..hi).rev().take_while(|&(_, &x)| x > lo).map(|(&a, &b)| (a, b)).collect();
@@ -118,4 +133,5 @@ pub fn release(addr: u64, len: u64) {
             u.insert(hi, b);
         }
     }
+    true
 }

@@ -113,9 +113,10 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
         done = [fwe_kernel::fdtable::reserve(done[0]), fwe_kernel::fdtable::reserve(done[1])];
     }
 
-    let pid = {
+    let (pid, kqueues) = {
         let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
-        fwe_kernel::fork_locked()
+        let kqueues = fwe_kernel::kqueue_state();
+        (fwe_kernel::fork_locked(), kqueues)
     };
     if pid < 0 {
         let e = fwe_kernel::host::last_error();
@@ -144,6 +145,7 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
             VFORK_DONE.store(-1, Ordering::SeqCst);
         }
         thread::init_main(host::getpid() as i32);
+        fwe_kernel::restore_kqueues(&kqueues);
         LIVE_THREADS.store(1, Ordering::SeqCst);
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
             // Best effort, as for Linux's own write of the word.

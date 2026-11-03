@@ -31,6 +31,30 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Write the registry into a fork snapshot.
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    with(|m| {
+        crate::snapshot::fd_map(e, m, |e, dir| {
+            e.u64(dir.entries.len() as u64);
+            for (name, t) in &dir.entries {
+                e.bytes(name);
+                e.u8(*t);
+            }
+            e.u64(dir.offset as u64);
+        })
+    })
+}
+
+/// Rebuild the registry in a fork child.
+pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
+    let reg = crate::snapshot::read_fd_map(d, |d| {
+        let n = d.count(9);
+        let entries = (0..n).map(|_| (d.bytes(), d.u8())).collect();
+        Dir { entries, offset: d.u64() as usize }
+    });
+    with(|m| *m = reg);
+}
+
 /// Open a synthetic directory with the given entries, returning a guest fd.
 pub fn open(entries: Vec<(Vec<u8>, u8)>) -> i64 {
     // Reserve a real, unique descriptor number backed by /dev/null.
