@@ -15,8 +15,9 @@ a Linux rootfs, networking, terminals, event descriptors and a synthetic
 A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
 `python3.11`, static Go) cannot be mapped in-process; fwe runs it in a
 Hypervisor.framework VM instead, which needs `fwe` signed with the
-hypervisor entitlement ([docs/hypervisor.md](docs/hypervisor.md)). In the
-VM, threads, `fork` and `execve` are not supported yet. See [ROADMAP.md](ROADMAP.md) for milestones and status,
+hypervisor entitlement ([docs/hypervisor.md](docs/hypervisor.md)); threads,
+`fork` and `execve` work there as they do in-process. See
+[ROADMAP.md](ROADMAP.md) for milestones and status,
 [PLAN.md](PLAN.md) for the goal and scope, and
 [docs/architecture.md](docs/architecture.md) for how it works and what is
 still missing.

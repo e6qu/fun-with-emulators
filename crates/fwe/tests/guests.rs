@@ -1101,6 +1101,23 @@ fn fork_from_a_threaded_process() {
     assert_eq!(signals("threaded-fork"), "child of a threaded parent\nexited 5\n");
 }
 
+/// A fork child sees the parent's memory as it was at the fork, and neither
+/// side sees the other's later private writes; shared memory stays shared.
+/// It can use the `epoll` and `timerfd` descriptors it inherited, which on
+/// macOS are kqueues that a child does not inherit and fwe rebuilds.
+#[test]
+fn fork_copies_memory_and_keeps_descriptors() {
+    assert_eq!(
+        signals("fork-cow"),
+        "child sees the fork-time memory: true\nparent's later writes unseen: true\n\
+         child's writes unseen: true\nshared memory shared: true\nexited 0\n"
+    );
+    assert_eq!(
+        signals("fork-epoll"),
+        "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"
+    );
+}
+
 /// `waitid` reports an exit and a kill as `siginfo`.
 #[test]
 fn waitid_reports_exit_and_kill() {
@@ -1497,15 +1514,42 @@ fn hv_execve_between_backends() {
     assert_eq!(stdout(&out), "hello from linux\nstatus=0 cwd=/lib\n");
 }
 
-/// A host `fork` of a process with a VM is refused (`ENOSYS`): the child
-/// could not own the VM, and a VM process must never be torn down
-/// abnormally (see docs/hypervisor.md).
+/// `fork` and `vfork` in the VM: the child is a fresh fwe process with a VM
+/// of its own, given the parent's memory copy-on-write and its state. The
+/// fork scenarios the native backend passes pass here too: fork and wait,
+/// signals between parent and child, a fork from a threaded process,
+/// resource usage, `posix_spawn` and `vfork` with `execve`, copy-on-write
+/// isolation, a snapshot taken at one instant while another thread writes,
+/// inherited `epoll` and `timerfd` descriptors, and `waitid`, whose child the
+/// guest ends with `SIGKILL` (relayed, so the child's VM is torn down before
+/// it dies; see docs/hypervisor.md).
 #[test]
-fn hv_fork_is_refused() {
+fn hv_fork_and_vfork() {
     let Some(out) = fwe_hv(&asm_guest("forktest-low"), &[]) else { return };
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("clone(")
-            && String::from_utf8_lossy(&out.stderr).contains("ENOSYS")
-    );
+    assert_eq!(out.status.code(), Some(7));
+    for (scenario, want) in [
+        ("kill-child", "killed by 15\n"),
+        ("notify-parent", "SIGUSR1 from child: true\nexited 0\n"),
+        ("sigchld", "SIGCHLD from child: true, status 3\nexited 3\n"),
+        ("threaded-fork", "child of a threaded parent\nexited 5\n"),
+        (
+            "rusage",
+            "child used cpu: true\nchild maxrss plausible: true\nown maxrss plausible: true\n",
+        ),
+        ("spawn", "child said: hello from the spawned child\nchild exit status: 0\n"),
+        ("spawn-status", "hello from the spawned child\nchild exit status: 0\n"),
+        ("vfork-exec", "hello from the spawned child\nexited 0\n"),
+        (
+            "fork-cow",
+            "child sees the fork-time memory: true\nparent's later writes unseen: true\n\
+             child's writes unseen: true\nshared memory shared: true\nexited 0\n",
+        ),
+        ("fork-epoll", "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"),
+        ("fork-snapshot", "consistent snapshots: 8 of 8\n"),
+        ("waitid", "exited: true, status 6, pid matches: true\nkilled: true, signal 9\n"),
+    ] {
+        let out = fwe_hv(&rust_low_guest("signals"), &[scenario]).unwrap();
+        assert_eq!(stdout(&out), want, "{scenario}");
+        assert_eq!(out.status.code(), Some(0), "{scenario}");
+    }
 }

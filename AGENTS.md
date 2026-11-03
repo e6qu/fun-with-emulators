@@ -82,6 +82,7 @@ in the code consistent with what the code now does.
   license recorded in that directory's README.
 - Treat implementation problems as things to solve, not as blockers.
 - A process running a Hypervisor.framework VM must never end, exec or fork
-  with the VM alive, and tests run one VM process at a time: abnormal VM
-  teardown took the development machine down twice (see
+  with the VM alive, and the VM tests run one at a time, never in parallel
+  (a forking guest's parent and child each have a VM): abnormal VM teardown
+  took the development machine down twice (see
   [docs/hypervisor.md](docs/hypervisor.md)).
