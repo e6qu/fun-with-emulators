@@ -110,9 +110,10 @@ Remaining:
 - [ ] The rest of the process model: `execve` from a process with other
   live threads, `execveat`, `clone3`; `vfork` sharing memory with its
   parent rather than copying it
-- [ ] The remaining `x18` forms (`sp`-writeback and `sp`-register-offset
-  loads and stores, `sp`-operand arithmetic, `casp`, pointer-authenticated
-  loads) and code discovery for binaries without section headers
+- [ ] Code discovery for binaries without section headers, and the `x18`
+  forms no tested binary uses yet (`sp`-writeback and `sp`-register-offset
+  loads and stores, flag-setting or extended `sp` arithmetic, `casp`,
+  pointer-authenticated loads), when a target program needs them
 - [ ] Each of the target programs vendored or fetched as a test with checked
   output: git, a C compiler, Node, Go, the Rust toolchain, `apt`, a database,
   a web server
