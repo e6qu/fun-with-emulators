@@ -114,6 +114,117 @@ pub struct Options {
     pub strace: bool,
     /// Root filesystem directory; the host `/` when `None`.
     pub root: Option<std::path::PathBuf>,
+    /// The program path is a guest path, resolved in the root filesystem
+    /// (as when fwe re-executes itself for a guest `execve`).
+    pub guest_path: bool,
+    /// The guest's initial working directory.
+    pub cwd: Option<Vec<u8>>,
+    /// The guest's `argv[0]`, when not the program path.
+    pub argv0: Option<OsString>,
+}
+
+/// Open the guest's root filesystem with its working directory.
+fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
+    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
+    let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
+        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
+    })?;
+    if let Some(cwd) = &options.cwd {
+        fs.chdir(fwe_abi::fcntl::AT_FDCWD as i32, cwd).map_err(|e| {
+            Error::Unsupported(format!("entering {}: errno {e}", String::from_utf8_lossy(cwd)))
+        })?;
+    }
+    Ok(fs)
+}
+
+/// The program's bytes: a host path, or a guest path in the rootfs.
+fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<Vec<u8>, Error> {
+    if options.guest_path {
+        fs.read(path.as_os_str().as_bytes())
+            .map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+    } else {
+        std::fs::read(path).map_err(Error::Read)
+    }
+}
+
+/// The guest's arguments, with `argv[0]` replaced if asked.
+fn guest_args(args: &[OsString], options: &Options) -> Vec<OsString> {
+    let mut a = args.to_vec();
+    if let (Some(first), Some(argv0)) = (a.first_mut(), &options.argv0) {
+        *first = argv0.clone();
+    }
+    a
+}
+
+/// This `fwe` executable, for re-executing it (see [`reexec`]).
+static FWE_EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Remember where this `fwe` executable is. Called at startup, before the
+/// working directory could matter.
+pub fn remember_exe() {
+    if let Ok(p) = std::env::current_exe() {
+        let _ = FWE_EXE.set(p);
+    }
+}
+
+/// `execve` by re-executing fwe on the new program: the new process image is
+/// a fresh fwe, which picks the backend the program needs — the native one,
+/// or the VM for a program linked below 4 GiB — so either backend can exec
+/// a program of the other kind. What Linux keeps across `execve` the host
+/// keeps across its own: the pid, descriptors not marked close-on-exec (the
+/// guest's flag is the host's), the signal mask, pending signals and ignored
+/// dispositions; the root filesystem, working directory and `--strace` are
+/// passed on. Other threads end, as on Linux. Returns a Linux errno only if
+/// the program cannot be run; on success it does not return.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn reexec(
+    path: &[u8],
+    args: &[Vec<u8>],
+    env: &[Vec<u8>],
+    fs: &fwe_kernel::Fs,
+    strace: bool,
+    before_exec: impl FnOnce(),
+) -> i64 {
+    use fwe_abi::{err, errno};
+    use std::ffi::CString;
+    let file = match fs.read(path) {
+        Ok(f) => f,
+        Err(e) => return err(e),
+    };
+    if Elf::parse(&file).is_err() {
+        return err(errno::ENOEXEC);
+    }
+    let Some(fwe) = FWE_EXE.get() else { return err(errno::ENOEXEC) };
+    let mut argv: Vec<Vec<u8>> =
+        vec![fwe.as_os_str().as_bytes().to_vec(), b"--guest-path".to_vec()];
+    if strace {
+        argv.push(b"--strace".to_vec());
+    }
+    if let Some(root) = fs.root_host_path() {
+        argv.push(b"--root".to_vec());
+        argv.push(root.as_os_str().as_bytes().to_vec());
+    }
+    argv.push(b"--cwd".to_vec());
+    argv.push(fs.cwd().to_vec());
+    if let Some(a0) = args.first() {
+        argv.push(b"--argv0".to_vec());
+        argv.push(a0.clone());
+    }
+    argv.push(b"--".to_vec());
+    argv.push(path.to_vec());
+    argv.extend(args.iter().skip(1).cloned());
+    let cargs: Result<Vec<CString>, _> = argv.into_iter().map(CString::new).collect();
+    let cenv: Result<Vec<CString>, _> = env.iter().cloned().map(CString::new).collect();
+    let (Ok(cargs), Ok(cenv)) = (cargs, cenv) else { return err(errno::EINVAL) };
+    let mut pargs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
+    pargs.push(std::ptr::null());
+    let mut penv: Vec<*const libc::c_char> = cenv.iter().map(|c| c.as_ptr()).collect();
+    penv.push(std::ptr::null());
+    before_exec();
+    // SAFETY: NUL-terminated argument and environment arrays of C strings
+    // that live across the call.
+    unsafe { libc::execve(pargs[0], pargs.as_ptr(), penv.as_ptr()) };
+    fwe_kernel::host::last_error()
 }
 
 #[derive(Debug)]
@@ -467,6 +578,15 @@ pub struct Loadout {
     pub brk: Brk,
 }
 
+/// Whether `file` is a program only the hypervisor backend can run: a non-PIE
+/// executable linked into the low 4 GiB.
+pub fn needs_vm(file: &[u8]) -> bool {
+    Elf::parse(file).is_ok_and(|elf| {
+        !elf.is_pie()
+            && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
+    })
+}
+
 /// Check that `file` is a program [`load_image`] can start, before `execve`
 /// discards the old one: an arm64 ELF executable that fits the host's
 /// address space, whose dynamic linker (if any) exists and is
@@ -627,16 +747,15 @@ fn start(
             "the native backend runs only on macOS on Apple Silicon".into(),
         ));
     }
-    let data = std::fs::read(path).map_err(Error::Read)?;
+    // fwe's own descriptors go above the guest's range from here on.
+    fwe_kernel::fdtable::init();
+    let args = &guest_args(args, options);
+    let data = read_program(path, options, &open_fs(options)?)?;
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Ok(elf) = Elf::parse(&data) {
-        if !elf.is_pie()
-            && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
-        {
-            return Err(hv::run(path, &data, args, env, options));
-        }
+    if needs_vm(&data) {
+        return Err(hv::run(path, &data, args, env, options));
     }
 
     let page = page_size();
@@ -648,13 +767,8 @@ fn start(
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
 
-    // fwe's own descriptors go above the guest's range from here on.
-    fwe_kernel::fdtable::init();
     // The root filesystem; also used to find the dynamic linker.
-    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-    let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
-        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
-    })?;
+    let mut fs = open_fs(options)?;
 
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
@@ -688,6 +802,9 @@ fn start(
 /// `/proc/self/exe`: the host path, made relative to the root filesystem when
 /// the program lies inside it.
 fn guest_exe_path(path: &Path, options: &Options) -> Vec<u8> {
+    if options.guest_path {
+        return path.as_os_str().as_bytes().to_vec();
+    }
     let Ok(host) = std::fs::canonicalize(path) else {
         return path.as_os_str().as_bytes().to_vec();
     };

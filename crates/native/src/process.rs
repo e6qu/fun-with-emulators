@@ -18,8 +18,9 @@ use std::sync::atomic::Ordering;
 /// mapping is tracked, see `fwe_kernel::mm::track`) and the new one loaded
 /// in its place, so a program can exec one linked at the same addresses —
 /// itself, for instance. A failure after that point is fatal, as on Linux.
-/// Descriptors marked close-on-exec are closed. `execve` in a process with
-/// other live threads is not supported yet.
+/// Descriptors marked close-on-exec are closed. A program only the VM can
+/// run, or an `execve` from a process with other live threads, re-executes
+/// fwe instead ([`crate::reexec`]).
 pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     use fwe_kernel::uaccess;
     // Linux's limit on one argument or environment string.
@@ -37,6 +38,11 @@ pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     let fs = k.fs.as_ref().expect("filesystem configured");
 
     let file = fs.read(&path).map_err(err)?;
+    // A program only the VM can run, or an exec from a process with other
+    // threads (which must end): replace this process with a fresh fwe.
+    if crate::needs_vm(&file) || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
+        return Err(crate::reexec(&path, &args, &env, fs, strace, || {}));
+    }
     // The old image is untouched on failure, so the guest can handle it.
     crate::check_image(&file, fs).map_err(err)?;
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();

@@ -45,6 +45,7 @@ pub const HV_SYS_REG_FAR_EL1: hv_sys_reg_t = 0xc300;
 pub const HV_SYS_REG_MAIR_EL1: hv_sys_reg_t = 0xc510;
 pub const HV_SYS_REG_VBAR_EL1: hv_sys_reg_t = 0xc600;
 pub const HV_SYS_REG_CNTKCTL_EL1: hv_sys_reg_t = 0xc708;
+pub const HV_SYS_REG_TPIDR_EL0: hv_sys_reg_t = 0xde82;
 
 pub const HV_MEMORY_READ: u64 = 1;
 pub const HV_MEMORY_WRITE: u64 = 2;
@@ -55,6 +56,7 @@ unsafe extern "C" {
     pub fn hv_vm_config_create() -> hv_vm_config_t;
     pub fn hv_vm_config_set_ipa_size(config: hv_vm_config_t, ipa_bit_length: u32) -> hv_return_t;
     pub fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t;
+    pub fn hv_vm_destroy() -> hv_return_t;
     pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t;
     pub fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t;
     pub fn hv_vcpu_create(
@@ -63,6 +65,7 @@ unsafe extern "C" {
         config: *mut c_void,
     ) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
+    pub fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
     pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t;
     pub fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t;
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;

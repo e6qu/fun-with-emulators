@@ -23,6 +23,7 @@ options:
 ";
 
 fn main() -> ExitCode {
+    fwe_native::remember_exe();
     let mut args = std::env::args_os().skip(1).peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {
@@ -36,6 +37,21 @@ fn main() -> ExitCode {
                         eprintln!("fwe: --root needs a directory\n{USAGE}");
                         return ExitCode::from(2);
                     }
+                }
+                continue;
+            }
+            // Used when fwe re-executes itself for a guest execve.
+            b"--guest-path" => options.guest_path = true,
+            b"--cwd" | b"--argv0" => {
+                let flag = args.next().unwrap();
+                let Some(value) = args.next() else {
+                    eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
+                    return ExitCode::from(2);
+                };
+                if flag == "--cwd" {
+                    options.cwd = Some(value.as_bytes().to_vec());
+                } else {
+                    options.argv0 = Some(value);
                 }
                 continue;
             }
