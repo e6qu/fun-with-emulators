@@ -461,6 +461,9 @@ fn fault_signal(host: libc::c_int) -> u64 {
     }
 }
 
+/// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
+const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
+
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // A process that sends itself one of these signals has it emulated (see
     // `Kernel::sys_kill`), so here it is a fault, or the rare signal sent by
@@ -468,6 +471,13 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if !IN_GUEST.with(Cell::get) {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        let addr = unsafe { (*info).si_addr() } as u64;
+        if fwe_kernel::mm::write_exec_writable(addr, crate::page_size()) {
+            // fwe writing for the guest into a page of its writable and
+            // executable memory that was last executed: retry the write.
+            return;
+        }
         if let Some(resume) = fwe_kernel::uaccess::fixup(ss.pc) {
             // A guest pointer the kernel was copying through was bad: the
             // copy reports EFAULT.
@@ -484,6 +494,32 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let addr = unsafe { (*info).si_addr() } as u64;
+
+    // `mrs <Xt>, ctr_el0`, which Linux lets user space run and macOS traps:
+    // the value is emulated.
+    // SAFETY: the guest was executing at `pc`, so it is mapped.
+    if let Some(word) = unsafe { insn(mc.ss.pc) }
+        .filter(|&w| sig == libc::SIGILL && crate::hwcap::is_mrs_ctr_el0(w))
+    {
+        let mut regs = regs_from(mc);
+        let rt = (word & 31) as usize;
+        if rt != 31 {
+            regs.x[rt] = crate::hwcap::CTR_EL0;
+        }
+        regs.pc += 4;
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
+        return;
+    }
+
+    // Memory the guest mapped writable and executable: the page becomes
+    // what this access needs, and the access is retried.
+    let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
+    if kernel().as_mut().is_some_and(|k| k.write_exec_fault(addr, exec)) {
+        return;
+    }
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);

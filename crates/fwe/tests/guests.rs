@@ -1105,6 +1105,18 @@ fn exec_replaces_the_address_space() {
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
 
+/// Writable and executable memory, as JIT compilers use it (macOS never maps
+/// memory so): code written there runs, runs again after being rewritten in
+/// place, and may make system calls; `mrs ctr_el0`, which macOS traps at
+/// EL0, reads a cache type.
+#[test]
+fn jit_code_runs_from_writable_executable_memory() {
+    assert_eq!(signals("jit"), JIT);
+}
+
+/// What the `jit` scenario prints.
+const JIT: &str = "jit: 42 7, getpid matches: true\nctr_el0 has cache lines: true\n";
+
 /// `fork` from a process with a second thread running: the child has just
 /// the forking thread and runs normally.
 #[test]
@@ -1441,6 +1453,9 @@ fn hv_runs_low_rust_programs() {
         stdout(&out).ends_with("arg[1]=one\narg[2]=two words\nFWE_GUEST_VAR=from-host\n"),
         "{out:?}"
     );
+    // Writable and executable memory: the VM maps it so, the host never.
+    let out = fwe_hv(&rust_low_guest("signals"), &["jit"]).unwrap();
+    assert_eq!(stdout(&out), JIT);
 }
 
 /// Signals in the VM: handlers for timers, real-time and sent fault signals,
