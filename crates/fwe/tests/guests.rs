@@ -1224,6 +1224,10 @@ fn bad_pointers_fail_with_efault() {
 fn hv_fwe() -> Option<&'static Path> {
     static FWE: OnceLock<Option<PathBuf>> = OnceLock::new();
     FWE.get_or_init(|| {
+        // FWE_NO_HV=1 skips the VM tests on a machine that could run them.
+        if std::env::var_os("FWE_NO_HV").is_some() {
+            return None;
+        }
         let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
         if String::from_utf8_lossy(&support.stdout).trim() != "1" {
             return None;
@@ -1239,6 +1243,7 @@ fn hv_fwe() -> Option<&'static Path> {
             .is_ok_and(|s| s.success());
         // A host that has the hypervisor but refuses the VM (no
         // entitlement honoured) also counts as unavailable.
+        let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
         let spike = Command::new(&signed).arg("--hv-spike").output().ok()?;
         (ok && spike.status.success()).then_some(signed)
     })
@@ -1276,6 +1281,11 @@ fn rust_low_guest(name: &str) -> PathBuf {
     dir.join("aarch64-unknown-linux-musl/release").join(name)
 }
 
+/// Held while a VM process runs, so the tests never run more than one at a
+/// time: Hypervisor.framework is shared with whatever else on the machine
+/// uses it, and the tests should not stress it.
+static ONE_VM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run `program` under the signed `fwe`, or `None` (test skipped) when this
 /// host cannot run the hypervisor backend.
 fn fwe_hv(program: &Path, args: &[&str]) -> Option<Output> {
@@ -1283,6 +1293,7 @@ fn fwe_hv(program: &Path, args: &[&str]) -> Option<Output> {
         eprintln!("skipped: no hypervisor on this host");
         return None;
     };
+    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(fwe);
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
     let out = run_bounded(cmd);
@@ -1412,6 +1423,7 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
         eprintln!("skipped: no hypervisor on this host");
         return None;
     };
+    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(fwe);
     cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
     let out = run_bounded(cmd);
@@ -1427,4 +1439,73 @@ fn signal_unblocked_by_sigreturn_and_fixed_mapping() {
     for name in ["sigmap", "sigmap-pie"] {
         assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
+}
+
+/// Threads in the VM, each on a vCPU of its own: creation and join,
+/// per-thread signal masks, `tgkill` to one thread (a host signal and a
+/// real-time one), and a timer interrupting one thread's blocking read.
+#[test]
+fn hv_runs_threads() {
+    for name in ["threadtest-low", "pipethread-low"] {
+        let Some(out) = fwe_hv(&asm_guest(name), &[]) else { return };
+        assert_eq!(out.status.code(), Some(0), "{name}");
+    }
+    for (scenario, want) in [
+        ("thread-mask", "handled on the unblocked thread: true\n"),
+        (
+            "tgkill",
+            "signal 12: reader EINTR, handled on it: true\nsignal 40: reader EINTR, handled on it: true\n",
+        ),
+        ("restart", "read: 1 byte, handler ran 1 time(s)\n"),
+    ] {
+        let out = fwe_hv(&rust_low_guest("signals"), &[scenario]).unwrap();
+        assert_eq!(stdout(&out), want, "{scenario}");
+    }
+}
+
+/// `execve` re-executes fwe, which picks the backend the new program needs:
+/// from the VM to the VM (a low program execs itself), from the VM to the
+/// native backend (with close-on-exec honoured), and from the native backend
+/// to the VM (real bash runs a low-linked program, from another directory).
+#[test]
+fn hv_execve_between_backends() {
+    let Some(out) = fwe_hv(&rust_low_guest("signals"), &["exec-self"]) else { return };
+    assert_eq!(stdout(&out), "hello from the spawned child\n");
+
+    let root = std::env::temp_dir().join(format!("fwe-hv-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(asm_guest("execee"), root.join("execee")).unwrap();
+    let out = fwe_hv_in(&root, &asm_guest("execer-low"), &[]).unwrap();
+    assert_eq!(stdout(&out), "exec target ran\n");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let root = debian_root();
+    std::fs::copy(asm_guest("hello-low"), root.join("hello-low")).unwrap();
+    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cmd = Command::new(hv_fwe().unwrap());
+    cmd.arg("--strace")
+        .arg("--root")
+        .arg(root)
+        .arg(debian_bin("bash"))
+        .args(["-c", "cd /lib && /hello-low; echo status=$? cwd=$PWD"])
+        .env_clear()
+        .env("LD_LIBRARY_PATH", "/lib")
+        .env("PATH", "/bin");
+    let out = run_bounded(cmd);
+    eprintln!("--- bash -> vm stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "hello from linux\nstatus=0 cwd=/lib\n");
+}
+
+/// A host `fork` of a process with a VM is refused (`ENOSYS`): the child
+/// could not own the VM, and a VM process must never be torn down
+/// abnormally (see docs/hypervisor.md).
+#[test]
+fn hv_fork_is_refused() {
+    let Some(out) = fwe_hv(&asm_guest("forktest-low"), &[]) else { return };
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("clone(")
+            && String::from_utf8_lossy(&out.stderr).contains("ENOSYS")
+    );
 }
