@@ -1,0 +1,674 @@
+//! The VMM: loading, the vCPU run loop and the system call path.
+
+use super::ffi::*;
+use super::vm;
+use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, page_size, stack};
+use fwe_abi::{auxv, err, errno, mman, nr};
+use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
+use fwe_kernel::{Brk, FpRegs, HostSignal, Kernel, Platform, Regs, Tracer, host, thread, uaccess};
+use std::cell::Cell;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+
+/// The kernel of the guest running in this VM.
+static KERNEL: Mutex<Option<Kernel<HvPlatform>>> = Mutex::new(None);
+
+fn kernel() -> MutexGuard<'static, Option<Kernel<HvPlatform>>> {
+    KERNEL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+thread_local! {
+    /// This thread's vCPU, for the signal handler to stop it.
+    static VCPU: Cell<Option<hv_vcpu_t>> = const { Cell::new(None) };
+}
+
+/// [`Platform`] for guests running in the VM.
+pub struct HvPlatform;
+
+impl Platform for HvPlatform {
+    fn prepare_exec(&mut self, _addr: u64, _len: u64) -> Result<(), i32> {
+        // The guest's code runs as it is.
+        Ok(())
+    }
+
+    fn exit(&mut self, code: i32) -> ! {
+        // SAFETY: terminating the process.
+        unsafe { libc::_exit(code) }
+    }
+
+    fn exit_thread(&mut self, code: i32) -> ! {
+        // One guest thread for now: the process ends with it.
+        self.exit(code)
+    }
+
+    fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        // SAFETY: resetting the disposition, unblocking and raising `sig`
+        // terminates the process with that signal.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            let mut set = host::empty_sigset();
+            libc::sigaddset(&mut set, sig);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::raise(sig);
+            libc::_exit(128 + sig)
+        }
+    }
+
+    fn stop_self(&mut self) {
+        // SAFETY: plain host call; the process resumes on SIGCONT.
+        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    }
+
+    fn set_host_signal(&mut self, sig: u64, how: HostSignal) {
+        set_host_signal(sig, how);
+    }
+
+    fn map_guest(&mut self, addr: u64, len: u64, prot: u64) -> Result<(), i32> {
+        vm::map(addr, uaccess::g2h(addr), len, prot)
+    }
+
+    fn unmap_guest(&mut self, addr: u64, len: u64) {
+        vm::unmap(addr, len);
+    }
+
+    fn protect_guest(&mut self, addr: u64, len: u64, prot: u64) {
+        vm::protect(addr, len, prot);
+    }
+
+    fn remapped_guest(&mut self, addr: u64, len: u64) {
+        vm::refresh(addr, len);
+    }
+}
+
+/// The handler for every signal the guest catches, and the wake signal:
+/// record it and stop this thread's vCPU, so the run loop delivers it.
+extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    if sig != host::WAKE_SIGNAL {
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        let (code, pid, uid, status) =
+            unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+        let lsig = host::signal_to_linux(sig);
+        thread::post_self(
+            lsig,
+            thread::SigInfo { code: host::si_code_to_linux(code), pid, uid, status },
+        );
+    }
+    if let Some(mut vcpu) = VCPU.with(Cell::get) {
+        // SAFETY: stopping this thread's own vCPU, if it is running.
+        unsafe { hv_vcpus_exit(&mut vcpu, 1) };
+    }
+}
+
+fn install(sig: libc::c_int, flags: libc::c_int) {
+    // SAFETY: installing a fully initialized sigaction.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_signal as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | flags;
+        libc::sigfillset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+fn set_host_signal(sig: u64, how: HostSignal) {
+    let Some(h) = host::signal_to_host(sig) else { return };
+    match how {
+        HostSignal::Catch { flags } => {
+            let mut f = 0;
+            if sig == fwe_abi::signal::SIGCHLD && flags & fwe_abi::signal::SA_NOCLDSTOP != 0 {
+                f |= libc::SA_NOCLDSTOP;
+            }
+            install(h, f);
+        }
+        // SAFETY: resetting a disposition.
+        HostSignal::Default => unsafe {
+            libc::signal(h, libc::SIG_DFL);
+        },
+        // SAFETY: ignoring a signal.
+        HostSignal::Ignore => unsafe {
+            libc::signal(h, libc::SIG_IGN);
+        },
+    }
+}
+
+/// Linux protections for ELF segment flags.
+fn prot_of(flags: u32) -> u64 {
+    let mut p = 0;
+    if flags & PF_R != 0 {
+        p |= mman::PROT_READ;
+    }
+    if flags & PF_W != 0 {
+        p |= mman::PROT_WRITE;
+    }
+    if flags & PF_X != 0 {
+        p |= mman::PROT_EXEC;
+    }
+    p
+}
+
+fn host_prot(prot: u64) -> libc::c_int {
+    let mut h = libc::PROT_NONE;
+    if prot & mman::PROT_READ != 0 {
+        h |= libc::PROT_READ;
+    }
+    if prot & mman::PROT_WRITE != 0 {
+        h |= libc::PROT_WRITE;
+    }
+    h
+}
+
+/// A fault in fwe's own code: the kernel's checked copies recover from it
+/// (EFAULT); anything else is fatal.
+extern "C" fn on_fault(sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+    let ss = unsafe { &mut (*(*(ctx as *mut crate::trap::Ucontext)).uc_mcontext).ss };
+    if let Some(resume) = uaccess::fixup(ss.pc) {
+        ss.pc = resume;
+        return;
+    }
+    // SAFETY: resetting to the default action, which the re-executed
+    // instruction then takes.
+    unsafe { libc::signal(sig, libc::SIG_DFL) };
+}
+
+/// Block every signal a guest can receive, and the wake signal, on the
+/// calling thread.
+fn block_guest_signals() {
+    let mut all = host::host_sigset(u64::MAX);
+    // SAFETY: an initialized signal set; changing this thread's mask.
+    unsafe {
+        libc::sigaddset(&mut all, host::WAKE_SIGNAL);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+    }
+}
+
+/// Fresh, zeroed, writable host memory.
+fn host_alloc(len: u64) -> Result<u64, Error> {
+    // SAFETY: a fresh private anonymous mapping.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return Err(Error::Unsupported(format!(
+            "allocating guest memory failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    fwe_kernel::mm::track(p as u64, len);
+    Ok(p as u64)
+}
+
+fn vm_map(guest: u64, host: u64, len: u64, prot: u64) -> Result<(), Error> {
+    vm::map(guest, host, len, prot).map_err(|e| {
+        Error::Unsupported(format!("mapping {guest:#x}+{len:#x} into the VM failed: errno {e}"))
+    })
+}
+
+/// Where an image ended up.
+struct Placed {
+    /// Added to the image's link addresses.
+    bias: u64,
+    entry: u64,
+    phdr: Option<u64>,
+    phnum: u16,
+    phent: u16,
+    end: u64,
+}
+
+/// Load `elf` into host memory and the VM. A non-PIE image goes at its link
+/// address in the VM, backed by host memory elsewhere (the translated range);
+/// a PIE one wherever the host puts it, at the same address in both.
+fn place(elf: &Elf<'_>, page: u64, translate: bool) -> Result<Placed, Error> {
+    let plan = LoadPlan::new(elf, page);
+    let host = host_alloc(plan.len)?;
+    let (guest, bias) = if elf.is_pie() { (host, host - plan.start) } else { (plan.start, 0) };
+    for ph in elf.loads() {
+        let src = &elf.data[ph.offset as usize..(ph.offset + ph.filesz) as usize];
+        let at = host + (ph.vaddr - plan.start);
+        // SAFETY: the segment lies within the fresh allocation.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), at as *mut u8, src.len()) };
+    }
+    if translate && guest != host {
+        uaccess::set_translation(guest, plan.len, host);
+    }
+    for run in &plan.runs {
+        let off = run.start - plan.start;
+        let prot = prot_of(run.prot);
+        vm_map(guest + off, host + off, run.len, prot)?;
+        // The host copy gets the same protections, so the kernel's own
+        // accesses fault (and report EFAULT) where the guest's would.
+        // SAFETY: changing protections of the allocation made above.
+        unsafe {
+            libc::mprotect((host + off) as *mut _, run.len as usize, host_prot(prot));
+        }
+    }
+    let (_, hi) = elf.bounds();
+    Ok(Placed {
+        bias,
+        entry: elf.entry + bias,
+        phdr: elf.phdr_vaddr().map(|a| a + bias),
+        phnum: elf.phnum,
+        phent: elf.phentsize,
+        end: hi + bias,
+    })
+}
+
+/// `movz x8, #139; svc #0`: the `rt_sigreturn` trampoline.
+const SIGRETURN: [u32; 2] = [0xd280_1168, 0xd400_0001];
+
+/// Run `path` (already read into `data`) in the VM. Returns only on failure.
+pub fn run(
+    path: &Path,
+    data: &[u8],
+    args: &[OsString],
+    env: &[OsString],
+    options: &Options,
+) -> Error {
+    match start(path, data, args, env, options) {
+        Ok(never) => match never {},
+        Err(e) => e,
+    }
+}
+
+fn start(
+    path: &Path,
+    data: &[u8],
+    args: &[OsString],
+    env: &[OsString],
+    options: &Options,
+) -> Result<std::convert::Infallible, Error> {
+    let page = page_size();
+    let tracer = Tracer { enabled: options.strace };
+    // Hypervisor.framework runs threads of its own, which inherit the mask
+    // of the thread that creates them. With every guest signal blocked
+    // there, the host delivers signals only to the vCPU threads, whose masks
+    // follow the guest's.
+    block_guest_signals();
+    vm::create().map_err(|e| {
+        Error::Unsupported(format!(
+            "this program is linked below 4 GiB, which needs the hypervisor backend, \
+             and creating the VM failed ({e}); fwe must be signed with the \
+             com.apple.security.hypervisor entitlement (see docs/hypervisor.md) \
+             on a Mac with hypervisor support"
+        ))
+    })?;
+    fwe_kernel::fdtable::init();
+    let root_bytes = options.root.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
+    let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
+        Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
+    })?;
+
+    let elf = Elf::parse(data).map_err(Error::Elf)?;
+    let exe = place(&elf, page, true)?;
+    let interp = match elf.interpreter().map_err(Error::Elf)? {
+        Some(ip) => {
+            let idata = fs.read(ip).map_err(|e| {
+                Error::Unsupported(format!(
+                    "loading the dynamic linker {}: errno {e}",
+                    String::from_utf8_lossy(ip)
+                ))
+            })?;
+            let ielf = Elf::parse(&idata).map_err(Error::Elf)?;
+            if !ielf.is_pie() {
+                return Err(Error::Unsupported(
+                    "the dynamic linker is not position-independent".into(),
+                ));
+            }
+            Some(place(&ielf, page, false)?)
+        }
+        None => None,
+    };
+
+    // The break: anywhere in the host above the image, the same address in
+    // the VM; its pages enter the VM as `brk` commits them.
+    let brk_start = host_alloc(Brk::RESERVATION)?;
+    // SAFETY: making the reservation inaccessible until `brk` commits it.
+    unsafe { libc::mprotect(brk_start as *mut _, Brk::RESERVATION as usize, libc::PROT_NONE) };
+    let brk = Brk { start: brk_start, current: brk_start, limit: brk_start + Brk::RESERVATION };
+    let _ = exe.end;
+
+    // The stack, with an inaccessible guard page below it.
+    let stack_base = host_alloc(STACK_SIZE + page)?;
+    vm_map(stack_base + page, stack_base + page, STACK_SIZE, mman::PROT_READ | mman::PROT_WRITE)?;
+    let stack_top = stack_base + page + STACK_SIZE;
+
+    let (hwcap, hwcap2) = hwcap::detect();
+    let (uid, euid, gid, egid) = host::ids();
+    let mut aux = vec![
+        (auxv::AT_HWCAP, hwcap),
+        (auxv::AT_PAGESZ, page),
+        (auxv::AT_CLKTCK, 100),
+        (auxv::AT_PHENT, exe.phent as u64),
+        (auxv::AT_PHNUM, exe.phnum as u64),
+        (auxv::AT_BASE, interp.as_ref().map_or(0, |i| i.bias)),
+        (auxv::AT_FLAGS, 0),
+        (auxv::AT_ENTRY, exe.entry),
+        (auxv::AT_UID, uid as u64),
+        (auxv::AT_EUID, euid as u64),
+        (auxv::AT_GID, gid as u64),
+        (auxv::AT_EGID, egid as u64),
+        (auxv::AT_SECURE, 0),
+        (auxv::AT_HWCAP2, hwcap2),
+        (auxv::AT_MINSIGSTKSZ, fwe_abi::signal::MINSIGSTKSZ),
+    ];
+    if let Some(phdr) = exe.phdr {
+        aux.push((auxv::AT_PHDR, phdr));
+    }
+    let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+    let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
+    let execfn = path.as_os_str().as_bytes();
+    let mut random = [0u8; 16];
+    host::fill_random(&mut random);
+    let image =
+        stack::InitialStack { args: &arg_bytes, env: &env_bytes, execfn, auxv: &aux, random }
+            .build(stack_top);
+    // SAFETY: the image fits in the stack mapping, ending at its top.
+    unsafe {
+        std::ptr::copy_nonoverlapping(image.bytes.as_ptr(), image.sp as *mut u8, image.bytes.len())
+    };
+
+    // The rt_sigreturn trampoline.
+    let tramp = host_alloc(page)?;
+    // SAFETY: two instruction words into the fresh page.
+    unsafe {
+        (tramp as *mut u32).write(SIGRETURN[0]);
+        ((tramp + 4) as *mut u32).write(SIGRETURN[1]);
+    }
+    vm_map(tramp, tramp, page, mman::PROT_READ | mman::PROT_EXEC)?;
+
+    let entry = interp.as_ref().map_or(exe.entry, |i| i.entry);
+    if options.strace {
+        tracer.note(&format!(
+            "hypervisor backend: exe entry {:#x}, image translated to host {:#x}, \
+             interp base {:#x}, brk {brk_start:#x}, stack top {stack_top:#x}",
+            exe.entry,
+            uaccess::g2h(exe.entry),
+            interp.as_ref().map_or(0, |i| i.bias),
+        ));
+    }
+
+    fs.set_proc_info(crate::guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
+    fwe_kernel::net::set_rootfs(fs.root_host_path());
+    thread::init_main(host::getpid() as i32);
+    let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
+    k.set_sigreturn_trampoline(tramp);
+    install(host::WAKE_SIGNAL, 0);
+    for sig in [libc::SIGSEGV, libc::SIGBUS] {
+        // SAFETY: installing a fully initialized sigaction.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_fault as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+    k.adopt_host_signals();
+    *kernel() = Some(k);
+
+    let regs = Regs { sp: image.sp, pc: entry, ..Regs::default() };
+    let vcpu = Vcpu::create().map_err(Error::Unsupported)?;
+    vcpu.run(regs)
+}
+
+/// One vCPU, created on and run by the calling host thread.
+struct Vcpu {
+    id: hv_vcpu_t,
+    exit: *mut hv_vcpu_exit_t,
+}
+
+// Exception classes (ESR bits 31:26).
+const EC_UNKNOWN: u64 = 0x00;
+const EC_SVC64: u64 = 0x15;
+const EC_HVC64: u64 = 0x16;
+const EC_IABT_LOWER: u64 = 0x20;
+const EC_PC_ALIGN: u64 = 0x22;
+const EC_DABT_LOWER: u64 = 0x24;
+const EC_SP_ALIGN: u64 = 0x26;
+const EC_BRK64: u64 = 0x3c;
+
+impl Vcpu {
+    fn create() -> Result<Vcpu, String> {
+        let mut id = 0;
+        let mut exit = std::ptr::null_mut();
+        // SAFETY: out-parameters for a vCPU owned by this thread.
+        let rc = unsafe { hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()) };
+        check(rc, "hv_vcpu_create")?;
+        let v = Vcpu { id, exit };
+        for (reg, value) in vm::system_registers() {
+            v.set_sys(reg, value);
+        }
+        VCPU.with(|c| c.set(Some(id)));
+        Ok(v)
+    }
+
+    fn get(&self, reg: hv_reg_t) -> u64 {
+        let mut v = 0;
+        // SAFETY: reading a register of this thread's vCPU.
+        unsafe { hv_vcpu_get_reg(self.id, reg, &mut v) };
+        v
+    }
+
+    fn set(&self, reg: hv_reg_t, v: u64) {
+        // SAFETY: writing a register of this thread's vCPU.
+        unsafe { hv_vcpu_set_reg(self.id, reg, v) };
+    }
+
+    fn get_sys(&self, reg: hv_sys_reg_t) -> u64 {
+        let mut v = 0;
+        // SAFETY: reading a system register of this thread's vCPU.
+        unsafe { hv_vcpu_get_sys_reg(self.id, reg, &mut v) };
+        v
+    }
+
+    fn set_sys(&self, reg: hv_sys_reg_t, v: u64) {
+        // SAFETY: writing a system register of this thread's vCPU.
+        unsafe { hv_vcpu_set_sys_reg(self.id, reg, v) };
+    }
+
+    /// The guest's registers, with `pc` and `pstate` as given.
+    fn regs(&self, pc: u64, pstate: u64) -> Regs {
+        let mut r = Regs { pc, pstate, sp: self.get_sys(HV_SYS_REG_SP_EL0), ..Regs::default() };
+        for i in 0..31 {
+            r.x[i] = self.get(HV_REG_X0 + i as u32);
+        }
+        let mut fp = FpRegs {
+            fpsr: self.get(HV_REG_FPSR) as u32,
+            fpcr: self.get(HV_REG_FPCR) as u32,
+            ..FpRegs::default()
+        };
+        for (i, v) in fp.v.iter_mut().enumerate() {
+            // SAFETY: reading a SIMD register of this thread's vCPU.
+            unsafe { hv_vcpu_get_simd_fp_reg(self.id, i as u32, v) };
+        }
+        r.fp = fp;
+        r
+    }
+
+    /// Resume the guest at EL0 with `r`.
+    fn set_regs(&self, r: &Regs) {
+        for i in 0..31 {
+            self.set(HV_REG_X0 + i as u32, r.x[i]);
+        }
+        self.set_sys(HV_SYS_REG_SP_EL0, r.sp);
+        self.set(HV_REG_PC, r.pc);
+        // EL0t, with the guest's flags.
+        self.set(HV_REG_CPSR, r.pstate & !0xf);
+        self.set(HV_REG_FPSR, r.fp.fpsr as u64);
+        self.set(HV_REG_FPCR, r.fp.fpcr as u64);
+        for (i, v) in r.fp.v.iter().enumerate() {
+            // SAFETY: writing a SIMD register of this thread's vCPU from 16
+            // readable bytes.
+            unsafe { set_simd_fp_reg(self.id, i as u32, v) };
+        }
+    }
+
+    /// Run the guest from `regs` until the process ends.
+    fn run(&self, mut regs: Regs) -> ! {
+        self.set_regs(&regs);
+        loop {
+            // The guest's mask is in force on the host while it runs, so the
+            // host routes signals as for the native backend.
+            let mask = host::host_mask_for(thread::mask());
+            // SAFETY: plain host calls; `exit` is HVF's record for this vCPU.
+            let (rc, exit) = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                (hv_vcpu_run(self.id), &*self.exit)
+            };
+            if rc != 0 {
+                fatal(&format!("hv_vcpu_run failed: {rc:#x}"));
+            }
+            match exit.reason {
+                HV_EXIT_REASON_EXCEPTION => {
+                    let syndrome = exit.exception.syndrome;
+                    match syndrome >> 26 {
+                        EC_HVC64 => regs = self.handle_el0_exception(),
+                        // A stage-2 abort: the guest touched memory it has
+                        // not mapped (or not for this access).
+                        EC_DABT_LOWER | EC_IABT_LOWER => {
+                            regs = self.regs(self.get(HV_REG_PC), self.get(HV_REG_CPSR));
+                            fault(
+                                &mut regs,
+                                fwe_abi::signal::SIGSEGV,
+                                exit.exception.virtual_address,
+                            );
+                        }
+                        ec => fatal(&format!(
+                            "unexpected VM exit: EC {ec:#x}, syndrome {syndrome:#x}, pc {:#x}",
+                            self.get(HV_REG_PC)
+                        )),
+                    }
+                }
+                HV_EXIT_REASON_CANCELED => {
+                    // A signal for the guest (or the wake signal).
+                    regs = self.regs(self.get(HV_REG_PC), self.get(HV_REG_CPSR));
+                    if let Some(k) = kernel().as_mut() {
+                        k.deliver_pending(&mut regs);
+                    }
+                }
+                HV_EXIT_REASON_VTIMER_ACTIVATED => continue,
+                other => fatal(&format!("unexpected VM exit reason {other}")),
+            }
+            self.set_regs(&regs);
+        }
+    }
+
+    /// The guest took an exception at EL0, which our vector turned into
+    /// `hvc`: handle it and return the registers to resume with.
+    fn handle_el0_exception(&self) -> Regs {
+        let esr = self.get_sys(HV_SYS_REG_ESR_EL1);
+        let elr = self.get_sys(HV_SYS_REG_ELR_EL1);
+        let spsr = self.get_sys(HV_SYS_REG_SPSR_EL1);
+        let far = self.get_sys(HV_SYS_REG_FAR_EL1);
+        let mut regs = self.regs(elr, spsr);
+        use fwe_abi::signal as s;
+        match esr >> 26 {
+            EC_SVC64 => {
+                // ELR is past the `svc`; the kernel advances pc past the
+                // trapping instruction itself.
+                regs.pc = elr - 4;
+                syscall(&mut regs);
+            }
+            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr),
+            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far),
+            EC_DABT_LOWER | EC_IABT_LOWER => fault(&mut regs, s::SIGSEGV, far),
+            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr),
+            _ => fault(&mut regs, s::SIGILL, elr),
+        }
+        regs
+    }
+}
+
+/// Deliver synchronous fault `sig` at `addr`, or die of it.
+fn fault(regs: &mut Regs, sig: u64, addr: u64) {
+    let mut guard = kernel();
+    let Some(k) = guard.as_mut() else { fatal("fault before the kernel exists") };
+    if !k.deliver_fault(regs, sig, addr) {
+        if k.tracer.enabled {
+            k.tracer.note(&format!(
+                "guest fault: signal {sig} at pc {:#x}, address {addr:#x}",
+                regs.pc
+            ));
+        }
+        let h = host::signal_to_host(sig).unwrap_or(libc::SIGSEGV);
+        k.platform.kill_self(h);
+    }
+}
+
+fn fatal(msg: &str) -> ! {
+    let line = format!("fwe: {msg}\n");
+    // SAFETY: writing a diagnostic to standard error, then exiting.
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+        libc::_exit(127)
+    }
+}
+
+/// Run the system call in `regs` (number in `x8`), leaving its result and
+/// any signal delivery in `regs`.
+fn syscall(regs: &mut Regs) {
+    let n = regs.x[8];
+    let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    // The kernel and the host see host addresses for guest pointers.
+    let mask = uaccess::pointer_args(n);
+    let mut host_args = args;
+    for (i, a) in host_args.iter_mut().enumerate() {
+        if mask & (1 << i) != 0 {
+            *a = uaccess::g2h(*a);
+        }
+    }
+    let result = match n {
+        nr::RT_SIGRETURN => {
+            kernel().as_mut().unwrap().enter_syscall(regs);
+            return;
+        }
+        nr::EXIT => {
+            fwe_kernel::thread_exit_cleanup();
+            // SAFETY: the last (only) guest thread ends the process.
+            unsafe { libc::_exit(args[0] as i32) }
+        }
+        nr::CLONE | nr::CLONE3 | nr::EXECVE | nr::EXECVEAT => err(errno::ENOSYS),
+        nr::WAIT4 => {
+            let mut r = *regs;
+            r.x[..6].copy_from_slice(&host_args);
+            crate::process::do_wait4(&r)
+        }
+        nr::WAITID => {
+            let mut r = *regs;
+            r.x[..6].copy_from_slice(&host_args);
+            crate::process::do_waitid(&r)
+        }
+        nr::RT_SIGTIMEDWAIT => {
+            let want: u64 = uaccess::read(host_args[0]).unwrap_or(0);
+            kernel().as_mut().unwrap().catch_for_wait(want);
+            // SAFETY: guest pointers, translated, reference guest memory.
+            let r = unsafe {
+                fwe_kernel::signal::sigtimedwait(
+                    host_args[0],
+                    host_args[1],
+                    host_args[2],
+                    host_args[3],
+                )
+            };
+            kernel().as_mut().unwrap().end_wait(want);
+            r
+        }
+        _ => {
+            // SAFETY: guest pointers, translated, reference guest memory.
+            match unsafe { fwe_kernel::blocking_syscall(n, host_args) } {
+                Some(r) => r,
+                None => kernel().as_mut().unwrap().run_call(n, host_args),
+            }
+        }
+    };
+    kernel().as_mut().unwrap().finish_syscall(regs, n, &args, result);
+}
