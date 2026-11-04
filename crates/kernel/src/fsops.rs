@@ -784,7 +784,12 @@ mod tests {
 
     struct NoPlatform;
     impl Platform for NoPlatform {
-        fn prepare_exec(&mut self, _addr: u64, _len: u64) -> Result<(), i32> {
+        fn prepare_exec(
+            &mut self,
+            _addr: u64,
+            _len: u64,
+            _known: Option<&[(u64, u64)]>,
+        ) -> Result<(), i32> {
             Ok(())
         }
         fn exit(&mut self, code: i32) -> ! {

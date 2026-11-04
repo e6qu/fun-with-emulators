@@ -482,14 +482,22 @@ mod tests {
     }
 }
 
+/// The known-code ranges given for memory a guest makes executable after
+/// mapping it (JIT code): none, so `x18` lookalikes there are left alone.
+/// JIT compilers for Linux arm64 do not use `x18` (V8 reserves it), while
+/// their code pages hold data that can look like an instruction naming it.
+const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
+
 /// Largest backing file read to find its executable sections.
 const MAX_EXEC_FILE: usize = 128 << 20;
 
 /// The executable sections of the ELF file open at `fd`, as file-offset
 /// ranges, or `None` if it is not a readable regular ELF with section headers
-/// (then the caller translates the whole mapped region instead). Reads with
-/// `pread`, so the guest's file position is untouched.
-fn exec_file_ranges(fd: i32) -> Option<Vec<(u64, u64)>> {
+/// (then the caller translates the whole mapped region instead), with the
+/// file-offset ranges its unwind table says are code, if it has a usable
+/// one. Reads with `pread`, so the guest's file position is untouched.
+type ExecFile = (Vec<(u64, u64)>, Option<Vec<(u64, u64)>>);
+fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
     if fd < 0 {
         return None;
     }
@@ -521,7 +529,8 @@ fn exec_file_ranges(fd: i32) -> Option<Vec<(u64, u64)>> {
         }
         done += n as usize;
     }
-    fwe_elf::Elf::parse(&buf).ok()?.exec_file_ranges()
+    let elf = fwe_elf::Elf::parse(&buf).ok()?;
+    Some((elf.exec_file_ranges()?, elf.unwind_code_file_ranges()))
 }
 
 fn host_prot(prot: u64) -> libc::c_int {
@@ -679,19 +688,23 @@ impl<P: Platform> Kernel<P> {
             // shared library's code segment can hold, as glibc's `libc.so.6`
             // does — is left untouched. Without section headers, or for an
             // anonymous mapping, the whole region is translated as before.
-            let prep = match if anonymous { None } else { exec_file_ranges(host_fd) } {
-                Some(sections) => sections
+            // File ranges in the mapping, as host addresses.
+            let in_mapping = |ranges: Vec<(u64, u64)>| -> Vec<(u64, u64)> {
+                ranges
                     .into_iter()
                     .filter_map(|(foff, fsize)| {
                         let start = foff.max(offset);
                         let end = (foff + fsize).min(offset + len);
                         (start < end).then_some((p + (start - offset), end - start))
                     })
-                    .collect(),
-                None => vec![(p, self.page_up(len))],
+                    .collect()
+            };
+            let (prep, known) = match if anonymous { None } else { exec_file_ranges(host_fd) } {
+                Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
+                None => (vec![(p, self.page_up(len))], None),
             };
             for (a, l) in prep {
-                if let Err(e) = self.platform.prepare_exec(a, l) {
+                if let Err(e) = self.platform.prepare_exec(a, l, known.as_deref()) {
                     // SAFETY: unmapping the mapping just created.
                     self.unmap_host(p, len);
                     untrack(p, self.page_up(len));
@@ -753,7 +766,12 @@ impl<P: Platform> Kernel<P> {
             if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
                 return last_error();
             }
-            if let Err(e) = self.platform.prepare_exec(a as u64, self.page_up(len)) {
+            // Code made executable after it was mapped is a JIT's, with no
+            // unwind table to tell its code from the data in it (V8 keeps
+            // constant pools and metadata in its code pages), and JITs leave
+            // x18 alone: only its system calls and thread-pointer accesses
+            // are translated (see [`JIT_CODE`]).
+            if let Err(e) = self.platform.prepare_exec(a as u64, self.page_up(len), JIT_CODE) {
                 return err(e);
             }
         }
@@ -783,7 +801,7 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
-            if self.platform.prepare_exec(page, self.page_size).is_err() {
+            if self.platform.prepare_exec(page, self.page_size, JIT_CODE).is_err() {
                 return false;
             }
             let rx = libc::PROT_READ | libc::PROT_EXEC;

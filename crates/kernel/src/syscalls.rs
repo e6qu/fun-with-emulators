@@ -865,7 +865,12 @@ mod tests {
     }
 
     impl Platform for TestPlatform {
-        fn prepare_exec(&mut self, addr: u64, len: u64) -> Result<(), i32> {
+        fn prepare_exec(
+            &mut self,
+            addr: u64,
+            len: u64,
+            _known: Option<&[(u64, u64)]>,
+        ) -> Result<(), i32> {
             self.exec.push((addr, len));
             Ok(())
         }

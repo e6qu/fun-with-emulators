@@ -108,7 +108,7 @@ pub fn host_min_address() -> u64 {
 pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
-    mut prepare_exec: impl FnMut(u64, u64, &mut StubArena) -> Result<(), String>,
+    mut prepare_exec: impl FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena) -> Result<(), String>,
 ) -> Result<Loaded, LoadError> {
     let plan = LoadPlan::new(elf, page_size);
     if !elf.is_pie() && plan.start < host_min_address() {
@@ -184,8 +184,12 @@ pub fn load(
     // segment: a segment can hold data (symbol/string/hash tables, read-only
     // constants) that must not be rewritten. `exec_ranges` reports the real
     // code extents from the section headers when present.
+    // The unwind table tells code from data placed among it (see
+    // `fwe_elf::Elf::unwind_code_ranges`).
+    let known: Option<Vec<(u64, u64)>> =
+        elf.unwind_code_ranges().map(|r| r.into_iter().map(|(a, l)| (a + bias, l)).collect());
     for (vaddr, size) in elf.exec_ranges() {
-        prepare_exec(vaddr + bias, size, &mut arena)
+        prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena)
             .map_err(|reason| LoadError::Prepare { start: vaddr + bias, reason })?;
     }
 

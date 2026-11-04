@@ -182,12 +182,29 @@ symbol, string, hash and relocation tables that share an executable segment
 with the code — the whole R-X segment of musl's `ld-musl`, the code segment
 of glibc's `libc.so.6` — are never scanned. For a file-backed `mmap` the
 kernel reads the backing file's section headers (`Elf::exec_file_ranges`)
-and translates only its executable sections. Within a code section, literal
-pools (the targets of `ldr` literal) are detected and skipped. Two gaps
-remain: inline data in a code section that is not a literal pool (a jump
-table), and a binary fully stripped of section headers, where the scan falls
-back to the whole executable segment. Recursive descent over reachable code
-is the general fix for both.
+and translates only its executable sections. Code sections still hold data:
+the constant tables of hand-written assembly (OpenSSL keeps SHA-256's and
+SHA-512's round constants, and many more, in `.text`, and over a thousand of
+`libcrypto`'s data words decode as instructions naming `x18`). An image's
+unwind table tells the two apart: every function a compiler emits has a
+frame description entry in `.eh_frame` giving the addresses it covers, and
+hand-written assembly with CFI directives does too
+(`crates/elf/src/unwind.rs`). Where an image has one, `x18` is rewritten
+only inside the ranges it covers — in glibc, libstdc++, ICU, git, bash,
+SQLite, lighttpd and PCRE2 every `x18` use lies inside them — and only a
+literal load that is itself code marks its target as a literal pool (a data
+word decoding as one had hidden an `x18` use in OpenSSL's MD5 from the
+rewrite). System calls and thread-pointer accesses are rewritten throughout
+the executable sections, as before. Without a usable unwind table the whole
+of each executable section counts as code. Two gaps remain: inline data in
+code an unwind table covers (a jump table), and a binary fully stripped of
+section headers, where the scan falls back to the whole executable segment.
+
+Code a guest makes executable after mapping it — a JIT compiler's, through
+`mprotect` or writable and executable memory (below) — has no unwind table,
+and its pages hold data among the code (V8's constant pools and metadata);
+JIT compilers for Linux arm64 leave `x18` alone (V8 reserves it). So there
+only system calls and thread-pointer accesses are rewritten.
 
 Stubs are placed in regions within `b` range (128 MiB) of their sites: the
 arena reserved after the loaded image, or, for code mapped later, regions
