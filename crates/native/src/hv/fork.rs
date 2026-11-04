@@ -197,8 +197,8 @@ struct Region {
 
 /// One memory entry per region of guest memory, with the regions. Private
 /// memory is snapshotted copy-on-write, shared memory shared; for a `vfork`
-/// child (`share_all`) private memory is shared too, while each region keeps
-/// its kind for the child's own later forks. A region the host has made
+/// child (`share_all`) writable private memory is shared too, while each
+/// region keeps its kind for the child's own later forks. A region the host has made
 /// unreadable is made readable for the moment it takes.
 fn take_memory(share_all: bool) -> Result<(Vec<Region>, Vec<Port>), String> {
     // The child can only rebuild a VM whose memory is all in the window.
@@ -229,7 +229,14 @@ fn take_memory(share_all: bool) -> Result<(Vec<Region>, Vec<Port>), String> {
                 // kernel lock held; restored below.
                 unsafe { libc::mprotect(lo as *mut _, (hi - lo) as usize, libc::PROT_READ) };
             }
-            let mode = if shared || share_all { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
+            // A vfork child shares the parent's writable memory, so what it
+            // writes reaches the parent. Read-only memory (the program's
+            // code and constants) is copied as for a fork: a shared entry
+            // of it can only be read, and the child could not map it into
+            // its VM.
+            let writable = prot & libc::PROT_WRITE != 0;
+            let mode =
+                if shared || share_all && writable { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
             let mut entry = 0;
             let mut max = VM_PROT_READ | VM_PROT_WRITE;
             let mut kr = KERN_SUCCESS;
