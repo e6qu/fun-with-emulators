@@ -25,3 +25,13 @@ undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 debug = 1
+
+# Preparing guest code scans every word of a program's executable sections,
+# 100 MB and more for rustc's libraries, once per process: optimized even in
+# debug builds, so the end-to-end tests are not dominated by it. Debug
+# assertions and overflow checks stay on.
+[profile.dev.package.fwe-native]
+opt-level = 2
+
+[profile.dev.package.fwe-elf]
+opt-level = 2
