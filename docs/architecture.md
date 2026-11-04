@@ -182,8 +182,8 @@ reports the `SHF_EXECINSTR` sections from the section headers, so the
 symbol, string, hash and relocation tables that share an executable segment
 with the code — the whole R-X segment of musl's `ld-musl`, the code segment
 of glibc's `libc.so.6` — are never scanned. For a file-backed `mmap` the
-kernel reads the backing file's section headers (`Elf::exec_file_ranges`)
-and translates only its executable sections. Code sections still hold data:
+kernel maps the backing file for a moment to read its section headers
+(`Elf::exec_file_ranges`) and translates only its executable sections. Code sections still hold data:
 the constant tables of hand-written assembly (OpenSSL keeps SHA-256's and
 SHA-512's round constants, and many more, in `.text`, and over a thousand of
 `libcrypto`'s data words decode as instructions naming `x18`). An image's
