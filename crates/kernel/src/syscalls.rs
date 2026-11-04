@@ -639,8 +639,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_sched_getaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
-        // SAFETY: plain host call.
-        if pid != 0 && pid as i32 != unsafe { libc::getpid() } {
+        // The caller, the process, or one of its threads: glibc's
+        // `pthread_getattr_np` asks with the thread's own id.
+        let id = pid as i32;
+        if id != 0 && id != thread::tgid() && thread::host_thread(id).is_none() {
             return err(errno::ESRCH);
         }
         // SAFETY: plain host call.
@@ -954,6 +956,25 @@ mod tests {
             let r = k.syscall(nr::IOCTL, [fd, req, buf.as_mut_ptr() as u64, 0, 0, 0]);
             assert_eq!(r, err(errno::ENOTTY), "ioctl {req:#x}");
         }
+    }
+
+    /// `sched_getaffinity` names the caller (0), the process, or any of its
+    /// threads by id — glibc's `pthread_getattr_np` asks with a thread's own
+    /// — and nothing else.
+    #[test]
+    fn affinity_of_a_thread_of_the_process() {
+        const TID: i32 = 900_001; // high enough that no test uses it
+        let pending = crate::thread::register(TID);
+        let mut mask = [0u64; 16];
+        let p = mask.as_mut_ptr() as u64;
+        let mut k = kernel();
+        let size = k.syscall(nr::SCHED_GETAFFINITY, [TID as u64, 128, p, 0, 0, 0]);
+        assert!(size > 0 && mask[0] & 1 == 1, "{size}");
+        crate::thread::unregister(&pending);
+        assert_eq!(
+            k.syscall(nr::SCHED_GETAFFINITY, [TID as u64, 128, p, 0, 0, 0]),
+            err(errno::ESRCH)
+        );
     }
 
     #[test]
