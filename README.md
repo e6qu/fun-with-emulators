@@ -8,11 +8,11 @@ run a Linux kernel. Like Wine, but for Linux. Written in Rust.
 
 Real, unmodified Debian `aarch64` programs run end to end: coreutils, `ls`
 with its shared-library graph, `bash`, `git` (commits, merges, rebases,
-`gc`, a local clone), SQLite, the lighttpd web server (with CGI) and
-Node.js with V8's JIT, dynamically linked against a genuine glibc (musl
-works too). Processes, threads, memory, signals, files on
-a Linux rootfs, networking, terminals, event descriptors and a synthetic
-`/proc` are in place.
+`gc`, a local clone), SQLite, the lighttpd web server (with CGI),
+Node.js with V8's JIT, and rustc with Cargo building a project,
+dynamically linked against a genuine glibc (musl works too). Processes,
+threads, memory, signals, files on a Linux rootfs, networking, terminals,
+event descriptors and a synthetic `/proc` are in place.
 
 A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
 `python3.11`, static Go) cannot be mapped in-process; fwe runs it in a
