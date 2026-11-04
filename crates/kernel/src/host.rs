@@ -579,6 +579,25 @@ pub fn flock_op_to_host(op: u64) -> Option<libc::c_int> {
     Some(if op & fcntl::LOCK_NB != 0 { lock | libc::LOCK_NB } else { lock })
 }
 
+/// Seconds since the host booted (macOS's `CLOCK_MONOTONIC` counts sleep,
+/// as Linux's boot-time clock does).
+pub fn uptime() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid out parameter.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+/// The host's 1, 5 and 15 minute load averages (zero if unavailable).
+pub fn load_averages() -> [f64; 3] {
+    let mut loads = [0f64; 3];
+    // SAFETY: `loads` has room for the three values asked for.
+    if unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) } != 3 {
+        return [0.0; 3];
+    }
+    loads
+}
+
 /// Settable file status flags (`F_SETFL`) from Linux to host.
 pub fn settable_flags_to_host(linux: u64) -> libc::c_int {
     let mut f = 0;

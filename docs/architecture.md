@@ -278,7 +278,9 @@ The rootfs has no real `/proc` or `/sys`, so the filesystem layer consults
 `crates/kernel/src/procfs.rs` before the host rootfs and generates what
 programs read at startup: `/proc/self/exe` (a symlink),
 `/proc/self/cmdline`, `/proc/self/fd`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
-`/proc/uptime`, `/proc/loadavg`, `/proc/sys/kernel/{ostype,osrelease,
+`/proc/uptime` and `/proc/loadavg` (the host's uptime and load, which
+`sysinfo` reports too, with the same fixed memory figures as
+`/proc/meminfo`), `/proc/sys/kernel/{ostype,osrelease,
 version,hostname,pid_max}`, `/proc/sys/vm/{overcommit_memory,mmap_min_addr}`
 and `/sys/devices/system/cpu/{online,possible}`. File content is served from
 an anonymous, seekable fd. The per-process values (exe, cmdline, cpu count,

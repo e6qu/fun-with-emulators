@@ -108,8 +108,11 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu)),
         b"/proc/meminfo" => Entry::File(meminfo()),
         b"/proc/stat" => Entry::File(stat(info.ncpu)),
-        b"/proc/uptime" => Entry::File(b"0.00 0.00\n".to_vec()),
-        b"/proc/loadavg" => Entry::File(b"0.00 0.00 0.00 1/1 1\n".to_vec()),
+        b"/proc/uptime" => Entry::File(format!("{:.2} 0.00\n", crate::host::uptime()).into_bytes()),
+        b"/proc/loadavg" => {
+            let [one, five, fifteen] = crate::host::load_averages();
+            Entry::File(format!("{one:.2} {five:.2} {fifteen:.2} 1/1 1\n").into_bytes())
+        }
         b"/proc/sys/kernel/ostype" => Entry::File(b"Linux\n".to_vec()),
         b"/proc/sys/kernel/osrelease" => Entry::File(line(RELEASE.as_bytes())),
         b"/proc/sys/kernel/version" => Entry::File(b"#1 SMP PREEMPT\n".to_vec()),
@@ -145,13 +148,21 @@ fn cpuinfo(ncpu: u32) -> Vec<u8> {
     out
 }
 
+/// The memory reported to the guest, in kB: plausible fixed values (programs
+/// mostly read the total and what is available). `sysinfo` reports the same.
+pub(crate) const MEM_TOTAL_KB: u64 = 8_388_608;
+pub(crate) const MEM_FREE_KB: u64 = 4_194_304;
+const MEM_AVAILABLE_KB: u64 = 6_291_456;
+const MEM_CACHED_KB: u64 = 1_048_576;
+
 fn meminfo() -> Vec<u8> {
-    // Plausible fixed values; programs mostly parse MemTotal/MemAvailable.
-    b"MemTotal:        8388608 kB\nMemFree:         4194304 kB\n\
-      MemAvailable:    6291456 kB\nBuffers:               0 kB\n\
-      Cached:          1048576 kB\nSwapTotal:             0 kB\n\
-      SwapFree:              0 kB\n"
-        .to_vec()
+    format!(
+        "MemTotal:       {MEM_TOTAL_KB:8} kB\nMemFree:        {MEM_FREE_KB:8} kB\n\
+         MemAvailable:   {MEM_AVAILABLE_KB:8} kB\nBuffers:               0 kB\n\
+         Cached:         {MEM_CACHED_KB:8} kB\nSwapTotal:             0 kB\n\
+         SwapFree:              0 kB\n"
+    )
+    .into_bytes()
 }
 
 fn stat(ncpu: u32) -> Vec<u8> {

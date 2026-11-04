@@ -292,6 +292,7 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::UNAME => self.sys_uname(a[0]),
+            nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 0
@@ -620,6 +621,23 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
+    /// `sysinfo`: the host's uptime and load, and the memory `/proc/meminfo`
+    /// reports.
+    fn sys_sysinfo(&mut self, buf: u64) -> i64 {
+        let scale = (1u64 << fwe_abi::SI_LOAD_SHIFT) as f64;
+        let info = fwe_abi::Sysinfo {
+            uptime: host::uptime() as i64,
+            loads: host::load_averages().map(|l| (l * scale) as u64),
+            totalram: crate::procfs::MEM_TOTAL_KB * 1024,
+            freeram: crate::procfs::MEM_FREE_KB * 1024,
+            procs: 1,
+            mem_unit: 1,
+            ..Default::default()
+        };
+        guest!(uaccess::write(buf, info));
+        0
+    }
+
     fn sys_sched_getaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
         // SAFETY: plain host call.
         if pid != 0 && pid as i32 != unsafe { libc::getpid() } {
@@ -916,6 +934,17 @@ mod tests {
         assert_eq!(kernel().syscall(nr::UNAME, [&mut u as *mut _ as u64, 0, 0, 0, 0, 0]), 0);
         assert!(u.sysname.starts_with(b"Linux\0"));
         assert!(u.machine.starts_with(b"aarch64\0"));
+    }
+
+    #[test]
+    fn sysinfo_reports_uptime_and_memory() {
+        let mut info = fwe_abi::Sysinfo::default();
+        let p = &mut info as *mut _ as u64;
+        assert_eq!(kernel().syscall(nr::SYSINFO, [p, 0, 0, 0, 0, 0]), 0);
+        assert!(info.uptime > 0);
+        assert_eq!(info.totalram, crate::procfs::MEM_TOTAL_KB * 1024);
+        assert!(info.freeram <= info.totalram);
+        assert_eq!(info.mem_unit, 1);
     }
 
     /// A scratch file, opened twice: two open file descriptions.

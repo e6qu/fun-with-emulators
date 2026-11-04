@@ -758,6 +758,29 @@ pub struct Rlimit {
 /// Length of each field of `struct new_utsname`.
 pub const UTSNAME_LEN: usize = 65;
 
+/// `struct sysinfo` (64-bit: the trailing pad array is empty).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sysinfo {
+    pub uptime: i64,
+    /// 1, 5 and 15 minute load averages, scaled by `1 << SI_LOAD_SHIFT`.
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+}
+
+/// `sysinfo` load averages are fixed point with this many fraction bits.
+pub const SI_LOAD_SHIFT: u32 = 16;
+
 /// `struct new_utsname`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -900,6 +923,8 @@ mod tests {
         assert_eq!(size_of::<Itimerspec>(), 32);
         assert_eq!(size_of::<Winsize>(), 8);
         assert_eq!(size_of::<Flock>(), 32);
+        assert_eq!(size_of::<Sysinfo>(), 112);
+        assert_eq!(core::mem::offset_of!(Sysinfo, totalhigh), 88);
         assert_eq!(size_of::<Rlimit>(), 16);
         assert_eq!(size_of::<Utsname>(), 390);
         assert_eq!(size_of::<Sigaction>(), 32);
