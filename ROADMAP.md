@@ -13,7 +13,7 @@ describes how the pieces work and lists the current limitations in detail.
 system-call surface is implemented, and the hypervisor backend runs
 low-address executables with threads, `fork` and `execve`; what remains is
 Debian's Python, the `x18` and code-discovery gaps, and running the rest of
-the listed software end to end (git, SQLite and lighttpd run).
+the listed software end to end (git, SQLite, lighttpd and Node run).
 
 ## M0 — Foundation (done)
 
@@ -109,17 +109,22 @@ Remaining:
   rather than copying it; a native-backend `fork` that stops the parent's
   other threads while memory is copied
 - [ ] Code discovery for binaries without section headers, and the `x18`
-  forms no tested binary uses yet (`sp`-writeback and `sp`-register-offset
-  loads and stores, flag-setting or extended `sp` arithmetic, `casp`,
-  pointer-authenticated loads), when a target program needs them
+  forms no tested binary uses yet (`sp`-writeback loads and stores, writes
+  to `sp`, `casp`, pointer-authenticated loads), when a target program needs
+  them. Done for Node: extended and flag-setting `sp` arithmetic, register
+  offsets and out-of-range offsets from `sp`, the vector-element moves, and
+  data among code told apart by the unwind table
 - [ ] Each of the target programs vendored or fetched as a test with checked
   output. Done: git (Debian's git runs a workflow of commits, branches,
   merge, stash, rebase, `grep` through PCRE2's JIT, `gc` and a `file://`
   clone), a database (Debian's SQLite: a write-ahead-logged database with
   concurrent writers, full-text search and JSON) and a web server (Debian's
   lighttpd: static files, directory listings, concurrent clients and CGI
-  scripts backed by SQLite). Left: a C compiler, Node, Go, the Rust
-  toolchain, `apt`
+  scripts backed by SQLite) and Node (Debian's Node.js 18, fetched: V8's
+  JIT, ICU, OpenSSL's digests, zlib, files, a child process, HTTP and a
+  worker thread). Left: a C compiler (Debian's GCC and clang are non-PIE
+  executables linked below 4 GiB, so they need the hypervisor backend, as
+  Python does), Go, the Rust toolchain, `apt`
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.

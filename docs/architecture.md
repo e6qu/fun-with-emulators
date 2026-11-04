@@ -608,11 +608,12 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
-  entitlement and a bare-metal Apple Silicon Mac. A few rare `x18` forms are left
-  unrewritten (see Rewriting guest code; `--strace` counts them). Code
-  discovery relies on section
-  headers; a stripped binary has its whole executable segment scanned, and
-  an inline jump table in a code section could be patched.
+  entitlement and a bare-metal Apple Silicon Mac (Debian's GCC, clang and
+  Python are such executables). A few rare `x18` forms are left unrewritten
+  (see Rewriting guest code; `--strace` counts them), and so is any `x18`
+  use in JIT code. Code discovery relies on section headers and the unwind
+  table; a stripped binary has its whole executable segment scanned, and an
+  inline jump table in code the unwind table covers could be patched.
 - **Processes:** a `vfork` child shares the guest's memory but not its
   mappings (an `mmap` or `munmap` in it stays in the child); a fork child
   of a timerfd loses the expirations not yet read; in the native backend a
