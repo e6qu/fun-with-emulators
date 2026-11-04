@@ -34,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # The Debian packages the target-program tests fetch
+      # (guests/debian/fetch), so each runner downloads them once.
+      - uses: actions/cache@v4
+        with:
+          path: target/debian-packages
+          key: debian-packages-${{ hashFiles('guests/debian/fetch/*.txt') }}
       - run: sw_vers && uname -m && clang --version
       - run: cargo build
       - name: Report hypervisor availability (informational)

@@ -47,6 +47,8 @@ const STR_UIMM: u32 = 0xf900_0000;
 const PUSH: u32 = 0xf81f_0fe0;
 /// `ldr xT, [sp], #16`
 const POP: u32 = 0xf841_07e0;
+/// `add xD, sp, #48`: the `sp` a three-register stub was entered with.
+const ADD_SP_48: u32 = 0x9100_c3e0;
 /// `b <label>`
 const B: u32 = 0x1400_0000;
 /// `br xN` (indirect branch); `| (n << 5)`.
@@ -108,10 +110,29 @@ pub struct Patched {
 }
 
 /// Rewrite what can be rewritten in place and collect the rest. `code`
-/// must start at a 4-byte aligned address.
-pub fn patch(code: &mut [u8]) -> Patched {
+/// must start at a 4-byte aligned address. `known`, when given, is the
+/// `(offset, length)` byte ranges of `code` that are known to be code (the
+/// image's unwind table covers them): a word outside them that looks like
+/// an `x18` instruction is data in practice — a constant table hand-written
+/// assembly keeps among its code — and is left alone.
+pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
     let mut out = Patched::default();
-    let data = literal_pool_words(code);
+    let words = code.len() / 4;
+    let is_code: Vec<bool> = match known {
+        None => vec![true; words],
+        Some(ranges) => {
+            let mut v = vec![false; words];
+            for &(off, len) in ranges {
+                let first = (off / 4) as usize;
+                let last = (off.saturating_add(len).div_ceil(4) as usize).min(words);
+                for w in v.iter_mut().take(last).skip(first) {
+                    *w = true;
+                }
+            }
+            v
+        }
+    };
+    let data = literal_pool_words(code, &is_code);
     for (i, word) in code.chunks_exact_mut(4).enumerate() {
         // Words that belong to a literal pool are data, not instructions, and a
         // constant can encode anything — never rewrite them.
@@ -134,6 +155,8 @@ pub fn patch(code: &mut [u8]) -> Patched {
         } else if insn & !RT_MASK == MSR_TPIDR {
             out.sites.push((i as u64 * 4, Site::WriteThreadPointer { rt: insn & RT_MASK }));
             None
+        } else if !is_code[i] {
+            None
         } else if x18_site(insn) {
             out.sites.push((i as u64 * 4, Site::X18 { insn }));
             None
@@ -152,10 +175,15 @@ pub fn patch(code: &mut [u8]) -> Patched {
 
 /// Mark, for each word of `code`, whether it is the target of a `ldr`-literal
 /// (so part of a literal pool) and therefore data rather than an instruction.
-fn literal_pool_words(code: &[u8]) -> Vec<bool> {
+fn literal_pool_words(code: &[u8], is_code: &[bool]) -> Vec<bool> {
     let n = code.len() / 4;
     let mut data = vec![false; n];
     for (i, w) in code.chunks_exact(4).enumerate() {
+        // Only a load that is code names a literal: a data word that happens
+        // to decode as one could otherwise hide a real instruction.
+        if !is_code[i] {
+            continue;
+        }
         let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
         if let Some((off, size)) = crate::decode::literal_target(insn) {
             let target = i as i64 * 4 + off;
@@ -394,6 +422,11 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let pick = |used: u32| (0u32..=30).find(|&r| used & (1 << r) == 0).expect("a free register");
     let s1 = pick(used);
     let s2 = pick(used | (1 << s1));
+    // An `sp` operand the push cannot be folded into is replaced by a third
+    // scratch register holding `sp` as it was on entry (see
+    // [`crate::decode::sp_base_scratch`]).
+    let sp_base = crate::decode::sp_base_scratch(insn);
+    let s3 = pick(used | (1 << s1) | (1 << s2));
 
     let reads = ops.iter().any(|f| field_reg(f) == 18 && f.read);
     let writes = ops.iter().any(|f| field_reg(f) == 18 && f.write);
@@ -405,6 +438,7 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     // independent.
     let mut rewritten = match crate::decode::sp_fixup(insn) {
         crate::decode::SpFixup::Adjusted(a) => a,
+        _ if sp_base => (insn & !(0x1f << 5)) | (s3 << 5),
         _ => insn,
     };
     for f in &ops {
@@ -413,13 +447,20 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
         }
     }
 
-    let mut words = vec![PUSH | s1, PUSH | s2, MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2];
+    let mut words = vec![PUSH | s1, PUSH | s2];
+    if sp_base {
+        words.extend([PUSH | s3, ADD_SP_48 | s3]);
+    }
+    words.extend([MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2]);
     if reads {
         words.push(LDR_UIMM | imm | (s2 << 5) | s1);
     }
     words.push(rewritten);
     if writes {
         words.push(STR_UIMM | imm | (s2 << 5) | s1);
+    }
+    if sp_base {
+        words.push(POP | s3);
     }
     words.push(POP | s2);
     words.push(POP | s1);
@@ -434,6 +475,31 @@ mod tests {
         ws.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
+    /// `add x1, sp, x18`: no immediate can absorb the 32-byte push, so a
+    /// third scratch register holds `sp` as it was on entry and stands in
+    /// for it.
+    #[test]
+    fn x18_stub_with_sp_in_a_scratch_register() {
+        let words = x18_stub(0x8b3263e1, 3 << 10);
+        // x1 and x18 are used: s1 = x0, s2 = x2, s3 = x3.
+        assert_eq!(
+            words,
+            vec![
+                PUSH,                            // str x0, [sp, #-16]!
+                PUSH | 2,                        // str x2, [sp, #-16]!
+                PUSH | 3,                        // str x3, [sp, #-16]!
+                ADD_SP_48 | 3,                   // add x3, sp, #48
+                MRS_TPIDRRO | 2,                 // mrs x2, tpidrro_el0
+                AND_NOT7 | (2 << 5) | 2,         // and x2, x2, #~7
+                LDR_UIMM | (3 << 10) | (2 << 5), // ldr x0, [x2, #24]
+                0x8b206061,                      // add x1, x3, x0 (uxtx)
+                POP | 3,
+                POP | 2,
+                POP,
+            ]
+        );
+    }
+
     #[test]
     fn trap_encoding() {
         // brk #0x4c58
@@ -445,7 +511,7 @@ mod tests {
         let mov_x8 = 0xd280_0808; // mov x8, #64
         let svc1 = 0xd400_0021; // svc #1
         let mut code = words(&[mov_x8, SVC0, svc1, SVC0]);
-        let p = patch(&mut code);
+        let p = patch(&mut code, None);
         assert_eq!(p.syscalls, 2);
         assert!(p.sites.is_empty());
         assert_eq!(code, words(&[mov_x8, TRAP, svc1, TRAP]));
@@ -459,7 +525,7 @@ mod tests {
             0xd53b_d05f, // mrs xzr, tpidr_el0
             0xd53b_d060, // mrs x0, tpidrro_el0 (left alone)
         ]);
-        let p = patch(&mut code);
+        let p = patch(&mut code, None);
         assert_eq!(
             p.sites,
             vec![(0, Site::ReadThreadPointer { rt: 9 }), (4, Site::WriteThreadPointer { rt: 0 }),]
@@ -473,7 +539,7 @@ mod tests {
         let mut code = vec![0u8; 2];
         code.extend_from_slice(&SVC0.to_le_bytes());
         code.extend_from_slice(&[0, 0]);
-        assert_eq!(patch(&mut code), Patched::default());
+        assert_eq!(patch(&mut code, None), Patched::default());
     }
 
     #[test]
@@ -701,11 +767,44 @@ mod tests {
             0xd283_0312, // data that looks like movz x18
             0x0000_0000, // data
         ]);
-        let p = patch(&mut code);
+        let p = patch(&mut code, None);
         assert!(p.sites.is_empty(), "literal-pool data must not become a site");
         assert_eq!(p.x18_deferred, 0);
         // The data word is untouched.
         assert_eq!(&code[8..12], &0xd283_0312u32.to_le_bytes());
+    }
+
+    /// Outside the known code (what the unwind table covers), a word that
+    /// looks like an `x18` instruction is data — a constant table kept
+    /// among hand-written assembly — and stays as it is; system calls are
+    /// still translated.
+    #[test]
+    fn x18_lookalikes_outside_known_code_are_data() {
+        let mut code = words(&[
+            0xd283_0312, // movz x18, #0x1818: code, rewritten
+            0xd400_0001, // svc #0: code
+            0xd283_0312, // the same word in a table: data
+            0x3956_c25b, // a SHA-256 constant that decodes as `ldrb w27, [x18, ...]`
+        ]);
+        let p = patch(&mut code, Some(&[(0, 8)]));
+        assert_eq!(p.sites.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(p.syscalls, 1);
+        assert_eq!(p.x18_deferred, 0);
+        assert_eq!(&code[8..16], &words(&[0xd283_0312, 0x3956_c25b])[..]);
+    }
+
+    /// A data word that happens to decode as a literal load does not make a
+    /// real instruction it "targets" into data (it hid an `x18` use in
+    /// OpenSSL's MD5 from the rewrite).
+    #[test]
+    fn literal_lookalikes_in_data_hide_no_code() {
+        let mut code = words(&[
+            0x1392_2a52, // ror w18, w18, #10: code
+            0xd65f_03c0, // ret
+            0x58ff_ffc0, // data that decodes as `ldr x0, #-8`, aimed at the ror
+        ]);
+        let p = patch(&mut code, Some(&[(0, 8)]));
+        assert_eq!(p.sites.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
     }
 
     #[test]
@@ -718,7 +817,7 @@ mod tests {
             0xf8010ff2, // str x18, [sp, #16]! -> deferred (sp writeback)
             0xd2800000, // movz x0, #0         -> untouched
         ]);
-        let p = patch(&mut code);
+        let p = patch(&mut code, None);
         assert_eq!(p.sites.len(), 4);
         assert_eq!(p.x18_deferred, 1);
         assert!(matches!(p.sites[0].1, Site::X18 { insn: 0xd2830312 }));

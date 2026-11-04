@@ -1019,6 +1019,172 @@ SQL
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// Where fetched Debian packages are cached (`FWE_DEBIAN_CACHE`, or under
+/// `target/`), so a test downloads each only once.
+fn debian_cache() -> PathBuf {
+    std::env::var_os("FWE_DEBIAN_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo().join("target/debian-packages"))
+}
+
+/// A root filesystem of the Debian packages listed in
+/// `guests/debian/fetch/<manifest>.txt`, fetched (and checked against the
+/// SHA-256 recorded there) on first use and unpacked once, plus the vendored
+/// glibc runtime and bash. The packages come from deb.debian.org, or from
+/// snapshot.debian.org once a newer version has replaced them.
+fn fetched_root(manifest: &str) -> PathBuf {
+    let list = std::fs::read_to_string(repo().join(format!("guests/debian/fetch/{manifest}.txt")))
+        .unwrap();
+    let packages: Vec<(&str, &str)> = list
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| l.split_once(' ').unwrap())
+        .collect();
+    let cache = debian_cache();
+    let root = cache.join(format!("root-{manifest}"));
+    let done = root.join(".fwe-complete");
+    if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
+        return root;
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    for (pool, sha256) in &packages {
+        let deb = cache.join(Path::new(pool).file_name().unwrap());
+        let sum = |f: &Path| {
+            let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
+        };
+        if !deb.exists() || sum(&deb) != *sha256 {
+            let fetched = [
+                format!("https://deb.debian.org/debian/{pool}"),
+                format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
+            ]
+            .iter()
+            .any(|url| {
+                Command::new("curl")
+                    .args(["-fsSL", "--retry", "3", "-o"])
+                    .arg(&deb)
+                    .arg(url)
+                    .status()
+                    .is_ok_and(|s| s.success())
+                    && sum(&deb) == *sha256
+            });
+            assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
+        }
+        // A .deb is an `ar` archive whose data.tar.* holds the files.
+        let unpack = cache.join("unpack");
+        let _ = std::fs::remove_dir_all(&unpack);
+        std::fs::create_dir_all(&unpack).unwrap();
+        run_checked(Command::new("ar").arg("x").arg(&deb).current_dir(&unpack));
+        let data = std::fs::read_dir(&unpack)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("data.tar"))
+            .unwrap();
+        run_checked(Command::new("tar").arg("xf").arg(&data).arg("-C").arg(&root));
+    }
+    for name in ["ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6"] {
+        std::fs::copy(repo().join("guests/glibc/lib").join(name), root.join("lib").join(name))
+            .unwrap();
+    }
+    std::fs::copy(repo().join("guests/debian/lib/libtinfo.so.6"), root.join("lib/libtinfo.so.6"))
+        .unwrap();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(debian_bin("bash"), root.join("bin/bash")).unwrap();
+    let _ = std::os::unix::fs::symlink("bash", root.join("bin/sh"));
+    std::fs::write(&done, &list).unwrap();
+    root
+}
+
+/// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
+/// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
+/// constant tables among its code, which must not be rewritten), zlib, the
+/// file system with promises and timers, a child process, an HTTP server
+/// and client in one process, and a worker thread.
+#[test]
+fn debian_node_runs_a_workload() {
+    let root = fetched_root("node");
+    let script = format!("/tmp/fwe-node-{}.js", std::process::id());
+    let data = format!("/tmp/fwe-node-{}.txt", std::process::id());
+    std::fs::write(
+        root.join(script.trim_start_matches('/')),
+        format!(
+            r#"
+const crypto = require('crypto');
+const zlib = require('zlib');
+const fs = require('fs');
+const http = require('http');
+const {{ execFileSync }} = require('child_process');
+const {{ Worker }} = require('worker_threads');
+
+function fib(n) {{ return n < 2 ? n : fib(n - 1) + fib(n - 2); }}
+let s = 0; for (let i = 0; i < 2000; i++) s += fib(15);
+console.log('fib', fib(25), s);
+console.log('intl', new Intl.NumberFormat('de-DE').format(1234567.891),
+            new Date(0).toLocaleDateString('en-GB', {{ timeZone: 'UTC' }}));
+for (const a of ['md5', 'sha1', 'sha256', 'sha512', 'ripemd160', 'sha3-256'])
+  console.log(a, crypto.createHash(a).update('fun-with-emulators').digest('hex').slice(0, 16));
+const big = Buffer.alloc(100000, 'abc');
+console.log('zlib', zlib.gunzipSync(zlib.gzipSync(big)).equals(big));
+fs.writeFileSync('{data}', 'line1\nline2\n');
+console.log('fs', fs.readFileSync('{data}', 'utf8').split('\n').length);
+console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toString().trim());
+(async () => {{
+  await new Promise(r => setTimeout(r, 20));
+  console.log('promises', (await fs.promises.readFile('{data}', 'utf8')).length);
+  fs.unlinkSync('{data}');
+  const server = http.createServer((req, res) => res.end('hi ' + req.url));
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const body = await new Promise((resolve, reject) => {{
+    http.get({{ host: '127.0.0.1', port: server.address().port, path: '/x' }}, res => {{
+      let b = ''; res.on('data', d => b += d); res.on('end', () => resolve(b));
+    }}).on('error', reject);
+  }});
+  console.log('http', body);
+  server.close();
+  const w = new Worker('require("worker_threads").parentPort.postMessage(21 * 2)', {{ eval: true }});
+  w.on('message', m => console.log('worker', m));
+  w.on('exit', c => console.log('worker exit', c));
+}})();
+"#
+        ),
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/node"))
+        .arg(&script)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/tmp")
+        .stdin(Stdio::null());
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
+    eprintln!("--- node stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    // The digests are the host's (`shasum`, `md5`, Python's hashlib).
+    assert_eq!(
+        stdout(&out),
+        "fib 75025 1220000\n\
+         intl 1.234.567,891 01/01/1970\n\
+         md5 83cce8037da91bde\n\
+         sha1 c650da2b9b797302\n\
+         sha256 9c3ef3144c6828d9\n\
+         sha512 fca8db3fbca619cd\n\
+         ripemd160 74e7d081086e35cb\n\
+         sha3-256 3bee16617c9f352e\n\
+         zlib true\n\
+         fs 3\n\
+         child 42\n\
+         promises 12\n\
+         http hi /x\n\
+         worker 42\n\
+         worker exit 0\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// A running guest server, stopped (`SIGTERM`) and reaped when dropped.
 struct Server(std::process::Child);
 

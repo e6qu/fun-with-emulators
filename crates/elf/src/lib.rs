@@ -11,6 +11,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+mod unwind;
+
 pub const ET_EXEC: u16 = 2;
 pub const ET_DYN: u16 = 3;
 pub const EM_AARCH64: u16 = 183;
@@ -265,6 +267,67 @@ impl<'a> Elf<'a> {
     /// the rewrite off those tables.
     pub fn exec_file_ranges(&self) -> Option<Vec<(u64, u64)>> {
         self.exec_sections().map(|s| s.into_iter().map(|s| (s.offset, s.size)).collect())
+    }
+
+    /// The `(start, length)` link-address ranges of code that the unwind
+    /// table (`.eh_frame`) describes, or `None` without a usable table. Bytes
+    /// of an executable section outside them are data in practice (see
+    /// `unwind.rs`).
+    pub fn unwind_code_ranges(&self) -> Option<Vec<(u64, u64)>> {
+        let s = self.section_named(b".eh_frame")?;
+        let end = s.offset.checked_add(s.size)?;
+        let data = self.data.get(s.offset as usize..end as usize)?;
+        let ranges = unwind::code_ranges(data, s.addr)?;
+        (!ranges.is_empty()).then_some(ranges)
+    }
+
+    /// [`Elf::unwind_code_ranges`] as `(file offset, length)`, through the
+    /// load segment holding each range.
+    pub fn unwind_code_file_ranges(&self) -> Option<Vec<(u64, u64)>> {
+        let ranges = self.unwind_code_ranges()?;
+        Some(
+            ranges
+                .into_iter()
+                .filter_map(|(a, l)| {
+                    let ph = self.loads().find(|ph| ph.vaddr <= a && a < ph.vaddr + ph.filesz)?;
+                    Some((a - ph.vaddr + ph.offset, l))
+                })
+                .collect(),
+        )
+    }
+
+    /// The section called `name`, through the section-name string table.
+    fn section_named(&self, name: &[u8]) -> Option<Section> {
+        let d = self.data;
+        if d.len() < EHDR_SIZE {
+            return None;
+        }
+        let shoff = u64_at(d, 40) as usize;
+        let shentsize = u16_at(d, 58) as usize;
+        let shnum = u16_at(d, 60) as usize;
+        let shstrndx = u16_at(d, 62) as usize;
+        if shoff == 0 || shentsize < SHDR_SIZE || shstrndx >= shnum {
+            return None;
+        }
+        let header = |i: usize| -> Option<(u32, Section)> {
+            let o = shoff.checked_add(i.checked_mul(shentsize)?)?;
+            if o.checked_add(SHDR_SIZE)? > d.len() {
+                return None;
+            }
+            let section = Section {
+                offset: u64_at(d, o + 24),
+                addr: u64_at(d, o + 16),
+                size: u64_at(d, o + 32),
+            };
+            Some((u32_at(d, o), section))
+        };
+        let (_, strtab) = header(shstrndx)?;
+        let names = d.get(strtab.offset as usize..(strtab.offset + strtab.size) as usize)?;
+        (0..shnum).filter_map(header).find_map(|(n, s)| {
+            let rest = names.get(n as usize..)?;
+            let len = rest.iter().position(|&b| b == 0)?;
+            (&rest[..len] == name).then_some(s)
+        })
     }
 
     /// The allocated `SHF_EXECINSTR` sections, or `None` when the section

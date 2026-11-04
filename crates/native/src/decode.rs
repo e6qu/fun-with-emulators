@@ -60,7 +60,9 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
             // `add x18, sp, #imm` and the like (`mov x18, sp`): the stub runs
             // with `sp` 32 bytes lower, which [`sp_fixup`] folds into the
             // immediate when it can.
-            if !flag_setting && reg(insn, RD) != 31 && sp_fixup(insn) != SpFixup::Defer {
+            if !flag_setting && reg(insn, RD) != 31 && sp_fixup(insn) != SpFixup::Defer
+                || sp_base_scratch(insn)
+            {
                 return Some(vec![Field { shift: RD, read: false, write: true }]);
             }
             return None;
@@ -104,7 +106,8 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
     if (insn >> 24) & 0x1f == 0b01011 {
         if (insn >> 21) & 1 == 1 {
             let flag_setting = (insn >> 29) & 1 == 1;
-            if reg(insn, RN) == 31 || (!flag_setting && reg(insn, RD) == 31) {
+            let sp_ok = reg(insn, RN) != 31 || sp_base_scratch(insn);
+            if !sp_ok || (!flag_setting && reg(insn, RD) == 31) {
                 return None;
             }
         }
@@ -205,6 +208,18 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         });
     }
 
+    // Moves between a general register and a vector element (AdvSIMD copy,
+    // op = 0): `dup` and `ins` from a general register read Rn; `smov` and
+    // `umov` (`mov` to a general register) write Rd. The vector operand is
+    // left alone, as for the conversions above.
+    if insn & 0xbfe0_8400 == 0x0e00_0400 {
+        return match (insn >> 11) & 0xf {
+            0b0001 | 0b0011 => Some(vec![Field { shift: RN, read: true, write: false }]),
+            0b0101 | 0b0111 => Some(vec![Field { shift: RD, read: false, write: true }]),
+            _ => None,
+        };
+    }
+
     load_store(insn)
 }
 
@@ -219,7 +234,9 @@ fn load_store(insn: u32) -> Option<Vec<Field>> {
     let base = |write| Field { shift: RN, read: true, write };
     let rr = |shift| Field { shift, read: true, write: false };
     let sp_base = reg(insn, RN) == 31;
-    let sp_defer = sp_base && !v && matches!(sp_fixup(insn), SpFixup::Defer);
+    // An `sp` base the stub can neither offset nor replace by a scratch
+    // register (a writeback onto `sp`).
+    let sp_defer = sp_base && matches!(sp_fixup(insn), SpFixup::Defer) && !sp_base_scratch(insn);
 
     // Load/store exclusive, ordered (acquire/release) and compare-and-swap:
     // op[29:24] = 001000.
@@ -242,12 +259,7 @@ fn load_store(insn: u32) -> Option<Vec<Field>> {
                 _ => return None,
             }
         }
-        if bit21 {
-            // Register offset: no immediate to absorb the stub's push.
-            if sp_base {
-                return None;
-            }
-        } else if sp_defer {
+        if sp_base && bit21 && !sp_base_scratch(insn) || !bit21 && sp_defer {
             return None;
         }
         let writeback = !unsigned_imm && !bit21 && matches!((insn >> 10) & 3, 0b01 | 0b11);
@@ -426,6 +438,42 @@ pub fn sp_fixup(insn: u32) -> SpFixup {
     SpFixup::NotSp
 }
 
+/// Whether `insn` takes `sp` as its base or first source (`Rn` = 31) in a
+/// form where a general register may stand in for it, and the stub must do
+/// that: [`sp_fixup`] cannot fold the stub's push into an offset. The stub
+/// then holds `sp`'s value on entry in a scratch register and runs the
+/// instruction with that register as `Rn`. These are `add`/`sub` immediate
+/// and extended-register (flag-setting too, but not one that writes `sp`),
+/// and loads and stores without writeback (a register offset, or an offset
+/// the bump would push out of range).
+pub fn sp_base_scratch(insn: u32) -> bool {
+    if reg(insn, RN) != 31 || matches!(sp_fixup(insn), SpFixup::Adjusted(_)) {
+        return false;
+    }
+    let flag_setting = (insn >> 29) & 1 == 1;
+    let writes_sp = !flag_setting && reg(insn, RD) == 31;
+    // Add/subtract (immediate), and (extended register).
+    if (insn >> 24) & 0x1f == 0b10001 || (insn >> 24) & 0x1f == 0b01011 && (insn >> 21) & 1 == 1 {
+        return !writes_sp;
+    }
+    // Single register (unsigned offset; unscaled, register offset), but
+    // not pre/post-index writeback or the atomics.
+    if insn & 0x3b00_0000 == 0x3900_0000 {
+        return true;
+    }
+    if insn & 0x3b00_0000 == 0x3800_0000 {
+        let bit21 = (insn >> 21) & 1 == 1;
+        let idx = (insn >> 10) & 3;
+        return if bit21 { idx == 0b10 } else { idx == 0b00 || idx == 0b10 };
+    }
+    // Pair, signed offset or no-allocate (not pre/post-index).
+    if insn & 0x3a00_0000 == 0x2800_0000 {
+        let mode = (insn >> 23) & 3;
+        return mode == 0b10 || mode == 0b00;
+    }
+    false
+}
+
 /// If `insn` is a `ldr`-literal (PC-relative load), the byte offset of its
 /// target relative to the instruction, and the number of bytes it loads. Used
 /// to mark literal-pool data so the rewrite pass does not scan it as code.
@@ -549,6 +597,8 @@ fn gpr_fields(insn: u32) -> Option<Vec<u32>> {
         // Data processing, register.
         0b0101 | 0b1101 => Some(if (insn >> 24) & 0x1f == 0b11011 {
             vec![RD, RN, RM, 10] // 3-source
+        } else if (insn >> 21) & 0xff == 0b1101_0010 && (insn >> 11) & 1 == 1 {
+            vec![RN] // ccmp/ccmn immediate: an imm5 where Rm would be
         } else {
             vec![RD, RN, RM]
         }),
@@ -598,10 +648,10 @@ mod tests {
         assert_eq!(operands(0x91001041), Some(vec![rd(RD), rr(RN)]));
         // add x18, sp, #0 (mov x18, sp) -> sp source, folded into the stub
         assert_eq!(operands(0x910003f2), Some(vec![rd(RD)]));
-        // adds x18, sp, #8 -> flag-setting from sp, deferred
-        assert_eq!(operands(0xb10023f2), None);
-        // add x18, sp, #1, lsl #12 -> shifted immediate, deferred
-        assert_eq!(operands(0x914007f2), None);
+        // adds x18, sp, #8 -> flag-setting from sp: sp through a scratch
+        assert_eq!(operands(0xb10023f2), Some(vec![rd(RD)]));
+        // add x18, sp, #1, lsl #12 -> shifted immediate: sp through a scratch
+        assert_eq!(operands(0x914007f2), Some(vec![rd(RD)]));
         // add sp, x18, #8 -> Rd is sp, deferred
         assert_eq!(operands(0x9100225f), None);
         // cmp x18, #42 == subs xzr, x18, #42 -> Rd is xzr; read x18
@@ -626,10 +676,40 @@ mod tests {
         assert_eq!(sp_fixup(0x913fc3f2), SpFixup::Defer);
     }
 
+    /// The `sp` forms no immediate can absorb the stub's push run with `sp`
+    /// in a scratch register; a writeback onto `sp`, or a result in `sp`,
+    /// is still left alone. Encodings from `llvm-mc`.
+    #[test]
+    fn sp_base_through_a_scratch_register() {
+        let scratch = [
+            0x8b3263e1, // add x1, sp, x18
+            0xab3263e1, // adds x1, sp, x18
+            0x8b3263f2, // add x18, sp, x18
+            0x0b3243e3, // add w3, wsp, w18
+            0xcb296bf2, // sub x18, sp, x9, lsl #2
+            0x913fe3f2, // add x18, sp, #4088
+            0xa91f4bf0, // stp x16, x18, [sp, #496]
+            0x295c4bef, // ldp w15, w18, [sp, #224]
+            0xf8636bf2, // ldr x18, [sp, x3]
+        ];
+        for insn in scratch {
+            assert!(sp_base_scratch(insn), "{insn:#x}");
+            assert!(operands(insn).is_some(), "{insn:#x}");
+        }
+        // add sp, sp, x18 writes sp; str x18, [sp, #-16]! writes it back.
+        for insn in [0x8b3263ff, 0xf81f0ff2] {
+            assert!(!sp_base_scratch(insn), "{insn:#x}");
+            assert_eq!(operands(insn), None, "{insn:#x}");
+        }
+        // add x18, sp, #0x18 folds the push into its immediate instead.
+        assert!(!sp_base_scratch(0x910063f2));
+    }
+
     /// Only real register fields count: immediates and branch offsets whose
     /// bits happen to read 18 do not.
     #[test]
     fn names_x18_is_precise() {
+        assert!(!names_x18(0x7a521840)); // ccmp w2, #18, #0, ne: an immediate
         assert!(!names_x18(0x94004869)); // bl: an offset, no registers
         assert!(!names_x18(0x54000240)); // b.eq
         assert!(!names_x18(0xf9404a60)); // ldr x0, [x19, #0x90]: imm12 bits
@@ -808,11 +888,26 @@ mod tests {
         assert_eq!(operands(0xeb21425f), Some(vec![rd(RD), rr(RN), rr(RM)]));
         // add sp, x18, x1: Rd is sp, deferred
         assert_eq!(operands(0x8b21625f), None);
-        // add x18, sp, x1: Rn is sp, deferred
-        assert_eq!(operands(0x8b2163f2), None);
+        // add x18, sp, x1: Rn is sp, which the stub keeps in a scratch
+        assert_eq!(operands(0x8b2163f2), Some(vec![rd(RD), rr(RN), rr(RM)]));
         // adc x18, x0, x1; sbcs x18, x0, x1
         assert_eq!(operands(0x9a010012), Some(vec![rd(RD), rr(RN), rr(RM)]));
         assert_eq!(operands(0xfa010012), Some(vec![rd(RD), rr(RN), rr(RM)]));
+    }
+
+    /// Encodings from `llvm-mc`.
+    #[test]
+    fn moves_between_general_registers_and_vector_elements() {
+        let reads = Some(vec![rr(RN)]);
+        let writes = Some(vec![rd(RD)]);
+        assert_eq!(operands(0x4e051e40), reads); // mov v0.b[2], w18 (ins)
+        assert_eq!(operands(0x4e081e45), reads); // mov v5.d[0], x18 (ins)
+        assert_eq!(operands(0x4e040e41), reads); // dup v1.4s, w18
+        assert_eq!(operands(0x0e0e3c52), writes); // umov w18, v2.h[3]
+        assert_eq!(operands(0x4e182c72), writes); // smov x18, v3.b[1]
+        assert_eq!(operands(0x4e183c92), writes); // mov x18, v4.d[1] (umov)
+        assert_eq!(operands(0x6e0c0420), None); // ins v0.s[1], v1.s[0]: no GPR
+        assert!(names_x18(0x4e051e40));
     }
 
     #[test]

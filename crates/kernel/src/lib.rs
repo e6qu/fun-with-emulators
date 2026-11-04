@@ -69,11 +69,18 @@ pub struct FpRegs {
 
 /// Services the kernel needs from the execution backend.
 pub trait Platform {
-    /// Make guest code in `[addr, addr + len)` safe to execute.
+    /// Make guest code in `[addr, addr + len)` safe to execute. `known`,
+    /// when given, is the address ranges the file's unwind table says hold
+    /// code; other bytes of the range may be data placed among the code.
     ///
     /// The memory is readable and writable when this is called; the kernel
     /// applies the final protections afterwards. Fails with a Linux errno.
-    fn prepare_exec(&mut self, addr: u64, len: u64) -> Result<(), i32>;
+    fn prepare_exec(
+        &mut self,
+        addr: u64,
+        len: u64,
+        known: Option<&[(u64, u64)]>,
+    ) -> Result<(), i32>;
 
     /// Terminate the whole process with `code` as its exit status
     /// (`exit_group`).

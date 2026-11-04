@@ -141,7 +141,9 @@ words finds every instruction exactly.
   the register-only data-processing classes (move wide, add/sub in the
   immediate, shifted- and extended-register and with-carry forms, logical,
   bitfield, extract, conditional select and compare, one-, two- and
-  three-source), the floating-point↔integer moves and conversions, all the
+  three-source), the floating-point↔integer moves and conversions, the moves
+  between a general register and a vector element (`dup`, `ins`, `smov`,
+  `umov`), all the
   load/store forms (unsigned and unscaled immediate, register offset, pre-
   and post-index, pair, the sign-extending loads, with general-purpose and
   SIMD transfer registers), the exclusive, acquire/release, compare-and-swap
@@ -153,14 +155,16 @@ words finds every instruction exactly.
   branches (`br`/`blr`/`ret` through `x18`, which load the target into
   `x16`/`x17`, dead at any branch). A stack spill of `x18` through `sp`, and
   `add`/`sub` of an immediate to `sp` into `x18` (`mov x18, sp`), have the
-  immediate adjusted by the 32 bytes the stub pushed. What is still left
-  alone: a load/store with writeback onto `sp` or a register offset from
-  `sp`, flag-setting, shifted-immediate or extended-register arithmetic
-  from `sp`, `casp` and the pointer-authenticated loads. Scanning the
-  vendored glibc, bash, coreutils and the Rust/musl test programs with the
-  disassembler finds none of these; `--strace` reports, per prepared range,
-  exactly how many `x18` uses were left (a count of real register operands,
-  not of bit patterns).
+  immediate adjusted by the 32 bytes the stub pushed. Where no immediate can
+  absorb the push — extended-register `add`/`sub` from `sp` (`add x1, sp,
+  x18`, of which Node's library has hundreds), flag-setting or shifted
+  immediates from `sp`, a register offset from `sp`, an offset the push
+  would move out of range — the stub saves a third scratch register, sets it
+  to `sp` as it was on entry and runs the instruction with that register in
+  place of `sp`. What is still left alone: a load/store with writeback onto
+  `sp`, an instruction that writes `sp`, `casp` and the pointer-authenticated
+  loads. `--strace` reports, per prepared image, exactly how many `x18`
+  uses were left (a count of real register operands, not of bit patterns).
 
   The backend keeps the slot and the kernel's register view in step: a trap
   reads the guest's `x18` from the slot into `Regs` and writes it back on
@@ -178,12 +182,29 @@ symbol, string, hash and relocation tables that share an executable segment
 with the code — the whole R-X segment of musl's `ld-musl`, the code segment
 of glibc's `libc.so.6` — are never scanned. For a file-backed `mmap` the
 kernel reads the backing file's section headers (`Elf::exec_file_ranges`)
-and translates only its executable sections. Within a code section, literal
-pools (the targets of `ldr` literal) are detected and skipped. Two gaps
-remain: inline data in a code section that is not a literal pool (a jump
-table), and a binary fully stripped of section headers, where the scan falls
-back to the whole executable segment. Recursive descent over reachable code
-is the general fix for both.
+and translates only its executable sections. Code sections still hold data:
+the constant tables of hand-written assembly (OpenSSL keeps SHA-256's and
+SHA-512's round constants, and many more, in `.text`, and over a thousand of
+`libcrypto`'s data words decode as instructions naming `x18`). An image's
+unwind table tells the two apart: every function a compiler emits has a
+frame description entry in `.eh_frame` giving the addresses it covers, and
+hand-written assembly with CFI directives does too
+(`crates/elf/src/unwind.rs`). Where an image has one, `x18` is rewritten
+only inside the ranges it covers — in glibc, libstdc++, ICU, git, bash,
+SQLite, lighttpd and PCRE2 every `x18` use lies inside them — and only a
+literal load that is itself code marks its target as a literal pool (a data
+word decoding as one had hidden an `x18` use in OpenSSL's MD5 from the
+rewrite). System calls and thread-pointer accesses are rewritten throughout
+the executable sections, as before. Without a usable unwind table the whole
+of each executable section counts as code. Two gaps remain: inline data in
+code an unwind table covers (a jump table), and a binary fully stripped of
+section headers, where the scan falls back to the whole executable segment.
+
+Code a guest makes executable after mapping it — a JIT compiler's, through
+`mprotect` or writable and executable memory (below) — has no unwind table,
+and its pages hold data among the code (V8's constant pools and metadata);
+JIT compilers for Linux arm64 leave `x18` alone (V8 reserves it). So there
+only system calls and thread-pointer accesses are rewritten.
 
 Stubs are placed in regions within `b` range (128 MiB) of their sites: the
 arena reserved after the loaded image, or, for code mapped later, regions
@@ -587,11 +608,12 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
-  entitlement and a bare-metal Apple Silicon Mac. A few rare `x18` forms are left
-  unrewritten (see Rewriting guest code; `--strace` counts them). Code
-  discovery relies on section
-  headers; a stripped binary has its whole executable segment scanned, and
-  an inline jump table in a code section could be patched.
+  entitlement and a bare-metal Apple Silicon Mac (Debian's GCC, clang and
+  Python are such executables). A few rare `x18` forms are left unrewritten
+  (see Rewriting guest code; `--strace` counts them), and so is any `x18`
+  use in JIT code. Code discovery relies on section headers and the unwind
+  table; a stripped binary has its whole executable segment scanned, and an
+  inline jump table in code the unwind table covers could be patched.
 - **Processes:** a `vfork` child shares the guest's memory but not its
   mappings (an `mmap` or `munmap` in it stays in the child); a fork child
   of a timerfd loses the expirations not yet read; in the native backend a

@@ -28,7 +28,12 @@ thread_local! {
 pub struct HvPlatform;
 
 impl Platform for HvPlatform {
-    fn prepare_exec(&mut self, _addr: u64, _len: u64) -> Result<(), i32> {
+    fn prepare_exec(
+        &mut self,
+        _addr: u64,
+        _len: u64,
+        _known: Option<&[(u64, u64)]>,
+    ) -> Result<(), i32> {
         // The guest's code runs as it is.
         Ok(())
     }

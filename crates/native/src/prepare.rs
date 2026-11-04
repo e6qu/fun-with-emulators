@@ -66,7 +66,9 @@ const PLACEMENT_STEP: u64 = 1 << 20;
 /// Sites grouped so that one stub region can reach all of them.
 const GROUP_SPAN: u64 = BRANCH_RANGE / 4;
 
-/// Prepare guest code in `[addr, addr + len)` for execution.
+/// Prepare guest code in `[addr, addr + len)` for execution. `known`, when
+/// given, is the host address ranges known to be code (see
+/// [`rewrite::patch`]).
 ///
 /// # Safety
 /// The range must be readable and writable guest memory that no thread is
@@ -78,12 +80,23 @@ pub unsafe fn prepare(
     x18_slot: u32,
     page: u64,
     mut arena: Option<&mut StubArena>,
+    known: Option<&[(u64, u64)]>,
 ) -> Result<Prepared, NoStubSpace> {
     let start = addr & !3;
     let len = (len + (addr - start)) & !3;
     // SAFETY: guaranteed by the caller.
     let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len as usize) };
-    let patched = rewrite::patch(code);
+    let known: Option<Vec<(u64, u64)>> = known.map(|ranges| {
+        ranges
+            .iter()
+            .filter_map(|&(a, l)| {
+                let lo = a.max(start);
+                let hi = a.saturating_add(l).min(start + len);
+                (lo < hi).then(|| (lo - start, hi - lo))
+            })
+            .collect()
+    });
+    let patched = rewrite::patch(code, known.as_deref());
     let stats = Prepared {
         syscalls: patched.syscalls,
         stubs: patched.sites.len(),
@@ -282,7 +295,7 @@ mod tests {
             unsafe { ((code + 4 * i as u64) as *mut u32).write(*w) };
         }
         // SAFETY: the mapping is ours, writable and not executing.
-        let stats = unsafe { prepare(code, 12, 8, 16, page, None) }.unwrap();
+        let stats = unsafe { prepare(code, 12, 8, 16, page, None, None) }.unwrap();
         assert_eq!(stats, Prepared { syscalls: 1, stubs: 2, x18_deferred: 0 });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };
