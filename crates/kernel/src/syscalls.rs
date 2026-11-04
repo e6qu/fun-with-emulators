@@ -536,7 +536,7 @@ impl<P: Platform> Kernel<P> {
                 ioctl::TIOCGWINSZ => {
                     let mut ws: libc::winsize = std::mem::zeroed();
                     if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) < 0 {
-                        return last_error();
+                        return host::tty_error();
                     }
                     let ws = Winsize {
                         ws_row: ws.ws_row,
@@ -934,6 +934,21 @@ mod tests {
         assert_eq!(kernel().syscall(nr::UNAME, [&mut u as *mut _ as u64, 0, 0, 0, 0, 0]), 0);
         assert!(u.sysname.starts_with(b"Linux\0"));
         assert!(u.machine.starts_with(b"aarch64\0"));
+    }
+
+    /// Terminal requests on something that is not a terminal fail with
+    /// `ENOTTY`, as on Linux, whatever the host says.
+    #[test]
+    fn terminal_requests_on_dev_null_are_enotty() {
+        use std::os::fd::AsRawFd;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let fd = null.as_raw_fd() as u64;
+        let mut buf = [0u8; 64];
+        let mut k = kernel();
+        for req in [ioctl::TCGETS, ioctl::TIOCGWINSZ] {
+            let r = k.syscall(nr::IOCTL, [fd, req, buf.as_mut_ptr() as u64, 0, 0, 0]);
+            assert_eq!(r, err(errno::ENOTTY), "ioctl {req:#x}");
+        }
     }
 
     #[test]

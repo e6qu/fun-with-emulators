@@ -614,6 +614,16 @@ pub unsafe fn openat(
     }
 }
 
+/// The error of a failed terminal request (`tcgetattr` and the like): Linux
+/// answers `ENOTTY` for anything that is not a terminal, where macOS gives
+/// `ENODEV` for some devices (`/dev/null`) and `EOPNOTSUPP` for others.
+pub fn tty_error() -> i64 {
+    match last_errno() {
+        libc::ENODEV | libc::EOPNOTSUPP => -(le::ENOTTY as i64),
+        _ => last_error(),
+    }
+}
+
 /// Seconds since the host booted (macOS's `CLOCK_MONOTONIC` counts sleep,
 /// as Linux's boot-time clock does).
 pub fn uptime() -> f64 {
