@@ -296,6 +296,11 @@ impl Fs {
         std::mem::replace(&mut self.umask, mask & 0o777)
     }
 
+    /// The guest path of the program the process runs (`/proc/self/exe`).
+    pub fn exe(&self) -> &[u8] {
+        &self.proc.exe
+    }
+
     /// Apply the umask to a creation mode.
     pub fn apply_umask(&self, mode: u32) -> u32 {
         mode & !self.umask & 0o7777

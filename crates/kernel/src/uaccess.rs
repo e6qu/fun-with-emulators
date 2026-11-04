@@ -301,6 +301,7 @@ pub fn pointer_args(nr: u64) -> u8 {
         n::GETRESUID | n::GETRESGID => 0b111,
         n::GETGROUPS | n::SETGROUPS => 0b10,
         n::PPOLL => 0b1101,
+        n::PSELECT6 => 0b11_1110,
         n::EPOLL_CTL => 0b1000,
         n::EPOLL_PWAIT => 0b1_0010,
         n::SIGNALFD4 => 0b10,
@@ -334,6 +335,16 @@ pub fn fcntl_pointer_args(cmd: u64) -> u8 {
     use fwe_abi::fcntl::*;
     match cmd {
         F_GETLK | F_SETLK | F_SETLKW => 0b100,
+        _ => 0,
+    }
+}
+
+/// [`pointer_args`] for a `prctl` call with option `option`: argument 1 is a
+/// pointer for the name and death-signal queries, a number otherwise.
+pub fn prctl_pointer_args(option: u64) -> u8 {
+    use fwe_abi::prctl::*;
+    match option {
+        PR_SET_NAME | PR_GET_NAME | PR_GET_PDEATHSIG => 0b10,
         _ => 0,
     }
 }

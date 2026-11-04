@@ -810,6 +810,24 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
+    /// `msync(addr, len, flags)`: the host's, on the same memory.
+    pub(crate) fn sys_msync(&mut self, addr: u64, len: u64, flags: u64) -> i64 {
+        if addr & (self.page_size - 1) != 0 {
+            return err(errno::EINVAL);
+        }
+        let Some(flags) = crate::host::msync_flags_to_host(flags) else {
+            return err(errno::EINVAL);
+        };
+        let len = self.page_up(len);
+        if crate::uaccess::crosses(addr, len) {
+            return err(errno::EINVAL);
+        }
+        let host = crate::uaccess::g2h(addr);
+        // SAFETY: syncing guest memory at the guest's request; the host
+        // checks the range is mapped.
+        ret(unsafe { libc::msync(host as *mut libc::c_void, len as usize, flags) })
+    }
+
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
         if addr & (self.page_size - 1) != 0 {
             return err(errno::EINVAL);

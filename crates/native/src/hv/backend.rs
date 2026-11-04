@@ -1081,6 +1081,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     let mask = match n {
         nr::FUTEX => uaccess::futex_pointer_args(args[1]),
         nr::FCNTL => uaccess::fcntl_pointer_args(args[1]),
+        nr::PRCTL => uaccess::prctl_pointer_args(args[0]),
         _ => uaccess::pointer_args(n),
     };
     let mut host_args = args;

@@ -624,6 +624,82 @@ pub fn tty_error() -> i64 {
     }
 }
 
+/// A host `struct statfs` in Linux layout. The filesystem type is reported
+/// as ext4, which is what a Linux rootfs would most likely be; the sizes
+/// and counts are the host's.
+#[cfg(target_os = "macos")]
+pub fn statfs_to_linux(s: &libc::statfs) -> fwe_abi::Statfs {
+    use fwe_abi::statfs::*;
+    let mut flags = 0;
+    if s.f_flags & libc::MNT_RDONLY as u32 != 0 {
+        flags |= ST_RDONLY;
+    }
+    if s.f_flags & libc::MNT_NOSUID as u32 != 0 {
+        flags |= ST_NOSUID;
+    }
+    fwe_abi::Statfs {
+        f_type: EXT4_SUPER_MAGIC,
+        f_bsize: i64::from(s.f_bsize),
+        f_blocks: s.f_blocks,
+        f_bfree: s.f_bfree,
+        f_bavail: s.f_bavail,
+        f_files: s.f_files,
+        f_ffree: s.f_ffree,
+        f_fsid: fsid(&s.f_fsid),
+        f_namelen: 255,
+        f_frsize: i64::from(s.f_bsize),
+        f_flags: flags,
+        f_spare: [0; 4],
+    }
+}
+
+/// A host `struct statfs` in arm64 layout (a Linux host has it already,
+/// but its `f_fsid` is opaque).
+#[cfg(target_os = "linux")]
+pub fn statfs_to_linux(s: &libc::statfs) -> fwe_abi::Statfs {
+    fwe_abi::Statfs {
+        f_type: s.f_type,
+        f_bsize: s.f_bsize,
+        f_blocks: s.f_blocks,
+        f_bfree: s.f_bfree,
+        f_bavail: s.f_bavail,
+        f_files: s.f_files,
+        f_ffree: s.f_ffree,
+        f_fsid: fsid(&s.f_fsid),
+        f_namelen: s.f_namelen,
+        f_frsize: s.f_frsize,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
+/// A filesystem id's two words (the libc crate keeps them private).
+fn fsid(id: &libc::fsid_t) -> [i32; 2] {
+    const _: () = assert!(size_of::<libc::fsid_t>() == 8);
+    // SAFETY: `fsid_t` is two 32-bit integers on both hosts.
+    unsafe { std::mem::transmute_copy(id) }
+}
+
+/// `msync` flags from Linux to host, or `None` for an unknown bit or for
+/// both `MS_ASYNC` and `MS_SYNC`.
+pub fn msync_flags_to_host(flags: u64) -> Option<libc::c_int> {
+    use fwe_abi::statfs::*;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & MS_ASYNC != 0 && flags & MS_SYNC != 0
+    {
+        return None;
+    }
+    let mut h = 0;
+    for (l, hb) in
+        [(MS_ASYNC, libc::MS_ASYNC), (MS_INVALIDATE, libc::MS_INVALIDATE), (MS_SYNC, libc::MS_SYNC)]
+    {
+        if flags & l != 0 {
+            h |= hb;
+        }
+    }
+    Some(h)
+}
+
 /// Seconds since the host booted (macOS's `CLOCK_MONOTONIC` counts sleep,
 /// as Linux's boot-time clock does).
 pub fn uptime() -> f64 {

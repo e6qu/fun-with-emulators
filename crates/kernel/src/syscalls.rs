@@ -198,6 +198,8 @@ impl<P: Platform> Kernel<P> {
             nr::FACCESSAT => self.sys_faccessat(a[0], a[1], a[2], 0),
             nr::FACCESSAT2 => self.sys_faccessat(a[0], a[1], a[2], a[3]),
             nr::NEWFSTATAT => self.sys_newfstatat(a[0], a[1], a[2], a[3]),
+            nr::STATFS => self.sys_statfs(a[0], a[1]),
+            nr::FSTATFS => self.sys_fstatfs(a[0], a[1]),
             nr::FSTAT => self.sys_fstat(a[0], a[1]),
             nr::STATX => self.sys_statx(a[0], a[1], a[2], a[3], a[4]),
             nr::GETDENTS64 => self.sys_getdents64(a[0], a[1], a[2]),
@@ -241,6 +243,7 @@ impl<P: Platform> Kernel<P> {
             nr::MUNMAP => self.sys_munmap(a[0], a[1]),
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),
             nr::MADVISE => self.sys_madvise(a[0], a[1], a[2]),
+            nr::MSYNC => self.sys_msync(a[0], a[1], a[2]),
             nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3]),
 
             // Process and thread identity.
@@ -293,6 +296,7 @@ impl<P: Platform> Kernel<P> {
             }
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
+            nr::PRCTL => self.sys_prctl(a[0], a[1]),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 0
@@ -621,6 +625,65 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
+    /// `prctl(option, arg2, ...)` for the options programs commonly use; any
+    /// other fails with `EINVAL`, as an unknown option does on Linux.
+    fn sys_prctl(&mut self, option: u64, arg2: u64) -> i64 {
+        use fwe_abi::prctl::*;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        /// `PR_SET_NO_NEW_PRIVS` (fwe grants no privileges an exec could
+        /// raise, so it only has to be remembered) and `PR_SET_DUMPABLE`.
+        static NO_NEW_PRIVS: AtomicBool = AtomicBool::new(false);
+        static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
+        match option {
+            PR_SET_NAME => {
+                let mut name = [0u8; TASK_COMM_LEN];
+                let s = guest!(uaccess::read_cstr(arg2, 4096));
+                let n = s.len().min(TASK_COMM_LEN - 1);
+                name[..n].copy_from_slice(&s[..n]);
+                thread::set_name(name);
+                0
+            }
+            PR_GET_NAME => {
+                // A thread not yet named has the program's file name.
+                let name = thread::name().unwrap_or_else(|| {
+                    let exe = self.fs().exe();
+                    let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
+                    let mut name = [0u8; TASK_COMM_LEN];
+                    let n = base.len().min(TASK_COMM_LEN - 1);
+                    name[..n].copy_from_slice(&base[..n]);
+                    name
+                });
+                guest!(uaccess::write(arg2, name));
+                0
+            }
+            // The virtual root's bounding set holds every capability.
+            PR_CAPBSET_READ if arg2 <= CAP_LAST_CAP => 1,
+            PR_CAPBSET_READ => err(errno::EINVAL),
+            PR_SET_NO_NEW_PRIVS if arg2 == 1 => {
+                NO_NEW_PRIVS.store(true, Relaxed);
+                0
+            }
+            PR_SET_NO_NEW_PRIVS => err(errno::EINVAL),
+            PR_GET_NO_NEW_PRIVS => i64::from(NO_NEW_PRIVS.load(Relaxed)),
+            PR_SET_DUMPABLE if arg2 <= 1 => {
+                UNDUMPABLE.store(arg2 == 0, Relaxed);
+                0
+            }
+            PR_SET_DUMPABLE => err(errno::EINVAL),
+            PR_GET_DUMPABLE => i64::from(!UNDUMPABLE.load(Relaxed)),
+            PR_SET_PDEATHSIG if arg2 <= signal::NSIG => {
+                thread::set_pdeathsig(arg2);
+                0
+            }
+            PR_SET_PDEATHSIG => err(errno::EINVAL),
+            PR_GET_PDEATHSIG => {
+                guest!(uaccess::write(arg2, thread::pdeathsig() as i32));
+                0
+            }
+            _ => err(errno::EINVAL),
+        }
+    }
+
     /// `sysinfo`: the host's uptime and load, and the memory `/proc/meminfo`
     /// reports.
     fn sys_sysinfo(&mut self, buf: u64) -> i64 {
@@ -840,6 +903,88 @@ impl<P: Platform> Kernel<P> {
 /// # Safety
 /// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
 /// a guest `Timespec`.
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, _)`, by way of the
+/// host's `poll`: each set bit below `nfds` becomes a `pollfd`, and the sets
+/// are rewritten with what is ready (the signal mask is the caller's, see
+/// [`crate::blocking_syscall`]). Linux's `fd_set` is a bitmap of 64-bit
+/// words, as fwe reads it. The timeout is not updated with the time left,
+/// which POSIX allows and glibc's `select` does not rely on.
+///
+/// # Safety
+/// The set and timeout pointers are null or reference guest memory.
+pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
+    const FD_SETSIZE: u64 = 1024;
+    if nfds > FD_SETSIZE {
+        return err(errno::EINVAL);
+    }
+    let words = nfds.div_ceil(64) as usize;
+    let mut bits = [[0u64; (FD_SETSIZE / 64) as usize]; 3];
+    for (set, ptr) in bits.iter_mut().zip(sets) {
+        if ptr != 0 {
+            for (i, w) in set.iter_mut().take(words).enumerate() {
+                *w = guest!(uaccess::read(ptr + 8 * i as u64));
+            }
+        }
+    }
+    let is_set = |set: &[u64; 16], fd: u64| set[(fd / 64) as usize] >> (fd % 64) & 1 == 1;
+    // fwe's own descriptors are not open as far as the guest can tell.
+    if (0..nfds)
+        .any(|fd| bits.iter().any(|s| is_set(s, fd)) && !crate::fdtable::guest_visible(fd as i32))
+    {
+        return err(errno::EBADF);
+    }
+    let events = [libc::POLLIN, libc::POLLOUT, libc::POLLPRI];
+    let mut fds: Vec<libc::pollfd> = (0..nfds)
+        .filter_map(|fd| {
+            let ev = (0..3).filter(|&k| is_set(&bits[k], fd)).fold(0, |e, k| e | events[k]);
+            (ev != 0).then_some(libc::pollfd { fd: fd as i32, events: ev, revents: 0 })
+        })
+        .collect();
+    let ms = if timeout == 0 {
+        -1
+    } else {
+        let ts: Timespec = guest!(uaccess::read(timeout));
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return err(errno::EINVAL);
+        }
+        let ms = ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
+        ms.min(i32::MAX as i64) as i32
+    };
+    // SAFETY: `fds` is a valid array of its length.
+    let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+    if r < 0 {
+        return last_error();
+    }
+    if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
+        return err(errno::EBADF);
+    }
+    // Which revents mark a descriptor ready for each set, as Linux counts.
+    let ready = [
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        libc::POLLOUT | libc::POLLERR,
+        libc::POLLPRI,
+    ];
+    let mut out = [[0u64; (FD_SETSIZE / 64) as usize]; 3];
+    let mut count = 0;
+    for p in &fds {
+        let fd = p.fd as u64;
+        for k in 0..3 {
+            if p.events & events[k] != 0 && p.revents & ready[k] != 0 {
+                out[k][(fd / 64) as usize] |= 1 << (fd % 64);
+                count += 1;
+            }
+        }
+    }
+    for (set, ptr) in out.iter().zip(sets) {
+        if ptr != 0 {
+            for (i, w) in set.iter().take(words).enumerate() {
+                guest!(uaccess::write(ptr + 8 * i as u64, *w));
+            }
+        }
+    }
+    count
+}
+
 pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
     let ms = if timeout == 0 {
@@ -975,6 +1120,98 @@ mod tests {
             k.syscall(nr::SCHED_GETAFFINITY, [TID as u64, 128, p, 0, 0, 0]),
             err(errno::ESRCH)
         );
+    }
+
+    /// `pselect6` through the host's `poll`: a pipe's write end is ready, its
+    /// read end becomes ready once a byte is written, and the sets come back
+    /// holding only what is ready.
+    #[test]
+    fn pselect6_reports_ready_descriptors() {
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0] as u64, fds[1] as u64);
+        let nfds = rd.max(wr) + 1;
+        let bit = |fd: u64| -> [u64; 16] {
+            let mut s = [0u64; 16];
+            s[(fd / 64) as usize] |= 1 << (fd % 64);
+            s
+        };
+        let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
+        let t = &zero as *const _ as u64;
+        let (mut r, mut w) = (bit(rd), bit(wr));
+        let sets = [r.as_mut_ptr() as u64, w.as_mut_ptr() as u64, 0];
+        // SAFETY: valid sets and timeout.
+        assert_eq!(unsafe { pselect6(nfds, sets, t) }, 1);
+        assert_eq!((r, w), ([0; 16], bit(wr)));
+        // SAFETY: writing one byte.
+        assert_eq!(unsafe { libc::write(wr as i32, b"x".as_ptr().cast(), 1) }, 1);
+        r = bit(rd);
+        // SAFETY: valid set and timeout.
+        assert_eq!(unsafe { pselect6(nfds, [r.as_mut_ptr() as u64, 0, 0], t) }, 1);
+        assert_eq!(r, bit(rd));
+        // SAFETY: closing the pipe.
+        unsafe {
+            libc::close(rd as i32);
+            libc::close(wr as i32);
+        }
+    }
+
+    #[test]
+    fn fstatfs_reports_the_filesystem() {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let mut st = fwe_abi::Statfs::default();
+        let p = &mut st as *mut _ as u64;
+        assert_eq!(kernel().syscall(nr::FSTATFS, [f.as_raw_fd() as u64, p, 0, 0, 0, 0]), 0);
+        assert!(st.f_bsize > 0 && st.f_blocks > 0 && st.f_namelen > 0, "{st:?}");
+        assert_eq!(kernel().syscall(nr::FSTATFS, [9999, p, 0, 0, 0, 0]), err(errno::EBADF));
+    }
+
+    #[test]
+    fn msync_syncs_a_mapping() {
+        use fwe_abi::statfs::{MS_ASYNC, MS_SYNC};
+        let mut k = kernel();
+        let len = k.page_size;
+        // SAFETY: a fresh anonymous mapping, unmapped below.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        } as u64;
+        assert_eq!(k.syscall(nr::MSYNC, [p, len, MS_SYNC, 0, 0, 0]), 0);
+        assert_eq!(k.syscall(nr::MSYNC, [p, len, MS_SYNC | MS_ASYNC, 0, 0, 0]), err(errno::EINVAL));
+        assert_eq!(k.syscall(nr::MSYNC, [p + 1, len, MS_SYNC, 0, 0, 0]), err(errno::EINVAL));
+        // SAFETY: unmapping the mapping made above.
+        unsafe { libc::munmap(p as *mut _, len as usize) };
+    }
+
+    /// The `prctl` options in use: a thread name, the capability bounding
+    /// set, `no_new_privs`, and `EINVAL` for anything unknown.
+    #[test]
+    fn prctl_options() {
+        use fwe_abi::prctl::*;
+        let mut k = kernel();
+        let mut call = |opt, arg| k.syscall(nr::PRCTL, [opt, arg, 0, 0, 0, 0]);
+        let name = std::ffi::CString::new("a-long-thread-name").unwrap();
+        assert_eq!(call(PR_SET_NAME, name.as_ptr() as u64), 0);
+        let mut got = [0xffu8; TASK_COMM_LEN];
+        assert_eq!(call(PR_GET_NAME, got.as_mut_ptr() as u64), 0);
+        assert_eq!(&got, b"a-long-thread-n\0");
+        assert_eq!(call(PR_CAPBSET_READ, 0), 1);
+        assert_eq!(call(PR_CAPBSET_READ, CAP_LAST_CAP + 1), err(errno::EINVAL));
+        assert_eq!(call(PR_SET_NO_NEW_PRIVS, 1), 0);
+        assert_eq!(call(PR_GET_NO_NEW_PRIVS, 0), 1);
+        assert_eq!(call(PR_SET_PDEATHSIG, 9), 0);
+        let mut sig = 0i32;
+        assert_eq!(call(PR_GET_PDEATHSIG, &mut sig as *mut _ as u64), 0);
+        assert_eq!(sig, 9);
+        assert_eq!(call(1000, 0), err(errno::EINVAL));
     }
 
     #[test]
