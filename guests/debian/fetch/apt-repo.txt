@@ -1,0 +1,4 @@
+# Debian 12 (bookworm) arm64 packages the apt test serves from a local
+# repository for apt to install: fetched like the others, not unpacked.
+# Each line is a pool path and the package's SHA-256 from the bookworm index.
+pool/main/h/hello/hello_2.10-3_arm64.deb f7b20d304db0f3a18da28eb2000de2b0205eaa340c1d0fecec3b7c50acc932dc

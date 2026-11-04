@@ -1,0 +1,41 @@
+# Debian 12 (bookworm) arm64 packages the apt test fetches from
+# https://deb.debian.org/debian/ and unpacks into its root filesystem: apt,
+# dpkg and the tools dpkg runs (tar, diff, ldconfig, coreutils), glibc, and
+# their libraries. Each line is a pool path and the package's SHA-256 from
+# the bookworm index.
+pool/main/a/apt/apt_2.6.1_arm64.deb c5a6f225715aa2ae5e025695acc205d9eedd2abc3d2393965418e19cde6a9e15
+pool/main/a/apt/libapt-pkg6.0_2.6.1_arm64.deb 78f637a952efcb7b6260ffac0833bf3b434e017da92472e5821180e5d799a966
+pool/main/d/dpkg/dpkg_1.21.23_arm64.deb 00b2b9d112ecbfe99d8f0c3de56dd33bc242f71c8ae51c3fd1e154ab2e2eb07a
+pool/main/t/tar/tar_1.34+dfsg-1.2+deb12u1_arm64.deb 04a945d4f24068f9d4c44294014ef5a33fc6179a57021978afc7d08358e13df3
+pool/main/c/coreutils/coreutils_9.1-1_arm64.deb ec8f090a14c684879dce251254d8d9ed0876d4480f750d5807ef04e5435e1c4d
+pool/main/d/diffutils/diffutils_3.8-4_arm64.deb d2a65fa215001e84c26e2fbe08b44746c6b64be51878ae1d79d5263365e244ec
+pool/main/g/glibc/libc-bin_2.36-9+deb12u14_arm64.deb 65166ea54c05213c4f48d889138179f1b7345edd05031a9af276aa5fb4a45c05
+pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb 01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4
+pool/main/libs/libselinux/libselinux1_3.4-1+b6_arm64.deb 29201edf23ebae40844d6c289afdb9bba52f927d55096ed1b1cd37e040135edc
+pool/main/p/pcre2/libpcre2-8-0_10.42-1_arm64.deb b2448d0a8a3db7fbeac231e7ef93811346c1fb5f96ccf6f631701d8a4eb39206
+pool/main/g/gmp/libgmp10_6.2.1+dfsg1-1.1_arm64.deb 9906387c1dd806518c915bd8616d072c741061d7fa26b222e52763456060b31a
+pool/main/a/attr/libattr1_2.5.1-4_arm64.deb 481e1c3fcad6773ba1c9d7f1de59e4fc80d95326c9b20192e13b7111013c932a
+pool/main/a/acl/libacl1_2.3.1-3_arm64.deb 2b0eef11a2e271e7355adaf1f6cbf8d2e83835ae1b6cf15165d59b8289c08342
+pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb 52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913
+pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_arm64.deb 95e173c9538f96ede4fc275ec7863f395a97dd0ea62454be9bc914efa1b9be93
+pool/main/libm/libmd/libmd0_1.0.4-2_arm64.deb 99a8c7dd591fae9fb37d8bf8dfdffa850e207fa405b3198c5b24711a5f972381
+pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_arm64.deb 647ce9d81e41c30071ce6ac0d3324579216a33aaa1d28971d6952315f6a95a75
+pool/main/b/bzip2/libbz2-1.0_1.0.8-5+b1_arm64.deb d3a96ece03326498b39ff093a76800dfcbcb1d4049d6ae6e9f6fa1aa7a590ad6
+pool/main/s/systemd/libsystemd0_252.39-1~deb12u2_arm64.deb 293ab474b90276dae9ebc03ed01e622e0c1f2578e83ed3aa926ae1eaf84dda9c
+pool/main/l/lz4/liblz4-1_1.9.4-1_arm64.deb f061216ce11aabba8f032dfd6c75c181e782fef7493033b9621a8c3b2953b87e
+pool/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_arm64.deb 140af58350c9b15bfa611000d9e0205528bbed2cba39271bf12bd36de2678f2e
+pool/main/libg/libgpg-error/libgpg-error0_1.46-1_arm64.deb aff6ce011ae9abf7090e906f0cf6bc2b447bbc4cc7e03ff117f9d73528857352
+pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_arm64.deb b3a21ae1cef9c2f3fa340007100fb0aa934ab6a4d8aed131660de9713db2bb6e
+pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_arm64.deb 26e138c677a985775331373828a6c286c551ff397cb735d00e2383cb273d1cb2
+pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_arm64.deb 576926b283613db80168ddf76380a3bd877602778cf0d226caa7bfbfa71eacf3
+pool/main/libs/libseccomp/libseccomp2_2.5.4-1+deb12u1_arm64.deb be675cf3b7778d88e8f6156c501d32fcbe77636b3dcf18bf2bc7e5daf3dde256
+pool/main/g/gnutls28/libgnutls30_3.7.9-2+deb12u7_arm64.deb 84f7f70084c9179d6670f4a6ebdf32adc36c6e4741a3a118104377e18cfa977f
+pool/main/libu/libunistring/libunistring2_1.0-2_arm64.deb 05b0b7700bfe269ff7af61f45e92055d7ef4c532c9584e4e2a352cf0bd4de5b1
+pool/main/libt/libtasn1-6/libtasn1-6_4.19.0-2+deb12u1_arm64.deb 7e80513007e8a71b5e737d3307dedbb06712f9cfed05ec2fad6fc00de460cc5f
+pool/main/p/p11-kit/libp11-kit0_0.24.1-2_arm64.deb d1f1f55023e9fc085b9ebfc9c4113d2d2dab2dc6b81a337f274b75c95ad8dc0a
+pool/main/libf/libffi/libffi8_3.4.4-1_arm64.deb 80b5c36177dc0e29d531c7eddbed3cc7355cb490e49f8cfa5959572d161f27b3
+pool/main/n/nettle/libnettle8_3.8.1-2_arm64.deb c945ff210df69cf7b95e935b8fa936e81c1c1f475355e3d5db83510b174f0cd6
+pool/main/libi/libidn2/libidn2-0_2.3.3-1+b1_arm64.deb 12a3efc056671bf1c1bed4c3444c2559c8d5e0c158a13316fc728f263b83ddc4
+pool/main/n/nettle/libhogweed6_3.8.1-2_arm64.deb e653a1a7e5a44be0f7b6443dc6ac865d2504e49149660fc253655245965e157f
+pool/main/x/xxhash/libxxhash0_0.8.1-1_arm64.deb a3eed3901eb1804f2882dc7676f174d619745539e66ac9e92e09cd96ca0cfd73
+pool/main/s/systemd/libudev1_252.39-1~deb12u2_arm64.deb b76444b0259abfa416f8c1d9a652d208a24770667a1181aa52317b74d12a7a72
