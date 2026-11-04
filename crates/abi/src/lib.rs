@@ -675,9 +675,9 @@ pub struct Itimerspec {
     pub it_value: Timespec,
 }
 
-/// `struct epoll_event`. On arm64 it is packed (no padding), 12 bytes, like
-/// x86-64, so the `data` word sits at offset 4.
-#[repr(C, packed)]
+/// `struct epoll_event`. Only x86-64 packs it; on arm64 it is naturally
+/// aligned, 16 bytes, with the `data` word at offset 8.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EpollEvent {
     pub events: u32,
@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(size_of::<Timespec>(), 16);
         assert_eq!(size_of::<Iovec>(), 16);
         assert_eq!(size_of::<Pollfd>(), 8);
-        assert_eq!(size_of::<EpollEvent>(), 12);
+        assert_eq!(size_of::<EpollEvent>(), 16);
         assert_eq!(size_of::<Itimerspec>(), 32);
         assert_eq!(size_of::<Winsize>(), 8);
         assert_eq!(size_of::<Rlimit>(), 16);

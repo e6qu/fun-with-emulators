@@ -18,12 +18,17 @@ _start:
     tbnz    x0, #63, fail
     mov     x20, x0                 // epfd
 
-    // Build epoll_event { events = EPOLLIN(1); data = 0x1234 } (packed).
+    // Build epoll_event { events = EPOLLIN(1); data = 0x123456789abcdef0 }:
+    // on arm64 the struct is not packed, so data sits at offset 8. All 64
+    // bits of it must come back.
     adr     x9, ev
     mov     w10, #1                 // EPOLLIN
     str     w10, [x9]
-    mov     x11, #0x1234
-    str     x11, [x9, #4]           // data at offset 4 (unaligned)
+    movz    x11, #0xdef0
+    movk    x11, #0x9abc, lsl #16
+    movk    x11, #0x5678, lsl #32
+    movk    x11, #0x1234, lsl #48
+    str     x11, [x9, #8]
 
     // epoll_ctl(epfd, EPOLL_CTL_ADD(1), read_fd, &ev)
     mov     x0, x20
@@ -64,9 +69,10 @@ _start:
     cmp     w10, #1
     b.ne    fail
 
-    // obuf[0].data must equal 0x1234.
-    ldr     x11, [x9, #4]
-    mov     x12, #0x1234
+    // obuf[0].data must equal what was registered.
+    ldr     x11, [x9, #8]
+    adr     x12, ev
+    ldr     x12, [x12, #8]
     cmp     x11, x12
     b.ne    fail
 
@@ -87,6 +93,6 @@ byte:
 fds:
     .skip   8                       // two ints: read, write
 ev:
-    .skip   16                      // packed epoll_event (12) + slack
+    .skip   16                      // one epoll_event
 obuf:
-    .skip   48                      // 4 * sizeof(epoll_event)
+    .skip   64                      // 4 * sizeof(epoll_event)

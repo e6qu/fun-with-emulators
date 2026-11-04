@@ -629,11 +629,12 @@ fn main() {
             let mut p = [0i32; 2];
             // SAFETY: a valid two-element array.
             assert_eq!(unsafe { pipe(p.as_mut_ptr()) }, 0);
-            // SAFETY: plain calls; the event is a packed epoll_event.
+            // SAFETY: plain calls; the event is an arm64 epoll_event, with
+            // its data word at offset 8.
             let ep = unsafe { epoll_create1(0) };
-            let mut ev = [0u8; 12];
+            let mut ev = [0u8; 16];
             ev[0] = 1; // EPOLLIN
-            ev[4..].copy_from_slice(&42u64.to_ne_bytes());
+            ev[8..].copy_from_slice(&42u64.to_ne_bytes());
             assert_eq!(unsafe { epoll_ctl(ep, 1, p[0], ev.as_mut_ptr()) }, 0);
             // A one-shot timer 50 ms out.
             // SAFETY: plain calls with a valid itimerspec.
@@ -641,10 +642,10 @@ fn main() {
             let spec = [Timespec { sec: 0, nsec: 0 }, Timespec { sec: 0, nsec: 50_000_000 }];
             assert_eq!(unsafe { timerfd_settime(tfd, 0, &spec, std::ptr::null_mut()) }, 0);
             let pid = child(move || {
-                let mut got = [0u8; 12];
+                let mut got = [0u8; 16];
                 // SAFETY: room for one event.
                 let n = unsafe { epoll_wait(ep, got.as_mut_ptr(), 1, 5000) };
-                let data = u64::from_ne_bytes(got[4..].try_into().unwrap());
+                let data = u64::from_ne_bytes(got[8..].try_into().unwrap());
                 println!("child's epoll: {n} event(s), data {data}");
                 let mut count = 0u64;
                 // SAFETY: an 8-byte read into a local.

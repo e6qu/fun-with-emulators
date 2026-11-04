@@ -474,9 +474,10 @@ pass through on Linux and are translated to `kqueue` on macOS: the epoll
 descriptor is a kqueue, each watched fd becomes an `EVFILT_READ` filter for
 `EPOLLIN` and an `EVFILT_WRITE` filter for `EPOLLOUT`, `EPOLLET` maps to
 `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`, and the caller's data word
-rides in the kevent `udata`. `epoll_pwait` writes the packed 12-byte arm64
-`epoll_event` array in place. The `EEXIST`/`ENOENT` edge cases of redundant
-`ADD`/`MOD` are not emulated precisely on macOS.
+rides in the kevent `udata`. `epoll_pwait` writes the arm64 `epoll_event`
+array in place: 16 bytes each, `data` at offset 8 (only x86-64 packs it).
+The `EEXIST`/`ENOENT` edge cases of redundant `ADD`/`MOD` are not emulated
+precisely on macOS.
 
 `eventfd` and `timerfd` (`crates/kernel/src/specialfd.rs`) have no macOS
 equivalent and are emulated in a process-global registry keyed by descriptor,

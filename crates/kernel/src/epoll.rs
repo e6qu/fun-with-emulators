@@ -12,8 +12,8 @@
 //! child rebuilds its epoll descriptors from it.
 //!
 //! Guest addresses are host addresses, so `epoll_event` arrays are read and
-//! written in place. The packed arm64 layout is `{ u32 events; u64 data; }`
-//! with `data` at offset 4 and a 12-byte stride.
+//! written in place. The arm64 layout is `{ u32 events; u64 data; }`, not
+//! packed as on x86-64: `data` sits at offset 8 and the stride is 16 bytes.
 
 /// Each epoll descriptor's interest list: `fd -> (events, data)`.
 #[cfg(not(target_os = "linux"))]
@@ -94,14 +94,13 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
         // Nested epoll descriptors exist by now, whatever the order.
         for epfd in fresh {
             for (&fd, &(events, data)) in &lists[&epfd] {
-                let ev = fwe_abi::EpollEvent { events, data };
-                // SAFETY: a valid event on this stack frame.
+                // SAFETY: plain host calls on the inherited descriptors.
                 let _ = unsafe {
                     ctl_kqueue(
                         epfd as u64,
                         fwe_abi::epoll::EPOLL_CTL_ADD,
                         fd as u64,
-                        &ev as *const _ as u64,
+                        (events, data),
                     )
                 };
             }
@@ -110,17 +109,15 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     }
 }
 
-/// Size of a packed arm64 `struct epoll_event`.
+/// Size of an arm64 `struct epoll_event`.
 #[cfg(not(target_os = "linux"))]
-const EVENT_SIZE: usize = 12;
+const EVENT_SIZE: usize = size_of::<fwe_abi::EpollEvent>();
 
 /// Read one guest `epoll_event` at `ptr`.
 #[cfg(not(target_os = "linux"))]
 fn read_event(ptr: u64) -> crate::uaccess::Result<(u32, u64)> {
-    let raw: [u8; EVENT_SIZE] = crate::uaccess::read(ptr)?;
-    let events = u32::from_ne_bytes(raw[0..4].try_into().unwrap());
-    let data = u64::from_ne_bytes(raw[4..12].try_into().unwrap());
-    Ok((events, data))
+    let ev: fwe_abi::EpollEvent = crate::uaccess::read(ptr)?;
+    Ok((ev.events, ev.data))
 }
 
 /// `epoll_create1(flags)`.
@@ -169,11 +166,14 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // SAFETY: the caller guarantees `event` is valid for ADD/MOD.
-        let r = unsafe { ctl_kqueue(epfd, op, fd, event) };
+        let entry = if op == fwe_abi::epoll::EPOLL_CTL_DEL {
+            None
+        } else {
+            Some(crate::guest!(read_event(event)))
+        };
+        // SAFETY: plain host calls on the guest's descriptors.
+        let r = unsafe { ctl_kqueue(epfd, op, fd, entry.unwrap_or((0, 0))) };
         if r == 0 {
-            let entry =
-                if op == fwe_abi::epoll::EPOLL_CTL_DEL { None } else { read_event(event).ok() };
             interest(|m| {
                 if let Some(list) = m.get_mut(&(epfd as i32)) {
                     match entry {
@@ -229,11 +229,8 @@ pub unsafe fn pwait(
 }
 
 #[cfg(not(target_os = "linux"))]
-unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
+unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) -> i64 {
     use fwe_abi::epoll::*;
-
-    let (events, data) =
-        if op == EPOLL_CTL_DEL { (0, 0) } else { crate::guest!(read_event(event)) };
 
     let want_read = events & EPOLLIN != 0;
     let want_write = events & EPOLLOUT != 0;
@@ -345,10 +342,8 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
             bits |= EPOLLERR;
         }
         let dst = events + (i * EVENT_SIZE) as u64;
-        let mut out = [0u8; EVENT_SIZE];
-        out[0..4].copy_from_slice(&bits.to_ne_bytes());
-        out[4..12].copy_from_slice(&(ev.udata as u64).to_ne_bytes());
-        crate::guest!(crate::uaccess::write_from(dst, &out));
+        let out = fwe_abi::EpollEvent { events: bits, data: ev.udata as u64 };
+        crate::guest!(crate::uaccess::write(dst, out));
     }
     n as i64
 }
@@ -357,6 +352,30 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
 mod tests {
     use super::*;
     use fwe_abi::epoll::*;
+
+    // A Linux host takes its own `epoll_event` (packed on x86-64); a macOS
+    // host goes through the translation, which takes the arm64 guest's.
+    #[cfg(target_os = "linux")]
+    type Event = libc::epoll_event;
+    #[cfg(not(target_os = "linux"))]
+    type Event = fwe_abi::EpollEvent;
+
+    #[cfg(target_os = "linux")]
+    fn event(events: u32, data: u64) -> Event {
+        libc::epoll_event { events, u64: data }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn event(events: u32, data: u64) -> Event {
+        fwe_abi::EpollEvent { events, data }
+    }
+    #[cfg(target_os = "linux")]
+    fn data(e: &Event) -> u64 {
+        e.u64
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn data(e: &Event) -> u64 {
+        e.data
+    }
 
     /// A pipe whose read end becomes readable once data is written, observed
     /// through the epoll translation on either host.
@@ -371,14 +390,14 @@ mod tests {
         let ep = unsafe { create1(0) };
         assert!(ep >= 0, "epoll_create1 failed: {ep}");
 
-        let reg = fwe_abi::EpollEvent { events: EPOLLIN, data: 0xdead_beef };
+        let reg = event(EPOLLIN, 0x0123_4567_89ab_cdef);
         let reg_ptr = &reg as *const _ as u64;
         // SAFETY: `reg_ptr` points to a valid epoll_event for the add.
         let r = unsafe { ctl(ep as u64, EPOLL_CTL_ADD, rd as u64, reg_ptr) };
         assert_eq!(r, 0, "epoll_ctl ADD failed: {r}");
 
         // Nothing written yet: a zero timeout returns no events.
-        let mut got = [fwe_abi::EpollEvent::default(); 4];
+        let mut got = [event(0, 0); 4];
         let got_ptr = got.as_mut_ptr() as u64;
         // SAFETY: `got` has room for 4 events.
         let n = unsafe { pwait(ep as u64, got_ptr, 4, 0, 0, 0) };
@@ -392,7 +411,7 @@ mod tests {
         assert_eq!(n, 1, "expected one ready fd, got {n}");
         let ev = got[0];
         assert_eq!({ ev.events } & EPOLLIN, EPOLLIN);
-        assert_eq!({ ev.data }, 0xdead_beef);
+        assert_eq!(data(&ev), 0x0123_4567_89ab_cdef);
 
         closed(ep as i32);
         // SAFETY: plain host cleanup calls.
@@ -414,27 +433,27 @@ mod tests {
         assert!(ep >= 0);
 
         // Register for EPOLLOUT only (read end is never writable): no readiness.
-        let reg = fwe_abi::EpollEvent { events: EPOLLOUT, data: 1 };
+        let reg = event(EPOLLOUT, 1);
         let p = &reg as *const _ as u64;
         // SAFETY: valid event pointer.
         assert_eq!(unsafe { ctl(ep as u64, EPOLL_CTL_ADD, rd as u64, p) }, 0);
 
         // SAFETY: writing one byte.
         assert_eq!(unsafe { libc::write(wr, b"x".as_ptr() as *const _, 1) }, 1);
-        let mut got = [fwe_abi::EpollEvent::default(); 2];
+        let mut got = [event(0, 0); 2];
         let gp = got.as_mut_ptr() as u64;
         // SAFETY: room for 2 events.
         assert_eq!(unsafe { pwait(ep as u64, gp, 2, 0, 0, 0) }, 0);
 
         // Modify to watch EPOLLIN: now the readable read end shows up.
-        let reg = fwe_abi::EpollEvent { events: EPOLLIN, data: 7 };
+        let reg = event(EPOLLIN, 7);
         let p = &reg as *const _ as u64;
         // SAFETY: valid event pointer.
         assert_eq!(unsafe { ctl(ep as u64, EPOLL_CTL_MOD, rd as u64, p) }, 0);
         // SAFETY: room for 2 events.
         let n = unsafe { pwait(ep as u64, gp, 2, 1000, 0, 0) };
         assert_eq!(n, 1);
-        assert_eq!({ got[0].data }, 7);
+        assert_eq!(data(&got[0]), 7);
 
         // Delete the registration: no more readiness.
         // SAFETY: DEL ignores the event pointer.
@@ -471,7 +490,7 @@ mod tests {
             libc::fcntl(EP, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         interest(|m| m.insert(EP, Interest::new()));
-        let reg = fwe_abi::EpollEvent { events: EPOLLIN, data: 77 };
+        let reg = event(EPOLLIN, 77);
         // SAFETY: a valid event pointer.
         let r = unsafe { ctl(EP as u64, EPOLL_CTL_ADD, fds[0] as u64, &reg as *const _ as u64) };
         assert_eq!(r, 0);
@@ -499,10 +518,10 @@ mod tests {
         assert_eq!(unsafe { libc::fcntl(EP, libc::F_GETFD) }, libc::FD_CLOEXEC);
         // SAFETY: writing one byte.
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
-        let mut got = [fwe_abi::EpollEvent::default(); 1];
+        let mut got = [event(0, 0); 1];
         // SAFETY: room for one event.
         assert_eq!(unsafe { pwait(EP as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
-        assert_eq!({ got[0].data }, 77);
+        assert_eq!(data(&got[0]), 77);
         closed(EP);
         // SAFETY: plain host cleanup.
         unsafe {
