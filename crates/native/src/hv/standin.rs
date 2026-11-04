@@ -46,11 +46,23 @@
 //!
 //! Only one vCPU emulates at a time (a fair lock, handed on at the next
 //! block whenever another vCPU waits): Unicorn instances are independent
-//! CPUs, and running one at a time keeps the guest's atomics atomic. Each
-//! Unicorn engine is driven only by its own thread — mapping changes are
-//! logged and applied by each vCPU before it next emulates, and a stop is
-//! a flag its block hook acts on — as an engine stopped or changed from
-//! another thread sometimes resumed with its registers and pc out of step. Not modelled: the virtual
+//! CPUs, and running one at a time keeps the guest's atomics atomic.
+//!
+//! Each Unicorn engine is driven only by its own thread: mapping changes
+//! are logged and applied by each vCPU before it next emulates, and a stop
+//! is a flag its block hook acts on. Unicorn's API is not safe to call on
+//! an engine another thread is running, `uc_emu_stop` included, though its
+//! documentation suggests it: on Apple Silicon every call begins and ends
+//! with unsynchronised updates of the engine's JIT bookkeeping
+//! (`save_jit_state`/`restore_jit_state`: `nested`, `current_executable`),
+//! which the emulating thread updates too on each register access from a
+//! hook, and from which it re-applies the JIT region's write protection
+//! after each hook. Stops and mapping changes from other threads corrupted
+//! guest state (a register update lost about once in ten runs of a
+//! threaded test); confined to their own threads, none in 300. The block
+//! hook costs about half the emulation speed in tight loops.
+//!
+//! Not modelled: the virtual
 //! timer, the exact fault address of an alignment fault outside the
 //! exclusive and atomic instructions, stack-pointer alignment checks, and
 //! code another vCPU writes without a mapping change (each emulated CPU

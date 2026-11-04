@@ -96,6 +96,25 @@ about fwe or the hypervisor in the system log. So `krunkit` running
 alongside is not needed for a crash, and a VM that fails to map memory and
 is then destroyed joins the suspects.
 
+A fifth crash, the same day at 16:03:48, came during a deliberate,
+fully recorded real run (the flight recorder, below, synced to disk). The
+record shows the map-rules probe agreeing with the stand-in, then the fork
+tests: 19 fork children and 3 vfork children that exec'd all ended cleanly.
+The last lines are a glibc `posix_spawn` vfork child, which had mapped the
+parent's writable memory *shared* into its own VM (its spawn stack
+included), failing its `execve` as the test intends, destroying its VM and
+exiting; 5 ms later the parent took that same stack out of its own VM and
+mapped one more range — and nothing was ever written again. Crash 4 also
+followed vfork children with shared memory. The path inside the kernel is
+still unknown, but the runtimes that run Linux programs on Apple Silicon
+the same way without such reports (hyper-linux, elfuse, Carrick) all avoid
+what fwe does here: they map guest memory into the VM once and never
+change stage 2 or the host memory behind it while the VM runs (guest
+`mmap`/`munmap`/`mprotect` only edit the guest's page tables), they give a
+fork child a copy-on-write copy rather than pages mapped into both VMs,
+and none maps a vfork child's memory into a second VM. The backend's
+memory model is being reworked to match.
+
 Since then **a plain `cargo test` never starts a VM**: the VM tests run on
 a software stand-in for the framework (below), and on the real one only when
 asked for (`FWE_HV_TESTS=1`), which only a machine whose crash costs nothing
@@ -185,8 +204,11 @@ to `hvc` with `ESR_EL1` and the other EL1 registers set, and direct exits for
 stage-2 aborts, `wfi`/`wfe` and the physical counter; `hv_vcpus_exit` from
 any thread or signal handler. Only one vCPU emulates at a time, handed on
 at the next block whenever another waits, and each emulated CPU is driven
-only by its own thread (one stopped or changed from another sometimes
-resumed with its registers and pc out of step).
+only by its own thread: Unicorn's API, `uc_emu_stop` included, races with
+an engine running on another thread (on Apple Silicon every call updates
+the engine's JIT write-protection bookkeeping unsynchronised), which lost
+guest register updates. Emulation is several times slower than the CPU, so
+the tests give a guest on the stand-in a longer time limit.
 
 And it checks the rules the backend must keep, printing a line with
 `fwe hv stand-in: VIOLATION:` on which the tests fail: a vCPU used from a

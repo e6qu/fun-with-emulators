@@ -19,6 +19,13 @@ use std::time::{Duration, Instant};
 /// becomes a fast, visible failure instead of hanging CI.
 const GUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The same for a guest on the hypervisor stand-in, which emulates every
+/// instruction (and checks for a stop at every block, the only safe way to
+/// stop a Unicorn engine): a guest doing about a second of work natively
+/// (`x18spin`) takes about 5 s there alone and over 20 s on a loaded CI
+/// runner. Still a fast failure for a hang.
+const STANDIN_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Run a command, killing it if it exceeds [`GUEST_TIMEOUT`]. The returned
 /// `Output` has a non-success status on timeout, and its captured output is
 /// preserved for the failure message.
@@ -37,10 +44,15 @@ fn run_bounded(mut cmd: Command) -> Output {
 /// and only a group still alive 5 s later gets `SIGKILL`. Afterwards no
 /// process of the group may be left (a fork child outliving its test would
 /// keep a VM running alongside the next one): the test fails if one is.
-fn run_vm_bounded(mut cmd: Command) -> Output {
+fn run_vm_bounded(cmd: Command) -> Output {
+    run_vm_bounded_for(cmd, GUEST_TIMEOUT)
+}
+
+/// [`run_vm_bounded`] with a time limit of `limit`.
+fn run_vm_bounded_for(mut cmd: Command, limit: Duration) -> Output {
     use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null()).process_group(0);
-    let out = run_bounded_inner(cmd, &[], GUEST_TIMEOUT, true);
+    let out = run_bounded_inner(cmd, &[], limit, true);
     // The leader is reaped; anything still in its group outlived it.
     let pgid = out.1;
     let lingering = || {
@@ -2284,7 +2296,9 @@ fn hv_command() -> Option<Command> {
 fn run_hv(cmd: Command, what: &str) -> Output {
     let _one = matches!(hv_mode(), Some(HvMode::Real(_)))
         .then(|| ONE_VM.lock().unwrap_or_else(|e| e.into_inner()));
-    let out = run_vm_bounded(cmd);
+    let limit =
+        if matches!(hv_mode(), Some(HvMode::Standin)) { STANDIN_TIMEOUT } else { GUEST_TIMEOUT };
+    let out = run_vm_bounded_for(cmd, limit);
     let stderr = String::from_utf8_lossy(&out.stderr);
     eprintln!("--- hv {what} stderr:\n{stderr}");
     if let Some(line) = stderr.lines().find(|l| l.contains("fwe hv stand-in: VIOLATION")) {
