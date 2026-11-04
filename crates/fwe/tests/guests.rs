@@ -2128,10 +2128,11 @@ fn bad_pointers_fail_with_efault() {
 
 // --- The hypervisor backend ------------------------------------------------
 //
-// These run only where Hypervisor.framework works: a bare-metal Apple Silicon
-// Mac (not GitHub's hosted runners, which are VMs themselves). There `fwe` is
-// copied and signed with the hypervisor entitlement; elsewhere the tests
-// report that they were skipped and pass.
+// These run only when asked for (`FWE_HV_TESTS=1`) and where
+// Hypervisor.framework works: a bare-metal Apple Silicon Mac (not GitHub's
+// hosted runners, which are VMs themselves). There `fwe` is copied and signed
+// with the hypervisor entitlement; otherwise the tests report that they were
+// skipped and pass.
 
 /// The name of a running process that uses the hypervisor itself (a VM
 /// manager), if any.
@@ -2158,13 +2159,17 @@ fn other_hypervisor_client() -> Option<String> {
 fn hv_fwe() -> Option<&'static Path> {
     static FWE: OnceLock<Option<PathBuf>> = OnceLock::new();
     FWE.get_or_init(|| {
-        // FWE_NO_HV=1 skips the VM tests on a machine that could run them.
-        if std::env::var_os("FWE_NO_HV").is_some() {
+        // Opt-in: the development Mac went down four times while this
+        // backend was built (docs/hypervisor.md), so a plain `cargo test`
+        // never starts a VM. Only a machine whose crash costs nothing (the
+        // self-hosted runner) sets this.
+        if std::env::var_os("FWE_HV_TESTS").is_none_or(|v| v != "1") {
+            eprintln!("skipped: the VM tests run only with FWE_HV_TESTS=1");
             return None;
         }
-        // Never alongside another hypervisor client: the machine crashed
-        // three times while one (Podman's krunkit, with nested
-        // virtualization) ran beside these tests (docs/hypervisor.md).
+        // Never alongside another hypervisor client: three of the crashes
+        // came while one (Podman's krunkit, with nested virtualization) ran
+        // beside these tests (docs/hypervisor.md).
         if let Some(other) = other_hypervisor_client() {
             eprintln!(
                 "skipped: another hypervisor client is running ({other}); \

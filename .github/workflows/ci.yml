@@ -84,8 +84,8 @@ jobs:
           echo "$out" | grep -q "guest exited with status 42"
       - name: Run the hypervisor backend's end-to-end tests
         run: |
-          out="$(cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
+          out="$(FWE_HV_TESTS=1 cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
           echo "$out"
           # They skip silently where the VM cannot run; here they must not.
-          if echo "$out" | grep -q "skipped: no hypervisor"; then exit 1; fi
+          if echo "$out" | grep -q "skipped:"; then exit 1; fi
           echo "$out" | grep -q "test result: ok"

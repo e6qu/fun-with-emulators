@@ -82,7 +82,24 @@ after it. That points to kernel state left behind rather than the moment of
 teardown; the panic of the second crash, in a kernel thread, lands near the
 kernel's thread-destruction code. The exact path is Apple's, and the panic
 reports are too thin to show it, so the backend rules out everything on its
-side of it:
+side of it.
+
+It went down a fourth time on 4 November at about 13:47, again a watchdog
+reset with no stackshot, and this time with no other hypervisor client
+running: `krunkit` had been stopped three and a half minutes before. Eight
+VM tests had passed one at a time, then for a minute a `vfork` test and four
+runs of one of its scenarios each started a child whose VM could not map
+the parent's read-only code (`hv_vm_map` failed, since a shared memory entry
+of read-only memory carries no write permission), which tore its VM down and
+exited. The crash came 30 to 40 seconds after the last of them, with nothing
+about fwe or the hypervisor in the system log. So `krunkit` running
+alongside is not needed for a crash, and a VM that fails to map memory and
+is then destroyed joins the suspects.
+
+Since then **the VM tests run only when asked for** (`FWE_HV_TESTS=1`),
+which only a machine whose crash costs nothing should set; a plain `cargo
+test` never starts a VM. Everything else the backend does to stay clear of
+the crash:
 
 - **Every way out tears the VM down first:** `exit_group`, the last thread's
   `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
@@ -169,8 +186,9 @@ reports the status 42 the guest exits with. `sysctl kern.hv_support` must be
 ## Tests and CI
 
 The end-to-end tests whose names start with `hv_` sign a copy of `fwe` with the
-entitlement and run low-linked programs in the VM, one test at a time.
-Where the host has no hypervisor they report that they were skipped and pass.
+entitlement and run low-linked programs in the VM, one test at a time. They
+run only with `FWE_HV_TESTS=1`; without it, or where the host has no
+hypervisor, they report that they were skipped and pass.
 
 GitHub's hosted macOS runners are themselves virtual machines without nested
 virtualization, so Hypervisor.framework is unavailable there. This is
@@ -199,7 +217,8 @@ Then set the repository variable that enables the job:
 `Settings → Secrets and variables → Actions → Variables → New variable`,
 name `FWE_HV_SELF_HOSTED`, value `true`. The job stays skipped until this is
 set, so it never blocks PRs when no runner exists. Once set, it runs the
-`hv_` end-to-end tests and `fwe --hv-spike` on every push.
+`hv_` end-to-end tests (with `FWE_HV_TESTS=1`) and `fwe --hv-spike` on every
+push.
 
-Until then, the tests run wherever a developer runs `cargo test` on an Apple
-Silicon Mac.
+The runner should be a machine whose crash costs nothing, such as a rented
+bare-metal cloud Mac, never the development Mac.
