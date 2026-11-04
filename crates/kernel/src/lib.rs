@@ -700,6 +700,21 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         } as i64),
         // SAFETY: caller guarantees the pollfd array and timeout pointers.
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
+        // The sixth argument points to `{ const sigset_t *ss; size_t len }`.
+        n::PSELECT6 => {
+            let mask = if a[5] == 0 {
+                0
+            } else {
+                match uaccess::read::<[u64; 2]>(a[5]) {
+                    Ok([ss, _]) => uaccess::g2h(ss),
+                    Err(e) => return Some(fwe_abi::err(e)),
+                }
+            };
+            // SAFETY: caller guarantees the set, timeout and mask pointers.
+            unsafe {
+                signal::with_call_mask(mask, || syscalls::pselect6(a[0], [a[1], a[2], a[3]], a[4]))
+            }
+        }
         // SAFETY: caller guarantees the signal set pointer.
         n::RT_SIGSUSPEND => unsafe { signal::sigsuspend(a[0], a[1]) },
         n::FLOCK => syscalls::flock(a[0], a[1]),

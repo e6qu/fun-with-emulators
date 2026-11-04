@@ -1027,61 +1027,81 @@ fn debian_cache() -> PathBuf {
         .unwrap_or_else(|| repo().join("target/debian-packages"))
 }
 
-/// A root filesystem of the Debian packages listed in
-/// `guests/debian/fetch/<manifest>.txt`, fetched (and checked against the
-/// SHA-256 recorded there) on first use and unpacked once, plus the vendored
-/// glibc runtime and bash. The packages come from deb.debian.org, or from
-/// snapshot.debian.org once a newer version has replaced them.
-fn fetched_root(manifest: &str) -> PathBuf {
+/// The packages listed in `guests/debian/fetch/<manifest>.txt` (pool paths
+/// and SHA-256s), and the manifest's text.
+fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
     let list = std::fs::read_to_string(repo().join(format!("guests/debian/fetch/{manifest}.txt")))
         .unwrap();
-    let packages: Vec<(&str, &str)> = list
+    let packages = list
         .lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
         .map(|l| l.split_once(' ').unwrap())
+        .map(|(p, h)| (p.to_string(), h.to_string()))
         .collect();
+    (list, packages)
+}
+
+/// The `.deb` files a manifest lists, fetched on first use and checked
+/// against the SHA-256 recorded there. They come from deb.debian.org, or
+/// from snapshot.debian.org once a newer version has replaced them.
+fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
+    let (_, packages) = manifest(manifest_name);
     let cache = debian_cache();
-    let root = cache.join(format!("root-{manifest}"));
+    std::fs::create_dir_all(&cache).unwrap();
+    let sum = |f: &Path| {
+        let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
+    };
+    packages
+        .iter()
+        .map(|(pool, sha256)| {
+            let deb = cache.join(Path::new(pool).file_name().unwrap());
+            if !deb.exists() || sum(&deb) != *sha256 {
+                // Tests fetch at once, and manifests share packages: each
+                // download goes to a name of its own and is renamed into
+                // place once it checks out.
+                let part = cache.join(format!("{pool}.{manifest_name}.part").replace('/', "_"));
+                let fetched = [
+                    format!("https://deb.debian.org/debian/{pool}"),
+                    format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
+                ]
+                .iter()
+                .any(|url| {
+                    Command::new("curl")
+                        .args(["-fsSL", "--retry", "3", "-o"])
+                        .arg(&part)
+                        .arg(url)
+                        .status()
+                        .is_ok_and(|s| s.success())
+                        && sum(&part) == *sha256
+                });
+                assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
+                std::fs::rename(&part, &deb).unwrap();
+            }
+            deb
+        })
+        .collect()
+}
+
+/// A root filesystem of the packages `manifest` lists ([`fetched_debs`]),
+/// unpacked once and cached, plus the vendored glibc runtime and bash.
+fn fetched_root(manifest_name: &str) -> PathBuf {
+    let (list, _) = manifest(manifest_name);
+    let cache = debian_cache();
+    let root = cache.join(format!("root-{manifest_name}"));
     let done = root.join(".fwe-complete");
     if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
         return root;
     }
+    let debs = fetched_debs(manifest_name);
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("lib")).unwrap();
-    for (pool, sha256) in &packages {
-        let deb = cache.join(Path::new(pool).file_name().unwrap());
-        let sum = |f: &Path| {
-            let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
-            String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
-        };
-        if !deb.exists() || sum(&deb) != *sha256 {
-            // Tests fetch at once, and manifests share packages: each
-            // download goes to a name of its own and is renamed into place
-            // once it checks out.
-            let part = cache
-                .join(format!("{}.{manifest}.part", Path::new(pool).display()).replace('/', "_"));
-            let fetched = [
-                format!("https://deb.debian.org/debian/{pool}"),
-                format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
-            ]
-            .iter()
-            .any(|url| {
-                Command::new("curl")
-                    .args(["-fsSL", "--retry", "3", "-o"])
-                    .arg(&part)
-                    .arg(url)
-                    .status()
-                    .is_ok_and(|s| s.success())
-                    && sum(&part) == *sha256
-            });
-            assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
-            std::fs::rename(&part, &deb).unwrap();
-        }
+    for deb in &debs {
         // A .deb is an `ar` archive whose data.tar.* holds the files.
-        let unpack = cache.join(format!("unpack-{manifest}"));
+        let unpack = cache.join(format!("unpack-{manifest_name}"));
         let _ = std::fs::remove_dir_all(&unpack);
         std::fs::create_dir_all(&unpack).unwrap();
-        run_checked(Command::new("ar").arg("x").arg(&deb).current_dir(&unpack));
+        run_checked(Command::new("ar").arg("x").arg(deb).current_dir(&unpack));
         let data = std::fs::read_dir(&unpack)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1288,6 +1308,119 @@ fn debian_cargo_builds_and_tests_a_project() {
     );
     assert!(text.contains("running 1 test\n.\n"), "{text}");
     assert!(text.contains("test result: ok. 1 passed; 0 failed"), "{text}");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Debian's apt (fetched: `guests/debian/fetch/apt.txt`) installs a package
+/// from a local repository and removes it: `apt-get update` reads the
+/// repository's index through its `file` method, `apt-get install` resolves
+/// the package against the dpkg database and hands it to dpkg, which
+/// unpacks and configures it (talking to apt through a pseudo-terminal);
+/// the program then runs, and `apt-get remove` takes it away again. The
+/// package, GNU hello, is fetched too (`fetch/apt-repo.txt`) and only
+/// served from the repository.
+#[test]
+fn debian_apt_installs_and_removes_a_package() {
+    // A copy of the cached root (an APFS clone, so cheap), as the test
+    // changes it.
+    let root = std::env::temp_dir().join(format!("fwe-apt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(fetched_root("apt")).arg(&root));
+    let dir = |d: &str| std::fs::create_dir_all(root.join(d)).unwrap();
+    for d in [
+        "repo",
+        "root",
+        "var/lib/dpkg/info",
+        "var/lib/dpkg/updates",
+        "var/lib/dpkg/triggers",
+        "var/lib/apt/lists/partial",
+        "var/cache/apt/archives/partial",
+        "var/log/apt",
+        "etc/apt/apt.conf.d",
+        "etc/apt/preferences.d",
+        "etc/apt/sources.list.d",
+        "etc/dpkg/dpkg.cfg.d",
+    ] {
+        dir(d);
+    }
+    // The repository: the package and its index stanza, made from its own
+    // control file as dpkg-scanpackages would.
+    let deb = &fetched_debs("apt-repo")[0];
+    let name = deb.file_name().unwrap().to_string_lossy().into_owned();
+    std::fs::copy(deb, root.join("repo").join(&name)).unwrap();
+    let control = Command::new("sh")
+        .arg("-c")
+        .arg("ar p \"$0\" control.tar.xz | tar xOf - ./control")
+        .arg(deb)
+        .output()
+        .unwrap();
+    assert!(control.status.success());
+    let sha = Command::new("shasum").args(["-a", "256"]).arg(deb).output().unwrap();
+    let sha = String::from_utf8_lossy(&sha.stdout).split_whitespace().next().unwrap().to_string();
+    let size = std::fs::metadata(deb).unwrap().len();
+    std::fs::write(
+        root.join("repo/Packages"),
+        format!(
+            "{}Filename: ./{name}\nSize: {size}\nSHA256: {sha}\n",
+            String::from_utf8_lossy(&control.stdout)
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("etc/apt/sources.list"), "deb [trusted=yes] file:/repo ./\n").unwrap();
+    // The dpkg database: glibc installed, as a bootstrapped system has it.
+    std::fs::write(
+        root.join("var/lib/dpkg/status"),
+        "Package: libc6\nStatus: install ok installed\nPriority: optional\n\
+         Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>\n\
+         Architecture: arm64\nMulti-Arch: same\nVersion: 2.36-9+deb12u14\n\
+         Description: GNU C Library: Shared libraries\n\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("var/lib/dpkg/available"), "").unwrap();
+    std::fs::write(
+        root.join("etc/passwd"),
+        "root:x:0:0:root:/root:/bin/bash\n_apt:x:42:65534::/nonexistent:/usr/sbin/nologin\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("etc/group"), "root:x:0:\nnogroup:x:65534:\n").unwrap();
+
+    let script = r#"
+        set -e
+        apt-get update -qq
+        apt-get install -y -qq hello
+        hello
+        hello --greeting='hello from a package apt installed'
+        dpkg-query -W -f='${Package} ${Version} ${Status}\n' hello
+        apt-get remove -y -qq hello
+        test ! -e /usr/bin/hello && echo removed
+        dpkg-query -W hello 2>/dev/null || echo "no longer known to dpkg"
+    "#;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("bin/bash"))
+        .args(["-c", script])
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("HOME", "/root")
+        .stdin(Stdio::null());
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("--- apt stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    // dpkg's progress, which apt relays, is interleaved; the lines asked for
+    // come in order.
+    let text = stdout(&out);
+    let mut lines = text.lines();
+    for want in [
+        "Hello, world!",
+        "hello from a package apt installed",
+        "hello 2.10-3 install ok installed",
+        "Removing hello (2.10-3) ...",
+        "removed",
+        "no longer known to dpkg",
+    ] {
+        assert!(lines.any(|l| l.ends_with(want)), "{want:?} missing from:\n{text}");
+    }
     assert_eq!(out.status.code(), Some(0));
 }
 

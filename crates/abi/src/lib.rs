@@ -176,6 +176,23 @@ pub mod mman {
 }
 
 /// File status flags (`asm-generic/fcntl.h`, arm64 overrides).
+/// `prctl` options.
+pub mod prctl {
+    pub const PR_SET_PDEATHSIG: u64 = 1;
+    pub const PR_GET_PDEATHSIG: u64 = 2;
+    pub const PR_GET_DUMPABLE: u64 = 3;
+    pub const PR_SET_DUMPABLE: u64 = 4;
+    pub const PR_SET_NAME: u64 = 15;
+    pub const PR_GET_NAME: u64 = 16;
+    pub const PR_CAPBSET_READ: u64 = 23;
+    pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    /// The highest capability number (`CAP_CHECKPOINT_RESTORE`).
+    pub const CAP_LAST_CAP: u64 = 40;
+    /// `TASK_COMM_LEN`: a thread name and its terminating NUL.
+    pub const TASK_COMM_LEN: usize = 16;
+}
+
 pub mod fcntl {
     pub const O_ACCMODE: u64 = 0o3;
     pub const O_RDONLY: u64 = 0o0;
@@ -813,6 +830,36 @@ pub struct Stack {
     pub ss_size: u64,
 }
 
+/// Kernel `struct statfs` on arm64 (`asm-generic/statfs.h`, 64-bit words).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Statfs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
+/// `statfs` values: the `f_type` fwe reports for the host filesystems it
+/// serves files from, and the `f_flags` mount flags.
+pub mod statfs {
+    pub const EXT4_SUPER_MAGIC: i64 = 0xef53;
+    pub const ST_RDONLY: i64 = 1;
+    pub const ST_NOSUID: i64 = 2;
+    /// `msync` flags.
+    pub const MS_ASYNC: u64 = 1;
+    pub const MS_INVALIDATE: u64 = 2;
+    pub const MS_SYNC: u64 = 4;
+}
+
 /// Kernel `struct stat` on arm64 (`asm-generic/stat.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -923,6 +970,7 @@ mod tests {
         assert_eq!(size_of::<Itimerspec>(), 32);
         assert_eq!(size_of::<Winsize>(), 8);
         assert_eq!(size_of::<Flock>(), 32);
+        assert_eq!(size_of::<Statfs>(), 120);
         assert_eq!(size_of::<Sysinfo>(), 112);
         assert_eq!(core::mem::offset_of!(Sysinfo, totalhigh), 88);
         assert_eq!(size_of::<Rlimit>(), 16);

@@ -240,7 +240,7 @@ it there without the bits that allow skipping cache maintenance
    saved thread state into a `Regs` value (the kernel's view of the guest
    register file), and dispatches on the number in `x8`.
 3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `ppoll`,
-   `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the blocking
+   `pselect6`, `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the blocking
    socket calls, `flock` and `fcntl`'s `F_SETLKW`, and `read`/`write` with their vectored and positioned forms
    (a pipe or socket blocks until another thread acts) — run **without** the
    kernel lock, so a waiting thread never stalls the threads meant to wake
@@ -479,7 +479,8 @@ thread (or, for the process, every thread) is woken with a host signal no
 Linux signal maps to. The fault signals (`SIGTRAP`, `SIGSEGV`, `SIGBUS`,
 `SIGILL`, `SIGFPE`) are handled the same way when a process sends them to
 itself, because macOS's `siginfo` cannot tell a sent one from a fault. A
-waiting call that takes a mask (`ppoll`, `epoll_pwait`) runs under it, as
+waiting call that takes a mask (`ppoll`, `pselect6`, `epoll_pwait`) runs
+under it, as
 `rt_sigsuspend` does. Before a handler returns to guest code it delivers
 anything that became pending while it ran.
 `rt_sigsuspend`, `rt_sigtimedwait` (which has the host catch the awaited
@@ -574,7 +575,17 @@ and pass through; `TIOCGPGRP`/`TIOCSPGRP` map to `tcgetpgrp`/`tcsetpgrp`;
 Pty allocation (`crates/kernel/src/pty.rs`): opening `/dev/ptmx` allocates a
 master with `posix_openpt`/`grantpt`/`unlockpt` and remembers a guest-facing
 slave number; `TIOCGPTN` returns it, `TIOCSPTLCK` is accepted, and opening
-`/dev/pts/<n>` maps that number to the host slave device.
+`/dev/pts/<n>` maps that number to the host slave device. Closing a master
+keeps the number mapped: another process may still hold the master, as a
+fork child closing its copy does before it opens the slave (apt runs dpkg
+on a pty that way).
+
+`pselect6` (what `select` is on arm64) turns its descriptor sets into a
+`poll` and back. `statfs` and `fstatfs` report the host filesystem's sizes
+and counts with ext4's type, and `msync` is the host's. `prctl` keeps a
+thread name (`PR_SET_NAME`/`PR_GET_NAME`), reports the virtual root's full
+capability bounding set, and records `no_new_privs`, dumpability and a
+parent-death signal; other options fail with `EINVAL`.
 
 ## Credentials
 
@@ -668,7 +679,11 @@ those items.
   acting when another thread unblocks it (one the guest catches is
   handed on), and in the VM a caught one is not handed on either.
 - **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases; `timerfd`
-  resolution and clock distinctions.
+  resolution and clock distinctions; `pselect6` does not write back the
+  time left.
+- **Process control:** a parent-death signal (`PR_SET_PDEATHSIG`) is
+  recorded but never sent, and a new thread does not inherit its creator's
+  name.
 - **Not implemented:** `rseq`, `membarrier` (optional for libc), and any
   system call not listed in `crates/kernel/src/syscalls.rs` returns `ENOSYS`
   and is noted under `--strace`.

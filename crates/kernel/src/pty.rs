@@ -136,10 +136,14 @@ pub fn ptsnum(master_fd: i32) -> Option<u32> {
 
 /// Release a master fd if it is one of ours (`close`). Returns `Some(0)` then,
 /// `None` for any other descriptor.
+///
+/// The slave's number stays mapped: another process may still hold the
+/// master (a fork child closing its copy, as apt's does before opening the
+/// slave by name), and on Linux the slave can be opened as long as any
+/// reference to the master is. Guest numbers are never reused, and once the
+/// last master is closed the host itself refuses to open its slave.
 pub fn try_close(fd: i32) -> Option<i64> {
-    let entry = with(|p| p.masters.remove(&fd));
-    let (n, _) = entry?;
-    with(|p| p.slaves.remove(&n));
+    with(|p| p.masters.remove(&fd))?;
     // SAFETY: `fd` is a master we allocated.
     unsafe { libc::close(fd) };
     Some(0)
@@ -174,6 +178,29 @@ mod tests {
         assert_eq!(try_close(m as i32), Some(0));
         // A second close is no longer ours.
         assert_eq!(try_close(m as i32), None);
+    }
+
+    /// A slave can be opened by number after the guest closes a master that
+    /// is still open elsewhere: a fork child closing its copy of the
+    /// parent's master, as apt's does before it opens the slave.
+    #[test]
+    fn slave_opens_after_a_shared_master_is_closed() {
+        let m = open_master(0);
+        if m < 0 {
+            eprintln!("skipping: pty unavailable ({m})");
+            return;
+        }
+        let n = ptsnum(m as i32).unwrap();
+        // SAFETY: duplicating the master: the copy another process keeps.
+        let other = unsafe { libc::dup(m as i32) };
+        assert_eq!(try_close(m as i32), Some(0));
+        let s = open_slave(n, libc::O_RDWR | libc::O_NOCTTY);
+        assert!(s >= 0, "open_slave after close: {s}");
+        // SAFETY: closing the descriptors made here.
+        unsafe {
+            libc::close(s as i32);
+            libc::close(other);
+        }
     }
 
     #[test]

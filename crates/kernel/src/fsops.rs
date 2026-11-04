@@ -95,7 +95,7 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 }
 
 impl<P: Platform> Kernel<P> {
-    fn fs(&self) -> &Fs {
+    pub(crate) fn fs(&self) -> &Fs {
         self.fs.as_ref().expect("filesystem configured")
     }
 
@@ -202,6 +202,22 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         ret(unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode as i32, 0) })
+    }
+
+    /// `statfs(path, buf)`: the filesystem of the directory holding `path`
+    /// (a rootfs has no mount points within it, so it is the same one).
+    pub(crate) fn sys_statfs(&mut self, path: u64, buf: u64) -> i64 {
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        let (dir, _) = match self.resolve_c(fcntl::AT_FDCWD as u64, &path, true) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        statfs_fd(dir.as_raw_fd(), buf)
+    }
+
+    /// `fstatfs(fd, buf)`.
+    pub(crate) fn sys_fstatfs(&mut self, fd: u64, buf: u64) -> i64 {
+        statfs_fd(fd as i32, buf)
     }
 
     pub(crate) fn sys_newfstatat(&mut self, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
@@ -552,6 +568,19 @@ impl<P: Platform> Kernel<P> {
         let name = r.name_c()?;
         Ok((r.dir, name))
     }
+}
+
+/// The filesystem holding host descriptor `fd`, written to `buf` in Linux
+/// layout.
+fn statfs_fd(fd: i32, buf: u64) -> i64 {
+    // SAFETY: zeroed bytes are a valid `statfs`; `fstatfs` fills it.
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out parameter.
+    if unsafe { libc::fstatfs(fd, &mut s) } < 0 {
+        return last_error();
+    }
+    guest!(uaccess::write(buf, host::statfs_to_linux(&s)));
+    0
 }
 
 /// `RENAME_NOREPLACE`.
@@ -1080,6 +1109,20 @@ mod tests {
             libc::waitpid(child, std::ptr::null_mut(), 0);
         }
         assert_eq!(failures, 0);
+    }
+
+    #[test]
+    fn statfs_of_a_path_in_the_root() {
+        let (mut k, _d) = rooted();
+        let mut st = fwe_abi::Statfs::default();
+        let p = &mut st as *mut _ as u64;
+        assert_eq!(k.syscall(nr::STATFS, [cstr("/").as_ptr() as u64, p, 0, 0, 0, 0]), 0);
+        assert!(st.f_bsize > 0 && st.f_blocks > 0, "{st:?}");
+        let missing = cstr("/no/such/dir/x");
+        assert_eq!(
+            k.syscall(nr::STATFS, [missing.as_ptr() as u64, p, 0, 0, 0, 0]),
+            err(errno::ENOENT)
+        );
     }
 
     #[test]
