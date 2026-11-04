@@ -141,7 +141,9 @@ words finds every instruction exactly.
   the register-only data-processing classes (move wide, add/sub in the
   immediate, shifted- and extended-register and with-carry forms, logical,
   bitfield, extract, conditional select and compare, one-, two- and
-  three-source), the floating-point↔integer moves and conversions, all the
+  three-source), the floating-point↔integer moves and conversions, the moves
+  between a general register and a vector element (`dup`, `ins`, `smov`,
+  `umov`), all the
   load/store forms (unsigned and unscaled immediate, register offset, pre-
   and post-index, pair, the sign-extending loads, with general-purpose and
   SIMD transfer registers), the exclusive, acquire/release, compare-and-swap
@@ -153,14 +155,16 @@ words finds every instruction exactly.
   branches (`br`/`blr`/`ret` through `x18`, which load the target into
   `x16`/`x17`, dead at any branch). A stack spill of `x18` through `sp`, and
   `add`/`sub` of an immediate to `sp` into `x18` (`mov x18, sp`), have the
-  immediate adjusted by the 32 bytes the stub pushed. What is still left
-  alone: a load/store with writeback onto `sp` or a register offset from
-  `sp`, flag-setting, shifted-immediate or extended-register arithmetic
-  from `sp`, `casp` and the pointer-authenticated loads. Scanning the
-  vendored glibc, bash, coreutils and the Rust/musl test programs with the
-  disassembler finds none of these; `--strace` reports, per prepared range,
-  exactly how many `x18` uses were left (a count of real register operands,
-  not of bit patterns).
+  immediate adjusted by the 32 bytes the stub pushed. Where no immediate can
+  absorb the push — extended-register `add`/`sub` from `sp` (`add x1, sp,
+  x18`, of which Node's library has hundreds), flag-setting or shifted
+  immediates from `sp`, a register offset from `sp`, an offset the push
+  would move out of range — the stub saves a third scratch register, sets it
+  to `sp` as it was on entry and runs the instruction with that register in
+  place of `sp`. What is still left alone: a load/store with writeback onto
+  `sp`, an instruction that writes `sp`, `casp` and the pointer-authenticated
+  loads. `--strace` reports, per prepared image, exactly how many `x18`
+  uses were left (a count of real register operands, not of bit patterns).
 
   The backend keeps the slot and the kernel's register view in step: a trap
   reads the guest's `x18` from the slot into `Regs` and writes it back on

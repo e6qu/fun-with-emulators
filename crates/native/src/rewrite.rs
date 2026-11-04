@@ -47,6 +47,8 @@ const STR_UIMM: u32 = 0xf900_0000;
 const PUSH: u32 = 0xf81f_0fe0;
 /// `ldr xT, [sp], #16`
 const POP: u32 = 0xf841_07e0;
+/// `add xD, sp, #48`: the `sp` a three-register stub was entered with.
+const ADD_SP_48: u32 = 0x9100_c3e0;
 /// `b <label>`
 const B: u32 = 0x1400_0000;
 /// `br xN` (indirect branch); `| (n << 5)`.
@@ -394,6 +396,11 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let pick = |used: u32| (0u32..=30).find(|&r| used & (1 << r) == 0).expect("a free register");
     let s1 = pick(used);
     let s2 = pick(used | (1 << s1));
+    // An `sp` operand the push cannot be folded into is replaced by a third
+    // scratch register holding `sp` as it was on entry (see
+    // [`crate::decode::sp_base_scratch`]).
+    let sp_base = crate::decode::sp_base_scratch(insn);
+    let s3 = pick(used | (1 << s1) | (1 << s2));
 
     let reads = ops.iter().any(|f| field_reg(f) == 18 && f.read);
     let writes = ops.iter().any(|f| field_reg(f) == 18 && f.write);
@@ -405,6 +412,7 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     // independent.
     let mut rewritten = match crate::decode::sp_fixup(insn) {
         crate::decode::SpFixup::Adjusted(a) => a,
+        _ if sp_base => (insn & !(0x1f << 5)) | (s3 << 5),
         _ => insn,
     };
     for f in &ops {
@@ -413,13 +421,20 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
         }
     }
 
-    let mut words = vec![PUSH | s1, PUSH | s2, MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2];
+    let mut words = vec![PUSH | s1, PUSH | s2];
+    if sp_base {
+        words.extend([PUSH | s3, ADD_SP_48 | s3]);
+    }
+    words.extend([MRS_TPIDRRO | s2, AND_NOT7 | (s2 << 5) | s2]);
     if reads {
         words.push(LDR_UIMM | imm | (s2 << 5) | s1);
     }
     words.push(rewritten);
     if writes {
         words.push(STR_UIMM | imm | (s2 << 5) | s1);
+    }
+    if sp_base {
+        words.push(POP | s3);
     }
     words.push(POP | s2);
     words.push(POP | s1);
@@ -432,6 +447,31 @@ mod tests {
 
     fn words(ws: &[u32]) -> Vec<u8> {
         ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// `add x1, sp, x18`: no immediate can absorb the 32-byte push, so a
+    /// third scratch register holds `sp` as it was on entry and stands in
+    /// for it.
+    #[test]
+    fn x18_stub_with_sp_in_a_scratch_register() {
+        let words = x18_stub(0x8b3263e1, 3 << 10);
+        // x1 and x18 are used: s1 = x0, s2 = x2, s3 = x3.
+        assert_eq!(
+            words,
+            vec![
+                PUSH,                            // str x0, [sp, #-16]!
+                PUSH | 2,                        // str x2, [sp, #-16]!
+                PUSH | 3,                        // str x3, [sp, #-16]!
+                ADD_SP_48 | 3,                   // add x3, sp, #48
+                MRS_TPIDRRO | 2,                 // mrs x2, tpidrro_el0
+                AND_NOT7 | (2 << 5) | 2,         // and x2, x2, #~7
+                LDR_UIMM | (3 << 10) | (2 << 5), // ldr x0, [x2, #24]
+                0x8b206061,                      // add x1, x3, x0 (uxtx)
+                POP | 3,
+                POP | 2,
+                POP,
+            ]
+        );
     }
 
     #[test]

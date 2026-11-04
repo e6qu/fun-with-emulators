@@ -1,6 +1,7 @@
 // x18 must survive through data-processing instructions beyond moves: extract,
-// conditional select, multiply-add and divide, add/sub with an sp source,
-// across preemption. Exit 0 if
+// conditional select, multiply-add and divide, add/sub with an sp source
+// (including the forms whose sp the stub keeps in a scratch register), loads
+// and stores from sp, moves to and from vector elements, across preemption. Exit 0 if
 // x18 holds its value throughout, 1 otherwise.
     .text
     .globl _start
@@ -50,6 +51,61 @@ _start:
     cmp     x18, x11
     b.ne    fail
     mov     x18, x10                // back to the sentinel
+
+    // sp forms no immediate can absorb the stub's push: the stub holds sp
+    // in a scratch register instead. Extended-register add/sub from sp
+    // (flag-setting too), a large immediate, a register offset from sp,
+    // and pair offsets the push would move out of range.
+    add     x12, x11, x10
+    add     x1, sp, x18
+    cmp     x1, x12
+    b.ne    fail
+    adds    x1, sp, x18
+    cmp     x1, x12
+    b.ne    fail
+    sub     x12, x11, x10, lsl #2
+    sub     x18, sp, x10, lsl #2
+    cmp     x18, x12
+    b.ne    fail
+    add     x12, x11, #4088
+    add     x18, sp, #4088
+    cmp     x18, x12
+    b.ne    fail
+    mov     x18, x10
+    sub     sp, sp, #512
+    mov     x11, sp
+    mov     x16, #7
+    stp     x16, x18, [sp, #496]
+    ldr     x12, [x11, #504]
+    cmp     x12, x10
+    b.ne    fail
+    mov     x18, xzr
+    ldp     x16, x18, [sp, #496]
+    cmp     x18, x10
+    b.ne    fail
+    stp     w16, w18, [sp, #232]
+    mov     x18, xzr
+    ldp     w15, w18, [sp, #232]
+    cmp     w18, w10
+    b.ne    fail
+    mov     x3, #496
+    ldr     x18, [sp, x3]
+    cmp     x18, #7
+    b.ne    fail
+    add     sp, sp, #512
+    mov     x11, sp
+    mov     x18, x10
+
+    // Moves between x18 and a vector element.
+    mov     v0.d[0], x18
+    umov    x12, v0.d[0]
+    cmp     x12, x10
+    b.ne    fail
+    dup     v1.2d, x18
+    mov     x18, xzr
+    mov     x18, v1.d[1]
+    cmp     x18, x10
+    b.ne    fail
 
     // spin without system calls to be preempted, re-checking x18
     movz    x19, #0x2000, lsl #16
