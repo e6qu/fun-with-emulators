@@ -20,30 +20,54 @@ automatically for an executable it cannot map in-process.
 
 The code is in `crates/native/src/hv/`.
 
-- **The VM** (`vm.rs`). A 40-bit guest-physical address space. Stage 1 maps
-  it all as identity 32 MiB blocks of normal memory accessible to EL0, so it
-  never faults; what the guest may touch, and how, is decided at stage 2 by
-  which host memory is mapped where, with the guest's protections. The top
-  block holds fwe's page tables and an exception vector, mapped for EL1 only.
+- **The VM** (`vm.rs`). Its stage 2 is set up once, when the VM is made,
+  and does not change while it runs: the slab (`window.rs`), all private
+  guest memory, mapped whole, and fwe's own region (the page-table pool and
+  a code page). Only shared segments add and remove mappings of their own.
+  The framework keeps the host pages it found when a range was mapped, and
+  the runtimes that run Linux programs this way without trouble
+  (hyper-linux, elfuse) never change stage 2 or the host memory behind it
+  either; nor does fwe.
+- **The guest's page tables** (`pagetables.rs`). Stage 1 is real: 4 KiB
+  pages, Linux's page size on arm64, in a 40-bit address space, with each
+  page's EL0 permissions and BTI guarding. A guest page translates to the
+  guest-physical address of its slab memory. Taking access away (unmapping,
+  reducing permissions) bumps a generation; a vCPU resuming after that goes
+  through the TLB stub on the code page (`tlbi vmalle1is; dsb ish; isb;
+  eret`, at EL1), so every vCPU's TLBs are invalidated before the guest
+  relies on the change, and memory given back is reused only after it.
 - **Execution.** The guest runs at EL0. Every exception it takes enters the
-  vector, which executes `hvc #0`, so the vCPU stops and the backend reads
+  vector, which executes `hvc #2` (not `hvc #0`, which the framework may
+  take for a firmware call), so the vCPU stops and the backend reads
   `ESR_EL1` to see what happened: an `svc` (a Linux system call, unchanged —
   nothing is rewritten, and `x18` and `TPIDR_EL0` are simply the guest's), a
-  `brk`, an undefined instruction, an alignment fault. An access to memory the
-  guest has not mapped stops the vCPU with a stage-2 abort, which becomes
-  `SIGSEGV`.
-- **Memory.** Guest memory is host memory mapped into the VM. Everything the
-  guest maps itself — stack, break, `mmap`s, the dynamic linker and the
-  libraries it loads — is placed at the same address in the VM as in the
-  host, so guest pointers are host pointers, as in the native backend. Only
-  the executable's image, at the low address the host cannot map, lives
-  elsewhere in the host: that one range is registered with the kernel layer,
-  which translates guest pointers into it wherever it uses them — in its
-  checked copies of guest memory (`crates/kernel/src/uaccess.rs`), in the
-  pointer arguments it hands to host system calls (a table of which arguments
-  are pointers), and in `iovec`s. The kernel's memory system calls tell the
-  backend about every mapping change (`Platform::map_guest` and friends), so
-  the VM's view follows the host's.
+  `brk`, an undefined instruction, an alignment fault, a translation or
+  permission fault (`SIGSEGV`), a branch target exception (`SIGILL`).
+- **Memory** (`mem.rs`). The kernel layer's memory system calls go to the
+  backend (`Platform::memory`), which keeps the guest's mappings
+  (`crates/kernel/src/vmas.rs`) and edits the page tables; host memory is
+  never replaced behind the VM. Private memory is slab memory: a mapping the
+  guest did not place sits at the same address as guest and host address; one
+  it placed outside the slab (the executable's image at its low link
+  address, a `MAP_FIXED` address) is backed by slab memory elsewhere and
+  translated, as the kernel's checked copies, the pointer arguments it hands
+  to host calls and `iovec`s do through a table of translated ranges
+  (`crates/kernel/src/uaccess.rs`). A private file mapping is a copy of the
+  file's data. Shared memory (`MAP_SHARED`, of a file, or anonymous, then of
+  an unlinked file) is a *segment*: a host mapping outside the slab, mapped
+  into the VM once. The host's memory behind the guest stays accessible where
+  the guest's is not, so every guest pointer the kernel or the host is given
+  is checked against the guest's mappings first (`EFAULT`). Code fwe writes
+  into guest memory (images, file data, a fork child's memory) has the
+  instruction cache invalidated, as Apple's cores do not keep it coherent
+  with data writes.
+- **Pointer authentication and BTI**, where the VM offers them (its vCPUs'
+  ID registers say): enabled in `SCTLR_EL1` as Linux enables them; each
+  program gets random keys, a thread its creator's, a fork child its
+  parent's, `PR_PAC_RESET_KEYS` new ones; `AT_HWCAP` reports `PACA` and
+  `PACG`. Code of a program built for BTI is mapped `PROT_BTI` where Linux
+  maps it so (the interpreter, or a static program), and a signal handler is
+  entered as from `blr`.
 - **The kernel.** System calls go to the same kernel layer as the native
   backend's, through a `Platform` of the backend's own.
 - **Signals.** As in the native backend, guest dispositions are mirrored onto
@@ -165,27 +189,40 @@ threads: the assembly test programs, Rust/musl programs, and a non-PIE glibc
 program whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the
 shape of Debian's `python3.11`. They can `execve` any program, and a native
 program can `execve` them, and `fork` and `vfork` work as in the native
-backend. A memory call (`mmap` with a fixed address,
-`munmap`, `mprotect`, `madvise`, `mremap`) on a range that runs across the
-edge of the executable's image fails with `EINVAL`, since that range has no
-single host address.
+backend. Two differences from Linux remain: a private file mapping is a copy
+of the file when it was mapped, so later writes to the file through other
+mappings or descriptors do not show in it; and what a `vfork` child changes
+in its address space itself (`mmap`, `munmap`, `mprotect` before it execs or
+exits) stays its own — the memory it writes reaches the parent, its mapping
+changes do not.
 
 ## Fork
 
 The child of a `fork` or `vfork` in the VM is a fresh fwe process,
-`fwe --hv-fork-child`, started with `posix_spawn` — never a host fork. All
-guest memory lives in one reserved host address window (512–960 GiB, inside
-the VM's 1 TiB address space), so the child can map it at the same
-addresses. With every other vCPU stopped, the parent takes a Mach memory
-entry per region: a copy-on-write snapshot of private memory, a share of
-`MAP_SHARED` memory (and of everything, for a `vfork` child). A snapshot is cheap (about 2 ms for 1 GiB) and neither
-process pays for a page until one of them writes to it. The entries, the
-real bootstrap port and the encoded kernel state reach the child in one Mach
-message, through a receive right the parent gave it as its bootstrap port.
-The child maps the memory, rebuilds the kernel (and the kqueues behind
-`epoll` and `timerfd`, which no child inherits), creates its own VM over the
-same guest mappings and resumes after the `svc` with `x0` = 0. See
-[architecture.md](architecture.md#processes) for the state carried over.
+`fwe --hv-fork-child`, started with `posix_spawn` — never a host fork. It
+reserves the slab at the parent's address, takes the parent's memory records
+and kernel state (through a receive right the parent gave it as its
+bootstrap port, with the real bootstrap port), rebuilds the kernel (and the
+kqueues behind `epoll` and `timerfd`, which no child inherits), makes its own
+VM and fills its page tables from the records, and resumes after the `svc`
+with `x0` = 0. No private page is ever in both processes' VMs:
+
+- a **`fork`** child is sent a copy of every page of the slab that exists
+  (`mach_vm_page_range_query`), over a socket pair, with the parent's vCPUs
+  stopped so it sees one instant. Copying 512 MiB takes about 60 ms; an APFS
+  clone of a file-backed slab, which elfuse uses, was measured fifty times
+  slower here, as it writes the memory to disk;
+- a **`vfork`** child is sent nothing up front: its private pages are
+  unmapped until it touches them, when it fetches them, 64 KiB at a time,
+  from the parent, whose waiting thread serves it (a guest pointer the
+  kernel or the host is given is fetched first too). Before it execs or
+  ends it sends back the bytes it changed, compared with what it fetched, and
+  the parent resumes once they are in its memory — so what the child writes
+  the parent sees, as on Linux, without either VM mapping the other's pages;
+- shared memory goes to the child as its file, which the child maps: those
+  pages are in both VMs, as Linux shares them.
+
+See [architecture.md](architecture.md#processes) for the state carried over.
 
 ## The stand-in
 
@@ -198,38 +235,61 @@ passed on to every fwe a guest's `execve`, `fork` or `vfork` starts.
 
 It models what the backend relies on: one VM per process and one vCPU per
 thread; stage 2 as exactly the memory mapped with `hv_vm_map`, with its
-flags; stage 1 as fwe's own tables, read from guest memory at the first run
-and checked to be the identity; exceptions at EL0 going through the vector
-to `hvc` with `ESR_EL1` and the other EL1 registers set, and direct exits for
-stage-2 aborts, `wfi`/`wfe` and the physical counter; `hv_vcpus_exit` from
-any thread or signal handler. Only one vCPU emulates at a time, handed on
-at the next block whenever another waits, and each emulated CPU is driven
-only by its own thread: Unicorn's API, `uc_emu_stop` included, races with
-an engine running on another thread (on Apple Silicon every call updates
-the engine's JIT write-protection bookkeeping unsynchronised), which lost
-guest register updates. Emulation is several times slower than the CPU, so
-the tests give a guest on the stand-in a longer time limit.
+flags; stage 1 as fwe's own tables, walked as the hardware walks them (a
+translation or permission fault, with its level and address, where the
+tables say), cached by the emulated CPU until fwe's TLB stub runs, which it
+carries out (only that stub may run at EL1); exceptions at EL0 going through
+the vector to `hvc #2` with `ESR_EL1` and the other EL1 registers set, and
+direct exits for stage-2 aborts, `wfi`/`wfe` and the physical counter;
+`hv_vcpus_exit` from any thread or signal handler; pointer authentication,
+with the keys fwe sets (QEMU's CPU signs and authenticates, run Non-secure
+as a VM runs, since QEMU traps the instructions in Secure state); BTI
+landing pads on guarded pages, which it checks itself, as its TLB hook
+cannot mark a page guarded for QEMU — and QEMU sets `BTYPE` as for a branch
+from an unguarded page, so a `br` through a register other than x16 or x17
+also accepts `bti c` or `paciasp`. Only one vCPU emulates at a time, handed
+on at the next block whenever another waits, and each emulated CPU is driven
+only by its own thread: Unicorn's API, `uc_emu_stop` included, races with an
+engine running on another thread (on Apple Silicon every call updates the
+engine's JIT write-protection bookkeeping unsynchronised), which lost guest
+register updates; and Unicorn runs hooks inside its own memory calls, so no
+lock a hook takes is held across them. Emulation is several times slower
+than the CPU, so the tests give a guest on the stand-in a longer time limit.
 
 And it checks the rules the backend must keep, printing a line with
-`fwe hv stand-in: VIOLATION:` on which the tests fail: a vCPU used from a
-thread other than its own, a VM destroyed with vCPUs alive, a vCPU run
-before its translation regime is set or leaving EL0, and — through a
-watcher process started with the VM — a process that ends or execs with its
-VM alive. A refused `hv_vm_map` is reported too, and fails as the framework
-fails it: misaligned (16 KiB), overlapping, or over host memory that is not
-mapped or could never be readable and writable. That last rule is inferred,
-not documented: the framework mapped memory whose most was RWX or RW
-(executable included) but refused a `vfork` child's shared code, which
-could only ever be read. The stand-in reproduces that failure.
+`fwe hv stand-in: VIOLATION:` on which the tests fail:
+
+- a vCPU used from a thread other than its own, a VM destroyed with vCPUs
+  alive, a vCPU run before its translation regime is set (40 bits, 4 KiB
+  granule) or at EL1 anywhere but the TLB stub;
+- a vector that is not `hvc #2` at each entry;
+- a change to the stage 2 the VM ran with (anything but shared segments);
+- host memory behind stage 2 replaced while the VM maps it (its VM object
+  changed), checked now and then;
+- anonymous host memory behind stage 2 shared with another process (pages
+  in two VMs: a file's shared pages are what `MAP_SHARED` means);
+- through a watcher process started with the VM, a process that ends or
+  execs with its VM alive.
+
+A refused `hv_vm_map` is reported too, and fails as the framework fails it:
+misaligned (16 KiB), overlapping, or over host memory that is not mapped or
+could never be readable and writable. That last rule was inferred from what
+the framework did, and a real run's `--probe hv-map-rules` matched it. The
+stand-in's unit test breaks each rule on purpose.
 
 A stand-in proves nothing about the real framework. Its own rules are what
 fwe has seen the framework do, and the kernel crashes the backend may cause
 cannot happen in it. So VM changes are also run on real hardware now and
 then, on a machine whose crash costs nothing, instrumented so that a crash
-can be traced (below). Not modelled: the virtual timer, the fault address of an
-alignment fault outside the exclusive and atomic instructions, stack-pointer
-alignment checks, and code one vCPU writes for another without a mapping
-change. `FWE_STANDIN_DEBUG=1` reports each exception and exit it models.
+can be traced (below). Not modelled: the virtual timer, the fault address of
+an alignment fault outside the exclusive and atomic instructions,
+stack-pointer alignment checks, and code one vCPU writes for another
+without a mapping change. What real hardware must still confirm for this
+memory model: the 4 KiB stage-1 granule on every M-series chip, pointer
+authentication and BTI as the vCPUs' ID registers offer them, and how the
+framework treats cache maintenance and `dc zva` at EL0 (hyper-linux reports
+traps: `HCR_EL2.TPU`, `TDZ`). `FWE_STANDIN_DEBUG=1` reports each exception
+and exit it models.
 
 ## Real-hardware runs and the flight recorder
 
