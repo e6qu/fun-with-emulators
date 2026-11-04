@@ -1,81 +1,343 @@
-//! The VM: its guest-physical address space, the stage-1 tables and the
-//! exception vector every vCPU shares.
+//! The VM: its guest-physical (IPA) layout, stage 2, the guest's stage-1
+//! page tables, and the code fwe runs at EL1.
 //!
-//! Guest virtual addresses equal guest-physical ones. Stage 1 maps the whole
-//! 40-bit space as identity 32 MiB blocks of normal memory, all accessible to
-//! EL0, so it never faults; what the guest may actually touch, and how, is
-//! decided at stage 2 by which host memory is mapped where
-//! ([`map`]/[`protect`]/[`unmap`]). An access to anything else stops the vCPU
-//! with an abort the backend turns into `SIGSEGV`.
+//! Stage 2 is set up once, when the VM is made, and never changes while it
+//! runs (only a shared segment adds or removes a mapping of its own): the
+//! framework keeps the host pages it found at mapping time, and the
+//! runtimes that run Linux programs this way without trouble (hyper-linux,
+//! elfuse) never change it either. The IPA space holds, in order:
 //!
-//! The top 32 MiB block holds fwe's own structures — the tables themselves
-//! and the vector page — and is mapped for EL1 only. Every exception the
-//! guest takes at EL0 enters that vector, which executes `hvc #0`: the vCPU
-//! stops and the backend reads `ESR_EL1` to see what happened.
+//! - the slab ([`super::window`]): all private guest memory, at IPA
+//!   `host - window::LO`;
+//! - room for shared segments (`MAP_SHARED` memory, each mapped once);
+//! - fwe's region at the top: the page-table pool and the code page.
+//!
+//! What the guest sees is its stage-1 tables ([`super::pagetables`], 4 KiB
+//! pages): guest `mmap`, `munmap` and `mprotect` edit them, and nothing
+//! else. The guest's addresses translate to IPAs; a guest page whose host
+//! memory is in the slab at the same address (most of them) sits at IPA
+//! `va - window::LO`.
+//!
+//! The code page, mapped for EL1 only at the top of the guest's address
+//! space, holds the exception vector — every exception the guest takes at
+//! EL0 runs `hvc #2`, so the vCPU stops and the backend reads `ESR_EL1` —
+//! and the TLB stub: after the tables lost a translation, a vCPU resumes
+//! through it, so `tlbi vmalle1is` invalidates every vCPU's TLBs before the
+//! guest goes on (see [`Flush`]).
 
 use super::ffi::*;
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use super::pagetables::{PAGE, PageTables, Perms, Pool, VA_LIMIT};
+use super::window;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Size of the guest-physical (and virtual) address space.
-pub const IPA_BITS: u32 = 40;
-pub const IPA_LIMIT: u64 = 1 << IPA_BITS;
-/// Granule of the stage-1 tables, and of guest pages.
-const GRANULE: u64 = 16 << 10;
-/// Span of one level-2 block (16 KiB granule).
-const BLOCK: u64 = 32 << 20;
-/// fwe's block: tables and vectors, out of EL0's reach.
-pub const SYS_BASE: u64 = IPA_LIMIT - BLOCK;
-/// Level-1 table, then sixteen level-2 tables, then the vector page.
-const L1_OFF: u64 = 0;
-const L2_OFF: u64 = GRANULE;
-const L1_ENTRIES: u64 = IPA_LIMIT / (64 << 30); // 16 entries of 64 GiB
-const VECTORS_OFF: u64 = L2_OFF + L1_ENTRIES * GRANULE;
-const SYS_SIZE: u64 = VECTORS_OFF + GRANULE;
-pub const VECTORS: u64 = SYS_BASE + VECTORS_OFF;
-pub const TTBR0: u64 = SYS_BASE + L1_OFF;
+/// The host's page size, the granule of stage 2.
+const HOST_PAGE: u64 = 16 << 10;
+/// fwe's region: the page-table pool, then the code page.
+const POOL_SIZE: u64 = 512 << 20;
+const SYS_SIZE: u64 = POOL_SIZE + HOST_PAGE;
+/// Where the code page sits in the guest's address space (EL1 only).
+pub const CODE_VA: u64 = VA_LIMIT - PAGE;
+/// The TLB stub's offset in the code page, after the sixteen vectors.
+const STUB_OFF: u64 = 0x800;
 
-// Descriptor bits (VMSAv8-64, 16 KiB granule).
-const DESC_TABLE: u64 = 0b11;
-const DESC_BLOCK: u64 = 0b01;
-const AP_EL0_RW: u64 = 0b01 << 6;
-const SH_INNER: u64 = 0b11 << 8;
-const AF: u64 = 1 << 10;
-const PXN: u64 = 1 << 53;
-const UXN: u64 = 1 << 54;
+/// The IPA layout of this process's VM.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    pub ipa_bits: u32,
+    /// Bytes of slab (the window's size).
+    pub slab: u64,
+    /// IPA range for shared segments.
+    pub seg_base: u64,
+    pub seg_end: u64,
+    /// IPA of fwe's region.
+    pub sys: u64,
+}
 
-/// `hvc #0` then `b .`, at each of the sixteen vector entries.
-const HVC_0: u32 = 0xd400_0002;
+static LAYOUT: OnceLock<Layout> = OnceLock::new();
+
+/// The IPA layout this host allows: as many IPA bits as it offers, up to
+/// 40 (the guest's address space). An M1 or M2 offers 36 (64 GiB).
+pub fn layout() -> Result<Layout, String> {
+    if let Some(l) = LAYOUT.get() {
+        return Ok(*l);
+    }
+    let mut max = 0u32;
+    // SAFETY: an out-parameter for the framework.
+    check(unsafe { hv_vm_config_get_max_ipa_size(&mut max) }, "hv_vm_config_get_max_ipa_size")?;
+    let bits = max.min(40);
+    if bits < 36 {
+        return Err(format!("the host offers only {bits}-bit guest-physical addresses"));
+    }
+    let space = 1u64 << bits;
+    // Slab 7/16 of the space (448 GiB of 1 TiB), segments 1/4, the rest
+    // spare below fwe's region.
+    let slab = space / 16 * 7;
+    let seg_base = slab;
+    let seg_end = seg_base + space / 4;
+    let sys = space - SYS_SIZE;
+    let l = Layout { ipa_bits: bits, slab, seg_base, seg_end, sys };
+    Ok(*LAYOUT.get_or_init(|| l))
+}
+
+/// The IPA of slab address `host`.
+pub fn slab_ipa(host: u64) -> u64 {
+    host - window::LO
+}
+
+// --- The page-table pool ----------------------------------------------------
+
+/// Tables in fwe's region: a bump allocator with a free list.
+struct SysPool {
+    host: u64,
+    ipa: u64,
+    next: u64,
+    free: Vec<u64>,
+}
+
+impl Pool for SysPool {
+    fn alloc(&mut self) -> Option<(u64, *mut u64)> {
+        let ipa = match self.free.pop() {
+            Some(ipa) => ipa,
+            None if self.next + PAGE <= POOL_SIZE => {
+                self.next += PAGE;
+                self.ipa + self.next - PAGE
+            }
+            None => return None,
+        };
+        let h = self.host(ipa);
+        // SAFETY: a page-sized table inside fwe's region.
+        unsafe { std::ptr::write_bytes(h, 0, 512) };
+        Some((ipa, h))
+    }
+    fn free(&mut self, ipa: u64) {
+        self.free.push(ipa);
+    }
+    fn host(&self, ipa: u64) -> *mut u64 {
+        (self.host + (ipa - self.ipa)) as *mut u64
+    }
+}
+
+// SAFETY: the pool's memory is fwe's, reached only under the TABLES lock.
+unsafe impl Send for SysPool {}
+
+static TABLES: Mutex<Option<PageTables<SysPool>>> = Mutex::new(None);
+
+fn tables() -> MutexGuard<'static, Option<PageTables<SysPool>>> {
+    TABLES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Host address of fwe's region, once made.
+static SYS_HOST: AtomicU64 = AtomicU64::new(0);
+
+// --- TLB invalidation -------------------------------------------------------
+
+/// Generations of the tables: bumped when they lose a translation; a vCPU
+/// resuming while its last flush is older goes through the TLB stub.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The newest generation a completed flush covers.
+static FLUSHED: AtomicU64 = AtomicU64::new(0);
+
+/// A flush a vCPU is taking: dispatched by [`Flush::needed`], done once the
+/// vCPU next stops (the stub runs before anything else).
+#[derive(Debug, Clone, Copy)]
+pub struct Flush {
+    generation: u64,
+}
+
+impl Flush {
+    /// The flush a vCPU must take before resuming the guest, if any.
+    pub fn needed() -> Option<Flush> {
+        let g = GENERATION.load(SeqCst);
+        (g != FLUSHED.load(SeqCst)).then_some(Flush { generation: g })
+    }
+
+    /// The vCPU ran the stub: every translation the tables lost up to this
+    /// generation is gone from every TLB, and emptied tables can be reused.
+    pub fn done(self) {
+        if FLUSHED.fetch_max(self.generation, SeqCst) < self.generation {
+            if let Some(t) = tables().as_mut() {
+                t.flushed();
+            }
+        }
+        flushed_hook(self.generation);
+    }
+}
+
+/// Called when a flush completes, so memory given back before it can be
+/// reused (set by the memory manager).
+static FLUSHED_HOOK: OnceLock<fn(u64)> = OnceLock::new();
+
+pub fn on_flushed(f: fn(u64)) {
+    let _ = FLUSHED_HOOK.set(f);
+}
+
+fn flushed_hook(generation: u64) {
+    if let Some(f) = FLUSHED_HOOK.get() {
+        f(generation);
+    }
+}
+
+/// The generation an edit that lost a translation belongs to; memory it
+/// freed is reusable once [`flushed`] reaches it.
+pub fn generation() -> u64 {
+    GENERATION.load(SeqCst)
+}
+
+/// No vCPU can hold a translation (none has run, or none runs now): every
+/// lost translation counts as flushed.
+pub fn flushed_without_vcpus() {
+    Flush { generation: GENERATION.load(SeqCst) }.done();
+}
+
+// --- Editing the guest's address space --------------------------------------
+
+/// Linux protections as page permissions.
+pub fn perms(prot: u64) -> Perms {
+    use fwe_abi::mman::*;
+    let read = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
+    Perms {
+        // Write implies read, and so does exec, as Linux on arm64 gives them.
+        read,
+        write: prot & PROT_WRITE != 0,
+        exec: prot & PROT_EXEC != 0,
+        guarded: prot & PROT_BTI != 0,
+    }
+}
+
+fn edited(change: super::pagetables::Change) {
+    if change.flush {
+        GENERATION.fetch_add(1, SeqCst);
+    }
+}
+
+/// Map guest pages `[va, va + len)` to IPAs from `ipa` with `p`.
+pub fn map_pages(va: u64, len: u64, ipa: u64, p: Perms) -> Result<(), i32> {
+    let mut t = tables();
+    let t = t.as_mut().ok_or(fwe_abi::errno::ENOMEM)?;
+    let change = t.map(va, len, ipa, p).map_err(|()| fwe_abi::errno::ENOMEM)?;
+    edited(change);
+    Ok(())
+}
+
+/// Unmap guest pages `[va, va + len)`.
+pub fn unmap_pages(va: u64, len: u64) {
+    if let Some(t) = tables().as_mut() {
+        edited(t.unmap(va, len));
+    }
+}
+
+// --- Shared segments ---------------------------------------------------------
+
+/// Segment IPA ranges in use, `start -> end`.
+static SEGMENTS: Mutex<std::collections::BTreeMap<u64, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Map host memory `[host, host + len)` (host-page aligned) into the VM as
+/// a shared segment, returning its IPA. One of the two stage-2 changes
+/// while the VM runs; its pages are the memory a `MAP_SHARED` mapping
+/// shares.
+pub fn map_segment(host: u64, len: u64) -> Result<u64, i32> {
+    let l = layout().map_err(|_| fwe_abi::errno::ENOMEM)?;
+    let len = len.div_ceil(HOST_PAGE) * HOST_PAGE;
+    let mut segs = SEGMENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut at = l.seg_base;
+    for (&s, &e) in segs.iter() {
+        if s >= at + len {
+            break;
+        }
+        at = at.max(e);
+    }
+    if at + len > l.seg_end {
+        return Err(fwe_abi::errno::ENOMEM);
+    }
+    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+    // SAFETY: host memory the caller keeps mapped until `unmap_segment`.
+    let rc = unsafe { hv_vm_map(host as *mut _, at, len as usize, flags) };
+    if rc != 0 {
+        return Err(fwe_abi::errno::ENOMEM);
+    }
+    segs.insert(at, at + len);
+    Ok(at)
+}
+
+/// Map a fork parent's segment again in the child, at the parent's IPA.
+pub fn map_segment_at(host: u64, len: u64, ipa: u64) -> Result<(), i32> {
+    let mut segs = SEGMENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+    // SAFETY: host memory the caller keeps mapped until `unmap_segment`.
+    let rc = unsafe { hv_vm_map(host as *mut _, ipa, len as usize, flags) };
+    if rc != 0 {
+        return Err(fwe_abi::errno::ENOMEM);
+    }
+    segs.insert(ipa, ipa + len);
+    Ok(())
+}
+
+/// Take the segment at `ipa` out of the VM; the host may then free its
+/// memory (the framework invalidates its translations of it).
+pub fn unmap_segment(ipa: u64) {
+    let mut segs = SEGMENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(end) = segs.remove(&ipa) {
+        // SAFETY: a mapping `map_segment` made.
+        unsafe { hv_vm_unmap(ipa, (end - ipa) as usize) };
+    }
+}
+
+// --- Making the VM --------------------------------------------------------------
+
+/// `hvc #2` then `b .`, at each of the sixteen vector entries: `hvc #0` is
+/// avoided, as the framework may take it for a firmware call when `x0`
+/// holds a function number (found by Carrick).
+const HVC_2: u32 = 0xd400_0042;
 const B_SELF: u32 = 0x1400_0000;
+/// The TLB stub: `tlbi vmalle1is; dsb ish; isb; eret`.
+const STUB: [u32; 4] = [0xd508_831f, 0xd503_3b9f, 0xd503_3fdf, 0xd69f_03e0];
 
-/// The guest's mappings, `start -> (end, Linux prot, host address)`, so a
-/// range can be mapped again after its host memory is replaced.
-static MAPPINGS: Mutex<BTreeMap<u64, (u64, u64, u64)>> = Mutex::new(BTreeMap::new());
+/// The address the vector's entries are at, for `VBAR_EL1`.
+pub const VECTORS: u64 = CODE_VA;
+/// The TLB stub's address.
+pub const TLB_STUB: u64 = CODE_VA + STUB_OFF;
 
-fn mappings() -> std::sync::MutexGuard<'static, BTreeMap<u64, (u64, u64, u64)>> {
-    MAPPINGS.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Create this process's VM: its stage 2 (the slab and fwe's region, each
+/// mapped once), the page tables and the code page. Called once per
+/// process, after [`window::reserve`].
+pub fn create() -> Result<(), String> {
+    let l = layout()?;
+    let sys = alloc_host(SYS_SIZE)?;
+    let code = sys + POOL_SIZE;
+    for e in 0..16u64 {
+        // SAFETY: within the code page, 4-aligned.
+        unsafe {
+            ((code + e * 0x80) as *mut u32).write(HVC_2);
+            ((code + e * 0x80 + 4) as *mut u32).write(B_SELF);
+        }
+    }
+    for (i, w) in STUB.iter().enumerate() {
+        // SAFETY: within the code page, 4-aligned.
+        unsafe { ((code + STUB_OFF + 4 * i as u64) as *mut u32).write(*w) };
+    }
+    SYS_HOST.store(sys, SeqCst);
+    let pool = SysPool { host: sys, ipa: l.sys, next: 0, free: Vec::new() };
+    let mut t = PageTables::new(pool).ok_or("making the page tables failed")?;
+    t.map_el1_code(CODE_VA, l.sys + POOL_SIZE).map_err(|()| "mapping fwe's code failed")?;
+    *tables() = Some(t);
 
-/// Every guest mapping as `(guest, len, Linux prot, host)`, for a fork child
-/// to map again in its own VM.
-pub fn mapping_list() -> Vec<(u64, u64, u64, u64)> {
-    mappings().iter().map(|(&s, &(e, prot, host))| (s, e - s, prot, host)).collect()
-}
-
-/// Host address of fwe's tables and vectors, once built.
-static SYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Create this process's VM, with its tables and vectors mapped.
-fn create_vm(sys: *mut libc::c_void) -> Result<(), String> {
     // SAFETY: a fresh configuration object, then a VM for this process.
     unsafe {
         let cfg = hv_vm_config_create();
-        check(hv_vm_config_set_ipa_size(cfg, IPA_BITS), "hv_vm_config_set_ipa_size")?;
+        check(hv_vm_config_set_ipa_size(cfg, l.ipa_bits), "hv_vm_config_set_ipa_size")?;
         check(hv_vm_create(cfg), "hv_vm_create")?;
     }
     let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
-    // SAFETY: mapping the tables and vectors at the top of the IPA space.
-    let mapped = check(unsafe { hv_vm_map(sys, SYS_BASE, SYS_SIZE as usize, flags) }, "hv_vm_map");
+    // SAFETY: the slab and fwe's region, host memory kept for the process's
+    // life, each mapped once.
+    let mapped = unsafe {
+        check(hv_vm_map(window::LO as *mut _, 0, l.slab as usize, flags), "hv_vm_map (slab)")
+            .and_then(|()| {
+                check(hv_vm_map(sys as *mut _, l.sys, SYS_SIZE as usize, flags), "hv_vm_map")
+            })
+    };
     if mapped.is_err() {
         // No VM is left behind on failure: it has no vCPU yet.
         // SAFETY: destroying the VM just created.
@@ -84,173 +346,37 @@ fn create_vm(sys: *mut libc::c_void) -> Result<(), String> {
     mapped
 }
 
-/// Create the VM and its shared structures. Called once per process.
-pub fn create() -> Result<(), String> {
-    // SAFETY: fresh host memory for the tables and vectors, never freed.
-    let sys = unsafe {
+/// Fresh zero-fill host memory of `len` bytes, kept for the process's life.
+fn alloc_host(len: u64) -> Result<u64, String> {
+    // SAFETY: a fresh anonymous mapping, never unmapped.
+    let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            SYS_SIZE as usize,
+            len as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
             0,
         )
     };
-    if sys == libc::MAP_FAILED {
-        return Err("allocating the VM's tables failed".into());
+    if p == libc::MAP_FAILED {
+        return Err("allocating the VM's own memory failed".into());
     }
-    let word = |off: u64, v: u64| {
-        // SAFETY: `off` lies within the SYS_SIZE mapping and is 8-aligned.
-        unsafe { (sys.cast::<u8>().add(off as usize) as *mut u64).write(v) }
+    Ok(p as u64)
+}
+
+/// Values for the vCPU's EL1 system registers: the translation regime of
+/// [`super::pagetables`], FP/SIMD enabled at EL0, and EL0 allowed the cache,
+/// timer and `dc zva` operations Linux allows user space.
+pub fn system_registers() -> Vec<(hv_sys_reg_t, u64)> {
+    let l = layout().expect("the layout is known once the VM exists");
+    let ips = match l.ipa_bits {
+        36 => 0b001,
+        40 => 0b010,
+        _ => 0b001,
     };
-    for i in 0..L1_ENTRIES {
-        let l2 = L2_OFF + i * GRANULE;
-        word(L1_OFF + i * 8, (SYS_BASE + l2) | DESC_TABLE);
-        for j in 0..GRANULE / 8 {
-            let va = i * (64 << 30) + j * BLOCK;
-            let attrs = if va == SYS_BASE {
-                // EL1 only (AP 00): the vectors execute here.
-                UXN
-            } else {
-                AP_EL0_RW | PXN
-            };
-            word(l2 + j * 8, va | DESC_BLOCK | SH_INNER | AF | attrs);
-        }
-    }
-    for e in 0..16u64 {
-        let at = VECTORS_OFF + e * 0x80;
-        // SAFETY: within the mapping, 4-aligned.
-        unsafe {
-            (sys.cast::<u8>().add(at as usize) as *mut u32).write(HVC_0);
-            (sys.cast::<u8>().add(at as usize + 4) as *mut u32).write(B_SELF);
-        }
-    }
-    SYS.store(sys as u64, std::sync::atomic::Ordering::SeqCst);
-    create_vm(sys)
-}
-
-fn flags(prot: u64) -> u64 {
-    use fwe_abi::mman::*;
-    let mut f = 0;
-    if prot & PROT_READ != 0 {
-        f |= HV_MEMORY_READ;
-    }
-    if prot & PROT_WRITE != 0 {
-        f |= HV_MEMORY_WRITE | HV_MEMORY_READ;
-    }
-    if prot & PROT_EXEC != 0 {
-        f |= HV_MEMORY_EXEC | HV_MEMORY_READ;
-    }
-    f
-}
-
-/// Map host memory `[host, host + len)` at guest address `guest` with Linux
-/// protections `prot`. Fails with a Linux errno.
-pub fn map(guest: u64, host: u64, len: u64, prot: u64) -> Result<(), i32> {
-    if guest.checked_add(len).is_none_or(|end| end > SYS_BASE) {
-        return Err(fwe_abi::errno::ENOMEM);
-    }
-    // Replace whatever was mapped there.
-    unmap(guest, len);
-    if prot != 0 {
-        // SAFETY: the guest's own memory, mapped into its address space.
-        let rc = unsafe { hv_vm_map(host as *mut _, guest, len as usize, flags(prot)) };
-        if rc != 0 {
-            return Err(fwe_abi::errno::ENOMEM);
-        }
-    }
-    mappings().insert(guest, (guest + len, prot, host));
-    Ok(())
-}
-
-/// Remove guest addresses `[guest, guest + len)` from the VM.
-pub fn unmap(guest: u64, len: u64) {
-    let end = guest + len;
-    let mut m = mappings();
-    let hit: Vec<(u64, (u64, u64, u64))> = m
-        .range(..end)
-        .rev()
-        .take_while(|&(_, &(e, _, _))| e > guest)
-        .map(|(&s, &v)| (s, v))
-        .collect();
-    for (s, (e, prot, host)) in hit {
-        m.remove(&s);
-        let (lo, hi) = (s.max(guest), e.min(end));
-        if prot != 0 {
-            // SAFETY: removing part of a mapping this module made.
-            unsafe { hv_vm_unmap(lo, (hi - lo) as usize) };
-        }
-        if s < lo {
-            m.insert(s, (lo, prot, host));
-        }
-        if e > hi {
-            m.insert(hi, (e, prot, host + (hi - s)));
-        }
-    }
-}
-
-/// Change the protections of guest addresses `[guest, guest + len)`. Any of
-/// it not mapped in the VM yet (the break's reservation above the current
-/// break, say) is mapped now, as the host's `mprotect` of the same memory
-/// made it accessible there.
-pub fn protect(guest: u64, len: u64, prot: u64) {
-    let _ = map(guest, fwe_kernel::uaccess::g2h(guest), len, prot);
-}
-
-/// Stop mapping `[guest, guest + len)` in the VM while its host memory is
-/// replaced, keeping the records [`refresh`] maps it again from.
-pub fn detach(guest: u64, len: u64) {
-    let end = guest + len;
-    let m = mappings();
-    for (&s, &(e, prot, _)) in m.range(..end).rev().take_while(|&(_, &(e, _, _))| e > guest) {
-        let (lo, hi) = (s.max(guest), e.min(end));
-        if prot != 0 {
-            // SAFETY: removing part of a mapping this module made; the
-            // record stays for `refresh`.
-            unsafe { hv_vm_unmap(lo, (hi - lo) as usize) };
-        }
-    }
-}
-
-/// Map `[guest, guest + len)` again with the same protections, after
-/// [`detach`] and the host replacing the memory behind it.
-pub fn refresh(guest: u64, len: u64) {
-    let pieces: Vec<(u64, u64, u64, u64)> = {
-        let m = mappings();
-        m.range(..guest + len)
-            .rev()
-            .take_while(|&(_, &(e, _, _))| e > guest)
-            .map(|(&s, &(e, prot, host))| {
-                let (lo, hi) = (s.max(guest), e.min(guest + len));
-                (lo, hi, host + (lo - s), prot)
-            })
-            .collect()
-    };
-    for (lo, hi, host, prot) in pieces {
-        if prot != 0 {
-            // SAFETY: the guest's own memory, at a range `detach` unmapped
-            // (its record kept); mapping it again maps the new pages.
-            unsafe { hv_vm_map(host as *mut _, lo, (hi - lo) as usize, flags(prot)) };
-        }
-    }
-}
-
-/// Values for the vCPU's EL1 system registers: the translation regime above,
-/// FP/SIMD enabled at EL0, and EL0 allowed the cache, timer and `dc zva`
-/// operations Linux allows user space.
-pub fn system_registers() -> [(hv_sys_reg_t, u64); 7] {
-    // T0SZ = 24 (40-bit), IRGN0/ORGN0 write-back, inner shareable, 16 KiB
-    // granule, no TTBR1 walks, 40-bit physical addresses, top byte ignored
-    // (as Linux does for user space).
-    let tcr = 24
-        | (1 << 8)
-        | (1 << 10)
-        | (0b11 << 12)
-        | (0b10 << 14)
-        | (1 << 23)
-        | (0b010 << 32)
-        | (1 << 37);
+    let tcr = (super::pagetables::tcr() & !(0b111 << 32)) | (ips << 32);
+    let root = tables().as_ref().map_or(0, |t| t.root());
     // M, C, SA0, I, DZE, UCT, nTWI, nTWE, UCI, plus the RES1 bits.
     let res1 = (1 << 11) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 28) | (1 << 29);
     let sctlr = res1
@@ -263,13 +389,27 @@ pub fn system_registers() -> [(hv_sys_reg_t, u64); 7] {
         | (1 << 16)
         | (1 << 18)
         | (1 << 26);
-    [
+    vec![
         (HV_SYS_REG_MAIR_EL1, 0xff), // attribute 0: normal, write-back
         (HV_SYS_REG_TCR_EL1, tcr),
-        (HV_SYS_REG_TTBR0_EL1, TTBR0),
+        (HV_SYS_REG_TTBR0_EL1, root),
         (HV_SYS_REG_VBAR_EL1, VECTORS),
         (HV_SYS_REG_CPACR_EL1, 0b11 << 20), // FPEN: no FP/SIMD traps
         (HV_SYS_REG_CNTKCTL_EL1, 0b11),     // EL0 may read the counters
         (HV_SYS_REG_SCTLR_EL1, sctlr),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stub_and_vectors_are_the_instructions_named() {
+        // Encodings from the assembler (clang -c):
+        //   hvc #2 = d4000042, tlbi vmalle1is = d508831f, dsb ish = d5033b9f,
+        //   isb = d5033fdf, eret = d69f03e0.
+        assert_eq!(HVC_2, 0xd400_0042);
+        assert_eq!(STUB, [0xd508_831f, 0xd503_3b9f, 0xd503_3fdf, 0xd69f_03e0]);
+    }
 }

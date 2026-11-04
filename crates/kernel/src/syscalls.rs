@@ -244,7 +244,7 @@ impl<P: Platform> Kernel<P> {
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),
             nr::MADVISE => self.sys_madvise(a[0], a[1], a[2]),
             nr::MSYNC => self.sys_msync(a[0], a[1], a[2]),
-            nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3]),
+            nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3], a[4]),
 
             // Process and thread identity.
             nr::EXIT_GROUP => self.platform.exit(a[0] as i32),

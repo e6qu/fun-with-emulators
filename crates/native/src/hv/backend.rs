@@ -1,8 +1,9 @@
 //! The VMM: loading, the vCPU run loop and the system call path.
 
 use super::ffi::*;
-use super::{fork, record, vm, window};
-use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, page_size, stack};
+use super::pagetables::PAGE;
+use super::{fork, mem, record, vm, window};
+use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, stack};
 use fwe_abi::{auxv, err, errno, mman, nr};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
 use fwe_kernel::{Brk, FpRegs, HostSignal, Kernel, Platform, Regs, Tracer, host, thread, uaccess};
@@ -39,6 +40,7 @@ impl Platform for HvPlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        mem::finish_lazy();
         teardown();
         record::Line::new().s("exit ").dec(code as u32 as u64).emit();
         // SAFETY: terminating the process, its VM gone.
@@ -50,6 +52,7 @@ impl Platform for HvPlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        mem::finish_lazy();
         teardown();
         record::Line::new().s("dies of host signal ").dec(sig as u64).emit();
         // SAFETY: resetting the disposition, unblocking and raising `sig`
@@ -73,34 +76,8 @@ impl Platform for HvPlatform {
         set_host_signal(sig, how);
     }
 
-    fn map_guest(&mut self, addr: u64, len: u64, prot: u64) -> Result<(), i32> {
-        let host = uaccess::g2h(addr);
-        window::mark_used(host, len);
-        vm::map(addr, host, len, prot)
-    }
-
-    fn place_mapping(&mut self, len: u64) -> Option<u64> {
-        window::alloc(len)
-    }
-
-    fn release_host(&mut self, addr: u64, len: u64) -> bool {
-        window::release(addr, len)
-    }
-
-    fn unmap_guest(&mut self, addr: u64, len: u64) {
-        vm::unmap(addr, len);
-    }
-
-    fn protect_guest(&mut self, addr: u64, len: u64, prot: u64) {
-        vm::protect(addr, len, prot);
-    }
-
-    fn replacing_guest(&mut self, addr: u64, len: u64) {
-        vm::detach(addr, len);
-    }
-
-    fn remapped_guest(&mut self, addr: u64, len: u64) {
-        vm::refresh(addr, len);
+    fn memory(&mut self, call: fwe_kernel::MemCall, brk: &mut Brk) -> Option<i64> {
+        Some(mem::call(call, brk))
     }
 }
 
@@ -249,6 +226,7 @@ pub(super) fn teardown() {
 fn exit_thread(code: i32) -> ! {
     use std::sync::atomic::Ordering::SeqCst;
     if crate::LIVE_THREADS.fetch_sub(1, SeqCst) == 1 {
+        mem::finish_lazy();
         teardown();
         record::Line::new().s("exit ").dec(code as u32 as u64).emit();
         // SAFETY: terminating the process, its VM gone.
@@ -355,17 +333,6 @@ fn prot_of(flags: u32) -> u64 {
     p
 }
 
-fn host_prot(prot: u64) -> libc::c_int {
-    let mut h = libc::PROT_NONE;
-    if prot & mman::PROT_READ != 0 {
-        h |= libc::PROT_READ;
-    }
-    if prot & mman::PROT_WRITE != 0 {
-        h |= libc::PROT_WRITE;
-    }
-    h
-}
-
 /// A fault in fwe's own code: the kernel's checked copies recover from it
 /// (EFAULT); anything else is fatal.
 extern "C" fn on_fault(sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
@@ -394,36 +361,8 @@ fn block_guest_signals() {
     }
 }
 
-/// Fresh, zeroed, writable host memory.
-fn host_alloc(len: u64) -> Result<u64, Error> {
-    let at = window::alloc(len)
-        .ok_or_else(|| Error::Unsupported("the guest memory window is full".into()))?;
-    // SAFETY: fresh private anonymous memory replacing part of the window's
-    // reservation.
-    let p = unsafe {
-        libc::mmap(
-            at as *mut libc::c_void,
-            len as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
-            -1,
-            0,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        return Err(Error::Unsupported(format!(
-            "allocating guest memory failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    fwe_kernel::mm::track(p as u64, len);
-    Ok(p as u64)
-}
-
-fn vm_map(guest: u64, host: u64, len: u64, prot: u64) -> Result<(), Error> {
-    vm::map(guest, host, len, prot).map_err(|e| {
-        Error::Unsupported(format!("mapping {guest:#x}+{len:#x} into the VM failed: errno {e}"))
-    })
+fn mem_error(what: &str, e: i32) -> Error {
+    Error::Unsupported(format!("{what} failed: errno {e}"))
 }
 
 /// Where an image ended up.
@@ -437,32 +376,31 @@ struct Placed {
     end: u64,
 }
 
-/// Load `elf` into host memory and the VM. A non-PIE image goes at its link
-/// address in the VM, backed by host memory elsewhere (the translated range);
-/// a PIE one wherever the host puts it, at the same address in both.
-fn place(elf: &Elf<'_>, page: u64, translate: bool) -> Result<Placed, Error> {
-    let plan = LoadPlan::new(elf, page);
-    let host = host_alloc(plan.len)?;
-    let (guest, bias) = if elf.is_pie() { (host, host - plan.start) } else { (plan.start, 0) };
+/// Load `elf` into the guest's memory: a non-PIE image at its link address
+/// (backed by slab memory elsewhere when that address is outside the slab,
+/// and translated), a PIE one wherever there is room. Its pages get the
+/// segments' protections; the gaps between segments are left inaccessible.
+fn place(elf: &Elf<'_>) -> Result<Placed, Error> {
+    let plan = LoadPlan::new(elf, PAGE);
+    let rw = mman::PROT_READ | mman::PROT_WRITE;
+    let guest = if elf.is_pie() {
+        mem::map_anywhere(plan.len, rw).map_err(|e| mem_error("placing the image", e))?
+    } else {
+        mem::map_fixed(plan.start, plan.len, rw).map_err(|e| mem_error("placing the image", e))?;
+        plan.start
+    };
+    let bias = guest - plan.start;
     for ph in elf.loads() {
         let src = &elf.data[ph.offset as usize..(ph.offset + ph.filesz) as usize];
-        let at = host + (ph.vaddr - plan.start);
-        // SAFETY: the segment lies within the fresh allocation.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), at as *mut u8, src.len()) };
+        uaccess::write_from(ph.vaddr + bias, src).map_err(|e| mem_error("loading the image", e))?;
+        mem::code_written(uaccess::g2h(ph.vaddr + bias), src.len() as u64);
     }
-    if translate && guest != host {
-        uaccess::set_translation(guest, plan.len, host);
-    }
+    mem::protect(guest, plan.len, mman::PROT_NONE)
+        .map_err(|e| mem_error("protecting the image", e))?;
     for run in &plan.runs {
         let off = run.start - plan.start;
-        let prot = prot_of(run.prot);
-        vm_map(guest + off, host + off, run.len, prot)?;
-        // The host copy gets the same protections, so the kernel's own
-        // accesses fault (and report EFAULT) where the guest's would.
-        // SAFETY: changing protections of the allocation made above.
-        unsafe {
-            libc::mprotect((host + off) as *mut _, run.len as usize, host_prot(prot));
-        }
+        mem::protect(guest + off, run.len, prot_of(run.prot))
+            .map_err(|e| mem_error("protecting the image", e))?;
     }
     let (_, hi) = elf.bounds();
     Ok(Placed {
@@ -532,14 +470,16 @@ fn start(
     env: &[OsString],
     options: &Options,
 ) -> Result<std::convert::Infallible, Error> {
-    let page = page_size();
+    // The guest's pages are Linux's 4 KiB ones: its own page tables say so.
+    let page = PAGE;
     let tracer = Tracer { enabled: options.strace };
     // Hypervisor.framework runs threads of its own, which inherit the mask
     // of the thread that creates them. With every guest signal blocked
     // there, the host delivers signals only to the vCPU threads, whose masks
     // follow the guest's. The mask fwe started with is the guest's own.
     let inherited_mask = host::blocked_signals();
-    window::reserve().map_err(Error::Unsupported)?;
+    let layout = vm::layout().map_err(Error::Unsupported)?;
+    window::reserve(layout.slab).map_err(Error::Unsupported)?;
     become_vm_process().map_err(|e| {
         Error::Unsupported(format!(
             "this program is linked below 4 GiB, which needs the hypervisor backend, \
@@ -551,7 +491,8 @@ fn start(
     let mut fs = crate::open_fs(options)?;
 
     let elf = Elf::parse(data).map_err(Error::Elf)?;
-    let exe = place(&elf, page, true)?;
+    mem::init();
+    let exe = place(&elf)?;
     let interp = match elf.interpreter().map_err(Error::Elf)? {
         Some(ip) => {
             let idata = fs.read(ip).map_err(|e| {
@@ -566,22 +507,22 @@ fn start(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            Some(place(&ielf, page, false)?)
+            Some(place(&ielf)?)
         }
         None => None,
     };
 
-    // The break: anywhere in the host above the image, the same address in
-    // the VM; its pages enter the VM as `brk` commits them.
-    let brk_start = host_alloc(Brk::RESERVATION)?;
-    // SAFETY: making the reservation inaccessible until `brk` commits it.
-    unsafe { libc::mprotect(brk_start as *mut _, Brk::RESERVATION as usize, libc::PROT_NONE) };
+    // The break: a reserved range the guest's `brk` maps page by page.
+    let brk_start =
+        mem::reserve_brk(Brk::RESERVATION).map_err(|e| mem_error("reserving the break", e))?;
     let brk = Brk { start: brk_start, current: brk_start, limit: brk_start + Brk::RESERVATION };
     let _ = exe.end;
 
     // The stack, with an inaccessible guard page below it.
-    let stack_base = host_alloc(STACK_SIZE + page)?;
-    vm_map(stack_base + page, stack_base + page, STACK_SIZE, mman::PROT_READ | mman::PROT_WRITE)?;
+    let rw = mman::PROT_READ | mman::PROT_WRITE;
+    let stack_base =
+        mem::map_anywhere(STACK_SIZE + page, rw).map_err(|e| mem_error("making the stack", e))?;
+    mem::protect(stack_base, page, mman::PROT_NONE).map_err(|e| mem_error("the stack guard", e))?;
     let stack_top = stack_base + page + STACK_SIZE;
 
     let (hwcap, hwcap2) = hwcap::detect();
@@ -614,19 +555,17 @@ fn start(
     let image =
         stack::InitialStack { args: &arg_bytes, env: &env_bytes, execfn, auxv: &aux, random }
             .build(stack_top);
-    // SAFETY: the image fits in the stack mapping, ending at its top.
-    unsafe {
-        std::ptr::copy_nonoverlapping(image.bytes.as_ptr(), image.sp as *mut u8, image.bytes.len())
-    };
+    uaccess::write_from(image.sp, &image.bytes).map_err(|e| mem_error("writing the stack", e))?;
 
     // The rt_sigreturn trampoline.
-    let tramp = host_alloc(page)?;
-    // SAFETY: two instruction words into the fresh page.
-    unsafe {
-        (tramp as *mut u32).write(SIGRETURN[0]);
-        ((tramp + 4) as *mut u32).write(SIGRETURN[1]);
-    }
-    vm_map(tramp, tramp, page, mman::PROT_READ | mman::PROT_EXEC)?;
+    let tramp = mem::map_anywhere(page, rw).map_err(|e| mem_error("the trampoline", e))?;
+    let words: Vec<u8> = SIGRETURN.iter().flat_map(|w| w.to_le_bytes()).collect();
+    uaccess::write_from(tramp, &words).map_err(|e| mem_error("the trampoline", e))?;
+    mem::code_written(uaccess::g2h(tramp), words.len() as u64);
+    mem::protect(tramp, page, mman::PROT_READ | mman::PROT_EXEC)
+        .map_err(|e| mem_error("the trampoline", e))?;
+    // No vCPU has run: nothing can hold an old translation.
+    vm::flushed_without_vcpus();
 
     let entry = interp.as_ref().map_or(exe.entry, |i| i.entry);
     if options.strace {
@@ -798,6 +737,17 @@ impl Vcpu {
             // host routes signals as for the native backend.
             let mask = host::host_mask_for(thread::mask());
             enter_run();
+            // After the page tables lost a translation, resume through the
+            // TLB stub: it invalidates every vCPU's TLBs, then returns to
+            // the guest where it was.
+            let flush = vm::Flush::needed();
+            if flush.is_some() {
+                self.set_sys(HV_SYS_REG_ELR_EL1, self.get(HV_REG_PC));
+                self.set_sys(HV_SYS_REG_SPSR_EL1, self.get(HV_REG_CPSR));
+                self.set(HV_REG_PC, vm::TLB_STUB);
+                // EL1h, interrupts masked.
+                self.set(HV_REG_CPSR, 0x3c5);
+            }
             // SAFETY: plain host calls; `exit` is HVF's record for this vCPU.
             let (rc, exit) = unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
@@ -812,6 +762,17 @@ impl Vcpu {
             }
             if rc != 0 {
                 fatal(&format!("hv_vcpu_run failed: {rc:#x}"));
+            }
+            if let Some(f) = flush {
+                let pc = self.get(HV_REG_PC);
+                if (vm::TLB_STUB..vm::TLB_STUB + 16).contains(&pc) {
+                    // Stopped inside the stub: back to the guest's state;
+                    // the flush is taken again next time.
+                    self.set(HV_REG_PC, self.get_sys(HV_SYS_REG_ELR_EL1));
+                    self.set(HV_REG_CPSR, self.get_sys(HV_SYS_REG_SPSR_EL1));
+                } else {
+                    f.done();
+                }
             }
             match exit.reason {
                 HV_EXIT_REASON_EXCEPTION => {
@@ -909,7 +870,16 @@ impl Vcpu {
             }
             EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr),
             EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far),
-            EC_DABT_LOWER | EC_IABT_LOWER => fault(&mut regs, s::SIGSEGV, far),
+            EC_DABT_LOWER | EC_IABT_LOWER => {
+                // A translation fault (DFSC/IFSC 0b0001xx) a vfork child
+                // takes on memory it has not fetched yet: fetched now, the
+                // access is tried again.
+                if esr & 0x3c == 0x04 && mem::demand(far) {
+                    regs.pc = elr;
+                } else {
+                    fault(&mut regs, s::SIGSEGV, far)
+                }
+            }
             EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr),
             _ => fault(&mut regs, s::SIGILL, elr),
         }
@@ -984,6 +954,8 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     // runnable, there is no way back.
     let state = k.exec_state();
     let before_exec = || {
+        // A vfork child's changes reach its parent before it goes on.
+        mem::finish_lazy();
         teardown();
         record::event("execve", &path);
     };
@@ -1083,6 +1055,39 @@ extern "C" fn thread_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     vcpu.run(regs)
 }
 
+/// Whether pointer argument `i` of system call `n` points at guest memory
+/// the call may use: a path, readable up to its terminator; a buffer with
+/// a length argument, all of it (writable if the host writes it); anything
+/// else, its first byte (`ioctl`'s argument is not checked: it is a
+/// pointer only for some requests). The memory up to a page past it is
+/// fetched first in a vfork child.
+fn pointer_ok(n: u64, i: usize, a: &[u64; 6]) -> bool {
+    let p = a[i];
+    let path = matches!(
+        (n, i),
+        (nr::OPENAT | nr::MKDIRAT | nr::MKNODAT | nr::UNLINKAT | nr::FCHMODAT, 1)
+            | (nr::FCHOWNAT | nr::FACCESSAT | nr::FACCESSAT2 | nr::NEWFSTATAT, 1)
+            | (nr::READLINKAT | nr::STATX | nr::UTIMENSAT, 1)
+            | (nr::CHDIR | nr::CHROOT | nr::TRUNCATE | nr::STATFS, 0)
+            | (nr::SYMLINKAT, 0 | 2)
+            | (nr::LINKAT | nr::RENAMEAT | nr::RENAMEAT2, 1 | 3)
+    );
+    if path {
+        return uaccess::read_cstr(p, uaccess::PATH_MAX).is_ok();
+    }
+    let (len, write) = match (n, i) {
+        (nr::READ | nr::PREAD64 | nr::GETDENTS64 | nr::RECVFROM, 1) => (a[2], true),
+        (nr::WRITE | nr::PWRITE64 | nr::SENDTO, 1) => (a[2], false),
+        (nr::READLINKAT, 2) => (a[3], true),
+        (nr::GETCWD | nr::GETRANDOM, 0) => (a[1], true),
+        _ => (1, false),
+    };
+    mem::prepare_access(p, len.max(PAGE));
+    // `ioctl`'s argument is a pointer only for some requests: translated,
+    // and fetched for a vfork child, but not refused.
+    n == nr::IOCTL || len == 0 || mem::valid(p, len, write)
+}
+
 /// Run the system call in `regs` (number in `x8`), leaving its result and
 /// any signal delivery in `regs`.
 fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
@@ -1095,6 +1100,15 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
         nr::PRCTL => uaccess::prctl_pointer_args(args[0]),
         _ => uaccess::pointer_args(n),
     };
+    // Guest pointers the host is given must be guest memory: the host's
+    // memory behind them is accessible either way (see `mem`). A vfork
+    // child fetches what they reach first.
+    for (i, &a) in args.iter().enumerate() {
+        if mask & (1 << i) != 0 && a != 0 && !pointer_ok(n, i, &args) {
+            kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EFAULT));
+            return;
+        }
+    }
     let mut host_args = args;
     for (i, a) in host_args.iter_mut().enumerate() {
         if mask & (1 << i) != 0 {

@@ -112,7 +112,7 @@ const UC_CPU_ARM64_MAX: c_int = 3;
 const UC_CTL_CPU_MODEL_W: u32 = 0x4400_0007;
 const UC_CTL_TLB_TYPE_W: u32 = 0x4400_000c;
 const UC_CTL_TLB_FLUSH_W: u32 = 0x4000_000b;
-const UC_CTL_TB_REMOVE_CACHE_W: u32 = 0x4800_0009;
+const UC_CTL_TB_FLUSH_W: u32 = 0x4000_000a;
 const UC_TLB_VIRTUAL: c_int = 1;
 
 const UC_HOOK_INTR: c_int = 1;
@@ -130,7 +130,6 @@ const UC_MEM_FETCH_PROT: c_int = 24;
 const UC_PROT_READ: u32 = 1;
 const UC_PROT_WRITE: u32 = 2;
 const UC_PROT_EXEC: u32 = 4;
-const UC_PROT_ALL: u32 = 7;
 
 const UC_ARM64_INS_MRS: c_int = 1;
 const UC_ARM64_INS_MSR: c_int = 2;
@@ -185,7 +184,6 @@ type RegReadFn = unsafe extern "C" fn(Uc, c_int, *mut c_void) -> c_int;
 type RegWriteFn = unsafe extern "C" fn(Uc, c_int, *const c_void) -> c_int;
 type MemMapPtrFn = unsafe extern "C" fn(Uc, u64, usize, u32, *mut c_void) -> c_int;
 type MemUnmapFn = unsafe extern "C" fn(Uc, u64, usize) -> c_int;
-type MemReadFn = unsafe extern "C" fn(Uc, u64, *mut c_void, u64) -> c_int;
 type HookAddFn =
     unsafe extern "C" fn(Uc, *mut usize, c_int, *mut c_void, *mut c_void, u64, u64, ...) -> c_int;
 type EmuStartFn = unsafe extern "C" fn(Uc, u64, u64, u64, usize) -> c_int;
@@ -200,7 +198,6 @@ struct Api {
     reg_write: RegWriteFn,
     mem_map_ptr: MemMapPtrFn,
     mem_unmap: MemUnmapFn,
-    mem_read: MemReadFn,
     hook_add: HookAddFn,
     emu_start: EmuStartFn,
     emu_stop: EmuStopFn,
@@ -250,7 +247,6 @@ fn load() -> Result<Api, String> {
             reg_write: std::mem::transmute::<*mut c_void, RegWriteFn>(sym("uc_reg_write")?),
             mem_map_ptr: std::mem::transmute::<*mut c_void, MemMapPtrFn>(sym("uc_mem_map_ptr")?),
             mem_unmap: std::mem::transmute::<*mut c_void, MemUnmapFn>(sym("uc_mem_unmap")?),
-            mem_read: std::mem::transmute::<*mut c_void, MemReadFn>(sym("uc_mem_read")?),
             hook_add: std::mem::transmute::<*mut c_void, HookAddFn>(sym("uc_hook_add")?),
             emu_start: std::mem::transmute::<*mut c_void, EmuStartFn>(sym("uc_emu_start")?),
             emu_stop: std::mem::transmute::<*mut c_void, EmuStopFn>(sym("uc_emu_stop")?),
@@ -280,7 +276,21 @@ fn note(msg: &str) {
 fn say(kind: &str, msg: &str) {
     let mut buf = [0u8; 512];
     let mut n = 0;
-    for part in ["fwe hv stand-in: ", kind, msg, "\n"] {
+    // The process, as several (a fork's parent and child) may be writing.
+    let mut pid = [0u8; 12];
+    // SAFETY: plain host call.
+    let mut v = unsafe { libc::getpid() } as u32;
+    let mut i = pid.len();
+    loop {
+        i -= 1;
+        pid[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let pid = std::str::from_utf8(&pid[i..]).unwrap_or("");
+    for part in ["fwe hv stand-in: ", kind, msg, " [", pid, "]", "\n"] {
         for &b in part.as_bytes() {
             if n < buf.len() - 1 {
                 buf[n] = b;
@@ -316,9 +326,14 @@ struct Vm {
     ipa_bits: u32,
     /// Stage 2, by start address.
     maps: BTreeMap<u64, Mapping>,
-    /// EL0's view of stage 1, `(start, end, Unicorn permissions)` runs of
-    /// fwe's blocks, once read (at the first run).
-    stage1: Option<Vec<(u64, u64, u32)>>,
+    /// Stage 2 as it was when a vCPU first ran: it may not change after
+    /// (shared segments come and go beside it).
+    first_run: Option<Vec<(u64, u64)>>,
+    /// The host memory behind each mapping: `(start, end, VM object)` of
+    /// each host region, so a replacement is seen.
+    objects: Vec<(u64, u64, u32)>,
+    /// Runs since the last check of `objects`.
+    runs: u64,
 }
 
 /// Lock order: `VM`, then `TURN`, then `LOG`, then a vCPU's `engine`.
@@ -348,6 +363,8 @@ struct Vcpu {
     cancel: AtomicBool,
     /// Another wants the turn: stop at the next block.
     yield_now: AtomicBool,
+    /// `TTBR0_EL1`, for walks from hooks.
+    ttbr0: AtomicU64,
     /// The block hook ended the last emulation (a yield or a cancel).
     hook_stopped: AtomicBool,
     /// Inside `uc_emu_start`.
@@ -369,6 +386,8 @@ struct Engine {
     sys: BTreeMap<hv_sys_reg_t, u64>,
     /// What a hook decided during the last emulation.
     event: Option<Event>,
+    /// `CPSR` set to an EL1 mode: the vCPU resumes in fwe's EL1 code.
+    el1: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -497,6 +516,16 @@ pub fn vm_config_create() -> hv_vm_config_t {
     Box::into_raw(Box::new(40u32)).cast()
 }
 
+/// The stand-in offers what an M3 or later does: 40-bit IPAs.
+pub fn vm_config_get_max_ipa_size(bits: *mut u32) -> hv_return_t {
+    if bits.is_null() {
+        return HV_BAD_ARGUMENT;
+    }
+    // SAFETY: the caller's out-parameter.
+    unsafe { *bits = 40 };
+    HV_SUCCESS
+}
+
 pub fn vm_config_set_ipa_size(config: hv_vm_config_t, bits: u32) -> hv_return_t {
     if config.is_null() || !(32..=40).contains(&bits) {
         return HV_BAD_ARGUMENT;
@@ -515,7 +544,8 @@ pub fn vm_create(config: hv_vm_config_t) -> hv_return_t {
     // SAFETY: a configuration made by vm_config_create, or none.
     let ipa_bits = if config.is_null() { 36 } else { unsafe { *config.cast::<u32>() } };
     start_watcher();
-    *g = Some(Vm { ipa_bits, maps: BTreeMap::new(), stage1: None });
+    *g =
+        Some(Vm { ipa_bits, maps: BTreeMap::new(), first_run: None, objects: Vec::new(), runs: 0 });
     VM_LIVE.store(true, SeqCst);
     tell_watcher(b'C');
     HV_SUCCESS
@@ -570,10 +600,10 @@ pub fn vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return
         return HV_BAD_ARGUMENT;
     }
     v.maps.insert(ipa, Mapping { end, host, flags });
-    let pieces = el0_pieces(v, ipa, end, host, flags);
-    let mut ops: Vec<Op> = pieces.iter().map(|&(lo, hi, h, p)| Op::Map(lo, hi, h, p)).collect();
-    ops.push(Op::Flush(ipa, end));
-    apply(ops);
+    for (lo, hi, obj, _, _) in host_regions(host, len) {
+        v.objects.push((lo, hi, obj));
+    }
+    apply(vec![Op::Map(ipa, end, host, uc_perms(flags)), Op::Flush]);
     HV_SUCCESS
 }
 
@@ -612,12 +642,20 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
         if m.end > hi {
             v.maps.insert(hi, Mapping { end: m.end, host: m.host + (hi - s), flags: m.flags });
         }
-        gone.extend(
-            el0_pieces(v, lo, hi, m.host + (lo - s), m.flags).into_iter().map(|p| (p.0, p.1)),
-        );
+        gone.push((lo, hi));
+        let (h, hl) = (m.host + (lo - s), hi - lo);
+        v.objects.retain(|&(a, b, _)| b <= h || a >= h + hl);
+    }
+    if let Some(first) = &v.first_run {
+        if first.iter().any(|&(a, b)| ipa < b && end > a) {
+            violation(&format!(
+                "hv_vm_unmap of {ipa:#x}+{size:#x}, part of the stage 2 the VM ran with: \
+                 stage 2 may not change while the VM runs"
+            ));
+        }
     }
     let mut ops: Vec<Op> = gone.iter().map(|&(lo, hi)| Op::Unmap(lo, hi)).collect();
-    ops.push(Op::Flush(ipa, end));
+    ops.push(Op::Flush);
     apply(ops);
     HV_SUCCESS
 }
@@ -630,8 +668,11 @@ enum Op {
     /// `(lo, hi, host, perms)`.
     Map(u64, u64, u64, u32),
     Unmap(u64, u64),
-    /// Discard translations of `[lo, hi)`.
-    Flush(u64, u64),
+    /// Discard translations and translated code (after a change of
+    /// guest-physical memory, or of code in it).
+    Flush,
+    /// Discard every cached translation: the guest ran `tlbi vmalle1is`.
+    FlushAll,
 }
 
 /// The changes, from absolute index `base` on.
@@ -650,6 +691,34 @@ fn log() -> MutexGuard<'static, Log> {
 /// until it has applied them.
 fn apply(ops: Vec<Op>) {
     take_turn(MAPPER, &|| false);
+    {
+        let mut w = walk_map();
+        for &op in &ops {
+            match op {
+                Op::Map(lo, hi, h, _) => {
+                    w.insert(lo, (hi, h));
+                }
+                Op::Unmap(lo, hi) => {
+                    let hit: Vec<(u64, (u64, u64))> = w
+                        .range(..hi)
+                        .rev()
+                        .take_while(|(_, (e, _))| *e > lo)
+                        .map(|(&a, &b)| (a, b))
+                        .collect();
+                    for (a, (e, h)) in hit {
+                        w.remove(&a);
+                        if a < lo {
+                            w.insert(a, (lo, h));
+                        }
+                        if e > hi {
+                            w.insert(hi, (e, h + (hi - a)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let mut l = log();
     l.ops.extend(ops);
     // Drop what every vCPU has applied.
@@ -678,12 +747,13 @@ fn apply(ops: Vec<Op>) {
 /// turn.
 fn catch_up(v: &Vcpu) {
     let l = log();
-    let mut e = engine(v);
-    let start = e.applied.max(l.base) - l.base;
+    let start = engine(v).applied.max(l.base) - l.base;
+    // Unicorn may run the vCPU's hooks inside these calls: the engine
+    // lock, which hooks take, is not held across them.
     for &op in &l.ops[start..] {
         apply_op(v.uc, op);
     }
-    e.applied = l.base + l.ops.len();
+    engine(v).applied = l.base + l.ops.len();
 }
 
 fn apply_op(uc: Uc, op: Op) {
@@ -712,16 +782,22 @@ fn apply_op(uc: Uc, op: Op) {
                 ));
             }
         }
-        Op::Flush(lo, hi) => flush(uc, lo, hi),
+        Op::Flush => flush(uc),
+        Op::FlushAll => {
+            // SAFETY: a control call on an engine not emulating.
+            unsafe { (api().ctl)(uc, UC_CTL_TLB_FLUSH_W) };
+        }
     }
 }
 
-/// Discard translations and translated code for `[lo, hi)`.
-fn flush(uc: Uc, lo: u64, hi: u64) {
+/// Discard every cached translation and all translated code. (Unicorn's
+/// per-range removal takes guest-virtual addresses and translates them
+/// through the TLB hook: no use for a change of guest-physical memory.)
+fn flush(uc: Uc) {
     // SAFETY: control calls on an engine not emulating.
     unsafe {
         (api().ctl)(uc, UC_CTL_TLB_FLUSH_W);
-        (api().ctl)(uc, UC_CTL_TB_REMOVE_CACHE_W, lo, hi);
+        (api().ctl)(uc, UC_CTL_TB_FLUSH_W);
     }
 }
 
@@ -757,91 +833,207 @@ fn host_allows(host: u64, len: u64, flags: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// `[lo, hi)` (host `host`, framework `flags`) cut along stage-1 blocks,
-/// with the Unicorn permissions EL0 ends up with: `(lo, hi, host, perms)`.
-/// Before stage 1 is known (no run yet) nothing is mapped for the CPU.
-fn el0_pieces(v: &Vm, lo: u64, hi: u64, host: u64, flags: u64) -> Vec<(u64, u64, u64, u32)> {
-    let Some(s1) = &v.stage1 else { return Vec::new() };
-    let stage2 = (if flags & HV_MEMORY_READ != 0 { UC_PROT_READ } else { 0 })
+/// The emulated CPU's permissions for stage-2 `flags`.
+fn uc_perms(flags: u64) -> u32 {
+    (if flags & HV_MEMORY_READ != 0 { UC_PROT_READ } else { 0 })
         | (if flags & HV_MEMORY_WRITE != 0 { UC_PROT_WRITE } else { 0 })
-        | (if flags & HV_MEMORY_EXEC != 0 { UC_PROT_EXEC } else { 0 });
-    let mut out: Vec<(u64, u64, u64, u32)> = Vec::new();
-    for &(bs, be, perms) in s1 {
-        let (a, b) = (bs.max(lo), be.min(hi));
-        if a >= b {
+        | (if flags & HV_MEMORY_EXEC != 0 { UC_PROT_EXEC } else { 0 })
+}
+
+// --- Stage 1: fwe's page tables, walked as the hardware walks them ----------
+
+/// Stage 2 for the walker, `ipa -> (end, host)`: kept with the emulated
+/// memory map (changed with the turn held, so no walk runs meanwhile).
+static WALK: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+fn walk_map() -> MutexGuard<'static, BTreeMap<u64, (u64, u64)>> {
+    WALK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The host address of guest-physical `ipa`, if stage 2 maps it.
+fn ipa_host(ipa: u64) -> Option<u64> {
+    let w = walk_map();
+    let (&lo, &(hi, host)) = w.range(..=ipa).next_back()?;
+    (ipa < hi).then_some(host + (ipa - lo))
+}
+
+/// The outcome of a walk.
+#[derive(Debug, Clone, Copy)]
+enum Walked {
+    /// A page: its guest-physical address (with the offset) and what EL0
+    /// may do with it.
+    Page { ipa: u64, perms: u32 },
+    /// A translation fault at this level.
+    Fault { level: u64 },
+}
+
+const DESC_ADDR: u64 = 0x0000_ffff_ffff_f000;
+
+/// Walk fwe's tables (4 KiB granule, 40 bits, level 0 first, pages only at
+/// level 3, as `pagetables` builds them) for `va`.
+fn walk(ttbr0: u64, va: u64) -> Walked {
+    if va >= 1 << 40 {
+        return Walked::Fault { level: 0 };
+    }
+    let mut table = ttbr0 & DESC_ADDR;
+    for level in 0..=3u64 {
+        let idx = (va >> (12 + 9 * (3 - level))) & 511;
+        let Some(h) = ipa_host(table + idx * 8) else { return Walked::Fault { level } };
+        // SAFETY: host memory behind a mapped guest-physical address.
+        let d = unsafe { std::ptr::read_volatile(h as *const u64) };
+        if d & 0b11 != 0b11 {
+            // Invalid, or a block (fwe's tables have none): a fault.
+            return Walked::Fault { level };
+        }
+        if level < 3 {
+            table = d & DESC_ADDR;
             continue;
         }
-        let p = perms & stage2;
-        if p == 0 {
-            continue;
+        let el0 = d & (1 << 6) != 0;
+        let read_only = d & (1 << 7) != 0;
+        let uxn = d & (1 << 54) != 0;
+        let mut perms = 0;
+        if el0 {
+            perms |= UC_PROT_READ;
+            if !read_only {
+                perms |= UC_PROT_WRITE;
+            }
         }
-        match out.last_mut() {
-            Some(last) if last.1 == a && last.3 == p => last.1 = b,
-            _ => out.push((a, b, host + (a - lo), p)),
+        if !uxn {
+            perms |= UC_PROT_EXEC;
         }
+        return Walked::Page { ipa: (d & DESC_ADDR) | (va & 0xfff), perms };
+    }
+    unreachable!()
+}
+
+/// Read 4 bytes of guest memory at `va` through the vCPU's tables.
+fn fetch_va(ttbr0: u64, va: u64) -> Option<u32> {
+    match walk(ttbr0, va) {
+        // SAFETY: host memory behind a mapped page.
+        Walked::Page { ipa, .. } => {
+            ipa_host(ipa).map(|h| {
+                // SAFETY: host memory behind a page the tables map.
+                unsafe { (h as *const u32).read_unaligned() }
+            })
+        }
+        Walked::Fault { .. } => None,
+    }
+}
+
+// --- Host memory behind stage 2 ----------------------------------------------
+
+/// The host regions of `[host, host + len)`: `(start, end, VM object id,
+/// share mode, file-backed)`.
+fn host_regions(host: u64, len: u64) -> Vec<(u64, u64, u32, u8, bool)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct TopInfo {
+        obj_id: u32,
+        ref_count: u32,
+        private_pages_resident: u32,
+        shared_pages_resident: u32,
+        share_mode: u8,
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_region(
+            task: u32,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: c_int,
+            info: *mut c_int,
+            count: *mut u32,
+            object_name: *mut u32,
+        ) -> c_int;
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedInfo {
+        protection: c_int,
+        user_tag: u32,
+        pages_resident: u32,
+        pages_shared_now_private: u32,
+        pages_swapped_out: u32,
+        pages_dirtied: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        pages_reusable: u32,
+    }
+    const VM_REGION_TOP_INFO: c_int = 12;
+    const VM_REGION_EXTENDED_INFO: c_int = 13;
+    let end = host + len;
+    let mut out = Vec::new();
+    let mut at = host;
+    while at < end {
+        let (mut start, mut size) = (at, 0u64);
+        let mut info = TopInfo::default();
+        let mut count = (size_of::<TopInfo>() / size_of::<c_int>()) as u32;
+        let mut name = 0u32;
+        // SAFETY: querying our own address space into a record of the
+        // size given.
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut start,
+                &mut size,
+                VM_REGION_TOP_INFO,
+                (&mut info as *mut TopInfo).cast(),
+                &mut count,
+                &mut name,
+            )
+        };
+        if kr != 0 || start >= end {
+            break;
+        }
+        let mut ext = ExtendedInfo::default();
+        let mut count = (size_of::<ExtendedInfo>() / size_of::<c_int>()) as u32;
+        let mut s2 = start;
+        let mut z2 = 0u64;
+        // SAFETY: as above, for the extended record.
+        unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut s2,
+                &mut z2,
+                VM_REGION_EXTENDED_INFO,
+                (&mut ext as *mut ExtendedInfo).cast(),
+                &mut count,
+                &mut name,
+            )
+        };
+        out.push((
+            start.max(host),
+            (start + size).min(end),
+            info.obj_id,
+            info.share_mode,
+            ext.external_pager != 0,
+        ));
+        at = start + size;
     }
     out
 }
 
-/// Read fwe's stage-1 tables from guest memory: identity blocks of 32 MiB
-/// under a 16 KiB granule and a 40-bit space, the only regime the backend
-/// sets up. Returns the EL0-accessible blocks merged into runs.
-fn read_stage1(v: &Vm, ttbr0: u64, tcr: u64) -> Result<Vec<(u64, u64, u32)>, String> {
-    if tcr & 0x3f != 24 || (tcr >> 14) & 3 != 0b10 {
-        return Err(format!("TCR_EL1 {tcr:#x} is not the 40-bit, 16 KiB-granule regime"));
-    }
-    let word = |ipa: u64| -> Result<u64, String> {
-        let (_, m) = v
-            .maps
-            .range(..=ipa)
-            .next_back()
-            .filter(|(_, m)| m.end > ipa + 7)
-            .ok_or_else(|| format!("page table at {ipa:#x} is not in guest memory"))?;
-        let s = v.maps.range(..=ipa).next_back().map(|(&s, _)| s).unwrap();
-        // SAFETY: reading mapped host memory behind guest-physical `ipa`.
-        Ok(unsafe { ((m.host + (ipa - s)) as *const u64).read_unaligned() })
-    };
-    const BLOCK: u64 = 32 << 20;
-    let mut runs: Vec<(u64, u64, u32)> = Vec::new();
-    let base = ttbr0 & 0x0000_ffff_ffff_c000;
-    for i in 0..16u64 {
-        let l1 = word(base + i * 8)?;
-        if l1 & 3 != 3 {
-            continue;
-        }
-        let l2 = l1 & 0x0000_ffff_ffff_c000;
-        for j in 0..(PAGE / 8) {
-            let va = i * (64 << 30) + j * BLOCK;
-            let d = word(l2 + j * 8)?;
-            if d & 3 != 1 {
-                continue;
-            }
-            if d & 0x0000_ffff_fe00_0000 != va {
-                return Err(format!(
-                    "stage 1 maps {va:#x} to {:#x}, not to itself",
-                    d & 0x0000_ffff_fe00_0000
+/// The host memory behind stage 2 must not have been replaced since it was
+/// mapped: the framework keeps the pages it found then. Checked now and
+/// then and when stage 2 changes.
+fn check_objects(v: &mut Vm) {
+    let mut updated = Vec::with_capacity(v.objects.len());
+    for &(lo, hi, obj) in &v.objects {
+        for (a, b, now, _, _) in host_regions(lo, hi - lo) {
+            // An object appears when anonymous memory is first touched.
+            if obj != 0 && now != 0 && now != obj {
+                violation(&format!(
+                    "the host memory at {a:#x}..{b:#x} behind stage 2 was replaced while the VM \
+                     maps it (the framework keeps the pages it mapped)"
                 ));
             }
-            if d & (1 << 10) == 0 {
-                return Err(format!("stage 1 block at {va:#x} has no access flag"));
-            }
-            let ap = (d >> 6) & 3;
-            let uxn = d & (1 << 54) != 0;
-            let perms = match ap {
-                0b01 => UC_PROT_READ | UC_PROT_WRITE,
-                0b11 => UC_PROT_READ,
-                _ => 0, // EL1 only
-            } | if !uxn && ap & 1 == 1 { UC_PROT_EXEC } else { 0 };
-            if perms == 0 {
-                continue;
-            }
-            match runs.last_mut() {
-                Some(last) if last.1 == va && last.2 == perms => last.1 = va + BLOCK,
-                _ => runs.push((va, va + BLOCK, perms)),
-            }
+            updated.push((a, b, if now != 0 { now } else { obj }));
         }
     }
-    Ok(runs)
+    v.objects = updated;
 }
 
 pub fn vcpu_create(
@@ -903,12 +1095,14 @@ pub fn vcpu_create(
             far: 0,
             sys: BTreeMap::new(),
             event: None,
+            el1: None,
         }),
         exit: exit_rec,
         // SAFETY: plain host call.
         owner: unsafe { libc::pthread_self() },
         cancel: AtomicBool::new(false),
         yield_now: AtomicBool::new(false),
+        ttbr0: AtomicU64::new(0),
         hook_stopped: AtomicBool::new(false),
         running: AtomicBool::new(false),
         vtimer_offset: AtomicU64::new(0),
@@ -1002,10 +1196,24 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
                 return HV_ERROR;
             }
         }
+        {
+            let mut g = vm();
+            if let Some(vmr) = g.as_mut() {
+                vmr.runs += 1;
+                if vmr.runs % 4096 == 1 {
+                    check_objects(vmr);
+                }
+            }
+        }
         if take_turn(me, &cancelled).is_none() {
             continue;
         }
         catch_up(v);
+        if let Err(msg) = enter_el1(v) {
+            end_turn();
+            violation(&msg);
+            return HV_ERROR;
+        }
         let mut e = engine(v);
         e.event = None;
         v.hook_stopped.store(false, SeqCst);
@@ -1035,9 +1243,9 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
                 e.far = far;
                 e.spsr = read(v.uc, R_PSTATE);
                 exit.reason = HV_EXIT_REASON_EXCEPTION;
-                // `hvc #0` (ESR_EL2: EC 0x16, IL).
+                // The vector's `hvc #2` (ESR_EL2: EC 0x16, IL, imm 2).
                 exit.exception = hv_vcpu_exit_exception_t {
-                    syndrome: (0x16 << 26) | (1 << 25),
+                    syndrome: (0x16 << 26) | (1 << 25) | 2,
                     virtual_address: 0,
                     physical_address: 0,
                 };
@@ -1066,9 +1274,20 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         drop(e);
         let now = read(v.uc, R_PC);
         if now == UNTIL && !v.cancel.load(SeqCst) {
+            // A jump to 0, where emulation stops by itself: the
+            // instruction abort the walk of page 0 gives.
+            let level = match walk(v.ttbr0.load(SeqCst), 0) {
+                Walked::Fault { level } => level,
+                Walked::Page { .. } => 3,
+            };
+            let mut e = engine(v);
+            e.esr = (0x20 << 26) | (1 << 25) | (0x04 | level);
+            e.elr = 0;
+            e.far = 0;
+            e.spsr = read(v.uc, R_PSTATE);
             exit.reason = HV_EXIT_REASON_EXCEPTION;
             exit.exception = hv_vcpu_exit_exception_t {
-                syndrome: (0x20 << 26) | (1 << 25) | 0x07,
+                syndrome: (0x16 << 26) | (1 << 25) | 2,
                 virtual_address: 0,
                 physical_address: 0,
             };
@@ -1076,7 +1295,7 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         }
         // `wfi`/`wfe` halt the emulated CPU past the instruction; the
         // framework exits at it.
-        if let Some(insn) = fetch(v.uc, now.wrapping_sub(4)) {
+        if let Some(insn) = fetch_va(v.ttbr0.load(SeqCst), now.wrapping_sub(4)) {
             let halted = !v.hook_stopped.load(SeqCst) && !v.cancel.load(SeqCst);
             if (insn == 0xd503_207f || insn == 0xd503_205f) && halted && now != pc {
                 write(v.uc, R_PC, now - 4);
@@ -1092,6 +1311,40 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         // Stopped for a cancel (seen at the loop's top) or to hand the
         // turn on: go round.
     }
+}
+
+/// fwe's TLB stub, `tlbi vmalle1is; dsb ish; isb; eret`.
+const TLB_STUB: [u32; 4] = [0xd508_831f, 0xd503_3b9f, 0xd503_3fdf, 0xd69f_03e0];
+
+/// The vCPU was set to resume at EL1: only fwe's TLB stub may run there.
+/// Carry it out — every emulated CPU's cached translations go — and return
+/// to EL0 as its `eret` does. With the turn held.
+fn enter_el1(v: &Vcpu) -> Result<(), String> {
+    let (pc, vbar, ttbr0, elr, spsr) = {
+        let mut e = engine(v);
+        let Some(_) = e.el1.take() else { return Ok(()) };
+        let vbar = e.sys.get(&HV_SYS_REG_VBAR_EL1).copied().unwrap_or(0);
+        (read(v.uc, R_PC), vbar, v.ttbr0.load(SeqCst), e.elr, e.spsr)
+    };
+    if pc != vbar + 0x800 {
+        return Err(format!("vCPU run at EL1 at {pc:#x}, not fwe's TLB stub"));
+    }
+    for (i, &w) in TLB_STUB.iter().enumerate() {
+        if fetch_va(ttbr0, pc + 4 * i as u64) != Some(w) {
+            return Err(format!(
+                "fwe's TLB stub at {pc:#x} is not `tlbi vmalle1is; dsb ish; isb; eret`"
+            ));
+        }
+    }
+    if spsr & 0xf != 0 {
+        return Err(format!("the TLB stub would return to SPSR {spsr:#x}, not EL0"));
+    }
+    log().ops.push(Op::FlushAll);
+    catch_up(v);
+    let _e = engine(v);
+    write(v.uc, R_PC, elr);
+    write(v.uc, R_PSTATE, spsr);
+    Ok(())
 }
 
 /// Apply stage 2 to this vCPU's CPU, reading stage 1 first if it is the
@@ -1118,20 +1371,51 @@ fn sync(v: &Vcpu) -> Result<(), String> {
         if get(HV_SYS_REG_CPACR_EL1) >> 20 & 3 != 3 {
             return Err("vCPU run with FP/SIMD trapped".into());
         }
-        if vmr.stage1.is_none() {
-            vmr.stage1 =
-                Some(read_stage1(vmr, get(HV_SYS_REG_TTBR0_EL1), get(HV_SYS_REG_TCR_EL1))?);
+        let tcr = get(HV_SYS_REG_TCR_EL1);
+        if tcr & 0x3f != 24 || (tcr >> 14) & 3 != 0 {
+            return Err(format!("TCR_EL1 {tcr:#x} is not the 40-bit, 4 KiB-granule regime"));
+        }
+        // The vector: `hvc #2; b .` at each entry (not `hvc #0`, which the
+        // framework may take for a firmware call).
+        let vbar = get(HV_SYS_REG_VBAR_EL1);
+        let ttbr0 = get(HV_SYS_REG_TTBR0_EL1);
+        for i in 0..16u64 {
+            let at = vbar + i * 0x80;
+            if (fetch_va(ttbr0, at), fetch_va(ttbr0, at + 4))
+                != (Some(0xd400_0042), Some(0x1400_0000))
+            {
+                return Err(format!("vector entry {i} at {at:#x} is not `hvc #2; b .`"));
+            }
+        }
+    }
+    if vmr.first_run.is_none() {
+        // The stage 2 the VM runs with: fixed from now on, and none of it
+        // shared with another process.
+        vmr.first_run = Some(vmr.maps.iter().map(|(&s, m)| (s, m.end)).collect());
+        let ranges: Vec<(u64, u64)> = vmr.maps.iter().map(|(&s, m)| (m.host, m.end - s)).collect();
+        for (host, len) in ranges {
+            for (a, b, _, share, file) in host_regions(host, len) {
+                // SM_SHARED, SM_TRUESHARED, SM_SHARED_ALIASED, of memory
+                // that is not a file's: anonymous memory in two processes'
+                // VMs at once (a file's pages are what `MAP_SHARED` shares).
+                if matches!(share, 4 | 5 | 7) && !file {
+                    violation(&format!(
+                        "anonymous host memory {a:#x}..{b:#x} behind the VM's stage 2 is \
+                         shared with another process"
+                    ));
+                }
+            }
         }
     }
     let pieces: Vec<(u64, u64, u64, u32)> =
-        vmr.maps.iter().flat_map(|(&s, m)| el0_pieces(vmr, s, m.end, m.host, m.flags)).collect();
+        vmr.maps.iter().map(|(&s, m)| (s, m.end, m.host, uc_perms(m.flags))).collect();
     take_turn(MAPPER, &|| false);
     // Everything logged so far is in `maps` (the VM lock, held, keeps new
     // changes out meanwhile).
     let l = log();
-    let mut e = engine(v);
-    e.applied = l.base + l.ops.len();
+    engine(v).applied = l.base + l.ops.len();
     drop(l);
+    // As in `catch_up`, hooks may run inside these calls.
     for (lo, hi, h, perms) in pieces {
         // SAFETY: as in vm_map.
         let rc =
@@ -1145,18 +1429,17 @@ fn sync(v: &Vcpu) -> Result<(), String> {
             ));
         }
     }
-    e.synced = true;
-    drop(e);
+    engine(v).synced = true;
     end_turn();
     Ok(())
 }
 
-/// The instruction at guest address `pc`, if the CPU has it mapped.
-fn fetch(uc: Uc, pc: u64) -> Option<u32> {
-    let mut insn = 0u32;
-    // SAFETY: reading 4 bytes of the engine's memory into a u32.
-    let rc = unsafe { (api().mem_read)(uc, pc, (&mut insn as *mut u32).cast(), 4) };
-    (rc == 0).then_some(insn)
+/// The instruction at guest address `pc` of the vCPU whose hook data is
+/// `d`, if mapped.
+fn fetch(d: *mut c_void, pc: u64) -> Option<u32> {
+    // SAFETY: the hook's data is its vCPU, never freed.
+    let v = unsafe { &*d.cast::<Vcpu>() };
+    fetch_va(v.ttbr0.load(SeqCst), pc)
 }
 
 // --- Hooks ----------------------------------------------------------------------
@@ -1172,28 +1455,55 @@ extern "C" fn on_block(uc: Uc, _addr: u64, _size: u32, d: *mut c_void) {
     }
 }
 
-/// Stage 1 is the identity over the 40-bit space (checked at the first
-/// run), with the top byte ignored as TCR_EL1.TBI0 makes it; stage 2 is the
-/// emulated memory map, whose permissions Unicorn enforces. An address
-/// beyond the space is a level-0 translation fault at EL1.
+/// Stage 1 is fwe's page tables, walked as the hardware walks them; stage 2
+/// is the emulated memory map, whose permissions Unicorn enforces. A walk
+/// that finds no page, or a page that does not allow the access, is the
+/// fault EL1 would take: a translation fault at the level the walk
+/// stopped, or a permission fault, with the faulting address.
 extern "C" fn on_tlb_fill(uc: Uc, va: u64, t: c_int, out: *mut TlbEntry, d: *mut c_void) -> bool {
-    let addr = va & 0x00ff_ffff_ffff_ffff;
-    if addr >= 1 << 40 {
-        const UC_MEM_FETCH: c_int = 18;
+    const UC_MEM_WRITE: c_int = 17;
+    const UC_MEM_FETCH: c_int = 18;
+    // SAFETY: the hook's data is its vCPU, never freed.
+    let v = unsafe { &*d.cast::<Vcpu>() };
+    let fetching = t == UC_MEM_FETCH;
+    // The top byte is ignored for data (TCR_EL1.TBI0), not for fetches.
+    let addr = if fetching { va } else { va & 0x00ff_ffff_ffff_ffff };
+    let want = match t {
+        UC_MEM_WRITE => UC_PROT_WRITE,
+        UC_MEM_FETCH => UC_PROT_EXEC,
+        _ => UC_PROT_READ,
+    };
+    let fault = |fsc: u64| {
+        // The instruction that faulted is at pc: for a fetch, the block
+        // QEMU was translating (none of it ran). The hook is given a fetch's
+        // address rounded down to QEMU's 1 KiB page; the instruction's own
+        // address is the fault address when it lies on the faulting page.
         let pc = read(uc, R_PC);
-        let ec = if t == UC_MEM_FETCH { 0x20 } else { 0x24 };
-        let wnr = if t == 17 { 1 << 6 } else { 0 };
-        record(d, Event::El1 { esr: (ec << 26) | (1 << 25) | wnr | 0x04, elr: pc, far: va });
-        return false;
+        let far = if fetching && pc & !0xfff == va & !0xfff { pc } else { va };
+        let ec = if fetching { 0x20 } else { 0x24 };
+        let wnr = if t == UC_MEM_WRITE { 1 << 6 } else { 0 };
+        record(d, Event::El1 { esr: (ec << 26) | (1 << 25) | wnr | fsc, elr: pc, far });
+        false
+    };
+    match walk(v.ttbr0.load(SeqCst), addr) {
+        Walked::Fault { level } => fault(0x04 | level),
+        Walked::Page { perms, .. } if perms & want == 0 => fault(0x0c | 3),
+        Walked::Page { ipa, perms } => {
+            // SAFETY: Unicorn passes an entry to fill.
+            unsafe { *out = TlbEntry { paddr: ipa, perms } };
+            true
+        }
     }
-    // SAFETY: Unicorn passes an entry to fill.
-    unsafe { *out = TlbEntry { paddr: addr, perms: UC_PROT_ALL } };
-    true
 }
 
 fn record(d: *mut c_void, ev: Event) {
     // SAFETY: the hook's data is its vCPU, on whose thread hooks run.
     let v = unsafe { &*d.cast::<Vcpu>() };
+    // Unicorn also runs hooks from its own calls outside emulation (memory
+    // changes): no guest access happened then.
+    if !v.running.load(SeqCst) {
+        return;
+    }
     // The run loop released the guard before emulating. The first event
     // of a run is the one that happened (a failed translation is followed
     // by QEMU's exception for it).
@@ -1227,11 +1537,11 @@ extern "C" fn on_exception(uc: Uc, intno: u32, d: *mut c_void) {
     let ev = match intno {
         // pc is past the `svc`.
         EXCP_SWI => {
-            let imm = fetch(uc, pc - 4).map_or(0, |i| u64::from((i >> 5) & 0xffff));
+            let imm = fetch(d, pc - 4).map_or(0, |i| u64::from((i >> 5) & 0xffff));
             Event::El1 { esr: (0x15 << 26) | il | imm, elr: pc, far: 0 }
         }
         EXCP_BKPT => {
-            let imm = fetch(uc, pc).map_or(0, |i| u64::from((i >> 5) & 0xffff));
+            let imm = fetch(d, pc).map_or(0, |i| u64::from((i >> 5) & 0xffff));
             Event::El1 { esr: (0x3c << 26) | il | imm, elr: pc, far: 0 }
         }
         EXCP_UDEF => Event::El1 { esr: il, elr: pc, far: 0 },
@@ -1241,8 +1551,8 @@ extern "C" fn on_exception(uc: Uc, intno: u32, d: *mut c_void) {
         EXCP_DATA_ABORT => {
             // Alignment (stage 1 never faults otherwise, and stage 2 faults
             // come through the memory hooks): DFSC 0x21.
-            let far = fetch(uc, pc).map_or(0, |i| exclusive_or_atomic_base(uc, i));
-            let wnr = fetch(uc, pc).map_or(0, |i| u64::from(i & (1 << 22) == 0) << 6);
+            let far = fetch(d, pc).map_or(0, |i| exclusive_or_atomic_base(uc, i));
+            let wnr = fetch(d, pc).map_or(0, |i| u64::from(i & (1 << 22) == 0) << 6);
             Event::El1 { esr: (0x24 << 26) | il | wnr | 0x21, elr: pc, far }
         }
         other => {
@@ -1317,7 +1627,7 @@ extern "C" fn on_system(uc: Uc, reg: c_int, cp: *const CpReg, d: *mut c_void) ->
     // SAFETY: Unicorn passes the instruction's encoding fields.
     let cp = unsafe { &*cp };
     let pc = read(uc, R_PC);
-    let insn = fetch(uc, pc).unwrap_or(0);
+    let insn = fetch(d, pc).unwrap_or(0);
     let read_dir = insn & (1 << 21) != 0;
     let rt = insn & 31;
     let key = (cp.op0, cp.op1, cp.crn, cp.crm, cp.op2);
@@ -1403,13 +1713,16 @@ fn sysreg_iss(cp: &CpReg, rt: u32, read: bool) -> u64 {
 
 pub fn vcpu_get_reg(id: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t {
     let Some(v) = own(id, "hv_vcpu_get_reg") else { return HV_BAD_ARGUMENT };
-    let _e = engine(v);
+    let e = engine(v);
     let r = match reg {
         0..=30 => read(v.uc, xreg(reg)),
         HV_REG_PC => read(v.uc, R_PC),
         HV_REG_FPCR => read(v.uc, R_FPCR),
         HV_REG_FPSR => read(v.uc, R_FPSR),
-        HV_REG_CPSR => read(v.uc, R_PSTATE),
+        HV_REG_CPSR => match e.el1 {
+            Some(ps) => ps,
+            None => read(v.uc, R_PSTATE),
+        },
         _ => return HV_BAD_ARGUMENT,
     };
     // SAFETY: the caller's out-parameter.
@@ -1419,7 +1732,7 @@ pub fn vcpu_get_reg(id: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_
 
 pub fn vcpu_set_reg(id: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t {
     let Some(v) = own(id, "hv_vcpu_set_reg") else { return HV_BAD_ARGUMENT };
-    let _e = engine(v);
+    let mut e = engine(v);
     match reg {
         0..=30 => write(v.uc, xreg(reg), value),
         HV_REG_PC => write(v.uc, R_PC, value),
@@ -1427,11 +1740,12 @@ pub fn vcpu_set_reg(id: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t {
         HV_REG_FPSR => write(v.uc, R_FPSR, value),
         HV_REG_CPSR => {
             if value & 0xf != 0 {
-                violation(&format!(
-                    "CPSR {value:#x} leaves EL0, which only the vector may run above"
-                ));
-                return HV_BAD_ARGUMENT;
+                // fwe's EL1 code: carried out when the vCPU runs (see
+                // `vcpu_run`), the emulated CPU staying at EL0.
+                e.el1 = Some(value);
+                return HV_SUCCESS;
             }
+            e.el1 = None;
             write(v.uc, R_PSTATE, value);
         }
         _ => return HV_BAD_ARGUMENT,
@@ -1467,6 +1781,9 @@ pub fn vcpu_set_sys_reg(id: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) -> hv_retu
         HV_SYS_REG_SPSR_EL1 => e.spsr = value,
         HV_SYS_REG_FAR_EL1 => e.far = value,
         r => {
+            if r == HV_SYS_REG_TTBR0_EL1 {
+                v.ttbr0.store(value, SeqCst);
+            }
             e.sys.insert(r, value);
         }
     }
@@ -1506,6 +1823,15 @@ pub fn vcpu_set_vtimer_offset(id: hv_vcpu_t, offset: u64) -> hv_return_t {
     let Some(v) = own(id, "hv_vcpu_set_vtimer_offset") else { return HV_BAD_ARGUMENT };
     v.vtimer_offset.store(offset, SeqCst);
     HV_SUCCESS
+}
+
+/// fwe wrote guest code through the host (where the hardware needs the
+/// instruction cache invalidated): emulated CPUs drop their translated code
+/// before they next run.
+pub fn code_written() {
+    if VM_LIVE.load(SeqCst) {
+        apply(vec![Op::Flush]);
+    }
 }
 
 // --- The watcher ----------------------------------------------------------------

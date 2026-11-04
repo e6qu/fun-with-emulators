@@ -63,6 +63,7 @@ mod framework {
             config: hv_vm_config_t,
             ipa_bit_length: u32,
         ) -> hv_return_t;
+        pub fn hv_vm_config_get_max_ipa_size(ipa_bit_length: *mut u32) -> hv_return_t;
         pub fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t;
         pub fn hv_vm_destroy() -> hv_return_t;
         pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t;
@@ -148,6 +149,8 @@ macro_rules! calls {
 calls! {
     fn hv_vm_config_set_ipa_size(config: hv_vm_config_t, bits: u32) -> hv_return_t
         => vm_config_set_ipa_size, quiet;
+    fn hv_vm_config_get_max_ipa_size(bits: *mut u32) -> hv_return_t
+        => vm_config_get_max_ipa_size, quiet;
     fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t => vm_create, rec;
     fn hv_vm_destroy() -> hv_return_t => vm_destroy, rec;
     fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t => vm_map, rec;

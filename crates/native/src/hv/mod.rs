@@ -32,6 +32,11 @@ mod backend;
 mod ffi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod fork;
+// Pure table logic: unit-tested on every host.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod mem;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+mod pagetables;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod probe;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
