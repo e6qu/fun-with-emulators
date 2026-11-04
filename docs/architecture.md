@@ -146,7 +146,8 @@ words finds every instruction exactly.
   `umov`), all the
   load/store forms (unsigned and unscaled immediate, register offset, pre-
   and post-index, pair, the sign-extending loads, with general-purpose and
-  SIMD transfer registers), the exclusive, acquire/release, compare-and-swap
+  SIMD transfer registers, and the SIMD structure loads and stores, `ld1`
+  to `ld4r` and `st1` to `st4`, through an `x18` base), the exclusive, acquire/release, compare-and-swap
   and LSE atomic memory instructions, the PC-relative forms (`adr`, `adrp`,
   `ldr` literal, where the stub materialises the value computed from the
   original pc), the compare- and test-branches (`cbz`/`cbnz`/`tbz`/`tbnz`,
