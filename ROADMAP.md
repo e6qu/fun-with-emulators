@@ -13,7 +13,8 @@ describes how the pieces work and lists the current limitations in detail.
 system-call surface is implemented, and the hypervisor backend runs
 low-address executables with threads, `fork` and `execve`; what remains is
 Debian's Python, the `x18` and code-discovery gaps, and running the rest of
-the listed software end to end (git, SQLite, lighttpd, Node and Cargo run).
+the listed software end to end (git, SQLite, lighttpd, Node, Cargo and apt
+run; GCC, clang and Go need the hypervisor backend).
 
 ## M0 — Foundation (done)
 
@@ -124,9 +125,11 @@ Remaining:
   JIT, ICU, OpenSSL's digests, zlib, files, a child process, HTTP and a
   worker thread) and the Rust toolchain (Debian's rustc and Cargo, fetched:
   a two-crate project built in release mode and its unit tests run, linked
-  by GNU ld). Left: a C compiler (Debian's GCC and clang are non-PIE
-  executables linked below 4 GiB, so they need the hypervisor backend, as
-  Python does), Go (Debian's `go` tool is one too), `apt`
+  by GNU ld) and `apt` (Debian's apt and dpkg, fetched: a package
+  installed from a local repository, run, and removed). Left: a C compiler
+  (Debian's GCC and clang are non-PIE executables linked below 4 GiB, so
+  they need the hypervisor backend, as Python does) and Go (Debian's `go`
+  tool is one too)
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.
