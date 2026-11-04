@@ -115,7 +115,7 @@ mod tests {
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use crate::guest;
-    use crate::host::{last_error, ret};
+    use crate::host::tty_error;
     use fwe_abi::term::*;
     use fwe_abi::{err, errno, ioctl};
 
@@ -243,7 +243,7 @@ mod imp {
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: plain host call.
         if unsafe { libc::tcgetattr(fd, &mut t) } < 0 {
-            return last_error();
+            return tty_error();
         }
         let iflag = h2l(t.c_iflag, IFLAG);
         let oflag = h2l(t.c_oflag, OFLAG);
@@ -285,6 +285,9 @@ mod imp {
         t.c_ispeed = 38400;
         t.c_ospeed = 38400;
         // SAFETY: `t` is a fully initialized termios.
-        ret(unsafe { libc::tcsetattr(fd, act, &t) } as i64)
+        if unsafe { libc::tcsetattr(fd, act, &t) } < 0 {
+            return tty_error();
+        }
+        0
     }
 }

@@ -219,7 +219,7 @@ it there without the bits that allow skipping cache maintenance
    register file), and dispatches on the number in `x8`.
 3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `ppoll`,
    `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the blocking
-   socket calls, and `read`/`write` with their vectored and positioned forms
+   socket calls, `flock` and `fcntl`'s `F_SETLKW`, and `read`/`write` with their vectored and positioned forms
    (a pipe or socket blocks until another thread acts) — run **without** the
    kernel lock, so a waiting thread never stalls the threads meant to wake
    it; `clone`, `execve` and `exit` are handled by the backend for the same
@@ -265,9 +265,14 @@ descriptor that is not open; `dup2` onto one fails the same way, and the
 limit cannot be raised into the range. `stat` results are translated into the arm64 Linux
 layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
 directory position when the translated entries outgrow the guest's buffer.
-Creation modes have the umask applied by the kernel. `fcntl` translates the
-descriptor and status flags; `ioctl` covers the terminal, pty and `FIO*`
-requests.
+Creation modes have the umask applied by the kernel. An `O_CREAT` open
+that macOS fails with `ENOENT` because another process is unlinking the
+name at that moment is retried, as Linux would have created the file. `fcntl` translates the
+descriptor and status flags, and record locks (`F_GETLK`, `F_SETLK`,
+`F_SETLKW`: the arm64 `struct flock` and its lock types differ from the
+host's); `flock` passes through. Both kinds of lock are the host's, so they
+hold between guest processes and against host ones. `ioctl` covers the
+terminal, pty and `FIO*` requests.
 
 ## Synthetic /proc and /sys
 
@@ -275,7 +280,9 @@ The rootfs has no real `/proc` or `/sys`, so the filesystem layer consults
 `crates/kernel/src/procfs.rs` before the host rootfs and generates what
 programs read at startup: `/proc/self/exe` (a symlink),
 `/proc/self/cmdline`, `/proc/self/fd`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
-`/proc/uptime`, `/proc/loadavg`, `/proc/sys/kernel/{ostype,osrelease,
+`/proc/uptime` and `/proc/loadavg` (the host's uptime and load, which
+`sysinfo` reports too, with the same fixed memory figures as
+`/proc/meminfo`), `/proc/sys/kernel/{ostype,osrelease,
 version,hostname,pid_max}`, `/proc/sys/vm/{overcommit_memory,mmap_min_addr}`
 and `/sys/devices/system/cpu/{online,possible}`. File content is served from
 an anonymous, seekable fd. The per-process values (exe, cmdline, cpu count,
@@ -429,7 +436,13 @@ background jobs). Each guest thread runs under a host mask that mirrors its
 guest mask, so the host routes a process-wide signal to a thread that
 accepts it and keeps a blocked one pending, and a signal from anywhere — a
 child exiting (`SIGCHLD`), the terminal, a timer (`setitimer`), another
-process — reaches the guest as it would on Linux. Every fwe handler starts
+process — reaches the guest as it would on Linux. One difference is made
+up for: a process-wide signal that arrives while every thread blocks it
+stays pending for the process on Linux, for whichever thread unblocks it
+first, while macOS parks it on one thread. In the native backend a thread
+entering a system call with such a signal parked on it, one the guest
+catches, takes it off the host and records it against the process, and
+the other threads are woken to take it. Every fwe handler starts
 and ends with all signals blocked, so the backend always knows whether it
 interrupted guest code or its own.
 
@@ -474,9 +487,10 @@ pass through on Linux and are translated to `kqueue` on macOS: the epoll
 descriptor is a kqueue, each watched fd becomes an `EVFILT_READ` filter for
 `EPOLLIN` and an `EVFILT_WRITE` filter for `EPOLLOUT`, `EPOLLET` maps to
 `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`, and the caller's data word
-rides in the kevent `udata`. `epoll_pwait` writes the packed 12-byte arm64
-`epoll_event` array in place. The `EEXIST`/`ENOENT` edge cases of redundant
-`ADD`/`MOD` are not emulated precisely on macOS.
+rides in the kevent `udata`. `epoll_pwait` writes the arm64 `epoll_event`
+array in place: 16 bytes each, `data` at offset 8 (only x86-64 packs it).
+The `EEXIST`/`ENOENT` edge cases of redundant `ADD`/`MOD` are not emulated
+precisely on macOS.
 
 `eventfd` and `timerfd` (`crates/kernel/src/specialfd.rs`) have no macOS
 equivalent and are emulated in a process-global registry keyed by descriptor,
@@ -593,6 +607,11 @@ those items.
   file by path (not one renamed or deleted since it was opened); `clone3`
   has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
   `rusage`.
+- **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
+  fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
+  to process locks.
+- **Sockets:** an `AF_UNIX` path that, rooted under the rootfs, is longer
+  than the host's 103 bytes fails with `ENAMETOOLONG`.
 - **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
   that opens more descriptors than its limit gets numbers in fwe's range,
   which it cannot use, rather than `EMFILE`; a reopened
@@ -620,7 +639,11 @@ those items.
   signal within 20 ms; a call rerun after an interruption the guest does
   not see starts its timeout over; a fault signal sent by another process
   is treated as a fault; a process killed by a real-time signal exits with
-  status 128 + the signal, since the host cannot report one it lacks.
+  status 128 + the signal, since the host cannot report one it lacks; a
+  process-wide signal left at its default action and sent while every
+  thread blocked it stays with the thread macOS parked it on, rather than
+  acting when another thread unblocks it (one the guest catches is
+  handed on), and in the VM a caught one is not handed on either.
 - **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases; `timerfd`
   resolution and clock distinctions.
 - **Not implemented:** `rseq`, `membarrier` (optional for libc), and any

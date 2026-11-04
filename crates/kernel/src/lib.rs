@@ -99,11 +99,18 @@ pub trait Platform {
         Ok(())
     }
 
-    /// The guest unmapped `[addr, addr + len)`.
+    /// The guest unmapped `[addr, addr + len)`, or is about to replace it.
+    /// The kernel calls this *before* it unmaps or replaces the host memory
+    /// behind the range, so a VM never maps memory the host is freeing.
     fn unmap_guest(&mut self, _addr: u64, _len: u64) {}
 
     /// The guest changed the protections of `[addr, addr + len)` to `prot`.
     fn protect_guest(&mut self, _addr: u64, _len: u64, _prot: u64) {}
+
+    /// The host memory behind `[addr, addr + len)` is about to be replaced
+    /// by fresh pages (`MADV_DONTNEED`): a VM stops mapping it, keeping the
+    /// mapping's record for [`Platform::remapped_guest`].
+    fn replacing_guest(&mut self, _addr: u64, _len: u64) {}
 
     /// The host memory behind `[addr, addr + len)` was replaced by fresh
     /// pages (`MADV_DONTNEED`); a VM mapping of it must follow.
@@ -606,8 +613,8 @@ pub fn wake_futex(addr: u64, count: u32) {
 
 /// Run a system call that must not hold the kernel lock because it can block:
 /// `futex`, the sleeps, `epoll_pwait`, `ppoll`, `rt_sigsuspend`, the socket
-/// calls that wait,
-/// and `read`/`write` and their vectored and positioned forms (a pipe, socket
+/// calls that wait, `flock` and `fcntl`'s `F_SETLKW` (waiting for another
+/// process's lock), and `read`/`write` and their vectored and positioned forms (a pipe, socket
 /// or terminal blocks until the other side acts, and the other side may be a
 /// guest thread that needs the lock). Returns `None` for any other call,
 /// which the backend runs under the lock through [`Kernel::enter_syscall`].
@@ -688,6 +695,10 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // SAFETY: caller guarantees the signal set pointer.
         n::RT_SIGSUSPEND => unsafe { signal::sigsuspend(a[0], a[1]) },
+        n::FLOCK => syscalls::flock(a[0], a[1]),
+        n::FCNTL if a[1] == fwe_abi::fcntl::F_SETLKW => {
+            syscalls::set_record_lock(a[0] as i32, a[1], a[2])
+        }
 
         // Socket calls that can block run without the kernel lock, so a thread
         // waiting in accept/recv does not stall the threads meant to feed it.

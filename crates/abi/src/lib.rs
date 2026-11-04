@@ -205,7 +205,24 @@ pub mod fcntl {
     pub const F_SETFD: u64 = 2;
     pub const F_GETFL: u64 = 3;
     pub const F_SETFL: u64 = 4;
+    pub const F_GETLK: u64 = 5;
+    pub const F_SETLK: u64 = 6;
+    pub const F_SETLKW: u64 = 7;
+    pub const F_OFD_GETLK: u64 = 36;
+    pub const F_OFD_SETLK: u64 = 37;
+    pub const F_OFD_SETLKW: u64 = 38;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+
+    /// `struct flock` lock types.
+    pub const F_RDLCK: i16 = 0;
+    pub const F_WRLCK: i16 = 1;
+    pub const F_UNLCK: i16 = 2;
+
+    /// `flock` operations.
+    pub const LOCK_SH: u64 = 1;
+    pub const LOCK_EX: u64 = 2;
+    pub const LOCK_NB: u64 = 4;
+    pub const LOCK_UN: u64 = 8;
 
     pub const FD_CLOEXEC: u64 = 1;
 
@@ -675,9 +692,9 @@ pub struct Itimerspec {
     pub it_value: Timespec,
 }
 
-/// `struct epoll_event`. On arm64 it is packed (no padding), 12 bytes, like
-/// x86-64, so the `data` word sits at offset 4.
-#[repr(C, packed)]
+/// `struct epoll_event`. Only x86-64 packs it; on arm64 it is naturally
+/// aligned, 16 bytes, with the `data` word at offset 8.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EpollEvent {
     pub events: u32,
@@ -709,6 +726,17 @@ pub struct Pollfd {
     pub revents: i16,
 }
 
+/// `struct flock` (arm64: 64-bit offsets, padded to 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flock {
+    pub l_type: i16,
+    pub l_whence: i16,
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: i32,
+}
+
 /// `struct winsize`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -729,6 +757,29 @@ pub struct Rlimit {
 
 /// Length of each field of `struct new_utsname`.
 pub const UTSNAME_LEN: usize = 65;
+
+/// `struct sysinfo` (64-bit: the trailing pad array is empty).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sysinfo {
+    pub uptime: i64,
+    /// 1, 5 and 15 minute load averages, scaled by `1 << SI_LOAD_SHIFT`.
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+}
+
+/// `sysinfo` load averages are fixed point with this many fraction bits.
+pub const SI_LOAD_SHIFT: u32 = 16;
 
 /// `struct new_utsname`.
 #[repr(C)]
@@ -868,9 +919,12 @@ mod tests {
         assert_eq!(size_of::<Timespec>(), 16);
         assert_eq!(size_of::<Iovec>(), 16);
         assert_eq!(size_of::<Pollfd>(), 8);
-        assert_eq!(size_of::<EpollEvent>(), 12);
+        assert_eq!(size_of::<EpollEvent>(), 16);
         assert_eq!(size_of::<Itimerspec>(), 32);
         assert_eq!(size_of::<Winsize>(), 8);
+        assert_eq!(size_of::<Flock>(), 32);
+        assert_eq!(size_of::<Sysinfo>(), 112);
+        assert_eq!(core::mem::offset_of!(Sysinfo, totalhigh), 88);
         assert_eq!(size_of::<Rlimit>(), 16);
         assert_eq!(size_of::<Utsname>(), 390);
         assert_eq!(size_of::<Sigaction>(), 32);

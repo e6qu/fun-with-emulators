@@ -30,6 +30,35 @@ fn run_bounded(mut cmd: Command) -> Output {
     run_bounded_with_stdin(cmd, &[])
 }
 
+/// [`run_bounded`] for a command that runs VM processes (the hypervisor
+/// backend). A VM process must never be killed with its VM alive, so the
+/// command runs in a process group of its own; on timeout the group gets
+/// `SIGTERM`, which every VM process catches to tear its VM down first,
+/// and only a group still alive 5 s later gets `SIGKILL`. Afterwards no
+/// process of the group may be left (a fork child outliving its test would
+/// keep a VM running alongside the next one): the test fails if one is.
+fn run_vm_bounded(mut cmd: Command) -> Output {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(Stdio::null()).process_group(0);
+    let out = run_bounded_inner(cmd, &[], GUEST_TIMEOUT, true);
+    // The leader is reaped; anything still in its group outlived it.
+    let pgid = out.1;
+    let lingering = || {
+        // SAFETY: signal 0 only checks whether the group has members.
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    };
+    if lingering() {
+        // SAFETY: asking the leftover processes to end (and tear down).
+        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        let start = Instant::now();
+        while lingering() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("a process of a VM test outlived it (process group {pgid})");
+    }
+    out.0
+}
+
 /// Like [`run_bounded`], but feeds `input` to the guest's standard input
 /// (written on its own thread so a guest that does not read it cannot wedge
 /// the test).
@@ -39,7 +68,14 @@ fn run_bounded_with_stdin(cmd: Command, input: &[u8]) -> Output {
 
 /// Like [`run_bounded_with_stdin`], with a time limit of `limit` (for a real
 /// program's workload that starts many processes).
-fn run_bounded_for(mut cmd: Command, input: &[u8], limit: Duration) -> Output {
+fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
+    run_bounded_inner(cmd, input, limit, false).0
+}
+
+/// The guest's output and its pid, killing it after `limit`. With `vm`, the
+/// command leads its own process group, and a timeout ends the group gently
+/// (see [`run_vm_bounded`]).
+fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     let feed = !input.is_empty();
     if feed {
@@ -74,8 +110,26 @@ fn run_bounded_for(mut cmd: Command, input: &[u8], limit: Duration) -> Output {
             break status;
         }
         if start.elapsed() > limit {
-            let _ = child.kill();
             timed_out = true;
+            if vm {
+                let pgid = child.id() as i32;
+                // SAFETY: SIGTERM to the guest's own process group; VM
+                // processes catch it and tear their VM down.
+                unsafe { libc::killpg(pgid, libc::SIGTERM) };
+                let grace = Instant::now();
+                while grace.elapsed() < Duration::from_secs(5) {
+                    if child.try_wait().unwrap().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if child.try_wait().unwrap().is_none() {
+                    eprintln!("--- VM guest ignored SIGTERM for 5 s; killing it");
+                    let _ = child.kill();
+                }
+            } else {
+                let _ = child.kill();
+            }
             break child.wait().unwrap();
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -86,7 +140,7 @@ fn run_bounded_for(mut cmd: Command, input: &[u8], limit: Duration) -> Output {
     // Readers finish once the pipes close (at process exit).
     let stdout = out_reader.join().unwrap();
     let stderr = err_reader.join().unwrap();
-    Output { status, stdout, stderr }
+    (Output { status, stdout, stderr }, child.id() as i32)
 }
 
 const ASM_GUESTS: &[&str] = &[
@@ -225,7 +279,7 @@ fn rust_guest(name: &str) -> PathBuf {
 fn fwe(program: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     // Shown when a test fails.
     eprintln!("--- {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     out
@@ -394,6 +448,7 @@ fn libc_rootfs(libc: Libc, tag: &str) -> PathBuf {
             )
             .unwrap();
             std::fs::copy(lib.join("libc.so.6"), root.join("lib/libc.so.6")).unwrap();
+            std::fs::copy(lib.join("libm.so.6"), root.join("lib/libm.so.6")).unwrap();
         }
     }
     root
@@ -866,6 +921,236 @@ three
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A root filesystem of its own for one Debian program's test (`tag`): the
+/// shared libraries, bash as `/bin/sh` and `/bin/bash`, and the `dirs` the
+/// test needs. Removed when dropped.
+struct ProgramRoot(PathBuf);
+
+impl ProgramRoot {
+    fn new(tag: &str, dirs: &[&str]) -> Self {
+        let root = std::env::temp_dir().join(format!("fwe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["lib", "bin", "tmp"].iter().chain(dirs) {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for entry in std::fs::read_dir(debian_root().join("lib")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), root.join("lib").join(entry.file_name())).unwrap();
+        }
+        std::fs::copy(debian_bin("bash"), root.join("bin/bash")).unwrap();
+        std::os::unix::fs::symlink("bash", root.join("bin/sh")).unwrap();
+        ProgramRoot(root)
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.0.join(rel)
+    }
+
+    /// `fwe` running `program` (a path inside the root) with a clean
+    /// environment.
+    fn command(&self, program: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root")
+            .arg(&self.0)
+            .arg(self.path(program.trim_start_matches('/')))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/tmp")
+            .stdin(Stdio::null());
+        cmd
+    }
+}
+
+impl Drop for ProgramRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Debian's SQLite, the first of M2's databases: a write-ahead-logged
+/// database (its index shared between processes through a `MAP_SHARED`
+/// mapping) with three processes inserting at once under `fcntl` locks,
+/// then full-text search, a recursive query, JSON, an integrity check and
+/// the schema.
+#[test]
+fn debian_sqlite_runs_a_database() {
+    let root = ProgramRoot::new("sqlite", &[]);
+    std::fs::copy(debian_bin("sqlite3"), root.path("bin/sqlite3")).unwrap();
+    std::fs::copy(debian_bin("seq"), root.path("bin/seq")).unwrap();
+    let script = r#"
+        set -e
+        cd /tmp
+        sqlite3 db <<'SQL'
+pragma journal_mode=wal;
+create table kv(k integer primary key, v text not null unique);
+create virtual table docs using fts5(body);
+insert into docs values ('the quick brown fox'), ('lazy dogs sleep'), ('quick thinking');
+SQL
+        for w in 1 2 3; do
+            (for i in $(seq 1 8); do
+                sqlite3 -cmd '.timeout 10000' db "insert into kv(v) values ('w$w-$i')"
+            done) &
+        done
+        wait
+        sqlite3 db "select count(*), count(distinct substr(v, 1, 2)) from kv"
+        sqlite3 db "select rowid from docs where docs match 'quick' order by rowid"
+        sqlite3 db "with recursive c(x) as (select 1 union all select x + 1 from c where x < 10)
+                    select group_concat(x * x) from c"
+        sqlite3 db "select json_object('a', 1, 'b', json_array(2, 3))"
+        sqlite3 db "pragma integrity_check"
+        sqlite3 db "select sql from sqlite_schema where name = 'kv'"
+    "#;
+    let mut cmd = root.command("/bin/bash");
+    cmd.args(["-c", script]);
+    // Each sqlite3 is a fresh fwe preparing the 1.5 MB library's code.
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    eprintln!("--- sqlite stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "wal\n\
+         24|3\n\
+         1\n\
+         3\n\
+         1,4,9,16,25,36,49,64,81,100\n\
+         {\"a\":1,\"b\":[2,3]}\n\
+         ok\n\
+         CREATE TABLE kv(k integer primary key, v text not null unique)\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A running guest server, stopped (`SIGTERM`) and reaped when dropped.
+struct Server(std::process::Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // SAFETY: signalling the child this test started.
+        unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
+        let start = Instant::now();
+        while self.0.try_wait().ok().flatten().is_none() {
+            if start.elapsed() > Duration::from_secs(5) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// One HTTP/1.0 request to `127.0.0.1:port`: the status line and the body.
+fn http(port: u16, method: &str, path: &str, body: &str) -> (String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let length =
+        if body.is_empty() { String::new() } else { format!("Content-Length: {}\r\n", body.len()) };
+    write!(s, "{method} {path} HTTP/1.0\r\nHost: localhost\r\n{length}\r\n{body}").unwrap();
+    let mut reply = Vec::new();
+    s.read_to_end(&mut reply).unwrap();
+    let split = reply.windows(4).position(|w| w == b"\r\n\r\n").expect("no end of headers");
+    let head = String::from_utf8_lossy(&reply[..split]).into_owned();
+    let status = head.lines().next().unwrap_or("").to_string();
+    (status, reply[split + 4..].to_vec())
+}
+
+/// Debian's lighttpd, M2's web server: it serves a page, a large file
+/// (through `sendfile`), a directory listing from a loaded module and a
+/// 404, to clients at once from one `epoll` loop; and through `mod_cgi`
+/// runs a bash script per request (fork, exec and pipes) that keeps its
+/// state in an SQLite database.
+#[test]
+fn debian_lighttpd_serves_files_and_cgi() {
+    let root = ProgramRoot::new("lighttpd", &["etc", "usr/lib/lighttpd", "srv/www/sub"]);
+    std::fs::copy(debian_bin("lighttpd"), root.path("bin/lighttpd")).unwrap();
+    std::fs::copy(debian_bin("sqlite3"), root.path("bin/sqlite3")).unwrap();
+    for module in ["mod_cgi.so", "mod_dirlisting.so"] {
+        std::fs::copy(
+            repo().join("guests/debian/lighttpd").join(module),
+            root.path("usr/lib/lighttpd").join(module),
+        )
+        .unwrap();
+    }
+    std::fs::write(root.path("srv/www/index.html"), "hello from lighttpd\n").unwrap();
+    let big: String = (1..=50_000).map(|i| format!("{i}\n")).collect();
+    std::fs::write(root.path("srv/www/big.txt"), &big).unwrap();
+    std::fs::write(root.path("srv/www/sub/a.txt"), "a\n").unwrap();
+    std::fs::write(
+        root.path("srv/www/count.sh"),
+        r#"echo "Content-Type: text/plain"
+echo
+if [ "$REQUEST_METHOD" = POST ]; then
+    read -r -n "$CONTENT_LENGTH" body
+    sqlite3 /tmp/db "insert into hits(who) values ('$body')"
+fi
+echo "$REQUEST_METHOD $QUERY_STRING: $(sqlite3 /tmp/db 'select group_concat(who) from hits')"
+"#,
+    )
+    .unwrap();
+    let mut init = root.command("/bin/sqlite3");
+    init.args(["/tmp/db", "create table hits(who text); insert into hits values ('init')"]);
+    assert_eq!(run_bounded(init).status.code(), Some(0));
+
+    // A port free a moment ago.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    std::fs::write(
+        root.path("etc/lighttpd.conf"),
+        format!(
+            r#"server.document-root = "/srv/www"
+server.bind = "127.0.0.1"
+server.port = {port}
+server.modules = ("mod_dirlisting", "mod_cgi")
+server.upload-dirs = ("/tmp")
+server.errorlog = "/tmp/error.log"
+index-file.names = ("index.html")
+dir-listing.activate = "enable"
+cgi.assign = (".sh" => "/bin/bash")
+mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
+"#
+        ),
+    )
+    .unwrap();
+    let mut cmd = root.command("/bin/lighttpd");
+    cmd.args(["-D", "-f", "/etc/lighttpd.conf", "-m", "/usr/lib/lighttpd"]);
+    let server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let start = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        http(port, "GET", "/", ""),
+        ("HTTP/1.0 200 OK".into(), b"hello from lighttpd\n".to_vec())
+    );
+    let (status, body) = http(port, "GET", "/big.txt", "");
+    assert_eq!(status, "HTTP/1.0 200 OK");
+    assert!(body == big.as_bytes(), "big.txt came back as {} bytes", body.len());
+    let (status, body) = http(port, "GET", "/sub/", "");
+    assert_eq!(status, "HTTP/1.0 200 OK");
+    let listing = String::from_utf8_lossy(&body);
+    assert!(listing.contains("Index of /sub/") && listing.contains("a.txt"), "{listing}");
+    assert_eq!(http(port, "GET", "/missing", "").0, "HTTP/1.0 404 Not Found");
+    // Clients at once.
+    let clients: Vec<_> =
+        (0..8).map(|_| std::thread::spawn(move || http(port, "GET", "/", "").1)).collect();
+    for c in clients {
+        assert_eq!(c.join().unwrap(), b"hello from lighttpd\n");
+    }
+    // CGI, with the database behind it.
+    assert_eq!(
+        http(port, "POST", "/count.sh", "alice"),
+        ("HTTP/1.0 200 OK".into(), b"POST : init,alice\n".to_vec())
+    );
+    assert_eq!(
+        http(port, "GET", "/count.sh?x=1", ""),
+        ("HTTP/1.0 200 OK".into(), b"GET x=1: init,alice\n".to_vec())
+    );
+    drop(server);
+    let log = std::fs::read_to_string(root.path("tmp/error.log")).unwrap();
+    assert!(log.contains("server started") && log.contains("server stopped"), "{log}");
+}
+
 #[test]
 fn debian_bash_propagates_exit_status() {
     assert_eq!(run_debian("bash", &["-c", "exit 7"], &[]).status.code(), Some(7));
@@ -1120,6 +1405,14 @@ fn pause_returns_after_timer_handler() {
 #[test]
 fn process_signal_goes_to_unblocked_thread() {
     assert_eq!(signals("thread-mask"), "handled on the unblocked thread: true\n");
+}
+
+/// A process signal sent while every thread blocks it reaches the thread
+/// that unblocks it first, though macOS parks it on the main thread, which
+/// never does.
+#[test]
+fn signal_blocked_everywhere_goes_to_the_thread_that_unblocks_it() {
+    assert_eq!(signals("parked"), "parked signal handled on the unblocked thread: true\n");
 }
 
 /// `tgkill` aims at one thread and interrupts its blocking call, both for a
@@ -1435,12 +1728,43 @@ fn bad_pointers_fail_with_efault() {
 // copied and signed with the hypervisor entitlement; elsewhere the tests
 // report that they were skipped and pass.
 
+/// The name of a running process that uses the hypervisor itself (a VM
+/// manager), if any.
+fn other_hypervisor_client() -> Option<String> {
+    const CLIENTS: &[&str] = &[
+        "krunkit",
+        "vfkit",
+        "qemu-system-aarch64",
+        "com.apple.Virtualization.VirtualMachine",
+        "limactl",
+        "UTM",
+        "VirtualBoxVM",
+        "prl_vm_app",
+    ];
+    let ps = Command::new("ps").args(["-axco", "comm="]).output().ok()?;
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|name| CLIENTS.contains(name))
+        .map(str::to_string)
+}
+
 /// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
 fn hv_fwe() -> Option<&'static Path> {
     static FWE: OnceLock<Option<PathBuf>> = OnceLock::new();
     FWE.get_or_init(|| {
         // FWE_NO_HV=1 skips the VM tests on a machine that could run them.
         if std::env::var_os("FWE_NO_HV").is_some() {
+            return None;
+        }
+        // Never alongside another hypervisor client: the machine crashed
+        // three times while one (Podman's krunkit, with nested
+        // virtualization) ran beside these tests (docs/hypervisor.md).
+        if let Some(other) = other_hypervisor_client() {
+            eprintln!(
+                "skipped: another hypervisor client is running ({other}); \
+                 stop it (for Podman: `podman machine stop`) to run the VM tests"
+            );
             return None;
         }
         let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
@@ -1459,7 +1783,9 @@ fn hv_fwe() -> Option<&'static Path> {
         // A host that has the hypervisor but refuses the VM (no
         // entitlement honoured) also counts as unavailable.
         let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
-        let spike = Command::new(&signed).arg("--hv-spike").output().ok()?;
+        let mut spike = Command::new(&signed);
+        spike.arg("--hv-spike");
+        let spike = run_vm_bounded(spike);
         (ok && spike.status.success()).then_some(signed)
     })
     .as_deref()
@@ -1511,7 +1837,7 @@ fn fwe_hv(program: &Path, args: &[&str]) -> Option<Output> {
     let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(fwe);
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     Some(out)
 }
@@ -1644,7 +1970,7 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(fwe);
     cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     Some(out)
 }
@@ -1710,7 +2036,7 @@ fn hv_execve_between_backends() {
         .env_clear()
         .env("LD_LIBRARY_PATH", "/lib")
         .env("PATH", "/bin");
-    let out = run_bounded(cmd);
+    let out = run_vm_bounded(cmd);
     eprintln!("--- bash -> vm stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout(&out), "hello from linux\nstatus=0 cwd=/lib\n");
 }

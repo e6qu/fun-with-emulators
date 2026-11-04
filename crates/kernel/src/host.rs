@@ -525,6 +525,124 @@ pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
     f | fcntl::O_LARGEFILE
 }
 
+/// A Linux `struct flock` in host layout, or `EINVAL` for an unknown lock
+/// type or `whence`.
+pub fn flock_to_host(lock: &fwe_abi::Flock) -> Result<libc::flock, i32> {
+    let l_type = match lock.l_type {
+        fcntl::F_RDLCK => libc::F_RDLCK,
+        fcntl::F_WRLCK => libc::F_WRLCK,
+        fcntl::F_UNLCK => libc::F_UNLCK,
+        _ => return Err(le::EINVAL),
+    };
+    if !(0..=2).contains(&lock.l_whence) {
+        return Err(le::EINVAL);
+    }
+    // SAFETY: `flock` is plain data; every field is set below.
+    let mut host: libc::flock = unsafe { std::mem::zeroed() };
+    host.l_type = l_type as _;
+    // SEEK_SET, SEEK_CUR and SEEK_END are 0, 1 and 2 on both.
+    host.l_whence = lock.l_whence as _;
+    host.l_start = lock.l_start;
+    host.l_len = lock.l_len;
+    host.l_pid = lock.l_pid;
+    Ok(host)
+}
+
+/// A host `struct flock` (as `F_GETLK` fills it) in Linux layout.
+// The host lock constants are `short` on macOS and `int` on Linux, so the
+// casts below are redundant on one of them.
+#[allow(clippy::unnecessary_cast)]
+pub fn flock_to_linux(host: &libc::flock) -> fwe_abi::Flock {
+    let l_type = match host.l_type as i32 {
+        t if t == libc::F_RDLCK as i32 => fcntl::F_RDLCK,
+        t if t == libc::F_WRLCK as i32 => fcntl::F_WRLCK,
+        _ => fcntl::F_UNLCK,
+    };
+    fwe_abi::Flock {
+        l_type,
+        l_whence: host.l_whence,
+        l_start: host.l_start,
+        l_len: host.l_len,
+        l_pid: host.l_pid,
+    }
+}
+
+/// `flock` operation bits from Linux to host (the same values on both, but
+/// named here so a stray bit is refused rather than passed on).
+pub fn flock_op_to_host(op: u64) -> Option<libc::c_int> {
+    let lock = match op & !fcntl::LOCK_NB {
+        fcntl::LOCK_SH => libc::LOCK_SH,
+        fcntl::LOCK_EX => libc::LOCK_EX,
+        fcntl::LOCK_UN => libc::LOCK_UN,
+        _ => return None,
+    };
+    Some(if op & fcntl::LOCK_NB != 0 { lock | libc::LOCK_NB } else { lock })
+}
+
+/// The host `openat`, without macOS's spurious `ENOENT` for `O_CREAT`.
+///
+/// On macOS an `O_CREAT` open fails with `ENOENT` when another process is
+/// unlinking the same name at that moment (SQLite's processes do this to
+/// a `-wal` file as each closes). Linux creates the file instead, and fails
+/// an `O_CREAT` open with `ENOENT` only when the directory itself has been
+/// removed, so the open is retried while the directory still exists.
+///
+/// # Safety
+/// `dir` is an open directory descriptor.
+pub unsafe fn openat(
+    dir: libc::c_int,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> libc::c_int {
+    let mut tries = 0;
+    loop {
+        // SAFETY: `name` is NUL-terminated; the caller vouches for `dir`.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, mode) };
+        if fd >= 0 || flags & libc::O_CREAT == 0 || last_errno() != libc::ENOENT || tries == 100 {
+            return fd;
+        }
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor and out parameter.
+        if unsafe { libc::fstat(dir, &mut st) } != 0 || st.st_nlink == 0 {
+            set_errno(libc::ENOENT);
+            return -1;
+        }
+        tries += 1;
+        std::thread::yield_now();
+    }
+}
+
+/// The error of a failed terminal request (`tcgetattr` and the like): Linux
+/// answers `ENOTTY` for anything that is not a terminal, where macOS gives
+/// `ENODEV` for some devices (`/dev/null`) and `EOPNOTSUPP` for others.
+pub fn tty_error() -> i64 {
+    match last_errno() {
+        libc::ENODEV | libc::EOPNOTSUPP => -(le::ENOTTY as i64),
+        _ => last_error(),
+    }
+}
+
+/// Seconds since the host booted (macOS's `CLOCK_MONOTONIC` counts sleep,
+/// as Linux's boot-time clock does).
+pub fn uptime() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid out parameter.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+/// The host's 1, 5 and 15 minute load averages (zero if unavailable).
+pub fn load_averages() -> [f64; 3] {
+    let mut loads = [0f64; 3];
+    // SAFETY: `loads` has room for the three values asked for.
+    if unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) } != 3 {
+        return [0.0; 3];
+    }
+    loads
+}
+
 /// Settable file status flags (`F_SETFL`) from Linux to host.
 pub fn settable_flags_to_host(linux: u64) -> libc::c_int {
     let mut f = 0;

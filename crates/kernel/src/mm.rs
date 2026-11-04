@@ -633,6 +633,11 @@ impl<P: Platform> Kernel<P> {
         };
 
         let host_fd = if anonymous { -1 } else { fd as i32 };
+        if flags & mman::MAP_FIXED != 0 {
+            // A fixed mapping replaces what is there: the VM lets go of it
+            // before the host frees it.
+            self.platform.unmap_guest(addr, self.page_up(len));
+        }
         // SAFETY: guest-requested mapping. MAP_FIXED may replace guest memory,
         // which is the guest's own business, exactly as on Linux.
         let p = unsafe {
@@ -728,12 +733,12 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let host = crate::uaccess::g2h(addr) as *mut libc::c_void;
-        // SAFETY: guest-requested unmapping of guest memory.
+        // The VM lets go of the memory before the host frees it.
+        self.platform.unmap_guest(addr, self.page_up(len));
         let r = self.unmap_host(host as u64, len);
         if r == 0 {
             untrack(host as u64, self.page_up(len));
             remove_range(&mut write_exec(), host as u64, self.page_up(len));
-            self.platform.unmap_guest(addr, self.page_up(len));
         }
         r
     }
@@ -800,11 +805,12 @@ impl<P: Platform> Kernel<P> {
         let host = crate::uaccess::g2h(addr);
         match advice {
             mman::MADV_DONTNEED => {
+                // The VM lets go of the pages before the host replaces them,
+                // then maps the new ones (whatever the outcome, so the
+                // guest keeps the mappings it had).
+                self.platform.replacing_guest(addr, len);
                 let r = dontneed(host, len);
-                if r == 0 {
-                    // The host memory behind the range was replaced.
-                    self.platform.remapped_guest(addr, len);
-                }
+                self.platform.remapped_guest(addr, len);
                 r
             }
             mman::MADV_FREE => {
@@ -837,10 +843,11 @@ impl<P: Platform> Kernel<P> {
         if new_len <= old_len {
             if new_len < old_len {
                 let tail = host + new_len;
+                // The VM lets go of the tail before the host frees it.
+                self.platform.unmap_guest(old + new_len, old_len - new_len);
                 self.unmap_host(tail, old_len - new_len);
                 untrack(tail, old_len - new_len);
                 remove_range(&mut write_exec(), tail, old_len - new_len);
-                self.platform.unmap_guest(old + new_len, old_len - new_len);
             }
             return old as i64;
         }

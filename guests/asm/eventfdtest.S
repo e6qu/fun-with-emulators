@@ -25,7 +25,7 @@ _start:
     mov     w10, #1
     str     w10, [x9]
     mov     x11, #0xABCD
-    str     x11, [x9, #4]
+    str     x11, [x9, #8]           // data at offset 8 (arm64 does not pack)
 
     // epoll_ctl(ep, EPOLL_CTL_ADD(1), efd, &ev)
     mov     x0, x20
@@ -78,7 +78,7 @@ _start:
     and     w10, w10, #1
     cmp     w10, #1
     b.ne    fail
-    ldr     x11, [x9, #4]
+    ldr     x11, [x9, #8]
     mov     x12, #0xABCD
     cmp     x11, x12
     b.ne    fail
@@ -109,7 +109,7 @@ exit:
 ev:
     .skip   16
 obuf:
-    .skip   48
+    .skip   64                      // 4 * sizeof(epoll_event)
 wbuf:
     .skip   8
 rbuf:

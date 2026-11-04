@@ -83,6 +83,7 @@ in the code consistent with what the code now does.
 - Treat implementation problems as things to solve, not as blockers.
 - A process running a Hypervisor.framework VM must never end, exec or fork
   with the VM alive, and the VM tests run one at a time, never in parallel
-  (a forking guest's parent and child each have a VM): abnormal VM teardown
-  took the development machine down twice (see
-  [docs/hypervisor.md](docs/hypervisor.md)).
+  (a forking guest's parent and child each have a VM) and never while
+  another hypervisor client such as Podman's `krunkit` runs (stop it first;
+  the tests skip otherwise): the development machine went down three times
+  while this backend was built (see [docs/hypervisor.md](docs/hypervisor.md)).

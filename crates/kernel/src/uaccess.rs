@@ -328,6 +328,16 @@ pub fn futex_pointer_args(op: u64) -> u8 {
     }
 }
 
+/// [`pointer_args`] for an `fcntl` call with command `cmd`: argument 2 is a
+/// `struct flock` pointer for the record-lock commands, a number otherwise.
+pub fn fcntl_pointer_args(cmd: u64) -> u8 {
+    use fwe_abi::fcntl::*;
+    match cmd {
+        F_GETLK | F_SETLK | F_SETLKW => 0b100,
+        _ => 0,
+    }
+}
+
 /// Evaluate a guest access, returning the system call's `EFAULT` (or other
 /// errno) from the enclosing function on failure.
 #[macro_export]
