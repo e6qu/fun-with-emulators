@@ -68,6 +68,12 @@ fn main() -> ExitCode {
         // A fork child of a VM process (see hv::fork); not for direct use.
         fwe_native::hv::fork_child();
     }
+    // Anywhere else they would come too late: `--hv-spike --hv-standin`
+    // would reach the real framework first.
+    if let Some(late) = late_leading_option(&args) {
+        eprintln!("fwe: {late} must come first\n{USAGE}");
+        return ExitCode::from(2);
+    }
     let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {
@@ -182,4 +188,20 @@ fn main() -> ExitCode {
     eprintln!("fwe: {}: {error}", path.display());
     // The shell's "cannot execute" status.
     ExitCode::from(126)
+}
+
+/// `--hv-standin` or `--hv-record` among fwe's own options after the first
+/// position (the guest's arguments, after its program, are not looked at).
+fn late_leading_option(args: &[OsString]) -> Option<String> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_bytes() {
+            b"--hv-standin" | b"--hv-record" => return Some(a.to_string_lossy().into_owned()),
+            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--probe" => i += 2,
+            b"--" => return None,
+            o if o.starts_with(b"-") => i += 1,
+            _ => return None,
+        }
+    }
+    None
 }

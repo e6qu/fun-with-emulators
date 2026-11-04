@@ -100,6 +100,14 @@ pub fn start(spec: &str) -> Result<(), String> {
     std::thread::Builder::new()
         .name("fwe-hv-record".into())
         .spawn(|| {
+            // No signal for the guest may land here: the backend relies on
+            // the host delivering them only to vCPU threads.
+            // SAFETY: blocking every signal on this thread only.
+            unsafe {
+                let mut all: libc::sigset_t = std::mem::zeroed();
+                libc::sigfillset(&mut all);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+            }
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let mut l = Line::new();

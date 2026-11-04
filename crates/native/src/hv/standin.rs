@@ -336,6 +336,8 @@ struct Vcpu {
     cancel: AtomicBool,
     /// Another wants the turn: stop at the next block.
     yield_now: AtomicBool,
+    /// The block hook ended the last emulation (a yield or a cancel).
+    hook_stopped: AtomicBool,
     /// Inside `uc_emu_start`.
     running: AtomicBool,
     vtimer_offset: AtomicU64,
@@ -895,6 +897,7 @@ pub fn vcpu_create(
         owner: unsafe { libc::pthread_self() },
         cancel: AtomicBool::new(false),
         yield_now: AtomicBool::new(false),
+        hook_stopped: AtomicBool::new(false),
         running: AtomicBool::new(false),
         vtimer_offset: AtomicU64::new(0),
     }));
@@ -993,6 +996,7 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         catch_up(v);
         let mut e = engine(v);
         e.event = None;
+        v.hook_stopped.store(false, SeqCst);
         let pc = read(v.uc, R_PC);
         v.running.store(true, SeqCst);
         CURRENT.store(v as *const Vcpu as *mut Vcpu, SeqCst);
@@ -1061,7 +1065,8 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         // `wfi`/`wfe` halt the emulated CPU past the instruction; the
         // framework exits at it.
         if let Some(insn) = fetch(v.uc, now.wrapping_sub(4)) {
-            if (insn == 0xd503_207f || insn == 0xd503_205f) && !v.cancel.load(SeqCst) && now != pc {
+            let halted = !v.hook_stopped.load(SeqCst) && !v.cancel.load(SeqCst);
+            if (insn == 0xd503_207f || insn == 0xd503_205f) && halted && now != pc {
                 write(v.uc, R_PC, now - 4);
                 exit.reason = HV_EXIT_REASON_EXCEPTION;
                 exit.exception = hv_vcpu_exit_exception_t {
@@ -1149,6 +1154,7 @@ extern "C" fn on_block(uc: Uc, _addr: u64, _size: u32, d: *mut c_void) {
     // SAFETY: the hook's data is its vCPU.
     let v = unsafe { &*d.cast::<Vcpu>() };
     if v.cancel.load(SeqCst) || v.yield_now.swap(false, SeqCst) {
+        v.hook_stopped.store(true, SeqCst);
         // SAFETY: stopping the engine whose hook this is, on its thread.
         unsafe { (api().emu_stop)(uc) };
     }

@@ -132,7 +132,6 @@ pub fn map_rules() -> Result<String, String> {
     let rw = VM_PROT_READ | VM_PROT_WRITE;
     let rwx = rw | VM_PROT_EXECUTE;
     let (r, x, w) = (HV_MEMORY_READ, HV_MEMORY_EXEC, HV_MEMORY_WRITE);
-    type Make = Box<dyn Fn() -> Result<Host, String>>;
     let cases: Vec<(&str, Make, u64)> = vec![
         ("RW, at most RWX, as RWX", Box::new(move || allocate(rw, rwx)), r | w | x),
         ("RW, at most RWX, as R", Box::new(move || allocate(rw, rwx)), r),
@@ -151,6 +150,28 @@ pub fn map_rules() -> Result<String, String> {
         ("shared entry of read-only memory, as RX", Box::new(shared_read_only), r | x),
         ("unmapped, as R", Box::new(unmapped), r),
     ];
+    // The signals that end a process wait until the VM is gone: it must
+    // never end with one alive (a CI job's cancel sends SIGTERM).
+    // SAFETY: changing this thread's mask; restored below.
+    let old = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::sigaddset(&mut set, sig);
+        }
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        old
+    };
+    let out = with_vm(&cases);
+    // SAFETY: restoring the mask saved above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    out
+}
+
+type Make = Box<dyn Fn() -> Result<Host, String>>;
+
+fn with_vm(cases: &[(&str, Make, u64)]) -> Result<String, String> {
     // SAFETY: a VM for this process, with no vCPU, destroyed below.
     unsafe {
         let cfg = hv_vm_config_create();
@@ -170,14 +191,18 @@ pub fn map_rules() -> Result<String, String> {
         // SAFETY: mapping host memory of ours into the VM, and taking it
         // out again before the memory goes.
         let rc = unsafe { hv_vm_map(host.addr as *mut _, ipa, SIZE as usize, *flags) };
+        let mut still_mapped = false;
         if rc == 0 {
             // SAFETY: as above.
-            unsafe { hv_vm_unmap(ipa, SIZE as usize) };
+            still_mapped = unsafe { hv_vm_unmap(ipa, SIZE as usize) } != 0;
             out.push_str(&format!("{name}: mapped\n"));
         } else {
             out.push_str(&format!("{name}: refused\n"));
         }
-        if host.owned {
+        if still_mapped {
+            // Memory the VM may still map is never freed.
+            out.push_str(&format!("{name}: could not be unmapped (memory kept)\n"));
+        } else if host.owned {
             // SAFETY: freeing our own memory, no longer in the VM.
             unsafe { mach_vm_deallocate(task(), host.addr, SIZE) };
         }

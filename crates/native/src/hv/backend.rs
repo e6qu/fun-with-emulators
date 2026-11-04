@@ -517,7 +517,8 @@ pub fn run(
     env: &[OsString],
     options: &Options,
 ) -> Error {
-    record::event("start", path.as_os_str().as_bytes());
+    let mode = if super::standin::active() { "start (stand-in)" } else { "start" };
+    record::event(mode, path.as_os_str().as_bytes());
     match start(path, data, args, env, options) {
         Ok(never) => match never {},
         Err(e) => e,
@@ -936,7 +937,8 @@ fn fatal(msg: &str) -> ! {
     let line = format!("fwe: {msg}\n");
     // SAFETY: writing a diagnostic to standard error.
     unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-    record::event("fatal:", msg.as_bytes());
+    // Not synced: the VM is still alive.
+    record::Line::new().s("fatal: ").bytes(msg.as_bytes()).emit_unsynced();
     teardown();
     // SAFETY: exiting, the VM gone.
     unsafe { libc::_exit(127) }

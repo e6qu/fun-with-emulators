@@ -95,7 +95,7 @@ jobs:
           echo "booted: $(sysctl -n kern.boottime)"; sw_vers; uptime
           for log in "$HV_RECORDS"/*.log; do
             [ -e "$log" ] || continue
-            if ! tail -n 1 "$log" | grep -q "run finished"; then
+            if ! grep -q " run finished$" "$log"; then
               echo "::warning::$log did not finish; its last records:"
               tail -n 60 "$log"
             fi
@@ -126,7 +126,7 @@ jobs:
       - name: Compare the stand-in's hv_vm_map rule with the framework's
         run: |
           real="$(target/release/fwe --hv-record "$FWE_HV_RECORD" --probe hv-map-rules)"
-          standin="$(target/release/fwe --hv-standin --probe hv-map-rules 2>/dev/null)"
+          standin="$(env -u FWE_HV_RECORD target/release/fwe --hv-standin --probe hv-map-rules)"
           echo "framework:"; echo "$real"
           if [ "$real" != "$standin" ]; then
             echo "::error::the stand-in's rule differs from the framework's:"
@@ -141,10 +141,10 @@ jobs:
           if echo "$out" | grep -q "skipped:"; then exit 1; fi
           echo "$out" | grep -q "test result: ok"
       - name: Close the flight record
-        if: always()
+        if: always() && env.HV_LOG != ''
         run: echo "fwe-hv $(date +%s).000000 run ${{ github.run_id }} run finished" >> "$HV_LOG"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && env.HV_LOG != ''
         with:
           name: hv-flight-record
           path: ${{ env.HV_LOG }}

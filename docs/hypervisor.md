@@ -298,7 +298,9 @@ push.
 
 The runner should be a machine whose crash costs nothing, such as a rented
 bare-metal cloud Mac, never the development Mac. Install Unicorn there too
-(`brew install unicorn`, which the job also does) for the probe comparison.
+(`brew install unicorn`, which the job also does) for the probe comparison,
+and make sure the runner service's `PATH` includes Homebrew
+(`/opt/homebrew/bin`), as it does not by default.
 To have the record streamed off the machine, run
 `tools/hv-record-listen.py PORT` on a machine that can receive from it and
 set the repository variable `FWE_HV_RECORD_UDP` to `udp:HOST:PORT`.
