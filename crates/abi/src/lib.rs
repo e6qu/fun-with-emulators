@@ -205,7 +205,24 @@ pub mod fcntl {
     pub const F_SETFD: u64 = 2;
     pub const F_GETFL: u64 = 3;
     pub const F_SETFL: u64 = 4;
+    pub const F_GETLK: u64 = 5;
+    pub const F_SETLK: u64 = 6;
+    pub const F_SETLKW: u64 = 7;
+    pub const F_OFD_GETLK: u64 = 36;
+    pub const F_OFD_SETLK: u64 = 37;
+    pub const F_OFD_SETLKW: u64 = 38;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+
+    /// `struct flock` lock types.
+    pub const F_RDLCK: i16 = 0;
+    pub const F_WRLCK: i16 = 1;
+    pub const F_UNLCK: i16 = 2;
+
+    /// `flock` operations.
+    pub const LOCK_SH: u64 = 1;
+    pub const LOCK_EX: u64 = 2;
+    pub const LOCK_NB: u64 = 4;
+    pub const LOCK_UN: u64 = 8;
 
     pub const FD_CLOEXEC: u64 = 1;
 
@@ -709,6 +726,17 @@ pub struct Pollfd {
     pub revents: i16,
 }
 
+/// `struct flock` (arm64: 64-bit offsets, padded to 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flock {
+    pub l_type: i16,
+    pub l_whence: i16,
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: i32,
+}
+
 /// `struct winsize`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -871,6 +899,7 @@ mod tests {
         assert_eq!(size_of::<EpollEvent>(), 16);
         assert_eq!(size_of::<Itimerspec>(), 32);
         assert_eq!(size_of::<Winsize>(), 8);
+        assert_eq!(size_of::<Flock>(), 32);
         assert_eq!(size_of::<Rlimit>(), 16);
         assert_eq!(size_of::<Utsname>(), 390);
         assert_eq!(size_of::<Sigaction>(), 32);

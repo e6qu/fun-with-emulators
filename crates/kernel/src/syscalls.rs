@@ -21,6 +21,30 @@ fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
 ///
 /// # Safety
 /// `req` and, when non-zero, `rem` must point to valid guest `Timespec`s.
+/// `flock(fd, op)`. Waiting for the lock blocks, so the backends run it
+/// without the kernel lock ([`crate::blocking_syscall`]).
+pub(crate) fn flock(fd: u64, op: u64) -> i64 {
+    match host::flock_op_to_host(op) {
+        // SAFETY: plain host call on a guest descriptor.
+        Some(op) => ret(unsafe { libc::flock(fd as i32, op) }),
+        None => err(errno::EINVAL),
+    }
+}
+
+/// `fcntl(fd, F_SETLK or F_SETLKW, lock)`: a record lock in Linux layout.
+/// `F_SETLKW` waits for a conflicting lock to go, so it runs without the
+/// kernel lock ([`crate::blocking_syscall`]).
+pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
+    let lock: fwe_abi::Flock = guest!(uaccess::read(arg));
+    let lock = match host::flock_to_host(&lock) {
+        Ok(l) => l,
+        Err(e) => return err(e),
+    };
+    let hcmd = if cmd == fcntl::F_SETLKW { libc::F_SETLKW } else { libc::F_SETLK };
+    // SAFETY: `lock` is a valid host `struct flock`.
+    ret(unsafe { libc::fcntl(fd, hcmd, &lock) })
+}
+
 pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> i64 {
     const TIMER_ABSTIME: u64 = 1;
     if matches!(id, clock::CLOCK_THREAD_CPUTIME_ID) {
@@ -129,6 +153,7 @@ impl<P: Platform> Kernel<P> {
             nr::DUP3 => self.sys_dup3(a[0], a[1], a[2]),
             nr::CLOSE_RANGE => self.sys_close_range(a[0] as u32, a[1] as u32, a[2]),
             nr::FCNTL => self.sys_fcntl(a[0], a[1], a[2]),
+            nr::FLOCK => flock(a[0], a[1]),
             nr::IOCTL => self.sys_ioctl(a[0], a[1], a[2]),
             nr::PPOLL => self.sys_ppoll(a[0], a[1], a[2]),
             nr::SIGNALFD4 => self.sys_signalfd4(a[0], a[1], a[2], a[3]),
@@ -483,6 +508,19 @@ impl<P: Platform> Kernel<P> {
                 fcntl::F_SETFL => {
                     ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
                 }
+                fcntl::F_GETLK => {
+                    let lock: fwe_abi::Flock = guest!(uaccess::read(arg));
+                    let mut lock = match host::flock_to_host(&lock) {
+                        Ok(l) => l,
+                        Err(e) => return err(e),
+                    };
+                    if libc::fcntl(fd, libc::F_GETLK, &mut lock) < 0 {
+                        return last_error();
+                    }
+                    guest!(uaccess::write(arg, host::flock_to_linux(&lock)));
+                    0
+                }
+                fcntl::F_SETLK | fcntl::F_SETLKW => set_record_lock(fd, cmd, arg),
                 _ => err(errno::EINVAL),
             }
         }
@@ -878,6 +916,53 @@ mod tests {
         assert_eq!(kernel().syscall(nr::UNAME, [&mut u as *mut _ as u64, 0, 0, 0, 0, 0]), 0);
         assert!(u.sysname.starts_with(b"Linux\0"));
         assert!(u.machine.starts_with(b"aarch64\0"));
+    }
+
+    /// A scratch file, opened twice: two open file descriptions.
+    fn two_opens(name: &str) -> (std::fs::File, std::fs::File, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("fwe-{name}-{}", std::process::id()));
+        let a = std::fs::File::create(&path).unwrap();
+        let b = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        (a, b, path)
+    }
+
+    /// `fcntl` record locks in Linux layout: set, query (a process's own
+    /// lock never conflicts with it, so the query reports none) and release;
+    /// a bad lock type is refused.
+    #[test]
+    fn fcntl_record_locks() {
+        use std::os::fd::AsRawFd;
+        let (a, _b, path) = two_opens("fcntl-lock");
+        let fd = a.as_raw_fd() as u64;
+        let mut k = kernel();
+        let mut lock = |cmd, l_type| {
+            let mut lock = fwe_abi::Flock { l_type, l_len: 10, ..Default::default() };
+            let r = k.syscall(nr::FCNTL, [fd, cmd, &mut lock as *mut _ as u64, 0, 0, 0]);
+            (r, lock.l_type)
+        };
+        assert_eq!(lock(fcntl::F_SETLK, fcntl::F_WRLCK), (0, fcntl::F_WRLCK));
+        assert_eq!(lock(fcntl::F_GETLK, fcntl::F_WRLCK), (0, fcntl::F_UNLCK));
+        assert_eq!(lock(fcntl::F_SETLKW, fcntl::F_UNLCK), (0, fcntl::F_UNLCK));
+        assert_eq!(lock(fcntl::F_SETLK, 7).0, err(errno::EINVAL));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `flock` locks belong to an open file description, so a second open of
+    /// the same file is refused an exclusive lock until the first lets go.
+    #[test]
+    fn flock_conflicts_between_open_descriptions() {
+        use std::os::fd::AsRawFd;
+        let (a, b, path) = two_opens("flock");
+        let (a, b) = (a.as_raw_fd() as u64, b.as_raw_fd() as u64);
+        let mut k = kernel();
+        let mut flock = |fd, op| k.syscall(nr::FLOCK, [fd, op, 0, 0, 0, 0]);
+        assert_eq!(flock(a, fcntl::LOCK_EX), 0);
+        assert_eq!(flock(b, fcntl::LOCK_EX | fcntl::LOCK_NB), err(errno::EAGAIN));
+        assert_eq!(flock(b, fcntl::LOCK_SH | fcntl::LOCK_NB), err(errno::EAGAIN));
+        assert_eq!(flock(a, fcntl::LOCK_UN), 0);
+        assert_eq!(flock(b, fcntl::LOCK_EX | fcntl::LOCK_NB), 0);
+        assert_eq!(flock(a, 0), err(errno::EINVAL));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

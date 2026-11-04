@@ -219,7 +219,7 @@ it there without the bits that allow skipping cache maintenance
    register file), and dispatches on the number in `x8`.
 3. Calls that can block — `futex`, the sleeps, `epoll_pwait`, `ppoll`,
    `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the blocking
-   socket calls, and `read`/`write` with their vectored and positioned forms
+   socket calls, `flock` and `fcntl`'s `F_SETLKW`, and `read`/`write` with their vectored and positioned forms
    (a pipe or socket blocks until another thread acts) — run **without** the
    kernel lock, so a waiting thread never stalls the threads meant to wake
    it; `clone`, `execve` and `exit` are handled by the backend for the same
@@ -266,8 +266,11 @@ limit cannot be raised into the range. `stat` results are translated into the ar
 layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
 directory position when the translated entries outgrow the guest's buffer.
 Creation modes have the umask applied by the kernel. `fcntl` translates the
-descriptor and status flags; `ioctl` covers the terminal, pty and `FIO*`
-requests.
+descriptor and status flags, and record locks (`F_GETLK`, `F_SETLK`,
+`F_SETLKW`: the arm64 `struct flock` and its lock types differ from the
+host's); `flock` passes through. Both kinds of lock are the host's, so they
+hold between guest processes and against host ones. `ioctl` covers the
+terminal, pty and `FIO*` requests.
 
 ## Synthetic /proc and /sys
 
@@ -594,6 +597,9 @@ those items.
   file by path (not one renamed or deleted since it was opened); `clone3`
   has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
   `rusage`.
+- **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
+  fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
+  to process locks.
 - **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
   that opens more descriptors than its limit gets numbers in fwe's range,
   which it cannot use, rather than `EMFILE`; a reopened

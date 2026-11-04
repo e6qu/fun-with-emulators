@@ -613,8 +613,8 @@ pub fn wake_futex(addr: u64, count: u32) {
 
 /// Run a system call that must not hold the kernel lock because it can block:
 /// `futex`, the sleeps, `epoll_pwait`, `ppoll`, `rt_sigsuspend`, the socket
-/// calls that wait,
-/// and `read`/`write` and their vectored and positioned forms (a pipe, socket
+/// calls that wait, `flock` and `fcntl`'s `F_SETLKW` (waiting for another
+/// process's lock), and `read`/`write` and their vectored and positioned forms (a pipe, socket
 /// or terminal blocks until the other side acts, and the other side may be a
 /// guest thread that needs the lock). Returns `None` for any other call,
 /// which the backend runs under the lock through [`Kernel::enter_syscall`].
@@ -695,6 +695,10 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // SAFETY: caller guarantees the signal set pointer.
         n::RT_SIGSUSPEND => unsafe { signal::sigsuspend(a[0], a[1]) },
+        n::FLOCK => syscalls::flock(a[0], a[1]),
+        n::FCNTL if a[1] == fwe_abi::fcntl::F_SETLKW => {
+            syscalls::set_record_lock(a[0] as i32, a[1], a[2])
+        }
 
         // Socket calls that can block run without the kernel lock, so a thread
         // waiting in accept/recv does not stall the threads meant to feed it.

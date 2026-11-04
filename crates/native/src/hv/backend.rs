@@ -1073,10 +1073,10 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The kernel and the host see host addresses for guest pointers.
-    let mask = if n == nr::FUTEX {
-        uaccess::futex_pointer_args(args[1])
-    } else {
-        uaccess::pointer_args(n)
+    let mask = match n {
+        nr::FUTEX => uaccess::futex_pointer_args(args[1]),
+        nr::FCNTL => uaccess::fcntl_pointer_args(args[1]),
+        _ => uaccess::pointer_args(n),
     };
     let mut host_args = args;
     for (i, a) in host_args.iter_mut().enumerate() {

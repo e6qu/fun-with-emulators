@@ -525,6 +525,60 @@ pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
     f | fcntl::O_LARGEFILE
 }
 
+/// A Linux `struct flock` in host layout, or `EINVAL` for an unknown lock
+/// type or `whence`.
+pub fn flock_to_host(lock: &fwe_abi::Flock) -> Result<libc::flock, i32> {
+    let l_type = match lock.l_type {
+        fcntl::F_RDLCK => libc::F_RDLCK,
+        fcntl::F_WRLCK => libc::F_WRLCK,
+        fcntl::F_UNLCK => libc::F_UNLCK,
+        _ => return Err(le::EINVAL),
+    };
+    if !(0..=2).contains(&lock.l_whence) {
+        return Err(le::EINVAL);
+    }
+    // SAFETY: `flock` is plain data; every field is set below.
+    let mut host: libc::flock = unsafe { std::mem::zeroed() };
+    host.l_type = l_type as _;
+    // SEEK_SET, SEEK_CUR and SEEK_END are 0, 1 and 2 on both.
+    host.l_whence = lock.l_whence as _;
+    host.l_start = lock.l_start;
+    host.l_len = lock.l_len;
+    host.l_pid = lock.l_pid;
+    Ok(host)
+}
+
+/// A host `struct flock` (as `F_GETLK` fills it) in Linux layout.
+// The host lock constants are `short` on macOS and `int` on Linux, so the
+// casts below are redundant on one of them.
+#[allow(clippy::unnecessary_cast)]
+pub fn flock_to_linux(host: &libc::flock) -> fwe_abi::Flock {
+    let l_type = match host.l_type as i32 {
+        t if t == libc::F_RDLCK as i32 => fcntl::F_RDLCK,
+        t if t == libc::F_WRLCK as i32 => fcntl::F_WRLCK,
+        _ => fcntl::F_UNLCK,
+    };
+    fwe_abi::Flock {
+        l_type,
+        l_whence: host.l_whence,
+        l_start: host.l_start,
+        l_len: host.l_len,
+        l_pid: host.l_pid,
+    }
+}
+
+/// `flock` operation bits from Linux to host (the same values on both, but
+/// named here so a stray bit is refused rather than passed on).
+pub fn flock_op_to_host(op: u64) -> Option<libc::c_int> {
+    let lock = match op & !fcntl::LOCK_NB {
+        fcntl::LOCK_SH => libc::LOCK_SH,
+        fcntl::LOCK_EX => libc::LOCK_EX,
+        fcntl::LOCK_UN => libc::LOCK_UN,
+        _ => return None,
+    };
+    Some(if op & fcntl::LOCK_NB != 0 { lock | libc::LOCK_NB } else { lock })
+}
+
 /// Settable file status flags (`F_SETFL`) from Linux to host.
 pub fn settable_flags_to_host(linux: u64) -> libc::c_int {
     let mut f = 0;
