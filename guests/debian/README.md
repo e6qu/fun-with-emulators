@@ -79,6 +79,20 @@ most `GLIBC_2.36`, which lighttpd needs), from `https://deb.debian.org/debian/po
 
 Each `.deb` is an `ar` archive whose `data.tar.xz` holds the files.
 
+## Fetched, not vendored
+
+Programs too large to keep here are listed in `fetch/` instead, one file per
+test: each line is a Debian 12 `arm64` package's pool path and its SHA-256
+from the bookworm index. The test downloads them from `deb.debian.org` (or,
+once a newer version has replaced one there, from `snapshot.debian.org`),
+checks each checksum, unpacks them into its root filesystem and caches them
+under `target/debian-packages` (`FWE_DEBIAN_CACHE` overrides it; CI caches
+it). Nothing fetched is redistributed in this repository.
+
+| Manifest | Program | Size |
+| --- | --- | --- |
+| `fetch/node.txt` | Node.js 18 with V8, its built-in modules Debian packages separately (`acorn`, `cjs-module-lexer`, `undici`), and its libraries: OpenSSL, ICU, libuv, c-ares, nghttp2, brotli, libstdc++, zlib | 22 MB |
+
 ## License
 
 - GNU coreutils and bash: GNU GPL v3 or later — `COREUTILS-COPYRIGHT`,
