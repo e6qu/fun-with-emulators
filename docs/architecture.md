@@ -436,7 +436,13 @@ background jobs). Each guest thread runs under a host mask that mirrors its
 guest mask, so the host routes a process-wide signal to a thread that
 accepts it and keeps a blocked one pending, and a signal from anywhere — a
 child exiting (`SIGCHLD`), the terminal, a timer (`setitimer`), another
-process — reaches the guest as it would on Linux. Every fwe handler starts
+process — reaches the guest as it would on Linux. One difference is made
+up for: a process-wide signal that arrives while every thread blocks it
+stays pending for the process on Linux, for whichever thread unblocks it
+first, while macOS parks it on one thread. In the native backend a thread
+entering a system call with such a signal parked on it, one the guest
+catches, takes it off the host and records it against the process, and
+the other threads are woken to take it. Every fwe handler starts
 and ends with all signals blocked, so the backend always knows whether it
 interrupted guest code or its own.
 
@@ -633,7 +639,11 @@ those items.
   signal within 20 ms; a call rerun after an interruption the guest does
   not see starts its timeout over; a fault signal sent by another process
   is treated as a fault; a process killed by a real-time signal exits with
-  status 128 + the signal, since the host cannot report one it lacks.
+  status 128 + the signal, since the host cannot report one it lacks; a
+  process-wide signal left at its default action and sent while every
+  thread blocked it stays with the thread macOS parked it on, rather than
+  acting when another thread unblocks it (one the guest catches is
+  handed on), and in the VM a caught one is not handed on either.
 - **Event descriptors:** `epoll` `EEXIST`/`ENOENT` edge cases; `timerfd`
   resolution and clock distinctions.
 - **Not implemented:** `rseq`, `membarrier` (optional for libc), and any

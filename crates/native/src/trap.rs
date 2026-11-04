@@ -96,6 +96,60 @@ thread_local! {
     /// Whether this thread is executing guest code (as opposed to fwe's own
     /// code, including the handlers here).
     static IN_GUEST: Cell<bool> = const { Cell::new(false) };
+    /// [`reroute_parked`] is taking a signal parked on this thread: record
+    /// it against the process rather than the thread.
+    static REROUTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the host delivers `sig` to [`on_async`] (the guest catches it).
+fn caught(sig: libc::c_int) -> bool {
+    // SAFETY: zeroed bytes are a valid `sigaction`; this only reads it.
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out parameter; no change is made.
+    unsafe { libc::sigaction(sig, std::ptr::null(), &mut act) };
+    act.sa_sigaction == on_async as *const () as usize
+}
+
+/// Hand signals the host parked on this thread back to the whole process.
+///
+/// Linux keeps a process-wide signal that every thread blocks pending for
+/// the process, and the first thread to unblock it takes it. macOS instead
+/// parks it on one thread for good, so a signal sent while every thread
+/// blocked it for a moment (each does while it is in fwe's handlers) could
+/// stay pending on a thread that never unblocks it while another thread
+/// accepts it. At a system call, a caught signal pending on the host that
+/// this thread's guest mask blocks may be such a signal: unblocking it
+/// here, in fwe's code, has the host deliver it to [`take_async`] now,
+/// which records it against the process (where Linux keeps it), and the
+/// other threads are woken to take it. A signal with the default action
+/// or ignored stays where it is: unblocking it would apply that action to
+/// a signal Linux keeps pending.
+fn reroute_parked() {
+    let blocked = thread::mask();
+    if blocked == 0 {
+        return;
+    }
+    let parked = host::pending_signals() & blocked;
+    if parked == 0 {
+        return;
+    }
+    let parked = (1..=fwe_abi::signal::NSIG)
+        .filter(|&sig| parked & (1 << (sig - 1)) != 0)
+        .filter(|&sig| host::signal_to_host(sig).is_some_and(caught))
+        .fold(0u64, |m, sig| m | 1 << (sig - 1));
+    if parked == 0 {
+        return;
+    }
+    let set = host::host_sigset(parked);
+    REROUTING.set(true);
+    // SAFETY: `set` is an initialized signal set; the pending signals are
+    // delivered to this thread between the two calls.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    REROUTING.set(false);
+    thread::wake_others(host::WAKE_SIGNAL);
 }
 
 /// Block every signal the guest can receive on this thread.
@@ -284,6 +338,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         // SAFETY: terminating the process.
         unsafe { libc::_exit(127) }
     }
+    reroute_parked();
     let nr = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
 
@@ -384,7 +439,12 @@ fn take_async(
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let (code, pid, uid, status) = unsafe { host::signal_info(sig, info) };
         let lsig = host::signal_to_linux(sig);
-        thread::post_self(lsig, thread::SigInfo { code, pid, uid, status });
+        let info = thread::SigInfo { code, pid, uid, status };
+        if REROUTING.with(Cell::get) {
+            thread::post_process(lsig, info);
+        } else {
+            thread::post_self(lsig, info);
+        }
     }
     if !in_guest {
         return;

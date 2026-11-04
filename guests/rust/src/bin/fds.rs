@@ -118,7 +118,10 @@ fn main() {
                 .filter(|&f| unsafe { fcntl(f, 1) } >= 0)
                 .collect();
             let extra: Vec<&i32> = listed.iter().filter(|f| !open.contains(f)).collect();
-            println!("and nothing else: {}", open.iter().all(|f| listed.contains(f)) && extra.len() == 1);
+            println!(
+                "and nothing else: {}",
+                open.iter().all(|f| listed.contains(f)) && extra.len() == 1
+            );
             let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
             println!("file link is its path: {}", link == exe);
             let link = std::fs::read_link(format!("/proc/self/fd/{}", p[0])).unwrap();

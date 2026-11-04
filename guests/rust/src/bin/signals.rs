@@ -238,9 +238,11 @@ fn main() {
     match scenario.as_str() {
         // The parent kills a child that waits forever.
         "kill-child" => {
-            let pid = child(|| loop {
-                // SAFETY: plain call.
-                unsafe { pause() };
+            let pid = child(|| {
+                loop {
+                    // SAFETY: plain call.
+                    unsafe { pause() };
+                }
             });
             std::thread::sleep(Duration::from_millis(50));
             // SAFETY: plain call.
@@ -294,8 +296,10 @@ fn main() {
                 // SAFETY: a 1-byte buffer.
                 unsafe { write(writer, b"x".as_ptr(), 1) };
             });
-            let timer =
-                Itimerval { interval: Timeval { sec: 0, usec: 0 }, value: Timeval { sec: 0, usec: 50_000 } };
+            let timer = Itimerval {
+                interval: Timeval { sec: 0, usec: 0 },
+                value: Timeval { sec: 0, usec: 50_000 },
+            };
             // SAFETY: a valid itimerval.
             unsafe { setitimer(0, &timer, std::ptr::null_mut()) };
             let mut b = 0u8;
@@ -308,8 +312,10 @@ fn main() {
         // handler runs and the loop sees its flag.
         "busy-alarm" => {
             catch(SIGALRM, 0);
-            let timer =
-                Itimerval { interval: Timeval { sec: 0, usec: 0 }, value: Timeval { sec: 0, usec: 50_000 } };
+            let timer = Itimerval {
+                interval: Timeval { sec: 0, usec: 0 },
+                value: Timeval { sec: 0, usec: 50_000 },
+            };
             // SAFETY: a valid itimerval.
             unsafe { setitimer(0, &timer, std::ptr::null_mut()) };
             let start = std::time::Instant::now();
@@ -324,13 +330,19 @@ fn main() {
         // pause() returns once a handler has run.
         "pause" => {
             catch(SIGALRM, 0);
-            let timer =
-                Itimerval { interval: Timeval { sec: 0, usec: 0 }, value: Timeval { sec: 0, usec: 30_000 } };
+            let timer = Itimerval {
+                interval: Timeval { sec: 0, usec: 0 },
+                value: Timeval { sec: 0, usec: 30_000 },
+            };
             // SAFETY: a valid itimerval.
             unsafe { setitimer(0, &timer, std::ptr::null_mut()) };
             // SAFETY: plain call.
             let r = unsafe { pause() };
-            println!("pause: {r} errno {}, handler ran: {}", errno(), HITS.load(Ordering::SeqCst) == 1);
+            println!(
+                "pause: {r} errno {}, handler ran: {}",
+                errno(),
+                HITS.load(Ordering::SeqCst) == 1
+            );
         }
         // A process-wide signal goes to the thread that does not block it.
         "thread-mask" => {
@@ -353,7 +365,41 @@ fn main() {
             while HITS.load(Ordering::SeqCst) == 0 {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            println!("handled on the unblocked thread: {}", LAST_TID.load(Ordering::SeqCst) == worker);
+            println!(
+                "handled on the unblocked thread: {}",
+                LAST_TID.load(Ordering::SeqCst) == worker
+            );
+        }
+        // A process signal sent while every thread blocks it goes to the
+        // first thread to unblock it, even though the host parks it on
+        // another thread (macOS picks the main one, which blocks it for
+        // good).
+        "parked" => {
+            catch(SIGUSR1, 0);
+            // SAFETY: a valid signal set.
+            unsafe { pthread_sigmask(SIG_BLOCK, &set(&[SIGUSR1]), std::ptr::null_mut()) };
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                tid_tx.send(gettid()).unwrap();
+                go_rx.recv().unwrap();
+                // SAFETY: a valid signal set.
+                unsafe { pthread_sigmask(SIG_UNBLOCK, &set(&[SIGUSR1]), std::ptr::null_mut()) };
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let worker = tid_rx.recv().unwrap();
+            // SAFETY: plain calls.
+            unsafe { kill(getpid(), SIGUSR1) };
+            go_tx.send(()).unwrap();
+            while HITS.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            println!(
+                "parked signal handled on the unblocked thread: {}",
+                LAST_TID.load(Ordering::SeqCst) == worker
+            );
         }
         // tgkill interrupts one thread's blocking call: a relayed signal and
         // a real-time one (which the host does not have).
@@ -382,7 +428,11 @@ fn main() {
             catch(SIGRT, 0);
             // SAFETY: plain calls.
             unsafe { kill(getpid(), SIGRT) };
-            println!("handled: {}, signal {}", HITS.load(Ordering::SeqCst), LAST_SIG.load(Ordering::SeqCst));
+            println!(
+                "handled: {}, signal {}",
+                HITS.load(Ordering::SeqCst),
+                LAST_SIG.load(Ordering::SeqCst)
+            );
         }
         // Writing to a pipe with no reader kills the writer by default.
         "sigpipe" => {
@@ -401,7 +451,8 @@ fn main() {
         // Dispositions inherited as ignored stay ignored.
         "inherited" => {
             for sig in [SIGHUP, SIGINT] {
-                let mut old = SigAction { handler: 99, mask: SigSet([0; 16]), flags: 0, restorer: 0 };
+                let mut old =
+                    SigAction { handler: 99, mask: SigSet([0; 16]), flags: 0, restorer: 0 };
                 // SAFETY: querying into a valid sigaction.
                 unsafe { sigaction(sig, std::ptr::null(), &mut old) };
                 let what = match old.handler {
@@ -426,7 +477,10 @@ fn main() {
             let ts = Timespec { sec: 0, nsec: 50_000_000 };
             // SAFETY: as above.
             let r = unsafe { sigtimedwait(&set(&[SIGUSR2]), &mut info, &ts) };
-            println!("then {r} errno {}", if errno() == EAGAIN { "EAGAIN".into() } else { errno().to_string() });
+            println!(
+                "then {r} errno {}",
+                if errno() == EAGAIN { "EAGAIN".into() } else { errno().to_string() }
+            );
         }
         // std::process::Command spawns with posix_spawn (a vfork-style clone).
         "spawn" => {
@@ -715,7 +769,11 @@ fn main() {
             let r = execveat(AT_FDCWD, cstr(&link).as_ptr(), AT_SYMLINK_NOFOLLOW);
             println!("symlink with AT_SYMLINK_NOFOLLOW: {r}, errno {}", errno());
             let _ = std::fs::remove_file(&link);
-            println!("unknown flag: {}, errno {}", execveat(dfd as i64, base.as_ptr(), 0x1), errno());
+            println!(
+                "unknown flag: {}, errno {}",
+                execveat(dfd as i64, base.as_ptr(), 0x1),
+                errno()
+            );
         }
         // execve keeps the credentials (the saved IDs becoming the effective
         // ones), the descriptor limit and the umask, whether the program is
@@ -739,8 +797,10 @@ fn main() {
                 umask(0o027);
             }
             if std::env::args().nth(2).as_deref() == Some("threaded") {
-                std::thread::spawn(|| loop {
-                    std::thread::sleep(Duration::from_secs(1));
+                std::thread::spawn(|| {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                 });
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -785,9 +845,11 @@ fn main() {
                 info.status,
                 info.pid == pid
             );
-            let pid = child(|| loop {
-                // SAFETY: plain call.
-                unsafe { pause() };
+            let pid = child(|| {
+                loop {
+                    // SAFETY: plain call.
+                    unsafe { pause() };
+                }
             });
             // SAFETY: plain call.
             unsafe { kill(pid, SIGKILL) };

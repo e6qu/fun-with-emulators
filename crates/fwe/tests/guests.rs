@@ -1407,6 +1407,14 @@ fn process_signal_goes_to_unblocked_thread() {
     assert_eq!(signals("thread-mask"), "handled on the unblocked thread: true\n");
 }
 
+/// A process signal sent while every thread blocks it reaches the thread
+/// that unblocks it first, though macOS parks it on the main thread, which
+/// never does.
+#[test]
+fn signal_blocked_everywhere_goes_to_the_thread_that_unblocks_it() {
+    assert_eq!(signals("parked"), "parked signal handled on the unblocked thread: true\n");
+}
+
 /// `tgkill` aims at one thread and interrupts its blocking call, both for a
 /// signal the host has and for a real-time one it does not.
 #[test]
