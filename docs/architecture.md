@@ -604,6 +604,8 @@ those items.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.
+- **Sockets:** an `AF_UNIX` path that, rooted under the rootfs, is longer
+  than the host's 103 bytes fails with `ENAMETOOLONG`.
 - **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
   that opens more descriptors than its limit gets numbers in fwe's range,
   which it cannot use, rather than `EMFILE`; a reopened
