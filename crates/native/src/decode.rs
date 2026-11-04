@@ -220,6 +220,23 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
         };
     }
 
+    // AdvSIMD load/store of multiple structures or of a single structure
+    // (`ld1`..`ld4`, `st1`..`st4`, `ld1r`..`ld4r`): the vectors are left
+    // alone; Rn is the base, written back by the post-index forms (bit 23),
+    // whose Rm is a register offset unless it is 31 (an immediate). An `sp`
+    // base has no offset to absorb the stub's push.
+    if insn & 0xbe00_0000 == 0x0c00_0000 {
+        if reg(insn, RN) == 31 {
+            return None;
+        }
+        let post = (insn >> 23) & 1 == 1;
+        let mut f = vec![Field { shift: RN, read: true, write: post }];
+        if post && reg(insn, RM) != 31 {
+            f.push(Field { shift: RM, read: true, write: false });
+        }
+        return Some(f);
+    }
+
     load_store(insn)
 }
 
@@ -592,6 +609,9 @@ fn gpr_fields(insn: u32) -> Option<Vec<u32>> {
                 }
                 return Some(rt(vec![RN])); // immediate forms, PAC loads
             }
+            if insn & 0xbe00_0000 == 0x0c00_0000 && (insn >> 23) & 1 == 1 {
+                return Some(vec![RN, RM]); // SIMD structures, post-index
+            }
             Some(vec![RN]) // SIMD structure loads and stores
         }
         // Data processing, register.
@@ -908,6 +928,23 @@ mod tests {
         assert_eq!(operands(0x4e183c92), writes); // mov x18, v4.d[1] (umov)
         assert_eq!(operands(0x6e0c0420), None); // ins v0.s[1], v1.s[0]: no GPR
         assert!(names_x18(0x4e051e40));
+    }
+
+    /// SIMD structure loads and stores through `x18`: a base, written back by
+    /// the post-index forms, or a post-index register offset. Encodings from
+    /// `llvm-mc`.
+    #[test]
+    fn simd_structure_loads_and_stores() {
+        let base = |write| Field { shift: RN, read: true, write };
+        assert_eq!(operands(0x0c408a42), Some(vec![base(false)])); // ld2 {v2.2s, v3.2s}, [x18]
+        assert_eq!(operands(0x4c407642), Some(vec![base(false)])); // ld1 {v2.8h}, [x18]
+        assert_eq!(operands(0x0d409240), Some(vec![base(false)])); // ld1 {v0.s}[1], [x18]
+        assert_eq!(operands(0x0cdf8240), Some(vec![base(true)])); // ld2 {..}, [x18], #16
+        assert_eq!(operands(0x4c837240), Some(vec![base(true), rr(RM)])); // st1 {..}, [x18], x3
+        assert_eq!(operands(0x4dc2ca40), Some(vec![base(true), rr(RM)])); // ld1r {..}, [x18], x2
+        assert_eq!(operands(0x4c927020), Some(vec![base(true), rr(RM)])); // st1 {..}, [x1], x18
+        assert!(names_x18(0x4c927020));
+        assert_eq!(operands(0x4c4073e0), None); // ld1 {v0.16b}, [sp]
     }
 
     #[test]

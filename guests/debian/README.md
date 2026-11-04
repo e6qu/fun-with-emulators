@@ -92,6 +92,7 @@ it). Nothing fetched is redistributed in this repository.
 | Manifest | Program | Size |
 | --- | --- | --- |
 | `fetch/node.txt` | Node.js 18 with V8, its built-in modules Debian packages separately (`acorn`, `cjs-module-lexer`, `undici`), and its libraries: OpenSSL, ICU, libuv, c-ares, nghttp2, brotli, libstdc++, zlib | 22 MB |
+| `fetch/rust.txt` | rustc 1.63 with its standard library and LLVM 14, Cargo with libcurl, libgit2 and libssh2, GNU binutils (`ld`), and the glibc and GCC files a program links with (`libc6-dev`, `libgcc-12-dev`) | 112 MB |
 
 ## License
 

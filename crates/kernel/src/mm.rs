@@ -488,14 +488,11 @@ mod tests {
 /// their code pages hold data that can look like an instruction naming it.
 const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
 
-/// Largest backing file read to find its executable sections.
-const MAX_EXEC_FILE: usize = 128 << 20;
-
 /// The executable sections of the ELF file open at `fd`, as file-offset
 /// ranges, or `None` if it is not a readable regular ELF with section headers
 /// (then the caller translates the whole mapped region instead), with the
 /// file-offset ranges its unwind table says are code, if it has a usable
-/// one. Reads with `pread`, so the guest's file position is untouched.
+/// one. Maps the file to read it, so the guest's file position is untouched.
 type ExecFile = (Vec<(u64, u64)>, Option<Vec<(u64, u64)>>);
 fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
     if fd < 0 {
@@ -509,28 +506,29 @@ fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
         return None;
     }
     let size = st.st_size as usize;
-    if !(64..=MAX_EXEC_FILE).contains(&size) {
+    if size < 64 {
         return None;
     }
-    let mut buf = vec![0u8; size];
-    let mut done = 0usize;
-    while done < size {
-        // SAFETY: pread into the owned buffer at an explicit offset.
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[done..].as_mut_ptr() as *mut libc::c_void,
-                size - done,
-                done as libc::off_t,
-            )
-        };
-        if n <= 0 {
-            return None;
-        }
-        done += n as usize;
+    // Mapped for the parse and unmapped at once, rather than read into a
+    // buffer: a library can be 100 MB, and a freed buffer that size stays
+    // reserved by the host's allocator, right beside the code, where the
+    // rewrite's stubs must be placed.
+    // SAFETY: a fresh read-only private mapping of the whole file.
+    let map = unsafe {
+        libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, fd, 0)
+    };
+    if map == libc::MAP_FAILED {
+        return None;
     }
-    let elf = fwe_elf::Elf::parse(&buf).ok()?;
-    Some((elf.exec_file_ranges()?, elf.unwind_code_file_ranges()))
+    // SAFETY: the mapping spans `size` readable bytes until it is unmapped
+    // below, after the last use of `data`.
+    let data = unsafe { std::slice::from_raw_parts(map as *const u8, size) };
+    let ranges = fwe_elf::Elf::parse(data)
+        .ok()
+        .and_then(|elf| Some((elf.exec_file_ranges()?, elf.unwind_code_file_ranges())));
+    // SAFETY: unmapping the mapping made above; `data` is not used again.
+    unsafe { libc::munmap(map, size) };
+    ranges
 }
 
 fn host_prot(prot: u64) -> libc::c_int {

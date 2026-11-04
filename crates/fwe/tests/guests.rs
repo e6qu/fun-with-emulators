@@ -1055,6 +1055,11 @@ fn fetched_root(manifest: &str) -> PathBuf {
             String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
         };
         if !deb.exists() || sum(&deb) != *sha256 {
+            // Tests fetch at once, and manifests share packages: each
+            // download goes to a name of its own and is renamed into place
+            // once it checks out.
+            let part = cache
+                .join(format!("{}.{manifest}.part", Path::new(pool).display()).replace('/', "_"));
             let fetched = [
                 format!("https://deb.debian.org/debian/{pool}"),
                 format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
@@ -1063,16 +1068,17 @@ fn fetched_root(manifest: &str) -> PathBuf {
             .any(|url| {
                 Command::new("curl")
                     .args(["-fsSL", "--retry", "3", "-o"])
-                    .arg(&deb)
+                    .arg(&part)
                     .arg(url)
                     .status()
                     .is_ok_and(|s| s.success())
-                    && sum(&deb) == *sha256
+                    && sum(&part) == *sha256
             });
             assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
+            std::fs::rename(&part, &deb).unwrap();
         }
         // A .deb is an `ar` archive whose data.tar.* holds the files.
-        let unpack = cache.join("unpack");
+        let unpack = cache.join(format!("unpack-{manifest}"));
         let _ = std::fs::remove_dir_all(&unpack);
         std::fs::create_dir_all(&unpack).unwrap();
         run_checked(Command::new("ar").arg("x").arg(&deb).current_dir(&unpack));
@@ -1182,6 +1188,106 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
          worker 42\n\
          worker exit 0\n"
     );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Debian's Rust toolchain (fetched: `guests/debian/fetch/rust.txt`): Cargo
+/// builds a two-crate project offline in release mode — rustc and its LLVM
+/// compiling, GNU ld linking — and runs it, then builds and runs a crate's
+/// unit tests. Debian's rustc links through `cc`, and Debian's GCC is a
+/// non-PIE executable (only the hypervisor backend runs it), so the project
+/// has rustc call ld itself with the C runtime's start files.
+#[test]
+fn debian_cargo_builds_and_tests_a_project() {
+    let root = fetched_root("rust");
+    let proj = format!("tmp/fwe-cargo-{}", std::process::id());
+    let dir = root.join(&proj);
+    let _ = std::fs::remove_dir_all(&dir);
+    for d in ["src", "util/src", ".cargo"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nutil = { path = \"util\" }\n",
+        ),
+        (
+            "util/Cargo.toml",
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "util/src/lib.rs",
+            "/// The primes below `n`, by a sieve.\n\
+             pub fn primes(n: usize) -> Vec<usize> {\n\
+             \x20   let mut sieve = vec![true; n];\n\
+             \x20   (2..n).filter(|&i| {\n\
+             \x20       if sieve[i] { (i * i..n).step_by(i).for_each(|j| sieve[j] = false); }\n\
+             \x20       sieve[i]\n\
+             \x20   }).collect()\n\
+             }\n\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   #[test]\n\
+             \x20   fn small_primes() { assert_eq!(super::primes(12), [2, 3, 5, 7, 11]); }\n\
+             }\n",
+        ),
+        (
+            "src/main.rs",
+            "fn main() {\n\
+             \x20   let p = util::primes(100_000);\n\
+             \x20   let sums: Vec<_> = p.chunks(p.len() / 4 + 1).map(|c| c.to_vec())\n\
+             \x20       .map(|c| std::thread::spawn(move || c.iter().sum::<usize>())).collect();\n\
+             \x20   let sum: usize = sums.into_iter().map(|t| t.join().unwrap()).sum();\n\
+             \x20   println!(\"{} primes below 100000, the last {}, summing to {sum}\", p.len(), p.last().unwrap());\n\
+             }\n",
+        ),
+    ];
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    // rustc calls GNU ld directly, with what gcc would add around it.
+    let (gcc, lib) = ("/usr/lib/gcc/aarch64-linux-gnu/12", "/usr/lib/aarch64-linux-gnu");
+    let link = format!(
+        "-dynamic-linker /lib/ld-linux-aarch64.so.1 {lib}/Scrt1.o {lib}/crti.o \
+         {gcc}/crtbeginS.o -L{gcc} -L{lib} -lgcc_s -lc {gcc}/crtendS.o {lib}/crtn.o"
+    );
+    std::fs::write(
+        dir.join(".cargo/config.toml"),
+        format!(
+            "[target.aarch64-unknown-linux-gnu]\n\
+             linker = \"/usr/bin/aarch64-linux-gnu-ld.bfd\"\n\
+             rustflags = [\"-C\", \"linker-flavor=ld\", \"-C\", \"link-args={link}\"]\n"
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        "set -e\ncd /{proj}\n\
+         cargo build --release --offline -q\n\
+         ./target/release/proj\n\
+         cargo test --offline -q -p util 2>&1\n"
+    );
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("bin/bash"))
+        .args(["-c", &script])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/tmp")
+        .stdin(Stdio::null());
+    // About 20 s alone: each rustc is a fresh fwe that prepares over 140 MB
+    // of code (rustc's driver and LLVM) before LLVM compiles the crates.
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("--- cargo stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("9592 primes below 100000, the last 99991, summing to 454396537\n"),
+        "{text}"
+    );
+    assert!(text.contains("running 1 test\n.\n"), "{text}");
+    assert!(text.contains("test result: ok. 1 passed; 0 failed"), "{text}");
     assert_eq!(out.status.code(), Some(0));
 }
 

@@ -191,9 +191,15 @@ fn find_region(
     let mut last_error = String::from("no candidate in range");
     let after = (hi + page - 1) & !(page - 1);
     let before = (lo & !(page - 1)).saturating_sub(size);
-    let candidates = (0..64u64)
-        .flat_map(|k| [after + k * PLACEMENT_STEP, before.saturating_sub(k * PLACEMENT_STEP)]);
-    for r in candidates.filter(|&r| r != 0 && reachable(r)) {
+    // Outward from the code in both directions, over the whole window the
+    // sites can reach: around a large library the nearest megabytes are
+    // often taken (by its own reservation, its neighbours and earlier stub
+    // regions).
+    let steps = 2 * BRANCH_RANGE / PLACEMENT_STEP;
+    let candidates = (0..steps).flat_map(|k| {
+        [after.checked_add(k * PLACEMENT_STEP), before.checked_sub(k * PLACEMENT_STEP)]
+    });
+    for r in candidates.flatten().filter(|&r| r != 0 && reachable(r)) {
         match reserve_fixed(r, size) {
             Ok(()) => {
                 fwe_kernel::mm::track(r, size);
