@@ -189,6 +189,27 @@ Stubs are placed in regions within `b` range (128 MiB) of their sites: the
 arena reserved after the loaded image, or, for code mapped later, regions
 found by probing near the code.
 
+Memory the guest maps both writable and executable — what a JIT compiler
+writes its code into, such as PCRE2's in `git grep` — macOS never maps so
+(it refuses `PROT_WRITE | PROT_EXEC` without `MAP_JIT`). The kernel keeps
+such memory writable only and records it (`crates/kernel/src/mm.rs`). In
+the native backend the guest's first instruction fetch from a page faults:
+the page's code is prepared as any guest code is and the page becomes
+read-execute; a later write to it faults and makes it read-write again,
+and so on. Preparing code twice is harmless (a rewritten site no longer
+matches), and the guest's own cache maintenance, which EL0 may do on macOS
+as on Linux, makes what it wrote visible. A write fwe makes for the guest
+(a `read` into such a page, say) switches the page in the same way. In the
+hypervisor backend the VM maps the memory writable and executable at stage
+2, so nothing faults.
+
+`mrs <Xt>, ctr_el0`, the cache type register that code flushing the caches
+reads (git's own copy of the compiler runtime's cache flush, for one), is
+allowed at EL0 on Linux and trapped on macOS. The native backend emulates
+it in its `SIGILL` handler, reporting Apple Silicon's value as Linux shows
+it there without the bits that allow skipping cache maintenance
+(`crates/native/src/hwcap.rs`).
+
 ## System call path
 
 1. The guest executes a rewritten `brk`. macOS delivers `SIGTRAP` on the
@@ -267,6 +288,12 @@ or to `pipe:[ino]`, `socket:[ino]` or `anon_inode:[eventfd]` and the like,
 and opening one reopens the file or, for an object with no path,
 duplicates the descriptor. An unknown path under `/proc` or `/sys` is
 `ENOENT`.
+
+`/dev` is the rootfs's, except for what Linux always mounts there: `null`,
+`zero`, `random`, `urandom` and `tty` resolve to the host's own nodes
+(`crates/kernel/src/fs.rs`; a rootfs unpacked without privileges has no
+device nodes), and `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`
+are links into `/proc/self/fd`.
 
 ## Processes
 
@@ -525,6 +552,13 @@ cannot regain them. `chown` as virtual root is accepted but does not change
 host ownership (shadow ownership is not tracked), and `access` under a
 virtual root bypasses the permission bits as Linux root does.
 
+Host user and group ids the guest sees — a file's owner from `stat`, a
+signal's sender, a child in `waitid` — are mapped as a rootless container's
+user namespace maps them (`host::uid_to_linux`): the host user fwe runs as
+is root (0), and every other id is the overflow id 65534 (`nobody`). So a
+guest running as its default root owns the files it creates, which is what
+git's check that a repository belongs to its user relies on.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -565,12 +599,21 @@ those items.
   `/proc/self/fd` entry for a pipe or socket shares the original's file
   description rather than getting a new one.
 - **Memory:** `MADV_DONTNEED` on a private file mapping keeps modified pages
-  where Linux would restore the file's.
+  where Linux would restore the file's. In the native backend, writable and
+  executable memory takes a fault each time a page goes from being written
+  to being run or back, which is slow for code that does both to one page
+  often; a host system call writing into such a page while it is
+  executable (a `read` into it, for one) fails with `EFAULT`.
+- **Filesystem:** of `/dev`, only `null`, `zero`, `random`, `urandom`,
+  `tty` and the `/proc/self/fd` links are provided; their `stat` reports
+  the host's device numbers. File owners other than fwe's own user read as
+  65534, and a `chown` does not show in a later `stat`.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a signal left pending
   while blocked loses its sender on macOS, so `rt_sigtimedwait` then
-  reports `si_pid` 0; `rt_sigqueueinfo` is not implemented; a signal that
+  reports `si_pid` 0 (except `SIGCHLD`, whose child fwe looks up with a
+  `waitid` that does not reap it); `rt_sigqueueinfo` is not implemented; a signal that
   arrives between a blocking call's start and its host wait can be noticed
   only when the call ends, except for `rt_sigsuspend`, `rt_sigtimedwait`
   and the masked waits, which close that window; a futex wait notices a

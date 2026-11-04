@@ -182,6 +182,8 @@ impl<P: Platform> Kernel<P> {
             nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
             nr::MKDIRAT => self.sys_mkdirat(a[0], a[1], a[2]),
             nr::UNLINKAT => self.sys_unlinkat(a[0], a[1], a[2]),
+            // arm64 keeps the flagless form, which glibc's `rename` uses.
+            nr::RENAMEAT => self.sys_renameat2(a[0], a[1], a[2], a[3], 0),
             nr::RENAMEAT2 => self.sys_renameat2(a[0], a[1], a[2], a[3], a[4]),
             nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),

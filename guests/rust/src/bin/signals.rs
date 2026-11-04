@@ -264,10 +264,15 @@ fn main() {
             println!("{}", describe(wait_status(pid)));
         }
         // SIGCHLD reaches a handler, with the exit status.
-        "sigchld" => {
+        // `sigchld-late`: the child has exited, and its SIGCHLD waited
+        // blocked, before the parent waits for it.
+        "sigchld" | "sigchld-late" => {
             catch(SIGCHLD, 0);
             block(&[SIGCHLD]);
             let pid = child(|| 3);
+            if scenario == "sigchld-late" {
+                std::thread::sleep(Duration::from_millis(300));
+            }
             suspend_until_hit();
             println!(
                 "SIGCHLD from child: {}, status {}",
@@ -471,6 +476,44 @@ fn main() {
             println!("{}", describe(wait_status(pid)));
         }
         "spawned" => println!("hello from the spawned child"),
+        // Code written into writable and executable memory, as a JIT
+        // compiler does: run, rewritten in place and run again, one piece
+        // making a system call itself. Then the cache type register, which
+        // code that flushes the caches reads.
+        "jit" => {
+            // SAFETY: a fresh anonymous mapping, PROT_READ | WRITE | EXEC.
+            let code = unsafe { mmap(std::ptr::null_mut(), 16384, 7, 0x22, -1, 0) };
+            assert!(!code.is_null() && code as isize != -1, "mmap failed");
+            let run = |words: &[u32]| -> u64 {
+                // SAFETY: writing instructions into the mapping, then making
+                // them visible to instruction fetch as Linux requires.
+                unsafe {
+                    let w = code.cast::<u32>();
+                    for (i, &word) in words.iter().enumerate() {
+                        w.add(i).write_volatile(word);
+                    }
+                    for i in 0..words.len() {
+                        let at = w.add(i);
+                        std::arch::asm!("dc cvau, {0}", "dsb ish", "ic ivau, {0}", in(reg) at);
+                    }
+                    std::arch::asm!("dsb ish", "isb");
+                    let f: extern "C" fn() -> u64 = std::mem::transmute(code);
+                    f()
+                }
+            };
+            let ret = 0xd65f_03c0; // ret
+            let first = run(&[0x5280_0540, ret]); // mov w0, #42
+            let second = run(&[0x5280_00e0, ret]); // mov w0, #7
+            // mov x8, #172 (getpid); svc #0
+            let pid = run(&[0xd280_1588, 0xd400_0001, ret]);
+            // SAFETY: plain call.
+            let mine = unsafe { getpid() } as u64;
+            let ctr: u64;
+            // SAFETY: reading the cache type register.
+            unsafe { std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr) };
+            println!("jit: {first} {second}, getpid matches: {}", pid == mine);
+            println!("ctr_el0 has cache lines: {}", ctr & 0xf != 0 && (ctr >> 16) & 0xf != 0);
+        }
         // fork from a process with another thread running.
         "threaded-fork" => {
             let stop = std::sync::Arc::new(AtomicBool::new(false));

@@ -324,7 +324,8 @@ pub fn do_waitid(regs: &Regs) -> i64 {
     if infop != 0 {
         let mut words = [0i32; 32]; // a 128-byte siginfo_t
         // SAFETY: `si` was filled by the host.
-        let (pid, uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+        let (pid, uid, status) =
+            unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
         if pid != 0 {
             let code = si.si_code;
             let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {

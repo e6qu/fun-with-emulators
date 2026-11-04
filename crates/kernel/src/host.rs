@@ -3,7 +3,7 @@
 //! Host values come from the `libc` crate, so this module compiles on any
 //! Unix host; on Linux hosts most translations are the identity.
 
-use fwe_abi::{clock, errno as le, fcntl, resource, signal};
+use fwe_abi::{clock, errno as le, fcntl, resource, signal, wait};
 
 /// The calling thread's host `errno`.
 pub fn last_errno() -> i32 {
@@ -118,6 +118,26 @@ pub fn last_error() -> i64 {
 pub fn ret(r: impl Into<i64>) -> i64 {
     let r = r.into();
     if r < 0 { last_error() } else { r }
+}
+
+/// The id Linux reports for an id that has no mapping into a user namespace
+/// (`/proc/sys/kernel/overflowuid`): `nobody`.
+pub const OVERFLOW_ID: u32 = 65534;
+
+/// The guest's view of host user id `uid` (a file's owner, a signal's
+/// sender): as in a rootless container's user namespace, the host user fwe
+/// runs as is root in the guest, whose default identity is root too, and
+/// every other user is [`OVERFLOW_ID`].
+pub fn uid_to_linux(uid: u32) -> u32 {
+    // SAFETY: plain host call.
+    if uid == unsafe { libc::geteuid() } { 0 } else { OVERFLOW_ID }
+}
+
+/// [`uid_to_linux`] for group ids: fwe's own group is the guest's root
+/// group.
+pub fn gid_to_linux(gid: u32) -> u32 {
+    // SAFETY: plain host call.
+    if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID }
 }
 
 /// Host clock for a Linux clock id.
@@ -390,6 +410,60 @@ pub fn si_code_to_linux(code: i32) -> i32 {
         }
     }
     code
+}
+
+/// The Linux `siginfo` fields `(si_code, si_pid, si_uid, si_status)` of
+/// host signal `sig` delivered with `info`.
+///
+/// macOS empties the `siginfo` of a signal left pending while blocked. For
+/// `SIGCHLD` the child it is about is then found with a `waitid` that
+/// neither blocks nor reaps (`WNOHANG | WNOWAIT`), so the guest still learns
+/// which child changed state and how, as Linux tells it.
+///
+/// # Safety
+/// `info` is the `siginfo_t` the host passed a `SA_SIGINFO` handler.
+pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i32, i32, u32, i32) {
+    // SAFETY: guaranteed by the caller.
+    let (mut code, mut pid, mut uid, mut status) =
+        unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+    if sig == libc::SIGCHLD && pid == 0 {
+        let saved = last_errno();
+        // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
+        // only inspects children.
+        let child = unsafe {
+            let mut si: libc::siginfo_t = std::mem::zeroed();
+            let how = libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED;
+            (libc::waitid(libc::P_ALL, 0, &mut si, how | libc::WNOHANG | libc::WNOWAIT) == 0
+                && si.si_pid() != 0)
+                .then_some(si)
+        };
+        if let Some(si) = child {
+            // SAFETY: filled in by the host.
+            (code, pid, uid, status) =
+                unsafe { (si.si_code, si.si_pid(), si.si_uid(), si.si_status()) };
+        }
+        set_errno(saved);
+    }
+    let code = si_code_to_linux(code);
+    let killed = matches!(code, wait::CLD_KILLED | wait::CLD_DUMPED | wait::CLD_STOPPED);
+    if sig == libc::SIGCHLD && killed {
+        status = signal_to_linux(status) as i32;
+    }
+    (code, pid, uid_to_linux(uid), status)
+}
+
+/// Set the calling thread's host `errno`.
+fn set_errno(value: i32) {
+    // SAFETY: writing this thread's errno.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = value
+    };
+    // SAFETY: as above.
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        *libc::__errno_location() = value
+    };
 }
 
 /// The microseconds of a host `timeval`: `i32` on macOS, `i64` on Linux.

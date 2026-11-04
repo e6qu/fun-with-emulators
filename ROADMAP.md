@@ -12,8 +12,8 @@ describes how the pieces work and lists the current limitations in detail.
 **Status (November 2026):** M0 and M1 are done. M2 is in progress: its
 system-call surface is implemented, and the hypervisor backend runs
 low-address executables with threads, `fork` and `execve`; what remains is
-Debian's Python, the `x18` and code-discovery gaps, and running the listed
-software end to end.
+Debian's Python, the `x18` and code-discovery gaps, and running the rest of
+the listed software end to end (git runs).
 
 ## M0 — Foundation (done)
 
@@ -113,8 +113,10 @@ Remaining:
   loads and stores, flag-setting or extended `sp` arithmetic, `casp`,
   pointer-authenticated loads), when a target program needs them
 - [ ] Each of the target programs vendored or fetched as a test with checked
-  output: git, a C compiler, Node, Go, the Rust toolchain, `apt`, a database,
-  a web server
+  output: git (done: Debian's git runs a workflow of commits, branches,
+  merge, stash, rebase, `grep` through PCRE2's JIT, `gc` and a `file://`
+  clone), a C compiler, Node, Go, the Rust toolchain, `apt`, a database, a
+  web server
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.

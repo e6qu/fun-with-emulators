@@ -80,3 +80,29 @@ pub fn detect() -> (u64, u64) {
     }
     (hwcap, hwcap2)
 }
+
+/// What a guest reading `CTR_EL0` gets: macOS traps the read at EL0, which
+/// Linux allows, so the backend emulates it. The value is Apple Silicon's as
+/// Linux reports it there (64-byte instruction and data cache lines, PIPT
+/// instruction cache), minus the `IDC` and `DIC` bits that let a program skip
+/// cache maintenance: the full maintenance it does instead is allowed at EL0
+/// on macOS, so code it writes is always made visible to instruction fetch.
+pub const CTR_EL0: u64 = 0x8444_c004;
+
+/// Whether `word` is `mrs <Xt>, ctr_el0`; then the low five bits are `Xt`.
+pub fn is_mrs_ctr_el0(word: u32) -> bool {
+    word & 0xffff_ffe0 == 0xd53b_0020
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_mrs_ctr_el0() {
+        assert!(is_mrs_ctr_el0(0xd53b_0022)); // mrs x2, ctr_el0
+        assert!(is_mrs_ctr_el0(0xd53b_003f)); // mrs xzr, ctr_el0
+        assert!(!is_mrs_ctr_el0(0xd53b_00e0)); // mrs x0, dczid_el0
+        assert!(!is_mrs_ctr_el0(0xd51b_0020)); // msr
+    }
+}

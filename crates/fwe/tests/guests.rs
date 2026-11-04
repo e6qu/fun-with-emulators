@@ -33,7 +33,13 @@ fn run_bounded(mut cmd: Command) -> Output {
 /// Like [`run_bounded`], but feeds `input` to the guest's standard input
 /// (written on its own thread so a guest that does not read it cannot wedge
 /// the test).
-fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
+fn run_bounded_with_stdin(cmd: Command, input: &[u8]) -> Output {
+    run_bounded_for(cmd, input, GUEST_TIMEOUT)
+}
+
+/// Like [`run_bounded_with_stdin`], with a time limit of `limit` (for a real
+/// program's workload that starts many processes).
+fn run_bounded_for(mut cmd: Command, input: &[u8], limit: Duration) -> Output {
     use std::io::{Read, Write};
     let feed = !input.is_empty();
     if feed {
@@ -67,7 +73,7 @@ fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if start.elapsed() > GUEST_TIMEOUT {
+        if start.elapsed() > limit {
             let _ = child.kill();
             timed_out = true;
             break child.wait().unwrap();
@@ -75,7 +81,7 @@ fn run_bounded_with_stdin(mut cmd: Command, input: &[u8]) -> Output {
         std::thread::sleep(Duration::from_millis(20));
     };
     if timed_out {
-        eprintln!("--- guest timed out after {GUEST_TIMEOUT:?} (killed)");
+        eprintln!("--- guest timed out after {limit:?} (killed)");
     }
     // Readers finish once the pipes close (at process exit).
     let stdout = out_reader.join().unwrap();
@@ -751,6 +757,115 @@ fn debian_bash_runs_a_command() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// Debian's git, the first of M2's target programs, driven by Debian's bash
+/// inside the guest: a repository is created, committed to on two branches,
+/// merged, stashed, rebased, searched (`git grep` compiles its pattern with
+/// PCRE2's JIT, so code written to writable and executable memory runs),
+/// blamed, packed with `gc` and cloned over `file://` (through `/bin/sh` and
+/// `git-upload-pack`). Every object name is fixed by the dates, and each
+/// matches what git on the host makes of the same steps.
+#[test]
+fn debian_git_runs_a_workflow() {
+    let root = std::env::temp_dir().join(format!("fwe-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for dir in ["lib", "bin", "usr/bin", "usr/lib/git-core", "home/u"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    for entry in std::fs::read_dir(debian_root().join("lib")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), root.join("lib").join(entry.file_name())).unwrap();
+    }
+    std::fs::copy(debian_bin("bash"), root.join("bin/bash")).unwrap();
+    std::fs::copy(debian_bin("git"), root.join("usr/bin/git")).unwrap();
+    // As Debian installs them: the shell, and git's helpers as links to git.
+    std::os::unix::fs::symlink("bash", root.join("bin/sh")).unwrap();
+    std::os::unix::fs::symlink("../../bin/git", root.join("usr/lib/git-core/git")).unwrap();
+    std::os::unix::fs::symlink("git", root.join("usr/lib/git-core/git-upload-pack")).unwrap();
+
+    let script = r#"
+        set -e
+        export HOME=/home/u GIT_CONFIG_NOSYSTEM=1
+        export GIT_AUTHOR_DATE=2026-01-01T00:00:00Z GIT_COMMITTER_DATE=2026-01-01T00:00:00Z
+        cd /home/u
+        git init -q -b main repo
+        cd repo
+        git config user.name Tester
+        git config user.email t@example.com
+        printf 'one
+two
+three
+' > a.txt
+        git add a.txt
+        git commit -q -m first
+        git switch -q -c feature
+        printf 'one
+two
+three
+four
+' > a.txt
+        git commit -q -am 'feature: four'
+        git switch -q main
+        printf 'zero
+one
+two
+three
+' > a.txt
+        git commit -q -am 'main: zero'
+        git merge -q --no-edit feature
+        git log --graph --format='%h %s'
+        git tag v1
+        echo scratch >> a.txt
+        git stash -q
+        git stash list
+        git stash pop -q
+        git checkout -q -- a.txt
+        git rebase -q HEAD~1
+        git grep -n two
+        git blame -s a.txt
+        git gc -q
+        git fsck --no-progress --no-dangling
+        cd ..
+        git clone -q file:///home/u/repo clone
+        git -C clone log --format='%h %s'
+        git -C clone status --short --branch
+    "#;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("bin/bash"))
+        .args(["-c", script])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null());
+    // About 12 s alone: git's commands start many git processes, each a
+    // fresh fwe that prepares the 3.7 MB binary's code.
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    eprintln!("--- git stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "Auto-merging a.txt\n\
+         *   add5a56 Merge branch 'feature'\n\
+         |\\  \n\
+         | * 032b22c feature: four\n\
+         * | c45f3f2 main: zero\n\
+         |/  \n\
+         * fc2d461 first\n\
+         stash@{0}: WIP on main: add5a56 Merge branch 'feature'\n\
+         a.txt:3:two\n\
+         c45f3f2b 1) zero\n\
+         ^fc2d461 2) one\n\
+         ^fc2d461 3) two\n\
+         ^fc2d461 4) three\n\
+         2586db8f 5) four\n\
+         2586db8 feature: four\n\
+         c45f3f2 main: zero\n\
+         fc2d461 first\n\
+         ## main...origin/main\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn debian_bash_propagates_exit_status() {
     assert_eq!(run_debian("bash", &["-c", "exit 7"], &[]).status.code(), Some(7));
@@ -972,10 +1087,17 @@ fn signal_from_child_reaches_parent_handler() {
 }
 
 /// A child's exit raises `SIGCHLD` in the parent, carrying the child's pid
-/// and exit status.
+/// and exit status — also when the signal waited blocked until after the
+/// child was gone, which macOS reports with an empty `siginfo`.
 #[test]
 fn sigchld_reaches_handler_with_status() {
-    assert_eq!(signals("sigchld"), "SIGCHLD from child: true, status 3\nexited 3\n");
+    for scenario in ["sigchld", "sigchld-late"] {
+        assert_eq!(
+            signals(scenario),
+            "SIGCHLD from child: true, status 3\nexited 3\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// A timer signal interrupts a blocking `read`: with `SA_RESTART` the read
@@ -1104,6 +1226,18 @@ fn exec_replaces_the_address_space() {
     assert_eq!(signals("vfork-exec"), "hello from the spawned child\nexited 0\n");
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
+
+/// Writable and executable memory, as JIT compilers use it (macOS never maps
+/// memory so): code written there runs, runs again after being rewritten in
+/// place, and may make system calls; `mrs ctr_el0`, which macOS traps at
+/// EL0, reads a cache type.
+#[test]
+fn jit_code_runs_from_writable_executable_memory() {
+    assert_eq!(signals("jit"), JIT);
+}
+
+/// What the `jit` scenario prints.
+const JIT: &str = "jit: 42 7, getpid matches: true\nctr_el0 has cache lines: true\n";
 
 /// `fork` from a process with a second thread running: the child has just
 /// the forking thread and runs normally.
@@ -1441,6 +1575,9 @@ fn hv_runs_low_rust_programs() {
         stdout(&out).ends_with("arg[1]=one\narg[2]=two words\nFWE_GUEST_VAR=from-host\n"),
         "{out:?}"
     );
+    // Writable and executable memory: the VM maps it so, the host never.
+    let out = fwe_hv(&rust_low_guest("signals"), &["jit"]).unwrap();
+    assert_eq!(stdout(&out), JIT);
 }
 
 /// Signals in the VM: handlers for timers, real-time and sent fault signals,

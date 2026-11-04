@@ -14,8 +14,8 @@ fn stat_to_linux(s: &libc::stat) -> Stat {
         st_ino: s.st_ino as u64,
         st_mode: s.st_mode as u32,
         st_nlink: s.st_nlink as u32,
-        st_uid: s.st_uid,
-        st_gid: s.st_gid,
+        st_uid: host::uid_to_linux(s.st_uid),
+        st_gid: host::gid_to_linux(s.st_gid),
         st_rdev: s.st_rdev as u64,
         __pad1: 0,
         st_size: s.st_size as i64,
@@ -45,8 +45,8 @@ fn statx_from(s: &libc::stat) -> Statx {
         stx_blksize: s.st_blksize as u32,
         stx_attributes: 0,
         stx_nlink: s.st_nlink as u32,
-        stx_uid: s.st_uid,
-        stx_gid: s.st_gid,
+        stx_uid: host::uid_to_linux(s.st_uid),
+        stx_gid: host::gid_to_linux(s.st_gid),
         stx_mode: s.st_mode as u16,
         __spare0: 0,
         stx_ino: s.st_ino as u64,
@@ -1070,7 +1070,15 @@ mod tests {
             ),
             0
         );
-        assert_eq!(k.syscall(nr::UNLINKAT, [AT_FDCWD, cstr("/y").as_ptr() as u64, 0, 0, 0, 0]), 0);
+        // The flagless renameat, which glibc's `rename` uses on arm64.
+        assert_eq!(
+            k.syscall(
+                nr::RENAMEAT,
+                [AT_FDCWD, cstr("/y").as_ptr() as u64, AT_FDCWD, cstr("/z").as_ptr() as u64, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(k.syscall(nr::UNLINKAT, [AT_FDCWD, cstr("/z").as_ptr() as u64, 0, 0, 0, 0]), 0);
         assert_eq!(
             k.syscall(
                 nr::NEWFSTATAT,
