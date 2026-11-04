@@ -1055,6 +1055,11 @@ fn fetched_root(manifest: &str) -> PathBuf {
             String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
         };
         if !deb.exists() || sum(&deb) != *sha256 {
+            // Tests fetch at once, and manifests share packages: each
+            // download goes to a name of its own and is renamed into place
+            // once it checks out.
+            let part = cache
+                .join(format!("{}.{manifest}.part", Path::new(pool).display()).replace('/', "_"));
             let fetched = [
                 format!("https://deb.debian.org/debian/{pool}"),
                 format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
@@ -1063,16 +1068,17 @@ fn fetched_root(manifest: &str) -> PathBuf {
             .any(|url| {
                 Command::new("curl")
                     .args(["-fsSL", "--retry", "3", "-o"])
-                    .arg(&deb)
+                    .arg(&part)
                     .arg(url)
                     .status()
                     .is_ok_and(|s| s.success())
-                    && sum(&deb) == *sha256
+                    && sum(&part) == *sha256
             });
             assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
+            std::fs::rename(&part, &deb).unwrap();
         }
         // A .deb is an `ar` archive whose data.tar.* holds the files.
-        let unpack = cache.join("unpack");
+        let unpack = cache.join(format!("unpack-{manifest}"));
         let _ = std::fs::remove_dir_all(&unpack);
         std::fs::create_dir_all(&unpack).unwrap();
         run_checked(Command::new("ar").arg("x").arg(&deb).current_dir(&unpack));
