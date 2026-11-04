@@ -14,6 +14,7 @@ must leave alone (`Elf::exec_file_ranges`).
 | --- | --- |
 | `lib/ld-linux-aarch64.so.1` | The glibc dynamic linker (soname `ld-linux-aarch64.so.1`). The interpreter at run time. |
 | `lib/libc.so.6` | The shared libc (soname `libc.so.6`), mapped by the dynamic linker; also the link target for the guests. |
+| `lib/libm.so.6` | glibc's maths library, needed by the vendored Debian SQLite. |
 | `lib/Scrt1.o`, `lib/crti.o`, `lib/crtn.o` | glibc C runtime startup objects for a PIE, used to link `guests/c/dynhello.c`. |
 | `lib/libc_nonshared.a` | The small static companion glibc links beside `libc.so.6`. |
 | `COPYRIGHT` | Debian's glibc copyright and license summary. |
@@ -23,7 +24,9 @@ must leave alone (`Elf::exec_file_ranges`).
 
 Extracted from Debian 12 (bookworm) `aarch64` packages, glibc `2.36-9+deb12u14`:
 
-- `ld-linux-aarch64.so.1`, `libc.so.6` from `libc6_2.36-9+deb12u14_arm64.deb`
+- `ld-linux-aarch64.so.1`, `libc.so.6`, `libm.so.6` from
+  `libc6_2.36-9+deb12u14_arm64.deb` (SHA-256
+  `01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4`)
 - `Scrt1.o`, `crti.o`, `crtn.o`, `libc_nonshared.a` from
   `libc6-dev_2.36-9+deb12u14_arm64.deb`
 
