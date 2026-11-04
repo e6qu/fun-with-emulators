@@ -579,6 +579,41 @@ pub fn flock_op_to_host(op: u64) -> Option<libc::c_int> {
     Some(if op & fcntl::LOCK_NB != 0 { lock | libc::LOCK_NB } else { lock })
 }
 
+/// The host `openat`, without macOS's spurious `ENOENT` for `O_CREAT`.
+///
+/// On macOS an `O_CREAT` open fails with `ENOENT` when another process is
+/// unlinking the same name at that moment (SQLite's processes do this to
+/// a `-wal` file as each closes). Linux creates the file instead, and fails
+/// an `O_CREAT` open with `ENOENT` only when the directory itself has been
+/// removed, so the open is retried while the directory still exists.
+///
+/// # Safety
+/// `dir` is an open directory descriptor.
+pub unsafe fn openat(
+    dir: libc::c_int,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> libc::c_int {
+    let mut tries = 0;
+    loop {
+        // SAFETY: `name` is NUL-terminated; the caller vouches for `dir`.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, mode) };
+        if fd >= 0 || flags & libc::O_CREAT == 0 || last_errno() != libc::ENOENT || tries == 100 {
+            return fd;
+        }
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor and out parameter.
+        if unsafe { libc::fstat(dir, &mut st) } != 0 || st.st_nlink == 0 {
+            set_errno(libc::ENOENT);
+            return -1;
+        }
+        tries += 1;
+        std::thread::yield_now();
+    }
+}
+
 /// Seconds since the host booted (macOS's `CLOCK_MONOTONIC` counts sleep,
 /// as Linux's boot-time clock does).
 pub fn uptime() -> f64 {

@@ -265,7 +265,9 @@ descriptor that is not open; `dup2` onto one fails the same way, and the
 limit cannot be raised into the range. `stat` results are translated into the arm64 Linux
 layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
 directory position when the translated entries outgrow the guest's buffer.
-Creation modes have the umask applied by the kernel. `fcntl` translates the
+Creation modes have the umask applied by the kernel. An `O_CREAT` open
+that macOS fails with `ENOENT` because another process is unlinking the
+name at that moment is retried, as Linux would have created the file. `fcntl` translates the
 descriptor and status flags, and record locks (`F_GETLK`, `F_SETLK`,
 `F_SETLKW`: the arm64 `struct flock` and its lock types differ from the
 host's); `flock` passes through. Both kinds of lock are the host's, so they

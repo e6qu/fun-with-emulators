@@ -171,9 +171,9 @@ impl<P: Platform> Kernel<P> {
             host_flags |= libc::O_DIRECTORY;
         }
         let mode = if flags & fcntl::O_CREAT != 0 { self.fs().apply_umask(mode as u32) } else { 0 };
-        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+        // SAFETY: `dir` is a live directory fd.
         let fd = unsafe {
-            libc::openat(resolved.dir.as_raw_fd(), name.as_ptr(), host_flags, mode as libc::c_uint)
+            host::openat(resolved.dir.as_raw_fd(), &name, host_flags, mode as libc::c_uint)
         };
         if fd < 0 { last_error() } else { fd as i64 }
     }
@@ -1038,6 +1038,43 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// An `O_CREAT` open succeeds while another process keeps unlinking and
+    /// recreating the name, as on Linux (the macOS host fails such opens
+    /// with `ENOENT` now and then).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn create_survives_a_racing_unlink() {
+        use fwe_abi::fcntl::{O_CLOEXEC, O_CREAT, O_RDWR};
+        let (mut k, dir) = rooted();
+        let host = std::ffi::CString::new(dir.join("f").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the child makes only raw system calls until it is killed.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            loop {
+                // SAFETY: plain host calls on a NUL-terminated path.
+                unsafe {
+                    libc::unlink(host.as_ptr());
+                    let fd = libc::open(host.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o644);
+                    libc::close(fd);
+                }
+            }
+        }
+        let failures = (0..20_000)
+            .filter(|_| {
+                let fd = open(&mut k, &cstr("/f"), O_CREAT | O_RDWR | O_CLOEXEC, 0o644);
+                // SAFETY: closing a test fd (or nothing, on failure).
+                unsafe { libc::close(fd as i32) };
+                fd < 0
+            })
+            .count();
+        // SAFETY: ending and reaping the child forked above.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        assert_eq!(failures, 0);
     }
 
     #[test]
