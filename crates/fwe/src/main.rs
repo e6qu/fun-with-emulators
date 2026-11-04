@@ -18,6 +18,9 @@ options:
   --hv-spike   check that the hypervisor backend can run here: a tiny guest
                in a VM (see docs/hypervisor.md; Apple Silicon, needs the
                entitlement)
+  --hv-standin run the hypervisor backend on a software stand-in for
+               Hypervisor.framework instead of a real VM (for development
+               and tests; needs Unicorn; must come first)
   -h, --help   show this help
   -V, --version
 ";
@@ -25,11 +28,26 @@ options:
 fn main() -> ExitCode {
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
-    if std::env::args_os().nth(1).is_some_and(|a| a == "--hv-fork-child") {
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // First, so it reaches every process fwe starts for the guest.
+    if args.first().is_some_and(|a| a == "--hv-standin") {
+        args.remove(0);
+        if !fwe_native::hv::use_standin() {
+            eprintln!("fwe: --hv-standin needs Apple Silicon macOS");
+            return ExitCode::from(2);
+        }
+    }
+    if args.first().is_some_and(|a| a == "--hv-standin-watch") {
+        // The stand-in's watcher of one VM process; not for direct use.
+        fwe_native::hv::standin_watch(
+            &args.get(1).map(|a| a.to_string_lossy()).unwrap_or_default(),
+        );
+    }
+    if args.first().is_some_and(|a| a == "--hv-fork-child") {
         // A fork child of a VM process (see hv::fork); not for direct use.
         fwe_native::hv::fork_child();
     }
-    let mut args = std::env::args_os().skip(1).peekable();
+    let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {

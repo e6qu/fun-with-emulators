@@ -41,12 +41,17 @@ jobs:
           path: target/debian-packages
           key: debian-packages-${{ hashFiles('guests/debian/fetch/*.txt') }}
       - run: sw_vers && uname -m && clang --version
+      # The VM backend's tests run on the software stand-in for
+      # Hypervisor.framework here, which needs Unicorn.
+      - run: brew install unicorn
       - run: cargo build
       - name: Report hypervisor availability (informational)
         run: |
           echo "kern.hv_support:"; sysctl kern.hv_support 2>&1 || true
-          codesign --sign - --entitlements hypervisor.entitlements --force target/debug/fwe || true
-          if target/debug/fwe --hv-spike; then
+          # A signed copy: the tests' own fwe stays without the entitlement.
+          cp target/debug/fwe target/debug/fwe-hv-probe
+          codesign --sign - --entitlements hypervisor.entitlements --force target/debug/fwe-hv-probe || true
+          if target/debug/fwe-hv-probe --hv-spike; then
             echo "hypervisor: AVAILABLE on this runner"
           else
             echo "hypervisor: unavailable here (expected on GitHub-hosted runners," \

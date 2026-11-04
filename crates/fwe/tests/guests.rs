@@ -2128,11 +2128,13 @@ fn bad_pointers_fail_with_efault() {
 
 // --- The hypervisor backend ------------------------------------------------
 //
-// These run only when asked for (`FWE_HV_TESTS=1`) and where
-// Hypervisor.framework works: a bare-metal Apple Silicon Mac (not GitHub's
-// hosted runners, which are VMs themselves). There `fwe` is copied and signed
-// with the hypervisor entitlement; otherwise the tests report that they were
-// skipped and pass.
+// By default these run on the software stand-in for Hypervisor.framework
+// (`fwe --hv-standin`, which needs Unicorn), with the unsigned `fwe`, which
+// cannot create a real VM at all. Only with `FWE_HV_TESTS=1` do they use the
+// real framework, where it works: a bare-metal Apple Silicon Mac (not
+// GitHub's hosted runners, which are VMs themselves), with `fwe` copied and
+// signed with the hypervisor entitlement. Where neither can run, the tests
+// report that they were skipped and pass.
 
 /// The name of a running process that uses the hypervisor itself (a VM
 /// manager), if any.
@@ -2155,50 +2157,126 @@ fn other_hypervisor_client() -> Option<String> {
         .map(str::to_string)
 }
 
-/// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
-fn hv_fwe() -> Option<&'static Path> {
-    static FWE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    FWE.get_or_init(|| {
-        // Opt-in: the development Mac went down four times while this
-        // backend was built (docs/hypervisor.md), so a plain `cargo test`
-        // never starts a VM. Only a machine whose crash costs nothing (the
-        // self-hosted runner) sets this.
+/// How the VM tests run their programs.
+enum HvMode {
+    /// On the real framework, with this signed copy of `fwe`.
+    Real(PathBuf),
+    /// On the stand-in, with the unsigned `fwe`.
+    Standin,
+}
+
+/// Where Unicorn is, for the stand-in (as `fwe` looks for it).
+fn unicorn_present() -> bool {
+    let named = std::env::var_os("FWE_UNICORN").map(PathBuf::from);
+    named
+        .into_iter()
+        .chain(
+            ["/opt/homebrew/lib/libunicorn.2.dylib", "/usr/local/lib/libunicorn.2.dylib"]
+                .map(PathBuf::from),
+        )
+        .any(|p| p.exists())
+}
+
+/// How this host runs the VM tests, if it can.
+fn hv_mode() -> Option<&'static HvMode> {
+    static MODE: OnceLock<Option<HvMode>> = OnceLock::new();
+    MODE.get_or_init(|| {
+        // The real framework only on request: the development Mac went down
+        // four times while this backend was built (docs/hypervisor.md), so a
+        // plain `cargo test` never starts a VM. Only a machine whose crash
+        // costs nothing (the self-hosted runner) sets this.
         if std::env::var_os("FWE_HV_TESTS").is_none_or(|v| v != "1") {
-            eprintln!("skipped: the VM tests run only with FWE_HV_TESTS=1");
-            return None;
-        }
-        // Never alongside another hypervisor client: three of the crashes
-        // came while one (Podman's krunkit, with nested virtualization) ran
-        // beside these tests (docs/hypervisor.md).
-        if let Some(other) = other_hypervisor_client() {
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) && unicorn_present() {
+                // A second guard besides the stand-in itself: this fwe must
+                // be unable to create a real VM.
+                let sig = Command::new("codesign")
+                    .args(["-d", "--entitlements", "-", env!("CARGO_BIN_EXE_fwe")])
+                    .output()
+                    .unwrap();
+                let sig =
+                    String::from_utf8_lossy(&sig.stdout) + String::from_utf8_lossy(&sig.stderr);
+                assert!(
+                    !sig.contains("com.apple.security.hypervisor"),
+                    "{} carries the hypervisor entitlement; the stand-in tests need one that \
+                     cannot create a VM (rebuild it, or sign a copy instead)",
+                    env!("CARGO_BIN_EXE_fwe")
+                );
+                return Some(HvMode::Standin);
+            }
             eprintln!(
-                "skipped: another hypervisor client is running ({other}); \
-                 stop it (for Podman: `podman machine stop`) to run the VM tests"
+                "skipped: the VM tests need Unicorn for the stand-in (`brew install unicorn`), \
+                 or FWE_HV_TESTS=1 for the real framework"
             );
             return None;
         }
-        let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
-        if String::from_utf8_lossy(&support.stdout).trim() != "1" {
-            return None;
-        }
-        let signed = out_dir().join("fwe-hv");
-        std::fs::create_dir_all(out_dir()).unwrap();
-        std::fs::copy(env!("CARGO_BIN_EXE_fwe"), &signed).unwrap();
-        let ok = Command::new("codesign")
-            .args(["--sign", "-", "--force", "--entitlements"])
-            .arg(repo().join("hypervisor.entitlements"))
-            .arg(&signed)
-            .status()
-            .is_ok_and(|s| s.success());
-        // A host that has the hypervisor but refuses the VM (no
-        // entitlement honoured) also counts as unavailable.
-        let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
-        let mut spike = Command::new(&signed);
-        spike.arg("--hv-spike");
-        let spike = run_vm_bounded(spike);
-        (ok && spike.status.success()).then_some(signed)
+        real_fwe().map(HvMode::Real)
     })
-    .as_deref()
+    .as_ref()
+}
+
+/// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
+fn real_fwe() -> Option<PathBuf> {
+    // Never alongside another hypervisor client: three of the crashes
+    // came while one (Podman's krunkit, with nested virtualization) ran
+    // beside these tests (docs/hypervisor.md).
+    if let Some(other) = other_hypervisor_client() {
+        eprintln!(
+            "skipped: another hypervisor client is running ({other}); \
+             stop it (for Podman: `podman machine stop`) to run the VM tests"
+        );
+        return None;
+    }
+    let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
+    if String::from_utf8_lossy(&support.stdout).trim() != "1" {
+        return None;
+    }
+    let signed = out_dir().join("fwe-hv");
+    std::fs::create_dir_all(out_dir()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_fwe"), &signed).unwrap();
+    let ok = Command::new("codesign")
+        .args(["--sign", "-", "--force", "--entitlements"])
+        .arg(repo().join("hypervisor.entitlements"))
+        .arg(&signed)
+        .status()
+        .is_ok_and(|s| s.success());
+    // A host that has the hypervisor but refuses the VM (no
+    // entitlement honoured) also counts as unavailable.
+    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
+    let mut spike = Command::new(&signed);
+    spike.arg("--hv-spike");
+    let spike = run_vm_bounded(spike);
+    (ok && spike.status.success()).then_some(signed)
+}
+
+/// A command running `fwe` as the VM tests do, or `None` (test skipped)
+/// when this host can run neither the stand-in nor a VM.
+fn hv_command() -> Option<Command> {
+    let Some(mode) = hv_mode() else {
+        eprintln!("skipped: no hypervisor on this host");
+        return None;
+    };
+    Some(match mode {
+        HvMode::Real(fwe) => Command::new(fwe),
+        HvMode::Standin => {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+            cmd.arg("--hv-standin");
+            cmd
+        }
+    })
+}
+
+/// Run a VM test's command: one at a time on the real framework, and
+/// failing on any rule the stand-in saw broken.
+fn run_hv(cmd: Command, what: &str) -> Output {
+    let _one = matches!(hv_mode(), Some(HvMode::Real(_)))
+        .then(|| ONE_VM.lock().unwrap_or_else(|e| e.into_inner()));
+    let out = run_vm_bounded(cmd);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("--- hv {what} stderr:\n{stderr}");
+    if let Some(line) = stderr.lines().find(|l| l.contains("fwe hv stand-in: VIOLATION")) {
+        panic!("{what}: {line}");
+    }
+    out
 }
 
 /// The Rust guests linked at the toolchain's default (low) address, which
@@ -2237,19 +2315,12 @@ fn rust_low_guest(name: &str) -> PathBuf {
 /// uses it, and the tests should not stress it.
 static ONE_VM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Run `program` under the signed `fwe`, or `None` (test skipped) when this
-/// host cannot run the hypervisor backend.
+/// Run `program` in the VM backend (see [`hv_command`]), or `None` (test
+/// skipped) when this host cannot.
 fn fwe_hv(program: &Path, args: &[&str]) -> Option<Output> {
-    let Some(fwe) = hv_fwe() else {
-        eprintln!("skipped: no hypervisor on this host");
-        return None;
-    };
-    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
-    let mut cmd = Command::new(fwe);
+    let mut cmd = hv_command()?;
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
-    let out = run_vm_bounded(cmd);
-    eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
-    Some(out)
+    Some(run_hv(cmd, &program.display().to_string()))
 }
 
 /// Assembly guests linked below 4 GiB run in the VM: system calls, the
@@ -2373,16 +2444,29 @@ fn hv_runs_dynamic_non_pie_glibc_program() {
 
 /// [`fwe_hv`] with a root filesystem.
 fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
-    let Some(fwe) = hv_fwe() else {
-        eprintln!("skipped: no hypervisor on this host");
-        return None;
-    };
-    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
-    let mut cmd = Command::new(fwe);
+    let mut cmd = hv_command()?;
     cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
-    let out = run_vm_bounded(cmd);
-    eprintln!("--- hv {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
-    Some(out)
+    Some(run_hv(cmd, &program.display().to_string()))
+}
+
+/// The stand-in's watcher reports a process that ended with its VM alive,
+/// and stays quiet about one that destroyed it first.
+#[test]
+fn hv_standin_watcher_reports_a_vm_left_alive() {
+    if !matches!(hv_mode(), Some(HvMode::Standin)) {
+        return;
+    }
+    for (life, reported) in [(&b"C"[..], true), (b"CD", false), (b"", false)] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.args(["--hv-standin-watch", "4242"]).stdin(Stdio::null());
+        let out = run_bounded_with_stdin(cmd, life);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.contains("VIOLATION: process 4242 ended or exec'd with its VM alive"),
+            reported,
+            "{life:?}: {stderr}"
+        );
+    }
 }
 
 /// A signal blocked while its handler runs is delivered as soon as the
@@ -2436,8 +2520,7 @@ fn hv_execve_between_backends() {
 
     let root = debian_root();
     std::fs::copy(asm_guest("hello-low"), root.join("hello-low")).unwrap();
-    let _one = ONE_VM.lock().unwrap_or_else(|e| e.into_inner());
-    let mut cmd = Command::new(hv_fwe().unwrap());
+    let mut cmd = hv_command().unwrap();
     cmd.arg("--strace")
         .arg("--root")
         .arg(root)
@@ -2446,8 +2529,7 @@ fn hv_execve_between_backends() {
         .env_clear()
         .env("LD_LIBRARY_PATH", "/lib")
         .env("PATH", "/bin");
-    let out = run_vm_bounded(cmd);
-    eprintln!("--- bash -> vm stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_hv(cmd, "bash -> vm");
     assert_eq!(stdout(&out), "hello from linux\nstatus=0 cwd=/lib\n");
 }
 

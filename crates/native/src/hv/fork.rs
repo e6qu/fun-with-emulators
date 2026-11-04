@@ -511,7 +511,12 @@ fn spawn_child(fds: &[(i32, bool)], entries: &[Port], state: &[u8]) -> Result<i3
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(fwe.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let flag = c"--hv-fork-child";
-    let argv = [path.as_ptr(), flag.as_ptr(), std::ptr::null()];
+    let standin = c"--hv-standin";
+    let argv = if super::standin::active() {
+        [path.as_ptr(), standin.as_ptr(), flag.as_ptr(), std::ptr::null()]
+    } else {
+        [path.as_ptr(), flag.as_ptr(), std::ptr::null(), std::ptr::null()]
+    };
 
     // A receive right of ours becomes the child's bootstrap port.
     let mut rx: Port = 0;

@@ -311,6 +311,8 @@ pub mod region {
         pub start: u64,
         pub size: u64,
         pub protection: c_int,
+        /// The most `protection` may become.
+        pub max_protection: c_int,
         /// A file (an external pager) backs the region.
         file_backed: bool,
         /// The mapping is `MAP_PRIVATE` (inherits by copy). A `MAP_SHARED`
@@ -369,6 +371,7 @@ pub mod region {
             start,
             size,
             protection: basic.protection,
+            max_protection: basic.max_protection,
             file_backed: ext.external_pager != 0,
             private: basic.inheritance == VM_INHERIT_COPY,
         })

@@ -14,7 +14,8 @@ fwe (crates/fwe)            the command line; end-to-end tests
  │    ├── threads      clone: a host thread per guest thread
  │    ├── process      fork and vfork, execve, wait4, waitid
  │    ├── hwcap        AT_HWCAP/AT_HWCAP2 from the host CPU
- │    └── hv           the hypervisor backend: VM, vCPU loop, loader
+ │    └── hv           the hypervisor backend: VM, vCPU loop, loader, and a
+ │                     software stand-in for Hypervisor.framework
  ├── kernel layer (crates/kernel)
  │    Linux system call semantics on top of the host, behind `Platform`
  ├── elf (crates/elf)   ELF64 parsing and load planning, host-independent

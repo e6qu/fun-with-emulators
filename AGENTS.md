@@ -41,12 +41,19 @@ runners. The end-to-end tests build the guests into `target/guests` and need
 `clang` from the Xcode command line tools.
 
 The hypervisor backend needs the hypervisor entitlement and a bare-metal
-Apple Silicon host. Its end-to-end tests (`hv_*`) sign a copy of `fwe`
-themselves and run only with `FWE_HV_TESTS=1` on such a Mac; otherwise they
-skip. The self-hosted `hypervisor` job sets it. Do not set it, or run a VM
-program by hand, on the development Mac: it went down four times while this
-backend was built (see [docs/hypervisor.md](docs/hypervisor.md)). To run a
-low-linked program by hand on a machine meant for it:
+Apple Silicon host. Its end-to-end tests (`hv_*`) run on a software
+stand-in for Hypervisor.framework (`fwe --hv-standin`, which needs
+`brew install unicorn`), and on the real framework only with
+`FWE_HV_TESTS=1`, which the self-hosted `hypervisor` job sets. Do not set it,
+or run a VM program by hand, on the development Mac: it went down four times
+while this backend was built (see [docs/hypervisor.md](docs/hypervisor.md)).
+On the stand-in, by hand:
+
+```sh
+target/debug/fwe --hv-standin ./program-linked-low
+```
+
+To run a low-linked program on the real framework, on a machine meant for it:
 
 ```sh
 cargo build --release -p fwe

@@ -96,10 +96,10 @@ about fwe or the hypervisor in the system log. So `krunkit` running
 alongside is not needed for a crash, and a VM that fails to map memory and
 is then destroyed joins the suspects.
 
-Since then **the VM tests run only when asked for** (`FWE_HV_TESTS=1`),
-which only a machine whose crash costs nothing should set; a plain `cargo
-test` never starts a VM. Everything else the backend does to stay clear of
-the crash:
+Since then **a plain `cargo test` never starts a VM**: the VM tests run on
+a software stand-in for the framework (below), and on the real one only when
+asked for (`FWE_HV_TESTS=1`), which only a machine whose crash costs nothing
+should set. Everything else the backend does to stay clear of the crash:
 
 - **Every way out tears the VM down first:** `exit_group`, the last thread's
   `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
@@ -168,6 +168,45 @@ The child maps the memory, rebuilds the kernel (and the kqueues behind
 same guest mappings and resumes after the `svc` with `x0` = 0. See
 [architecture.md](architecture.md#processes) for the state carried over.
 
+## The stand-in
+
+`fwe --hv-standin` runs the backend on a software stand-in for
+Hypervisor.framework (`crates/native/src/hv/standin.rs`): every framework
+call the backend makes goes to an emulated CPU instead, Unicorn (QEMU's CPU
+emulator as a library, `brew install unicorn`), loaded only in this mode. It
+creates no VM, so it is safe on any Mac and runs in hosted CI; the flag is
+passed on to every fwe a guest's `execve`, `fork` or `vfork` starts.
+
+It models what the backend relies on: one VM per process and one vCPU per
+thread; stage 2 as exactly the memory mapped with `hv_vm_map`, with its
+flags; stage 1 as fwe's own tables, read from guest memory at the first run
+and checked to be the identity; exceptions at EL0 going through the vector
+to `hvc` with `ESR_EL1` and the other EL1 registers set, and direct exits for
+stage-2 aborts, `wfi`/`wfe` and the physical counter; `hv_vcpus_exit` from
+any thread or signal handler. Only one vCPU emulates at a time, handed on
+every few milliseconds.
+
+And it checks the rules the backend must keep, printing a line with
+`fwe hv stand-in: VIOLATION:` on which the tests fail: a vCPU used from a
+thread other than its own, a VM destroyed with vCPUs alive, a vCPU run
+before its translation regime is set or leaving EL0, and — through a
+watcher process started with the VM — a process that ends or execs with its
+VM alive. A refused `hv_vm_map` is reported too, and fails as the framework
+fails it: misaligned (16 KiB), overlapping, or over host memory that is not
+mapped or could never be readable and writable. That last rule is inferred,
+not documented: the framework mapped memory whose most was RWX or RW
+(executable included) but refused a `vfork` child's shared code, which
+could only ever be read. The stand-in reproduces that failure.
+
+A stand-in proves nothing about the real framework. Its own rules are what
+fwe has seen the framework do, and the kernel crashes the backend may cause
+cannot happen in it. So VM changes are also run on real hardware now and
+then, on a machine whose crash costs nothing, instrumented so that a crash
+can be traced. Not modelled: the virtual timer, the fault address of an
+alignment fault outside the exclusive and atomic instructions, stack-pointer
+alignment checks, and code one vCPU writes for another without a mapping
+change. `FWE_STANDIN_DEBUG=1` reports each exception and exit it models.
+
 ## Running it (Apple Silicon, no root)
 
 ```sh
@@ -185,10 +224,13 @@ reports the status 42 the guest exits with. `sysctl kern.hv_support` must be
 
 ## Tests and CI
 
-The end-to-end tests whose names start with `hv_` sign a copy of `fwe` with the
-entitlement and run low-linked programs in the VM, one test at a time. They
-run only with `FWE_HV_TESTS=1`; without it, or where the host has no
-hypervisor, they report that they were skipped and pass.
+The end-to-end tests whose names start with `hv_` run low-linked programs in
+the VM backend. By default they use the stand-in, with the unsigned `fwe`,
+which could not create a real VM even by mistake (the tests check it carries
+no entitlement). With `FWE_HV_TESTS=1` they sign a copy of `fwe` with the
+entitlement and use the real framework, one test at a time. Where neither
+can run (no Unicorn; no hypervisor), they report that they were skipped and
+pass.
 
 GitHub's hosted macOS runners are themselves virtual machines without nested
 virtualization, so Hypervisor.framework is unavailable there. This is
@@ -200,9 +242,9 @@ reports it:
 - Both: `hv_vm_create` returns `0xfae9400f` (`HV_UNSUPPORTED`), even though the
   binary is correctly signed with the entitlement.
 
-So in hosted CI the backend is compiled and lint-checked (it cannot rot) but
-its tests skip. They run for real on a **self-hosted Apple Silicon runner**,
-in the `hypervisor` job.
+So in hosted CI the backend's tests run on the stand-in, and on the real
+framework only on a **self-hosted Apple Silicon runner**, in the
+`hypervisor` job.
 
 ### Registering the self-hosted runner (one time)
 

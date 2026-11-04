@@ -21,6 +21,10 @@
 //! alive (see `docs/hypervisor.md`): a guest `fork` or `vfork` starts a
 //! fresh fwe process that takes the parent's memory copy-on-write (see
 //! [`fork`]).
+//!
+//! Under `--hv-standin` every framework call goes to a software stand-in
+//! instead ([`standin`]), which creates no VM: what the tests use unless
+//! asked for the real framework.
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod backend;
@@ -29,6 +33,8 @@ mod ffi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod fork;
 pub mod spike;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod standin;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vm;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -47,3 +53,34 @@ pub fn fork_child() -> ! {
     std::process::exit(2)
 }
 pub use spike::{Spike, spike};
+
+/// Use the software stand-in for Hypervisor.framework from now on; false
+/// where there is no VM backend.
+pub fn use_standin() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        standin::enable();
+        true
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    false
+}
+
+/// `fwe --hv-standin-watch <pid>` (see [`standin`]).
+pub fn standin_watch(pid: &str) -> ! {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    standin::watch(pid);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = pid;
+        std::process::exit(2)
+    }
+}
+
+/// Whether the VM backend uses the software stand-in (`--hv-standin`).
+pub fn standin_active() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return standin::active();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    false
+}
