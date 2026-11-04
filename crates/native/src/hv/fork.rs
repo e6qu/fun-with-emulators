@@ -404,6 +404,9 @@ pub(super) fn fork(
         backend::pause_others();
         let mut e = Enc::new();
         save_regs(&mut e, parent);
+        for k in backend::thread_keys() {
+            e.u64(k);
+        }
         e.u64(tpidr);
         e.u64(vtimer_offset);
         e.u64(flags);
@@ -734,6 +737,13 @@ fn become_child() -> Result<std::convert::Infallible, String> {
         }
     }
     let mut regs = read_regs(&mut d);
+    // The forking thread's pointer-authentication keys, which the child
+    // keeps, as on Linux.
+    let mut keys = [0u64; 10];
+    for k in &mut keys {
+        *k = d.u64();
+    }
+    backend::set_thread_keys(keys);
     let tpidr = d.u64();
     let vtimer_offset = d.u64();
     let flags = d.u64();

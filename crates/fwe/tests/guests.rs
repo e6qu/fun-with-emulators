@@ -156,6 +156,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
 }
 
 const ASM_GUESTS: &[&str] = &[
+    "pacbti",
     "hello",
     "exit42",
     "enosys",
@@ -2475,6 +2476,30 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     let mut cmd = hv_command()?;
     cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
     Some(run_hv(cmd, &program.display().to_string()))
+}
+
+/// Pointer authentication and BTI in the VM, as Linux gives them to a
+/// program: keys of its own (kept by a fork child, changed by
+/// `PR_PAC_RESET_KEYS`), its code mapped guarded when it is built for BTI,
+/// and SIGILL for an indirect branch to no landing pad. The stand-in's CPU
+/// offers both; on a real VM a feature it lacks is reported as such.
+#[test]
+fn hv_pointer_authentication_and_bti() {
+    let Some(out) = fwe_hv(&asm_guest("pacbti-low"), &[]) else { return };
+    let text = stdout(&out);
+    let pac = "pac: a signed pointer authenticates\n\
+               pac: a fork child has its parent's keys\n\
+               pac: new keys sign differently\n";
+    let bti = "bti: a branch to a landing pad goes on\n\
+               bti: a branch to no landing pad raises SIGILL\n";
+    if matches!(hv_mode(), Some(HvMode::Standin)) {
+        assert_eq!(text, format!("{pac}{bti}"));
+    } else {
+        let pac_ok = text.starts_with(pac) || text.starts_with("pac: not offered\n");
+        let bti_ok = text.ends_with(bti) || text.ends_with("bti: not offered\n");
+        assert!(pac_ok && bti_ok, "{text}");
+    }
+    assert_eq!(out.status.code(), Some(0), "{text}");
 }
 
 /// The stand-in's watcher reports a process that ended with its VM alive,

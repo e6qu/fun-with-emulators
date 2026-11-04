@@ -379,8 +379,9 @@ struct Placed {
 /// Load `elf` into the guest's memory: a non-PIE image at its link address
 /// (backed by slab memory elsewhere when that address is outside the slab,
 /// and translated), a PIE one wherever there is room. Its pages get the
-/// segments' protections; the gaps between segments are left inaccessible.
-fn place(elf: &Elf<'_>) -> Result<Placed, Error> {
+/// segments' protections, its code `PROT_BTI` with `bti`; the gaps between
+/// segments are left inaccessible.
+fn place(elf: &Elf<'_>, bti: bool) -> Result<Placed, Error> {
     let plan = LoadPlan::new(elf, PAGE);
     let rw = mman::PROT_READ | mman::PROT_WRITE;
     let guest = if elf.is_pie() {
@@ -399,7 +400,11 @@ fn place(elf: &Elf<'_>) -> Result<Placed, Error> {
         .map_err(|e| mem_error("protecting the image", e))?;
     for run in &plan.runs {
         let off = run.start - plan.start;
-        mem::protect(guest + off, run.len, prot_of(run.prot))
+        let mut prot = prot_of(run.prot);
+        if bti && prot & mman::PROT_EXEC != 0 {
+            prot |= mman::PROT_BTI;
+        }
+        mem::protect(guest + off, run.len, prot)
             .map_err(|e| mem_error("protecting the image", e))?;
     }
     let (_, hi) = elf.bounds();
@@ -492,7 +497,17 @@ fn start(
 
     let elf = Elf::parse(data).map_err(Error::Elf)?;
     mem::init();
-    let exe = place(&elf)?;
+    // The first vCPU now: it tells what the VM offers (BTI decides how the
+    // images are mapped).
+    let vcpu = Vcpu::create().map_err(Error::Unsupported)?;
+    let features = vm::features();
+    fwe_kernel::signal::set_bti(features.bti);
+    // BTI as Linux applies it at load: to the interpreter where there is
+    // one (it applies BTI to the program and its libraries itself), else to
+    // a static program; each only if built for BTI.
+    let has_interp = elf.interpreter().map_err(Error::Elf)?.is_some();
+    let built_bti = |e: &Elf<'_>| e.aarch64_features() & fwe_elf::AARCH64_FEATURE_BTI != 0;
+    let exe = place(&elf, features.bti && !has_interp && built_bti(&elf))?;
     let interp = match elf.interpreter().map_err(Error::Elf)? {
         Some(ip) => {
             let idata = fs.read(ip).map_err(|e| {
@@ -507,7 +522,7 @@ fn start(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            Some(place(&ielf)?)
+            Some(place(&ielf, features.bti && built_bti(&ielf))?)
         }
         None => None,
     };
@@ -525,7 +540,18 @@ fn start(
     mem::protect(stack_base, page, mman::PROT_NONE).map_err(|e| mem_error("the stack guard", e))?;
     let stack_top = stack_base + page + STACK_SIZE;
 
-    let (hwcap, hwcap2) = hwcap::detect();
+    let (mut hwcap, mut hwcap2) = hwcap::detect();
+    // The VM's own pointer authentication and BTI, not the host's.
+    hwcap2 &= !fwe_abi::hwcap2::BTI;
+    if features.bti {
+        hwcap2 |= fwe_abi::hwcap2::BTI;
+    }
+    if features.pac {
+        hwcap |= fwe_abi::hwcap::PACA;
+    }
+    if features.pacg {
+        hwcap |= fwe_abi::hwcap::PACG;
+    }
     let (uid, euid, gid, egid) = host::ids();
     let mut aux = vec![
         (auxv::AT_HWCAP, hwcap),
@@ -589,7 +615,6 @@ fn start(
     *kernel() = Some(k);
 
     let regs = Regs { sp: image.sp, pc: entry, ..Regs::default() };
-    let vcpu = Vcpu::create().map_err(Error::Unsupported)?;
     vcpu.run(regs)
 }
 
@@ -628,8 +653,17 @@ impl Vcpu {
         let rc = unsafe { hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()) };
         check(rc, "hv_vcpu_create")?;
         let v = Vcpu { id, exit };
+        // What the VM offers, asked of its first vCPU.
+        let isar1 = v.get_sys(HV_SYS_REG_ID_AA64ISAR1_EL1);
+        let pfr1 = v.get_sys(HV_SYS_REG_ID_AA64PFR1_EL1);
+        let features = vm::set_features(vm::Features::from_id_registers(isar1, pfr1));
         for (reg, value) in vm::system_registers() {
             v.set_sys(reg, value);
+        }
+        if features.pac {
+            for (&reg, value) in HV_SYS_REG_PAC_KEYS.iter().zip(thread_keys()) {
+                v.set_sys(reg, value);
+            }
         }
         // Every vCPU of the process reads the same virtual counter: the
         // first one's offset (or a fork parent's) is everyone's.
@@ -969,9 +1003,71 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     r
 }
 
+// --- Pointer authentication -------------------------------------------------
+
+thread_local! {
+    /// This thread's pointer-authentication keys (APIA, APIB, APDA, APDB,
+    /// APGA; low, high), once made.
+    static KEYS: Cell<Option<[u64; 10]>> = const { Cell::new(None) };
+}
+
+fn random_keys() -> [u64; 10] {
+    let mut b = [0u8; 80];
+    host::fill_random(&mut b);
+    let mut k = [0u64; 10];
+    for (i, w) in k.iter_mut().enumerate() {
+        *w = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    k
+}
+
+/// This thread's keys: a program's first thread gets fresh random ones, as
+/// Linux gives a program at `execve`.
+pub(super) fn thread_keys() -> [u64; 10] {
+    KEYS.with(|c| {
+        let k = c.get().unwrap_or_else(random_keys);
+        c.set(Some(k));
+        k
+    })
+}
+
+/// Give this thread `keys` (a new thread's creator's, a fork parent's), for
+/// its vCPU to take when it is made.
+pub(super) fn set_thread_keys(keys: [u64; 10]) {
+    KEYS.with(|c| c.set(Some(keys)));
+}
+
+/// `prctl(PR_PAC_RESET_KEYS, which, 0, 0, 0)`: new random keys for the
+/// calling thread, all of them for `which` = 0.
+fn pac_reset_keys(vcpu: &Vcpu, a: &[u64; 6]) -> i64 {
+    use fwe_abi::prctl::*;
+    let all = PR_PAC_APIAKEY | PR_PAC_APIBKEY | PR_PAC_APDAKEY | PR_PAC_APDBKEY | PR_PAC_APGAKEY;
+    let f = vm::features();
+    if !f.pac || a[1] & !all != 0 || a[2] != 0 || a[3] != 0 || a[4] != 0 {
+        return err(errno::EINVAL);
+    }
+    let which = if a[1] == 0 { all } else { a[1] };
+    let fresh = random_keys();
+    let mut keys = thread_keys();
+    for bit in 0..5 {
+        if which & (1 << bit) != 0 {
+            keys[bit * 2] = fresh[bit * 2];
+            keys[bit * 2 + 1] = fresh[bit * 2 + 1];
+        }
+    }
+    set_thread_keys(keys);
+    for (&reg, value) in HV_SYS_REG_PAC_KEYS.iter().zip(keys) {
+        vcpu.set_sys(reg, value);
+    }
+    0
+}
+
 /// What a new thread needs to become a guest thread on its own vCPU.
 struct Spawn {
     regs: Regs,
+    /// The creating thread's pointer-authentication keys, which a new
+    /// thread starts with as on Linux.
+    keys: [u64; 10],
     tid: i32,
     tpidr: u64,
     clear_child_tid: u64,
@@ -1007,6 +1103,7 @@ fn clone(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     regs.pc = parent.pc + 4;
     let pending = thread::register(tid);
     let spawn = Box::new(Spawn {
+        keys: thread_keys(),
         regs,
         tid,
         tpidr,
@@ -1045,6 +1142,7 @@ extern "C" fn thread_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     thread::adopt(&spawn.pending);
     thread::set_mask(spawn.sigmask);
     thread::set_clear_child_tid(spawn.clear_child_tid);
+    set_thread_keys(spawn.keys);
     let vcpu = match Vcpu::create() {
         Ok(v) => v,
         Err(e) => fatal(&e),
@@ -1130,6 +1228,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             Ok(a) => clone(vcpu, regs, a),
             Err(e) => err(e),
         },
+        nr::PRCTL if args[0] == fwe_abi::prctl::PR_PAC_RESET_KEYS => pac_reset_keys(vcpu, &args),
         nr::EXECVE => execve(&host_args),
         nr::EXECVEAT => execveat(&host_args),
         nr::WAIT4 => {

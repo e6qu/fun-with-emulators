@@ -365,9 +365,45 @@ fn alloc_host(len: u64) -> Result<u64, String> {
     Ok(p as u64)
 }
 
+/// What the VM offers the guest beyond the base architecture, from its
+/// vCPUs' ID registers (not the host's): pointer authentication of
+/// addresses (`pac`) and generic (`pacg`), and BTI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Features {
+    pub pac: bool,
+    pub pacg: bool,
+    pub bti: bool,
+}
+
+impl Features {
+    /// From `ID_AA64ISAR1_EL1` (APA, API, GPA, GPI) and `ID_AA64PFR1_EL1`
+    /// (BT).
+    pub fn from_id_registers(isar1: u64, pfr1: u64) -> Features {
+        let field = |v: u64, at: u32| (v >> at) & 0xf;
+        Features {
+            pac: field(isar1, 4) != 0 || field(isar1, 8) != 0,
+            pacg: field(isar1, 24) != 0 || field(isar1, 28) != 0,
+            bti: field(pfr1, 0) != 0,
+        }
+    }
+}
+
+static FEATURES: OnceLock<Features> = OnceLock::new();
+
+/// Record what the VM offers (from the first vCPU).
+pub fn set_features(f: Features) -> Features {
+    *FEATURES.get_or_init(|| f)
+}
+
+/// What the VM offers, once a vCPU has been asked.
+pub fn features() -> Features {
+    FEATURES.get().copied().unwrap_or_default()
+}
+
 /// Values for the vCPU's EL1 system registers: the translation regime of
-/// [`super::pagetables`], FP/SIMD enabled at EL0, and EL0 allowed the cache,
-/// timer and `dc zva` operations Linux allows user space.
+/// [`super::pagetables`], FP/SIMD enabled at EL0, EL0 allowed the cache,
+/// timer and `dc zva` operations Linux allows user space, and pointer
+/// authentication and BTI as Linux enables them where the VM offers them.
 pub fn system_registers() -> Vec<(hv_sys_reg_t, u64)> {
     let l = layout().expect("the layout is known once the VM exists");
     let ips = match l.ipa_bits {
@@ -389,6 +425,12 @@ pub fn system_registers() -> Vec<(hv_sys_reg_t, u64)> {
         | (1 << 16)
         | (1 << 18)
         | (1 << 26);
+    let f = features();
+    // EnIA, EnIB, EnDA, EnDB; BT0 (PACIxSP is no landing pad for an
+    // indirect branch through another register, as Linux sets it).
+    let pac = if f.pac { (1 << 31) | (1 << 30) | (1 << 27) | (1 << 13) } else { 0 };
+    let bti = if f.bti { 1 << 35 } else { 0 };
+    let sctlr = sctlr | pac | bti;
     vec![
         (HV_SYS_REG_MAIR_EL1, 0xff), // attribute 0: normal, write-back
         (HV_SYS_REG_TCR_EL1, tcr),

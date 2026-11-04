@@ -265,8 +265,12 @@ fn uc_error(rc: c_int) -> String {
 
 /// Report a broken rule. Async-signal-safe.
 fn violation(msg: &str) {
+    VIOLATIONS.fetch_add(1, SeqCst);
     say("VIOLATION: ", msg);
 }
+
+/// Broken rules seen so far in this process (for the stand-in's own tests).
+static VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// A note that is not a broken rule. Async-signal-safe.
 fn note(msg: &str) {
@@ -365,6 +369,10 @@ struct Vcpu {
     yield_now: AtomicBool,
     /// `TTBR0_EL1`, for walks from hooks.
     ttbr0: AtomicU64,
+    /// Code pages the vCPU has fetched from that are BTI guarded (page
+    /// numbers), so only blocks there pay for the BTI check.
+    guarded: Mutex<std::collections::BTreeSet<u64>>,
+    any_guarded: AtomicBool,
     /// The block hook ended the last emulation (a yield or a cancel).
     hook_stopped: AtomicBool,
     /// Inside `uc_emu_start`.
@@ -860,9 +868,9 @@ fn ipa_host(ipa: u64) -> Option<u64> {
 /// The outcome of a walk.
 #[derive(Debug, Clone, Copy)]
 enum Walked {
-    /// A page: its guest-physical address (with the offset) and what EL0
-    /// may do with it.
-    Page { ipa: u64, perms: u32 },
+    /// A page: its guest-physical address (with the offset), what EL0
+    /// may do with it, and whether it is a BTI guarded page.
+    Page { ipa: u64, perms: u32, guarded: bool },
     /// A translation fault at this level.
     Fault { level: u64 },
 }
@@ -902,7 +910,8 @@ fn walk(ttbr0: u64, va: u64) -> Walked {
         if !uxn {
             perms |= UC_PROT_EXEC;
         }
-        return Walked::Page { ipa: (d & DESC_ADDR) | (va & 0xfff), perms };
+        let guarded = d & (1 << 50) != 0;
+        return Walked::Page { ipa: (d & DESC_ADDR) | (va & 0xfff), perms, guarded };
     }
     unreachable!()
 }
@@ -1075,6 +1084,23 @@ pub fn vcpu_create(
     let cp = CpReg { crn: 1, crm: 0, op0: 3, op1: 0, op2: 0, val: sctlr };
     // SAFETY: writing SCTLR_EL1 through Unicorn's coprocessor-register form.
     unsafe { (a.reg_write)(uc, R_CP_REG, (&cp as *const CpReg).cast()) };
+    // The emulated CPU has EL2 and EL3, and starts in Secure state, where
+    // QEMU traps pointer authentication whatever HCR_EL2 says. Run the
+    // guest as a VM runs: Non-secure (SCR_EL3.NS), EL1 and EL2 AArch64
+    // (SCR_EL3.RW, HCR_EL2.RW), pointer authentication not trapped
+    // (HCR_EL2.API/APK, SCR_EL3.API/APK) — a VM whose ID registers offer
+    // the feature lets its guest use it.
+    let hcr = (1u64 << 41) | (1 << 40) | (1 << 31);
+    let scr = (1u64 << 17) | (1 << 16) | (1 << 10) | 1;
+    for (op1, bits) in [(4, hcr), (6, scr)] {
+        let mut c = CpReg { crn: 1, crm: 1, op0: 3, op1, op2: 0, val: 0 };
+        // SAFETY: reading then writing HCR_EL2 or SCR_EL3 of the engine.
+        unsafe {
+            (a.reg_read)(uc, R_CP_REG, (&mut c as *mut CpReg).cast());
+            c.val |= bits;
+            (a.reg_write)(uc, R_CP_REG, (&c as *const CpReg).cast());
+        }
+    }
 
     let exit_rec = Box::into_raw(Box::new(hv_vcpu_exit_t {
         reason: 0,
@@ -1103,6 +1129,8 @@ pub fn vcpu_create(
         cancel: AtomicBool::new(false),
         yield_now: AtomicBool::new(false),
         ttbr0: AtomicU64::new(0),
+        guarded: Mutex::new(std::collections::BTreeSet::new()),
+        any_guarded: AtomicBool::new(false),
         hook_stopped: AtomicBool::new(false),
         running: AtomicBool::new(false),
         vtimer_offset: AtomicU64::new(0),
@@ -1444,10 +1472,42 @@ fn fetch(d: *mut c_void, pc: u64) -> Option<u32> {
 
 // --- Hooks ----------------------------------------------------------------------
 
-/// At each block: stop if `hv_vcpus_exit` or another vCPU's turn asks.
-extern "C" fn on_block(uc: Uc, _addr: u64, _size: u32, d: *mut c_void) {
+/// At each block: stop if `hv_vcpus_exit` or another vCPU's turn asks, and
+/// check BTI, which Unicorn's TLB hook cannot tell QEMU about: a block
+/// entered by an indirect branch (`PSTATE.BTYPE` set) on a guarded page
+/// must begin with a landing pad compatible with the branch, or the guest
+/// takes a branch target exception, as the hardware raises it. QEMU sets
+/// `BTYPE` as for branches from unguarded pages (a `br` through a register
+/// other than x16 or x17 gives `0b01`, not `0b11`), so `bti c` and
+/// `paciasp` are taken as landing pads there too.
+extern "C" fn on_block(uc: Uc, addr: u64, _size: u32, d: *mut c_void) {
     // SAFETY: the hook's data is its vCPU.
     let v = unsafe { &*d.cast::<Vcpu>() };
+    // Only on a guarded page the vCPU fetched from (confirmed by a walk
+    // below): reading PSTATE at every block would halve the speed.
+    let maybe_guarded = v.any_guarded.load(SeqCst)
+        && v.guarded.lock().unwrap_or_else(|e| e.into_inner()).contains(&(addr >> 12));
+    let btype = if maybe_guarded { (read(uc, R_PSTATE) >> 10) & 3 } else { 0 };
+    if btype != 0 {
+        if let Walked::Page { guarded: true, .. } = walk(v.ttbr0.load(SeqCst), addr) {
+            let insn = fetch_va(v.ttbr0.load(SeqCst), addr).unwrap_or(0);
+            // bti c, bti j, bti jc; paciasp, pacibsp (with SCTLR.BT0 set,
+            // as fwe sets it: not for BTYPE 0b11).
+            let ok = match insn {
+                0xd503_245f => btype != 0b11,
+                0xd503_249f => btype != 0b10,
+                0xd503_24df => true,
+                0xd503_233f | 0xd503_237f => btype != 0b11,
+                _ => false,
+            };
+            if !ok {
+                record(d, Event::El1 { esr: (0x0d << 26) | (1 << 25) | btype, elr: addr, far: 0 });
+                // SAFETY: stopping the engine whose hook this is.
+                unsafe { (api().emu_stop)(uc) };
+                return;
+            }
+        }
+    }
     if v.cancel.load(SeqCst) || v.yield_now.swap(false, SeqCst) {
         v.hook_stopped.store(true, SeqCst);
         // SAFETY: stopping the engine whose hook this is, on its thread.
@@ -1488,7 +1548,11 @@ extern "C" fn on_tlb_fill(uc: Uc, va: u64, t: c_int, out: *mut TlbEntry, d: *mut
     match walk(v.ttbr0.load(SeqCst), addr) {
         Walked::Fault { level } => fault(0x04 | level),
         Walked::Page { perms, .. } if perms & want == 0 => fault(0x0c | 3),
-        Walked::Page { ipa, perms } => {
+        Walked::Page { ipa, perms, guarded } => {
+            if fetching && guarded {
+                v.guarded.lock().unwrap_or_else(|e| e.into_inner()).insert(addr >> 12);
+                v.any_guarded.store(true, SeqCst);
+            }
             // SAFETY: Unicorn passes an entry to fill.
             unsafe { *out = TlbEntry { paddr: ipa, perms } };
             true
@@ -1711,6 +1775,38 @@ fn sysreg_iss(cp: &CpReg, rt: u32, read: bool) -> u64 {
 
 // --- Registers ------------------------------------------------------------------
 
+/// The framework's number for a system register is its encoding,
+/// `op0:op1:CRn:CRm:op2` in 2, 3, 4, 4 and 3 bits: Unicorn's form of it.
+fn cp(reg: hv_sys_reg_t) -> CpReg {
+    let r = u32::from(reg);
+    CpReg {
+        op0: r >> 14 & 3,
+        op1: r >> 11 & 7,
+        crn: r >> 7 & 0xf,
+        crm: r >> 3 & 0xf,
+        op2: r & 7,
+        val: 0,
+    }
+}
+
+fn cp_read(uc: Uc, reg: hv_sys_reg_t) -> u64 {
+    let mut c = cp(reg);
+    // SAFETY: reading a system register of the engine into the record.
+    unsafe { (api().reg_read)(uc, R_CP_REG, (&mut c as *mut CpReg).cast()) };
+    c.val
+}
+
+fn cp_write(uc: Uc, reg: hv_sys_reg_t, val: u64) {
+    let c = CpReg { val, ..cp(reg) };
+    // SAFETY: writing a system register of the engine from the record.
+    unsafe { (api().reg_write)(uc, R_CP_REG, (&c as *const CpReg).cast()) };
+}
+
+/// The `SCTLR_EL1` bits the emulated CPU takes from fwe's value: pointer
+/// authentication's enables and BT0 (the rest is the stand-in's own: no
+/// MMU, as the TLB hook walks the tables).
+const SCTLR_PASSED: u64 = (1 << 31) | (1 << 30) | (1 << 27) | (1 << 13) | (1 << 35);
+
 pub fn vcpu_get_reg(id: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t {
     let Some(v) = own(id, "hv_vcpu_get_reg") else { return HV_BAD_ARGUMENT };
     let e = engine(v);
@@ -1763,6 +1859,9 @@ pub fn vcpu_get_sys_reg(id: hv_vcpu_t, reg: hv_sys_reg_t, value: *mut u64) -> hv
         HV_SYS_REG_ELR_EL1 => e.elr,
         HV_SYS_REG_SPSR_EL1 => e.spsr,
         HV_SYS_REG_FAR_EL1 => e.far,
+        // What the emulated CPU offers (QEMU's `max`): pointer
+        // authentication and BTI among them.
+        HV_SYS_REG_ID_AA64ISAR1_EL1 | HV_SYS_REG_ID_AA64PFR1_EL1 => cp_read(v.uc, reg),
         r => e.sys.get(&r).copied().unwrap_or(0),
     };
     // SAFETY: the caller's out-parameter.
@@ -1783,6 +1882,14 @@ pub fn vcpu_set_sys_reg(id: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) -> hv_retu
         r => {
             if r == HV_SYS_REG_TTBR0_EL1 {
                 v.ttbr0.store(value, SeqCst);
+            }
+            if r == HV_SYS_REG_SCTLR_EL1 {
+                let now = cp_read(v.uc, r);
+                cp_write(v.uc, r, (now & !SCTLR_PASSED) | (value & SCTLR_PASSED));
+            }
+            if HV_SYS_REG_PAC_KEYS.contains(&r) {
+                // The emulated CPU signs and authenticates with them.
+                cp_write(v.uc, r, value);
             }
             e.sys.insert(r, value);
         }
@@ -2022,5 +2129,207 @@ mod tests {
         assert_eq!(vcpus_exit(&mut one, 1), HV_SUCCESS);
         assert_eq!(vcpu_destroy(id), HV_SUCCESS);
         assert_eq!(vm_destroy(), HV_SUCCESS);
+
+        rules_of_a_running_vm();
+    }
+
+    /// Page tables for the small VMs below, in their own guest memory.
+    struct TestPool {
+        host: u64,
+        ipa: u64,
+        next: u64,
+    }
+
+    impl crate::hv::pagetables::Pool for TestPool {
+        fn alloc(&mut self) -> Option<(u64, *mut u64)> {
+            self.next += 0x1000;
+            let ipa = self.ipa + self.next - 0x1000;
+            let h = self.host(ipa);
+            // SAFETY: a page of the test's own memory.
+            unsafe { std::ptr::write_bytes(h, 0, 512) };
+            Some((ipa, h))
+        }
+        fn free(&mut self, _ipa: u64) {}
+        fn host(&self, ipa: u64) -> *mut u64 {
+            (self.host + (ipa - self.ipa)) as *mut u64
+        }
+    }
+
+    const CODE_VA: u64 = 0x40_0000;
+    const VECTORS_VA: u64 = crate::hv::pagetables::VA_LIMIT - 0x1000;
+    const LEN: u64 = 2 << 20;
+
+    /// A VM as fwe sets one up, small: 2 MiB of guest memory at IPA 0 —
+    /// guest code (`svc #0; b .`) at IPA 0, mapped at `CODE_VA`; a vector
+    /// whose entries are `entry; b .` and the TLB stub at IPA 0x4000,
+    /// mapped for EL1 at the top; the tables from IPA 1 MiB — and a vCPU
+    /// set to run the guest code. Its host memory and vCPU.
+    fn small_vm(entry: u32, memory: *mut c_void) -> (u64, hv_vcpu_t) {
+        use crate::hv::pagetables::{PageTables, Perms};
+        assert_eq!(vm_create(std::ptr::null_mut()), HV_SUCCESS);
+        let host = memory as u64;
+        // SAFETY: writing the test's own memory.
+        unsafe {
+            (host as *mut u32).write(0xd400_0001); // svc #0
+            ((host + 4) as *mut u32).write(0x1400_0000); // b .
+            for e in 0..16u64 {
+                ((host + 0x4000 + e * 0x80) as *mut u32).write(entry);
+                ((host + 0x4000 + e * 0x80 + 4) as *mut u32).write(0x1400_0000);
+            }
+            for (i, w) in TLB_STUB.iter().enumerate() {
+                ((host + 0x4800 + 4 * i as u64) as *mut u32).write(*w);
+            }
+        }
+        let all = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+        assert_eq!(vm_map(memory, 0, LEN as usize, all), HV_SUCCESS);
+        let pool = TestPool { host: host + (1 << 20), ipa: 1 << 20, next: 0 };
+        let mut t = PageTables::new(pool).unwrap();
+        let rx = Perms { read: true, write: false, exec: true, guarded: false };
+        let _ = t.map(CODE_VA, 0x1000, 0, rx).unwrap();
+        t.map_el1_code(VECTORS_VA, 0x4000).unwrap();
+        let (mut id, mut exit) = (0, std::ptr::null_mut());
+        assert_eq!(vcpu_create(&mut id, &mut exit, std::ptr::null_mut()), HV_SUCCESS);
+        for (reg, value) in [
+            (HV_SYS_REG_TTBR0_EL1, t.root()),
+            (HV_SYS_REG_TCR_EL1, crate::hv::pagetables::tcr()),
+            (HV_SYS_REG_VBAR_EL1, VECTORS_VA),
+            (HV_SYS_REG_SCTLR_EL1, 1),
+            (HV_SYS_REG_CPACR_EL1, 0b11 << 20),
+        ] {
+            assert_eq!(vcpu_set_sys_reg(id, reg, value), HV_SUCCESS);
+        }
+        assert_eq!(vcpu_set_reg(id, HV_REG_PC, CODE_VA), HV_SUCCESS);
+        assert_eq!(vcpu_set_reg(id, HV_REG_CPSR, 0), HV_SUCCESS);
+        (host, id)
+    }
+
+    fn fresh_memory() -> *mut c_void {
+        map(
+            LEN as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+        )
+    }
+
+    fn end(id: hv_vcpu_t) {
+        assert_eq!(vcpu_destroy(id), HV_SUCCESS);
+        assert_eq!(vm_destroy(), HV_SUCCESS);
+    }
+
+    /// Each rule a running VM must keep, broken on purpose: the stand-in
+    /// reports it. (A VM is one per process: one after the other.)
+    fn rules_of_a_running_vm() {
+        let broken = || VIOLATIONS.load(SeqCst);
+
+        // As fwe runs it: the guest's `svc` reaches the backend through the
+        // vector's `hvc #2`, with ESR_EL1 telling it was an `svc`.
+        let (_, id) = small_vm(0xd400_0042, fresh_memory());
+        let before = broken();
+        assert_eq!(vcpu_run(id), HV_SUCCESS);
+        let mut esr = 0;
+        let _ = vcpu_get_sys_reg(id, HV_SYS_REG_ESR_EL1, &mut esr);
+        assert_eq!(esr >> 26, 0x15, "an svc");
+        assert_eq!(broken(), before, "nothing broken");
+        // Stage 2 may not change once the VM has run.
+        assert_eq!(vm_unmap(0, LEN as usize), HV_SUCCESS);
+        assert_eq!(broken(), before + 1, "the VM's stage 2 changed while it ran");
+        end(id);
+
+        // `hvc #0` in the vector: refused.
+        let (_, id) = small_vm(0xd400_0002, fresh_memory());
+        let before = broken();
+        assert_eq!(vcpu_run(id), HV_ERROR);
+        assert_eq!(broken(), before + 1, "a vector of hvc #0");
+        end(id);
+
+        // EL1 anywhere but fwe's TLB stub: refused.
+        let (_, id) = small_vm(0xd400_0042, fresh_memory());
+        assert_eq!(vcpu_set_reg(id, HV_REG_CPSR, 0x3c5), HV_SUCCESS);
+        let before = broken();
+        assert_eq!(vcpu_run(id), HV_ERROR);
+        assert_eq!(broken(), before + 1, "EL1 outside the stub");
+        end(id);
+
+        // Host memory behind stage 2 replaced: reported.
+        let memory = fresh_memory();
+        let (host, id) = small_vm(0xd400_0042, memory);
+        assert_eq!(vcpu_run(id), HV_SUCCESS);
+        let before = broken();
+        // SAFETY: the test's own memory, replaced at the same address.
+        let p = unsafe {
+            libc::mmap(
+                (host + 0x8000) as *mut c_void,
+                0x4000,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(p as u64, host + 0x8000);
+        // SAFETY: touching the new page, so it has an object of its own.
+        unsafe { ((host + 0x8000) as *mut u8).write_volatile(1) };
+        check_objects(vm().as_mut().unwrap());
+        assert!(broken() > before, "host memory behind stage 2 replaced");
+        end(id);
+
+        // Anonymous memory behind stage 2 also mapped elsewhere (as a
+        // vfork child's VM once shared its parent's): reported at the run.
+        let shared = map(
+            LEN as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_SHARED,
+            -1,
+        );
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn mach_make_memory_entry_64(
+                t: u32,
+                size: *mut u64,
+                off: u64,
+                perm: i32,
+                h: *mut u32,
+                p: u32,
+            ) -> i32;
+            fn mach_vm_map(
+                t: u32,
+                a: *mut u64,
+                s: u64,
+                m: u64,
+                f: i32,
+                o: u32,
+                off: u64,
+                c: i32,
+                cur: i32,
+                max: i32,
+                inh: u32,
+            ) -> i32;
+        }
+        let (mut size, mut entry, mut alias) = (LEN, 0u32, 0u64);
+        // SAFETY: a share of the test's own memory, mapped a second time.
+        unsafe {
+            assert_eq!(
+                mach_make_memory_entry_64(
+                    mach_task_self_,
+                    &mut size,
+                    shared as u64,
+                    0x40_0000 | 3,
+                    &mut entry,
+                    0
+                ),
+                0
+            );
+            assert_eq!(
+                mach_vm_map(mach_task_self_, &mut alias, LEN, 0, 1, entry, 0, 0, 3, 3, 0),
+                0
+            );
+            (shared as *mut u8).write_volatile(1);
+        }
+        let (_, id) = small_vm(0xd400_0042, shared);
+        let before = broken();
+        assert_eq!(vcpu_run(id), HV_SUCCESS);
+        assert!(broken() > before, "anonymous memory behind stage 2 shared");
+        end(id);
     }
 }
