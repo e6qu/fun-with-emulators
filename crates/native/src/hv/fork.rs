@@ -448,6 +448,10 @@ pub(super) fn fork(
                 state.extend_from_slice(&e.into_bytes());
                 let r = spawn_child(&fds, &entries, &state);
                 release_ports(&entries);
+                if let Ok(pid) = r {
+                    let what = if vfork { b"vfork child" } else { b"fork child " };
+                    super::record::Line::new().bytes(what).s(" ").dec(pid as u64).emit();
+                }
                 r
             }
             Err(msg) => Err(msg),
@@ -510,13 +514,14 @@ fn spawn_child(fds: &[(i32, bool)], entries: &[Port], state: &[u8]) -> Result<i3
     let Some(fwe) = crate::FWE_EXE.get() else { return Err("fwe's own path is unknown".into()) };
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(fwe.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let flag = c"--hv-fork-child";
-    let standin = c"--hv-standin";
-    let argv = if super::standin::active() {
-        [path.as_ptr(), standin.as_ptr(), flag.as_ptr(), std::ptr::null()]
-    } else {
-        [path.as_ptr(), flag.as_ptr(), std::ptr::null(), std::ptr::null()]
-    };
+    let mut words: Vec<std::ffi::CString> = super::passed_on()
+        .into_iter()
+        .map(|w| std::ffi::CString::new(w).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    words.insert(0, path.clone());
+    words.push(c"--hv-fork-child".to_owned());
+    let mut argv: Vec<*const libc::c_char> = words.iter().map(|w| w.as_ptr()).collect();
+    argv.push(std::ptr::null());
 
     // A receive right of ours becomes the child's bootstrap port.
     let mut rx: Port = 0;
@@ -690,9 +695,11 @@ fn hand_off(rx: Port, pid: i32, entries: &[Port], state: &[u8]) -> Result<(), St
 /// The child's side: `fwe --hv-fork-child`. Takes the parent's memory and
 /// state, builds a VM and resumes the guest. Does not return.
 pub fn child() -> ! {
+    super::record::event("fork child starts", b"");
     match become_child() {
         Ok(never) => match never {},
         Err(msg) => {
+            super::record::event("fork child failed:", msg.as_bytes());
             // The parent sees the pipe close without its byte and reports
             // the fork failed. A VM made by then goes first.
             note(&format!("fork child: {msg}"));

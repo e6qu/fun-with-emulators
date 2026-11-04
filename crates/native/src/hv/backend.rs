@@ -1,7 +1,7 @@
 //! The VMM: loading, the vCPU run loop and the system call path.
 
 use super::ffi::*;
-use super::{fork, vm, window};
+use super::{fork, record, vm, window};
 use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, page_size, stack};
 use fwe_abi::{auxv, err, errno, mman, nr};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
@@ -40,6 +40,7 @@ impl Platform for HvPlatform {
 
     fn exit(&mut self, code: i32) -> ! {
         teardown();
+        record::Line::new().s("exit ").dec(code as u32 as u64).emit();
         // SAFETY: terminating the process, its VM gone.
         unsafe { libc::_exit(code) }
     }
@@ -50,6 +51,7 @@ impl Platform for HvPlatform {
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
         teardown();
+        record::Line::new().s("dies of host signal ").dec(sig as u64).emit();
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
@@ -248,6 +250,7 @@ fn exit_thread(code: i32) -> ! {
     use std::sync::atomic::Ordering::SeqCst;
     if crate::LIVE_THREADS.fetch_sub(1, SeqCst) == 1 {
         teardown();
+        record::Line::new().s("exit ").dec(code as u32 as u64).emit();
         // SAFETY: terminating the process, its VM gone.
         unsafe { libc::_exit(code) }
     }
@@ -514,6 +517,7 @@ pub fn run(
     env: &[OsString],
     options: &Options,
 ) -> Error {
+    record::event("start", path.as_os_str().as_bytes());
     match start(path, data, args, env, options) {
         Ok(never) => match never {},
         Err(e) => e,
@@ -932,6 +936,7 @@ fn fatal(msg: &str) -> ! {
     let line = format!("fwe: {msg}\n");
     // SAFETY: writing a diagnostic to standard error.
     unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    record::event("fatal:", msg.as_bytes());
     teardown();
     // SAFETY: exiting, the VM gone.
     unsafe { libc::_exit(127) }
@@ -976,7 +981,11 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
     let state = k.exec_state();
-    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, &state, teardown);
+    let before_exec = || {
+        teardown();
+        record::event("execve", &path);
+    };
+    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, &state, before_exec);
     if !VM_LIVE.load(std::sync::atomic::Ordering::SeqCst) {
         fatal(&format!(
             "execve {} failed after the VM was destroyed: {r}",

@@ -21,6 +21,10 @@ options:
   --hv-standin run the hypervisor backend on a software stand-in for
                Hypervisor.framework instead of a real VM (for development
                and tests; needs Unicorn; must come first)
+  --hv-record DEST
+               record the hypervisor backend's VM calls, synchronously, to
+               file:PATH and/or udp:HOST:PORT (comma separated; also
+               FWE_HV_RECORD; must come first; see docs/hypervisor.md)
   -h, --help   show this help
   -V, --version
 ";
@@ -29,11 +33,28 @@ fn main() -> ExitCode {
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    // First, so it reaches every process fwe starts for the guest.
-    if args.first().is_some_and(|a| a == "--hv-standin") {
-        args.remove(0);
-        if !fwe_native::hv::use_standin() {
-            eprintln!("fwe: --hv-standin needs Apple Silicon macOS");
+    // These come first, as fwe passes them on to every process it starts
+    // for the guest.
+    let mut record = std::env::var("FWE_HV_RECORD").ok().filter(|s| !s.is_empty());
+    loop {
+        match args.first().map(|a| a.as_bytes()) {
+            Some(b"--hv-standin") => {
+                args.remove(0);
+                if !fwe_native::hv::use_standin() {
+                    eprintln!("fwe: --hv-standin needs Apple Silicon macOS");
+                    return ExitCode::from(2);
+                }
+            }
+            Some(b"--hv-record") if args.len() > 1 => {
+                args.remove(0);
+                record = Some(args.remove(0).to_string_lossy().into_owned());
+            }
+            _ => break,
+        }
+    }
+    if let Some(spec) = record {
+        if let Err(e) = fwe_native::hv::start_recording(&spec) {
+            eprintln!("fwe: --hv-record: {e}");
             return ExitCode::from(2);
         }
     }

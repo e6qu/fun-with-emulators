@@ -32,6 +32,10 @@ mod backend;
 mod ffi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod fork;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod probe;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod record;
 pub mod spike;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod standin;
@@ -75,6 +79,42 @@ pub fn standin_watch(pid: &str) -> ! {
         let _ = pid;
         std::process::exit(2)
     }
+}
+
+/// `fwe --probe hv-map-rules` (see [`probe`]).
+pub fn map_rules_probe() -> Result<String, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return probe::map_rules();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    Err("the hypervisor backend needs Apple Silicon macOS".into())
+}
+
+/// Start the flight recorder (`--hv-record DEST`, see [`record`]).
+pub fn start_recording(spec: &str) -> Result<(), String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return record::start(spec);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = spec;
+        Err("the flight recorder needs Apple Silicon macOS".into())
+    }
+}
+
+/// The leading options every fwe that fwe starts for the guest is given:
+/// the stand-in and the flight recorder, when in use.
+pub fn passed_on() -> Vec<Vec<u8>> {
+    let mut words = Vec::new();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if standin::active() {
+            words.push(b"--hv-standin".to_vec());
+        }
+        if let Some(spec) = record::spec() {
+            words.push(b"--hv-record".to_vec());
+            words.push(spec.as_bytes().to_vec());
+        }
+    }
+    words
 }
 
 /// Whether the VM backend uses the software stand-in (`--hv-standin`).

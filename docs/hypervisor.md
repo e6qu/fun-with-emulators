@@ -202,10 +202,42 @@ A stand-in proves nothing about the real framework. Its own rules are what
 fwe has seen the framework do, and the kernel crashes the backend may cause
 cannot happen in it. So VM changes are also run on real hardware now and
 then, on a machine whose crash costs nothing, instrumented so that a crash
-can be traced. Not modelled: the virtual timer, the fault address of an
+can be traced (below). Not modelled: the virtual timer, the fault address of an
 alignment fault outside the exclusive and atomic instructions, stack-pointer
 alignment checks, and code one vCPU writes for another without a mapping
 change. `FWE_STANDIN_DEBUG=1` reports each exception and exit it models.
+
+## Real-hardware runs and the flight recorder
+
+Real runs happen on a machine whose crash costs nothing — the self-hosted
+runner of the `hypervisor` CI job, such as a rented bare-metal cloud Mac —
+and are instrumented so that a crash can be traced. The crashes so far were
+watchdog resets that left no stackshot and lost the last seconds of the
+system log, so the evidence has to be kept by fwe itself:
+
+- **The flight recorder** (`--hv-record DEST`, or `FWE_HV_RECORD=DEST`; in
+  `crates/native/src/hv/record.rs`) writes a line before and after every
+  framework call that changes a VM — `hv_vm_create`, `hv_vm_map`,
+  `hv_vm_unmap`, `hv_vcpu_create`, `hv_vcpus_exit`, `hv_vcpu_destroy`,
+  `hv_vm_destroy` — with its arguments and result, each process's start,
+  `execve`, fork children and end (exit status or signal), and a heartbeat
+  with the count of `hv_vcpu_run` calls every half second. Each line is
+  written synchronously: to `file:PATH` with `F_FULLFSYNC`, so it is on the
+  disk before the call it announces, and/or to `udp:HOST:PORT` as a datagram
+  to another machine, which a reset cannot take back; there
+  `tools/hv-record-listen.py PORT` collects them. The setting reaches every
+  fwe a guest starts. A call begun and never ended names what was running
+  when the machine went down.
+- **The `hypervisor` job** records every run to a file outside its
+  workspace (and to `FWE_HV_RECORD_UDP`, a repository variable, if set),
+  marks the record finished at the end, and at its start reports any
+  earlier record that never finished, with its last lines, alongside the
+  boot time and the panic reports — so the run after a crash shows what the
+  crashed one was doing. The record is also kept as a job artifact.
+- **The stand-in's inferred rules are checked**: the job runs
+  `fwe --probe hv-map-rules` on the framework and on the stand-in, and fails
+  if the framework maps host memory the stand-in would refuse, or the other
+  way round.
 
 ## Running it (Apple Silicon, no root)
 
@@ -263,4 +295,8 @@ set, so it never blocks PRs when no runner exists. Once set, it runs the
 push.
 
 The runner should be a machine whose crash costs nothing, such as a rented
-bare-metal cloud Mac, never the development Mac.
+bare-metal cloud Mac, never the development Mac. Install Unicorn there too
+(`brew install unicorn`, which the job also does) for the probe comparison.
+To have the record streamed off the machine, run
+`tools/hv-record-listen.py PORT` on a machine that can receive from it and
+set the repository variable `FWE_HV_RECORD_UDP` to `udp:HOST:PORT`.

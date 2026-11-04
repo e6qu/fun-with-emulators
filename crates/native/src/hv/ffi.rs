@@ -109,50 +109,62 @@ mod framework {
 }
 
 /// Each call goes to the framework, or to the stand-in under
-/// `--hv-standin` (see [`super::standin`]).
+/// `--hv-standin` (see [`super::standin`]). Calls that change the VM's state
+/// are recorded by the flight recorder (`rec`, see [`super::record`]), runs
+/// are counted (`run`), register accesses are not (`quiet`).
 macro_rules! calls {
-    ($(fn $name:ident($($arg:ident: $ty:ty),*) -> hv_return_t => $standin:ident;)*) => {$(
+    ($(fn $name:ident($($arg:ident: $ty:ty),*) -> hv_return_t => $standin:ident, $kind:ident;)*) => {$(
         /// # Safety
         /// As for the framework call of this name.
         pub unsafe fn $name($($arg: $ty),*) -> hv_return_t {
-            if super::standin::active() {
+            calls!(@before $kind $name $($arg)*);
+            let rc = if super::standin::active() {
                 super::standin::$standin($($arg),*)
             } else {
                 // SAFETY: the caller keeps the framework's contract.
                 unsafe { framework::$name($($arg),*) }
-            }
+            };
+            calls!(@after $kind $name rc);
+            rc
         }
     )*};
+    (@before rec $name:ident $($arg:ident)*) => {
+        super::record::begin(stringify!($name), &[$($arg as u64),*])
+    };
+    (@before run $name:ident $($arg:ident)*) => { super::record::count_run() };
+    (@before quiet $name:ident $($arg:ident)*) => {};
+    (@after rec $name:ident $rc:ident) => { super::record::end(stringify!($name), $rc) };
+    (@after $kind:ident $name:ident $rc:ident) => {};
 }
 
 calls! {
     fn hv_vm_config_set_ipa_size(config: hv_vm_config_t, bits: u32) -> hv_return_t
-        => vm_config_set_ipa_size;
-    fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t => vm_create;
-    fn hv_vm_destroy() -> hv_return_t => vm_destroy;
-    fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t => vm_map;
-    fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t => vm_unmap;
+        => vm_config_set_ipa_size, quiet;
+    fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t => vm_create, rec;
+    fn hv_vm_destroy() -> hv_return_t => vm_destroy, rec;
+    fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t => vm_map, rec;
+    fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t => vm_unmap, rec;
     fn hv_vcpu_create(vcpu: *mut hv_vcpu_t, exit: *mut *mut hv_vcpu_exit_t, config: *mut c_void)
-        -> hv_return_t => vcpu_create;
-    fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_run;
-    fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_destroy;
+        -> hv_return_t => vcpu_create, rec;
+    fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_run, run;
+    fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_destroy, rec;
     fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t
-        => vcpu_get_vtimer_offset;
+        => vcpu_get_vtimer_offset, quiet;
     fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t
-        => vcpu_set_vtimer_offset;
-    fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t => vcpus_exit;
+        => vcpu_set_vtimer_offset, quiet;
+    fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t => vcpus_exit, rec;
     fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t
-        => vcpu_get_reg;
+        => vcpu_get_reg, quiet;
     fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t
-        => vcpu_set_reg;
+        => vcpu_set_reg, quiet;
     fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: *mut u64) -> hv_return_t
-        => vcpu_get_sys_reg;
+        => vcpu_get_sys_reg, quiet;
     fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) -> hv_return_t
-        => vcpu_set_sys_reg;
+        => vcpu_set_sys_reg, quiet;
     fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u128) -> hv_return_t
-        => vcpu_get_simd_fp_reg;
+        => vcpu_get_simd_fp_reg, quiet;
     fn set_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *const u128) -> hv_return_t
-        => vcpu_set_simd_fp_reg;
+        => vcpu_set_simd_fp_reg, quiet;
 }
 
 /// # Safety

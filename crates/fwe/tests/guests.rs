@@ -2255,14 +2255,21 @@ fn hv_command() -> Option<Command> {
         eprintln!("skipped: no hypervisor on this host");
         return None;
     };
-    Some(match mode {
+    let mut cmd = match mode {
         HvMode::Real(fwe) => Command::new(fwe),
         HvMode::Standin => {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
             cmd.arg("--hv-standin");
             cmd
         }
-    })
+    };
+    // The flight recorder, for runs on real hardware (the `hypervisor` CI
+    // job sets it); passed as an option, so a test that clears the
+    // environment is recorded too.
+    if let Some(spec) = std::env::var_os("FWE_HV_RECORD").filter(|s| !s.is_empty()) {
+        cmd.arg("--hv-record").arg(spec);
+    }
+    Some(cmd)
 }
 
 /// Run a VM test's command: one at a time on the real framework, and
@@ -2467,6 +2474,76 @@ fn hv_standin_watcher_reports_a_vm_left_alive() {
             "{life:?}: {stderr}"
         );
     }
+}
+
+/// The flight recorder follows a VM process and the vfork child it starts
+/// through the child's `execve`: every framework call that changes a VM is
+/// recorded before and after, and each process's start and end.
+#[test]
+fn hv_records_the_vm_calls() {
+    let Some(mut cmd) = hv_command() else { return };
+    let log = out_dir().join(format!("hv-record-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    cmd.arg("--hv-record").arg(format!("file:{}", log.display()));
+    cmd.arg(rust_low_guest("signals")).arg("spawn-status");
+    let out = run_hv(cmd, "recorded spawn-status");
+    assert_eq!(stdout(&out), "hello from the spawned child\nchild exit status: 0\n");
+    let record = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    let lines: Vec<&str> = record.lines().collect();
+    assert!(lines.iter().all(|l| l.starts_with("fwe-hv ")), "{record}");
+    let what = |l: &&str| l.splitn(7, ' ').nth(6).unwrap_or("").to_string();
+    let pid = |l: &&str| l.split(' ').nth(3).unwrap_or("").to_string();
+    let parent = pid(&lines[0]);
+    let has = |p: &str, w: &str| lines.iter().any(|l| pid(l) == p && what(l).starts_with(w));
+    assert!(has(&parent, "start "), "{record}");
+    let child = lines
+        .iter()
+        .find_map(|l| what(l).strip_prefix("vfork child ").map(str::to_string))
+        .expect("the vfork child is recorded");
+    for p in [&parent, &child] {
+        for w in
+            ["> hv_vm_create", "< hv_vm_create = 0x0", "> hv_vm_destroy", "< hv_vm_destroy = 0x0"]
+        {
+            assert!(has(p, w), "{p}: {w}\n{record}");
+        }
+    }
+    assert!(has(&child, "fork child starts"), "{record}");
+    assert!(has(&child, "execve "), "{record}");
+    assert!(has(&parent, "exit 0"), "{record}");
+    // Every call recorded as begun is recorded as ended, in each process.
+    for p in [&parent, &child] {
+        let begun = lines.iter().filter(|l| pid(l) == *p && what(l).starts_with("> ")).count();
+        let ended = lines.iter().filter(|l| pid(l) == *p && what(l).starts_with("< ")).count();
+        assert_eq!(begun, ended, "{p}\n{record}");
+    }
+}
+
+/// What `fwe --probe hv-map-rules` says on the stand-in: its inferred rule
+/// for the host memory `hv_vm_map` takes. The self-hosted `hypervisor` CI
+/// job compares the real framework's answers with these.
+const STANDIN_MAP_RULES: &str = "\
+RW, at most RWX, as RWX: mapped
+RW, at most RWX, as R: mapped
+R, at most RWX, as RX: mapped
+R, at most RW, as RX: mapped
+RW, at most RW, as RWX: mapped
+R, at most R, as RX: refused
+R, at most R, as R: refused
+RX, at most RX, as RX: refused
+shared entry of read-only memory, as RX: refused
+unmapped, as R: refused
+";
+
+#[test]
+fn hv_standin_map_rules() {
+    if !matches!(hv_mode(), Some(HvMode::Standin)) {
+        return;
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.args(["--hv-standin", "--probe", "hv-map-rules"]);
+    let out = run_hv(cmd, "hv-map-rules");
+    assert_eq!(stdout(&out), STANDIN_MAP_RULES);
 }
 
 /// A signal blocked while its handler runs is delivered as soon as the
