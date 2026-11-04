@@ -110,8 +110,10 @@ mod framework {
 
 /// Each call goes to the framework, or to the stand-in under
 /// `--hv-standin` (see [`super::standin`]). Calls that change the VM's state
-/// are recorded by the flight recorder (`rec`, see [`super::record`]), runs
-/// are counted (`run`), register accesses are not (`quiet`).
+/// are recorded by the flight recorder (`rec`, see [`super::record`]; a
+/// vCPU's destruction without waiting for the disk, `unsynced`), runs are
+/// counted (`run`); register accesses and stops are not (`quiet`): a fork's
+/// pause and every guest signal stop vCPUs, often.
 macro_rules! calls {
     ($(fn $name:ident($($arg:ident: $ty:ty),*) -> hv_return_t => $standin:ident, $kind:ident;)*) => {$(
         /// # Safety
@@ -129,11 +131,17 @@ macro_rules! calls {
         }
     )*};
     (@before rec $name:ident $($arg:ident)*) => {
-        super::record::begin(stringify!($name), &[$($arg as u64),*])
+        super::record::begin(stringify!($name), &[$($arg as u64),*], true)
+    };
+    (@before unsynced $name:ident $($arg:ident)*) => {
+        super::record::begin(stringify!($name), &[$($arg as u64),*], false)
     };
     (@before run $name:ident $($arg:ident)*) => { super::record::count_run() };
     (@before quiet $name:ident $($arg:ident)*) => {};
-    (@after rec $name:ident $rc:ident) => { super::record::end(stringify!($name), $rc) };
+    (@after rec $name:ident $rc:ident) => { super::record::end(stringify!($name), $rc, true) };
+    (@after unsynced $name:ident $rc:ident) => {
+        super::record::end(stringify!($name), $rc, false)
+    };
     (@after $kind:ident $name:ident $rc:ident) => {};
 }
 
@@ -147,12 +155,12 @@ calls! {
     fn hv_vcpu_create(vcpu: *mut hv_vcpu_t, exit: *mut *mut hv_vcpu_exit_t, config: *mut c_void)
         -> hv_return_t => vcpu_create, rec;
     fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_run, run;
-    fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_destroy, rec;
+    fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t => vcpu_destroy, unsynced;
     fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t
         => vcpu_get_vtimer_offset, quiet;
     fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t
         => vcpu_set_vtimer_offset, quiet;
-    fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t => vcpus_exit, rec;
+    fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t => vcpus_exit, quiet;
     fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t
         => vcpu_get_reg, quiet;
     fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t

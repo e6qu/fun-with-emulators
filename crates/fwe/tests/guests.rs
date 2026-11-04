@@ -1944,6 +1944,13 @@ fn fork_from_a_threaded_process() {
     assert_eq!(signals("threaded-fork"), "child of a threaded parent\nexited 5\n");
 }
 
+/// A fork child reading a pipe sees its end once the parent closes its
+/// write end.
+#[test]
+fn fork_child_sees_the_end_of_a_pipe() {
+    assert_eq!(signals("fork-pipe"), "child read 5 bytes, then the end\nexited 0\n");
+}
+
 /// A fork while another thread writes sees one instant of the process: the
 /// threads running guest code are stopped while the host fork copies memory.
 #[test]
@@ -2511,6 +2518,17 @@ fn hv_records_the_vm_calls() {
     assert!(has(&child, "fork child starts"), "{record}");
     assert!(has(&child, "execve "), "{record}");
     assert!(has(&parent, "exit 0"), "{record}");
+    // A guest that closes every descriptor it can leaves the record's
+    // alone: they are fwe's, out of its reach.
+    let mut cmd = hv_command().unwrap();
+    cmd.arg("--hv-record").arg(format!("file:{}", log.display()));
+    cmd.arg(rust_low_guest("fds")).arg("close-all-hard");
+    let out = run_hv(cmd, "recorded close-all-hard");
+    assert_eq!(out.status.code(), Some(0));
+    let closer = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    assert!(closer.contains("< hv_vm_destroy = 0x0"), "{closer}");
+    assert!(closer.lines().last().is_some_and(|l| l.ends_with(" exit 0")), "{closer}");
     // Every call recorded as begun is recorded as ended, in each process.
     for p in [&parent, &child] {
         let begun = lines.iter().filter(|l| pid(l) == *p && what(l).starts_with("> ")).count();
@@ -2644,6 +2662,7 @@ fn hv_fork_and_vfork() {
         ("fork-epoll", "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"),
         ("fork-snapshot", "consistent snapshots: 8 of 8\n"),
         ("waitid", "exited: true, status 6, pid matches: true\nkilled: true, signal 9\n"),
+        ("fork-pipe", "child read 5 bytes, then the end\nexited 0\n"),
     ] {
         let out = fwe_hv(&rust_low_guest("signals"), &[scenario]).unwrap();
         assert_eq!(stdout(&out), want, "{scenario}");

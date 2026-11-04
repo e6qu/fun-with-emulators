@@ -123,6 +123,12 @@ fn main() -> ExitCode {
                 println!("{}", fwe_native::host_support());
                 return ExitCode::SUCCESS;
             }
+            // The spike is the real framework's own check: it creates a VM
+            // with no stand-in behind it.
+            b"--hv-spike" if fwe_native::hv::standin_active() => {
+                eprintln!("fwe: --hv-spike tests the real Hypervisor.framework, not the stand-in");
+                return ExitCode::from(2);
+            }
             b"--hv-spike" => {
                 // A quick check that a VM runs here (docs/hypervisor.md).
                 return match fwe_native::hv::spike() {

@@ -345,6 +345,9 @@ fn guarded(fd: i32, kind: u32) -> bool {
 /// parent's pipe.
 fn descriptors(skip: i32) -> Vec<(i32, bool)> {
     let vfork_word = VFORK_WORD.load(Ordering::SeqCst);
+    // The flight recorder's and the stand-in's: the child opens its own.
+    let mut own = super::record::own_fds();
+    own.push(super::standin::own_fd());
     // SAFETY: with no buffer, the call reports the size the list needs.
     let need = unsafe {
         libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
@@ -363,6 +366,7 @@ fn descriptors(skip: i32) -> Vec<(i32, bool)> {
             f.proc_fdtype != libc::PROX_FDTYPE_KQUEUE as u32
                 && f.proc_fd != skip
                 && f.proc_fd != vfork_word
+                && !own.contains(&f.proc_fd)
                 && !guarded(f.proc_fd, f.proc_fdtype)
         })
         .map(|f| {

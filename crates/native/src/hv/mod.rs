@@ -103,9 +103,9 @@ pub fn start_recording(spec: &str) -> Result<(), String> {
 /// The leading options every fwe that fwe starts for the guest is given:
 /// the stand-in and the flight recorder, when in use.
 pub fn passed_on() -> Vec<Vec<u8>> {
-    let mut words = Vec::new();
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        let mut words = Vec::new();
         if standin::active() {
             words.push(b"--hv-standin".to_vec());
         }
@@ -113,8 +113,10 @@ pub fn passed_on() -> Vec<Vec<u8>> {
             words.push(b"--hv-record".to_vec());
             words.push(spec.as_bytes().to_vec());
         }
+        words
     }
-    words
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    Vec::new()
 }
 
 /// Whether the VM backend uses the software stand-in (`--hv-standin`).

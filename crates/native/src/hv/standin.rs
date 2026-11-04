@@ -44,9 +44,13 @@
 //! is caught by a watcher process started with the VM (`fwe
 //! --hv-standin-watch`), which sees the process's end of a pipe close.
 //!
-//! Only one vCPU emulates at a time (a fair lock, handed on every few
-//! milliseconds): Unicorn instances are independent CPUs, and running one
-//! at a time keeps the guest's atomics atomic. Not modelled: the virtual
+//! Only one vCPU emulates at a time (a fair lock, handed on at the next
+//! block whenever another vCPU waits): Unicorn instances are independent
+//! CPUs, and running one at a time keeps the guest's atomics atomic. Each
+//! Unicorn engine is driven only by its own thread — mapping changes are
+//! logged and applied by each vCPU before it next emulates, and a stop is
+//! a flag its block hook acts on — as an engine stopped or changed from
+//! another thread sometimes resumed with its registers and pc out of step. Not modelled: the virtual
 //! timer, the exact fault address of an alignment fault outside the
 //! exclusive and atomic instructions, stack-pointer alignment checks, and
 //! code another vCPU writes without a mapping change (each emulated CPU
@@ -101,6 +105,7 @@ const UC_TLB_VIRTUAL: c_int = 1;
 
 const UC_HOOK_INTR: c_int = 1;
 const UC_HOOK_INSN: c_int = 2;
+const UC_HOOK_BLOCK: c_int = 8;
 const UC_HOOK_MEM_UNMAPPED: c_int = 112;
 const UC_HOOK_MEM_PROT: c_int = 896;
 const UC_HOOK_TLB_FILL: c_int = 131_072;
@@ -304,7 +309,7 @@ struct Vm {
     stage1: Option<Vec<(u64, u64, u32)>>,
 }
 
-/// Lock order: `VM`, then `TURN`, then a vCPU's `engine`.
+/// Lock order: `VM`, then `TURN`, then `LOG`, then a vCPU's `engine`.
 static VM: Mutex<Option<Vm>> = Mutex::new(None);
 static VM_LIVE: AtomicBool = AtomicBool::new(false);
 /// The watcher's pipe: written `C` when the VM is created and `D` when it
@@ -329,6 +334,8 @@ struct Vcpu {
     owner: libc::pthread_t,
     /// `hv_vcpus_exit` asked for a stop.
     cancel: AtomicBool,
+    /// Another wants the turn: stop at the next block.
+    yield_now: AtomicBool,
     /// Inside `uc_emu_start`.
     running: AtomicBool,
     vtimer_offset: AtomicU64,
@@ -338,6 +345,8 @@ struct Vcpu {
 struct Engine {
     /// Stage 2 has been applied to this CPU.
     synced: bool,
+    /// How much of the mapping log it has applied (an absolute index).
+    applied: usize,
     /// The EL1 registers the vector would see, and the others fwe sets.
     esr: u64,
     elr: u64,
@@ -366,13 +375,10 @@ unsafe impl Sync for Vcpu {}
 
 static VCPUS: [AtomicPtr<Vcpu>; MAX_VCPUS] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_VCPUS];
-/// vCPUs destroyed, freed later from an ordinary context.
-static GRAVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 fn vcpu(id: hv_vcpu_t) -> Option<&'static Vcpu> {
     let p = VCPUS.get(id as usize)?.load(SeqCst);
-    // SAFETY: a registered vCPU stays allocated until it is freed from the
-    // grave, long after it left the table.
+    // SAFETY: a vCPU, once registered, is never freed.
     (!p.is_null()).then(|| unsafe { &*p })
 }
 
@@ -458,35 +464,17 @@ fn end_turn() {
     TURN.1.notify_all();
 }
 
-/// Stop the vCPU emulating now, which then hands the turn on.
+/// Ask the vCPU emulating now to stop at its next block and hand the turn
+/// on. An engine is never stopped from another thread: Unicorn stopped
+/// asynchronously sometimes resumes with its registers and pc out of step
+/// (seen as a register update lost across the stop), so every stop is the
+/// engine's own, from its block hook ([`on_block`]).
 fn preempt() {
     let p = CURRENT.load(SeqCst);
     if !p.is_null() {
-        // SAFETY: CURRENT is cleared before its vCPU can be freed.
-        unsafe { (api().emu_stop)((*p).uc) };
+        // SAFETY: vCPUs are never freed.
+        unsafe { (*p).yield_now.store(true, SeqCst) };
     }
-}
-
-/// Hand the turn on every few milliseconds while others wait, and stop a
-/// vCPU whose cancel came just before its emulation began (a stop then
-/// has no effect).
-fn start_ticker() {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, SeqCst) {
-        return;
-    }
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(Duration::from_millis(4));
-            let waiting = !TURN.0.lock().unwrap_or_else(|e| e.into_inner()).queue.is_empty();
-            let p = CURRENT.load(SeqCst);
-            // SAFETY: CURRENT is cleared before its vCPU can be freed.
-            let cancelled = !p.is_null() && unsafe { (*p).cancel.load(SeqCst) };
-            if waiting || cancelled {
-                preempt();
-            }
-        }
-    });
 }
 
 // --- The calls ------------------------------------------------------------------
@@ -569,27 +557,14 @@ pub fn vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return
     }
     v.maps.insert(ipa, Mapping { end, host, flags });
     let pieces = el0_pieces(v, ipa, end, host, flags);
-    apply(|uc| {
-        for &(lo, hi, h, perms) in &pieces {
-            // SAFETY: host memory the caller maps into the VM, which it
-            // keeps until it unmaps it (checked above to be mapped).
-            let rc =
-                unsafe { (api().mem_map_ptr)(uc, lo, (hi - lo) as usize, perms, h as *mut c_void) };
-            if rc != 0 {
-                violation(&format!(
-                    "emulated mapping of {lo:#x}+{:#x} failed: {}",
-                    hi - lo,
-                    uc_error(rc)
-                ));
-            }
-        }
-        flush(uc, ipa, end);
-    });
+    let mut ops: Vec<Op> = pieces.iter().map(|&(lo, hi, h, p)| Op::Map(lo, hi, h, p)).collect();
+    ops.push(Op::Flush(ipa, end));
+    apply(ops);
     HV_SUCCESS
 }
 
 pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
-    let end = ipa + size as u64;
+    let Some(end) = ipa.checked_add(size as u64) else { return HV_BAD_ARGUMENT };
     if !VM_LIVE.load(SeqCst) {
         violation("hv_vm_unmap without a VM");
         return HV_ERROR;
@@ -627,8 +602,92 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
             el0_pieces(v, lo, hi, m.host + (lo - s), m.flags).into_iter().map(|p| (p.0, p.1)),
         );
     }
-    apply(|uc| {
-        for &(lo, hi) in &gone {
+    let mut ops: Vec<Op> = gone.iter().map(|&(lo, hi)| Op::Unmap(lo, hi)).collect();
+    ops.push(Op::Flush(ipa, end));
+    apply(ops);
+    HV_SUCCESS
+}
+
+/// A change to the emulated memory map, which each vCPU's CPU applies on
+/// its own thread before it next emulates: a Unicorn engine is driven only
+/// by its own thread (QEMU keeps per-thread state), except `uc_emu_stop`.
+#[derive(Clone, Copy)]
+enum Op {
+    /// `(lo, hi, host, perms)`.
+    Map(u64, u64, u64, u32),
+    Unmap(u64, u64),
+    /// Discard translations of `[lo, hi)`.
+    Flush(u64, u64),
+}
+
+/// The changes, from absolute index `base` on.
+struct Log {
+    base: usize,
+    ops: Vec<Op>,
+}
+
+static LOG: Mutex<Log> = Mutex::new(Log { base: 0, ops: Vec::new() });
+
+fn log() -> MutexGuard<'static, Log> {
+    LOG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Log `ops` with no vCPU emulating, so none touches memory being changed
+/// until it has applied them.
+fn apply(ops: Vec<Op>) {
+    take_turn(MAPPER, &|| false);
+    let mut l = log();
+    l.ops.extend(ops);
+    // Drop what every vCPU has applied.
+    if l.ops.len() > 4096 {
+        let done = VCPUS
+            .iter()
+            .filter_map(|slot| {
+                let p = slot.load(SeqCst);
+                // SAFETY: registered vCPUs are never freed (see `vcpu`).
+                (!p.is_null())
+                    .then(|| engine(unsafe { &*p }))
+                    .filter(|e| e.synced)
+                    .map(|e| e.applied)
+            })
+            .min()
+            .unwrap_or(l.base + l.ops.len());
+        let n = done - l.base;
+        l.ops.drain(..n);
+        l.base = done;
+    }
+    drop(l);
+    end_turn();
+}
+
+/// Apply the logged changes this vCPU has not; on its own thread, in its
+/// turn.
+fn catch_up(v: &Vcpu) {
+    let l = log();
+    let mut e = engine(v);
+    let start = e.applied.max(l.base) - l.base;
+    for &op in &l.ops[start..] {
+        apply_op(v.uc, op);
+    }
+    e.applied = l.base + l.ops.len();
+}
+
+fn apply_op(uc: Uc, op: Op) {
+    match op {
+        Op::Map(lo, hi, h, perms) => {
+            // SAFETY: host memory the VM maps, kept until it is unmapped
+            // (checked to be mapped when it was).
+            let rc =
+                unsafe { (api().mem_map_ptr)(uc, lo, (hi - lo) as usize, perms, h as *mut c_void) };
+            if rc != 0 {
+                violation(&format!(
+                    "emulated mapping of {lo:#x}+{:#x} failed: {}",
+                    hi - lo,
+                    uc_error(rc)
+                ));
+            }
+        }
+        Op::Unmap(lo, hi) => {
             // SAFETY: removing an emulated mapping made by vm_map.
             let rc = unsafe { (api().mem_unmap)(uc, lo, (hi - lo) as usize) };
             if rc != 0 {
@@ -639,27 +698,8 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
                 ));
             }
         }
-        flush(uc, ipa, end);
-    });
-    HV_SUCCESS
-}
-
-/// Run `f` on every vCPU whose mappings are in force, with none emulating.
-fn apply(f: impl Fn(Uc)) {
-    take_turn(MAPPER, &|| false);
-    for slot in &VCPUS {
-        let p = slot.load(SeqCst);
-        if p.is_null() {
-            continue;
-        }
-        // SAFETY: registered vCPUs stay allocated (see `vcpu`).
-        let v = unsafe { &*p };
-        let e = engine(v);
-        if e.synced {
-            f(v.uc);
-        }
+        Op::Flush(lo, hi) => flush(uc, lo, hi),
     }
-    end_turn();
 }
 
 /// Discard translations and translated code for `[lo, hi)`.
@@ -799,7 +839,6 @@ pub fn vcpu_create(
         violation("hv_vcpu_create without a VM");
         return HV_ERROR;
     }
-    bury();
     let a = api();
     let mut uc: Uc = std::ptr::null_mut();
     // SAFETY: Unicorn calls with valid out-pointers; the engine is ours.
@@ -843,6 +882,7 @@ pub fn vcpu_create(
         uc,
         engine: Mutex::new(Engine {
             synced: false,
+            applied: 0,
             esr: 0,
             elr: 0,
             spsr: 0,
@@ -854,6 +894,7 @@ pub fn vcpu_create(
         // SAFETY: plain host call.
         owner: unsafe { libc::pthread_self() },
         cancel: AtomicBool::new(false),
+        yield_now: AtomicBool::new(false),
         running: AtomicBool::new(false),
         vtimer_offset: AtomicU64::new(0),
     }));
@@ -864,6 +905,7 @@ pub fn vcpu_create(
         let data = v.cast::<c_void>();
         let mut h = 0usize;
         (a.hook_add)(uc, &mut h, UC_HOOK_TLB_FILL, on_tlb_fill as *mut c_void, data, 1, 0);
+        (a.hook_add)(uc, &mut h, UC_HOOK_BLOCK, on_block as *mut c_void, data, 1, 0);
         (a.hook_add)(uc, &mut h, UC_HOOK_INTR, on_exception as *mut c_void, data, 1, 0);
         (a.hook_add)(uc, &mut h, UC_HOOK_MEM_UNMAPPED, on_stage2 as *mut c_void, data, 1, 0);
         (a.hook_add)(uc, &mut h, UC_HOOK_MEM_PROT, on_stage2 as *mut c_void, data, 1, 0);
@@ -882,7 +924,6 @@ pub fn vcpu_create(
         *id = slot as hv_vcpu_t;
         *exit = exit_rec;
     }
-    start_ticker();
     HV_SUCCESS
 }
 
@@ -893,28 +934,11 @@ pub fn vcpu_destroy(id: hv_vcpu_t) -> hv_return_t {
         violation("hv_vcpu_destroy of a running vCPU");
         return HV_BUSY;
     }
+    // Never freed: another thread may still hold it (a late
+    // `hv_vcpus_exit`, a mapping change, a preemption), and a guest makes few
+    // enough threads for the leak not to matter in a stand-in.
     VCPUS[id as usize].store(std::ptr::null_mut(), SeqCst);
-    if let Ok(mut g) = GRAVE.try_lock() {
-        g.push(v as *const Vcpu as usize);
-    }
-    // (If the grave is busy, the vCPU is simply never freed.)
     HV_SUCCESS
-}
-
-/// Free destroyed vCPUs; from an ordinary context.
-fn bury() {
-    let dead: Vec<usize> = std::mem::take(&mut *GRAVE.lock().unwrap_or_else(|e| e.into_inner()));
-    for p in dead {
-        let v = p as *mut Vcpu;
-        if CURRENT.load(SeqCst) == v {
-            GRAVE.lock().unwrap_or_else(|e| e.into_inner()).push(p);
-            continue;
-        }
-        // The Unicorn engine itself is kept: another thread's late
-        // `hv_vcpus_exit` may still stop it. Only the records go.
-        // SAFETY: the vCPU left the table when it was destroyed.
-        drop(unsafe { Box::from_raw(v) });
-    }
 }
 
 pub fn vcpus_exit(ids: *mut hv_vcpu_t, count: u32) -> hv_return_t {
@@ -922,18 +946,31 @@ pub fn vcpus_exit(ids: *mut hv_vcpu_t, count: u32) -> hv_return_t {
         // SAFETY: `count` ids the caller passed.
         let id = unsafe { *ids.add(i) };
         if let Some(v) = vcpu(id) {
+            // Seen at the vCPU's next block, or before it next emulates.
             v.cancel.store(true, SeqCst);
-            if v.running.load(SeqCst) {
-                // SAFETY: Unicorn allows stopping an engine from any thread.
-                unsafe { (api().emu_stop)(v.uc) };
-            }
         }
     }
     HV_SUCCESS
 }
 
+/// Under `FWE_STANDIN_DEBUG`, the registers a run starts or ends with.
+fn debug_exit(v: &Vcpu, id: hv_vcpu_t, what: &str) {
+    if std::env::var_os("FWE_STANDIN_DEBUG").is_some() {
+        let _e = engine(v);
+        note(&format!(
+            "vcpu {id} {what}: pc {:#x} x8 {} x0 {:#x} x1 {:#x} sp {:#x}",
+            read(v.uc, R_PC),
+            read(v.uc, xreg(8)),
+            read(v.uc, xreg(0)),
+            read(v.uc, xreg(1)),
+            read(v.uc, R_SP)
+        ));
+    }
+}
+
 pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
     let Some(v) = own(id, "hv_vcpu_run") else { return HV_BAD_ARGUMENT };
+    debug_exit(v, id, "runs");
     // SAFETY: the vCPU's exit record, written only here.
     let exit = unsafe { &mut *v.exit };
     let me = id as usize;
@@ -941,6 +978,7 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         let cancelled = || v.cancel.load(SeqCst);
         if v.cancel.swap(false, SeqCst) {
             exit.reason = HV_EXIT_REASON_CANCELED;
+            debug_exit(v, id, "cancelled");
             return HV_SUCCESS;
         }
         if !engine(v).synced {
@@ -952,6 +990,7 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
         if take_turn(me, &cancelled).is_none() {
             continue;
         }
+        catch_up(v);
         let mut e = engine(v);
         e.event = None;
         let pc = read(v.uc, R_PC);
@@ -1070,7 +1109,12 @@ fn sync(v: &Vcpu) -> Result<(), String> {
     let pieces: Vec<(u64, u64, u64, u32)> =
         vmr.maps.iter().flat_map(|(&s, m)| el0_pieces(vmr, s, m.end, m.host, m.flags)).collect();
     take_turn(MAPPER, &|| false);
+    // Everything logged so far is in `maps` (the VM lock, held, keeps new
+    // changes out meanwhile).
+    let l = log();
     let mut e = engine(v);
+    e.applied = l.base + l.ops.len();
+    drop(l);
     for (lo, hi, h, perms) in pieces {
         // SAFETY: as in vm_map.
         let rc =
@@ -1100,6 +1144,16 @@ fn fetch(uc: Uc, pc: u64) -> Option<u32> {
 
 // --- Hooks ----------------------------------------------------------------------
 
+/// At each block: stop if `hv_vcpus_exit` or another vCPU's turn asks.
+extern "C" fn on_block(uc: Uc, _addr: u64, _size: u32, d: *mut c_void) {
+    // SAFETY: the hook's data is its vCPU.
+    let v = unsafe { &*d.cast::<Vcpu>() };
+    if v.cancel.load(SeqCst) || v.yield_now.swap(false, SeqCst) {
+        // SAFETY: stopping the engine whose hook this is, on its thread.
+        unsafe { (api().emu_stop)(uc) };
+    }
+}
+
 /// Stage 1 is the identity over the 40-bit space (checked at the first
 /// run), with the top byte ignored as TCR_EL1.TBI0 makes it; stage 2 is the
 /// emulated memory map, whose permissions Unicorn enforces. An address
@@ -1127,7 +1181,14 @@ fn record(d: *mut c_void, ev: Event) {
     // by QEMU's exception for it).
     let mut e = engine(v);
     if std::env::var_os("FWE_STANDIN_DEBUG").is_some() {
-        note(&format!("event {ev:?} (already {:?}) pc {:#x}", e.event, read(v.uc, R_PC)));
+        note(&format!(
+            "event {ev:?} (already {:?}) pc {:#x} x19 {:#x} x20 {:#x} x25 {:#x}",
+            e.event,
+            read(v.uc, R_PC),
+            read(v.uc, xreg(19)),
+            read(v.uc, xreg(20)),
+            read(v.uc, xreg(25))
+        ));
     }
     if e.event.is_none() {
         e.event = Some(ev);
@@ -1459,16 +1520,28 @@ fn start_watcher() {
     let flag = c"--hv-standin-watch";
     let argv = [path.as_ptr(), flag.as_ptr(), pid.as_ptr(), std::ptr::null()];
     let mut child = 0;
+    unsafe extern "C" {
+        fn posix_spawn_file_actions_addinherit_np(
+            fa: *mut libc::posix_spawn_file_actions_t,
+            fd: c_int,
+        ) -> c_int;
+    }
     // SAFETY: spawn attributes and file actions initialized, used and
     // destroyed here; the argument array lives across the call.
     let rc = unsafe {
         let mut fa: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
         libc::posix_spawn_file_actions_init(&mut fa);
         libc::posix_spawn_file_actions_adddup2(&mut fa, fds[0], 0);
+        // Only its standard input and error: it must hold none of the
+        // guest's descriptors (a pipe it held open would never see EOF).
+        posix_spawn_file_actions_addinherit_np(&mut fa, 2);
         let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
         libc::posix_spawnattr_init(&mut attr);
         // Its own process group, so a test's group is only the VM's.
-        libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETPGROUP as libc::c_short);
+        libc::posix_spawnattr_setflags(
+            &mut attr,
+            (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT) as libc::c_short,
+        );
         libc::posix_spawnattr_setpgroup(&mut attr, 0);
         let env: [*const c_char; 1] = [std::ptr::null()];
         let rc = libc::posix_spawn(
@@ -1491,6 +1564,11 @@ fn start_watcher() {
         return;
     }
     WATCH_FD.store(fwe_kernel::fdtable::reserve(fds[1]), SeqCst);
+}
+
+/// The stand-in's own descriptor, which a fork child must not be given.
+pub fn own_fd() -> i32 {
+    WATCH_FD.load(SeqCst)
 }
 
 fn tell_watcher(b: u8) {

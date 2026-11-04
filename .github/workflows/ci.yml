@@ -64,6 +64,12 @@ jobs:
           done
           target/debug/fwe --host-info || echo "(host-info exit $?)"
       - run: cargo test -p fwe-native --test host -- --nocapture
+      - name: The VM backend's tests run (on the stand-in), not skip
+        run: |
+          out="$(cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
+          echo "$out"
+          if echo "$out" | grep -q "skipped:"; then exit 1; fi
+          echo "$out" | grep -q "test result: ok"
       - run: cargo test
 
   # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs

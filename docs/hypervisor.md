@@ -184,7 +184,9 @@ and checked to be the identity; exceptions at EL0 going through the vector
 to `hvc` with `ESR_EL1` and the other EL1 registers set, and direct exits for
 stage-2 aborts, `wfi`/`wfe` and the physical counter; `hv_vcpus_exit` from
 any thread or signal handler. Only one vCPU emulates at a time, handed on
-every few milliseconds.
+at the next block whenever another waits, and each emulated CPU is driven
+only by its own thread (one stopped or changed from another sometimes
+resumed with its registers and pc out of step).
 
 And it checks the rules the backend must keep, printing a line with
 `fwe hv stand-in: VIOLATION:` on which the tests fail: a vCPU used from a

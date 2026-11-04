@@ -1,7 +1,7 @@
 //! The flight recorder (`--hv-record DEST`, or `FWE_HV_RECORD=DEST` for the
 //! first process): a line per framework call that changes the VM's state —
-//! made, mapped, unmapped, a vCPU made, stopped or destroyed, the VM
-//! destroyed — written before the call and after it, plus the process's
+//! made, mapped, unmapped, a vCPU made or destroyed, the VM destroyed —
+//! written before the call and after it, plus the process's
 //! start, its `execve` and fork children, and a heartbeat with the count of
 //! `hv_vcpu_run` calls every half second.
 //!
@@ -10,7 +10,9 @@
 //! `docs/hypervisor.md`): the record shows what every VM process was doing
 //! up to the crash. A watchdog reset loses what the system had not yet
 //! written, so each line is written synchronously: to a file (`file:PATH`),
-//! with `F_FULLFSYNC` so it is on the disk before the call it announces, or
+//! with `F_FULLFSYNC` so it is on the disk before the call it announces
+//! (a vCPU's destruction, which every thread records at once as a process
+//! ends, is synced by the VM's destruction after it), or
 //! as a UDP datagram to another machine (`udp:HOST:PORT`), which a reset
 //! cannot take back. Several destinations are separated by commas; the
 //! setting is passed on to every fwe a guest's `execve`, `fork` or `vfork`
@@ -37,7 +39,12 @@ static RUNS: AtomicU64 = AtomicU64::new(0);
 /// Start recording to `spec` (`file:PATH` and/or `udp:HOST:PORT`, comma
 /// separated). Called at startup.
 pub fn start(spec: &str) -> Result<(), String> {
+    // fwe's own descriptors live above the guest's range, which this sets:
+    // the guest must never see, reuse or close the record's.
+    fwe_kernel::fdtable::init();
     let mut fds = Vec::new();
+    // What is passed on, with each host resolved once, here.
+    let mut resolved = Vec::new();
     for part in spec.split(',').filter(|p| !p.is_empty()) {
         let fd = if let Some(path) = part.strip_prefix("file:") {
             let c = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
@@ -52,6 +59,7 @@ pub fn start(spec: &str) -> Result<(), String> {
             if fd < 0 {
                 return Err(format!("{path}: {}", std::io::Error::last_os_error()));
             }
+            resolved.push(part.to_string());
             (fd, true)
         } else if let Some(addr) = part.strip_prefix("udp:") {
             use std::net::ToSocketAddrs;
@@ -61,6 +69,7 @@ pub fn start(spec: &str) -> Result<(), String> {
                 .find(|a| a.is_ipv4())
                 .ok_or_else(|| format!("{addr}: no IPv4 address"))?;
             let std::net::SocketAddr::V4(v4) = to else { unreachable!() };
+            resolved.push(format!("udp:{v4}"));
             // SAFETY: a UDP socket connected to `v4`, from a filled-in
             // address record.
             let fd = unsafe {
@@ -87,7 +96,7 @@ pub fn start(spec: &str) -> Result<(), String> {
         };
         fds.push((fwe_kernel::fdtable::reserve(fd.0), fd.1));
     }
-    let _ = SINKS.set(Sinks { spec: spec.to_string(), fds });
+    let _ = SINKS.set(Sinks { spec: resolved.join(","), fds });
     std::thread::Builder::new()
         .name("fwe-hv-record".into())
         .spawn(|| {
@@ -111,6 +120,11 @@ pub fn active() -> bool {
 /// Its destinations, to pass on to the processes fwe starts.
 pub fn spec() -> Option<&'static str> {
     SINKS.get().map(|s| s.spec.as_str())
+}
+
+/// Its descriptors, which a fork child must not be given (it opens its own).
+pub fn own_fds() -> Vec<i32> {
+    SINKS.get().map(|s| s.fds.iter().map(|&(fd, _)| fd).collect()).unwrap_or_default()
 }
 
 /// Count an `hv_vcpu_run`.
@@ -208,6 +222,18 @@ impl Line {
 
     /// Write the line to every destination, synchronously.
     pub fn emit(&mut self) {
+        self.send(true);
+    }
+
+    /// Write the line without waiting for the disk: for what many threads
+    /// record at once while a process ends, which must not hold up its
+    /// teardown. The next synced line (the VM's destruction) puts it on the
+    /// disk too; a datagram goes at once either way.
+    pub fn emit_unsynced(&mut self) {
+        self.send(false);
+    }
+
+    fn send(&mut self, sync: bool) {
         let Some(sinks) = SINKS.get() else { return };
         self.buf[self.n] = b'\n';
         let len = self.n + 1;
@@ -216,7 +242,7 @@ impl Line {
             // puts it on the disk itself, past the drive's cache.
             unsafe {
                 libc::write(fd, self.buf.as_ptr().cast(), len);
-                if file {
+                if file && sync {
                     libc::fcntl(fd, libc::F_FULLFSYNC);
                 }
             }
@@ -231,8 +257,9 @@ pub fn event(what: &str, detail: &[u8]) {
     }
 }
 
-/// Record the start of framework call `name` with `args`.
-pub fn begin(name: &str, args: &[u64]) {
+/// Record the start of framework call `name` with `args`; `sync` as for
+/// [`Line::emit`] or [`Line::emit_unsynced`].
+pub fn begin(name: &str, args: &[u64], sync: bool) {
     if !active() {
         return;
     }
@@ -241,12 +268,12 @@ pub fn begin(name: &str, args: &[u64]) {
     for &a in args {
         l.s(" ").hex(a);
     }
-    l.emit();
+    l.send(sync);
 }
 
 /// Record the end of framework call `name`, which returned `rc`.
-pub fn end(name: &str, rc: i32) {
+pub fn end(name: &str, rc: i32, sync: bool) {
     if active() {
-        Line::new().s("< ").s(name).s(" = ").hex(rc as u32 as u64).emit();
+        Line::new().s("< ").s(name).s(" = ").hex(rc as u32 as u64).send(sync);
     }
 }
