@@ -18,6 +18,13 @@ options:
   --hv-spike   check that the hypervisor backend can run here: a tiny guest
                in a VM (see docs/hypervisor.md; Apple Silicon, needs the
                entitlement)
+  --hv-standin run the hypervisor backend on a software stand-in for
+               Hypervisor.framework instead of a real VM (for development
+               and tests; needs Unicorn; must come first)
+  --hv-record DEST
+               record the hypervisor backend's VM calls, synchronously, to
+               file:PATH and/or udp:HOST:PORT (comma separated; also
+               FWE_HV_RECORD; must come first; see docs/hypervisor.md)
   -h, --help   show this help
   -V, --version
 ";
@@ -25,11 +32,49 @@ options:
 fn main() -> ExitCode {
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
-    if std::env::args_os().nth(1).is_some_and(|a| a == "--hv-fork-child") {
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // These come first, as fwe passes them on to every process it starts
+    // for the guest.
+    let mut record = std::env::var("FWE_HV_RECORD").ok().filter(|s| !s.is_empty());
+    loop {
+        match args.first().map(|a| a.as_bytes()) {
+            Some(b"--hv-standin") => {
+                args.remove(0);
+                if !fwe_native::hv::use_standin() {
+                    eprintln!("fwe: --hv-standin needs Apple Silicon macOS");
+                    return ExitCode::from(2);
+                }
+            }
+            Some(b"--hv-record") if args.len() > 1 => {
+                args.remove(0);
+                record = Some(args.remove(0).to_string_lossy().into_owned());
+            }
+            _ => break,
+        }
+    }
+    if let Some(spec) = record {
+        if let Err(e) = fwe_native::hv::start_recording(&spec) {
+            eprintln!("fwe: --hv-record: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    if args.first().is_some_and(|a| a == "--hv-standin-watch") {
+        // The stand-in's watcher of one VM process; not for direct use.
+        fwe_native::hv::standin_watch(
+            &args.get(1).map(|a| a.to_string_lossy()).unwrap_or_default(),
+        );
+    }
+    if args.first().is_some_and(|a| a == "--hv-fork-child") {
         // A fork child of a VM process (see hv::fork); not for direct use.
         fwe_native::hv::fork_child();
     }
-    let mut args = std::env::args_os().skip(1).peekable();
+    // Anywhere else they would come too late: `--hv-spike --hv-standin`
+    // would reach the real framework first.
+    if let Some(late) = late_leading_option(&args) {
+        eprintln!("fwe: {late} must come first\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {
@@ -84,6 +129,12 @@ fn main() -> ExitCode {
                 println!("{}", fwe_native::host_support());
                 return ExitCode::SUCCESS;
             }
+            // The spike is the real framework's own check: it creates a VM
+            // with no stand-in behind it.
+            b"--hv-spike" if fwe_native::hv::standin_active() => {
+                eprintln!("fwe: --hv-spike tests the real Hypervisor.framework, not the stand-in");
+                return ExitCode::from(2);
+            }
             b"--hv-spike" => {
                 // A quick check that a VM runs here (docs/hypervisor.md).
                 return match fwe_native::hv::spike() {
@@ -137,4 +188,20 @@ fn main() -> ExitCode {
     eprintln!("fwe: {}: {error}", path.display());
     // The shell's "cannot execute" status.
     ExitCode::from(126)
+}
+
+/// `--hv-standin` or `--hv-record` among fwe's own options after the first
+/// position (the guest's arguments, after its program, are not looked at).
+fn late_leading_option(args: &[OsString]) -> Option<String> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_bytes() {
+            b"--hv-standin" | b"--hv-record" => return Some(a.to_string_lossy().into_owned()),
+            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--probe" => i += 2,
+            b"--" => return None,
+            o if o.starts_with(b"-") => i += 1,
+            _ => return None,
+        }
+    }
+    None
 }

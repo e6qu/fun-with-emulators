@@ -56,7 +56,7 @@ same way. See [docs/architecture.md](docs/architecture.md).
 | `crates/abi` | Linux arm64 userspace ABI: syscall numbers, errno, flags, structs |
 | `crates/elf` | ELF parsing and load planning |
 | `crates/kernel` | Linux system call implementations on top of the host |
-| `crates/native` | Native execution backend: loader, instruction rewriting, traps; the hypervisor spike |
+| `crates/native` | Native execution backend: loader, instruction rewriting, traps; the hypervisor backend and its stand-in |
 | `crates/fwe` | The `fwe` command and end-to-end tests |
 | `guests/asm`, `guests/c`, `guests/rust` | Linux test programs built by the tests |
 | `guests/musl`, `guests/glibc`, `guests/debian` | Vendored, unmodified runtimes and Debian binaries the tests run |
@@ -71,7 +71,9 @@ cargo test
 
 On macOS on Apple Silicon this includes the end-to-end tests, which build the
 programs in `guests/` (needs `clang`, from the Xcode command line tools) and
-run them under `fwe`. Elsewhere only unit tests run. See
+run them under `fwe`; the hypervisor backend's run on a software stand-in
+for Hypervisor.framework, which needs Unicorn (`brew install unicorn`), and
+never in a real VM unless asked for. Elsewhere only unit tests run. See
 [AGENTS.md](AGENTS.md) for the full set of checks CI runs.
 
 ## License

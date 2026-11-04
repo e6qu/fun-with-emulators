@@ -97,8 +97,9 @@ Remaining:
   runs at EL0 in a Hypervisor.framework VM, its `svc` trapping unchanged;
   fwe picks the backend automatically. Static and dynamically linked
   programs, signals included (see [docs/hypervisor.md](docs/hypervisor.md)).
-  Its tests run on an Apple Silicon Mac and the self-hosted runner (the
-  `hypervisor` job); hosted runners cannot run a VM and skip them
+  Its tests run on a software stand-in for Hypervisor.framework everywhere
+  (hosted CI included), and on the real framework on the self-hosted runner
+  (the `hypervisor` job)
 - [x] In the VM: threads, and `execve` between the VM and the native backend
   either way (fwe re-executes itself on the new program)
 - [x] In the VM: `fork` and `vfork`: the child is a fresh fwe process given

@@ -82,7 +82,43 @@ after it. That points to kernel state left behind rather than the moment of
 teardown; the panic of the second crash, in a kernel thread, lands near the
 kernel's thread-destruction code. The exact path is Apple's, and the panic
 reports are too thin to show it, so the backend rules out everything on its
-side of it:
+side of it.
+
+It went down a fourth time on 4 November at about 13:47, again a watchdog
+reset with no stackshot, and this time with no other hypervisor client
+running: `krunkit` had been stopped three and a half minutes before. Eight
+VM tests had passed one at a time, then for a minute a `vfork` test and four
+runs of one of its scenarios each started a child whose VM could not map
+the parent's read-only code (`hv_vm_map` failed, since a shared memory entry
+of read-only memory carries no write permission), which tore its VM down and
+exited. The crash came 30 to 40 seconds after the last of them, with nothing
+about fwe or the hypervisor in the system log. So `krunkit` running
+alongside is not needed for a crash, and a VM that fails to map memory and
+is then destroyed joins the suspects.
+
+A fifth crash, the same day at 16:03:48, came during a deliberate,
+fully recorded real run (the flight recorder, below, synced to disk). The
+record shows the map-rules probe agreeing with the stand-in, then the fork
+tests: 19 fork children and 3 vfork children that exec'd all ended cleanly.
+The last lines are a glibc `posix_spawn` vfork child, which had mapped the
+parent's writable memory *shared* into its own VM (its spawn stack
+included), failing its `execve` as the test intends, destroying its VM and
+exiting; 5 ms later the parent took that same stack out of its own VM and
+mapped one more range — and nothing was ever written again. Crash 4 also
+followed vfork children with shared memory. The path inside the kernel is
+still unknown, but the runtimes that run Linux programs on Apple Silicon
+the same way without such reports (hyper-linux, elfuse, Carrick) all avoid
+what fwe does here: they map guest memory into the VM once and never
+change stage 2 or the host memory behind it while the VM runs (guest
+`mmap`/`munmap`/`mprotect` only edit the guest's page tables), they give a
+fork child a copy-on-write copy rather than pages mapped into both VMs,
+and none maps a vfork child's memory into a second VM. The backend's
+memory model is being reworked to match.
+
+Since then **a plain `cargo test` never starts a VM**: the VM tests run on
+a software stand-in for the framework (below), and on the real one only when
+asked for (`FWE_HV_TESTS=1`), which only a machine whose crash costs nothing
+should set. Everything else the backend does to stay clear of the crash:
 
 - **Every way out tears the VM down first:** `exit_group`, the last thread's
   `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
@@ -151,6 +187,82 @@ The child maps the memory, rebuilds the kernel (and the kqueues behind
 same guest mappings and resumes after the `svc` with `x0` = 0. See
 [architecture.md](architecture.md#processes) for the state carried over.
 
+## The stand-in
+
+`fwe --hv-standin` runs the backend on a software stand-in for
+Hypervisor.framework (`crates/native/src/hv/standin.rs`): every framework
+call the backend makes goes to an emulated CPU instead, Unicorn (QEMU's CPU
+emulator as a library, `brew install unicorn`), loaded only in this mode. It
+creates no VM, so it is safe on any Mac and runs in hosted CI; the flag is
+passed on to every fwe a guest's `execve`, `fork` or `vfork` starts.
+
+It models what the backend relies on: one VM per process and one vCPU per
+thread; stage 2 as exactly the memory mapped with `hv_vm_map`, with its
+flags; stage 1 as fwe's own tables, read from guest memory at the first run
+and checked to be the identity; exceptions at EL0 going through the vector
+to `hvc` with `ESR_EL1` and the other EL1 registers set, and direct exits for
+stage-2 aborts, `wfi`/`wfe` and the physical counter; `hv_vcpus_exit` from
+any thread or signal handler. Only one vCPU emulates at a time, handed on
+at the next block whenever another waits, and each emulated CPU is driven
+only by its own thread: Unicorn's API, `uc_emu_stop` included, races with
+an engine running on another thread (on Apple Silicon every call updates
+the engine's JIT write-protection bookkeeping unsynchronised), which lost
+guest register updates. Emulation is several times slower than the CPU, so
+the tests give a guest on the stand-in a longer time limit.
+
+And it checks the rules the backend must keep, printing a line with
+`fwe hv stand-in: VIOLATION:` on which the tests fail: a vCPU used from a
+thread other than its own, a VM destroyed with vCPUs alive, a vCPU run
+before its translation regime is set or leaving EL0, and — through a
+watcher process started with the VM — a process that ends or execs with its
+VM alive. A refused `hv_vm_map` is reported too, and fails as the framework
+fails it: misaligned (16 KiB), overlapping, or over host memory that is not
+mapped or could never be readable and writable. That last rule is inferred,
+not documented: the framework mapped memory whose most was RWX or RW
+(executable included) but refused a `vfork` child's shared code, which
+could only ever be read. The stand-in reproduces that failure.
+
+A stand-in proves nothing about the real framework. Its own rules are what
+fwe has seen the framework do, and the kernel crashes the backend may cause
+cannot happen in it. So VM changes are also run on real hardware now and
+then, on a machine whose crash costs nothing, instrumented so that a crash
+can be traced (below). Not modelled: the virtual timer, the fault address of an
+alignment fault outside the exclusive and atomic instructions, stack-pointer
+alignment checks, and code one vCPU writes for another without a mapping
+change. `FWE_STANDIN_DEBUG=1` reports each exception and exit it models.
+
+## Real-hardware runs and the flight recorder
+
+Real runs happen on a machine whose crash costs nothing — the self-hosted
+runner of the `hypervisor` CI job, such as a rented bare-metal cloud Mac —
+and are instrumented so that a crash can be traced. The crashes so far were
+watchdog resets that left no stackshot and lost the last seconds of the
+system log, so the evidence has to be kept by fwe itself:
+
+- **The flight recorder** (`--hv-record DEST`, or `FWE_HV_RECORD=DEST`; in
+  `crates/native/src/hv/record.rs`) writes a line before and after every
+  framework call that changes a VM — `hv_vm_create`, `hv_vm_map`,
+  `hv_vm_unmap`, `hv_vcpu_create`, `hv_vcpus_exit`, `hv_vcpu_destroy`,
+  `hv_vm_destroy` — with its arguments and result, each process's start,
+  `execve`, fork children and end (exit status or signal), and a heartbeat
+  with the count of `hv_vcpu_run` calls every half second. Each line is
+  written synchronously: to `file:PATH` with `F_FULLFSYNC`, so it is on the
+  disk before the call it announces, and/or to `udp:HOST:PORT` as a datagram
+  to another machine, which a reset cannot take back; there
+  `tools/hv-record-listen.py PORT` collects them. The setting reaches every
+  fwe a guest starts. A call begun and never ended names what was running
+  when the machine went down.
+- **The `hypervisor` job** records every run to a file outside its
+  workspace (and to `FWE_HV_RECORD_UDP`, a repository variable, if set),
+  marks the record finished at the end, and at its start reports any
+  earlier record that never finished, with its last lines, alongside the
+  boot time and the panic reports — so the run after a crash shows what the
+  crashed one was doing. The record is also kept as a job artifact.
+- **The stand-in's inferred rules are checked**: the job runs
+  `fwe --probe hv-map-rules` on the framework and on the stand-in, and fails
+  if the framework maps host memory the stand-in would refuse, or the other
+  way round.
+
 ## Running it (Apple Silicon, no root)
 
 ```sh
@@ -168,9 +280,13 @@ reports the status 42 the guest exits with. `sysctl kern.hv_support` must be
 
 ## Tests and CI
 
-The end-to-end tests whose names start with `hv_` sign a copy of `fwe` with the
-entitlement and run low-linked programs in the VM, one test at a time.
-Where the host has no hypervisor they report that they were skipped and pass.
+The end-to-end tests whose names start with `hv_` run low-linked programs in
+the VM backend. By default they use the stand-in, with the unsigned `fwe`,
+which could not create a real VM even by mistake (the tests check it carries
+no entitlement). With `FWE_HV_TESTS=1` they sign a copy of `fwe` with the
+entitlement and use the real framework, one test at a time. Where neither
+can run (no Unicorn; no hypervisor), they report that they were skipped and
+pass.
 
 GitHub's hosted macOS runners are themselves virtual machines without nested
 virtualization, so Hypervisor.framework is unavailable there. This is
@@ -182,9 +298,9 @@ reports it:
 - Both: `hv_vm_create` returns `0xfae9400f` (`HV_UNSUPPORTED`), even though the
   binary is correctly signed with the entitlement.
 
-So in hosted CI the backend is compiled and lint-checked (it cannot rot) but
-its tests skip. They run for real on a **self-hosted Apple Silicon runner**,
-in the `hypervisor` job.
+So in hosted CI the backend's tests run on the stand-in, and on the real
+framework only on a **self-hosted Apple Silicon runner**, in the
+`hypervisor` job.
 
 ### Registering the self-hosted runner (one time)
 
@@ -199,7 +315,14 @@ Then set the repository variable that enables the job:
 `Settings → Secrets and variables → Actions → Variables → New variable`,
 name `FWE_HV_SELF_HOSTED`, value `true`. The job stays skipped until this is
 set, so it never blocks PRs when no runner exists. Once set, it runs the
-`hv_` end-to-end tests and `fwe --hv-spike` on every push.
+`hv_` end-to-end tests (with `FWE_HV_TESTS=1`) and `fwe --hv-spike` on every
+push.
 
-Until then, the tests run wherever a developer runs `cargo test` on an Apple
-Silicon Mac.
+The runner should be a machine whose crash costs nothing, such as a rented
+bare-metal cloud Mac, never the development Mac. Install Unicorn there too
+(`brew install unicorn`, which the job also does) for the probe comparison,
+and make sure the runner service's `PATH` includes Homebrew
+(`/opt/homebrew/bin`), as it does not by default.
+To have the record streamed off the machine, run
+`tools/hv-record-listen.py PORT` on a machine that can receive from it and
+set the repository variable `FWE_HV_RECORD_UDP` to `udp:HOST:PORT`.

@@ -213,8 +213,8 @@ pub fn remember_exe() {
 /// a program of the other kind. What Linux keeps across `execve` the host
 /// keeps across its own: the pid, descriptors not marked close-on-exec (the
 /// guest's flag is the host's), the signal mask, pending signals and ignored
-/// dispositions; the root filesystem, working directory and `--strace` are
-/// passed on. Other threads end, as on Linux. Returns a Linux errno only if
+/// dispositions; the root filesystem, working directory, `--strace`,
+/// `--hv-standin` and `--hv-record` are passed on. Other threads end, as on Linux. Returns a Linux errno only if
 /// the program cannot be run; on success it does not return.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reexec(
@@ -236,8 +236,9 @@ pub(crate) fn reexec(
         return err(errno::ENOEXEC);
     }
     let Some(fwe) = FWE_EXE.get() else { return err(errno::ENOEXEC) };
-    let mut argv: Vec<Vec<u8>> =
-        vec![fwe.as_os_str().as_bytes().to_vec(), b"--guest-path".to_vec()];
+    let mut argv: Vec<Vec<u8>> = vec![fwe.as_os_str().as_bytes().to_vec()];
+    argv.extend(hv::passed_on());
+    argv.push(b"--guest-path".to_vec());
     if strace {
         argv.push(b"--strace".to_vec());
     }
@@ -545,6 +546,8 @@ pub fn probe(name: &str) -> Result<String, String> {
             true
         })
         .map(|_| "waited in mode".into()),
+        // Creates a VM unless under --hv-standin (see hv::probe).
+        "hv-map-rules" => hv::map_rules_probe(),
         _ => Err(format!("unknown probe {name}")),
     }
 }

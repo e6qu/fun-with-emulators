@@ -41,12 +41,17 @@ jobs:
           path: target/debian-packages
           key: debian-packages-${{ hashFiles('guests/debian/fetch/*.txt') }}
       - run: sw_vers && uname -m && clang --version
+      # The VM backend's tests run on the software stand-in for
+      # Hypervisor.framework here, which needs Unicorn.
+      - run: brew install unicorn
       - run: cargo build
       - name: Report hypervisor availability (informational)
         run: |
           echo "kern.hv_support:"; sysctl kern.hv_support 2>&1 || true
-          codesign --sign - --entitlements hypervisor.entitlements --force target/debug/fwe || true
-          if target/debug/fwe --hv-spike; then
+          # A signed copy: the tests' own fwe stays without the entitlement.
+          cp target/debug/fwe target/debug/fwe-hv-probe
+          codesign --sign - --entitlements hypervisor.entitlements --force target/debug/fwe-hv-probe || true
+          if target/debug/fwe-hv-probe --hv-spike; then
             echo "hypervisor: AVAILABLE on this runner"
           else
             echo "hypervisor: unavailable here (expected on GitHub-hosted runners," \
@@ -59,6 +64,13 @@ jobs:
           done
           target/debug/fwe --host-info || echo "(host-info exit $?)"
       - run: cargo test -p fwe-native --test host -- --nocapture
+      - name: The VM backend's tests run (on the stand-in), not skip
+        run: |
+          set +e
+          cargo test -p fwe --test guests hv_ -- --nocapture 2>&1 | tee hv-tests.log
+          status=${PIPESTATUS[0]}
+          if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
+          exit "$status"
       - run: cargo test
 
   # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs
@@ -71,21 +83,70 @@ jobs:
     name: Hypervisor backend (self-hosted Apple Silicon)
     if: ${{ vars.FWE_HV_SELF_HOSTED == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
+    env:
+      # The flight recorder (docs/hypervisor.md): synchronously to a file
+      # that outlives the runner's workspace, and to another machine if the
+      # repository variable FWE_HV_RECORD_UDP (udp:HOST:PORT) is set.
+      HV_RECORDS: ${{ github.workspace }}/../fwe-hv-records
     steps:
       - uses: actions/checkout@v4
+      - name: Report earlier runs that did not finish (a crash)
+        run: |
+          mkdir -p "$HV_RECORDS"
+          echo "booted: $(sysctl -n kern.boottime)"; sw_vers; uptime
+          for log in "$HV_RECORDS"/*.log; do
+            [ -e "$log" ] || continue
+            if ! grep -q " run finished$" "$log"; then
+              echo "::warning::$log did not finish; its last records:"
+              tail -n 60 "$log"
+            fi
+          done
+          echo "panic reports:"; ls -lt /Library/Logs/DiagnosticReports/ | grep -iE "panic|ResetCounter" | head -10 || true
+          # The tests skip while another hypervisor client runs.
+          ps -axco comm= | grep -iE "krunkit|vfkit|qemu-system|Virtualization|limactl|UTM|VirtualBoxVM|prl_vm" || echo "no other hypervisor client"
       - run: sysctl kern.hv_support
+      - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
       - run: cargo build --release -p fwe
+      - name: Start the flight record
+        run: |
+          log="$HV_RECORDS/${{ github.run_id }}-${{ github.run_attempt }}.log"
+          echo "fwe-hv $(date +%s).000000 run ${{ github.run_id }} of ${{ github.sha }} starts" >> "$log"
+          spec="file:$log"
+          if [ -n "${{ vars.FWE_HV_RECORD_UDP }}" ]; then spec="$spec,${{ vars.FWE_HV_RECORD_UDP }}"; fi
+          echo "FWE_HV_RECORD=$spec" >> "$GITHUB_ENV"
+          echo "HV_LOG=$log" >> "$GITHUB_ENV"
       - name: Codesign and run the hypervisor spike
         run: |
           codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
+          echo "fwe-hv $(date +%s).000000 spike starts" >> "$HV_LOG"
           out="$(target/release/fwe --hv-spike)"
+          echo "fwe-hv $(date +%s).000000 spike ends" >> "$HV_LOG"
           echo "$out"
           echo "$out" | grep -qx "hv: hello from the guest"
           echo "$out" | grep -q "guest exited with status 42"
+      - name: Compare the stand-in's hv_vm_map rule with the framework's
+        run: |
+          real="$(target/release/fwe --hv-record "$FWE_HV_RECORD" --probe hv-map-rules)"
+          standin="$(env -u FWE_HV_RECORD target/release/fwe --hv-standin --probe hv-map-rules)"
+          echo "framework:"; echo "$real"
+          if [ "$real" != "$standin" ]; then
+            echo "::error::the stand-in's rule differs from the framework's:"
+            diff <(echo "$standin") <(echo "$real") || true
+            exit 1
+          fi
       - name: Run the hypervisor backend's end-to-end tests
         run: |
-          out="$(cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
-          echo "$out"
+          set +e
+          FWE_HV_TESTS=1 cargo test -p fwe --test guests hv_ -- --nocapture 2>&1 | tee hv-tests.log
+          status=${PIPESTATUS[0]}
           # They skip silently where the VM cannot run; here they must not.
-          if echo "$out" | grep -q "skipped: no hypervisor"; then exit 1; fi
-          echo "$out" | grep -q "test result: ok"
+          if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
+          exit "$status"
+      - name: Close the flight record
+        if: always() && env.HV_LOG != ''
+        run: echo "fwe-hv $(date +%s).000000 run ${{ github.run_id }} run finished" >> "$HV_LOG"
+      - uses: actions/upload-artifact@v4
+        if: always() && env.HV_LOG != ''
+        with:
+          name: hv-flight-record
+          path: ${{ env.HV_LOG }}

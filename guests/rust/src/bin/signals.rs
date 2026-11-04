@@ -644,6 +644,36 @@ fn main() {
             println!("shared memory shared: {}", unsafe { *shared } == b'c');
             println!("{}", describe(status));
         }
+        // A fork child reading a pipe until its end: the end comes once
+        // the parent closes its write end, as no one else holds one.
+        "fork-pipe" => {
+            let mut p = [0i32; 2];
+            // SAFETY: a valid two-element array.
+            unsafe { assert!(pipe(p.as_mut_ptr()) == 0) };
+            let pid = child(move || {
+                // SAFETY: the child's own descriptors and a local buffer.
+                unsafe {
+                    close(p[1]);
+                    let (mut got, mut b) = (0, [0u8; 16]);
+                    loop {
+                        let n = read(p[0], b.as_mut_ptr(), b.len());
+                        if n <= 0 {
+                            break;
+                        }
+                        got += n;
+                    }
+                    println!("child read {got} bytes, then the end");
+                }
+                0
+            });
+            // SAFETY: the parent's own descriptors.
+            unsafe {
+                close(p[0]);
+                write(p[1], b"hello".as_ptr(), 5);
+                close(p[1]);
+            }
+            println!("{}", describe(wait_status(pid)));
+        }
         // A fork while another thread writes sees one instant of the
         // process: the thread bumps a counter in the executable's image and
         // then one on the heap, so any instant has them equal or the first

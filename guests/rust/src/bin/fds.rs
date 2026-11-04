@@ -51,7 +51,14 @@ fn main() {
         // Close every descriptor from 3 to the limit, as daemons and spawn
         // helpers do, keeping only an eventfd and a signalfd: paths still
         // resolve, and both descriptors still work.
-        Some("close-all") => {
+        // The same after raising the soft limit to the hard one, so the
+        // closing reaches every descriptor the guest could ever have.
+        Some(mode @ ("close-all" | "close-all-hard")) => {
+            if mode == "close-all-hard" {
+                let lim = nofile();
+                // SAFETY: a valid in-parameter.
+                unsafe { setrlimit(RLIMIT_NOFILE, &Rlimit { cur: lim.max, max: lim.max }) };
+            }
             let mut mask = [0u64; 16];
             mask[0] = 1 << (SIGUSR1 - 1);
             // SAFETY: valid sets; plain calls.

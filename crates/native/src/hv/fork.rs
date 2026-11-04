@@ -197,8 +197,8 @@ struct Region {
 
 /// One memory entry per region of guest memory, with the regions. Private
 /// memory is snapshotted copy-on-write, shared memory shared; for a `vfork`
-/// child (`share_all`) private memory is shared too, while each region keeps
-/// its kind for the child's own later forks. A region the host has made
+/// child (`share_all`) writable private memory is shared too, while each
+/// region keeps its kind for the child's own later forks. A region the host has made
 /// unreadable is made readable for the moment it takes.
 fn take_memory(share_all: bool) -> Result<(Vec<Region>, Vec<Port>), String> {
     // The child can only rebuild a VM whose memory is all in the window.
@@ -229,7 +229,14 @@ fn take_memory(share_all: bool) -> Result<(Vec<Region>, Vec<Port>), String> {
                 // kernel lock held; restored below.
                 unsafe { libc::mprotect(lo as *mut _, (hi - lo) as usize, libc::PROT_READ) };
             }
-            let mode = if shared || share_all { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
+            // A vfork child shares the parent's writable memory, so what it
+            // writes reaches the parent. Read-only memory (the program's
+            // code and constants) is copied as for a fork: a shared entry
+            // of it can only be read, and the child could not map it into
+            // its VM.
+            let writable = prot & libc::PROT_WRITE != 0;
+            let mode =
+                if shared || share_all && writable { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
             let mut entry = 0;
             let mut max = VM_PROT_READ | VM_PROT_WRITE;
             let mut kr = KERN_SUCCESS;
@@ -338,6 +345,9 @@ fn guarded(fd: i32, kind: u32) -> bool {
 /// parent's pipe.
 fn descriptors(skip: i32) -> Vec<(i32, bool)> {
     let vfork_word = VFORK_WORD.load(Ordering::SeqCst);
+    // The flight recorder's and the stand-in's: the child opens its own.
+    let mut own = super::record::own_fds();
+    own.push(super::standin::own_fd());
     // SAFETY: with no buffer, the call reports the size the list needs.
     let need = unsafe {
         libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
@@ -356,6 +366,7 @@ fn descriptors(skip: i32) -> Vec<(i32, bool)> {
             f.proc_fdtype != libc::PROX_FDTYPE_KQUEUE as u32
                 && f.proc_fd != skip
                 && f.proc_fd != vfork_word
+                && !own.contains(&f.proc_fd)
                 && !guarded(f.proc_fd, f.proc_fdtype)
         })
         .map(|f| {
@@ -441,6 +452,10 @@ pub(super) fn fork(
                 state.extend_from_slice(&e.into_bytes());
                 let r = spawn_child(&fds, &entries, &state);
                 release_ports(&entries);
+                if let Ok(pid) = r {
+                    let what = if vfork { b"vfork child" } else { b"fork child " };
+                    super::record::Line::new().bytes(what).s(" ").dec(pid as u64).emit();
+                }
                 r
             }
             Err(msg) => Err(msg),
@@ -503,8 +518,14 @@ fn spawn_child(fds: &[(i32, bool)], entries: &[Port], state: &[u8]) -> Result<i3
     let Some(fwe) = crate::FWE_EXE.get() else { return Err("fwe's own path is unknown".into()) };
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(fwe.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let flag = c"--hv-fork-child";
-    let argv = [path.as_ptr(), flag.as_ptr(), std::ptr::null()];
+    let mut words: Vec<std::ffi::CString> = super::passed_on()
+        .into_iter()
+        .map(|w| std::ffi::CString::new(w).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    words.insert(0, path.clone());
+    words.push(c"--hv-fork-child".to_owned());
+    let mut argv: Vec<*const libc::c_char> = words.iter().map(|w| w.as_ptr()).collect();
+    argv.push(std::ptr::null());
 
     // A receive right of ours becomes the child's bootstrap port.
     let mut rx: Port = 0;
@@ -678,9 +699,11 @@ fn hand_off(rx: Port, pid: i32, entries: &[Port], state: &[u8]) -> Result<(), St
 /// The child's side: `fwe --hv-fork-child`. Takes the parent's memory and
 /// state, builds a VM and resumes the guest. Does not return.
 pub fn child() -> ! {
+    super::record::event("fork child starts", b"");
     match become_child() {
         Ok(never) => match never {},
         Err(msg) => {
+            super::record::event("fork child failed:", msg.as_bytes());
             // The parent sees the pipe close without its byte and reports
             // the fork failed. A VM made by then goes first.
             note(&format!("fork child: {msg}"));

@@ -41,11 +41,19 @@ runners. The end-to-end tests build the guests into `target/guests` and need
 `clang` from the Xcode command line tools.
 
 The hypervisor backend needs the hypervisor entitlement and a bare-metal
-Apple Silicon host. Its end-to-end tests (`hv_*`) sign a copy of `fwe`
-themselves and run wherever `cargo test` runs on such a Mac; in the hosted
-CI jobs they skip, and the self-hosted `hypervisor` job runs them; set
-`FWE_NO_HV=1` to skip them on a Mac that could run them. To run a
-low-linked program by hand:
+Apple Silicon host. Its end-to-end tests (`hv_*`) run on a software
+stand-in for Hypervisor.framework (`fwe --hv-standin`, which needs
+`brew install unicorn`), and on the real framework only with
+`FWE_HV_TESTS=1`, which the self-hosted `hypervisor` job sets. Do not set it,
+or run a VM program by hand, on the development Mac: it went down four times
+while this backend was built (see [docs/hypervisor.md](docs/hypervisor.md)).
+On the stand-in, by hand:
+
+```sh
+target/debug/fwe --hv-standin ./program-linked-low
+```
+
+To run a low-linked program on the real framework, on a machine meant for it:
 
 ```sh
 cargo build --release -p fwe
@@ -85,5 +93,8 @@ in the code consistent with what the code now does.
   with the VM alive, and the VM tests run one at a time, never in parallel
   (a forking guest's parent and child each have a VM) and never while
   another hypervisor client such as Podman's `krunkit` runs (stop it first;
-  the tests skip otherwise): the development machine went down three times
+  the tests skip otherwise): the development machine went down four times
   while this backend was built (see [docs/hypervisor.md](docs/hypervisor.md)).
+  VM changes are verified on a machine whose crash costs nothing, with the
+  run instrumented so a crash can be traced; a software stand-in never
+  replaces that.
