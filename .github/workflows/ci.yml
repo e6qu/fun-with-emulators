@@ -66,10 +66,11 @@ jobs:
       - run: cargo test -p fwe-native --test host -- --nocapture
       - name: The VM backend's tests run (on the stand-in), not skip
         run: |
-          out="$(cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
-          echo "$out"
-          if echo "$out" | grep -q "skipped:"; then exit 1; fi
-          echo "$out" | grep -q "test result: ok"
+          set +e
+          cargo test -p fwe --test guests hv_ -- --nocapture 2>&1 | tee hv-tests.log
+          status=${PIPESTATUS[0]}
+          if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
+          exit "$status"
       - run: cargo test
 
   # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs
@@ -135,11 +136,12 @@ jobs:
           fi
       - name: Run the hypervisor backend's end-to-end tests
         run: |
-          out="$(FWE_HV_TESTS=1 cargo test -p fwe --test guests hv_ -- --nocapture 2>&1)"
-          echo "$out"
+          set +e
+          FWE_HV_TESTS=1 cargo test -p fwe --test guests hv_ -- --nocapture 2>&1 | tee hv-tests.log
+          status=${PIPESTATUS[0]}
           # They skip silently where the VM cannot run; here they must not.
-          if echo "$out" | grep -q "skipped:"; then exit 1; fi
-          echo "$out" | grep -q "test result: ok"
+          if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
+          exit "$status"
       - name: Close the flight record
         if: always() && env.HV_LOG != ''
         run: echo "fwe-hv $(date +%s).000000 run ${{ github.run_id }} run finished" >> "$HV_LOG"
