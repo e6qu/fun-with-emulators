@@ -12,8 +12,8 @@ describes how the pieces work and lists the current limitations in detail.
 **Status (November 2026):** M0 and M1 are done. M2 is in progress: its
 system-call surface is implemented, and the hypervisor backend runs
 low-address executables with threads, `fork` and `execve`; what remains is
-Debian's Python, the rest of the process model and running the listed
-software end to end.
+Debian's Python, the `x18` and code-discovery gaps, and running the rest of
+the listed software end to end (git runs).
 
 ## M0 — Foundation (done)
 
@@ -103,17 +103,20 @@ Remaining:
 - [x] In the VM: `fork` and `vfork`: the child is a fresh fwe process given
   the parent's memory copy-on-write and its kernel state
 - [ ] Python from the Debian rootfs (carried over from M1)
-- [ ] The rest of the process model: `execveat`, `clone3`; `vfork` sharing
-  memory with its parent rather than copying it; a native-backend `fork`
-  that stops the parent's other threads while memory is copied; virtual credentials and
-  `RLIMIT_NOFILE` carried across an `execve` that re-executes fwe
+- [x] `execveat` and `clone3`; virtual credentials, `RLIMIT_NOFILE` and the
+  umask carried across an `execve` that re-executes fwe
+- [x] The rest of the process model: `vfork` sharing memory with its parent
+  rather than copying it; a native-backend `fork` that stops the parent's
+  other threads while memory is copied
 - [ ] Code discovery for binaries without section headers, and the `x18`
   forms no tested binary uses yet (`sp`-writeback and `sp`-register-offset
   loads and stores, flag-setting or extended `sp` arithmetic, `casp`,
   pointer-authenticated loads), when a target program needs them
 - [ ] Each of the target programs vendored or fetched as a test with checked
-  output: git, a C compiler, Node, Go, the Rust toolchain, `apt`, a database,
-  a web server
+  output: git (done: Debian's git runs a workflow of commits, branches,
+  merge, stash, rebase, `grep` through PCRE2's JIT, `gc` and a `file://`
+  clone), a C compiler, Node, Go, the Rust toolchain, `apt`, a database, a
+  web server
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.

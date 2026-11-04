@@ -189,6 +189,27 @@ Stubs are placed in regions within `b` range (128 MiB) of their sites: the
 arena reserved after the loaded image, or, for code mapped later, regions
 found by probing near the code.
 
+Memory the guest maps both writable and executable — what a JIT compiler
+writes its code into, such as PCRE2's in `git grep` — macOS never maps so
+(it refuses `PROT_WRITE | PROT_EXEC` without `MAP_JIT`). The kernel keeps
+such memory writable only and records it (`crates/kernel/src/mm.rs`). In
+the native backend the guest's first instruction fetch from a page faults:
+the page's code is prepared as any guest code is and the page becomes
+read-execute; a later write to it faults and makes it read-write again,
+and so on. Preparing code twice is harmless (a rewritten site no longer
+matches), and the guest's own cache maintenance, which EL0 may do on macOS
+as on Linux, makes what it wrote visible. A write fwe makes for the guest
+(a `read` into such a page, say) switches the page in the same way. In the
+hypervisor backend the VM maps the memory writable and executable at stage
+2, so nothing faults.
+
+`mrs <Xt>, ctr_el0`, the cache type register that code flushing the caches
+reads (git's own copy of the compiler runtime's cache flush, for one), is
+allowed at EL0 on Linux and trapped on macOS. The native backend emulates
+it in its `SIGILL` handler, reporting Apple Silicon's value as Linux shows
+it there without the bits that allow skipping cache maintenance
+(`crates/native/src/hwcap.rs`).
+
 ## System call path
 
 1. The guest executes a rewritten `brk`. macOS delivers `SIGTRAP` on the
@@ -268,6 +289,12 @@ and opening one reopens the file or, for an object with no path,
 duplicates the descriptor. An unknown path under `/proc` or `/sys` is
 `ENOENT`.
 
+`/dev` is the rootfs's, except for what Linux always mounts there: `null`,
+`zero`, `random`, `urandom` and `tty` resolve to the host's own nodes
+(`crates/kernel/src/fs.rs`; a rootfs unpacked without privileges has no
+device nodes), and `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`
+are links into `/proc/self/fd`.
+
 ## Processes
 
 `execve` first checks the new program (an arm64 ELF executable that fits the
@@ -287,24 +314,43 @@ from a process with other live threads, which Linux ends. The host's own
 exec then does the work: the pid, descriptors not marked close-on-exec, the
 signal mask, pending signals and ignored dispositions survive it as Linux
 requires, and fwe passes on the root filesystem, the working directory, the
-guest's `argv[0]` and `--strace` (`--guest-path`, `--cwd`, `--argv0`); the
-new fwe picks the backend. The hypervisor backend's `execve` always works
-this way.
+guest's `argv[0]` and `--strace` (`--guest-path`, `--cwd`, `--argv0`), and
+what only the kernel layer holds — the virtual credentials, the
+`RLIMIT_NOFILE` and the umask — as one encoded `--exec-state`
+(`Kernel::exec_state`); the new fwe picks the backend. The hypervisor
+backend's `execve` always works this way. As on Linux, the saved user and
+group IDs become the effective ones across an `execve`.
+
+`execveat` turns its `dirfd`, path and flags into a guest path and then is
+`execve` (`Kernel::execveat_path`): a relative path is taken from the
+directory `dirfd` is open on, `AT_EMPTY_PATH` runs the file `dirfd` itself
+names, and `AT_SYMLINK_NOFOLLOW` refuses a final symbolic link with
+`ELOOP`. The descriptor is turned into the path of its file, so a file
+renamed or deleted after it was opened is not found.
 
 `fork` (a `clone` without `CLONE_THREAD`) duplicates the process with host
 `fork`. In a multithreaded guest the kernel lock and every kernel registry
 lock are held across it, so the child — which, as on Linux, has only the
-forking thread — cannot inherit a lock another thread held. The child cannot
+forking thread — cannot inherit a lock another thread held. A host fork
+copies memory while the other threads run, so a child could see one
+thread's writes torn across pages; instead the threads running guest code
+are suspended for the fork (`crates/native/src/quiesce.rs`). Only those:
+guest code holds none of fwe's or the host libraries' locks, while a thread
+suspended in fwe's code (inside `malloc`, say) could deadlock the fork. A
+thread in fwe's code runs on, and waits before going back into guest code
+until the fork is done. The child cannot
 return through the trap handler frame it inherited (macOS does not restore
 the signal mask from a frame the process did not take), so it installs a
 signal stack of its own and enters the guest directly with `x0` = 0. The
 `vfork` form, `CLONE_VM | CLONE_VFORK`, which `posix_spawn`, `vfork` and Go's
-`os/exec` use, runs as a fork: the child gets a copy of the address space,
-not a share of it, and the parent waits until the child has exec'd or exited
-(it holds the write end of a close-on-exec pipe). Spawn helpers only exec or
-exit in the child, so this matches; a child that writes to memory the parent
-reads afterwards (glibc's `posix_spawn` reporting an exec failure) is not
-seen by the parent. A host fork child does not inherit kqueues (their
+`os/exec` use, is a fork whose child shares the guest's memory: for that
+fork the private guest memory is set to be inherited by sharing
+(`minherit`), then back to being copied, in both processes. The parent waits
+until the child has exec'd or exited (it holds the write end of a
+close-on-exec pipe), and sees what the child wrote meanwhile — glibc's
+`posix_spawn` reports an exec failure that way. fwe's own memory is not
+shared, so the child's kernel state is its own, and so are its mappings: an
+`mmap` or `munmap` in a `vfork` child does not reach the parent. A host fork child does not inherit kqueues (their
 descriptors are closed in it), so the kqueues behind the guest's `epoll` and
 `timerfd` descriptors are recorded before the fork and rebuilt in the child
 at the same numbers (see Event descriptors).
@@ -330,7 +376,8 @@ the state. The child reserves the window, maps each entry at the parent's
 address, restores the kernel, creates its own VM over the same mappings and
 resumes the guest after the `svc` with `x0` = 0. The parent returns once the
 child is about to run; a `vfork` parent waits on until the child execs or
-exits. Neither side pays for memory until it writes to a page. A guest that
+exits, and a `vfork` child is given shares of private memory as well, so its
+writes reach the parent. Neither side pays for memory until it writes to a page. A guest that
 has placed a `MAP_FIXED` mapping outside the window cannot fork (`EAGAIN`).
 
 `wait4` reaps a child through the host, translating the status into the
@@ -358,7 +405,11 @@ The futex wait queues are a process-global structure operating on raw guest
 memory, outside the kernel lock, so `FUTEX_WAIT` blocks without holding it.
 A host condition variable is not interrupted by signals, so a waiter checks
 every 20 ms for a signal it should take, and returns `EINTR` for it.
-`clone3` is not implemented (glibc falls back to `clone`).
+`clone3` reads the guest's `struct clone_args` and then goes the way of the
+`clone` it describes (`crates/kernel/src/cloneargs.rs`): the stack is the
+top of the range given, and the child's other registers are the parent's.
+What fwe has no notion of — a pidfd, chosen tids, a cgroup, clearing the
+handlers — fails with `ENOSYS`, which C libraries take as "use `clone`".
 
 ## Signals
 
@@ -501,6 +552,13 @@ cannot regain them. `chown` as virtual root is accepted but does not change
 host ownership (shadow ownership is not tracked), and `access` under a
 virtual root bypasses the permission bits as Linux root does.
 
+Host user and group ids the guest sees — a file's owner from `stat`, a
+signal's sender, a child in `waitid` — are mapped as a rootless container's
+user namespace maps them (`host::uid_to_linux`): the host user fwe runs as
+is root (0), and every other id is the overflow id 65534 (`nobody`). So a
+guest running as its default root owns the files it creates, which is what
+git's check that a repository belongs to its user relies on.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -515,38 +573,47 @@ those items.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
-  entitlement and a bare-metal Apple Silicon Mac. `execve` re-executes fwe, so the guest's
-  virtual credentials and `RLIMIT_NOFILE` start over in the new program. A few rare `x18` forms are left
+  entitlement and a bare-metal Apple Silicon Mac. A few rare `x18` forms are left
   unrewritten (see Rewriting guest code; `--strace` counts them). Code
   discovery relies on section
   headers; a stripped binary has its whole executable segment scanned, and
   an inline jump table in a code section could be patched.
-- **Processes:** `vfork` copies the address space instead of sharing it
-  (see Processes), in both backends; a fork child of a timerfd loses the
-  expirations not yet read; in the native backend a host `fork` copies
-  memory while the parent's other threads keep running, so a child can see
-  one thread's writes torn across pages (the hypervisor backend stops every
-  vCPU for its snapshot); in a fork child, an epoll or timerfd descriptor
+- **Processes:** a `vfork` child shares the guest's memory but not its
+  mappings (an `mmap` or `munmap` in it stays in the child); a fork child
+  of a timerfd loses the expirations not yet read; in the native backend a
+  thread inside fwe's code during a `fork` (in a system call) is not
+  stopped, so a write it makes to guest memory then, such as a `read`
+  completing into a buffer, may or may not reach the child; in a fork
+  child, an epoll or timerfd descriptor
   duplicated with `dup` is gone (only the original number is rebuilt), a
   periodic timerfd restarts its period, and eventfd counters and signalfd
   queues are the child's own copies while their readiness pipes are shared;
   a VM fork that fails after spawning its child can have that child reaped
-  by another thread's `wait4(-1)`; `execveat` and `clone3` are not implemented; `waitid`
-  reports no `rusage`. An `execve` from a process with other live threads,
-  or of a program only the VM can run, re-executes fwe, and the guest's
-  virtual credentials and `RLIMIT_NOFILE` start over in the new program.
+  by another thread's `wait4(-1)`; `execveat` of a descriptor finds its
+  file by path (not one renamed or deleted since it was opened); `clone3`
+  has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
+  `rusage`.
 - **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
   that opens more descriptors than its limit gets numbers in fwe's range,
   which it cannot use, rather than `EMFILE`; a reopened
   `/proc/self/fd` entry for a pipe or socket shares the original's file
   description rather than getting a new one.
 - **Memory:** `MADV_DONTNEED` on a private file mapping keeps modified pages
-  where Linux would restore the file's.
+  where Linux would restore the file's. In the native backend, writable and
+  executable memory takes a fault each time a page goes from being written
+  to being run or back, which is slow for code that does both to one page
+  often; a host system call writing into such a page while it is
+  executable (a `read` into it, for one) fails with `EFAULT`.
+- **Filesystem:** of `/dev`, only `null`, `zero`, `random`, `urandom`,
+  `tty` and the `/proc/self/fd` links are provided; their `stat` reports
+  the host's device numbers. File owners other than fwe's own user read as
+  65534, and a `chown` does not show in a later `stat`.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a signal left pending
   while blocked loses its sender on macOS, so `rt_sigtimedwait` then
-  reports `si_pid` 0; `rt_sigqueueinfo` is not implemented; a signal that
+  reports `si_pid` 0 (except `SIGCHLD`, whose child fwe looks up with a
+  `waitid` that does not reap it); `rt_sigqueueinfo` is not implemented; a signal that
   arrives between a blocking call's start and its host wait can be noticed
   only when the call ends, except for `rt_sigsuspend`, `rt_sigtimedwait`
   and the masked waits, which close that window; a futex wait notices a

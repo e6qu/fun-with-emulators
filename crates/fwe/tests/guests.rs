@@ -40,7 +40,7 @@ fn run_bounded(mut cmd: Command) -> Output {
 fn run_vm_bounded(mut cmd: Command) -> Output {
     use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null()).process_group(0);
-    let out = run_bounded_inner(cmd, &[], true);
+    let out = run_bounded_inner(cmd, &[], GUEST_TIMEOUT, true);
     // The leader is reaped; anything still in its group outlived it.
     let pgid = out.1;
     let lingering = || {
@@ -63,13 +63,19 @@ fn run_vm_bounded(mut cmd: Command) -> Output {
 /// (written on its own thread so a guest that does not read it cannot wedge
 /// the test).
 fn run_bounded_with_stdin(cmd: Command, input: &[u8]) -> Output {
-    run_bounded_inner(cmd, input, false).0
+    run_bounded_for(cmd, input, GUEST_TIMEOUT)
 }
 
-/// The guest's output and its pid. With `vm`, the command leads its own
-/// process group, and a timeout ends the group gently (see
-/// [`run_vm_bounded`]).
-fn run_bounded_inner(mut cmd: Command, input: &[u8], vm: bool) -> (Output, i32) {
+/// Like [`run_bounded_with_stdin`], with a time limit of `limit` (for a real
+/// program's workload that starts many processes).
+fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
+    run_bounded_inner(cmd, input, limit, false).0
+}
+
+/// The guest's output and its pid, killing it after `limit`. With `vm`, the
+/// command leads its own process group, and a timeout ends the group gently
+/// (see [`run_vm_bounded`]).
+fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     let feed = !input.is_empty();
     if feed {
@@ -103,7 +109,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], vm: bool) -> (Output, i32) 
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if start.elapsed() > GUEST_TIMEOUT {
+        if start.elapsed() > limit {
             timed_out = true;
             if vm {
                 let pgid = child.id() as i32;
@@ -129,7 +135,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], vm: bool) -> (Output, i32) 
         std::thread::sleep(Duration::from_millis(20));
     };
     if timed_out {
-        eprintln!("--- guest timed out after {GUEST_TIMEOUT:?} (killed)");
+        eprintln!("--- guest timed out after {limit:?} (killed)");
     }
     // Readers finish once the pipes close (at process exit).
     let stdout = out_reader.join().unwrap();
@@ -160,6 +166,7 @@ const ASM_GUESTS: &[&str] = &[
     "fileio",
     "sigtest",
     "threadtest",
+    "clone3test",
     "execer",
     "execee",
     "forktest",
@@ -606,6 +613,16 @@ fn execve_replaces_program() {
 
 /// Threads: a guest clones a child that writes a shared counter and exits;
 /// the parent joins via the CLONE_CHILD_CLEARTID futex and checks the counter.
+/// `clone3`: a thread made from a `struct clone_args` gets the stack, TLS
+/// and tid words it names; a too-small structure is `EINVAL` and a pidfd
+/// request `ENOSYS`.
+#[test]
+fn clone3_makes_a_thread() {
+    for name in ["clone3test", "clone3test-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
 #[test]
 fn clone_thread_runs_and_joins() {
     for name in ["threadtest", "threadtest-pie"] {
@@ -792,6 +809,115 @@ fn debian_bash_runs_a_command() {
     let out = run_debian("bash", &["-c", "echo hello world"], &[]);
     assert_eq!(stdout(&out), "hello world\n");
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// Debian's git, the first of M2's target programs, driven by Debian's bash
+/// inside the guest: a repository is created, committed to on two branches,
+/// merged, stashed, rebased, searched (`git grep` compiles its pattern with
+/// PCRE2's JIT, so code written to writable and executable memory runs),
+/// blamed, packed with `gc` and cloned over `file://` (through `/bin/sh` and
+/// `git-upload-pack`). Every object name is fixed by the dates, and each
+/// matches what git on the host makes of the same steps.
+#[test]
+fn debian_git_runs_a_workflow() {
+    let root = std::env::temp_dir().join(format!("fwe-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for dir in ["lib", "bin", "usr/bin", "usr/lib/git-core", "home/u"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    for entry in std::fs::read_dir(debian_root().join("lib")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), root.join("lib").join(entry.file_name())).unwrap();
+    }
+    std::fs::copy(debian_bin("bash"), root.join("bin/bash")).unwrap();
+    std::fs::copy(debian_bin("git"), root.join("usr/bin/git")).unwrap();
+    // As Debian installs them: the shell, and git's helpers as links to git.
+    std::os::unix::fs::symlink("bash", root.join("bin/sh")).unwrap();
+    std::os::unix::fs::symlink("../../bin/git", root.join("usr/lib/git-core/git")).unwrap();
+    std::os::unix::fs::symlink("git", root.join("usr/lib/git-core/git-upload-pack")).unwrap();
+
+    let script = r#"
+        set -e
+        export HOME=/home/u GIT_CONFIG_NOSYSTEM=1
+        export GIT_AUTHOR_DATE=2026-01-01T00:00:00Z GIT_COMMITTER_DATE=2026-01-01T00:00:00Z
+        cd /home/u
+        git init -q -b main repo
+        cd repo
+        git config user.name Tester
+        git config user.email t@example.com
+        printf 'one
+two
+three
+' > a.txt
+        git add a.txt
+        git commit -q -m first
+        git switch -q -c feature
+        printf 'one
+two
+three
+four
+' > a.txt
+        git commit -q -am 'feature: four'
+        git switch -q main
+        printf 'zero
+one
+two
+three
+' > a.txt
+        git commit -q -am 'main: zero'
+        git merge -q --no-edit feature
+        git log --graph --format='%h %s'
+        git tag v1
+        echo scratch >> a.txt
+        git stash -q
+        git stash list
+        git stash pop -q
+        git checkout -q -- a.txt
+        git rebase -q HEAD~1
+        git grep -n two
+        git blame -s a.txt
+        git gc -q
+        git fsck --no-progress --no-dangling
+        cd ..
+        git clone -q file:///home/u/repo clone
+        git -C clone log --format='%h %s'
+        git -C clone status --short --branch
+    "#;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("bin/bash"))
+        .args(["-c", script])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null());
+    // About 12 s alone: git's commands start many git processes, each a
+    // fresh fwe that prepares the 3.7 MB binary's code.
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    eprintln!("--- git stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "Auto-merging a.txt\n\
+         *   add5a56 Merge branch 'feature'\n\
+         |\\  \n\
+         | * 032b22c feature: four\n\
+         * | c45f3f2 main: zero\n\
+         |/  \n\
+         * fc2d461 first\n\
+         stash@{0}: WIP on main: add5a56 Merge branch 'feature'\n\
+         a.txt:3:two\n\
+         c45f3f2b 1) zero\n\
+         ^fc2d461 2) one\n\
+         ^fc2d461 3) two\n\
+         ^fc2d461 4) three\n\
+         2586db8f 5) four\n\
+         2586db8 feature: four\n\
+         c45f3f2 main: zero\n\
+         fc2d461 first\n\
+         ## main...origin/main\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1015,10 +1141,17 @@ fn signal_from_child_reaches_parent_handler() {
 }
 
 /// A child's exit raises `SIGCHLD` in the parent, carrying the child's pid
-/// and exit status.
+/// and exit status — also when the signal waited blocked until after the
+/// child was gone, which macOS reports with an empty `siginfo`.
 #[test]
 fn sigchld_reaches_handler_with_status() {
-    assert_eq!(signals("sigchld"), "SIGCHLD from child: true, status 3\nexited 3\n");
+    for scenario in ["sigchld", "sigchld-late"] {
+        assert_eq!(
+            signals(scenario),
+            "SIGCHLD from child: true, status 3\nexited 3\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// A timer signal interrupts a blocking `read`: with `SA_RESTART` the read
@@ -1148,12 +1281,52 @@ fn exec_replaces_the_address_space() {
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
 
+/// Writable and executable memory, as JIT compilers use it (macOS never maps
+/// memory so): code written there runs, runs again after being rewritten in
+/// place, and may make system calls; `mrs ctr_el0`, which macOS traps at
+/// EL0, reads a cache type.
+#[test]
+fn jit_code_runs_from_writable_executable_memory() {
+    assert_eq!(signals("jit"), JIT);
+}
+
+/// What the `jit` scenario prints.
+const JIT: &str = "jit: 42 7, getpid matches: true\nctr_el0 has cache lines: true\n";
+
 /// `fork` from a process with a second thread running: the child has just
 /// the forking thread and runs normally.
 #[test]
 fn fork_from_a_threaded_process() {
     assert_eq!(signals("threaded-fork"), "child of a threaded parent\nexited 5\n");
 }
+
+/// A fork while another thread writes sees one instant of the process: the
+/// threads running guest code are stopped while the host fork copies memory.
+#[test]
+fn fork_sees_one_instant_of_a_threaded_process() {
+    assert_eq!(signals("fork-snapshot"), "consistent snapshots: 8 of 8\n");
+}
+
+/// What a vfork child writes the parent sees: glibc's `posix_spawn` reports
+/// a failed exec through the memory it shares with its child (so it returns
+/// `ENOENT`), and a plain `vfork` child's writes to a global and to the
+/// parent's stack are there once it exits.
+#[test]
+fn vfork_child_shares_memory() {
+    let prog = build_c_dynamic("dynspawn", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "glibc-spawn");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- dynspawn stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), VFORK_SHARES);
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What `dynspawn` prints when the vfork child shares memory.
+const VFORK_SHARES: &str =
+    "posix_spawn of a missing program: 2\nvfork child's writes seen: 42 7, status 0\n";
 
 /// A fork child sees the parent's memory as it was at the fork, and neither
 /// side sees the other's later private writes; shared memory stays shared.
@@ -1170,6 +1343,31 @@ fn fork_copies_memory_and_keeps_descriptors() {
         signals("fork-epoll"),
         "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"
     );
+}
+
+/// `clone3` in its fork form, and `execveat` relative to a directory, of the
+/// open file itself, and refusing a symbolic link under
+/// `AT_SYMLINK_NOFOLLOW`.
+#[test]
+fn clone3_fork_and_execveat() {
+    assert_eq!(signals("clone3-fork"), "clone3 child\nexited 3\n");
+    assert_eq!(
+        signals("execveat"),
+        "hello from the spawned child\nrelative to a directory: exited 0\n\
+         hello from the spawned child\nthe open file itself: exited 0\n\
+         symlink with AT_SYMLINK_NOFOLLOW: -1, errno 40\nunknown flag: -1, errno 22\n"
+    );
+}
+
+/// `execve` keeps the virtual credentials (the saved IDs becoming the
+/// effective ones), `RLIMIT_NOFILE` and the umask, both when the program is
+/// replaced in place and when fwe re-executes itself (another thread alive).
+#[test]
+fn exec_keeps_credentials_and_limits() {
+    let want = "uids [10, 11, 11] gids [20, 21, 21] groups [7] nofile [300, 400] umask 27\n";
+    assert_eq!(signals("exec-keeps-ids"), want);
+    let out = fwe(&rust_guest("signals"), &["exec-keeps-ids", "threaded"]);
+    assert_eq!(stdout(&out), want);
 }
 
 /// `waitid` reports an exit and a kill as `siginfo`.
@@ -1464,6 +1662,9 @@ fn hv_runs_low_rust_programs() {
         stdout(&out).ends_with("arg[1]=one\narg[2]=two words\nFWE_GUEST_VAR=from-host\n"),
         "{out:?}"
     );
+    // Writable and executable memory: the VM maps it so, the host never.
+    let out = fwe_hv(&rust_low_guest("signals"), &["jit"]).unwrap();
+    assert_eq!(stdout(&out), JIT);
 }
 
 /// Signals in the VM: handlers for timers, real-time and sent fault signals,
@@ -1550,7 +1751,7 @@ fn signal_unblocked_by_sigreturn_and_fixed_mapping() {
 /// real-time one), and a timer interrupting one thread's blocking read.
 #[test]
 fn hv_runs_threads() {
-    for name in ["threadtest-low", "pipethread-low"] {
+    for name in ["threadtest-low", "pipethread-low", "clone3test-low"] {
         let Some(out) = fwe_hv(&asm_guest(name), &[]) else { return };
         assert_eq!(out.status.code(), Some(0), "{name}");
     }
@@ -1607,9 +1808,10 @@ fn hv_execve_between_backends() {
 /// signals between parent and child, a fork from a threaded process,
 /// resource usage, `posix_spawn` and `vfork` with `execve`, copy-on-write
 /// isolation, a snapshot taken at one instant while another thread writes,
-/// inherited `epoll` and `timerfd` descriptors, and `waitid`, whose child the
+/// inherited `epoll` and `timerfd` descriptors, `waitid`, whose child the
 /// guest ends with `SIGKILL` (relayed, so the child's VM is torn down before
-/// it dies; see docs/hypervisor.md).
+/// it dies; see docs/hypervisor.md), and a `vfork` child sharing its
+/// parent's memory.
 #[test]
 fn hv_fork_and_vfork() {
     let Some(out) = fwe_hv(&asm_guest("forktest-low"), &[]) else { return };
@@ -1639,4 +1841,10 @@ fn hv_fork_and_vfork() {
         assert_eq!(stdout(&out), want, "{scenario}");
         assert_eq!(out.status.code(), Some(0), "{scenario}");
     }
+    let prog = build_c("dynspawn", Libc::Glibc, true, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-spawn-nopie");
+    let out = fwe_hv_in(&root, &prog, &[]).unwrap();
+    assert_eq!(stdout(&out), VFORK_SHARES);
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
 }

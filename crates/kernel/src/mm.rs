@@ -39,10 +39,20 @@ pub fn set_guest_ranges(ranges: BTreeMap<u64, u64>) {
 
 /// Record `[addr, addr + len)` as guest memory.
 pub fn track(addr: u64, len: u64) {
+    add_range(&mut guest_maps(), addr, len);
+}
+
+/// Forget `[addr, addr + len)` (the guest unmapped it).
+pub fn untrack(addr: u64, len: u64) {
+    remove_range(&mut guest_maps(), addr, len);
+}
+
+/// Add `[addr, addr + len)` to a set of ranges `start -> end`, merging it
+/// with every range it overlaps or touches.
+fn add_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
     if len == 0 {
         return;
     }
-    let mut maps = guest_maps();
     let (mut start, mut end) = (addr, addr.saturating_add(len));
     // Absorb every range that overlaps or touches the new one.
     let touching: Vec<(u64, u64)> =
@@ -55,12 +65,12 @@ pub fn track(addr: u64, len: u64) {
     maps.insert(start, end);
 }
 
-/// Forget `[addr, addr + len)` (the guest unmapped it).
-pub fn untrack(addr: u64, len: u64) {
+/// Remove `[addr, addr + len)` from a set of ranges, splitting any range it
+/// covers part of.
+fn remove_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
     if len == 0 {
         return;
     }
-    let mut maps = guest_maps();
     let end = addr.saturating_add(len);
     let overlapping: Vec<(u64, u64)> =
         maps.range(..end).rev().take_while(|&(_, &e)| e > addr).map(|(&s, &e)| (s, e)).collect();
@@ -80,8 +90,46 @@ pub fn tracked() -> Vec<(u64, u64)> {
     guest_maps().iter().map(|(&s, &e)| (s, e - s)).collect()
 }
 
+/// Guest memory the guest mapped both writable and executable, host
+/// addresses `start -> end`. macOS never maps memory so, so the host keeps
+/// these writable only: in the hypervisor backend the VM alone executes
+/// them, and the native backend makes a page executable when the guest runs
+/// code in it and writable again when it writes there
+/// ([`Kernel::write_exec_fault`]), as a JIT compiler expects of such memory.
+static WRITE_EXEC: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn write_exec() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    WRITE_EXEC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether host address `addr` is in writable and executable guest memory.
+fn is_write_exec(addr: u64) -> bool {
+    write_exec().range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
+}
+
+/// If host address `addr` is in writable and executable guest memory, make
+/// its page (of `page_size` bytes) writable, and report whether it was. Takes
+/// no kernel lock, so fwe's own code may use it when a write it makes for the
+/// guest faults.
+pub fn write_exec_writable(addr: u64, page_size: u64) -> bool {
+    if !is_write_exec(addr) {
+        return false;
+    }
+    let page = addr & !(page_size - 1);
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    // SAFETY: a page of guest memory the guest mapped writable and
+    // executable; only its host protections change.
+    unsafe { libc::mprotect(page as *mut libc::c_void, page_size as usize, rw) == 0 }
+}
+
+/// Both `PROT_WRITE` and `PROT_EXEC`.
+fn wants_write_exec(prot: u64) -> bool {
+    prot & (mman::PROT_WRITE | mman::PROT_EXEC) == mman::PROT_WRITE | mman::PROT_EXEC
+}
+
 /// Unmap all guest memory (the old program, at `execve`).
 pub fn release_guest_memory() {
+    write_exec().clear();
     let ranges = std::mem::take(&mut *guest_maps());
     for (start, end) in ranges {
         // SAFETY: only guest memory is tracked, and the old program is
@@ -217,8 +265,10 @@ pub mod region {
     /// `VM_INHERIT_COPY`: what a `MAP_PRIVATE` mapping gets; `MAP_SHARED`
     /// mappings inherit by sharing (`VM_INHERIT_SHARE`, 0).
     const VM_INHERIT_COPY: c_uint = 1;
+    const VM_INHERIT_SHARE: c_uint = 0;
 
     unsafe extern "C" {
+        fn minherit(addr: *mut libc::c_void, len: usize, inherit: c_int) -> c_int;
         /// This task's port (`mach_task_self()` is a macro over it).
         static mach_task_self_: libc::mach_port_t;
         fn mach_vm_region(
@@ -281,6 +331,37 @@ pub mod region {
         }
     }
 
+    /// The parts of `ranges` (`(start, len)` pairs) mapped `MAP_PRIVATE`,
+    /// as `(start, len)` in address order.
+    pub fn private_parts(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut parts = Vec::new();
+        for &(start, len) in ranges {
+            let end = start + len;
+            let mut at = start;
+            while at < end {
+                let Some(r) = query(at) else { break };
+                if r.start >= end {
+                    break;
+                }
+                let (lo, hi) = (r.start.max(at), (r.start + r.size).min(end));
+                if r.private {
+                    parts.push((lo, hi - lo));
+                }
+                at = hi;
+            }
+        }
+        parts
+    }
+
+    /// Make a host `fork` share `[start, start + len)` with the child
+    /// (`share`) or give it a copy, as `MAP_PRIVATE` memory normally is.
+    pub fn set_shared_on_fork(start: u64, len: u64, share: bool) {
+        let how = if share { VM_INHERIT_SHARE } else { VM_INHERIT_COPY };
+        // SAFETY: changes only what a later fork does with this task's own
+        // memory; the mapping itself is untouched.
+        unsafe { minherit(start as *mut libc::c_void, len as usize, how as c_int) };
+    }
+
     pub fn query(addr: u64) -> Option<Region> {
         let (start, size, basic) = query_flavor::<BasicInfo>(addr, VM_REGION_BASIC_INFO_64)?;
         let (_, _, ext) = query_flavor::<ExtendedInfo>(start, VM_REGION_EXTENDED_INFO)?;
@@ -327,6 +408,45 @@ mod tests {
         );
         untrack(base, 0x20000);
         assert_eq!(here(tracked()), vec![]);
+    }
+
+    /// Private memory set to be shared on fork is written by the child for
+    /// the parent to see (what a `vfork` child does), and goes back to
+    /// being copied; `private_parts` leaves `MAP_SHARED` memory out.
+    #[test]
+    fn private_memory_can_be_shared_with_a_fork_child() {
+        let len = 1 << 15;
+        let private = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE);
+        let shared = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED);
+        let ranges = [(private, len as u64), (shared, len as u64)];
+        assert_eq!(region::private_parts(&ranges), vec![(private, len as u64)]);
+        let child_writes = |value: u8| {
+            // SAFETY: the child only writes into the mapping and exits.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // SAFETY: as above.
+                unsafe {
+                    (private as *mut u8).write(value);
+                    libc::_exit(0)
+                }
+            }
+            assert!(pid > 0);
+            let mut status = 0;
+            // SAFETY: reaping the child just made.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            // SAFETY: reading inside the mapping.
+            unsafe { (private as *const u8).read() }
+        };
+        region::set_shared_on_fork(private, len as u64, true);
+        assert_eq!(child_writes(7), 7);
+        region::set_shared_on_fork(private, len as u64, false);
+        assert_eq!(child_writes(9), 7);
+        assert!(region::query(private).unwrap().private());
+        // SAFETY: unmapping the test's own mappings.
+        unsafe {
+            libc::munmap(private as *mut _, len);
+            libc::munmap(shared as *mut _, len);
+        }
     }
 
     #[test]
@@ -416,6 +536,13 @@ fn host_prot(prot: u64) -> libc::c_int {
         p |= libc::PROT_EXEC;
     }
     p
+}
+
+/// The host protections guest protections `prot` end up as: writable and
+/// executable memory is only writable (see [`WRITE_EXEC`]).
+fn final_prot(prot: u64) -> libc::c_int {
+    let p = host_prot(prot);
+    if wants_write_exec(prot) { p & !libc::PROT_EXEC } else { p }
 }
 
 impl<P: Platform> Kernel<P> {
@@ -572,7 +699,8 @@ impl<P: Platform> Kernel<P> {
                 }
             }
             // SAFETY: changing protections of the mapping just created.
-            if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, host_prot(prot)) } != 0
+            if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, final_prot(prot)) }
+                != 0
             {
                 let e = last_error();
                 // SAFETY: unmapping the mapping just created.
@@ -580,6 +708,11 @@ impl<P: Platform> Kernel<P> {
                 untrack(p, self.page_up(len));
                 return e;
             }
+        }
+        if wants_write_exec(prot) {
+            add_range(&mut write_exec(), p, self.page_up(len));
+        } else {
+            remove_range(&mut write_exec(), p, self.page_up(len));
         }
         guest as i64
     }
@@ -605,6 +738,7 @@ impl<P: Platform> Kernel<P> {
         let r = self.unmap_host(host as u64, len);
         if r == 0 {
             untrack(host as u64, self.page_up(len));
+            remove_range(&mut write_exec(), host as u64, self.page_up(len));
         }
         r
     }
@@ -624,11 +758,40 @@ impl<P: Platform> Kernel<P> {
             }
         }
         // SAFETY: guest-requested protection change of guest memory.
-        let r = ret(unsafe { libc::mprotect(a, len as usize, host_prot(prot)) });
+        let r = ret(unsafe { libc::mprotect(a, len as usize, final_prot(prot)) });
         if r == 0 {
+            let mut wx = write_exec();
+            if wants_write_exec(prot) {
+                add_range(&mut wx, a as u64, self.page_up(len));
+            } else {
+                remove_range(&mut wx, a as u64, self.page_up(len));
+            }
+            drop(wx);
             self.platform.protect_guest(addr, self.page_up(len), prot);
         }
         r
+    }
+
+    /// A fault the guest took at host address `addr`, fetching an
+    /// instruction (`exec`) or writing: if `addr` is in memory the guest
+    /// mapped writable and executable, switch its page to what the access
+    /// needs — executable, with its code prepared as any guest code is, or
+    /// writable — and report it handled, so the access is retried.
+    pub fn write_exec_fault(&mut self, addr: u64, exec: bool) -> bool {
+        if !write_exec_writable(addr, self.page_size) {
+            return false;
+        }
+        if exec {
+            let page = addr & !(self.page_size - 1);
+            if self.platform.prepare_exec(page, self.page_size).is_err() {
+                return false;
+            }
+            let rx = libc::PROT_READ | libc::PROT_EXEC;
+            // SAFETY: a page of guest memory the guest mapped writable and
+            // executable; only its host protections change.
+            unsafe { libc::mprotect(page as *mut libc::c_void, self.page_size as usize, rx) };
+        }
+        true
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
@@ -684,6 +847,7 @@ impl<P: Platform> Kernel<P> {
                 self.platform.unmap_guest(old + new_len, old_len - new_len);
                 self.unmap_host(tail, old_len - new_len);
                 untrack(tail, old_len - new_len);
+                remove_range(&mut write_exec(), tail, old_len - new_len);
             }
             return old as i64;
         }

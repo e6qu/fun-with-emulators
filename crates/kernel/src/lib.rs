@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod cloneargs;
 pub mod creds;
 pub mod epoll;
 pub mod fdtable;
@@ -32,11 +33,13 @@ pub mod thread;
 mod trace;
 pub mod uaccess;
 
+pub use cloneargs::CloneArgs;
 pub use fs::Fs;
 pub use mm::Brk;
 pub use trace::Tracer;
 
 use fwe_abi::{Sigaction, Stack, signal as absig};
+use std::os::fd::AsRawFd;
 
 /// The guest's register file, as the backend exposes it to the kernel for one
 /// trap. `x[30]` is the link register; `pstate` is the condition/execution
@@ -327,6 +330,112 @@ impl<P: Platform> Kernel<P> {
         thread::set_altstack(Stack { ss_flags: absig::SS_DISABLE, ..Stack::default() });
         thread::set_clear_child_tid(0);
         thread::set_robust_list(0, 0);
+        // The saved IDs become the effective ones, as Linux's execve sets
+        // them (no set-user-ID programs here).
+        self.creds.suid = self.creds.euid;
+        self.creds.sgid = self.creds.egid;
+    }
+
+    /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
+    /// itself if absolute, else relative to `dirfd` (or the working
+    /// directory for `AT_FDCWD`); with `AT_EMPTY_PATH` and an empty `path`,
+    /// the file `dirfd` is open on. `AT_SYMLINK_NOFOLLOW` refuses a final
+    /// symbolic link with `ELOOP`. Fails with a Linux errno.
+    pub fn execveat_path(&self, dirfd: i32, path: &[u8], flags: u64) -> Result<Vec<u8>, i32> {
+        use fwe_abi::{errno, fcntl};
+        if flags & !(fcntl::AT_EMPTY_PATH | fcntl::AT_SYMLINK_NOFOLLOW) != 0 {
+            return Err(errno::EINVAL);
+        }
+        let fs = self.fs.as_ref().ok_or(errno::ENOENT)?;
+        let at_cwd = dirfd == fcntl::AT_FDCWD as i32;
+        // The guest path of an open descriptor, if it names a file.
+        let fd_path = |fd: i32| -> Result<Vec<u8>, i32> {
+            // SAFETY: F_GETFD only queries the descriptor.
+            if !fdtable::guest_visible(fd) || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                return Err(errno::EBADF);
+            }
+            let p = fs.fd_target(fd);
+            if p.first() == Some(&b'/') { Ok(p) } else { Err(errno::EACCES) }
+        };
+        let target = if path.is_empty() {
+            if flags & fcntl::AT_EMPTY_PATH == 0 {
+                return Err(errno::ENOENT);
+            }
+            if at_cwd { fs.cwd().to_vec() } else { fd_path(dirfd)? }
+        } else if path.first() == Some(&b'/') {
+            path.to_vec()
+        } else {
+            let mut base = if at_cwd { fs.cwd().to_vec() } else { fd_path(dirfd)? };
+            if !base.ends_with(b"/") {
+                base.push(b'/');
+            }
+            base.extend_from_slice(path);
+            base
+        };
+        if flags & fcntl::AT_SYMLINK_NOFOLLOW != 0 && !path.is_empty() {
+            let r = fs.resolve(fcntl::AT_FDCWD as i32, &target, false)?;
+            let name = r.name_c()?;
+            // SAFETY: an all-zero stat is a valid out-parameter.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid directory descriptor, name and out-parameter.
+            let ok = unsafe {
+                libc::fstatat(r.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+            } == 0;
+            if ok && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return Err(errno::ELOOP);
+            }
+        }
+        Ok(target)
+    }
+
+    /// What an `execve` that re-executes fwe carries into the new process
+    /// beyond what the host keeps: the credentials, the descriptor limit and
+    /// the umask (see [`Kernel::restore_exec_state`]).
+    pub fn exec_state(&self) -> Vec<u8> {
+        let mut e = snapshot::Enc::new();
+        e.u64(EXEC_STATE_MAGIC);
+        let c = &self.creds;
+        for v in [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid] {
+            e.u32(v);
+        }
+        e.u64(c.groups.len() as u64);
+        for &g in &c.groups {
+            e.u32(g);
+        }
+        let (soft, hard) = fdtable::limit();
+        e.u64(soft);
+        e.u64(hard);
+        e.u32(self.fs.as_ref().map_or(0o022, |fs| fs.umask()));
+        e.into_bytes()
+    }
+
+    /// Take the state [`Kernel::exec_state`] recorded in the process that
+    /// exec'd this one. Fails, changing nothing, on a malformed record.
+    pub fn restore_exec_state(&mut self, state: &[u8]) -> Result<(), String> {
+        let mut d = snapshot::Dec::new(state);
+        if d.u64() != EXEC_STATE_MAGIC {
+            return Err("the exec state is not fwe's".into());
+        }
+        let mut ids = [0u32; 8];
+        for v in &mut ids {
+            *v = d.u32();
+        }
+        let n = d.count(4);
+        let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
+        let (soft, hard) = (d.u64(), d.u64());
+        let umask = d.u32();
+        d.finish()?;
+        // The saved IDs become the effective ones, as across any execve.
+        let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;
+        self.creds =
+            creds::Creds { uid, euid, suid: euid, fsuid, gid, egid, sgid: egid, fsgid, groups };
+        // The limit was the guest's own, so it fits the new process's range
+        // (the host limit is inherited); keep the default if it does not.
+        let _ = fdtable::set_limit(soft, hard);
+        if let Some(fs) = self.fs.as_mut() {
+            fs.set_umask(umask);
+        }
+        Ok(())
     }
 
     /// Adopt the dispositions this process inherited: a signal the host
@@ -435,12 +544,11 @@ pub fn thread_exit_cleanup() {
     }
 }
 
-/// Host `fork` with every lock the kernel's own registries use held, so that
-/// in a multithreaded guest the child cannot inherit one locked by a thread
-/// that does not exist in it. The caller holds the kernel lock itself. The
-/// locks are released in both processes.
 /// Host `fork` is refused (see [`forbid_fork`]).
 static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Leads an exec state record ([`Kernel::exec_state`]).
+const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
 
 /// Refuse every host `fork` from now on: a process running its guest in a
 /// Hypervisor.framework VM must never fork, as the child would inherit a VM
@@ -449,7 +557,12 @@ pub fn forbid_fork() {
     NO_FORK.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-pub fn fork_locked() -> libc::pid_t {
+/// Run `fork` (a host `fork`, perhaps wrapped by the backend) with every lock
+/// the kernel's own registries use held, so that in a multithreaded guest
+/// the child cannot inherit one locked by a thread that does not exist in
+/// it. The caller holds the kernel lock itself. The locks are released in
+/// both processes.
+pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     if NO_FORK.load(std::sync::atomic::Ordering::SeqCst) {
         // SAFETY: setting this thread's errno.
         #[cfg(target_os = "macos")]
@@ -466,17 +579,7 @@ pub fn fork_locked() -> libc::pid_t {
     signalfd::hold(|| {
         specialfd::hold(|| {
             synthdir::hold(|| {
-                pty::hold(|| {
-                    net::hold(|| {
-                        futex::hold(|| {
-                            mm::hold(|| {
-                                // SAFETY: plain host call; the child continues
-                                // with only the calling thread, as on Linux.
-                                thread::hold(|| unsafe { libc::fork() })
-                            })
-                        })
-                    })
-                })
+                pty::hold(|| net::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
             })
         })
     })

@@ -6,6 +6,7 @@ use crate::{
     x18_slot,
 };
 use fwe_abi::{clone as cl, err, errno};
+use fwe_kernel::mm::region;
 use fwe_kernel::{Platform, Regs, host, thread};
 use std::sync::atomic::Ordering;
 
@@ -23,12 +24,42 @@ use std::sync::atomic::Ordering;
 /// fwe instead ([`crate::reexec`]).
 pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     use fwe_kernel::uaccess;
-    // Linux's limit on one argument or environment string.
-    const ARG_MAX: usize = 128 * 1024;
     let path = uaccess::read_cstr(regs.x[0], uaccess::PATH_MAX).map_err(err)?;
-    let args = uaccess::read_cstr_array(regs.x[1], ARG_MAX).map_err(err)?;
-    let env = uaccess::read_cstr_array(regs.x[2], ARG_MAX).map_err(err)?;
+    let (args, env) = read_exec_args(regs.x[1], regs.x[2])?;
+    exec_program(path, args, env)
+}
 
+/// Linux's limit on one argument or environment string.
+const ARG_MAX: usize = 128 * 1024;
+
+/// An `execve`'s argument and environment strings.
+type ExecArgs = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// The argument and environment arrays of an `execve`.
+fn read_exec_args(argv: u64, envp: u64) -> Result<ExecArgs, i64> {
+    use fwe_kernel::uaccess;
+    let args = uaccess::read_cstr_array(argv, ARG_MAX).map_err(err)?;
+    let env = uaccess::read_cstr_array(envp, ARG_MAX).map_err(err)?;
+    Ok((args, env))
+}
+
+/// `execveat(dirfd, path, argv, envp, flags)`: `execve` of the program
+/// `dirfd`, `path` and `flags` name ([`fwe_kernel::Kernel::execveat_path`]).
+pub fn do_execveat(regs: &Regs) -> Result<Regs, i64> {
+    use fwe_kernel::uaccess;
+    let rel = uaccess::read_cstr(regs.x[1], uaccess::PATH_MAX).map_err(err)?;
+    let (args, env) = read_exec_args(regs.x[2], regs.x[3])?;
+    let path = {
+        let guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().unwrap().execveat_path(regs.x[0] as i32, &rel, regs.x[4]).map_err(err)?
+    };
+    exec_program(path, args, env)
+}
+
+/// Replace the program with `path` (a guest path), given its arguments and
+/// environment. Returns the new program's registers, or a negated errno
+/// while the old program is still intact.
+fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<Regs, i64> {
     let mut guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     let k = guard.as_mut().unwrap();
     let page = page_size();
@@ -41,7 +72,8 @@ pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     // A program only the VM can run, or an exec from a process with other
     // threads (which must end): replace this process with a fresh fwe.
     if crate::needs_vm(&file) || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
-        return Err(crate::reexec(&path, &args, &env, fs, strace, || {}));
+        let state = k.exec_state();
+        return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
     // The old image is untouched on failure, so the guest can handle it.
     crate::check_image(&file, fs).map_err(err)?;
@@ -88,19 +120,18 @@ static VFORK_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::
 ///
 /// A multithreaded guest forks with the kernel lock and every kernel
 /// registry lock held ([`fwe_kernel::fork_locked`]), so the child, which has
-/// only the forking thread, cannot inherit a lock another thread held.
+/// only the forking thread, cannot inherit a lock another thread held, and
+/// with the other threads that run guest code stopped
+/// ([`crate::quiesce`]), so the child sees one instant of memory.
 ///
 /// With `vfork` (`CLONE_VM | CLONE_VFORK`, as `posix_spawn` and `vfork` use)
-/// the child gets a copy of the address space rather than sharing it, and
-/// the parent waits until the child has called `execve` or exited, as Linux
-/// suspends it. That suits the spawn helpers, which only exec or exit in the
-/// child; a child that writes to memory the parent later reads (glibc's
-/// `posix_spawn` reporting an exec failure) is not seen by the parent.
-pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
-    let flags = parent.x[0];
-    let child_stack = parent.x[1];
-    let parent_tid = parent.x[2];
-    let child_tid = parent.x[4];
+/// the child shares the guest's memory with the parent, and the parent
+/// waits until the child has called `execve` or exited, as Linux suspends
+/// it; what the child writes before then (glibc's `posix_spawn` reporting an
+/// exec failure, say) the parent sees. Its own mappings are its own: an
+/// `mmap` or `munmap` in the child does not reach the parent.
+pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
+    let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
     // A pipe whose write end only the child holds: it closes when the child
     // execs (it is close-on-exec) or exits, which ends the parent's wait.
@@ -116,7 +147,25 @@ pub fn do_fork(parent: &Regs, vfork: bool) -> i64 {
     let (pid, kqueues) = {
         let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let kqueues = fwe_kernel::kqueue_state();
-        (fwe_kernel::fork_locked(), kqueues)
+        // A vfork child shares the guest's memory: its private parts are
+        // shared for the fork, then copied again by any later one (in either
+        // process). The kernel lock keeps the guest's mappings as they are.
+        let share =
+            if vfork { region::private_parts(&fwe_kernel::mm::tracked()) } else { Vec::new() };
+        let set_shared = |on: bool| {
+            for &(start, len) in &share {
+                region::set_shared_on_fork(start, len, on);
+            }
+        };
+        let pid = fwe_kernel::fork_locked(|| {
+            set_shared(true);
+            // SAFETY: plain host call; the child continues with only the
+            // calling thread, as on Linux.
+            let pid = crate::quiesce::fork_stopped(|| unsafe { libc::fork() });
+            set_shared(false);
+            pid
+        });
+        (pid, kqueues)
     };
     if pid < 0 {
         let e = fwe_kernel::host::last_error();
@@ -275,7 +324,8 @@ pub fn do_waitid(regs: &Regs) -> i64 {
     if infop != 0 {
         let mut words = [0i32; 32]; // a 128-byte siginfo_t
         // SAFETY: `si` was filled by the host.
-        let (pid, uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+        let (pid, uid, status) =
+            unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
         if pid != 0 {
             let code = si.si_code;
             let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {

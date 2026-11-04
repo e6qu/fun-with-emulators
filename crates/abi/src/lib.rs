@@ -569,6 +569,13 @@ pub mod clone {
     pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
     pub const CLONE_DETACHED: u64 = 0x0040_0000;
     pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+    pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    /// The size of the first `struct clone_args` (`CLONE_ARGS_SIZE_VER0`).
+    pub const CLONE_ARGS_SIZE_VER0: u64 = 64;
+    /// The size of `struct clone_args` with every field this ABI knows,
+    /// through `cgroup` (`CLONE_ARGS_SIZE_VER2`).
+    pub const CLONE_ARGS_SIZE_VER2: u64 = 88;
 }
 
 /// `epoll` control ops, flags and event bits (`linux/eventpoll.h`).

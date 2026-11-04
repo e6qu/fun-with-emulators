@@ -143,6 +143,7 @@ impl HostCode {
             abi.set_enabled(false);
         }
         let was_in_guest = IN_GUEST.with(|g| g.replace(false));
+        crate::quiesce::leave();
         apply_guest_mask();
         HostCode { abi, was_in_guest }
     }
@@ -152,6 +153,10 @@ impl Drop for HostCode {
     fn drop(&mut self) {
         block_async_signals();
         IN_GUEST.with(|g| g.set(self.was_in_guest));
+        if self.was_in_guest {
+            // Back to guest code, unless a fork is copying memory.
+            crate::quiesce::enter();
+        }
         if let Some(abi) = self.abi {
             abi.set_enabled(true);
         }
@@ -164,6 +169,8 @@ impl Drop for HostCode {
 pub fn prepare_guest_entry() {
     block_async_signals();
     IN_GUEST.with(|g| g.set(true));
+    crate::quiesce::register();
+    crate::quiesce::enter();
     if let Some(abi) = X18Abi::get() {
         abi.set_enabled(true);
     }
@@ -290,10 +297,15 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         fwe_kernel::thread_exit_cleanup();
         crate::exit_current_thread(regs.x[0] as i32);
     }
-    if nr == fwe_abi::nr::EXECVE {
+    if nr == fwe_abi::nr::EXECVE || nr == fwe_abi::nr::EXECVEAT {
         // On success this enters the new program and never returns; on
         // failure it reports an errno the guest can handle.
-        match crate::process::do_execve(&regs) {
+        let r = if nr == fwe_abi::nr::EXECVE {
+            crate::process::do_execve(&regs)
+        } else {
+            crate::process::do_execveat(&regs)
+        };
+        match r {
             // Return from the handler into the new program, which also
             // leaves the signal stack and restores the guest's mask.
             Ok(new) => regs = new,
@@ -305,8 +317,16 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         unsafe { return_with_guest_mask(ctx) };
         return;
     }
-    if nr == fwe_abi::nr::CLONE {
-        let r = crate::threads::do_clone(&regs);
+    if nr == fwe_abi::nr::CLONE || nr == fwe_abi::nr::CLONE3 {
+        let a = if nr == fwe_abi::nr::CLONE {
+            Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
+        } else {
+            fwe_kernel::CloneArgs::from_clone3(regs.x[0], regs.x[1])
+        };
+        let r = match a {
+            Ok(a) => crate::threads::do_clone(&regs, a),
+            Err(e) => fwe_abi::err(e),
+        };
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
     } else if nr == fwe_abi::nr::WAIT4 {
         // wait4 blocks; run it without the kernel lock.
@@ -362,19 +382,8 @@ fn take_async(
     let _host = HostCode::enter();
     if sig != host::WAKE_SIGNAL {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        let (code, pid, uid, status) =
-            unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+        let (code, pid, uid, status) = unsafe { host::signal_info(sig, info) };
         let lsig = host::signal_to_linux(sig);
-        let code = host::si_code_to_linux(code);
-        let status = if lsig == fwe_abi::signal::SIGCHLD
-            && matches!(
-                code,
-                fwe_abi::wait::CLD_KILLED | fwe_abi::wait::CLD_DUMPED | fwe_abi::wait::CLD_STOPPED
-            ) {
-            host::signal_to_linux(status) as i32
-        } else {
-            status
-        };
         thread::post_self(lsig, thread::SigInfo { code, pid, uid, status });
     }
     if !in_guest {
@@ -435,6 +444,9 @@ fn fault_signal(host: libc::c_int) -> u64 {
     }
 }
 
+/// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
+const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
+
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // A process that sends itself one of these signals has it emulated (see
     // `Kernel::sys_kill`), so here it is a fault, or the rare signal sent by
@@ -442,6 +454,13 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if !IN_GUEST.with(Cell::get) {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        let addr = unsafe { (*info).si_addr() } as u64;
+        if fwe_kernel::mm::write_exec_writable(addr, crate::page_size()) {
+            // fwe writing for the guest into a page of its writable and
+            // executable memory that was last executed: retry the write.
+            return;
+        }
         if let Some(resume) = fwe_kernel::uaccess::fixup(ss.pc) {
             // A guest pointer the kernel was copying through was bad: the
             // copy reports EFAULT.
@@ -458,6 +477,32 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let addr = unsafe { (*info).si_addr() } as u64;
+
+    // `mrs <Xt>, ctr_el0`, which Linux lets user space run and macOS traps:
+    // the value is emulated.
+    // SAFETY: the guest was executing at `pc`, so it is mapped.
+    if let Some(word) = unsafe { insn(mc.ss.pc) }
+        .filter(|&w| sig == libc::SIGILL && crate::hwcap::is_mrs_ctr_el0(w))
+    {
+        let mut regs = regs_from(mc);
+        let rt = (word & 31) as usize;
+        if rt != 31 {
+            regs.x[rt] = crate::hwcap::CTR_EL0;
+        }
+        regs.pc += 4;
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
+        return;
+    }
+
+    // Memory the guest mapped writable and executable: the page becomes
+    // what this access needs, and the access is retried.
+    let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
+    if kernel().as_mut().is_some_and(|k| k.write_exec_fault(addr, exec)) {
+        return;
+    }
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
