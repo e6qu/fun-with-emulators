@@ -20,6 +20,8 @@ pub mod futex;
 pub mod host;
 pub mod memfd;
 pub mod mm;
+mod mountops;
+pub mod mounts;
 pub mod net;
 pub mod procfs;
 pub mod pty;
@@ -442,11 +444,20 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// What an `execve` that re-executes fwe carries into the new process
-    /// beyond what the host keeps: the credentials, the descriptor limit and
+    /// beyond what the host keeps: the mount namespace and root (first, so
+    /// that the new process finds its program in them, see
+    /// [`Fs::adopt_exec_view`]), the credentials, the descriptor limit and
     /// the umask (see [`Kernel::restore_exec_state`]).
     pub fn exec_state(&self) -> Vec<u8> {
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
+        match self.fs.as_ref() {
+            Some(fs) => {
+                e.bool(true);
+                fs.save_view(&mut e);
+            }
+            None => e.bool(false),
+        }
         let c = &self.creds;
         for v in [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid] {
             e.u32(v);
@@ -468,6 +479,10 @@ impl<P: Platform> Kernel<P> {
         let mut d = snapshot::Dec::new(state);
         if d.u64() != EXEC_STATE_MAGIC {
             return Err("the exec state is not fwe's".into());
+        }
+        // The view, which the filesystem took when it was opened.
+        if d.bool() {
+            fs::Fs::skip_view(&mut d);
         }
         let mut ids = [0u32; 8];
         for v in &mut ids {
@@ -603,7 +618,7 @@ pub fn thread_exit_cleanup() {
 static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Leads an exec state record ([`Kernel::exec_state`]).
-const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
+pub(crate) const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
 
 /// Refuse every host `fork` from now on: a process running its guest in a
 /// Hypervisor.framework VM must never fork, as the child would inherit a VM

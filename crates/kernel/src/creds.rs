@@ -58,6 +58,17 @@ impl Creds {
         self.euid == 0
     }
 
+    /// May administer the system: mount, unmount, make namespaces
+    /// (`CAP_SYS_ADMIN`).
+    pub fn has_admin(&self) -> bool {
+        self.privileged()
+    }
+
+    /// May change its root directory (`CAP_SYS_CHROOT`).
+    pub fn has_chroot(&self) -> bool {
+        self.privileged()
+    }
+
     pub fn getuid(&self) -> i64 {
         self.uid as i64
     }

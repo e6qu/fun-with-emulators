@@ -620,7 +620,24 @@ pub mod clone {
     pub const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
     pub const CLONE_DETACHED: u64 = 0x0040_0000;
+    pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
     pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+    pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+    pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+    pub const CLONE_NEWPID: u64 = 0x2000_0000;
+    pub const CLONE_NEWNET: u64 = 0x4000_0000;
+    pub const CLONE_IO: u64 = 0x8000_0000;
+    /// `unshare` and `setns` only.
+    pub const CLONE_NEWTIME: u64 = 0x0000_0080;
+    /// Every namespace a `clone` or `unshare` can make.
+    pub const CLONE_NEW_ANY: u64 = CLONE_NEWNS
+        | CLONE_NEWCGROUP
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_NEWNET;
     pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
     pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
     /// The size of the first `struct clone_args` (`CLONE_ARGS_SIZE_VER0`).

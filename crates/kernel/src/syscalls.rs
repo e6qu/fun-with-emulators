@@ -264,6 +264,11 @@ impl<P: Platform> Kernel<P> {
 
             // Memory.
             nr::BRK => self.sys_brk(a[0]),
+            nr::UNSHARE => self.sys_unshare(a[0]),
+            nr::MOUNT => self.sys_mount(a[0], a[1], a[2], a[3], a[4]),
+            nr::UMOUNT2 => self.sys_umount2(a[0], a[1]),
+            nr::PIVOT_ROOT => self.sys_pivot_root(a[0], a[1]),
+            nr::CHROOT => self.sys_chroot(a[0]),
             nr::MMAP => self.sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
             nr::MUNMAP => self.sys_munmap(a[0], a[1]),
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),

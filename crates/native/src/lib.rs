@@ -174,6 +174,12 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
     let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
         Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
     })?;
+    if let Some(text) = &options.exec_state {
+        // The mount namespace and root the program is found in.
+        let state =
+            unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?;
+        fs.adopt_exec_view(&state).map_err(Error::Unsupported)?;
+    }
     if let Some(fd) = options.exe_fd {
         // fwe's own from here on, out of the guest's reach.
         // SAFETY: plain host call on the descriptor fwe was handed.

@@ -1169,6 +1169,62 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
     root
 }
 
+/// The files an Alpine manifest (`guests/alpine/fetch/<manifest>.txt`)
+/// lists, fetched from dl-cdn.alpinelinux.org on first use and checked
+/// against their SHA-256s.
+fn fetched_alpine(manifest_name: &str) -> Vec<PathBuf> {
+    let (_, files) = manifest_in("alpine", manifest_name);
+    files
+        .iter()
+        .map(|(path, sha256)| {
+            let name = format!("alpine-{}", Path::new(path).file_name().unwrap().to_string_lossy());
+            let urls = [format!("https://dl-cdn.alpinelinux.org/alpine/{path}")];
+            fetch_pinned(&name, &urls, sha256, manifest_name)
+        })
+        .collect()
+}
+
+/// A root filesystem of what an Alpine manifest lists, unpacked in order
+/// and cached: the minirootfs, then each package. An `.apk` is gzipped tar
+/// segments, its signature and metadata (dot files) before the files.
+fn alpine_root(manifest_name: &str) -> PathBuf {
+    let (list, _) = manifest_in("alpine", manifest_name);
+    let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
+    let done = root.join(".fwe-complete");
+    if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
+        return root;
+    }
+    let files = fetched_alpine(manifest_name);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    for f in &files {
+        run_checked(
+            Command::new("tar")
+                .arg("xzf")
+                .arg(f)
+                .args(["--exclude", ".PKGINFO", "--exclude", ".SIGN.*", "--exclude", ".pre-*"])
+                .args(["--exclude", ".post-*", "--exclude", ".trigger", "-C"])
+                .arg(&root),
+        );
+    }
+    std::fs::write(&done, &list).unwrap();
+    root
+}
+
+/// Alpine's crun (fetched: `guests/alpine/fetch/crun.txt`) runs the
+/// standard `alpine` image.
+#[test]
+fn alpine_crun_runs_an_image() {
+    let root = alpine_root("crun");
+    let _workload = workload();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg("--strace=failures");
+    cmd.arg(root.join("usr/bin/crun")).arg("--version");
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    eprintln!("--- crun stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("crun version 1.17"), "{}", stdout(&out));
+}
+
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
 /// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
 /// constant tables among its code, which must not be rewritten), zlib, the
