@@ -396,6 +396,30 @@ impl Mem {
         source: Option<Source>,
         kept: Vec<(u64, u64)>,
     ) -> Result<(), i32> {
+        // Memory kept from the mapping this one replaces is still reached
+        // through other vCPUs' TLBs, with the old permissions, until they
+        // flush: they stay stopped while it is zeroed and mapped anew, and
+        // take the flush before they run guest code again — as Linux
+        // invalidates other CPUs' TLBs before such a call returns.
+        let paused = !kept.is_empty() && super::backend::others_exist();
+        if paused {
+            super::backend::pause_others();
+        }
+        let r = self.map_private_now(addr, len, prot, source, kept);
+        if paused {
+            super::backend::resume_others();
+        }
+        r
+    }
+
+    fn map_private_now(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        source: Option<Source>,
+        kept: Vec<(u64, u64)>,
+    ) -> Result<(), i32> {
         let host = self.back(addr, len, kept)?;
         if let Some(s) = &source {
             if let Err(e) = fill(host, len, s) {

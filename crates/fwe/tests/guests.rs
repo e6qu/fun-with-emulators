@@ -158,6 +158,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
 const ASM_GUESTS: &[&str] = &[
     "pacbti",
     "mapfixed",
+    "mapfixedmt",
     "hello",
     "exit42",
     "enosys",
@@ -1460,13 +1461,16 @@ impl Drop for Server {
 /// One HTTP/1.0 request to `127.0.0.1:port`: the status line and the body.
 fn http(port: u16, method: &str, path: &str, body: &str) -> (String, Vec<u8>) {
     use std::io::{Read, Write};
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let fail = |what: &str, e: std::io::Error| -> ! { panic!("{method} {path}: {what}: {e}") };
+    let mut s =
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| fail("connecting", e));
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let length =
         if body.is_empty() { String::new() } else { format!("Content-Length: {}\r\n", body.len()) };
-    write!(s, "{method} {path} HTTP/1.0\r\nHost: localhost\r\n{length}\r\n{body}").unwrap();
+    write!(s, "{method} {path} HTTP/1.0\r\nHost: localhost\r\n{length}\r\n{body}")
+        .unwrap_or_else(|e| fail("sending", e));
     let mut reply = Vec::new();
-    s.read_to_end(&mut reply).unwrap();
+    s.read_to_end(&mut reply).unwrap_or_else(|e| fail("reading the reply", e));
     let split = reply.windows(4).position(|w| w == b"\r\n\r\n").expect("no end of headers");
     let head = String::from_utf8_lossy(&reply[..split]).into_owned();
     let status = head.lines().next().unwrap_or("").to_string();
@@ -1537,7 +1541,25 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
         assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // On a failure, lighttpd's own account of it.
+    let log_path = root.path("tmp/error.log");
+    let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
+    if let Err(e) = result {
+        drop(server);
+        eprintln!(
+            "--- lighttpd's error log:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        std::panic::resume_unwind(e);
+    }
+    drop(server);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("server started") && log.contains("server stopped"), "{log}");
+}
 
+/// The requests `debian_lighttpd_serves_files_and_cgi` makes of the server
+/// on `port`, which serves `big` as `/big.txt`.
+fn lighttpd_requests(port: u16, big: &str) {
     assert_eq!(
         http(port, "GET", "/", ""),
         ("HTTP/1.0 200 OK".into(), b"hello from lighttpd\n".to_vec())
@@ -1565,9 +1587,6 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
         http(port, "GET", "/count.sh?x=1", ""),
         ("HTTP/1.0 200 OK".into(), b"GET x=1: init,alice\n".to_vec())
     );
-    drop(server);
-    let log = std::fs::read_to_string(root.path("tmp/error.log")).unwrap();
-    assert!(log.contains("server started") && log.contains("server stopped"), "{log}");
 }
 
 #[test]
@@ -2008,7 +2027,13 @@ fn fork_copies_memory_and_keeps_descriptors() {
         signals("fork-epoll"),
         "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"
     );
+    assert_eq!(signals("fork-timerfd"), FORK_TIMERFD);
 }
+
+/// What `signals fork-timerfd` prints.
+const FORK_TIMERFD: &str = "parent read its expiration: true\n\
+                            child reads the unread expiration: true\n\
+                            child finds the read one empty: true\nexited 0\n";
 
 /// `clone3` in its fork form, and `execveat` relative to a directory, of the
 /// open file itself, and refusing a symbolic link under
@@ -2520,6 +2545,10 @@ fn hv_map_fixed_replaces_mapped_memory() {
     );
     assert_eq!(text, want);
     assert_eq!(out.status.code(), Some(0));
+    // The same with another thread running guest code meanwhile.
+    let out = fwe_hv(&asm_guest("mapfixedmt-low"), &[]).unwrap();
+    assert_eq!(stdout(&out), "ok\n");
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// The stand-in's watcher reports a process that ended with its VM alive,
@@ -2719,6 +2748,7 @@ fn hv_fork_and_vfork() {
              child's writes unseen: true\nshared memory shared: true\nexited 0\n",
         ),
         ("fork-epoll", "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"),
+        ("fork-timerfd", FORK_TIMERFD),
         ("fork-snapshot", "consistent snapshots: 8 of 8\n"),
         ("waitid", "exited: true, status 6, pid matches: true\nkilled: true, signal 9\n"),
         ("fork-pipe", "child read 5 bytes, then the end\nexited 0\n"),

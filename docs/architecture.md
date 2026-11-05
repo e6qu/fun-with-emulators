@@ -525,8 +525,9 @@ realtime/monotonic distinction are not modelled.
 A kqueue cannot be passed to a child process, so each epoll descriptor's
 interest list is also recorded (and kept up to date by `epoll_ctl` and
 `close`), as is how each timerfd is armed; a fork child rebuilds both at the
-same descriptor numbers. A timer's expirations not yet read when the process
-forks are not carried over.
+same descriptor numbers. A one-shot timer that expired before the fork, its
+expiration unread, is readable in the child at once; a periodic timer's
+expirations not yet read are not carried over.
 
 `signalfd` (`crates/kernel/src/signalfd.rs`) has no macOS equivalent and is
 emulated: each signalfd is a readiness pipe plus a queue of
@@ -625,7 +626,7 @@ those items.
   inline jump table in code the unwind table covers could be patched.
 - **Processes:** a `vfork` child shares the guest's memory but not its
   mappings (an `mmap` or `munmap` in it stays in the child); a fork child
-  of a timerfd loses the expirations not yet read; in the native backend a
+  of a periodic timerfd loses the expirations not yet read; in the native backend a
   thread inside fwe's code during a `fork` (in a system call) is not
   stopped, so a write it makes to guest memory then, such as a `read`
   completing into a buffer, may or may not reach the child; in a fork
@@ -658,7 +659,10 @@ those items.
   one translated guest range into another fails with `EINVAL` (it has no
   single host address), and `ioctl`'s argument is translated but not
   checked against the guest's mappings (it is a pointer only for some
-  requests).
+  requests). A guest mapping placed with `MAP_FIXED` exactly where fwe keeps
+  the memory of another, translated range makes their addresses ambiguous
+  to the kernel within a system call that translated a pointer into that
+  range.
 - **Filesystem:** of `/dev`, only `null`, `zero`, `random`, `urandom`,
   `tty` and the `/proc/self/fd` links are provided; their `stat` reports
   the host's device numbers. File owners other than fwe's own user read as

@@ -178,6 +178,12 @@ should set. Everything else the backend does to stay clear of the crash:
   `MADV_DONTNEED` remove the range from the VM before the host frees or
   replaces the memory behind it, and map it again afterwards where needed,
   so the VM never maps memory the host is freeing.
+- **A vCPU is never destroyed under a call on it.** When the process ends,
+  each thread destroys its own vCPU, from the wake signal's handler if it
+  is blocked elsewhere — but not in the middle of a framework call on that
+  vCPU (it does so as the call returns), and no call follows on it; a vCPU
+  being destroyed is first taken out of other threads' `hv_vcpus_exit`,
+  and destroyed once none is under way.
 - **The tests run one VM test at a time**, never several in parallel. A test
   of `fork` has the parent's and the child's VM processes alive together,
   as any forking program does; each ends through teardown, a guest's

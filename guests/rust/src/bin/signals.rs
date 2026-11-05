@@ -741,6 +741,32 @@ fn main() {
             unsafe { write(p[1], b"x".as_ptr(), 1) };
             println!("{}", describe(wait_status(pid)));
         }
+        // A one-shot timer that expired before the fork, unread, is read in
+        // the child; one the parent read is not, in the child either.
+        "fork-timerfd" => {
+            let spec = [Timespec { sec: 0, nsec: 0 }, Timespec { sec: 0, nsec: 1_000_000 }];
+            // SAFETY: plain calls with a valid itimerspec; 2048 is
+            // TFD_NONBLOCK.
+            let unread = unsafe { timerfd_create(1, 2048) };
+            let read_ = unsafe { timerfd_create(1, 2048) };
+            assert_eq!(unsafe { timerfd_settime(unread, 0, &spec, std::ptr::null_mut()) }, 0);
+            assert_eq!(unsafe { timerfd_settime(read_, 0, &spec, std::ptr::null_mut()) }, 0);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut count = 0u64;
+            // SAFETY: an 8-byte read into a local.
+            let r = unsafe { read(read_, (&mut count as *mut u64).cast(), 8) };
+            println!("parent read its expiration: {}", r == 8 && count == 1);
+            let pid = child(move || {
+                let mut count = 0u64;
+                // SAFETY: 8-byte reads into a local.
+                let r = unsafe { read(unread, (&mut count as *mut u64).cast(), 8) };
+                println!("child reads the unread expiration: {}", r == 8 && count == 1);
+                let r = unsafe { read(read_, (&mut count as *mut u64).cast(), 8) };
+                println!("child finds the read one empty: {}", r < 0 && errno() == 11);
+                0
+            });
+            println!("{}", describe(wait_status(pid)));
+        }
         // clone3 in its fork form: no flags, SIGCHLD as the exit signal.
         "clone3-fork" => {
             let mut args = [0u64; 11];

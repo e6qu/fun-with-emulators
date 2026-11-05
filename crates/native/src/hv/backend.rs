@@ -168,18 +168,19 @@ pub(super) fn pause_others() {
     PAUSED.store(true, SeqCst);
     let own = VCPU.with(Cell::get);
     loop {
-        let mut others: Vec<hv_vcpu_t> =
-            live_vcpus().into_iter().filter(|&v| Some(v) != own).collect();
-        if !others.is_empty() {
-            // SAFETY: stopping the other threads' vCPUs, which may be running.
-            unsafe { hv_vcpus_exit(others.as_mut_ptr(), others.len() as u32) };
-        }
+        stop_others(own);
         if RUNNING.load(SeqCst) == 0 {
             return;
         }
         // SAFETY: plain host call.
         unsafe { libc::usleep(20) };
     }
+}
+
+/// Whether a vCPU other than the calling thread's exists.
+pub(super) fn others_exist() -> bool {
+    let own = VCPU.with(Cell::get);
+    live_vcpus().iter().any(|&v| Some(v) != own)
 }
 
 /// Let the vCPUs [`pause_others`] stopped run again.
@@ -194,21 +195,74 @@ fn register_vcpu(id: hv_vcpu_t) -> bool {
     VCPU_SLOTS.iter().any(|s| s.compare_exchange(0, id + 1, SeqCst, SeqCst).is_ok())
 }
 
+/// A vCPU slot's mark while its vCPU is being destroyed: no longer
+/// stopped by others, still waited for by teardown.
+const RETIRING: u64 = 1 << 63;
+
+/// Threads inside [`stop_others`]' call on other threads' vCPUs.
+static STOPPING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread is inside [`stop_others`].
+    static IN_STOP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Make every vCPU but `own` stop running guest code (`hv_vcpus_exit`). A
+/// vCPU its thread is destroying meanwhile is not passed: the destroying
+/// thread marks it first, then waits for every stop under way (see
+/// [`retire_vcpu`]). Async-signal-safe.
+fn stop_others(own: Option<hv_vcpu_t>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    IN_STOP.with(|c| c.set(true));
+    STOPPING.fetch_add(1, SeqCst);
+    let mut ids = [0 as hv_vcpu_t; 256];
+    let mut n = 0;
+    for s in &VCPU_SLOTS {
+        let v = s.load(SeqCst);
+        if v != 0 && v & RETIRING == 0 && Some(v - 1) != own {
+            ids[n] = v - 1;
+            n += 1;
+        }
+    }
+    if n > 0 {
+        // SAFETY: stopping other threads' vCPUs, which may be running and
+        // are not destroyed before this returns.
+        unsafe { hv_vcpus_exit(ids.as_mut_ptr(), n as u32) };
+    }
+    STOPPING.fetch_sub(1, SeqCst);
+    IN_STOP.with(|c| c.set(false));
+}
+
 /// Destroy the calling thread's vCPU, if it has one. Async-signal-safe.
 fn retire_vcpu() {
     use std::sync::atomic::Ordering::SeqCst;
     if let Some(id) = VCPU.with(|c| c.take()) {
+        let slot = VCPU_SLOTS
+            .iter()
+            .find(|s| s.compare_exchange(id + 1, (id + 1) | RETIRING, SeqCst, SeqCst).is_ok());
+        // No other thread's stop can still be passing it (one that read the
+        // slot before the mark is counted in STOPPING); this thread's own
+        // is not under way (see `on_signal`).
+        while STOPPING.load(SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
         // SAFETY: destroying this thread's own vCPU, which is not running.
         unsafe { hv_vcpu_destroy(id) };
-        for s in &VCPU_SLOTS {
-            let _ = s.compare_exchange(id + 1, 0, SeqCst, SeqCst);
+        if let Some(s) = slot {
+            s.store(0, SeqCst);
         }
     }
 }
 
+/// Every vCPU of the process, ones being destroyed included.
 fn live_vcpus() -> Vec<hv_vcpu_t> {
     use std::sync::atomic::Ordering::SeqCst;
-    VCPU_SLOTS.iter().map(|s| s.load(SeqCst)).filter(|&v| v != 0).map(|v| v - 1).collect()
+    VCPU_SLOTS
+        .iter()
+        .map(|s| s.load(SeqCst))
+        .filter(|&v| v != 0)
+        .map(|v| (v & !RETIRING) - 1)
+        .collect()
 }
 
 /// Stop and destroy every vCPU, then the VM. Idempotent; safe to call from a
@@ -220,10 +274,8 @@ pub(super) fn teardown() {
     }
     EXITING.store(true, SeqCst);
     let own = VCPU.with(Cell::get);
-    let mut others: Vec<hv_vcpu_t> = live_vcpus().into_iter().filter(|&v| Some(v) != own).collect();
-    if !others.is_empty() {
-        // SAFETY: stopping the other threads' vCPUs, which may be running.
-        unsafe { hv_vcpus_exit(others.as_mut_ptr(), others.len() as u32) };
+    if live_vcpus().iter().any(|&v| Some(v) != own) {
+        stop_others(own);
         // Threads blocked in a system call are interrupted, and destroy their
         // vCPU from the wake signal's handler.
         thread::wake_others(host::WAKE_SIGNAL);
@@ -278,7 +330,9 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
         // The process is ending: a thread not running guest code gives up
         // its vCPU now (one inside hv_vcpu_run does as the run returns).
-        if IN_HVF.with(Cell::get) {
+        // Not in the middle of a call on the vCPU, nor of this thread's
+        // own stop of the others (which a retirement waits for).
+        if IN_HVF.with(Cell::get) || IN_STOP.with(Cell::get) {
             RETIRE_AFTER.with(|c| c.set(true));
         } else if !IN_RUN.with(Cell::get) {
             retire_vcpu();
@@ -510,16 +564,18 @@ fn start(
     // there, the host delivers signals only to the vCPU threads, whose masks
     // follow the guest's. The mask fwe started with is the guest's own.
     let inherited_mask = host::blocked_signals();
-    let layout = vm::layout().map_err(Error::Unsupported)?;
-    window::reserve(layout.slab).map_err(Error::Unsupported)?;
-    become_vm_process().map_err(|e| {
+    let unsupported = |e: String| {
         Error::Unsupported(format!(
             "this program is linked below 4 GiB, which needs the hypervisor backend, \
              and creating the VM failed ({e}); fwe must be signed with the \
              com.apple.security.hypervisor entitlement (see docs/hypervisor.md) \
              on a Mac with hypervisor support"
         ))
-    })?;
+    };
+    // Asking the framework anything needs the entitlement too.
+    let layout = vm::layout().map_err(unsupported)?;
+    window::reserve(layout.slab).map_err(Error::Unsupported)?;
+    become_vm_process().map_err(unsupported)?;
     let mut fs = crate::open_fs(options)?;
 
     let elf = Elf::parse(data).map_err(Error::Elf)?;
@@ -1249,13 +1305,7 @@ fn pointer_ok(n: u64, i: usize, a: &[u64; 6]) -> bool {
     if path {
         return uaccess::read_cstr(p, uaccess::PATH_MAX).is_ok();
     }
-    let (len, write) = match (n, i) {
-        (nr::READ | nr::PREAD64 | nr::GETDENTS64 | nr::RECVFROM, 1) => (a[2], true),
-        (nr::WRITE | nr::PWRITE64 | nr::SENDTO, 1) => (a[2], false),
-        (nr::READLINKAT, 2) => (a[3], true),
-        (nr::GETCWD | nr::GETRANDOM, 0) => (a[1], true),
-        _ => (1, false),
-    };
+    let (len, write) = host_buffer(n, i, a).unwrap_or((1, false));
     mem::prepare_access(p, len.max(PAGE));
     // `ioctl`'s argument is a pointer only for some requests: translated,
     // and fetched for a vfork child, but not refused.
@@ -1267,14 +1317,26 @@ fn pointer_ok(n: u64, i: usize, a: &[u64; 6]) -> bool {
 /// for it. (Paths and structures the kernel copies are split where they
 /// cross; see `uaccess`.)
 fn one_host_range(n: u64, i: usize, a: &[u64; 6]) -> bool {
-    let len = match (n, i) {
-        (nr::READ | nr::PREAD64 | nr::GETDENTS64 | nr::RECVFROM, 1) => a[2],
-        (nr::WRITE | nr::PWRITE64 | nr::SENDTO, 1) => a[2],
-        (nr::READLINKAT, 2) => a[3],
-        (nr::GETCWD | nr::GETRANDOM, 0) => a[1],
-        _ => return true,
-    };
-    !uaccess::crosses(a[i], len)
+    host_buffer(n, i, a).is_none_or(|(len, _)| !uaccess::crosses(a[i], len))
+}
+
+/// Pointer argument `i` of system call `n` as a buffer of known length the
+/// host is given whole: its length, and whether the host writes it.
+fn host_buffer(n: u64, i: usize, a: &[u64; 6]) -> Option<(u64, bool)> {
+    Some(match (n, i) {
+        (nr::READ | nr::PREAD64 | nr::GETDENTS64 | nr::RECVFROM, 1) => (a[2], true),
+        (nr::WRITE | nr::PWRITE64 | nr::SENDTO, 1) => (a[2], false),
+        (nr::READLINKAT, 2) => (a[3], true),
+        (nr::GETCWD | nr::GETRANDOM, 0) => (a[1], true),
+        (nr::SETSOCKOPT, 3) => (a[4], false),
+        // The length is what the word at `optlen` says.
+        (nr::GETSOCKOPT, 3) => (uaccess::read::<u32>(a[4]).map_or(0, u64::from), true),
+        (nr::GETSOCKOPT, 4) => (4, true),
+        // A struct itimerval.
+        (nr::SETITIMER, 1) => (32, false),
+        (nr::SETITIMER, 2) | (nr::GETITIMER, 1) => (32, true),
+        _ => return None,
+    })
 }
 
 /// Run the system call in `regs` (number in `x8`), leaving its result and
