@@ -17,6 +17,9 @@ pub struct ProcInfo {
     pub ncpu: u32,
     /// Host name.
     pub hostname: Vec<u8>,
+    /// fwe's descriptor of the running program when it has no path (a
+    /// memfd it was executed from), which `/proc/self/exe` opens.
+    pub exe_fd: Option<i32>,
 }
 
 /// A synthetic entry for a `/proc` or `/sys` path.
@@ -103,6 +106,9 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         return None;
     }
     Some(match path {
+        b"/proc/self/exe" if info.exe_fd.is_some() => {
+            Entry::Fd { fd: info.exe_fd.unwrap(), target: info.exe.clone() }
+        }
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
         b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu)),
@@ -189,6 +195,7 @@ mod tests {
             cmdline: b"prog\0arg\0".to_vec(),
             ncpu: 4,
             hostname: b"fwe".to_vec(),
+            exe_fd: None,
         }
     }
 

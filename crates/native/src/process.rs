@@ -77,6 +77,12 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     }
     // The old image is untouched on failure, so the guest can handle it.
     crate::check_image(&file, fs).map_err(err)?;
+    // A program with no path (a memfd) is held, for `/proc/self/exe`: the
+    // descriptor it was run through may close on exec.
+    let exe_fd = match fs.pathless_fd(&path) {
+        Some(fd) => Some(fwe_kernel::fdtable::dup_reserved(fd).map_err(err)?),
+        None => None,
+    };
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env_refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
     // The point of no return: the old program's memory goes, and a vfork
@@ -101,7 +107,9 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     k.exec_reset();
     k.brk = out.brk;
     if let Some(fs) = k.fs.as_mut() {
-        fs.set_proc_info(path.clone(), crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+        fs.set_exe_fd(exe_fd);
+        let exe = fs.exe_fd_target().unwrap_or_else(|| path.clone());
+        fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
         fs.publish();
     }
     // The new program starts with every register zero, as Linux leaves it;

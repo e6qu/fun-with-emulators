@@ -98,7 +98,7 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--exec-state" => {
+            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
@@ -108,6 +108,12 @@ fn main() -> ExitCode {
                     options.cwd = Some(value.as_bytes().to_vec());
                 } else if flag == "--exec-state" {
                     options.exec_state = Some(value.as_bytes().to_vec());
+                } else if flag == "--exe-fd" {
+                    let Some(fd) = value.to_str().and_then(|v| v.parse().ok()) else {
+                        eprintln!("fwe: --exe-fd needs a descriptor number\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    options.exe_fd = Some(fd);
                 } else {
                     options.argv0 = Some(value);
                 }
@@ -203,7 +209,9 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
     while let Some(a) = args.get(i) {
         match a.as_bytes() {
             b"--hv-standin" | b"--hv-record" => return Some(a.to_string_lossy().into_owned()),
-            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--probe" => i += 2,
+            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--probe" => {
+                i += 2
+            }
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
             _ => return None,

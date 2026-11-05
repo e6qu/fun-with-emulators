@@ -237,6 +237,16 @@ pub mod fcntl {
     pub const F_OFD_SETLK: u64 = 37;
     pub const F_OFD_SETLKW: u64 = 38;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+    pub const F_ADD_SEALS: u64 = 1033;
+    pub const F_GET_SEALS: u64 = 1034;
+
+    /// File seals (`F_ADD_SEALS`).
+    pub const F_SEAL_SEAL: u32 = 0x1;
+    pub const F_SEAL_SHRINK: u32 = 0x2;
+    pub const F_SEAL_GROW: u32 = 0x4;
+    pub const F_SEAL_WRITE: u32 = 0x8;
+    pub const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+    pub const F_SEAL_EXEC: u32 = 0x20;
 
     /// `struct flock` lock types.
     pub const F_RDLCK: i16 = 0;
@@ -854,6 +864,17 @@ pub struct Statfs {
     pub f_frsize: i64,
     pub f_flags: i64,
     pub f_spare: [i64; 4],
+}
+
+/// `memfd_create` flags.
+pub mod memfd {
+    pub const MFD_CLOEXEC: u64 = 0x1;
+    pub const MFD_ALLOW_SEALING: u64 = 0x2;
+    pub const MFD_HUGETLB: u64 = 0x4;
+    pub const MFD_NOEXEC_SEAL: u64 = 0x8;
+    pub const MFD_EXEC: u64 = 0x10;
+    /// The longest name, without the `memfd:` prefix Linux adds.
+    pub const NAME_MAX: usize = 249;
 }
 
 /// `fallocate` modes.

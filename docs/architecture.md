@@ -311,6 +311,20 @@ host's); `flock` passes through. Both kinds of lock are the host's, so they
 hold between guest processes and against host ones. `ioctl` covers the
 terminal, pty and `FIO*` requests.
 
+A memfd (`memfd_create`, `crates/kernel/src/memfd.rs`) is a file in fwe's
+private directory, unlinked as soon as it is made, with its name and its
+seals in extended attributes, so every process that holds it sees the
+same ones. `/proc/self/fd` names it `/memfd:<name> (deleted)`. The resize
+seals are checked by `ftruncate` and `fallocate`. `F_SEAL_WRITE` clones
+the file and replaces each of this process's descriptors of it with a
+read-only one of the clone, keeping offsets, flags and shared open file
+descriptions. The host then refuses writes and writable shared mappings,
+and they fail with `EPERM`. A program runs from a memfd as crun runs its
+sealed copy of itself: by `execveat(fd, "", AT_EMPTY_PATH)` under the
+name Linux gives it (`/dev/fd/N`), or by its `/proc/self/fd` path. fwe
+keeps a descriptor of the program, which `/proc/self/exe` opens, and hands
+it on by number (`--exe-fd`) when it re-executes itself.
+
 ## Synthetic /proc and /sys
 
 The rootfs has no real `/proc` or `/sys`, so the filesystem layer consults
@@ -682,8 +696,9 @@ those items.
   periodic timerfd restarts its period, and eventfd counters and signalfd
   queues are the child's own copies while their readiness pipes are shared;
   a VM fork that fails after spawning its child can have that child reaped
-  by another thread's `wait4(-1)`; `execveat` of a descriptor finds its
-  file by path (not one renamed or deleted since it was opened); `clone3`
+  by another thread's `wait4(-1)`; `execveat` of a descriptor of a file
+  with a path finds it by that path (not one renamed or deleted since it
+  was opened); `clone3`
   has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
   `rusage`.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
@@ -696,7 +711,13 @@ those items.
   file is not filled, and its other modes are `EOPNOTSUPP`, as on a Linux
   filesystem without them. `/dev/shm` outlives the processes that use it,
   until the host clears its temporary files, and a `rename` between it
-  and the rootfs succeeds where Linux returns `EXDEV`.
+  and the rootfs succeeds where Linux returns `EXDEV`. A memfd sealed
+  against writing cannot be resized, even without `F_SEAL_SHRINK` and
+  `F_SEAL_GROW`; `F_SEAL_GROW` alone does not stop a write past the end;
+  `F_SEAL_WRITE` succeeds although a writable shared mapping exists
+  (Linux fails it with `EBUSY`), does not reach the descriptors another
+  process holds, and gives the file a new inode number. A memfd reopened
+  through `/proc/self/fd` shares the original's offset.
 - **Descriptors:** descriptors received with `SCM_RIGHTS` are not held to
   the guest's `RLIMIT_NOFILE` (every other way of making one is); a reopened
   `/proc/self/fd` entry for a pipe or socket shares the original's file

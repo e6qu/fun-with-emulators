@@ -121,6 +121,8 @@ impl Fs {
         e.bytes(&self.proc.cmdline);
         e.u32(self.proc.ncpu);
         e.bytes(&self.proc.hostname);
+        // Inherited like the root's.
+        e.i32(self.proc.exe_fd.unwrap_or(-1));
     }
 
     /// The filesystem view [`Fs::save`] wrote, in a fork child.
@@ -140,6 +142,7 @@ impl Fs {
                 cmdline: d.bytes(),
                 ncpu: d.u32(),
                 hostname: d.bytes(),
+                exe_fd: Some(d.i32()).filter(|&fd| fd >= 0),
             },
         }
     }
@@ -173,7 +176,38 @@ impl Fs {
     /// the guest's working directory: `/proc/self/exe` is always absolute.
     pub fn set_proc_info(&mut self, exe: Vec<u8>, cmdline: Vec<u8>, ncpu: u32, hostname: Vec<u8>) {
         let exe = if exe.starts_with(b"/") { exe } else { normalize(&self.cwd, &exe) };
-        self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname };
+        let exe_fd = self.proc.exe_fd;
+        self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd };
+    }
+
+    /// Hold `fd` (fwe's, in the reserved range) as the running program's
+    /// file, for a program with no path; `None` for one that has a path.
+    /// The descriptor held before is closed.
+    pub fn set_exe_fd(&mut self, fd: Option<i32>) {
+        if let Some(old) = self.proc.exe_fd
+            && Some(old) != fd
+        {
+            // SAFETY: closing fwe's own descriptor of the old program.
+            unsafe { libc::close(old) };
+        }
+        self.proc.exe_fd = fd;
+    }
+
+    /// What `/proc/self/exe` names when the program has no path (see
+    /// [`set_exe_fd`](Self::set_exe_fd)).
+    pub fn exe_fd_target(&self) -> Option<Vec<u8>> {
+        self.proc.exe_fd.map(|fd| self.fd_target(fd))
+    }
+
+    /// The descriptor `path` reaches when it names an open file that has no
+    /// path of its own (`/dev/fd/N` or `/proc/self/fd/N` of a memfd, or
+    /// `/proc/self/exe` of a program run from one), which is then read and
+    /// executed through the descriptor.
+    pub fn pathless_fd(&self, path: &[u8]) -> Option<i32> {
+        match self.synthetic(fcntl::AT_FDCWD as i32, path)? {
+            crate::procfs::Entry::Fd { fd, target } if !has_path(fd, &target) => Some(fd),
+            _ => None,
+        }
     }
 
     /// The host path of the rootfs, or `None` when the root is the host `/`
@@ -216,6 +250,9 @@ impl Fs {
     /// What `/proc/self/fd/<fd>` links to: the guest path of the open file,
     /// or Linux's name for an object with none.
     pub fn fd_target(&self, fd: i32) -> Vec<u8> {
+        if let Some(name) = crate::memfd::name(fd) {
+            return [&b"/memfd:"[..], &name, b" (deleted)"].concat();
+        }
         if let Some(name) = crate::specialfd::anon_name(fd) {
             return format!("anon_inode:{name}").into_bytes();
         }
@@ -324,6 +361,18 @@ impl Fs {
     /// Resolve and read a whole file under the root (following symlinks).
     /// Used to load the dynamic linker named by a guest executable.
     pub fn read(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
+            use crate::procfs::Entry;
+            return match entry {
+                Entry::File(data) => Ok(data),
+                Entry::Fd { fd, target } if !has_path(fd, &target) => read_all(fd),
+                Entry::Fd { target: t, .. } | Entry::Symlink(t) if t.starts_with(b"/") => {
+                    self.read(&t)
+                }
+                Entry::Dir => Err(errno::EISDIR),
+                _ => Err(errno::ENOENT),
+            };
+        }
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
@@ -627,7 +676,34 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
 /// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
 /// user's temporary directory. Unlike a tmpfs it outlives the processes,
 /// until the host clears its temporary files.
-mod shm {
+/// Whether `target`, what `/proc/self/fd/<fd>` links to, is a path the
+/// file can be opened by again; otherwise opening the link duplicates the
+/// descriptor (a pipe, a socket, a memfd).
+pub(crate) fn has_path(fd: i32, target: &[u8]) -> bool {
+    target.starts_with(b"/") && crate::memfd::name(fd).is_none()
+}
+
+/// The whole contents of the file `fd` is open on, from its start whatever
+/// its offset.
+fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        // SAFETY: reading into a valid local buffer.
+        let n = unsafe {
+            libc::pread(fd, chunk.as_mut_ptr().cast(), chunk.len(), data.len() as libc::off_t)
+        };
+        if n < 0 {
+            return Err(e());
+        }
+        if n == 0 {
+            return Ok(data);
+        }
+        data.extend_from_slice(&chunk[..n as usize]);
+    }
+}
+
+pub(crate) mod shm {
     use super::{OwnedFd, e, fd_path};
     use fwe_abi::errno;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -690,20 +766,27 @@ mod shm {
         Ok(())
     }
 
+    /// fwe's private directory for this user (`fwe-<uid>` in the user's
+    /// temporary directory), created on first use.
+    pub(crate) fn user_dir() -> Result<Vec<u8>, i32> {
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let mut base = user_temp();
+        if base.last() != Some(&b'/') {
+            base.push(b'/');
+        }
+        base.extend_from_slice(format!("fwe-{uid}").as_bytes());
+        ensure_dir(&base, 0o700, true)?;
+        Ok(base)
+    }
+
     /// Open the directory for the root at `root_host`, creating it on first
     /// use.
     pub(super) fn open(root_host: &[u8]) -> Result<OwnedFd, i32> {
         let path = match TOP.get() {
             Some(top) => top.path.clone(),
             None => {
-                // SAFETY: getuid cannot fail.
-                let uid = unsafe { libc::getuid() };
-                let mut base = user_temp();
-                if base.last() != Some(&b'/') {
-                    base.push(b'/');
-                }
-                base.extend_from_slice(format!("fwe-{uid}").as_bytes());
-                ensure_dir(&base, 0o700, true)?;
+                let mut base = user_dir()?;
                 // FNV-1a: stable across processes and fwe builds.
                 let hash = root_host.iter().fold(0xcbf29ce484222325u64, |h, &b| {
                     (h ^ b as u64).wrapping_mul(0x100000001b3)

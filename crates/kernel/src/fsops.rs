@@ -123,11 +123,12 @@ impl<P: Platform> Kernel<P> {
                     if flags & fcntl::O_NOFOLLOW != 0 {
                         return err(errno::ELOOP);
                     }
-                    if target.starts_with(b"/") {
+                    if crate::fs::has_path(fd, &target) {
                         // Reopen the file, as Linux does.
                         return self.sys_openat_bytes(dirfd, &target, flags, mode);
                     }
-                    // A pipe, socket or the like: a new descriptor for it.
+                    // A pipe, socket, memfd or the like: a new descriptor
+                    // for it.
                     let cmd = if flags & fcntl::O_CLOEXEC != 0 {
                         libc::F_DUPFD_CLOEXEC
                     } else {
@@ -507,11 +508,31 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_ftruncate(&mut self, fd: u64, len: u64) -> i64 {
+        if let Err(e) = crate::memfd::check_resize(fd as i32, len as i64) {
+            return err(e);
+        }
         // SAFETY: plain host call on a guest fd.
         ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) })
     }
 
     pub(crate) fn sys_fallocate(&mut self, fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
+        if mode & fwe_abi::falloc::FALLOC_FL_KEEP_SIZE == 0 {
+            let end = (offset as i64).saturating_add(len as i64);
+            // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `st` is a valid out-parameter.
+            let size = if unsafe { libc::fstat(fd as i32, &mut st) } == 0 { st.st_size } else { 0 };
+            if end > size {
+                if let Err(e) = crate::memfd::check_resize(fd as i32, end) {
+                    return err(e);
+                }
+            }
+        }
+        if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0
+            && crate::memfd::write_refused(fd as i32)
+        {
+            return err(errno::EPERM);
+        }
         match crate::host::fallocate(fd as i32, mode, offset as i64, len as i64) {
             Ok(()) => 0,
             Err(e) => err(e),

@@ -18,6 +18,7 @@ pub mod fs;
 mod fsops;
 pub mod futex;
 pub mod host;
+pub mod memfd;
 pub mod mm;
 pub mod net;
 pub mod procfs;
@@ -382,8 +383,9 @@ impl<P: Platform> Kernel<P> {
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
     /// itself if absolute, else relative to `dirfd` (or the working
     /// directory for `AT_FDCWD`); with `AT_EMPTY_PATH` and an empty `path`,
-    /// the file `dirfd` is open on. `AT_SYMLINK_NOFOLLOW` refuses a final
-    /// symbolic link with `ELOOP`. Fails with a Linux errno.
+    /// the file `dirfd` is open on (`/dev/fd/N`, as Linux names it, for a
+    /// file with no path, such as a memfd). `AT_SYMLINK_NOFOLLOW` refuses a
+    /// final symbolic link with `ELOOP`. Fails with a Linux errno.
     pub fn execveat_path(&self, dirfd: i32, path: &[u8], flags: u64) -> Result<Vec<u8>, i32> {
         use fwe_abi::{errno, fcntl};
         if flags & !(fcntl::AT_EMPTY_PATH | fcntl::AT_SYMLINK_NOFOLLOW) != 0 {
@@ -404,7 +406,15 @@ impl<P: Platform> Kernel<P> {
             if flags & fcntl::AT_EMPTY_PATH == 0 {
                 return Err(errno::ENOENT);
             }
-            if at_cwd { fs.cwd().to_vec() } else { fd_path(dirfd)? }
+            if at_cwd {
+                fs.cwd().to_vec()
+            } else if crate::memfd::name(dirfd).is_some() && fdtable::guest_visible(dirfd) {
+                // A file with no path, run through its descriptor under the
+                // name Linux gives it.
+                format!("/dev/fd/{dirfd}").into_bytes()
+            } else {
+                fd_path(dirfd)?
+            }
         } else if path.first() == Some(&b'/') {
             path.to_vec()
         } else {
@@ -667,6 +677,17 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    // SAFETY: the caller's guarantee, passed on.
+    let r = unsafe { blocking_call(nr, a) }?;
+    // A write the host refused to a sealed memfd, as Linux reports it.
+    Some(memfd::linux_write_error(nr, &a, r))
+}
+
+/// [`blocking_syscall`]'s calls.
+///
+/// # Safety
+/// As for [`blocking_syscall`].
+unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);

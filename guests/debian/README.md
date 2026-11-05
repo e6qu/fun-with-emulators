@@ -86,7 +86,7 @@ test: each line is a Debian 12 `arm64` package's pool path and its SHA-256
 from the bookworm index. The test downloads them from `deb.debian.org` (or,
 once a newer version has replaced one there, from `snapshot.debian.org`),
 checks each checksum, unpacks them into its root filesystem and caches them
-under `target/debian-packages` (`FWE_DEBIAN_CACHE` overrides it; CI caches
+under `target/fetched-packages` (`FWE_FETCH_CACHE` overrides it; CI caches
 it). Nothing fetched is redistributed in this repository.
 
 | Manifest | Program | Size |

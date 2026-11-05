@@ -357,8 +357,10 @@ fn main() {
         // SIGTSTP's default action stops the process, and the parent's
         // waitpid reports that signal.
         "stop-tstp" => {
-            let pid = child(|| loop {
-                std::thread::sleep(Duration::from_millis(10));
+            let pid = child(|| {
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             });
             // SAFETY: plain calls.
             unsafe { kill(pid, SIGTSTP) };

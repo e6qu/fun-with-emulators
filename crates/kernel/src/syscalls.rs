@@ -93,7 +93,7 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_limit(n, &a) {
             return e;
         }
-        let r = self.dispatch_call(n, a);
+        let r = crate::memfd::linux_write_error(n, &a, self.dispatch_call(n, a));
         // Descriptors past the guest's soft limit are ones Linux would not
         // have given: closed again (by the guest's `close`, which also drops
         // what fwe keeps for one), and the call fails.
@@ -179,6 +179,11 @@ impl<P: Platform> Kernel<P> {
             nr::EPOLL_CREATE1 => unsafe { crate::epoll::create1(a[0]) },
             // SAFETY: the host validates the epoll_event pointer.
             nr::EPOLL_CTL => unsafe { crate::epoll::ctl(a[0], a[1], a[2], a[3]) },
+            nr::MEMFD_CREATE => match uaccess::read_cstr(a[0], fwe_abi::memfd::NAME_MAX) {
+                Ok(name) => crate::memfd::create(&name, a[1]),
+                Err(errno::ENAMETOOLONG) => err(errno::EINVAL),
+                Err(e) => err(e),
+            },
             // SAFETY: eventfd2 takes no pointers.
             nr::EVENTFD2 => unsafe { crate::specialfd::eventfd2(a[0], a[1]) },
             // SAFETY: timerfd_create takes no pointers.
@@ -233,6 +238,7 @@ impl<P: Platform> Kernel<P> {
             nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
+            nr::FCHMOD if crate::memfd::chmod_sealed(a[0] as i32) => err(errno::EPERM),
             nr::FCHMOD => {
                 // SAFETY: plain host call on a guest fd.
                 ret(unsafe { libc::fchmod(a[0] as i32, a[1] as libc::mode_t) })
@@ -527,7 +533,16 @@ impl<P: Platform> Kernel<P> {
                 }
                 fcntl::F_GETFL => {
                     let r = libc::fcntl(fd, libc::F_GETFL);
-                    if r < 0 { last_error() } else { host::status_flags_to_linux(r) as i64 }
+                    if r < 0 {
+                        last_error()
+                    } else if crate::memfd::write_refused(fd) {
+                        // Read-only on the host since it was sealed (see
+                        // `memfd`), but open for writing as far as Linux goes.
+                        let r = (r & !libc::O_ACCMODE) | libc::O_RDWR;
+                        host::status_flags_to_linux(r) as i64
+                    } else {
+                        host::status_flags_to_linux(r) as i64
+                    }
                 }
                 fcntl::F_SETFL => {
                     ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
@@ -545,6 +560,8 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 fcntl::F_SETLK | fcntl::F_SETLKW => set_record_lock(fd, cmd, arg),
+                fcntl::F_ADD_SEALS => crate::memfd::add_seals(fd, arg),
+                fcntl::F_GET_SEALS => crate::memfd::get_seals(fd),
                 _ => err(errno::EINVAL),
             }
         }

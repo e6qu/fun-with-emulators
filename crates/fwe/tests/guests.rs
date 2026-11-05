@@ -1053,19 +1053,20 @@ SQL
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// Where fetched Debian packages are cached (`FWE_DEBIAN_CACHE`, or under
+/// Where fetched packages are cached (`FWE_FETCH_CACHE`, or under
 /// `target/`), so a test downloads each only once.
-fn debian_cache() -> PathBuf {
-    std::env::var_os("FWE_DEBIAN_CACHE")
+fn fetch_cache() -> PathBuf {
+    std::env::var_os("FWE_FETCH_CACHE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| repo().join("target/debian-packages"))
+        .unwrap_or_else(|| repo().join("target/fetched-packages"))
 }
 
-/// The packages listed in `guests/debian/fetch/<manifest>.txt` (pool paths
-/// and SHA-256s), and the manifest's text.
-fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
-    let list = std::fs::read_to_string(repo().join(format!("guests/debian/fetch/{manifest}.txt")))
-        .unwrap();
+/// The files listed in `guests/<distro>/fetch/<manifest>.txt` (paths and
+/// SHA-256s), and the manifest's text.
+fn manifest_in(distro: &str, manifest: &str) -> (String, Vec<(String, String)>) {
+    let list =
+        std::fs::read_to_string(repo().join(format!("guests/{distro}/fetch/{manifest}.txt")))
+            .unwrap();
     let packages = list
         .lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
@@ -1075,44 +1076,55 @@ fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
     (list, packages)
 }
 
+fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
+    manifest_in("debian", manifest)
+}
+
+fn sha256(f: &Path) -> String {
+    let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// A file fetched from the first of `urls` that serves it with SHA-256
+/// `sha256`, cached under `name`.
+fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> PathBuf {
+    let cache = fetch_cache();
+    std::fs::create_dir_all(&cache).unwrap();
+    let file = cache.join(name);
+    if file.exists() && sha256(&file) == sha256_hex {
+        return file;
+    }
+    // Tests fetch at once, and manifests share packages: each download goes
+    // to a name of its own and is renamed into place once it checks out.
+    let part = cache.join(format!("{name}.{tag}.part"));
+    let fetched = urls.iter().any(|url| {
+        Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "-o"])
+            .arg(&part)
+            .arg(url)
+            .status()
+            .is_ok_and(|s| s.success())
+            && sha256(&part) == sha256_hex
+    });
+    assert!(fetched, "could not fetch {name} with SHA-256 {sha256_hex} from {urls:?}");
+    std::fs::rename(&part, &file).unwrap();
+    file
+}
+
 /// The `.deb` files a manifest lists, fetched on first use and checked
 /// against the SHA-256 recorded there. They come from deb.debian.org, or
 /// from snapshot.debian.org once a newer version has replaced them.
 fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
     let (_, packages) = manifest(manifest_name);
-    let cache = debian_cache();
-    std::fs::create_dir_all(&cache).unwrap();
-    let sum = |f: &Path| {
-        let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
-    };
     packages
         .iter()
         .map(|(pool, sha256)| {
-            let deb = cache.join(Path::new(pool).file_name().unwrap());
-            if !deb.exists() || sum(&deb) != *sha256 {
-                // Tests fetch at once, and manifests share packages: each
-                // download goes to a name of its own and is renamed into
-                // place once it checks out.
-                let part = cache.join(format!("{pool}.{manifest_name}.part").replace('/', "_"));
-                let fetched = [
-                    format!("https://deb.debian.org/debian/{pool}"),
-                    format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
-                ]
-                .iter()
-                .any(|url| {
-                    Command::new("curl")
-                        .args(["-fsSL", "--retry", "3", "-o"])
-                        .arg(&part)
-                        .arg(url)
-                        .status()
-                        .is_ok_and(|s| s.success())
-                        && sum(&part) == *sha256
-                });
-                assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
-                std::fs::rename(&part, &deb).unwrap();
-            }
-            deb
+            let name = Path::new(pool).file_name().unwrap().to_string_lossy().into_owned();
+            let urls = [
+                format!("https://deb.debian.org/debian/{pool}"),
+                format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
+            ];
+            fetch_pinned(&name, &urls, sha256, manifest_name)
         })
         .collect()
 }
@@ -1121,7 +1133,7 @@ fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
 /// unpacked once and cached, plus the vendored glibc runtime and bash.
 fn fetched_root(manifest_name: &str) -> PathBuf {
     let (list, _) = manifest(manifest_name);
-    let cache = debian_cache();
+    let cache = fetch_cache();
     let root = cache.join(format!("root-{manifest_name}"));
     let done = root.join(".fwe-complete");
     if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
@@ -2149,6 +2161,57 @@ fn debian_bash_runs_trap_handlers() {
     assert_eq!(stdout(&out), "trapped\nreaped\nend\n");
 }
 
+/// Run one scenario of the `memfd` guest and return its output.
+fn memfd(scenario: &str) -> String {
+    let out = fwe(&rust_guest("memfd"), &[scenario]);
+    eprintln!("--- memfd {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{scenario}");
+    stdout(&out)
+}
+
+/// What the `memfd` guest's `seals` scenario prints: a memfd named as
+/// Linux names it, and each seal holding.
+const MEMFD_SEALS: &str = "\
+link: /memfd:plain (deleted)
+seals: 1
+sealing it: -1 EPERM
+not a memfd: -1 EINVAL
+sealable: 0
+shrink: -1 EPERM
+grow: -1 EPERM
+same size: 0
+write: -1 EPERM
+writable mapping: -1 EPERM
+read-only mapping: true
+still open for writing: true
+seals now: 15
+more: -1 EPERM
+reopened: true seals 15
+";
+
+/// A memfd's seals hold as on Linux: against resizing, writing and
+/// writable shared mappings, through every descriptor of it.
+#[test]
+fn memfd_seals_hold() {
+    assert_eq!(memfd("seals"), MEMFD_SEALS);
+}
+
+/// What the copy of the `memfd` guest run from a sealed memfd prints.
+fn memfd_child(how: &str) -> String {
+    format!("running {how} as copy\nexe: /memfd:self (deleted)\nexe sealed: true\n")
+}
+
+/// A program runs from a sealed memfd, as crun re-executes itself: by
+/// descriptor (`execveat` with `AT_EMPTY_PATH`), by its `/proc/self/fd`
+/// path, and from a process with another thread (where fwe re-executes
+/// itself); `/proc/self/exe` then opens the memfd, seals and all.
+#[test]
+fn program_runs_from_a_sealed_memfd() {
+    assert_eq!(memfd("exec"), memfd_child("by-descriptor"));
+    assert_eq!(memfd("exec-path"), memfd_child("by-path"));
+    assert_eq!(memfd("exec-threaded"), memfd_child("from-a-thread"));
+}
+
 /// Run one scenario of the `fds` guest from inside a root filesystem (so
 /// path resolution depends on fwe's handle on it) and return its output.
 fn fds(scenario: &str) -> String {
@@ -2583,6 +2646,19 @@ fn hv_delivers_signals() {
     use std::os::unix::process::ExitStatusExt;
     let out = run("sigpipe").unwrap();
     assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
+}
+
+/// memfds in the VM: seals hold, and a program runs from a sealed memfd,
+/// which the VM process hands to the fwe it re-executes by descriptor.
+#[test]
+fn hv_runs_a_program_from_a_sealed_memfd() {
+    let run = |scenario: &str| fwe_hv(&rust_low_guest("memfd"), &[scenario]);
+    let Some(out) = run("seals") else { return };
+    assert_eq!(stdout(&out), MEMFD_SEALS);
+    for (scenario, how) in [("exec", "by-descriptor"), ("exec-path", "by-path")] {
+        let out = run(scenario).unwrap();
+        assert_eq!(stdout(&out), memfd_child(how), "{scenario}");
+    }
 }
 
 /// The kernel's view of guest memory in the VM: /proc/self/fd and the
