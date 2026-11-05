@@ -10,8 +10,26 @@ use fwe_abi::{err, errno};
 use std::sync::Arc;
 
 /// The namespaces fwe can make.
-const SUPPORTED: u64 =
-    CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWPID;
+const SUPPORTED: u64 = CLONE_NEWNS
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWCGROUP
+    | CLONE_NEWPID
+    | CLONE_NEWUSER;
+
+/// The capabilities a process has in a user namespace it has just made:
+/// all of them, as Linux gives them.
+fn caps_in_new_userns() -> crate::caps::Caps {
+    crate::caps::Caps {
+        effective: crate::caps::ALL,
+        permitted: crate::caps::ALL,
+        inheritable: 0,
+        bounding: crate::caps::ALL,
+        ambient: 0,
+        securebits: 0,
+    }
+}
 
 /// What a `clone` that makes a process arranges for the child's
 /// namespaces, from before the host `fork` until it is known how it went
@@ -21,6 +39,9 @@ pub struct ForkNs {
     saved: Option<(Arc<crate::mounts::store::Ns>, Namespaces)>,
     /// The child's namespaces' records, for its record.
     dirs: Vec<Vec<u8>>,
+    /// The parent's capabilities, while the child's (in a new user
+    /// namespace) are in place for the fork.
+    caps: Option<crate::caps::Caps>,
     /// The child's pid namespaces, and its numbers in them.
     chain: pidns::Chain,
     nums: Vec<i32>,
@@ -37,7 +58,13 @@ impl<P: Platform> Kernel<P> {
         if flags & SUPPORTED == 0 {
             return 0;
         }
-        if !self.creds.has_admin() {
+        // A new user namespace needs no privilege, and gives the caller what
+        // the others need; it cannot be made by a process with other threads.
+        let new_user = flags & CLONE_NEWUSER != 0;
+        if new_user && crate::thread::live_threads() > 1 {
+            return err(errno::EINVAL);
+        }
+        if !new_user && !self.creds.has_admin() {
             return err(errno::EPERM);
         }
         let fs = self.fs.as_mut().expect("filesystem configured");
@@ -50,6 +77,10 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = fs.ns.unshare(flags) {
             return err(e);
         }
+        if new_user {
+            self.creds.caps = caps_in_new_userns();
+        }
+        let fs = self.fs.as_mut().expect("filesystem configured");
         if flags & CLONE_NEWPID != 0 {
             // For the children: the process itself stays where it is.
             let parent = fs.ns.pid_children.as_ref().map(|r| (r.dir().to_vec(), r.id()));
@@ -85,11 +116,12 @@ impl<P: Platform> Kernel<P> {
     /// inherits it. The caller holds the kernel lock until
     /// [`Kernel::fork_parent`] or [`Kernel::fork_child`].
     pub fn fork_begin(&mut self, flags: u64) -> Result<ForkNs, i32> {
-        if flags & CLONE_NEWUSER != 0 || flags & CLONE_NEWTIME != 0 {
+        if flags & CLONE_NEWTIME != 0 {
             return Err(errno::EINVAL);
         }
         let new = flags & SUPPORTED;
-        if new != 0 && !self.creds.has_admin() {
+        let new_user = new & CLONE_NEWUSER != 0;
+        if new != 0 && !new_user && !self.creds.has_admin() {
             return Err(errno::EPERM);
         }
         // Within the cgroup's `pids.max`.
@@ -119,13 +151,17 @@ impl<P: Platform> Kernel<P> {
             None
         };
         let dirs = fs.ns_dirs();
-        Ok(ForkNs { saved, chain, nums, dirs })
+        let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
+        Ok(ForkNs { saved, chain, nums, dirs, caps })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
     /// pid, or negative if it failed): back to its own namespaces. Returns
     /// the child's pid as the parent sees it.
     pub fn fork_parent(&mut self, t: ForkNs, child: i32) -> i32 {
+        if let Some(caps) = t.caps {
+            self.creds.caps = caps;
+        }
         if let Some((mnt, ns)) = t.saved {
             let fs = self.fs.as_mut().expect("filesystem configured");
             fs.set_mount_ns(mnt);

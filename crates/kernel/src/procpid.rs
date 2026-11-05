@@ -228,6 +228,16 @@ fn ns_link(kind: &[u8], dirs: &[Vec<u8>], init: u64) -> Vec<u8> {
     [k, format!(":[{id}]").as_bytes()].concat()
 }
 
+/// The user namespace record among a process's namespace records, if it
+/// is in one of fwe's.
+pub fn user_record(dirs: &[Vec<u8>]) -> Option<crate::shared::Record<crate::userns::UserNs>> {
+    let prefix = format!("v{}-user-", crate::shared::FORMAT);
+    let d = dirs.iter().find(|d| {
+        d.rsplit(|&b| b == b'/').next().is_some_and(|n| n.starts_with(prefix.as_bytes()))
+    })?;
+    crate::shared::Record::join(d, 0).ok()
+}
+
 /// The entry `sub` (empty for the directory itself) of `/proc/<pid>`, for
 /// process `pid` of the reader's pid namespace behind host pid `host`.
 pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
@@ -254,8 +264,24 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),
         b"/cgroup" => Entry::File([b"0::", &rec.cgroup[..], b"\n"].concat()),
-        b"/uid_map" | b"/gid_map" => Entry::File(b"         0          0 4294967295\n".to_vec()),
-        b"/setgroups" => Entry::File(b"allow\n".to_vec()),
+        b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
+            Some(u) => {
+                let n = u.get();
+                Entry::File(match sub {
+                    b"/uid_map" => crate::userns::show_map(&n.uid_map),
+                    b"/gid_map" => crate::userns::show_map(&n.gid_map),
+                    _ => {
+                        if n.setgroups_deny {
+                            b"deny\n".to_vec()
+                        } else {
+                            b"allow\n".to_vec()
+                        }
+                    }
+                })
+            }
+            None if sub == b"/setgroups" => Entry::File(b"allow\n".to_vec()),
+            None => Entry::File(b"         0          0 4294967295\n".to_vec()),
+        },
         _ => {
             if let Some(kind) = sub.strip_prefix(b"/ns/") {
                 let init = match kind {

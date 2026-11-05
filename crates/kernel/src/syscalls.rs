@@ -118,6 +118,11 @@ impl<P: Platform> Kernel<P> {
                 if let Some(r) = crate::cgroupfs::try_write(a[0] as i32, a[1], a[2]) {
                     return r;
                 }
+                if crate::fdmarks::any_marks()
+                    && let Some(r) = crate::userns::try_write(a[0] as i32, a[1], a[2])
+                {
+                    return r;
+                }
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
@@ -341,19 +346,48 @@ impl<P: Platform> Kernel<P> {
             // A parent outside the namespace is 0, as Linux reports it.
             nr::GETPPID => crate::pidns::guest_ret(host::getppid()),
             // Virtual credentials (see crates/kernel/src/creds.rs).
-            nr::GETUID => self.creds.getuid(),
-            nr::GETEUID => self.creds.geteuid(),
-            nr::GETGID => self.creds.getgid(),
-            nr::GETEGID => self.creds.getegid(),
-            nr::SETUID => self.creds.setuid(a[0] as u32),
-            nr::SETREUID => self.creds.setreuid(a[0] as u32, a[1] as u32),
-            nr::SETRESUID => self.creds.setresuid(a[0] as u32, a[1] as u32, a[2] as u32),
-            nr::SETFSUID => self.creds.setfsuid(a[0] as u32),
+            // Kept as the initial namespace's ids, seen through the user
+            // namespace's maps (see `userns`).
+            nr::GETUID => uid_out(self.creds.uid, false),
+            nr::GETEUID => uid_out(self.creds.euid, false),
+            nr::GETGID => uid_out(self.creds.gid, true),
+            nr::GETEGID => uid_out(self.creds.egid, true),
+            nr::SETUID => match uid_in(a[0], false) {
+                Ok(u) => self.creds.setuid(u),
+                Err(e) => err(e),
+            },
+            nr::SETREUID => match (uid_in(a[0], false), uid_in(a[1], false)) {
+                (Ok(r), Ok(e)) => self.creds.setreuid(r, e),
+                (Err(x), _) | (_, Err(x)) => err(x),
+            },
+            nr::SETRESUID => {
+                match (uid_in(a[0], false), uid_in(a[1], false), uid_in(a[2], false)) {
+                    (Ok(r), Ok(e), Ok(s)) => self.creds.setresuid(r, e, s),
+                    (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
+                }
+            }
+            nr::SETFSUID => match uid_in(a[0], false) {
+                Ok(u) => uid_out(self.creds.setfsuid(u) as u32, false),
+                // Unmapped: no change, and the old one back.
+                Err(_) => uid_out(self.creds.fsuid, false),
+            },
             nr::GETRESUID => self.sys_getresuid(a[0], a[1], a[2]),
-            nr::SETGID => self.creds.setgid(a[0] as u32),
-            nr::SETREGID => self.creds.setregid(a[0] as u32, a[1] as u32),
-            nr::SETRESGID => self.creds.setresgid(a[0] as u32, a[1] as u32, a[2] as u32),
-            nr::SETFSGID => self.creds.setfsgid(a[0] as u32),
+            nr::SETGID => match uid_in(a[0], true) {
+                Ok(g) => self.creds.setgid(g),
+                Err(e) => err(e),
+            },
+            nr::SETREGID => match (uid_in(a[0], true), uid_in(a[1], true)) {
+                (Ok(r), Ok(e)) => self.creds.setregid(r, e),
+                (Err(x), _) | (_, Err(x)) => err(x),
+            },
+            nr::SETRESGID => match (uid_in(a[0], true), uid_in(a[1], true), uid_in(a[2], true)) {
+                (Ok(r), Ok(e), Ok(s)) => self.creds.setresgid(r, e, s),
+                (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
+            },
+            nr::SETFSGID => match uid_in(a[0], true) {
+                Ok(g) => uid_out(self.creds.setfsgid(g) as u32, true),
+                Err(_) => uid_out(self.creds.fsgid, true),
+            },
             nr::GETRESGID => self.sys_getresgid(a[0], a[1], a[2]),
             nr::GETGROUPS => self.sys_getgroups(a[0], a[1]),
             nr::SETGROUPS => self.sys_setgroups(a[0], a[1]),
@@ -475,9 +509,10 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         let (r, e, s) = self.creds.resuid();
-        guest!(uaccess::write(rp, r));
-        guest!(uaccess::write(ep, e));
-        guest!(uaccess::write(sp, s));
+        let v = |id| crate::userns::to_ns(id, false);
+        guest!(uaccess::write(rp, v(r)));
+        guest!(uaccess::write(ep, v(e)));
+        guest!(uaccess::write(sp, v(s)));
         0
     }
 
@@ -486,9 +521,10 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         let (r, e, s) = self.creds.resgid();
-        guest!(uaccess::write(rp, r));
-        guest!(uaccess::write(ep, e));
-        guest!(uaccess::write(sp, s));
+        let v = |id| crate::userns::to_ns(id, true);
+        guest!(uaccess::write(rp, v(r)));
+        guest!(uaccess::write(ep, v(e)));
+        guest!(uaccess::write(sp, v(s)));
         0
     }
 
@@ -502,7 +538,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         for (i, &g) in groups.iter().enumerate() {
-            guest!(uaccess::write(list + (i * 4) as u64, g));
+            guest!(uaccess::write(list + (i * 4) as u64, crate::userns::to_ns(g, true)));
         }
         n as i64
     }
@@ -512,9 +548,18 @@ impl<P: Platform> Kernel<P> {
         if n > 65536 {
             return err(errno::EINVAL);
         }
+        // Denied in a user namespace whose setgroups says so, or whose
+        // gid_map is not yet written.
+        if crate::userns::nested() && !crate::userns::setgroups_allowed() {
+            return err(errno::EPERM);
+        }
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
-            v.push(guest!(uaccess::read::<u32>(list + (i * 4) as u64)));
+            let g = guest!(uaccess::read::<u32>(list + (i * 4) as u64));
+            match crate::userns::from_ns(g, true) {
+                Some(k) => v.push(k),
+                None => return err(errno::EINVAL),
+            }
         }
         self.creds.setgroups(v)
     }
@@ -1073,10 +1118,12 @@ impl<P: Platform> Kernel<P> {
             });
         let h = crate::procpid::host_info(host).unwrap_or_default();
         let c = &self.creds;
+        let u = |id| crate::userns::to_ns(id, false);
+        let g = |id| crate::userns::to_ns(id, true);
         let creds = crate::procpid::Creds {
-            uids: [c.uid, c.euid, c.suid, c.fsuid],
-            gids: [c.gid, c.egid, c.sgid, c.fsgid],
-            groups: c.groups.clone(),
+            uids: [u(c.uid), u(c.euid), u(c.suid), u(c.fsuid)],
+            gids: [g(c.gid), g(c.egid), g(c.sgid), g(c.fsgid)],
+            groups: c.groups.iter().map(|&x| g(x)).collect(),
             caps: Some(c.caps),
             no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
             seccomp: crate::seccomp::mode(),
@@ -1454,6 +1501,23 @@ fn online_cpus() -> Vec<u64> {
             if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 }
         })
         .collect()
+}
+
+
+
+/// An id the process holds (the initial namespace's) as it sees it.
+fn uid_out(id: u32, gid: bool) -> i64 {
+    i64::from(crate::userns::to_ns(id, gid))
+}
+
+/// An id argument (in the process's user namespace) as the initial
+/// namespace's, `-1` (leave alone) kept: `EINVAL` for one with no mapping.
+fn uid_in(arg: u64, gid: bool) -> Result<u32, i32> {
+    let id = arg as u32;
+    if id == u32::MAX {
+        return Ok(id);
+    }
+    crate::userns::from_ns(id, gid).ok_or(errno::EINVAL)
 }
 
 #[cfg(test)]

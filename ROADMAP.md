@@ -16,7 +16,9 @@ lighttpd, Node, Cargo and apt run natively, and Debian's Python, GCC, Go
 and clang in the VM (verified on the software stand-in; a run on real
 hardware is still to come), so every target program has a test. What
 remains is that run on real hardware, and the `x18` and code-discovery
-gaps, which no target program needs yet.
+gaps, which no target program needs yet. M3 is in progress: crun runs the
+standard `alpine` image in its own namespaces, cgroup, capabilities and
+seccomp profile; overlay mounts, podman and containerd are next.
 
 ## M0 — Foundation (done)
 
@@ -149,10 +151,13 @@ servers run unmodified.
 
 ## M3 — Containers
 
-- [ ] Namespaces (mount, pid, user, uts, ipc, network, cgroup)
-- [ ] cgroups v2
+- [x] Namespaces (mount, pid, user, uts, ipc, network, cgroup)
+- [x] cgroups v2
 - [ ] Overlay mounts
-- [ ] seccomp and capabilities
+- [x] seccomp and capabilities
+- [x] An OCI runtime runs a standard image: crun runs the `alpine` image
+- [ ] podman runs standard images
+- [ ] containerd runs standard images
 
 **Done when:** podman and containerd run standard container images.
 

@@ -127,6 +127,21 @@ impl<P: Platform> Kernel<P> {
                 {
                     anon_fd(&self.self_status())
                 }
+                crate::procfs::Entry::File(content)
+                    if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
+                {
+                    // The map files take a write; the rest are read-only.
+                    match self.map_file(dirfd as i32, &path) {
+                        Some(mark) => {
+                            let fd = anon_fd(&content);
+                            if fd >= 0 {
+                                crate::fdmarks::mark(fd as i32, mark);
+                            }
+                            fd
+                        }
+                        None => err(errno::EACCES),
+                    }
+                }
                 crate::procfs::Entry::File(content) => anon_fd(&content),
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
@@ -223,9 +238,19 @@ impl<P: Platform> Kernel<P> {
             }
         }
         // SAFETY: `dir` is a live directory fd.
-        let fd = unsafe {
+        let mut fd = unsafe {
             host::openat(resolved.dir.as_raw_fd(), &name, host_flags, mode as libc::c_uint)
         };
+        if fd < 0
+            && flags & fcntl::O_PATH != 0
+            && matches!(host::last_errno(), libc::ENXIO | libc::ENODEV | libc::EBUSY)
+        {
+            // O_PATH names a device without opening it; the host has no such
+            // open, so a stand-in holds the node's place (where it was
+            // opened, which is what an O_PATH descriptor is used for).
+            // SAFETY: a constant NUL-terminated path.
+            fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        }
         if fd < 0 {
             return last_error();
         }
@@ -881,6 +906,44 @@ impl<P: Platform> Kernel<P> {
             crate::procfs::Entry::Fd { fd, .. } => Some(fd),
             _ => None,
         }
+    }
+
+    /// For `/proc/<pid>/uid_map`, `gid_map` or `setgroups` at `path`, what
+    /// a write to it acts on, with the opener's standing (see `userns`).
+    fn map_file(&self, dirfd: i32, path: &[u8]) -> Option<crate::fdmarks::Mark> {
+        let p = self.fs().proc_path(dirfd, path).or_else(|| {
+            // Another process's: /proc/<pid>/...
+            let a = self.fs().absolute_path(dirfd, path)?;
+            let (m, fs_path) = self.fs().mount_of(&a);
+            (m.fstype == crate::mounts::FsType::Proc)
+                .then(|| crate::mounts::join(b"/proc", &fs_path))
+        })?;
+        let rest = p.strip_prefix(b"/proc/")?;
+        let (who, file) = rest.split_at(rest.iter().position(|&b| b == b'/')?);
+        let which = match file {
+            b"/uid_map" => 0,
+            b"/gid_map" => 1,
+            b"/setgroups" => 2,
+            _ => return None,
+        };
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let host = if who == b"self" {
+            me
+        } else {
+            crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
+        };
+        let target = crate::procreg::read(host).and_then(|r| crate::procpid::user_record(&r.ns));
+        let (privileged, own) = match &target {
+            Some(t) => {
+                let gid = which == 1;
+                let cap = if gid { crate::caps::CAP_SETGID } else { crate::caps::CAP_SETUID };
+                let kid = if gid { self.creds.egid } else { self.creds.euid };
+                crate::userns::standing(t, kid, gid, self.creds.has(cap))
+            }
+            None => (false, 0),
+        };
+        Some(crate::fdmarks::Mark::ProcMap { host, which, privileged, own })
     }
 
     /// `EROFS` for a file opened through a read-only mount.

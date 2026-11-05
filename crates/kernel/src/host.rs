@@ -128,7 +128,15 @@ pub const OVERFLOW_ID: u32 = 65534;
 /// sender): as in a rootless container's user namespace, the host user fwe
 /// runs as is root in the guest, whose default identity is root too, and
 /// every other user is [`OVERFLOW_ID`].
+/// In a user namespace of fwe's, that id as the namespace sees it.
 pub fn uid_to_linux(uid: u32) -> u32 {
+    crate::userns::to_ns(uid_to_initial(uid), false)
+}
+
+/// [`uid_to_linux`] in the initial user namespace's terms: what a signal
+/// handler may compute (it takes no lock), translated when the guest is
+/// given it.
+pub fn uid_to_initial(uid: u32) -> u32 {
     // SAFETY: plain host call.
     if uid == unsafe { libc::geteuid() } { 0 } else { OVERFLOW_ID }
 }
@@ -137,7 +145,8 @@ pub fn uid_to_linux(uid: u32) -> u32 {
 /// group.
 pub fn gid_to_linux(gid: u32) -> u32 {
     // SAFETY: plain host call.
-    if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID }
+    let id = if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID };
+    crate::userns::to_ns(id, true)
 }
 
 /// Host clock for a Linux clock id.
@@ -502,7 +511,7 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     if sig == libc::SIGCHLD && killed {
         status = signal_to_linux(status) as i32;
     }
-    (code, pid, uid_to_linux(uid), status)
+    (code, pid, uid_to_initial(uid), status)
 }
 
 /// Set the calling thread's host `errno`.

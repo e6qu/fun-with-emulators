@@ -13,7 +13,9 @@ Node.js with V8's JIT, rustc with Cargo building a project, and apt
 installing a package, dynamically linked against a genuine glibc (musl
 works too). Processes, threads, memory, signals, files on a Linux rootfs,
 networking, terminals, event descriptors and a synthetic `/proc` are in
-place.
+place. Alpine's crun runs the standard `alpine` container image, in
+namespaces, a cgroup, and the capabilities and seccomp profile its spec
+gives it.
 
 A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
 `python3.11`, GCC, clang and Go) cannot be mapped in-process; fwe runs it in a

@@ -264,6 +264,7 @@ it there without the bits that allow skipping cache maintenance
 
 `--strace` prints each call with its arguments and result, plus the
 backend's notes (what was loaded and prepared), to standard error.
+Path and name arguments are shown as strings.
 `--strace=failures` prints only the calls that fail, and the notes. That is
 cheap enough to leave a run's timing much as it is, for a failure that
 full tracing hides. A failed code preparation is noted with its reason,
@@ -273,12 +274,17 @@ for example no room for stubs near the code, while the guest gets
 ## Filesystem
 
 The guest sees a filesystem rooted at a host directory, set with
-`fwe --root DIR`; with no `--root` the root is the host `/`. Guest paths are
-resolved under the root in `crates/kernel/src/fs.rs` one component at a time,
-following symlinks ourselves and clamping `..` so a path can never escape the
-root — the containment `openat2(RESOLVE_IN_ROOT)` gives on Linux, done by
-hand so it works on macOS too. Absolute symlink targets re-root at the
-rootfs. `*at` calls resolve relative to their directory descriptor.
+`fwe --root DIR`; with no `--root` the root is the host `/`. What is mounted
+on it is its mount namespace's mount table (see Containers): the rootfs at
+`/`, and `/proc`, `/sys`, `/sys/fs/cgroup`, `/dev/pts`, `/dev/mqueue` and
+`/dev/shm` as Linux always has them. Guest paths are resolved in
+`crates/kernel/src/fs.rs` one component at a time, following symlinks
+ourselves, entering a mount where one is attached to the directory reached,
+and clamping `..` at the process's root, so a path can never escape it — the
+containment `openat2(RESOLVE_IN_ROOT)` gives on Linux, done by hand so it
+works on macOS too. Absolute symlink targets re-root at the process's root.
+`*at` calls resolve relative to their directory descriptor, placed in the
+namespace by where it was opened.
 
 Guest file descriptors are host file descriptors: an opened file's host fd is
 returned to the guest unchanged, so `read`, `write`, `lseek`, `fstat` and the
@@ -309,7 +315,19 @@ descriptor and status flags, and record locks (`F_GETLK`, `F_SETLK`,
 `F_SETLKW`: the arm64 `struct flock` and its lock types differ from the
 host's); `flock` passes through. Both kinds of lock are the host's, so they
 hold between guest processes and against host ones. `ioctl` covers the
-terminal, pty and `FIO*` requests.
+terminal, pty and `FIO*` requests, and the network interface ones
+(`SIOCGIFFLAGS` and the like).
+
+Each open file remembers the mount it was opened through
+(`crates/kernel/src/fdmarks.rs`), as Linux's open files do: `fstatfs`
+reports that mount's type and flags, `/proc/self/fd` its path, and a
+`/proc/self/fd/N` link names that file to `chmod`, `mount` and the like,
+even after the mount is detached or the path removed. The record follows
+the descriptor through `dup`, `close`, `fork` and `execve`, and one whose
+descriptor no longer names the same file is never trusted. Writes on a
+read-only mount fail with `EROFS`, a rename or link across mounts with
+`EXDEV`, and the removal of a mount's root with `EBUSY`. `sendfile` and
+`copy_file_range` copy between descriptors.
 
 A memfd (`memfd_create`, `crates/kernel/src/memfd.rs`) is a file in fwe's
 private directory, unlinked as soon as it is made, with its name and its
@@ -319,23 +337,29 @@ seals are checked by `ftruncate` and `fallocate`. `F_SEAL_WRITE` clones
 the file and replaces each of this process's descriptors of it with a
 read-only one of the clone, keeping offsets, flags and shared open file
 descriptions. The host then refuses writes and writable shared mappings,
-and they fail with `EPERM`. A program runs from a memfd as crun runs its
-sealed copy of itself: by `execveat(fd, "", AT_EMPTY_PATH)` under the
-name Linux gives it (`/dev/fd/N`), or by its `/proc/self/fd` path. fwe
-keeps a descriptor of the program, which `/proc/self/exe` opens, and hands
-it on by number (`--exe-fd`) when it re-executes itself.
+and they fail with `EPERM`. A program run through a descriptor, as crun
+runs its sealed copy of itself (`execveat(fd, "", AT_EMPTY_PATH)`, under
+the name Linux gives it, `/dev/fd/N`, or a `/proc/self/fd` path), is read
+through it, whatever has become of its path. fwe keeps a descriptor of
+the program, which `/proc/self/exe` opens, and hands it on by number
+(`--exe-fd`) when it re-executes itself.
 
 ## Synthetic /proc and /sys
 
-The rootfs has no real `/proc` or `/sys`, so the filesystem layer consults
-`crates/kernel/src/procfs.rs` before the host rootfs and generates what
-programs read at startup: `/proc/self/exe` (a symlink),
-`/proc/self/cmdline`, `/proc/self/fd`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
+`proc` and `sysfs` are filesystems of fwe's own: a path in a mount of
+one is answered by `crates/kernel/src/procfs.rs` (and `procpid.rs` for
+another process's `/proc/<pid>`) instead of a host directory, which
+generates what programs read: `/proc/self/exe` (a link that opens the
+program itself), `/proc/self/{cmdline,stat,status,cgroup,mountinfo,mounts,
+uid_map,gid_map,setgroups}`, `/proc/self/fd`, `/proc/self/ns`,
+`/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
 `/proc/uptime` and `/proc/loadavg` (the host's uptime and load, which
 `sysinfo` reports too, with the same fixed memory figures as
 `/proc/meminfo`), `/proc/sys/kernel/{ostype,osrelease,
-version,hostname,pid_max}`, `/proc/sys/vm/{overcommit_memory,mmap_min_addr}`
-and `/sys/devices/system/cpu/{online,possible}`. File content is served from
+version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,overflowuid,
+overflowgid,threads-max}`, `/proc/sys/fs/{nr_open,file-max,pipe-max-size}`,
+`/proc/sys/vm/{overcommit_memory,mmap_min_addr}`, `/sys/fs/cgroup` (a
+mount point) and `/sys/devices/system/cpu/{online,possible}`. File content is served from
 an anonymous, seekable fd. The per-process values (exe, cmdline, cpu count,
 host name) are set at program load and `execve`. The directories can be
 opened and listed: `crates/kernel/src/synthdir.rs` serves `getdents64`,
@@ -661,9 +685,100 @@ virtual root bypasses the permission bits as Linux root does.
 Host user and group ids the guest sees — a file's owner from `stat`, a
 signal's sender, a child in `waitid` — are mapped as a rootless container's
 user namespace maps them (`host::uid_to_linux`): the host user fwe runs as
-is root (0), and every other id is the overflow id 65534 (`nobody`). So a
-guest running as its default root owns the files it creates, which is what
-git's check that a repository belongs to its user relies on.
+is root (0), and every other id is the overflow id 65534 (`nobody`), then
+through the guest's own user namespace, if it is in one. So a guest
+running as its default root owns the files it creates, which is what git's
+check that a repository belongs to its user relies on. What the guest may
+do is decided by its capabilities (see Containers).
+
+## Containers
+
+### Shared state
+
+What Linux keeps in one kernel for every process — namespaces, mount
+tables, the cgroup tree — has to be seen by every fwe process, so it lives
+in fwe's private directory on the host (`crates/kernel/src/shared.rs`): a
+directory per record, its data replaced whole by each change under a lock,
+and a generation count each process maps, so that it rereads the data only
+after another has changed it. A record's name carries a format number, so
+one written by another fwe build is never read. fwe also keeps a record of
+each process (`crates/kernel/src/procreg.rs`): its start time (so a record
+outlives no process into a new one with its pid), cgroup, namespaces, name,
+command line and program. A record no live process holds is collected
+(`shared::collect`) when a namespace is made and when a fresh fwe starts.
+
+### Mounts
+
+Each mount namespace has a table (`crates/kernel/src/mounts.rs`) of mounts,
+each attached at a path to a parent mount, as on Linux: stacked mounts,
+`pivot_root(".", ".")` and the unmount of the old root behave as there. A
+mount shows a host directory (the rootfs, a bind mount's source, a tmpfs's
+backing directory in fwe's private directory) or one of fwe's own
+filesystems (`proc`, `sysfs`, `devpts`, `mqueue`; `cgroup2` is the shared
+tree). `mount` (new mounts, bind and recursive bind, move, remount,
+propagation), `umount2`, `pivot_root` and `chroot` act on it, and
+`/proc/self/mountinfo` and `/proc/self/mounts` show it from the process's
+root.
+
+### Namespaces
+
+`clone` and `unshare` make the namespaces they ask for: mount, UTS, IPC,
+network, cgroup, pid and user (`crates/kernel/src/nsops.rs`). The parent
+makes the child's before the host `fork` and has them for the fork, so the
+child inherits them (a VM fork child from its snapshot). A process in an
+initial namespace sees the host's: its host name, its pids.
+
+- **pid** (`pidns.rs`): a namespace numbers its processes and threads from
+  1 and maps each number to its host pid; `getpid`, `getppid`, `kill`,
+  `wait4`, `waitid`, the process-group, session and terminal calls and
+  the senders in `siginfo` are translated.
+- **UTS**: `uname`, `sethostname`, `setdomainname` and
+  `/proc/sys/kernel/hostname` use its names.
+- **network** (`netns.rs`): a loopback interface, down until brought up;
+  its sockets reach only loopback addresses, and its ports are its own (a
+  bound port is a host loopback port its table maps, translated both
+  ways); abstract `AF_UNIX` names are its own.
+- **user** (`userns.rs`): credentials are kept as the initial namespace's
+  ids and seen through the namespace's `uid_map` and `gid_map`, which are
+  written once through `/proc/<pid>/uid_map` and the like, with Linux's
+  rules; a process that makes one has every capability in it.
+- **cgroup**: `/proc/self/cgroup` and a `cgroup2` mount show the tree from
+  its root.
+- **IPC**: its identity (there are no System V IPC objects).
+
+`/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
+`status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
+records and what the host reports; `/proc/self/ns` names each namespace.
+
+### cgroups
+
+The cgroup v2 hierarchy (`crates/kernel/src/cgroupfs.rs`) is one tree for
+the user's fwe processes, of real directories with their interface files.
+`mkdir` makes a cgroup with the files of the controllers its parent
+enables; `rmdir` removes an empty one. Writing a pid to `cgroup.procs`
+moves the process, under Linux's rule that a cgroup enabling controllers
+for its children has no processes. Opening `cgroup.procs`, `cgroup.events`
+or a counter shows what is so then. `cgroup.freeze`, `cgroup.kill` and
+`pids.max` act. Device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`, loaded with
+`bpf`) attached to a cgroup decide every device open and `mknod` of its
+members; they run on an interpreter (`crates/kernel/src/bpf.rs`) that
+checks each access against the context and the stack and stops a program
+that runs too long.
+
+### Capabilities, seccomp and devices
+
+The five capability sets and the securebits (`crates/kernel/src/caps.rs`)
+change with `capset`, the capability `prctl`s, `setuid` and `execve` as on
+Linux (no file capabilities or set-ID programs), and a privileged call
+checks a capability, not the uid: `CAP_SYS_ADMIN` to mount, `CAP_SETUID`
+to change uid, `CAP_DAC_OVERRIDE` to pass permission bits, and the like.
+seccomp filters (`crates/kernel/src/seccomp.rs`) are classic BPF on
+`seccomp_data`, checked before each backend routes a call; the action of
+highest precedence is taken, and filters and `no_new_privs` are kept across
+`fork` and `execve`. A device node made with `mknod` is an empty file fwe
+marks (`crates/kernel/src/devnodes.rs`): `stat` reports the device, and
+opening it opens the host device its numbers name. `/dev/full`, which the
+host lacks, is fwe's own node.
 
 ## Translation
 
@@ -696,9 +811,7 @@ those items.
   periodic timerfd restarts its period, and eventfd counters and signalfd
   queues are the child's own copies while their readiness pipes are shared;
   a VM fork that fails after spawning its child can have that child reaped
-  by another thread's `wait4(-1)`; `execveat` of a descriptor of a file
-  with a path finds it by that path (not one renamed or deleted since it
-  was opened); `clone3`
+  by another thread's `wait4(-1)`; `clone3`
   has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
   `rusage`.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
@@ -736,10 +849,38 @@ those items.
   the memory of another, translated range makes their addresses ambiguous
   to the kernel within a system call that translated a pointer into that
   range.
-- **Filesystem:** of `/dev`, only `null`, `zero`, `random`, `urandom`,
-  `tty` and the `/proc/self/fd` links are provided; their `stat` reports
-  the host's device numbers. File owners other than fwe's own user read as
-  65534, and a `chown` does not show in a later `stat`.
+- **Filesystem:** of `/dev`, only `null`, `zero`, `full`, `random`,
+  `urandom`, `tty` and the `/proc/self/fd` links are provided, and a node
+  `mknod` makes opens a host device only for those numbers (`ENXIO`
+  otherwise); a node lists as a regular file in `getdents64`, and an
+  `O_PATH` descriptor of a device the host will not open is a stand-in
+  whose `stat` is `/dev/null`'s. File owners other than fwe's own user
+  read as 65534, and a `chown` does not show in a later `stat`.
+- **Mounts:** mounts do not propagate between namespaces, whatever their
+  propagation type; a remount of a filesystem acts on the one mount; a
+  tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
+  always detaches).
+- **Namespaces:** a network namespace has a loopback interface only (no
+  `veth`, no netlink), and a datagram to one of its ports nobody bound by
+  number goes to the host loopback port of that number; a port is freed
+  when the last descriptor of its socket in the binding process closes;
+  capabilities are the process's, not qualified by user namespace;
+  `setns` is not implemented; an orphan is not reparented to a
+  `PR_SET_CHILD_SUBREAPER` ancestor (macOS gives it to launchd), so a
+  runtime that double-forks its container (crun with a user namespace)
+  loses sight of it; `/proc/<pid>` of another process has no `fd`, `cwd`,
+  `root` or `environ`, and shows only fwe's processes in the initial pid
+  namespace.
+- **cgroups:** the memory, CPU, I/O and other limits are kept and read
+  back but not enforced (only `pids.max` and device programs are); a
+  threaded cgroup cannot be made (`cgroup.threads` refuses writes); the
+  tree is the user's, not the machine's.
+- **Security:** seccomp filters apply to every thread (as with
+  `SECCOMP_FILTER_FLAG_TSYNC`), and there is no user-notification listener
+  (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`);
+  `sched_setaffinity` is checked and remembered but threads still run on
+  any CPU; `SOCK_SEQPACKET` exists only as a socketpair, a datagram pair
+  that loses its kind when passed with `SCM_RIGHTS`.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a blocked signal whose

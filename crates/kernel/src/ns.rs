@@ -109,6 +109,8 @@ pub struct Namespaces {
     /// The one its children will be in (another after
     /// `unshare(CLONE_NEWPID)`).
     pub pid_children: Option<Arc<Record<crate::pidns::PidNs>>>,
+    /// The user namespace.
+    pub user: Option<Arc<Record<crate::userns::UserNs>>>,
 }
 
 /// The host's name.
@@ -143,6 +145,13 @@ impl Namespaces {
     /// pid ones, which the caller makes), copying what a new one starts
     /// with from this process's.
     pub fn unshare(&mut self, flags: u64) -> Result<(), i32> {
+        // The user namespace first: the others are made in it.
+        if flags & CLONE_NEWUSER != 0 {
+            let parent = self.user.as_ref().map(|r| (r.dir().to_vec(), r.id()));
+            let owner = crate::userns::from_ns(0, false).unwrap_or(0);
+            let ns = crate::userns::UserNs { parent, owner, ..Default::default() };
+            self.user = Some(Arc::new(Record::fresh("user", ns)?));
+        }
         if flags & CLONE_NEWUTS != 0 {
             let uts = Uts { hostname: self.hostname(), domainname: self.domainname() };
             self.uts = Some(Arc::new(Record::fresh("uts", uts)?));
@@ -186,7 +195,7 @@ impl Namespaces {
             b"cgroup" => id(&self.cgroup, INIT_CGROUP),
             b"pid" => id(&self.pid, INIT_PID),
             b"pid_for_children" => id(&self.pid_children, INIT_PID),
-            b"user" => INIT_USER,
+            b"user" => id(&self.user, INIT_USER),
             b"mnt" => mnt,
             _ => return None,
         };
@@ -209,6 +218,7 @@ impl Namespaces {
         add(self.cgroup.as_ref().map(|r| r.dir()));
         add(self.pid.as_ref().map(|r| r.dir()));
         add(self.pid_children.as_ref().map(|r| r.dir()));
+        add(self.user.as_ref().map(|r| r.dir()));
         out
     }
 
@@ -216,6 +226,7 @@ impl Namespaces {
     /// [`crate::netns`]); called whenever the process's change.
     pub fn activate(&self) {
         crate::netns::set_current(self.net.clone());
+        crate::userns::set_current(self.user.clone());
     }
 
     /// Write the namespaces into a fork snapshot or exec state.
@@ -226,6 +237,7 @@ impl Namespaces {
         shared::save_opt(e, &self.cgroup);
         shared::save_opt(e, &self.pid);
         shared::save_opt(e, &self.pid_children);
+        shared::save_opt(e, &self.user);
     }
 
     /// What [`Namespaces::save`] wrote.
@@ -237,6 +249,7 @@ impl Namespaces {
             cgroup: shared::load_opt(d)?,
             pid: shared::load_opt(d)?,
             pid_children: shared::load_opt(d)?,
+            user: shared::load_opt(d)?,
         })
     }
 }

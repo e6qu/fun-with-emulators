@@ -30,7 +30,7 @@ const MAX_SYMLINKS: u32 = 40;
 /// The device nodes every Linux system has in `/dev`, which the guest finds
 /// there whatever the rootfs holds: they are the host's own nodes (a rootfs
 /// unpacked without privileges has none, and Linux mounts `/dev` over it).
-const DEVICES: &[&[u8]] = &[b"null", b"zero", b"random", b"urandom", b"tty"];
+const DEVICES: &[&[u8]] = &[b"null", b"zero", b"full", b"random", b"urandom", b"tty"];
 
 /// `/dev` entries that are links into `/proc/self/fd`, as on Linux.
 fn dev_link(absolute: &[u8]) -> Option<Vec<u8>> {
@@ -456,6 +456,22 @@ impl Fs {
             // The kernel's view of the process fills it in (see
             // `Kernel::self_status`); its place is held here.
             b"/proc/self/status" => return Some(crate::procfs::Entry::File(Vec::new())),
+            b"/proc/self/uid_map" | b"/proc/self/gid_map" | b"/proc/self/setgroups" => {
+                if let Some(u) = &self.ns.user {
+                    let n = u.get();
+                    return Some(crate::procfs::Entry::File(match &absolute[..] {
+                        b"/proc/self/uid_map" => crate::userns::show_map(&n.uid_map),
+                        b"/proc/self/gid_map" => crate::userns::show_map(&n.gid_map),
+                        _ => {
+                            if n.setgroups_deny {
+                                b"deny\n".to_vec()
+                            } else {
+                                b"allow\n".to_vec()
+                            }
+                        }
+                    }));
+                }
+            }
             b"/proc/self/cgroup" => {
                 let root = self.ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
                 return Some(crate::procfs::Entry::File(crate::cgroupfs::proc_self_cgroup(&root)));
@@ -905,9 +921,12 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         is_rootfs(m, v.root_host).then(|| name.to_vec())
     });
     if let Some(name) = device {
+        // The host has no /dev/full: fwe's own node stands in for it.
+        let dir: &[u8] = if name == b"full" { &fwe_devices()? } else { b"/dev" };
+        let dir = cstr(dir)?;
         // SAFETY: plain host call; the result is checked and owned.
         let dev = unsafe {
-            libc::open(c"/dev".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
         };
         if dev < 0 {
             return Err(e());
@@ -1116,6 +1135,21 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         }
     }
     done(here, b".".to_vec(), false)
+}
+
+/// fwe's directory of the device nodes Linux has and the host does not
+/// (`full`), made on first use.
+fn fwe_devices() -> Result<Vec<u8>, i32> {
+    let dir = mounts::join(&shm::user_dir()?, format!("v{}-dev", crate::shared::FORMAT).as_bytes());
+    let d = cstr(&dir)?;
+    // SAFETY: a NUL-terminated path in fwe's private directory.
+    unsafe { libc::mkdir(d.as_ptr(), 0o755) };
+    let fd = open_host_dir(&dir)?;
+    let node = crate::devnodes::Node { kind: crate::devnodes::S_IFCHR, major: 1, minor: 7 };
+    match crate::devnodes::make(fd.as_raw_fd(), c"full", node, 0o666) {
+        Ok(()) | Err(errno::EEXIST) => Ok(dir),
+        Err(e) => Err(e),
+    }
 }
 
 /// A host path's directory and final name.

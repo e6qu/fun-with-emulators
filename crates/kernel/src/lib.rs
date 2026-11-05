@@ -48,6 +48,7 @@ pub mod term;
 pub mod thread;
 mod trace;
 pub mod uaccess;
+pub mod userns;
 pub mod vmas;
 
 pub use cloneargs::CloneArgs;
@@ -936,6 +937,11 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             if let Some(r) = cgroupfs::try_write(fd, buf, len) {
+                return Some(r);
+            }
+            if fdmarks::any_marks()
+                && let Some(r) = userns::try_write(fd, buf, len)
+            {
                 return Some(r);
             }
             // SAFETY: the host validates the guest buffer.

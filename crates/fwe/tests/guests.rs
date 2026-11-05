@@ -2367,6 +2367,23 @@ fn network_namespace_has_its_own_loopback() {
     assert_eq!(namespaces("net-outside"), "inside: 127.0.0.1:18082\noutside too: true\n");
 }
 
+/// A user namespace: unmapped until its maps are written, once, under
+/// Linux's rules (the process itself its own id only, setgroups denied
+/// first; its parent, privileged outside, anything), with every capability
+/// inside.
+#[test]
+fn user_namespace_maps_ids() {
+    assert_eq!(
+        namespaces("user"),
+        "unmapped: 65534 65534\nCapEff:\t000001ffffffffff\n\
+         gid_map before setgroups: Err(1)\nsetgroups: Ok(())\n\
+         uid_map, more than one's own: Err(1)\nuid_map: Ok(())\ngid_map: Ok(())\nagain: Err(1)\n\
+         mapped: 0 0\nsetuid to an unmapped id: -1 errno 22\n\
+         map:          0          0          1\nchild exited 0\n\
+         parent wrote the map: true\nin child: uid 0, setuid(5) 0, uid 5\n"
+    );
+}
+
 /// `chroot` confines paths; a `clone` makes the namespaces it asks for.
 #[test]
 fn chroot_and_clone_namespaces() {
@@ -2862,6 +2879,34 @@ fn hv_delivers_signals() {
     use std::os::unix::process::ExitStatusExt;
     let out = run("sigpipe").unwrap();
     assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
+}
+
+/// Namespaces in the VM, whose fork child starts from a snapshot of the
+/// namespaces made for it: a pid namespace numbering from 1, a UTS
+/// namespace's own name, a user namespace's maps.
+#[test]
+fn hv_namespaces() {
+    let run = |scenario: &str| fwe_hv(&rust_low_guest("namespaces"), &[scenario]);
+    let Some(out) = run("pid") else { return };
+    assert_eq!(
+        stdout(&out),
+        "child: pid 1 ppid 0\ngrandchild: pid 2 ppid 1\nforked 2\nkill: 0\n\
+         reaped 2, killed by 9\nno such pid: -1 errno 3\n\
+         parent: child true reaped as itself, exited 7\n"
+    );
+    let out = run("uts").unwrap();
+    assert!(
+        stdout(&out)
+            .starts_with("inside: box\nproc: box\nchild exited 0, outside unchanged: true\n"),
+        "{}",
+        stdout(&out)
+    );
+    let out = run("user").unwrap();
+    assert!(
+        stdout(&out).ends_with("parent wrote the map: true\nin child: uid 0, setuid(5) 0, uid 5\n"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 /// memfds in the VM: seals hold, and a program runs from a sealed memfd,

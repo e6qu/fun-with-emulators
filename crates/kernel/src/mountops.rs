@@ -105,6 +105,17 @@ impl<P: Platform> Kernel<P> {
         Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
     }
 
+    /// The host file `path` resolves to when it is one fwe serves from the
+    /// host outside any mount.
+    fn host_source(&self, path: &[u8]) -> Option<Vec<u8>> {
+        let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, path, true).ok()?;
+        if r.ns_path.is_some() {
+            return None;
+        }
+        let dir = crate::fs::host_path_of(std::os::fd::AsRawFd::as_raw_fd(&r.dir))?;
+        Some(crate::mounts::join(&dir, &r.name))
+    }
+
     /// `mount(source, target, fstype, flags, data)`.
     pub(crate) fn sys_mount(
         &mut self,
@@ -137,11 +148,29 @@ impl<P: Platform> Kernel<P> {
                 t.remount(&point, flags, opts)
             })
         } else if flags & ms::BIND != 0 {
-            let (from, _) = match self.mount_path(&source, true) {
-                Ok(v) => v,
+            match self.mount_path(&source, true) {
+                Ok((from, _)) => {
+                    ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0, 0).map(|_| ()))
+                }
+                // A file fwe serves from the host outside any mount (the
+                // standard device nodes): that host file.
+                Err(errno::EINVAL) => match self.host_source(&source) {
+                    Some(host) => ns.update(|t| {
+                        t.mount(
+                            &point,
+                            FsType::Tmpfs,
+                            Source::Host(host),
+                            b"/".to_vec(),
+                            0,
+                            b"devtmpfs".to_vec(),
+                            Vec::new(),
+                        );
+                        Ok(())
+                    }),
+                    None => return err(errno::EINVAL),
+                },
                 Err(e) => return err(e),
-            };
-            ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0, 0).map(|_| ()))
+            }
         } else if flags & ms::MOVE != 0 {
             let (from, _) = match self.mount_path(&source, true) {
                 Ok(v) => v,

@@ -36,6 +36,11 @@ pub enum Mark {
     /// A socket bound in a network namespace of fwe's, to its port `port`
     /// (of the wildcard address if `any`), see [`crate::netns`].
     NetBound { port: u16, any: bool },
+    /// `/proc/<pid>/uid_map` (`which` 0), `gid_map` (1) or `setgroups` (2)
+    /// of host process `host`, opened for writing by a process that was
+    /// `privileged` there, and whose own id in the map's parent namespace
+    /// is `own` (Linux checks the opener's credentials).
+    ProcMap { host: i32, which: u8, privileged: bool, own: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +120,11 @@ pub fn opened(fd: i32, ns_path: Vec<u8>, flags: u64, fstype: FsType) {
 /// there are any.
 static MARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Whether any descriptor was ever marked (so a write need not look).
+pub fn any_marks() -> bool {
+    MARKS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
     MARKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -176,7 +186,14 @@ pub fn save(e: &mut Enc) {
             Some(Mark::SeqPacket) => 1,
             Some(Mark::DevFull) => 2,
             Some(Mark::NetBound { .. }) => 3,
+            Some(Mark::ProcMap { .. }) => 4,
         });
+        if let Some(Mark::ProcMap { host, which, privileged, own }) = rec.mark {
+            e.i32(host);
+            e.u8(which);
+            e.bool(privileged);
+            e.u32(own);
+        }
         if let Some(Mark::NetBound { port, any }) = rec.mark {
             e.u32(u32::from(port));
             e.bool(any);
@@ -200,6 +217,12 @@ pub fn load(d: &mut Dec) {
             1 => Some(Mark::SeqPacket),
             2 => Some(Mark::DevFull),
             3 => Some(Mark::NetBound { port: d.u32() as u16, any: d.bool() }),
+            4 => Some(Mark::ProcMap {
+                host: d.i32(),
+                which: d.u8(),
+                privileged: d.bool(),
+                own: d.u32(),
+            }),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

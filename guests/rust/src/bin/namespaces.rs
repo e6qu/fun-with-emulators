@@ -11,6 +11,7 @@ const CLONE_NEWUTS: i32 = 0x0400_0000;
 const CLONE_NEWPID: i32 = 0x2000_0000;
 const CLONE_NEWIPC: i32 = 0x0800_0000;
 const CLONE_NEWNET: i32 = 0x4000_0000;
+const CLONE_NEWUSER: i32 = 0x1000_0000;
 const MS_RDONLY: u64 = 1;
 const MS_BIND: u64 = 4096;
 const MS_REC: u64 = 16384;
@@ -38,6 +39,9 @@ unsafe extern "C" {
     fn sethostname(name: *const u8, len: usize) -> i32;
     fn uname(u: *mut Utsname) -> i32;
     fn fork() -> i32;
+    fn getuid() -> u32;
+    fn getgid() -> u32;
+    fn setuid(uid: u32) -> i32;
     fn getpid() -> i32;
     fn getppid() -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
@@ -389,6 +393,73 @@ fn main() {
                 let outside = std::net::TcpListener::bind("127.0.0.1:18082");
                 println!("outside too: {}", outside.is_ok());
                 kill(pid, SIGKILL);
+                let mut status = 0;
+                waitpid(pid, &mut status, 0);
+            }
+        }
+        // A user namespace: unmapped until its map is written, by itself
+        // (its own id only, setgroups denied first) or by its parent.
+        Some("user") => {
+            let code = in_child(|| {
+                // SAFETY: plain calls.
+                unsafe {
+                    unshare(CLONE_NEWUSER);
+                    println!("unmapped: {} {}", getuid(), getgid());
+                }
+                let caps = std::fs::read_to_string("/proc/self/status").unwrap();
+                println!("{}", caps.lines().find(|l| l.starts_with("CapEff")).unwrap());
+                let w = |p: &str, s: &str| {
+                    std::fs::write(p, s).map_err(|e| e.raw_os_error().unwrap_or(0))
+                };
+                println!("gid_map before setgroups: {:?}", w("/proc/self/gid_map", "0 0 1"));
+                println!("setgroups: {:?}", w("/proc/self/setgroups", "deny"));
+                println!("uid_map, more than one's own: {:?}", w("/proc/self/uid_map", "0 0 2"));
+                println!("uid_map: {:?}", w("/proc/self/uid_map", "0 0 1"));
+                println!("gid_map: {:?}", w("/proc/self/gid_map", "0 0 1"));
+                println!("again: {:?}", w("/proc/self/uid_map", "0 0 1"));
+                // SAFETY: plain calls.
+                unsafe {
+                    println!("mapped: {} {}", getuid(), getgid());
+                    println!("setuid to an unmapped id: {} errno {}", setuid(7), errno());
+                }
+                println!(
+                    "map: {}",
+                    std::fs::read_to_string("/proc/self/uid_map").unwrap().trim_end()
+                );
+                0
+            });
+            println!("child exited {code}");
+            // The parent writes a child's map, with ranges.
+            let mut ready = [0i32; 2];
+            let mut go = [0i32; 2];
+            // SAFETY: plain calls with valid arrays.
+            unsafe {
+                pipe(ready.as_mut_ptr());
+                pipe(go.as_mut_ptr());
+            }
+            let pid = clone_child(CLONE_NEWUSER, || {
+                let mut b = 0u8;
+                // SAFETY: plain calls on the pipes.
+                unsafe {
+                    write(ready[1], b"x".as_ptr(), 1);
+                    read(go[0], &mut b, 1);
+                    println!(
+                        "in child: uid {}, setuid(5) {}, uid {}",
+                        getuid(),
+                        setuid(5),
+                        getuid()
+                    );
+                }
+                0
+            });
+            let mut b = 0u8;
+            // SAFETY: plain calls on the pipes.
+            unsafe { read(ready[0], &mut b, 1) };
+            let map = std::fs::write(format!("/proc/{pid}/uid_map"), "0 0 1\n1 100000 1000\n");
+            println!("parent wrote the map: {}", map.is_ok());
+            // SAFETY: plain calls.
+            unsafe {
+                write(go[1], b"x".as_ptr(), 1);
                 let mut status = 0;
                 waitpid(pid, &mut status, 0);
             }

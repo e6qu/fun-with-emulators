@@ -129,7 +129,7 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
     } else {
         // Recorded as the host pid; the guest sees its own namespace's.
         buf.put32(SI_PID_OFF, guest_pid(info.pid));
-        buf.put32(SI_UID_OFF, info.uid as i32);
+        buf.put32(SI_UID_OFF, crate::userns::to_ns(info.uid, false) as i32);
         buf.put32(SI_STATUS_OFF, info.status);
     }
 }
@@ -210,7 +210,7 @@ pub fn drain_to_signalfd() {
                 sig as u32,
                 info.code,
                 guest_pid(info.pid),
-                info.uid,
+                crate::userns::to_ns(info.uid, false),
                 info.status,
             );
             crate::signalfd::deliver(sig, record);
