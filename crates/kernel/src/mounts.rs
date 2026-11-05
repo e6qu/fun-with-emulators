@@ -118,7 +118,7 @@ impl FsType {
         self as u32
     }
 
-    fn from_code(c: u32) -> FsType {
+    pub(crate) fn from_code(c: u32) -> FsType {
         match c {
             1 => FsType::Tmpfs,
             2 => FsType::Proc,

@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 struct Dir {
+    /// Its guest path, for paths relative to it.
+    path: Vec<u8>,
     /// `(name, d_type)` entries, including `.` and `..`.
     entries: Vec<(Vec<u8>, u8)>,
     /// Index of the next entry `getdents64` will emit.
@@ -35,6 +37,7 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     with(|m| {
         crate::snapshot::fd_map(e, m, |e, dir| {
+            e.bytes(&dir.path);
             e.u64(dir.entries.len() as u64);
             for (name, t) in &dir.entries {
                 e.bytes(name);
@@ -48,22 +51,24 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 /// Rebuild the registry in a fork child.
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     let reg = crate::snapshot::read_fd_map(d, |d| {
+        let path = d.bytes();
         let n = d.count(9);
         let entries = (0..n).map(|_| (d.bytes(), d.u8())).collect();
-        Dir { entries, offset: d.u64() as usize }
+        Dir { path, entries, offset: d.u64() as usize }
     });
     with(|m| *m = reg);
 }
 
-/// Open a synthetic directory with the given entries, returning a guest fd.
-pub fn open(entries: Vec<(Vec<u8>, u8)>) -> i64 {
+/// Open the synthetic directory at guest path `path` with the given
+/// entries, returning a guest fd.
+pub fn open(path: Vec<u8>, entries: Vec<(Vec<u8>, u8)>) -> i64 {
     // Reserve a real, unique descriptor number backed by /dev/null.
     // SAFETY: a constant NUL-terminated path and plain open flags.
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return last_error();
     }
-    with(|m| m.insert(fd, Dir { entries, offset: 0 }));
+    with(|m| m.insert(fd, Dir { path, entries, offset: 0 }));
     fd as i64
 }
 
@@ -74,6 +79,11 @@ pub fn add(fd: i32, name: Vec<u8>, dtype: u8) {
             dir.entries.push((name, dtype));
         }
     });
+}
+
+/// The guest path of synthetic directory `fd`.
+pub fn path_of(fd: i32) -> Option<Vec<u8>> {
+    with(|m| m.get(&fd).map(|d| d.path.clone()))
 }
 
 /// Whether `fd` is a synthetic directory.
@@ -159,7 +169,7 @@ mod tests {
     fn lists_entries_and_rewinds() {
         let entries =
             vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR), (b"cpuinfo".to_vec(), DT_REG)];
-        let fd = open(entries) as i32;
+        let fd = open(b"/proc".to_vec(), entries) as i32;
         assert!(fd >= 0);
         assert!(is_synth(fd));
 
@@ -187,7 +197,7 @@ mod tests {
 
     #[test]
     fn tiny_buffer_is_einval() {
-        let fd = open(vec![(b"cpuinfo".to_vec(), DT_REG)]) as i32;
+        let fd = open(b"/proc".to_vec(), vec![(b"cpuinfo".to_vec(), DT_REG)]) as i32;
         let mut buf = [0u8; 8];
         // SAFETY: buffer too small for one record.
         assert_eq!(unsafe { getdents64(fd, buf.as_mut_ptr() as u64, 8) }, Some(err(errno::EINVAL)));

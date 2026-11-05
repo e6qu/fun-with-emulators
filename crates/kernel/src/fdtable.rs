@@ -291,6 +291,11 @@ pub fn made(nr: u64, a: &[u64; 6], result: i64) -> Vec<i32> {
         | n::ACCEPT4
         | n::MEMFD_CREATE
         | n::INOTIFY_INIT1 => vec![result as i32],
+        // A command that makes a descriptor (loading a program, or one by
+        // its identity).
+        n::BPF if matches!(a[0], crate::bpf::BPF_PROG_LOAD | crate::bpf::BPF_PROG_GET_FD_BY_ID) => {
+            vec![result as i32]
+        }
         // A new signalfd, not an existing one changed.
         n::SIGNALFD4 if a[0] as i32 == -1 => vec![result as i32],
         n::FCNTL if matches!(a[1], fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC) => {

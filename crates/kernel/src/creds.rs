@@ -30,6 +30,8 @@ pub struct Creds {
     pub sgid: u32,
     pub fsgid: u32,
     pub groups: Vec<u32>,
+    /// Capabilities (see [`crate::caps`]).
+    pub caps: crate::caps::Caps,
 }
 
 impl Default for Creds {
@@ -44,6 +46,7 @@ impl Default for Creds {
             sgid: 0,
             fsgid: 0,
             groups: vec![0],
+            caps: crate::caps::Caps::default(),
         }
     }
 }
@@ -53,20 +56,35 @@ fn pick(arg: u32, cur: u32) -> u32 {
 }
 
 impl Creds {
-    /// Privileged if the effective uid is root.
-    fn privileged(&self) -> bool {
-        self.euid == 0
+    /// May set any user id (`CAP_SETUID`).
+    fn can_setuid(&self) -> bool {
+        self.caps.has(crate::caps::CAP_SETUID)
+    }
+
+    /// May set any group id (`CAP_SETGID`).
+    fn can_setgid(&self) -> bool {
+        self.caps.has(crate::caps::CAP_SETGID)
     }
 
     /// May administer the system: mount, unmount, make namespaces
     /// (`CAP_SYS_ADMIN`).
     pub fn has_admin(&self) -> bool {
-        self.privileged()
+        self.caps.has(crate::caps::CAP_SYS_ADMIN)
     }
 
     /// May change its root directory (`CAP_SYS_CHROOT`).
     pub fn has_chroot(&self) -> bool {
-        self.privileged()
+        self.caps.has(crate::caps::CAP_SYS_CHROOT)
+    }
+
+    /// Has capability `cap` in effect.
+    pub fn has(&self, cap: u32) -> bool {
+        self.caps.has(cap)
+    }
+
+    /// The capability changes a change of user ids from `old` makes.
+    fn fix_caps(&mut self, old: (u32, u32, u32)) {
+        self.caps.after_setuid(old, (self.uid, self.euid, self.suid));
     }
 
     pub fn getuid(&self) -> i64 {
@@ -84,18 +102,21 @@ impl Creds {
 
     /// `setuid(u)`.
     pub fn setuid(&mut self, u: u32) -> i64 {
+        let old = self.resuid();
         if u == KEEP {
             return err(errno::EINVAL);
         }
-        if self.privileged() {
+        if self.can_setuid() {
             self.uid = u;
             self.euid = u;
             self.suid = u;
             self.fsuid = u;
+            self.fix_caps(old);
             0
         } else if u == self.uid || u == self.suid {
             self.euid = u;
             self.fsuid = u;
+            self.fix_caps(old);
             0
         } else {
             err(errno::EPERM)
@@ -104,12 +125,14 @@ impl Creds {
 
     /// `seteuid(e)`; `-1` is a no-op.
     pub fn seteuid(&mut self, e: u32) -> i64 {
+        let old = self.resuid();
         if e == KEEP {
             return 0;
         }
-        if self.privileged() || e == self.uid || e == self.euid || e == self.suid {
+        if self.can_setuid() || e == self.uid || e == self.euid || e == self.suid {
             self.euid = e;
             self.fsuid = e;
+            self.fix_caps(old);
             0
         } else {
             err(errno::EPERM)
@@ -118,10 +141,11 @@ impl Creds {
 
     /// `setreuid(r, e)`.
     pub fn setreuid(&mut self, r: u32, e: u32) -> i64 {
+        let old = self.resuid();
         let old_uid = self.uid;
         let nr = pick(r, self.uid);
         let ne = pick(e, self.euid);
-        if !self.privileged() {
+        if !self.can_setuid() {
             if r != KEEP && !(nr == self.uid || nr == self.euid) {
                 return err(errno::EPERM);
             }
@@ -136,15 +160,17 @@ impl Creds {
             self.suid = ne;
         }
         self.fsuid = self.euid;
+        self.fix_caps(old);
         0
     }
 
     /// `setresuid(r, e, s)`.
     pub fn setresuid(&mut self, r: u32, e: u32, s: u32) -> i64 {
+        let old = self.resuid();
         let nr = pick(r, self.uid);
         let ne = pick(e, self.euid);
         let ns = pick(s, self.suid);
-        if !self.privileged() {
+        if !self.can_setuid() {
             let cur = [self.uid, self.euid, self.suid];
             if (r != KEEP && !cur.contains(&nr))
                 || (e != KEEP && !cur.contains(&ne))
@@ -157,6 +183,7 @@ impl Creds {
         self.euid = ne;
         self.suid = ns;
         self.fsuid = ne;
+        self.fix_caps(old);
         0
     }
 
@@ -169,12 +196,13 @@ impl Creds {
     pub fn setfsuid(&mut self, f: u32) -> i64 {
         let old = self.fsuid;
         if f != KEEP
-            && (self.privileged()
+            && (self.can_setuid()
                 || f == self.uid
                 || f == self.euid
                 || f == self.suid
                 || f == self.fsuid)
         {
+            self.caps.after_setfsuid(self.fsuid, f);
             self.fsuid = f;
         }
         old as i64
@@ -185,7 +213,7 @@ impl Creds {
         if g == KEEP {
             return err(errno::EINVAL);
         }
-        if self.privileged() {
+        if self.can_setgid() {
             self.gid = g;
             self.egid = g;
             self.sgid = g;
@@ -205,7 +233,7 @@ impl Creds {
         if e == KEEP {
             return 0;
         }
-        if self.privileged() || e == self.gid || e == self.egid || e == self.sgid {
+        if self.can_setgid() || e == self.gid || e == self.egid || e == self.sgid {
             self.egid = e;
             self.fsgid = e;
             0
@@ -219,7 +247,7 @@ impl Creds {
         let old_gid = self.gid;
         let nr = pick(r, self.gid);
         let ne = pick(e, self.egid);
-        if !self.privileged() {
+        if !self.can_setgid() {
             if r != KEEP && !(nr == self.gid || nr == self.egid) {
                 return err(errno::EPERM);
             }
@@ -242,7 +270,7 @@ impl Creds {
         let nr = pick(r, self.gid);
         let ne = pick(e, self.egid);
         let ns = pick(s, self.sgid);
-        if !self.privileged() {
+        if !self.can_setgid() {
             let cur = [self.gid, self.egid, self.sgid];
             if (r != KEEP && !cur.contains(&nr))
                 || (e != KEEP && !cur.contains(&ne))
@@ -267,7 +295,7 @@ impl Creds {
     pub fn setfsgid(&mut self, f: u32) -> i64 {
         let old = self.fsgid;
         if f != KEEP
-            && (self.privileged()
+            && (self.can_setgid()
                 || f == self.gid
                 || f == self.egid
                 || f == self.sgid
@@ -285,7 +313,7 @@ impl Creds {
 
     /// `setgroups`: privileged only.
     pub fn setgroups(&mut self, groups: Vec<u32>) -> i64 {
-        if !self.privileged() {
+        if !self.can_setgid() {
             return err(errno::EPERM);
         }
         self.groups = groups;

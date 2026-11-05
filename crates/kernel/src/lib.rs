@@ -10,10 +10,14 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod bpf;
+pub mod caps;
 pub mod cgroupfs;
 pub mod cloneargs;
 pub mod creds;
+pub mod devnodes;
 pub mod epoll;
+pub mod fdmarks;
 pub mod fdtable;
 pub mod fs;
 mod fsops;
@@ -28,6 +32,7 @@ pub mod ns;
 pub mod nsops;
 pub mod pidns;
 pub mod procfs;
+pub mod procreg;
 pub mod pty;
 pub mod shared;
 pub mod signal;
@@ -245,6 +250,7 @@ impl<P: Platform> Kernel<P> {
         e.u64(self.brk.limit);
         e.bool(self.tracer.enabled);
         e.bool(self.tracer.failures_only);
+        fdmarks::save(e);
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -260,6 +266,7 @@ impl<P: Platform> Kernel<P> {
         for &g in &c.groups {
             e.u32(g);
         }
+        c.caps.encode(e);
         for a in &self.sigactions {
             for v in [a.handler, a.flags, a.restorer, a.mask] {
                 e.u64(v);
@@ -295,6 +302,7 @@ impl<P: Platform> Kernel<P> {
         let page_size = d.u64();
         let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
+        fdmarks::load(d);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
@@ -312,6 +320,7 @@ impl<P: Platform> Kernel<P> {
         }
         let n = d.count(4);
         c.groups = (0..n).map(|_| d.u32()).collect();
+        c.caps = caps::Caps::decode(d);
         for a in &mut k.sigactions {
             *a = Sigaction { handler: d.u64(), flags: d.u64(), restorer: d.u64(), mask: d.u64() };
         }
@@ -385,6 +394,8 @@ impl<P: Platform> Kernel<P> {
         // them (no set-user-ID programs here).
         self.creds.suid = self.creds.euid;
         self.creds.sgid = self.creds.egid;
+        let (uid, euid) = (self.creds.uid, self.creds.euid);
+        self.creds.caps.on_exec(uid, euid);
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
@@ -415,12 +426,10 @@ impl<P: Platform> Kernel<P> {
             }
             if at_cwd {
                 fs.cwd().to_vec()
-            } else if crate::memfd::name(dirfd).is_some() && fdtable::guest_visible(dirfd) {
-                // A file with no path, run through its descriptor under the
-                // name Linux gives it.
-                format!("/dev/fd/{dirfd}").into_bytes()
             } else {
-                fd_path(dirfd)?
+                // Run through the descriptor, under the name Linux gives it.
+                fd_path(dirfd)?;
+                format!("/dev/fd/{dirfd}").into_bytes()
             }
         } else if path.first() == Some(&b'/') {
             path.to_vec()
@@ -471,10 +480,14 @@ impl<P: Platform> Kernel<P> {
         for &g in &c.groups {
             e.u32(g);
         }
+        c.caps.encode(&mut e);
         let (soft, hard) = fdtable::limit();
         e.u64(soft);
         e.u64(hard);
         e.u32(self.fs.as_ref().map_or(0o022, |fs| fs.umask()));
+        // Which mount each open file came through (a record whose
+        // descriptor does not survive is never trusted, see `fdmarks`).
+        fdmarks::save(&mut e);
         e.into_bytes()
     }
 
@@ -495,13 +508,27 @@ impl<P: Platform> Kernel<P> {
         }
         let n = d.count(4);
         let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
+        let mut caps = caps::Caps::decode(&mut d);
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
+        fdmarks::load(&mut d);
         d.finish()?;
-        // The saved IDs become the effective ones, as across any execve.
+        // The saved IDs become the effective ones, and the capabilities
+        // what an exec makes of them, as across any execve.
         let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;
-        self.creds =
-            creds::Creds { uid, euid, suid: euid, fsuid, gid, egid, sgid: egid, fsgid, groups };
+        caps.on_exec(uid, euid);
+        self.creds = creds::Creds {
+            uid,
+            euid,
+            suid: euid,
+            fsuid,
+            gid,
+            egid,
+            sgid: egid,
+            fsgid,
+            groups,
+            caps,
+        };
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
         let _ = fdtable::set_limit(soft, hard);
@@ -704,8 +731,42 @@ pub fn wake_futex(addr: u64, count: u32) {
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     // SAFETY: the caller's guarantee, passed on.
     let r = unsafe { blocking_call(nr, a) }?;
-    // A write the host refused to a sealed memfd, as Linux reports it.
-    Some(memfd::linux_write_error(nr, &a, r))
+    // A write the host refused to a sealed memfd, and what a socket that
+    // stands in for another kind reports, as Linux reports them.
+    Some(linux_result(nr, &a, r))
+}
+
+/// The result of system call `nr` as Linux reports it where the host's
+/// differs: a write refused to a sealed memfd, a socket that stands in for
+/// another kind, and the `SIGPIPE` a socket write to a closed peer raises.
+pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
+    let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
+    if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
+        sigpipe_for_socket(nr, a);
+    }
+    r
+}
+
+/// A write to a socket whose peer has gone raises `SIGPIPE`, unless the send
+/// said `MSG_NOSIGNAL`. fwe's sockets never let the host raise it (they are
+/// all `SO_NOSIGPIPE`, so that the flag can be honoured), so it does.
+fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
+    use fwe_abi::nr as n;
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    let quiet = match nr {
+        n::WRITE | n::WRITEV | n::PWRITE64 => false,
+        n::SENDTO => a[3] & MSG_NOSIGNAL != 0,
+        n::SENDMSG => a[2] & MSG_NOSIGNAL != 0,
+        _ => return,
+    };
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    let socket = unsafe { libc::fstat(a[0] as i32, &mut st) } == 0
+        && st.st_mode & libc::S_IFMT == libc::S_IFSOCK;
+    if socket && !quiet {
+        signal::raise_self(absig::SIGPIPE);
+    }
 }
 
 /// [`blocking_syscall`]'s calls.
@@ -752,6 +813,9 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             let (fd, buf, len) = (a[0] as i32, a[1], a[2]);
             // SAFETY: caller guarantees the buffer spans the length.
             if let Some(r) = unsafe { specialfd::try_write(fd, buf, len) } {
+                return Some(r);
+            }
+            if let Some(r) = cgroupfs::try_write(fd, buf, len) {
                 return Some(r);
             }
             // SAFETY: the host validates the guest buffer.

@@ -181,6 +181,24 @@ impl Namespaces {
         Some([name, format!(":[{n}]").as_bytes()].concat())
     }
 
+    /// The directories of the namespaces' shared records (none for the
+    /// initial ones).
+    pub fn dirs(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut add = |d: Option<&[u8]>| {
+            if let Some(d) = d {
+                out.push(d.to_vec());
+            }
+        };
+        add(self.uts.as_ref().map(|r| r.dir()));
+        add(self.ipc.as_ref().map(|r| r.dir()));
+        add(self.net.as_ref().map(|r| r.dir()));
+        add(self.cgroup.as_ref().map(|r| r.dir()));
+        add(self.pid.as_ref().map(|r| r.dir()));
+        add(self.pid_children.as_ref().map(|r| r.dir()));
+        out
+    }
+
     /// Write the namespaces into a fork snapshot or exec state.
     pub fn save(&self, e: &mut Enc) {
         shared::save_opt(e, &self.uts);

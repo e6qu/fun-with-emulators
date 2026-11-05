@@ -79,8 +79,12 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     crate::check_image(&file, fs).map_err(err)?;
     // A program with no path (a memfd) is held, for `/proc/self/exe`: the
     // descriptor it was run through may close on exec.
-    let exe_fd = match fs.pathless_fd(&path) {
-        Some(fd) => Some(fwe_kernel::fdtable::dup_reserved(fd).map_err(err)?),
+    let exe_fd = match fs.exec_fd(&path) {
+        Some(fd) => {
+            let held = fwe_kernel::fdtable::dup_reserved(fd).map_err(err)?;
+            fwe_kernel::fdmarks::duplicated(fd, held);
+            Some(held)
+        }
         None => None,
     };
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();

@@ -215,6 +215,12 @@ fn guest_pid(host: i32) -> i32 {
     if host != 0 && crate::pidns::nested() { crate::pidns::to_guest(host) } else { host }
 }
 
+/// Raise `sig` against the calling thread, as the kernel raises `SIGPIPE`
+/// for a write that hit a closed peer.
+pub(crate) fn raise_self(sig: u64) {
+    thread::post_self(sig, own_info(signal::SI_KERNEL));
+}
+
 fn own_info(code: i32) -> SigInfo {
     // SAFETY: plain host calls.
     let pid = unsafe { libc::getpid() };

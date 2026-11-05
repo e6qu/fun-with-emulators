@@ -51,14 +51,38 @@ fn mode_option(data: &[u8]) -> Option<u32> {
 
 impl<P: Platform> Kernel<P> {
     /// The namespace path of `path`, which must exist; `follow` as for
-    /// resolution. Fails with `EINVAL` for one fwe cannot place.
+    /// resolution, a link in `/proc` included (`/proc/self/exe` names the
+    /// program's file, `/proc/self/fd/N` the open file's). Fails with
+    /// `EINVAL` for one fwe cannot place.
     fn mount_path(&self, path: &[u8], follow: bool) -> Result<(Vec<u8>, bool), i32> {
         if let Some(entry) = self.fs().synthetic(fwe_abi::fcntl::AT_FDCWD as i32, path) {
-            if matches!(entry, crate::procfs::Entry::Missing) {
-                return Err(errno::ENOENT);
-            }
-            let absolute = crate::fs::normalize(self.fs().cwd(), path);
-            return Ok((self.fs().to_ns(&absolute), false));
+            use crate::procfs::Entry;
+            return match entry {
+                Entry::Missing => Err(errno::ENOENT),
+                Entry::Symlink(target) if follow && target.starts_with(b"/") => {
+                    self.mount_path(&target, true)
+                }
+                Entry::Fd { fd, .. } if follow => {
+                    // The file itself, where it was opened.
+                    let ns = self.fs().fd_ns_path(fd).ok_or(errno::EINVAL)?;
+                    if crate::synthdir::path_of(fd).is_some() {
+                        return Ok((ns, true));
+                    }
+                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid out-parameter.
+                    unsafe { libc::fstat(fd, &mut st) };
+                    Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
+                }
+                Entry::Dir => {
+                    let absolute = crate::fs::normalize(self.fs().cwd(), path);
+                    Ok((self.fs().to_ns(&absolute), true))
+                }
+                _ => {
+                    let absolute = crate::fs::normalize(self.fs().cwd(), path);
+                    Ok((self.fs().to_ns(&absolute), false))
+                }
+            };
         }
         let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, path, follow)?;
         let name = r.name_c()?;

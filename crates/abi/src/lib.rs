@@ -184,7 +184,15 @@ pub mod prctl {
     pub const PR_SET_DUMPABLE: u64 = 4;
     pub const PR_SET_NAME: u64 = 15;
     pub const PR_GET_NAME: u64 = 16;
+    pub const PR_GET_KEEPCAPS: u64 = 7;
+    pub const PR_SET_KEEPCAPS: u64 = 8;
     pub const PR_CAPBSET_READ: u64 = 23;
+    pub const PR_CAPBSET_DROP: u64 = 24;
+    pub const PR_GET_SECUREBITS: u64 = 27;
+    pub const PR_SET_SECUREBITS: u64 = 28;
+    pub const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    pub const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    pub const PR_CAP_AMBIENT: u64 = 47;
     pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
     pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
     /// Reset pointer-authentication keys (arm64): which, a mask of
@@ -448,6 +456,16 @@ pub mod ioctl {
     pub const FIONBIO: u64 = 0x5421;
     pub const FIOCLEX: u64 = 0x5451;
     pub const FIONCLEX: u64 = 0x5450;
+    /// Network interface requests on a socket (`struct ifreq`).
+    pub const SIOCGIFNAME: u64 = 0x8910;
+    pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const SIOCGIFMTU: u64 = 0x8921;
+    pub const SIOCGIFINDEX: u64 = 0x8933;
+    /// `IFF_*` interface flags.
+    pub const IFF_UP: u16 = 0x1;
+    pub const IFF_LOOPBACK: u16 = 0x8;
+    pub const IFF_RUNNING: u16 = 0x40;
 }
 
 /// `struct termios` fields (Linux asm-generic, arm64). The guest layout is
@@ -906,6 +924,11 @@ pub mod statfs {
     pub const EXT4_SUPER_MAGIC: i64 = 0xef53;
     pub const ST_RDONLY: i64 = 1;
     pub const ST_NOSUID: i64 = 2;
+    pub const ST_NODEV: i64 = 4;
+    pub const ST_NOEXEC: i64 = 8;
+    pub const ST_NOATIME: i64 = 1024;
+    pub const ST_NODIRATIME: i64 = 2048;
+    pub const ST_RELATIME: i64 = 4096;
     /// `msync` flags.
     pub const MS_ASYNC: u64 = 1;
     pub const MS_INVALIDATE: u64 = 2;

@@ -93,7 +93,7 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_limit(n, &a) {
             return e;
         }
-        let r = crate::memfd::linux_write_error(n, &a, self.dispatch_call(n, a));
+        let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
         // Descriptors past the guest's soft limit are ones Linux would not
         // have given: closed again (by the guest's `close`, which also drops
         // what fwe keeps for one), and the call fails.
@@ -115,6 +115,9 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::read(a[0] as i32, a[1] as *mut _, a[2] as usize) } as i64)
             }
             nr::WRITE => {
+                if let Some(r) = crate::cgroupfs::try_write(a[0] as i32, a[1], a[2]) {
+                    return r;
+                }
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
@@ -151,6 +154,7 @@ impl<P: Platform> Kernel<P> {
             nr::CLOSE => {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
+                crate::fdmarks::closed(fd);
                 if let Some(r) = crate::specialfd::try_close(fd) {
                     r
                 } else if let Some(r) = crate::signalfd::try_close(fd) {
@@ -166,7 +170,11 @@ impl<P: Platform> Kernel<P> {
             }
             nr::DUP => {
                 // SAFETY: plain host call.
-                ret(unsafe { libc::dup(a[0] as i32) })
+                let r = ret(unsafe { libc::dup(a[0] as i32) });
+                if r >= 0 {
+                    crate::fdmarks::duplicated(a[0] as i32, r as i32);
+                }
+                r
             }
             nr::DUP3 => self.sys_dup3(a[0], a[1], a[2]),
             nr::CLOSE_RANGE => self.sys_close_range(a[0] as u32, a[1] as u32, a[2]),
@@ -231,6 +239,7 @@ impl<P: Platform> Kernel<P> {
             nr::FCHDIR => self.sys_fchdir(a[0]),
             nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
             nr::MKDIRAT => self.sys_mkdirat(a[0], a[1], a[2]),
+            nr::MKNODAT => self.sys_mknodat(a[0], a[1], a[2], a[3]),
             nr::UNLINKAT => self.sys_unlinkat(a[0], a[1], a[2]),
             // arm64 keeps the flagless form, which glibc's `rename` uses.
             nr::RENAMEAT => self.sys_renameat2(a[0], a[1], a[2], a[3], 0),
@@ -346,12 +355,17 @@ impl<P: Platform> Kernel<P> {
             }
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
-            nr::PRCTL => self.sys_prctl(a[0], a[1]),
+            nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::CAPGET => self.sys_capget(a[0], a[1]),
+            nr::BPF if !self.creds.has_admin() => err(errno::EPERM),
+            nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
+            nr::CAPSET => self.sys_capset(a[0], a[1]),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 0
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
                 let who = match a[0] as i32 as i64 {
@@ -437,7 +451,7 @@ impl<P: Platform> Kernel<P> {
         if uid == u32::MAX && gid == u32::MAX {
             return 0;
         }
-        if self.creds.euid == 0 { 0 } else { err(errno::EPERM) }
+        if self.creds.has(crate::caps::CAP_CHOWN) { 0 } else { err(errno::EPERM) }
     }
 
     fn sys_getresuid(&self, rp: u64, ep: u64, sp: u64) -> i64 {
@@ -502,6 +516,9 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: plain host calls.
         let r = unsafe { libc::dup2(old as i32, new as i32) };
+        if r >= 0 {
+            crate::fdmarks::duplicated(old as i32, r);
+        }
         if r >= 0 && flags & fcntl::O_CLOEXEC != 0 {
             // SAFETY: plain host call on the descriptor just created.
             unsafe { libc::fcntl(r, libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -542,8 +559,15 @@ impl<P: Platform> Kernel<P> {
                 {
                     err(errno::EINVAL)
                 }
-                fcntl::F_DUPFD => ret(libc::fcntl(fd, libc::F_DUPFD, arg as i32)),
-                fcntl::F_DUPFD_CLOEXEC => ret(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, arg as i32)),
+                fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC => {
+                    let how =
+                        if cmd == fcntl::F_DUPFD { libc::F_DUPFD } else { libc::F_DUPFD_CLOEXEC };
+                    let r = ret(libc::fcntl(fd, how, arg as i32));
+                    if r >= 0 {
+                        crate::fdmarks::duplicated(fd, r as i32);
+                    }
+                    r
+                }
                 fcntl::F_GETFD => {
                     let r = libc::fcntl(fd, libc::F_GETFD);
                     if r < 0 {
@@ -613,6 +637,11 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
+                ioctl::SIOCGIFFLAGS
+                | ioctl::SIOCSIFFLAGS
+                | ioctl::SIOCGIFINDEX
+                | ioctl::SIOCGIFMTU
+                | ioctl::SIOCGIFNAME => self.interface_ioctl(fd, req, arg),
                 ioctl::TCSETS | ioctl::TCSETSW | ioctl::TCSETSF => {
                     crate::term::tcsetattr(fd, req, arg)
                 }
@@ -690,13 +719,14 @@ impl<P: Platform> Kernel<P> {
 
     /// `prctl(option, arg2, ...)` for the options programs commonly use; any
     /// other fails with `EINVAL`, as an unknown option does on Linux.
-    fn sys_prctl(&mut self, option: u64, arg2: u64) -> i64 {
+    fn sys_prctl(&mut self, option: u64, arg2: u64, arg3: u64) -> i64 {
         use fwe_abi::prctl::*;
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         /// `PR_SET_NO_NEW_PRIVS` (fwe grants no privileges an exec could
         /// raise, so it only has to be remembered) and `PR_SET_DUMPABLE`.
         static NO_NEW_PRIVS: AtomicBool = AtomicBool::new(false);
         static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
+        static SUBREAPER: AtomicBool = AtomicBool::new(false);
         match option {
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
@@ -719,9 +749,40 @@ impl<P: Platform> Kernel<P> {
                 guest!(uaccess::write(arg2, name));
                 0
             }
-            // The virtual root's bounding set holds every capability.
-            PR_CAPBSET_READ if arg2 <= CAP_LAST_CAP => 1,
+            PR_CAPBSET_READ if arg2 <= CAP_LAST_CAP => {
+                i64::from(self.creds.caps.bounding & (1 << arg2) != 0)
+            }
             PR_CAPBSET_READ => err(errno::EINVAL),
+            PR_CAPBSET_DROP => match self.creds.caps.drop_bounding(arg2) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
+            PR_CAP_AMBIENT => match self.creds.caps.ambient_op(arg2, arg3) {
+                Ok(r) => r,
+                Err(e) => err(e),
+            },
+            PR_GET_KEEPCAPS => {
+                i64::from(self.creds.caps.securebits & crate::caps::SECBIT_KEEP_CAPS != 0)
+            }
+            PR_SET_KEEPCAPS => match self.creds.caps.set_keepcaps(arg2) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
+            PR_GET_SECUREBITS => i64::from(self.creds.caps.securebits),
+            PR_SET_SECUREBITS => match self.creds.caps.set_securebits(arg2) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
+            // Recorded: macOS gives a subreaper no orphans (see
+            // docs/architecture.md).
+            PR_SET_CHILD_SUBREAPER => {
+                SUBREAPER.store(arg2 != 0, Relaxed);
+                0
+            }
+            PR_GET_CHILD_SUBREAPER => {
+                guest!(uaccess::write(arg2, i32::from(SUBREAPER.load(Relaxed))));
+                0
+            }
             PR_SET_NO_NEW_PRIVS if arg2 == 1 => {
                 NO_NEW_PRIVS.store(true, Relaxed);
                 0
@@ -744,6 +805,184 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             _ => err(errno::EINVAL),
+        }
+    }
+
+    /// The data words a `capget`/`capset` header's version asks for, or
+    /// `EINVAL` after writing the version fwe prefers into the header.
+    fn cap_words(&self, hdr: u64) -> Result<(usize, i32), i64> {
+        use crate::caps::*;
+        let h: [u32; 2] = uaccess::read(hdr).map_err(err)?;
+        match h[0] {
+            VERSION_1 => Ok((1, h[1] as i32)),
+            VERSION_2 | VERSION_3 => Ok((2, h[1] as i32)),
+            _ => {
+                uaccess::write(hdr, [VERSION_3, h[1]]).map_err(err)?;
+                Err(err(errno::EINVAL))
+            }
+        }
+    }
+
+    /// `capget(hdr, data)`: the caller's capabilities (another process's
+    /// fwe does not hold: `ESRCH`).
+    fn sys_capget(&mut self, hdr: u64, data: u64) -> i64 {
+        let (words, pid) = match self.cap_words(hdr) {
+            Ok(v) => v,
+            Err(e) => return if data == 0 && e == err(errno::EINVAL) { 0 } else { e },
+        };
+        if pid != 0 && pid != thread::tgid() {
+            return err(errno::ESRCH);
+        }
+        if data == 0 {
+            return 0;
+        }
+        let c = &self.creds.caps;
+        let mut out = [0u32; 6];
+        for w in 0..words {
+            let shift = 32 * w as u64;
+            out[w * 3] = (c.effective >> shift) as u32;
+            out[w * 3 + 1] = (c.permitted >> shift) as u32;
+            out[w * 3 + 2] = (c.inheritable >> shift) as u32;
+        }
+        guest!(uaccess::write_from(data, &bytemuck_u32(&out[..words * 3])));
+        0
+    }
+
+    /// `capset(hdr, data)`: the caller's own sets only.
+    fn sys_capset(&mut self, hdr: u64, data: u64) -> i64 {
+        let (words, pid) = match self.cap_words(hdr) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if pid != 0 && pid != thread::tgid() {
+            return err(errno::EPERM);
+        }
+        let mut raw = [0u8; 24];
+        guest!(uaccess::read_into(data, &mut raw[..words * 12]));
+        let word = |i: usize| u32::from_ne_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()) as u64;
+        let (mut e, mut p, mut i) = (word(0), word(1), word(2));
+        if words == 2 {
+            e |= word(3) << 32;
+            p |= word(4) << 32;
+            i |= word(5) << 32;
+        }
+        match self.creds.caps.set(e, p, i) {
+            Ok(()) => 0,
+            Err(x) => err(x),
+        }
+    }
+
+    /// The network interface requests on a socket (`struct ifreq`: a
+    /// 16-byte name, then the value). In a network namespace of fwe's the
+    /// one interface is `lo`, index 1, up as the namespace says; in the
+    /// initial one they are the host's, with Linux's `lo` for its `lo0`.
+    fn interface_ioctl(&mut self, fd: i32, req: u64, arg: u64) -> i64 {
+        use ioctl::*;
+        let mut ifr = [0u8; 40];
+        guest!(uaccess::read_into(arg, &mut ifr));
+        let name_end = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+        let name = ifr[..name_end].to_vec();
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            // SAFETY: F_GETFD only queries the descriptor.
+            let open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+            return err(if open { errno::ENOTTY } else { errno::EBADF });
+        }
+        let put16 = |v: u16| uaccess::write(arg + 16, v);
+        let put32 = |v: i32| uaccess::write(arg + 16, v);
+        if let Some(net) = self.fs().ns.net.clone() {
+            let is_lo = name == b"lo";
+            return match req {
+                SIOCGIFNAME => {
+                    let index = u32::from_ne_bytes(ifr[16..20].try_into().unwrap());
+                    if index != 1 {
+                        return err(errno::ENODEV);
+                    }
+                    let mut out = [0u8; 16];
+                    out[..2].copy_from_slice(b"lo");
+                    guest!(uaccess::write(arg, out));
+                    0
+                }
+                _ if !is_lo => err(errno::ENODEV),
+                SIOCGIFFLAGS => {
+                    let up = net.get().lo_up;
+                    let flags = IFF_LOOPBACK | if up { IFF_UP | IFF_RUNNING } else { 0 };
+                    guest!(put16(flags));
+                    0
+                }
+                SIOCSIFFLAGS => {
+                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                        return err(errno::EPERM);
+                    }
+                    let flags = u16::from_ne_bytes(ifr[16..18].try_into().unwrap());
+                    match net.update(|n| {
+                        n.lo_up = flags & IFF_UP != 0;
+                        Ok(())
+                    }) {
+                        Ok(()) => 0,
+                        Err(e) => err(e),
+                    }
+                }
+                SIOCGIFINDEX => {
+                    guest!(put32(1));
+                    0
+                }
+                SIOCGIFMTU => {
+                    guest!(put32(65536));
+                    0
+                }
+                _ => err(errno::EINVAL),
+            };
+        }
+        // The host's interfaces, named as on Linux.
+        let host_name: Vec<u8> = if name == b"lo" { b"lo0".to_vec() } else { name.clone() };
+        let Ok(cname) = std::ffi::CString::new(host_name) else { return err(errno::ENODEV) };
+        match req {
+            SIOCGIFINDEX => {
+                // SAFETY: a NUL-terminated name.
+                let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+                if index == 0 {
+                    return err(errno::ENODEV);
+                }
+                guest!(put32(index as i32));
+                0
+            }
+            SIOCGIFNAME => {
+                let index = u32::from_ne_bytes(ifr[16..20].try_into().unwrap());
+                let mut buf = [0u8; libc::IF_NAMESIZE];
+                // SAFETY: `buf` holds IF_NAMESIZE bytes.
+                if unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) }.is_null() {
+                    return err(errno::ENODEV);
+                }
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                let shown: &[u8] = if &buf[..end] == b"lo0" { b"lo" } else { &buf[..end] };
+                let mut out = [0u8; 16];
+                out[..shown.len().min(15)].copy_from_slice(&shown[..shown.len().min(15)]);
+                guest!(uaccess::write(arg, out));
+                0
+            }
+            SIOCGIFFLAGS | SIOCGIFMTU => {
+                // macOS's `struct ifreq` has the same name and the value
+                // after it.
+                let mut h = [0u8; 32];
+                h[..cname.as_bytes().len()].copy_from_slice(cname.as_bytes());
+                let host_req = if req == SIOCGIFFLAGS { 0xc020_6911u64 } else { 0xc020_6933u64 };
+                // SAFETY: a 32-byte ifreq for the host call.
+                if unsafe { libc::ioctl(fd, host_req as libc::c_ulong, h.as_mut_ptr()) } < 0 {
+                    return host::last_error();
+                }
+                let v = u16::from_ne_bytes([h[16], h[17]]);
+                if req == SIOCGIFFLAGS {
+                    guest!(put16(v & (IFF_UP | IFF_LOOPBACK | IFF_RUNNING | 0x2 | 0x10 | 0x1000)));
+                } else {
+                    guest!(put32(i32::from_ne_bytes(h[16..20].try_into().unwrap())));
+                }
+                0
+            }
+            // The host's interfaces are not the guest's to change.
+            _ => err(errno::EPERM),
         }
     }
 
@@ -771,23 +1010,51 @@ impl<P: Platform> Kernel<P> {
         if id != 0 && id != thread::tgid() && thread::host_thread(id).is_none() {
             return err(errno::ESRCH);
         }
-        // SAFETY: plain host call.
-        let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64;
-        let size = cpus.div_ceil(64) * 8;
+        let online = online_cpus();
+        let size = online.len() as u64 * 8;
         if len < size || len % 8 != 0 {
             return err(errno::EINVAL);
         }
-        for word in 0..size / 8 {
-            let bits = (cpus - word * 64).min(64);
-            let value = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            guest!(uaccess::write(mask + word * 8, value));
+        let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(online);
+        for (word, value) in set.iter().enumerate() {
+            guest!(uaccess::write(mask + word as u64 * 8, *value));
         }
         size as i64
     }
 
+    /// `sched_setaffinity(pid, len, mask)`: checked as Linux checks it (the
+    /// mask must name an online CPU) and remembered for the caller, which
+    /// `sched_getaffinity` then reports. The host has no affinity to set:
+    /// threads still run on any CPU, and another process's is not kept.
+    fn sys_sched_setaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
+        let online = online_cpus();
+        let mut want = vec![0u64; online.len()];
+        let take = (len as usize).min(want.len() * 8);
+        let mut bytes = vec![0u8; take];
+        guest!(uaccess::read_into(mask, &mut bytes));
+        for (i, b) in bytes.iter().enumerate() {
+            want[i / 8] |= u64::from(*b) << (8 * (i % 8));
+        }
+        for (w, o) in want.iter_mut().zip(&online) {
+            *w &= o;
+        }
+        if want.iter().all(|&w| w == 0) {
+            return err(errno::EINVAL);
+        }
+        let id = pid as i32;
+        if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
+            *AFFINITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
+            return 0;
+        }
+        match crate::pidns::host_arg(id) {
+            // SAFETY: a signal 0 only checks that the process exists.
+            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => 0,
+            _ => err(errno::ESRCH),
+        }
+    }
+
     fn sys_prlimit(&mut self, pid: u64, res: u64, new: u64, old: u64) -> i64 {
-        // SAFETY: plain host call.
-        if pid != 0 && pid as i32 != unsafe { libc::getpid() } {
+        if pid != 0 && pid as i32 != thread::tgid() {
             return err(errno::ESRCH);
         }
         if res >= resource::RLIM_NLIMITS {
@@ -1063,6 +1330,26 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     // SAFETY: `struct pollfd` and the POLL* bits match the host's; the host
     // validates the guest array.
     ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) })
+}
+
+/// `u32` words as their native-endian bytes.
+fn bytemuck_u32(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_ne_bytes()).collect()
+}
+
+/// The affinity `sched_setaffinity` set for this process, if it did.
+static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
+
+/// The online CPUs, as a mask of 64-bit words.
+fn online_cpus() -> Vec<u64> {
+    // SAFETY: plain host call.
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64;
+    (0..cpus.div_ceil(64))
+        .map(|word| {
+            let bits = (cpus - word * 64).min(64);
+            if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 }
+        })
+        .collect()
 }
 
 #[cfg(test)]

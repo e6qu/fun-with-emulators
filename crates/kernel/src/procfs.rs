@@ -61,12 +61,41 @@ const DIRS: &[DirDef] = &[
             (b"uptime", DT_REG),
             (b"loadavg", DT_REG),
             (b"sys", DT_DIR),
+            (b"mounts", DT_LNK),
         ],
     ),
-    (b"/proc/self", &[(b"exe", DT_LNK), (b"cmdline", DT_REG), (b"fd", DT_DIR)]),
+    (
+        b"/proc/self",
+        &[
+            (b"exe", DT_LNK),
+            (b"cmdline", DT_REG),
+            (b"fd", DT_DIR),
+            (b"ns", DT_DIR),
+            (b"mountinfo", DT_REG),
+            (b"mounts", DT_REG),
+            (b"uid_map", DT_REG),
+            (b"gid_map", DT_REG),
+            (b"setgroups", DT_REG),
+            (b"cgroup", DT_REG),
+        ],
+    ),
+    (
+        b"/proc/self/ns",
+        &[
+            (b"cgroup", DT_LNK),
+            (b"ipc", DT_LNK),
+            (b"mnt", DT_LNK),
+            (b"net", DT_LNK),
+            (b"pid", DT_LNK),
+            (b"pid_for_children", DT_LNK),
+            (b"user", DT_LNK),
+            (b"uts", DT_LNK),
+        ],
+    ),
     // Listed from the open descriptors (see `Fs::synth_children`).
     (b"/proc/self/fd", &[]),
-    (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR)]),
+    (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR), (b"fs", DT_DIR)]),
+    (b"/proc/sys/fs", &[(b"nr_open", DT_REG), (b"file-max", DT_REG), (b"pipe-max-size", DT_REG)]),
     (
         b"/proc/sys/kernel",
         &[
@@ -75,10 +104,19 @@ const DIRS: &[DirDef] = &[
             (b"version", DT_REG),
             (b"hostname", DT_REG),
             (b"pid_max", DT_REG),
+            (b"cap_last_cap", DT_REG),
+            (b"ngroups_max", DT_REG),
+            (b"overflowuid", DT_REG),
+            (b"overflowgid", DT_REG),
+            (b"threads-max", DT_REG),
+            (b"domainname", DT_REG),
         ],
     ),
     (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
-    (b"/sys", &[(b"devices", DT_DIR)]),
+    (b"/sys", &[(b"devices", DT_DIR), (b"fs", DT_DIR)]),
+    // Where the cgroup hierarchy is mounted.
+    (b"/sys/fs", &[(b"cgroup", DT_DIR)]),
+    (b"/sys/fs/cgroup", &[]),
     (b"/sys/devices", &[(b"system", DT_DIR)]),
     (b"/sys/devices/system", &[(b"cpu", DT_DIR)]),
     (b"/sys/devices/system/cpu", &[(b"online", DT_REG), (b"possible", DT_REG)]),
@@ -111,6 +149,11 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
+        // The initial user namespace's: every id is itself.
+        b"/proc/self/uid_map" | b"/proc/self/gid_map" => {
+            Entry::File(b"         0          0 4294967295\n".to_vec())
+        }
+        b"/proc/self/setgroups" => Entry::File(b"allow\n".to_vec()),
         b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu)),
         b"/proc/meminfo" => Entry::File(meminfo()),
         b"/proc/stat" => Entry::File(stat(info.ncpu)),
@@ -124,6 +167,17 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/sys/kernel/version" => Entry::File(b"#1 SMP PREEMPT\n".to_vec()),
         b"/proc/sys/kernel/hostname" => Entry::File(line(&info.hostname)),
         b"/proc/sys/kernel/pid_max" => Entry::File(b"4194304\n".to_vec()),
+        b"/proc/sys/kernel/cap_last_cap" => {
+            Entry::File(format!("{}\n", crate::caps::CAP_LAST_CAP).into_bytes())
+        }
+        b"/proc/sys/kernel/ngroups_max" => Entry::File(b"65536\n".to_vec()),
+        b"/proc/sys/kernel/overflowuid" | b"/proc/sys/kernel/overflowgid" => {
+            Entry::File(b"65534\n".to_vec())
+        }
+        b"/proc/sys/kernel/threads-max" => Entry::File(b"254828\n".to_vec()),
+        b"/proc/sys/fs/nr_open" => Entry::File(b"1048576\n".to_vec()),
+        b"/proc/sys/fs/file-max" => Entry::File(b"9223372036854775807\n".to_vec()),
+        b"/proc/sys/fs/pipe-max-size" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),
         b"/proc/sys/vm/mmap_min_addr" => Entry::File(b"65536\n".to_vec()),
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {

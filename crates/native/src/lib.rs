@@ -25,6 +25,7 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// since `pthread_exit` does not return and would never release it.
 pub(crate) fn exit_current_thread(code: i32) -> ! {
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        fwe_kernel::procreg::exiting();
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
@@ -90,6 +91,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        fwe_kernel::procreg::exiting();
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
@@ -99,6 +101,7 @@ impl Platform for NativePlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        fwe_kernel::procreg::exiting();
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
@@ -158,14 +161,26 @@ fn unhex(text: &[u8]) -> Option<Vec<u8>> {
     text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
 }
 
-/// Apply [`Options::exec_state`] to a new kernel.
+/// Apply [`Options::exec_state`] to a new kernel. A program fwe was handed
+/// by descriptor (`--exe-fd`), run as `/dev/fd/N`, came through the mount
+/// the guest's descriptor `N` was opened in.
 fn apply_exec_state<P: fwe_kernel::Platform>(
     k: &mut Kernel<P>,
     options: &Options,
+    path: &Path,
 ) -> Result<(), Error> {
     let Some(text) = &options.exec_state else { return Ok(()) };
     let state = unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?;
-    k.restore_exec_state(&state).map_err(Error::Unsupported)
+    k.restore_exec_state(&state).map_err(Error::Unsupported)?;
+    let n = path
+        .as_os_str()
+        .as_bytes()
+        .strip_prefix(b"/dev/fd/")
+        .and_then(|n| std::str::from_utf8(n).ok()?.parse().ok());
+    if let (Some(held), Some(n)) = (options.exe_fd, n) {
+        fwe_kernel::fdmarks::duplicated(n, held);
+    }
+    Ok(())
 }
 
 /// Open the guest's root filesystem with its working directory.
@@ -306,7 +321,7 @@ pub(crate) fn reexec(
     }
     // A program with no path goes by descriptor: one of fwe's, kept open
     // across the host `execve`.
-    let held = match fs.pathless_fd(path).map(fwe_kernel::fdtable::dup_reserved) {
+    let held = match fs.exec_fd(path).map(fwe_kernel::fdtable::dup_reserved) {
         Some(Ok(held)) => {
             // SAFETY: plain host call on fwe's own descriptor; it must
             // survive the host `execve` (the new fwe takes it over).
@@ -891,6 +906,11 @@ fn start(
     }
     // fwe's own descriptors go above the guest's range from here on.
     fwe_kernel::fdtable::init();
+    if options.exec_state.is_none() {
+        // A fresh start: what earlier runs left behind and no process holds
+        // goes (see `fwe_kernel::shared::collect`).
+        fwe_kernel::shared::collect();
+    }
     let args = &guest_args(args, options);
     let data = read_program(path, options, &open_fs(options)?)?;
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
@@ -935,10 +955,11 @@ fn start(
     // The main thread's id equals the process id, as on Linux: in its pid
     // namespace, for a process exec'd in one.
     fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
+    fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
 
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
-    apply_exec_state(&mut kernel, options)?;
+    apply_exec_state(&mut kernel, options, path)?;
     *KERNEL.lock().unwrap() = Some(kernel);
     enter(out.sp, out.entry)
 }

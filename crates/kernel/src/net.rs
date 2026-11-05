@@ -291,7 +291,14 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
         Ok(d) => d,
         Err(e) => return e,
     };
-    let base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    // macOS has no SOCK_SEQPACKET Unix sockets: a datagram pair keeps the
+    // message boundaries, and the sockets are marked so that what differs
+    // reads as Linux has it (see `fdmarks`).
+    let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
+    if seqpacket {
+        base = libc::SOCK_DGRAM;
+    }
     let mut fds = [0i32; 2];
     // SAFETY: plain host call with a 2-element array.
     let r = unsafe { libc::socketpair(dom, base, protocol as i32, fds.as_mut_ptr()) };
@@ -300,6 +307,10 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     }
     apply_sock_flags(fds[0], type_);
     apply_sock_flags(fds[1], type_);
+    if seqpacket {
+        crate::fdmarks::mark(fds[0], crate::fdmarks::Mark::SeqPacket);
+        crate::fdmarks::mark(fds[1], crate::fdmarks::Mark::SeqPacket);
+    }
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -585,7 +596,7 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
         Err(e) => return e,
     };
     // SAFETY: the caller guarantees the out buffers.
-    ret(unsafe {
+    let r = ret(unsafe {
         libc::getsockopt(
             fd as i32,
             hl,
@@ -593,7 +604,16 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
             optval as *mut libc::c_void,
             optlen as *mut libc::socklen_t,
         ) as i64
-    })
+    });
+    // The kind a socket fwe made stands in for.
+    if r == 0
+        && level == SOL_SOCKET
+        && optname == SO_TYPE
+        && crate::fdmarks::marked(fd as i32) == Some(crate::fdmarks::Mark::SeqPacket)
+    {
+        let _ = uaccess::write(optval, SOCK_SEQPACKET as i32);
+    }
+    r
 }
 
 /// `shutdown(fd, how)`. `how` matches on both.

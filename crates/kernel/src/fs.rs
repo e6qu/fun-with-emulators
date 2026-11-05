@@ -305,13 +305,14 @@ impl Fs {
         self.proc.exe_fd.map(|fd| self.fd_target(fd))
     }
 
-    /// The descriptor `path` reaches when it names an open file that has no
-    /// path of its own (`/dev/fd/N` or `/proc/self/fd/N` of a memfd, or
-    /// `/proc/self/exe` of a program run from one), which is then read and
-    /// executed through the descriptor.
-    pub fn pathless_fd(&self, path: &[u8]) -> Option<i32> {
+    /// The descriptor `path` reaches when it names an open file through
+    /// one (`/dev/fd/N` or `/proc/self/fd/N`, or `/proc/self/exe` of a
+    /// program run that way), which is then read and executed through the
+    /// descriptor, as Linux runs the open file whatever has become of its
+    /// path.
+    pub fn exec_fd(&self, path: &[u8]) -> Option<i32> {
         match self.synthetic(fcntl::AT_FDCWD as i32, path)? {
-            crate::procfs::Entry::Fd { fd, target } if !has_path(fd, &target) => Some(fd),
+            crate::procfs::Entry::Fd { fd, .. } => Some(fd),
             _ => None,
         }
     }
@@ -325,6 +326,14 @@ impl Fs {
             use std::os::unix::ffi::OsStrExt;
             Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&self.root_host)))
         }
+    }
+
+    /// The directories of the shared records of the process's namespaces,
+    /// for its record ([`crate::procreg`]).
+    pub fn ns_dirs(&self) -> Vec<Vec<u8>> {
+        let mut d = vec![self.mnt.dir().to_vec()];
+        d.extend(self.ns.dirs());
+        d
     }
 
     /// The mount namespace.
@@ -369,6 +378,16 @@ impl Fs {
         from_ns(&self.proc_root, ns)
     }
 
+    /// Where the synthetic link `path` (relative to `dirfd`) to `target`
+    /// leads: `target` itself if absolute, else from the link's directory.
+    pub fn link_target(&self, dirfd: i32, path: &[u8], target: &[u8]) -> Vec<u8> {
+        if target.first() == Some(&b'/') {
+            return target.to_vec();
+        }
+        let link = self.absolute(dirfd, path).unwrap_or_else(|| path.to_vec());
+        normalize(&normalize(&link, b".."), target)
+    }
+
     /// The mount the absolute guest path `path` is in (taken lexically),
     /// and the path inside its filesystem.
     pub fn mount_of(&self, path: &[u8]) -> (Mount, Vec<u8>) {
@@ -409,6 +428,10 @@ impl Fs {
             });
         }
         match &absolute[..] {
+            b"/proc/self/cgroup" => {
+                let root = self.ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
+                return Some(crate::procfs::Entry::File(crate::cgroupfs::proc_self_cgroup(&root)));
+            }
             b"/proc/sys/kernel/hostname" => {
                 return Some(crate::procfs::Entry::File([&self.ns.hostname()[..], b"\n"].concat()));
             }
@@ -450,6 +473,12 @@ impl Fs {
         if let Some(name) = crate::memfd::name(fd) {
             return [&b"/memfd:"[..], &name, b" (deleted)"].concat();
         }
+        if crate::bpf::prog_of(fd).is_some() {
+            return b"anon_inode:bpf-prog".to_vec();
+        }
+        if let Some(p) = crate::synthdir::path_of(fd) {
+            return p;
+        }
         if let Some(name) = crate::specialfd::anon_name(fd) {
             return format!("anon_inode:{name}").into_bytes();
         }
@@ -466,6 +495,9 @@ impl Fs {
             libc::S_IFIFO => return format!("pipe:[{}]", st.st_ino).into_bytes(),
             libc::S_IFSOCK => return format!("socket:[{}]", st.st_ino).into_bytes(),
             _ => {}
+        }
+        if let Some(guest) = crate::fdmarks::origin(fd).and_then(|o| self.from_ns(&o.ns_path)) {
+            return guest;
         }
         match fd_path(fd) {
             Some(host) => self.host_to_guest(&host).unwrap_or(host),
@@ -545,16 +577,34 @@ impl Fs {
         mode & !self.umask & 0o7777
     }
 
-    /// `path` as a normalized absolute guest path, if it is absolute or
-    /// relative to the working directory (not to another directory fd).
+    /// `path` as a normalized absolute guest path (taken lexically), if fwe
+    /// can place it: absolute, relative to the working directory, or to a
+    /// directory descriptor whose place it knows (a synthetic directory, or
+    /// one opened through a mount of the process's).
     fn absolute(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
         if path.first() == Some(&b'/') {
-            Some(normalize(b"/", path))
-        } else if dirfd as i64 == fcntl::AT_FDCWD {
-            Some(normalize(&self.cwd, path))
-        } else {
-            None
+            return Some(normalize(b"/", path));
         }
+        if dirfd as i64 == fcntl::AT_FDCWD {
+            return Some(normalize(&self.cwd, path));
+        }
+        let dir = self.fd_ns_path(dirfd).and_then(|ns| self.from_ns(&ns))?;
+        Some(normalize(&dir, path))
+    }
+
+    /// Where the file `fd` is open on is in the namespace's view, if fwe
+    /// can tell: a synthetic directory's path, where the file was opened,
+    /// or else the mount showing its host path.
+    pub fn fd_ns_path(&self, fd: i32) -> Option<Vec<u8>> {
+        if let Some(p) = crate::synthdir::path_of(fd) {
+            return Some(self.to_ns(&p));
+        }
+        crate::fdmarks::origin(fd).map(|o| o.ns_path).or_else(|| self.ns_path_of_fd(fd))
+    }
+
+    /// [`absolute`](Self::absolute), for the callers outside.
+    pub fn absolute_path(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
+        self.absolute(dirfd, path)
     }
 
     /// Resolve `path` relative to `dirfd`. Every symlink is followed except,
@@ -582,10 +632,19 @@ impl Fs {
             use crate::procfs::Entry;
             return match entry {
                 Entry::File(data) => Ok(data),
-                Entry::Fd { fd, target } if !has_path(fd, &target) => read_all(fd),
-                Entry::Fd { target: t, .. } | Entry::Symlink(t) if t.starts_with(b"/") => {
-                    self.read(&t)
+                Entry::Fd { fd, .. } => {
+                    // Through the descriptor: only a regular file is run.
+                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid out-parameter.
+                    if unsafe { libc::fstat(fd, &mut st) } != 0
+                        || st.st_mode & libc::S_IFMT != libc::S_IFREG
+                    {
+                        return Err(errno::EACCES);
+                    }
+                    read_all(fd)
                 }
+                Entry::Symlink(t) if t.starts_with(b"/") => self.read(&t),
                 Entry::Dir => Err(errno::EISDIR),
                 _ => Err(errno::ENOENT),
             };
@@ -912,8 +971,15 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             let child_ns = mounts::join(ns, &comp);
             if let Some(m) = table.child_at(*mid, &child_ns).cloned() {
                 if m.source == Source::Synthetic {
-                    // Served by `Fs::synthetic`, which the callers ask first.
-                    return Err(errno::ENOENT);
+                    // Served by `Fs::synthetic`, which the callers ask
+                    // first; only a mount below it is reached through it.
+                    if is_last {
+                        return Err(errno::ENOENT);
+                    }
+                    let dir = dup_cloexec(here.dir.as_raw_fd())?;
+                    let next = Here { dir, at: Some((m.id, child_ns)), phantom: true };
+                    ancestors.push(std::mem::replace(&mut here, next));
+                    continue;
                 }
                 let Some(host) = m.host_path(b"") else { return Err(errno::ENOENT) };
                 let is_dir = std::fs::metadata(std::ffi::OsStr::from_bytes_compat(&host))
@@ -1112,6 +1178,18 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
 /// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
 /// user's temporary directory. Unlike a tmpfs it outlives the processes,
 /// until the host clears its temporary files.
+/// The host path of the file `fd` is open on.
+pub(crate) fn host_path_of(fd: i32) -> Option<Vec<u8>> {
+    fd_path(fd)
+}
+
+/// The host path of `name` in the directory `dir` is open on (`.` for the
+/// directory itself).
+pub(crate) fn host_path_in(dir: i32, name: &[u8]) -> Option<Vec<u8>> {
+    let d = fd_path(dir)?;
+    Some(if name == b"." { d } else { mounts::join(&d, name) })
+}
+
 /// Whether `target`, what `/proc/self/fd/<fd>` links to, is a path the
 /// file can be opened by again; otherwise opening the link duplicates the
 /// descriptor (a pipe, a socket, a memfd).
@@ -1193,6 +1271,10 @@ pub(crate) mod shm {
     /// fwe's private directory for this user (`fwe-<uid>` in the user's
     /// temporary directory), created on first use.
     pub(crate) fn user_dir() -> Result<Vec<u8>, i32> {
+        static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        if let Some(d) = DIR.get() {
+            return Ok(d.clone());
+        }
         // SAFETY: getuid cannot fail.
         let uid = unsafe { libc::getuid() };
         let mut base = user_temp();
@@ -1201,7 +1283,13 @@ pub(crate) mod shm {
         }
         base.extend_from_slice(format!("fwe-{uid}").as_bytes());
         ensure_dir(&base, 0o700, true)?;
-        Ok(base)
+        // Its canonical path, as the host reports a descriptor's (the user's
+        // temporary directory is reached through the `/var` link).
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let canonical = std::fs::canonicalize(std::ffi::OsStr::from_bytes(&base))
+            .map(|p| p.into_os_string().into_vec())
+            .unwrap_or(base);
+        Ok(DIR.get_or_init(|| canonical).clone())
     }
 
     /// The host path of the directory for the root at `root_host`, created

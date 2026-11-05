@@ -19,6 +19,8 @@ const SUPPORTED: u64 =
 pub struct ForkNs {
     /// The parent's own, while it has the child's for the fork.
     saved: Option<(Arc<crate::mounts::store::Ns>, Namespaces)>,
+    /// The child's namespaces' records, for its record.
+    dirs: Vec<Vec<u8>>,
     /// The child's pid namespaces, and its numbers in them.
     chain: pidns::Chain,
     nums: Vec<i32>,
@@ -56,6 +58,7 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => return err(e),
             }
         }
+        crate::procreg::own_namespaces(fs.ns_dirs());
         0
     }
 
@@ -88,6 +91,8 @@ impl<P: Platform> Kernel<P> {
         if new != 0 && !self.creds.has_admin() {
             return Err(errno::EPERM);
         }
+        // Within the cgroup's `pids.max`.
+        crate::cgroupfs::fork_allowed(&crate::cgroupfs::current())?;
         let fs = self.fs.as_mut().expect("filesystem configured");
         let mut ns = fs.ns.clone();
         ns.unshare(new)?;
@@ -112,7 +117,8 @@ impl<P: Platform> Kernel<P> {
         } else {
             None
         };
-        Ok(ForkNs { saved, chain, nums })
+        let dirs = fs.ns_dirs();
+        Ok(ForkNs { saved, chain, nums, dirs })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
@@ -123,6 +129,10 @@ impl<P: Platform> Kernel<P> {
             let fs = self.fs.as_mut().expect("filesystem configured");
             fs.set_mount_ns(mnt);
             fs.ns = ns;
+        }
+        if child > 0 {
+            // It starts in this process's cgroup, in its namespaces.
+            crate::procreg::forked(child, t.dirs.clone());
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {
