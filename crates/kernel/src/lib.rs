@@ -236,6 +236,7 @@ impl<P: Platform> Kernel<P> {
         e.u64(self.brk.current);
         e.u64(self.brk.limit);
         e.bool(self.tracer.enabled);
+        e.bool(self.tracer.failures_only);
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -285,7 +286,7 @@ impl<P: Platform> Kernel<P> {
     pub fn restore_for_fork(platform: P, d: &mut snapshot::Dec) -> Kernel<P> {
         let page_size = d.u64();
         let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
-        let tracer = Tracer { enabled: d.bool() };
+        let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;

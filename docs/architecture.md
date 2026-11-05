@@ -264,6 +264,11 @@ it there without the bits that allow skipping cache maintenance
 
 `--strace` prints each call with its arguments and result, plus the
 backend's notes (what was loaded and prepared), to standard error.
+`--strace=failures` prints only the calls that fail, and the notes. That is
+cheap enough to leave a run's timing much as it is, for a failure that
+full tracing hides. A failed code preparation is noted with its reason,
+for example no room for stubs near the code, while the guest gets
+`ENOMEM`. Both modes are passed on across `execve` and `fork`.
 
 ## Filesystem
 

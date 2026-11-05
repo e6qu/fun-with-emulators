@@ -127,7 +127,7 @@ impl Platform for NativePlatform {
 #[derive(Debug, Default, Clone)]
 pub struct Options {
     /// Trace system calls to standard error.
-    pub strace: bool,
+    pub strace: Tracer,
     /// Root filesystem directory; the host `/` when `None`.
     pub root: Option<std::path::PathBuf>,
     /// The program path is a guest path, resolved in the root filesystem
@@ -253,7 +253,7 @@ pub(crate) fn reexec(
     args: &[Vec<u8>],
     env: &[Vec<u8>],
     fs: &fwe_kernel::Fs,
-    strace: bool,
+    strace: Tracer,
     state: &[u8],
     before_exec: impl FnOnce(),
 ) -> i64 {
@@ -270,7 +270,9 @@ pub(crate) fn reexec(
     let mut argv: Vec<Vec<u8>> = vec![fwe.as_os_str().as_bytes().to_vec()];
     argv.extend(hv::passed_on());
     argv.push(b"--guest-path".to_vec());
-    if strace {
+    if strace.failures_only {
+        argv.push(b"--strace=failures".to_vec());
+    } else if strace.enabled {
         argv.push(b"--strace".to_vec());
     }
     if let Some(root) = fs.root_host_path() {
@@ -721,12 +723,12 @@ pub fn load_image(
     fs: &fwe_kernel::Fs,
     platform: &NativePlatform,
     page: u64,
-    strace: bool,
+    tracer: Tracer,
 ) -> Result<Loadout, Error> {
     let elf = Elf::parse(file).map_err(Error::Elf)?;
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
-    let tracer = Tracer { enabled: strace };
+    let strace = tracer.enabled;
     let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
         loader::load(elf, page, |a, l, known, arena| {
             let stats = platform.prepare(a, l, Some(arena), known).map_err(|e| e.to_string())?;
@@ -860,9 +862,9 @@ fn start(
     }
 
     let page = page_size();
-    let tracer = Tracer { enabled: options.strace };
+    let tracer = options.strace;
     let host = host_support();
-    if options.strace {
+    if tracer.enabled {
         tracer.note(&format!("host: {host}"));
     }
     let platform =

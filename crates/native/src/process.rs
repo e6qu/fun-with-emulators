@@ -63,7 +63,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let mut guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     let k = guard.as_mut().unwrap();
     let page = page_size();
-    let strace = k.tracer.enabled;
+    let strace = k.tracer;
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
     let fs = k.fs.as_ref().expect("filesystem configured");

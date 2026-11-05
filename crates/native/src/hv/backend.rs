@@ -6,7 +6,7 @@ use super::{fork, mem, record, vm, window};
 use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, stack};
 use fwe_abi::{auxv, err, errno, mman, nr};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
-use fwe_kernel::{Brk, FpRegs, HostSignal, Kernel, Platform, Regs, Tracer, host, thread, uaccess};
+use fwe_kernel::{Brk, FpRegs, HostSignal, Kernel, Platform, Regs, host, thread, uaccess};
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
@@ -558,7 +558,7 @@ fn start(
 ) -> Result<std::convert::Infallible, Error> {
     // The guest's pages are Linux's 4 KiB ones: its own page tables say so.
     let page = PAGE;
-    let tracer = Tracer { enabled: options.strace };
+    let tracer = options.strace;
     // Hypervisor.framework runs threads of its own, which inherit the mask
     // of the thread that creates them. With every guest signal blocked
     // there, the host delivers signals only to the vCPU threads, whose masks
@@ -677,7 +677,7 @@ fn start(
     vm::flushed_without_vcpus();
 
     let entry = interp.as_ref().map_or(exe.entry, |i| i.entry);
-    if options.strace {
+    if tracer.enabled {
         tracer.note(&format!(
             "hypervisor backend: exe entry {:#x}, image translated to host {:#x}, \
              interp base {:#x}, brk {brk_start:#x}, stack top {stack_top:#x}",
@@ -1130,7 +1130,7 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
         teardown();
         record::event("execve", &path);
     };
-    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, &state, before_exec);
+    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer, &state, before_exec);
     if !VM_LIVE.load(std::sync::atomic::Ordering::SeqCst) {
         fatal(&format!(
             "execve {} failed after the VM was destroyed: {r}",

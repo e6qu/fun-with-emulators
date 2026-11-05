@@ -2363,38 +2363,34 @@ fn run_hv(cmd: Command, what: &str) -> Output {
 
 /// [`run_hv`] for a workload that can fail far from its cause (a loader
 /// saying only that a segment could not be mapped): `args` adds the
-/// command's arguments to [`hv_command`]'s. When the run's output is not
-/// `expected`, it is run again with `--strace`, and the failed memory calls
-/// and fwe's notes (why code could not be prepared, say) are printed.
+/// command's arguments to [`hv_command`]'s. The run is traced with
+/// `--strace=failures`, which leaves its timing much as it is; the guest's
+/// own standard error is echoed, and when the output is not `expected` the
+/// failed memory calls and fwe's notes (why code could not be prepared,
+/// say) are printed too.
 fn run_hv_explained(args: impl Fn(&mut Command), what: &str, expected: &str) -> Option<Output> {
     let mut cmd = hv_command()?;
+    cmd.arg("--strace=failures");
     args(&mut cmd);
-    let out = run_hv(cmd, what);
-    if stdout(&out) == expected && out.status.success() {
-        return Some(out);
-    }
-    let mut cmd = hv_command()?;
-    cmd.arg("--strace");
-    args(&mut cmd);
-    // Tracing slows it down severalfold.
-    let traced = run_hv_quietly(cmd, &format!("{what}, traced"), 4 * STANDIN_TIMEOUT);
-    let memory = ["mmap(", "mprotect(", "munmap(", "mremap("];
-    let lines: Vec<&str> = std::str::from_utf8(&traced.stderr)
-        .unwrap_or("")
-        .lines()
-        .filter(|l| {
-            let call = l.strip_prefix("[fwe] ");
-            call.is_some_and(|c| {
-                !memory.iter().any(|m| c.starts_with(m)) && !c.contains(" = ")
-                    || memory.iter().any(|m| c.starts_with(m)) && c.contains(" = -1 ")
+    let limit =
+        if matches!(hv_mode(), Some(HvMode::Standin)) { STANDIN_TIMEOUT } else { GUEST_TIMEOUT };
+    let out = run_hv_quietly(cmd, what, limit);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (trace, guest): (Vec<&str>, Vec<&str>) =
+        stderr.lines().partition(|l| l.starts_with("[fwe] "));
+    eprintln!("--- hv {what} stderr:\n{}", guest.join("\n"));
+    if stdout(&out) != expected || !out.status.success() {
+        let memory = ["mmap(", "mprotect(", "munmap(", "mremap("];
+        let telling: Vec<&str> = trace
+            .into_iter()
+            .filter(|l| {
+                let line = &l["[fwe] ".len()..];
+                // A note, or a memory call that failed.
+                !line.contains(") = ") || memory.iter().any(|m| line.starts_with(m))
             })
-        })
-        .collect();
-    eprintln!(
-        "--- {what}: traced again ({}), failed memory calls and notes:\n{}",
-        if stdout(&traced) == expected { "passed this time" } else { "failed again" },
-        lines.join("\n")
-    );
+            .collect();
+        eprintln!("--- {what}: failed memory calls and fwe's notes:\n{}", telling.join("\n"));
+    }
     Some(out)
 }
 

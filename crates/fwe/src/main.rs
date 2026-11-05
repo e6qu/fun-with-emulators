@@ -12,6 +12,8 @@ Run a Linux arm64 executable.
 
 options:
   --strace     trace system calls to standard error
+  --strace=failures
+               trace only the calls that fail, and fwe's notes
   --root DIR   use DIR as the guest root filesystem
   --host-info  show host features that affect compatibility
   --probe NAME run one host-behaviour probe (diagnostic; used by CI)
@@ -78,7 +80,11 @@ fn main() -> ExitCode {
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {
-            b"--strace" => options.strace = true,
+            b"--strace" => options.strace.enabled = true,
+            b"--strace=failures" => {
+                options.strace.enabled = true;
+                options.strace.failures_only = true;
+            }
             b"--root" => {
                 args.next();
                 match args.next() {
