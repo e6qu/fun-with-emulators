@@ -33,6 +33,9 @@ pub enum Mark {
     SeqPacket,
     /// `/dev/full`, whose writes fail with `ENOSPC`.
     DevFull,
+    /// A socket bound in a network namespace of fwe's, to its port `port`
+    /// (of the wildcard address if `any`), see [`crate::netns`].
+    NetBound { port: u16, any: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +137,13 @@ pub fn closed(fd: i32) {
     take(&mut records(), fd);
 }
 
+/// Whether a descriptor of this process other than `fd` is open on the
+/// file `fd` is (as a `dup` of it would be).
+pub fn shared_elsewhere(fd: i32) -> bool {
+    let Some(id) = identity(fd) else { return false };
+    crate::fdtable::open_fds().into_iter().any(|o| o != fd && identity(o) == Some(id))
+}
+
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
     let mut r = records();
@@ -165,7 +175,12 @@ pub fn save(e: &mut Enc) {
             None => 0,
             Some(Mark::SeqPacket) => 1,
             Some(Mark::DevFull) => 2,
+            Some(Mark::NetBound { .. }) => 3,
         });
+        if let Some(Mark::NetBound { port, any }) = rec.mark {
+            e.u32(u32::from(port));
+            e.bool(any);
+        }
     }
 }
 
@@ -184,6 +199,7 @@ pub fn load(d: &mut Dec) {
         let mark = match d.u8() {
             1 => Some(Mark::SeqPacket),
             2 => Some(Mark::DevFull),
+            3 => Some(Mark::NetBound { port: d.u32() as u16, any: d.bool() }),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

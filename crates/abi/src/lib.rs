@@ -186,6 +186,8 @@ pub mod prctl {
     pub const PR_GET_NAME: u64 = 16;
     pub const PR_GET_KEEPCAPS: u64 = 7;
     pub const PR_SET_KEEPCAPS: u64 = 8;
+    pub const PR_GET_SECCOMP: u64 = 21;
+    pub const PR_SET_SECCOMP: u64 = 22;
     pub const PR_CAPBSET_READ: u64 = 23;
     pub const PR_CAPBSET_DROP: u64 = 24;
     pub const PR_GET_SECUREBITS: u64 = 27;

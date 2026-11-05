@@ -204,6 +204,11 @@ struct Registered {
 /// Every live guest thread's pending set, by tid.
 static THREADS: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
 
+/// How many guest threads the process has.
+pub fn live_threads() -> usize {
+    THREADS.lock().unwrap_or_else(|e| e.into_inner()).len().max(1)
+}
+
 const UNBLOCKABLE: u64 = (1 << (signal::SIGKILL - 1)) | (1 << (signal::SIGSTOP - 1));
 
 thread_local! {

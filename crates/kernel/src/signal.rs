@@ -116,7 +116,15 @@ impl Buf {
 fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
     buf.put32(0, sig as i32); // si_signo
     buf.put32(8, info.code); // si_code
-    if fault_addr != 0 {
+    if sig == signal::SIGSYS && info.code == SYS_SECCOMP {
+        // `_sigsys`: the call's address (kept in `pid` and `uid`), its
+        // number and the architecture; the filter's data is `si_errno`.
+        buf.put32(4, info.status >> 16);
+        buf.put32(SI_PID_OFF, info.pid);
+        buf.put32(SI_UID_OFF, info.uid as i32);
+        buf.put32(SI_STATUS_OFF, info.status & 0xffff);
+        buf.put32(SI_STATUS_OFF + 4, crate::seccomp::AUDIT_ARCH_AARCH64 as i32);
+    } else if fault_addr != 0 {
         buf.put(SI_ADDR_OFF, fault_addr);
     } else {
         // Recorded as the host pid; the guest sees its own namespace's.
@@ -213,6 +221,21 @@ pub fn drain_to_signalfd() {
 /// A sender's or child's host pid as the guest sees it.
 fn guest_pid(host: i32) -> i32 {
     if host != 0 && crate::pidns::nested() { crate::pidns::to_guest(host) } else { host }
+}
+
+/// `si_code` of the `SIGSYS` a seccomp filter raises.
+const SYS_SECCOMP: i32 = 1;
+
+/// The `SIGSYS` a seccomp filter's `SECCOMP_RET_TRAP` raises for call `nr`
+/// at `pc`, with the filter's `data`.
+pub(crate) fn raise_sigsys(pc: u64, nr: u64, data: u16) {
+    let info = SigInfo {
+        code: SYS_SECCOMP,
+        pid: pc as u32 as i32,
+        uid: (pc >> 32) as u32,
+        status: (i32::from(data) << 16) | (nr as i32 & 0xffff),
+    };
+    thread::post_self(signal::SIGSYS, info);
 }
 
 /// Raise `sig` against the calling thread, as the kernel raises `SIGPIPE`

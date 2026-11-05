@@ -343,6 +343,18 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     reroute_parked();
     let nr = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    // The process's seccomp filters decide first, for every call.
+    if fwe_kernel::seccomp::mode() != 0 {
+        let action = fwe_kernel::seccomp::check(nr, &args, regs.pc);
+        if action != fwe_kernel::seccomp::Action::Allow {
+            kernel().as_mut().unwrap().seccomp_refuse(&mut regs, nr, &args, action);
+            settle(&mut regs);
+            regs_to(mc, &regs);
+            // SAFETY: `ctx` is this handler's ucontext.
+            unsafe { return_with_guest_mask(ctx) };
+            return;
+        }
+    }
 
     // `clone` and the blocking system calls run without holding the kernel
     // lock, so a blocked or spawning thread does not stall the others; the

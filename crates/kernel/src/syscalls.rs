@@ -154,6 +154,14 @@ impl<P: Platform> Kernel<P> {
             nr::CLOSE => {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
+                // A port bound in a network namespace is free once its
+                // socket is.
+                let mark = crate::fdmarks::marked(fd);
+                if matches!(mark, Some(crate::fdmarks::Mark::NetBound { .. }))
+                    && !crate::fdmarks::shared_elsewhere(fd)
+                {
+                    crate::netns::closed(fd, mark);
+                }
                 crate::fdmarks::closed(fd);
                 if let Some(r) = crate::specialfd::try_close(fd) {
                     r
@@ -210,7 +218,14 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: the sv pointer is validated by the host/impl.
             nr::SOCKETPAIR => unsafe { crate::net::socketpair(a[0], a[1], a[2], a[3]) },
             // SAFETY: the sockaddr pointer is validated by the host/impl.
-            nr::BIND => unsafe { crate::net::bind(a[0], a[1], a[2]) },
+            nr::BIND => unsafe {
+                crate::net::bind(
+                    a[0],
+                    a[1],
+                    a[2],
+                    self.creds.has(crate::caps::CAP_NET_BIND_SERVICE),
+                )
+            },
             // SAFETY: no pointers.
             nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
             // SAFETY: the out pointers are validated by the host/impl.
@@ -357,6 +372,7 @@ impl<P: Platform> Kernel<P> {
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
+            nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
             nr::BPF if !self.creds.has_admin() => err(errno::EPERM),
             nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
             nr::CAPSET => self.sys_capset(a[0], a[1]),
@@ -722,9 +738,7 @@ impl<P: Platform> Kernel<P> {
     fn sys_prctl(&mut self, option: u64, arg2: u64, arg3: u64) -> i64 {
         use fwe_abi::prctl::*;
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        /// `PR_SET_NO_NEW_PRIVS` (fwe grants no privileges an exec could
-        /// raise, so it only has to be remembered) and `PR_SET_DUMPABLE`.
-        static NO_NEW_PRIVS: AtomicBool = AtomicBool::new(false);
+        /// `PR_SET_DUMPABLE`.
         static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
         static SUBREAPER: AtomicBool = AtomicBool::new(false);
         match option {
@@ -734,6 +748,10 @@ impl<P: Platform> Kernel<P> {
                 let n = s.len().min(TASK_COMM_LEN - 1);
                 name[..n].copy_from_slice(&s[..n]);
                 thread::set_name(name);
+                if thread::tid() == thread::tgid() {
+                    // What /proc/<pid>/comm shows of the process.
+                    crate::procreg::own_comm(&name[..n]);
+                }
                 0
             }
             PR_GET_NAME => {
@@ -789,6 +807,12 @@ impl<P: Platform> Kernel<P> {
             }
             PR_SET_NO_NEW_PRIVS => err(errno::EINVAL),
             PR_GET_NO_NEW_PRIVS => i64::from(NO_NEW_PRIVS.load(Relaxed)),
+            PR_GET_SECCOMP => i64::from(crate::seccomp::mode()),
+            PR_SET_SECCOMP => self.sys_seccomp(
+                if arg2 == 1 { 0 } else { arg2 - 1 },
+                0,
+                if arg2 == 1 { 0 } else { arg3 },
+            ),
             PR_SET_DUMPABLE if arg2 <= 1 => {
                 UNDUMPABLE.store(arg2 == 0, Relaxed);
                 0
@@ -984,6 +1008,81 @@ impl<P: Platform> Kernel<P> {
             // The host's interfaces are not the guest's to change.
             _ => err(errno::EPERM),
         }
+    }
+
+    /// A call the seccomp filters refused with `action` (not `Allow`): its
+    /// errno, a `SIGSYS`, or the end of the thread or process.
+    pub fn seccomp_refuse(
+        &mut self,
+        regs: &mut crate::Regs,
+        nr: u64,
+        args: &[u64; 6],
+        action: crate::seccomp::Action,
+    ) {
+        use crate::seccomp::Action;
+        match action {
+            Action::Allow => self.enter_syscall(regs),
+            Action::Errno(e) => self.finish_syscall(regs, nr, args, err(e)),
+            Action::Trap(data) => {
+                crate::signal::raise_sigsys(regs.pc, nr, data);
+                // The call is not made; a handler may set what it returns.
+                let x0 = regs.x[0] as i64;
+                self.finish_syscall(regs, nr, args, x0);
+            }
+            Action::KillThread if thread::live_threads() > 1 => {
+                self.thread_cleanup();
+                self.platform.exit_thread(128 + signal::SIGSYS as i32)
+            }
+            Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
+        }
+    }
+
+    /// `seccomp(op, flags, args)`.
+    fn sys_seccomp(&mut self, op: u64, flags: u64, args: u64) -> i64 {
+        use crate::seccomp::*;
+        let allowed = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
+            || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+        let r = match op {
+            SET_MODE_STRICT if flags != 0 || args != 0 => Err(errno::EINVAL),
+            SET_MODE_STRICT => set_strict(),
+            SET_MODE_FILTER => install_filter(args, flags, allowed),
+            GET_ACTION_AVAIL if flags != 0 => Err(errno::EINVAL),
+            GET_ACTION_AVAIL => uaccess::read::<u32>(args).and_then(action_available),
+            GET_NOTIF_SIZES if flags != 0 => Err(errno::EINVAL),
+            // struct seccomp_notif_sizes: seccomp_notif, seccomp_notif_resp
+            // and seccomp_data.
+            GET_NOTIF_SIZES => uaccess::write(args, [80u16, 24, 64]).map(|()| 0),
+            _ => Err(errno::EINVAL),
+        };
+        match r {
+            Ok(v) => v,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `/proc/self/status`: the host's view of the process with the
+    /// kernel's own of its credentials, capabilities and restrictions.
+    pub(crate) fn self_status(&self) -> Vec<u8> {
+        // SAFETY: getpid cannot fail.
+        let host = unsafe { libc::getpid() };
+        let comm = thread::name()
+            .map(|n| n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())].to_vec())
+            .unwrap_or_else(|| {
+                let exe = self.fs().exe();
+                exe.rsplit(|&b| b == b'/').next().unwrap_or(exe).iter().take(15).copied().collect()
+            });
+        let h = crate::procpid::host_info(host).unwrap_or_default();
+        let c = &self.creds;
+        let creds = crate::procpid::Creds {
+            uids: [c.uid, c.euid, c.suid, c.fsuid],
+            gids: [c.gid, c.egid, c.sgid, c.fsgid],
+            groups: c.groups.clone(),
+            caps: Some(c.caps),
+            no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
+            seccomp: crate::seccomp::mode(),
+            umask: self.fs().umask(),
+        };
+        crate::procpid::status(thread::tgid(), &comm, &h, &creds)
     }
 
     /// `sysinfo`: the host's uptime and load, and the memory `/proc/meminfo`
@@ -1336,6 +1435,11 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
 fn bytemuck_u32(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_ne_bytes()).collect()
 }
+
+/// `PR_SET_NO_NEW_PRIVS`: fwe grants no privileges an exec could raise, so
+/// it only has to be remembered (and shown), as it is kept across `execve`.
+pub(crate) static NO_NEW_PRIVS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The affinity `sched_setaffinity` set for this process, if it did.
 static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);

@@ -121,6 +121,12 @@ impl<P: Platform> Kernel<P> {
         // Synthetic /proc and /sys files take priority over the host rootfs.
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
+                crate::procfs::Entry::File(_)
+                    if self.fs().proc_path(dirfd as i32, &path).as_deref()
+                        == Some(b"/proc/self/status") =>
+                {
+                    anon_fd(&self.self_status())
+                }
                 crate::procfs::Entry::File(content) => anon_fd(&content),
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {

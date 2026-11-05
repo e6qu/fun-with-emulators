@@ -18,6 +18,11 @@ pub struct ProcRecord {
     pub cgroup: Vec<u8>,
     /// The directories of the shared records of its namespaces.
     pub ns: Vec<Vec<u8>>,
+    /// Its name (`comm`), command line (NUL-separated) and program's path,
+    /// for `/proc/<pid>`.
+    pub comm: Vec<u8>,
+    pub cmdline: Vec<u8>,
+    pub exe: Vec<u8>,
 }
 
 fn dir() -> Option<Vec<u8>> {
@@ -67,6 +72,9 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     for d in &r.ns {
         e.bytes(d);
     }
+    e.bytes(&r.comm);
+    e.bytes(&r.cmdline);
+    e.bytes(&r.exe);
     e.into_bytes()
 }
 
@@ -77,7 +85,7 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
     let (start, cgroup) = (d.u64(), d.bytes());
     let n = d.count(8);
     let ns = (0..n).map(|_| d.bytes()).collect();
-    let r = ProcRecord { start, cgroup, ns };
+    let r = ProcRecord { start, cgroup, ns, comm: d.bytes(), cmdline: d.bytes(), exe: d.bytes() };
     d.finish().ok()?;
     (start_time(pid) == Some(r.start)).then_some(r)
 }
@@ -130,20 +138,48 @@ pub fn cgroup_of(pid: i32) -> Vec<u8> {
     read(pid).map_or_else(|| b"/".to_vec(), |r| r.cgroup)
 }
 
+/// Change the record of host process `pid` with `f` (making one if it has
+/// none).
+fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
+    let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    let mut r = read(pid).unwrap_or(ProcRecord {
+        start,
+        cgroup: b"/".to_vec(),
+        ns: Vec::new(),
+        comm: Vec::new(),
+        cmdline: Vec::new(),
+        exe: Vec::new(),
+    });
+    f(&mut r);
+    write(pid, &r);
+    Ok(())
+}
+
 /// Put host process `pid` in `cgroup`.
 pub fn set_cgroup(pid: i32, cgroup: &[u8]) -> Result<(), i32> {
-    let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
-    let ns = read(pid).map(|r| r.ns).unwrap_or_default();
-    write(pid, &ProcRecord { start, cgroup: cgroup.to_vec(), ns });
-    Ok(())
+    change(pid, |r| r.cgroup = cgroup.to_vec())
 }
 
 /// Record that host process `pid` is in the namespaces whose shared
 /// records are `ns`.
 pub fn set_namespaces(pid: i32, ns: Vec<Vec<u8>>) {
-    let Some(start) = start_time(pid) else { return };
-    let cgroup = read(pid).map_or_else(|| b"/".to_vec(), |r| r.cgroup);
-    write(pid, &ProcRecord { start, cgroup, ns });
+    let _ = change(pid, |r| r.ns = ns);
+}
+
+/// This process runs program `exe` with command line `cmdline`.
+pub fn own_program(exe: &[u8], cmdline: &[u8]) {
+    let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
+    let comm = base[..base.len().min(15)].to_vec();
+    let _ = change(me(), |r| {
+        r.exe = exe.to_vec();
+        r.cmdline = cmdline.to_vec();
+        r.comm = comm;
+    });
+}
+
+/// This process's main thread is named `comm`.
+pub fn own_comm(comm: &[u8]) {
+    let _ = change(me(), |r| r.comm = comm.to_vec());
 }
 
 /// This process is in the namespaces `ns`.
@@ -155,7 +191,9 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 /// namespaces `ns`.
 pub fn forked(child: i32, ns: Vec<Vec<u8>>) {
     let Some(start) = start_time(child) else { return };
-    write(child, &ProcRecord { start, cgroup: own_cgroup(), ns });
+    let mine = read(me());
+    let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
+    write(child, &ProcRecord { start, cgroup: own_cgroup(), ns, comm, cmdline, exe });
 }
 
 /// This process is ending.

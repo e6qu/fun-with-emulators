@@ -1355,6 +1355,14 @@ fn host_buffer(n: u64, i: usize, a: &[u64; 6]) -> Option<(u64, bool)> {
 fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    // The process's seccomp filters decide first, for every call.
+    if fwe_kernel::seccomp::mode() != 0 {
+        let action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        if action != fwe_kernel::seccomp::Action::Allow {
+            kernel().as_mut().unwrap().seccomp_refuse(regs, n, &args, action);
+            return;
+        }
+    }
     // The kernel and the host see host addresses for guest pointers.
     let mask = match n {
         nr::FUTEX => uaccess::futex_pointer_args(args[1]),

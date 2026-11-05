@@ -239,6 +239,12 @@ fn cpu_range(ncpu: u32) -> Vec<u8> {
     if n == 1 { b"0\n".to_vec() } else { format!("0-{}\n", n - 1).into_bytes() }
 }
 
+/// The online CPUs.
+pub fn ncpu_hint() -> u32 {
+    // SAFETY: plain host call.
+    (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

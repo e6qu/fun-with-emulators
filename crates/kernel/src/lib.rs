@@ -28,12 +28,15 @@ pub mod mm;
 mod mountops;
 pub mod mounts;
 pub mod net;
+pub mod netns;
 pub mod ns;
 pub mod nsops;
 pub mod pidns;
 pub mod procfs;
+pub mod procpid;
 pub mod procreg;
 pub mod pty;
+pub mod seccomp;
 pub mod shared;
 pub mod signal;
 pub mod signalfd;
@@ -251,6 +254,8 @@ impl<P: Platform> Kernel<P> {
         e.bool(self.tracer.enabled);
         e.bool(self.tracer.failures_only);
         fdmarks::save(e);
+        seccomp::save(e);
+        e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -303,6 +308,8 @@ impl<P: Platform> Kernel<P> {
         let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
         fdmarks::load(d);
+        seccomp::load_state(d);
+        syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
@@ -488,6 +495,9 @@ impl<P: Platform> Kernel<P> {
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
         fdmarks::save(&mut e);
+        // Kept across execve, as on Linux.
+        seccomp::save(&mut e);
+        e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.into_bytes()
     }
 
@@ -512,7 +522,10 @@ impl<P: Platform> Kernel<P> {
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
         fdmarks::load(&mut d);
+        seccomp::load_state(&mut d);
+        let nnp = d.bool();
         d.finish()?;
+        syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
         let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;
@@ -747,6 +760,113 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     r
 }
 
+/// `sendfile` (`both_files` false) and `copy_file_range` (true): copy up to
+/// `count` bytes from `input` to `output`, from the offset at `in_off` (a
+/// guest pointer, updated, leaving the file's own offset alone) or the
+/// file's, and for `copy_file_range` to the one at `out_off` likewise.
+/// The input must be a regular file, as Linux has it; `copy_file_range`
+/// needs both to be. Returns the bytes copied, or an errno when none were.
+fn copy_between(
+    input: i32,
+    in_off: u64,
+    output: i32,
+    out_off: u64,
+    count: u64,
+    both_files: bool,
+) -> i64 {
+    use fwe_abi::{err, errno};
+    let regular = |fd: i32| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        let r = unsafe { libc::fstat(fd, &mut st) };
+        if r != 0 {
+            Err(host::errno_to_linux(host::last_errno()))
+        } else {
+            Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG)
+        }
+    };
+    match (regular(input), regular(output)) {
+        (Err(e), _) | (_, Err(e)) => return err(e),
+        (Ok(false), _) => return err(errno::EINVAL),
+        (_, Ok(false)) if both_files => return err(errno::EINVAL),
+        _ => {}
+    }
+    let read_off = |p: u64| -> Result<Option<i64>, i32> {
+        if p == 0 { Ok(None) } else { uaccess::read::<i64>(p).map(Some) }
+    };
+    let (mut ipos, mut opos) = match (read_off(in_off), read_off(out_off)) {
+        (Ok(i), Ok(o)) => (i, o),
+        (Err(e), _) | (_, Err(e)) => return err(e),
+    };
+    if ipos.is_some_and(|p| p < 0) || opos.is_some_and(|p| p < 0) {
+        return err(errno::EINVAL);
+    }
+    let mut buf = vec![0u8; 1 << 16];
+    let mut done: u64 = 0;
+    let mut failure = 0;
+    while done < count {
+        let want = (count - done).min(buf.len() as u64) as usize;
+        // SAFETY: `buf` holds at least `want` bytes.
+        let n = unsafe {
+            match ipos {
+                Some(p) => libc::pread(input, buf.as_mut_ptr().cast(), want, p),
+                None => libc::read(input, buf.as_mut_ptr().cast(), want),
+            }
+        };
+        if n < 0 {
+            failure = host::errno_to_linux(host::last_errno());
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        let mut sent = 0usize;
+        while sent < n as usize {
+            // SAFETY: the first `n` bytes of `buf` are initialized.
+            let w = unsafe {
+                match opos {
+                    Some(p) => libc::pwrite(
+                        output,
+                        buf[sent..].as_ptr().cast(),
+                        n as usize - sent,
+                        p + sent as i64,
+                    ),
+                    None => libc::write(output, buf[sent..].as_ptr().cast(), n as usize - sent),
+                }
+            };
+            if w <= 0 {
+                failure = if w < 0 { host::errno_to_linux(host::last_errno()) } else { errno::EIO };
+                break;
+            }
+            sent += w as usize;
+        }
+        // What was read and not written goes back to the input.
+        if sent < n as usize && ipos.is_none() {
+            // SAFETY: plain host call on the input.
+            unsafe { libc::lseek(input, -((n as usize - sent) as i64), libc::SEEK_CUR) };
+        }
+        done += sent as u64;
+        if let Some(p) = ipos.as_mut() {
+            *p += sent as i64;
+        }
+        if let Some(p) = opos.as_mut() {
+            *p += sent as i64;
+        }
+        if failure != 0 || sent < n as usize {
+            break;
+        }
+    }
+    for (ptr, pos) in [(in_off, ipos), (out_off, opos)] {
+        if let (true, Some(p)) = (ptr != 0, pos)
+            && uaccess::write(ptr, p).is_err()
+        {
+            return err(errno::EFAULT);
+        }
+    }
+    if done == 0 && failure != 0 { err(failure) } else { done as i64 }
+}
+
 /// A write to a socket whose peer has gone raises `SIGPIPE`, unless the send
 /// said `MSG_NOSIGNAL`. fwe's sockets never let the host raise it (they are
 /// all `SO_NOSIGPIPE`, so that the flag can be honoured), so it does.
@@ -754,7 +874,7 @@ fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
     use fwe_abi::nr as n;
     const MSG_NOSIGNAL: u64 = 0x4000;
     let quiet = match nr {
-        n::WRITE | n::WRITEV | n::PWRITE64 => false,
+        n::WRITE | n::WRITEV | n::PWRITE64 | n::SENDFILE => false,
         n::SENDTO => a[3] & MSG_NOSIGNAL != 0,
         n::SENDMSG => a[2] & MSG_NOSIGNAL != 0,
         _ => return,
@@ -846,6 +966,9 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PWRITE64 => host::ret(unsafe {
             libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
         } as i64),
+        n::SENDFILE => copy_between(a[1] as i32, a[2], a[0] as i32, 0, a[3], false),
+        n::COPY_FILE_RANGE if a[5] != 0 => fwe_abi::err(fwe_abi::errno::EINVAL),
+        n::COPY_FILE_RANGE => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], a[4], true),
         // SAFETY: caller guarantees the pollfd array and timeout pointers.
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // The sixth argument points to `{ const sigset_t *ss; size_t len }`.

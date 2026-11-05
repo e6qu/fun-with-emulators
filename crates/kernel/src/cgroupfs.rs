@@ -236,13 +236,12 @@ fn usage(pid: i32) -> (u64, u64, u64, u64) {
             )
         };
         if n == size {
-            // Mach absolute time is nanoseconds on Apple Silicon hosts' tick
-            // base after the timebase; proc_taskinfo reports nanoseconds.
             return (
                 t.pti_threadnum as u64,
                 t.pti_resident_size,
-                t.pti_total_user / 1000,
-                t.pti_total_system / 1000,
+                // In Mach time units: microseconds here.
+                crate::procpid::mach_to_ns(t.pti_total_user) / 1000,
+                crate::procpid::mach_to_ns(t.pti_total_system) / 1000,
             );
         }
         (1, 0, 0, 0)

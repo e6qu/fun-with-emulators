@@ -53,19 +53,32 @@ impl Data for Ipc {
     }
 }
 
-/// A network namespace: a loopback interface only.
+/// A network namespace: a loopback interface only, and its own ports
+/// ([`crate::netns`]).
 #[derive(Clone, Default, Debug)]
 pub struct Net {
     /// Whether `lo` is up (a new namespace's is down).
     pub lo_up: bool,
+    /// Each bound port, by protocol (6, 17) and number, and the host
+    /// loopback port behind it.
+    pub ports: std::collections::BTreeMap<(u8, u16), u16>,
 }
 
 impl Data for Net {
     fn encode(&self, e: &mut Enc) {
         e.bool(self.lo_up);
+        e.u64(self.ports.len() as u64);
+        for ((p, port), host) in &self.ports {
+            e.u8(*p);
+            e.u32(u32::from(*port));
+            e.u32(u32::from(*host));
+        }
     }
     fn decode(d: &mut Dec) -> Self {
-        Net { lo_up: d.bool() }
+        let lo_up = d.bool();
+        let n = d.count(9);
+        let ports = (0..n).map(|_| ((d.u8(), d.u32() as u16), d.u32() as u16)).collect();
+        Net { lo_up, ports }
     }
 }
 
@@ -197,6 +210,12 @@ impl Namespaces {
         add(self.pid.as_ref().map(|r| r.dir()));
         add(self.pid_children.as_ref().map(|r| r.dir()));
         out
+    }
+
+    /// Make these the namespaces the process's sockets act in (see
+    /// [`crate::netns`]); called whenever the process's change.
+    pub fn activate(&self) {
+        crate::netns::set_current(self.net.clone());
     }
 
     /// Write the namespaces into a fork snapshot or exec state.

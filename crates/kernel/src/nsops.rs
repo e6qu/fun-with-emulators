@@ -59,6 +59,7 @@ impl<P: Platform> Kernel<P> {
             }
         }
         crate::procreg::own_namespaces(fs.ns_dirs());
+        fs.ns.activate();
         0
     }
 
@@ -151,6 +152,9 @@ impl<P: Platform> Kernel<P> {
     /// made for it. Returns its pid, for `thread::init_main`.
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
         pidns::set_current(t.chain);
+        if let Some(fs) = self.fs.as_ref() {
+            fs.ns.activate();
+        }
         // SAFETY: getpid cannot fail.
         t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
     }

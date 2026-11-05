@@ -1211,18 +1211,85 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     root
 }
 
+/// The minirootfs of an Alpine manifest: the standard `alpine` image's
+/// root filesystem, for a container to run.
+fn alpine_image(manifest_name: &str) -> PathBuf {
+    fetched_alpine(manifest_name)
+        .into_iter()
+        .find(|f| f.to_string_lossy().contains("minirootfs"))
+        .unwrap()
+}
+
+/// What the container prints in [`alpine_crun_runs_an_image`].
+const IN_CONTAINER: &str = "echo pid $$ host $(hostname); cat /proc/self/cgroup; \
+    ls /proc | grep -E '^[0-9]+$' | head -1; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; \
+    touch /x 2>&1 | sed 's/.*: //'; mkdir /dev/shm/d 2>&1 | sed 's/.*: //'; echo $(ls /dev); \
+    echo $(awk '{print $5}' /proc/self/mountinfo); cat /etc/alpine-release";
+
 /// Alpine's crun (fetched: `guests/alpine/fetch/crun.txt`) runs the
-/// standard `alpine` image.
+/// standard `alpine` image from the spec it writes itself, with a seccomp
+/// profile added: in its own pid, network, IPC, UTS, cgroup and mount
+/// namespaces, on a read-only root with the mounts and devices the spec
+/// names, with the capabilities it keeps, `no_new_privs`, and the profile
+/// refusing `mkdirat`.
 #[test]
 fn alpine_crun_runs_an_image() {
-    let root = alpine_root("crun");
+    let root = std::env::temp_dir().join(format!("fwe-crun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("crun")).arg(&root));
+    let bundle = root.join("bundle");
+    std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+    run_checked(
+        Command::new("tar")
+            .arg("xzf")
+            .arg(alpine_image("crun"))
+            .arg("-C")
+            .arg(bundle.join("rootfs")),
+    );
     let _workload = workload();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg("--strace=failures");
-    cmd.arg(root.join("usr/bin/crun")).arg("--version");
-    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
-    eprintln!("--- crun stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    // Traced, except for the container's run: its program writes its own
+    // standard error into what the test reads.
+    let crun = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg("--cwd").arg("/bundle");
+        if args[0] != "run" {
+            cmd.arg("--strace=failures");
+        }
+        cmd.arg(root.join("usr/bin/crun")).args(args);
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        eprintln!("--- crun {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let out = crun(&["--version"]);
     assert!(stdout(&out).contains("crun version 1.17"), "{}", stdout(&out));
+    assert_eq!(crun(&["spec"]).status.code(), Some(0));
+    // The spec as crun wrote it, with no terminal, the program to run, and
+    // a seccomp profile.
+    let config = bundle.join("config.json");
+    let mut spec = std::fs::read_to_string(&config).unwrap();
+    spec = spec.replacen("\"terminal\": true", "\"terminal\": false", 1);
+    let args_at = spec.find("\"args\": [").unwrap();
+    let args_end = args_at + spec[args_at..].find(']').unwrap() + 1;
+    let quoted = format!("{IN_CONTAINER:?}");
+    spec.replace_range(args_at..args_end, &format!("\"args\": [\"/bin/sh\", \"-c\", {quoted}]"));
+    let linux_at = spec.find("\"linux\": {").unwrap() + "\"linux\": {".len();
+    spec.insert_str(
+        linux_at,
+        "\"seccomp\": {\"defaultAction\": \"SCMP_ACT_ALLOW\", \"architectures\": [\"SCMP_ARCH_AARCH64\"], \
+         \"syscalls\": [{\"names\": [\"mkdirat\"], \"action\": \"SCMP_ACT_ERRNO\", \"errnoRet\": 1}]},",
+    );
+    std::fs::write(&config, spec).unwrap();
+    let id = format!("fwe-test-{}", std::process::id());
+    let out = crun(&["run", &id]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
+         Read-only file system\nOperation not permitted\n\
+         core fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero\n\
+         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/sys\n3.20.10\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
@@ -2285,6 +2352,19 @@ fn pivot_root_makes_a_container_root() {
         "pivot: 0\numount old root: 0\nmarker: new\nold root gone: true\nproc: true\n\
          mounts: / /proc\nchild exited 0\n"
     );
+}
+
+/// A network namespace has a loopback interface, down until brought up,
+/// and ports of its own: a stream within it works, a port is taken once,
+/// other addresses are unreachable, and a port it holds is free outside.
+#[test]
+fn network_namespace_has_its_own_loopback() {
+    assert_eq!(
+        namespaces("net"),
+        "lo down: true\nlo up: true\nbound: 127.0.0.1:18080\nclient's peer: 127.0.0.1:18080\n\
+         served: ping\ntaken: true\nelsewhere: true\nnobody there: true\nchild exited 0\n"
+    );
+    assert_eq!(namespaces("net-outside"), "inside: 127.0.0.1:18082\noutside too: true\n");
 }
 
 /// `chroot` confines paths; a `clone` makes the namespaces it asks for.

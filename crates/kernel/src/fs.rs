@@ -206,7 +206,11 @@ impl Fs {
                 hostname: d.bytes(),
                 exe_fd: Some(d.i32()).filter(|&fd| fd >= 0),
             },
-            ns: crate::ns::Namespaces::load(d).unwrap_or_default(),
+            ns: {
+                let ns = crate::ns::Namespaces::load(d).unwrap_or_default();
+                ns.activate();
+                ns
+            },
         }
     }
 
@@ -244,6 +248,7 @@ impl Fs {
         self.proc_root = root;
         self.ns = crate::ns::Namespaces::load(&mut d)
             .map_err(|e| format!("joining the namespaces: errno {e}"))?;
+        self.ns.activate();
         self.republish();
         Ok(())
     }
@@ -283,6 +288,7 @@ impl Fs {
     pub fn set_proc_info(&mut self, exe: Vec<u8>, cmdline: Vec<u8>, ncpu: u32, hostname: Vec<u8>) {
         let exe = if exe.starts_with(b"/") { exe } else { normalize(&self.cwd, &exe) };
         let exe_fd = self.proc.exe_fd;
+        crate::procreg::own_program(&exe, &cmdline);
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd };
     }
 
@@ -421,6 +427,17 @@ impl Fs {
             }
             _ => return None,
         };
+        // /proc/<pid>: the reader's own is /proc/self; another, what fwe
+        // knows of it.
+        let absolute = match own_or_other(&absolute) {
+            Ok(a) => a,
+            Err((host, pid, sub)) => {
+                return Some(match host {
+                    Some(h) => crate::procpid::entry(h, pid, &sub),
+                    None => crate::procfs::Entry::Missing,
+                });
+            }
+        };
         if let Some(kind) = absolute.strip_prefix(b"/proc/self/ns/") {
             return Some(match self.ns.link(kind, self.mnt.id()) {
                 Some(link) => crate::procfs::Entry::Symlink(link),
@@ -428,6 +445,17 @@ impl Fs {
             });
         }
         match &absolute[..] {
+            b"/proc/self/stat" => {
+                let me = crate::thread::tgid();
+                // SAFETY: getpid cannot fail.
+                let host = unsafe { libc::getpid() };
+                let comm = crate::procreg::read(host).map(|r| r.comm).unwrap_or_default();
+                let h = crate::procpid::host_info(host).unwrap_or_default();
+                return Some(crate::procfs::Entry::File(crate::procpid::stat_line(me, &comm, &h)));
+            }
+            // The kernel's view of the process fills it in (see
+            // `Kernel::self_status`); its place is held here.
+            b"/proc/self/status" => return Some(crate::procfs::Entry::File(Vec::new())),
             b"/proc/self/cgroup" => {
                 let root = self.ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
                 return Some(crate::procfs::Entry::File(crate::cgroupfs::proc_self_cgroup(&root)));
@@ -512,6 +540,13 @@ impl Fs {
         self.synthetic_path(dirfd, path).as_deref() == Some(b"/proc/self/fd")
     }
 
+    /// The `/proc` path `path` names, the reader's own process as
+    /// `/proc/self`, if it is in a `proc` mount.
+    pub fn proc_path(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
+        let p = self.synthetic_path(dirfd, path)?;
+        own_or_other(&p).ok()
+    }
+
     /// The path in fwe's synthetic tree (`/proc/...`, `/sys/...`) that
     /// `path` names, if it is in a `proc` or `sysfs` mount.
     fn synthetic_path(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
@@ -539,6 +574,20 @@ impl Fs {
                 _ => None,
             };
         };
+        let absolute = match own_or_other(&absolute) {
+            Ok(a) => a,
+            Err((Some(_), pid, sub)) => return crate::procpid::children(pid, &sub),
+            Err((None, _, _)) => return None,
+        };
+        if absolute == b"/proc" {
+            let mut out = crate::procfs::children(b"/proc")?;
+            out.extend(
+                crate::procpid::listed()
+                    .into_iter()
+                    .map(|p| (p.to_string().into_bytes(), crate::procfs::DT_DIR)),
+            );
+            return Some(out);
+        }
         if absolute == b"/proc/self/fd" {
             let mut out = vec![
                 (b".".to_vec(), crate::procfs::DT_DIR),
@@ -1178,6 +1227,29 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
 /// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
 /// user's temporary directory. Unlike a tmpfs it outlives the processes,
 /// until the host clears its temporary files.
+/// A `/proc` path naming a process by pid: `Ok` with the reader's own as
+/// `/proc/self/...` (any other path unchanged), or `Err` with another's
+/// host pid (if it is in the reader's pid namespace), pid and the rest of
+/// the path.
+#[allow(clippy::type_complexity)]
+fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)> {
+    let Some(rest) = absolute.strip_prefix(b"/proc/") else { return Ok(absolute.to_vec()) };
+    let (num, sub) = match rest.iter().position(|&b| b == b'/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, &b""[..]),
+    };
+    if num.is_empty() || !num.iter().all(u8::is_ascii_digit) {
+        return Ok(absolute.to_vec());
+    }
+    let Some(pid) = std::str::from_utf8(num).ok().and_then(|n| n.parse::<i32>().ok()) else {
+        return Err((None, 0, sub.to_vec()));
+    };
+    if pid == crate::thread::tgid() {
+        return Ok([&b"/proc/self"[..], sub].concat());
+    }
+    Err((crate::pidns::to_host(pid), pid, sub.to_vec()))
+}
+
 /// The host path of the file `fd` is open on.
 pub(crate) fn host_path_of(fd: i32) -> Option<Vec<u8>> {
     fd_path(fd)

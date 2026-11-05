@@ -56,6 +56,9 @@ unsafe extern "C" {
     fn chdir(path: *const std::ffi::c_char) -> i32;
     fn syscall(n: i64, ...) -> i64;
     fn pipe(fds: *mut i32) -> i32;
+    fn socket(domain: i32, ty: i32, proto: i32) -> i32;
+    fn ioctl(fd: i32, req: u64, ...) -> i32;
+    fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn __errno_location() -> *mut i32;
@@ -98,6 +101,22 @@ fn clone_child(flags: i32, f: impl FnOnce() -> i32) -> i32 {
             _exit(f());
         }
         pid
+    }
+}
+
+/// Bring the loopback interface up, as a runtime does in a new network
+/// namespace (`SIOCSIFFLAGS` with `IFF_UP`).
+fn set_lo_up() -> bool {
+    const SIOCSIFFLAGS: u64 = 0x8914;
+    let mut ifr = [0u8; 40];
+    ifr[..2].copy_from_slice(b"lo");
+    ifr[16] = 1 | 8; // IFF_UP | IFF_LOOPBACK
+    // SAFETY: a socket for the request, and a valid ifreq.
+    unsafe {
+        let s = socket(2, 2, 0);
+        let r = ioctl(s, SIOCSIFFLAGS, ifr.as_mut_ptr());
+        close(s);
+        r == 0
     }
 }
 
@@ -319,6 +338,60 @@ fn main() {
                 std::fs::read_link(format!("/proc/self/ns/{k}")).unwrap().display().to_string()
             };
             println!("own: {} {}", ns("uts"), ns("pid"));
+        }
+        // A network namespace: a loopback interface, down until brought up,
+        // and ports of its own.
+        Some("net") => {
+            use std::io::{Read, Write};
+            let code = in_child(|| {
+                // SAFETY: plain call.
+                unsafe { unshare(CLONE_NEWNET) };
+                let down = std::net::TcpListener::bind("127.0.0.1:18080").map(|_| ()).unwrap_err();
+                println!("lo down: {:?}", down.raw_os_error() == Some(99));
+                println!("lo up: {}", set_lo_up());
+                let listener = std::net::TcpListener::bind("127.0.0.1:18080").unwrap();
+                println!("bound: {}", listener.local_addr().unwrap());
+                let mut client = std::net::TcpStream::connect("127.0.0.1:18080").unwrap();
+                println!("client's peer: {}", client.peer_addr().unwrap());
+                let (mut conn, _) = listener.accept().unwrap();
+                client.write_all(b"ping").unwrap();
+                let mut buf = [0u8; 4];
+                conn.read_exact(&mut buf).unwrap();
+                println!("served: {}", String::from_utf8_lossy(&buf));
+                let again = std::net::TcpListener::bind("0.0.0.0:18080").map(|_| ()).unwrap_err();
+                println!("taken: {}", again.raw_os_error() == Some(98));
+                let far = std::net::TcpStream::connect("10.1.2.3:80").map(|_| ()).unwrap_err();
+                println!("elsewhere: {}", far.raw_os_error() == Some(101));
+                let refused =
+                    std::net::TcpStream::connect("127.0.0.1:18081").map(|_| ()).unwrap_err();
+                println!("nobody there: {}", refused.raw_os_error() == Some(111));
+                std::io::stdout().flush().unwrap();
+                0
+            });
+            println!("child exited {code}");
+        }
+        Some("net-outside") => {
+            // The port a namespace holds is not the host's: the parent binds
+            // it while a child in its own namespace has it.
+            // SAFETY: plain calls; the child waits until killed.
+            unsafe {
+                let pid = fork();
+                if pid == 0 {
+                    unshare(CLONE_NEWNET);
+                    set_lo_up();
+                    let l = std::net::TcpListener::bind("127.0.0.1:18082").unwrap();
+                    println!("inside: {}", l.local_addr().unwrap());
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    pause();
+                    _exit(0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let outside = std::net::TcpListener::bind("127.0.0.1:18082");
+                println!("outside too: {}", outside.is_ok());
+                kill(pid, SIGKILL);
+                let mut status = 0;
+                waitpid(pid, &mut status, 0);
+            }
         }
         other => panic!("unknown scenario {other:?}"),
     }
