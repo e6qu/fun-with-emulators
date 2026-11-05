@@ -47,6 +47,12 @@ pub const HV_SYS_REG_MAIR_EL1: hv_sys_reg_t = 0xc510;
 pub const HV_SYS_REG_VBAR_EL1: hv_sys_reg_t = 0xc600;
 pub const HV_SYS_REG_CNTKCTL_EL1: hv_sys_reg_t = 0xc708;
 pub const HV_SYS_REG_TPIDR_EL0: hv_sys_reg_t = 0xde82;
+pub const HV_SYS_REG_ID_AA64PFR1_EL1: hv_sys_reg_t = 0xc021;
+pub const HV_SYS_REG_ID_AA64ISAR1_EL1: hv_sys_reg_t = 0xc031;
+/// The pointer-authentication keys: APIA, APIB, APDA, APDB, APGA, each a
+/// low and a high half.
+pub const HV_SYS_REG_PAC_KEYS: [hv_sys_reg_t; 10] =
+    [0xc108, 0xc109, 0xc10a, 0xc10b, 0xc110, 0xc111, 0xc112, 0xc113, 0xc118, 0xc119];
 
 pub const HV_MEMORY_READ: u64 = 1;
 pub const HV_MEMORY_WRITE: u64 = 2;
@@ -63,6 +69,7 @@ mod framework {
             config: hv_vm_config_t,
             ipa_bit_length: u32,
         ) -> hv_return_t;
+        pub fn hv_vm_config_get_max_ipa_size(ipa_bit_length: *mut u32) -> hv_return_t;
         pub fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t;
         pub fn hv_vm_destroy() -> hv_return_t;
         pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t;
@@ -148,6 +155,8 @@ macro_rules! calls {
 calls! {
     fn hv_vm_config_set_ipa_size(config: hv_vm_config_t, bits: u32) -> hv_return_t
         => vm_config_set_ipa_size, quiet;
+    fn hv_vm_config_get_max_ipa_size(bits: *mut u32) -> hv_return_t
+        => vm_config_get_max_ipa_size, quiet;
     fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t => vm_create, rec;
     fn hv_vm_destroy() -> hv_return_t => vm_destroy, rec;
     fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t => vm_map, rec;

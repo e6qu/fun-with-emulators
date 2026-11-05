@@ -187,6 +187,14 @@ pub mod prctl {
     pub const PR_CAPBSET_READ: u64 = 23;
     pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
     pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    /// Reset pointer-authentication keys (arm64): which, a mask of
+    /// `PR_PAC_AP*KEY`, or 0 for all.
+    pub const PR_PAC_RESET_KEYS: u64 = 54;
+    pub const PR_PAC_APIAKEY: u64 = 1 << 0;
+    pub const PR_PAC_APIBKEY: u64 = 1 << 1;
+    pub const PR_PAC_APDAKEY: u64 = 1 << 2;
+    pub const PR_PAC_APDBKEY: u64 = 1 << 3;
+    pub const PR_PAC_APGAKEY: u64 = 1 << 4;
     /// The highest capability number (`CAP_CHECKPOINT_RESTORE`).
     pub const CAP_LAST_CAP: u64 = 40;
     /// `TASK_COMM_LEN`: a thread name and its terminating NUL.

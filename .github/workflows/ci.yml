@@ -16,6 +16,7 @@ jobs:
   lint:
     name: Lint and unit tests (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -31,6 +32,9 @@ jobs:
       matrix:
         os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
+    # A full run takes about 10 minutes; a hang fails instead of holding the
+    # runner for GitHub's six hours.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -83,6 +87,7 @@ jobs:
     name: Hypervisor backend (self-hosted Apple Silicon)
     if: ${{ vars.FWE_HV_SELF_HOSTED == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 60
     env:
       # The flight recorder (docs/hypervisor.md): synchronously to a file
       # that outlives the runner's workspace, and to another machine if the

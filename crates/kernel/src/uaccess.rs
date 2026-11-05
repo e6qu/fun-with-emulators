@@ -13,53 +13,181 @@
 //! Pointers the kernel passes straight to a host system call need none of
 //! this: the host checks them and fails with its own `EFAULT`.
 //!
-//! Guest addresses are host addresses, with one exception: a backend that
-//! runs the guest in a VM can place a program image where the host process
-//! cannot map anything (the low 4 GiB on macOS), backing it with host memory
-//! elsewhere. It registers that range with [`set_translation`], and every
-//! guest address is passed through [`g2h`] before the kernel or the host
-//! touches it.
+//! Guest addresses are host addresses, with exceptions in a backend that
+//! runs the guest in a VM: it can back guest ranges with host memory
+//! elsewhere — a program image where the host process cannot map anything
+//! (the low 4 GiB on macOS), a shared mapping. It registers each such range
+//! with [`add_translation`], and every guest address is passed through
+//! [`g2h`] before the kernel or the host touches it; copies that cross from
+//! one translation into another are split where they do. Pointer arguments
+//! a system call hands the host are translated with [`host_arg`], which
+//! remembers them for the call, so a copy the kernel makes through one is
+//! taken as a copy of the guest address it came from ([`guest_of`]).
+//!
+//! Such a backend also keeps host memory accessible where the guest's is
+//! not (its guest has page tables of its own), so a bad pointer would not
+//! fault on the host: it registers a [`set_validator`] that every copy here
+//! asks first.
 
 use fwe_abi::errno;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
-/// The one translated guest range `[LO, HI)` and the host address of `LO`.
-static LO: AtomicU64 = AtomicU64::new(0);
-static HI: AtomicU64 = AtomicU64::new(0);
-static HOST: AtomicU64 = AtomicU64::new(0);
-
-/// The translated range as `(guest, len, host)`, for a fork child.
-pub fn translation() -> (u64, u64, u64) {
-    let lo = LO.load(Ordering::SeqCst);
-    (lo, HI.load(Ordering::SeqCst).saturating_sub(lo), HOST.load(Ordering::SeqCst))
+/// A translated guest range `[lo, hi)`, backed at `host`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Translation {
+    lo: u64,
+    hi: u64,
+    host: u64,
 }
 
-/// Back guest addresses `[guest, guest + len)` with host memory at `host`.
-pub fn set_translation(guest: u64, len: u64, host: u64) {
-    HI.store(0, Ordering::SeqCst);
-    LO.store(guest, Ordering::SeqCst);
-    HOST.store(host, Ordering::SeqCst);
-    HI.store(guest + len, Ordering::SeqCst);
+/// The translated ranges, sorted and disjoint.
+static TABLE: RwLock<Vec<Translation>> = RwLock::new(Vec::new());
+
+fn table() -> std::sync::RwLockReadGuard<'static, Vec<Translation>> {
+    TABLE.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether `[addr, addr + len)` straddles the edge of the translated range
-/// (partly inside, partly out): such a range has no single host address,
-/// and memory calls on it are refused.
-pub fn crosses(addr: u64, len: u64) -> bool {
-    let (lo, hi) = (LO.load(Ordering::Relaxed), HI.load(Ordering::Relaxed));
-    let end = addr.saturating_add(len);
-    lo < hi && addr < hi && end > lo && (addr < lo || end > hi)
+fn table_mut() -> std::sync::RwLockWriteGuard<'static, Vec<Translation>> {
+    TABLE.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The host address of guest address `addr` (itself, outside the translated
-/// range).
-pub fn g2h(addr: u64) -> u64 {
-    let lo = LO.load(Ordering::Relaxed);
-    if addr >= lo && addr < HI.load(Ordering::Relaxed) {
-        HOST.load(Ordering::Relaxed) + (addr - lo)
-    } else {
-        addr
+/// Every translated range as `(guest, len, host)`, for a fork child.
+pub fn translations() -> Vec<(u64, u64, u64)> {
+    table().iter().map(|t| (t.lo, t.hi - t.lo, t.host)).collect()
+}
+
+/// Back guest addresses `[guest, guest + len)` with host memory at `host`,
+/// replacing any translation of part of the range.
+pub fn add_translation(guest: u64, len: u64, host: u64) {
+    remove_translation(guest, len);
+    if len == 0 {
+        return;
     }
+    let mut t = table_mut();
+    let at = t.partition_point(|x| x.lo < guest);
+    t.insert(at, Translation { lo: guest, hi: guest + len, host });
+}
+
+/// Guest addresses `[guest, guest + len)` are their own host addresses
+/// again.
+pub fn remove_translation(guest: u64, len: u64) {
+    let end = guest.saturating_add(len);
+    let mut t = table_mut();
+    let mut out = Vec::with_capacity(t.len() + 1);
+    for x in t.iter() {
+        if x.hi <= guest || x.lo >= end {
+            out.push(*x);
+            continue;
+        }
+        if x.lo < guest {
+            out.push(Translation { lo: x.lo, hi: guest, host: x.host });
+        }
+        if x.hi > end {
+            out.push(Translation { lo: end, hi: x.hi, host: x.host + (end - x.lo) });
+        }
+    }
+    *t = out;
+}
+
+/// Take a parent's translations, in a fork child.
+pub fn set_translations(all: &[(u64, u64, u64)]) {
+    let mut t: Vec<Translation> =
+        all.iter().map(|&(g, l, h)| Translation { lo: g, hi: g + l, host: h }).collect();
+    t.sort_by_key(|x| x.lo);
+    *table_mut() = t;
+}
+
+/// Back guest addresses `[guest, guest + len)` with host memory at `host`,
+/// as the only translated range.
+pub fn set_translation(guest: u64, len: u64, host: u64) {
+    set_translations(&[(guest, len, host)]);
+}
+
+/// Whether `[addr, addr + len)` straddles the edge of a translated range
+/// (partly inside, partly out): such a range has no single host address,
+/// and memory calls on it are refused where host memory is mapped for it.
+pub fn crosses(addr: u64, len: u64) -> bool {
+    let end = addr.saturating_add(len);
+    table().iter().any(|t| addr < t.hi && end > t.lo && (addr < t.lo || end > t.hi))
+}
+
+/// The host address of guest address `addr`, and how many bytes from it
+/// on share its translation (`u64::MAX` for an untranslated run).
+fn run(addr: u64) -> (u64, u64) {
+    let t = table();
+    let i = t.partition_point(|x| x.hi <= addr);
+    match t.get(i) {
+        Some(x) if x.lo <= addr => (x.host + (addr - x.lo), x.hi - addr),
+        Some(x) => (addr, x.lo - addr),
+        None => (addr, u64::MAX),
+    }
+}
+
+/// The host address of guest address `addr` (itself, outside every
+/// translated range).
+pub fn g2h(addr: u64) -> u64 {
+    if table().is_empty() {
+        return addr;
+    }
+    run(addr).0
+}
+
+thread_local! {
+    /// The pointer arguments of the system call this thread is in that the
+    /// backend translated ([`host_arg`]), as `(host, host end, guest)`: the
+    /// kernel holds host addresses for them, which stand for those guest
+    /// addresses — and nothing else does.
+    static HOST_ARGS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The host address for pointer argument `addr` of the system call this
+/// thread is starting ([`g2h`]), remembered so the kernel's own copies
+/// through it are taken as copies of `addr` ([`guest_of`]).
+pub fn host_arg(addr: u64) -> u64 {
+    if table().is_empty() {
+        return addr;
+    }
+    let (host, room) = run(addr);
+    if host != addr {
+        HOST_ARGS.with(|h| h.borrow_mut().push((host, host.saturating_add(room), addr)));
+    }
+    host
+}
+
+/// The system call [`host_arg`] translated arguments for is over.
+pub fn clear_host_args() {
+    HOST_ARGS.with(|h| h.borrow_mut().clear());
+}
+
+/// The guest address an address the kernel holds stands for: the guest
+/// address a translated pointer argument came from, else itself.
+pub fn guest_of(addr: u64) -> u64 {
+    HOST_ARGS.with(|h| {
+        h.borrow()
+            .iter()
+            .find(|&&(lo, hi, _)| addr >= lo && addr < hi)
+            .map_or(addr, |&(lo, _, g)| g + (addr - lo))
+    })
+}
+
+/// Whether the guest may access `[addr, addr + len)` (for writing, with
+/// `write`), as the backend's registered validator says.
+type Validator = fn(u64, u64, bool) -> bool;
+
+static VALIDATOR: std::sync::OnceLock<Validator> = std::sync::OnceLock::new();
+
+/// Have every copy of guest memory first ask `f` whether the guest may
+/// access the range, failing with `EFAULT` where it may not. For a backend
+/// whose host memory stays accessible where the guest's is not.
+pub fn set_validator(f: Validator) {
+    let _ = VALIDATOR.set(f);
+}
+
+/// Whether the guest may access `[addr, addr + len)` (writing, with
+/// `write`): always, without a validator (the host faults instead).
+pub fn valid(addr: u64, len: u64, write: bool) -> bool {
+    len == 0 || VALIDATOR.get().is_none_or(|f| f(addr, len, write))
 }
 
 /// The longest path the kernel reads, with its terminator (Linux's
@@ -153,25 +281,51 @@ fn check(ok: bool) -> Result<()> {
     if ok { Ok(()) } else { Err(errno::EFAULT) }
 }
 
+/// Copy between guest range `[addr, addr + len)` and fwe's buffer `buf`,
+/// run by run of one translation: into the guest with `to_guest`.
+///
+/// # Safety
+/// `buf` must be valid for `len` bytes.
+unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Result<()> {
+    let addr = guest_of(addr);
+    check(valid(addr, len as u64, to_guest))?;
+    let mut done = 0usize;
+    while done < len {
+        let at = addr + done as u64;
+        let (host, room) = run(at);
+        let n = (len - done).min(room.min(usize::MAX as u64) as usize);
+        // SAFETY: `buf + done` has `n` bytes (the caller's guarantee); the
+        // guest side was validated and faults are recovered.
+        let ok = unsafe {
+            if to_guest {
+                imp::copy(host as *mut u8, buf.add(done), n)
+            } else {
+                imp::copy(buf.add(done), host as *const u8, n)
+            }
+        };
+        check(ok)?;
+        done += n;
+    }
+    Ok(())
+}
+
 /// Copy `dst.len()` bytes from guest address `addr`.
 pub fn read_into(addr: u64, dst: &mut [u8]) -> Result<()> {
-    // SAFETY: `dst` is fwe's own buffer; the guest side is checked.
-    check(unsafe { imp::copy(dst.as_mut_ptr(), g2h(addr) as *const u8, dst.len()) })
+    // SAFETY: `dst` is fwe's own buffer of that length.
+    unsafe { copy_guest(addr, dst.as_mut_ptr(), dst.len(), false) }
 }
 
 /// Copy `src` to guest address `addr`.
 pub fn write_from(addr: u64, src: &[u8]) -> Result<()> {
-    // SAFETY: `src` is fwe's own buffer; the guest side is checked.
-    check(unsafe { imp::copy(g2h(addr) as *mut u8, src.as_ptr(), src.len()) })
+    // SAFETY: `src` is fwe's own buffer of that length; it is only read.
+    unsafe { copy_guest(addr, src.as_ptr() as *mut u8, src.len(), true) }
 }
 
 /// Read a `T` from guest address `addr`.
 pub fn read<T: Copy>(addr: u64) -> Result<T> {
     let mut v = std::mem::MaybeUninit::<T>::uninit();
-    // SAFETY: `v` is `size_of::<T>()` writable bytes; the guest side is
-    // checked.
-    let ok = unsafe { imp::copy(v.as_mut_ptr().cast(), g2h(addr) as *const u8, size_of::<T>()) };
-    check(ok)?;
+    // SAFETY: `v` is `size_of::<T>()` writable bytes.
+    unsafe { copy_guest(addr, v.as_mut_ptr().cast(), size_of::<T>(), false) }?;
     // SAFETY: fully written by the copy; the kernel only reads plain-data
     // ABI types, for which any bit pattern is valid.
     Ok(unsafe { v.assume_init() })
@@ -179,9 +333,8 @@ pub fn read<T: Copy>(addr: u64) -> Result<T> {
 
 /// Write `value` to guest address `addr`.
 pub fn write<T: Copy>(addr: u64, value: T) -> Result<()> {
-    // SAFETY: `value` is a readable `T`; the guest side is checked.
-    let ok = unsafe { imp::copy(g2h(addr) as *mut u8, (&raw const value).cast(), size_of::<T>()) };
-    check(ok)
+    // SAFETY: `value` is a readable `T`; it is only read.
+    unsafe { copy_guest(addr, (&raw const value) as *mut u8, size_of::<T>(), true) }
 }
 
 /// Read `len` bytes from guest address `addr`.
@@ -240,19 +393,27 @@ pub fn read_cstr_array(addr: u64, max_each: usize) -> Result<Vec<Vec<u8>>> {
 }
 
 /// A guest `iovec` array of `count` entries at `addr`, with each buffer's
-/// address translated, ready to hand to the host.
-pub fn host_iovecs(addr: u64, count: u64) -> Result<Vec<libc::iovec>> {
+/// address translated, ready to hand to the host, which writes into the
+/// buffers with `write`. Each buffer must be guest memory (`EFAULT`), in
+/// one translated range or none (`EINVAL`: the host is given one address
+/// for it).
+pub fn host_iovecs(addr: u64, count: u64, write: bool) -> Result<Vec<libc::iovec>> {
     if count > 1024 {
         return Err(errno::EINVAL);
     }
     let raw = read_bytes(addr, count as usize * 16)?;
-    Ok(raw
-        .chunks_exact(16)
-        .map(|c| libc::iovec {
-            iov_base: g2h(u64::from_ne_bytes(c[0..8].try_into().unwrap())) as *mut libc::c_void,
-            iov_len: u64::from_ne_bytes(c[8..16].try_into().unwrap()) as usize,
-        })
-        .collect())
+    let mut out = Vec::with_capacity(count as usize);
+    for c in raw.chunks_exact(16) {
+        let base = u64::from_ne_bytes(c[0..8].try_into().unwrap());
+        let len = u64::from_ne_bytes(c[8..16].try_into().unwrap());
+        // An empty buffer is never touched, as on Linux.
+        check(len == 0 || valid(base, len, write))?;
+        if crosses(base, len) {
+            return Err(errno::EINVAL);
+        }
+        out.push(libc::iovec { iov_base: g2h(base) as *mut libc::c_void, iov_len: len as usize });
+    }
+    Ok(out)
 }
 
 /// Which arguments of system call `nr` are pointers to guest memory the
@@ -320,11 +481,14 @@ pub fn pointer_args(nr: u64) -> u8 {
 }
 
 /// [`pointer_args`] for a `futex` call with operation `op`: argument 3 is
-/// a timeout pointer for the waits, a count for the requeues and `WAKE_OP`.
+/// a timeout pointer for the waits, a count for the requeues and `WAKE_OP`;
+/// argument 4 a second word for those, unused by the wakes.
 pub fn futex_pointer_args(op: u64) -> u8 {
     use fwe_abi::futex::*;
     match op & FUTEX_CMD_MASK {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => 0b1001,
+        // A wake uses only the word: the other arguments may hold anything.
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => 0b1,
         _ => 0b1_0001,
     }
 }
@@ -364,6 +528,42 @@ macro_rules! guest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guest ranges in the low 4 GiB, which no test's real memory uses, so
+    /// tests running alongside are not affected.
+    #[test]
+    fn translated_ranges_split_copies_where_they_meet() {
+        let a = vec![0xaau8; 0x2000];
+        let b = vec![0xbbu8; 0x1000];
+        add_translation(0x1_0000, 0x2000, a.as_ptr() as u64);
+        add_translation(0x1_2000, 0x1000, b.as_ptr() as u64);
+        assert_eq!(g2h(0x1_0010), a.as_ptr() as u64 + 0x10);
+        assert_eq!(g2h(0x1_2004), b.as_ptr() as u64 + 4);
+        assert_eq!(g2h(0x9_0000), 0x9_0000, "untranslated");
+        let mut got = [0u8; 32];
+        read_into(0x1_1ff0, &mut got).unwrap();
+        assert_eq!(&got[..16], &[0xaa; 16]);
+        assert_eq!(&got[16..], &[0xbb; 16]);
+        assert!(crosses(0x1_2800, 0x1000));
+        assert!(crosses(0x1_0000, 0x3000), "no single host address for both");
+        assert!(!crosses(0x1_0000, 0x2000));
+        // Removing the middle of one splits it.
+        remove_translation(0x1_0800, 0x800);
+        assert_eq!(g2h(0x1_0900), 0x1_0900);
+        assert_eq!(g2h(0x1_1004), a.as_ptr() as u64 + 0x1004);
+        // A translated pointer argument stands for its guest address, and
+        // copies through it are copies of the guest's memory.
+        let h = host_arg(0x1_1000);
+        assert_eq!(h, a.as_ptr() as u64 + 0x1000);
+        assert_eq!(guest_of(h + 8), 0x1_1008);
+        let mut one = [0u8; 4];
+        read_into(h, &mut one).unwrap();
+        assert_eq!(one, [0xaa; 4]);
+        clear_host_args();
+        assert_eq!(guest_of(h + 8), h + 8);
+        remove_translation(0x1_0000, 0x3000);
+        assert!(translations().iter().all(|&(g, _, _)| !(0x1_0000..0x1_0000_0000).contains(&g)));
+    }
 
     #[test]
     fn round_trips_values_and_strings() {

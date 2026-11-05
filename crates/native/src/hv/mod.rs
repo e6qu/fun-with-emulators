@@ -8,19 +8,21 @@
 //! `TPIDR_EL0` are simply the guest's. System calls go to the same kernel
 //! layer as the native backend's.
 //!
-//! Guest memory is host memory mapped into the VM. Everything the guest maps
-//! itself — its stack, break, `mmap`s, the dynamic linker — is mapped at the
-//! same address in the VM as in the host, so guest pointers are host
-//! pointers. Only the executable's image, at the low address the host cannot
-//! map, lives elsewhere in the host; that one range is registered with
-//! [`fwe_kernel::uaccess::set_translation`], and guest pointers into it are
-//! translated wherever the kernel or a host call uses them.
+//! The VM's stage 2 is set up once (the slab and fwe's region, see [`vm`])
+//! and does not change while it runs; the guest's own page tables
+//! ([`pagetables`]) decide what it sees, and its memory system calls edit
+//! them ([`mem`]). Private guest memory is slab memory, at the same address
+//! as guest and host address unless the guest placed it outside the slab
+//! (the executable's image at its low link address), when it is translated
+//! ([`fwe_kernel::uaccess::add_translation`]) wherever the kernel or a host
+//! call uses a guest pointer; every such pointer is checked against the
+//! guest's mappings first.
 //!
 //! Each guest thread runs on a vCPU of its own; `execve` re-executes fwe.
 //! A VM process never forks on the host and never ends or execs with its VM
 //! alive (see `docs/hypervisor.md`): a guest `fork` or `vfork` starts a
-//! fresh fwe process that takes the parent's memory copy-on-write (see
-//! [`fork`]).
+//! fresh fwe process that takes a copy of the parent's memory, or for
+//! `vfork` fetches it as it goes (see [`fork`]).
 //!
 //! Under `--hv-standin` every framework call goes to a software stand-in
 //! instead ([`standin`]), which creates no VM: what the tests use unless
@@ -32,6 +34,11 @@ mod backend;
 mod ffi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod fork;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod mem;
+// Pure table logic: unit-tested on every host.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+mod pagetables;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod probe;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

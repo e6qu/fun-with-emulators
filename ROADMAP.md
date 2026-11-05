@@ -103,7 +103,13 @@ Remaining:
 - [x] In the VM: threads, and `execve` between the VM and the native backend
   either way (fwe re-executes itself on the new program)
 - [x] In the VM: `fork` and `vfork`: the child is a fresh fwe process given
-  the parent's memory copy-on-write and its kernel state
+  a copy of the parent's memory (a `vfork` child fetching it as it goes and
+  sending back what it changed) and its kernel state
+- [x] The VM's memory as the runtimes that run Linux programs this way
+  without trouble keep it: stage 2 mapped once, the guest's own 4 KiB page
+  tables for every mapping change, no private page in two VMs; pointer
+  authentication and BTI as Linux sets them up, where the VM offers them
+  (verified on the stand-in; a real-hardware run is still to come)
 - [ ] Python from the Debian rootfs (carried over from M1)
 - [x] `execveat` and `clone3`; virtual credentials, `RLIMIT_NOFILE` and the
   umask carried across an `execve` that re-executes fwe

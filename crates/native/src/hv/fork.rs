@@ -3,44 +3,42 @@
 //! A host `fork` of a VM process is out of the question: the child could not
 //! use the VM it copied, and a VM process must never fork (see
 //! `docs/hypervisor.md`). Instead the child is a fresh fwe process, started
-//! with `posix_spawn`, that receives the parent's memory copy-on-write and
-//! its kernel state, builds a VM of its own around them and resumes the
-//! guest where the parent called `fork`, with `x0` = 0.
+//! with `posix_spawn`, that receives the parent's memory and kernel state,
+//! builds a VM of its own around them and resumes the guest where the
+//! parent called `fork`, with `x0` = 0. No page of private memory is ever
+//! in both processes' VMs: the runtimes that run Linux programs this way
+//! without trouble never share one either.
 //!
-//! - **Memory.** All guest memory lives in one host address window
-//!   ([`super::window`]). For each region in it the parent takes a Mach
-//!   memory entry: `MAP_MEM_VM_COPY` for private memory, a copy-on-write
-//!   snapshot that costs nothing until either side writes a page, and
-//!   `MAP_MEM_VM_SHARE` for `MAP_SHARED` memory, which stays shared. The
-//!   child maps each entry at the same address, inside its own reservation
-//!   of the window, and maps the VM's guest ranges onto them as the parent's
-//!   are.
+//! - **Memory.** The child reserves the slab at the same address
+//!   ([`super::window`]) and takes the parent's records of its mappings
+//!   ([`super::mem`]), from which it fills its own page tables. A `fork`
+//!   child is sent a copy of every page of the slab that exists (copying
+//!   is about fifty times cheaper than an APFS file clone, which writes the
+//!   memory to disk), with the parent's vCPUs stopped, so it sees one
+//!   instant. A `vfork` child is sent nothing up front: its private pages
+//!   are unmapped until it touches them, when it fetches them from the
+//!   parent, whose waiting thread serves it; before it execs or ends it
+//!   sends back the bytes it changed, and the parent resumes once they are
+//!   in its memory, so what a vfork child writes the parent sees, as on
+//!   Linux. Shared memory (`MAP_SHARED`) is passed as its file, which the
+//!   child maps: those pages are in both VMs, as Linux shares them.
 //! - **Hand-off.** The parent gives the child a receive right of its own as
 //!   its bootstrap port. The child sends a request there; the reply carries
-//!   the memory entries, the real bootstrap port (which the child puts back)
-//!   and the state as out-of-line data.
+//!   the real bootstrap port (which the child puts back) and the state as
+//!   out-of-line data. The memory goes over a socket pair.
 //! - **State.** The kernel's own ([`fwe_kernel::Kernel::save_for_fork`]),
 //!   then what the backend holds: the forking thread's registers and thread
-//!   pointer, the VM's mappings and the memory regions.
+//!   pointer, the memory records and the slab's use.
 //! - **Descriptors.** Every descriptor is inherited, close-on-exec ones
 //!   too (their flag is cleared for the spawn and set back on both sides),
 //!   except kqueues, which the host never passes on: the kernel rebuilds
 //!   the ones behind `epoll` and `timerfd`.
-//! - **Consistency.** The parent takes the snapshot with the kernel lock
-//!   held and every other vCPU stopped, so the child sees one instant of the
-//!   process, as Linux's fork copies the address space atomically.
-//!
-//! The parent returns once the child has its memory and state and is about
-//! to run (a pipe carries its word); a `vfork` parent waits on, until the
-//! child execs or exits. A `vfork` child is given every region as a share
-//! (`MAP_MEM_VM_SHARE`), so what it writes before then the parent sees, as
-//! on Linux.
 
 use super::backend::{self, HvPlatform};
-use super::{vm, window};
+use super::{mem, vm, window};
 use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::snapshot::{Dec, Enc};
-use fwe_kernel::{FpRegs, Kernel, Regs, fdtable, host, mm, thread, uaccess};
+use fwe_kernel::{FpRegs, Kernel, Regs, fdtable, host, thread, uaccess};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // --- Mach ---------------------------------------------------------------
@@ -63,13 +61,6 @@ const MACH_RCV_TIMED_OUT: i32 = 0x1000_4003;
 const MACH_MSG_VIRTUAL_COPY: u32 = 1;
 const MACH_MSG_OOL_DESCRIPTOR: u32 = 1;
 const MACH_MSG_OOL_PORTS_DESCRIPTOR: u32 = 2;
-const MAP_MEM_VM_COPY: i32 = 0x20_0000;
-const MAP_MEM_VM_SHARE: i32 = 0x40_0000;
-const VM_PROT_READ: i32 = 1;
-const VM_PROT_WRITE: i32 = 2;
-const VM_FLAGS_OVERWRITE: i32 = 0x4000;
-const VM_INHERIT_SHARE: u32 = 0;
-const VM_INHERIT_COPY: u32 = 1;
 
 /// `mach_msg_header_t`.
 #[repr(C, packed(4))]
@@ -94,8 +85,7 @@ struct Ool {
     count: u32,
 }
 
-/// The parent's reply: the ports (the real bootstrap port, then one memory
-/// entry per region) and the state.
+/// The parent's reply: the ports (the real bootstrap port) and the state.
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 struct Handoff {
@@ -130,27 +120,6 @@ unsafe extern "C" {
         timeout: u32,
         notify: Port,
     ) -> i32;
-    fn mach_make_memory_entry_64(
-        task: Port,
-        size: *mut u64,
-        offset: u64,
-        permission: i32,
-        handle: *mut Port,
-        parent: Port,
-    ) -> i32;
-    fn mach_vm_map(
-        task: Port,
-        address: *mut u64,
-        size: u64,
-        mask: u64,
-        flags: i32,
-        object: Port,
-        offset: u64,
-        copy: i32,
-        cur: i32,
-        max: i32,
-        inheritance: u32,
-    ) -> i32;
     fn mach_vm_deallocate(task: Port, address: u64, size: u64) -> i32;
     fn posix_spawnattr_setspecialport_np(
         attr: *mut libc::posix_spawnattr_t,
@@ -183,100 +152,111 @@ const HANDOFF_TIMEOUT_MS: u32 = 10_000;
 
 // --- What the child is given ----------------------------------------------
 
-/// A host memory region the child maps at the same address.
-struct Region {
-    addr: u64,
-    size: u64,
-    /// Host protections, `PROT_*` (the same bits as `VM_PROT_*`).
-    prot: i32,
-    /// The protections the entry carries, the most the child may use.
-    max: i32,
-    /// `MAP_SHARED` memory: parent and child keep sharing it.
-    shared: bool,
+/// Bytes per write of the memory a `fork` child is sent.
+const STREAM_CHUNK: u64 = 1 << 20;
+
+fn task_page_query(addr: u64, size: u64, out: &mut [i32]) -> bool {
+    unsafe extern "C" {
+        fn mach_vm_page_range_query(
+            task: Port,
+            addr: u64,
+            size: u64,
+            dispositions: u64,
+            count: *mut u64,
+        ) -> i32;
+    }
+    let mut n = out.len() as u64;
+    // SAFETY: room for `n` dispositions, one per host page of the range.
+    unsafe { mach_vm_page_range_query(task(), addr, size, out.as_mut_ptr() as u64, &mut n) == 0 }
 }
 
-/// One memory entry per region of guest memory, with the regions. Private
-/// memory is snapshotted copy-on-write, shared memory shared; for a `vfork`
-/// child (`share_all`) writable private memory is shared too, while each
-/// region keeps its kind for the child's own later forks. A region the host has made
-/// unreadable is made readable for the moment it takes.
-fn take_memory(share_all: bool) -> Result<(Vec<Region>, Vec<Port>), String> {
-    // The child can only rebuild a VM whose memory is all in the window.
-    let used = window::used_ranges();
-    for (guest, len, _, host) in vm::mapping_list() {
-        let covered = used.range(..=host).next_back().is_some_and(|(_, &end)| end >= host + len);
-        if !covered {
-            return Err(format!(
-                "guest memory at {guest:#x} lies outside fwe's window, so it cannot be handed on"
-            ));
+/// Send a `fork` child every page of the slab that exists (untouched
+/// pages are zero in the child too), as `(address, length, bytes)` runs,
+/// then `(0, 0)`.
+fn stream_memory(sock: i32) -> Result<(), String> {
+    const HOST_PAGE: u64 = 16 << 10;
+    let send = |addr: u64, len: u64| -> Result<(), String> {
+        let mut hdr = [0u8; 16];
+        hdr[..8].copy_from_slice(&addr.to_le_bytes());
+        hdr[8..].copy_from_slice(&len.to_le_bytes());
+        // SAFETY: the parent's slab memory, always readable.
+        let data = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
+        if write_all(sock, &hdr) && write_all(sock, data) {
+            Ok(())
+        } else {
+            Err("sending memory to the child failed".into())
         }
-    }
-    let mut regions = Vec::new();
-    let mut entries = Vec::new();
+    };
     for (start, end) in window::used_ranges() {
-        let mut at = start;
+        let mut at = start & !(HOST_PAGE - 1);
         while at < end {
-            let Some(r) = mm::region::query(at) else { break };
-            if r.start >= end {
-                break;
+            let span = (end - at).min(STREAM_CHUNK.max(HOST_PAGE));
+            let pages = span.div_ceil(HOST_PAGE) as usize;
+            let mut disp = vec![0i32; pages];
+            if !task_page_query(at, pages as u64 * HOST_PAGE, &mut disp) {
+                disp.iter_mut().for_each(|d| *d = 1);
             }
-            let (lo, hi) = (r.start.max(at), (r.start + r.size).min(end));
-            at = hi;
-            let prot = r.protection & (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
-            let shared = !r.private();
-            if prot & libc::PROT_READ == 0 {
-                // SAFETY: briefly readable, with every vCPU stopped and the
-                // kernel lock held; restored below.
-                unsafe { libc::mprotect(lo as *mut _, (hi - lo) as usize, libc::PROT_READ) };
-            }
-            // A vfork child shares the parent's writable memory, so what it
-            // writes reaches the parent. Read-only memory (the program's
-            // code and constants) is copied as for a fork: a shared entry
-            // of it can only be read, and the child could not map it into
-            // its VM.
-            let writable = prot & libc::PROT_WRITE != 0;
-            let mode =
-                if shared || share_all && writable { MAP_MEM_VM_SHARE } else { MAP_MEM_VM_COPY };
-            let mut entry = 0;
-            let mut max = VM_PROT_READ | VM_PROT_WRITE;
-            let mut kr = KERN_SUCCESS;
-            for want in [VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ] {
-                let mut size = hi - lo;
-                // SAFETY: an entry for a range of this task's own memory.
-                kr = unsafe {
-                    mach_make_memory_entry_64(task(), &mut size, lo, mode | want, &mut entry, 0)
-                };
-                if kr == KERN_SUCCESS && size != hi - lo {
-                    // SAFETY: dropping the entry, which does not cover the region.
-                    unsafe { mach_port_deallocate(task(), entry) };
-                    kr = -1;
-                    break;
+            let mut i = 0;
+            while i < pages {
+                if disp[i] == 0 {
+                    i += 1;
+                    continue;
                 }
-                if kr == KERN_SUCCESS {
-                    max = want;
-                    break;
+                let j = (i..pages).find(|&k| disp[k] == 0).unwrap_or(pages);
+                let lo = (at + i as u64 * HOST_PAGE).max(start);
+                let hi = (at + j as u64 * HOST_PAGE).min(end);
+                if hi > lo {
+                    send(lo, hi - lo)?;
                 }
+                i = j;
             }
-            if prot & libc::PROT_READ == 0 {
-                // SAFETY: putting back the protections the region had.
-                unsafe { libc::mprotect(lo as *mut _, (hi - lo) as usize, prot) };
-            }
-            if kr != KERN_SUCCESS {
-                release_ports(&entries);
-                return Err(format!("snapshotting memory at {lo:#x} failed ({kr:#x})"));
-            }
-            regions.push(Region { addr: lo, size: hi - lo, prot, max, shared });
-            entries.push(entry);
+            at += pages as u64 * HOST_PAGE;
         }
     }
-    Ok((regions, entries))
+    if write_all(sock, &[0u8; 16]) {
+        Ok(())
+    } else {
+        Err("sending memory to the child failed".into())
+    }
 }
 
-fn release_ports(ports: &[Port]) {
-    for &p in ports {
-        // SAFETY: dropping a send right this task holds.
-        unsafe { mach_port_deallocate(task(), p) };
+/// Receive the memory [`stream_memory`] sends into this child's slab.
+fn receive_memory(sock: i32) -> Result<(), String> {
+    loop {
+        let mut hdr = [0u8; 16];
+        if !mem::recv_all(sock, &mut hdr) {
+            return Err("receiving the parent's memory failed".into());
+        }
+        let addr = u64::from_le_bytes(hdr[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(hdr[8..].try_into().unwrap());
+        if len == 0 {
+            return Ok(());
+        }
+        if !window::contains(addr, len) {
+            return Err(format!("the parent sent memory outside the slab ({addr:#x}+{len:#x})"));
+        }
+        // SAFETY: this child's own slab memory, at the parent's address.
+        let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len as usize) };
+        if !mem::recv_all(sock, dst) {
+            return Err("receiving the parent's memory failed".into());
+        }
+        mem::code_written(addr, len);
     }
+}
+
+fn write_all(fd: i32, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        // SAFETY: writing our buffer to our socket.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 && host::last_errno() == libc::EINTR {
+            continue;
+        }
+        if n <= 0 {
+            return false;
+        }
+        buf = &buf[n as usize..];
+    }
+    true
 }
 
 fn save_regs(e: &mut Enc, r: &Regs) {
@@ -343,7 +323,7 @@ fn guarded(fd: i32, kind: u32) -> bool {
 /// The host descriptors to hand down, with their close-on-exec flags:
 /// everything open except kqueues, guarded descriptors, `skip` and a vfork
 /// parent's pipe.
-fn descriptors(skip: i32) -> Vec<(i32, bool)> {
+fn descriptors(skip: &[i32]) -> Vec<(i32, bool)> {
     let vfork_word = VFORK_WORD.load(Ordering::SeqCst);
     // The flight recorder's and the stand-in's: the child opens its own.
     let mut own = super::record::own_fds();
@@ -364,7 +344,7 @@ fn descriptors(skip: i32) -> Vec<(i32, bool)> {
         .iter()
         .filter(|f| {
             f.proc_fdtype != libc::PROX_FDTYPE_KQUEUE as u32
-                && f.proc_fd != skip
+                && !skip.contains(&f.proc_fd)
                 && f.proc_fd != vfork_word
                 && !own.contains(&f.proc_fd)
                 && !guarded(f.proc_fd, f.proc_fdtype)
@@ -402,65 +382,73 @@ pub(super) fn fork(
         return host::last_error();
     }
     let word = [fdtable::reserve(word[0]), fdtable::reserve(word[1])];
+    // The memory's channel; the child's end is handed on like any
+    // descriptor.
+    let mut sv = [-1i32; 2];
+    // SAFETY: plain host call with a 2-element array.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
+        let e = host::last_error();
+        // SAFETY: closing the pipe made above.
+        unsafe {
+            libc::close(word[0]);
+            libc::close(word[1]);
+        }
+        return e;
+    }
+    let sv = [fdtable::reserve(sv[0]), fdtable::reserve(sv[1])];
     let spawned = {
-        // One instant of the process: every other vCPU stopped while memory
-        // and state are captured. The descriptors stay as captured until
-        // the child holds them, as the kernel lock keeps every close out.
+        // One instant of the process: every other vCPU stopped while the
+        // state is captured — and, for a fork, the memory copied. The
+        // descriptors stay as captured until the child holds them, as the
+        // kernel lock keeps every close out.
         backend::pause_others();
-        let taken = take_memory(vfork);
         let mut e = Enc::new();
-        if let Ok((regions, _)) = &taken {
-            save_regs(&mut e, parent);
-            e.u64(tpidr);
-            e.u64(vtimer_offset);
-            e.u64(flags);
-            e.u64(child_stack);
-            e.u64(child_tid);
-            e.bool(vfork);
-            e.i32(word[1]);
-            let maps = vm::mapping_list();
-            e.u64(maps.len() as u64);
-            for (guest, len, prot, host) in maps {
-                for v in [guest, len, prot, host] {
-                    e.u64(v);
-                }
-            }
-            e.map(&window::used_ranges());
-            e.u64(regions.len() as u64);
-            for r in regions {
-                e.u64(r.addr);
-                e.u64(r.size);
-                e.i32(r.prot);
-                e.i32(r.max);
-                e.bool(r.shared);
-            }
-            k.save_for_fork(&mut e);
+        save_regs(&mut e, parent);
+        for k in backend::thread_keys() {
+            e.u64(k);
         }
-        backend::resume_others();
-        match taken {
-            Ok((_, entries)) => {
-                let fds = descriptors(word[0]);
-                let mut e2 = Enc::new();
-                e2.u64(STATE_MAGIC);
-                e2.u64(build_id());
-                e2.u64(fds.len() as u64);
-                for &(fd, cloexec) in &fds {
-                    e2.i32(fd);
-                    e2.bool(cloexec);
-                }
-                let mut state = e2.into_bytes();
-                state.extend_from_slice(&e.into_bytes());
-                let r = spawn_child(&fds, &entries, &state);
-                release_ports(&entries);
-                if let Ok(pid) = r {
-                    let what = if vfork { b"vfork child" } else { b"fork child " };
-                    super::record::Line::new().bytes(what).s(" ").dec(pid as u64).emit();
-                }
-                r
-            }
-            Err(msg) => Err(msg),
+        e.u64(tpidr);
+        e.u64(vtimer_offset);
+        e.u64(flags);
+        e.u64(child_stack);
+        e.u64(child_tid);
+        e.bool(vfork);
+        e.i32(word[1]);
+        e.i32(sv[1]);
+        e.map(&window::used_ranges());
+        if let Some(m) = mem::mem().as_ref() {
+            m.save(&mut e);
         }
+        k.save_for_fork(&mut e);
+        if vfork {
+            // A vfork child fetches memory as it goes; the parent's other
+            // threads go on meanwhile, as on Linux.
+            backend::resume_others();
+        }
+        let fds = descriptors(&[word[0], sv[0]]);
+        let mut e2 = Enc::new();
+        e2.u64(STATE_MAGIC);
+        e2.u64(build_id());
+        e2.u64(fds.len() as u64);
+        for &(fd, cloexec) in &fds {
+            e2.i32(fd);
+            e2.bool(cloexec);
+        }
+        let mut state = e2.into_bytes();
+        state.extend_from_slice(&e.into_bytes());
+        let r = spawn_child(&fds, &state)
+            .and_then(|pid| if vfork { Ok(pid) } else { stream_memory(sv[0]).map(|()| pid) });
+        if !vfork {
+            backend::resume_others();
+        }
+        if let Ok(pid) = r {
+            let what = if vfork { b"vfork child" } else { b"fork child " };
+            super::record::Line::new().bytes(what).s(" ").dec(pid as u64).emit();
+        }
+        r
     };
+    // SAFETY: the child holds its own copy of the socket's end.
+    unsafe { libc::close(sv[1]) };
     // SAFETY: the child holds its own copy of the write end.
     unsafe { libc::close(word[1]) };
     drop(guard);
@@ -468,18 +456,27 @@ pub(super) fn fork(
         Ok(pid) => pid,
         Err(msg) => {
             note(&format!("fork failed: {msg}"));
-            // SAFETY: closing the read end opened above.
-            unsafe { libc::close(word[0]) };
+            // SAFETY: closing the read end and the socket opened above.
+            unsafe {
+                libc::close(word[0]);
+                libc::close(sv[0]);
+            }
             return err(errno::EAGAIN);
         }
     };
     let ready = read_byte(word[0]);
     if ready && vfork {
-        // Linux suspends a vfork parent until the child execs or exits.
+        // Linux suspends a vfork parent until the child execs or exits;
+        // meanwhile it serves the child's memory, and takes back what the
+        // child changed before going on.
+        mem::serve_vfork_child(sv[0]);
         while read_byte(word[0]) {}
     }
-    // SAFETY: closing the read end opened above.
-    unsafe { libc::close(word[0]) };
+    // SAFETY: closing the read end and the socket opened above.
+    unsafe {
+        libc::close(word[0]);
+        libc::close(sv[0]);
+    }
     if !ready {
         // The child ended before it could run: reap it; the fork failed.
         let mut status = 0;
@@ -513,8 +510,8 @@ fn read_byte(fd: i32) -> bool {
     }
 }
 
-/// Start `fwe --hv-fork-child` with `fds` and hand it `entries` and `state`.
-fn spawn_child(fds: &[(i32, bool)], entries: &[Port], state: &[u8]) -> Result<i32, String> {
+/// Start `fwe --hv-fork-child` with `fds` and hand it `state`.
+fn spawn_child(fds: &[(i32, bool)], state: &[u8]) -> Result<i32, String> {
     let Some(fwe) = crate::FWE_EXE.get() else { return Err("fwe's own path is unknown".into()) };
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(fwe.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
@@ -594,7 +591,7 @@ fn spawn_child(fds: &[(i32, bool)], entries: &[Port], state: &[u8]) -> Result<i3
         destroy_rx();
         return Err(format!("posix_spawn failed: {}", std::io::Error::from_raw_os_error(rc)));
     }
-    let r = hand_off(rx, pid, entries, state);
+    let r = hand_off(rx, pid, state);
     destroy_rx();
     match r {
         Ok(()) => Ok(pid),
@@ -610,7 +607,7 @@ fn spawn_child(fds: &[(i32, bool)], entries: &[Port], state: &[u8]) -> Result<i3
 }
 
 /// Wait for the child's request on `rx` and answer it.
-fn hand_off(rx: Port, pid: i32, entries: &[Port], state: &[u8]) -> Result<(), String> {
+fn hand_off(rx: Port, pid: i32, state: &[u8]) -> Result<(), String> {
     let mut request = Received { message: Header::default(), trailer: [0; 64] };
     let mut waited = 0;
     loop {
@@ -649,9 +646,7 @@ fn hand_off(rx: Port, pid: i32, entries: &[Port], state: &[u8]) -> Result<(), St
     let mut real_bootstrap: Port = 0;
     // SAFETY: reading this task's own bootstrap port.
     unsafe { task_get_special_port(task(), TASK_BOOTSTRAP_PORT, &mut real_bootstrap) };
-    let mut ports = Vec::with_capacity(entries.len() + 1);
-    ports.push(real_bootstrap);
-    ports.extend_from_slice(entries);
+    let ports = [real_bootstrap];
     let mut reply = Handoff {
         header: Header {
             bits: MACH_MSG_TYPE_MOVE_SEND_ONCE | MACH_MSGH_BITS_COMPLEX,
@@ -715,16 +710,17 @@ pub fn child() -> ! {
 }
 
 fn become_child() -> Result<std::convert::Infallible, String> {
-    // The window first, before anything else could take its addresses.
-    window::reserve()?;
+    // The slab first, before anything else could take its addresses.
+    let layout = vm::layout()?;
+    window::reserve(layout.slab)?;
     let (ports, state) = receive()?;
-    let (bootstrap, entries) = ports.split_first().ok_or("no ports in the hand-off")?;
+    let bootstrap = *ports.first().ok_or("no ports in the hand-off")?;
     // SAFETY: putting back the real bootstrap port, so services resolve.
     unsafe {
         let mut parent_rx: Port = 0;
         task_get_special_port(task(), TASK_BOOTSTRAP_PORT, &mut parent_rx);
-        task_set_special_port(task(), TASK_BOOTSTRAP_PORT, *bootstrap);
-        bootstrap_port = *bootstrap;
+        task_set_special_port(task(), TASK_BOOTSTRAP_PORT, bootstrap);
+        bootstrap_port = bootstrap;
         mach_port_deallocate(task(), parent_rx);
     }
 
@@ -741,6 +737,13 @@ fn become_child() -> Result<std::convert::Infallible, String> {
         }
     }
     let mut regs = read_regs(&mut d);
+    // The forking thread's pointer-authentication keys, which the child
+    // keeps, as on Linux.
+    let mut keys = [0u64; 10];
+    for k in &mut keys {
+        *k = d.u64();
+    }
+    backend::set_thread_keys(keys);
     let tpidr = d.u64();
     let vtimer_offset = d.u64();
     let flags = d.u64();
@@ -748,48 +751,12 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let child_tid = d.u64();
     let vfork = d.bool();
     let word = d.i32();
-    let n = d.count(32);
-    let maps: Vec<[u64; 4]> = (0..n).map(|_| [d.u64(), d.u64(), d.u64(), d.u64()]).collect();
+    let sock = d.i32();
     let used = d.map();
-    let n = d.count(25);
-    let regions: Vec<Region> = (0..n)
-        .map(|_| Region {
-            addr: d.u64(),
-            size: d.u64(),
-            prot: d.i32(),
-            max: d.i32(),
-            shared: d.bool(),
-        })
-        .collect();
-    if regions.len() != entries.len() {
-        return Err("the hand-off does not match its memory".into());
+    let mut m = mem::Mem::load(&mut d);
+    if !vfork {
+        receive_memory(sock)?;
     }
-
-    for (r, &entry) in regions.iter().zip(entries) {
-        let mut at = r.addr;
-        let inherit = if r.shared { VM_INHERIT_SHARE } else { VM_INHERIT_COPY };
-        // SAFETY: mapping the parent's memory over our reservation of the
-        // window, at the parent's address.
-        let kr = unsafe {
-            mach_vm_map(
-                task(),
-                &mut at,
-                r.size,
-                0,
-                VM_FLAGS_OVERWRITE,
-                entry,
-                0,
-                0,
-                r.prot & r.max,
-                r.max,
-                inherit,
-            )
-        };
-        if kr != KERN_SUCCESS || at != r.addr {
-            return Err(format!("mapping the parent's memory at {:#x} failed ({kr:#x})", r.addr));
-        }
-    }
-    release_ports(entries);
     window::set_used(used);
 
     // The process becomes a VM process: from here every way out tears the
@@ -798,21 +765,21 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let k = Kernel::restore_for_fork(HvPlatform, &mut d);
     d.finish()?;
     backend::become_vm_process()?;
-    for [guest, len, prot, host] in maps {
-        vm::map(guest, host, len, prot)
-            .map_err(|e| format!("mapping {guest:#x}+{len:#x} into the VM failed: errno {e}"))?;
-    }
+    m.rebuild(vfork)?;
+    mem::install(m);
+    // No vCPU has run here: nothing holds an old translation.
+    vm::flushed_without_vcpus();
     *backend::kernel() = Some(k);
+    if vfork {
+        mem::start_lazy(sock);
+    } else {
+        // SAFETY: the memory has arrived; the channel is done.
+        unsafe { libc::close(sock) };
+    }
 
     // SAFETY: the word's write end is ours: close-on-exec, so a vfork parent
     // also sees it close when the child execs.
     unsafe { libc::fcntl(word, libc::F_SETFD, libc::FD_CLOEXEC) };
-    if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
-        let _ = uaccess::write(child_tid, thread::tid());
-    }
-    if flags & cl::CLONE_CHILD_CLEARTID != 0 && child_tid != 0 {
-        thread::set_clear_child_tid(child_tid);
-    }
     regs.x[0] = 0;
     regs.pc += 4;
     if child_stack != 0 {
@@ -821,8 +788,16 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     backend::use_vtimer_offset(vtimer_offset);
     let vcpu = backend::Vcpu::create()?;
     vcpu.set_thread_pointer(tpidr);
-    // SAFETY: one byte from a local to the parent's pipe.
+    // SAFETY: one byte from a local to the parent's pipe. Written before
+    // any access to guest memory: a vfork child's first one asks the
+    // parent, which serves it only once it has this byte.
     unsafe { libc::write(word, b"1".as_ptr().cast(), 1) };
+    if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
+        let _ = uaccess::write(child_tid, thread::tid());
+    }
+    if flags & cl::CLONE_CHILD_CLEARTID != 0 && child_tid != 0 {
+        thread::set_clear_child_tid(child_tid);
+    }
     if !vfork {
         // SAFETY: the parent has its answer; the pipe is done.
         unsafe { libc::close(word) };

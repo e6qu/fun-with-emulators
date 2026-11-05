@@ -294,14 +294,14 @@ mod imp {
             if !crate::snapshot::fresh_kqueue_at(t.kq, ce) || t.first_at_ms == 0 {
                 continue;
             }
-            // A one-shot timer fires once what was left of its time is up; a
-            // periodic one keeps its period. Expirations not yet read are lost.
+            // A one-shot timer fires once what was left of its time is up —
+            // at once if it is up already and its expiration was not read; a
+            // periodic one keeps its period, losing expirations not yet read.
             let (period, extra) = if t.periodic {
                 (t.period_ms, libc::EV_ENABLE)
-            } else if t.first_at_ms > now_ms() {
-                ((t.first_at_ms - now_ms()).max(1), libc::EV_ENABLE | libc::EV_ONESHOT)
             } else {
-                continue;
+                // A kqueue timer of 0 fires at once.
+                ((t.first_at_ms - now_ms()).max(0), libc::EV_ENABLE | libc::EV_ONESHOT)
             };
             let change = timer_kevent(libc::EV_ADD | extra, period);
             // SAFETY: single-change kevent with no event list.
@@ -468,6 +468,23 @@ mod imp {
         })
     }
 
+    /// What is left until timer `t` next expires at monotonic time `now`
+    /// (milliseconds), as `(seconds, nanoseconds)`: zero when disarmed, or
+    /// a one-shot timer that has expired.
+    fn time_left(t: &TimerFd, now: i64) -> (i64, i64) {
+        if t.first_at_ms == 0 {
+            return (0, 0);
+        }
+        let left = if now < t.first_at_ms {
+            t.first_at_ms - now
+        } else if t.periodic && t.period_ms > 0 {
+            t.period_ms - (now - t.first_at_ms) % t.period_ms
+        } else {
+            0
+        };
+        (left / 1000, left % 1000 * 1_000_000)
+    }
+
     fn timer_kevent(flags: u16, period_ms: i64) -> libc::kevent {
         libc::kevent {
             ident: 1,
@@ -482,7 +499,7 @@ mod imp {
     pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
         let fd = fd as i32;
         match with_reg(|m| match m.get(&fd) {
-            Some(Special::Timer(t)) => Some((t.interval, t.value)),
+            Some(Special::Timer(t)) => Some((t.interval, time_left(t, now_ms()))),
             _ => None,
         }) {
             Some((iv, val)) => {
@@ -558,7 +575,17 @@ mod imp {
                 if n == 0 {
                     return Some(err(errno::EAGAIN));
                 }
-                let count = ev.data.max(1) as u64;
+                // A one-shot timer expires once (kqueue counts on as if it
+                // were periodic), and once read it is disarmed, as a fork
+                // child must find it.
+                let one_shot = with_reg(|m| match m.get_mut(&fd) {
+                    Some(Special::Timer(t)) if !t.periodic => {
+                        t.first_at_ms = 0;
+                        true
+                    }
+                    _ => false,
+                });
+                let count = if one_shot { 1 } else { ev.data.max(1) as u64 };
                 match uaccess::write(buf, count) {
                     Ok(()) => 8,
                     Err(e) => err(e),
@@ -726,11 +753,21 @@ mod tests {
         // SAFETY: `spec` is a valid itimerspec; no old_value.
         let r = unsafe { timerfd_settime(fd as u64, 0, spec.as_ptr() as u64, 0) };
         assert_eq!(r, 0, "settime failed: {r}");
+        // Some of its time is left, at most what it was set to.
+        let mut cur = [0i64; 4];
+        // SAFETY: `cur` is a writable itimerspec.
+        assert_eq!(unsafe { timerfd_gettime(fd as u64, cur.as_mut_ptr() as u64) }, 0);
+        assert!(cur[2] == 0 && cur[3] > 0 && cur[3] <= 40_000_000, "{cur:?}");
+        std::thread::sleep(std::time::Duration::from_millis(80));
         let mut v: u64 = 0;
-        // Blocking read returns the expiration count once the timer fires.
+        // Read well after it fired: it fired once, as a one-shot timer does.
         let n = read_into(fd, &mut v);
         assert_eq!(n, 8);
-        assert!(v >= 1, "expirations: {v}");
+        assert_eq!(v, 1, "expirations");
+        // Expired: disarmed.
+        // SAFETY: as above.
+        assert_eq!(unsafe { timerfd_gettime(fd as u64, cur.as_mut_ptr() as u64) }, 0);
+        assert_eq!(cur, [0; 4]);
         assert_eq!(close_fd(fd), 0);
     }
 

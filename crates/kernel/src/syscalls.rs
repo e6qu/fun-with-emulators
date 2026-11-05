@@ -101,12 +101,12 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
             nr::READV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2]));
+                let iov = guest!(uaccess::host_iovecs(a[1], a[2], true));
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
             nr::WRITEV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2]));
+                let iov = guest!(uaccess::host_iovecs(a[1], a[2], false));
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
@@ -244,7 +244,7 @@ impl<P: Platform> Kernel<P> {
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),
             nr::MADVISE => self.sys_madvise(a[0], a[1], a[2]),
             nr::MSYNC => self.sys_msync(a[0], a[1], a[2]),
-            nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3]),
+            nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3], a[4]),
 
             // Process and thread identity.
             nr::EXIT_GROUP => self.platform.exit(a[0] as i32),

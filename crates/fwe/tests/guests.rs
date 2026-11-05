@@ -89,6 +89,9 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
 /// (see [`run_vm_bounded`]).
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+    // Its own process group, so a timeout reaches the processes it starts.
+    cmd.process_group(0);
     let feed = !input.is_empty();
     if feed {
         cmd.stdin(Stdio::piped());
@@ -140,7 +143,8 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                     let _ = child.kill();
                 }
             } else {
-                let _ = child.kill();
+                // SAFETY: SIGKILL to the guest's own process group.
+                unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
             }
             break child.wait().unwrap();
         }
@@ -149,13 +153,29 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
     if timed_out {
         eprintln!("--- guest timed out after {limit:?} (killed)");
     }
-    // Readers finish once the pipes close (at process exit).
-    let stdout = out_reader.join().unwrap();
-    let stderr = err_reader.join().unwrap();
+    // Readers finish once the pipes close: at the exit of the last process
+    // holding them, which may have left the group. One still holding them
+    // a while later is reported, not waited for.
+    let joined = |reader: std::thread::JoinHandle<Vec<u8>>, which: &str| {
+        let start = Instant::now();
+        while !reader.is_finished() {
+            if start.elapsed() > Duration::from_secs(10) {
+                eprintln!("--- a process outlived the guest holding its {which}");
+                return Vec::new();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reader.join().unwrap()
+    };
+    let stdout = joined(out_reader, "standard output");
+    let stderr = joined(err_reader, "standard error");
     (Output { status, stdout, stderr }, child.id() as i32)
 }
 
 const ASM_GUESTS: &[&str] = &[
+    "pacbti",
+    "mapfixed",
+    "mapfixedmt",
     "hello",
     "exit42",
     "enosys",
@@ -1458,13 +1478,16 @@ impl Drop for Server {
 /// One HTTP/1.0 request to `127.0.0.1:port`: the status line and the body.
 fn http(port: u16, method: &str, path: &str, body: &str) -> (String, Vec<u8>) {
     use std::io::{Read, Write};
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let fail = |what: &str, e: std::io::Error| -> ! { panic!("{method} {path}: {what}: {e}") };
+    let mut s =
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| fail("connecting", e));
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let length =
         if body.is_empty() { String::new() } else { format!("Content-Length: {}\r\n", body.len()) };
-    write!(s, "{method} {path} HTTP/1.0\r\nHost: localhost\r\n{length}\r\n{body}").unwrap();
+    write!(s, "{method} {path} HTTP/1.0\r\nHost: localhost\r\n{length}\r\n{body}")
+        .unwrap_or_else(|e| fail("sending", e));
     let mut reply = Vec::new();
-    s.read_to_end(&mut reply).unwrap();
+    s.read_to_end(&mut reply).unwrap_or_else(|e| fail("reading the reply", e));
     let split = reply.windows(4).position(|w| w == b"\r\n\r\n").expect("no end of headers");
     let head = String::from_utf8_lossy(&reply[..split]).into_owned();
     let status = head.lines().next().unwrap_or("").to_string();
@@ -1535,7 +1558,25 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
         assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // On a failure, lighttpd's own account of it.
+    let log_path = root.path("tmp/error.log");
+    let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
+    if let Err(e) = result {
+        drop(server);
+        eprintln!(
+            "--- lighttpd's error log:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        std::panic::resume_unwind(e);
+    }
+    drop(server);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("server started") && log.contains("server stopped"), "{log}");
+}
 
+/// The requests `debian_lighttpd_serves_files_and_cgi` makes of the server
+/// on `port`, which serves `big` as `/big.txt`.
+fn lighttpd_requests(port: u16, big: &str) {
     assert_eq!(
         http(port, "GET", "/", ""),
         ("HTTP/1.0 200 OK".into(), b"hello from lighttpd\n".to_vec())
@@ -1563,9 +1604,6 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
         http(port, "GET", "/count.sh?x=1", ""),
         ("HTTP/1.0 200 OK".into(), b"GET x=1: init,alice\n".to_vec())
     );
-    drop(server);
-    let log = std::fs::read_to_string(root.path("tmp/error.log")).unwrap();
-    assert!(log.contains("server started") && log.contains("server stopped"), "{log}");
 }
 
 #[test]
@@ -2006,7 +2044,13 @@ fn fork_copies_memory_and_keeps_descriptors() {
         signals("fork-epoll"),
         "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"
     );
+    assert_eq!(signals("fork-timerfd"), FORK_TIMERFD);
 }
+
+/// What `signals fork-timerfd` prints.
+const FORK_TIMERFD: &str = "parent read its expiration: true\n\
+                            child reads the unread expiration: true\n\
+                            child finds the read one empty: true\nexited 0\n";
 
 /// `clone3` in its fork form, and `execveat` relative to a directory, of the
 /// open file itself, and refusing a symbolic link under
@@ -2477,6 +2521,53 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     Some(run_hv(cmd, &program.display().to_string()))
 }
 
+/// Pointer authentication and BTI in the VM, as Linux gives them to a
+/// program: keys of its own (kept by a fork child, changed by
+/// `PR_PAC_RESET_KEYS`), its code mapped guarded when it is built for BTI,
+/// and SIGILL for an indirect branch to no landing pad. The stand-in's CPU
+/// offers both; on a real VM a feature it lacks is reported as such.
+#[test]
+fn hv_pointer_authentication_and_bti() {
+    let Some(out) = fwe_hv(&asm_guest("pacbti-low"), &[]) else { return };
+    let text = stdout(&out);
+    let pac = "pac: a signed pointer authenticates\n\
+               pac: a fork child has its parent's keys\n\
+               pac: new keys sign differently\n";
+    let bti = "bti: a branch to a landing pad goes on\n\
+               bti: a branch to no landing pad raises SIGILL\n";
+    if matches!(hv_mode(), Some(HvMode::Standin)) {
+        assert_eq!(text, format!("{pac}{bti}"));
+    } else {
+        let pac_ok = text.starts_with(pac) || text.starts_with("pac: not offered\n");
+        let bti_ok = text.ends_with(bti) || text.ends_with("bti: not offered\n");
+        assert!(pac_ok && bti_ok, "{text}");
+    }
+    assert_eq!(out.status.code(), Some(0), "{text}");
+}
+
+/// MAP_FIXED over mapped memory replaces it, keeping the rest; a buffer
+/// across old and new is one buffer to the kernel; a widened page takes a
+/// write; a mapping over the program's own data (linked low, backed
+/// elsewhere in the VM) reads as zero and takes writes.
+#[test]
+fn hv_map_fixed_replaces_mapped_memory() {
+    let Some(out) = fwe_hv(&asm_guest("mapfixed-low"), &[]) else { return };
+    let text = stdout(&out);
+    let want = format!(
+        "{}{}\nmap_fixed: replaces, and a buffer across both is one\n\
+         mprotect: a widened page takes the write\n\
+         map_fixed: over the program's own data\n",
+        "A".repeat(4096),
+        "B".repeat(4096)
+    );
+    assert_eq!(text, want);
+    assert_eq!(out.status.code(), Some(0));
+    // The same with another thread running guest code meanwhile.
+    let out = fwe_hv(&asm_guest("mapfixedmt-low"), &[]).unwrap();
+    assert_eq!(stdout(&out), "ok\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// The stand-in's watcher reports a process that ended with its VM alive,
 /// and stays quiet about one that destroyed it first.
 #[test]
@@ -2674,6 +2765,7 @@ fn hv_fork_and_vfork() {
              child's writes unseen: true\nshared memory shared: true\nexited 0\n",
         ),
         ("fork-epoll", "child's epoll: 1 event(s), data 42\nchild's timer fired: true\nexited 0\n"),
+        ("fork-timerfd", FORK_TIMERFD),
         ("fork-snapshot", "consistent snapshots: 8 of 8\n"),
         ("waitid", "exited: true, status 6, pid matches: true\nkilled: true, signal 9\n"),
         ("fork-pipe", "child read 5 bytes, then the end\nexited 0\n"),

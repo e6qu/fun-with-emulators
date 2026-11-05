@@ -32,6 +32,7 @@ pub mod term;
 pub mod thread;
 mod trace;
 pub mod uaccess;
+pub mod vmas;
 
 pub use cloneargs::CloneArgs;
 pub use fs::Fs;
@@ -68,7 +69,28 @@ pub struct FpRegs {
 }
 
 /// Services the kernel needs from the execution backend.
+/// A memory system call, for a backend that manages the guest's memory
+/// itself ([`Platform::memory`]). Addresses are guest addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemCall {
+    Brk { addr: u64 },
+    Mmap { addr: u64, len: u64, prot: u64, flags: u64, fd: i32, offset: u64 },
+    Munmap { addr: u64, len: u64 },
+    Mprotect { addr: u64, len: u64, prot: u64 },
+    Madvise { addr: u64, len: u64, advice: u64 },
+    Msync { addr: u64, len: u64, flags: u64 },
+    Mremap { old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64 },
+}
+
 pub trait Platform {
+    /// Carry out a memory system call, for a backend whose guest has an
+    /// address space of its own that it manages (the hypervisor backend);
+    /// `None` leaves it to the kernel, which maps host memory at the
+    /// guest's addresses. `brk` is the program break, which `Brk` moves.
+    fn memory(&mut self, _call: MemCall, _brk: &mut mm::Brk) -> Option<i64> {
+        None
+    }
+
     /// Make guest code in `[addr, addr + len)` safe to execute. `known`,
     /// when given, is the address ranges the file's unwind table says hold
     /// code; other bytes of the range may be data placed among the code.
@@ -230,9 +252,12 @@ impl<P: Platform> Kernel<P> {
         e.u64(ss.ss_sp);
         e.i32(ss.ss_flags);
         e.u64(ss.ss_size);
-        let (guest, len, host) = uaccess::translation();
-        for v in [guest, len, host] {
-            e.u64(v);
+        let translations = uaccess::translations();
+        e.u64(translations.len() as u64);
+        for (guest, len, host) in translations {
+            for v in [guest, len, host] {
+                e.u64(v);
+            }
         }
         e.map(&mm::guest_ranges());
         fdtable::save(e);
@@ -279,10 +304,10 @@ impl<P: Platform> Kernel<P> {
             _pad: 0,
             ss_size: d.u64(),
         });
-        let (guest, len, host) = (d.u64(), d.u64(), d.u64());
-        if len != 0 {
-            uaccess::set_translation(guest, len, host);
-        }
+        let n = d.count(24);
+        let translations: Vec<(u64, u64, u64)> =
+            (0..n).map(|_| (d.u64(), d.u64(), d.u64())).collect();
+        uaccess::set_translations(&translations);
         mm::set_guest_ranges(d.map());
         fdtable::restore(d);
         specialfd::restore(d);
@@ -673,7 +698,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
-        n::READV => match uaccess::host_iovecs(a[1], a[2]) {
+        n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) => {
                 // SAFETY: the iovecs are translated host buffers; the host
                 // checks them.
@@ -682,7 +707,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             Err(e) => fwe_abi::err(e),
         },
-        n::WRITEV => match uaccess::host_iovecs(a[1], a[2]) {
+        n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
             Ok(iov) => {
                 // SAFETY: as for readv.
                 let r = unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
@@ -706,7 +731,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
                 0
             } else {
                 match uaccess::read::<[u64; 2]>(a[5]) {
-                    Ok([ss, _]) => uaccess::g2h(ss),
+                    Ok([ss, _]) => ss,
                     Err(e) => return Some(fwe_abi::err(e)),
                 }
             };

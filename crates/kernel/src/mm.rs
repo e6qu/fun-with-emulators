@@ -1,7 +1,7 @@
 //! Memory management system calls.
 
 use crate::host::{last_error, ret};
-use crate::{Kernel, Platform};
+use crate::{Kernel, MemCall, Platform};
 use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -561,6 +561,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_brk(&mut self, addr: u64) -> i64 {
+        if let Some(r) = self.platform.memory(MemCall::Brk { addr }, &mut self.brk) {
+            return r;
+        }
         let b = self.brk;
         if addr < b.start || addr > b.limit {
             return b.current as i64;
@@ -593,6 +596,10 @@ impl<P: Platform> Kernel<P> {
         fd: u64,
         offset: u64,
     ) -> i64 {
+        let call = MemCall::Mmap { addr, len, prot, flags, fd: fd as i32, offset };
+        if let Some(r) = self.platform.memory(call, &mut self.brk) {
+            return r;
+        }
         if len == 0 || offset & (self.page_size - 1) != 0 {
             return err(errno::EINVAL);
         }
@@ -743,6 +750,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+        if let Some(r) = self.platform.memory(MemCall::Munmap { addr, len }, &mut self.brk) {
+            return r;
+        }
         if crate::uaccess::crosses(addr, self.page_up(len)) {
             return err(errno::EINVAL);
         }
@@ -758,6 +768,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        if let Some(r) = self.platform.memory(MemCall::Mprotect { addr, len, prot }, &mut self.brk)
+        {
+            return r;
+        }
         if crate::uaccess::crosses(addr, self.page_up(len)) {
             return err(errno::EINVAL);
         }
@@ -815,6 +829,9 @@ impl<P: Platform> Kernel<P> {
 
     /// `msync(addr, len, flags)`: the host's, on the same memory.
     pub(crate) fn sys_msync(&mut self, addr: u64, len: u64, flags: u64) -> i64 {
+        if let Some(r) = self.platform.memory(MemCall::Msync { addr, len, flags }, &mut self.brk) {
+            return r;
+        }
         if addr & (self.page_size - 1) != 0 {
             return err(errno::EINVAL);
         }
@@ -832,6 +849,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
+        let call = MemCall::Madvise { addr, len, advice };
+        if let Some(r) = self.platform.memory(call, &mut self.brk) {
+            return r;
+        }
         if addr & (self.page_size - 1) != 0 {
             return err(errno::EINVAL);
         }
@@ -867,7 +888,18 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    pub(crate) fn sys_mremap(&mut self, old: u64, old_len: u64, new_len: u64, flags: u64) -> i64 {
+    pub(crate) fn sys_mremap(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        flags: u64,
+        new_addr: u64,
+    ) -> i64 {
+        let call = MemCall::Mremap { old, old_len, new_len, flags, new_addr };
+        if let Some(r) = self.platform.memory(call, &mut self.brk) {
+            return r;
+        }
         if old & (self.page_size - 1) != 0 || new_len == 0 {
             return err(errno::EINVAL);
         }

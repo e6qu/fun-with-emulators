@@ -23,6 +23,11 @@ pub const PT_INTERP: u32 = 3;
 pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
 pub const PT_GNU_STACK: u32 = 0x6474_e551;
+pub const PT_GNU_PROPERTY: u32 = 0x6474_e553;
+/// `GNU_PROPERTY_AARCH64_FEATURE_1_AND` bits: the binary is built for BTI
+/// (its indirect branch targets are landing pads), and for PAC.
+pub const AARCH64_FEATURE_BTI: u32 = 1 << 0;
+pub const AARCH64_FEATURE_PAC: u32 = 1 << 1;
 
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
@@ -202,6 +207,48 @@ impl<'a> Elf<'a> {
 
     pub fn loads(&self) -> impl Iterator<Item = &ProgramHeader> {
         self.phdrs.iter().filter(|ph| ph.kind == PT_LOAD)
+    }
+
+    /// The AArch64 features the binary's `PT_GNU_PROPERTY` note declares
+    /// (`AARCH64_FEATURE_*`), as Linux reads them to map it with
+    /// `PROT_BTI`: 0 without the note or for a malformed one.
+    pub fn aarch64_features(&self) -> u32 {
+        const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
+        const GNU_PROPERTY_AARCH64_FEATURE_1_AND: u32 = 0xc000_0000;
+        let Some(ph) = self.phdrs.iter().find(|p| p.kind == PT_GNU_PROPERTY) else { return 0 };
+        let (start, end) = (ph.offset as usize, (ph.offset + ph.filesz) as usize);
+        let Some(note) = self.data.get(start..end) else { return 0 };
+        let mut at = 0usize;
+        // Notes: namesz, descsz, type, name, desc.
+        while at + 12 <= note.len() {
+            let (namesz, descsz, kind) =
+                (u32_at(note, at) as usize, u32_at(note, at + 4) as usize, u32_at(note, at + 8));
+            let name_at = at + 12;
+            // 8-byte aligned notes: the descriptor, and the next note,
+            // start at the next multiple of 8.
+            let desc_at = (name_at + namesz).next_multiple_of(8);
+            let next = (desc_at + descsz).next_multiple_of(8);
+            if desc_at + descsz > note.len() {
+                return 0;
+            }
+            if kind == NT_GNU_PROPERTY_TYPE_0 && note.get(name_at..name_at + 4) == Some(b"GNU\0") {
+                // Properties: type, size, data (padded to 8).
+                let desc = &note[desc_at..desc_at + descsz];
+                let mut p = 0usize;
+                while p + 8 <= desc.len() {
+                    let (pr_type, size) = (u32_at(desc, p), u32_at(desc, p + 4) as usize);
+                    if pr_type == GNU_PROPERTY_AARCH64_FEATURE_1_AND
+                        && size >= 4
+                        && p + 12 <= desc.len()
+                    {
+                        return u32_at(desc, p + 8);
+                    }
+                    p += 8 + size.div_ceil(8) * 8;
+                }
+            }
+            at = next;
+        }
+        0
     }
 
     pub fn is_pie(&self) -> bool {
@@ -465,6 +512,36 @@ mod tests {
 
     fn load(flags: u32, offset: u64, vaddr: u64, filesz: u64, memsz: u64) -> ProgramHeader {
         ProgramHeader { kind: PT_LOAD, flags, offset, vaddr, filesz, memsz, align: 0x1000 }
+    }
+
+    /// The note clang emits for `-mbranch-protection=standard` (BTI, PAC
+    /// and GCS bits), from `llvm-objdump -s -j .note.gnu.property`.
+    const BTI_PAC_NOTE: [u8; 32] = [
+        0x04, 0, 0, 0, 0x10, 0, 0, 0, 0x05, 0, 0, 0, b'G', b'N', b'U', 0, //
+        0x00, 0, 0, 0xc0, 0x04, 0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    #[test]
+    fn reads_the_aarch64_feature_note() {
+        let note_at = 0x100u64;
+        let prop = ProgramHeader {
+            kind: PT_GNU_PROPERTY,
+            flags: PF_R,
+            offset: note_at,
+            vaddr: 0x1100,
+            filesz: BTI_PAC_NOTE.len() as u64,
+            memsz: BTI_PAC_NOTE.len() as u64,
+            align: 8,
+        };
+        let mut d = image(ET_DYN, &[load(PF_R, 0, 0x1000, 0x200, 0x200), prop], 0x200);
+        d[note_at as usize..note_at as usize + 32].copy_from_slice(&BTI_PAC_NOTE);
+        let elf = Elf::parse(&d).unwrap();
+        let f = elf.aarch64_features();
+        assert_ne!(f & AARCH64_FEATURE_BTI, 0);
+        assert_ne!(f & AARCH64_FEATURE_PAC, 0);
+        // Without the note, nothing.
+        let d = image(ET_DYN, &[load(PF_R, 0, 0x1000, 0x200, 0x200)], 0x200);
+        assert_eq!(Elf::parse(&d).unwrap().aarch64_features(), 0);
     }
 
     #[test]

@@ -18,6 +18,19 @@ use crate::thread::{self, SigInfo};
 use crate::{HostSignal, Kernel, Platform, Regs, guest, host, uaccess};
 use fwe_abi::{Sigaction, Stack, err, errno, signal};
 
+/// `PSTATE.BTYPE` for a handler entered as if by `blr` (Linux's
+/// `PSR_BTYPE_C`).
+const BTYPE_C: u64 = 0b10 << 10;
+
+/// The guest's code is run with BTI in force (the hypervisor backend sets
+/// it where the VM offers BTI).
+static BTI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Have signal handlers entered as Linux enters them with BTI in force.
+pub fn set_bti(on: bool) {
+    BTI.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 // Offsets within `struct rt_sigframe` on arm64 (`siginfo` then `ucontext`).
 const SIGINFO_SIZE: u64 = 128;
 /// `si_addr` within `siginfo` (the `_sigfault` member), and where `si_pid`,
@@ -376,7 +389,9 @@ impl<P: Platform> Kernel<P> {
         };
         regs.sp = frame;
         regs.pc = action.handler;
-        regs.pstate = 0;
+        // Entered as if by `blr`: with BTI in use, the handler's first
+        // instruction must be a landing pad, as Linux makes it.
+        regs.pstate = if BTI.load(std::sync::atomic::Ordering::Relaxed) { BTYPE_C } else { 0 };
         true
     }
 

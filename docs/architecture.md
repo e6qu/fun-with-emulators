@@ -67,8 +67,10 @@ functions do their work in user space (`clock_gettime`, `gettimeofday`,
 `nanosleep`), so those results go through fwe's memory and the checked
 copies too.
 
-The guest sees the host page size (16 KiB on Apple Silicon) through
-`AT_PAGESZ`, which the arm64 Linux ABI permits.
+In the native backend the guest sees the host page size (16 KiB on Apple
+Silicon) through `AT_PAGESZ`, which the arm64 Linux ABI permits; in the
+hypervisor backend, whose guest has page tables of its own, it sees Linux's
+usual 4 KiB.
 
 Every range of guest memory — the loaded images and their code stubs, the
 stack, the break reservation and whatever the guest maps — is recorded
@@ -387,28 +389,22 @@ at the same numbers (see Event descriptors).
 
 In the hypervisor backend a host fork is impossible, since a child cannot use
 its parent's VM, so `fork` and `vfork` start a fresh fwe process instead
-(`crates/native/src/hv/fork.rs`, [hypervisor.md](hypervisor.md)). All guest
-memory there lives in one reserved host address window (512–960 GiB). With
-the kernel lock held and every other vCPU stopped, the parent takes a Mach
-memory entry for each region of it — a copy-on-write snapshot
-(`MAP_MEM_VM_COPY`) of private memory, a share (`MAP_MEM_VM_SHARE`) of
-`MAP_SHARED` memory — and encodes the kernel's state
-(`Kernel::save_for_fork`, `crates/kernel/src/snapshot.rs`): signal
-dispositions, the forking thread's mask and alternate stack, the break,
-filesystem view, credentials, descriptor limits and every descriptor
-registry, then the backend's own (registers, thread pointer, the VM's
-mappings). It `posix_spawn`s `fwe --hv-fork-child` with all of its
+(`crates/native/src/hv/fork.rs`, [hypervisor.md](hypervisor.md#fork)). With
+the kernel lock held and every other vCPU stopped, the parent encodes the
+kernel's state (`Kernel::save_for_fork`, `crates/kernel/src/snapshot.rs`):
+signal dispositions, the forking thread's mask and alternate stack, the
+break, filesystem view, credentials, descriptor limits and every descriptor
+registry, the translated guest ranges, then the backend's own (registers,
+thread pointer and pointer-authentication keys, the guest's mapping records
+and the slab's use). It `posix_spawn`s `fwe --hv-fork-child` with all of its
 descriptors (close-on-exec ones too, the flag cleared for the spawn and set
-back on both sides; kqueues never pass and are rebuilt), and a receive right
-of its own as the child's bootstrap port. The child asks there for its
-state; the answer carries the memory entries, the real bootstrap port and
-the state. The child reserves the window, maps each entry at the parent's
-address, restores the kernel, creates its own VM over the same mappings and
-resumes the guest after the `svc` with `x0` = 0. The parent returns once the
-child is about to run; a `vfork` parent waits on until the child execs or
-exits, and a `vfork` child is given shares of private memory as well, so its
-writes reach the parent. Neither side pays for memory until it writes to a page. A guest that
-has placed a `MAP_FIXED` mapping outside the window cannot fork (`EAGAIN`).
+back on both sides; kqueues never pass and are rebuilt), a socket pair for
+the memory, and a receive right of its own as the child's bootstrap port.
+The child asks there for its state; the answer carries the real bootstrap
+port and the state. A `fork` child receives a copy of the parent's memory; a
+`vfork` child fetches it as it goes and sends back what it changed before
+the parent resumes. The parent returns once the child is about to run; a
+`vfork` parent waits on until the child execs or exits.
 
 `wait4` reaps a child through the host, translating the status into the
 Linux encoding and the resource usage into Linux units (`ru_maxrss` in KiB);
@@ -529,8 +525,9 @@ realtime/monotonic distinction are not modelled.
 A kqueue cannot be passed to a child process, so each epoll descriptor's
 interest list is also recorded (and kept up to date by `epoll_ctl` and
 `close`), as is how each timerfd is armed; a fork child rebuilds both at the
-same descriptor numbers. A timer's expirations not yet read when the process
-forks are not carried over.
+same descriptor numbers. A one-shot timer that expired before the fork, its
+expiration unread, is readable in the child at once; a periodic timer's
+expirations not yet read are not carried over.
 
 `signalfd` (`crates/kernel/src/signalfd.rs`) has no macOS equivalent and is
 emulated: each signalfd is a readiness pipe plus a queue of
@@ -629,7 +626,7 @@ those items.
   inline jump table in code the unwind table covers could be patched.
 - **Processes:** a `vfork` child shares the guest's memory but not its
   mappings (an `mmap` or `munmap` in it stays in the child); a fork child
-  of a timerfd loses the expirations not yet read; in the native backend a
+  of a periodic timerfd loses the expirations not yet read; in the native backend a
   thread inside fwe's code during a `fork` (in a system call) is not
   stopped, so a write it makes to guest memory then, such as a `read`
   completing into a buffer, may or may not reach the child; in a fork
@@ -657,7 +654,15 @@ those items.
   executable memory takes a fault each time a page goes from being written
   to being run or back, which is slow for code that does both to one page
   often; a host system call writing into such a page while it is
-  executable (a `read` into it, for one) fails with `EFAULT`.
+  executable (a `read` into it, for one) fails with `EFAULT`. In the VM, a
+  buffer a host call is given whole (`read`'s, an `iovec`'s) that runs from
+  one translated guest range into another fails with `EINVAL` (it has no
+  single host address), and `ioctl`'s argument is translated but not
+  checked against the guest's mappings (it is a pointer only for some
+  requests). A guest mapping placed with `MAP_FIXED` exactly where fwe keeps
+  the memory of another, translated range makes their addresses ambiguous
+  to the kernel within a system call that translated a pointer into that
+  range.
 - **Filesystem:** of `/dev`, only `null`, `zero`, `random`, `urandom`,
   `tty` and the `/proc/self/fd` links are provided; their `stat` reports
   the host's device numbers. File owners other than fwe's own user read as
