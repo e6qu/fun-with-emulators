@@ -112,9 +112,8 @@ impl Platform for NativePlatform {
         }
     }
 
-    fn stop_self(&mut self) {
-        // SAFETY: plain host call; the process resumes on SIGCONT.
-        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    fn stop_self(&mut self, sig: libc::c_int) {
+        fwe_kernel::host::stop_with(sig);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -298,6 +297,7 @@ pub(crate) fn reexec(
     let mut penv: Vec<*const libc::c_char> = cenv.iter().map(|c| c.as_ptr()).collect();
     penv.push(std::ptr::null());
     before_exec();
+    fwe_kernel::host::hand_over_for_exec();
     // SAFETY: NUL-terminated argument and environment arrays of C strings
     // that live across the call.
     unsafe { libc::execve(pargs[0], pargs.as_ptr(), penv.as_ptr()) };

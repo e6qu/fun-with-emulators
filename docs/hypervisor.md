@@ -86,8 +86,9 @@ The code is in `crates/native/src/hv/`.
   entered as from `blr`.
 - **The kernel.** System calls go to the same kernel layer as the native
   backend's, through a `Platform` of the backend's own.
-- **Signals.** As in the native backend, guest dispositions are mirrored onto
-  the host and the vCPU thread runs under the guest's mask. The handler
+- **Signals.** As in the native backend, guest dispositions are passed to
+  the host, and the vCPU thread runs under the host mask the guest's mask
+  calls for (see [architecture.md](architecture.md)). The handler
   records the signal and stops the vCPU (`hv_vcpus_exit`), and the run loop
   delivers it — so a signal reaches a guest busy in a loop without system
   calls too. The framework's own threads are created with every guest signal

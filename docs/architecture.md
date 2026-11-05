@@ -469,24 +469,41 @@ alternate stack and the pending set are per thread (`crates/kernel/src/thread.rs
 
 Guest signals travel as host signals wherever the host has an equivalent.
 `kill` sends the host signal to whatever the pid names — another process, a
-process group, the caller itself — and `tgkill` sends it to that guest
-thread's host thread. The backend mirrors each disposition onto the host:
-a signal with a guest handler, or one a `signalfd` reads, is caught by the
-backend; `SIG_DFL` and `SIG_IGN` become the host's, whose default actions
-match Linux's (terminate, ignore, stop, continue), so a child killed by a
-signal shows the right status to its parent. At startup a signal fwe
-inherited as ignored stays ignored in the guest (`nohup`, a shell's
-background jobs). Each guest thread runs under a host mask that mirrors its
-guest mask, so the host routes a process-wide signal to a thread that
-accepts it and keeps a blocked one pending, and a signal from anywhere — a
-child exiting (`SIGCHLD`), the terminal, a timer (`setitimer`), another
-process — reaches the guest as it would on Linux. One difference is made
-up for: a process-wide signal that arrives while every thread blocks it
-stays pending for the process on Linux, for whichever thread unblocks it
-first, while macOS parks it on one thread. In the native backend a thread
-entering a system call with such a signal parked on it, one the guest
-catches, takes it off the host and records it against the process, and
-the other threads are woken to take it. Every fwe handler starts
+process group, the caller itself. `tgkill` sends it to that guest thread's
+host thread, except a signal the backend catches, which is recorded
+against that thread directly and the thread woken.
+
+Each disposition is passed to the host. The backend catches a signal with
+a guest handler, one a `signalfd` or `rt_sigtimedwait` reads, and one whose
+default action ends or stops the process, which fwe then takes itself: it
+ends the process with that signal, or stops it with that signal, so the
+parent sees the status Linux gives. The host takes the remaining defaults,
+ignoring a signal or continuing the process, and `SIG_IGN`. At startup a
+signal fwe inherited as ignored stays ignored in the guest (`nohup`, a
+shell's background jobs). A signal from anywhere — a child exiting
+(`SIGCHLD`), the terminal, a timer (`setitimer`), another process —
+reaches the guest as it would on Linux.
+
+The host never blocks a signal the backend catches, whatever the guest's
+mask: macOS forgets the sender of a signal it holds blocked, and Linux
+keeps it. The handler records each one as it arrives, with its sender,
+code and status, and fwe keeps it pending while the guest blocks it. A
+signal that lands on a thread whose guest mask blocks it is the process's,
+as Linux keeps it, for whichever thread accepts it first, and the other
+threads are woken to take it. The exception is `SIGPIPE` and `SIGXFSZ`,
+which the host directs at the thread whose write caused them. Each thread
+runs under a host mask that blocks only the guest-blocked signals the host
+acts on itself, so the host keeps those pending. Before a host `execve`
+that re-executes fwe, the whole guest mask goes on the host, and the
+signals fwe holds pending that the guest blocks go to the host, pending on
+the thread, which `execve` keeps.
+
+A process-wide signal the host holds can still be parked on one thread,
+which never takes it, while the thread runs fwe's handlers with every
+signal blocked. In the native backend a thread entering a system call
+with such a signal parked on it, one the guest catches, takes it off the
+host and records it against the process, and the other threads are woken
+to take it. Every fwe handler starts
 and ends with all signals blocked, so the backend always knows whether it
 interrupted guest code or its own.
 
@@ -704,10 +721,12 @@ those items.
   65534, and a `chown` does not show in a later `stat`.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
-  (one pending per signal, as Linux does for them); a signal left pending
-  while blocked loses its sender on macOS, so `rt_sigtimedwait` then
-  reports `si_pid` 0 (except `SIGCHLD`, whose child fwe looks up with a
-  `waitid` that does not reap it); `rt_sigqueueinfo` is not implemented; a signal that
+  (one pending per signal, as Linux does for them); a blocked signal whose
+  action the host applies (one ignored, or a default that ignores or
+  continues) loses its sender, which matters only if a handler is
+  installed before it is unblocked; a blocked signal pending across an
+  `execve` arrives with fwe's own pid as its sender;
+  `rt_sigqueueinfo` is not implemented; a signal that
   arrives between a blocking call's start and its host wait can be noticed
   only when the call ends, except for `rt_sigsuspend`, `rt_sigtimedwait`
   and the masked waits, which close that window; a futex wait notices a

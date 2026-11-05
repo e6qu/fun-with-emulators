@@ -1832,6 +1832,29 @@ fn signal_from_child_reaches_parent_handler() {
     assert_eq!(signals("notify-parent"), "SIGUSR1 from child: true\nexited 0\n");
 }
 
+/// A signal the guest blocks stays pending with its sender, as on Linux,
+/// though macOS forgets the sender of a signal it holds blocked: taken by a
+/// handler and by `sigtimedwait` after the sender has exited.
+#[test]
+fn blocked_signal_keeps_its_sender() {
+    assert_eq!(signals("notify-parent-blocked"), "SIGUSR1 from child: true\nexited 0\n");
+    assert_eq!(signals("sigwait-from-child"), "took 12 from child: true\nexited 0\n");
+}
+
+/// Signals the guest blocks, routed as Linux routes them: one sent with
+/// `tgkill` waits for its thread, which blocks it, though another thread
+/// accepts it; one with a default action that ends the process stays
+/// pending while every thread blocks it; and a stop reports its signal.
+#[test]
+fn blocked_signals_routed_as_on_linux() {
+    assert_eq!(
+        signals("tgkill-blocked"),
+        "held for the blocking thread: true, then handled on it: true\n"
+    );
+    assert_eq!(signals("default-blocked"), "still running, pending: true\n");
+    assert_eq!(signals("stop-tstp"), "stopped: true, by 20\nkilled by 9\n");
+}
+
 /// A child's exit raises `SIGCHLD` in the parent, carrying the child's pid
 /// and exit status — also when the signal waited blocked until after the
 /// child was gone, which macOS reports with an empty `siginfo`.
@@ -2544,6 +2567,11 @@ fn hv_delivers_signals() {
         ("pause", "pause: -1 errno 4, handler ran: true\n"),
         ("rt-self", "handled: 1, signal 40\n"),
         ("sigtimedwait", "took 12, code 0\nthen -1 errno EAGAIN\n"),
+        ("notify-parent-blocked", "SIGUSR1 from child: true\nexited 0\n"),
+        ("sigwait-from-child", "took 12 from child: true\nexited 0\n"),
+        ("tgkill-blocked", "held for the blocking thread: true, then handled on it: true\n"),
+        ("default-blocked", "still running, pending: true\n"),
+        ("stop-tstp", "stopped: true, by 20\nkilled by 9\n"),
         (
             "raise-faults",
             "signal 11: handled 1\nsignal 8: handled 1\nsignal 5: handled 1\nignored SIGTRAP: still running\n",

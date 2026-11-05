@@ -125,9 +125,9 @@ pub trait Platform {
     /// Terminate the guest as if killed by host signal `sig`.
     fn kill_self(&mut self, sig: libc::c_int) -> !;
 
-    /// Stop the process, as the default action of `SIGTSTP` and friends
-    /// does, until it is continued.
-    fn stop_self(&mut self) {}
+    /// Stop the process with host signal `sig`, as the default action of
+    /// `SIGTSTP` and friends does, until it is continued.
+    fn stop_self(&mut self, _sig: libc::c_int) {}
 
     /// The guest now has `[addr, addr + len)` mapped with Linux protections
     /// `prot`. A backend that runs the guest in an address space of its own

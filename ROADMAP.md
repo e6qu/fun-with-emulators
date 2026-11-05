@@ -14,8 +14,9 @@ system-call surface is implemented, and the hypervisor backend runs
 low-address executables with threads, `fork` and `execve`; git, SQLite,
 lighttpd, Node, Cargo and apt run natively, and Debian's Python, GCC, Go
 and clang in the VM (verified on the software stand-in; a run on real
-hardware is still to come). What remains is the `x18` and code-discovery
-gaps.
+hardware is still to come), so every target program has a test. What
+remains is that run on real hardware, and the `x18` and code-discovery
+gaps, which no target program needs yet.
 
 ## M0 — Foundation (done)
 
@@ -126,7 +127,7 @@ Remaining:
   them. Done for Node: extended and flag-setting `sp` arithmetic, register
   offsets and out-of-range offsets from `sp`, the vector-element moves, and
   data among code told apart by the unwind table
-- [ ] Each of the target programs vendored or fetched as a test with checked
+- [x] Each of the target programs vendored or fetched as a test with checked
   output. Done: git (Debian's git runs a workflow of commits, branches,
   merge, stash, rebase, `grep` through PCRE2's JIT, `gc` and a `file://`
   clone), a database (Debian's SQLite: a write-ahead-logged database with

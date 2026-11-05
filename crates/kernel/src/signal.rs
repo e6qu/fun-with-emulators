@@ -3,13 +3,17 @@
 //!
 //! Dispositions are process-wide (in [`Kernel`]); the blocked mask, the
 //! alternate stack and pending signals are per thread (in [`crate::thread`]).
-//! Signals with a host equivalent travel as host signals: `kill` and `tgkill`
-//! send the host signal, and the backend mirrors each disposition onto the
-//! host ([`Platform::set_host_signal`]) so a signal from anywhere — another
+//! Signals with a host equivalent travel as host signals: `kill` sends the
+//! host signal, and the backend passes each disposition to the host
+//! ([`Platform::set_host_signal`]) so a signal from anywhere — another
 //! process, the terminal, a timer, a child exiting — is caught by the backend
-//! and recorded pending for the guest, or takes the host's default action,
-//! which is Linux's. Signals with no host equivalent (the real-time signals)
-//! are kept pending here and only travel within the process.
+//! and recorded pending for the guest, with its sender, or takes the host's
+//! action where that is ignoring it or continuing. A default action that
+//! ends or stops the process is fwe's to take. The host never blocks a
+//! caught signal ([`caught`]): fwe keeps it pending while the guest blocks
+//! it. Signals with no host equivalent (the real-time signals), and caught
+//! ones sent with `tgkill`, are recorded here directly; the real-time ones
+//! only travel within the process.
 //!
 //! A frame carries the general-purpose registers and the floating-point and
 //! SIMD state (an `fpsimd_context` record), as on Linux.
@@ -64,6 +68,18 @@ const FRAME_SIZE: u64 = MC_RESERVED_OFF + 4096;
 const FPSIMD_FPSR_OFF: u64 = 8;
 const FPSIMD_FPCR_OFF: u64 = 12;
 const FPSIMD_VREGS_OFF: u64 = 16;
+
+/// The relayed signals the host delivers to the backend's handler
+/// ([`HostSignal::Catch`]). The host never blocks these for the guest: a
+/// signal macOS leaves pending while blocked loses its sender, so the
+/// handler takes each one as it arrives and fwe keeps it pending, with its
+/// sender, while the guest blocks it (see [`host::host_mask_for`]).
+static CAUGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The relayed signals the host delivers to the backend's handler.
+pub fn caught() -> u64 {
+    CAUGHT.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// How many `rt_sigtimedwait` calls are waiting for each signal; while any
 /// is, the host catches it whatever its disposition.
@@ -216,16 +232,33 @@ impl<P: Platform> Kernel<P> {
         let action = self.sigactions[(sig - 1) as usize];
         let watched = crate::signalfd::watched() & bit(sig) != 0
             || WAITERS[(sig - 1) as usize].load(std::sync::atomic::Ordering::SeqCst) > 0;
-        let how = if watched {
-            HostSignal::Catch { flags: action.flags }
-        } else {
-            match action.handler {
-                signal::SIG_DFL => HostSignal::Default,
-                signal::SIG_IGN => HostSignal::Ignore,
-                _ => HostSignal::Catch { flags: action.flags },
-            }
+        // A default action that ends or stops the process is fwe's to take
+        // too ([`Kernel::deliver_pending`]), not the host's: the host never
+        // blocks a caught signal for the guest (see [`caught`]), so a
+        // default action left to the host could strike a thread whose guest
+        // mask blocks the signal, which Linux keeps pending instead.
+        let fwe_default = matches!(
+            signal::default_action(sig),
+            signal::Default::Terminate | signal::Default::Stop
+        );
+        let how = match action.handler {
+            _ if watched => HostSignal::Catch { flags: action.flags },
+            signal::SIG_DFL if !fwe_default => HostSignal::Default,
+            signal::SIG_IGN => HostSignal::Ignore,
+            _ => HostSignal::Catch { flags: action.flags },
         };
-        self.platform.set_host_signal(sig, how);
+        // Recorded first: from the moment the host catches it, the host
+        // mask a thread takes on next leaves it unblocked.
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        if matches!(how, HostSignal::Catch { .. }) {
+            CAUGHT.fetch_or(bit(sig), ordering);
+            self.platform.set_host_signal(sig, how);
+        } else {
+            // Not caught any more: blocked again where the guest blocks it
+            // from the next host mask a thread takes on.
+            self.platform.set_host_signal(sig, how);
+            CAUGHT.fetch_and(!bit(sig), ordering);
+        }
     }
 
     pub(crate) fn sync_all_host_signals(&mut self) {
@@ -254,6 +287,7 @@ impl<P: Platform> Kernel<P> {
     /// one with a handler enters it. Ends a finished `rt_sigsuspend` by
     /// restoring the mask it replaced, if no handler did.
     pub fn deliver_pending(&mut self, regs: &mut Regs) {
+        thread::wake_others_if_asked(host::WAKE_SIGNAL);
         drain_to_signalfd();
         loop {
             let ready = thread::deliverable();
@@ -267,7 +301,11 @@ impl<P: Platform> Kernel<P> {
                 signal::SIG_IGN => {}
                 signal::SIG_DFL => match signal::default_action(sig) {
                     signal::Default::Terminate => self.terminate_by(sig),
-                    signal::Default::Stop => self.platform.stop_self(),
+                    signal::Default::Stop => {
+                        if let Some(h) = host::signal_to_host(sig) {
+                            self.platform.stop_self(h);
+                        }
+                    }
                     signal::Default::Ignore | signal::Default::Continue => {}
                 },
                 _ => {
@@ -487,7 +525,12 @@ impl<P: Platform> Kernel<P> {
             // It ends the whole process, whichever thread it names.
             return self.sys_kill(me, sig);
         }
-        let r = match host::signal_to_host(sig).filter(|_| !owned(sig)) {
+        // A signal the backend's handler catches is posted to the thread
+        // directly, with the wake signal to interrupt it: sent as a host
+        // signal, it would land on a thread that blocks it as if it were the
+        // process's (see [`thread::post_landed`]).
+        let r = match host::signal_to_host(sig).filter(|_| !owned(sig) && caught() & bit(sig) == 0)
+        {
             // SAFETY: `host_thread` is a live registered guest thread.
             Some(h) if host_thread != 0 => unsafe { libc::pthread_kill(host_thread, h) },
             // Not started yet: it takes the signal at its first system call.
@@ -599,7 +642,7 @@ pub(crate) unsafe fn sigsuspend(set: u64, size: u64) -> i64 {
             unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
             return err(errno::EINTR);
         }
-        let wait = host::host_sigset(thread::mask());
+        let wait = host::host_mask_for(thread::mask());
         // SAFETY: as above; returns after a host handler ran.
         unsafe {
             libc::sigsuspend(&wait);

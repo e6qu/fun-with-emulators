@@ -67,9 +67,8 @@ impl Platform for HvPlatform {
         }
     }
 
-    fn stop_self(&mut self) {
-        // SAFETY: plain host call; the process resumes on SIGCONT.
-        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    fn stop_self(&mut self, sig: libc::c_int) {
+        host::stop_with(sig);
     }
 
     fn set_host_signal(&mut self, sig: u64, how: HostSignal) {
@@ -348,7 +347,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         } else {
             host::signal_to_linux(sig)
         };
-        thread::post_self(lsig, thread::SigInfo { code, pid, uid, status });
+        thread::post_landed(lsig, thread::SigInfo { code, pid, uid, status });
     }
     if let Some(mut vcpu) = VCPU.with(Cell::get) {
         // SAFETY: stopping this thread's own vCPU, if it is running.
@@ -371,7 +370,9 @@ fn set_host_signal(sig: u64, how: HostSignal) {
     let Some(h) = host::signal_to_host(sig) else { return };
     // A signal whose default action ends the process is caught all the same,
     // so the process ends through the kernel's default action, which tears
-    // the VM down first, never by the host's with the VM alive.
+    // the VM down first, never by the host's with the VM alive. The kernel
+    // already asks for that (`Kernel::sync_host_signal`); this keeps it the
+    // VM's own guarantee.
     let how = match how {
         HostSignal::Default
             if fwe_abi::signal::default_action(sig) == fwe_abi::signal::Default::Terminate =>
@@ -858,8 +859,8 @@ impl Vcpu {
             if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
                 park();
             }
-            // The guest's mask is in force on the host while it runs, so the
-            // host routes signals as for the native backend.
+            // The host mask the guest's mask calls for is in force while it
+            // runs, as in the native backend.
             let mask = host::host_mask_for(thread::mask());
             enter_run();
             // After the page tables lost a translation, resume through the
