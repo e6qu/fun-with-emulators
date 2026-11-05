@@ -35,7 +35,13 @@ The code is in `crates/native/src/hv/`.
   reducing permissions) bumps a generation; a vCPU resuming after that goes
   through the TLB stub on the code page (`tlbi vmalle1is; dsb ish; isb;
   eret`, at EL1), so every vCPU's TLBs are invalidated before the guest
-  relies on the change, and memory given back is reused only after it.
+  relies on the change, and memory and page tables given back are reused
+  only after a flush that covers the edit that freed them. A page that
+  would lead a translation still possibly in a TLB somewhere else goes into
+  the tables only after such a flush (Arm's break-before-make); an access
+  meanwhile faults and is retried. A permission fault the tables no longer
+  give (a TLB keeping a page's old permissions after `mprotect` widened
+  them) is answered with a flush and a retry, once.
 - **Execution.** The guest runs at EL0. Every exception it takes enters the
   vector, which executes `hvc #2` (not `hvc #0`, which the framework may
   take for a firmware call), so the vCPU stops and the backend reads
@@ -52,7 +58,11 @@ The code is in `crates/native/src/hv/`.
   address, a `MAP_FIXED` address) is backed by slab memory elsewhere and
   translated, as the kernel's checked copies, the pointer arguments it hands
   to host calls and `iovec`s do through a table of translated ranges
-  (`crates/kernel/src/uaccess.rs`). A private file mapping is a copy of the
+  (`crates/kernel/src/uaccess.rs`). A `MAP_FIXED` mapping over slab memory
+  at its own address keeps using that memory, zeroed, so translated ranges
+  stay rare. A buffer the host is given whole (`read`'s, an `iovec`'s) that
+  runs from one translated range into another has no single host address:
+  the call fails with `EINVAL`. A private file mapping is a copy of the
   file's data. Shared memory (`MAP_SHARED`, of a file, or anonymous, then of
   an unlinked file) is a *segment*: a host mapping outside the slab, mapped
   into the VM once. The host's memory behind the guest stays accessible where
@@ -218,7 +228,10 @@ with `x0` = 0. No private page is ever in both processes' VMs:
   kernel or the host is given is fetched first too). Before it execs or
   ends it sends back the bytes it changed, compared with what it fetched, and
   the parent resumes once they are in its memory — so what the child writes
-  the parent sees, as on Linux, without either VM mapping the other's pages;
+  the parent sees, as on Linux, without either VM mapping the other's pages.
+  Only the slab ranges the parent had in use at the `vfork` are fetched and
+  sent back, and only while the child keeps them: memory it gives back or
+  maps anew is its own;
 - shared memory goes to the child as its file, which the child maps: those
   pages are in both VMs, as Linux shares them.
 

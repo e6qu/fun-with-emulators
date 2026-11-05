@@ -157,6 +157,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
 
 const ASM_GUESTS: &[&str] = &[
     "pacbti",
+    "mapfixed",
     "hello",
     "exit42",
     "enosys",
@@ -2500,6 +2501,25 @@ fn hv_pointer_authentication_and_bti() {
         assert!(pac_ok && bti_ok, "{text}");
     }
     assert_eq!(out.status.code(), Some(0), "{text}");
+}
+
+/// MAP_FIXED over mapped memory replaces it, keeping the rest; a buffer
+/// across old and new is one buffer to the kernel; a widened page takes a
+/// write; a mapping over the program's own data (linked low, backed
+/// elsewhere in the VM) reads as zero and takes writes.
+#[test]
+fn hv_map_fixed_replaces_mapped_memory() {
+    let Some(out) = fwe_hv(&asm_guest("mapfixed-low"), &[]) else { return };
+    let text = stdout(&out);
+    let want = format!(
+        "{}{}\nmap_fixed: replaces, and a buffer across both is one\n\
+         mprotect: a widened page takes the write\n\
+         map_fixed: over the program's own data\n",
+        "A".repeat(4096),
+        "B".repeat(4096)
+    );
+    assert_eq!(text, want);
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// The stand-in's watcher reports a process that ended with its VM alive,

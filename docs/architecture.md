@@ -653,7 +653,12 @@ those items.
   executable memory takes a fault each time a page goes from being written
   to being run or back, which is slow for code that does both to one page
   often; a host system call writing into such a page while it is
-  executable (a `read` into it, for one) fails with `EFAULT`.
+  executable (a `read` into it, for one) fails with `EFAULT`. In the VM, a
+  buffer a host call is given whole (`read`'s, an `iovec`'s) that runs from
+  one translated guest range into another fails with `EINVAL` (it has no
+  single host address), and `ioctl`'s argument is translated but not
+  checked against the guest's mappings (it is a pointer only for some
+  requests).
 - **Filesystem:** of `/dev`, only `null`, `zero`, `random`, `urandom`,
   `tty` and the `/proc/self/fd` links are provided; their `stat` reports
   the host's device numbers. File owners other than fwe's own user read as

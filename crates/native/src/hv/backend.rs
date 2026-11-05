@@ -103,6 +103,31 @@ static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 thread_local! {
     /// This thread is inside `hv_vcpu_run`.
     static IN_RUN: Cell<bool> = const { Cell::new(false) };
+    /// This thread is inside another framework call on its vCPU ([`hvf`]).
+    static IN_HVF: Cell<bool> = const { Cell::new(false) };
+    /// The process began ending while this thread was in such a call: it
+    /// gives up its vCPU as the call returns.
+    static RETIRE_AFTER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Make framework call `f` on this thread's vCPU. The wake signal that
+/// ends the process destroys a thread's vCPU from its handler, which must
+/// not happen in the middle of a call on it, nor be followed by one: if it
+/// arrives during `f`, the thread destroys its vCPU after `f` and stops;
+/// if it came before, the thread stops instead of making the call.
+fn hvf<T>(f: impl FnOnce() -> T) -> T {
+    if EXITING.load(std::sync::atomic::Ordering::SeqCst)
+        && (VCPU.with(Cell::get).is_none() || RETIRE_AFTER.with(Cell::get))
+    {
+        park();
+    }
+    let outer = IN_HVF.with(|c| c.replace(true));
+    let r = f();
+    IN_HVF.with(|c| c.set(outer));
+    if !outer && RETIRE_AFTER.with(Cell::get) {
+        park();
+    }
+    r
 }
 
 // --- Stopping the other vCPUs for a fork ----------------------------------
@@ -253,7 +278,9 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
         // The process is ending: a thread not running guest code gives up
         // its vCPU now (one inside hv_vcpu_run does as the run returns).
-        if !IN_RUN.with(Cell::get) {
+        if IN_HVF.with(Cell::get) {
+            RETIRE_AFTER.with(|c| c.set(true));
+        } else if !IN_RUN.with(Cell::get) {
             retire_vcpu();
         }
         return;
@@ -649,8 +676,16 @@ impl Vcpu {
     pub(super) fn create() -> Result<Vcpu, String> {
         let mut id = 0;
         let mut exit = std::ptr::null_mut();
-        // SAFETY: out-parameters for a vCPU owned by this thread.
-        let rc = unsafe { hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()) };
+        // Known as this thread's at once, so an end of the process during
+        // the call destroys it.
+        let rc = hvf(|| {
+            // SAFETY: out-parameters for a vCPU owned by this thread.
+            let rc = unsafe { hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()) };
+            if rc == 0 {
+                VCPU.with(|c| c.set(Some(id)));
+            }
+            rc
+        });
         check(rc, "hv_vcpu_create")?;
         let v = Vcpu { id, exit };
         // What the VM offers, asked of its first vCPU.
@@ -683,25 +718,25 @@ impl Vcpu {
     fn get(&self, reg: hv_reg_t) -> u64 {
         let mut v = 0;
         // SAFETY: reading a register of this thread's vCPU.
-        unsafe { hv_vcpu_get_reg(self.id, reg, &mut v) };
+        hvf(|| unsafe { hv_vcpu_get_reg(self.id, reg, &mut v) });
         v
     }
 
     fn set(&self, reg: hv_reg_t, v: u64) {
         // SAFETY: writing a register of this thread's vCPU.
-        unsafe { hv_vcpu_set_reg(self.id, reg, v) };
+        hvf(|| unsafe { hv_vcpu_set_reg(self.id, reg, v) });
     }
 
     fn get_sys(&self, reg: hv_sys_reg_t) -> u64 {
         let mut v = 0;
         // SAFETY: reading a system register of this thread's vCPU.
-        unsafe { hv_vcpu_get_sys_reg(self.id, reg, &mut v) };
+        hvf(|| unsafe { hv_vcpu_get_sys_reg(self.id, reg, &mut v) });
         v
     }
 
     fn set_sys(&self, reg: hv_sys_reg_t, v: u64) {
         // SAFETY: writing a system register of this thread's vCPU.
-        unsafe { hv_vcpu_set_sys_reg(self.id, reg, v) };
+        hvf(|| unsafe { hv_vcpu_set_sys_reg(self.id, reg, v) });
     }
 
     /// The guest's registers, with `pc` and `pstate` as given.
@@ -717,7 +752,7 @@ impl Vcpu {
         };
         for (i, v) in fp.v.iter_mut().enumerate() {
             // SAFETY: reading a SIMD register of this thread's vCPU.
-            unsafe { hv_vcpu_get_simd_fp_reg(self.id, i as u32, v) };
+            hvf(|| unsafe { hv_vcpu_get_simd_fp_reg(self.id, i as u32, v) });
         }
         r.fp = fp;
         r
@@ -740,7 +775,7 @@ impl Vcpu {
         for (i, v) in r.fp.v.iter().enumerate() {
             // SAFETY: writing a SIMD register of this thread's vCPU from 16
             // readable bytes.
-            unsafe { set_simd_fp_reg(self.id, i as u32, v) };
+            hvf(|| unsafe { set_simd_fp_reg(self.id, i as u32, v) });
         }
     }
 
@@ -751,13 +786,13 @@ impl Vcpu {
     pub(super) fn vtimer_offset(&self) -> u64 {
         let mut offset = 0;
         // SAFETY: reading this thread's vCPU's timer offset.
-        unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut offset) };
+        hvf(|| unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut offset) });
         offset
     }
 
     fn set_vtimer_offset(&self, offset: u64) {
         // SAFETY: setting this thread's vCPU's timer offset.
-        unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
+        hvf(|| unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) });
     }
 
     /// Run the guest from `regs` until the process ends.
@@ -786,7 +821,7 @@ impl Vcpu {
             let (rc, exit) = unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
                 IN_RUN.with(|r| r.set(true));
-                let rc = hv_vcpu_run(self.id);
+                let rc = hvf(|| hv_vcpu_run(self.id));
                 IN_RUN.with(|r| r.set(false));
                 (rc, &*self.exit)
             };
@@ -873,7 +908,7 @@ impl Vcpu {
         if read && (key == (14, 3, 1, 3, 0) || key == (14, 3, 5, 3, 0)) {
             let mut offset = 0;
             // SAFETY: reading this thread's vCPU's timer offset.
-            unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut offset) };
+            hvf(|| unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut offset) });
             // SAFETY: plain host call.
             let now = unsafe { mach_absolute_time() };
             if rt != 31 {
@@ -910,6 +945,11 @@ impl Vcpu {
                 // access is tried again.
                 if esr & 0x3c == 0x04 && mem::demand(far) {
                     regs.pc = elr;
+                } else if esr & 0x3c == 0x0c && stale_permissions(esr, far) {
+                    // A permission fault (0b0011xx) the tables no longer
+                    // give: the TLBs are invalidated, the access tried
+                    // again.
+                    regs.pc = elr;
                 } else {
                     fault(&mut regs, s::SIGSEGV, far)
                 }
@@ -919,6 +959,42 @@ impl Vcpu {
         }
         regs
     }
+}
+
+thread_local! {
+    /// The last permission fault taken as a stale TLB entry's, and the
+    /// flush asked for it: the same fault after that flush is real.
+    static STALE: Cell<(u64, u64)> = const { Cell::new((u64::MAX, 0)) };
+}
+
+/// Whether permission fault `esr` at `far` came from a TLB entry older
+/// than the tables, which allow the access now: Arm lets a TLB keep a
+/// translation's old permissions after they were widened, until it is
+/// invalidated. If so, a flush is asked for, which the vCPU takes before
+/// it resumes.
+fn stale_permissions(esr: u64, far: u64) -> bool {
+    let Some(p) = vm::page_perms(far) else { return false };
+    let ec = esr >> 26;
+    let allowed = if ec == EC_IABT_LOWER {
+        p.exec
+    } else if esr & (1 << 6) != 0 {
+        // WnR: a write.
+        p.write
+    } else {
+        p.read
+    };
+    if !allowed {
+        return false;
+    }
+    let page = far & !(PAGE - 1);
+    let (last, asked) = STALE.with(Cell::get);
+    if last == page && vm::flushed_generation() >= asked {
+        // Flushed since, and it faults still.
+        STALE.with(|c| c.set((u64::MAX, 0)));
+        return false;
+    }
+    STALE.with(|c| c.set((page, vm::request_flush())));
+    true
 }
 
 /// Deliver synchronous fault `sig` at `addr`, or die of it.
@@ -1186,6 +1262,21 @@ fn pointer_ok(n: u64, i: usize, a: &[u64; 6]) -> bool {
     n == nr::IOCTL || len == 0 || mem::valid(p, len, write)
 }
 
+/// Whether the buffer pointer argument `i` of system call `n` is, with its
+/// length, in one translated range or none: the host is given one address
+/// for it. (Paths and structures the kernel copies are split where they
+/// cross; see `uaccess`.)
+fn one_host_range(n: u64, i: usize, a: &[u64; 6]) -> bool {
+    let len = match (n, i) {
+        (nr::READ | nr::PREAD64 | nr::GETDENTS64 | nr::RECVFROM, 1) => a[2],
+        (nr::WRITE | nr::PWRITE64 | nr::SENDTO, 1) => a[2],
+        (nr::READLINKAT, 2) => a[3],
+        (nr::GETCWD | nr::GETRANDOM, 0) => a[1],
+        _ => return true,
+    };
+    !uaccess::crosses(a[i], len)
+}
+
 /// Run the system call in `regs` (number in `x8`), leaving its result and
 /// any signal delivery in `regs`.
 fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
@@ -1201,16 +1292,24 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // Guest pointers the host is given must be guest memory: the host's
     // memory behind them is accessible either way (see `mem`). A vfork
     // child fetches what they reach first.
+    uaccess::clear_host_args();
     for (i, &a) in args.iter().enumerate() {
         if mask & (1 << i) != 0 && a != 0 && !pointer_ok(n, i, &args) {
             kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EFAULT));
             return;
         }
     }
+    // Buffers the host is given whole must have one host address.
+    for (i, &a) in args.iter().enumerate() {
+        if mask & (1 << i) != 0 && a != 0 && !one_host_range(n, i, &args) {
+            kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EINVAL));
+            return;
+        }
+    }
     let mut host_args = args;
     for (i, a) in host_args.iter_mut().enumerate() {
         if mask & (1 << i) != 0 {
-            *a = uaccess::g2h(*a);
+            *a = uaccess::host_arg(*a);
         }
     }
     let result = match n {
@@ -1264,5 +1363,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             }
         }
     };
+    // Guest addresses only from here on (a signal frame, say).
+    uaccess::clear_host_args();
     kernel().as_mut().unwrap().finish_syscall(regs, n, &args, result);
 }

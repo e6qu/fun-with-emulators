@@ -157,7 +157,7 @@ impl Flush {
     pub fn done(self) {
         if FLUSHED.fetch_max(self.generation, SeqCst) < self.generation {
             if let Some(t) = tables().as_mut() {
-                t.flushed();
+                t.flushed(self.generation);
             }
         }
         flushed_hook(self.generation);
@@ -184,6 +184,28 @@ pub fn generation() -> u64 {
     GENERATION.load(SeqCst)
 }
 
+/// The newest generation a completed flush covers: translations lost up
+/// to it are in no TLB.
+pub fn flushed_generation() -> u64 {
+    FLUSHED.load(SeqCst)
+}
+
+/// The permissions the tables give guest page `va`, if it is mapped.
+pub fn page_perms(va: u64) -> Option<Perms> {
+    tables().as_ref()?.translate(va).map(|(_, p)| p)
+}
+
+/// Have every vCPU invalidate its TLBs before it next runs the guest,
+/// although the tables lost nothing: a TLB holds an entry older than the
+/// tables' (permissions they gave since, which a TLB may keep the old
+/// ones of). The generation to wait for.
+pub fn request_flush() -> u64 {
+    // Under the tables' lock: an edit owns the generation it bumps to, and
+    // a flush dispatched for this one must not count as covering it.
+    let _t = tables();
+    GENERATION.fetch_add(1, SeqCst) + 1
+}
+
 /// No vCPU can hold a translation (none has run, or none runs now): every
 /// lost translation counts as flushed.
 pub fn flushed_without_vcpus() {
@@ -205,26 +227,38 @@ pub fn perms(prot: u64) -> Perms {
     }
 }
 
-fn edited(change: super::pagetables::Change) {
-    if change.flush {
-        GENERATION.fetch_add(1, SeqCst);
+/// Edit the tables. An edit that loses a translation belongs to the
+/// generation it bumps to, made under the tables' lock: a flush dispatched
+/// before the bump does not cover it.
+fn edit<T>(
+    f: impl FnOnce(&mut PageTables<SysPool>) -> Result<(super::pagetables::Change, T), i32>,
+) -> Result<T, i32> {
+    let mut t = tables();
+    let t = t.as_mut().ok_or(fwe_abi::errno::ENOMEM)?;
+    t.set_generation(GENERATION.load(SeqCst) + 1);
+    match f(t) {
+        Ok((change, out)) => {
+            if change.flush {
+                GENERATION.fetch_add(1, SeqCst);
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            // It may have changed some of the range before it failed.
+            GENERATION.fetch_add(1, SeqCst);
+            Err(e)
+        }
     }
 }
 
 /// Map guest pages `[va, va + len)` to IPAs from `ipa` with `p`.
 pub fn map_pages(va: u64, len: u64, ipa: u64, p: Perms) -> Result<(), i32> {
-    let mut t = tables();
-    let t = t.as_mut().ok_or(fwe_abi::errno::ENOMEM)?;
-    let change = t.map(va, len, ipa, p).map_err(|()| fwe_abi::errno::ENOMEM)?;
-    edited(change);
-    Ok(())
+    edit(|t| Ok((t.map(va, len, ipa, p).map_err(|()| fwe_abi::errno::ENOMEM)?, ())))
 }
 
 /// Unmap guest pages `[va, va + len)`.
 pub fn unmap_pages(va: u64, len: u64) {
-    if let Some(t) = tables().as_mut() {
-        edited(t.unmap(va, len));
-    }
+    let _ = edit(|t| Ok((t.unmap(va, len), ())));
 }
 
 // --- Shared segments ---------------------------------------------------------

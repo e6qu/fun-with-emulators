@@ -119,6 +119,17 @@ pub struct Mem {
     /// up it has held data (pages below are zeroed when mapped again).
     brk_range: (u64, u64),
     brk_high: u64,
+    /// Guest ranges taken out of the tables since the last flush,
+    /// `(start, end, ipa of start, generation)`: a TLB may still hold their
+    /// translations.
+    removed: Vec<(u64, u64, u64, u64)>,
+    /// Guest ranges whose pages wait for a flush, `(start, end,
+    /// generation)`: they would lead a removed translation somewhere else,
+    /// which the architecture allows only once no TLB holds the old one
+    /// (break-before-make). They go into the tables when a flush covers the
+    /// generation ([`flushed`]); until then an access faults and is tried
+    /// again ([`demand`]).
+    deferred: Vec<(u64, u64, u64)>,
 }
 
 static MEM: Mutex<Option<Mem>> = Mutex::new(None);
@@ -145,12 +156,10 @@ fn page_up(a: u64) -> u64 {
     a.checked_add(PAGE - 1).map_or(!(PAGE - 1), |v| v & !(PAGE - 1))
 }
 
-/// Whether the guest may access `[addr, addr + len)` (writing, with
-/// `write`): every page mapped, readable, and writable if `write`. The
-/// kernel is given host addresses for guest pointers: one inside a
-/// translated range's host memory stands for its guest address.
+/// Whether the guest may access guest range `[addr, addr + len)`
+/// (writing, with `write`): every page mapped, readable, and writable if
+/// `write`.
 pub fn valid(addr: u64, len: u64, write: bool) -> bool {
-    let addr = guest_of(addr, len);
     let Some(end) = addr.checked_add(len) else { return false };
     // A vfork child has its parent's memory fetched first.
     prepare_access(addr, len);
@@ -172,26 +181,27 @@ pub fn valid(addr: u64, len: u64, write: bool) -> bool {
     at >= hi
 }
 
-/// The guest address host address `addr` stands for: itself, or — inside
-/// the host memory of a translated range — the guest address it backs.
-fn guest_of(addr: u64, len: u64) -> u64 {
-    for (g, l, h) in uaccess::translations() {
-        if addr >= h && addr.saturating_add(len) <= h + l {
-            return g + (addr - h);
-        }
-    }
-    addr
-}
-
 /// A flush covering `generation` completed: what was given back before it
 /// can be reused.
 fn flushed(generation: u64) {
     let mut g = mem();
     let Some(m) = g.as_mut() else { return };
+    m.removed.retain(|&(_, _, _, g)| g > generation);
+    let (now, later): (Vec<_>, Vec<_>) =
+        m.deferred.drain(..).partition(|&(_, _, g)| g <= generation);
+    m.deferred = later;
+    for (start, end, _) in now {
+        for p in m.vmas.pieces(start, end) {
+            // On failure the pages stay out: an access faults as for
+            // memory not mapped.
+            let _ = m.install(p.start, p.end, &p.value);
+        }
+    }
     let (now, later): (Vec<_>, Vec<_>) =
         m.pending.drain(..).partition(|&(g, _, _)| g <= generation);
     m.pending = later;
     for (_, host, len) in now {
+        forget_remote(host, host + len);
         window::release(host, len);
     }
     let (now, later): (Vec<_>, Vec<_>) =
@@ -215,7 +225,32 @@ impl Mem {
         }
     }
 
-    /// Put `[start, end)` of `area` into the tables.
+    /// Put `[start, end)` of `area` into the tables, or — where a TLB may
+    /// still lead its pages elsewhere — once a flush covers that
+    /// ([`Mem::deferred`]).
+    fn install(&mut self, start: u64, end: u64, area: &Area) -> Result<(), i32> {
+        if area.prot != mman::PROT_NONE {
+            let ipa = self.ipa(area).ok_or(errno::ENOMEM)?;
+            let flushed = vm::flushed_generation();
+            let elsewhere = self.removed.iter().any(|&(a, b, old, g)| {
+                // Not flushed yet, overlapping, at a different IPA for the
+                // same address.
+                g > flushed
+                    && a < end
+                    && b > start
+                    && old.wrapping_sub(a) != ipa.wrapping_sub(start)
+            });
+            let waiting = self.deferred.iter().any(|&(a, b, _)| a < end && b > start);
+            if elsewhere || waiting {
+                vm::unmap_pages(start, end - start);
+                self.deferred.push((start, end, vm::generation()));
+                return Ok(());
+            }
+        }
+        self.install_pages(start, end, area)
+    }
+
+    /// Put `[start, end)` of `area` into the tables now.
     fn install_pages(&self, start: u64, end: u64, area: &Area) -> Result<(), i32> {
         if area.prot == mman::PROT_NONE {
             vm::unmap_pages(start, end - start);
@@ -228,26 +263,61 @@ impl Mem {
     /// Unmap `[start, end)`: out of the tables, its memory released after
     /// the flush that follows.
     fn remove(&mut self, start: u64, end: u64) {
+        let held = self.remove_keeping(start, end);
+        let generation = vm::generation();
+        for (h, e) in held {
+            self.pending.push((generation, h, e - h));
+        }
+    }
+
+    /// Unmap `[start, end)` for a mapping that replaces it at once: slab
+    /// memory at the same address as its guest pages (the common case) is
+    /// kept for the new mapping, which takes it at the same address — old
+    /// and new translations then lead to the same memory, so no TLB entry
+    /// can lead anywhere else. Returns the slab ranges kept; everything else
+    /// is released after the flush that follows.
+    fn remove_keeping(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
         let gone = self.vmas.remove(start, end);
         if gone.is_empty() {
-            return;
+            return Vec::new();
         }
         vm::unmap_pages(start, end - start);
         // Released after the flush the unmapping needs: the generation the
         // edit bumped to.
         let generation = vm::generation();
+        for p in &gone {
+            if let Some(ipa) = self.ipa(&p.value) {
+                self.removed.push((p.start, p.end, ipa, generation));
+            }
+        }
+        let (bs, be) = self.brk_range;
+        let mut kept = Vec::new();
         for Piece { start, end, value } in gone {
             match value.back {
                 Back::Slab { host } => {
                     if host != start {
                         uaccess::remove_translation(start, end - start);
                     }
-                    // The break's range stays reserved for it.
-                    let (bs, be) = self.brk_range;
-                    if host >= bs && host < be {
-                        continue;
+                    let (h, he) = (host, host + (end - start));
+                    // The parts outside the break's range, which stays
+                    // reserved for the break.
+                    let mut parts = Vec::new();
+                    if h < bs {
+                        parts.push((h, he.min(bs)));
                     }
-                    self.pending.push((generation, host, end - start));
+                    if he > be {
+                        parts.push((h.max(be), he));
+                    }
+                    if bs == be {
+                        parts = vec![(h, he)];
+                    }
+                    for (a, b) in parts.into_iter().filter(|(a, b)| a < b) {
+                        if host == start {
+                            kept.push((a, b));
+                        } else {
+                            self.pending.push((generation, a, b - a));
+                        }
+                    }
                 }
                 Back::Segment { id, .. } => {
                     uaccess::remove_translation(start, end - start);
@@ -260,36 +330,91 @@ impl Mem {
                 }
             }
         }
+        kept
     }
 
     /// Slab memory for `len` bytes at guest address `addr`: the same host
-    /// address where it is free in the slab, else a range elsewhere.
-    fn back(&mut self, addr: u64, len: u64) -> Result<u64, i32> {
-        if window::take_fixed(addr, len) {
+    /// address where it is `kept` (memory of the mapping this one replaces,
+    /// zeroed now) or free in the slab, else a range elsewhere, translated.
+    fn back(&mut self, addr: u64, len: u64, kept: Vec<(u64, u64)>) -> Result<u64, i32> {
+        let end = addr + len;
+        // The parts not kept must be free at the same address.
+        let mut gaps = Vec::new();
+        let mut at = addr;
+        let mut sorted = kept.clone();
+        sorted.sort();
+        for &(a, b) in &sorted {
+            if a > at {
+                gaps.push((at, a));
+            }
+            at = at.max(b);
+        }
+        if at < end {
+            gaps.push((at, end));
+        }
+        let mut claimed = Vec::new();
+        let mut identity = window::contains(addr, len);
+        if identity {
+            for &(a, b) in &gaps {
+                if window::take_fixed(a, b - a) {
+                    claimed.push((a, b));
+                } else {
+                    identity = false;
+                    break;
+                }
+            }
+        }
+        if identity {
+            for &(a, b) in &sorted {
+                forget_remote(a, b);
+                // SAFETY: slab memory of the mapping being replaced, kept
+                // for this one at the same address.
+                unsafe { std::ptr::write_bytes(a as *mut u8, 0, (b - a) as usize) };
+            }
             return Ok(addr);
+        }
+        // Never mapped by anyone since they were taken: given back now.
+        for (a, b) in claimed {
+            window::release(a, b - a);
+        }
+        let generation = vm::generation();
+        for (a, b) in sorted {
+            self.pending.push((generation, a, b - a));
         }
         let host = window::alloc(len).ok_or(errno::ENOMEM)?;
         uaccess::add_translation(addr, len, host);
         Ok(host)
     }
 
-    /// Map private memory at `[addr, addr + len)` (placed already), with
-    /// file data from `source` copied in.
+    /// Map private memory at `[addr, addr + len)` (placed already, the
+    /// memory it replaces `kept`), with file data from `source` copied in.
     fn map_private(
         &mut self,
         addr: u64,
         len: u64,
         prot: u64,
         source: Option<Source>,
+        kept: Vec<(u64, u64)>,
     ) -> Result<(), i32> {
-        let host = self.back(addr, len)?;
+        let host = self.back(addr, len, kept)?;
         if let Some(s) = &source {
-            fill(host, len, s)?;
-            code_written(host, len);
+            if let Err(e) = fill(host, len, s) {
+                // Nothing maps it yet: given back after the next flush.
+                self.pending.push((vm::generation(), host, len));
+                if host != addr {
+                    uaccess::remove_translation(addr, len);
+                }
+                return Err(e);
+            }
         }
+        // Kept memory was zeroed, filled memory written: either may have
+        // held code.
+        code_written(host, len);
         let area = Area { prot, back: Back::Slab { host }, source };
-        if let Err(e) = self.install_pages(addr, addr + len, &area) {
-            window::release(host, len);
+        if let Err(e) = self.install(addr, addr + len, &area) {
+            // What was mapped of it goes again; its memory after a flush.
+            vm::unmap_pages(addr, len);
+            self.pending.push((vm::generation(), host, len));
             if host != addr {
                 uaccess::remove_translation(addr, len);
             }
@@ -342,7 +467,7 @@ impl Mem {
         self.segments
             .insert(id, Segment { host, len: hlen, ipa, file, file_offset: base, refs: len });
         let area = Area { prot, back: Back::Segment { id, off: delta }, source: None };
-        if let Err(e) = self.install_pages(addr, addr + len, &area) {
+        if let Err(e) = self.install(addr, addr + len, &area) {
             self.segments.remove(&id);
             vm::unmap_segment(ipa);
             // SAFETY: the mapping just made, no longer in the VM.
@@ -425,8 +550,12 @@ impl Mem {
             }
         };
         // A fixed mapping replaces what is there.
-        self.remove(at, at + len);
+        let kept = self.remove_keeping(at, at + len);
         let r = if shared {
+            let generation = vm::generation();
+            for &(h, e) in &kept {
+                self.pending.push((generation, h, e - h));
+            }
             let file = match file {
                 Some(f) => f,
                 None => match anonymous_file(len) {
@@ -436,7 +565,7 @@ impl Mem {
             };
             self.map_shared(at, len, prot, file, if anonymous { 0 } else { offset })
         } else {
-            self.map_private(at, len, prot, file.map(|file| Source { file, offset }))
+            self.map_private(at, len, prot, file.map(|file| Source { file, offset }), kept)
         };
         match r {
             Ok(()) => at as i64,
@@ -464,7 +593,7 @@ impl Mem {
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC | mman::PROT_BTI);
         self.vmas.update(addr, end, |a| Area { prot, ..a.clone() });
         for p in self.vmas.pieces(addr, end) {
-            if let Err(e) = self.install_pages(p.start, p.end, &p.value) {
+            if let Err(e) = self.install(p.start, p.end, &p.value) {
                 return err(e);
             }
         }
@@ -481,6 +610,7 @@ impl Mem {
             // Pages the break held before read as zero again.
             let dirty_end = new_end.min(self.brk_high);
             if dirty_end > old_end {
+                forget_remote(old_end, dirty_end);
                 // SAFETY: the break's own slab range, unmapped from the
                 // guest since it shrank (and flushed since: a vCPU only
                 // shrinks or grows it from a system call).
@@ -493,7 +623,7 @@ impl Mem {
                 back: Back::Slab { host: old_end },
                 source: None,
             };
-            if self.install_pages(old_end, new_end, &area).is_err() {
+            if self.install(old_end, new_end, &area).is_err() {
                 return brk.current as i64;
             }
             self.vmas.insert(old_end, new_end, area);
@@ -515,7 +645,9 @@ impl Mem {
                 return err(errno::ENOMEM);
             }
             // Private memory reads as zero again (or as the file, for a
-            // file mapping); shared memory keeps its contents.
+            // file mapping); shared memory keeps its contents. A vfork
+            // child has its parent's memory first, to send back the change.
+            fetch_range(self, addr, end - addr);
             for p in self.vmas.pieces(addr, end) {
                 if let Back::Slab { host } = p.value.back {
                     let len = p.end - p.start;
@@ -590,7 +722,7 @@ impl Mem {
             if host != old {
                 uaccess::add_translation(old_end, grow, host + old_len);
             }
-            if let Err(e) = self.install_pages(old_end, old_end + grow, &more) {
+            if let Err(e) = self.install(old_end, old_end + grow, &more) {
                 return err(e);
             }
             self.vmas.insert(old_end, old_end + grow, more);
@@ -599,11 +731,13 @@ impl Mem {
         if flags & mman::MREMAP_MAYMOVE == 0 {
             return err(errno::ENOMEM);
         }
+        // A vfork child has its parent's memory first, to copy it.
+        fetch_range(self, old, old_len);
         let to = match self.place(new_len) {
             Ok(a) => a,
             Err(e) => return err(e),
         };
-        if let Err(e) = self.map_private(to, new_len, area.prot, None) {
+        if let Err(e) = self.map_private(to, new_len, area.prot, area.source.clone(), Vec::new()) {
             return err(e);
         }
         let to_host = uaccess::g2h(to);
@@ -693,8 +827,8 @@ pub fn map_fixed(addr: u64, len: u64, prot: u64) -> Result<u64, i32> {
     let mut g = mem();
     let m = g.as_mut().ok_or(errno::ENOMEM)?;
     let len = page_up(len);
-    m.remove(addr, addr + len);
-    m.map_private(addr, len, prot, None)?;
+    let kept = m.remove_keeping(addr, addr + len);
+    m.map_private(addr, len, prot, None, kept)?;
     Ok(uaccess::g2h(addr))
 }
 
@@ -705,7 +839,7 @@ pub fn map_anywhere(len: u64, prot: u64) -> Result<u64, i32> {
     let m = g.as_mut().ok_or(errno::ENOMEM)?;
     let len = page_up(len);
     let at = m.place(len)?;
-    m.map_private(at, len, prot, None)?;
+    m.map_private(at, len, prot, None, Vec::new())?;
     Ok(at)
 }
 
@@ -798,6 +932,13 @@ impl Mem {
         e.u64(self.brk_range.0);
         e.u64(self.brk_range.1);
         e.u64(self.brk_high);
+        // Slab memory waiting to be given back: in use in the window the
+        // child takes, given back there once its VM is made.
+        e.u64(self.pending.len() as u64);
+        for &(_, host, len) in &self.pending {
+            e.u64(host);
+            e.u64(len);
+        }
     }
 
     /// The records a fork parent saved; segments are mapped again by
@@ -831,6 +972,11 @@ impl Mem {
         m.next_segment = d.u64();
         m.brk_range = (d.u64(), d.u64());
         m.brk_high = d.u64();
+        // No vCPU has run in the child: released at its first flush.
+        for _ in 0..d.count(16) {
+            let (host, len) = (d.u64(), d.u64());
+            m.pending.push((0, host, len));
+        }
         m
     }
 
@@ -891,16 +1037,64 @@ pub const CHUNK: u64 = 64 << 10;
 /// What a `vfork` child fetched, and the channel to its parent.
 struct Lazy {
     sock: i32,
+    /// The slab ranges, `start -> end`, that still hold the parent's memory
+    /// here (as the parent had them in use at the `vfork`): fetched before
+    /// use, and what the child changes in them sent back. A range the child
+    /// gives back or maps anew is its own from then on.
+    remote: BTreeMap<u64, u64>,
     /// Each fetched chunk's contents as fetched, to send back what changed.
     fetched: BTreeMap<u64, Box<[u8]>>,
 }
 
+impl Lazy {
+    /// The parts of `[start, end)` that hold the parent's memory.
+    fn remote_parts(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = self
+            .remote
+            .range(..end)
+            .rev()
+            .take_while(|&(_, &e)| e > start)
+            .map(|(&s, &e)| (s.max(start), e.min(end)))
+            .collect();
+        out.reverse();
+        out
+    }
+}
+
 static LAZY: Mutex<Option<Lazy>> = Mutex::new(None);
 
+fn lazy() -> MutexGuard<'static, Option<Lazy>> {
+    LAZY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// This process is a `vfork` child that fetches its parent's private memory
-/// over `sock` as it needs it.
+/// over `sock` as it needs it: the slab ranges in use now.
 pub fn start_lazy(sock: i32) {
-    *LAZY.lock().unwrap_or_else(|e| e.into_inner()) = Some(Lazy { sock, fetched: BTreeMap::new() });
+    let remote = window::used_ranges();
+    *lazy() = Some(Lazy { sock, remote, fetched: BTreeMap::new() });
+}
+
+/// Slab range `[start, end)` no longer holds the parent's memory in a
+/// `vfork` child: it was given back, or taken anew.
+fn forget_remote(start: u64, end: u64) {
+    let mut g = lazy();
+    let Some(lz) = g.as_mut() else { return };
+    let hit: Vec<(u64, u64)> = lz
+        .remote
+        .range(..end)
+        .rev()
+        .take_while(|&(_, &e)| e > start)
+        .map(|(&a, &b)| (a, b))
+        .collect();
+    for (a, b) in hit {
+        lz.remote.remove(&a);
+        if a < start {
+            lz.remote.insert(a, start);
+        }
+        if b > end {
+            lz.remote.insert(end, b);
+        }
+    }
 }
 
 /// Requests a `vfork` child sends its parent.
@@ -942,9 +1136,9 @@ pub fn recv_all(fd: i32, buf: &mut [u8]) -> bool {
 /// In a `vfork` child: fetch every chunk of slab memory behind guest range
 /// `[addr, addr + len)` not fetched yet, and map the guest pages those
 /// chunks back. True if private memory of the range is now mapped.
-fn fetch_range(m: &Mem, addr: u64, len: u64) -> bool {
+fn fetch_range(m: &mut Mem, addr: u64, len: u64) -> bool {
     let (lo, hi) = (addr & !(PAGE - 1), page_up(addr.saturating_add(len.max(1))));
-    let mut lazy = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lazy = lazy();
     let Some(lz) = lazy.as_mut() else { return false };
     // The guest pages to map: the parts of each private mapping whose slab
     // memory the chunks hold.
@@ -955,7 +1149,8 @@ fn fetch_range(m: &Mem, addr: u64, len: u64) -> bool {
         let (c_lo, c_hi) = (h_lo & !(CHUNK - 1), (h_hi + CHUNK - 1) & !(CHUNK - 1));
         let mut chunk = c_lo;
         while chunk < c_hi {
-            if !lz.fetched.contains_key(&chunk) {
+            let parts = lz.remote_parts(chunk, chunk + CHUNK);
+            if !parts.is_empty() && !lz.fetched.contains_key(&chunk) {
                 let mut req = [0u8; 17];
                 req[0] = FETCH;
                 req[1..9].copy_from_slice(&chunk.to_le_bytes());
@@ -964,12 +1159,21 @@ fn fetch_range(m: &Mem, addr: u64, len: u64) -> bool {
                 if !send_all(lz.sock, &req) || !recv_all(lz.sock, &mut data) {
                     return false;
                 }
-                // SAFETY: the child's own slab memory at the parent's
-                // address, not yet touched by the child.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), chunk as *mut u8, CHUNK as usize)
-                };
-                code_written(chunk, CHUNK);
+                // Only what holds the parent's memory: the rest of the
+                // chunk is the child's own.
+                for (a, b) in parts {
+                    let off = (a - chunk) as usize;
+                    // SAFETY: the child's own slab memory at the parent's
+                    // address, not yet touched by the child.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(off),
+                            a as *mut u8,
+                            (b - a) as usize,
+                        )
+                    };
+                    code_written(a, b - a);
+                }
                 lz.fetched.insert(chunk, data);
             }
             chunk += CHUNK;
@@ -988,19 +1192,26 @@ fn fetch_range(m: &Mem, addr: u64, len: u64) -> bool {
     drop(lazy);
     let mut ok = !install.is_empty();
     for (a, b, area) in install {
-        ok &= m.install_pages(a, b, &area).is_ok();
+        ok &= m.install(a, b, &area).is_ok();
     }
     ok
 }
 
-/// A guest access at `va` faulted for lack of a translation: in a `vfork`
-/// child, fetch what is missing and map it. True if the access can be
-/// tried again.
+/// A guest access at `va` faulted for lack of a translation: its pages
+/// wait for a flush ([`Mem::deferred`]) or went in at one, or — in a
+/// `vfork` child — what is missing is fetched and mapped now. True if the
+/// access can be tried again.
 pub fn demand(va: u64) -> bool {
-    let g = mem();
-    let Some(m) = g.as_ref() else { return false };
+    let mut g = mem();
+    let Some(m) = g.as_mut() else { return false };
     if m.vmas.get(va).is_none() {
         return false;
+    }
+    // Its pages wait for a flush, which the vCPU takes before it resumes;
+    // or they went in since the access (at the flush the vCPU ran just
+    // before it).
+    if m.deferred.iter().any(|&(a, b, _)| a <= va && va < b) || vm::page_perms(va).is_some() {
+        return true;
     }
     fetch_range(m, va, 1)
 }
@@ -1008,12 +1219,11 @@ pub fn demand(va: u64) -> bool {
 /// The kernel is about to touch guest range `[addr, addr + len)`: in a
 /// `vfork` child, fetch what of it is missing first.
 pub fn prepare_access(addr: u64, len: u64) {
-    if LAZY.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+    if lazy().is_none() {
         return;
     }
-    let addr = guest_of(addr, len);
-    let g = mem();
-    if let Some(m) = g.as_ref() {
+    let mut g = mem();
+    if let Some(m) = g.as_mut() {
         fetch_range(m, addr, len);
     }
 }
@@ -1021,27 +1231,29 @@ pub fn prepare_access(addr: u64, len: u64) {
 /// In a `vfork` child about to exec or end: send the parent every byte it
 /// changed in the memory it fetched, and wait until the parent has them.
 pub fn finish_lazy() {
-    let Some(lz) = LAZY.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let Some(lz) = lazy().take() else { return };
     for (&chunk, orig) in &lz.fetched {
         // SAFETY: the child's own slab memory, fetched from the parent.
         let now = unsafe { std::slice::from_raw_parts(chunk as *const u8, CHUNK as usize) };
-        let mut i = 0;
-        while i < now.len() {
-            if now[i] == orig[i] {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < now.len() && now[i] != orig[i] {
-                i += 1;
-            }
-            let mut msg = Vec::with_capacity(17 + i - start);
-            msg.push(WRITE);
-            msg.extend_from_slice(&(chunk + start as u64).to_le_bytes());
-            msg.extend_from_slice(&((i - start) as u64).to_le_bytes());
-            msg.extend_from_slice(&now[start..i]);
-            if !send_all(lz.sock, &msg) {
-                return;
+        for (a, b) in lz.remote_parts(chunk, chunk + CHUNK) {
+            let (mut i, end) = ((a - chunk) as usize, (b - chunk) as usize);
+            while i < end {
+                if now[i] == orig[i] {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < end && now[i] != orig[i] {
+                    i += 1;
+                }
+                let mut msg = Vec::with_capacity(17 + i - start);
+                msg.push(WRITE);
+                msg.extend_from_slice(&(chunk + start as u64).to_le_bytes());
+                msg.extend_from_slice(&((i - start) as u64).to_le_bytes());
+                msg.extend_from_slice(&now[start..i]);
+                if !send_all(lz.sock, &msg) {
+                    return;
+                }
             }
         }
     }

@@ -19,7 +19,10 @@
 //! (the low 4 GiB on macOS), a shared mapping. It registers each such range
 //! with [`add_translation`], and every guest address is passed through
 //! [`g2h`] before the kernel or the host touches it; copies that cross from
-//! one translation into another are split where they do.
+//! one translation into another are split where they do. Pointer arguments
+//! a system call hands the host are translated with [`host_arg`], which
+//! remembers them for the call, so a copy the kernel makes through one is
+//! taken as a copy of the guest address it came from ([`guest_of`]).
 //!
 //! Such a backend also keeps host memory accessible where the guest's is
 //! not (its guest has page tables of its own), so a bad pointer would not
@@ -127,6 +130,45 @@ pub fn g2h(addr: u64) -> u64 {
         return addr;
     }
     run(addr).0
+}
+
+thread_local! {
+    /// The pointer arguments of the system call this thread is in that the
+    /// backend translated ([`host_arg`]), as `(host, host end, guest)`: the
+    /// kernel holds host addresses for them, which stand for those guest
+    /// addresses — and nothing else does.
+    static HOST_ARGS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The host address for pointer argument `addr` of the system call this
+/// thread is starting ([`g2h`]), remembered so the kernel's own copies
+/// through it are taken as copies of `addr` ([`guest_of`]).
+pub fn host_arg(addr: u64) -> u64 {
+    if table().is_empty() {
+        return addr;
+    }
+    let (host, room) = run(addr);
+    if host != addr {
+        HOST_ARGS.with(|h| h.borrow_mut().push((host, host.saturating_add(room), addr)));
+    }
+    host
+}
+
+/// The system call [`host_arg`] translated arguments for is over.
+pub fn clear_host_args() {
+    HOST_ARGS.with(|h| h.borrow_mut().clear());
+}
+
+/// The guest address an address the kernel holds stands for: the guest
+/// address a translated pointer argument came from, else itself.
+pub fn guest_of(addr: u64) -> u64 {
+    HOST_ARGS.with(|h| {
+        h.borrow()
+            .iter()
+            .find(|&&(lo, hi, _)| addr >= lo && addr < hi)
+            .map_or(addr, |&(lo, _, g)| g + (addr - lo))
+    })
 }
 
 /// Whether the guest may access `[addr, addr + len)` (for writing, with
@@ -245,6 +287,7 @@ fn check(ok: bool) -> Result<()> {
 /// # Safety
 /// `buf` must be valid for `len` bytes.
 unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Result<()> {
+    let addr = guest_of(addr);
     check(valid(addr, len as u64, to_guest))?;
     let mut done = 0usize;
     while done < len {
@@ -350,19 +393,27 @@ pub fn read_cstr_array(addr: u64, max_each: usize) -> Result<Vec<Vec<u8>>> {
 }
 
 /// A guest `iovec` array of `count` entries at `addr`, with each buffer's
-/// address translated, ready to hand to the host.
-pub fn host_iovecs(addr: u64, count: u64) -> Result<Vec<libc::iovec>> {
+/// address translated, ready to hand to the host, which writes into the
+/// buffers with `write`. Each buffer must be guest memory (`EFAULT`), in
+/// one translated range or none (`EINVAL`: the host is given one address
+/// for it).
+pub fn host_iovecs(addr: u64, count: u64, write: bool) -> Result<Vec<libc::iovec>> {
     if count > 1024 {
         return Err(errno::EINVAL);
     }
     let raw = read_bytes(addr, count as usize * 16)?;
-    Ok(raw
-        .chunks_exact(16)
-        .map(|c| libc::iovec {
-            iov_base: g2h(u64::from_ne_bytes(c[0..8].try_into().unwrap())) as *mut libc::c_void,
-            iov_len: u64::from_ne_bytes(c[8..16].try_into().unwrap()) as usize,
-        })
-        .collect())
+    let mut out = Vec::with_capacity(count as usize);
+    for c in raw.chunks_exact(16) {
+        let base = u64::from_ne_bytes(c[0..8].try_into().unwrap());
+        let len = u64::from_ne_bytes(c[8..16].try_into().unwrap());
+        // An empty buffer is never touched, as on Linux.
+        check(len == 0 || valid(base, len, write))?;
+        if crosses(base, len) {
+            return Err(errno::EINVAL);
+        }
+        out.push(libc::iovec { iov_base: g2h(base) as *mut libc::c_void, iov_len: len as usize });
+    }
+    Ok(out)
 }
 
 /// Which arguments of system call `nr` are pointers to guest memory the
@@ -500,6 +551,16 @@ mod tests {
         remove_translation(0x1_0800, 0x800);
         assert_eq!(g2h(0x1_0900), 0x1_0900);
         assert_eq!(g2h(0x1_1004), a.as_ptr() as u64 + 0x1004);
+        // A translated pointer argument stands for its guest address, and
+        // copies through it are copies of the guest's memory.
+        let h = host_arg(0x1_1000);
+        assert_eq!(h, a.as_ptr() as u64 + 0x1000);
+        assert_eq!(guest_of(h + 8), 0x1_1008);
+        let mut one = [0u8; 4];
+        read_into(h, &mut one).unwrap();
+        assert_eq!(one, [0xaa; 4]);
+        clear_host_args();
+        assert_eq!(guest_of(h + 8), h + 8);
         remove_translation(0x1_0000, 0x3000);
         assert!(translations().iter().all(|&(g, _, _)| !(0x1_0000..0x1_0000_0000).contains(&g)));
     }

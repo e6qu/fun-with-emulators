@@ -698,7 +698,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
-        n::READV => match uaccess::host_iovecs(a[1], a[2]) {
+        n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) => {
                 // SAFETY: the iovecs are translated host buffers; the host
                 // checks them.
@@ -707,7 +707,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             Err(e) => fwe_abi::err(e),
         },
-        n::WRITEV => match uaccess::host_iovecs(a[1], a[2]) {
+        n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
             Ok(iov) => {
                 // SAFETY: as for readv.
                 let r = unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
@@ -731,7 +731,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
                 0
             } else {
                 match uaccess::read::<[u64; 2]>(a[5]) {
-                    Ok([ss, _]) => uaccess::g2h(ss),
+                    Ok([ss, _]) => ss,
                     Err(e) => return Some(fwe_abi::err(e)),
                 }
             };

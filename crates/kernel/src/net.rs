@@ -657,7 +657,7 @@ fn read_msghdr(msg: u64) -> uaccess::Result<(u64, u32, u64, u64, u64, u64)> {
 /// `msg` must point to a valid `msghdr`.
 pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let (name, namelen, iov, iovlen, control, controllen) = guest!(read_msghdr(msg));
-    let mut hiov = guest!(uaccess::host_iovecs(iov, iovlen));
+    let mut hiov = guest!(uaccess::host_iovecs(iov, iovlen, false));
     let mut hb = empty_sockaddr();
     let (name_ptr, name_len) = if name != 0 && namelen != 0 {
         // SAFETY: the caller guarantees the name spans namelen.
@@ -705,7 +705,7 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
 /// `msg` must point to a valid `msghdr` with writable `iov`/`name`.
 pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let (name, namelen, iov, iovlen, control, controllen) = guest!(read_msghdr(msg));
-    let mut hiov = guest!(uaccess::host_iovecs(iov, iovlen));
+    let mut hiov = guest!(uaccess::host_iovecs(iov, iovlen, true));
     let want_name = name != 0 && namelen != 0;
     let mut hb = empty_sockaddr();
 

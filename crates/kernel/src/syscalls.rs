@@ -101,12 +101,12 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
             nr::READV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2]));
+                let iov = guest!(uaccess::host_iovecs(a[1], a[2], true));
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
             nr::WRITEV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2]));
+                let iov = guest!(uaccess::host_iovecs(a[1], a[2], false));
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }

@@ -117,8 +117,11 @@ pub trait Pool {
 pub struct PageTables<P: Pool> {
     pool: P,
     root: u64,
-    /// Tables emptied by unmappings, freed after the next invalidation.
-    retired: Vec<u64>,
+    /// Tables emptied by unmappings, `(table, generation)`: freed once an
+    /// invalidation covers the generation of the edit that emptied them.
+    retired: Vec<(u64, u64)>,
+    /// The generation edits now belong to ([`PageTables::set_generation`]).
+    generation: u64,
 }
 
 /// Make the stores to a table visible to the table walker before the
@@ -136,7 +139,7 @@ fn barrier() {
 impl<P: Pool> PageTables<P> {
     pub fn new(mut pool: P) -> Option<Self> {
         let (root, _) = pool.alloc()?;
-        Some(PageTables { pool, root, retired: Vec::new() })
+        Some(PageTables { pool, root, retired: Vec::new(), generation: 0 })
     }
 
     /// The level-0 table's IPA, for `TTBR0_EL1`.
@@ -263,19 +266,28 @@ impl<P: Pool> PageTables<P> {
         let i = Self::index(va, 2);
         if self.read(table, i) & ADDR_MASK == leaf {
             self.write(table, i, 0);
-            self.retired.push(leaf);
+            self.retired.push((leaf, self.generation));
         }
     }
 
-    /// The TLBs were invalidated: tables retired before can be reused.
-    pub fn flushed(&mut self) {
-        for t in std::mem::take(&mut self.retired) {
+    /// The generation the edits that follow belong to: a table they empty
+    /// waits for an invalidation that covers it.
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    /// The TLBs were invalidated for every edit up to generation `upto`:
+    /// tables those edits emptied can be reused.
+    pub fn flushed(&mut self, upto: u64) {
+        let (free, later): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.retired).into_iter().partition(|&(_, g)| g <= upto);
+        self.retired = later;
+        for (t, _) in free {
             self.pool.free(t);
         }
     }
 
     /// What `va` translates to, as the hardware would walk it.
-    #[cfg(test)]
     pub fn translate(&self, va: u64) -> Option<(u64, Perms)> {
         let mut table = self.root;
         for level in 0..3 {
@@ -395,13 +407,16 @@ mod tests {
         // Root, L1, L2 and an L3 table.
         let _ = t.map(0x20_0000, 0x1000, 0x50_0000, R).unwrap();
         let before = t.pool.next;
+        t.set_generation(1);
         let _ = t.unmap(0x20_0000, 0x1000);
         assert_eq!(t.retired.len(), 1, "the L3 table waits for the flush");
         // A mapping in another 2 MiB needs a new L3 table; the retired one
         // is not handed out yet.
         let _ = t.map(0x40_0000, 0x1000, 0x60_0000, R).unwrap();
         assert_eq!(t.pool.next, before + 1);
-        t.flushed();
+        t.flushed(0);
+        assert!(t.pool.free.is_empty(), "a flush older than the unmapping frees nothing");
+        t.flushed(1);
         assert_eq!(t.pool.free.len(), 1);
         let _ = t.map(0x60_0000, 0x1000, 0x70_0000, R).unwrap();
         assert_eq!(t.pool.next, before + 1, "the freed table was reused");
