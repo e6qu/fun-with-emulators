@@ -150,8 +150,32 @@ pub fn closed(fd: i32) {
 /// Whether a descriptor of this process other than `fd` is open on the
 /// file `fd` is (as a `dup` of it would be).
 pub fn shared_elsewhere(fd: i32) -> bool {
+    // An inet socket has no identity the host reports (every one is 0:0):
+    // a bound one's duplicates carry its mark.
+    if let Some(m @ Mark::NetBound { .. }) = marked(fd) {
+        let others: Vec<i32> = records()
+            .iter()
+            .filter(|(o, r)| **o != fd && r.mark == Some(m))
+            .map(|(o, _)| *o)
+            .collect();
+        // SAFETY: F_GETFD only queries the descriptor.
+        return others.into_iter().any(|o| unsafe { libc::fcntl(o, libc::F_GETFD) } >= 0);
+    }
     let Some(id) = identity(fd) else { return false };
     crate::fdtable::open_fds().into_iter().any(|o| o != fd && identity(o) == Some(id))
+}
+
+/// Forget the records of descriptors that are not open, in a new process
+/// that took over another's (those closed on exec), so that one never
+/// lends its record to a later descriptor at its number.
+pub fn forget_closed() {
+    let mut r = records();
+    // SAFETY: F_GETFD only queries the descriptor.
+    let gone: Vec<i32> =
+        r.keys().copied().filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0).collect();
+    for fd in gone {
+        take(&mut r, fd);
+    }
 }
 
 /// `new` is a duplicate of `old`.

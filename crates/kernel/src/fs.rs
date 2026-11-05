@@ -1025,10 +1025,19 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 }
                 None => {
                     // Somewhere fwe cannot place: up on the host, but never
-                    // above the rootfs.
-                    if !same_file(here.dir.as_raw_fd(), v.root) {
-                        here.dir = open_dir(here.dir.as_raw_fd(), c"..")?;
+                    // above the rootfs or the top of a mount's directory,
+                    // and never from outside them.
+                    let host = fd_path(here.dir.as_raw_fd()).ok_or(errno::ENOENT)?;
+                    let tops: Vec<Vec<u8>> = std::iter::once(v.root_host.to_vec())
+                        .chain(table.mounts.iter().filter_map(|m| m.host_path(b"")))
+                        .collect();
+                    if tops.contains(&host) {
+                        continue;
                     }
+                    if !tops.iter().any(|t| mounts::under(&host, t).is_some()) {
+                        return Err(errno::EACCES);
+                    }
+                    here.dir = open_dir(here.dir.as_raw_fd(), c"..")?;
                 }
             }
             continue;
@@ -1049,16 +1058,34 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     ancestors.push(std::mem::replace(&mut here, next));
                     continue;
                 }
-                let Some(host) = m.host_path(b"") else { return Err(errno::ENOENT) };
-                let is_dir = std::fs::metadata(std::ffi::OsStr::from_bytes_compat(&host))
-                    .is_ok_and(|md| md.is_dir());
-                if !is_dir {
+                // What the mount shows, found without following a link the
+                // guest could have put in its source's place.
+                let (parent, name) = mount_parent(v, &m)?;
+                let c_name = cstr(&name)?;
+                // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: a live directory descriptor and NUL-terminated name.
+                if unsafe {
+                    libc::fstatat(
+                        parent.as_raw_fd(),
+                        c_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return Err(e());
+                }
+                let kind = st.st_mode & libc::S_IFMT;
+                if kind == libc::S_IFLNK {
+                    return Err(errno::ELOOP);
+                }
+                if kind != libc::S_IFDIR {
                     // A file bind mount: the host file itself.
                     if !is_last {
                         return Err(errno::ENOTDIR);
                     }
-                    let (parent, name) = split_host(&host);
-                    let dir = open_host_dir(&parent)?;
+                    let dir = parent;
                     let mut r = done(Here { dir, at: None, phantom: false }, name, true)?;
                     r.ns_path = Some(child_ns.clone());
                     r.mount_flags = m.flags;
@@ -1152,6 +1179,28 @@ fn fwe_devices() -> Result<Vec<u8>, i32> {
     }
 }
 
+/// The directory holding what mount `m` shows, open, and that entry's name:
+/// within the rootfs, reached a component at a time without following a
+/// link; elsewhere (fwe's own directories, a host device), by its path.
+fn mount_parent(v: &View, m: &Mount) -> Result<(OwnedFd, Vec<u8>), i32> {
+    let Source::Host(base) = &m.source else { return Err(errno::ENOENT) };
+    if base == v.root_host {
+        let mut comps = components(&m.root);
+        let Some(name) = comps.pop() else {
+            // The rootfs itself: its parent is out of reach; its own top.
+            return Ok((dup_cloexec(v.root)?, b".".to_vec()));
+        };
+        let mut d = dup_cloexec(v.root)?;
+        for c in comps {
+            d = open_dir(d.as_raw_fd(), &cstr(&c)?)?;
+        }
+        return Ok((d, name));
+    }
+    let host = mounts::join(base, &m.root);
+    let (parent, name) = split_host(&host);
+    Ok((open_host_dir(&parent)?, name))
+}
+
 /// A host path's directory and final name.
 fn split_host(host: &[u8]) -> (Vec<u8>, Vec<u8>) {
     match host.iter().rposition(|&b| b == b'/') {
@@ -1171,18 +1220,6 @@ fn open_host_dir(path: &[u8]) -> Result<OwnedFd, i32> {
     }
     // SAFETY: `fd` is a fresh owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// `OsStr::from_bytes`, for the Unix hosts fwe builds on.
-trait FromBytesCompat {
-    fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr;
-}
-
-impl FromBytesCompat for std::ffi::OsStr {
-    fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr {
-        use std::os::unix::ffi::OsStrExt;
-        std::ffi::OsStr::from_bytes(b)
-    }
 }
 
 /// The filesystem view the socket calls resolve `AF_UNIX` paths in: they
@@ -1449,6 +1486,7 @@ fn readlink_at(dir: i32, name: &CString) -> Result<Vec<u8>, i32> {
 
 /// Open `name` in `dir` as a directory, not following a final symlink.
 /// Whether two descriptors name the same file (same device and inode).
+#[cfg(test)]
 fn same_file(a: i32, b: i32) -> bool {
     let stat = |fd: i32| {
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.

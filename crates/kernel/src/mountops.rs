@@ -143,10 +143,7 @@ impl<P: Platform> Kernel<P> {
         let ns = self.fs().mount_ns().clone();
         let r = if flags & ms::REMOUNT != 0 {
             let opts = (!data.is_empty() && flags & ms::BIND == 0).then(|| data.clone());
-            ns.update(|t| {
-                // A remount keeps what it does not set of the atime flags.
-                t.remount(&point, flags, opts)
-            })
+            ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0 {
             match self.mount_path(&source, true) {
                 Ok((from, _)) => {
@@ -276,8 +273,11 @@ impl<P: Platform> Kernel<P> {
             Ok(p) => p,
             Err(e) => return err(e),
         };
+        // A working directory at the old root moves to the new one, as
+        // Linux moves it.
         let cwd = match crate::mounts::under(&cwd_ns, &new_ns) {
             Some(rest) => crate::mounts::join(b"/", rest),
+            None if cwd_ns == b"/" => b"/".to_vec(),
             None => crate::mounts::join(&old_point, &cwd_ns),
         };
         let fs = self.fs.as_mut().expect("filesystem configured");

@@ -92,17 +92,37 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
 
 /// Write the record of host process `pid`.
 pub fn write(pid: i32, r: &ProcRecord) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
     let Some(p) = path(pid) else { return };
-    let tmp = [&p[..], b".tmp"].concat();
+    // A name of this writer's own: two processes may write one record.
+    let tmp = [&p[..], format!(".{}.{}.tmp", me(), N.fetch_add(1, Ordering::Relaxed)).as_bytes()]
+        .concat();
     if std::fs::write(OsStr::from_bytes(&tmp), encode(r)).is_ok() {
         let _ = std::fs::rename(OsStr::from_bytes(&tmp), OsStr::from_bytes(&p));
     }
+}
+
+/// Hold host process `pid`'s record's lock while the result lives.
+fn lock(pid: i32) -> Option<std::fs::File> {
+    let p = [path(pid)?, b".lock".to_vec()].concat();
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(OsStr::from_bytes(&p))
+        .ok()?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain host call on the file just opened; the lock goes with it.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    Some(f)
 }
 
 /// Forget host process `pid` (it ended).
 pub fn remove(pid: i32) {
     if let Some(p) = path(pid) {
         let _ = std::fs::remove_file(OsStr::from_bytes(&p));
+        let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     }
 }
 
@@ -113,7 +133,11 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
     let mut out = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            // A lock or a write in progress; a leftover of a writer that died
+            // goes with its process's record.
+            continue;
+        };
         match read(pid) {
             Some(r) => out.push((pid, r)),
             None => remove(pid),
@@ -142,6 +166,8 @@ pub fn cgroup_of(pid: i32) -> Vec<u8> {
 /// none).
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    // Under the record's lock: a parent and its child may change one.
+    let _lock = lock(pid);
     let mut r = read(pid).unwrap_or(ProcRecord {
         start,
         cgroup: b"/".to_vec(),
@@ -190,10 +216,17 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 /// A child `child` of this process starts in this process's cgroup, in the
 /// namespaces `ns`.
 pub fn forked(child: i32, ns: Vec<Vec<u8>>) {
-    let Some(start) = start_time(child) else { return };
     let mine = read(me());
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
-    write(child, &ProcRecord { start, cgroup: own_cgroup(), ns, comm, cmdline, exe });
+    let cgroup = own_cgroup();
+    // Kept what the child has already written of itself (its program).
+    let _ = change(child, |r| {
+        r.cgroup = cgroup;
+        r.ns = ns;
+        if r.exe.is_empty() {
+            (r.comm, r.cmdline, r.exe) = (comm, cmdline, exe);
+        }
+    });
 }
 
 /// This process is ending.

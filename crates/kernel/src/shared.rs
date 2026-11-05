@@ -312,7 +312,20 @@ pub fn collect() {
         let rest = name.strip_prefix(format!("v{FORMAT}-").as_bytes()).unwrap_or(&[]);
         rest.split(|&b| b == b'-').next().unwrap_or(&[]).to_vec()
     };
-    for d in live.iter().filter(|d| kind_of(d) == b"mnt") {
+    // The initial tables are kept for the next fwe on their rootfs, and
+    // their mounts with them.
+    let init_tables: Vec<Vec<u8>> = std::fs::read_dir(os(&base))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| [&base[..], b"/", e.file_name().as_bytes()].concat())
+        .filter(|p| {
+            p.rsplit(|&b| b == b'/')
+                .next()
+                .is_some_and(|n| n.starts_with(format!("v{FORMAT}-mnt-init-").as_bytes()))
+        })
+        .collect();
+    for d in live.iter().filter(|d| kind_of(d) == b"mnt").chain(init_tables.iter()) {
         if let Ok(ns) = crate::mounts::store::Ns::join(d, 0) {
             for m in &ns.table().mounts {
                 if let crate::mounts::Source::Host(h) = &m.source {
@@ -335,7 +348,9 @@ pub fn collect() {
         let gone = if let Some(rest) = name.strip_prefix(mine.as_bytes()) {
             let kind = rest.split(|&b| b == b'-').next().unwrap_or(&[]);
             match kind {
-                b"mnt" | b"uts" | b"ipc" | b"net" | b"pid" | b"cgroup" if !live.contains(&path) => {
+                b"mnt" | b"uts" | b"ipc" | b"net" | b"pid" | b"user" | b"cgroup"
+                    if !live.contains(&path) =>
+                {
                     if rest.starts_with(b"mnt-init-") {
                         // Kept while its rootfs exists, for the next fwe on it.
                         let root = crate::mounts::store::Ns::join(&path, 0).ok().and_then(|ns| {

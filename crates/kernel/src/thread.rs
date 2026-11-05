@@ -75,6 +75,7 @@ pub fn alloc_tid() -> i32 {
         // SAFETY: getpid cannot fail.
         let host = unsafe { libc::getpid() };
         if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
+            crate::pidns::remember_thread(nums[0], nums.clone());
             return nums[0];
         }
     }

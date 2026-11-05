@@ -82,6 +82,15 @@ impl<P: Platform> Kernel<P> {
         }
         let fs = self.fs.as_mut().expect("filesystem configured");
         if flags & CLONE_NEWPID != 0 {
+            // A second one before a child was made in the first fails.
+            let unshared = match (&fs.ns.pid, &fs.ns.pid_children) {
+                (None, None) => false,
+                (Some(a), Some(b)) => a.dir() != b.dir(),
+                _ => true,
+            };
+            if unshared {
+                return err(errno::EINVAL);
+            }
             // For the children: the process itself stays where it is.
             let parent = fs.ns.pid_children.as_ref().map(|r| (r.dir().to_vec(), r.id()));
             match Record::fresh("pid", PidNs::new(parent)) {
@@ -138,9 +147,11 @@ impl<P: Platform> Kernel<P> {
         };
         ns.pid = child_pid_ns.clone();
         ns.pid_children = child_pid_ns.clone();
+        let mnt = if new & CLONE_NEWNS != 0 { Some(Arc::new(fs.mount_ns().copy()?)) } else { None };
+        // Numbered last, so that nothing after it can fail and leave the
+        // numbers taken.
         let chain = pidns::chain_from(child_pid_ns);
         let nums = if chain.is_empty() { Vec::new() } else { pidns::alloc(&chain, 0, false)? };
-        let mnt = if new & CLONE_NEWNS != 0 { Some(Arc::new(fs.mount_ns().copy()?)) } else { None };
         let saved = if new != 0 || !nums.is_empty() {
             let old = (fs.mount_ns().clone(), std::mem::replace(&mut fs.ns, ns));
             if let Some(m) = mnt {

@@ -551,7 +551,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `kill(-1, sig)` in a pid namespace of fwe's: every process in it
-    /// but its init, the caller too.
+    /// but its init and the caller, as on Linux.
     fn kill_namespace(&mut self, sig: u64) -> i64 {
         let Some(ns) = crate::pidns::current().first().cloned() else { return err(errno::ESRCH) };
         let me = thread::tgid();
@@ -565,14 +565,16 @@ impl<P: Platform> Kernel<P> {
         if targets.is_empty() {
             return err(errno::ESRCH);
         }
+        let mut sent = false;
         for (n, host) in targets {
             if n == me {
-                let _ = self.sys_kill(me as i64, sig);
-            } else if let Some(h) = host::signal_to_host(sig) {
-                let _ = host::kill(host, h);
+                continue;
+            }
+            if let Some(h) = host::signal_to_host(sig) {
+                sent |= host::kill(host, h) == 0;
             }
         }
-        0
+        if sent { 0 } else { err(errno::ESRCH) }
     }
 
     /// `tgkill(tgid, tid, sig)`, and `tkill(tid, sig)` as `tgid == -1`: send

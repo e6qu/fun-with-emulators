@@ -338,7 +338,17 @@ mod imp {
                 None => {
                     // A new description of the clone: reopened through its
                     // descriptor's path, which the clone keeps while linked.
-                    let d = clone.reopen()?;
+                    let d = match clone.reopen() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            // What was opened goes; what was swapped stays.
+                            for (_, d) in opened {
+                                // SAFETY: closing a descriptor made here.
+                                unsafe { libc::close(d) };
+                            }
+                            return Err(e);
+                        }
+                    };
                     // SAFETY: plain host calls on descriptors this process holds.
                     unsafe {
                         let fl =

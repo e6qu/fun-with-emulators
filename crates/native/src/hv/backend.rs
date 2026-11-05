@@ -1358,6 +1358,12 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
         let action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        if action == fwe_kernel::seccomp::Action::KillThread && thread::live_threads() > 1 {
+            // The thread ends without the kernel lock, as `exit` does.
+            let _ = vcpu;
+            fwe_kernel::thread_exit_cleanup();
+            exit_thread(128 + fwe_abi::signal::SIGSYS as i32)
+        }
         if action != fwe_kernel::seccomp::Action::Allow {
             kernel().as_mut().unwrap().seccomp_refuse(regs, n, &args, action);
             return;

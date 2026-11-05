@@ -180,6 +180,7 @@ fn apply_exec_state<P: fwe_kernel::Platform>(
     if let (Some(held), Some(n)) = (options.exe_fd, n) {
         fwe_kernel::fdmarks::duplicated(n, held);
     }
+    fwe_kernel::fdmarks::forget_closed();
     Ok(())
 }
 

@@ -93,6 +93,17 @@ pub fn load(bytes: &[u8]) -> Result<Program, i32> {
     }
     let insns: Vec<Insn> = bytes.chunks(8).map(Insn::decode).collect();
     let n = insns.len();
+    // The second halves of 64-bit immediate loads, where no jump may land.
+    let mut halves = vec![false; n];
+    let mut j = 0;
+    while j < n {
+        if insns[j].code == LD_IMM64 && j + 1 < n {
+            halves[j + 1] = true;
+            j += 2;
+        } else {
+            j += 1;
+        }
+    }
     let mut i = 0;
     while i < n {
         let ins = insns[i];
@@ -103,7 +114,11 @@ pub fn load(bytes: &[u8]) -> Result<Program, i32> {
         match class {
             CLASS_LD => {
                 // Only the 64-bit immediate load, which takes two slots.
-                if ins.code != LD_IMM64 || i + 1 >= n || ins.src != 0 {
+                let second = insns.get(i + 1);
+                if ins.code != LD_IMM64
+                    || ins.src != 0
+                    || second.is_none_or(|s| s.code != 0 || s.dst != 0 || s.src != 0 || s.off != 0)
+                {
                     return Err(errno::EINVAL);
                 }
                 i += 2;
@@ -128,7 +143,7 @@ pub fn load(bytes: &[u8]) -> Result<Program, i32> {
                     _ if op > 0xd0 => return Err(errno::EINVAL),
                     _ => {
                         let target = i as i64 + 1 + ins.off as i64;
-                        if target < 0 || target as usize >= n {
+                        if target < 0 || target as usize >= n || halves[target as usize] {
                             return Err(errno::EINVAL);
                         }
                     }
@@ -197,7 +212,7 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
                     r[ins.src as usize].scalar()?
                 };
                 let Val::Stack(base) = r[ins.dst as usize] else { return None };
-                let at = STACK as i64 + base + ins.off as i64;
+                let at = (STACK as i64).checked_add(base)?.checked_add(ins.off as i64)?;
                 if at < 0 || at as usize + size > STACK {
                     return None;
                 }
@@ -212,7 +227,8 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
                 } else {
                     Val::Scalar(ins.imm as i64 as u64)
                 };
-                r[ins.dst as usize] = alu(op, wide, r[ins.dst as usize], src, ins.imm)?;
+                r[ins.dst as usize] =
+                    alu(op, wide, r[ins.dst as usize], src, ins.imm, ins.code & 8 != 0)?;
             }
             CLASS_JMP | CLASS_JMP32 => {
                 let op = ins.code & 0xf0;
@@ -282,8 +298,8 @@ fn mem(
     _write: bool,
 ) -> Option<u64> {
     let (buf, at): (&[u8], i64) = match p {
-        Val::Ctx(base) => (ctx, base + off as i64),
-        Val::Stack(base) => (stack, STACK as i64 + base + off as i64),
+        Val::Ctx(base) => (ctx, base.checked_add(off as i64)?),
+        Val::Stack(base) => (stack, (STACK as i64).checked_add(base)?.checked_add(off as i64)?),
         Val::Scalar(_) => return None,
     };
     if at < 0 || at as usize + size > buf.len() {
@@ -297,7 +313,7 @@ fn mem(
 
 /// One ALU operation. A pointer may only move by a number; anything else
 /// done to one ends the run.
-fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32) -> Option<Val> {
+fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32, src_is_x: bool) -> Option<Val> {
     let fit = |v: u64| if wide { v } else { v as u32 as u64 };
     match (op, dst, src) {
         (0xb0, _, s) => {
@@ -344,12 +360,17 @@ fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32) -> Option<Val> {
             }
         }
         0xd0 => {
-            // Byte swaps: to little-endian is the host's order; to
-            // big-endian swaps the low `imm` bits.
-            match imm {
-                16 => (a as u16).swap_bytes() as u64,
-                32 => (a as u32).swap_bytes() as u64,
-                64 => a.swap_bytes(),
+            // Byte order: to little-endian (the source bit clear) is the
+            // host's order and only truncates; to big-endian swaps the low
+            // `imm` bits.
+            let big = src_is_x;
+            match (imm, big) {
+                (16, false) => a as u16 as u64,
+                (32, false) => a as u32 as u64,
+                (64, false) => a,
+                (16, true) => (a as u16).swap_bytes() as u64,
+                (32, true) => (a as u32).swap_bytes() as u64,
+                (64, true) => a.swap_bytes(),
                 _ => return None,
             }
         }
@@ -624,6 +645,15 @@ mod tests {
             load(&[ins(0x05, 0, 0, 5, 0), ins(0x95, 0, 0, 0, 0)].concat()),
             Err(errno::EINVAL)
         );
+        // A jump into the second half of a 64-bit immediate load.
+        let half = [
+            ins(0x05, 0, 0, 1, 0),
+            ins(0x18, 0, 0, 0, 0),
+            ins(0xb7, 15, 0, 0, 0),
+            ins(0x95, 0, 0, 0, 0),
+        ]
+        .concat();
+        assert_eq!(load(&half), Err(errno::EINVAL));
         let forever = [ins(0x05, 0, 0, -1, 0)].concat();
         assert_eq!(run(&load(&forever).unwrap(), 2, 2, 1, 3), None);
     }

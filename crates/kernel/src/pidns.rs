@@ -244,12 +244,27 @@ pub fn adopt(ns: &crate::ns::Namespaces, known: i32) -> i32 {
     }
 }
 
-/// Forget a thread's number in the current namespace (it exited).
+/// Each thread's numbers in the namespaces of the chain, by its number in
+/// the first.
+static THREAD_NUMS: std::sync::Mutex<BTreeMap<i32, Vec<i32>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Remember the numbers [`alloc`] gave thread `tid`.
+pub fn remember_thread(tid: i32, nums: Vec<i32>) {
+    THREAD_NUMS.lock().unwrap_or_else(|e| e.into_inner()).insert(tid, nums);
+}
+
+/// Forget a thread's numbers in every namespace of the chain (it exited).
 pub fn release_thread(tid: i32) {
-    if let Some(r) = current().first() {
+    let nums = THREAD_NUMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&tid)
+        .unwrap_or_else(|| vec![tid]);
+    for (r, n) in current().iter().zip(nums) {
         let _ = r.update(|ns| {
-            if ns.pids.get(&tid).is_some_and(|e| e.thread) {
-                ns.pids.remove(&tid);
+            if ns.pids.get(&n).is_some_and(|e| e.thread) {
+                ns.pids.remove(&n);
             }
             Ok(())
         });

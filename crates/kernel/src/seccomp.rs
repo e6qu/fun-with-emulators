@@ -185,6 +185,11 @@ fn run(f: &Filter, d: &[u8; DATA_LEN as usize]) -> u32 {
             BPF_ST => mem[ins.k as usize] = a,
             BPF_STX => mem[ins.k as usize] = x,
             BPF_ALU => {
+                // Dividing by a zero X ends the program with 0, as Linux's
+                // classic BPF does.
+                if matches!(ins.code & 0xf0, 0x30 | 0x90) && ins.code & BPF_X != 0 && x == 0 {
+                    return 0;
+                }
                 a = match ins.code & 0xf0 {
                     0x00 => a.wrapping_add(src),
                     0x10 => a.wrapping_sub(src),
@@ -260,8 +265,13 @@ pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
             let st = STATE.read().unwrap_or_else(|e| e.into_inner());
             // The answer with the highest precedence: the lowest action, as
             // a signed number (kill-process is negative).
-            let ret =
-                st.filters.iter().map(|f| run(f, &d)).min_by_key(|r| (r & ACTION_FULL) as i32);
+            // On a tie the newest filter's answer (its data) is taken.
+            let ret = st
+                .filters
+                .iter()
+                .rev()
+                .map(|f| run(f, &d))
+                .min_by_key(|r| (r & ACTION_FULL) as i32);
             match ret {
                 None => Action::Allow,
                 Some(r) => match r & ACTION_FULL {

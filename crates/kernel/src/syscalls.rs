@@ -1074,10 +1074,8 @@ impl<P: Platform> Kernel<P> {
                 let x0 = regs.x[0] as i64;
                 self.finish_syscall(regs, nr, args, x0);
             }
-            Action::KillThread if thread::live_threads() > 1 => {
-                self.thread_cleanup();
-                self.platform.exit_thread(128 + signal::SIGSYS as i32)
-            }
+            // The backends end a thread of several before taking the
+            // kernel lock; the last one takes the process with it.
             Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
         }
     }
@@ -1502,8 +1500,6 @@ fn online_cpus() -> Vec<u64> {
         })
         .collect()
 }
-
-
 
 /// An id the process holds (the initial namespace's) as it sees it.
 fn uid_out(id: u32, gid: bool) -> i64 {

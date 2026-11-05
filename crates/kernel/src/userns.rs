@@ -167,10 +167,15 @@ pub fn write_map(
         let [i, o, c] = w[..] else { return Err(errno::EINVAL) };
         let parse = |s: &str| s.parse::<u32>().map_err(|_| errno::EINVAL);
         let (i, o, c) = (parse(i)?, parse(o)?, parse(c)?);
-        if c == 0 || i.checked_add(c - 1).is_none() || o.checked_add(c - 1).is_none() {
+        // Linux takes ids up to 2^32 - 2: an extent may not reach 2^32 - 1.
+        if c == 0 || i.checked_add(c).is_none() || o.checked_add(c).is_none() {
             return Err(errno::EINVAL);
         }
-        let overlaps = |(a, b, n): &Extent| (i < a + n && *a < i + c) || (o < b + n && *b < o + c);
+        let (iw, ow, cw) = (u64::from(i), u64::from(o), u64::from(c));
+        let overlaps = |(a, b, n): &Extent| {
+            let (a, b, n) = (u64::from(*a), u64::from(*b), u64::from(*n));
+            (iw < a + n && a < iw + cw) || (ow < b + n && b < ow + cw)
+        };
         if map.iter().any(overlaps) {
             return Err(errno::EINVAL);
         }

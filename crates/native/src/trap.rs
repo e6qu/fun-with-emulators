@@ -346,6 +346,13 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
         let action = fwe_kernel::seccomp::check(nr, &args, regs.pc);
+        if action == fwe_kernel::seccomp::Action::KillThread
+            && fwe_kernel::thread::live_threads() > 1
+        {
+            // The thread ends without the kernel lock, as `exit` does.
+            fwe_kernel::thread_exit_cleanup();
+            crate::exit_current_thread(128 + fwe_abi::signal::SIGSYS as i32);
+        }
         if action != fwe_kernel::seccomp::Action::Allow {
             kernel().as_mut().unwrap().seccomp_refuse(&mut regs, nr, &args, action);
             settle(&mut regs);
