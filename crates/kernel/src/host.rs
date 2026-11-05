@@ -457,6 +457,17 @@ pub fn signal_is_ignored(sig: u64) -> bool {
     }
 }
 
+/// Whether the host reaps this process's children as they end, leaving no
+/// zombie for `wait`: it ignores `SIGCHLD`, or set `SA_NOCLDWAIT`.
+pub fn children_reaped_by_host() -> bool {
+    // SAFETY: querying a disposition into a zeroed sigaction.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) == 0
+            && (old.sa_sigaction == libc::SIG_IGN || old.sa_flags & libc::SA_NOCLDWAIT != 0)
+    }
+}
+
 /// Translate a host `si_code` into Linux's. The `SIGCHLD` codes and the
 /// fault codes are the same; the codes for user-sent signals differ.
 pub fn si_code_to_linux(code: i32) -> i32 {
@@ -488,6 +499,18 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+    // A `SIGCHLD` sent with `kill` comes with no information on macOS
+    // (`si_code` and `si_pid` 0), unlike a child's.
+    if sig == libc::SIGCHLD
+        && code == 0
+        && pid == 0
+        && let Some((c, p, s)) = crate::reaper::take_report()
+    {
+        // An adopted process's end, which fwe's reaper sent this process
+        // (`si_code` and `si_status` already Linux's).
+        // SAFETY: getuid cannot fail.
+        return (c, p, uid_to_initial(unsafe { libc::getuid() }), s);
+    }
     if sig == libc::SIGCHLD && pid == 0 {
         let saved = last_errno();
         // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call

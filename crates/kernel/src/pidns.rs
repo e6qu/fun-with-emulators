@@ -203,6 +203,44 @@ pub fn nested() -> bool {
     !current().is_empty()
 }
 
+/// The init of the namespace whose record is `ns` has ended: end every
+/// other process in it (those of namespaces inside it too, which are
+/// numbered here), as Linux does.
+pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
+    let hosts: std::collections::BTreeSet<i32> =
+        ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
+    for h in hosts.into_iter().filter(|&h| h != init) {
+        // SAFETY: plain host call.
+        unsafe { libc::kill(h, libc::SIGKILL) };
+    }
+}
+
+/// This process is ending: if it is its pid namespace's init, the
+/// namespace ends with it.
+pub fn exiting() {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    if let Some(ns) = current().first()
+        && ns.get().number_of(me) == Some(1)
+    {
+        zap(ns, me);
+    }
+}
+
+/// The pid namespace of fwe's whose init is host process `host`, if any:
+/// the one to end with it when it is sent `SIGKILL`, which it cannot see
+/// coming ([`zap`]).
+pub fn led_by(host: i32) -> Option<crate::shared::Record<PidNs>> {
+    let r = crate::procreg::read(host)?;
+    let prefix = format!("v{}-pid-", crate::shared::FORMAT);
+    r.ns.iter()
+        .filter(|d| {
+            d.rsplit(|&b| b == b'/').next().is_some_and(|n| n.starts_with(prefix.as_bytes()))
+        })
+        .filter_map(|d| crate::shared::Record::<PidNs>::join(d, 0).ok())
+        .find(|ns| ns.get().host_of(1) == Some(host))
+}
+
 /// Forget a reaped child's numbers, in every namespace of the chain.
 pub fn reaped(host: i32) {
     for r in current().iter() {
@@ -236,6 +274,16 @@ pub fn adopt(ns: &crate::ns::Namespaces, known: i32) -> i32 {
     // SAFETY: getpid cannot fail.
     let host = unsafe { libc::getpid() };
     if known > 0 {
+        // Its number stands for it from now on, not only once the parent
+        // gets to it.
+        if let Some(r) = current().first() {
+            let _ = r.update(|ns| {
+                if let Some(e) = ns.pids.get_mut(&known).filter(|e| e.host == 0) {
+                    e.host = host;
+                }
+                Ok(())
+            });
+        }
         return known;
     }
     match current().first() {

@@ -344,7 +344,12 @@ impl<P: Platform> Kernel<P> {
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
             // A parent outside the namespace is 0, as Linux reports it.
-            nr::GETPPID => crate::pidns::guest_ret(host::getppid()),
+            nr::GETPPID => {
+                // SAFETY: getpid cannot fail.
+                let me = unsafe { libc::getpid() };
+                let parent = crate::reaper::parent_of(me, host::getppid() as i32);
+                crate::pidns::guest_ret(i64::from(parent))
+            }
             // Virtual credentials (see crates/kernel/src/creds.rs).
             // Kept as the initial namespace's ids, seen through the user
             // namespace's maps (see `userns`).
@@ -785,7 +790,6 @@ impl<P: Platform> Kernel<P> {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         /// `PR_SET_DUMPABLE`.
         static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
-        static SUBREAPER: AtomicBool = AtomicBool::new(false);
         match option {
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
@@ -836,14 +840,15 @@ impl<P: Platform> Kernel<P> {
                 Ok(()) => 0,
                 Err(e) => err(e),
             },
-            // Recorded: macOS gives a subreaper no orphans (see
-            // docs/architecture.md).
+            // In the process's record, where its descendants look for it;
+            // fwe keeps the adoption (see `reaper`).
             PR_SET_CHILD_SUBREAPER => {
-                SUBREAPER.store(arg2 != 0, Relaxed);
+                crate::procreg::set_own_subreaper(arg2 != 0);
+                crate::reaper::start_if_reaper();
                 0
             }
             PR_GET_CHILD_SUBREAPER => {
-                guest!(uaccess::write(arg2, i32::from(SUBREAPER.load(Relaxed))));
+                guest!(uaccess::write(arg2, i32::from(crate::procreg::own_subreaper())));
                 0
             }
             PR_SET_NO_NEW_PRIVS if arg2 == 1 => {

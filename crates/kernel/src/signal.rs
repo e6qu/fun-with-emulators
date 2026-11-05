@@ -537,7 +537,17 @@ impl<P: Platform> Kernel<P> {
         }
         let to_self = pid == me || pid == 0 || pid == -1;
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
-            return host::kill(target as libc::pid_t, h);
+            // A namespace's init takes its namespace with it.
+            let led = (sig == signal::SIGKILL && target > 0)
+                .then(|| crate::pidns::led_by(target as i32))
+                .flatten();
+            let r = host::kill(target as libc::pid_t, h);
+            if r == 0
+                && let Some(ns) = led
+            {
+                crate::pidns::zap(&ns, target as i32);
+            }
+            return r;
         }
         if to_self {
             thread::post_process(sig, own_info(signal::SI_USER));

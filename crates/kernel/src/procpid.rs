@@ -75,7 +75,8 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         let sid = unsafe { libc::getsid(pid) };
         Some(HostInfo {
             state,
-            ppid: b.pbi_ppid as i32,
+            // The guest's parent: an orphan's is the reaper that adopted it.
+            ppid: crate::reaper::parent_of(pid, b.pbi_ppid as i32),
             pgid: b.pbi_pgid as i32,
             sid,
             nice: b.pbi_nice,

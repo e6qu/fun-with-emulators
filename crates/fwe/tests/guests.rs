@@ -3573,3 +3573,36 @@ fn hv_fork_and_vfork() {
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A child subreaper adopts the orphans below it: it is their parent, it
+/// is sent `SIGCHLD` when one ends, and it reaps it, also one killed
+/// outright; a child of its own is not a subreaper.
+#[test]
+fn subreaper_adopts_orphans() {
+    assert_eq!(
+        namespaces("subreaper"),
+        "subreaper: 1\nchild exited 0\nchild is not a subreaper: true\n\
+         orphan's parent is the subreaper: true\nreaped the orphan: true, exited 7\n\
+         SIGCHLD from the orphan: true\nthen: -1 errno true\n"
+    );
+    assert_eq!(
+        namespaces("subreaper-kill"),
+        "child exited 0\nchild is not a subreaper: true\nproc shows the subreaper: true\n\
+         not ended yet: true\nreaped the orphan: true, killed by 9\n"
+    );
+}
+
+/// A pid namespace's init adopts the orphans in it, and when it ends, or
+/// is killed, the rest of its namespace is killed.
+#[test]
+fn pid_namespace_init_reaps_and_ends_its_namespace() {
+    assert_eq!(
+        namespaces("pid-orphan"),
+        "child exited 0\nchild is not a subreaper: true\norphan's parent: 1\n\
+         init reaped the orphan: true, exited 5\ninit exited 0\n"
+    );
+    assert_eq!(
+        namespaces("init-death"),
+        "init exited 3: the rest ended too: true\ninit killed by 9: the rest ended too: true\n"
+    );
+}

@@ -25,7 +25,7 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// since `pthread_exit` does not return and would never release it.
 pub(crate) fn exit_current_thread(code: i32) -> ! {
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting((code & 0xff) << 8);
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
@@ -91,7 +91,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting((code & 0xff) << 8);
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
@@ -101,7 +101,7 @@ impl Platform for NativePlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting(fwe_kernel::host::signal_to_linux(sig) as i32);
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
@@ -957,6 +957,8 @@ fn start(
     // namespace, for a process exec'd in one.
     fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
     fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    // A subreaper stays one across execve; a namespace's init is one.
+    fwe_kernel::reaper::start_if_reaper();
 
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);

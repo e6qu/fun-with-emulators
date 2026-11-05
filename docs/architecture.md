@@ -731,7 +731,8 @@ initial namespace sees the host's: its host name, its pids.
 - **pid** (`pidns.rs`): a namespace numbers its processes and threads from
   1 and maps each number to its host pid; `getpid`, `getppid`, `kill`,
   `wait4`, `waitid`, the process-group, session and terminal calls and
-  the senders in `siginfo` are translated.
+  the senders in `siginfo` are translated. When its init ends, or is sent
+  `SIGKILL`, every other process in it is killed.
 - **UTS**: `uname`, `sethostname`, `setdomainname` and
   `/proc/sys/kernel/hostname` use its names.
 - **network** (`netns.rs`): a loopback interface, down until brought up;
@@ -745,6 +746,23 @@ initial namespace sees the host's: its host name, its pids.
 - **cgroup**: `/proc/self/cgroup` and a `cgroup2` mount show the tree from
   its root.
 - **IPC**: its identity (there are no System V IPC objects).
+
+An orphan is adopted as on Linux, by its nearest living ancestor that is
+a child subreaper (`PR_SET_CHILD_SUBREAPER`), or else by the init of its
+dying parent's pid namespace (`crates/kernel/src/reaper.rs`); macOS gives
+every orphan to launchd, and only a parent can wait for a process, so fwe
+keeps the adoption itself. Each process's record holds its line of
+ancestors and whether it is a subreaper, so an orphan's `getppid` (and
+`/proc/<pid>`) names its adopter. A process that ends where a reaper
+might adopt it records how it ended; one killed by `SIGKILL` cannot, and
+whoever finds it gone records that for it. Its parent's `wait` removes the
+record, or once the parent has gone, the adopter's `wait` takes it. A
+reaper runs a watcher thread that follows its descendants on the host
+(`kqueue` process events) and, when an adopted one ends, sends the reaper
+a `SIGCHLD` through the host (so its disposition and mask act on it as on
+a child's; the handler takes the sender and status from the watcher) and
+wakes its threads waiting in `wait`, which look at its own children and
+then at its adopted ones.
 
 `/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
 `status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
@@ -865,12 +883,13 @@ those items.
   number goes to the host loopback port of that number; a port is freed
   when the last descriptor of its socket in the binding process closes;
   capabilities are the process's, not qualified by user namespace;
-  `setns` is not implemented; an orphan is not reparented to a
-  `PR_SET_CHILD_SUBREAPER` ancestor (macOS gives it to launchd), so a
-  runtime that double-forks its container (crun with a user namespace)
-  loses sight of it; `/proc/<pid>` of another process has no `fd`, `cwd`,
-  `root` or `environ`, and shows only fwe's processes in the initial pid
-  namespace.
+  `setns` is not implemented; an adopted orphan that stops or continues
+  is not reported to its adopter's `wait`, and its adopter is found when
+  asked for, not fixed when its parent ends (an ancestor that becomes a
+  subreaper later adopts it too); a pid namespace's init killed with
+  `SIGKILL` from outside fwe leaves the rest of the namespace running;
+  `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
+  `environ`, and shows only fwe's processes in the initial pid namespace.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
   back but not enforced (only `pids.max` and device programs are); a
   threaded cgroup cannot be made (`cgroup.threads` refuses writes); the

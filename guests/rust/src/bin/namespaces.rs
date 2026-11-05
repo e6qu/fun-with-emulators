@@ -66,6 +66,134 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn __errno_location() -> *mut i32;
+    fn prctl(option: i32, ...) -> i32;
+    fn sigaction(sig: i32, act: *const Sigaction, old: *mut Sigaction) -> i32;
+    fn poll(fds: *mut [i32; 2], n: u64, timeout: i32) -> i32;
+    fn usleep(us: u32) -> i32;
+}
+
+/// musl's `struct sigaction`.
+#[repr(C)]
+struct Sigaction {
+    handler: extern "C" fn(i32, *const u8, *const u8),
+    mask: [u64; 16],
+    flags: i32,
+    restorer: usize,
+}
+
+const PR_SET_CHILD_SUBREAPER: i32 = 36;
+const PR_GET_CHILD_SUBREAPER: i32 = 37;
+const SA_SIGINFO: i32 = 4;
+const ECHILD: i32 = 10;
+
+/// The `si_pid` of the last `SIGCHLD`.
+static CHLD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn on_chld(_sig: i32, info: *const u8, _ctx: *const u8) {
+    // SAFETY: a `siginfo_t`, whose `si_pid` is at offset 16.
+    let pid = unsafe { info.add(16).cast::<i32>().read() };
+    CHLD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Note each `SIGCHLD`'s sender in [`CHLD_PID`].
+fn catch_sigchld() {
+    let act = Sigaction { handler: on_chld, mask: [0; 16], flags: SA_SIGINFO, restorer: 0 };
+    // SAFETY: a valid action.
+    unsafe { sigaction(SIGCHLD as i32, &act, std::ptr::null_mut()) };
+}
+
+/// Whether a `SIGCHLD` from `pid` arrives, waiting a while for it.
+fn sigchld_from(pid: i32) -> bool {
+    for _ in 0..200 {
+        if CHLD_PID.load(std::sync::atomic::Ordering::SeqCst) == pid {
+            return true;
+        }
+        // SAFETY: plain call.
+        unsafe { usleep(10_000) };
+    }
+    false
+}
+
+fn read_i32(fd: i32) -> i32 {
+    let mut b = [0u8; 4];
+    // SAFETY: a valid buffer.
+    unsafe { read(fd, b.as_mut_ptr(), 4) };
+    i32::from_ne_bytes(b)
+}
+
+fn write_i32(fd: i32, v: i32) {
+    // SAFETY: a valid buffer.
+    unsafe { write(fd, v.to_ne_bytes().as_ptr(), 4) };
+}
+
+/// Block until `fd` reaches its end (every writer closed it).
+fn drain(fd: i32) {
+    let mut b = 0u8;
+    // SAFETY: a valid buffer.
+    while unsafe { read(fd, &mut b, 1) } > 0 {}
+}
+
+/// Make a child that makes a grandchild and exits, leaving the grandchild
+/// an orphan: the grandchild waits for its parent to end, reports its
+/// parent to `report`, then runs `then`. Returns the child's pid, and the
+/// grandchild's (read from `report` once the child is reaped).
+fn orphan(report: [i32; 2], then: fn() -> i32) -> (i32, i32) {
+    let mut hold = [0i32; 2];
+    // SAFETY: plain calls; the children exit.
+    unsafe {
+        pipe(hold.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            close(hold[0]);
+            let mut sub = -1;
+            prctl(PR_GET_CHILD_SUBREAPER, &mut sub as *mut i32);
+            let parent = getpid();
+            let g = fork();
+            if g == 0 {
+                close(hold[1]);
+                drain(hold[0]);
+                // Its descriptors close before it is gone: wait for the
+                // adoption, as on Linux.
+                for _ in 0..500 {
+                    if getppid() != parent {
+                        break;
+                    }
+                    usleep(10_000);
+                }
+                write_i32(report[1], getppid());
+                _exit(then());
+            }
+            write_i32(report[1], sub);
+            write_i32(report[1], g);
+            _exit(0);
+        }
+        close(hold[0]);
+        close(hold[1]);
+        let mut status = 0;
+        waitpid(child, &mut status, 0);
+        println!("child exited {}", (status >> 8) & 0xff);
+        let sub = read_i32(report[0]);
+        println!("child is not a subreaper: {}", sub == 0);
+        (child, read_i32(report[0]))
+    }
+}
+
+/// How a wait status ended: "exited N" or "killed by N".
+fn ended(status: i32) -> String {
+    if status & 0x7f == 0 {
+        format!("exited {}", (status >> 8) & 0xff)
+    } else {
+        format!("killed by {}", status & 0x7f)
+    }
+}
+
+/// The `PPid` line of `/proc/<pid>/status`.
+fn proc_ppid(pid: i32) -> i32 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:\t").and_then(|v| v.trim().parse().ok()))
+        .unwrap_or(-1)
 }
 
 fn errno() -> i32 {
@@ -462,6 +590,121 @@ fn main() {
                 write(go[1], b"x".as_ptr(), 1);
                 let mut status = 0;
                 waitpid(pid, &mut status, 0);
+            }
+        }
+        // A child subreaper adopts the orphans below it: it is their
+        // parent, is sent SIGCHLD when one ends, and reaps it.
+        Some("subreaper") => {
+            catch_sigchld();
+            // SAFETY: plain calls with valid out-parameters.
+            unsafe {
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                let mut on = 0;
+                prctl(PR_GET_CHILD_SUBREAPER, &mut on as *mut i32);
+                println!("subreaper: {on}");
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let (_, g) = orphan(report, || 7);
+                let parent = read_i32(report[0]);
+                println!("orphan's parent is the subreaper: {}", parent == getpid());
+                let mut status = 0;
+                let w = waitpid(-1, &mut status, 0);
+                println!("reaped the orphan: {}, {}", w == g, ended(status));
+                println!("SIGCHLD from the orphan: {}", sigchld_from(g));
+                println!("then: {} errno {}", waitpid(-1, &mut status, 0), errno() == ECHILD);
+            }
+        }
+        // An adopted orphan killed outright is reaped as killed.
+        Some("subreaper-kill") => {
+            // SAFETY: plain calls with valid out-parameters.
+            unsafe {
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let (_, g) = orphan(report, || {
+                    // SAFETY: plain call.
+                    unsafe { pause() };
+                    0
+                });
+                read_i32(report[0]);
+                println!("proc shows the subreaper: {}", proc_ppid(g) == getpid());
+                let mut status = 0;
+                println!("not ended yet: {}", waitpid(g, &mut status, 1) == 0);
+                kill(g, SIGKILL);
+                let w = waitpid(g, &mut status, 0);
+                println!("reaped the orphan: {}, {}", w == g, ended(status));
+            }
+        }
+        // A pid namespace's init adopts the orphans in it.
+        Some("pid-orphan") => {
+            let init = clone_child(CLONE_NEWPID, || {
+                // SAFETY: plain calls with valid out-parameters.
+                unsafe {
+                    let mut report = [0i32; 2];
+                    pipe(report.as_mut_ptr());
+                    let (_, g) = orphan(report, || 5);
+                    println!("orphan's parent: {}", read_i32(report[0]));
+                    let mut status = 0;
+                    let w = waitpid(-1, &mut status, 0);
+                    println!("init reaped the orphan: {}, {}", w == g, ended(status));
+                }
+                0
+            });
+            let mut status = 0;
+            // SAFETY: a valid out-parameter.
+            unsafe { waitpid(init, &mut status, 0) };
+            println!("init {}", ended(status));
+        }
+        // When a pid namespace's init ends, or is killed, every other
+        // process in it is killed.
+        Some("init-death") => {
+            for kill_it in [false, true] {
+                let (mut hold, mut ready, mut up) = ([0i32; 2], [0i32; 2], [0i32; 2]);
+                // SAFETY: plain calls; the children exit.
+                unsafe {
+                    pipe(hold.as_mut_ptr());
+                    pipe(ready.as_mut_ptr());
+                    pipe(up.as_mut_ptr());
+                    let init = clone_child(CLONE_NEWPID, || {
+                        // SAFETY: plain calls.
+                        unsafe {
+                            if fork() == 0 {
+                                close(hold[0]);
+                                write(ready[1], b"x".as_ptr(), 1);
+                                pause();
+                                _exit(0);
+                            }
+                            let mut b = 0u8;
+                            read(ready[0], &mut b, 1);
+                            write(up[1], b"x".as_ptr(), 1);
+                            if kill_it {
+                                pause();
+                            }
+                        }
+                        3
+                    });
+                    for fd in [hold[1], ready[0], ready[1], up[1]] {
+                        close(fd);
+                    }
+                    let mut b = 0u8;
+                    read(up[0], &mut b, 1);
+                    if kill_it {
+                        kill(init, SIGKILL);
+                    }
+                    let mut status = 0;
+                    waitpid(init, &mut status, 0);
+                    // The init's child holds `hold` open: it ends when the
+                    // child does.
+                    let mut pfd = [hold[0], 1]; // POLLIN
+                    let r = poll(&mut pfd, 1, 5000);
+                    println!(
+                        "init {}: the rest ended too: {}",
+                        ended(status),
+                        r == 1 && read(hold[0], &mut b, 1) == 0
+                    );
+                    close(hold[0]);
+                    close(up[0]);
+                }
             }
         }
         other => panic!("unknown scenario {other:?}"),

@@ -378,6 +378,7 @@ pub(super) fn fork(
         Err(e) => return err(e),
     };
     let number = Kernel::<HvPlatform>::fork_number(&token);
+    let line = Kernel::<HvPlatform>::fork_line(&token).clone();
     // The child writes one byte here once it is ready to run; its end is
     // close-on-exec there, so a vfork parent also sees it close on exec. It
     // is made and the parent's write end closed under the kernel lock, so
@@ -432,6 +433,7 @@ pub(super) fn fork(
         e.u64(child_stack);
         e.u64(child_tid);
         e.i32(number);
+        fwe_kernel::procreg::save_line(&mut e, &line);
         e.bool(vfork);
         e.i32(word[1]);
         e.i32(sv[1]);
@@ -772,6 +774,7 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let child_stack = d.u64();
     let child_tid = d.u64();
     let number = d.i32();
+    let line = fwe_kernel::procreg::load_line(&mut d);
     let vfork = d.bool();
     let word = d.i32();
     let sock = d.i32();
@@ -789,6 +792,9 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     if let Some(fs) = k.fs.as_ref() {
         fwe_kernel::pidns::adopt(&fs.ns, number);
     }
+    // Its own record too: it may end before the parent writes it.
+    fwe_kernel::procreg::own_line(&line);
+    fwe_kernel::reaper::start_if_reaper();
     d.finish()?;
     backend::become_vm_process()?;
     m.rebuild(vfork)?;

@@ -36,6 +36,7 @@ pub mod procfs;
 pub mod procpid;
 pub mod procreg;
 pub mod pty;
+pub mod reaper;
 pub mod seccomp;
 pub mod shared;
 pub mod signal;
@@ -697,10 +698,12 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         };
         return -1;
     }
-    signalfd::hold(|| {
-        specialfd::hold(|| {
-            synthdir::hold(|| {
-                pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+    reaper::hold(|| {
+        signalfd::hold(|| {
+            specialfd::hold(|| {
+                synthdir::hold(|| {
+                    pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+                })
             })
         })
     })
