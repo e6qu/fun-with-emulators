@@ -1,0 +1,20 @@
+# Debian 12 (bookworm) arm64 packages the Python test fetches from
+# https://deb.debian.org/debian/ and unpacks into its root filesystem;
+# each line is a pool path and the package's SHA-256 from the bookworm index.
+pool/main/p/python3.11/python3.11-minimal_3.11.2-6+deb12u8_arm64.deb 6a07dd571f1a15af2f855d64571766fe44b73a57cc3b5ca79502bc89156a5e12
+pool/main/p/python3.11/libpython3.11-minimal_3.11.2-6+deb12u8_arm64.deb c48bac178c0fc43a2bf8ace784c762b5ee83e2b981894a991dc3ccfd3ec7cd4b
+pool/main/p/python3.11/libpython3.11-stdlib_3.11.2-6+deb12u8_arm64.deb e79876de55c6c2dca10d044b2fa69ccd863950ea01714220c1982d16008105f9
+pool/main/e/expat/libexpat1_2.5.0-1+deb12u2_arm64.deb 8dc1976735acf825e3a922d82f171e20feec7394da2b8c616091983e38706275
+pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb 52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913
+pool/main/o/openssl/libssl3_3.0.20-1~deb12u2_arm64.deb a256e03cc3abd7243ac5c6ee91a9deb56478221ef0d3c2b0748551e13140c0bf
+pool/main/b/bzip2/libbz2-1.0_1.0.8-5+b1_arm64.deb d3a96ece03326498b39ff093a76800dfcbcb1d4049d6ae6e9f6fa1aa7a590ad6
+pool/main/libx/libxcrypt/libcrypt1_4.4.33-2_arm64.deb eea0ad76ea5eb507127fea0c291622ea4ecdbb71c4b9a8ed9c76ae33fc1a0127
+pool/main/libf/libffi/libffi8_3.4.4-1_arm64.deb 80b5c36177dc0e29d531c7eddbed3cc7355cb490e49f8cfa5959572d161f27b3
+pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_arm64.deb 647ce9d81e41c30071ce6ac0d3324579216a33aaa1d28971d6952315f6a95a75
+pool/main/n/ncurses/libncursesw6_6.4-4_arm64.deb cf32cb6751718872c6def448b82211eec494f688e2f1a3e6c71bfdaf6b0722c5
+pool/main/n/ncurses/libtinfo6_6.4-4_arm64.deb baef0f6776f84c7eed4f1146d6e5774689567dad43216894d41da02e6608e4b3
+pool/main/r/readline/libreadline8_8.2-1.3_arm64.deb f3b162b7c1e05430607e792ebdbfc417cbd1f1d32cf83664133ae63d811a72d2
+pool/main/s/sqlite3/libsqlite3-0_3.40.1-2+deb12u2_arm64.deb a690f7f2aa6435bd1fd7cbbd2216acb9acbb8c48c9721f2c195766375439eb13
+pool/main/u/util-linux/libuuid1_2.38.1-5+deb12u3_arm64.deb 3b2d19df0f3190108cf54228c4cfc822226c06d8f3615a5ab16a7dffb1f58aed
+pool/main/d/db5.3/libdb5.3_5.3.28+dfsg2-1_arm64.deb 344367608d622298a3d916f4cee3dc3173286f3b21f8f497ab21e7178ba930f9
+pool/main/m/media-types/media-types_10.0.0_all.deb aaa46dcb3b39948ae2e0fdb72cfcb2f48c0b59f19785a3da8045c05eb19955dd

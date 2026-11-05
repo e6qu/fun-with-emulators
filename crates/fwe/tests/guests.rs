@@ -853,6 +853,7 @@ fn debian_bash_runs_a_command() {
 /// matches what git on the host makes of the same steps.
 #[test]
 fn debian_git_runs_a_workflow() {
+    let _workload = workload();
     let root = std::env::temp_dir().join(format!("fwe-git-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for dir in ["lib", "bin", "usr/bin", "usr/lib/git-core", "home/u"] {
@@ -924,7 +925,7 @@ three
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null());
-    // About 12 s alone: git's commands start many git processes, each a
+    // About 20 s alone: git's commands start many git processes, each a
     // fresh fwe that prepares the 3.7 MB binary's code.
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     eprintln!("--- git stderr:\n{}", String::from_utf8_lossy(&out.stderr));
@@ -1006,6 +1007,7 @@ impl Drop for ProgramRoot {
 /// the schema.
 #[test]
 fn debian_sqlite_runs_a_database() {
+    let _workload = workload();
     let root = ProgramRoot::new("sqlite", &[]);
     std::fs::copy(debian_bin("sqlite3"), root.path("bin/sqlite3")).unwrap();
     std::fs::copy(debian_bin("seq"), root.path("bin/seq")).unwrap();
@@ -1163,6 +1165,7 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
 #[test]
 fn debian_node_runs_a_workload() {
     let root = fetched_root("node");
+    let _workload = workload();
     let script = format!("/tmp/fwe-node-{}.js", std::process::id());
     let data = format!("/tmp/fwe-node-{}.txt", std::process::id());
     std::fs::write(
@@ -1252,6 +1255,7 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
 #[test]
 fn debian_cargo_builds_and_tests_a_project() {
     let root = fetched_root("rust");
+    let _workload = workload();
     let proj = format!("tmp/fwe-cargo-{}", std::process::id());
     let dir = root.join(&proj);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1358,6 +1362,7 @@ fn debian_apt_installs_and_removes_a_package() {
     let root = std::env::temp_dir().join(format!("fwe-apt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     run_checked(Command::new("cp").arg("-cR").arg(fetched_root("apt")).arg(&root));
+    let _workload = workload();
     let dir = |d: &str| std::fs::create_dir_all(root.join(d)).unwrap();
     for d in [
         "repo",
@@ -1501,6 +1506,7 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> (String, Vec<u8>) {
 /// state in an SQLite database.
 #[test]
 fn debian_lighttpd_serves_files_and_cgi() {
+    let _workload = workload();
     let root = ProgramRoot::new("lighttpd", &["etc", "usr/lib/lighttpd", "srv/www/sub"]);
     std::fs::copy(debian_bin("lighttpd"), root.path("bin/lighttpd")).unwrap();
     std::fs::copy(debian_bin("sqlite3"), root.path("bin/sqlite3")).unwrap();
@@ -2170,12 +2176,24 @@ fn proc_self_fd_lists_and_links_descriptors() {
 /// begins, so `dup2` there fails with `EBADF` and raising it is refused.
 #[test]
 fn descriptor_limit_bounds_the_guest() {
-    assert_eq!(
-        fds("limits"),
-        "hard limit above soft: true\ndup2 at the hard limit: -1 EBADF\ndup2 just below it: true\n\
-         raising past it: -1 EPERM\nsoft limit now 256\n"
-    );
+    assert_eq!(fds("limits"), FDS_LIMITS);
 }
+
+/// What the `fds` guest's `limits` scenario prints: the guest's soft
+/// `RLIMIT_NOFILE` held as Linux holds it.
+const FDS_LIMITS: &str = "\
+hard limit above soft: true
+dup2 at the soft limit: -1 EBADF
+dup2 just below it: true
+F_DUPFD from it: -1 EINVAL
+raising past it: -1 EPERM
+soft limit now 32
+dup stopped at 32: EMFILE
+eventfd: -1 EMFILE
+pipe with one free: -1 EMFILE
+eventfd with one free: true
+and counts: 8 8 7
+";
 
 /// A bad pointer makes a system call fail with `EFAULT` instead of crashing
 /// fwe: pointers the kernel layer copies through itself (`uname`, `openat`,
@@ -2338,10 +2356,15 @@ fn hv_command() -> Option<Command> {
 /// Run a VM test's command: one at a time on the real framework, and
 /// failing on any rule the stand-in saw broken.
 fn run_hv(cmd: Command, what: &str) -> Output {
-    let _one = matches!(hv_mode(), Some(HvMode::Real(_)))
-        .then(|| ONE_VM.lock().unwrap_or_else(|e| e.into_inner()));
     let limit =
         if matches!(hv_mode(), Some(HvMode::Standin)) { STANDIN_TIMEOUT } else { GUEST_TIMEOUT };
+    run_hv_for(cmd, what, limit)
+}
+
+/// [`run_hv`] with a time limit of its own, for a long workload.
+fn run_hv_for(cmd: Command, what: &str, limit: Duration) -> Output {
+    let _one = matches!(hv_mode(), Some(HvMode::Real(_)))
+        .then(|| ONE_VM.lock().unwrap_or_else(|e| e.into_inner()));
     let out = run_vm_bounded_for(cmd, limit);
     let stderr = String::from_utf8_lossy(&out.stderr);
     eprintln!("--- hv {what} stderr:\n{stderr}");
@@ -2380,6 +2403,17 @@ fn rust_low_guest(name: &str) -> PathBuf {
         out
     });
     dir.join("aarch64-unknown-linux-musl/release").join(name)
+}
+
+/// Held while one of the big workloads runs (a Debian program suite, natively
+/// or in the VM), so they run one at a time: each is bounded by a time limit
+/// that is meant to catch a hang, and run beside the others on a busy runner
+/// they took several times as long. Taken once a test's files are fetched,
+/// and before [`ONE_VM`].
+static WORKLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn workload() -> std::sync::MutexGuard<'static, ()> {
+    WORKLOAD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Held while a VM process runs, so the tests never run more than one at a
@@ -2496,7 +2530,7 @@ fn hv_descriptors_and_translated_pointers() {
          pipe link: true\nreopened pipe reads: 1 z\n"
     );
     let out = fwe_hv(&rust_low_guest("fds"), &["limits"]).unwrap();
-    assert!(stdout(&out).contains("dup2 at the hard limit: -1 EBADF"));
+    assert_eq!(stdout(&out), FDS_LIMITS);
 }
 
 /// A dynamically linked, non-PIE glibc program at a low address — the shape
@@ -2520,6 +2554,336 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     cmd.arg("--strace").arg("--root").arg(root).arg(program).args(args);
     Some(run_hv(cmd, &program.display().to_string()))
 }
+
+/// Debian's Python 3.11 (fetched: `guests/debian/fetch/python.txt`), a
+/// non-PIE executable linked at `0x400000`, so the VM runs it: the standard
+/// library's C modules (sqlite3, hashlib on OpenSSL, zlib, bz2, lzma,
+/// decimal, unicodedata), threads, a socket pair, an asyncio server and
+/// client, ctypes calling into libc and libffi's closures called back, a
+/// signal handler, `fork`, a shell run by `subprocess` (the native backend,
+/// by `execve`), and a process pool, whose locks are POSIX semaphores in
+/// `/dev/shm` shared by the processes.
+#[test]
+fn hv_debian_python_runs_a_workload() {
+    let root = fetched_root("python");
+    let _workload = workload();
+    let script = format!("/tmp/fwe-python-{}.py", std::process::id());
+    std::fs::write(root.join(script.trim_start_matches('/')), PYTHON_WORKLOAD).unwrap();
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/python3.11"))
+        .arg("-B")
+        .arg(&script)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/tmp")
+        .stdin(Stdio::null());
+    let out = run_hv(cmd, "python3.11");
+    let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
+    assert_eq!(
+        stdout(&out),
+        "executable /usr/bin/python3.11\n\
+         json {\"a\": [1, 2, {\"b\": null}]}\n\
+         re host at user and there at me\n\
+         sqlite (100, 4950, '9801')\n\
+         sha256 9c3ef3144c6828d97a4c2d6a1e7d07ba9f68b8ba2354dfa1f0717fb29023c10b\n\
+         compress 6000 6000 6000\n\
+         threads 4 418819\n\
+         socket b'ping'\n\
+         asyncio b'ASYNCIO ECHO\\n'\n\
+         decimal 0.1428571428571428571428571428571428571429\n\
+         ctypes 12 [1, 2, 3, 4, 5]\n\
+         signal [10]\n\
+         unicode LATIN SMALL LETTER E WITH ACUTE STRASSE\n\
+         fork 7\n\
+         subprocess from-sh 42\n\
+         processes [1024, 59049, 1048576]\n\
+         shm True\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Debian's GCC 12 (fetched: `guests/debian/fetch/gcc.txt`), whose driver,
+/// `cc1` and `collect2` are non-PIE executables the VM runs, while GNU `as`
+/// and `ld` run natively: a program with a thread and libm compiled and
+/// linked, and one built from a static library made with `ar`, linked as a
+/// PIE (run natively), a non-PIE and a static executable (both run in the
+/// VM). A shell script drives it, so every compiler stage is an `execve`
+/// between the backends.
+#[test]
+fn hv_debian_gcc_builds_c_programs() {
+    let root = fetched_root("gcc");
+    let _workload = workload();
+    let proj = format!("tmp/fwe-gcc-{}", std::process::id());
+    let dir = root.join(&proj);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = [
+        (
+            "hello.c",
+            r#"#include <math.h>
+#include <pthread.h>
+#include <stdio.h>
+static void *work(void *arg) {
+    long n = (long)arg, s = 0;
+    for (long i = 0; i < n; i++) s += i;
+    return (void *)s;
+}
+int main(int argc, char **argv) {
+    pthread_t t;
+    void *r;
+    pthread_create(&t, 0, work, (void *)1000);
+    pthread_join(t, &r);
+    printf("hello from gcc: %s %ld %.4f\n", argc > 1 ? argv[1] : "-", (long)r, sqrt(2.0));
+    return 0;
+}
+"#,
+        ),
+        ("util.c", "int triple(int x) { return 3 * x; }\n"),
+        (
+            "main.c",
+            "#include <stdio.h>\nint triple(int);\n\
+             int main(void) { printf(\"triple %d\\n\", triple(14)); return 0; }\n",
+        ),
+        (
+            "build.sh",
+            "set -e\n\
+             cc=aarch64-linux-gnu-gcc-12\n\
+             $cc -O2 -Wall -o hello hello.c -lm\n\
+             ./hello world\n\
+             $cc -c -O2 util.c\n\
+             ar rcs libutil.a util.o\n\
+             $cc -O2 -o pie main.c -L. -lutil\n\
+             $cc -O2 -no-pie -o nopie main.c -L. -lutil\n\
+             $cc -O2 -static -o static main.c -L. -lutil\n\
+             ./pie\n./nopie\n./static\n",
+        ),
+    ];
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--root")
+        .arg(&root)
+        .arg("--cwd")
+        .arg(format!("/{proj}"))
+        .arg(root.join("bin/bash"))
+        .arg("build.sh")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null());
+    let out = run_hv(cmd, "gcc");
+    assert_eq!(
+        stdout(&out),
+        "hello from gcc: world 499500 1.4142\ntriple 42\ntriple 42\ntriple 42\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Debian's clang 14 (fetched: `guests/debian/fetch/clang.txt`), a non-PIE
+/// executable the VM runs, with LLVM's libraries, GNU `ld` linking
+/// natively: a C program using libm and a C++ one using the standard
+/// library (libstdc++), each compiled, linked and run.
+#[test]
+fn hv_debian_clang_builds_c_and_cpp() {
+    let root = fetched_root("clang");
+    let _workload = workload();
+    let proj = format!("tmp/fwe-clang-{}", std::process::id());
+    let dir = root.join(&proj);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.c"),
+        "#include <math.h>\n#include <stdio.h>\n\
+         int main(void) { printf(\"clang %.3f\\n\", sqrt(2.0)); return 0; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b.cpp"),
+        "#include <iostream>\n#include <numeric>\n#include <vector>\n\
+         int main() { std::vector<int> v{1, 2, 3};\n\
+         std::cout << \"c++ \" << std::accumulate(v.begin(), v.end(), 0) << \"\\n\"; }\n",
+    )
+    .unwrap();
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--root")
+        .arg(&root)
+        .arg("--cwd")
+        .arg(format!("/{proj}"))
+        .arg(root.join("bin/bash"))
+        .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
+        .env_clear()
+        .env("PATH", "/usr/lib/llvm-14/bin:/usr/bin:/bin")
+        .stdin(Stdio::null());
+    let out = run_hv(cmd, "clang");
+    assert_eq!(stdout(&out), "clang 1.414\nc++ 6\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Debian's Go 1.19 (fetched: `guests/debian/fetch/go.txt`): the `go`
+/// command and its `compile` and `link` tools, all executables linked low
+/// that the VM runs, build a module (goroutines, `crypto/sha256`) and run
+/// it (a static executable, in the VM too), then build and run its tests.
+/// The `go` command starts its tools with `vfork`, mapping many files
+/// meanwhile, and the linker preallocates its output with `fallocate`.
+#[test]
+fn hv_debian_go_builds_and_tests_a_module() {
+    let root = fetched_root("go");
+    let _workload = workload();
+    let proj = format!("tmp/fwe-go-{}", std::process::id());
+    let dir = root.join(&proj);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = [
+        ("go.mod", "module example.com/hello\n\ngo 1.19\n"),
+        (
+            "main.go",
+            r#"package main
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"sync"
+)
+
+func sums() []int {
+	var wg sync.WaitGroup
+	s := make([]int, 8)
+	for i := range s {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100000; j++ {
+				s[i] += j % (i + 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	return s
+}
+
+func main() {
+	fmt.Printf("hello from go %v %x\n", sums(), sha256.Sum256([]byte("fun-with-emulators")))
+}
+"#,
+        ),
+        (
+            "main_test.go",
+            r#"package main
+
+import "testing"
+
+func TestSums(t *testing.T) {
+	if s := sums(); s[1] != 50000 {
+		t.Fatalf("got %v", s)
+	}
+}
+"#,
+        ),
+        ("build.sh", "set -e\ngo build -o hello .\n./hello\ngo test -count=1 .\n"),
+    ];
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--root")
+        .arg(&root)
+        .arg("--cwd")
+        .arg(format!("/{proj}"))
+        .arg(root.join("bin/bash"))
+        .arg("build.sh")
+        .env_clear()
+        .env("PATH", "/usr/lib/go-1.19/bin:/usr/bin:/bin")
+        .env("HOME", format!("/{proj}"))
+        .env("GOCACHE", format!("/{proj}/cache"))
+        .env("GOPROXY", "off")
+        .env("CGO_ENABLED", "0")
+        .stdin(Stdio::null());
+    let out = run_hv_for(cmd, "go", Duration::from_secs(900));
+    let text = stdout(&out);
+    assert_eq!(
+        text.lines().next(),
+        Some(
+            "hello from go [0 50000 99999 150000 200000 249996 299995 350000] \
+             9c3ef3144c6828d97a4c2d6a1e7d07ba9f68b8ba2354dfa1f0717fb29023c10b"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.lines().nth(1).is_some_and(|l| l.starts_with("ok  \texample.com/hello\t")),
+        "{text}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The script [`hv_debian_python_runs_a_workload`] runs.
+const PYTHON_WORKLOAD: &str = r#"
+import asyncio, bz2, concurrent.futures, ctypes, decimal, hashlib, json, lzma, os
+import re, signal, socket, sqlite3, subprocess, sys, threading, unicodedata, zlib
+print("executable", sys.executable)
+print("json", json.dumps({"a": [1, 2, {"b": None}]}))
+print("re", re.sub(r"(\w+)@(\w+)", r"\2 at \1", "user@host and me@there"))
+db = sqlite3.connect(":memory:")
+db.execute("create table t(x integer, y text)")
+db.executemany("insert into t values (?, ?)", [(i, str(i * i)) for i in range(100)])
+print("sqlite", db.execute("select count(*), sum(x), max(y) from t").fetchone())
+print("sha256", hashlib.sha256(b"fun-with-emulators").hexdigest())
+data = b"hello " * 1000
+print("compress", len(zlib.decompress(zlib.compress(data))),
+      len(bz2.decompress(bz2.compress(data))), len(lzma.decompress(lzma.compress(data))))
+total, lock = [], threading.Lock()
+def work(n):
+    s = sum(i * i for i in range(n))
+    with lock:
+        total.append(s)
+ts = [threading.Thread(target=work, args=(10000 + i,)) for i in range(4)]
+for t in ts: t.start()
+for t in ts: t.join()
+print("threads", len(total), sum(total) % 1000003)
+a, b = socket.socketpair()
+a.sendall(b"ping")
+print("socket", b.recv(4))
+async def echo():
+    async def handle(r, w):
+        w.write((await r.readline()).upper())
+        await w.drain()
+        w.close()
+    srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+    r, w = await asyncio.open_connection("127.0.0.1", srv.sockets[0].getsockname()[1])
+    w.write(b"asyncio echo\n")
+    await w.drain()
+    line = await r.readline()
+    w.close()
+    srv.close()
+    await srv.wait_closed()
+    return line
+print("asyncio", asyncio.run(echo()))
+decimal.getcontext().prec = 40
+print("decimal", decimal.Decimal(1) / decimal.Decimal(7))
+libc = ctypes.CDLL("libc.so.6")
+CMP = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+arr = (ctypes.c_int * 5)(5, 3, 1, 4, 2)
+libc.qsort(arr, 5, ctypes.sizeof(ctypes.c_int), CMP(lambda x, y: x[0] - y[0]))
+print("ctypes", libc.strlen(b"twelve chars"), list(arr))
+got = []
+signal.signal(signal.SIGUSR1, lambda s, f: got.append(s))
+os.kill(os.getpid(), signal.SIGUSR1)
+print("signal", got)
+print("unicode", unicodedata.name("é"), "straße".upper())
+pid = os.fork()
+if pid == 0:
+    os._exit(7)
+print("fork", os.waitpid(pid, 0)[1] >> 8)
+sh = subprocess.run(["/bin/sh", "-c", "echo from-sh $((6*7))"], capture_output=True, text=True)
+print("subprocess", sh.stdout.strip())
+with concurrent.futures.ProcessPoolExecutor(2) as ex:
+    print("processes", list(ex.map(pow, [2, 3, 4], [10, 10, 10])))
+print("shm", os.path.isdir("/dev/shm"))
+"#;
 
 /// Pointer authentication and BTI in the VM, as Linux gives them to a
 /// program: keys of its own (kept by a fork child, changed by
@@ -2642,6 +3006,27 @@ fn hv_records_the_vm_calls() {
     }
 }
 
+/// A program with hundreds of file mappings, which fwe's VM backend each
+/// keeps a descriptor for: they stay out of the program's reach (a `vfork`
+/// child taking over descriptors 3-399 still reaches its parent's memory),
+/// and a shared mapping of a file opened read-only follows the file and
+/// cannot be made writable.
+#[test]
+fn hv_many_file_mappings() {
+    let prog = build_c("manymaps", Libc::Glibc, true, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-manymaps-nopie");
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    let Some(out) = fwe_hv_in(&root, &prog, &[]) else { return };
+    assert_eq!(
+        stdout(&out),
+        "300 read-only shared mappings; a later write seen: 1 1\n\
+         made writable: -1, errno 13\n\
+         vfork child after taking descriptors 3-399: exit 10\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// What `fwe --probe hv-map-rules` says on the stand-in: its inferred rule
 /// for the host memory `hv_vm_map` takes. The self-hosted `hypervisor` CI
 /// job compares the real framework's answers with these.
@@ -2655,6 +3040,8 @@ R, at most R, as RX: refused
 R, at most R, as R: refused
 RX, at most RX, as RX: refused
 shared entry of read-only memory, as RX: refused
+a read-only file, shared, as RX: refused
+a read-only file, private, as RX: mapped
 unmapped, as R: refused
 ";
 

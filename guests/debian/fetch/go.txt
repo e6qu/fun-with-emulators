@@ -1,0 +1,5 @@
+# Debian 12 (bookworm) arm64 packages the Go test fetches from
+# https://deb.debian.org/debian/ and unpacks into its root filesystem;
+# each line is a pool path and the package's SHA-256 from the bookworm index.
+pool/main/g/golang-1.19/golang-1.19-go_1.19.8-2_arm64.deb c087d91b306be6cb69085a1fd5ba5a9c841c6e7a5c8d27705bb5a6928c6d3f74
+pool/main/g/golang-1.19/golang-1.19-src_1.19.8-2_all.deb 2dfa82fe4f08f4e0193c532e561af4c91871f5235608f04f2bb8d57bb288df5a

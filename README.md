@@ -16,10 +16,14 @@ networking, terminals, event descriptors and a synthetic `/proc` are in
 place.
 
 A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
-`python3.11`, static Go) cannot be mapped in-process; fwe runs it in a
+`python3.11`, GCC, clang and Go) cannot be mapped in-process; fwe runs it in a
 Hypervisor.framework VM instead, which needs `fwe` signed with the
 hypervisor entitlement ([docs/hypervisor.md](docs/hypervisor.md)); threads,
-`fork` and `execve` work there as they do in-process. See
+`fork` and `execve` work there as they do in-process. Debian's Python
+running its standard library, GCC and clang building C and C++ programs
+and Go building and
+testing a module pass there on a software stand-in for the framework; a
+run on real hardware is still to come. See
 [ROADMAP.md](ROADMAP.md) for milestones and status,
 [PLAN.md](PLAN.md) for the goal and scope, and
 [docs/architecture.md](docs/architecture.md) for how it works and what is

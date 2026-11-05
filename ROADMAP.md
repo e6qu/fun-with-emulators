@@ -11,10 +11,11 @@ describes how the pieces work and lists the current limitations in detail.
 
 **Status (November 2026):** M0 and M1 are done. M2 is in progress: its
 system-call surface is implemented, and the hypervisor backend runs
-low-address executables with threads, `fork` and `execve`; what remains is
-Debian's Python, the `x18` and code-discovery gaps, and running the rest of
-the listed software end to end (git, SQLite, lighttpd, Node, Cargo and apt
-run; GCC, clang and Go need the hypervisor backend).
+low-address executables with threads, `fork` and `execve`; git, SQLite,
+lighttpd, Node, Cargo and apt run natively, and Debian's Python, GCC, Go
+and clang in the VM (verified on the software stand-in; a run on real
+hardware is still to come). What remains is the `x18` and code-discovery
+gaps.
 
 ## M0 — Foundation (done)
 
@@ -110,7 +111,10 @@ Remaining:
   tables for every mapping change, no private page in two VMs; pointer
   authentication and BTI as Linux sets them up, where the VM offers them
   (verified on the stand-in; a real-hardware run is still to come)
-- [ ] Python from the Debian rootfs (carried over from M1)
+- [x] Python from the Debian rootfs (carried over from M1): Debian's
+  Python 3.11, fetched, runs a standard-library workload in the VM (C
+  modules, threads, asyncio, ctypes, `fork`, `subprocess`, and a process
+  pool whose semaphores are in `/dev/shm`), verified on the stand-in
 - [x] `execveat` and `clone3`; virtual credentials, `RLIMIT_NOFILE` and the
   umask carried across an `execve` that re-executes fwe
 - [x] The rest of the process model: `vfork` sharing memory with its parent
@@ -133,10 +137,11 @@ Remaining:
   worker thread) and the Rust toolchain (Debian's rustc and Cargo, fetched:
   a two-crate project built in release mode and its unit tests run, linked
   by GNU ld) and `apt` (Debian's apt and dpkg, fetched: a package
-  installed from a local repository, run, and removed). Left: a C compiler
-  (Debian's GCC and clang are non-PIE executables linked below 4 GiB, so
-  they need the hypervisor backend, as Python does) and Go (Debian's `go`
-  tool is one too)
+  installed from a local repository, run, and removed) and a C compiler
+  (Debian's GCC 12, fetched, in the VM: a threaded program, a static
+  library, PIE, non-PIE and static executables; and Debian's clang 14, C
+  and C++) and Go (Debian's Go 1.19, fetched, in the VM: a module built,
+  run and its tests run); the VM's are verified on the stand-in
 
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.

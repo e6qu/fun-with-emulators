@@ -95,6 +95,10 @@ it). Nothing fetched is redistributed in this repository.
 | `fetch/apt.txt` | apt 2.6 and dpkg 1.21 with the tools dpkg runs (tar, diffutils, coreutils, `ldconfig`), glibc, and their libraries (GnuTLS, libgcrypt, libsystemd, libseccomp and others) | 17 MB |
 | `fetch/apt-repo.txt` | GNU hello, which the apt test serves from a local repository rather than unpacking | 52 kB |
 | `fetch/rust.txt` | rustc 1.63 with its standard library and LLVM 14, Cargo with libcurl, libgit2 and libssh2, GNU binutils (`ld`), and the glibc and GCC files a program links with (`libc6-dev`, `libgcc-12-dev`) | 112 MB |
+| `fetch/python.txt` | Python 3.11 and its standard library, with the libraries its C modules use: OpenSSL, SQLite, expat, zlib, bzip2, xz, libffi, ncurses, readline, Berkeley DB, libuuid, libcrypt, and `media-types` | 8 MB |
+| `fetch/gcc.txt` | GCC 12 (the driver, `cc1`, `collect2`) with GMP, MPFR, MPC and ISL, GNU binutils (`as`, `ld`, `ar`), and the glibc and GCC files a program links with (`libc6`, `libc6-dev`, `linux-libc-dev`, `libgcc-12-dev`) | 40 MB |
+| `fetch/clang.txt` | clang 14 with LLVM 14 and its libraries, GNU binutils, and the glibc, GCC and libstdc++ files a program builds and links with | 63 MB |
+| `fetch/go.txt` | Go 1.19: the `go` command, its tools and the standard library's sources | 74 MB |
 
 ## License
 
