@@ -94,7 +94,9 @@ pub fn start(spec: &str) -> Result<(), String> {
         } else {
             return Err(format!("{part}: a destination is file:PATH or udp:HOST:PORT"));
         };
-        fds.push((fwe_kernel::fdtable::reserve(fd.0), fd.1));
+        let kept = fwe_kernel::fdtable::reserve(fd.0)
+            .map_err(|_| format!("{part}: no descriptor left for it"))?;
+        fds.push((kept, fd.1));
     }
     let _ = SINKS.set(Sinks { spec: resolved.join(","), fds });
     std::thread::Builder::new()

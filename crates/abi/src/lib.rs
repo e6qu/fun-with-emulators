@@ -856,6 +856,12 @@ pub struct Statfs {
     pub f_spare: [i64; 4],
 }
 
+/// `fallocate` modes.
+pub mod falloc {
+    pub const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+    pub const FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+}
+
 /// `statfs` values: the `f_type` fwe reports for the host filesystems it
 /// serves files from, and the `f_flags` mount flags.
 pub mod statfs {

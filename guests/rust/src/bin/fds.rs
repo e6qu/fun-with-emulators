@@ -7,6 +7,9 @@ const SIG_BLOCK: i32 = 0;
 const RLIMIT_NOFILE: i32 = 7;
 const EBADF: i32 = 9;
 const EPERM: i32 = 1;
+const EINVAL: i32 = 22;
+const EMFILE: i32 = 24;
+const F_DUPFD: i32 = 0;
 const SYS_CLOSE_RANGE: i64 = 436;
 
 #[repr(C)]
@@ -36,6 +39,16 @@ unsafe extern "C" {
 fn errno() -> i32 {
     // SAFETY: musl's errno location for this thread.
     unsafe { *__errno_location() }
+}
+
+fn name(e: i32) -> &'static str {
+    match e {
+        EBADF => "EBADF",
+        EPERM => "EPERM",
+        EINVAL => "EINVAL",
+        EMFILE => "EMFILE",
+        _ => "?",
+    }
 }
 
 fn nofile() -> Rlimit {
@@ -142,24 +155,66 @@ fn main() {
             let n = unsafe { read(reopened.as_raw_fd(), &mut b, 1) };
             println!("reopened pipe reads: {n} {}", b as char);
         }
-        // The limit is virtual and bounds what the guest can name.
+        // The limit is virtual and bounds what the guest can name, as
+        // Linux's soft limit does.
         Some("limits") => {
             let lim = nofile();
             println!("hard limit above soft: {}", lim.max >= lim.cur);
             // SAFETY: plain calls.
-            let (r, e) = unsafe { (dup2(1, lim.max as i32), errno()) };
-            println!("dup2 at the hard limit: {r} {}", if e == EBADF { "EBADF" } else { "?" });
+            let (r, e) = unsafe { (dup2(1, lim.cur as i32), errno()) };
+            println!("dup2 at the soft limit: {r} {}", name(e));
             // SAFETY: plain call.
-            let r = unsafe { dup2(1, lim.max as i32 - 1) };
-            println!("dup2 just below it: {}", r == lim.max as i32 - 1);
+            let r = unsafe { dup2(1, lim.cur as i32 - 1) };
+            println!("dup2 just below it: {}", r == lim.cur as i32 - 1);
+            // SAFETY: plain call.
+            unsafe { close(lim.cur as i32 - 1) };
+            // SAFETY: plain calls.
+            let (r, e) = unsafe { (fcntl(1, F_DUPFD, lim.cur as i32), errno()) };
+            println!("F_DUPFD from it: {r} {}", name(e));
             let above = Rlimit { cur: lim.max + 1, max: lim.max + 1 };
             // SAFETY: a valid in-parameter.
             let (r, e) = unsafe { (setrlimit(RLIMIT_NOFILE, &above), errno()) };
-            println!("raising past it: {r} {}", if e == EPERM { "EPERM" } else { "?" });
-            let lower = Rlimit { cur: 256, max: lim.max };
+            println!("raising past it: {r} {}", name(e));
+
+            // With the soft limit lowered and every descriptor below it
+            // taken, a new one fails with EMFILE, whatever makes it.
+            let lower = Rlimit { cur: 32, max: lim.max };
             // SAFETY: a valid in-parameter.
             unsafe { setrlimit(RLIMIT_NOFILE, &lower) };
             println!("soft limit now {}", nofile().cur);
+            let mut held = Vec::new();
+            loop {
+                // SAFETY: plain call.
+                let fd = unsafe { fcntl(1, F_DUPFD, 0) };
+                if fd < 0 {
+                    let next = held.last().map_or(0, |&l| l + 1);
+                    println!("dup stopped at {next}: {}", name(errno()));
+                    break;
+                }
+                held.push(fd);
+            }
+            // SAFETY: plain calls.
+            let (r, e) = unsafe { (eventfd(0, 0), errno()) };
+            println!("eventfd: {r} {}", name(e));
+            // One free: a pipe needs two.
+            let last = held.pop().unwrap();
+            // SAFETY: plain call.
+            unsafe { close(last) };
+            let mut p = [0i32; 2];
+            // SAFETY: a 2-element array.
+            let (r, e) = unsafe { (pipe(p.as_mut_ptr()), errno()) };
+            println!("pipe with one free: {r} {}", name(e));
+            // SAFETY: plain call; the free one is still free.
+            let fd = unsafe { eventfd(0, 0) };
+            println!("eventfd with one free: {}", fd == last);
+            // The eventfd works, so fwe's record of the one refused above
+            // did not linger.
+            // SAFETY: an 8-byte value.
+            let w = unsafe { write(fd, 7u64.to_ne_bytes().as_ptr(), 8) };
+            let mut v = [0u8; 8];
+            // SAFETY: an 8-byte buffer.
+            let n = unsafe { read(fd, v.as_mut_ptr(), 8) };
+            println!("and counts: {w} {n} {}", u64::from_ne_bytes(v));
         }
         other => {
             eprintln!("unknown scenario {other:?}");

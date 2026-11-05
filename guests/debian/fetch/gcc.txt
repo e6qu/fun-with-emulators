@@ -1,0 +1,26 @@
+# Debian 12 (bookworm) arm64 packages the C compiler test fetches from
+# https://deb.debian.org/debian/ and unpacks into its root filesystem;
+# each line is a pool path and the package's SHA-256 from the bookworm index.
+pool/main/g/gcc-12/gcc-12_12.2.0-14+deb12u1_arm64.deb d4f6bc31cefeb188eddc7e0f738f51c12f863cd03502935c388a9f305f558996
+pool/main/g/gcc-12/cpp-12_12.2.0-14+deb12u1_arm64.deb f95ae5b0f967bf9de96c952e12b865b133756f3f07f904a64a1fec5fcf3d20e7
+pool/main/g/gcc-12/gcc-12-base_12.2.0-14+deb12u1_arm64.deb 674cf6cba6d432bd200c45fe866c1652c7a53523cc2e7a613e05bc4abf7b5440
+pool/main/g/gcc-12/libcc1-0_12.2.0-14+deb12u1_arm64.deb ed4d33378031fb5138486e3aa648d57003456f257265a54059042fe952026fd8
+pool/main/i/isl/libisl23_0.25-1.1_arm64.deb e7232e299714254a9473d7eacdf6879eedf02b950c87da145f5d605800710c6c
+pool/main/m/mpclib3/libmpc3_1.3.1-1_arm64.deb 19fd1712d02a9ee3eeff5b6678a8766a12f2858c3384258c7abc15edd891739f
+pool/main/m/mpfr4/libmpfr6_4.2.0-1_arm64.deb d818fbfb555561bff56694cc628dc9939f393a07026aefd237e9c818b9f2cb77
+pool/main/g/gmp/libgmp10_6.2.1+dfsg1-1.1_arm64.deb 9906387c1dd806518c915bd8616d072c741061d7fa26b222e52763456060b31a
+pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_arm64.deb 95e173c9538f96ede4fc275ec7863f395a97dd0ea62454be9bc914efa1b9be93
+pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb 52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913
+pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_arm64.deb 26e138c677a985775331373828a6c286c551ff397cb735d00e2383cb273d1cb2
+pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_arm64.deb 576926b283613db80168ddf76380a3bd877602778cf0d226caa7bfbfa71eacf3
+pool/main/g/gcc-12/libgcc-12-dev_12.2.0-14+deb12u1_arm64.deb c83d28b7c3397c25f15ae17783fce78716a3d7cd415940940cc2af8dc4db8d6d
+pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb 01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4
+pool/main/g/glibc/libc6-dev_2.36-9+deb12u14_arm64.deb 8bc395bf2ee9939f1a6ae395f974cffdcf541d98f99adfe89ce7e4bef36d159e
+pool/main/l/linux/linux-libc-dev_6.1.176-1_arm64.deb eeca5ec13bed7206f8171fab9a48e84119dcc20cc79557f104628447a524ad10
+pool/main/b/binutils/binutils-aarch64-linux-gnu_2.40-2_arm64.deb fa154fed9b3bb5e11c4c152c3faaa5b56dce9ea39fed68156c3d656c97b4a11e
+pool/main/b/binutils/libbinutils_2.40-2_arm64.deb 1987db5a2ca550be3153dce8b23d6b2e038079c4de0b26b349e5b742e293ad23
+pool/main/b/binutils/libctf0_2.40-2_arm64.deb 539036b9ecf8af5e803962ffcf0639332dcb3a027a7ab10b174f8f92272f5b21
+pool/main/b/binutils/libctf-nobfd0_2.40-2_arm64.deb 27a232cba9b33bd8495e7ccc8ffbe24c729574a8073df0851decba037fb12a63
+pool/main/j/jansson/libjansson4_2.14-2_arm64.deb 49fda2bcfdf6b78098a5cdc9eaee23ef1f3b331559f02f1e32bc26f1fb6b4aec
+pool/main/b/binutils/binutils_2.40-2_arm64.deb 546129bb85470fa3b5398d7429cd87c5353ab47f37e9d5e28abc57e6923a24fa
+pool/main/b/binutils/binutils-common_2.40-2_arm64.deb 2e340788164c94d876ab88c41f85ec0875a9f4324f83c93a44a14879925a11a0

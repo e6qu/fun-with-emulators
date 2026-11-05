@@ -6,7 +6,7 @@ use super::{fork, mem, record, vm, window};
 use crate::{Error, Options, STACK_SIZE, cmdline, hostname, hwcap, ncpu, stack};
 use fwe_abi::{auxv, err, errno, mman, nr};
 use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
-use fwe_kernel::{Brk, FpRegs, HostSignal, Kernel, Platform, Regs, Tracer, host, thread, uaccess};
+use fwe_kernel::{Brk, FpRegs, HostSignal, Kernel, Platform, Regs, host, thread, uaccess};
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
@@ -34,7 +34,7 @@ impl Platform for HvPlatform {
         _addr: u64,
         _len: u64,
         _known: Option<&[(u64, u64)]>,
-    ) -> Result<(), i32> {
+    ) -> Result<(), fwe_kernel::PrepareFailed> {
         // The guest's code runs as it is.
         Ok(())
     }
@@ -558,7 +558,7 @@ fn start(
 ) -> Result<std::convert::Infallible, Error> {
     // The guest's pages are Linux's 4 KiB ones: its own page tables say so.
     let page = PAGE;
-    let tracer = Tracer { enabled: options.strace };
+    let tracer = options.strace;
     // Hypervisor.framework runs threads of its own, which inherit the mask
     // of the thread that creates them. With every guest signal blocked
     // there, the host delivers signals only to the vCPU threads, whose masks
@@ -658,7 +658,7 @@ fn start(
     }
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
-    let execfn = path.as_os_str().as_bytes();
+    let execfn = &crate::guest_execfn(path, options);
     let mut random = [0u8; 16];
     host::fill_random(&mut random);
     let image =
@@ -677,7 +677,7 @@ fn start(
     vm::flushed_without_vcpus();
 
     let entry = interp.as_ref().map_or(exe.entry, |i| i.entry);
-    if options.strace {
+    if tracer.enabled {
         tracer.note(&format!(
             "hypervisor backend: exe entry {:#x}, image translated to host {:#x}, \
              interp base {:#x}, brk {brk_start:#x}, stack top {stack_top:#x}",
@@ -688,7 +688,7 @@ fn start(
     }
 
     fs.set_proc_info(crate::guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
-    fwe_kernel::net::set_rootfs(fs.root_host_path());
+    fs.publish();
     thread::init_main(host::getpid() as i32);
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
     crate::apply_exec_state(&mut k, options)?;
@@ -1007,6 +1007,11 @@ impl Vcpu {
                     // again.
                     regs.pc = elr;
                 } else {
+                    let k = kernel();
+                    if let Some(k) = k.as_ref().filter(|k| k.tracer.enabled) {
+                        k.tracer.note(&format!("guest abort: esr {esr:#x}, far {far:#x}"));
+                    }
+                    drop(k);
                     fault(&mut regs, s::SIGSEGV, far)
                 }
             }
@@ -1069,7 +1074,7 @@ fn fault(regs: &mut Regs, sig: u64, addr: u64) {
     }
 }
 
-fn fatal(msg: &str) -> ! {
+pub(super) fn fatal(msg: &str) -> ! {
     let line = format!("fwe: {msg}\n");
     // SAFETY: writing a diagnostic to standard error.
     unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
@@ -1125,7 +1130,7 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
         teardown();
         record::event("execve", &path);
     };
-    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer.enabled, &state, before_exec);
+    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer, &state, before_exec);
     if !VM_LIVE.load(std::sync::atomic::Ordering::SeqCst) {
         fatal(&format!(
             "execve {} failed after the VM was destroyed: {r}",

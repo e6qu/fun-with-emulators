@@ -26,24 +26,7 @@ use crate::host::{last_error, ret};
 use crate::{guest, uaccess};
 use fwe_abi::socket::*;
 use fwe_abi::{err, errno};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
-use std::sync::Mutex;
-
-/// Host rootfs, used to root `AF_UNIX` paths. `None` means pass paths through
-/// (no `--root`).
-static ROOTFS: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-/// Run `f` holding the rootfs lock (see [`crate::fork_locked`]).
-pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = ROOTFS.lock().unwrap_or_else(|e| e.into_inner());
-    f()
-}
-
-/// Set the rootfs used to root `AF_UNIX` socket paths. Called at program load.
-pub fn set_rootfs(root: Option<PathBuf>) {
-    *ROOTFS.lock().unwrap() = root;
-}
+use std::os::unix::ffi::OsStringExt;
 
 const SOCKADDR_MAX: usize = 128;
 /// Host `sun_path` capacity.
@@ -62,8 +45,9 @@ fn host_af(domain: u64) -> Result<libc::c_int, i64> {
     })
 }
 
-/// Map a guest `AF_UNIX` `sun_path` to a host filesystem path.
-fn root_unix_path(raw: &[u8]) -> Result<Vec<u8>, i64> {
+/// Map a guest `AF_UNIX` `sun_path` to a host filesystem path, following a
+/// final symlink if `follow` (not for `bind`, which creates the name).
+fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     if raw.is_empty() {
         return Ok(Vec::new()); // unnamed / autobind
     }
@@ -78,54 +62,28 @@ fn root_unix_path(raw: &[u8]) -> Result<Vec<u8>, i64> {
         let p = dir.join(format!("{:016x}", h.finish()));
         return Ok(p.into_os_string().into_vec());
     }
-    // Pathed: trim at the first NUL, then root under the rootfs.
+    // Pathed: trim at the first NUL, then resolve as a file's path is, in
+    // the guest's filesystem.
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    let path = &raw[..end];
-    let root = ROOTFS.lock().unwrap().clone();
-    match root {
-        None => Ok(path.to_vec()),
-        Some(root) => {
-            let mut full = root;
-            for comp in path.split(|&b| b == b'/') {
-                match comp {
-                    b"" | b"." => {}
-                    b".." => {
-                        full.pop();
-                    }
-                    c => full.push(std::ffi::OsStr::from_bytes(c)),
-                }
-            }
-            Ok(full.into_os_string().into_vec())
+    let host = crate::fs::resolve_host(&raw[..end], follow).map_err(err)?;
+    if !follow {
+        // Linux's `bind` takes a name that exists, a symlink included, as
+        // in use; macOS's would follow the symlink.
+        let c = std::ffi::CString::new(host.clone()).map_err(|_| err(errno::EINVAL))?;
+        // SAFETY: zeroed bytes are a valid `stat`; `lstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is NUL-terminated; `st` is a valid out-parameter.
+        if unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0 {
+            return Err(err(errno::EADDRINUSE));
         }
     }
+    Ok(host)
 }
 
-/// Reverse [`root_unix_path`] for addresses handed back to the guest: strip the
-/// rootfs prefix so the guest sees its own path. Best effort.
+/// Reverse [`root_unix_path`] for addresses handed back to the guest: the
+/// guest path of the host path, or the host path when it has none.
 fn unroot_unix_path(host: &[u8]) -> Vec<u8> {
-    let root = ROOTFS.lock().unwrap().clone();
-    if let Some(root) = root {
-        let root_bytes = root.into_os_string().into_vec();
-        if host.len() > root_bytes.len() && host.starts_with(&root_bytes) {
-            let mut out = vec![b'/'];
-            out.extend_from_slice(host[root_bytes.len()..].trim_ascii_start_matches_slash());
-            return out;
-        }
-    }
-    host.to_vec()
-}
-
-trait TrimSlash {
-    fn trim_ascii_start_matches_slash(&self) -> &Self;
-}
-impl TrimSlash for [u8] {
-    fn trim_ascii_start_matches_slash(&self) -> &[u8] {
-        let mut s = self;
-        while let [b'/', rest @ ..] = s {
-            s = rest;
-        }
-        s
-    }
+    crate::fs::guest_of_host(host).unwrap_or_else(|| host.to_vec())
 }
 
 /// Convert a guest `sockaddr` at `addr`/`len` into host layout in `out`,
@@ -137,6 +95,7 @@ unsafe fn to_host(
     addr: u64,
     len: u64,
     out: &mut [u8; SOCKADDR_MAX],
+    follow: bool,
 ) -> Result<libc::socklen_t, i64> {
     if addr == 0 || len < 2 {
         return Err(err(errno::EINVAL));
@@ -145,7 +104,7 @@ unsafe fn to_host(
     match u16::from_ne_bytes([src[0], src[1]]) as u64 {
         AF_INET => inet_to_host(&src, out, 16),
         AF_INET6 => inet_to_host(&src, out, 28),
-        AF_UNIX => unix_to_host(&src, out),
+        AF_UNIX => unix_to_host(&src, out, follow),
         _ => Err(err(errno::EAFNOSUPPORT)),
     }
 }
@@ -175,9 +134,13 @@ fn inet_to_host(
 }
 
 /// `src` is the guest's address.
-fn unix_to_host(src: &[u8], out: &mut [u8; SOCKADDR_MAX]) -> Result<libc::socklen_t, i64> {
+fn unix_to_host(
+    src: &[u8],
+    out: &mut [u8; SOCKADDR_MAX],
+    follow: bool,
+) -> Result<libc::socklen_t, i64> {
     let raw = &src[2..];
-    let host = root_unix_path(raw)?;
+    let host = root_unix_path(raw, follow)?;
     if host.len() + 1 > UNIX_PATH_MAX {
         return Err(err(errno::ENAMETOOLONG));
     }
@@ -355,7 +318,7 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
 pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64) -> i64 {
     let mut hb = empty_sockaddr();
     // SAFETY: the caller guarantees the sockaddr spans addrlen.
-    let hlen = match unsafe { to_host(addr, addrlen, &mut hb) } {
+    let hlen = match unsafe { to_host(addr, addrlen, &mut hb, false) } {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -379,7 +342,7 @@ pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
 pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     let mut hb = empty_sockaddr();
     // SAFETY: the caller guarantees the sockaddr spans addrlen.
-    let hlen = match unsafe { to_host(addr, addrlen, &mut hb) } {
+    let hlen = match unsafe { to_host(addr, addrlen, &mut hb, true) } {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -498,7 +461,7 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     let mut hb = empty_sockaddr();
     let (aptr, alen) = if addr != 0 && addrlen != 0 {
         // SAFETY: the caller guarantees the sockaddr spans addrlen.
-        match unsafe { to_host(addr, addrlen, &mut hb) } {
+        match unsafe { to_host(addr, addrlen, &mut hb, true) } {
             Ok(l) => (hb.as_ptr() as *const libc::sockaddr, l),
             Err(e) => return e,
         }
@@ -661,7 +624,7 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let mut hb = empty_sockaddr();
     let (name_ptr, name_len) = if name != 0 && namelen != 0 {
         // SAFETY: the caller guarantees the name spans namelen.
-        match unsafe { to_host(name, namelen as u64, &mut hb) } {
+        match unsafe { to_host(name, namelen as u64, &mut hb, true) } {
             Ok(l) => (hb.as_mut_ptr() as *mut libc::c_void, l),
             Err(e) => return e,
         }
@@ -1033,52 +996,85 @@ mod tests {
         close(fd);
     }
 
-    /// Pathed AF_UNIX: bind a stream socket to a filesystem path (rooted under
-    /// the rootfs), connect to it, accept, and exchange a message.
+    /// A guest `AF_UNIX` address for `path`, and its length.
+    fn unix_addr(path: &[u8]) -> ([u8; 110], u64) {
+        let mut addr = [0u8; 2 + 108];
+        addr[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        addr[2..2 + path.len()].copy_from_slice(path);
+        (addr, 2 + path.len() as u64 + 1)
+    }
+
+    /// Pathed AF_UNIX: socket paths are resolved as file paths are, in the
+    /// guest's filesystem: a relative one from the working directory, `..`
+    /// kept inside the root, symlinks followed in the root (except by
+    /// `bind`, which creates the name). A stream socket bound, connected,
+    /// accepted and exchanging a message, and its name reported as the
+    /// guest's path.
     #[test]
     fn unix_path_round_trip() {
         let dir = std::env::temp_dir().join(format!("fwe-unix-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        set_rootfs(Some(dir.clone()));
-
-        // Guest path "/s"; the rooted host path is dir/s.
-        let mut addr = [0u8; 2 + 108];
-        addr[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
-        addr[2..4].copy_from_slice(b"/s");
-        let alen = 2 + 3; // family + "/s" + NUL
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink("/sub/s", dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("/sub/t", dir.join("dangling")).unwrap();
+        let mut fs = crate::fs::Fs::new(Some(dir.as_os_str().as_encoded_bytes())).unwrap();
+        fs.publish();
+        fs.chdir(fwe_abi::fcntl::AT_FDCWD as i32, b"/sub").unwrap();
 
         // SAFETY: no pointers.
         let srv = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
         assert!(srv >= 0);
+        // "s", from the working directory /sub.
+        let (addr, alen) = unix_addr(b"s");
         // SAFETY: valid sockaddr.
-        let b = unsafe { bind(srv as u64, addr.as_ptr() as u64, alen as u64) };
+        let b = unsafe { bind(srv as u64, addr.as_ptr() as u64, alen) };
         assert_eq!(b, 0, "unix bind: {b}");
+        assert!(dir.join("sub/s").exists());
         // SAFETY: no pointers.
-        assert_eq!(unsafe { listen(srv as u64, 1) }, 0);
+        assert_eq!(unsafe { listen(srv as u64, 4) }, 0);
+        let mut name = [0u8; 110];
+        let mut len = name.len() as u32;
+        // SAFETY: valid out pointers.
+        let r = unsafe {
+            getname(srv as u64, name.as_mut_ptr() as u64, &mut len as *mut u32 as u64, false)
+        };
+        assert_eq!(r, 0);
+        assert_eq!(&name[2..len as usize], b"/sub/s\0");
 
+        // The same socket by `..` past the root, and through a symlink.
+        for path in [&b"/../../sub/s"[..], b"../link"] {
+            // SAFETY: no pointers.
+            let cli = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+            let (addr, alen) = unix_addr(path);
+            // SAFETY: valid sockaddr.
+            let c = unsafe { connect(cli as u64, addr.as_ptr() as u64, alen) };
+            assert_eq!(c, 0, "unix connect {}: {c}", String::from_utf8_lossy(path));
+            // SAFETY: no out address.
+            let acc = unsafe { accept4(srv as u64, 0, 0, 0) };
+            assert!(acc >= 0, "unix accept: {acc}");
+            // SAFETY: valid buffer.
+            let sent = unsafe { sendto(cli as u64, b"u!".as_ptr() as u64, 2, 0, 0, 0) };
+            assert_eq!(sent, 2);
+            let mut buf = [0u8; 4];
+            // SAFETY: valid buffer.
+            let got = unsafe { recvfrom(acc as u64, buf.as_mut_ptr() as u64, 4, 0, 0, 0) };
+            assert_eq!(&buf[..got as usize], b"u!");
+            close(acc);
+            close(cli);
+        }
+
+        // `bind` does not follow a final symlink: the name is taken.
         // SAFETY: no pointers.
-        let cli = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
-        assert!(cli >= 0);
+        let other = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+        let (addr, alen) = unix_addr(b"/dangling");
         // SAFETY: valid sockaddr.
-        let c = unsafe { connect(cli as u64, addr.as_ptr() as u64, alen as u64) };
-        assert_eq!(c, 0, "unix connect: {c}");
-        // SAFETY: no out address.
-        let acc = unsafe { accept4(srv as u64, 0, 0, 0) };
-        assert!(acc >= 0, "unix accept: {acc}");
+        let b = unsafe { bind(other as u64, addr.as_ptr() as u64, alen) };
+        assert_eq!(b, -(errno::EADDRINUSE as i64));
+        assert!(!dir.join("sub/t").exists());
 
-        // SAFETY: valid buffer.
-        let sent = unsafe { sendto(cli as u64, b"u!".as_ptr() as u64, 2, 0, 0, 0) };
-        assert_eq!(sent, 2);
-        let mut buf = [0u8; 4];
-        // SAFETY: valid buffer.
-        let got = unsafe { recvfrom(acc as u64, buf.as_mut_ptr() as u64, 4, 0, 0, 0) };
-        assert_eq!(got, 2);
-        assert_eq!(&buf[..2], b"u!");
-
-        close(acc);
-        close(cli);
+        close(other);
         close(srv);
-        set_rootfs(None);
+        crate::fs::unpublish();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

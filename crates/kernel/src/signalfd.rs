@@ -114,7 +114,15 @@ pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
         return crate::host::last_error();
     }
     // The write end is fwe's: out of the guest's reach.
-    let (rfd, wfd) = (fds[0], crate::fdtable::reserve(fds[1]));
+    let wfd = match crate::fdtable::reserve(fds[1]) {
+        Ok(w) => w,
+        Err(e) => {
+            // SAFETY: closing the read end made above.
+            unsafe { libc::close(fds[0]) };
+            return fwe_abi::err(e);
+        }
+    };
+    let rfd = fds[0];
     if flags & fcntl::O_CLOEXEC != 0 {
         // SAFETY: plain host call on a fresh descriptor.
         unsafe { libc::fcntl(rfd, libc::F_SETFD, libc::FD_CLOEXEC) };

@@ -90,6 +90,24 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_args(n, &a) {
             return e;
         }
+        if let Err(e) = crate::fdtable::check_limit(n, &a) {
+            return e;
+        }
+        let r = self.dispatch_call(n, a);
+        // Descriptors past the guest's soft limit are ones Linux would not
+        // have given: closed again (by the guest's `close`, which also drops
+        // what fwe keeps for one), and the call fails.
+        let made = crate::fdtable::made(n, &a, r);
+        if crate::fdtable::over_limit(&made) {
+            for fd in made {
+                self.dispatch_call(nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+            }
+            return fwe_abi::err(fwe_abi::errno::EMFILE);
+        }
+        r
+    }
+
+    fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             // Files and I/O.
             nr::READ => {
@@ -225,6 +243,7 @@ impl<P: Platform> Kernel<P> {
             nr::FCHOWN => self.chown_check(a[1] as u32, a[2] as u32),
             nr::TRUNCATE => self.sys_truncate(a[0], a[1]),
             nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
+            nr::FALLOCATE => self.sys_fallocate(a[0], a[1], a[2], a[3]),
             nr::UMASK => self.sys_umask(a[0]),
             nr::PIPE2 => self.sys_pipe2(a[0], a[1]),
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
@@ -1017,7 +1036,7 @@ mod tests {
             addr: u64,
             len: u64,
             _known: Option<&[(u64, u64)]>,
-        ) -> Result<(), i32> {
+        ) -> Result<(), crate::PrepareFailed> {
             self.exec.push((addr, len));
             Ok(())
         }

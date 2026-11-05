@@ -2,19 +2,23 @@
 //!
 //! Guest descriptors are host descriptors, but fwe holds some for itself —
 //! the root filesystem directory, the pipe ends behind eventfd and signalfd,
-//! the pipe a `vfork` parent waits on. Those live in a reserved range at the
-//! top of the host's descriptor space, above the highest number the guest
-//! may use: the guest's `RLIMIT_NOFILE` is virtual, with its hard limit
-//! [`RESERVED`] below the host's. Loops that close everything up to the
-//! limit, `close_range`, and `/proc/self/fd` never reach the reserved range,
-//! and a system call naming a descriptor there fails with `EBADF`, as for a
-//! descriptor that is not open.
+//! the pipe a `vfork` parent waits on, and in the VM backend the file of
+//! each file mapping. Those live in a reserved range at the top of the
+//! host's descriptor space, above the highest number the guest may use: the
+//! guest's `RLIMIT_NOFILE` is virtual, its hard limit below the range.
+//! Loops that close everything up to the limit, `close_range`, and
+//! `/proc/self/fd` never reach the reserved range, and a system call naming
+//! a descriptor there fails with `EBADF`, as for a descriptor that is not
+//! open. A descriptor of fwe's never goes below the range: when it is full,
+//! what needed one fails.
 
 use fwe_abi::resource::RLIM_INFINITY;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-/// Descriptors kept for fwe's own use, above the guest's range.
+/// The least number of descriptors kept for fwe's own use, above the
+/// guest's range; it takes a quarter of the host's descriptors when there
+/// are more ([`init`]).
 pub const RESERVED: i32 = 64;
 
 /// The first descriptor the guest may not use (the guest's hard limit).
@@ -72,7 +76,9 @@ pub fn init() {
     }
     // Descriptors stop at the lower of the soft limit and the per-process cap.
     let host = lim.rlim_cur.min(cap).max(2 * RESERVED as u64) as i32;
-    let guest_max = host - RESERVED;
+    // The guest keeps at least Linux's default soft limit.
+    let reserved = (host / 4).max(RESERVED).min(host - DEFAULT_SOFT as i32).max(RESERVED);
+    let guest_max = host - reserved;
     GUEST_MAX.store(guest_max, Ordering::SeqCst);
     NEXT.store(guest_max, Ordering::SeqCst);
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -108,26 +114,40 @@ pub fn guest_visible(fd: i32) -> bool {
 }
 
 /// Move `fd` into the reserved range, close-on-exec, and return its new
-/// number. If the range is full the descriptor stays where it is.
-pub fn reserve(fd: i32) -> i32 {
-    if fd < 0 || !guest_visible(fd) {
-        return fd;
+/// number. If the range is full, `fd` is closed and the result is
+/// `EMFILE`.
+pub fn reserve(fd: i32) -> Result<i32, i32> {
+    if fd < 0 {
+        return Err(fwe_abi::errno::EBADF);
     }
+    if !guest_visible(fd) {
+        return Ok(fd);
+    }
+    let high = dup_reserved(fd);
+    // SAFETY: closing the caller's descriptor, now moved (or not wanted).
+    unsafe { libc::close(fd) };
+    high
+}
+
+/// A close-on-exec duplicate of `fd` in the reserved range, or `EMFILE`
+/// when the range is full (`EBADF` if `fd` is not open).
+pub fn dup_reserved(fd: i32) -> Result<i32, i32> {
     let floor = NEXT.load(Ordering::SeqCst).max(guest_max());
-    // SAFETY: plain host calls on a descriptor the caller owns.
+    // SAFETY: plain host calls on a descriptor the caller holds.
     unsafe {
+        if libc::fcntl(fd, libc::F_GETFD) < 0 {
+            return Err(fwe_abi::errno::EBADF);
+        }
         let mut high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor);
         if high < 0 {
             // The range above `floor` is full; reuse any freed slot.
             high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, guest_max());
         }
         if high < 0 {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            return fd;
+            return Err(fwe_abi::errno::EMFILE);
         }
-        libc::close(fd);
         NEXT.store(high + 1, Ordering::SeqCst);
-        high
+        Ok(high)
     }
 }
 
@@ -239,6 +259,61 @@ pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
     Ok(())
 }
 
+/// Linux's checks against the guest's soft `RLIMIT_NOFILE` made before a
+/// call runs: `dup3` onto a descriptor at or above it fails with `EBADF`,
+/// `F_DUPFD` from one with `EINVAL`.
+pub fn check_limit(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
+    use fwe_abi::{errno, fcntl, nr as n};
+    let soft = limit().0;
+    if nr == n::DUP3 && a[1] >= soft {
+        return Err(fwe_abi::err(errno::EBADF));
+    }
+    if nr == n::FCNTL && matches!(a[1], fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC) && a[2] >= soft {
+        return Err(fwe_abi::err(errno::EINVAL));
+    }
+    Ok(())
+}
+
+/// The descriptors call `nr` (arguments `a`) made, given its `result`.
+pub fn made(nr: u64, a: &[u64; 6], result: i64) -> Vec<i32> {
+    use fwe_abi::{fcntl, nr as n};
+    if result < 0 {
+        return Vec::new();
+    }
+    match nr {
+        n::OPENAT
+        | n::DUP
+        | n::EPOLL_CREATE1
+        | n::EVENTFD2
+        | n::TIMERFD_CREATE
+        | n::SOCKET
+        | n::ACCEPT
+        | n::ACCEPT4
+        | n::MEMFD_CREATE
+        | n::INOTIFY_INIT1 => vec![result as i32],
+        // A new signalfd, not an existing one changed.
+        n::SIGNALFD4 if a[0] as i32 == -1 => vec![result as i32],
+        n::FCNTL if matches!(a[1], fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC) => {
+            vec![result as i32]
+        }
+        n::PIPE2 | n::SOCKETPAIR => {
+            let at = if nr == n::PIPE2 { a[0] } else { a[3] };
+            crate::uaccess::read::<[i32; 2]>(at).map(Vec::from).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether any of `fds` is at or above the guest's soft `RLIMIT_NOFILE`:
+/// one Linux would not have had to give, so the call that made them is to
+/// fail with `EMFILE`, its descriptors closed again. (The host gives the
+/// lowest free number, as Linux does, so only a guest holding as many
+/// descriptors as its limit gets one.)
+pub fn over_limit(fds: &[i32]) -> bool {
+    let soft = limit().0;
+    fds.iter().any(|&fd| fd as u64 >= soft)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +324,7 @@ mod tests {
         let mut fds = [0; 2];
         // SAFETY: a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let high = reserve(fds[1]);
+        let high = reserve(fds[1]).unwrap();
         assert!(high >= guest_max(), "{high} below {}", guest_max());
         assert!(!guest_visible(high));
         assert!(!open_fds().contains(&high));

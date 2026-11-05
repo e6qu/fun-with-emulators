@@ -63,7 +63,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let mut guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     let k = guard.as_mut().unwrap();
     let page = page_size();
-    let strace = k.tracer.enabled;
+    let strace = k.tracer;
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
     let fs = k.fs.as_ref().expect("filesystem configured");
@@ -102,7 +102,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     k.brk = out.brk;
     if let Some(fs) = k.fs.as_mut() {
         fs.set_proc_info(path.clone(), crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
-        fwe_kernel::net::set_rootfs(fs.root_host_path());
+        fs.publish();
     }
     // The new program starts with every register zero, as Linux leaves it;
     // the trap handler returns into it.
@@ -130,6 +130,23 @@ static VFORK_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::
 /// it; what the child writes before then (glibc's `posix_spawn` reporting an
 /// exec failure, say) the parent sees. Its own mappings are its own: an
 /// `mmap` or `munmap` in the child does not reach the parent.
+/// Both ends of a new pipe moved into fwe's reserved range, or both closed
+/// and the error (`EAGAIN`: the range is full).
+pub(crate) fn reserve_pair(fds: [i32; 2]) -> Result<[i32; 2], i32> {
+    let r = fwe_kernel::fdtable::reserve(fds[0]);
+    let w = fwe_kernel::fdtable::reserve(fds[1]);
+    match (r, w) {
+        (Ok(r), Ok(w)) => Ok([r, w]),
+        (r, w) => {
+            for fd in [r, w].into_iter().flatten() {
+                // SAFETY: closing a descriptor made by the caller.
+                unsafe { libc::close(fd) };
+            }
+            Err(fwe_abi::errno::EAGAIN)
+        }
+    }
+}
+
 pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
@@ -141,7 +158,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
         if unsafe { libc::pipe(done.as_mut_ptr()) } != 0 {
             return fwe_kernel::host::last_error();
         }
-        done = [fwe_kernel::fdtable::reserve(done[0]), fwe_kernel::fdtable::reserve(done[1])];
+        done = match reserve_pair(done) {
+            Ok(d) => d,
+            Err(e) => return fwe_abi::err(e),
+        };
     }
 
     let (pid, kqueues) = {

@@ -264,6 +264,11 @@ it there without the bits that allow skipping cache maintenance
 
 `--strace` prints each call with its arguments and result, plus the
 backend's notes (what was loaded and prepared), to standard error.
+`--strace=failures` prints only the calls that fail, and the notes. That is
+cheap enough to leave a run's timing much as it is, for a failure that
+full tracing hides. A failed code preparation is noted with its reason,
+for example no room for stubs near the code, while the guest gets
+`ENOMEM`. Both modes are passed on across `execve` and `fork`.
 
 ## Filesystem
 
@@ -282,12 +287,19 @@ handle, the write ends of the pipes behind the emulated event descriptors,
 the pipe a `vfork` parent waits on) live in a reserved range at the top of
 the host's descriptor space (`crates/kernel/src/fdtable.rs`). At startup fwe
 raises its host soft limit as far as macOS allows and gives the guest a
-virtual `RLIMIT_NOFILE` whose hard limit ends 64 descriptors short of it
-(soft 1024, as on Linux). A guest that closes everything up to its limit,
+virtual `RLIMIT_NOFILE` whose hard limit leaves fwe a quarter of the host's
+descriptors (at least 64; soft 1024, as on Linux): besides the few above,
+the VM backend keeps the file of every file mapping. A descriptor of fwe's
+never goes below the range: when it is full, what needed one fails as Linux
+would fail it (`EMFILE` for an `eventfd`, `ENOMEM` for an `mmap`, `EAGAIN`
+for a `fork`). A guest that closes everything up to its limit,
 calls `close_range(3, ~0)` or walks `/proc/self/fd` never reaches fwe's
 descriptors, and a system call that names one fails with `EBADF`, as for a
 descriptor that is not open; `dup2` onto one fails the same way, and the
-limit cannot be raised into the range. `stat` results are translated into the arm64 Linux
+limit cannot be raised into the range. The soft limit holds as on Linux: a
+call that would make a descriptor numbered at or above it fails with
+`EMFILE` (the descriptor closed again, with what fwe keeps for it), `dup3`
+onto one with `EBADF` and `F_DUPFD` from one with `EINVAL`. `stat` results are translated into the arm64 Linux
 layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
 directory position when the translated entries outgrow the guest's buffer.
 Creation modes have the umask applied by the kernel. An `O_CREAT` open
@@ -325,7 +337,20 @@ duplicates the descriptor. An unknown path under `/proc` or `/sys` is
 `zero`, `random`, `urandom` and `tty` resolve to the host's own nodes
 (`crates/kernel/src/fs.rs`; a rootfs unpacked without privileges has no
 device nodes), and `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`
-are links into `/proc/self/fd`.
+are links into `/proc/self/fd`. `/dev/shm`, the tmpfs Linux mounts there
+for POSIX shared memory and semaphores (`shm_open`, `sem_open`, Python's
+`multiprocessing` locks), is a directory of fwe's for each rootfs, shared
+by every fwe process running on that root and private to the user:
+`fwe-<uid>/shm-<hash of the root's host path>` in the user's temporary
+directory. The resolver treats it as a mount point — reached by any path
+that leads to `/dev/shm`, symlinks included, whether or not the rootfs has
+a `/dev`, with `..` from it the root's `/dev` — and a descriptor of a file
+in it reports its `/dev/shm` path.
+
+A program given to fwe by a host path inside the rootfs gets that file's
+guest path as its `argv[0]` and `AT_EXECFN`, as it would have been named in
+the guest (Python finds its installation from `argv[0]`); `--argv0` still
+sets one of its own.
 
 ## Processes
 
@@ -549,8 +574,13 @@ in-place header fix-up), the `SOCK_NONBLOCK`/`SOCK_CLOEXEC` type flags
 and the `send`/`recv` flags. `MSG_NOSIGNAL` has no macOS equivalent, so every
 socket gets `SO_NOSIGPIPE` and a broken pipe returns `EPIPE`.
 
-`AF_UNIX` socket paths are rooted under the rootfs like every other path, and
-abstract-namespace names (a leading NUL) map to files under a per-host
+`AF_UNIX` socket paths are resolved as file paths are, in the guest's
+filesystem (`fs::resolve_host`; the socket calls run without the kernel
+lock, so the process's root and working directory are published for them):
+a relative path from the working directory, `..` kept inside the root,
+symlinks followed inside it, `/dev/shm` included. `bind` follows no final
+symlink and takes a name that exists as in use (`EADDRINUSE`), as Linux
+does; macOS's would follow it. Abstract-namespace names (a leading NUL) map to files under a per-host
 temporary directory, since macOS has no abstract namespace. `SCM_RIGHTS`
 ancillary data is re-encoded, since `cmsg_len` is 64-bit on Linux and 32-bit
 on macOS; the passed descriptors are host descriptors and work in the
@@ -644,9 +674,14 @@ those items.
   to process locks.
 - **Sockets:** an `AF_UNIX` path that, rooted under the rootfs, is longer
   than the host's 103 bytes fails with `ENAMETOOLONG`.
-- **Descriptors:** the guest's `RLIMIT_NOFILE` is not enforced: a guest
-  that opens more descriptors than its limit gets numbers in fwe's range,
-  which it cannot use, rather than `EMFILE`; a reopened
+- **Files:** `fallocate` reserves space past the end of a file (mode 0
+  and `FALLOC_FL_KEEP_SIZE`) and punches holes, but a hole inside a sparse
+  file is not filled, and its other modes are `EOPNOTSUPP`, as on a Linux
+  filesystem without them. `/dev/shm` outlives the processes that use it,
+  until the host clears its temporary files, and a `rename` between it
+  and the rootfs succeeds where Linux returns `EXDEV`.
+- **Descriptors:** descriptors received with `SCM_RIGHTS` are not held to
+  the guest's `RLIMIT_NOFILE` (every other way of making one is); a reopened
   `/proc/self/fd` entry for a pipe or socket shares the original's file
   description rather than getting a new one.
 - **Memory:** `MADV_DONTNEED` on a private file mapping keeps modified pages

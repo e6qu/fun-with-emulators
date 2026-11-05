@@ -7,11 +7,14 @@ use std::fmt::Write as _;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Tracer {
     pub enabled: bool,
+    /// Only the calls that fail, and the notes (`--strace=failures`): cheap
+    /// enough to leave the timing of a run much as it is.
+    pub failures_only: bool,
 }
 
 impl Tracer {
     pub fn syscall(&self, nr: u64, args: &[u64; 6], result: i64) {
-        if !self.enabled {
+        if !self.enabled || self.failures_only && !(-4095..0).contains(&result) {
             return;
         }
         let mut line = String::with_capacity(128);
