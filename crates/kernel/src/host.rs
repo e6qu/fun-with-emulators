@@ -881,6 +881,145 @@ pub fn ids() -> (i64, i64, i64, i64) {
     }
 }
 
+/// `fallocate(fd, mode, offset, len)` on the host, returning a Linux errno
+/// on failure. Mode 0 reserves the space and extends the file to cover the
+/// range, `FALLOC_FL_KEEP_SIZE` only reserves it, and with
+/// `FALLOC_FL_PUNCH_HOLE` too the range reads as zeros and its blocks are
+/// freed. macOS reserves space only past the end of a file, so a hole
+/// inside a sparse file is not filled. Other modes are `EOPNOTSUPP`, as on
+/// a Linux filesystem without them.
+pub fn fallocate(fd: i32, mode: u64, offset: i64, len: i64) -> Result<(), i32> {
+    use fwe_abi::falloc::{FALLOC_FL_KEEP_SIZE as KEEP, FALLOC_FL_PUNCH_HOLE as PUNCH};
+    if offset < 0 || len <= 0 {
+        return Err(le::EINVAL);
+    }
+    let end = offset.checked_add(len).ok_or(le::EFBIG)?;
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a valid out-parameter.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(errno_to_linux(last_errno()));
+    }
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => {}
+        libc::S_IFIFO | libc::S_IFSOCK => return Err(le::ESPIPE),
+        _ => return Err(le::ENODEV),
+    }
+    // SAFETY: F_GETFL only reads the descriptor's flags.
+    if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY {
+        return Err(le::EBADF);
+    }
+    let fail = || Err(errno_to_linux(last_errno()));
+    match mode {
+        0 | KEEP => {
+            if end > st.st_size {
+                reserve_past_end(fd, end - st.st_size)?;
+                // SAFETY: plain host call on the caller's descriptor.
+                if mode == 0 && unsafe { libc::ftruncate(fd, end) } != 0 {
+                    return fail();
+                }
+            }
+            Ok(())
+        }
+        m if m == PUNCH | KEEP => {
+            let end = end.min(st.st_size);
+            if offset >= end {
+                return Ok(());
+            }
+            // SAFETY: zeroed bytes are a valid `statfs`; `fstatfs` fills it.
+            let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `fs` is a valid out-parameter.
+            if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
+                return fail();
+            }
+            // The host frees whole blocks; the partial ones at either end
+            // are written with zeros.
+            // `f_bsize` is a `u32` on macOS and already an `i64` on Linux.
+            #[allow(clippy::useless_conversion)]
+            let block = i64::from(fs.f_bsize).max(1);
+            let lo = (offset + block - 1) / block * block;
+            let hi = end / block * block;
+            if lo < hi {
+                punch_hole(fd, lo, hi - lo)?;
+                write_zeros(fd, offset, lo)?;
+                write_zeros(fd, hi, end)
+            } else {
+                write_zeros(fd, offset, end)
+            }
+        }
+        _ => Err(le::EOPNOTSUPP),
+    }
+}
+
+/// Reserve `len` bytes past the end of the file.
+#[cfg(target_os = "macos")]
+fn reserve_past_end(fd: i32, len: i64) -> Result<(), i32> {
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: `store` is a valid `fstore_t`.
+    if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) } != 0 {
+        return Err(errno_to_linux(last_errno()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reserve_past_end(fd: i32, len: i64) -> Result<(), i32> {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: plain host calls on the caller's descriptor.
+    let r = unsafe {
+        libc::fstat(fd, &mut st);
+        libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, st.st_size, len)
+    };
+    if r != 0 {
+        return Err(errno_to_linux(last_errno()));
+    }
+    Ok(())
+}
+
+/// Free the blocks of `[offset, offset + len)`, which is block-aligned.
+#[cfg(target_os = "macos")]
+fn punch_hole(fd: i32, offset: i64, len: i64) -> Result<(), i32> {
+    let mut hole =
+        libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: offset, fp_length: len };
+    // SAFETY: `hole` is a valid `fpunchhole_t`.
+    if unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut hole) } != 0 {
+        return Err(errno_to_linux(last_errno()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn punch_hole(fd: i32, offset: i64, len: i64) -> Result<(), i32> {
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    // SAFETY: plain host call on the caller's descriptor.
+    if unsafe { libc::fallocate(fd, mode, offset, len) } != 0 {
+        return Err(errno_to_linux(last_errno()));
+    }
+    Ok(())
+}
+
+/// Write zeros over `[from, to)` of the file.
+fn write_zeros(fd: i32, mut from: i64, to: i64) -> Result<(), i32> {
+    let zeros = [0u8; 4096];
+    while from < to {
+        let n = ((to - from) as usize).min(zeros.len());
+        // SAFETY: `zeros` holds at least `n` bytes.
+        let w = unsafe { libc::pwrite(fd, zeros.as_ptr().cast(), n, from) };
+        if w <= 0 {
+            return Err(if w == 0 { le::EIO } else { errno_to_linux(last_errno()) });
+        }
+        from += w as i64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,5 +1055,53 @@ mod tests {
         assert_eq!(signal_to_host(signal::SIGABRT), Some(libc::SIGABRT));
         assert_eq!(signal_to_host(signal::SIGUSR1), Some(libc::SIGUSR1));
         assert_eq!(signal_to_host(signal::SIGRTMIN), None);
+    }
+
+    /// `fallocate`: mode 0 extends the file, `KEEP_SIZE` does not, a
+    /// punched hole reads as zeros (partial blocks included) and leaves the
+    /// size; bad arguments, descriptors and modes fail as on Linux.
+    #[test]
+    fn fallocate_extends_keeps_and_punches() {
+        use fwe_abi::falloc::{FALLOC_FL_KEEP_SIZE as KEEP, FALLOC_FL_PUNCH_HOLE as PUNCH};
+        use std::io::{Read, Seek, Write};
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("fwe-fallocate-{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let fd = f.as_raw_fd();
+        assert_eq!(fallocate(fd, 0, 0, 10000), Ok(()));
+        assert_eq!(f.metadata().unwrap().len(), 10000);
+        assert_eq!(fallocate(fd, KEEP, 0, 50000), Ok(()));
+        assert_eq!(f.metadata().unwrap().len(), 10000);
+        f.write_all(&vec![7u8; 10000]).unwrap();
+        // A range across several blocks, starting and ending inside one.
+        assert_eq!(fallocate(fd, PUNCH | KEEP, 100, 9000), Ok(()));
+        assert_eq!(f.metadata().unwrap().len(), 10000);
+        let mut back = Vec::new();
+        f.rewind().unwrap();
+        f.read_to_end(&mut back).unwrap();
+        assert!(back[..100].iter().all(|&b| b == 7));
+        assert!(back[100..9100].iter().all(|&b| b == 0));
+        assert!(back[9100..].iter().all(|&b| b == 7));
+        assert_eq!(fallocate(fd, PUNCH, 0, 1), Err(le::EOPNOTSUPP));
+        assert_eq!(fallocate(fd, 0, -1, 1), Err(le::EINVAL));
+        assert_eq!(fallocate(fd, 0, 0, 0), Err(le::EINVAL));
+        let ro = std::fs::File::open(&path).unwrap();
+        assert_eq!(fallocate(ro.as_raw_fd(), 0, 0, 1), Err(le::EBADF));
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for two descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(fallocate(fds[1], 0, 0, 1), Err(le::ESPIPE));
+        // SAFETY: closing the pipe made above.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

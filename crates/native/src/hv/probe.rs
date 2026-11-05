@@ -119,6 +119,30 @@ fn shared_read_only() -> Result<Host, String> {
     }
 }
 
+/// A file of one host page for a case, removed once it is open.
+fn probe_file() -> Result<std::fs::File, String> {
+    let path = std::env::temp_dir().join(format!("fwe-probe-{}", std::process::id()));
+    std::fs::write(&path, vec![0u8; SIZE as usize]).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&path);
+    file
+}
+
+/// A file opened read-only, mapped with `flags` (`MAP_SHARED`: memory that
+/// can never be written; `MAP_PRIVATE`: copy-on-write, so it can).
+fn read_only_file(flags: i32) -> Result<Host, String> {
+    use std::os::fd::AsRawFd;
+    let file = probe_file()?;
+    // SAFETY: a fresh mapping of our own file; it outlives the descriptor.
+    let addr = unsafe {
+        libc::mmap(std::ptr::null_mut(), SIZE as usize, libc::PROT_READ, flags, file.as_raw_fd(), 0)
+    };
+    if addr == libc::MAP_FAILED {
+        return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(Host { addr: addr as u64, owned: true })
+}
+
 /// Memory that was mapped and is not any more.
 fn unmapped() -> Result<Host, String> {
     let h = allocate(VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)?;
@@ -148,6 +172,8 @@ pub fn map_rules() -> Result<String, String> {
             r | x,
         ),
         ("shared entry of read-only memory, as RX", Box::new(shared_read_only), r | x),
+        ("a read-only file, shared, as RX", Box::new(|| read_only_file(libc::MAP_SHARED)), r | x),
+        ("a read-only file, private, as RX", Box::new(|| read_only_file(libc::MAP_PRIVATE)), r | x),
         ("unmapped, as R", Box::new(unmapped), r),
     ];
     // The signals that end a process wait until the VM is gone: it must

@@ -38,7 +38,7 @@ use super::backend::{self, HvPlatform};
 use super::{mem, vm, window};
 use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::snapshot::{Dec, Enc};
-use fwe_kernel::{FpRegs, Kernel, Regs, fdtable, host, thread, uaccess};
+use fwe_kernel::{FpRegs, Kernel, Regs, host, thread, uaccess};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // --- Mach ---------------------------------------------------------------
@@ -381,7 +381,10 @@ pub(super) fn fork(
     if unsafe { libc::pipe(word.as_mut_ptr()) } != 0 {
         return host::last_error();
     }
-    let word = [fdtable::reserve(word[0]), fdtable::reserve(word[1])];
+    let word = match crate::process::reserve_pair(word) {
+        Ok(w) => w,
+        Err(e) => return err(e),
+    };
     // The memory's channel; the child's end is handed on like any
     // descriptor.
     let mut sv = [-1i32; 2];
@@ -395,7 +398,17 @@ pub(super) fn fork(
         }
         return e;
     }
-    let sv = [fdtable::reserve(sv[0]), fdtable::reserve(sv[1])];
+    let sv = match crate::process::reserve_pair(sv) {
+        Ok(s) => s,
+        Err(e) => {
+            // SAFETY: closing the pipe made above.
+            unsafe {
+                libc::close(word[0]);
+                libc::close(word[1]);
+            }
+            return err(e);
+        }
+    };
     let spawned = {
         // One instant of the process: every other vCPU stopped while the
         // state is captured — and, for a fork, the memory copied. The

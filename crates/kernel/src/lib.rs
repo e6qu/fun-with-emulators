@@ -316,7 +316,7 @@ impl<P: Platform> Kernel<P> {
         pty::restore(d);
         epoll::restore(d);
         if let Some(fs) = &k.fs {
-            net::set_rootfs(fs.root_host_path());
+            fs.publish();
         }
         k.sync_all_host_signals();
         k
@@ -513,7 +513,9 @@ impl<P: Platform> Kernel<P> {
                 // A frame the guest cannot read back: Linux kills it.
                 self.terminate_by(absig::SIGSEGV);
             }
-            self.tracer.syscall(regs.x[8], &[0; 6], regs.x[0] as i64);
+            // Traced after the frame is restored: `x8` is the interrupted
+            // code's now.
+            self.tracer.syscall(fwe_abi::nr::RT_SIGRETURN, &[0; 6], regs.x[0] as i64);
             return;
         }
         let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
@@ -611,7 +613,7 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     signalfd::hold(|| {
         specialfd::hold(|| {
             synthdir::hold(|| {
-                pty::hold(|| net::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+                pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
             })
         })
     })
@@ -751,10 +753,20 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         // waiting in accept/recv does not stall the threads meant to feed it.
         // SAFETY: caller guarantees the sockaddr pointer.
         n::CONNECT => unsafe { net::connect(a[0], a[1], a[2]) },
-        // SAFETY: caller guarantees the out pointers.
-        n::ACCEPT => unsafe { net::accept4(a[0], a[1], a[2], 0) },
-        // SAFETY: caller guarantees the out pointers.
-        n::ACCEPT4 => unsafe { net::accept4(a[0], a[1], a[2], a[3]) },
+        n::ACCEPT | n::ACCEPT4 => {
+            let flags = if nr == n::ACCEPT4 { a[3] } else { 0 };
+            // SAFETY: caller guarantees the out pointers.
+            let r = unsafe { net::accept4(a[0], a[1], a[2], flags) };
+            let made = fdtable::made(nr, &a, r);
+            if fdtable::over_limit(&made) {
+                // A socket: nothing of fwe's to drop with it.
+                // SAFETY: closing the descriptor just accepted.
+                unsafe { libc::close(r as i32) };
+                fwe_abi::err(fwe_abi::errno::EMFILE)
+            } else {
+                r
+            }
+        }
         // SAFETY: caller guarantees the buffer and sockaddr.
         n::SENDTO => unsafe { net::sendto(a[0], a[1], a[2], a[3], a[4], a[5]) },
         // SAFETY: caller guarantees the buffer and out pointers.

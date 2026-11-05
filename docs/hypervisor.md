@@ -65,7 +65,13 @@ The code is in `crates/native/src/hv/`.
   the call fails with `EINVAL`. A private file mapping is a copy of the
   file's data. Shared memory (`MAP_SHARED`, of a file, or anonymous, then of
   an unlinked file) is a *segment*: a host mapping outside the slab, mapped
-  into the VM once. The host's memory behind the guest stays accessible where
+  into the VM once. The framework maps only host memory that may be
+  written, which a shared mapping of a file opened read-only is not: such a
+  segment is made of the same file opened again for writing (checked to be
+  the same file; the VM maps it readable and executable, and an `mprotect`
+  asking to write fails with `EACCES`, as on Linux), or, for a file the user
+  may not write, of a private copy, which later writes to the file do not
+  reach. The host's memory behind the guest stays accessible where
   the guest's is not, so every guest pointer the kernel or the host is given
   is checked against the guest's mappings first (`EFAULT`). Code fwe writes
   into guest memory (images, file data, a fork child's memory) has the
@@ -237,7 +243,10 @@ with `x0` = 0. No private page is ever in both processes' VMs:
   the parent sees, as on Linux, without either VM mapping the other's pages.
   Only the slab ranges the parent had in use at the `vfork` are fetched and
   sent back, and only while the child keeps them: memory it gives back or
-  maps anew is its own;
+  maps anew is its own. The channel is one of fwe's reserved descriptors,
+  out of reach of the descriptors a child moves into place before it execs
+  (Go's does), and a child that loses it ends with a message rather than
+  run on without its parent's memory;
 - shared memory goes to the child as its file, which the child maps: those
   pages are in both VMs, as Linux shares them.
 
@@ -293,8 +302,10 @@ And it checks the rules the backend must keep, printing a line with
 A refused `hv_vm_map` is reported too, and fails as the framework fails it:
 misaligned (16 KiB), overlapping, or over host memory that is not mapped or
 could never be readable and writable. That last rule was inferred from what
-the framework did, and a real run's `--probe hv-map-rules` matched it. The
-stand-in's unit test breaks each rule on purpose.
+the framework did, and a real run's `--probe hv-map-rules` matched it (its
+two cases of a file opened read-only, mapped shared and private, came later
+and wait for the next real run). The stand-in's unit test breaks each rule
+on purpose.
 
 A stand-in proves nothing about the real framework. Its own rules are what
 fwe has seen the framework do, and the kernel crashes the backend may cause

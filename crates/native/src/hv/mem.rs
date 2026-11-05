@@ -100,6 +100,14 @@ pub struct Segment {
     /// one), and the file offset of `host`.
     pub file: Arc<OwnedFd>,
     pub file_offset: u64,
+    /// Whether the guest opened the file for writing, and so may write the
+    /// mapping (the VM's mapping takes writes): as on Linux, a shared
+    /// mapping of a file opened read-only can never be made writable.
+    pub writable: bool,
+    /// The host mapping is a private copy of the file, which later changes
+    /// to the file do not reach: for a file opened read-only that the user
+    /// cannot open for writing (see [`Mem::map_shared`]).
+    pub private: bool,
     /// Guest bytes mapping it; at zero it goes.
     refs: u64,
 }
@@ -461,15 +469,41 @@ impl Mem {
         let base = offset & !(HOST_PAGE - 1);
         let delta = offset - base;
         let hlen = (delta + len).div_ceil(HOST_PAGE) * HOST_PAGE;
-        let hprot =
-            libc::PROT_READ | if prot & mman::PROT_WRITE != 0 { libc::PROT_WRITE } else { 0 };
-        // SAFETY: a fresh shared mapping of the guest's file, fwe's own.
+        // SAFETY: F_GETFL only reads the descriptor's flags.
+        let mode = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE;
+        if mode == libc::O_WRONLY {
+            return Err(errno::EACCES);
+        }
+        let writable = mode == libc::O_RDWR;
+        if prot & mman::PROT_WRITE != 0 && !writable {
+            return Err(errno::EACCES);
+        }
+        // The framework maps only host memory that may be written (see
+        // `standin::host_allows`), which a shared mapping of a file opened
+        // read-only is not. Such a mapping is made of the same file opened
+        // again for writing (the guest still cannot write it: its page
+        // tables and `mprotect` see to that), or, when the user may not
+        // write the file, of a private copy.
+        let (file, private) = if writable {
+            (file, false)
+        } else {
+            match reopen_writable(&file)? {
+                Some(f) => (Arc::new(f), false),
+                None => (file, true),
+            }
+        };
+        // Writable whenever the guest's file is, so an `mprotect` can add
+        // the write permission later: the host mapping and the VM's stay as
+        // made.
+        let hprot = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+        let share = if private { libc::MAP_PRIVATE } else { libc::MAP_SHARED };
+        // SAFETY: a fresh mapping of the guest's file, fwe's own.
         let host = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 hlen as usize,
                 hprot,
-                libc::MAP_SHARED,
+                share,
                 file.as_raw_fd(),
                 base as i64,
             )
@@ -478,7 +512,7 @@ impl Mem {
             return Err(last_errno());
         }
         let host = host as u64;
-        let ipa = match vm::map_segment(host, hlen) {
+        let ipa = match vm::map_segment(host, hlen, writable) {
             Ok(ipa) => ipa,
             Err(e) => {
                 // SAFETY: the mapping just made.
@@ -488,8 +522,9 @@ impl Mem {
         };
         let id = self.next_segment;
         self.next_segment += 1;
-        self.segments
-            .insert(id, Segment { host, len: hlen, ipa, file, file_offset: base, refs: len });
+        let s =
+            Segment { host, len: hlen, ipa, file, file_offset: base, writable, private, refs: len };
+        self.segments.insert(id, s);
         let area = Area { prot, back: Back::Segment { id, off: delta }, source: None };
         if let Err(e) = self.install(addr, addr + len, &area) {
             self.segments.remove(&id);
@@ -552,13 +587,14 @@ impl Mem {
         let file = if anonymous {
             None
         } else {
-            // SAFETY: duplicating the guest's descriptor, so the mapping
-            // keeps its file as Linux's does.
-            let d =
-                unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, fwe_kernel::fdtable::guest_max()) };
-            if d < 0 {
-                return err(errno::EBADF);
-            }
+            // The guest's descriptor, duplicated so the mapping keeps its
+            // file as Linux's does; with no room for it, the mapping fails
+            // as for want of memory.
+            let d = match fwe_kernel::fdtable::dup_reserved(fd) {
+                Ok(d) => d,
+                Err(errno::EMFILE) => return err(errno::ENOMEM),
+                Err(e) => return err(e),
+            };
             // SAFETY: a descriptor just made, owned here.
             Some(Arc::new(unsafe { OwnedFd::from_raw_fd(d) }))
         };
@@ -615,6 +651,14 @@ impl Mem {
             return err(errno::ENOMEM);
         }
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC | mman::PROT_BTI);
+        // A shared mapping of a file opened read-only stays read-only.
+        let read_only = |p: &Piece<Area>| match p.value.back {
+            Back::Segment { id, .. } => self.segments.get(&id).is_some_and(|s| !s.writable),
+            Back::Slab { .. } => false,
+        };
+        if prot & mman::PROT_WRITE != 0 && self.vmas.pieces(addr, end).iter().any(read_only) {
+            return err(errno::EACCES);
+        }
         self.vmas.update(addr, end, |a| Area { prot, ..a.clone() });
         for p in self.vmas.pieces(addr, end) {
             if let Err(e) = self.install(p.start, p.end, &p.value) {
@@ -671,7 +715,10 @@ impl Mem {
             // Private memory reads as zero again (or as the file, for a
             // file mapping); shared memory keeps its contents. A vfork
             // child has its parent's memory first, to send back the change.
-            fetch_range(self, addr, end - addr);
+            if fetch_range(self, addr, end - addr).is_err() {
+                // (`teardown` takes no memory lock.)
+                lost_parent();
+            }
             for p in self.vmas.pieces(addr, end) {
                 if let Back::Slab { host } = p.value.back {
                     let len = p.end - p.start;
@@ -756,7 +803,10 @@ impl Mem {
             return err(errno::ENOMEM);
         }
         // A vfork child has its parent's memory first, to copy it.
-        fetch_range(self, old, old_len);
+        if fetch_range(self, old, old_len).is_err() {
+            // (`teardown` takes no memory lock.)
+            lost_parent();
+        }
         let to = match self.place(new_len) {
             Ok(a) => a,
             Err(e) => return err(e),
@@ -819,6 +869,34 @@ fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
     Ok(())
 }
 
+/// `file` opened again for reading and writing, if the user may (by its
+/// path, checked to be the same file); `ENOMEM` when fwe has no descriptor
+/// left to keep it in.
+fn reopen_writable(file: &OwnedFd) -> Result<Option<OwnedFd>, i32> {
+    let mut path = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH fills `path` (PATH_MAX bytes) with a C string.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return Ok(None);
+    }
+    let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `path` is NUL-terminated.
+    let fd = unsafe { libc::open(path.as_ptr().cast(), flags) };
+    if fd < 0 {
+        return Ok(None);
+    }
+    let fd = fwe_kernel::fdtable::reserve(fd).map_err(|_| errno::ENOMEM)?;
+    // SAFETY: a descriptor just made, owned here, out of the guest's range.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let id = |f: i32| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid out-parameter.
+        (unsafe { libc::fstat(f, &mut st) } == 0).then_some((st.st_dev, st.st_ino))
+    };
+    let same = id(fd.as_raw_fd()).is_some() && id(fd.as_raw_fd()) == id(file.as_raw_fd());
+    Ok(same.then_some(fd))
+}
+
 /// An unlinked file of `len` bytes to back anonymous shared memory, so a
 /// fork child can map the same pages.
 fn anonymous_file(len: u64) -> Result<OwnedFd, i32> {
@@ -830,7 +908,7 @@ fn anonymous_file(len: u64) -> Result<OwnedFd, i32> {
     }
     // SAFETY: the template now names the file just made.
     unsafe { libc::unlink(path.as_ptr().cast()) };
-    let fd = fwe_kernel::fdtable::reserve(fd);
+    let fd = fwe_kernel::fdtable::reserve(fd).map_err(|_| errno::ENOMEM)?;
     // SAFETY: a descriptor just made, owned here.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     // SAFETY: sizing the file just made.
@@ -950,6 +1028,8 @@ impl Mem {
             e.u64(s.ipa);
             e.i32(s.file.as_raw_fd());
             e.u64(s.file_offset);
+            e.bool(s.writable);
+            e.bool(s.private);
             e.u64(s.refs);
         }
         e.u64(self.next_segment);
@@ -987,11 +1067,12 @@ impl Mem {
             });
             m.vmas.insert(start, end, Area { prot, back, source });
         }
-        for _ in 0..d.count(44) {
+        for _ in 0..d.count(46) {
             let (id, len, ipa) = (d.u64(), d.u64(), d.u64());
             let f = file(d.i32());
-            let (file_offset, refs) = (d.u64(), d.u64());
-            m.segments.insert(id, Segment { host: 0, len, ipa, file: f, file_offset, refs });
+            let (file_offset, writable, private, refs) = (d.u64(), d.bool(), d.bool(), d.u64());
+            let s = Segment { host: 0, len, ipa, file: f, file_offset, writable, private, refs };
+            m.segments.insert(id, s);
         }
         m.next_segment = d.u64();
         m.brk_range = (d.u64(), d.u64());
@@ -1016,8 +1097,8 @@ impl Mem {
                 libc::mmap(
                     std::ptr::null_mut(),
                     s.len as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
+                    libc::PROT_READ | if s.writable { libc::PROT_WRITE } else { 0 },
+                    if s.private { libc::MAP_PRIVATE } else { libc::MAP_SHARED },
                     s.file.as_raw_fd(),
                     s.file_offset as i64,
                 )
@@ -1029,7 +1110,7 @@ impl Mem {
                 ));
             }
             s.host = host as u64;
-            vm::map_segment_at(s.host, s.len, s.ipa)
+            vm::map_segment_at(s.host, s.len, s.ipa, s.writable)
                 .map_err(|e| format!("mapping a segment into the VM: errno {e}"))?;
         }
         let pieces: Vec<Piece<Area>> = self
@@ -1157,13 +1238,17 @@ pub fn recv_all(fd: i32, buf: &mut [u8]) -> bool {
     true
 }
 
+/// A `vfork` child's channel to its parent's memory failed: the child
+/// cannot go on (see [`lost_parent`]).
+struct Lost;
+
 /// In a `vfork` child: fetch every chunk of slab memory behind guest range
 /// `[addr, addr + len)` not fetched yet, and map the guest pages those
 /// chunks back. True if private memory of the range is now mapped.
-fn fetch_range(m: &mut Mem, addr: u64, len: u64) -> bool {
+fn fetch_range(m: &mut Mem, addr: u64, len: u64) -> Result<bool, Lost> {
     let (lo, hi) = (addr & !(PAGE - 1), page_up(addr.saturating_add(len.max(1))));
     let mut lazy = lazy();
-    let Some(lz) = lazy.as_mut() else { return false };
+    let Some(lz) = lazy.as_mut() else { return Ok(false) };
     // The guest pages to map: the parts of each private mapping whose slab
     // memory the chunks hold.
     let mut install = Vec::new();
@@ -1181,7 +1266,7 @@ fn fetch_range(m: &mut Mem, addr: u64, len: u64) -> bool {
                 req[9..17].copy_from_slice(&CHUNK.to_le_bytes());
                 let mut data = vec![0u8; CHUNK as usize].into_boxed_slice();
                 if !send_all(lz.sock, &req) || !recv_all(lz.sock, &mut data) {
-                    return false;
+                    return Err(Lost);
                 }
                 // Only what holds the parent's memory: the rest of the
                 // chunk is the child's own.
@@ -1218,7 +1303,7 @@ fn fetch_range(m: &mut Mem, addr: u64, len: u64) -> bool {
     for (a, b, area) in install {
         ok &= m.install(a, b, &area).is_ok();
     }
-    ok
+    Ok(ok)
 }
 
 /// A guest access at `va` faulted for lack of a translation: its pages
@@ -1237,7 +1322,15 @@ pub fn demand(va: u64) -> bool {
     if m.deferred.iter().any(|&(a, b, _)| a <= va && va < b) || vm::page_perms(va).is_some() {
         return true;
     }
-    fetch_range(m, va, 1)
+    let r = fetch_range(m, va, 1);
+    drop(g);
+    r.unwrap_or_else(|Lost| lost_parent())
+}
+
+/// A `vfork` child whose parent's memory cannot be reached any more ends:
+/// it shares that memory, on Linux, so it cannot go on without it.
+fn lost_parent() -> ! {
+    super::backend::fatal("a vfork child lost the channel to its parent's memory")
 }
 
 /// The kernel is about to touch guest range `[addr, addr + len)`: in a
@@ -1247,8 +1340,10 @@ pub fn prepare_access(addr: u64, len: u64) {
         return;
     }
     let mut g = mem();
-    if let Some(m) = g.as_mut() {
-        fetch_range(m, addr, len);
+    let r = g.as_mut().map(|m| fetch_range(m, addr, len));
+    drop(g);
+    if let Some(Err(Lost)) = r {
+        lost_parent();
     }
 }
 

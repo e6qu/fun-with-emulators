@@ -511,6 +511,13 @@ impl<P: Platform> Kernel<P> {
         ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) })
     }
 
+    pub(crate) fn sys_fallocate(&mut self, fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
+        match crate::host::fallocate(fd as i32, mode, offset as i64, len as i64) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
     pub(crate) fn sys_umask(&mut self, mask: u64) -> i64 {
         let fs = self.fs.as_mut().expect("filesystem configured");
         fs.set_umask(mask as u32) as i64

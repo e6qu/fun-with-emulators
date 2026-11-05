@@ -39,7 +39,7 @@ use fwe_elf::Elf;
 use fwe_kernel::{Brk, Kernel, Platform, Tracer};
 use std::ffi::OsString;
 use std::fmt;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -187,13 +187,41 @@ fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<V
     }
 }
 
-/// The guest's arguments, with `argv[0]` replaced if asked.
+/// The guest's arguments, with `argv[0]` replaced if asked. Otherwise an
+/// `argv[0]` naming a host file inside the rootfs becomes its guest path, as
+/// the program would have been named in the guest's filesystem (Python, for
+/// one, finds itself by `argv[0]`).
 fn guest_args(args: &[OsString], options: &Options) -> Vec<OsString> {
     let mut a = args.to_vec();
-    if let (Some(first), Some(argv0)) = (a.first_mut(), &options.argv0) {
-        *first = argv0.clone();
+    match (a.first_mut(), &options.argv0) {
+        (Some(first), Some(argv0)) => *first = argv0.clone(),
+        (Some(first), None) => {
+            if let Some(guest) = guest_path_in_root(Path::new(first), options) {
+                *first = OsString::from_vec(guest);
+            }
+        }
+        (None, _) => {}
     }
     a
+}
+
+/// The guest path of the host file `path`, if it is inside the rootfs and
+/// was given as a host path (not by fwe re-executing itself on a guest
+/// path).
+fn guest_path_in_root(path: &Path, options: &Options) -> Option<Vec<u8>> {
+    if options.guest_path {
+        return None;
+    }
+    let host = std::fs::canonicalize(path).ok()?;
+    let root = std::fs::canonicalize(options.root.as_ref()?).ok()?;
+    let inside = host.strip_prefix(&root).ok()?;
+    Some(Path::new("/").join(inside).as_os_str().as_bytes().to_vec())
+}
+
+/// The name the program was started by, as `AT_EXECFN` gives it: the path
+/// fwe was given, in the guest's terms.
+pub(crate) fn guest_execfn(path: &Path, options: &Options) -> Vec<u8> {
+    guest_path_in_root(path, options).unwrap_or_else(|| path.as_os_str().as_bytes().to_vec())
 }
 
 /// This `fwe` executable, for re-executing it (see [`reexec`]).
@@ -844,7 +872,7 @@ fn start(
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
     let out = load_image(
         &data,
-        path.as_os_str().as_bytes(),
+        &guest_execfn(path, options),
         &arg_bytes,
         &env_bytes,
         &fs,
@@ -853,7 +881,7 @@ fn start(
         options.strace,
     )?;
     fs.set_proc_info(guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
-    fwe_kernel::net::set_rootfs(fs.root_host_path());
+    fs.publish();
 
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
@@ -876,15 +904,13 @@ fn guest_exe_path(path: &Path, options: &Options) -> Vec<u8> {
     if options.guest_path {
         return path.as_os_str().as_bytes().to_vec();
     }
-    let Ok(host) = std::fs::canonicalize(path) else {
-        return path.as_os_str().as_bytes().to_vec();
-    };
-    if let Some(root) = options.root.as_ref().and_then(|r| std::fs::canonicalize(r).ok()) {
-        if let Ok(inside) = host.strip_prefix(&root) {
-            return Path::new("/").join(inside).as_os_str().as_bytes().to_vec();
-        }
+    if let Some(guest) = guest_path_in_root(path, options) {
+        return guest;
     }
-    host.as_os_str().as_bytes().to_vec()
+    match std::fs::canonicalize(path) {
+        Ok(host) => host.as_os_str().as_bytes().to_vec(),
+        Err(_) => path.as_os_str().as_bytes().to_vec(),
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

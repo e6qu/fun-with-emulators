@@ -658,7 +658,7 @@ fn start(
     }
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
-    let execfn = path.as_os_str().as_bytes();
+    let execfn = &crate::guest_execfn(path, options);
     let mut random = [0u8; 16];
     host::fill_random(&mut random);
     let image =
@@ -688,7 +688,7 @@ fn start(
     }
 
     fs.set_proc_info(crate::guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
-    fwe_kernel::net::set_rootfs(fs.root_host_path());
+    fs.publish();
     thread::init_main(host::getpid() as i32);
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
     crate::apply_exec_state(&mut k, options)?;
@@ -1007,6 +1007,11 @@ impl Vcpu {
                     // again.
                     regs.pc = elr;
                 } else {
+                    let k = kernel();
+                    if let Some(k) = k.as_ref().filter(|k| k.tracer.enabled) {
+                        k.tracer.note(&format!("guest abort: esr {esr:#x}, far {far:#x}"));
+                    }
+                    drop(k);
                     fault(&mut regs, s::SIGSEGV, far)
                 }
             }
@@ -1069,7 +1074,7 @@ fn fault(regs: &mut Regs, sig: u64, addr: u64) {
     }
 }
 
-fn fatal(msg: &str) -> ! {
+pub(super) fn fatal(msg: &str) -> ! {
     let line = format!("fwe: {msg}\n");
     // SAFETY: writing a diagnostic to standard error.
     unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };

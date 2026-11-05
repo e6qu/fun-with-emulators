@@ -354,7 +354,15 @@ mod imp {
             return last_error();
         }
         // The write end is fwe's: out of the guest's reach.
-        let (rfd, wfd) = (fds[0], crate::fdtable::reserve(fds[1]));
+        let wfd = match crate::fdtable::reserve(fds[1]) {
+            Ok(w) => w,
+            Err(e) => {
+                // SAFETY: closing the read end made above.
+                unsafe { libc::close(fds[0]) };
+                return err(e);
+            }
+        };
+        let rfd = fds[0];
         if flags & EFD_CLOEXEC != 0 {
             set_cloexec(rfd);
         }

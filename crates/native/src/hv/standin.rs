@@ -2014,7 +2014,10 @@ fn start_watcher() {
         unsafe { libc::close(fds[1]) };
         return;
     }
-    WATCH_FD.store(fwe_kernel::fdtable::reserve(fds[1]), SeqCst);
+    match fwe_kernel::fdtable::reserve(fds[1]) {
+        Ok(fd) => WATCH_FD.store(fd, SeqCst),
+        Err(_) => violation("the watcher's descriptor could not be kept"),
+    }
 }
 
 /// The stand-in's own descriptor, which a fork child must not be given.

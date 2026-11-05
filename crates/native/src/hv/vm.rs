@@ -270,8 +270,9 @@ static SEGMENTS: Mutex<std::collections::BTreeMap<u64, u64>> =
 /// Map host memory `[host, host + len)` (host-page aligned) into the VM as
 /// a shared segment, returning its IPA. One of the two stage-2 changes
 /// while the VM runs; its pages are the memory a `MAP_SHARED` mapping
-/// shares.
-pub fn map_segment(host: u64, len: u64) -> Result<u64, i32> {
+/// shares. Host memory that is not `writable` (a file opened read-only)
+/// is mapped readable and executable only: the framework refuses more.
+pub fn map_segment(host: u64, len: u64, writable: bool) -> Result<u64, i32> {
     let l = layout().map_err(|_| fwe_abi::errno::ENOMEM)?;
     let len = len.div_ceil(HOST_PAGE) * HOST_PAGE;
     let mut segs = SEGMENTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -285,7 +286,7 @@ pub fn map_segment(host: u64, len: u64) -> Result<u64, i32> {
     if at + len > l.seg_end {
         return Err(fwe_abi::errno::ENOMEM);
     }
-    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+    let flags = segment_flags(writable);
     // SAFETY: host memory the caller keeps mapped until `unmap_segment`.
     let rc = unsafe { hv_vm_map(host as *mut _, at, len as usize, flags) };
     if rc != 0 {
@@ -296,9 +297,9 @@ pub fn map_segment(host: u64, len: u64) -> Result<u64, i32> {
 }
 
 /// Map a fork parent's segment again in the child, at the parent's IPA.
-pub fn map_segment_at(host: u64, len: u64, ipa: u64) -> Result<(), i32> {
+pub fn map_segment_at(host: u64, len: u64, ipa: u64, writable: bool) -> Result<(), i32> {
     let mut segs = SEGMENTS.lock().unwrap_or_else(|e| e.into_inner());
-    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+    let flags = segment_flags(writable);
     // SAFETY: host memory the caller keeps mapped until `unmap_segment`.
     let rc = unsafe { hv_vm_map(host as *mut _, ipa, len as usize, flags) };
     if rc != 0 {
@@ -306,6 +307,11 @@ pub fn map_segment_at(host: u64, len: u64, ipa: u64) -> Result<(), i32> {
     }
     segs.insert(ipa, ipa + len);
     Ok(())
+}
+
+/// The stage-2 permissions of a segment.
+fn segment_flags(writable: bool) -> u64 {
+    HV_MEMORY_READ | HV_MEMORY_EXEC | if writable { HV_MEMORY_WRITE } else { 0 }
 }
 
 /// Take the segment at `ipa` out of the VM; the host may then free its
