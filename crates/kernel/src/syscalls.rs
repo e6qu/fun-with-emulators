@@ -1036,7 +1036,7 @@ mod tests {
             addr: u64,
             len: u64,
             _known: Option<&[(u64, u64)]>,
-        ) -> Result<(), i32> {
+        ) -> Result<(), crate::PrepareFailed> {
             self.exec.push((addr, len));
             Ok(())
         }

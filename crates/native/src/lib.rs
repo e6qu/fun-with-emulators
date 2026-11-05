@@ -82,8 +82,11 @@ impl Platform for NativePlatform {
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
-    ) -> Result<(), i32> {
-        self.prepare(addr, len, None, known).map(|_| ()).map_err(|_| fwe_abi::errno::ENOMEM)
+    ) -> Result<(), fwe_kernel::PrepareFailed> {
+        self.prepare(addr, len, None, known).map(|_| ()).map_err(|e| fwe_kernel::PrepareFailed {
+            errno: fwe_abi::errno::ENOMEM,
+            why: e.to_string(),
+        })
     }
 
     fn exit(&mut self, code: i32) -> ! {

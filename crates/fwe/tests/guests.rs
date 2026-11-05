@@ -2361,13 +2361,56 @@ fn run_hv(cmd: Command, what: &str) -> Output {
     run_hv_for(cmd, what, limit)
 }
 
+/// [`run_hv`] for a workload that can fail far from its cause (a loader
+/// saying only that a segment could not be mapped): `args` adds the
+/// command's arguments to [`hv_command`]'s. When the run's output is not
+/// `expected`, it is run again with `--strace`, and the failed memory calls
+/// and fwe's notes (why code could not be prepared, say) are printed.
+fn run_hv_explained(args: impl Fn(&mut Command), what: &str, expected: &str) -> Option<Output> {
+    let mut cmd = hv_command()?;
+    args(&mut cmd);
+    let out = run_hv(cmd, what);
+    if stdout(&out) == expected && out.status.success() {
+        return Some(out);
+    }
+    let mut cmd = hv_command()?;
+    cmd.arg("--strace");
+    args(&mut cmd);
+    // Tracing slows it down severalfold.
+    let traced = run_hv_quietly(cmd, &format!("{what}, traced"), 4 * STANDIN_TIMEOUT);
+    let memory = ["mmap(", "mprotect(", "munmap(", "mremap("];
+    let lines: Vec<&str> = std::str::from_utf8(&traced.stderr)
+        .unwrap_or("")
+        .lines()
+        .filter(|l| {
+            let call = l.strip_prefix("[fwe] ");
+            call.is_some_and(|c| {
+                !memory.iter().any(|m| c.starts_with(m)) && !c.contains(" = ")
+                    || memory.iter().any(|m| c.starts_with(m)) && c.contains(" = -1 ")
+            })
+        })
+        .collect();
+    eprintln!(
+        "--- {what}: traced again ({}), failed memory calls and notes:\n{}",
+        if stdout(&traced) == expected { "passed this time" } else { "failed again" },
+        lines.join("\n")
+    );
+    Some(out)
+}
+
 /// [`run_hv`] with a time limit of its own, for a long workload.
 fn run_hv_for(cmd: Command, what: &str, limit: Duration) -> Output {
+    let out = run_hv_quietly(cmd, what, limit);
+    eprintln!("--- hv {what} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    out
+}
+
+/// [`run_hv_for`] without echoing the standard error, for a traced run.
+fn run_hv_quietly(cmd: Command, what: &str, limit: Duration) -> Output {
     let _one = matches!(hv_mode(), Some(HvMode::Real(_)))
         .then(|| ONE_VM.lock().unwrap_or_else(|e| e.into_inner()));
     let out = run_vm_bounded_for(cmd, limit);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    eprintln!("--- hv {what} stderr:\n{stderr}");
     if let Some(line) = stderr.lines().find(|l| l.contains("fwe hv stand-in: VIOLATION")) {
         panic!("{what}: {line}");
     }
@@ -2663,21 +2706,20 @@ int main(int argc, char **argv) {
     for (name, text) in files {
         std::fs::write(dir.join(name), text).unwrap();
     }
-    let Some(mut cmd) = hv_command() else { return };
-    cmd.arg("--root")
-        .arg(&root)
-        .arg("--cwd")
-        .arg(format!("/{proj}"))
-        .arg(root.join("bin/bash"))
-        .arg("build.sh")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::null());
-    let out = run_hv(cmd, "gcc");
-    assert_eq!(
-        stdout(&out),
-        "hello from gcc: world 499500 1.4142\ntriple 42\ntriple 42\ntriple 42\n"
-    );
+    let expected = "hello from gcc: world 499500 1.4142\ntriple 42\ntriple 42\ntriple 42\n";
+    let args = |cmd: &mut Command| {
+        cmd.arg("--root")
+            .arg(&root)
+            .arg("--cwd")
+            .arg(format!("/{proj}"))
+            .arg(root.join("bin/bash"))
+            .arg("build.sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null());
+    };
+    let Some(out) = run_hv_explained(args, "gcc", expected) else { return };
+    assert_eq!(stdout(&out), expected);
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2707,18 +2749,20 @@ fn hv_debian_clang_builds_c_and_cpp() {
          std::cout << \"c++ \" << std::accumulate(v.begin(), v.end(), 0) << \"\\n\"; }\n",
     )
     .unwrap();
-    let Some(mut cmd) = hv_command() else { return };
-    cmd.arg("--root")
-        .arg(&root)
-        .arg("--cwd")
-        .arg(format!("/{proj}"))
-        .arg(root.join("bin/bash"))
-        .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
-        .env_clear()
-        .env("PATH", "/usr/lib/llvm-14/bin:/usr/bin:/bin")
-        .stdin(Stdio::null());
-    let out = run_hv(cmd, "clang");
-    assert_eq!(stdout(&out), "clang 1.414\nc++ 6\n");
+    let expected = "clang 1.414\nc++ 6\n";
+    let args = |cmd: &mut Command| {
+        cmd.arg("--root")
+            .arg(&root)
+            .arg("--cwd")
+            .arg(format!("/{proj}"))
+            .arg(root.join("bin/bash"))
+            .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
+            .env_clear()
+            .env("PATH", "/usr/lib/llvm-14/bin:/usr/bin:/bin")
+            .stdin(Stdio::null());
+    };
+    let Some(out) = run_hv_explained(args, "clang", expected) else { return };
+    assert_eq!(stdout(&out), expected);
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -716,7 +716,7 @@ impl<P: Platform> Kernel<P> {
                     // SAFETY: unmapping the mapping just created.
                     self.unmap_host(p, len);
                     untrack(p, self.page_up(len));
-                    return err(e);
+                    return self.prepare_failed(e);
                 }
             }
             // SAFETY: changing protections of the mapping just created.
@@ -767,6 +767,13 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    /// The guest's answer to a failed [`Platform::prepare_exec`], with the
+    /// reason in the trace.
+    fn prepare_failed(&self, e: crate::PrepareFailed) -> i64 {
+        self.tracer.note(&format!("code not prepared: {}", e.why));
+        err(e.errno)
+    }
+
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
         if let Some(r) = self.platform.memory(MemCall::Mprotect { addr, len, prot }, &mut self.brk)
         {
@@ -787,7 +794,7 @@ impl<P: Platform> Kernel<P> {
             // x18 alone: only its system calls and thread-pointer accesses
             // are translated (see [`JIT_CODE`]).
             if let Err(e) = self.platform.prepare_exec(a as u64, self.page_up(len), JIT_CODE) {
-                return err(e);
+                return self.prepare_failed(e);
             }
         }
         // SAFETY: guest-requested protection change of guest memory.
@@ -816,7 +823,8 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
-            if self.platform.prepare_exec(page, self.page_size, JIT_CODE).is_err() {
+            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE) {
+                self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
                 return false;
             }
             let rx = libc::PROT_READ | libc::PROT_EXEC;

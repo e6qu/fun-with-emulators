@@ -825,7 +825,7 @@ mod tests {
             _addr: u64,
             _len: u64,
             _known: Option<&[(u64, u64)]>,
-        ) -> Result<(), i32> {
+        ) -> Result<(), crate::PrepareFailed> {
             Ok(())
         }
         fn exit(&mut self, code: i32) -> ! {

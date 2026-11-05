@@ -82,6 +82,15 @@ pub enum MemCall {
     Mremap { old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64 },
 }
 
+/// Why [`Platform::prepare_exec`] failed: the errno the guest gets, and the
+/// reason, which the trace records (`ld.so` reports only that a segment
+/// could not be mapped).
+#[derive(Debug)]
+pub struct PrepareFailed {
+    pub errno: i32,
+    pub why: String,
+}
+
 pub trait Platform {
     /// Carry out a memory system call, for a backend whose guest has an
     /// address space of its own that it manages (the hypervisor backend);
@@ -96,13 +105,14 @@ pub trait Platform {
     /// code; other bytes of the range may be data placed among the code.
     ///
     /// The memory is readable and writable when this is called; the kernel
-    /// applies the final protections afterwards. Fails with a Linux errno.
+    /// applies the final protections afterwards. A failure carries the
+    /// Linux errno for the guest and why, for the trace.
     fn prepare_exec(
         &mut self,
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
-    ) -> Result<(), i32>;
+    ) -> Result<(), PrepareFailed>;
 
     /// Terminate the whole process with `code` as its exit status
     /// (`exit_group`).
