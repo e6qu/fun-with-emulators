@@ -343,10 +343,63 @@ pub fn host_sigset(mask: u64) -> libc::sigset_t {
 }
 
 /// The host mask a guest thread with blocked mask `mask` runs under: its
-/// relayed signals, except those a `signalfd` reads, which must reach the
-/// backend's handler to be queued on the descriptor.
+/// relayed signals, except those the backend's handler catches (see
+/// [`crate::signal::caught`]): the handler records one the guest blocks as
+/// pending, with its sender, which macOS forgets of a signal it holds
+/// blocked. A `signalfd` reads them from there too. What stays blocked on
+/// the host is the signals whose default action or ignoring the host
+/// applies itself, which must wait while the guest blocks them.
 pub fn host_mask_for(mask: u64) -> libc::sigset_t {
-    host_sigset(mask & !crate::signalfd::watched())
+    host_sigset(mask & !(crate::signal::caught() | crate::signalfd::watched()))
+}
+
+/// Stop the process with host stop signal `sig` (`SIGTSTP`, `SIGTTIN`,
+/// `SIGTTOU`, `SIGSTOP`) until it is continued, so the parent's `waitpid`
+/// reports that signal, as on Linux: raised on this thread with its default
+/// action and unblocked for the moment, then put back.
+pub fn stop_with(sig: libc::c_int) {
+    // SAFETY: plain host calls on initialized values; the disposition and
+    // the mask are restored as they were.
+    unsafe {
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, &dfl, &mut old);
+        let mut set = empty_sigset();
+        libc::sigaddset(&mut set, sig);
+        let mut mask = empty_sigset();
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut mask);
+        // Delivered before raise returns: the process stops here.
+        libc::raise(sig);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        libc::sigaction(sig, &old, std::ptr::null_mut());
+    }
+}
+
+/// Before a host `execve` that re-executes fwe: block the guest's whole
+/// mask on the host, which the new process reads back as the guest's
+/// ([`crate::Kernel::adopt_host_signals`]), and hand the signals pending in
+/// fwe that the guest blocks to the host, pending on this thread, which
+/// `execve` keeps (Linux keeps a blocked signal pending across `execve`).
+/// Their senders do not survive: the host records this process as the
+/// sender. If the `execve` fails, the guest's host mask is put back by the
+/// next system call, and they are taken again as they arrive.
+pub fn hand_over_for_exec() {
+    let mask = crate::thread::mask();
+    let set = host_sigset(mask);
+    // SAFETY: an initialized signal set; changing this thread's mask.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) };
+    let pending = crate::thread::pending() & mask;
+    for sig in 1..=signal::NSIG {
+        if pending & (1 << (sig - 1)) == 0 || !crate::signal::relayed(sig) {
+            continue;
+        }
+        let Some(h) = signal_to_host(sig) else { continue };
+        if crate::thread::take_pending(sig).is_some() {
+            // SAFETY: raising a signal this thread blocks, on itself.
+            unsafe { libc::pthread_kill(libc::pthread_self(), h) };
+        }
+    }
 }
 
 /// The relayed signals the calling thread blocks on the host, as a Linux

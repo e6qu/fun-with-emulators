@@ -9,9 +9,11 @@
 //! `fwe_kernel::signal`): [`on_async`] records each one pending for the
 //! guest, and when it interrupted guest code it delivers it at once by
 //! rewriting the interrupted context, as a Linux kernel would on the way
-//! back to user space. Each guest thread runs under a host signal mask that
-//! mirrors its guest mask, so the host routes a process-wide signal to a
-//! thread that accepts it, and leaves a blocked one pending.
+//! back to user space. Each guest thread runs under the host signal mask its
+//! guest mask calls for ([`fwe_kernel::host::host_mask_for`]): the signals
+//! fwe catches are never blocked on the host, and one that lands on a
+//! thread whose guest mask blocks it is recorded against the process
+//! ([`fwe_kernel::thread::post_landed`]).
 //!
 //! Every handler here runs with all signals blocked on entry and exit, so
 //! [`IN_GUEST`] reliably tells whether an interrupted context is guest code;
@@ -162,7 +164,7 @@ fn block_async_signals() {
     }
 }
 
-/// Run under the host mask that mirrors this thread's guest mask.
+/// Run under the host mask this thread's guest mask calls for.
 fn apply_guest_mask() {
     let mask = host::host_mask_for(thread::mask());
     // SAFETY: `mask` is an initialized signal set.
@@ -443,7 +445,7 @@ fn take_async(
         if REROUTING.with(Cell::get) {
             thread::post_process(lsig, info);
         } else {
-            thread::post_self(lsig, info);
+            thread::post_landed(lsig, info);
         }
     }
     if !in_guest {

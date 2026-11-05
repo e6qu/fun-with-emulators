@@ -207,6 +207,9 @@ thread_local! {
     };
     /// This thread's registered pending set (owned by [`THREADS`]).
     static OWN: Cell<*const Pending> = const { Cell::new(std::ptr::null()) };
+    /// A process signal landed here while this thread blocked it: the
+    /// other threads are to be woken to take it ([`post_landed`]).
+    static WAKE_OTHERS: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` holding the thread registry lock (see [`crate::fork_locked`]).
@@ -274,6 +277,35 @@ fn with_own<R>(f: impl FnOnce(&Pending) -> R) -> R {
 /// the backend calls it from its host signal handler.
 pub fn post_self(sig: u64, info: SigInfo) {
     with_own(|p| p.post(sig, info));
+}
+
+/// Record a signal the host delivered to the calling thread, with its
+/// sender. A signal this thread accepts is its own. One it blocks is the
+/// process's, as Linux keeps a process signal for a thread that accepts it,
+/// and the other threads are to be woken to take it, which
+/// [`wake_others_if_asked`] does at a point where no lock is held. The
+/// exception is `SIGPIPE` and `SIGXFSZ`, which the host directs at the
+/// thread whose write caused them, as Linux does. (A signal another thread
+/// directs at this one with `tgkill` never comes this way: it is posted to
+/// this thread directly.) Async-signal-safe: the backend calls it from its
+/// host signal handler.
+pub fn post_landed(sig: u64, info: SigInfo) {
+    let own = matches!(sig, signal::SIGPIPE | signal::SIGXFSZ);
+    if own || (1..=signal::NSIG).contains(&sig) && mask() & (1 << (sig - 1)) == 0 {
+        post_self(sig, info);
+    } else {
+        PROCESS.post(sig, info);
+        WAKE_OTHERS.with(|w| w.set(true));
+    }
+}
+
+/// Wake the other threads if a process signal landed on this one while it
+/// blocked it ([`post_landed`]). Takes the thread registry lock: called
+/// where this thread holds none of fwe's locks.
+pub fn wake_others_if_asked(sig: libc::c_int) {
+    if WAKE_OTHERS.with(|w| w.replace(false)) {
+        wake_others(sig);
+    }
 }
 
 /// Record `sig` as pending against the process; any thread that does not

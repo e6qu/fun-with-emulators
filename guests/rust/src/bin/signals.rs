@@ -18,6 +18,8 @@ const SIGPIPE: i32 = 13;
 const SIGALRM: i32 = 14;
 const SIGTERM: i32 = 15;
 const SIGCHLD: i32 = 17;
+const SIGCONT: i32 = 18;
+const SIGTSTP: i32 = 20;
 /// A real-time signal musl does not reserve for itself.
 const SIGRT: i32 = 40;
 
@@ -31,6 +33,7 @@ const EINTR: i32 = 4;
 const EAGAIN: i32 = 11;
 const P_PID: i32 = 1;
 const WEXITED: i32 = 4;
+const WUNTRACED: i32 = 2;
 const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
 const SYS_GETTID: i64 = 178;
@@ -91,6 +94,7 @@ unsafe extern "C" {
     fn sigprocmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     fn sigsuspend(set: *const SigSet) -> i32;
+    fn sigpending(set: *mut SigSet) -> i32;
     fn sigtimedwait(set: *const SigSet, info: *mut SigInfo, timeout: *const Timespec) -> i32;
     fn fork() -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
@@ -251,10 +255,9 @@ fn main() {
         }
         // A child signals its parent, which learns the sender.
         "notify-parent" => {
-            // Not blocked: delivered as it arrives, so its sender is known
-            // (macOS forgets the sender of a signal left pending while
-            // blocked). If it arrives before the wait, the wait returns at
-            // once.
+            // The child may signal before the parent's `fork` returns, while
+            // musl's `fork` blocks every signal: the sender is kept either
+            // way. If it arrives before the wait, the wait returns at once.
             catch(SIGUSR1, 0);
             let pid = child(|| {
                 // SAFETY: plain calls.
@@ -263,6 +266,112 @@ fn main() {
             });
             suspend_until_hit();
             println!("SIGUSR1 from child: {}", LAST_PID.load(Ordering::SeqCst) == pid);
+            println!("{}", describe(wait_status(pid)));
+        }
+        // A signal kept pending while blocked keeps its sender, as on
+        // Linux (macOS forgets the sender of a signal it holds blocked):
+        // the child has signalled and exited before the parent unblocks.
+        "notify-parent-blocked" => {
+            catch(SIGUSR1, 0);
+            block(&[SIGUSR1]);
+            let pid = child(|| {
+                // SAFETY: plain calls.
+                unsafe { kill(getppid(), SIGUSR1) };
+                0
+            });
+            let status = wait_status(pid);
+            suspend_until_hit();
+            println!("SIGUSR1 from child: {}", LAST_PID.load(Ordering::SeqCst) == pid);
+            println!("{}", describe(status));
+        }
+        // The same taken with sigtimedwait, whose siginfo names the sender.
+        "sigwait-from-child" => {
+            block(&[SIGUSR2]);
+            let pid = child(|| {
+                // SAFETY: plain calls.
+                unsafe { kill(getppid(), SIGUSR2) };
+                0
+            });
+            let status = wait_status(pid);
+            // SAFETY: zeroed bytes are a valid siginfo.
+            let mut info: SigInfo = unsafe { std::mem::zeroed() };
+            let ts = Timespec { sec: 5, nsec: 0 };
+            // SAFETY: valid set, info and timeout.
+            let r = unsafe { sigtimedwait(&set(&[SIGUSR2]), &mut info, &ts) };
+            println!("took {r} from child: {}", info.pid == pid);
+            println!("{}", describe(status));
+        }
+        // A signal sent with tgkill to a thread that blocks it waits for
+        // that thread, even while another thread accepts it.
+        "tgkill-blocked" => {
+            catch(SIGUSR1, 0);
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                // SAFETY: a valid signal set.
+                unsafe { pthread_sigmask(SIG_BLOCK, &set(&[SIGUSR1]), std::ptr::null_mut()) };
+                tid_tx.send(gettid()).unwrap();
+                go_rx.recv().unwrap();
+                // SAFETY: a valid signal set.
+                unsafe { pthread_sigmask(SIG_UNBLOCK, &set(&[SIGUSR1]), std::ptr::null_mut()) };
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let worker = tid_rx.recv().unwrap();
+            assert_eq!(tgkill(worker, SIGUSR1), 0);
+            // The main thread accepts it, and must not take it meanwhile.
+            std::thread::sleep(Duration::from_millis(200));
+            let early = HITS.load(Ordering::SeqCst);
+            go_tx.send(()).unwrap();
+            while HITS.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            println!(
+                "held for the blocking thread: {}, then handled on it: {}",
+                early == 0,
+                LAST_TID.load(Ordering::SeqCst) == worker
+            );
+        }
+        // A signal whose default action ends the process stays pending
+        // while every thread blocks it.
+        "default-blocked" => {
+            block(&[SIGUSR1]);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // Inherits the blocked mask.
+                ready_tx.send(()).unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            ready_rx.recv().unwrap();
+            // SAFETY: plain calls.
+            unsafe { kill(getpid(), SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(200));
+            let mut pending = SigSet([0; 16]);
+            // SAFETY: a valid out-parameter.
+            unsafe { sigpending(&mut pending) };
+            println!("still running, pending: {}", pending.0[0] & 1 << (SIGUSR1 - 1) != 0);
+        }
+        // SIGTSTP's default action stops the process, and the parent's
+        // waitpid reports that signal.
+        "stop-tstp" => {
+            let pid = child(|| loop {
+                std::thread::sleep(Duration::from_millis(10));
+            });
+            // SAFETY: plain calls.
+            unsafe { kill(pid, SIGTSTP) };
+            let mut status = 0;
+            // SAFETY: a valid out-parameter.
+            assert_eq!(unsafe { waitpid(pid, &mut status, WUNTRACED) }, pid);
+            let stopped = status & 0xff == 0x7f;
+            println!("stopped: {stopped}, by {}", (status >> 8) & 0xff);
+            // SAFETY: plain calls.
+            unsafe {
+                kill(pid, SIGCONT);
+                kill(pid, SIGKILL);
+            }
             println!("{}", describe(wait_status(pid)));
         }
         // SIGCHLD reaches a handler, with the exit status.

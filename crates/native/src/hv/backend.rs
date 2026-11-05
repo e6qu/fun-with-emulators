@@ -67,9 +67,8 @@ impl Platform for HvPlatform {
         }
     }
 
-    fn stop_self(&mut self) {
-        // SAFETY: plain host call; the process resumes on SIGCONT.
-        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+    fn stop_self(&mut self, sig: libc::c_int) {
+        host::stop_with(sig);
     }
 
     fn set_host_signal(&mut self, sig: u64, how: HostSignal) {
@@ -348,7 +347,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         } else {
             host::signal_to_linux(sig)
         };
-        thread::post_self(lsig, thread::SigInfo { code, pid, uid, status });
+        thread::post_landed(lsig, thread::SigInfo { code, pid, uid, status });
     }
     if let Some(mut vcpu) = VCPU.with(Cell::get) {
         // SAFETY: stopping this thread's own vCPU, if it is running.
@@ -858,8 +857,8 @@ impl Vcpu {
             if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
                 park();
             }
-            // The guest's mask is in force on the host while it runs, so the
-            // host routes signals as for the native backend.
+            // The host mask the guest's mask calls for is in force while it
+            // runs, as in the native backend.
             let mask = host::host_mask_for(thread::mask());
             enter_run();
             // After the page tables lost a translation, resume through the
