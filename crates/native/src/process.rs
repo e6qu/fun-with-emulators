@@ -161,7 +161,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
             set_shared(true);
             // SAFETY: plain host call; the child continues with only the
             // calling thread, as on Linux.
-            let pid = crate::quiesce::fork_stopped(|| unsafe { libc::fork() });
+            let pid =
+                crate::quiesce::fork_stopped(|| fork_with_signals_held(|| unsafe { libc::fork() }));
             set_shared(false);
             pid
         });
@@ -229,6 +230,34 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
         }
     }
     pid as i64
+}
+
+/// Run `fork` with every asynchronous signal blocked on this thread. The parent
+/// unblocks them again at once; the child keeps them blocked until it sets
+/// the guest's mask as it enters guest code (`trap::prepare_guest_entry`),
+/// so no handler runs in it before its state is its own. Inside `fork`,
+/// before the child's libc has caught up, its `getpid` still answers with
+/// the parent's pid: the relayed form of a guest's `SIGKILL` arriving then
+/// would have the child kill its parent.
+fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
+    // SAFETY: plain host calls on initialized signal sets.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        // Faults stay deliverable: the child's checked copies of guest
+        // memory recover from them, and a blocked one would end it.
+        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP, libc::SIGFPE] {
+            libc::sigdelset(&mut all, sig);
+        }
+        libc::sigdelset(&mut all, libc::SIGSYS);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+        let pid = fork();
+        if pid != 0 {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+        pid
+    }
 }
 
 /// Encode a host `wait` status into the Linux layout a guest expects.

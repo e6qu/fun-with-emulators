@@ -89,6 +89,9 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
 /// (see [`run_vm_bounded`]).
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+    // Its own process group, so a timeout reaches the processes it starts.
+    cmd.process_group(0);
     let feed = !input.is_empty();
     if feed {
         cmd.stdin(Stdio::piped());
@@ -140,7 +143,8 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                     let _ = child.kill();
                 }
             } else {
-                let _ = child.kill();
+                // SAFETY: SIGKILL to the guest's own process group.
+                unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
             }
             break child.wait().unwrap();
         }
@@ -149,9 +153,22 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
     if timed_out {
         eprintln!("--- guest timed out after {limit:?} (killed)");
     }
-    // Readers finish once the pipes close (at process exit).
-    let stdout = out_reader.join().unwrap();
-    let stderr = err_reader.join().unwrap();
+    // Readers finish once the pipes close: at the exit of the last process
+    // holding them, which may have left the group. One still holding them
+    // a while later is reported, not waited for.
+    let joined = |reader: std::thread::JoinHandle<Vec<u8>>, which: &str| {
+        let start = Instant::now();
+        while !reader.is_finished() {
+            if start.elapsed() > Duration::from_secs(10) {
+                eprintln!("--- a process outlived the guest holding its {which}");
+                return Vec::new();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reader.join().unwrap()
+    };
+    let stdout = joined(out_reader, "standard output");
+    let stderr = joined(err_reader, "standard error");
     (Output { status, stdout, stderr }, child.id() as i32)
 }
 

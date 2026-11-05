@@ -279,8 +279,16 @@ pub fn install_kill_relay() {
     #[cfg(target_os = "macos")]
     {
         extern "C" fn die(_: libc::c_int) {
+            // The pid from the system call itself, not libc's copy, which a
+            // fork child has the parent's of until `fork` returns in it.
             // SAFETY: async-signal-safe calls ending the process.
-            unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+            unsafe {
+                // <sys/syscall.h>: SYS_getpid.
+                const SYS_GETPID: libc::c_int = 20;
+                #[allow(deprecated)]
+                let me = libc::syscall(SYS_GETPID) as libc::pid_t;
+                libc::kill(me, libc::SIGKILL)
+            };
         }
         // SAFETY: installing a handler that only ends the process.
         unsafe { libc::signal(fwe_kernel::host::KILL_RELAY, die as *const () as usize) };
