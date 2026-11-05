@@ -932,8 +932,9 @@ fn start(
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
 
-    // The main thread's id equals the process id, as on Linux.
-    fwe_kernel::thread::init_main(fwe_kernel::host::getpid() as i32);
+    // The main thread's id equals the process id, as on Linux: in its pid
+    // namespace, for a process exec'd in one.
+    fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
 
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);

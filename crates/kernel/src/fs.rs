@@ -104,6 +104,8 @@ pub struct Resolved {
     pub mount_flags: u64,
     /// The type of the filesystem it is in.
     pub fstype: FsType,
+    /// The mount it is in (0 when not known).
+    pub mount_id: u32,
     /// It is the root of a mount (which cannot be removed or renamed).
     pub mount_root: bool,
 }
@@ -126,6 +128,7 @@ impl Resolved {
             mount_flags: 0,
             fstype: FsType::Ext4,
             mount_root: false,
+            mount_id: 0,
         }
     }
 }
@@ -146,6 +149,8 @@ pub struct Fs {
     cwd: Vec<u8>,
     umask: u32,
     proc: crate::procfs::ProcInfo,
+    /// The process's other namespaces.
+    pub ns: crate::ns::Namespaces,
 }
 
 impl Fs {
@@ -166,6 +171,7 @@ impl Fs {
         e.bytes(&self.proc.hostname);
         // Inherited like the root's.
         e.i32(self.proc.exe_fd.unwrap_or(-1));
+        self.ns.save(e);
     }
 
     /// The filesystem view [`Fs::save`] wrote, in a fork child.
@@ -200,6 +206,7 @@ impl Fs {
                 hostname: d.bytes(),
                 exe_fd: Some(d.i32()).filter(|&fd| fd >= 0),
             },
+            ns: crate::ns::Namespaces::load(d).unwrap_or_default(),
         }
     }
 
@@ -209,10 +216,12 @@ impl Fs {
         e.bytes(self.mnt.dir());
         e.u64(self.mnt.id());
         e.bytes(&self.proc_root);
+        self.ns.save(e);
     }
 
     pub(crate) fn skip_view(d: &mut crate::snapshot::Dec) {
         let _ = (d.bytes(), d.u64(), d.bytes());
+        let _ = crate::ns::Namespaces::load(d);
     }
 
     /// Take the mount namespace and root an exec state records, in a
@@ -233,6 +242,8 @@ impl Fs {
             self.mnt = Arc::new(ns);
         }
         self.proc_root = root;
+        self.ns = crate::ns::Namespaces::load(&mut d)
+            .map_err(|e| format!("joining the namespaces: errno {e}"))?;
         self.republish();
         Ok(())
     }
@@ -262,6 +273,7 @@ impl Fs {
             proc_root: b"/".to_vec(),
             umask: 0o022,
             proc: crate::procfs::ProcInfo::default(),
+            ns: crate::ns::Namespaces::default(),
         })
     }
 
@@ -374,7 +386,7 @@ impl Fs {
         let absolute = match m.fstype {
             FsType::Proc => mounts::join(b"/proc", &fs_path),
             FsType::Sysfs => mounts::join(b"/sys", &fs_path),
-            FsType::Cgroup2 | FsType::Devpts | FsType::Mqueue => {
+            FsType::Devpts | FsType::Mqueue => {
                 // Directories of their own, empty until fwe fills them.
                 return Some(if fs_path == b"/" {
                     crate::procfs::Entry::Dir
@@ -390,7 +402,21 @@ impl Fs {
             }
             _ => return None,
         };
+        if let Some(kind) = absolute.strip_prefix(b"/proc/self/ns/") {
+            return Some(match self.ns.link(kind, self.mnt.id()) {
+                Some(link) => crate::procfs::Entry::Symlink(link),
+                None => crate::procfs::Entry::Missing,
+            });
+        }
         match &absolute[..] {
+            b"/proc/sys/kernel/hostname" => {
+                return Some(crate::procfs::Entry::File([&self.ns.hostname()[..], b"\n"].concat()));
+            }
+            b"/proc/sys/kernel/domainname" => {
+                return Some(crate::procfs::Entry::File(
+                    [&self.ns.domainname()[..], b"\n"].concat(),
+                ));
+            }
             b"/proc/self/mountinfo" => {
                 return Some(crate::procfs::Entry::File(self.mounts().mountinfo(&self.proc_root)));
             }
@@ -474,7 +500,7 @@ impl Fs {
             let absolute = self.absolute(dirfd, path)?;
             let (m, fs_path) = self.mount_of(&absolute);
             return match m.fstype {
-                FsType::Cgroup2 | FsType::Devpts | FsType::Mqueue if fs_path == b"/" => Some(vec![
+                FsType::Devpts | FsType::Mqueue if fs_path == b"/" => Some(vec![
                     (b".".to_vec(), crate::procfs::DT_DIR),
                     (b"..".to_vec(), crate::procfs::DT_DIR),
                 ]),
@@ -853,6 +879,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             ns_path,
             mount_flags: mount.as_ref().map_or(0, |m| m.flags),
             fstype: mount.as_ref().map_or(FsType::Ext4, |m| m.fstype),
+            mount_id: mount.as_ref().map_or(0, |m| m.id),
             mount_root,
         })
     };
@@ -902,6 +929,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     r.ns_path = Some(child_ns.clone());
                     r.mount_flags = m.flags;
                     r.fstype = m.fstype;
+                    r.mount_id = m.id;
                     return Ok(r);
                 }
                 let dir = open_in_mount(v, &m, b"")?;

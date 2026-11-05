@@ -119,7 +119,8 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
     if fault_addr != 0 {
         buf.put(SI_ADDR_OFF, fault_addr);
     } else {
-        buf.put32(SI_PID_OFF, info.pid);
+        // Recorded as the host pid; the guest sees its own namespace's.
+        buf.put32(SI_PID_OFF, guest_pid(info.pid));
         buf.put32(SI_UID_OFF, info.uid as i32);
         buf.put32(SI_STATUS_OFF, info.status);
     }
@@ -200,13 +201,18 @@ pub fn drain_to_signalfd() {
             let record = crate::signalfd::siginfo_full(
                 sig as u32,
                 info.code,
-                info.pid,
+                guest_pid(info.pid),
                 info.uid,
                 info.status,
             );
             crate::signalfd::deliver(sig, record);
         }
     }
+}
+
+/// A sender's or child's host pid as the guest sees it.
+fn guest_pid(host: i32) -> i32 {
+    if host != 0 && crate::pidns::nested() { crate::pidns::to_guest(host) } else { host }
 }
 
 fn own_info(code: i32) -> SigInfo {
@@ -479,14 +485,30 @@ impl<P: Platform> Kernel<P> {
         if sig > signal::NSIG {
             return err(errno::EINVAL);
         }
+        let me = thread::tgid() as i64;
+        // The host process (or group) `pid` names in the guest's pid
+        // namespace.
+        let target = match pid {
+            0 | -1 => pid,
+            p if p > 0 => match crate::pidns::to_host(p as i32) {
+                Some(h) => h as i64,
+                None => return err(errno::ESRCH),
+            },
+            p => match crate::pidns::to_host(-p as i32) {
+                Some(h) => -(h as i64),
+                None => return err(errno::ESRCH),
+            },
+        };
+        if pid == -1 && crate::pidns::nested() {
+            return self.kill_namespace(sig);
+        }
         if sig == 0 {
             // SAFETY: plain host call; signal 0 only checks the target.
-            return host::ret(unsafe { libc::kill(pid as libc::pid_t, 0) });
+            return host::ret(unsafe { libc::kill(target as libc::pid_t, 0) });
         }
-        let me = thread::tgid() as i64;
         let to_self = pid == me || pid == 0 || pid == -1;
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
-            return host::kill(pid as libc::pid_t, h);
+            return host::kill(target as libc::pid_t, h);
         }
         if to_self {
             thread::post_process(sig, own_info(signal::SI_USER));
@@ -497,6 +519,31 @@ impl<P: Platform> Kernel<P> {
         }
         // Another process cannot be sent a signal the host does not have.
         err(errno::EINVAL)
+    }
+
+    /// `kill(-1, sig)` in a pid namespace of fwe's: every process in it
+    /// but its init, the caller too.
+    fn kill_namespace(&mut self, sig: u64) -> i64 {
+        let Some(ns) = crate::pidns::current().first().cloned() else { return err(errno::ESRCH) };
+        let me = thread::tgid();
+        let targets: Vec<(i32, i32)> = ns
+            .get()
+            .pids
+            .iter()
+            .filter(|(n, e)| !e.thread && **n != 1 && e.host != 0)
+            .map(|(n, e)| (*n, e.host))
+            .collect();
+        if targets.is_empty() {
+            return err(errno::ESRCH);
+        }
+        for (n, host) in targets {
+            if n == me {
+                let _ = self.sys_kill(me as i64, sig);
+            } else if let Some(h) = host::signal_to_host(sig) {
+                let _ = host::kill(host, h);
+            }
+        }
+        0
     }
 
     /// `tgkill(tgid, tid, sig)`, and `tkill(tid, sig)` as `tgid == -1`: send

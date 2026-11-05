@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod cgroupfs;
 pub mod cloneargs;
 pub mod creds;
 pub mod epoll;
@@ -23,8 +24,12 @@ pub mod mm;
 mod mountops;
 pub mod mounts;
 pub mod net;
+pub mod ns;
+pub mod nsops;
+pub mod pidns;
 pub mod procfs;
 pub mod pty;
+pub mod shared;
 pub mod signal;
 pub mod signalfd;
 pub mod snapshot;
@@ -604,6 +609,11 @@ impl<P: Platform> Kernel<P> {
 /// wakes. Touches only thread-local state and guest memory, so the backend
 /// calls it on thread exit without holding the kernel lock.
 pub fn thread_exit_cleanup() {
+    // A thread's number in the pid namespace is free again (the main
+    // thread's is the process's, freed when it is reaped).
+    if pidns::nested() && thread::tid() != thread::tgid() {
+        pidns::release_thread(thread::tid());
+    }
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {

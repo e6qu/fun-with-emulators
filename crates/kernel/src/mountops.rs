@@ -137,16 +137,30 @@ impl<P: Platform> Kernel<P> {
             // `cgroup` names the v2 hierarchy when that is the one there is.
             let name: &[u8] = if fstype == b"cgroup" { b"cgroup2" } else { &fstype };
             let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
+            let mut root = b"/".to_vec();
             let src = match kind {
                 FsType::Tmpfs => match tmpfs_dir(mode_option(&data).unwrap_or(0o1777)) {
                     Ok(dir) => Source::Host(dir),
+                    Err(e) => return err(e),
+                },
+                FsType::Cgroup2 => match crate::cgroupfs::tree_dir() {
+                    // The hierarchy from the cgroup namespace's root.
+                    Ok(dir) => {
+                        root = self
+                            .fs()
+                            .ns
+                            .cgroup
+                            .as_ref()
+                            .map_or(b"/".to_vec(), |c| c.get().root.clone());
+                        Source::Host(dir)
+                    }
                     Err(e) => return err(e),
                 },
                 _ => Source::Synthetic,
             };
             let device = if source.is_empty() { kind.name().as_bytes().to_vec() } else { source };
             ns.update(|t| {
-                t.mount(&point, kind, src, b"/".to_vec(), flags, device, data);
+                t.mount(&point, kind, src, root, flags, device, data);
                 Ok(())
             })
         };
@@ -240,33 +254,5 @@ impl<P: Platform> Kernel<P> {
             .unwrap_or_else(|| b"/".to_vec());
         fs.set_root(ns, cwd);
         0
-    }
-
-    /// `unshare(flags)`. Of the namespaces, only the mount namespace yet.
-    pub(crate) fn sys_unshare(&mut self, flags: u64) -> i64 {
-        use fwe_abi::clone::*;
-        // What is shared already in a single-threaded process, or not at all.
-        let unshared = CLONE_FILES | CLONE_FS | CLONE_SYSVSEM;
-        if flags & !(unshared | CLONE_NEWNS) != 0 {
-            return err(errno::EINVAL);
-        }
-        if flags & CLONE_NEWNS != 0 {
-            if !self.creds.has_admin() {
-                return err(errno::EPERM);
-            }
-            if let Err(e) = self.new_mount_ns() {
-                return err(e);
-            }
-        }
-        0
-    }
-
-    /// `unshare(CLONE_NEWNS)` and a `clone` with it: a copy of the mount
-    /// namespace of the process's own.
-    pub(crate) fn new_mount_ns(&mut self) -> Result<(), i32> {
-        let fs = self.fs.as_mut().expect("filesystem configured");
-        let copy = fs.mount_ns().copy()?;
-        fs.set_mount_ns(std::sync::Arc::new(copy));
-        Ok(())
     }
 }

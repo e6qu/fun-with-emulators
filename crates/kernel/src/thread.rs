@@ -68,8 +68,16 @@ pub fn tgid() -> i32 {
     TGID.load(Ordering::SeqCst)
 }
 
-/// Allocate a fresh thread id for a new thread.
+/// Allocate a fresh thread id for a new thread: in a pid namespace of
+/// fwe's, a number from it (threads and processes share the numbers).
 pub fn alloc_tid() -> i32 {
+    if crate::pidns::nested() {
+        // SAFETY: getpid cannot fail.
+        let host = unsafe { libc::getpid() };
+        if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
+            return nums[0];
+        }
+    }
     NEXT_TID.fetch_add(1, Ordering::SeqCst)
 }
 

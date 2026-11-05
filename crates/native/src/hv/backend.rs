@@ -691,7 +691,7 @@ fn start(
     let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options));
     fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
     fs.publish();
-    thread::init_main(host::getpid() as i32);
+    thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
     crate::apply_exec_state(&mut k, options)?;
     k.set_sigreturn_trampoline(tramp);

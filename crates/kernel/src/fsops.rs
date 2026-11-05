@@ -162,6 +162,19 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        let writes = flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
+            || flags & (fcntl::O_TRUNC | fcntl::O_TMPFILE) != 0;
+        if writes || flags & fcntl::O_CREAT != 0 {
+            // A file that exists on a read-only mount may still be opened
+            // to read with O_CREAT.
+            let exists =
+                resolved.name_c().is_ok_and(|n| stat_at(resolved.dir.as_raw_fd(), &n).is_ok());
+            if (writes || !exists)
+                && let Err(e) = resolved.writable()
+            {
+                return err(e);
+            }
+        }
         let name = match resolved.name_c() {
             Ok(n) => n,
             Err(e) => return err(e),
@@ -388,8 +401,9 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_mkdirat(&mut self, dirfd: u64, path: u64, mode: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        let (dir, name) = match self.resolve_c(dirfd, &path, false) {
-            Ok(v) => v,
+        let (dir, name) = match self.resolve_w(dirfd, &path, false, false) {
+            Ok((d, n, _)) => (d, n),
+            Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
         let mode = self.fs().apply_umask(mode as u32);
@@ -399,8 +413,8 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_unlinkat(&mut self, dirfd: u64, path: u64, flags: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        let (dir, name) = match self.resolve_c(dirfd, &path, false) {
-            Ok(v) => v,
+        let (dir, name) = match self.resolve_w(dirfd, &path, false, false) {
+            Ok((d, n, _)) => (d, n),
             Err(e) => return err(e),
         };
         let host_flags = if flags & fcntl::AT_REMOVEDIR != 0 { libc::AT_REMOVEDIR } else { 0 };
@@ -415,8 +429,9 @@ impl<P: Platform> Kernel<P> {
             Ok(t) => t,
             Err(_) => return err(errno::EINVAL),
         };
-        let (dir, name) = match self.resolve_c(dirfd, &path, false) {
-            Ok(v) => v,
+        let (dir, name) = match self.resolve_w(dirfd, &path, false, false) {
+            Ok((d, n, _)) => (d, n),
+            Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
         // SAFETY: both strings NUL-terminated; `dir` live.
@@ -434,14 +449,19 @@ impl<P: Platform> Kernel<P> {
         let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_FOLLOW != 0;
-        let (od, on) = match self.resolve_c(olddirfd, &oldpath, follow) {
+        let (od, on, om) = match self.resolve_w(olddirfd, &oldpath, follow, true) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        let (nd, nn) = match self.resolve_c(newdirfd, &newpath, false) {
+        let (nd, nn, nm) = match self.resolve_w(newdirfd, &newpath, false, false) {
             Ok(v) => v,
+            Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
+        if om != nm && om != 0 && nm != 0 {
+            // Across mounts, even of one filesystem.
+            return err(errno::EXDEV);
+        }
         // SAFETY: names NUL-terminated; dirs live. We resolved symlinks, so 0.
         ret(unsafe { libc::linkat(od.as_raw_fd(), on.as_ptr(), nd.as_raw_fd(), nn.as_ptr(), 0) })
     }
@@ -456,22 +476,26 @@ impl<P: Platform> Kernel<P> {
     ) -> i64 {
         let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
-        let (od, on) = match self.resolve_c(olddirfd, &oldpath, false) {
+        let (od, on, om) = match self.resolve_w(olddirfd, &oldpath, false, false) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        let (nd, nn) = match self.resolve_c(newdirfd, &newpath, false) {
+        let (nd, nn, nm) = match self.resolve_w(newdirfd, &newpath, false, false) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
+        if om != nm && om != 0 && nm != 0 {
+            // Across mounts, even of one filesystem.
+            return err(errno::EXDEV);
+        }
         rename(od.as_raw_fd(), &on, nd.as_raw_fd(), &nn, flags)
     }
 
     pub(crate) fn sys_fchmodat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
-            Ok(v) => v,
+        let (dir, name) = match self.resolve_w(dirfd, &path, follow, true) {
+            Ok((d, n, _)) => (d, n),
             Err(e) => return err(e),
         };
         // SAFETY: `name` NUL-terminated; `dir` live.
@@ -490,7 +514,7 @@ impl<P: Platform> Kernel<P> {
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         // Resolve for existence/permission errors, then apply the virtual
         // ownership policy (ownership is not reflected to the host file).
-        match self.resolve_c(dirfd, &path, follow) {
+        match self.resolve_w(dirfd, &path, follow, true) {
             Ok(_) => self.chown_check(uid as u32, gid as u32),
             Err(e) => err(e),
         }
@@ -577,12 +601,31 @@ impl<P: Platform> Kernel<P> {
         }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
-            Ok(v) => v,
+        let (dir, name) = match self.resolve_w(dirfd, &path, follow, true) {
+            Ok((d, n, _)) => (d, n),
             Err(e) => return err(e),
         };
         // SAFETY: `name` NUL-terminated; `dir` live; times valid or null.
         ret(unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, 0) })
+    }
+
+    /// [`resolve_c`](Self::resolve_c) for a call that changes what it
+    /// names: `EROFS` on a read-only mount, and, unless `mount_root_ok`,
+    /// `EBUSY` for a mount's root.
+    fn resolve_w(
+        &self,
+        dirfd: u64,
+        path: &[u8],
+        follow: bool,
+        mount_root_ok: bool,
+    ) -> Result<(std::os::fd::OwnedFd, CString, u32), i32> {
+        let r = self.fs().resolve(dirfd as i32, path, follow)?;
+        r.writable()?;
+        if r.mount_root && !mount_root_ok {
+            return Err(errno::EBUSY);
+        }
+        let name = r.name_c()?;
+        Ok((r.dir, name, r.mount_id))
     }
 
     /// Resolve and return the parent dir fd plus a C name.

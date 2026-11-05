@@ -2217,6 +2217,86 @@ fn debian_bash_runs_trap_handlers() {
     assert_eq!(stdout(&out), "trapped\nreaped\nend\n");
 }
 
+/// Run one scenario of the `namespaces` guest in a root filesystem of its
+/// own (`/mnt`, `/tmp`, and `/newroot` with `etc/marker` and `proc`) and
+/// return its output.
+fn namespaces(scenario: &str) -> String {
+    let root = std::env::temp_dir().join(format!("fwe-ns-{}-{scenario}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["mnt", "tmp", "newroot/etc", "newroot/proc"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(root.join("newroot/etc/marker"), "new\n").unwrap();
+    std::fs::copy(rust_guest("namespaces"), root.join("namespaces")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures")
+        .arg("--root")
+        .arg(&root)
+        .arg(root.join("namespaces"))
+        .arg(scenario);
+    let out = run_bounded(cmd);
+    eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
+    stdout(&out)
+}
+
+/// A UTS namespace has its own host name; the initial one's is the host's,
+/// which the guest cannot change.
+#[test]
+fn uts_namespace_has_its_own_name() {
+    assert_eq!(
+        namespaces("uts"),
+        "inside: box\nproc: box\nchild exited 0, outside unchanged: true\n\
+         outside sethostname: -1 errno 1\n"
+    );
+}
+
+/// A pid namespace numbers its processes from 1: its init has parent 0,
+/// its children are numbered and reaped there, and its parent sees it by
+/// a pid of its own.
+#[test]
+fn pid_namespace_numbers_from_one() {
+    assert_eq!(
+        namespaces("pid"),
+        "child: pid 1 ppid 0\ngrandchild: pid 2 ppid 1\nforked 2\nkill: 0\n\
+         reaped 2, killed by 9\nno such pid: -1 errno 3\n\
+         parent: child true reaped as itself, exited 7\n"
+    );
+}
+
+/// A mount made in a mount namespace is seen there only; a read-only bind
+/// mount refuses writes.
+#[test]
+fn mounts_stay_in_their_namespace() {
+    assert_eq!(
+        namespaces("mount"),
+        "mount tmpfs: 0\ninside: in tmpfs true\nthrough the bind: in tmpfs\n\
+         write there: EROFS true\numount: 0\nchild exited 0, outside: false false\n"
+    );
+}
+
+/// The root a container runtime makes: `pivot_root(".", ".")` onto a bind
+/// mount of the new root, then the old root unmounted.
+#[test]
+fn pivot_root_makes_a_container_root() {
+    assert_eq!(
+        namespaces("pivot"),
+        "pivot: 0\numount old root: 0\nmarker: new\nold root gone: true\nproc: true\n\
+         mounts: / /proc\nchild exited 0\n"
+    );
+}
+
+/// `chroot` confines paths; a `clone` makes the namespaces it asks for.
+#[test]
+fn chroot_and_clone_namespaces() {
+    assert_eq!(
+        namespaces("chroot"),
+        "chroot: 0\nmarker: new\ncannot leave: new\nchild exited 0\nnew namespaces: true\n\
+         own: uts:[4026531838] pid:[4026531836]\n"
+    );
+}
+
 /// Run one scenario of the `memfd` guest and return its output.
 fn memfd(scenario: &str) -> String {
     let out = fwe(&rust_guest("memfd"), &[scenario]);

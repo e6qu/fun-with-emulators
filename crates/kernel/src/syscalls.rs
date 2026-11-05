@@ -265,6 +265,8 @@ impl<P: Platform> Kernel<P> {
             // Memory.
             nr::BRK => self.sys_brk(a[0]),
             nr::UNSHARE => self.sys_unshare(a[0]),
+            nr::SETHOSTNAME => self.sys_setname(a[0], a[1], true),
+            nr::SETDOMAINNAME => self.sys_setname(a[0], a[1], false),
             nr::MOUNT => self.sys_mount(a[0], a[1], a[2], a[3], a[4]),
             nr::UMOUNT2 => self.sys_umount2(a[0], a[1]),
             nr::PIVOT_ROOT => self.sys_pivot_root(a[0], a[1]),
@@ -283,19 +285,37 @@ impl<P: Platform> Kernel<P> {
                 self.platform.exit_thread(a[0] as i32)
             }
             // Job control / sessions. These act on host process groups and
-            // sessions; a guest "pid" of 0 (self) always works, and child pids
-            // from fork are host pids, so setpgid(child, ...) works too.
-            // SAFETY: plain host calls.
-            nr::SETPGID => ret(unsafe { libc::setpgid(a[0] as libc::pid_t, a[1] as libc::pid_t) }),
+            // sessions, whose ids are host pids: the guest's are its pid
+            // namespace's (the host's in the initial one).
+            nr::SETPGID => {
+                let (pid, pgid) = match (
+                    crate::pidns::host_arg(a[0] as i32),
+                    crate::pidns::host_arg(a[1] as i32),
+                ) {
+                    (Ok(p), Ok(g)) => (p, g),
+                    // A group that does not exist here is not one to join.
+                    (Ok(_), Err(_)) => return err(errno::EPERM),
+                    (Err(e), _) => return err(e),
+                };
+                // SAFETY: plain host call.
+                ret(unsafe { libc::setpgid(pid, pgid) })
+            }
+            nr::GETPGID => match crate::pidns::host_arg(a[0] as i32) {
+                // SAFETY: plain host call.
+                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getpgid(p) } as i64)),
+                Err(e) => err(e),
+            },
+            nr::GETSID => match crate::pidns::host_arg(a[0] as i32) {
+                // SAFETY: plain host call.
+                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getsid(p) } as i64)),
+                Err(e) => err(e),
+            },
             // SAFETY: plain host call.
-            nr::GETPGID => ret(unsafe { libc::getpgid(a[0] as libc::pid_t) } as i64),
-            // SAFETY: plain host call.
-            nr::GETSID => ret(unsafe { libc::getsid(a[0] as libc::pid_t) } as i64),
-            // SAFETY: plain host call.
-            nr::SETSID => ret(unsafe { libc::setsid() } as i64),
+            nr::SETSID => crate::pidns::guest_ret(ret(unsafe { libc::setsid() } as i64)),
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
-            nr::GETPPID => host::getppid(),
+            // A parent outside the namespace is 0, as Linux reports it.
+            nr::GETPPID => crate::pidns::guest_ret(host::getppid()),
             // Virtual credentials (see crates/kernel/src/creds.rs).
             nr::GETUID => self.creds.getuid(),
             nr::GETEUID => self.creds.geteuid(),
@@ -610,12 +630,15 @@ impl<P: Platform> Kernel<P> {
                     if pg < 0 {
                         return last_error();
                     }
-                    guest!(uaccess::write(arg, pg));
+                    guest!(uaccess::write(arg, crate::pidns::guest_ret(pg as i64) as i32));
                     0
                 }
                 ioctl::TIOCSPGRP => {
                     let pg: i32 = guest!(uaccess::read(arg));
-                    ret(libc::tcsetpgrp(fd, pg))
+                    match crate::pidns::host_arg(pg) {
+                        Ok(pg) => ret(libc::tcsetpgrp(fd, pg)),
+                        Err(_) => err(errno::EPERM),
+                    }
                 }
                 ioctl::TIOCSCTTY => ret(libc::ioctl(fd, libc::TIOCSCTTY as _, arg as libc::c_int)),
                 ioctl::TIOCNOTTY => ret(libc::ioctl(fd, libc::TIOCNOTTY as _)),
@@ -652,16 +675,15 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: zeroed bytes are a valid `Utsname`.
         let mut u: Utsname = unsafe { std::mem::zeroed() };
         fill(&mut u.sysname, b"Linux");
-        let mut host = [0u8; 256];
-        // SAFETY: `host` is a valid buffer of its length.
-        if unsafe { libc::gethostname(host.as_mut_ptr().cast(), host.len()) } == 0 {
-            let end = host.iter().position(|&c| c == 0).unwrap_or(host.len());
-            fill(&mut u.nodename, &host[..end]);
-        }
+        let (host, domain) = match self.fs.as_ref() {
+            Some(fs) => (fs.ns.hostname(), fs.ns.domainname()),
+            None => (crate::ns::host_name(), b"(none)".to_vec()),
+        };
+        fill(&mut u.nodename, &host);
         fill(&mut u.release, RELEASE.as_bytes());
         fill(&mut u.version, b"#1 SMP PREEMPT");
         fill(&mut u.machine, b"aarch64");
-        fill(&mut u.domainname, b"(none)");
+        fill(&mut u.domainname, &domain);
         guest!(uaccess::write(buf, u));
         0
     }

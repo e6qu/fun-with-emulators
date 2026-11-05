@@ -220,7 +220,7 @@ pub struct Table {
 impl Table {
     /// The table a namespace starts with when nothing was mounted in it:
     /// the rootfs at `root_host` and what Linux always has mounted.
-    pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>) -> Table {
+    pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>, cgroup_host: Option<&[u8]>) -> Table {
         let mut t = Table { mounts: Vec::new(), next_id: 1 };
         let root = t.alloc();
         t.mounts.push(Mount {
@@ -253,7 +253,21 @@ impl Table {
         };
         add(&mut t, root, b"/proc", FsType::Proc, b"rw");
         let sys = add(&mut t, root, b"/sys", FsType::Sysfs, b"rw");
-        add(&mut t, sys, b"/sys/fs/cgroup", FsType::Cgroup2, b"rw,nsdelegate");
+        if let Some(cg) = cgroup_host {
+            let id = t.alloc();
+            t.mounts.push(Mount {
+                id,
+                parent: sys,
+                point: b"/sys/fs/cgroup".to_vec(),
+                fstype: FsType::Cgroup2,
+                source: Source::Host(cg.to_vec()),
+                root: b"/".to_vec(),
+                flags: ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME,
+                propagation: ms::PRIVATE,
+                device: b"cgroup2".to_vec(),
+                options: b"rw,nsdelegate".to_vec(),
+            });
+        }
         add(&mut t, root, b"/dev/pts", FsType::Devpts, b"rw,gid=5,mode=620,ptmxmode=000");
         add(&mut t, root, b"/dev/mqueue", FsType::Mqueue, b"rw");
         if let Some(shm) = shm_host {
@@ -684,234 +698,71 @@ impl Table {
     }
 }
 
+impl crate::shared::Data for Table {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        Table::encode(self, e);
+    }
+    fn decode(d: &mut crate::snapshot::Dec) -> Self {
+        Table::decode(d)
+    }
+    fn valid(&self) -> bool {
+        self.mounts.iter().any(|m| m.parent == m.id)
+    }
+}
+
 /// A mount namespace's table where every process in the namespace finds
-/// it: a directory of fwe's for the namespace, holding the table (replaced
-/// whole by each change, under a lock) and a generation count each process
-/// maps, so it rereads the table only when another has changed it.
+/// it: a shared record ([`crate::shared`]).
 pub mod store {
     use super::Table;
-    use crate::host::{errno_to_linux, last_errno};
-    use fwe_abi::errno;
-    use std::ffi::CString;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use crate::shared::Record;
+    use std::sync::Arc;
 
     /// The namespace identity Linux gives the initial mount namespace.
     pub const INIT_ID: u64 = 4026531841;
 
-    fn e() -> i32 {
-        errno_to_linux(last_errno())
-    }
-
-    fn c(p: &[u8]) -> Result<CString, i32> {
-        CString::new(p).map_err(|_| errno::EINVAL)
-    }
-
     /// One mount namespace, as this process sees it.
-    pub struct Ns {
-        /// The namespace's directory.
-        dir: Vec<u8>,
-        /// Its identity (`/proc/self/ns/mnt`).
-        id: u64,
-        /// The shared generation count.
-        generation: &'static AtomicU64,
-        /// The table as last read, and the generation it was read at.
-        cache: Mutex<(u64, Arc<Table>)>,
-    }
-
-    impl std::fmt::Debug for Ns {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "Ns({})", String::from_utf8_lossy(&self.dir))
-        }
-    }
-
-    /// FNV-1a: stable across processes and fwe builds.
-    fn hash(bytes: &[u8]) -> u64 {
-        bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
-    }
+    #[derive(Debug)]
+    pub struct Ns(Record<Table>);
 
     impl Ns {
         /// The initial namespace of the rootfs at `root_host`: every fwe
         /// process started on that root is in it, as every process on a
         /// machine starts in one. Made with [`Table::initial`] when new.
         pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>) -> Result<Ns, i32> {
-            let mut dir = crate::fs::shm::user_dir()?;
-            dir.extend_from_slice(format!("/mnt-init-{:016x}", hash(root_host)).as_bytes());
-            Ns::open_or_make(dir, INIT_ID, || Table::initial(root_host, shm_host))
+            let name = format!("mnt-init-{:016x}", crate::shared::hash(root_host));
+            let cgroup = crate::cgroupfs::tree_dir().ok();
+            Record::named(&name, INIT_ID, || Table::initial(root_host, shm_host, cgroup.as_deref()))
+                .map(Ns)
         }
 
         /// A new namespace holding a copy of this one's mounts
         /// (`CLONE_NEWNS`).
         pub fn copy(&self) -> Result<Ns, i32> {
-            static N: AtomicU64 = AtomicU64::new(0);
-            let mut dir = crate::fs::shm::user_dir()?;
-            // SAFETY: getpid cannot fail.
-            let pid = unsafe { libc::getpid() };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            dir.extend_from_slice(format!("/mnt-{pid}-{now}-{n}").as_bytes());
-            let table = (*self.table()).clone();
-            Ns::open_or_make(dir, 0, || table)
+            Record::fresh("mnt", (*self.table()).clone()).map(Ns)
         }
 
         /// The namespace whose directory is `dir`, as [`Ns::dir`] gives it
         /// (in a process that inherited it).
         pub fn join(dir: &[u8], id: u64) -> Result<Ns, i32> {
-            Ns::open_or_make(dir.to_vec(), id, || unreachable!("joined namespaces exist"))
-                .or(Err(errno::ENOENT))
-        }
-
-        fn open_or_make(dir: Vec<u8>, id: u64, initial: impl FnOnce() -> Table) -> Result<Ns, i32> {
-            let d = c(&dir)?;
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            unsafe { libc::mkdir(d.as_ptr(), 0o700) };
-            let gen_path = c(&[&dir[..], b"/generation"].concat())?;
-            // SAFETY: as above.
-            let fd = unsafe {
-                libc::open(gen_path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-            };
-            if fd < 0 {
-                return Err(e());
-            }
-            // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: plain host calls on the descriptor just opened.
-            let ok = unsafe { libc::ftruncate(fd, 8) == 0 && libc::fstat(fd, &mut st) == 0 };
-            if !ok {
-                // SAFETY: closing it again.
-                unsafe { libc::close(fd) };
-                return Err(e());
-            }
-            // SAFETY: a shared mapping of the 8-byte file, never unmapped:
-            // the namespace stays this process's until it leaves it, and a
-            // few such pages are all a process ever has.
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    8,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            };
-            // SAFETY: the mapping holds its own reference to the file.
-            unsafe { libc::close(fd) };
-            if p == libc::MAP_FAILED {
-                return Err(e());
-            }
-            // SAFETY: the mapping is 8 bytes, aligned and lives forever.
-            let generation: &'static AtomicU64 = unsafe { &*(p as *const AtomicU64) };
-            let id = if id != 0 { id } else { 4026532000 + (st.st_ino as u64 & 0xffff_ffff) };
-            let ns = Ns {
-                dir,
-                id,
-                generation,
-                cache: Mutex::new((u64::MAX, Arc::new(Table::default()))),
-            };
-            ns.with_lock(|| {
-                if ns.read_file().is_err() {
-                    ns.write_file(&initial())?;
-                }
-                Ok(())
-            })?;
-            Ok(ns)
+            Record::join(dir, id).map(Ns)
         }
 
         pub fn dir(&self) -> &[u8] {
-            &self.dir
+            self.0.dir()
         }
 
         pub fn id(&self) -> u64 {
-            self.id
-        }
-
-        fn table_path(&self) -> Vec<u8> {
-            [&self.dir[..], b"/table"].concat()
-        }
-
-        fn read_file(&self) -> Result<Table, i32> {
-            let bytes = std::fs::read(std::ffi::OsStr::from_bytes_compat(&self.table_path()))
-                .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
-            let mut d = crate::snapshot::Dec::new(&bytes);
-            let t = Table::decode(&mut d);
-            d.finish().map_err(|_| errno::EIO)?;
-            if t.mounts.iter().all(|m| m.parent != m.id) {
-                return Err(errno::EIO);
-            }
-            Ok(t)
-        }
-
-        fn write_file(&self, t: &Table) -> Result<(), i32> {
-            let mut enc = crate::snapshot::Enc::new();
-            t.encode(&mut enc);
-            // SAFETY: getpid cannot fail.
-            let pid = unsafe { libc::getpid() };
-            let tmp = [&self.table_path()[..], format!(".{pid}").as_bytes()].concat();
-            std::fs::write(std::ffi::OsStr::from_bytes_compat(&tmp), enc.into_bytes())
-                .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
-            let (from, to) = (c(&tmp)?, c(&self.table_path())?);
-            // SAFETY: NUL-terminated paths in the namespace's directory.
-            if unsafe { libc::rename(from.as_ptr(), to.as_ptr()) } != 0 {
-                return Err(e());
-            }
-            self.generation.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        /// Run `f` holding the namespace's lock.
-        fn with_lock<R>(&self, f: impl FnOnce() -> Result<R, i32>) -> Result<R, i32> {
-            let lock = c(&[&self.dir[..], b"/lock"].concat())?;
-            // SAFETY: a NUL-terminated path in the namespace's directory.
-            let fd = unsafe {
-                libc::open(lock.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-            };
-            if fd < 0 {
-                return Err(e());
-            }
-            // SAFETY: plain host calls on the descriptor just opened; the
-            // lock goes with it.
-            unsafe { libc::flock(fd, libc::LOCK_EX) };
-            let r = f();
-            // SAFETY: as above.
-            unsafe { libc::close(fd) };
-            r
+            self.0.id()
         }
 
         /// The table as it is now.
         pub fn table(&self) -> Arc<Table> {
-            let now = self.generation.load(Ordering::SeqCst);
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if cache.0 != now {
-                if let Ok(t) = self.read_file() {
-                    *cache = (now, Arc::new(t));
-                }
-            }
-            cache.1.clone()
+            self.0.get()
         }
 
         /// Change the table with `f`, for every process in the namespace.
         pub fn update<R>(&self, f: impl FnOnce(&mut Table) -> Result<R, i32>) -> Result<R, i32> {
-            self.with_lock(|| {
-                let mut t = self.read_file()?;
-                let r = f(&mut t)?;
-                self.write_file(&t)?;
-                Ok(r)
-            })
-        }
-    }
-
-    /// `OsStr::from_bytes`, for the Unix hosts fwe builds on.
-    trait FromBytesCompat {
-        fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr;
-    }
-
-    impl FromBytesCompat for std::ffi::OsStr {
-        fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr {
-            use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(b)
+            self.0.update(f)
         }
     }
 }
@@ -934,7 +785,7 @@ mod tests {
     use super::*;
 
     fn table() -> Table {
-        Table::initial(b"/host/root", Some(b"/host/shm"))
+        Table::initial(b"/host/root", Some(b"/host/shm"), Some(b"/host/cgroup"))
     }
 
     fn tmpfs(t: &mut Table, at: &[u8]) -> u32 {
