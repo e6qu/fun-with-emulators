@@ -1053,19 +1053,20 @@ SQL
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// Where fetched Debian packages are cached (`FWE_DEBIAN_CACHE`, or under
+/// Where fetched packages are cached (`FWE_FETCH_CACHE`, or under
 /// `target/`), so a test downloads each only once.
-fn debian_cache() -> PathBuf {
-    std::env::var_os("FWE_DEBIAN_CACHE")
+fn fetch_cache() -> PathBuf {
+    std::env::var_os("FWE_FETCH_CACHE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| repo().join("target/debian-packages"))
+        .unwrap_or_else(|| repo().join("target/fetched-packages"))
 }
 
-/// The packages listed in `guests/debian/fetch/<manifest>.txt` (pool paths
-/// and SHA-256s), and the manifest's text.
-fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
-    let list = std::fs::read_to_string(repo().join(format!("guests/debian/fetch/{manifest}.txt")))
-        .unwrap();
+/// The files listed in `guests/<distro>/fetch/<manifest>.txt` (paths and
+/// SHA-256s), and the manifest's text.
+fn manifest_in(distro: &str, manifest: &str) -> (String, Vec<(String, String)>) {
+    let list =
+        std::fs::read_to_string(repo().join(format!("guests/{distro}/fetch/{manifest}.txt")))
+            .unwrap();
     let packages = list
         .lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
@@ -1075,44 +1076,55 @@ fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
     (list, packages)
 }
 
+fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
+    manifest_in("debian", manifest)
+}
+
+fn sha256(f: &Path) -> String {
+    let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// A file fetched from the first of `urls` that serves it with SHA-256
+/// `sha256`, cached under `name`.
+fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> PathBuf {
+    let cache = fetch_cache();
+    std::fs::create_dir_all(&cache).unwrap();
+    let file = cache.join(name);
+    if file.exists() && sha256(&file) == sha256_hex {
+        return file;
+    }
+    // Tests fetch at once, and manifests share packages: each download goes
+    // to a name of its own and is renamed into place once it checks out.
+    let part = cache.join(format!("{name}.{tag}.part"));
+    let fetched = urls.iter().any(|url| {
+        Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "-o"])
+            .arg(&part)
+            .arg(url)
+            .status()
+            .is_ok_and(|s| s.success())
+            && sha256(&part) == sha256_hex
+    });
+    assert!(fetched, "could not fetch {name} with SHA-256 {sha256_hex} from {urls:?}");
+    std::fs::rename(&part, &file).unwrap();
+    file
+}
+
 /// The `.deb` files a manifest lists, fetched on first use and checked
 /// against the SHA-256 recorded there. They come from deb.debian.org, or
 /// from snapshot.debian.org once a newer version has replaced them.
 fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
     let (_, packages) = manifest(manifest_name);
-    let cache = debian_cache();
-    std::fs::create_dir_all(&cache).unwrap();
-    let sum = |f: &Path| {
-        let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
-    };
     packages
         .iter()
         .map(|(pool, sha256)| {
-            let deb = cache.join(Path::new(pool).file_name().unwrap());
-            if !deb.exists() || sum(&deb) != *sha256 {
-                // Tests fetch at once, and manifests share packages: each
-                // download goes to a name of its own and is renamed into
-                // place once it checks out.
-                let part = cache.join(format!("{pool}.{manifest_name}.part").replace('/', "_"));
-                let fetched = [
-                    format!("https://deb.debian.org/debian/{pool}"),
-                    format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
-                ]
-                .iter()
-                .any(|url| {
-                    Command::new("curl")
-                        .args(["-fsSL", "--retry", "3", "-o"])
-                        .arg(&part)
-                        .arg(url)
-                        .status()
-                        .is_ok_and(|s| s.success())
-                        && sum(&part) == *sha256
-                });
-                assert!(fetched, "could not fetch {pool} with SHA-256 {sha256}");
-                std::fs::rename(&part, &deb).unwrap();
-            }
-            deb
+            let name = Path::new(pool).file_name().unwrap().to_string_lossy().into_owned();
+            let urls = [
+                format!("https://deb.debian.org/debian/{pool}"),
+                format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
+            ];
+            fetch_pinned(&name, &urls, sha256, manifest_name)
         })
         .collect()
 }
@@ -1121,7 +1133,7 @@ fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
 /// unpacked once and cached, plus the vendored glibc runtime and bash.
 fn fetched_root(manifest_name: &str) -> PathBuf {
     let (list, _) = manifest(manifest_name);
-    let cache = debian_cache();
+    let cache = fetch_cache();
     let root = cache.join(format!("root-{manifest_name}"));
     let done = root.join(".fwe-complete");
     if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
@@ -1155,6 +1167,129 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
     let _ = std::os::unix::fs::symlink("bash", root.join("bin/sh"));
     std::fs::write(&done, &list).unwrap();
     root
+}
+
+/// The files an Alpine manifest (`guests/alpine/fetch/<manifest>.txt`)
+/// lists, fetched from dl-cdn.alpinelinux.org on first use and checked
+/// against their SHA-256s.
+fn fetched_alpine(manifest_name: &str) -> Vec<PathBuf> {
+    let (_, files) = manifest_in("alpine", manifest_name);
+    files
+        .iter()
+        .map(|(path, sha256)| {
+            let name = format!("alpine-{}", Path::new(path).file_name().unwrap().to_string_lossy());
+            let urls = [format!("https://dl-cdn.alpinelinux.org/alpine/{path}")];
+            fetch_pinned(&name, &urls, sha256, manifest_name)
+        })
+        .collect()
+}
+
+/// A root filesystem of what an Alpine manifest lists, unpacked in order
+/// and cached: the minirootfs, then each package. An `.apk` is gzipped tar
+/// segments, its signature and metadata (dot files) before the files.
+fn alpine_root(manifest_name: &str) -> PathBuf {
+    let (list, _) = manifest_in("alpine", manifest_name);
+    let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
+    let done = root.join(".fwe-complete");
+    if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
+        return root;
+    }
+    let files = fetched_alpine(manifest_name);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    for f in &files {
+        run_checked(
+            Command::new("tar")
+                .arg("xzf")
+                .arg(f)
+                .args(["--exclude", ".PKGINFO", "--exclude", ".SIGN.*", "--exclude", ".pre-*"])
+                .args(["--exclude", ".post-*", "--exclude", ".trigger", "-C"])
+                .arg(&root),
+        );
+    }
+    std::fs::write(&done, &list).unwrap();
+    root
+}
+
+/// The minirootfs of an Alpine manifest: the standard `alpine` image's
+/// root filesystem, for a container to run.
+fn alpine_image(manifest_name: &str) -> PathBuf {
+    fetched_alpine(manifest_name)
+        .into_iter()
+        .find(|f| f.to_string_lossy().contains("minirootfs"))
+        .unwrap()
+}
+
+/// What the container prints in [`alpine_crun_runs_an_image`].
+const IN_CONTAINER: &str = "echo pid $$ host $(hostname); cat /proc/self/cgroup; \
+    ls /proc | grep -E '^[0-9]+$' | head -1; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; \
+    touch /x 2>&1 | sed 's/.*: //'; mkdir /dev/shm/d 2>&1 | sed 's/.*: //'; echo $(ls /dev); \
+    echo $(awk '{print $5}' /proc/self/mountinfo); cat /etc/alpine-release";
+
+/// Alpine's crun (fetched: `guests/alpine/fetch/crun.txt`) runs the
+/// standard `alpine` image from the spec it writes itself, with a seccomp
+/// profile added: in its own pid, network, IPC, UTS, cgroup and mount
+/// namespaces, on a read-only root with the mounts and devices the spec
+/// names, with the capabilities it keeps, `no_new_privs`, and the profile
+/// refusing `mkdirat`.
+#[test]
+fn alpine_crun_runs_an_image() {
+    let root = std::env::temp_dir().join(format!("fwe-crun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("crun")).arg(&root));
+    let bundle = root.join("bundle");
+    std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+    run_checked(
+        Command::new("tar")
+            .arg("xzf")
+            .arg(alpine_image("crun"))
+            .arg("-C")
+            .arg(bundle.join("rootfs")),
+    );
+    let _workload = workload();
+    // Traced, except for the container's run: its program writes its own
+    // standard error into what the test reads.
+    let crun = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg("--cwd").arg("/bundle");
+        if args[0] != "run" {
+            cmd.arg("--strace=failures");
+        }
+        cmd.arg(root.join("usr/bin/crun")).args(args);
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        eprintln!("--- crun {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let out = crun(&["--version"]);
+    assert!(stdout(&out).contains("crun version 1.17"), "{}", stdout(&out));
+    assert_eq!(crun(&["spec"]).status.code(), Some(0));
+    // The spec as crun wrote it, with no terminal, the program to run, and
+    // a seccomp profile.
+    let config = bundle.join("config.json");
+    let mut spec = std::fs::read_to_string(&config).unwrap();
+    spec = spec.replacen("\"terminal\": true", "\"terminal\": false", 1);
+    let args_at = spec.find("\"args\": [").unwrap();
+    let args_end = args_at + spec[args_at..].find(']').unwrap() + 1;
+    let quoted = format!("{IN_CONTAINER:?}");
+    spec.replace_range(args_at..args_end, &format!("\"args\": [\"/bin/sh\", \"-c\", {quoted}]"));
+    let linux_at = spec.find("\"linux\": {").unwrap() + "\"linux\": {".len();
+    spec.insert_str(
+        linux_at,
+        "\"seccomp\": {\"defaultAction\": \"SCMP_ACT_ALLOW\", \"architectures\": [\"SCMP_ARCH_AARCH64\"], \
+         \"syscalls\": [{\"names\": [\"mkdirat\"], \"action\": \"SCMP_ACT_ERRNO\", \"errnoRet\": 1}]},",
+    );
+    std::fs::write(&config, spec).unwrap();
+    let id = format!("fwe-test-{}", std::process::id());
+    let out = crun(&["run", &id]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
+         Read-only file system\nOperation not permitted\n\
+         core fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero\n\
+         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/sys\n3.20.10\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
@@ -2149,6 +2284,167 @@ fn debian_bash_runs_trap_handlers() {
     assert_eq!(stdout(&out), "trapped\nreaped\nend\n");
 }
 
+/// Run one scenario of the `namespaces` guest in a root filesystem of its
+/// own (`/mnt`, `/tmp`, and `/newroot` with `etc/marker` and `proc`) and
+/// return its output.
+fn namespaces(scenario: &str) -> String {
+    let root = std::env::temp_dir().join(format!("fwe-ns-{}-{scenario}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["mnt", "tmp", "newroot/etc", "newroot/proc"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(root.join("newroot/etc/marker"), "new\n").unwrap();
+    std::fs::copy(rust_guest("namespaces"), root.join("namespaces")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures")
+        .arg("--root")
+        .arg(&root)
+        .arg(root.join("namespaces"))
+        .arg(scenario);
+    let out = run_bounded(cmd);
+    eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
+    stdout(&out)
+}
+
+/// A UTS namespace has its own host name; the initial one's is the host's,
+/// which the guest cannot change.
+#[test]
+fn uts_namespace_has_its_own_name() {
+    assert_eq!(
+        namespaces("uts"),
+        "inside: box\nproc: box\nchild exited 0, outside unchanged: true\n\
+         outside sethostname: -1 errno 1\n"
+    );
+}
+
+/// A pid namespace numbers its processes from 1: its init has parent 0,
+/// its children are numbered and reaped there, and its parent sees it by
+/// a pid of its own.
+#[test]
+fn pid_namespace_numbers_from_one() {
+    assert_eq!(
+        namespaces("pid"),
+        "child: pid 1 ppid 0\ngrandchild: pid 2 ppid 1\nforked 2\nkill: 0\n\
+         reaped 2, killed by 9\nno such pid: -1 errno 3\n\
+         parent: child true reaped as itself, exited 7\n"
+    );
+}
+
+/// A mount made in a mount namespace is seen there only; a read-only bind
+/// mount refuses writes.
+#[test]
+fn mounts_stay_in_their_namespace() {
+    assert_eq!(
+        namespaces("mount"),
+        "mount tmpfs: 0\ninside: in tmpfs true\nthrough the bind: in tmpfs\n\
+         write there: EROFS true\numount: 0\nchild exited 0, outside: false false\n"
+    );
+}
+
+/// The root a container runtime makes: `pivot_root(".", ".")` onto a bind
+/// mount of the new root, then the old root unmounted.
+#[test]
+fn pivot_root_makes_a_container_root() {
+    assert_eq!(
+        namespaces("pivot"),
+        "pivot: 0\numount old root: 0\nmarker: new\nold root gone: true\nproc: true\n\
+         mounts: / /proc\nchild exited 0\n"
+    );
+}
+
+/// A network namespace has a loopback interface, down until brought up,
+/// and ports of its own: a stream within it works, a port is taken once,
+/// other addresses are unreachable, and a port it holds is free outside.
+#[test]
+fn network_namespace_has_its_own_loopback() {
+    assert_eq!(
+        namespaces("net"),
+        "lo down: true\nlo up: true\nbound: 127.0.0.1:18080\nclient's peer: 127.0.0.1:18080\n\
+         served: ping\ntaken: true\nelsewhere: true\nnobody there: true\nchild exited 0\n"
+    );
+    assert_eq!(namespaces("net-outside"), "inside: 127.0.0.1:18082\noutside too: true\n");
+}
+
+/// A user namespace: unmapped until its maps are written, once, under
+/// Linux's rules (the process itself its own id only, setgroups denied
+/// first; its parent, privileged outside, anything), with every capability
+/// inside.
+#[test]
+fn user_namespace_maps_ids() {
+    assert_eq!(
+        namespaces("user"),
+        "unmapped: 65534 65534\nCapEff:\t000001ffffffffff\n\
+         gid_map before setgroups: Err(1)\nsetgroups: Ok(())\n\
+         uid_map, more than one's own: Err(1)\nuid_map: Ok(())\ngid_map: Ok(())\nagain: Err(1)\n\
+         mapped: 0 0\nsetuid to an unmapped id: -1 errno 22\n\
+         map:          0          0          1\nchild exited 0\n\
+         parent wrote the map: true\nin child: uid 0, setuid(5) 0, uid 5\n"
+    );
+}
+
+/// `chroot` confines paths; a `clone` makes the namespaces it asks for.
+#[test]
+fn chroot_and_clone_namespaces() {
+    assert_eq!(
+        namespaces("chroot"),
+        "chroot: 0\nmarker: new\ncannot leave: new\nchild exited 0\nnew namespaces: true\n\
+         own: uts:[4026531838] pid:[4026531836]\n"
+    );
+}
+
+/// Run one scenario of the `memfd` guest and return its output.
+fn memfd(scenario: &str) -> String {
+    let out = fwe(&rust_guest("memfd"), &[scenario]);
+    eprintln!("--- memfd {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{scenario}");
+    stdout(&out)
+}
+
+/// What the `memfd` guest's `seals` scenario prints: a memfd named as
+/// Linux names it, and each seal holding.
+const MEMFD_SEALS: &str = "\
+link: /memfd:plain (deleted)
+seals: 1
+sealing it: -1 EPERM
+not a memfd: -1 EINVAL
+sealable: 0
+shrink: -1 EPERM
+grow: -1 EPERM
+same size: 0
+write: -1 EPERM
+writable mapping: -1 EPERM
+read-only mapping: true
+still open for writing: true
+seals now: 15
+more: -1 EPERM
+reopened: true seals 15
+";
+
+/// A memfd's seals hold as on Linux: against resizing, writing and
+/// writable shared mappings, through every descriptor of it.
+#[test]
+fn memfd_seals_hold() {
+    assert_eq!(memfd("seals"), MEMFD_SEALS);
+}
+
+/// What the copy of the `memfd` guest run from a sealed memfd prints.
+fn memfd_child(how: &str) -> String {
+    format!("running {how} as copy\nexe: /memfd:self (deleted)\nexe sealed: true\n")
+}
+
+/// A program runs from a sealed memfd, as crun re-executes itself: by
+/// descriptor (`execveat` with `AT_EMPTY_PATH`), by its `/proc/self/fd`
+/// path, and from a process with another thread (where fwe re-executes
+/// itself); `/proc/self/exe` then opens the memfd, seals and all.
+#[test]
+fn program_runs_from_a_sealed_memfd() {
+    assert_eq!(memfd("exec"), memfd_child("by-descriptor"));
+    assert_eq!(memfd("exec-path"), memfd_child("by-path"));
+    assert_eq!(memfd("exec-threaded"), memfd_child("from-a-thread"));
+}
+
 /// Run one scenario of the `fds` guest from inside a root filesystem (so
 /// path resolution depends on fwe's handle on it) and return its output.
 fn fds(scenario: &str) -> String {
@@ -2583,6 +2879,47 @@ fn hv_delivers_signals() {
     use std::os::unix::process::ExitStatusExt;
     let out = run("sigpipe").unwrap();
     assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
+}
+
+/// Namespaces in the VM, whose fork child starts from a snapshot of the
+/// namespaces made for it: a pid namespace numbering from 1, a UTS
+/// namespace's own name, a user namespace's maps.
+#[test]
+fn hv_namespaces() {
+    let run = |scenario: &str| fwe_hv(&rust_low_guest("namespaces"), &[scenario]);
+    let Some(out) = run("pid") else { return };
+    assert_eq!(
+        stdout(&out),
+        "child: pid 1 ppid 0\ngrandchild: pid 2 ppid 1\nforked 2\nkill: 0\n\
+         reaped 2, killed by 9\nno such pid: -1 errno 3\n\
+         parent: child true reaped as itself, exited 7\n"
+    );
+    let out = run("uts").unwrap();
+    assert!(
+        stdout(&out)
+            .starts_with("inside: box\nproc: box\nchild exited 0, outside unchanged: true\n"),
+        "{}",
+        stdout(&out)
+    );
+    let out = run("user").unwrap();
+    assert!(
+        stdout(&out).ends_with("parent wrote the map: true\nin child: uid 0, setuid(5) 0, uid 5\n"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// memfds in the VM: seals hold, and a program runs from a sealed memfd,
+/// which the VM process hands to the fwe it re-executes by descriptor.
+#[test]
+fn hv_runs_a_program_from_a_sealed_memfd() {
+    let run = |scenario: &str| fwe_hv(&rust_low_guest("memfd"), &[scenario]);
+    let Some(out) = run("seals") else { return };
+    assert_eq!(stdout(&out), MEMFD_SEALS);
+    for (scenario, how) in [("exec", "by-descriptor"), ("exec-path", "by-path")] {
+        let out = run(scenario).unwrap();
+        assert_eq!(stdout(&out), memfd_child(how), "{scenario}");
+    }
 }
 
 /// The kernel's view of guest memory in the VM: /proc/self/fd and the

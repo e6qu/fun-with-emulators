@@ -93,7 +93,7 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_limit(n, &a) {
             return e;
         }
-        let r = self.dispatch_call(n, a);
+        let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
         // Descriptors past the guest's soft limit are ones Linux would not
         // have given: closed again (by the guest's `close`, which also drops
         // what fwe keeps for one), and the call fails.
@@ -115,6 +115,14 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe { libc::read(a[0] as i32, a[1] as *mut _, a[2] as usize) } as i64)
             }
             nr::WRITE => {
+                if let Some(r) = crate::cgroupfs::try_write(a[0] as i32, a[1], a[2]) {
+                    return r;
+                }
+                if crate::fdmarks::any_marks()
+                    && let Some(r) = crate::userns::try_write(a[0] as i32, a[1], a[2])
+                {
+                    return r;
+                }
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
@@ -151,6 +159,15 @@ impl<P: Platform> Kernel<P> {
             nr::CLOSE => {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
+                // A port bound in a network namespace is free once its
+                // socket is.
+                let mark = crate::fdmarks::marked(fd);
+                if matches!(mark, Some(crate::fdmarks::Mark::NetBound { .. }))
+                    && !crate::fdmarks::shared_elsewhere(fd)
+                {
+                    crate::netns::closed(fd, mark);
+                }
+                crate::fdmarks::closed(fd);
                 if let Some(r) = crate::specialfd::try_close(fd) {
                     r
                 } else if let Some(r) = crate::signalfd::try_close(fd) {
@@ -166,7 +183,11 @@ impl<P: Platform> Kernel<P> {
             }
             nr::DUP => {
                 // SAFETY: plain host call.
-                ret(unsafe { libc::dup(a[0] as i32) })
+                let r = ret(unsafe { libc::dup(a[0] as i32) });
+                if r >= 0 {
+                    crate::fdmarks::duplicated(a[0] as i32, r as i32);
+                }
+                r
             }
             nr::DUP3 => self.sys_dup3(a[0], a[1], a[2]),
             nr::CLOSE_RANGE => self.sys_close_range(a[0] as u32, a[1] as u32, a[2]),
@@ -179,6 +200,11 @@ impl<P: Platform> Kernel<P> {
             nr::EPOLL_CREATE1 => unsafe { crate::epoll::create1(a[0]) },
             // SAFETY: the host validates the epoll_event pointer.
             nr::EPOLL_CTL => unsafe { crate::epoll::ctl(a[0], a[1], a[2], a[3]) },
+            nr::MEMFD_CREATE => match uaccess::read_cstr(a[0], fwe_abi::memfd::NAME_MAX) {
+                Ok(name) => crate::memfd::create(&name, a[1]),
+                Err(errno::ENAMETOOLONG) => err(errno::EINVAL),
+                Err(e) => err(e),
+            },
             // SAFETY: eventfd2 takes no pointers.
             nr::EVENTFD2 => unsafe { crate::specialfd::eventfd2(a[0], a[1]) },
             // SAFETY: timerfd_create takes no pointers.
@@ -197,7 +223,14 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: the sv pointer is validated by the host/impl.
             nr::SOCKETPAIR => unsafe { crate::net::socketpair(a[0], a[1], a[2], a[3]) },
             // SAFETY: the sockaddr pointer is validated by the host/impl.
-            nr::BIND => unsafe { crate::net::bind(a[0], a[1], a[2]) },
+            nr::BIND => unsafe {
+                crate::net::bind(
+                    a[0],
+                    a[1],
+                    a[2],
+                    self.creds.has(crate::caps::CAP_NET_BIND_SERVICE),
+                )
+            },
             // SAFETY: no pointers.
             nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
             // SAFETY: the out pointers are validated by the host/impl.
@@ -226,6 +259,7 @@ impl<P: Platform> Kernel<P> {
             nr::FCHDIR => self.sys_fchdir(a[0]),
             nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
             nr::MKDIRAT => self.sys_mkdirat(a[0], a[1], a[2]),
+            nr::MKNODAT => self.sys_mknodat(a[0], a[1], a[2], a[3]),
             nr::UNLINKAT => self.sys_unlinkat(a[0], a[1], a[2]),
             // arm64 keeps the flagless form, which glibc's `rename` uses.
             nr::RENAMEAT => self.sys_renameat2(a[0], a[1], a[2], a[3], 0),
@@ -233,6 +267,7 @@ impl<P: Platform> Kernel<P> {
             nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
+            nr::FCHMOD if crate::memfd::chmod_sealed(a[0] as i32) => err(errno::EPERM),
             nr::FCHMOD => {
                 // SAFETY: plain host call on a guest fd.
                 ret(unsafe { libc::fchmod(a[0] as i32, a[1] as libc::mode_t) })
@@ -258,6 +293,13 @@ impl<P: Platform> Kernel<P> {
 
             // Memory.
             nr::BRK => self.sys_brk(a[0]),
+            nr::UNSHARE => self.sys_unshare(a[0]),
+            nr::SETHOSTNAME => self.sys_setname(a[0], a[1], true),
+            nr::SETDOMAINNAME => self.sys_setname(a[0], a[1], false),
+            nr::MOUNT => self.sys_mount(a[0], a[1], a[2], a[3], a[4]),
+            nr::UMOUNT2 => self.sys_umount2(a[0], a[1]),
+            nr::PIVOT_ROOT => self.sys_pivot_root(a[0], a[1]),
+            nr::CHROOT => self.sys_chroot(a[0]),
             nr::MMAP => self.sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
             nr::MUNMAP => self.sys_munmap(a[0], a[1]),
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),
@@ -272,33 +314,80 @@ impl<P: Platform> Kernel<P> {
                 self.platform.exit_thread(a[0] as i32)
             }
             // Job control / sessions. These act on host process groups and
-            // sessions; a guest "pid" of 0 (self) always works, and child pids
-            // from fork are host pids, so setpgid(child, ...) works too.
-            // SAFETY: plain host calls.
-            nr::SETPGID => ret(unsafe { libc::setpgid(a[0] as libc::pid_t, a[1] as libc::pid_t) }),
+            // sessions, whose ids are host pids: the guest's are its pid
+            // namespace's (the host's in the initial one).
+            nr::SETPGID => {
+                let (pid, pgid) = match (
+                    crate::pidns::host_arg(a[0] as i32),
+                    crate::pidns::host_arg(a[1] as i32),
+                ) {
+                    (Ok(p), Ok(g)) => (p, g),
+                    // A group that does not exist here is not one to join.
+                    (Ok(_), Err(_)) => return err(errno::EPERM),
+                    (Err(e), _) => return err(e),
+                };
+                // SAFETY: plain host call.
+                ret(unsafe { libc::setpgid(pid, pgid) })
+            }
+            nr::GETPGID => match crate::pidns::host_arg(a[0] as i32) {
+                // SAFETY: plain host call.
+                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getpgid(p) } as i64)),
+                Err(e) => err(e),
+            },
+            nr::GETSID => match crate::pidns::host_arg(a[0] as i32) {
+                // SAFETY: plain host call.
+                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getsid(p) } as i64)),
+                Err(e) => err(e),
+            },
             // SAFETY: plain host call.
-            nr::GETPGID => ret(unsafe { libc::getpgid(a[0] as libc::pid_t) } as i64),
-            // SAFETY: plain host call.
-            nr::GETSID => ret(unsafe { libc::getsid(a[0] as libc::pid_t) } as i64),
-            // SAFETY: plain host call.
-            nr::SETSID => ret(unsafe { libc::setsid() } as i64),
+            nr::SETSID => crate::pidns::guest_ret(ret(unsafe { libc::setsid() } as i64)),
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
-            nr::GETPPID => host::getppid(),
+            // A parent outside the namespace is 0, as Linux reports it.
+            nr::GETPPID => crate::pidns::guest_ret(host::getppid()),
             // Virtual credentials (see crates/kernel/src/creds.rs).
-            nr::GETUID => self.creds.getuid(),
-            nr::GETEUID => self.creds.geteuid(),
-            nr::GETGID => self.creds.getgid(),
-            nr::GETEGID => self.creds.getegid(),
-            nr::SETUID => self.creds.setuid(a[0] as u32),
-            nr::SETREUID => self.creds.setreuid(a[0] as u32, a[1] as u32),
-            nr::SETRESUID => self.creds.setresuid(a[0] as u32, a[1] as u32, a[2] as u32),
-            nr::SETFSUID => self.creds.setfsuid(a[0] as u32),
+            // Kept as the initial namespace's ids, seen through the user
+            // namespace's maps (see `userns`).
+            nr::GETUID => uid_out(self.creds.uid, false),
+            nr::GETEUID => uid_out(self.creds.euid, false),
+            nr::GETGID => uid_out(self.creds.gid, true),
+            nr::GETEGID => uid_out(self.creds.egid, true),
+            nr::SETUID => match uid_in(a[0], false) {
+                Ok(u) => self.creds.setuid(u),
+                Err(e) => err(e),
+            },
+            nr::SETREUID => match (uid_in(a[0], false), uid_in(a[1], false)) {
+                (Ok(r), Ok(e)) => self.creds.setreuid(r, e),
+                (Err(x), _) | (_, Err(x)) => err(x),
+            },
+            nr::SETRESUID => {
+                match (uid_in(a[0], false), uid_in(a[1], false), uid_in(a[2], false)) {
+                    (Ok(r), Ok(e), Ok(s)) => self.creds.setresuid(r, e, s),
+                    (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
+                }
+            }
+            nr::SETFSUID => match uid_in(a[0], false) {
+                Ok(u) => uid_out(self.creds.setfsuid(u) as u32, false),
+                // Unmapped: no change, and the old one back.
+                Err(_) => uid_out(self.creds.fsuid, false),
+            },
             nr::GETRESUID => self.sys_getresuid(a[0], a[1], a[2]),
-            nr::SETGID => self.creds.setgid(a[0] as u32),
-            nr::SETREGID => self.creds.setregid(a[0] as u32, a[1] as u32),
-            nr::SETRESGID => self.creds.setresgid(a[0] as u32, a[1] as u32, a[2] as u32),
-            nr::SETFSGID => self.creds.setfsgid(a[0] as u32),
+            nr::SETGID => match uid_in(a[0], true) {
+                Ok(g) => self.creds.setgid(g),
+                Err(e) => err(e),
+            },
+            nr::SETREGID => match (uid_in(a[0], true), uid_in(a[1], true)) {
+                (Ok(r), Ok(e)) => self.creds.setregid(r, e),
+                (Err(x), _) | (_, Err(x)) => err(x),
+            },
+            nr::SETRESGID => match (uid_in(a[0], true), uid_in(a[1], true), uid_in(a[2], true)) {
+                (Ok(r), Ok(e), Ok(s)) => self.creds.setresgid(r, e, s),
+                (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
+            },
+            nr::SETFSGID => match uid_in(a[0], true) {
+                Ok(g) => uid_out(self.creds.setfsgid(g) as u32, true),
+                Err(_) => uid_out(self.creds.fsgid, true),
+            },
             nr::GETRESGID => self.sys_getresgid(a[0], a[1], a[2]),
             nr::GETGROUPS => self.sys_getgroups(a[0], a[1]),
             nr::SETGROUPS => self.sys_setgroups(a[0], a[1]),
@@ -315,12 +404,18 @@ impl<P: Platform> Kernel<P> {
             }
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
-            nr::PRCTL => self.sys_prctl(a[0], a[1]),
+            nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::CAPGET => self.sys_capget(a[0], a[1]),
+            nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
+            nr::BPF if !self.creds.has_admin() => err(errno::EPERM),
+            nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
+            nr::CAPSET => self.sys_capset(a[0], a[1]),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 0
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
                 let who = match a[0] as i32 as i64 {
@@ -406,7 +501,7 @@ impl<P: Platform> Kernel<P> {
         if uid == u32::MAX && gid == u32::MAX {
             return 0;
         }
-        if self.creds.euid == 0 { 0 } else { err(errno::EPERM) }
+        if self.creds.has(crate::caps::CAP_CHOWN) { 0 } else { err(errno::EPERM) }
     }
 
     fn sys_getresuid(&self, rp: u64, ep: u64, sp: u64) -> i64 {
@@ -414,9 +509,10 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         let (r, e, s) = self.creds.resuid();
-        guest!(uaccess::write(rp, r));
-        guest!(uaccess::write(ep, e));
-        guest!(uaccess::write(sp, s));
+        let v = |id| crate::userns::to_ns(id, false);
+        guest!(uaccess::write(rp, v(r)));
+        guest!(uaccess::write(ep, v(e)));
+        guest!(uaccess::write(sp, v(s)));
         0
     }
 
@@ -425,9 +521,10 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         let (r, e, s) = self.creds.resgid();
-        guest!(uaccess::write(rp, r));
-        guest!(uaccess::write(ep, e));
-        guest!(uaccess::write(sp, s));
+        let v = |id| crate::userns::to_ns(id, true);
+        guest!(uaccess::write(rp, v(r)));
+        guest!(uaccess::write(ep, v(e)));
+        guest!(uaccess::write(sp, v(s)));
         0
     }
 
@@ -441,7 +538,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         for (i, &g) in groups.iter().enumerate() {
-            guest!(uaccess::write(list + (i * 4) as u64, g));
+            guest!(uaccess::write(list + (i * 4) as u64, crate::userns::to_ns(g, true)));
         }
         n as i64
     }
@@ -451,9 +548,18 @@ impl<P: Platform> Kernel<P> {
         if n > 65536 {
             return err(errno::EINVAL);
         }
+        // Denied in a user namespace whose setgroups says so, or whose
+        // gid_map is not yet written.
+        if crate::userns::nested() && !crate::userns::setgroups_allowed() {
+            return err(errno::EPERM);
+        }
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
-            v.push(guest!(uaccess::read::<u32>(list + (i * 4) as u64)));
+            let g = guest!(uaccess::read::<u32>(list + (i * 4) as u64));
+            match crate::userns::from_ns(g, true) {
+                Some(k) => v.push(k),
+                None => return err(errno::EINVAL),
+            }
         }
         self.creds.setgroups(v)
     }
@@ -471,6 +577,9 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: plain host calls.
         let r = unsafe { libc::dup2(old as i32, new as i32) };
+        if r >= 0 {
+            crate::fdmarks::duplicated(old as i32, r);
+        }
         if r >= 0 && flags & fcntl::O_CLOEXEC != 0 {
             // SAFETY: plain host call on the descriptor just created.
             unsafe { libc::fcntl(r, libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -511,8 +620,15 @@ impl<P: Platform> Kernel<P> {
                 {
                     err(errno::EINVAL)
                 }
-                fcntl::F_DUPFD => ret(libc::fcntl(fd, libc::F_DUPFD, arg as i32)),
-                fcntl::F_DUPFD_CLOEXEC => ret(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, arg as i32)),
+                fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC => {
+                    let how =
+                        if cmd == fcntl::F_DUPFD { libc::F_DUPFD } else { libc::F_DUPFD_CLOEXEC };
+                    let r = ret(libc::fcntl(fd, how, arg as i32));
+                    if r >= 0 {
+                        crate::fdmarks::duplicated(fd, r as i32);
+                    }
+                    r
+                }
                 fcntl::F_GETFD => {
                     let r = libc::fcntl(fd, libc::F_GETFD);
                     if r < 0 {
@@ -527,7 +643,16 @@ impl<P: Platform> Kernel<P> {
                 }
                 fcntl::F_GETFL => {
                     let r = libc::fcntl(fd, libc::F_GETFL);
-                    if r < 0 { last_error() } else { host::status_flags_to_linux(r) as i64 }
+                    if r < 0 {
+                        last_error()
+                    } else if crate::memfd::write_refused(fd) {
+                        // Read-only on the host since it was sealed (see
+                        // `memfd`), but open for writing as far as Linux goes.
+                        let r = (r & !libc::O_ACCMODE) | libc::O_RDWR;
+                        host::status_flags_to_linux(r) as i64
+                    } else {
+                        host::status_flags_to_linux(r) as i64
+                    }
                 }
                 fcntl::F_SETFL => {
                     ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
@@ -545,6 +670,8 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 fcntl::F_SETLK | fcntl::F_SETLKW => set_record_lock(fd, cmd, arg),
+                fcntl::F_ADD_SEALS => crate::memfd::add_seals(fd, arg),
+                fcntl::F_GET_SEALS => crate::memfd::get_seals(fd),
                 _ => err(errno::EINVAL),
             }
         }
@@ -571,6 +698,11 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
+                ioctl::SIOCGIFFLAGS
+                | ioctl::SIOCSIFFLAGS
+                | ioctl::SIOCGIFINDEX
+                | ioctl::SIOCGIFMTU
+                | ioctl::SIOCGIFNAME => self.interface_ioctl(fd, req, arg),
                 ioctl::TCSETS | ioctl::TCSETSW | ioctl::TCSETSF => {
                     crate::term::tcsetattr(fd, req, arg)
                 }
@@ -588,12 +720,15 @@ impl<P: Platform> Kernel<P> {
                     if pg < 0 {
                         return last_error();
                     }
-                    guest!(uaccess::write(arg, pg));
+                    guest!(uaccess::write(arg, crate::pidns::guest_ret(pg as i64) as i32));
                     0
                 }
                 ioctl::TIOCSPGRP => {
                     let pg: i32 = guest!(uaccess::read(arg));
-                    ret(libc::tcsetpgrp(fd, pg))
+                    match crate::pidns::host_arg(pg) {
+                        Ok(pg) => ret(libc::tcsetpgrp(fd, pg)),
+                        Err(_) => err(errno::EPERM),
+                    }
                 }
                 ioctl::TIOCSCTTY => ret(libc::ioctl(fd, libc::TIOCSCTTY as _, arg as libc::c_int)),
                 ioctl::TIOCNOTTY => ret(libc::ioctl(fd, libc::TIOCNOTTY as _)),
@@ -630,29 +765,27 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: zeroed bytes are a valid `Utsname`.
         let mut u: Utsname = unsafe { std::mem::zeroed() };
         fill(&mut u.sysname, b"Linux");
-        let mut host = [0u8; 256];
-        // SAFETY: `host` is a valid buffer of its length.
-        if unsafe { libc::gethostname(host.as_mut_ptr().cast(), host.len()) } == 0 {
-            let end = host.iter().position(|&c| c == 0).unwrap_or(host.len());
-            fill(&mut u.nodename, &host[..end]);
-        }
+        let (host, domain) = match self.fs.as_ref() {
+            Some(fs) => (fs.ns.hostname(), fs.ns.domainname()),
+            None => (crate::ns::host_name(), b"(none)".to_vec()),
+        };
+        fill(&mut u.nodename, &host);
         fill(&mut u.release, RELEASE.as_bytes());
         fill(&mut u.version, b"#1 SMP PREEMPT");
         fill(&mut u.machine, b"aarch64");
-        fill(&mut u.domainname, b"(none)");
+        fill(&mut u.domainname, &domain);
         guest!(uaccess::write(buf, u));
         0
     }
 
     /// `prctl(option, arg2, ...)` for the options programs commonly use; any
     /// other fails with `EINVAL`, as an unknown option does on Linux.
-    fn sys_prctl(&mut self, option: u64, arg2: u64) -> i64 {
+    fn sys_prctl(&mut self, option: u64, arg2: u64, arg3: u64) -> i64 {
         use fwe_abi::prctl::*;
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        /// `PR_SET_NO_NEW_PRIVS` (fwe grants no privileges an exec could
-        /// raise, so it only has to be remembered) and `PR_SET_DUMPABLE`.
-        static NO_NEW_PRIVS: AtomicBool = AtomicBool::new(false);
+        /// `PR_SET_DUMPABLE`.
         static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
+        static SUBREAPER: AtomicBool = AtomicBool::new(false);
         match option {
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
@@ -660,6 +793,10 @@ impl<P: Platform> Kernel<P> {
                 let n = s.len().min(TASK_COMM_LEN - 1);
                 name[..n].copy_from_slice(&s[..n]);
                 thread::set_name(name);
+                if thread::tid() == thread::tgid() {
+                    // What /proc/<pid>/comm shows of the process.
+                    crate::procreg::own_comm(&name[..n]);
+                }
                 0
             }
             PR_GET_NAME => {
@@ -675,15 +812,52 @@ impl<P: Platform> Kernel<P> {
                 guest!(uaccess::write(arg2, name));
                 0
             }
-            // The virtual root's bounding set holds every capability.
-            PR_CAPBSET_READ if arg2 <= CAP_LAST_CAP => 1,
+            PR_CAPBSET_READ if arg2 <= CAP_LAST_CAP => {
+                i64::from(self.creds.caps.bounding & (1 << arg2) != 0)
+            }
             PR_CAPBSET_READ => err(errno::EINVAL),
+            PR_CAPBSET_DROP => match self.creds.caps.drop_bounding(arg2) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
+            PR_CAP_AMBIENT => match self.creds.caps.ambient_op(arg2, arg3) {
+                Ok(r) => r,
+                Err(e) => err(e),
+            },
+            PR_GET_KEEPCAPS => {
+                i64::from(self.creds.caps.securebits & crate::caps::SECBIT_KEEP_CAPS != 0)
+            }
+            PR_SET_KEEPCAPS => match self.creds.caps.set_keepcaps(arg2) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
+            PR_GET_SECUREBITS => i64::from(self.creds.caps.securebits),
+            PR_SET_SECUREBITS => match self.creds.caps.set_securebits(arg2) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
+            // Recorded: macOS gives a subreaper no orphans (see
+            // docs/architecture.md).
+            PR_SET_CHILD_SUBREAPER => {
+                SUBREAPER.store(arg2 != 0, Relaxed);
+                0
+            }
+            PR_GET_CHILD_SUBREAPER => {
+                guest!(uaccess::write(arg2, i32::from(SUBREAPER.load(Relaxed))));
+                0
+            }
             PR_SET_NO_NEW_PRIVS if arg2 == 1 => {
                 NO_NEW_PRIVS.store(true, Relaxed);
                 0
             }
             PR_SET_NO_NEW_PRIVS => err(errno::EINVAL),
             PR_GET_NO_NEW_PRIVS => i64::from(NO_NEW_PRIVS.load(Relaxed)),
+            PR_GET_SECCOMP => i64::from(crate::seccomp::mode()),
+            PR_SET_SECCOMP => self.sys_seccomp(
+                if arg2 == 1 { 0 } else { arg2 - 1 },
+                0,
+                if arg2 == 1 { 0 } else { arg3 },
+            ),
             PR_SET_DUMPABLE if arg2 <= 1 => {
                 UNDUMPABLE.store(arg2 == 0, Relaxed);
                 0
@@ -701,6 +875,259 @@ impl<P: Platform> Kernel<P> {
             }
             _ => err(errno::EINVAL),
         }
+    }
+
+    /// The data words a `capget`/`capset` header's version asks for, or
+    /// `EINVAL` after writing the version fwe prefers into the header.
+    fn cap_words(&self, hdr: u64) -> Result<(usize, i32), i64> {
+        use crate::caps::*;
+        let h: [u32; 2] = uaccess::read(hdr).map_err(err)?;
+        match h[0] {
+            VERSION_1 => Ok((1, h[1] as i32)),
+            VERSION_2 | VERSION_3 => Ok((2, h[1] as i32)),
+            _ => {
+                uaccess::write(hdr, [VERSION_3, h[1]]).map_err(err)?;
+                Err(err(errno::EINVAL))
+            }
+        }
+    }
+
+    /// `capget(hdr, data)`: the caller's capabilities (another process's
+    /// fwe does not hold: `ESRCH`).
+    fn sys_capget(&mut self, hdr: u64, data: u64) -> i64 {
+        let (words, pid) = match self.cap_words(hdr) {
+            Ok(v) => v,
+            Err(e) => return if data == 0 && e == err(errno::EINVAL) { 0 } else { e },
+        };
+        if pid != 0 && pid != thread::tgid() {
+            return err(errno::ESRCH);
+        }
+        if data == 0 {
+            return 0;
+        }
+        let c = &self.creds.caps;
+        let mut out = [0u32; 6];
+        for w in 0..words {
+            let shift = 32 * w as u64;
+            out[w * 3] = (c.effective >> shift) as u32;
+            out[w * 3 + 1] = (c.permitted >> shift) as u32;
+            out[w * 3 + 2] = (c.inheritable >> shift) as u32;
+        }
+        guest!(uaccess::write_from(data, &bytemuck_u32(&out[..words * 3])));
+        0
+    }
+
+    /// `capset(hdr, data)`: the caller's own sets only.
+    fn sys_capset(&mut self, hdr: u64, data: u64) -> i64 {
+        let (words, pid) = match self.cap_words(hdr) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if pid != 0 && pid != thread::tgid() {
+            return err(errno::EPERM);
+        }
+        let mut raw = [0u8; 24];
+        guest!(uaccess::read_into(data, &mut raw[..words * 12]));
+        let word = |i: usize| u32::from_ne_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()) as u64;
+        let (mut e, mut p, mut i) = (word(0), word(1), word(2));
+        if words == 2 {
+            e |= word(3) << 32;
+            p |= word(4) << 32;
+            i |= word(5) << 32;
+        }
+        match self.creds.caps.set(e, p, i) {
+            Ok(()) => 0,
+            Err(x) => err(x),
+        }
+    }
+
+    /// The network interface requests on a socket (`struct ifreq`: a
+    /// 16-byte name, then the value). In a network namespace of fwe's the
+    /// one interface is `lo`, index 1, up as the namespace says; in the
+    /// initial one they are the host's, with Linux's `lo` for its `lo0`.
+    fn interface_ioctl(&mut self, fd: i32, req: u64, arg: u64) -> i64 {
+        use ioctl::*;
+        let mut ifr = [0u8; 40];
+        guest!(uaccess::read_into(arg, &mut ifr));
+        let name_end = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+        let name = ifr[..name_end].to_vec();
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            // SAFETY: F_GETFD only queries the descriptor.
+            let open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+            return err(if open { errno::ENOTTY } else { errno::EBADF });
+        }
+        let put16 = |v: u16| uaccess::write(arg + 16, v);
+        let put32 = |v: i32| uaccess::write(arg + 16, v);
+        if let Some(net) = self.fs().ns.net.clone() {
+            let is_lo = name == b"lo";
+            return match req {
+                SIOCGIFNAME => {
+                    let index = u32::from_ne_bytes(ifr[16..20].try_into().unwrap());
+                    if index != 1 {
+                        return err(errno::ENODEV);
+                    }
+                    let mut out = [0u8; 16];
+                    out[..2].copy_from_slice(b"lo");
+                    guest!(uaccess::write(arg, out));
+                    0
+                }
+                _ if !is_lo => err(errno::ENODEV),
+                SIOCGIFFLAGS => {
+                    let up = net.get().lo_up;
+                    let flags = IFF_LOOPBACK | if up { IFF_UP | IFF_RUNNING } else { 0 };
+                    guest!(put16(flags));
+                    0
+                }
+                SIOCSIFFLAGS => {
+                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                        return err(errno::EPERM);
+                    }
+                    let flags = u16::from_ne_bytes(ifr[16..18].try_into().unwrap());
+                    match net.update(|n| {
+                        n.lo_up = flags & IFF_UP != 0;
+                        Ok(())
+                    }) {
+                        Ok(()) => 0,
+                        Err(e) => err(e),
+                    }
+                }
+                SIOCGIFINDEX => {
+                    guest!(put32(1));
+                    0
+                }
+                SIOCGIFMTU => {
+                    guest!(put32(65536));
+                    0
+                }
+                _ => err(errno::EINVAL),
+            };
+        }
+        // The host's interfaces, named as on Linux.
+        let host_name: Vec<u8> = if name == b"lo" { b"lo0".to_vec() } else { name.clone() };
+        let Ok(cname) = std::ffi::CString::new(host_name) else { return err(errno::ENODEV) };
+        match req {
+            SIOCGIFINDEX => {
+                // SAFETY: a NUL-terminated name.
+                let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+                if index == 0 {
+                    return err(errno::ENODEV);
+                }
+                guest!(put32(index as i32));
+                0
+            }
+            SIOCGIFNAME => {
+                let index = u32::from_ne_bytes(ifr[16..20].try_into().unwrap());
+                let mut buf = [0u8; libc::IF_NAMESIZE];
+                // SAFETY: `buf` holds IF_NAMESIZE bytes.
+                if unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) }.is_null() {
+                    return err(errno::ENODEV);
+                }
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                let shown: &[u8] = if &buf[..end] == b"lo0" { b"lo" } else { &buf[..end] };
+                let mut out = [0u8; 16];
+                out[..shown.len().min(15)].copy_from_slice(&shown[..shown.len().min(15)]);
+                guest!(uaccess::write(arg, out));
+                0
+            }
+            SIOCGIFFLAGS | SIOCGIFMTU => {
+                // macOS's `struct ifreq` has the same name and the value
+                // after it.
+                let mut h = [0u8; 32];
+                h[..cname.as_bytes().len()].copy_from_slice(cname.as_bytes());
+                let host_req = if req == SIOCGIFFLAGS { 0xc020_6911u64 } else { 0xc020_6933u64 };
+                // SAFETY: a 32-byte ifreq for the host call.
+                if unsafe { libc::ioctl(fd, host_req as libc::c_ulong, h.as_mut_ptr()) } < 0 {
+                    return host::last_error();
+                }
+                let v = u16::from_ne_bytes([h[16], h[17]]);
+                if req == SIOCGIFFLAGS {
+                    guest!(put16(v & (IFF_UP | IFF_LOOPBACK | IFF_RUNNING | 0x2 | 0x10 | 0x1000)));
+                } else {
+                    guest!(put32(i32::from_ne_bytes(h[16..20].try_into().unwrap())));
+                }
+                0
+            }
+            // The host's interfaces are not the guest's to change.
+            _ => err(errno::EPERM),
+        }
+    }
+
+    /// A call the seccomp filters refused with `action` (not `Allow`): its
+    /// errno, a `SIGSYS`, or the end of the thread or process.
+    pub fn seccomp_refuse(
+        &mut self,
+        regs: &mut crate::Regs,
+        nr: u64,
+        args: &[u64; 6],
+        action: crate::seccomp::Action,
+    ) {
+        use crate::seccomp::Action;
+        match action {
+            Action::Allow => self.enter_syscall(regs),
+            Action::Errno(e) => self.finish_syscall(regs, nr, args, err(e)),
+            Action::Trap(data) => {
+                crate::signal::raise_sigsys(regs.pc, nr, data);
+                // The call is not made; a handler may set what it returns.
+                let x0 = regs.x[0] as i64;
+                self.finish_syscall(regs, nr, args, x0);
+            }
+            // The backends end a thread of several before taking the
+            // kernel lock; the last one takes the process with it.
+            Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
+        }
+    }
+
+    /// `seccomp(op, flags, args)`.
+    fn sys_seccomp(&mut self, op: u64, flags: u64, args: u64) -> i64 {
+        use crate::seccomp::*;
+        let allowed = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
+            || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+        let r = match op {
+            SET_MODE_STRICT if flags != 0 || args != 0 => Err(errno::EINVAL),
+            SET_MODE_STRICT => set_strict(),
+            SET_MODE_FILTER => install_filter(args, flags, allowed),
+            GET_ACTION_AVAIL if flags != 0 => Err(errno::EINVAL),
+            GET_ACTION_AVAIL => uaccess::read::<u32>(args).and_then(action_available),
+            GET_NOTIF_SIZES if flags != 0 => Err(errno::EINVAL),
+            // struct seccomp_notif_sizes: seccomp_notif, seccomp_notif_resp
+            // and seccomp_data.
+            GET_NOTIF_SIZES => uaccess::write(args, [80u16, 24, 64]).map(|()| 0),
+            _ => Err(errno::EINVAL),
+        };
+        match r {
+            Ok(v) => v,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `/proc/self/status`: the host's view of the process with the
+    /// kernel's own of its credentials, capabilities and restrictions.
+    pub(crate) fn self_status(&self) -> Vec<u8> {
+        // SAFETY: getpid cannot fail.
+        let host = unsafe { libc::getpid() };
+        let comm = thread::name()
+            .map(|n| n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())].to_vec())
+            .unwrap_or_else(|| {
+                let exe = self.fs().exe();
+                exe.rsplit(|&b| b == b'/').next().unwrap_or(exe).iter().take(15).copied().collect()
+            });
+        let h = crate::procpid::host_info(host).unwrap_or_default();
+        let c = &self.creds;
+        let u = |id| crate::userns::to_ns(id, false);
+        let g = |id| crate::userns::to_ns(id, true);
+        let creds = crate::procpid::Creds {
+            uids: [u(c.uid), u(c.euid), u(c.suid), u(c.fsuid)],
+            gids: [g(c.gid), g(c.egid), g(c.sgid), g(c.fsgid)],
+            groups: c.groups.iter().map(|&x| g(x)).collect(),
+            caps: Some(c.caps),
+            no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
+            seccomp: crate::seccomp::mode(),
+            umask: self.fs().umask(),
+        };
+        crate::procpid::status(thread::tgid(), &comm, &h, &creds)
     }
 
     /// `sysinfo`: the host's uptime and load, and the memory `/proc/meminfo`
@@ -727,23 +1154,51 @@ impl<P: Platform> Kernel<P> {
         if id != 0 && id != thread::tgid() && thread::host_thread(id).is_none() {
             return err(errno::ESRCH);
         }
-        // SAFETY: plain host call.
-        let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64;
-        let size = cpus.div_ceil(64) * 8;
+        let online = online_cpus();
+        let size = online.len() as u64 * 8;
         if len < size || len % 8 != 0 {
             return err(errno::EINVAL);
         }
-        for word in 0..size / 8 {
-            let bits = (cpus - word * 64).min(64);
-            let value = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            guest!(uaccess::write(mask + word * 8, value));
+        let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(online);
+        for (word, value) in set.iter().enumerate() {
+            guest!(uaccess::write(mask + word as u64 * 8, *value));
         }
         size as i64
     }
 
+    /// `sched_setaffinity(pid, len, mask)`: checked as Linux checks it (the
+    /// mask must name an online CPU) and remembered for the caller, which
+    /// `sched_getaffinity` then reports. The host has no affinity to set:
+    /// threads still run on any CPU, and another process's is not kept.
+    fn sys_sched_setaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
+        let online = online_cpus();
+        let mut want = vec![0u64; online.len()];
+        let take = (len as usize).min(want.len() * 8);
+        let mut bytes = vec![0u8; take];
+        guest!(uaccess::read_into(mask, &mut bytes));
+        for (i, b) in bytes.iter().enumerate() {
+            want[i / 8] |= u64::from(*b) << (8 * (i % 8));
+        }
+        for (w, o) in want.iter_mut().zip(&online) {
+            *w &= o;
+        }
+        if want.iter().all(|&w| w == 0) {
+            return err(errno::EINVAL);
+        }
+        let id = pid as i32;
+        if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
+            *AFFINITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
+            return 0;
+        }
+        match crate::pidns::host_arg(id) {
+            // SAFETY: a signal 0 only checks that the process exists.
+            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => 0,
+            _ => err(errno::ESRCH),
+        }
+    }
+
     fn sys_prlimit(&mut self, pid: u64, res: u64, new: u64, old: u64) -> i64 {
-        // SAFETY: plain host call.
-        if pid != 0 && pid as i32 != unsafe { libc::getpid() } {
+        if pid != 0 && pid as i32 != thread::tgid() {
             return err(errno::ESRCH);
         }
         if res >= resource::RLIM_NLIMITS {
@@ -1019,6 +1474,46 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     // SAFETY: `struct pollfd` and the POLL* bits match the host's; the host
     // validates the guest array.
     ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) })
+}
+
+/// `u32` words as their native-endian bytes.
+fn bytemuck_u32(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_ne_bytes()).collect()
+}
+
+/// `PR_SET_NO_NEW_PRIVS`: fwe grants no privileges an exec could raise, so
+/// it only has to be remembered (and shown), as it is kept across `execve`.
+pub(crate) static NO_NEW_PRIVS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The affinity `sched_setaffinity` set for this process, if it did.
+static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
+
+/// The online CPUs, as a mask of 64-bit words.
+fn online_cpus() -> Vec<u64> {
+    // SAFETY: plain host call.
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64;
+    (0..cpus.div_ceil(64))
+        .map(|word| {
+            let bits = (cpus - word * 64).min(64);
+            if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 }
+        })
+        .collect()
+}
+
+/// An id the process holds (the initial namespace's) as it sees it.
+fn uid_out(id: u32, gid: bool) -> i64 {
+    i64::from(crate::userns::to_ns(id, gid))
+}
+
+/// An id argument (in the process's user namespace) as the initial
+/// namespace's, `-1` (leave alone) kept: `EINVAL` for one with no mapping.
+fn uid_in(arg: u64, gid: bool) -> Result<u32, i32> {
+    let id = arg as u32;
+    if id == u32::MAX {
+        return Ok(id);
+    }
+    crate::userns::from_ns(id, gid).ok_or(errno::EINVAL)
 }
 
 #[cfg(test)]

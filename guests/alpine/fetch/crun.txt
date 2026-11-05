@@ -1,0 +1,10 @@
+# Alpine Linux 3.20 aarch64 files the crun test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs (the root filesystem
+# of the standard `alpine` image), crun and its libraries. Each line is a
+# path under that URL and the file's SHA-256. 3.20 is past its end of life,
+# so these files no longer change.
+v3.20/releases/aarch64/alpine-minirootfs-3.20.10-aarch64.tar.gz 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+v3.20/community/aarch64/crun-1.17-r0.apk f18a1b72e250fab6f390aba8946efb3722aa46064c9f43bb6b4ed2ec272059bf
+v3.20/main/aarch64/libcap2-2.78-r0.apk 80cfbaffa9b278a4a4cbb0ebe0290232925dcaa9d6b45673b2b1cd6c6d92b200
+v3.20/main/aarch64/libseccomp-2.5.5-r1.apk 8ccd1bd0dbe018a5b4f07ee9c2ffb4fe2805ecfe22e004dd301870d47e14618b
+v3.20/main/aarch64/yajl-2.1.0-r9.apk 1a6ec6ae73d7f5452eb3d779795c90d65b1f5de0aa6ab83ad1d4d8cc849fe2ed

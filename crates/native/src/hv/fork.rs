@@ -370,8 +370,14 @@ pub(super) fn fork(
     vfork: bool,
 ) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
-    let guard = backend::kernel();
-    let Some(k) = guard.as_ref() else { return err(errno::EAGAIN) };
+    let mut guard = backend::kernel();
+    let Some(k) = guard.as_mut() else { return err(errno::EAGAIN) };
+    // The child's namespaces, which its snapshot carries.
+    let token = match k.fork_begin(flags) {
+        Ok(t) => t,
+        Err(e) => return err(e),
+    };
+    let number = Kernel::<HvPlatform>::fork_number(&token);
     // The child writes one byte here once it is ready to run; its end is
     // close-on-exec there, so a vfork parent also sees it close on exec. It
     // is made and the parent's write end closed under the kernel lock, so
@@ -425,6 +431,7 @@ pub(super) fn fork(
         e.u64(flags);
         e.u64(child_stack);
         e.u64(child_tid);
+        e.i32(number);
         e.bool(vfork);
         e.i32(word[1]);
         e.i32(sv[1]);
@@ -464,6 +471,7 @@ pub(super) fn fork(
     unsafe { libc::close(sv[1]) };
     // SAFETY: the child holds its own copy of the write end.
     unsafe { libc::close(word[1]) };
+    let shown = k.fork_parent(token, *spawned.as_ref().unwrap_or(&-1));
     drop(guard);
     let pid = match spawned {
         Ok(pid) => pid,
@@ -499,9 +507,10 @@ pub(super) fn fork(
         return err(errno::EAGAIN);
     }
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-        let _ = uaccess::write(parent_tid, pid);
+        let _ = uaccess::write(parent_tid, shown);
     }
-    pid as i64
+    let _ = pid;
+    shown as i64
 }
 
 fn note(msg: &str) {
@@ -762,6 +771,7 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let flags = d.u64();
     let child_stack = d.u64();
     let child_tid = d.u64();
+    let number = d.i32();
     let vfork = d.bool();
     let word = d.i32();
     let sock = d.i32();
@@ -774,8 +784,11 @@ fn become_child() -> Result<std::convert::Infallible, String> {
 
     // The process becomes a VM process: from here every way out tears the
     // VM down first.
-    thread::init_main(host::getpid() as i32);
+    thread::init_main(if number > 0 { number } else { host::getpid() as i32 });
     let k = Kernel::restore_for_fork(HvPlatform, &mut d);
+    if let Some(fs) = k.fs.as_ref() {
+        fwe_kernel::pidns::adopt(&fs.ns, number);
+    }
     d.finish()?;
     backend::become_vm_process()?;
     m.rebuild(vfork)?;

@@ -40,6 +40,7 @@ impl Platform for HvPlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        fwe_kernel::procreg::exiting();
         mem::finish_lazy();
         teardown();
         record::Line::new().s("exit ").dec(code as u32 as u64).emit();
@@ -52,6 +53,7 @@ impl Platform for HvPlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        fwe_kernel::procreg::exiting();
         mem::finish_lazy();
         teardown();
         record::Line::new().s("dies of host signal ").dec(sig as u64).emit();
@@ -302,6 +304,7 @@ pub(super) fn teardown() {
 fn exit_thread(code: i32) -> ! {
     use std::sync::atomic::Ordering::SeqCst;
     if crate::LIVE_THREADS.fetch_sub(1, SeqCst) == 1 {
+        fwe_kernel::procreg::exiting();
         mem::finish_lazy();
         teardown();
         record::Line::new().s("exit ").dec(code as u32 as u64).emit();
@@ -688,11 +691,13 @@ fn start(
         ));
     }
 
-    fs.set_proc_info(crate::guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
+    let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options));
+    fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
     fs.publish();
-    thread::init_main(host::getpid() as i32);
+    thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
+    fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
-    crate::apply_exec_state(&mut k, options)?;
+    crate::apply_exec_state(&mut k, options, path)?;
     k.set_sigreturn_trampoline(tramp);
     k.adopt_host_signals();
     thread::set_mask(inherited_mask);
@@ -1350,6 +1355,20 @@ fn host_buffer(n: u64, i: usize, a: &[u64; 6]) -> Option<(u64, bool)> {
 fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    // The process's seccomp filters decide first, for every call.
+    if fwe_kernel::seccomp::mode() != 0 {
+        let action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        if action == fwe_kernel::seccomp::Action::KillThread && thread::live_threads() > 1 {
+            // The thread ends without the kernel lock, as `exit` does.
+            let _ = vcpu;
+            fwe_kernel::thread_exit_cleanup();
+            exit_thread(128 + fwe_abi::signal::SIGSYS as i32)
+        }
+        if action != fwe_kernel::seccomp::Action::Allow {
+            kernel().as_mut().unwrap().seccomp_refuse(regs, n, &args, action);
+            return;
+        }
+    }
     // The kernel and the host see host addresses for guest pointers.
     let mask = match n {
         nr::FUTEX => uaccess::futex_pointer_args(args[1]),

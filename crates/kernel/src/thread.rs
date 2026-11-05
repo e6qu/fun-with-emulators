@@ -68,8 +68,17 @@ pub fn tgid() -> i32 {
     TGID.load(Ordering::SeqCst)
 }
 
-/// Allocate a fresh thread id for a new thread.
+/// Allocate a fresh thread id for a new thread: in a pid namespace of
+/// fwe's, a number from it (threads and processes share the numbers).
 pub fn alloc_tid() -> i32 {
+    if crate::pidns::nested() {
+        // SAFETY: getpid cannot fail.
+        let host = unsafe { libc::getpid() };
+        if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
+            crate::pidns::remember_thread(nums[0], nums.clone());
+            return nums[0];
+        }
+    }
     NEXT_TID.fetch_add(1, Ordering::SeqCst)
 }
 
@@ -195,6 +204,11 @@ struct Registered {
 
 /// Every live guest thread's pending set, by tid.
 static THREADS: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
+
+/// How many guest threads the process has.
+pub fn live_threads() -> usize {
+    THREADS.lock().unwrap_or_else(|e| e.into_inner()).len().max(1)
+}
 
 const UNBLOCKABLE: u64 = (1 << (signal::SIGKILL - 1)) | (1 << (signal::SIGSTOP - 1));
 

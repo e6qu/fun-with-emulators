@@ -184,7 +184,17 @@ pub mod prctl {
     pub const PR_SET_DUMPABLE: u64 = 4;
     pub const PR_SET_NAME: u64 = 15;
     pub const PR_GET_NAME: u64 = 16;
+    pub const PR_GET_KEEPCAPS: u64 = 7;
+    pub const PR_SET_KEEPCAPS: u64 = 8;
+    pub const PR_GET_SECCOMP: u64 = 21;
+    pub const PR_SET_SECCOMP: u64 = 22;
     pub const PR_CAPBSET_READ: u64 = 23;
+    pub const PR_CAPBSET_DROP: u64 = 24;
+    pub const PR_GET_SECUREBITS: u64 = 27;
+    pub const PR_SET_SECUREBITS: u64 = 28;
+    pub const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    pub const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    pub const PR_CAP_AMBIENT: u64 = 47;
     pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
     pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
     /// Reset pointer-authentication keys (arm64): which, a mask of
@@ -237,6 +247,16 @@ pub mod fcntl {
     pub const F_OFD_SETLK: u64 = 37;
     pub const F_OFD_SETLKW: u64 = 38;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+    pub const F_ADD_SEALS: u64 = 1033;
+    pub const F_GET_SEALS: u64 = 1034;
+
+    /// File seals (`F_ADD_SEALS`).
+    pub const F_SEAL_SEAL: u32 = 0x1;
+    pub const F_SEAL_SHRINK: u32 = 0x2;
+    pub const F_SEAL_GROW: u32 = 0x4;
+    pub const F_SEAL_WRITE: u32 = 0x8;
+    pub const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+    pub const F_SEAL_EXEC: u32 = 0x20;
 
     /// `struct flock` lock types.
     pub const F_RDLCK: i16 = 0;
@@ -438,6 +458,16 @@ pub mod ioctl {
     pub const FIONBIO: u64 = 0x5421;
     pub const FIOCLEX: u64 = 0x5451;
     pub const FIONCLEX: u64 = 0x5450;
+    /// Network interface requests on a socket (`struct ifreq`).
+    pub const SIOCGIFNAME: u64 = 0x8910;
+    pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const SIOCGIFMTU: u64 = 0x8921;
+    pub const SIOCGIFINDEX: u64 = 0x8933;
+    /// `IFF_*` interface flags.
+    pub const IFF_UP: u16 = 0x1;
+    pub const IFF_LOOPBACK: u16 = 0x8;
+    pub const IFF_RUNNING: u16 = 0x40;
 }
 
 /// `struct termios` fields (Linux asm-generic, arm64). The guest layout is
@@ -610,7 +640,24 @@ pub mod clone {
     pub const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
     pub const CLONE_DETACHED: u64 = 0x0040_0000;
+    pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
     pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+    pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+    pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+    pub const CLONE_NEWPID: u64 = 0x2000_0000;
+    pub const CLONE_NEWNET: u64 = 0x4000_0000;
+    pub const CLONE_IO: u64 = 0x8000_0000;
+    /// `unshare` and `setns` only.
+    pub const CLONE_NEWTIME: u64 = 0x0000_0080;
+    /// Every namespace a `clone` or `unshare` can make.
+    pub const CLONE_NEW_ANY: u64 = CLONE_NEWNS
+        | CLONE_NEWCGROUP
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_NEWNET;
     pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
     pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
     /// The size of the first `struct clone_args` (`CLONE_ARGS_SIZE_VER0`).
@@ -856,6 +903,17 @@ pub struct Statfs {
     pub f_spare: [i64; 4],
 }
 
+/// `memfd_create` flags.
+pub mod memfd {
+    pub const MFD_CLOEXEC: u64 = 0x1;
+    pub const MFD_ALLOW_SEALING: u64 = 0x2;
+    pub const MFD_HUGETLB: u64 = 0x4;
+    pub const MFD_NOEXEC_SEAL: u64 = 0x8;
+    pub const MFD_EXEC: u64 = 0x10;
+    /// The longest name, without the `memfd:` prefix Linux adds.
+    pub const NAME_MAX: usize = 249;
+}
+
 /// `fallocate` modes.
 pub mod falloc {
     pub const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
@@ -868,6 +926,11 @@ pub mod statfs {
     pub const EXT4_SUPER_MAGIC: i64 = 0xef53;
     pub const ST_RDONLY: i64 = 1;
     pub const ST_NOSUID: i64 = 2;
+    pub const ST_NODEV: i64 = 4;
+    pub const ST_NOEXEC: i64 = 8;
+    pub const ST_NOATIME: i64 = 1024;
+    pub const ST_NODIRATIME: i64 = 2048;
+    pub const ST_RELATIME: i64 = 4096;
     /// `msync` flags.
     pub const MS_ASYNC: u64 = 1;
     pub const MS_INVALIDATE: u64 = 2;

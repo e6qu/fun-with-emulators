@@ -25,6 +25,7 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// since `pthread_exit` does not return and would never release it.
 pub(crate) fn exit_current_thread(code: i32) -> ! {
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        fwe_kernel::procreg::exiting();
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
@@ -90,6 +91,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        fwe_kernel::procreg::exiting();
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
@@ -99,6 +101,7 @@ impl Platform for NativePlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        fwe_kernel::procreg::exiting();
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
@@ -139,6 +142,9 @@ pub struct Options {
     /// What the guest that exec'd this program carries into it
     /// ([`fwe_kernel::Kernel::exec_state`]), hex-encoded.
     pub exec_state: Option<Vec<u8>>,
+    /// A descriptor fwe was handed the program on, for a program with no
+    /// path (a memfd) that a guest `execve` ran.
+    pub exe_fd: Option<i32>,
 }
 
 /// Hex-encode `bytes`.
@@ -155,14 +161,27 @@ fn unhex(text: &[u8]) -> Option<Vec<u8>> {
     text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
 }
 
-/// Apply [`Options::exec_state`] to a new kernel.
+/// Apply [`Options::exec_state`] to a new kernel. A program fwe was handed
+/// by descriptor (`--exe-fd`), run as `/dev/fd/N`, came through the mount
+/// the guest's descriptor `N` was opened in.
 fn apply_exec_state<P: fwe_kernel::Platform>(
     k: &mut Kernel<P>,
     options: &Options,
+    path: &Path,
 ) -> Result<(), Error> {
     let Some(text) = &options.exec_state else { return Ok(()) };
     let state = unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?;
-    k.restore_exec_state(&state).map_err(Error::Unsupported)
+    k.restore_exec_state(&state).map_err(Error::Unsupported)?;
+    let n = path
+        .as_os_str()
+        .as_bytes()
+        .strip_prefix(b"/dev/fd/")
+        .and_then(|n| std::str::from_utf8(n).ok()?.parse().ok());
+    if let (Some(held), Some(n)) = (options.exe_fd, n) {
+        fwe_kernel::fdmarks::duplicated(n, held);
+    }
+    fwe_kernel::fdmarks::forget_closed();
+    Ok(())
 }
 
 /// Open the guest's root filesystem with its working directory.
@@ -171,6 +190,18 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
     let mut fs = fwe_kernel::Fs::new(root_bytes.as_deref()).map_err(|e| {
         Error::Unsupported(format!("opening the root filesystem failed: errno {e}"))
     })?;
+    if let Some(text) = &options.exec_state {
+        // The mount namespace and root the program is found in.
+        let state =
+            unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?;
+        fs.adopt_exec_view(&state).map_err(Error::Unsupported)?;
+    }
+    if let Some(fd) = options.exe_fd {
+        // fwe's own from here on, out of the guest's reach.
+        // SAFETY: plain host call on the descriptor fwe was handed.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        fs.set_exe_fd(Some(fd));
+    }
     if let Some(cwd) = &options.cwd {
         fs.chdir(fwe_abi::fcntl::AT_FDCWD as i32, cwd).map_err(|e| {
             Error::Unsupported(format!("entering {}: errno {e}", String::from_utf8_lossy(cwd)))
@@ -181,7 +212,9 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
 
 /// The program's bytes: a host path, or a guest path in the rootfs.
 fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<Vec<u8>, Error> {
-    if options.guest_path {
+    if options.exe_fd.is_some() {
+        fs.read(b"/proc/self/exe").map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+    } else if options.guest_path {
         fs.read(path.as_os_str().as_bytes())
             .map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
     } else {
@@ -244,7 +277,8 @@ pub fn remember_exe() {
 /// keeps across its own: the pid, descriptors not marked close-on-exec (the
 /// guest's flag is the host's), the signal mask, pending signals and ignored
 /// dispositions; the root filesystem, working directory, `--strace`,
-/// `--hv-standin` and `--hv-record` are passed on. Other threads end, as on Linux. Returns a Linux errno only if
+/// `--hv-standin` and `--hv-record` are passed on, and a program with no
+/// path (a memfd) by descriptor (`--exe-fd`). Other threads end, as on Linux. Returns a Linux errno only if
 /// the program cannot be run; on success it does not return.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reexec(
@@ -286,12 +320,31 @@ pub(crate) fn reexec(
         argv.push(b"--argv0".to_vec());
         argv.push(a0.clone());
     }
+    // A program with no path goes by descriptor: one of fwe's, kept open
+    // across the host `execve`.
+    let held = match fs.exec_fd(path).map(fwe_kernel::fdtable::dup_reserved) {
+        Some(Ok(held)) => {
+            // SAFETY: plain host call on fwe's own descriptor; it must
+            // survive the host `execve` (the new fwe takes it over).
+            unsafe { libc::fcntl(held, libc::F_SETFD, 0) };
+            argv.push(b"--exe-fd".to_vec());
+            argv.push(held.to_string().into_bytes());
+            Some(held)
+        }
+        Some(Err(e)) => return err(e),
+        None => None,
+    };
+    // SAFETY: closing fwe's own descriptor, when the exec did not happen.
+    let release = || held.map(|fd| unsafe { libc::close(fd) });
     argv.push(b"--".to_vec());
     argv.push(path.to_vec());
     argv.extend(args.iter().skip(1).cloned());
     let cargs: Result<Vec<CString>, _> = argv.into_iter().map(CString::new).collect();
     let cenv: Result<Vec<CString>, _> = env.iter().cloned().map(CString::new).collect();
-    let (Ok(cargs), Ok(cenv)) = (cargs, cenv) else { return err(errno::EINVAL) };
+    let (Ok(cargs), Ok(cenv)) = (cargs, cenv) else {
+        release();
+        return err(errno::EINVAL);
+    };
     let mut pargs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
     pargs.push(std::ptr::null());
     let mut penv: Vec<*const libc::c_char> = cenv.iter().map(|c| c.as_ptr()).collect();
@@ -301,7 +354,9 @@ pub(crate) fn reexec(
     // SAFETY: NUL-terminated argument and environment arrays of C strings
     // that live across the call.
     unsafe { libc::execve(pargs[0], pargs.as_ptr(), penv.as_ptr()) };
-    fwe_kernel::host::last_error()
+    let e = fwe_kernel::host::last_error();
+    release();
+    e
 }
 
 /// Die of `SIGKILL` on the relayed form of a guest's `SIGKILL`
@@ -852,6 +907,11 @@ fn start(
     }
     // fwe's own descriptors go above the guest's range from here on.
     fwe_kernel::fdtable::init();
+    if options.exec_state.is_none() {
+        // A fresh start: what earlier runs left behind and no process holds
+        // goes (see `fwe_kernel::shared::collect`).
+        fwe_kernel::shared::collect();
+    }
     let args = &guest_args(args, options);
     let data = read_program(path, options, &open_fs(options)?)?;
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
@@ -885,19 +945,22 @@ fn start(
         page,
         options.strace,
     )?;
-    fs.set_proc_info(guest_exe_path(path, options), cmdline(&arg_bytes), ncpu(), hostname());
+    let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
+    fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
     fs.publish();
 
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
 
-    // The main thread's id equals the process id, as on Linux.
-    fwe_kernel::thread::init_main(fwe_kernel::host::getpid() as i32);
+    // The main thread's id equals the process id, as on Linux: in its pid
+    // namespace, for a process exec'd in one.
+    fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
+    fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
 
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
-    apply_exec_state(&mut kernel, options)?;
+    apply_exec_state(&mut kernel, options, path)?;
     *KERNEL.lock().unwrap() = Some(kernel);
     enter(out.sp, out.entry)
 }

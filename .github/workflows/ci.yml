@@ -38,12 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      # The Debian packages the target-program tests fetch
-      # (guests/debian/fetch), so each runner downloads them once.
+      # The Debian and Alpine packages the target-program tests fetch
+      # (guests/*/fetch), so each runner downloads them once.
       - uses: actions/cache@v4
         with:
-          path: target/debian-packages
-          key: debian-packages-${{ hashFiles('guests/debian/fetch/*.txt') }}
+          path: target/fetched-packages
+          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: sw_vers && uname -m && clang --version
       # The VM backend's tests run on the software stand-in for
       # Hypervisor.framework here, which needs Unicorn.

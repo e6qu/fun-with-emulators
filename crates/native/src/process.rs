@@ -77,6 +77,16 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     }
     // The old image is untouched on failure, so the guest can handle it.
     crate::check_image(&file, fs).map_err(err)?;
+    // A program with no path (a memfd) is held, for `/proc/self/exe`: the
+    // descriptor it was run through may close on exec.
+    let exe_fd = match fs.exec_fd(&path) {
+        Some(fd) => {
+            let held = fwe_kernel::fdtable::dup_reserved(fd).map_err(err)?;
+            fwe_kernel::fdmarks::duplicated(fd, held);
+            Some(held)
+        }
+        None => None,
+    };
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env_refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
     // The point of no return: the old program's memory goes, and a vfork
@@ -101,7 +111,9 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     k.exec_reset();
     k.brk = out.brk;
     if let Some(fs) = k.fs.as_mut() {
-        fs.set_proc_info(path.clone(), crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+        fs.set_exe_fd(exe_fd);
+        let exe = fs.exe_fd_target().unwrap_or_else(|| path.clone());
+        fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
         fs.publish();
     }
     // The new program starts with every register zero, as Linux leaves it;
@@ -164,8 +176,20 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
         };
     }
 
-    let (pid, kqueues) = {
-        let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let (pid, kqueues, shown) = {
+        let mut kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        let k = kernel.as_mut().unwrap();
+        // The child's namespaces, which it inherits from this view.
+        let token = match k.fork_begin(flags) {
+            Ok(t) => t,
+            Err(e) => {
+                for fd in done.into_iter().filter(|&fd| fd >= 0) {
+                    // SAFETY: closing the pipe opened above.
+                    unsafe { libc::close(fd) };
+                }
+                return fwe_abi::err(e);
+            }
+        };
         let kqueues = fwe_kernel::kqueue_state();
         // A vfork child shares the guest's memory: its private parts are
         // shared for the fork, then copied again by any later one (in either
@@ -186,10 +210,14 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
             set_shared(false);
             pid
         });
-        (pid, kqueues)
+        let e = fwe_kernel::host::last_error();
+        // The child's pid: in the child, its own namespace's; in the
+        // parent, as the parent sees it.
+        let shown = if pid == 0 { k.fork_child(token) } else { k.fork_parent(token, pid) };
+        (if pid < 0 { e } else { pid as i64 }, kqueues, shown)
     };
     if pid < 0 {
-        let e = fwe_kernel::host::last_error();
+        let e = pid;
         for fd in done.into_iter().filter(|&fd| fd >= 0) {
             // SAFETY: closing the pipe opened above.
             unsafe { libc::close(fd) };
@@ -214,7 +242,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
         } else {
             VFORK_DONE.store(-1, Ordering::SeqCst);
         }
-        thread::init_main(host::getpid() as i32);
+        thread::init_main(shown);
         fwe_kernel::restore_kqueues(&kqueues);
         LIVE_THREADS.store(1, Ordering::SeqCst);
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
@@ -236,7 +264,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
     }
     // Parent: the child's pid.
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-        let _ = fwe_kernel::uaccess::write(parent_tid, pid);
+        let _ = fwe_kernel::uaccess::write(parent_tid, shown);
     }
     if vfork {
         // SAFETY: plain host calls on the pipe opened above.
@@ -249,7 +277,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
             libc::close(done[0]);
         }
     }
-    pid as i64
+    shown as i64
 }
 
 /// Run `fork` with every asynchronous signal blocked on this thread. The parent
@@ -298,7 +326,18 @@ fn linux_wstatus(status: libc::c_int) -> i32 {
 /// `wait4(pid, wstatus, options, rusage)`: reap a child. Blocks, so it runs
 /// without the kernel lock.
 pub fn do_wait4(regs: &Regs) -> i64 {
-    let pid = regs.x[0] as i32;
+    // The child or group in the guest's pid namespace, as the host's.
+    let pid = match regs.x[0] as i32 {
+        p if p > 0 => match fwe_kernel::pidns::host_arg(p) {
+            Ok(h) => h,
+            Err(_) => return err(errno::ECHILD),
+        },
+        p if p < -1 => match fwe_kernel::pidns::host_arg(-p) {
+            Ok(h) => -h,
+            Err(_) => return err(errno::ECHILD),
+        },
+        p => p,
+    };
     let wstatus = regs.x[1];
     let options = regs.x[2];
     let rusage = regs.x[3];
@@ -330,7 +369,12 @@ pub fn do_wait4(regs: &Regs) -> i64 {
     if r > 0 && host::write_rusage(rusage, &usage).is_err() {
         return err(errno::EFAULT);
     }
-    r as i64
+    let guest = fwe_kernel::pidns::guest_ret(r as i64);
+    if r > 0 && !libc::WIFSTOPPED(status) && !libc::WIFCONTINUED(status) {
+        // Reaped: its numbers are free again.
+        fwe_kernel::pidns::reaped(r);
+    }
+    guest
 }
 
 /// `waitid(idtype, id, infop, options, rusage)`: wait for a child state
@@ -343,10 +387,16 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         (regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4]);
     let (idtype, id) = match idtype {
         w::P_ALL => (libc::P_ALL, 0),
-        w::P_PID => (libc::P_PID, id as libc::id_t),
+        w::P_PID => match fwe_kernel::pidns::host_arg(id as i32) {
+            Ok(h) => (libc::P_PID, h as libc::id_t),
+            Err(_) => return err(errno::ECHILD),
+        },
         // SAFETY: plain host call.
         w::P_PGID if id == 0 => (libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t),
-        w::P_PGID => (libc::P_PGID, id as libc::id_t),
+        w::P_PGID => match fwe_kernel::pidns::host_arg(id as i32) {
+            Ok(h) => (libc::P_PGID, h as libc::id_t),
+            Err(_) => return err(errno::ECHILD),
+        },
         _ => return err(errno::EINVAL),
     };
     if options & (w::WEXITED | w::WSTOPPED | w::WCONTINUED) == 0 {
@@ -384,7 +434,12 @@ pub fn do_waitid(regs: &Regs) -> i64 {
             };
             words[0] = fwe_abi::signal::SIGCHLD as i32; // si_signo
             words[2] = code; // si_code
-            words[4] = pid; // si_pid
+            words[4] = fwe_kernel::pidns::guest_ret(pid as i64) as i32; // si_pid
+            if options & w::WNOWAIT == 0
+                && matches!(code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
+            {
+                fwe_kernel::pidns::reaped(pid);
+            }
             words[5] = uid as i32; // si_uid
             words[6] = status; // si_status
         }

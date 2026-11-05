@@ -10,18 +10,34 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod bpf;
+pub mod caps;
+pub mod cgroupfs;
 pub mod cloneargs;
 pub mod creds;
+pub mod devnodes;
 pub mod epoll;
+pub mod fdmarks;
 pub mod fdtable;
 pub mod fs;
 mod fsops;
 pub mod futex;
 pub mod host;
+pub mod memfd;
 pub mod mm;
+mod mountops;
+pub mod mounts;
 pub mod net;
+pub mod netns;
+pub mod ns;
+pub mod nsops;
+pub mod pidns;
 pub mod procfs;
+pub mod procpid;
+pub mod procreg;
 pub mod pty;
+pub mod seccomp;
+pub mod shared;
 pub mod signal;
 pub mod signalfd;
 pub mod snapshot;
@@ -32,6 +48,7 @@ pub mod term;
 pub mod thread;
 mod trace;
 pub mod uaccess;
+pub mod userns;
 pub mod vmas;
 
 pub use cloneargs::CloneArgs;
@@ -237,6 +254,9 @@ impl<P: Platform> Kernel<P> {
         e.u64(self.brk.limit);
         e.bool(self.tracer.enabled);
         e.bool(self.tracer.failures_only);
+        fdmarks::save(e);
+        seccomp::save(e);
+        e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -252,6 +272,7 @@ impl<P: Platform> Kernel<P> {
         for &g in &c.groups {
             e.u32(g);
         }
+        c.caps.encode(e);
         for a in &self.sigactions {
             for v in [a.handler, a.flags, a.restorer, a.mask] {
                 e.u64(v);
@@ -287,6 +308,9 @@ impl<P: Platform> Kernel<P> {
         let page_size = d.u64();
         let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
+        fdmarks::load(d);
+        seccomp::load_state(d);
+        syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
@@ -304,6 +328,7 @@ impl<P: Platform> Kernel<P> {
         }
         let n = d.count(4);
         c.groups = (0..n).map(|_| d.u32()).collect();
+        c.caps = caps::Caps::decode(d);
         for a in &mut k.sigactions {
             *a = Sigaction { handler: d.u64(), flags: d.u64(), restorer: d.u64(), mask: d.u64() };
         }
@@ -377,13 +402,16 @@ impl<P: Platform> Kernel<P> {
         // them (no set-user-ID programs here).
         self.creds.suid = self.creds.euid;
         self.creds.sgid = self.creds.egid;
+        let (uid, euid) = (self.creds.uid, self.creds.euid);
+        self.creds.caps.on_exec(uid, euid);
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
     /// itself if absolute, else relative to `dirfd` (or the working
     /// directory for `AT_FDCWD`); with `AT_EMPTY_PATH` and an empty `path`,
-    /// the file `dirfd` is open on. `AT_SYMLINK_NOFOLLOW` refuses a final
-    /// symbolic link with `ELOOP`. Fails with a Linux errno.
+    /// the file `dirfd` is open on (`/dev/fd/N`, as Linux names it, for a
+    /// file with no path, such as a memfd). `AT_SYMLINK_NOFOLLOW` refuses a
+    /// final symbolic link with `ELOOP`. Fails with a Linux errno.
     pub fn execveat_path(&self, dirfd: i32, path: &[u8], flags: u64) -> Result<Vec<u8>, i32> {
         use fwe_abi::{errno, fcntl};
         if flags & !(fcntl::AT_EMPTY_PATH | fcntl::AT_SYMLINK_NOFOLLOW) != 0 {
@@ -404,7 +432,13 @@ impl<P: Platform> Kernel<P> {
             if flags & fcntl::AT_EMPTY_PATH == 0 {
                 return Err(errno::ENOENT);
             }
-            if at_cwd { fs.cwd().to_vec() } else { fd_path(dirfd)? }
+            if at_cwd {
+                fs.cwd().to_vec()
+            } else {
+                // Run through the descriptor, under the name Linux gives it.
+                fd_path(dirfd)?;
+                format!("/dev/fd/{dirfd}").into_bytes()
+            }
         } else if path.first() == Some(&b'/') {
             path.to_vec()
         } else {
@@ -432,11 +466,20 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// What an `execve` that re-executes fwe carries into the new process
-    /// beyond what the host keeps: the credentials, the descriptor limit and
+    /// beyond what the host keeps: the mount namespace and root (first, so
+    /// that the new process finds its program in them, see
+    /// [`Fs::adopt_exec_view`]), the credentials, the descriptor limit and
     /// the umask (see [`Kernel::restore_exec_state`]).
     pub fn exec_state(&self) -> Vec<u8> {
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
+        match self.fs.as_ref() {
+            Some(fs) => {
+                e.bool(true);
+                fs.save_view(&mut e);
+            }
+            None => e.bool(false),
+        }
         let c = &self.creds;
         for v in [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid] {
             e.u32(v);
@@ -445,10 +488,17 @@ impl<P: Platform> Kernel<P> {
         for &g in &c.groups {
             e.u32(g);
         }
+        c.caps.encode(&mut e);
         let (soft, hard) = fdtable::limit();
         e.u64(soft);
         e.u64(hard);
         e.u32(self.fs.as_ref().map_or(0o022, |fs| fs.umask()));
+        // Which mount each open file came through (a record whose
+        // descriptor does not survive is never trusted, see `fdmarks`).
+        fdmarks::save(&mut e);
+        // Kept across execve, as on Linux.
+        seccomp::save(&mut e);
+        e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.into_bytes()
     }
 
@@ -459,19 +509,40 @@ impl<P: Platform> Kernel<P> {
         if d.u64() != EXEC_STATE_MAGIC {
             return Err("the exec state is not fwe's".into());
         }
+        // The view, which the filesystem took when it was opened.
+        if d.bool() {
+            fs::Fs::skip_view(&mut d);
+        }
         let mut ids = [0u32; 8];
         for v in &mut ids {
             *v = d.u32();
         }
         let n = d.count(4);
         let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
+        let mut caps = caps::Caps::decode(&mut d);
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
+        fdmarks::load(&mut d);
+        seccomp::load_state(&mut d);
+        let nnp = d.bool();
         d.finish()?;
-        // The saved IDs become the effective ones, as across any execve.
+        syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
+        // The saved IDs become the effective ones, and the capabilities
+        // what an exec makes of them, as across any execve.
         let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;
-        self.creds =
-            creds::Creds { uid, euid, suid: euid, fsuid, gid, egid, sgid: egid, fsgid, groups };
+        caps.on_exec(uid, euid);
+        self.creds = creds::Creds {
+            uid,
+            euid,
+            suid: euid,
+            fsuid,
+            gid,
+            egid,
+            sgid: egid,
+            fsgid,
+            groups,
+            caps,
+        };
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
         let _ = fdtable::set_limit(soft, hard);
@@ -579,6 +650,11 @@ impl<P: Platform> Kernel<P> {
 /// wakes. Touches only thread-local state and guest memory, so the backend
 /// calls it on thread exit without holding the kernel lock.
 pub fn thread_exit_cleanup() {
+    // A thread's number in the pid namespace is free again (the main
+    // thread's is the process's, freed when it is reaped).
+    if pidns::nested() && thread::tid() != thread::tgid() {
+        pidns::release_thread(thread::tid());
+    }
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {
@@ -593,7 +669,7 @@ pub fn thread_exit_cleanup() {
 static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Leads an exec state record ([`Kernel::exec_state`]).
-const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
+pub(crate) const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
 
 /// Refuse every host `fork` from now on: a process running its guest in a
 /// Hypervisor.framework VM must never fork, as the child would inherit a VM
@@ -667,6 +743,158 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    // SAFETY: the caller's guarantee, passed on.
+    let r = unsafe { blocking_call(nr, a) }?;
+    // A write the host refused to a sealed memfd, and what a socket that
+    // stands in for another kind reports, as Linux reports them.
+    Some(linux_result(nr, &a, r))
+}
+
+/// The result of system call `nr` as Linux reports it where the host's
+/// differs: a write refused to a sealed memfd, a socket that stands in for
+/// another kind, and the `SIGPIPE` a socket write to a closed peer raises.
+pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
+    let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
+    if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
+        sigpipe_for_socket(nr, a);
+    }
+    r
+}
+
+/// `sendfile` (`both_files` false) and `copy_file_range` (true): copy up to
+/// `count` bytes from `input` to `output`, from the offset at `in_off` (a
+/// guest pointer, updated, leaving the file's own offset alone) or the
+/// file's, and for `copy_file_range` to the one at `out_off` likewise.
+/// The input must be a regular file, as Linux has it; `copy_file_range`
+/// needs both to be. Returns the bytes copied, or an errno when none were.
+fn copy_between(
+    input: i32,
+    in_off: u64,
+    output: i32,
+    out_off: u64,
+    count: u64,
+    both_files: bool,
+) -> i64 {
+    use fwe_abi::{err, errno};
+    let regular = |fd: i32| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        let r = unsafe { libc::fstat(fd, &mut st) };
+        if r != 0 {
+            Err(host::errno_to_linux(host::last_errno()))
+        } else {
+            Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG)
+        }
+    };
+    match (regular(input), regular(output)) {
+        (Err(e), _) | (_, Err(e)) => return err(e),
+        (Ok(false), _) => return err(errno::EINVAL),
+        (_, Ok(false)) if both_files => return err(errno::EINVAL),
+        _ => {}
+    }
+    let read_off = |p: u64| -> Result<Option<i64>, i32> {
+        if p == 0 { Ok(None) } else { uaccess::read::<i64>(p).map(Some) }
+    };
+    let (mut ipos, mut opos) = match (read_off(in_off), read_off(out_off)) {
+        (Ok(i), Ok(o)) => (i, o),
+        (Err(e), _) | (_, Err(e)) => return err(e),
+    };
+    if ipos.is_some_and(|p| p < 0) || opos.is_some_and(|p| p < 0) {
+        return err(errno::EINVAL);
+    }
+    let mut buf = vec![0u8; 1 << 16];
+    let mut done: u64 = 0;
+    let mut failure = 0;
+    while done < count {
+        let want = (count - done).min(buf.len() as u64) as usize;
+        // SAFETY: `buf` holds at least `want` bytes.
+        let n = unsafe {
+            match ipos {
+                Some(p) => libc::pread(input, buf.as_mut_ptr().cast(), want, p),
+                None => libc::read(input, buf.as_mut_ptr().cast(), want),
+            }
+        };
+        if n < 0 {
+            failure = host::errno_to_linux(host::last_errno());
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        let mut sent = 0usize;
+        while sent < n as usize {
+            // SAFETY: the first `n` bytes of `buf` are initialized.
+            let w = unsafe {
+                match opos {
+                    Some(p) => libc::pwrite(
+                        output,
+                        buf[sent..].as_ptr().cast(),
+                        n as usize - sent,
+                        p + sent as i64,
+                    ),
+                    None => libc::write(output, buf[sent..].as_ptr().cast(), n as usize - sent),
+                }
+            };
+            if w <= 0 {
+                failure = if w < 0 { host::errno_to_linux(host::last_errno()) } else { errno::EIO };
+                break;
+            }
+            sent += w as usize;
+        }
+        // What was read and not written goes back to the input.
+        if sent < n as usize && ipos.is_none() {
+            // SAFETY: plain host call on the input.
+            unsafe { libc::lseek(input, -((n as usize - sent) as i64), libc::SEEK_CUR) };
+        }
+        done += sent as u64;
+        if let Some(p) = ipos.as_mut() {
+            *p += sent as i64;
+        }
+        if let Some(p) = opos.as_mut() {
+            *p += sent as i64;
+        }
+        if failure != 0 || sent < n as usize {
+            break;
+        }
+    }
+    for (ptr, pos) in [(in_off, ipos), (out_off, opos)] {
+        if let (true, Some(p)) = (ptr != 0, pos)
+            && uaccess::write(ptr, p).is_err()
+        {
+            return err(errno::EFAULT);
+        }
+    }
+    if done == 0 && failure != 0 { err(failure) } else { done as i64 }
+}
+
+/// A write to a socket whose peer has gone raises `SIGPIPE`, unless the send
+/// said `MSG_NOSIGNAL`. fwe's sockets never let the host raise it (they are
+/// all `SO_NOSIGPIPE`, so that the flag can be honoured), so it does.
+fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
+    use fwe_abi::nr as n;
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    let quiet = match nr {
+        n::WRITE | n::WRITEV | n::PWRITE64 | n::SENDFILE => false,
+        n::SENDTO => a[3] & MSG_NOSIGNAL != 0,
+        n::SENDMSG => a[2] & MSG_NOSIGNAL != 0,
+        _ => return,
+    };
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    let socket = unsafe { libc::fstat(a[0] as i32, &mut st) } == 0
+        && st.st_mode & libc::S_IFMT == libc::S_IFSOCK;
+    if socket && !quiet {
+        signal::raise_self(absig::SIGPIPE);
+    }
+}
+
+/// [`blocking_syscall`]'s calls.
+///
+/// # Safety
+/// As for [`blocking_syscall`].
+unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
@@ -708,6 +936,14 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
             if let Some(r) = unsafe { specialfd::try_write(fd, buf, len) } {
                 return Some(r);
             }
+            if let Some(r) = cgroupfs::try_write(fd, buf, len) {
+                return Some(r);
+            }
+            if fdmarks::any_marks()
+                && let Some(r) = userns::try_write(fd, buf, len)
+            {
+                return Some(r);
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
@@ -736,6 +972,9 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PWRITE64 => host::ret(unsafe {
             libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
         } as i64),
+        n::SENDFILE => copy_between(a[1] as i32, a[2], a[0] as i32, 0, a[3], false),
+        n::COPY_FILE_RANGE if a[5] != 0 => fwe_abi::err(fwe_abi::errno::EINVAL),
+        n::COPY_FILE_RANGE => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], a[4], true),
         // SAFETY: caller guarantees the pollfd array and timeout pointers.
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // The sixth argument points to `{ const sigset_t *ss; size_t len }`.
