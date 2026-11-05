@@ -370,7 +370,9 @@ fn set_host_signal(sig: u64, how: HostSignal) {
     let Some(h) = host::signal_to_host(sig) else { return };
     // A signal whose default action ends the process is caught all the same,
     // so the process ends through the kernel's default action, which tears
-    // the VM down first, never by the host's with the VM alive.
+    // the VM down first, never by the host's with the VM alive. The kernel
+    // already asks for that (`Kernel::sync_host_signal`); this keeps it the
+    // VM's own guarantee.
     let how = match how {
         HostSignal::Default
             if fwe_abi::signal::default_action(sig) == fwe_abi::signal::Default::Terminate =>
