@@ -515,10 +515,14 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     // child's (no process is its own child), so the reaper's report.
     // SAFETY: getpid cannot fail.
     let sent_self = (code == 0 && pid == 0) || pid == unsafe { libc::getpid() };
+    if sig == libc::SIGCHLD {
+        crate::sigdebug::event("host sigchld code pid", &[code as i64, pid as i64]);
+    }
     if sig == libc::SIGCHLD
         && sent_self
         && let Some((c, p, s)) = crate::reaper::take_report()
     {
+        crate::sigdebug::event("report taken", &[p as i64]);
         // An adopted process's end, which fwe's reaper sent this process
         // (`si_code` and `si_status` already Linux's).
         // SAFETY: getuid cannot fail.

@@ -161,6 +161,16 @@ impl Pending {
             return;
         }
         let slot = &self.info[(sig - 1) as usize];
+        if sig == signal::SIGCHLD {
+            crate::sigdebug::event(
+                "post pid pending-pid pending",
+                &[
+                    info.pid as i64,
+                    slot.pid.load(Ordering::Relaxed) as i64,
+                    (self.bits.load(Ordering::Acquire) >> (sig - 1) & 1) as i64,
+                ],
+            );
+        }
         if sig == signal::SIGCHLD && crate::reaper::superseded(info.pid) {
             return;
         }

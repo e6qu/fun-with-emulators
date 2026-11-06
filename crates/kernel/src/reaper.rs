@@ -610,6 +610,7 @@ pub fn take_report() -> Option<(i32, i32, i32)> {
 /// (`SIGCHLD` ignored, or `SA_NOCLDWAIT`), they are reaped instead.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn notify() {
+    crate::sigdebug::event("notify", &[]);
     let fresh: Vec<Ended> = {
         let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
         let n = n.get_or_insert_with(HashSet::new);
@@ -652,13 +653,21 @@ pub fn precedes(pid: i32, pending: i32) -> bool {
 /// still pending absorbs it (a standard signal is not queued twice). Taken
 /// once. Async-signal-safe.
 pub fn superseded(pid: i32) -> bool {
-    pid != 0
+    let r = pid != 0
         && REPORTED.load(SeqCst) != 0
-        && REPORTED_PARENT.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok()
+        && REPORTED_PARENT.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok();
+    if r {
+        crate::sigdebug::event("superseded", &[pid as i64]);
+    }
+    r
 }
 
 /// Send this process the `SIGCHLD` for adopted process `e`'s end.
 fn raise(e: &Ended) {
+    crate::sigdebug::event(
+        "raise orphan parent",
+        &[e.pid as i64, e.lineage.first().map_or(0, |p| p.0) as i64],
+    );
     REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);
     REPORTED.store(e.pid, SeqCst);
     let (code, status) = child_code(e.status);

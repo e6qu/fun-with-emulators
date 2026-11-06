@@ -2575,6 +2575,10 @@ fn namespaces(scenario: &str) -> String {
         .arg(&root)
         .arg(root.join("namespaces"))
         .arg(scenario);
+    if scenario == "subreaper-zombie" {
+        // How each SIGCHLD travels, for a failure on a busy host.
+        cmd.env("FWE_DEBUG_SIGCHLD", "1");
+    }
     let out = run_bounded(cmd);
     eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&root);
