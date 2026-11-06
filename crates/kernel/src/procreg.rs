@@ -172,7 +172,8 @@ pub fn remove(pid: i32) {
     }
 }
 
-/// Every live process fwe has a record of, forgetting those that ended.
+/// Every live process fwe has a record of, forgetting those that ended
+/// (zombies too).
 pub fn all() -> Vec<(i32, ProcRecord)> {
     let Some(d) = dir() else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return Vec::new() };
@@ -184,7 +185,9 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
             // goes with its process's record.
             continue;
         };
-        match read(pid) {
+        // A zombie has ended (Linux lists it in no cgroup either): its
+        // record goes, and how it ended is kept for whoever reaps it.
+        match read(pid).filter(|r| alive((pid, r.start))) {
             Some(r) => out.push((pid, r)),
             None => gone(pid),
         }
