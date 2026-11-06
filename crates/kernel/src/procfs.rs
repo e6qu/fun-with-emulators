@@ -20,6 +20,9 @@ pub struct ProcInfo {
     /// fwe's descriptor of the running program when it has no path (a
     /// memfd it was executed from), which `/proc/self/exe` opens.
     pub exe_fd: Option<i32>,
+    /// The auxiliary vector the program started with, as words
+    /// (`/proc/self/auxv`).
+    pub auxv: Vec<u8>,
 }
 
 /// A synthetic entry for a `/proc` or `/sys` path.
@@ -125,14 +128,23 @@ const DIRS: &[DirDef] = &[
 /// The entries of a synthetic directory `path`, including `.` and `..`, or
 /// `None` if `path` is not a synthetic directory.
 pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
-    let entries = DIRS.iter().find(|(p, _)| *p == path)?.1;
+    let listed = DIRS.iter().find(|(p, _)| *p == path).map(|d| d.1);
+    if listed.is_none() && !crate::sysctl::is_dir(path) {
+        return None;
+    }
     let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
-    out.extend(entries.iter().map(|(n, t)| (n.to_vec(), *t)));
+    out.extend(listed.unwrap_or_default().iter().map(|(n, t)| (n.to_vec(), *t)));
+    // The network namespace's sysctls.
+    for (name, dir) in crate::sysctl::children(path) {
+        if !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, if dir { DT_DIR } else { DT_REG }));
+        }
+    }
     Some(out)
 }
 
 fn is_dir(path: &[u8]) -> bool {
-    DIRS.iter().any(|(p, _)| *p == path)
+    DIRS.iter().any(|(p, _)| *p == path) || crate::sysctl::is_dir(path)
 }
 
 /// Look up `path` (an absolute, normalized guest path). Returns `None` if the
@@ -149,6 +161,8 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
+        b"/proc/self/auxv" => Entry::File(info.auxv.clone()),
+        p if crate::sysctl::read(p).is_some() => Entry::File(crate::sysctl::read(p).unwrap()),
         // The initial user namespace's: every id is itself.
         b"/proc/self/uid_map" | b"/proc/self/gid_map" => {
             Entry::File(b"         0          0 4294967295\n".to_vec())
@@ -225,12 +239,28 @@ fn meminfo() -> Vec<u8> {
     .into_bytes()
 }
 
+/// `/proc/stat`: the host's CPU times (in `USER_HZ` ticks), each of the
+/// first `ncpu` CPUs', and when it booted.
 fn stat(ncpu: u32) -> Vec<u8> {
-    let mut out = b"cpu  0 0 0 0 0 0 0 0 0 0\n".to_vec();
-    for i in 0..ncpu.max(1) {
-        out.extend_from_slice(format!("cpu{i} 0 0 0 0 0 0 0 0 0 0\n").as_bytes());
+    let mut cpus = crate::host::cpu_times();
+    cpus.resize(ncpu.max(1) as usize, [0; 4]);
+    let line = |name: &str, t: [u64; 4]| {
+        format!("{name} {} {} {} {} 0 0 0 0 0 0\n", t[0], t[1], t[2], t[3])
+    };
+    let total =
+        cpus.iter().fold([0; 4], |a, t| [a[0] + t[0], a[1] + t[1], a[2] + t[2], a[3] + t[3]]);
+    let mut out = line("cpu ", total).into_bytes();
+    for (i, t) in cpus.iter().enumerate() {
+        out.extend_from_slice(line(&format!("cpu{i}"), *t).as_bytes());
     }
-    out.extend_from_slice(b"btime 1700000000\nprocesses 1\n");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    let btime = (now - crate::host::uptime()).max(0.0) as u64;
+    out.extend_from_slice(
+        format!("intr 0\nctxt 0\nbtime {btime}\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n")
+            .as_bytes(),
+    );
     out
 }
 
@@ -256,6 +286,7 @@ mod tests {
             ncpu: 4,
             hostname: b"fwe".to_vec(),
             exe_fd: None,
+            auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0],
         }
     }
 
@@ -267,6 +298,9 @@ mod tests {
         );
         assert!(
             matches!(lookup(b"/proc/self/cmdline", &info), Some(Entry::File(c)) if c == b"prog\0arg\0")
+        );
+        assert!(
+            matches!(lookup(b"/proc/self/auxv", &info), Some(Entry::File(a)) if a == info.auxv)
         );
         assert!(
             matches!(lookup(b"/proc/sys/kernel/ostype", &info), Some(Entry::File(c)) if c == b"Linux\n")

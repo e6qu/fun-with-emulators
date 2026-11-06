@@ -794,6 +794,70 @@ pub fn uptime() -> f64 {
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
+/// Each host CPU's time so far, in clock ticks (100 a second, Linux's
+/// `USER_HZ`): user, nice, system and idle. Empty if unavailable.
+pub fn cpu_times() -> Vec<[u64; 4]> {
+    #[cfg(target_os = "macos")]
+    {
+        // `PROCESSOR_CPU_LOAD_INFO`, and the order of `cpu_ticks`.
+        const LOAD_INFO: i32 = 2;
+        const USER: usize = 0;
+        const SYSTEM: usize = 1;
+        const IDLE: usize = 2;
+        const NICE: usize = 3;
+        unsafe extern "C" {
+            fn host_processor_info(
+                host: u32,
+                flavor: i32,
+                count: *mut u32,
+                info: *mut *mut i32,
+                info_count: *mut u32,
+            ) -> i32;
+            fn mach_host_self() -> u32;
+            fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+            static mach_task_self_: u32;
+        }
+        let (mut cpus, mut info, mut words) = (0u32, std::ptr::null_mut::<i32>(), 0u32);
+        // SAFETY: valid out-parameters; the kernel allocates `info`.
+        if unsafe {
+            host_processor_info(mach_host_self(), LOAD_INFO, &mut cpus, &mut info, &mut words)
+        } != 0
+        {
+            return Vec::new();
+        }
+        // SAFETY: `info` holds `words` integers, four per CPU.
+        let ticks = unsafe { std::slice::from_raw_parts(info, words as usize) };
+        let out = ticks
+            .chunks_exact(4)
+            .take(cpus as usize)
+            .map(|t| {
+                let v = |i: usize| u64::from(t[i] as u32);
+                [v(USER), v(NICE), v(SYSTEM), v(IDLE)]
+            })
+            .collect();
+        // SAFETY: freeing what the kernel allocated, in this task.
+        unsafe { vm_deallocate(mach_task_self_, info as usize, words as usize * 4) };
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+        stat.lines()
+            .filter(|l| l.starts_with("cpu") && !l.starts_with("cpu "))
+            .map(|l| {
+                let f: Vec<u64> =
+                    l.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
+                [
+                    f.first().copied().unwrap_or(0),
+                    f.get(1).copied().unwrap_or(0),
+                    f.get(2).copied().unwrap_or(0),
+                    f.get(3).copied().unwrap_or(0),
+                ]
+            })
+            .collect()
+    }
+}
+
 /// The host's 1, 5 and 15 minute load averages (zero if unavailable).
 pub fn load_averages() -> [f64; 3] {
     let mut loads = [0f64; 3];

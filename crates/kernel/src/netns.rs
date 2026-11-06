@@ -167,7 +167,7 @@ pub fn bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan
     }
     let proto = proto(fd);
     if a.port != 0 {
-        if a.port < 1024 && !may_low {
+        if a.port < crate::sysctl::unprivileged_port_start() && !may_low {
             return Err(errno::EACCES);
         }
         if let Some(h) = host_port(&net, proto, a.port)

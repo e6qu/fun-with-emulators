@@ -24,6 +24,7 @@ pub const CAP_NET_ADMIN: u32 = 12;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_MKNOD: u32 = 27;
+pub const CAP_SETFCAP: u32 = 31;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
 /// The highest capability (`CAP_CHECKPOINT_RESTORE`).
 pub const CAP_LAST_CAP: u32 = 40;

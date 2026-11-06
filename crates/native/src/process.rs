@@ -115,6 +115,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         fs.set_exe_fd(exe_fd);
         let exe = fs.exe_fd_target().unwrap_or_else(|| path.clone());
         fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+        fs.set_auxv(out.auxv);
         fs.publish();
     }
     // The new program starts with every register zero, as Linux leaves it;

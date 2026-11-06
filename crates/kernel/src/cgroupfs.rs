@@ -60,7 +60,17 @@ const ROOT_FILES: &[&str] = &[
     "cgroup.max.depth",
     "cgroup.max.descendants",
     "cgroup.stat",
+    "cpuset.cpus.effective",
+    "cpuset.mems.effective",
 ];
+
+/// The host's CPUs, as a cpuset lists them (`0-7`).
+fn all_cpus() -> String {
+    match crate::procfs::ncpu_hint() {
+        1 => "0\n".to_string(),
+        n => format!("0-{}\n", n - 1),
+    }
+}
 
 /// Each controller's files in a cgroup whose parent enables it: name,
 /// initial content, writable.
@@ -83,7 +93,7 @@ const CONTROLLER_FILES: &[(&str, &str, &str, bool)] = &[
     ("cpu", "cpu.stat", "usage_usec 0\nuser_usec 0\nsystem_usec 0\n", false),
     ("cpuset", "cpuset.cpus", "\n", true),
     ("cpuset", "cpuset.mems", "\n", true),
-    ("cpuset", "cpuset.cpus.effective", "\n", false),
+    ("cpuset", "cpuset.cpus.effective", "", false),
     ("cpuset", "cpuset.mems.effective", "0\n", false),
     ("io", "io.max", "", true),
     ("io", "io.weight", "default 100\n", true),
@@ -117,11 +127,25 @@ pub fn tree_dir() -> Result<Vec<u8>, i32> {
     if std::fs::create_dir(os(&dir)).is_ok()
         || !std::path::Path::new(os(&dir)).join("cgroup.procs").exists()
     {
-        for name in ROOT_FILES {
-            put(&dir, name, "", *name != "cgroup.controllers" && *name != "cgroup.stat");
-        }
         let all = CONTROLLERS.join(" ") + "\n";
-        let _ = std::fs::write(os(&[&dir[..], b"/cgroup.controllers"].concat()), all);
+        let cpus = all_cpus();
+        for name in ROOT_FILES {
+            // Written as they are made: the read-only ones cannot be after.
+            let content = match *name {
+                "cgroup.controllers" => all.as_str(),
+                "cpuset.cpus.effective" => cpus.as_str(),
+                "cpuset.mems.effective" => "0\n",
+                _ => "",
+            };
+            let writable = !matches!(
+                *name,
+                "cgroup.controllers"
+                    | "cgroup.stat"
+                    | "cpuset.cpus.effective"
+                    | "cpuset.mems.effective"
+            );
+            put(&dir, name, content, writable);
+        }
     }
     Ok(dir)
 }
@@ -177,8 +201,11 @@ pub fn made(dir: &[u8]) {
     }
     let enabled = controllers(&cg);
     let _ = std::fs::write(os(&[dir, b"/cgroup.controllers"].concat()), enabled.join(" ") + "\n");
+    let cpus = all_cpus();
     for (ctl, name, content, writable) in CONTROLLER_FILES {
         if enabled.iter().any(|e| e == ctl) {
+            // Every CPU is the cgroup's: none is held back.
+            let content = if *name == "cpuset.cpus.effective" { cpus.as_str() } else { content };
             put(dir, name, content, *writable);
         }
     }
@@ -379,6 +406,12 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                             continue;
                         }
                         if on {
+                            let cpus = all_cpus();
+                            let content = if *file == "cpuset.cpus.effective" {
+                                cpus.as_str()
+                            } else {
+                                content
+                            };
                             put(&child, file, content, *writable);
                         } else {
                             let _ = std::fs::remove_file(os(

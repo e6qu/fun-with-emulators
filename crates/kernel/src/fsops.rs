@@ -90,13 +90,46 @@ fn minor(dev: u64) -> u32 {
     (((dev >> 12) & 0xffff_ff00) | (dev & 0xff)) as u32
 }
 
-/// Fetch host metadata for the resolved path (symlink already resolved).
+/// Fetch host metadata for the resolved path (symlink already resolved),
+/// with the guest's permission bits ([`crate::modes`]).
 fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
     // SAFETY: `out` is a valid out-parameter; `name` is NUL-terminated.
     let mut out = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd; `out` valid.
     let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut out, libc::AT_SYMLINK_NOFOLLOW) };
-    if r < 0 { Err(host::errno_to_linux(host::last_errno())) } else { Ok(out) }
+    if r < 0 {
+        return Err(host::errno_to_linux(host::last_errno()));
+    }
+    let perm = crate::modes::guest_perm_at(dir, name, &out);
+    crate::modes::apply(&mut out, perm);
+    Ok(out)
+}
+
+/// Host metadata of open descriptor `fd`, with the guest's permission
+/// bits ([`crate::modes`]).
+fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
+    let mut out = zeroed_stat();
+    // SAFETY: plain host call with a valid out-parameter.
+    if unsafe { libc::fstat(fd, &mut out) } < 0 {
+        return Err(host::errno_to_linux(host::last_errno()));
+    }
+    let perm = crate::modes::guest_perm_fd(fd, &out);
+    crate::modes::apply(&mut out, perm);
+    Ok(out)
+}
+
+/// The access (`R_OK`, `W_OK` bits) an `open` with Linux `flags` asks of
+/// an existing file.
+fn open_wants(flags: u64) -> u32 {
+    let mut want = match flags & fcntl::O_ACCMODE {
+        fcntl::O_RDONLY => 4,
+        fcntl::O_WRONLY => 2,
+        _ => 6,
+    };
+    if flags & fcntl::O_TRUNC != 0 {
+        want |= 2;
+    }
+    want
 }
 
 impl<P: Platform> Kernel<P> {
@@ -130,16 +163,26 @@ impl<P: Platform> Kernel<P> {
                 crate::procfs::Entry::File(content)
                     if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
                 {
-                    // The map files take a write; the rest are read-only.
-                    match self.map_file(dirfd as i32, &path) {
-                        Some(mark) => {
+                    // The map files and the network namespace's sysctls
+                    // take a write; the rest are read-only.
+                    let sysctl = || {
+                        let p = self.fs().proc_path(dirfd as i32, &path)?;
+                        let admin = self.creds.has(crate::caps::CAP_NET_ADMIN);
+                        crate::sysctl::open_for_write(&p, admin)
+                    };
+                    let mark = match self.map_file(dirfd as i32, &path) {
+                        Some(mark) => Ok(mark),
+                        None => sysctl().unwrap_or(Err(errno::EACCES)),
+                    };
+                    match mark {
+                        Ok(mark) => {
                             let fd = anon_fd(&content);
                             if fd >= 0 {
                                 crate::fdmarks::mark(fd as i32, mark);
                             }
                             fd
                         }
-                        None => err(errno::EACCES),
+                        Err(e) => err(e),
                     }
                 }
                 crate::procfs::Entry::File(content) => anon_fd(&content),
@@ -222,6 +265,19 @@ impl<P: Platform> Kernel<P> {
             host_flags |= libc::O_DIRECTORY;
         }
         let mode = if flags & fcntl::O_CREAT != 0 { self.fs().apply_umask(mode as u32) } else { 0 };
+        // An existing file's kept mode, for a caller that does not pass
+        // permission bits; a new one is made with what its owner must have
+        // on the host ([`crate::modes`]).
+        let existing = stat_at(resolved.dir.as_raw_fd(), &name).ok();
+        if let Some(st) = &existing
+            && crate::modes::marked(st)
+            && flags & fcntl::O_PATH == 0
+            && !self.passes_dac(open_wants(flags))
+            && !crate::modes::owner_allows(crate::modes::perm_of(st), open_wants(flags))
+        {
+            return err(errno::EACCES);
+        }
+        let host_mode = crate::modes::host_perm(mode, false);
         if resolved.fstype == crate::mounts::FsType::Cgroup2
             && let Some(host) = crate::fs::host_path_in(resolved.dir.as_raw_fd(), &resolved.name)
             && let Some((cg, Some(file))) = crate::cgroupfs::locate(&host)
@@ -237,17 +293,50 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EACCES);
             }
         }
+        let dirfd = resolved.dir.as_raw_fd();
         // SAFETY: `dir` is a live directory fd.
-        let mut fd = unsafe {
-            host::openat(resolved.dir.as_raw_fd(), &name, host_flags, mode as libc::c_uint)
+        let open = || unsafe { host::openat(dirfd, &name, host_flags, host_mode as libc::c_uint) };
+        let mut fd = match &existing {
+            // Made here: a change of the directory.
+            None if flags & fcntl::O_CREAT != 0 => {
+                let r = self.change_in(dirfd, || {
+                    let fd = open();
+                    if fd < 0 { last_error() } else { fd as i64 }
+                });
+                if r >= 0 && host_mode != mode & 0o7777 {
+                    let _ = crate::modes::keep_fd(r as i32, mode);
+                }
+                if r < 0 {
+                    return r;
+                }
+                r as i32
+            }
+            Some(st) => {
+                let fd = open();
+                if fd < 0
+                    && host::last_errno() == libc::EACCES
+                    && self.passes_dac(open_wants(flags))
+                    && crate::modes::keep_at(dirfd, &name, crate::modes::perm_of(st)).is_ok()
+                {
+                    // Root, refused by the host's bits: they are the owner's
+                    // now, the mode kept.
+                    open()
+                } else {
+                    fd
+                }
+            }
+            None => open(),
         };
         if fd < 0
             && flags & fcntl::O_PATH != 0
-            && matches!(host::last_errno(), libc::ENXIO | libc::ENODEV | libc::EBUSY)
+            && matches!(
+                host::last_errno(),
+                libc::ENXIO | libc::ENODEV | libc::EBUSY | libc::EOPNOTSUPP
+            )
         {
-            // O_PATH names a device without opening it; the host has no such
-            // open, so a stand-in holds the node's place (where it was
-            // opened, which is what an O_PATH descriptor is used for).
+            // O_PATH names a device or a socket without opening it; the host
+            // has no such open, so a stand-in holds the node's place (where
+            // it was opened, which is what an O_PATH descriptor is used for).
             // SAFETY: a constant NUL-terminated path.
             fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         }
@@ -314,17 +403,24 @@ impl<P: Platform> Kernel<P> {
         // on Linux: any existing file is accessible, and X_OK needs only one
         // execute bit set.
         const X_OK: u64 = 1;
+        let st = match stat_at(dir.as_raw_fd(), &name) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
         if self.creds.has(crate::caps::CAP_DAC_OVERRIDE) {
-            // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: valid dirfd, path and stat out-parameter.
-            if unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, 0) } < 0 {
-                return last_error();
-            }
             if mode & X_OK != 0 && (st.st_mode & 0o111) == 0 {
                 return err(errno::EACCES);
             }
             return 0;
+        }
+        if crate::modes::marked(&st) {
+            // A kept mode: the owner's bits of it, which are the caller's.
+            let perm = crate::modes::perm_of(&st);
+            return if crate::modes::owner_allows(perm, mode as u32 & 7) {
+                0
+            } else {
+                err(errno::EACCES)
+            };
         }
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         ret(unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode as i32, 0) })
@@ -439,12 +535,10 @@ impl<P: Platform> Kernel<P> {
             guest!(uaccess::write(buf, synth_stat(st::S_IFDIR | 0o555, 0)));
             return 0;
         }
-        // SAFETY: `out` is a valid out-parameter.
-        let mut out = unsafe { std::mem::zeroed::<libc::stat>() };
-        // SAFETY: plain host call on a guest fd.
-        if unsafe { libc::fstat(fd as i32, &mut out) } < 0 {
-            return last_error();
-        }
+        let out = match stat_fd(fd as i32) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
         let node =
             crate::devnodes::marked(&out).then(|| crate::devnodes::node_of(fd as i32)).flatten();
         guest!(uaccess::write(buf, as_node(stat_to_linux(&out), node)));
@@ -461,12 +555,10 @@ impl<P: Platform> Kernel<P> {
     ) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let (host, node) = if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
-            // SAFETY: `out` is a valid out-parameter.
-            let mut out = unsafe { std::mem::zeroed::<libc::stat>() };
-            // SAFETY: plain host call on a guest fd with a valid out-parameter.
-            if unsafe { libc::fstat(dirfd as i32, &mut out) } < 0 {
-                return last_error();
-            }
+            let out = match stat_fd(dirfd as i32) {
+                Ok(s) => s,
+                Err(e) => return err(e),
+            };
             let node = crate::devnodes::marked(&out)
                 .then(|| crate::devnodes::node_of(dirfd as i32))
                 .flatten();
@@ -582,9 +674,15 @@ impl<P: Platform> Kernel<P> {
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let mode = self.fs().apply_umask(mode as u32);
-        // SAFETY: `name` NUL-terminated; `dir` live.
-        let made =
-            ret(unsafe { libc::mkdirat(r.dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) });
+        let host_mode = crate::modes::host_perm(mode, true);
+        let dir = r.dir.as_raw_fd();
+        let made = self.change_in(dir, || {
+            // SAFETY: `name` NUL-terminated; `dir` live.
+            ret(unsafe { libc::mkdirat(dir, name.as_ptr(), host_mode as libc::mode_t) })
+        });
+        if made == 0 && host_mode != mode & 0o7777 {
+            let _ = crate::modes::keep_at(dir, &name, mode);
+        }
         if made == 0 && r.fstype == crate::mounts::FsType::Cgroup2 {
             // A new cgroup, with its interface files.
             if let Some(host) = crate::fs::host_path_in(r.dir.as_raw_fd(), &r.name) {
@@ -606,15 +704,17 @@ impl<P: Platform> Kernel<P> {
             Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
-        match kind {
-            0 | 0o100000 => {
+        let d = dir.as_raw_fd();
+        let host_perm = crate::modes::host_perm(perm, false);
+        let made = match kind {
+            0 | 0o100000 => self.change_in(d, || {
                 // SAFETY: a NUL-terminated name; `dir` live.
                 let fd = unsafe {
                     libc::openat(
-                        dir.as_raw_fd(),
+                        d,
                         name.as_ptr(),
                         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                        perm as libc::c_uint,
+                        host_perm as libc::c_uint,
                     )
                 };
                 if fd < 0 {
@@ -623,11 +723,11 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: closing the descriptor just made.
                 unsafe { libc::close(fd) };
                 0
-            }
-            0o010000 => {
+            }),
+            0o010000 => self.change_in(d, || {
                 // SAFETY: a NUL-terminated name; `dir` live.
-                ret(unsafe { libc::mkfifoat(dir.as_raw_fd(), name.as_ptr(), perm as libc::mode_t) })
-            }
+                ret(unsafe { libc::mkfifoat(d, name.as_ptr(), host_perm as libc::mode_t) })
+            }),
             S_IFCHR | S_IFBLK => {
                 if !self.creds.has(crate::caps::CAP_MKNOD) {
                     return err(errno::EPERM);
@@ -645,15 +745,19 @@ impl<P: Platform> Kernel<P> {
                 ) {
                     return err(e);
                 }
-                match crate::devnodes::make(dir.as_raw_fd(), &name, node, perm) {
+                self.change_in(d, || match crate::devnodes::make(d, &name, node, host_perm) {
                     Ok(()) => 0,
                     Err(e) => err(e),
-                }
+                })
             }
             // A socket node is made by binding a socket there.
-            0o140000 => err(errno::EPERM),
-            _ => err(errno::EINVAL),
+            0o140000 => return err(errno::EPERM),
+            _ => return err(errno::EINVAL),
+        };
+        if made == 0 && host_perm != perm {
+            let _ = crate::modes::keep_at(d, &name, perm);
         }
+        made
     }
 
     pub(crate) fn sys_unlinkat(&mut self, dirfd: u64, path: u64, flags: u64) -> i64 {
@@ -678,8 +782,22 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         let host_flags = if flags & fcntl::AT_REMOVEDIR != 0 { libc::AT_REMOVEDIR } else { 0 };
+        let d = dir.as_raw_fd();
         // SAFETY: `name` NUL-terminated; `dir` live.
-        ret(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), host_flags) })
+        let r = self.change_in(d, || ret(unsafe { libc::unlinkat(d, name.as_ptr(), host_flags) }));
+        if r == err(errno::EPERM) && host_flags == 0 {
+            // macOS refuses to unlink a directory with EPERM; Linux says
+            // what it is.
+            let mut st = zeroed_stat();
+            // SAFETY: `name` NUL-terminated; `dir` live; `st` an out-parameter.
+            let r = unsafe {
+                libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+            };
+            if r == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                return err(errno::EISDIR);
+            }
+        }
+        r
     }
 
     pub(crate) fn sys_symlinkat(&mut self, target: u64, dirfd: u64, path: u64) -> i64 {
@@ -694,8 +812,9 @@ impl<P: Platform> Kernel<P> {
             Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
+        let d = dir.as_raw_fd();
         // SAFETY: both strings NUL-terminated; `dir` live.
-        ret(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) })
+        self.change_in(d, || ret(unsafe { libc::symlinkat(target.as_ptr(), d, name.as_ptr()) }))
     }
 
     pub(crate) fn sys_linkat(
@@ -722,8 +841,9 @@ impl<P: Platform> Kernel<P> {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
         }
+        let (o, n) = (od.as_raw_fd(), nd.as_raw_fd());
         // SAFETY: names NUL-terminated; dirs live. We resolved symlinks, so 0.
-        ret(unsafe { libc::linkat(od.as_raw_fd(), on.as_ptr(), nd.as_raw_fd(), nn.as_ptr(), 0) })
+        self.change_in(n, || ret(unsafe { libc::linkat(o, on.as_ptr(), n, nn.as_ptr(), 0) }))
     }
 
     pub(crate) fn sys_renameat2(
@@ -748,7 +868,8 @@ impl<P: Platform> Kernel<P> {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
         }
-        rename(od.as_raw_fd(), &on, nd.as_raw_fd(), &nn, flags)
+        let (o, n) = (od.as_raw_fd(), nd.as_raw_fd());
+        self.change_in(o, || self.change_in(n, || rename(o, &on, n, &nn, flags)))
     }
 
     pub(crate) fn sys_fchmodat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
@@ -758,15 +879,30 @@ impl<P: Platform> Kernel<P> {
             if let Err(e) = Self::fd_writable(fd) {
                 return err(e);
             }
-            // SAFETY: plain host call on an open descriptor.
-            return ret(unsafe { libc::fchmod(fd, mode as libc::mode_t) });
+            return match crate::modes::keep_fd(fd, mode as u32) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            };
         }
         let (dir, name) = match self.resolve_w(dirfd, &path, follow, true) {
             Ok((d, n, _)) => (d, n),
             Err(e) => return err(e),
         };
-        // SAFETY: `name` NUL-terminated; `dir` live.
-        ret(unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) })
+        if !follow {
+            // A symbolic link's mode cannot be changed on Linux.
+            let mut st = zeroed_stat();
+            // SAFETY: `name` NUL-terminated; `dir` live; `st` an out-parameter.
+            let r = unsafe {
+                libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+            };
+            if r == 0 && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return err(errno::EOPNOTSUPP);
+            }
+        }
+        match crate::modes::keep_at(dir.as_raw_fd(), &name, mode as u32) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
     }
 
     pub(crate) fn sys_fchownat(
@@ -872,7 +1008,21 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_utimensat(&mut self, dirfd: u64, path: u64, times: u64, flags: u64) -> i64 {
-        let times_ptr = if times == 0 { std::ptr::null() } else { times as *const libc::timespec };
+        // The times, with Linux's `UTIME_NOW` and `UTIME_OMIT` as the host's.
+        let host_times = if times == 0 {
+            None
+        } else {
+            let t: [fwe_abi::Timespec; 2] = guest!(uaccess::read(times));
+            Some(t.map(|t| libc::timespec {
+                tv_sec: t.tv_sec as libc::time_t,
+                tv_nsec: match t.tv_nsec {
+                    fwe_abi::UTIME_NOW => libc::UTIME_NOW,
+                    fwe_abi::UTIME_OMIT => libc::UTIME_OMIT,
+                    n => n as libc::c_long,
+                },
+            }))
+        };
+        let times_ptr = host_times.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
         if path == 0 {
             // futimens-style: operate on the fd in dirfd.
             // SAFETY: valid timespec array pointer or null.
@@ -891,8 +1041,10 @@ impl<P: Platform> Kernel<P> {
             Ok((d, n, _)) => (d, n),
             Err(e) => return err(e),
         };
+        // Not followed: a symbolic link's own times.
+        let host_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         // SAFETY: `name` NUL-terminated; `dir` live; times valid or null.
-        ret(unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, 0) })
+        ret(unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, host_flags) })
     }
 
     /// The open file a `/proc/self/fd/N` link (or `/proc/self/exe`) at
@@ -947,6 +1099,257 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `EROFS` for a file opened through a read-only mount.
+    /// `setxattr`, `lsetxattr` (`!follow`): set attribute `name` of the
+    /// file at `path` to the `size` bytes at `value`.
+    pub(crate) fn sys_setxattr(
+        &mut self,
+        path: u64,
+        name: u64,
+        value: u64,
+        size: u64,
+        flags: u64,
+        follow: bool,
+    ) -> i64 {
+        let (name, value) = match self.xattr_args(name, value, size) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
+            return err(errno::EPERM);
+        }
+        let r =
+            self.resolve_w(fcntl::AT_FDCWD as u64, &path, follow, true).and_then(|(d, n, _)| {
+                let (host, plain) = Self::xattr_file(&d, &n)?;
+                let space = crate::xattr::space(&name)?;
+                crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+                crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
+            });
+        match r {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `fsetxattr`.
+    pub(crate) fn sys_fsetxattr(
+        &mut self,
+        fd: u64,
+        name: u64,
+        value: u64,
+        size: u64,
+        flags: u64,
+    ) -> i64 {
+        let (name, value) = match self.xattr_args(name, value, size) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let fd = fd as i32;
+        let r = Self::fd_writable(fd).and_then(|()| {
+            let plain = Self::xattr_fd(fd)?;
+            let space = crate::xattr::space(&name)?;
+            crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+            crate::xattr::set(&crate::xattr::Target::Fd(fd), &name, &value, flags)
+        });
+        match r {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `getxattr`, `lgetxattr` (`!follow`), and `fgetxattr` (`path` 0,
+    /// `fd` set): attribute `name` into the `size` bytes at `value` (its
+    /// length, if `size` is 0).
+    pub(crate) fn sys_getxattr(
+        &mut self,
+        fd: Option<i32>,
+        path: u64,
+        name: u64,
+        value: u64,
+        size: u64,
+        follow: bool,
+    ) -> i64 {
+        let name = guest!(uaccess::read_cstr(name, 256));
+        let got = self.xattr_target(fd, path, follow, |t, who| {
+            who.may_read(crate::xattr::space(&name)?)?;
+            crate::xattr::get(t, &name)
+        });
+        self.xattr_out(got, value, size)
+    }
+
+    /// `listxattr`, `llistxattr` (`!follow`), and `flistxattr`: the names
+    /// of the attributes the caller sees, into the `size` bytes at `list`.
+    pub(crate) fn sys_listxattr(
+        &mut self,
+        fd: Option<i32>,
+        path: u64,
+        list: u64,
+        size: u64,
+        follow: bool,
+    ) -> i64 {
+        let got = self.xattr_target(fd, path, follow, crate::xattr::list);
+        // A file fwe makes up has none.
+        let got = if got == Err(SYNTHETIC) { Ok(Vec::new()) } else { got };
+        self.xattr_out(got, list, size)
+    }
+
+    /// `removexattr`, `lremovexattr` (`!follow`), and `fremovexattr`.
+    pub(crate) fn sys_removexattr(
+        &mut self,
+        fd: Option<i32>,
+        path: u64,
+        name: u64,
+        follow: bool,
+    ) -> i64 {
+        let name = guest!(uaccess::read_cstr(name, 256));
+        let r = match fd {
+            Some(fd) => Self::fd_writable(fd).and_then(|()| {
+                let plain = Self::xattr_fd(fd)?;
+                let space = crate::xattr::space(&name)?;
+                crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+                crate::xattr::remove(&crate::xattr::Target::Fd(fd), &name)
+            }),
+            None => {
+                let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+                if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
+                    return err(errno::EPERM);
+                }
+                self.resolve_w(fcntl::AT_FDCWD as u64, &path, follow, true).and_then(|(d, n, _)| {
+                    let (host, plain) = Self::xattr_file(&d, &n)?;
+                    let space = crate::xattr::space(&name)?;
+                    crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+                    crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
+                })
+            }
+        };
+        match r {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// An attribute's name and value from the guest.
+    fn xattr_args(&self, name: u64, value: u64, size: u64) -> Result<(Vec<u8>, Vec<u8>), i32> {
+        let name = uaccess::read_cstr(name, 256).map_err(|_| errno::EFAULT)?;
+        if size as usize > crate::xattr::SIZE_MAX {
+            return Err(errno::E2BIG);
+        }
+        let mut v = vec![0u8; size as usize];
+        if size > 0 {
+            uaccess::read_into(value, &mut v).map_err(|_| errno::EFAULT)?;
+        }
+        Ok((name, v))
+    }
+
+    /// Run `f` on the file a reading attribute call names: descriptor `fd`,
+    /// or the file at guest `path` (followed if `follow`), with the
+    /// caller's standing toward it. A file fwe makes up has no attributes
+    /// ([`SYNTHETIC`]).
+    fn xattr_target<T>(
+        &self,
+        fd: Option<i32>,
+        path: u64,
+        follow: bool,
+        f: impl FnOnce(&crate::xattr::Target, &crate::xattr::Who) -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        match fd {
+            Some(fd) => {
+                let plain = Self::xattr_fd(fd)?;
+                f(&crate::xattr::Target::Fd(fd), &crate::xattr::Who::of(&self.creds, plain))
+            }
+            None => {
+                let path =
+                    uaccess::read_cstr(path, uaccess::PATH_MAX).map_err(|_| errno::EFAULT)?;
+                if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
+                    return Err(SYNTHETIC);
+                }
+                let (d, n) = self.resolve_c(fcntl::AT_FDCWD as u64, &path, follow)?;
+                let (host, plain) = Self::xattr_file(&d, &n)?;
+                let t = crate::xattr::Target::Path(&host);
+                f(&t, &crate::xattr::Who::of(&self.creds, plain))
+            }
+        }
+    }
+
+    /// Copy what a reading attribute call got to the `size` bytes at `buf`:
+    /// its length when `size` is 0, `ERANGE` when it does not fit.
+    fn xattr_out(&self, got: Result<Vec<u8>, i32>, buf: u64, size: u64) -> i64 {
+        let data = match got {
+            Ok(d) => d,
+            Err(e) if e == SYNTHETIC => return err(errno::ENODATA),
+            Err(e) => return err(e),
+        };
+        if size == 0 {
+            return data.len() as i64;
+        }
+        if data.len() > size as usize {
+            return err(errno::ERANGE);
+        }
+        guest!(uaccess::write_from(buf, &data));
+        data.len() as i64
+    }
+
+    /// The host path of `name` in `dir`, and whether it is a regular file or
+    /// a directory (a device node fwe made is neither).
+    fn xattr_file(dir: &std::os::fd::OwnedFd, name: &CString) -> Result<(CString, bool), i32> {
+        let mut st: libc::stat = zeroed_stat();
+        // SAFETY: `name` NUL-terminated; `dir` live; `st` an out-parameter.
+        if unsafe {
+            libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+        } != 0
+        {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        let plain =
+            (kind == libc::S_IFREG && !crate::devnodes::marked(&st)) || kind == libc::S_IFDIR;
+        let mut host = crate::fs::fd_path(dir.as_raw_fd()).ok_or(errno::ENOENT)?;
+        host.push(b'/');
+        host.extend_from_slice(name.as_bytes());
+        Ok((CString::new(host).map_err(|_| errno::EINVAL)?, plain))
+    }
+
+    /// Whether open descriptor `fd` is of a regular file or a directory.
+    fn xattr_fd(fd: i32) -> Result<bool, i32> {
+        let mut st: libc::stat = zeroed_stat();
+        // SAFETY: `st` an out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        Ok((kind == libc::S_IFREG && !crate::devnodes::marked(&st)) || kind == libc::S_IFDIR)
+    }
+
+    /// Whether the caller passes permission bits for access `want` (`R_OK`,
+    /// `W_OK`, `X_OK` bits): `CAP_DAC_OVERRIDE`, or `CAP_DAC_READ_SEARCH`
+    /// to read.
+    fn passes_dac(&self, want: u32) -> bool {
+        self.creds.has(crate::caps::CAP_DAC_OVERRIDE)
+            || want & !4 == 0 && self.creds.has(crate::caps::CAP_DAC_READ_SEARCH)
+    }
+
+    /// Change the entries of directory `dir` with `op` (a host call, as a
+    /// raw Linux result). A caller that does not pass permission bits
+    /// needs the write and search bits of the directory's kept mode; one
+    /// that does is not refused by the host's: refused with `EACCES`, the
+    /// directory's mode is kept apart and `op` tried again
+    /// ([`crate::modes`]).
+    fn change_in(&self, dir: i32, op: impl Fn() -> i64) -> i64 {
+        let st = match stat_fd(dir) {
+            Ok(st) => st,
+            Err(_) => return op(),
+        };
+        let perm = crate::modes::perm_of(&st);
+        if !self.passes_dac(2) {
+            if crate::modes::marked(&st) && !crate::modes::owner_allows(perm, 2 | 1) {
+                return err(errno::EACCES);
+            }
+            return op();
+        }
+        let r = op();
+        if r == err(errno::EACCES) && crate::modes::keep_fd(dir, perm).is_ok() { op() } else { r }
+    }
+
     fn fd_writable(fd: i32) -> Result<(), i32> {
         match crate::fdmarks::origin(fd) {
             Some(o) if o.flags & crate::mounts::ms::RDONLY != 0 => Err(errno::EROFS),
@@ -984,6 +1387,16 @@ impl<P: Platform> Kernel<P> {
         let name = r.name_c()?;
         Ok((r.dir, name))
     }
+}
+
+/// What an attribute call on a file fwe makes up (under `/proc`) finds:
+/// no attributes. Never a Linux errno.
+const SYNTHETIC: i32 = -1;
+
+/// A zeroed `stat`, an out-parameter.
+fn zeroed_stat() -> libc::stat {
+    // SAFETY: zeroed bytes are a valid `stat`.
+    unsafe { std::mem::zeroed() }
 }
 
 /// A stat as a device node shows it.

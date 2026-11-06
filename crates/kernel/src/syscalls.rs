@@ -110,6 +110,10 @@ impl<P: Platform> Kernel<P> {
     fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             // Files and I/O.
+            nr::READ if crate::seqpacket::is(a[0] as i32) => {
+                let v = libc::iovec { iov_base: a[1] as *mut _, iov_len: a[2] as usize };
+                crate::seqpacket::read(a[0] as i32, &[v])
+            }
             nr::READ => {
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::read(a[0] as i32, a[1] as *mut _, a[2] as usize) } as i64)
@@ -123,16 +127,31 @@ impl<P: Platform> Kernel<P> {
                 {
                     return r;
                 }
+                if crate::fdmarks::any_marks()
+                    && let Some(r) = crate::sysctl::try_write(a[0] as i32, a[1], a[2])
+                {
+                    return r;
+                }
+                if crate::seqpacket::is(a[0] as i32) {
+                    let v = libc::iovec { iov_base: a[1] as *mut _, iov_len: a[2] as usize };
+                    return crate::seqpacket::write(a[0] as i32, &[v]);
+                }
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
             nr::READV => {
                 let iov = guest!(uaccess::host_iovecs(a[1], a[2], true));
+                if crate::seqpacket::is(a[0] as i32) {
+                    return crate::seqpacket::read(a[0] as i32, &iov);
+                }
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
             nr::WRITEV => {
                 let iov = guest!(uaccess::host_iovecs(a[1], a[2], false));
+                if crate::seqpacket::is(a[0] as i32) {
+                    return crate::seqpacket::write(a[0] as i32, &iov);
+                }
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
@@ -229,6 +248,7 @@ impl<P: Platform> Kernel<P> {
                     a[1],
                     a[2],
                     self.creds.has(crate::caps::CAP_NET_BIND_SERVICE),
+                    self.fs().umask(),
                 )
             },
             // SAFETY: no pointers.
@@ -267,11 +287,24 @@ impl<P: Platform> Kernel<P> {
             nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
+            nr::SETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], true),
+            nr::LSETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], false),
+            nr::FSETXATTR => self.sys_fsetxattr(a[0], a[1], a[2], a[3], a[4]),
+            nr::GETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], true),
+            nr::LGETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], false),
+            nr::FGETXATTR => self.sys_getxattr(Some(a[0] as i32), 0, a[1], a[2], a[3], true),
+            nr::LISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], true),
+            nr::LLISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], false),
+            nr::FLISTXATTR => self.sys_listxattr(Some(a[0] as i32), 0, a[1], a[2], true),
+            nr::REMOVEXATTR => self.sys_removexattr(None, a[0], a[1], true),
+            nr::LREMOVEXATTR => self.sys_removexattr(None, a[0], a[1], false),
+            nr::FREMOVEXATTR => self.sys_removexattr(Some(a[0] as i32), 0, a[1], true),
             nr::FCHMOD if crate::memfd::chmod_sealed(a[0] as i32) => err(errno::EPERM),
-            nr::FCHMOD => {
-                // SAFETY: plain host call on a guest fd.
-                ret(unsafe { libc::fchmod(a[0] as i32, a[1] as libc::mode_t) })
-            }
+            // A mode that denies the owner is kept apart (see `modes`).
+            nr::FCHMOD => match crate::modes::keep_fd(a[0] as i32, a[1] as u32) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
             // Ownership is virtual: honor the guest's credentials rather than
             // changing the backing host file (fwe does not run as root).
@@ -405,6 +438,26 @@ impl<P: Platform> Kernel<P> {
                     return err(errno::EINVAL);
                 }
                 thread::set_robust_list(a[0], a[1]);
+                0
+            }
+            // The caller's own list; another thread's or process's needs a
+            // tracer's standing, which nothing has.
+            nr::GET_ROBUST_LIST => {
+                let pid = a[0] as i32;
+                if pid != 0 && pid != thread::tid() {
+                    return err(
+                        if crate::pidns::to_host(pid).is_some()
+                            || thread::host_thread(pid).is_some()
+                        {
+                            errno::EPERM
+                        } else {
+                            errno::ESRCH
+                        },
+                    );
+                }
+                let (head, len) = thread::robust_list();
+                guest!(uaccess::write(a[1], head));
+                guest!(uaccess::write(a[2], len));
                 0
             }
             nr::UNAME => self.sys_uname(a[0]),

@@ -125,6 +125,14 @@ impl Platform for NativePlatform {
     }
 }
 
+/// Trace to the file at `path` (`--strace-file`), every process of the run.
+pub fn trace_to_file(path: &[u8]) -> Result<(), String> {
+    // fwe's own descriptors live above the guest's range, which this sets:
+    // the guest must never see, reuse or close the trace file's.
+    fwe_kernel::fdtable::init();
+    fwe_kernel::trace::to_file(path)
+}
+
 /// How to run a guest.
 #[derive(Debug, Default, Clone)]
 pub struct Options {
@@ -307,6 +315,9 @@ pub(crate) fn reexec(
         argv.push(b"--strace=failures".to_vec());
     } else if strace.enabled {
         argv.push(b"--strace".to_vec());
+    }
+    if let Some(file) = fwe_kernel::trace::file() {
+        argv.push([&b"--strace-file="[..], file].concat());
     }
     if let Some(root) = fs.root_host_path() {
         argv.push(b"--root".to_vec());
@@ -734,6 +745,8 @@ pub struct Loadout {
     pub entry: u64,
     pub sp: u64,
     pub brk: Brk,
+    /// The auxiliary vector given the program (see [`fwe_kernel::Fs::set_auxv`]).
+    pub auxv: Vec<u8>,
 }
 
 /// Whether `file` is a program only the hypervisor backend can run: a non-PIE
@@ -891,7 +904,7 @@ pub fn load_image(
             loaded.entry, brk.start
         ));
     }
-    Ok(Loadout { entry, sp: image.sp, brk })
+    Ok(Loadout { entry, sp: image.sp, brk, auxv: image.auxv })
 }
 
 fn start(
@@ -947,6 +960,7 @@ fn start(
     )?;
     let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
     fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+    fs.set_auxv(out.auxv.clone());
     fs.publish();
 
     // A trampoline used as the return address for signal handlers that have

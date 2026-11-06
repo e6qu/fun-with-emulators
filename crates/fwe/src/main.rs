@@ -14,6 +14,9 @@ options:
   --strace     trace system calls to standard error
   --strace=failures
                trace only the calls that fail, and fwe's notes
+  --strace-file=PATH
+               trace to PATH (appended to) instead, every process of the
+               run, each line naming its process
   --root DIR   use DIR as the guest root filesystem
   --host-info  show host features that affect compatibility
   --probe NAME run one host-behaviour probe (diagnostic; used by CI)
@@ -84,6 +87,12 @@ fn main() -> ExitCode {
             b"--strace=failures" => {
                 options.strace.enabled = true;
                 options.strace.failures_only = true;
+            }
+            a if a.starts_with(b"--strace-file=") => {
+                if let Err(e) = fwe_native::trace_to_file(&a[b"--strace-file=".len()..]) {
+                    eprintln!("fwe: --strace-file: {e}");
+                    return ExitCode::from(2);
+                }
             }
             b"--root" => {
                 args.next();

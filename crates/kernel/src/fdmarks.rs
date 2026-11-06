@@ -5,9 +5,9 @@
 //! On Linux an open file keeps the mount it was reached by: `fstatfs`
 //! reports that mount's flags and `/proc/self/fd` its path, even once the
 //! mount is detached. A host descriptor knows nothing of fwe's mounts.
-//! macOS has no `SOCK_SEQPACKET` Unix sockets either, and fwe makes a pair
-//! of them from a datagram pair, which keeps message boundaries. So fwe
-//! records both against the descriptor, follows it through `dup` and
+//! macOS has no `SOCK_SEQPACKET` Unix sockets either, and fwe makes one of
+//! a stream socket ([`crate::seqpacket`]). So fwe records both against the
+//! descriptor, follows it through `dup` and
 //! `close`, `fork` and `exec`, and drops a record whose descriptor no
 //! longer names the same file.
 
@@ -29,8 +29,12 @@ pub struct Origin {
 /// A socket standing in for another kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
-    /// One end of a `SOCK_SEQPACKET` socketpair, made of a datagram pair.
+    /// A `SOCK_SEQPACKET` Unix socket, made of a stream socket whose
+    /// messages are framed ([`crate::seqpacket`]).
     SeqPacket,
+    /// A sysctl of the network namespace opened for writing (its index in
+    /// [`crate::sysctl`]'s table).
+    Sysctl(u8),
     /// `/dev/full`, whose writes fail with `ENOSPC`.
     DevFull,
     /// A socket bound in a network namespace of fwe's, to its port `port`
@@ -211,7 +215,11 @@ pub fn save(e: &mut Enc) {
             Some(Mark::DevFull) => 2,
             Some(Mark::NetBound { .. }) => 3,
             Some(Mark::ProcMap { .. }) => 4,
+            Some(Mark::Sysctl(_)) => 6,
         });
+        if let Some(Mark::Sysctl(i)) = rec.mark {
+            e.u8(i);
+        }
         if let Some(Mark::ProcMap { host, which, privileged, own }) = rec.mark {
             e.i32(host);
             e.u8(which);
@@ -247,6 +255,7 @@ pub fn load(d: &mut Dec) {
                 privileged: d.bool(),
                 own: d.u32(),
             }),
+            6 => Some(Mark::Sysctl(d.u8())),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });
@@ -254,32 +263,17 @@ pub fn load(d: &mut Dec) {
 }
 
 /// The result of system call `nr` on descriptor `a[0]`, with what the
-/// host reports differently for a socket that stands in for another kind
-/// made as Linux reports it: a `SOCK_SEQPACKET` socket whose peer has gone
-/// reads end-of-file (`ECONNRESET` on the datagram socket behind it), and
-/// a send to it fails with `EPIPE`.
+/// host reports differently for a file that stands in for another kind
+/// made as Linux reports it: a write to `/dev/full` fails with `ENOSPC`.
 pub fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     use fwe_abi::{err, errno, nr as n};
-    if r >= 0 {
-        // A write to /dev/full is refused.
-        let writes = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64);
-        if writes
-            && MARKS.load(std::sync::atomic::Ordering::SeqCst) > 0
-            && marked(a[0] as i32) == Some(Mark::DevFull)
-        {
-            return err(errno::ENOSPC);
-        }
-        return r;
+    let writes = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64);
+    if r >= 0
+        && writes
+        && MARKS.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && marked(a[0] as i32) == Some(Mark::DevFull)
+    {
+        return err(errno::ENOSPC);
     }
-    let reset = r == err(errno::ECONNRESET);
-    let gone = r == err(errno::EDESTADDRREQ) || r == err(errno::ENOTCONN) || reset;
-    if !gone {
-        return r;
-    }
-    let receives = matches!(nr, n::READ | n::READV | n::RECVFROM | n::RECVMSG | n::PREAD64);
-    let sends = matches!(nr, n::WRITE | n::WRITEV | n::SENDTO | n::SENDMSG | n::PWRITE64);
-    if !(receives && reset || sends) || marked(a[0] as i32) != Some(Mark::SeqPacket) {
-        return r;
-    }
-    if receives { 0 } else { err(errno::EPIPE) }
+    r
 }
