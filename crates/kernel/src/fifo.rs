@@ -95,3 +95,39 @@ use libc::select as select_any;
 
 /// How long a wait that watches FIFO readers sleeps between probes.
 pub const SLICE_MS: i32 = 20;
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// The host's `select` says what Linux's `poll` would: nothing before a
+    /// writer has been there or while one is, data once written, end of
+    /// file once the writers have gone; and the look takes nothing.
+    #[test]
+    fn probe_sees_writers_go() {
+        let dir = std::env::temp_dir().join(format!("fwe-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = CString::new(dir.join("f").to_str().unwrap()).unwrap();
+        // SAFETY: plain host calls on a FIFO of this test's own.
+        unsafe {
+            assert_eq!(libc::mkfifo(path.as_ptr(), 0o600), 0);
+            let r = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK);
+            assert!(r >= 0);
+            assert_eq!(probe(r), Probe::Nothing, "no writer yet");
+            let w = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK);
+            assert!(w >= 0);
+            assert_eq!(probe(r), Probe::Nothing, "a writer, nothing written");
+            assert_eq!(libc::write(w, b"ab".as_ptr().cast(), 2), 2);
+            assert_eq!(probe(r), Probe::Data);
+            libc::close(w);
+            assert_eq!(probe(r), Probe::Data, "gone, data left");
+            let mut b = [0u8; 4];
+            assert_eq!(libc::read(r, b.as_mut_ptr().cast(), 4), 2, "the look took nothing");
+            assert_eq!(probe(r), Probe::HungUp);
+            libc::close(r);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

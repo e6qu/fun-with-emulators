@@ -476,7 +476,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         reaper::busy(|| {
             fwe_kernel::pidns::reaped(r);
             fwe_kernel::procreg::reaped(r);
-            reaper::reaped_own_child();
+            reaper::reaped_own_child(r);
         });
         reaper::reaped_child(r);
     }
@@ -616,7 +616,7 @@ fn waitid_host(
             reaper::busy(|| {
                 fwe_kernel::pidns::reaped(pid);
                 fwe_kernel::procreg::reaped(pid);
-                reaper::reaped_own_child();
+                reaper::reaped_own_child(pid);
             });
             reaper::reaped_child(pid);
         }

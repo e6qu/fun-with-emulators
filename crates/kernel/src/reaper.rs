@@ -217,10 +217,18 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
     None
 }
 
-/// A reaper reaped a child of its own: what that child left unreaped is
-/// now the reaper's, and owed its SIGCHLD.
-pub fn reaped_own_child() {
+/// A reaper reaped `child`, a child of its own: what that child left
+/// unreaped is now the reaper's, and owed its SIGCHLD before the `wait`
+/// returns, as Linux hands a parent's zombies on as the parent ends. One
+/// killed outright left no record of its end, which the watcher may not
+/// have made yet: it is made here.
+pub fn reaped_own_child(child: i32) {
     if active() {
+        for (pid, r) in procreg::all() {
+            if r.lineage.first().is_some_and(|&(p, _)| p == child) {
+                procreg::gone(pid);
+            }
+        }
         notify();
     }
 }

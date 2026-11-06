@@ -1406,7 +1406,8 @@ fn alpine_podman_runs_an_image() {
         cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
-        if !out.status.success() && args[0] != "run" {
+        // A `run` ends with its container's status; one killed hung.
+        if !out.status.success() && (args[0] != "run" || out.status.code().is_none()) {
             print_last_calls(&trace);
         }
         out
