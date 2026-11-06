@@ -289,11 +289,114 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
     0
 }
 
+/// `epoll_pwait` on a kqueue. A set that watches the read end of a named
+/// FIFO waits in slices, looking between them for the end of its writers,
+/// which the host does not report ([`crate::fifo`]).
 #[cfg(not(target_os = "linux"))]
 unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> i64 {
     use fwe_abi::epoll::*;
+    let ms = timeout as i32;
+    let fifos: Vec<(i32, u64, u32)> = interest(|m| {
+        m.get(&(epfd as i32)).map_or_else(Vec::new, |l| {
+            l.iter()
+                .filter(|(_, (ev, _))| ev & EPOLLIN != 0)
+                .map(|(&fd, &(ev, d))| (fd, d, ev))
+                .collect()
+        })
+    })
+    .into_iter()
+    .filter(|&(fd, ..)| crate::fifo::is_reader(fd))
+    .collect();
+    if fifos.is_empty() {
+        // SAFETY: the caller's guarantee, passed on.
+        return unsafe { kevent_into(epfd, events, 0, maxevents as usize, ms) };
+    }
+    let deadline =
+        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    loop {
+        // FIFOs whose writers have gone, or with bytes a probe kept.
+        let mut ready: Vec<(u32, u64)> = Vec::new();
+        for &(fd, data, ev) in &fifos {
+            match crate::fifo::probe(fd) {
+                crate::fifo::Probe::HungUp => {
+                    // Edge-triggered: once, as Linux reports the change.
+                    if ev & EPOLLET == 0 || hup_first(epfd as i32, fd) {
+                        ready.push((EPOLLIN | EPOLLHUP, data));
+                    }
+                }
+                _ => {
+                    hup_clear(epfd as i32, fd);
+                    if crate::fifo::has_kept(fd) {
+                        ready.push((EPOLLIN, data));
+                    }
+                }
+            }
+        }
+        let max = maxevents as usize;
+        ready.truncate(max);
+        if !ready.is_empty() {
+            for (i, &(bits, data)) in ready.iter().enumerate() {
+                let dst = events + (i * EVENT_SIZE) as u64;
+                crate::guest!(crate::uaccess::write(
+                    dst,
+                    fwe_abi::EpollEvent { events: bits, data }
+                ));
+            }
+            // And whatever else is ready now.
+            // SAFETY: the caller's guarantee, passed on.
+            let more = unsafe { kevent_into(epfd, events, ready.len(), max, 0) };
+            return ready.len() as i64 + more.max(0);
+        }
+        let slice = match deadline {
+            None => crate::fifo::SLICE_MS,
+            Some(d) => {
+                let left =
+                    d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+                left.min(crate::fifo::SLICE_MS)
+            }
+        };
+        // SAFETY: the caller's guarantee, passed on.
+        let n = unsafe { kevent_into(epfd, events, 0, max, slice) };
+        if n != 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return n;
+        }
+    }
+}
 
-    let max = maxevents as usize;
+/// The FIFOs whose writers' end an edge-triggered set has reported, by
+/// epoll descriptor and descriptor.
+#[cfg(not(target_os = "linux"))]
+static HUP: std::sync::Mutex<Vec<(i32, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the hang-up of `fd` is news to epoll set `epfd` (and note it).
+#[cfg(not(target_os = "linux"))]
+fn hup_first(epfd: i32, fd: i32) -> bool {
+    let mut h = HUP.lock().unwrap_or_else(|e| e.into_inner());
+    if h.contains(&(epfd, fd)) {
+        return false;
+    }
+    h.push((epfd, fd));
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hup_clear(epfd: i32, fd: i32) {
+    HUP.lock().unwrap_or_else(|e| e.into_inner()).retain(|&k| k != (epfd, fd));
+}
+
+/// Wait up to `ms` milliseconds (forever if negative) on kqueue `epfd`,
+/// writing the events as `epoll_event`s from slot `first` of `events`, at
+/// most `max` in all. Returns how many, or the error.
+///
+/// # Safety
+/// `events` spans `max` entries.
+#[cfg(not(target_os = "linux"))]
+unsafe fn kevent_into(epfd: u64, events: u64, first: usize, max: usize, ms: i32) -> i64 {
+    use fwe_abi::epoll::*;
+    if first >= max {
+        return 0;
+    }
+    let room = max - first;
     let mut out: Vec<libc::kevent> = vec![
         libc::kevent {
             ident: 0,
@@ -303,31 +406,27 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        max
+        room
     ];
-
-    let ms = timeout as i32;
     let ts = libc::timespec {
         tv_sec: (ms / 1000) as libc::time_t,
         tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
     };
     let ts_ptr: *const libc::timespec = if ms < 0 { std::ptr::null() } else { &ts };
-
-    // SAFETY: `out` holds `max` entries; `ts_ptr` is null or a valid timespec.
+    // SAFETY: `out` holds `room` entries; `ts_ptr` is null or a valid timespec.
     let n = unsafe {
         libc::kevent(
             epfd as libc::c_int,
             std::ptr::null(),
             0,
             out.as_mut_ptr(),
-            max as libc::c_int,
+            room as libc::c_int,
             ts_ptr,
         )
     };
     if n < 0 {
         return crate::host::last_error();
     }
-
     for (i, ev) in out[..n as usize].iter().enumerate() {
         let mut bits: u32 = 0;
         match ev.filter {
@@ -341,7 +440,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
         if ev.flags & libc::EV_ERROR != 0 {
             bits |= EPOLLERR;
         }
-        let dst = events + (i * EVENT_SIZE) as u64;
+        let dst = events + ((first + i) * EVENT_SIZE) as u64;
         let out = fwe_abi::EpollEvent { events: bits, data: ev.udata as u64 };
         crate::guest!(crate::uaccess::write(dst, out));
     }

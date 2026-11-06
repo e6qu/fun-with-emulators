@@ -22,6 +22,8 @@ pub const BPF_PROG_QUERY: u64 = 16;
 
 /// The one program type fwe runs.
 pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+/// The highest program type Linux 6.x has (`BPF_PROG_TYPE_NETFILTER`).
+const MAX_PROG_TYPE: u32 = 32;
 /// Its attach type.
 pub const BPF_CGROUP_DEVICE: u32 = 6;
 
@@ -391,10 +393,11 @@ fn last() -> i32 {
     crate::host::errno_to_linux(crate::host::last_errno())
 }
 
-/// A descriptor for loaded program `bytes` with identity `id`: an unlinked
-/// file of fwe's holding its instructions.
+/// A descriptor for loaded program `bytes` of type `ty` with identity
+/// `id`: an unlinked file of fwe's holding its instructions, its identity
+/// and type in an attribute.
 #[cfg(target_os = "macos")]
-fn prog_fd(bytes: &[u8], id: u32) -> Result<i32, i32> {
+fn prog_fd(bytes: &[u8], id: u32, ty: u32) -> Result<i32, i32> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let mut path = crate::fs::shm::user_dir()?;
@@ -411,11 +414,13 @@ fn prog_fd(bytes: &[u8], id: u32) -> Result<i32, i32> {
     }
     // SAFETY: as above; fwe's own file.
     unsafe { libc::unlink(p.as_ptr()) };
-    let idb = id.to_le_bytes();
+    let mut idb = [0u8; 8];
+    idb[..4].copy_from_slice(&id.to_le_bytes());
+    idb[4..].copy_from_slice(&ty.to_le_bytes());
     // SAFETY: valid buffers for the calls.
     let ok = unsafe {
         libc::write(fd, bytes.as_ptr().cast(), bytes.len()) == bytes.len() as isize
-            && libc::fsetxattr(fd, PROG_ATTR.as_ptr(), idb.as_ptr().cast(), 4, 0, 0) == 0
+            && libc::fsetxattr(fd, PROG_ATTR.as_ptr(), idb.as_ptr().cast(), 8, 0, 0) == 0
     };
     if !ok {
         let e = last();
@@ -429,12 +434,7 @@ fn prog_fd(bytes: &[u8], id: u32) -> Result<i32, i32> {
 /// The identity and instructions of the program `fd` is a descriptor of.
 #[cfg(target_os = "macos")]
 pub fn prog_of(fd: i32) -> Option<(u32, Vec<u8>)> {
-    let mut idb = [0u8; 4];
-    // SAFETY: a valid buffer of its length.
-    let n = unsafe { libc::fgetxattr(fd, PROG_ATTR.as_ptr(), idb.as_mut_ptr().cast(), 4, 0, 0) };
-    if n != 4 {
-        return None;
-    }
+    let (id, _) = prog_id_type(fd)?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -446,7 +446,25 @@ pub fn prog_of(fd: i32) -> Option<(u32, Vec<u8>)> {
         }
         bytes.extend_from_slice(&chunk[..n as usize]);
     }
-    Some((u32::from_le_bytes(idb), bytes))
+    Some((id, bytes))
+}
+
+/// The identity and program type of the program `fd` is a descriptor of.
+#[cfg(target_os = "macos")]
+fn prog_id_type(fd: i32) -> Option<(u32, u32)> {
+    let mut idb = [0u8; 8];
+    // SAFETY: a valid buffer of its length.
+    let n = unsafe { libc::fgetxattr(fd, PROG_ATTR.as_ptr(), idb.as_mut_ptr().cast(), 8, 0, 0) };
+    if n != 8 {
+        return None;
+    }
+    let w = |i: usize| u32::from_le_bytes(idb[i..i + 4].try_into().unwrap());
+    Some((w(0), w(4)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prog_id_type(_fd: i32) -> Option<(u32, u32)> {
+    None
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -487,8 +505,9 @@ fn dword(a: &[u8], at: usize) -> u64 {
 }
 
 /// `bpf(cmd, attr, size)` for the device controller's programs: load,
-/// attach, detach, query, and a descriptor by identity. Other commands and
-/// program types fail as on a kernel without them.
+/// attach, detach, query, and a descriptor by identity. A program of
+/// another type loads (as programs probe for features by loading one) but
+/// cannot be attached; other commands fail as on a kernel without them.
 pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     use fwe_abi::err;
     let size = size.min(256) as usize;
@@ -498,7 +517,8 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     }
     let r = match cmd {
         BPF_PROG_LOAD => (|| {
-            if word(&a, 0) != BPF_PROG_TYPE_CGROUP_DEVICE {
+            let ty = word(&a, 0);
+            if ty == 0 || ty > MAX_PROG_TYPE {
                 return Err(errno::EINVAL);
             }
             let n = word(&a, 4) as usize;
@@ -506,9 +526,13 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                 return Err(errno::E2BIG);
             }
             let bytes = crate::uaccess::read_bytes(dword(&a, 8), n * 8)?;
-            load(&bytes)?;
+            // A device program is checked as fwe will run it; one of
+            // another type is kept but never attached (see below).
+            if ty == BPF_PROG_TYPE_CGROUP_DEVICE {
+                load(&bytes)?;
+            }
             #[cfg(target_os = "macos")]
-            return prog_fd(&bytes, fresh_id()).map(|fd| fd as i64);
+            return prog_fd(&bytes, fresh_id(), ty).map(|fd| fd as i64);
             #[cfg(not(target_os = "macos"))]
             return Err(errno::ENOSYS);
         })(),
@@ -523,6 +547,10 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                 return crate::cgroupfs::detach(&dir, id).map(|()| 0);
             }
             let (id, bytes) = prog_of(prog).ok_or(errno::EBADF)?;
+            if prog_id_type(prog).map(|(_, t)| t) != Some(BPF_PROG_TYPE_CGROUP_DEVICE) {
+                // fwe runs device programs only.
+                return Err(errno::EINVAL);
+            }
             // Without BPF_F_ALLOW_MULTI (2) the program replaces what was
             // attached; with BPF_F_REPLACE (4) it replaces the one named.
             let flags = word(&a, 12);
@@ -561,9 +589,10 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
         })(),
         BPF_PROG_GET_FD_BY_ID => (|| {
             let id = word(&a, 0);
+            // Only attached programs are found by identity: device ones.
             let bytes = crate::cgroupfs::find(id).ok_or(errno::ENOENT)?;
             #[cfg(target_os = "macos")]
-            return prog_fd(&bytes, id).map(|fd| fd as i64);
+            return prog_fd(&bytes, id, BPF_PROG_TYPE_CGROUP_DEVICE).map(|fd| fd as i64);
             #[cfg(not(target_os = "macos"))]
             return {
                 let _ = bytes;
@@ -656,5 +685,74 @@ mod tests {
         assert_eq!(load(&half), Err(errno::EINVAL));
         let forever = [ins(0x05, 0, 0, -1, 0)].concat();
         assert_eq!(run(&load(&forever).unwrap(), 2, 2, 1, 3), None);
+    }
+}
+
+/// The identity, type and instructions of the program `fd` is a
+/// descriptor of, if it is one.
+pub fn prog_info(fd: i32) -> Option<(u32, u32, Vec<u8>)> {
+    let (id, bytes) = prog_of(fd)?;
+    let (_, ty) = prog_id_type(fd)?;
+    Some((id, ty, bytes))
+}
+
+/// A program's tag, as Linux computes it: the first 8 bytes of the SHA-1
+/// of its instructions, in hex.
+pub fn tag_hex(insns: &[u8]) -> String {
+    sha1(insns)[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA-1 (FIPS 180-4) of `data`.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut msg = data.to_vec();
+    let bits = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bits.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(chunk[4 * i..4 * i + 4].try_into().unwrap());
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let t =
+                a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (i, v) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod sha1_tests {
+    #[test]
+    fn known_digests() {
+        let hex = |d: [u8; 20]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(super::sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(hex(super::sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
     }
 }

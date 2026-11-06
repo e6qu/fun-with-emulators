@@ -28,6 +28,10 @@ pub struct Origin {
     /// The layers of the overlay it was opened in, if it was: the
     /// overlay's file it is wherever the mount has gone since.
     pub ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
+    /// For an `O_PATH` descriptor fwe could not open the file for (a FIFO,
+    /// which any open of would count as a reader; a device or a socket):
+    /// the host path of the file the stand-in descriptor names.
+    pub stand_in: Option<Vec<u8>>,
 }
 
 /// A socket standing in for another kind.
@@ -49,6 +53,12 @@ pub enum Mark {
     /// `privileged` there, and whose own id in the map's parent namespace
     /// is `own` (Linux checks the opener's credentials).
     ProcMap { host: i32, which: u8, privileged: bool, own: u32 },
+    /// `/proc/<pid>/oom_score_adj` (or the older `oom_adj`, `legacy`) of
+    /// host process `host`, opened for writing by a process that may lower
+    /// it (`privileged`: `CAP_SYS_RESOURCE`).
+    OomScore { host: i32, legacy: bool, privileged: bool },
+    /// An `AF_NETLINK` socket ([`crate::netlink`]).
+    Netlink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,8 +136,30 @@ pub fn opened(
     ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 ) {
     let Some((dev, ino)) = identity(fd) else { return };
-    let origin = Some(Origin { flags, fstype, ns_path, ovl });
+    let origin = Some(Origin { flags, fstype, ns_path, ovl, stand_in: None });
     insert(&mut records(), fd, Record { dev, ino, origin, mark: None });
+}
+
+/// How many stand-in descriptors were made ([`set_stand_in`]), so that a
+/// path lookup looks for one only once there are any.
+static STAND_INS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `fd` is a stand-in for the file at host path `host` (see
+/// [`Origin::stand_in`]), its origin recorded already.
+pub fn set_stand_in(fd: i32, host: Vec<u8>) {
+    let mut r = records();
+    if let Some(o) = r.get_mut(&fd).and_then(|rec| rec.origin.as_mut()) {
+        STAND_INS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        o.stand_in = Some(host);
+    }
+}
+
+/// The host path of the file stand-in descriptor `fd` names, if it is one.
+pub fn stand_in(fd: i32) -> Option<Vec<u8>> {
+    if STAND_INS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return None;
+    }
+    origin(fd)?.stand_in
 }
 
 /// How many marks there are, so that a write looks for one only while
@@ -221,6 +253,8 @@ pub fn save(e: &mut Enc) {
                 if let Some(l) = &o.ovl {
                     l.encode(e);
                 }
+                e.bool(o.stand_in.is_some());
+                e.bytes(o.stand_in.as_deref().unwrap_or_default());
             }
             None => e.bool(false),
         }
@@ -230,10 +264,17 @@ pub fn save(e: &mut Enc) {
             Some(Mark::DevFull) => 2,
             Some(Mark::NetBound { .. }) => 3,
             Some(Mark::ProcMap { .. }) => 4,
+            Some(Mark::OomScore { .. }) => 7,
+            Some(Mark::Netlink) => 8,
             Some(Mark::Sysctl(_)) => 6,
         });
         if let Some(Mark::Sysctl(i)) = rec.mark {
             e.u8(i);
+        }
+        if let Some(Mark::OomScore { host, legacy, privileged }) = rec.mark {
+            e.i32(host);
+            e.bool(legacy);
+            e.bool(privileged);
         }
         if let Some(Mark::ProcMap { host, which, privileged, own }) = rec.mark {
             e.i32(host);
@@ -258,7 +299,12 @@ pub fn load(d: &mut Dec) {
         let origin = if d.bool() {
             let (flags, fstype, ns_path) = (d.u64(), FsType::from_code(d.u32()), d.bytes());
             let ovl = d.bool().then(|| std::sync::Arc::new(crate::overlay::Layers::decode(d)));
-            Some(Origin { flags, fstype, ns_path, ovl })
+            let (some, path) = (d.bool(), d.bytes());
+            let stand_in = some.then_some(path);
+            if stand_in.is_some() {
+                STAND_INS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Some(Origin { flags, fstype, ns_path, ovl, stand_in })
         } else {
             None
         };
@@ -273,6 +319,8 @@ pub fn load(d: &mut Dec) {
                 own: d.u32(),
             }),
             6 => Some(Mark::Sysctl(d.u8())),
+            7 => Some(Mark::OomScore { host: d.i32(), legacy: d.bool(), privileged: d.bool() }),
+            8 => Some(Mark::Netlink),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

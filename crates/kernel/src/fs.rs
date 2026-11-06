@@ -551,6 +551,10 @@ impl Fs {
     /// A synthetic `/proc` or `/sys` entry for `path`, if it names one. Only
     /// absolute paths and `AT_FDCWD`-relative paths are considered.
     pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
+        if path.is_empty() {
+            // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).
+            return None;
+        }
         let absolute = self.absolute(dirfd, path)?;
         let (m, fs_path) = self.mount_of(&absolute);
         let absolute = match m.fstype {
@@ -578,6 +582,11 @@ impl Fs {
             Ok(a) => a,
             Err((host, pid, sub)) => {
                 return Some(match host {
+                    Some(h) if sub == b"/fd" => match crate::procreg::read(h) {
+                        Some(_) => crate::procfs::Entry::Dir,
+                        None => crate::procfs::Entry::Missing,
+                    },
+                    Some(h) if sub.starts_with(b"/fd/") => self.other_fd(h, &sub[4..]),
                     Some(h) => crate::procpid::entry(h, pid, &sub),
                     None => crate::procfs::Entry::Missing,
                 });
@@ -639,6 +648,12 @@ impl Fs {
                     }));
                 }
             }
+            b"/proc/self/oom_score_adj" | b"/proc/self/oom_adj" | b"/proc/self/oom_score" => {
+                let sub = &absolute[b"/proc/self".len()..];
+                // SAFETY: getpid cannot fail.
+                let adj = crate::procreg::oom_score_adj(unsafe { libc::getpid() });
+                return Some(crate::procfs::Entry::File(crate::procpid::oom_file(sub, adj)));
+            }
             b"/proc/self/cgroup" => {
                 let root = self.ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
                 return Some(crate::procfs::Entry::File(crate::cgroupfs::proc_self_cgroup(&root)));
@@ -661,6 +676,16 @@ impl Fs {
             }
             b"/proc/mounts" => return Some(crate::procfs::Entry::Symlink(b"self/mounts".to_vec())),
             _ => {}
+        }
+        if absolute == b"/proc/self/fdinfo" {
+            return Some(crate::procfs::Entry::Dir);
+        }
+        if let Some(n) = absolute.strip_prefix(b"/proc/self/fdinfo/") {
+            let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok());
+            return Some(match fd.filter(|&fd| self.guest_fd_open(fd)) {
+                Some(fd) => crate::procfs::Entry::File(self.fdinfo(fd)),
+                None => crate::procfs::Entry::Missing,
+            });
         }
         if let Some(n) = absolute.strip_prefix(b"/proc/self/fd/") {
             let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok());
@@ -703,8 +728,16 @@ impl Fs {
             return b"anon_inode:[unknown]".to_vec();
         }
         match st.st_mode & libc::S_IFMT {
-            libc::S_IFIFO => return format!("pipe:[{}]", st.st_ino).into_bytes(),
-            libc::S_IFSOCK => return format!("socket:[{}]", st.st_ino).into_bytes(),
+            // A pipe; a named FIFO has its path.
+            libc::S_IFIFO if fd_path(fd).is_none() => {
+                return format!("pipe:[{}]", st.st_ino).into_bytes();
+            }
+            libc::S_IFSOCK => {
+                // Named as other processes see it ([`crate::procpid::socket_id`]).
+                // SAFETY: getpid cannot fail.
+                let id = crate::procpid::socket_id(unsafe { libc::getpid() }, fd);
+                return format!("socket:[{}]", id.unwrap_or(st.st_ino as u64)).into_bytes();
+            }
             _ => {}
         }
         if let Some(guest) = crate::fdmarks::origin(fd).and_then(|o| self.from_ns(&o.ns_path)) {
@@ -715,6 +748,73 @@ impl Fs {
             // A kqueue (an epoll descriptor) has neither path nor type.
             None => b"anon_inode:[eventpoll]".to_vec(),
         }
+    }
+
+    /// `/proc/<pid>/fd/<n>` of another process, host process `host`: a
+    /// link to what its descriptor `n` is open on, a path as this process
+    /// sees it.
+    fn other_fd(&self, host: i32, n: &[u8]) -> crate::procfs::Entry {
+        use crate::procpid::FdTarget;
+        let Some(fd) = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok()) else {
+            return crate::procfs::Entry::Missing;
+        };
+        let Some((_, target)) = crate::procpid::fds(host).into_iter().find(|(f, _)| *f == fd)
+        else {
+            return crate::procfs::Entry::Missing;
+        };
+        crate::procfs::Entry::Symlink(match target {
+            FdTarget::Path(p) => self.host_to_guest(&p).unwrap_or(p),
+            FdTarget::Pipe(id) => format!("pipe:[{id}]").into_bytes(),
+            FdTarget::Socket(id) => format!("socket:[{id}]").into_bytes(),
+            FdTarget::Anon(name) => name.as_bytes().to_vec(),
+        })
+    }
+
+    /// Whether guest descriptor `fd` is open.
+    fn guest_fd_open(&self, fd: i32) -> bool {
+        // SAFETY: F_GETFD only queries the descriptor.
+        fd >= 0
+            && crate::fdtable::guest_visible(fd)
+            && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0
+    }
+
+    /// `/proc/self/fdinfo/<fd>`: the descriptor's offset, flags (Linux's),
+    /// mount and inode, and for a BPF program its type, tag and identity.
+    #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
+    fn fdinfo(&self, fd: i32) -> Vec<u8> {
+        // SAFETY: plain host calls on an open descriptor.
+        let (pos, status, fd_flags) = unsafe {
+            (
+                libc::lseek(fd, 0, libc::SEEK_CUR).max(0),
+                libc::fcntl(fd, libc::F_GETFL),
+                libc::fcntl(fd, libc::F_GETFD),
+            )
+        };
+        let mut flags = crate::host::status_flags_to_linux(status);
+        if fd_flags & libc::FD_CLOEXEC != 0 {
+            flags |= fcntl::O_CLOEXEC;
+        }
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        unsafe { libc::fstat(fd, &mut st) };
+        let mnt = crate::fdmarks::origin(fd)
+            .filter(|o| !o.ns_path.is_empty())
+            .map_or(self.mnt.table().root().id, |o| self.mnt.table().locate(&o.ns_path).0.id);
+        let mut out = format!(
+            "pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t{mnt}\nino:\t{}\n",
+            st.st_ino as u64
+        );
+        if let Some((id, ty, insns)) = crate::bpf::prog_info(fd) {
+            out.push_str(&format!(
+                "prog_type:\t{ty}\nprog_jited:\t0\nprog_tag:\t{}\nmemlock:\t4096\n\
+                 prog_id:\t{id}\nrun_time_ns:\t0\nrun_cnt:\t0\nrecursion_misses:\t0\n\
+                 verified_insns:\t{}\n",
+                crate::bpf::tag_hex(&insns),
+                insns.len() / 8
+            ));
+        }
+        out.into_bytes()
     }
 
     /// Whether `path` names `/proc/self/fd`, whose listing is the open
@@ -759,6 +859,18 @@ impl Fs {
         };
         let absolute = match own_or_other(&absolute) {
             Ok(a) => a,
+            Err((Some(h), _, sub)) if sub == b"/fd" => {
+                let mut out = vec![
+                    (b".".to_vec(), crate::procfs::DT_DIR),
+                    (b"..".to_vec(), crate::procfs::DT_DIR),
+                ];
+                out.extend(
+                    crate::procpid::fds(h)
+                        .into_iter()
+                        .map(|(fd, _)| (fd.to_string().into_bytes(), crate::procfs::DT_LNK)),
+                );
+                return Some(out);
+            }
             Err((Some(_), pid, sub)) => return crate::procpid::children(pid, &sub),
             Err((None, _, _)) => return None,
         };
@@ -768,6 +880,18 @@ impl Fs {
                 crate::procpid::listed()
                     .into_iter()
                     .map(|p| (p.to_string().into_bytes(), crate::procfs::DT_DIR)),
+            );
+            return Some(out);
+        }
+        if absolute == b"/proc/self/fdinfo" {
+            let mut out = vec![
+                (b".".to_vec(), crate::procfs::DT_DIR),
+                (b"..".to_vec(), crate::procfs::DT_DIR),
+            ];
+            out.extend(
+                crate::fdtable::open_fds()
+                    .into_iter()
+                    .map(|fd| (fd.to_string().into_bytes(), crate::procfs::DT_REG)),
             );
             return Some(out);
         }
@@ -844,6 +968,11 @@ impl Fs {
     /// standard device nodes ([`DEVICES`]) resolve to the host's, and
     /// `/dev/shm` to fwe's own directory for it ([`shm`]).
     pub fn resolve(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
+        if path.is_empty() {
+            // An empty path names nothing, as on Linux; a call that takes
+            // `AT_EMPTY_PATH` acts on its descriptor before resolving.
+            return Err(errno::ENOENT);
+        }
         resolve_in(&self.view(), dirfd, path, follow_final)
     }
 
@@ -1776,6 +1905,78 @@ pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i
     Ok(host)
 }
 
+thread_local! {
+    /// A FIFO [`open_fifo_unlocked`] opened for this thread's `openat`: its
+    /// descriptor, and the Linux flags it was opened with.
+    static FIFO: std::cell::Cell<Option<(i32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Before an `openat(dirfd, path, flags)` that runs under the kernel lock:
+/// if `path` names a FIFO and the open is one that waits for the other end
+/// (to read or to write, without `O_NONBLOCK`), open it here, where the
+/// wait holds no lock and a signal interrupts it (`EINTR`). The locked
+/// open takes the descriptor ([`take_fifo`]). Only paths from the working
+/// directory or absolute are looked at (the view that runs without the
+/// lock has no descriptors to start from).
+pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<(), i32> {
+    use fwe_abi::fcntl as f;
+    if flags & (f::O_NONBLOCK | f::O_PATH) != 0 || flags & f::O_ACCMODE == f::O_RDWR {
+        return Ok(());
+    }
+    let Ok(path) = crate::uaccess::read_cstr(path, crate::uaccess::PATH_MAX) else { return Ok(()) };
+    if path.first() != Some(&b'/') && dirfd as i64 != fcntl::AT_FDCWD {
+        return Ok(());
+    }
+    let Ok(host) = resolve_host(&path, flags & f::O_NOFOLLOW == 0) else { return Ok(()) };
+    let Ok(c) = cstr(&host) else { return Ok(()) };
+    // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid out-parameter.
+    if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO
+    {
+        return Ok(());
+    }
+    let access = if flags & f::O_ACCMODE == f::O_WRONLY { libc::O_WRONLY } else { libc::O_RDONLY };
+    // SAFETY: as above; waits for the other end.
+    let fd = unsafe { libc::open(c.as_ptr(), access | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(e());
+    }
+    if let Some((old, _)) = FIFO.with(|f| f.replace(Some((fd, flags)))) {
+        // SAFETY: one this thread opened and never handed on.
+        unsafe { libc::close(old) };
+    }
+    Ok(())
+}
+
+/// Close a FIFO [`open_fifo_unlocked`] opened that this thread's `openat`
+/// did not take (it failed first), so it holds no end of the FIFO open.
+pub(crate) fn drop_fifo() {
+    if let Some((fd, _)) = FIFO.with(|f| f.take()) {
+        // SAFETY: this thread's own, never handed on.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// The FIFO [`open_fifo_unlocked`] opened for this thread's `openat` with
+/// `flags`, if it is the file `st` describes: the locked open uses it
+/// instead of waiting under the lock. Any other is closed.
+pub(crate) fn take_fifo(flags: u64, st: &libc::stat) -> Option<i32> {
+    let (fd, with) = FIFO.with(|f| f.take())?;
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut own: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    let same = unsafe { libc::fstat(fd, &mut own) } == 0
+        && (own.st_dev, own.st_ino) == (st.st_dev, st.st_ino)
+        && with & fwe_abi::fcntl::O_ACCMODE == flags & fwe_abi::fcntl::O_ACCMODE;
+    if same {
+        return Some(fd);
+    }
+    // SAFETY: this thread's own, never handed on.
+    unsafe { libc::close(fd) };
+    None
+}
+
 /// The guest path of the host path an `AF_UNIX` socket is bound to, if it
 /// is in the published view.
 pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
@@ -2010,8 +2211,12 @@ fn open_dir(dir: i32, name: &std::ffi::CStr) -> Result<OwnedFd, i32> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// The host path a descriptor refers to.
+/// The host path a descriptor refers to (for a stand-in `O_PATH`
+/// descriptor, the file it names).
 pub(crate) fn fd_path(fd: i32) -> Option<Vec<u8>> {
+    if let Some(p) = crate::fdmarks::stand_in(fd) {
+        return Some(p);
+    }
     #[cfg(target_os = "macos")]
     {
         let mut buf = [0u8; 1024]; // PATH_MAX on macOS.

@@ -3867,6 +3867,32 @@ fn overlay_mounts() {
     );
 }
 
+/// What container runtimes ask beyond the namespaces, as containerd's shim
+/// and runc ask it: an `O_PATH` descriptor of a FIFO is no reader of it and
+/// stats as it; a FIFO's open waits for its other end while the process's
+/// other threads run on, and its reader sees its writer go in `epoll` and
+/// `poll`; `/proc` shows namespace links as their namespaces, `fdinfo`,
+/// another process's descriptors, `oom_score_adj` (inherited), and is
+/// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
+/// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
+/// is not attached; limits set with `prlimit` from outside; netlink of a
+/// network namespace's `lo`.
+#[test]
+fn container_runtime_calls() {
+    assert_eq!(
+        containers("runtime-calls"),
+        "stat \"\": ENOENT\nwriter with only an O_PATH: ENXIO\nO_PATH fstat is a FIFO: true\n\
+         its link: /tmp/ff\nanother thread ran\nopened the FIFO: true\ndata: 1\n\
+         writer gone: 1 hup true\npoll: hup true\nthen: 0\nns inode matches: true\n\
+         fdinfo: true\nproc fstatfs: 0x9fa0\noom: 500 child's fd 9: /etc/marker\n\
+         prlimit of the child: ok\nchild: oom 500 nofile 100 200\npeer: self true uid 0\n\
+         shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
+         linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
+         attached as a device program: EINVAL\nnetlink outside: EAFNOSUPPORT\n\
+         netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
+    );
+}
+
 /// An overlay keeps its layers' own directories theirs, makes nothing for
 /// `O_PATH`, follows a directory moved since it was opened, keeps a
 /// descriptor on its own file when another is renamed over it, reads a

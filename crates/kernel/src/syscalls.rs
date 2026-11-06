@@ -197,6 +197,8 @@ impl<P: Platform> Kernel<P> {
                 {
                     crate::netns::closed(fd, mark);
                 }
+                crate::netlink::closed(fd);
+                crate::fifo::closed(fd);
                 crate::fdmarks::closed(fd);
                 if let Some(r) = crate::specialfd::try_close(fd) {
                     r
@@ -248,10 +250,16 @@ impl<P: Platform> Kernel<P> {
 
             // Sockets. The blocking calls (connect, accept, send*, recv*) are
             // handled lock-free in `blocking_syscall`; these set up or query.
+            nr::SOCKET if a[0] == crate::netlink::AF_NETLINK => {
+                crate::netlink::socket(a[1], a[2], self.creds.has(crate::caps::CAP_NET_ADMIN))
+            }
             // SAFETY: socket takes no pointers.
             nr::SOCKET => unsafe { crate::net::socket(a[0], a[1], a[2]) },
             // SAFETY: the sv pointer is validated by the host/impl.
             nr::SOCKETPAIR => unsafe { crate::net::socketpair(a[0], a[1], a[2], a[3]) },
+            nr::BIND if crate::netlink::is(a[0] as i32) => {
+                crate::netlink::bind(a[0] as i32, a[1], a[2])
+            }
             // SAFETY: the sockaddr pointer is validated by the host/impl.
             nr::BIND => unsafe {
                 crate::net::bind(
@@ -264,10 +272,22 @@ impl<P: Platform> Kernel<P> {
             },
             // SAFETY: no pointers.
             nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
+            nr::GETSOCKNAME if crate::netlink::is(a[0] as i32) => {
+                crate::netlink::getname(a[0] as i32, a[1], a[2], false)
+            }
+            nr::GETPEERNAME if crate::netlink::is(a[0] as i32) => {
+                crate::netlink::getname(a[0] as i32, a[1], a[2], true)
+            }
             // SAFETY: the out pointers are validated by the host/impl.
             nr::GETSOCKNAME => unsafe { crate::net::getname(a[0], a[1], a[2], false) },
             // SAFETY: the out pointers are validated by the host/impl.
             nr::GETPEERNAME => unsafe { crate::net::getname(a[0], a[1], a[2], true) },
+            // A netlink socket's own options change nothing fwe does.
+            nr::SETSOCKOPT
+                if a[1] == crate::netlink::SOL_NETLINK && crate::netlink::is(a[0] as i32) =>
+            {
+                0
+            }
             // SAFETY: the option buffer is validated by the host/impl.
             nr::SETSOCKOPT => unsafe { crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4]) },
             // SAFETY: the out buffers are validated by the host/impl.
@@ -1273,11 +1293,17 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_prlimit(&mut self, pid: u64, res: u64, new: u64, old: u64) -> i64 {
-        if pid != 0 && pid as i32 != thread::tgid() {
-            return err(errno::ESRCH);
-        }
+        self.take_pending_limits();
         if res >= resource::RLIM_NLIMITS {
             return err(errno::EINVAL);
+        }
+        let target = match crate::pidns::host_arg(pid as i32) {
+            Ok(0) => host::getpid() as i32,
+            Ok(h) => h,
+            Err(e) => return err(e),
+        };
+        if target != host::getpid() as i32 {
+            return self.prlimit_other(target, res, new, old);
         }
         if res == resource::RLIMIT_NOFILE {
             // Virtual: the host's limit also covers fwe's own descriptors.
@@ -1330,6 +1356,62 @@ impl<P: Platform> Kernel<P> {
             }
         }
         0
+    }
+
+    /// `prlimit` of another process, host process `target`: the limit it
+    /// was left (or, none left, the caller's own, which a child inherits:
+    /// fwe cannot read another's), and a new one left for it to take up
+    /// ([`crate::procreg::push_limit`]), with `CAP_SYS_RESOURCE` (fwe does
+    /// not know the other's credentials to allow its owner).
+    fn prlimit_other(&mut self, target: i32, res: u64, new: u64, old: u64) -> i64 {
+        if crate::procreg::read(target).is_none() {
+            return err(errno::ESRCH);
+        }
+        let n: Option<Rlimit> = if new != 0 { Some(guest!(uaccess::read(new))) } else { None };
+        if n.is_some() && !self.creds.has(crate::caps::CAP_SYS_RESOURCE) {
+            return err(errno::EPERM);
+        }
+        if let Some(n) = &n
+            && n.rlim_cur > n.rlim_max
+        {
+            return err(errno::EINVAL);
+        }
+        if old != 0 {
+            match crate::procreg::pending_limit(target, res as u32) {
+                Some((cur, max)) => {
+                    guest!(uaccess::write(old, Rlimit { rlim_cur: cur, rlim_max: max }));
+                }
+                None => {
+                    let r = self.sys_prlimit(0, res, 0, old);
+                    if r != 0 {
+                        return r;
+                    }
+                }
+            }
+        }
+        if let Some(n) = n
+            && let Err(e) = crate::procreg::push_limit(target, res as u32, n.rlim_cur, n.rlim_max)
+        {
+            return err(e);
+        }
+        0
+    }
+
+    /// Take up the resource limits another process set for this one.
+    pub(crate) fn take_pending_limits(&mut self) {
+        for (res, soft, hard) in crate::procreg::take_limits() {
+            let value = Rlimit { rlim_cur: soft, rlim_max: hard };
+            if u64::from(res) == resource::RLIMIT_NOFILE {
+                let _ = crate::fdtable::set_limit(soft, hard);
+            } else if let Some(hres) = host::rlimit_to_host(u64::from(res)) {
+                let r = libc::rlimit {
+                    rlim_cur: host::rlim_to_host(value.rlim_cur),
+                    rlim_max: host::rlim_to_host(value.rlim_max),
+                };
+                // SAFETY: `r` is a valid in-parameter.
+                unsafe { libc::setrlimit(hres as _, &r) };
+            }
+        }
     }
 
     fn sys_clock_gettime(&mut self, id: u64, tp: u64) -> i64 {
@@ -1546,9 +1628,66 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
         let ms = ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
         ms.min(i32::MAX as i64) as i32
     };
-    // SAFETY: `struct pollfd` and the POLL* bits match the host's; the host
-    // validates the guest array.
-    ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) })
+    // The read ends of named FIFOs it watches, whose writers' end the
+    // host does not report ([`crate::fifo`]): waited for in slices,
+    // looked at between them.
+    let fifos: Vec<usize> = if nfds as usize <= 4096 {
+        (0..nfds as usize)
+            .filter(|&i| {
+                uaccess::read::<Pollfd>(fds + (i * size_of::<Pollfd>()) as u64)
+                    .is_ok_and(|p| p.events & libc::POLLIN != 0 && crate::fifo::is_reader(p.fd))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if fifos.is_empty() {
+        // SAFETY: `struct pollfd` and the POLL* bits match the host's; the
+        // host validates the guest array.
+        return ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) });
+    }
+    let deadline =
+        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    loop {
+        let slice = match deadline {
+            None => crate::fifo::SLICE_MS,
+            Some(d) => {
+                let left =
+                    d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+                left.min(crate::fifo::SLICE_MS)
+            }
+        };
+        // SAFETY: as above.
+        let n = unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, 0) };
+        if n < 0 {
+            return last_error();
+        }
+        let mut ready = n as i64;
+        for &i in &fifos {
+            let at = fds + (i * size_of::<Pollfd>()) as u64;
+            let mut p: Pollfd = guest!(uaccess::read(at));
+            let extra = match crate::fifo::probe(p.fd) {
+                crate::fifo::Probe::HungUp => libc::POLLHUP,
+                _ if crate::fifo::has_kept(p.fd) => libc::POLLIN,
+                _ => 0,
+            };
+            if extra != 0 {
+                if p.revents == 0 {
+                    ready += 1;
+                }
+                p.revents |= extra;
+                guest!(uaccess::write(at, p));
+            }
+        }
+        if ready > 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return ready;
+        }
+        // SAFETY: as above.
+        let n = unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, slice) };
+        if n != 0 {
+            return if n < 0 { last_error() } else { n as i64 };
+        }
+    }
 }
 
 /// `u32` words as their native-endian bytes.

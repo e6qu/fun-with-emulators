@@ -126,7 +126,11 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"comm", DT_REG),
     (b"exe", DT_LNK),
     (b"cgroup", DT_REG),
+    (b"oom_score_adj", DT_REG),
+    (b"oom_adj", DT_REG),
+    (b"oom_score", DT_REG),
     (b"ns", DT_DIR),
+    (b"fd", DT_DIR),
     (b"task", DT_DIR),
 ];
 
@@ -265,6 +269,9 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),
         b"/cgroup" => Entry::File([b"0::", &rec.cgroup[..], b"\n"].concat()),
+        b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
+            Entry::File(oom_file(sub, rec.oom_score_adj))
+        }
         b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
             Some(u) => {
                 let n = u.get();
@@ -335,4 +342,186 @@ pub fn listed() -> Vec<i32> {
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+/// `/proc/<pid>/oom_score_adj`, `oom_adj` or `oom_score` (`sub`) of a
+/// process whose `oom_score_adj` is `adj`. fwe has no OOM killer to rank
+/// processes for, so the score is the adjustment's share of its range.
+pub fn oom_file(sub: &[u8], adj: i32) -> Vec<u8> {
+    let v = match sub {
+        b"/oom_adj" => legacy_adj(adj),
+        b"/oom_score" => adj.clamp(0, 1000),
+        _ => adj,
+    };
+    format!("{v}\n").into_bytes()
+}
+
+/// `oom_adj` (-17 to 15) for `oom_score_adj` `adj`, as Linux scales it.
+fn legacy_adj(adj: i32) -> i32 {
+    if adj == -1000 { -17 } else { adj * 15 / 1000 }
+}
+
+/// What a write of `data` to `/proc/<pid>/oom_score_adj` (or `oom_adj`)
+/// opened as `mark` does.
+pub fn oom_write(mark: crate::fdmarks::Mark, data: &[u8], len: u64) -> i64 {
+    use fwe_abi::{err, errno};
+    let crate::fdmarks::Mark::OomScore { host, legacy, privileged } = mark else {
+        return err(errno::EINVAL);
+    };
+    let Ok(v) = String::from_utf8_lossy(data).trim().parse::<i32>() else {
+        return err(errno::EINVAL);
+    };
+    let adj = if legacy {
+        if !(-17..=15).contains(&v) {
+            return err(errno::EINVAL);
+        }
+        if v == -17 { -1000 } else { v * 1000 / 15 }
+    } else {
+        if !(-1000..=1000).contains(&v) {
+            return err(errno::EINVAL);
+        }
+        v
+    };
+    // Lowering it takes CAP_SYS_RESOURCE, as on Linux.
+    if adj < crate::procreg::oom_score_adj(host) && !privileged {
+        return err(errno::EACCES);
+    }
+    match crate::procreg::set_oom_score_adj(host, adj) {
+        Ok(()) => len as i64,
+        Err(_) => err(errno::ESRCH),
+    }
+}
+
+/// A `write` of `len` bytes at guest `buf` to `fd`: for an
+/// `oom_score_adj` file opened for writing, what the write does.
+pub fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
+    let mark @ crate::fdmarks::Mark::OomScore { .. } = crate::fdmarks::marked(fd)? else {
+        return None;
+    };
+    Some(match crate::uaccess::read_bytes(buf, len.min(64) as usize) {
+        Ok(d) => oom_write(mark, &d, len),
+        Err(e) => fwe_abi::err(e),
+    })
+}
+
+/// What one of another process's descriptors is open on, as the host
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FdTarget {
+    /// A file, at this host path.
+    Path(Vec<u8>),
+    /// A pipe, of this identity (its `fstat` inode).
+    Pipe(u64),
+    /// A socket, of this identity (see [`socket_id`]).
+    Socket(u64),
+    /// Something with neither: Linux's name for its kind.
+    Anon(&'static str),
+}
+
+/// The guest's descriptors of host process `host`, with what each is open
+/// on (fwe's own, in the reserved range, left out: every fwe process
+/// reserves the same range).
+pub fn fds(host: i32) -> Vec<(i32, FdTarget)> {
+    #[cfg(target_os = "macos")]
+    {
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut buf: Vec<libc::proc_fdinfo> = Vec::new();
+        let mut n = 64usize;
+        loop {
+            // SAFETY: zeroed bytes are valid `proc_fdinfo`s.
+            buf.resize(n, unsafe { std::mem::zeroed() });
+            // SAFETY: a valid out-buffer of `n` entries.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    host,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    buf.as_mut_ptr().cast(),
+                    (n * size) as i32,
+                )
+            };
+            if got <= 0 {
+                return Vec::new();
+            }
+            let count = got as usize / size;
+            if count < n {
+                buf.truncate(count);
+                break;
+            }
+            n *= 2;
+        }
+        buf.iter()
+            .filter(|f| crate::fdtable::guest_visible(f.proc_fd))
+            .filter_map(|f| Some((f.proc_fd, target_of(host, f.proc_fd, f.proc_fdtype as i32)?)))
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = host;
+        Vec::new()
+    }
+}
+
+/// What descriptor `fd` of host process `host`, of host kind `kind`, is
+/// open on.
+#[cfg(target_os = "macos")]
+fn target_of(host: i32, fd: i32, kind: i32) -> Option<FdTarget> {
+    /// The `proc_pidfdinfo` flavours, and where in their results the path
+    /// and the pipe's identity are (measured against the SDK's headers).
+    const VNODE_PATH: i32 = 2;
+    const PIPE: i32 = 6;
+    const VNODE_PATH_SIZE: usize = 1200;
+    const PATH_AT: usize = 176;
+    const PIPE_SIZE: usize = 184;
+    const PIPE_HANDLE_AT: usize = 160;
+    let info = |flavor: i32, size: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; size];
+        // SAFETY: a valid out-buffer of `size` bytes.
+        let n =
+            unsafe { libc::proc_pidfdinfo(host, fd, flavor, b.as_mut_ptr().cast(), size as i32) };
+        (n as usize == size).then_some(b)
+    };
+    Some(match kind {
+        libc::PROX_FDTYPE_VNODE => {
+            let b = info(VNODE_PATH, VNODE_PATH_SIZE)?;
+            let path = &b[PATH_AT..];
+            let end = path.iter().position(|&c| c == 0)?;
+            FdTarget::Path(path[..end].to_vec())
+        }
+        libc::PROX_FDTYPE_PIPE => {
+            let b = info(PIPE, PIPE_SIZE)?;
+            let h = u64::from_ne_bytes(b[PIPE_HANDLE_AT..PIPE_HANDLE_AT + 8].try_into().ok()?);
+            FdTarget::Pipe(h)
+        }
+        libc::PROX_FDTYPE_SOCKET => FdTarget::Socket(socket_id(host, fd)?),
+        libc::PROX_FDTYPE_KQUEUE => FdTarget::Anon("anon_inode:[eventpoll]"),
+        _ => FdTarget::Anon("anon_inode:[unknown]"),
+    })
+}
+
+/// A socket's identity as every process names it: the host's kernel handle
+/// of descriptor `fd` of host process `host` (its `fstat` inode is a
+/// number only that process can read).
+pub fn socket_id(host: i32, fd: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        const SOCKET: i32 = 3;
+        const SOCKET_SIZE: usize = 792;
+        /// `psi.soi_so`, measured against the SDK's headers.
+        const SO_AT: usize = 160;
+        let mut b = vec![0u8; SOCKET_SIZE];
+        // SAFETY: a valid out-buffer of its size.
+        let n = unsafe {
+            libc::proc_pidfdinfo(host, fd, SOCKET, b.as_mut_ptr().cast(), SOCKET_SIZE as i32)
+        };
+        if n as usize != SOCKET_SIZE {
+            return None;
+        }
+        Some(u64::from_ne_bytes(b[SO_AT..SO_AT + 8].try_into().ok()?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (host, fd);
+        None
+    }
 }

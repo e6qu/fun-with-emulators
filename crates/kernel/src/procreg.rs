@@ -49,6 +49,12 @@ pub struct ProcRecord {
     /// Whether the host reaps its children as they end (it ignores
     /// `SIGCHLD`, or set `SA_NOCLDWAIT`): no reaper is to take them.
     pub autoreap: bool,
+    /// Its `oom_score_adj` (-1000 to 1000), which its children inherit.
+    pub oom_score_adj: i32,
+    /// Resource limits another process set for it with `prlimit`
+    /// (resource, soft, hard), which it takes up at its next limit call,
+    /// `fork` or `execve`.
+    pub limits: Vec<(u32, u64, u64)>,
 }
 
 /// A host process, as its pid and its start time.
@@ -110,6 +116,13 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     put_procs(&mut e, &r.kept);
     e.i32(r.pgid);
     e.bool(r.autoreap);
+    e.i32(r.oom_score_adj);
+    e.u64(r.limits.len() as u64);
+    for &(res, soft, hard) in &r.limits {
+        e.u32(res);
+        e.u64(soft);
+        e.u64(hard);
+    }
     e.into_bytes()
 }
 
@@ -128,7 +141,9 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let (comm, cmdline, exe) = (d.bytes(), d.bytes(), d.bytes());
     let (lineage, bound, subreaper) = (get_procs(&mut d), get_opt(&mut d), d.bool());
     let (declined, kept) = (get_procs(&mut d), get_procs(&mut d));
-    let (pgid, autoreap) = (d.i32(), d.bool());
+    let (pgid, autoreap, oom_score_adj) = (d.i32(), d.bool(), d.i32());
+    let n = d.count(20);
+    let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -144,6 +159,8 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         kept,
         pgid,
         autoreap,
+        oom_score_adj,
+        limits,
     })
 }
 
@@ -316,6 +333,8 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         // SAFETY: plain host call.
         pgid: unsafe { libc::getpgid(pid) },
         autoreap: false,
+        oom_score_adj: 0,
+        limits: Vec::new(),
     });
     f(&mut r);
     write(pid, &r);
@@ -359,6 +378,7 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 /// ([`child_line`]).
 pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
     let mine = read(me());
+    let oom = mine.as_ref().map_or(0, |r| r.oom_score_adj);
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
     let cgroup = own_cgroup();
     // Kept what the child has already written of itself (its program).
@@ -371,7 +391,43 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
         (r.lineage, r.bound) = line.clone();
         // An ignored SIGCHLD is inherited, and so is the host's reaping.
         r.autoreap = crate::host::children_reaped_by_host();
+        r.oom_score_adj = oom;
     });
+}
+
+/// Host process `pid`'s `oom_score_adj` (0 for one fwe has no record of).
+pub fn oom_score_adj(pid: i32) -> i32 {
+    read(pid).map_or(0, |r| r.oom_score_adj)
+}
+
+/// Leave resource limit `res` (soft, hard) for host process `pid` to take
+/// up ([`take_limits`]).
+pub fn push_limit(pid: i32, res: u32, soft: u64, hard: u64) -> Result<(), i32> {
+    change(pid, |r| {
+        r.limits.retain(|l| l.0 != res);
+        r.limits.push((res, soft, hard));
+    })
+}
+
+/// The limits another process left for this one, taken.
+pub fn take_limits() -> Vec<(u32, u64, u64)> {
+    let me = me();
+    if read(me).is_none_or(|r| r.limits.is_empty()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let _ = change(me, |r| out = std::mem::take(&mut r.limits));
+    out
+}
+
+/// The limit `res` left for host process `pid`, if any.
+pub fn pending_limit(pid: i32, res: u32) -> Option<(u64, u64)> {
+    read(pid)?.limits.iter().find(|l| l.0 == res).map(|l| (l.1, l.2))
+}
+
+/// Set host process `pid`'s `oom_score_adj`.
+pub fn set_oom_score_adj(pid: i32, value: i32) -> Result<(), i32> {
+    change(pid, |r| r.oom_score_adj = value)
 }
 
 /// The line of ancestors a child of this process has (this process, then

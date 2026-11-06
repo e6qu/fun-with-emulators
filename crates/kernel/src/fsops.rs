@@ -73,6 +73,45 @@ fn statx_from(s: &libc::stat) -> Statx {
     }
 }
 
+/// `statx` of what Linux's `stat` reports as `s`.
+fn statx_of(s: &Stat) -> Statx {
+    let ts = |sec: i64, nsec: u64| fwe_abi::StatxTimestamp {
+        tv_sec: sec,
+        tv_nsec: nsec as u32,
+        __reserved: 0,
+    };
+    Statx {
+        stx_mask: statx_mask::STATX_BASIC_STATS,
+        stx_blksize: s.st_blksize as u32,
+        stx_nlink: s.st_nlink,
+        stx_uid: s.st_uid,
+        stx_gid: s.st_gid,
+        stx_mode: s.st_mode as u16,
+        stx_ino: s.st_ino,
+        stx_size: s.st_size as u64,
+        stx_blocks: s.st_blocks as u64,
+        stx_atime: ts(s.st_atime, s.st_atime_nsec),
+        stx_ctime: ts(s.st_ctime, s.st_ctime_nsec),
+        stx_mtime: ts(s.st_mtime, s.st_mtime_nsec),
+        stx_rdev_major: crate::devnodes::major(s.st_rdev),
+        stx_rdev_minor: crate::devnodes::minor(s.st_rdev),
+        stx_dev_major: crate::devnodes::major(s.st_dev),
+        stx_dev_minor: crate::devnodes::minor(s.st_dev),
+        ..Statx::default()
+    }
+}
+
+/// The number of the namespace a `/proc/<pid>/ns` link's target names
+/// (`pid:[4026531836]`), if it is one.
+fn namespace_inode(target: &[u8]) -> Option<u64> {
+    let open = target.iter().position(|&b| b == b'[')?;
+    let digits = target[open + 1..].strip_suffix(b"]")?;
+    if open == 0 || target[open - 1] != b':' {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
 /// If `path` is `/dev/pts/<n>` with a decimal `<n>`, return `n`.
 fn pts_number(path: &[u8]) -> Option<u32> {
     let rest = path.strip_prefix(b"/dev/pts/")?;
@@ -108,6 +147,16 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 /// Host metadata of open descriptor `fd`, with the guest's permission
 /// bits ([`crate::modes`]).
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
+    if let Some(host) = crate::fdmarks::stand_in(fd) {
+        // A stand-in `O_PATH` descriptor: the file it names.
+        let c = CString::new(host).map_err(|_| errno::EINVAL)?;
+        let mut out = zeroed_stat();
+        // SAFETY: a NUL-terminated path and a valid out-parameter.
+        if unsafe { libc::lstat(c.as_ptr(), &mut out) } < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        return Ok(out);
+    }
     let mut out = zeroed_stat();
     // SAFETY: plain host call with a valid out-parameter.
     if unsafe { libc::fstat(fd, &mut out) } < 0 {
@@ -138,8 +187,16 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_openat(&mut self, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
-        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        self.open_path(dirfd, path, flags, mode)
+        let path = match uaccess::read_cstr(path, uaccess::PATH_MAX) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::fs::drop_fifo();
+                return err(e);
+            }
+        };
+        let r = self.open_path(dirfd, path, flags, mode);
+        crate::fs::drop_fifo();
+        r
     }
 
     /// `openat` of `path`, read from the guest.
@@ -158,7 +215,7 @@ impl<P: Platform> Kernel<P> {
                     if self.fs().proc_path(dirfd as i32, &path).as_deref()
                         == Some(b"/proc/self/status") =>
                 {
-                    anon_fd(&self.self_status())
+                    self.synthetic_fd(anon_fd(&self.self_status()), dirfd as i32, &path)
                 }
                 crate::procfs::Entry::File(content)
                     if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
@@ -172,7 +229,10 @@ impl<P: Platform> Kernel<P> {
                     };
                     let mark = match self.map_file(dirfd as i32, &path) {
                         Some(mark) => Ok(mark),
-                        None => sysctl().unwrap_or(Err(errno::EACCES)),
+                        None => match self.oom_file(dirfd as i32, &path) {
+                            Some(mark) => Ok(mark),
+                            None => sysctl().unwrap_or(Err(errno::EACCES)),
+                        },
                     };
                     match mark {
                         Ok(mark) => {
@@ -185,7 +245,9 @@ impl<P: Platform> Kernel<P> {
                         Err(e) => err(e),
                     }
                 }
-                crate::procfs::Entry::File(content) => anon_fd(&content),
+                crate::procfs::Entry::File(content) => {
+                    self.synthetic_fd(anon_fd(&content), dirfd as i32, &path)
+                }
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
                         return err(errno::ELOOP);
@@ -224,6 +286,7 @@ impl<P: Platform> Kernel<P> {
                     Some(entries) => {
                         let at = self.fs().absolute_path(dirfd as i32, &path).unwrap_or_default();
                         let fd = crate::synthdir::open(at, entries);
+                        let fd = self.synthetic_fd(fd, dirfd as i32, &path);
                         if fd >= 0 && self.fs().lists_fds(dirfd as i32, &path) {
                             // Linux lists the listing's own descriptor too.
                             let name = fd.to_string().into_bytes();
@@ -282,6 +345,12 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         let mut host_flags = host::open_flags_to_host(flags);
+        if flags & fcntl::O_PATH != 0 {
+            // The host has no O_PATH: the file is opened to read, which
+            // must not wait as a FIFO's open does for a writer, nor make a
+            // terminal the controlling one. The descriptor only names it.
+            host_flags |= libc::O_NONBLOCK | libc::O_NOCTTY;
+        }
         if flags & fcntl::O_DIRECTORY == 0 && resolved.name == b"." {
             // Opening the directory itself.
             host_flags |= libc::O_DIRECTORY;
@@ -318,6 +387,8 @@ impl<P: Platform> Kernel<P> {
         let dirfd = resolved.dir.as_raw_fd();
         // SAFETY: `dir` is a live directory fd.
         let open = || unsafe { host::openat(dirfd, &name, host_flags, host_mode as libc::c_uint) };
+        // Whether `fd` is a stand-in for the file (see `Origin::stand_in`).
+        let mut stand_in = false;
         let mut fd = match &existing {
             // Made here: a change of the directory.
             None if flags & fcntl::O_CREAT != 0 => {
@@ -355,6 +426,23 @@ impl<P: Platform> Kernel<P> {
                 }
                 r as i32
             }
+            Some(st)
+                if st.st_mode & libc::S_IFMT == libc::S_IFIFO && flags & fcntl::O_PATH != 0 =>
+            {
+                // Any open of a FIFO is a reader or a writer of it, which an
+                // O_PATH descriptor is not: a stand-in names it.
+                stand_in = true;
+                // SAFETY: a constant NUL-terminated path.
+                unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) }
+            }
+            Some(st)
+                if st.st_mode & libc::S_IFMT == libc::S_IFIFO
+                    && let Some(fd) = crate::fs::take_fifo(flags, st) =>
+            {
+                // Opened already, waiting for the other end without the
+                // lock ([`crate::fs::open_fifo_unlocked`]).
+                fifo_flags(fd, flags)
+            }
             Some(st) => {
                 let fd = open();
                 if fd < 0
@@ -383,6 +471,7 @@ impl<P: Platform> Kernel<P> {
             // it was opened, which is what an O_PATH descriptor is used for).
             // SAFETY: a constant NUL-terminated path.
             fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            stand_in = true;
         }
         if fd < 0 {
             return last_error();
@@ -424,9 +513,12 @@ impl<P: Platform> Kernel<P> {
             }
         }
         let layers = resolved.ovl.as_ref().map(|o| o.layers.clone());
-        if resolved.ns_path.is_some() || layers.is_some() {
-            let ns = resolved.ns_path.unwrap_or_default();
+        if resolved.ns_path.is_some() || layers.is_some() || stand_in {
+            let ns = resolved.ns_path.clone().unwrap_or_default();
             crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype, layers);
+        }
+        if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
+            crate::fdmarks::set_stand_in(fd, host);
         }
         fd as i64
     }
@@ -518,62 +610,63 @@ impl<P: Platform> Kernel<P> {
             return self.sys_fstat(dirfd, buf);
         }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
-            use fwe_abi::stat as st;
-            let s = match entry {
-                crate::procfs::Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
-                crate::procfs::Entry::Symlink(_) if follow => {
-                    // /proc/self/exe and the like follow to the real target.
-                    let target = match self.fs().synthetic(dirfd as i32, &path) {
-                        Some(crate::procfs::Entry::Symlink(t)) => t,
-                        _ => return err(errno::ENOENT),
-                    };
-                    let target = self.fs().link_target(dirfd as i32, &path, &target);
-                    return self.stat_path(fcntl::AT_FDCWD as u64, &target, buf, flags);
-                }
-                crate::procfs::Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
-                crate::procfs::Entry::Fd { fd, .. } if follow => {
-                    return self.sys_fstat(fd as u64, buf);
-                }
-                crate::procfs::Entry::Fd { target, .. } => {
-                    synth_stat(st::S_IFLNK | 0o700, target.len() as u64)
-                }
-                crate::procfs::Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
-                crate::procfs::Entry::Missing => return err(errno::ENOENT),
-            };
-            guest!(uaccess::write(buf, s));
-            return 0;
-        }
-        let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        match stat_at(dir.as_raw_fd(), &name) {
-            Ok(s) => {
-                let node = crate::devnodes::marked(&s)
-                    .then(|| crate::devnodes::node_at(dir.as_raw_fd(), &name))
-                    .flatten();
-                guest!(uaccess::write(buf, as_node(stat_to_linux(&s), node)));
+        match self.linux_stat(dirfd as i32, &path, follow, 0) {
+            Ok(st) => {
+                guest!(uaccess::write(buf, st));
                 0
             }
             Err(e) => err(e),
         }
     }
 
-    /// `stat` a path given as bytes, following a final symlink per `flags`.
-    fn stat_path(&mut self, dirfd: u64, path: &[u8], buf: u64, flags: u64) -> i64 {
-        let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        let (dir, name) = match self.resolve_c(dirfd, path, follow) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        match stat_at(dir.as_raw_fd(), &name) {
-            Ok(s) => {
-                guest!(uaccess::write(buf, stat_to_linux(&s)));
-                0
-            }
-            Err(e) => err(e),
+    /// What `stat` (`follow`) or `lstat` reports for `path` from `dirfd`,
+    /// in Linux's layout: a file of fwe's `/proc` or `/sys`, a link there
+    /// followed (to a descriptor's file, a path, or a namespace), a device
+    /// node of fwe's as the device, or the host file. `depth` counts the
+    /// links followed.
+    fn linux_stat(&self, dirfd: i32, path: &[u8], follow: bool, depth: u32) -> Result<Stat, i32> {
+        use crate::procfs::Entry;
+        use fwe_abi::stat as st;
+        if let Some(entry) = self.fs().synthetic(dirfd, path) {
+            return Ok(match entry {
+                Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
+                Entry::Symlink(t) if follow => {
+                    if let Some(ino) = namespace_inode(&t) {
+                        // A namespace, as nsfs shows one: its number is
+                        // the inode, on nsfs's device.
+                        let mut s = synth_stat(st::S_IFREG | 0o444, 0);
+                        s.st_ino = ino;
+                        s.st_dev = crate::devnodes::makedev(0, 4);
+                        return Ok(s);
+                    }
+                    if depth >= 40 {
+                        return Err(errno::ELOOP);
+                    }
+                    // /proc/self/exe and the like follow to the real target.
+                    let target = self.fs().link_target(dirfd, path, &t);
+                    return self.linux_stat(fcntl::AT_FDCWD as i32, &target, true, depth + 1);
+                }
+                Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
+                Entry::Fd { fd, .. } if follow => {
+                    if crate::synthdir::fstat_is_dir(fd) {
+                        return Ok(synth_stat(st::S_IFDIR | 0o555, 0));
+                    }
+                    let s = stat_fd(fd)?;
+                    let node =
+                        crate::devnodes::marked(&s).then(|| crate::devnodes::node_of(fd)).flatten();
+                    return Ok(as_node(stat_to_linux(&s), node));
+                }
+                Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
+                Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
+                Entry::Missing => return Err(errno::ENOENT),
+            });
         }
+        let (dir, name) = self.resolve_c(dirfd as u64, path, follow)?;
+        let s = stat_at(dir.as_raw_fd(), &name)?;
+        let node = crate::devnodes::marked(&s)
+            .then(|| crate::devnodes::node_at(dir.as_raw_fd(), &name))
+            .flatten();
+        Ok(as_node(stat_to_linux(&s), node))
     }
 
     pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
@@ -612,19 +705,13 @@ impl<P: Platform> Kernel<P> {
             (out, node)
         } else {
             let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-            let (dir, name) = match self.resolve_c(dirfd, &path, follow) {
-                Ok(v) => v,
-                Err(e) => return err(e),
-            };
-            match stat_at(dir.as_raw_fd(), &name) {
-                Ok(s) => {
-                    let node = crate::devnodes::marked(&s)
-                        .then(|| crate::devnodes::node_at(dir.as_raw_fd(), &name))
-                        .flatten();
-                    (s, node)
+            return match self.linux_stat(dirfd as i32, &path, follow, 0) {
+                Ok(st) => {
+                    guest!(uaccess::write(buf, statx_of(&st)));
+                    0
                 }
-                Err(e) => return err(e),
-            }
+                Err(e) => err(e),
+            };
         };
         let mut x = statx_from(&host);
         if let Some(n) = node {
@@ -915,6 +1002,10 @@ impl<P: Platform> Kernel<P> {
         let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_FOLLOW != 0;
+        if oldpath.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
+            // A name for the descriptor's own file (an O_TMPFILE one, say).
+            return self.link_fd(olddirfd as i32, newdirfd, &newpath);
+        }
         let old = match self.fs().resolve(olddirfd as i32, &oldpath, follow) {
             Ok(r) => r,
             Err(e) => return err(e),
@@ -1056,6 +1147,10 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
     ) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
+            // The descriptor's own file.
+            return self.sys_fchown(dirfd, uid, gid);
+        }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         if let Some(fd) = self.fd_link(dirfd, &path, follow) {
             if let Err(e) = self.fd_change(fd) {
@@ -1220,6 +1315,46 @@ impl<P: Platform> Kernel<P> {
             crate::procfs::Entry::Fd { fd, .. } => Some(fd),
             _ => None,
         }
+    }
+
+    /// `fd` (or an error), just opened on a file of fwe's `/proc` or `/sys`
+    /// at `path`: recorded as of that mount, so `fstatfs` reports `proc`
+    /// or `sysfs` as runtimes check, not what stands in for it on the host.
+    fn synthetic_fd(&self, fd: i64, dirfd: i32, path: &[u8]) -> i64 {
+        if fd >= 0
+            && let Some(absolute) = self.fs().absolute_path(dirfd, path)
+        {
+            let ns = self.fs().to_ns(&absolute);
+            let (m, _) = self.fs().mount_of(&absolute);
+            crate::fdmarks::opened(fd as i32, ns, m.flags, m.fstype, None);
+        }
+        fd
+    }
+
+    /// For `/proc/<pid>/oom_score_adj` or `oom_adj` at `path`, what a write
+    /// to it acts on.
+    fn oom_file(&self, dirfd: i32, path: &[u8]) -> Option<crate::fdmarks::Mark> {
+        let p = self.fs().proc_path(dirfd, path).or_else(|| {
+            let a = self.fs().absolute_path(dirfd, path)?;
+            let (m, fs_path) = self.fs().mount_of(&a);
+            (m.fstype == crate::mounts::FsType::Proc)
+                .then(|| crate::mounts::join(b"/proc", &fs_path))
+        })?;
+        let rest = p.strip_prefix(b"/proc/")?;
+        let (who, file) = rest.split_at(rest.iter().position(|&b| b == b'/')?);
+        let legacy = match file {
+            b"/oom_score_adj" => false,
+            b"/oom_adj" => true,
+            _ => return None,
+        };
+        let host = if who == b"self" {
+            // SAFETY: getpid cannot fail.
+            unsafe { libc::getpid() }
+        } else {
+            crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
+        };
+        let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
+        Some(crate::fdmarks::Mark::OomScore { host, legacy, privileged })
     }
 
     /// For `/proc/<pid>/uid_map`, `gid_map` or `setgroups` at `path`, what
@@ -1557,6 +1692,37 @@ impl<P: Platform> Kernel<P> {
         if r == err(errno::EACCES) && crate::modes::keep_fd(dir, perm).is_ok() { op() } else { r }
     }
 
+    /// `linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH)`: give the file
+    /// open as `fd` the name `newpath`.
+    fn link_fd(&self, fd: i32, newdirfd: u64, newpath: &[u8]) -> i64 {
+        if !self.creds.has(crate::caps::CAP_DAC_READ_SEARCH) {
+            return err(errno::ENOENT);
+        }
+        let Some(host) = crate::fs::host_path_of(fd) else { return err(errno::ENOENT) };
+        let Ok(src) = CString::new(host) else { return err(errno::EINVAL) };
+        let mut new = match self.fs().resolve(newdirfd as i32, newpath, false) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        if new.mount_root {
+            return err(errno::EEXIST);
+        }
+        if let Err(e) = new.prepare(Change::Create) {
+            return err(e);
+        }
+        let Ok(nn) = new.name_c() else { return err(errno::EINVAL) };
+        let n = new.dir.as_raw_fd();
+        // SAFETY: names NUL-terminated; `n` live.
+        let made = self.change_in(n, || {
+            // SAFETY: names NUL-terminated; `n` live.
+            ret(unsafe { libc::linkat(libc::AT_FDCWD, src.as_ptr(), n, nn.as_ptr(), 0) })
+        });
+        match new.finish(made == 0) {
+            Err(e) if made == 0 => err(e),
+            _ => made,
+        }
+    }
+
     /// Get ready for a call that changes the file open as `fd`: `EROFS`
     /// for one opened through a read-only mount; for one of an overlay's
     /// lower layers, the file copied up and `fd` moved onto the copy, as
@@ -1737,6 +1903,16 @@ fn open_device(fd: i32, node: crate::devnodes::Node, flags: u64, node_file: bool
 
 /// Open the file `fd` is open on afresh, with Linux open `flags`: a new
 /// open file description of it, as opening `/proc/self/fd/N` makes.
+/// A FIFO opened ahead ([`crate::fs::take_fifo`]), close-on-exec as the
+/// guest's Linux `flags` ask.
+fn fifo_flags(fd: i32, flags: u64) -> i32 {
+    if flags & fcntl::O_CLOEXEC == 0 {
+        // SAFETY: plain host call on the descriptor.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+    }
+    fd
+}
+
 fn reopen(fd: i32, flags: u64) -> i64 {
     let origin = crate::fdmarks::origin(fd);
     let writes = flags & fcntl::O_ACCMODE != fcntl::O_RDONLY || flags & fcntl::O_TRUNC != 0;
@@ -1745,6 +1921,15 @@ fn reopen(fd: i32, flags: u64) -> i64 {
     }
     let Some(host) = crate::fs::host_path_of(fd) else { return err(errno::ENOENT) };
     let Ok(p) = CString::new(host) else { return err(errno::EINVAL) };
+    // A FIFO opened already, waiting for its other end without the lock.
+    let st = stat_fd(fd).ok();
+    if let Some(st) = st.filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFIFO)
+        && let Some(new) = crate::fs::take_fifo(flags, &st)
+    {
+        let new = fifo_flags(new, flags);
+        crate::fdmarks::duplicated(fd, new);
+        return new as i64;
+    }
     // The host flags, without those that would make a new file.
     let host_flags = host::open_flags_to_host(flags & !(fcntl::O_CREAT | fcntl::O_EXCL));
     // SAFETY: a NUL-terminated host path.

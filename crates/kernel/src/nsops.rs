@@ -128,6 +128,9 @@ impl<P: Platform> Kernel<P> {
     /// inherits it. The caller holds the kernel lock until
     /// [`Kernel::fork_parent`] or [`Kernel::fork_child`].
     pub fn fork_begin(&mut self, flags: u64) -> Result<ForkNs, i32> {
+        // Limits left for this process are its own before its child
+        // inherits them.
+        self.take_pending_limits();
         if flags & CLONE_NEWTIME != 0 {
             return Err(errno::EINVAL);
         }
@@ -137,7 +140,12 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EPERM);
         }
         // Taken while this process's own pid namespaces are current.
-        let line = crate::procreg::child_line();
+        let mut line = crate::procreg::child_line();
+        if flags & fwe_abi::clone::CLONE_PARENT != 0 && !line.0.is_empty() {
+            // Its parent is this process's parent, as Linux has it (the
+            // host's is this process, which the host cannot change).
+            line.0.remove(0);
+        }
         // Within the cgroup's `pids.max`.
         crate::cgroupfs::fork_allowed(&crate::cgroupfs::current())?;
         let fs = self.fs.as_mut().expect("filesystem configured");

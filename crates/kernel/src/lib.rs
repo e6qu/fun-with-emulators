@@ -19,6 +19,7 @@ pub mod devnodes;
 pub mod epoll;
 pub mod fdmarks;
 pub mod fdtable;
+pub mod fifo;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -29,6 +30,7 @@ pub mod modes;
 mod mountops;
 pub mod mounts;
 pub mod net;
+pub mod netlink;
 pub mod netns;
 pub mod ns;
 pub mod nsops;
@@ -562,6 +564,9 @@ impl<P: Platform> Kernel<P> {
         if let Some(fs) = self.fs.as_mut() {
             fs.set_umask(umask);
         }
+        // Limits another process left for this one (runc sets its
+        // container's this way before it runs the program).
+        self.take_pending_limits();
         Ok(())
     }
 
@@ -920,6 +925,14 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
     }
+    if nr == n::OPENAT {
+        // A FIFO's open waits for the other end: here, without the lock,
+        // and the locked open takes what this one opened.
+        if let Err(e) = fs::open_fifo_unlocked(a[0] as i32, a[1], a[2]) {
+            return Some(fwe_abi::err(e));
+        }
+        return None;
+    }
     Some(match nr {
         // SAFETY: caller guarantees the futex word and timeout are valid.
         n::FUTEX => unsafe { futex::op(a[0], a[1], a[2] as u32, a[3]) },
@@ -954,6 +967,10 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // Bytes a FIFO probe took, first.
+            if let Some(r) = fifo::take(fd, buf, len) {
+                return Some(r);
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
         }
@@ -976,6 +993,17 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             {
                 return Some(r);
             }
+            if fdmarks::any_marks()
+                && let Some(r) = crate::procpid::try_write(fd, buf, len)
+            {
+                return Some(r);
+            }
+            if netlink::is(fd) {
+                return Some(match uaccess::read_bytes(buf, len as usize) {
+                    Ok(d) => netlink::send(fd, &d),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             if seqpacket::is(fd) {
                 return Some(match uaccess::host_buffer(buf, len, false) {
                     Ok(v) => seqpacket::write(fd, &[v]),
@@ -984,6 +1012,13 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
+        }
+        n::READV if fifo::has_kept(a[0] as i32) => {
+            // Bytes a FIFO probe took, into the first buffer.
+            match uaccess::read::<[u64; 2]>(a[1]) {
+                Ok([base, len]) => fifo::take(a[0] as i32, base, len).unwrap_or(0),
+                Err(e) => fwe_abi::err(e),
+            }
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),

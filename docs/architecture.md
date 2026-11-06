@@ -691,9 +691,35 @@ or taken under the socket's lock for that way, which the threads of a
 process share as a mutex and processes as a byte-range lock on a file of
 fwe's, so neither threads nor processes interleave or split one.
 
+`SO_PEERCRED` names a Unix socket's peer (its pid in the caller's pid
+namespace, its ids as the guest sees the host's), and `shutdown` of a Unix
+socket whose peer has gone succeeds, as on Linux.
+
+In a network namespace of fwe's, an `AF_NETLINK` socket of the
+`NETLINK_ROUTE` family (`crates/kernel/src/netlink.rs`) answers what a
+container runtime asks of its loopback: `RTM_GETLINK` describes `lo`,
+`RTM_NEWLINK` brings it up or down, `RTM_GETADDR` lists its addresses once
+up, anything else is answered with `EOPNOTSUPP`. The guest's descriptor is
+one end of a host datagram pair, fwe writing each reply to the other, so
+receiving and `epoll` are the host's own. In the initial namespace, whose
+interfaces are the host's, there is no netlink socket (`EAFNOSUPPORT`).
+
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
-over these sockets. `AF_NETLINK` and raw sockets are M4.
+over these sockets. Raw sockets are M4.
+
+Named FIFOs differ on the host in two ways fwe makes up for
+(`crates/kernel/src/fifo.rs`). macOS reports neither to `kqueue` nor to
+`poll` that a FIFO's last writer has gone: fwe's `epoll` and `ppoll`
+watching a FIFO's read end wait in short slices and probe it between them
+with a read that does not block (end-of-file then, or `EAGAIN` while a
+writer remains; a byte taken by the probe is kept for the next read), and
+report `POLLHUP` as Linux does. An open of a FIFO that waits for its other
+end runs outside the kernel lock, so the process's other threads run on.
+An `O_PATH` descriptor never opens a FIFO, which on the host would count as
+a reader or writer of it: like one of a device or socket the host cannot
+open, it is a stand-in that names the file, whose `fstat` is the file's
+and through whose `/proc/self/fd` link the file is opened again.
 
 ## Terminals and job control
 
@@ -843,8 +869,13 @@ subreaper notes the orphans below it that have one already, and one that
 stops being a subreaper keeps those it adopted.
 
 `/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
-`status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
-records and what the host reports; `/proc/self/ns` names each namespace.
+`status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, `fd`, `oom_score_adj`,
+the maps), from their records and what the host reports of their
+descriptors; `/proc/self/ns` names each namespace, its links followed by
+`stat` to the namespace itself (its number the inode, as nsfs shows it),
+and `/proc/self/fdinfo` describes each descriptor. A process's
+`oom_score_adj` is in its record, inherited by its children (lowering it
+takes `CAP_SYS_RESOURCE`).
 
 ### cgroups
 
@@ -859,7 +890,10 @@ or a counter shows what is so then. `cgroup.freeze`, `cgroup.kill` and
 `bpf`) attached to a cgroup decide every device open and `mknod` of its
 members; they run on an interpreter (`crates/kernel/src/bpf.rs`) that
 checks each access against the context and the stack and stops a program
-that runs too long.
+that runs too long. A program of another type loads (libraries probe the
+kernel's features by loading one) but is not attached (`EINVAL`), and
+`/proc/self/fdinfo` shows a program's type, identity and tag (Linux's:
+the first 8 bytes of its instructions' SHA-1).
 
 ### Capabilities, seccomp and devices
 
@@ -913,8 +947,9 @@ those items.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.
-- **Sockets:** an `AF_UNIX` path that, rooted under the rootfs, is longer
-  than the host's 103 bytes fails with `ENAMETOOLONG`.
+- **Sockets:** a `sendto` to an `AF_UNIX` path that, rooted under the
+  rootfs, is longer than the host's 103 bytes fails with `ENAMETOOLONG`
+  (`bind` and `connect` reach it from its directory).
 - **Files:** `fallocate` reserves space past the end of a file (mode 0
   and `FALLOC_FL_KEEP_SIZE`) and punches holes, but a hole inside a sparse
   file is not filled, and its other modes are `EOPNOTSUPP`, as on a Linux
@@ -948,9 +983,7 @@ those items.
 - **Filesystem:** of `/dev`, only `null`, `zero`, `full`, `random`,
   `urandom`, `tty` and the `/proc/self/fd` links are provided, and a node
   `mknod` makes opens a host device only for those numbers (`ENXIO`
-  otherwise); a node lists as a regular file in `getdents64`, and an
-  `O_PATH` descriptor of a device the host will not open is a stand-in
-  whose `stat` is `/dev/null`'s, as is that of a socket. File owners other
+  otherwise); a node lists as a regular file in `getdents64`. File owners other
   than fwe's own user read as 65534, and a `chown` does not show in a
   later `stat`. A caller without the capabilities is held only to the
   owner's bits of a kept mode, and a directory's search bit is not
@@ -980,8 +1013,15 @@ those items.
   an adopted orphan's state after each signal it is sent, so a stop and a
   continue sent together, before it looks, are not reported, and stops
   not yet reported are forgotten when the reaper runs another program;
-  `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
-  `environ`, and shows only fwe's processes in the initial pid namespace.
+  `/proc/<pid>` of another process has no `cwd`, `root` or `environ`, and
+  shows only fwe's processes in the initial pid namespace; resource limits
+  set on another process with `prlimit` need `CAP_SYS_RESOURCE` (fwe does
+  not know the other's credentials) and take effect at its next limit
+  call, `fork` or `execve`, and reading another's reports what was set for
+  it, else the caller's own; a `CLONE_PARENT` child's parent is the
+  caller's for `getppid`, `/proc` and its adoption, but on the host it is
+  the caller's child, which the caller's parent cannot `wait` for while
+  the caller lives.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
   back but not enforced (only `pids.max` and device programs are); a
   threaded cgroup cannot be made (`cgroup.threads` refuses writes); the

@@ -74,6 +74,7 @@ const DIRS: &[DirDef] = &[
             (b"exe", DT_LNK),
             (b"cmdline", DT_REG),
             (b"fd", DT_DIR),
+            (b"fdinfo", DT_DIR),
             (b"ns", DT_DIR),
             (b"mountinfo", DT_REG),
             (b"mounts", DT_REG),
@@ -81,6 +82,9 @@ const DIRS: &[DirDef] = &[
             (b"gid_map", DT_REG),
             (b"setgroups", DT_REG),
             (b"cgroup", DT_REG),
+            (b"oom_score_adj", DT_REG),
+            (b"oom_adj", DT_REG),
+            (b"oom_score", DT_REG),
         ],
     ),
     (

@@ -19,6 +19,8 @@ const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
 const ESTALE: i32 = 116;
+const ENXIO: i32 = 6;
+const EAFNOSUPPORT: i32 = 97;
 const MSG_PEEK: i32 = 2;
 const MSG_DONTWAIT: i32 = 0x40;
 const O_NONBLOCK: i32 = 0o4000;
@@ -117,6 +119,20 @@ unsafe extern "C" {
     fn lseek(fd: i32, off: i64, wh: i32) -> i64;
     fn mknod(p: *const std::ffi::c_char, m: u32, d: u64) -> i32;
     fn syscall(n: i64, ...) -> i64;
+    fn mkfifo(p: *const std::ffi::c_char, m: u32) -> i32;
+    fn getpid() -> i32;
+    fn getppid() -> i32;
+    fn usleep(us: u32) -> i32;
+    fn pipe2(fds: *mut i32, f: i32) -> i32;
+    fn dup2(a: i32, b: i32) -> i32;
+    fn shutdown(fd: i32, how: i32) -> i32;
+    fn poll(fds: *mut [i32; 2], n: u64, t: i32) -> i32;
+    fn fstatfs(fd: i32, b: *mut u64) -> i32;
+    fn stat(p: *const std::ffi::c_char, b: *mut u64) -> i32;
+    fn linkat(a: i32, p: *const std::ffi::c_char, b: i32, q: *const std::ffi::c_char, f: i32) -> i32;
+    fn fchownat(d: i32, p: *const std::ffi::c_char, u: u32, g: u32, f: i32) -> i32;
+    fn prlimit(pid: i32, r: i32, n: *const [u64; 2], o: *mut [u64; 2]) -> i32;
+    fn getrlimit(r: i32, o: *mut [u64; 2]) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
@@ -141,6 +157,8 @@ fn name(e: i32) -> &'static str {
         EROFS => "EROFS",
         EINVAL => "EINVAL",
         ESTALE => "ESTALE",
+        ENXIO => "ENXIO",
+        EAFNOSUPPORT => "EAFNOSUPPORT",
         _ => "?",
     }
 }
@@ -696,6 +714,167 @@ fn main() {
                 let opts = b"lowerdir=/tmp/l1,upperdir=/tmp/rm/up,workdir=/tmp/rm/work\0";
                 let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
                 println!("read-only upper: {}", res(r as i64));
+            }
+            // What container runtimes ask beyond the namespaces: FIFOs
+            // named and waited on, /proc of themselves and their children,
+            // socket peers, netlink, BPF probes, limits set from outside.
+            Some("runtime-calls") => {
+                let r = |v: i64| res(v);
+                // An empty path names nothing.
+                let mut st = [0u64; 16];
+                println!("stat \"\": {}", r(stat(c("").as_ptr(), st.as_mut_ptr()) as i64));
+                // O_PATH of a FIFO is no reader of it; its stat is the FIFO's.
+                mkfifo(c("/tmp/ff").as_ptr(), 0o600);
+                let p = open(c("/tmp/ff").as_ptr(), O_PATH | 0o2000000);
+                let w = open(c("/tmp/ff").as_ptr(), O_WRONLY | O_NONBLOCK);
+                println!("writer with only an O_PATH: {}", r(w as i64));
+                syscall(80, p, st.as_mut_ptr());
+                println!("O_PATH fstat is a FIFO: {}", (st[2] as u32 >> 0) & 0o170000 == 0o010000);
+                let mut buf = [0u8; 64];
+                let n = readlink(c(&format!("/proc/self/fd/{p}")).as_ptr(), buf.as_mut_ptr(), 64);
+                println!("its link: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+                // A FIFO's open waits for the other end without stopping the
+                // process; its reader sees the writer go, in epoll and poll.
+                let other = std::thread::spawn(|| {
+                    usleep(100_000);
+                    println!("another thread ran");
+                });
+                if fork() == 0 {
+                    usleep(400_000);
+                    let w = open(c("/tmp/ff").as_ptr(), O_WRONLY);
+                    write(w, b"x".as_ptr(), 1);
+                    usleep(200_000);
+                    _exit(0);
+                }
+                let fd = open(c("/tmp/ff").as_ptr(), O_RDONLY);
+                other.join().unwrap();
+                println!("opened the FIFO: {}", fd >= 0);
+                let ep = epoll_create1(0);
+                let mut ev = EpollEvent { events: EPOLLIN, data: 7 };
+                epoll_ctl(ep, EPOLL_CTL_ADD, fd, &mut ev);
+                let mut got = EpollEvent { events: 0, data: 0 };
+                epoll_wait(ep, &mut got, 1, 5000);
+                let mut b = [0u8; 4];
+                println!("data: {}", read(fd, b.as_mut_ptr(), 4));
+                let n = epoll_wait(ep, &mut got, 1, 5000);
+                println!("writer gone: {} hup {}", n, got.events & EPOLLHUP != 0);
+                let mut pf = [fd, 1]; // POLLIN
+                poll(&mut pf, 1, 1000);
+                println!("poll: hup {}", (pf[1] >> 16) & 0x10 != 0);
+                println!("then: {}", read(fd, b.as_mut_ptr(), 4));
+                waitpid(-1, std::ptr::null_mut(), 0);
+                // /proc: namespace links stat as the namespace, fdinfo,
+                // and /proc is procfs to fstatfs.
+                let n = readlink(c("/proc/self/ns/pid").as_ptr(), buf.as_mut_ptr(), 64);
+                let link = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+                stat(c("/proc/self/ns/pid").as_ptr(), st.as_mut_ptr());
+                println!("ns inode matches: {}", link.contains(&format!("[{}]", st[1])));
+                let info = std::fs::read_to_string("/proc/self/fdinfo/0").unwrap_or_default();
+                println!("fdinfo: {}", info.starts_with("pos:\t") && info.contains("flags:\t"));
+                let d = open(c("/proc/self/fd").as_ptr(), O_RDONLY | O_DIRECTORY);
+                let mut sf = [0u64; 15];
+                fstatfs(d, sf.as_mut_ptr());
+                println!("proc fstatfs: {:#x}", sf[0]);
+                // oom_score_adj, kept and inherited.
+                std::fs::write("/proc/self/oom_score_adj", "500").unwrap();
+                let own = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+                let (mut pp, mut cp) = ([0i32; 2], [0i32; 2]);
+                pipe2(pp.as_mut_ptr(), 0);
+                pipe2(cp.as_mut_ptr(), 0);
+                let child = fork();
+                if child == 0 {
+                    let marker = open(c("/etc/marker").as_ptr(), O_RDONLY);
+                    dup2(marker, 9);
+                    write(cp[1], b"r".as_ptr(), 1);
+                    let mut x = [0u8; 1];
+                    read(pp[0], x.as_mut_ptr(), 1);
+                    let mut l = [0u64; 2];
+                    getrlimit(7, &mut l);
+                    let inherited = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+                    println!("child: oom {} nofile {} {}", inherited.trim(), l[0], l[1]);
+                    _exit(0);
+                }
+                let mut x = [0u8; 1];
+                read(cp[0], x.as_mut_ptr(), 1);
+                let n = readlink(c(&format!("/proc/{child}/fd/9")).as_ptr(), buf.as_mut_ptr(), 64);
+                println!("oom: {} child's fd 9: {}", own.trim(), String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+                println!("prlimit of the child: {}", r(prlimit(child, 7, &[100, 200], std::ptr::null_mut()) as i64));
+                write(pp[1], b"g".as_ptr(), 1);
+                waitpid(child, std::ptr::null_mut(), 0);
+                // A socket's peer, and a shutdown after it has gone.
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
+                let mut cred = [0i32; 3];
+                let mut len = 12u32;
+                getsockopt(sv[0], SOL_SOCKET, 17, cred.as_mut_ptr(), &mut len);
+                println!("peer: self {} uid {}", cred[0] == getpid(), cred[1]);
+                close(sv[1]);
+                println!("shutdown after the peer: {}", r(shutdown(sv[0], 1) as i64));
+                // CLONE_PARENT: the child's parent is the caller's.
+                let me = getpid();
+                if fork() == 0 {
+                    let g = syscall(220, 0x8000 | 17, 0, 0, 0, 0);
+                    if g == 0 {
+                        println!("CLONE_PARENT's parent is the grandparent: {}", getppid() == me);
+                        _exit(0);
+                    }
+                    usleep(300_000);
+                    _exit(0);
+                }
+                usleep(500_000);
+                waitpid(-1, std::ptr::null_mut(), 0);
+                // AT_EMPTY_PATH.
+                let f = open(c("/tmp/linked").as_ptr(), O_WRONLY | O_CREAT, 0o644);
+                println!("linkat AT_EMPTY_PATH: {}", r(linkat(f, c("").as_ptr(), -100, c("/tmp/again").as_ptr(), 0x1000) as i64));
+                println!("fchownat AT_EMPTY_PATH: {}", r(fchownat(f, c("").as_ptr(), 0, 0, 0x1000) as i64));
+                // BPF: a program of another type loads but does not attach.
+                let insns: [u64; 2] = [0x0000_0000_0000_00b7, 0x0000_0000_0000_0095];
+                let mut attr = [0u8; 128];
+                attr[0..4].copy_from_slice(&8u32.to_ne_bytes()); // CGROUP_SKB
+                attr[4..8].copy_from_slice(&2u32.to_ne_bytes());
+                attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+                let lic = c("MIT");
+                attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
+                let prog = syscall(280, 5, attr.as_ptr(), 128) as i32;
+                let finfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{prog}")).unwrap_or_default();
+                println!("skb program loads: {} type 8: {}", prog >= 0, finfo.contains("prog_type:\t8"));
+                let cg = open(c("/sys/fs/cgroup").as_ptr(), O_RDONLY | O_DIRECTORY);
+                let mut at = [0u8; 32];
+                at[0..4].copy_from_slice(&cg.to_ne_bytes());
+                at[4..8].copy_from_slice(&prog.to_ne_bytes());
+                at[8..12].copy_from_slice(&6u32.to_ne_bytes()); // BPF_CGROUP_DEVICE
+                println!("attached as a device program: {}", r(syscall(280, 8, at.as_ptr(), 32)));
+                // Netlink: none in the host's namespace; lo in one's own.
+                println!("netlink outside: {}", r(socket(16, 3, 0) as i64));
+                unshare(CLONE_NEWNET);
+                let nl = socket(16, 3, 0);
+                println!("netlink inside: {}", nl >= 0);
+                let link = |up: Option<bool>| -> u32 {
+                    // RTM_GETLINK of index 1, or RTM_NEWLINK setting IFF_UP.
+                    let mut m = vec![0u8; 32];
+                    m[0..4].copy_from_slice(&32u32.to_ne_bytes());
+                    let (ty, flags): (u16, u16) = if up.is_some() { (16, 5) } else { (18, 1) };
+                    m[4..6].copy_from_slice(&ty.to_ne_bytes());
+                    m[6..8].copy_from_slice(&flags.to_ne_bytes());
+                    m[8..12].copy_from_slice(&1u32.to_ne_bytes());
+                    m[20..24].copy_from_slice(&1i32.to_ne_bytes());
+                    if let Some(u) = up {
+                        m[24..28].copy_from_slice(&(u as u32).to_ne_bytes());
+                        m[28..32].copy_from_slice(&1u32.to_ne_bytes());
+                    }
+                    send(nl, m.as_ptr(), m.len(), 0);
+                    let mut reply = [0u8; 512];
+                    let n = recv(nl, reply.as_mut_ptr(), 512, 0);
+                    let ty = u16::from_ne_bytes([reply[4], reply[5]]);
+                    if n >= 40 && ty == 16 {
+                        u32::from_ne_bytes(reply[24..28].try_into().unwrap())
+                    } else {
+                        i32::from_ne_bytes(reply[16..20].try_into().unwrap()) as u32
+                    }
+                };
+                println!("lo flags: {:#x}", link(None));
+                println!("set up: {}", link(Some(true)) as i32);
+                println!("lo flags then: {:#x}", link(None));
             }
             other => panic!("unknown scenario {other:?}"),
         }

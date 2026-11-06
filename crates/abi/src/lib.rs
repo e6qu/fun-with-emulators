@@ -719,6 +719,7 @@ pub mod socket {
     pub const SO_KEEPALIVE: u64 = 9;
     pub const SO_OOBINLINE: u64 = 10;
     pub const SO_LINGER: u64 = 13;
+    pub const SO_PEERCRED: u64 = 17;
     pub const SO_REUSEPORT: u64 = 15;
     pub const SO_RCVTIMEO: u64 = 20;
     pub const SO_SNDTIMEO: u64 = 21;
