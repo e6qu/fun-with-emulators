@@ -1379,9 +1379,31 @@ fn alpine_podman_runs_an_image() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         // As a login would have it, not the host's.
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        // Each process's calls, for a step that fails.
+        let trace = root.join("tmp/podman.trace");
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
         cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() && args[0] != "run" {
+            // The last calls of each process.
+            let text = std::fs::read_to_string(&trace).unwrap_or_default();
+            let mut pids: Vec<&str> = Vec::new();
+            for l in text.lines() {
+                let p = l.split(']').next().unwrap_or("");
+                if !pids.contains(&p) {
+                    pids.push(p);
+                }
+            }
+            for p in pids {
+                let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(p)).collect();
+                eprintln!("--- {p}] last calls:");
+                for l in &lines[lines.len().saturating_sub(15)..] {
+                    eprintln!("{l}");
+                }
+            }
+        }
         out
     };
     let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
