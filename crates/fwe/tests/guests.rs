@@ -1330,9 +1330,11 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    // Without the host's own attributes, which an archive made on Linux
+    // would not have.
     run_checked(
         Command::new("tar")
-            .arg("cf")
+            .args(["--no-xattrs", "--no-mac-metadata", "-cf"])
             .arg(out)
             .args(["oci-layout", "index.json", "blobs"])
             .current_dir(&dir),
@@ -1343,11 +1345,13 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
 /// What the container prints in [`alpine_podman_runs_an_image`].
 const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
     grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; ls /proc | grep -E '^[0-9]+$' | head -1; \
-    touch /made-here && echo writable; exit 3";
+    touch /made-here && echo writable; \
+    awk '$5 == \"/\" && / - overlay / {print \"root on overlay\"}' /proc/self/mountinfo; exit 3";
 
 /// Alpine's podman (fetched: `guests/alpine/fetch/podman.txt`), as root
-/// with the `vfs` storage driver: it loads the standard `alpine` image
-/// from an OCI archive and runs a container of it through conmon and crun
+/// with its default storage driver, `overlay`: it loads the standard
+/// `alpine` image from an OCI archive and runs a container of it, whose
+/// root is an overlay of the image's layer, through conmon and crun
 /// (conmon adopting the container's init as a subreaper, and attaching to
 /// it over a `SOCK_SEQPACKET` socket); the container's exit status is
 /// podman's, and `--rm` leaves no container behind.
@@ -1359,7 +1363,7 @@ fn alpine_podman_runs_an_image() {
     let etc = root.join("etc/containers");
     std::fs::write(
         etc.join("storage.conf"),
-        "[storage]\ndriver = \"vfs\"\nrunroot = \"/run/containers/storage\"\n\
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\n\
          graphroot = \"/var/lib/containers/storage\"\n",
     )
     .unwrap();
@@ -1375,19 +1379,46 @@ fn alpine_podman_runs_an_image() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         // As a login would have it, not the host's.
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        // Each process's calls, for a step that fails.
+        let trace = root.join("tmp/podman.trace");
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
         cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() && args[0] != "run" {
+            // The last calls of each process.
+            let text = std::fs::read_to_string(&trace).unwrap_or_default();
+            let mut pids: Vec<&str> = Vec::new();
+            for l in text.lines() {
+                let p = l.split(']').next().unwrap_or("");
+                if !pids.contains(&p) {
+                    pids.push(p);
+                }
+            }
+            for p in pids {
+                let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(p)).collect();
+                eprintln!("--- {p}] last calls:");
+                for l in &lines[lines.len().saturating_sub(15)..] {
+                    eprintln!("{l}");
+                }
+            }
+        }
         out
     };
     let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
     let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
+    let driver = podman(&["info", "--format", "{{.Store.GraphDriverName}}"]);
     let run = podman(&["run", "--rm", "--network=none", "alpine:3.20", "sh", "-c", IN_PODMAN]);
     let after = podman(&["ps", "-a", "--format", "{{.ID}}"]);
     let _ = std::fs::remove_dir_all(&root);
     assert!(stdout(&loaded).contains("Loaded image: docker.io/library/alpine:3.20"));
     assert_eq!(stdout(&images), "docker.io/library/alpine:3.20\n");
-    assert_eq!(stdout(&run), "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\n");
+    assert_eq!(stdout(&driver), "overlay\n");
+    assert_eq!(
+        stdout(&run),
+        "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\nroot on overlay\n"
+    );
     assert_eq!(run.status.code(), Some(3));
     assert_eq!(stdout(&after), "");
 }
@@ -3692,6 +3723,30 @@ fn subreaper_adopts_orphans() {
     );
 }
 
+/// A process that becomes a subreaper does not adopt an orphan below it
+/// that had its adopter already, unless that adopter is a subreaper below
+/// it which then ends; an orphan it adopted that stops and
+/// continues is reported to its `wait` (`WUNTRACED`, `WCONTINUED`) and
+/// with `SIGCHLD`, once each, as a child's stop and continue are.
+#[test]
+fn subreaper_adoption_and_stops() {
+    assert_eq!(
+        namespaces("subreaper-late"),
+        "child exited 0\nchild is not a subreaper: true\norphan's parent is another: true\n\
+         and stays so: true\nnothing to wait for: true\n"
+    );
+    assert_eq!(
+        namespaces("subreaper-handover"),
+        "adopted below: true\nhanded up: true\nreaped: true, killed by 9\n"
+    );
+    assert_eq!(
+        namespaces("subreaper-stop"),
+        "child exited 0\nchild is not a subreaper: true\nnothing yet: true\n\
+         stopped: true, by 19\nSIGCHLD for the stop: true\nreported once: true\n\
+         continued: true\nSIGCHLD for the continue: true\nreaped: true, killed by 9\n"
+    );
+}
+
 /// A child killed outright while its parent lives is that parent's zombie;
 /// once the parent ends, the subreaper is sent `SIGCHLD` for it and reaps
 /// it as killed.
@@ -3714,7 +3769,8 @@ fn pid_namespace_init_is_unkillable_from_inside() {
 }
 
 /// A pid namespace's init adopts the orphans in it, and when it ends, or
-/// is killed, the rest of its namespace is killed.
+/// is killed, the rest of its namespace is killed, before its parent's
+/// `wait` reports it.
 #[test]
 fn pid_namespace_init_reaps_and_ends_its_namespace() {
     assert_eq!(
@@ -3724,8 +3780,33 @@ fn pid_namespace_init_reaps_and_ends_its_namespace() {
     );
     assert_eq!(
         namespaces("init-death"),
-        "init exited 3: the rest ended too: true\ninit killed by 9: the rest ended too: true\n"
+        "init exited 3: the rest ended first: true\ninit killed by 9: the rest ended first: true\n"
     );
+}
+
+/// A pid namespace's init killed from outside fwe, by the host's
+/// `SIGKILL`, which it cannot see coming, takes its namespace with it at
+/// once, before its parent reaps it.
+#[test]
+fn pid_namespace_ends_with_an_init_killed_from_outside() {
+    let file = std::env::temp_dir()
+        .join(format!("fwe-ns-{}-init-killed", std::process::id()))
+        .join("tmp/init-pid");
+    let killer = std::thread::spawn(move || {
+        for _ in 0..3000 {
+            if let Some(pid) = std::fs::read_to_string(&file).ok().and_then(|s| s.parse().ok()) {
+                // SAFETY: plain call, to the guest's init (a host pid in
+                // fwe's initial pid namespace).
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    });
+    let out = namespaces("init-killed");
+    assert!(killer.join().unwrap());
+    assert_eq!(out, "the rest ended unreaped: true\ninit killed by 9\n");
 }
 
 /// Run one scenario of the `containers` guest in a root filesystem of its
@@ -3765,6 +3846,46 @@ fn extended_attributes() {
     );
 }
 
+/// An overlay mount: lookups and listings merge the layers; a write copies
+/// the file up, a removal leaves a whiteout, a directory a lower layer has
+/// cannot be renamed, a directory made again hides the lower one's
+/// entries; a file opened in a lower layer and changed through its
+/// descriptor is copied up; the lower layers are never changed. Without an
+/// upper layer an overlay is read-only, and an option fwe lacks is refused.
+#[test]
+fn overlay_mounts() {
+    assert_eq!(
+        containers("overlay"),
+        "mount: ok\na: lower1\nd: x y z\na written: lower1+ lower: lower1 upper: lower1+\n\
+         unlink: ok\ngone: ENOENT lower: g whiteout: true 0\nrename a lower dir: EXDEV\n\
+         rename a file: ok\nd: x2 y z lower: x y\nrmdir full: ENOTEMPTY\nrmdir: ok\n\
+         made again: ok holds: []\nopaque in upper: y\n\
+         opaque through the overlay: EOPNOTSUPP\nfchmod: ok\ne: 600 lower: 644 upper: 600\n\
+         f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\nroot: a d deep sub\n\
+         upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
+         metacopy: EINVAL\n"
+    );
+}
+
+/// An overlay keeps its layers' own directories theirs, makes nothing for
+/// `O_PATH`, follows a directory moved since it was opened, keeps a
+/// descriptor on its own file when another is renamed over it, reads a
+/// listing on across its directory's copy-up and seeks in it, hides what a
+/// whiteout hid when directories are exchanged, refuses a whiteout made by
+/// hand, never writes a lower layer through a descriptor that outlived the
+/// mount, and refuses an upper layer in a read-only mount.
+#[test]
+fn overlay_edge_cases() {
+    assert_eq!(
+        containers("overlay-edges"),
+        "mount: ok\nlayer's own: true not upper: true\nO_PATH|O_CREAT: ENOENT then: ENOENT\n\
+         moved dir: true\nrenamed over: ESTALE still reads: lower\n\
+         listing across copy-up: 8 entries, 8 distinct\nseek to 3: true\n\
+         exchange: ok h holds: []\nmknod 0:0: EPERM\nafter unmount: upper true lower false\n\
+         read-only upper: EROFS\n"
+    );
+}
+
 /// Root passes permission bits, also of modes that deny every access, which
 /// `stat` shows as they are; a process without the capabilities is held to
 /// them.
@@ -3774,6 +3895,17 @@ fn root_passes_permission_bits() {
         containers("modes"),
         "dir: 555\nroot makes a file in it: ok\nfile: 0\nroot writes it: ok\n\
          user reads it: EACCES\nuser makes a file: EACCES\ndir after chmod: 755\n"
+    );
+}
+
+/// Two processes reading one `SOCK_SEQPACKET` socket at once each take
+/// whole messages, though they arrive in pieces; a child forked while a
+/// thread of its parent waits in a receive on a socket receives from it.
+#[test]
+fn seqpacket_shared_between_processes() {
+    assert_eq!(
+        containers("seqpacket-shared"),
+        "whole: 40 torn: 0\nthread got: 5\nchild got one: true\n"
     );
 }
 

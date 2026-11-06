@@ -367,9 +367,15 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         p if p > 0 => reaper::Select::Pid(p),
         p => reaper::Select::Pgid(-p),
     };
+    let want = Want {
+        exited: true,
+        stopped: options & fwe_abi::wait::WUNTRACED != 0,
+        continued: options & fwe_abi::wait::WCONTINUED != 0,
+    };
     reaper_wait(
         sel,
         host_options & libc::WNOHANG != 0,
+        want,
         || wait4_host(pid, host_options | libc::WNOHANG, wstatus, rusage),
         |e| {
             if wstatus != 0 && fwe_kernel::uaccess::write(wstatus, e.status).is_err() {
@@ -386,14 +392,23 @@ pub fn do_wait4(regs: &Regs) -> i64 {
     )
 }
 
+/// What a `wait` reports: ends, stops, continues.
+#[derive(Clone, Copy)]
+struct Want {
+    exited: bool,
+    stopped: bool,
+    continued: bool,
+}
+
 /// A reaper's `wait` for the children `sel` picks: `own` checks its own
 /// children (without blocking; `ECHILD` when it has none), then `adopted`
-/// reports one it adopted that ended (taken, unless `peek`); until one is
-/// found, or there are none, or a signal arrives (`EINTR`), unless
-/// `nohang`.
+/// reports one it adopted that ended, stopped or continued, as `want`
+/// says (taken, unless `peek`); until one is found, or there are none, or
+/// a signal arrives (`EINTR`), unless `nohang`.
 fn reaper_wait(
     sel: reaper::Select,
     nohang: bool,
+    want: Want,
     own: impl Fn() -> i64,
     adopted: impl Fn(&fwe_kernel::procreg::Ended) -> i64,
     peek: bool,
@@ -411,7 +426,12 @@ fn reaper_wait(
             // ended before it forgets its record, so one ending meanwhile
             // is seen in one or the other.
             let live = reaper::has_live_adopted(sel);
-            if let Some(e) = reaper::take_adopted(sel, peek) {
+            if want.exited
+                && let Some(e) = reaper::take_adopted(sel, peek)
+            {
+                return Some(adopted(&e));
+            }
+            if let Some(e) = reaper::take_change(sel, peek, want.stopped, want.continued) {
                 return Some(adopted(&e));
             }
             (r == err(errno::ECHILD) && !live).then_some(r)
@@ -432,6 +452,9 @@ fn reaper_wait(
 /// `wait4` of the host's children (`pid` is the host's), the result
 /// written in Linux's layout.
 fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
+    if host_options & libc::WNOHANG != 0 && pid > 0 && reaper::init_unreapable(pid) {
+        return 0;
+    }
     let mut status: libc::c_int = 0;
     // SAFETY: an all-zero rusage is a valid out-parameter.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -455,6 +478,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
             fwe_kernel::procreg::reaped(r);
             reaper::reaped_own_child();
         });
+        reaper::reaped_child(r);
     }
     guest
 }
@@ -504,7 +528,7 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         }
         0
     };
-    if !reaper::active() || options & w::WEXITED == 0 {
+    if !reaper::active() {
         let r = waitid_host(idtype, id, host_options, infop, options);
         return if r < 0 { r } else { zero_rusage() };
     }
@@ -514,9 +538,15 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         _ => reaper::Select::Any,
     };
     let own = || waitid_host(idtype, id, host_options | libc::WNOHANG, infop, options);
+    let want = Want {
+        exited: options & w::WEXITED != 0,
+        stopped: options & w::WSTOPPED != 0,
+        continued: options & w::WCONTINUED != 0,
+    };
     let r = reaper_wait(
         sel,
         options & w::WNOHANG != 0,
+        want,
         own,
         |e| {
             let (code, status) = reaper::child_code(e.status);
@@ -548,6 +578,15 @@ fn waitid_host(
     options: u64,
 ) -> i64 {
     use fwe_abi::wait as w;
+    if host_options & libc::WNOHANG != 0
+        && idtype == libc::P_PID
+        && reaper::init_unreapable(id as i32)
+    {
+        if infop != 0 && fwe_kernel::uaccess::write(infop, [0i32; 32]).is_err() {
+            return err(errno::EFAULT);
+        }
+        return 0;
+    }
     // SAFETY: an all-zero siginfo is a valid out-parameter.
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `si` is a valid out-parameter.
@@ -579,6 +618,7 @@ fn waitid_host(
                 fwe_kernel::procreg::reaped(pid);
                 reaper::reaped_own_child();
             });
+            reaper::reaped_child(pid);
         }
     }
     if infop != 0 && fwe_kernel::uaccess::write(infop, words).is_err() {

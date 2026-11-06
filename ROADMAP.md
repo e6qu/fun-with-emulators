@@ -19,7 +19,7 @@ remains is that run on real hardware, and the `x18` and code-discovery
 gaps, which no target program needs yet. M3 is in progress: crun runs the
 standard `alpine` image in its own namespaces, cgroup, capabilities and
 seccomp profile, and podman loads that image and runs containers of it
-with `vfs` storage; overlay mounts and containerd are next.
+on overlay mounts; containerd is next.
 
 ## M0 — Foundation (done)
 
@@ -154,11 +154,12 @@ servers run unmodified.
 
 - [x] Namespaces (mount, pid, user, uts, ipc, network, cgroup)
 - [x] cgroups v2
-- [ ] Overlay mounts
+- [x] Overlay mounts: layers merged, copy-up, whiteouts and opaque
+  directories, as Linux's `overlay` filesystem
 - [x] seccomp and capabilities
 - [x] An OCI runtime runs a standard image: crun runs the `alpine` image
 - [x] podman runs standard images: it loads the `alpine` image and runs
-  containers of it (`vfs` storage until overlay mounts)
+  containers of it, on its default `overlay` storage driver
 - [ ] containerd runs standard images
 
 **Done when:** podman and containerd run standard container images.

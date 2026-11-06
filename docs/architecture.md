@@ -686,7 +686,10 @@ a send is whole or, without blocking, `EAGAIN`. The rest is the stream's
 own, so it can listen, connect and accept, and a peer's close is
 end-of-file to `read`, `poll` and `epoll` alike. Its buffers hold two of
 the largest messages, and their odd size marks it, so a process that
-receives one with `SCM_RIGHTS` knows it for what it is.
+receives one with `SCM_RIGHTS` knows it for what it is. A message is sent
+or taken under the socket's lock for that way, which the threads of a
+process share as a mutex and processes as a byte-range lock on a file of
+fwe's, so neither threads nor processes interleave or split one.
 
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
@@ -762,12 +765,31 @@ Each mount namespace has a table (`crates/kernel/src/mounts.rs`) of mounts,
 each attached at a path to a parent mount, as on Linux: stacked mounts,
 `pivot_root(".", ".")` and the unmount of the old root behave as there. A
 mount shows a host directory (the rootfs, a bind mount's source, a tmpfs's
-backing directory in fwe's private directory) or one of fwe's own
-filesystems (`proc`, `sysfs`, `devpts`, `mqueue`; `cgroup2` is the shared
-tree). `mount` (new mounts, bind and recursive bind, move, remount,
-propagation), `umount2`, `pivot_root` and `chroot` act on it, and
-`/proc/self/mountinfo` and `/proc/self/mounts` show it from the process's
-root.
+backing directory in fwe's private directory), a stack of them (an
+overlay), or one of fwe's own filesystems (`proc`, `sysfs`, `devpts`,
+`mqueue`; `cgroup2` is the shared tree). `mount` (new mounts, bind and
+recursive bind, move, remount, propagation), `umount2`, `pivot_root` and
+`chroot` act on it, and `/proc/self/mountinfo` and `/proc/self/mounts`
+show it from the process's root.
+
+An overlay (`crates/kernel/src/overlay.rs`) is resolved as Linux's
+`overlay` filesystem resolves it: each name in the upper layer, then in
+the lower ones in turn, directories of one name merging; a whiteout (a
+device node numbered 0:0) hides a name below it and an opaque directory
+(`trusted.overlay.opaque`, or `user.overlay.opaque` with `userxattr`) what
+is below it. A call that changes a file of a lower layer copies it up
+first, its directories with it (a regular file as an APFS clone, which
+shares its blocks until written); a removal of what a lower layer has
+leaves a whiteout; `getdents64` lists the layers merged. A descriptor of a
+lower layer's file that is then changed through it (`fchmod` and the like)
+is moved onto the copy, as Linux moves it: the copy records the file it
+is of. A descriptor opened through an overlay keeps that overlay's layers,
+so it is the overlay's file even once the mount has gone or moved, and a
+layer's directory opened as itself is never taken for the overlay's. Each change is built in the
+work directory and moved into place with one atomic rename, so other
+processes see it whole. The overlay's own attributes are hidden from its
+files, and a mount option asking for what fwe does not do (`metacopy=on`,
+`redirect_dir=on`, `index=on`) is refused, as by a kernel without it.
 
 ### Namespaces
 
@@ -780,9 +802,11 @@ initial namespace sees the host's: its host name, its pids.
 - **pid** (`pidns.rs`): a namespace numbers its processes and threads from
   1 and maps each number to its host pid; `getpid`, `getppid`, `kill`,
   `wait4`, `waitid`, the process-group, session and terminal calls and
-  the senders in `siginfo` are translated. When its init ends, or is sent
-  `SIGKILL`, every other process in it is killed; from inside the
-  namespace, its init cannot be sent `SIGKILL` or `SIGSTOP`.
+  the senders in `siginfo` are translated. When its init ends, however it
+  ends (its parent watches it, so also when the host kills it), every
+  other process in it is killed, and its parent's `wait` reports it only
+  once they have gone; from inside the namespace, its init cannot be sent
+  `SIGKILL` or `SIGSTOP`.
 - **UTS**: `uname`, `sethostname`, `setdomainname` and
   `/proc/sys/kernel/hostname` use its names.
 - **network** (`netns.rs`): a loopback interface, down until brought up;
@@ -808,11 +832,15 @@ might adopt it records how it ended; one killed by `SIGKILL` cannot, and
 whoever finds it gone records that for it. Its parent's `wait` removes the
 record, or once the parent has gone, the adopter's `wait` takes it. A
 reaper runs a watcher thread that follows its descendants on the host
-(`kqueue` process events) and, when an adopted one ends, sends the reaper
-a `SIGCHLD` through the host (so its disposition and mask act on it as on
-a child's; the handler takes the sender and status from the watcher) and
-wakes its threads waiting in `wait`, which look at its own children and
-then at its adopted ones.
+(`kqueue` process events) and, when an adopted one ends, stops or
+continues (the signals it is sent, and then its state), sends the reaper
+a `SIGCHLD` through the host (so its disposition, mask and `SA_NOCLDSTOP`
+act on it as on a child's; the handler takes the sender and status from
+the watcher) and wakes its threads waiting in `wait`, which look at its
+own children and then at its adopted ones. As on Linux, an orphan keeps
+the adopter it had when its parent ended: a process that becomes a
+subreaper notes the orphans below it that have one already, and one that
+stops being a subreaper keeps those it adopted.
 
 `/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
 `status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
@@ -930,7 +958,15 @@ those items.
 - **Mounts:** mounts do not propagate between namespaces, whatever their
   propagation type; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
-  always detaches).
+  always detaches). An overlay's layers must be host directories (not in
+  another overlay); a directory a lower layer has cannot be renamed
+  (`EXDEV`, as with `redirect_dir=off`); a rename that leaves a whiteout
+  behind, and a `bind` over one, are two host steps, between which another
+  process can see the lower layer's file at that name; a lower layer's
+  file that another was renamed over, changed through a descriptor of it,
+  fails with `ESTALE`, and one moved onto its copy-up loses the
+  record locks held through it; descriptors of one overlay directory
+  (`dup`, `fork`) each keep their own place in its listing.
 - **Namespaces:** a network namespace has a loopback interface only (no
   `veth`, no netlink), and a datagram to one of its ports nobody bound by
   number goes to the host loopback port of that number; the initial
@@ -938,13 +974,12 @@ those items.
   port is freed
   when the last descriptor of its socket in the binding process closes;
   capabilities are the process's, not qualified by user namespace;
-  `setns` is not implemented; an adopted orphan that stops or continues
-  is not reported to its adopter's `wait`, and its adopter is found when
-  asked for, not fixed when its parent ends (an ancestor that becomes a
-  subreaper later adopts it too); a pid namespace's init killed outright
-  (not by a fwe process's `kill`) ends its namespace only once its parent
-  reaps it or a reaper sees it gone, and an init's end is reported before
-  the rest of its namespace has gone;
+  `setns` is not implemented; a pid namespace's init killed from outside
+  fwe after its parent ran another program (`execve`) ends its namespace
+  only once that parent reaps it or a reaper sees it gone; a reaper sees
+  an adopted orphan's state after each signal it is sent, so a stop and a
+  continue sent together, before it looks, are not reported, and stops
+  not yet reported are forgotten when the reaper runs another program;
   `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
   `environ`, and shows only fwe's processes in the initial pid namespace.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
@@ -955,8 +990,7 @@ those items.
   `SECCOMP_FILTER_FLAG_TSYNC`), and there is no user-notification listener
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`);
   `sched_setaffinity` is checked and remembered but threads still run on
-  any CPU; processes that share a `SOCK_SEQPACKET` socket and read it at
-  once can split a message between them (a process's own threads cannot).
+  any CPU.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a blocked signal whose

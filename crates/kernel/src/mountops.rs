@@ -3,7 +3,9 @@
 //!
 //! A tmpfs is a fresh directory of fwe's ([`tmpfs_dir`]), the synthetic
 //! filesystems (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`) are fwe's
-//! own, and a bind mount shows a directory or file the guest names. Mounts
+//! own, an overlay stacks directories the guest names
+//! ([`crate::overlay`]), and a bind mount shows a directory or file the
+//! guest names. Mounts
 //! do not propagate between namespaces: each is private, whatever its
 //! propagation type says.
 
@@ -116,13 +118,65 @@ impl<P: Platform> Kernel<P> {
         Some(crate::mounts::join(&dir, &r.name))
     }
 
+    /// The host directory of the guest directory `path`, which must be in
+    /// a mount of host directories (`EINVAL` for one in an overlay or in
+    /// a filesystem of fwe's).
+    fn host_dir(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        self.host_dir_rw(path, false)
+    }
+
+    /// [`host_dir`](Self::host_dir) of a directory to be written to:
+    /// `EROFS` in a read-only mount.
+    fn host_dir_rw(&self, path: &[u8], write: bool) -> Result<Vec<u8>, i32> {
+        let (ns, is_dir) = self.mount_path(path, true)?;
+        if !is_dir {
+            return Err(errno::ENOTDIR);
+        }
+        let table = self.fs().mounts();
+        let (m, rest) = table.locate(&ns);
+        if write && m.read_only() {
+            return Err(errno::EROFS);
+        }
+        m.host_path(&rest).ok_or(errno::EINVAL)
+    }
+
+    /// The layers an overlay's mount options (`data`) name, checked as
+    /// Linux checks them, with the work directory made ready.
+    fn overlay_layers(&self, data: &[u8]) -> Result<crate::overlay::Layers, i32> {
+        let o = crate::overlay::parse(data)?;
+        let lowers = o.lowers.iter().map(|p| self.host_dir(p)).collect::<Result<Vec<_>, _>>()?;
+        let upper = o.upper.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
+        let work = o.work.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
+        if let (Some(u), Some(w)) = (&upper, &work) {
+            // Separate directories of one filesystem.
+            let dev = |p: &[u8]| -> Result<u64, i32> {
+                let c = std::ffi::CString::new(p).map_err(|_| errno::EINVAL)?;
+                // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: a NUL-terminated path; a valid out-parameter.
+                if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
+                    return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+                }
+                Ok(st.st_dev as u64)
+            };
+            if dev(u)? != dev(w)?
+                || crate::mounts::under(u, w).is_some()
+                || crate::mounts::under(w, u).is_some()
+            {
+                return Err(errno::EINVAL);
+            }
+            crate::overlay::prepare_work(w)?;
+        }
+        Ok(crate::overlay::Layers { upper, work, lowers, userxattr: o.userxattr })
+    }
+
     /// `mount(source, target, fstype, flags, data)`.
     pub(crate) fn sys_mount(
         &mut self,
         source: u64,
         target: u64,
         fstype: u64,
-        flags: u64,
+        mut flags: u64,
         data: u64,
     ) -> i64 {
         if !self.creds.has_admin() {
@@ -203,6 +257,16 @@ impl<P: Platform> Kernel<P> {
                             .as_ref()
                             .map_or(b"/".to_vec(), |c| c.get().root.clone());
                         Source::Host(dir)
+                    }
+                    Err(e) => return err(e),
+                },
+                FsType::Overlay => match self.overlay_layers(&data) {
+                    Ok(layers) => {
+                        if layers.upper.is_none() {
+                            // Nothing to write to: read-only, as on Linux.
+                            flags |= ms::RDONLY;
+                        }
+                        Source::Overlay(std::sync::Arc::new(layers))
                     }
                     Err(e) => return err(e),
                 },

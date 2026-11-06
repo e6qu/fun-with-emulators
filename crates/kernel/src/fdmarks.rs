@@ -22,8 +22,12 @@ pub struct Origin {
     /// The mount's flags and filesystem type.
     pub flags: u64,
     pub fstype: FsType,
-    /// The file's path in the mount namespace's view, as it was opened.
+    /// The file's path in the mount namespace's view, as it was opened
+    /// (empty when fwe could not place it).
     pub ns_path: Vec<u8>,
+    /// The layers of the overlay it was opened in, if it was: the
+    /// overlay's file it is wherever the mount has gone since.
+    pub ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 }
 
 /// A socket standing in for another kind.
@@ -114,9 +118,15 @@ fn record(fd: i32) -> Option<Record> {
 
 /// Record that `fd` was opened at `ns_path` in a mount with `flags` and
 /// `fstype`.
-pub fn opened(fd: i32, ns_path: Vec<u8>, flags: u64, fstype: FsType) {
+pub fn opened(
+    fd: i32,
+    ns_path: Vec<u8>,
+    flags: u64,
+    fstype: FsType,
+    ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
+) {
     let Some((dev, ino)) = identity(fd) else { return };
-    let origin = Some(Origin { flags, fstype, ns_path });
+    let origin = Some(Origin { flags, fstype, ns_path, ovl });
     insert(&mut records(), fd, Record { dev, ino, origin, mark: None });
 }
 
@@ -149,6 +159,7 @@ pub fn marked(fd: i32) -> Option<Mark> {
 /// `fd` was closed.
 pub fn closed(fd: i32) {
     take(&mut records(), fd);
+    crate::overlay::closed(fd);
 }
 
 /// Whether a descriptor of this process other than `fd` is open on the
@@ -206,6 +217,10 @@ pub fn save(e: &mut Enc) {
                 e.u64(o.flags);
                 e.u32(o.fstype as u32);
                 e.bytes(&o.ns_path);
+                e.bool(o.ovl.is_some());
+                if let Some(l) = &o.ovl {
+                    l.encode(e);
+                }
             }
             None => e.bool(false),
         }
@@ -241,7 +256,9 @@ pub fn load(d: &mut Dec) {
         let fd = d.i32();
         let (dev, ino) = (d.u64(), d.u64());
         let origin = if d.bool() {
-            Some(Origin { flags: d.u64(), fstype: FsType::from_code(d.u32()), ns_path: d.bytes() })
+            let (flags, fstype, ns_path) = (d.u64(), FsType::from_code(d.u32()), d.bytes());
+            let ovl = d.bool().then(|| std::sync::Arc::new(crate::overlay::Layers::decode(d)));
+            Some(Origin { flags, fstype, ns_path, ovl })
         } else {
             None
         };

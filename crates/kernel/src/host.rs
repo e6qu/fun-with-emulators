@@ -457,6 +457,16 @@ pub fn signal_is_ignored(sig: u64) -> bool {
     }
 }
 
+/// Whether the host's `SIGCHLD` action has `SA_NOCLDSTOP` (the guest's
+/// does): no `SIGCHLD` for a child that stops or continues.
+pub fn sigchld_nocldstop() -> bool {
+    // SAFETY: zeroed bytes are a valid `sigaction`; the call only reads.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter; no new action.
+    unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) };
+    old.sa_flags & libc::SA_NOCLDSTOP != 0
+}
+
 /// Whether the host reaps this process's children as they end, leaving no
 /// zombie for `wait`: it ignores `SIGCHLD`, or set `SA_NOCLDWAIT`.
 pub fn children_reaped_by_host() -> bool {
@@ -1252,5 +1262,81 @@ mod tests {
             libc::close(fds[1]);
         }
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// What [`rename_at`] does about a file already at the new name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rename {
+    /// Replaces it, as `rename` does.
+    Replace,
+    /// Fails with `EEXIST` (Linux's `RENAME_NOREPLACE`), atomically.
+    NoReplace,
+    /// Swaps the two, both of which must exist (`RENAME_EXCHANGE`).
+    Exchange,
+}
+
+/// Rename `on` in directory `od` to `nn` in `nd`, atomically in each
+/// mode: macOS's `renameatx_np` with `RENAME_EXCL` or `RENAME_SWAP`,
+/// Linux's `renameat2`. A filesystem that cannot is `EINVAL`, as on Linux.
+pub fn rename_at(
+    od: i32,
+    on: &std::ffi::CStr,
+    nd: i32,
+    nn: &std::ffi::CStr,
+    how: Rename,
+) -> Result<(), i32> {
+    #[cfg(target_os = "macos")]
+    let r = {
+        let flags = match how {
+            Rename::Replace => 0,
+            Rename::NoReplace => libc::RENAME_EXCL,
+            Rename::Exchange => libc::RENAME_SWAP,
+        };
+        // SAFETY: names NUL-terminated; the caller's directories.
+        unsafe { libc::renameatx_np(od, on.as_ptr(), nd, nn.as_ptr(), flags) }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let r = {
+        let flags: libc::c_uint = match how {
+            Rename::Replace => 0,
+            Rename::NoReplace => 1,
+            Rename::Exchange => 2,
+        };
+        // SAFETY: names NUL-terminated; the caller's directories.
+        let r =
+            unsafe { libc::syscall(libc::SYS_renameat2, od, on.as_ptr(), nd, nn.as_ptr(), flags) };
+        r as i32
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    match last_errno() {
+        #[cfg(target_os = "macos")]
+        libc::ENOTSUP if how != Rename::Replace => Err(le::EINVAL),
+        e => Err(errno_to_linux(e)),
+    }
+}
+
+/// Make `dst` in directory `dst_dir` a copy of the regular file open as
+/// `src` that shares its blocks until either is written (an APFS clone),
+/// with its mode, flags and extended attributes. `EOPNOTSUPP` where the
+/// host cannot (another filesystem, or not macOS): the caller copies.
+pub fn clone_at(src: i32, dst_dir: i32, dst: &std::ffi::CStr) -> Result<(), i32> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a NUL-terminated name; the caller's descriptors.
+        if unsafe { libc::fclonefileat(src, dst_dir, dst.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        match last_errno() {
+            libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
+            e => Err(errno_to_linux(e)),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (src, dst_dir, dst);
+        Err(le::EOPNOTSUPP)
     }
 }

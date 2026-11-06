@@ -1,6 +1,6 @@
 //! File and directory system calls, built on the [`crate::fs`] resolver.
 
-use crate::fs::Fs;
+use crate::fs::{Change, Fs, Resolved};
 use crate::host::{self, last_error, ret};
 use crate::{Kernel, Platform, guest, uaccess};
 use fwe_abi::{Stat, Statx, err, errno, fcntl, statx_mask};
@@ -201,7 +201,13 @@ impl<P: Platform> Kernel<P> {
                     if crate::fs::has_path(fd, &target) {
                         // Reopen the file, as Linux does: the same one, in
                         // the mount it was opened through, whatever has
-                        // become of its path.
+                        // become of its path; copied up first, to write a
+                        // file of an overlay.
+                        let writes = flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
+                            || flags & fcntl::O_TRUNC != 0;
+                        if writes && let Err(e) = self.fd_change(fd) {
+                            return err(e);
+                        }
                         return reopen(fd, flags);
                     }
                     // A pipe, socket, memfd or the like: a new descriptor
@@ -234,9 +240,16 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_openat_bytes(&mut self, dirfd: u64, path: &[u8], flags: u64, mode: u64) -> i64 {
+        // With O_PATH every flag but these is ignored, as on Linux: nothing
+        // is made, truncated or opened for writing.
+        let flags = if flags & fcntl::O_PATH != 0 {
+            flags & (fcntl::O_PATH | fcntl::O_CLOEXEC | fcntl::O_DIRECTORY | fcntl::O_NOFOLLOW)
+        } else {
+            flags
+        };
         let follow_final = flags & fcntl::O_NOFOLLOW == 0
             && flags & (fcntl::O_CREAT | fcntl::O_EXCL) != fcntl::O_CREAT | fcntl::O_EXCL;
-        let resolved = match self.fs().resolve(dirfd as i32, path, follow_final) {
+        let mut resolved = match self.fs().resolve(dirfd as i32, path, follow_final) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -251,6 +264,15 @@ impl<P: Platform> Kernel<P> {
                 resolved.name_c().is_ok_and(|n| stat_at(resolved.dir.as_raw_fd(), &n).is_ok());
             if (writes || !exists)
                 && let Err(e) = resolved.writable()
+            {
+                return err(e);
+            }
+            // In an overlay, the file is copied up to be written, or its
+            // directory to make it in.
+            let how = if exists { writes.then_some(Change::Modify) } else { Some(Change::Create) };
+            if flags & fcntl::O_PATH == 0
+                && let Some(how) = how
+                && let Err(e) = resolved.prepare(how)
             {
                 return err(e);
             }
@@ -321,6 +343,13 @@ impl<P: Platform> Kernel<P> {
                 if r >= 0 && made.get() && host_mode != mode & 0o7777 {
                     let _ = crate::modes::keep_fd(r as i32, mode);
                 }
+                if let Err(e) = resolved.finish(r >= 0)
+                    && r >= 0
+                {
+                    // SAFETY: closing the descriptor just opened.
+                    unsafe { libc::close(r as i32) };
+                    return err(e);
+                }
                 if r < 0 {
                     return r;
                 }
@@ -387,14 +416,17 @@ impl<P: Platform> Kernel<P> {
                             ns,
                             resolved.mount_flags,
                             resolved.fstype,
+                            None,
                         );
                     }
                     return device;
                 }
             }
         }
-        if let Some(ns) = resolved.ns_path {
-            crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype);
+        let layers = resolved.ovl.as_ref().map(|o| o.layers.clone());
+        if resolved.ns_path.is_some() || layers.is_some() {
+            let ns = resolved.ns_path.unwrap_or_default();
+            crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype, layers);
         }
         fd as i64
     }
@@ -677,7 +709,7 @@ impl<P: Platform> Kernel<P> {
                 _ => errno::EEXIST,
             });
         }
-        let r = match self.fs().resolve(dirfd as i32, &path, false) {
+        let mut r = match self.fs().resolve(dirfd as i32, &path, false) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -686,6 +718,9 @@ impl<P: Platform> Kernel<P> {
         }
         if r.mount_root {
             return err(errno::EEXIST);
+        }
+        if let Err(e) = r.prepare(Change::Create) {
+            return err(e);
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let mode = self.fs().apply_umask(mode as u32);
@@ -697,6 +732,11 @@ impl<P: Platform> Kernel<P> {
         });
         if made == 0 && host_mode != mode & 0o7777 {
             let _ = crate::modes::keep_at(dir, &name, mode);
+        }
+        if let Err(e) = r.finish(made == 0)
+            && made == 0
+        {
+            return err(e);
         }
         if made == 0 && r.fstype == crate::mounts::FsType::Cgroup2 {
             // A new cgroup, with its interface files.
@@ -714,12 +754,13 @@ impl<P: Platform> Kernel<P> {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let kind = mode as u32 & 0o170000;
         let perm = self.fs().apply_umask(mode as u32 & 0o7777);
-        let (dir, name) = match self.resolve_w(dirfd, &path, false, false) {
-            Ok((d, n, _)) => (d, n),
+        let mut r = match self.resolve_p(dirfd, &path, false, false, Change::Create) {
+            Ok(r) => r,
             Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
-        let d = dir.as_raw_fd();
+        let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
+        let d = r.dir.as_raw_fd();
         let host_perm = crate::modes::host_perm(perm, false);
         let made = match kind {
             0 | 0o100000 => self.change_in(d, || {
@@ -752,6 +793,10 @@ impl<P: Platform> Kernel<P> {
                     major: crate::devnodes::major(dev),
                     minor: crate::devnodes::minor(dev),
                 };
+                if r.ovl.is_some() && kind == S_IFCHR && node.major == 0 && node.minor == 0 {
+                    // A whiteout is the overlay's own, as on Linux.
+                    return err(errno::EPERM);
+                }
                 if let Err(e) = crate::cgroupfs::check_device(
                     crate::bpf::BPF_DEVCG_ACC_MKNOD,
                     node.bpf_type(),
@@ -772,7 +817,10 @@ impl<P: Platform> Kernel<P> {
         if made == 0 && host_perm != perm {
             let _ = crate::modes::keep_at(d, &name, perm);
         }
-        made
+        match r.finish(made == 0) {
+            Err(e) if made == 0 => err(e),
+            _ => made,
+        }
     }
 
     pub(crate) fn sys_unlinkat(&mut self, dirfd: u64, path: u64, flags: u64) -> i64 {
@@ -792,10 +840,27 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => err(e),
             };
         }
-        let (dir, name) = match self.resolve_w(dirfd, &path, false, false) {
-            Ok((d, n, _)) => (d, n),
+        let r = match self.resolve_p(dirfd, &path, false, false, Change::Remove) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
+        if let Some(o) = &r.ovl {
+            // The directory copied up, then the name removed from the
+            // upper layer, or covered there.
+            let up = match crate::overlay::upper_dir(&o.layers, &o.parent) {
+                Ok(up) => up,
+                Err(e) => return err(e),
+            };
+            let rmdir = flags & fcntl::AT_REMOVEDIR != 0;
+            return self.change_in(up.as_raw_fd(), || {
+                match crate::overlay::remove(&o.layers, &o.parent, &r.name, rmdir) {
+                    Ok(()) => 0,
+                    Err(e) => err(e),
+                }
+            });
+        }
+        let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
+        let dir = r.dir;
         let host_flags = if flags & fcntl::AT_REMOVEDIR != 0 { libc::AT_REMOVEDIR } else { 0 };
         let d = dir.as_raw_fd();
         // SAFETY: `name` NUL-terminated; `dir` live.
@@ -822,14 +887,21 @@ impl<P: Platform> Kernel<P> {
             Ok(t) => t,
             Err(_) => return err(errno::EINVAL),
         };
-        let (dir, name) = match self.resolve_w(dirfd, &path, false, false) {
-            Ok((d, n, _)) => (d, n),
+        let mut r = match self.resolve_p(dirfd, &path, false, false, Change::Create) {
+            Ok(r) => r,
             Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
-        let d = dir.as_raw_fd();
-        // SAFETY: both strings NUL-terminated; `dir` live.
-        self.change_in(d, || ret(unsafe { libc::symlinkat(target.as_ptr(), d, name.as_ptr()) }))
+        let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
+        let d = r.dir.as_raw_fd();
+        let made = self.change_in(d, || {
+            // SAFETY: both strings NUL-terminated; `dir` live.
+            ret(unsafe { libc::symlinkat(target.as_ptr(), d, name.as_ptr()) })
+        });
+        match r.finish(made == 0) {
+            Err(e) if made == 0 => err(e),
+            _ => made,
+        }
     }
 
     pub(crate) fn sys_linkat(
@@ -843,22 +915,37 @@ impl<P: Platform> Kernel<P> {
         let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_FOLLOW != 0;
-        let (od, on, om) = match self.resolve_w(olddirfd, &oldpath, follow, true) {
-            Ok(v) => v,
+        let old = match self.fs().resolve(olddirfd as i32, &oldpath, follow) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
-        let (nd, nn, nm) = match self.resolve_w(newdirfd, &newpath, false, false) {
-            Ok(v) => v,
-            Err(errno::EBUSY) => return err(errno::EEXIST),
+        let new = match self.fs().resolve(newdirfd as i32, &newpath, false) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
-        if om != nm && om != 0 && nm != 0 {
+        if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
         }
-        let (o, n) = (od.as_raw_fd(), nd.as_raw_fd());
+        let (mut old, mut new) = (old, new);
+        if let Err(e) = old.prepare(Change::Modify) {
+            return err(e);
+        }
+        if new.mount_root {
+            return err(errno::EEXIST);
+        }
+        if let Err(e) = new.prepare(Change::Create) {
+            return err(e);
+        }
+        let (Ok(on), Ok(nn)) = (old.name_c(), new.name_c()) else { return err(errno::EINVAL) };
+        let (o, n) = (old.dir.as_raw_fd(), new.dir.as_raw_fd());
         // SAFETY: names NUL-terminated; dirs live. We resolved symlinks, so 0.
-        self.change_in(n, || ret(unsafe { libc::linkat(o, on.as_ptr(), n, nn.as_ptr(), 0) }))
+        let made =
+            self.change_in(n, || ret(unsafe { libc::linkat(o, on.as_ptr(), n, nn.as_ptr(), 0) }));
+        match new.finish(made == 0) {
+            Err(e) if made == 0 => err(e),
+            _ => made,
+        }
     }
 
     pub(crate) fn sys_renameat2(
@@ -871,27 +958,65 @@ impl<P: Platform> Kernel<P> {
     ) -> i64 {
         let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
-        let (od, on, om) = match self.resolve_w(olddirfd, &oldpath, false, false) {
-            Ok(v) => v,
+        let how = match rename_mode(flags) {
+            Ok(how) => how,
             Err(e) => return err(e),
         };
-        let (nd, nn, nm) = match self.resolve_w(newdirfd, &newpath, false, false) {
-            Ok(v) => v,
+        if flags & RENAME_WHITEOUT != 0 && !self.creds.has(crate::caps::CAP_MKNOD) {
+            return err(errno::EPERM);
+        }
+        let old = match self.resolve_p(olddirfd, &oldpath, false, false, Change::Remove) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
-        if om != nm && om != 0 && nm != 0 {
+        let new = match self.resolve_p(newdirfd, &newpath, false, false, Change::Remove) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
         }
-        let (o, n) = (od.as_raw_fd(), nd.as_raw_fd());
-        self.change_in(o, || self.change_in(n, || rename(o, &on, n, &nn, flags)))
+        if old.ovl.is_some() != new.ovl.is_some() {
+            // One in an overlay, the other not (a directory fwe cannot
+            // place): not one filesystem.
+            return err(errno::EXDEV);
+        }
+        if let (Some(a), Some(b)) = (&old.ovl, &new.ovl) {
+            if flags & RENAME_WHITEOUT != 0 {
+                return err(errno::EINVAL);
+            }
+            let up = |o: &crate::fs::Ovl| crate::overlay::upper_dir(&o.layers, &o.parent);
+            let (ua, ub) = match (up(a), up(b)) {
+                (Ok(x), Ok(y)) => (x, y),
+                (Err(e), _) | (_, Err(e)) => return err(e),
+            };
+            return self.change_in(ua.as_raw_fd(), || {
+                self.change_in(ub.as_raw_fd(), || {
+                    let from = (&a.parent[..], &old.name[..]);
+                    let to = (&b.parent[..], &new.name[..]);
+                    match crate::overlay::rename(&a.layers, from, to, how) {
+                        Ok(()) => 0,
+                        Err(e) => err(e),
+                    }
+                })
+            });
+        }
+        let (Ok(on), Ok(nn)) = (old.name_c(), new.name_c()) else { return err(errno::EINVAL) };
+        let (o, n) = (old.dir.as_raw_fd(), new.dir.as_raw_fd());
+        self.change_in(o, || {
+            self.change_in(n, || match rename(o, &on, n, &nn, how, flags & RENAME_WHITEOUT != 0) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            })
+        })
     }
 
     pub(crate) fn sys_fchmodat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         if let Some(fd) = self.fd_link(dirfd, &path, follow) {
-            if let Err(e) = Self::fd_writable(fd) {
+            if let Err(e) = self.fd_change(fd) {
                 return err(e);
             }
             return match crate::modes::keep_fd(fd, mode as u32) {
@@ -899,10 +1024,12 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => err(e),
             };
         }
-        let (dir, name) = match self.resolve_w(dirfd, &path, follow, true) {
-            Ok((d, n, _)) => (d, n),
+        let r = match self.resolve_p(dirfd, &path, follow, true, Change::Modify) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
+        let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
+        let dir = r.dir;
         if !follow {
             // A symbolic link's mode cannot be changed on Linux.
             let mut st = zeroed_stat();
@@ -931,15 +1058,23 @@ impl<P: Platform> Kernel<P> {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         if let Some(fd) = self.fd_link(dirfd, &path, follow) {
-            if let Err(e) = Self::fd_writable(fd) {
+            if let Err(e) = self.fd_change(fd) {
                 return err(e);
             }
             return self.chown_check(uid as u32, gid as u32);
         }
         // Resolve for existence/permission errors, then apply the virtual
         // ownership policy (ownership is not reflected to the host file).
-        match self.resolve_w(dirfd, &path, follow, true) {
-            Ok(_) => self.chown_check(uid as u32, gid as u32),
+        // A file of an overlay is copied up, as a change of owner does.
+        let check = self.chown_check(uid as u32, gid as u32);
+        if check != 0 {
+            return check;
+        }
+        match self.resolve_p(dirfd, &path, follow, true, Change::Modify) {
+            Ok(r) => match r.name_c().and_then(|n| stat_at(r.dir.as_raw_fd(), &n)) {
+                Ok(_) => 0,
+                Err(e) => err(e),
+            },
             Err(e) => err(e),
         }
     }
@@ -1013,6 +1148,13 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = unsafe { crate::synthdir::getdents64(fd as i32, buf, count) } {
             return r;
         }
+        if let Some(l) = crate::fdmarks::origin(fd as i32).and_then(|o| o.ovl) {
+            // The overlay's directory: its layers' entries merged.
+            return crate::overlay::getdents64(fd as i32, buf, count, || {
+                let path = crate::overlay::path_of(&l, fd as i32).ok_or(errno::ENOENT)?;
+                crate::overlay::list(&crate::overlay::open(&l, &path)?)
+            });
+        }
         // What fwe keeps in a cgroup's directory is its own.
         let cgroup = crate::fdmarks::origin(fd as i32)
             .is_some_and(|o| o.fstype == crate::mounts::FsType::Cgroup2);
@@ -1040,22 +1182,27 @@ impl<P: Platform> Kernel<P> {
         let times_ptr = host_times.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
         if path == 0 {
             // futimens-style: operate on the fd in dirfd.
+            if let Err(e) = self.fd_change(dirfd as i32) {
+                return err(e);
+            }
             // SAFETY: valid timespec array pointer or null.
             return ret(unsafe { libc::futimens(dirfd as i32, times_ptr) });
         }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         if let Some(fd) = self.fd_link(dirfd, &path, follow) {
-            if let Err(e) = Self::fd_writable(fd) {
+            if let Err(e) = self.fd_change(fd) {
                 return err(e);
             }
             // SAFETY: valid timespec array pointer or null.
             return ret(unsafe { libc::futimens(fd, times_ptr) });
         }
-        let (dir, name) = match self.resolve_w(dirfd, &path, follow, true) {
-            Ok((d, n, _)) => (d, n),
+        let r = match self.resolve_p(dirfd, &path, follow, true, Change::Modify) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
+        let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
+        let dir = r.dir;
         // Not followed: a symbolic link's own times.
         let host_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         // SAFETY: `name` NUL-terminated; `dir` live; times valid or null.
@@ -1133,9 +1280,12 @@ impl<P: Platform> Kernel<P> {
         if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
             return err(errno::EPERM);
         }
-        let r =
-            self.resolve_w(fcntl::AT_FDCWD as u64, &path, follow, true).and_then(|(d, n, _)| {
-                let (host, plain) = Self::xattr_file(&d, &n)?;
+        let r = self
+            .resolve_p(fcntl::AT_FDCWD as u64, &path, follow, true, Change::Modify)
+            .and_then(|r| {
+                Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
+                let n = r.name_c()?;
+                let (host, plain) = Self::xattr_file(&r.dir, &n)?;
                 let space = crate::xattr::space(&name)?;
                 self.xattr_who(plain).may_write(&name, space)?;
                 crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
@@ -1160,7 +1310,8 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         let fd = fd as i32;
-        let r = Self::fd_writable(fd).and_then(|()| {
+        let r = self.fd_change(fd).and_then(|()| {
+            Self::overlay_own(self.fd_overlay(fd).as_deref(), &name)?;
             let plain = Self::xattr_fd(fd)?;
             let space = crate::xattr::space(&name)?;
             self.xattr_who(plain).may_write(&name, space)?;
@@ -1185,7 +1336,8 @@ impl<P: Platform> Kernel<P> {
         follow: bool,
     ) -> i64 {
         let name = guest!(uaccess::read_cstr(name, 256));
-        let got = self.xattr_target(fd, path, follow, |t, who| {
+        let got = self.xattr_target(fd, path, follow, |t, who, layers| {
+            Self::overlay_own(layers, &name)?;
             who.may_read(crate::xattr::space(&name)?)?;
             crate::xattr::get(t, &name)
         });
@@ -1202,7 +1354,19 @@ impl<P: Platform> Kernel<P> {
         size: u64,
         follow: bool,
     ) -> i64 {
-        let got = self.xattr_target(fd, path, follow, crate::xattr::list);
+        let got = self.xattr_target(fd, path, follow, |t, who, layers| {
+            let all = crate::xattr::list(t, who)?;
+            // An overlay's file does not show the overlay's own.
+            let Some(l) = layers else { return Ok(all) };
+            let mut out = Vec::new();
+            for n in all.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+                if !n.starts_with(l.private_prefix()) {
+                    out.extend_from_slice(n);
+                    out.push(0);
+                }
+            }
+            Ok(out)
+        });
         // A file fwe makes up has none.
         let got = if got == Err(SYNTHETIC) { Ok(Vec::new()) } else { got };
         self.xattr_out(got, list, size)
@@ -1218,7 +1382,8 @@ impl<P: Platform> Kernel<P> {
     ) -> i64 {
         let name = guest!(uaccess::read_cstr(name, 256));
         let r = match fd {
-            Some(fd) => Self::fd_writable(fd).and_then(|()| {
+            Some(fd) => self.fd_change(fd).and_then(|()| {
+                Self::overlay_own(self.fd_overlay(fd).as_deref(), &name)?;
                 let plain = Self::xattr_fd(fd)?;
                 let space = crate::xattr::space(&name)?;
                 self.xattr_who(plain).may_write(&name, space)?;
@@ -1229,12 +1394,15 @@ impl<P: Platform> Kernel<P> {
                 if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
                     return err(errno::EPERM);
                 }
-                self.resolve_w(fcntl::AT_FDCWD as u64, &path, follow, true).and_then(|(d, n, _)| {
-                    let (host, plain) = Self::xattr_file(&d, &n)?;
-                    let space = crate::xattr::space(&name)?;
-                    self.xattr_who(plain).may_write(&name, space)?;
-                    crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
-                })
+                self.resolve_p(fcntl::AT_FDCWD as u64, &path, follow, true, Change::Modify)
+                    .and_then(|r| {
+                        Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
+                        let n = r.name_c()?;
+                        let (host, plain) = Self::xattr_file(&r.dir, &n)?;
+                        let space = crate::xattr::space(&name)?;
+                        self.xattr_who(plain).may_write(&name, space)?;
+                        crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
+                    })
             }
         };
         match r {
@@ -1265,12 +1433,17 @@ impl<P: Platform> Kernel<P> {
         fd: Option<i32>,
         path: u64,
         follow: bool,
-        f: impl FnOnce(&crate::xattr::Target, &crate::xattr::Who) -> Result<T, i32>,
+        f: impl FnOnce(
+            &crate::xattr::Target,
+            &crate::xattr::Who,
+            Option<&crate::overlay::Layers>,
+        ) -> Result<T, i32>,
     ) -> Result<T, i32> {
         match fd {
             Some(fd) => {
                 let plain = Self::xattr_fd(fd)?;
-                f(&crate::xattr::Target::Fd(fd), &self.xattr_who(plain))
+                let layers = self.fd_overlay(fd);
+                f(&crate::xattr::Target::Fd(fd), &self.xattr_who(plain), layers.as_deref())
             }
             None => {
                 let path =
@@ -1278,10 +1451,11 @@ impl<P: Platform> Kernel<P> {
                 if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
                     return Err(SYNTHETIC);
                 }
-                let (d, n) = self.resolve_c(fcntl::AT_FDCWD as u64, &path, follow)?;
-                let (host, plain) = Self::xattr_file(&d, &n)?;
+                let r = self.fs().resolve(fcntl::AT_FDCWD as i32, &path, follow)?;
+                let n = r.name_c()?;
+                let (host, plain) = Self::xattr_file(&r.dir, &n)?;
                 let t = crate::xattr::Target::Path(&host);
-                f(&t, &self.xattr_who(plain))
+                f(&t, &self.xattr_who(plain), r.ovl.as_ref().map(|o| &*o.layers))
             }
         }
     }
@@ -1367,6 +1541,11 @@ impl<P: Platform> Kernel<P> {
             Ok(st) => st,
             Err(_) => return op(),
         };
+        if crate::fs::is_empty_dir(&st) {
+            // What a name an overlay does not show is resolved in: nothing
+            // is ever made there.
+            return err(errno::EACCES);
+        }
         let perm = crate::modes::perm_of(&st);
         if !self.passes_dac(2) {
             if crate::modes::marked(&st) && !crate::modes::owner_allows(perm, 2 | 1) {
@@ -1378,30 +1557,116 @@ impl<P: Platform> Kernel<P> {
         if r == err(errno::EACCES) && crate::modes::keep_fd(dir, perm).is_ok() { op() } else { r }
     }
 
-    fn fd_writable(fd: i32) -> Result<(), i32> {
-        match crate::fdmarks::origin(fd) {
-            Some(o) if o.flags & crate::mounts::ms::RDONLY != 0 => Err(errno::EROFS),
+    /// Get ready for a call that changes the file open as `fd`: `EROFS`
+    /// for one opened through a read-only mount; for one of an overlay's
+    /// lower layers, the file copied up and `fd` moved onto the copy, as
+    /// Linux moves an open file to its copy (the same offset and flags).
+    pub(crate) fn fd_change(&self, fd: i32) -> Result<(), i32> {
+        let Some(o) = crate::fdmarks::origin(fd) else { return Ok(()) };
+        if o.flags & crate::mounts::ms::RDONLY != 0 {
+            return Err(errno::EROFS);
+        }
+        let Some(layers) = o.ovl.clone() else { return Ok(()) };
+        // The descriptor's own file, copied up if it is a lower one.
+        let Some((up, name)) = crate::overlay::copy_up_open(&layers, fd)? else { return Ok(()) };
+        // SAFETY: plain host calls on an open descriptor.
+        let (status, fd_flags) =
+            unsafe { (libc::fcntl(fd, libc::F_GETFL), libc::fcntl(fd, libc::F_GETFD)) };
+        let keep = libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK;
+        let dir = stat_fd(fd).is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        let open_flags = status & keep
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if dir { libc::O_DIRECTORY } else { 0 };
+        // SAFETY: a NUL-terminated name in a live directory.
+        let copy = unsafe { libc::openat(up.as_raw_fd(), name.as_ptr(), open_flags) };
+        if copy < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        // SAFETY: plain host calls on the two open descriptors; `copy`
+        // replaces `fd`, then goes.
+        unsafe {
+            let offset = libc::lseek(fd, 0, libc::SEEK_CUR);
+            if offset > 0 {
+                libc::lseek(copy, offset, libc::SEEK_SET);
+            }
+            let r = libc::dup2(copy, fd);
+            libc::close(copy);
+            if r < 0 {
+                return Err(host::errno_to_linux(host::last_errno()));
+            }
+            libc::fcntl(fd, libc::F_SETFD, fd_flags);
+        }
+        crate::fdmarks::opened(fd, o.ns_path, o.flags, o.fstype, o.ovl);
+        if dir {
+            crate::overlay::moved(fd);
+        }
+        Ok(())
+    }
+
+    /// The layers of the overlay `fd` was opened in, if it was.
+    fn fd_overlay(&self, fd: i32) -> Option<std::sync::Arc<crate::overlay::Layers>> {
+        crate::fdmarks::origin(fd)?.ovl
+    }
+
+    /// `EOPNOTSUPP` for an overlay's own attributes on its files (in
+    /// `layers`), which they neither show nor take.
+    fn overlay_own(layers: Option<&crate::overlay::Layers>, name: &[u8]) -> Result<(), i32> {
+        match layers {
+            Some(l) if name.starts_with(l.private_prefix()) => Err(errno::EOPNOTSUPP),
             _ => Ok(()),
         }
     }
 
-    /// [`resolve_c`](Self::resolve_c) for a call that changes what it
-    /// names: `EROFS` on a read-only mount, and, unless `mount_root_ok`,
-    /// `EBUSY` for a mount's root.
-    fn resolve_w(
+    /// `fchmod(fd, mode)`.
+    pub(crate) fn sys_fchmod(&mut self, fd: u64, mode: u64) -> i64 {
+        let fd = fd as i32;
+        if crate::memfd::chmod_sealed(fd) {
+            return err(errno::EPERM);
+        }
+        if let Err(e) = self.fd_change(fd) {
+            return err(e);
+        }
+        // A mode that denies the owner is kept apart (see `modes`).
+        match crate::modes::keep_fd(fd, mode as u32) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `fchown(fd, uid, gid)`: ownership is virtual, the guest's
+    /// credentials honoured rather than the host file changed (fwe does
+    /// not run as root).
+    pub(crate) fn sys_fchown(&mut self, fd: u64, uid: u64, gid: u64) -> i64 {
+        let check = self.chown_check(uid as u32, gid as u32);
+        if check != 0 {
+            return check;
+        }
+        match self.fd_change(fd as i32) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// Resolve `path` for a call that changes what it names, `how`
+    /// ([`Resolved::prepare`]; [`Change::Remove`] only checks): `EROFS` on
+    /// a read-only mount, and, unless `mount_root_ok`, `EBUSY` for a
+    /// mount's root.
+    fn resolve_p(
         &self,
         dirfd: u64,
         path: &[u8],
         follow: bool,
         mount_root_ok: bool,
-    ) -> Result<(std::os::fd::OwnedFd, CString, u32), i32> {
-        let r = self.fs().resolve(dirfd as i32, path, follow)?;
+        how: Change,
+    ) -> Result<Resolved, i32> {
+        let mut r = self.fs().resolve(dirfd as i32, path, follow)?;
         r.writable()?;
         if r.mount_root && !mount_root_ok {
             return Err(errno::EBUSY);
         }
-        let name = r.name_c()?;
-        Ok((r.dir, name, r.mount_id))
+        r.prepare(how)?;
+        Ok(r)
     }
 
     /// Resolve and return the parent dir fd plus a C name.
@@ -1525,45 +1790,45 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
     0
 }
 
-/// `RENAME_NOREPLACE`.
-#[cfg(target_os = "macos")]
+/// `renameat2`'s flags.
 const RENAME_NOREPLACE: u64 = 1;
-/// `RENAME_EXCHANGE`.
-#[cfg(target_os = "macos")]
 const RENAME_EXCHANGE: u64 = 2;
+const RENAME_WHITEOUT: u64 = 4;
 
-fn rename(od: i32, on: &CString, nd: i32, nn: &CString, flags: u64) -> i64 {
-    #[cfg(not(target_os = "macos"))]
+/// What `renameat2`'s `flags` ask for: `EINVAL` for an unknown flag or
+/// one that cannot go with another.
+fn rename_mode(flags: u64) -> Result<host::Rename, i32> {
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+        || flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0
     {
-        // SAFETY: names NUL-terminated; dirs live.
-        ret(unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                od,
-                on.as_ptr(),
-                nd,
-                nn.as_ptr(),
-                flags as libc::c_uint,
-            )
-        })
+        return Err(errno::EINVAL);
     }
-    #[cfg(target_os = "macos")]
-    {
-        if flags & RENAME_EXCHANGE != 0 {
-            // RENAME_SWAP; emulated best-effort is unsafe, so report unsupported.
-            return err(errno::ENOSYS);
-        }
-        if flags & RENAME_NOREPLACE != 0 {
-            // Not atomic, but adequate until renameatx_np is wired up.
-            // SAFETY: `nn` NUL-terminated; `nd` live.
-            let exists = unsafe { libc::faccessat(nd, nn.as_ptr(), libc::F_OK, 0) } == 0;
-            if exists {
-                return err(errno::EEXIST);
-            }
-        }
-        // SAFETY: names NUL-terminated; dirs live.
-        ret(unsafe { libc::renameat(od, on.as_ptr(), nd, nn.as_ptr()) })
+    Ok(if flags & RENAME_EXCHANGE != 0 {
+        host::Rename::Exchange
+    } else if flags & RENAME_NOREPLACE != 0 {
+        host::Rename::NoReplace
+    } else {
+        host::Rename::Replace
+    })
+}
+
+/// Rename `on` in `od` to `nn` in `nd` as `how` says, leaving a whiteout
+/// (one of fwe's device nodes numbered 0:0) at the old name if
+/// `whiteout`.
+fn rename(
+    od: i32,
+    on: &CString,
+    nd: i32,
+    nn: &CString,
+    how: host::Rename,
+    whiteout: bool,
+) -> Result<(), i32> {
+    host::rename_at(od, on, nd, nn, how)?;
+    if whiteout {
+        let node = crate::devnodes::Node { kind: crate::devnodes::S_IFCHR, major: 0, minor: 0 };
+        crate::devnodes::make(od, on, node, 0o600)?;
     }
+    Ok(())
 }
 
 fn make_pipe(fds: &mut [i32; 2], flags: u64) -> Result<(), i32> {

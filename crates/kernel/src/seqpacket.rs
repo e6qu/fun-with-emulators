@@ -12,8 +12,10 @@
 //! - The socket's buffers are made big enough for two of the largest
 //!   messages, and their size, which any process can read back, marks it,
 //!   so one received with `SCM_RIGHTS` is known for what it is ([`adopt`]).
-//! - The threads of a process take a socket's messages one at a time;
-//!   processes that share a socket and read it at once can split a frame.
+//! - A message is sent, or taken, under the socket's lock for that
+//!   direction: a mutex for the threads of a process, and between
+//!   processes that share the socket a byte-range lock on a file of fwe's
+//!   ([`Exclusive`]), so that no two interleave or split a frame.
 
 use crate::fdmarks::{self, Mark};
 use crate::host::{self, last_error};
@@ -72,6 +74,107 @@ pub fn adopt(fd: i32) {
 /// Each socket's lock (by inode), which a thread holds while it takes a
 /// whole message, or sends one.
 static LOCKS: Mutex<BTreeMap<u64, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+
+/// Run a host `fork` (see [`crate::fork_locked`]) with the table of locks
+/// held; in the child, the sockets' locks are new: one a thread of the
+/// parent held (blocked in a receive, say) has no holder there.
+pub(crate) fn hold(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = fork();
+    if pid == 0 {
+        locks.clear();
+    }
+    pid
+}
+
+/// Which way a lock is for.
+#[derive(Clone, Copy)]
+enum Way {
+    Receive = 0,
+    Send = 1,
+}
+
+/// The file whose bytes stand for the sockets' locks between processes:
+/// `v<format>-seqpacket.lock` in fwe's private directory, open for the
+/// life of the process.
+fn lock_file() -> Option<i32> {
+    // Opened once, under a lock: a second descriptor of the file, closed,
+    // would drop every byte-range lock this process holds on it.
+    static FD: Mutex<i32> = Mutex::new(-1);
+    let mut fd = FD.lock().unwrap_or_else(|e| e.into_inner());
+    if *fd >= 0 {
+        return Some(*fd);
+    }
+    let mut path = crate::fs::shm::user_dir().ok()?;
+    path.extend_from_slice(format!("/v{}-seqpacket.lock", crate::shared::FORMAT).as_bytes());
+    let c = std::ffi::CString::new(path).ok()?;
+    // SAFETY: a NUL-terminated path in fwe's private directory.
+    let raw =
+        unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
+    // No lock is held on the file yet, so `reserve` closing `raw` loses none.
+    *fd = crate::fdtable::reserve(raw).ok()?;
+    Some(*fd)
+}
+
+/// A socket's lock for one way held between processes: a write lock on
+/// one byte of [`lock_file`] (byte-range locks are a process's, so the
+/// threads of one take the mutex first). Released when dropped.
+struct Exclusive {
+    file: i32,
+    at: i64,
+}
+
+impl Exclusive {
+    /// Take the lock of socket `fd` for `way`, waiting for it unless
+    /// `nonblock`: `EAGAIN` if another process holds it and `nonblock`,
+    /// `EINTR` if a signal came first. `None` where fwe has no lock file
+    /// (the threads' mutex is then all).
+    fn take(fd: i32, way: Way, nonblock: bool) -> Result<Option<Exclusive>, i32> {
+        let Some(file) = lock_file() else { return Ok(None) };
+        // A byte for each way of each socket (its inode, kept within the
+        // offsets a file has; two that meet only wait for each other).
+        let at = ((inode(fd) % (1 << 40)) * 2 + way as u64) as i64;
+        let mut fl = lock_range(at, libc::F_WRLCK);
+        let cmd = if nonblock { libc::F_SETLK } else { libc::F_SETLKW };
+        // SAFETY: a valid lock description on fwe's own file.
+        if unsafe { libc::fcntl(file, cmd, &mut fl) } == 0 {
+            return Ok(Some(Exclusive { file, at }));
+        }
+        match host::last_errno() {
+            libc::EAGAIN | libc::EACCES => Err(errno::EAGAIN),
+            libc::EINTR => Err(errno::EINTR),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        let mut fl = lock_range(self.at, libc::F_UNLCK);
+        // SAFETY: a valid lock description on fwe's own file.
+        unsafe { libc::fcntl(self.file, libc::F_SETLK, &mut fl) };
+    }
+}
+
+fn lock_range(at: i64, kind: impl Into<i32>) -> libc::flock {
+    // SAFETY: zeroed bytes are a valid `flock`, filled in below.
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = kind.into() as _;
+    fl.l_whence = libc::SEEK_SET as _;
+    fl.l_start = at as _;
+    fl.l_len = 1;
+    fl
+}
+
+/// The inode number of socket `fd`, which names it to every process.
+#[allow(clippy::unnecessary_cast)] // `ino_t` differs by host
+fn inode(fd: i32) -> u64 {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::fstat(fd, &mut st) };
+    st.st_ino as u64
+}
 
 fn lock_of(fd: i32) -> Arc<Mutex<()>> {
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -132,6 +235,10 @@ pub fn send(
         }
     } else {
         lock.lock().unwrap_or_else(|e| e.into_inner())
+    };
+    let _between = match Exclusive::take(fd, Way::Send, nonblock) {
+        Ok(x) => x,
+        Err(e) => return err(e),
     };
     let total = HEADER + len;
     if nonblock && !has_room(fd, total) {
@@ -287,6 +394,10 @@ pub fn recv(
         }
     } else {
         lock.lock().unwrap_or_else(|e| e.into_inner())
+    };
+    let _between = match Exclusive::take(fd, Way::Receive, nonblock) {
+        Ok(x) => x,
+        Err(e) => return fail(err(e)),
     };
     let mut header = [0u8; HEADER];
     if nonblock {

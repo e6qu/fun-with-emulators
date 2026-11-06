@@ -19,6 +19,7 @@
 
 use crate::host::{errno_to_linux, last_errno};
 use crate::mounts::{self, FsType, Mount, Source, Table, store::Ns};
+use crate::overlay::{self, Layers};
 use fwe_abi::{errno, fcntl};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -108,6 +109,41 @@ pub struct Resolved {
     pub mount_id: u32,
     /// It is the root of a mount (which cannot be removed or renamed).
     pub mount_root: bool,
+    /// Where it is in an overlay, when it is in one.
+    pub ovl: Option<Ovl>,
+    /// What [`Resolved::prepare`] set up for a file being made in an
+    /// overlay, which [`Resolved::finish`] puts in place.
+    created: Option<overlay::Created>,
+}
+
+/// Where a resolved name is in an overlay mount ([`crate::overlay`]).
+pub struct Ovl {
+    pub layers: Arc<Layers>,
+    /// The overlay path of the directory holding the name (of the
+    /// directory itself, for `.`).
+    pub parent: Vec<u8>,
+    /// What the name is there.
+    pub found: overlay::Found,
+}
+
+impl Ovl {
+    /// The overlay path of what was resolved.
+    pub fn path(&self, name: &[u8]) -> Vec<u8> {
+        if name == b"." { self.parent.clone() } else { mounts::join(&self.parent, name) }
+    }
+}
+
+/// How a call is about to change what it resolved ([`Resolved::prepare`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Make it (it is missing).
+    Create,
+    /// Change the file that is there: its data or its metadata.
+    Modify,
+    /// Remove or rename it, which an overlay does its own way
+    /// ([`crate::overlay::remove`], [`crate::overlay::rename`]): nothing
+    /// to prepare but the check of the mount.
+    Remove,
 }
 
 impl Resolved {
@@ -120,6 +156,74 @@ impl Resolved {
         if self.mount_flags & mounts::ms::RDONLY != 0 { Err(errno::EROFS) } else { Ok(()) }
     }
 
+    /// Get ready for a call that is about to change what was resolved, as
+    /// `how` says: `EROFS` on a read-only mount; in an overlay, the copy-up
+    /// that puts it (or, to make it, its directory) in the upper layer,
+    /// after which [`dir`](Self::dir) and [`name`](Self::name) are where the
+    /// call acts. A call that makes a file calls [`finish`](Self::finish)
+    /// once it has.
+    pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
+        self.writable()?;
+        let Some(o) = &self.ovl else { return Ok(()) };
+        let upper = o.layers.upper.is_some();
+        let dir = match (&o.found, how) {
+            (_, Change::Modify) if self.name == b"." => overlay::upper_dir(&o.layers, &o.parent)?,
+            // Nothing there to change, or already in the upper layer.
+            (overlay::Found::Missing, Change::Modify) => return Ok(()),
+            (overlay::Found::Other { layer: 0, .. }, _) if upper => return Ok(()),
+            (overlay::Found::Dir(d), _) if upper && d.fds[0].is_some() => return Ok(()),
+            (overlay::Found::Missing, Change::Create) => {
+                let made = overlay::create(&o.layers, &o.parent, &self.name)?;
+                let (dir, name) = made.target();
+                self.dir = dup_cloexec(dir)?;
+                self.name = name.to_bytes().to_vec();
+                self.created = Some(made);
+                return Ok(());
+            }
+            // Made already: the call fails as it would anywhere.
+            (_, Change::Create) | (_, Change::Remove) => return Ok(()),
+            (_, Change::Modify) => overlay::copy_up(&o.layers, &o.path(&self.name))?,
+        };
+        self.dir = dup_cloexec(dir.as_raw_fd())?;
+        Ok(())
+    }
+
+    /// Get ready for a `bind` to make a socket's node at what was
+    /// resolved: in an overlay, the directory copied up, and a whiteout in
+    /// the way removed (the host makes the node where `bind` says, so it
+    /// cannot be made aside and moved over the whiteout).
+    pub fn prepare_bind(&mut self) -> Result<(), i32> {
+        let Some(o) = &self.ovl else { return Ok(()) };
+        if !matches!(o.found, overlay::Found::Missing) {
+            return Ok(());
+        }
+        self.writable()?;
+        let made = overlay::create(&o.layers, &o.parent, &self.name)?;
+        if let Some((_, _)) = &made.temp {
+            // SAFETY: a NUL-terminated name in a live directory.
+            if unsafe { libc::unlinkat(made.dir.as_raw_fd(), made.name.as_ptr(), 0) } != 0 {
+                return Err(e());
+            }
+        }
+        self.dir = dup_cloexec(made.dir.as_raw_fd())?;
+        Ok(())
+    }
+
+    /// Put a file made after [`prepare`](Self::prepare) with
+    /// [`Change::Create`] in place (`made`), or clear up after a call that
+    /// failed to make it.
+    pub fn finish(&mut self, made: bool) -> Result<(), i32> {
+        match self.created.take() {
+            Some(c) => {
+                let r = c.finish(made);
+                self.dir = dup_cloexec(c.dir.as_raw_fd())?;
+                self.name = c.name.to_bytes().to_vec();
+                r
+            }
+            None => Ok(()),
+        }
+    }
+
     fn plain(dir: OwnedFd, name: Vec<u8>) -> Resolved {
         Resolved {
             dir,
@@ -129,6 +233,8 @@ impl Resolved {
             fstype: FsType::Ext4,
             mount_root: false,
             mount_id: 0,
+            ovl: None,
+            created: None,
         }
     }
 }
@@ -864,7 +970,17 @@ impl Fs {
     /// Set the working directory to the host directory `fd` refers to.
     pub fn fchdir(&mut self, fd: i32) -> Result<(), i32> {
         let host = fd_path(fd).ok_or(errno::EBADF)?;
-        match self.host_to_guest(&host) {
+        // A directory opened through an overlay is that overlay's: its host
+        // path is in one of the layers, which says nothing of where.
+        let table = self.mnt.table();
+        let opened = overlay_here(&table, &self.proc_root, fd)
+            .ok()
+            .flatten()
+            .and_then(|h| h.at)
+            .and_then(|(_, ns)| self.from_ns(&ns));
+        let overlaid = crate::fdmarks::origin(fd).is_some_and(|o| o.ovl.is_some());
+        let fallback = if overlaid { None } else { self.host_to_guest(&host) };
+        match opened.or(fallback) {
             Some(guest) => {
                 self.cwd = guest;
                 self.republish();
@@ -908,6 +1024,9 @@ fn is_rootfs(m: &Mount, root_host: &[u8]) -> bool {
 /// deepest host-backed mount showing it that resolution enters.
 fn host_to_ns(table: &Table, host: &[u8]) -> Option<Vec<u8>> {
     let mut best: Option<(usize, Vec<u8>)> = None;
+    // Not through an overlay's layers: a layer's directory is the
+    // overlay's only when it was opened through the overlay, which its
+    // descriptor's record says ([`overlay_here`]).
     for m in &table.mounts {
         let Some(top) = m.host_path(b"") else { continue };
         let Some(rest) = mounts::under(host, &top) else { continue };
@@ -921,6 +1040,26 @@ fn host_to_ns(table: &Table, host: &[u8]) -> Option<Vec<u8>> {
         }
     }
     best.map(|(_, ns)| ns)
+}
+
+/// Where descriptor `fd` is, if it was opened through an overlay: that
+/// overlay's directory at the path the descriptor is at in its layer, in
+/// the mount of that overlay that shows it inside the process's root (if
+/// one still does).
+fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, i32> {
+    let Some(l) = crate::fdmarks::origin(fd).and_then(|o| o.ovl) else { return Ok(None) };
+    let path = overlay::path_of(&l, fd).ok_or(errno::ENOENT)?;
+    let at = table.mounts.iter().find_map(|m| {
+        let Source::Overlay(ml) = &m.source else { return None };
+        if **ml != *l {
+            return None;
+        }
+        let rest = mounts::under(&path, &m.root)?;
+        let ns = mounts::join(&m.point, rest);
+        (table.locate(&ns).0.id == m.id && mounts::under(&ns, root_ns).is_some())
+            .then_some((m.id, ns))
+    });
+    Here::overlay(&l, path, at).map(Some)
 }
 
 /// Open the directory at `rest` (a path inside the mount, from its root)
@@ -952,6 +1091,15 @@ fn open_in_mount(v: &View, m: &Mount, rest: &[u8]) -> Result<OwnedFd, i32> {
     Ok(dir)
 }
 
+/// A directory of an overlay mount resolution is in.
+#[derive(Clone)]
+struct OvlHere {
+    layers: Arc<Layers>,
+    /// Its path in the overlay, from the overlay's root.
+    path: Vec<u8>,
+    dir: overlay::Dir,
+}
+
 /// One step's state in [`resolve_in`].
 struct Here {
     dir: OwnedFd,
@@ -961,6 +1109,90 @@ struct Here {
     /// below it (a rootfs with no `/dev` still has `/dev/shm`): the nearest
     /// directory above it that does.
     phantom: bool,
+    /// In an overlay mount: the directory in each of its layers (`dir` is
+    /// the topmost of them).
+    ovl: Option<OvlHere>,
+}
+
+impl Here {
+    /// The directory at overlay path `path` of the overlay `layers`.
+    fn overlay(
+        layers: &Arc<Layers>,
+        path: Vec<u8>,
+        at: Option<(u32, Vec<u8>)>,
+    ) -> Result<Here, i32> {
+        let dir = overlay::open(layers, &path)?;
+        Here::of_overlay(layers, path, dir, at)
+    }
+
+    fn of_overlay(
+        layers: &Arc<Layers>,
+        path: Vec<u8>,
+        dir: overlay::Dir,
+        at: Option<(u32, Vec<u8>)>,
+    ) -> Result<Here, i32> {
+        let top = dup_cloexec(dir.top().1.as_raw_fd())?;
+        Ok(Here {
+            dir: top,
+            at,
+            phantom: false,
+            ovl: Some(OvlHere { layers: layers.clone(), path, dir }),
+        })
+    }
+}
+
+/// The directory at `rest` (a path inside the mount, from its root) of
+/// the mount `m`, which is at namespace path `ns`.
+fn open_here(v: &View, m: &Mount, rest: &[u8], ns: &[u8]) -> Result<Here, i32> {
+    let at = Some((m.id, ns.to_vec()));
+    match &m.source {
+        Source::Overlay(l) => Here::overlay(l, m.fs_path(rest), at),
+        _ => Ok(Here { dir: open_in_mount(v, m, rest)?, at, phantom: false, ovl: None }),
+    }
+}
+
+/// What a name in a directory resolution walks through is.
+enum Step {
+    /// A symbolic link, to this.
+    Link(Vec<u8>),
+    /// Something else that is there.
+    Other,
+    /// A directory of an overlay.
+    OvlDir(overlay::Dir),
+    Missing,
+}
+
+/// An empty directory nothing can be made in: what a name an overlay
+/// does not show is resolved in, so that it is found nowhere, and a call
+/// that would make it there without [`Resolved::prepare`] fails.
+fn empty_dir() -> Result<OwnedFd, i32> {
+    static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let path = match PATH.get() {
+        Some(p) => p.clone(),
+        None => {
+            let p = mounts::join(&shm::user_dir()?, b"empty");
+            let c = cstr(&p)?;
+            // SAFETY: a NUL-terminated path in fwe's private directory.
+            unsafe {
+                libc::mkdir(c.as_ptr(), 0o500);
+                libc::chmod(c.as_ptr(), 0o500);
+            }
+            PATH.get_or_init(|| p).clone()
+        }
+    };
+    open_host_dir(&path)
+}
+
+/// Whether host metadata `st` is of [`empty_dir`], which nothing may
+/// be made in.
+pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
+    empty_dir().is_ok_and(|d| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut e: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        let ok = unsafe { libc::fstat(d.as_raw_fd(), &mut e) } == 0;
+        ok && e.st_dev == st.st_dev && e.st_ino == st.st_ino
+    })
 }
 
 /// Resolve `path` relative to `dirfd` in the view `v`: the work of
@@ -1002,8 +1234,8 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         if m.source == Source::Synthetic {
             return Err(errno::ENOENT);
         }
-        match open_in_mount(v, m, &rest) {
-            Ok(dir) => Ok(Here { dir, at: Some((m.id, ns.to_vec())), phantom: false }),
+        match open_here(v, m, &rest, ns) {
+            Ok(here) => Ok(here),
             Err(errno::ENOENT)
                 if table.mounts.iter().any(|o| mounts::under(&o.point, ns).is_some()) =>
             {
@@ -1013,8 +1245,9 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 loop {
                     let parent = normalize(&up, b"..");
                     let (pm, prest) = table.locate(&parent);
-                    if let Ok(dir) = open_in_mount(v, pm, &prest) {
-                        return Ok(Here { dir, at: Some((m.id, ns.to_vec())), phantom: true });
+                    if let Ok(found) = open_here(v, pm, &prest, &parent) {
+                        let at = Some((m.id, ns.to_vec()));
+                        return Ok(Here { dir: found.dir, at, phantom: true, ovl: None });
                     }
                     if parent == up {
                         return Err(errno::ENOENT);
@@ -1030,13 +1263,20 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         (false, true) => (enter(&to_ns(v.proc_root, v.cwd))?, path.to_vec()),
         _ => {
             // From a directory descriptor: where it is, when fwe can tell
-            // and it is inside the process's root.
-            let ns = fd_path(dirfd)
-                .and_then(|h| host_to_ns(&table, &h))
-                .filter(|ns| mounts::under(ns, &root_ns).is_some());
-            let dir = dup_cloexec(dirfd)?;
-            let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
-            (Here { dir, at, phantom: false }, path.to_vec())
+            // and it is inside the process's root; a directory of an
+            // overlay is the overlay's, wherever the mount has gone.
+            let here = match overlay_here(&table, &root_ns, dirfd)? {
+                Some(here) => here,
+                None => {
+                    let ns = fd_path(dirfd)
+                        .and_then(|h| host_to_ns(&table, &h))
+                        .filter(|ns| mounts::under(ns, &root_ns).is_some());
+                    let dir = dup_cloexec(dirfd)?;
+                    let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
+                    Here { dir, at, phantom: false, ovl: None }
+                }
+            };
+            (here, path.to_vec())
         }
     };
     let mut ancestors: Vec<Here> = Vec::new();
@@ -1061,14 +1301,36 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             // Only the mounts below a missing directory are there.
             return Err(errno::ENOENT);
         }
+        let (dir, ovl) = match here.ovl {
+            None => (here.dir, None),
+            Some(o) if name == b"." => {
+                let found = overlay::Found::Dir(o.dir.clone());
+                (here.dir, Some(Ovl { layers: o.layers, parent: o.path, found }))
+            }
+            Some(o) => {
+                let found = overlay::lookup(&o.layers, &o.dir, &cstr(&name)?)?;
+                let dir = match &found {
+                    overlay::Found::Missing => empty_dir()?,
+                    overlay::Found::Other { layer, .. } => {
+                        dup_cloexec(o.dir.fds[*layer].as_ref().expect("its layer").as_raw_fd())?
+                    }
+                    overlay::Found::Dir(d) => {
+                        dup_cloexec(o.dir.fds[d.top().0].as_ref().expect("its layer").as_raw_fd())?
+                    }
+                };
+                (dir, Some(Ovl { layers: o.layers, parent: o.path, found }))
+            }
+        };
         Ok(Resolved {
-            dir: here.dir,
+            dir,
             name,
             ns_path,
             mount_flags: mount.as_ref().map_or(0, |m| m.flags),
             fstype: mount.as_ref().map_or(FsType::Ext4, |m| m.fstype),
             mount_id: mount.as_ref().map_or(0, |m| m.id),
             mount_root,
+            ovl,
+            created: None,
         })
     };
 
@@ -1084,13 +1346,24 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         None => enter(&parent)?,
                     };
                 }
+                None if here.ovl.is_some() => {
+                    // An overlay directory fwe cannot place: up in the
+                    // overlay, no further than its root.
+                    let o = here.ovl.as_ref().expect("in an overlay");
+                    if let Some(a) = ancestors.pop() {
+                        here = a;
+                    } else if o.path != b"/" {
+                        let parent = normalize(&o.path, b"..");
+                        here = Here::overlay(&o.layers.clone(), parent, None)?;
+                    }
+                }
                 None => {
                     // Somewhere fwe cannot place: up on the host, but never
                     // above the rootfs or the top of a mount's directory,
                     // and never from outside them.
                     let host = fd_path(here.dir.as_raw_fd()).ok_or(errno::ENOENT)?;
                     let tops: Vec<Vec<u8>> = std::iter::once(v.root_host.to_vec())
-                        .chain(table.mounts.iter().filter_map(|m| m.host_path(b"")))
+                        .chain(table.mounts.iter().flat_map(mount_tops))
                         .collect();
                     if tops.contains(&host) {
                         continue;
@@ -1115,7 +1388,33 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         return Err(errno::ENOENT);
                     }
                     let dir = dup_cloexec(here.dir.as_raw_fd())?;
-                    let next = Here { dir, at: Some((m.id, child_ns)), phantom: true };
+                    let next = Here { dir, at: Some((m.id, child_ns)), phantom: true, ovl: None };
+                    ancestors.push(std::mem::replace(&mut here, next));
+                    continue;
+                }
+                if let Source::Overlay(l) = &m.source {
+                    let at = Some((m.id, child_ns.clone()));
+                    let next = match overlay::open(l, &m.root) {
+                        Ok(dir) => Here::of_overlay(l, m.root.clone(), dir, at)?,
+                        Err(errno::ENOTDIR) => {
+                            // A file bind mount of an overlay's file.
+                            if !is_last {
+                                return Err(errno::ENOTDIR);
+                            }
+                            let (parent, name) = split_host(&m.root);
+                            let parent = Here::overlay(l, parent, None)?;
+                            let mut r = done(parent, name, true)?;
+                            r.ns_path = Some(child_ns.clone());
+                            r.mount_flags = m.flags;
+                            r.fstype = m.fstype;
+                            r.mount_id = m.id;
+                            return Ok(r);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if is_last {
+                        return done(next, b".".to_vec(), true);
+                    }
                     ancestors.push(std::mem::replace(&mut here, next));
                     continue;
                 }
@@ -1147,7 +1446,8 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         return Err(errno::ENOTDIR);
                     }
                     let dir = parent;
-                    let mut r = done(Here { dir, at: None, phantom: false }, name, true)?;
+                    let mut r =
+                        done(Here { dir, at: None, phantom: false, ovl: None }, name, true)?;
                     r.ns_path = Some(child_ns.clone());
                     r.mount_flags = m.flags;
                     r.fstype = m.fstype;
@@ -1155,7 +1455,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     return Ok(r);
                 }
                 let dir = open_in_mount(v, &m, b"")?;
-                let next = Here { dir, at: Some((m.id, child_ns)), phantom: false };
+                let next = Here { dir, at: Some((m.id, child_ns)), phantom: false, ovl: None };
                 if is_last {
                     return done(next, b".".to_vec(), true);
                 }
@@ -1195,18 +1495,21 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 _ => None,
             };
             let next = match link {
-                Some(MagicLink::Fd(fd)) => {
-                    let ns = fd_path(fd)
-                        .and_then(|h| host_to_ns(&table, &h))
-                        .filter(|ns| mounts::under(ns, &root_ns).is_some());
-                    let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
-                    Here { dir: dup_cloexec(fd)?, at, phantom: false }
-                }
+                Some(MagicLink::Fd(fd)) => match overlay_here(&table, &root_ns, fd)? {
+                    Some(here) => here,
+                    None => {
+                        let ns = fd_path(fd)
+                            .and_then(|h| host_to_ns(&table, &h))
+                            .filter(|ns| mounts::under(ns, &root_ns).is_some());
+                        let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
+                        Here { dir: dup_cloexec(fd)?, at, phantom: false, ovl: None }
+                    }
+                },
                 Some(MagicLink::Cwd) => enter(&to_ns(v.proc_root, v.cwd))?,
                 Some(MagicLink::Root) => enter(&root_ns)?,
                 None => {
                     let dir = dup_cloexec(here.dir.as_raw_fd())?;
-                    Here { dir, at: Some((id, child_ns)), phantom: true }
+                    Here { dir, at: Some((id, child_ns)), phantom: true, ovl: None }
                 }
             };
             if link.is_some() {
@@ -1222,13 +1525,29 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             return done(here, comp, false);
         }
         let comp_c = cstr(&comp)?;
-        let looked = if here.phantom {
-            Err(errno::ENOENT)
+        let step = if here.phantom {
+            Step::Missing
+        } else if let Some(o) = &here.ovl {
+            match overlay::lookup(&o.layers, &o.dir, &comp_c)? {
+                overlay::Found::Missing => Step::Missing,
+                overlay::Found::Dir(d) => Step::OvlDir(d),
+                overlay::Found::Other { layer, link: true } => {
+                    let in_layer = o.dir.fds[layer].as_ref().expect("its layer");
+                    Step::Link(readlink_at(in_layer.as_raw_fd(), &comp_c)?)
+                }
+                overlay::Found::Other { .. } => Step::Other,
+            }
         } else {
-            readlink_at(here.dir.as_raw_fd(), &comp_c)
+            match readlink_at(here.dir.as_raw_fd(), &comp_c) {
+                Ok(target) => Step::Link(target),
+                // Not a symlink.
+                Err(errno::EINVAL) => Step::Other,
+                Err(errno::ENOENT) => Step::Missing,
+                Err(other) => return Err(other),
+            }
         };
-        match looked {
-            Ok(target) => {
+        match step {
+            Step::Link(target) => {
                 symlinks += 1;
                 if symlinks > MAX_SYMLINKS {
                     return Err(errno::ELOOP);
@@ -1245,17 +1564,20 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 parts.reverse();
                 pending.extend(parts);
             }
-            Err(errno::EINVAL) => {
-                // Not a symlink.
-                if is_last {
-                    return done(here, comp, false);
-                }
+            Step::Other | Step::OvlDir(_) if is_last => return done(here, comp, false),
+            Step::Other => {
                 let child = open_dir(here.dir.as_raw_fd(), &comp_c)?;
                 let at = here.at.as_ref().map(|(id, ns)| (*id, mounts::join(ns, &comp)));
-                ancestors
-                    .push(std::mem::replace(&mut here, Here { dir: child, at, phantom: false }));
+                let next = Here { dir: child, at, phantom: false, ovl: None };
+                ancestors.push(std::mem::replace(&mut here, next));
             }
-            Err(errno::ENOENT) => {
+            Step::OvlDir(d) => {
+                let o = here.ovl.as_ref().expect("in an overlay");
+                let at = here.at.as_ref().map(|(id, ns)| (*id, mounts::join(ns, &comp)));
+                let next = Here::of_overlay(&o.layers, mounts::join(&o.path, &comp), d, at)?;
+                ancestors.push(std::mem::replace(&mut here, next));
+            }
+            Step::Missing => {
                 let below = here.at.as_ref().map(|(_, ns)| mounts::join(ns, &comp)).filter(|p| {
                     table
                         .mounts
@@ -1266,7 +1588,8 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     // Missing, but a mount hangs below it.
                     let at = Some((here.at.as_ref().unwrap().0, p));
                     let dir = dup_cloexec(here.dir.as_raw_fd())?;
-                    ancestors.push(std::mem::replace(&mut here, Here { dir, at, phantom: true }));
+                    let next = Here { dir, at, phantom: true, ovl: None };
+                    ancestors.push(std::mem::replace(&mut here, next));
                     continue;
                 }
                 if is_last {
@@ -1274,10 +1597,19 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 }
                 return Err(errno::ENOENT);
             }
-            Err(other) => return Err(other),
         }
     }
     done(here, b".".to_vec(), false)
+}
+
+/// The host directories at the top of what mount `m` shows: its source's
+/// directory, or each of an overlay's layers'.
+fn mount_tops(m: &Mount) -> Vec<Vec<u8>> {
+    match &m.source {
+        Source::Host(_) => m.host_path(b"").into_iter().collect(),
+        Source::Overlay(l) => l.paths().map(|p| mounts::join(p, &m.root)).collect(),
+        Source::Synthetic => Vec::new(),
+    }
 }
 
 /// Where a magic link of `/proc` leads.
@@ -1429,7 +1761,11 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
     let view = published();
     let Some(v) = view.as_ref() else { return Ok(path.to_vec()) };
-    let r = resolve_in(&v.view(), fcntl::AT_FDCWD as i32, path, follow_final)?;
+    let mut r = resolve_in(&v.view(), fcntl::AT_FDCWD as i32, path, follow_final)?;
+    if !follow_final {
+        // A bind, which makes the socket's node there.
+        r.prepare_bind()?;
+    }
     let mut host = fd_path(r.dir.as_raw_fd()).ok_or(errno::ENOENT)?;
     if r.name != b"." {
         if host.last() != Some(&b'/') {

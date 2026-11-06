@@ -37,6 +37,12 @@ pub struct ProcRecord {
     pub bound: Option<Proc>,
     /// Whether it is a child subreaper (`PR_SET_CHILD_SUBREAPER`).
     pub subreaper: bool,
+    /// The orphans below it that already had their adopter when it became
+    /// a subreaper, which it does not take from that adopter.
+    pub declined: Vec<Proc>,
+    /// The orphans it adopted as a subreaper, which stay its own once it
+    /// no longer is one.
+    pub kept: Vec<Proc>,
     /// Its process group, as it last set it (what a `wait` for a group
     /// matches it by once it is gone).
     pub pgid: i32,
@@ -100,6 +106,8 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     put_procs(&mut e, &r.lineage);
     put_opt(&mut e, r.bound);
     e.bool(r.subreaper);
+    put_procs(&mut e, &r.declined);
+    put_procs(&mut e, &r.kept);
     e.i32(r.pgid);
     e.bool(r.autoreap);
     e.into_bytes()
@@ -119,6 +127,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let ns = (0..n).map(|_| d.bytes()).collect();
     let (comm, cmdline, exe) = (d.bytes(), d.bytes(), d.bytes());
     let (lineage, bound, subreaper) = (get_procs(&mut d), get_opt(&mut d), d.bool());
+    let (declined, kept) = (get_procs(&mut d), get_procs(&mut d));
     let (pgid, autoreap) = (d.i32(), d.bool());
     d.finish().ok()?;
     Some(ProcRecord {
@@ -131,6 +140,8 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         lineage,
         bound,
         subreaper,
+        declined,
+        kept,
         pgid,
         autoreap,
     })
@@ -207,7 +218,9 @@ pub fn gone(pid: i32) {
     {
         // A namespace's init takes its namespace with it.
         crate::pidns::init_gone(&r.ns, pid);
-        if crate::reaper::might_adopt(&r.lineage, r.bound) && !parent_autoreaps(&r.lineage) {
+        if crate::reaper::might_adopt((pid, r.start), &r.lineage, r.bound)
+            && !parent_autoreaps(&r.lineage)
+        {
             write_ended(&Ended {
                 pid,
                 start: r.start,
@@ -247,7 +260,7 @@ pub fn own_autoreap(on: bool) {
 
 /// Host process `host`'s numbers in the pid namespaces that `dirs` (a
 /// process's namespaces' records) name, and those above them.
-fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
+pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
     let prefix = format!("v{}-pid-", crate::shared::FORMAT);
     let mut out: Vec<(Vec<u8>, i32)> = Vec::new();
     for d in dirs {
@@ -298,6 +311,8 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         lineage: Vec::new(),
         bound: None,
         subreaper: false,
+        declined: Vec::new(),
+        kept: Vec::new(),
         // SAFETY: plain host call.
         pgid: unsafe { libc::getpgid(pid) },
         autoreap: false,
@@ -392,14 +407,67 @@ pub fn own_line(line: &(Vec<Proc>, Option<Proc>)) {
     let _ = change(me(), |r| (r.lineage, r.bound) = line.clone());
 }
 
-/// Make this process a child subreaper, or not.
-pub fn set_own_subreaper(on: bool) {
-    let _ = change(me(), |r| r.subreaper = on);
+/// Make this process a child subreaper, or not, with the orphans below it
+/// it is not to adopt (`declined`) and those it keeps (`kept`), see
+/// [`crate::reaper::set_subreaper`].
+pub fn set_own_subreaper(on: bool, declined: Vec<Proc>, kept: Vec<Proc>) {
+    let _ = change(me(), |r| (r.subreaper, r.declined, r.kept) = (on, declined, kept));
 }
 
 /// Whether this process is a child subreaper.
 pub fn own_subreaper() -> bool {
     read(me()).is_some_and(|r| r.subreaper)
+}
+
+/// Whether host process `pid` is stopped, and by which signal (the
+/// host's): `None` if it runs or is gone.
+pub fn stopped_by(pid: i32) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: zeroed bytes are a valid `proc_bsdinfo`, which the call fills.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: a valid out-buffer of `size` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if n != size || info.pbi_status != libc::SSTOP {
+            return None;
+        }
+        // The signal is `p_xstat` of the process's `kinfo_proc`, which the
+        // libc crate does not describe: a `u16` 280 bytes into its 648.
+        const SIZE: usize = 648;
+        const XSTAT: usize = 280;
+        let mut buf = [0u8; SIZE];
+        let mut len = SIZE;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        // SAFETY: a valid name and out-buffer of `len` bytes.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r != 0 || len != SIZE {
+            return Some(libc::SIGSTOP);
+        }
+        Some(i32::from(u16::from_ne_bytes([buf[XSTAT], buf[XSTAT + 1]])))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Whether host process `p` is alive (not ended, nor a zombie) and the one
@@ -569,7 +637,7 @@ pub fn exiting(status: i32) {
             lineage: r.lineage,
             bound: r.bound,
         };
-        if crate::reaper::might_adopt(&ended.lineage, ended.bound)
+        if crate::reaper::might_adopt((ended.pid, ended.start), &ended.lineage, ended.bound)
             && !parent_autoreaps(&ended.lineage)
         {
             write_ended(&ended);

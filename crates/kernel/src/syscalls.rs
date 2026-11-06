@@ -177,6 +177,10 @@ impl<P: Platform> Kernel<P> {
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
                     r
+                } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
+                    && is_dir_fd(a[0] as i32)
+                {
+                    crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 } else {
                     // SAFETY: plain host call; SEEK_SET/CUR/END match.
                     ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
@@ -306,16 +310,9 @@ impl<P: Platform> Kernel<P> {
             nr::REMOVEXATTR => self.sys_removexattr(None, a[0], a[1], true),
             nr::LREMOVEXATTR => self.sys_removexattr(None, a[0], a[1], false),
             nr::FREMOVEXATTR => self.sys_removexattr(Some(a[0] as i32), 0, a[1], true),
-            nr::FCHMOD if crate::memfd::chmod_sealed(a[0] as i32) => err(errno::EPERM),
-            // A mode that denies the owner is kept apart (see `modes`).
-            nr::FCHMOD => match crate::modes::keep_fd(a[0] as i32, a[1] as u32) {
-                Ok(()) => 0,
-                Err(e) => err(e),
-            },
+            nr::FCHMOD => self.sys_fchmod(a[0], a[1]),
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
-            // Ownership is virtual: honor the guest's credentials rather than
-            // changing the backing host file (fwe does not run as root).
-            nr::FCHOWN => self.chown_check(a[1] as u32, a[2] as u32),
+            nr::FCHOWN => self.sys_fchown(a[0], a[1], a[2]),
             nr::TRUNCATE => self.sys_truncate(a[0], a[1]),
             nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
             nr::FALLOCATE => self.sys_fallocate(a[0], a[1], a[2], a[3]),
@@ -916,7 +913,7 @@ impl<P: Platform> Kernel<P> {
             // In the process's record, where its descendants look for it;
             // fwe keeps the adoption (see `reaper`).
             PR_SET_CHILD_SUBREAPER => {
-                crate::procreg::set_own_subreaper(arg2 != 0);
+                crate::reaper::set_subreaper(arg2 != 0);
                 crate::reaper::start_if_reaper();
                 0
             }
@@ -1592,6 +1589,14 @@ fn uid_in(arg: u64, gid: bool) -> Result<u32, i32> {
         return Ok(id);
     }
     crate::userns::from_ns(id, gid).ok_or(errno::EINVAL)
+}
+
+/// Whether `fd` is open on a directory.
+fn is_dir_fd(fd: i32) -> bool {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR }
 }
 
 #[cfg(test)]

@@ -9,7 +9,8 @@
 //! ([`crate::fs::Fs`]).
 //!
 //! A filesystem is a host directory (the rootfs, a bind mount's source, a
-//! tmpfs's backing directory, all [`Source::Host`]) or one fwe generates
+//! tmpfs's backing directory, all [`Source::Host`]), a stack of them
+//! ([`Source::Overlay`], see [`crate::overlay`]) or one fwe generates
 //! (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`), each reached from
 //! [`Mount::root`], the path inside it the mount shows (a bind mount of a
 //! subdirectory).
@@ -73,6 +74,7 @@ pub enum FsType {
     Cgroup2,
     Devpts,
     Mqueue,
+    Overlay,
 }
 
 impl FsType {
@@ -85,6 +87,7 @@ impl FsType {
             FsType::Cgroup2 => "cgroup2",
             FsType::Devpts => "devpts",
             FsType::Mqueue => "mqueue",
+            FsType::Overlay => "overlay",
         }
     }
 
@@ -98,6 +101,7 @@ impl FsType {
             FsType::Cgroup2 => 0x6367_7270,
             FsType::Devpts => 0x1cd1,
             FsType::Mqueue => 0x1980_2002,
+            FsType::Overlay => crate::overlay::MAGIC,
         }
     }
 
@@ -110,6 +114,7 @@ impl FsType {
             b"cgroup2" => FsType::Cgroup2,
             b"devpts" => FsType::Devpts,
             b"mqueue" => FsType::Mqueue,
+            b"overlay" => FsType::Overlay,
             _ => return None,
         })
     }
@@ -126,6 +131,7 @@ impl FsType {
             4 => FsType::Cgroup2,
             5 => FsType::Devpts,
             6 => FsType::Mqueue,
+            7 => FsType::Overlay,
             _ => FsType::Ext4,
         }
     }
@@ -137,6 +143,8 @@ pub enum Source {
     /// A host directory, or a host file for a file bind mount: the path
     /// the mount's [`Mount::root`] is taken in.
     Host(Vec<u8>),
+    /// Host directories stacked as one ([`crate::overlay`]).
+    Overlay(std::sync::Arc<crate::overlay::Layers>),
     /// A filesystem fwe generates.
     Synthetic,
 }
@@ -663,10 +671,14 @@ impl Table {
             e.u32(m.fstype.code());
             match &m.source {
                 Source::Host(p) => {
-                    e.bool(true);
+                    e.u8(1);
                     e.bytes(p);
                 }
-                Source::Synthetic => e.bool(false),
+                Source::Overlay(l) => {
+                    e.u8(2);
+                    l.encode(e);
+                }
+                Source::Synthetic => e.u8(0),
             }
             e.bytes(&m.root);
             e.u64(m.flags);
@@ -686,7 +698,11 @@ impl Table {
                 parent: d.u32(),
                 point: d.bytes(),
                 fstype: FsType::from_code(d.u32()),
-                source: if d.bool() { Source::Host(d.bytes()) } else { Source::Synthetic },
+                source: match d.u8() {
+                    1 => Source::Host(d.bytes()),
+                    2 => Source::Overlay(std::sync::Arc::new(crate::overlay::Layers::decode(d))),
+                    _ => Source::Synthetic,
+                },
                 root: d.bytes(),
                 flags: d.u64(),
                 propagation: d.u64(),
