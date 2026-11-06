@@ -1910,12 +1910,16 @@ echo "$REQUEST_METHOD $QUERY_STRING: $(sqlite3 /tmp/db 'select group_concat(who)
     init.args(["/tmp/db", "create table hits(who text); insert into hits values ('init')"]);
     assert_eq!(run_bounded(init).status.code(), Some(0));
 
-    // A port free a moment ago.
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    std::fs::write(
-        root.path("etc/lighttpd.conf"),
-        format!(
-            r#"server.document-root = "/srv/www"
+    // A port free a moment ago, which another test may take before lighttpd
+    // binds it: then lighttpd ends, and another is tried.
+    let log_path = root.path("tmp/error.log");
+    let mut started = None;
+    for _ in 0..5 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        std::fs::write(
+            root.path("etc/lighttpd.conf"),
+            format!(
+                r#"server.document-root = "/srv/www"
 server.bind = "127.0.0.1"
 server.port = {port}
 server.modules = ("mod_dirlisting", "mod_cgi")
@@ -1926,19 +1930,51 @@ dir-listing.activate = "enable"
 cgi.assign = (".sh" => "/bin/bash")
 mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
 "#
-        ),
-    )
-    .unwrap();
-    let mut cmd = root.command("/bin/lighttpd");
-    cmd.args(["-D", "-f", "/etc/lighttpd.conf", "-m", "/usr/lib/lighttpd"]);
-    let server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-    let start = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
-        std::thread::sleep(Duration::from_millis(50));
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&log_path);
+        // Its failed calls on standard error, for a start that fails.
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace=failures")
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.path("bin/lighttpd"))
+            .args(["-D", "-f", "/etc/lighttpd.conf", "-m", "/usr/lib/lighttpd"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/tmp")
+            .stdin(Stdio::null());
+        let mut server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap());
+        let start = Instant::now();
+        // Listening once its log says it started (a connection could reach
+        // whoever else holds the port).
+        let ended = loop {
+            if std::fs::read_to_string(&log_path).is_ok_and(|l| l.contains("server started")) {
+                break None;
+            }
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break Some(status);
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let Some(status) = ended else {
+            started = Some((server, port));
+            break;
+        };
+        let mut err = String::new();
+        if let Some(mut e) = server.0.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut e, &mut err);
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("Address already in use") || err.contains("Address already in use"),
+            "lighttpd ended ({status}) before it listened:\n{err}\n{log}"
+        );
     }
+    let (server, port) = started.expect("a free port for lighttpd");
     // On a failure, lighttpd's own account of it.
-    let log_path = root.path("tmp/error.log");
     let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
     if let Err(e) = result {
         drop(server);
