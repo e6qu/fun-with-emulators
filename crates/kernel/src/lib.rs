@@ -942,8 +942,10 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             if seqpacket::is(fd) {
-                let v = libc::iovec { iov_base: buf as *mut _, iov_len: len as usize };
-                return Some(seqpacket::read(fd, &[v]));
+                return Some(match uaccess::host_buffer(buf, len, true) {
+                    Ok(v) => seqpacket::read(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
             }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
@@ -968,8 +970,10 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             if seqpacket::is(fd) {
-                let v = libc::iovec { iov_base: buf as *mut _, iov_len: len as usize };
-                return Some(seqpacket::write(fd, &[v]));
+                return Some(match uaccess::host_buffer(buf, len, false) {
+                    Ok(v) => seqpacket::write(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
             }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
@@ -986,6 +990,10 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         },
         n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
+            Ok(iov) if crate::sysctl::is(a[0] as i32) => {
+                crate::sysctl::try_writev(a[0] as i32, &iov)
+                    .unwrap_or(fwe_abi::err(fwe_abi::errno::EINVAL))
+            }
             Ok(iov) => {
                 // SAFETY: as for readv.
                 let r = unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
@@ -997,6 +1005,10 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PREAD64 => host::ret(unsafe {
             libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
         } as i64),
+        n::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
+            crate::sysctl::try_write(a[0] as i32, a[1], a[2])
+                .unwrap_or(fwe_abi::err(fwe_abi::errno::EINVAL))
+        }
         // SAFETY: the host validates the guest buffer.
         n::PWRITE64 => host::ret(unsafe {
             libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)

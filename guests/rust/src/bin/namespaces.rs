@@ -638,6 +638,66 @@ fn main() {
                 println!("reaped the orphan: {}, {}", w == g, ended(status));
             }
         }
+        // A child killed outright while its parent lives, a zombie of that
+        // parent; when the parent ends, the subreaper is sent SIGCHLD for it
+        // and reaps it.
+        Some("subreaper-zombie") => {
+            catch_sigchld();
+            // SAFETY: plain calls with valid out-parameters.
+            unsafe {
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                let (mut report, mut go) = ([0i32; 2], [0i32; 2]);
+                pipe(report.as_mut_ptr());
+                pipe(go.as_mut_ptr());
+                let p = fork();
+                if p == 0 {
+                    let x = fork();
+                    if x == 0 {
+                        pause();
+                        _exit(0);
+                    }
+                    write_i32(report[1], x);
+                    // Until the subreaper has killed it.
+                    read_i32(go[0]);
+                    _exit(0);
+                }
+                let x = read_i32(report[0]);
+                kill(x, SIGKILL);
+                // Its parent lives on a moment, then ends without waiting.
+                usleep(100_000);
+                write_i32(go[1], 1);
+                let mut status = 0;
+                waitpid(p, &mut status, 0);
+                println!("SIGCHLD for the killed orphan: {}", sigchld_from(x));
+                let w = waitpid(-1, &mut status, 0);
+                println!("reaped it: {}, {}", w == x, ended(status));
+            }
+        }
+        // A pid namespace's init cannot be killed from inside it, by
+        // itself or by a child.
+        Some("init-unkillable") => {
+            let init = clone_child(CLONE_NEWPID, || {
+                // Plain calls, in the unsafe block around.
+                {
+                    // SAFETY: plain calls.
+                    unsafe {
+                        println!("init kills itself: {}", kill(1, SIGKILL));
+                        if fork() == 0 {
+                            println!("child kills init: {}", kill(1, SIGKILL));
+                            _exit(0);
+                        }
+                        let mut status = 0;
+                        waitpid(-1, &mut status, 0);
+                    }
+                }
+                println!("init lives");
+                4
+            });
+            let mut status = 0;
+            // SAFETY: a valid out-parameter.
+            unsafe { waitpid(init, &mut status, 0) };
+            println!("init {}", ended(status));
+        }
         // A pid namespace's init adopts the orphans in it.
         Some("pid-orphan") => {
             let init = clone_child(CLONE_NEWPID, || {

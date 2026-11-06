@@ -133,13 +133,13 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
             return Some(e);
         }
         if procreg::take_ended(&e) {
-            crate::pidns::reaped(e.pid);
+            crate::pidns::released(&e.numbers, e.pid);
             let told = NOTIFIED
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_mut()
                 .is_some_and(|n| n.remove(&(e.pid, e.start)));
-            if !told {
+            if !told && sigchld_taken() {
                 // Reaped before the watcher saw it end: its SIGCHLD is
                 // still owed, as Linux sends it before `wait` can return.
                 raise(&e);
@@ -160,6 +160,7 @@ pub fn has_live_adopted(sel: Select) -> bool {
         // SAFETY: plain host call.
         let pgid = unsafe { libc::getpgid(pid) };
         sel.matches(pid, pgid)
+            && procreg::alive((pid, r.start))
             && r.lineage.first().is_some_and(|&(p, _)| p != me)
             && orphaned(&r.lineage)
             && adopter(&r.lineage, r.bound) == Some(me)
@@ -243,12 +244,20 @@ fn is_reaper() -> bool {
 /// there fwe runs only the kernel's unit tests.
 pub fn start_if_reaper() {
     #[cfg(target_os = "macos")]
-    if !active()
-        && is_reaper()
-        && !RUNNING.swap(true, SeqCst)
-        && std::thread::Builder::new().name("fwe-reaper".into()).spawn(watch::run).is_err()
-    {
-        RUNNING.store(false, SeqCst);
+    if !active() && is_reaper() && !RUNNING.swap(true, SeqCst) {
+        // Made here, where the caller holds the kernel lock, so no guest
+        // thread takes its number before it is moved out of their range.
+        // SAFETY: plain host call.
+        let kq = unsafe { libc::kqueue() };
+        let started = crate::fdtable::reserve(kq).ok().is_some_and(|kq| {
+            std::thread::Builder::new()
+                .name("fwe-reaper".into())
+                .spawn(move || watch::run(kq))
+                .is_ok()
+        });
+        if !started {
+            RUNNING.store(false, SeqCst);
+        }
     }
 }
 
@@ -343,15 +352,23 @@ fn notify() {
         n.retain(|k| ended.iter().any(|e| (e.pid, e.start) == *k));
         ended.into_iter().filter(|e| n.insert((e.pid, e.start))).collect()
     };
+    let sig = fwe_abi::signal::SIGCHLD;
     for e in fresh {
-        if crate::host::children_reaped_by_host() {
-            if procreg::take_ended(&e) {
-                crate::pidns::reaped(e.pid);
-            }
-            continue;
+        if crate::host::children_reaped_by_host() && procreg::take_ended(&e) {
+            crate::pidns::released(&e.numbers, e.pid);
         }
-        raise(&e);
+        // A SIGCHLD ignored is not sent at all (and one left at its
+        // default would be dropped): only one the guest takes.
+        if !crate::host::signal_is_ignored(sig) && sigchld_taken() {
+            raise(&e);
+        }
     }
+}
+
+/// Whether the guest takes `SIGCHLD`: a handler, or a signalfd.
+fn sigchld_taken() -> bool {
+    let bit = 1u64 << (fwe_abi::signal::SIGCHLD - 1);
+    (crate::signal::caught() | crate::signalfd::watched()) & bit != 0
 }
 
 /// Send this process the `SIGCHLD` for adopted process `e`'s end.
@@ -453,7 +470,7 @@ mod watch {
         }
     }
 
-    pub(super) fn run() {
+    pub(super) fn run(kq: i32) {
         // Signals are for the guest's threads, never this one.
         // SAFETY: plain host calls on a valid signal set.
         unsafe {
@@ -461,12 +478,6 @@ mod watch {
             libc::sigfillset(&mut all);
             libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
         }
-        // SAFETY: plain host call.
-        let kq = unsafe { libc::kqueue() };
-        let Ok(kq) = crate::fdtable::reserve(kq) else {
-            RUNNING.store(false, SeqCst);
-            return;
-        };
         let me = me();
         let mut w = Watcher { kq, watched: HashSet::new() };
         // This process's forks, and the host's SIGCHLD (a child of its own

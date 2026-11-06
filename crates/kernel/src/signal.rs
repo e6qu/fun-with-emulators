@@ -294,6 +294,11 @@ impl<P: Platform> Kernel<P> {
             self.platform.set_host_signal(sig, how);
             CAUGHT.fetch_and(!bit(sig), ordering);
         }
+        if sig == signal::SIGCHLD {
+            // Whether the host now reaps the children as they end, which a
+            // reaper adopting one must know (see `reaper`).
+            crate::procreg::own_autoreap(host::children_reaped_by_host());
+        }
     }
 
     pub(crate) fn sync_all_host_signals(&mut self) {
@@ -534,6 +539,16 @@ impl<P: Platform> Kernel<P> {
         if sig == 0 {
             // SAFETY: plain host call; signal 0 only checks the target.
             return host::ret(unsafe { libc::kill(target as libc::pid_t, 0) });
+        }
+        // A pid namespace's init cannot be killed or stopped from inside it
+        // (it has no handler for either), as on Linux.
+        if matches!(sig, signal::SIGKILL | signal::SIGSTOP)
+            && target > 0
+            && crate::pidns::current()
+                .first()
+                .is_some_and(|ns| ns.get().host_of(1) == Some(target as i32))
+        {
+            return 0;
         }
         let to_self = pid == me || pid == 0 || pid == -1;
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {

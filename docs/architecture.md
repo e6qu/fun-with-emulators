@@ -682,8 +682,11 @@ macOS has no `SOCK_SEQPACKET` Unix sockets, so fwe makes one of a stream
 socket (`crates/kernel/src/seqpacket.rs`): each message is framed on the
 stream, its length first, and a receive takes one whole message, cut to
 the buffer (`MSG_TRUNC`) with the rest dropped, so boundaries are kept;
-the rest is the stream's own, so it can listen, connect and accept, and a
-peer's close is end-of-file to `read`, `poll` and `epoll` alike.
+a send is whole or, without blocking, `EAGAIN`. The rest is the stream's
+own, so it can listen, connect and accept, and a peer's close is
+end-of-file to `read`, `poll` and `epoll` alike. Its buffers hold two of
+the largest messages, and their odd size marks it, so a process that
+receives one with `SCM_RIGHTS` knows it for what it is.
 
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
@@ -778,7 +781,8 @@ initial namespace sees the host's: its host name, its pids.
   1 and maps each number to its host pid; `getpid`, `getppid`, `kill`,
   `wait4`, `waitid`, the process-group, session and terminal calls and
   the senders in `siginfo` are translated. When its init ends, or is sent
-  `SIGKILL`, every other process in it is killed.
+  `SIGKILL`, every other process in it is killed; from inside the
+  namespace, its init cannot be sent `SIGKILL` or `SIGSTOP`.
 - **UTS**: `uname`, `sethostname`, `setdomainname` and
   `/proc/sys/kernel/hostname` use its names.
 - **network** (`netns.rs`): a loopback interface, down until brought up;
@@ -937,8 +941,10 @@ those items.
   `setns` is not implemented; an adopted orphan that stops or continues
   is not reported to its adopter's `wait`, and its adopter is found when
   asked for, not fixed when its parent ends (an ancestor that becomes a
-  subreaper later adopts it too); a pid namespace's init killed with
-  `SIGKILL` from outside fwe leaves the rest of the namespace running;
+  subreaper later adopts it too); a pid namespace's init killed outright
+  (not by a fwe process's `kill`) ends its namespace only once its parent
+  reaps it or a reaper sees it gone, and an init's end is reported before
+  the rest of its namespace has gone;
   `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
   `environ`, and shows only fwe's processes in the initial pid namespace.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
@@ -949,8 +955,8 @@ those items.
   `SECCOMP_FILTER_FLAG_TSYNC`), and there is no user-notification listener
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`);
   `sched_setaffinity` is checked and remembered but threads still run on
-  any CPU; a `SOCK_SEQPACKET` socket passed with `SCM_RIGHTS` is a plain
-  stream socket in the receiver, its framing in the way.
+  any CPU; processes that share a `SOCK_SEQPACKET` socket and read it at
+  once can split a message between them (a process's own threads cannot).
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a blocked signal whose

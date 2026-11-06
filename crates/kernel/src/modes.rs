@@ -24,9 +24,11 @@ const MARK: u32 = libc::UF_NODUMP;
 
 /// What the host's mode must have of guest mode `perm` (its low 12 bits)
 /// for a directory (`dir`) or another file: the owner's read and write,
-/// and search for a directory.
+/// and search for a directory or execute for a file anyone may run.
 pub fn host_perm(perm: u32, dir: bool) -> u32 {
-    perm & 0o7777 | 0o600 | if dir { 0o100 } else { 0 }
+    // Execute for anyone is the owner's too: root may run what anyone may.
+    let exec = dir || perm & 0o111 != 0;
+    perm & 0o7777 | 0o600 | if exec { 0o100 } else { 0 }
 }
 
 /// The permission bits of host metadata `st`.
@@ -98,7 +100,10 @@ pub fn keep_at(dir: i32, name: &CStr, perm: u32) -> Result<(), i32> {
     }
     let host = host_perm(perm, kind == libc::S_IFDIR);
     // SAFETY: `name` NUL-terminated; `dir` live.
-    if unsafe { libc::fchmodat(dir, name.as_ptr(), host as libc::mode_t, 0) } != 0 {
+    let r = unsafe {
+        libc::fchmodat(dir, name.as_ptr(), host as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if r != 0 {
         return Err(last());
     }
     let path = path_of(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
@@ -183,9 +188,10 @@ fn mark_fd(fd: i32, st: &libc::stat, perm: Option<u32>) -> Result<(), i32> {
                     return Err(last());
                 }
             }
-            None if marked(st) => {
+            // The flag is fwe's only where the attribute is: one a user
+            // set on a file of their own stays.
+            None if marked(st) && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0 => {
                 libc::fchflags(fd, st.st_flags & !MARK);
-                libc::fremovexattr(fd, ATTR.as_ptr(), 0);
             }
             None => {}
         }
@@ -213,9 +219,10 @@ fn mark_path(path: &CStr, st: &libc::stat, perm: Option<u32>) -> Result<(), i32>
                     return Err(last());
                 }
             }
-            None if marked(st) => {
+            None if marked(st)
+                && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0 =>
+            {
                 libc::lchflags(path.as_ptr(), st.st_flags & !MARK);
-                libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW);
             }
             None => {}
         }

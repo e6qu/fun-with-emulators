@@ -299,11 +299,26 @@ impl<P: Platform> Kernel<P> {
         let mut fd = match &existing {
             // Made here: a change of the directory.
             None if flags & fcntl::O_CREAT != 0 => {
+                // Made here, or found made meanwhile, whose mode is its own.
+                let made = std::cell::Cell::new(true);
                 let r = self.change_in(dirfd, || {
-                    let fd = open();
+                    // SAFETY: `dir` is a live directory fd.
+                    let fd = unsafe {
+                        host::openat(
+                            dirfd,
+                            &name,
+                            host_flags | libc::O_EXCL,
+                            host_mode as libc::c_uint,
+                        )
+                    };
+                    if fd < 0 && host::last_errno() == libc::EEXIST && flags & fcntl::O_EXCL == 0 {
+                        made.set(false);
+                        let fd = open();
+                        return if fd < 0 { last_error() } else { fd as i64 };
+                    }
                     if fd < 0 { last_error() } else { fd as i64 }
                 });
-                if r >= 0 && host_mode != mode & 0o7777 {
+                if r >= 0 && made.get() && host_mode != mode & 0o7777 {
                     let _ = crate::modes::keep_fd(r as i32, mode);
                 }
                 if r < 0 {
@@ -1122,7 +1137,7 @@ impl<P: Platform> Kernel<P> {
             self.resolve_w(fcntl::AT_FDCWD as u64, &path, follow, true).and_then(|(d, n, _)| {
                 let (host, plain) = Self::xattr_file(&d, &n)?;
                 let space = crate::xattr::space(&name)?;
-                crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+                self.xattr_who(plain).may_write(&name, space)?;
                 crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
             });
         match r {
@@ -1148,7 +1163,7 @@ impl<P: Platform> Kernel<P> {
         let r = Self::fd_writable(fd).and_then(|()| {
             let plain = Self::xattr_fd(fd)?;
             let space = crate::xattr::space(&name)?;
-            crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+            self.xattr_who(plain).may_write(&name, space)?;
             crate::xattr::set(&crate::xattr::Target::Fd(fd), &name, &value, flags)
         });
         match r {
@@ -1206,7 +1221,7 @@ impl<P: Platform> Kernel<P> {
             Some(fd) => Self::fd_writable(fd).and_then(|()| {
                 let plain = Self::xattr_fd(fd)?;
                 let space = crate::xattr::space(&name)?;
-                crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+                self.xattr_who(plain).may_write(&name, space)?;
                 crate::xattr::remove(&crate::xattr::Target::Fd(fd), &name)
             }),
             None => {
@@ -1217,7 +1232,7 @@ impl<P: Platform> Kernel<P> {
                 self.resolve_w(fcntl::AT_FDCWD as u64, &path, follow, true).and_then(|(d, n, _)| {
                     let (host, plain) = Self::xattr_file(&d, &n)?;
                     let space = crate::xattr::space(&name)?;
-                    crate::xattr::Who::of(&self.creds, plain).may_write(&name, space)?;
+                    self.xattr_who(plain).may_write(&name, space)?;
                     crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
                 })
             }
@@ -1255,7 +1270,7 @@ impl<P: Platform> Kernel<P> {
         match fd {
             Some(fd) => {
                 let plain = Self::xattr_fd(fd)?;
-                f(&crate::xattr::Target::Fd(fd), &crate::xattr::Who::of(&self.creds, plain))
+                f(&crate::xattr::Target::Fd(fd), &self.xattr_who(plain))
             }
             None => {
                 let path =
@@ -1266,7 +1281,7 @@ impl<P: Platform> Kernel<P> {
                 let (d, n) = self.resolve_c(fcntl::AT_FDCWD as u64, &path, follow)?;
                 let (host, plain) = Self::xattr_file(&d, &n)?;
                 let t = crate::xattr::Target::Path(&host);
-                f(&t, &crate::xattr::Who::of(&self.creds, plain))
+                f(&t, &self.xattr_who(plain))
             }
         }
     }
@@ -1289,9 +1304,11 @@ impl<P: Platform> Kernel<P> {
         data.len() as i64
     }
 
-    /// The host path of `name` in `dir`, and whether it is a regular file or
-    /// a directory (a device node fwe made is neither).
-    fn xattr_file(dir: &std::os::fd::OwnedFd, name: &CString) -> Result<(CString, bool), i32> {
+    /// The host path of `name` in `dir`, and what kind of file it is.
+    fn xattr_file(
+        dir: &std::os::fd::OwnedFd,
+        name: &CString,
+    ) -> Result<(CString, crate::xattr::Kind), i32> {
         let mut st: libc::stat = zeroed_stat();
         // SAFETY: `name` NUL-terminated; `dir` live; `st` an out-parameter.
         if unsafe {
@@ -1300,24 +1317,35 @@ impl<P: Platform> Kernel<P> {
         {
             return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
-        let kind = st.st_mode & libc::S_IFMT;
-        let plain =
-            (kind == libc::S_IFREG && !crate::devnodes::marked(&st)) || kind == libc::S_IFDIR;
+        let kept = crate::modes::marked(&st)
+            .then(|| crate::modes::guest_perm_at(dir.as_raw_fd(), name, &st));
         let mut host = crate::fs::fd_path(dir.as_raw_fd()).ok_or(errno::ENOENT)?;
         host.push(b'/');
         host.extend_from_slice(name.as_bytes());
-        Ok((CString::new(host).map_err(|_| errno::EINVAL)?, plain))
+        Ok((CString::new(host).map_err(|_| errno::EINVAL)?, crate::xattr::Kind::of(&st, kept)))
     }
 
-    /// Whether open descriptor `fd` is of a regular file or a directory.
-    fn xattr_fd(fd: i32) -> Result<bool, i32> {
+    /// What kind of file open descriptor `fd` is of.
+    fn xattr_fd(fd: i32) -> Result<crate::xattr::Kind, i32> {
         let mut st: libc::stat = zeroed_stat();
         // SAFETY: `st` an out-parameter.
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
             return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
-        let kind = st.st_mode & libc::S_IFMT;
-        Ok((kind == libc::S_IFREG && !crate::devnodes::marked(&st)) || kind == libc::S_IFDIR)
+        let kept = crate::modes::marked(&st).then(|| crate::modes::guest_perm_fd(fd, &st));
+        Ok(crate::xattr::Kind::of(&st, kept))
+    }
+
+    /// The caller's standing toward a file of kind `kind`, for its
+    /// attributes.
+    fn xattr_who(&self, kind: crate::xattr::Kind) -> crate::xattr::Who {
+        crate::xattr::Who {
+            admin: self.creds.has(crate::caps::CAP_SYS_ADMIN),
+            setfcap: self.creds.has(crate::caps::CAP_SETFCAP),
+            read_any: self.passes_dac(4),
+            write_any: self.passes_dac(2),
+            kind,
+        }
     }
 
     /// Whether the caller passes permission bits for access `want` (`R_OK`,

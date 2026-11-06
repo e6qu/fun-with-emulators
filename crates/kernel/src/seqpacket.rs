@@ -2,15 +2,24 @@
 //! socket (a socketpair's end, or one made with `socket`, to bind, listen,
 //! connect and accept with), marked ([`crate::fdmarks::Mark::SeqPacket`]),
 //! whose messages are framed on the stream: a 4-byte length, then the
-//! message. A send writes a whole frame (its descriptors passed with the
-//! first byte); a receive takes one, cut to the buffer (`MSG_TRUNC`), the
-//! rest of it dropped, as Linux keeps message boundaries. Everything else
-//! is the stream's own: a peer that has gone reads end-of-file, a send to
-//! it fails with `EPIPE`, and `poll` and `epoll` see both.
+//! message. A send writes a whole frame or none (its descriptors passed
+//! with the first byte); a receive takes one, cut to the buffer
+//! (`MSG_TRUNC`), the rest of it dropped, as Linux keeps message
+//! boundaries. Everything else is the stream's own: a peer that has gone
+//! reads end-of-file, a send to it fails with `EPIPE`, and `poll` and
+//! `epoll` see both.
+//!
+//! - The socket's buffers are made big enough for two of the largest
+//!   messages, and their size, which any process can read back, marks it,
+//!   so one received with `SCM_RIGHTS` is known for what it is ([`adopt`]).
+//! - The threads of a process take a socket's messages one at a time;
+//!   processes that share a socket and read it at once can split a frame.
 
 use crate::fdmarks::{self, Mark};
 use crate::host::{self, last_error};
 use fwe_abi::{err, errno};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// The length a frame starts with.
 const HEADER: usize = 4;
@@ -18,9 +27,61 @@ const HEADER: usize = 4;
 /// The largest message, as Linux's default socket buffer bounds one.
 const MAX: usize = 212_992;
 
+/// The size of a seqpacket socket's buffers: room for two whole frames,
+/// and an odd number no one else asks for, which marks the socket.
+const BUFFER: i32 = 2 * (HEADER + MAX) as i32 + 1;
+
 /// Whether `fd` is a `SOCK_SEQPACKET` socket of fwe's.
 pub fn is(fd: i32) -> bool {
     fdmarks::any_marks() && fdmarks::marked(fd) == Some(Mark::SeqPacket)
+}
+
+fn sockopt(fd: i32, opt: i32) -> i32 {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, opt, (&mut v as *mut libc::c_int).cast(), &mut len)
+    };
+    v
+}
+
+fn set_sockopt(fd: i32, opt: i32, v: i32) {
+    // SAFETY: a valid in-parameter.
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&v as *const i32).cast(), 4);
+    }
+}
+
+/// Make stream socket `fd` a `SOCK_SEQPACKET` one: mark it and size its
+/// buffers.
+pub fn make(fd: i32) {
+    set_sockopt(fd, libc::SO_SNDBUF, BUFFER);
+    set_sockopt(fd, libc::SO_RCVBUF, BUFFER);
+    fdmarks::mark(fd, Mark::SeqPacket);
+}
+
+/// A descriptor received with `SCM_RIGHTS`: if it is a `SOCK_SEQPACKET`
+/// socket of fwe's (its buffers say so), mark it here too.
+pub fn adopt(fd: i32) {
+    if sockopt(fd, libc::SO_TYPE) == libc::SOCK_STREAM && sockopt(fd, libc::SO_RCVBUF) == BUFFER {
+        fdmarks::mark(fd, Mark::SeqPacket);
+    }
+}
+
+/// Each socket's lock (by inode), which a thread holds while it takes a
+/// whole message, or sends one.
+static LOCKS: Mutex<BTreeMap<u64, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+
+fn lock_of(fd: i32) -> Arc<Mutex<()>> {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::fstat(fd, &mut st) };
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    // Those of sockets no thread is using go.
+    locks.retain(|_, l| Arc::strong_count(l) > 1);
+    locks.entry(st.st_ino as u64).or_default().clone()
 }
 
 fn nonblocking(fd: i32, host_flags: i32) -> bool {
@@ -29,15 +90,27 @@ fn nonblocking(fd: i32, host_flags: i32) -> bool {
         || unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0
 }
 
-/// Wait until `fd` can take a write (or has an error to report).
-fn wait_writable(fd: i32) {
-    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+/// Wait until `fd` is ready for `events`; `Err` when a signal came first.
+fn wait(fd: i32, events: i16) -> Result<(), ()> {
+    let mut p = libc::pollfd { fd, events, revents: 0 };
     // SAFETY: one valid pollfd.
-    unsafe { libc::poll(&mut p, 1, -1) };
+    if unsafe { libc::poll(&mut p, 1, -1) } < 0 { Err(()) } else { Ok(()) }
 }
 
-/// Send one message, the bytes of `iov` (host buffers), with the host
-/// control data `control` (its descriptors), as Linux's `sendmsg` on a
+/// Whether the peer of `fd` has room for `need` more bytes now: what
+/// `POLLOUT` says with the low-water mark at `need`.
+fn has_room(fd: i32, need: usize) -> bool {
+    let old = sockopt(fd, libc::SO_SNDLOWAT);
+    set_sockopt(fd, libc::SO_SNDLOWAT, need as i32);
+    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    // SAFETY: one valid pollfd; no wait.
+    unsafe { libc::poll(&mut p, 1, 0) };
+    set_sockopt(fd, libc::SO_SNDLOWAT, old.max(1));
+    p.revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+}
+
+/// Send one message, the bytes of `iov` (host buffers, checked), with the
+/// host control data `control` (its descriptors), as Linux's `sendmsg` on a
 /// `SOCK_SEQPACKET` socket: whole, or not at all. Returns the message's
 /// length, or a raw Linux error.
 pub fn send(
@@ -49,6 +122,20 @@ pub fn send(
     let len: usize = iov.iter().map(|v| v.iov_len).sum();
     if len > MAX {
         return err(errno::EMSGSIZE);
+    }
+    let nonblock = nonblocking(fd, host_flags);
+    let lock = lock_of(fd);
+    let _held = if nonblock {
+        match lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => return err(errno::EAGAIN),
+        }
+    } else {
+        lock.lock().unwrap_or_else(|e| e.into_inner())
+    };
+    let total = HEADER + len;
+    if nonblock && !has_room(fd, total) {
+        return err(errno::EAGAIN);
     }
     let header = (len as u32).to_le_bytes();
     let mut frame = vec![libc::iovec { iov_base: header.as_ptr() as *mut _, iov_len: HEADER }];
@@ -64,8 +151,8 @@ pub fn send(
     if sent < 0 {
         return last_error();
     }
-    // A frame is never left half sent: the rest goes, waiting for room.
-    let total = HEADER + len;
+    // A frame is never left half sent: the rest goes, waiting for room
+    // (only a blocking send gets here with any of it left).
     while (sent as usize) < total {
         let mut skip = sent as usize;
         let rest: Vec<libc::iovec> = frame
@@ -90,7 +177,7 @@ pub fn send(
             match host::last_errno() {
                 libc::EINTR => continue,
                 libc::EAGAIN => {
-                    wait_writable(fd);
+                    let _ = wait(fd, libc::POLLOUT);
                     continue;
                 }
                 _ => return last_error(),
@@ -101,27 +188,33 @@ pub fn send(
     len as i64
 }
 
-/// Read exactly `buf.len()` bytes (`peek`: look at them) from `fd`, the
-/// host control data that comes with them into `control`. Returns how many
-/// bytes there were (fewer at end-of-file), with the control length and
-/// flags, or the host errno.
+/// Read `buf.len()` bytes from `fd`, or with `peek` look at them, the host
+/// control data that comes with the first into `control`. `committed`
+/// says a frame is begun, so neither an interruption nor a lull ends the
+/// read. Returns how many bytes there were (fewer at end-of-file), the
+/// control length and flags, or the host errno.
 fn read_exact(
     fd: i32,
     buf: &mut [u8],
     control: (*mut libc::c_void, usize),
     peek: bool,
+    committed: bool,
 ) -> Result<(usize, usize, i32), i32> {
     let mut got = 0;
     let (mut clen, mut cflags) = (0, 0);
     while got < buf.len() {
-        let mut v =
+        // A peek sees what is there from the start each time.
+        let at = if peek { 0 } else { got };
+        let mut v = libc::iovec {
             // SAFETY: within `buf`.
-            libc::iovec { iov_base: unsafe { buf.as_mut_ptr().add(got) }.cast(), iov_len: buf.len() - got };
+            iov_base: unsafe { buf.as_mut_ptr().add(at) }.cast(),
+            iov_len: buf.len() - at,
+        };
         // SAFETY: zeroed bytes are a valid `msghdr`, filled in below.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut v;
         msg.msg_iovlen = 1;
-        if got == 0 {
+        if got == 0 && !control.0.is_null() {
             msg.msg_control = control.0;
             msg.msg_controllen = control.1 as _;
         }
@@ -129,22 +222,33 @@ fn read_exact(
         // SAFETY: a valid message header and buffers.
         let r = unsafe { libc::recvmsg(fd, &mut msg, flags) };
         if r < 0 {
-            if host::last_errno() == libc::EINTR && got > 0 {
+            let e = host::last_errno();
+            let begun = got > 0 || committed;
+            if begun && e == libc::EINTR {
                 continue;
             }
-            return Err(host::last_errno());
+            if begun && e == libc::EAGAIN {
+                // The rest of a frame begun is on its way.
+                let _ = wait(fd, libc::POLLIN);
+                continue;
+            }
+            return Err(e);
         }
-        if got == 0 {
+        if got == 0 && msg.msg_controllen != 0 {
             (clen, cflags) = (msg.msg_controllen as usize, msg.msg_flags);
         }
         if r == 0 {
             break;
         }
-        if peek {
-            // A peek sees the whole of what is there at once.
-            return Ok((r as usize, clen, cflags));
+        if !peek {
+            got += r as usize;
+            continue;
         }
-        got += r as usize;
+        got = r as usize;
+        if got < buf.len() && wait(fd, libc::POLLIN).is_err() && !committed {
+            // Not all of it is there yet, and a signal came first.
+            return Err(libc::EINTR);
+        }
     }
     Ok((got, clen, cflags))
 }
@@ -158,10 +262,10 @@ pub struct Received {
     pub flags: i32,
 }
 
-/// Take one message into `iov` (host buffers), its descriptors into host
-/// control buffer `control`, as Linux's `recvmsg` on a `SOCK_SEQPACKET`
-/// socket. `linux_flags` are the guest's (`MSG_PEEK`, `MSG_TRUNC`,
-/// `MSG_DONTWAIT`).
+/// Take one message into `iov` (host buffers, checked), its descriptors
+/// into host control buffer `control`, as Linux's `recvmsg` on a
+/// `SOCK_SEQPACKET` socket. `linux_flags` are the guest's (`MSG_PEEK`,
+/// `MSG_TRUNC`, `MSG_DONTWAIT`).
 pub fn recv(
     fd: i32,
     iov: &[libc::iovec],
@@ -171,10 +275,22 @@ pub fn recv(
 ) -> Received {
     use fwe_abi::socket::{MSG_PEEK, MSG_TRUNC};
     let fail = |e: i64| Received { result: e, controllen: 0, flags: 0 };
+    let eof = || Received { result: 0, controllen: 0, flags: 0 };
+    let as_err = |e: i32| fail(err(host::errno_to_linux(e)));
     let peek = linux_flags & MSG_PEEK != 0;
-    if nonblocking(fd, host_flags) {
+    let nonblock = nonblocking(fd, host_flags);
+    let lock = lock_of(fd);
+    let _held = if nonblock {
+        match lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => return fail(err(errno::EAGAIN)),
+        }
+    } else {
+        lock.lock().unwrap_or_else(|e| e.into_inner())
+    };
+    let mut header = [0u8; HEADER];
+    if nonblock {
         // Only a whole frame is a message to take now.
-        let mut header = [0u8; HEADER];
         // SAFETY: a valid buffer.
         let n = unsafe {
             libc::recv(fd, header.as_mut_ptr().cast(), HEADER, libc::MSG_PEEK | libc::MSG_DONTWAIT)
@@ -183,55 +299,39 @@ pub fn recv(
             return fail(last_error());
         }
         if n == 0 {
-            return Received { result: 0, controllen: 0, flags: 0 };
+            return eof();
         }
         let mut ready: libc::c_int = 0;
         // SAFETY: a valid out-parameter.
         unsafe { libc::ioctl(fd, libc::FIONREAD, &mut ready) };
-        let need = HEADER + u32::from_le_bytes(header) as usize;
-        if (n as usize) < HEADER || (ready as usize) < need {
+        let len = u32::from_le_bytes(header) as usize;
+        if len <= MAX && ((n as usize) < HEADER || (ready as usize) < HEADER + len) {
             return fail(err(errno::EAGAIN));
         }
     }
-    // The frame: its length (with the descriptors sent with it), then the
-    // message.
-    let mut header = [0u8; HEADER];
-    let peeked;
-    let (len, controllen, cflags) = if peek {
-        let mut whole = vec![0u8; HEADER + MAX];
-        let (n, cl, cf) = match read_exact(fd, &mut whole[..HEADER], control, true) {
-            Ok(v) => v,
-            Err(e) => return fail(err(host::errno_to_linux(e))),
-        };
-        if n == 0 {
-            return Received { result: 0, controllen: 0, flags: 0 };
-        }
-        let len = u32::from_le_bytes(whole[..HEADER].try_into().unwrap()) as usize;
-        let want = (HEADER + len).min(whole.len());
-        whole.truncate(want);
-        if let Err(e) = read_exact(fd, &mut whole, (std::ptr::null_mut(), 0), true) {
-            return fail(err(host::errno_to_linux(e)));
-        }
-        peeked = whole;
-        (len, cl, cf)
-    } else {
-        let (n, cl, cf) = match read_exact(fd, &mut header, control, false) {
-            Ok(v) => v,
-            Err(e) => return fail(err(host::errno_to_linux(e))),
-        };
-        if n == 0 {
-            return Received { result: 0, controllen: 0, flags: 0 };
-        }
-        peeked = Vec::new();
-        (u32::from_le_bytes(header) as usize, cl, cf)
+    // The frame's length (and the descriptors sent with it).
+    let (len, controllen, cflags) = match read_exact(fd, &mut header, control, peek, false) {
+        Ok((n, ..)) if n < HEADER => return eof(),
+        Ok((_, cl, cf)) => (u32::from_le_bytes(header) as usize, cl, cf),
+        Err(e) => return as_err(e),
     };
+    if len > MAX {
+        // Not a frame of fwe's: what the stream holds cannot be read as
+        // messages.
+        return fail(err(errno::EIO));
+    }
     let body: Vec<u8> = if peek {
-        peeked[HEADER..].to_vec()
+        let mut whole = vec![0u8; HEADER + len];
+        match read_exact(fd, &mut whole, (std::ptr::null_mut(), 0), true, false) {
+            Ok((n, ..)) => whole.truncate(n),
+            Err(e) => return as_err(e),
+        }
+        whole.split_off(HEADER.min(whole.len()))
     } else {
         let mut b = vec![0u8; len];
-        match read_exact(fd, &mut b, (std::ptr::null_mut(), 0), false) {
-            Ok((n, _, _)) => b.truncate(n),
-            Err(e) => return fail(err(host::errno_to_linux(e))),
+        match read_exact(fd, &mut b, (std::ptr::null_mut(), 0), false, true) {
+            Ok((n, ..)) => b.truncate(n),
+            Err(e) => return as_err(e),
         }
         b
     };
@@ -242,8 +342,9 @@ pub fn recv(
             break;
         }
         let n = v.iov_len.min(body.len() - at);
-        // SAFETY: the caller's buffer spans `iov_len` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(body[at..].as_ptr(), v.iov_base.cast(), n) };
+        if crate::uaccess::write_host(v.iov_base as u64, &body[at..at + n]).is_err() {
+            return fail(err(errno::EFAULT));
+        }
         at += n;
     }
     let truncated = at < len;

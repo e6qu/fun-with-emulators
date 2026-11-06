@@ -111,7 +111,7 @@ impl<P: Platform> Kernel<P> {
         match n {
             // Files and I/O.
             nr::READ if crate::seqpacket::is(a[0] as i32) => {
-                let v = libc::iovec { iov_base: a[1] as *mut _, iov_len: a[2] as usize };
+                let v = guest!(uaccess::host_buffer(a[1], a[2], true));
                 crate::seqpacket::read(a[0] as i32, &[v])
             }
             nr::READ => {
@@ -133,7 +133,7 @@ impl<P: Platform> Kernel<P> {
                     return r;
                 }
                 if crate::seqpacket::is(a[0] as i32) {
-                    let v = libc::iovec { iov_base: a[1] as *mut _, iov_len: a[2] as usize };
+                    let v = guest!(uaccess::host_buffer(a[1], a[2], false));
                     return crate::seqpacket::write(a[0] as i32, &[v]);
                 }
                 // SAFETY: the host validates the guest buffer.
@@ -152,6 +152,10 @@ impl<P: Platform> Kernel<P> {
                 if crate::seqpacket::is(a[0] as i32) {
                     return crate::seqpacket::write(a[0] as i32, &iov);
                 }
+                if crate::sysctl::is(a[0] as i32) {
+                    return crate::sysctl::try_writev(a[0] as i32, &iov)
+                        .unwrap_or(err(errno::EINVAL));
+                }
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
@@ -160,6 +164,9 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe {
                     libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
                 } as i64)
+            }
+            nr::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
+                crate::sysctl::try_write(a[0] as i32, a[1], a[2]).unwrap_or(err(errno::EINVAL))
             }
             nr::PWRITE64 => {
                 // SAFETY: the host validates the guest buffer.
@@ -360,7 +367,13 @@ impl<P: Platform> Kernel<P> {
                     (Err(e), _) => return err(e),
                 };
                 // SAFETY: plain host call.
-                ret(unsafe { libc::setpgid(pid, pgid) })
+                let r = ret(unsafe { libc::setpgid(pid, pgid) });
+                if r == 0 {
+                    // SAFETY: getpid cannot fail.
+                    let me = unsafe { libc::getpid() };
+                    crate::procreg::record_pgid(if pid == 0 { me } else { pid });
+                }
+                r
             }
             nr::GETPGID => match crate::pidns::host_arg(a[0] as i32) {
                 // SAFETY: plain host call.
@@ -372,8 +385,15 @@ impl<P: Platform> Kernel<P> {
                 Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getsid(p) } as i64)),
                 Err(e) => err(e),
             },
-            // SAFETY: plain host call.
-            nr::SETSID => crate::pidns::guest_ret(ret(unsafe { libc::setsid() } as i64)),
+            nr::SETSID => {
+                // SAFETY: plain host call.
+                let r = ret(unsafe { libc::setsid() } as i64);
+                if r > 0 {
+                    // SAFETY: getpid cannot fail.
+                    crate::procreg::record_pgid(unsafe { libc::getpid() });
+                }
+                crate::pidns::guest_ret(r)
+            }
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
             // A parent outside the namespace is 0, as Linux reports it.

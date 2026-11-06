@@ -186,7 +186,42 @@ pub fn set_host(chain: &Chain, nums: &[i32], host: i32) {
 pub fn to_guest(host: i32) -> i32 {
     match current().first() {
         None => host,
-        Some(r) => r.get().number_of(host).unwrap_or(0),
+        Some(r) => r.get().number_of(host).or_else(|| recently(host, r.dir())).unwrap_or(0),
+    }
+}
+
+/// Numbers just released by a reap, by host pid and namespace record: a
+/// `SIGCHLD` delivered after its `wait` still names the child by its pid.
+static RECENT: std::sync::Mutex<std::collections::VecDeque<(i32, Vec<u8>, i32)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn remember_released(host: i32, dir: &[u8], n: i32) {
+    let mut r = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    r.retain(|(h, d, _)| !(*h == host && d == dir));
+    if r.len() >= 64 {
+        r.pop_front();
+    }
+    r.push_back((host, dir.to_vec(), n));
+}
+
+fn recently(host: i32, dir: &[u8]) -> Option<i32> {
+    let r = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    r.iter().rev().find(|(h, d, _)| *h == host && d == dir).map(|e| e.2)
+}
+
+/// Forget the numbers an adopted process `host` had (`numbers`: by
+/// namespace record), as it is reaped: those, not whatever its host pid
+/// may stand for by now.
+pub fn released(numbers: &[(Vec<u8>, i32)], host: i32) {
+    for r in current().iter() {
+        let Some(&(_, n)) = numbers.iter().find(|(d, _)| d == r.dir()) else { continue };
+        remember_released(host, r.dir(), n);
+        let _ = r.update(|ns| {
+            if ns.pids.get(&n).is_some_and(|e| e.host == host && !e.thread) {
+                ns.pids.remove(&n);
+            }
+            Ok(())
+        });
     }
 }
 
@@ -209,9 +244,45 @@ pub fn nested() -> bool {
 pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
     let hosts: std::collections::BTreeSet<i32> =
         ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
-    for h in hosts.into_iter().filter(|&h| h != init) {
+    // Only processes that are still members: a number left behind can name
+    // a host pid that has since been given to another process.
+    for h in hosts.into_iter().filter(|&h| h != init && member(h, ns.dir())) {
         // SAFETY: plain host call.
         unsafe { libc::kill(h, libc::SIGKILL) };
+    }
+}
+
+/// Whether live host process `host` is in the pid namespace whose record
+/// is `dir` (or one inside it), by fwe's record of it.
+fn member(host: i32, dir: &[u8]) -> bool {
+    let Some(r) = crate::procreg::read(host) else { return false };
+    pid_dirs(&r.ns).into_iter().any(|d| {
+        crate::shared::Record::<PidNs>::join(&d, 0).ok().is_some_and(|ns| {
+            chain_from(Some(std::sync::Arc::new(ns))).iter().any(|n| n.dir() == dir)
+        })
+    })
+}
+
+/// The pid namespaces' records among a process's namespaces' records.
+fn pid_dirs(dirs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let prefix = format!("v{}-pid-", crate::shared::FORMAT);
+    dirs.iter()
+        .filter(|d| {
+            d.rsplit(|&b| b == b'/').next().is_some_and(|n| n.starts_with(prefix.as_bytes()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Host process `host`, in the namespaces whose records are `dirs`, has
+/// gone: if it was the init of one, that namespace ends.
+pub fn init_gone(dirs: &[Vec<u8>], host: i32) {
+    for d in pid_dirs(dirs) {
+        if let Ok(ns) = crate::shared::Record::<PidNs>::join(&d, 0)
+            && ns.get().host_of(1) == Some(host)
+        {
+            zap(&ns, host);
+        }
     }
 }
 
@@ -232,11 +303,8 @@ pub fn exiting() {
 /// coming ([`zap`]).
 pub fn led_by(host: i32) -> Option<crate::shared::Record<PidNs>> {
     let r = crate::procreg::read(host)?;
-    let prefix = format!("v{}-pid-", crate::shared::FORMAT);
-    r.ns.iter()
-        .filter(|d| {
-            d.rsplit(|&b| b == b'/').next().is_some_and(|n| n.starts_with(prefix.as_bytes()))
-        })
+    pid_dirs(&r.ns)
+        .iter()
         .filter_map(|d| crate::shared::Record::<PidNs>::join(d, 0).ok())
         .find(|ns| ns.get().host_of(1) == Some(host))
 }
@@ -244,6 +312,9 @@ pub fn led_by(host: i32) -> Option<crate::shared::Record<PidNs>> {
 /// Forget a reaped child's numbers, in every namespace of the chain.
 pub fn reaped(host: i32) {
     for r in current().iter() {
+        if let Some(n) = r.get().number_of(host) {
+            remember_released(host, r.dir(), n);
+        }
         let _ = r.update(|ns| {
             ns.release(host);
             Ok(())

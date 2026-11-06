@@ -13,6 +13,14 @@ const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
 const ENODATA: i32 = 61;
 const EOPNOTSUPP: i32 = 95;
+const EFAULT: i32 = 14;
+const MSG_PEEK: i32 = 2;
+const MSG_DONTWAIT: i32 = 0x40;
+const O_NONBLOCK: i32 = 0o4000;
+const F_SETFL: i32 = 4;
+const SOL_SOCKET: i32 = 1;
+const SO_TYPE: i32 = 3;
+const SCM_RIGHTS: i32 = 1;
 const XATTR_CREATE: i32 = 1;
 const AF_UNIX: i32 = 1;
 const SOCK_STREAM: i32 = 1;
@@ -86,6 +94,11 @@ unsafe extern "C" {
     fn send(fd: i32, b: *const u8, n: usize, f: i32) -> isize;
     fn recvmsg(fd: i32, m: *mut Msghdr, f: i32) -> isize;
     fn epoll_create1(f: i32) -> i32;
+    fn socketpair(d: i32, t: i32, p: i32, sv: *mut i32) -> i32;
+    fn recv(fd: i32, b: *mut u8, n: usize, f: i32) -> isize;
+    fn sendmsg(fd: i32, m: *const Msghdr, f: i32) -> isize;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn getsockopt(fd: i32, l: i32, o: i32, v: *mut i32, len: *mut u32) -> i32;
     fn epoll_ctl(ep: i32, op: i32, fd: i32, ev: *mut EpollEvent) -> i32;
     fn epoll_wait(ep: i32, ev: *mut EpollEvent, n: i32, t: i32) -> i32;
     fn _exit(code: i32) -> !;
@@ -105,6 +118,7 @@ fn name(e: i32) -> &'static str {
         EEXIST => "EEXIST",
         ENODATA => "ENODATA",
         EOPNOTSUPP => "EOPNOTSUPP",
+        EFAULT => "EFAULT",
         _ => "?",
     }
 }
@@ -326,6 +340,72 @@ fn main() {
                 let (a, len) = unix_addr(&format!("{long}/missing"));
                 let s = socket(AF_UNIX, SOCK_STREAM, 0);
                 println!("missing: {}", res(connect(s, &a, len) as i64));
+            }
+            // Messages bigger than a host socket's default buffers, sent
+            // and taken without blocking, looked at first; a bad buffer;
+            // and a SOCK_SEQPACKET socket passed to another holder of it
+            // with SCM_RIGHTS keeps its message boundaries.
+            Some("seqpacket-more") => {
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv.as_mut_ptr());
+                fcntl(sv[0], F_SETFL, O_NONBLOCK);
+                let big: Vec<u8> = (0..20000u32).map(|i| (i % 251) as u8 + 1).collect();
+                println!("non-blocking send: {}", send(sv[0], big.as_ptr(), big.len(), 0));
+                let mut buf = vec![0u8; 50000];
+                let n = recv(sv[1], buf.as_mut_ptr(), buf.len(), MSG_PEEK);
+                println!("peek: {n} same {}", buf[..n.max(0) as usize] == big[..]);
+                let n = recv(sv[1], buf.as_mut_ptr(), buf.len(), MSG_DONTWAIT);
+                println!("take: {n} same {}", buf[..n.max(0) as usize] == big[..]);
+                println!("nothing left: {}", recv(sv[1], buf.as_mut_ptr(), 10, MSG_DONTWAIT));
+                send(sv[0], b"x".as_ptr(), 1, 0);
+                let r = read(sv[1], 8 as *mut u8, 2);
+                println!("bad buffer: {} {}", r, name(errno()));
+                // Pass one end of a second pair over the first.
+                let mut pair = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair.as_mut_ptr());
+                let mut control = [0u8; 24];
+                control[..8].copy_from_slice(&20u64.to_ne_bytes());
+                control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+                control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+                control[16..20].copy_from_slice(&pair[1].to_ne_bytes());
+                let mut byte = *b"f";
+                let mut iov = Iovec { base: byte.as_mut_ptr(), len: 1 };
+                let m = Msghdr {
+                    name: std::ptr::null_mut(),
+                    namelen: 0,
+                    iov: &mut iov,
+                    iovlen: 1,
+                    control: control.as_mut_ptr(),
+                    controllen: 24,
+                    flags: 0,
+                };
+                println!("passed: {}", sendmsg(sv[0], &m, 0));
+                let mut cbuf = [0u8; 64];
+                let mut b = 0u8;
+                let mut iov = Iovec { base: &mut b, len: 1 };
+                let mut m = Msghdr {
+                    name: std::ptr::null_mut(),
+                    namelen: 0,
+                    iov: &mut iov,
+                    iovlen: 1,
+                    control: cbuf.as_mut_ptr(),
+                    controllen: 64,
+                    flags: 0,
+                };
+                recvmsg(sv[1], &mut m, 0);
+                let got = i32::from_ne_bytes(cbuf[16..20].try_into().unwrap());
+                close(pair[1]);
+                for msg in ["m1", "m22"] {
+                    send(pair[0], msg.as_ptr(), msg.len(), 0);
+                }
+                let mut ty = 0;
+                let mut len = 4u32;
+                getsockopt(got, SOL_SOCKET, SO_TYPE, &mut ty, &mut len);
+                println!("received socket type: {ty}");
+                for _ in 0..2 {
+                    let (n, text, _) = recv_one(got, 64);
+                    println!("through it: {n} {text:?}");
+                }
             }
             other => panic!("unknown scenario {other:?}"),
         }

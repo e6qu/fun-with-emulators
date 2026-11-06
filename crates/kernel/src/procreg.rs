@@ -37,6 +37,12 @@ pub struct ProcRecord {
     pub bound: Option<Proc>,
     /// Whether it is a child subreaper (`PR_SET_CHILD_SUBREAPER`).
     pub subreaper: bool,
+    /// Its process group, as it last set it (what a `wait` for a group
+    /// matches it by once it is gone).
+    pub pgid: i32,
+    /// Whether the host reaps its children as they end (it ignores
+    /// `SIGCHLD`, or set `SA_NOCLDWAIT`): no reaper is to take them.
+    pub autoreap: bool,
 }
 
 /// A host process, as its pid and its start time.
@@ -94,6 +100,8 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     put_procs(&mut e, &r.lineage);
     put_opt(&mut e, r.bound);
     e.bool(r.subreaper);
+    e.i32(r.pgid);
+    e.bool(r.autoreap);
     e.into_bytes()
 }
 
@@ -111,8 +119,21 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let ns = (0..n).map(|_| d.bytes()).collect();
     let (comm, cmdline, exe) = (d.bytes(), d.bytes(), d.bytes());
     let (lineage, bound, subreaper) = (get_procs(&mut d), get_opt(&mut d), d.bool());
+    let (pgid, autoreap) = (d.i32(), d.bool());
     d.finish().ok()?;
-    Some(ProcRecord { start, cgroup, ns, comm, cmdline, exe, lineage, bound, subreaper })
+    Some(ProcRecord {
+        start,
+        cgroup,
+        ns,
+        comm,
+        cmdline,
+        exe,
+        lineage,
+        bound,
+        subreaper,
+        pgid,
+        autoreap,
+    })
 }
 
 /// Write the record of host process `pid`.
@@ -177,21 +198,47 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
 /// take it.
 pub fn gone(pid: i32) {
     let _lock = lock(pid);
+    // A zombie has ended: its record goes now, not once it is reaped.
     if let Some(r) = read_any(pid)
-        && !host_info(pid).is_some_and(|(start, _, _)| start == r.start)
+        && !alive((pid, r.start))
     {
-        if crate::reaper::might_adopt(&r.lineage, r.bound) {
+        // A namespace's init takes its namespace with it.
+        crate::pidns::init_gone(&r.ns, pid);
+        if crate::reaper::might_adopt(&r.lineage, r.bound) && !parent_autoreaps(&r.lineage) {
             write_ended(&Ended {
                 pid,
                 start: r.start,
                 status: fwe_abi::signal::SIGKILL as i32,
-                pgid: 0,
+                pgid: r.pgid,
                 numbers: numbers_in(&r.ns, pid),
                 lineage: r.lineage,
                 bound: r.bound,
             });
         }
         remove(pid);
+    }
+}
+
+/// Whether the parent at the head of `lineage` lives and has the host reap
+/// its children as they end: then no reaper is to take one of them.
+fn parent_autoreaps(lineage: &[Proc]) -> bool {
+    lineage.first().is_some_and(|&p| alive(p) && read(p.0).is_some_and(|r| r.autoreap))
+}
+
+/// Host process `pid` (this one or a child) has changed process group.
+pub fn record_pgid(pid: i32) {
+    // SAFETY: plain host call.
+    let pgid = unsafe { libc::getpgid(pid) };
+    if read(pid).is_some_and(|r| r.pgid != pgid) {
+        let _ = change(pid, |r| r.pgid = pgid);
+    }
+}
+
+/// The host reaps this process's children as they end, or not.
+pub fn own_autoreap(on: bool) {
+    // Written only when it changes.
+    if read(me()).is_some_and(|r| r.autoreap != on) {
+        let _ = change(me(), |r| r.autoreap = on);
     }
 }
 
@@ -248,6 +295,9 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         lineage: Vec::new(),
         bound: None,
         subreaper: false,
+        // SAFETY: plain host call.
+        pgid: unsafe { libc::getpgid(pid) },
+        autoreap: false,
     });
     f(&mut r);
     write(pid, &r);
@@ -301,6 +351,8 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
             (r.comm, r.cmdline, r.exe) = (comm, cmdline, exe);
         }
         (r.lineage, r.bound) = line.clone();
+        // An ignored SIGCHLD is inherited, and so is the host's reaping.
+        r.autoreap = crate::host::children_reaped_by_host();
     });
 }
 
@@ -478,7 +530,11 @@ pub fn take_ended(e: &Ended) -> bool {
 pub fn reaped(pid: i32) {
     if read(pid).is_none() {
         let _lock = lock(pid);
-        if read_any(pid).is_some_and(|r| r.lineage.first().is_some_and(|&(p, _)| p == me())) {
+        if let Some(r) = read_any(pid)
+            && r.lineage.first().is_some_and(|&(p, _)| p == me())
+        {
+            // An init killed outright: its namespace goes with it.
+            crate::pidns::init_gone(&r.ns, pid);
             remove(pid);
         }
     }
@@ -510,7 +566,9 @@ pub fn exiting(status: i32) {
             lineage: r.lineage,
             bound: r.bound,
         };
-        if crate::reaper::might_adopt(&ended.lineage, ended.bound) {
+        if crate::reaper::might_adopt(&ended.lineage, ended.bound)
+            && !parent_autoreaps(&ended.lineage)
+        {
             write_ended(&ended);
         }
     }

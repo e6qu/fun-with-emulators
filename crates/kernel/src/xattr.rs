@@ -13,7 +13,6 @@
 //!   `security.capability`;
 //! - `system.` holds POSIX ACLs, which fwe does not keep (`EOPNOTSUPP`).
 
-use crate::caps::{CAP_SETFCAP, CAP_SYS_ADMIN};
 use fwe_abi::errno;
 use std::ffi::{CStr, CString};
 
@@ -54,18 +53,43 @@ pub fn space(name: &[u8]) -> Result<Space, i32> {
         .ok_or(errno::EOPNOTSUPP)
 }
 
+/// What kind of file an attribute call acts on.
+#[derive(Clone, Copy, Debug)]
+pub struct Kind {
+    /// A regular file or a directory (a device node fwe made is neither).
+    pub plain: bool,
+    /// Its kept mode, if its mode denies its owner ([`crate::modes`]).
+    pub kept: Option<u32>,
+}
+
+impl Kind {
+    /// The kind of the file whose host metadata is `st`, with its kept mode.
+    pub fn of(st: &libc::stat, kept: Option<u32>) -> Kind {
+        let kind = st.st_mode & libc::S_IFMT;
+        let plain =
+            (kind == libc::S_IFREG && !crate::devnodes::marked(st)) || kind == libc::S_IFDIR;
+        Kind { plain, kept }
+    }
+}
+
 /// What a caller is and what it acts on, for the permission checks.
 pub struct Who {
     /// `CAP_SYS_ADMIN`, and `CAP_SETFCAP`.
     pub admin: bool,
     pub setfcap: bool,
-    /// The file is a regular file or a directory.
-    pub plain: bool,
+    /// Whether it passes permission bits to read, and to write.
+    pub read_any: bool,
+    pub write_any: bool,
+    pub kind: Kind,
 }
 
 impl Who {
-    pub fn of(creds: &crate::creds::Creds, plain: bool) -> Who {
-        Who { admin: creds.has(CAP_SYS_ADMIN), setfcap: creds.has(CAP_SETFCAP), plain }
+    /// Whether the file's own permission bits let it do `want` (`R_OK`,
+    /// `W_OK`): as the file's owner, of a kept mode (the host checks the
+    /// rest).
+    fn bits_allow(&self, want: u32) -> bool {
+        let passes = if want & 2 != 0 { self.write_any } else { self.read_any };
+        passes || self.kind.kept.is_none_or(|k| crate::modes::owner_allows(k, want))
     }
 
     /// Whether `name` (in `space`) may be read: `ENODATA` where Linux hides
@@ -74,7 +98,8 @@ impl Who {
         match space {
             Space::System => Err(errno::EOPNOTSUPP),
             Space::Trusted if !self.admin => Err(errno::ENODATA),
-            Space::User if !self.plain => Err(errno::ENODATA),
+            Space::User if !self.kind.plain => Err(errno::ENODATA),
+            Space::User if !self.bits_allow(4) => Err(errno::EACCES),
             _ => Ok(()),
         }
     }
@@ -86,7 +111,8 @@ impl Who {
             Space::Trusted if !self.admin => Err(errno::EPERM),
             Space::Security if name == b"security.capability" && !self.setfcap => Err(errno::EPERM),
             Space::Security if name != b"security.capability" && !self.admin => Err(errno::EPERM),
-            Space::User if !self.plain => Err(errno::EPERM),
+            Space::User if !self.kind.plain => Err(errno::EPERM),
+            Space::User if !self.bits_allow(2) => Err(errno::EACCES),
             _ => Ok(()),
         }
     }
@@ -270,13 +296,20 @@ mod tests {
 
     #[test]
     fn rules_by_namespace() {
-        let user = Who { admin: false, setfcap: false, plain: true };
+        let file = Kind { plain: true, kept: None };
+        let user =
+            Who { admin: false, setfcap: false, read_any: false, write_any: false, kind: file };
         assert_eq!(user.may_read(Space::Trusted), Err(errno::ENODATA));
         assert_eq!(user.may_write(b"trusted.x", Space::Trusted), Err(errno::EPERM));
         assert_eq!(user.may_write(b"user.x", Space::User), Ok(()));
         assert_eq!(user.may_write(b"security.selinux", Space::Security), Err(errno::EPERM));
         assert!(!user.shows(b"trusted.x") && user.shows(b"user.x") && !user.shows(b"org.fwe.dev"));
-        let node = Who { admin: true, setfcap: true, plain: false };
+        let read_only = Kind { plain: true, kept: Some(0o444) };
+        let user = Who { kind: read_only, ..user };
+        assert_eq!(user.may_write(b"user.x", Space::User), Err(errno::EACCES));
+        assert_eq!(user.may_read(Space::User), Ok(()));
+        let node = Kind { plain: false, kept: None };
+        let node = Who { admin: true, setfcap: true, read_any: true, write_any: true, kind: node };
         assert_eq!(node.may_write(b"user.x", Space::User), Err(errno::EPERM));
         assert_eq!(node.may_read(Space::User), Err(errno::ENODATA));
         assert_eq!(node.may_write(b"trusted.x", Space::Trusted), Ok(()));
@@ -288,7 +321,13 @@ mod tests {
         std::fs::write(&dir, b"").unwrap();
         let path = CString::new(dir.to_str().unwrap()).unwrap();
         let t = Target::Path(&path);
-        let who = Who { admin: true, setfcap: true, plain: true };
+        let who = Who {
+            admin: true,
+            setfcap: true,
+            read_any: true,
+            write_any: true,
+            kind: Kind { plain: true, kept: None },
+        };
         set(&t, b"user.a", b"1", 0).unwrap();
         set(&t, b"trusted.b", b"22", CREATE).unwrap();
         assert_eq!(set(&t, b"trusted.b", b"3", CREATE), Err(errno::EEXIST));

@@ -3692,6 +3692,27 @@ fn subreaper_adopts_orphans() {
     );
 }
 
+/// A child killed outright while its parent lives is that parent's zombie;
+/// once the parent ends, the subreaper is sent `SIGCHLD` for it and reaps
+/// it as killed.
+#[test]
+fn subreaper_adopts_a_killed_zombie() {
+    assert_eq!(
+        namespaces("subreaper-zombie"),
+        "SIGCHLD for the killed orphan: true\nreaped it: true, killed by 9\n"
+    );
+}
+
+/// A pid namespace's init cannot be killed with `SIGKILL` from inside its
+/// namespace, by itself or a child, as Linux shields it.
+#[test]
+fn pid_namespace_init_is_unkillable_from_inside() {
+    assert_eq!(
+        namespaces("init-unkillable"),
+        "init kills itself: 0\nchild kills init: 0\ninit lives\ninit exited 4\n"
+    );
+}
+
 /// A pid namespace's init adopts the orphans in it, and when it ends, or
 /// is killed, the rest of its namespace is killed.
 #[test]
@@ -3766,6 +3787,20 @@ fn seqpacket_listener() {
         "bind: ok\ngot 3 \"one\" cut false\ngot 3 \"two\" cut false\n\
          got 5 \"hello\" cut true\nnothing yet: 0\npeer gone: 1 in true hup true\n\
          end of file: 0\n"
+    );
+}
+
+/// `SOCK_SEQPACKET` messages bigger than a host socket's default buffers
+/// are sent and taken without blocking, and looked at whole first; a bad
+/// buffer is `EFAULT`; a socket passed with `SCM_RIGHTS` is one of its kind
+/// in the receiver too.
+#[test]
+fn seqpacket_large_peeked_and_passed() {
+    assert_eq!(
+        containers("seqpacket-more"),
+        "non-blocking send: 20000\npeek: 20000 same true\ntake: 20000 same true\n\
+         nothing left: -1\nbad buffer: -1 EFAULT\npassed: 1\nreceived socket type: 5\n\
+         through it: 2 \"m1\"\nthrough it: 3 \"m22\"\n"
     );
 }
 

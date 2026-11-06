@@ -114,7 +114,7 @@ unsafe fn to_host(
         AF_UNIX => return unix_to_host(&src, out, follow),
         _ => return Err(err(errno::EAFNOSUPPORT)),
     };
-    Ok(HostAddr { len, dir: None })
+    Ok(HostAddr { len, dir: None, guest: Vec::new() })
 }
 
 /// A host socket address [`to_host`] made: its length, and for a Unix path
@@ -123,6 +123,8 @@ unsafe fn to_host(
 struct HostAddr {
     len: libc::socklen_t,
     dir: Option<std::os::fd::OwnedFd>,
+    /// For such a path, the guest's: what the host will not report back.
+    guest: Vec<u8>,
 }
 
 #[cfg(target_os = "macos")]
@@ -229,7 +231,7 @@ fn unix_to_host(src: &[u8], out: &mut [u8; SOCKADDR_MAX], follow: bool) -> Resul
         {
             out[0] = 2;
         }
-        return Ok(HostAddr { len: 2, dir });
+        return Ok(HostAddr { len: 2, dir, guest: Vec::new() });
     }
     out[2..2 + host.len()].copy_from_slice(&host);
     out[2 + host.len()] = 0;
@@ -238,7 +240,12 @@ fn unix_to_host(src: &[u8], out: &mut [u8; SOCKADDR_MAX], follow: bool) -> Resul
     {
         out[0] = total as u8;
     }
-    Ok(HostAddr { len: total as libc::socklen_t, dir })
+    let guest = if dir.is_some() {
+        raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(HostAddr { len: total as libc::socklen_t, dir, guest })
 }
 
 /// Write a host `sockaddr` back to a guest buffer in Linux layout, honoring the
@@ -358,7 +365,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     }
     apply_sock_flags(fd, type_);
     if seqpacket {
-        crate::fdmarks::mark(fd, crate::fdmarks::Mark::SeqPacket);
+        crate::seqpacket::make(fd);
     }
     fd as i64
 }
@@ -388,8 +395,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     apply_sock_flags(fds[0], type_);
     apply_sock_flags(fds[1], type_);
     if seqpacket {
-        crate::fdmarks::mark(fds[0], crate::fdmarks::Mark::SeqPacket);
-        crate::fdmarks::mark(fds[1], crate::fdmarks::Mark::SeqPacket);
+        crate::seqpacket::make(fds[0]);
+        crate::seqpacket::make(fds[1]);
     }
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
@@ -420,6 +427,9 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
         Err(e) => return err(e),
     };
     let r = ret(bind_or_connect(fd as i32, &hb, &a, true) as i64);
+    if r == 0 && a.dir.is_some() {
+        remember_name(fd as i32, true, &a.guest);
+    }
     if r == 0
         && let Some(plan) = plan
     {
@@ -433,8 +443,21 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
         if let Ok(name) = std::ffi::CString::new(&hb[2..end]) {
             use std::os::fd::AsRawFd;
             let dir = a.dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+            // Not through a link another thread may have put in its place.
             // SAFETY: a NUL-terminated name, relative to a live directory.
-            unsafe { libc::fchmodat(dir, name.as_ptr(), mode as libc::mode_t, 0) };
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
+                    && st.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                {
+                    libc::fchmodat(
+                        dir,
+                        name.as_ptr(),
+                        mode as libc::mode_t,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    );
+                }
+            };
         }
     }
     r
@@ -502,7 +525,32 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
         return err(e);
     }
-    ret(bind_or_connect(fd as i32, &hb, &a, false) as i64)
+    let r = ret(bind_or_connect(fd as i32, &hb, &a, false) as i64);
+    if r == 0 && a.dir.is_some() {
+        remember_name(fd as i32, false, &a.guest);
+    }
+    r
+}
+
+/// Unix sockets bound (`local`) or connected to a path the host knows only
+/// relative to its directory: by descriptor and inode, the guest's path,
+/// which `getsockname` and `getpeername` report.
+#[allow(clippy::type_complexity)]
+static NAMES: std::sync::Mutex<Vec<(i32, u64, bool, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+fn remember_name(fd: i32, local: bool, guest: &[u8]) {
+    let Some(ino) = inode(fd) else { return };
+    let mut n = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    n.retain(|&(f, _, l, _)| !(f == fd && l == local));
+    n.push((fd, ino, local, guest.to_vec()));
+}
+
+/// The guest path [`remember_name`] kept for `fd`, if it still names that
+/// socket.
+fn remembered_name(fd: i32, local: bool) -> Option<Vec<u8>> {
+    let ino = inode(fd)?;
+    let n = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    n.iter().find(|&&(f, i, l, _)| f == fd && i == ino && l == local).map(|e| e.3.clone())
 }
 
 /// `accept4(fd, addr, addrlen, flags)`; `accept` is this with `flags == 0`.
@@ -527,7 +575,7 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.
-        crate::fdmarks::mark(r, crate::fdmarks::Mark::SeqPacket);
+        crate::seqpacket::make(r);
     }
     if want && name_to_guest(&hb, hl, addr, addrlen).is_err() {
         // SAFETY: closing the connection just accepted.
@@ -556,6 +604,17 @@ pub unsafe fn getname(fd: u64, addr: u64, addrlen: u64, peer: bool) -> i64 {
     };
     if r < 0 {
         return last_error();
+    }
+    if let Some(path) = remembered_name(fd as i32, !peer) {
+        // A Linux `sockaddr_un` with the guest's path, cut to the buffer.
+        let mut name = (AF_UNIX as u16).to_ne_bytes().to_vec();
+        name.extend_from_slice(&path);
+        name.push(0);
+        let cap: u32 = guest!(uaccess::read(addrlen));
+        let n = (cap as usize).min(name.len());
+        guest!(uaccess::write_from(addr, &name[..n]));
+        guest!(uaccess::write(addrlen, name.len() as u32));
+        return 0;
     }
     crate::netns::to_guest(fd as i32, &mut hb, !peer);
     guest!(name_to_guest(&hb, hl, addr, addrlen));
@@ -639,7 +698,7 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         (std::ptr::null(), 0)
     };
     if crate::seqpacket::is(fd as i32) {
-        let v = libc::iovec { iov_base: buf as *mut libc::c_void, iov_len: len as usize };
+        let v = guest!(uaccess::host_buffer(buf, len, false));
         return crate::seqpacket::send(fd as i32, &[v], (std::ptr::null_mut(), 0), hflags);
     }
     // SAFETY: valid buffer and optional host sockaddr.
@@ -659,7 +718,7 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
         if addr != 0 && addrlen != 0 {
             guest!(uaccess::write(addrlen, 0u32));
         }
-        let v = libc::iovec { iov_base: buf as *mut libc::c_void, iov_len: len as usize };
+        let v = guest!(uaccess::host_buffer(buf, len, true));
         return crate::seqpacket::recv(fd as i32, &[v], (std::ptr::null_mut(), 0), flags, hflags)
             .result;
     }
@@ -1036,8 +1095,10 @@ fn scm_host_to_linux(
             out[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
             out[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
             for i in 0..nfds {
-                out[16 + i * 4..20 + i * 4]
-                    .copy_from_slice(&host[off + 12 + i * 4..off + 16 + i * 4]);
+                let fd = &host[off + 12 + i * 4..off + 16 + i * 4];
+                out[16 + i * 4..20 + i * 4].copy_from_slice(fd);
+                // A SOCK_SEQPACKET socket of fwe's is one here too.
+                crate::seqpacket::adopt(i32::from_ne_bytes(fd.try_into().unwrap()));
             }
             uaccess::write_from(dst, &out)?;
             return Ok((linux_len as u64, false));
