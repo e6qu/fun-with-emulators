@@ -782,7 +782,10 @@ first, its directories with it (a regular file as an APFS clone, which
 shares its blocks until written); a removal of what a lower layer has
 leaves a whiteout; `getdents64` lists the layers merged. A descriptor of a
 lower layer's file that is then changed through it (`fchmod` and the like)
-is moved onto the copy, as Linux moves it. Each change is built in the
+is moved onto the copy, as Linux moves it: the copy records the file it
+is of. A descriptor opened through an overlay keeps that overlay's layers,
+so it is the overlay's file even once the mount has gone or moved, and a
+layer's directory opened as itself is never taken for the overlay's. Each change is built in the
 work directory and moved into place with one atomic rename, so other
 processes see it whole. The overlay's own attributes are hidden from its
 files, and a mount option asking for what fwe does not do (`metacopy=on`,
@@ -959,9 +962,11 @@ those items.
   another overlay); a directory a lower layer has cannot be renamed
   (`EXDEV`, as with `redirect_dir=off`); a rename that leaves a whiteout
   behind, and a `bind` over one, are two host steps, between which another
-  process can see the lower layer's file at that name; a directory's
-  listing is read from where it was opened, not from the directory itself
-  if it has been moved since.
+  process can see the lower layer's file at that name; a lower layer's
+  file that another was renamed over, changed through a descriptor of it,
+  fails with `ESTALE`, and one moved onto its copy-up loses the
+  record locks held through it; descriptors of one overlay directory
+  (`dup`, `fork`) each keep their own place in its listing.
 - **Namespaces:** a network namespace has a loopback interface only (no
   `veth`, no netlink), and a datagram to one of its ports nobody bound by
   number goes to the host loopback port of that number; the initial

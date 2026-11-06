@@ -177,9 +177,10 @@ impl<P: Platform> Kernel<P> {
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
                     r
-                } else if let Some(r) = crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
+                    && is_dir_fd(a[0] as i32)
                 {
-                    r
+                    crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 } else {
                     // SAFETY: plain host call; SEEK_SET/CUR/END match.
                     ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
@@ -1588,6 +1589,14 @@ fn uid_in(arg: u64, gid: bool) -> Result<u32, i32> {
         return Ok(id);
     }
     crate::userns::from_ns(id, gid).ok_or(errno::EINVAL)
+}
+
+/// Whether `fd` is open on a directory.
+fn is_dir_fd(fd: i32) -> bool {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR }
 }
 
 #[cfg(test)]

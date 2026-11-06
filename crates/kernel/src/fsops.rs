@@ -240,6 +240,13 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_openat_bytes(&mut self, dirfd: u64, path: &[u8], flags: u64, mode: u64) -> i64 {
+        // With O_PATH every flag but these is ignored, as on Linux: nothing
+        // is made, truncated or opened for writing.
+        let flags = if flags & fcntl::O_PATH != 0 {
+            flags & (fcntl::O_PATH | fcntl::O_CLOEXEC | fcntl::O_DIRECTORY | fcntl::O_NOFOLLOW)
+        } else {
+            flags
+        };
         let follow_final = flags & fcntl::O_NOFOLLOW == 0
             && flags & (fcntl::O_CREAT | fcntl::O_EXCL) != fcntl::O_CREAT | fcntl::O_EXCL;
         let mut resolved = match self.fs().resolve(dirfd as i32, path, follow_final) {
@@ -409,14 +416,17 @@ impl<P: Platform> Kernel<P> {
                             ns,
                             resolved.mount_flags,
                             resolved.fstype,
+                            None,
                         );
                     }
                     return device;
                 }
             }
         }
-        if let Some(ns) = resolved.ns_path {
-            crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype);
+        let layers = resolved.ovl.as_ref().map(|o| o.layers.clone());
+        if resolved.ns_path.is_some() || layers.is_some() {
+            let ns = resolved.ns_path.unwrap_or_default();
+            crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype, layers);
         }
         fd as i64
     }
@@ -783,6 +793,10 @@ impl<P: Platform> Kernel<P> {
                     major: crate::devnodes::major(dev),
                     minor: crate::devnodes::minor(dev),
                 };
+                if r.ovl.is_some() && kind == S_IFCHR && node.major == 0 && node.minor == 0 {
+                    // A whiteout is the overlay's own, as on Linux.
+                    return err(errno::EPERM);
+                }
                 if let Err(e) = crate::cgroupfs::check_device(
                     crate::bpf::BPF_DEVCG_ACC_MKNOD,
                     node.bpf_type(),
@@ -963,6 +977,11 @@ impl<P: Platform> Kernel<P> {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
         }
+        if old.ovl.is_some() != new.ovl.is_some() {
+            // One in an overlay, the other not (a directory fwe cannot
+            // place): not one filesystem.
+            return err(errno::EXDEV);
+        }
         if let (Some(a), Some(b)) = (&old.ovl, &new.ovl) {
             if flags & RENAME_WHITEOUT != 0 {
                 return err(errno::EINVAL);
@@ -1129,18 +1148,11 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = unsafe { crate::synthdir::getdents64(fd as i32, buf, count) } {
             return r;
         }
-        if let Some(o) =
-            crate::fdmarks::origin(fd as i32).filter(|o| o.fstype == crate::mounts::FsType::Overlay)
-        {
-            // The overlay's directory where it was opened: its layers'
-            // entries merged.
-            let table = self.fs().mounts();
+        if let Some(l) = crate::fdmarks::origin(fd as i32).and_then(|o| o.ovl) {
+            // The overlay's directory: its layers' entries merged.
             return crate::overlay::getdents64(fd as i32, buf, count, || {
-                let (m, rest) = table.locate(&o.ns_path);
-                let crate::mounts::Source::Overlay(l) = &m.source else {
-                    return Err(errno::ENOENT);
-                };
-                crate::overlay::list(&crate::overlay::open(l, &m.fs_path(&rest))?)
+                let path = crate::overlay::path_of(&l, fd as i32).ok_or(errno::ENOENT)?;
+                crate::overlay::list(&crate::overlay::open(&l, &path)?)
             });
         }
         // What fwe keeps in a cgroup's directory is its own.
@@ -1529,6 +1541,11 @@ impl<P: Platform> Kernel<P> {
             Ok(st) => st,
             Err(_) => return op(),
         };
+        if crate::fs::is_empty_dir(&st) {
+            // What a name an overlay does not show is resolved in: nothing
+            // is ever made there.
+            return err(errno::EACCES);
+        }
         let perm = crate::modes::perm_of(&st);
         if !self.passes_dac(2) {
             if crate::modes::marked(&st) && !crate::modes::owner_allows(perm, 2 | 1) {
@@ -1549,17 +1566,9 @@ impl<P: Platform> Kernel<P> {
         if o.flags & crate::mounts::ms::RDONLY != 0 {
             return Err(errno::EROFS);
         }
-        let Some(layers) = self.fd_overlay(fd) else { return Ok(()) };
-        let upper = layers.upper.as_deref().ok_or(errno::EROFS)?;
-        let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
-        if crate::mounts::under(&host, upper).is_some() {
-            return Ok(());
-        }
-        // In a lower layer: the file its path shows now, copied up.
-        let Some(guest) = self.fs().from_ns(&o.ns_path) else { return Err(errno::EXDEV) };
-        let mut r = self.fs().resolve(fcntl::AT_FDCWD as i32, &guest, false)?;
-        r.prepare(Change::Modify)?;
-        let name = r.name_c()?;
+        let Some(layers) = o.ovl.clone() else { return Ok(()) };
+        // The descriptor's own file, copied up if it is a lower one.
+        let Some((up, name)) = crate::overlay::copy_up_open(&layers, fd)? else { return Ok(()) };
         // SAFETY: plain host calls on an open descriptor.
         let (status, fd_flags) =
             unsafe { (libc::fcntl(fd, libc::F_GETFL), libc::fcntl(fd, libc::F_GETFD)) };
@@ -1570,7 +1579,7 @@ impl<P: Platform> Kernel<P> {
             | libc::O_CLOEXEC
             | if dir { libc::O_DIRECTORY } else { 0 };
         // SAFETY: a NUL-terminated name in a live directory.
-        let copy = unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), open_flags) };
+        let copy = unsafe { libc::openat(up.as_raw_fd(), name.as_ptr(), open_flags) };
         if copy < 0 {
             return Err(host::errno_to_linux(host::last_errno()));
         }
@@ -1588,18 +1597,16 @@ impl<P: Platform> Kernel<P> {
             }
             libc::fcntl(fd, libc::F_SETFD, fd_flags);
         }
-        crate::fdmarks::opened(fd, o.ns_path, o.flags, o.fstype);
+        crate::fdmarks::opened(fd, o.ns_path, o.flags, o.fstype, o.ovl);
+        if dir {
+            crate::overlay::moved(fd);
+        }
         Ok(())
     }
 
     /// The layers of the overlay `fd` was opened in, if it was.
     fn fd_overlay(&self, fd: i32) -> Option<std::sync::Arc<crate::overlay::Layers>> {
-        let o =
-            crate::fdmarks::origin(fd).filter(|o| o.fstype == crate::mounts::FsType::Overlay)?;
-        match &self.fs().mounts().locate(&o.ns_path).0.source {
-            crate::mounts::Source::Overlay(l) => Some(l.clone()),
-            _ => None,
-        }
+        crate::fdmarks::origin(fd)?.ovl
     }
 
     /// `EOPNOTSUPP` for an overlay's own attributes on its files (in

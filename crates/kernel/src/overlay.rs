@@ -261,6 +261,66 @@ fn make_whiteout(dir: i32, name: &CStr) -> Result<(), i32> {
     crate::devnodes::make(dir, name, node, 0o600)
 }
 
+/// The attribute of a copied-up file naming the lower file it was copied
+/// from (its device and inode): fwe's own, which no guest call sees.
+const ORIGIN: &[u8] = b"org.fwe.overlay.origin";
+
+#[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
+fn id_bytes(st: &libc::stat) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&(st.st_dev as u64).to_le_bytes());
+    b[8..].copy_from_slice(&(st.st_ino as u64).to_le_bytes());
+    b
+}
+
+/// The path in the overlay `l` of what descriptor `fd` (open on a file of
+/// one of its layers) is: where it is now in its layer, which a rename
+/// moves it with.
+pub fn path_of(l: &Layers, fd: i32) -> Option<Vec<u8>> {
+    let host = crate::fs::host_path_of(fd)?;
+    l.paths().find_map(|p| {
+        let rest = crate::mounts::under(&host, p)?;
+        Some(if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() })
+    })
+}
+
+/// The file descriptor `fd` (of one of `l`'s layers) is open on, copied up
+/// if it is a lower one: the upper layer's directory holding the copy and
+/// its name, or `None` if `fd` is of the upper layer already. `ESTALE` if
+/// the file is not where the overlay shows it any more (renamed over).
+pub fn copy_up_open(l: &Layers, fd: i32) -> Result<Option<(Arc<OwnedFd>, CString)>, i32> {
+    let upper = l.upper.as_deref().ok_or(errno::EROFS)?;
+    let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
+    if crate::mounts::under(&host, upper).is_some() {
+        return Ok(None);
+    }
+    let path = path_of(l, fd).ok_or(errno::ESTALE)?;
+    let (parent, name) = split(&path);
+    let own = id_bytes(&stat_fd(fd)?);
+    let n = cstr(&name)?;
+    let d = open(l, &parent).map_err(|_| errno::ESTALE)?;
+    // Copied up already: the copy is the one that says it is of `fd`'s.
+    let shown = match lookup(l, &d, &n)? {
+        Found::Other { layer, .. } => d.fds[layer].clone(),
+        Found::Dir(child) => d.fds[child.top().0].clone(),
+        Found::Missing => None,
+    };
+    let Some(shown) = shown else { return Err(errno::ESTALE) };
+    let of = |dir: i32| {
+        open_at(dir, &n, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK).ok().is_some_and(
+            |f| {
+                stat_fd(f.as_raw_fd()).is_ok_and(|st| id_bytes(&st) == own)
+                    || crate::xattr::get_host(f.as_raw_fd(), ORIGIN).is_ok_and(|v| v == own)
+            },
+        )
+    };
+    if !of(shown.as_raw_fd()) {
+        return Err(errno::ESTALE);
+    }
+    let up = copy_up(l, &path)?;
+    Ok(Some((up, n)))
+}
+
 /// One directory of the overlay: the directory of that path in each layer
 /// that has it and shows it (`None` for one that does not, or that an
 /// opaque directory or a whiteout above hides).
@@ -608,6 +668,14 @@ fn copy_one(
         // A socket's node is made only by binding one there.
         _ => return Err(errno::EOPNOTSUPP),
     }
+    if kind != libc::S_IFLNK {
+        // Which lower file it is a copy of, for a descriptor of that file
+        // to find its copy ([`copy_up_open`]).
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        if let Ok(made) = open_at(w, &tmp, flags) {
+            let _ = crate::xattr::set_host(made.as_raw_fd(), ORIGIN, &id_bytes(st));
+        }
+    }
     place(w, &tmp, dst_dir, name, kind == libc::S_IFDIR)
 }
 
@@ -901,7 +969,17 @@ pub fn rename(
     let up_to = if how == Rename::Exchange { copy_up(l, &to_path)? } else { upper_dir(l, to.0)? };
     let (uf, ut) = (up_from.as_raw_fd(), up_to.as_raw_fd());
     if how == Rename::Exchange {
-        // Both names stay; each layer below still shows what it showed.
+        // Both names stay. A directory moved to a name the lower layers
+        // have hides theirs.
+        for (found, dir, name, lower) in [
+            (&src, uf, &fname, lower_has(l, &td, &tname)?),
+            (&dst, ut, &tname, lower_has(l, &fd, &fname)?),
+        ] {
+            if lower && matches!(found, Found::Dir(_)) {
+                let moving = open_dir(dir, name)?;
+                crate::xattr::set_host(moving.as_raw_fd(), l.opaque_attr(), b"y")?;
+            }
+        }
         return rename_at(uf, &fname, ut, &tname, Rename::Exchange);
     }
     let src_lower = lower_has(l, &fd, &fname)?;
@@ -994,7 +1072,8 @@ pub fn list(d: &Dir) -> Result<Vec<Entry>, i32> {
 struct Cursor {
     /// The directory, to tell a listing from a reused descriptor number's.
     id: (u64, u64),
-    entries: Vec<Entry>,
+    /// Read when first needed, and again after a seek to the start.
+    entries: Option<Vec<Entry>>,
     offset: usize,
 }
 
@@ -1029,10 +1108,15 @@ pub fn getdents64(
     entries: impl FnOnce() -> Result<Vec<Entry>, i32>,
 ) -> i64 {
     const HEADER: usize = fwe_abi::DIRENT64_HEADER;
-    let id = identity(fd);
-    let fresh = cursors(|m| m.get(&fd).is_none_or(|c| Some(c.id) != id));
-    if fresh {
-        let Some(id) = id else { return fwe_abi::err(errno::EBADF) };
+    let Some(id) = identity(fd) else { return fwe_abi::err(errno::EBADF) };
+    let unread = cursors(|m| {
+        let c = m.entry(fd).or_insert(Cursor { id, entries: None, offset: 0 });
+        if c.id != id {
+            *c = Cursor { id, entries: None, offset: 0 };
+        }
+        c.entries.is_none()
+    });
+    if unread {
         let mut all = vec![
             Entry { name: b".".to_vec(), kind: libc::DT_DIR, ino: id.1 },
             Entry { name: b"..".to_vec(), kind: libc::DT_DIR, ino: 1 },
@@ -1041,13 +1125,18 @@ pub fn getdents64(
             Ok(e) => all.extend(e),
             Err(err) => return fwe_abi::err(err),
         }
-        cursors(|m| m.insert(fd, Cursor { id, entries: all, offset: 0 }));
+        cursors(|m| {
+            if let Some(c) = m.get_mut(&fd) {
+                c.entries = Some(all);
+            }
+        });
     }
     cursors(|m| {
         let Some(c) = m.get_mut(&fd) else { return fwe_abi::err(errno::EBADF) };
+        let Some(entries) = &c.entries else { return fwe_abi::err(errno::EBADF) };
         let mut out = Vec::new();
         let mut i = c.offset;
-        while let Some(ent) = c.entries.get(i) {
+        while let Some(ent) = entries.get(i) {
             let reclen = (HEADER + ent.name.len() + 1 + 7) & !7;
             if out.len() + reclen > count as usize {
                 break;
@@ -1062,7 +1151,7 @@ pub fn getdents64(
             rec[HEADER..HEADER + ent.name.len()].copy_from_slice(&ent.name);
             i += 1;
         }
-        if out.is_empty() && i < c.entries.len() {
+        if out.is_empty() && i < entries.len() {
             return fwe_abi::err(errno::EINVAL);
         }
         if let Err(err) = crate::uaccess::write_from(buf, &out) {
@@ -1073,32 +1162,40 @@ pub fn getdents64(
     })
 }
 
-/// `lseek` on an overlay directory: an offset is an index into its
-/// listing, and seeking to 0 reads the directory again. `None` if `fd`
-/// has no listing yet (the host's offset is then the one to move, and is
-/// 0 when it is first read).
-pub fn lseek(fd: i32, offset: i64, whence: i32) -> Option<i64> {
-    let id = identity(fd);
+/// `lseek` on overlay directory `fd`: an offset is an index into its
+/// listing, and seeking to 0 reads the directory again.
+pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    let Some(id) = identity(fd) else { return fwe_abi::err(errno::EBADF) };
     cursors(|m| {
-        if m.get(&fd).is_some_and(|c| Some(c.id) != id) {
-            m.remove(&fd);
+        let c = m.entry(fd).or_insert(Cursor { id, entries: None, offset: 0 });
+        if c.id != id {
+            *c = Cursor { id, entries: None, offset: 0 };
         }
-        let c = m.get_mut(&fd)?;
         let to = match whence {
             libc::SEEK_SET => offset,
             libc::SEEK_CUR => c.offset as i64 + offset,
-            _ => return Some(fwe_abi::err(errno::EINVAL)),
+            _ => return fwe_abi::err(errno::EINVAL),
         };
         if to < 0 {
-            return Some(fwe_abi::err(errno::EINVAL));
+            return fwe_abi::err(errno::EINVAL);
         }
         if to == 0 {
-            m.remove(&fd);
-            return Some(0);
+            c.entries = None;
         }
         c.offset = to as usize;
-        Some(to)
+        to
     })
+}
+
+/// Directory `fd` was moved onto its copy-up: its listing is the same
+/// directory's, read on from where it was.
+pub fn moved(fd: i32) {
+    let Some(id) = identity(fd) else { return };
+    cursors(|m| {
+        if let Some(c) = m.get_mut(&fd) {
+            c.id = id;
+        }
+    });
 }
 
 /// `fd` was closed (or replaced): its listing goes.

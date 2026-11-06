@@ -3845,6 +3845,25 @@ fn overlay_mounts() {
     );
 }
 
+/// An overlay keeps its layers' own directories theirs, makes nothing for
+/// `O_PATH`, follows a directory moved since it was opened, keeps a
+/// descriptor on its own file when another is renamed over it, reads a
+/// listing on across its directory's copy-up and seeks in it, hides what a
+/// whiteout hid when directories are exchanged, refuses a whiteout made by
+/// hand, never writes a lower layer through a descriptor that outlived the
+/// mount, and refuses an upper layer in a read-only mount.
+#[test]
+fn overlay_edge_cases() {
+    assert_eq!(
+        containers("overlay-edges"),
+        "mount: ok\nlayer's own: true not upper: true\nO_PATH|O_CREAT: ENOENT then: ENOENT\n\
+         moved dir: true\nrenamed over: ESTALE still reads: lower\n\
+         listing across copy-up: 8 entries, 8 distinct\nseek to 3: true\n\
+         exchange: ok h holds: []\nmknod 0:0: EPERM\nafter unmount: upper true lower false\n\
+         read-only upper: EROFS\n"
+    );
+}
+
 /// Root passes permission bits, also of modes that deny every access, which
 /// `stat` shows as they are; a process without the capabilities is held to
 /// them.

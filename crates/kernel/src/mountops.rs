@@ -122,12 +122,21 @@ impl<P: Platform> Kernel<P> {
     /// a mount of host directories (`EINVAL` for one in an overlay or in
     /// a filesystem of fwe's).
     fn host_dir(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        self.host_dir_rw(path, false)
+    }
+
+    /// [`host_dir`](Self::host_dir) of a directory to be written to:
+    /// `EROFS` in a read-only mount.
+    fn host_dir_rw(&self, path: &[u8], write: bool) -> Result<Vec<u8>, i32> {
         let (ns, is_dir) = self.mount_path(path, true)?;
         if !is_dir {
             return Err(errno::ENOTDIR);
         }
         let table = self.fs().mounts();
         let (m, rest) = table.locate(&ns);
+        if write && m.read_only() {
+            return Err(errno::EROFS);
+        }
         m.host_path(&rest).ok_or(errno::EINVAL)
     }
 
@@ -136,8 +145,8 @@ impl<P: Platform> Kernel<P> {
     fn overlay_layers(&self, data: &[u8]) -> Result<crate::overlay::Layers, i32> {
         let o = crate::overlay::parse(data)?;
         let lowers = o.lowers.iter().map(|p| self.host_dir(p)).collect::<Result<Vec<_>, _>>()?;
-        let upper = o.upper.as_deref().map(|p| self.host_dir(p)).transpose()?;
-        let work = o.work.as_deref().map(|p| self.host_dir(p)).transpose()?;
+        let upper = o.upper.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
+        let work = o.work.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
         if let (Some(u), Some(w)) = (&upper, &work) {
             // Separate directories of one filesystem.
             let dev = |p: &[u8]| -> Result<u64, i32> {

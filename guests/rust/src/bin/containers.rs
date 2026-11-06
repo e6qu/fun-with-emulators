@@ -18,6 +18,7 @@ const EXDEV: i32 = 18;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
+const ESTALE: i32 = 116;
 const MSG_PEEK: i32 = 2;
 const MSG_DONTWAIT: i32 = 0x40;
 const O_NONBLOCK: i32 = 0o4000;
@@ -34,6 +35,7 @@ const O_RDONLY: i32 = 0;
 const O_WRONLY: i32 = 1;
 const O_CREAT: i32 = 0o100;
 const O_DIRECTORY: i32 = 0o40000;
+const O_PATH: i32 = 0o10000000;
 const EPOLLIN: u32 = 1;
 const EPOLLHUP: u32 = 0x10;
 const EPOLLRDHUP: u32 = 0x2000;
@@ -110,6 +112,11 @@ unsafe extern "C" {
     fn statfs(p: *const std::ffi::c_char, b: *mut u64) -> i32;
     fn rmdir(p: *const std::ffi::c_char) -> i32;
     fn alarm(s: u32) -> u32;
+    fn openat(d: i32, p: *const std::ffi::c_char, f: i32, ...) -> i32;
+    fn pread(fd: i32, b: *mut u8, n: usize, off: i64) -> isize;
+    fn lseek(fd: i32, off: i64, wh: i32) -> i64;
+    fn mknod(p: *const std::ffi::c_char, m: u32, d: u64) -> i32;
+    fn syscall(n: i64, ...) -> i64;
     fn pipe(fds: *mut i32) -> i32;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
@@ -133,6 +140,7 @@ fn name(e: i32) -> &'static str {
         ENOTEMPTY => "ENOTEMPTY",
         EROFS => "EROFS",
         EINVAL => "EINVAL",
+        ESTALE => "ESTALE",
         _ => "?",
     }
 }
@@ -196,6 +204,29 @@ fn io<T>(r: std::io::Result<T>) -> &'static str {
 
 fn text(p: &str) -> String {
     std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{}>", name(e.raw_os_error().unwrap_or(0))))
+}
+
+/// The names `getdents64` gives for `fd`, `size` bytes at a time, until
+/// there are `max` or more.
+fn dents(fd: i32, size: usize, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; size];
+    while out.len() < max {
+        // SAFETY: a valid buffer of `size` bytes.
+        let n = unsafe { syscall(61, fd, buf.as_mut_ptr(), size) };
+        if n <= 0 {
+            break;
+        }
+        let mut i = 0usize;
+        while i < n as usize {
+            let reclen = u16::from_ne_bytes([buf[i + 16], buf[i + 17]]) as usize;
+            let name = &buf[i + 19..i + reclen];
+            let end = name.iter().position(|&b| b == 0).unwrap();
+            out.push(String::from_utf8_lossy(&name[..end]).into_owned());
+            i += reclen;
+        }
+    }
+    out
 }
 
 fn main() {
@@ -586,6 +617,85 @@ fn main() {
                 waitpid(child, &mut status, 0);
                 println!("thread got: {}", waiting.join().unwrap());
                 println!("child got one: {}", status == 0);
+            }
+            // What an overlay must not do: write a layer through a layer's
+            // own directory, a descriptor that outlived its mount, or a
+            // name it does not show; lose track of a moved directory or a
+            // listing's place; show what a whiteout hid.
+            Some("overlay-edges") => {
+                for d in ["l1/d", "l1/e", "l1/lst", "l1/h", "u", "w", "m", "ro/up", "ro/work", "rm"] {
+                    std::fs::create_dir_all(format!("/tmp/{d}")).unwrap();
+                }
+                std::fs::write("/tmp/l1/a", "lower").unwrap();
+                std::fs::write("/tmp/l1/h/secret", "s").unwrap();
+                for i in 1..=6 {
+                    std::fs::write(format!("/tmp/l1/lst/e{i}"), "").unwrap();
+                }
+                let opts = b"lowerdir=/tmp/l1,upperdir=/tmp/u,workdir=/tmp/w\0";
+                let mnt = || mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
+                println!("mount: {}", res(mnt() as i64));
+                // A layer's directory, opened as itself.
+                let fd = open(c("/tmp/l1/d").as_ptr(), O_RDONLY | O_DIRECTORY);
+                close(openat(fd, c("own").as_ptr(), O_WRONLY | O_CREAT, 0o644));
+                close(fd);
+                println!("layer's own: {} not upper: {}", std::path::Path::new("/tmp/l1/d/own").exists(), !std::path::Path::new("/tmp/u/d/own").exists());
+                // O_PATH makes nothing.
+                let r = open(c("/tmp/m/zz").as_ptr(), O_PATH | O_CREAT, 0o644);
+                println!("O_PATH|O_CREAT: {} then: {}", res(r as i64), res(open(c("/tmp/m/d/zz").as_ptr(), O_RDONLY) as i64));
+                // A directory moved, then one made in its place.
+                std::fs::create_dir("/tmp/m/n").unwrap();
+                let fd = open(c("/tmp/m/n").as_ptr(), O_RDONLY | O_DIRECTORY);
+                std::fs::rename("/tmp/m/n", "/tmp/m/n2").unwrap();
+                std::fs::create_dir("/tmp/m/n").unwrap();
+                close(openat(fd, c("f").as_ptr(), O_WRONLY | O_CREAT, 0o644));
+                close(fd);
+                println!("moved dir: {}", std::path::Path::new("/tmp/m/n2/f").exists() && !std::path::Path::new("/tmp/m/n/f").exists());
+                // A lower file renamed over, then changed through its own
+                // descriptor.
+                let fd = open(c("/tmp/m/a").as_ptr(), O_RDONLY);
+                std::fs::write("/tmp/m/b", "upper-b").unwrap();
+                std::fs::rename("/tmp/m/b", "/tmp/m/a").unwrap();
+                let r = fchmod(fd, 0o600);
+                let mut buf = [0u8; 16];
+                let n = pread(fd, buf.as_mut_ptr(), 16, 0);
+                close(fd);
+                println!("renamed over: {} still reads: {}", res(r as i64), String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+                // A listing read on across its directory's copy-up, then
+                // sought.
+                let fd = open(c("/tmp/m/lst").as_ptr(), O_RDONLY | O_DIRECTORY);
+                let mut seen = dents(fd, 64, 3);
+                fchmod(fd, 0o755);
+                seen.extend(dents(fd, 4096, 100));
+                let mut sorted = seen.clone();
+                sorted.sort();
+                sorted.dedup();
+                println!("listing across copy-up: {} entries, {} distinct", seen.len(), sorted.len());
+                lseek(fd, 0, 0);
+                lseek(fd, 3, 0);
+                let after = dents(fd, 4096, 1);
+                println!("seek to 3: {}", after.first().is_some_and(|n| n != "." && n != ".."));
+                close(fd);
+                // RENAME_EXCHANGE of a directory onto a name a whiteout hid.
+                std::fs::remove_file("/tmp/m/h/secret").unwrap();
+                std::fs::remove_dir("/tmp/m/h").unwrap();
+                std::fs::write("/tmp/m/h", "file").unwrap();
+                std::fs::create_dir("/tmp/m/k").unwrap();
+                let r = syscall(276, -100i64, c("/tmp/m/k").as_ptr(), -100i64, c("/tmp/m/h").as_ptr(), 2u32);
+                println!("exchange: {} h holds: [{}]", res(r), names("/tmp/m/h"));
+                // A whiteout of one's own.
+                println!("mknod 0:0: {}", res(mknod(c("/tmp/m/wh").as_ptr(), 0o20000 | 0o644, 0) as i64));
+                // A descriptor that outlives its mount.
+                let fd = open(c("/tmp/m/e").as_ptr(), O_RDONLY | O_DIRECTORY);
+                umount2(c("/tmp/m").as_ptr(), 2);
+                close(openat(fd, c("late").as_ptr(), O_WRONLY | O_CREAT, 0o644));
+                close(fd);
+                println!("after unmount: upper {} lower {}", std::path::Path::new("/tmp/u/e/late").exists(), std::path::Path::new("/tmp/l1/e/late").exists());
+                // An upper layer in a read-only mount.
+                mount(c("/tmp/ro").as_ptr(), c("/tmp/rm").as_ptr(), std::ptr::null(), 4096, std::ptr::null());
+                mount(std::ptr::null(), c("/tmp/rm").as_ptr(), std::ptr::null(), 4096 | 32 | 1, std::ptr::null());
+                let opts = b"lowerdir=/tmp/l1,upperdir=/tmp/rm/up,workdir=/tmp/rm/work\0";
+                let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
+                println!("read-only upper: {}", res(r as i64));
             }
             other => panic!("unknown scenario {other:?}"),
         }

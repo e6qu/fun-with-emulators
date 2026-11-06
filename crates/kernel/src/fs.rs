@@ -970,12 +970,17 @@ impl Fs {
     /// Set the working directory to the host directory `fd` refers to.
     pub fn fchdir(&mut self, fd: i32) -> Result<(), i32> {
         let host = fd_path(fd).ok_or(errno::EBADF)?;
-        // A directory of an overlay is where it was opened: its host path
-        // is in one of the layers, which other overlays may share.
-        let opened = crate::fdmarks::origin(fd)
-            .filter(|o| o.fstype == FsType::Overlay)
-            .and_then(|o| self.from_ns(&o.ns_path));
-        match opened.or_else(|| self.host_to_guest(&host)) {
+        // A directory opened through an overlay is that overlay's: its host
+        // path is in one of the layers, which says nothing of where.
+        let table = self.mnt.table();
+        let opened = overlay_here(&table, &self.proc_root, fd)
+            .ok()
+            .flatten()
+            .and_then(|h| h.at)
+            .and_then(|(_, ns)| self.from_ns(&ns));
+        let overlaid = crate::fdmarks::origin(fd).is_some_and(|o| o.ovl.is_some());
+        let fallback = if overlaid { None } else { self.host_to_guest(&host) };
+        match opened.or(fallback) {
             Some(guest) => {
                 self.cwd = guest;
                 self.republish();
@@ -1019,20 +1024,42 @@ fn is_rootfs(m: &Mount, root_host: &[u8]) -> bool {
 /// deepest host-backed mount showing it that resolution enters.
 fn host_to_ns(table: &Table, host: &[u8]) -> Option<Vec<u8>> {
     let mut best: Option<(usize, Vec<u8>)> = None;
+    // Not through an overlay's layers: a layer's directory is the
+    // overlay's only when it was opened through the overlay, which its
+    // descriptor's record says ([`overlay_here`]).
     for m in &table.mounts {
-        for top in mount_tops(m) {
-            let Some(rest) = mounts::under(host, &top) else { continue };
-            let ns = mounts::join(&m.point, rest);
-            if table.locate(&ns).0.id != m.id {
-                // Covered by another mount there.
-                continue;
-            }
-            if best.as_ref().is_none_or(|(len, _)| top.len() > *len) {
-                best = Some((top.len(), ns));
-            }
+        let Some(top) = m.host_path(b"") else { continue };
+        let Some(rest) = mounts::under(host, &top) else { continue };
+        let ns = mounts::join(&m.point, rest);
+        if table.locate(&ns).0.id != m.id {
+            // Covered by another mount there.
+            continue;
+        }
+        if best.as_ref().is_none_or(|(len, _)| top.len() > *len) {
+            best = Some((top.len(), ns));
         }
     }
     best.map(|(_, ns)| ns)
+}
+
+/// Where descriptor `fd` is, if it was opened through an overlay: that
+/// overlay's directory at the path the descriptor is at in its layer, in
+/// the mount of that overlay that shows it inside the process's root (if
+/// one still does).
+fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, i32> {
+    let Some(l) = crate::fdmarks::origin(fd).and_then(|o| o.ovl) else { return Ok(None) };
+    let path = overlay::path_of(&l, fd).ok_or(errno::ENOENT)?;
+    let at = table.mounts.iter().find_map(|m| {
+        let Source::Overlay(ml) = &m.source else { return None };
+        if **ml != *l {
+            return None;
+        }
+        let rest = mounts::under(&path, &m.root)?;
+        let ns = mounts::join(&m.point, rest);
+        (table.locate(&ns).0.id == m.id && mounts::under(&ns, root_ns).is_some())
+            .then_some((m.id, ns))
+    });
+    Here::overlay(&l, path, at).map(Some)
 }
 
 /// Open the directory at `rest` (a path inside the mount, from its root)
@@ -1156,6 +1183,18 @@ fn empty_dir() -> Result<OwnedFd, i32> {
     open_host_dir(&path)
 }
 
+/// Whether host metadata `st` is of [`empty_dir`], which nothing may
+/// be made in.
+pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
+    empty_dir().is_ok_and(|d| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut e: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        let ok = unsafe { libc::fstat(d.as_raw_fd(), &mut e) } == 0;
+        ok && e.st_dev == st.st_dev && e.st_ino == st.st_ino
+    })
+}
+
 /// Resolve `path` relative to `dirfd` in the view `v`: the work of
 /// [`Fs::resolve`], also done for the socket calls that run without the
 /// kernel lock ([`resolve_host`]).
@@ -1224,21 +1263,14 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         (false, true) => (enter(&to_ns(v.proc_root, v.cwd))?, path.to_vec()),
         _ => {
             // From a directory descriptor: where it is, when fwe can tell
-            // and it is inside the process's root. A directory of an
-            // overlay is where it was opened (its layers' directories may
-            // be in other overlays too), and is entered as the overlay's.
-            let origin = crate::fdmarks::origin(dirfd)
-                .filter(|o| o.fstype == FsType::Overlay)
-                .map(|o| o.ns_path);
-            let ns = origin
-                .or_else(|| fd_path(dirfd).and_then(|h| host_to_ns(&table, &h)))
-                .filter(|ns| mounts::under(ns, &root_ns).is_some());
-            let overlaid = ns
-                .as_ref()
-                .is_some_and(|ns| matches!(table.locate(ns).0.source, Source::Overlay(_)));
-            let here = match ns {
-                Some(ns) if overlaid => enter(&ns)?,
-                ns => {
+            // and it is inside the process's root; a directory of an
+            // overlay is the overlay's, wherever the mount has gone.
+            let here = match overlay_here(&table, &root_ns, dirfd)? {
+                Some(here) => here,
+                None => {
+                    let ns = fd_path(dirfd)
+                        .and_then(|h| host_to_ns(&table, &h))
+                        .filter(|ns| mounts::under(ns, &root_ns).is_some());
                     let dir = dup_cloexec(dirfd)?;
                     let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
                     Here { dir, at, phantom: false, ovl: None }
@@ -1313,6 +1345,17 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         Some(a) => a,
                         None => enter(&parent)?,
                     };
+                }
+                None if here.ovl.is_some() => {
+                    // An overlay directory fwe cannot place: up in the
+                    // overlay, no further than its root.
+                    let o = here.ovl.as_ref().expect("in an overlay");
+                    if let Some(a) = ancestors.pop() {
+                        here = a;
+                    } else if o.path != b"/" {
+                        let parent = normalize(&o.path, b"..");
+                        here = Here::overlay(&o.layers.clone(), parent, None)?;
+                    }
                 }
                 None => {
                     // Somewhere fwe cannot place: up on the host, but never
@@ -1452,23 +1495,16 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 _ => None,
             };
             let next = match link {
-                Some(MagicLink::Fd(fd)) => {
-                    let origin = crate::fdmarks::origin(fd)
-                        .filter(|o| o.fstype == FsType::Overlay)
-                        .map(|o| o.ns_path);
-                    let ns = origin
-                        .or_else(|| fd_path(fd).and_then(|h| host_to_ns(&table, &h)))
-                        .filter(|ns| mounts::under(ns, &root_ns).is_some());
-                    match ns {
-                        Some(ns) if matches!(table.locate(&ns).0.source, Source::Overlay(_)) => {
-                            enter(&ns)?
-                        }
-                        ns => {
-                            let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
-                            Here { dir: dup_cloexec(fd)?, at, phantom: false, ovl: None }
-                        }
+                Some(MagicLink::Fd(fd)) => match overlay_here(&table, &root_ns, fd)? {
+                    Some(here) => here,
+                    None => {
+                        let ns = fd_path(fd)
+                            .and_then(|h| host_to_ns(&table, &h))
+                            .filter(|ns| mounts::under(ns, &root_ns).is_some());
+                        let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
+                        Here { dir: dup_cloexec(fd)?, at, phantom: false, ovl: None }
                     }
-                }
+                },
                 Some(MagicLink::Cwd) => enter(&to_ns(v.proc_root, v.cwd))?,
                 Some(MagicLink::Root) => enter(&root_ns)?,
                 None => {
