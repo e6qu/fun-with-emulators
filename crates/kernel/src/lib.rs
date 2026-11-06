@@ -715,7 +715,11 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
             specialfd::hold(|| {
                 synthdir::hold(|| {
                     overlay::hold(|| {
-                        pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+                        pty::hold(|| {
+                            fs::hold(|| {
+                                futex::hold(|| mm::hold(|| thread::hold(|| seqpacket::hold(fork))))
+                            })
+                        })
                     })
                 })
             })

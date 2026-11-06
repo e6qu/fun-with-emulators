@@ -109,6 +109,8 @@ unsafe extern "C" {
     fn umount2(t: *const std::ffi::c_char, f: i32) -> i32;
     fn statfs(p: *const std::ffi::c_char, b: *mut u64) -> i32;
     fn rmdir(p: *const std::ffi::c_char) -> i32;
+    fn alarm(s: u32) -> u32;
+    fn pipe(fds: *mut i32) -> i32;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -514,6 +516,76 @@ fn main() {
                 let bad = b"lowerdir=/tmp/l1,metacopy=on\0";
                 let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, bad.as_ptr());
                 println!("metacopy: {}", res(r as i64));
+            }
+            // Processes sharing a SOCK_SEQPACKET socket take whole
+            // messages, however they come in; and a child forked while a
+            // thread waits in a receive on the socket receives from it too.
+            Some("seqpacket-shared") => {
+                const LEN: usize = 100_000;
+                const COUNT: usize = 40;
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv.as_mut_ptr());
+                let mut counts = [0i32; 2];
+                pipe(counts.as_mut_ptr());
+                for _ in 0..2 {
+                    if fork() == 0 {
+                        close(sv[0]);
+                        let (mut whole, mut torn) = (0i32, 0i32);
+                        let mut buf = vec![0u8; LEN + 16];
+                        loop {
+                            let n = read(sv[1], buf.as_mut_ptr(), buf.len());
+                            if n <= 0 {
+                                break;
+                            }
+                            let n = n as usize;
+                            if n == LEN && buf[..n].iter().all(|&b| b == buf[0]) {
+                                whole += 1;
+                            } else {
+                                torn += 1;
+                            }
+                        }
+                        write(counts[1], [whole, torn].as_ptr().cast(), 8);
+                        _exit(0);
+                    }
+                }
+                close(sv[1]);
+                close(counts[1]);
+                for i in 0..COUNT {
+                    let msg = vec![i as u8; LEN];
+                    write(sv[0], msg.as_ptr(), LEN);
+                }
+                close(sv[0]);
+                let (mut whole, mut torn) = (0, 0);
+                for _ in 0..2 {
+                    let mut c = [0i32; 2];
+                    read(counts[0], c.as_mut_ptr().cast(), 8);
+                    whole += c[0];
+                    torn += c[1];
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
+                println!("whole: {whole} torn: {torn}");
+                // A thread waits in a receive; a fork then.
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv.as_mut_ptr());
+                let r = sv[1];
+                let waiting = std::thread::spawn(move || {
+                    let mut b = [0u8; 16];
+                    read(r, b.as_mut_ptr(), 16)
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let child = fork();
+                if child == 0 {
+                    alarm(10);
+                    let mut b = [0u8; 16];
+                    let n = read(r, b.as_mut_ptr(), 16);
+                    _exit(if n == 5 { 0 } else { 1 });
+                }
+                write(sv[0], b"first".as_ptr(), 5);
+                write(sv[0], b"other".as_ptr(), 5);
+                let mut status = 0;
+                waitpid(child, &mut status, 0);
+                println!("thread got: {}", waiting.join().unwrap());
+                println!("child got one: {}", status == 0);
             }
             other => panic!("unknown scenario {other:?}"),
         }

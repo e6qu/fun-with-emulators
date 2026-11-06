@@ -3852,6 +3852,17 @@ fn root_passes_permission_bits() {
     );
 }
 
+/// Two processes reading one `SOCK_SEQPACKET` socket at once each take
+/// whole messages, though they arrive in pieces; a child forked while a
+/// thread of its parent waits in a receive on a socket receives from it.
+#[test]
+fn seqpacket_shared_between_processes() {
+    assert_eq!(
+        containers("seqpacket-shared"),
+        "whole: 40 torn: 0\nthread got: 5\nchild got one: true\n"
+    );
+}
+
 /// A listening `SOCK_SEQPACKET` Unix socket: messages keep their
 /// boundaries, one longer than the buffer is cut (`MSG_TRUNC`), and the
 /// peer's close is end-of-file that `epoll` reports.

@@ -686,7 +686,10 @@ a send is whole or, without blocking, `EAGAIN`. The rest is the stream's
 own, so it can listen, connect and accept, and a peer's close is
 end-of-file to `read`, `poll` and `epoll` alike. Its buffers hold two of
 the largest messages, and their odd size marks it, so a process that
-receives one with `SCM_RIGHTS` knows it for what it is.
+receives one with `SCM_RIGHTS` knows it for what it is. A message is sent
+or taken under the socket's lock for that way, which the threads of a
+process share as a mutex and processes as a byte-range lock on a file of
+fwe's, so neither threads nor processes interleave or split one.
 
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
@@ -979,8 +982,7 @@ those items.
   `SECCOMP_FILTER_FLAG_TSYNC`), and there is no user-notification listener
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`);
   `sched_setaffinity` is checked and remembered but threads still run on
-  any CPU; processes that share a `SOCK_SEQPACKET` socket and read it at
-  once can split a message between them (a process's own threads cannot).
+  any CPU.
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a blocked signal whose
