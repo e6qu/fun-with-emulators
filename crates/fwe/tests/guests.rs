@@ -1342,6 +1342,26 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Print the last calls of each process in the `--strace-file` trace
+/// `trace`, for a run that failed.
+fn print_last_calls(trace: &Path) {
+    let text = std::fs::read_to_string(trace).unwrap_or_default();
+    let mut pids: Vec<&str> = Vec::new();
+    for l in text.lines() {
+        let p = l.split(']').next().unwrap_or("");
+        if !pids.contains(&p) {
+            pids.push(p);
+        }
+    }
+    for p in pids {
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(p)).collect();
+        eprintln!("--- {p}] last calls:");
+        for l in &lines[lines.len().saturating_sub(15)..] {
+            eprintln!("{l}");
+        }
+    }
+}
+
 /// What the container prints in [`alpine_podman_runs_an_image`].
 const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
     grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; ls /proc | grep -E '^[0-9]+$' | head -1; \
@@ -1387,22 +1407,7 @@ fn alpine_podman_runs_an_image() {
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
         if !out.status.success() && args[0] != "run" {
-            // The last calls of each process.
-            let text = std::fs::read_to_string(&trace).unwrap_or_default();
-            let mut pids: Vec<&str> = Vec::new();
-            for l in text.lines() {
-                let p = l.split(']').next().unwrap_or("");
-                if !pids.contains(&p) {
-                    pids.push(p);
-                }
-            }
-            for p in pids {
-                let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(p)).collect();
-                eprintln!("--- {p}] last calls:");
-                for l in &lines[lines.len().saturating_sub(15)..] {
-                    eprintln!("{l}");
-                }
-            }
+            print_last_calls(&trace);
         }
         out
     };
@@ -1420,6 +1425,107 @@ fn alpine_podman_runs_an_image() {
         "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\nroot on overlay\n"
     );
     assert_eq!(run.status.code(), Some(3));
+    assert_eq!(stdout(&after), "");
+}
+
+/// What the container prints in [`alpine_containerd_runs_an_image`].
+const IN_CONTAINERD: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
+    grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; touch /made-here && echo writable; \
+    awk '$5 == \"/\" && / - overlay / {print \"root on overlay\"}' /proc/self/mountinfo; exit 4";
+
+/// Alpine's containerd (fetched: `guests/alpine/fetch/containerd.txt`), as
+/// root: the daemon runs, `ctr` imports the standard `alpine` image from an
+/// OCI archive into its overlay snapshotter and runs a container of it
+/// through containerd's runc shim and runc, in its own namespaces, with
+/// `no_new_privs` and, asked for, containerd's default seccomp profile; the
+/// container's exit status is `ctr`'s, and `--rm` leaves no container
+/// behind.
+#[test]
+fn alpine_containerd_runs_an_image() {
+    let root = std::env::temp_dir().join(format!("fwe-containerd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("containerd")).arg(&root));
+    std::fs::create_dir_all(root.join("etc/containerd")).unwrap();
+    std::fs::write(
+        root.join("etc/containerd/config.toml"),
+        "version = 2\nroot = \"/var/lib/containerd\"\nstate = \"/run/containerd\"\n\
+         disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n\
+         [grpc]\n  address = \"/run/containerd/containerd.sock\"\n",
+    )
+    .unwrap();
+    alpine_oci_archive("containerd", &root.join("tmp/alpine.tar"));
+    let _workload = workload();
+    // Each process's calls, for a step that fails: the daemon's (its
+    // shims' and runc's with them), and each ctr's.
+    let fwe = |prog: &str, trace: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        let trace = root.join("tmp").join(trace);
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join(prog));
+        cmd
+    };
+    let log = std::fs::File::create(root.join("tmp/containerd.log")).unwrap();
+    let mut daemon = fwe("usr/bin/containerd", "containerd.trace")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let socket = root.join("run/containerd/containerd.sock");
+    for _ in 0..600 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ctr = |args: &[&str]| {
+        let trace = format!("ctr-{}.trace", args[..2].join("-"));
+        let mut cmd = fwe("usr/bin/ctr", &trace);
+        cmd.args(args);
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        eprintln!("--- ctr {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() && args[0] != "run" || out.status.code().is_none() {
+            print_last_calls(&root.join("tmp").join(&trace));
+            print_last_calls(&root.join("tmp/containerd.trace"));
+        }
+        out
+    };
+    let imported = ctr(&["images", "import", "/tmp/alpine.tar"]);
+    let images = ctr(&["images", "ls", "-q"]);
+    let run =
+        ctr(&["run", "--rm", "docker.io/library/alpine:3.20", "t1", "sh", "-c", IN_CONTAINERD]);
+    // Again with containerd's default seccomp profile.
+    let filtered = ctr(&[
+        "run",
+        "--rm",
+        "--seccomp",
+        "docker.io/library/alpine:3.20",
+        "t2",
+        "sh",
+        "-c",
+        "grep Seccomp: /proc/self/status; uname -r",
+    ]);
+    let after = ctr(&["containers", "ls", "-q"]);
+    // SAFETY: plain call, to the daemon this test started.
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+    eprintln!(
+        "--- containerd log:\n{}",
+        std::fs::read_to_string(root.join("tmp/containerd.log")).unwrap_or_default()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(stdout(&imported).contains("docker.io/library/alpine:3.20"), "{}", stdout(&imported));
+    assert_eq!(stdout(&images), "docker.io/library/alpine:3.20\n");
+    // ctr's spec sets no_new_privs and, without `--seccomp`, no filter.
+    assert_eq!(
+        stdout(&run),
+        "3.20.10\npid 1\n0\nNoNewPrivs:\t1\nSeccomp:\t0\nwritable\nroot on overlay\n"
+    );
+    assert_eq!(run.status.code(), Some(4));
+    assert!(stdout(&filtered).starts_with("Seccomp:\t2\n"), "{}", stdout(&filtered));
+    assert_eq!(filtered.status.code(), Some(0));
     assert_eq!(stdout(&after), "");
 }
 

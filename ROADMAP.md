@@ -16,10 +16,10 @@ lighttpd, Node, Cargo and apt run natively, and Debian's Python, GCC, Go
 and clang in the VM (verified on the software stand-in; a run on real
 hardware is still to come), so every target program has a test. What
 remains is that run on real hardware, and the `x18` and code-discovery
-gaps, which no target program needs yet. M3 is in progress: crun runs the
+gaps, which no target program needs yet. M3 is done: crun runs the
 standard `alpine` image in its own namespaces, cgroup, capabilities and
-seccomp profile, and podman loads that image and runs containers of it
-on overlay mounts; containerd is next.
+seccomp profile, and podman and containerd (with runc) load that image and
+run containers of it on overlay mounts.
 
 ## M0 — Foundation (done)
 
@@ -150,7 +150,7 @@ Remaining:
 **Done when:** git, compilers, Node, Go, Rust, `apt`, databases and web
 servers run unmodified.
 
-## M3 — Containers
+## M3 — Containers (done)
 
 - [x] Namespaces (mount, pid, user, uts, ipc, network, cgroup)
 - [x] cgroups v2
@@ -160,16 +160,19 @@ servers run unmodified.
 - [x] An OCI runtime runs a standard image: crun runs the `alpine` image
 - [x] podman runs standard images: it loads the `alpine` image and runs
   containers of it, on its default `overlay` storage driver
-- [ ] containerd runs standard images
+- [x] containerd runs standard images: `ctr` imports the `alpine` image and
+  runs containers of it through containerd's runc shim and runc, with the
+  overlay snapshotter
 
-**Done when:** podman and containerd run standard container images.
+**Done when:** podman and containerd run standard container images. ✔
 
 ## M4 — Full compatibility
 
 - [ ] Long-tail system calls
 - [ ] ptrace and debuggers (gdb, strace)
 - [ ] io_uring
-- [ ] Advanced networking (netlink, firewalling, raw sockets, TUN)
+- [ ] Advanced networking (netlink beyond a namespace's loopback,
+  firewalling, raw sockets, TUN)
 - [ ] High pass rates on gVisor's syscall tests, LTP and kselftests
 
 **Done when:** real-world workloads run unmodified and conformance suites
