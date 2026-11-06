@@ -509,11 +509,14 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
-    // A `SIGCHLD` sent with `kill` comes with no information on macOS
-    // (`si_code` and `si_pid` 0), unlike a child's.
+    // A `SIGCHLD` this process sent itself with `kill` comes with no
+    // information when macOS held it pending (`si_code` and `si_pid` 0),
+    // and else may name this process as its sender: either way not a
+    // child's (no process is its own child), so the reaper's report.
+    // SAFETY: getpid cannot fail.
+    let sent_self = (code == 0 && pid == 0) || pid == unsafe { libc::getpid() };
     if sig == libc::SIGCHLD
-        && code == 0
-        && pid == 0
+        && sent_self
         && let Some((c, p, s)) = crate::reaper::take_report()
     {
         // An adopted process's end, which fwe's reaper sent this process
