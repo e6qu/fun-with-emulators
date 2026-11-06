@@ -315,6 +315,9 @@ mod tests {
         assert_eq!(node.may_write(b"trusted.x", Space::Trusted), Ok(()));
     }
 
+    /// On the host fwe runs on: a Linux host keeps `trusted.` attributes
+    /// for its root.
+    #[cfg(target_os = "macos")]
     #[test]
     fn set_get_list_remove_on_a_file() {
         let dir = std::env::temp_dir().join(format!("fwe-xattr-{}", std::process::id()));
