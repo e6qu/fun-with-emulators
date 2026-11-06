@@ -635,6 +635,9 @@ fn main() {
                 println!("not ended yet: {}", waitpid(g, &mut status, 1) == 0);
                 kill(g, SIGKILL);
                 let w = waitpid(g, &mut status, 0);
+                if w != g {
+                    eprintln!("waitpid({g}) returned {w}, errno {}", errno());
+                }
                 println!("reaped the orphan: {}, {}", w == g, ended(status));
             }
         }
