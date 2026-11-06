@@ -289,8 +289,18 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
 /// before the child's libc has caught up, its `getpid` still answers with
 /// the parent's pid: the relayed form of a guest's `SIGKILL` arriving then
 /// would have the child kill its parent.
+///
+/// The child goes on only once the parent has unblocked them: a signal the
+/// child sends its parent sooner would be left pending, and macOS empties
+/// the `siginfo` of a signal it holds blocked, so its sender would be lost.
 fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
-    // SAFETY: plain host calls on initialized signal sets.
+    let mut go = [-1i32; 2];
+    // SAFETY: a valid out-array; on failure the fork goes on without it.
+    if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
+        go = [-1, -1];
+    }
+    // SAFETY: plain host calls on initialized signal sets and the pipe
+    // opened above, each end closed once in each process.
     unsafe {
         let mut all: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
@@ -303,9 +313,28 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         libc::sigdelset(&mut all, libc::SIGSYS);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
         let pid = fork();
+        // What a failed fork left, kept for the caller across the calls below.
+        let saved = host::last_errno();
         if pid != 0 {
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            if go[1] >= 0 {
+                libc::write(go[1], b"g".as_ptr().cast(), 1);
+            }
+        } else if go[0] >= 0 {
+            libc::close(go[1]);
+            // Until the parent's byte, or its end (should it be gone).
+            let mut b = 0u8;
+            while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
+                && host::last_errno() == libc::EINTR
+            {}
         }
+        for fd in go.into_iter().filter(|&fd| fd >= 0) {
+            if pid == 0 && fd == go[1] {
+                continue;
+            }
+            libc::close(fd);
+        }
+        host::set_errno(saved);
         pid
     }
 }

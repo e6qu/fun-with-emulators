@@ -548,7 +548,7 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
 }
 
 /// Set the calling thread's host `errno`.
-fn set_errno(value: i32) {
+pub fn set_errno(value: i32) {
     // SAFETY: writing this thread's errno.
     #[cfg(target_os = "macos")]
     unsafe {

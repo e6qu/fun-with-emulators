@@ -587,6 +587,10 @@ fn wake_waiters() {
 /// sent itself carries: its host pid (0 for none), `si_code` and
 /// `si_status`. Read by the host signal handler ([`take_report`]).
 static REPORT_PID: AtomicI32 = AtomicI32::new(0);
+/// The last adopted process the reaper reported, and its former parent
+/// (host pids), for [`precedes`].
+static REPORTED: AtomicI32 = AtomicI32::new(0);
+static REPORTED_PARENT: AtomicI32 = AtomicI32::new(0);
 static REPORT_CODE: AtomicI32 = AtomicI32::new(0);
 static REPORT_STATUS: AtomicI32 = AtomicI32::new(0);
 
@@ -633,8 +637,19 @@ fn sigchld_taken() -> bool {
     (crate::signal::caught() | crate::signalfd::watched()) & bit != 0
 }
 
+/// Whether the `SIGCHLD` of host process `pid` comes before one of host
+/// process `pending`'s still pending: `pid` is an adopted process the
+/// reaper reported, and `pending` the parent it was orphaned by, whose
+/// end Linux reports after the orphan's (it hands its children on as it
+/// ends). Async-signal-safe.
+pub fn precedes(pid: i32, pending: i32) -> bool {
+    pid != 0 && REPORTED.load(SeqCst) == pid && REPORTED_PARENT.load(SeqCst) == pending
+}
+
 /// Send this process the `SIGCHLD` for adopted process `e`'s end.
 fn raise(e: &Ended) {
+    REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);
+    REPORTED.store(e.pid, SeqCst);
     let (code, status) = child_code(e.status);
     REPORT_CODE.store(code, SeqCst);
     REPORT_STATUS.store(status, SeqCst);

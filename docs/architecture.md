@@ -569,6 +569,13 @@ that re-executes fwe, the whole guest mask goes on the host, and the
 signals fwe holds pending that the guest blocks go to the host, pending on
 the thread, which `execve` keeps.
 
+A standard signal already pending keeps the `siginfo` it was first raised
+with, as Linux drops a later instance; an adopted orphan's `SIGCHLD` takes
+the place of its former parent's, which Linux sends after it. The parent
+of a `fork` holds every signal blocked across the host call, so a child
+goes on only once its parent has unblocked them: a signal it sent sooner
+would lose its sender.
+
 A process-wide signal the host holds can still be parked on one thread,
 which never takes it, while the thread runs fwe's handlers with every
 signal blocked. In the native backend a thread entering a system call
