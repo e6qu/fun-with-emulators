@@ -161,6 +161,9 @@ impl Pending {
             return;
         }
         let slot = &self.info[(sig - 1) as usize];
+        if sig == signal::SIGCHLD && crate::reaper::superseded(info.pid) {
+            return;
+        }
         if sig < signal::SIGRTMIN
             && self.bits.load(Ordering::Acquire) & (1 << (sig - 1)) != 0
             && !(sig == signal::SIGCHLD

@@ -646,6 +646,17 @@ pub fn precedes(pid: i32, pending: i32) -> bool {
     pid != 0 && REPORTED.load(SeqCst) == pid && REPORTED_PARENT.load(SeqCst) == pending
 }
 
+/// Whether a `SIGCHLD` of host process `pid` is one Linux would not send
+/// now: `pid` ended leaving an orphan the reaper has reported already, and
+/// Linux sends a parent's `SIGCHLD` after its orphans' as it ends, so one
+/// still pending absorbs it (a standard signal is not queued twice). Taken
+/// once. Async-signal-safe.
+pub fn superseded(pid: i32) -> bool {
+    pid != 0
+        && REPORTED.load(SeqCst) != 0
+        && REPORTED_PARENT.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok()
+}
+
 /// Send this process the `SIGCHLD` for adopted process `e`'s end.
 fn raise(e: &Ended) {
     REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);

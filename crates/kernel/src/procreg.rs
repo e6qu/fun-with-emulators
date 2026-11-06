@@ -96,6 +96,11 @@ fn dir() -> Option<Vec<u8>> {
     Some(d)
 }
 
+/// The directory the process records are kept in.
+pub fn records_dir() -> Option<Vec<u8>> {
+    dir()
+}
+
 fn path(pid: i32) -> Option<Vec<u8>> {
     Some([dir()?, format!("/{pid}").into_bytes()].concat())
 }
@@ -215,6 +220,7 @@ pub fn remove(pid: i32) {
         let _ = std::fs::remove_file(OsStr::from_bytes(&p));
         let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     }
+    crate::signote::remove(pid);
 }
 
 /// Every live process fwe has a record of, forgetting those that ended

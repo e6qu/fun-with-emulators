@@ -556,6 +556,9 @@ impl<P: Platform> Kernel<P> {
             let led = (sig == signal::SIGKILL && target > 0)
                 .then(|| crate::pidns::led_by(target as i32))
                 .flatten();
+            if target > 0 && !to_self {
+                crate::signote::note(target as i32, h);
+            }
             let r = host::kill(target as libc::pid_t, h);
             if r == 0
                 && let Some(ns) = led
@@ -596,6 +599,7 @@ impl<P: Platform> Kernel<P> {
                 continue;
             }
             if let Some(h) = host::signal_to_host(sig) {
+                crate::signote::note(host, h);
                 sent |= host::kill(host, h) == 0;
             }
         }

@@ -570,8 +570,15 @@ signals fwe holds pending that the guest blocks go to the host, pending on
 the thread, which `execve` keeps.
 
 A standard signal already pending keeps the `siginfo` it was first raised
-with, as Linux drops a later instance; an adopted orphan's `SIGCHLD` takes
-the place of its former parent's, which Linux sends after it. The parent
+with, as Linux drops a later instance. An adopted orphan's `SIGCHLD` comes
+before its former parent's, as Linux sends them when the parent ends: it
+takes the place of the parent's while that is pending, and absorbs one that
+comes after it. fwe's own handlers run with every signal blocked, so a
+signal arriving during one (a child's `SIGUSR1`, then its `SIGCHLD`) is
+taken after it with the `siginfo` macOS emptied; an fwe process that sends
+another a signal leaves a note of itself in the target's mailbox, beside
+its process record, which the target's handler reads then
+(`crates/kernel/src/signote.rs`). The parent
 of a `fork` holds every signal blocked across the host call, so a child
 goes on only once its parent has unblocked them: a signal it sent sooner
 would lose its sender.
@@ -1050,7 +1057,9 @@ those items.
   (one pending per signal, as Linux does for them); a blocked signal whose
   action the host applies (one ignored, or a default that ignores or
   continues) loses its sender, which matters only if a handler is
-  installed before it is unblocked; a blocked signal pending across an
+  installed before it is unblocked; a signal from outside fwe (or sent
+  to a process group) that arrives while one of fwe's handlers runs comes
+  with no sender; a blocked signal pending across an
   `execve` arrives with fwe's own pid as its sender;
   `rt_sigqueueinfo` is not implemented; a signal that
   arrives between a blocking call's start and its host wait can be noticed
