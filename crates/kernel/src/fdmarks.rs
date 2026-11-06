@@ -149,6 +149,7 @@ pub fn marked(fd: i32) -> Option<Mark> {
 /// `fd` was closed.
 pub fn closed(fd: i32) {
     take(&mut records(), fd);
+    crate::overlay::closed(fd);
 }
 
 /// Whether a descriptor of this process other than `fd` is open on the

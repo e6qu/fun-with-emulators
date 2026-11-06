@@ -41,7 +41,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -337,8 +337,22 @@ pub fn collect() {
     for d in live.iter().filter(|d| kind_of(d) == b"mnt").chain(init_tables.iter()) {
         if let Ok(ns) = crate::mounts::store::Ns::join(d, 0) {
             for m in &ns.table().mounts {
-                if let crate::mounts::Source::Host(h) = &m.source {
-                    shown.insert(h.clone());
+                match &m.source {
+                    crate::mounts::Source::Host(h) => {
+                        shown.insert(h.clone());
+                    }
+                    // An overlay keeps the tmpfs its layers are in, even
+                    // once that is unmounted.
+                    crate::mounts::Source::Overlay(l) => {
+                        for p in l.paths().chain(l.work.as_deref()) {
+                            let Some(rest) = p.strip_prefix(&base[..]) else { continue };
+                            let top = rest.split(|&b| b == b'/').find(|c| !c.is_empty());
+                            if let Some(top) = top {
+                                shown.insert([&base[..], b"/", top].concat());
+                            }
+                        }
+                    }
+                    crate::mounts::Source::Synthetic => {}
                 }
             }
         }

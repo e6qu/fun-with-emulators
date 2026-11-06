@@ -16,7 +16,7 @@ networking, terminals, event descriptors and a synthetic `/proc` are in
 place. Alpine's crun runs the standard `alpine` container image, in
 namespaces, a cgroup, and the capabilities and seccomp profile its spec
 gives it, and Alpine's podman loads that image and runs containers of it
-(through conmon and crun, with `vfs` storage).
+(through conmon and crun, on its default `overlay` storage).
 
 A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
 `python3.11`, GCC, clang and Go) cannot be mapped in-process; fwe runs it in a

@@ -1330,9 +1330,11 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    // Without the host's own attributes, which an archive made on Linux
+    // would not have.
     run_checked(
         Command::new("tar")
-            .arg("cf")
+            .args(["--no-xattrs", "--no-mac-metadata", "-cf"])
             .arg(out)
             .args(["oci-layout", "index.json", "blobs"])
             .current_dir(&dir),
@@ -1343,11 +1345,13 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
 /// What the container prints in [`alpine_podman_runs_an_image`].
 const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
     grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; ls /proc | grep -E '^[0-9]+$' | head -1; \
-    touch /made-here && echo writable; exit 3";
+    touch /made-here && echo writable; \
+    awk '$5 == \"/\" && / - overlay / {print \"root on overlay\"}' /proc/self/mountinfo; exit 3";
 
 /// Alpine's podman (fetched: `guests/alpine/fetch/podman.txt`), as root
-/// with the `vfs` storage driver: it loads the standard `alpine` image
-/// from an OCI archive and runs a container of it through conmon and crun
+/// with its default storage driver, `overlay`: it loads the standard
+/// `alpine` image from an OCI archive and runs a container of it, whose
+/// root is an overlay of the image's layer, through conmon and crun
 /// (conmon adopting the container's init as a subreaper, and attaching to
 /// it over a `SOCK_SEQPACKET` socket); the container's exit status is
 /// podman's, and `--rm` leaves no container behind.
@@ -1359,7 +1363,7 @@ fn alpine_podman_runs_an_image() {
     let etc = root.join("etc/containers");
     std::fs::write(
         etc.join("storage.conf"),
-        "[storage]\ndriver = \"vfs\"\nrunroot = \"/run/containers/storage\"\n\
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\n\
          graphroot = \"/var/lib/containers/storage\"\n",
     )
     .unwrap();
@@ -1382,12 +1386,17 @@ fn alpine_podman_runs_an_image() {
     };
     let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
     let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
+    let driver = podman(&["info", "--format", "{{.Store.GraphDriverName}}"]);
     let run = podman(&["run", "--rm", "--network=none", "alpine:3.20", "sh", "-c", IN_PODMAN]);
     let after = podman(&["ps", "-a", "--format", "{{.ID}}"]);
     let _ = std::fs::remove_dir_all(&root);
     assert!(stdout(&loaded).contains("Loaded image: docker.io/library/alpine:3.20"));
     assert_eq!(stdout(&images), "docker.io/library/alpine:3.20\n");
-    assert_eq!(stdout(&run), "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\n");
+    assert_eq!(stdout(&driver), "overlay\n");
+    assert_eq!(
+        stdout(&run),
+        "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\nroot on overlay\n"
+    );
     assert_eq!(run.status.code(), Some(3));
     assert_eq!(stdout(&after), "");
 }
@@ -3762,6 +3771,27 @@ fn extended_attributes() {
          no namespace: EOPNOTSUPP\nget: y\nsize: 1\nmissing: ENODATA\n\
          list: trusted.overlay.opaque user.a\nremove: ok\nuser on a link: EPERM\n\
          trusted on a link: ok\n"
+    );
+}
+
+/// An overlay mount: lookups and listings merge the layers; a write copies
+/// the file up, a removal leaves a whiteout, a directory a lower layer has
+/// cannot be renamed, a directory made again hides the lower one's
+/// entries; a file opened in a lower layer and changed through its
+/// descriptor is copied up; the lower layers are never changed. Without an
+/// upper layer an overlay is read-only, and an option fwe lacks is refused.
+#[test]
+fn overlay_mounts() {
+    assert_eq!(
+        containers("overlay"),
+        "mount: ok\na: lower1\nd: x y z\na written: lower1+ lower: lower1 upper: lower1+\n\
+         unlink: ok\ngone: ENOENT lower: g whiteout: true 0\nrename a lower dir: EXDEV\n\
+         rename a file: ok\nd: x2 y z lower: x y\nrmdir full: ENOTEMPTY\nrmdir: ok\n\
+         made again: ok holds: []\nopaque in upper: y\n\
+         opaque through the overlay: EOPNOTSUPP\nfchmod: ok\ne: 600 lower: 644 upper: 600\n\
+         f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\nroot: a d deep sub\n\
+         upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
+         metacopy: EINVAL\n"
     );
 }
 

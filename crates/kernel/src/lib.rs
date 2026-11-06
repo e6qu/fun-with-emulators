@@ -32,6 +32,7 @@ pub mod net;
 pub mod netns;
 pub mod ns;
 pub mod nsops;
+pub mod overlay;
 pub mod pidns;
 pub mod procfs;
 pub mod procpid;
@@ -713,7 +714,9 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         signalfd::hold(|| {
             specialfd::hold(|| {
                 synthdir::hold(|| {
-                    pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+                    overlay::hold(|| {
+                        pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+                    })
                 })
             })
         })

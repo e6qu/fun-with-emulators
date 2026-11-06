@@ -177,6 +177,9 @@ impl<P: Platform> Kernel<P> {
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
                     r
+                } else if let Some(r) = crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    r
                 } else {
                     // SAFETY: plain host call; SEEK_SET/CUR/END match.
                     ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
@@ -306,16 +309,9 @@ impl<P: Platform> Kernel<P> {
             nr::REMOVEXATTR => self.sys_removexattr(None, a[0], a[1], true),
             nr::LREMOVEXATTR => self.sys_removexattr(None, a[0], a[1], false),
             nr::FREMOVEXATTR => self.sys_removexattr(Some(a[0] as i32), 0, a[1], true),
-            nr::FCHMOD if crate::memfd::chmod_sealed(a[0] as i32) => err(errno::EPERM),
-            // A mode that denies the owner is kept apart (see `modes`).
-            nr::FCHMOD => match crate::modes::keep_fd(a[0] as i32, a[1] as u32) {
-                Ok(()) => 0,
-                Err(e) => err(e),
-            },
+            nr::FCHMOD => self.sys_fchmod(a[0], a[1]),
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
-            // Ownership is virtual: honor the guest's credentials rather than
-            // changing the backing host file (fwe does not run as root).
-            nr::FCHOWN => self.chown_check(a[1] as u32, a[2] as u32),
+            nr::FCHOWN => self.sys_fchown(a[0], a[1], a[2]),
             nr::TRUNCATE => self.sys_truncate(a[0], a[1]),
             nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
             nr::FALLOCATE => self.sys_fallocate(a[0], a[1], a[2], a[3]),

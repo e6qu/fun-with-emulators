@@ -762,12 +762,28 @@ Each mount namespace has a table (`crates/kernel/src/mounts.rs`) of mounts,
 each attached at a path to a parent mount, as on Linux: stacked mounts,
 `pivot_root(".", ".")` and the unmount of the old root behave as there. A
 mount shows a host directory (the rootfs, a bind mount's source, a tmpfs's
-backing directory in fwe's private directory) or one of fwe's own
-filesystems (`proc`, `sysfs`, `devpts`, `mqueue`; `cgroup2` is the shared
-tree). `mount` (new mounts, bind and recursive bind, move, remount,
-propagation), `umount2`, `pivot_root` and `chroot` act on it, and
-`/proc/self/mountinfo` and `/proc/self/mounts` show it from the process's
-root.
+backing directory in fwe's private directory), a stack of them (an
+overlay), or one of fwe's own filesystems (`proc`, `sysfs`, `devpts`,
+`mqueue`; `cgroup2` is the shared tree). `mount` (new mounts, bind and
+recursive bind, move, remount, propagation), `umount2`, `pivot_root` and
+`chroot` act on it, and `/proc/self/mountinfo` and `/proc/self/mounts`
+show it from the process's root.
+
+An overlay (`crates/kernel/src/overlay.rs`) is resolved as Linux's
+`overlay` filesystem resolves it: each name in the upper layer, then in
+the lower ones in turn, directories of one name merging; a whiteout (a
+device node numbered 0:0) hides a name below it and an opaque directory
+(`trusted.overlay.opaque`, or `user.overlay.opaque` with `userxattr`) what
+is below it. A call that changes a file of a lower layer copies it up
+first, its directories with it (a regular file as an APFS clone, which
+shares its blocks until written); a removal of what a lower layer has
+leaves a whiteout; `getdents64` lists the layers merged. A descriptor of a
+lower layer's file that is then changed through it (`fchmod` and the like)
+is moved onto the copy, as Linux moves it. Each change is built in the
+work directory and moved into place with one atomic rename, so other
+processes see it whole. The overlay's own attributes are hidden from its
+files, and a mount option asking for what fwe does not do (`metacopy=on`,
+`redirect_dir=on`, `index=on`) is refused, as by a kernel without it.
 
 ### Namespaces
 
@@ -930,7 +946,13 @@ those items.
 - **Mounts:** mounts do not propagate between namespaces, whatever their
   propagation type; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
-  always detaches).
+  always detaches). An overlay's layers must be host directories (not in
+  another overlay); a directory a lower layer has cannot be renamed
+  (`EXDEV`, as with `redirect_dir=off`); a rename that leaves a whiteout
+  behind, and a `bind` over one, are two host steps, between which another
+  process can see the lower layer's file at that name; a directory's
+  listing is read from where it was opened, not from the directory itself
+  if it has been moved since.
 - **Namespaces:** a network namespace has a loopback interface only (no
   `veth`, no netlink), and a datagram to one of its ports nobody bound by
   number goes to the host loopback port of that number; the initial

@@ -262,6 +262,37 @@ fn raw_get(t: &Target, n: &CStr, buf: *mut u8, len: usize) -> isize {
     }
 }
 
+/// The value of host attribute `name` (any, fwe's own included) of the
+/// file open as `fd`.
+pub fn get_host(fd: i32, name: &[u8]) -> Result<Vec<u8>, i32> {
+    get(&Target::Fd(fd), name)
+}
+
+/// Set host attribute `name` of the file open as `fd`.
+pub fn set_host(fd: i32, name: &[u8], value: &[u8]) -> Result<(), i32> {
+    set(&Target::Fd(fd), name, value, 0)
+}
+
+/// Every host attribute name of the file open as `fd`, each
+/// NUL-terminated.
+pub fn list_host(fd: i32) -> Result<Vec<u8>, i32> {
+    loop {
+        let size = raw_list(&Target::Fd(fd), std::ptr::null_mut(), 0);
+        if size < 0 {
+            return fail();
+        }
+        let mut buf = vec![0u8; size as usize];
+        let got = raw_list(&Target::Fd(fd), buf.as_mut_ptr(), buf.len());
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(buf);
+        }
+        if crate::host::last_errno() != libc::ERANGE {
+            return fail();
+        }
+    }
+}
+
 fn raw_list(t: &Target, buf: *mut u8, len: usize) -> isize {
     // SAFETY: `buf` is null with `len` 0, or valid for `len` bytes.
     unsafe {

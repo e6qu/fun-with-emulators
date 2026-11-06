@@ -63,6 +63,7 @@ const DIRS: &[DirDef] = &[
             (b"stat", DT_REG),
             (b"uptime", DT_REG),
             (b"loadavg", DT_REG),
+            (b"filesystems", DT_REG),
             (b"sys", DT_DIR),
             (b"mounts", DT_LNK),
         ],
@@ -169,6 +170,12 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         b"/proc/self/setgroups" => Entry::File(b"allow\n".to_vec()),
         b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu)),
+        // What `mount` takes, and the rootfs's own.
+        b"/proc/filesystems" => Entry::File(
+            b"nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tcgroup2\nnodev\tdevpts\n\
+              nodev\tmqueue\nnodev\toverlay\n\text4\n"
+                .to_vec(),
+        ),
         b"/proc/meminfo" => Entry::File(meminfo()),
         b"/proc/stat" => Entry::File(stat(info.ncpu)),
         b"/proc/uptime" => Entry::File(format!("{:.2} 0.00\n", crate::host::uptime()).into_bytes()),
