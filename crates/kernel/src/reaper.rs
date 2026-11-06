@@ -93,25 +93,37 @@ pub fn set_subreaper(on: bool) {
             procreg::set_own_subreaper(on, Vec::new(), Vec::new());
             return;
         };
-        // Every orphan below this process, living or ended unreaped, and
-        // who adopts it now.
-        let mut orphans: Vec<(Proc, Option<i32>)> = procreg::all()
+        // Every orphan below this process, living or ended unreaped, who
+        // adopts it now, and whether that is a reaper below this process
+        // (which, when it ends, hands it on to the next reaper up, as on
+        // Linux, so it is not declined).
+        let below = |lineage: &[Proc], a: Option<i32>| {
+            let mine = lineage.iter().position(|&(p, _)| p == me);
+            a.is_some_and(|a| lineage.iter().position(|&(p, _)| p == a) < mine)
+        };
+        let mut orphans: Vec<(Proc, Option<i32>, bool)> = procreg::all()
             .into_iter()
             .filter(|(_, r)| r.lineage.iter().any(|&(p, _)| p == me) && orphaned(&r.lineage))
-            .map(|(pid, r)| ((pid, r.start), adopter((pid, r.start), &r.lineage, r.bound)))
+            .map(|(pid, r)| {
+                let a = adopter((pid, r.start), &r.lineage, r.bound);
+                ((pid, r.start), a, below(&r.lineage, a))
+            })
             .collect();
         orphans.extend(
             procreg::all_ended()
                 .into_iter()
                 .filter(|e| e.lineage.iter().any(|&(p, _)| p == me) && orphaned(&e.lineage))
-                .map(|e| ((e.pid, e.start), adopter((e.pid, e.start), &e.lineage, e.bound))),
+                .map(|e| {
+                    let a = adopter((e.pid, e.start), &e.lineage, e.bound);
+                    ((e.pid, e.start), a, below(&e.lineage, a))
+                }),
         );
-        let still = |p: &Proc| orphans.iter().any(|(o, _)| o == p);
+        let still = |p: &Proc| orphans.iter().any(|(o, ..)| o == p);
         let mut kept: Vec<Proc> = own.kept.iter().copied().filter(still).collect();
         let declined = if on {
-            orphans.iter().filter(|(_, a)| *a != Some(me)).map(|(o, _)| *o).collect()
+            orphans.iter().filter(|(_, a, low)| *a != Some(me) && !low).map(|(o, ..)| *o).collect()
         } else {
-            kept.extend(orphans.iter().filter(|(_, a)| *a == Some(me)).map(|(o, _)| *o));
+            kept.extend(orphans.iter().filter(|(_, a, _)| *a == Some(me)).map(|(o, ..)| *o));
             Vec::new()
         };
         procreg::set_own_subreaper(on, declined, kept);
@@ -425,6 +437,21 @@ fn ended_init(init: i32, ns: &[u8]) {
     });
 }
 
+/// Whether a `wait` that must not block (`WNOHANG`) for child `child`
+/// alone is to report nothing yet: it is a pid namespace's init that has
+/// ended while the rest of its namespace has not (Linux reaps an init only
+/// once its namespace is empty).
+pub fn init_unreapable(child: i32) -> bool {
+    let ns = INITS.lock().unwrap_or_else(|e| e.into_inner()).children.get(&child).cloned();
+    let Some(ns) = ns else { return false };
+    let ended = procreg::host_info(child).is_none_or(|(_, _, zombie)| zombie);
+    busy(|| {
+        ended
+            && crate::shared::Record::<crate::pidns::PidNs>::join(&ns, 0)
+                .is_ok_and(|r| crate::pidns::members_alive(&r, child))
+    })
+}
+
 /// This process reaped child `child`: if it was a pid namespace's init,
 /// its `wait` reports that only once the rest of the namespace has gone,
 /// as on Linux, where an init is not reaped before its namespace is
@@ -432,7 +459,9 @@ fn ended_init(init: i32, ns: &[u8]) {
 pub fn reaped_child(child: i32) {
     let ns = INITS.lock().unwrap_or_else(|e| e.into_inner()).children.remove(&child);
     let Some(ns) = ns else { return };
-    let Ok(r) = crate::shared::Record::<crate::pidns::PidNs>::join(&ns, 0) else { return };
+    let Ok(r) = busy(|| crate::shared::Record::<crate::pidns::PidNs>::join(&ns, 0)) else {
+        return;
+    };
     busy(|| crate::pidns::zap(&r, child));
     // A process killed is gone in a moment; one that the host cannot end
     // is not waited for long.
@@ -633,6 +662,10 @@ mod watch {
     struct Watcher {
         kq: i32,
         watched: HashSet<i32>,
+        /// Whether each followed process is stopped, as last seen: from
+        /// when it is first followed, so a continue is seen as one even
+        /// for a process stopped before it was adopted.
+        stopped: std::collections::HashMap<i32, bool>,
     }
 
     impl Watcher {
@@ -663,6 +696,7 @@ mod watch {
                     gone = true;
                     continue;
                 }
+                self.stopped.insert(p, procreg::stopped_by(p).is_some());
                 // Registered first, so a child it makes from now on is
                 // reported by its fork.
                 todo.extend(children(p));
@@ -719,6 +753,10 @@ mod watch {
                     INITS.lock().unwrap_or_else(|e| e.into_inner()).children.get(&pid).cloned();
                 if let Some(ns) = ns {
                     ended_init(pid, &ns);
+                    if crate::host::children_reaped_by_host() {
+                        // Reaped by the host: no `wait` will take it.
+                        INITS.lock().unwrap_or_else(|e| e.into_inner()).children.remove(&pid);
+                    }
                 }
             }
         }
@@ -733,7 +771,7 @@ mod watch {
             libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
         }
         let me = me();
-        let mut w = Watcher { kq, watched: HashSet::new() };
+        let mut w = Watcher { kq, watched: HashSet::new(), stopped: Default::default() };
         // This process's forks, and the host's SIGCHLD (a child of its own
         // that ended, stopped or continued).
         let own = [
@@ -757,11 +795,10 @@ mod watch {
         // way out (not yet zombies): looked at again until they are, since
         // nothing else will be reported for them.
         let mut ending: HashSet<(i32, Option<u64>)> = HashSet::new();
-        // Adopted processes sent a signal, looked at until it has stopped
+        // Followed processes sent a signal, looked at until it has stopped
         // or continued them or a little while has passed (a stop takes
-        // effect as the process gets to it), and whether each is stopped.
+        // effect as the process gets to it).
         let mut signalled: std::collections::HashMap<i32, std::time::Instant> = Default::default();
-        let mut stopped: std::collections::HashMap<i32, bool> = Default::default();
         let soon = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
         loop {
             let idle = ending.is_empty() && signalled.is_empty();
@@ -793,11 +830,9 @@ mod watch {
                         w.watched.remove(&pid);
                         ending.insert((pid, procreg::start_time(pid)));
                         signalled.remove(&pid);
-                        stopped.remove(&pid);
+                        w.stopped.remove(&pid);
                         CHANGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.pid != pid);
-                    } else if ev.fflags & libc::NOTE_SIGNAL != 0
-                        && procreg::read(pid).is_some_and(|r| adopted_live(pid, &r))
-                    {
+                    } else if ev.fflags & libc::NOTE_SIGNAL != 0 && pid != me {
                         let until =
                             std::time::Instant::now() + std::time::Duration::from_millis(50);
                         signalled.insert(pid, until);
@@ -806,12 +841,15 @@ mod watch {
                 // Those of them that stopped or continued.
                 let now = std::time::Instant::now();
                 signalled.retain(|&pid, until| {
-                    let Some(r) = procreg::read(pid) else { return false };
                     let sig = procreg::stopped_by(pid);
-                    let was = stopped.get(&pid).copied().unwrap_or(false);
+                    let was = w.stopped.get(&pid).copied().unwrap_or(false);
                     if sig.is_some() != was {
-                        stopped.insert(pid, sig.is_some());
-                        changed(pid, &r, sig.map(|s| crate::host::signal_to_linux(s) as i32));
+                        w.stopped.insert(pid, sig.is_some());
+                        // Reported if it is an adopted one; a child of a
+                        // living parent is that parent's to hear of.
+                        if let Some(r) = procreg::read(pid).filter(|r| adopted_live(pid, r)) {
+                            changed(pid, &r, sig.map(|s| crate::host::signal_to_linux(s) as i32));
+                        }
                         return false;
                     }
                     now < *until

@@ -98,11 +98,12 @@ enum Way {
 /// `v<format>-seqpacket.lock` in fwe's private directory, open for the
 /// life of the process.
 fn lock_file() -> Option<i32> {
-    use std::sync::atomic::{AtomicI32, Ordering::SeqCst};
-    static FD: AtomicI32 = AtomicI32::new(-1);
-    let fd = FD.load(SeqCst);
-    if fd >= 0 {
-        return Some(fd);
+    // Opened once, under a lock: a second descriptor of the file, closed,
+    // would drop every byte-range lock this process holds on it.
+    static FD: Mutex<i32> = Mutex::new(-1);
+    let mut fd = FD.lock().unwrap_or_else(|e| e.into_inner());
+    if *fd >= 0 {
+        return Some(*fd);
     }
     let mut path = crate::fs::shm::user_dir().ok()?;
     path.extend_from_slice(format!("/v{}-seqpacket.lock", crate::shared::FORMAT).as_bytes());
@@ -110,15 +111,9 @@ fn lock_file() -> Option<i32> {
     // SAFETY: a NUL-terminated path in fwe's private directory.
     let raw =
         unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
-    let fd = crate::fdtable::reserve(raw).ok()?;
-    match FD.compare_exchange(-1, fd, SeqCst, SeqCst) {
-        Ok(_) => Some(fd),
-        Err(other) => {
-            // SAFETY: closing the descriptor just opened.
-            unsafe { libc::close(fd) };
-            Some(other)
-        }
-    }
+    // No lock is held on the file yet, so `reserve` closing `raw` loses none.
+    *fd = crate::fdtable::reserve(raw).ok()?;
+    Some(*fd)
 }
 
 /// A socket's lock for one way held between processes: a write lock on

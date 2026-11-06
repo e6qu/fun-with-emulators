@@ -452,6 +452,9 @@ fn reaper_wait(
 /// `wait4` of the host's children (`pid` is the host's), the result
 /// written in Linux's layout.
 fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
+    if host_options & libc::WNOHANG != 0 && pid > 0 && reaper::init_unreapable(pid) {
+        return 0;
+    }
     let mut status: libc::c_int = 0;
     // SAFETY: an all-zero rusage is a valid out-parameter.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -575,6 +578,15 @@ fn waitid_host(
     options: u64,
 ) -> i64 {
     use fwe_abi::wait as w;
+    if host_options & libc::WNOHANG != 0
+        && idtype == libc::P_PID
+        && reaper::init_unreapable(id as i32)
+    {
+        if infop != 0 && fwe_kernel::uaccess::write(infop, [0i32; 32]).is_err() {
+            return err(errno::EFAULT);
+        }
+        return 0;
+    }
     // SAFETY: an all-zero siginfo is a valid out-parameter.
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `si` is a valid out-parameter.

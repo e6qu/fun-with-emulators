@@ -715,6 +715,49 @@ fn main() {
                 kill(g, SIGKILL);
             }
         }
+        // An orphan a subreaper below adopted goes on to a process that
+        // became a subreaper later, once the one below ends, as on Linux.
+        Some("subreaper-handover") => {
+            // SAFETY: plain calls with valid out-parameters; children exit.
+            unsafe {
+                let (mut report, mut go) = ([0i32; 2], [0i32; 2]);
+                pipe(report.as_mut_ptr());
+                pipe(go.as_mut_ptr());
+                let b = fork();
+                if b == 0 {
+                    prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                    let d = fork();
+                    if d == 0 {
+                        let c = fork();
+                        if c == 0 {
+                            pause();
+                            _exit(0);
+                        }
+                        write_i32(report[1], c);
+                        _exit(0);
+                    }
+                    waitpid(d, std::ptr::null_mut(), 0);
+                    read_i32(go[0]);
+                    _exit(0);
+                }
+                let c = read_i32(report[0]);
+                for _ in 0..500 {
+                    if proc_ppid(c) == b {
+                        break;
+                    }
+                    usleep(10_000);
+                }
+                println!("adopted below: {}", proc_ppid(c) == b);
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                write_i32(go[1], 1);
+                let mut status = 0;
+                waitpid(b, &mut status, 0);
+                println!("handed up: {}", proc_ppid(c) == getpid());
+                kill(c, SIGKILL);
+                let w = waitpid(c, &mut status, 0);
+                println!("reaped: {}, {}", w == c, ended(status));
+            }
+        }
         // An adopted orphan that stops and continues is reported to the
         // subreaper's `wait` and with `SIGCHLD`, as a child is.
         Some("subreaper-stop") => {

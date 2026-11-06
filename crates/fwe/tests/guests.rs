@@ -3702,7 +3702,8 @@ fn subreaper_adopts_orphans() {
 }
 
 /// A process that becomes a subreaper does not adopt an orphan below it
-/// that had its adopter already; an orphan it adopted that stops and
+/// that had its adopter already, unless that adopter is a subreaper below
+/// it which then ends; an orphan it adopted that stops and
 /// continues is reported to its `wait` (`WUNTRACED`, `WCONTINUED`) and
 /// with `SIGCHLD`, once each, as a child's stop and continue are.
 #[test]
@@ -3711,6 +3712,10 @@ fn subreaper_adoption_and_stops() {
         namespaces("subreaper-late"),
         "child exited 0\nchild is not a subreaper: true\norphan's parent is another: true\n\
          and stays so: true\nnothing to wait for: true\n"
+    );
+    assert_eq!(
+        namespaces("subreaper-handover"),
+        "adopted below: true\nhanded up: true\nreaped: true, killed by 9\n"
     );
     assert_eq!(
         namespaces("subreaper-stop"),

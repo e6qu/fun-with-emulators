@@ -971,7 +971,10 @@ those items.
   capabilities are the process's, not qualified by user namespace;
   `setns` is not implemented; a pid namespace's init killed from outside
   fwe after its parent ran another program (`execve`) ends its namespace
-  only once that parent reaps it or a reaper sees it gone;
+  only once that parent reaps it or a reaper sees it gone; a reaper sees
+  an adopted orphan's state after each signal it is sent, so a stop and a
+  continue sent together, before it looks, are not reported, and stops
+  not yet reported are forgotten when the reaper runs another program;
   `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
   `environ`, and shows only fwe's processes in the initial pid namespace.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
