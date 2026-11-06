@@ -150,6 +150,14 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
     None
 }
 
+/// A reaper reaped a child of its own: what that child left unreaped is
+/// now the reaper's, and owed its SIGCHLD.
+pub fn reaped_own_child() {
+    if active() {
+        notify();
+    }
+}
+
 /// Whether a living process this one adopted matches `sel`.
 pub fn has_live_adopted(sel: Select) -> bool {
     if !active() {
@@ -499,17 +507,17 @@ mod watch {
         });
         // SAFETY: a zeroed kevent is a valid out-parameter.
         let mut evs: [libc::kevent; 32] = unsafe { std::mem::zeroed() };
+        // Processes whose end was reported while they were still on their
+        // way out (not yet zombies): looked at again until they are, since
+        // nothing else will be reported for them.
+        let mut ending: HashSet<(i32, Option<u64>)> = HashSet::new();
+        let soon = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
         loop {
-            // SAFETY: valid out-buffer; blocks until something happens.
+            let timeout = if ending.is_empty() { std::ptr::null() } else { &soon as *const _ };
+            // SAFETY: valid out-buffer; blocks until something happens (or
+            // briefly, while an end is under way).
             let n = unsafe {
-                libc::kevent(
-                    kq,
-                    std::ptr::null(),
-                    0,
-                    evs.as_mut_ptr(),
-                    evs.len() as i32,
-                    std::ptr::null(),
-                )
+                libc::kevent(kq, std::ptr::null(), 0, evs.as_mut_ptr(), evs.len() as i32, timeout)
             };
             if n < 0 {
                 if crate::host::last_errno() == libc::EINTR {
@@ -531,10 +539,20 @@ mod watch {
                     }
                     if ev.fflags & libc::NOTE_EXIT != 0 && pid != me {
                         w.watched.remove(&pid);
+                        ending.insert((pid, procreg::start_time(pid)));
+                    }
+                }
+                // Those that have ended by now: a zombie, or gone.
+                ending.retain(|&(pid, start)| {
+                    // (A pid given to another process since is done too.)
+                    let done = procreg::host_info(pid)
+                        .is_none_or(|(now, _, zombie)| zombie || Some(now) != start);
+                    if done {
                         // Its record is gone unless it was killed outright.
                         procreg::gone(pid);
                     }
-                }
+                    !done
+                });
                 w.follow_recorded(me);
                 notify();
                 wake_waiters();
