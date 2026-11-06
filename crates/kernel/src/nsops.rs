@@ -197,6 +197,12 @@ impl<P: Platform> Kernel<P> {
             return child;
         }
         pidns::set_host(&t.chain, &t.nums, child);
+        if t.nums.first() == Some(&1)
+            && let Some(ns) = t.chain.first()
+        {
+            // The init of a namespace: it takes the namespace with it.
+            crate::reaper::init_child(child, ns.dir().to_vec());
+        }
         pidns::to_guest(child)
     }
 

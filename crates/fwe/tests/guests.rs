@@ -3701,6 +3701,25 @@ fn subreaper_adopts_orphans() {
     );
 }
 
+/// A process that becomes a subreaper does not adopt an orphan below it
+/// that had its adopter already; an orphan it adopted that stops and
+/// continues is reported to its `wait` (`WUNTRACED`, `WCONTINUED`) and
+/// with `SIGCHLD`, once each, as a child's stop and continue are.
+#[test]
+fn subreaper_adoption_and_stops() {
+    assert_eq!(
+        namespaces("subreaper-late"),
+        "child exited 0\nchild is not a subreaper: true\norphan's parent is another: true\n\
+         and stays so: true\nnothing to wait for: true\n"
+    );
+    assert_eq!(
+        namespaces("subreaper-stop"),
+        "child exited 0\nchild is not a subreaper: true\nnothing yet: true\n\
+         stopped: true, by 19\nSIGCHLD for the stop: true\nreported once: true\n\
+         continued: true\nSIGCHLD for the continue: true\nreaped: true, killed by 9\n"
+    );
+}
+
 /// A child killed outright while its parent lives is that parent's zombie;
 /// once the parent ends, the subreaper is sent `SIGCHLD` for it and reaps
 /// it as killed.
@@ -3723,7 +3742,8 @@ fn pid_namespace_init_is_unkillable_from_inside() {
 }
 
 /// A pid namespace's init adopts the orphans in it, and when it ends, or
-/// is killed, the rest of its namespace is killed.
+/// is killed, the rest of its namespace is killed, before its parent's
+/// `wait` reports it.
 #[test]
 fn pid_namespace_init_reaps_and_ends_its_namespace() {
     assert_eq!(
@@ -3733,8 +3753,33 @@ fn pid_namespace_init_reaps_and_ends_its_namespace() {
     );
     assert_eq!(
         namespaces("init-death"),
-        "init exited 3: the rest ended too: true\ninit killed by 9: the rest ended too: true\n"
+        "init exited 3: the rest ended first: true\ninit killed by 9: the rest ended first: true\n"
     );
+}
+
+/// A pid namespace's init killed from outside fwe, by the host's
+/// `SIGKILL`, which it cannot see coming, takes its namespace with it at
+/// once, before its parent reaps it.
+#[test]
+fn pid_namespace_ends_with_an_init_killed_from_outside() {
+    let file = std::env::temp_dir()
+        .join(format!("fwe-ns-{}-init-killed", std::process::id()))
+        .join("tmp/init-pid");
+    let killer = std::thread::spawn(move || {
+        for _ in 0..3000 {
+            if let Some(pid) = std::fs::read_to_string(&file).ok().and_then(|s| s.parse().ok()) {
+                // SAFETY: plain call, to the guest's init (a host pid in
+                // fwe's initial pid namespace).
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    });
+    let out = namespaces("init-killed");
+    assert!(killer.join().unwrap());
+    assert_eq!(out, "the rest ended unreaped: true\ninit killed by 9\n");
 }
 
 /// Run one scenario of the `containers` guest in a root filesystem of its

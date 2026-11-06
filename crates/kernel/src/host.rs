@@ -457,6 +457,16 @@ pub fn signal_is_ignored(sig: u64) -> bool {
     }
 }
 
+/// Whether the host's `SIGCHLD` action has `SA_NOCLDSTOP` (the guest's
+/// does): no `SIGCHLD` for a child that stops or continues.
+pub fn sigchld_nocldstop() -> bool {
+    // SAFETY: zeroed bytes are a valid `sigaction`; the call only reads.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter; no new action.
+    unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) };
+    old.sa_flags & libc::SA_NOCLDSTOP != 0
+}
+
 /// Whether the host reaps this process's children as they end, leaving no
 /// zombie for `wait`: it ignores `SIGCHLD`, or set `SA_NOCLDWAIT`.
 pub fn children_reaped_by_host() -> bool {

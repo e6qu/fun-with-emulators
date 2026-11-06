@@ -252,6 +252,16 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
     }
 }
 
+/// Whether a process of the namespace whose record is `ns`, other than
+/// its init `init`, still runs (a zombie has ended).
+pub fn members_alive(ns: &crate::shared::Record<PidNs>, init: i32) -> bool {
+    let hosts: std::collections::BTreeSet<i32> =
+        ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
+    hosts.into_iter().filter(|&h| h != init).any(|h| {
+        crate::procreg::host_info(h).is_some_and(|(_, _, zombie)| !zombie) && member(h, ns.dir())
+    })
+}
+
 /// Whether live host process `host` is in the pid namespace whose record
 /// is `dir` (or one inside it), by fwe's record of it.
 fn member(host: i32, dir: &[u8]) -> bool {

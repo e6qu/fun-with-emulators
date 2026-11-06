@@ -912,7 +912,7 @@ impl<P: Platform> Kernel<P> {
             // In the process's record, where its descendants look for it;
             // fwe keeps the adoption (see `reaper`).
             PR_SET_CHILD_SUBREAPER => {
-                crate::procreg::set_own_subreaper(arg2 != 0);
+                crate::reaper::set_subreaper(arg2 != 0);
                 crate::reaper::start_if_reaper();
                 0
             }

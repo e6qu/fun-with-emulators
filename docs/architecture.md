@@ -796,9 +796,11 @@ initial namespace sees the host's: its host name, its pids.
 - **pid** (`pidns.rs`): a namespace numbers its processes and threads from
   1 and maps each number to its host pid; `getpid`, `getppid`, `kill`,
   `wait4`, `waitid`, the process-group, session and terminal calls and
-  the senders in `siginfo` are translated. When its init ends, or is sent
-  `SIGKILL`, every other process in it is killed; from inside the
-  namespace, its init cannot be sent `SIGKILL` or `SIGSTOP`.
+  the senders in `siginfo` are translated. When its init ends, however it
+  ends (its parent watches it, so also when the host kills it), every
+  other process in it is killed, and its parent's `wait` reports it only
+  once they have gone; from inside the namespace, its init cannot be sent
+  `SIGKILL` or `SIGSTOP`.
 - **UTS**: `uname`, `sethostname`, `setdomainname` and
   `/proc/sys/kernel/hostname` use its names.
 - **network** (`netns.rs`): a loopback interface, down until brought up;
@@ -824,11 +826,15 @@ might adopt it records how it ended; one killed by `SIGKILL` cannot, and
 whoever finds it gone records that for it. Its parent's `wait` removes the
 record, or once the parent has gone, the adopter's `wait` takes it. A
 reaper runs a watcher thread that follows its descendants on the host
-(`kqueue` process events) and, when an adopted one ends, sends the reaper
-a `SIGCHLD` through the host (so its disposition and mask act on it as on
-a child's; the handler takes the sender and status from the watcher) and
-wakes its threads waiting in `wait`, which look at its own children and
-then at its adopted ones.
+(`kqueue` process events) and, when an adopted one ends, stops or
+continues (the signals it is sent, and then its state), sends the reaper
+a `SIGCHLD` through the host (so its disposition, mask and `SA_NOCLDSTOP`
+act on it as on a child's; the handler takes the sender and status from
+the watcher) and wakes its threads waiting in `wait`, which look at its
+own children and then at its adopted ones. As on Linux, an orphan keeps
+the adopter it had when its parent ended: a process that becomes a
+subreaper notes the orphans below it that have one already, and one that
+stops being a subreaper keeps those it adopted.
 
 `/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
 `status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
@@ -960,13 +966,9 @@ those items.
   port is freed
   when the last descriptor of its socket in the binding process closes;
   capabilities are the process's, not qualified by user namespace;
-  `setns` is not implemented; an adopted orphan that stops or continues
-  is not reported to its adopter's `wait`, and its adopter is found when
-  asked for, not fixed when its parent ends (an ancestor that becomes a
-  subreaper later adopts it too); a pid namespace's init killed outright
-  (not by a fwe process's `kill`) ends its namespace only once its parent
-  reaps it or a reaper sees it gone, and an init's end is reported before
-  the rest of its namespace has gone;
+  `setns` is not implemented; a pid namespace's init killed from outside
+  fwe after its parent ran another program (`execve`) ends its namespace
+  only once that parent reaps it or a reaper sees it gone;
   `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
   `environ`, and shows only fwe's processes in the initial pid namespace.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
