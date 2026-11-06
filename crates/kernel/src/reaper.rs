@@ -233,16 +233,28 @@ pub fn reaped_own_child(child: i32) {
     }
 }
 
-/// Whether a living process this one adopted matches `sel`.
+/// Whether a living process this one adopted matches `sel`. One found
+/// ended with its record left (killed outright, which records nothing)
+/// has its end recorded now, for the `wait` that looks next to take, as
+/// the watcher would a moment later.
 pub fn has_live_adopted(sel: Select) -> bool {
     if !active() {
         return false;
     }
-    procreg::all().into_iter().any(|(pid, r)| {
+    let mut live = false;
+    for (pid, r) in procreg::all() {
         // SAFETY: plain host call.
         let pgid = unsafe { libc::getpgid(pid) };
-        sel.matches(pid, pgid) && procreg::alive((pid, r.start)) && adopted_live(pid, &r)
-    })
+        if !adopted_live(pid, &r) {
+            continue;
+        }
+        if !procreg::alive((pid, r.start)) {
+            procreg::gone(pid);
+        } else if sel.matches(pid, pgid) {
+            live = true;
+        }
+    }
+    live
 }
 
 /// The stops and continues of adopted processes not yet reported to
