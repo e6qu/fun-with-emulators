@@ -18,7 +18,8 @@ hardware is still to come), so every target program has a test. What
 remains is that run on real hardware, and the `x18` and code-discovery
 gaps, which no target program needs yet. M3 is in progress: crun runs the
 standard `alpine` image in its own namespaces, cgroup, capabilities and
-seccomp profile; overlay mounts, podman and containerd are next.
+seccomp profile, and podman loads that image and runs containers of it
+with `vfs` storage; overlay mounts and containerd are next.
 
 ## M0 — Foundation (done)
 
@@ -156,7 +157,8 @@ servers run unmodified.
 - [ ] Overlay mounts
 - [x] seccomp and capabilities
 - [x] An OCI runtime runs a standard image: crun runs the `alpine` image
-- [ ] podman runs standard images
+- [x] podman runs standard images: it loads the `alpine` image and runs
+  containers of it (`vfs` storage until overlay mounts)
 - [ ] containerd runs standard images
 
 **Done when:** podman and containerd run standard container images.

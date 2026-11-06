@@ -178,6 +178,13 @@ fn orphan(report: [i32; 2], then: fn() -> i32) -> (i32, i32) {
     }
 }
 
+/// Wait for a signal to end the process.
+fn wait_forever() -> i32 {
+    // SAFETY: plain call.
+    unsafe { pause() };
+    0
+}
+
 /// How a wait status ended: "exited N" or "killed by N".
 fn ended(status: i32) -> String {
     if status & 0x7f == 0 {
@@ -621,11 +628,7 @@ fn main() {
                 prctl(PR_SET_CHILD_SUBREAPER, 1u64);
                 let mut report = [0i32; 2];
                 pipe(report.as_mut_ptr());
-                let (_, g) = orphan(report, || {
-                    // SAFETY: plain call.
-                    unsafe { pause() };
-                    0
-                });
+                let (_, g) = orphan(report, wait_forever);
                 read_i32(report[0]);
                 println!("proc shows the subreaper: {}", proc_ppid(g) == getpid());
                 let mut status = 0;
@@ -666,8 +669,8 @@ fn main() {
                     pipe(ready.as_mut_ptr());
                     pipe(up.as_mut_ptr());
                     let init = clone_child(CLONE_NEWPID, || {
-                        // SAFETY: plain calls.
-                        unsafe {
+                        // Plain calls, in the unsafe block around.
+                        {
                             if fork() == 0 {
                                 close(hold[0]);
                                 write(ready[1], b"x".as_ptr(), 1);

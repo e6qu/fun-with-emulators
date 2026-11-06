@@ -17,11 +17,17 @@ of life, so the files no longer change.
 | Manifest | Contents | Size |
 | --- | --- | --- |
 | `fetch/crun.txt` | The 3.20.10 minirootfs (the root filesystem of the standard `alpine` image, used both as the test's root and as the container's image), crun 1.17, libcap, libseccomp and yajl | 4 MB |
+| `fetch/podman.txt` | The minirootfs (the test's root, and the one layer of the `alpine` image the test builds an OCI archive of), podman 5.2.5, conmon, crun, netavark, containers-common, catatonit and their libraries (gpgme, libassuan, libgpg-error, sqlite, glib, pcre2, libintl, libgcc, libcap, libseccomp, yajl) | 22 MB |
 
 ## License
 
 What the tests fetch keeps the licenses Alpine ships it under, recorded in
 each package's metadata: crun GPL-2.0-or-later and LGPL-2.1-or-later;
 libcap BSD-3-Clause or GPL-2.0-only; libseccomp LGPL-2.1-or-later; yajl MIT;
+podman, conmon, netavark and containers-common Apache-2.0; catatonit
+GPL-2.0-or-later; gpgme LGPL-2.1-or-later and GPL-3.0-or-later; libassuan,
+glib and libintl LGPL-2.1-or-later; libgpg-error and libgcc
+GPL-2.0-or-later and LGPL-2.1-or-later; sqlite the SQLite blessing; pcre2
+BSD-3-Clause;
 the minirootfs's packages (BusyBox GPL-2.0-only, musl MIT, and others) their
 own.

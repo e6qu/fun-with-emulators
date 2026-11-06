@@ -1292,6 +1292,106 @@ fn alpine_crun_runs_an_image() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// The standard `alpine` image as an OCI archive at `out`, made from its
+/// one layer, the minirootfs, as the official image is: named
+/// `docker.io/library/alpine:3.20`.
+fn alpine_oci_archive(manifest_name: &str, out: &Path) {
+    let dir = out.with_extension("layout");
+    let _ = std::fs::remove_dir_all(&dir);
+    let blobs = dir.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let blob = |bytes: &[u8]| {
+        let tmp = dir.join("blob");
+        std::fs::write(&tmp, bytes).unwrap();
+        let digest = sha256(&tmp);
+        std::fs::rename(&tmp, blobs.join(&digest)).unwrap();
+        (digest, bytes.len())
+    };
+    let layer = std::fs::read(alpine_image(manifest_name)).unwrap();
+    let tar = Command::new("gunzip").arg("-c").arg(alpine_image(manifest_name)).output().unwrap();
+    let unpacked = dir.join("layer.tar");
+    std::fs::write(&unpacked, &tar.stdout).unwrap();
+    let diff_id = sha256(&unpacked);
+    std::fs::remove_file(&unpacked).unwrap();
+    let (layer_digest, layer_size) = blob(&layer);
+    let config = format!(
+        r#"{{"architecture":"arm64","variant":"v8","os":"linux","config":{{"Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],"Cmd":["/bin/sh"]}},"rootfs":{{"type":"layers","diff_ids":["sha256:{diff_id}"]}}}}"#
+    );
+    let (config_digest, config_size) = blob(config.as_bytes());
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config_digest}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{layer_digest}","size":{layer_size}}}]}}"#
+    );
+    let (manifest_digest, manifest_size) = blob(manifest.as_bytes());
+    std::fs::write(
+        dir.join("index.json"),
+        format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:{manifest_digest}","size":{manifest_size},"annotations":{{"org.opencontainers.image.ref.name":"docker.io/library/alpine:3.20"}}}}]}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    run_checked(
+        Command::new("tar")
+            .arg("cf")
+            .arg(out)
+            .args(["oci-layout", "index.json", "blobs"])
+            .current_dir(&dir),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What the container prints in [`alpine_podman_runs_an_image`].
+const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
+    grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; ls /proc | grep -E '^[0-9]+$' | head -1; \
+    touch /made-here && echo writable; exit 3";
+
+/// Alpine's podman (fetched: `guests/alpine/fetch/podman.txt`), as root
+/// with the `vfs` storage driver: it loads the standard `alpine` image
+/// from an OCI archive and runs a container of it through conmon and crun
+/// (conmon adopting the container's init as a subreaper, and attaching to
+/// it over a `SOCK_SEQPACKET` socket); the container's exit status is
+/// podman's, and `--rm` leaves no container behind.
+#[test]
+fn alpine_podman_runs_an_image() {
+    let root = std::env::temp_dir().join(format!("fwe-podman-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("podman")).arg(&root));
+    let etc = root.join("etc/containers");
+    std::fs::write(
+        etc.join("storage.conf"),
+        "[storage]\ndriver = \"vfs\"\nrunroot = \"/run/containers/storage\"\n\
+         graphroot = \"/var/lib/containers/storage\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        etc.join("containers.conf"),
+        "[engine]\ncgroup_manager = \"cgroupfs\"\nevents_logger = \"file\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("root")).unwrap();
+    alpine_oci_archive("podman", &root.join("tmp/alpine.tar"));
+    let _workload = workload();
+    let podman = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        // As a login would have it, not the host's.
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
+        eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
+    let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
+    let run = podman(&["run", "--rm", "--network=none", "alpine:3.20", "sh", "-c", IN_PODMAN]);
+    let after = podman(&["ps", "-a", "--format", "{{.ID}}"]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(stdout(&loaded).contains("Loaded image: docker.io/library/alpine:3.20"));
+    assert_eq!(stdout(&images), "docker.io/library/alpine:3.20\n");
+    assert_eq!(stdout(&run), "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\n");
+    assert_eq!(run.status.code(), Some(3));
+    assert_eq!(stdout(&after), "");
+}
+
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
 /// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
 /// constant tables among its code, which must not be rewritten), zlib, the
@@ -3605,4 +3705,129 @@ fn pid_namespace_init_reaps_and_ends_its_namespace() {
         namespaces("init-death"),
         "init exited 3: the rest ended too: true\ninit killed by 9: the rest ended too: true\n"
     );
+}
+
+/// Run one scenario of the `containers` guest in a root filesystem of its
+/// own (`/tmp`, and `/etc` with `marker`) and return its output.
+fn containers(scenario: &str) -> String {
+    let root = std::env::temp_dir().join(format!("fwe-ct-{}-{scenario}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["tmp", "etc"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(root.join("etc/marker"), "marked\n").unwrap();
+    std::fs::copy(rust_guest("containers"), root.join("containers")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures")
+        .arg("--root")
+        .arg(&root)
+        .arg(root.join("containers"))
+        .arg(scenario);
+    let out = run_bounded(cmd);
+    eprintln!("--- containers {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
+    stdout(&out)
+}
+
+/// Extended attributes by Linux's namespaces: set, created once, read
+/// (and measured), listed, removed; `system.` (ACLs) and a name in no
+/// namespace are not kept; `user.` ones are for files, not links.
+#[test]
+fn extended_attributes() {
+    assert_eq!(
+        containers("xattr"),
+        "user: ok\ntrusted: ok\nagain, create: EEXIST\nacl: EOPNOTSUPP\n\
+         no namespace: EOPNOTSUPP\nget: y\nsize: 1\nmissing: ENODATA\n\
+         list: trusted.overlay.opaque user.a\nremove: ok\nuser on a link: EPERM\n\
+         trusted on a link: ok\n"
+    );
+}
+
+/// Root passes permission bits, also of modes that deny every access, which
+/// `stat` shows as they are; a process without the capabilities is held to
+/// them.
+#[test]
+fn root_passes_permission_bits() {
+    assert_eq!(
+        containers("modes"),
+        "dir: 555\nroot makes a file in it: ok\nfile: 0\nroot writes it: ok\n\
+         user reads it: EACCES\nuser makes a file: EACCES\ndir after chmod: 755\n"
+    );
+}
+
+/// A listening `SOCK_SEQPACKET` Unix socket: messages keep their
+/// boundaries, one longer than the buffer is cut (`MSG_TRUNC`), and the
+/// peer's close is end-of-file that `epoll` reports.
+#[test]
+fn seqpacket_listener() {
+    assert_eq!(
+        containers("seqpacket"),
+        "bind: ok\ngot 3 \"one\" cut false\ngot 3 \"two\" cut false\n\
+         got 5 \"hello\" cut true\nnothing yet: 0\npeer gone: 1 in true hup true\n\
+         end of file: 0\n"
+    );
+}
+
+/// `/proc/self/fd/N`, `cwd` and `root` lead out of `/proc` in the middle of
+/// a path, as Linux's magic links do.
+#[test]
+fn proc_magic_links() {
+    assert_eq!(
+        containers("proc-links"),
+        "made through the fd: ok\nthere: true\nthrough cwd: marked\nthrough root: marked\n\
+         cwd: /etc\n"
+    );
+}
+
+/// A network namespace has sysctls of its own, checked as Linux checks
+/// them; the initial namespace's (the host's) cannot be changed.
+#[test]
+fn network_namespace_sysctls() {
+    assert_eq!(
+        containers("sysctl"),
+        "initial: 1 0\ninitial write: Permission denied (os error 13)\nnew: 1 0\n\
+         set: 0 2147483647\nbackwards: Invalid argument (os error 22)\ninitial after: 1 0\n\
+         listed: [\"ping_group_range\"]\n"
+    );
+}
+
+/// A Unix socket's node has the socket's mode (every bit, or what `fchmod`
+/// gave it) less the umask, and a path under a long root binds and
+/// connects.
+#[test]
+fn unix_socket_nodes() {
+    assert_eq!(
+        containers("sockets"),
+        "plain: 755\nfchmod 660: 640\nlong bind: ok\nlong connect: ok\nmissing: ENOENT\n"
+    );
+}
+
+/// `--strace-file` traces every process of a run to one file, each line
+/// naming its process: here a parent and the child it forks.
+#[test]
+fn strace_file_follows_children() {
+    let root = std::env::temp_dir().join(format!("fwe-trace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("containers"), root.join("containers")).unwrap();
+    let log = root.with_extension("log");
+    let _ = std::fs::remove_file(&log);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace")
+        .arg(format!("--strace-file={}", log.display()))
+        .arg("--root")
+        .arg(&root)
+        .arg(root.join("containers"))
+        .arg("modes");
+    let out = run_bounded(cmd);
+    let trace = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("mkdirat("), "traced to stderr");
+    let pids: std::collections::BTreeSet<&str> =
+        trace.lines().filter_map(|l| l.strip_prefix("[fwe ")?.split(']').next()).collect();
+    assert_eq!(pids.len(), 2, "{pids:?}");
+    assert!(trace.contains("setuid("), "the child's calls are there");
 }
