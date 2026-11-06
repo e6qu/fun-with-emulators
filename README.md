@@ -15,7 +15,8 @@ works too). Processes, threads, memory, signals, files on a Linux rootfs,
 networking, terminals, event descriptors and a synthetic `/proc` are in
 place. Alpine's crun runs the standard `alpine` container image, in
 namespaces, a cgroup, and the capabilities and seccomp profile its spec
-gives it.
+gives it, and Alpine's podman loads that image and runs containers of it
+(through conmon and crun, with `vfs` storage).
 
 A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
 `python3.11`, GCC, clang and Go) cannot be mapped in-process; fwe runs it in a
@@ -37,6 +38,7 @@ still missing.
 cargo build --release
 target/release/fwe ./hello                 # run a Linux arm64 executable
 target/release/fwe --strace ./hello        # trace its system calls
+target/release/fwe --strace --strace-file=trace.log ./hello  # every process, to a file
 target/release/fwe --root ./rootfs ./hello # run with ./rootfs as /
 ```
 

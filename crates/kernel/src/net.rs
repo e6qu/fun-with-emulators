@@ -103,16 +103,68 @@ unsafe fn to_host(
     len: u64,
     out: &mut [u8; SOCKADDR_MAX],
     follow: bool,
-) -> Result<libc::socklen_t, i64> {
+) -> Result<HostAddr, i64> {
     if addr == 0 || len < 2 {
         return Err(err(errno::EINVAL));
     }
     let src = uaccess::read_bytes(addr, (len as usize).min(SOCKADDR_MAX)).map_err(err)?;
-    match u16::from_ne_bytes([src[0], src[1]]) as u64 {
-        AF_INET => inet_to_host(&src, out, 16),
-        AF_INET6 => inet_to_host(&src, out, 28),
-        AF_UNIX => unix_to_host(&src, out, follow),
-        _ => Err(err(errno::EAFNOSUPPORT)),
+    let len = match u16::from_ne_bytes([src[0], src[1]]) as u64 {
+        AF_INET => inet_to_host(&src, out, 16)?,
+        AF_INET6 => inet_to_host(&src, out, 28)?,
+        AF_UNIX => return unix_to_host(&src, out, follow),
+        _ => return Err(err(errno::EAFNOSUPPORT)),
+    };
+    Ok(HostAddr { len, dir: None, guest: Vec::new() })
+}
+
+/// A host socket address [`to_host`] made: its length, and for a Unix path
+/// too long for the host's `sun_path`, the directory it is in (the
+/// address then holds only the last name, see [`bind_or_connect`]).
+struct HostAddr {
+    len: libc::socklen_t,
+    dir: Option<std::os::fd::OwnedFd>,
+    /// For such a path, the guest's: what the host will not report back.
+    guest: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// Change the calling thread's working directory alone (`-1`: back to
+    /// the process's).
+    fn pthread_fchdir_np(fd: i32) -> i32;
+}
+
+/// `bind` (or `connect`, for `!bind`) socket `fd` to host address `hb`, as
+/// [`to_host`] made it: for one relative to a directory, from that
+/// directory as this thread's working directory, for the call.
+fn bind_or_connect(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr, bind: bool) -> i32 {
+    let p = hb.as_ptr() as *const libc::sockaddr;
+    // SAFETY: `hb` holds a valid host sockaddr of `a.len` bytes.
+    let call =
+        || unsafe { if bind { libc::bind(fd, p, a.len) } else { libc::connect(fd, p, a.len) } };
+    let Some(dir) = &a.dir else { return call() };
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a live directory; the thread's own directory is undone
+        // before returning, the call's errno kept.
+        unsafe {
+            if pthread_fchdir_np(dir.as_raw_fd()) != 0 {
+                return -1;
+            }
+            let r = call();
+            let e = crate::host::last_errno();
+            pthread_fchdir_np(-1);
+            *libc::__error() = e;
+            r
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        // SAFETY: setting this thread's errno.
+        unsafe { *libc::__errno_location() = libc::ENAMETOOLONG };
+        -1
     }
 }
 
@@ -141,15 +193,30 @@ fn inet_to_host(
 }
 
 /// `src` is the guest's address.
-fn unix_to_host(
-    src: &[u8],
-    out: &mut [u8; SOCKADDR_MAX],
-    follow: bool,
-) -> Result<libc::socklen_t, i64> {
+fn unix_to_host(src: &[u8], out: &mut [u8; SOCKADDR_MAX], follow: bool) -> Result<HostAddr, i64> {
     let raw = &src[2..];
-    let host = root_unix_path(raw, follow)?;
+    let mut host = root_unix_path(raw, follow)?;
+    let mut dir = None;
     if host.len() + 1 > UNIX_PATH_MAX {
-        return Err(err(errno::ENAMETOOLONG));
+        // A guest path short enough for Linux, under a long host root: the
+        // name relative to its directory.
+        let slash = host.iter().rposition(|&b| b == b'/').ok_or(err(errno::ENAMETOOLONG))?;
+        let name = host[slash + 1..].to_vec();
+        if name.is_empty() || name.len() + 1 > UNIX_PATH_MAX {
+            return Err(err(errno::ENAMETOOLONG));
+        }
+        let parent = if slash == 0 { b"/".to_vec() } else { host[..slash].to_vec() };
+        let c = std::ffi::CString::new(parent).map_err(|_| err(errno::EINVAL))?;
+        // SAFETY: a NUL-terminated path.
+        let fd =
+            unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(last_error());
+        }
+        use std::os::fd::FromRawFd;
+        // SAFETY: a fresh descriptor this owns.
+        dir = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        host = name;
     }
     #[cfg(target_os = "linux")]
     {
@@ -164,7 +231,7 @@ fn unix_to_host(
         {
             out[0] = 2;
         }
-        return Ok(2);
+        return Ok(HostAddr { len: 2, dir, guest: Vec::new() });
     }
     out[2..2 + host.len()].copy_from_slice(&host);
     out[2 + host.len()] = 0;
@@ -173,7 +240,12 @@ fn unix_to_host(
     {
         out[0] = total as u8;
     }
-    Ok(total as libc::socklen_t)
+    let guest = if dir.is_some() {
+        raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(HostAddr { len: total as libc::socklen_t, dir, guest })
 }
 
 /// Write a host `sockaddr` back to a guest buffer in Linux layout, honoring the
@@ -279,13 +351,22 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
         Ok(d) => d,
         Err(e) => return e,
     };
-    let base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    // macOS has no SOCK_SEQPACKET Unix sockets: a stream socket with its
+    // messages framed (see `seqpacket`).
+    let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
+    if seqpacket {
+        base = libc::SOCK_STREAM;
+    }
     // SAFETY: plain host call.
     let fd = unsafe { libc::socket(dom, base, protocol as i32) };
     if fd < 0 {
         return last_error();
     }
     apply_sock_flags(fd, type_);
+    if seqpacket {
+        crate::seqpacket::make(fd);
+    }
     fd as i64
 }
 
@@ -299,12 +380,11 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
         Err(e) => return e,
     };
     let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
-    // macOS has no SOCK_SEQPACKET Unix sockets: a datagram pair keeps the
-    // message boundaries, and the sockets are marked so that what differs
-    // reads as Linux has it (see `fdmarks`).
+    // macOS has no SOCK_SEQPACKET Unix sockets: a stream pair with its
+    // messages framed (see `seqpacket`).
     let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
     if seqpacket {
-        base = libc::SOCK_DGRAM;
+        base = libc::SOCK_STREAM;
     }
     let mut fds = [0i32; 2];
     // SAFETY: plain host call with a 2-element array.
@@ -315,8 +395,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     apply_sock_flags(fds[0], type_);
     apply_sock_flags(fds[1], type_);
     if seqpacket {
-        crate::fdmarks::mark(fds[0], crate::fdmarks::Mark::SeqPacket);
-        crate::fdmarks::mark(fds[1], crate::fdmarks::Mark::SeqPacket);
+        crate::seqpacket::make(fds[0]);
+        crate::seqpacket::make(fds[1]);
     }
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
@@ -335,26 +415,91 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
 /// `addr` must point to `addrlen` readable bytes.
 /// `may_low`: the caller may bind a port below 1024
 /// (`CAP_NET_BIND_SERVICE`), as a network namespace of fwe's asks.
-pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool) -> i64 {
+pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) -> i64 {
     let mut hb = empty_sockaddr();
     // SAFETY: the caller guarantees the sockaddr spans addrlen.
-    let hlen = match unsafe { to_host(addr, addrlen, &mut hb, false) } {
-        Ok(l) => l,
+    let a = match unsafe { to_host(addr, addrlen, &mut hb, false) } {
+        Ok(a) => a,
         Err(e) => return e,
     };
     let plan = match crate::netns::bind_prepare(fd as i32, &mut hb, may_low) {
         Ok(p) => p,
         Err(e) => return err(e),
     };
-    // SAFETY: `hb` holds a valid host sockaddr of `hlen` bytes.
-    let r =
-        ret(unsafe { libc::bind(fd as i32, hb.as_ptr() as *const libc::sockaddr, hlen) } as i64);
+    let r = ret(bind_or_connect(fd as i32, &hb, &a, true) as i64);
+    if r == 0 && a.dir.is_some() {
+        remember_name(fd as i32, true, &a.guest);
+    }
     if r == 0
         && let Some(plan) = plan
     {
         crate::netns::bind_done(fd as i32, plan);
     }
+    if r == 0 && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
+        // The node takes the socket's mode (its `fchmod`, or every bit),
+        // less the umask, as on Linux.
+        let mode = take_socket_mode(fd as i32).unwrap_or(0o777) & !umask;
+        let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
+        if let Ok(name) = std::ffi::CString::new(&hb[2..end]) {
+            use std::os::fd::AsRawFd;
+            let dir = a.dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+            // Not through a link another thread may have put in its place.
+            // SAFETY: a NUL-terminated name, relative to a live directory.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
+                    && st.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                {
+                    libc::fchmodat(
+                        dir,
+                        name.as_ptr(),
+                        mode as libc::mode_t,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    );
+                }
+            };
+        }
+    }
     r
+}
+
+/// The family of host socket address `hb`.
+fn family(hb: &[u8]) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        u16::from_ne_bytes([hb[0], hb[1]]) as i32
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        hb[1] as i32
+    }
+}
+
+/// Modes given unbound sockets with `fchmod`, by descriptor and the
+/// socket's inode: what a node bound for one is made with.
+static SOCKET_MODES: std::sync::Mutex<Vec<(i32, u64, u32)>> = std::sync::Mutex::new(Vec::new());
+
+fn inode(fd: i32) -> Option<u64> {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino as u64)
+}
+
+/// `fchmod` of socket `fd` to `perm`: the mode a node bound for it gets
+/// (the host has no mode for a socket itself).
+pub fn set_socket_mode(fd: i32, perm: u32) {
+    let Some(ino) = inode(fd) else { return };
+    let mut m = SOCKET_MODES.lock().unwrap_or_else(|e| e.into_inner());
+    m.retain(|&(f, _, _)| f != fd);
+    m.push((fd, ino, perm & 0o7777));
+}
+
+fn take_socket_mode(fd: i32) -> Option<u32> {
+    let ino = inode(fd)?;
+    let mut m = SOCKET_MODES.lock().unwrap_or_else(|e| e.into_inner());
+    let i = m.iter().position(|&(f, n, _)| f == fd && n == ino)?;
+    Some(m.swap_remove(i).2)
 }
 
 /// `listen(fd, backlog)`.
@@ -373,15 +518,39 @@ pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
 pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     let mut hb = empty_sockaddr();
     // SAFETY: the caller guarantees the sockaddr spans addrlen.
-    let hlen = match unsafe { to_host(addr, addrlen, &mut hb, true) } {
-        Ok(l) => l,
+    let a = match unsafe { to_host(addr, addrlen, &mut hb, true) } {
+        Ok(a) => a,
         Err(e) => return e,
     };
     if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
         return err(e);
     }
-    // SAFETY: `hb` holds a valid host sockaddr of `hlen` bytes.
-    ret(unsafe { libc::connect(fd as i32, hb.as_ptr() as *const libc::sockaddr, hlen) } as i64)
+    let r = ret(bind_or_connect(fd as i32, &hb, &a, false) as i64);
+    if r == 0 && a.dir.is_some() {
+        remember_name(fd as i32, false, &a.guest);
+    }
+    r
+}
+
+/// Unix sockets bound (`local`) or connected to a path the host knows only
+/// relative to its directory: by descriptor and inode, the guest's path,
+/// which `getsockname` and `getpeername` report.
+#[allow(clippy::type_complexity)]
+static NAMES: std::sync::Mutex<Vec<(i32, u64, bool, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+fn remember_name(fd: i32, local: bool, guest: &[u8]) {
+    let Some(ino) = inode(fd) else { return };
+    let mut n = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    n.retain(|&(f, _, l, _)| !(f == fd && l == local));
+    n.push((fd, ino, local, guest.to_vec()));
+}
+
+/// The guest path [`remember_name`] kept for `fd`, if it still names that
+/// socket.
+fn remembered_name(fd: i32, local: bool) -> Option<Vec<u8>> {
+    let ino = inode(fd)?;
+    let n = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    n.iter().find(|&&(f, i, l, _)| f == fd && i == ino && l == local).map(|e| e.3.clone())
 }
 
 /// `accept4(fd, addr, addrlen, flags)`; `accept` is this with `flags == 0`.
@@ -404,6 +573,10 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
         return last_error();
     }
     crate::netns::to_guest(r, &mut hb, false);
+    if crate::seqpacket::is(fd as i32) {
+        // A connection of a SOCK_SEQPACKET listener is one too.
+        crate::seqpacket::make(r);
+    }
     if want && name_to_guest(&hb, hl, addr, addrlen).is_err() {
         // SAFETY: closing the connection just accepted.
         unsafe { libc::close(r) };
@@ -431,6 +604,17 @@ pub unsafe fn getname(fd: u64, addr: u64, addrlen: u64, peer: bool) -> i64 {
     };
     if r < 0 {
         return last_error();
+    }
+    if let Some(path) = remembered_name(fd as i32, !peer) {
+        // A Linux `sockaddr_un` with the guest's path, cut to the buffer.
+        let mut name = (AF_UNIX as u16).to_ne_bytes().to_vec();
+        name.extend_from_slice(&path);
+        name.push(0);
+        let cap: u32 = guest!(uaccess::read(addrlen));
+        let n = (cap as usize).min(name.len());
+        guest!(uaccess::write_from(addr, &name[..n]));
+        guest!(uaccess::write(addrlen, name.len() as u32));
+        return 0;
     }
     crate::netns::to_guest(fd as i32, &mut hb, !peer);
     guest!(name_to_guest(&hb, hl, addr, addrlen));
@@ -498,17 +682,25 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     let (aptr, alen) = if addr != 0 && addrlen != 0 {
         // SAFETY: the caller guarantees the sockaddr spans addrlen.
         match unsafe { to_host(addr, addrlen, &mut hb, true) } {
-            Ok(l) => {
+            Ok(a) => {
+                if a.dir.is_some() {
+                    // No `sendto` takes a directory to name it from.
+                    return err(errno::ENAMETOOLONG);
+                }
                 if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
                     return err(e);
                 }
-                (hb.as_ptr() as *const libc::sockaddr, l)
+                (hb.as_ptr() as *const libc::sockaddr, a.len)
             }
             Err(e) => return e,
         }
     } else {
         (std::ptr::null(), 0)
     };
+    if crate::seqpacket::is(fd as i32) {
+        let v = guest!(uaccess::host_buffer(buf, len, false));
+        return crate::seqpacket::send(fd as i32, &[v], (std::ptr::null_mut(), 0), hflags);
+    }
     // SAFETY: valid buffer and optional host sockaddr.
     ret(unsafe {
         libc::sendto(fd as i32, buf as *const libc::c_void, len as usize, hflags, aptr, alen) as i64
@@ -521,6 +713,15 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
 /// `buf` spans `len` writable bytes; `addr`/`addrlen`, if non-null, writable.
 pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> i64 {
     let hflags = msg_flags_to_host(flags);
+    if crate::seqpacket::is(fd as i32) {
+        // A connected socket's peer, which Linux does not report here.
+        if addr != 0 && addrlen != 0 {
+            guest!(uaccess::write(addrlen, 0u32));
+        }
+        let v = guest!(uaccess::host_buffer(buf, len, true));
+        return crate::seqpacket::recv(fd as i32, &[v], (std::ptr::null_mut(), 0), flags, hflags)
+            .result;
+    }
     if addr != 0 {
         let mut hb = empty_sockaddr();
         let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
@@ -676,11 +877,15 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let (name_ptr, name_len) = if name != 0 && namelen != 0 {
         // SAFETY: the caller guarantees the name spans namelen.
         match unsafe { to_host(name, namelen as u64, &mut hb, true) } {
-            Ok(l) => {
+            Ok(a) => {
+                if a.dir.is_some() {
+                    // No `sendto` takes a directory to name it from.
+                    return err(errno::ENAMETOOLONG);
+                }
                 if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
                     return err(e);
                 }
-                (hb.as_mut_ptr() as *mut libc::c_void, l)
+                (hb.as_mut_ptr() as *mut libc::c_void, a.len)
             }
             Err(e) => return e,
         }
@@ -714,6 +919,14 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_len,
         msg_flags: 0,
     };
+    if crate::seqpacket::is(fd as i32) {
+        return crate::seqpacket::send(
+            fd as i32,
+            &hiov,
+            (hmsg.msg_control, hmsg.msg_controllen as usize),
+            msg_flags_to_host(flags),
+        );
+    }
     // SAFETY: `hmsg` references guest iov and local name/control buffers.
     ret(unsafe { libc::sendmsg(fd as i32, &hmsg, msg_flags_to_host(flags)) } as i64)
 }
@@ -752,11 +965,29 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_cap,
         msg_flags: 0,
     };
-    // SAFETY: `hmsg` references guest iov and local name/control buffers.
-    let r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
-    if r < 0 {
-        return last_error();
-    }
+    let r = if crate::seqpacket::is(fd as i32) {
+        let got = crate::seqpacket::recv(
+            fd as i32,
+            &hiov,
+            (hmsg.msg_control, hmsg.msg_controllen as usize),
+            flags,
+            msg_flags_to_host(flags),
+        );
+        if got.result < 0 {
+            return got.result;
+        }
+        hmsg.msg_namelen = 0;
+        hmsg.msg_controllen = got.controllen as _;
+        hmsg.msg_flags = got.flags;
+        got.result as isize
+    } else {
+        // SAFETY: `hmsg` references guest iov and local name/control buffers.
+        let r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        if r < 0 {
+            return last_error();
+        }
+        r
+    };
     if want_name {
         crate::netns::to_guest(fd as i32, &mut hb, false);
         let full = guest!(to_guest(&hb, hmsg.msg_namelen, name, namelen));
@@ -864,8 +1095,10 @@ fn scm_host_to_linux(
             out[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
             out[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
             for i in 0..nfds {
-                out[16 + i * 4..20 + i * 4]
-                    .copy_from_slice(&host[off + 12 + i * 4..off + 16 + i * 4]);
+                let fd = &host[off + 12 + i * 4..off + 16 + i * 4];
+                out[16 + i * 4..20 + i * 4].copy_from_slice(fd);
+                // A SOCK_SEQPACKET socket of fwe's is one here too.
+                crate::seqpacket::adopt(i32::from_ne_bytes(fd.try_into().unwrap()));
             }
             uaccess::write_from(dst, &out)?;
             return Ok((linux_len as u64, false));
@@ -921,7 +1154,7 @@ mod tests {
         assert!(tx >= 0);
         let addr = sockaddr_in_v4(0);
         // SAFETY: valid sockaddr.
-        assert_eq!(unsafe { bind(rx as u64, addr.as_ptr() as u64, 16, true) }, 0);
+        assert_eq!(unsafe { bind(rx as u64, addr.as_ptr() as u64, 16, true, 0o022) }, 0);
         let mut got = [0u8; 16];
         let mut len: u32 = 16;
         // SAFETY: writable out sockaddr and length.
@@ -967,7 +1200,7 @@ mod tests {
         let mut addr = [0u8; 28];
         addr[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
         // SAFETY: valid sockaddr_in6.
-        let b = unsafe { bind(fd as u64, addr.as_ptr() as u64, 28, true) };
+        let b = unsafe { bind(fd as u64, addr.as_ptr() as u64, 28, true, 0o022) };
         if b != 0 {
             eprintln!("skipping: IPv6 bind unavailable ({b})");
             close(fd);
@@ -997,7 +1230,7 @@ mod tests {
         }
         let addr = sockaddr_in_v4(0);
         // SAFETY: valid sockaddr.
-        assert_eq!(unsafe { bind(srv as u64, addr.as_ptr() as u64, 16, true) }, 0);
+        assert_eq!(unsafe { bind(srv as u64, addr.as_ptr() as u64, 16, true, 0o022) }, 0);
         // SAFETY: no pointers.
         assert_eq!(unsafe { listen(srv as u64, 1) }, 0);
         let mut sa = [0u8; 16];
@@ -1084,7 +1317,7 @@ mod tests {
         // "s", from the working directory /sub.
         let (addr, alen) = unix_addr(b"s");
         // SAFETY: valid sockaddr.
-        let b = unsafe { bind(srv as u64, addr.as_ptr() as u64, alen, true) };
+        let b = unsafe { bind(srv as u64, addr.as_ptr() as u64, alen, true, 0o022) };
         assert_eq!(b, 0, "unix bind: {b}");
         assert!(dir.join("sub/s").exists());
         // SAFETY: no pointers.
@@ -1125,7 +1358,7 @@ mod tests {
         let other = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
         let (addr, alen) = unix_addr(b"/dangling");
         // SAFETY: valid sockaddr.
-        let b = unsafe { bind(other as u64, addr.as_ptr() as u64, alen, true) };
+        let b = unsafe { bind(other as u64, addr.as_ptr() as u64, alen, true, 0o022) };
         assert_eq!(b, -(errno::EADDRINUSE as i64));
         assert!(!dir.join("sub/t").exists());
 

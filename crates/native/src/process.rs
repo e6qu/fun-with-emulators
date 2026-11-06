@@ -7,6 +7,7 @@ use crate::{
 };
 use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::mm::region;
+use fwe_kernel::reaper;
 use fwe_kernel::{Platform, Regs, host, thread};
 use std::sync::atomic::Ordering;
 
@@ -114,6 +115,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         fs.set_exe_fd(exe_fd);
         let exe = fs.exe_fd_target().unwrap_or_else(|| path.clone());
         fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+        fs.set_auxv(out.auxv);
         fs.publish();
     }
     // The new program starts with every register zero, as Linux leaves it;
@@ -354,6 +356,82 @@ pub fn do_wait4(regs: &Regs) -> i64 {
             host_options |= host;
         }
     }
+    if !reaper::active() {
+        return wait4_host(pid, host_options, wstatus, rusage);
+    }
+    // A reaper: its own children, and those it adopted.
+    let sel = match pid {
+        -1 => reaper::Select::Any,
+        // SAFETY: plain host call.
+        0 => reaper::Select::Pgid(unsafe { libc::getpgrp() }),
+        p if p > 0 => reaper::Select::Pid(p),
+        p => reaper::Select::Pgid(-p),
+    };
+    reaper_wait(
+        sel,
+        host_options & libc::WNOHANG != 0,
+        || wait4_host(pid, host_options | libc::WNOHANG, wstatus, rusage),
+        |e| {
+            if wstatus != 0 && fwe_kernel::uaccess::write(wstatus, e.status).is_err() {
+                return err(errno::EFAULT);
+            }
+            if rusage != 0
+                && fwe_kernel::uaccess::zero(rusage, fwe_abi::resource_usage::RUSAGE_SIZE).is_err()
+            {
+                return err(errno::EFAULT);
+            }
+            i64::from(reaper::guest_pid(e))
+        },
+        false,
+    )
+}
+
+/// A reaper's `wait` for the children `sel` picks: `own` checks its own
+/// children (without blocking; `ECHILD` when it has none), then `adopted`
+/// reports one it adopted that ended (taken, unless `peek`); until one is
+/// found, or there are none, or a signal arrives (`EINTR`), unless
+/// `nohang`.
+fn reaper_wait(
+    sel: reaper::Select,
+    nohang: bool,
+    own: impl Fn() -> i64,
+    adopted: impl Fn(&fwe_kernel::procreg::Ended) -> i64,
+    peek: bool,
+) -> i64 {
+    loop {
+        // Registered, with signals held, before looking: a change after
+        // the look wakes the sleep below.
+        let waiter = reaper::Waiter::new();
+        let r = own();
+        if r != 0 && r != err(errno::ECHILD) {
+            return r;
+        }
+        let found = reaper::busy(|| {
+            // The living ones before the ended: a process records how it
+            // ended before it forgets its record, so one ending meanwhile
+            // is seen in one or the other.
+            let live = reaper::has_live_adopted(sel);
+            if let Some(e) = reaper::take_adopted(sel, peek) {
+                return Some(adopted(&e));
+            }
+            (r == err(errno::ECHILD) && !live).then_some(r)
+        });
+        if let Some(r) = found {
+            return r;
+        }
+        if nohang {
+            return 0;
+        }
+        if fwe_kernel::thread::deliverable() != 0 {
+            return err(errno::EINTR);
+        }
+        waiter.sleep();
+    }
+}
+
+/// `wait4` of the host's children (`pid` is the host's), the result
+/// written in Linux's layout.
+fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     let mut status: libc::c_int = 0;
     // SAFETY: an all-zero rusage is a valid out-parameter.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -371,8 +449,12 @@ pub fn do_wait4(regs: &Regs) -> i64 {
     }
     let guest = fwe_kernel::pidns::guest_ret(r as i64);
     if r > 0 && !libc::WIFSTOPPED(status) && !libc::WIFCONTINUED(status) {
-        // Reaped: its numbers are free again.
-        fwe_kernel::pidns::reaped(r);
+        // Reaped: its numbers are free again, and its records go.
+        reaper::busy(|| {
+            fwe_kernel::pidns::reaped(r);
+            fwe_kernel::procreg::reaped(r);
+            reaper::reaped_own_child();
+        });
     }
     guest
 }
@@ -414,43 +496,93 @@ pub fn do_waitid(regs: &Regs) -> i64 {
             host_options |= host;
         }
     }
+    let zero_rusage = || {
+        if rusage != 0
+            && fwe_kernel::uaccess::zero(rusage, fwe_abi::resource_usage::RUSAGE_SIZE).is_err()
+        {
+            return err(errno::EFAULT);
+        }
+        0
+    };
+    if !reaper::active() || options & w::WEXITED == 0 {
+        let r = waitid_host(idtype, id, host_options, infop, options);
+        return if r < 0 { r } else { zero_rusage() };
+    }
+    let sel = match idtype {
+        libc::P_PID => reaper::Select::Pid(id as i32),
+        libc::P_PGID => reaper::Select::Pgid(id as i32),
+        _ => reaper::Select::Any,
+    };
+    let own = || waitid_host(idtype, id, host_options | libc::WNOHANG, infop, options);
+    let r = reaper_wait(
+        sel,
+        options & w::WNOHANG != 0,
+        own,
+        |e| {
+            let (code, status) = reaper::child_code(e.status);
+            let mut words = [0i32; 32];
+            words[0] = fwe_abi::signal::SIGCHLD as i32;
+            words[2] = code;
+            words[4] = reaper::guest_pid(e);
+            // SAFETY: getuid cannot fail.
+            words[5] = host::uid_to_linux(unsafe { libc::getuid() }) as i32;
+            words[6] = status;
+            if infop != 0 && fwe_kernel::uaccess::write(infop, words).is_err() {
+                return err(errno::EFAULT);
+            }
+            1
+        },
+        options & w::WNOWAIT != 0,
+    );
+    if r < 0 { r } else { zero_rusage() }
+}
+
+/// `waitid` of the host's children (`idtype` and `id` are the host's), the
+/// report written to `infop` in Linux's layout (all zero when `WNOHANG`
+/// found none). Returns the child's host pid, 0 for none, or an error.
+fn waitid_host(
+    idtype: libc::idtype_t,
+    id: libc::id_t,
+    host_options: i32,
+    infop: u64,
+    options: u64,
+) -> i64 {
+    use fwe_abi::wait as w;
     // SAFETY: an all-zero siginfo is a valid out-parameter.
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `si` is a valid out-parameter.
     if unsafe { libc::waitid(idtype, id, &mut si, host_options) } != 0 {
         return fwe_kernel::host::last_error();
     }
-    if infop != 0 {
-        let mut words = [0i32; 32]; // a 128-byte siginfo_t
-        // SAFETY: `si` was filled by the host.
-        let (pid, uid, status) =
-            unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
-        if pid != 0 {
-            let code = si.si_code;
-            let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {
-                host::signal_to_linux(status) as i32
-            } else {
-                status
-            };
-            words[0] = fwe_abi::signal::SIGCHLD as i32; // si_signo
-            words[2] = code; // si_code
-            words[4] = fwe_kernel::pidns::guest_ret(pid as i64) as i32; // si_pid
-            if options & w::WNOWAIT == 0
-                && matches!(code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
-            {
+    let mut words = [0i32; 32]; // a 128-byte siginfo_t
+    // SAFETY: `si` was filled by the host.
+    let (pid, uid, status) =
+        unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
+    if pid != 0 {
+        let code = si.si_code;
+        let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {
+            host::signal_to_linux(status) as i32
+        } else {
+            status
+        };
+        words[0] = fwe_abi::signal::SIGCHLD as i32; // si_signo
+        words[2] = code; // si_code
+        words[4] = fwe_kernel::pidns::guest_ret(pid as i64) as i32; // si_pid
+        words[5] = uid as i32; // si_uid
+        words[6] = status; // si_status
+        if options & w::WNOWAIT == 0
+            && matches!(code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
+        {
+            // Reaped: its numbers are free again, and its records go.
+            reaper::busy(|| {
                 fwe_kernel::pidns::reaped(pid);
-            }
-            words[5] = uid as i32; // si_uid
-            words[6] = status; // si_status
-        }
-        if fwe_kernel::uaccess::write(infop, words).is_err() {
-            return err(errno::EFAULT);
+                fwe_kernel::procreg::reaped(pid);
+                reaper::reaped_own_child();
+            });
         }
     }
-    if rusage != 0
-        && fwe_kernel::uaccess::zero(rusage, fwe_abi::resource_usage::RUSAGE_SIZE).is_err()
-    {
+    if infop != 0 && fwe_kernel::uaccess::write(infop, words).is_err() {
         return err(errno::EFAULT);
     }
-    0
+    i64::from(pid)
 }

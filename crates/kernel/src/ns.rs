@@ -62,6 +62,8 @@ pub struct Net {
     /// Each bound port, by protocol (6, 17) and number, and the host
     /// loopback port behind it.
     pub ports: std::collections::BTreeMap<(u8, u16), u16>,
+    /// Its sysctls set (see [`crate::sysctl`]), by path under `/proc/sys`.
+    pub sysctls: std::collections::BTreeMap<String, String>,
 }
 
 impl Data for Net {
@@ -73,12 +75,20 @@ impl Data for Net {
             e.u32(u32::from(*port));
             e.u32(u32::from(*host));
         }
+        e.u64(self.sysctls.len() as u64);
+        for (k, v) in &self.sysctls {
+            e.bytes(k.as_bytes());
+            e.bytes(v.as_bytes());
+        }
     }
     fn decode(d: &mut Dec) -> Self {
         let lo_up = d.bool();
         let n = d.count(9);
         let ports = (0..n).map(|_| ((d.u8(), d.u32() as u16), d.u32() as u16)).collect();
-        Net { lo_up, ports }
+        let n = d.count(16);
+        let text = |d: &mut Dec| String::from_utf8_lossy(&d.bytes()).into_owned();
+        let sysctls = (0..n).map(|_| (text(d), text(d))).collect();
+        Net { lo_up, ports, sysctls }
     }
 }
 

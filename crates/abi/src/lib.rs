@@ -781,6 +781,10 @@ pub struct Timespec {
     pub tv_nsec: i64,
 }
 
+/// `tv_nsec` values `utimensat` takes for "now" and "leave as it is".
+pub const UTIME_NOW: i64 = (1 << 30) - 1;
+pub const UTIME_OMIT: i64 = (1 << 30) - 2;
+
 /// `struct iovec`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

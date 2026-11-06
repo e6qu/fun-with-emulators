@@ -45,6 +45,9 @@ pub struct ForkNs {
     /// The child's pid namespaces, and its numbers in them.
     chain: pidns::Chain,
     nums: Vec<i32>,
+    /// The child's line of ancestors and the bound of its adoption (see
+    /// [`crate::reaper`]).
+    line: (Vec<crate::procreg::Proc>, Option<crate::procreg::Proc>),
 }
 
 impl<P: Platform> Kernel<P> {
@@ -133,6 +136,8 @@ impl<P: Platform> Kernel<P> {
         if new != 0 && !new_user && !self.creds.has_admin() {
             return Err(errno::EPERM);
         }
+        // Taken while this process's own pid namespaces are current.
+        let line = crate::procreg::child_line();
         // Within the cgroup's `pids.max`.
         crate::cgroupfs::fork_allowed(&crate::cgroupfs::current())?;
         let fs = self.fs.as_mut().expect("filesystem configured");
@@ -163,7 +168,7 @@ impl<P: Platform> Kernel<P> {
         };
         let dirs = fs.ns_dirs();
         let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
-        Ok(ForkNs { saved, chain, nums, dirs, caps })
+        Ok(ForkNs { saved, chain, nums, dirs, caps, line })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
@@ -180,7 +185,7 @@ impl<P: Platform> Kernel<P> {
         }
         if child > 0 {
             // It starts in this process's cgroup, in its namespaces.
-            crate::procreg::forked(child, t.dirs.clone());
+            crate::procreg::forked(child, t.dirs.clone(), &t.line);
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {
@@ -198,10 +203,18 @@ impl<P: Platform> Kernel<P> {
     /// In the child after the host `fork`: its pid namespaces are the ones
     /// made for it. Returns its pid, for `thread::init_main`.
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
+        // Its numbers stand for it from now on, not only once the parent
+        // gets to it: whether it is an init, for one, depends on it.
+        // SAFETY: getpid cannot fail.
+        pidns::set_host(&t.chain, &t.nums, unsafe { libc::getpid() });
         pidns::set_current(t.chain);
         if let Some(fs) = self.fs.as_ref() {
             fs.ns.activate();
         }
+        // Its own record too: it may end before the parent writes it.
+        crate::procreg::own_line(&t.line);
+        crate::reaper::forked_child();
+        crate::reaper::start_if_reaper();
         // SAFETY: getpid cannot fail.
         t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
     }
@@ -210,5 +223,11 @@ impl<P: Platform> Kernel<P> {
     /// numbered it there (0 in the initial one).
     pub fn fork_number(t: &ForkNs) -> i32 {
         t.nums.first().copied().unwrap_or(0)
+    }
+
+    /// The child's line of ancestors and bound, for a child that starts
+    /// on state the parent hands it (a VM fork's).
+    pub fn fork_line(t: &ForkNs) -> &(Vec<crate::procreg::Proc>, Option<crate::procreg::Proc>) {
+        &t.line
     }
 }

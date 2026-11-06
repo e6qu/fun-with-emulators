@@ -25,7 +25,7 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// since `pthread_exit` does not return and would never release it.
 pub(crate) fn exit_current_thread(code: i32) -> ! {
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting((code & 0xff) << 8);
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
@@ -91,7 +91,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting((code & 0xff) << 8);
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
@@ -101,7 +101,7 @@ impl Platform for NativePlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting(fwe_kernel::host::signal_to_linux(sig) as i32);
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
@@ -123,6 +123,14 @@ impl Platform for NativePlatform {
     fn set_host_signal(&mut self, sig: u64, how: fwe_kernel::HostSignal) {
         trap::set_host_signal(sig, how);
     }
+}
+
+/// Trace to the file at `path` (`--strace-file`), every process of the run.
+pub fn trace_to_file(path: &[u8]) -> Result<(), String> {
+    // fwe's own descriptors live above the guest's range, which this sets:
+    // the guest must never see, reuse or close the trace file's.
+    fwe_kernel::fdtable::init();
+    fwe_kernel::trace::to_file(path)
 }
 
 /// How to run a guest.
@@ -307,6 +315,9 @@ pub(crate) fn reexec(
         argv.push(b"--strace=failures".to_vec());
     } else if strace.enabled {
         argv.push(b"--strace".to_vec());
+    }
+    if let Some(file) = fwe_kernel::trace::file() {
+        argv.push([&b"--strace-file="[..], file].concat());
     }
     if let Some(root) = fs.root_host_path() {
         argv.push(b"--root".to_vec());
@@ -734,6 +745,8 @@ pub struct Loadout {
     pub entry: u64,
     pub sp: u64,
     pub brk: Brk,
+    /// The auxiliary vector given the program (see [`fwe_kernel::Fs::set_auxv`]).
+    pub auxv: Vec<u8>,
 }
 
 /// Whether `file` is a program only the hypervisor backend can run: a non-PIE
@@ -891,7 +904,7 @@ pub fn load_image(
             loaded.entry, brk.start
         ));
     }
-    Ok(Loadout { entry, sp: image.sp, brk })
+    Ok(Loadout { entry, sp: image.sp, brk, auxv: image.auxv })
 }
 
 fn start(
@@ -947,6 +960,7 @@ fn start(
     )?;
     let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
     fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+    fs.set_auxv(out.auxv.clone());
     fs.publish();
 
     // A trampoline used as the return address for signal handlers that have
@@ -957,6 +971,8 @@ fn start(
     // namespace, for a process exec'd in one.
     fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
     fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    // A subreaper stays one across execve; a namespace's init is one.
+    fwe_kernel::reaper::start_if_reaper();
 
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);

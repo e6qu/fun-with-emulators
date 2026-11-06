@@ -20,6 +20,9 @@ pub struct InitialStack<'a> {
 pub struct StackImage {
     pub sp: u64,
     pub bytes: Vec<u8>,
+    /// The auxiliary vector's words, `AT_NULL` included, as
+    /// `/proc/self/auxv` shows them.
+    pub auxv: Vec<u8>,
 }
 
 const PLATFORM: &[u8] = b"aarch64";
@@ -76,7 +79,9 @@ impl InitialStack<'_> {
         for (i, w) in table.iter().enumerate() {
             bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
         }
-        StackImage { sp, bytes }
+        let first = words - 2 * auxv_len;
+        let auxv = table[first..].iter().flat_map(|w| w.to_le_bytes()).collect();
+        StackImage { sp, bytes, auxv }
     }
 }
 

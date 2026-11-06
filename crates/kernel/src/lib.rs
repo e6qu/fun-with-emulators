@@ -25,6 +25,7 @@ pub mod futex;
 pub mod host;
 pub mod memfd;
 pub mod mm;
+pub mod modes;
 mod mountops;
 pub mod mounts;
 pub mod net;
@@ -36,7 +37,9 @@ pub mod procfs;
 pub mod procpid;
 pub mod procreg;
 pub mod pty;
+pub mod reaper;
 pub mod seccomp;
+pub mod seqpacket;
 pub mod shared;
 pub mod signal;
 pub mod signalfd;
@@ -44,12 +47,14 @@ pub mod snapshot;
 pub mod specialfd;
 pub mod synthdir;
 mod syscalls;
+pub mod sysctl;
 pub mod term;
 pub mod thread;
-mod trace;
+pub mod trace;
 pub mod uaccess;
 pub mod userns;
 pub mod vmas;
+pub mod xattr;
 
 pub use cloneargs::CloneArgs;
 pub use fs::Fs;
@@ -254,6 +259,7 @@ impl<P: Platform> Kernel<P> {
         e.u64(self.brk.limit);
         e.bool(self.tracer.enabled);
         e.bool(self.tracer.failures_only);
+        e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -308,6 +314,7 @@ impl<P: Platform> Kernel<P> {
         let page_size = d.u64();
         let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
+        let trace_file = d.bytes();
         fdmarks::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
@@ -346,6 +353,11 @@ impl<P: Platform> Kernel<P> {
         uaccess::set_translations(&translations);
         mm::set_guest_ranges(d.map());
         fdtable::restore(d);
+        if !trace_file.is_empty() {
+            // The parent's trace file, which this fresh process opens again
+            // (above the guest's descriptors, now placed).
+            let _ = trace::to_file(&trace_file);
+        }
         specialfd::restore(d);
         signalfd::restore(d);
         synthdir::restore(d);
@@ -697,10 +709,12 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         };
         return -1;
     }
-    signalfd::hold(|| {
-        specialfd::hold(|| {
-            synthdir::hold(|| {
-                pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+    reaper::hold(|| {
+        signalfd::hold(|| {
+            specialfd::hold(|| {
+                synthdir::hold(|| {
+                    pty::hold(|| fs::hold(|| futex::hold(|| mm::hold(|| thread::hold(fork)))))
+                })
             })
         })
     })
@@ -927,6 +941,12 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             if let Some(r) = unsafe { signalfd::try_read(fd, buf, len) } {
                 return Some(r);
             }
+            if seqpacket::is(fd) {
+                return Some(match uaccess::host_buffer(buf, len, true) {
+                    Ok(v) => seqpacket::read(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
         }
@@ -944,10 +964,22 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             {
                 return Some(r);
             }
+            if fdmarks::any_marks()
+                && let Some(r) = crate::sysctl::try_write(fd, buf, len)
+            {
+                return Some(r);
+            }
+            if seqpacket::is(fd) {
+                return Some(match uaccess::host_buffer(buf, len, false) {
+                    Ok(v) => seqpacket::write(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
+            Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),
             Ok(iov) => {
                 // SAFETY: the iovecs are translated host buffers; the host
                 // checks them.
@@ -957,6 +989,11 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Err(e) => fwe_abi::err(e),
         },
         n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
+            Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
+            Ok(iov) if crate::sysctl::is(a[0] as i32) => {
+                crate::sysctl::try_writev(a[0] as i32, &iov)
+                    .unwrap_or(fwe_abi::err(fwe_abi::errno::EINVAL))
+            }
             Ok(iov) => {
                 // SAFETY: as for readv.
                 let r = unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
@@ -968,6 +1005,10 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PREAD64 => host::ret(unsafe {
             libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
         } as i64),
+        n::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
+            crate::sysctl::try_write(a[0] as i32, a[1], a[2])
+                .unwrap_or(fwe_abi::err(fwe_abi::errno::EINVAL))
+        }
         // SAFETY: the host validates the guest buffer.
         n::PWRITE64 => host::ret(unsafe {
             libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)

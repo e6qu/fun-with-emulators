@@ -309,6 +309,14 @@ unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Res
     Ok(())
 }
 
+/// Copy `src` to host address `dst`, a guest buffer already translated
+/// ([`host_buffer`], [`host_iovecs`]): `EFAULT`, not a crash, where the
+/// guest's memory is not there.
+pub fn write_host(dst: u64, src: &[u8]) -> Result<()> {
+    // SAFETY: `src` is fwe's own buffer; a fault on `dst` is recovered.
+    check(unsafe { imp::copy(dst as *mut u8, src.as_ptr(), src.len()) })
+}
+
 /// Copy `dst.len()` bytes from guest address `addr`.
 pub fn read_into(addr: u64, dst: &mut [u8]) -> Result<()> {
     // SAFETY: `dst` is fwe's own buffer of that length.
@@ -397,6 +405,16 @@ pub fn read_cstr_array(addr: u64, max_each: usize) -> Result<Vec<Vec<u8>>> {
 /// buffers with `write`. Each buffer must be guest memory (`EFAULT`), in
 /// one translated range or none (`EINVAL`: the host is given one address
 /// for it).
+/// The guest buffer of `len` bytes at `base` (written to if `write`) as
+/// a host `iovec`, checked as [`host_iovecs`] checks each of its own.
+pub fn host_buffer(base: u64, len: u64, write: bool) -> Result<libc::iovec> {
+    check(len == 0 || valid(base, len, write))?;
+    if crosses(base, len) {
+        return Err(errno::EINVAL);
+    }
+    Ok(libc::iovec { iov_base: g2h(base) as *mut libc::c_void, iov_len: len as usize })
+}
+
 pub fn host_iovecs(addr: u64, count: u64, write: bool) -> Result<Vec<libc::iovec>> {
     if count > 1024 {
         return Err(errno::EINVAL);

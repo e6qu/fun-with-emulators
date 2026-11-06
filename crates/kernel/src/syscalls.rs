@@ -110,6 +110,10 @@ impl<P: Platform> Kernel<P> {
     fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             // Files and I/O.
+            nr::READ if crate::seqpacket::is(a[0] as i32) => {
+                let v = guest!(uaccess::host_buffer(a[1], a[2], true));
+                crate::seqpacket::read(a[0] as i32, &[v])
+            }
             nr::READ => {
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::read(a[0] as i32, a[1] as *mut _, a[2] as usize) } as i64)
@@ -123,16 +127,35 @@ impl<P: Platform> Kernel<P> {
                 {
                     return r;
                 }
+                if crate::fdmarks::any_marks()
+                    && let Some(r) = crate::sysctl::try_write(a[0] as i32, a[1], a[2])
+                {
+                    return r;
+                }
+                if crate::seqpacket::is(a[0] as i32) {
+                    let v = guest!(uaccess::host_buffer(a[1], a[2], false));
+                    return crate::seqpacket::write(a[0] as i32, &[v]);
+                }
                 // SAFETY: the host validates the guest buffer.
                 ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
             }
             nr::READV => {
                 let iov = guest!(uaccess::host_iovecs(a[1], a[2], true));
+                if crate::seqpacket::is(a[0] as i32) {
+                    return crate::seqpacket::read(a[0] as i32, &iov);
+                }
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
             nr::WRITEV => {
                 let iov = guest!(uaccess::host_iovecs(a[1], a[2], false));
+                if crate::seqpacket::is(a[0] as i32) {
+                    return crate::seqpacket::write(a[0] as i32, &iov);
+                }
+                if crate::sysctl::is(a[0] as i32) {
+                    return crate::sysctl::try_writev(a[0] as i32, &iov)
+                        .unwrap_or(err(errno::EINVAL));
+                }
                 // SAFETY: the iovecs are translated host buffers; the host checks them.
                 ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
             }
@@ -141,6 +164,9 @@ impl<P: Platform> Kernel<P> {
                 ret(unsafe {
                     libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
                 } as i64)
+            }
+            nr::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
+                crate::sysctl::try_write(a[0] as i32, a[1], a[2]).unwrap_or(err(errno::EINVAL))
             }
             nr::PWRITE64 => {
                 // SAFETY: the host validates the guest buffer.
@@ -229,6 +255,7 @@ impl<P: Platform> Kernel<P> {
                     a[1],
                     a[2],
                     self.creds.has(crate::caps::CAP_NET_BIND_SERVICE),
+                    self.fs().umask(),
                 )
             },
             // SAFETY: no pointers.
@@ -267,11 +294,24 @@ impl<P: Platform> Kernel<P> {
             nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
+            nr::SETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], true),
+            nr::LSETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], false),
+            nr::FSETXATTR => self.sys_fsetxattr(a[0], a[1], a[2], a[3], a[4]),
+            nr::GETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], true),
+            nr::LGETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], false),
+            nr::FGETXATTR => self.sys_getxattr(Some(a[0] as i32), 0, a[1], a[2], a[3], true),
+            nr::LISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], true),
+            nr::LLISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], false),
+            nr::FLISTXATTR => self.sys_listxattr(Some(a[0] as i32), 0, a[1], a[2], true),
+            nr::REMOVEXATTR => self.sys_removexattr(None, a[0], a[1], true),
+            nr::LREMOVEXATTR => self.sys_removexattr(None, a[0], a[1], false),
+            nr::FREMOVEXATTR => self.sys_removexattr(Some(a[0] as i32), 0, a[1], true),
             nr::FCHMOD if crate::memfd::chmod_sealed(a[0] as i32) => err(errno::EPERM),
-            nr::FCHMOD => {
-                // SAFETY: plain host call on a guest fd.
-                ret(unsafe { libc::fchmod(a[0] as i32, a[1] as libc::mode_t) })
-            }
+            // A mode that denies the owner is kept apart (see `modes`).
+            nr::FCHMOD => match crate::modes::keep_fd(a[0] as i32, a[1] as u32) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            },
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
             // Ownership is virtual: honor the guest's credentials rather than
             // changing the backing host file (fwe does not run as root).
@@ -327,7 +367,13 @@ impl<P: Platform> Kernel<P> {
                     (Err(e), _) => return err(e),
                 };
                 // SAFETY: plain host call.
-                ret(unsafe { libc::setpgid(pid, pgid) })
+                let r = ret(unsafe { libc::setpgid(pid, pgid) });
+                if r == 0 {
+                    // SAFETY: getpid cannot fail.
+                    let me = unsafe { libc::getpid() };
+                    crate::procreg::record_pgid(if pid == 0 { me } else { pid });
+                }
+                r
             }
             nr::GETPGID => match crate::pidns::host_arg(a[0] as i32) {
                 // SAFETY: plain host call.
@@ -339,12 +385,24 @@ impl<P: Platform> Kernel<P> {
                 Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getsid(p) } as i64)),
                 Err(e) => err(e),
             },
-            // SAFETY: plain host call.
-            nr::SETSID => crate::pidns::guest_ret(ret(unsafe { libc::setsid() } as i64)),
+            nr::SETSID => {
+                // SAFETY: plain host call.
+                let r = ret(unsafe { libc::setsid() } as i64);
+                if r > 0 {
+                    // SAFETY: getpid cannot fail.
+                    crate::procreg::record_pgid(unsafe { libc::getpid() });
+                }
+                crate::pidns::guest_ret(r)
+            }
             nr::GETPID => thread::tgid() as i64,
             nr::GETTID => thread::tid() as i64,
             // A parent outside the namespace is 0, as Linux reports it.
-            nr::GETPPID => crate::pidns::guest_ret(host::getppid()),
+            nr::GETPPID => {
+                // SAFETY: getpid cannot fail.
+                let me = unsafe { libc::getpid() };
+                let parent = crate::reaper::parent_of(me, host::getppid() as i32);
+                crate::pidns::guest_ret(i64::from(parent))
+            }
             // Virtual credentials (see crates/kernel/src/creds.rs).
             // Kept as the initial namespace's ids, seen through the user
             // namespace's maps (see `userns`).
@@ -400,6 +458,26 @@ impl<P: Platform> Kernel<P> {
                     return err(errno::EINVAL);
                 }
                 thread::set_robust_list(a[0], a[1]);
+                0
+            }
+            // The caller's own list; another thread's or process's needs a
+            // tracer's standing, which nothing has.
+            nr::GET_ROBUST_LIST => {
+                let pid = a[0] as i32;
+                if pid != 0 && pid != thread::tid() {
+                    return err(
+                        if crate::pidns::to_host(pid).is_some()
+                            || thread::host_thread(pid).is_some()
+                        {
+                            errno::EPERM
+                        } else {
+                            errno::ESRCH
+                        },
+                    );
+                }
+                let (head, len) = thread::robust_list();
+                guest!(uaccess::write(a[1], head));
+                guest!(uaccess::write(a[2], len));
                 0
             }
             nr::UNAME => self.sys_uname(a[0]),
@@ -785,7 +863,6 @@ impl<P: Platform> Kernel<P> {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         /// `PR_SET_DUMPABLE`.
         static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
-        static SUBREAPER: AtomicBool = AtomicBool::new(false);
         match option {
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
@@ -836,14 +913,15 @@ impl<P: Platform> Kernel<P> {
                 Ok(()) => 0,
                 Err(e) => err(e),
             },
-            // Recorded: macOS gives a subreaper no orphans (see
-            // docs/architecture.md).
+            // In the process's record, where its descendants look for it;
+            // fwe keeps the adoption (see `reaper`).
             PR_SET_CHILD_SUBREAPER => {
-                SUBREAPER.store(arg2 != 0, Relaxed);
+                crate::procreg::set_own_subreaper(arg2 != 0);
+                crate::reaper::start_if_reaper();
                 0
             }
             PR_GET_CHILD_SUBREAPER => {
-                guest!(uaccess::write(arg2, i32::from(SUBREAPER.load(Relaxed))));
+                guest!(uaccess::write(arg2, i32::from(crate::procreg::own_subreaper())));
                 0
             }
             PR_SET_NO_NEW_PRIVS if arg2 == 1 => {

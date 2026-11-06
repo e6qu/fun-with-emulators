@@ -457,6 +457,17 @@ pub fn signal_is_ignored(sig: u64) -> bool {
     }
 }
 
+/// Whether the host reaps this process's children as they end, leaving no
+/// zombie for `wait`: it ignores `SIGCHLD`, or set `SA_NOCLDWAIT`.
+pub fn children_reaped_by_host() -> bool {
+    // SAFETY: querying a disposition into a zeroed sigaction.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) == 0
+            && (old.sa_sigaction == libc::SIG_IGN || old.sa_flags & libc::SA_NOCLDWAIT != 0)
+    }
+}
+
 /// Translate a host `si_code` into Linux's. The `SIGCHLD` codes and the
 /// fault codes are the same; the codes for user-sent signals differ.
 pub fn si_code_to_linux(code: i32) -> i32 {
@@ -488,6 +499,18 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+    // A `SIGCHLD` sent with `kill` comes with no information on macOS
+    // (`si_code` and `si_pid` 0), unlike a child's.
+    if sig == libc::SIGCHLD
+        && code == 0
+        && pid == 0
+        && let Some((c, p, s)) = crate::reaper::take_report()
+    {
+        // An adopted process's end, which fwe's reaper sent this process
+        // (`si_code` and `si_status` already Linux's).
+        // SAFETY: getuid cannot fail.
+        return (c, p, uid_to_initial(unsafe { libc::getuid() }), s);
+    }
     if sig == libc::SIGCHLD && pid == 0 {
         let saved = last_errno();
         // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
@@ -769,6 +792,70 @@ pub fn uptime() -> f64 {
     // SAFETY: `ts` is a valid out parameter.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+/// Each host CPU's time so far, in clock ticks (100 a second, Linux's
+/// `USER_HZ`): user, nice, system and idle. Empty if unavailable.
+pub fn cpu_times() -> Vec<[u64; 4]> {
+    #[cfg(target_os = "macos")]
+    {
+        // `PROCESSOR_CPU_LOAD_INFO`, and the order of `cpu_ticks`.
+        const LOAD_INFO: i32 = 2;
+        const USER: usize = 0;
+        const SYSTEM: usize = 1;
+        const IDLE: usize = 2;
+        const NICE: usize = 3;
+        unsafe extern "C" {
+            fn host_processor_info(
+                host: u32,
+                flavor: i32,
+                count: *mut u32,
+                info: *mut *mut i32,
+                info_count: *mut u32,
+            ) -> i32;
+            fn mach_host_self() -> u32;
+            fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+            static mach_task_self_: u32;
+        }
+        let (mut cpus, mut info, mut words) = (0u32, std::ptr::null_mut::<i32>(), 0u32);
+        // SAFETY: valid out-parameters; the kernel allocates `info`.
+        if unsafe {
+            host_processor_info(mach_host_self(), LOAD_INFO, &mut cpus, &mut info, &mut words)
+        } != 0
+        {
+            return Vec::new();
+        }
+        // SAFETY: `info` holds `words` integers, four per CPU.
+        let ticks = unsafe { std::slice::from_raw_parts(info, words as usize) };
+        let out = ticks
+            .chunks_exact(4)
+            .take(cpus as usize)
+            .map(|t| {
+                let v = |i: usize| u64::from(t[i] as u32);
+                [v(USER), v(NICE), v(SYSTEM), v(IDLE)]
+            })
+            .collect();
+        // SAFETY: freeing what the kernel allocated, in this task.
+        unsafe { vm_deallocate(mach_task_self_, info as usize, words as usize * 4) };
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+        stat.lines()
+            .filter(|l| l.starts_with("cpu") && !l.starts_with("cpu "))
+            .map(|l| {
+                let f: Vec<u64> =
+                    l.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
+                [
+                    f.first().copied().unwrap_or(0),
+                    f.get(1).copied().unwrap_or(0),
+                    f.get(2).copied().unwrap_or(0),
+                    f.get(3).copied().unwrap_or(0),
+                ]
+            })
+            .collect()
+    }
 }
 
 /// The host's 1, 5 and 15 minute load averages (zero if unavailable).

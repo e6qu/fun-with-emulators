@@ -2,6 +2,38 @@
 
 use fwe_abi::{errno_name, syscall_name};
 use std::fmt::Write as _;
+use std::sync::OnceLock;
+
+/// The file every process of the run traces to (`--strace-file`), and fwe's
+/// descriptor of it in this process.
+static FILE: OnceLock<(Vec<u8>, i32)> = OnceLock::new();
+
+/// Trace to the file at host path `path`, appended to, each line naming
+/// the process, instead of to standard error: so a run of many processes
+/// (whose standard error another may hold) is traced whole. Called once
+/// the guest's descriptor range is placed ([`crate::fdtable::init`]).
+pub fn to_file(path: &[u8]) -> Result<(), String> {
+    let c = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let fd = crate::fdtable::reserve(fd).map_err(|e| format!("errno {e}"))?;
+    let _ = FILE.set((path.to_vec(), fd));
+    Ok(())
+}
+
+/// The file traced to, which a process fwe starts is told of.
+pub fn file() -> Option<&'static [u8]> {
+    FILE.get().map(|(p, _)| p.as_slice())
+}
 
 /// Writes one line per system call to the host's standard error when enabled.
 #[derive(Debug, Default, Clone, Copy)]
@@ -60,14 +92,24 @@ impl Tracer {
     }
 
     fn write_line(&self, line: &str) {
-        let mut out = String::with_capacity(line.len() + 8);
-        out.push_str("[fwe] ");
+        let mut out = String::with_capacity(line.len() + 16);
+        let fd = match FILE.get() {
+            Some((_, fd)) => {
+                // SAFETY: getpid cannot fail.
+                let _ = write!(out, "[fwe {}] ", unsafe { libc::getpid() });
+                *fd
+            }
+            None => {
+                out.push_str("[fwe] ");
+                2
+            }
+        };
         out.push_str(line);
         out.push('\n');
         // Written with a single host write so lines from the guest and the
         // tracer do not interleave mid-line.
         // SAFETY: `out` is a valid buffer of `out.len()` bytes.
-        unsafe { libc::write(2, out.as_ptr().cast(), out.len()) };
+        unsafe { libc::write(fd, out.as_ptr().cast(), out.len()) };
     }
 }
 

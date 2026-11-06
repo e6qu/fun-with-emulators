@@ -40,7 +40,7 @@ impl Platform for HvPlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting((code & 0xff) << 8);
         mem::finish_lazy();
         teardown();
         record::Line::new().s("exit ").dec(code as u32 as u64).emit();
@@ -53,7 +53,7 @@ impl Platform for HvPlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting(fwe_kernel::host::signal_to_linux(sig) as i32);
         mem::finish_lazy();
         teardown();
         record::Line::new().s("dies of host signal ").dec(sig as u64).emit();
@@ -304,7 +304,7 @@ pub(super) fn teardown() {
 fn exit_thread(code: i32) -> ! {
     use std::sync::atomic::Ordering::SeqCst;
     if crate::LIVE_THREADS.fetch_sub(1, SeqCst) == 1 {
-        fwe_kernel::procreg::exiting();
+        fwe_kernel::procreg::exiting((code & 0xff) << 8);
         mem::finish_lazy();
         teardown();
         record::Line::new().s("exit ").dec(code as u32 as u64).emit();
@@ -693,9 +693,12 @@ fn start(
 
     let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options));
     fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+    fs.set_auxv(image.auxv.clone());
     fs.publish();
     thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
     fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    // A subreaper stays one across execve; a namespace's init is one.
+    fwe_kernel::reaper::start_if_reaper();
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);
     crate::apply_exec_state(&mut k, options, path)?;
     k.set_sigreturn_trampoline(tramp);

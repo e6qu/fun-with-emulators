@@ -41,7 +41,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -290,6 +290,15 @@ pub fn collect() {
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
         live.extend(r.ns);
+    }
+    // An ended process not yet reaped keeps its numbers, while someone
+    // may still reap it.
+    for e in crate::procreg::all_ended() {
+        if crate::reaper::reapable(&e) {
+            live.extend(e.numbers.into_iter().map(|(d, _)| d));
+        } else {
+            crate::procreg::take_ended(&e);
+        }
     }
     // A pid namespace above a live one is live too.
     let mut pending: Vec<Vec<u8>> = live.iter().cloned().collect();

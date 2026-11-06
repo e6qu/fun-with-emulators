@@ -171,6 +171,7 @@ impl Fs {
         e.bytes(&self.proc.hostname);
         // Inherited like the root's.
         e.i32(self.proc.exe_fd.unwrap_or(-1));
+        e.bytes(&self.proc.auxv);
         self.ns.save(e);
     }
 
@@ -205,6 +206,7 @@ impl Fs {
                 ncpu: d.u32(),
                 hostname: d.bytes(),
                 exe_fd: Some(d.i32()).filter(|&fd| fd >= 0),
+                auxv: d.bytes(),
             },
             ns: {
                 let ns = crate::ns::Namespaces::load(d).unwrap_or_default();
@@ -287,9 +289,46 @@ impl Fs {
     /// the guest's working directory: `/proc/self/exe` is always absolute.
     pub fn set_proc_info(&mut self, exe: Vec<u8>, cmdline: Vec<u8>, ncpu: u32, hostname: Vec<u8>) {
         let exe = if exe.starts_with(b"/") { exe } else { normalize(&self.cwd, &exe) };
+        // The program's own path, not the links it was run through (such as
+        // `/proc/self/exe`).
+        let exe = if self.proc.exe_fd.is_some() { exe } else { self.program_path(&exe) };
         let exe_fd = self.proc.exe_fd;
+        let auxv = std::mem::take(&mut self.proc.auxv);
         crate::procreg::own_program(&exe, &cmdline);
-        self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd };
+        self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
+    }
+
+    /// The running program started with the auxiliary vector `auxv` (its
+    /// words, `AT_NULL` included), which `/proc/self/auxv` shows.
+    pub fn set_auxv(&mut self, auxv: Vec<u8>) {
+        self.proc.auxv = auxv;
+    }
+
+    /// The guest path of the file `path` names, its links followed (`path`
+    /// itself if that cannot be found).
+    pub fn program_path(&self, path: &[u8]) -> Vec<u8> {
+        let mut p = path.to_vec();
+        for _ in 0..40 {
+            use crate::procfs::Entry;
+            match self.synthetic(fcntl::AT_FDCWD as i32, &p) {
+                Some(Entry::Symlink(t)) if t.starts_with(b"/") => p = t,
+                Some(Entry::Fd { fd, .. }) => return self.fd_target(fd),
+                Some(_) => return p,
+                None => break,
+            }
+        }
+        let Ok(r) = self.resolve(fcntl::AT_FDCWD as i32, &p, true) else { return p };
+        let Ok(name) = r.name_c() else { return p };
+        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+        let fd = unsafe {
+            libc::openat(r.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return p;
+        }
+        // SAFETY: `fd` is a fresh owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        self.fd_target(fd.as_raw_fd())
     }
 
     /// Hold `fd` (fwe's, in the reserved range) as the running program's
@@ -438,6 +477,28 @@ impl Fs {
                 });
             }
         };
+        // A path through one of the process's magic links is the
+        // resolver's to follow, out of `/proc`.
+        if let Some(rel) = absolute.strip_prefix(b"/proc/")
+            && let Some((link, rest)) = through_magic_link(rel)
+        {
+            // What the link leads to, if fwe knows its path, is asked
+            // again; else the resolver follows the descriptor itself.
+            let base = match link {
+                MagicLink::Cwd => self.cwd.clone(),
+                MagicLink::Root => b"/".to_vec(),
+                MagicLink::Fd(fd) => self.fd_target(fd),
+            };
+            if !base.starts_with(b"/") {
+                return None;
+            }
+            return self.synthetic(fcntl::AT_FDCWD as i32, &mounts::join(&base, &rest));
+        }
+        match &absolute[..] {
+            b"/proc/self/cwd" => return Some(crate::procfs::Entry::Symlink(self.cwd.clone())),
+            b"/proc/self/root" => return Some(crate::procfs::Entry::Symlink(b"/".to_vec())),
+            _ => {}
+        }
         if let Some(kind) = absolute.strip_prefix(b"/proc/self/ns/") {
             return Some(match self.ns.link(kind, self.mnt.id()) {
                 Some(link) => crate::procfs::Entry::Symlink(link),
@@ -1102,6 +1163,61 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 continue;
             }
         }
+        // Inside fwe's own `/proc`: names it serves itself (`Fs::synthetic`
+        // answers for the last), and the magic links that lead out of it
+        // to a descriptor's file, the working directory or the root.
+        if here.phantom
+            && let Some((id, ns)) = &here.at
+            && let Some(m) = table.get(*id).filter(|m| m.source == Source::Synthetic)
+        {
+            let (id, child_ns) = (*id, mounts::join(ns, &comp));
+            if is_last {
+                // A descriptor's link, followed: the file it was opened at.
+                let link = match m.fstype {
+                    FsType::Proc => mounts::under(&child_ns, &m.point).and_then(proc_magic_link),
+                    _ => None,
+                };
+                if follow_final
+                    && let Some(MagicLink::Fd(fd)) = link
+                    && let Some(guest) =
+                        crate::fdmarks::origin(fd).and_then(|o| from_ns(v.proc_root, &o.ns_path))
+                {
+                    symlinks += 1;
+                    if symlinks > MAX_SYMLINKS {
+                        return Err(errno::ELOOP);
+                    }
+                    return resolve_in(v, fcntl::AT_FDCWD as i32, &guest, true);
+                }
+                return done(here, comp, false);
+            }
+            let link = match m.fstype {
+                FsType::Proc => mounts::under(&child_ns, &m.point).and_then(proc_magic_link),
+                _ => None,
+            };
+            let next = match link {
+                Some(MagicLink::Fd(fd)) => {
+                    let ns = fd_path(fd)
+                        .and_then(|h| host_to_ns(&table, &h))
+                        .filter(|ns| mounts::under(ns, &root_ns).is_some());
+                    let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
+                    Here { dir: dup_cloexec(fd)?, at, phantom: false }
+                }
+                Some(MagicLink::Cwd) => enter(&to_ns(v.proc_root, v.cwd))?,
+                Some(MagicLink::Root) => enter(&root_ns)?,
+                None => {
+                    let dir = dup_cloexec(here.dir.as_raw_fd())?;
+                    Here { dir, at: Some((id, child_ns)), phantom: true }
+                }
+            };
+            if link.is_some() {
+                // `..` from there is the file's own parent.
+                ancestors.clear();
+                here = next;
+            } else {
+                ancestors.push(std::mem::replace(&mut here, next));
+            }
+            continue;
+        }
         if is_last && !follow_final {
             return done(here, comp, false);
         }
@@ -1162,6 +1278,48 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         }
     }
     done(here, b".".to_vec(), false)
+}
+
+/// Where a magic link of `/proc` leads.
+#[derive(Clone, Copy)]
+enum MagicLink {
+    /// The file open as this process's descriptor.
+    Fd(i32),
+    Cwd,
+    Root,
+}
+
+/// The magic link at `rel` in a `proc` mount (`self/fd/3`, `self/cwd`,
+/// and the like, `self` also as this process's pid or `thread-self`), if it
+/// is one of this process's.
+fn proc_magic_link(rel: &[u8]) -> Option<MagicLink> {
+    let parts: Vec<&[u8]> = rel.split(|&b| b == b'/').filter(|p| !p.is_empty()).collect();
+    let own = |p: &[u8]| {
+        p == b"self"
+            || p == b"thread-self"
+            || std::str::from_utf8(p).ok().and_then(|n| n.parse::<i32>().ok())
+                // SAFETY: getpid cannot fail.
+                == Some(crate::pidns::to_guest(unsafe { libc::getpid() }))
+    };
+    match parts[..] {
+        [who, b"fd", n] if own(who) => {
+            let fd = std::str::from_utf8(n).ok()?.parse::<i32>().ok()?;
+            crate::fdtable::guest_visible(fd).then_some(MagicLink::Fd(fd))
+        }
+        [who, b"cwd"] if own(who) => Some(MagicLink::Cwd),
+        [who, b"root"] if own(who) => Some(MagicLink::Root),
+        _ => None,
+    }
+}
+
+/// The magic link of the process's that `rel` (a path in a `proc` mount)
+/// goes through to something below what it leads to, and the rest of it.
+fn through_magic_link(rel: &[u8]) -> Option<(MagicLink, Vec<u8>)> {
+    let parts: Vec<&[u8]> = rel.split(|&b| b == b'/').filter(|p| !p.is_empty()).collect();
+    (2..=3).filter(|&k| parts.len() > k).find_map(|k| {
+        let link = proc_magic_link(&parts[..k].join(&b'/'))?;
+        Some((link, parts[k..].join(&b'/')))
+    })
 }
 
 /// fwe's directory of the device nodes Linux has and the host does not
@@ -1517,7 +1675,7 @@ fn open_dir(dir: i32, name: &std::ffi::CStr) -> Result<OwnedFd, i32> {
 }
 
 /// The host path a descriptor refers to.
-fn fd_path(fd: i32) -> Option<Vec<u8>> {
+pub(crate) fn fd_path(fd: i32) -> Option<Vec<u8>> {
     #[cfg(target_os = "macos")]
     {
         let mut buf = [0u8; 1024]; // PATH_MAX on macOS.

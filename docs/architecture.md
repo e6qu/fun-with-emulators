@@ -270,6 +270,10 @@ cheap enough to leave a run's timing much as it is, for a failure that
 full tracing hides. A failed code preparation is noted with its reason,
 for example no room for stubs near the code, while the guest gets
 `ENOMEM`. Both modes are passed on across `execve` and `fork`.
+`--strace-file=PATH` writes the trace to `PATH` instead, appended to by
+every process of the run (each line naming its process), so a run of many
+programs whose standard error is not the terminal's, as a container
+engine's helpers are, is traced whole.
 
 ## Filesystem
 
@@ -329,6 +333,26 @@ read-only mount fail with `EROFS`, a rename or link across mounts with
 `EXDEV`, and the removal of a mount's root with `EBUSY`. `sendfile` and
 `copy_file_range` copy between descriptors.
 
+Extended attributes (`crates/kernel/src/xattr.rs`) are the host's of the
+same name: a Linux name is always in one of Linux's namespaces (`user.`,
+`trusted.`, `security.`, `system.`), so it meets neither the host's own
+nor fwe's (`org.fwe.`), and a list shows only those. Linux's rules apply:
+`user.` attributes are for regular files and directories, `trusted.` ones
+need `CAP_SYS_ADMIN` (and are hidden from others), writing a `security.`
+one needs `CAP_SYS_ADMIN` (`CAP_SETFCAP` for `security.capability`), and
+`system.` (ACLs) is not kept.
+
+Every guest file is the host user's, so the host checks its owner's bits
+on every access, where Linux's root passes them (`CAP_DAC_OVERRIDE`) and
+container tools count on it (a layer directory made `0555`, then filled).
+So a mode that denies its owner something is kept apart
+(`crates/kernel/src/modes.rs`): on the host the file keeps the owner's read
+and write (and search, for a directory), and the guest's mode is in an
+attribute, the file flagged (`UF_NODUMP`) so that a `stat` shows at once
+whether to look for it. `stat` reports the kept mode; a caller without the
+capabilities is held to the owner's bits of it by fwe; and a file the host
+refuses root, made by something else, is converted the first time.
+
 A memfd (`memfd_create`, `crates/kernel/src/memfd.rs`) is a file in fwe's
 private directory, unlinked as soon as it is made, with its name and its
 seals in extended attributes, so every process that holds it sees the
@@ -359,7 +383,16 @@ uid_map,gid_map,setgroups}`, `/proc/self/fd`, `/proc/self/ns`,
 version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,overflowuid,
 overflowgid,threads-max}`, `/proc/sys/fs/{nr_open,file-max,pipe-max-size}`,
 `/proc/sys/vm/{overcommit_memory,mmap_min_addr}`, `/sys/fs/cgroup` (a
-mount point) and `/sys/devices/system/cpu/{online,possible}`. File content is served from
+mount point) and `/sys/devices/system/cpu/{online,possible}`.
+`/proc/self/auxv` is the auxiliary vector the program started with, and
+`/proc/stat` the host's CPU times and boot time. A network namespace of
+fwe's has sysctls of its own (`crates/kernel/src/sysctl.rs`:
+`net/ipv4/ping_group_range`, `ip_unprivileged_port_start` and the like),
+kept in its record, written with Linux's checks; the initial namespace's
+are Linux's defaults. `/proc/self/fd/N`, `/proc/self/cwd` and
+`/proc/self/root` lead out of `/proc` in the middle of a path, as Linux's
+magic links do (a program that binds a socket at
+`/proc/self/fd/N/name`, to keep the path short). File content is served from
 an anonymous, seekable fd. The per-process values (exe, cmdline, cpu count,
 host name) are set at program load and `execve`. The directories can be
 opened and listed: `crates/kernel/src/synthdir.rs` serves `getdents64`,
@@ -639,7 +672,23 @@ does; macOS's would follow it. Abstract-namespace names (a leading NUL) map to f
 temporary directory, since macOS has no abstract namespace. `SCM_RIGHTS`
 ancillary data is re-encoded, since `cmsg_len` is 64-bit on Linux and 32-bit
 on macOS; the passed descriptors are host descriptors and work in the
-receiver directly. DNS needs no special support: the guest's resolver reads
+receiver directly. macOS limits a socket path to 104 bytes, which a short
+guest path under a long root can pass: such a socket is bound or connected
+by its name from its directory, the calling thread's alone
+(`pthread_fchdir_np`). A socket's node has the socket's mode less the
+umask: every bit, or what `fchmod` gave the socket before it was bound.
+
+macOS has no `SOCK_SEQPACKET` Unix sockets, so fwe makes one of a stream
+socket (`crates/kernel/src/seqpacket.rs`): each message is framed on the
+stream, its length first, and a receive takes one whole message, cut to
+the buffer (`MSG_TRUNC`) with the rest dropped, so boundaries are kept;
+a send is whole or, without blocking, `EAGAIN`. The rest is the stream's
+own, so it can listen, connect and accept, and a peer's close is
+end-of-file to `read`, `poll` and `epoll` alike. Its buffers hold two of
+the largest messages, and their odd size marks it, so a process that
+receives one with `SCM_RIGHTS` knows it for what it is.
+
+DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
 over these sockets. `AF_NETLINK` and raw sockets are M4.
 
@@ -679,8 +728,8 @@ would be wrong (one host process backs the guest) and would need root. The
 act on it with Linux permission semantics. The default is root (uid 0), the
 usual identity inside a container image; a program that drops privileges
 cannot regain them. `chown` as virtual root is accepted but does not change
-host ownership (shadow ownership is not tracked), and `access` under a
-virtual root bypasses the permission bits as Linux root does.
+host ownership (shadow ownership is not tracked), and a virtual root passes
+permission bits as Linux's does (see Filesystem).
 
 Host user and group ids the guest sees — a file's owner from `stat`, a
 signal's sender, a child in `waitid` — are mapped as a rootless container's
@@ -731,7 +780,9 @@ initial namespace sees the host's: its host name, its pids.
 - **pid** (`pidns.rs`): a namespace numbers its processes and threads from
   1 and maps each number to its host pid; `getpid`, `getppid`, `kill`,
   `wait4`, `waitid`, the process-group, session and terminal calls and
-  the senders in `siginfo` are translated.
+  the senders in `siginfo` are translated. When its init ends, or is sent
+  `SIGKILL`, every other process in it is killed; from inside the
+  namespace, its init cannot be sent `SIGKILL` or `SIGSTOP`.
 - **UTS**: `uname`, `sethostname`, `setdomainname` and
   `/proc/sys/kernel/hostname` use its names.
 - **network** (`netns.rs`): a loopback interface, down until brought up;
@@ -745,6 +796,23 @@ initial namespace sees the host's: its host name, its pids.
 - **cgroup**: `/proc/self/cgroup` and a `cgroup2` mount show the tree from
   its root.
 - **IPC**: its identity (there are no System V IPC objects).
+
+An orphan is adopted as on Linux, by its nearest living ancestor that is
+a child subreaper (`PR_SET_CHILD_SUBREAPER`), or else by the init of its
+dying parent's pid namespace (`crates/kernel/src/reaper.rs`); macOS gives
+every orphan to launchd, and only a parent can wait for a process, so fwe
+keeps the adoption itself. Each process's record holds its line of
+ancestors and whether it is a subreaper, so an orphan's `getppid` (and
+`/proc/<pid>`) names its adopter. A process that ends where a reaper
+might adopt it records how it ended; one killed by `SIGKILL` cannot, and
+whoever finds it gone records that for it. Its parent's `wait` removes the
+record, or once the parent has gone, the adopter's `wait` takes it. A
+reaper runs a watcher thread that follows its descendants on the host
+(`kqueue` process events) and, when an adopted one ends, sends the reaper
+a `SIGCHLD` through the host (so its disposition and mask act on it as on
+a child's; the handler takes the sender and status from the watcher) and
+wakes its threads waiting in `wait`, which look at its own children and
+then at its adopted ones.
 
 `/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
 `status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
@@ -854,23 +922,31 @@ those items.
   `mknod` makes opens a host device only for those numbers (`ENXIO`
   otherwise); a node lists as a regular file in `getdents64`, and an
   `O_PATH` descriptor of a device the host will not open is a stand-in
-  whose `stat` is `/dev/null`'s. File owners other than fwe's own user
-  read as 65534, and a `chown` does not show in a later `stat`.
+  whose `stat` is `/dev/null`'s, as is that of a socket. File owners other
+  than fwe's own user read as 65534, and a `chown` does not show in a
+  later `stat`. A caller without the capabilities is held only to the
+  owner's bits of a kept mode, and a directory's search bit is not
+  enforced for it.
 - **Mounts:** mounts do not propagate between namespaces, whatever their
   propagation type; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
   always detaches).
 - **Namespaces:** a network namespace has a loopback interface only (no
   `veth`, no netlink), and a datagram to one of its ports nobody bound by
-  number goes to the host loopback port of that number; a port is freed
+  number goes to the host loopback port of that number; the initial
+  namespace's sysctls cannot be changed (they would be the host's); a
+  port is freed
   when the last descriptor of its socket in the binding process closes;
   capabilities are the process's, not qualified by user namespace;
-  `setns` is not implemented; an orphan is not reparented to a
-  `PR_SET_CHILD_SUBREAPER` ancestor (macOS gives it to launchd), so a
-  runtime that double-forks its container (crun with a user namespace)
-  loses sight of it; `/proc/<pid>` of another process has no `fd`, `cwd`,
-  `root` or `environ`, and shows only fwe's processes in the initial pid
-  namespace.
+  `setns` is not implemented; an adopted orphan that stops or continues
+  is not reported to its adopter's `wait`, and its adopter is found when
+  asked for, not fixed when its parent ends (an ancestor that becomes a
+  subreaper later adopts it too); a pid namespace's init killed outright
+  (not by a fwe process's `kill`) ends its namespace only once its parent
+  reaps it or a reaper sees it gone, and an init's end is reported before
+  the rest of its namespace has gone;
+  `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
+  `environ`, and shows only fwe's processes in the initial pid namespace.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
   back but not enforced (only `pids.max` and device programs are); a
   threaded cgroup cannot be made (`cgroup.threads` refuses writes); the
@@ -879,8 +955,8 @@ those items.
   `SECCOMP_FILTER_FLAG_TSYNC`), and there is no user-notification listener
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`);
   `sched_setaffinity` is checked and remembered but threads still run on
-  any CPU; `SOCK_SEQPACKET` exists only as a socketpair, a datagram pair
-  that loses its kind when passed with `SCM_RIGHTS`.
+  any CPU; processes that share a `SOCK_SEQPACKET` socket and read it at
+  once can split a message between them (a process's own threads cannot).
 - **Signals:** a real-time signal (`SIGRTMIN` and up, which the host lacks)
   can only be sent within the process; standard signals are not queued
   (one pending per signal, as Linux does for them); a blocked signal whose
