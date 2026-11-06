@@ -141,6 +141,15 @@ impl<P: Platform> Kernel<P> {
         }
         // Taken while this process's own pid namespaces are current.
         let mut line = crate::procreg::child_line();
+        if flags & fwe_abi::clone::CLONE_PARENT != 0
+            && crate::pidns::current().first().is_some_and(|ns| {
+                // SAFETY: getpid cannot fail.
+                ns.get().number_of(unsafe { libc::getpid() }) == Some(1)
+            })
+        {
+            // A pid namespace's init has no parent in its namespace to give.
+            return Err(errno::EINVAL);
+        }
         if flags & fwe_abi::clone::CLONE_PARENT != 0 && !line.0.is_empty() {
             // Its parent is this process's parent, as Linux has it (the
             // host's is this process, which the host cannot change).
@@ -228,6 +237,7 @@ impl<P: Platform> Kernel<P> {
         // Its own record too: it may end before the parent writes it.
         crate::procreg::own_line(&t.line);
         crate::reaper::forked_child();
+        crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
         // SAFETY: getpid cannot fail.
         t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })

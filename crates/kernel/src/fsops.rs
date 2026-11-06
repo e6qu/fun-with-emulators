@@ -230,7 +230,7 @@ impl<P: Platform> Kernel<P> {
                     let mark = match self.map_file(dirfd as i32, &path) {
                         Some(mark) => Ok(mark),
                         None => match self.oom_file(dirfd as i32, &path) {
-                            Some(mark) => Ok(mark),
+                            Some(mark) => mark,
                             None => sysctl().unwrap_or(Err(errno::EACCES)),
                         },
                     };
@@ -389,6 +389,7 @@ impl<P: Platform> Kernel<P> {
         let open = || unsafe { host::openat(dirfd, &name, host_flags, host_mode as libc::c_uint) };
         // Whether `fd` is a stand-in for the file (see `Origin::stand_in`).
         let mut stand_in = false;
+        let cloexec = host_flags & libc::O_CLOEXEC;
         let mut fd = match &existing {
             // Made here: a change of the directory.
             None if flags & fcntl::O_CREAT != 0 => {
@@ -427,13 +428,15 @@ impl<P: Platform> Kernel<P> {
                 r as i32
             }
             Some(st)
-                if st.st_mode & libc::S_IFMT == libc::S_IFIFO && flags & fcntl::O_PATH != 0 =>
+                if matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFLNK)
+                    && flags & fcntl::O_PATH != 0 =>
             {
                 // Any open of a FIFO is a reader or a writer of it, which an
-                // O_PATH descriptor is not: a stand-in names it.
+                // O_PATH descriptor is not, and the host opens no symbolic
+                // link itself (O_PATH | O_NOFOLLOW does): a stand-in names it.
                 stand_in = true;
                 // SAFETY: a constant NUL-terminated path.
-                unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) }
+                unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | cloexec) }
             }
             Some(st)
                 if st.st_mode & libc::S_IFMT == libc::S_IFIFO
@@ -470,7 +473,7 @@ impl<P: Platform> Kernel<P> {
             // has no such open, so a stand-in holds the node's place (where
             // it was opened, which is what an O_PATH descriptor is used for).
             // SAFETY: a constant NUL-terminated path.
-            fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | cloexec) };
             stand_in = true;
         }
         if fd < 0 {
@@ -524,7 +527,18 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_faccessat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
-        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if flags & !(fcntl::AT_EACCESS | fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH) != 0
+            || mode & !7 != 0
+        {
+            return err(errno::EINVAL);
+        }
+        let mut path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
+            if dirfd as i64 != fcntl::AT_FDCWD {
+                return self.access_fd(dirfd as i32, mode);
+            }
+            path = b".".to_vec();
+        }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         let r = match self.fs().resolve(dirfd as i32, &path, follow) {
             Ok(r) => r,
@@ -563,6 +577,58 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         ret(unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode as i32, 0) })
+    }
+
+    /// `faccessat2(fd, "", mode, AT_EMPTY_PATH)`: the access the caller has
+    /// to the file `fd` is open on (or, for an `O_PATH` stand-in, names).
+    fn access_fd(&self, fd: i32, mode: u64) -> i64 {
+        let st = match stat_fd(fd) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
+        const W_OK: u64 = 2;
+        const X_OK: u64 = 1;
+        if mode & W_OK != 0
+            && crate::fdmarks::origin(fd).is_some_and(|o| o.flags & crate::mounts::ms::RDONLY != 0)
+        {
+            return err(errno::EROFS);
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            // A symbolic link's own bits are all set.
+            return 0;
+        }
+        if self.creds.has(crate::caps::CAP_DAC_OVERRIDE) {
+            if mode & X_OK != 0 && (st.st_mode & 0o111) == 0 {
+                return err(errno::EACCES);
+            }
+            return 0;
+        }
+        if crate::modes::marked(&st) {
+            let perm = crate::modes::perm_of(&st);
+            return if crate::modes::owner_allows(perm, mode as u32 & 7) {
+                0
+            } else {
+                err(errno::EACCES)
+            };
+        }
+        if let Some(path) = crate::fs::host_path_of(fd).filter(|p| p.starts_with(b"/"))
+            && let Ok(c) = CString::new(path)
+        {
+            // SAFETY: a NUL-terminated path.
+            return ret(unsafe { libc::access(c.as_ptr(), mode as i32) });
+        }
+        // A file with no path (a pipe, a socket): its bits for the caller.
+        // SAFETY: plain host calls.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let shift = if st.st_uid == uid {
+            6
+        } else if st.st_gid == gid {
+            3
+        } else {
+            0
+        };
+        let bits = (st.st_mode as u32 >> shift) & 7;
+        if bits & mode as u32 == mode as u32 { 0 } else { err(errno::EACCES) }
     }
 
     /// `statfs(path, buf)`: the filesystem of the directory holding `path`
@@ -726,6 +792,23 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if path.is_empty() {
+            // The symbolic link an O_PATH | O_NOFOLLOW descriptor names (a
+            // stand-in); any other descriptor has no link to read.
+            let Some(host) = crate::fdmarks::stand_in(dirfd as i32) else {
+                return err(errno::ENOENT);
+            };
+            let Ok(c) = CString::new(host) else { return err(errno::ENOENT) };
+            let mut target = vec![0u8; uaccess::PATH_MAX];
+            // SAFETY: a NUL-terminated path and a buffer of its length.
+            let n = unsafe { libc::readlink(c.as_ptr(), target.as_mut_ptr().cast(), target.len()) };
+            if n < 0 {
+                return last_error();
+            }
+            let n = (n as usize).min(size as usize);
+            guest!(uaccess::write_from(buf, &target[..n]));
+            return n as i64;
+        }
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
                 crate::procfs::Entry::Symlink(target) | crate::procfs::Entry::Fd { target, .. } => {
@@ -1283,7 +1366,33 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: valid timespec array pointer or null.
             return ret(unsafe { libc::futimens(dirfd as i32, times_ptr) });
         }
+        if flags & !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH) != 0 {
+            return err(errno::EINVAL);
+        }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 && dirfd as i64 != fcntl::AT_FDCWD {
+            // The descriptor's own file; an O_PATH stand-in's is the one it
+            // names.
+            if let Err(e) = self.fd_change(dirfd as i32) {
+                return err(e);
+            }
+            if let Some(host) = crate::fdmarks::stand_in(dirfd as i32) {
+                let Ok(c) = CString::new(host) else { return err(errno::ENOENT) };
+                // SAFETY: a NUL-terminated path; times valid or null.
+                return ret(unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        c.as_ptr(),
+                        times_ptr,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                });
+            }
+            // SAFETY: valid timespec array pointer or null.
+            return ret(unsafe { libc::futimens(dirfd as i32, times_ptr) });
+        }
+        let path =
+            if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 { b".".to_vec() } else { path };
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
         if let Some(fd) = self.fd_link(dirfd, &path, follow) {
             if let Err(e) = self.fd_change(fd) {
@@ -1332,8 +1441,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// For `/proc/<pid>/oom_score_adj` or `oom_adj` at `path`, what a write
-    /// to it acts on.
-    fn oom_file(&self, dirfd: i32, path: &[u8]) -> Option<crate::fdmarks::Mark> {
+    /// to it acts on, or why it may not be opened to write (another owner's,
+    /// to a caller without `CAP_DAC_OVERRIDE`).
+    fn oom_file(&self, dirfd: i32, path: &[u8]) -> Option<Result<crate::fdmarks::Mark, i32>> {
         let p = self.fs().proc_path(dirfd, path).or_else(|| {
             let a = self.fs().absolute_path(dirfd, path)?;
             let (m, fs_path) = self.fs().mount_of(&a);
@@ -1353,8 +1463,17 @@ impl<P: Platform> Kernel<P> {
         } else {
             crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
         };
+        // SAFETY: getpid cannot fail.
+        let own = host == unsafe { libc::getpid() };
+        // The file is its process's effective user's, mode 0644.
+        if !own
+            && !self.creds.has(crate::caps::CAP_DAC_OVERRIDE)
+            && crate::procreg::ids(host)[1] != self.creds.fsuid
+        {
+            return Some(Err(errno::EACCES));
+        }
         let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
-        Some(crate::fdmarks::Mark::OomScore { host, legacy, privileged })
+        Some(Ok(crate::fdmarks::Mark::OomScore { host, legacy, privileged }))
     }
 
     /// For `/proc/<pid>/uid_map`, `gid_map` or `setgroups` at `path`, what
@@ -1733,6 +1852,21 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EROFS);
         }
         let Some(layers) = o.ovl.clone() else { return Ok(()) };
+        if let Some(host) = o.stand_in {
+            // An O_PATH stand-in names its file by path: copied up by it,
+            // the stand-in names the copy.
+            let upper = layers.upper.as_deref().ok_or(errno::EROFS)?;
+            if crate::mounts::under(&host, upper).is_some() {
+                return Ok(());
+            }
+            let path = crate::overlay::path_of(&layers, fd).ok_or(errno::ESTALE)?;
+            let up = crate::overlay::copy_up(&layers, &path)?;
+            let name = path.rsplit(|&b| b == b'/').next().unwrap_or_default();
+            if let Some(dir) = crate::fs::host_path_of(up.as_raw_fd()) {
+                crate::fdmarks::set_stand_in(fd, crate::mounts::join(&dir, name));
+            }
+            return Ok(());
+        }
         // The descriptor's own file, copied up if it is a lower one.
         let Some((up, name)) = crate::overlay::copy_up_open(&layers, fd)? else { return Ok(()) };
         // SAFETY: plain host calls on an open descriptor.

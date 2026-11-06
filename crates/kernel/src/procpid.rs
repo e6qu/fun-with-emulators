@@ -259,12 +259,17 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
     match sub {
         b"" | b"/ns" | b"/task" => Entry::Dir,
         b"/stat" => Entry::File(stat_line(pid, &rec.comm, &h)),
-        b"/status" => Entry::File(status(
-            pid,
-            &rec.comm,
-            &h,
-            &Creds { uids: [0; 4], gids: [0; 4], groups: vec![0], ..Creds::default() },
-        )),
+        b"/status" => Entry::File(status(pid, &rec.comm, &h, &{
+            let u = |id| crate::userns::to_ns(id, false);
+            let g = |id| crate::userns::to_ns(id, true);
+            let i = rec.ids;
+            Creds {
+                uids: [u(i[0]), u(i[1]), u(i[2]), u(i[3])],
+                gids: [g(i[4]), g(i[5]), g(i[6]), g(i[7])],
+                groups: Vec::new(),
+                ..Creds::default()
+            }
+        })),
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),
@@ -356,9 +361,10 @@ pub fn oom_file(sub: &[u8], adj: i32) -> Vec<u8> {
     format!("{v}\n").into_bytes()
 }
 
-/// `oom_adj` (-17 to 15) for `oom_score_adj` `adj`, as Linux scales it.
+/// `oom_adj` (-17 to 15) for `oom_score_adj` `adj`, as Linux scales it
+/// (by 17/1000, the top of the range kept the top).
 fn legacy_adj(adj: i32) -> i32 {
-    if adj == -1000 { -17 } else { adj * 15 / 1000 }
+    if adj == 1000 { 15 } else { adj * 17 / 1000 }
 }
 
 /// What a write of `data` to `/proc/<pid>/oom_score_adj` (or `oom_adj`)
@@ -375,18 +381,20 @@ pub fn oom_write(mark: crate::fdmarks::Mark, data: &[u8], len: u64) -> i64 {
         if !(-17..=15).contains(&v) {
             return err(errno::EINVAL);
         }
-        if v == -17 { -1000 } else { v * 1000 / 15 }
+        if v == 15 { 1000 } else { v * 1000 / 17 }
     } else {
         if !(-1000..=1000).contains(&v) {
             return err(errno::EINVAL);
         }
         v
     };
-    // Lowering it takes CAP_SYS_RESOURCE, as on Linux.
-    if adj < crate::procreg::oom_score_adj(host) && !privileged {
+    // Going below the floor a privileged process set (or, by the older
+    // file, lowering it at all) takes CAP_SYS_RESOURCE, as on Linux.
+    let (now, floor) = crate::procreg::oom_score_adj_range(host);
+    if adj < if legacy { now } else { floor } && !privileged {
         return err(errno::EACCES);
     }
-    match crate::procreg::set_oom_score_adj(host, adj) {
+    match crate::procreg::set_oom_score_adj(host, adj, privileged && !legacy) {
         Ok(()) => len as i64,
         Err(_) => err(errno::ESRCH),
     }

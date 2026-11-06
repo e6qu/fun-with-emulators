@@ -711,15 +711,21 @@ over these sockets. Raw sockets are M4.
 Named FIFOs differ on the host in two ways fwe makes up for
 (`crates/kernel/src/fifo.rs`). macOS reports neither to `kqueue` nor to
 `poll` that a FIFO's last writer has gone: fwe's `epoll` and `ppoll`
-watching a FIFO's read end wait in short slices and probe it between them
-with a read that does not block (end-of-file then, or `EAGAIN` while a
-writer remains; a byte taken by the probe is kept for the next read), and
-report `POLLHUP` as Linux does. An open of a FIFO that waits for its other
-end runs outside the kernel lock, so the process's other threads run on.
+watching a FIFO's read end wait in short slices and look between them with
+the host's `select`, which asks the FIFO's underlying socket and finds it
+readable with nothing to read once a writer has been there and gone. They
+report `POLLHUP` as Linux does (once to an edge-triggered or one-shot
+`epoll` entry; a signal ends the wait between slices), after the data still
+buffered has been read. The look reads nothing, so a process holding a
+FIFO's read end only to keep it open takes no data from its reader. An
+open of a FIFO that waits for its other end runs outside the kernel lock,
+so the process's other threads run on.
 An `O_PATH` descriptor never opens a FIFO, which on the host would count as
 a reader or writer of it: like one of a device or socket the host cannot
-open, it is a stand-in that names the file, whose `fstat` is the file's
-and through whose `/proc/self/fd` link the file is opened again.
+open, or of a symbolic link itself (`O_NOFOLLOW`), it is a stand-in that
+names the file, whose `fstat`, `readlinkat`, `faccessat2`, `utimensat` and
+fdinfo are the file's and through whose `/proc/self/fd` link the file is
+opened again.
 
 ## Terminals and job control
 
@@ -874,8 +880,9 @@ the maps), from their records and what the host reports of their
 descriptors; `/proc/self/ns` names each namespace, its links followed by
 `stat` to the namespace itself (its number the inode, as nsfs shows it),
 and `/proc/self/fdinfo` describes each descriptor. A process's
-`oom_score_adj` is in its record, inherited by its children (lowering it
-takes `CAP_SYS_RESOURCE`).
+`oom_score_adj` is in its record, inherited by its children (going below
+the last value a privileged process set takes `CAP_SYS_RESOURCE`), and so
+are its user and group ids, which its files there are owned by.
 
 ### cgroups
 
@@ -1001,7 +1008,8 @@ those items.
   record locks held through it; descriptors of one overlay directory
   (`dup`, `fork`) each keep their own place in its listing.
 - **Namespaces:** a network namespace has a loopback interface only (no
-  `veth`, no netlink), and a datagram to one of its ports nobody bound by
+  `veth`; netlink describes and brings up only it, its port numbers
+  unique within a process rather than the namespace), and a datagram to one of its ports nobody bound by
   number goes to the host loopback port of that number; the initial
   namespace's sysctls cannot be changed (they would be the host's); a
   port is freed
@@ -1015,13 +1023,12 @@ those items.
   not yet reported are forgotten when the reaper runs another program;
   `/proc/<pid>` of another process has no `cwd`, `root` or `environ`, and
   shows only fwe's processes in the initial pid namespace; resource limits
-  set on another process with `prlimit` need `CAP_SYS_RESOURCE` (fwe does
-  not know the other's credentials) and take effect at its next limit
+  set on another process with `prlimit` take effect at its next limit
   call, `fork` or `execve`, and reading another's reports what was set for
   it, else the caller's own; a `CLONE_PARENT` child's parent is the
   caller's for `getppid`, `/proc` and its adoption, but on the host it is
-  the caller's child, which the caller's parent cannot `wait` for while
-  the caller lives.
+  the caller's child, which the caller's parent cannot `wait` for (nor
+  gets `SIGCHLD` of) while the caller lives.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
   back but not enforced (only `pids.max` and device programs are); a
   threaded cgroup cannot be made (`cgroup.threads` refuses writes); the

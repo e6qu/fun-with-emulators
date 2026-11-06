@@ -3999,6 +3999,29 @@ fn container_runtime_calls() {
     );
 }
 
+/// Descriptor edges container runtimes reach: an `O_PATH | O_NOFOLLOW`
+/// descriptor of a symbolic link (its stat, link, close-on-exec, fdinfo,
+/// access and times through `AT_EMPTY_PATH`); `epoll` reporting one event
+/// per descriptor, one-shot entries once until re-armed, and a FIFO's
+/// writers gone once to one-shot and edge-triggered entries, and nothing
+/// taken from its reader by another process waiting on it; a signal
+/// ending a wait on a FIFO; `oom_adj`'s scale, the floor a privileged write
+/// sets, and another user's `/proc` files.
+#[test]
+fn container_descriptor_edges() {
+    assert_eq!(
+        containers("fd-edges"),
+        "link: true S_IFLNK true\nreadlinkat \"\": target-x\n\
+         readlinkat \"\" of a file: ENOENT\ncloexec: 0 1\nfdinfo O_PATH: true\n\
+         faccessat2 \"\": ok bad flags: EINVAL\nutimensat \"\": ok\nlink's mtime: 2000\n\
+         events: 1 bits 0x5\none-shot: 1 0 re-armed 1\nFIFO one-shot: 1 hup true then 0\n\
+         FIFO edge-triggered: 1 hup true then 0\nFIFO level-triggered: 1 then 1\n\
+         reader got: 200\nppoll: EINTR\nepoll_wait: EINTR\noom_adj 15: 1000 500: 8 -17: -1000\n\
+         user: below the floor EACCES above ok parent's EACCES\n\
+         child's Uid: 1000 1000 1000 1000; root opens its oom_score_adj: ok\n"
+    );
+}
+
 /// An overlay keeps its layers' own directories theirs, makes nothing for
 /// `O_PATH`, follows a directory moved since it was opened, keeps a
 /// descriptor on its own file when another is renamed over it, reads a

@@ -415,8 +415,11 @@ pub fn host_buffer(base: u64, len: u64, write: bool) -> Result<libc::iovec> {
     Ok(libc::iovec { iov_base: g2h(base) as *mut libc::c_void, iov_len: len as usize })
 }
 
+/// The most buffers one vectored call takes (Linux's `UIO_MAXIOV`).
+pub const UIO_MAXIOV: u64 = 1024;
+
 pub fn host_iovecs(addr: u64, count: u64, write: bool) -> Result<Vec<libc::iovec>> {
-    if count > 1024 {
+    if count > UIO_MAXIOV {
         return Err(errno::EINVAL);
     }
     let raw = read_bytes(addr, count as usize * 16)?;

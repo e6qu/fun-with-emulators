@@ -35,12 +35,15 @@ pub fn closed(fd: i32) {
     #[cfg(target_os = "linux")]
     let _ = fd;
     #[cfg(not(target_os = "linux"))]
-    interest(|m| {
-        m.remove(&fd);
-        for list in m.values_mut() {
-            list.remove(&fd);
-        }
-    })
+    {
+        interest(|m| {
+            m.remove(&fd);
+            for list in m.values_mut() {
+                list.remove(&fd);
+            }
+        });
+        EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
+    }
 }
 
 /// Write the interest lists into a fork snapshot.
@@ -174,6 +177,8 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         // SAFETY: plain host calls on the guest's descriptors.
         let r = unsafe { ctl_kqueue(epfd, op, fd, entry.unwrap_or((0, 0))) };
         if r == 0 {
+            // A changed entry is looked at afresh, edge-triggered or not.
+            edge_clear(epfd as i32, fd as i32);
             interest(|m| {
                 if let Some(list) = m.get_mut(&(epfd as i32)) {
                     match entry {
@@ -291,13 +296,16 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
 
 /// `epoll_pwait` on a kqueue. A set that watches the read end of a named
 /// FIFO waits in slices, looking between them for the end of its writers,
-/// which the host does not report ([`crate::fifo`]).
+/// which the host does not report ([`crate::fifo`]), and for a signal to
+/// deliver.
 #[cfg(not(target_os = "linux"))]
 unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> i64 {
     use fwe_abi::epoll::*;
+    let ep = epfd as i32;
     let ms = timeout as i32;
+    let max = maxevents as usize;
     let fifos: Vec<(i32, u64, u32)> = interest(|m| {
-        m.get(&(epfd as i32)).map_or_else(Vec::new, |l| {
+        m.get(&ep).map_or_else(Vec::new, |l| {
             l.iter()
                 .filter(|(_, (ev, _))| ev & EPOLLIN != 0)
                 .map(|(&fd, &(ev, d))| (fd, d, ev))
@@ -308,95 +316,146 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
     .filter(|&(fd, ..)| crate::fifo::is_reader(fd))
     .collect();
     if fifos.is_empty() {
-        // SAFETY: the caller's guarantee, passed on.
-        return unsafe { kevent_into(epfd, events, 0, maxevents as usize, ms) };
+        let ready = match kevent_wait(ep, max, ms) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        return write_events(events, &ready);
     }
     let deadline =
         (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
     loop {
         // FIFOs whose writers have gone, or with bytes a probe kept.
-        let mut ready: Vec<(u32, u64)> = Vec::new();
+        let mut ready: Vec<(i32, u32, u64)> = Vec::new();
         for &(fd, data, ev) in &fifos {
-            match crate::fifo::probe(fd) {
-                crate::fifo::Probe::HungUp => {
-                    // Edge-triggered: once, as Linux reports the change.
-                    if ev & EPOLLET == 0 || hup_first(epfd as i32, fd) {
-                        ready.push((EPOLLIN | EPOLLHUP, data));
-                    }
-                }
-                _ => {
-                    hup_clear(epfd as i32, fd);
-                    if crate::fifo::has_kept(fd) {
-                        ready.push((EPOLLIN, data));
-                    }
-                }
+            // A one-shot entry already reported waits for EPOLL_CTL_MOD.
+            if !armed(ep, fd) {
+                continue;
+            }
+            let bits = match crate::fifo::probe(fd) {
+                crate::fifo::Probe::HungUp => EPOLLIN | EPOLLHUP,
+                _ => 0,
+            };
+            // Edge-triggered: once per change, as Linux reports it.
+            if bits != 0 && (ev & EPOLLET == 0 || edge(ep, fd, bits)) {
+                ready.push((fd, bits, data));
+            } else if bits == 0 {
+                edge_clear(ep, fd);
             }
         }
-        let max = maxevents as usize;
         ready.truncate(max);
-        if !ready.is_empty() {
-            for (i, &(bits, data)) in ready.iter().enumerate() {
-                let dst = events + (i * EVENT_SIZE) as u64;
-                crate::guest!(crate::uaccess::write(
-                    dst,
-                    fwe_abi::EpollEvent { events: bits, data }
-                ));
+        let wait = if ready.is_empty() {
+            match deadline {
+                None => crate::fifo::SLICE_MS,
+                Some(d) => {
+                    let left =
+                        d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+                    left.min(crate::fifo::SLICE_MS)
+                }
             }
-            // And whatever else is ready now.
-            // SAFETY: the caller's guarantee, passed on.
-            let more = unsafe { kevent_into(epfd, events, ready.len(), max, 0) };
-            return ready.len() as i64 + more.max(0);
-        }
-        let slice = match deadline {
-            None => crate::fifo::SLICE_MS,
-            Some(d) => {
-                let left =
-                    d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
-                left.min(crate::fifo::SLICE_MS)
-            }
+        } else {
+            0
         };
-        // SAFETY: the caller's guarantee, passed on.
-        let n = unsafe { kevent_into(epfd, events, 0, max, slice) };
-        if n != 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            return n;
+        // Whatever else is ready, one entry per descriptor.
+        let more = match kevent_wait(ep, max - ready.len(), wait) {
+            Ok(r) => r,
+            Err(e) if ready.is_empty() => return e,
+            Err(_) => Vec::new(),
+        };
+        for (fd, bits, data) in more {
+            match ready.iter_mut().find(|r| r.0 == fd) {
+                Some(r) => r.1 |= bits,
+                None => ready.push((fd, bits, data)),
+            }
+        }
+        for &(fd, ..) in &ready {
+            if fifos.iter().any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
+                disarm(ep, fd);
+            }
+        }
+        if !ready.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return write_events(events, &ready);
+        }
+        if crate::thread::deliverable() != 0 {
+            return fwe_abi::err(fwe_abi::errno::EINTR);
         }
     }
 }
 
-/// The FIFOs whose writers' end an edge-triggered set has reported, by
-/// epoll descriptor and descriptor.
+/// Write `ready` events to the guest's `events` array.
 #[cfg(not(target_os = "linux"))]
-static HUP: std::sync::Mutex<Vec<(i32, i32)>> = std::sync::Mutex::new(Vec::new());
-
-/// Whether the hang-up of `fd` is news to epoll set `epfd` (and note it).
-#[cfg(not(target_os = "linux"))]
-fn hup_first(epfd: i32, fd: i32) -> bool {
-    let mut h = HUP.lock().unwrap_or_else(|e| e.into_inner());
-    if h.contains(&(epfd, fd)) {
-        return false;
+fn write_events(events: u64, ready: &[(i32, u32, u64)]) -> i64 {
+    for (i, &(_, bits, data)) in ready.iter().enumerate() {
+        let dst = events + (i * EVENT_SIZE) as u64;
+        crate::guest!(crate::uaccess::write(dst, fwe_abi::EpollEvent { events: bits, data }));
     }
-    h.push((epfd, fd));
-    true
+    ready.len() as i64
+}
+
+/// What an edge-triggered set last reported of a FIFO the host does not
+/// report on (its writers' end, bytes a probe kept), by epoll descriptor and
+/// descriptor.
+#[cfg(not(target_os = "linux"))]
+static EDGES: std::sync::Mutex<Vec<(i32, i32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `bits` of `fd` are news to epoll set `epfd` (and note them).
+#[cfg(not(target_os = "linux"))]
+fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
+    let mut e = EDGES.lock().unwrap_or_else(|e| e.into_inner());
+    match e.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
+        Some(k) if k.2 == bits => false,
+        Some(k) => {
+            k.2 = bits;
+            true
+        }
+        None => {
+            e.push((epfd, fd, bits));
+            true
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn hup_clear(epfd: i32, fd: i32) {
-    HUP.lock().unwrap_or_else(|e| e.into_inner()).retain(|&k| k != (epfd, fd));
+fn edge_clear(epfd: i32, fd: i32) {
+    EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
 }
 
-/// Wait up to `ms` milliseconds (forever if negative) on kqueue `epfd`,
-/// writing the events as `epoll_event`s from slot `first` of `events`, at
-/// most `max` in all. Returns how many, or the error.
-///
-/// # Safety
-/// `events` spans `max` entries.
+/// Whether `fd`'s entry in set `epfd` still reports (a one-shot entry stops
+/// after its first report, until `EPOLL_CTL_MOD` re-arms it).
 #[cfg(not(target_os = "linux"))]
-unsafe fn kevent_into(epfd: u64, events: u64, first: usize, max: usize, ms: i32) -> i64 {
+fn armed(epfd: i32, fd: i32) -> bool {
     use fwe_abi::epoll::*;
-    if first >= max {
-        return 0;
+    interest(|m| {
+        m.get(&epfd).and_then(|l| l.get(&fd)).is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT) != 0)
+    })
+}
+
+/// A one-shot entry has reported: like Linux, it reports nothing more (in
+/// either direction) until re-armed, and a fork child rebuilds it disarmed.
+#[cfg(not(target_os = "linux"))]
+fn disarm(epfd: i32, fd: i32) {
+    use fwe_abi::epoll::*;
+    let data = interest(|m| {
+        let e = m.get_mut(&epfd)?.get_mut(&fd)?;
+        e.0 &= !(EPOLLIN | EPOLLOUT);
+        Some(e.1)
+    });
+    let Some(data) = data else { return };
+    // Both filters go (kqueue removes only the one that fired).
+    // SAFETY: plain host calls on the guest's descriptors.
+    unsafe { ctl_kqueue(epfd as u64, EPOLL_CTL_DEL, fd as u64, (0, data)) };
+}
+
+/// Wait up to `ms` milliseconds (forever if negative) on kqueue `epfd` for
+/// at most `room` events: `(fd, epoll bits, data)`, one per descriptor
+/// (kqueue reports reading and writing separately; epoll as one event).
+/// A one-shot entry that reports is disarmed.
+#[cfg(not(target_os = "linux"))]
+fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, i64> {
+    use fwe_abi::epoll::*;
+    if room == 0 {
+        return Ok(Vec::new());
     }
-    let room = max - first;
     let mut out: Vec<libc::kevent> = vec![
         libc::kevent {
             ident: 0,
@@ -415,19 +474,13 @@ unsafe fn kevent_into(epfd: u64, events: u64, first: usize, max: usize, ms: i32)
     let ts_ptr: *const libc::timespec = if ms < 0 { std::ptr::null() } else { &ts };
     // SAFETY: `out` holds `room` entries; `ts_ptr` is null or a valid timespec.
     let n = unsafe {
-        libc::kevent(
-            epfd as libc::c_int,
-            std::ptr::null(),
-            0,
-            out.as_mut_ptr(),
-            room as libc::c_int,
-            ts_ptr,
-        )
+        libc::kevent(epfd, std::ptr::null(), 0, out.as_mut_ptr(), room as libc::c_int, ts_ptr)
     };
     if n < 0 {
-        return crate::host::last_error();
+        return Err(crate::host::last_error());
     }
-    for (i, ev) in out[..n as usize].iter().enumerate() {
+    let mut ready: Vec<(i32, u32, u64)> = Vec::with_capacity(n as usize);
+    for ev in &out[..n as usize] {
         let mut bits: u32 = 0;
         match ev.filter {
             libc::EVFILT_READ => bits |= EPOLLIN,
@@ -440,11 +493,21 @@ unsafe fn kevent_into(epfd: u64, events: u64, first: usize, max: usize, ms: i32)
         if ev.flags & libc::EV_ERROR != 0 {
             bits |= EPOLLERR;
         }
-        let dst = events + ((first + i) * EVENT_SIZE) as u64;
-        let out = fwe_abi::EpollEvent { events: bits, data: ev.udata as u64 };
-        crate::guest!(crate::uaccess::write(dst, out));
+        let fd = ev.ident as i32;
+        match ready.iter_mut().find(|r| r.0 == fd) {
+            Some(r) => r.1 |= bits,
+            None => ready.push((fd, bits, ev.udata as u64)),
+        }
     }
-    n as i64
+    for &(fd, ..) in &ready {
+        let oneshot = interest(|m| {
+            m.get(&epfd).and_then(|l| l.get(&fd)).is_some_and(|&(ev, _)| ev & EPOLLONESHOT != 0)
+        });
+        if oneshot {
+            disarm(epfd, fd);
+        }
+    }
+    Ok(ready)
 }
 
 #[cfg(test)]

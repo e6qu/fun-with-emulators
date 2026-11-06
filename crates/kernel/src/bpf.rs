@@ -455,11 +455,13 @@ fn prog_id_type(fd: i32) -> Option<(u32, u32)> {
     let mut idb = [0u8; 8];
     // SAFETY: a valid buffer of its length.
     let n = unsafe { libc::fgetxattr(fd, PROG_ATTR.as_ptr(), idb.as_mut_ptr().cast(), 8, 0, 0) };
-    if n != 8 {
-        return None;
-    }
     let w = |i: usize| u32::from_le_bytes(idb[i..i + 4].try_into().unwrap());
-    Some((w(0), w(4)))
+    match n {
+        8 => Some((w(0), w(4))),
+        // Written by an fwe that kept device programs only.
+        4 => Some((w(0), BPF_PROG_TYPE_CGROUP_DEVICE)),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -699,7 +701,21 @@ pub fn prog_info(fd: i32) -> Option<(u32, u32, Vec<u8>)> {
 /// A program's tag, as Linux computes it: the first 8 bytes of the SHA-1
 /// of its instructions, in hex.
 pub fn tag_hex(insns: &[u8]) -> String {
-    sha1(insns)[..8].iter().map(|b| format!("{b:02x}")).collect()
+    // As Linux hashes it: a 64-bit load of a map's descriptor or value
+    // (BPF_LD|BPF_IMM|BPF_DW with source 1 or 2) without its immediates,
+    // which name the map only in the loading process.
+    let mut v = insns.to_vec();
+    let mut i = 0;
+    while i + 16 <= v.len() {
+        if v[i] == 0x18 && matches!(v[i + 1] >> 4, 1 | 2) {
+            v[i + 4..i + 8].fill(0);
+            v[i + 12..i + 16].fill(0);
+            i += 16;
+        } else {
+            i += 8;
+        }
+    }
+    sha1(&v)[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// SHA-1 (FIPS 180-4) of `data`.

@@ -8,6 +8,7 @@
 use std::ffi::CString;
 
 const EPERM: i32 = 1;
+const EINTR: i32 = 4;
 const ENOENT: i32 = 2;
 const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
@@ -42,6 +43,13 @@ const EPOLLIN: u32 = 1;
 const EPOLLHUP: u32 = 0x10;
 const EPOLLRDHUP: u32 = 0x2000;
 const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_MOD: i32 = 3;
+const EPOLLOUT: u32 = 4;
+const EPOLLET: u32 = 1 << 31;
+const EPOLLONESHOT: u32 = 1 << 30;
+const O_RDWR: i32 = 2;
+const O_NOFOLLOW: i32 = 0o100000;
+const O_CLOEXEC: i32 = 0o2000000;
 const CLONE_NEWNET: i32 = 0x4000_0000;
 
 #[repr(C)]
@@ -135,6 +143,7 @@ unsafe extern "C" {
     fn getrlimit(r: i32, o: *mut [u64; 2]) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn _exit(code: i32) -> !;
+    fn signal(sig: i32, h: extern "C" fn(i32)) -> usize;
     fn __errno_location() -> *mut i32;
 }
 
@@ -146,6 +155,7 @@ fn errno() -> i32 {
 fn name(e: i32) -> &'static str {
     match e {
         EPERM => "EPERM",
+        EINTR => "EINTR",
         ENOENT => "ENOENT",
         EACCES => "EACCES",
         EEXIST => "EEXIST",
@@ -167,6 +177,8 @@ fn name(e: i32) -> &'static str {
 fn res(r: i64) -> &'static str {
     if r >= 0 { "ok" } else { name(errno()) }
 }
+
+extern "C" fn on_alarm(_: i32) {}
 
 fn c(s: &str) -> CString {
     CString::new(s).unwrap()
@@ -875,6 +887,175 @@ fn main() {
                 println!("lo flags: {:#x}", link(None));
                 println!("set up: {}", link(Some(true)) as i32);
                 println!("lo flags then: {:#x}", link(None));
+            }
+            Some("fd-edges") => {
+                let r = |v: i64| res(v);
+                // O_PATH | O_NOFOLLOW names a symbolic link itself.
+                symlink(c("target-x").as_ptr(), c("/tmp/sl").as_ptr());
+                let l = open(c("/tmp/sl").as_ptr(), O_PATH | O_NOFOLLOW);
+                let mut st = [0u64; 16];
+                syscall(80, l, st.as_mut_ptr());
+                println!("link: {} S_IFLNK {}", l >= 0, st[2] as u32 & 0o170000 == 0o120000);
+                let mut buf = [0u8; 64];
+                let n = syscall(78, l, c("").as_ptr(), buf.as_mut_ptr(), 64);
+                println!("readlinkat \"\": {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+                let f = open(c("/etc/marker").as_ptr(), O_RDONLY);
+                println!("readlinkat \"\" of a file: {}", r(syscall(78, f, c("").as_ptr(), buf.as_mut_ptr(), 64)));
+                let lc = open(c("/tmp/sl").as_ptr(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+                println!("cloexec: {} {}", fcntl(l, 1), fcntl(lc, 1));
+                let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{l}")).unwrap_or_default();
+                let flags = info
+                    .lines()
+                    .find_map(|x| x.strip_prefix("flags:\t"))
+                    .and_then(|x| u64::from_str_radix(x, 8).ok())
+                    .unwrap_or(0);
+                println!("fdinfo O_PATH: {}", flags & 0o10000000 != 0);
+                println!("faccessat2 \"\": {} bad flags: {}",
+                    r(syscall(439, l, c("").as_ptr(), 4, 0x1000)),
+                    r(syscall(439, f, c("").as_ptr(), 4, 0x8000)));
+                let times: [i64; 4] = [1000, 0, 2000, 0];
+                println!("utimensat \"\": {}", r(syscall(88, l, c("").as_ptr(), times.as_ptr(), 0x1000)));
+                syscall(79, -100, c("/tmp/sl").as_ptr(), st.as_mut_ptr(), 0x100);
+                println!("link's mtime: {}", st[11]);
+                // One event per descriptor; a one-shot entry reports once,
+                // until re-armed.
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
+                write(sv[1], b"x".as_ptr(), 1);
+                let ep = epoll_create1(0);
+                let mut ev = EpollEvent { events: EPOLLIN | EPOLLOUT, data: 1 };
+                epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &mut ev);
+                let mut got: [EpollEvent; 4] = std::array::from_fn(|_| EpollEvent { events: 0, data: 0 });
+                let n = epoll_wait(ep, got.as_mut_ptr(), 4, 1000);
+                println!("events: {} bits {:#x}", n, got[0].events);
+                let mut ev = EpollEvent { events: EPOLLIN | EPOLLOUT | EPOLLONESHOT, data: 1 };
+                epoll_ctl(ep, EPOLL_CTL_MOD, sv[0], &mut ev);
+                let a = epoll_wait(ep, got.as_mut_ptr(), 4, 1000);
+                let b = epoll_wait(ep, got.as_mut_ptr(), 4, 0);
+                epoll_ctl(ep, EPOLL_CTL_MOD, sv[0], &mut ev);
+                let c2 = epoll_wait(ep, got.as_mut_ptr(), 4, 1000);
+                println!("one-shot: {a} {b} re-armed {c2}");
+                // A FIFO's writers gone: once for a one-shot entry, once
+                // edge-triggered.
+                mkfifo(c("/tmp/f2").as_ptr(), 0o600);
+                if fork() == 0 {
+                    let w = open(c("/tmp/f2").as_ptr(), O_WRONLY);
+                    close(w);
+                    _exit(0);
+                }
+                let fr = open(c("/tmp/f2").as_ptr(), O_RDONLY);
+                waitpid(-1, std::ptr::null_mut(), 0);
+                let watch = |extra: u32| -> (i32, u32, i32) {
+                    let ep = epoll_create1(0);
+                    let mut ev = EpollEvent { events: EPOLLIN | extra, data: 2 };
+                    epoll_ctl(ep, EPOLL_CTL_ADD, fr, &mut ev);
+                    let mut got = EpollEvent { events: 0, data: 0 };
+                    let a = epoll_wait(ep, &mut got, 1, 2000);
+                    let bits = got.events;
+                    let b = epoll_wait(ep, &mut got, 1, 100);
+                    close(ep);
+                    (a, bits & EPOLLHUP, b)
+                };
+                let (a, hup, b) = watch(EPOLLONESHOT);
+                println!("FIFO one-shot: {a} hup {} then {b}", hup != 0);
+                let (a, hup, b) = watch(EPOLLET);
+                println!("FIFO edge-triggered: {a} hup {} then {b}", hup != 0);
+                let (a, _, b) = watch(0);
+                println!("FIFO level-triggered: {a} then {b}");
+                // A process that holds a FIFO's read end open, waiting on
+                // it, takes nothing from its reader.
+                mkfifo(c("/tmp/f3").as_ptr(), 0o600);
+                let (mut ready, mut done) = ([0i32; 2], [0i32; 2]);
+                pipe2(ready.as_mut_ptr(), 0);
+                pipe2(done.as_mut_ptr(), 0);
+                let holder = fork();
+                if holder == 0 {
+                    let h = open(c("/tmp/f3").as_ptr(), O_RDONLY | O_NONBLOCK);
+                    let ep = epoll_create1(0);
+                    let mut ev = EpollEvent { events: EPOLLIN | EPOLLET, data: 4 };
+                    epoll_ctl(ep, EPOLL_CTL_ADD, h, &mut ev);
+                    write(ready[1], b"r".as_ptr(), 1);
+                    let mut pf = [done[0], 1];
+                    while poll(&mut pf, 1, 0) == 0 {
+                        let mut got = EpollEvent { events: 0, data: 0 };
+                        epoll_wait(ep, &mut got, 1, 5);
+                    }
+                    _exit(0);
+                }
+                let mut x = [0u8; 1];
+                read(ready[0], x.as_mut_ptr(), 1);
+                let reader = open(c("/tmp/f3").as_ptr(), O_RDONLY | O_NONBLOCK);
+                if fork() == 0 {
+                    let w = open(c("/tmp/f3").as_ptr(), O_WRONLY);
+                    for _ in 0..200 {
+                        write(w, b"y".as_ptr(), 1);
+                        usleep(1000);
+                    }
+                    _exit(0);
+                }
+                let mut total = 0;
+                let mut pf = [reader, 1];
+                while total < 200 && poll(&mut pf, 1, 2000) > 0 {
+                    let mut b = [0u8; 64];
+                    let n = read(reader, b.as_mut_ptr(), 64);
+                    if n <= 0 && pf[1] >> 16 & 0x10 != 0 {
+                        break;
+                    }
+                    total += n.max(0);
+                }
+                write(done[1], b"d".as_ptr(), 1);
+                waitpid(-1, std::ptr::null_mut(), 0);
+                waitpid(-1, std::ptr::null_mut(), 0);
+                println!("reader got: {total}");
+                // A signal ends a wait on a FIFO.
+                signal(14, on_alarm);
+                let rw = open(c("/tmp/f2").as_ptr(), O_RDWR);
+                alarm(1);
+                let mut pf = [rw, 1];
+                let p = syscall(73, pf.as_mut_ptr(), 1, 0, 0, 8);
+                println!("ppoll: {}", r(p));
+                let ep = epoll_create1(0);
+                let mut ev = EpollEvent { events: EPOLLIN, data: 3 };
+                epoll_ctl(ep, EPOLL_CTL_ADD, rw, &mut ev);
+                alarm(1);
+                let mut got = EpollEvent { events: 0, data: 0 };
+                println!("epoll_wait: {}", r(epoll_wait(ep, &mut got, 1, -1) as i64));
+                // oom_adj scales by 17/1000; a privileged write sets the
+                // floor an unprivileged one may not go below; another
+                // user's file is not to be written.
+                let set = |file: &str, v: &str| -> &'static str { io(std::fs::write(format!("/proc/self/{file}"), v)) };
+                let get = |file: &str| std::fs::read_to_string(format!("/proc/self/{file}")).unwrap_or_default().trim().to_string();
+                set("oom_adj", "15");
+                let top = get("oom_score_adj");
+                set("oom_score_adj", "500");
+                let mid = get("oom_adj");
+                set("oom_adj", "-17");
+                println!("oom_adj 15: {top} 500: {mid} -17: {}", get("oom_score_adj"));
+                set("oom_score_adj", "-500");
+                let (mut pp, mut cp) = ([0i32; 2], [0i32; 2]);
+                pipe2(pp.as_mut_ptr(), 0);
+                pipe2(cp.as_mut_ptr(), 0);
+                let parent = getpid();
+                let child = fork();
+                if child == 0 {
+                    setuid(1000);
+                    let below = set("oom_score_adj", "-600");
+                    let above = set("oom_score_adj", "-400");
+                    let theirs = open(c(&format!("/proc/{parent}/oom_score_adj")).as_ptr(), O_WRONLY);
+                    println!("user: below the floor {below} above {above} parent's {}", r(theirs as i64));
+                    write(cp[1], b"r".as_ptr(), 1);
+                    let mut x = [0u8; 1];
+                    read(pp[0], x.as_mut_ptr(), 1);
+                    _exit(0);
+                }
+                let mut x = [0u8; 1];
+                read(cp[0], x.as_mut_ptr(), 1);
+                let status = std::fs::read_to_string(format!("/proc/{child}/status")).unwrap_or_default();
+                let uid = status.lines().find(|l| l.starts_with("Uid:")).unwrap_or("").replace('\t', " ");
+                let theirs = open(c(&format!("/proc/{child}/oom_score_adj")).as_ptr(), O_WRONLY);
+                println!("child's {uid}; root opens its oom_score_adj: {}", r(theirs as i64));
+                write(pp[1], b"g".as_ptr(), 1);
+                waitpid(child, std::ptr::null_mut(), 0);
             }
             other => panic!("unknown scenario {other:?}"),
         }

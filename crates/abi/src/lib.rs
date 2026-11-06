@@ -274,6 +274,9 @@ pub mod fcntl {
     pub const AT_FDCWD: i64 = -100;
     pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     pub const AT_REMOVEDIR: u64 = 0x200;
+    /// `faccessat2`: check with the effective ids (the same bit as
+    /// `AT_REMOVEDIR`, which is `unlinkat`'s).
+    pub const AT_EACCESS: u64 = 0x200;
     pub const AT_SYMLINK_FOLLOW: u64 = 0x400;
     pub const AT_NO_AUTOMOUNT: u64 = 0x800;
     pub const AT_EMPTY_PATH: u64 = 0x1000;

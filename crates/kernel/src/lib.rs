@@ -264,6 +264,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(self.tracer.failures_only);
         e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
+        netlink::save(e, false);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         match &self.fs {
@@ -319,6 +320,7 @@ impl<P: Platform> Kernel<P> {
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
         let trace_file = d.bytes();
         fdmarks::load(d);
+        netlink::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
@@ -402,6 +404,9 @@ impl<P: Platform> Kernel<P> {
     /// Ignored signals stay ignored, and the blocked mask and pending signals
     /// are kept, as Linux does.
     pub fn exec_reset(&mut self) {
+        // Limits another process left for this one (runc sets its
+        // container's this way before it runs the program).
+        self.take_pending_limits();
         for action in &mut self.sigactions {
             let ignored = action.handler == absig::SIG_IGN;
             *action = Sigaction::default();
@@ -415,10 +420,14 @@ impl<P: Platform> Kernel<P> {
         thread::set_robust_list(0, 0);
         // The saved IDs become the effective ones, as Linux's execve sets
         // them (no set-user-ID programs here).
+        let saved = (self.creds.suid, self.creds.sgid);
         self.creds.suid = self.creds.euid;
         self.creds.sgid = self.creds.egid;
         let (uid, euid) = (self.creds.uid, self.creds.euid);
         self.creds.caps.on_exec(uid, euid);
+        if saved != (self.creds.suid, self.creds.sgid) {
+            self.ids_changed(0);
+        }
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
@@ -511,6 +520,8 @@ impl<P: Platform> Kernel<P> {
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
         fdmarks::save(&mut e);
+        // The netlink sockets' host ends, which survive the host exec.
+        netlink::save(&mut e, true);
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -538,6 +549,7 @@ impl<P: Platform> Kernel<P> {
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
         fdmarks::load(&mut d);
+        netlink::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         d.finish()?;
@@ -567,6 +579,7 @@ impl<P: Platform> Kernel<P> {
         // Limits another process left for this one (runc sets its
         // container's this way before it runs the program).
         self.take_pending_limits();
+        self.ids_changed(0);
         Ok(())
     }
 
@@ -967,10 +980,6 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
-            // Bytes a FIFO probe took, first.
-            if let Some(r) = fifo::take(fd, buf, len) {
-                return Some(r);
-            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
         }
@@ -999,6 +1008,9 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             if netlink::is(fd) {
+                if netlink::too_large(len) {
+                    return Some(fwe_abi::err(fwe_abi::errno::EMSGSIZE));
+                }
                 return Some(match uaccess::read_bytes(buf, len as usize) {
                     Ok(d) => netlink::send(fd, &d),
                     Err(e) => fwe_abi::err(e),
@@ -1012,13 +1024,6 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
-        }
-        n::READV if fifo::has_kept(a[0] as i32) => {
-            // Bytes a FIFO probe took, into the first buffer.
-            match uaccess::read::<[u64; 2]>(a[1]) {
-                Ok([base, len]) => fifo::take(a[0] as i32, base, len).unwrap_or(0),
-                Err(e) => fwe_abi::err(e),
-            }
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),

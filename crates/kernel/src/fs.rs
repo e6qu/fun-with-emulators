@@ -796,8 +796,18 @@ impl Fs {
         }
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out-parameter.
-        unsafe { libc::fstat(fd, &mut st) };
+        match crate::fdmarks::stand_in(fd).and_then(|h| std::ffi::CString::new(h).ok()) {
+            // An O_PATH stand-in: the file it names.
+            Some(host) => {
+                flags = flags & fcntl::O_CLOEXEC | fcntl::O_PATH;
+                // SAFETY: a NUL-terminated path and a valid out-parameter.
+                unsafe { libc::lstat(host.as_ptr(), &mut st) };
+            }
+            // SAFETY: a valid out-parameter.
+            None => unsafe {
+                libc::fstat(fd, &mut st);
+            },
+        }
         let mnt = crate::fdmarks::origin(fd)
             .filter(|o| !o.ns_path.is_empty())
             .map_or(self.mnt.table().root().id, |o| self.mnt.table().locate(&o.ns_path).0.id);
@@ -1911,48 +1921,93 @@ thread_local! {
     static FIFO: std::cell::Cell<Option<(i32, u64)>> = const { std::cell::Cell::new(None) };
 }
 
+/// FIFOs [`open_fifo_unlocked`] holds open for a thread's `openat`, by
+/// fwe's descriptor: a fork child closes them, as no `openat` of its takes
+/// them.
+static PREOPENED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// In a fork child: close the FIFOs other threads of the parent opened
+/// ahead of their `openat` ([`open_fifo_unlocked`]).
+pub(crate) fn forked_child_fifos() {
+    let fds = std::mem::take(&mut *PREOPENED.lock().unwrap_or_else(|e| e.into_inner()));
+    for fd in fds {
+        // SAFETY: fwe's own descriptors, inherited.
+        unsafe { libc::close(fd) };
+    }
+    FIFO.with(|f| f.set(None));
+}
+
 /// Before an `openat(dirfd, path, flags)` that runs under the kernel lock:
 /// if `path` names a FIFO and the open is one that waits for the other end
 /// (to read or to write, without `O_NONBLOCK`), open it here, where the
 /// wait holds no lock and a signal interrupts it (`EINTR`). The locked
 /// open takes the descriptor ([`take_fifo`]). Only paths from the working
 /// directory or absolute are looked at (the view that runs without the
-/// lock has no descriptors to start from).
+/// lock has no descriptors to start from), and only opens that the locked
+/// open would not refuse first: not one that must make the file
+/// (`O_CREAT|O_EXCL`), of a directory, of a link not to be followed, on a
+/// read-only mount to write, of an overlay's file, or of one whose mode fwe
+/// keeps aside (whose checks are the locked open's).
 pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<(), i32> {
     use fwe_abi::fcntl as f;
-    if flags & (f::O_NONBLOCK | f::O_PATH) != 0 || flags & f::O_ACCMODE == f::O_RDWR {
-        return Ok(());
-    }
-    let Ok(path) = crate::uaccess::read_cstr(path, crate::uaccess::PATH_MAX) else { return Ok(()) };
-    if path.first() != Some(&b'/') && dirfd as i64 != fcntl::AT_FDCWD {
-        return Ok(());
-    }
-    let Ok(host) = resolve_host(&path, flags & f::O_NOFOLLOW == 0) else { return Ok(()) };
-    let Ok(c) = cstr(&host) else { return Ok(()) };
-    // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: a NUL-terminated path and a valid out-parameter.
-    if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO
+    if flags & (f::O_NONBLOCK | f::O_PATH | f::O_DIRECTORY) != 0
+        || flags & f::O_ACCMODE == f::O_RDWR
+        || flags & (f::O_CREAT | f::O_EXCL) == f::O_CREAT | f::O_EXCL
     {
         return Ok(());
     }
-    let access = if flags & f::O_ACCMODE == f::O_WRONLY { libc::O_WRONLY } else { libc::O_RDONLY };
+    let Ok(path) = crate::uaccess::read_cstr(path, crate::uaccess::PATH_MAX) else { return Ok(()) };
+    if path.is_empty() || path.first() != Some(&b'/') && dirfd as i64 != fcntl::AT_FDCWD {
+        return Ok(());
+    }
+    let resolved = {
+        let view = published();
+        let Some(v) = view.as_ref() else { return Ok(()) };
+        resolve_in(&v.view(), fcntl::AT_FDCWD as i32, &path, flags & f::O_NOFOLLOW == 0)
+    };
+    let Ok(r) = resolved else { return Ok(()) };
+    let writes = flags & f::O_ACCMODE == f::O_WRONLY;
+    if r.ovl.is_some() || writes && r.writable().is_err() || r.name == b"." {
+        return Ok(());
+    }
+    let Ok(name) = r.name_c() else { return Ok(()) };
+    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
+    let found = unsafe {
+        libc::fstatat(r.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+    } == 0;
+    if !found || st.st_mode & libc::S_IFMT != libc::S_IFIFO || crate::modes::marked(&st) {
+        return Ok(());
+    }
+    let access = if writes { libc::O_WRONLY } else { libc::O_RDONLY };
     // SAFETY: as above; waits for the other end.
-    let fd = unsafe { libc::open(c.as_ptr(), access | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    };
     if fd < 0 {
         return Err(e());
     }
+    // Out of the guest's range while it waits to be taken.
+    let fd = crate::fdtable::reserve(fd)?;
+    PREOPENED.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
     if let Some((old, _)) = FIFO.with(|f| f.replace(Some((fd, flags)))) {
+        forget_preopened(old);
         // SAFETY: one this thread opened and never handed on.
         unsafe { libc::close(old) };
     }
     Ok(())
 }
 
+fn forget_preopened(fd: i32) {
+    PREOPENED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+}
+
 /// Close a FIFO [`open_fifo_unlocked`] opened that this thread's `openat`
 /// did not take (it failed first), so it holds no end of the FIFO open.
 pub(crate) fn drop_fifo() {
     if let Some((fd, _)) = FIFO.with(|f| f.take()) {
+        forget_preopened(fd);
         // SAFETY: this thread's own, never handed on.
         unsafe { libc::close(fd) };
     }
@@ -1963,18 +2018,19 @@ pub(crate) fn drop_fifo() {
 /// instead of waiting under the lock. Any other is closed.
 pub(crate) fn take_fifo(flags: u64, st: &libc::stat) -> Option<i32> {
     let (fd, with) = FIFO.with(|f| f.take())?;
+    forget_preopened(fd);
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut own: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
     let same = unsafe { libc::fstat(fd, &mut own) } == 0
         && (own.st_dev, own.st_ino) == (st.st_dev, st.st_ino)
         && with & fwe_abi::fcntl::O_ACCMODE == flags & fwe_abi::fcntl::O_ACCMODE;
-    if same {
-        return Some(fd);
-    }
+    // Into the guest's range, at the lowest free number as an open's.
+    // SAFETY: plain host calls on fwe's own descriptor.
+    let guest = if same { unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) } } else { -1 };
     // SAFETY: this thread's own, never handed on.
     unsafe { libc::close(fd) };
-    None
+    (guest >= 0).then_some(guest)
 }
 
 /// The guest path of the host path an `AF_UNIX` socket is bound to, if it

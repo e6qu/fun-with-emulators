@@ -682,6 +682,9 @@ fn msg_flags_from_host(flags: i32) -> i32 {
 /// `buf` spans `len` readable bytes; `addr`, if non-null, a `sockaddr`.
 pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> i64 {
     if crate::netlink::is(fd as i32) {
+        if crate::netlink::too_large(len) {
+            return err(errno::EMSGSIZE);
+        }
         let data = guest!(uaccess::read_bytes(buf, len as usize));
         return crate::netlink::send(fd as i32, &data);
     }
@@ -722,12 +725,15 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
 pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> i64 {
     let hflags = msg_flags_to_host(flags);
     if crate::netlink::is(fd as i32) {
-        // From the kernel: port 0.
+        // The whole message's length, asked for with MSG_TRUNC (the host
+        // takes the flag as an output only).
+        let whole = (flags & MSG_TRUNC != 0).then(|| crate::netlink::next_len(fd as i32));
         // SAFETY: the caller guarantees the buffer.
         let r = unsafe { libc::recv(fd as i32, buf as *mut libc::c_void, len as usize, hflags) };
         if r < 0 {
             return last_error();
         }
+        let r = whole.flatten().filter(|_| r >= 0).map_or(r, |w| w as isize);
         if addr != 0 && addrlen != 0 {
             let w = crate::netlink::write_name(addr, addrlen, 0);
             if w < 0 {
@@ -847,6 +853,10 @@ pub unsafe fn setsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
 /// `optval`/`optlen` must be writable.
 pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> i64 {
     if level == SOL_SOCKET && optname == SO_PEERCRED {
+        if !is_unix(fd as i32) || crate::netlink::is(fd as i32) {
+            // No peer process: Linux's empty `ucred` (pid 0, ids -1).
+            return write_ucred(optval, optlen, [0, u32::MAX, u32::MAX]);
+        }
         return peercred(fd as i32, optval, optlen);
     }
     let (hl, ho) = match opt_to_host(level, optname) {
@@ -894,6 +904,13 @@ fn peercred(fd: i32, optval: u64, optlen: u64) -> i64 {
     };
     let pid = crate::pidns::to_guest(pid);
     let cred = [pid as u32, crate::host::uid_to_linux(uid), crate::host::gid_to_linux(gid)];
+    let _ = len;
+    write_ucred(optval, optlen, cred)
+}
+
+/// Write `struct ucred` `cred` to `optval`, its room at `optlen`.
+fn write_ucred(optval: u64, optlen: u64, cred: [u32; 3]) -> i64 {
+    let Ok(len) = uaccess::read::<u32>(optlen) else { return err(errno::EFAULT) };
     let mut bytes = Vec::with_capacity(12);
     for w in cred {
         bytes.extend_from_slice(&w.to_ne_bytes());
@@ -1011,6 +1028,10 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let (name, namelen, iov, iovlen, control, controllen) = guest!(read_msghdr(msg));
     let mut hiov = guest!(uaccess::host_iovecs(iov, iovlen, false));
     if crate::netlink::is(fd as i32) {
+        let total: usize = hiov.iter().map(|v| v.iov_len).sum();
+        if crate::netlink::too_large(total as u64) {
+            return err(errno::EMSGSIZE);
+        }
         let mut data = Vec::new();
         for v in &hiov {
             // SAFETY: the iovecs are checked host buffers.
@@ -1112,6 +1133,10 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_cap,
         msg_flags: 0,
     };
+    // A netlink message's whole length, asked for with MSG_TRUNC.
+    let nl_whole = (crate::netlink::is(fd as i32) && flags & MSG_TRUNC != 0)
+        .then(|| crate::netlink::next_len(fd as i32))
+        .flatten();
     let r = if crate::seqpacket::is(fd as i32) {
         let got = crate::seqpacket::recv(
             fd as i32,
@@ -1133,7 +1158,7 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         if r < 0 {
             return last_error();
         }
-        r
+        nl_whole.map_or(r, |w| w as isize)
     };
     if want_name && crate::netlink::is(fd as i32) {
         // From the kernel: port 0.

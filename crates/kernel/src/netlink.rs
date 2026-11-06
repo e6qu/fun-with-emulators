@@ -64,7 +64,16 @@ struct Sock {
     ty: i32,
     /// Its opener had `CAP_NET_ADMIN`, which changing a link needs.
     admin: bool,
+    /// The network namespace it was made in, which it answers for.
+    net: std::sync::Arc<crate::shared::Record<crate::ns::Net>>,
 }
+
+/// The most a socket's queue holds, and the largest request: Linux's
+/// default socket buffer.
+const BUFFER: usize = 212_992;
+
+/// `NLM_F_CAPPED`: an acknowledgement carries only the request's header.
+const NLM_F_CAPPED: u16 = 0x100;
 
 /// The sockets, by the inode of the guest's end (which its duplicates
 /// share).
@@ -92,9 +101,7 @@ pub fn is(fd: i32) -> bool {
 /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
 pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     use fwe_abi::socket::{SOCK_CLOEXEC, SOCK_NONBLOCK};
-    if crate::netns::current().is_none() {
-        return err(errno::EAFNOSUPPORT);
-    }
+    let Some(net) = crate::netns::current() else { return err(errno::EAFNOSUPPORT) };
     let base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
     // SOCK_RAW and SOCK_DGRAM.
     if base != 3 && base != 2 {
@@ -117,6 +124,15 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
         }
     };
     let fd = pair[0];
+    // Room for the replies a burst of requests queues, as on Linux (a
+    // host datagram socket holds 4 KiB, and drops the rest).
+    for (end, opt) in [(fd, libc::SO_RCVBUF), (peer, libc::SO_SNDBUF)] {
+        let v = BUFFER as libc::c_int;
+        // SAFETY: a valid option value.
+        unsafe {
+            libc::setsockopt(end, libc::SOL_SOCKET, opt, (&v as *const libc::c_int).cast(), 4)
+        };
+    }
     // SAFETY: plain host calls on the new descriptor.
     unsafe {
         if type_ & SOCK_CLOEXEC != 0 {
@@ -128,7 +144,7 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     fdmarks::mark(fd, Mark::Netlink);
-    socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin }));
+    socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin, net }));
     fd as i64
 }
 
@@ -169,6 +185,8 @@ pub fn bind(fd: i32, addr: u64, len: u64) -> i64 {
             return err(errno::EADDRINUSE);
         }
         match m.get_mut(&ino) {
+            // Bound already (explicitly, or by a send): Linux refuses.
+            Some(s) if s.port != 0 && s.port != port => err(errno::EINVAL),
             Some(s) => {
                 s.port = port;
                 0
@@ -213,6 +231,76 @@ pub fn write_name(addr: u64, len: u64, port: u32) -> i64 {
         return err(errno::EFAULT);
     }
     0
+}
+
+/// The length of the next message waiting on `fd`, if one is (macOS's
+/// `SO_NREAD` gives a datagram socket's first).
+pub fn next_len(fd: i32) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut n: libc::c_int = 0;
+        let mut l = 4 as libc::socklen_t;
+        // SAFETY: valid out-parameters.
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NREAD,
+                (&mut n as *mut libc::c_int).cast(),
+                &mut l,
+            )
+        };
+        (r == 0 && n > 0).then_some(n as usize)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// Whether a request of `len` bytes is too large for a socket (Linux's
+/// `EMSGSIZE`): checked before anything is copied for it.
+pub fn too_large(len: u64) -> bool {
+    len > BUFFER as u64
+}
+
+/// Write the sockets into an exec state or fork snapshot (`exec`: the
+/// host ends survive the host `execve` that re-executes fwe).
+pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
+    socks(|m| {
+        e.u64(m.len() as u64);
+        for (&ino, s) in m.iter() {
+            if exec {
+                // SAFETY: plain host call on fwe's own descriptor.
+                unsafe { libc::fcntl(s.peer, libc::F_SETFD, 0) };
+            }
+            e.u64(ino);
+            e.i32(s.peer);
+            e.u32(s.port);
+            e.i32(s.ty);
+            e.bool(s.admin);
+        }
+    });
+}
+
+/// What [`save`] wrote, in the new process (in the namespace it runs in,
+/// which an exec or fork keeps).
+pub(crate) fn load(d: &mut crate::snapshot::Dec) {
+    let n = d.count(21);
+    let mut read = Vec::new();
+    for _ in 0..n {
+        read.push((d.u64(), d.i32(), d.u32(), d.i32(), d.bool()));
+    }
+    let Some(net) = crate::netns::current() else { return };
+    socks(|m| {
+        for (ino, peer, port, ty, admin) in read {
+            // SAFETY: plain host call on fwe's own descriptor.
+            if unsafe { libc::fcntl(peer, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
+                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone() });
+            }
+        }
+    });
 }
 
 /// `fd` is closed: its host end goes with the last of its descriptors.
@@ -314,10 +402,13 @@ fn addr_bodies(family: u8) -> Vec<Vec<u8>> {
 /// A request the guest sent on `fd` (`data`, one or more messages):
 /// answered on the socket. Returns the bytes taken, or the error.
 pub fn send(fd: i32, data: &[u8]) -> i64 {
-    let Some(net) = crate::netns::current() else { return err(errno::EAFNOSUPPORT) };
+    if too_large(data.len() as u64) {
+        return err(errno::EMSGSIZE);
+    }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     let port = port_of(fd);
-    let Some((peer, admin)) = socks(|m| m.get(&ino).map(|s| (s.peer, s.admin))) else {
+    let Some((peer, admin, net)) = socks(|m| m.get(&ino).map(|s| (s.peer, s.admin, s.net.clone())))
+    else {
         return err(errno::EBADF);
     };
     let mut replies: Vec<Vec<u8>> = Vec::new();
@@ -332,13 +423,21 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
         let seq = u32::from_ne_bytes(data[at + 8..at + 12].try_into().unwrap());
         let head = &data[at..at + HEADER];
         let body = &data[at + HEADER..at + len];
-        // An error (or, asked for, an acknowledgement): the error, then
-        // the request's header.
+        // An acknowledgement (the request's header, capped) or an error
+        // (the whole request), as Linux sends them.
+        let whole = &data[at..at + len];
         let ack = |code: i32| {
             let mut b = (-code).to_ne_bytes().to_vec();
-            b.extend_from_slice(head);
-            message(NLMSG_ERROR, 0, seq, port, &b)
+            let flags = if code == 0 {
+                b.extend_from_slice(head);
+                NLM_F_CAPPED
+            } else {
+                b.extend_from_slice(whole);
+                0
+            };
+            message(NLMSG_ERROR, flags, seq, port, &b)
         };
+        let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
         let up = net.get().lo_up;
         let result: Result<Vec<Vec<u8>>, i32> = match ty {
             RTM_GETLINK if flags & NLM_F_DUMP == NLM_F_DUMP => Ok(vec![
@@ -387,7 +486,8 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
         match result {
             Ok(msgs) => {
                 replies.extend(msgs);
-                if flags & NLM_F_ACK != 0 {
+                // A dump ends with its NLMSG_DONE, never an ACK.
+                if flags & NLM_F_ACK != 0 && !dump {
                     replies.push(ack(0));
                 }
             }
