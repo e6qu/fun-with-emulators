@@ -78,6 +78,23 @@ stack, the break reservation and whatever the guest maps — is recorded
 memory (its heap, thread and signal stacks, the `rt_sigreturn` trampoline)
 never is, so `execve` can discard exactly the old program.
 
+The guest's mappings as Linux keeps them are recorded too
+(`crates/kernel/src/maps.rs`), for `/proc/self/maps`, `/proc/self/smaps`
+and `PROCMAP_QUERY`: each memory system call that succeeds, whichever
+backend carried it out, with the protections and sharing the guest asked
+for (memory mapped writable and executable is one or the other at a time
+on macOS) and the file it maps, from which offset; the loaders add the
+program, its dynamic linker (each segment the file's as far as the file
+has contents, zeroed memory beyond) and the stack, and the break is the
+heap. Memory the native backend maps for the guest that the guest did not
+ask for (code stubs, a stack's guard page) is listed as anonymous memory
+with the host's protections, so a program looking for free address space
+in the list does not pick it. Locking (`mlock`, `mlock2`, `mlockall`,
+`MAP_LOCKED`) brings the memory in and marks it locked, which `smaps`,
+`VmLck` in `/proc/self/status` and the next lock's `RLIMIT_MEMLOCK` check
+count; the host is not asked to wire it. `mincore` reports the host's
+residency of each page.
+
 macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO`; on Apple
 Silicon the kernel refuses to launch a process with a smaller one.
 Position-independent executables are loaded anywhere, and `ET_EXEC` images
@@ -387,7 +404,7 @@ one is answered by `crates/kernel/src/procfs.rs` (and `procpid.rs` for
 another process's `/proc/<pid>`) instead of a host directory, which
 generates what programs read: `/proc/self/exe` (a link that opens the
 program itself), `/proc/self/{cmdline,stat,status,cgroup,mountinfo,mounts,
-uid_map,gid_map,setgroups}`, `/proc/self/fd`, `/proc/self/ns`,
+uid_map,gid_map,setgroups,maps,smaps}`, `/proc/self/fd`, `/proc/self/ns`,
 `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`,
 `/proc/uptime` and `/proc/loadavg` (the host's uptime and load, which
 `sysinfo` reports too, with the same fixed memory figures as
@@ -1062,8 +1079,13 @@ those items.
 - **Resources:** the limits the host keeps (`RLIMIT_NPROC`, `RLIMIT_STACK`,
   `RLIMIT_CPU` and the like) cannot be raised past the host's hard limit,
   even by root, and the host acts on them as macOS does (it sends no
-  `SIGKILL` at the hard CPU limit); memory already locked is not counted
-  against `RLIMIT_MEMLOCK` or in `/proc/self/status`.
+  `SIGKILL` at the hard CPU limit).
+- **Mappings:** another process's `/proc/<pid>/maps` is not available (a
+  process's record is its own); in the hypervisor backend, residency
+  (`mincore`, `Rss`) is by the host's 16 KiB pages, so a 4 KiB guest page
+  is in memory when its neighbour in the host page is; `PROCMAP_QUERY`
+  gives no build IDs; `POSIX_FADV_DONTNEED` leaves the host's cache as it
+  is.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.
@@ -1189,8 +1211,8 @@ those items.
   test does) is slow; `SHM_INFO` reports no resident pages; a segment
   stays attached in a hypervisor-backend fork child without being counted
   for it; huge pages (`SHM_HUGETLB`) are refused, as without hugetlbfs.
-- **Not implemented:** `rseq`, `membarrier` (optional for libc), loop devices, `/proc/<pid>/maps`,
-  `splice`, `tee` and `vmsplice`, `mlock`, `personality`, `inotify`,
+- **Not implemented:** `rseq`, `membarrier` (optional for libc), loop devices,
+  `splice`, `tee` and `vmsplice`, `personality`, `inotify`,
   `name_to_handle_at` and the AIO calls; any system call not listed in
   `crates/kernel/src/syscalls.rs` returns `ENOSYS` and is noted under
   `--strace`.

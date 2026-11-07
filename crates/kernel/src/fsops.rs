@@ -1352,6 +1352,43 @@ impl<P: Platform> Kernel<P> {
         ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) })
     }
 
+    /// `fadvise64(fd, offset, len, advice)`: checked as Linux checks it;
+    /// `POSIX_FADV_WILLNEED` starts the host reading the range ahead, and
+    /// the rest only describe how the file will be used, which the host's
+    /// cache works out for itself.
+    pub(crate) fn sys_fadvise(&mut self, fd: u64, offset: u64, len: u64, advice: u64) -> i64 {
+        use fwe_abi::fadvise::*;
+        let fd = fd as i32;
+        if crate::fdmarks::stand_in(fd).is_some() {
+            return err(errno::EBADF);
+        }
+        let mut st = zeroed_stat();
+        // SAFETY: plain host call with a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
+            return err(errno::EBADF);
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFIFO {
+            return err(errno::ESPIPE);
+        }
+        if advice > POSIX_FADV_NOREUSE || (len as i64) < 0 {
+            return err(errno::EINVAL);
+        }
+        #[cfg(target_os = "macos")]
+        if advice == POSIX_FADV_WILLNEED && st.st_mode & libc::S_IFMT == libc::S_IFREG {
+            // Up to the end of the file when `len` is 0, as Linux reads.
+            let count = if len == 0 { (st.st_size as u64).saturating_sub(offset) } else { len };
+            let ra = libc::radvisory {
+                ra_offset: offset as libc::off_t,
+                ra_count: count.min(i32::MAX as u64) as libc::c_int,
+            };
+            // SAFETY: a valid advisory for a guest descriptor; advice only.
+            unsafe { libc::fcntl(fd, libc::F_RDADVISE, &ra) };
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = offset;
+        0
+    }
+
     pub(crate) fn sys_fallocate(&mut self, fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
         if mode & fwe_abi::falloc::FALLOC_FL_KEEP_SIZE == 0 {
             let end = (offset as i64).saturating_add(len as i64);

@@ -136,6 +136,47 @@ pub mod hwcap2 {
     pub const HBC: u64 = 1 << 44;
 }
 
+/// `PROCMAP_QUERY` (`linux/fs.h`): its argument and flags.
+pub mod procmap {
+    pub const VMA_READABLE: u64 = 0x01;
+    pub const VMA_WRITABLE: u64 = 0x02;
+    pub const VMA_EXECUTABLE: u64 = 0x04;
+    pub const VMA_SHARED: u64 = 0x08;
+    pub const COVERING_OR_NEXT_VMA: u64 = 0x10;
+    pub const FILE_BACKED_VMA: u64 = 0x20;
+
+    /// `struct procmap_query`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Query {
+        pub size: u64,
+        pub query_flags: u64,
+        pub query_addr: u64,
+        pub vma_start: u64,
+        pub vma_end: u64,
+        pub vma_flags: u64,
+        pub vma_page_size: u64,
+        pub vma_offset: u64,
+        pub inode: u64,
+        pub dev_major: u32,
+        pub dev_minor: u32,
+        pub vma_name_size: u32,
+        pub build_id_size: u32,
+        pub vma_name_addr: u64,
+        pub build_id_addr: u64,
+    }
+}
+
+/// `posix_fadvise` advice (`linux/fadvise.h`).
+pub mod fadvise {
+    pub const POSIX_FADV_NORMAL: u64 = 0;
+    pub const POSIX_FADV_RANDOM: u64 = 1;
+    pub const POSIX_FADV_SEQUENTIAL: u64 = 2;
+    pub const POSIX_FADV_WILLNEED: u64 = 3;
+    pub const POSIX_FADV_DONTNEED: u64 = 4;
+    pub const POSIX_FADV_NOREUSE: u64 = 5;
+}
+
 /// Memory protection and mapping flags (`asm-generic/mman*.h`).
 pub mod mman {
     /// `mlock2` and `mlockall` flags.
@@ -473,6 +514,9 @@ pub mod signal {
 
 /// Terminal ioctls (`asm-generic/ioctls.h`).
 pub mod ioctl {
+    /// `PROCMAP_QUERY` on a `/proc/<pid>/maps` descriptor
+    /// (`_IOWR('f', 17, struct procmap_query)`).
+    pub const PROCMAP_QUERY: u64 = 0xc068_6611;
     pub const TCGETS: u64 = 0x5401;
     pub const TCSETS: u64 = 0x5402;
     pub const TCSETSW: u64 = 0x5403;

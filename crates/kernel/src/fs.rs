@@ -623,6 +623,9 @@ impl Fs {
         if absolute == b"/proc/self/task" {
             return Some(crate::procfs::Entry::Dir);
         }
+        if absolute == b"/proc/self/maps" || absolute == b"/proc/self/smaps" {
+            return Some(crate::procfs::Entry::File(self.maps(absolute.ends_with(b"/smaps"))));
+        }
         // The calling process's IPC namespace's objects.
         if let Some(kind) = absolute.strip_prefix(b"/proc/sysvipc/") {
             use crate::sysvipc::Kind;
@@ -1087,6 +1090,37 @@ impl Fs {
             data.extend_from_slice(&chunk[..n as usize]);
         }
         Ok(data)
+    }
+
+    /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
+    /// mappings (see [`crate::maps`]).
+    fn maps(&self, smaps: bool) -> Vec<u8> {
+        // The host's view first: its lock comes before the record's.
+        let extra = crate::mm::host_guest_memory();
+        let areas = crate::maps::record().with_extra(&extra);
+        let exe = self.maps_exe();
+        let usage = |s: u64, e: u64| crate::maps::Usage { resident: crate::mm::resident(s, e) };
+        crate::maps::render(&areas, &exe, crate::maps::page_size(), smaps.then_some(&usage))
+    }
+
+    /// The program as `/proc/self/maps` names it.
+    pub(crate) fn maps_exe(&self) -> crate::maps::Exe<'_> {
+        let exe = self.exe();
+        crate::maps::Exe { path: exe, id: self.file_id(exe).unwrap_or((0, 0)) }
+    }
+
+    /// The device and inode numbers of the file `path` names, following
+    /// symbolic links, as `stat` gives them.
+    pub fn file_id(&self, path: &[u8]) -> Option<(u64, u64)> {
+        let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
+        let name = resolved.name_c().ok()?;
+        // SAFETY: zeroed bytes are a valid `stat`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated name, a live directory fd and a valid
+        // out-parameter.
+        let ok = unsafe { libc::fstatat(resolved.dir.as_raw_fd(), name.as_ptr(), &mut st, 0) } == 0;
+        #[allow(clippy::unnecessary_cast)] // the field types differ by host
+        ok.then_some((st.st_dev as u64, st.st_ino as u64))
     }
 
     /// Make this the view the socket calls resolve `AF_UNIX` paths in (see

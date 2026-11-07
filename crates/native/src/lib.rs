@@ -807,6 +807,8 @@ pub fn load_image(
     };
 
     let loaded = load_object(&elf, "exe")?;
+    // The program's file is told by `/proc/self/exe` when listed.
+    fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
     // A dynamically linked executable names an interpreter (the dynamic
     // linker); load it too and start the guest there. It maps the executable's
@@ -825,7 +827,16 @@ pub fn load_image(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            Some(load_object(&ielf, "interp")?)
+            let placed = load_object(&ielf, "interp")?;
+            let name = fwe_kernel::maps::Name::Path(ip.as_slice().into());
+            fwe_kernel::maps::record().loaded(
+                &ielf,
+                placed.bias,
+                page,
+                name,
+                fs.file_id(ip).unwrap_or((0, 0)),
+            );
+            Some(placed)
         }
         None => None,
     };
@@ -857,6 +868,8 @@ pub fn load_image(
     // SAFETY: protecting the lowest page of the mapping just made.
     unsafe { libc::mprotect(stack_base, page as usize, libc::PROT_NONE) };
     let stack_top = stack_base as u64 + STACK_SIZE + page;
+    fwe_kernel::maps::record().set_stack(stack_base as u64 + page, stack_top);
+    fwe_kernel::maps::record().set_heap(brk.start, brk.start, brk.limit);
 
     let (hwcap, hwcap2) = hwcap::detect();
     let (uid, euid, gid, egid) = fwe_kernel::host::ids();

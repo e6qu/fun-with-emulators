@@ -39,8 +39,8 @@ impl<V> Default for Vmas<V> {
 }
 
 impl<V: Mapping> Vmas<V> {
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Vmas { map: BTreeMap::new() }
     }
 
     /// Every mapping, in address order.

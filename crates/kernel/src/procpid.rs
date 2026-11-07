@@ -247,6 +247,8 @@ pub struct Creds {
     pub no_new_privs: bool,
     pub seccomp: u8,
     pub umask: u32,
+    /// Bytes of memory locked (`mlock`).
+    pub locked: u64,
 }
 
 /// `/proc/<pid>/status`.
@@ -267,7 +269,7 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
     format!(
         "Name:\t{}\nUmask:\t{:04o}\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\n\
          Uid:\t{}\nGid:\t{}\nFDSize:\t64\nGroups:\t{groups}\nNStgid:\t{pid}\nNSpid:\t{pid}\nNSpgid:\t{}\nNSsid:\t{}\n\
-         VmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nSigQ:\t0/63448\n{caps}NoNewPrivs:\t{}\nSeccomp:\t{}\n\
+         VmSize:\t{} kB\nVmLck:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nSigQ:\t0/63448\n{caps}NoNewPrivs:\t{}\nSeccomp:\t{}\n\
          Seccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         String::from_utf8_lossy(comm),
         c.umask,
@@ -277,6 +279,7 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
         g(h.pgid),
         g(h.sid),
         h.vsize / 1024,
+        c.locked / 1024,
         h.rss_bytes / 1024,
         h.threads,
         u8::from(c.no_new_privs),

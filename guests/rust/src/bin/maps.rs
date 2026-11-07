@@ -1,0 +1,172 @@
+//! The process's mappings as `/proc/self/maps`, `/proc/self/smaps`,
+//! `PROCMAP_QUERY`, `mincore` and `/proc/self/status` report them: the
+//! program and its stack, a file mapped from an offset, a shared mapping
+//! with a page made read-only in the middle, locked memory, and a mapping
+//! gone once unmapped. It prints what it observed, in terms that do not
+//! depend on where things were placed.
+//!
+//! The C library calls go straight to the statically linked musl, declared
+//! here, so the guest needs no crates.
+use std::ffi::{CString, c_char};
+
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const MAP_SHARED: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MAP_ANONYMOUS: i32 = 0x20;
+/// `_IOWR('f', 17, struct procmap_query)`, passed as the `int` the C
+/// library takes (its top bit set).
+const PROCMAP_QUERY: i32 = 0xc068_6611_u32 as i32;
+const PROCMAP_QUERY_VMA_EXECUTABLE: u64 = 4;
+
+#[repr(C)]
+#[derive(Default)]
+struct ProcmapQuery {
+    size: u64,
+    query_flags: u64,
+    query_addr: u64,
+    vma_start: u64,
+    vma_end: u64,
+    vma_flags: u64,
+    vma_page_size: u64,
+    vma_offset: u64,
+    inode: u64,
+    dev_major: u32,
+    dev_minor: u32,
+    vma_name_size: u32,
+    build_id_size: u32,
+    vma_name_addr: u64,
+    build_id_addr: u64,
+}
+
+unsafe extern "C" {
+    fn memfd_create(name: *const c_char, flags: u32) -> i32;
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+    fn mlock(addr: *const u8, len: usize) -> i32;
+    fn mincore(addr: *mut u8, len: usize, vec: *mut u8) -> i32;
+    fn open(path: *const c_char, flags: i32, ...) -> i32;
+    fn ioctl(fd: i32, req: i32, ...) -> i32;
+    fn getpagesize() -> i32;
+}
+
+/// The lines of `/proc/self/maps` as (start, end, perms, offset, name).
+fn maps() -> Vec<(u64, u64, String, u64, String)> {
+    let text = std::fs::read_to_string("/proc/self/maps").unwrap();
+    text.lines()
+        .map(|l| {
+            let mut f = l.split_whitespace();
+            let range = f.next().unwrap();
+            let (s, e) = range.split_once('-').unwrap();
+            let perms = f.next().unwrap().to_string();
+            let offset = u64::from_str_radix(f.next().unwrap(), 16).unwrap();
+            let _dev = f.next();
+            let _ino = f.next();
+            let name = f.collect::<Vec<_>>().join(" ");
+            (u64::from_str_radix(s, 16).unwrap(), u64::from_str_radix(e, 16).unwrap(), perms, offset, name)
+        })
+        .collect()
+}
+
+/// The perms of the lines covering `[start, end)`, in order.
+fn perms_over(start: u64, end: u64) -> Vec<String> {
+    maps().into_iter().filter(|m| m.0 < end && m.1 > start).map(|m| m.2).collect()
+}
+
+/// A field of `/proc/self/smaps` for the mapping starting at `start`, in kB.
+fn smaps_field(start: u64, field: &str) -> u64 {
+    let text = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut inside = false;
+    for l in text.lines() {
+        let first = l.split_whitespace().next().unwrap_or("");
+        if let Some((s, e)) = first.split_once('-')
+            && u64::from_str_radix(e, 16).is_ok()
+            && let Ok(s) = u64::from_str_radix(s, 16)
+        {
+            inside = s == start;
+        } else if inside && first == format!("{field}:") {
+            return l.split_whitespace().nth(1).unwrap().parse().unwrap();
+        }
+    }
+    u64::MAX
+}
+
+fn main() {
+    // SAFETY: plain C library calls with valid arguments, on memory this
+    // program maps for them.
+    unsafe {
+        let page = getpagesize() as usize;
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let exe = exe.to_str().unwrap().to_string();
+        let all = maps();
+        let code = all.iter().find(|m| m.4 == exe && m.2.contains('x'));
+        println!("program: listed with its code executable: {}", code.is_some());
+        let stack = all.iter().find(|m| m.4 == "[stack]").map(|m| m.2.clone());
+        println!("stack: {}", stack.unwrap_or_default());
+
+        // A file mapped from its second page.
+        let name = CString::new("maps-test").unwrap();
+        let fd = memfd_create(name.as_ptr(), 0);
+        write(fd, vec![7u8; 3 * page].as_ptr(), 3 * page);
+        let f = mmap(std::ptr::null_mut(), 2 * page, PROT_READ, MAP_PRIVATE, fd, page as i64);
+        let line = maps().into_iter().find(|m| m.0 == f as u64).unwrap();
+        println!(
+            "file: {} {}, from page {}, {} pages",
+            line.2,
+            line.4,
+            line.3 / page as u64,
+            (line.1 - line.0) / page as u64
+        );
+
+        // Shared memory with its middle page made read-only.
+        let rw = PROT_READ | PROT_WRITE;
+        let s = mmap(std::ptr::null_mut(), 3 * page, rw, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        mprotect(s.add(page), page, PROT_READ);
+        let (lo, hi) = (s as u64, s as u64 + 3 * page as u64);
+        println!("shared: {}", perms_over(lo, hi).join(" "));
+
+        // Locked memory is in memory, and counted.
+        let l = mmap(std::ptr::null_mut(), 4 * page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        let locked = mlock(l, 2 * page);
+        let mut vec = vec![9u8; 2];
+        let r = mincore(l, 2 * page, vec.as_mut_ptr());
+        let resident = r == 0 && vec.iter().all(|&b| b & 1 != 0);
+        let kb = (2 * page / 1024) as u64;
+        println!(
+            "mlock: {}, locked pages resident: {resident}, smaps Locked {}, Rss {}",
+            locked,
+            smaps_field(l as u64, "Locked") == kb,
+            smaps_field(l as u64, "Rss") == kb
+        );
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let vmlck: u64 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmLck:"))
+            .map_or(0, |v| v.trim().trim_end_matches(" kB").parse().unwrap());
+        println!("status: VmLck covers it: {}", vmlck >= kb);
+
+        // The program's code asked about by address.
+        let maps_fd = open(c"/proc/self/maps".as_ptr(), 0);
+        let mut buf = [0u8; 256];
+        let mut q = ProcmapQuery {
+            size: size_of::<ProcmapQuery>() as u64,
+            query_addr: code.map_or(0, |m| m.0),
+            vma_name_addr: buf.as_mut_ptr() as u64,
+            vma_name_size: buf.len() as u32,
+            ..ProcmapQuery::default()
+        };
+        let r = ioctl(maps_fd, PROCMAP_QUERY, &mut q as *mut ProcmapQuery);
+        let named = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_str().unwrap() == exe;
+        println!(
+            "query: {r}, the program's code: {}, executable: {}",
+            named && q.vma_start == code.map_or(1, |m| m.0),
+            q.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE != 0
+        );
+
+        // Unmapped: gone from the list.
+        munmap(s, 3 * page);
+        println!("unmapped: listed {}", perms_over(lo, hi).len());
+    }
+}

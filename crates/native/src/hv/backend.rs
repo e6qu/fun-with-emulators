@@ -604,6 +604,8 @@ fn start(
     let has_interp = elf.interpreter().map_err(Error::Elf)?.is_some();
     let built_bti = |e: &Elf<'_>| e.aarch64_features() & fwe_elf::AARCH64_FEATURE_BTI != 0;
     let exe = place(&elf, features.bti && !has_interp && built_bti(&elf))?;
+    // The program's file is told by `/proc/self/exe` when listed.
+    fwe_kernel::maps::record().loaded(&elf, exe.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
     let interp = match elf.interpreter().map_err(Error::Elf)? {
         Some(ip) => {
             let idata = fs.read(ip).map_err(|e| {
@@ -618,7 +620,16 @@ fn start(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            Some(place(&ielf, features.bti && built_bti(&ielf))?)
+            let placed = place(&ielf, features.bti && built_bti(&ielf))?;
+            let name = fwe_kernel::maps::Name::Path(ip.into());
+            fwe_kernel::maps::record().loaded(
+                &ielf,
+                placed.bias,
+                page,
+                name,
+                fs.file_id(ip).unwrap_or((0, 0)),
+            );
+            Some(placed)
         }
         None => None,
     };
@@ -635,6 +646,8 @@ fn start(
         mem::map_anywhere(STACK_SIZE + page, rw).map_err(|e| mem_error("making the stack", e))?;
     mem::protect(stack_base, page, mman::PROT_NONE).map_err(|e| mem_error("the stack guard", e))?;
     let stack_top = stack_base + page + STACK_SIZE;
+    fwe_kernel::maps::record().set_stack(stack_base + page, stack_top);
+    fwe_kernel::maps::record().set_heap(brk.start, brk.start, brk.limit);
 
     let (mut hwcap, mut hwcap2) = hwcap::detect();
     // The VM's own pointer authentication and BTI, not the host's.

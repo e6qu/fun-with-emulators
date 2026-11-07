@@ -2725,6 +2725,27 @@ fn sysv_semaphore_between_threads() {
     assert_eq!(sysvipc("threads"), "thread: waited for the other thread's post: true\n");
 }
 
+/// What the `maps` guest observes of its own mappings.
+const MAPS: &str = "program: listed with its code executable: true\n\
+    stack: rw-p\n\
+    file: r--p /memfd:maps-test (deleted), from page 1, 2 pages\n\
+    shared: rw-s r--s rw-s\n\
+    mlock: 0, locked pages resident: true, smaps Locked true, Rss true\n\
+    status: VmLck covers it: true\n\
+    query: 0, the program's code: true, executable: true\n\
+    unmapped: listed 0\n";
+
+/// `/proc/self/maps` and `smaps` list the program, its stack, a file
+/// mapped from an offset, protections changed in the middle of a mapping
+/// and locked memory; `mincore`, `VmLck` and `PROCMAP_QUERY` agree, and an
+/// unmapped range is gone.
+#[test]
+fn proc_maps_lists_the_mappings() {
+    let out = fwe(&rust_guest("maps"), &[]);
+    assert_eq!(stdout(&out), MAPS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Run one scenario of the `memfd` guest and return its output.
 fn memfd(scenario: &str) -> String {
     let out = fwe(&rust_guest("memfd"), &[scenario]);
@@ -3180,6 +3201,15 @@ fn hv_runs_low_rust_programs() {
     // Writable and executable memory: the VM maps it so, the host never.
     let out = fwe_hv(&rust_low_guest("signals"), &["jit"]).unwrap();
     assert_eq!(stdout(&out), JIT);
+}
+
+/// The VM's mappings as `/proc/self/maps` lists them (see
+/// [`proc_maps_lists_the_mappings`]).
+#[test]
+fn hv_lists_the_mappings() {
+    let Some(out) = fwe_hv(&rust_low_guest("maps"), &[]) else { return };
+    assert_eq!(stdout(&out), MAPS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// Signals in the VM: handlers for timers, real-time and sent fault signals,

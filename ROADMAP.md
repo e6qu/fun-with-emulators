@@ -175,8 +175,9 @@ servers run unmodified.
   `2` forms, `getpriority`/`setpriority`, CPU-time clock ids, the `mlock`
   family, `fcntl`'s owner, signal, lease and pipe-size commands, futex
   requeue and bitsets, System V IPC (shared memory, semaphores and message
-  queues per IPC namespace, between processes). Next: loop devices,
-  `/proc/<pid>/maps`, `splice`, `inotify`
+  queues per IPC namespace, between processes), `/proc/self/maps` and
+  `smaps` with `PROCMAP_QUERY`, `mincore`, `fadvise64`. Next: loop devices,
+  `splice`, `inotify`
 - [ ] ptrace and debuggers (gdb, strace)
 - [ ] io_uring
 - [ ] Advanced networking (netlink beyond a namespace's loopback,
