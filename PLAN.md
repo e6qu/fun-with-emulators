@@ -2,92 +2,88 @@
 
 ## Goal
 
-Run unmodified Linux arm64 binaries natively on macOS (Apple Silicon),
-in-process and without a Linux kernel — in the spirit of Wine, but for
-Linux. The project is written in Rust.
+Run unmodified Linux arm64 binaries on macOS (Apple Silicon), in-process and
+without a Linux kernel, in the spirit of Wine. It is written in Rust.
 
 ## Approach
 
-A Rust implementation of the Linux userspace ABI that runs on macOS:
+fwe implements the Linux userspace ABI on top of macOS:
 
-- Linux binaries are loaded into macOS processes and execute directly on the
-  CPU at native speed.
-- Linux system calls are redirected to our own implementation instead of the
-  macOS kernel.
-- Our implementation provides Linux behaviour — processes, threads, memory,
-  files, signals, networking, namespaces and cgroups — built on top of macOS.
+- A Linux program is loaded into an `fwe` process and runs directly on the
+  CPU.
+- Its system calls go to fwe's kernel layer instead of the macOS kernel.
+- That layer provides Linux behaviour on macOS: processes, threads, memory,
+  files, signals, networking, namespaces and cgroups.
 
-The in-process path carries every position-independent binary, which is the
-norm for distribution packages. The one class it physically cannot run is a
-non-PIE executable linked into the low 4 GiB that macOS reserves in every
-arm64 process (Debian's `python3.11`, static Go binaries): the OS refuses the
-mapping and the image cannot be relocated. For exactly those, a
-**minimalistic Hypervisor.framework backend** supplies a guest address space
-without that reservation — a VM for the CPU and memory only, with system
-calls trapped straight into the same kernel layer. A full virtual machine
-with its own Linux kernel is a non-goal; the hypervisor path is as thin as
-possible and used only where the in-process path cannot reach.
-
-## Scope
-
-In scope:
-
-- The Linux userspace ABI on arm64: system calls, ELF loading, signals,
-  `/proc`, `/sys`, `/dev`, ioctls, netlink, namespaces and cgroups.
-- Running real Linux distributions' userland (Debian, Alpine, and others).
-- Running container tooling and standard container images.
-
-Out of scope:
-
-- Linux kernel modules and other private kernel ABI (kprobes, kexec, kernel
-  memory access).
-- Hardware drivers.
-- x86 Linux binaries.
+The in-process path runs every position-independent binary, which is what
+distributions ship. The one class it cannot run is a non-PIE executable
+linked into the low 4 GiB that macOS reserves in every arm64 process. For
+those, a minimal Hypervisor.framework backend gives the guest an address
+space of its own: a VM for the CPU and memory only, with system calls going
+to the same kernel layer. A virtual machine running a Linux kernel is a
+non-goal.
 
 ## Architecture
 
 Four layers, described in [docs/architecture.md](docs/architecture.md):
 
-1. **Loader** — maps a Linux ELF image, and its dynamic linker, into the
-   process and builds the Linux initial stack.
-2. **Execution backend** — runs guest code. The native backend rewrites the
-   few instructions macOS cannot let a Linux process execute unchanged
-   (`svc`, `TPIDR_EL0`, `x18`) and traps system calls; the hypervisor
-   backend runs the guest in a VM and traps `svc` directly.
-3. **Kernel layer** — Linux system call semantics on top of macOS, shared by
-   both backends behind a small `Platform` trait.
-4. **Linux environment** — a root filesystem with synthesized `/proc`, `/sys`
+1. **Loader:** maps a Linux ELF image and its dynamic linker, and builds
+   the Linux initial stack.
+2. **Execution backends:**
+   - the native backend rewrites the few instructions macOS cannot let a
+     Linux process run unchanged (`svc`, `TPIDR_EL0`, `x18`) and traps
+     system calls;
+   - the hypervisor backend runs the guest in a VM and traps `svc` directly
+     ([docs/hypervisor.md](docs/hypervisor.md)).
+3. **Kernel layer:** Linux system-call semantics on macOS, shared by both
+   backends behind a small `Platform` trait.
+4. **Linux environment:** a root filesystem with fwe's own `/proc`, `/sys`
    and `/dev`.
+
+## Scope
+
+In scope:
+- the Linux userspace ABI on arm64: system calls, ELF loading, signals,
+  `/proc`, `/sys`, `/dev`, ioctls, namespaces and cgroups;
+- distributions' userland (Debian, Alpine);
+- container engines and standard images.
+
+Out of scope:
+- kernel modules and private kernel interfaces;
+- hardware drivers;
+- x86 binaries;
+- graphical programs.
+
+## The finish line: 1.0
+
+1.0 is reached when all of these hold, as M2, M4 and M5 of
+[ROADMAP.md](ROADMAP.md) define them:
+- the target programs (git, compilers, Node, Go, Rust, apt, a database, a
+  web server) and container engines (podman, containerd) run unmodified,
+  the VM's verified on real hardware;
+- LTP's system-call tests pass at 80% or more of those that apply;
+- `strace` and `gdb` work on a guest program;
+- a signed release installs and runs them, with user documentation.
+
+What 1.0 leaves out is listed in the roadmap under "Not planned for 1.0".
 
 ## Principles
 
-- **Compatibility first.** The measure of success is unmodified Linux binaries
-  working.
-- **Native performance.** Stay lightweight; no heavy virtualization.
-- **No blockers.** Every implementation challenge is something to overcome.
-- **Measured progress.** Conformance test suites and real workloads define
-  what "working" means.
+- **Compatibility first:** the measure of success is unmodified Linux
+  binaries working.
+- **Native performance:** in-process, with no virtual machine where one is
+  not needed.
+- **No blockers:** an implementation problem is something to solve.
+- **Measured progress:** real workloads and LTP define what "working"
+  means.
 
 ## Measuring progress
 
-- **Real workloads:** unmodified distribution binaries run as end-to-end
-  tests with their output checked. This is what milestones are ticked off
-  against today; the list grows with each milestone.
-- **Conformance:** gVisor's syscall test suite, the Linux Test Project (LTP)
-  and kselftests, tracked as pass rates (from M4).
-- **Performance:** benchmarks against native macOS tools and a Linux VM (M5).
+- **Workloads:** unmodified distribution binaries run as end-to-end tests
+  with their output checked.
+- **Conformance:** LTP's system-call tests run in CI against a baseline of
+  those that pass (`tools/ltp`); a test that stops passing fails CI.
+- **Performance:** benchmarks against native macOS and a Linux VM (M5).
 
-## Workstreams
-
-With the core userland running, work proceeds in parallel across:
-
-- Core kernel (processes, memory, signals)
-- Filesystems and VFS
-- Networking
-- Containers (namespaces, cgroups, security)
-- Execution backends and performance
-- Testing and CI infrastructure
-
-Milestones and status are in [ROADMAP.md](ROADMAP.md). How work is
-delivered — large outcome-sized pull requests, tests as the definition of
-done — is in [AGENTS.md](AGENTS.md).
+How work is delivered (large outcome-sized pull requests, with tests as the
+definition of done) is in [AGENTS.md](AGENTS.md).

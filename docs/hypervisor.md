@@ -105,56 +105,25 @@ The code is in `crates/native/src/hv/`.
 
 ## Never end a VM process abnormally
 
-On 3 November 2026 the development Mac (macOS 15.6.1, M4 Pro) went down twice
-while this backend was being built: a watchdog reset about two minutes after a
-VM process was killed by a signal, and a kernel panic (a NULL dereference in a
-kernel thread) while a VM process was being torn down. Neither was memory
-pressure. Both times the VM processes ended without destroying their vCPUs and
-VM, the tests ran several of them at once, and another Hypervisor.framework
-client (Podman's `krunkit`) was running.
+The development Mac (M4 Pro, macOS 15.6) went down five times on 3 and 4
+November 2026 while this backend was built. The crashes were watchdog
+resets or a kernel panic in a kernel thread, with no stackshot. They came
+during or some time after VM processes ended. Those processes had:
+- ended without destroying their VM;
+- run several at once, beside another hypervisor client (Podman's
+  `krunkit`), or without one;
+- had a VM fail to map memory;
+- had `vfork` children map their parent's memory into a second VM.
 
-It went down a third time that day, with a watchdog reset at about 16:18,
-and that time no fwe VM was alive: the last VM test (the fork tests) had
-ended cleanly 23 minutes before, and the one fwe run just before the crash
-failed before creating a VM. Before that day the machine had been up for
-three weeks with `krunkit` (which uses nested virtualization) running, so
-the crashes follow this backend's use of the hypervisor, but can come long
-after it. That points to kernel state left behind rather than the moment of
-teardown; the panic of the second crash, in a kernel thread, lands near the
-kernel's thread-destruction code. The exact path is Apple's, and the panic
-reports are too thin to show it, so the backend rules out everything on its
-side of it.
+The path inside Apple's kernel is unknown. The runtimes that run Linux
+programs the same way without such reports (hyper-linux, elfuse, Carrick)
+all:
+- map guest memory into the VM once;
+- never change stage 2, or the host memory behind it, while the VM runs;
+- give a fork child a copy rather than pages mapped into two VMs.
 
-It went down a fourth time on 4 November at about 13:47, again a watchdog
-reset with no stackshot, and this time with no other hypervisor client
-running: `krunkit` had been stopped three and a half minutes before. Eight
-VM tests had passed one at a time, then for a minute a `vfork` test and four
-runs of one of its scenarios each started a child whose VM could not map
-the parent's read-only code (`hv_vm_map` failed, since a shared memory entry
-of read-only memory carries no write permission), which tore its VM down and
-exited. The crash came 30 to 40 seconds after the last of them, with nothing
-about fwe or the hypervisor in the system log. So `krunkit` running
-alongside is not needed for a crash, and a VM that fails to map memory and
-is then destroyed joins the suspects.
-
-A fifth crash, the same day at 16:03:48, came during a deliberate,
-fully recorded real run (the flight recorder, below, synced to disk). The
-record shows the map-rules probe agreeing with the stand-in, then the fork
-tests: 19 fork children and 3 vfork children that exec'd all ended cleanly.
-The last lines are a glibc `posix_spawn` vfork child, which had mapped the
-parent's writable memory *shared* into its own VM (its spawn stack
-included), failing its `execve` as the test intends, destroying its VM and
-exiting; 5 ms later the parent took that same stack out of its own VM and
-mapped one more range — and nothing was ever written again. Crash 4 also
-followed vfork children with shared memory. The path inside the kernel is
-still unknown, but the runtimes that run Linux programs on Apple Silicon
-the same way without such reports (hyper-linux, elfuse, Carrick) all avoid
-what fwe does here: they map guest memory into the VM once and never
-change stage 2 or the host memory behind it while the VM runs (guest
-`mmap`/`munmap`/`mprotect` only edit the guest's page tables), they give a
-fork child a copy-on-write copy rather than pages mapped into both VMs,
-and none maps a vfork child's memory into a second VM. The backend's
-memory model is being reworked to match.
+fwe's memory model was reworked to match (above and [Fork](#fork)). It has
+not run on real hardware since.
 
 Since then **a plain `cargo test` never starts a VM**: the VM tests run on
 a software stand-in for the framework (below), and on the real one only when
@@ -207,17 +176,18 @@ Keep to these when changing the backend.
 
 ## Status
 
-Programs linked below 4 GiB run in the VM, static and dynamically linked, with
-threads: the assembly test programs, Rust/musl programs, and a non-PIE glibc
-program whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the
-shape of Debian's `python3.11`. They can `execve` any program, and a native
-program can `execve` them, and `fork` and `vfork` work as in the native
-backend. Two differences from Linux remain: a private file mapping is a copy
-of the file when it was mapped, so later writes to the file through other
-mappings or descriptors do not show in it; and what a `vfork` child changes
-in its address space itself (`mmap`, `munmap`, `mprotect` before it execs or
-exits) stays its own — the memory it writes reaches the parent, its mapping
-changes do not.
+Programs linked below 4 GiB run in the VM: static and dynamically linked,
+with threads, signals, `execve` in both directions, `fork` and `vfork`.
+Debian's Python, GCC, clang and Go pass their tests there. All of it is
+verified on the stand-in (below). The run on real hardware, in the
+self-hosted `hypervisor` job, is still to come: no runner is registered.
+
+Two differences from Linux remain:
+- a private file mapping is a copy of the file when it was mapped, so later
+  writes to the file do not show in it;
+- what a `vfork` child changes in its own address space (`mmap`, `munmap`,
+  `mprotect` before it execs or exits) stays its own, though the memory it
+  writes reaches the parent.
 
 ## Fork
 

@@ -68,8 +68,8 @@ Each document has one job; do not duplicate content across them.
 | Document | Holds |
 |---|---|
 | [README.md](README.md) | What the project is, a short status, how to run and test it |
-| [PLAN.md](PLAN.md) | Goal, approach, scope, principles, how progress is measured |
-| [ROADMAP.md](ROADMAP.md) | Milestones with checklists, "Done when" criteria and status |
+| [PLAN.md](PLAN.md) | Goal, approach, scope, the 1.0 finish line, principles, how progress is measured |
+| [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 with "Done when" criteria, and what is not planned |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |

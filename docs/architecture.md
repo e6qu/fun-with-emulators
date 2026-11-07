@@ -165,45 +165,37 @@ words finds every instruction exactly.
   ordinary scratch register is safe.
 
   `crates/native/src/decode.rs` decides which instructions are covered:
-  the register-only data-processing classes (move wide, add/sub in the
-  immediate, shifted- and extended-register and with-carry forms, logical,
-  bitfield, extract, conditional select and compare, one-, two- and
-  three-source), the floating-point↔integer moves and conversions, the moves
-  between a general register and a vector element (`dup`, `ins`, `smov`,
-  `umov`), all the
-  load/store forms (unsigned and unscaled immediate, register offset, pre-
-  and post-index, pair, the sign-extending loads, with general-purpose and
-  SIMD transfer registers, and the SIMD structure loads and stores, `ld1`
-  to `ld4r` and `st1` to `st4`, through an `x18` base), the exclusive, acquire/release, compare-and-swap
-  and LSE atomic memory instructions, the PC-relative forms (`adr`, `adrp`,
-  `ldr` literal, where the stub materialises the value computed from the
-  original pc), the compare- and test-branches (`cbz`/`cbnz`/`tbz`/`tbnz`,
-  which get a branch stub that tests the preserved value and takes a
-  full-range branch to the real target or the fall-through) and indirect
-  branches (`br`/`blr`/`ret` through `x18`, which load the target into
-  `x16`/`x17`, dead at any branch). A stack spill of `x18` through `sp`, and
-  `add`/`sub` of an immediate to `sp` into `x18` (`mov x18, sp`), have the
-  immediate adjusted by the 32 bytes the stub pushed. Where no immediate can
-  absorb the push — extended-register `add`/`sub` from `sp` (`add x1, sp,
-  x18`, of which Node's library has hundreds), flag-setting or shifted
-  immediates from `sp`, a register offset from `sp`, an offset the push
-  would move out of range — the stub saves a third scratch register, sets it
-  to `sp` as it was on entry and runs the instruction with that register in
-  place of `sp`. What is still left alone: a load/store with writeback onto
-  `sp`, an instruction that writes `sp`, `casp` and the pointer-authenticated
-  loads. `--strace` reports, per prepared image, exactly how many `x18`
-  uses were left (a count of real register operands, not of bit patterns).
+  - every data-processing class (immediate, register, carry, logical,
+    bitfield, conditional, one- to three-source), floating-point and vector
+    element moves to and from general registers;
+  - every load/store form, general and SIMD, structure loads and stores,
+    exclusives, acquire/release and the LSE atomics;
+  - PC-relative forms (`adr`, `adrp`, literal loads): the stub materialises
+    the value from the original pc;
+  - compare- and test-branches: a stub tests the value and takes a
+    full-range branch;
+  - indirect branches through `x18`, via `x16`/`x17`.
+
+  Code that uses `sp` gets special care, since the stub pushes 32 bytes:
+  - a spill of `x18` through `sp`, or `mov x18, sp`, has its immediate
+    adjusted;
+  - where no immediate can absorb the push (an extended-register or
+    flag-setting form from `sp`, a register offset, an offset pushed out of
+    range), a third scratch register stands in for the original `sp`.
+
+  Still left alone: load/store writeback onto `sp`, writes to `sp`, `casp`
+  and the pointer-authenticated loads. `--strace` reports, per prepared
+  image, how many `x18` uses were left.
 
   The backend keeps the slot and the kernel's register view in step: a trap
   reads the guest's `x18` from the slot into `Regs` and writes it back on
   return, so a signal frame carries the real value and `rt_sigreturn`
   restores it, and a cloned thread starts with its parent's.
 
-  The macOS custom x18 ABI (`<os/arch/arm64.h>`, macOS 26.4 and later) and
-  `fwe --host-info` remain only as host probes; correctness no longer
-  depends on the host preserving `x18`, and guest code runs without the
-  mode (switching it at every trap cost two host calls, and one of them
-  could hang).
+  Correctness does not depend on the host preserving `x18`. The macOS
+  custom `x18` ABI (`<os/arch/arm64.h>`, macOS 26.4 and later) is only
+  probed (`fwe --host-info`), not used: switching it at every trap costs
+  two host calls, and one of them could hang.
 
 Only executable code is scanned, since a data word that happens to encode a
 rewritten instruction would otherwise be patched too. `Elf::exec_ranges`
@@ -225,7 +217,7 @@ SQLite, lighttpd and PCRE2 every `x18` use lies inside them — and only a
 literal load that is itself code marks its target as a literal pool (a data
 word decoding as one had hidden an `x18` use in OpenSSL's MD5 from the
 rewrite). System calls and thread-pointer accesses are rewritten throughout
-the executable sections, as before. Without a usable unwind table the whole
+the executable sections. Without a usable unwind table the whole
 of each executable section counts as code. Two gaps remain: inline data in
 code an unwind table covers (a jump table), and a binary fully stripped of
 section headers, where the scan falls back to the whole executable segment.
@@ -560,9 +552,8 @@ A process's nice value (`setpriority`, `getpriority`) is in its record
 `/proc/<pid>/stat`, set with Linux's checks (another user's process, or a
 lower value than `RLIMIT_NICE` allows, takes `CAP_SYS_NICE`); the host's
 scheduling is untouched. The resource limits the host has no counterpart
-of, and `RLIMIT_MEMLOCK` (fwe wires no memory: `mlock` and its family
-check the range and the limit, as Linux does, and lock nothing on the
-host), are fwe's (`crates/kernel/src/rlimits.rs`), set as Linux sets them;
+of, and `RLIMIT_MEMLOCK` (locked memory is counted, not wired: see Memory
+model), are fwe's (`crates/kernel/src/rlimits.rs`), set as Linux sets them;
 the others are the host's. The interval timers are the host's, but one
 longer than the host takes (100,000,000 seconds) is given the host's
 longest and reads back as asked. A thread's or process's CPU-time clock
@@ -836,7 +827,7 @@ interfaces are the host's, there is no netlink socket (`EAFNOSUPPORT`).
 
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
-over these sockets. Raw sockets are M4.
+over these sockets. There are no raw sockets.
 
 Named FIFOs differ on the host in two ways fwe makes up for
 (`crates/kernel/src/fifo.rs`). macOS reports neither to `kqueue` nor to
@@ -876,6 +867,8 @@ slave number; `TIOCGPTN` returns it, `TIOCSPTLCK` is accepted, and opening
 keeps the number mapped: another process may still hold the master, as a
 fork child closing its copy does before it opens the slave (apt runs dpkg
 on a pty that way).
+
+## Other calls
 
 `pselect6` (what `select` is on arm64) turns its descriptor sets into a
 `poll` and back. `statfs` and `fstatfs` report the host filesystem's sizes
@@ -981,7 +974,7 @@ initial namespace sees the host's: its host name, its pids.
   rules; a process that makes one has every capability in it.
 - **cgroup**: `/proc/self/cgroup` and a `cgroup2` mount show the tree from
   its root.
-- **IPC**: its identity (there are no System V IPC objects).
+- **IPC**: its System V objects (see System V IPC).
 
 An orphan is adopted as on Linux, by its nearest living ancestor that is
 a child subreaper (`PR_SET_CHILD_SUBREAPER`), or else by the init of its
@@ -1057,13 +1050,14 @@ generated from the Linux UAPI headers by `tools/gen-abi.py`.
 
 ## Known limitations
 
-Each of these is on the [roadmap](../ROADMAP.md); this is the detail behind
-those items.
+Where fwe still differs from Linux. The [roadmap](../ROADMAP.md) says which
+of these are to be lifted for 1.0 and which are not planned.
 
 - **Execution:** a non-PIE executable linked below 4 GiB runs only in the
   hypervisor backend, which needs `fwe` signed with the hypervisor
   entitlement and a bare-metal Apple Silicon Mac (Debian's GCC, clang and
-  Python are such executables). A few rare `x18` forms are left unrewritten
+  Python are such executables); that backend is verified on its software
+  stand-in, not yet on real hardware. A few rare `x18` forms are left unrewritten
   (see Rewriting guest code; `--strace` counts them), and so is any `x18`
   use in JIT code. Code discovery relies on section headers and the unwind
   table; a stripped binary has its whole executable segment scanned, and an
@@ -1219,8 +1213,18 @@ those items.
   test does) is slow; `SHM_INFO` reports no resident pages; a segment
   stays attached in a hypervisor-backend fork child without being counted
   for it; huge pages (`SHM_HUGETLB`) are refused, as without hugetlbfs.
-- **Not implemented:** `rseq`, `membarrier` (optional for libc), loop devices,
-  `splice`, `tee` and `vmsplice`, `personality`, `inotify`,
-  `name_to_handle_at` and the AIO calls; any system call not listed in
-  `crates/kernel/src/syscalls.rs` returns `ENOSYS` and is noted under
-  `--strace`.
+- **Not implemented:**
+  - loop devices;
+  - `ptrace`;
+  - `inotify` and `fanotify`;
+  - `splice`, `tee` and `vmsplice`;
+  - POSIX message queues;
+  - `clock_settime`;
+  - `personality`, `kcmp` and `sched_setattr`;
+  - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`);
+  - `io_uring`, `userfaultfd` and `perf_event_open`;
+  - `rseq` and `membarrier` (optional for libc);
+  - `name_to_handle_at` and the AIO calls.
+
+  Any system call not listed in `crates/kernel/src/syscalls.rs` returns
+  `ENOSYS` and is noted under `--strace`.
