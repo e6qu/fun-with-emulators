@@ -44,7 +44,6 @@ pub mod reaper;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;
-pub mod sigdebug;
 pub mod signal;
 pub mod signalfd;
 pub mod signote;
@@ -242,7 +241,6 @@ impl<P: Platform> Kernel<P> {
     pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
         // Before any handler may need to read a note of a sender.
         signote::init();
-        sigdebug::init();
         Kernel {
             platform,
             tracer,

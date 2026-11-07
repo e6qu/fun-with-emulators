@@ -596,7 +596,6 @@ static REPORTED_PARENT: AtomicI32 = AtomicI32::new(0);
 /// (`SIGCHLD` ignored, or `SA_NOCLDWAIT`), they are reaped instead.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn notify() {
-    crate::sigdebug::event("notify", &[]);
     let fresh: Vec<Ended> = {
         let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
         let n = n.get_or_insert_with(HashSet::new);
@@ -639,13 +638,9 @@ pub fn precedes(pid: i32, pending: i32) -> bool {
 /// still pending absorbs it (a standard signal is not queued twice). Taken
 /// once. Async-signal-safe.
 pub fn superseded(pid: i32) -> bool {
-    let r = pid != 0
+    pid != 0
         && REPORTED.load(SeqCst) != 0
-        && REPORTED_PARENT.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok();
-    if r {
-        crate::sigdebug::event("superseded", &[pid as i64]);
-    }
-    r
+        && REPORTED_PARENT.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok()
 }
 
 /// Raise the `SIGCHLD` for adopted process `e`'s end: pending for the
@@ -654,10 +649,6 @@ pub fn superseded(pid: i32) -> bool {
 /// holds or is delivering would absorb it (standard signals are not queued
 /// twice), and the guest would hear of the orphan from neither.
 fn raise(e: &Ended) {
-    crate::sigdebug::event(
-        "raise orphan parent",
-        &[e.pid as i64, e.lineage.first().map_or(0, |p| p.0) as i64],
-    );
     // An end is what Linux reports before the former parent's own.
     if !is_stop(e.status) && e.status != CONTINUED {
         REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);

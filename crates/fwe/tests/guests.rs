@@ -1403,21 +1403,12 @@ fn alpine_podman_runs_an_image() {
         let trace = root.join("tmp/podman.trace");
         let _ = std::fs::remove_file(&trace);
         cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
-        // How each SIGCHLD report travels (conmon learns of its container's
-        // end by one), for a run that hangs.
-        let sigchld = root.join("tmp/sigchld.trace");
-        let _ = std::fs::remove_file(&sigchld);
-        cmd.arg(format!("--debug-sigchld={}", sigchld.display()));
         cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
         // A `run` ends with its container's status; one killed hung.
         if !out.status.success() && (args[0] != "run" || out.status.code().is_none()) {
             print_last_calls(&trace);
-            eprintln!(
-                "--- SIGCHLD reports:\n{}",
-                std::fs::read_to_string(&sigchld).unwrap_or_default()
-            );
         }
         out
     };
@@ -1473,9 +1464,6 @@ fn alpine_containerd_runs_an_image() {
         let trace = root.join("tmp").join(trace);
         let _ = std::fs::remove_file(&trace);
         cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
-        // How each SIGCHLD report travels (a shim learns of its container's
-        // end by one).
-        cmd.arg(format!("--debug-sigchld={}", root.join("tmp/sigchld.trace").display()));
         cmd.arg("--root").arg(&root).arg(root.join(prog));
         cmd
     };
@@ -1505,10 +1493,6 @@ fn alpine_containerd_runs_an_image() {
         if out.status.code() != Some(expect) {
             print_last_calls(&root.join("tmp").join(&trace));
             print_last_calls(&root.join("tmp/containerd.trace"));
-            eprintln!(
-                "--- SIGCHLD reports:\n{}",
-                std::fs::read_to_string(root.join("tmp/sigchld.trace")).unwrap_or_default()
-            );
         }
         out
     };
@@ -2256,9 +2240,11 @@ fn kill_reaches_another_process() {
     assert_eq!(signals("kill-child"), "killed by 15\n");
 }
 
-/// A flood of signals from another process while the guest makes system
-/// calls: fwe's handlers do not nest without bound on the signal stack
-/// (one that interrupts fwe's own code only records the signal).
+/// A flood of signals, from other processes and between the guest's own
+/// threads (as Go's runtime preempts them), while those threads make
+/// system calls: fwe's handlers do not nest without bound on the signal
+/// stack (one that interrupts fwe's own code only records the signal);
+/// before, the process hung in nested handlers or its signal stack ran out.
 #[test]
 fn signal_flood_during_system_calls() {
     assert_eq!(signals("storm"), "survived: true calls: true\n");
@@ -2605,10 +2591,6 @@ fn namespaces(scenario: &str) -> String {
         .arg(&root)
         .arg(root.join("namespaces"))
         .arg(scenario);
-    if scenario.starts_with("subreaper") {
-        // How each SIGCHLD travels, for a failure on a busy host.
-        cmd.env("FWE_DEBUG_SIGCHLD", "1");
-    }
     let out = run_bounded(cmd);
     eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&root);

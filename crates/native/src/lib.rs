@@ -126,12 +126,6 @@ impl Platform for NativePlatform {
 }
 
 /// Trace to the file at `path` (`--strace-file`), every process of the run.
-/// Trace how each `SIGCHLD` report travels to the file at `path`
-/// (`--debug-sigchld`; see [`fwe_kernel::sigdebug`]).
-pub fn debug_sigchld_to(path: &[u8]) {
-    fwe_kernel::sigdebug::to_file(path);
-}
-
 pub fn trace_to_file(path: &[u8]) -> Result<(), String> {
     // fwe's own descriptors live above the guest's range, which this sets:
     // the guest must never see, reuse or close the trace file's.
@@ -324,9 +318,6 @@ pub(crate) fn reexec(
     }
     if let Some(file) = fwe_kernel::trace::file() {
         argv.push([&b"--strace-file="[..], file].concat());
-    }
-    if let Some(file) = fwe_kernel::sigdebug::file() {
-        argv.push([&b"--debug-sigchld="[..], file].concat());
     }
     if let Some(root) = fs.root_host_path() {
         argv.push(b"--root".to_vec());

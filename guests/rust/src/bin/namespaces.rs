@@ -97,26 +97,10 @@ const ECHILD: i32 = 10;
 static CHLD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CHLD_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// Every `SIGCHLD` taken, as `si_pid` (the first 32), for a failure's
-/// account.
-static CHLD_SEEN: [std::sync::atomic::AtomicI32; 32] =
-    [const { std::sync::atomic::AtomicI32::new(0) }; 32];
-static CHLD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// The senders of the `SIGCHLD`s taken so far.
-fn chld_seen() -> Vec<i32> {
-    let n = CHLD_COUNT.load(std::sync::atomic::Ordering::SeqCst).min(32);
-    CHLD_SEEN[..n].iter().map(|p| p.load(std::sync::atomic::Ordering::SeqCst)).collect()
-}
-
 extern "C" fn on_chld(_sig: i32, info: *const u8, _ctx: *const u8) {
     // SAFETY: a `siginfo_t`, whose `si_code` is at offset 8 and `si_pid`
     // at 16.
     let (code, pid) = unsafe { (info.add(8).cast::<i32>().read(), info.add(16).cast::<i32>().read()) };
-    let k = CHLD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if k < 32 {
-        CHLD_SEEN[k].store(pid, std::sync::atomic::Ordering::SeqCst);
-    }
     CHLD_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
     CHLD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
 }
@@ -851,11 +835,7 @@ fn main() {
                 write_i32(go[1], 1);
                 let mut status = 0;
                 waitpid(p, &mut status, 0);
-                let from = sigchld_from(x);
-                if !from {
-                    eprintln!("orphan {x}, its parent {p}; SIGCHLDs from {:?}", chld_seen());
-                }
-                println!("SIGCHLD for the killed orphan: {from}");
+                println!("SIGCHLD for the killed orphan: {}", sigchld_from(x));
                 let w = waitpid(-1, &mut status, 0);
                 println!("reaped it: {}, {}", w == x, ended(status));
             }
