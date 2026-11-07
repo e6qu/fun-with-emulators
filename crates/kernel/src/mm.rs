@@ -178,9 +178,10 @@ pub(crate) fn host_guest_memory() -> Vec<(u64, u64, u64)> {
 }
 
 /// The memory regions of host process `pid` over its host range `[start,
-/// end)`, as `(start, end, Linux prot, bytes resident)`, cut to the range:
-/// the host counts a region's resident pages, which a part of it is given
-/// its share of.
+/// end)`, as `(start, end, Linux prot, bytes resident)`, cut to the range.
+/// The host counts a region's resident pages, not which they are: a part
+/// of a larger region is counted as resident up to what the region has in
+/// memory.
 #[cfg(target_os = "macos")]
 pub(crate) fn regions_of(pid: i32, start: u64, end: u64) -> Vec<(u64, u64, u64, u64)> {
     /// `struct proc_regioninfo` (`sys/proc_info.h`).
@@ -244,8 +245,10 @@ pub(crate) fn regions_of(pid: i32, start: u64, end: u64) -> Vec<(u64, u64, u64, 
                 prot |= linux;
             }
         }
-        let resident =
-            (r.pages_resident as u128 * page as u128 * (hi - lo) as u128 / r.size as u128) as u64;
+        // Exact where the region is the range; where it is larger, as much
+        // of the range as the region has in memory (the host counts a
+        // region's pages, not which they are).
+        let resident = (r.pages_resident as u64).saturating_mul(page);
         out.push((lo, hi, prot, resident.min(hi - lo)));
         at = hi;
     }

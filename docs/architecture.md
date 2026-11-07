@@ -1089,8 +1089,11 @@ those items.
   `SIGKILL` at the hard CPU limit).
 - **Mappings:** in the hypervisor backend, residency (`mincore`, `Rss`)
   is by the host's 16 KiB pages, so a 4 KiB guest page is in memory when
-  its neighbour in the host page is; another process's `Rss` gives each
-  mapping its share of the host region it lies in.
+  its neighbour in the host page is; another process's `Rss` is exact for
+  a mapping that is a host region of its own, and for one inside a larger
+  region (a hypervisor-backend process's guest memory is one) is as much
+  of it as the region has in memory, which can overstate it: macOS tells
+  another process's resident pages by region, not page by page.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.
