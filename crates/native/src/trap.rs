@@ -455,21 +455,32 @@ fn take_async(
     ctx: *mut libc::c_void,
     in_guest: bool,
 ) {
-    let _host = HostCode::enter();
-    if sig != host::WAKE_SIGNAL {
-        // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        let (code, pid, uid, status) = unsafe { host::signal_info(sig, info) };
-        let lsig = host::signal_to_linux(sig);
-        let info = thread::SigInfo { code, pid, uid, status };
-        if REROUTING.with(Cell::get) {
-            thread::post_process(lsig, info);
-        } else {
-            thread::post_landed(lsig, info);
+    let record = || {
+        if sig != host::WAKE_SIGNAL {
+            // SAFETY: `info` is valid for SA_SIGINFO handlers.
+            let (code, pid, uid, status) = unsafe { host::signal_info(sig, info) };
+            let lsig = host::signal_to_linux(sig);
+            let info = thread::SigInfo { code, pid, uid, status };
+            if REROUTING.with(Cell::get) {
+                thread::post_process(lsig, info);
+            } else {
+                thread::post_landed(lsig, info);
+            }
         }
-    }
+    };
     if !in_guest {
+        // fwe's own code was interrupted (a system call being made for the
+        // guest, which delivers what is pending as it ends): the signal is
+        // only recorded, under the handler's mask, which blocks every
+        // signal. Entering `HostCode` would apply the guest's mask and let
+        // signals nest in this handler without bound, each frame further
+        // down the thread's signal stack until the host cannot deliver one
+        // and ends the process.
+        record();
         return;
     }
+    let _host = HostCode::enter();
+    record();
     // Guest code holds none of fwe's locks, so taking the kernel lock here
     // cannot deadlock against this thread.
     let mut guard = kernel();

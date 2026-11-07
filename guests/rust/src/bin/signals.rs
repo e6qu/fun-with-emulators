@@ -254,6 +254,40 @@ fn main() {
             println!("{}", describe(wait_status(pid)));
         }
         // A child signals its parent, which learns the sender.
+        // A flood of signals while the process makes system calls, which
+        // fwe runs inside a host signal handler: each is taken, and none
+        // nests the handlers until the signal stack runs out.
+        "storm" => {
+            catch(SIGUSR1, SA_RESTART);
+            catch(SIGUSR2, SA_RESTART);
+            let me = std::process::id() as i32;
+            // Several senders at once.
+            let senders: Vec<i32> = (0..6)
+                .map(|_| {
+                    child(move || {
+                        for i in 0..20_000 {
+                            // SAFETY: plain calls.
+                            unsafe { kill(me, if i % 2 == 0 { SIGUSR1 } else { SIGUSR2 }) };
+                        }
+                        0
+                    })
+                })
+                .collect();
+            let mut status = 0;
+            let mut calls = 0u64;
+            let mut left = senders.len();
+            while left > 0 {
+                // A call with a path, failing: faccessat(AT_FDCWD, ..).
+                // SAFETY: plain calls with valid arguments.
+                unsafe { syscall(48, -100i64, c"/no/such/file".as_ptr(), 0i64, 0i64) };
+                calls += 1;
+                // SAFETY: a valid out-parameter.
+                if unsafe { waitpid(-1, &mut status, 1) } > 0 {
+                    left -= 1;
+                }
+            }
+            println!("survived: {} calls: {}", HITS.load(Ordering::SeqCst) > 0, calls > 0);
+        }
         "notify-parent" => {
             // The child may signal before the parent's `fork` returns, while
             // musl's `fork` blocks every signal: the sender is kept either

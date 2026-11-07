@@ -2256,6 +2256,14 @@ fn kill_reaches_another_process() {
     assert_eq!(signals("kill-child"), "killed by 15\n");
 }
 
+/// A flood of signals from another process while the guest makes system
+/// calls: fwe's handlers do not nest without bound on the signal stack
+/// (one that interrupts fwe's own code only records the signal).
+#[test]
+fn signal_flood_during_system_calls() {
+    assert_eq!(signals("storm"), "survived: true calls: true\n");
+}
+
 /// A signal from another process reaches a guest handler (through the host),
 /// with the sender's pid in `siginfo`, and wakes `sigsuspend`.
 #[test]
