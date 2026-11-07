@@ -25,6 +25,7 @@ pub mod fs;
 mod fsops;
 pub mod futex;
 pub mod host;
+pub mod ipcops;
 pub mod memfd;
 pub mod mm;
 pub mod modes;
@@ -57,6 +58,7 @@ pub mod specialwrite;
 pub mod synthdir;
 mod syscalls;
 pub mod sysctl;
+pub mod sysvipc;
 pub mod term;
 pub mod thread;
 pub mod trace;
@@ -416,8 +418,11 @@ impl<P: Platform> Kernel<P> {
     /// Ignored signals stay ignored, and the blocked mask and pending signals
     /// are kept, as Linux does.
     pub fn exec_reset(&mut self) {
-        // The other threads are gone, and with them their waits.
+        // The other threads are gone, and with them their waits; the
+        // segments it had attached are detached (its memory is the new
+        // program's).
         futex::process_started();
+        sysvipc::process_leaving(true);
         // Limits another process left for this one (runc sets its
         // container's this way before it runs the program).
         self.take_pending_limits();

@@ -32,6 +32,63 @@ fn c(p: &[u8]) -> Result<CString, i32> {
     CString::new(p).map_err(|_| errno::EINVAL)
 }
 
+#[cfg(target_os = "macos")]
+const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
+#[cfg(target_os = "macos")]
+const ULF_NO_ERRNO: u32 = 0x0100_0000;
+#[cfg(target_os = "macos")]
+const ULF_WAKE_ALL: u32 = 0x0000_0100;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn __ulock_wait2(
+        op: u32,
+        addr: *mut libc::c_void,
+        value: u64,
+        timeout_ns: u64,
+        value2: u64,
+    ) -> libc::c_int;
+    fn __ulock_wake(op: u32, addr: *mut libc::c_void, wake_value: u64) -> libc::c_int;
+}
+
+/// Sleep up to `slice` while the generation word reads `seen` (its low
+/// half, which every change changes), a shared host address wait any
+/// process's change ends ([`wake_all`]).
+fn wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
+    #[cfg(target_os = "macos")]
+    // SAFETY: the record's mapped generation word; the host sleeps while
+    // its low half still reads `seen`'s.
+    unsafe {
+        __ulock_wait2(
+            UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
+            word.as_ptr().cast(),
+            seen & 0xffff_ffff,
+            slice.as_nanos().max(1) as u64,
+            0,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (word, seen);
+        std::thread::sleep(slice.min(std::time::Duration::from_millis(1)));
+    }
+}
+
+/// Wake every process waiting for the record's generation to change.
+fn wake_all(word: &AtomicU64) {
+    #[cfg(target_os = "macos")]
+    // SAFETY: wakes waiters on the address; reads nothing.
+    unsafe {
+        __ulock_wake(
+            UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO | ULF_WAKE_ALL,
+            word.as_ptr().cast(),
+            0,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = word;
+}
+
 /// FNV-1a: stable across processes and fwe builds.
 pub fn hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
@@ -41,7 +98,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 5;
+pub const FORMAT: u32 = 6;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -197,6 +254,7 @@ impl<T: Data> Record<T> {
             return Err(e());
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
+        wake_all(self.generation);
         Ok(())
     }
 
@@ -219,6 +277,32 @@ impl<T: Data> Record<T> {
         r
     }
 
+    /// The record's generation: it changes with every change of its data.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the data changes from generation `seen`, `until` passes
+    /// (`EAGAIN`) or a signal comes for the guest (`EINTR`), in slices as
+    /// a futex wait does.
+    pub fn wait_change(&self, seen: u64, until: Option<std::time::Instant>) -> Result<(), i32> {
+        loop {
+            if self.generation() != seen {
+                return Ok(());
+            }
+            if crate::thread::deliverable() != 0 {
+                return Err(errno::EINTR);
+            }
+            let now = std::time::Instant::now();
+            let slice = match until {
+                Some(d) if now >= d => return Err(errno::EAGAIN),
+                Some(d) => (d - now).min(crate::futex::SIGNAL_CHECK),
+                None => crate::futex::SIGNAL_CHECK,
+            };
+            wait_word(self.generation, seen, slice);
+        }
+    }
+
     /// The data as it is now.
     pub fn get(&self) -> Arc<T> {
         let now = self.generation.load(Ordering::SeqCst);
@@ -237,6 +321,23 @@ impl<T: Data> Record<T> {
             let mut t = self.read_file()?;
             let r = f(&mut t)?;
             self.write_file(&t)?;
+            Ok(r)
+        })
+    }
+
+    /// Change the data with `f`, for every process, if `f` says it changed
+    /// it: the generation moves only then (a waiter that looked again and
+    /// must go on waiting changes nothing, so does not wake itself).
+    pub fn update_maybe<R>(
+        &self,
+        f: impl FnOnce(&mut T) -> Result<(R, bool), i32>,
+    ) -> Result<R, i32> {
+        self.with_lock(|| {
+            let mut t = self.read_file()?;
+            let (r, changed) = f(&mut t)?;
+            if changed {
+                self.write_file(&t)?;
+            }
             Ok(r)
         })
     }

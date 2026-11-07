@@ -477,6 +477,19 @@ impl<P: Platform> Kernel<P> {
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::SHMGET => self.sys_shmget(a[0], a[1], a[2]),
+            nr::SHMAT => self.sys_shmat(a[0], a[1], a[2]),
+            nr::SHMDT => self.sys_shmdt(a[0]),
+            nr::SHMCTL => self.sys_shmctl(a[0], a[1], a[2]),
+            nr::SEMGET => self.sys_semget(a[0], a[1], a[2]),
+            // The backends run these without the lock (they wait); the same,
+            // reached here (the plain `syscall` helper).
+            nr::SEMOP | nr::SEMTIMEDOP | nr::MSGSND | nr::MSGRCV => {
+                crate::ipcops::blocking(self.ipc_context(), n, a)
+            }
+            nr::SEMCTL => self.sys_semctl(a[0], a[1], a[2], a[3]),
+            nr::MSGGET => self.sys_msgget(a[0], a[1]),
+            nr::MSGCTL => self.sys_msgctl(a[0], a[1], a[2]),
             nr::MLOCK => self.sys_mlock(a[0], a[1], 0, true),
             nr::MLOCK2 => self.sys_mlock(a[0], a[1], a[2], true),
             nr::MUNLOCK => self.sys_mlock(a[0], a[1], 0, false),

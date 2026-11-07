@@ -1439,6 +1439,12 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             r.x[..6].copy_from_slice(&host_args);
             crate::process::do_waitid(&r)
         }
+        n if fwe_kernel::ipcops::waits(n) => {
+            // As in the native backend: the context under the lock, the
+            // wait without it.
+            let ctx = kernel().as_ref().unwrap().ipc_context();
+            fwe_kernel::ipcops::blocking(ctx, n, host_args)
+        }
         nr::RT_SIGTIMEDWAIT => {
             let want: u64 = uaccess::read(host_args[0]).unwrap_or(0);
             kernel().as_mut().unwrap().catch_for_wait(want);

@@ -2693,6 +2693,38 @@ fn chroot_and_clone_namespaces() {
     );
 }
 
+/// Run one scenario of the `sysvipc` guest and return its output.
+fn sysvipc(scenario: &str) -> String {
+    let out = fwe(&rust_guest("sysvipc"), &[scenario]);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {out:?}");
+    stdout(&out)
+}
+
+/// System V IPC between processes, as on Linux: a segment a child writes
+/// is what its parent reads (and counts the parent's attachment), a
+/// semaphore a child posts ends its parent's wait (whose operation is the
+/// last on it),
+/// a child's `SEM_UNDO` post is undone as it ends, and messages go both
+/// ways by type.
+#[test]
+fn sysv_ipc_between_processes() {
+    assert_eq!(
+        sysvipc("processes"),
+        "shm: written by the child, attached 1\n\
+         sem: waited for the child's post: true, last by this process: true\n\
+         sem: after the child's undo: 0\n\
+         msg: got ping (type 3)\n\
+         msg: left on the queue: 1\n"
+    );
+}
+
+/// A semaphore one thread waits on and another posts: the wait holds
+/// nothing the post needs.
+#[test]
+fn sysv_semaphore_between_threads() {
+    assert_eq!(sysvipc("threads"), "thread: waited for the other thread's post: true\n");
+}
+
 /// Run one scenario of the `memfd` guest and return its output.
 fn memfd(scenario: &str) -> String {
     let out = fwe(&rust_guest("memfd"), &[scenario]);

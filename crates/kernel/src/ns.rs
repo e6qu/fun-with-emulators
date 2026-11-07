@@ -38,20 +38,8 @@ impl Data for Uts {
     }
 }
 
-/// An IPC namespace: its identity (fwe has no System V IPC objects, and
-/// POSIX message queues are the mqueue filesystem's).
-#[derive(Clone, Default, Debug)]
-pub struct Ipc;
-
-impl Data for Ipc {
-    fn encode(&self, e: &mut Enc) {
-        e.u8(1);
-    }
-    fn decode(d: &mut Dec) -> Self {
-        d.u8();
-        Ipc
-    }
-}
+/// An IPC namespace's objects (System V IPC).
+pub use crate::sysvipc::Ipc;
 
 /// A network namespace: a loopback interface only, and its own ports
 /// ([`crate::netns`]).
@@ -172,7 +160,7 @@ impl Namespaces {
             self.uts = Some(Arc::new(Record::fresh("uts", uts)?));
         }
         if flags & CLONE_NEWIPC != 0 {
-            self.ipc = Some(Arc::new(Record::fresh("ipc", Ipc)?));
+            self.ipc = Some(Arc::new(Record::fresh("ipc", Ipc::default())?));
         }
         if flags & CLONE_NEWNET != 0 {
             self.net = Some(Arc::new(Record::fresh("net", Net::default())?));
@@ -242,6 +230,7 @@ impl Namespaces {
     pub fn activate(&self) {
         crate::netns::set_current(self.net.clone());
         crate::userns::set_current(self.user.clone());
+        crate::sysvipc::activate(self.ipc.clone());
     }
 
     /// Write the namespaces into a fork snapshot or exec state.

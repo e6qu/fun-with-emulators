@@ -179,6 +179,34 @@ fn map_fixed_anon(addr: u64, len: u64, prot: libc::c_int) -> bool {
     p != libc::MAP_FAILED
 }
 
+/// Whether any of guest range `[start, start + len)` is mapped (what
+/// `shmat` without `SHM_REMAP` refuses to map over).
+pub(crate) fn any_mapped(start: u64, len: u64) -> bool {
+    let host = crate::uaccess::g2h(start);
+    #[cfg(target_os = "macos")]
+    {
+        region::query(host).is_some_and(|r| r.start < host.saturating_add(len))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: plain host call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        let mut at = host & !(page - 1);
+        let mut byte = 0u8;
+        while at < host.saturating_add(len) {
+            // SAFETY: one byte of residency for one page.
+            if unsafe {
+                libc::mincore(at as *mut libc::c_void, page as usize, (&mut byte as *mut u8).cast())
+            } == 0
+            {
+                return true;
+            }
+            at += page;
+        }
+        false
+    }
+}
+
 /// Whether all of guest range `[start, start + len)` is mapped.
 fn mapped(start: u64, len: u64) -> bool {
     // A backend that knows the guest's memory says (the VM's); the host
