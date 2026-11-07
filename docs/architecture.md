@@ -405,7 +405,8 @@ fwe has (and takes an option not listed as not set). `/proc/self/task`
 lists the process's threads; each `task/<tid>` has the thread's `stat`
 (its own state and CPU time), `status` and `comm`. A process's state in
 `stat` is its main thread's, as on Linux: `S` while it waits in a system
-call, which programs wait to see. A network namespace of
+call, which programs wait to see (and while it waits for one of fwe's own
+locks, where Linux would show it running). A network namespace of
 fwe's has sysctls of its own (`crates/kernel/src/sysctl.rs`:
 `net/ipv4/ping_group_range`, `ip_unprivileged_port_start` and the like),
 kept in its record, written with Linux's checks; the initial namespace's
@@ -685,6 +686,30 @@ the right fields. A handler already running on the alternate stack keeps
 using it from its current `sp`. The frame carries the floating-point and
 SIMD registers in an `fpsimd_context` record, restored by `rt_sigreturn`, so
 a handler may use them freely.
+
+## System V IPC
+
+Shared memory segments, semaphore sets and message queues
+(`crates/kernel/src/sysvipc.rs`, the calls in `crates/kernel/src/ipcops.rs`)
+are an IPC namespace's: its record holds every object's key, owner,
+permissions and times, a set's values and `SEM_UNDO` adjustments, a queue's
+messages, and the namespace's limits (`kernel.shmmax`, `kernel.sem`,
+`kernel.msgmni` and the rest, which root may change through `/proc/sys`).
+The initial namespace's record is the host boot's, so its objects last
+until the machine restarts, as Linux's do. A segment's memory is a file
+beside the record, which `shmat` maps shared (at an address rounded to
+`SHMLBA` with `SHM_RND`, over a mapping only with `SHM_REMAP`); a fork child
+counts its parent's attachments, and `execve` and the process's end detach
+them. Each operation is one change of the record under its lock, so
+`semop`'s operations happen all at once or not at all across processes;
+one that must wait (a semaphore that would go below zero or is not yet
+zero, a full or empty queue) waits, without the kernel lock, for the record
+to change, and tries again (`EINTR` for a signal, `EIDRM` if the object
+goes, `EAGAIN` at `semtimedop`'s timeout). A process is known by pid and
+start time: what one that has gone leaves — attachments, undo adjustments,
+which are applied — is cleaned up by the next process that looks, so even
+one killed outright gives its semaphores back. `/proc/sysvipc/{shm,sem,msg}`
+list the namespace's objects.
 
 ## Event descriptors
 
@@ -1159,8 +1184,12 @@ those items.
 - **Process control:** a parent-death signal (`PR_SET_PDEATHSIG`) is
   recorded but never sent, and a new thread does not inherit its creator's
   name.
-- **Not implemented:** `rseq`, `membarrier` (optional for libc), System V
-  IPC (`shmget`, `semget`, `msgget`), loop devices, `/proc/<pid>/maps`,
+- **System V IPC:** every change rewrites the namespace's record, so
+  filling a namespace with thousands of objects (to its limit, as a stress
+  test does) is slow; `SHM_INFO` reports no resident pages; a segment
+  stays attached in a hypervisor-backend fork child without being counted
+  for it; huge pages (`SHM_HUGETLB`) are refused, as without hugetlbfs.
+- **Not implemented:** `rseq`, `membarrier` (optional for libc), loop devices, `/proc/<pid>/maps`,
   `splice`, `tee` and `vmsplice`, `mlock`, `personality`, `inotify`,
   `name_to_handle_at` and the AIO calls; any system call not listed in
   `crates/kernel/src/syscalls.rs` returns `ENOSYS` and is noted under

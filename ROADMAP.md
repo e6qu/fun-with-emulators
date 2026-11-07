@@ -174,7 +174,8 @@ servers run unmodified.
 - [ ] Long-tail system calls. Done so far: `preadv`/`pwritev` and their
   `2` forms, `getpriority`/`setpriority`, CPU-time clock ids, the `mlock`
   family, `fcntl`'s owner, signal, lease and pipe-size commands, futex
-  requeue and bitsets. Next: System V IPC, loop devices,
+  requeue and bitsets, System V IPC (shared memory, semaphores and message
+  queues per IPC namespace, between processes). Next: loop devices,
   `/proc/<pid>/maps`, `splice`, `inotify`
 - [ ] ptrace and debuggers (gdb, strace)
 - [ ] io_uring

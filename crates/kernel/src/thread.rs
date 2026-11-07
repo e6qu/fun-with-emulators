@@ -62,6 +62,7 @@ pub fn init_main(pid: i32) {
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     crate::futex::forked_child();
     crate::signote::open_own();
+    crate::sysvipc::forked_child();
     register_current();
 }
 

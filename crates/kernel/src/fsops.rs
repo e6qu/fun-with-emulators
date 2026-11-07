@@ -237,8 +237,7 @@ impl<P: Platform> Kernel<P> {
                     // take a write; the rest are read-only.
                     let sysctl = || {
                         let p = self.fs().proc_path(dirfd as i32, &path)?;
-                        let admin = self.creds.has(crate::caps::CAP_NET_ADMIN);
-                        crate::sysctl::open_for_write(&p, admin)
+                        crate::sysctl::open_for_write(&p, &self.creds)
                     };
                     let mark = match self.map_file(dirfd as i32, &path) {
                         Some(mark) => Ok(mark),

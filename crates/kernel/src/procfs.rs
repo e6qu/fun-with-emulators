@@ -157,6 +157,7 @@ const DIRS: &[DirDef] = &[
             (b"mounts", DT_LNK),
             (b"cmdline", DT_REG),
             (b"config.gz", DT_REG),
+            (b"sysvipc", DT_DIR),
         ],
     ),
     (
@@ -194,6 +195,7 @@ const DIRS: &[DirDef] = &[
     // Listed from the open descriptors (see `Fs::synth_children`).
     (b"/proc/self/fd", &[]),
     (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR), (b"fs", DT_DIR)]),
+    (b"/proc/sysvipc", &[(b"shm", DT_REG), (b"sem", DT_REG), (b"msg", DT_REG)]),
     (
         b"/proc/sys/fs",
         &[

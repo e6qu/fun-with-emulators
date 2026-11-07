@@ -623,6 +623,20 @@ impl Fs {
         if absolute == b"/proc/self/task" {
             return Some(crate::procfs::Entry::Dir);
         }
+        // The calling process's IPC namespace's objects.
+        if let Some(kind) = absolute.strip_prefix(b"/proc/sysvipc/") {
+            use crate::sysvipc::Kind;
+            let kind = match kind {
+                b"shm" => Kind::Shm,
+                b"sem" => Kind::Sem,
+                b"msg" => Kind::Msg,
+                _ => return Some(crate::procfs::Entry::Missing),
+            };
+            let r = self.ns.ipc.clone().or_else(crate::sysvipc::initial);
+            return Some(crate::procfs::Entry::File(
+                r.map_or_else(Vec::new, |r| crate::sysvipc::proc_listing(&r, kind)),
+            ));
+        }
         if let Some(rest) = absolute.strip_prefix(b"/proc/self/task/") {
             return Some(task_entry(rest));
         }
