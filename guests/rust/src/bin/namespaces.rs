@@ -687,9 +687,16 @@ fn main() {
                 println!("subreaper: {on}");
                 let mut report = [0i32; 2];
                 pipe(report.as_mut_ptr());
-                let (_, g) = orphan(report, || 7);
+                let (child, g) = orphan(report, || 7);
                 let parent = read_i32(report[0]);
-                println!("orphan's parent is the subreaper: {}", parent == getpid());
+                // On a mismatch, what it saw instead (its old parent, still
+                // there after the orphan's wait, or another).
+                let seen = if parent == getpid() {
+                    "true".to_string()
+                } else {
+                    format!("false: saw {parent}, its old parent was {child}, this is {}", getpid())
+                };
+                println!("orphan's parent is the subreaper: {seen}");
                 let mut status = 0;
                 let w = waitpid(-1, &mut status, 0);
                 println!("reaped the orphan: {}, {}", w == g, ended(status));
