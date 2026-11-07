@@ -79,6 +79,7 @@ epoll_ctl07
 epoll_pwait01
 epoll_pwait02
 epoll_pwait04
+epoll_pwait06
 epoll_wait01
 epoll_wait03
 epoll_wait04
@@ -274,6 +275,7 @@ getuid01
 getuid03
 getxattr01
 ioctl_ns07
+ioctl10
 keyctl07
 kill02
 kill03
@@ -306,6 +308,10 @@ memcmp01
 memcpy01
 memfd_create02
 memset01
+mincore01
+mincore02
+mincore03
+mincore04
 mkdir03
 mkdirat01
 mkdirat02
@@ -316,17 +322,24 @@ mknod09
 mknodat01
 mlock01
 mlock02
+mlock03
 mlock04
+mlock05
+mlock201
 mlock202
+mlock203
 mlockall01
 mlockall02
+mlockall03
 mmap01
 mmap02
 mmap03
+mmap04
 mmap05
 mmap06
 mmap09
 mmap13
+mmap14
 mmap15
 mmap17
 mmap19
@@ -361,6 +374,7 @@ msync01
 msync02
 munlock01
 munlock02
+munlockall01
 munmap01
 munmap03
 nanosleep02
@@ -370,6 +384,7 @@ nice01
 nice02
 nice03
 nice04
+nice05
 open01
 open03
 open04
@@ -398,6 +413,8 @@ pipe2_01
 pipe2_02
 poll01
 poll04
+posix_fadvise01
+posix_fadvise01_64
 prctl01
 prctl03
 pread01
