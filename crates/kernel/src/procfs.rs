@@ -177,6 +177,8 @@ const DIRS: &[DirDef] = &[
             (b"oom_score_adj", DT_REG),
             (b"oom_adj", DT_REG),
             (b"oom_score", DT_REG),
+            (b"maps", DT_REG),
+            (b"smaps", DT_REG),
         ],
     ),
     (

@@ -225,6 +225,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EACCES);
         }
         let size = (s.size + self.page_size - 1) & !(self.page_size - 1);
+        let key = o.key;
         drop(t);
         let mut at = addr;
         if at & (ipc::SHMLBA - 1) != 0 {
@@ -262,6 +263,21 @@ impl<P: Platform> Kernel<P> {
         if mapped < 0 {
             return mapped;
         }
+        // Listed as Linux lists a segment: a deleted file of the shared
+        // memory filesystem's, named by its key, whose inode is its id.
+        crate::maps::record().rename(
+            mapped as u64,
+            size,
+            crate::maps::Object {
+                name: crate::maps::Name::Path(
+                    format!("/SYSV{key:08x} (deleted)").into_bytes().into(),
+                ),
+                dev: crate::devnodes::makedev(0, 1),
+                ino: id as u64,
+                offset: 0,
+            },
+        );
+        crate::maps::publish();
         let me = ipc::me();
         ipc::note_attached(mapped as u64, id, size);
         let _ = r.update(|t| {

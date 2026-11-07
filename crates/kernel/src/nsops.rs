@@ -202,7 +202,7 @@ impl<P: Platform> Kernel<P> {
         }
         if child > 0 {
             // It starts in this process's cgroup, in its namespaces.
-            crate::procreg::forked(child, t.dirs.clone(), &t.line);
+            crate::procreg::forked(child, t.dirs.clone(), &t.line, crate::maps::snapshot());
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {
@@ -235,7 +235,9 @@ impl<P: Platform> Kernel<P> {
             fs.ns.activate();
         }
         // Its own record too: it may end before the parent writes it.
-        crate::procreg::own_line(&t.line);
+        // With the mappings it inherited, for other processes'
+        // `/proc/<pid>/maps`.
+        crate::procreg::own_line(&t.line, crate::maps::forked());
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();

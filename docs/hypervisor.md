@@ -24,10 +24,8 @@ The code is in `crates/native/src/hv/`.
   and does not change while it runs: the slab (`window.rs`), all private
   guest memory, mapped whole, and fwe's own region (the page-table pool and
   a code page). Only shared segments add and remove mappings of their own.
-  The framework keeps the host pages it found when a range was mapped, and
-  the runtimes that run Linux programs this way without trouble
-  (hyper-linux, elfuse) never change stage 2 or the host memory behind it
-  either; nor does fwe.
+  The framework keeps the host pages it found when a range was mapped, so
+  the host memory behind stage 2 never changes either.
 - **The guest's page tables** (`pagetables.rs`). Stage 1 is real: 4 KiB
   pages, Linux's page size on arm64, in a 40-bit address space, with each
   page's EL0 permissions and BTI guarding. A guest page translates to the
@@ -105,62 +103,25 @@ The code is in `crates/native/src/hv/`.
 
 ## Never end a VM process abnormally
 
-On 3 November 2026 the development Mac (macOS 15.6.1, M4 Pro) went down twice
-while this backend was being built: a watchdog reset about two minutes after a
-VM process was killed by a signal, and a kernel panic (a NULL dereference in a
-kernel thread) while a VM process was being torn down. Neither was memory
-pressure. Both times the VM processes ended without destroying their vCPUs and
-VM, the tests ran several of them at once, and another Hypervisor.framework
-client (Podman's `krunkit`) was running.
+Misusing Hypervisor.framework can bring the whole Mac down, as a watchdog
+reset or a kernel panic with no useful report. The suspects are:
+- a VM process that ends with its VM alive;
+- several VM processes ending together;
+- a VM that fails to map memory and is then destroyed;
+- private memory mapped into two VMs at once.
 
-It went down a third time that day, with a watchdog reset at about 16:18,
-and that time no fwe VM was alive: the last VM test (the fork tests) had
-ended cleanly 23 minutes before, and the one fwe run just before the crash
-failed before creating a VM. Before that day the machine had been up for
-three weeks with `krunkit` (which uses nested virtualization) running, so
-the crashes follow this backend's use of the hypervisor, but can come long
-after it. That points to kernel state left behind rather than the moment of
-teardown; the panic of the second crash, in a kernel thread, lands near the
-kernel's thread-destruction code. The exact path is Apple's, and the panic
-reports are too thin to show it, so the backend rules out everything on its
-side of it.
+The runtimes that run Linux programs the same way without such trouble
+(hyper-linux, elfuse, Carrick) all:
+- map guest memory into the VM once;
+- never change stage 2, or the host memory behind it, while the VM runs;
+- give a fork child a copy rather than pages mapped into two VMs.
 
-It went down a fourth time on 4 November at about 13:47, again a watchdog
-reset with no stackshot, and this time with no other hypervisor client
-running: `krunkit` had been stopped three and a half minutes before. Eight
-VM tests had passed one at a time, then for a minute a `vfork` test and four
-runs of one of its scenarios each started a child whose VM could not map
-the parent's read-only code (`hv_vm_map` failed, since a shared memory entry
-of read-only memory carries no write permission), which tore its VM down and
-exited. The crash came 30 to 40 seconds after the last of them, with nothing
-about fwe or the hypervisor in the system log. So `krunkit` running
-alongside is not needed for a crash, and a VM that fails to map memory and
-is then destroyed joins the suspects.
+fwe does the same (above, and [Fork](#fork)), and keeps these rules:
 
-A fifth crash, the same day at 16:03:48, came during a deliberate,
-fully recorded real run (the flight recorder, below, synced to disk). The
-record shows the map-rules probe agreeing with the stand-in, then the fork
-tests: 19 fork children and 3 vfork children that exec'd all ended cleanly.
-The last lines are a glibc `posix_spawn` vfork child, which had mapped the
-parent's writable memory *shared* into its own VM (its spawn stack
-included), failing its `execve` as the test intends, destroying its VM and
-exiting; 5 ms later the parent took that same stack out of its own VM and
-mapped one more range — and nothing was ever written again. Crash 4 also
-followed vfork children with shared memory. The path inside the kernel is
-still unknown, but the runtimes that run Linux programs on Apple Silicon
-the same way without such reports (hyper-linux, elfuse, Carrick) all avoid
-what fwe does here: they map guest memory into the VM once and never
-change stage 2 or the host memory behind it while the VM runs (guest
-`mmap`/`munmap`/`mprotect` only edit the guest's page tables), they give a
-fork child a copy-on-write copy rather than pages mapped into both VMs,
-and none maps a vfork child's memory into a second VM. The backend's
-memory model is being reworked to match.
-
-Since then **a plain `cargo test` never starts a VM**: the VM tests run on
-a software stand-in for the framework (below), and on the real one only when
-asked for (`FWE_HV_TESTS=1`), which only a machine whose crash costs nothing
-should set. Everything else the backend does to stay clear of the crash:
-
+- **A plain `cargo test` never starts a VM.** The VM tests run on a
+  software stand-in for the framework (below), and on the real one only
+  when asked for (`FWE_HV_TESTS=1`), which only a machine whose crash
+  costs nothing should set.
 - **Every way out tears the VM down first:** `exit_group`, the last thread's
   `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
   panics, and `execve`. Teardown stops every vCPU, has each thread destroy its
@@ -207,17 +168,18 @@ Keep to these when changing the backend.
 
 ## Status
 
-Programs linked below 4 GiB run in the VM, static and dynamically linked, with
-threads: the assembly test programs, Rust/musl programs, and a non-PIE glibc
-program whose own `ld.so` maps `libc.so.6`, relocates and applies RELRO — the
-shape of Debian's `python3.11`. They can `execve` any program, and a native
-program can `execve` them, and `fork` and `vfork` work as in the native
-backend. Two differences from Linux remain: a private file mapping is a copy
-of the file when it was mapped, so later writes to the file through other
-mappings or descriptors do not show in it; and what a `vfork` child changes
-in its address space itself (`mmap`, `munmap`, `mprotect` before it execs or
-exits) stays its own — the memory it writes reaches the parent, its mapping
-changes do not.
+Programs linked below 4 GiB run in the VM: static and dynamically linked,
+with threads, signals, `execve` in both directions, `fork` and `vfork`.
+Debian's Python, GCC, clang and Go pass their tests there. All of it is
+verified on the stand-in (below). The run on real hardware, in the
+self-hosted `hypervisor` job, is still to come: no runner is registered.
+
+Two differences from Linux remain:
+- a private file mapping is a copy of the file when it was mapped, so later
+  writes to the file do not show in it;
+- what a `vfork` child changes in its own address space (`mmap`, `munmap`,
+  `mprotect` before it execs or exits) stays its own, though the memory it
+  writes reaches the parent.
 
 ## Fork
 
@@ -233,7 +195,7 @@ with `x0` = 0. No private page is ever in both processes' VMs:
 - a **`fork`** child is sent a copy of every page of the slab that exists
   (`mach_vm_page_range_query`), over a socket pair, with the parent's vCPUs
   stopped so it sees one instant. Copying 512 MiB takes about 60 ms; an APFS
-  clone of a file-backed slab, which elfuse uses, was measured fifty times
+  clone of a file-backed slab, which elfuse uses, is fifty times
   slower here, as it writes the memory to disk;
 - a **`vfork`** child is sent nothing up front: its private pages are
   unmapped until it touches them, when it fetches them, 64 KiB at a time,
@@ -302,17 +264,16 @@ And it checks the rules the backend must keep, printing a line with
 
 A refused `hv_vm_map` is reported too, and fails as the framework fails it:
 misaligned (16 KiB), overlapping, or over host memory that is not mapped or
-could never be readable and writable. That last rule was inferred from what
-the framework did, and a real run's `--probe hv-map-rules` matched it (its
-two cases of a file opened read-only, mapped shared and private, came later
-and wait for the next real run). The stand-in's unit test breaks each rule
-on purpose.
+could never be readable and writable. That last rule is inferred from the
+framework's behaviour; `fwe --probe hv-map-rules` compares the two on real
+hardware, in the `hypervisor` job. The stand-in's unit test breaks each
+rule on purpose.
 
 A stand-in proves nothing about the real framework. Its own rules are what
 fwe has seen the framework do, and the kernel crashes the backend may cause
-cannot happen in it. So VM changes are also run on real hardware now and
-then, on a machine whose crash costs nothing, instrumented so that a crash
-can be traced (below). Not modelled: the virtual timer, the fault address of
+cannot happen in it. So VM changes are also run on real hardware, on a
+machine whose crash costs nothing, instrumented so that a crash can be
+traced (below). Not modelled: the virtual timer, the fault address of
 an alignment fault outside the exclusive and atomic instructions,
 stack-pointer alignment checks, and code one vCPU writes for another
 without a mapping change. What real hardware must still confirm for this
@@ -326,9 +287,9 @@ and exit it models.
 
 Real runs happen on a machine whose crash costs nothing — the self-hosted
 runner of the `hypervisor` CI job, such as a rented bare-metal cloud Mac —
-and are instrumented so that a crash can be traced. The crashes so far were
-watchdog resets that left no stackshot and lost the last seconds of the
-system log, so the evidence has to be kept by fwe itself:
+and are instrumented so that a crash can be traced. Such a crash leaves no
+stackshot and loses the last seconds of the system log, so fwe keeps the
+evidence itself:
 
 - **The flight recorder** (`--hv-record DEST`, or `FWE_HV_RECORD=DEST`; in
   `crates/native/src/hv/record.rs`) writes a line before and after every

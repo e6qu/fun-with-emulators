@@ -401,6 +401,14 @@ impl Fs {
         let exe_fd = self.proc.exe_fd;
         let auxv = std::mem::take(&mut self.proc.auxv);
         crate::procreg::own_program(&exe, &cmdline);
+        // The program's file, for `/proc/self/maps`: through the descriptor
+        // it was run by, if it has no path.
+        let id = match exe_fd {
+            Some(fd) => crate::fsops::linux_fstat(fd).ok().map(|st| (st.st_dev, st.st_ino)),
+            None => self.file_id(&exe),
+        };
+        crate::maps::record().set_exe(exe.clone(), id.unwrap_or((0, 0)));
+        crate::maps::publish();
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
     }
 
@@ -622,6 +630,9 @@ impl Fs {
         }
         if absolute == b"/proc/self/task" {
             return Some(crate::procfs::Entry::Dir);
+        }
+        if absolute == b"/proc/self/maps" || absolute == b"/proc/self/smaps" {
+            return Some(crate::procfs::Entry::File(self.maps(absolute.ends_with(b"/smaps"))));
         }
         // The calling process's IPC namespace's objects.
         if let Some(kind) = absolute.strip_prefix(b"/proc/sysvipc/") {
@@ -1087,6 +1098,66 @@ impl Fs {
             data.extend_from_slice(&chunk[..n as usize]);
         }
         Ok(data)
+    }
+
+    /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
+    /// mappings (see [`crate::maps`]).
+    fn maps(&self, smaps: bool) -> Vec<u8> {
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        crate::mm::MapsView::of(me).map_or_else(Vec::new, |v| v.render(smaps))
+    }
+
+    /// The first `len` bytes (or fewer, at its end) of the regular file
+    /// `path` names.
+    pub fn read_head(&self, path: &[u8], len: usize) -> Result<Vec<u8>, i32> {
+        let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        let name = resolved.name_c()?;
+        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+        let fd = unsafe {
+            libc::openat(resolved.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(e());
+        }
+        // SAFETY: `fd` is a fresh owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut out = vec![0u8; len];
+        let mut at = 0;
+        while at < len {
+            // SAFETY: reading into the rest of `out`.
+            let n = unsafe {
+                libc::pread(
+                    fd.as_raw_fd(),
+                    out[at..].as_mut_ptr().cast(),
+                    len - at,
+                    at as libc::off_t,
+                )
+            };
+            if n < 0 {
+                return Err(e());
+            }
+            if n == 0 {
+                break;
+            }
+            at += n as usize;
+        }
+        out.truncate(at);
+        Ok(out)
+    }
+
+    /// The device and inode numbers of the file `path` names, following
+    /// symbolic links, as `stat` gives them.
+    pub fn file_id(&self, path: &[u8]) -> Option<(u64, u64)> {
+        let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
+        let name = resolved.name_c().ok()?;
+        // SAFETY: zeroed bytes are a valid `stat`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated name, a live directory fd and a valid
+        // out-parameter.
+        let ok = unsafe { libc::fstatat(resolved.dir.as_raw_fd(), name.as_ptr(), &mut st, 0) } == 0;
+        #[allow(clippy::unnecessary_cast)] // the field types differ by host
+        ok.then_some((st.st_dev as u64, st.st_ino as u64))
     }
 
     /// Make this the view the socket calls resolve `AF_UNIX` paths in (see

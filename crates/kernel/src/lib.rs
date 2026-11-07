@@ -26,6 +26,7 @@ mod fsops;
 pub mod futex;
 pub mod host;
 pub mod ipcops;
+pub mod maps;
 pub mod memfd;
 pub mod mm;
 pub mod modes;
@@ -252,6 +253,7 @@ impl<P: Platform> Kernel<P> {
         // one process making many kernels while others wait.)
         #[cfg(not(test))]
         futex::process_started();
+        maps::set_page_size(page_size);
         Kernel {
             platform,
             tracer,
@@ -316,6 +318,7 @@ impl<P: Platform> Kernel<P> {
             }
         }
         e.map(&mm::guest_ranges());
+        maps::save(e);
         fdtable::save(e);
         specialfd::save(e);
         signalfd::save(e);
@@ -371,6 +374,7 @@ impl<P: Platform> Kernel<P> {
             (0..n).map(|_| (d.u64(), d.u64(), d.u64())).collect();
         uaccess::set_translations(&translations);
         mm::set_guest_ranges(d.map());
+        maps::restore(d);
         fdtable::restore(d);
         if !trace_file.is_empty() {
             // The parent's trace file, which this fresh process opens again
@@ -756,7 +760,11 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
                     overlay::hold(|| {
                         pty::hold(|| {
                             fs::hold(|| {
-                                futex::hold(|| mm::hold(|| thread::hold(|| seqpacket::hold(fork))))
+                                futex::hold(|| {
+                                    mm::hold(|| {
+                                        maps::hold(|| thread::hold(|| seqpacket::hold(fork)))
+                                    })
+                                })
                             })
                         })
                     })

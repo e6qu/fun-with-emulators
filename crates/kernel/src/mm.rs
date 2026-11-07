@@ -130,12 +130,208 @@ fn wants_write_exec(prot: u64) -> bool {
 /// Unmap all guest memory (the old program, at `execve`).
 pub fn release_guest_memory() {
     write_exec().clear();
+    crate::maps::clear();
     let ranges = std::mem::take(&mut *guest_maps());
     for (start, end) in ranges {
         // SAFETY: only guest memory is tracked, and the old program is
         // discarded; fwe runs on its own stacks.
         unsafe { libc::munmap(start as *mut libc::c_void, (end - start) as usize) };
     }
+}
+
+/// The memory fwe mapped for the guest, as `(start, end, Linux prot)` by
+/// the host's protections: the native backend's, whose guest addresses are
+/// host addresses (the VM's guest memory is not tracked here).
+#[cfg(target_os = "macos")]
+pub(crate) fn host_guest_memory() -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    for (start, len) in tracked() {
+        let end = start + len;
+        let mut at = start;
+        while at < end {
+            let Some(r) = region::query(at) else { break };
+            if r.start >= end {
+                break;
+            }
+            let (lo, hi) = (r.start.max(at), (r.start + r.size).min(end));
+            let mut prot = 0;
+            for (host, linux) in [
+                (libc::PROT_READ, mman::PROT_READ),
+                (libc::PROT_WRITE, mman::PROT_WRITE),
+                (libc::PROT_EXEC, mman::PROT_EXEC),
+            ] {
+                if r.protection & host != 0 {
+                    prot |= linux;
+                }
+            }
+            out.push((lo, hi, prot));
+            at = hi;
+        }
+    }
+    out
+}
+
+/// No backend runs guests on other hosts (the kernel's unit tests do).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn host_guest_memory() -> Vec<(u64, u64, u64)> {
+    Vec::new()
+}
+
+/// The memory regions of host process `pid` over its host range `[start,
+/// end)`, as `(start, end, Linux prot, bytes resident)`, cut to the range.
+/// The host counts a region's resident pages, not which they are: a part
+/// of a larger region is counted as resident up to what the region has in
+/// memory.
+#[cfg(target_os = "macos")]
+pub(crate) fn regions_of(pid: i32, start: u64, end: u64) -> Vec<(u64, u64, u64, u64)> {
+    /// `struct proc_regioninfo` (`sys/proc_info.h`).
+    #[repr(C)]
+    #[derive(Default)]
+    struct RegionInfo {
+        protection: u32,
+        max_protection: u32,
+        inheritance: u32,
+        flags: u32,
+        offset: u64,
+        behavior: u32,
+        user_wired_count: u32,
+        user_tag: u32,
+        pages_resident: u32,
+        pages_shared_now_private: u32,
+        pages_swapped_out: u32,
+        pages_dirtied: u32,
+        ref_count: u32,
+        shadow_depth: u32,
+        share_mode: u32,
+        private_pages_resident: u32,
+        shared_pages_resident: u32,
+        obj_id: u32,
+        depth: u32,
+        address: u64,
+        size: u64,
+    }
+    const PROC_PIDREGIONINFO: libc::c_int = 7;
+    // SAFETY: plain host call.
+    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64;
+    let mut out = Vec::new();
+    let mut at = start;
+    while at < end {
+        let mut r = RegionInfo::default();
+        let size = std::mem::size_of::<RegionInfo>() as libc::c_int;
+        // SAFETY: a valid out-buffer of `size` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDREGIONINFO,
+                at,
+                (&mut r as *mut RegionInfo).cast(),
+                size,
+            )
+        };
+        if n != size || r.size == 0 || r.address >= end {
+            break;
+        }
+        let (lo, hi) = (r.address.max(at), (r.address + r.size).min(end));
+        if hi <= lo {
+            break;
+        }
+        let mut prot = 0;
+        for (host, linux) in [
+            (libc::PROT_READ as u32, mman::PROT_READ),
+            (libc::PROT_WRITE as u32, mman::PROT_WRITE),
+            (libc::PROT_EXEC as u32, mman::PROT_EXEC),
+        ] {
+            if r.protection & host != 0 {
+                prot |= linux;
+            }
+        }
+        // Exact where the region is the range; where it is larger, as much
+        // of the range as the region has in memory (the host counts a
+        // region's pages, not which they are).
+        let resident = (r.pages_resident as u64).saturating_mul(page);
+        out.push((lo, hi, prot, resident.min(hi - lo)));
+        at = hi;
+    }
+    out
+}
+
+/// Another host than macOS has no fwe processes to ask about.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn regions_of(_pid: i32, _start: u64, _end: u64) -> Vec<(u64, u64, u64, u64)> {
+    Vec::new()
+}
+
+/// The mappings of host process `pid` (this one's, or another fwe
+/// process's as it published them), with the memory fwe mapped for its
+/// guest, the record, and how many bytes of a range of it are resident.
+pub(crate) struct MapsView {
+    pub areas: Vec<crate::vmas::Piece<crate::maps::Area>>,
+    pub record: crate::maps::Record,
+    pub page: u64,
+    other: Option<(i32, crate::maps::Published)>,
+}
+
+impl MapsView {
+    pub(crate) fn of(pid: i32) -> Option<MapsView> {
+        // SAFETY: getpid cannot fail.
+        if pid == unsafe { libc::getpid() } {
+            // The host's view first: its lock comes before the record's.
+            let extra = host_guest_memory();
+            let record = crate::maps::record().clone();
+            let areas = record.with_extra(&extra);
+            return Some(MapsView { areas, record, page: crate::maps::page_size(), other: None });
+        }
+        let p = crate::maps::of_process(pid)?;
+        let extra: Vec<(u64, u64, u64)> = p
+            .tracked
+            .iter()
+            .flat_map(|&(s, l)| regions_of(pid, s, s + l))
+            .map(|(lo, hi, prot, _)| (lo, hi, prot))
+            .collect();
+        let areas = p.record.with_extra(&extra);
+        Some(MapsView { areas, record: p.record.clone(), page: p.page, other: Some((pid, p)) })
+    }
+
+    /// Bytes of guest range `[start, end)` resident.
+    pub(crate) fn resident(&self, start: u64, end: u64) -> u64 {
+        match &self.other {
+            None => resident(start, end),
+            Some((pid, p)) => {
+                let host = p.host_of(start);
+                regions_of(*pid, host, host + (end - start)).iter().map(|r| r.3).sum()
+            }
+        }
+    }
+
+    /// The listing (`/proc/<pid>/maps`, or with `smaps` `smaps`).
+    pub(crate) fn render(&self, smaps: bool) -> Vec<u8> {
+        let usage = |s: u64, e: u64| crate::maps::Usage { resident: self.resident(s, e) };
+        crate::maps::render(&self.areas, &self.record.exe(), self.page, smaps.then_some(&usage))
+    }
+}
+
+/// How many bytes of guest memory `[start, end)` are in memory, by the
+/// host's pages.
+pub(crate) fn resident(start: u64, end: u64) -> u64 {
+    // SAFETY: plain host call.
+    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64;
+    let mut total = 0;
+    let mut at = start;
+    while at < end {
+        let host = crate::uaccess::g2h(at) & !(page - 1);
+        let next = ((at & !(page - 1)) + page).min(end);
+        let mut byte = 0u8;
+        // SAFETY: one byte of residency for one host page; a page not
+        // mapped fails, and nothing else changes.
+        let ok = unsafe {
+            libc::mincore(host as *mut libc::c_void, page as usize, (&mut byte as *mut u8).cast())
+        } == 0;
+        if ok && byte & 1 != 0 {
+            total += next - at;
+        }
+        at = next;
+    }
+    total
 }
 
 /// Run `f` holding the tracking lock (see [`crate::fork_locked`]).
@@ -660,12 +856,310 @@ fn final_prot(prot: u64) -> libc::c_int {
     if wants_write_exec(prot) { p & !libc::PROT_EXEC } else { p }
 }
 
+/// The memory system calls, recorded for `/proc/self/maps` once they
+/// succeed, whichever backend carried them out, and published for other
+/// processes (see [`crate::maps`]).
+impl<P: Platform> Kernel<P> {
+    pub(crate) fn sys_brk(&mut self, addr: u64) -> i64 {
+        let r = self.brk_call(addr);
+        let b = self.brk;
+        crate::maps::record().set_heap(b.start, self.page_up(b.current), b.limit);
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+
+    pub(crate) fn sys_mmap(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        fd: u64,
+        offset: u64,
+    ) -> i64 {
+        let r = self.mmap_call(addr, len, prot, flags, fd, offset);
+        if r < 0 {
+            return r;
+        }
+        let object = (flags & mman::MAP_ANONYMOUS == 0)
+            .then(|| {
+                let st = crate::fsops::linux_fstat(fd as i32).ok()?;
+                let path = self.fs.as_ref().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
+                Some(crate::maps::Object::file(path, &st, offset))
+            })
+            .flatten();
+        let shared = flags & mman::MAP_TYPE != mman::MAP_PRIVATE;
+        let len = self.page_up(len);
+        let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
+        let locked = crate::maps::record().mapped(r as u64, len, prot, shared, object);
+        if flags & mman::MAP_LOCKED != 0 {
+            crate::maps::record().lock(r as u64, len, true);
+            populate(r as u64, len, self.page_size);
+        } else if locked {
+            populate(r as u64, len, self.page_size);
+        }
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+
+    pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+        let r = self.munmap_call(addr, len);
+        if r == 0 {
+            crate::maps::record().unmapped(addr, self.page_up(len));
+        }
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+
+    pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        let r = self.mprotect_call(addr, len, prot);
+        if r == 0 {
+            let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
+            crate::maps::record().protected(addr, self.page_up(len), prot);
+        }
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+
+    pub(crate) fn sys_mremap(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        flags: u64,
+        new_addr: u64,
+    ) -> i64 {
+        let kept = if flags & mman::MREMAP_DONTUNMAP != 0 {
+            crate::maps::record().areas_in(old, old + self.page_up(old_len))
+        } else {
+            Vec::new()
+        };
+        let r = self.mremap_call(old, old_len, new_len, flags, new_addr);
+        if r >= 0 {
+            crate::maps::record().remapped(
+                old,
+                self.page_up(old_len),
+                r as u64,
+                self.page_up(new_len),
+            );
+            // The old range stays mapped, emptied, with `MREMAP_DONTUNMAP`.
+            for p in kept {
+                let a = p.value;
+                crate::maps::record().mapped(
+                    p.start,
+                    p.end - p.start,
+                    a.prot,
+                    a.shared,
+                    Some(a.object),
+                );
+            }
+        }
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+
+    /// `mlock`, `mlock2` and `munlock`: locked memory is brought in
+    /// (unless `MLOCK_ONFAULT`) and listed as locked.
+    pub(crate) fn sys_mlock(&mut self, addr: u64, len: u64, flags: u64, lock: bool) -> i64 {
+        let r = self.mlock_call(addr, len, flags, lock);
+        if r == 0 && len > 0 {
+            let start = addr & !(self.page_size - 1);
+            let len = self.page_up(addr + len) - start;
+            crate::maps::record().lock(start, len, lock);
+            if lock && flags & mman::MLOCK_ONFAULT == 0 {
+                populate(start, len, self.page_size);
+            }
+        }
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+
+    /// `mincore(addr, len, vec)`: a byte for each page of the range, bit 0
+    /// set if the page is in memory.
+    pub(crate) fn sys_mincore(&mut self, addr: u64, len: u64, vec: u64) -> i64 {
+        if addr & (self.page_size - 1) != 0 {
+            return err(errno::EINVAL);
+        }
+        let Some(end) = addr.checked_add(len).map(|e| self.page_up(e)) else {
+            return err(errno::ENOMEM);
+        };
+        if end == addr {
+            return 0;
+        }
+        if !mapped(addr, end - addr) {
+            return err(errno::ENOMEM);
+        }
+        let pages = (end - addr) / self.page_size;
+        let mut out = Vec::with_capacity(pages as usize);
+        for i in 0..pages {
+            let at = addr + i * self.page_size;
+            out.push(u8::from(resident(at, at + self.page_size) > 0));
+        }
+        match crate::uaccess::write_from(vec, &out) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `ioctl(fd, PROCMAP_QUERY, arg)` on a descriptor of host process
+    /// `pid`'s `/proc/<pid>/maps`: the mapping `arg` asks about, described
+    /// in it.
+    pub(crate) fn procmap_query(&mut self, pid: i32, arg: u64) -> i64 {
+        use fwe_abi::procmap::*;
+        let size_of = std::mem::size_of::<Query>() as u64;
+        let usize = match crate::uaccess::read::<u64>(arg) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        if usize > self.page_size {
+            return err(errno::E2BIG);
+        }
+        if usize < size_of {
+            return err(errno::EINVAL);
+        }
+        // A larger structure's extra bytes must be zero.
+        match crate::uaccess::read_bytes(arg + size_of, (usize - size_of) as usize) {
+            Ok(rest) if rest.iter().any(|&b| b != 0) => return err(errno::E2BIG),
+            Ok(_) => {}
+            Err(e) => return err(e),
+        }
+        let mut q: Query = match crate::uaccess::read(arg) {
+            Ok(q) => q,
+            Err(e) => return err(e),
+        };
+        let valid = VMA_READABLE
+            | VMA_WRITABLE
+            | VMA_EXECUTABLE
+            | VMA_SHARED
+            | COVERING_OR_NEXT_VMA
+            | FILE_BACKED_VMA;
+        if q.query_flags & !valid != 0
+            || (q.vma_name_size == 0) != (q.vma_name_addr == 0)
+            || (q.build_id_size == 0) != (q.build_id_addr == 0)
+        {
+            return err(errno::EINVAL);
+        }
+        let Some(view) = MapsView::of(pid) else { return err(errno::ESRCH) };
+        let Some(p) = crate::maps::query(&view.areas, q.query_addr, q.query_flags) else {
+            return err(errno::ENOENT);
+        };
+        let exe = view.record.exe();
+        let a = &p.value;
+        let (name, (dev, ino)) = crate::maps::name_of(a, &exe);
+        q.vma_start = p.start;
+        q.vma_end = p.end;
+        q.vma_flags = [
+            (mman::PROT_READ, VMA_READABLE),
+            (mman::PROT_WRITE, VMA_WRITABLE),
+            (mman::PROT_EXEC, VMA_EXECUTABLE),
+        ]
+        .iter()
+        .filter(|(prot, _)| a.prot & prot != 0)
+        .fold(if a.shared { VMA_SHARED } else { 0 }, |f, (_, flag)| f | flag);
+        q.vma_page_size = view.page;
+        q.vma_offset = a.file_offset();
+        q.inode = ino;
+        q.dev_major = crate::devnodes::major(dev);
+        q.dev_minor = crate::devnodes::minor(dev);
+        // The file's build ID, read from its start as Linux reads it.
+        if q.build_id_size != 0 {
+            let file_backed =
+                matches!(a.object.name, crate::maps::Name::Exe | crate::maps::Name::Path(_));
+            let head = if file_backed { self.fs().read_head(name, 1 << 16).ok() } else { None };
+            match head.as_deref().and_then(fwe_elf::build_id) {
+                Some(id) => {
+                    if (q.build_id_size as usize) < id.len() {
+                        return err(errno::ENAMETOOLONG);
+                    }
+                    if let Err(e) = crate::uaccess::write_from(q.build_id_addr, id) {
+                        return err(e);
+                    }
+                    q.build_id_size = id.len() as u32;
+                }
+                None => q.build_id_size = 0,
+            }
+        }
+        if q.vma_name_size != 0 {
+            if name.is_empty() {
+                q.vma_name_size = 0;
+            } else {
+                if (q.vma_name_size as usize) < name.len() + 1 {
+                    return err(errno::ENAMETOOLONG);
+                }
+                let named = [name, b"\0"].concat();
+                if let Err(e) = crate::uaccess::write_from(q.vma_name_addr, &named) {
+                    return err(e);
+                }
+                q.vma_name_size = named.len() as u32;
+            }
+        }
+        match crate::uaccess::write(arg, q) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `mlockall` and `munlockall` (`flags` `None`).
+    pub(crate) fn sys_mlockall(&mut self, flags: Option<u64>) -> i64 {
+        let r = self.mlockall_call(flags);
+        if r == 0 {
+            match flags {
+                Some(f) => {
+                    let current = f & mman::MCL_CURRENT != 0;
+                    crate::maps::record().lock_all(Some((current, f & mman::MCL_FUTURE != 0)));
+                    if current && f & mman::MCL_ONFAULT == 0 {
+                        let all = crate::maps::record().areas();
+                        for p in all {
+                            populate(p.start, p.end - p.start, self.page_size);
+                        }
+                    }
+                }
+                None => crate::maps::record().lock_all(None),
+            }
+        }
+        if r >= 0 {
+            crate::maps::publish();
+        }
+        r
+    }
+}
+
+/// Bring the accessible pages of guest memory `[start, start + len)` in,
+/// as locking memory does: a read of each (of `page` bytes).
+fn populate(start: u64, len: u64, page: u64) {
+    let areas = crate::maps::record().areas_in(start, start + len);
+    for p in areas {
+        // Writable memory is readable on the host (arm64 has no
+        // write-only pages), and the VM's memory is the host's.
+        if p.value.prot & (mman::PROT_READ | mman::PROT_WRITE) == 0 {
+            continue;
+        }
+        let mut at = p.start;
+        while at < p.end {
+            let _ = crate::uaccess::read::<u8>(at);
+            at += page;
+        }
+    }
+}
+
 impl<P: Platform> Kernel<P> {
     fn page_up(&self, a: u64) -> u64 {
         (a + self.page_size - 1) & !(self.page_size - 1)
     }
 
-    pub(crate) fn sys_brk(&mut self, addr: u64) -> i64 {
+    fn brk_call(&mut self, addr: u64) -> i64 {
         if let Some(r) = self.platform.memory(MemCall::Brk { addr }, &mut self.brk) {
             return r;
         }
@@ -692,7 +1186,7 @@ impl<P: Platform> Kernel<P> {
         self.brk.current as i64
     }
 
-    pub(crate) fn sys_mmap(
+    fn mmap_call(
         &mut self,
         addr: u64,
         len: u64,
@@ -854,7 +1348,7 @@ impl<P: Platform> Kernel<P> {
         ret(unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) })
     }
 
-    pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+    fn munmap_call(&mut self, addr: u64, len: u64) -> i64 {
         if let Some(r) = self.platform.memory(MemCall::Munmap { addr, len }, &mut self.brk) {
             return r;
         }
@@ -879,7 +1373,7 @@ impl<P: Platform> Kernel<P> {
         err(e.errno)
     }
 
-    pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+    fn mprotect_call(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
         if let Some(r) = self.platform.memory(MemCall::Mprotect { addr, len, prot }, &mut self.brk)
         {
             return r;
@@ -967,7 +1461,7 @@ impl<P: Platform> Kernel<P> {
     /// all if that is 0). The host is not asked to wire the pages: Linux's
     /// root may lock far more than the host lets a user process, and what
     /// a program sees of a locked page is the same.
-    pub(crate) fn sys_mlock(&mut self, addr: u64, len: u64, flags: u64, lock: bool) -> i64 {
+    fn mlock_call(&mut self, addr: u64, len: u64, flags: u64, lock: bool) -> i64 {
         if lock && flags & !mman::MLOCK_ONFAULT != 0 {
             return err(errno::EINVAL);
         }
@@ -983,7 +1477,12 @@ impl<P: Platform> Kernel<P> {
             if soft == 0 {
                 return err(errno::EPERM);
             }
-            if end - start > soft {
+            // What it would have locked: this range and what else is.
+            let (already, all) = {
+                let r = crate::maps::record();
+                (r.locked_in(start, end), r.locked_bytes())
+            };
+            if all - already + (end - start) > soft {
                 return err(errno::ENOMEM);
             }
         }
@@ -992,16 +1491,21 @@ impl<P: Platform> Kernel<P> {
 
     /// `mlockall(flags)` and `munlockall` (`flags` `None`): checked as Linux
     /// checks them, nothing wired (see [`Kernel::sys_mlock`]).
-    pub(crate) fn sys_mlockall(&mut self, flags: Option<u64>) -> i64 {
+    fn mlockall_call(&mut self, flags: Option<u64>) -> i64 {
         let Some(flags) = flags else { return 0 };
         let all = mman::MCL_CURRENT | mman::MCL_FUTURE | mman::MCL_ONFAULT;
         if flags == 0 || flags & !all != 0 || flags == mman::MCL_ONFAULT {
             return err(errno::EINVAL);
         }
-        if !self.creds.has(crate::caps::CAP_IPC_LOCK)
-            && crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK) == 0
-        {
-            return err(errno::EPERM);
+        if !self.creds.has(crate::caps::CAP_IPC_LOCK) {
+            let soft = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
+            if soft == 0 {
+                return err(errno::EPERM);
+            }
+            // Locking what is mapped now must fit the limit.
+            if flags & mman::MCL_CURRENT != 0 && crate::maps::record().total_bytes() > soft {
+                return err(errno::ENOMEM);
+            }
         }
         0
     }
@@ -1046,7 +1550,7 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    pub(crate) fn sys_mremap(
+    fn mremap_call(
         &mut self,
         old: u64,
         old_len: u64,

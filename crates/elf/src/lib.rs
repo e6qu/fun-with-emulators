@@ -20,6 +20,7 @@ pub const EM_AARCH64: u16 = 183;
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
+pub const PT_NOTE: u32 = 4;
 pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
 pub const PT_GNU_STACK: u32 = 0x6474_e551;
@@ -111,6 +112,56 @@ pub struct Elf<'a> {
     pub phentsize: u16,
     pub phnum: u16,
     pub phdrs: Vec<ProgramHeader>,
+}
+
+/// The GNU build ID of the ELF image whose first bytes are `head`: the
+/// `NT_GNU_BUILD_ID` note of a `PT_NOTE` segment within them, as Linux
+/// reads it (from the start of a mapped file) for `PROCMAP_QUERY`.
+pub fn build_id(head: &[u8]) -> Option<&[u8]> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    /// Linux's largest (`BUILD_ID_SIZE_MAX`).
+    const MAX: usize = 20;
+    if head.len() < EHDR_SIZE || &head[0..4] != b"\x7fELF" || head[4] != 2 || head[5] != 1 {
+        return None;
+    }
+    let phoff = u64_at(head, 32) as usize;
+    let (phentsize, phnum) = (u16_at(head, 54) as usize, u16_at(head, 56) as usize);
+    if phentsize != PHDR_SIZE {
+        return None;
+    }
+    for i in 0..phnum {
+        let o = phoff.checked_add(i * PHDR_SIZE)?;
+        if o + PHDR_SIZE > head.len() {
+            return None;
+        }
+        if u32_at(head, o) != PT_NOTE {
+            continue;
+        }
+        let (offset, filesz) = (u64_at(head, o + 8) as usize, u64_at(head, o + 32) as usize);
+        let align = if u64_at(head, o + 48) == 8 { 8 } else { 4 };
+        let Some(notes) = offset.checked_add(filesz).and_then(|end| head.get(offset..end)) else {
+            continue;
+        };
+        let mut at = 0usize;
+        while at + 12 <= notes.len() {
+            let (namesz, descsz, kind) =
+                (u32_at(notes, at) as usize, u32_at(notes, at + 4) as usize, u32_at(notes, at + 8));
+            let name_at = at + 12;
+            let desc_at = (name_at + namesz).next_multiple_of(align);
+            if desc_at + descsz > notes.len() {
+                break;
+            }
+            if kind == NT_GNU_BUILD_ID
+                && namesz == 4
+                && &notes[name_at..name_at + 4] == b"GNU\0"
+                && (1..=MAX).contains(&descsz)
+            {
+                return Some(&notes[desc_at..desc_at + descsz]);
+            }
+            at = (desc_at + descsz).next_multiple_of(align);
+        }
+    }
+    None
 }
 
 fn u16_at(d: &[u8], o: usize) -> u16 {
@@ -520,6 +571,31 @@ mod tests {
         0x04, 0, 0, 0, 0x10, 0, 0, 0, 0x05, 0, 0, 0, b'G', b'N', b'U', 0, //
         0x00, 0, 0, 0xc0, 0x04, 0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0,
     ];
+
+    /// A build ID note, as linkers write it (4-byte aligned).
+    #[test]
+    fn reads_the_build_id() {
+        let mut note = vec![4, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0, b'G', b'N', b'U', 0];
+        note.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let other = [4u8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, b'G', b'N', b'U', 0, 9, 9, 9, 9];
+        let notes = [&other[..], &note[..]].concat();
+        let ph = ProgramHeader {
+            kind: PT_NOTE,
+            flags: PF_R,
+            offset: 0x100,
+            vaddr: 0x100,
+            filesz: notes.len() as u64,
+            memsz: notes.len() as u64,
+            align: 4,
+        };
+        let mut d = image(ET_DYN, &[load(PF_R, 0, 0, 0x200, 0x200), ph], 0x200);
+        d[0x100..0x100 + notes.len()].copy_from_slice(&notes);
+        assert_eq!(build_id(&d), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
+        // Cut before the note: none found.
+        assert_eq!(build_id(&d[..0x110]), None);
+        let without = image(ET_DYN, &[load(PF_R, 0, 0, 0x200, 0x200)], 0x200);
+        assert_eq!(build_id(&without), None);
+    }
 
     #[test]
     fn reads_the_aarch64_feature_note() {

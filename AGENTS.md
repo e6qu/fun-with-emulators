@@ -45,8 +45,8 @@ Apple Silicon host. Its end-to-end tests (`hv_*`) run on a software
 stand-in for Hypervisor.framework (`fwe --hv-standin`, which needs
 `brew install unicorn`), and on the real framework only with
 `FWE_HV_TESTS=1`, which the self-hosted `hypervisor` job sets. Do not set it,
-or run a VM program by hand, on the development Mac: it went down four times
-while this backend was built (see [docs/hypervisor.md](docs/hypervisor.md)).
+or run a VM program by hand, on the development Mac: misusing the hypervisor
+can bring the machine down (see [docs/hypervisor.md](docs/hypervisor.md)).
 On the stand-in, by hand:
 
 ```sh
@@ -68,8 +68,8 @@ Each document has one job; do not duplicate content across them.
 | Document | Holds |
 |---|---|
 | [README.md](README.md) | What the project is, a short status, how to run and test it |
-| [PLAN.md](PLAN.md) | Goal, approach, scope, principles, how progress is measured |
-| [ROADMAP.md](ROADMAP.md) | Milestones with checklists, "Done when" criteria and status |
+| [PLAN.md](PLAN.md) | Goal, approach, scope, the 1.0 finish line, principles, how progress is measured |
+| [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 with "Done when" criteria, and what is not planned |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
@@ -93,8 +93,8 @@ in the code consistent with what the code now does.
   with the VM alive, and the VM tests run one at a time, never in parallel
   (a forking guest's parent and child each have a VM) and never while
   another hypervisor client such as Podman's `krunkit` runs (stop it first;
-  the tests skip otherwise): the development machine went down four times
-  while this backend was built (see [docs/hypervisor.md](docs/hypervisor.md)).
+  the tests skip otherwise): misusing the hypervisor can bring the machine
+  down (see [docs/hypervisor.md](docs/hypervisor.md)).
   VM changes are verified on a machine whose crash costs nothing, with the
   run instrumented so a crash can be traced; a software stand-in never
   replaces that.

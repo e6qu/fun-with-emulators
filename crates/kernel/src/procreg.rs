@@ -65,6 +65,10 @@ pub struct ProcRecord {
     /// Its nice value (-20 to 19, `setpriority`), which its children
     /// inherit.
     pub nice: i32,
+    /// Its mappings as they were when it was forked, until it publishes
+    /// its own (see [`crate::maps::publish`]): what a fork child inherits,
+    /// recorded with the record it writes anyway.
+    pub maps: Vec<u8>,
 }
 
 /// A host process, as its pid and its start time.
@@ -108,6 +112,12 @@ fn path(pid: i32) -> Option<Vec<u8>> {
     Some([dir()?, format!("/{pid}").into_bytes()].concat())
 }
 
+/// The file host process `pid` publishes its mappings in (see
+/// [`crate::maps::publish`]).
+pub fn maps_path(pid: i32) -> Option<Vec<u8>> {
+    Some([path(pid)?, b".maps".to_vec()].concat())
+}
+
 /// When host process `pid` started, if it exists.
 pub fn start_time(pid: i32) -> Option<u64> {
     host_info(pid).map(|(start, _, _)| start)
@@ -143,6 +153,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
         e.u64(hard);
     }
     e.i32(r.nice);
+    e.bytes(&r.maps);
     e.into_bytes()
 }
 
@@ -169,6 +180,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let n = d.count(20);
     let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let nice = d.i32();
+    let maps = d.bytes();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -189,6 +201,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         ids,
         limits,
         nice,
+        maps,
     })
 }
 
@@ -224,6 +237,7 @@ fn lock(pid: i32) -> Option<std::fs::File> {
 pub fn remove(pid: i32) {
     if let Some(p) = path(pid) {
         let _ = std::fs::remove_file(OsStr::from_bytes(&p));
+        let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
         let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     }
     crate::signote::remove(pid);
@@ -388,6 +402,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         ids: [0; 8],
         limits: Vec::new(),
         nice: 0,
+        maps: Vec::new(),
     });
     f(&mut r);
     write(pid, &r);
@@ -428,8 +443,9 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 
 /// A child `child` of this process starts in this process's cgroup, in the
 /// namespaces `ns`, with the line of ancestors and bound of `line`
-/// ([`child_line`]).
-pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
+/// ([`child_line`]) and this process's mappings `maps` (see
+/// [`crate::maps::forked`]).
+pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), maps: Vec<u8>) {
     let mine = read(me());
     let oom = mine.as_ref().map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min));
     let ids = mine.as_ref().map_or([0; 8], |r| r.ids);
@@ -449,6 +465,11 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
         (r.oom_score_adj, r.oom_score_adj_min) = oom;
         r.ids = ids;
         r.nice = nice;
+        // Whichever of the two writes first, the child's mappings are there
+        // from the start; the child's own stand.
+        if r.maps.is_empty() {
+            r.maps = maps;
+        }
     });
 }
 
@@ -557,9 +578,13 @@ pub fn load_line(d: &mut Dec) -> (Vec<Proc>, Option<Proc>) {
     (get_procs(d), get_opt(d))
 }
 
-/// This process (just forked) has the line of ancestors and bound `line`.
-pub fn own_line(line: &(Vec<Proc>, Option<Proc>)) {
-    let _ = change(me(), |r| (r.lineage, r.bound) = line.clone());
+/// This process (just forked) has the line of ancestors and bound `line`,
+/// and the mappings `maps` it inherited (see [`crate::maps::forked`]).
+pub fn own_line(line: &(Vec<Proc>, Option<Proc>), maps: Vec<u8>) {
+    let _ = change(me(), |r| {
+        (r.lineage, r.bound) = line.clone();
+        r.maps = maps;
+    });
 }
 
 /// Make this process a child subreaper, or not, with the orphans below it

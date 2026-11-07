@@ -85,6 +85,22 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
     e
 }
 
+/// The host process whose `/proc/<pid>/maps` descriptor `fd` is open on,
+/// if it is one.
+fn maps_of_fd(fd: i32) -> Option<i32> {
+    let o = crate::fdmarks::origin(fd)?;
+    if o.fstype != crate::mounts::FsType::Proc {
+        return None;
+    }
+    let who = o.ns_path.strip_suffix(b"/maps")?.rsplit(|&b| b == b'/').next()?;
+    if who == b"self" {
+        // SAFETY: getpid cannot fail.
+        return Some(unsafe { libc::getpid() });
+    }
+    let pid: i32 = std::str::from_utf8(who).ok()?.parse().ok()?;
+    crate::pidns::to_host(pid)
+}
+
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
         if let Err(e) = crate::fdtable::check_args(n, &a) {
@@ -287,6 +303,7 @@ impl<P: Platform> Kernel<P> {
             nr::TRUNCATE => self.sys_truncate(a[0], a[1]),
             nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
             nr::FALLOCATE => self.sys_fallocate(a[0], a[1], a[2], a[3]),
+            nr::FADVISE64 => self.sys_fadvise(a[0], a[1], a[2], a[3]),
             nr::UMASK => self.sys_umask(a[0]),
             nr::PIPE2 => self.sys_pipe2(a[0], a[1]),
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
@@ -313,6 +330,7 @@ impl<P: Platform> Kernel<P> {
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),
             nr::MADVISE => self.sys_madvise(a[0], a[1], a[2]),
             nr::MSYNC => self.sys_msync(a[0], a[1], a[2]),
+            nr::MINCORE => self.sys_mincore(a[0], a[1], a[2]),
             nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3], a[4]),
 
             // Process and thread identity.
@@ -925,6 +943,9 @@ impl<P: Platform> Kernel<P> {
 
     fn sys_ioctl(&mut self, fd: u64, req: u64, arg: u64) -> i64 {
         let fd = fd as i32;
+        // The request is 32 bits (an `unsigned int`); a C library passing
+        // an `int` sign-extends it.
+        let req = req as u32 as u64;
         // SAFETY: in every arm the argument layouts match the host's; the host
         // validates guest pointers.
         unsafe {
@@ -944,6 +965,9 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
+                ioctl::PROCMAP_QUERY if let Some(pid) = maps_of_fd(fd) => {
+                    self.procmap_query(pid, arg)
+                }
                 ioctl::SIOCGIFFLAGS
                 | ioctl::SIOCSIFFLAGS
                 | ioctl::SIOCGIFINDEX
@@ -1403,6 +1427,7 @@ impl<P: Platform> Kernel<P> {
             no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
             seccomp: crate::seccomp::mode(),
             umask: self.fs().umask(),
+            locked: crate::maps::record().locked_bytes(),
         };
         crate::procpid::status(thread::tgid(), &comm, &h, &creds)
     }
@@ -2378,6 +2403,147 @@ mod tests {
             let r = k.syscall(nr::IOCTL, [fd, req, buf.as_mut_ptr() as u64, 0, 0, 0]);
             assert_eq!(r, err(errno::ENOTTY), "ioctl {req:#x}");
         }
+    }
+
+    /// An ioctl request is 32 bits: one the C library sign-extended (an
+    /// `int` with its top bit set) is the same request.
+    #[test]
+    fn ioctl_requests_are_32_bits() {
+        use std::os::fd::AsRawFd;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let fd = null.as_raw_fd() as u64;
+        let mut n = 0u32;
+        let mut k = kernel();
+        let extended = ioctl::TIOCGPTN as u32 as i32 as i64 as u64;
+        assert_ne!(extended, ioctl::TIOCGPTN);
+        // Not a pseudo-terminal master: the request is recognised, and fails
+        // as `TIOCGPTN` does there.
+        let r = k.syscall(nr::IOCTL, [fd, extended, &mut n as *mut u32 as u64, 0, 0, 0]);
+        assert_eq!(
+            r,
+            k.syscall(nr::IOCTL, [fd, ioctl::TIOCGPTN, &mut n as *mut u32 as u64, 0, 0, 0])
+        );
+    }
+
+    /// `fadvise64` checks its descriptor and advice as Linux does.
+    #[test]
+    fn fadvise_checks_descriptor_and_advice() {
+        use fwe_abi::fadvise::*;
+        use std::os::fd::AsRawFd;
+        let file = tempfile_in_tmp();
+        let fd = file.as_raw_fd() as u64;
+        let mut k = kernel();
+        let call = |k: &mut Kernel<TestPlatform>, fd: u64, len: u64, advice: u64| {
+            k.syscall(nr::FADVISE64, [fd, 0, len, advice, 0, 0])
+        };
+        for advice in
+            [POSIX_FADV_NORMAL, POSIX_FADV_WILLNEED, POSIX_FADV_DONTNEED, POSIX_FADV_NOREUSE]
+        {
+            assert_eq!(call(&mut k, fd, 0, advice), 0, "advice {advice}");
+        }
+        assert_eq!(call(&mut k, fd, 0, 6), err(errno::EINVAL));
+        assert_eq!(call(&mut k, fd, -1i64 as u64, POSIX_FADV_NORMAL), err(errno::EINVAL));
+        assert_eq!(call(&mut k, 9999, 0, POSIX_FADV_NORMAL), err(errno::EBADF));
+        let mut p = [0i32; 2];
+        // SAFETY: a valid out-parameter.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        assert_eq!(call(&mut k, p[0] as u64, 0, POSIX_FADV_NORMAL), err(errno::ESPIPE));
+        // SAFETY: closing the pipe made above.
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+    }
+
+    /// `POSIX_FADV_DONTNEED` drops a file's pages from the host's cache,
+    /// after writing back what was written to it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fadvise_dontneed_drops_the_cache() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let file = tempfile_in_tmp();
+        // SAFETY: plain host call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 8 * page;
+        file.write_all_at(&vec![b'a'; len], 0).unwrap();
+        file.write_all_at(b"kept", 100).unwrap();
+        let resident = || {
+            // SAFETY: a fresh read-only shared mapping of the file.
+            let m = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(m, libc::MAP_FAILED);
+            let mut v = vec![0 as libc::c_char; 8];
+            // SAFETY: one byte for each page of the mapping.
+            unsafe { libc::mincore(m, len, v.as_mut_ptr()) };
+            // SAFETY: unmapping the mapping made above.
+            unsafe { libc::munmap(m, len) };
+            v.iter().filter(|&&b| b & 1 != 0).count()
+        };
+        assert!(resident() > 0);
+        let fd = file.as_raw_fd() as u64;
+        let dontneed = fwe_abi::fadvise::POSIX_FADV_DONTNEED;
+        assert_eq!(kernel().syscall(nr::FADVISE64, [fd, 0, 0, dontneed, 0, 0]), 0);
+        assert_eq!(resident(), 0);
+        let mut b = [0u8; 4];
+        file.read_exact_at(&mut b, 100).unwrap();
+        assert_eq!(&b, b"kept");
+    }
+
+    fn tempfile_in_tmp() -> std::fs::File {
+        let path = std::env::temp_dir().join(format!("fwe-fadvise-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        f
+    }
+
+    /// `mincore` reports a touched page as in memory, and refuses an
+    /// unaligned start and an unmapped range. (A bad vector's `EFAULT`
+    /// needs a backend's fault handling: LTP's `mincore01` checks it.)
+    #[test]
+    fn mincore_reports_residency() {
+        let mut k = kernel();
+        let page = k.page_size;
+        // SAFETY: a fresh anonymous mapping for the test.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let p = p as u64;
+        // SAFETY: writing inside the mapping.
+        unsafe { (p as *mut u8).write(1) };
+        let mut vec = [0xffu8; 2];
+        let v = vec.as_mut_ptr() as u64;
+        assert_eq!(k.syscall(nr::MINCORE, [p, 2 * page, v, 0, 0, 0]), 0);
+        assert_eq!(vec[0] & 1, 1);
+        assert_eq!(vec[0] & !1, 0);
+        assert_eq!(k.syscall(nr::MINCORE, [p + 1, page, v, 0, 0, 0]), err(errno::EINVAL));
+        // SAFETY: unmapping the second page of the test's mapping.
+        unsafe { libc::munmap((p + page) as *mut libc::c_void, page as usize) };
+        assert_eq!(k.syscall(nr::MINCORE, [p, 2 * page, v, 0, 0, 0]), err(errno::ENOMEM));
+        // SAFETY: unmapping the rest.
+        unsafe { libc::munmap(p as *mut libc::c_void, page as usize) };
     }
 
     /// `sched_getaffinity` names the caller (0), the process, or any of its

@@ -1,76 +1,60 @@
 # fun-with-emulators
 
 Run unmodified Linux arm64 binaries on macOS (Apple Silicon), in-process and
-at native speed — we implement the Linux kernel's userspace ABI rather than
-run a Linux kernel. Like Wine, but for Linux. Written in Rust.
+at native speed. `fwe` implements the Linux kernel's userspace ABI rather
+than running a Linux kernel: like Wine, but for Linux. Written in Rust.
 
 ## Status
 
-Real, unmodified Debian `aarch64` programs run end to end: coreutils, `ls`
-with its shared-library graph, `bash`, `git` (commits, merges, rebases,
-`gc`, a local clone), SQLite, the lighttpd web server (with CGI),
-Node.js with V8's JIT, rustc with Cargo building a project, and apt
-installing a package, dynamically linked against a genuine glibc (musl
-works too). Processes, threads, memory, signals, files on a Linux rootfs,
-networking, terminals, event descriptors and a synthetic `/proc` are in
-place. Alpine's crun runs the standard `alpine` container image, in
-namespaces, a cgroup, and the capabilities and seccomp profile its spec
-gives it; Alpine's podman (through conmon and crun) and containerd
-(through its runc shim and runc) load that image and run containers of it
-on overlay mounts.
+Unmodified Debian `aarch64` programs run natively, against a genuine glibc
+(musl works too): coreutils, bash, git, SQLite, lighttpd, Node.js, rustc
+with Cargo, and apt.
 
-A non-PIE executable linked into the low 4 GiB that macOS reserves (Debian's
-`python3.11`, GCC, clang and Go) cannot be mapped in-process; fwe runs it in a
-Hypervisor.framework VM instead, which needs `fwe` signed with the
-hypervisor entitlement ([docs/hypervisor.md](docs/hypervisor.md)); threads,
-`fork` and `execve` work there as they do in-process. Debian's Python
-running its standard library, GCC and clang building C and C++ programs
-and Go building and
-testing a module pass there on a software stand-in for the framework; a
-run on real hardware is still to come. See
-[ROADMAP.md](ROADMAP.md) for milestones and status,
-[PLAN.md](PLAN.md) for the goal and scope, and
-[docs/architecture.md](docs/architecture.md) for how it works and what is
-still missing.
+Executables linked below 4 GiB run in a Hypervisor.framework VM:
+- that covers Debian's Python, GCC, clang and Go;
+- `fwe` must be signed with the hypervisor entitlement for this
+  ([docs/hypervisor.md](docs/hypervisor.md));
+- it is verified on a software stand-in for the framework, not yet on real
+  hardware.
+
+Container engines run standard images: crun, podman and containerd run
+`alpine`.
+
+LTP's system-call tests pass at 651 of 1534 (57% of those that apply).
+
+[ROADMAP.md](ROADMAP.md) has what is done and what is left to 1.0;
+[PLAN.md](PLAN.md) has the goal and scope;
+[docs/architecture.md](docs/architecture.md) explains how it works and its
+current limitations.
 
 ## Usage
 
 ```sh
 cargo build --release
 target/release/fwe ./hello                 # run a Linux arm64 executable
+target/release/fwe --root ./rootfs ./hello # with ./rootfs as /
 target/release/fwe --strace ./hello        # trace its system calls
 target/release/fwe --strace --strace-file=trace.log ./hello  # every process, to a file
-target/release/fwe --root ./rootfs ./hello # run with ./rootfs as /
 ```
 
 A dynamically linked program needs its dynamic linker and libraries under
-the root, at the paths the program names (for Debian binaries, a Debian
-rootfs).
-
-## How it works
-
-`fwe` maps the ELF image into its own address space at the guest's
-addresses, rewrites each `svc #0` into a trapping `brk` — along with uses
-of `x18` and `TPIDR_EL0`, which macOS treats specially — builds a Linux
-initial stack, and jumps to the entry point. Guest code then runs directly
-on the CPU. Each system call traps into a signal handler, which runs the
-Linux system call in the kernel layer and resumes the guest. A dynamically
-linked program's interpreter and libraries are loaded and translated the
-same way. See [docs/architecture.md](docs/architecture.md).
+the root, at the paths the program names. For Debian binaries, that means a
+Debian rootfs.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `crates/abi` | Linux arm64 userspace ABI: syscall numbers, errno, flags, structs |
-| `crates/elf` | ELF parsing and load planning |
-| `crates/kernel` | Linux system call implementations on top of the host |
-| `crates/native` | Native execution backend: loader, instruction rewriting, traps; the hypervisor backend and its stand-in |
-| `crates/fwe` | The `fwe` command and end-to-end tests |
-| `guests/asm`, `guests/c`, `guests/rust` | Linux test programs built by the tests |
-| `guests/musl`, `guests/glibc`, `guests/debian` | Vendored, unmodified runtimes and Debian binaries the tests run |
-| `tools/gen-abi.py` | Generates ABI tables from Linux UAPI headers |
-| `docs/` | Architecture and the hypervisor spike |
+| `crates/abi` | Linux arm64 ABI: system-call numbers, errno values, flags, structures |
+| `crates/elf` | ELF parsing, load planning, unwind tables, build IDs |
+| `crates/kernel` | Linux system calls on top of the host |
+| `crates/native` | The native backend (loader, code rewriting, traps) and the hypervisor backend with its stand-in |
+| `crates/fwe` | The `fwe` command and the end-to-end tests |
+| `guests/asm`, `guests/c`, `guests/rust` | Linux test programs the tests build |
+| `guests/musl`, `guests/glibc`, `guests/debian`, `guests/alpine` | Vendored or fetched binaries the tests run, with their provenance |
+| `tools/gen-abi.py` | Generates the ABI tables from Linux's UAPI headers |
+| `tools/ltp` | Builds LTP and runs its system-call tests against the baseline |
+| `docs/` | How fwe works, and the hypervisor backend |
 
 ## Testing
 
@@ -78,25 +62,25 @@ same way. See [docs/architecture.md](docs/architecture.md).
 cargo test
 ```
 
-On macOS on Apple Silicon this includes the end-to-end tests, which build the
-programs in `guests/` (needs `clang`, from the Xcode command line tools) and
-run them under `fwe`; the hypervisor backend's run on a software stand-in
-for Hypervisor.framework, which needs Unicorn (`brew install unicorn`), and
-never in a real VM unless asked for. Elsewhere only unit tests run. See
-[AGENTS.md](AGENTS.md) for the full set of checks CI runs.
+On Apple Silicon macOS this includes the end-to-end tests:
+- They build the programs in `guests/`, which needs `clang` from the Xcode
+  command line tools, and run them under `fwe`.
+- The hypervisor backend's tests run on a software stand-in, which needs
+  `brew install unicorn`. They never use a real VM unless asked to.
 
-The Linux Test Project's system-call tests run under `fwe` too, against a
-baseline of the tests that pass (`tools/ltp/baseline.txt`); CI fails if one
-of them stops passing:
+Elsewhere only the unit tests run. [AGENTS.md](AGENTS.md) lists every check
+CI runs.
+
+LTP's system-call tests run under `fwe` against `tools/ltp/baseline.txt`;
+CI fails if a test in the baseline stops passing:
 
 ```sh
 tools/ltp/build.sh target/ltp      # needs zig 0.17.0: LTP in an Alpine root
 cargo build
 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root
-tools/ltp/run.py ... --update      # rewrite the baseline from a run
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The vendored runtimes and Debian binaries under
-`guests/` carry their own licenses, noted in each directory's README.
+MIT, see [LICENSE](LICENSE). The binaries under `guests/` carry their own
+licenses, noted in each directory's README.
