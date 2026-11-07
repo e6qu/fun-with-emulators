@@ -97,43 +97,53 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
     }
 }
 
-/// Linux's state of host process `pid`, which the host has running: `R`
-/// if a thread of it runs (or waits only for a processor), `S` if every
-/// one sleeps (a thread in a system call that waits, which Linux shows as
-/// sleeping and programs wait to see).
+/// Linux's state of host process `pid`, which the host has running: its
+/// main thread's, as Linux shows a process (`R` if it runs or waits only
+/// for a processor, `S` if it sleeps, as a thread in a system call that
+/// waits does, which programs wait to see). This process's main thread is
+/// fwe's record of it; another's is the first the host lists, the one
+/// created first.
 #[cfg(target_os = "macos")]
 fn threads_state(pid: i32) -> u8 {
     /// `PROC_PIDLISTTHREADS`: the process's thread handles.
     const PROC_PIDLISTTHREADS: i32 = 6;
+    // SAFETY: getpid cannot fail.
+    if pid == unsafe { libc::getpid() } {
+        let main = if crate::thread::tid() == crate::thread::tgid() {
+            // SAFETY: plain host call.
+            Some(unsafe { libc::pthread_self() })
+        } else {
+            crate::thread::host_thread(crate::thread::tgid()).filter(|&t| t != 0 as libc::pthread_t)
+        };
+        return match main.and_then(crate::host::thread_state) {
+            Some((_, _, true)) | None => b'R',
+            Some((_, _, false)) => b'S',
+        };
+    }
     let mut handles = [0u64; 256];
     let size = std::mem::size_of_val(&handles) as i32;
     // SAFETY: a valid out-buffer of `size` bytes.
     let got = unsafe {
         libc::proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles.as_mut_ptr().cast(), size)
     };
-    if got <= 0 {
+    if got < 8 {
         return b'R';
     }
-    for &h in &handles[..got as usize / 8] {
-        // SAFETY: zeroed bytes are a valid `proc_threadinfo`, which the
-        // call fills.
-        let mut t: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-        let tsize = std::mem::size_of::<libc::proc_threadinfo>() as i32;
-        // SAFETY: a valid out-buffer of `tsize` bytes.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTHREADINFO,
-                h,
-                (&mut t as *mut libc::proc_threadinfo).cast(),
-                tsize,
-            )
-        };
-        if n == tsize && t.pth_run_state == libc::TH_STATE_RUNNING {
-            return b'R';
-        }
-    }
-    b'S'
+    // SAFETY: zeroed bytes are a valid `proc_threadinfo`, which the call
+    // fills.
+    let mut t: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+    let tsize = std::mem::size_of::<libc::proc_threadinfo>() as i32;
+    // SAFETY: a valid out-buffer of `tsize` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTHREADINFO,
+            handles[0],
+            (&mut t as *mut libc::proc_threadinfo).cast(),
+            tsize,
+        )
+    };
+    if n == tsize && t.pth_run_state != libc::TH_STATE_RUNNING { b'S' } else { b'R' }
 }
 
 /// The CPU time host process `pid` has used, user and system, in

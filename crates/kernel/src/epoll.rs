@@ -135,15 +135,18 @@ pub unsafe fn create1(flags: u64) -> i64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        if flags & !fwe_abi::epoll::EPOLL_CLOEXEC != 0 {
+            return fwe_abi::err(fwe_abi::errno::EINVAL);
+        }
         // SAFETY: plain host call.
         let fd = unsafe { libc::kqueue() };
         if fd < 0 {
             return crate::host::last_error();
         }
-        if flags & fwe_abi::epoll::EPOLL_CLOEXEC != 0 {
-            // SAFETY: plain host call on the descriptor just created.
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
+        // The host makes a kqueue close-on-exec; the guest's flag decides.
+        let cloexec = if flags & fwe_abi::epoll::EPOLL_CLOEXEC != 0 { libc::FD_CLOEXEC } else { 0 };
+        // SAFETY: plain host call on the descriptor just created.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, cloexec) };
         interest(|m| m.insert(fd, Interest::new()));
         fd as i64
     }
@@ -169,13 +172,47 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let entry = if op == fwe_abi::epoll::EPOLL_CTL_DEL {
-            None
-        } else {
-            Some(crate::guest!(read_event(event)))
-        };
+        use fwe_abi::epoll::*;
+        use fwe_abi::{err, errno};
+        let entry = if op == EPOLL_CTL_DEL { None } else { Some(crate::guest!(read_event(event))) };
+        // As Linux checks, in its order: both descriptors, whether the
+        // target can be watched (a file or directory is always ready, so
+        // it cannot), whether the set is one, nesting, then the entry.
+        let (ep, target) = (epfd as i32, fd as i32);
+        // SAFETY: plain host call; F_GETFD only queries.
+        if unsafe { libc::fcntl(ep, libc::F_GETFD) } < 0 {
+            return err(errno::EBADF);
+        }
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::fstat(target, &mut st) } < 0 {
+            return err(errno::EBADF);
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFREG || kind == libc::S_IFDIR {
+            return err(errno::EPERM);
+        }
+        if ep == target || !is_epoll(ep) {
+            return err(errno::EINVAL);
+        }
+        if op == EPOLL_CTL_ADD && is_epoll(target) && nesting_refused(ep, target) {
+            return err(errno::ELOOP);
+        }
+        let listed = interest(|m| m.get(&ep).is_some_and(|l| l.contains_key(&target)));
+        match op {
+            EPOLL_CTL_ADD if listed => return err(errno::EEXIST),
+            EPOLL_CTL_DEL | EPOLL_CTL_MOD if !listed => return err(errno::ENOENT),
+            EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD => {}
+            _ => return err(errno::EINVAL),
+        }
         // SAFETY: plain host calls on the guest's descriptors.
         let r = unsafe { ctl_kqueue(epfd, op, fd, entry.unwrap_or((0, 0))) };
+        // A device the host cannot watch (`/dev/zero`) is one Linux cannot
+        // poll either.
+        if r == err(errno::EINVAL) && kind == libc::S_IFCHR {
+            return err(errno::EPERM);
+        }
         if r == 0 {
             // A changed entry is looked at afresh, edge-triggered or not.
             edge_clear(epfd as i32, fd as i32);
@@ -190,6 +227,62 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         }
         r
     }
+}
+
+/// Whether `fd` is an epoll descriptor.
+#[cfg(not(target_os = "linux"))]
+fn is_epoll(fd: i32) -> bool {
+    interest(|m| m.contains_key(&fd))
+}
+
+/// The most epoll descriptors one path of nested sets may pass through
+/// beyond the first (Linux's `EPOLL_MAX_NESTS`).
+#[cfg(not(target_os = "linux"))]
+const MAX_NESTS: usize = 4;
+
+/// Whether adding epoll descriptor `target` to set `ep` would make a set
+/// watch itself through others, or nest sets deeper than Linux allows
+/// (`ELOOP`).
+#[cfg(not(target_os = "linux"))]
+fn nesting_refused(ep: i32, target: i32) -> bool {
+    interest(|m| {
+        // The longest path of sets below `from`; `None` if it reaches `ep`.
+        fn down(
+            m: &std::collections::HashMap<i32, Interest>,
+            from: i32,
+            ep: i32,
+            seen: usize,
+        ) -> Option<usize> {
+            if from == ep {
+                return None;
+            }
+            if seen > m.len() {
+                return Some(seen);
+            }
+            let mut deepest = 0;
+            for &fd in m.get(&from).into_iter().flat_map(|l| l.keys()) {
+                if m.contains_key(&fd) {
+                    deepest = deepest.max(down(m, fd, ep, seen + 1)? + 1);
+                }
+            }
+            Some(deepest)
+        }
+        // The longest path of sets above `to`.
+        fn up(m: &std::collections::HashMap<i32, Interest>, to: i32, seen: usize) -> usize {
+            if seen > m.len() {
+                return seen;
+            }
+            m.iter()
+                .filter(|(_, l)| l.contains_key(&to))
+                .map(|(&p, _)| up(m, p, seen + 1) + 1)
+                .max()
+                .unwrap_or(0)
+        }
+        match down(m, target, ep, 0) {
+            None => true,
+            Some(below) => below + 1 + up(m, ep, 0) > MAX_NESTS,
+        }
+    })
 }
 
 /// `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)`.
@@ -228,6 +321,13 @@ pub unsafe fn pwait(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (sigmask, sigsetsize);
+        // SAFETY: plain host call; F_GETFD only queries.
+        if unsafe { libc::fcntl(epfd as i32, libc::F_GETFD) } < 0 {
+            return fwe_abi::err(fwe_abi::errno::EBADF);
+        }
+        if !is_epoll(epfd as i32) {
+            return fwe_abi::err(fwe_abi::errno::EINVAL);
+        }
         // SAFETY: the caller guarantees `events` spans `maxevents` entries.
         unsafe { pwait_kqueue(epfd, events, maxevents, timeout) }
     }
@@ -239,6 +339,10 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
 
     let want_read = events & EPOLLIN != 0;
     let want_write = events & EPOLLOUT != 0;
+    // A socket watched only for its reading side's shutting
+    // (`EPOLLRDHUP`): the read filter, at a low-water mark no read reaches,
+    // so it fires only at the end of the stream.
+    let hangup_only = events & EPOLLRDHUP != 0 && !want_read && is_socket(fd as i32);
     let extra = (if events & EPOLLONESHOT != 0 { libc::EV_ONESHOT } else { 0 })
         | (if events & EPOLLET != 0 { libc::EV_CLEAR } else { 0 });
 
@@ -247,7 +351,7 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
     // effect. For DEL both filters are removed. EV_RECEIPT makes `kevent` report
     // per-change status in the event list without reporting readiness.
     let mut changes: Vec<libc::kevent> = Vec::with_capacity(2);
-    let mut push = |filter: i16, want: bool| {
+    let mut push = |filter: i16, want: bool, lowat: Option<isize>| {
         let flags = if op != EPOLL_CTL_DEL && want {
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT | extra
         } else {
@@ -257,13 +361,13 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
             ident: fd as libc::uintptr_t,
             filter,
             flags,
-            fflags: 0,
-            data: 0,
+            fflags: if lowat.is_some() { libc::NOTE_LOWAT } else { 0 },
+            data: lowat.unwrap_or(0),
             udata: data as *mut libc::c_void,
         });
     };
-    push(libc::EVFILT_READ, want_read);
-    push(libc::EVFILT_WRITE, want_write);
+    push(libc::EVFILT_READ, want_read || hangup_only, hangup_only.then_some(i32::MAX as isize));
+    push(libc::EVFILT_WRITE, want_write, None);
 
     let mut out = changes.clone();
     // SAFETY: both lists are valid for `changes.len()` entries; no timeout.
@@ -332,8 +436,10 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
             if !armed(ep, fd) {
                 continue;
             }
+            // Writers gone, nothing left to read: hung up, as Linux
+            // reports a pipe.
             let bits = match crate::fifo::probe(fd) {
-                crate::fifo::Probe::HungUp => EPOLLIN | EPOLLHUP,
+                crate::fifo::Probe::HungUp => EPOLLHUP,
                 _ => 0,
             };
             // Edge-triggered: once per change, as Linux reports it.
@@ -426,7 +532,9 @@ fn edge_clear(epfd: i32, fd: i32) {
 fn armed(epfd: i32, fd: i32) -> bool {
     use fwe_abi::epoll::*;
     interest(|m| {
-        m.get(&epfd).and_then(|l| l.get(&fd)).is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT) != 0)
+        m.get(&epfd)
+            .and_then(|l| l.get(&fd))
+            .is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP) != 0)
     })
 }
 
@@ -437,13 +545,23 @@ fn disarm(epfd: i32, fd: i32) {
     use fwe_abi::epoll::*;
     let data = interest(|m| {
         let e = m.get_mut(&epfd)?.get_mut(&fd)?;
-        e.0 &= !(EPOLLIN | EPOLLOUT);
+        e.0 &= !(EPOLLIN | EPOLLOUT | EPOLLRDHUP);
         Some(e.1)
     });
     let Some(data) = data else { return };
     // Both filters go (kqueue removes only the one that fired).
     // SAFETY: plain host calls on the guest's descriptors.
     unsafe { ctl_kqueue(epfd as u64, EPOLL_CTL_DEL, fd as u64, (0, data)) };
+}
+
+/// Whether `fd` is a socket (what `EPOLLRDHUP` and a stream's end mean
+/// differently for).
+#[cfg(not(target_os = "linux"))]
+fn is_socket(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK }
 }
 
 /// Wait up to `ms` milliseconds (forever if negative) on kqueue `epfd` for
@@ -480,25 +598,56 @@ fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, 
         return Err(crate::host::last_error());
     }
     let mut ready: Vec<(i32, u32, u64)> = Vec::with_capacity(n as usize);
+    // Ends of the stream seen, per descriptor: (reading, writing).
+    let mut ends: Vec<(i32, bool, bool)> = Vec::new();
     for ev in &out[..n as usize] {
+        let fd = ev.ident as i32;
+        let eof = ev.flags & libc::EV_EOF != 0;
         let mut bits: u32 = 0;
         match ev.filter {
+            // At its end, as Linux reports it: a socket whose reading side
+            // is shut is readable (reads return 0) and says so; a pipe or
+            // terminal whose writers have gone has hung up, readable only
+            // while data is left.
+            libc::EVFILT_READ if eof && is_socket(fd) => bits |= EPOLLIN | EPOLLRDHUP,
+            libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { EPOLLIN } else { 0 },
             libc::EVFILT_READ => bits |= EPOLLIN,
+            // A pipe whose readers have gone is an error to write to; a
+            // socket whose writing side is shut stays writable (a write
+            // fails at once).
+            libc::EVFILT_WRITE if eof && !is_socket(fd) => bits |= EPOLLOUT | EPOLLERR,
             libc::EVFILT_WRITE => bits |= EPOLLOUT,
             _ => {}
-        }
-        if ev.flags & libc::EV_EOF != 0 {
-            bits |= EPOLLHUP;
         }
         if ev.flags & libc::EV_ERROR != 0 {
             bits |= EPOLLERR;
         }
-        let fd = ev.ident as i32;
+        if eof {
+            match ends.iter_mut().find(|e| e.0 == fd) {
+                Some(e) => {
+                    e.1 |= ev.filter == libc::EVFILT_READ;
+                    e.2 |= ev.filter == libc::EVFILT_WRITE;
+                }
+                None => {
+                    ends.push((fd, ev.filter == libc::EVFILT_READ, ev.filter == libc::EVFILT_WRITE))
+                }
+            }
+        }
         match ready.iter_mut().find(|r| r.0 == fd) {
             Some(r) => r.1 |= bits,
             None => ready.push((fd, bits, ev.udata as u64)),
         }
     }
+    // A socket shut both ways has hung up. Only what was asked for is
+    // reported, and the error and hang-up always (as Linux reports them).
+    for r in &mut ready {
+        if ends.iter().any(|&(fd, read, write)| fd == r.0 && read && write) && is_socket(r.0) {
+            r.1 |= EPOLLHUP;
+        }
+        let asked = interest(|m| m.get(&epfd).and_then(|l| l.get(&r.0)).map(|&(ev, _)| ev));
+        r.1 &= asked.unwrap_or(!0) | EPOLLERR | EPOLLHUP;
+    }
+    ready.retain(|r| r.1 != 0);
     for &(fd, ..) in &ready {
         let oneshot = interest(|m| {
             m.get(&epfd).and_then(|l| l.get(&fd)).is_some_and(|&(ev, _)| ev & EPOLLONESHOT != 0)
@@ -514,6 +663,14 @@ fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, 
 mod tests {
     use super::*;
     use fwe_abi::epoll::*;
+
+    /// The interest lists are the process's (a rebuild replaces them all,
+    /// as a fork child does): the tests take turns.
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // A Linux host takes its own `epoll_event` (packed on x86-64); a macOS
     // host goes through the translation, which takes the arm64 guest's.
@@ -543,6 +700,7 @@ mod tests {
     /// through the epoll translation on either host.
     #[test]
     fn pipe_readiness_round_trip() {
+        let _turn = turn();
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -586,6 +744,7 @@ mod tests {
 
     #[test]
     fn mod_and_del() {
+        let _turn = turn();
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -639,6 +798,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn interest_list_survives_a_rebuild() {
+        let _turn = turn();
         const EP: i32 = 900;
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
@@ -695,6 +855,7 @@ mod tests {
 
     #[test]
     fn bad_maxevents_is_einval() {
+        let _turn = turn();
         // SAFETY: create1 takes no pointers.
         let ep = unsafe { create1(0) };
         assert!(ep >= 0);
