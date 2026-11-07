@@ -1473,6 +1473,9 @@ fn alpine_containerd_runs_an_image() {
         let trace = root.join("tmp").join(trace);
         let _ = std::fs::remove_file(&trace);
         cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        // How each SIGCHLD report travels (a shim learns of its container's
+        // end by one).
+        cmd.arg(format!("--debug-sigchld={}", root.join("tmp/sigchld.trace").display()));
         cmd.arg("--root").arg(&root).arg(root.join(prog));
         cmd
     };
@@ -1490,34 +1493,44 @@ fn alpine_containerd_runs_an_image() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let ctr = |args: &[&str]| {
+    // `ctr` with `args`, which is to end with status `expect`; otherwise
+    // the last calls of it and of containerd's processes (the shims, runc)
+    // are printed.
+    let ctr = |args: &[&str], expect: i32| {
         let trace = format!("ctr-{}.trace", args[..2].join("-"));
         let mut cmd = fwe("usr/bin/ctr", &trace);
         cmd.args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
         eprintln!("--- ctr {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
-        if !out.status.success() && args[0] != "run" || out.status.code().is_none() {
+        if out.status.code() != Some(expect) {
             print_last_calls(&root.join("tmp").join(&trace));
             print_last_calls(&root.join("tmp/containerd.trace"));
+            eprintln!(
+                "--- SIGCHLD reports:\n{}",
+                std::fs::read_to_string(root.join("tmp/sigchld.trace")).unwrap_or_default()
+            );
         }
         out
     };
-    let imported = ctr(&["images", "import", "/tmp/alpine.tar"]);
-    let images = ctr(&["images", "ls", "-q"]);
+    let imported = ctr(&["images", "import", "/tmp/alpine.tar"], 0);
+    let images = ctr(&["images", "ls", "-q"], 0);
     let run =
-        ctr(&["run", "--rm", "docker.io/library/alpine:3.20", "t1", "sh", "-c", IN_CONTAINERD]);
+        ctr(&["run", "--rm", "docker.io/library/alpine:3.20", "t1", "sh", "-c", IN_CONTAINERD], 4);
     // Again with containerd's default seccomp profile.
-    let filtered = ctr(&[
-        "run",
-        "--rm",
-        "--seccomp",
-        "docker.io/library/alpine:3.20",
-        "t2",
-        "sh",
-        "-c",
-        "grep Seccomp: /proc/self/status; uname -r",
-    ]);
-    let after = ctr(&["containers", "ls", "-q"]);
+    let filtered = ctr(
+        &[
+            "run",
+            "--rm",
+            "--seccomp",
+            "docker.io/library/alpine:3.20",
+            "t2",
+            "sh",
+            "-c",
+            "grep Seccomp: /proc/self/status; uname -r",
+        ],
+        0,
+    );
+    let after = ctr(&["containers", "ls", "-q"], 0);
     // SAFETY: plain call, to the daemon this test started.
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
