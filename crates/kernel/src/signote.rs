@@ -13,10 +13,14 @@
 //! sender takes the note for it, if a recent one is there ([`take`]); one
 //! given a sender clears that sender's note ([`clear`]), so a later signal
 //! from elsewhere (the terminal, the host) is not taken for it. Both are
-//! async-signal-safe: plain `open`, `pread`, `pwrite` and `close` on a path
-//! made without allocating.
+//! async-signal-safe: `pread` and `pwrite` on the process's own mailbox,
+//! which it opened as it started (and a fork child as it starts), in fwe's
+//! reserved descriptor range, so a handler takes no number the guest's
+//! next descriptor would. A note whose signal could not be sent is taken
+//! back.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// The directory of the process records, made once as the process starts
 /// (the handlers read it without allocating).
@@ -29,7 +33,11 @@ const SLOT: usize = 16;
 const SIGNALS: usize = 32;
 /// A note older than this is not taken: a signal is held by fwe's handlers
 /// only for a moment.
-const FRESH_NS: u64 = 5_000_000_000;
+const FRESH_NS: u64 = 1_000_000_000;
+
+/// This process's own mailbox, open (-1: not yet), and the pid it is of.
+static OWN: AtomicI32 = AtomicI32::new(-1);
+static OWN_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Learn where the mailboxes are. Called as the process starts, before any
 /// handler may need it.
@@ -38,6 +46,30 @@ pub fn init() {
         && let Some(d) = crate::procreg::records_dir()
     {
         let _ = DIR.set(d);
+    }
+    open_own();
+}
+
+/// Open this process's own mailbox, if it is not open yet for this pid (a
+/// fork child has its parent's open): where its handlers read notes.
+pub fn open_own() {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    if OWN_PID.load(Ordering::SeqCst) == me {
+        return;
+    }
+    let mut buf = [0u8; 512];
+    let Some(path) = mailbox(me, &mut buf) else { return };
+    // SAFETY: a NUL-terminated path; the descriptor is moved out of the
+    // guest's range and kept for the process's life.
+    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
+    let Ok(fd) = crate::fdtable::reserve(fd) else { return };
+    let old = OWN.swap(fd, Ordering::SeqCst);
+    OWN_PID.store(me, Ordering::SeqCst);
+    if old >= 0 {
+        // The parent's, inherited.
+        // SAFETY: fwe's own descriptor, no longer used.
+        unsafe { libc::close(old) };
     }
 }
 
@@ -83,6 +115,29 @@ fn offset(sig: libc::c_int) -> Option<libc::off_t> {
     (1..SIGNALS as libc::c_int).contains(&sig).then(|| sig as libc::off_t * SLOT as libc::off_t)
 }
 
+/// The signal [`note`] was for could not be sent: take the note back, if
+/// it is still this process's.
+pub fn unnote(target: i32, sig: libc::c_int) {
+    let Some(off) = offset(sig) else { return };
+    let mut buf = [0u8; 512];
+    let Some(path) = mailbox(target, &mut buf) else { return };
+    let mut slot = [0u8; SLOT];
+    // SAFETY: a NUL-terminated path; buffers of `SLOT` bytes.
+    unsafe {
+        let fd = libc::open(path, libc::O_RDWR | libc::O_CLOEXEC);
+        if fd < 0 {
+            return;
+        }
+        let me = libc::getpid();
+        if libc::pread(fd, slot.as_mut_ptr().cast(), SLOT, off) == SLOT as isize
+            && i32::from_ne_bytes(slot[0..4].try_into().unwrap()) == me
+        {
+            libc::pwrite(fd, [0u8; SLOT].as_ptr().cast(), SLOT, off);
+        }
+        libc::close(fd);
+    }
+}
+
 /// This process is about to send host signal `sig` to host process
 /// `target`: leave a note of itself there.
 pub fn note(target: i32, sig: libc::c_int) {
@@ -110,25 +165,23 @@ pub fn note(target: i32, sig: libc::c_int) {
 /// Async-signal-safe.
 fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(i32, u32, u64)> {
     let off = offset(sig)?;
-    let mut buf = [0u8; 512];
     // SAFETY: getpid cannot fail.
-    let path = mailbox(unsafe { libc::getpid() }, &mut buf)?;
+    if OWN_PID.load(Ordering::SeqCst) != unsafe { libc::getpid() } {
+        // Not open for this process yet (a fork child before it starts).
+        return None;
+    }
+    let fd = OWN.load(Ordering::SeqCst);
     let saved = crate::host::last_errno();
     let mut slot = [0u8; SLOT];
-    // SAFETY: a NUL-terminated path; a buffer of `SLOT` bytes.
+    // SAFETY: fwe's own descriptor of the mailbox; a buffer of `SLOT`
+    // bytes.
     let got = unsafe {
-        let fd = libc::open(path, libc::O_RDWR | libc::O_CLOEXEC);
-        if fd < 0 {
-            crate::host::set_errno(saved);
-            return None;
-        }
         let n = libc::pread(fd, slot.as_mut_ptr().cast(), SLOT, off);
         let pid = i32::from_ne_bytes(slot[0..4].try_into().unwrap());
         if n == SLOT as isize && pid != 0 && clear_if.is_none_or(|c| c == 0 || c == pid) {
             let zero = [0u8; SLOT];
             libc::pwrite(fd, zero.as_ptr().cast(), SLOT, off);
         }
-        libc::close(fd);
         n == SLOT as isize && pid != 0
     };
     crate::host::set_errno(saved);

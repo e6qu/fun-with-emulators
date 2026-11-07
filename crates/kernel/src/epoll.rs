@@ -353,7 +353,11 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
     let mut changes: Vec<libc::kevent> = Vec::with_capacity(2);
     let mut push = |filter: i16, want: bool, lowat: Option<isize>| {
         let flags = if op != EPOLL_CTL_DEL && want {
-            libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT | extra
+            // The hang-up-only filter fires again only on a change (the
+            // host caps the low-water mark at the receive buffer's size,
+            // so a full buffer would fire it while it stays full).
+            let edge = if lowat.is_some() { libc::EV_CLEAR } else { 0 };
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT | extra | edge
         } else {
             libc::EV_DELETE | libc::EV_RECEIPT
         };
@@ -564,15 +568,57 @@ fn is_socket(fd: i32) -> bool {
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK }
 }
 
+/// Whether socket `fd` is a Unix-domain one.
+#[cfg(not(target_os = "linux"))]
+fn is_unix(fd: i32) -> bool {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid out-parameter of
+    // the size given.
+    let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: as above.
+    let named =
+        unsafe { libc::getsockname(fd, (&mut sa as *mut libc::sockaddr_storage).cast(), &mut len) };
+    named == 0 && i32::from(sa.ss_family) == libc::AF_UNIX
+}
+
 /// Wait up to `ms` milliseconds (forever if negative) on kqueue `epfd` for
 /// at most `room` events: `(fd, epoll bits, data)`, one per descriptor
 /// (kqueue reports reading and writing separately; epoll as one event).
 /// A one-shot entry that reports is disarmed.
 #[cfg(not(target_os = "linux"))]
 fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, i64> {
+    let deadline =
+        (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    let mut wait = ms;
+    loop {
+        let (ready, seen) = kevent_once(epfd, room, wait)?;
+        if !ready.is_empty() || seen == 0 || ms == 0 {
+            return Ok(ready);
+        }
+        // All the host reported was what the guest did not ask for: wait
+        // on, for what is left of the time (Linux never returns no events
+        // before it is up).
+        if let Some(d) = deadline {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(ready);
+            }
+            wait = left.as_millis().clamp(1, i32::MAX as u128) as i32;
+        }
+    }
+}
+
+/// Ready descriptors: `(fd, epoll bits, data)`.
+#[cfg(not(target_os = "linux"))]
+type Ready = Vec<(i32, u32, u64)>;
+
+/// One `kevent` wait for [`kevent_wait`]: the events as the guest asked
+/// for them, and how many the host reported.
+#[cfg(not(target_os = "linux"))]
+fn kevent_once(epfd: i32, room: usize, ms: i32) -> Result<(Ready, usize), i64> {
     use fwe_abi::epoll::*;
     if room == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut out: Vec<libc::kevent> = vec![
         libc::kevent {
@@ -609,7 +655,11 @@ fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, 
             // is shut is readable (reads return 0) and says so; a pipe or
             // terminal whose writers have gone has hung up, readable only
             // while data is left.
-            libc::EVFILT_READ if eof && is_socket(fd) => bits |= EPOLLIN | EPOLLRDHUP,
+            // A Unix socket's peer has gone altogether (Linux shuts both
+            // ways of it), so it has hung up too.
+            libc::EVFILT_READ if eof && is_socket(fd) => {
+                bits |= EPOLLIN | EPOLLRDHUP | if is_unix(fd) { EPOLLHUP } else { 0 }
+            }
             libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { EPOLLIN } else { 0 },
             libc::EVFILT_READ => bits |= EPOLLIN,
             // A pipe whose readers have gone is an error to write to; a
@@ -656,7 +706,7 @@ fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, 
             disarm(epfd, fd);
         }
     }
-    Ok(ready)
+    Ok((ready, n as usize))
 }
 
 #[cfg(test)]

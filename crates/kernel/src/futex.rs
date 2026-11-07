@@ -114,22 +114,30 @@ pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, 
             if uaddr2 % 4 != 0 || (val as i32) < 0 || (timeout as i32) < 0 {
                 return err(errno::EINVAL);
             }
-            if op & futex::FUTEX_CMD_MASK == futex::FUTEX_CMP_REQUEUE {
-                match load(uaddr) {
-                    Ok(v) if v == val3 => {}
-                    Ok(_) => return err(errno::EAGAIN),
-                    Err(e) => return err(e),
-                }
-            }
+            let expect = (op & futex::FUTEX_CMD_MASK == futex::FUTEX_CMP_REQUEUE).then_some(val3);
             let moved = timeout as u32;
             if private {
-                requeue_private(uaddr, val, moved, uaddr2)
+                requeue_private(uaddr, val, moved, uaddr2, expect)
             } else {
+                if let Some(v3) = expect {
+                    match load(uaddr) {
+                        Ok(v) if v == v3 => {}
+                        Ok(_) => return err(errno::EAGAIN),
+                        Err(e) => return err(e),
+                    }
+                }
                 shared::requeue(uaddr, val, moved, uaddr2)
             }
         }
         _ => err(errno::ENOSYS),
     }
+}
+
+/// This process starts, or runs another program: no thread of it waits on
+/// a shared futex ([`shared`]).
+pub fn process_started() {
+    #[cfg(target_os = "macos")]
+    shared::process_started();
 }
 
 /// Wake up to `count` waiters on the word at `uaddr`, private or shared
@@ -161,7 +169,7 @@ mod shared {
     }
 
     pub fn requeue(uaddr: u64, wake: u32, requeue: u32, uaddr2: u64) -> i64 {
-        super::requeue_private(uaddr, wake, requeue, uaddr2)
+        super::requeue_private(uaddr, wake, requeue, uaddr2, None)
     }
 }
 
@@ -223,9 +231,17 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
         Err(e) => return err(e),
     }
     let me = Arc::new(Waiter { bits, woken: AtomicBool::new(false) });
-    queues.entry(uaddr).or_default().push_back(me.clone());
+    queues.entry(key(uaddr)).or_default().push_back(me.clone());
     loop {
         if me.woken.load(Ordering::SeqCst) {
+            return 0;
+        }
+        // The word changed under it: a wake it was not counted in may be
+        // on its way (a waiter may always wake spuriously, and its caller
+        // looks at the word again), so it leaves rather than risk missing
+        // one sent under another name for the word.
+        if load(uaddr) != Ok(val) {
+            leave(&mut queues, &me, 0);
             return 0;
         }
         // A condition variable is not interrupted by host signals, so wait in
@@ -289,6 +305,19 @@ fn take(queues: &mut Queues, uaddr: u64, count: u32, bits: u32) -> Vec<Arc<Waite
     out
 }
 
+/// The queue a private futex at `uaddr` is on: its guest address (a
+/// backend may give a call the address it translated, while fwe's own
+/// wakes, of a thread's `clear_child_tid` word, use the guest's).
+fn key(uaddr: u64) -> u64 {
+    crate::uaccess::guest_of(uaddr)
+}
+
+/// A fork child has none of its parent's other threads: their waits are
+/// not its own (a wake must not take them).
+pub fn forked_child() {
+    table().queues.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// Mark `woken` woken and let them see it.
 fn wake_all_of(table: &Table, woken: &[Arc<Waiter>]) {
     for w in woken {
@@ -309,7 +338,7 @@ pub(crate) fn wake_private(uaddr: u64, count: u32) -> i64 {
 pub(crate) fn wake_private_bits(uaddr: u64, count: u32, bits: u32) -> i64 {
     let table = table();
     let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
-    let woken = take(&mut queues, uaddr, count, bits);
+    let woken = take(&mut queues, key(uaddr), count, bits);
     wake_all_of(table, &woken);
     woken.len() as i64
 }
@@ -317,9 +346,25 @@ pub(crate) fn wake_private_bits(uaddr: u64, count: u32, bits: u32) -> i64 {
 /// `FUTEX_CMP_REQUEUE` of private futexes: wake up to `wake` waiters of
 /// `uaddr`, move up to `requeue` of the rest to `uaddr2`: the number woken
 /// and moved.
-pub(crate) fn requeue_private(uaddr: u64, wake: u32, requeue: u32, uaddr2: u64) -> i64 {
+pub(crate) fn requeue_private(
+    uaddr: u64,
+    wake: u32,
+    requeue: u32,
+    uaddr2: u64,
+    expect: Option<u32>,
+) -> i64 {
     let table = table();
     let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+    // `FUTEX_CMP_REQUEUE`'s comparison, under the lock a waiter queues
+    // under, as Linux makes it: no waiter comes or goes in between.
+    if let Some(v3) = expect {
+        match load(uaddr) {
+            Ok(v) if v == v3 => {}
+            Ok(_) => return err(errno::EAGAIN),
+            Err(e) => return err(e),
+        }
+    }
+    let (uaddr, uaddr2) = (key(uaddr), key(uaddr2));
     let woken = take(&mut queues, uaddr, wake, u32::MAX);
     wake_all_of(table, &woken);
     let moved = take(&mut queues, uaddr, requeue, u32::MAX);

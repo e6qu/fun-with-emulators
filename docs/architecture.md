@@ -309,7 +309,11 @@ descriptor that is not open; `dup2` onto one fails the same way, and the
 limit cannot be raised into the range. The soft limit holds as on Linux: a
 call that would make a descriptor numbered at or above it fails with
 `EMFILE` (the descriptor closed again, with what fwe keeps for it), `dup3`
-onto one with `EBADF` and `F_DUPFD` from one with `EINVAL`. `stat` results are translated into the arm64 Linux
+onto one with `EBADF` and `F_DUPFD` from one with `EINVAL`. A new
+descriptor is the lowest free number, as on Linux (a daemon that closes
+0 to 2 counts on the files it opens next taking them): the directory a
+path resolves to, which fwe holds while the call runs, is moved into the
+reserved range first. `stat` results are translated into the arm64 Linux
 layout (`statx` too); `getdents64` is built from `getdirentries` on macOS, re-reading from the
 directory position when the translated entries outgrow the guest's buffer.
 Creation modes have the umask applied by the kernel. An `O_CREAT` open
@@ -317,7 +321,13 @@ that macOS fails with `ENOENT` because another process is unlinking the
 name at that moment is retried, as Linux would have created the file. `fcntl` translates the
 descriptor and status flags, and record locks (`F_GETLK`, `F_SETLK`,
 `F_SETLKW`: the arm64 `struct flock` and its lock types differ from the
-host's); `flock` passes through. Both kinds of lock are the host's, so they
+host's); `flock` passes through. The owner `SIGIO` goes to (`F_SETOWN`,
+`F_SETOWN_EX`) is the host's; what Linux keeps on an open file and the
+host has no place for — an owner that is a thread, the signal `F_SETSIG`
+names, a lease, a pipe's capacity (`F_SETPIPE_SZ`) — is kept by fwe
+(`crates/kernel/src/fdstate.rs`), read back as set and checked as Linux
+checks it, without effect on the host (no lease is broken, and a pipe holds
+what the host's does). Both kinds of lock are the host's, so they
 hold between guest processes and against host ones. `ioctl` covers the
 terminal, pty and `FIO*` requests, and the network interface ones
 (`SIOCGIFFLAGS` and the like).
@@ -452,7 +462,8 @@ signal mask, pending signals and ignored dispositions survive it as Linux
 requires, and fwe passes on the root filesystem, the working directory, the
 guest's `argv[0]` and `--strace` (`--guest-path`, `--cwd`, `--argv0`), and
 what only the kernel layer holds — the virtual credentials, the
-`RLIMIT_NOFILE` and the umask — as one encoded `--exec-state`
+`RLIMIT_NOFILE`, the resource limits fwe keeps and the umask — as one
+encoded `--exec-state`
 (`Kernel::exec_state`); the new fwe picks the backend. The hypervisor
 backend's `execve` always works this way. As on Linux, the saved user and
 group IDs become the effective ones across an `execve`.
@@ -516,6 +527,20 @@ Linux encoding and the resource usage into Linux units (`ru_maxrss` in KiB);
 host's `waitid` has none). `getrusage` translates likewise. `getpid` is the
 main thread's tid; child pids are host pids, so `kill`, `setpgid` and `wait`
 on them act on the real processes.
+
+A process's nice value (`setpriority`, `getpriority`) is in its record
+(`crates/kernel/src/procreg.rs`), inherited by its children and shown in
+`/proc/<pid>/stat`, set with Linux's checks (another user's process, or a
+lower value than `RLIMIT_NICE` allows, takes `CAP_SYS_NICE`); the host's
+scheduling is untouched. The resource limits the host has no counterpart
+of, and `RLIMIT_MEMLOCK` (fwe wires no memory: `mlock` and its family
+check the range and the limit, as Linux does, and lock nothing on the
+host), are fwe's (`crates/kernel/src/rlimits.rs`), set as Linux sets them;
+the others are the host's. The interval timers are the host's, but one
+longer than the host takes (100,000,000 seconds) is given the host's
+longest and reads back as asked. A thread's or process's CPU-time clock
+(the clock ids `pthread_getcpuclockid` and `clock_getcpuclockid` make) is
+the host thread's or process's CPU time.
 
 ## Threads and concurrency
 
@@ -1007,6 +1032,11 @@ those items.
   has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid` reports no
   `rusage`; a process a signal ends writes no core file, and its status
   never has the core-dump bit.
+- **Resources:** the limits the host keeps (`RLIMIT_NPROC`, `RLIMIT_STACK`,
+  `RLIMIT_CPU` and the like) cannot be raised past the host's hard limit,
+  even by root, and the host acts on them as macOS does (it sends no
+  `SIGKILL` at the hard CPU limit); memory already locked is not counted
+  against `RLIMIT_MEMLOCK` or in `/proc/self/status`.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.
@@ -1027,7 +1057,11 @@ those items.
   through `/proc/self/fd` shares the original's offset. An `O_PATH`
   descriptor of a file fwe could open reads and writes as an ordinary one
   would (Linux refuses both with `EBADF`).
-- **Descriptors:** descriptors received with `SCM_RIGHTS` are not held to
+- **Descriptors:** what fwe keeps of an open file for `fcntl` (an owner
+  thread, `F_SETSIG`'s signal, a lease) is kept per descriptor, so a
+  duplicate's changes do not show in the original as they would on Linux;
+  `pwritev2` with `RWF_APPEND` sets `O_APPEND` on the open file for the
+  call, which another writer sharing it would see meanwhile. Descriptors received with `SCM_RIGHTS` are not held to
   the guest's `RLIMIT_NOFILE` (every other way of making one is); a reopened
   `/proc/self/fd` entry for a pipe or socket shares the original's file
   description rather than getting a new one.

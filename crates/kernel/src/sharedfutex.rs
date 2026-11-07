@@ -13,9 +13,16 @@
 //! with `UL_COMPARE_AND_WAIT_SHARED`). A wake claims the waiting slots of
 //! the key, oldest first, marking each woken and waking its word: so it
 //! knows exactly whom it woke, as Linux reports it, which the host's own
-//! address waits cannot say. A slot's state carries a generation, so a
-//! slot freed and taken again meanwhile is never claimed for the old
-//! waiter.
+//! address waits cannot say. A requeue moves a slot to another key.
+//!
+//! A slot's state carries a generation, which every change of what the
+//! slot stands for bumps (freeing it, moving it to another futex): a wake
+//! claims a slot only in the state it saw it in, so never one freed and
+//! taken again meanwhile, nor one moved off the futex it is waking. A slot
+//! is its owner's, a process known by pid and start time: one whose owner
+//! has gone (killed while it waited) is freed by the next process that
+//! looks, and a process frees what its pid holds as it starts or runs
+//! another program (`execve`), whose threads cannot be waiting.
 
 use fwe_abi::{err, errno};
 use std::sync::OnceLock;
@@ -40,7 +47,8 @@ unsafe extern "C" {
 #[repr(C)]
 struct Slot {
     /// Generation (above) and state (the low byte): [`FREE`], [`TAKEN`]
-    /// while it is filled in, [`WAITING`], [`WOKEN`].
+    /// while it is filled in, [`WAITING`], [`MOVING`] while a requeue
+    /// changes its key, [`WOKEN`].
     state: AtomicU32,
     /// The `FUTEX_WAIT_BITSET` bits it waits for (all, for `FUTEX_WAIT`).
     bits: AtomicU32,
@@ -48,6 +56,8 @@ struct Slot {
     owner: AtomicU32,
     /// When it came, from [`Header::tickets`]: the oldest is woken first.
     ticket: AtomicU32,
+    /// When the owner started ([`crate::procreg::start_time`]).
+    owner_start: AtomicU64,
     /// The futex's key.
     key: [AtomicU64; 2],
 }
@@ -56,6 +66,7 @@ const FREE: u32 = 0;
 const TAKEN: u32 = 1;
 const WAITING: u32 = 2;
 const WOKEN: u32 = 3;
+const MOVING: u32 = 4;
 
 /// The first slot's room: the counter tickets are drawn from.
 #[repr(C)]
@@ -68,12 +79,17 @@ struct Header {
 /// fwe runs).
 const SLOTS: usize = 16384;
 
+fn st(state: u32) -> u32 {
+    state & 0xff
+}
+
 fn with_state(state: u32, st: u32) -> u32 {
     (state & !0xff) | st
 }
 
-fn next_generation(state: u32) -> u32 {
-    state.wrapping_add(0x100) & !0xff
+/// `state` as what the slot stands for changes: the next generation.
+fn next(state: u32, st: u32) -> u32 {
+    (state.wrapping_add(0x100) & !0xff) | st
 }
 
 /// The table, mapped once per process.
@@ -126,13 +142,13 @@ fn host_of(uaddr: u64) -> u64 {
 
 /// The key of the futex word at host address `host`, as Linux tells
 /// futexes apart: shared memory by what it is, private memory by process
-/// and address.
+/// and address. The word must have been read first (a shared page the
+/// process has not touched has no memory object yet, so no identity).
 fn key_of(host: u64) -> Option<[u64; 2]> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() } as u64;
     Some(match crate::mm::region::sharing(host)? {
+        Some((0, _)) => return None,
         Some((object, offset)) => [1 << 63 | object as u64, offset],
-        None => [me, host],
+        None => [me() as u64, host],
     })
 }
 
@@ -141,42 +157,95 @@ fn me() -> u32 {
     unsafe { libc::getpid() as u32 }
 }
 
-/// Take a free slot for this waiter, filled in and waiting: its index and
-/// state.
-fn take_slot(t: &[Slot], key: [u64; 2], bits: u32) -> Option<(usize, u32)> {
-    for (i, s) in t.iter().enumerate() {
+/// This process, as slots name their owner: (pid, start time).
+fn me_proc() -> (u32, u64) {
+    static ME: std::sync::Mutex<(u32, u64)> = std::sync::Mutex::new((0, 0));
+    let pid = me();
+    let mut m = ME.lock().unwrap_or_else(|e| e.into_inner());
+    if m.0 != pid {
+        *m = (pid, crate::procreg::start_time(pid as i32).unwrap_or(0));
+    }
+    *m
+}
+
+/// Whether slot `s`'s owner still runs.
+fn owner_alive(s: &Slot) -> bool {
+    let (pid, start) = (s.owner.load(SeqCst), s.owner_start.load(SeqCst));
+    (pid, start) == me_proc() || crate::procreg::alive((pid as i32, start))
+}
+
+/// Free slot `s`, seen in state `seen`, if it is still so.
+fn free(s: &Slot, seen: u32) -> bool {
+    s.state.compare_exchange(seen, next(seen, FREE), SeqCst, SeqCst).is_ok()
+}
+
+/// This process starts (or runs another program): what its pid holds in
+/// the table is no waiter's, whether left by a process its pid had
+/// before or by its own threads before the `execve`.
+pub fn process_started() {
+    let Some(t) = table() else { return };
+    let pid = me();
+    for s in t {
         let cur = s.state.load(SeqCst);
-        if cur & 0xff != FREE
-            || s.state.compare_exchange(cur, with_state(cur, TAKEN), SeqCst, SeqCst).is_err()
-        {
-            continue;
+        if st(cur) != FREE && s.owner.load(SeqCst) == pid {
+            free(s, cur);
         }
-        s.key[0].store(key[0], SeqCst);
-        s.key[1].store(key[1], SeqCst);
-        s.bits.store(bits, SeqCst);
-        s.owner.store(me(), SeqCst);
-        s.ticket.store(header()?.tickets.fetch_add(1, SeqCst), SeqCst);
-        let waiting = with_state(cur, WAITING);
-        s.state.store(waiting, SeqCst);
-        return Some((i, waiting));
+    }
+}
+
+/// Take a free slot for this waiter, filled in and waiting: its index and
+/// state. With none free, those of processes that have gone are freed.
+fn take_slot(t: &[Slot], key: [u64; 2], bits: u32) -> Option<(usize, u32)> {
+    for round in 0..2 {
+        for (i, s) in t.iter().enumerate() {
+            let cur = s.state.load(SeqCst);
+            if st(cur) != FREE {
+                if round == 1 && !owner_alive(s) {
+                    free(s, cur);
+                }
+                continue;
+            }
+            if s.state.compare_exchange(cur, with_state(cur, TAKEN), SeqCst, SeqCst).is_err() {
+                continue;
+            }
+            let (pid, start) = me_proc();
+            s.key[0].store(key[0], SeqCst);
+            s.key[1].store(key[1], SeqCst);
+            s.bits.store(bits, SeqCst);
+            s.owner.store(pid, SeqCst);
+            s.owner_start.store(start, SeqCst);
+            s.ticket.store(header()?.tickets.fetch_add(1, SeqCst), SeqCst);
+            let waiting = with_state(cur, WAITING);
+            s.state.store(waiting, SeqCst);
+            return Some((i, waiting));
+        }
     }
     None
 }
 
-/// Give back slot `s`, which this waiter holds in state `held`: `Ok` if it
-/// was still waiting, `Err` if a wake claimed it first (the waiter was
-/// woken). A requeue moving it meanwhile is let finish.
-fn give_back(s: &Slot, held: u32) -> Result<(), ()> {
-    let free = with_state(next_generation(held), FREE);
+/// Give back this waiter's slot `s`: `Ok` if it was still waiting, `Err`
+/// if a wake claimed it first (the waiter was woken). A requeue moving it
+/// meanwhile is let finish.
+fn give_back(s: &Slot) -> Result<(), ()> {
+    let mut spins = 0u32;
     loop {
-        match s.state.compare_exchange(held, free, SeqCst, SeqCst) {
-            Ok(_) => return Ok(()),
-            Err(cur) if cur == with_state(held, WOKEN) => {
-                s.state.store(free, SeqCst);
+        let cur = s.state.load(SeqCst);
+        match st(cur) {
+            WAITING if free(s, cur) => return Ok(()),
+            WOKEN => {
+                s.state.store(next(cur, FREE), SeqCst);
                 return Err(());
             }
-            // Being moved to another futex ([`requeue`]): back shortly.
-            Err(_) => std::hint::spin_loop(),
+            _ => {
+                // Being moved to another futex ([`requeue`]): back at once,
+                // unless its mover was stopped there.
+                spins += 1;
+                if spins < 128 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
         }
     }
 }
@@ -185,19 +254,25 @@ fn give_back(s: &Slot, held: u32) -> Result<(), ()> {
 /// for `bits` claims this waiter, the `deadline` passes or a signal for
 /// the guest comes (`EINTR`), checked in slices as the private wait does.
 pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
+    // Read first, as Linux finds the word's page before keying it.
+    match crate::futex::load(uaddr) {
+        Ok(v) if v == val => {}
+        Ok(_) => return err(errno::EAGAIN),
+        Err(e) => return err(e),
+    }
     let (Some(t), Some(key)) = (table(), key_of(host_of(uaddr))) else {
-        return super_wait(uaddr, val, deadline);
+        return crate::futex::wait_private_bits(uaddr, val, deadline, bits);
     };
-    let Some((i, held)) = take_slot(t, key, bits) else {
+    let Some((i, _)) = take_slot(t, key, bits) else {
         return err(errno::ENOMEM);
     };
     let slot = &t[i];
-    // Waiting before the word is read: a waker that changed it first is
-    // seen here, and one that changes it after finds this slot.
+    // Waiting before the word is read again: a waker that changed it first
+    // is seen here, and one that changes it after finds this slot.
     match crate::futex::load(uaddr) {
         Ok(v) if v == val => {}
         other => {
-            return match give_back(slot, held) {
+            return match give_back(slot) {
                 Ok(()) => err(other.err().unwrap_or(errno::EAGAIN)),
                 // Claimed meanwhile: woken, and counted so.
                 Err(()) => 0,
@@ -206,37 +281,36 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
     }
     let word = slot.state.as_ptr().cast::<libc::c_void>();
     loop {
-        if slot.state.load(SeqCst) == with_state(held, WOKEN) {
-            let _ = give_back(slot, held);
+        let cur = slot.state.load(SeqCst);
+        if st(cur) == WOKEN || crate::futex::load(uaddr) != Ok(val) {
+            // Woken, or the word changed under it (a spurious wakeup, which
+            // a futex's caller allows for, rather than risk missing a wake).
+            let _ = give_back(slot);
             return 0;
         }
+        let gone = |e| match give_back(slot) {
+            Ok(()) => err(e),
+            Err(()) => 0,
+        };
         if crate::thread::deliverable() != 0 {
-            return match give_back(slot, held) {
-                Ok(()) => err(errno::EINTR),
-                Err(()) => 0,
-            };
+            return gone(errno::EINTR);
         }
         if crate::thread::pending() & crate::signalfd::watched() != 0 {
             crate::signal::drain_to_signalfd();
         }
         let now = Instant::now();
         let slice = match deadline {
-            Some(d) if now >= d => {
-                return match give_back(slot, held) {
-                    Ok(()) => err(errno::ETIMEDOUT),
-                    Err(()) => 0,
-                };
-            }
+            Some(d) if now >= d => return gone(errno::ETIMEDOUT),
             Some(d) => (d - now).min(crate::futex::SIGNAL_CHECK),
             None => crate::futex::SIGNAL_CHECK,
         };
         // SAFETY: the slot's word, in fwe's shared table; the host sleeps
-        // while it still reads `held`.
+        // while it still reads `cur`.
         unsafe {
             __ulock_wait2(
                 UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
                 word,
-                held as u64,
+                cur as u64,
                 slice.as_nanos().max(1) as u64,
                 0,
             )
@@ -244,29 +318,14 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
     }
 }
 
-/// Without the table, the process's own wait.
-fn super_wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
-    crate::futex::wait_private(uaddr, val, deadline)
-}
-
-/// Whether host process `pid` lives (a waiter killed while it waited
-/// leaves its slot behind).
-fn alive(pid: u32) -> bool {
-    // SAFETY: plain host call; signal 0 only checks.
-    pid == me()
-        || unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
-        || crate::host::last_errno() == libc::EPERM
-}
-
 /// Wake up to `count` waiters of the futex at guest `uaddr` waiting for
 /// any of `bits`, oldest first: the number woken.
 pub fn wake(uaddr: u64, count: u32, bits: u32) -> i64 {
     let (Some(t), Some(key)) = (table(), key_of(host_of(uaddr))) else {
-        return crate::futex::wake_private(uaddr, count);
+        return crate::futex::wake_private_bits(uaddr, count, bits);
     };
     claim(t, key, bits, count, |s, state| {
-        let woken = with_state(state, WOKEN);
-        if s.state.compare_exchange(state, woken, SeqCst, SeqCst).is_err() {
+        if s.state.compare_exchange(state, with_state(state, WOKEN), SeqCst, SeqCst).is_err() {
             return false;
         }
         // SAFETY: wakes whoever sleeps on the slot's word; reads nothing.
@@ -289,15 +348,20 @@ pub fn requeue(uaddr: u64, wake_n: u32, requeue_n: u32, uaddr2: u64) -> i64 {
         return woken;
     };
     // A waiter sleeps on its slot, not the word: moving it is changing its
-    // key, while it is held so no wake claims it half moved.
+    // key, while it is held so no wake claims it half moved, and in a new
+    // generation, so a wake that saw it on `from` does not claim it after.
     let moved = claim(t, from, u32::MAX, requeue_n, |s, state| {
-        let taken = with_state(state, TAKEN);
-        if s.state.compare_exchange(state, taken, SeqCst, SeqCst).is_err() {
+        if s.state.compare_exchange(state, with_state(state, MOVING), SeqCst, SeqCst).is_err() {
             return false;
         }
         s.key[0].store(to[0], SeqCst);
         s.key[1].store(to[1], SeqCst);
-        s.state.store(state, SeqCst);
+        s.state.store(next(state, WAITING), SeqCst);
+        // SAFETY: as in [`wake`]: the waiter goes back to sleep on the new
+        // state.
+        unsafe {
+            __ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, s.state.as_ptr().cast(), 0)
+        };
         true
     });
     woken + moved
@@ -319,16 +383,15 @@ fn claim(
     let mut waiting: Vec<(u32, usize, u32)> = Vec::new();
     for (i, s) in t.iter().enumerate() {
         let state = s.state.load(SeqCst);
-        if state & 0xff != WAITING
+        if st(state) != WAITING
             || s.key[0].load(SeqCst) != key[0]
             || s.key[1].load(SeqCst) != key[1]
             || s.bits.load(SeqCst) & bits == 0
         {
             continue;
         }
-        if !alive(s.owner.load(SeqCst)) {
-            let free = with_state(next_generation(state), FREE);
-            let _ = s.state.compare_exchange(state, free, SeqCst, SeqCst);
+        if !owner_alive(s) {
+            free(s, state);
             continue;
         }
         waiting.push((s.ticket.load(SeqCst), i, state));

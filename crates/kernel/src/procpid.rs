@@ -109,13 +109,7 @@ fn threads_state(pid: i32) -> u8 {
     const PROC_PIDLISTTHREADS: i32 = 6;
     // SAFETY: getpid cannot fail.
     if pid == unsafe { libc::getpid() } {
-        let main = if crate::thread::tid() == crate::thread::tgid() {
-            // SAFETY: plain host call.
-            Some(unsafe { libc::pthread_self() })
-        } else {
-            crate::thread::host_thread(crate::thread::tgid()).filter(|&t| t != 0 as libc::pthread_t)
-        };
-        return match main.and_then(crate::host::thread_state) {
+        return match crate::thread::host_state(crate::thread::tgid()) {
             Some((_, _, true)) | None => b'R',
             Some((_, _, false)) => b'S',
         };

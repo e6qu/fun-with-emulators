@@ -582,6 +582,9 @@ impl<P: Platform> Kernel<P> {
                 crate::signote::note(target as i32, h);
             }
             let r = host::kill(target as libc::pid_t, h);
+            if r != 0 && target > 0 && !to_self {
+                crate::signote::unnote(target as i32, h);
+            }
             if r == 0
                 && let Some(ns) = led
             {
@@ -629,7 +632,11 @@ impl<P: Platform> Kernel<P> {
                 (0, _) => 0,
                 (_, Some(h)) => {
                     crate::signote::note(host, h);
-                    host::kill(host, h)
+                    let r = host::kill(host, h);
+                    if r != 0 {
+                        crate::signote::unnote(host, h);
+                    }
+                    r
                 }
                 // Another process cannot be sent a signal the host does not
                 // have.

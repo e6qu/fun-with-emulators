@@ -2033,14 +2033,8 @@ fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
     let who = !(id >> 3);
     let me = thread::tgid();
     let sample = if thread {
-        if who == 0 || who == thread::tid() {
-            // SAFETY: plain host call.
-            host::thread_cpu_ns(unsafe { libc::pthread_self() })
-        } else {
-            thread::host_thread(who)
-                .filter(|&t| t != 0 as libc::pthread_t)
-                .and_then(host::thread_cpu_ns)
-        }
+        let tid = if who == 0 { thread::tid() } else { who };
+        thread::host_state(tid).map(|(user, system, _)| (user, system))
     } else if who == 0 || who == me {
         // SAFETY: getpid cannot fail.
         crate::procpid::cpu_ns(unsafe { libc::getpid() })

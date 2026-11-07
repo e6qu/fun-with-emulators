@@ -2114,13 +2114,7 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
         b"" => Entry::Dir,
         b"/stat" => {
             let mut h = crate::procpid::host_info(host).unwrap_or_default();
-            let thread = if tid == crate::thread::tid() {
-                // SAFETY: plain host call.
-                Some(unsafe { libc::pthread_self() })
-            } else {
-                crate::thread::host_thread(tid).filter(|&t| t != 0 as libc::pthread_t)
-            };
-            if let Some((user, system, running)) = thread.and_then(crate::host::thread_state) {
+            if let Some((user, system, running)) = crate::thread::host_state(tid) {
                 h.state = if running { b'R' } else { b'S' };
                 (h.utime, h.stime) =
                     (crate::procpid::ns_to_ticks(user), crate::procpid::ns_to_ticks(system));

@@ -246,6 +246,10 @@ impl<P: Platform> Kernel<P> {
     pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
         // Before any handler may need to read a note of a sender.
         signote::init();
+        // Before any thread could wait. (Not in the unit tests, which are
+        // one process making many kernels while others wait.)
+        #[cfg(not(test))]
+        futex::process_started();
         Kernel {
             platform,
             tracer,
@@ -412,6 +416,8 @@ impl<P: Platform> Kernel<P> {
     /// Ignored signals stay ignored, and the blocked mask and pending signals
     /// are kept, as Linux does.
     pub fn exec_reset(&mut self) {
+        // The other threads are gone, and with them their waits.
+        futex::process_started();
         // Limits another process left for this one (runc sets its
         // container's this way before it runs the program).
         self.take_pending_limits();

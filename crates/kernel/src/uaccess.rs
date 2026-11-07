@@ -317,6 +317,14 @@ pub fn write_host(dst: u64, src: &[u8]) -> Result<()> {
     check(unsafe { imp::copy(dst as *mut u8, src.as_ptr(), src.len()) })
 }
 
+/// Copy `dst.len()` bytes from host address `src`, a guest buffer already
+/// translated ([`host_buffer`], [`host_iovecs`]): `EFAULT`, not a crash,
+/// where the guest's memory is not there (gone since it was checked).
+pub fn read_host(src: u64, dst: &mut [u8]) -> Result<()> {
+    // SAFETY: `dst` is fwe's own buffer; a fault on `src` is recovered.
+    check(unsafe { imp::copy(dst.as_mut_ptr(), src as *const u8, dst.len()) })
+}
+
 /// Copy `dst.len()` bytes from guest address `addr`.
 pub fn read_into(addr: u64, dst: &mut [u8]) -> Result<()> {
     // SAFETY: `dst` is fwe's own buffer of that length.

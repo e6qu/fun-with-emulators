@@ -60,6 +60,8 @@ pub fn init_main(pid: i32) {
     TID.with(|t| t.set(pid));
     PROCESS.clear();
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crate::futex::forked_child();
+    crate::signote::open_own();
     register_current();
 }
 
@@ -379,6 +381,23 @@ pub fn wake_others(sig: libc::c_int) {
 pub fn host_thread(tid: i32) -> Option<libc::pthread_t> {
     let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     threads.iter().find(|r| r.tid == tid).map(|r| r.host)
+}
+
+/// Guest thread `tid`'s CPU time (user, system, in nanoseconds) and whether
+/// it runs, as the host reports its thread: asked while the thread is
+/// registered (one that ends unregisters first, so its host thread is
+/// never asked about once it is gone). The calling thread's own too.
+pub fn host_state(tid: i32) -> Option<(u64, u64, bool)> {
+    if tid == self::tid() {
+        // SAFETY: plain host call.
+        return crate::host::thread_state(unsafe { libc::pthread_self() });
+    }
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let host = threads.iter().find(|r| r.tid == tid).map(|r| r.host)?;
+    if host == 0 as libc::pthread_t {
+        return None;
+    }
+    crate::host::thread_state(host)
 }
 
 /// Signals pending against the calling thread or the process.

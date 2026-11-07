@@ -48,10 +48,11 @@ pub fn write(fd: i32, src: Source, len: u64) -> Option<i64> {
             // An empty buffer may be at any address, null included.
             for v in iov.iter().filter(|v| v.iov_len > 0) {
                 let take = v.iov_len.min(MOST - d.len());
-                // SAFETY: the buffers are the guest's, checked by the caller.
-                d.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(v.iov_base.cast::<u8>(), take)
-                });
+                let at = d.len();
+                d.resize(at + take, 0);
+                if let Err(e) = uaccess::read_host(v.iov_base as u64, &mut d[at..]) {
+                    return Some(err(e));
+                }
             }
             d
         }
