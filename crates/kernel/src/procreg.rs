@@ -443,8 +443,9 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 
 /// A child `child` of this process starts in this process's cgroup, in the
 /// namespaces `ns`, with the line of ancestors and bound of `line`
-/// ([`child_line`]).
-pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
+/// ([`child_line`]) and this process's mappings `maps` (see
+/// [`crate::maps::forked`]).
+pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), maps: Vec<u8>) {
     let mine = read(me());
     let oom = mine.as_ref().map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min));
     let ids = mine.as_ref().map_or([0; 8], |r| r.ids);
@@ -464,6 +465,11 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
         (r.oom_score_adj, r.oom_score_adj_min) = oom;
         r.ids = ids;
         r.nice = nice;
+        // Whichever of the two writes first, the child's mappings are there
+        // from the start; the child's own stand.
+        if r.maps.is_empty() {
+            r.maps = maps;
+        }
     });
 }
 

@@ -202,7 +202,7 @@ impl<P: Platform> Kernel<P> {
         }
         if child > 0 {
             // It starts in this process's cgroup, in its namespaces.
-            crate::procreg::forked(child, t.dirs.clone(), &t.line);
+            crate::procreg::forked(child, t.dirs.clone(), &t.line, crate::maps::snapshot());
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {

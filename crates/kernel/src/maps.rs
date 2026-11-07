@@ -485,7 +485,7 @@ static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
 const HEADER: usize = 16;
 
 /// This process's mappings encoded as [`publish`] publishes them.
-fn snapshot() -> Vec<u8> {
+pub fn snapshot() -> Vec<u8> {
     // The host's view first: its lock comes before the record's.
     let tracked = crate::mm::tracked();
     let translations = crate::uaccess::translations();
