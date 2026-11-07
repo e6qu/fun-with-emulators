@@ -18,7 +18,6 @@ import argparse
 import concurrent.futures
 import os
 import re
-import resource
 import shlex
 import shutil
 import signal
@@ -73,11 +72,45 @@ def classify(status):
     return f"exit-{status}"
 
 
-def limit_processes():
-    os.setsid()
-    soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
-    cap = PROCESS_LIMIT if hard == resource.RLIM_INFINITY else min(hard, PROCESS_LIMIT)
-    resource.setrlimit(resource.RLIMIT_NPROC, (min(soft, cap) if soft != resource.RLIM_INFINITY else cap, cap))
+def session(sid):
+    """The processes of session `sid` (macOS's `pkill` and `pgrep` cannot
+    select by session)."""
+    ps = subprocess.run(["ps", "-axo", "pid="], capture_output=True, text=True).stdout.split()
+    out = []
+    for pid in map(int, ps):
+        try:
+            if os.getsid(pid) == sid:
+                out.append(pid)
+        except OSError:
+            pass
+    return out
+
+
+def end_session(sid):
+    """Kill every process of session `sid`."""
+    for pid in session(sid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def stacks(sid, work):
+    """The stacks of the processes of session `sid`, as macOS's `sample`
+    takes them: fwe's own frames, a few lines a thread."""
+    out = []
+    for pid in map(str, session(sid)[:8]):
+        path = os.path.join(work, f"sample-{pid}.txt")
+        subprocess.run(["sample", pid, "1", "-file", path], capture_output=True, timeout=60)
+        try:
+            with open(path) as f:
+                lines = [l.rstrip() for l in f if "fwe_" in l or "Thread_" in l or "libsystem_kernel" in l]
+            os.remove(path)
+        except OSError:
+            continue
+        out.append(f"--- stacks of {pid}:")
+        out.extend(l[:220] for l in lines[:60])
+    return "\n" + "\n".join(out) + "\n"
 
 
 def run_one(fwe, root, work, name, argv):
@@ -102,39 +135,56 @@ def run_one(fwe, root, work, name, argv):
         "LANG": "C",
     }
     start = time.monotonic()
-    proc = subprocess.Popen(
-        [fwe, "--root", root, host_prog, *argv[1:]],
-        cwd=tmp,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=limit_processes,
-    )
-    try:
-        out, _ = proc.communicate(timeout=HARD_LIMIT)
-        outcome = classify(proc.returncode)
-    except subprocess.TimeoutExpired:
+    # Output to a file, not a pipe: a process the test leaves behind, in a
+    # process group of its own, would hold a pipe open and the read would
+    # never end. The process limit is set by a shell for the test (the
+    # runner's threads make a `preexec_fn` unsafe), in a session of its own
+    # so everything it starts can be found and ended.
+    with tempfile.TemporaryFile(dir=work) as log:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null; exec "$@"', "sh",
+             fwe, "--root", root, host_prog, *argv[1:]],
+            cwd=tmp,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            proc.wait(timeout=HARD_LIMIT)
+            outcome = classify(proc.returncode)
+        except subprocess.TimeoutExpired:
+            outcome = "timeout"
+            # Where each of its processes is stuck, for the record (a test
+            # that hangs is a bug of fwe's to find).
+            log.write(stacks(proc.pid, work).encode())
+        # It, and whatever it left running in its session (in process
+        # groups of its own, some of it).
+        end_session(proc.pid)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
             pass
-        out, _ = proc.communicate()
-        outcome = "timeout"
-    # Whatever it left running in its session goes too (in process
-    # groups of its own, some of it).
-    subprocess.run(["pkill", "-KILL", "-s", str(proc.pid)], stderr=subprocess.DEVNULL)
+        log.seek(0)
+        out = log.read()
     shutil.rmtree(tmp, ignore_errors=True)
-    tail = "\n".join(out.decode(errors="replace").splitlines()[-40:])
+    keep = 400 if outcome == "timeout" else 40
+    tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
     return name, outcome, time.monotonic() - start, tail
 
 
 def run_guarded(fwe, root, work, name, argv):
-    """`run_one`, a failure of the runner itself reported as the outcome."""
-    try:
-        return run_one(fwe, root, work, name, argv)
-    except Exception as e:  # noqa: BLE001 - reported, and fails the run
-        return name, "runner-error", 0.0, repr(e)
+    """`run_one`, a failure of the runner itself (starting a test while
+    another has the host short of processes, say) retried once, then
+    reported as the outcome."""
+    for attempt in range(2):
+        try:
+            return run_one(fwe, root, work, name, argv)
+        except Exception as e:  # noqa: BLE001 - reported, and fails the run
+            if attempt == 1:
+                return name, "runner-error", 0.0, repr(e)
+            time.sleep(1)
 
 
 def main():
