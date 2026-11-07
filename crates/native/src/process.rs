@@ -442,15 +442,14 @@ fn reaper_wait(
     adopted: impl Fn(&fwe_kernel::procreg::Ended) -> i64,
     peek: bool,
 ) -> i64 {
-    loop {
-        // Registered, with signals held, before looking: a change after
-        // the look wakes the sleep below.
-        let waiter = reaper::Waiter::new();
+    // One look at the own children, then the adopted ones: what to return,
+    // if anything.
+    let look = || {
         let r = own();
         if r != 0 && r != err(errno::ECHILD) {
-            return r;
+            return Some(r);
         }
-        let found = reaper::busy(|| {
+        reaper::busy(|| {
             // The living ones before the ended: a process records how it
             // ended before it forgets its record, so one ending meanwhile
             // is seen in one or the other.
@@ -464,15 +463,23 @@ fn reaper_wait(
                 return Some(adopted(&e));
             }
             (r == err(errno::ECHILD) && !live).then_some(r)
-        });
-        if let Some(r) = found {
+        })
+    };
+    loop {
+        // Registered, with signals held, before looking: a change after
+        // the look wakes the sleep below.
+        let waiter = reaper::Waiter::new();
+        if let Some(r) = look() {
             return r;
         }
         if nohang {
             return 0;
         }
         if fwe_kernel::thread::deliverable() != 0 {
-            return err(errno::EINTR);
+            // A child ready is reported though a signal is pending, as
+            // Linux's `wait` does: the reaper raises an adopted one's
+            // SIGCHLD as it records its end, which may be after the look.
+            return look().unwrap_or(err(errno::EINTR));
         }
         waiter.sleep();
     }

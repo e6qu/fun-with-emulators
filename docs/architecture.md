@@ -879,10 +879,11 @@ whoever finds it gone records that for it. Its parent's `wait` removes the
 record, or once the parent has gone, the adopter's `wait` takes it. A
 reaper runs a watcher thread that follows its descendants on the host
 (`kqueue` process events) and, when an adopted one ends, stops or
-continues (the signals it is sent, and then its state), sends the reaper
-a `SIGCHLD` through the host (so its disposition, mask and `SA_NOCLDSTOP`
-act on it as on a child's; the handler takes the sender and status from
-the watcher) and wakes its threads waiting in `wait`, which look at its
+continues (the signals it is sent, and then its state), raises a
+`SIGCHLD` in the reaper (pending for the guest with a child's `siginfo`,
+its disposition, mask and `SA_NOCLDSTOP` acting on it as on a child's; not
+through the host, where a `SIGCHLD` held or being delivered would absorb
+it) and wakes its threads waiting in `wait`, which look at its
 own children and then at its adopted ones. As on Linux, an orphan keeps
 the adopter it had when its parent ended: a process that becomes a
 subreaper notes the orphans below it that have one already, and one that
