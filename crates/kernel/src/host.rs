@@ -215,7 +215,6 @@ pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
         resource::RLIMIT_CORE => libc::RLIMIT_CORE as libc::c_int,
         resource::RLIMIT_NPROC => libc::RLIMIT_NPROC as libc::c_int,
         resource::RLIMIT_NOFILE => libc::RLIMIT_NOFILE as libc::c_int,
-        resource::RLIMIT_MEMLOCK => libc::RLIMIT_MEMLOCK as libc::c_int,
         resource::RLIMIT_AS => libc::RLIMIT_AS as libc::c_int,
         _ => return None,
     })

@@ -138,6 +138,11 @@ pub mod hwcap2 {
 
 /// Memory protection and mapping flags (`asm-generic/mman*.h`).
 pub mod mman {
+    /// `mlock2` and `mlockall` flags.
+    pub const MLOCK_ONFAULT: u64 = 1;
+    pub const MCL_CURRENT: u64 = 1;
+    pub const MCL_FUTURE: u64 = 2;
+    pub const MCL_ONFAULT: u64 = 4;
     pub const PROT_NONE: u64 = 0;
     pub const PROT_READ: u64 = 1;
     pub const PROT_WRITE: u64 = 2;

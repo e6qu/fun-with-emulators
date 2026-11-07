@@ -477,6 +477,11 @@ impl<P: Platform> Kernel<P> {
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::MLOCK => self.sys_mlock(a[0], a[1], 0, true),
+            nr::MLOCK2 => self.sys_mlock(a[0], a[1], a[2], true),
+            nr::MUNLOCK => self.sys_mlock(a[0], a[1], 0, false),
+            nr::MLOCKALL => self.sys_mlockall(Some(a[0])),
+            nr::MUNLOCKALL => self.sys_mlockall(None),
             nr::GETPRIORITY => self.sys_getpriority(a[0], a[1] as i32),
             nr::SETPRIORITY => self.sys_setpriority(a[0], a[1] as i32, a[2] as i32),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
@@ -1486,8 +1491,17 @@ impl<P: Platform> Kernel<P> {
             }
             return 0;
         }
+        if crate::rlimits::kept(res) {
+            if new != 0 {
+                let n: Rlimit = guest!(uaccess::read(new));
+                let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
+                if let Err(e) = crate::rlimits::set(res, n.rlim_cur, n.rlim_max, privileged) {
+                    return err(e);
+                }
+            }
+            return 0;
+        }
         let Some(hres) = host::rlimit_to_host(res) else {
-            // Limits the host does not have: Linux defaults, kept.
             return 0;
         };
         if new != 0 {
@@ -1577,6 +1591,9 @@ impl<P: Platform> Kernel<P> {
             let value = Rlimit { rlim_cur: soft, rlim_max: hard };
             if u64::from(res) == resource::RLIMIT_NOFILE {
                 let _ = crate::fdtable::set_limit(soft, hard);
+            } else if crate::rlimits::kept(u64::from(res)) {
+                // The setter was allowed to (`prlimit_other`).
+                let _ = crate::rlimits::set(u64::from(res), soft, hard, true);
             } else if let Some(hres) = host::rlimit_to_host(u64::from(res)) {
                 let r = libc::rlimit {
                     rlim_cur: host::rlim_to_host(value.rlim_cur),
@@ -2183,19 +2200,21 @@ mod itimer {
     }
 }
 
+/// The caller's soft limit of resource `res`.
+pub(crate) fn own_limit_of(res: u64) -> u64 {
+    own_limit(res).map_or(resource::RLIM_INFINITY, |(soft, _)| soft)
+}
+
 fn own_limit(res: u64) -> Result<(u64, u64), i32> {
     if res == resource::RLIMIT_NOFILE {
         // Virtual: the host's limit also covers fwe's own descriptors.
         return Ok(crate::fdtable::limit());
     }
+    if crate::rlimits::kept(res) {
+        return Ok(crate::rlimits::get(res));
+    }
     let Some(hres) = host::rlimit_to_host(res) else {
-        let v = match res {
-            resource::RLIMIT_SIGPENDING => 63_432,
-            resource::RLIMIT_MSGQUEUE => 819_200,
-            resource::RLIMIT_NICE | resource::RLIMIT_RTPRIO => 0,
-            _ => resource::RLIM_INFINITY,
-        };
-        return Ok((v, v));
+        return Err(errno::EINVAL);
     };
     let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: `r` is a valid out-parameter.

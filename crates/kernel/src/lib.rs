@@ -42,6 +42,7 @@ pub mod procpid;
 pub mod procreg;
 pub mod pty;
 pub mod reaper;
+pub mod rlimits;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;
@@ -524,6 +525,7 @@ impl<P: Platform> Kernel<P> {
         e.u64(soft);
         e.u64(hard);
         e.u32(self.fs.as_ref().map_or(0o022, |fs| fs.umask()));
+        rlimits::save(&mut e);
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
         fdmarks::save(&mut e);
@@ -555,6 +557,7 @@ impl<P: Platform> Kernel<P> {
         let mut caps = caps::Caps::decode(&mut d);
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
+        rlimits::load(&mut d);
         fdmarks::load(&mut d);
         netlink::load(&mut d);
         seccomp::load_state(&mut d);
