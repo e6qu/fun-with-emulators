@@ -235,10 +235,9 @@ impl<P: Platform> Kernel<P> {
             fs.ns.activate();
         }
         // Its own record too: it may end before the parent writes it.
-        crate::procreg::own_line(&t.line);
-        // Its mappings, for other processes' `/proc/<pid>/maps`, in a file
-        // of its own (not the parent's, which it inherited).
-        crate::maps::publish();
+        // With the mappings it inherited, for other processes'
+        // `/proc/<pid>/maps`.
+        crate::procreg::own_line(&t.line, crate::maps::forked());
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();

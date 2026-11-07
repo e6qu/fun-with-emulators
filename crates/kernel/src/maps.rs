@@ -15,7 +15,9 @@
 //!
 //! Each process publishes its record after every change, in a shared file
 //! beside its process record ([`publish`]), which another process reads
-//! for `/proc/<pid>/maps` ([`of_process`]).
+//! for `/proc/<pid>/maps` ([`of_process`]). A fork child, until its first
+//! change, is described by what it inherited, kept in its process record
+//! ([`forked`]), so a fork makes no file.
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
@@ -482,9 +484,8 @@ static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
 /// The header before the encoded record: the sequence word and the length.
 const HEADER: usize = 16;
 
-/// Publish this process's mappings for other processes to read (after
-/// each change, and in a new process).
-pub fn publish() {
+/// This process's mappings encoded as [`publish`] publishes them.
+fn snapshot() -> Vec<u8> {
     // The host's view first: its lock comes before the record's.
     let tracked = crate::mm::tracked();
     let translations = crate::uaccess::translations();
@@ -502,14 +503,16 @@ pub fn publish() {
             e.u64(v);
         }
     }
-    let body = e.into_bytes();
-    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    e.into_bytes()
+}
+
+/// Let go of the parent's file a fork child inherited.
+fn drop_inherited(out: &mut Option<Outbox>) {
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };
     if let Some(o) = out.as_ref()
         && o.pid != me
     {
-        // A fork child's copy of its parent's: let it go, and make its own.
         // SAFETY: the mapping and descriptor are this process's copies.
         unsafe {
             libc::munmap(o.map.cast(), o.cap);
@@ -517,6 +520,24 @@ pub fn publish() {
         }
         *out = None;
     }
+}
+
+/// In a fork child: its mappings, which are its parent's, for the record
+/// it writes as it starts (see [`crate::procreg::own_line`]). It makes a
+/// file of its own only once they change, so a fork costs no file.
+pub fn forked() -> Vec<u8> {
+    drop_inherited(&mut OUTBOX.lock().unwrap_or_else(|e| e.into_inner()));
+    snapshot()
+}
+
+/// Publish this process's mappings for other processes to read (after
+/// each change, and in a new program).
+pub fn publish() {
+    let body = snapshot();
+    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    drop_inherited(&mut out);
     if out.is_none() {
         let Some(path) = crate::procreg::maps_path(me) else { return };
         let Ok(c) = std::ffi::CString::new(path) else { return };
@@ -579,12 +600,29 @@ pub fn publish() {
     }
 }
 
+/// What [`snapshot`] encoded.
+fn decode_published(body: &[u8]) -> Option<Published> {
+    let mut d = crate::snapshot::Dec::new(body);
+    let record = Record::decode(&mut d);
+    let page = d.u64();
+    let n = d.count(16);
+    let tracked = (0..n).map(|_| (d.u64(), d.u64())).collect();
+    let n = d.count(24);
+    let translations = (0..n).map(|_| (d.u64(), d.u64(), d.u64())).collect();
+    d.finish().ok()?;
+    Some(Published { record, page, tracked, translations })
+}
+
 /// The mappings host process `pid` published, if it is a process of
 /// fwe's that has.
 pub fn of_process(pid: i32) -> Option<Published> {
     use std::os::unix::fs::FileExt;
     let path = crate::procreg::maps_path(pid)?;
-    let file = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)).ok()?;
+    let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)) else {
+        // None published yet: what it was forked with.
+        let r = crate::procreg::read(pid)?;
+        return (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten();
+    };
     let word = |at: u64| -> Option<u64> {
         let mut b = [0u8; 8];
         file.read_exact_at(&mut b, at).ok()?;
@@ -597,15 +635,7 @@ pub fn of_process(pid: i32) -> Option<Published> {
             let len = word(8)? as usize;
             let mut body = vec![0u8; len];
             if file.read_exact_at(&mut body, HEADER as u64).is_ok() && word(0)? == before {
-                let mut d = crate::snapshot::Dec::new(&body);
-                let record = Record::decode(&mut d);
-                let page = d.u64();
-                let n = d.count(16);
-                let tracked = (0..n).map(|_| (d.u64(), d.u64())).collect();
-                let n = d.count(24);
-                let translations = (0..n).map(|_| (d.u64(), d.u64(), d.u64())).collect();
-                d.finish().ok()?;
-                return Some(Published { record, page, tracked, translations });
+                return decode_published(&body);
             }
         }
         std::thread::yield_now();

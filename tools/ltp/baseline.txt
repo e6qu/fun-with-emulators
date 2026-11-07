@@ -384,7 +384,6 @@ nice01
 nice02
 nice03
 nice04
-nice05
 open01
 open03
 open04

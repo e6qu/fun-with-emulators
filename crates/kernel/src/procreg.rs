@@ -65,6 +65,10 @@ pub struct ProcRecord {
     /// Its nice value (-20 to 19, `setpriority`), which its children
     /// inherit.
     pub nice: i32,
+    /// Its mappings as they were when it was forked, until it publishes
+    /// its own (see [`crate::maps::publish`]): what a fork child inherits,
+    /// recorded with the record it writes anyway.
+    pub maps: Vec<u8>,
 }
 
 /// A host process, as its pid and its start time.
@@ -149,6 +153,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
         e.u64(hard);
     }
     e.i32(r.nice);
+    e.bytes(&r.maps);
     e.into_bytes()
 }
 
@@ -175,6 +180,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let n = d.count(20);
     let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let nice = d.i32();
+    let maps = d.bytes();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -195,6 +201,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         ids,
         limits,
         nice,
+        maps,
     })
 }
 
@@ -395,6 +402,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         ids: [0; 8],
         limits: Vec::new(),
         nice: 0,
+        maps: Vec::new(),
     });
     f(&mut r);
     write(pid, &r);
@@ -564,9 +572,13 @@ pub fn load_line(d: &mut Dec) -> (Vec<Proc>, Option<Proc>) {
     (get_procs(d), get_opt(d))
 }
 
-/// This process (just forked) has the line of ancestors and bound `line`.
-pub fn own_line(line: &(Vec<Proc>, Option<Proc>)) {
-    let _ = change(me(), |r| (r.lineage, r.bound) = line.clone());
+/// This process (just forked) has the line of ancestors and bound `line`,
+/// and the mappings `maps` it inherited (see [`crate::maps::forked`]).
+pub fn own_line(line: &(Vec<Proc>, Option<Proc>), maps: Vec<u8>) {
+    let _ = change(me(), |r| {
+        (r.lineage, r.bound) = line.clone();
+        r.maps = maps;
+    });
 }
 
 /// Make this process a child subreaper, or not, with the orphans below it

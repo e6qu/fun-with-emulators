@@ -2736,6 +2736,7 @@ const MAPS: &str = "program: listed with its code executable: true\n\
     query: build ID of 20 bytes, the file's: true\n\
     query: a short build ID buffer: -1 true\n\
     unmapped: listed 0\n\
+    other: an idle fork child lists what it inherited: true\n\
     other: r--p /memfd:maps-other (deleted), from page 1\n\
     other: its filled memory resident: true\n\
     other: query 0: /memfd:maps-other (deleted), offset 1 pages\n\

@@ -203,6 +203,21 @@ fn main() {
         munmap(s, 3 * page);
         println!("unmapped: listed {}", perms_over(lo, hi).len());
 
+        // A fork child that has changed nothing lists what it inherited.
+        let mut hold = [0i32; 2];
+        pipe(hold.as_mut_ptr());
+        let idle = fork();
+        if idle == 0 {
+            let mut b = 0u8;
+            read(hold[0], &mut b, 1);
+            _exit(0);
+        }
+        let inherited = maps_of(&idle.to_string()).into_iter().any(|m| m.0 == f as u64 && m.2 == "r--p");
+        println!("other: an idle fork child lists what it inherited: {inherited}");
+        write(hold[1], b"x".as_ptr(), 1);
+        let mut status = 0;
+        waitpid(idle, &mut status, 0);
+
         // Another process's mappings: a child maps a file from its second
         // page and memory it fills, and waits while this one looks.
         let (mut up, mut down) = ([0i32; 2], [0i32; 2]);

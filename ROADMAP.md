@@ -21,7 +21,7 @@ standard `alpine` image in its own namespaces, cgroup, capabilities and
 seccomp profile, and podman and containerd (with runc) load that image and
 run containers of it on overlay mounts. M4 has begun: the Linux Test
 Project's system-call tests run under fwe in CI against a baseline of the
-ones that pass (652 of 1534), and the bugs they found first are
+ones that pass (651 of 1534), and the bugs they found first are
 fixed.
 
 ## M0 — Foundation (done)
@@ -185,7 +185,7 @@ servers run unmodified.
 - [ ] High pass rates on gVisor's syscall tests, LTP and kselftests. LTP's
   system-call tests (`tools/ltp`, the pinned 20260930 release built for
   arm64 musl, run in an Alpine root) run in CI against a baseline:
-  652 of 1534 pass, 57% of the 1139 that apply
+  651 of 1534 pass, 57% of the 1139 that apply
 
 **Done when:** real-world workloads run unmodified and conformance suites
 pass at high rates.
