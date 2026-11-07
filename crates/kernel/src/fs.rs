@@ -620,6 +620,12 @@ impl Fs {
                 None => crate::procfs::Entry::Missing,
             });
         }
+        if absolute == b"/proc/self/task" {
+            return Some(crate::procfs::Entry::Dir);
+        }
+        if let Some(rest) = absolute.strip_prefix(b"/proc/self/task/") {
+            return Some(task_entry(rest));
+        }
         match &absolute[..] {
             b"/proc/self/stat" => {
                 let me = crate::thread::tgid();
@@ -903,6 +909,28 @@ impl Fs {
                     .into_iter()
                     .map(|fd| (fd.to_string().into_bytes(), crate::procfs::DT_REG)),
             );
+            return Some(out);
+        }
+        if absolute == b"/proc/self/task" {
+            let mut out = vec![
+                (b".".to_vec(), crate::procfs::DT_DIR),
+                (b"..".to_vec(), crate::procfs::DT_DIR),
+            ];
+            out.extend(
+                crate::thread::tids()
+                    .into_iter()
+                    .map(|t| (t.to_string().into_bytes(), crate::procfs::DT_DIR)),
+            );
+            return Some(out);
+        }
+        if let Some(t) = absolute.strip_prefix(b"/proc/self/task/")
+            && matches!(task_entry(t), crate::procfs::Entry::Dir)
+        {
+            let mut out = vec![
+                (b".".to_vec(), crate::procfs::DT_DIR),
+                (b"..".to_vec(), crate::procfs::DT_DIR),
+            ];
+            out.extend(TASK_FILES.iter().map(|n| (n.to_vec(), crate::procfs::DT_REG)));
             return Some(out);
         }
         if absolute == b"/proc/self/fd" {
@@ -2054,6 +2082,57 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
 /// host pid (if it is in the reader's pid namespace), pid and the rest of
 /// the path.
 #[allow(clippy::type_complexity)]
+/// The files of `/proc/self/task/<tid>`.
+const TASK_FILES: &[&[u8]] = &[b"stat", b"status", b"comm"];
+
+/// `/proc/self/task/<rest>`: a thread of this process's directory, and in
+/// it the thread's `stat` (its own state and CPU time), `comm` and
+/// `status` (filled in on open, see `Kernel::task_status`).
+fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
+    use crate::procfs::Entry;
+    let (num, sub) = match rest.iter().position(|&b| b == b'/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, &b""[..]),
+    };
+    let Some(tid) = std::str::from_utf8(num).ok().and_then(|n| n.parse::<i32>().ok()) else {
+        return Entry::Missing;
+    };
+    if !crate::thread::tids().contains(&tid) {
+        return Entry::Missing;
+    }
+    // SAFETY: getpid cannot fail.
+    let host = unsafe { libc::getpid() };
+    let comm = || {
+        if tid == crate::thread::tid()
+            && let Some(name) = crate::thread::name()
+        {
+            return name.iter().take_while(|&&b| b != 0).copied().collect();
+        }
+        crate::procreg::read(host).map(|r| r.comm).unwrap_or_default()
+    };
+    match sub {
+        b"" => Entry::Dir,
+        b"/stat" => {
+            let mut h = crate::procpid::host_info(host).unwrap_or_default();
+            let thread = if tid == crate::thread::tid() {
+                // SAFETY: plain host call.
+                Some(unsafe { libc::pthread_self() })
+            } else {
+                crate::thread::host_thread(tid).filter(|&t| t != 0 as libc::pthread_t)
+            };
+            if let Some((user, system, running)) = thread.and_then(crate::host::thread_state) {
+                h.state = if running { b'R' } else { b'S' };
+                (h.utime, h.stime) =
+                    (crate::procpid::ns_to_ticks(user), crate::procpid::ns_to_ticks(system));
+            }
+            Entry::File(crate::procpid::stat_line(tid, &comm(), &h))
+        }
+        b"/comm" => Entry::File([&comm()[..], b"\n"].concat()),
+        b"/status" => Entry::File(Vec::new()),
+        _ => Entry::Missing,
+    }
+}
+
 fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)> {
     let Some(rest) = absolute.strip_prefix(b"/proc/") else { return Ok(absolute.to_vec()) };
     let (num, sub) = match rest.iter().position(|&b| b == b'/') {

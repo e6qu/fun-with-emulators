@@ -6,14 +6,20 @@
 # Fetches the pinned LTP release (checked against its SHA-256), configures it
 # for aarch64 musl with `zig cc`, and builds testcases/kernel/syscalls as
 # stripped static PIE executables (PIE so they load above the 4 GiB macOS
-# reserves, on the in-process backend). Installs them as a root filesystem's
-# /opt/ltp, in OUT/root (testcases/bin and runtest/syscalls, as LTP lays
-# them out), for tools/ltp/run.py. Needs zig and xz on the PATH.
+# reserves, on the in-process backend). Installs them in /opt/ltp of a root
+# filesystem in OUT/root (testcases/bin and runtest/syscalls, as LTP lays
+# them out): the Alpine minirootfs, the root of the standard `alpine`
+# image, which gives the tests a shell, the usual utilities and users.
+# For tools/ltp/run.py. Needs zig and xz on the PATH.
 set -eu
 
 VERSION=20260930
 SHA256=b9837481134fa6eabce91c2fba57d96695f81360468f83e11e6982584ad4d29d
 URL="https://github.com/linux-test-project/ltp/releases/download/$VERSION/ltp-full-$VERSION.tar.xz"
+# The root filesystem (as guests/alpine/fetch pins it).
+ROOTFS=alpine-minirootfs-3.20.10-aarch64.tar.gz
+ROOTFS_SHA256=61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+ROOTFS_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/$ROOTFS"
 # The compiler the build is pinned to (CI fetches it; see ci.yml).
 ZIG_VERSION=0.17.0
 # Not built: musl lacks fmtmsg's addseverity and the sigevent member
@@ -31,15 +37,21 @@ tarball="$out/ltp-full-$VERSION.tar.xz"
 src="$out/src"
 tools="$out/tools"
 
-if [ ! -f "$tarball" ] || ! echo "$SHA256  $tarball" | shasum -a 256 -c - >/dev/null 2>&1; then
-    curl -fsSL --retry 3 -o "$tarball.part" "$URL"
-    echo "$SHA256  $tarball.part" | shasum -a 256 -c -
-    mv "$tarball.part" "$tarball"
-fi
+# fetch URL SHA256 FILE: FILE, downloaded once and checked.
+fetch() {
+    if [ ! -f "$3" ] || ! echo "$2  $3" | shasum -a 256 -c - >/dev/null 2>&1; then
+        curl -fsSL --retry 3 -o "$3.part" "$1"
+        echo "$2  $3.part" | shasum -a 256 -c -
+        mv "$3.part" "$3"
+    fi
+}
+fetch "$URL" "$SHA256" "$tarball"
+fetch "$ROOTFS_URL" "$ROOTFS_SHA256" "$out/$ROOTFS"
 
 rm -rf "${src:?}" "${out:?}/root" "${tools:?}"
-mkdir -p "$src" "$tools"
+mkdir -p "$src" "$tools" "$out/root"
 tar -xJf "$tarball" -C "$src" --strip-components=1
+tar -xzf "$out/$ROOTFS" -C "$out/root"
 
 # The cross toolchain: zig's clang with its bundled musl and Linux headers.
 cat > "$tools/cc" <<'EOF'

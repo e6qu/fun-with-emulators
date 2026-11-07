@@ -615,6 +615,11 @@ pub mod wait {
     pub const WNOHANG: u64 = 1;
     pub const WUNTRACED: u64 = 2;
     pub const WCONTINUED: u64 = 8;
+    /// Which children `wait4` and `waitid` consider (`__WNOTHREAD`,
+    /// `__WALL`, `__WCLONE`).
+    pub const WNOTHREAD: u64 = 0x2000_0000;
+    pub const WALL: u64 = 0x4000_0000;
+    pub const WCLONE: u64 = 0x8000_0000;
     /// `waitid` options.
     pub const WSTOPPED: u64 = 2;
     pub const WEXITED: u64 = 4;

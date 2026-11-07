@@ -1191,6 +1191,25 @@ impl<P: Platform> Kernel<P> {
 
     /// `/proc/self/status`: the host's view of the process with the
     /// kernel's own of its credentials, capabilities and restrictions.
+    /// `/proc/self/task/<tid>/status`: the process's, as thread `tid` of
+    /// it shows it (its own id as `Pid`).
+    pub(crate) fn task_status(&self, tid: i32) -> Vec<u8> {
+        let status = String::from_utf8_lossy(&self.self_status()).into_owned();
+        status
+            .lines()
+            .map(
+                |l| {
+                    if l.starts_with("Pid:\t") {
+                        format!("Pid:\t{tid}\n")
+                    } else {
+                        format!("{l}\n")
+                    }
+                },
+            )
+            .collect::<String>()
+            .into_bytes()
+    }
+
     pub(crate) fn self_status(&self) -> Vec<u8> {
         // SAFETY: getpid cannot fail.
         let host = unsafe { libc::getpid() };

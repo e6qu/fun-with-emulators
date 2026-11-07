@@ -164,6 +164,11 @@ pub fn cpu_ns(pid: i32) -> Option<(u64, u64)> {
     }
 }
 
+/// Nanoseconds as the clock ticks (`USER_HZ`) `/proc` counts CPU time in.
+pub fn ns_to_ticks(ns: u64) -> u64 {
+    ns / (1_000_000_000 / 100)
+}
+
 /// Mach absolute time units (what the host reports CPU times in) in
 /// nanoseconds.
 #[cfg(target_os = "macos")]

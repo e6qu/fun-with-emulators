@@ -217,6 +217,14 @@ impl<P: Platform> Kernel<P> {
                 {
                     self.synthetic_fd(anon_fd(&self.self_status()), dirfd as i32, &path)
                 }
+                crate::procfs::Entry::File(_)
+                    if let Some(tid) = self.fs().proc_path(dirfd as i32, &path).and_then(|p| {
+                        let t = p.strip_prefix(b"/proc/self/task/")?.strip_suffix(b"/status")?;
+                        std::str::from_utf8(t).ok()?.parse::<i32>().ok()
+                    }) =>
+                {
+                    self.synthetic_fd(anon_fd(&self.task_status(tid)), dirfd as i32, &path)
+                }
                 crate::procfs::Entry::File(content)
                     if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
                 {

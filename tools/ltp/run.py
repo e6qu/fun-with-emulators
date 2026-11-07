@@ -6,9 +6,7 @@ Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
                         [--jobs N] [--only REGEX] [--results FILE]
 
 The root is a root filesystem with LTP in /opt/ltp (tools/ltp/build.sh
-makes it); the runner gives it the files a Linux system has that the tests
-read (`/etc/passwd` with `nobody`, `/etc/group`, `/etc/hosts`) and `/tmp`.
-Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
+makes it, of Alpine's minirootfs). Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
 <args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
 own per-test timeout and a hard limit above that. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
@@ -38,23 +36,8 @@ HARD_LIMIT = 300
 PROCESS_LIMIT = 1500
 
 
-# What a minimal Linux system has in /etc, as the tests expect it.
-ETC = {
-    "passwd": "root:x:0:0:root:/root:/bin/sh\n"
-    "daemon:x:1:1:daemon:/usr/sbin:/sbin/nologin\n"
-    "bin:x:2:2:bin:/bin:/sbin/nologin\n"
-    "nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
-    "group": "root:x:0:\ndaemon:x:1:\nbin:x:2:\nusers:x:100:\nnogroup:x:65534:\n",
-    "hosts": "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
-}
-
-
 def prepare(root):
-    """Give the root the files the tests read, and /tmp."""
-    os.makedirs(os.path.join(root, "etc"), exist_ok=True)
-    for name, text in ETC.items():
-        with open(os.path.join(root, "etc", name), "w") as f:
-            f.write(text)
+    """The root's /tmp, where each test gets a directory."""
     tmp = os.path.join(root, "tmp")
     os.makedirs(tmp, exist_ok=True)
     os.chmod(tmp, 0o1777)
@@ -106,7 +89,7 @@ def run_one(fwe, root, work, name, argv):
         return name, "missing", 0.0, ""
     with open(host_prog, "rb") as f:
         if f.read(4) != b"\x7fELF":
-            # A shell script, and the root has no shell.
+            # A shell script: LTP's shell library is not built.
             return name, "script", 0.0, ""
     tmp = tempfile.mkdtemp(prefix=name[:40] + ".", dir=work)
     guest_tmp = "/" + os.path.relpath(tmp, root)

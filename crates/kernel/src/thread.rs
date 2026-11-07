@@ -221,6 +221,15 @@ struct Registered {
 /// Every live guest thread's pending set, by tid.
 static THREADS: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
 
+/// The guest's threads, by tid, the main thread's (the process's) first.
+pub fn tids() -> Vec<i32> {
+    let me = tgid();
+    let mut out = vec![me];
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    out.extend(threads.iter().map(|r| r.tid).filter(|&t| t != me));
+    out
+}
+
 /// How many guest threads the process has.
 pub fn live_threads() -> usize {
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).len().max(1)

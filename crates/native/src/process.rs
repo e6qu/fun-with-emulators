@@ -357,6 +357,23 @@ fn linux_wstatus(status: libc::c_int) -> i32 {
 /// `wait4(pid, wstatus, options, rusage)`: reap a child. Blocks, so it runs
 /// without the kernel lock.
 pub fn do_wait4(regs: &Regs) -> i64 {
+    // Options Linux does not know are refused first: besides those that
+    // pick what to report, the ones that pick which children (all are
+    // fwe's processes, so they change nothing).
+    let options = regs.x[2];
+    let known = fwe_abi::wait::WNOHANG
+        | fwe_abi::wait::WUNTRACED
+        | fwe_abi::wait::WCONTINUED
+        | fwe_abi::wait::WNOTHREAD
+        | fwe_abi::wait::WALL
+        | fwe_abi::wait::WCLONE;
+    if options & !known != 0 {
+        return err(errno::EINVAL);
+    }
+    // The least pid has no group to name (Linux refuses it so).
+    if regs.x[0] as i32 == i32::MIN {
+        return err(errno::ESRCH);
+    }
     // The child or group in the guest's pid namespace, as the host's.
     let pid = match regs.x[0] as i32 {
         p if p > 0 => match fwe_kernel::pidns::host_arg(p) {
@@ -370,7 +387,6 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         p => p,
     };
     let wstatus = regs.x[1];
-    let options = regs.x[2];
     let rusage = regs.x[3];
 
     // WNOHANG and WUNTRACED share values with Linux; WCONTINUED does not
@@ -527,8 +543,22 @@ pub fn do_waitid(regs: &Regs) -> i64 {
     use fwe_abi::wait as w;
     let (idtype, id, infop, options, rusage) =
         (regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4]);
+    // In Linux's order: the options, then what they name.
+    let known = w::WNOHANG
+        | w::WNOWAIT
+        | w::WEXITED
+        | w::WSTOPPED
+        | w::WCONTINUED
+        | w::WNOTHREAD
+        | w::WALL
+        | w::WCLONE;
+    if options & !known != 0 || options & (w::WEXITED | w::WSTOPPED | w::WCONTINUED) == 0 {
+        return err(errno::EINVAL);
+    }
     let (idtype, id) = match idtype {
         w::P_ALL => (libc::P_ALL, 0),
+        w::P_PID if id as i32 <= 0 => return err(errno::EINVAL),
+        w::P_PGID if (id as i32) < 0 => return err(errno::EINVAL),
         w::P_PID => match fwe_kernel::pidns::host_arg(id as i32) {
             Ok(h) => (libc::P_PID, h as libc::id_t),
             Err(_) => return err(errno::ECHILD),
@@ -541,9 +571,6 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         },
         _ => return err(errno::EINVAL),
     };
-    if options & (w::WEXITED | w::WSTOPPED | w::WCONTINUED) == 0 {
-        return err(errno::EINVAL);
-    }
     let mut host_options = 0;
     for (linux, host) in [
         (w::WNOHANG, libc::WNOHANG),
@@ -635,10 +662,12 @@ fn waitid_host(
         unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
     if pid != 0 {
         let code = si.si_code;
-        let status = if matches!(code, w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED) {
-            host::signal_to_linux(status) as i32
-        } else {
-            status
+        let status = match code {
+            w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED => host::signal_to_linux(status) as i32,
+            // What continued it, as Linux reports (the host gives the
+            // signal that had stopped it).
+            w::CLD_CONTINUED => fwe_abi::signal::SIGCONT as i32,
+            _ => status,
         };
         words[0] = fwe_abi::signal::SIGCHLD as i32; // si_signo
         words[2] = code; // si_code

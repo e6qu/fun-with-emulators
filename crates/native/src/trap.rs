@@ -306,7 +306,8 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     // signal was sent by another process, a signal for the guest.
     // SAFETY: the thread was executing at `pc`, so it is mapped.
     if !unsafe { insn(pc) }.is_some_and(is_brk) {
-        take_async(sig, info, ctx, in_guest);
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        take_async(sig, || unsafe { host::signal_info(sig, info) }, ctx, in_guest);
         return;
     }
     let _host = HostCode::enter();
@@ -444,21 +445,23 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
 /// and the signal is delivered when that call returns — a blocking call was
 /// interrupted by it.
 extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-    take_async(sig, info, ctx, IN_GUEST.with(Cell::get));
+    // SAFETY: `info` is valid for SA_SIGINFO handlers.
+    let sent = || unsafe { host::signal_info(sig, info) };
+    take_async(sig, sent, ctx, IN_GUEST.with(Cell::get));
 }
 
 /// The body of [`on_async`], also used for a fault signal that was sent
-/// rather than raised by an instruction.
+/// rather than raised by an instruction. `sent` gives the signal's
+/// (Linux code, pid, uid, status).
 fn take_async(
     sig: libc::c_int,
-    info: *mut libc::siginfo_t,
+    sent: impl Fn() -> (i32, i32, u32, i32),
     ctx: *mut libc::c_void,
     in_guest: bool,
 ) {
     let record = || {
         if sig != host::WAKE_SIGNAL {
-            // SAFETY: `info` is valid for SA_SIGINFO handlers.
-            let (code, pid, uid, status) = unsafe { host::signal_info(sig, info) };
+            let (code, pid, uid, status) = sent();
             let lsig = host::signal_to_linux(sig);
             let info = thread::SigInfo { code, pid, uid, status };
             if REROUTING.with(Cell::get) {
@@ -541,8 +544,16 @@ const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // A process that sends itself one of these signals has it emulated (see
-    // `Kernel::sys_kill`), so here it is a fault, or the rare signal sent by
-    // another process, which macOS's siginfo does not tell apart.
+    // `Kernel::sys_kill`), so here it is a fault, or a signal sent by
+    // another process, which macOS's siginfo does not tell apart (it gives
+    // a sent one the thread's last fault). Another fwe process leaves a
+    // note before it sends one ([`fwe_kernel::signote`]): that one is a
+    // signal for the guest, whatever this thread was running. (A genuine
+    // fault that coincides with a note faults again, without one.)
+    if let Some((pid, uid)) = fwe_kernel::signote::take(sig) {
+        take_async(sig, || host::sent_info(pid, uid), ctx, IN_GUEST.with(Cell::get));
+        return;
+    }
     if !IN_GUEST.with(Cell::get) {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
