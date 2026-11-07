@@ -110,69 +110,21 @@ impl<P: Platform> Kernel<P> {
     fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             // Files and I/O.
-            nr::READ if crate::seqpacket::is(a[0] as i32) => {
-                let v = guest!(uaccess::host_buffer(a[1], a[2], true));
-                crate::seqpacket::read(a[0] as i32, &[v])
-            }
-            nr::READ => {
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe { libc::read(a[0] as i32, a[1] as *mut _, a[2] as usize) } as i64)
-            }
-            nr::WRITE => {
-                if let Some(r) = crate::cgroupfs::try_write(a[0] as i32, a[1], a[2]) {
-                    return r;
-                }
-                if crate::fdmarks::any_marks()
-                    && let Some(r) = crate::userns::try_write(a[0] as i32, a[1], a[2])
-                {
-                    return r;
-                }
-                if crate::fdmarks::any_marks()
-                    && let Some(r) = crate::sysctl::try_write(a[0] as i32, a[1], a[2])
-                {
-                    return r;
-                }
-                if crate::seqpacket::is(a[0] as i32) {
-                    let v = guest!(uaccess::host_buffer(a[1], a[2], false));
-                    return crate::seqpacket::write(a[0] as i32, &[v]);
-                }
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
-            }
-            nr::READV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2], true));
-                if crate::seqpacket::is(a[0] as i32) {
-                    return crate::seqpacket::read(a[0] as i32, &iov);
-                }
-                // SAFETY: the iovecs are translated host buffers; the host checks them.
-                ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
-            }
-            nr::WRITEV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2], false));
-                if crate::seqpacket::is(a[0] as i32) {
-                    return crate::seqpacket::write(a[0] as i32, &iov);
-                }
-                if crate::sysctl::is(a[0] as i32) {
-                    return crate::sysctl::try_writev(a[0] as i32, &iov)
-                        .unwrap_or(err(errno::EINVAL));
-                }
-                // SAFETY: the iovecs are translated host buffers; the host checks them.
-                ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
-            }
-            nr::PREAD64 => {
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe {
-                    libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
-                } as i64)
-            }
-            nr::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
-                crate::sysctl::try_write(a[0] as i32, a[1], a[2]).unwrap_or(err(errno::EINVAL))
-            }
-            nr::PWRITE64 => {
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe {
-                    libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
-                } as i64)
+            // The backends run these without the lock
+            // ([`crate::blocking_syscall`]); the same, reached here (the
+            // plain `syscall` helper).
+            nr::READ
+            | nr::WRITE
+            | nr::READV
+            | nr::WRITEV
+            | nr::PREAD64
+            | nr::PWRITE64
+            | nr::PREADV
+            | nr::PWRITEV
+            | nr::PREADV2
+            | nr::PWRITEV2 => {
+                // SAFETY: the backend's guarantee for the guest pointers.
+                unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS))
             }
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
@@ -525,6 +477,13 @@ impl<P: Platform> Kernel<P> {
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::MLOCK => self.sys_mlock(a[0], a[1], 0, true),
+            nr::MLOCK2 => self.sys_mlock(a[0], a[1], a[2], true),
+            nr::MUNLOCK => self.sys_mlock(a[0], a[1], 0, false),
+            nr::MLOCKALL => self.sys_mlockall(Some(a[0])),
+            nr::MUNLOCKALL => self.sys_mlockall(None),
+            nr::GETPRIORITY => self.sys_getpriority(a[0], a[1] as i32),
+            nr::SETPRIORITY => self.sys_setpriority(a[0], a[1] as i32, a[2] as i32),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
             nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
             nr::BPF if !self.creds.has_admin() => err(errno::EPERM),
@@ -588,15 +547,14 @@ impl<P: Platform> Kernel<P> {
             nr::TKILL => self.sys_tgkill(-1, a[0] as i32 as i64, a[1]),
             nr::TGKILL => self.sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(a[0], a[1]),
-            nr::SETITIMER => {
-                // SAFETY: `struct itimerval` has the same layout and timer
-                // numbers on both hosts; the host validates the pointers.
-                ret(unsafe { libc::setitimer(a[0] as i32, a[1] as *const _, a[2] as *mut _) })
-            }
-            nr::GETITIMER => {
-                // SAFETY: as for setitimer.
-                ret(unsafe { libc::getitimer(a[0] as i32, a[1] as *mut _) })
-            }
+            nr::SETITIMER => self.sys_setitimer(a[0], a[1], a[2]),
+            nr::GETITIMER => match itimer::get(a[0]) {
+                Ok(v) => {
+                    guest!(uaccess::write(a[1], v));
+                    0
+                }
+                Err(e) => err(e),
+            },
 
             // futex and the sleeps can block, so the backend runs them
             // outside the kernel lock via `blocking_syscall`; reaching them
@@ -732,11 +690,17 @@ impl<P: Platform> Kernel<P> {
 
     fn sys_fcntl(&mut self, fd: u64, cmd: u64, arg: u64) -> i64 {
         let fd = fd as i32;
+        // The descriptor first, whatever the command, as Linux checks.
+        // SAFETY: F_GETFD only queries.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return err(errno::EBADF);
+        }
         // SAFETY: every arm is a plain host call on a guest descriptor.
         unsafe {
             match cmd {
                 fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC
-                    if !crate::fdtable::guest_visible(arg as i32) =>
+                    if arg >= crate::fdtable::limit().0
+                        || !crate::fdtable::guest_visible(arg as i32) =>
                 {
                     err(errno::EINVAL)
                 }
@@ -778,23 +742,172 @@ impl<P: Platform> Kernel<P> {
                     ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
                 }
                 fcntl::F_GETLK => {
-                    let lock: fwe_abi::Flock = guest!(uaccess::read(arg));
-                    let mut lock = match host::flock_to_host(&lock) {
+                    let asked: fwe_abi::Flock = guest!(uaccess::read(arg));
+                    let mut lock = match host::flock_to_host(&asked) {
                         Ok(l) => l,
                         Err(e) => return err(e),
                     };
                     if libc::fcntl(fd, libc::F_GETLK, &mut lock) < 0 {
                         return last_error();
                     }
-                    guest!(uaccess::write(arg, host::flock_to_linux(&lock)));
+                    // Nothing in the way: Linux changes only the type (the
+                    // host makes the range absolute too).
+                    let found = host::flock_to_linux(&lock);
+                    let answer = if found.l_type == fcntl::F_UNLCK {
+                        fwe_abi::Flock { l_type: fcntl::F_UNLCK, ..asked }
+                    } else {
+                        found
+                    };
+                    guest!(uaccess::write(arg, answer));
                     0
                 }
                 fcntl::F_SETLK | fcntl::F_SETLKW => set_record_lock(fd, cmd, arg),
                 fcntl::F_ADD_SEALS => crate::memfd::add_seals(fd, arg),
                 fcntl::F_GET_SEALS => crate::memfd::get_seals(fd),
+                fcntl::F_SETOWN => {
+                    crate::fdstate::update(fd, |s| s.owner_tid = None);
+                    self.set_owner(fd, arg as i32)
+                }
+                fcntl::F_GETOWN => match crate::fdstate::get(fd).owner_tid {
+                    Some(tid) => tid as i64,
+                    None => self.owner(fd),
+                },
+                fcntl::F_SETOWN_EX => {
+                    let [kind, pid]: [i32; 2] = guest!(uaccess::read(arg));
+                    let r = match kind {
+                        fcntl::F_OWNER_TID if pid != 0 && !thread::tids().contains(&pid) => {
+                            // A thread of another process: its process.
+                            self.set_owner(fd, pid)
+                        }
+                        fcntl::F_OWNER_TID if pid != 0 => self.set_owner(fd, thread::tgid()),
+                        fcntl::F_OWNER_TID | fcntl::F_OWNER_PID => self.set_owner(fd, pid),
+                        fcntl::F_OWNER_PGRP => self.set_owner(fd, pid.wrapping_neg()),
+                        _ => return err(errno::EINVAL),
+                    };
+                    if r == 0 {
+                        let tid = (kind == fcntl::F_OWNER_TID && pid != 0).then_some(pid);
+                        crate::fdstate::update(fd, |s| s.owner_tid = tid);
+                    }
+                    r
+                }
+                fcntl::F_GETOWN_EX => {
+                    let owner = match crate::fdstate::get(fd).owner_tid {
+                        Some(tid) => [fcntl::F_OWNER_TID, tid],
+                        None => match self.owner(fd) {
+                            o if o < 0 => [fcntl::F_OWNER_PGRP, -o as i32],
+                            o => [fcntl::F_OWNER_PID, o as i32],
+                        },
+                    };
+                    guest!(uaccess::write(arg, owner));
+                    0
+                }
+                fcntl::F_SETSIG if arg > signal::NSIG => err(errno::EINVAL),
+                fcntl::F_SETSIG => {
+                    crate::fdstate::update(fd, |s| s.sig = arg as u32);
+                    0
+                }
+                fcntl::F_GETSIG => crate::fdstate::get(fd).sig as i64,
+                fcntl::F_SETLEASE => self.set_lease(fd, arg),
+                fcntl::F_GETLEASE => {
+                    i64::from(crate::fdstate::get(fd).lease.unwrap_or(fcntl::F_UNLCK))
+                }
+                fcntl::F_GETPIPE_SZ | fcntl::F_SETPIPE_SZ => self.pipe_size(fd, cmd, arg),
                 _ => err(errno::EINVAL),
             }
         }
+    }
+
+    /// `F_SETOWN`'s owner `who` (a pid, or a process group negated) for
+    /// the host, which sends it `SIGIO`.
+    fn set_owner(&self, fd: i32, who: i32) -> i64 {
+        let host = match who {
+            0 => 0,
+            p if p > 0 => match crate::pidns::to_host(p) {
+                Some(h) => h,
+                None => return err(errno::ESRCH),
+            },
+            p => match crate::pidns::to_host(p.wrapping_neg()) {
+                Some(h) => -h,
+                None => return err(errno::ESRCH),
+            },
+        };
+        // SAFETY: plain host call on the guest's descriptor.
+        ret(unsafe { libc::fcntl(fd, libc::F_SETOWN, host) })
+    }
+
+    /// `F_GETOWN`: the owner, a pid or a process group negated, in the
+    /// guest's pid namespace.
+    fn owner(&self, fd: i32) -> i64 {
+        // SAFETY: plain host call on the guest's descriptor.
+        let h = unsafe { libc::fcntl(fd, libc::F_GETOWN) };
+        match h {
+            0 => 0,
+            p if p > 0 => crate::pidns::guest_ret(p as i64),
+            p => -crate::pidns::guest_ret(-(p as i64)),
+        }
+    }
+
+    /// `F_SETLEASE`: a lease on a regular file, as Linux grants it: by its
+    /// owner or with `CAP_LEASE`, a read lease only on a descriptor not open
+    /// for writing, a write lease only while no other descriptor has the
+    /// file open (of those fwe can see: its own).
+    fn set_lease(&self, fd: i32, arg: u64) -> i64 {
+        let kind = arg as i16;
+        if arg > 2 || !matches!(kind, fcntl::F_RDLCK | fcntl::F_WRLCK | fcntl::F_UNLCK) {
+            return err(errno::EINVAL);
+        }
+        let st = match crate::fsops::linux_fstat(fd) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
+        if st.st_mode & fwe_abi::stat::S_IFMT != fwe_abi::stat::S_IFREG {
+            return err(errno::EINVAL);
+        }
+        if st.st_uid != self.creds.fsuid && !self.creds.has(crate::caps::CAP_LEASE) {
+            return err(errno::EACCES);
+        }
+        // SAFETY: plain host call on the guest's descriptor.
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let writable = fl & libc::O_ACCMODE != libc::O_RDONLY;
+        if (kind == fcntl::F_RDLCK && writable)
+            || (kind == fcntl::F_WRLCK && crate::fdmarks::shared_elsewhere(fd))
+        {
+            return err(errno::EAGAIN);
+        }
+        crate::fdstate::update(fd, |s| s.lease = (kind != fcntl::F_UNLCK).then_some(kind));
+        0
+    }
+
+    /// `F_GETPIPE_SZ` and `F_SETPIPE_SZ` of a pipe or FIFO: its capacity, and
+    /// a new one, rounded as Linux rounds it and held to `pipe-max-size`
+    /// without `CAP_SYS_RESOURCE`, and never below what the pipe holds.
+    fn pipe_size(&self, fd: i32, cmd: u64, arg: u64) -> i64 {
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::fstat(fd, &mut st) } < 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            return err(errno::EBADF);
+        }
+        let id = (st.st_dev as u64, st.st_ino);
+        if cmd == fcntl::F_GETPIPE_SZ {
+            return crate::fdstate::pipe_size(id) as i64;
+        }
+        let Some(size) = crate::fdstate::round_pipe_size(arg) else {
+            return err(errno::EINVAL);
+        };
+        /// `/proc/sys/fs/pipe-max-size`.
+        const PIPE_MAX: u64 = 1_048_576;
+        if size > PIPE_MAX && !self.creds.has(crate::caps::CAP_SYS_RESOURCE) {
+            return err(errno::EPERM);
+        }
+        let mut held: libc::c_int = 0;
+        // SAFETY: a valid out-parameter for FIONREAD.
+        unsafe { libc::ioctl(fd, libc::FIONREAD, &mut held) };
+        if (held as u64) > size {
+            return err(errno::EBUSY);
+        }
+        crate::fdstate::set_pipe_size(id, size);
+        size as i64
     }
 
     fn sys_ioctl(&mut self, fd: u64, req: u64, arg: u64) -> i64 {
@@ -1237,6 +1350,25 @@ impl<P: Platform> Kernel<P> {
 
     /// `/proc/self/status`: the host's view of the process with the
     /// kernel's own of its credentials, capabilities and restrictions.
+    /// `/proc/self/task/<tid>/status`: the process's, as thread `tid` of
+    /// it shows it (its own id as `Pid`).
+    pub(crate) fn task_status(&self, tid: i32) -> Vec<u8> {
+        let status = String::from_utf8_lossy(&self.self_status()).into_owned();
+        status
+            .lines()
+            .map(
+                |l| {
+                    if l.starts_with("Pid:\t") {
+                        format!("Pid:\t{tid}\n")
+                    } else {
+                        format!("{l}\n")
+                    }
+                },
+            )
+            .collect::<String>()
+            .into_bytes()
+    }
+
     pub(crate) fn self_status(&self) -> Vec<u8> {
         // SAFETY: getpid cannot fail.
         let host = unsafe { libc::getpid() };
@@ -1359,8 +1491,17 @@ impl<P: Platform> Kernel<P> {
             }
             return 0;
         }
+        if crate::rlimits::kept(res) {
+            if new != 0 {
+                let n: Rlimit = guest!(uaccess::read(new));
+                let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
+                if let Err(e) = crate::rlimits::set(res, n.rlim_cur, n.rlim_max, privileged) {
+                    return err(e);
+                }
+            }
+            return 0;
+        }
         let Some(hres) = host::rlimit_to_host(res) else {
-            // Limits the host does not have: Linux defaults, kept.
             return 0;
         };
         if new != 0 {
@@ -1450,6 +1591,9 @@ impl<P: Platform> Kernel<P> {
             let value = Rlimit { rlim_cur: soft, rlim_max: hard };
             if u64::from(res) == resource::RLIMIT_NOFILE {
                 let _ = crate::fdtable::set_limit(soft, hard);
+            } else if crate::rlimits::kept(u64::from(res)) {
+                // The setter was allowed to (`prlimit_other`).
+                let _ = crate::rlimits::set(u64::from(res), soft, hard, true);
             } else if let Some(hres) = host::rlimit_to_host(u64::from(res)) {
                 let r = libc::rlimit {
                     rlim_cur: host::rlim_to_host(value.rlim_cur),
@@ -1462,6 +1606,18 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_clock_gettime(&mut self, id: u64, tp: u64) -> i64 {
+        if let Some(ns) = cpu_clock_ns(id) {
+            let ns = match ns {
+                Ok(n) => n,
+                Err(e) => return err(e),
+            };
+            let ts = Timespec {
+                tv_sec: (ns / 1_000_000_000) as i64,
+                tv_nsec: (ns % 1_000_000_000) as i64,
+            };
+            guest!(uaccess::write(tp, ts));
+            return 0;
+        }
         let Some(hid) = host::clock_to_host(id) else {
             return err(errno::EINVAL);
         };
@@ -1482,18 +1638,31 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_clock_getres(&mut self, id: u64, tp: u64) -> i64 {
-        let Some(hid) = host::clock_to_host(id) else {
+        if let Some(ns) = cpu_clock_ns(id) {
+            if let Err(e) = ns {
+                return err(e);
+            }
+            if tp != 0 {
+                // Linux's: a nanosecond for the scheduler's clock, a tick
+                // (HZ 250) for the others.
+                let res = if id & 3 == 2 { 1 } else { 4_000_000 };
+                guest!(uaccess::write(tp, Timespec { tv_sec: 0, tv_nsec: res }));
+            }
+            return 0;
+        }
+        if host::clock_to_host(id).is_none() {
             return err(errno::EINVAL);
-        };
+        }
         if tp == 0 {
             return 0;
         }
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: `ts` is a valid out-parameter.
-        if unsafe { libc::clock_getres(hid, &mut ts) } != 0 {
-            return last_error();
-        }
-        guest!(uaccess::write(tp, Timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec }));
+        // Linux's: a nanosecond for the high-resolution clocks, a tick (HZ
+        // 250, as `/proc/config.gz` says) for the coarse ones, which read
+        // the time as of the last tick. (The host's is a microsecond, which
+        // a program that sizes its timers by it would take too short.)
+        let coarse = matches!(id, clock::CLOCK_REALTIME_COARSE | clock::CLOCK_MONOTONIC_COARSE);
+        let res = if coarse { 4_000_000 } else { 1 };
+        guest!(uaccess::write(tp, Timespec { tv_sec: 0, tv_nsec: res }));
         0
     }
 
@@ -1743,19 +1912,303 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
 /// The calling process's own limit of Linux resource `res` (soft, hard):
 /// the descriptor limit fwe keeps, the host's, or for a limit the host does
 /// not have, Linux's default.
+impl<P: Platform> Kernel<P> {
+    /// The host processes `getpriority`/`setpriority`'s `which` and `who`
+    /// name, among those the caller sees: a process, a process group or a
+    /// user's processes (`who` 0: the caller's own).
+    fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<i32>, i32> {
+        use fwe_abi::prio;
+        // SAFETY: plain host calls.
+        let (me, my_group) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        let seen = || {
+            crate::procpid::listed()
+                .into_iter()
+                .filter_map(crate::pidns::to_host)
+                .collect::<Vec<_>>()
+        };
+        Ok(match which {
+            prio::PROCESS if who == 0 => vec![me],
+            prio::PROCESS => crate::pidns::to_host(who)
+                .filter(|&h| h == me || crate::procreg::start_time(h).is_some())
+                .into_iter()
+                .collect(),
+            prio::PGRP => {
+                let group = if who == 0 {
+                    my_group
+                } else {
+                    match crate::pidns::to_host(who) {
+                        Some(g) => g,
+                        None => return Ok(Vec::new()),
+                    }
+                };
+                // SAFETY: plain host call.
+                seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect()
+            }
+            prio::USER => {
+                let uid = if who == 0 { self.creds.uid } else { who as u32 };
+                let own = |h: i32| if h == me { self.creds.uid } else { crate::procreg::ids(h)[0] };
+                seen().into_iter().filter(|&h| own(h) == uid).collect()
+            }
+            _ => return Err(errno::EINVAL),
+        })
+    }
+
+    /// `getpriority(which, who)`: the highest priority (least nice value)
+    /// of the processes named, as the system call returns it (20 less the
+    /// nice value, 1 to 40; the C library turns it back).
+    fn sys_getpriority(&mut self, which: u64, who: i32) -> i64 {
+        match self.prio_targets(which, who) {
+            Ok(t) => t
+                .iter()
+                .map(|&h| crate::procreg::nice(h))
+                .min()
+                .map_or(err(errno::ESRCH), |n| (20 - n) as i64),
+            Err(e) => err(e),
+        }
+    }
+
+    /// `setpriority(which, who, nice)`: the processes named take nice
+    /// value `nice` (clamped to -20..19), as Linux allows it: another
+    /// user's needs `CAP_SYS_NICE` (`EPERM`), and so does lowering one's
+    /// own beyond what `RLIMIT_NICE` lets (`EACCES`). As on Linux, a
+    /// failure stands whatever the other processes take.
+    fn sys_setpriority(&mut self, which: u64, who: i32, nice: i32) -> i64 {
+        let targets = match self.prio_targets(which, who) {
+            Ok(t) => t,
+            Err(e) => return err(e),
+        };
+        let nice = nice.clamp(-20, 19);
+        let privileged = self.creds.has(crate::caps::CAP_SYS_NICE);
+        // `RLIMIT_NICE` bounds the least nice value as 20 less it.
+        let floor =
+            20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let mut result = err(errno::ESRCH);
+        for h in targets {
+            let ids = if h == me {
+                [self.creds.uid, self.creds.euid]
+            } else {
+                let i = crate::procreg::ids(h);
+                [i[0], i[1]]
+            };
+            let r = if !privileged && !ids.contains(&self.creds.euid) {
+                err(errno::EPERM)
+            } else if nice < crate::procreg::nice(h) && !privileged && nice < floor {
+                err(errno::EACCES)
+            } else if h != me && crate::procreg::read(h).is_none() {
+                // A process fwe did not start: as far as the host lets.
+                // SAFETY: plain host call.
+                ret(unsafe { libc::setpriority(libc::PRIO_PROCESS, h as libc::id_t, nice) })
+            } else if crate::procreg::set_nice(h, nice).is_err() {
+                err(errno::ESRCH)
+            } else {
+                0
+            };
+            if r != 0 || result == err(errno::ESRCH) {
+                result = r;
+            }
+        }
+        result
+    }
+}
+
+/// For a clock id Linux's CPU-time clocks encode (negative: a pid or tid,
+/// complemented, above whether it is a thread's and which time), that
+/// time in nanoseconds: user and system time (`CPUCLOCK_PROF`, and
+/// `CPUCLOCK_SCHED`, the time run), or user time alone (`CPUCLOCK_VIRT`).
+/// A thread's clock is of a thread of this process; 0 is the caller (or
+/// its process). `None` for any other clock id.
+fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
+    let id = id as i32;
+    if id >= 0 {
+        return None;
+    }
+    let which = id & 3;
+    if which == 3 {
+        // A clock of a descriptor (a PTP device): none here.
+        return Some(Err(errno::EINVAL));
+    }
+    let thread = id & 4 != 0;
+    let who = !(id >> 3);
+    let me = thread::tgid();
+    let sample = if thread {
+        let tid = if who == 0 { thread::tid() } else { who };
+        thread::host_state(tid).map(|(user, system, _)| (user, system))
+    } else if who == 0 || who == me {
+        // SAFETY: getpid cannot fail.
+        crate::procpid::cpu_ns(unsafe { libc::getpid() })
+    } else {
+        crate::pidns::to_host(who).and_then(crate::procpid::cpu_ns)
+    };
+    Some(match sample {
+        Some((user, _)) if which == 1 => Ok(user),
+        Some((user, system)) => Ok(user + system),
+        None => Err(errno::EINVAL),
+    })
+}
+
+impl<P: Platform> Kernel<P> {
+    /// `setitimer(which, new, old)`: the host's interval timer, which
+    /// sends the host signal of Linux's (`SIGALRM`, `SIGVTALRM`, `SIGPROF`).
+    fn sys_setitimer(&mut self, which: u64, new: u64, old: u64) -> i64 {
+        // As Linux reads it: no new value is a zero one.
+        let value: fwe_abi::Itimerval =
+            if new == 0 { Default::default() } else { guest!(uaccess::read(new)) };
+        match itimer::set(which, value) {
+            Ok(previous) => {
+                if old != 0 {
+                    guest!(uaccess::write(old, previous));
+                }
+                0
+            }
+            Err(e) => err(e),
+        }
+    }
+}
+
+/// The interval timers. The host keeps them, but takes no value past
+/// 100,000,000 seconds (Linux takes any): a longer one is given the
+/// host's longest, and what was asked is kept, so the time left reads as
+/// on Linux (`alarm(INT_MAX)` then `alarm(0)`).
+mod itimer {
+    use fwe_abi::{Itimerval, Timeval, errno};
+    use std::sync::Mutex;
+
+    /// The longest value the host takes, in seconds.
+    const HOST_MAX: i64 = 100_000_000;
+
+    /// For each timer given less than asked: (asked, given).
+    static CLAMPED: Mutex<[Option<(Itimerval, Itimerval)>; 3]> = Mutex::new([None; 3]);
+
+    fn valid(t: &Timeval) -> bool {
+        t.tv_sec >= 0 && (0..1_000_000).contains(&t.tv_usec)
+    }
+
+    fn clamp(t: Timeval) -> Timeval {
+        if t.tv_sec > HOST_MAX { Timeval { tv_sec: HOST_MAX, tv_usec: 0 } } else { t }
+    }
+
+    fn micros(t: &Timeval) -> i128 {
+        t.tv_sec as i128 * 1_000_000 + t.tv_usec as i128
+    }
+
+    fn from_micros(us: i128) -> Timeval {
+        let us = us.max(0);
+        Timeval { tv_sec: (us / 1_000_000) as i64, tv_usec: (us % 1_000_000) as i64 }
+    }
+
+    fn to_host(v: &Itimerval) -> libc::itimerval {
+        let tv = |t: Timeval| libc::timeval {
+            tv_sec: t.tv_sec,
+            tv_usec: t.tv_usec as libc::suseconds_t,
+        };
+        libc::itimerval { it_interval: tv(v.it_interval), it_value: tv(v.it_value) }
+    }
+
+    // `suseconds_t` is 32 bits on macOS, 64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    fn from_host(v: &libc::itimerval) -> Itimerval {
+        let tv = |t: libc::timeval| Timeval { tv_sec: t.tv_sec, tv_usec: t.tv_usec as i64 };
+        Itimerval { it_interval: tv(v.it_interval), it_value: tv(v.it_value) }
+    }
+
+    /// What timer `which` has left, as asked: the host's, or for one the
+    /// host was given less, what was asked less what has passed.
+    fn as_asked(
+        which: usize,
+        host: Itimerval,
+        clamped: &mut [Option<(Itimerval, Itimerval)>; 3],
+    ) -> Itimerval {
+        match clamped[which] {
+            Some((asked, given)) if micros(&host.it_value) > 0 => {
+                let passed = micros(&given.it_value) - micros(&host.it_value);
+                Itimerval {
+                    it_interval: asked.it_interval,
+                    it_value: from_micros(micros(&asked.it_value) - passed),
+                }
+            }
+            _ => {
+                clamped[which] = None;
+                host
+            }
+        }
+    }
+
+    /// `getitimer(which)`.
+    pub fn get(which: u64) -> Result<Itimerval, i32> {
+        if which > 2 {
+            return Err(errno::EINVAL);
+        }
+        // SAFETY: a valid out-parameter.
+        let mut h: libc::itimerval = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::getitimer(which as i32, &mut h) } != 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        let mut clamped = CLAMPED.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(as_asked(which as usize, from_host(&h), &mut clamped))
+    }
+
+    /// `setitimer(which, value)`: the timer's previous value.
+    pub fn set(which: u64, value: Itimerval) -> Result<Itimerval, i32> {
+        if which > 2 || !valid(&value.it_value) || !valid(&value.it_interval) {
+            return Err(errno::EINVAL);
+        }
+        let given =
+            Itimerval { it_interval: clamp(value.it_interval), it_value: clamp(value.it_value) };
+        // SAFETY: zeroed bytes are a valid `itimerval`, which the host fills.
+        let mut old: libc::itimerval = unsafe { std::mem::zeroed() };
+        let mut clamped = CLAMPED.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: valid in- and out-parameters.
+        if unsafe { libc::setitimer(which as i32, &to_host(&given), &mut old) } != 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        let previous = as_asked(which as usize, from_host(&old), &mut clamped);
+        clamped[which as usize] = (given != value).then_some((value, given));
+        Ok(previous)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A real timer longer than the host takes reads back as asked,
+        /// less what has passed; one that fits is the host's own.
+        #[test]
+        fn a_timer_longer_than_the_host_takes_reads_back_as_asked() {
+            let long = Itimerval {
+                it_interval: Timeval::default(),
+                it_value: Timeval { tv_sec: i32::MAX as i64, tv_usec: 0 },
+            };
+            set(0, long).unwrap();
+            let left = get(0).unwrap();
+            assert!(left.it_value.tv_sec > i32::MAX as i64 - 5, "{left:?}");
+            let previous = set(0, Itimerval::default()).unwrap();
+            assert!(previous.it_value.tv_sec > i32::MAX as i64 - 5, "{previous:?}");
+            assert_eq!(get(0).unwrap(), Itimerval::default());
+            assert_eq!(set(3, long), Err(errno::EINVAL));
+            let bad = Itimerval { it_interval: Timeval { tv_sec: 0, tv_usec: 1_000_000 }, ..long };
+            assert_eq!(set(0, bad), Err(errno::EINVAL));
+        }
+    }
+}
+
+/// The caller's soft limit of resource `res`.
+pub(crate) fn own_limit_of(res: u64) -> u64 {
+    own_limit(res).map_or(resource::RLIM_INFINITY, |(soft, _)| soft)
+}
+
 fn own_limit(res: u64) -> Result<(u64, u64), i32> {
     if res == resource::RLIMIT_NOFILE {
         // Virtual: the host's limit also covers fwe's own descriptors.
         return Ok(crate::fdtable::limit());
     }
+    if crate::rlimits::kept(res) {
+        return Ok(crate::rlimits::get(res));
+    }
     let Some(hres) = host::rlimit_to_host(res) else {
-        let v = match res {
-            resource::RLIMIT_SIGPENDING => 63_432,
-            resource::RLIMIT_MSGQUEUE => 819_200,
-            resource::RLIMIT_NICE | resource::RLIMIT_RTPRIO => 0,
-            _ => resource::RLIM_INFINITY,
-        };
-        return Ok((v, v));
+        return Err(errno::EINVAL);
     };
     let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: `r` is a valid out-parameter.

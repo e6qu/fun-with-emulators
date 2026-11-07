@@ -179,6 +179,53 @@ fn map_fixed_anon(addr: u64, len: u64, prot: libc::c_int) -> bool {
     p != libc::MAP_FAILED
 }
 
+/// Whether all of guest range `[start, start + len)` is mapped.
+fn mapped(start: u64, len: u64) -> bool {
+    // A backend that knows the guest's memory says (the VM's); the host
+    // knows what it has mapped.
+    if !crate::uaccess::valid(start, len, false) {
+        return false;
+    }
+    host_mapped(crate::uaccess::g2h(start), len)
+}
+
+/// Whether all of host range `[host, host + len)` is mapped, as Mach's
+/// regions say (`mincore` does not fail for a hole on macOS).
+#[cfg(target_os = "macos")]
+fn host_mapped(host: u64, len: u64) -> bool {
+    let end = host.saturating_add(len);
+    let mut at = host;
+    while at < end {
+        match region::query(at) {
+            Some(r) if r.start <= at => at = r.start + r.size,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether all of host range `[host, host + len)` is mapped: `mincore`
+/// fails with `ENOMEM` for a hole, and has no other effect.
+#[cfg(not(target_os = "macos"))]
+fn host_mapped(host: u64, len: u64) -> bool {
+    // SAFETY: plain host call.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let mut vec = [0u8; 4096];
+    let end = host.saturating_add(len);
+    let mut at = host & !(page - 1);
+    while at < end {
+        let n = (end - at).min(vec.len() as u64 * page);
+        // SAFETY: `vec` has room for one byte per page of `n` bytes.
+        if unsafe { libc::mincore(at as *mut libc::c_void, n as usize, vec.as_mut_ptr().cast()) }
+            != 0
+        {
+            return false;
+        }
+        at += n;
+    }
+    true
+}
+
 /// `MADV_DONTNEED` on a Linux host is the real thing.
 #[cfg(not(target_os = "macos"))]
 fn dontneed(addr: u64, len: u64) -> i64 {
@@ -260,7 +307,19 @@ pub mod region {
         pages_reusable: c_uint,
     }
 
+    /// `vm_region_top_info`.
+    #[repr(C)]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct TopInfo {
+        obj_id: c_uint,
+        ref_count: c_uint,
+        private_pages_resident: c_uint,
+        shared_pages_resident: c_uint,
+        share_mode: c_uchar,
+    }
+
     const VM_REGION_BASIC_INFO_64: c_int = 9;
+    const VM_REGION_TOP_INFO: c_int = 12;
     const VM_REGION_EXTENDED_INFO: c_int = 13;
     /// `VM_INHERIT_COPY`: what a `MAP_PRIVATE` mapping gets; `MAP_SHARED`
     /// mappings inherit by sharing (`VM_INHERIT_SHARE`, 0).
@@ -362,6 +421,24 @@ pub mod region {
         // SAFETY: changes only what a later fork does with this task's own
         // memory; the mapping itself is untouched.
         unsafe { minherit(start as *mut libc::c_void, len as usize, how as c_int) };
+    }
+
+    /// What memory host address `addr` is, as Linux tells futexes apart:
+    /// `Some(None)` for private memory (a futex there is this process's,
+    /// at this address), `Some(Some((object, offset)))` for shared memory,
+    /// the same pair in every process that maps it, wherever (Mach's id of
+    /// the memory object, the same for the system's life, and the offset
+    /// into it); `None` where nothing is mapped.
+    pub fn sharing(addr: u64) -> Option<Option<(u32, u64)>> {
+        let (start, _, basic) = query_flavor::<BasicInfo>(addr, VM_REGION_BASIC_INFO_64)?;
+        if start > addr {
+            return None;
+        }
+        if basic.inheritance == VM_INHERIT_COPY {
+            return Some(None);
+        }
+        let (_, _, top) = query_flavor::<TopInfo>(start, VM_REGION_TOP_INFO)?;
+        Some(Some((top.obj_id, basic.offset + (addr - start))))
     }
 
     pub fn query(addr: u64) -> Option<Region> {
@@ -854,6 +931,51 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: syncing guest memory at the guest's request; the host
         // checks the range is mapped.
         ret(unsafe { libc::msync(host as *mut libc::c_void, len as usize, flags) })
+    }
+
+    /// `mlock`, `mlock2` (`flags`) and `munlock` (`lock` false): the range,
+    /// widened to whole pages, must be mapped, and a caller without
+    /// `CAP_IPC_LOCK` may lock no more than its `RLIMIT_MEMLOCK` (none at
+    /// all if that is 0). The host is not asked to wire the pages: Linux's
+    /// root may lock far more than the host lets a user process, and what
+    /// a program sees of a locked page is the same.
+    pub(crate) fn sys_mlock(&mut self, addr: u64, len: u64, flags: u64, lock: bool) -> i64 {
+        if lock && flags & !mman::MLOCK_ONFAULT != 0 {
+            return err(errno::EINVAL);
+        }
+        let start = addr & !(self.page_size - 1);
+        let Some(end) = addr.checked_add(len).map(|e| self.page_up(e)) else {
+            return err(errno::ENOMEM);
+        };
+        if end == start {
+            return 0;
+        }
+        if lock && !self.creds.has(crate::caps::CAP_IPC_LOCK) {
+            let soft = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
+            if soft == 0 {
+                return err(errno::EPERM);
+            }
+            if end - start > soft {
+                return err(errno::ENOMEM);
+            }
+        }
+        if mapped(start, end - start) { 0 } else { err(errno::ENOMEM) }
+    }
+
+    /// `mlockall(flags)` and `munlockall` (`flags` `None`): checked as Linux
+    /// checks them, nothing wired (see [`Kernel::sys_mlock`]).
+    pub(crate) fn sys_mlockall(&mut self, flags: Option<u64>) -> i64 {
+        let Some(flags) = flags else { return 0 };
+        let all = mman::MCL_CURRENT | mman::MCL_FUTURE | mman::MCL_ONFAULT;
+        if flags == 0 || flags & !all != 0 || flags == mman::MCL_ONFAULT {
+            return err(errno::EINVAL);
+        }
+        if !self.creds.has(crate::caps::CAP_IPC_LOCK)
+            && crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK) == 0
+        {
+            return err(errno::EPERM);
+        }
+        0
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {

@@ -146,6 +146,11 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 
 /// Host metadata of open descriptor `fd`, with the guest's permission
 /// bits ([`crate::modes`]).
+/// `fstat` of `fd` in Linux's layout (the host's view of the file).
+pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
+    stat_fd(fd).map(|s| stat_to_linux(&s))
+}
+
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if let Some(host) = crate::fdmarks::stand_in(fd) {
         // A stand-in `O_PATH` descriptor: the file it names.
@@ -216,6 +221,14 @@ impl<P: Platform> Kernel<P> {
                         == Some(b"/proc/self/status") =>
                 {
                     self.synthetic_fd(anon_fd(&self.self_status()), dirfd as i32, &path)
+                }
+                crate::procfs::Entry::File(_)
+                    if let Some(tid) = self.fs().proc_path(dirfd as i32, &path).and_then(|p| {
+                        let t = p.strip_prefix(b"/proc/self/task/")?.strip_suffix(b"/status")?;
+                        std::str::from_utf8(t).ok()?.parse::<i32>().ok()
+                    }) =>
+                {
+                    self.synthetic_fd(anon_fd(&self.task_status(tid)), dirfd as i32, &path)
                 }
                 crate::procfs::Entry::File(content)
                     if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
@@ -540,6 +553,15 @@ impl<P: Platform> Kernel<P> {
             path = b".".to_vec();
         }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
+        if self.fs().synthetic(dirfd as i32, &path).is_some() {
+            return self.access_synthetic(
+                dirfd as i32,
+                &path,
+                mode,
+                follow,
+                flags & fcntl::AT_EACCESS != 0,
+            );
+        }
         let r = match self.fs().resolve(dirfd as i32, &path, follow) {
             Ok(r) => r,
             Err(e) => return err(e),
@@ -577,6 +599,61 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         ret(unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode as i32, 0) })
+    }
+
+    /// `faccessat` of a file of fwe's `/proc` or `/sys`: whether it exists,
+    /// and the caller's access by the mode `stat` shows for it, as Linux
+    /// checks it (root's `CAP_DAC_OVERRIDE` bypassing all but a missing
+    /// execute bit on a file). A process's `oom_score_adj` is writable as
+    /// opening it to write is. The caller's real ids are checked, or with
+    /// `eaccess` (`AT_EACCESS`) those it acts on files with.
+    fn access_synthetic(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        mode: u64,
+        follow: bool,
+        eaccess: bool,
+    ) -> i64 {
+        const W_OK: u64 = 2;
+        const X_OK: u64 = 1;
+        let st = match self.linux_stat(dirfd, path, follow, 0) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
+        let kind = st.st_mode & fwe_abi::stat::S_IFMT;
+        if kind == fwe_abi::stat::S_IFLNK {
+            // A symbolic link's own bits are all set.
+            return 0;
+        }
+        if mode & W_OK != 0
+            && let Some(open) = self.oom_file(dirfd, path)
+        {
+            return match (open, mode & !W_OK) {
+                (Err(e), _) => err(e),
+                (Ok(_), 0) => 0,
+                (Ok(_), rest) => self.access_synthetic(dirfd, path, rest, follow, eaccess),
+            };
+        }
+        if self.creds.has(crate::caps::CAP_DAC_OVERRIDE) {
+            let dir = kind == fwe_abi::stat::S_IFDIR;
+            return if mode & X_OK != 0 && !dir && st.st_mode & 0o111 == 0 {
+                err(errno::EACCES)
+            } else {
+                0
+            };
+        }
+        let c = &self.creds;
+        let (uid, gid) = if eaccess { (c.fsuid, c.fsgid) } else { (c.uid, c.gid) };
+        let shift = if st.st_uid == uid {
+            6
+        } else if st.st_gid == gid || c.groups.contains(&st.st_gid) {
+            3
+        } else {
+            0
+        };
+        let bits = (st.st_mode >> shift) & 7;
+        if bits & mode as u32 == mode as u32 { 0 } else { err(errno::EACCES) }
     }
 
     /// `faccessat2(fd, "", mode, AT_EMPTY_PATH)`: the access the caller has

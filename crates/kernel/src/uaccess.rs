@@ -317,6 +317,14 @@ pub fn write_host(dst: u64, src: &[u8]) -> Result<()> {
     check(unsafe { imp::copy(dst as *mut u8, src.as_ptr(), src.len()) })
 }
 
+/// Copy `dst.len()` bytes from host address `src`, a guest buffer already
+/// translated ([`host_buffer`], [`host_iovecs`]): `EFAULT`, not a crash,
+/// where the guest's memory is not there (gone since it was checked).
+pub fn read_host(src: u64, dst: &mut [u8]) -> Result<()> {
+    // SAFETY: `dst` is fwe's own buffer; a fault on `src` is recovered.
+    check(unsafe { imp::copy(dst.as_mut_ptr(), src as *const u8, dst.len()) })
+}
+
 /// Copy `dst.len()` bytes from guest address `addr`.
 pub fn read_into(addr: u64, dst: &mut [u8]) -> Result<()> {
     // SAFETY: `dst` is fwe's own buffer of that length.
@@ -412,7 +420,37 @@ pub fn host_buffer(base: u64, len: u64, write: bool) -> Result<libc::iovec> {
     if crosses(base, len) {
         return Err(errno::EINVAL);
     }
-    Ok(libc::iovec { iov_base: g2h(base) as *mut libc::c_void, iov_len: len as usize })
+    let host = g2h(base);
+    check(write || readable(host, len))?;
+    Ok(libc::iovec { iov_base: host as *mut libc::c_void, iov_len: len as usize })
+}
+
+/// Whether all of host range `[host, host + len)`, a guest buffer the
+/// host is to read whole, reads without faulting. Without a validator (the
+/// in-process backend) the host would otherwise find a hole itself, partway
+/// through, and a write would fail having written what came before it;
+/// Linux refuses such a write, or writes only what it reports (`writev07`).
+fn readable(host: u64, len: u64) -> bool {
+    if len == 0
+        || VALIDATOR.get().is_some()
+        || !cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    {
+        return true;
+    }
+    // A byte from each page, the guest's (4 KiB) as the finest grain.
+    const PAGE: u64 = 4096;
+    let end = host.saturating_add(len);
+    let mut at = host;
+    let mut byte = 0u8;
+    while at < end {
+        // SAFETY: one byte into a local; a fault on the guest's side is
+        // recovered.
+        if !unsafe { imp::copy(&mut byte, at as *const u8, 1) } {
+            return false;
+        }
+        at = (at & !(PAGE - 1)) + PAGE;
+    }
+    true
 }
 
 /// The most buffers one vectored call takes (Linux's `UIO_MAXIOV`).
@@ -427,12 +465,13 @@ pub fn host_iovecs(addr: u64, count: u64, write: bool) -> Result<Vec<libc::iovec
     for c in raw.chunks_exact(16) {
         let base = u64::from_ne_bytes(c[0..8].try_into().unwrap());
         let len = u64::from_ne_bytes(c[8..16].try_into().unwrap());
-        // An empty buffer is never touched, as on Linux.
-        check(len == 0 || valid(base, len, write))?;
-        if crosses(base, len) {
+        // A length that is negative as a `ssize_t` is refused before any
+        // address is looked at, as on Linux.
+        if (len as i64) < 0 {
             return Err(errno::EINVAL);
         }
-        out.push(libc::iovec { iov_base: g2h(base) as *mut libc::c_void, iov_len: len as usize });
+        // An empty buffer is never touched, as on Linux.
+        out.push(host_buffer(base, len, write)?);
     }
     Ok(out)
 }

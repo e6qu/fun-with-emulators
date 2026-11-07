@@ -600,10 +600,10 @@ pub fn check_device(access: u32, dev_type: u32, major: u32, minor: u32) -> Resul
     if device_allowed(access, dev_type, major, minor) { Ok(()) } else { Err(errno::EPERM) }
 }
 
-/// A `write` of `len` bytes at guest `buf` to `fd`: for a cgroup's
-/// interface file, what the write does (`Some` result); `None` for any
-/// other descriptor.
-pub fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
+/// A write of `len` bytes, `data` the first of them, to `fd`: for a
+/// cgroup's interface file, what the write does (`Some` result); `None`
+/// for any other descriptor ([`crate::specialwrite`]).
+pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     let host = crate::fdmarks::cgroup_file(fd)?;
     let (cg, Some(name)) = locate(&host)? else { return None };
     // Writable only if opened so.
@@ -612,12 +612,8 @@ pub fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
     if fl & libc::O_ACCMODE == libc::O_RDONLY {
         return Some(err(errno::EBADF));
     }
-    let data = match crate::uaccess::read_bytes(buf, len.min(1 << 16) as usize) {
-        Ok(d) => d,
-        Err(e) => return Some(err(e)),
-    };
     let dir = host_dir(&cg).ok()?;
-    Some(match write(&dir, &cg, &name, &data) {
+    Some(match write(&dir, &cg, &name, data) {
         Ok(()) => len as i64,
         Err(e) => err(e),
     })

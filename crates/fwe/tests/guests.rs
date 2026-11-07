@@ -309,9 +309,14 @@ fn rust_guest(name: &str) -> PathBuf {
 }
 
 fn fwe(program: &Path, args: &[&str]) -> Output {
+    fwe_within(program, args, GUEST_TIMEOUT)
+}
+
+/// [`fwe`] with a time limit of `limit`.
+fn fwe_within(program: &Path, args: &[&str], limit: Duration) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace").arg(program).args(args).env("FWE_GUEST_VAR", "from-host");
-    let out = run_vm_bounded(cmd);
+    let out = run_vm_bounded_for(cmd, limit);
     // Shown when a test fails.
     eprintln!("--- {} stderr:\n{}", program.display(), String::from_utf8_lossy(&out.stderr));
     out
@@ -2247,7 +2252,11 @@ fn kill_reaches_another_process() {
 /// before, the process hung in nested handlers or its signal stack ran out.
 #[test]
 fn signal_flood_during_system_calls() {
-    assert_eq!(signals("storm"), "survived: true calls: true\n");
+    // What it checks is that the storm is survived, not how fast: on a
+    // small machine running other tests beside it, it takes a while.
+    let out = fwe_within(&rust_guest("signals"), &["storm"], Duration::from_secs(60));
+    assert_eq!(out.status.code(), Some(0), "storm: {out:?}");
+    assert_eq!(stdout(&out), "survived: true calls: true\n");
 }
 
 /// A signal from another process reaches a guest handler (through the host),

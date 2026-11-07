@@ -138,7 +138,9 @@ pub fn write_refused(fd: i32) -> bool {
 pub fn linux_write_error(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     use fwe_abi::{mman, nr as n};
     let fd = match nr {
-        n::WRITE | n::WRITEV | n::PWRITE64 if r == err(errno::EBADF) => a[0],
+        n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2 if r == err(errno::EBADF) => {
+            a[0]
+        }
         n::MMAP
             if r == err(errno::EACCES)
                 && a[3] & mman::MAP_SHARED != 0

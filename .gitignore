@@ -1,2 +1,3 @@
 /target
 /guests/rust/target
+__pycache__/

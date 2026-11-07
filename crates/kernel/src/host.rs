@@ -167,6 +167,44 @@ pub fn clock_to_host(id: u64) -> Option<libc::clockid_t> {
     })
 }
 
+/// The CPU time host thread `t` of this process has used, user and
+/// system, in nanoseconds.
+pub fn thread_cpu_ns(t: libc::pthread_t) -> Option<(u64, u64)> {
+    thread_state(t).map(|(user, system, _)| (user, system))
+}
+
+/// Host thread `t` of this process: its CPU time, user and system, in
+/// nanoseconds, and whether it runs (or waits only for a processor).
+pub fn thread_state(t: libc::pthread_t) -> Option<(u64, u64, bool)> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a live thread of this process (the caller's guarantee:
+        // fwe's record of it); zeroed bytes are a valid info structure,
+        // which the call fills, `count` words of it.
+        unsafe {
+            let port = libc::pthread_mach_thread_np(t);
+            let mut info: libc::thread_extended_info = std::mem::zeroed();
+            let mut count = libc::THREAD_EXTENDED_INFO_COUNT;
+            let kr = libc::thread_info(
+                port,
+                libc::THREAD_EXTENDED_INFO as libc::thread_flavor_t,
+                (&mut info as *mut libc::thread_extended_info).cast(),
+                &mut count,
+            );
+            (kr == 0).then_some((
+                info.pth_user_time,
+                info.pth_system_time,
+                info.pth_run_state == libc::TH_STATE_RUNNING,
+            ))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = t;
+        None
+    }
+}
+
 /// Host resource for a Linux resource limit, if the host has it.
 pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
     Some(match resource {
@@ -177,7 +215,6 @@ pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
         resource::RLIMIT_CORE => libc::RLIMIT_CORE as libc::c_int,
         resource::RLIMIT_NPROC => libc::RLIMIT_NPROC as libc::c_int,
         resource::RLIMIT_NOFILE => libc::RLIMIT_NOFILE as libc::c_int,
-        resource::RLIMIT_MEMLOCK => libc::RLIMIT_MEMLOCK as libc::c_int,
         resource::RLIMIT_AS => libc::RLIMIT_AS as libc::c_int,
         _ => return None,
     })
@@ -545,8 +582,23 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     let killed = matches!(code, wait::CLD_KILLED | wait::CLD_DUMPED | wait::CLD_STOPPED);
     if sig == libc::SIGCHLD && killed {
         status = signal_to_linux(status) as i32;
+    } else if sig == libc::SIGCHLD && code == wait::CLD_CONTINUED {
+        // What continued it, as Linux reports (the host gives the signal
+        // that had stopped it).
+        status = signal::SIGCONT as i32;
     }
     (code, pid, uid_to_initial(uid), status)
+}
+
+/// The siginfo of a signal host process `pid`, of host user `uid`, sent
+/// with `kill`, as [`signal_info`] gives it: for a fault signal another
+/// fwe process sent, which comes with the receiving thread's last fault in
+/// its siginfo instead (macOS fills a sent `SIGSEGV`, `SIGBUS`, `SIGILL`
+/// or `SIGFPE` so), known by the sender's note ([`crate::signote`]).
+pub fn sent_info(pid: i32, uid: u32) -> (i32, i32, u32, i32) {
+    /// macOS's `SI_USER`.
+    const SENT: i32 = 0x10001;
+    (si_code_to_linux(SENT), pid, uid_to_initial(uid), 0)
 }
 
 /// Set the calling thread's host `errno`.

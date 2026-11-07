@@ -161,6 +161,12 @@ pub fn relayed(sig: u64) -> bool {
 /// whether such a signal was raised by an instruction or sent, so when the
 /// process sends one to itself it is emulated, like a real-time signal,
 /// rather than sent through the host.
+/// This host process.
+fn me_host() -> i64 {
+    // SAFETY: getpid cannot fail.
+    unsafe { libc::getpid() as i64 }
+}
+
 fn owned(sig: u64) -> bool {
     matches!(
         sig,
@@ -513,12 +519,22 @@ impl<P: Platform> Kernel<P> {
 
     /// `kill(pid, sig)`. A relayed signal is sent as the host signal to
     /// whatever `pid` names (a process, `0` for the caller's process group,
-    /// `-pgid`, or `-1`); the host delivers it, to this process too. A signal
-    /// with no host equivalent can only be sent within this process.
+    /// or `-pgid`); the host delivers it, to this process too. `-1` is every
+    /// other process of the caller's pid namespace, or outside one, of the
+    /// caller's run of fwe ([`Kernel::kill_every`]): never the host's other
+    /// processes. A signal with no host equivalent can only be sent within
+    /// this process.
     pub(crate) fn sys_kill(&mut self, pid: i64, sig: u64) -> i64 {
         if sig > signal::NSIG {
             return err(errno::EINVAL);
         }
+        // A `pid_t`: the register's low half. Its least value has no
+        // negation, so names no group (Linux refuses it so).
+        let pid = pid as i32;
+        if pid == i32::MIN {
+            return err(errno::ESRCH);
+        }
+        let pid = pid as i64;
         let me = thread::tgid() as i64;
         // The host process (or group) `pid` names in the guest's pid
         // namespace.
@@ -533,8 +549,14 @@ impl<P: Platform> Kernel<P> {
                 None => return err(errno::ESRCH),
             },
         };
-        if pid == -1 && crate::pidns::nested() {
-            return self.kill_namespace(sig);
+        if pid == -1 {
+            return self.kill_every(sig);
+        }
+        if target > 0 && target != me_host() && !self.may_signal(target as i32, sig) {
+            // SAFETY: plain host call; signal 0 only checks the target.
+            let exists = unsafe { libc::kill(target as libc::pid_t, 0) } == 0
+                || host::last_errno() == libc::EPERM;
+            return err(if exists { errno::EPERM } else { errno::ESRCH });
         }
         if sig == 0 {
             // SAFETY: plain host call; signal 0 only checks the target.
@@ -550,7 +572,7 @@ impl<P: Platform> Kernel<P> {
         {
             return 0;
         }
-        let to_self = pid == me || pid == 0 || pid == -1;
+        let to_self = pid == me || pid == 0;
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
             // A namespace's init takes its namespace with it.
             let led = (sig == signal::SIGKILL && target > 0)
@@ -560,6 +582,9 @@ impl<P: Platform> Kernel<P> {
                 crate::signote::note(target as i32, h);
             }
             let r = host::kill(target as libc::pid_t, h);
+            if r != 0 && target > 0 && !to_self {
+                crate::signote::unnote(target as i32, h);
+            }
             if r == 0
                 && let Some(ns) = led
             {
@@ -578,32 +603,66 @@ impl<P: Platform> Kernel<P> {
         err(errno::EINVAL)
     }
 
-    /// `kill(-1, sig)` in a pid namespace of fwe's: every process in it
-    /// but its init and the caller, as on Linux.
-    fn kill_namespace(&mut self, sig: u64) -> i64 {
-        let Some(ns) = crate::pidns::current().first().cloned() else { return err(errno::ESRCH) };
-        let me = thread::tgid();
-        let targets: Vec<(i32, i32)> = ns
-            .get()
-            .pids
-            .iter()
-            .filter(|(n, e)| !e.thread && **n != 1 && e.host != 0)
-            .map(|(n, e)| (*n, e.host))
-            .collect();
-        if targets.is_empty() {
-            return err(errno::ESRCH);
-        }
-        let mut sent = false;
-        for (n, host) in targets {
-            if n == me {
+    /// `kill(-1, sig)`: every process the caller may signal but itself
+    /// and its namespace's init, as on Linux. In a pid namespace of fwe's,
+    /// the processes in it; outside one, those of the caller's run of fwe
+    /// ([`crate::procreg::run`]), so a guest never signals the host's other
+    /// processes. As on Linux, one the caller may not signal is passed
+    /// over, and the result is that of the last one signalled otherwise.
+    fn kill_every(&mut self, sig: u64) -> i64 {
+        let me = me_host() as i32;
+        let targets: Vec<i32> = match crate::pidns::current().first() {
+            Some(ns) => ns
+                .get()
+                .pids
+                .iter()
+                .filter(|(n, e)| !e.thread && **n != 1 && e.host != 0)
+                .map(|(_, e)| e.host)
+                .collect(),
+            None => crate::procreg::run(),
+        };
+        let mut count = 0;
+        let mut ret = 0;
+        for host in targets.into_iter().filter(|&h| h != me) {
+            count += 1;
+            if !self.may_signal(host, sig) {
                 continue;
             }
-            if let Some(h) = host::signal_to_host(sig) {
-                crate::signote::note(host, h);
-                sent |= host::kill(host, h) == 0;
+            let r = match (sig, host::signal_to_host(sig)) {
+                (0, _) => 0,
+                (_, Some(h)) => {
+                    crate::signote::note(host, h);
+                    let r = host::kill(host, h);
+                    if r != 0 {
+                        crate::signote::unnote(host, h);
+                    }
+                    r
+                }
+                // Another process cannot be sent a signal the host does not
+                // have.
+                (_, None) => err(errno::EINVAL),
+            };
+            if r != err(errno::EPERM) {
+                ret = r;
             }
         }
-        if sent { 0 } else { err(errno::ESRCH) }
+        if count == 0 { err(errno::ESRCH) } else { ret }
+    }
+
+    /// Whether the caller may send `sig` to host process `target` (Linux's
+    /// `check_kill_permission`): with `CAP_KILL`, when its real or
+    /// effective user id is the target's real or saved one, or `SIGCONT`
+    /// within its session. A process fwe has no record of counts as root's.
+    fn may_signal(&self, target: i32, sig: u64) -> bool {
+        if self.creds.has(crate::caps::CAP_KILL) {
+            return true;
+        }
+        let ids = crate::procreg::ids(target);
+        if [self.creds.uid, self.creds.euid].iter().any(|&u| u == ids[0] || u == ids[2]) {
+            return true;
+        }
+        // SAFETY: plain host calls.
+        sig == signal::SIGCONT && unsafe { libc::getsid(target) == libc::getsid(0) }
     }
 
     /// `tgkill(tgid, tid, sig)`, and `tkill(tid, sig)` as `tgid == -1`: send

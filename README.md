@@ -85,6 +85,17 @@ for Hypervisor.framework, which needs Unicorn (`brew install unicorn`), and
 never in a real VM unless asked for. Elsewhere only unit tests run. See
 [AGENTS.md](AGENTS.md) for the full set of checks CI runs.
 
+The Linux Test Project's system-call tests run under `fwe` too, against a
+baseline of the tests that pass (`tools/ltp/baseline.txt`); CI fails if one
+of them stops passing:
+
+```sh
+tools/ltp/build.sh target/ltp      # needs zig 0.17.0: LTP in an Alpine root
+cargo build
+tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root
+tools/ltp/run.py ... --update      # rewrite the baseline from a run
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE). The vendored runtimes and Debian binaries under

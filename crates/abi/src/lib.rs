@@ -138,6 +138,11 @@ pub mod hwcap2 {
 
 /// Memory protection and mapping flags (`asm-generic/mman*.h`).
 pub mod mman {
+    /// `mlock2` and `mlockall` flags.
+    pub const MLOCK_ONFAULT: u64 = 1;
+    pub const MCL_CURRENT: u64 = 1;
+    pub const MCL_FUTURE: u64 = 2;
+    pub const MCL_ONFAULT: u64 = 4;
     pub const PROT_NONE: u64 = 0;
     pub const PROT_READ: u64 = 1;
     pub const PROT_WRITE: u64 = 2;
@@ -211,6 +216,15 @@ pub mod prctl {
     pub const TASK_COMM_LEN: usize = 16;
 }
 
+/// `preadv2`/`pwritev2` flags (`RWF_*`).
+pub mod rwf {
+    pub const HIPRI: u64 = 0x01;
+    pub const DSYNC: u64 = 0x02;
+    pub const SYNC: u64 = 0x04;
+    pub const NOWAIT: u64 = 0x08;
+    pub const APPEND: u64 = 0x10;
+}
+
 pub mod fcntl {
     pub const O_ACCMODE: u64 = 0o3;
     pub const O_RDONLY: u64 = 0o0;
@@ -246,8 +260,22 @@ pub mod fcntl {
     pub const F_OFD_GETLK: u64 = 36;
     pub const F_OFD_SETLK: u64 = 37;
     pub const F_OFD_SETLKW: u64 = 38;
+    pub const F_SETOWN: u64 = 8;
+    pub const F_GETOWN: u64 = 9;
+    pub const F_SETSIG: u64 = 10;
+    pub const F_GETSIG: u64 = 11;
+    pub const F_SETOWN_EX: u64 = 15;
+    pub const F_GETOWN_EX: u64 = 16;
+    pub const F_SETLEASE: u64 = 1024;
+    pub const F_GETLEASE: u64 = 1025;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+    pub const F_SETPIPE_SZ: u64 = 1031;
+    pub const F_GETPIPE_SZ: u64 = 1032;
     pub const F_ADD_SEALS: u64 = 1033;
+    /// `struct f_owner_ex` types.
+    pub const F_OWNER_TID: i32 = 0;
+    pub const F_OWNER_PID: i32 = 1;
+    pub const F_OWNER_PGRP: i32 = 2;
     pub const F_GET_SEALS: u64 = 1034;
 
     /// File seals (`F_ADD_SEALS`).
@@ -560,6 +588,13 @@ pub mod term {
 }
 
 /// Resource limits (`asm-generic/resource.h`).
+/// `getpriority`/`setpriority`'s `which`.
+pub mod prio {
+    pub const PROCESS: u64 = 0;
+    pub const PGRP: u64 = 1;
+    pub const USER: u64 = 2;
+}
+
 pub mod resource {
     pub const RLIMIT_CPU: u64 = 0;
     pub const RLIMIT_FSIZE: u64 = 1;
@@ -586,6 +621,7 @@ pub mod futex {
     pub const FUTEX_WAIT: u64 = 0;
     pub const FUTEX_WAKE: u64 = 1;
     pub const FUTEX_REQUEUE: u64 = 3;
+    pub const FUTEX_CMP_REQUEUE: u64 = 4;
     pub const FUTEX_WAIT_BITSET: u64 = 9;
     pub const FUTEX_WAKE_BITSET: u64 = 10;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
@@ -598,6 +634,11 @@ pub mod wait {
     pub const WNOHANG: u64 = 1;
     pub const WUNTRACED: u64 = 2;
     pub const WCONTINUED: u64 = 8;
+    /// Which children `wait4` and `waitid` consider (`__WNOTHREAD`,
+    /// `__WALL`, `__WCLONE`).
+    pub const WNOTHREAD: u64 = 0x2000_0000;
+    pub const WALL: u64 = 0x4000_0000;
+    pub const WCLONE: u64 = 0x8000_0000;
     /// `waitid` options.
     pub const WSTOPPED: u64 = 2;
     pub const WEXITED: u64 = 4;
@@ -775,6 +816,22 @@ pub struct Itimerspec {
 pub struct EpollEvent {
     pub events: u32,
     pub data: u64,
+}
+
+/// `struct timeval`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// `struct itimerval` (`setitimer`, `getitimer`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Itimerval {
+    pub it_interval: Timeval,
+    pub it_value: Timeval,
 }
 
 /// `struct timespec`.

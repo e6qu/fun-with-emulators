@@ -52,6 +52,95 @@ type Child = (&'static [u8], u8);
 /// One synthetic directory: `(path, entries)`.
 type DirDef = (&'static [u8], &'static [Child]);
 
+/// The kernel configuration fwe presents: what it implements, in the
+/// options' terms (an option not listed is not set), for the programs and
+/// test suites that read `/proc/config.gz` to tell what the kernel has.
+const CONFIG: &str = "\
+# Linux/arm64 Kernel Configuration, as fwe implements it
+CONFIG_ARM64=y
+CONFIG_64BIT=y
+CONFIG_MMU=y
+CONFIG_ARM64_4K_PAGES=y
+CONFIG_ARM64_VA_BITS_48=y
+CONFIG_PGTABLE_LEVELS=4
+CONFIG_SMP=y
+CONFIG_HZ_250=y
+CONFIG_HZ=250
+CONFIG_HIGH_RES_TIMERS=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_MULTIUSER=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EVENTFD=y
+CONFIG_SHMEM=y
+CONFIG_TMPFS=y
+CONFIG_MEMFD_CREATE=y
+CONFIG_UNIX98_PTYS=y
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_USER_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_CGROUPS=y
+CONFIG_CGROUP_BPF=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_OVERLAY_FS=y
+CONFIG_NET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+";
+
+/// [`CONFIG`], gzipped as `/proc/config.gz` is (in stored blocks: the
+/// format, not the size, is what readers need).
+fn config_gz() -> Vec<u8> {
+    gzip_stored(CONFIG.as_bytes())
+}
+
+/// `data` as a gzip stream of stored (uncompressed) deflate blocks.
+fn gzip_stored(data: &[u8]) -> Vec<u8> {
+    // Magic, deflate, no flags, no time, no extra flags, Unix.
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    let mut chunks = data.chunks(0xffff).peekable();
+    if chunks.peek().is_none() {
+        out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+    }
+    while let Some(chunk) = chunks.next() {
+        let last = chunks.peek().is_none();
+        let len = chunk.len() as u16;
+        out.push(last as u8);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+/// The CRC-32 gzip ends with (IEEE 802.3, reflected).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
 /// The synthetic directory tree: each directory and the entries it lists.
 const DIRS: &[DirDef] = &[
     (
@@ -66,6 +155,8 @@ const DIRS: &[DirDef] = &[
             (b"filesystems", DT_REG),
             (b"sys", DT_DIR),
             (b"mounts", DT_LNK),
+            (b"cmdline", DT_REG),
+            (b"config.gz", DT_REG),
         ],
     ),
     (
@@ -103,7 +194,15 @@ const DIRS: &[DirDef] = &[
     // Listed from the open descriptors (see `Fs::synth_children`).
     (b"/proc/self/fd", &[]),
     (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR), (b"fs", DT_DIR)]),
-    (b"/proc/sys/fs", &[(b"nr_open", DT_REG), (b"file-max", DT_REG), (b"pipe-max-size", DT_REG)]),
+    (
+        b"/proc/sys/fs",
+        &[
+            (b"nr_open", DT_REG),
+            (b"file-max", DT_REG),
+            (b"pipe-max-size", DT_REG),
+            (b"lease-break-time", DT_REG),
+        ],
+    ),
     (
         b"/proc/sys/kernel",
         &[
@@ -118,6 +217,7 @@ const DIRS: &[DirDef] = &[
             (b"overflowgid", DT_REG),
             (b"threads-max", DT_REG),
             (b"domainname", DT_REG),
+            (b"tainted", DT_REG),
         ],
     ),
     (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
@@ -200,6 +300,12 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
             Entry::File(b"65534\n".to_vec())
         }
         b"/proc/sys/kernel/threads-max" => Entry::File(b"254828\n".to_vec()),
+        // Nothing has tainted fwe's kernel.
+        b"/proc/sys/kernel/tainted" => Entry::File(b"0\n".to_vec()),
+        b"/proc/sys/fs/lease-break-time" => Entry::File(b"45\n".to_vec()),
+        // The kernel was given no command line.
+        b"/proc/cmdline" => Entry::File(b"\n".to_vec()),
+        b"/proc/config.gz" => Entry::File(config_gz()),
         b"/proc/sys/fs/nr_open" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/fs/file-max" => Entry::File(b"9223372036854775807\n".to_vec()),
         b"/proc/sys/fs/pipe-max-size" => Entry::File(b"1048576\n".to_vec()),
@@ -299,6 +405,25 @@ mod tests {
             exe_fd: None,
             auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0],
         }
+    }
+
+    /// `/proc/config.gz` is a gzip stream of the configuration: framed as
+    /// gzip, the configuration in its stored blocks, the right CRC.
+    #[test]
+    fn config_is_gzipped() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        let gz = config_gz();
+        assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
+        let body = &gz[10..gz.len() - 8];
+        assert_eq!(body[0], 1);
+        let len = u16::from_le_bytes([body[1], body[2]]) as usize;
+        assert_eq!(&body[5..5 + len], CONFIG.as_bytes());
+        let tail = &gz[gz.len() - 8..];
+        assert_eq!(u32::from_le_bytes(tail[..4].try_into().unwrap()), crc32(CONFIG.as_bytes()));
+        assert_eq!(u32::from_le_bytes(tail[4..].try_into().unwrap()), CONFIG.len() as u32);
+        let big = gzip_stored(&vec![7u8; 70_000]);
+        assert_eq!(big[10], 0);
+        assert_eq!(big.len(), 10 + 5 + 65_535 + 5 + (70_000 - 65_535) + 8);
     }
 
     #[test]

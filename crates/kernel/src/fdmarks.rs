@@ -192,6 +192,7 @@ pub fn marked(fd: i32) -> Option<Mark> {
 pub fn closed(fd: i32) {
     take(&mut records(), fd);
     crate::overlay::closed(fd);
+    crate::fdstate::closed(fd);
 }
 
 /// Whether a descriptor of this process other than `fd` is open on the
@@ -227,6 +228,7 @@ pub fn forget_closed() {
 
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
+    crate::fdstate::duplicated(old, new);
     let mut r = records();
     match r.get(&old).cloned() {
         Some(rec) => insert(&mut r, new, rec),
@@ -332,7 +334,7 @@ pub fn load(d: &mut Dec) {
 /// made as Linux reports it: a write to `/dev/full` fails with `ENOSPC`.
 pub fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     use fwe_abi::{err, errno, nr as n};
-    let writes = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64);
+    let writes = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2);
     if r >= 0
         && writes
         && MARKS.load(std::sync::atomic::Ordering::SeqCst) > 0

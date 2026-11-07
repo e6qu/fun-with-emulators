@@ -229,27 +229,25 @@ pub fn show_map(map: &[Extent]) -> Vec<u8> {
         .into_bytes()
 }
 
-/// A `write` of `len` bytes at guest `buf` to `fd`: for a map file of
-/// `/proc/<pid>` opened for writing, what the write does (`Some` result).
-pub fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
+/// A write of `len` bytes, `data` the first of them, to `fd`: for a map
+/// file of `/proc/<pid>` opened for writing, what the write does (`Some`
+/// result; see [`crate::specialwrite`]).
+pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     let Some(crate::fdmarks::Mark::ProcMap { host, which, privileged, own }) =
         crate::fdmarks::marked(fd)
     else {
         return None;
     };
-    let data = match crate::uaccess::read_bytes(buf, len.min(4096) as usize) {
-        Ok(d) => d,
-        Err(e) => return Some(fwe_abi::err(e)),
-    };
+    let data = &data[..data.len().min(4096)];
     let rec = crate::procreg::read(host).and_then(|r| crate::procpid::user_record(&r.ns));
     let Some(ns) = rec else {
         // The initial namespace's maps are fixed.
         return Some(fwe_abi::err(errno::EPERM));
     };
     let r = match which {
-        0 => write_map(&ns, false, &data, privileged, own),
-        1 => write_map(&ns, true, &data, privileged, own),
-        _ => write_setgroups(&ns, &data),
+        0 => write_map(&ns, false, data, privileged, own),
+        1 => write_map(&ns, true, data, privileged, own),
+        _ => write_setgroups(&ns, data),
     };
     Some(match r {
         Ok(()) => len as i64,

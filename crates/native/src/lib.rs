@@ -720,15 +720,9 @@ pub fn ncpu() -> u32 {
     (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as u32
 }
 
-/// The host name, without a trailing NUL.
+/// The host name, as the guest's kernel holds it.
 pub fn hostname() -> Vec<u8> {
-    let mut buf = [0u8; 256];
-    // SAFETY: `buf` is a valid buffer of its length.
-    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
-        return b"localhost".to_vec();
-    }
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    buf[..end].to_vec()
+    fwe_kernel::ns::host_name()
 }
 
 /// Load the Linux executable at `path` and run it with `args` (including

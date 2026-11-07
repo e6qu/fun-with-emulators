@@ -21,10 +21,13 @@ pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_ADMIN: u32 = 12;
+pub const CAP_IPC_LOCK: u32 = 14;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_MKNOD: u32 = 27;
+pub const CAP_LEASE: u32 = 28;
 pub const CAP_SETFCAP: u32 = 31;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
 /// The highest capability (`CAP_CHECKPOINT_RESTORE`).

@@ -123,14 +123,19 @@ pub struct Namespaces {
     pub user: Option<Arc<Record<crate::userns::UserNs>>>,
 }
 
-/// The host's name.
+/// The longest host name Linux holds (`__NEW_UTS_LEN`).
+pub const HOST_NAME_MAX: usize = 64;
+
+/// The host's name, as Linux would hold it: no longer than
+/// [`HOST_NAME_MAX`] (macOS allows 255), so `uname` and
+/// `/proc/sys/kernel/hostname` agree.
 pub fn host_name() -> Vec<u8> {
     let mut host = [0u8; 256];
     // SAFETY: `host` is a valid buffer of its length.
     if unsafe { libc::gethostname(host.as_mut_ptr().cast(), host.len()) } != 0 {
         return b"localhost".to_vec();
     }
-    let end = host.iter().position(|&c| c == 0).unwrap_or(host.len());
+    let end = host.iter().position(|&c| c == 0).unwrap_or(host.len()).min(HOST_NAME_MAX);
     host[..end].to_vec()
 }
 
