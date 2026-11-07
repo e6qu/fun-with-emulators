@@ -2733,7 +2733,13 @@ const MAPS: &str = "program: listed with its code executable: true\n\
     mlock: 0, locked pages resident: true, smaps Locked true, Rss true\n\
     status: VmLck covers it: true\n\
     query: 0, the program's code: true, executable: true\n\
-    unmapped: listed 0\n";
+    query: build ID of 20 bytes, the file's: true\n\
+    query: a short build ID buffer: -1 true\n\
+    unmapped: listed 0\n\
+    other: r--p /memfd:maps-other (deleted), from page 1\n\
+    other: its filled memory resident: true\n\
+    other: query 0: /memfd:maps-other (deleted), offset 1 pages\n\
+    other: gone with it: true\n";
 
 /// `/proc/self/maps` and `smaps` list the program, its stack, a file
 /// mapped from an offset, protections changed in the middle of a mapping
@@ -3107,7 +3113,8 @@ fn rust_low_guest(name: &str) -> PathBuf {
         // RUSTFLAGS replaces the config's flags, dropping its high image base.
         build.env(
             "RUSTFLAGS",
-            "-C linker-flavor=ld.lld -C link-self-contained=yes -C target-feature=+crt-static",
+            "-C linker-flavor=ld.lld -C link-self-contained=yes -C target-feature=+crt-static \
+             -C link-arg=--build-id",
         );
         run_checked(&mut build);
         out

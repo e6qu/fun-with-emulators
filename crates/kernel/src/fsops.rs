@@ -1353,9 +1353,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `fadvise64(fd, offset, len, advice)`: checked as Linux checks it;
-    /// `POSIX_FADV_WILLNEED` starts the host reading the range ahead, and
-    /// the rest only describe how the file will be used, which the host's
-    /// cache works out for itself.
+    /// `POSIX_FADV_WILLNEED` starts the host reading the range ahead,
+    /// `POSIX_FADV_DONTNEED` writes its changes back and drops its pages
+    /// from the host's cache, and the rest only describe how the file will
+    /// be used, which the host's cache works out for itself.
     pub(crate) fn sys_fadvise(&mut self, fd: u64, offset: u64, len: u64, advice: u64) -> i64 {
         use fwe_abi::fadvise::*;
         let fd = fd as i32;
@@ -1383,6 +1384,10 @@ impl<P: Platform> Kernel<P> {
             };
             // SAFETY: a valid advisory for a guest descriptor; advice only.
             unsafe { libc::fcntl(fd, libc::F_RDADVISE, &ra) };
+        }
+        #[cfg(target_os = "macos")]
+        if advice == POSIX_FADV_DONTNEED && st.st_mode & libc::S_IFMT == libc::S_IFREG {
+            drop_cached(fd, offset, len, st.st_size as u64);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = offset;
@@ -2444,6 +2449,63 @@ fn anon_fd(content: &[u8]) -> i64 {
     // SAFETY: rewinding to the start for the guest's reads.
     unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
     fd as i64
+}
+
+/// Write back and drop from the host's cache the pages of the regular file
+/// open at `fd` (`size` bytes long) over `[offset, offset + len)`, to its
+/// end if `len` is 0: what `POSIX_FADV_DONTNEED` asks. A shared mapping of
+/// the range, synced and invalidated, does it: changes made through any
+/// other mapping or `write` are written first, so none is lost.
+#[cfg(target_os = "macos")]
+fn drop_cached(fd: i32, offset: u64, len: u64, size: u64) {
+    // SAFETY: plain host call.
+    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64;
+    let start = offset & !(page - 1);
+    let end = if len == 0 { size } else { offset.saturating_add(len).min(size) };
+    if end <= start {
+        return;
+    }
+    let span = (end - start) as usize;
+    let map = |fd: i32| {
+        // SAFETY: a fresh read-only shared mapping of part of the file.
+        let m = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                span,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                start as libc::off_t,
+            )
+        };
+        (m != libc::MAP_FAILED).then_some(m)
+    };
+    // A write-only descriptor cannot be mapped: the file through a
+    // read-only one of fwe's.
+    let mut own = -1;
+    let m = map(fd).or_else(|| {
+        let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: a buffer of `PATH_MAX` bytes, as `F_GETPATH` needs.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: the NUL-terminated path the host just gave.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        // Above the guest's descriptors, so it takes none of their numbers.
+        own = if fd < 0 { -1 } else { crate::fdtable::reserve(fd).unwrap_or(-1) };
+        if own < 0 { None } else { map(own) }
+    });
+    if let Some(m) = m {
+        // SAFETY: the mapping made above, synced, invalidated and unmapped.
+        unsafe {
+            libc::msync(m, span, libc::MS_SYNC | libc::MS_INVALIDATE);
+            libc::munmap(m, span);
+        }
+    }
+    if own >= 0 {
+        // SAFETY: fwe's own descriptor, opened above.
+        unsafe { libc::close(own) };
+    }
 }
 
 #[cfg(test)]

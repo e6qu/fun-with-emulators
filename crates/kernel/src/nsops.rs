@@ -236,6 +236,9 @@ impl<P: Platform> Kernel<P> {
         }
         // Its own record too: it may end before the parent writes it.
         crate::procreg::own_line(&t.line);
+        // Its mappings, for other processes' `/proc/<pid>/maps`, in a file
+        // of its own (not the parent's, which it inherited).
+        crate::maps::publish();
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();

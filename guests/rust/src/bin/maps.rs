@@ -50,11 +50,21 @@ unsafe extern "C" {
     fn open(path: *const c_char, flags: i32, ...) -> i32;
     fn ioctl(fd: i32, req: i32, ...) -> i32;
     fn getpagesize() -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn fork() -> i32;
+    fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
+    fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
+    fn _exit(code: i32) -> !;
 }
 
 /// The lines of `/proc/self/maps` as (start, end, perms, offset, name).
 fn maps() -> Vec<(u64, u64, String, u64, String)> {
-    let text = std::fs::read_to_string("/proc/self/maps").unwrap();
+    maps_of("self")
+}
+
+/// The lines of `/proc/<who>/maps`.
+fn maps_of(who: &str) -> Vec<(u64, u64, String, u64, String)> {
+    let text = std::fs::read_to_string(format!("/proc/{who}/maps")).unwrap();
     text.lines()
         .map(|l| {
             let mut f = l.split_whitespace();
@@ -77,7 +87,12 @@ fn perms_over(start: u64, end: u64) -> Vec<String> {
 
 /// A field of `/proc/self/smaps` for the mapping starting at `start`, in kB.
 fn smaps_field(start: u64, field: &str) -> u64 {
-    let text = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    smaps_field_of("self", start, field)
+}
+
+/// A field of `/proc/<who>/smaps` for the mapping starting at `start`.
+fn smaps_field_of(who: &str, start: u64, field: &str) -> u64 {
+    let text = std::fs::read_to_string(format!("/proc/{who}/smaps")).unwrap();
     let mut inside = false;
     for l in text.lines() {
         let first = l.split_whitespace().next().unwrap_or("");
@@ -157,6 +172,9 @@ fn main() {
             vma_name_size: buf.len() as u32,
             ..ProcmapQuery::default()
         };
+        let mut id = [0u8; 20];
+        q.build_id_addr = id.as_mut_ptr() as u64;
+        q.build_id_size = id.len() as u32;
         let r = ioctl(maps_fd, PROCMAP_QUERY, &mut q as *mut ProcmapQuery);
         let named = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_str().unwrap() == exe;
         println!(
@@ -164,9 +182,71 @@ fn main() {
             named && q.vma_start == code.map_or(1, |m| m.0),
             q.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE != 0
         );
+        // The build ID, as the program's file has it in its note.
+        let file = std::fs::read("/proc/self/exe").unwrap();
+        let head = [4u8, 0, 0, 0];
+        let note = file.windows(16).position(|w| {
+            w[..4] == head && w[8..12] == [3, 0, 0, 0] && &w[12..] == b"GNU\0"
+        });
+        let own = note.map(|at| {
+            let n = u32::from_le_bytes(file[at + 4..at + 8].try_into().unwrap()) as usize;
+            file[at + 16..at + 16 + n].to_vec()
+        });
+        let got = id[..q.build_id_size as usize].to_vec();
+        println!("query: build ID of {} bytes, the file's: {}", got.len(), own == Some(got.clone()));
+        // A buffer too small for it.
+        q.build_id_size = 4;
+        let short = ioctl(maps_fd, PROCMAP_QUERY, &mut q as *mut ProcmapQuery);
+        println!("query: a short build ID buffer: {short} {}", std::io::Error::last_os_error().raw_os_error() == Some(36));
 
         // Unmapped: gone from the list.
         munmap(s, 3 * page);
         println!("unmapped: listed {}", perms_over(lo, hi).len());
+
+        // Another process's mappings: a child maps a file from its second
+        // page and memory it fills, and waits while this one looks.
+        let (mut up, mut down) = ([0i32; 2], [0i32; 2]);
+        pipe(up.as_mut_ptr());
+        pipe(down.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            let name = CString::new("maps-other").unwrap();
+            let fd = memfd_create(name.as_ptr(), 0);
+            write(fd, vec![7u8; 3 * page].as_ptr(), 3 * page);
+            let f = mmap(std::ptr::null_mut(), 2 * page, PROT_READ, MAP_PRIVATE, fd, page as i64);
+            let m = mmap(std::ptr::null_mut(), 4 * page, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            std::ptr::write_bytes(m, 1, 4 * page);
+            let addrs = [f as u64, m as u64];
+            write(up[1], addrs.as_ptr().cast(), 16);
+            let mut b = 0u8;
+            read(down[0], &mut b, 1);
+            _exit(0);
+        }
+        let mut addrs = [0u64; 2];
+        read(up[0], addrs.as_mut_ptr().cast(), 16);
+        let who = child.to_string();
+        let line = maps_of(&who).into_iter().find(|m| m.0 == addrs[0]);
+        println!(
+            "other: {}",
+            line.map_or("not listed".into(), |l| format!("{} {}, from page {}", l.2, l.4, l.3 / page as u64))
+        );
+        println!("other: its filled memory resident: {}", smaps_field_of(&who, addrs[1], "Rss") > 0);
+        let fd = open(CString::new(format!("/proc/{who}/maps")).unwrap().as_ptr(), 0);
+        let mut buf = [0u8; 256];
+        let mut q = ProcmapQuery {
+            size: size_of::<ProcmapQuery>() as u64,
+            query_addr: addrs[0],
+            vma_name_addr: buf.as_mut_ptr() as u64,
+            vma_name_size: buf.len() as u32,
+            ..ProcmapQuery::default()
+        };
+        let r = ioctl(fd, PROCMAP_QUERY, &mut q as *mut ProcmapQuery);
+        let name = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_str().unwrap().to_string();
+        println!("other: query {r}: {name}, offset {} pages", q.vma_offset / page as u64);
+        write(down[1], b"x".as_ptr(), 1);
+        let mut status = 0;
+        waitpid(child, &mut status, 0);
+        let gone = std::fs::read_to_string(format!("/proc/{who}/maps")).is_err();
+        println!("other: gone with it: {gone}");
     }
 }

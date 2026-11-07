@@ -85,6 +85,22 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
     e
 }
 
+/// The host process whose `/proc/<pid>/maps` descriptor `fd` is open on,
+/// if it is one.
+fn maps_of_fd(fd: i32) -> Option<i32> {
+    let o = crate::fdmarks::origin(fd)?;
+    if o.fstype != crate::mounts::FsType::Proc {
+        return None;
+    }
+    let who = o.ns_path.strip_suffix(b"/maps")?.rsplit(|&b| b == b'/').next()?;
+    if who == b"self" {
+        // SAFETY: getpid cannot fail.
+        return Some(unsafe { libc::getpid() });
+    }
+    let pid: i32 = std::str::from_utf8(who).ok()?.parse().ok()?;
+    crate::pidns::to_host(pid)
+}
+
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
         if let Err(e) = crate::fdtable::check_args(n, &a) {
@@ -949,12 +965,8 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
-                ioctl::PROCMAP_QUERY
-                    if crate::fdmarks::origin(fd).is_some_and(|o| {
-                        o.fstype == crate::mounts::FsType::Proc && o.ns_path.ends_with(b"/maps")
-                    }) =>
-                {
-                    self.procmap_query(arg)
+                ioctl::PROCMAP_QUERY if let Some(pid) = maps_of_fd(fd) => {
+                    self.procmap_query(pid, arg)
                 }
                 ioctl::SIOCGIFFLAGS
                 | ioctl::SIOCSIFFLAGS
@@ -2441,6 +2453,49 @@ mod tests {
             libc::close(p[0]);
             libc::close(p[1]);
         }
+    }
+
+    /// `POSIX_FADV_DONTNEED` drops a file's pages from the host's cache,
+    /// after writing back what was written to it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fadvise_dontneed_drops_the_cache() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let file = tempfile_in_tmp();
+        // SAFETY: plain host call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 8 * page;
+        file.write_all_at(&vec![b'a'; len], 0).unwrap();
+        file.write_all_at(b"kept", 100).unwrap();
+        let resident = || {
+            // SAFETY: a fresh read-only shared mapping of the file.
+            let m = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(m, libc::MAP_FAILED);
+            let mut v = vec![0 as libc::c_char; 8];
+            // SAFETY: one byte for each page of the mapping.
+            unsafe { libc::mincore(m, len, v.as_mut_ptr()) };
+            // SAFETY: unmapping the mapping made above.
+            unsafe { libc::munmap(m, len) };
+            v.iter().filter(|&&b| b & 1 != 0).count()
+        };
+        assert!(resident() > 0);
+        let fd = file.as_raw_fd() as u64;
+        let dontneed = fwe_abi::fadvise::POSIX_FADV_DONTNEED;
+        assert_eq!(kernel().syscall(nr::FADVISE64, [fd, 0, 0, dontneed, 0, 0]), 0);
+        assert_eq!(resident(), 0);
+        let mut b = [0u8; 4];
+        file.read_exact_at(&mut b, 100).unwrap();
+        assert_eq!(&b, b"kept");
     }
 
     fn tempfile_in_tmp() -> std::fs::File {

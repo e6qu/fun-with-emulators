@@ -277,6 +277,7 @@ impl<P: Platform> Kernel<P> {
                 offset: 0,
             },
         );
+        crate::maps::publish();
         let me = ipc::me();
         ipc::note_attached(mapped as u64, id, size);
         let _ = r.update(|t| {

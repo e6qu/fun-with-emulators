@@ -13,4 +13,7 @@ rustflags = [
     # musl's non-PIE crt1 takes the address of a weak _DYNAMIC with adrp but
     # never uses it; undefined (0) it is out of adrp range from the image.
     "-C", "link-arg=--defsym=_DYNAMIC=0x10000000000",
+    # A GNU build ID, as distributions' binaries carry (`PROCMAP_QUERY`
+    # reports it).
+    "-C", "link-arg=--build-id",
 ]

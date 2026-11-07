@@ -201,6 +201,8 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"stat", DT_REG),
     (b"status", DT_REG),
     (b"cmdline", DT_REG),
+    (b"maps", DT_REG),
+    (b"smaps", DT_REG),
     (b"comm", DT_REG),
     (b"exe", DT_LNK),
     (b"cgroup", DT_REG),
@@ -352,6 +354,10 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
                 ..Creds::default()
             }
         })),
+        b"/maps" | b"/smaps" => match crate::mm::MapsView::of(host) {
+            Some(v) => Entry::File(v.render(sub == b"/smaps")),
+            None => Entry::Missing,
+        },
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),

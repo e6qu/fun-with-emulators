@@ -401,6 +401,14 @@ impl Fs {
         let exe_fd = self.proc.exe_fd;
         let auxv = std::mem::take(&mut self.proc.auxv);
         crate::procreg::own_program(&exe, &cmdline);
+        // The program's file, for `/proc/self/maps`: through the descriptor
+        // it was run by, if it has no path.
+        let id = match exe_fd {
+            Some(fd) => crate::fsops::linux_fstat(fd).ok().map(|st| (st.st_dev, st.st_ino)),
+            None => self.file_id(&exe),
+        };
+        crate::maps::record().set_exe(exe.clone(), id.unwrap_or((0, 0)));
+        crate::maps::publish();
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
     }
 
@@ -1095,18 +1103,47 @@ impl Fs {
     /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
     /// mappings (see [`crate::maps`]).
     fn maps(&self, smaps: bool) -> Vec<u8> {
-        // The host's view first: its lock comes before the record's.
-        let extra = crate::mm::host_guest_memory();
-        let areas = crate::maps::record().with_extra(&extra);
-        let exe = self.maps_exe();
-        let usage = |s: u64, e: u64| crate::maps::Usage { resident: crate::mm::resident(s, e) };
-        crate::maps::render(&areas, &exe, crate::maps::page_size(), smaps.then_some(&usage))
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        crate::mm::MapsView::of(me).map_or_else(Vec::new, |v| v.render(smaps))
     }
 
-    /// The program as `/proc/self/maps` names it.
-    pub(crate) fn maps_exe(&self) -> crate::maps::Exe<'_> {
-        let exe = self.exe();
-        crate::maps::Exe { path: exe, id: self.file_id(exe).unwrap_or((0, 0)) }
+    /// The first `len` bytes (or fewer, at its end) of the regular file
+    /// `path` names.
+    pub fn read_head(&self, path: &[u8], len: usize) -> Result<Vec<u8>, i32> {
+        let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        let name = resolved.name_c()?;
+        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+        let fd = unsafe {
+            libc::openat(resolved.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(e());
+        }
+        // SAFETY: `fd` is a fresh owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut out = vec![0u8; len];
+        let mut at = 0;
+        while at < len {
+            // SAFETY: reading into the rest of `out`.
+            let n = unsafe {
+                libc::pread(
+                    fd.as_raw_fd(),
+                    out[at..].as_mut_ptr().cast(),
+                    len - at,
+                    at as libc::off_t,
+                )
+            };
+            if n < 0 {
+                return Err(e());
+            }
+            if n == 0 {
+                break;
+            }
+            at += n as usize;
+        }
+        out.truncate(at);
+        Ok(out)
     }
 
     /// The device and inode numbers of the file `path` names, following

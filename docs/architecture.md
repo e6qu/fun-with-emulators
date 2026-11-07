@@ -93,7 +93,14 @@ in the list does not pick it. Locking (`mlock`, `mlock2`, `mlockall`,
 `MAP_LOCKED`) brings the memory in and marks it locked, which `smaps`,
 `VmLck` in `/proc/self/status` and the next lock's `RLIMIT_MEMLOCK` check
 count; the host is not asked to wire it. `mincore` reports the host's
-residency of each page.
+residency of each page. Each process publishes its record after every
+change, in a shared file beside its process record (a sequence word odd
+while it is being written), so another process's `/proc/<pid>/maps` and
+`smaps` are read from it, with that process's own memory regions and their
+resident pages from the host (`proc_pidinfo`). `PROCMAP_QUERY` answers for
+any of them, with the GNU build ID of the mapped file read from its start.
+`POSIX_FADV_DONTNEED` writes a range's changes back and drops its pages
+from the host's cache (a shared mapping of it, synced and invalidated).
 
 macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO`; on Apple
 Silicon the kernel refuses to launch a process with a smaller one.
@@ -1080,12 +1087,10 @@ those items.
   `RLIMIT_CPU` and the like) cannot be raised past the host's hard limit,
   even by root, and the host acts on them as macOS does (it sends no
   `SIGKILL` at the hard CPU limit).
-- **Mappings:** another process's `/proc/<pid>/maps` is not available (a
-  process's record is its own); in the hypervisor backend, residency
-  (`mincore`, `Rss`) is by the host's 16 KiB pages, so a 4 KiB guest page
-  is in memory when its neighbour in the host page is; `PROCMAP_QUERY`
-  gives no build IDs; `POSIX_FADV_DONTNEED` leaves the host's cache as it
-  is.
+- **Mappings:** in the hypervisor backend, residency (`mincore`, `Rss`)
+  is by the host's 16 KiB pages, so a 4 KiB guest page is in memory when
+  its neighbour in the host page is; another process's `Rss` gives each
+  mapping its share of the host region it lies in.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.

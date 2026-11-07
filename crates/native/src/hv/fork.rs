@@ -794,6 +794,8 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     }
     // Its own record too: it may end before the parent writes it.
     fwe_kernel::procreg::own_line(&line);
+    // Its mappings, for other processes' `/proc/<pid>/maps`.
+    fwe_kernel::maps::publish();
     fwe_kernel::reaper::start_if_reaper();
     d.finish()?;
     backend::become_vm_process()?;

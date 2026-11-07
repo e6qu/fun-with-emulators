@@ -108,6 +108,12 @@ fn path(pid: i32) -> Option<Vec<u8>> {
     Some([dir()?, format!("/{pid}").into_bytes()].concat())
 }
 
+/// The file host process `pid` publishes its mappings in (see
+/// [`crate::maps::publish`]).
+pub fn maps_path(pid: i32) -> Option<Vec<u8>> {
+    Some([path(pid)?, b".maps".to_vec()].concat())
+}
+
 /// When host process `pid` started, if it exists.
 pub fn start_time(pid: i32) -> Option<u64> {
     host_info(pid).map(|(start, _, _)| start)
@@ -224,6 +230,7 @@ fn lock(pid: i32) -> Option<std::fs::File> {
 pub fn remove(pid: i32) {
     if let Some(p) = path(pid) {
         let _ = std::fs::remove_file(OsStr::from_bytes(&p));
+        let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
         let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     }
     crate::signote::remove(pid);

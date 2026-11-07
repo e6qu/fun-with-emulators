@@ -12,9 +12,14 @@
 //! for (the native backend's code stubs, a stack's guard page) is listed
 //! as anonymous memory with the host's protections, so a program looking
 //! for free address space in the list does not pick it.
+//!
+//! Each process publishes its record after every change, in a shared file
+//! beside its process record ([`publish`]), which another process reads
+//! for `/proc/<pid>/maps` ([`of_process`]).
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a mapping is named by in the listing.
@@ -98,6 +103,10 @@ pub struct Record {
     brk: (u64, u64),
     /// `mlockall(MCL_FUTURE)`: new mappings are locked.
     lock_future: bool,
+    /// The program's path, as `/proc/self/exe` names it, and its file's
+    /// device and inode.
+    exe: Vec<u8>,
+    exe_id: (u64, u64),
 }
 
 impl Default for Record {
@@ -108,7 +117,79 @@ impl Default for Record {
 
 impl Record {
     pub const fn new() -> Record {
-        Record { areas: Vmas::new(), brk: (0, 0), lock_future: false }
+        Record {
+            areas: Vmas::new(),
+            brk: (0, 0),
+            lock_future: false,
+            exe: Vec::new(),
+            exe_id: (0, 0),
+        }
+    }
+
+    /// The program is `path`, whose file's device and inode are `id`.
+    pub fn set_exe(&mut self, path: Vec<u8>, id: (u64, u64)) {
+        self.exe = path;
+        self.exe_id = id;
+    }
+
+    /// The program, as the listing names it.
+    pub fn exe(&self) -> Exe<'_> {
+        Exe { path: &self.exe, id: self.exe_id }
+    }
+
+    /// The record in a form [`Record::decode`] reads back.
+    pub fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.u64(self.brk.0);
+        e.u64(self.brk.1);
+        e.bool(self.lock_future);
+        e.bytes(&self.exe);
+        e.u64(self.exe_id.0);
+        e.u64(self.exe_id.1);
+        let all: Vec<_> = self.areas.iter().collect();
+        e.u64(all.len() as u64);
+        for p in all {
+            let a = p.value;
+            for v in [p.start, p.end, a.prot, a.object.dev, a.object.ino, a.object.offset] {
+                e.u64(v);
+            }
+            e.bool(a.shared);
+            e.bool(a.locked);
+            match &a.object.name {
+                Name::Anonymous => e.u8(0),
+                Name::Heap => e.u8(1),
+                Name::Stack => e.u8(2),
+                Name::Exe => e.u8(3),
+                Name::Path(p) => {
+                    e.u8(4);
+                    e.bytes(p);
+                }
+            }
+        }
+    }
+
+    /// The record [`Record::encode`] wrote.
+    pub fn decode(d: &mut crate::snapshot::Dec) -> Record {
+        let mut r = Record::new();
+        r.brk = (d.u64(), d.u64());
+        r.lock_future = d.bool();
+        r.exe = d.bytes();
+        r.exe_id = (d.u64(), d.u64());
+        let n = d.count(8 * 6 + 3);
+        for _ in 0..n {
+            let (start, end, prot, dev, ino, offset) =
+                (d.u64(), d.u64(), d.u64(), d.u64(), d.u64(), d.u64());
+            let (shared, locked) = (d.bool(), d.bool());
+            let name = match d.u8() {
+                1 => Name::Heap,
+                2 => Name::Stack,
+                3 => Name::Exe,
+                4 => Name::Path(d.bytes().into()),
+                _ => Name::Anonymous,
+            };
+            let object = Object { name, dev, ino, offset };
+            r.areas.insert(start, end, Area { prot, shared, locked, object });
+        }
+        r
     }
 
     /// The guest mapped `[start, start + len)` with Linux protections
@@ -350,53 +431,186 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 
 /// Save the record for a fork child that is a fresh process.
 pub fn save(e: &mut crate::snapshot::Enc) {
-    let s = record();
-    e.u64(s.brk.0);
-    e.u64(s.brk.1);
-    e.bool(s.lock_future);
-    let all: Vec<_> = s.areas.iter().collect();
-    e.u64(all.len() as u64);
-    for p in all {
-        let a = p.value;
-        for v in [p.start, p.end, a.prot, a.object.dev, a.object.ino, a.object.offset] {
-            e.u64(v);
-        }
-        e.bool(a.shared);
-        e.bool(a.locked);
-        match &a.object.name {
-            Name::Anonymous => e.u8(0),
-            Name::Heap => e.u8(1),
-            Name::Stack => e.u8(2),
-            Name::Exe => e.u8(3),
-            Name::Path(p) => {
-                e.u8(4);
-                e.bytes(p);
-            }
-        }
-    }
+    record().encode(e);
 }
 
 /// The record [`save`] saved.
 pub fn restore(d: &mut crate::snapshot::Dec) {
-    let mut s = record();
-    s.brk = (d.u64(), d.u64());
-    s.lock_future = d.bool();
-    s.areas = Vmas::new();
-    let n = d.count(8 * 6 + 3);
-    for _ in 0..n {
-        let (start, end, prot, dev, ino, offset) =
-            (d.u64(), d.u64(), d.u64(), d.u64(), d.u64(), d.u64());
-        let (shared, locked) = (d.bool(), d.bool());
-        let name = match d.u8() {
-            1 => Name::Heap,
-            2 => Name::Stack,
-            3 => Name::Exe,
-            4 => Name::Path(d.bytes().into()),
-            _ => Name::Anonymous,
-        };
-        let object = Object { name, dev, ino, offset };
-        s.areas.insert(start, end, Area { prot, shared, locked, object });
+    *record() = Record::decode(d);
+}
+
+/// A process's mappings as it published them for other processes
+/// ([`publish`]).
+pub struct Published {
+    pub record: Record,
+    /// Its page size.
+    pub page: u64,
+    /// The memory fwe mapped for the guest, host `(start, len)` (see
+    /// [`crate::mm::tracked`]).
+    pub tracked: Vec<(u64, u64)>,
+    /// Its guest addresses backed elsewhere, `(guest, len, host)` (see
+    /// [`crate::uaccess::translations`]).
+    pub translations: Vec<(u64, u64, u64)>,
+}
+
+impl Published {
+    /// The host address of guest address `addr` in that process.
+    pub fn host_of(&self, addr: u64) -> u64 {
+        self.translations
+            .iter()
+            .find(|&&(g, l, _)| addr >= g && addr < g + l)
+            .map_or(addr, |&(g, _, h)| h + (addr - g))
     }
+}
+
+/// The shared file this process publishes its mappings in: other
+/// processes read it for `/proc/<pid>/maps`. It holds a sequence word
+/// (odd while a change is written), the length of what follows, and the
+/// encoded [`Published`].
+struct Outbox {
+    pid: i32,
+    fd: i32,
+    map: *mut u8,
+    cap: usize,
+}
+
+// SAFETY: the mapping is this process's own, used under `OUTBOX`'s lock.
+unsafe impl Send for Outbox {}
+
+static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
+
+/// The header before the encoded record: the sequence word and the length.
+const HEADER: usize = 16;
+
+/// Publish this process's mappings for other processes to read (after
+/// each change, and in a new process).
+pub fn publish() {
+    // The host's view first: its lock comes before the record's.
+    let tracked = crate::mm::tracked();
+    let translations = crate::uaccess::translations();
+    let mut e = crate::snapshot::Enc::new();
+    record().encode(&mut e);
+    e.u64(page_size());
+    e.u64(tracked.len() as u64);
+    for (start, len) in tracked {
+        e.u64(start);
+        e.u64(len);
+    }
+    e.u64(translations.len() as u64);
+    for (g, l, h) in translations {
+        for v in [g, l, h] {
+            e.u64(v);
+        }
+    }
+    let body = e.into_bytes();
+    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    if let Some(o) = out.as_ref()
+        && o.pid != me
+    {
+        // A fork child's copy of its parent's: let it go, and make its own.
+        // SAFETY: the mapping and descriptor are this process's copies.
+        unsafe {
+            libc::munmap(o.map.cast(), o.cap);
+            libc::close(o.fd);
+        }
+        *out = None;
+    }
+    if out.is_none() {
+        let Some(path) = crate::procreg::maps_path(me) else { return };
+        let Ok(c) = std::ffi::CString::new(path) else { return };
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return;
+        }
+        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
+        *out = Some(Outbox { pid: me, fd, map: std::ptr::null_mut(), cap: 0 });
+    }
+    let Some(o) = out.as_mut() else { return };
+    let need = HEADER + body.len();
+    if need > o.cap {
+        let cap = need.next_power_of_two().max(1 << 16);
+        // SAFETY: fwe's own file; growing it keeps what it holds.
+        if unsafe { libc::ftruncate(o.fd, cap as libc::off_t) } != 0 {
+            return;
+        }
+        // SAFETY: a fresh shared mapping of the whole file.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                cap,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                o.fd,
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return;
+        }
+        if !o.map.is_null() {
+            // SAFETY: the old mapping, replaced by the new one.
+            unsafe { libc::munmap(o.map.cast(), o.cap) };
+        }
+        o.map = map.cast();
+        o.cap = cap;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering, fence};
+    // SAFETY: the mapping is `cap` bytes, at least `need`, page-aligned
+    // (so the words are aligned), and only this process writes it.
+    unsafe {
+        let seq = &*(o.map as *const AtomicU64);
+        let len = &*(o.map.add(8) as *const AtomicU64);
+        let s = seq.load(Ordering::Relaxed);
+        seq.store(s | 1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        std::ptr::copy_nonoverlapping(body.as_ptr(), o.map.add(HEADER), body.len());
+        len.store(body.len() as u64, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        seq.store((s | 1) + 1, Ordering::Release);
+    }
+}
+
+/// The mappings host process `pid` published, if it is a process of
+/// fwe's that has.
+pub fn of_process(pid: i32) -> Option<Published> {
+    use std::os::unix::fs::FileExt;
+    let path = crate::procreg::maps_path(pid)?;
+    let file = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)).ok()?;
+    let word = |at: u64| -> Option<u64> {
+        let mut b = [0u8; 8];
+        file.read_exact_at(&mut b, at).ok()?;
+        Some(u64::from_ne_bytes(b))
+    };
+    // A consistent copy: the same even sequence word before and after.
+    for _ in 0..1000 {
+        let before = word(0)?;
+        if before & 1 == 0 {
+            let len = word(8)? as usize;
+            let mut body = vec![0u8; len];
+            if file.read_exact_at(&mut body, HEADER as u64).is_ok() && word(0)? == before {
+                let mut d = crate::snapshot::Dec::new(&body);
+                let record = Record::decode(&mut d);
+                let page = d.u64();
+                let n = d.count(16);
+                let tracked = (0..n).map(|_| (d.u64(), d.u64())).collect();
+                let n = d.count(24);
+                let translations = (0..n).map(|_| (d.u64(), d.u64(), d.u64())).collect();
+                d.finish().ok()?;
+                return Some(Published { record, page, tracked, translations });
+            }
+        }
+        std::thread::yield_now();
+    }
+    None
 }
 
 /// What the listing shows of each mapping beyond its line (`smaps`).
