@@ -260,7 +260,19 @@ pub mod region {
         pages_reusable: c_uint,
     }
 
+    /// `vm_region_top_info`.
+    #[repr(C)]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct TopInfo {
+        obj_id: c_uint,
+        ref_count: c_uint,
+        private_pages_resident: c_uint,
+        shared_pages_resident: c_uint,
+        share_mode: c_uchar,
+    }
+
     const VM_REGION_BASIC_INFO_64: c_int = 9;
+    const VM_REGION_TOP_INFO: c_int = 12;
     const VM_REGION_EXTENDED_INFO: c_int = 13;
     /// `VM_INHERIT_COPY`: what a `MAP_PRIVATE` mapping gets; `MAP_SHARED`
     /// mappings inherit by sharing (`VM_INHERIT_SHARE`, 0).
@@ -362,6 +374,24 @@ pub mod region {
         // SAFETY: changes only what a later fork does with this task's own
         // memory; the mapping itself is untouched.
         unsafe { minherit(start as *mut libc::c_void, len as usize, how as c_int) };
+    }
+
+    /// What memory host address `addr` is, as Linux tells futexes apart:
+    /// `Some(None)` for private memory (a futex there is this process's,
+    /// at this address), `Some(Some((object, offset)))` for shared memory,
+    /// the same pair in every process that maps it, wherever (Mach's id of
+    /// the memory object, the same for the system's life, and the offset
+    /// into it); `None` where nothing is mapped.
+    pub fn sharing(addr: u64) -> Option<Option<(u32, u64)>> {
+        let (start, _, basic) = query_flavor::<BasicInfo>(addr, VM_REGION_BASIC_INFO_64)?;
+        if start > addr {
+            return None;
+        }
+        if basic.inheritance == VM_INHERIT_COPY {
+            return Some(None);
+        }
+        let (_, _, top) = query_flavor::<TopInfo>(start, VM_REGION_TOP_INFO)?;
+        Some(Some((top.obj_id, basic.offset + (addr - start))))
     }
 
     pub fn query(addr: u64) -> Option<Region> {

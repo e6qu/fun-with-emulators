@@ -59,7 +59,9 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             )
         } == tsize;
         let state = match b.pbi_status {
-            2 => b'R', // SRUN
+            // SRUN: running or runnable, as the host sees a process that
+            // is neither stopped nor ended; Linux tells from its threads.
+            2 => threads_state(pid),
             4 => b'T', // SSTOP
             5 => b'Z', // SZOMB
             _ => b'S', // SIDL, SSLEEP
@@ -79,7 +81,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             ppid: crate::reaper::parent_of(pid, b.pbi_ppid as i32),
             pgid: b.pbi_pgid as i32,
             sid,
-            nice: b.pbi_nice,
+            nice: crate::procreg::nice(pid),
             threads: if have_task { t.pti_threadnum as u64 } else { 1 },
             rss_bytes: if have_task { t.pti_resident_size } else { 0 },
             vsize: if have_task { t.pti_virtual_size } else { 0 },
@@ -87,6 +89,73 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             stime: if have_task { ns_to_ticks(mach_to_ns(t.pti_total_system)) } else { 0 },
             start: (since_boot * HZ as f64) as u64,
         })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Linux's state of host process `pid`, which the host has running: `R`
+/// if a thread of it runs (or waits only for a processor), `S` if every
+/// one sleeps (a thread in a system call that waits, which Linux shows as
+/// sleeping and programs wait to see).
+#[cfg(target_os = "macos")]
+fn threads_state(pid: i32) -> u8 {
+    /// `PROC_PIDLISTTHREADS`: the process's thread handles.
+    const PROC_PIDLISTTHREADS: i32 = 6;
+    let mut handles = [0u64; 256];
+    let size = std::mem::size_of_val(&handles) as i32;
+    // SAFETY: a valid out-buffer of `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles.as_mut_ptr().cast(), size)
+    };
+    if got <= 0 {
+        return b'R';
+    }
+    for &h in &handles[..got as usize / 8] {
+        // SAFETY: zeroed bytes are a valid `proc_threadinfo`, which the
+        // call fills.
+        let mut t: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        let tsize = std::mem::size_of::<libc::proc_threadinfo>() as i32;
+        // SAFETY: a valid out-buffer of `tsize` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTHREADINFO,
+                h,
+                (&mut t as *mut libc::proc_threadinfo).cast(),
+                tsize,
+            )
+        };
+        if n == tsize && t.pth_run_state == libc::TH_STATE_RUNNING {
+            return b'R';
+        }
+    }
+    b'S'
+}
+
+/// The CPU time host process `pid` has used, user and system, in
+/// nanoseconds.
+pub fn cpu_ns(pid: i32) -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: zeroed bytes are a valid `proc_taskinfo`, which the call
+        // fills.
+        let mut t: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        // SAFETY: a valid out-buffer of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&mut t as *mut libc::proc_taskinfo).cast(),
+                size,
+            )
+        };
+        (got == size).then(|| (mach_to_ns(t.pti_total_user), mach_to_ns(t.pti_total_system)))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -140,7 +209,7 @@ pub fn stat_line(pid: i32, comm: &[u8], h: &HostInfo) -> Vec<u8> {
     let g = crate::pidns::to_guest;
     let page = 16384;
     format!(
-        "{pid} ({}) {} {} {} {} 0 -1 4194560 0 0 0 0 {} {} 0 0 20 {} {} 0 {} {} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{pid} ({}) {} {} {} {} 0 -1 4194560 0 0 0 0 {} {} 0 0 {} {} {} 0 {} {} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         String::from_utf8_lossy(comm),
         h.state as char,
         g(h.ppid),
@@ -148,6 +217,7 @@ pub fn stat_line(pid: i32, comm: &[u8], h: &HostInfo) -> Vec<u8> {
         g(h.sid),
         h.utime,
         h.stime,
+        20 + h.nice,
         h.nice,
         h.threads,
         h.start,
@@ -400,16 +470,14 @@ pub fn oom_write(mark: crate::fdmarks::Mark, data: &[u8], len: u64) -> i64 {
     }
 }
 
-/// A `write` of `len` bytes at guest `buf` to `fd`: for an
-/// `oom_score_adj` file opened for writing, what the write does.
-pub fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
+/// A write of `len` bytes, `data` the first of them, to `fd`: for an
+/// `oom_score_adj` file opened for writing, what the write does (see
+/// [`crate::specialwrite`]).
+pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     let mark @ crate::fdmarks::Mark::OomScore { .. } = crate::fdmarks::marked(fd)? else {
         return None;
     };
-    Some(match crate::uaccess::read_bytes(buf, len.min(64) as usize) {
-        Ok(d) => oom_write(mark, &d, len),
-        Err(e) => fwe_abi::err(e),
-    })
+    Some(oom_write(mark, &data[..data.len().min(64)], len))
 }
 
 /// What one of another process's descriptors is open on, as the host

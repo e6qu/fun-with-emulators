@@ -1,10 +1,15 @@
-//! A process-global futex: `FUTEX_WAIT` blocks and `FUTEX_WAKE` wakes, across
-//! the host threads that run the guest's threads.
+//! Futexes: `FUTEX_WAIT` blocks and `FUTEX_WAKE` wakes.
 //!
-//! The wait queues live here, outside the kernel lock, and operate only on
-//! raw guest memory (the futex word) and their own synchronization. A backend
-//! therefore runs a futex operation **without** holding the kernel lock, so a
-//! waiting thread never blocks the threads that would wake it.
+//! A private futex (`FUTEX_PRIVATE_FLAG`, what a process's own locks use)
+//! is the process's: its wait queues live here, outside the kernel lock,
+//! and operate only on raw guest memory (the futex word) and their own
+//! synchronization. A shared one, as Linux keys it by the memory itself,
+//! may be woken from another process that maps the same memory (a
+//! process-shared lock, condition or semaphore, in `/dev/shm` or a
+//! `MAP_SHARED` mapping): it waits on the host's own shared address waits
+//! ([`shared`]), which key on the memory too. A backend runs a futex
+//! operation **without** holding the kernel lock, so a waiting thread
+//! never blocks the threads that would wake it.
 
 use fwe_abi::{Timespec, err, errno, futex};
 use std::collections::HashMap;
@@ -25,7 +30,7 @@ fn table() -> &'static Table {
 }
 
 /// Read the futex word from guest memory (an aligned single load).
-fn load(uaddr: u64) -> crate::uaccess::Result<u32> {
+pub(crate) fn load(uaddr: u64) -> crate::uaccess::Result<u32> {
     crate::uaccess::read(uaddr)
 }
 
@@ -38,20 +43,124 @@ pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
     if uaddr % 4 != 0 {
         return err(errno::EINVAL);
     }
-    match op & futex::FUTEX_CMD_MASK {
+    // SAFETY: the caller's guarantee, passed on; no second address.
+    unsafe { op_full(uaddr, op, val, timeout, 0, u32::MAX) }
+}
+
+/// [`op`] with `futex`'s fifth and sixth arguments: `uaddr2` and `val3`
+/// (the bitset of the bitset operations, the expected value of
+/// `FUTEX_CMP_REQUEUE`). For the requeue operations `timeout` is the
+/// number to move (`val2`).
+///
+/// # Safety
+/// As for [`op`].
+pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
+    if uaddr % 4 != 0 {
+        return err(errno::EINVAL);
+    }
+    let private = op & futex::FUTEX_PRIVATE_FLAG != 0;
+    let cmd = op & futex::FUTEX_CMD_MASK;
+    // Linux finds the word's memory for every operation, a wake's too:
+    // `EFAULT` where there is none to read.
+    if matches!(cmd, futex::FUTEX_WAKE | futex::FUTEX_WAKE_BITSET | futex::FUTEX_REQUEUE)
+        && let Err(e) = load(uaddr)
+    {
+        return err(e);
+    }
+    if matches!(cmd, futex::FUTEX_REQUEUE | futex::FUTEX_CMP_REQUEUE)
+        && let Err(e) = load(uaddr2)
+    {
+        return err(e);
+    }
+    match cmd {
         futex::FUTEX_WAIT => {
             let deadline = crate::guest!(wait_deadline(timeout));
-            wait(uaddr, val, deadline)
+            if private {
+                wait_private(uaddr, val, deadline)
+            } else {
+                shared::wait(uaddr, val, deadline, u32::MAX)
+            }
         }
         futex::FUTEX_WAIT_BITSET => {
-            // Treat the bitset variant as a plain wait. Its timeout is
-            // absolute, on CLOCK_MONOTONIC unless FUTEX_CLOCK_REALTIME is set.
+            if val3 == 0 {
+                return err(errno::EINVAL);
+            }
+            // Its timeout is absolute, on CLOCK_MONOTONIC unless
+            // FUTEX_CLOCK_REALTIME is set. A private one waits for any
+            // wake (a wake for other bits is a spurious wakeup, which a
+            // futex's user allows for).
             let realtime = op & futex::FUTEX_CLOCK_REALTIME != 0;
             let deadline = crate::guest!(wait_deadline_abs(timeout, realtime));
-            wait(uaddr, val, deadline)
+            if private {
+                wait_private(uaddr, val, deadline)
+            } else {
+                shared::wait(uaddr, val, deadline, val3)
+            }
         }
-        futex::FUTEX_WAKE | futex::FUTEX_WAKE_BITSET => wake(uaddr, val),
+        futex::FUTEX_WAKE | futex::FUTEX_WAKE_BITSET if private => {
+            if op & futex::FUTEX_CMD_MASK == futex::FUTEX_WAKE_BITSET && val3 == 0 {
+                return err(errno::EINVAL);
+            }
+            wake_private(uaddr, val)
+        }
+        futex::FUTEX_WAKE => shared::wake(uaddr, val, u32::MAX),
+        futex::FUTEX_WAKE_BITSET if val3 == 0 => err(errno::EINVAL),
+        futex::FUTEX_WAKE_BITSET => shared::wake(uaddr, val, val3),
+        futex::FUTEX_REQUEUE | futex::FUTEX_CMP_REQUEUE => {
+            if uaddr2 % 4 != 0 || (val as i32) < 0 || (timeout as i32) < 0 {
+                return err(errno::EINVAL);
+            }
+            if op & futex::FUTEX_CMD_MASK == futex::FUTEX_CMP_REQUEUE {
+                match load(uaddr) {
+                    Ok(v) if v == val3 => {}
+                    Ok(_) => return err(errno::EAGAIN),
+                    Err(e) => return err(e),
+                }
+            }
+            let moved = timeout as u32;
+            if private {
+                // The process's own waiters sleep on one condition: those
+                // to move are woken instead, which they take as a spurious
+                // wakeup (and wait again on the other word).
+                wake_private(uaddr, val.saturating_add(moved))
+            } else {
+                shared::requeue(uaddr, val, moved, uaddr2)
+            }
+        }
         _ => err(errno::ENOSYS),
+    }
+}
+
+/// Wake up to `count` waiters on the word at `uaddr`, private or shared
+/// (for what fwe itself wakes, as Linux wakes a thread's
+/// `clear_child_tid` word as it ends, which C libraries wait on either
+/// way).
+pub fn wake_any(uaddr: u64, count: u32) -> i64 {
+    let woken = wake_private(uaddr, count);
+    if cfg!(not(target_os = "macos")) || woken >= count as i64 {
+        return woken;
+    }
+    woken + shared::wake(uaddr, count - woken as u32, u32::MAX).max(0)
+}
+
+#[cfg(target_os = "macos")]
+use crate::sharedfutex as shared;
+
+/// Elsewhere every futex is the process's own.
+#[cfg(not(target_os = "macos"))]
+mod shared {
+    use super::Instant;
+
+    pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, _bits: u32) -> i64 {
+        super::wait_private(uaddr, val, deadline)
+    }
+
+    pub fn wake(uaddr: u64, count: u32, _bits: u32) -> i64 {
+        super::wake_private(uaddr, count)
+    }
+
+    pub fn requeue(uaddr: u64, wake: u32, requeue: u32, _uaddr2: u64) -> i64 {
+        super::wake_private(uaddr, wake.saturating_add(requeue))
     }
 }
 
@@ -93,10 +202,10 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// How often a blocked futex wait checks for a pending signal.
-const SIGNAL_CHECK: Duration = Duration::from_millis(20);
+pub(crate) const SIGNAL_CHECK: Duration = Duration::from_millis(20);
 
-/// Block while the futex word still equals `val`.
-fn wait(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
+/// Block while the futex word still equals `val` (a private futex).
+pub(crate) fn wait_private(uaddr: u64, val: u32, deadline: Option<Instant>) -> i64 {
     let table = table();
     let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     // Re-check under the lock: if the value already differs, do not sleep.
@@ -150,9 +259,9 @@ fn decrement(queues: &mut HashMap<u64, usize>, uaddr: u64) {
     }
 }
 
-/// Wake up to `count` waiters on `uaddr`. Returns the number that may have
-/// been waiting (an upper bound, as Linux allows).
-fn wake(uaddr: u64, count: u32) -> i64 {
+/// Wake up to `count` waiters on private futex `uaddr`. Returns the number
+/// that may have been waiting (an upper bound, as Linux allows).
+pub(crate) fn wake_private(uaddr: u64, count: u32) -> i64 {
     let table = table();
     let queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     let waiting = queues.get(&uaddr).copied().unwrap_or(0);

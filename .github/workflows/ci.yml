@@ -77,6 +77,45 @@ jobs:
           exit "$status"
       - run: cargo test
 
+  # The Linux Test Project's system-call tests (tools/ltp): every test of the
+  # baseline must still pass, and the pass rate is reported.
+  ltp:
+    name: LTP system calls (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - id: ltp-cache
+        uses: actions/cache@v4
+        with:
+          path: target/ltp/root/opt/ltp
+          key: ltp-${{ hashFiles('tools/ltp/build.sh') }}
+      - name: Install zig 0.17.0 (to build LTP)
+        if: steps.ltp-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/zig.tar.xz" \
+            https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz
+          echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  $RUNNER_TEMP/zig.tar.xz" \
+            | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Build LTP
+        if: steps.ltp-cache.outputs.cache-hit != 'true'
+        run: tools/ltp/build.sh target/ltp
+      - run: cargo build
+      - name: Run LTP's system-call tests under fwe
+        run: |
+          python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
+            --results ltp-results.txt --show
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltp-results
+          path: ltp-results.txt
+          if-no-files-found: ignore
+
   # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs
   # without nested virtualization (kern.hv_support = 0), so HVF cannot run
   # there and the hv_ tests skip; this job targets a self-hosted Apple Silicon

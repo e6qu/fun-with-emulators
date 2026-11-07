@@ -167,6 +167,34 @@ pub fn clock_to_host(id: u64) -> Option<libc::clockid_t> {
     })
 }
 
+/// The CPU time host thread `t` of this process has used, user and
+/// system, in nanoseconds.
+pub fn thread_cpu_ns(t: libc::pthread_t) -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a live thread of this process (the caller's guarantee:
+        // fwe's record of it); zeroed bytes are a valid info structure,
+        // which the call fills, `count` words of it.
+        unsafe {
+            let port = libc::pthread_mach_thread_np(t);
+            let mut info: libc::thread_extended_info = std::mem::zeroed();
+            let mut count = libc::THREAD_EXTENDED_INFO_COUNT;
+            let kr = libc::thread_info(
+                port,
+                libc::THREAD_EXTENDED_INFO as libc::thread_flavor_t,
+                (&mut info as *mut libc::thread_extended_info).cast(),
+                &mut count,
+            );
+            (kr == 0).then_some((info.pth_user_time, info.pth_system_time))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = t;
+        None
+    }
+}
+
 /// Host resource for a Linux resource limit, if the host has it.
 pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
     Some(match resource {

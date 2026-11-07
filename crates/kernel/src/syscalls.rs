@@ -110,69 +110,21 @@ impl<P: Platform> Kernel<P> {
     fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             // Files and I/O.
-            nr::READ if crate::seqpacket::is(a[0] as i32) => {
-                let v = guest!(uaccess::host_buffer(a[1], a[2], true));
-                crate::seqpacket::read(a[0] as i32, &[v])
-            }
-            nr::READ => {
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe { libc::read(a[0] as i32, a[1] as *mut _, a[2] as usize) } as i64)
-            }
-            nr::WRITE => {
-                if let Some(r) = crate::cgroupfs::try_write(a[0] as i32, a[1], a[2]) {
-                    return r;
-                }
-                if crate::fdmarks::any_marks()
-                    && let Some(r) = crate::userns::try_write(a[0] as i32, a[1], a[2])
-                {
-                    return r;
-                }
-                if crate::fdmarks::any_marks()
-                    && let Some(r) = crate::sysctl::try_write(a[0] as i32, a[1], a[2])
-                {
-                    return r;
-                }
-                if crate::seqpacket::is(a[0] as i32) {
-                    let v = guest!(uaccess::host_buffer(a[1], a[2], false));
-                    return crate::seqpacket::write(a[0] as i32, &[v]);
-                }
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe { libc::write(a[0] as i32, a[1] as *const _, a[2] as usize) } as i64)
-            }
-            nr::READV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2], true));
-                if crate::seqpacket::is(a[0] as i32) {
-                    return crate::seqpacket::read(a[0] as i32, &iov);
-                }
-                // SAFETY: the iovecs are translated host buffers; the host checks them.
-                ret(unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
-            }
-            nr::WRITEV => {
-                let iov = guest!(uaccess::host_iovecs(a[1], a[2], false));
-                if crate::seqpacket::is(a[0] as i32) {
-                    return crate::seqpacket::write(a[0] as i32, &iov);
-                }
-                if crate::sysctl::is(a[0] as i32) {
-                    return crate::sysctl::try_writev(a[0] as i32, &iov)
-                        .unwrap_or(err(errno::EINVAL));
-                }
-                // SAFETY: the iovecs are translated host buffers; the host checks them.
-                ret(unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) } as i64)
-            }
-            nr::PREAD64 => {
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe {
-                    libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
-                } as i64)
-            }
-            nr::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
-                crate::sysctl::try_write(a[0] as i32, a[1], a[2]).unwrap_or(err(errno::EINVAL))
-            }
-            nr::PWRITE64 => {
-                // SAFETY: the host validates the guest buffer.
-                ret(unsafe {
-                    libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
-                } as i64)
+            // The backends run these without the lock
+            // ([`crate::blocking_syscall`]); the same, reached here (the
+            // plain `syscall` helper).
+            nr::READ
+            | nr::WRITE
+            | nr::READV
+            | nr::WRITEV
+            | nr::PREAD64
+            | nr::PWRITE64
+            | nr::PREADV
+            | nr::PWRITEV
+            | nr::PREADV2
+            | nr::PWRITEV2 => {
+                // SAFETY: the backend's guarantee for the guest pointers.
+                unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS))
             }
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
@@ -525,6 +477,8 @@ impl<P: Platform> Kernel<P> {
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::GETPRIORITY => self.sys_getpriority(a[0], a[1] as i32),
+            nr::SETPRIORITY => self.sys_setpriority(a[0], a[1] as i32, a[2] as i32),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
             nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
             nr::BPF if !self.creds.has_admin() => err(errno::EPERM),
@@ -1462,6 +1416,18 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_clock_gettime(&mut self, id: u64, tp: u64) -> i64 {
+        if let Some(ns) = cpu_clock_ns(id) {
+            let ns = match ns {
+                Ok(n) => n,
+                Err(e) => return err(e),
+            };
+            let ts = Timespec {
+                tv_sec: (ns / 1_000_000_000) as i64,
+                tv_nsec: (ns % 1_000_000_000) as i64,
+            };
+            guest!(uaccess::write(tp, ts));
+            return 0;
+        }
         let Some(hid) = host::clock_to_host(id) else {
             return err(errno::EINVAL);
         };
@@ -1482,6 +1448,18 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_clock_getres(&mut self, id: u64, tp: u64) -> i64 {
+        if let Some(ns) = cpu_clock_ns(id) {
+            if let Err(e) = ns {
+                return err(e);
+            }
+            if tp != 0 {
+                // Linux's: a nanosecond for the scheduler's clock, a tick
+                // (HZ 250) for the others.
+                let res = if id & 3 == 2 { 1 } else { 4_000_000 };
+                guest!(uaccess::write(tp, Timespec { tv_sec: 0, tv_nsec: res }));
+            }
+            return 0;
+        }
         let Some(hid) = host::clock_to_host(id) else {
             return err(errno::EINVAL);
         };
@@ -1743,6 +1721,148 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
 /// The calling process's own limit of Linux resource `res` (soft, hard):
 /// the descriptor limit fwe keeps, the host's, or for a limit the host does
 /// not have, Linux's default.
+impl<P: Platform> Kernel<P> {
+    /// The host processes `getpriority`/`setpriority`'s `which` and `who`
+    /// name, among those the caller sees: a process, a process group or a
+    /// user's processes (`who` 0: the caller's own).
+    fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<i32>, i32> {
+        use fwe_abi::prio;
+        // SAFETY: plain host calls.
+        let (me, my_group) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        let seen = || {
+            crate::procpid::listed()
+                .into_iter()
+                .filter_map(crate::pidns::to_host)
+                .collect::<Vec<_>>()
+        };
+        Ok(match which {
+            prio::PROCESS if who == 0 => vec![me],
+            prio::PROCESS => crate::pidns::to_host(who)
+                .filter(|&h| h == me || crate::procreg::start_time(h).is_some())
+                .into_iter()
+                .collect(),
+            prio::PGRP => {
+                let group = if who == 0 {
+                    my_group
+                } else {
+                    match crate::pidns::to_host(who) {
+                        Some(g) => g,
+                        None => return Ok(Vec::new()),
+                    }
+                };
+                // SAFETY: plain host call.
+                seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect()
+            }
+            prio::USER => {
+                let uid = if who == 0 { self.creds.uid } else { who as u32 };
+                let own = |h: i32| if h == me { self.creds.uid } else { crate::procreg::ids(h)[0] };
+                seen().into_iter().filter(|&h| own(h) == uid).collect()
+            }
+            _ => return Err(errno::EINVAL),
+        })
+    }
+
+    /// `getpriority(which, who)`: the highest priority (least nice value)
+    /// of the processes named, as the system call returns it (20 less the
+    /// nice value, 1 to 40; the C library turns it back).
+    fn sys_getpriority(&mut self, which: u64, who: i32) -> i64 {
+        match self.prio_targets(which, who) {
+            Ok(t) => t
+                .iter()
+                .map(|&h| crate::procreg::nice(h))
+                .min()
+                .map_or(err(errno::ESRCH), |n| (20 - n) as i64),
+            Err(e) => err(e),
+        }
+    }
+
+    /// `setpriority(which, who, nice)`: the processes named take nice
+    /// value `nice` (clamped to -20..19), as Linux allows it: another
+    /// user's needs `CAP_SYS_NICE` (`EPERM`), and so does lowering one's
+    /// own beyond what `RLIMIT_NICE` lets (`EACCES`). As on Linux, a
+    /// failure stands whatever the other processes take.
+    fn sys_setpriority(&mut self, which: u64, who: i32, nice: i32) -> i64 {
+        let targets = match self.prio_targets(which, who) {
+            Ok(t) => t,
+            Err(e) => return err(e),
+        };
+        let nice = nice.clamp(-20, 19);
+        let privileged = self.creds.has(crate::caps::CAP_SYS_NICE);
+        // `RLIMIT_NICE` bounds the least nice value as 20 less it.
+        let floor =
+            20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let mut result = err(errno::ESRCH);
+        for h in targets {
+            let ids = if h == me {
+                [self.creds.uid, self.creds.euid]
+            } else {
+                let i = crate::procreg::ids(h);
+                [i[0], i[1]]
+            };
+            let r = if !privileged && !ids.contains(&self.creds.euid) {
+                err(errno::EPERM)
+            } else if nice < crate::procreg::nice(h) && !privileged && nice < floor {
+                err(errno::EACCES)
+            } else if h != me && crate::procreg::read(h).is_none() {
+                // A process fwe did not start: as far as the host lets.
+                // SAFETY: plain host call.
+                ret(unsafe { libc::setpriority(libc::PRIO_PROCESS, h as libc::id_t, nice) })
+            } else if crate::procreg::set_nice(h, nice).is_err() {
+                err(errno::ESRCH)
+            } else {
+                0
+            };
+            if r != 0 || result == err(errno::ESRCH) {
+                result = r;
+            }
+        }
+        result
+    }
+}
+
+/// For a clock id Linux's CPU-time clocks encode (negative: a pid or tid,
+/// complemented, above whether it is a thread's and which time), that
+/// time in nanoseconds: user and system time (`CPUCLOCK_PROF`, and
+/// `CPUCLOCK_SCHED`, the time run), or user time alone (`CPUCLOCK_VIRT`).
+/// A thread's clock is of a thread of this process; 0 is the caller (or
+/// its process). `None` for any other clock id.
+fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
+    let id = id as i32;
+    if id >= 0 {
+        return None;
+    }
+    let which = id & 3;
+    if which == 3 {
+        // A clock of a descriptor (a PTP device): none here.
+        return Some(Err(errno::EINVAL));
+    }
+    let thread = id & 4 != 0;
+    let who = !(id >> 3);
+    let me = thread::tgid();
+    let sample = if thread {
+        if who == 0 || who == thread::tid() {
+            // SAFETY: plain host call.
+            host::thread_cpu_ns(unsafe { libc::pthread_self() })
+        } else {
+            thread::host_thread(who)
+                .filter(|&t| t != 0 as libc::pthread_t)
+                .and_then(host::thread_cpu_ns)
+        }
+    } else if who == 0 || who == me {
+        // SAFETY: getpid cannot fail.
+        crate::procpid::cpu_ns(unsafe { libc::getpid() })
+    } else {
+        crate::pidns::to_host(who).and_then(crate::procpid::cpu_ns)
+    };
+    Some(match sample {
+        Some((user, _)) if which == 1 => Ok(user),
+        Some((user, system)) => Ok(user + system),
+        None => Err(errno::EINVAL),
+    })
+}
+
 fn own_limit(res: u64) -> Result<(u64, u64), i32> {
     if res == resource::RLIMIT_NOFILE {
         // Virtual: the host's limit also covers fwe's own descriptors.

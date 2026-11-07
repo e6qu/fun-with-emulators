@@ -62,6 +62,9 @@ pub struct ProcRecord {
     /// (resource, soft, hard), which it takes up at its next limit call,
     /// `fork` or `execve`.
     pub limits: Vec<(u32, u64, u64)>,
+    /// Its nice value (-20 to 19, `setpriority`), which its children
+    /// inherit.
+    pub nice: i32,
 }
 
 /// A host process, as its pid and its start time.
@@ -139,6 +142,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
         e.u64(soft);
         e.u64(hard);
     }
+    e.i32(r.nice);
     e.into_bytes()
 }
 
@@ -164,6 +168,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     }
     let n = d.count(20);
     let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
+    let nice = d.i32();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -183,6 +188,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         oom_score_adj_min,
         ids,
         limits,
+        nice,
     })
 }
 
@@ -244,6 +250,23 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
         }
     }
     out
+}
+
+/// The first fwe process of the run that host process `pid` (with record
+/// `r`) belongs to: the last of its line of ancestors, or itself if it has
+/// none.
+fn run_root(pid: i32, r: &ProcRecord) -> Proc {
+    r.lineage.last().copied().unwrap_or((pid, r.start))
+}
+
+/// The live processes of this process's run of fwe: those started, one
+/// from another, from the same first fwe process (which a program run
+/// under fwe sees as its whole system, where `kill(-1)` reaches).
+pub fn run() -> Vec<i32> {
+    let me = me();
+    let Some(mine) = read(me) else { return vec![me] };
+    let root = run_root(me, &mine);
+    all().into_iter().filter(|(pid, r)| run_root(*pid, r) == root).map(|(pid, _)| pid).collect()
 }
 
 /// Host process `pid`, which has a record, has gone: forget its record. It
@@ -360,6 +383,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         oom_score_adj_min: 0,
         ids: [0; 8],
         limits: Vec::new(),
+        nice: 0,
     });
     f(&mut r);
     write(pid, &r);
@@ -405,6 +429,7 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
     let mine = read(me());
     let oom = mine.as_ref().map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min));
     let ids = mine.as_ref().map_or([0; 8], |r| r.ids);
+    let nice = mine.as_ref().map_or(0, |r| r.nice);
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
     let cgroup = own_cgroup();
     // Kept what the child has already written of itself (its program).
@@ -419,7 +444,27 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>)) {
         r.autoreap = crate::host::children_reaped_by_host();
         (r.oom_score_adj, r.oom_score_adj_min) = oom;
         r.ids = ids;
+        r.nice = nice;
     });
+}
+
+/// Host process `pid`'s nice value: as `setpriority` set it, or for a
+/// process fwe has no record of, the host's.
+pub fn nice(pid: i32) -> i32 {
+    read(pid).map_or_else(
+        || {
+            // SAFETY: plain host call; -1 is a valid value, so errno is
+            // not consulted (an absent process reads as 0).
+            let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+            v.clamp(-20, 19)
+        },
+        |r| r.nice,
+    )
+}
+
+/// Host process `pid`'s nice value is now `nice`.
+pub fn set_nice(pid: i32, nice: i32) -> Result<(), i32> {
+    change(pid, |r| r.nice = nice)
 }
 
 /// Host process `pid`'s `oom_score_adj` (0 for one fwe has no record of).

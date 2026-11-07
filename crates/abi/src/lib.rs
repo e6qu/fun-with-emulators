@@ -211,6 +211,15 @@ pub mod prctl {
     pub const TASK_COMM_LEN: usize = 16;
 }
 
+/// `preadv2`/`pwritev2` flags (`RWF_*`).
+pub mod rwf {
+    pub const HIPRI: u64 = 0x01;
+    pub const DSYNC: u64 = 0x02;
+    pub const SYNC: u64 = 0x04;
+    pub const NOWAIT: u64 = 0x08;
+    pub const APPEND: u64 = 0x10;
+}
+
 pub mod fcntl {
     pub const O_ACCMODE: u64 = 0o3;
     pub const O_RDONLY: u64 = 0o0;
@@ -560,6 +569,13 @@ pub mod term {
 }
 
 /// Resource limits (`asm-generic/resource.h`).
+/// `getpriority`/`setpriority`'s `which`.
+pub mod prio {
+    pub const PROCESS: u64 = 0;
+    pub const PGRP: u64 = 1;
+    pub const USER: u64 = 2;
+}
+
 pub mod resource {
     pub const RLIMIT_CPU: u64 = 0;
     pub const RLIMIT_FSIZE: u64 = 1;
@@ -586,6 +602,7 @@ pub mod futex {
     pub const FUTEX_WAIT: u64 = 0;
     pub const FUTEX_WAKE: u64 = 1;
     pub const FUTEX_REQUEUE: u64 = 3;
+    pub const FUTEX_CMP_REQUEUE: u64 = 4;
     pub const FUTEX_WAIT_BITSET: u64 = 9;
     pub const FUTEX_WAKE_BITSET: u64 = 10;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;

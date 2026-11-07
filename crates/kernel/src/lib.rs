@@ -44,11 +44,14 @@ pub mod reaper;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;
+#[cfg(target_os = "macos")]
+pub mod sharedfutex;
 pub mod signal;
 pub mod signalfd;
 pub mod signote;
 pub mod snapshot;
 pub mod specialfd;
+pub mod specialwrite;
 pub mod synthdir;
 mod syscalls;
 pub mod sysctl;
@@ -766,12 +769,10 @@ pub fn restore_kqueues(state: &[u8]) {
     epoll::restore(&mut d);
 }
 
-/// Wake up to `count` waiters on the futex word at `addr`.
+/// Wake up to `count` waiters on the futex word at `addr`, whether they
+/// wait on it as a private futex or a shared one.
 pub fn wake_futex(addr: u64, count: u32) {
-    // SAFETY: `addr` is a guest futex word; wake only reads waiter counts.
-    unsafe {
-        futex::op(addr, fwe_abi::futex::FUTEX_WAKE, count, 0);
-    }
+    futex::wake_any(addr, count);
 }
 
 /// Run a system call that must not hold the kernel lock because it can block:
@@ -913,6 +914,139 @@ fn copy_between(
 /// A write to a socket whose peer has gone raises `SIGPIPE`, unless the send
 /// said `MSG_NOSIGNAL`. fwe's sockets never let the host raise it (they are
 /// all `SO_NOSIGPIPE`, so that the flag can be honoured), so it does.
+/// `preadv`/`pwritev` (and with `v2`, `preadv2`/`pwritev2`, whose offset
+/// -1 is the file's own position and whose `RWF_*` `flags` qualify the
+/// call): vectored I/O on `fd` at `offset`. On arm64 Linux the 64-bit
+/// offset is the first of its two halves; the second adds nothing.
+fn vectored_at(
+    fd: i32,
+    iov: u64,
+    count: u64,
+    offset: i64,
+    flags: u64,
+    write: bool,
+    v2: bool,
+) -> i64 {
+    use fwe_abi::{err, errno, rwf};
+    // In Linux's order: the offset, the descriptor, whether it has a
+    // position, whether it is open for this, the buffers, the flags.
+    if offset < -1 || (offset == -1 && !v2) {
+        return err(errno::EINVAL);
+    }
+    // SAFETY: plain host call on the guest's descriptor.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above, into a local.
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        return host::last_error();
+    }
+    let kind = st.st_mode & libc::S_IFMT;
+    if offset != -1 && (kind == libc::S_IFIFO || kind == libc::S_IFSOCK) {
+        return err(errno::ESPIPE);
+    }
+    if no_buffers(fd, write) != 0 {
+        return err(errno::EBADF);
+    }
+    let iov = match uaccess::host_iovecs(iov, count, !write) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    if flags & !(rwf::HIPRI | rwf::DSYNC | rwf::SYNC | rwf::NOWAIT | rwf::APPEND) != 0
+        || (flags & rwf::APPEND != 0 && !write)
+    {
+        return err(errno::EOPNOTSUPP);
+    }
+    if iov.is_empty() {
+        return 0;
+    }
+    if write {
+        let special = specialwrite::Source::Host(&iov);
+        if let Some(r) = specialwrite::write(fd, special, specialwrite::total(&iov)) {
+            return r;
+        }
+    }
+    if flags & rwf::NOWAIT != 0 && kind != libc::S_IFREG {
+        // Only what is ready now: a regular file's data always is.
+        let events = if write { libc::POLLOUT } else { libc::POLLIN };
+        let mut p = libc::pollfd { fd, events, revents: 0 };
+        // SAFETY: one pollfd, no wait.
+        if unsafe { libc::poll(&mut p, 1, 0) } == 0 {
+            return err(errno::EAGAIN);
+        }
+    }
+    let n = iov.len() as i32;
+    let r = if flags & rwf::APPEND != 0 {
+        append_vectored(fd, &iov, offset)
+    } else if offset == -1 {
+        // SAFETY: the iovecs are checked host buffers.
+        unsafe {
+            if write { libc::writev(fd, iov.as_ptr(), n) } else { libc::readv(fd, iov.as_ptr(), n) }
+        }
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            if write {
+                libc::pwritev(fd, iov.as_ptr(), n, offset as libc::off_t)
+            } else {
+                libc::preadv(fd, iov.as_ptr(), n, offset as libc::off_t)
+            }
+        }
+    };
+    if r < 0 {
+        return host::last_error();
+    }
+    if write && flags & (rwf::DSYNC | rwf::SYNC) != 0 {
+        // SAFETY: plain host call.
+        unsafe { libc::fsync(fd) };
+    }
+    r as i64
+}
+
+/// A vectored read (or `write`) of no buffers: nothing moves, but the
+/// descriptor must be open for it, as on Linux (the host refuses the
+/// call outright).
+fn no_buffers(fd: i32, write: bool) -> i64 {
+    // SAFETY: plain host call on the guest's descriptor.
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 {
+        return host::last_error();
+    }
+    let open_for = match fl & libc::O_ACCMODE {
+        libc::O_RDONLY => !write,
+        libc::O_WRONLY => write,
+        _ => true,
+    };
+    if open_for { 0 } else { fwe_abi::err(fwe_abi::errno::EBADF) }
+}
+
+/// `pwritev2` with `RWF_APPEND`: the data goes at the end of the file, as
+/// with `O_APPEND` (and atomically so, which only the host's own append
+/// gives), whatever `offset` says. With an offset, the file's position is
+/// left as it was, as `pwrite` leaves it.
+fn append_vectored(fd: i32, iov: &[libc::iovec], offset: i64) -> isize {
+    // SAFETY: plain host calls on the guest's descriptor; the iovecs are
+    // checked host buffers.
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl < 0 {
+            return -1;
+        }
+        let pos = if offset == -1 { -1 } else { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        if fl & libc::O_APPEND == 0 {
+            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_APPEND);
+        }
+        let r = libc::writev(fd, iov.as_ptr(), iov.len() as i32);
+        let saved = host::last_errno();
+        if fl & libc::O_APPEND == 0 {
+            libc::fcntl(fd, libc::F_SETFL, fl);
+        }
+        if pos >= 0 {
+            libc::lseek(fd, pos, libc::SEEK_SET);
+        }
+        host::set_errno(saved);
+        r
+    }
+}
+
 fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
     use fwe_abi::nr as n;
     const MSG_NOSIGNAL: u64 = 0x4000;
@@ -936,7 +1070,7 @@ fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
 ///
 /// # Safety
 /// As for [`blocking_syscall`].
-unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
+pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
@@ -951,7 +1085,7 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     }
     Some(match nr {
         // SAFETY: caller guarantees the futex word and timeout are valid.
-        n::FUTEX => unsafe { futex::op(a[0], a[1], a[2] as u32, a[3]) },
+        n::FUTEX => unsafe { futex::op_full(a[0], a[1], a[2] as u32, a[3], a[4], a[5] as u32) },
         // On macOS `nanosleep` reads and writes its arguments in the C
         // library, unchecked, so it goes through `clock_nanosleep`'s copies.
         // SAFETY: the arguments are checked guest pointers.
@@ -992,22 +1126,7 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             if let Some(r) = unsafe { specialfd::try_write(fd, buf, len) } {
                 return Some(r);
             }
-            if let Some(r) = cgroupfs::try_write(fd, buf, len) {
-                return Some(r);
-            }
-            if fdmarks::any_marks()
-                && let Some(r) = userns::try_write(fd, buf, len)
-            {
-                return Some(r);
-            }
-            if fdmarks::any_marks()
-                && let Some(r) = crate::sysctl::try_write(fd, buf, len)
-            {
-                return Some(r);
-            }
-            if fdmarks::any_marks()
-                && let Some(r) = crate::procpid::try_write(fd, buf, len)
-            {
+            if let Some(r) = specialwrite::write(fd, specialwrite::Source::Guest(buf), len) {
                 return Some(r);
             }
             if netlink::is(fd) {
@@ -1030,6 +1149,7 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),
+            Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, false),
             Ok(iov) => {
                 // SAFETY: the iovecs are translated host buffers; the host
                 // checks them.
@@ -1040,14 +1160,16 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         },
         n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
-            Ok(iov) if crate::sysctl::is(a[0] as i32) => {
-                crate::sysctl::try_writev(a[0] as i32, &iov)
-                    .unwrap_or(fwe_abi::err(fwe_abi::errno::EINVAL))
-            }
+            Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
-                // SAFETY: as for readv.
-                let r = unsafe { libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32) };
-                host::ret(r as i64)
+                let special = specialwrite::Source::Host(&iov);
+                match specialwrite::write(a[0] as i32, special, specialwrite::total(&iov)) {
+                    Some(r) => r,
+                    // SAFETY: as for readv.
+                    None => host::ret(unsafe {
+                        libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32)
+                    } as i64),
+                }
             }
             Err(e) => fwe_abi::err(e),
         },
@@ -1055,14 +1177,20 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PREAD64 => host::ret(unsafe {
             libc::pread(a[0] as i32, a[1] as *mut _, a[2] as usize, a[3] as libc::off_t)
         } as i64),
-        n::PWRITE64 if crate::sysctl::is(a[0] as i32) => {
-            crate::sysctl::try_write(a[0] as i32, a[1], a[2])
-                .unwrap_or(fwe_abi::err(fwe_abi::errno::EINVAL))
+        n::PWRITE64 => {
+            let special = specialwrite::Source::Guest(a[1]);
+            match specialwrite::write(a[0] as i32, special, a[2]) {
+                Some(r) => r,
+                // SAFETY: the host validates the guest buffer.
+                None => host::ret(unsafe {
+                    libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
+                } as i64),
+            }
         }
-        // SAFETY: the host validates the guest buffer.
-        n::PWRITE64 => host::ret(unsafe {
-            libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
-        } as i64),
+        n::PREADV => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, 0, false, false),
+        n::PWRITEV => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, 0, true, false),
+        n::PREADV2 => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, a[5], false, true),
+        n::PWRITEV2 => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, a[5], true, true),
         n::SENDFILE => copy_between(a[1] as i32, a[2], a[0] as i32, 0, a[3], false),
         n::COPY_FILE_RANGE if a[5] != 0 => fwe_abi::err(fwe_abi::errno::EINVAL),
         n::COPY_FILE_RANGE => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], a[4], true),

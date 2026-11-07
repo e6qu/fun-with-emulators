@@ -96,36 +96,12 @@ pub fn open_for_write(path: &[u8], admin: bool) -> Option<Result<Mark, i32>> {
     })
 }
 
-/// Whether `fd` is a sysctl opened for writing.
-pub fn is(fd: i32) -> bool {
-    fdmarks::any_marks() && matches!(fdmarks::marked(fd), Some(Mark::Sysctl(_)))
-}
-
-/// A `write` of `len` bytes at guest `buf` to `fd`: for a sysctl opened
-/// for writing, what the write does (`Some` result).
-pub fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
+/// A write of `len` bytes, `data` the first of them, to `fd`: for a
+/// sysctl opened for writing, what the write does (`Some` result; see
+/// [`crate::specialwrite`]).
+pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     let Some(Mark::Sysctl(_)) = fdmarks::marked(fd) else { return None };
-    let data = match crate::uaccess::read_bytes(buf, len.min(256) as usize) {
-        Ok(d) => d,
-        Err(e) => return Some(fwe_abi::err(e)),
-    };
-    write_value(fd, &data, len)
-}
-
-/// A `writev` (or `pwritev`) of host buffers `iov` (checked) to `fd`, as
-/// [`try_write`] does a `write`.
-pub fn try_writev(fd: i32, iov: &[libc::iovec]) -> Option<i64> {
-    let Some(Mark::Sysctl(_)) = fdmarks::marked(fd) else { return None };
-    let mut data = Vec::new();
-    for v in iov {
-        // SAFETY: the buffer is the guest's, checked by the caller.
-        data.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len)
-        });
-    }
-    let len = data.len() as u64;
-    data.truncate(256);
-    write_value(fd, &data, len)
+    write_value(fd, &data[..data.len().min(256)], len)
 }
 
 /// Keep `data`, written to sysctl descriptor `fd` (`len` bytes in all).

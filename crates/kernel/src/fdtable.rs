@@ -192,6 +192,10 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
             | n::WRITEV
             | n::PREAD64
             | n::PWRITE64
+            | n::PREADV
+            | n::PWRITEV
+            | n::PREADV2
+            | n::PWRITEV2
             | n::CLOSE
             | n::DUP
             | n::DUP3

@@ -332,7 +332,7 @@ pub fn load(d: &mut Dec) {
 /// made as Linux reports it: a write to `/dev/full` fails with `ENOSPC`.
 pub fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     use fwe_abi::{err, errno, nr as n};
-    let writes = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64);
+    let writes = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2);
     if r >= 0
         && writes
         && MARKS.load(std::sync::atomic::Ordering::SeqCst) > 0

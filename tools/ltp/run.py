@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Run LTP's system-call tests under fwe and compare with the baseline.
+
+Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
+                        [--baseline tools/ltp/baseline.txt] [--update]
+                        [--jobs N] [--only REGEX] [--results FILE]
+
+The root is a root filesystem with LTP in /opt/ltp (tools/ltp/build.sh
+makes it); the runner gives it the files a Linux system has that the tests
+read (`/etc/passwd` with `nobody`, `/etc/group`, `/etc/hosts`) and `/tmp`.
+Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
+<args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
+own per-test timeout and a hard limit above that. A test passes when it exits 0; LTP's exit status
+otherwise says why (TCONF, 32: not applicable here). The baseline lists the
+tests that pass; a run fails if any of them does not (a regression), and
+`--update` rewrites it from the run. The pass rate is printed either way.
+"""
+
+import argparse
+import concurrent.futures
+import os
+import re
+import resource
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+# LTP's exit statuses (include/tst_res_flags.h), as bits.
+TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
+# A hard limit on each test, over LTP's own (30 s per run by default, which
+# tests that run longer raise themselves and report as they go).
+HARD_LIMIT = 300
+# A test that runs away with processes must not take the host with it.
+PROCESS_LIMIT = 1500
+
+
+# What a minimal Linux system has in /etc, as the tests expect it.
+ETC = {
+    "passwd": "root:x:0:0:root:/root:/bin/sh\n"
+    "daemon:x:1:1:daemon:/usr/sbin:/sbin/nologin\n"
+    "bin:x:2:2:bin:/bin:/sbin/nologin\n"
+    "nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n",
+    "group": "root:x:0:\ndaemon:x:1:\nbin:x:2:\nusers:x:100:\nnogroup:x:65534:\n",
+    "hosts": "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
+}
+
+
+def prepare(root):
+    """Give the root the files the tests read, and /tmp."""
+    os.makedirs(os.path.join(root, "etc"), exist_ok=True)
+    for name, text in ETC.items():
+        with open(os.path.join(root, "etc", name), "w") as f:
+            f.write(text)
+    tmp = os.path.join(root, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    os.chmod(tmp, 0o1777)
+    return tmp
+
+
+def entries(ltp):
+    """(name, argv) of each test in runtest/syscalls."""
+    out = []
+    with open(os.path.join(ltp, "runtest", "syscalls")) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, *argv = shlex.split(line)
+            out.append((name, argv or [name]))
+    return out
+
+
+def classify(status):
+    if status == 0:
+        return "pass"
+    if status < 0:
+        return "signal"
+    if status & TBROK:
+        return "broken"
+    if status & TFAIL:
+        return "fail"
+    if status & TWARN:
+        return "warn"
+    if status == TCONF:
+        return "conf"
+    return f"exit-{status}"
+
+
+def limit_processes():
+    os.setsid()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    cap = PROCESS_LIMIT if hard == resource.RLIM_INFINITY else min(hard, PROCESS_LIMIT)
+    resource.setrlimit(resource.RLIMIT_NPROC, (min(soft, cap) if soft != resource.RLIM_INFINITY else cap, cap))
+
+
+def run_one(fwe, root, work, name, argv):
+    """Run one test; (name, outcome, seconds, output tail)."""
+    bindir = "/opt/ltp/testcases/bin"
+    prog = argv[0] if "/" in argv[0] else f"{bindir}/{argv[0]}"
+    host_prog = os.path.join(root, prog.lstrip("/"))
+    if not os.path.isfile(host_prog):
+        return name, "missing", 0.0, ""
+    with open(host_prog, "rb") as f:
+        if f.read(4) != b"\x7fELF":
+            # A shell script, and the root has no shell.
+            return name, "script", 0.0, ""
+    tmp = tempfile.mkdtemp(prefix=name[:40] + ".", dir=work)
+    guest_tmp = "/" + os.path.relpath(tmp, root)
+    env = {
+        "PATH": f"{bindir}:/usr/sbin:/usr/bin:/sbin:/bin",
+        "TMPDIR": guest_tmp,
+        "LTPROOT": "/opt/ltp",
+        "LTP_COLORIZE_OUTPUT": "0",
+        "HOME": guest_tmp,
+        "LANG": "C",
+    }
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        [fwe, "--root", root, host_prog, *argv[1:]],
+        cwd=tmp,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        preexec_fn=limit_processes,
+    )
+    try:
+        out, _ = proc.communicate(timeout=HARD_LIMIT)
+        outcome = classify(proc.returncode)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, _ = proc.communicate()
+        outcome = "timeout"
+    # Whatever it left running in its session goes too (in process
+    # groups of its own, some of it).
+    subprocess.run(["pkill", "-KILL", "-s", str(proc.pid)], stderr=subprocess.DEVNULL)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tail = "\n".join(out.decode(errors="replace").splitlines()[-40:])
+    return name, outcome, time.monotonic() - start, tail
+
+
+def run_guarded(fwe, root, work, name, argv):
+    """`run_one`, a failure of the runner itself reported as the outcome."""
+    try:
+        return run_one(fwe, root, work, name, argv)
+    except Exception as e:  # noqa: BLE001 - reported, and fails the run
+        return name, "runner-error", 0.0, repr(e)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fwe", required=True)
+    ap.add_argument("--root", required=True, help="a root filesystem with LTP in /opt/ltp")
+    ap.add_argument("--baseline", default=os.path.join(os.path.dirname(__file__), "baseline.txt"))
+    ap.add_argument("--update", action="store_true", help="rewrite the baseline from this run")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--only", help="run only the tests whose name matches")
+    ap.add_argument("--results", help="write every outcome to this file")
+    ap.add_argument("--show", action="store_true", help="print the output of each test that does not pass")
+    args = ap.parse_args()
+
+    fwe = os.path.abspath(args.fwe)
+    root = os.path.abspath(args.root)
+    tests = entries(os.path.join(root, "opt", "ltp"))
+    if args.only:
+        tests = [t for t in tests if re.search(args.only, t[0])]
+    work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+    results = {}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
+            futures = [pool.submit(run_guarded, fwe, root, work, n, a) for n, a in tests]
+            for done, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                name, outcome, secs, tail = fut.result()
+                results[name] = outcome
+                print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
+                if args.show and outcome not in ("pass", "conf", "script", "missing"):
+                    print("    " + tail.replace("\n", "\n    "), flush=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    if args.results:
+        with open(args.results, "w") as f:
+            for name in sorted(results):
+                f.write(f"{name} {results[name]}\n")
+
+    counts = {}
+    for outcome in results.values():
+        counts[outcome] = counts.get(outcome, 0) + 1
+    passed = counts.get("pass", 0)
+    run = len(results) - counts.get("script", 0) - counts.get("missing", 0)
+    applicable = run - counts.get("conf", 0)
+    print("\noutcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    print(f"passed {passed} of {run} run ({100 * passed / max(run, 1):.1f}%), "
+          f"{passed} of {applicable} applicable ({100 * passed / max(applicable, 1):.1f}%)")
+
+    if args.update:
+        with open(args.baseline, "w") as f:
+            f.write("# LTP system-call tests that pass under fwe (tools/ltp/run.py --update).\n")
+            for name in sorted(n for n, o in results.items() if o == "pass"):
+                f.write(name + "\n")
+        print(f"baseline: {passed} tests written to {args.baseline}")
+        return 0
+
+    with open(args.baseline) as f:
+        baseline = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    regressed = [n for n in baseline if n in results and results[n] != "pass"]
+    newly = sorted(n for n, o in results.items() if o == "pass" and n not in set(baseline))
+    if newly:
+        print(f"passing, not in the baseline ({len(newly)}): " + " ".join(newly))
+    if regressed:
+        # Once more, alone: a test timed against a loaded machine may have
+        # missed its moment. One that passes so is named, not failed.
+        argv_of = dict(tests)
+        work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+        try:
+            again = {n: run_guarded(fwe, root, work, n, argv_of[n]) for n in regressed}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        flaky = [n for n in regressed if again[n][1] == "pass"]
+        if flaky:
+            print(f"passed when run again alone ({len(flaky)}): " + " ".join(flaky))
+        for n in regressed:
+            if again[n][1] != "pass" and args.show:
+                print(f"--- {n} ({again[n][1]}), run again:\n" + again[n][3])
+        regressed = [n for n in regressed if again[n][1] != "pass"]
+    if regressed:
+        print(f"REGRESSED ({len(regressed)}): " + " ".join(f"{n}={results[n]}" for n in regressed))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
