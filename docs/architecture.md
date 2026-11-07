@@ -214,9 +214,7 @@ hand-written assembly with CFI directives does too
 (`crates/elf/src/unwind.rs`). Where an image has one, `x18` is rewritten
 only inside the ranges it covers — in glibc, libstdc++, ICU, git, bash,
 SQLite, lighttpd and PCRE2 every `x18` use lies inside them — and only a
-literal load that is itself code marks its target as a literal pool (a data
-word decoding as one had hidden an `x18` use in OpenSSL's MD5 from the
-rewrite). System calls and thread-pointer accesses are rewritten throughout
+literal load that is itself code marks its target as a literal pool. System calls and thread-pointer accesses are rewritten throughout
 the executable sections. Without a usable unwind table the whole
 of each executable section counts as code. Two gaps remain: inline data in
 code an unwind table covers (a jump table), and a binary fully stripped of

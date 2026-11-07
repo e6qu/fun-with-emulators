@@ -5,7 +5,7 @@ in CI; its checklist is the work that gets there. [PLAN.md](PLAN.md) states
 the goal and the 1.0 finish line; [docs/architecture.md](docs/architecture.md)
 describes how each part works and lists the current limitations in detail.
 
-## Status (November 2026)
+## Status
 
 | Milestone | State |
 |---|---|
@@ -16,7 +16,7 @@ describes how each part works and lists the current limitations in detail.
 | M4 Compatibility | In progress: LTP's system-call tests at 651 of 1534 (57% of the 1139 that apply) |
 | M5 Release | Not started |
 
-What runs today, unmodified, with its output checked in CI:
+What runs, unmodified, with its output checked in CI:
 - **Natively, in-process:** Debian's coreutils, bash, git, SQLite, lighttpd,
   Node.js (V8's JIT), rustc with Cargo, and apt.
 - **In the VM:** Python, GCC, clang and Go, for executables linked below
@@ -58,7 +58,7 @@ server) run unmodified.*
 namespaces; cgroups v2 with device programs; overlay mounts; seccomp and
 capabilities. *crun, podman and containerd run standard images.*
 
-**M4 so far:**
+**M4, done:**
 - the LTP system-call suite in CI against a baseline, and the bugs it found;
 - `preadv`/`pwritev` and their `2` forms;
 - priorities and CPU-time clocks;

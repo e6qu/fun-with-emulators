@@ -14,8 +14,8 @@ Executables linked below 4 GiB run in a Hypervisor.framework VM:
 - that covers Debian's Python, GCC, clang and Go;
 - `fwe` must be signed with the hypervisor entitlement for this
   ([docs/hypervisor.md](docs/hypervisor.md));
-- so far it is verified on a software stand-in for the framework, not yet
-  on real hardware.
+- it is verified on a software stand-in for the framework, not yet on real
+  hardware.
 
 Container engines run standard images: crun, podman and containerd run
 `alpine`.

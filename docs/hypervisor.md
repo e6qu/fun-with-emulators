@@ -24,10 +24,8 @@ The code is in `crates/native/src/hv/`.
   and does not change while it runs: the slab (`window.rs`), all private
   guest memory, mapped whole, and fwe's own region (the page-table pool and
   a code page). Only shared segments add and remove mappings of their own.
-  The framework keeps the host pages it found when a range was mapped, and
-  the runtimes that run Linux programs this way without trouble
-  (hyper-linux, elfuse) never change stage 2 or the host memory behind it
-  either; nor does fwe.
+  The framework keeps the host pages it found when a range was mapped, so
+  the host memory behind stage 2 never changes either.
 - **The guest's page tables** (`pagetables.rs`). Stage 1 is real: 4 KiB
   pages, Linux's page size on arm64, in a 40-bit address space, with each
   page's EL0 permissions and BTI guarding. A guest page translates to the
@@ -105,31 +103,25 @@ The code is in `crates/native/src/hv/`.
 
 ## Never end a VM process abnormally
 
-The development Mac (M4 Pro, macOS 15.6) went down five times on 3 and 4
-November 2026 while this backend was built. The crashes were watchdog
-resets or a kernel panic in a kernel thread, with no stackshot. They came
-during or some time after VM processes ended. Those processes had:
-- ended without destroying their VM;
-- run several at once, beside another hypervisor client (Podman's
-  `krunkit`), or without one;
-- had a VM fail to map memory;
-- had `vfork` children map their parent's memory into a second VM.
+Misusing Hypervisor.framework can bring the whole Mac down, as a watchdog
+reset or a kernel panic with no useful report. The suspects are:
+- a VM process that ends with its VM alive;
+- several VM processes ending together;
+- a VM that fails to map memory and is then destroyed;
+- private memory mapped into two VMs at once.
 
-The path inside Apple's kernel is unknown. The runtimes that run Linux
-programs the same way without such reports (hyper-linux, elfuse, Carrick)
-all:
+The runtimes that run Linux programs the same way without such trouble
+(hyper-linux, elfuse, Carrick) all:
 - map guest memory into the VM once;
 - never change stage 2, or the host memory behind it, while the VM runs;
 - give a fork child a copy rather than pages mapped into two VMs.
 
-fwe's memory model was reworked to match (above and [Fork](#fork)). It has
-not run on real hardware since.
+fwe does the same (above, and [Fork](#fork)), and keeps these rules:
 
-Since then **a plain `cargo test` never starts a VM**: the VM tests run on
-a software stand-in for the framework (below), and on the real one only when
-asked for (`FWE_HV_TESTS=1`), which only a machine whose crash costs nothing
-should set. Everything else the backend does to stay clear of the crash:
-
+- **A plain `cargo test` never starts a VM.** The VM tests run on a
+  software stand-in for the framework (below), and on the real one only
+  when asked for (`FWE_HV_TESTS=1`), which only a machine whose crash
+  costs nothing should set.
 - **Every way out tears the VM down first:** `exit_group`, the last thread's
   `exit`, a fatal signal's default action, fwe's own fatal errors, faults and
   panics, and `execve`. Teardown stops every vCPU, has each thread destroy its
@@ -203,7 +195,7 @@ with `x0` = 0. No private page is ever in both processes' VMs:
 - a **`fork`** child is sent a copy of every page of the slab that exists
   (`mach_vm_page_range_query`), over a socket pair, with the parent's vCPUs
   stopped so it sees one instant. Copying 512 MiB takes about 60 ms; an APFS
-  clone of a file-backed slab, which elfuse uses, was measured fifty times
+  clone of a file-backed slab, which elfuse uses, is fifty times
   slower here, as it writes the memory to disk;
 - a **`vfork`** child is sent nothing up front: its private pages are
   unmapped until it touches them, when it fetches them, 64 KiB at a time,
@@ -272,17 +264,16 @@ And it checks the rules the backend must keep, printing a line with
 
 A refused `hv_vm_map` is reported too, and fails as the framework fails it:
 misaligned (16 KiB), overlapping, or over host memory that is not mapped or
-could never be readable and writable. That last rule was inferred from what
-the framework did, and a real run's `--probe hv-map-rules` matched it (its
-two cases of a file opened read-only, mapped shared and private, came later
-and wait for the next real run). The stand-in's unit test breaks each rule
-on purpose.
+could never be readable and writable. That last rule is inferred from the
+framework's behaviour; `fwe --probe hv-map-rules` compares the two on real
+hardware, in the `hypervisor` job. The stand-in's unit test breaks each
+rule on purpose.
 
 A stand-in proves nothing about the real framework. Its own rules are what
 fwe has seen the framework do, and the kernel crashes the backend may cause
-cannot happen in it. So VM changes are also run on real hardware now and
-then, on a machine whose crash costs nothing, instrumented so that a crash
-can be traced (below). Not modelled: the virtual timer, the fault address of
+cannot happen in it. So VM changes are also run on real hardware, on a
+machine whose crash costs nothing, instrumented so that a crash can be
+traced (below). Not modelled: the virtual timer, the fault address of
 an alignment fault outside the exclusive and atomic instructions,
 stack-pointer alignment checks, and code one vCPU writes for another
 without a mapping change. What real hardware must still confirm for this
@@ -296,9 +287,9 @@ and exit it models.
 
 Real runs happen on a machine whose crash costs nothing — the self-hosted
 runner of the `hypervisor` CI job, such as a rented bare-metal cloud Mac —
-and are instrumented so that a crash can be traced. The crashes so far were
-watchdog resets that left no stackshot and lost the last seconds of the
-system log, so the evidence has to be kept by fwe itself:
+and are instrumented so that a crash can be traced. Such a crash leaves no
+stackshot and loses the last seconds of the system log, so fwe keeps the
+evidence itself:
 
 - **The flight recorder** (`--hv-record DEST`, or `FWE_HV_RECORD=DEST`; in
   `crates/native/src/hv/record.rs`) writes a line before and after every
