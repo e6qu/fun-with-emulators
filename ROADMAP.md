@@ -21,7 +21,7 @@ standard `alpine` image in its own namespaces, cgroup, capabilities and
 seccomp profile, and podman and containerd (with runc) load that image and
 run containers of it on overlay mounts. M4 has begun: the Linux Test
 Project's system-call tests run under fwe in CI against a baseline of the
-ones that pass (571 of 1534), and the bugs they found first are
+ones that pass (635 of 1534), and the bugs they found first are
 fixed.
 
 ## M0 — Foundation (done)
@@ -174,7 +174,8 @@ servers run unmodified.
 - [ ] Long-tail system calls. Done so far: `preadv`/`pwritev` and their
   `2` forms, `getpriority`/`setpriority`, CPU-time clock ids, the `mlock`
   family, `fcntl`'s owner, signal, lease and pipe-size commands, futex
-  requeue and bitsets. Next: System V IPC, loop devices,
+  requeue and bitsets, System V IPC (shared memory, semaphores and message
+  queues per IPC namespace, between processes). Next: loop devices,
   `/proc/<pid>/maps`, `splice`, `inotify`
 - [ ] ptrace and debuggers (gdb, strace)
 - [ ] io_uring
@@ -183,7 +184,7 @@ servers run unmodified.
 - [ ] High pass rates on gVisor's syscall tests, LTP and kselftests. LTP's
   system-call tests (`tools/ltp`, the pinned 20260930 release built for
   arm64 musl, run in an Alpine root) run in CI against a baseline:
-  571 of 1534 pass, half of the 1134 that apply
+  635 of 1534 pass, 56% of the 1139 that apply
 
 **Done when:** real-world workloads run unmodified and conformance suites
 pass at high rates.

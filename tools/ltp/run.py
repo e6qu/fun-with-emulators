@@ -31,6 +31,10 @@ TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
 # A hard limit on each test, over LTP's own (30 s per run by default, which
 # tests that run longer raise themselves and report as they go).
 HARD_LIMIT = 300
+# The System V IPC tests: each runs in an IPC namespace of its own. They
+# fill and count what a namespace holds, which tests run beside them (four
+# at a time, where LTP runs one) would otherwise see and change.
+IPC_TESTS = re.compile(r"^(shm|sem|msg|ipc)")
 # A test that runs away with processes must not take the host with it.
 PROCESS_LIMIT = 1500
 
@@ -117,7 +121,7 @@ def stacks(sid, work):
     return "\n" + "\n".join(out) + "\n"
 
 
-def run_one(fwe, root, work, name, argv):
+def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """Run one test; (name, outcome, seconds, output tail)."""
     bindir = "/opt/ltp/testcases/bin"
     prog = argv[0] if "/" in argv[0] else f"{bindir}/{argv[0]}"
@@ -144,10 +148,13 @@ def run_one(fwe, root, work, name, argv):
     # never end. The process limit is set by a shell for the test (the
     # runner's threads make a `preexec_fn` unsafe), in a session of its own
     # so everything it starts can be found and ended.
+    command = [fwe, "--root", root, host_prog, *argv[1:]]
+    if IPC_TESTS.match(name):
+        busybox = os.path.join(root, "bin", "busybox")
+        command = [fwe, "--root", root, busybox, "unshare", "-i", "--", prog, *argv[1:]]
     with tempfile.TemporaryFile(dir=work) as log:
         proc = subprocess.Popen(
-            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null; exec "$@"', "sh",
-             fwe, "--root", root, host_prog, *argv[1:]],
+            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null; exec "$@"', "sh", *command],
             cwd=tmp,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -156,7 +163,7 @@ def run_one(fwe, root, work, name, argv):
             start_new_session=True,
         )
         try:
-            proc.wait(timeout=HARD_LIMIT)
+            proc.wait(timeout=hard_limit)
             outcome = classify(proc.returncode)
         except subprocess.TimeoutExpired:
             outcome = "timeout"
@@ -178,13 +185,13 @@ def run_one(fwe, root, work, name, argv):
     return name, outcome, time.monotonic() - start, tail
 
 
-def run_guarded(fwe, root, work, name, argv):
+def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """`run_one`, a failure of the runner itself (starting a test while
     another has the host short of processes, say) retried once, then
     reported as the outcome."""
     for attempt in range(2):
         try:
-            return run_one(fwe, root, work, name, argv)
+            return run_one(fwe, root, work, name, argv, hard_limit)
         except Exception as e:  # noqa: BLE001 - reported, and fails the run
             if attempt == 1:
                 return name, "runner-error", 0.0, repr(e)
@@ -201,6 +208,7 @@ def main():
     ap.add_argument("--only", help="run only the tests whose name matches")
     ap.add_argument("--results", help="write every outcome to this file")
     ap.add_argument("--show", action="store_true", help="print the output of each test that does not pass")
+    ap.add_argument("--hard-limit", type=int, default=HARD_LIMIT, help="seconds before a test is ended")
     args = ap.parse_args()
 
     fwe = os.path.abspath(args.fwe)
@@ -212,7 +220,7 @@ def main():
     results = {}
     try:
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-            futures = [pool.submit(run_guarded, fwe, root, work, n, a) for n, a in tests]
+            futures = [pool.submit(run_guarded, fwe, root, work, n, a, args.hard_limit) for n, a in tests]
             for done, fut in enumerate(concurrent.futures.as_completed(futures), 1):
                 name, outcome, secs, tail = fut.result()
                 results[name] = outcome

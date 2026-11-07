@@ -86,11 +86,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # The whole root: the tests run in Alpine's root filesystem with LTP
+      # in it, and the build that makes both is skipped on a hit.
       - id: ltp-cache
         uses: actions/cache@v4
         with:
-          path: target/ltp/root/opt/ltp
-          key: ltp-${{ hashFiles('tools/ltp/build.sh') }}
+          path: target/ltp/root
+          key: ltp-root-${{ hashFiles('tools/ltp/build.sh') }}
       - name: Install zig 0.17.0 (to build LTP)
         if: steps.ltp-cache.outputs.cache-hit != 'true'
         run: |

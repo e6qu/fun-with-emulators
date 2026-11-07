@@ -281,7 +281,11 @@ pub fn gone(pid: i32) {
     {
         // A namespace's init takes its namespace with it.
         crate::pidns::init_gone(&r.ns, pid);
-        if crate::reaper::might_adopt((pid, r.start), &r.lineage, r.bound)
+        // An account the process left itself stands.
+        let told = ended_path(pid, r.start)
+            .is_some_and(|p| std::path::Path::new(OsStr::from_bytes(&p)).exists());
+        if !told
+            && crate::reaper::might_adopt((pid, r.start), &r.lineage, r.bound)
             && !parent_autoreaps(&r.lineage)
         {
             write_ended(&Ended {
@@ -772,8 +776,17 @@ pub fn reaped(pid: i32) {
 /// This process is ending with Linux wait status `status`: forget its
 /// record, and leave one of how it ended if a reaper might take it.
 pub fn exiting(status: i32) {
+    // Its System V IPC attachments and undo adjustments, as it ends.
+    crate::sysvipc::process_leaving(false);
     let me = me();
     crate::pidns::exiting();
+    if crate::host::children_reaped_by_host() {
+        forget_children(me);
+    }
+    // Under the record's lock: whoever finds the process gone (`gone`)
+    // checks its record and records how it ended under the same lock, so
+    // it sees the record with this account written, or no record at all.
+    let _lock = lock(me);
     if let Some(r) = read(me) {
         let ended = Ended {
             pid: me,
@@ -793,9 +806,6 @@ pub fn exiting(status: i32) {
         {
             write_ended(&ended);
         }
-    }
-    if crate::host::children_reaped_by_host() {
-        forget_children(me);
     }
     remove(me);
 }

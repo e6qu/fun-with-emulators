@@ -851,6 +851,30 @@ pub fn msync_flags_to_host(flags: u64) -> Option<libc::c_int> {
 
 /// Seconds since the host booted (macOS's `CLOCK_MONOTONIC` counts sleep,
 /// as Linux's boot-time clock does).
+/// When the host started, in seconds since the epoch (0 if unknown).
+pub fn boot_time() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        // SAFETY: a valid out-parameter of the size given.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                (&mut tv as *mut libc::timeval).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 { tv.tv_sec as u64 } else { 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
+
 pub fn uptime() -> f64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is a valid out parameter.

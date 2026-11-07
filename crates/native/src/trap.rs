@@ -401,6 +401,12 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     } else if nr == fwe_abi::nr::WAITID {
         let r = crate::process::do_waitid(&regs);
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else if fwe_kernel::ipcops::waits(nr) {
+        // A semaphore or message queue wait: what it needs of the kernel is
+        // taken under the lock, and it waits without it.
+        let ctx = kernel().as_ref().unwrap().ipc_context();
+        let r = fwe_kernel::ipcops::blocking(ctx, nr, args);
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
     } else if nr == fwe_abi::nr::RT_SIGTIMEDWAIT {
         // The awaited signals are caught on the host while the call waits,
         // without the kernel lock.
@@ -528,6 +534,33 @@ fn fault_signal(host: libc::c_int) -> u64 {
     }
 }
 
+/// The Linux signal of host fault `host` at `addr` (`esr` its syndrome):
+/// macOS reports an access the page's protection forbids, on some
+/// mappings, as `SIGBUS`, which Linux reports as `SIGSEGV` (keeping
+/// `SIGBUS` for memory past a mapped file's end, whose protection allows
+/// the access).
+fn linux_fault_signal(host: libc::c_int, addr: u64, esr: u32) -> u64 {
+    let sig = fault_signal(host);
+    #[cfg(target_os = "macos")]
+    if host == libc::SIGBUS
+        && let Some(r) = fwe_kernel::mm::region::query(addr).filter(|r| r.start <= addr)
+    {
+        let class = (esr >> 26) & 0x3f;
+        let needed = if class == ESR_EC_INSTRUCTION_ABORT_LOWER {
+            libc::PROT_EXEC
+        } else if esr & (1 << 6) != 0 {
+            libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        if r.protection & needed == 0 {
+            return fwe_abi::signal::SIGSEGV;
+        }
+    }
+    let _ = (addr, esr);
+    sig
+}
+
 /// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
 const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
 
@@ -598,8 +631,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
-    let delivered =
-        kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, fault_signal(sig), addr));
+    let lsig = linux_fault_signal(sig, addr, mc.es.esr);
+    let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr));
     if delivered {
         settle(&mut regs);
         regs_to(mc, &regs);
@@ -647,6 +680,13 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     }
     // Returning re-executes the faulting instruction under the default action.
     restore_default(sig);
+    if lsig != fault_signal(sig) {
+        // It dies of the signal Linux would send: taken as the handler
+        // returns, before the instruction runs again.
+        restore_default(libc::SIGSEGV);
+        // SAFETY: plain host call.
+        unsafe { libc::raise(libc::SIGSEGV) };
+    }
 }
 
 extern "C" fn on_probe_signal(
