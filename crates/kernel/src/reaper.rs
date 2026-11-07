@@ -199,14 +199,16 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
         if peek {
             return Some(e);
         }
+        // Taken, and marked told, under the lock the watcher's `notify`
+        // marks under: whichever marks it first raises its SIGCHLD, and only
+        // it (a second would arrive with no report, from no one). The mark
+        // goes with the watcher's next look, the record taken.
+        let mut told = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
         if procreg::take_ended(&e) {
+            let first = told.get_or_insert_with(HashSet::new).insert((e.pid, e.start));
+            drop(told);
             crate::pidns::released(&e.numbers, e.pid);
-            let told = NOTIFIED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
-                .is_some_and(|n| n.remove(&(e.pid, e.start)));
-            if !told && sigchld_taken() {
+            if first && sigchld_taken() {
                 // Reaped before the watcher saw it end: its SIGCHLD is
                 // still owed, as Linux sends it before `wait` can return.
                 raise(&e);
