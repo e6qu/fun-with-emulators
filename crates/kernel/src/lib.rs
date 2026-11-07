@@ -18,6 +18,7 @@ pub mod creds;
 pub mod devnodes;
 pub mod epoll;
 pub mod fdmarks;
+pub mod fdstate;
 pub mod fdtable;
 pub mod fifo;
 pub mod fs;

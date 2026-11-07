@@ -255,8 +255,22 @@ pub mod fcntl {
     pub const F_OFD_GETLK: u64 = 36;
     pub const F_OFD_SETLK: u64 = 37;
     pub const F_OFD_SETLKW: u64 = 38;
+    pub const F_SETOWN: u64 = 8;
+    pub const F_GETOWN: u64 = 9;
+    pub const F_SETSIG: u64 = 10;
+    pub const F_GETSIG: u64 = 11;
+    pub const F_SETOWN_EX: u64 = 15;
+    pub const F_GETOWN_EX: u64 = 16;
+    pub const F_SETLEASE: u64 = 1024;
+    pub const F_GETLEASE: u64 = 1025;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+    pub const F_SETPIPE_SZ: u64 = 1031;
+    pub const F_GETPIPE_SZ: u64 = 1032;
     pub const F_ADD_SEALS: u64 = 1033;
+    /// `struct f_owner_ex` types.
+    pub const F_OWNER_TID: i32 = 0;
+    pub const F_OWNER_PID: i32 = 1;
+    pub const F_OWNER_PGRP: i32 = 2;
     pub const F_GET_SEALS: u64 = 1034;
 
     /// File seals (`F_ADD_SEALS`).
@@ -797,6 +811,22 @@ pub struct Itimerspec {
 pub struct EpollEvent {
     pub events: u32,
     pub data: u64,
+}
+
+/// `struct timeval`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// `struct itimerval` (`setitimer`, `getitimer`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Itimerval {
+    pub it_interval: Timeval,
+    pub it_value: Timeval,
 }
 
 /// `struct timespec`.

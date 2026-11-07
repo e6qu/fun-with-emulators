@@ -146,6 +146,11 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 
 /// Host metadata of open descriptor `fd`, with the guest's permission
 /// bits ([`crate::modes`]).
+/// `fstat` of `fd` in Linux's layout (the host's view of the file).
+pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
+    stat_fd(fd).map(|s| stat_to_linux(&s))
+}
+
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if let Some(host) = crate::fdmarks::stand_in(fd) {
         // A stand-in `O_PATH` descriptor: the file it names.

@@ -226,7 +226,7 @@ impl Resolved {
 
     fn plain(dir: OwnedFd, name: Vec<u8>) -> Resolved {
         Resolved {
-            dir,
+            dir: out_of_reach(dir),
             name,
             ns_path: None,
             mount_flags: 0,
@@ -1489,7 +1489,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             }
         };
         Ok(Resolved {
-            dir,
+            dir: out_of_reach(dir),
             name,
             ns_path,
             mount_flags: mount.as_ref().map_or(0, |m| m.flags),
@@ -2327,6 +2327,24 @@ fn same_file(a: i32, b: i32) -> bool {
     match (stat(a), stat(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
+    }
+}
+
+/// `dir`, a directory a path was resolved to, moved into fwe's reserved
+/// range: held while the call that resolved it runs, it must not take a
+/// number the guest's next descriptor would (a file that call opens, or
+/// creates, gets the lowest free one, as on Linux). Left where it is if
+/// the range is full.
+fn out_of_reach(dir: OwnedFd) -> OwnedFd {
+    let fd = dir.as_raw_fd();
+    if !crate::fdtable::guest_visible(fd) {
+        return dir;
+    }
+    match crate::fdtable::dup_transient(fd) {
+        // SAFETY: a fresh descriptor this takes ownership of; `dir` closes
+        // the old one.
+        Ok(high) => unsafe { OwnedFd::from_raw_fd(high) },
+        Err(_) => dir,
     }
 }
 

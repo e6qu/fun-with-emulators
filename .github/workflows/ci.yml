@@ -107,8 +107,9 @@ jobs:
       - run: cargo build
       - name: Run LTP's system-call tests under fwe
         run: |
+          # Four at once: most of a test's time is spent waiting.
           python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
-            --results ltp-results.txt --show
+            --jobs 4 --results ltp-results.txt --show
       - if: always()
         uses: actions/upload-artifact@v4
         with:

@@ -129,6 +129,15 @@ pub fn reserve(fd: i32) -> Result<i32, i32> {
     high
 }
 
+/// A close-on-exec duplicate of `fd`, a descriptor fwe holds only for the
+/// call it is in, at the lowest free number of the reserved range (or
+/// `EMFILE` when the range is full).
+pub fn dup_transient(fd: i32) -> Result<i32, i32> {
+    // SAFETY: plain host call on a descriptor the caller holds.
+    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, guest_max()) };
+    if high < 0 { Err(fwe_abi::errno::EMFILE) } else { Ok(high) }
+}
+
 /// A close-on-exec duplicate of `fd` in the reserved range, or `EMFILE`
 /// when the range is full (`EBADF` if `fd` is not open).
 pub fn dup_reserved(fd: i32) -> Result<i32, i32> {
