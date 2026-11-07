@@ -116,14 +116,23 @@ thread_local! {
 /// not happen in the middle of a call on it, nor be followed by one: if it
 /// arrives during `f`, the thread destroys its vCPU after `f` and stops;
 /// if it came before, the thread stops instead of making the call.
+///
+/// The thread is marked as in a call before it looks whether the process
+/// is ending: a wake that comes after the mark leaves the vCPU for the
+/// thread to destroy (which the look then sees), and one that came before
+/// it destroyed the vCPU already (which the look sees too). Looking first
+/// would leave a moment in which the handler destroys the vCPU unmarked
+/// and the call is then made on it.
 fn hvf<T>(f: impl FnOnce() -> T) -> T {
-    if EXITING.load(std::sync::atomic::Ordering::SeqCst)
-        && (VCPU.with(Cell::get).is_none() || RETIRE_AFTER.with(Cell::get))
-    {
+    use std::sync::atomic::{Ordering::SeqCst, compiler_fence};
+    let outer = IN_HVF.with(|c| c.replace(true));
+    // The handler runs on this thread: keep the mark before the look.
+    compiler_fence(SeqCst);
+    if EXITING.load(SeqCst) && (VCPU.with(Cell::get).is_none() || RETIRE_AFTER.with(Cell::get)) {
         park();
     }
-    let outer = IN_HVF.with(|c| c.replace(true));
     let r = f();
+    compiler_fence(SeqCst);
     IN_HVF.with(|c| c.set(outer));
     if !outer && RETIRE_AFTER.with(Cell::get) {
         park();

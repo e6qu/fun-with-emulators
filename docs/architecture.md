@@ -569,6 +569,20 @@ that re-executes fwe, the whole guest mask goes on the host, and the
 signals fwe holds pending that the guest blocks go to the host, pending on
 the thread, which `execve` keeps.
 
+A standard signal already pending keeps the `siginfo` it was first raised
+with, as Linux drops a later instance. An adopted orphan's `SIGCHLD` comes
+before its former parent's, as Linux sends them when the parent ends: it
+takes the place of the parent's while that is pending, and absorbs one that
+comes after it. fwe's own handlers run with every signal blocked, so a
+signal arriving during one (a child's `SIGUSR1`, then its `SIGCHLD`) is
+taken after it with the `siginfo` macOS emptied; an fwe process that sends
+another a signal leaves a note of itself in the target's mailbox, beside
+its process record, which the target's handler reads then
+(`crates/kernel/src/signote.rs`). The parent
+of a `fork` holds every signal blocked across the host call, so a child
+goes on only once its parent has unblocked them: a signal it sent sooner
+would lose its sender.
+
 A process-wide signal the host holds can still be parked on one thread,
 which never takes it, while the thread runs fwe's handlers with every
 signal blocked. In the native backend a thread entering a system call
@@ -691,9 +705,41 @@ or taken under the socket's lock for that way, which the threads of a
 process share as a mutex and processes as a byte-range lock on a file of
 fwe's, so neither threads nor processes interleave or split one.
 
+`SO_PEERCRED` names a Unix socket's peer (its pid in the caller's pid
+namespace, its ids as the guest sees the host's), and `shutdown` of a Unix
+socket whose peer has gone succeeds, as on Linux.
+
+In a network namespace of fwe's, an `AF_NETLINK` socket of the
+`NETLINK_ROUTE` family (`crates/kernel/src/netlink.rs`) answers what a
+container runtime asks of its loopback: `RTM_GETLINK` describes `lo`,
+`RTM_NEWLINK` brings it up or down, `RTM_GETADDR` lists its addresses once
+up, anything else is answered with `EOPNOTSUPP`. The guest's descriptor is
+one end of a host datagram pair, fwe writing each reply to the other, so
+receiving and `epoll` are the host's own. In the initial namespace, whose
+interfaces are the host's, there is no netlink socket (`EAFNOSUPPORT`).
+
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
-over these sockets. `AF_NETLINK` and raw sockets are M4.
+over these sockets. Raw sockets are M4.
+
+Named FIFOs differ on the host in two ways fwe makes up for
+(`crates/kernel/src/fifo.rs`). macOS reports neither to `kqueue` nor to
+`poll` that a FIFO's last writer has gone: fwe's `epoll` and `ppoll`
+watching a FIFO's read end wait in short slices and look between them with
+the host's `select`, which asks the FIFO's underlying socket and finds it
+readable with nothing to read once a writer has been there and gone. They
+report `POLLHUP` as Linux does (once to an edge-triggered or one-shot
+`epoll` entry; a signal ends the wait between slices), after the data still
+buffered has been read. The look reads nothing, so a process holding a
+FIFO's read end only to keep it open takes no data from its reader. An
+open of a FIFO that waits for its other end runs outside the kernel lock,
+so the process's other threads run on.
+An `O_PATH` descriptor never opens a FIFO, which on the host would count as
+a reader or writer of it: like one of a device or socket the host cannot
+open, or of a symbolic link itself (`O_NOFOLLOW`), it is a stand-in that
+names the file, whose `fstat`, `readlinkat`, `faccessat2`, `utimensat` and
+fdinfo are the file's and through whose `/proc/self/fd` link the file is
+opened again.
 
 ## Terminals and job control
 
@@ -833,18 +879,25 @@ whoever finds it gone records that for it. Its parent's `wait` removes the
 record, or once the parent has gone, the adopter's `wait` takes it. A
 reaper runs a watcher thread that follows its descendants on the host
 (`kqueue` process events) and, when an adopted one ends, stops or
-continues (the signals it is sent, and then its state), sends the reaper
-a `SIGCHLD` through the host (so its disposition, mask and `SA_NOCLDSTOP`
-act on it as on a child's; the handler takes the sender and status from
-the watcher) and wakes its threads waiting in `wait`, which look at its
+continues (the signals it is sent, and then its state), raises a
+`SIGCHLD` in the reaper (pending for the guest with a child's `siginfo`,
+its disposition, mask and `SA_NOCLDSTOP` acting on it as on a child's; not
+through the host, where a `SIGCHLD` held or being delivered would absorb
+it) and wakes its threads waiting in `wait`, which look at its
 own children and then at its adopted ones. As on Linux, an orphan keeps
 the adopter it had when its parent ended: a process that becomes a
 subreaper notes the orphans below it that have one already, and one that
 stops being a subreaper keeps those it adopted.
 
 `/proc/<pid>` shows the processes of the reader's pid namespace (`stat`,
-`status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, the maps), from their
-records and what the host reports; `/proc/self/ns` names each namespace.
+`status`, `cmdline`, `comm`, `exe`, `cgroup`, `ns`, `fd`, `oom_score_adj`,
+the maps), from their records and what the host reports of their
+descriptors; `/proc/self/ns` names each namespace, its links followed by
+`stat` to the namespace itself (its number the inode, as nsfs shows it),
+and `/proc/self/fdinfo` describes each descriptor. A process's
+`oom_score_adj` is in its record, inherited by its children (going below
+the last value a privileged process set takes `CAP_SYS_RESOURCE`), and so
+are its user and group ids, which its files there are owned by.
 
 ### cgroups
 
@@ -859,7 +912,10 @@ or a counter shows what is so then. `cgroup.freeze`, `cgroup.kill` and
 `bpf`) attached to a cgroup decide every device open and `mknod` of its
 members; they run on an interpreter (`crates/kernel/src/bpf.rs`) that
 checks each access against the context and the stack and stops a program
-that runs too long.
+that runs too long. A program of another type loads (libraries probe the
+kernel's features by loading one) but is not attached (`EINVAL`), and
+`/proc/self/fdinfo` shows a program's type, identity and tag (Linux's:
+the first 8 bytes of its instructions' SHA-1).
 
 ### Capabilities, seccomp and devices
 
@@ -913,8 +969,9 @@ those items.
 - **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
   fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
   to process locks.
-- **Sockets:** an `AF_UNIX` path that, rooted under the rootfs, is longer
-  than the host's 103 bytes fails with `ENAMETOOLONG`.
+- **Sockets:** a `sendto` to an `AF_UNIX` path that, rooted under the
+  rootfs, is longer than the host's 103 bytes fails with `ENAMETOOLONG`
+  (`bind` and `connect` reach it from its directory).
 - **Files:** `fallocate` reserves space past the end of a file (mode 0
   and `FALLOC_FL_KEEP_SIZE`) and punches holes, but a hole inside a sparse
   file is not filled, and its other modes are `EOPNOTSUPP`, as on a Linux
@@ -948,9 +1005,7 @@ those items.
 - **Filesystem:** of `/dev`, only `null`, `zero`, `full`, `random`,
   `urandom`, `tty` and the `/proc/self/fd` links are provided, and a node
   `mknod` makes opens a host device only for those numbers (`ENXIO`
-  otherwise); a node lists as a regular file in `getdents64`, and an
-  `O_PATH` descriptor of a device the host will not open is a stand-in
-  whose `stat` is `/dev/null`'s, as is that of a socket. File owners other
+  otherwise); a node lists as a regular file in `getdents64`. File owners other
   than fwe's own user read as 65534, and a `chown` does not show in a
   later `stat`. A caller without the capabilities is held only to the
   owner's bits of a kept mode, and a directory's search bit is not
@@ -968,7 +1023,8 @@ those items.
   record locks held through it; descriptors of one overlay directory
   (`dup`, `fork`) each keep their own place in its listing.
 - **Namespaces:** a network namespace has a loopback interface only (no
-  `veth`, no netlink), and a datagram to one of its ports nobody bound by
+  `veth`; netlink describes and brings up only it, its port numbers
+  unique within a process rather than the namespace), and a datagram to one of its ports nobody bound by
   number goes to the host loopback port of that number; the initial
   namespace's sysctls cannot be changed (they would be the host's); a
   port is freed
@@ -980,8 +1036,14 @@ those items.
   an adopted orphan's state after each signal it is sent, so a stop and a
   continue sent together, before it looks, are not reported, and stops
   not yet reported are forgotten when the reaper runs another program;
-  `/proc/<pid>` of another process has no `fd`, `cwd`, `root` or
-  `environ`, and shows only fwe's processes in the initial pid namespace.
+  `/proc/<pid>` of another process has no `cwd`, `root` or `environ`, and
+  shows only fwe's processes in the initial pid namespace; resource limits
+  set on another process with `prlimit` take effect at its next limit
+  call, `fork` or `execve`, and reading another's reports what was set for
+  it, else the caller's own; a `CLONE_PARENT` child's parent is the
+  caller's for `getppid`, `/proc` and its adoption, but on the host it is
+  the caller's child, which the caller's parent cannot `wait` for (nor
+  gets `SIGCHLD` of) while the caller lives.
 - **cgroups:** the memory, CPU, I/O and other limits are kept and read
   back but not enforced (only `pids.max` and device programs are); a
   threaded cgroup cannot be made (`cgroup.threads` refuses writes); the
@@ -996,7 +1058,9 @@ those items.
   (one pending per signal, as Linux does for them); a blocked signal whose
   action the host applies (one ignored, or a default that ignores or
   continues) loses its sender, which matters only if a handler is
-  installed before it is unblocked; a blocked signal pending across an
+  installed before it is unblocked; a signal from outside fwe (or sent
+  to a process group) that arrives while one of fwe's handlers runs comes
+  with no sender; a blocked signal pending across an
   `execve` arrives with fwe's own pid as its sender;
   `rt_sigqueueinfo` is not implemented; a signal that
   arrives between a blocking call's start and its host wait can be noticed

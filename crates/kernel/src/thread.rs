@@ -149,12 +149,28 @@ impl Pending {
         Pending { bits: AtomicU64::new(0), info: [const { SigSlot::new() }; signal::NSIG as usize] }
     }
 
-    /// Mark `sig` pending. Async-signal-safe.
+    /// Mark `sig` pending. A standard signal already pending keeps the
+    /// `siginfo` it was first raised with, as Linux drops a second instance
+    /// of one (real-time signals, which Linux queues, keep the latest).
+    /// The exception is an adopted process's `SIGCHLD`, which takes the
+    /// place of its former parent's ([`crate::reaper::precedes`]): Linux
+    /// sends it as the parent ends, before the parent's own. Async-signal-
+    /// safe.
     pub fn post(&self, sig: u64, info: SigInfo) {
         if !(1..=signal::NSIG).contains(&sig) {
             return;
         }
         let slot = &self.info[(sig - 1) as usize];
+        if sig == signal::SIGCHLD && crate::reaper::superseded(info.pid) {
+            return;
+        }
+        if sig < signal::SIGRTMIN
+            && self.bits.load(Ordering::Acquire) & (1 << (sig - 1)) != 0
+            && !(sig == signal::SIGCHLD
+                && crate::reaper::precedes(info.pid, slot.pid.load(Ordering::Relaxed)))
+        {
+            return;
+        }
         slot.code.store(info.code, Ordering::Relaxed);
         slot.pid.store(info.pid, Ordering::Relaxed);
         slot.uid.store(info.uid, Ordering::Relaxed);

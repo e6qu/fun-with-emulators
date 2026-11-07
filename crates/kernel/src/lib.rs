@@ -19,6 +19,7 @@ pub mod devnodes;
 pub mod epoll;
 pub mod fdmarks;
 pub mod fdtable;
+pub mod fifo;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -29,6 +30,7 @@ pub mod modes;
 mod mountops;
 pub mod mounts;
 pub mod net;
+pub mod netlink;
 pub mod netns;
 pub mod ns;
 pub mod nsops;
@@ -44,6 +46,7 @@ pub mod seqpacket;
 pub mod shared;
 pub mod signal;
 pub mod signalfd;
+pub mod signote;
 pub mod snapshot;
 pub mod specialfd;
 pub mod synthdir;
@@ -236,6 +239,8 @@ pub struct Kernel<P: Platform> {
 
 impl<P: Platform> Kernel<P> {
     pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
+        // Before any handler may need to read a note of a sender.
+        signote::init();
         Kernel {
             platform,
             tracer,
@@ -262,6 +267,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(self.tracer.failures_only);
         e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
+        netlink::save(e, false);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         match &self.fs {
@@ -317,6 +323,7 @@ impl<P: Platform> Kernel<P> {
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
         let trace_file = d.bytes();
         fdmarks::load(d);
+        netlink::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
@@ -400,6 +407,9 @@ impl<P: Platform> Kernel<P> {
     /// Ignored signals stay ignored, and the blocked mask and pending signals
     /// are kept, as Linux does.
     pub fn exec_reset(&mut self) {
+        // Limits another process left for this one (runc sets its
+        // container's this way before it runs the program).
+        self.take_pending_limits();
         for action in &mut self.sigactions {
             let ignored = action.handler == absig::SIG_IGN;
             *action = Sigaction::default();
@@ -413,10 +423,14 @@ impl<P: Platform> Kernel<P> {
         thread::set_robust_list(0, 0);
         // The saved IDs become the effective ones, as Linux's execve sets
         // them (no set-user-ID programs here).
+        let saved = (self.creds.suid, self.creds.sgid);
         self.creds.suid = self.creds.euid;
         self.creds.sgid = self.creds.egid;
         let (uid, euid) = (self.creds.uid, self.creds.euid);
         self.creds.caps.on_exec(uid, euid);
+        if saved != (self.creds.suid, self.creds.sgid) {
+            self.ids_changed(0);
+        }
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
@@ -509,6 +523,8 @@ impl<P: Platform> Kernel<P> {
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
         fdmarks::save(&mut e);
+        // The netlink sockets' host ends, which survive the host exec.
+        netlink::save(&mut e, true);
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -536,6 +552,7 @@ impl<P: Platform> Kernel<P> {
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
         fdmarks::load(&mut d);
+        netlink::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         d.finish()?;
@@ -562,6 +579,10 @@ impl<P: Platform> Kernel<P> {
         if let Some(fs) = self.fs.as_mut() {
             fs.set_umask(umask);
         }
+        // Limits another process left for this one (runc sets its
+        // container's this way before it runs the program).
+        self.take_pending_limits();
+        self.ids_changed(0);
         Ok(())
     }
 
@@ -920,6 +941,14 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
     }
+    if nr == n::OPENAT {
+        // A FIFO's open waits for the other end: here, without the lock,
+        // and the locked open takes what this one opened.
+        if let Err(e) = fs::open_fifo_unlocked(a[0] as i32, a[1], a[2]) {
+            return Some(fwe_abi::err(e));
+        }
+        return None;
+    }
     Some(match nr {
         // SAFETY: caller guarantees the futex word and timeout are valid.
         n::FUTEX => unsafe { futex::op(a[0], a[1], a[2] as u32, a[3]) },
@@ -975,6 +1004,20 @@ unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 && let Some(r) = crate::sysctl::try_write(fd, buf, len)
             {
                 return Some(r);
+            }
+            if fdmarks::any_marks()
+                && let Some(r) = crate::procpid::try_write(fd, buf, len)
+            {
+                return Some(r);
+            }
+            if netlink::is(fd) {
+                if netlink::too_large(len) {
+                    return Some(fwe_abi::err(fwe_abi::errno::EMSGSIZE));
+                }
+                return Some(match uaccess::read_bytes(buf, len as usize) {
+                    Ok(d) => netlink::send(fd, &d),
+                    Err(e) => fwe_abi::err(e),
+                });
             }
             if seqpacket::is(fd) {
                 return Some(match uaccess::host_buffer(buf, len, false) {

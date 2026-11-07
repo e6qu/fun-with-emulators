@@ -197,6 +197,7 @@ impl<P: Platform> Kernel<P> {
                 {
                     crate::netns::closed(fd, mark);
                 }
+                crate::netlink::closed(fd);
                 crate::fdmarks::closed(fd);
                 if let Some(r) = crate::specialfd::try_close(fd) {
                     r
@@ -248,10 +249,16 @@ impl<P: Platform> Kernel<P> {
 
             // Sockets. The blocking calls (connect, accept, send*, recv*) are
             // handled lock-free in `blocking_syscall`; these set up or query.
+            nr::SOCKET if a[0] == crate::netlink::AF_NETLINK => {
+                crate::netlink::socket(a[1], a[2], self.creds.has(crate::caps::CAP_NET_ADMIN))
+            }
             // SAFETY: socket takes no pointers.
             nr::SOCKET => unsafe { crate::net::socket(a[0], a[1], a[2]) },
             // SAFETY: the sv pointer is validated by the host/impl.
             nr::SOCKETPAIR => unsafe { crate::net::socketpair(a[0], a[1], a[2], a[3]) },
+            nr::BIND if crate::netlink::is(a[0] as i32) => {
+                crate::netlink::bind(a[0] as i32, a[1], a[2])
+            }
             // SAFETY: the sockaddr pointer is validated by the host/impl.
             nr::BIND => unsafe {
                 crate::net::bind(
@@ -264,10 +271,22 @@ impl<P: Platform> Kernel<P> {
             },
             // SAFETY: no pointers.
             nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
+            nr::GETSOCKNAME if crate::netlink::is(a[0] as i32) => {
+                crate::netlink::getname(a[0] as i32, a[1], a[2], false)
+            }
+            nr::GETPEERNAME if crate::netlink::is(a[0] as i32) => {
+                crate::netlink::getname(a[0] as i32, a[1], a[2], true)
+            }
             // SAFETY: the out pointers are validated by the host/impl.
             nr::GETSOCKNAME => unsafe { crate::net::getname(a[0], a[1], a[2], false) },
             // SAFETY: the out pointers are validated by the host/impl.
             nr::GETPEERNAME => unsafe { crate::net::getname(a[0], a[1], a[2], true) },
+            // A netlink socket's own options change nothing fwe does.
+            nr::SETSOCKOPT
+                if a[1] == crate::netlink::SOL_NETLINK && crate::netlink::is(a[0] as i32) =>
+            {
+                0
+            }
             // SAFETY: the option buffer is validated by the host/impl.
             nr::SETSOCKOPT => unsafe { crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4]) },
             // SAFETY: the out buffers are validated by the host/impl.
@@ -408,39 +427,65 @@ impl<P: Platform> Kernel<P> {
             nr::GETGID => uid_out(self.creds.gid, true),
             nr::GETEGID => uid_out(self.creds.egid, true),
             nr::SETUID => match uid_in(a[0], false) {
-                Ok(u) => self.creds.setuid(u),
+                Ok(u) => {
+                    let r = self.creds.setuid(u);
+                    self.ids_changed(r)
+                }
                 Err(e) => err(e),
             },
             nr::SETREUID => match (uid_in(a[0], false), uid_in(a[1], false)) {
-                (Ok(r), Ok(e)) => self.creds.setreuid(r, e),
+                (Ok(r), Ok(e)) => {
+                    let r = self.creds.setreuid(r, e);
+                    self.ids_changed(r)
+                }
                 (Err(x), _) | (_, Err(x)) => err(x),
             },
             nr::SETRESUID => {
                 match (uid_in(a[0], false), uid_in(a[1], false), uid_in(a[2], false)) {
-                    (Ok(r), Ok(e), Ok(s)) => self.creds.setresuid(r, e, s),
+                    (Ok(r), Ok(e), Ok(s)) => {
+                        let r = self.creds.setresuid(r, e, s);
+                        self.ids_changed(r)
+                    }
                     (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
                 }
             }
             nr::SETFSUID => match uid_in(a[0], false) {
-                Ok(u) => uid_out(self.creds.setfsuid(u) as u32, false),
+                Ok(u) => {
+                    let old = self.creds.setfsuid(u) as u32;
+                    self.ids_changed(0);
+                    uid_out(old, false)
+                }
                 // Unmapped: no change, and the old one back.
                 Err(_) => uid_out(self.creds.fsuid, false),
             },
             nr::GETRESUID => self.sys_getresuid(a[0], a[1], a[2]),
             nr::SETGID => match uid_in(a[0], true) {
-                Ok(g) => self.creds.setgid(g),
+                Ok(g) => {
+                    let r = self.creds.setgid(g);
+                    self.ids_changed(r)
+                }
                 Err(e) => err(e),
             },
             nr::SETREGID => match (uid_in(a[0], true), uid_in(a[1], true)) {
-                (Ok(r), Ok(e)) => self.creds.setregid(r, e),
+                (Ok(r), Ok(e)) => {
+                    let r = self.creds.setregid(r, e);
+                    self.ids_changed(r)
+                }
                 (Err(x), _) | (_, Err(x)) => err(x),
             },
             nr::SETRESGID => match (uid_in(a[0], true), uid_in(a[1], true), uid_in(a[2], true)) {
-                (Ok(r), Ok(e), Ok(s)) => self.creds.setresgid(r, e, s),
+                (Ok(r), Ok(e), Ok(s)) => {
+                    let r = self.creds.setresgid(r, e, s);
+                    self.ids_changed(r)
+                }
                 (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
             },
             nr::SETFSGID => match uid_in(a[0], true) {
-                Ok(g) => uid_out(self.creds.setfsgid(g) as u32, true),
+                Ok(g) => {
+                    let old = self.creds.setfsgid(g) as u32;
+                    self.ids_changed(0);
+                    uid_out(old, true)
+                }
                 Err(_) => uid_out(self.creds.fsgid, true),
             },
             nr::GETRESGID => self.sys_getresgid(a[0], a[1], a[2]),
@@ -1178,6 +1223,18 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
+    /// A call that may have changed the caller's ids returned `r`: other
+    /// processes see the ids it now has ([`crate::procreg::ProcRecord::ids`]).
+    pub(crate) fn ids_changed(&self, r: i64) -> i64 {
+        if r >= 0 {
+            let c = &self.creds;
+            crate::procreg::set_own_ids([
+                c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
+            ]);
+        }
+        r
+    }
+
     /// `/proc/self/status`: the host's view of the process with the
     /// kernel's own of its credentials, capabilities and restrictions.
     pub(crate) fn self_status(&self) -> Vec<u8> {
@@ -1273,18 +1330,27 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_prlimit(&mut self, pid: u64, res: u64, new: u64, old: u64) -> i64 {
-        if pid != 0 && pid as i32 != thread::tgid() {
-            return err(errno::ESRCH);
-        }
+        self.take_pending_limits();
         if res >= resource::RLIM_NLIMITS {
             return err(errno::EINVAL);
         }
-        if res == resource::RLIMIT_NOFILE {
-            // Virtual: the host's limit also covers fwe's own descriptors.
-            let (cur, max) = crate::fdtable::limit();
-            if old != 0 {
-                guest!(uaccess::write(old, Rlimit { rlim_cur: cur, rlim_max: max }));
+        let target = match crate::pidns::host_arg(pid as i32) {
+            Ok(0) => host::getpid() as i32,
+            Ok(h) => h,
+            Err(e) => return err(e),
+        };
+        if target != host::getpid() as i32 {
+            return self.prlimit_other(target, res, new, old);
+        }
+        if old != 0 {
+            match own_limit(res) {
+                Ok((cur, max)) => {
+                    guest!(uaccess::write(old, Rlimit { rlim_cur: cur, rlim_max: max }))
+                }
+                Err(e) => return err(e),
             }
+        }
+        if res == resource::RLIMIT_NOFILE {
             if new != 0 {
                 let n: Rlimit = guest!(uaccess::read(new));
                 if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
@@ -1294,30 +1360,9 @@ impl<P: Platform> Kernel<P> {
             return 0;
         }
         let Some(hres) = host::rlimit_to_host(res) else {
-            // Limits the host does not have: report Linux defaults.
-            if old != 0 {
-                let v = match res {
-                    resource::RLIMIT_SIGPENDING => 63_432,
-                    resource::RLIMIT_MSGQUEUE => 819_200,
-                    resource::RLIMIT_NICE | resource::RLIMIT_RTPRIO => 0,
-                    _ => resource::RLIM_INFINITY,
-                };
-                guest!(uaccess::write(old, Rlimit { rlim_cur: v, rlim_max: v }));
-            }
+            // Limits the host does not have: Linux defaults, kept.
             return 0;
         };
-        if old != 0 {
-            let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-            // SAFETY: `r` is a valid out-parameter.
-            if unsafe { libc::getrlimit(hres as _, &mut r) } != 0 {
-                return last_error();
-            }
-            let value = Rlimit {
-                rlim_cur: host::rlim_to_linux(r.rlim_cur),
-                rlim_max: host::rlim_to_linux(r.rlim_max),
-            };
-            guest!(uaccess::write(old, value));
-        }
         if new != 0 {
             let n: Rlimit = guest!(uaccess::read(new));
             let r = libc::rlimit {
@@ -1330,6 +1375,90 @@ impl<P: Platform> Kernel<P> {
             }
         }
         0
+    }
+
+    /// `prlimit` of another process, host process `target`: the limit it
+    /// was left (or, none left, the caller's own, which a child inherits:
+    /// fwe cannot read another's), and a new one left for it to take up
+    /// ([`crate::procreg::push_limit`]), for a caller of its ids or with
+    /// `CAP_SYS_RESOURCE`.
+    fn prlimit_other(&mut self, target: i32, res: u64, new: u64, old: u64) -> i64 {
+        if crate::procreg::read(target).is_none() {
+            return err(errno::ESRCH);
+        }
+        // As Linux: another process's limits are the caller's to see and
+        // set if its real, effective and saved ids are all the caller's
+        // real ones, or with CAP_SYS_RESOURCE.
+        let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
+        let ids = crate::procreg::ids(target);
+        let (uid, gid) = (self.creds.uid, self.creds.gid);
+        if !(ids[..3].iter().all(|&u| u == uid) && ids[4..7].iter().all(|&g| g == gid))
+            && !privileged
+        {
+            return err(errno::EPERM);
+        }
+        let n: Option<Rlimit> = if new != 0 { Some(guest!(uaccess::read(new))) } else { None };
+        if let Some(n) = &n
+            && n.rlim_cur > n.rlim_max
+        {
+            return err(errno::EINVAL);
+        }
+        // Raising the hard limit takes CAP_SYS_RESOURCE (the other's limit
+        // as fwe knows it: what was set for it, else the caller's own).
+        if let Some(n) = &n
+            && !privileged
+        {
+            let hard = match crate::procreg::pending_limit(target, res as u32) {
+                Some((_, max)) => max,
+                None => own_limit(res).map_or(resource::RLIM_INFINITY, |(_, max)| max),
+            };
+            if n.rlim_max > hard {
+                return err(errno::EPERM);
+            }
+        }
+        // A descriptor limit past what fwe leaves the guest (every fwe
+        // process the same range): refused now, as Linux refuses one past
+        // `nr_open`, rather than when the other takes it up.
+        if let Some(n) = &n
+            && res == resource::RLIMIT_NOFILE
+            && n.rlim_max != resource::RLIM_INFINITY
+            && n.rlim_max > crate::fdtable::guest_max() as u64
+        {
+            return err(errno::EPERM);
+        }
+        if old != 0 {
+            let had = match crate::procreg::pending_limit(target, res as u32) {
+                Some(l) => l,
+                None => match own_limit(res) {
+                    Ok(l) => l,
+                    Err(e) => return err(e),
+                },
+            };
+            guest!(uaccess::write(old, Rlimit { rlim_cur: had.0, rlim_max: had.1 }));
+        }
+        if let Some(n) = n
+            && let Err(e) = crate::procreg::push_limit(target, res as u32, n.rlim_cur, n.rlim_max)
+        {
+            return err(e);
+        }
+        0
+    }
+
+    /// Take up the resource limits another process set for this one.
+    pub(crate) fn take_pending_limits(&mut self) {
+        for (res, soft, hard) in crate::procreg::take_limits() {
+            let value = Rlimit { rlim_cur: soft, rlim_max: hard };
+            if u64::from(res) == resource::RLIMIT_NOFILE {
+                let _ = crate::fdtable::set_limit(soft, hard);
+            } else if let Some(hres) = host::rlimit_to_host(u64::from(res)) {
+                let r = libc::rlimit {
+                    rlim_cur: host::rlim_to_host(value.rlim_cur),
+                    rlim_max: host::rlim_to_host(value.rlim_max),
+                };
+                // SAFETY: `r` is a valid in-parameter.
+                unsafe { libc::setrlimit(hres as _, &r) };
+            }
+        }
     }
 
     fn sys_clock_gettime(&mut self, id: u64, tp: u64) -> i64 {
@@ -1546,9 +1675,94 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
         let ms = ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
         ms.min(i32::MAX as i64) as i32
     };
-    // SAFETY: `struct pollfd` and the POLL* bits match the host's; the host
-    // validates the guest array.
-    ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) })
+    // The read ends of named FIFOs it watches, whose writers' end the
+    // host does not report ([`crate::fifo`]): waited for in slices,
+    // looked at between them.
+    let fifos: Vec<usize> = if nfds as usize <= 4096 {
+        (0..nfds as usize)
+            .filter(|&i| {
+                uaccess::read::<Pollfd>(fds + (i * size_of::<Pollfd>()) as u64)
+                    .is_ok_and(|p| p.events & libc::POLLIN != 0 && crate::fifo::is_reader(p.fd))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if fifos.is_empty() {
+        // SAFETY: `struct pollfd` and the POLL* bits match the host's; the
+        // host validates the guest array.
+        return ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) });
+    }
+    let deadline =
+        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    loop {
+        let slice = match deadline {
+            None => crate::fifo::SLICE_MS,
+            Some(d) => {
+                let left =
+                    d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+                left.min(crate::fifo::SLICE_MS)
+            }
+        };
+        // SAFETY: as above.
+        let n = unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, 0) };
+        if n < 0 {
+            return last_error();
+        }
+        let mut ready = n as i64;
+        for &i in &fifos {
+            let at = fds + (i * size_of::<Pollfd>()) as u64;
+            let mut p: Pollfd = guest!(uaccess::read(at));
+            let extra = match crate::fifo::probe(p.fd) {
+                crate::fifo::Probe::HungUp => libc::POLLHUP,
+                _ => 0,
+            };
+            if extra != 0 {
+                if p.revents == 0 {
+                    ready += 1;
+                }
+                p.revents |= extra;
+                guest!(uaccess::write(at, p));
+            }
+        }
+        if ready > 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return ready;
+        }
+        // A signal that came between slices interrupts the wait.
+        if crate::thread::deliverable() != 0 {
+            return err(errno::EINTR);
+        }
+        // SAFETY: as above.
+        let n = unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, slice) };
+        if n != 0 {
+            return if n < 0 { last_error() } else { n as i64 };
+        }
+    }
+}
+
+/// The calling process's own limit of Linux resource `res` (soft, hard):
+/// the descriptor limit fwe keeps, the host's, or for a limit the host does
+/// not have, Linux's default.
+fn own_limit(res: u64) -> Result<(u64, u64), i32> {
+    if res == resource::RLIMIT_NOFILE {
+        // Virtual: the host's limit also covers fwe's own descriptors.
+        return Ok(crate::fdtable::limit());
+    }
+    let Some(hres) = host::rlimit_to_host(res) else {
+        let v = match res {
+            resource::RLIMIT_SIGPENDING => 63_432,
+            resource::RLIMIT_MSGQUEUE => 819_200,
+            resource::RLIMIT_NICE | resource::RLIMIT_RTPRIO => 0,
+            _ => resource::RLIM_INFINITY,
+        };
+        return Ok((v, v));
+    };
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `r` is a valid out-parameter.
+    if unsafe { libc::getrlimit(hres as _, &mut r) } != 0 {
+        return Err(host::errno_to_linux(host::last_errno()));
+    }
+    Ok((host::rlim_to_linux(r.rlim_cur), host::rlim_to_linux(r.rlim_max)))
 }
 
 /// `u32` words as their native-endian bytes.

@@ -1342,6 +1342,26 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Print the last calls of each process in the `--strace-file` trace
+/// `trace`, for a run that failed.
+fn print_last_calls(trace: &Path) {
+    let text = std::fs::read_to_string(trace).unwrap_or_default();
+    let mut pids: Vec<&str> = Vec::new();
+    for l in text.lines() {
+        let p = l.split(']').next().unwrap_or("");
+        if !pids.contains(&p) {
+            pids.push(p);
+        }
+    }
+    for p in pids {
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(p)).collect();
+        eprintln!("--- {p}] last calls:");
+        for l in &lines[lines.len().saturating_sub(15)..] {
+            eprintln!("{l}");
+        }
+    }
+}
+
 /// What the container prints in [`alpine_podman_runs_an_image`].
 const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
     grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; ls /proc | grep -E '^[0-9]+$' | head -1; \
@@ -1386,23 +1406,9 @@ fn alpine_podman_runs_an_image() {
         cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
-        if !out.status.success() && args[0] != "run" {
-            // The last calls of each process.
-            let text = std::fs::read_to_string(&trace).unwrap_or_default();
-            let mut pids: Vec<&str> = Vec::new();
-            for l in text.lines() {
-                let p = l.split(']').next().unwrap_or("");
-                if !pids.contains(&p) {
-                    pids.push(p);
-                }
-            }
-            for p in pids {
-                let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(p)).collect();
-                eprintln!("--- {p}] last calls:");
-                for l in &lines[lines.len().saturating_sub(15)..] {
-                    eprintln!("{l}");
-                }
-            }
+        // A `run` ends with its container's status; one killed hung.
+        if !out.status.success() && (args[0] != "run" || out.status.code().is_none()) {
+            print_last_calls(&trace);
         }
         out
     };
@@ -1420,6 +1426,113 @@ fn alpine_podman_runs_an_image() {
         "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\nroot on overlay\n"
     );
     assert_eq!(run.status.code(), Some(3));
+    assert_eq!(stdout(&after), "");
+}
+
+/// What the container prints in [`alpine_containerd_runs_an_image`].
+const IN_CONTAINERD: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
+    grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; touch /made-here && echo writable; \
+    awk '$5 == \"/\" && / - overlay / {print \"root on overlay\"}' /proc/self/mountinfo; exit 4";
+
+/// Alpine's containerd (fetched: `guests/alpine/fetch/containerd.txt`), as
+/// root: the daemon runs, `ctr` imports the standard `alpine` image from an
+/// OCI archive into its overlay snapshotter and runs a container of it
+/// through containerd's runc shim and runc, in its own namespaces, with
+/// `no_new_privs` and, asked for, containerd's default seccomp profile; the
+/// container's exit status is `ctr`'s, and `--rm` leaves no container
+/// behind.
+#[test]
+fn alpine_containerd_runs_an_image() {
+    let root = std::env::temp_dir().join(format!("fwe-containerd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("containerd")).arg(&root));
+    std::fs::create_dir_all(root.join("etc/containerd")).unwrap();
+    std::fs::write(
+        root.join("etc/containerd/config.toml"),
+        "version = 2\nroot = \"/var/lib/containerd\"\nstate = \"/run/containerd\"\n\
+         disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n\
+         [grpc]\n  address = \"/run/containerd/containerd.sock\"\n",
+    )
+    .unwrap();
+    alpine_oci_archive("containerd", &root.join("tmp/alpine.tar"));
+    let _workload = workload();
+    // Each process's calls, for a step that fails: the daemon's (its
+    // shims' and runc's with them), and each ctr's.
+    let fwe = |prog: &str, trace: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        let trace = root.join("tmp").join(trace);
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join(prog));
+        cmd
+    };
+    let log = std::fs::File::create(root.join("tmp/containerd.log")).unwrap();
+    let mut daemon = fwe("usr/bin/containerd", "containerd.trace")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let socket = root.join("run/containerd/containerd.sock");
+    for _ in 0..600 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // `ctr` with `args`, which is to end with status `expect`; otherwise
+    // the last calls of it and of containerd's processes (the shims, runc)
+    // are printed.
+    let ctr = |args: &[&str], expect: i32| {
+        let trace = format!("ctr-{}.trace", args[..2].join("-"));
+        let mut cmd = fwe("usr/bin/ctr", &trace);
+        cmd.args(args);
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        eprintln!("--- ctr {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        if out.status.code() != Some(expect) {
+            print_last_calls(&root.join("tmp").join(&trace));
+            print_last_calls(&root.join("tmp/containerd.trace"));
+        }
+        out
+    };
+    let imported = ctr(&["images", "import", "/tmp/alpine.tar"], 0);
+    let images = ctr(&["images", "ls", "-q"], 0);
+    let run =
+        ctr(&["run", "--rm", "docker.io/library/alpine:3.20", "t1", "sh", "-c", IN_CONTAINERD], 4);
+    // Again with containerd's default seccomp profile.
+    let filtered = ctr(
+        &[
+            "run",
+            "--rm",
+            "--seccomp",
+            "docker.io/library/alpine:3.20",
+            "t2",
+            "sh",
+            "-c",
+            "grep Seccomp: /proc/self/status; uname -r",
+        ],
+        0,
+    );
+    let after = ctr(&["containers", "ls", "-q"], 0);
+    // SAFETY: plain call, to the daemon this test started.
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+    eprintln!(
+        "--- containerd log:\n{}",
+        std::fs::read_to_string(root.join("tmp/containerd.log")).unwrap_or_default()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(stdout(&imported).contains("docker.io/library/alpine:3.20"), "{}", stdout(&imported));
+    assert_eq!(stdout(&images), "docker.io/library/alpine:3.20\n");
+    // ctr's spec sets no_new_privs and, without `--seccomp`, no filter.
+    assert_eq!(
+        stdout(&run),
+        "3.20.10\npid 1\n0\nNoNewPrivs:\t1\nSeccomp:\t0\nwritable\nroot on overlay\n"
+    );
+    assert_eq!(run.status.code(), Some(4));
+    assert!(stdout(&filtered).starts_with("Seccomp:\t2\n"), "{}", stdout(&filtered));
+    assert_eq!(filtered.status.code(), Some(0));
     assert_eq!(stdout(&after), "");
 }
 
@@ -1803,12 +1916,16 @@ echo "$REQUEST_METHOD $QUERY_STRING: $(sqlite3 /tmp/db 'select group_concat(who)
     init.args(["/tmp/db", "create table hits(who text); insert into hits values ('init')"]);
     assert_eq!(run_bounded(init).status.code(), Some(0));
 
-    // A port free a moment ago.
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    std::fs::write(
-        root.path("etc/lighttpd.conf"),
-        format!(
-            r#"server.document-root = "/srv/www"
+    // A port free a moment ago, which another test may take before lighttpd
+    // binds it: then lighttpd ends, and another is tried.
+    let log_path = root.path("tmp/error.log");
+    let mut started = None;
+    for _ in 0..5 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        std::fs::write(
+            root.path("etc/lighttpd.conf"),
+            format!(
+                r#"server.document-root = "/srv/www"
 server.bind = "127.0.0.1"
 server.port = {port}
 server.modules = ("mod_dirlisting", "mod_cgi")
@@ -1819,19 +1936,51 @@ dir-listing.activate = "enable"
 cgi.assign = (".sh" => "/bin/bash")
 mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
 "#
-        ),
-    )
-    .unwrap();
-    let mut cmd = root.command("/bin/lighttpd");
-    cmd.args(["-D", "-f", "/etc/lighttpd.conf", "-m", "/usr/lib/lighttpd"]);
-    let server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-    let start = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
-        std::thread::sleep(Duration::from_millis(50));
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&log_path);
+        // Its failed calls on standard error, for a start that fails.
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace=failures")
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.path("bin/lighttpd"))
+            .args(["-D", "-f", "/etc/lighttpd.conf", "-m", "/usr/lib/lighttpd"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/tmp")
+            .stdin(Stdio::null());
+        let mut server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap());
+        let start = Instant::now();
+        // Listening once its log says it started (a connection could reach
+        // whoever else holds the port).
+        let ended = loop {
+            if std::fs::read_to_string(&log_path).is_ok_and(|l| l.contains("server started")) {
+                break None;
+            }
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break Some(status);
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "lighttpd never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let Some(status) = ended else {
+            started = Some((server, port));
+            break;
+        };
+        let mut err = String::new();
+        if let Some(mut e) = server.0.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut e, &mut err);
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("Address already in use") || err.contains("Address already in use"),
+            "lighttpd ended ({status}) before it listened:\n{err}\n{log}"
+        );
     }
+    let (server, port) = started.expect("a free port for lighttpd");
     // On a failure, lighttpd's own account of it.
-    let log_path = root.path("tmp/error.log");
     let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
     if let Err(e) = result {
         drop(server);
@@ -2089,6 +2238,16 @@ fn signals(scenario: &str) -> String {
 #[test]
 fn kill_reaches_another_process() {
     assert_eq!(signals("kill-child"), "killed by 15\n");
+}
+
+/// A flood of signals, from other processes and between the guest's own
+/// threads (as Go's runtime preempts them), while those threads make
+/// system calls: fwe's handlers do not nest without bound on the signal
+/// stack (one that interrupts fwe's own code only records the signal);
+/// before, the process hung in nested handlers or its signal stack ran out.
+#[test]
+fn signal_flood_during_system_calls() {
+    assert_eq!(signals("storm"), "survived: true calls: true\n");
 }
 
 /// A signal from another process reaches a guest handler (through the host),
@@ -3864,6 +4023,55 @@ fn overlay_mounts() {
          f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\nroot: a d deep sub\n\
          upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
          metacopy: EINVAL\n"
+    );
+}
+
+/// What container runtimes ask beyond the namespaces, as containerd's shim
+/// and runc ask it: an `O_PATH` descriptor of a FIFO is no reader of it and
+/// stats as it; a FIFO's open waits for its other end while the process's
+/// other threads run on, and its reader sees its writer go in `epoll` and
+/// `poll`; `/proc` shows namespace links as their namespaces, `fdinfo`,
+/// another process's descriptors, `oom_score_adj` (inherited), and is
+/// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
+/// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
+/// is not attached; limits set with `prlimit` from outside; netlink of a
+/// network namespace's `lo`.
+#[test]
+fn container_runtime_calls() {
+    assert_eq!(
+        containers("runtime-calls"),
+        "stat \"\": ENOENT\nwriter with only an O_PATH: ENXIO\nO_PATH fstat is a FIFO: true\n\
+         its link: /tmp/ff\nanother thread ran\nopened the FIFO: true\ndata: 1\n\
+         writer gone: 1 hup true\npoll: hup true\nthen: 0\nns inode matches: true\n\
+         fdinfo: true\nproc fstatfs: 0x9fa0\noom: 500 child's fd 9: /etc/marker\n\
+         prlimit of the child: ok\nchild: oom 500 nofile 100 200\npeer: self true uid 0\n\
+         shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
+         linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
+         attached as a device program: EINVAL\nnetlink outside: EAFNOSUPPORT\n\
+         netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
+    );
+}
+
+/// Descriptor edges container runtimes reach: an `O_PATH | O_NOFOLLOW`
+/// descriptor of a symbolic link (its stat, link, close-on-exec, fdinfo,
+/// access and times through `AT_EMPTY_PATH`); `epoll` reporting one event
+/// per descriptor, one-shot entries once until re-armed, and a FIFO's
+/// writers gone once to one-shot and edge-triggered entries, and nothing
+/// taken from its reader by another process waiting on it; a signal
+/// ending a wait on a FIFO; `oom_adj`'s scale, the floor a privileged write
+/// sets, and another user's `/proc` files.
+#[test]
+fn container_descriptor_edges() {
+    assert_eq!(
+        containers("fd-edges"),
+        "link: true S_IFLNK true\nreadlinkat \"\": target-x\n\
+         readlinkat \"\" of a file: ENOENT\ncloexec: 0 1\nfdinfo O_PATH: true\n\
+         faccessat2 \"\": ok bad flags: EINVAL\nutimensat \"\": ok\nlink's mtime: 2000\n\
+         events: 1 bits 0x5\none-shot: 1 0 re-armed 1\nFIFO one-shot: 1 hup true then 0\n\
+         FIFO edge-triggered: 1 hup true then 0\nFIFO level-triggered: 1 then 1\n\
+         reader got: 200\nppoll: EINTR\nepoll_wait: EINTR\noom_adj 15: 1000 500: 8 -17: -1000\n\
+         user: below the floor EACCES above ok parent's EACCES\n\
+         child's Uid: 1000 1000 1000 1000; root opens its oom_score_adj: ok\n"
     );
 }
 

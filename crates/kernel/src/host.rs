@@ -509,18 +509,6 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
-    // A `SIGCHLD` sent with `kill` comes with no information on macOS
-    // (`si_code` and `si_pid` 0), unlike a child's.
-    if sig == libc::SIGCHLD
-        && code == 0
-        && pid == 0
-        && let Some((c, p, s)) = crate::reaper::take_report()
-    {
-        // An adopted process's end, which fwe's reaper sent this process
-        // (`si_code` and `si_status` already Linux's).
-        // SAFETY: getuid cannot fail.
-        return (c, p, uid_to_initial(unsafe { libc::getuid() }), s);
-    }
     if sig == libc::SIGCHLD && pid == 0 {
         let saved = last_errno();
         // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
@@ -539,6 +527,20 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
         }
         set_errno(saved);
     }
+    // A signal sent by another fwe process left a note of its sender, for
+    // when it comes with none ([`crate::signote`]).
+    #[cfg(target_os = "macos")]
+    {
+        /// macOS's `SI_USER`.
+        const SENT: i32 = 0x10001;
+        if code == 0 && pid == 0 {
+            if let Some((p, u)) = crate::signote::take(sig) {
+                (code, pid, uid) = (SENT, p, u);
+            }
+        } else if code == SENT {
+            crate::signote::clear(sig, pid);
+        }
+    }
     let code = si_code_to_linux(code);
     let killed = matches!(code, wait::CLD_KILLED | wait::CLD_DUMPED | wait::CLD_STOPPED);
     if sig == libc::SIGCHLD && killed {
@@ -548,7 +550,7 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
 }
 
 /// Set the calling thread's host `errno`.
-fn set_errno(value: i32) {
+pub fn set_errno(value: i32) {
     // SAFETY: writing this thread's errno.
     #[cfg(target_os = "macos")]
     unsafe {

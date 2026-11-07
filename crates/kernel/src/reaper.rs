@@ -199,14 +199,16 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
         if peek {
             return Some(e);
         }
+        // Taken, and marked told, under the lock the watcher's `notify`
+        // marks under: whichever marks it first raises its SIGCHLD, and only
+        // it (a second would arrive with no report, from no one). The mark
+        // goes with the watcher's next look, the record taken.
+        let mut told = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
         if procreg::take_ended(&e) {
+            let first = told.get_or_insert_with(HashSet::new).insert((e.pid, e.start));
+            drop(told);
             crate::pidns::released(&e.numbers, e.pid);
-            let told = NOTIFIED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
-                .is_some_and(|n| n.remove(&(e.pid, e.start)));
-            if !told && sigchld_taken() {
+            if first && sigchld_taken() {
                 // Reaped before the watcher saw it end: its SIGCHLD is
                 // still owed, as Linux sends it before `wait` can return.
                 raise(&e);
@@ -217,24 +219,44 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
     None
 }
 
-/// A reaper reaped a child of its own: what that child left unreaped is
-/// now the reaper's, and owed its SIGCHLD.
-pub fn reaped_own_child() {
+/// A reaper reaped `child`, a child of its own: what that child left
+/// unreaped is now the reaper's, and owed its SIGCHLD before the `wait`
+/// returns, as Linux hands a parent's zombies on as the parent ends. One
+/// killed outright left no record of its end, which the watcher may not
+/// have made yet: it is made here.
+pub fn reaped_own_child(child: i32) {
     if active() {
+        for (pid, r) in procreg::all() {
+            if r.lineage.first().is_some_and(|&(p, _)| p == child) {
+                procreg::gone(pid);
+            }
+        }
         notify();
     }
 }
 
-/// Whether a living process this one adopted matches `sel`.
+/// Whether a living process this one adopted matches `sel`. One found
+/// ended with its record left (killed outright, which records nothing)
+/// has its end recorded now, for the `wait` that looks next to take, as
+/// the watcher would a moment later.
 pub fn has_live_adopted(sel: Select) -> bool {
     if !active() {
         return false;
     }
-    procreg::all().into_iter().any(|(pid, r)| {
+    let mut live = false;
+    for (pid, r) in procreg::all() {
         // SAFETY: plain host call.
         let pgid = unsafe { libc::getpgid(pid) };
-        sel.matches(pid, pgid) && procreg::alive((pid, r.start)) && adopted_live(pid, &r)
-    })
+        if !adopted_live(pid, &r) {
+            continue;
+        }
+        if !procreg::alive((pid, r.start)) {
+            procreg::gone(pid);
+        } else if sel.matches(pid, pgid) {
+            live = true;
+        }
+    }
+    live
 }
 
 /// The stops and continues of adopted processes not yet reported to
@@ -563,26 +585,14 @@ fn wake_waiters() {
     }
 }
 
-/// The report of an adopted process's end that a `SIGCHLD` this process
-/// sent itself carries: its host pid (0 for none), `si_code` and
-/// `si_status`. Read by the host signal handler ([`take_report`]).
-static REPORT_PID: AtomicI32 = AtomicI32::new(0);
-static REPORT_CODE: AtomicI32 = AtomicI32::new(0);
-static REPORT_STATUS: AtomicI32 = AtomicI32::new(0);
-
-/// In the host signal handler, for a `SIGCHLD` this process sent itself:
-/// the adopted process's end it reports (`si_code`, host pid, `si_status`),
-/// if it was the watcher's. Async-signal-safe.
-pub fn take_report() -> Option<(i32, i32, i32)> {
-    let pid = REPORT_PID.swap(0, SeqCst);
-    (pid != 0).then(|| (REPORT_CODE.load(SeqCst), pid, REPORT_STATUS.load(SeqCst)))
-}
+/// The last adopted process the reaper reported, and its former parent
+/// (host pids), for [`precedes`].
+static REPORTED: AtomicI32 = AtomicI32::new(0);
+static REPORTED_PARENT: AtomicI32 = AtomicI32::new(0);
 
 /// Raise `SIGCHLD` for each adopted process that ended and was not yet
-/// told of, as Linux does for a child (or a zombie) it hands a reaper. It
-/// is sent through the host, to this process, so the guest's disposition
-/// and mask act on it as on a child's; the handler takes its report from
-/// [`take_report`]. If the host reaps this process's children itself
+/// told of, as Linux does for a child (or a zombie) it hands a reaper
+/// ([`raise`]). If the host reaps this process's children itself
 /// (`SIGCHLD` ignored, or `SA_NOCLDWAIT`), they are reaped instead.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn notify() {
@@ -613,14 +623,47 @@ fn sigchld_taken() -> bool {
     (crate::signal::caught() | crate::signalfd::watched()) & bit != 0
 }
 
-/// Send this process the `SIGCHLD` for adopted process `e`'s end.
+/// Whether the `SIGCHLD` of host process `pid` comes before one of host
+/// process `pending`'s still pending: `pid` is an adopted process the
+/// reaper reported, and `pending` the parent it was orphaned by, whose
+/// end Linux reports after the orphan's (it hands its children on as it
+/// ends). Async-signal-safe.
+pub fn precedes(pid: i32, pending: i32) -> bool {
+    pid != 0 && REPORTED.load(SeqCst) == pid && REPORTED_PARENT.load(SeqCst) == pending
+}
+
+/// Whether a `SIGCHLD` of host process `pid` is one Linux would not send
+/// now: `pid` ended leaving an orphan the reaper has reported already, and
+/// Linux sends a parent's `SIGCHLD` after its orphans' as it ends, so one
+/// still pending absorbs it (a standard signal is not queued twice). Taken
+/// once. Async-signal-safe.
+pub fn superseded(pid: i32) -> bool {
+    pid != 0
+        && REPORTED.load(SeqCst) != 0
+        && REPORTED_PARENT.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok()
+}
+
+/// Raise the `SIGCHLD` for adopted process `e`'s end: pending for the
+/// guest with the `siginfo` Linux gives a child's end, and a guest thread
+/// woken to take it. It is not sent through the host: a `SIGCHLD` the host
+/// holds or is delivering would absorb it (standard signals are not queued
+/// twice), and the guest would hear of the orphan from neither.
 fn raise(e: &Ended) {
+    // An end is what Linux reports before the former parent's own.
+    if !is_stop(e.status) && e.status != CONTINUED {
+        REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);
+        REPORTED.store(e.pid, SeqCst);
+    }
     let (code, status) = child_code(e.status);
-    REPORT_CODE.store(code, SeqCst);
-    REPORT_STATUS.store(status, SeqCst);
-    REPORT_PID.store(e.pid, SeqCst);
+    // SAFETY: getuid cannot fail.
+    let uid = crate::host::uid_to_initial(unsafe { libc::getuid() });
+    let info = crate::thread::SigInfo { code, pid: e.pid, uid, status };
+    crate::thread::post_process(fwe_abi::signal::SIGCHLD, info);
+    // One thread is woken to take it, as the host picks one for a signal
+    // sent to the process: the wake carries nothing, so a wake the host
+    // holds or merges loses nothing.
     // SAFETY: plain host call, to this process.
-    unsafe { libc::kill(me(), libc::SIGCHLD) };
+    unsafe { libc::kill(me(), crate::host::WAKE_SIGNAL) };
 }
 
 /// Host process `pid`'s children.

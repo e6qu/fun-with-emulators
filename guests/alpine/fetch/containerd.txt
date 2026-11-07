@@ -1,0 +1,10 @@
+# Alpine Linux 3.20 aarch64 files the containerd test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs (the root filesystem
+# of the standard `alpine` image), containerd with its shim, ctr, runc and
+# libseccomp. Each line is a path under that URL and the file's SHA-256.
+# 3.20 is past its end of life, so these files no longer change.
+v3.20/releases/aarch64/alpine-minirootfs-3.20.10-aarch64.tar.gz 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+v3.20/community/aarch64/containerd-1.7.17-r2.apk d7d5f399dc2e2d7af7206c51b788ed06991aa2dfe022a014c125bafbe49fdbe6
+v3.20/community/aarch64/containerd-ctr-1.7.17-r2.apk 72e463829f376219a3808943a7ccdb30cd29a9e37946ad61e5a409b4760c6cde
+v3.20/community/aarch64/runc-1.1.14-r0.apk 25551850e3490e8722c462b49483e31a113a8c1ab4d93fb626e3725fcddb0a6f
+v3.20/main/aarch64/libseccomp-2.5.5-r1.apk 8ccd1bd0dbe018a5b4f07ee9c2ffb4fe2805ecfe22e004dd301870d47e14618b

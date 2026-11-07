@@ -254,6 +254,73 @@ fn main() {
             println!("{}", describe(wait_status(pid)));
         }
         // A child signals its parent, which learns the sender.
+        // A flood of signals while the process's threads make system calls,
+        // which fwe runs inside a host signal handler: from other processes,
+        // and between the threads, as Go's runtime preempts its threads.
+        // Each is taken, and none nests the handlers until the process hangs
+        // in them or the signal stack runs out.
+        "storm" => {
+            catch(SIGUSR1, SA_RESTART);
+            catch(SIGUSR2, SA_RESTART);
+            let me = std::process::id() as i32;
+            // Several senders at once, for a while (not a number of signals:
+            // a slow host would take too long to send them).
+            let senders: Vec<i32> = (0..8)
+                .map(|_| {
+                    child(move || {
+                        let start = std::time::Instant::now();
+                        let mut i = 0u32;
+                        while start.elapsed() < std::time::Duration::from_secs(4) {
+                            // SAFETY: plain calls.
+                            unsafe { kill(me, if i % 2 == 0 { SIGUSR1 } else { SIGUSR2 }) };
+                            i = i.wrapping_add(1);
+                        }
+                        0
+                    })
+                })
+                .collect();
+            // Threads that make system calls and signal each other, as Go's
+            // runtime preempts its threads.
+            static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static TIDS: [AtomicI32; 8] = [const { AtomicI32::new(0) }; 8];
+            let threads: Vec<_> = (0..8)
+                .map(|k| {
+                    std::thread::spawn(move || {
+                        // SAFETY: plain system calls.
+                        TIDS[k].store(unsafe { syscall(SYS_GETTID) } as i32, Ordering::SeqCst);
+                        let mut n = 0u64;
+                        while !STOP.load(Ordering::SeqCst) {
+                            // SAFETY: plain calls with valid arguments.
+                            unsafe { syscall(48, -100i64, c"/no/such/file".as_ptr(), 0i64, 0i64) };
+                            let other = TIDS[(k + 1) % 8].load(Ordering::SeqCst);
+                            if other != 0 {
+                                // SAFETY: tgkill to a thread of this process.
+                                unsafe { syscall(131, me as i64, other as i64, SIGUSR2 as i64) };
+                            }
+                            n += 1;
+                        }
+                    })
+                })
+                .collect();
+            let mut status = 0;
+            let mut calls = 0u64;
+            let mut left = senders.len();
+            while left > 0 {
+                // A call with a path, failing: faccessat(AT_FDCWD, ..).
+                // SAFETY: plain calls with valid arguments.
+                unsafe { syscall(48, -100i64, c"/no/such/file".as_ptr(), 0i64, 0i64) };
+                calls += 1;
+                // SAFETY: a valid out-parameter.
+                if unsafe { waitpid(-1, &mut status, 1) } > 0 {
+                    left -= 1;
+                }
+            }
+            STOP.store(true, Ordering::SeqCst);
+            for t in threads {
+                t.join().unwrap();
+            }
+            println!("survived: {} calls: {}", HITS.load(Ordering::SeqCst) > 0, calls > 0);
+        }
         "notify-parent" => {
             // The child may signal before the parent's `fork` returns, while
             // musl's `fork` blocks every signal: the sender is kept either

@@ -128,6 +128,9 @@ impl<P: Platform> Kernel<P> {
     /// inherits it. The caller holds the kernel lock until
     /// [`Kernel::fork_parent`] or [`Kernel::fork_child`].
     pub fn fork_begin(&mut self, flags: u64) -> Result<ForkNs, i32> {
+        // Limits left for this process are its own before its child
+        // inherits them.
+        self.take_pending_limits();
         if flags & CLONE_NEWTIME != 0 {
             return Err(errno::EINVAL);
         }
@@ -137,7 +140,21 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EPERM);
         }
         // Taken while this process's own pid namespaces are current.
-        let line = crate::procreg::child_line();
+        let mut line = crate::procreg::child_line();
+        if flags & fwe_abi::clone::CLONE_PARENT != 0
+            && crate::pidns::current().first().is_some_and(|ns| {
+                // SAFETY: getpid cannot fail.
+                ns.get().number_of(unsafe { libc::getpid() }) == Some(1)
+            })
+        {
+            // A pid namespace's init has no parent in its namespace to give.
+            return Err(errno::EINVAL);
+        }
+        if flags & fwe_abi::clone::CLONE_PARENT != 0 && !line.0.is_empty() {
+            // Its parent is this process's parent, as Linux has it (the
+            // host's is this process, which the host cannot change).
+            line.0.remove(0);
+        }
         // Within the cgroup's `pids.max`.
         crate::cgroupfs::fork_allowed(&crate::cgroupfs::current())?;
         let fs = self.fs.as_mut().expect("filesystem configured");
@@ -220,6 +237,7 @@ impl<P: Platform> Kernel<P> {
         // Its own record too: it may end before the parent writes it.
         crate::procreg::own_line(&t.line);
         crate::reaper::forked_child();
+        crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
         // SAFETY: getpid cannot fail.
         t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
