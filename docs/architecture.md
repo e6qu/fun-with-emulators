@@ -177,7 +177,9 @@ words finds every instruction exactly.
 
   The macOS custom x18 ABI (`<os/arch/arm64.h>`, macOS 26.4 and later) and
   `fwe --host-info` remain only as host probes; correctness no longer
-  depends on the host preserving `x18`.
+  depends on the host preserving `x18`, and guest code runs without the
+  mode (switching it at every trap cost two host calls, and one of them
+  could hang).
 
 Only executable code is scanned, since a data word that happens to encode a
 rewritten instruction would otherwise be patched too. `Elf::exec_ranges`

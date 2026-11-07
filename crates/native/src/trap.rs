@@ -188,20 +188,15 @@ unsafe fn return_with_guest_mask(ctx: *mut libc::c_void) {
 /// drop it blocks signals again and restores both. The guest's x18 is part
 /// of the saved signal context and is restored when the handler returns.
 struct HostCode {
-    abi: Option<X18Abi>,
     was_in_guest: bool,
 }
 
 impl HostCode {
     fn enter() -> HostCode {
-        let abi = X18Abi::get().filter(|abi| abi.enabled());
-        if let Some(abi) = abi {
-            abi.set_enabled(false);
-        }
         let was_in_guest = IN_GUEST.with(|g| g.replace(false));
         crate::quiesce::leave();
         apply_guest_mask();
-        HostCode { abi, was_in_guest }
+        HostCode { was_in_guest }
     }
 }
 
@@ -212,9 +207,6 @@ impl Drop for HostCode {
         if self.was_in_guest {
             // Back to guest code, unless a fork is copying memory.
             crate::quiesce::enter();
-        }
-        if let Some(abi) = self.abi {
-            abi.set_enabled(true);
         }
     }
 }
@@ -227,9 +219,6 @@ pub fn prepare_guest_entry() {
     IN_GUEST.with(|g| g.set(true));
     crate::quiesce::register();
     crate::quiesce::enter();
-    if let Some(abi) = X18Abi::get() {
-        abi.set_enabled(true);
-    }
     apply_guest_mask();
 }
 

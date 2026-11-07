@@ -40,6 +40,10 @@ def prepare(root):
     tmp = os.path.join(root, "tmp")
     os.makedirs(tmp, exist_ok=True)
     os.chmod(tmp, 0o1777)
+    # The host gives a new file its directory's group: the user's own, as
+    # in a checkout, wherever the root is (a group the guest sees as
+    # another's would change what tests of ownership find).
+    os.chown(tmp, -1, os.getegid())
     return tmp
 
 

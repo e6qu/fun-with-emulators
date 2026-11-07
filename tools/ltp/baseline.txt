@@ -115,7 +115,6 @@ fchdir02
 fchmod02
 fchmod03
 fchmod04
-fchmod05
 fchmodat01
 fchmodat02
 fchown01
@@ -303,7 +302,6 @@ mkdirat01
 mkdirat02
 mknod01
 mknod06
-mknod08
 mknod09
 mknodat01
 mlock01
@@ -467,7 +465,6 @@ setregid04
 setresgid01
 setresgid02
 setresgid03
-setresgid04
 setresuid01
 setresuid02
 setresuid03
