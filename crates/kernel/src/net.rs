@@ -342,6 +342,64 @@ fn apply_sock_flags(fd: i32, type_or_flags: u64) {
     }
 }
 
+/// A read's result `r` from descriptor `fd` (system call `nr`) as Linux
+/// gives it: a Unix stream socket that is not connected fails a read with
+/// `EINVAL` there (`ENOTCONN` on the host).
+pub fn linux_read_error(nr: u64, fd: i32, r: i64) -> i64 {
+    use fwe_abi::nr as n;
+    let reads = matches!(
+        nr,
+        n::READ | n::READV | n::PREAD64 | n::PREADV | n::PREADV2 | n::RECVFROM | n::RECVMSG
+    );
+    if !reads || r != err(errno::ENOTCONN) {
+        return r;
+    }
+    let opt = |o: i32| {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-parameters.
+        let ok = unsafe {
+            libc::getsockopt(fd, libc::SOL_SOCKET, o, (&mut v as *mut libc::c_int).cast(), &mut len)
+        } == 0;
+        ok.then_some(v)
+    };
+    // SAFETY: zeroed bytes are a valid `sockaddr_storage`.
+    let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: a valid out-buffer of its length.
+    let named = unsafe {
+        libc::getsockname(fd, (&mut name as *mut libc::sockaddr_storage).cast(), &mut len)
+    } == 0;
+    let unix = named && name.ss_family as i32 == libc::AF_UNIX;
+    if unix && opt(libc::SO_TYPE) == Some(libc::SOCK_STREAM) { err(errno::EINVAL) } else { r }
+}
+
+/// Linux's default socket buffer (`net.core.wmem_default` and
+/// `rmem_default`).
+const LINUX_BUFFER: i32 = 212_992;
+
+/// Give a new Unix socket Linux's buffer sizes: the host's are a few KiB,
+/// so a program that writes more before its peer reads (or sends a larger
+/// datagram) would block (or fail) where on Linux it does not. A
+/// `SOCK_SEQPACKET` one is sized as such ([`crate::seqpacket::make`]).
+fn linux_buffers(fd: i32, dom: i32) {
+    if dom != libc::AF_UNIX {
+        return;
+    }
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: a valid in-parameter on a fresh socket.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&LINUX_BUFFER as *const i32).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+    }
+}
+
 /// `socket(domain, type, protocol)`.
 ///
 /// # Safety
@@ -364,6 +422,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
         return last_error();
     }
     apply_sock_flags(fd, type_);
+    linux_buffers(fd, dom);
     if seqpacket {
         crate::seqpacket::make(fd);
     }
@@ -394,6 +453,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     }
     apply_sock_flags(fds[0], type_);
     apply_sock_flags(fds[1], type_);
+    linux_buffers(fds[0], dom);
+    linux_buffers(fds[1], dom);
     if seqpacket {
         crate::seqpacket::make(fds[0]);
         crate::seqpacket::make(fds[1]);

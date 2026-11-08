@@ -358,7 +358,20 @@ descriptor no longer names the same file is never trusted. Writes on a
 read-only mount fail with `EROFS` (a device, FIFO or socket there still
 opens for writing, as on Linux), a rename or link across mounts with
 `EXDEV`, and the removal of a mount's root with `EBUSY`. `sendfile` and
-`copy_file_range` copy between descriptors.
+`copy_file_range` copy between descriptors. `splice`, `tee` and `vmsplice`
+(`crates/kernel/src/splice.rs`) copy too, since fwe's pipes are the host's:
+from a pipe what it holds, into one what room it has (as Linux would move
+its buffers), waiting for either unless asked not to, without the kernel
+lock; the other end is read and written as the guest's own `read` and
+`write` would be. The host cannot read a pipe without taking what it
+reads, so a pipe's data is taken only as far as it can be written: all of
+it, with what is not written put back in order through a write end of that
+pipe the process holds (as `tee` puts back all it copies), or else no more
+than the output takes now; a pipe or socket with no one to read it fails
+with `EPIPE` before anything is taken. An `O_PATH` descriptor is marked, and
+the calls Linux refuses one (reads and writes, requests, mappings, changes
+through it, syncs, locks, seeks, listings and most of `fcntl`) fail with
+`EBADF`.
 
 Extended attributes (`crates/kernel/src/xattr.rs`) are the host's of the
 same name: a Linux name is always in one of Linux's namespaces (`user.`,
@@ -783,7 +796,9 @@ family byte; the port and address that follow are identical, so it is an
 in-place header fix-up), the `SOCK_NONBLOCK`/`SOCK_CLOEXEC` type flags
 (applied with `fcntl`), `setsockopt` levels and the common option numbers,
 and the `send`/`recv` flags. `MSG_NOSIGNAL` has no macOS equivalent, so every
-socket gets `SO_NOSIGPIPE` and a broken pipe returns `EPIPE`.
+socket gets `SO_NOSIGPIPE` and a broken pipe returns `EPIPE`. A Unix
+socket gets Linux's buffer sizes (the host's are a few KiB), and a read of
+an unconnected Unix stream socket fails with Linux's `EINVAL`.
 
 `AF_UNIX` socket paths are resolved as file paths are, in the guest's
 filesystem (`fs::resolve_host`; the socket calls run without the kernel
@@ -873,11 +888,24 @@ on a pty that way).
 ## Other calls
 
 `pselect6` (what `select` is on arm64) turns its descriptor sets into a
-`poll` and back. `statfs` and `fstatfs` report the host filesystem's sizes
+`poll` and back, and it and `ppoll` write back the time left, unless the
+personality asks for `STICKY_TIMEOUTS`. `personality` is kept per process
+(Linux keeps it per thread) across `fork` and `execve`; `UNAME26` makes
+`uname` report a 2.6 release, and the address-space flags are kept and
+reported only. Scheduling policies (`crates/kernel/src/sched.rs`:
+`sched_setscheduler`, `sched_setattr` and the rest) are kept in each
+process's record with Linux's checks and inherited by its children (reset
+with `SCHED_RESET_ON_FORK`); the host schedules every process alike, and
+the policy is a process's, not each thread's. The clock is read but never
+set: fwe's processes lack `CAP_SYS_TIME`, as in a container, so
+`clock_settime`, `settimeofday`, `adjtimex` and `clock_adjtime` check what
+they are given and refuse a change with `EPERM`; read, the clock reports
+itself unsynchronised. `statfs` and `fstatfs` report the host filesystem's sizes
 and counts with ext4's type, and `msync` is the host's. `prctl` keeps a
-thread name (`PR_SET_NAME`/`PR_GET_NAME`), reports the virtual root's full
-capability bounding set, and records `no_new_privs`, dumpability and a
-parent-death signal; other options fail with `EINVAL`.
+thread name (`PR_SET_NAME`/`PR_GET_NAME`), reports the capability
+bounding set (the virtual root's: every capability but `CAP_SYS_TIME`),
+and records `no_new_privs`, dumpability and a parent-death signal; other
+options fail with `EINVAL`.
 
 ## Credentials
 
@@ -1121,11 +1149,14 @@ of these are to be lifted for 1.0 and which are not planned.
   `F_SEAL_WRITE` succeeds although a writable shared mapping exists
   (Linux fails it with `EBUSY`), does not reach the descriptors another
   process holds, and gives the file a new inode number. A memfd reopened
-  through `/proc/self/fd` shares the original's offset. An `O_PATH`
-  descriptor of a file fwe could open reads and writes as an ordinary one
-  would (Linux refuses both with `EBADF`), and an `O_PATH | O_NOFOLLOW`
-  open of a link in `/proc` or `/sys` fails with `ELOOP` (Linux gives a
-  descriptor of the link).
+  through `/proc/self/fd` shares the original's offset. An `O_PATH |
+  O_NOFOLLOW` open of a link in `/proc` or `/sys` fails with `ELOOP`
+  (Linux gives a descriptor of the link). `tee` needs the process to hold
+  a write end of its input pipe (`EINVAL` otherwise). `splice` from a pipe
+  takes only what it writes when the process holds a write end of that
+  pipe; otherwise a write to a file or a waiting socket that a signal or an
+  error cuts short loses what it took and did not write (Linux leaves it in
+  the pipe).
 - **Descriptors:** what fwe keeps of an open file for `fcntl` (an owner
   thread, `F_SETSIG`'s signal, a lease) is kept per descriptor, so a
   duplicate's changes do not show in the original as they would on Linux;

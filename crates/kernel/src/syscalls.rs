@@ -138,7 +138,10 @@ impl<P: Platform> Kernel<P> {
             | nr::PREADV
             | nr::PWRITEV
             | nr::PREADV2
-            | nr::PWRITEV2 => {
+            | nr::PWRITEV2
+            | nr::SPLICE
+            | nr::TEE
+            | nr::VMSPLICE => {
                 // SAFETY: the backend's guarantee for the guest pointers.
                 unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS))
             }
@@ -525,6 +528,16 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::PERSONALITY => personality(a[0]),
+            nr::SCHED_SETSCHEDULER => self.sys_sched_setscheduler(a[0], Some(a[1]), a[2]),
+            nr::SCHED_SETPARAM => self.sys_sched_setscheduler(a[0], None, a[1]),
+            nr::SCHED_GETSCHEDULER => self.sys_sched_getscheduler(a[0]),
+            nr::SCHED_GETPARAM => self.sys_sched_getparam(a[0], a[1]),
+            nr::SCHED_SETATTR => self.sys_sched_setattr(a[0], a[1], a[2]),
+            nr::SCHED_GETATTR => self.sys_sched_getattr(a[0], a[1], a[2], a[3]),
+            nr::SCHED_GET_PRIORITY_MAX => crate::sched::priority_bound(a[0], true),
+            nr::SCHED_GET_PRIORITY_MIN => crate::sched::priority_bound(a[0], false),
+            nr::SCHED_RR_GET_INTERVAL => self.sys_sched_rr_get_interval(a[0], a[1]),
             nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
@@ -550,6 +563,10 @@ impl<P: Platform> Kernel<P> {
             // Time.
             nr::CLOCK_GETTIME => self.sys_clock_gettime(a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(a[0], a[1]),
+            nr::CLOCK_SETTIME => self.sys_clock_settime(a[0], a[1]),
+            nr::CLOCK_ADJTIME => self.sys_clock_adjtime(a[0], a[1]),
+            nr::SETTIMEOFDAY => self.sys_settimeofday(a[0], a[1]),
+            nr::ADJTIMEX => self.sys_adjtimex(a[0]),
             nr::GETTIMEOFDAY => {
                 // The C library fills these in itself, unchecked: copy out.
                 let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
@@ -760,6 +777,12 @@ impl<P: Platform> Kernel<P> {
                     let r = libc::fcntl(fd, libc::F_GETFL);
                     if r < 0 {
                         last_error()
+                    } else if crate::fdmarks::any_marks()
+                        && crate::fdmarks::marked(fd) == Some(crate::fdmarks::Mark::Path)
+                    {
+                        // An `O_PATH` descriptor's flags: that, and the
+                        // large-file flag every arm64 open has.
+                        (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
                     } else if crate::memfd::write_refused(fd) {
                         // Read-only on the host since it was sealed (see
                         // `memfd`), but open for writing as far as Linux goes.
@@ -1054,7 +1077,7 @@ impl<P: Platform> Kernel<P> {
             None => (crate::ns::host_name(), b"(none)".to_vec()),
         };
         fill(&mut u.nodename, &host);
-        fill(&mut u.release, RELEASE.as_bytes());
+        fill(&mut u.release, release().as_bytes());
         fill(&mut u.version, b"#1 SMP PREEMPT");
         fill(&mut u.machine, b"aarch64");
         fill(&mut u.domainname, &domain);
@@ -1183,6 +1206,9 @@ impl<P: Platform> Kernel<P> {
             Ok(v) => v,
             Err(e) => return if data == 0 && e == err(errno::EINVAL) { 0 } else { e },
         };
+        if pid < 0 {
+            return err(errno::EINVAL);
+        }
         if pid != 0 && pid != thread::tgid() {
             return err(errno::ESRCH);
         }
@@ -1508,7 +1534,16 @@ impl<P: Platform> Kernel<P> {
         }
         match crate::pidns::host_arg(id) {
             // SAFETY: a signal 0 only checks that the process exists.
-            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => 0,
+            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => {
+                // Another user's process, without CAP_SYS_NICE: refused.
+                let owner = crate::procreg::ids(h);
+                if !self.creds.has(crate::caps::CAP_SYS_NICE)
+                    && ![owner[0], owner[1]].contains(&self.creds.euid)
+                {
+                    return err(errno::EPERM);
+                }
+                0
+            }
             _ => err(errno::ESRCH),
         }
     }
@@ -1812,6 +1847,15 @@ impl<P: Platform> Kernel<P> {
 /// # Safety
 /// The set and timeout pointers are null or reference guest memory.
 pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
+    // SAFETY: the caller's guarantee, passed on.
+    with_remaining(timeout, || unsafe { pselect6_wait(nfds, sets, timeout) })
+}
+
+/// [`pselect6`]'s wait.
+///
+/// # Safety
+/// As for [`pselect6`].
+unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     const FD_SETSIZE: u64 = 1024;
     if nfds > FD_SETSIZE {
         return err(errno::EINVAL);
@@ -1885,6 +1929,15 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
 }
 
 pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
+    // SAFETY: the caller's guarantee, passed on.
+    with_remaining(timeout, || unsafe { ppoll_wait(fds, nfds, timeout) })
+}
+
+/// [`ppoll`]'s wait.
+///
+/// # Safety
+/// As for [`ppoll`].
+unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
     let ms = if timeout == 0 {
         -1
@@ -2071,7 +2124,7 @@ impl<P: Platform> Kernel<P> {
 /// `CPUCLOCK_SCHED`, the time run), or user time alone (`CPUCLOCK_VIRT`).
 /// A thread's clock is of a thread of this process; 0 is the caller (or
 /// its process). `None` for any other clock id.
-fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
+pub(crate) fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
     let id = id as i32;
     if id >= 0 {
         return None;
@@ -2280,6 +2333,81 @@ fn bytemuck_u32(words: &[u32]) -> Vec<u8> {
 pub(crate) static NO_NEW_PRIVS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The process's personality (`personality`), kept across `fork` and
+/// `execve` as Linux keeps a task's. Linux keeps one per thread; fwe one
+/// per process, which a program setting it before an `execve` (`setarch`)
+/// cannot tell apart.
+pub(crate) static PERSONALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Personality flags fwe acts on: `select`'s timeout left as given, and
+/// `uname` reporting a 2.6 release. The others (address-space layout,
+/// `READ_IMPLIES_EXEC`) are kept and reported only.
+const STICKY_TIMEOUTS: u32 = 0x400_0000;
+const UNAME26: u32 = 0x2_0000;
+/// `PER_LINUX32`, which needs 32-bit execution, which the host lacks.
+const PER_LINUX32: u32 = 0x0008;
+
+/// `personality(persona)`: the old personality, the new one set unless
+/// `persona` is `0xffffffff`.
+fn personality(persona: u64) -> i64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    let persona = persona as u32;
+    let old = PERSONALITY.load(SeqCst);
+    if persona != 0xffff_ffff {
+        if persona & 0xff == PER_LINUX32 {
+            return err(errno::EINVAL);
+        }
+        PERSONALITY.store(persona, SeqCst);
+    }
+    old as i64
+}
+
+/// The kernel release `uname` reports: as a 2.6 one (`2.6.(60 + minor)`
+/// and the rest) with the `UNAME26` personality, for programs that cannot
+/// parse a later one.
+fn release() -> String {
+    if PERSONALITY.load(std::sync::atomic::Ordering::SeqCst) & UNAME26 == 0 {
+        return RELEASE.to_string();
+    }
+    // As Linux's `override_release`: the version's numbers (up to its
+    // third dot) replaced, what follows them kept.
+    let mut dots = 0;
+    let end = RELEASE
+        .char_indices()
+        .find(|&(_, c)| {
+            if c == '.' {
+                dots += 1;
+            }
+            dots >= 3 || !(c.is_ascii_digit() || c == '.')
+        })
+        .map_or(RELEASE.len(), |(i, _)| i);
+    let minor: u32 = RELEASE.split('.').nth(1).and_then(|m| m.parse().ok()).unwrap_or(0);
+    format!("2.6.{}{}", 60 + minor, &RELEASE[end..])
+}
+
+/// The remaining time of a `pselect6` or `ppoll` wait, run by `f`, whose
+/// timeout is at guest `timeout`, written back there as Linux does (not
+/// with the `STICKY_TIMEOUTS` personality, nor for no timeout or a zero
+/// one; a failed write is not the call's).
+fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
+    let start = std::time::Instant::now();
+    let given = if timeout == 0 { None } else { uaccess::read::<Timespec>(timeout).ok() };
+    let r = f();
+    let sticky = PERSONALITY.load(std::sync::atomic::Ordering::SeqCst) & STICKY_TIMEOUTS != 0;
+    if let Some(ts) = given.filter(|t| (t.tv_sec, t.tv_nsec) != (0, 0))
+        && !sticky
+        && r != err(errno::EINVAL)
+        && ts.tv_sec >= 0
+        && (0..1_000_000_000).contains(&ts.tv_nsec)
+    {
+        let total = std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        let left = total.saturating_sub(start.elapsed());
+        let left = Timespec { tv_sec: left.as_secs() as i64, tv_nsec: left.subsec_nanos() as i64 };
+        let _ = uaccess::write(timeout, left);
+    }
+    r
+}
+
 /// The affinity `sched_setaffinity` set for this process, if it did.
 static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
 
@@ -2437,6 +2565,91 @@ mod tests {
             r,
             k.syscall(nr::IOCTL, [fd, ioctl::TIOCGPTN, &mut n as *mut u32 as u64, 0, 0, 0])
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pipe() -> [i32; 2] {
+        let mut p = [0i32; 2];
+        // SAFETY: a valid out-parameter.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        p
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close_all(fds: &[i32]) {
+        for &fd in fds {
+            // SAFETY: closing descriptors the test made.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// `splice` moves a file's bytes from an offset into a pipe and on
+    /// into another file, leaving the file's own position; it refuses two
+    /// non-pipes, an offset for a pipe, an empty pipe asked not to wait,
+    /// and both ends of one pipe. (A host pipe's contents are as macOS
+    /// reports them.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn splice_moves_through_pipes() {
+        use std::io::{Read, Seek, Write};
+        use std::os::fd::AsRawFd;
+        let mut src = tempfile_in_tmp();
+        src.write_all(b"0123456789").unwrap();
+        let mut dst = tempfile_in_tmp();
+        let [r, w] = pipe();
+        let mut k = kernel();
+        let (s, d) = (src.as_raw_fd() as u64, dst.as_raw_fd() as u64);
+        let mut off: i64 = 2;
+        let n = k.syscall(nr::SPLICE, [s, &mut off as *mut i64 as u64, w as u64, 0, 5, 0]);
+        assert_eq!((n, off), (5, 7));
+        assert_eq!(src.stream_position().unwrap(), 10, "its own position is left");
+        assert_eq!(k.syscall(nr::SPLICE, [r as u64, 0, d, 0, 100, 0]), 5);
+        let mut got = String::new();
+        dst.rewind().unwrap();
+        dst.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "23456");
+        // Neither end a pipe; an offset of a pipe; nothing in it, not waiting.
+        assert_eq!(k.syscall(nr::SPLICE, [s, 0, d, 0, 1, 0]), err(errno::EINVAL));
+        assert_eq!(
+            k.syscall(nr::SPLICE, [r as u64, &mut off as *mut i64 as u64, d, 0, 1, 0]),
+            err(errno::ESPIPE)
+        );
+        assert_eq!(k.syscall(nr::SPLICE, [r as u64, 0, d, 0, 1, 2]), err(errno::EAGAIN));
+        assert_eq!(k.syscall(nr::SPLICE, [r as u64, 0, w as u64, 0, 1, 0]), err(errno::EINVAL));
+        close_all(&[r, w]);
+    }
+
+    /// `tee` copies a pipe's bytes into another and leaves them; `vmsplice`
+    /// fills a pipe from memory and refuses a full one asked not to wait.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tee_and_vmsplice() {
+        let ([r1, w1], [r2, w2]) = (pipe(), pipe());
+        let mut k = kernel();
+        let data = *b"hello";
+        let iov = [data.as_ptr() as u64, data.len() as u64];
+        assert_eq!(k.syscall(nr::VMSPLICE, [w1 as u64, iov.as_ptr() as u64, 1, 0, 0, 0]), 5);
+        assert_eq!(k.syscall(nr::TEE, [r1 as u64, w2 as u64, 3, 0, 0, 0]), 3);
+        let mut buf = [0u8; 8];
+        // SAFETY: valid buffers of their lengths.
+        let (a, b) = unsafe {
+            (
+                libc::read(r1, buf.as_mut_ptr().cast(), 8),
+                libc::read(r2, buf[5..].as_mut_ptr().cast(), 3),
+            )
+        };
+        assert_eq!((a, b, &buf), (5, 3, b"hellohel"));
+        // A pipe filled to its capacity takes nothing more without waiting.
+        let big = vec![0u8; 65_536];
+        let iov = [big.as_ptr() as u64, big.len() as u64];
+        assert_eq!(k.syscall(nr::VMSPLICE, [w1 as u64, iov.as_ptr() as u64, 1, 0, 0, 0]), 65_536);
+        assert_eq!(
+            k.syscall(nr::VMSPLICE, [w1 as u64, iov.as_ptr() as u64, 1, 2, 0, 0]),
+            err(errno::EAGAIN)
+        );
+        // Both ends of one pipe.
+        assert_eq!(k.syscall(nr::TEE, [r1 as u64, w1 as u64, 1, 0, 0, 0]), err(errno::EINVAL));
+        close_all(&[r1, w1, r2, w2]);
     }
 
     /// `FIOASYNC` turns `O_ASYNC` on and off, as on any Linux descriptor.

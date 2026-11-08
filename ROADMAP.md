@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 706 of 1534 (66% of the 1064 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 751 of 1534 (69% of the 1084 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -70,7 +70,10 @@ capabilities. *crun, podman and containerd run standard images.*
 - `mincore` and `fadvise64`;
 - loop devices (`/dev/loop-control`, `/dev/loopN`, the `LOOP_*` and
   `BLK*` requests, `/sys/block`), on which LTP's device tests run with
-  tmpfs.
+  tmpfs;
+- `splice`, `tee` and `vmsplice`; `personality`; the scheduling policies
+  (`sched_setattr` and the rest); the clock refused as Linux refuses it
+  without `CAP_SYS_TIME`.
 
 ## Left to 1.0
 
@@ -93,10 +96,7 @@ run.
 
 - [ ] **Missing system calls LTP tests:**
   - `inotify` (and `fanotify` refused cleanly);
-  - `splice`, `tee`, `vmsplice`;
-  - `clock_settime` (refused as Linux refuses it without `CAP_SYS_TIME`);
   - POSIX message queues (`mq_open` and the rest);
-  - `personality`, `kcmp`, `sched_setattr`;
   - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`).
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,
@@ -141,4 +141,6 @@ for it fall back:
   sockets, TUN);
 - kselftests and gVisor's system-call suite as gates;
 - x86_64 Linux binaries;
+- `kcmp`: macOS cannot tell whether two descriptors share an open file
+  description, and programs that use it (CRIU, systemd) fall back;
 - graphical programs.

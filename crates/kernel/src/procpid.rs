@@ -265,7 +265,13 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
     let ids = |v: &[u32; 4]| v.iter().map(u32::to_string).collect::<Vec<_>>().join("\t");
     let groups = c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
     let caps = c.caps.map_or_else(
-        || "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n".to_string(),
+        || {
+            format!(
+                "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n\
+                 CapBnd:\t{:016x}\nCapAmb:\t0000000000000000\n",
+                crate::caps::INITIAL
+            )
+        },
         |k| k.status(),
     );
     format!(

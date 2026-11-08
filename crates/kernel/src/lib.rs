@@ -13,6 +13,7 @@
 pub mod bpf;
 pub mod caps;
 pub mod cgroupfs;
+mod clockset;
 pub mod cloneargs;
 pub mod creds;
 pub mod devnodes;
@@ -46,6 +47,7 @@ pub mod procreg;
 pub mod pty;
 pub mod reaper;
 pub mod rlimits;
+mod sched;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;
@@ -57,6 +59,7 @@ pub mod signote;
 pub mod snapshot;
 pub mod specialfd;
 pub mod specialwrite;
+pub mod splice;
 pub mod synthdir;
 mod syscalls;
 pub mod sysctl;
@@ -284,6 +287,7 @@ impl<P: Platform> Kernel<P> {
         netlink::save(e, false);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
+        e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -341,6 +345,7 @@ impl<P: Platform> Kernel<P> {
         netlink::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
+        syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
@@ -550,6 +555,9 @@ impl<P: Platform> Kernel<P> {
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
+        // Kept across execve, as on Linux (whose set-ID exec, which fwe
+        // has none of, would clear some of it).
+        e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.into_bytes()
     }
 
@@ -578,8 +586,10 @@ impl<P: Platform> Kernel<P> {
         netlink::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
+        let persona = d.u32();
         d.finish()?;
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
+        syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
         let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;
@@ -819,9 +829,11 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
 
 /// The result of system call `nr` as Linux reports it where the host's
 /// differs: a write refused to a sealed memfd, a socket that stands in for
-/// another kind, and the `SIGPIPE` a socket write to a closed peer raises.
+/// another kind, a read of an unconnected Unix socket, and the `SIGPIPE` a
+/// socket write to a closed peer raises.
 pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
+    let r = net::linux_read_error(nr, a[0] as i32, r);
     if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
         sigpipe_for_socket(nr, a);
     }
@@ -912,7 +924,7 @@ fn copy_between(
         let mut sent = 0usize;
         while sent < n as usize {
             if out_dev {
-                match loopdev::write_from(output, &buf[sent..n as usize]) {
+                match loopdev::write_at_pos(output, &buf[sent..n as usize], None) {
                     Some(w) if w > 0 => {
                         sent += w as usize;
                         continue;
@@ -1254,6 +1266,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::PREADV2 => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, a[5], false, true),
         n::PWRITEV2 => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, a[5], true, true),
         n::SENDFILE => copy_between(a[1] as i32, a[2], a[0] as i32, 0, a[3], false),
+        // Pipes wait for data or room: without the lock.
+        n::SPLICE => splice::splice(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5]),
+        n::TEE => splice::tee(a[0] as i32, a[1] as i32, a[2], a[3]),
+        n::VMSPLICE => splice::vmsplice(a[0] as i32, a[1], a[2], a[3]),
         n::COPY_FILE_RANGE if a[5] != 0 => fwe_abi::err(fwe_abi::errno::EINVAL),
         n::COPY_FILE_RANGE => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], a[4], true),
         // SAFETY: caller guarantees the pollfd array and timeout pointers.

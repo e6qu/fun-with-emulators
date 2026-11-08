@@ -63,6 +63,9 @@ pub enum Mark {
     Loop(u32),
     /// `/dev/loop-control`'s node, open as the device.
     LoopControl,
+    /// An `O_PATH` descriptor: it names a file, which is not open to
+    /// read, write or act on ([`refuses_path`]).
+    Path,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +192,64 @@ pub fn any_marks() -> bool {
     MARKS.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
+/// Whether system call `nr` (arguments `a`) names an `O_PATH` descriptor
+/// where Linux needs one open for I/O (it then fails with `EBADF`): reads
+/// and writes, requests, mappings, changes through the descriptor, syncs,
+/// locks, seeks, listings, extended attributes, and every `fcntl` but
+/// those that duplicate it or read or set its descriptor flags.
+pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
+    use fwe_abi::{fcntl, mman, nr as n};
+    if !any_marks() {
+        return false;
+    }
+    let path = |fd: u64| marked(fd as i32) == Some(Mark::Path);
+    match nr {
+        n::READ
+        | n::READV
+        | n::PREAD64
+        | n::PREADV
+        | n::PREADV2
+        | n::WRITE
+        | n::WRITEV
+        | n::PWRITE64
+        | n::PWRITEV
+        | n::PWRITEV2
+        | n::IOCTL
+        | n::FCHMOD
+        | n::FCHOWN
+        | n::FSYNC
+        | n::FDATASYNC
+        | n::FTRUNCATE
+        | n::FALLOCATE
+        | n::FLOCK
+        | n::LSEEK
+        | n::GETDENTS64
+        | n::FADVISE64
+        | n::FSETXATTR
+        | n::FGETXATTR
+        | n::FLISTXATTR
+        | n::FREMOVEXATTR
+        | n::SYNC_FILE_RANGE
+        | n::SYNCFS
+        | n::READAHEAD
+        | n::VMSPLICE => path(a[0]),
+        n::SPLICE | n::COPY_FILE_RANGE => path(a[0]) || path(a[2]),
+        n::TEE | n::SENDFILE => path(a[0]) || path(a[1]),
+        n::MMAP => a[3] & mman::MAP_ANONYMOUS == 0 && path(a[4]),
+        n::FCNTL => {
+            !matches!(
+                a[1],
+                fcntl::F_DUPFD
+                    | fcntl::F_DUPFD_CLOEXEC
+                    | fcntl::F_GETFD
+                    | fcntl::F_SETFD
+                    | fcntl::F_GETFL
+            ) && path(a[0])
+        }
+        _ => false,
+    }
+}
+
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
     let Some((dev, ino)) = identity(fd) else { return };
@@ -290,6 +351,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Sysctl(_)) => 6,
             Some(Mark::Loop(_)) => 9,
             Some(Mark::LoopControl) => 10,
+            Some(Mark::Path) => 11,
         });
         if let Some(Mark::Loop(n)) = rec.mark {
             e.u32(n);
@@ -349,6 +411,7 @@ pub fn load(d: &mut Dec) {
             8 => Some(Mark::Netlink),
             9 => Some(Mark::Loop(d.u32())),
             10 => Some(Mark::LoopControl),
+            11 => Some(Mark::Path),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

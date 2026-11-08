@@ -2753,6 +2753,27 @@ fn proc_maps_lists_the_mappings() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `calls` guest prints.
+const CALLS: &str = "splice: 5, offset 7, position 10\n\
+    tee: 3; first pipe 23456, second 234\n\
+    vmsplice: 8, read vmsplice\n\
+    splice from an empty pipe: true\n\
+    splice between files: true\n\
+    personality: was 0, now 0x20000, release 2.6: true\n\
+    sched: set 0, get 0, policy 2, priority 10\n\
+    child's policy: 2\n\
+    clock: read 0, set refused true\n";
+
+/// Data moved through pipes (`splice` from a file's offset, `tee`,
+/// `vmsplice`), the personality, a scheduling policy a fork child
+/// inherits, and a clock that is read but not set.
+#[test]
+fn kernel_calls_move_data_and_keep_settings() {
+    let out = fwe(&rust_guest("calls"), &[]);
+    assert_eq!(stdout(&out), CALLS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `loopdev` guest prints.
 const LOOPDEV: &str = "free: true\n\
     node: 0, block device: true, 7:N: true\n\
@@ -3257,6 +3278,15 @@ fn hv_runs_low_rust_programs() {
 fn hv_lists_the_mappings() {
     let Some(out) = fwe_hv(&rust_low_guest("maps"), &[]) else { return };
     assert_eq!(stdout(&out), MAPS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The same calls in the VM (see [`kernel_calls_move_data_and_keep_settings`]):
+/// their buffers and offsets are the guest's memory, translated.
+#[test]
+fn hv_kernel_calls_move_data_and_keep_settings() {
+    let Some(out) = fwe_hv(&rust_low_guest("calls"), &[]) else { return };
+    assert_eq!(stdout(&out), CALLS, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
