@@ -170,7 +170,8 @@ reads the guest's `x18` into `Regs` and writes it back on return, so a
 signal frame carries the real value, `rt_sigreturn` restores it, and a
 cloned thread starts with its parent's. Correctness never depends on the
 host preserving `x18`; macOS 26.4's custom-`x18` ABI is only probed
-(`fwe --host-info`).
+(`fwe --host-info`), not used: switching it at every trap costs two host
+calls, and one of them could hang.
 
 **What is scanned.** A data word that happens to encode one of these
 instructions must not be patched:
@@ -409,7 +410,9 @@ The model, numbers and relay are in
   converted the first time.
 - **Extended attributes** (`crates/kernel/src/xattr.rs`): a list shows
   only Linux's namespaces; `trusted.` ones are hidden from callers without
-  `CAP_SYS_ADMIN`.
+  `CAP_SYS_ADMIN`; `user.` ones are for regular files and directories
+  only; writing a `security.` one needs `CAP_SYS_ADMIN`, or `CAP_SETFCAP`
+  for `security.capability`.
 - **memfd** (`crates/kernel/src/memfd.rs`): `/proc/self/fd` names it
   `/memfd:<name> (deleted)`; `F_SEAL_SHRINK`/`GROW` are checked by
   `ftruncate` and `fallocate`, `F_SEAL_EXEC` by `fchmod`; after
@@ -621,7 +624,9 @@ Namespaces, cgroups, credentials, seccomp and devices are mapped in
 - **Overlays** (`crates/kernel/src/overlay.rs`): a descriptor of a lower
   file changed through it (`fchmod`) moves onto the copy; a descriptor
   opened through an overlay keeps its layers after the mount moves or
-  goes. The overlay's own attributes are hidden; `metacopy=on`,
+  goes. An opaque directory is marked `trusted.overlay.opaque` (or
+  `user.overlay.opaque` with `userxattr`). The overlay's own attributes
+  are hidden; `metacopy=on`,
   `redirect_dir=on` and `index=on` are refused.
 - **cgroups** (`crates/kernel/src/cgroupfs.rs`, `bpf.rs`): device programs
   are kept in the cgroup's directory, so they outlive the runtime that

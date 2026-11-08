@@ -112,7 +112,8 @@ discovery it depends on are in
   parent, new ones for `PR_PAC_RESET_KEYS`; it reports `PACA` and `PACG`.
 - **BTI:** reported in `AT_HWCAP2` where the host has it. In the VM, code of
   a program built for BTI is mapped guarded (`PROT_BTI`) where Linux maps it
-  so, and a branch-target exception is `SIGILL`.
+  so, a signal handler is entered as if by `blr`, and a branch-target
+  exception is `SIGILL`.
 
 ### auxv, hwcaps and the vDSO
 
@@ -499,6 +500,9 @@ must tear its VM down before dying; see
 | Pending instances | one per standard signal; real-time signals queued | one per signal number; a standard signal keeps its first `siginfo`, a real-time one its latest |
 | Signal frame | `rt_sigframe` with `ucontext`, `fpsimd_context` | the same layout, built on the guest stack (or alternate stack); return through `sa_restorer` or fwe's `rt_sigreturn` trampoline |
 
+A signal ignored when fwe starts (`nohup`, a shell's background job)
+starts out ignored in the guest, as across a Linux `execve`.
+
 The host never blocks a signal fwe catches, whatever the guest's mask:
 macOS empties the `siginfo` of a signal it holds blocked. So fwe catches a
 signal that has a guest handler, one a `signalfd` or `rt_sigtimedwait`
@@ -542,8 +546,9 @@ sequenceDiagram
   apart by its note.
 - **Permission to signal** follows Linux: `CAP_KILL`, or the caller's real
   or effective uid matching the target's real or saved one, or `SIGCONT`
-  within the session. `kill(-1)` reaches only the
-  caller's pid namespace or its run of fwe, never other host processes.
+  within the session; a process fwe has no record of counts as root's.
+  `kill(-1)` reaches only the caller's pid namespace or its run of fwe,
+  never other host processes.
 - **Restart:** a host call a signal interrupted runs again if no guest
   handler waits for the signal, or if the handler has `SA_RESTART` and the
   call is one Linux restarts; otherwise it fails with `EINTR`.
