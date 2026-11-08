@@ -147,6 +147,9 @@ sums up where they differ, and the next sections explain each row.
 
 ## Which binaries run where, and why
 
+fwe picks a backend for each program from its ELF headers alone. The
+reason lies in how the two kernels lay out a process's memory.
+
 ### The low 4 GiB
 
 On Linux, an arm64 process owns its whole lower address space. A program
@@ -296,12 +299,11 @@ is loaded as it is and runs as it is. The costs move elsewhere:
 ### Choosing, and what runs best
 
 Since fwe picks the backend from the binary, the practical choice is how a
-program is built. The table compares the two for the things that differ.
+program is built. The table sets the two backends' costs side by side,
+trait by trait.
 
 | Program trait | Native | VM |
 |---|---|---|
-| PIE, or non-PIE linked at or above 4 GiB | runs here | — |
-| non-PIE linked below 4 GiB | cannot run | runs here |
 | static | one image prepared | loaded as is |
 | dynamic | the dynamic linker and each library prepared as mapped | loaded as is; private file mappings copied |
 | system call | a `brk` trap, a host signal handler | a vCPU exit and register transfers |
