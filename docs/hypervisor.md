@@ -70,20 +70,14 @@ mapped once and then only the guest's own page tables change.
   may not write, of a private copy.
 - **Pointer authentication and BTI**, where the vCPUs' ID registers offer
   them (see [linux-on-macos.md](linux-on-macos.md#cache-maintenance-pac-and-bti)).
-- **Signals:** dispositions are passed to the host as in the native
-  backend (see [linux-on-macos.md](linux-on-macos.md#host-signals)), and
-  each vCPU thread runs under the host mask the guest's mask calls for.
-  The handler records the signal and stops the vCPU (`hv_vcpus_exit`), and
-  the run loop delivers it, so a signal reaches a guest spinning without
-  system calls. The framework's own threads are created with every guest
-  signal blocked.
-- **Threads:** each guest thread is a host thread with a vCPU of its own,
-  created on it; all vCPUs share the VM.
-- **`execve`** always re-executes fwe, which picks the backend the new
-  program needs, so a program in the VM can exec a native one and back.
-- **`fork` and `vfork`** start a fresh `fwe --hv-fork-child`, never a host
-  fork (`fork.rs`; sequence in
-  [linux-on-macos.md](linux-on-macos.md#fork)).
+- **Signals, threads, `execve` and `fork`** are explained in
+  linux-on-macos.md: a signal stops the vCPU with `hv_vcpus_exit` and the
+  run loop delivers it, while the framework's own threads block every
+  guest signal ([Signals into a running vCPU](linux-on-macos.md#signals-into-a-running-vcpu));
+  each guest thread has a vCPU of its own, created on it
+  ([Threads](linux-on-macos.md#threads)); `execve` always re-executes fwe
+  and `fork` starts a fresh `fwe --hv-fork-child` (`fork.rs`), never a
+  host fork ([fork](linux-on-macos.md#fork)).
 
 ### The run loop
 
