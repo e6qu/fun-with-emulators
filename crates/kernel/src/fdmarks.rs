@@ -68,6 +68,12 @@ pub enum Mark {
     Path,
     /// A POSIX message queue's descriptor ([`crate::mqueue`]).
     Mq,
+    /// A filesystem context of the new mount API (`fsopen`, `fspick`),
+    /// by its number ([`crate::mountapi`]).
+    FsContext(u32),
+    /// A detached mount tree (`fsmount`, `open_tree`), by its number: an
+    /// `O_PATH` descriptor ([`crate::mountapi`]).
+    Detached(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,7 +210,7 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
     if !any_marks() {
         return false;
     }
-    let path = |fd: u64| marked(fd as i32) == Some(Mark::Path);
+    let path = |fd: u64| is_path(fd as i32);
     match nr {
         n::READ
         | n::READV
@@ -263,6 +269,11 @@ pub fn mark(fd: i32, mark: Mark) {
 /// Where `fd` was opened, if fwe recorded it.
 pub fn origin(fd: i32) -> Option<Origin> {
     record(fd)?.origin
+}
+
+/// Whether `fd` is an `O_PATH` descriptor (a detached mount's is one).
+pub fn is_path(fd: i32) -> bool {
+    any_marks() && matches!(marked(fd), Some(Mark::Path | Mark::Detached(_)))
 }
 
 /// What `fd` stands in for, if anything.
@@ -355,7 +366,12 @@ pub fn save(e: &mut Enc) {
             Some(Mark::LoopControl) => 10,
             Some(Mark::Path) => 11,
             Some(Mark::Mq) => 12,
+            Some(Mark::FsContext(_)) => 13,
+            Some(Mark::Detached(_)) => 14,
         });
+        if let Some(Mark::FsContext(n) | Mark::Detached(n)) = rec.mark {
+            e.u32(n);
+        }
         if let Some(Mark::Loop(n)) = rec.mark {
             e.u32(n);
         }
@@ -416,6 +432,8 @@ pub fn load(d: &mut Dec) {
             10 => Some(Mark::LoopControl),
             11 => Some(Mark::Path),
             12 => Some(Mark::Mq),
+            13 => Some(Mark::FsContext(d.u32())),
+            14 => Some(Mark::Detached(d.u32())),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

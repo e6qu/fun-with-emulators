@@ -77,6 +77,9 @@ capabilities. *crun, podman and containerd run standard images.*
 - POSIX message queues per IPC namespace, with notifications across
   processes (a signal with its value, or the C library's thread through a
   netlink socket).
+- the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`,
+  `open_tree`, `move_mount`, `mount_setattr`, `statmount`, `listmount`),
+  with peer groups kept and mount ids in `statx`.
 
 ## Left to 1.0
 
@@ -99,7 +102,12 @@ run.
 
 - [ ] **Missing system calls LTP tests:**
   - `inotify` (and `fanotify` refused cleanly);
-  - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`).
+  - namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
+    `NS_GET_*` requests.
+- [ ] **Mounts as Linux enforces them:** propagation between peers and to
+  slaves; `nodev`, `noexec`, `nosymfollow` and the access-time modes
+  acted on; a busy mount refused (`EBUSY`), with `MNT_DETACH` and
+  `MNT_EXPIRE` as Linux has them.
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).

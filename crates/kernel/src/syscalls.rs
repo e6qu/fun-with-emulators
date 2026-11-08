@@ -182,6 +182,7 @@ impl<P: Platform> Kernel<P> {
                     crate::netns::closed(fd, mark);
                 }
                 crate::netlink::closed(fd);
+                crate::mountapi::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
@@ -528,6 +529,15 @@ impl<P: Platform> Kernel<P> {
             | nr::MQ_TIMEDSEND
             | nr::MQ_TIMEDRECEIVE => crate::ipcops::blocking(self.ipc_context(), n, a),
             nr::MQ_OPEN => self.sys_mq_open(a[0], a[1], a[2], a[3]),
+            nr::FSOPEN => self.sys_fsopen(a[0], a[1]),
+            nr::FSCONFIG => self.sys_fsconfig(a[0], a[1], a[2], a[3], a[4]),
+            nr::FSMOUNT => self.sys_fsmount(a[0], a[1], a[2]),
+            nr::FSPICK => self.sys_fspick(a[0], a[1], a[2]),
+            nr::OPEN_TREE => self.sys_open_tree(a[0], a[1], a[2]),
+            nr::MOVE_MOUNT => self.sys_move_mount(a[0], a[1], a[2], a[3], a[4]),
+            nr::MOUNT_SETATTR => self.sys_mount_setattr(a[0], a[1], a[2], a[3], a[4]),
+            nr::STATMOUNT => self.sys_statmount(a[0], a[1], a[2], a[3]),
+            nr::LISTMOUNT => self.sys_listmount(a[0], a[1], a[2], a[3]),
             nr::MQ_UNLINK => self.sys_mq_unlink(a[0]),
             nr::MQ_NOTIFY => self.sys_mq_notify(a[0], a[1]),
             nr::MQ_GETSETATTR => self.sys_mq_getsetattr(a[0], a[1], a[2]),
@@ -800,9 +810,7 @@ impl<P: Platform> Kernel<P> {
                     let r = libc::fcntl(fd, libc::F_GETFL);
                     if r < 0 {
                         last_error()
-                    } else if crate::fdmarks::any_marks()
-                        && crate::fdmarks::marked(fd) == Some(crate::fdmarks::Mark::Path)
-                    {
+                    } else if crate::fdmarks::is_path(fd) {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64

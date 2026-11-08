@@ -1,8 +1,9 @@
 //! System calls a program makes of the kernel's own: moving data through
 //! pipes (`splice` from a file's offset, `tee`, `vmsplice`), the
 //! personality, a scheduling policy set and read back (and a fork child
-//! that inherits it), and the clock, which may be read but not set. It
-//! prints what it observed.
+//! that inherits it), the clock, which may be read but not set, a pipe's
+//! filesystem, and a `statx` request Linux refuses. It prints what it
+//! observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates; the calls musl lacks are made with
@@ -26,6 +27,7 @@ const SYS_SCHED_GETATTR: i64 = 275;
 const SYS_SCHED_GETSCHEDULER: i64 = 120;
 const SYS_CLOCK_SETTIME: i64 = 112;
 const SYS_CLOCK_GETTIME: i64 = 113;
+const SYS_STATX: i64 = 291;
 
 const SCHED_RR: u32 = 2;
 const UNAME26: u64 = 0x2_0000;
@@ -60,6 +62,7 @@ unsafe extern "C" {
     fn fork() -> i32;
     fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
     fn uname(u: *mut Utsname) -> i32;
+    fn fstatfs(fd: i32, buf: *mut i64) -> i32;
     fn syscall(n: i64, ...) -> i64;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
@@ -134,6 +137,14 @@ fn main() {
         let read_ok = syscall(SYS_CLOCK_GETTIME, 0, ts.as_mut_ptr());
         let set = res(syscall(SYS_CLOCK_SETTIME, 0, ts.as_ptr()));
         println!("clock: read {read_ok}, set refused {}", set == -(EPERM as i64));
+
+        // A pipe's filesystem is pipefs; `statx` refuses a reserved mask
+        // bit.
+        let mut sf = [0i64; 15];
+        let r = fstatfs(a[0], sf.as_mut_ptr());
+        let mut sx = [0u8; 256];
+        let bad = res(syscall(SYS_STATX, -100i64, c"/".as_ptr(), 0, 0x8000_0000u32, sx.as_mut_ptr()));
+        println!("pipe's filesystem: {r}, pipefs {}; statx reserved bit refused {}", sf[0] == 0x5049_5045, bad == -(EINVAL as i64));
 
         for fd in [a[0], a[1], b[0], b[1], file] {
             close(fd);

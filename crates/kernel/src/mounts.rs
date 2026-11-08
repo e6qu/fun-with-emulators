@@ -165,16 +165,31 @@ pub struct Mount {
     pub root: Vec<u8>,
     /// Per-mount `MS_*` flags ([`ms::PER_MOUNT`]).
     pub flags: u64,
-    /// Propagation (`MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` or
-    /// `MS_UNBINDABLE`); recorded, not acted on.
+    /// Propagation: `MS_SHARED` (with [`Mount::peer`]), `MS_SLAVE` (with
+    /// [`Mount::master`]), both, `MS_UNBINDABLE`, or `MS_PRIVATE`. Kept and
+    /// shown, not acted on: a mount does not propagate.
     pub propagation: u64,
+    /// The peer group a shared mount is in (0: none).
+    pub peer: u32,
+    /// The peer group a slave mount receives from (0: none).
+    pub master: u32,
     /// The source as `mount` was given it, for `mountinfo`.
     pub device: Vec<u8>,
     /// The filesystem's options (`mode=755` and the like).
     pub options: Vec<u8>,
 }
 
+/// What unique mount ids (`STATX_MNT_ID_UNIQUE`, `statmount`) count up
+/// from: Linux's `MNT_UNIQUE_ID_OFFSET`, above any old 32-bit id.
+pub const UNIQUE_ID_BASE: u64 = 1 << 31;
+
 impl Mount {
+    /// The mount's unique id: its id above [`UNIQUE_ID_BASE`] (a table
+    /// never reuses an id).
+    pub fn unique_id(&self) -> u64 {
+        UNIQUE_ID_BASE + u64::from(self.id)
+    }
+
     /// The host path of `rest` (a path inside the mount, starting with
     /// `/` or empty), for a host-backed mount.
     pub fn host_path(&self, rest: &[u8]) -> Option<Vec<u8>> {
@@ -185,6 +200,27 @@ impl Mount {
     /// The path inside the filesystem `rest` names.
     pub fn fs_path(&self, rest: &[u8]) -> Vec<u8> {
         join(&self.root, rest)
+    }
+
+    /// The per-mount options `mountinfo` and `mounts` show: `ro` or `rw`,
+    /// then the flags set.
+    pub fn mount_options(&self) -> Vec<u8> {
+        let mut opts = if self.read_only() { b"ro".to_vec() } else { b"rw".to_vec() };
+        for (flag, name) in [
+            (ms::NOSUID, &b"nosuid"[..]),
+            (ms::NODEV, b"nodev"),
+            (ms::NOEXEC, b"noexec"),
+            (ms::NOATIME, b"noatime"),
+            (ms::NODIRATIME, b"nodiratime"),
+            (ms::RELATIME, b"relatime"),
+            (ms::NOSYMFOLLOW, b"nosymfollow"),
+        ] {
+            if self.flags & flag != 0 {
+                opts.push(b',');
+                opts.extend_from_slice(name);
+            }
+        }
+        opts
     }
 
     pub fn read_only(&self) -> bool {
@@ -223,13 +259,15 @@ pub struct Table {
     pub mounts: Vec<Mount>,
     /// The id the next mount gets.
     pub next_id: u32,
+    /// The id the next peer group gets.
+    pub next_group: u32,
 }
 
 impl Table {
     /// The table a namespace starts with when nothing was mounted in it:
     /// the rootfs at `root_host` and what Linux always has mounted.
     pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>, cgroup_host: Option<&[u8]>) -> Table {
-        let mut t = Table { mounts: Vec::new(), next_id: 1 };
+        let mut t = Table { mounts: Vec::new(), next_id: 1, next_group: 1 };
         let root = t.alloc();
         t.mounts.push(Mount {
             id: root,
@@ -240,6 +278,8 @@ impl Table {
             root: b"/".to_vec(),
             flags: ms::RELATIME,
             propagation: ms::PRIVATE,
+            peer: 0,
+            master: 0,
             device: b"/dev/root".to_vec(),
             options: b"rw".to_vec(),
         });
@@ -254,6 +294,8 @@ impl Table {
                 root: b"/".to_vec(),
                 flags: ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME,
                 propagation: ms::PRIVATE,
+                peer: 0,
+                master: 0,
                 device: fstype.name().as_bytes().to_vec(),
                 options: opts.to_vec(),
             });
@@ -272,6 +314,8 @@ impl Table {
                 root: b"/".to_vec(),
                 flags: ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME,
                 propagation: ms::PRIVATE,
+                peer: 0,
+                master: 0,
                 device: b"cgroup2".to_vec(),
                 options: b"rw,nsdelegate".to_vec(),
             });
@@ -289,6 +333,8 @@ impl Table {
                 root: b"/".to_vec(),
                 flags: ms::NOSUID | ms::NODEV,
                 propagation: ms::PRIVATE,
+                peer: 0,
+                master: 0,
                 device: b"tmpfs".to_vec(),
                 options: b"rw".to_vec(),
             });
@@ -381,10 +427,11 @@ impl Table {
         // Onto the mount `point` is in; onto the one whose root it is, for a
         // mount stacked over another.
         let parent = self.locate(point).0.id;
-        let propagation = self.get(parent).map_or(ms::PRIVATE, |p| {
-            // A new mount under a shared one is shared, else private.
-            if p.propagation & ms::SHARED != 0 { ms::SHARED } else { ms::PRIVATE }
-        });
+        // A new mount under a shared one is shared, in a peer group of its
+        // own; else private.
+        let shared = self.get(parent).is_some_and(|p| p.peer != 0);
+        let (propagation, peer) =
+            if shared { (ms::SHARED, self.alloc_group()) } else { (ms::PRIVATE, 0) };
         let id = self.alloc();
         self.mounts.push(Mount {
             id,
@@ -395,10 +442,34 @@ impl Table {
             root,
             flags: flags & ms::PER_MOUNT,
             propagation,
+            peer,
+            master: 0,
             device,
             options,
         });
         id
+    }
+
+    fn alloc_group(&mut self) -> u32 {
+        let g = self.next_group;
+        self.next_group += 1;
+        g
+    }
+
+    fn get_mut(&mut self, id: u32) -> Option<&mut Mount> {
+        self.mounts.iter_mut().find(|m| m.id == id)
+    }
+
+    /// Mount `id`, a copy of `src`, joins its propagation as a clone does
+    /// on Linux: a peer of a shared one, a slave of a slave's master.
+    fn clone_propagation(&mut self, id: u32, src: &Mount) {
+        let Some(m) = self.get_mut(id) else { return };
+        if src.peer == 0 && src.master == 0 {
+            return;
+        }
+        m.peer = src.peer;
+        m.master = src.master;
+        m.propagation = src.propagation & (ms::SHARED | ms::SLAVE);
     }
 
     /// A bind mount of `from` (a path in the namespace's view) at `to`;
@@ -424,6 +495,7 @@ impl Table {
             src.device.clone(),
             src.options.clone(),
         );
+        self.clone_propagation(id, &src);
         if recursive {
             // Each mount under `from`, attached to its copy's parent at the
             // matching path under `to`.
@@ -450,8 +522,83 @@ impl Table {
         Ok(id)
     }
 
+    /// The mount with unique id `id`.
+    pub fn by_unique(&self, id: u64) -> Option<&Mount> {
+        self.mounts.iter().find(|m| m.unique_id() == id)
+    }
+
+    /// A copy of the mount `from` (a path in the namespace's view) is in,
+    /// showing what is at `from`, and with `recursive` of the mounts under
+    /// it: a detached tree ([`Table::attach_tree`]). Its first mount is
+    /// the root (`point` empty); the others' points are relative to it and
+    /// their parents are the copied mounts' ids.
+    pub fn copy_tree(&self, from: &[u8], recursive: bool) -> Result<Vec<Mount>, i32> {
+        let (src, rest) = self.locate(from);
+        if src.propagation & ms::UNBINDABLE != 0 {
+            return Err(errno::EINVAL);
+        }
+        let mut tree = vec![Mount { point: Vec::new(), root: src.fs_path(&rest), ..src.clone() }];
+        if recursive {
+            let mut below: Vec<Mount> = self
+                .mounts
+                .iter()
+                .filter(|m| under(&m.point, from).is_some_and(|r| !r.is_empty()))
+                .filter(|m| self.is_below(m.id, src.id))
+                .cloned()
+                .collect();
+            below.sort_by_key(|m| m.point.len());
+            for m in below {
+                let point = under(&m.point, from).unwrap_or(b"").to_vec();
+                tree.push(Mount { point, ..m });
+            }
+        }
+        Ok(tree)
+    }
+
+    /// Attach detached `tree` ([`Table::copy_tree`], or a new filesystem's
+    /// one mount) at `to`, or with `beneath` under the mount at `to`
+    /// (which must be a mount's root, not the namespace's), between it and
+    /// what it is attached to. Returns the root's new id.
+    pub fn attach_tree(&mut self, tree: &[Mount], to: &[u8], beneath: bool) -> Result<u32, i32> {
+        let Some(top) = tree.first() else { return Err(errno::EINVAL) };
+        let (at, rest) = self.locate(to);
+        let (parent, above) = if beneath {
+            if !rest.is_empty() || at.parent == at.id {
+                return Err(errno::EINVAL);
+            }
+            (at.parent, Some(at.id))
+        } else {
+            (at.id, None)
+        };
+        let shared_parent = self.get(parent).is_some_and(|p| p.peer != 0);
+        let root = self.alloc();
+        let mut copies = vec![(top.id, root)];
+        let mut m = Mount { id: root, parent, point: to.to_vec(), ..top.clone() };
+        if m.peer == 0 && shared_parent {
+            // Under a shared mount: shared, in a group of its own.
+            m.peer = self.alloc_group();
+            m.propagation = (m.propagation & ms::SLAVE) | ms::SHARED;
+        }
+        self.mounts.push(m);
+        if let Some(above) = above
+            && let Some(a) = self.get_mut(above)
+        {
+            a.parent = root;
+        }
+        for m in &tree[1..] {
+            let Some(&(_, parent)) = copies.iter().find(|(o, _)| *o == m.parent) else {
+                continue;
+            };
+            let id = self.alloc();
+            let point = join(to, &m.point);
+            self.mounts.push(Mount { id, parent, point, ..m.clone() });
+            copies.push((m.id, id));
+        }
+        Ok(root)
+    }
+
     /// Whether mount `id` is below mount `ancestor`.
-    fn is_below(&self, mut id: u32, ancestor: u32) -> bool {
+    pub fn is_below(&self, mut id: u32, ancestor: u32) -> bool {
         while let Some(m) = self.get(id) {
             if m.parent == ancestor {
                 return true;
@@ -534,10 +681,36 @@ impl Table {
         if recursive {
             ids.extend(self.descendants(id));
         }
-        for m in self.mounts.iter_mut().filter(|m| ids.contains(&m.id)) {
-            m.propagation = how & ms::PROPAGATION;
+        for id in ids {
+            self.change_propagation(id, how & ms::PROPAGATION);
         }
         Ok(())
+    }
+
+    /// Make mount `id` shared, a slave, private or unbindable, as Linux
+    /// changes one: a shared mount keeps its peer group (or gets one); one
+    /// made a slave receives from the group it leaves, if others are in
+    /// it, or keeps its master; private and unbindable ones leave both.
+    fn change_propagation(&mut self, id: u32, how: u64) {
+        let Some(m) = self.get(id).cloned() else { return };
+        let others = m.peer != 0 && self.mounts.iter().any(|o| o.id != id && o.peer == m.peer);
+        let (peer, master) = match how {
+            ms::SHARED if m.peer == 0 => (self.alloc_group(), m.master),
+            ms::SHARED => (m.peer, m.master),
+            ms::SLAVE if others => (0, m.peer),
+            ms::SLAVE => (0, m.master),
+            _ => (0, 0),
+        };
+        let Some(m) = self.get_mut(id) else { return };
+        m.peer = peer;
+        m.master = master;
+        m.propagation = match (peer != 0, master != 0) {
+            _ if how == ms::UNBINDABLE => ms::UNBINDABLE,
+            (true, true) => ms::SHARED | ms::SLAVE,
+            (true, false) => ms::SHARED,
+            (false, true) => ms::SLAVE,
+            (false, false) => ms::PRIVATE,
+        };
     }
 
     /// `pivot_root(new_root, put_old)`: the mount whose root is `new_root`
@@ -596,26 +769,17 @@ impl Table {
             // Hidden under a mount stacked over it, or a parent.
             let point = if rel.is_empty() { b"/".to_vec() } else { rel.to_vec() };
             let parent = if m.parent == m.id { m.id } else { m.parent };
-            let mut opts = if m.read_only() { b"ro".to_vec() } else { b"rw".to_vec() };
-            for (flag, name) in [
-                (ms::NOSUID, &b"nosuid"[..]),
-                (ms::NODEV, b"nodev"),
-                (ms::NOEXEC, b"noexec"),
-                (ms::NOATIME, b"noatime"),
-                (ms::NODIRATIME, b"nodiratime"),
-                (ms::RELATIME, b"relatime"),
-            ] {
-                if m.flags & flag != 0 {
-                    opts.push(b',');
-                    opts.extend_from_slice(name);
-                }
+            let opts = m.mount_options();
+            let mut optional = Vec::new();
+            if m.peer != 0 {
+                optional.extend_from_slice(format!(" shared:{}", m.peer).as_bytes());
             }
-            let optional: &[u8] = match m.propagation {
-                p if p & ms::SHARED != 0 => b" shared:1",
-                p if p & ms::SLAVE != 0 => b" master:1",
-                p if p & ms::UNBINDABLE != 0 => b" unbindable",
-                _ => b"",
-            };
+            if m.master != 0 {
+                optional.extend_from_slice(format!(" master:{}", m.master).as_bytes());
+            }
+            if m.propagation & ms::UNBINDABLE != 0 {
+                optional.extend_from_slice(b" unbindable");
+            }
             let line = [
                 format!("{} {} 0:{} ", m.id, parent, 20 + m.id).as_bytes(),
                 &escape(&m.root),
@@ -623,7 +787,7 @@ impl Table {
                 &escape(&point),
                 b" ",
                 &opts,
-                optional,
+                &optional,
                 b" - ",
                 m.fstype.name().as_bytes(),
                 b" ",
@@ -644,7 +808,14 @@ impl Table {
         for m in &self.mounts {
             let Some(rel) = under(&m.point, root) else { continue };
             let point = if rel.is_empty() { b"/".to_vec() } else { rel.to_vec() };
-            let ro = if m.read_only() { "ro" } else { "rw" };
+            // The mount's options, then its filesystem's.
+            let mut opts = m.mount_options();
+            for o in m.options.split(|&b| b == b',') {
+                if !o.is_empty() && o != b"rw" && o != b"ro" {
+                    opts.push(b',');
+                    opts.extend_from_slice(o);
+                }
+            }
             let line = [
                 &escape(&m.device),
                 &b" "[..],
@@ -652,7 +823,7 @@ impl Table {
                 b" ",
                 m.fstype.name().as_bytes(),
                 b" ",
-                ro.as_bytes(),
+                &opts,
                 b" 0 0\n",
             ]
             .concat();
@@ -663,6 +834,7 @@ impl Table {
 
     pub fn encode(&self, e: &mut crate::snapshot::Enc) {
         e.u32(self.next_id);
+        e.u32(self.next_group);
         e.u64(self.mounts.len() as u64);
         for m in &self.mounts {
             e.u32(m.id);
@@ -683,15 +855,17 @@ impl Table {
             e.bytes(&m.root);
             e.u64(m.flags);
             e.u64(m.propagation);
+            e.u32(m.peer);
+            e.u32(m.master);
             e.bytes(&m.device);
             e.bytes(&m.options);
         }
     }
 
     pub fn decode(d: &mut crate::snapshot::Dec) -> Table {
-        let next_id = d.u32();
+        let (next_id, next_group) = (d.u32(), d.u32());
         // Each mount takes at least its fixed-size fields.
-        let n = d.count(40);
+        let n = d.count(48);
         let mounts = (0..n)
             .map(|_| Mount {
                 id: d.u32(),
@@ -706,11 +880,13 @@ impl Table {
                 root: d.bytes(),
                 flags: d.u64(),
                 propagation: d.u64(),
+                peer: d.u32(),
+                master: d.u32(),
                 device: d.bytes(),
                 options: d.bytes(),
             })
             .collect();
-        Table { mounts, next_id }
+        Table { mounts, next_id, next_group }
     }
 }
 
@@ -830,6 +1006,71 @@ mod tests {
         assert_eq!(m.fstype, FsType::Sysfs);
         let (m, rest) = t.locate(b"/dev/shm/x");
         assert_eq!(m.host_path(&rest).unwrap(), b"/host/shm/x");
+    }
+
+    /// Peer groups as Linux keeps them: a bind of a shared mount is its
+    /// peer, a slave receives from the group it left, and `mountinfo`
+    /// shows both.
+    #[test]
+    fn peer_groups_follow_binds_and_changes() {
+        let mut t = table();
+        let a = tmpfs(&mut t, b"/a");
+        t.set_propagation(b"/a", ms::SHARED, false).unwrap();
+        let group = t.get(a).unwrap().peer;
+        assert_ne!(group, 0);
+        let b = t.bind(b"/a", b"/b", false, 0).unwrap();
+        assert_eq!(t.get(b).unwrap().peer, group);
+        t.set_propagation(b"/b", ms::SLAVE, false).unwrap();
+        let bm = t.get(b).unwrap();
+        assert_eq!((bm.peer, bm.master, bm.propagation), (0, group, ms::SLAVE));
+        let info = String::from_utf8(t.mountinfo(b"/")).unwrap();
+        assert!(info.lines().any(|l| l.contains(" /a ") && l.contains(&format!("shared:{group}"))));
+        assert!(info.lines().any(|l| l.contains(" /b ") && l.contains(&format!("master:{group}"))));
+        // The last of a group, made a slave, has no one to receive from.
+        t.set_propagation(b"/a", ms::SLAVE, false).unwrap();
+        assert_eq!(t.get(a).unwrap().propagation, ms::PRIVATE);
+        // A new mount under a shared one is shared, in a group of its own.
+        t.set_propagation(b"/b", ms::SHARED, false).unwrap();
+        let c = tmpfs(&mut t, b"/b/c");
+        let peer = t.get(c).unwrap().peer;
+        assert!(peer != 0 && peer != t.get(b).unwrap().peer);
+    }
+
+    /// A detached copy attaches elsewhere, and beneath a mount: between it
+    /// and what it was attached to.
+    #[test]
+    fn detached_trees_attach_and_go_beneath() {
+        let mut t = table();
+        tmpfs(&mut t, b"/a");
+        tmpfs(&mut t, b"/a/sub");
+        let top = tmpfs(&mut t, b"/b");
+        let tree = t.copy_tree(b"/a", true).unwrap();
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[1].point, b"/sub");
+        let copy = t.attach_tree(&tree, b"/c", false).unwrap();
+        assert_eq!(t.locate(b"/c/sub/x").0.point, b"/c/sub");
+        assert_ne!(t.locate(b"/c/sub/x").0.id, t.locate(b"/a/sub/x").0.id);
+        assert!(t.get(copy).is_some());
+        // Beneath /b: /b still shows on top, and unmounting it uncovers
+        // the copy.
+        let under = t.attach_tree(&tree[..1], b"/b", true).unwrap();
+        assert_eq!(t.locate(b"/b/x").0.id, top);
+        assert_eq!(t.get(top).unwrap().parent, under);
+        t.umount(b"/b").unwrap();
+        assert_eq!(t.locate(b"/b/x").0.id, under);
+        // Not beneath the root, nor beneath a path that is no mount's root.
+        assert_eq!(t.attach_tree(&tree, b"/", true), Err(errno::EINVAL));
+        assert_eq!(t.attach_tree(&tree, b"/b/x", true), Err(errno::EINVAL));
+    }
+
+    /// Unique ids sit above every old one.
+    #[test]
+    fn unique_ids_find_mounts() {
+        let mut t = table();
+        let a = tmpfs(&mut t, b"/a");
+        let u = t.get(a).unwrap().unique_id();
+        assert!(u > UNIQUE_ID_BASE);
+        assert_eq!(t.by_unique(u).unwrap().id, a);
     }
 
     /// Mounts stack, and unmounting one uncovers what it covered.

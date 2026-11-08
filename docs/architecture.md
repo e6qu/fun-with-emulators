@@ -992,7 +992,24 @@ overlay), or one of fwe's own filesystems (`proc`, `sysfs`, `devpts`,
 `mqueue`; `cgroup2` is the shared tree). `mount` (new mounts, bind and
 recursive bind, move, remount, propagation), `umount2`, `pivot_root` and
 `chroot` act on it, and `/proc/self/mountinfo` and `/proc/self/mounts`
-show it from the process's root.
+show it from the process's root, with each mount's options and its peer
+group (`shared:N`) and master (`master:N`). A bind of a shared mount joins
+its peer group, a new mount under a shared one gets a group of its own,
+and a shared mount made a slave receives from the group it left, as on
+Linux.
+
+The new mount API (`crates/kernel/src/mountapi.rs`) works on the same
+table. A filesystem context (`fsopen`, or `fspick` of a mounted filesystem)
+gathers a source, flags and options through `fsconfig`, checked as Linux
+checks them (an unknown parameter is refused and logged, and reading the
+context's descriptor gives the log), and `CMD_CREATE` makes the filesystem
+as `mount` would. `fsmount` and `open_tree` with `OPEN_TREE_CLONE` give a
+detached mount, a copy kept by the process against an `O_PATH` descriptor,
+which `mount_setattr` can change and `move_mount` attaches, beneath the
+mount at the target with `MOVE_MOUNT_BENEATH`. `statx` reports a file's
+mount id (or its unique id, for `STATX_MNT_ID_UNIQUE`), which
+`statmount` describes and `listmount` lists; a mount the caller cannot
+reach from its root is refused to it without `CAP_SYS_ADMIN`.
 
 An overlay (`crates/kernel/src/overlay.rs`) is resolved as Linux's
 `overlay` filesystem resolves it: each name in the upper layer, then in
@@ -1232,8 +1249,10 @@ of these are to be lifted for 1.0 and which are not planned.
 - **Mounts:** the filesystems mounted are tmpfs, `proc`, `sysfs`,
   `cgroup2`, `devpts`, `mqueue` and overlays, not one on a block device
   (ext4, XFS: `ENODEV`), so a loop device holds a file's bytes but no
-  filesystem to mount. Mounts do not propagate between namespaces, whatever their
-  propagation type; a remount of a filesystem acts on the one mount; a
+  filesystem to mount. Mounts do not propagate, between namespaces or
+  within one, whatever their propagation type (peer groups and masters
+  are kept and shown); a detached mount or a filesystem context does not
+  survive an `execve`; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
   always detaches). An overlay's layers must be host directories (not in
   another overlay); a directory a lower layer has cannot be renamed
@@ -1320,7 +1339,6 @@ of these are to be lifted for 1.0 and which are not planned.
   - `ptrace`;
   - `inotify` and `fanotify`;
   - `kcmp`;
-  - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`);
   - `io_uring`, `userfaultfd` and `perf_event_open`;
   - `rseq` and `membarrier` (optional for libc);
   - `name_to_handle_at` and the AIO calls.

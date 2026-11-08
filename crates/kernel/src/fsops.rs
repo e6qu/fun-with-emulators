@@ -121,11 +121,11 @@ fn pts_number(path: &[u8]) -> Option<u32> {
     std::str::from_utf8(rest).ok()?.parse().ok()
 }
 
-fn major(dev: u64) -> u32 {
+pub(crate) fn major(dev: u64) -> u32 {
     (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff)) as u32
 }
 
-fn minor(dev: u64) -> u32 {
+pub(crate) fn minor(dev: u64) -> u32 {
     (((dev >> 12) & 0xffff_ff00) | (dev & 0xff)) as u32
 }
 
@@ -760,6 +760,32 @@ impl<P: Platform> Kernel<P> {
     /// `fstatfs(fd, buf)`.
     pub(crate) fn sys_fstatfs(&mut self, fd: u64, buf: u64) -> i64 {
         let fd = fd as i32;
+        // A pipe's or socket's filesystem is the kernel's own (pipefs,
+        // sockfs), which the host does not report.
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } == 0 {
+            const PIPEFS_MAGIC: i64 = 0x5049_5045;
+            const SOCKFS_MAGIC: i64 = 0x534f_434b;
+            let magic = match st.st_mode & libc::S_IFMT {
+                libc::S_IFIFO if crate::fs::fd_path(fd).is_none() => Some(PIPEFS_MAGIC),
+                libc::S_IFSOCK => Some(SOCKFS_MAGIC),
+                _ => None,
+            };
+            if let Some(f_type) = magic {
+                let page = 4096;
+                let out = fwe_abi::Statfs {
+                    f_type,
+                    f_bsize: page,
+                    f_namelen: 255,
+                    f_frsize: page,
+                    ..Default::default()
+                };
+                guest!(uaccess::write(buf, out));
+                return 0;
+            }
+        }
         if let Some(o) = crate::fdmarks::origin(fd) {
             return statfs_fd(fd, buf, Some((o.fstype, o.flags)));
         }
@@ -862,15 +888,48 @@ impl<P: Platform> Kernel<P> {
         dirfd: u64,
         path: u64,
         flags: u64,
-        _mask: u64,
+        mask: u64,
         buf: u64,
     ) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        let (host, node) = if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
+        // Linux's checks of the request: the reserved mask bit, both sync
+        // types at once, an unknown flag.
+        const STATX_RESERVED: u64 = 0x8000_0000;
+        const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+        let known = fcntl::AT_SYMLINK_NOFOLLOW
+            | fcntl::AT_NO_AUTOMOUNT
+            | fcntl::AT_EMPTY_PATH
+            | AT_STATX_SYNC_TYPE;
+        if mask & STATX_RESERVED != 0
+            || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+            || flags & !known != 0
+        {
+            return err(errno::EINVAL);
+        }
+        let empty = path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0;
+        let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
+        // The mount it is in: its id, or its unique id if asked for, as
+        // Linux reports one or the other.
+        let mount = self.statx_mount(dirfd as i32, &path, empty, follow);
+        let with_mount = |mut x: Statx| {
+            use fwe_abi::statx_mask::{STATX_MNT_ID, STATX_MNT_ID_UNIQUE};
+            if let Some(m) = &mount {
+                if mask as u32 & STATX_MNT_ID_UNIQUE != 0 {
+                    x.stx_mnt_id = m.unique_id();
+                    x.stx_mask |= STATX_MNT_ID_UNIQUE;
+                } else {
+                    x.stx_mnt_id = u64::from(m.id);
+                    x.stx_mask |= STATX_MNT_ID;
+                }
+            }
+            x
+        };
+        let (host, node) = if empty {
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {
                 use fwe_abi::stat as st;
-                guest!(uaccess::write(buf, statx_of(&synth_stat(st::S_IFDIR | 0o555, 0))));
+                let x = with_mount(statx_of(&synth_stat(st::S_IFDIR | 0o555, 0)));
+                guest!(uaccess::write(buf, x));
                 return 0;
             }
             let out = match stat_fd(dirfd as i32) {
@@ -882,10 +941,9 @@ impl<P: Platform> Kernel<P> {
                 .flatten();
             (out, node)
         } else {
-            let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
             return match self.linux_stat(dirfd as i32, &path, follow, 0) {
                 Ok(st) => {
-                    guest!(uaccess::write(buf, statx_of(&st)));
+                    guest!(uaccess::write(buf, with_mount(statx_of(&st))));
                     0
                 }
                 Err(e) => err(e),
@@ -902,8 +960,30 @@ impl<P: Platform> Kernel<P> {
             x.stx_rdev_minor = n.minor;
             x.stx_size = 0;
         }
-        guest!(uaccess::write(buf, x));
+        guest!(uaccess::write(buf, with_mount(x)));
         0
+    }
+
+    /// The mount `path` from `dirfd` (or with `empty`, the file `dirfd` is
+    /// open on) is in, if fwe can place it.
+    fn statx_mount(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        empty: bool,
+        follow: bool,
+    ) -> Option<crate::mounts::Mount> {
+        let fs = self.fs();
+        let table = fs.mount_ns().table();
+        // A path's own mount: the one at it, for a mount point.
+        let ns = if empty {
+            fs.fd_ns_path(dirfd)?
+        } else if let Some(ns) = fs.resolve(dirfd, path, follow).ok().and_then(|r| r.ns_path) {
+            ns
+        } else {
+            fs.to_ns(&fs.absolute_path(dirfd, path)?)
+        };
+        Some(table.locate(&ns).0.clone())
     }
 
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
@@ -2271,6 +2351,7 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
             (ms::NOATIME, ST_NOATIME),
             (ms::NODIRATIME, ST_NODIRATIME),
             (ms::RELATIME, ST_RELATIME),
+            (ms::NOSYMFOLLOW, ST_NOSYMFOLLOW),
         ] {
             if flags & m != 0 {
                 f |= st;

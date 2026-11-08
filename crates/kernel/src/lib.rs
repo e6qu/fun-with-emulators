@@ -32,6 +32,7 @@ pub mod maps;
 pub mod memfd;
 pub mod mm;
 pub mod modes;
+pub mod mountapi;
 mod mountops;
 pub mod mounts;
 pub mod mqueue;
@@ -1192,6 +1193,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // SAFETY: caller guarantees the buffer spans the length.
             if let Some(r) = unsafe { signalfd::try_read(fd, buf, len) } {
+                return Some(r);
+            }
+            if let Some(r) = mountapi::read(fd, buf, len) {
                 return Some(r);
             }
             if seqpacket::is(fd) {

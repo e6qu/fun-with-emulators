@@ -2762,7 +2762,8 @@ const CALLS: &str = "splice: 5, offset 7, position 10\n\
     personality: was 0, now 0x20000, release 2.6: true\n\
     sched: set 0, get 0, policy 2, priority 10\n\
     child's policy: 2\n\
-    clock: read 0, set refused true\n";
+    clock: read 0, set refused true\n\
+    pipe's filesystem: 0, pipefs true; statx reserved bit refused true\n";
 
 /// Data moved through pipes (`splice` from a file's offset, `tee`,
 /// `vmsplice`), the personality, a scheduling policy a fork child
@@ -2793,6 +2794,26 @@ const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-ex
 fn message_queues_deliver_and_notify() {
     let out = fwe(&rust_guest("mqueue"), &[]);
     assert_eq!(stdout(&out), MQUEUE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `mountapi` guest prints.
+const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown parameter 'bogus'\", create 0, attached 0\n\
+    mounted: options rw,noexec,relatime\n\
+    statmount: 0, same id true, type tmpfs, point true\n\
+    listmount: listed true\n\
+    beneath: 0, top first true, then the copy true\n\
+    fspick: 0, read-only true, then rw\n\
+    mount_setattr: 0, nodev true, shared true\n";
+
+/// The new mount API: a tmpfs made through a filesystem context and
+/// attached from a detached mount, a detached copy attached beneath
+/// another mount, `fspick`, `mount_setattr`, and `statx`, `statmount` and
+/// `listmount` agreeing on the mount.
+#[test]
+fn the_new_mount_api_makes_and_attaches_mounts() {
+    let out = fwe(&rust_guest("mountapi"), &[]);
+    assert_eq!(stdout(&out), MOUNTAPI, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -3319,6 +3340,16 @@ fn hv_kernel_calls_move_data_and_keep_settings() {
 fn hv_message_queues_deliver_and_notify() {
     let Some(out) = fwe_hv(&rust_low_guest("mqueue"), &[]) else { return };
     assert_eq!(stdout(&out), MQUEUE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The new mount API in the VM (see
+/// [`the_new_mount_api_makes_and_attaches_mounts`]): its structures are
+/// the guest's memory, translated.
+#[test]
+fn hv_the_new_mount_api_makes_and_attaches_mounts() {
+    let Some(out) = fwe_hv(&rust_low_guest("mountapi"), &[]) else { return };
+    assert_eq!(stdout(&out), MOUNTAPI, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

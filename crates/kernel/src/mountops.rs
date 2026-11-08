@@ -57,7 +57,17 @@ impl<P: Platform> Kernel<P> {
     /// program's file, `/proc/self/fd/N` the open file's). Fails with
     /// `EINVAL` for one fwe cannot place.
     fn mount_path(&self, path: &[u8], follow: bool) -> Result<(Vec<u8>, bool), i32> {
-        if let Some(entry) = self.fs().synthetic(fwe_abi::fcntl::AT_FDCWD as i32, path) {
+        self.mount_path_at(fwe_abi::fcntl::AT_FDCWD as i32, path, follow)
+    }
+
+    /// [`mount_path`](Self::mount_path) of `path` from directory `dirfd`.
+    pub(crate) fn mount_path_at(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<(Vec<u8>, bool), i32> {
+        if let Some(entry) = self.fs().synthetic(dirfd, path) {
             use crate::procfs::Entry;
             return match entry {
                 Entry::Missing => Err(errno::ENOENT),
@@ -77,16 +87,16 @@ impl<P: Platform> Kernel<P> {
                     Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
                 }
                 Entry::Dir => {
-                    let absolute = crate::fs::normalize(self.fs().cwd(), path);
+                    let absolute = self.fs().absolute_path(dirfd, path).ok_or(errno::EBADF)?;
                     Ok((self.fs().to_ns(&absolute), true))
                 }
                 _ => {
-                    let absolute = crate::fs::normalize(self.fs().cwd(), path);
+                    let absolute = self.fs().absolute_path(dirfd, path).ok_or(errno::EBADF)?;
                     Ok((self.fs().to_ns(&absolute), false))
                 }
             };
         }
-        let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, path, follow)?;
+        let r = self.fs().resolve(dirfd, path, follow)?;
         let name = r.name_c()?;
         // It must exist.
         // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
@@ -105,6 +115,36 @@ impl<P: Platform> Kernel<P> {
         }
         let ns = r.ns_path.ok_or(errno::EINVAL)?;
         Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
+    }
+
+    /// A new filesystem of `kind` with options `data`: where it is, the
+    /// path inside it a mount shows, and the mount flags it imposes (an
+    /// overlay with nothing to write to is read-only, as on Linux).
+    pub(crate) fn new_filesystem(
+        &self,
+        kind: FsType,
+        data: &[u8],
+    ) -> Result<(Source, Vec<u8>, u64), i32> {
+        let mut root = b"/".to_vec();
+        let mut flags = 0;
+        let src = match kind {
+            FsType::Tmpfs => Source::Host(tmpfs_dir(mode_option(data).unwrap_or(0o1777))?),
+            FsType::Cgroup2 => {
+                // The hierarchy from the cgroup namespace's root.
+                let dir = crate::cgroupfs::tree_dir()?;
+                root = self.fs().ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
+                Source::Host(dir)
+            }
+            FsType::Overlay => {
+                let layers = self.overlay_layers(data)?;
+                if layers.upper.is_none() {
+                    flags |= ms::RDONLY;
+                }
+                Source::Overlay(std::sync::Arc::new(layers))
+            }
+            _ => Source::Synthetic,
+        };
+        Ok((src, root, flags))
     }
 
     /// The host file `path` resolves to when it is one fwe serves from the
@@ -187,6 +227,7 @@ impl<P: Platform> Kernel<P> {
             if p == 0 { Ok(Vec::new()) } else { uaccess::read_cstr(p, uaccess::PATH_MAX) }
         };
         let source = guest!(read_opt(source));
+        let fstype_ptr = fstype;
         let fstype = guest!(read_opt(fstype));
         // `data` is a page of options, a string for the filesystems fwe has.
         let data = guest!(read_opt(data));
@@ -238,40 +279,18 @@ impl<P: Platform> Kernel<P> {
             if !is_dir {
                 return err(errno::ENOTDIR);
             }
+            // A new mount names its filesystem's type.
+            if fstype_ptr == 0 {
+                return err(errno::EINVAL);
+            }
             // `cgroup` names the v2 hierarchy when that is the one there is.
             let name: &[u8] = if fstype == b"cgroup" { b"cgroup2" } else { &fstype };
             let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
-            let mut root = b"/".to_vec();
-            let src = match kind {
-                FsType::Tmpfs => match tmpfs_dir(mode_option(&data).unwrap_or(0o1777)) {
-                    Ok(dir) => Source::Host(dir),
-                    Err(e) => return err(e),
-                },
-                FsType::Cgroup2 => match crate::cgroupfs::tree_dir() {
-                    // The hierarchy from the cgroup namespace's root.
-                    Ok(dir) => {
-                        root = self
-                            .fs()
-                            .ns
-                            .cgroup
-                            .as_ref()
-                            .map_or(b"/".to_vec(), |c| c.get().root.clone());
-                        Source::Host(dir)
-                    }
-                    Err(e) => return err(e),
-                },
-                FsType::Overlay => match self.overlay_layers(&data) {
-                    Ok(layers) => {
-                        if layers.upper.is_none() {
-                            // Nothing to write to: read-only, as on Linux.
-                            flags |= ms::RDONLY;
-                        }
-                        Source::Overlay(std::sync::Arc::new(layers))
-                    }
-                    Err(e) => return err(e),
-                },
-                _ => Source::Synthetic,
+            let (src, root, more) = match self.new_filesystem(kind, &data) {
+                Ok(v) => v,
+                Err(e) => return err(e),
             };
+            flags |= more;
             let device = if source.is_empty() { kind.name().as_bytes().to_vec() } else { source };
             ns.update(|t| {
                 t.mount(&point, kind, src, root, flags, device, data);
