@@ -80,6 +80,10 @@ CONFIG_TIMERFD=y
 CONFIG_EVENTFD=y
 CONFIG_SHMEM=y
 CONFIG_TMPFS=y
+CONFIG_BLOCK=y
+CONFIG_BLK_DEV=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BLK_DEV_LOOP_MIN_COUNT=8
 CONFIG_MEMFD_CREATE=y
 CONFIG_UNIX98_PTYS=y
 CONFIG_NAMESPACES=y
@@ -158,6 +162,7 @@ const DIRS: &[DirDef] = &[
             (b"cmdline", DT_REG),
             (b"config.gz", DT_REG),
             (b"sysvipc", DT_DIR),
+            (b"partitions", DT_REG),
         ],
     ),
     (
@@ -225,11 +230,11 @@ const DIRS: &[DirDef] = &[
         ],
     ),
     (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
-    (b"/sys", &[(b"devices", DT_DIR), (b"fs", DT_DIR)]),
+    (b"/sys", &[(b"devices", DT_DIR), (b"fs", DT_DIR), (b"block", DT_DIR), (b"dev", DT_DIR)]),
     // Where the cgroup hierarchy is mounted.
     (b"/sys/fs", &[(b"cgroup", DT_DIR)]),
     (b"/sys/fs/cgroup", &[]),
-    (b"/sys/devices", &[(b"system", DT_DIR)]),
+    (b"/sys/devices", &[(b"system", DT_DIR), (b"virtual", DT_DIR)]),
     (b"/sys/devices/system", &[(b"cpu", DT_DIR)]),
     (b"/sys/devices/system/cpu", &[(b"online", DT_REG), (b"possible", DT_REG)]),
 ];
@@ -237,11 +242,16 @@ const DIRS: &[DirDef] = &[
 /// The entries of a synthetic directory `path`, including `.` and `..`, or
 /// `None` if `path` is not a synthetic directory.
 pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
+    let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
+    // The loop devices' directories.
+    if let Some(entries) = crate::loopdev::sys_children(path) {
+        out.extend(entries);
+        return Some(out);
+    }
     let listed = DIRS.iter().find(|(p, _)| *p == path).map(|d| d.1);
     if listed.is_none() && !crate::sysctl::is_dir(path) {
         return None;
     }
-    let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
     out.extend(listed.unwrap_or_default().iter().map(|(n, t)| (n.to_vec(), *t)));
     // The network namespace's sysctls.
     for (name, dir) in crate::sysctl::children(path) {
@@ -318,6 +328,8 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {
             Entry::File(cpu_range(info.ncpu))
         }
+        b"/proc/partitions" => Entry::File(crate::loopdev::partitions()),
+        p if let Some(e) = crate::loopdev::sys_lookup(p) => e,
         p if is_dir(p) => Entry::Dir,
         _ => Entry::Missing,
     })

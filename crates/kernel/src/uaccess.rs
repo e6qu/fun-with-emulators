@@ -415,7 +415,10 @@ pub fn read_cstr_array(addr: u64, max_each: usize) -> Result<Vec<Vec<u8>>> {
 /// for it).
 /// The guest buffer of `len` bytes at `base` (written to if `write`) as
 /// a host `iovec`, checked as [`host_iovecs`] checks each of its own.
+/// `base` may be a pointer argument the backend translated already
+/// ([`host_arg`]): it stands for the guest address it came from.
 pub fn host_buffer(base: u64, len: u64, write: bool) -> Result<libc::iovec> {
+    let base = guest_of(base);
     check(len == 0 || valid(base, len, write))?;
     if crosses(base, len) {
         return Err(errno::EINVAL);
