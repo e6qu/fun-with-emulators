@@ -52,6 +52,7 @@ pub mod nsfd;
 pub mod nsops;
 mod openat2;
 pub mod overlay;
+pub mod pdeath;
 pub mod pidfd;
 pub mod pidns;
 pub mod procfs;
@@ -598,6 +599,8 @@ impl<P: Platform> Kernel<P> {
         nsfd::save(&mut e);
         // Process descriptors, which the host exec closes (kqueues).
         pidfd::save(&mut e);
+        // The parent-death signal, whose watch the exec ends.
+        pdeath::save(&mut e);
         // The message queues' descriptors the exec closes: their
         // registrations go now, as Linux removes them as it closes them.
         mqueue::exec_closing(&self.creds);
@@ -642,6 +645,7 @@ impl<P: Platform> Kernel<P> {
         inotify::load(&mut d);
         nsfd::load(&mut d);
         pidfd::restore(&mut d, true);
+        pdeath::restore(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         let persona = d.u32();

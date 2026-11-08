@@ -3,8 +3,8 @@
 //! refused; a signal the host lacks (`SIGSTKFLT`) and a fault signal sent
 //! to a child the moment it is forked; core dumps, of a fault and of a
 //! sent signal; a child whose end is told with `SIGUSR2`; a child sharing
-//! the memory (`CLONE_VM`); the hard CPU limit; and the timer slack a child
-//! inherits. It prints what it observed.
+//! the memory (`CLONE_VM`); the hard CPU limit; the timer slack a child
+//! inherits; and a parent-death signal. It prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
@@ -26,6 +26,8 @@ const RLIMIT_CORE: i32 = 4;
 const CLONE_VM: i32 = 0x100;
 const SIGCHLD: i32 = 17;
 const WALL: i32 = 0x4000_0000;
+const PR_SET_PDEATHSIG: i32 = 1;
+const SIGTERM: i32 = 15;
 const PR_SET_TIMERSLACK: i32 = 29;
 const PR_GET_TIMERSLACK: i32 = 30;
 const PROT_RW: i32 = 3;
@@ -60,6 +62,11 @@ unsafe extern "C" {
     fn clone(f: extern "C" fn(*mut c_void) -> i32, stack: *mut c_void, flags: i32, arg: *mut c_void) -> i32;
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn chdir(path: *const c_char) -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn read(fd: i32, buf: *mut c_void, len: usize) -> isize;
+    fn write(fd: i32, buf: *const c_void, len: usize) -> isize;
+    fn close(fd: i32) -> i32;
+    fn poll(fds: *mut PollFd, n: u64, timeout: i32) -> i32;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -217,5 +224,41 @@ fn main() {
             shown.trim(),
             ended(status) == (-1, false)
         );
+
+        // A parent-death signal: a grandchild that asked for SIGTERM as its
+        // parent ends, then the parent ending. Its end shows as the end of
+        // a pipe only it holds.
+        let (mut ready, mut held) = ([0i32; 2], [0i32; 2]);
+        pipe(ready.as_mut_ptr());
+        pipe(held.as_mut_ptr());
+        let pid = fork();
+        if pid == 0 {
+            if fork() == 0 {
+                close(held[0]);
+                prctl(PR_SET_PDEATHSIG, SIGTERM as u64);
+                write(ready[1], b"r".as_ptr().cast(), 1);
+                loop {
+                    pause();
+                }
+            }
+            let mut b = 0u8;
+            read(ready[0], (&mut b as *mut u8).cast(), 1);
+            _exit(0);
+        }
+        close(held[1]);
+        close(ready[1]);
+        waitpid(pid, &mut status, 0);
+        let mut p = PollFd { fd: held[0], events: 1, revents: 0 };
+        let came = poll(&mut p, 1, 5000) == 1;
+        let mut b = 0u8;
+        let gone = came && read(held[0], (&mut b as *mut u8).cast(), 1) == 0;
+        println!("parent-death signal: the orphan ended {gone}");
     }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }

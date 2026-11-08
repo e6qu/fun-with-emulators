@@ -805,8 +805,9 @@ which are to be lifted for 1.0 and which are not planned.
   descriptor fwe stands in for (an eventfd, a timerfd, a signalfd) gives
   the host object behind it, as one passed over a socket does, and waits
   while the target is stopped.
-- A parent-death signal (`PR_SET_PDEATHSIG`) is recorded but never sent;
-  a new thread does not inherit its creator's name.
+- A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
+  process ends (Linux sends it when the parent thread does); a new thread
+  does not inherit its creator's name.
 
 **Resources**
 - The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),

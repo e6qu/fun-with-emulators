@@ -28,8 +28,6 @@ thread_local! {
     static ROBUST_LIST: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// The name `prctl(PR_SET_NAME)` gave this thread, if any.
     static NAME: Cell<Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]>> = const { Cell::new(None) };
-    /// `prctl(PR_SET_PDEATHSIG)`: recorded, not delivered (see the limitations).
-    static PDEATHSIG: Cell<u64> = const { Cell::new(0) };
 }
 
 /// This thread's name as `prctl(PR_SET_NAME)` set it, or `None`.
@@ -39,14 +37,6 @@ pub fn name() -> Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]> {
 
 pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
     NAME.with(|n| n.set(Some(name)));
-}
-
-pub fn pdeathsig() -> u64 {
-    PDEATHSIG.with(Cell::get)
-}
-
-pub fn set_pdeathsig(sig: u64) {
-    PDEATHSIG.with(|s| s.set(sig));
 }
 
 /// Initialize the thread-group id and the main thread's id (both the host
@@ -78,6 +68,7 @@ pub fn init_main(pid: i32) {
     }
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     forget_wait_pipes();
+    crate::pdeath::forked();
     crate::futex::forked_child();
     crate::signote::open_own();
     crate::sysvipc::forked_child();

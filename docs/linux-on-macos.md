@@ -2039,7 +2039,7 @@ Each way a child can change, and what the parent's guest sees:
 | `rusage` from `wait4` | `ru_maxrss` from bytes to KiB | Linux's `rusage` |
 | `waitid` | the host gives no `rusage` | zero-filled `rusage` |
 | the guest ignores `SIGCHLD`, or set `SA_NOCLDWAIT` | the host reaps the children itself | no zombies, as on Linux |
-| the parent ends | the child goes to `launchd` on the host | its Linux adopter, below; `PR_SET_PDEATHSIG` is not sent ([limitations](architecture.md#known-limitations)) |
+| the parent ends | the child goes to `launchd` on the host | its Linux adopter, below; a `PR_SET_PDEATHSIG` signal, which a thread of fwe's in the child waits on the parent's exit (`kqueue`) to send (`crates/kernel/src/pdeath.rs`) |
 
 #### Orphans and reapers
 

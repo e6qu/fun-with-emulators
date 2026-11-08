@@ -1298,12 +1298,12 @@ impl<P: Platform> Kernel<P> {
             PR_SET_DUMPABLE => err(errno::EINVAL),
             PR_GET_DUMPABLE => i64::from(!crate::coredump::UNDUMPABLE.load(Relaxed)),
             PR_SET_PDEATHSIG if arg2 <= signal::NSIG => {
-                thread::set_pdeathsig(arg2);
+                crate::pdeath::set(arg2);
                 0
             }
             PR_SET_PDEATHSIG => err(errno::EINVAL),
             PR_GET_PDEATHSIG => {
-                guest!(uaccess::write(arg2, thread::pdeathsig() as i32));
+                guest!(uaccess::write(arg2, crate::pdeath::get() as i32));
                 0
             }
             _ => err(errno::EINVAL),
@@ -3075,6 +3075,8 @@ mod tests {
         let mut sig = 0i32;
         assert_eq!(call(PR_GET_PDEATHSIG, &mut sig as *mut _ as u64), 0);
         assert_eq!(sig, 9);
+        // None again: the test's process is sent nothing as its parent ends.
+        assert_eq!(call(PR_SET_PDEATHSIG, 0), 0);
         assert_eq!(call(1000, 0), err(errno::EINVAL));
     }
 
