@@ -3248,7 +3248,8 @@ mod tests {
         // At a fixed address it stays, or fails.
         let at = k.syscall(nr::MMAP, [0, len, PROT_READ | PROT_WRITE, anon, u64::MAX, 0]) as u64;
         k.platform.refuse = 1;
-        let r = k.syscall(nr::MMAP, [at, len, PROT_READ | PROT_EXEC, anon | MAP_FIXED, u64::MAX, 0]);
+        let r =
+            k.syscall(nr::MMAP, [at, len, PROT_READ | PROT_EXEC, anon | MAP_FIXED, u64::MAX, 0]);
         assert_eq!(r, err(errno::ENOMEM));
         let _ = k.syscall(nr::MUNMAP, [at, len, 0, 0, 0, 0]);
     }
