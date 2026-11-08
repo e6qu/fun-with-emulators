@@ -41,7 +41,7 @@ fn run_bounded(mut cmd: Command) -> Output {
 /// backend). A VM process must never be killed with its VM alive, so the
 /// command runs in a process group of its own; on timeout the group gets
 /// `SIGTERM`, which every VM process catches to tear its VM down first,
-/// and only a group still alive 5 s later gets `SIGKILL`. Afterwards no
+/// and only a leader still alive 5 s later gets `SIGKILL`. Afterwards no
 /// process of the group may be left (a fork child outliving its test would
 /// keep a VM running alongside the next one): the test fails if one is.
 fn run_vm_bounded(cmd: Command) -> Output {

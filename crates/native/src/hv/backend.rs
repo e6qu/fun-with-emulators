@@ -84,11 +84,9 @@ impl Platform for HvPlatform {
 
 // --- Ending a VM process cleanly -----------------------------------------
 //
-// A process must never end, or exec, with its VM alive: the machine this was
-// developed on panicked twice in that situation (a kernel NULL dereference in
-// a kernel thread while a VM process was being torn down, and a watchdog
-// reset two minutes after a VM process was killed by a signal), with another
-// hypervisor client running alongside. So every way out — exit_group, the
+// A process must never end, or exec, with its VM alive: misusing the
+// framework can bring the machine down (see the safety rules in
+// docs/hypervisor.md). So every way out — exit_group, the
 // last thread's exit, a fatal signal's default action, fwe's own fatal errors
 // and panics, execve — first stops and destroys every vCPU and then the VM,
 // and a host fork, which would copy a VM the child cannot own, is refused.
