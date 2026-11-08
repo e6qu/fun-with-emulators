@@ -24,6 +24,16 @@ fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
 /// `flock(fd, op)`. Waiting for the lock blocks, so the backends run it
 /// without the kernel lock ([`crate::blocking_syscall`]).
 pub(crate) fn flock(fd: u64, op: u64) -> i64 {
+    // A message queue's descriptor holds the host lock that keeps the
+    // queue alive ([`crate::mqueue`]): the guest's lock is not taken there.
+    if crate::fdmarks::any_marks()
+        && crate::fdmarks::marked(fd as i32) == Some(crate::fdmarks::Mark::Mq)
+    {
+        return match host::flock_op_to_host(op) {
+            Some(_) => 0,
+            None => err(errno::EINVAL),
+        };
+    }
     match host::flock_op_to_host(op) {
         // SAFETY: plain host call on a guest descriptor.
         Some(op) => ret(unsafe { libc::flock(fd as i32, op) }),
@@ -172,8 +182,14 @@ impl<P: Platform> Kernel<P> {
                     crate::netns::closed(fd, mark);
                 }
                 crate::netlink::closed(fd);
+                let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
-                if let Some(r) = crate::specialfd::try_close(fd) {
+                if let Some(after) = queue {
+                    // SAFETY: plain host call.
+                    let r = ret(unsafe { libc::close(fd) });
+                    after();
+                    r
+                } else if let Some(r) = crate::specialfd::try_close(fd) {
                     r
                 } else if let Some(r) = crate::signalfd::try_close(fd) {
                     r
@@ -505,9 +521,16 @@ impl<P: Platform> Kernel<P> {
             nr::SEMGET => self.sys_semget(a[0], a[1], a[2]),
             // The backends run these without the lock (they wait); the same,
             // reached here (the plain `syscall` helper).
-            nr::SEMOP | nr::SEMTIMEDOP | nr::MSGSND | nr::MSGRCV => {
-                crate::ipcops::blocking(self.ipc_context(), n, a)
-            }
+            nr::SEMOP
+            | nr::SEMTIMEDOP
+            | nr::MSGSND
+            | nr::MSGRCV
+            | nr::MQ_TIMEDSEND
+            | nr::MQ_TIMEDRECEIVE => crate::ipcops::blocking(self.ipc_context(), n, a),
+            nr::MQ_OPEN => self.sys_mq_open(a[0], a[1], a[2], a[3]),
+            nr::MQ_UNLINK => self.sys_mq_unlink(a[0]),
+            nr::MQ_NOTIFY => self.sys_mq_notify(a[0], a[1]),
+            nr::MQ_GETSETATTR => self.sys_mq_getsetattr(a[0], a[1], a[2]),
             nr::SEMCTL => self.sys_semctl(a[0], a[1], a[2], a[3]),
             nr::MSGGET => self.sys_msgget(a[0], a[1]),
             nr::MSGCTL => self.sys_msgctl(a[0], a[1], a[2]),

@@ -34,6 +34,7 @@ pub mod mm;
 pub mod modes;
 mod mountops;
 pub mod mounts;
+pub mod mqueue;
 pub mod net;
 pub mod netlink;
 pub mod netns;
@@ -1147,6 +1148,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         return Some(e);
     }
     if let Some(r) = loopdev::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = mqueue::io(nr, &a) {
         return Some(r);
     }
     if nr == n::OPENAT {

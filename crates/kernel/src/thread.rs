@@ -119,6 +119,9 @@ pub struct SigInfo {
     pub uid: u32,
     /// Exit status or signal (`SIGCHLD`).
     pub status: i32,
+    /// The value a queued signal carries (`si_value`: `SI_QUEUE`,
+    /// `SI_MESGQ`).
+    pub value: u64,
 }
 
 #[derive(Default)]
@@ -127,6 +130,7 @@ struct SigSlot {
     pid: AtomicI32,
     uid: AtomicU32,
     status: AtomicI32,
+    value: AtomicU64,
 }
 
 impl SigSlot {
@@ -136,6 +140,7 @@ impl SigSlot {
             pid: AtomicI32::new(0),
             uid: AtomicU32::new(0),
             status: AtomicI32::new(0),
+            value: AtomicU64::new(0),
         }
     }
 }
@@ -178,6 +183,7 @@ impl Pending {
         slot.pid.store(info.pid, Ordering::Relaxed);
         slot.uid.store(info.uid, Ordering::Relaxed);
         slot.status.store(info.status, Ordering::Relaxed);
+        slot.value.store(info.value, Ordering::Relaxed);
         self.bits.fetch_or(1 << (sig - 1), Ordering::Release);
     }
 
@@ -192,6 +198,7 @@ impl Pending {
             pid: slot.pid.load(Ordering::Relaxed),
             uid: slot.uid.load(Ordering::Relaxed),
             status: slot.status.load(Ordering::Relaxed),
+            value: slot.value.load(Ordering::Relaxed),
         })
     }
 
@@ -454,7 +461,7 @@ mod tests {
     #[test]
     fn pending_is_per_thread_and_carries_info() {
         register_current();
-        let info = SigInfo { code: -6, pid: 7, uid: 8, status: 0 };
+        let info = SigInfo { code: -6, pid: 7, uid: 8, status: 0, value: 9 };
         post_self(signal::SIGUSR1, info);
         assert_eq!(pending() & (1 << (signal::SIGUSR1 - 1)), 1 << (signal::SIGUSR1 - 1));
         // Another thread does not see it.

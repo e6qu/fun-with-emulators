@@ -657,7 +657,7 @@ fn raise(e: &Ended) {
     let (code, status) = child_code(e.status);
     // SAFETY: getuid cannot fail.
     let uid = crate::host::uid_to_initial(unsafe { libc::getuid() });
-    let info = crate::thread::SigInfo { code, pid: e.pid, uid, status };
+    let info = crate::thread::SigInfo { code, pid: e.pid, uid, status, value: 0 };
     crate::thread::post_process(fwe_abi::signal::SIGCHLD, info);
     // One thread is woken to take it, as the host picks one for a signal
     // sent to the process: the wake carries nothing, so a wake the host

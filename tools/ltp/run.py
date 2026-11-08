@@ -31,10 +31,11 @@ TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
 # A hard limit on each test, over LTP's own (30 s per run by default, which
 # tests that run longer raise themselves and report as they go).
 HARD_LIMIT = 300
-# The System V IPC tests: each runs in an IPC namespace of its own. They
-# fill and count what a namespace holds, which tests run beside them (four
-# at a time, where LTP runs one) would otherwise see and change.
-IPC_TESTS = re.compile(r"^(shm|sem|msg|ipc)")
+# The System V IPC and message queue tests: each runs in an IPC namespace of
+# its own. They fill, count and limit what a namespace holds, which tests
+# run beside them (four at a time, where LTP runs one) would otherwise see
+# and change.
+IPC_TESTS = re.compile(r"^(shm|sem|msg|ipc|mq_)")
 # A test that runs away with processes must not take the host with it.
 PROCESS_LIMIT = 1500
 

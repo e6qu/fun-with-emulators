@@ -199,6 +199,15 @@ pub struct Ipc {
     /// The namespace's sysctls (`kernel.shmmax` and the like) set from
     /// their defaults, by name ([`crate::sysctl`]).
     pub sysctls: BTreeMap<String, String>,
+    /// The namespace's POSIX message queues ([`crate::mqueue`]): each
+    /// name's queue, by its record's directory in this one's.
+    pub mq_names: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Every queue not yet freed (one unlinked lives while it is open),
+    /// with the user it is charged to and the bytes charged
+    /// (`RLIMIT_MSGQUEUE`).
+    pub mq_live: BTreeMap<Vec<u8>, (u32, u64)>,
+    /// The number the next queue's directory takes.
+    pub mq_seq: u64,
 }
 
 impl Ipc {
@@ -240,6 +249,21 @@ impl Ipc {
 
     pub fn msgmni(&self) -> u64 {
         self.tunable("kernel/msgmni", 0, MSGMNI)
+    }
+
+    /// `fs.mqueue.*`: the most queues, the largest `mq_maxmsg` and
+    /// `mq_msgsize` an unprivileged creator may ask, and a queue's when it
+    /// asks none.
+    pub fn mq_tunable(&self, name: &str) -> i64 {
+        use fwe_abi::mqueue as mq;
+        let default = match name {
+            "queues_max" => mq::DFLT_QUEUESMAX,
+            "msg_max" => mq::DFLT_MSGMAX,
+            "msgsize_max" => mq::DFLT_MSGSIZEMAX,
+            "msg_default" => mq::DFLT_MSG,
+            _ => mq::DFLT_MSGSIZE,
+        };
+        self.tunable(&format!("fs/mqueue/{name}"), 0, default as u64) as i64
     }
 }
 
@@ -336,6 +360,18 @@ impl Data for Ipc {
                 }
             }
         }
+        e.u64(self.mq_names.len() as u64);
+        for (name, dir) in &self.mq_names {
+            e.bytes(name);
+            e.bytes(dir);
+        }
+        e.u64(self.mq_live.len() as u64);
+        for (dir, &(uid, bytes)) in &self.mq_live {
+            e.bytes(dir);
+            e.u32(uid);
+            e.u64(bytes);
+        }
+        e.u64(self.mq_seq);
     }
 
     fn decode(d: &mut Dec) -> Self {
@@ -392,6 +428,17 @@ impl Data for Ipc {
             let obj = Obj { key, perm, ctime, removed, body };
             ipc.objs.insert((obj.kind() as u8, id), obj);
         }
+        let n = d.count(16);
+        for _ in 0..n {
+            let (name, dir) = (d.bytes(), d.bytes());
+            ipc.mq_names.insert(name, dir);
+        }
+        let n = d.count(20);
+        for _ in 0..n {
+            let (dir, uid, bytes) = (d.bytes(), d.u32(), d.u64());
+            ipc.mq_live.insert(dir, (uid, bytes));
+        }
+        ipc.mq_seq = d.u64();
         ipc
     }
 }

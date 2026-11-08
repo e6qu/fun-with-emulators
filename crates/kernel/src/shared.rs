@@ -98,7 +98,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 8;
+pub const FORMAT: u32 = 9;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -136,6 +136,12 @@ impl<T: Data> Record<T> {
         let mut dir = crate::fs::shm::user_dir()?;
         dir.extend_from_slice(format!("/v{FORMAT}-{name}").as_bytes());
         Record::open_or_make(dir, id, initial)
+    }
+
+    /// The record at directory `dir`, inside another record's (whose life
+    /// it shares), made with `initial` if it does not exist.
+    pub fn at(dir: Vec<u8>, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
+        Record::open_or_make(dir, 0, initial)
     }
 
     /// A new record of `kind` holding `data` (after collecting those no

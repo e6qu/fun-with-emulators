@@ -446,19 +446,18 @@ extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
 }
 
 /// The body of [`on_async`], also used for a fault signal that was sent
-/// rather than raised by an instruction. `sent` gives the signal's
-/// (Linux code, pid, uid, status).
+/// rather than raised by an instruction. `sent` gives the signal's Linux
+/// `siginfo`.
 fn take_async(
     sig: libc::c_int,
-    sent: impl Fn() -> (i32, i32, u32, i32),
+    sent: impl Fn() -> thread::SigInfo,
     ctx: *mut libc::c_void,
     in_guest: bool,
 ) {
     let record = || {
         if sig != host::WAKE_SIGNAL {
-            let (code, pid, uid, status) = sent();
+            let info = sent();
             let lsig = host::signal_to_linux(sig);
-            let info = thread::SigInfo { code, pid, uid, status };
             if REROUTING.with(Cell::get) {
                 thread::post_process(lsig, info);
             } else {
@@ -572,8 +571,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // note before it sends one ([`fwe_kernel::signote`]): that one is a
     // signal for the guest, whatever this thread was running. (A genuine
     // fault that coincides with a note faults again, without one.)
-    if let Some((pid, uid)) = fwe_kernel::signote::take(sig) {
-        take_async(sig, || host::sent_info(pid, uid), ctx, IN_GUEST.with(Cell::get));
+    if let Some(note) = fwe_kernel::signote::take(sig) {
+        take_async(sig, || host::sent_info(note), ctx, IN_GUEST.with(Cell::get));
         return;
     }
     if !IN_GUEST.with(Cell::get) {

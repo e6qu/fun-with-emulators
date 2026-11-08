@@ -12,8 +12,12 @@
 //! is up; any other request is answered with `EOPNOTSUPP`, as the kernel
 //! answers one it has no handler for.
 //!
-//! In the initial network namespace, whose interfaces are the host's, fwe
-//! has none: making such a socket fails with `EAFNOSUPPORT`.
+//! In the initial network namespace, whose interfaces are the host's, a
+//! socket can be made, and every request on it is answered with
+//! `EOPNOTSUPP`: fwe does not describe the host's interfaces. Such a socket
+//! still carries what the kernel itself sends it: a message queue's
+//! notification ([`crate::mqueue`]), for which [`bind_for_notify`] gives
+//! the socket a host address another process can send to.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::{err, errno};
@@ -64,8 +68,12 @@ struct Sock {
     ty: i32,
     /// Its opener had `CAP_NET_ADMIN`, which changing a link needs.
     admin: bool,
-    /// The network namespace it was made in, which it answers for.
-    net: std::sync::Arc<crate::shared::Record<crate::ns::Net>>,
+    /// The network namespace it was made in, which it answers for (none:
+    /// the initial one).
+    net: Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
+    /// The host path the guest's end is bound to, once a message queue's
+    /// notification is to come to it ([`bind_for_notify`]).
+    bound: Option<Vec<u8>>,
 }
 
 /// The most a socket's queue holds, and the largest request: Linux's
@@ -101,7 +109,7 @@ pub fn is(fd: i32) -> bool {
 /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
 pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     use fwe_abi::socket::{SOCK_CLOEXEC, SOCK_NONBLOCK};
-    let Some(net) = crate::netns::current() else { return err(errno::EAFNOSUPPORT) };
+    let net = crate::netns::current();
     let base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
     // SOCK_RAW and SOCK_DGRAM.
     if base != 3 && base != 2 {
@@ -124,15 +132,7 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
         }
     };
     let fd = pair[0];
-    // Room for the replies a burst of requests queues, as on Linux (a
-    // host datagram socket holds 4 KiB, and drops the rest).
-    for (end, opt) in [(fd, libc::SO_RCVBUF), (peer, libc::SO_SNDBUF)] {
-        let v = BUFFER as libc::c_int;
-        // SAFETY: a valid option value.
-        unsafe {
-            libc::setsockopt(end, libc::SOL_SOCKET, opt, (&v as *const libc::c_int).cast(), 4)
-        };
-    }
+    room(fd, peer);
     // SAFETY: plain host calls on the new descriptor.
     unsafe {
         if type_ & SOCK_CLOEXEC != 0 {
@@ -144,8 +144,121 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     fdmarks::mark(fd, Mark::Netlink);
-    socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin, net }));
+    socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin, net, bound: None }));
     fd as i64
+}
+
+/// Room for the replies a burst of requests queues on guest end `fd`, sent
+/// from fwe's end `peer`, as on Linux (a host datagram socket holds 4 KiB,
+/// and drops the rest).
+fn room(fd: i32, peer: i32) {
+    for (end, opt) in [(fd, libc::SO_RCVBUF), (peer, libc::SO_SNDBUF)] {
+        let v = BUFFER as libc::c_int;
+        // SAFETY: a valid option value.
+        unsafe {
+            libc::setsockopt(end, libc::SOL_SOCKET, opt, (&v as *const libc::c_int).cast(), 4)
+        };
+    }
+}
+
+/// Give netlink socket `fd` a host address another process can send to,
+/// `path` (a path no other socket is given), unless it has one: the
+/// address it has. A message queue's
+/// notification for the socket is sent there ([`notify`]).
+///
+/// The guest's end of a host socket pair can have no address, so it is
+/// replaced: a new datagram socket bound to `path` takes the descriptor
+/// (its flags kept), and fwe's end is a new one connected to it.
+pub fn bind_for_notify(fd: i32, path: &[u8]) -> Result<Vec<u8>, i32> {
+    let ino = inode(fd).ok_or(errno::EBADF)?;
+    if let Some(p) = socks(|m| m.get(&ino).and_then(|s| s.bound.clone())) {
+        return Ok(p);
+    }
+    let fresh = || {
+        // SAFETY: plain host call.
+        let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+        if s < 0 { Err(crate::host::errno_to_linux(crate::host::last_errno())) } else { Ok(s) }
+    };
+    let close = |s: i32| {
+        // SAFETY: a descriptor made here.
+        unsafe { libc::close(s) };
+    };
+    let fail = || crate::host::errno_to_linux(crate::host::last_errno());
+    let own = fresh()?;
+    if let Ok(c) = std::ffi::CString::new(path) {
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        unsafe { libc::unlink(c.as_ptr()) };
+    }
+    // SAFETY: a valid address of the length given.
+    let bound = crate::net::at_unix_path(path, |a, l| unsafe { libc::bind(own, a, l) });
+    if bound != Ok(0) {
+        close(own);
+        return Err(bound.err().unwrap_or_else(fail));
+    }
+    let peer = match fresh() {
+        Ok(p) => p,
+        Err(e) => {
+            close(own);
+            return Err(e);
+        }
+    };
+    // SAFETY: as above.
+    let joined = crate::net::at_unix_path(path, |a, l| unsafe { libc::connect(peer, a, l) });
+    let peer = match (joined, crate::fdtable::reserve(peer)) {
+        (Ok(0), Ok(p)) => p,
+        (_, r) => {
+            close(own);
+            if let Ok(p) = r {
+                close(p);
+            }
+            return Err(errno::ENOBUFS);
+        }
+    };
+    room(own, peer);
+    // SAFETY: plain host calls on the guest's descriptor and the new one,
+    // which takes its number.
+    let moved = unsafe {
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        let fl_flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(own, libc::F_SETFL, fl_flags & libc::O_NONBLOCK);
+        let r = libc::dup2(own, fd);
+        libc::fcntl(fd, libc::F_SETFD, fd_flags & libc::FD_CLOEXEC);
+        libc::close(own);
+        r == fd
+    };
+    if !moved {
+        close(peer);
+        return Err(fail());
+    }
+    let new_ino = inode(fd).ok_or(errno::EBADF)?;
+    fdmarks::mark(fd, Mark::Netlink);
+    socks(|m| {
+        if let Some(mut s) = m.remove(&ino) {
+            close(s.peer);
+            s.peer = peer;
+            s.bound = Some(path.to_vec());
+            m.insert(new_ino, s);
+        }
+    });
+    Ok(path.to_vec())
+}
+
+/// Send `cookie` to the netlink socket bound at host `path` (by
+/// [`bind_for_notify`], in any process), as the kernel sends a message
+/// queue's notification. Whether it was sent.
+pub fn notify(path: &[u8], cookie: &[u8]) -> bool {
+    // SAFETY: plain host call.
+    let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    if s < 0 {
+        return false;
+    }
+    // SAFETY: a valid buffer and address of the lengths given.
+    let r = crate::net::at_unix_path(path, |a, l| unsafe {
+        libc::sendto(s, cookie.as_ptr().cast(), cookie.len(), 0, a, l) as i32
+    });
+    // SAFETY: the descriptor made here.
+    unsafe { libc::close(s) };
+    r == Ok(cookie.len() as i32)
 }
 
 /// The socket's type, as the guest made it (`SO_TYPE`).
@@ -280,6 +393,8 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
             e.u32(s.port);
             e.i32(s.ty);
             e.bool(s.admin);
+            e.bool(s.bound.is_some());
+            e.bytes(s.bound.as_deref().unwrap_or_default());
         }
     });
 }
@@ -287,17 +402,19 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
 /// What [`save`] wrote, in the new process (in the namespace it runs in,
 /// which an exec or fork keeps).
 pub(crate) fn load(d: &mut crate::snapshot::Dec) {
-    let n = d.count(21);
+    let n = d.count(30);
     let mut read = Vec::new();
     for _ in 0..n {
-        read.push((d.u64(), d.i32(), d.u32(), d.i32(), d.bool()));
+        let (ino, peer, port, ty, admin) = (d.u64(), d.i32(), d.u32(), d.i32(), d.bool());
+        let (some, path) = (d.bool(), d.bytes());
+        read.push((ino, peer, port, ty, admin, some.then_some(path)));
     }
-    let Some(net) = crate::netns::current() else { return };
+    let net = crate::netns::current();
     socks(|m| {
-        for (ino, peer, port, ty, admin) in read {
+        for (ino, peer, port, ty, admin, bound) in read {
             // SAFETY: plain host call on fwe's own descriptor.
             if unsafe { libc::fcntl(peer, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
-                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone() });
+                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone(), bound });
             }
         }
     });
@@ -312,6 +429,11 @@ pub fn closed(fd: i32) {
     if let Some(s) = socks(|m| m.remove(&ino)) {
         // SAFETY: the host end is fwe's own.
         unsafe { libc::close(s.peer) };
+        // Its address (one no other socket is given) goes with it.
+        if let Some(c) = s.bound.and_then(|p| std::ffi::CString::new(p).ok()) {
+            // SAFETY: a NUL-terminated path in fwe's private directory.
+            unsafe { libc::unlink(c.as_ptr()) };
+        }
     }
 }
 
@@ -438,6 +560,13 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             message(NLMSG_ERROR, flags, seq, port, &b)
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+        // The initial namespace's interfaces are the host's, which fwe does
+        // not describe.
+        let Some(net) = &net else {
+            replies.push(ack(errno::EOPNOTSUPP));
+            at += (len + 3) & !3;
+            continue;
+        };
         let up = net.get().lo_up;
         let result: Result<Vec<Vec<u8>>, i32> = match ty {
             RTM_GETLINK if flags & NLM_F_DUMP == NLM_F_DUMP => Ok(vec![

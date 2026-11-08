@@ -73,7 +73,10 @@ capabilities. *crun, podman and containerd run standard images.*
   tmpfs;
 - `splice`, `tee` and `vmsplice`; `personality`; the scheduling policies
   (`sched_setattr` and the rest); the clock refused as Linux refuses it
-  without `CAP_SYS_TIME`.
+  without `CAP_SYS_TIME`;
+- POSIX message queues per IPC namespace, with notifications across
+  processes (a signal with its value, or the C library's thread through a
+  netlink socket).
 
 ## Left to 1.0
 
@@ -96,7 +99,6 @@ run.
 
 - [ ] **Missing system calls LTP tests:**
   - `inotify` (and `fanotify` refused cleanly);
-  - POSIX message queues (`mq_open` and the rest);
   - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`).
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,

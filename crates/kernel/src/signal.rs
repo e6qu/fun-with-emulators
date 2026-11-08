@@ -130,8 +130,19 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
         // Recorded as the host pid; the guest sees its own namespace's.
         buf.put32(SI_PID_OFF, guest_pid(info.pid));
         buf.put32(SI_UID_OFF, crate::userns::to_ns(info.uid, false) as i32);
-        buf.put32(SI_STATUS_OFF, info.status);
+        if queued(info.code) {
+            // `si_value`, where a child's status is for `SIGCHLD`.
+            buf.put(SI_STATUS_OFF, info.value);
+        } else {
+            buf.put32(SI_STATUS_OFF, info.status);
+        }
     }
+}
+
+/// Whether a signal of `si_code` `code` carries a value (`si_value`):
+/// one queued with `sigqueue`, by a timer, a message queue or AIO.
+fn queued(code: i32) -> bool {
+    matches!(code, signal::SI_QUEUE | signal::SI_TIMER | signal::SI_MESGQ | signal::SI_ASYNCIO)
 }
 
 fn align_down(x: u64, a: u64) -> u64 {
@@ -197,7 +208,9 @@ pub fn restartable(nr: u64, args: &[u64; 6]) -> bool {
         | n::OPENAT
         | n::IOCTL
         | n::FLOCK
-        | n::FCNTL => true,
+        | n::FCNTL
+        | n::MQ_TIMEDSEND
+        | n::MQ_TIMEDRECEIVE => true,
         // A futex wait without a timeout.
         n::FUTEX => args[3] == 0,
         _ => false,
@@ -218,6 +231,7 @@ pub fn drain_to_signalfd() {
                 guest_pid(info.pid),
                 crate::userns::to_ns(info.uid, false),
                 info.status,
+                info.value,
             );
             crate::signalfd::deliver(sig, record);
         }
@@ -240,6 +254,7 @@ pub(crate) fn raise_sigsys(pc: u64, nr: u64, data: u16) {
         pid: pc as u32 as i32,
         uid: (pc >> 32) as u32,
         status: (i32::from(data) << 16) | (nr as i32 & 0xffff),
+        value: 0,
     };
     thread::post_self(signal::SIGSYS, info);
 }
@@ -253,7 +268,7 @@ pub(crate) fn raise_self(sig: u64) {
 fn own_info(code: i32) -> SigInfo {
     // SAFETY: plain host calls.
     let pid = unsafe { libc::getpid() };
-    SigInfo { code, pid, uid: 0, status: 0 }
+    SigInfo { code, pid, ..SigInfo::default() }
 }
 
 impl<P: Platform> Kernel<P> {
