@@ -76,6 +76,15 @@ echo "$PACKAGES" | while read -r pkg sum; do
     tar -xzf "$out/$name.apk" -C "$out/root"
 done
 find "$out/root" -maxdepth 1 -type f -name '.*' -exec rm -f {} +
+# The modules built into the kernel, as a kernel package installs the list
+# for its release (fwe's, crates/kernel/src/syscalls.rs RELEASE): modprobe
+# of one succeeds, as the key tests' module loads expect.
+modules="$out/root/lib/modules/6.12.0-fwe"
+mkdir -p "$modules"
+printf '%s\n' kernel/net/dns_resolver/dns_resolver.ko \
+    kernel/crypto/asymmetric_keys/x509_key_parser.ko \
+    kernel/crypto/asymmetric_keys/pkcs8_key_parser.ko > "$modules/modules.builtin"
+: > "$modules/modules.dep"
 
 # The cross toolchain: zig's clang with its bundled musl and Linux headers.
 cat > "$tools/cc" <<'EOF'

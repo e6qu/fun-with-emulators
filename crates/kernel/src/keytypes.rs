@@ -71,7 +71,7 @@ pub fn preparse(
             plain(data.to_vec())
         }
         "asymmetric" => crypto::asymmetric(data),
-        "encrypted" => crypto::encrypted_new(s, c, data),
+        "encrypted" => crypto::encrypted_new(s, c, desc.ok_or(errno::EINVAL)?, data),
         _ => Err(errno::ENODEV),
     }
 }
@@ -98,16 +98,19 @@ pub fn preparse_update(
             }
             Ok(data.to_vec())
         }
-        "encrypted" => crypto::encrypted_update(s, c, k, data),
+        "encrypted" => crypto::encrypted_update(s, c, s.keys.get(&k).ok_or(errno::ENOKEY)?, data),
         _ => Err(errno::EOPNOTSUPP),
     }
 }
 
-/// What reading key `k` gives (a key of a readable type, not a keyring).
-pub fn read(s: &Store, c: &Caller, k: i32) -> Result<Vec<u8>, i32> {
+/// What reading key `k` gives (a key of a readable type, not a keyring)
+/// into a buffer of `len` bytes: an encrypted key read into a shorter one
+/// than it needs gives only its length (bytes not copied), without its
+/// master key.
+pub fn read(s: &Store, c: &Caller, k: i32, len: usize) -> Result<Vec<u8>, i32> {
     let key = s.keys.get(&k).ok_or(errno::ENOKEY)?;
     match key.kind.as_str() {
-        "encrypted" => crypto::encrypted_read(s, c, key),
+        "encrypted" => crypto::encrypted_read(s, c, key, len),
         _ => Ok(key.payload.clone()),
     }
 }
@@ -142,10 +145,11 @@ pub fn describe(s: &Store, k: &Key) -> Vec<u8> {
     out
 }
 
-/// Whether asymmetric key `k` is signed by one of `signers` (keys, asymmetric
-/// or not), as a keyring restriction checks it.
-pub fn signed_by_any(s: &Store, k: &Key, signers: &[i32]) -> Result<(), i32> {
-    crypto::signed_by_any(s, k, signers)
+/// Whether asymmetric key `k` is signed by key `trusted` (or a key in
+/// keyring `trusted`), or with `dest` by a key in that keyring, as the
+/// `key_or_keyring` restriction checks it.
+pub fn signed_by(s: &Store, k: &Key, trusted: Option<&Key>, dest: Option<&Key>) -> Result<(), i32> {
+    crypto::signed_by(s, k, trusted, dest)
 }
 
 /// A `user` (or `logon`) payload: 1 to 32767 bytes.
@@ -164,36 +168,128 @@ fn logon_description(d: &[u8]) -> Result<(), i32> {
     }
 }
 
-/// The types and operations that need cryptography.
-mod crypto {
+/// The types and operations that need cryptography
+/// ([`crate::keycrypto`]).
+pub(crate) mod crypto {
     use super::*;
+    use crate::keycrypto::{self, Asym, EncryptedKey};
+    use crate::snapshot::{Dec, Enc};
 
-    pub fn asymmetric(_data: &[u8]) -> Result<Prepared, i32> {
-        Err(errno::ENODEV)
+    /// An `asymmetric` payload: a certificate or key, parsed and kept
+    /// encoded; its description the one Linux makes if none is given.
+    pub fn asymmetric(data: &[u8]) -> Result<Prepared, i32> {
+        let a = keycrypto::parse_asymmetric(data)?;
+        let desc = (!a.description.is_empty()).then(|| a.description.clone());
+        Ok(Prepared { payload: a.encode(), desc })
     }
 
-    pub fn asymmetric_describe(_k: &Key) -> Vec<u8> {
-        Vec::new()
+    /// The asymmetric key `k` holds.
+    pub fn asym(k: &Key) -> Result<Asym, i32> {
+        Asym::decode(&k.payload).ok_or(errno::EINVAL)
     }
 
-    pub fn encrypted_new(_s: &Store, _c: &Caller, _data: &[u8]) -> Result<Prepared, i32> {
-        Err(errno::ENODEV)
+    /// `/proc/keys`' words for an asymmetric key, after its description:
+    /// its kind and algorithm, and the end of its identifier.
+    pub fn asymmetric_describe(k: &Key) -> Vec<u8> {
+        let Ok(a) = asym(k) else { return Vec::new() };
+        let kind = if a.private { "PKCS8" } else { "X509" };
+        let id = &a.fingerprint[a.fingerprint.len().saturating_sub(4)..];
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        format!(": {kind}.rsa {hex} []").into_bytes()
     }
 
-    pub fn encrypted_update(
-        _s: &Store,
-        _c: &Caller,
-        _k: i32,
-        _data: &[u8],
-    ) -> Result<Vec<u8>, i32> {
-        Err(errno::EOPNOTSUPP)
+    fn encode(e: &EncryptedKey) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.bytes(&e.format);
+        enc.bytes(&e.master_desc);
+        enc.bytes(&e.datalen);
+        enc.bytes(&e.iv);
+        enc.bytes(&e.decrypted);
+        enc.into_bytes()
     }
 
-    pub fn encrypted_read(_s: &Store, _c: &Caller, _k: &Key) -> Result<Vec<u8>, i32> {
-        Err(errno::EOPNOTSUPP)
+    fn decode(b: &[u8]) -> Result<EncryptedKey, i32> {
+        let mut d = Dec::new(b);
+        let (format, master_desc, datalen) = (d.bytes(), d.bytes(), d.bytes());
+        let iv: [u8; 16] = d.bytes().try_into().map_err(|_| errno::EINVAL)?;
+        let decrypted = d.bytes();
+        d.finish().map_err(|_| errno::EINVAL)?;
+        Ok(EncryptedKey { format, master_desc, datalen, iv, decrypted })
     }
 
-    pub fn signed_by_any(_s: &Store, _k: &Key, _signers: &[i32]) -> Result<(), i32> {
-        Err(errno::ENOKEY)
+    /// The payload of the master key an encrypted key names: a `user` key
+    /// (else a `logon` key) of that whole description the caller's keyrings
+    /// reach, as Linux's `request_user_key` finds it.
+    fn master<'a>(s: &'a Store, c: &'a Caller) -> impl Fn(&[u8]) -> Option<Vec<u8>> + 'a {
+        move |desc: &[u8]| {
+            ["user", "logon"].iter().find_map(|kind| {
+                let k = s.search_process(c, kind, desc).ok()?;
+                Some(s.keys.get(&k)?.payload.clone())
+            })
+        }
+    }
+
+    pub fn encrypted_new(s: &Store, c: &Caller, desc: &[u8], data: &[u8]) -> Result<Prepared, i32> {
+        let key =
+            EncryptedKey::instantiate(desc, data, &master(s, c), &mut crate::host::fill_random)?;
+        Ok(Prepared { payload: encode(&key), desc: None })
+    }
+
+    pub fn encrypted_update(_s: &Store, _c: &Caller, k: &Key, data: &[u8]) -> Result<Vec<u8>, i32> {
+        let key = decode(&k.payload)?.update(data)?;
+        Ok(encode(&key))
+    }
+
+    pub fn encrypted_read(s: &Store, c: &Caller, k: &Key, len: usize) -> Result<Vec<u8>, i32> {
+        let key = decode(&k.payload)?;
+        if len < key.read_len() {
+            return Ok(vec![0; key.read_len()]);
+        }
+        key.read(&master(s, c))
+    }
+
+    /// The `key_or_keyring` restriction's check (Linux's
+    /// `restrict_link_by_key_or_keyring`): the signer is key `trusted`
+    /// when it is the key the certificate names, or the key keyring
+    /// `trusted` holds that it names; else, with `dest`, one in the
+    /// destination keyring. None found is `ENOKEY`.
+    pub fn signed_by(
+        s: &Store,
+        k: &Key,
+        trusted: Option<&Key>,
+        dest: Option<&Key>,
+    ) -> Result<(), i32> {
+        let subject = asym(k)?;
+        keycrypto::signature_precheck(&subject)?;
+        let in_ring = |ring: &Key| -> Option<Asym> {
+            let found = ring
+                .links
+                .iter()
+                .filter_map(|l| s.keys.get(l))
+                .filter(|o| o.kind == "asymmetric")
+                .filter_map(|o| asym(o).ok())
+                .find(|o| keycrypto::keyring_signer_matches(&subject, o))?;
+            keycrypto::keyring_signer_accepted(&subject, &found).then_some(found)
+        };
+        let mut signer = None;
+        if let Some(t) = trusted {
+            if t.kind == "keyring" {
+                signer = in_ring(t);
+            } else if t.kind == "asymmetric" {
+                let t = asym(t)?;
+                if keycrypto::keyring_signer_matches(&subject, &t) {
+                    signer = Some(t);
+                }
+            } else {
+                return Err(errno::EOPNOTSUPP);
+            }
+        }
+        if signer.is_none()
+            && let Some(d) = dest
+        {
+            signer = in_ring(d);
+        }
+        let signer = signer.ok_or(errno::ENOKEY)?;
+        keycrypto::verify_cert_signature(&subject, &signer)
     }
 }

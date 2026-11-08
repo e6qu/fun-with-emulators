@@ -29,6 +29,7 @@ pub mod futex;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
+pub mod keycrypto;
 pub mod keys;
 mod keytypes;
 pub mod loopdev;

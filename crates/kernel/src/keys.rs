@@ -688,18 +688,9 @@ impl Store {
                 if k.kind != "asymmetric" {
                     return Err(errno::EOPNOTSUPP);
                 }
-                let mut signers: Vec<i32> = Vec::new();
-                if let Some(s) = self.keys.get(signer) {
-                    if s.is_keyring() {
-                        signers.extend(&s.links);
-                    } else {
-                        signers.push(*signer);
-                    }
-                }
-                if *chain {
-                    signers.extend(&r.links);
-                }
-                crate::keytypes::signed_by_any(self, k, &signers)
+                let trusted = self.keys.get(signer);
+                let dest = chain.then_some(r);
+                crate::keytypes::signed_by(self, k, trusted, dest)
             }
         }
     }
@@ -810,7 +801,7 @@ impl Store {
 
     /// Search the caller's keyrings (thread, process, session) as
     /// `request_key` does.
-    fn search_process(&self, c: &Caller, kind: &str, desc: &[u8]) -> Result<i32, i32> {
+    pub(crate) fn search_process(&self, c: &Caller, kind: &str, desc: &[u8]) -> Result<i32, i32> {
         let mut error = errno::ENOKEY;
         for r in [self.thread_of(c), self.process_of(c), self.session_of(c)] {
             if r == 0 {
@@ -1354,7 +1345,7 @@ impl<P: Platform> Kernel<P> {
                             let list = key.links.iter().flat_map(|l| l.to_ne_bytes()).collect();
                             return Ok((list, true));
                         }
-                        crate::keytypes::read(s, &c, k).map(|d| (d, false))
+                        crate::keytypes::read(s, &c, k, a[2] as usize).map(|d| (d, false))
                     })();
                     (r, true)
                 });
@@ -1635,19 +1626,188 @@ impl<P: Platform> Kernel<P> {
         }))
     }
 
-    /// `KEYCTL_DH_COMPUTE(params, buffer, buflen, kdf)`.
-    fn dh_compute(&self, _c: &Caller, _params: u64, _buf: u64, _len: u64, _kdf: u64) -> i64 {
-        err(errno::EOPNOTSUPP)
+    /// `KEYCTL_DH_COMPUTE(params, buffer, buflen, kdf)`: the shared secret
+    /// of the private, prime and base numbers three `user` keys hold (or,
+    /// with KDF parameters, `buflen` bytes derived from it), in Linux's
+    /// order of checks.
+    fn dh_compute(&self, c: &Caller, params: u64, buf: u64, len: u64, kdf: u64) -> i64 {
+        use crate::keycrypto as kc;
+        if params == 0 || (buf == 0 && len != 0) {
+            return err(errno::EINVAL);
+        }
+        let ids: [i32; 3] = guest!(uaccess::read(params));
+        let kdf = if kdf == 0 {
+            None
+        } else {
+            let raw = guest!(uaccess::read_bytes(kdf, 52));
+            let word = |at: usize| u64::from_ne_bytes(raw[at..at + 8].try_into().unwrap());
+            let oi_len = u32::from_ne_bytes(raw[16..20].try_into().unwrap()) as usize;
+            if raw[20..52].iter().any(|&b| b != 0) {
+                return err(errno::EINVAL);
+            }
+            if len as usize > kc::KDF_MAX_OUTPUT_LEN || oi_len > kc::KDF_MAX_OI_LEN {
+                return err(errno::EMSGSIZE);
+            }
+            let hash = guest!(uaccess::read_cstr(word(0), 128));
+            let hash = String::from_utf8_lossy(&hash).into_owned();
+            if kc::hash_size(&hash).is_none() {
+                return err(errno::ENOENT);
+            }
+            let other =
+                if oi_len > 0 { guest!(uaccess::read_bytes(word(8), oi_len)) } else { Vec::new() };
+            Some((hash, other))
+        };
+        let numbers = with(|s| {
+            let r = (|| {
+                let mut out = Vec::new();
+                // The prime, the private key, then the base, as Linux reads
+                // them.
+                for id in [ids[1], ids[0], ids[2]] {
+                    let (k, _) = s.lookup(c, id, Look::Plain, KEY_READ)?;
+                    let key = &s.keys[&k];
+                    if let Some(e) = key.invalid(now()) {
+                        return Err(e);
+                    }
+                    if key.kind != "user" {
+                        return Err(errno::EOPNOTSUPP);
+                    }
+                    out.push(key.payload.clone());
+                }
+                Ok(out)
+            })();
+            (r, false)
+        });
+        let n = match numbers {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) | Err(e) => return err(e),
+        };
+        let (prime, private, base) = (&n[0], &n[1], &n[2]);
+        let size = match kc::dh_secret_len(base, private, prime) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
+        let out = match &kdf {
+            None => {
+                if len == 0 {
+                    return size as i64;
+                }
+                if (len as usize) < size {
+                    return err(errno::EOVERFLOW);
+                }
+                match kc::dh_compute(base, private, prime) {
+                    Ok(o) => o,
+                    Err(e) => return err(e),
+                }
+            }
+            Some((hash, other)) => {
+                let secret = match kc::dh_compute(base, private, prime) {
+                    Ok(o) => o,
+                    Err(e) => return err(e),
+                };
+                match kc::dh_kdf(hash, &secret, other, len as usize) {
+                    Some(o) => o,
+                    None => return err(errno::ENOENT),
+                }
+            }
+        };
+        if !out.is_empty() {
+            guest!(uaccess::write_from(buf, &out));
+        }
+        out.len() as i64
     }
 
-    /// `KEYCTL_PKEY_QUERY(key, reserved, info, query)`.
-    fn pkey_query(&self, _c: &Caller, _a: [u64; 4]) -> i64 {
-        err(errno::EOPNOTSUPP)
+    /// The asymmetric key `id` names, for a public-key operation: the info
+    /// string read, the key searchable by the caller and asymmetric.
+    fn pkey_key(
+        &self,
+        c: &Caller,
+        id: i32,
+        info: u64,
+    ) -> Result<(crate::keycrypto::Asym, String), i32> {
+        let info = uaccess::read_cstr(info, 4096)?;
+        let info = String::from_utf8_lossy(&info).into_owned();
+        let r = with(|s| {
+            let r = (|| {
+                let (k, _) = s.lookup(c, id, Look::Plain, KEY_SEARCH)?;
+                let key = &s.keys[&k];
+                if let Some(e) = key.invalid(now()) {
+                    return Err(e);
+                }
+                if key.kind != "asymmetric" {
+                    return Err(errno::EOPNOTSUPP);
+                }
+                crate::keytypes::crypto::asym(key)
+            })();
+            (r, false)
+        });
+        match r {
+            Ok(Ok(a)) => Ok((a, info)),
+            Ok(Err(e)) | Err(e) => Err(e),
+        }
     }
 
-    /// `KEYCTL_PKEY_ENCRYPT`, `DECRYPT`, `SIGN` and `VERIFY`.
-    fn pkey_op(&self, _c: &Caller, _op: u64, _a: [u64; 4]) -> i64 {
-        err(errno::EOPNOTSUPP)
+    /// `KEYCTL_PKEY_QUERY(key, reserved, info, query)`: what the key can do
+    /// and its sizes, as `struct keyctl_pkey_query`.
+    fn pkey_query(&self, c: &Caller, a: [u64; 4]) -> i64 {
+        if a[1] != 0 {
+            return err(errno::EINVAL);
+        }
+        let (key, info) = match self.pkey_key(c, a[0] as i32, a[2]) {
+            Ok(k) => k,
+            Err(e) => return err(e),
+        };
+        let q = match crate::keycrypto::pkey_query(&key, &info) {
+            Ok(q) => q,
+            Err(e) => return err(e),
+        };
+        let mut out = [0u8; 56];
+        out[0..4].copy_from_slice(&q.supported_ops.to_ne_bytes());
+        out[4..8].copy_from_slice(&q.key_size.to_ne_bytes());
+        out[8..10].copy_from_slice(&q.max_data_size.to_ne_bytes());
+        out[10..12].copy_from_slice(&q.max_sig_size.to_ne_bytes());
+        out[12..14].copy_from_slice(&q.max_enc_size.to_ne_bytes());
+        out[14..16].copy_from_slice(&q.max_dec_size.to_ne_bytes());
+        guest!(uaccess::write_from(a[3], &out));
+        0
+    }
+
+    /// `KEYCTL_PKEY_ENCRYPT`, `DECRYPT`, `SIGN` (`params, info, in, out`)
+    /// and `VERIFY` (`params, info, data, signature`), with
+    /// `struct keyctl_pkey_params` giving the key and the lengths.
+    fn pkey_op(&self, c: &Caller, op: u64, a: [u64; 4]) -> i64 {
+        use crate::keycrypto as kc;
+        let raw = guest!(uaccess::read_bytes(a[0], 40));
+        let word = |at: usize| u32::from_ne_bytes(raw[at..at + 4].try_into().unwrap());
+        if raw[12..40].iter().any(|&b| b != 0) {
+            return err(errno::EINVAL);
+        }
+        let (id, in_len, out_len) = (word(0) as i32, word(4) as usize, word(8) as usize);
+        let (key, info) = match self.pkey_key(c, id, a[1]) {
+            Ok(k) => k,
+            Err(e) => return err(e),
+        };
+        let input = guest!(uaccess::read_bytes(a[2], in_len));
+        if op == KEYCTL_PKEY_VERIFY {
+            let sig = guest!(uaccess::read_bytes(a[3], out_len));
+            return match kc::pkey_verify(&key, &info, &input, &sig) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            };
+        }
+        let r = match op {
+            KEYCTL_PKEY_ENCRYPT => {
+                kc::pkey_encrypt(&key, &info, &input, out_len, &mut crate::host::fill_random)
+            }
+            KEYCTL_PKEY_DECRYPT => kc::pkey_decrypt(&key, &info, &input, out_len),
+            _ => kc::pkey_sign(&key, &info, &input, out_len),
+        };
+        match r {
+            Ok(out) => {
+                guest!(uaccess::write_from(a[3], &out));
+                out.len() as i64
+            }
+            Err(e) => err(e),
+        }
     }
 
     /// `KEYCTL_RESTRICT_KEYRING(keyring, type, restriction)`.
