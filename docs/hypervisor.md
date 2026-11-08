@@ -74,13 +74,16 @@ flowchart TD
     esr -- "SVC64" --> sys["kernel crate system call"]
     esr -- "BRK64" --> trap["SIGTRAP"]
     esr -- "PC / SP alignment" --> bus["SIGBUS"]
-    esr -- "data / instruction abort" --> abort{"vfork page not fetched? stale TLB permission?"}
-    abort -- yes --> retry["fetch the page / flush, retry"]
+    esr -- "data / instruction abort" --> abort{"page not mapped yet (vfork fetch, break-before-make)? stale TLB permission?"}
+    abort -- yes --> retry["fetch or map the page / flush, retry"]
     abort -- no --> segv["SIGSEGV"]
     esr -- "BTI, unknown, other" --> ill["SIGILL"]
     why -- "exception: stage-2 abort" --> segv
     why -- "exception: wfi / wfe" --> next["step past it"]
-    why -- "exception: trapped CNTPCT_EL0 read" --> cnt["emulate from the virtual counter"]
+    why -- "exception: trapped system register" --> sr{"CNTPCT_EL0 read?"}
+    sr -- yes --> cnt["emulate from the virtual counter"]
+    sr -- no --> ill
+    why -- "anything else" --> fatal["fwe's fatal error, VM torn down"]
     why -- "canceled (hv_vcpus_exit)" --> sig["deliver pending signals"]
     why -- "virtual timer" --> run
     sys --> deliver["deliver any deliverable signal"]
@@ -131,10 +134,11 @@ and keeps these rules:
   `HV_BUSY`), so it would die with a VM it inherited.
   `fwe_kernel::fork_locked` refuses outright once a VM exists; a fork child
   that fails to set up tears down any VM it made before it exits.
-- **The VM lets go of memory before the host changes it.** `munmap`, a
-  shrinking `mremap`, a `MAP_FIXED` mapping over existing memory and
-  `MADV_DONTNEED` remove the range from the VM before the host frees or
-  replaces the memory, and map it again afterwards where needed.
+- **Host memory behind the VM is never replaced.** Private memory stays
+  in the slab: `munmap`, `mremap`, a `MAP_FIXED` mapping over existing
+  memory and `MADV_DONTNEED` edit stage 1 and zero slab memory, which is
+  reused only after a TLB flush. A shared segment leaves the VM before its
+  host mapping goes.
 - **A vCPU is never destroyed under a call on it.** At the end each thread
   destroys its own vCPU, from the wake signal's handler if it is blocked
   elsewhere, but not in the middle of a framework call on it (it does so as
@@ -144,8 +148,8 @@ and keeps these rules:
   the parent's and the child's VM processes alive together, as any forking
   program does; each ends through teardown. Each VM test's processes form a
   process group: a timeout sends it `SIGTERM` (caught, so every VM is torn
-  down), `SIGKILL` only to a group still alive 5 s later, and a process
-  outliving its test fails it.
+  down), `SIGKILL` only to a test's first process still alive 5 s later,
+  and a process outliving its test gets `SIGTERM` and fails the test.
 - **Never alongside another hypervisor client.** The VM tests skip while
   one runs (`krunkit`, `vfkit`, QEMU, Virtualization.framework VMs); for
   Podman, `podman machine stop` first. The same goes for running a VM
@@ -237,11 +241,12 @@ system log, so fwe keeps the evidence itself:
 - **The flight recorder** (`--hv-record DEST` or `FWE_HV_RECORD=DEST`;
   `crates/native/src/hv/record.rs`) writes a line before and after every
   framework call that changes a VM (`hv_vm_create`, `hv_vm_map`,
-  `hv_vm_unmap`, `hv_vcpu_create`, `hv_vcpus_exit`, `hv_vcpu_destroy`,
-  `hv_vm_destroy`) with its arguments and result, each process's start,
-  `execve`, fork children and end, and a heartbeat with the count of
-  `hv_vcpu_run` calls every half second. Each line is written
-  synchronously: to `file:PATH` with `F_FULLFSYNC`, and/or to
+  `hv_vm_unmap`, `hv_vcpu_create`, `hv_vcpu_destroy`, `hv_vm_destroy`)
+  with its arguments and result, each process's start, `execve`, fork
+  children and end, and a heartbeat with the count of `hv_vcpu_run` calls
+  every half second. Each line is written synchronously: to `file:PATH`
+  with `F_FULLFSYNC` (a vCPU's destruction and a fatal error are synced
+  by the VM's destruction that follows), and/or to
   `udp:HOST:PORT` as a datagram, which a reset cannot take back
   (`tools/hv-record-listen.py PORT` collects them). The setting reaches
   every fwe a guest starts. A call begun and never ended names what was
