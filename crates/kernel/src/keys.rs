@@ -342,8 +342,30 @@ impl Look {
 }
 
 impl Store {
-    fn holder(&self, c: &Caller) -> Option<&Holder> {
-        self.holders.iter().find(|h| h.pid == c.pid && h.start == c.start)
+    /// What `c` holds. A fork child that has not used its keyrings yet,
+    /// before its parent has written what it holds, holds what the parent
+    /// did as it forked ([`INHERIT`]), as [`Store::holder_mut`] would make
+    /// it.
+    fn holder(&self, c: &Caller) -> Option<std::borrow::Cow<'_, Holder>> {
+        if let Some(h) = self.holders.iter().find(|h| h.pid == c.pid && h.start == c.start) {
+            return Some(std::borrow::Cow::Borrowed(h));
+        }
+        // SAFETY: getpid cannot fail.
+        if c.pid != unsafe { libc::getpid() } {
+            return None;
+        }
+        match *INHERIT.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((parent, session, reqkey)) if parent != c.pid => {
+                Some(std::borrow::Cow::Owned(Holder {
+                    pid: c.pid,
+                    start: c.start,
+                    session,
+                    reqkey,
+                    ..Holder::default()
+                }))
+            }
+            _ => None,
+        }
     }
 
     fn holder_mut(&mut self, c: &Caller) -> &mut Holder {
@@ -506,8 +528,8 @@ impl Store {
 
     fn thread_of(&self, c: &Caller) -> i32 {
         self.holder(c)
-            .and_then(|h| h.threads.iter().find(|(t, _)| *t == c.tid))
-            .map_or(0, |(_, r)| *r)
+            .and_then(|h| h.threads.iter().find(|(t, _)| *t == c.tid).map(|&(_, r)| r))
+            .unwrap_or(0)
             .max(0)
     }
 
