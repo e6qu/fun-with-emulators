@@ -1,22 +1,45 @@
 # The hypervisor backend
 
-The backend for **non-PIE `ET_EXEC` executables linked below 4 GiB**
-(Debian's `python3.11`, GCC and clang at `0x400000`, static Go at
-`0x10000`), which the native backend cannot map: macOS gives every arm64
-process a mandatory 4 GiB `__PAGEZERO`, Apple's loader refuses a smaller one
-on Apple Silicon, and a non-PIE image has no relocations to move it.
+## Summary
 
-A Hypervisor.framework VM gives the guest an address space of its own. The
-framework needs the `com.apple.security.hypervisor` entitlement (an ad-hoc
-signature carrying it is enough) but no root. fwe picks this backend
-automatically for such an executable. The VM runs the guest's CPU and
-memory only: system calls go to the same kernel crate as the native
-backend's. How its memory, fork and execve compare with Linux and the native
-backend is in [linux-on-macos.md](linux-on-macos.md).
+Most Linux programs run in fwe's native backend, inside the fwe process.
+One kind cannot: a non-position-independent executable linked below
+4 GiB, such as Debian's `python3.11`, GCC and clang at `0x400000` or
+static Go programs at `0x10000`. macOS reserves the low 4 GiB of every
+arm64 process (`__PAGEZERO`, which Apple's loader will not let a program
+shrink on Apple Silicon), and such a program has no relocations that would
+let it run anywhere else. fwe runs these programs in a small virtual
+machine made with Hypervisor.framework, where the guest has an address
+space of its own, and picks this backend automatically.
+
+The VM runs only the guest's CPU and memory. It has no Linux kernel in it:
+every system call leaves the VM and goes to the same kernel crate the
+native backend uses. How the VM is used — the vCPUs, fwe's exception
+vector, the two stages of address translation, system calls, timers and
+signals — is explained for a reader new to it in
+[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used), and
+how its memory, fork and execve compare with Linux and the native backend
+in the same document's [Memory](linux-on-macos.md#memory) and
+[Processes](linux-on-macos.md#processes) sections. This document holds
+what is particular to the backend:
+
+- the rules its implementation keeps ([How it works](#how-it-works));
+- why misusing the framework is dangerous and the rules that prevent it
+  ([Never end a VM process abnormally](#never-end-a-vm-process-abnormally));
+- how it is tested without a real VM (the [stand-in](#the-stand-in)) and
+  with one ([real-hardware runs](#real-hardware-runs-and-the-flight-recorder));
+- how to [run it](#running-it-apple-silicon-no-root) and how
+  [CI](#tests-and-ci) is arranged.
+
+The framework needs the `com.apple.security.hypervisor` entitlement (an
+ad-hoc signature carrying it is enough) but no root.
 
 ## How it works
 
-The code is in `crates/native/src/hv/`.
+The code is in `crates/native/src/hv/`. The backend's design follows from
+one requirement: the framework must never see host memory change behind
+the VM, and a VM must never outlive its process. So the VM's memory is
+mapped once and then only the guest's own page tables change.
 
 - **The VM** (`vm.rs`): stage 2 is set up once, when the VM is made, and
   does not change while it runs — the slab (`window.rs`, all private guest
@@ -48,12 +71,12 @@ The code is in `crates/native/src/hv/`.
 - **Pointer authentication and BTI**, where the vCPUs' ID registers offer
   them (see [linux-on-macos.md](linux-on-macos.md#cache-maintenance-pac-and-bti)).
 - **Signals:** dispositions are passed to the host as in the native
-  backend (see
-  [linux-on-macos.md](linux-on-macos.md#host-signals)), and each vCPU
-  thread runs under the host mask the guest's mask calls for. The handler records the signal and stops the vCPU
-  (`hv_vcpus_exit`), and the run loop delivers it, so a signal reaches a
-  guest spinning without system calls. The framework's own threads are
-  created with every guest signal blocked.
+  backend (see [linux-on-macos.md](linux-on-macos.md#host-signals)), and
+  each vCPU thread runs under the host mask the guest's mask calls for.
+  The handler records the signal and stops the vCPU (`hv_vcpus_exit`), and
+  the run loop delivers it, so a signal reaches a guest spinning without
+  system calls. The framework's own threads are created with every guest
+  signal blocked.
 - **Threads:** each guest thread is a host thread with a vCPU of its own,
   created on it; all vCPUs share the VM.
 - **`execve`** always re-executes fwe, which picks the backend the new
@@ -64,9 +87,13 @@ The code is in `crates/native/src/hv/`.
 
 ### The run loop
 
-Every exception the guest takes at EL0 enters fwe's vector, which runs
-`hvc #2` (not `hvc #0`, which the framework may take for a firmware call),
-so the vCPU exits and the backend reads `ESR_EL1`:
+Each vCPU thread spends its life in one loop: run the vCPU until it exits,
+find out why, act, and run it again. Every exception the guest takes at
+EL0 enters fwe's vector, which runs `hvc #2` (not `hvc #0`, which the
+framework may take for a firmware call), so the vCPU exits and the backend
+reads `ESR_EL1` to learn what the guest did. A few things exit the vCPU
+directly instead, and a signal for the guest exits it as *canceled*. The
+diagram is the whole decision:
 
 ```mermaid
 flowchart TD
@@ -169,12 +196,14 @@ remain are in [architecture.md](architecture.md#known-limitations).
 
 ## The stand-in
 
-`fwe --hv-standin` runs the backend on a software stand-in for
-Hypervisor.framework (`crates/native/src/hv/standin.rs`): every framework
-call goes to an emulated CPU, Unicorn (QEMU's CPU emulator as a library,
-`brew install unicorn`), loaded only in this mode. It creates no VM, so it
-is safe on any Mac and runs in hosted CI; the flag is passed on to every fwe
-a guest's `execve`, `fork` or `vfork` starts.
+The real framework cannot be used in hosted CI, and should not be used on
+a development Mac. So the backend can run on a software imitation of the
+framework instead: `fwe --hv-standin` sends every framework call
+(`crates/native/src/hv/standin.rs`) to an emulated CPU, Unicorn (QEMU's
+CPU emulator as a library, `brew install unicorn`), loaded only in this
+mode. It creates no VM, so it is safe on any Mac and runs in hosted CI; the
+flag is passed on to every fwe a guest's `execve`, `fork` or `vfork`
+starts.
 
 What it models:
 - one VM per process and one vCPU per thread;
@@ -199,8 +228,9 @@ Silicon), and Unicorn runs hooks inside its own memory calls, so no lock a
 hook takes is held across them. Emulation is several times slower than the
 CPU, so the tests give stand-in guests a longer time limit.
 
-It checks the rules the backend must keep, printing a line with
-`fwe hv stand-in: VIOLATION:` on which the tests fail:
+Besides running the guest, the stand-in checks the rules the backend must
+keep, printing a line with `fwe hv stand-in: VIOLATION:` on which the
+tests fail:
 - a vCPU used from a thread other than its own, a VM destroyed with vCPUs
   alive, a vCPU run before its translation regime is set (40 bits, 4 KiB
   granule) or at EL1 anywhere but the TLB stub;
@@ -263,6 +293,9 @@ system log, so fwe keeps the evidence itself:
 
 ## Running it (Apple Silicon, no root)
 
+On a machine meant for it (see the rules above), build fwe, sign it with
+the entitlement, and run a low-linked program as any other:
+
 ```sh
 cargo build --release -p fwe
 codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
@@ -276,6 +309,9 @@ target/release/fwe ./program-linked-low
   works: it prints `hv: hello from the guest` and reports exit status 42.
 
 ## Tests and CI
+
+The backend's end-to-end tests run on the stand-in unless asked for the
+real framework:
 
 - The end-to-end tests named `hv_*` run low-linked programs in the VM
   backend, by default on the stand-in with the unsigned `fwe`, which could
