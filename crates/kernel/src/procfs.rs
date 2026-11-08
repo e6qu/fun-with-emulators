@@ -104,6 +104,27 @@ CONFIG_NET=y
 CONFIG_UNIX=y
 CONFIG_INET=y
 CONFIG_IPV6=y
+CONFIG_KEYS=y
+CONFIG_PERSISTENT_KEYRINGS=y
+CONFIG_BIG_KEYS=y
+CONFIG_ENCRYPTED_KEYS=y
+CONFIG_USER_DECRYPTED_DATA=y
+CONFIG_KEY_DH_OPERATIONS=y
+CONFIG_DNS_RESOLVER=y
+CONFIG_ASYMMETRIC_KEY_TYPE=y
+CONFIG_ASYMMETRIC_PUBLIC_KEY_SUBTYPE=y
+CONFIG_X509_CERTIFICATE_PARSER=y
+CONFIG_PKCS8_PRIVATE_KEY_PARSER=y
+CONFIG_SYSTEM_TRUSTED_KEYRING=y
+CONFIG_SECONDARY_TRUSTED_KEYRING=y
+CONFIG_CRYPTO_DH=y
+CONFIG_CRYPTO_RSA=y
+CONFIG_CRYPTO_SHA1=y
+CONFIG_CRYPTO_SHA256=y
+CONFIG_CRYPTO_SHA512=y
+CONFIG_CRYPTO_AES=y
+CONFIG_CRYPTO_CBC=y
+CONFIG_CRYPTO_HMAC=y
 ";
 
 /// [`CONFIG`], gzipped as `/proc/config.gz` is (in stored blocks: the
@@ -163,6 +184,8 @@ const DIRS: &[DirDef] = &[
             (b"config.gz", DT_REG),
             (b"sysvipc", DT_DIR),
             (b"partitions", DT_REG),
+            (b"keys", DT_REG),
+            (b"key-users", DT_REG),
         ],
     ),
     (
@@ -303,6 +326,10 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
                 .to_vec(),
         ),
         b"/proc/meminfo" => Entry::File(meminfo()),
+        // The keys the reader may view, which the open gives
+        // ([`crate::keys::proc_keys`]); each user's keys and quotas.
+        b"/proc/keys" => Entry::File(Vec::new()),
+        b"/proc/key-users" => Entry::File(crate::keys::proc_key_users()),
         b"/proc/stat" => Entry::File(stat(info.ncpu)),
         b"/proc/uptime" => Entry::File(format!("{:.2} 0.00\n", crate::host::uptime()).into_bytes()),
         b"/proc/loadavg" => {

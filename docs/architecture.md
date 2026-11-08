@@ -849,6 +849,33 @@ an identical one is merged with it, as Linux merges them. `IN_ONESHOT`,
 enforced, and `/proc/<pid>/fdinfo` lists an instance's watches. `vm.drop_caches` takes the values Linux takes, and drops
 nothing (the host keeps its caches).
 
+## Keys and keyrings
+
+`add_key`, `request_key` and `keyctl` (`crates/kernel/src/keys.rs`) keep
+every key in one record every fwe process shares: each key's type,
+description, owner, permissions, state (negative, revoked, invalidated),
+expiry and payload, and each keyring's links and restriction, with the
+keyrings each process holds (thread, process and session, by host pid and
+start time) and each user's (user, user-session and persistent). A call
+works on the record under its lock. A fork child holds its parent's session
+keyring; `execve` drops the thread and process keyrings. A key nothing
+reaches (no keyring links it, no live process or user holds it) goes, as
+do invalidated keys, and revoked or expired ones after
+`kernel.keys.gc_delay` seconds. Possession (a key the caller's keyrings
+reach through keyrings it may search) adds a key's possessor permissions;
+quotas are each user's keys and bytes (each key's description and what
+its type charges, each keyring link four bytes) against
+`kernel.keys.maxkeys` and `maxbytes` (`root_*` for root). The types (`crates/kernel/src/keytypes.rs`)
+are `keyring`, `user`, `logon`, `big_key`, `dns_resolver`, `asymmetric`
+(X.509 certificates and PKCS#8 RSA keys) and `encrypted`, with Linux's
+payload rules; `KEYCTL_DH_COMPUTE`, the public-key operations and keyring
+restrictions by signature use fwe's own cryptography
+(`crates/kernel/src/keycrypto.rs`). `request_key` finds a key in the
+caller's keyrings or, given callout information, constructs one: there is
+no `/sbin/request-key` upcall, so the key is negated for a minute, as Linux
+leaves a key whose helper failed. `/proc/keys` and `/proc/key-users` list
+the keys the reader may view and each user's quota.
+
 ## Sockets
 
 Socket calls (`crates/kernel/src/net.rs`) pass through on Linux. macOS has
@@ -1424,6 +1451,12 @@ of these are to be lifted for 1.0 and which are not planned.
   namespace, not in every namespace; a registration goes when its process
   closes a descriptor of the queue with `close` or `execve`, not when
   `dup2` or `close_range` replaces or closes one.
+- **Keys:** `request_key` runs no `/sbin/request-key` helper even when the
+  root has one, so a key it would construct is negative and
+  `KEYCTL_INSTANTIATE`, `NEGATE`, `REJECT` and `ASSUME_AUTHORITY` have no
+  authorisation key to act under; asymmetric keys are RSA only (an ECDSA
+  or other certificate is refused with `ENOPKG`), and a certificate signed
+  with SHA-3 or Streebog has no signature a restriction can check.
 - **Not implemented:**
   - `ptrace`;
   - `fanotify`;

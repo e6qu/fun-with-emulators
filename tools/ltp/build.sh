@@ -21,6 +21,16 @@ URL="https://github.com/linux-test-project/ltp/releases/download/$VERSION/ltp-fu
 ROOTFS=alpine-minirootfs-3.20.10-aarch64.tar.gz
 ROOTFS_SHA256=61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
 ROOTFS_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/$ROOTFS"
+# Packages the tests need beyond the minirootfs (repository/name and the
+# package's SHA-256): shadow's useradd, userdel and groupdel (add_key05),
+# with the libraries they load.
+APK_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20"
+PACKAGES="main/skalibs-2.14.1.1-r0 589979c5251411ea880ffcb9e854426afacf820b6b37d8647ed449b6c220d3e0
+main/utmps-libs-0.1.2.2-r1 18860f30d392b1cf9120693dd7a0d85ad050169f5ff0175283de40e6863925fa
+main/linux-pam-1.6.0-r0 81bc03286b21c1e4c6d25daf7c97074e6d8e4a414a46923cac1604b833ef79eb
+main/libmd-1.1.0-r0 48ef621c994f1ed7a56b6ecac6534a0dff889e067384e5863a742adf73b3b2c2
+main/libbsd-0.12.2-r0 5685d7302b4bbb5665e6ad3e59c61e4cfa69bd2c78911f4fae5d2439b0088eba
+community/shadow-4.15.1-r0 a9038a48ca02a2f9d86656a31629c1b4092c43e8e07eda8aebe15851125c67bd"
 # The compiler the build is pinned to (CI fetches it; see ci.yml).
 ZIG_VERSION=0.17.0
 # Not built: musl lacks fmtmsg's addseverity. timer_create's tests name
@@ -57,6 +67,24 @@ rm -rf "${src:?}" "${out:?}/root" "${tools:?}"
 mkdir -p "$src" "$tools" "$out/root"
 tar -xJf "$tarball" -C "$src" --strip-components=1
 tar -xzf "$out/$ROOTFS" -C "$out/root"
+# The packages, unpacked into the root as apk installs them (an .apk is
+# gzipped tar segments: signature, metadata, files); the metadata files
+# go.
+echo "$PACKAGES" | while read -r pkg sum; do
+    name=${pkg#*/}
+    fetch "$APK_URL/${pkg%%/*}/aarch64/$name.apk" "$sum" "$out/$name.apk"
+    tar -xzf "$out/$name.apk" -C "$out/root"
+done
+find "$out/root" -maxdepth 1 -type f -name '.*' -exec rm -f {} +
+# The modules built into the kernel, as a kernel package installs the list
+# for its release (fwe's, crates/kernel/src/syscalls.rs RELEASE): modprobe
+# of one succeeds, as the key tests' module loads expect.
+modules="$out/root/lib/modules/6.12.0-fwe"
+mkdir -p "$modules"
+printf '%s\n' kernel/net/dns_resolver/dns_resolver.ko \
+    kernel/crypto/asymmetric_keys/x509_key_parser.ko \
+    kernel/crypto/asymmetric_keys/pkcs8_key_parser.ko > "$modules/modules.builtin"
+: > "$modules/modules.dep"
 
 # The cross toolchain: zig's clang with its bundled musl and Linux headers.
 cat > "$tools/cc" <<'EOF'
