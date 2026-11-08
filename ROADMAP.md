@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 651 of 1534 (57% of the 1139 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 706 of 1534 (66% of the 1064 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -67,7 +67,10 @@ capabilities. *crun, podman and containerd run standard images.*
 - System V IPC per IPC namespace;
 - `/proc/<pid>/maps` and `smaps` with `PROCMAP_QUERY`;
 - the `mlock` family with locked-memory accounting;
-- `mincore` and `fadvise64`.
+- `mincore` and `fadvise64`;
+- loop devices (`/dev/loop-control`, `/dev/loopN`, the `LOOP_*` and
+  `BLK*` requests, `/sys/block`), on which LTP's device tests run with
+  tmpfs.
 
 ## Left to 1.0
 
@@ -88,10 +91,6 @@ hardware.
 In order of what each item unblocks. The LTP counts are from the latest
 run.
 
-- [ ] **Loop devices** (`/dev/loop-control`, `/dev/loopN`, `LOOP_*`
-  ioctls) backed by files, and mounting a tmpfs on one. 156 LTP tests break
-  only because they cannot acquire a device; with one, LTP runs each of
-  them on the filesystems fwe offers.
 - [ ] **Missing system calls LTP tests:**
   - `inotify` (and `fanotify` refused cleanly);
   - `splice`, `tee`, `vmsplice`;

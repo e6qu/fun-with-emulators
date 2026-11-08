@@ -355,7 +355,8 @@ reports that mount's type and flags, `/proc/self/fd` its path, and a
 even after the mount is detached or the path removed. The record follows
 the descriptor through `dup`, `close`, `fork` and `execve`, and one whose
 descriptor no longer names the same file is never trusted. Writes on a
-read-only mount fail with `EROFS`, a rename or link across mounts with
+read-only mount fail with `EROFS` (a device, FIFO or socket there still
+opens for writing, as on Linux), a rename or link across mounts with
 `EXDEV`, and the removal of a mount's root with `EBUSY`. `sendfile` and
 `copy_file_range` copy between descriptors.
 
@@ -409,8 +410,10 @@ uid_map,gid_map,setgroups,maps,smaps}`, `/proc/self/fd`, `/proc/self/ns`,
 version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,overflowuid,
 overflowgid,threads-max,tainted}`, `/proc/sys/fs/{nr_open,file-max,pipe-max-size,
 lease-break-time}`, `/proc/cmdline`,
-`/proc/sys/vm/{overcommit_memory,mmap_min_addr}`, `/sys/fs/cgroup` (a
-mount point) and `/sys/devices/system/cpu/{online,possible}`.
+`/proc/sys/vm/{overcommit_memory,mmap_min_addr}`, `/proc/partitions`,
+`/sys/fs/cgroup` (a mount point), `/sys/devices/system/cpu/{online,possible}`
+and the loop devices' `/sys/block`, `/sys/dev/block` and
+`/sys/devices/virtual/block` entries.
 `/proc/self/auxv` is the auxiliary vector the program started with, and
 `/proc/stat` the host's CPU times and boot time. `/proc/config.gz` is the
 kernel configuration fwe presents: the options of what it implements, so
@@ -442,8 +445,9 @@ duplicates the descriptor. An unknown path under `/proc` or `/sys` is
 `/dev` is the rootfs's, except for what Linux always mounts there: `null`,
 `zero`, `random`, `urandom` and `tty` resolve to the host's own nodes
 (`crates/kernel/src/fs.rs`; a rootfs unpacked without privileges has no
-device nodes), and `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`
-are links into `/proc/self/fd`. `/dev/shm`, the tmpfs Linux mounts there
+device nodes), `full`, `loop-control` and `loopN` to fwe's own (see
+Capabilities, seccomp and devices), and `/dev/fd`, `/dev/stdin`,
+`/dev/stdout` and `/dev/stderr` are links into `/proc/self/fd`. `/dev/shm`, the tmpfs Linux mounts there
 for POSIX shared memory and semaphores (`shm_open`, `sem_open`, Python's
 `multiprocessing` locks), is a directory of fwe's for each rootfs, shared
 by every fwe process running on that root and private to the user:
@@ -901,7 +905,7 @@ do is decided by its capabilities (see Containers).
 ### Shared state
 
 What Linux keeps in one kernel for every process — namespaces, mount
-tables, the cgroup tree — has to be seen by every fwe process, so it lives
+tables, the cgroup tree, the loop devices — has to be seen by every fwe process, so it lives
 in fwe's private directory on the host (`crates/kernel/src/shared.rs`): a
 directory per record, its data replaced whole by each change under a lock,
 and a generation count each process maps, so that it rereads the data only
@@ -1039,6 +1043,20 @@ marks (`crates/kernel/src/devnodes.rs`): `stat` reports the device, and
 opening it opens the host device its numbers name. `/dev/full`, which the
 host lacks, is fwe's own node.
 
+Loop devices (`crates/kernel/src/loopdev.rs`) are fwe's own block devices
+7:N, with `/dev/loop-control` (10:237) to find, add and remove them; there
+are eight at first. Which exist, and the file each is attached to, are a
+shared record every process sees, as Linux's are the kernel's. An open
+device is its node's descriptor, marked, whose position the host keeps;
+fwe carries out its reads and writes (from the attached file's offset,
+within its size limit, in whole sectors), seeks, syncs, `fallocate`,
+mappings (of the attached file) and requests (`LOOP_*` and the `BLK*`
+requests of a block device) on the attached file, which it opens by path
+for each. `/sys/block/loopN` shows each device and its attachment. A
+device `LOOP_CTL_GET_FREE` names is not named to another process for a few
+seconds unless it is attached first, so programs run side by side that
+each take a free device get different ones.
+
 ## Translation
 
 Linux numbers (errno, flags, clock ids, signals, rlimits, ioctls) are
@@ -1105,7 +1123,9 @@ of these are to be lifted for 1.0 and which are not planned.
   process holds, and gives the file a new inode number. A memfd reopened
   through `/proc/self/fd` shares the original's offset. An `O_PATH`
   descriptor of a file fwe could open reads and writes as an ordinary one
-  would (Linux refuses both with `EBADF`).
+  would (Linux refuses both with `EBADF`), and an `O_PATH | O_NOFOLLOW`
+  open of a link in `/proc` or `/sys` fails with `ELOOP` (Linux gives a
+  descriptor of the link).
 - **Descriptors:** what fwe keeps of an open file for `fcntl` (an owner
   thread, `F_SETSIG`'s signal, a lease) is kept per descriptor, so a
   duplicate's changes do not show in the original as they would on Linux;
@@ -1129,14 +1149,22 @@ of these are to be lifted for 1.0 and which are not planned.
   to the kernel within a system call that translated a pointer into that
   range.
 - **Filesystem:** of `/dev`, only `null`, `zero`, `full`, `random`,
-  `urandom`, `tty` and the `/proc/self/fd` links are provided, and a node
-  `mknod` makes opens a host device only for those numbers (`ENXIO`
-  otherwise); a node lists as a regular file in `getdents64`. File owners other
+  `urandom`, `tty`, the loop devices and the `/proc/self/fd` links are
+  provided, and a node `mknod` makes opens a device only for those numbers
+  (`ENXIO` otherwise); a node lists as a regular file in `getdents64`, and
+  `/dev`'s listing does not show fwe's. A loop device's attached file must stay at
+  its path while attached (fwe reaches it by path; Linux holds it open);
+  `LOOP_CLR_FD` detaches at once even while another process has the device
+  open, `LO_FLAGS_AUTOCLEAR` detaches nothing on the last close, and the
+  device can be mapped only where its start in the file falls on a page. File owners other
   than fwe's own user read as 65534, and a `chown` does not show in a
   later `stat`. A caller without the capabilities is held only to the
   owner's bits of a kept mode, and a directory's search bit is not
   enforced for it.
-- **Mounts:** mounts do not propagate between namespaces, whatever their
+- **Mounts:** the filesystems mounted are tmpfs, `proc`, `sysfs`,
+  `cgroup2`, `devpts`, `mqueue` and overlays, not one on a block device
+  (ext4, XFS: `ENODEV`), so a loop device holds a file's bytes but no
+  filesystem to mount. Mounts do not propagate between namespaces, whatever their
   propagation type; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
   always detaches). An overlay's layers must be host directories (not in
