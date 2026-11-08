@@ -365,7 +365,7 @@ sequenceDiagram
   them.
 - A `fork` child gets every slab page that exists
   (`mach_vm_page_range_query`), sent with the parent's vCPUs stopped so it
-  sees one instant: about 60 ms for 512 MiB. The copy goes over a socket
+  sees one instant. The copy goes over a socket
   pair rather than through a file-backed slab, as elfuse does: an APFS
   clone writes the memory to disk and is some fifty times slower.
 - A `vfork` child fetches only the slab ranges the parent had in use, and
