@@ -249,8 +249,9 @@ The fork, vfork, execve and wait models are drawn in
   only the forking thread) inherits none held by a thread it lacks. It
   refuses outright (`ENOSYS`) once the process has a VM.
 - **quiesce** (`crates/native/src/quiesce.rs`): threads running guest code
-  are suspended for the fork; a thread in fwe's code runs on and waits
-  before re-entering guest code until the fork is done.
+  are suspended for the fork; a thread in fwe's code (which may hold
+  `malloc`'s lock) runs on and waits before re-entering guest code until
+  the fork is done.
 - **Child entry:** the child cannot return through the trap frame it
   inherited (macOS would not restore its signal mask), so it installs a
   signal stack and enters the guest directly with `x0` = 0.
@@ -496,9 +497,9 @@ The model, numbers and relay are in
   mark no read reaches, so only the end fires.
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
-- **Fork:** epoll interest lists and timerfd settings are recorded and
-  rebuilt in a host fork child at the same numbers; a one-shot timer that
-  expired unread is readable in the child at once.
+- **Fork:** of the epoll and timerfd kqueues a host fork child rebuilds
+  (see [linux-on-macos.md](linux-on-macos.md#waiting-and-events)), a
+  one-shot timer that expired unread is readable in the child at once.
 - **signalfd** (`crates/kernel/src/signalfd.rs`): a call interrupted by a
   signal moved onto a signalfd runs again.
 - **inotify** (`crates/kernel/src/inotify.rs`):
@@ -583,10 +584,9 @@ The model, numbers and relay are in
 Namespaces, cgroups, credentials, seccomp and devices are mapped in
 [linux-on-macos.md](linux-on-macos.md#namespaces). Inside fwe:
 
-- **Shared records** (`crates/kernel/src/shared.rs`): see
-  [linux-on-macos.md](linux-on-macos.md#kernel-wide-state). A record no
-  live process holds is collected (`shared::collect`) when a namespace is
-  made and when a fresh fwe starts.
+- **Shared records** (`crates/kernel/src/shared.rs`, collected by
+  `shared::collect`): see
+  [linux-on-macos.md](linux-on-macos.md#kernel-wide-state).
 - **Namespace creation:** the parent makes a child's namespaces before the
   host `fork`, so the child inherits them (a VM fork child from its
   snapshot).

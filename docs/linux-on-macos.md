@@ -317,8 +317,6 @@ sequenceDiagram
     C->>C: enter guest with x0 = 0
 ```
 
-- Threads in fwe's own code are not suspended (they may hold `malloc`'s
-  lock); they wait before re-entering guest code until the fork is done.
 - The child keeps the guest's blocked mask and alternate stack; pending
   signals are not inherited, as on Linux.
 - Descriptors are inherited by the host fork; the child's process record,
