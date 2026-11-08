@@ -1371,8 +1371,41 @@ impl<P: Platform> Kernel<P> {
         newpath: u64,
         flags: u64,
     ) -> i64 {
-        let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
-        let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
+        let old = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
+        let new = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
+        let from = self.fs().absolute_path(olddirfd as i32, &old);
+        let to = self.fs().absolute_path(newdirfd as i32, &new);
+        let r = self.rename_paths(olddirfd, old, newdirfd, new, flags);
+        // The working directory is a directory, wherever it moves: one
+        // renamed with it is where it went (`RENAME_EXCHANGE`: each where
+        // the other was).
+        if r == 0
+            && let (Some(from), Some(to)) = (from, to)
+        {
+            let cwd = self.fs().cwd().to_vec();
+            let moved = |a: &[u8], b: &[u8]| {
+                crate::mounts::under(&cwd, a).map(|rest| crate::mounts::join(b, rest))
+            };
+            let now = moved(&from, &to)
+                .or_else(|| (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten());
+            if let Some(now) = now {
+                let fs = self.fs.as_mut().expect("filesystem configured");
+                let root = fs.proc_root().to_vec();
+                fs.set_root(root, now);
+            }
+        }
+        r
+    }
+
+    /// [`sys_renameat2`](Self::sys_renameat2) of paths read.
+    fn rename_paths(
+        &mut self,
+        olddirfd: u64,
+        oldpath: Vec<u8>,
+        newdirfd: u64,
+        newpath: Vec<u8>,
+        flags: u64,
+    ) -> i64 {
         let how = match rename_mode(flags) {
             Ok(how) => how,
             Err(e) => return err(e),

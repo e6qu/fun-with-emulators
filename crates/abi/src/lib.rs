@@ -574,6 +574,43 @@ pub mod ioctl {
     pub const BLKGETDISKSEQ: u64 = 0x8008_1280;
 }
 
+/// inotify (`linux/inotify.h`).
+pub mod inotify {
+    pub const IN_ACCESS: u32 = 0x0000_0001;
+    pub const IN_MODIFY: u32 = 0x0000_0002;
+    pub const IN_ATTRIB: u32 = 0x0000_0004;
+    pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+    pub const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+    pub const IN_OPEN: u32 = 0x0000_0020;
+    pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+    pub const IN_MOVED_TO: u32 = 0x0000_0080;
+    pub const IN_CREATE: u32 = 0x0000_0100;
+    pub const IN_DELETE: u32 = 0x0000_0200;
+    pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+    pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+    pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+    pub const IN_UNMOUNT: u32 = 0x0000_2000;
+    pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+    pub const IN_IGNORED: u32 = 0x0000_8000;
+    pub const IN_ONLYDIR: u32 = 0x0100_0000;
+    pub const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+    pub const IN_EXCL_UNLINK: u32 = 0x0400_0000;
+    pub const IN_MASK_CREATE: u32 = 0x1000_0000;
+    pub const IN_MASK_ADD: u32 = 0x2000_0000;
+    pub const IN_ISDIR: u32 = 0x4000_0000;
+    pub const IN_ONESHOT: u32 = 0x8000_0000;
+    /// `inotify_init1`'s flags: `O_NONBLOCK` and `O_CLOEXEC`.
+    pub const IN_NONBLOCK: u64 = 0o4000;
+    pub const IN_CLOEXEC: u64 = 0o2000000;
+    /// `struct inotify_event` without its name: `wd`, `mask`, `cookie`,
+    /// `len`.
+    pub const EVENT_SIZE: usize = 16;
+    /// The defaults of `fs.inotify.*`.
+    pub const MAX_QUEUED_EVENTS: i64 = 16384;
+    pub const MAX_USER_INSTANCES: i64 = 128;
+    pub const MAX_USER_WATCHES: i64 = 8192;
+}
+
 /// The new mount API (`linux/mount.h`): `fsopen`, `fsconfig`, `fsmount`,
 /// `fspick`, `open_tree`, `move_mount`, `mount_setattr`, `statmount` and
 /// `listmount`.

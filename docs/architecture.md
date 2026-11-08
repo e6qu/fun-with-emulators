@@ -821,6 +821,29 @@ the thread blocks and some signalfd watches is moved onto that signalfd
 instead (including the `SIGCHLD` of a child exiting), and a call it
 interrupted runs again.
 
+## inotify
+
+fwe raises inotify's events itself (`crates/kernel/src/inotify.rs`): the
+host's file events say neither which name a directory gained nor that a
+file was opened, read or closed. Every fwe process's file calls raise
+Linux's events for a watched file and for a file in a watched directory
+(with its name): opening, reading, writing and truncating, closing (for
+writing or not), attribute changes, creation, removal (`IN_DELETE` to the
+directory; for the file's last link, `IN_ATTRIB`, `IN_DELETE_SELF` and
+`IN_IGNORED`), renames (`IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie,
+`IN_MOVE_SELF`), and an unmount (`IN_UNMOUNT`). The watches are a record
+every process sees, each naming the file by host device and inode. An
+instance's descriptor is a host datagram socket bound to a path in fwe's
+private directory, to which the process raising an event sends it, so
+reading it, `poll` and `epoll` are the host's own; a read takes whole
+events, as many as fit. Shared words beside the socket count what is
+queued, up to `fs.inotify.max_queued_events` (past it the reader gets
+`IN_Q_OVERFLOW` once it has read the rest), and keep the last event, so
+an identical one is merged with it, as Linux merges them. `IN_ONESHOT`,
+`IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR` and
+`IN_DONT_FOLLOW` act as on Linux, the `fs.inotify.*` limits are
+enforced, and `/proc/<pid>/fdinfo` lists an instance's watches.
+
 ## Sockets
 
 Socket calls (`crates/kernel/src/net.rs`) pass through on Linux. macOS has
@@ -1329,6 +1352,13 @@ of these are to be lifted for 1.0 and which are not planned.
   thread blocked it stays with the thread macOS parked it on, rather than
   acting when another thread unblocks it (one the guest catches is
   handed on), and in the VM a caught one is not handed on either.
+- **inotify:** a change made by a program fwe does not run raises no
+  event; a watch is of the host file, so a file of an overlay is watched
+  as its layer's (another after its copy-up, and changes made through the
+  layer's own path show); `IN_DELETE_SELF` comes as the last link goes,
+  not as the last descriptor closes; a close raises its event once no
+  descriptor of the open file is left in the process, not in every
+  process.
 - **Event descriptors:** `EPOLLEXCLUSIVE` wakes every waiter; `timerfd`
   resolution and clock distinctions; `pselect6` does not write back the
   time left.
@@ -1349,7 +1379,7 @@ of these are to be lifted for 1.0 and which are not planned.
   `dup2` or `close_range` replaces or closes one.
 - **Not implemented:**
   - `ptrace`;
-  - `inotify` and `fanotify`;
+  - `fanotify`;
   - `kcmp`;
   - `io_uring`, `userfaultfd` and `perf_event_open`;
   - `rseq` and `membarrier` (optional for libc);

@@ -26,6 +26,7 @@ pub mod fs;
 mod fsops;
 pub mod futex;
 pub mod host;
+pub mod inotify;
 pub mod ipcops;
 pub mod loopdev;
 pub mod maps;
@@ -289,6 +290,7 @@ impl<P: Platform> Kernel<P> {
         fdmarks::save(e);
         netlink::save(e, false);
         mountapi::save(e);
+        inotify::save(e);
         nsfd::save(e);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -349,6 +351,7 @@ impl<P: Platform> Kernel<P> {
         fdmarks::load(d);
         netlink::load(d);
         mountapi::load(d);
+        inotify::load(d);
         nsfd::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
@@ -562,6 +565,7 @@ impl<P: Platform> Kernel<P> {
         // The netlink sockets' host ends, which survive the host exec.
         netlink::save(&mut e, true);
         mountapi::save(&mut e);
+        inotify::save(&mut e);
         nsfd::save(&mut e);
         // The message queues' descriptors the exec closes: their
         // registrations go now, as Linux removes them as it closes them.
@@ -599,6 +603,7 @@ impl<P: Platform> Kernel<P> {
         fdmarks::load(&mut d);
         netlink::load(&mut d);
         mountapi::load(&mut d);
+        inotify::load(&mut d);
         nsfd::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
@@ -848,6 +853,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
 /// another kind, a read of an unconnected Unix socket, and the `SIGPIPE` a
 /// socket write to a closed peer raises.
 pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
+    inotify::after_io(nr, a, r);
     let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
     let r = net::linux_read_error(nr, a[0] as i32, r);
     if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
@@ -1171,6 +1177,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Some(r) = nsfd::io(nr, &a) {
         return Some(r);
     }
+    if let Some(r) = inotify::refuse_write(nr, &a) {
+        return Some(r);
+    }
     if nr == n::OPENAT {
         // A FIFO's open waits for the other end: here, without the lock,
         // and the locked open takes what this one opened.
@@ -1208,6 +1217,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             if let Some(r) = mountapi::read(fd, buf, len) {
+                return Some(r);
+            }
+            if let Some(r) = inotify::try_read(fd, buf, len) {
                 return Some(r);
             }
             if seqpacket::is(fd) {

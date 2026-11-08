@@ -760,6 +760,9 @@ impl Fs {
         if let Some(t) = crate::nsfd::target(fd) {
             return t;
         }
+        if crate::inotify::instance_of(fd).is_some() {
+            return b"anon_inode:inotify".to_vec();
+        }
         // SAFETY: an all-zero stat is a valid out-parameter.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `st` is a valid out-parameter.
@@ -862,6 +865,9 @@ impl Fs {
                 crate::bpf::tag_hex(&insns),
                 insns.len() / 8
             ));
+        }
+        if let Some(lines) = crate::inotify::fdinfo(fd) {
+            out.push_str(&lines);
         }
         out.into_bytes()
     }

@@ -2832,6 +2832,23 @@ fn namespace_descriptors_name_and_join_namespaces() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `inotify` guest prints.
+const INOTIFY: &str = "watch: true, nothing yet true\n\
+    ready true: create a, open a, modify a, close_write a, moved_from a, moved_to b, delete b\n\
+    move cookies paired true\n\
+    fdinfo lists the watch true\n\
+    removed 0: ignored true\n";
+
+/// inotify: a watched directory hears what another process does in it,
+/// in Linux's order, `poll` sees the events, fdinfo lists the watch, and a
+/// removed watch reports `IN_IGNORED`.
+#[test]
+fn inotify_reports_another_process_s_changes() {
+    let out = fwe(&rust_guest("inotify"), &[]);
+    assert_eq!(stdout(&out), INOTIFY, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `loopdev` guest prints.
 const LOOPDEV: &str = "free: true\n\
     node: 0, block device: true, 7:N: true\n\
@@ -3374,6 +3391,15 @@ fn hv_the_new_mount_api_makes_and_attaches_mounts() {
 fn hv_namespace_descriptors_name_and_join_namespaces() {
     let Some(out) = fwe_hv(&rust_low_guest("nsfd"), &[]) else { return };
     assert_eq!(stdout(&out), NSFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// inotify in the VM (see [`inotify_reports_another_process_s_changes`]):
+/// a forking guest, its events read into guest memory, translated.
+#[test]
+fn hv_inotify_reports_another_process_s_changes() {
+    let Some(out) = fwe_hv(&rust_low_guest("inotify"), &[]) else { return };
+    assert_eq!(stdout(&out), INOTIFY, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

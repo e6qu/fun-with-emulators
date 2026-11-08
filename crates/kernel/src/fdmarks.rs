@@ -77,6 +77,8 @@ pub enum Mark {
     /// A namespace (`/proc/<pid>/ns/<kind>` opened), by its number
     /// ([`crate::nsfd`]).
     Ns(u32),
+    /// An inotify instance, by its number ([`crate::inotify`]).
+    Inotify(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,8 +374,11 @@ pub fn save(e: &mut Enc) {
             Some(Mark::FsContext(_)) => 13,
             Some(Mark::Detached(_)) => 14,
             Some(Mark::Ns(_)) => 15,
+            Some(Mark::Inotify(_)) => 16,
         });
-        if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n)) = rec.mark {
+        if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
+            rec.mark
+        {
             e.u32(n);
         }
         if let Some(Mark::Loop(n)) = rec.mark {
@@ -439,6 +444,7 @@ pub fn load(d: &mut Dec) {
             13 => Some(Mark::FsContext(d.u32())),
             14 => Some(Mark::Detached(d.u32())),
             15 => Some(Mark::Ns(d.u32())),
+            16 => Some(Mark::Inotify(d.u32())),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

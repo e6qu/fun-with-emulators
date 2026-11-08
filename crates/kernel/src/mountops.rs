@@ -320,7 +320,10 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         match self.fs().mount_ns().clone().update(|t| t.umount(&point)) {
-            Ok(()) => 0,
+            Ok(()) => {
+                crate::inotify::unmounted(&point);
+                0
+            }
             Err(e) => err(e),
         }
     }

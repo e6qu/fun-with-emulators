@@ -119,7 +119,9 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_limit(n, &a) {
             return e;
         }
+        let plan = self.inotify_before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
+        self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
         // have given: closed again (by the guest's `close`, which also drops
         // what fwe keeps for one), and the call fails.
@@ -184,6 +186,7 @@ impl<P: Platform> Kernel<P> {
                 crate::netlink::closed(fd);
                 crate::mountapi::closed(fd);
                 crate::nsfd::closed(fd);
+                crate::inotify::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
@@ -531,6 +534,9 @@ impl<P: Platform> Kernel<P> {
             | nr::MQ_TIMEDRECEIVE => crate::ipcops::blocking(self.ipc_context(), n, a),
             nr::MQ_OPEN => self.sys_mq_open(a[0], a[1], a[2], a[3]),
             nr::SETNS => self.sys_setns(a[0], a[1]),
+            nr::INOTIFY_INIT1 => self.sys_inotify_init1(a[0]),
+            nr::INOTIFY_ADD_WATCH => self.sys_inotify_add_watch(a[0], a[1], a[2]),
+            nr::INOTIFY_RM_WATCH => self.sys_inotify_rm_watch(a[0], a[1]),
             nr::FSOPEN => self.sys_fsopen(a[0], a[1]),
             nr::FSCONFIG => self.sys_fsconfig(a[0], a[1], a[2], a[3], a[4]),
             nr::FSMOUNT => self.sys_fsmount(a[0], a[1], a[2]),

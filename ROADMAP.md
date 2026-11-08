@@ -81,7 +81,8 @@ capabilities. *crun, podman and containerd run standard images.*
   `open_tree`, `move_mount`, `mount_setattr`, `statmount`, `listmount`),
   with peer groups kept and mount ids in `statx`;
 - namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
-  `NS_GET_*` requests.
+  `NS_GET_*` requests;
+- inotify, its events raised by fwe from every process's file calls.
 
 ## Left to 1.0
 
@@ -102,8 +103,6 @@ hardware.
 In order of what each item unblocks. The LTP counts are from the latest
 run.
 
-- [ ] **Missing system calls LTP tests:**
-  - `inotify` (and `fanotify` refused cleanly).
 - [ ] **Mounts as Linux enforces them:** propagation between peers and to
   slaves; `nodev`, `noexec`, `nosymfollow` and the access-time modes
   acted on; a busy mount refused (`EBUSY`), with `MNT_DETACH` and
@@ -155,4 +154,7 @@ for it fall back:
 - x86_64 Linux binaries;
 - `kcmp`: macOS cannot tell whether two descriptors share an open file
   description, and programs that use it (CRIU, systemd) fall back;
+- `fanotify`: its permission events would hold every process's file
+  calls on another's answer; it is refused (`ENOSYS`), and programs fall
+  back to inotify;
 - graphical programs.
