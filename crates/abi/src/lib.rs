@@ -310,6 +310,8 @@ pub mod fcntl {
     pub const F_SETLEASE: u64 = 1024;
     pub const F_GETLEASE: u64 = 1025;
     pub const F_DUPFD_CLOEXEC: u64 = 1030;
+    /// Whether the descriptor's open made the file (Linux 6.12).
+    pub const F_CREATED_QUERY: u64 = 1028;
     pub const F_SETPIPE_SZ: u64 = 1031;
     pub const F_GETPIPE_SZ: u64 = 1032;
     pub const F_ADD_SEALS: u64 = 1033;

@@ -561,7 +561,7 @@ pub fn futex_pointer_args(op: u64) -> u8 {
 pub fn fcntl_pointer_args(cmd: u64) -> u8 {
     use fwe_abi::fcntl::*;
     match cmd {
-        F_GETLK | F_SETLK | F_SETLKW => 0b100,
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => 0b100,
         _ => 0,
     }
 }

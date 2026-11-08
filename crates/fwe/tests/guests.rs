@@ -2850,6 +2850,30 @@ const INOTIFY: &str = "watch: true, nothing yet true\n\
     fdinfo lists the watch true\n\
     removed 0: ignored true\n";
 
+/// What the `filectl` guest prints.
+const FILECTL: &str = "created: 1, then 0\n\
+    ofd: locked 0, other open refused true, released through a duplicate 0, then 0\n\
+    io signal: the chosen one, for the descriptor true\n\
+    lease: set 0, broken true, to read, downgraded 0, the other open done true\n";
+
+/// `fcntl` on open files: open-file-description locks, `F_CREATED_QUERY`,
+/// an `F_SETSIG` signal for `SIGIO`, and a lease another process's open
+/// breaks.
+#[test]
+fn file_control_locks_signals_and_leases() {
+    let out = fwe(&rust_guest("filectl"), &[]);
+    assert_eq!(stdout(&out), FILECTL, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The same in the VM (see [`file_control_locks_signals_and_leases`]).
+#[test]
+fn hv_file_control_locks_signals_and_leases() {
+    let Some(out) = fwe_hv(&rust_low_guest("filectl"), &[]) else { return };
+    assert_eq!(stdout(&out), FILECTL, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `keys` guest prints.
 const KEYS: &str = "session true, key read true, described true\n\
     child shares the session true, its key here true\n\

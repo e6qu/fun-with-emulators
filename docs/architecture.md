@@ -337,14 +337,21 @@ Creation modes have the umask applied by the kernel. An `O_CREAT` open
 that macOS fails with `ENOENT` because another process is unlinking the
 name at that moment is retried, as Linux would have created the file. `fcntl` translates the
 descriptor and status flags, and record locks (`F_GETLK`, `F_SETLK`,
-`F_SETLKW`: the arm64 `struct flock` and its lock types differ from the
-host's); `flock` passes through. The owner `SIGIO` goes to (`F_SETOWN`,
-`F_SETOWN_EX`) is the host's; what Linux keeps on an open file and the
-host has no place for — an owner that is a thread, the signal `F_SETSIG`
-names, a lease, a pipe's capacity (`F_SETPIPE_SZ`) — is kept by fwe
+`F_SETLKW`, and the open-file-description `F_OFD_*` forms, which macOS
+has under private numbers: the arm64 `struct flock` and its lock types
+differ from the host's); `flock` passes through. The owner `SIGIO` goes to
+(`F_SETOWN`, `F_SETOWN_EX`) is the host's; what Linux keeps on an open
+file and the host has no place for — an owner that is a thread, the signal
+`F_SETSIG` names, whether its open made the file (`F_CREATED_QUERY`), a
+pipe's capacity (`F_SETPIPE_SZ`, `fs.pipe-max-size`) — is kept by fwe
 (`crates/kernel/src/fdstate.rs`), read back as set and checked as Linux
-checks it, without effect on the host (no lease is broken, and a pipe holds
-what the host's does). Both kinds of lock are the host's, so they
+checks it. A `SIGIO` the host raises for a descriptor set to signal
+(`O_ASYNC`) with a signal chosen is that signal, with the descriptor and
+its events (`si_fd`, `si_band`); one for no such descriptor is dropped.
+Leases (`crates/kernel/src/leases.rs`) are kept in a record every fwe
+process shares: an open (or truncation) that conflicts with one signals
+its holder and waits until the lease is let go or downgraded, or for
+`fs.lease-break-time` seconds. Locks of both kinds are the host's, so they
 hold between guest processes and against host ones. `ioctl` covers the
 terminal, pty and `FIO*` requests, and the network interface ones
 (`SIOCGIFFLAGS` and the like).
@@ -1286,9 +1293,9 @@ of these are to be lifted for 1.0 and which are not planned.
   region (a hypervisor-backend process's guest memory is one) is as much
   of it as the region has in memory, which can overstate it: macOS tells
   another process's resident pages by region, not page by page.
-- **Locks:** open-file-description locks (`F_OFD_SETLK` and the like)
-  fail with `EINVAL`, as on a kernel before 3.15, so a program falls back
-  to process locks.
+- **Pipes:** a pipe holds at most what the host's does (64 KiB): a new
+  pipe's capacity is that, not Linux's 16 pages (256 KiB with 16 KiB
+  pages), and one set larger with `F_SETPIPE_SZ` still holds no more.
 - **Sockets:** a `sendto` to an `AF_UNIX` path that, rooted under the
   rootfs, is longer than the host's 103 bytes fails with `ENAMETOOLONG`
   (`bind` and `connect` reach it from its directory).

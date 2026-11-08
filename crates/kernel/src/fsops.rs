@@ -437,6 +437,20 @@ impl<P: Platform> Kernel<P> {
         // permission bits; a new one is made with what its owner must have
         // on the host ([`crate::modes`]).
         let existing = stat_at(resolved.dir.as_raw_fd(), &name).ok();
+        // A lease on the file this open conflicts with is broken first.
+        if let Some(st) = &existing
+            && st.st_mode & libc::S_IFMT == libc::S_IFREG
+            && flags & fcntl::O_PATH == 0
+        {
+            let write = flags & fcntl::O_ACCMODE != fcntl::O_RDONLY || flags & fcntl::O_TRUNC != 0;
+            let nonblock = flags & fcntl::O_NONBLOCK != 0;
+            // `st_dev` is narrower on macOS.
+            #[allow(clippy::unnecessary_cast)]
+            let dev = st.st_dev as u64;
+            if let Err(e) = crate::leases::break_for(dev, st.st_ino, write, nonblock) {
+                return err(e);
+            }
+        }
         if let Some(st) = &existing
             && crate::modes::marked(st)
             && flags & fcntl::O_PATH == 0
@@ -491,6 +505,9 @@ impl<P: Platform> Kernel<P> {
                 });
                 if r >= 0 && made.get() && host_mode != mode & 0o7777 {
                     let _ = crate::modes::keep_fd(r as i32, mode);
+                }
+                if r >= 0 {
+                    crate::fdstate::update(r as i32, |s| s.created = made.get());
                 }
                 if let Err(e) = resolved.finish(r >= 0)
                     && r >= 0
@@ -618,6 +635,11 @@ impl<P: Platform> Kernel<P> {
         }
         if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
             crate::fdmarks::set_stand_in(fd, host);
+        }
+        // An open of a file that was there made nothing (a number reused
+        // keeps no earlier open's word).
+        if existing.is_some() {
+            crate::fdstate::update(fd, |s| s.created = false);
         }
         fd as i64
     }
@@ -1733,6 +1755,22 @@ impl<P: Platform> Kernel<P> {
         let mut fds = [0i32; 2];
         if let Err(e) = make_pipe(&mut fds, flags) {
             return err(e);
+        }
+        // Its ends, one pipe; its capacity, as the maker's privilege and
+        // `pipe-max-size` allow.
+        let id = |fd: i32| {
+            // SAFETY: an all-zero `stat` is a valid out-parameter.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as above, on the pipe just made.
+            (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino))
+        };
+        if let (Some(read), Some(write)) = (id(fds[0]), id(fds[1])) {
+            crate::fdstate::pipe_made(read, write);
+            let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
+            let size = crate::fdstate::new_pipe_size(privileged, self.page_size);
+            if size != crate::fdstate::default_pipe_size() {
+                crate::fdstate::set_pipe_size(read, size);
+            }
         }
         if uaccess::write(buf, fds).is_err() {
             // SAFETY: closing the pipe just made.

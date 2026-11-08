@@ -126,16 +126,74 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
         buf.put32(SI_STATUS_OFF + 4, crate::seccomp::AUDIT_ARCH_AARCH64 as i32);
     } else if fault_addr != 0 {
         buf.put(SI_ADDR_OFF, fault_addr);
+    } else if let Some((fd, band)) = info.poll {
+        // `_sigpoll`: the events and the descriptor.
+        buf.put(SI_PID_OFF, band as u64);
+        buf.put32(SI_STATUS_OFF, fd);
     } else {
-        // Recorded as the host pid; the guest sees its own namespace's.
-        buf.put32(SI_PID_OFF, guest_pid(info.pid));
-        buf.put32(SI_UID_OFF, crate::userns::to_ns(info.uid, false) as i32);
+        // Recorded as the host pid; the guest sees its own namespace's. A
+        // signal from the kernel names no sender.
+        if info.code != signal::SI_KERNEL {
+            buf.put32(SI_PID_OFF, guest_pid(info.pid));
+            buf.put32(SI_UID_OFF, crate::userns::to_ns(info.uid, false) as i32);
+        }
         if queued(info.code) {
             // `si_value`, where a child's status is for `SIGCHLD`.
             buf.put(SI_STATUS_OFF, info.value);
         } else {
             buf.put32(SI_STATUS_OFF, info.status);
         }
+    }
+}
+
+/// A `SIGIO` the host raised for an owned descriptor's readiness (one no
+/// process sent) is, as on Linux, the signal that descriptor's `F_SETSIG`
+/// chose, carrying the descriptor and its events (`POLL_IN` and the like);
+/// the host knows only `SIGIO`.
+fn route_io_signal() {
+    if thread::pending() & bit(signal::SIGIO) == 0 {
+        return;
+    }
+    let Some(info) = thread::take_pending(signal::SIGIO) else { return };
+    // Only the host's own: another process's (a lease break's) names it.
+    if info.code != signal::SI_KERNEL || info.pid != 0 {
+        thread::post_process(signal::SIGIO, info);
+        return;
+    }
+    let Some((fd, sig, tid)) = crate::fdstate::io_signal() else {
+        // The host's, for no descriptor set to signal now (one closed since
+        // the event): Linux would send none.
+        if crate::fdstate::any_async() {
+            thread::post_process(signal::SIGIO, info);
+        }
+        return;
+    };
+    let mut p =
+        libc::pollfd { fd, events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI, revents: 0 };
+    // SAFETY: one valid pollfd, not waited on.
+    unsafe { libc::poll(&mut p, 1, 0) };
+    let ev = p.revents;
+    // Linux's `si_code` for the events, and `si_band` as `poll` reports
+    // them.
+    let code = if ev & libc::POLLHUP != 0 {
+        6
+    } else if ev & libc::POLLIN != 0 {
+        1
+    } else if ev & libc::POLLOUT != 0 {
+        2
+    } else if ev & libc::POLLPRI != 0 {
+        5
+    } else {
+        1
+    };
+    // The basic poll bits are Linux's on the host too.
+    let band = i64::from(ev);
+    let info = SigInfo { code, poll: Some((fd, band)), ..SigInfo::default() };
+    match tid {
+        Some(t) => {
+            thread::post_thread(t, sig as u64, info);
+        }
+        None => thread::post_process(sig as u64, info),
     }
 }
 
@@ -220,6 +278,7 @@ pub fn restartable(nr: u64, args: &[u64; 6]) -> bool {
 /// Move pending signals that the calling thread blocks and a `signalfd`
 /// watches onto that `signalfd`, as Linux queues them there.
 pub fn drain_to_signalfd() {
+    route_io_signal();
     let mut ready = thread::pending() & thread::mask() & crate::signalfd::watched();
     while ready != 0 {
         let sig = ready.trailing_zeros() as u64 + 1;
@@ -255,6 +314,7 @@ pub(crate) fn raise_sigsys(pc: u64, nr: u64, data: u16) {
         uid: (pc >> 32) as u32,
         status: (i32::from(data) << 16) | (nr as i32 & 0xffff),
         value: 0,
+        poll: None,
     };
     thread::post_self(signal::SIGSYS, info);
 }
@@ -603,11 +663,14 @@ impl<P: Platform> Kernel<P> {
             let led = (sig == signal::SIGKILL && target > 0)
                 .then(|| crate::pidns::led_by(target as i32))
                 .flatten();
-            if target > 0 && !to_self {
+            // A note of the sender for another process; and for this one's
+            // own SIGIO, which without one is taken for the host's I/O signal.
+            let noted = target > 0 && (!to_self || sig == signal::SIGIO);
+            if noted {
                 crate::signote::note(target as i32, h);
             }
             let r = host::kill(target as libc::pid_t, h);
-            if r != 0 && target > 0 && !to_self {
+            if r != 0 && noted {
                 crate::signote::unnote(target as i32, h);
             }
             if r == 0

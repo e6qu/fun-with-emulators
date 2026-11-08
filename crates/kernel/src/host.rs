@@ -593,15 +593,25 @@ pub unsafe fn signal_info(
         } else {
             None
         };
+        // The host's own SIGIO, for a descriptor's readiness (one another
+        // process sent leaves a note): Linux's is the kernel's, from no
+        // process.
+        if sig == libc::SIGIO && code == 0 && note.is_none() {
+            return crate::thread::SigInfo { code: signal::SI_KERNEL, ..Default::default() };
+        }
         if let Some(n) = note {
             (code, pid, uid) = (SENT, n.pid, n.uid);
             if n.code != 0 {
+                // A lease break carries the leased descriptor.
+                let poll = (n.code == crate::leases::POLL_MSG && sig != libc::SIGCHLD)
+                    .then_some((n.value as i32, crate::leases::POLL_MSG_BAND));
                 return crate::thread::SigInfo {
                     code: n.code,
                     pid,
                     uid: uid_to_initial(uid),
                     status: 0,
-                    value: n.value,
+                    value: if poll.is_some() { 0 } else { n.value },
+                    poll,
                 };
             }
             value = n.value;
@@ -616,7 +626,7 @@ pub unsafe fn signal_info(
         // that had stopped it).
         status = signal::SIGCONT as i32;
     }
-    crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value }
+    crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value, poll: None }
 }
 
 /// The code and sender the host last gave each host signal, as
@@ -644,6 +654,7 @@ pub fn sent_info(note: crate::signote::Note) -> crate::thread::SigInfo {
         uid: uid_to_initial(note.uid),
         status: 0,
         value: note.value,
+        poll: None,
     }
 }
 
@@ -741,6 +752,25 @@ pub fn flock_to_host(lock: &fwe_abi::Flock) -> Result<libc::flock, i32> {
     host.l_len = lock.l_len;
     host.l_pid = lock.l_pid;
     Ok(host)
+}
+
+/// The host command for Linux record-lock command `cmd`: `F_GETLK`,
+/// `F_SETLK`, `F_SETLKW` and their open-file-description forms (`F_OFD_*`,
+/// which macOS has under private numbers).
+pub fn lock_cmd(cmd: u64) -> Option<libc::c_int> {
+    #[cfg(target_os = "macos")]
+    const OFD: [libc::c_int; 3] = [92, 90, 91];
+    #[cfg(not(target_os = "macos"))]
+    const OFD: [libc::c_int; 3] = [libc::F_OFD_GETLK, libc::F_OFD_SETLK, libc::F_OFD_SETLKW];
+    Some(match cmd {
+        fcntl::F_GETLK => libc::F_GETLK,
+        fcntl::F_SETLK => libc::F_SETLK,
+        fcntl::F_SETLKW => libc::F_SETLKW,
+        fcntl::F_OFD_GETLK => OFD[0],
+        fcntl::F_OFD_SETLK => OFD[1],
+        fcntl::F_OFD_SETLKW => OFD[2],
+        _ => return None,
+    })
 }
 
 /// A host `struct flock` (as `F_GETLK` fills it) in Linux layout.
