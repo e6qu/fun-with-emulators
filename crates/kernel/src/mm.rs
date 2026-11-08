@@ -1298,81 +1298,100 @@ impl<P: Platform> Kernel<P> {
             // before the host frees it.
             self.platform.unmap_guest(addr, self.page_up(len));
         }
-        // SAFETY: guest-requested mapping. MAP_FIXED may replace guest memory,
-        // which is the guest's own business, exactly as on Linux.
-        let p = unsafe {
-            libc::mmap(
-                haddr as *mut libc::c_void,
-                len as usize,
-                initial_prot,
-                hflags,
-                host_fd,
-                offset as libc::off_t,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            let e = last_error();
-            if placed {
-                // The range chosen for it goes back to the backend.
-                self.platform.release_host(haddr, self.page_up(len));
-            }
-            return e;
-        }
-        let p = p as u64;
-        if noreplace && p != haddr {
-            // SAFETY: unmapping the mapping just created.
-            self.unmap_host(p, len);
-            return err(errno::EEXIST);
-        }
-        let guest = if p == haddr && fixed { addr } else { p };
-        track(p, self.page_up(len));
-        if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
-            // SAFETY: unmapping the mapping just created.
-            self.unmap_host(p, len);
-            untrack(p, self.page_up(len));
-            return err(e);
-        }
-        if exec {
-            // Translate the code. For a file-backed mapping, confine the
-            // rewrite to the file's executable sections, so data mapped into
-            // the same region — the symbol, string and hash tables that a
-            // shared library's code segment can hold, as glibc's `libc.so.6`
-            // does — is left untouched. Without section headers, or for an
-            // anonymous mapping, the whole region is translated as before.
-            // File ranges in the mapping, as host addresses.
-            let in_mapping = |ranges: Vec<(u64, u64)>| -> Vec<(u64, u64)> {
-                ranges
-                    .into_iter()
-                    .filter_map(|(foff, fsize)| {
-                        let start = foff.max(offset);
-                        let end = (foff + fsize).min(offset + len);
-                        (start < end).then_some((p + (start - offset), end - start))
-                    })
-                    .collect()
+        let mut retried = false;
+        let (p, guest) = 'map: loop {
+            // SAFETY: guest-requested mapping. MAP_FIXED may replace guest memory,
+            // which is the guest's own business, exactly as on Linux.
+            let p = unsafe {
+                libc::mmap(
+                    haddr as *mut libc::c_void,
+                    len as usize,
+                    initial_prot,
+                    hflags,
+                    host_fd,
+                    offset as libc::off_t,
+                )
             };
-            let (prep, known) = match if anonymous { None } else { exec_file_ranges(host_fd) } {
-                Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
-                None => (vec![(p, self.page_up(len))], None),
-            };
-            for (a, l) in prep {
-                if let Err(e) = self.platform.prepare_exec(a, l, known.as_deref()) {
-                    // SAFETY: unmapping the mapping just created.
-                    self.unmap_host(p, len);
-                    untrack(p, self.page_up(len));
-                    return self.prepare_failed(e);
-                }
-            }
-            // SAFETY: changing protections of the mapping just created.
-            if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, final_prot(prot)) }
-                != 0
-            {
+            if p == libc::MAP_FAILED {
                 let e = last_error();
+                if placed {
+                    // The range chosen for it goes back to the backend.
+                    self.platform.release_host(haddr, self.page_up(len));
+                } else if retried {
+                    // SAFETY: the place reserved for it, not otherwise used.
+                    unsafe { libc::munmap(haddr as *mut libc::c_void, len as usize) };
+                }
+                return e;
+            }
+            let p = p as u64;
+            if noreplace && p != haddr {
+                // SAFETY: unmapping the mapping just created.
+                self.unmap_host(p, len);
+                return err(errno::EEXIST);
+            }
+            let guest = if p == haddr && fixed { addr } else { p };
+            track(p, self.page_up(len));
+            if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
                 // SAFETY: unmapping the mapping just created.
                 self.unmap_host(p, len);
                 untrack(p, self.page_up(len));
-                return e;
+                return err(e);
             }
-        }
+            if exec {
+                // Translate the code. For a file-backed mapping, confine the
+                // rewrite to the file's executable sections, so data mapped into
+                // the same region — the symbol, string and hash tables that a
+                // shared library's code segment can hold, as glibc's `libc.so.6`
+                // does — is left untouched. Without section headers, or for an
+                // anonymous mapping, the whole region is translated as before.
+                // File ranges in the mapping, as host addresses.
+                let in_mapping = |ranges: Vec<(u64, u64)>| -> Vec<(u64, u64)> {
+                    ranges
+                        .into_iter()
+                        .filter_map(|(foff, fsize)| {
+                            let start = foff.max(offset);
+                            let end = (foff + fsize).min(offset + len);
+                            (start < end).then_some((p + (start - offset), end - start))
+                        })
+                        .collect()
+                };
+                let (prep, known) = match if anonymous { None } else { exec_file_ranges(host_fd) } {
+                    Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
+                    None => (vec![(p, self.page_up(len))], None),
+                };
+                for (a, l) in prep {
+                    if let Err(e) = self.platform.prepare_exec(a, l, known.as_deref()) {
+                        // SAFETY: unmapping the mapping just created.
+                        self.unmap_host(p, len);
+                        untrack(p, self.page_up(len));
+                        // Where the guest left the place to fwe, and the host
+                        // put the code with no room for its stubs within
+                        // reach: once more, where there is.
+                        if !fixed && !placed && !retried {
+                            if let Some(at) = Self::roomy_place(self.page_up(len)) {
+                                self.tracer.note(&format!("code moved for room: {}", e.why));
+                                haddr = at;
+                                hflags |= libc::MAP_FIXED;
+                                retried = true;
+                                continue 'map;
+                            }
+                        }
+                        return self.prepare_failed(e);
+                    }
+                }
+                // SAFETY: changing protections of the mapping just created.
+                if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, final_prot(prot)) }
+                    != 0
+                {
+                    let e = last_error();
+                    // SAFETY: unmapping the mapping just created.
+                    self.unmap_host(p, len);
+                    untrack(p, self.page_up(len));
+                    return e;
+                }
+            }
+            break (p, guest);
+        };
         if wants_write_exec(prot) {
             add_range(&mut write_exec(), p, self.page_up(len));
         } else {
@@ -1408,6 +1427,29 @@ impl<P: Platform> Kernel<P> {
             remove_range(&mut write_exec(), host as u64, self.page_up(len));
         }
         r
+    }
+
+    /// A place for a mapping of `len` bytes with room after it for the stubs
+    /// its code needs ([`Platform::prepare_exec`]): reserved (inaccessible),
+    /// the room left free. None if the host has no such place.
+    fn roomy_place(len: u64) -> Option<u64> {
+        const ROOM: u64 = 64 << 20;
+        // SAFETY: a fresh inaccessible mapping of fwe's; its tail is let go.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                (len + ROOM) as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                return None;
+            }
+            libc::munmap((p as u64 + len) as *mut libc::c_void, ROOM as usize);
+            Some(p as u64)
+        }
     }
 
     /// The guest's answer to a failed [`Platform::prepare_exec`], with the

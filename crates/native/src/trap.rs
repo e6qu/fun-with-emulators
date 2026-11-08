@@ -458,6 +458,8 @@ fn take_async(
         // Past the hard CPU limit: the process ends.
         return;
     }
+    // A wait this thread is about to begin, or is in, ends for it.
+    thread::poke_wait();
     let record = || {
         if sig == host::WAKE_SIGNAL {
             // Signals the host lacks, queued by another process.

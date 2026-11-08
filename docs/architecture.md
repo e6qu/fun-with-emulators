@@ -188,7 +188,8 @@ The pieces that do it:
   reaches each group (a quarter of the branch range apart at most), takes
   the region from the loader's arena or reserves one near the code, writes
   the stubs, points each site at its stub and invalidates the instruction
-  cache;
+  cache; code the guest mapped without a fixed address, which the host put
+  where no region is within reach, is mapped again where there is room;
 - the kernel crate asks for preparation through
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
@@ -353,6 +354,11 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
 - **Wake signal:** a signal recorded without a host signal (real-time,
   emulated faults, caught `tgkill`) wakes its target thread, or every
   thread, with `SIGEMT`.
+- **Wake pipes:** every host signal a thread takes writes a byte to that
+  thread's pipe (`thread::poke_wait`), and `poll`, `select` and the
+  `epoll` waits watch it beside the guest's descriptors
+  (`thread::wait_ready`), so a signal that lands after such a wait looked
+  for pending ones, and before the host wait began, still ends it.
 - **Signals the host lacks, between processes:** queued in the target's
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets.
@@ -898,9 +904,9 @@ which are to be lifted for 1.0 and which are not planned.
   no sender; a blocked signal pending across an `execve` arrives with
   fwe's own pid as sender.
 - A signal arriving between a blocking call's start and its host wait is
-  noticed only when the call ends, except for `rt_sigsuspend`,
-  `rt_sigtimedwait` and the masked waits; a futex wait notices one within
-  20 ms; a call rerun after an interruption the guest does not see starts
+  noticed only when the call ends, except for `poll`, `select`, the `epoll`
+  waits, `rt_sigsuspend` and `rt_sigtimedwait`; a futex wait notices one
+  within 20 ms; a call rerun after an interruption the guest does not see starts
   its timeout over.
 - A fault signal sent by a process fwe did not start is taken as a fault.
 - A process-wide signal left at its default action and sent while every

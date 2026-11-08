@@ -354,6 +354,8 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         // Past the hard CPU limit: the process ends.
         return;
     }
+    // A wait this thread is about to begin, or is in, ends for it.
+    thread::poke_wait();
     if sig == host::WAKE_SIGNAL {
         // Signals the host lacks, queued by another process.
         fwe_kernel::signote::drain(|lsig, note| {

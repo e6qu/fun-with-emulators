@@ -75,10 +75,158 @@ pub fn init_main(pid: i32) {
         PROCESS.post(s, i);
     }
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    forget_wait_pipes();
     crate::futex::forked_child();
     crate::signote::open_own();
     crate::sysvipc::forked_child();
     register_current();
+}
+
+/// Each waiting thread's wake pipe: the host thread, and the pipe's read
+/// and write ends (in fwe's reserved range). A signal the host delivers
+/// to a thread writes a byte to its pipe ([`poke_wait`]), and the waits
+/// that block without bound until a descriptor is ready (`ppoll`, `epoll`)
+/// watch the pipe beside the guest's descriptors ([`wait_ready`]): a
+/// signal that lands after such a wait looked for pending signals, and
+/// before the host wait began, still ends it. Kept without a lock: the
+/// handler reads it.
+static WAIT_PIPES: [(AtomicU64, AtomicI32, AtomicI32); 256] =
+    [const { (AtomicU64::new(0), AtomicI32::new(-1), AtomicI32::new(-1)) }; 256];
+
+fn self_id() -> u64 {
+    // SAFETY: pthread_self cannot fail; async-signal-safe.
+    unsafe { libc::pthread_self() as u64 }
+}
+
+/// The calling thread's wake pipe's read end, made on first use (none if
+/// every slot is taken or no pipe can be made).
+fn wait_pipe() -> Option<i32> {
+    let me = self_id();
+    if let Some((_, r, _)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
+        return Some(r.load(Ordering::SeqCst)).filter(|&r| r >= 0);
+    }
+    let mut p = [-1i32; 2];
+    // SAFETY: a valid out-array; the ends are made non-blocking and moved
+    // to fwe's reserved range.
+    unsafe {
+        if libc::pipe(p.as_mut_ptr()) != 0 {
+            return None;
+        }
+        for fd in p {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    let (Ok(r), Ok(w)) = (crate::fdtable::reserve(p[0]), crate::fdtable::reserve(p[1])) else {
+        return None;
+    };
+    for (t, rs, ws) in &WAIT_PIPES {
+        if t.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            rs.store(r, Ordering::SeqCst);
+            ws.store(w, Ordering::SeqCst);
+            return Some(r);
+        }
+    }
+    // SAFETY: the pipe made above, not kept.
+    unsafe {
+        libc::close(r);
+        libc::close(w);
+    }
+    None
+}
+
+/// In a host signal handler: end the calling thread's wait, if it has a
+/// wake pipe. Async-signal-safe.
+pub fn poke_wait() {
+    let me = self_id();
+    if let Some((_, _, w)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
+        let saved = crate::host::last_errno();
+        // SAFETY: one byte to the thread's own pipe; a full pipe is woken
+        // already.
+        unsafe { libc::write(w.load(Ordering::SeqCst), b"w".as_ptr().cast(), 1) };
+        crate::host::set_errno(saved);
+    }
+}
+
+/// The calling thread's wake pipe goes, as it exits.
+fn drop_wait_pipe() {
+    let me = self_id();
+    if let Some((t, r, w)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
+        // SAFETY: the thread's own pipe, no longer used.
+        unsafe {
+            libc::close(r.swap(-1, Ordering::SeqCst));
+            libc::close(w.swap(-1, Ordering::SeqCst));
+        }
+        t.store(0, Ordering::SeqCst);
+    }
+}
+
+/// In a fork child: the parent's wake pipes are its own (the forking
+/// thread's is shared with the parent), so they go; this thread makes its
+/// own when it next waits.
+fn forget_wait_pipes() {
+    for (t, r, w) in &WAIT_PIPES {
+        if t.swap(0, Ordering::SeqCst) != 0 {
+            // SAFETY: inherited descriptors of fwe's, no longer used here.
+            unsafe {
+                libc::close(r.swap(-1, Ordering::SeqCst));
+                libc::close(w.swap(-1, Ordering::SeqCst));
+            }
+        }
+    }
+}
+
+/// `poll` of `fds` for up to `ms` milliseconds (-1: without bound), ended
+/// as well by a signal for the guest (`EINTR`): one pending as the wait
+/// starts, or one that lands during it, however soon. A signal the thread
+/// blocks for a `signalfd` is moved onto it, so the wait sees that
+/// descriptor ready. Returns how many of `fds` are ready.
+pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
+    let Some(wake) = wait_pipe() else {
+        // SAFETY: a valid array of `fds.len()` entries.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        return if n < 0 {
+            Err(crate::host::errno_to_linux(crate::host::last_errno()))
+        } else {
+            Ok(n)
+        };
+    };
+    let deadline =
+        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    let mut all: Vec<libc::pollfd> = fds.to_vec();
+    all.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
+    loop {
+        // What woke it before is spent; a signal from now on writes again.
+        let mut b = [0u8; 64];
+        // SAFETY: the thread's own non-blocking pipe and a buffer of its length.
+        while unsafe { libc::read(wake, b.as_mut_ptr().cast(), b.len()) } > 0 {}
+        crate::signal::drain_to_signalfd();
+        if deliverable() != 0 {
+            return Err(fwe_abi::errno::EINTR);
+        }
+        let left = match deadline {
+            None => -1,
+            Some(d) => d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32,
+        };
+        for p in &mut all {
+            p.revents = 0;
+        }
+        // SAFETY: a valid array of `all.len()` entries.
+        let n = unsafe { libc::poll(all.as_mut_ptr(), all.len() as libc::nfds_t, left) };
+        if n < 0 && crate::host::last_errno() != libc::EINTR {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        let woke = all[fds.len()].revents != 0;
+        let ready = n.max(0) - i32::from(woke);
+        if ready > 0 {
+            for (f, a) in fds.iter_mut().zip(&all) {
+                f.revents = a.revents;
+            }
+            return Ok(ready);
+        }
+        if n == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Ok(0);
+        }
+    }
 }
 
 /// In a fork child, as the fork returns: the parent's pending signals,
@@ -392,6 +540,7 @@ pub fn unregister(pending: &Arc<Pending>) {
 
 /// Forget the calling thread's registration as it exits.
 pub fn unregister_current() {
+    drop_wait_pipe();
     let own = OWN.with(|o| o.replace(std::ptr::null()));
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
 }

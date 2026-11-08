@@ -2068,9 +2068,26 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         Vec::new()
     };
     if fifos.is_empty() {
-        // SAFETY: `struct pollfd` and the POLL* bits match the host's; the
-        // host validates the guest array.
-        return ret(unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, ms) });
+        // `struct pollfd` and the POLL* bits match the host's.
+        let mut set = vec![libc::pollfd { fd: 0, events: 0, revents: 0 }; nfds as usize];
+        // SAFETY: a `pollfd` is plain data, as many bytes as the guest's.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                set.as_mut_ptr().cast::<u8>(),
+                set.len() * size_of::<libc::pollfd>(),
+            )
+        };
+        guest!(uaccess::read_into(fds, bytes));
+        return match crate::thread::wait_ready(&mut set, ms) {
+            Ok(n) => {
+                for (i, p) in set.iter().enumerate() {
+                    let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
+                    guest!(uaccess::write(at, p.revents));
+                }
+                i64::from(n)
+            }
+            Err(e) => err(e),
+        };
     }
     let deadline =
         (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
@@ -2577,6 +2594,9 @@ mod tests {
 
     struct TestPlatform {
         exec: Vec<(u64, u64)>,
+        /// How many code preparations to refuse, as a host with no room
+        /// for stubs near the code would.
+        refuse: u32,
     }
 
     impl Platform for TestPlatform {
@@ -2586,6 +2606,10 @@ mod tests {
             len: u64,
             _known: Option<&[(u64, u64)]>,
         ) -> Result<(), crate::PrepareFailed> {
+            if self.refuse > 0 {
+                self.refuse -= 1;
+                return Err(crate::PrepareFailed { errno: errno::ENOMEM, why: "no room".into() });
+            }
             self.exec.push((addr, len));
             Ok(())
         }
@@ -2604,7 +2628,7 @@ mod tests {
         // SAFETY: plain host call.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         Kernel::new(
-            TestPlatform { exec: vec![] },
+            TestPlatform { exec: vec![], refuse: 0 },
             page,
             Brk { start: 0, current: 0, limit: 0 },
             None,
@@ -3205,6 +3229,28 @@ mod tests {
         }
         // tgkill's thread group must be a process.
         assert_eq!(k.syscall(nr::TGKILL, [-1i64 as u64, 1, 0, 0, 0, 0]), err(errno::EINVAL));
+    }
+
+    /// Code the host placed with no room for its stubs near it is mapped
+    /// again where there is, when the guest left the place to fwe; a fixed
+    /// mapping cannot move, and fails.
+    #[test]
+    fn code_without_room_for_stubs_moves_unless_fixed() {
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let len = k.page_size;
+        k.platform.refuse = 1;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let p = k.syscall(nr::MMAP, [0, len, PROT_READ | PROT_EXEC, anon, u64::MAX, 0]);
+        assert!(p > 0, "mmap: {p}");
+        assert_eq!(k.platform.exec.last().map(|e| e.0), Some(p as u64));
+        assert_eq!(k.syscall(nr::MUNMAP, [p as u64, len, 0, 0, 0, 0]), 0);
+        // At a fixed address it stays, or fails.
+        let at = k.syscall(nr::MMAP, [0, len, PROT_READ | PROT_WRITE, anon, u64::MAX, 0]) as u64;
+        k.platform.refuse = 1;
+        let r = k.syscall(nr::MMAP, [at, len, PROT_READ | PROT_EXEC, anon | MAP_FIXED, u64::MAX, 0]);
+        assert_eq!(r, err(errno::ENOMEM));
+        let _ = k.syscall(nr::MUNMAP, [at, len, 0, 0, 0, 0]);
     }
 
     /// `prctl`'s options that take no further arguments refuse them, and

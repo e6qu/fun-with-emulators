@@ -591,13 +591,13 @@ fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, 
         (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
     let mut wait = ms;
     loop {
-        let (ready, seen) = kevent_once(epfd, room, wait)?;
-        if !ready.is_empty() || seen == 0 || ms == 0 {
+        let (ready, _) = kevent_once(epfd, room, wait)?;
+        if !ready.is_empty() || ms == 0 {
             return Ok(ready);
         }
-        // All the host reported was what the guest did not ask for: wait
-        // on, for what is left of the time (Linux never returns no events
-        // before it is up).
+        // Nothing the guest asked for (or the events went to another
+        // thread's wait): wait on, for what is left of the time (Linux never
+        // returns no events before it is up).
         if let Some(d) = deadline {
             let left = d.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -631,14 +631,21 @@ fn kevent_once(epfd: i32, room: usize, ms: i32) -> Result<(Ready, usize), i64> {
         };
         room
     ];
-    let ts = libc::timespec {
-        tv_sec: (ms / 1000) as libc::time_t,
-        tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
-    };
-    let ts_ptr: *const libc::timespec = if ms < 0 { std::ptr::null() } else { &ts };
-    // SAFETY: `out` holds `room` entries; `ts_ptr` is null or a valid timespec.
+    // The wait is for the kqueue to have events, or a signal for the
+    // guest, however soon it lands ([`crate::thread::wait_ready`]); the
+    // events are then taken without waiting.
+    if ms != 0 {
+        let mut kq = [libc::pollfd { fd: epfd, events: libc::POLLIN, revents: 0 }];
+        match crate::thread::wait_ready(&mut kq, ms) {
+            Ok(0) => return Ok((Vec::new(), 0)),
+            Ok(_) => {}
+            Err(e) => return Err(fwe_abi::err(e)),
+        }
+    }
+    let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `out` holds `room` entries; `ts` is a valid timespec.
     let n = unsafe {
-        libc::kevent(epfd, std::ptr::null(), 0, out.as_mut_ptr(), room as libc::c_int, ts_ptr)
+        libc::kevent(epfd, std::ptr::null(), 0, out.as_mut_ptr(), room as libc::c_int, &ts)
     };
     if n < 0 {
         return Err(crate::host::last_error());
