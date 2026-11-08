@@ -229,8 +229,8 @@ flowchart LR
 
 The low 4 GiB can never be identity-mapped (it is `__PAGEZERO` on the
 host), so the low image is always one of the translated ranges. A host call
-given one buffer that spans two translated ranges has no single host
-address and fails with `EINVAL`.
+given one buffer that runs over the edge of a translated range has no
+single host address and fails with `EINVAL`.
 
 ### The mmap family
 
@@ -299,17 +299,21 @@ sequenceDiagram
     participant P as Parent (forking thread)
     participant T as Parent's other threads
     participant C as Child
-    P->>P: take the kernel lock and every registry lock (fork_locked)
-    P->>P: record epoll/timerfd kqueues, make the child's namespaces
+    P->>P: take the kernel lock
+    P->>P: make the child's namespaces, record epoll/timerfd kqueues
+    P->>P: take every registry lock (fork_locked)
     P->>T: thread_suspend those running guest code (quiesce)
     P->>P: block all async signals
     P->>C: host fork()
+    P->>P: unblock signals
+    P->>C: one byte: go on
     P->>T: resume
-    P->>P: unblock signals, release locks, return child pid
+    P->>P: release locks, return child pid
+    C->>C: wait for the parent's byte
+    C->>C: pid namespace numbers, process record, reaper, FIFO records
     C->>C: own signal stack, init main thread (tid = pid)
     C->>C: rebuild kqueues at the same numbers
-    C->>C: pid namespace numbers, process record, reaper, FIFO records
-    C->>C: wait for parent's byte, then enter guest with x0 = 0
+    C->>C: enter guest with x0 = 0
 ```
 
 - Threads in fwe's own code are not suspended (they may hold `malloc`'s
@@ -337,18 +341,23 @@ sequenceDiagram
     participant C as fwe --hv-fork-child
     P->>P: kernel lock, stop every other vCPU
     P->>P: encode kernel state (Kernel::save_for_fork) + registers, TPIDR, PAC keys, mapping records
+    opt vfork
+        P->>P: resume the other vCPUs
+    end
     P->>C: posix_spawn: all descriptors (CLOEXEC cleared for the spawn), memory socket, bootstrap port = parent's receive right
     C->>C: reserve the slab at 512 GiB
     C->>P: request on bootstrap port
     P-->>C: real bootstrap port + state (Mach out-of-line data)
-    alt fork
+    opt fork
         P-->>C: every existing slab page over the socket
-    else vfork
-        C->>P: fetch 64 KiB chunks on first touch
+        P->>P: resume the other vCPUs
     end
     C->>C: rebuild kernel and kqueues, make its VM, fill page tables
     C-->>P: one byte: ready
-    P->>P: resume vCPUs (vfork: serve pages until the child execs or exits, then take back its changes)
+    opt vfork
+        C->>P: fetch 64 KiB chunks on first touch
+        P-->>C: serve pages until the child execs or exits, then take back its changes
+    end
     C->>C: resume after svc with x0 = 0
 ```
 
@@ -375,7 +384,7 @@ sequenceDiagram
 | | Linux | fwe |
 |---|---|---|
 | Thread | a task sharing `mm`, files, handlers | a host pthread running guest code (native) or a host thread with its own vCPU (VM) |
-| `clone` flags | any combination | a thread needs `CLONE_VM` and a stack (`EINVAL` without, VM); the native backend accepts `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`, `DETACHED` and fails others with `ENOSYS` |
+| `clone` flags | any combination | a thread needs `CLONE_VM` and a stack (`EINVAL` without either in the VM; natively `EINVAL` without a stack, `ENOSYS` without `CLONE_VM`); the native backend accepts `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`, `DETACHED` and fails others with `ENOSYS` |
 | `clone3` | `struct clone_args` | read and treated as the `clone` it describes; `CLONE_PIDFD`, `CLONE_INTO_CGROUP`, `CLONE_CLEAR_SIGHAND` and `set_tid` fail with `ENOSYS` |
 | Per-thread state | in the task | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
 
@@ -391,11 +400,13 @@ dispositions. fwe does it one of two ways:
 
 ```mermaid
 flowchart TD
-    e["guest execve(path)"] --> chk{"new program valid? (arm64 ELF that fits, interpreter exists)"}
+    e["guest execve(path)"] --> how{"VM backend, program needs the VM, or other live threads?"}
+    how -- no --> chk{"new program valid? (arm64 ELF that fits, interpreter exists)"}
     chk -- no --> fail["error returned, caller intact"]
-    chk -- yes --> how{"VM backend, program needs the VM, or other live threads?"}
-    how -- no --> inplace["native, in place: unmap tracked guest memory, close CLOEXEC fds, load new image, all registers zero"]
-    how -- yes --> reexec["host execve of fwe itself with --exec-state, --guest-path, --cwd, --argv0, --strace"]
+    chk -- yes --> inplace["native, in place: unmap tracked guest memory, close CLOEXEC fds, load new image, all registers zero"]
+    how -- yes --> elf{"an ELF file?"}
+    elf -- no --> fail
+    elf -- yes --> reexec["host execve of fwe itself with --exec-state, --guest-path, --root, --cwd, --argv0 and the trace and VM options"]
     reexec --> pick["new fwe picks the backend the program needs"]
 ```
 

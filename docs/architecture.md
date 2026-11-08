@@ -119,9 +119,11 @@ ranges):
 - The break is reserved after the image and its stub space (up to 1 GiB,
   halved while something is in the way) before the dynamic linker is
   placed. The stack is 8 MiB with a guard page.
-- `execve` checks the new program first (an arm64 ELF that fits the
-  address space, with a dynamic linker that exists), so a bad one fails
-  with the caller intact.
+- An in-place `execve` checks the new program first (an arm64 ELF that
+  fits the address space, with a dynamic linker that exists), so a bad
+  one fails with the caller intact. A re-exec checks only that it is an
+  ELF file before the host `execve`, so a later failure ends the
+  process.
 - A program given by a host path inside the rootfs gets its guest path as
   `argv[0]` and `AT_EXECFN` (Python finds its installation so);
   `--argv0` overrides it.
@@ -717,7 +719,7 @@ are to be lifted for 1.0 and which are not planned.
   writes to the file do not show; a shared segment cannot grow with
   `mremap`, and `MREMAP_FIXED`/`MREMAP_DONTUNMAP` are refused (`EINVAL`).
 - VM: a buffer a host call takes whole (`read`'s, an `iovec`'s) that runs
-  from one translated range into another fails with `EINVAL`; `ioctl`'s
+  over the edge of a translated range fails with `EINVAL`; `ioctl`'s
   argument is translated but not checked against the guest's mappings; a
   `MAP_FIXED` mapping placed exactly where fwe keeps another translated
   range's memory makes their addresses ambiguous within a call that
