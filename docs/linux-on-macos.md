@@ -468,8 +468,8 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 
 ### Numbers
 
-Linux and macOS agree on signals 1–6, 8, 9, 11 and 13–15; the rest
-differ. fwe translates every number (`host::signal_to_host`).
+Linux and macOS agree on signals 1–6, 8, 9, 11, 13–15, 21, 22 and 24–28;
+the rest differ. fwe translates every number (`host::signal_to_host`).
 
 | Signal | Linux | macOS |
 |---|---|---|
@@ -540,8 +540,9 @@ sequenceDiagram
   a process sends itself are recorded directly, since macOS's `siginfo`
   cannot tell a sent one from a fault. One from another fwe process is told
   apart by its note.
-- **Permission to signal** follows Linux: `CAP_KILL`, or matching real or
-  saved uids, or `SIGCONT` within the session. `kill(-1)` reaches only the
+- **Permission to signal** follows Linux: `CAP_KILL`, or the caller's real
+  or effective uid matching the target's real or saved one, or `SIGCONT`
+  within the session. `kill(-1)` reaches only the
   caller's pid namespace or its run of fwe, never other host processes.
 - **Restart:** a host call a signal interrupted runs again if no guest
   handler waits for the signal, or if the handler has `SA_RESTART` and the
@@ -588,7 +589,7 @@ sequenceDiagram
 | `eventfd` | none | a pipe plus a 64-bit counter; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
 | `timerfd` | none | a kqueue with one `EVFILT_TIMER`, millisecond resolution |
 | `signalfd` | none | a readiness pipe plus a queue of `signalfd_siginfo`; a pending signal the thread blocks and a signalfd watches moves onto it |
-| inotify | `kqueue` vnode events, FSEvents: no names, no open/read/close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |
+| inotify | `kqueue` vnode events (no names), FSEvents (paths, after the fact); neither reports open, read or close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |
 | futex, private | `__ulock_wait`/`__ulock_wake` (private) | per-process wait queues, outside the kernel lock |
 | futex, shared | `__ulock_wait2` with `UL_COMPARE_AND_WAIT_SHARED` | a slot table every fwe process maps, keyed as Linux keys a shared futex (Mach memory object + offset); each waiter sleeps on its slot's word, so a wake knows whom it woke |
 
@@ -607,7 +608,7 @@ settings are recorded and rebuilt in the child at the same numbers.
 | `MSG_NOSIGNAL` | `SO_NOSIGPIPE` | every socket gets `SO_NOSIGPIPE` |
 | `SCM_RIGHTS`: 64-bit `cmsg_len` | 32-bit | re-encoded |
 | `AF_UNIX` paths | 104-byte limit | resolved in the guest's root; a long one bound or connected from its directory with `pthread_fchdir_np` |
-| abstract `AF_UNIX` names | none | files in a per-host temporary directory (per network namespace) |
+| abstract `AF_UNIX` names | none | files in a per-host temporary directory, or in an fwe network namespace's own directory |
 | `SOCK_SEQPACKET` Unix sockets | none | a stream socket with length-prefixed frames (`crates/kernel/src/seqpacket.rs`) |
 | `AF_NETLINK`/`NETLINK_ROUTE` | none | in an fwe network namespace, answers for `lo`; elsewhere every request is `EOPNOTSUPP` |
 | `SO_PEERCRED` | `LOCAL_PEERCRED` | peer pid in the caller's pid namespace, ids as the guest sees them |
@@ -691,8 +692,8 @@ processes in it name; a process in an initial namespace sees the host's
 
 ## cgroups
 
-macOS has no cgroups and no way to hold a process to a memory or CPU
-budget. fwe keeps one cgroup v2 tree for the user's fwe processes, as real
+macOS has no cgroups and no unprivileged way to hold a process to a
+memory or CPU budget. fwe keeps one cgroup v2 tree for the user's fwe processes, as real
 directories with interface files (`crates/kernel/src/cgroupfs.rs`):
 
 - `mkdir`/`rmdir`, `cgroup.procs`, `cgroup.subtree_control` with Linux's
@@ -706,7 +707,8 @@ directories with interface files (`crates/kernel/src/cgroupfs.rs`):
 
 ## Mounts
 
-macOS mounts need root and have no bind mounts, overlays or propagation.
+macOS mounts are system-wide and need root; there are no mount
+namespaces, no bind or overlay mounts of Linux's kind and no propagation.
 fwe's mounts exist only in its tables (`crates/kernel/src/mounts.rs`,
 `mountops.rs`, `mountapi.rs`, `overlay.rs`):
 
@@ -735,7 +737,7 @@ fwe's mounts exist only in its tables (`crates/kernel/src/mounts.rs`,
 
 ## seccomp
 
-macOS has nothing like seccomp. fwe runs each filter, classic BPF over
+macOS has no seccomp. fwe runs each filter, classic BPF over
 Linux's `seccomp_data` (`AUDIT_ARCH_AARCH64`), before either backend routes
 a call (`crates/kernel/src/seccomp.rs`); the action of highest precedence
 wins. Filters apply to every thread of the process and are kept across
@@ -759,7 +761,7 @@ with `ENOSYS`, as with no tracer or listener.
 | clocks: `REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`, `*_COARSE`, `*_ALARM`, CPU-time | fewer | mapped onto the host's realtime, monotonic, raw and CPU-time clocks |
 | setting the clock (`CAP_SYS_TIME`) | root | refused with `EPERM` after Linux's argument checks, as in a container |
 | nice, scheduling policies | own scheduler | kept in the process record with Linux's checks, inherited; the host schedules every process alike |
-| `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`); `CPU`, `FSIZE`, `DATA`, `STACK`, `CORE`, `NPROC`, `NOFILE`, `AS` are the host's |
+| `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`); `NOFILE` is virtual, below fwe's reserved descriptors; `CPU`, `FSIZE`, `DATA`, `STACK`, `CORE`, `NPROC`, `AS` are the host's |
 | `personality` | none | kept per process; `UNAME26` and `STICKY_TIMEOUTS` act |
 
 ## Not available
@@ -774,4 +776,10 @@ These fail with `ENOSYS` (any call not dispatched in
 - `io_uring`, the AIO calls, `userfaultfd`, `perf_event_open`, `fanotify`,
   `kcmp`, `landlock`, `rseq`, `membarrier`, `futex_waitv`,
   `name_to_handle_at`/`open_by_handle_at`;
-- kernel modules, `kexec`, `reboot`, swap, quotas, NUMA policy.
+- `epoll_pwait2`, `sendmmsg`/`recvmmsg`, `times`, `getcpu`,
+  `ioprio_get`/`ioprio_set`, the `pkey_*` calls, `process_madvise`,
+  `process_mrelease`, `memfd_secret`, `cachestat`, `map_shadow_stack`,
+  `remap_file_pages`, the `lsm_*` calls;
+- `sync`, `syncfs`, `sync_file_range`, `readahead`;
+- kernel modules, `kexec`, `reboot`, swap, quotas, NUMA policy, `acct`,
+  `syslog`, `vhangup`.
