@@ -2793,6 +2793,28 @@ const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-ex
     unlinked: name gone true, still sends 0, receives kept\n\
     made again: true, empty true\n";
 
+const PIDFD: &str = "self: cloexec true, link anon_inode:[pidfd], fdinfo pid true\n\
+    errors: -1 true, flags true, none true\n\
+    child: nonblock true, ended early false, waitid EAGAIN, info 0 pid true exit asked false\n\
+    ended: readable true, waitid 0 status 7, info 0 exit true code 0x700, without exit ESRCH, signal ESRCH\n\
+    signal: sent 0, another number EINVAL, child saw the value true\n\
+    clone3: pidfd true, cloexec true, epoll 1 data 9, waitid 0 status 5\n\
+    inherited: the fork child saw its sibling end true, reaped 0\n\
+    thread: without PIDFD_THREAD EINVAL, ended while running false, ended after true\n\
+    getfd: got true, cloexec true, file \"from the child, and the parent\", not open EBADF, flags EINVAL, not a pidfd EBADF\n\
+    namespaces: uts descriptor true, setns joined it true\n\
+    not a pidfd: signal EBADF, waitid EBADF\n";
+
+/// Process descriptors: opened, polled and waited for, signalled through,
+/// made by `clone3`, inherited by a fork child, of a thread, taken a
+/// descriptor from, and a way into a process's namespaces.
+#[test]
+fn process_descriptors_name_processes() {
+    let out = fwe(&rust_guest("pidfd"), &[]);
+    assert_eq!(stdout(&out), PIDFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// POSIX message queues: messages by priority, the status line, a queue
 /// that outlives its name, and the notifications another process's
 /// message sets off (a signal with the value and sender, and the C
@@ -3495,6 +3517,13 @@ fn hv_message_queues_deliver_and_notify() {
 /// The new mount API in the VM (see
 /// [`the_new_mount_api_makes_and_attaches_mounts`]): its structures are
 /// the guest's memory, translated.
+#[test]
+fn hv_process_descriptors_name_processes() {
+    let Some(out) = fwe_hv(&rust_low_guest("pidfd"), &[]) else { return };
+    assert_eq!(stdout(&out), PIDFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 #[test]
 fn hv_the_new_mount_api_makes_and_attaches_mounts() {
     let Some(out) = fwe_hv(&rust_low_guest("mountapi"), &[]) else { return };

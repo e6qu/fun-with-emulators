@@ -256,7 +256,7 @@ impl<P: Platform> Kernel<P> {
         self.queue_info(tgid as i32, Some(tid as i32), s, info)
     }
 
-    fn queue_info(&mut self, tgid: i32, tid: Option<i32>, s: u64, info: u64) -> i64 {
+    pub(crate) fn queue_info(&mut self, tgid: i32, tid: Option<i32>, s: u64, info: u64) -> i64 {
         let raw: [u8; 128] = guest!(uaccess::read(info));
         let word = |at: usize| i32::from_ne_bytes(raw[at..at + 4].try_into().unwrap());
         let code = word(8);
@@ -275,6 +275,10 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let Some(host) = crate::pidns::to_host(tgid) else { return err(errno::ESRCH) };
+        // As `kill` is: only a process the caller may signal.
+        if tgid != me && !self.may_signal(host, s) {
+            return err(errno::EPERM);
+        }
         if s == 0 {
             return 0;
         }

@@ -810,7 +810,7 @@ impl<P: Platform> Kernel<P> {
     /// `check_kill_permission`): with `CAP_KILL`, when its real or
     /// effective user id is the target's real or saved one, or `SIGCONT`
     /// within its session. A process fwe has no record of counts as root's.
-    fn may_signal(&self, target: i32, sig: u64) -> bool {
+    pub(crate) fn may_signal(&self, target: i32, sig: u64) -> bool {
         if self.creds.has(crate::caps::CAP_KILL) {
             return true;
         }

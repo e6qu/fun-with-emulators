@@ -854,6 +854,9 @@ impl Fs {
         if let Some(t) = crate::nsfd::target(fd) {
             return t;
         }
+        if crate::pidfd::of(fd).is_some() {
+            return b"anon_inode:[pidfd]".to_vec();
+        }
         // A descriptor of a `/proc` link: the link's path.
         if let Some(link) = crate::fdmarks::proc_link(fd).and_then(|ns| self.from_ns(&ns)) {
             return link;
@@ -968,6 +971,9 @@ impl Fs {
             ));
         }
         if let Some(lines) = crate::inotify::fdinfo(fd) {
+            out.push_str(&lines);
+        }
+        if let Some(lines) = crate::pidfd::fdinfo(fd) {
             out.push_str(&lines);
         }
         out.into_bytes()

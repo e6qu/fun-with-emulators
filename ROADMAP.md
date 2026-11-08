@@ -95,7 +95,10 @@ capabilities. *crun, podman and containerd run standard images.*
   handlers cleared, `CLONE_VM` processes, and `getcpu`, `syslog`,
   `membarrier`, `readahead`, `sync_file_range` and `vhangup`;
 - `openat2` with its `resolve` rules, `epoll_pwait2`, `mseal`,
-  `futex_waitv` and `remap_file_pages`.
+  `futex_waitv` and `remap_file_pages`;
+- process descriptors: `pidfd_open`, `CLONE_PIDFD`, `pidfd_send_signal`,
+  `pidfd_getfd`, `waitid(P_PIDFD)`, `PIDFD_GET_INFO` and the namespace
+  requests, and `setns` with one.
 
 ## Left to 1.0
 
@@ -182,6 +185,8 @@ for it fall back:
 - x86_64 Linux binaries;
 - `kcmp`: macOS cannot tell whether two descriptors share an open file
   description, and programs that use it (CRIU, systemd) fall back;
+- choosing pids, as checkpoint and restore does (`clone3`'s `set_tid`,
+  `/proc/sys/kernel/ns_last_pid`): macOS assigns the host's;
 - `fanotify`: its permission events would hold every process's file
   calls on another's answer; it is refused (`ENOSYS`), and programs fall
   back to inotify;

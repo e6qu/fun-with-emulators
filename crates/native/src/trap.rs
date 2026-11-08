@@ -401,6 +401,11 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     } else if nr == fwe_abi::nr::WAITID {
         let r = crate::process::do_waitid(&regs);
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+    } else if nr == fwe_abi::nr::PIDFD_GETFD {
+        // The target is asked for its descriptor without the kernel lock.
+        let req = kernel().as_ref().unwrap().getfd_request(args[0], args[1], args[2]);
+        let r = fwe_kernel::pidfd::getfd(req);
+        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
     } else if fwe_kernel::ipcops::waits(nr) {
         // A semaphore or message queue wait: what it needs of the kernel is
         // taken under the lock, and it waits without it.

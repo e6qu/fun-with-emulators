@@ -168,6 +168,11 @@ pub fn maps_path(pid: i32) -> Option<Vec<u8>> {
     Some([path(pid)?, b".maps".to_vec()].concat())
 }
 
+/// Host process `pid`'s parent as the host has it, if it exists.
+pub fn host_parent(pid: i32) -> Option<i32> {
+    host_info(pid).map(|(_, ppid, _)| ppid)
+}
+
 /// When host process `pid` started, if it exists.
 pub fn start_time(pid: i32) -> Option<u64> {
     host_info(pid).map(|(start, _, _)| start)

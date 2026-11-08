@@ -1507,6 +1507,11 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             let ctx = kernel().as_ref().unwrap().ipc_context();
             fwe_kernel::ipcops::blocking(ctx, n, host_args)
         }
+        nr::PIDFD_GETFD => {
+            let req =
+                kernel().as_ref().unwrap().getfd_request(host_args[0], host_args[1], host_args[2]);
+            fwe_kernel::pidfd::getfd(req)
+        }
         nr::RT_SIGTIMEDWAIT => {
             let want: u64 = uaccess::read(host_args[0]).unwrap_or(0);
             kernel().as_mut().unwrap().catch_for_wait(want);

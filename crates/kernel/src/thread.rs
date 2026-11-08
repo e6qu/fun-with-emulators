@@ -578,6 +578,8 @@ pub fn unregister(pending: &Arc<Pending>) {
 
 /// Forget the calling thread's registration as it exits.
 pub fn unregister_current() {
+    // Its process descriptors (`PIDFD_THREAD`) say it has ended.
+    crate::pidfd::thread_gone(tid());
     drop_wait_pipe();
     let own = OWN.with(|o| o.replace(std::ptr::null()));
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);

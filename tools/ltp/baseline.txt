@@ -366,6 +366,12 @@ ioctl_ns07
 ioctl05
 ioctl06
 ioctl10
+ioctl_pidfd01
+ioctl_pidfd02
+ioctl_pidfd03
+ioctl_pidfd04
+ioctl_pidfd05
+ioctl_pidfd06
 keyctl01
 keyctl02
 keyctl03
@@ -550,6 +556,13 @@ pause01
 pause02
 personality01
 personality02
+pidfd_getfd02
+pidfd_open01
+pidfd_open02
+pidfd_open03
+pidfd_open04
+pidfd_send_signal01
+pidfd_send_signal02
 pipe01
 pipe02
 pipe03

@@ -208,6 +208,7 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
             let first = told.get_or_insert_with(HashSet::new).insert((e.pid, e.start));
             drop(told);
             crate::pidns::released(&e.numbers, e.pid);
+            crate::pidfd::reaped(e.pid, e.status);
             if first && sigchld_taken() {
                 // Reaped before the watcher saw it end: its SIGCHLD is
                 // still owed, as Linux sends it before `wait` can return.

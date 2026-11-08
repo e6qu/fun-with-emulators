@@ -1285,7 +1285,7 @@ direct macOS counterpart for the shared case:
 |---|---|---|---|
 | Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native) or a host thread with its own vCPU (VM) |
 | `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either in the VM; natively `EINVAL` without a stack, `ENOSYS` without `CLONE_VM`); the native backend accepts `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`, `DETACHED` and fails others with `ENOSYS` |
-| `clone3` | `struct clone_args` | — | read and treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers; `CLONE_PIDFD` and `set_tid` fail with `ENOSYS` |
+| `clone3` | `struct clone_args` | — | read and treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers, `CLONE_PIDFD` makes the parent a process descriptor of it before the fork and points it at the child after; `set_tid` fails with `ENOSYS` |
 | Per-thread state | in the task | — | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
 | futex, private | a wait queue per address | `__ulock_wait`/`__ulock_wake` (private) | per-process wait queues, outside the kernel lock |
 | futex, shared | keyed by the page's backing object | `__ulock_wait2` with `UL_COMPARE_AND_WAIT_SHARED` | a slot table every fwe process maps, keyed as Linux keys a shared futex (Mach memory object + offset); each waiter sleeps on its slot's word, so a wake knows whom it woke |
@@ -1353,6 +1353,7 @@ host processes; the flags and pid arguments need translating:
 | `WCONTINUED` | 8 | `0x10` | translated |
 | `__WALL`, `__WCLONE`, `__WNOTHREAD` | select which children | none | accepted; every child is an fwe process, so they change nothing |
 | a reaper's `wait` | its children and adopted orphans | its children only | its host children, then the orphans fwe recorded for it ([orphans and reapers](#orphans-and-reapers)) |
+| `waitid(P_PIDFD, fd)` | the process a pidfd names | none | `P_PID` of the host pid the descriptor names; with `PIDFD_NONBLOCK` as `WNOHANG`, `EAGAIN` when nothing changed |
 
 Child pids are host pids (or their numbers in the guest's pid namespace),
 so `wait`, `kill` and `setpgid` act on real processes. What comes back (the
@@ -1493,9 +1494,12 @@ a kqueue, a pipe, or both, so that the guest can mix them in one `epoll`:
 | `timerfd` | none | a kqueue with one `EVFILT_TIMER`, millisecond resolution |
 | `signalfd` | none | a readiness pipe plus a queue of `signalfd_siginfo`; a pending signal the thread blocks and a signalfd watches moves onto it |
 | inotify | `kqueue` vnode events (no names), FSEvents (paths, after the fact); neither reports open, read or close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |
+| pidfd (`pidfd_open`, `CLONE_PIDFD`) | `kqueue`'s `EVFILT_PROC` | a kqueue watching the process's exit, never read, so it stays readable once the process has ended (a zombie, which the host will not report again, gets a user event); a `PIDFD_THREAD` one of another thread of the process gets the user event as the thread exits |
 
-A host `fork` child gets no kqueues, so epoll interest lists and timerfd
-settings are recorded and rebuilt in the child at the same numbers.
+A host `fork` child gets no kqueues, and an `execve` closes them, so epoll
+interest lists, timerfd settings and process descriptors are recorded and
+rebuilt at the same numbers in the child (and across an `execve` that
+re-executes fwe).
 
 ### IPC
 
@@ -1699,7 +1703,6 @@ A few Linux facilities have no implementation yet. These fail with
 noted under `--strace`):
 
 - `ptrace` and `process_vm_readv`/`writev`;
-- pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`);
 - POSIX timers (`timer_create` and the rest);
 - `io_uring`, the AIO calls, `userfaultfd`, `perf_event_open`, `fanotify`,
   `kcmp`, `landlock`, `rseq`,

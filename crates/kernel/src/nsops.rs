@@ -63,6 +63,9 @@ pub struct ForkNs {
     clear_sighand: bool,
     /// The signal its end is told with.
     exit_signal: u64,
+    /// `CLONE_PIDFD`: the descriptor made ready for the child, and where it
+    /// goes.
+    pidfd: Option<(i32, u64)>,
 }
 
 impl<P: Platform> Kernel<P> {
@@ -144,6 +147,28 @@ impl<P: Platform> Kernel<P> {
     /// inherits it. The caller holds the kernel lock until
     /// [`Kernel::fork_parent`] or [`Kernel::fork_child`].
     pub fn fork_begin(&mut self, a: &crate::CloneArgs) -> Result<ForkNs, i32> {
+        // `CLONE_PIDFD`: the descriptor, and that it can be put where it
+        // goes, before anything else is done for the child.
+        let pidfd = if a.flags & CLONE_PIDFD != 0 {
+            let word: i32 = crate::uaccess::read(a.pidfd).map_err(|_| errno::EFAULT)?;
+            crate::uaccess::write(a.pidfd, word).map_err(|_| errno::EFAULT)?;
+            Some((crate::pidfd::reserve()?, a.pidfd))
+        } else {
+            None
+        };
+        match self.fork_begin_ns(a) {
+            Ok(t) => Ok(ForkNs { pidfd, ..t }),
+            Err(e) => {
+                if let Some((fd, _)) = pidfd {
+                    // SAFETY: the descriptor made above, not yet the guest's.
+                    unsafe { libc::close(fd) };
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn fork_begin_ns(&mut self, a: &crate::CloneArgs) -> Result<ForkNs, i32> {
         let flags = a.flags;
         // Limits left for this process are its own before its child
         // inherits them.
@@ -257,6 +282,7 @@ impl<P: Platform> Kernel<P> {
             cgroup,
             clear_sighand,
             exit_signal,
+            pidfd: None,
         })
     }
 
@@ -286,6 +312,13 @@ impl<P: Platform> Kernel<P> {
             // It holds this process's session keyring.
             crate::keys::forked(child);
             crate::reaper::set_exit_signal(child, t.exit_signal);
+            if let Some((fd, at)) = t.pidfd {
+                crate::pidfd::attach(fd, child);
+                let _ = crate::uaccess::write(at, fd);
+            }
+        } else if let Some((fd, _)) = t.pidfd {
+            // SAFETY: the descriptor made for the child there is none of.
+            unsafe { libc::close(fd) };
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {

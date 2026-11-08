@@ -289,6 +289,18 @@ does for it, then the per-process state fwe keeps. Inside fwe:
   record never outlives its process into another with the same pid),
   cgroup, namespaces, name, command line, program, ancestors, subreaper
   flag, nice value, scheduling policy and `oom_score_adj`.
+- **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
+  watching the process's exit, marked with what it names (see
+  [linux-on-macos.md](linux-on-macos.md#waiting-and-events));
+  `pidfd_send_signal` is `kill`, `tgkill` or `rt_sigqueueinfo` of the
+  process it names; `PIDFD_GET_INFO` gives its pid, parent and ids, and
+  once this process has reaped it, its wait status; the
+  `PIDFD_GET_*_NAMESPACE` requests and `setns` with one use its
+  namespaces as `/proc/<pid>/ns` has them. `pidfd_getfd` queues a
+  request in the target's mailbox and wakes it; its wake handler sends the
+  descriptor as `SCM_RIGHTS` to a datagram socket the caller bound beside
+  the process records (or, where that path is too long for a socket's
+  address, in `/tmp/fwe-<uid>-fd`, which only the user may use).
 - **Priorities and policies:** `setpriority`/`getpriority` and the
   `sched_*` calls (`crates/kernel/src/sched.rs`) are kept in the record
   with Linux's checks and inherited (`SCHED_RESET_ON_FORK` honoured); the
@@ -549,7 +561,9 @@ shapes differently:
   `exe`, `cgroup`, `ns`, `fd`, `oom_score_adj` and the maps, from
   its records and what the host reports. `oom_score_adj` is inherited
   (going below the last value a privileged process set takes
-  `CAP_SYS_RESOURCE`).
+  `CAP_SYS_RESOURCE`). A host process fwe did not start (outside a pid
+  namespace, any process number names the host's, 1 its `launchd`) is an
+  empty directory while it exists.
 
 ## Event descriptors and inotify
 
@@ -774,7 +788,7 @@ which are to be lifted for 1.0 and which are not planned.
   shared.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
-- `clone3` has no pidfds or chosen tids (`ENOSYS`); `waitid` reports no
+- `clone3` has no chosen tids (`ENOSYS`); `waitid` reports no
   `rusage`; a core file holds the dying thread's registers only, and a
   `core_pattern` piping to a program dumps none; a process ended by a
   signal the host lacks exits on the host with status 128 + the signal,
@@ -783,6 +797,14 @@ which are to be lifted for 1.0 and which are not planned.
   and adoption, but on the host it is the caller's child, which the
   caller's parent cannot `wait` for (nor gets `SIGCHLD` of) while the
   caller lives.
+- A process descriptor cannot be passed over a Unix socket (`EINVAL`:
+  the host passes no kqueue); `PIDFD_GET_INFO` gives a wait status only
+  to the process that reaped it, and no cgroup id; a `PIDFD_THREAD`
+  descriptor names only a thread of the caller's own process, and in a
+  fork child it stands for the parent's process; `pidfd_getfd` of a
+  descriptor fwe stands in for (an eventfd, a timerfd, a signalfd) gives
+  the host object behind it, as one passed over a socket does, and waits
+  while the target is stopped.
 - A parent-death signal (`PR_SET_PDEATHSIG`) is recorded but never sent;
   a new thread does not inherit its creator's name.
 

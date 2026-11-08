@@ -299,6 +299,28 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The identity of the initial namespace of `kind` (a `/proc/<pid>/ns`
+/// name), if it is one.
+fn init_ns(kind: &[u8]) -> Option<u64> {
+    use crate::ns::*;
+    Some(match kind {
+        b"uts" => INIT_UTS,
+        b"ipc" => INIT_IPC,
+        b"net" => INIT_NET,
+        b"pid" | b"pid_for_children" => INIT_PID,
+        b"user" => INIT_USER,
+        b"cgroup" => INIT_CGROUP,
+        b"mnt" => crate::mounts::store::INIT_ID,
+        _ => return None,
+    })
+}
+
+/// The link `/proc/<pid>/ns/<kind>` reads for a process in the namespaces
+/// whose records are `dirs` (empty for a kind there is none of).
+pub(crate) fn ns_link_of(kind: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
+    init_ns(kind).map_or_else(Vec::new, |init| ns_link(kind, dirs, init))
+}
+
 /// A namespace's link (`/proc/<pid>/ns/<kind>`) for a process in the
 /// namespaces whose records are `dirs`: the identity the record has
 /// ([`crate::shared::Record`]), or `init`'s when it is in the initial one.
@@ -338,15 +360,14 @@ pub fn user_record(dirs: &[Vec<u8>]) -> Option<crate::shared::Record<crate::user
 /// process `pid` of the reader's pid namespace behind host pid `host`.
 pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
     let Some(rec) = crate::procreg::read(host) else {
-        // A process fwe has no record of: only what the host says.
-        return match (crate::procreg::start_time(host), sub) {
-            (None, _) => Entry::Missing,
-            (Some(_), b"") => Entry::Dir,
-            (Some(_), _) => Entry::Missing,
+        // A process fwe has no record of: only that it exists (one of
+        // another user's, such as the host's process 1, too).
+        return match sub {
+            b"" if crate::host::process_exists(host) => Entry::Dir,
+            _ => Entry::Missing,
         };
     };
     let Some(h) = host_info(host) else { return Entry::Missing };
-    use crate::ns::*;
     match sub {
         b"" | b"/ns" | b"/task" => Entry::Dir,
         b"/stat" => Entry::File(stat_line(pid, &rec.comm, &h)),
@@ -393,17 +414,10 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         },
         _ => {
             if let Some(kind) = sub.strip_prefix(b"/ns/") {
-                let init = match kind {
-                    b"uts" => INIT_UTS,
-                    b"ipc" => INIT_IPC,
-                    b"net" => INIT_NET,
-                    b"pid" | b"pid_for_children" => INIT_PID,
-                    b"user" => INIT_USER,
-                    b"cgroup" => INIT_CGROUP,
-                    b"mnt" => crate::mounts::store::INIT_ID,
-                    _ => return Entry::Missing,
+                return match init_ns(kind) {
+                    Some(init) => Entry::Symlink(ns_link(kind, &rec.ns, init)),
+                    None => Entry::Missing,
                 };
-                return Entry::Symlink(ns_link(kind, &rec.ns, init));
             }
             if let Some(t) = sub.strip_prefix(b"/task/") {
                 // The main thread only: fwe knows another's threads by count.
