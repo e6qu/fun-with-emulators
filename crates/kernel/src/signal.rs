@@ -406,6 +406,16 @@ impl<P: Platform> Kernel<P> {
         if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN {
             return false;
         }
+        if self.tracer.enabled && !self.tracer.failures_only {
+            // As strace shows a delivery, with what the host gave the
+            // signal it came as.
+            let (code, pid) =
+                crate::host::signal_to_host(sig).map_or((0, 0), crate::host::last_host_info);
+            self.tracer.note(&format!(
+                "--- signal {sig} {{si_code={}, si_pid={}, si_uid={}, si_value={:#x}}} (host: code {code:#x}, pid {pid}) ---",
+                info.code, info.pid, info.uid, info.value
+            ));
+        }
 
         // Choose the stack: the alternate stack if requested and available.
         // A handler already running on the alternate stack keeps using it

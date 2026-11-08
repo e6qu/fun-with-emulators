@@ -548,6 +548,12 @@ pub unsafe fn signal_info(
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+    if let Some(slot) = LAST_HOST_INFO.get(sig as usize) {
+        slot.store(
+            ((code as u32 as u64) << 32) | pid as u32 as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
     if sig == libc::SIGCHLD && pid == 0 {
         let saved = last_errno();
         // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
@@ -607,6 +613,18 @@ pub unsafe fn signal_info(
         status = signal::SIGCONT as i32;
     }
     crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value }
+}
+
+/// The code and sender the host last gave each host signal, as
+/// `(code << 32) | pid`, for the trace of a signal's delivery.
+static LAST_HOST_INFO: [std::sync::atomic::AtomicU64; 32] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+
+/// What the host last gave host signal `sig`: its code and sender.
+pub fn last_host_info(sig: libc::c_int) -> (i32, i32) {
+    let v =
+        LAST_HOST_INFO.get(sig as usize).map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst));
+    ((v >> 32) as u32 as i32, v as u32 as i32)
 }
 
 /// The siginfo of a signal another fwe process sent, as its note
