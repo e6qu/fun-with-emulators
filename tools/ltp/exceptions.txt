@@ -12,3 +12,7 @@ inotify03 it remounts its device and expects a file it wrote there; a new tmpfs 
 mount02 a tmpfs (LTP_DEV_FS_TYPE) takes any source and stacks over itself, so its char-device, mounted-folder and invalid-device cases mount where a disk filesystem refuses
 umount2_01 it remounts its device after MNT_DETACH and expects the file it wrote; a new tmpfs (LTP_DEV_FS_TYPE) starts empty
 fmtmsg01 not built: musl has no addseverity
+clone08 musl's clone() refuses CLONE_THREAD, CLONE_SETTLS and CLONE_CHILD_CLEARTID (EINVAL) without asking the kernel
+clone10 musl's clone() refuses CLONE_THREAD, CLONE_SETTLS and CLONE_CHILD_CLEARTID (EINVAL) without asking the kernel
+sigtimedwait01 musl's sigtimedwait retries a wait the kernel ends with EINTR, so the test's interrupted wait never returns
+sigwaitinfo01 musl's sigwaitinfo retries a wait the kernel ends with EINTR, so the test's interrupted wait never returns

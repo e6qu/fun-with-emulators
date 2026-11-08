@@ -194,11 +194,22 @@ pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
 fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
     let off = offset(sig)?;
     // SAFETY: getpid cannot fail.
-    if OWN_PID.load(Ordering::SeqCst) != unsafe { libc::getpid() } {
-        // Not open for this process yet (a fork child before it starts).
-        return None;
-    }
-    let fd = OWN.load(Ordering::SeqCst);
+    let me = unsafe { libc::getpid() };
+    // Not open for this process yet (a fork child before it starts, which
+    // may be sent a signal at once): opened by its path for the read.
+    let opened = if OWN_PID.load(Ordering::SeqCst) == me {
+        None
+    } else {
+        let mut buf = [0u8; 512];
+        let path = mailbox(me, &mut buf)?;
+        // SAFETY: a NUL-terminated path; async-signal-safe.
+        let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        Some(fd)
+    };
+    let fd = opened.unwrap_or_else(|| OWN.load(Ordering::SeqCst));
     let saved = crate::host::last_errno();
     let mut slot = [0u8; SLOT];
     // SAFETY: fwe's own descriptor of the mailbox; a buffer of `SLOT`
@@ -212,6 +223,10 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
         }
         n == SLOT as isize && pid != 0
     };
+    if let Some(fd) = opened {
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+    }
     crate::host::set_errno(saved);
     let word = |at: usize| slot[at..at + 4].try_into().unwrap();
     got.then(|| {
@@ -223,6 +238,120 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
         };
         (note, u64::from_ne_bytes(slot[8..16].try_into().unwrap()))
     })
+}
+
+/// The queue of signals the host has no equivalent of (Linux's real-time
+/// signals, `SIGSTKFLT`, `SIGPWR`), after the host signals' slots: each
+/// entry is the Linux signal (0: free), the sender's pid and uid, the
+/// `si_code` and the value. A sender queues one under the mailbox's lock
+/// ([`queue`]), then wakes the target with [`crate::host::WAKE_SIGNAL`],
+/// whose handler takes them all ([`drain`]).
+const QUEUE_AT: usize = SIGNALS * SLOT;
+/// Entries in the queue: as many signals as may wait for a process.
+const QUEUE_LEN: usize = 64;
+const ENTRY: usize = 32;
+
+/// Queue Linux signal `sig`, which the host lacks, for host process
+/// `target`, sent with `code` and `value` (and this process as sender):
+/// a standard one already queued is not queued again, as Linux keeps one;
+/// a full queue refuses a real-time one (`EAGAIN`). The caller wakes the
+/// target.
+pub fn queue(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
+    let mut buf = [0u8; 512];
+    let path = mailbox(target, &mut buf).ok_or(fwe_abi::errno::ESRCH)?;
+    // SAFETY: plain host calls.
+    let (me, uid) = unsafe { (libc::getpid(), libc::getuid()) };
+    // SAFETY: a NUL-terminated path; buffers of their stated lengths; the
+    // descriptor is closed below.
+    unsafe {
+        let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+        if fd < 0 {
+            return Err(fwe_abi::errno::ESRCH);
+        }
+        libc::flock(fd, libc::LOCK_EX);
+        let mut q = [0u8; QUEUE_LEN * ENTRY];
+        let n = libc::pread(fd, q.as_mut_ptr().cast(), q.len(), QUEUE_AT as libc::off_t);
+        if n < q.len() as isize {
+            // Short of the queue: what is missing is free.
+            q[n.max(0) as usize..].fill(0);
+        }
+        let sig_at = |i: usize| i32::from_ne_bytes(q[i * ENTRY..i * ENTRY + 4].try_into().unwrap());
+        let r =
+            if sig < fwe_abi::signal::SIGRTMIN && (0..QUEUE_LEN).any(|i| sig_at(i) == sig as i32) {
+                Ok(())
+            } else if let Some(i) = (0..QUEUE_LEN).find(|&i| sig_at(i) == 0) {
+                let mut e = [0u8; ENTRY];
+                e[0..4].copy_from_slice(&(sig as i32).to_ne_bytes());
+                e[4..8].copy_from_slice(&me.to_ne_bytes());
+                e[8..12].copy_from_slice(&uid.to_ne_bytes());
+                e[12..16].copy_from_slice(&code.to_ne_bytes());
+                e[16..24].copy_from_slice(&value.to_ne_bytes());
+                let at = (QUEUE_AT + i * ENTRY) as libc::off_t;
+                if libc::pwrite(fd, e.as_ptr().cast(), ENTRY, at) == ENTRY as isize {
+                    Ok(())
+                } else {
+                    Err(fwe_abi::errno::EAGAIN)
+                }
+            } else {
+                Err(fwe_abi::errno::EAGAIN)
+            };
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+        r
+    }
+}
+
+/// In the wake signal's handler: take every queued signal for this
+/// process, each with its sender's note, in the order queued.
+/// Async-signal-safe.
+pub fn drain(mut post: impl FnMut(u64, Note)) {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let own = OWN_PID.load(Ordering::SeqCst) == me;
+    let fd = if own {
+        OWN.load(Ordering::SeqCst)
+    } else {
+        // A fork child before it opened its own: by its path.
+        let mut buf = [0u8; 512];
+        let Some(path) = mailbox(me, &mut buf) else { return };
+        // SAFETY: a NUL-terminated path.
+        unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) }
+    };
+    if fd < 0 {
+        return;
+    }
+    let saved = crate::host::last_errno();
+    let mut q = [0u8; QUEUE_LEN * ENTRY];
+    // SAFETY: fwe's descriptor of the mailbox; a buffer of its length.
+    let n = unsafe {
+        libc::flock(fd, libc::LOCK_EX);
+        let n = libc::pread(fd, q.as_mut_ptr().cast(), q.len(), QUEUE_AT as libc::off_t);
+        if n > 0 {
+            let zero = [0u8; QUEUE_LEN * ENTRY];
+            libc::pwrite(fd, zero.as_ptr().cast(), n as usize, QUEUE_AT as libc::off_t);
+        }
+        libc::flock(fd, libc::LOCK_UN);
+        if !own {
+            libc::close(fd);
+        }
+        n
+    };
+    crate::host::set_errno(saved);
+    for e in q[..n.max(0) as usize].chunks_exact(ENTRY) {
+        let word = |at: usize| e[at..at + 4].try_into().unwrap();
+        let sig = i32::from_ne_bytes(word(0));
+        if sig > 0 {
+            post(
+                sig as u64,
+                Note {
+                    pid: i32::from_ne_bytes(word(4)),
+                    uid: u32::from_ne_bytes(word(8)),
+                    code: i32::from_ne_bytes(word(12)),
+                    value: u64::from_ne_bytes(e[16..24].try_into().unwrap()),
+                },
+            );
+        }
+    }
 }
 
 /// In the host handler, for host signal `sig` that came with no sender: the
@@ -255,6 +384,29 @@ pub fn remove(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Signals the host lacks queue in a process's mailbox and are taken
+    /// in order, a standard one once, each with its sender and value.
+    #[test]
+    fn queued_signals_are_taken_in_order() {
+        init();
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        if DIR.get().is_none() {
+            return;
+        }
+        drain(|_, _| {});
+        queue(me, 34, -1, 7).unwrap();
+        queue(me, 16, 0, 0).unwrap();
+        queue(me, 16, 0, 0).unwrap();
+        queue(me, 34, -1, 8).unwrap();
+        let mut got = Vec::new();
+        drain(|sig, n| got.push((sig, n.code, n.value, n.pid)));
+        assert_eq!(got, [(34, -1, 7, me), (16, 0, 0, me), (34, -1, 8, me)]);
+        let mut again = 0;
+        drain(|_, _| again += 1);
+        assert_eq!(again, 0);
+    }
 
     #[test]
     fn mailbox_path_is_made_without_allocating() {

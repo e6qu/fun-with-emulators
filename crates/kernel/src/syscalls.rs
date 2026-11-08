@@ -318,6 +318,7 @@ impl<P: Platform> Kernel<P> {
             nr::SYMLINKAT => self.sys_symlinkat(a[0], a[1], a[2]),
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
+            nr::FCHMODAT2 => self.sys_fchmodat2(a[0], a[1], a[2], a[3]),
             nr::SETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], true),
             nr::LSETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], false),
             nr::FSETXATTR => self.sys_fsetxattr(a[0], a[1], a[2], a[3], a[4]),
@@ -524,7 +525,7 @@ impl<P: Platform> Kernel<P> {
             }
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
-            nr::PRCTL => self.sys_prctl(a[0], a[1], a[2]),
+            nr::PRCTL => self.sys_prctl(a[0], a[1], a[2], a[3], a[4]),
             nr::SHMGET => self.sys_shmget(a[0], a[1], a[2]),
             nr::SHMAT => self.sys_shmat(a[0], a[1], a[2]),
             nr::SHMDT => self.sys_shmdt(a[0]),
@@ -578,6 +579,15 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::GETCPU => self.sys_getcpu(a[0], a[1]),
+            nr::VHANGUP => self.sys_vhangup(),
+            nr::READAHEAD => self.sys_readahead(a[0]),
+            nr::SYNC_FILE_RANGE => self.sys_sync_file_range(a[0], a[1], a[2], a[3]),
+            nr::DELETE_MODULE => self.sys_delete_module(a[0]),
+            nr::SYSLOG => self.sys_syslog(a[0], a[1], a[2]),
+            nr::MEMBARRIER => self.sys_membarrier(a[0], a[1]),
+            nr::RT_SIGQUEUEINFO => self.sys_rt_sigqueueinfo(a[0], a[1], a[2]),
+            nr::RT_TGSIGQUEUEINFO => self.sys_rt_tgsigqueueinfo(a[0], a[1], a[2], a[3]),
             nr::PERSONALITY => personality(a[0]),
             nr::SCHED_SETSCHEDULER => self.sys_sched_setscheduler(a[0], Some(a[1]), a[2]),
             nr::SCHED_SETPARAM => self.sys_sched_setscheduler(a[0], None, a[1]),
@@ -643,6 +653,8 @@ impl<P: Platform> Kernel<P> {
             nr::SIGALTSTACK => self.sys_sigaltstack(a[0], a[1]),
             nr::KILL => self.sys_kill(a[0] as i32 as i64, a[1]),
             nr::TKILL => self.sys_tgkill(-1, a[0] as i32 as i64, a[1]),
+            // A tgid must name a process (`tkill` passes -1 for any).
+            nr::TGKILL if (a[0] as i32) <= 0 => err(errno::EINVAL),
             nr::TGKILL => self.sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(a[0], a[1]),
             nr::SETITIMER => self.sys_setitimer(a[0], a[1], a[2]),
@@ -1150,11 +1162,9 @@ impl<P: Platform> Kernel<P> {
 
     /// `prctl(option, arg2, ...)` for the options programs commonly use; any
     /// other fails with `EINVAL`, as an unknown option does on Linux.
-    fn sys_prctl(&mut self, option: u64, arg2: u64, arg3: u64) -> i64 {
+    fn sys_prctl(&mut self, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
         use fwe_abi::prctl::*;
-        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        /// `PR_SET_DUMPABLE`.
-        static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
+        use std::sync::atomic::Ordering::Relaxed;
         match option {
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
@@ -1216,24 +1226,56 @@ impl<P: Platform> Kernel<P> {
                 guest!(uaccess::write(arg2, i32::from(crate::procreg::own_subreaper())));
                 0
             }
-            PR_SET_NO_NEW_PRIVS if arg2 == 1 => {
+            PR_SET_NO_NEW_PRIVS if arg2 == 1 && arg3 | arg4 | arg5 == 0 => {
                 NO_NEW_PRIVS.store(true, Relaxed);
                 0
             }
             PR_SET_NO_NEW_PRIVS => err(errno::EINVAL),
+            PR_GET_NO_NEW_PRIVS if arg2 | arg3 | arg4 | arg5 != 0 => err(errno::EINVAL),
             PR_GET_NO_NEW_PRIVS => i64::from(NO_NEW_PRIVS.load(Relaxed)),
+            // Transparent huge pages are the host's; the choice is kept, as
+            // a fork child and an exec keep it.
+            PR_SET_THP_DISABLE if arg3 | arg4 | arg5 != 0 => err(errno::EINVAL),
+            PR_SET_THP_DISABLE => {
+                THP_DISABLE.store(arg2 != 0, Relaxed);
+                0
+            }
+            PR_GET_THP_DISABLE if arg2 | arg3 | arg4 | arg5 != 0 => err(errno::EINVAL),
+            PR_GET_THP_DISABLE => i64::from(THP_DISABLE.load(Relaxed)),
+            // The CPU's speculation is the host's to control: no misfeature
+            // is reported as one the process may change.
+            PR_GET_SPECULATION_CTRL if arg3 | arg4 | arg5 != 0 => err(errno::EINVAL),
+            PR_GET_SPECULATION_CTRL => match arg2 {
+                PR_SPEC_STORE_BYPASS | PR_SPEC_INDIRECT_BRANCH | PR_SPEC_L1D_FLUSH => {
+                    PR_SPEC_NOT_AFFECTED
+                }
+                _ => err(errno::ENODEV),
+            },
+            PR_SET_SPECULATION_CTRL if arg4 | arg5 != 0 => err(errno::EINVAL),
+            PR_SET_SPECULATION_CTRL => match arg2 {
+                PR_SPEC_STORE_BYPASS | PR_SPEC_INDIRECT_BRANCH | PR_SPEC_L1D_FLUSH => {
+                    err(errno::ENXIO)
+                }
+                _ => err(errno::ENODEV),
+            },
             PR_GET_SECCOMP => i64::from(crate::seccomp::mode()),
             PR_SET_SECCOMP => self.sys_seccomp(
                 if arg2 == 1 { 0 } else { arg2 - 1 },
                 0,
                 if arg2 == 1 { 0 } else { arg3 },
             ),
+            // Kept, as the host's timers have no slack to set.
+            PR_SET_TIMERSLACK => {
+                thread::set_slack(arg2);
+                0
+            }
+            PR_GET_TIMERSLACK => thread::slack() as i64,
             PR_SET_DUMPABLE if arg2 <= 1 => {
-                UNDUMPABLE.store(arg2 == 0, Relaxed);
+                crate::coredump::UNDUMPABLE.store(arg2 == 0, Relaxed);
                 0
             }
             PR_SET_DUMPABLE => err(errno::EINVAL),
-            PR_GET_DUMPABLE => i64::from(!UNDUMPABLE.load(Relaxed)),
+            PR_GET_DUMPABLE => i64::from(!crate::coredump::UNDUMPABLE.load(Relaxed)),
             PR_SET_PDEATHSIG if arg2 <= signal::NSIG => {
                 thread::set_pdeathsig(arg2);
                 0
@@ -2396,6 +2438,11 @@ fn bytemuck_u32(words: &[u32]) -> Vec<u8> {
 pub(crate) static NO_NEW_PRIVS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// `PR_SET_THP_DISABLE`: remembered (and shown), kept across `fork` and
+/// `execve` as Linux keeps it.
+pub(crate) static THP_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The process's personality (`personality`), kept across `fork` and
 /// `execve` as Linux keeps a task's. Linux keeps one per thread; fwe one
 /// per process, which a program setting it before an `execve` (`setarch`)
@@ -2473,6 +2520,20 @@ fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
 
 /// The affinity `sched_setaffinity` set for this process, if it did.
 static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
+
+/// The CPU the caller is taken to run on: the first of its affinity (the
+/// host's scheduler places it where it will).
+pub(crate) fn own_cpu() -> usize {
+    let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    set.and_then(|words| {
+        words
+            .iter()
+            .enumerate()
+            .find(|(_, w)| **w != 0)
+            .map(|(i, w)| i * 64 + w.trailing_zeros() as usize)
+    })
+    .unwrap_or(0)
+}
 
 /// The online CPUs, as a mask of 64-bit words.
 fn online_cpus() -> Vec<u64> {
@@ -3125,5 +3186,44 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(k.syscall(nr::GETRANDOM, [buf.as_mut_ptr() as u64, 64, 0, 0, 0, 0]), 64);
         assert!(buf.iter().any(|&b| b != 0));
+    }
+
+    /// A pid that names no single process never reaches the host: the
+    /// host's -1 is every process of the user. None of these sends a
+    /// signal.
+    #[test]
+    fn no_guest_pid_signals_the_hosts_processes() {
+        let mut k = kernel();
+        let info = [0u8; 128];
+        for pid in [-1i64, 0, -5] {
+            let r = k.syscall(nr::RT_SIGQUEUEINFO, [pid as u64, 10, info.as_ptr() as u64, 0, 0, 0]);
+            assert_eq!(r, err(errno::ESRCH), "rt_sigqueueinfo to {pid}");
+        }
+        assert_eq!(host::kill(-1, libc::SIGUSR1), err(errno::ESRCH));
+        for pid in [-1, 0, -5] {
+            assert_eq!(host::kill_process(pid, libc::SIGUSR1), err(errno::ESRCH));
+        }
+        // tgkill's thread group must be a process.
+        assert_eq!(k.syscall(nr::TGKILL, [-1i64 as u64, 1, 0, 0, 0, 0]), err(errno::EINVAL));
+    }
+
+    /// `prctl`'s options that take no further arguments refuse them, and
+    /// the transparent-huge-page choice and speculation controls answer
+    /// as Linux does.
+    #[test]
+    fn prctl_arguments_are_checked() {
+        use fwe_abi::prctl::*;
+        let mut k = kernel();
+        let mut call = |a: [u64; 5]| k.syscall(nr::PRCTL, [a[0], a[1], a[2], a[3], a[4], 0]);
+        assert_eq!(call([PR_SET_NO_NEW_PRIVS, 1, 1, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call([PR_GET_NO_NEW_PRIVS, 1, 0, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call([PR_SET_THP_DISABLE, 1, 0, 0, 0]), 0);
+        assert_eq!(call([PR_GET_THP_DISABLE, 0, 0, 0, 0]), 1);
+        assert_eq!(call([PR_GET_THP_DISABLE, 1, 0, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call([PR_SET_THP_DISABLE, 0, 0, 0, 0]), 0);
+        assert_eq!(call([PR_GET_SPECULATION_CTRL, PR_SPEC_STORE_BYPASS, 0, 0, 0]), 0);
+        assert_eq!(call([PR_GET_SPECULATION_CTRL, 0, 1, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call([PR_GET_SPECULATION_CTRL, 9, 0, 0, 0]), err(errno::ENODEV));
+        assert_eq!(call([PR_SET_SPECULATION_CTRL, 0, 0, 0, 0]), err(errno::ENXIO));
     }
 }

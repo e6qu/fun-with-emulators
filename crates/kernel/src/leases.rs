@@ -251,7 +251,7 @@ fn tell(pid: i32, sig: u32, fd: i32) {
         if sig == 0 { (signal::SIGIO, signal::SI_KERNEL) } else { (u64::from(sig), POLL_MSG) };
     let Some(h) = crate::host::signal_to_host(sig) else { return };
     crate::signote::note_with(pid, h, code, fd as u64);
-    if crate::host::kill(pid, h) != 0 {
+    if crate::host::kill_process(pid, h) != 0 {
         crate::signote::unnote(pid, h);
     }
 }

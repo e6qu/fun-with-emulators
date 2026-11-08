@@ -424,7 +424,7 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
                 // carries. A real-time signal, which the host lacks, cannot
                 // reach it.
                 crate::signote::note_with(n.owner.0, h, info.code, info.value);
-                if crate::host::kill(n.owner.0, h) != 0 {
+                if crate::host::kill_process(n.owner.0, h) != 0 {
                     crate::signote::unnote(n.owner.0, h);
                 }
             }

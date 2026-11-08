@@ -373,7 +373,7 @@ pub(super) fn fork(
     let mut guard = backend::kernel();
     let Some(k) = guard.as_mut() else { return err(errno::EAGAIN) };
     // The child's namespaces, which its snapshot carries.
-    let token = match k.fork_begin(flags) {
+    let token = match k.fork_begin(&a) {
         Ok(t) => t,
         Err(e) => return err(e),
     };

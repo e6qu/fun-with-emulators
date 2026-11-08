@@ -191,6 +191,12 @@ const DIRS: &[DirDef] = &[
     (
         b"/proc/self",
         &[
+            (b"stat", DT_REG),
+            (b"status", DT_REG),
+            (b"comm", DT_REG),
+            (b"task", DT_DIR),
+            (b"cwd", DT_LNK),
+            (b"root", DT_LNK),
             (b"exe", DT_LNK),
             (b"cmdline", DT_REG),
             (b"fd", DT_DIR),
@@ -205,6 +211,7 @@ const DIRS: &[DirDef] = &[
             (b"oom_score_adj", DT_REG),
             (b"oom_adj", DT_REG),
             (b"oom_score", DT_REG),
+            (b"timerslack_ns", DT_REG),
             (b"maps", DT_REG),
             (b"smaps", DT_REG),
             (b"personality", DT_REG),
@@ -243,7 +250,6 @@ const DIRS: &[DirDef] = &[
             (b"osrelease", DT_REG),
             (b"version", DT_REG),
             (b"hostname", DT_REG),
-            (b"pid_max", DT_REG),
             (b"cap_last_cap", DT_REG),
             (b"ngroups_max", DT_REG),
             (b"overflowuid", DT_REG),
@@ -340,7 +346,6 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/sys/kernel/osrelease" => Entry::File(line(RELEASE.as_bytes())),
         b"/proc/sys/kernel/version" => Entry::File(b"#1 SMP PREEMPT\n".to_vec()),
         b"/proc/sys/kernel/hostname" => Entry::File(line(&info.hostname)),
-        b"/proc/sys/kernel/pid_max" => Entry::File(b"4194304\n".to_vec()),
         b"/proc/sys/kernel/cap_last_cap" => {
             Entry::File(format!("{}\n", crate::caps::CAP_LAST_CAP).into_bytes())
         }

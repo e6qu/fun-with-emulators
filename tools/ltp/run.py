@@ -28,8 +28,9 @@ import time
 
 # LTP's exit statuses (include/tst_res_flags.h), as bits.
 TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
-# A hard limit on each test, over LTP's own (30 s per run by default, which
-# tests that run longer raise themselves and report as they go).
+# A hard limit on each test, over LTP's own (30 s per run by default, times
+# LTP_TIMEOUT_MUL below; tests that run longer raise it themselves and
+# report as they go).
 HARD_LIMIT = 300
 # The System V IPC and message queue tests: each runs in an IPC namespace of
 # its own. They fill, count and limit what a namespace holds, which tests
@@ -143,6 +144,12 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         # A test given a device puts tmpfs on it, the filesystem fwe has
         # (LTP's default is ext2).
         "LTP_DEV_FS_TYPE": "tmpfs",
+        # A fork under fwe takes milliseconds, not Linux's tenth of one: a
+        # test that forks thousands of times (fork14) is given eight times
+        # LTP's time. One that runs for a set time instead (fork13's ten
+        # minutes) runs a tenth of it: the same checks, fewer rounds.
+        "LTP_TIMEOUT_MUL": "8",
+        "LTP_RUNTIME_MUL": "0.1",
         "HOME": guest_tmp,
         "LANG": "C",
     }

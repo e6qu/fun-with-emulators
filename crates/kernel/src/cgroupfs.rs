@@ -354,12 +354,7 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 } else {
                     crate::pidns::host_arg(pid)?
                 };
-                // No processes in a cgroup that enables controllers for its
-                // children, but at the root.
-                if cg != b"/" && !read_words(&[dir, b"/cgroup.subtree_control"].concat()).is_empty()
-                {
-                    return Err(errno::EBUSY);
-                }
+                may_join(cg)?;
                 procreg::set_cgroup(host, cg)?;
             }
             Ok(())
@@ -438,7 +433,7 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 "0" => false,
                 _ => return Err(errno::EINVAL),
             };
-            for pid in members(cg, true) {
+            for pid in members(cg, true).into_iter().filter(|&p| p > 0) {
                 // SAFETY: plain host call.
                 unsafe { libc::kill(pid, if on { libc::SIGSTOP } else { libc::SIGCONT }) };
             }
@@ -448,7 +443,7 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
             if text.trim() != "1" {
                 return Err(errno::EINVAL);
             }
-            for pid in members(cg, true) {
+            for pid in members(cg, true).into_iter().filter(|&p| p > 0) {
                 // SAFETY: plain host call.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
@@ -491,6 +486,16 @@ fn parse_size(v: &str) -> Option<u64> {
         _ => (v, 1),
     };
     num.parse::<u64>().ok()?.checked_mul(mul)
+}
+
+/// Whether a process may join cgroup `cg`: not one that enables
+/// controllers for its children, but at the root (`EBUSY`).
+pub fn may_join(cg: &[u8]) -> Result<(), i32> {
+    let dir = host_dir(cg)?;
+    if cg != b"/" && !read_words(&[&dir[..], b"/cgroup.subtree_control"].concat()).is_empty() {
+        return Err(errno::EBUSY);
+    }
+    Ok(())
 }
 
 /// Whether a `fork` in cgroup `cg` stays within the `pids.max` of it and

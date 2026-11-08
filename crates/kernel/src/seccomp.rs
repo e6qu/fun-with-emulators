@@ -301,13 +301,15 @@ pub fn install_filter(prog: u64, flags: u64, allowed: bool) -> Result<i64, i32> 
         // A listener descriptor for user notification is not offered.
         return Err(errno::EINVAL);
     }
-    if !allowed {
-        return Err(errno::EACCES);
-    }
+    // In Linux's order: the program's header read, its length checked,
+    // then the caller's standing.
     let hdr: [u64; 2] = crate::uaccess::read(prog)?;
     let len = (hdr[0] & 0xffff) as usize;
     if len == 0 || len > MAX_INSNS {
         return Err(errno::EINVAL);
+    }
+    if !allowed {
+        return Err(errno::EACCES);
     }
     let raw = crate::uaccess::read_bytes(hdr[1], len * 8)?;
     let insns: Vec<Insn> = raw

@@ -705,6 +705,18 @@ impl Fs {
             // The kernel's view of the process fills it in (see
             // `Kernel::self_status`); its place is held here.
             b"/proc/self/status" => return Some(crate::procfs::Entry::File(Vec::new())),
+            b"/proc/self/timerslack_ns" => {
+                // SAFETY: getpid cannot fail.
+                let (slack, _) = crate::procreg::slack(unsafe { libc::getpid() });
+                return Some(crate::procfs::Entry::File(format!("{slack}\n").into_bytes()));
+            }
+            // The main thread's name, as the process's.
+            b"/proc/self/comm" => {
+                // SAFETY: getpid cannot fail.
+                let host = unsafe { libc::getpid() };
+                let comm = crate::procreg::read(host).map(|r| r.comm).unwrap_or_default();
+                return Some(crate::procfs::Entry::File([&comm[..], b"\n"].concat()));
+            }
             b"/proc/self/uid_map" | b"/proc/self/gid_map" | b"/proc/self/setgroups" => {
                 if let Some(u) = &self.ns.user {
                     let n = u.get();
@@ -803,6 +815,9 @@ impl Fs {
         }
         if crate::inotify::instance_of(fd).is_some() {
             return b"anon_inode:inotify".to_vec();
+        }
+        if crate::mountapi::is_context(fd) {
+            return b"anon_inode:[fscontext]".to_vec();
         }
         // SAFETY: an all-zero stat is a valid out-parameter.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };

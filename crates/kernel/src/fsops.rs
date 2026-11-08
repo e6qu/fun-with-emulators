@@ -7,6 +7,14 @@ use fwe_abi::{Stat, Statx, err, errno, fcntl, statx_mask};
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 
+/// A host mode as Linux reports it: a symbolic link's permissions are
+/// always 0777 (the host's follow the umask it was made under).
+fn linux_mode(mode: u32) -> u32 {
+    // The file-type bits are the same on both.
+    use fwe_abi::stat::{S_IFLNK, S_IFMT};
+    if mode & S_IFMT == S_IFLNK { S_IFLNK | 0o777 } else { mode }
+}
+
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 fn stat_to_linux(s: &libc::stat) -> Stat {
     // A host device has the numbers Linux gives it.
@@ -15,7 +23,7 @@ fn stat_to_linux(s: &libc::stat) -> Stat {
     Stat {
         st_dev: s.st_dev as u64,
         st_ino: s.st_ino as u64,
-        st_mode: s.st_mode as u32,
+        st_mode: linux_mode(s.st_mode as u32),
         st_nlink: s.st_nlink as u32,
         st_uid: host::uid_to_linux(s.st_uid),
         st_gid: host::gid_to_linux(s.st_gid),
@@ -52,7 +60,7 @@ fn statx_from(s: &libc::stat) -> Statx {
         stx_nlink: s.st_nlink as u32,
         stx_uid: host::uid_to_linux(s.st_uid),
         stx_gid: host::gid_to_linux(s.st_gid),
-        stx_mode: s.st_mode as u16,
+        stx_mode: linux_mode(s.st_mode as u32) as u16,
         __spare0: 0,
         stx_ino: s.st_ino as u64,
         stx_size: s.st_size as u64,
@@ -177,6 +185,11 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if unsafe { libc::fstat(fd, &mut out) } < 0 {
         return Err(host::errno_to_linux(host::last_errno()));
     }
+    if crate::mountapi::is_context(fd) {
+        // An anonymous inode: owner read and write, of no file type.
+        out.st_mode = 0o600;
+        return Ok(out);
+    }
     let perm = crate::modes::guest_perm_fd(fd, &out);
     crate::modes::apply(&mut out, perm);
     Ok(out)
@@ -238,7 +251,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `openat` of `path`, read from the guest.
-    fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
+    pub(crate) fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         // Pseudo-terminal devices are synthesized, not served from the rootfs.
         if path == b"/dev/ptmx" {
             return crate::pty::open_master(flags);
@@ -1357,6 +1370,11 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_unlinkat(&mut self, dirfd: u64, path: u64, flags: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        self.unlink_path(dirfd, path, flags)
+    }
+
+    /// `unlinkat` of guest path `path`.
+    pub(crate) fn unlink_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64) -> i64 {
         if let Ok(r) = self.fs().resolve(dirfd as i32, &path, false)
             && r.fstype == crate::mounts::FsType::Cgroup2
         {
@@ -1582,6 +1600,22 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => err(e),
             })
         })
+    }
+
+    /// `fchmodat2(dirfd, path, mode, flags)`: `fchmodat` with flags,
+    /// `AT_SYMLINK_NOFOLLOW` (a link's mode cannot change: `EOPNOTSUPP`) and
+    /// `AT_EMPTY_PATH` (the descriptor's own file).
+    pub(crate) fn sys_fchmodat2(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
+        if flags & !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH) != 0 {
+            return err(errno::EINVAL);
+        }
+        if flags & fcntl::AT_EMPTY_PATH != 0 {
+            let p = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+            if p.is_empty() {
+                return self.sys_fchmod(dirfd, mode);
+            }
+        }
+        self.sys_fchmodat(dirfd, path, mode, flags)
     }
 
     pub(crate) fn sys_fchmodat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
@@ -1917,6 +1951,21 @@ impl<P: Platform> Kernel<P> {
         let legacy = match file {
             b"/oom_score_adj" => false,
             b"/oom_adj" => true,
+            b"/timerslack_ns" => {
+                let host = if who == b"self" {
+                    // SAFETY: getpid cannot fail.
+                    unsafe { libc::getpid() }
+                } else {
+                    crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
+                };
+                // Another process's takes CAP_SYS_NICE, as on Linux.
+                // SAFETY: getpid cannot fail.
+                let own = host == unsafe { libc::getpid() };
+                if !own && !self.creds.has(crate::caps::CAP_SYS_NICE) {
+                    return Some(Err(errno::EPERM));
+                }
+                return Some(Ok(crate::fdmarks::Mark::TimerSlack { host }));
+            }
             _ => return None,
         };
         let host = if who == b"self" {

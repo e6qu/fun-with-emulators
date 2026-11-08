@@ -2874,6 +2874,42 @@ fn hv_file_control_locks_signals_and_leases() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `procsig` guest prints, the memory-sharing line aside.
+const PROCSIG: &str = "queued to -1: true\n\
+    real-time to another: sent 0, taken with its value true\n\
+    signal 16 at once: (16, false)\n\
+    signal 8 at once: (8, false)\n\
+    signal 4 at once: (4, false)\n\
+    core of a fault: (11, true), an ELF core true\n\
+    core of SIGABRT: (6, true), an ELF core true\n\
+    end told with: SIGUSR2, reaped true\n\
+    memory shared: {shared}\n\
+    cpu limit: SIGXCPU true, then true\n\
+    timer slack: 70000, shown 70000, the child's true\n";
+
+/// Signals between processes and how processes end: a queued real-time
+/// signal, `rt_sigqueueinfo` to -1 refused, signals the moment a child is
+/// forked, core dumps, a clone's own exit signal, a child sharing the
+/// memory, the hard CPU limit and an inherited timer slack.
+#[test]
+fn process_signals_and_ends() {
+    let out = fwe(&rust_guest("procsig"), &[]);
+    let expected = PROCSIG.replace("{shared}", "true");
+    assert_eq!(stdout(&out), expected, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The same in the VM (see [`process_signals_and_ends`]), where a child
+/// sharing the memory while both run is refused: its pages would be in
+/// two VMs at once.
+#[test]
+fn hv_process_signals_and_ends() {
+    let Some(out) = fwe_hv(&rust_low_guest("procsig"), &[]) else { return };
+    let expected = PROCSIG.replace("{shared}", "refused");
+    assert_eq!(stdout(&out), expected, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `keys` guest prints.
 const KEYS: &str = "session true, key read true, described true\n\
     child shares the session true, its key here true\n\
@@ -4490,13 +4526,13 @@ fn proc_magic_links() {
 }
 
 /// A network namespace has sysctls of its own, checked as Linux checks
-/// them; the initial namespace's (the host's) cannot be changed.
+/// them, a new one's from Linux's defaults; root sets the initial one's.
 #[test]
 fn network_namespace_sysctls() {
     assert_eq!(
         containers("sysctl"),
-        "initial: 1 0\ninitial write: Permission denied (os error 13)\nnew: 1 0\n\
-         set: 0 2147483647\nbackwards: Invalid argument (os error 22)\ninitial after: 1 0\n\
+        "initial: 1 0\ninitial write: ok\nnew: 1 0\n\
+         set: 0 2147483647\nbackwards: 1 0\ninitial after: 0 0\n\
          listed: [\"ping_group_range\"]\n"
     );
 }

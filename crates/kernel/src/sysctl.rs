@@ -5,9 +5,10 @@
 //! namespace of fwe's keeps its own values in its record
 //! ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
 //! `/proc/sys` shows and a write there changes, with Linux's checks. The
-//! initial network namespace's are Linux's defaults and cannot be changed
-//! (they would be the host's); the initial IPC namespace is fwe's own, so
-//! root may change its limits.
+//! initial network namespace's start at Linux's defaults and are kept with
+//! the sysctls of no namespace: fwe consults them only for its own
+//! namespaces, so changing them changes nothing on the host. The initial
+//! IPC namespace is fwe's own, so root may change its limits.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::errno;
@@ -70,21 +71,29 @@ fn globals() -> Option<&'static crate::shared::Record<Globals>> {
 /// The value of the sysctl at `path` (under `/proc/sys`, `fs/inotify/...`)
 /// as a number, if it is one fwe keeps.
 pub fn number(path: &[u8]) -> Option<i64> {
+    text(path)?.trim().parse().ok()
+}
+
+/// The value of the sysctl at `path` (under `/proc/sys`), if it is one fwe
+/// keeps.
+pub fn text(path: &[u8]) -> Option<String> {
     let i = SYSCTLS.iter().position(|s| s.path == path)?;
-    value(i).trim().parse().ok()
+    Some(value(i))
 }
 
 #[derive(Clone, Copy)]
 enum Kind {
     /// One integer, in a range.
     Int(i64, i64),
-    /// Two integers, the first not above the second
-    /// (`net.ipv4.ping_group_range`).
+    /// Two integers, a range (`net.ipv4.ping_group_range`).
     Range,
     /// One unsigned 64-bit integer (`kernel.shmmax`).
     U64,
     /// Integers, as many as given, each in a range (`kernel.sem`: four).
     Ints(usize, i64, i64),
+    /// A line of text, up to the length given (with its NUL), the rest of
+    /// a longer one dropped (`kernel.core_pattern`).
+    Text(usize),
 }
 
 const INT_MAX: i64 = i32::MAX as i64;
@@ -105,6 +114,26 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Net,
     },
     Sysctl { path: b"net/ipv4/ip_forward", default: "0", kind: Kind::Int(0, 1), space: Space::Net },
+    // An interface's tag, for userspace: the loopback's, and what a new
+    // interface takes (`default`), or every one is set to (`all`).
+    Sysctl {
+        path: b"net/ipv4/conf/all/tag",
+        default: "0",
+        kind: Kind::Int(0, u32::MAX as i64),
+        space: Space::Net,
+    },
+    Sysctl {
+        path: b"net/ipv4/conf/default/tag",
+        default: "0",
+        kind: Kind::Int(0, u32::MAX as i64),
+        space: Space::Net,
+    },
+    Sysctl {
+        path: b"net/ipv4/conf/lo/tag",
+        default: "0",
+        kind: Kind::Int(0, u32::MAX as i64),
+        space: Space::Net,
+    },
     Sysctl {
         path: b"net/core/somaxconn",
         default: "4096",
@@ -219,6 +248,32 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, INT_MAX),
         space: Space::Global,
     },
+    // Pids are below it (fwe's namespaces number below it; the host's
+    // own pids are the host's).
+    Sysctl {
+        path: b"kernel/pid_max",
+        default: "4194304",
+        kind: Kind::Int(301, 4_194_304),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/printk",
+        default: "4\t4\t1\t7",
+        kind: Kind::Ints(4, 0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/core_pattern",
+        default: "core",
+        kind: Kind::Text(128),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/core_uses_pid",
+        default: "0",
+        kind: Kind::Int(0, 1),
+        space: Space::Global,
+    },
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
     Sysctl {
         path: b"fs/mqueue/queues_max",
@@ -261,11 +316,27 @@ fn index(path: &[u8]) -> Option<usize> {
 fn value(i: usize) -> String {
     let name = String::from_utf8_lossy(SYSCTLS[i].path).into_owned();
     let set = match SYSCTLS[i].space {
-        Space::Net => crate::netns::current().and_then(|n| n.get().sysctls.get(&name).cloned()),
+        Space::Net => match crate::netns::current() {
+            Some(n) => n.get().sysctls.get(&name).cloned(),
+            // The initial namespace's, kept with those of no namespace.
+            None => globals().and_then(|r| r.get().0.get(&name).cloned()),
+        },
         Space::Ipc => crate::sysvipc::current().and_then(|r| r.get().sysctls.get(&name).cloned()),
         Space::Global => globals().and_then(|r| r.get().0.get(&name).cloned()),
     };
     set.unwrap_or_else(|| SYSCTLS[i].default.to_string())
+}
+
+/// Set the sysctl of no namespace at `path` (under `/proc/sys`) to
+/// `value`, as the kernel itself does (`syslog` setting the console's
+/// level).
+pub fn set_global(path: &[u8], value: String) -> Result<(), i32> {
+    let s = SYSCTLS.iter().find(|s| s.path == path && s.space == Space::Global);
+    let name = String::from_utf8_lossy(s.ok_or(errno::EINVAL)?.path).into_owned();
+    globals().ok_or(errno::ENOMEM)?.update(|t| {
+        t.0.insert(name, value);
+        Ok(())
+    })
 }
 
 /// What `/proc/sys` shows at `path` (a sysctl fwe keeps), if it is one.
@@ -311,7 +382,7 @@ pub fn is_dir(path: &[u8]) -> bool {
 pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result<Mark, i32>> {
     let i = index(path)?;
     let allowed = match SYSCTLS[i].space {
-        Space::Net => crate::netns::current().is_some() && creds.has(crate::caps::CAP_NET_ADMIN),
+        Space::Net => creds.has(crate::caps::CAP_NET_ADMIN),
         Space::Ipc | Space::Global => creds.has(crate::caps::CAP_DAC_OVERRIDE),
     };
     Some(if allowed { Ok(Mark::Sysctl(i as u8)) } else { Err(errno::EACCES) })
@@ -330,7 +401,15 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     let Some(Mark::Sysctl(i)) = fdmarks::marked(fd) else { return None };
     let s = SYSCTLS.get(i as usize)?;
     let text = String::from_utf8_lossy(data);
-    let kept = if let Kind::U64 = s.kind {
+    let kept = if let Kind::Text(max) = s.kind {
+        // The first line, as much of it as fits.
+        let line = text.split('\n').next().unwrap_or("");
+        let mut end = line.len().min(max - 1);
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line[..end].to_string()
+    } else if let Kind::U64 = s.kind {
         match text.trim().parse::<u64>() {
             Ok(v) => v.to_string(),
             Err(_) => return Some(fwe_abi::err(errno::EINVAL)),
@@ -342,8 +421,16 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
         };
         match (s.kind, &words[..]) {
             (Kind::Int(lo, hi), [v]) if (lo..=hi).contains(v) => v.to_string(),
-            (Kind::Range, [a, b]) if a <= b && *a >= 0 && *b <= i64::from(u32::MAX >> 1) => {
-                format!("{a}\t{b}")
+            // A range of valid ids; a backwards one is taken as none
+            // (`1 0`), as Linux takes it.
+            (Kind::Range, [a, b])
+                if *a >= 0 && *b >= 0 && *a.max(b) <= i64::from(u32::MAX >> 1) =>
+            {
+                if a <= b {
+                    format!("{a}\t{b}")
+                } else {
+                    "1\t0".to_string()
+                }
             }
             (Kind::Ints(n, lo, hi), w)
                 if w.len() == n && w.iter().all(|v| (lo..=hi).contains(v)) =>
@@ -355,10 +442,8 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     };
     let name = String::from_utf8_lossy(s.path).into_owned();
     let r = match s.space {
-        Space::Net => {
-            let Some(net) = crate::netns::current() else {
-                return Some(fwe_abi::err(errno::EACCES));
-            };
+        Space::Net if crate::netns::current().is_some() => {
+            let net = crate::netns::current()?;
             net.update(|n| {
                 n.sysctls.insert(name.clone(), kept.clone());
                 Ok(())
@@ -373,7 +458,8 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
                 Ok(())
             })
         }
-        Space::Global => {
+        // The initial network namespace's, with those of no namespace.
+        Space::Global | Space::Net => {
             let Some(r) = globals() else {
                 return Some(fwe_abi::err(errno::ENOMEM));
             };

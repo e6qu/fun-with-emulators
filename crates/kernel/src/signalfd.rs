@@ -21,7 +21,6 @@ struct SignalFd {
     rfd: i32,
     wfd: i32,
     mask: u64,
-    nonblock: bool,
     queue: VecDeque<[u8; SIGINFO_SIZE]>,
 }
 
@@ -50,7 +49,6 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
             e.i32(s.rfd);
             e.i32(s.wfd);
             e.u64(s.mask);
-            e.bool(s.nonblock);
             crate::snapshot::queue(e, &s.queue);
         })
     })
@@ -62,7 +60,6 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
         rfd: d.i32(),
         wfd: d.i32(),
         mask: d.u64(),
-        nonblock: d.bool(),
         queue: crate::snapshot::read_queue(d),
     });
     with(|m| *m = reg);
@@ -104,13 +101,19 @@ pub fn siginfo_full(
 /// signal set (bit `sig-1`).
 pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
     use fwe_abi::fcntl;
-    if fd >= 0 {
+    if flags & !(fcntl::O_CLOEXEC | fcntl::O_NONBLOCK) != 0 {
+        return err(errno::EINVAL);
+    }
+    if fd != -1 {
         return with(|m| match m.get_mut(&fd) {
             Some(s) => {
                 s.mask = mask;
                 fd as i64
             }
-            None => err(errno::EINVAL),
+            // An open descriptor of another kind (`EINVAL`), or none.
+            // SAFETY: F_GETFD only queries the descriptor.
+            None if fd >= 0 && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 => err(errno::EINVAL),
+            None => err(errno::EBADF),
         });
     }
     let mut fds = [0i32; 2];
@@ -132,13 +135,12 @@ pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
         // SAFETY: plain host call on a fresh descriptor.
         unsafe { libc::fcntl(rfd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
-    let s = SignalFd {
-        rfd,
-        wfd,
-        mask,
-        nonblock: flags & fcntl::O_NONBLOCK != 0,
-        queue: VecDeque::new(),
-    };
+    if flags & fcntl::O_NONBLOCK != 0 {
+        // As `F_GETFL` shows it, and `F_SETFL` changes it.
+        // SAFETY: plain host call on a fresh descriptor.
+        unsafe { libc::fcntl(rfd, libc::F_SETFL, libc::O_NONBLOCK) };
+    }
+    let s = SignalFd { rfd, wfd, mask, queue: VecDeque::new() };
     with(|m| m.insert(rfd, s));
     rfd as i64
 }
@@ -173,7 +175,7 @@ pub fn deliver(sig: u64, info: [u8; SIGINFO_SIZE]) -> bool {
 /// # Safety
 /// `buf` must span `len` writable bytes.
 pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
-    let (rfd, nonblock) = with(|m| m.get(&fd).map(|s| (s.rfd, s.nonblock)))?;
+    let rfd = with(|m| m.get(&fd).map(|s| s.rfd))?;
     if (len as usize) < SIGINFO_SIZE {
         return Some(err(errno::EINVAL));
     }
@@ -213,7 +215,9 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
                 if with(|m| m.get(&fd).is_some_and(|s| !s.queue.is_empty())) {
                     continue;
                 }
-                if nonblock {
+                // As `signalfd4` or `F_SETFL` last set it.
+                // SAFETY: F_GETFL only queries the descriptor.
+                if unsafe { libc::fcntl(rfd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
                     return Some(err(errno::EAGAIN));
                 }
                 let mut pfd = libc::pollfd { fd: rfd, events: libc::POLLIN, revents: 0 };

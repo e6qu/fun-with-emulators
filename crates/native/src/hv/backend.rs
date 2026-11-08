@@ -53,7 +53,9 @@ impl Platform for HvPlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
-        fwe_kernel::procreg::exiting(fwe_kernel::host::signal_to_linux(sig) as i32);
+        fwe_kernel::procreg::exiting(
+            fwe_kernel::host::signal_to_linux(sig) as i32 | fwe_kernel::coredump::status_bit(),
+        );
         mem::finish_lazy();
         teardown();
         record::Line::new().s("dies of host signal ").dec(sig as u64).emit();
@@ -348,7 +350,16 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         }
         return;
     }
-    if sig != host::WAKE_SIGNAL {
+    if sig == libc::SIGXCPU && !fwe_kernel::rlimits::cpu_signal() {
+        // Past the hard CPU limit: the process ends.
+        return;
+    }
+    if sig == host::WAKE_SIGNAL {
+        // Signals the host lacks, queued by another process.
+        fwe_kernel::signote::drain(|lsig, note| {
+            thread::post_landed(lsig, host::sent_info(note));
+        });
+    } else {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let info = unsafe { host::signal_info(sig, info) };
         // The relayed form of a guest's SIGKILL (see host::KILL_RELAY).
@@ -521,6 +532,30 @@ const SIGRETURN: [u32; 2] = [0xd280_1168, 0xd400_0001];
 /// masks follow the guest's.
 pub(super) fn become_vm_process() -> Result<(), String> {
     block_guest_signals();
+    // From before the VM exists, no host signal may end the process by the
+    // host's default action: every one whose default ends it is caught (for
+    // the guest, whose default action tears the VM down first) until the
+    // kernel sets the guest's dispositions, which keep that. A fork child,
+    // started afresh, would otherwise have the host's defaults while a
+    // signal sent to it at once arrives. One ignored as the process
+    // started stays ignored.
+    for lsig in 1..=fwe_abi::signal::SIGSYS {
+        if fwe_abi::signal::default_action(lsig) != fwe_abi::signal::Default::Terminate
+            || lsig == fwe_abi::signal::SIGKILL
+        {
+            continue;
+        }
+        let Some(h) = host::signal_to_host(lsig) else { continue };
+        // SAFETY: querying the disposition into a zeroed sigaction.
+        let ignored = unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(h, std::ptr::null(), &mut old);
+            old.sa_sigaction == libc::SIG_IGN
+        };
+        if !ignored && !matches!(h, libc::SIGSEGV | libc::SIGBUS) {
+            install(h, 0);
+        }
+    }
     vm::create()?;
     VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     fwe_kernel::forbid_fork();
@@ -1098,8 +1133,8 @@ fn fault(regs: &mut Regs, sig: u64, addr: u64) {
                 regs.pc
             ));
         }
-        let h = host::signal_to_host(sig).unwrap_or(libc::SIGSEGV);
-        k.platform.kill_self(h);
+        // Its core first, as Linux dumps it; the VM goes as it ends.
+        k.terminate_with(sig, Some(regs));
     }
 }
 
@@ -1247,10 +1282,19 @@ struct Spawn {
 /// and state (see [`fork`]).
 fn clone(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     use fwe_abi::clone as cl;
-    let fwe_kernel::CloneArgs { flags, stack, parent_tid: ptid, tls, child_tid: ctid } = a;
+    let fwe_kernel::CloneArgs { flags, stack, parent_tid: ptid, tls, child_tid: ctid, .. } = a;
+    if let Err(e) = a.check() {
+        return err(e);
+    }
     let tpidr =
         if flags & cl::CLONE_SETTLS != 0 { tls } else { vcpu.get_sys(HV_SYS_REG_TPIDR_EL0) };
     if flags & cl::CLONE_THREAD == 0 {
+        // A process sharing the memory while both run would put its pages
+        // in two VMs at once, which a VM must never have (see `fork`): only
+        // a vfork child, which runs while its parent waits, shares it.
+        if flags & cl::CLONE_VM != 0 && flags & cl::CLONE_VFORK == 0 {
+            return err(errno::ENOSYS);
+        }
         return fork::fork(parent, a, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
     }
     if flags & cl::CLONE_VM == 0 || stack == 0 {

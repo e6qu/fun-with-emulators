@@ -34,6 +34,12 @@ fn caps_in_new_userns() -> crate::caps::Caps {
 /// What a `clone` that makes a process arranges for the child's
 /// namespaces, from before the host `fork` until it is known how it went
 /// ([`Kernel::fork_parent`], [`Kernel::fork_child`]).
+/// A fork under way resets the child's handlers (`CLONE_CLEAR_SIGHAND`):
+/// for the state a VM child is handed ([`crate::Kernel::save_for_fork`]).
+/// Set and cleared under the kernel lock.
+pub(crate) static CLEAR_SIGHAND: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub struct ForkNs {
     /// The parent's own, while it has the child's for the fork.
     saved: Option<(Arc<crate::mounts::store::Ns>, Namespaces)>,
@@ -50,6 +56,13 @@ pub struct ForkNs {
     line: (Vec<crate::procreg::Proc>, Option<crate::procreg::Proc>),
     /// What the child inherits of this process's record.
     inherit: crate::procreg::Inherit,
+    /// The cgroup it starts in (`CLONE_INTO_CGROUP`), if not this
+    /// process's.
+    cgroup: Option<Vec<u8>>,
+    /// Its handlers are reset (`CLONE_CLEAR_SIGHAND`).
+    clear_sighand: bool,
+    /// The signal its end is told with.
+    exit_signal: u64,
 }
 
 impl<P: Platform> Kernel<P> {
@@ -130,10 +143,26 @@ impl<P: Platform> Kernel<P> {
     /// and give the parent the child's view for the fork, so that the child
     /// inherits it. The caller holds the kernel lock until
     /// [`Kernel::fork_parent`] or [`Kernel::fork_child`].
-    pub fn fork_begin(&mut self, flags: u64) -> Result<ForkNs, i32> {
+    pub fn fork_begin(&mut self, a: &crate::CloneArgs) -> Result<ForkNs, i32> {
+        let flags = a.flags;
         // Limits left for this process are its own before its child
         // inherits them.
         self.take_pending_limits();
+        // RLIMIT_NPROC: a user with as many processes as it allows has no
+        // more but as root or with CAP_SYS_RESOURCE or CAP_SYS_ADMIN, as on
+        // Linux (the host's limit, the user's on the host, applies too).
+        let (nproc, _) = crate::rlimits::get(fwe_abi::resource::RLIMIT_NPROC);
+        if nproc != fwe_abi::resource::RLIM_INFINITY
+            && self.creds.uid != 0
+            && !self.creds.has(crate::caps::CAP_SYS_RESOURCE)
+            && !self.creds.has_admin()
+        {
+            let uid = self.creds.uid;
+            let mine = crate::procreg::all().iter().filter(|(_, r)| r.ids[0] == uid).count();
+            if mine as u64 >= nproc {
+                return Err(errno::EAGAIN);
+            }
+        }
         // And so are its keyrings.
         crate::keys::before_fork();
         if flags & CLONE_NEWTIME != 0 {
@@ -160,8 +189,28 @@ impl<P: Platform> Kernel<P> {
             // host's is this process, which the host cannot change).
             line.0.remove(0);
         }
+        // The cgroup it starts in: this process's, or with
+        // `CLONE_INTO_CGROUP` the one the descriptor is of, which must be
+        // a cgroup directory a process may join.
+        let cgroup = match a.cgroup {
+            None => None,
+            Some(fd) => {
+                let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
+                match crate::cgroupfs::locate(&host) {
+                    Some((cg, None)) => {
+                        crate::cgroupfs::may_join(&cg)?;
+                        Some(cg)
+                    }
+                    _ => return Err(errno::EBADF),
+                }
+            }
+        };
         // Within the cgroup's `pids.max`.
-        crate::cgroupfs::fork_allowed(&crate::cgroupfs::current())?;
+        crate::cgroupfs::fork_allowed(&cgroup.clone().unwrap_or_else(crate::cgroupfs::current))?;
+        CLEAR_SIGHAND.store(
+            flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let fs = self.fs.as_mut().expect("filesystem configured");
         let mut ns = fs.ns.clone();
         ns.unshare(new)?;
@@ -195,13 +244,27 @@ impl<P: Platform> Kernel<P> {
         let dirs = fs.ns_dirs();
         let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
         let inherit = crate::procreg::inherit();
-        Ok(ForkNs { saved, chain, nums, dirs, caps, line, inherit })
+        let clear_sighand = flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0;
+        let exit_signal = flags & fwe_abi::clone::CSIGNAL;
+        Ok(ForkNs {
+            saved,
+            chain,
+            nums,
+            dirs,
+            caps,
+            line,
+            inherit,
+            cgroup,
+            clear_sighand,
+            exit_signal,
+        })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
     /// pid, or negative if it failed): back to its own namespaces. Returns
     /// the child's pid as the parent sees it.
     pub fn fork_parent(&mut self, t: ForkNs, child: i32) -> i32 {
+        CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(caps) = t.caps {
             self.creds.caps = caps;
         }
@@ -218,9 +281,11 @@ impl<P: Platform> Kernel<P> {
                 &t.line,
                 &t.inherit,
                 crate::maps::snapshot(),
+                t.cgroup.as_deref(),
             );
             // It holds this process's session keyring.
             crate::keys::forked(child);
+            crate::reaper::set_exit_signal(child, t.exit_signal);
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {
@@ -256,11 +321,34 @@ impl<P: Platform> Kernel<P> {
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
         crate::procreg::own_line(&t.line, &t.inherit, crate::maps::forked());
+        if let Some(cg) = &t.cgroup {
+            // Where it starts, should it look before the parent writes it.
+            // SAFETY: getpid cannot fail.
+            let _ = crate::procreg::set_cgroup(unsafe { libc::getpid() }, cg);
+        }
+        if t.clear_sighand {
+            self.clear_handlers();
+        }
+        CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
         // SAFETY: getpid cannot fail.
         t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
+    }
+
+    /// `CLONE_CLEAR_SIGHAND`: every handler back to the default action (an
+    /// ignored signal stays ignored), with no flags or mask, as Linux
+    /// resets them.
+    pub(crate) fn clear_handlers(&mut self) {
+        for a in &mut self.sigactions {
+            if a.handler != fwe_abi::signal::SIG_IGN {
+                a.handler = fwe_abi::signal::SIG_DFL;
+            }
+            a.flags = 0;
+            a.mask = 0;
+        }
+        self.sync_all_host_signals();
     }
 
     /// The child's pid in its own pid namespace, once [`Kernel::fork_begin`]

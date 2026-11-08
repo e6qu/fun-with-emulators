@@ -28,7 +28,12 @@ pub fn is(fd: i32) -> bool {
         || (fdmarks::any_marks()
             && matches!(
                 fdmarks::marked(fd),
-                Some(Mark::Sysctl(_) | Mark::ProcMap { .. } | Mark::OomScore { .. })
+                Some(
+                    Mark::Sysctl(_)
+                        | Mark::ProcMap { .. }
+                        | Mark::OomScore { .. }
+                        | Mark::TimerSlack { .. }
+                )
             ))
 }
 

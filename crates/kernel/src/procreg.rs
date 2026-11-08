@@ -72,6 +72,9 @@ pub struct ProcRecord {
     /// its own (see [`crate::maps::publish`]): what a fork child inherits,
     /// recorded with the record it writes anyway.
     pub maps: Vec<u8>,
+    /// Its main thread's timer slack and the default a slack of 0 restores
+    /// (`PR_SET_TIMERSLACK`, `/proc/<pid>/timerslack_ns`), in nanoseconds.
+    pub slack: (u64, u64),
 }
 
 /// A host process, as its pid and its start time.
@@ -202,6 +205,8 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     e.i32(r.nice);
     r.sched.encode(&mut e);
     e.bytes(&r.maps);
+    e.u64(r.slack.0);
+    e.u64(r.slack.1);
     e.into_bytes()
 }
 
@@ -230,6 +235,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let nice = d.i32();
     let sched = Sched::decode(&mut d);
     let maps = d.bytes();
+    let slack = (d.u64(), d.u64());
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -252,6 +258,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         nice,
         sched,
         maps,
+        slack,
     })
 }
 
@@ -281,6 +288,34 @@ fn lock(pid: i32) -> Option<std::fs::File> {
     // SAFETY: plain host call on the file just opened; the lock goes with it.
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
     Some(f)
+}
+
+fn end_path(pid: i32) -> Option<Vec<u8>> {
+    Some([dir()?, format!("/{pid}.end").into_bytes()].concat())
+}
+
+/// This process ends of a Linux signal, with Linux wait status `status`
+/// (the signal, and `0x80` if it dumped core): what its parent's `wait` is
+/// to report, which the host cannot say when the host has no such signal,
+/// ignores it by default (`SIGIO`), or wrote no core.
+pub fn ending(status: i32) {
+    // SAFETY: getpid cannot fail.
+    let Some(p) = end_path(unsafe { libc::getpid() }) else { return };
+    let _ = std::fs::write(OsStr::from_bytes(&p), status.to_ne_bytes());
+}
+
+/// The Linux wait status host process `pid` left as it ended of a signal.
+pub fn end_status(pid: i32) -> Option<i32> {
+    let b = std::fs::read(OsStr::from_bytes(&end_path(pid)?)).ok()?;
+    Some(i32::from_ne_bytes(b.get(..4)?.try_into().ok()?))
+}
+
+/// Host process `pid` was reaped, or this one starts with that number:
+/// its end status goes.
+pub fn forget_end(pid: i32) {
+    if let Some(p) = end_path(pid) {
+        let _ = std::fs::remove_file(OsStr::from_bytes(&p));
+    }
 }
 
 /// Forget host process `pid` (it ended).
@@ -454,6 +489,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         nice: 0,
         sched: Sched::default(),
         maps: Vec::new(),
+        slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
     });
     f(&mut r);
     write(pid, &r);
@@ -500,6 +536,8 @@ pub struct Inherit {
     oom: (i32, i32),
     nice: i32,
     sched: Sched,
+    /// The forking thread's timer slack: the child's, and its default.
+    slack: u64,
 }
 
 /// What a child forked now inherits ([`Inherit`]): a child of a process
@@ -520,7 +558,8 @@ pub fn inherit() -> Inherit {
         }
         s => (s, r.nice),
     };
-    Inherit { ids: r.ids, oom: (r.oom_score_adj, r.oom_score_adj_min), nice, sched }
+    let slack = crate::thread::slack();
+    Inherit { ids: r.ids, oom: (r.oom_score_adj, r.oom_score_adj_min), nice, sched, slack }
 }
 
 /// Write `i` for a child that starts on state handed to it.
@@ -532,6 +571,7 @@ pub fn save_inherit(e: &mut Enc, i: &Inherit) {
     e.i32(i.oom.1);
     e.i32(i.nice);
     i.sched.encode(e);
+    e.u64(i.slack);
 }
 
 /// What [`save_inherit`] wrote.
@@ -543,7 +583,8 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let oom = (d.i32(), d.i32());
     let nice = d.i32();
     let sched = Sched::decode(d);
-    Inherit { ids, oom, nice, sched }
+    let slack = d.u64();
+    Inherit { ids, oom, nice, sched, slack }
 }
 
 /// Set `r`'s inherited part.
@@ -552,9 +593,13 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
     (r.oom_score_adj, r.oom_score_adj_min) = i.oom;
     r.nice = i.nice;
     r.sched = i.sched;
+    if i.slack != 0 {
+        r.slack = (i.slack, i.slack);
+    }
 }
 
-/// A child `child` of this process starts in this process's cgroup, in the
+/// A child `child` of this process starts in this process's cgroup (or in
+/// `cgroup`, from `CLONE_INTO_CGROUP`), in the
 /// namespaces `ns`, with the line of ancestors and bound of `line`
 /// ([`child_line`]), what it inherits (`inherit`, unless the child has
 /// written it already, see [`own_line`]) and this process's mappings `maps`
@@ -565,10 +610,11 @@ pub fn forked(
     line: &(Vec<Proc>, Option<Proc>),
     inherit: &Inherit,
     maps: Vec<u8>,
+    cgroup: Option<&[u8]>,
 ) {
     let mine = read(me());
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
-    let cgroup = own_cgroup();
+    let cgroup = cgroup.map_or_else(own_cgroup, <[u8]>::to_vec);
     // Kept what the child has already written of itself (its program).
     let _ = change(child, |r| {
         r.cgroup = cgroup;
@@ -670,6 +716,17 @@ pub fn ids(pid: i32) -> [u32; 8] {
 /// This process's ids are now `ids` ([`ProcRecord::ids`]).
 pub fn set_own_ids(ids: [u32; 8]) {
     let _ = change(me(), |r| r.ids = ids);
+}
+
+/// Host process `pid`'s main thread's timer slack and its default.
+pub fn slack(pid: i32) -> (u64, u64) {
+    read(pid).map_or((crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK), |r| r.slack)
+}
+
+/// Set host process `pid`'s main thread's timer slack to `value` (0: its
+/// default).
+pub fn set_slack(pid: i32, value: u64) -> Result<(), i32> {
+    change(pid, |r| r.slack.0 = if value == 0 { r.slack.1 } else { value })
 }
 
 /// Host process `pid`'s `oom_score_adj` and the least it may set without
@@ -923,6 +980,8 @@ pub fn take_ended(e: &Ended) -> bool {
 
 /// Child `pid` was reaped by its parent: forget it, and how it ended.
 pub fn reaped(pid: i32) {
+    forget_end(pid);
+    crate::reaper::forget_exit_signal(pid);
     if read(pid).is_none() {
         let _lock = lock(pid);
         if let Some(r) = read_any(pid)
@@ -951,6 +1010,8 @@ pub fn exiting(status: i32) {
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
     let me = me();
+    // Ending of a Linux signal: its status as recorded ([`ending`]).
+    let status = end_status(me).unwrap_or(status);
     crate::pidns::exiting();
     if crate::host::children_reaped_by_host() {
         forget_children(me);

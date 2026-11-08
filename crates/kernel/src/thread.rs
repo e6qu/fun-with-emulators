@@ -54,16 +54,75 @@ pub fn set_pdeathsig(sig: u64) {
 ///
 /// Also used in a forked child, which starts as a single-threaded process
 /// with no pending signals: the other threads' registrations are dropped.
+///
+/// A signal that came after the fork, before this (a sender may name the
+/// child as soon as the parent's `fork` returns), is kept: the parent's,
+/// which the child does not inherit, are dropped as the fork returns
+/// ([`forked`]).
 pub fn init_main(pid: i32) {
     TGID.store(pid, Ordering::SeqCst);
     NEXT_TID.store(pid + 1, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
-    PROCESS.clear();
+    // An end status left by an earlier process of this number.
+    // SAFETY: getpid cannot fail.
+    crate::procreg::forget_end(unsafe { libc::getpid() });
+    // The calling thread's own set goes with the registry: what landed in
+    // it is moved to the process's, and a handler meanwhile posts there.
+    let early: Vec<(u64, SigInfo)> =
+        with_own(|p| (1..=signal::NSIG).filter_map(|s| p.take(s).map(|i| (s, i))).collect());
+    OWN.with(|o| o.set(std::ptr::null()));
+    for (s, i) in early {
+        PROCESS.post(s, i);
+    }
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     crate::futex::forked_child();
     crate::signote::open_own();
     crate::sysvipc::forked_child();
     register_current();
+}
+
+/// In a fork child, as the fork returns: the parent's pending signals,
+/// which a child does not inherit, are dropped. Async-signal-safe.
+pub fn forked() {
+    PROCESS.clear();
+    with_own(Pending::clear);
+}
+
+/// Linux's timer slack for a process that never set one, in nanoseconds.
+pub const DEFAULT_SLACK: u64 = 50_000;
+
+thread_local! {
+    /// This thread's timer slack and its default (not the main thread's,
+    /// which its process record holds, for `/proc/<pid>/timerslack_ns`).
+    static SLACK: Cell<(u64, u64)> = const { Cell::new((DEFAULT_SLACK, DEFAULT_SLACK)) };
+}
+
+/// The timer slack of threads being created ([`register`]), until each
+/// takes its own ([`set_tid`]).
+static SLACK_HANDOFF: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+
+/// This thread's timer slack (`PR_GET_TIMERSLACK`).
+pub fn slack() -> u64 {
+    if tid() == tgid() {
+        // SAFETY: getpid cannot fail.
+        crate::procreg::slack(unsafe { libc::getpid() }).0
+    } else {
+        SLACK.with(Cell::get).0
+    }
+}
+
+/// Set this thread's timer slack (`PR_SET_TIMERSLACK`; 0 restores its
+/// default).
+pub fn set_slack(value: u64) {
+    if tid() == tgid() {
+        // SAFETY: getpid cannot fail.
+        let _ = crate::procreg::set_slack(unsafe { libc::getpid() }, value);
+    } else {
+        SLACK.with(|s| {
+            let (_, default) = s.get();
+            s.set((if value == 0 { default } else { value }, default));
+        });
+    }
 }
 
 /// The thread-group id (what `getpid` returns).
@@ -88,6 +147,12 @@ pub fn alloc_tid() -> i32 {
 /// Record this host thread's guest thread id (called when a thread starts).
 pub fn set_tid(tid: i32) {
     TID.with(|t| t.set(tid));
+    // A new thread: its creator's timer slack, as its own and its default.
+    let mut handoff = SLACK_HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = handoff.iter().position(|&(t, _)| t == tid) {
+        let (_, s) = handoff.swap_remove(i);
+        SLACK.with(|c| c.set((s, s)));
+    }
 }
 
 /// This thread's guest thread id (`gettid`).
@@ -296,6 +361,10 @@ pub fn register_current() {
 /// [`adopt`]s the returned set; its creator calls [`set_host_thread`] once
 /// the host thread exists.
 pub fn register(tid: i32) -> Arc<Pending> {
+    if tid != tgid() {
+        let s = slack();
+        SLACK_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).push((tid, s));
+    }
     let pending = Arc::new(Pending::new());
     let entry = Registered { tid, pending: pending.clone(), host: 0 };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
@@ -354,6 +423,23 @@ pub fn post_self(sig: u64, info: SigInfo) {
 /// this thread directly.) Async-signal-safe: the backend calls it from its
 /// host signal handler.
 pub fn post_landed(sig: u64, info: SigInfo) {
+    use fwe_abi::wait::{CLD_DUMPED, CLD_EXITED, CLD_KILLED};
+    // A child's end that Linux tells with its own exit signal (or none).
+    let sig = match sig {
+        signal::SIGCHLD if matches!(info.code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) => {
+            match crate::reaper::exit_signal(info.pid) {
+                Some(0) => return,
+                Some(s) => s,
+                None => sig,
+            }
+        }
+        _ => sig,
+    };
+    let unblocked = (1..=signal::NSIG).contains(&sig) && mask() & (1 << (sig - 1)) == 0;
+    if unblocked && crate::signal::ignored() & (1 << (sig - 1)) != 0 {
+        // Ignored, and not held: gone, as Linux drops it.
+        return;
+    }
     let own = matches!(sig, signal::SIGPIPE | signal::SIGXFSZ);
     if own || (1..=signal::NSIG).contains(&sig) && mask() & (1 << (sig - 1)) == 0 {
         post_self(sig, info);
@@ -421,6 +507,19 @@ pub fn host_state(tid: i32) -> Option<(u64, u64, bool)> {
         return None;
     }
     crate::host::thread_state(host)
+}
+
+/// Whether real-time signal `sig` may be queued: Linux refuses one
+/// (`EAGAIN`) once as many signals are pending as `RLIMIT_SIGPENDING`
+/// allows (those of this process are counted).
+pub fn may_queue(sig: u64) -> bool {
+    if sig < signal::SIGRTMIN {
+        return true;
+    }
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let count = threads.iter().map(|r| r.pending.bits().count_ones()).sum::<u32>()
+        + PROCESS.bits().count_ones();
+    u64::from(count) < crate::rlimits::get(fwe_abi::resource::RLIMIT_SIGPENDING).0
 }
 
 /// Signals pending against the calling thread or the process.

@@ -14,17 +14,44 @@ pub struct CloneArgs {
     pub parent_tid: u64,
     pub tls: u64,
     pub child_tid: u64,
+    /// `CLONE_INTO_CGROUP`'s descriptor of the cgroup the child starts in.
+    pub cgroup: Option<i32>,
 }
 
 impl CloneArgs {
     /// `clone(flags, stack, parent_tid, tls, child_tid)`, the arm64 order.
     pub fn from_clone(x: &[u64]) -> CloneArgs {
-        CloneArgs { flags: x[0], stack: x[1], parent_tid: x[2], tls: x[3], child_tid: x[4] }
+        CloneArgs {
+            flags: x[0],
+            stack: x[1],
+            parent_tid: x[2],
+            tls: x[3],
+            child_tid: x[4],
+            cgroup: None,
+        }
+    }
+
+    /// The combinations of flags Linux refuses (`EINVAL`) whichever call
+    /// asked for them.
+    pub fn check(&self) -> Result<(), i32> {
+        let f = self.flags;
+        let both = |a: u64, b: u64| f & (a | b) == a | b;
+        if both(CLONE_NEWNS, CLONE_FS)
+            || both(CLONE_NEWUSER, CLONE_FS)
+            // A thread shares the handlers, which share the memory.
+            || (f & CLONE_THREAD != 0 && f & CLONE_SIGHAND == 0)
+            || (f & CLONE_SIGHAND != 0 && f & CLONE_VM == 0)
+            || (f & CLONE_THREAD != 0 && f & (CLONE_NEWUSER | CLONE_NEWPID) != 0)
+            || both(CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
+        {
+            return Err(errno::EINVAL);
+        }
+        Ok(())
     }
 
     /// `clone3(args, size)`: read the guest's `struct clone_args`. Features
-    /// fwe does not have (a pidfd, chosen tids, a cgroup, clearing the
-    /// handlers) fail with `ENOSYS`, so a C library falls back to `clone`.
+    /// fwe does not have (a pidfd, chosen tids) fail with `ENOSYS`, so a C
+    /// library falls back to `clone`.
     pub fn from_clone3(args: u64, size: u64) -> Result<CloneArgs, i32> {
         if size < CLONE_ARGS_SIZE_VER0 {
             return Err(errno::EINVAL);
@@ -54,16 +81,23 @@ impl CloneArgs {
             tls,
             _set_tid,
             set_tid_size,
-            _cgroup,
+            cgroup,
         ] = raw;
-        if flags & CSIGNAL != 0 || exit_signal > fwe_abi::signal::NSIG {
+        let legacy = (1u64 << 32) - 1;
+        if flags & !(legacy | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
+            || flags & (CLONE_DETACHED | CSIGNAL) != 0
+            || exit_signal > fwe_abi::signal::NSIG
+            // A thread, or a sibling, is no child of the caller's to
+            // signal its end.
+            || (flags & (CLONE_THREAD | CLONE_PARENT) != 0 && exit_signal != 0)
+            || cgroup > i32::MAX as u64
+        {
             return Err(errno::EINVAL);
         }
         if (stack == 0) != (stack_size == 0) {
             return Err(errno::EINVAL);
         }
-        if flags & (CLONE_PIDFD | CLONE_INTO_CGROUP | CLONE_CLEAR_SIGHAND) != 0 || set_tid_size != 0
-        {
+        if flags & CLONE_PIDFD != 0 || set_tid_size != 0 {
             return Err(errno::ENOSYS);
         }
         Ok(CloneArgs {
@@ -73,6 +107,7 @@ impl CloneArgs {
             parent_tid,
             tls,
             child_tid,
+            cgroup: (flags & CLONE_INTO_CGROUP != 0).then_some(cgroup as i32),
         })
     }
 }
@@ -99,7 +134,8 @@ mod tests {
                 stack: 0x3000,
                 parent_tid: 0x40,
                 tls: 0x50,
-                child_tid: 0x30
+                child_tid: 0x30,
+                cgroup: None,
             }
         );
         // A fork: no flags, SIGCHLD as the exit signal, the parent's stack.
@@ -122,5 +158,34 @@ mod tests {
         assert_eq!(p(&big, 104), Err(errno::E2BIG));
         big[12] = 0;
         assert!(p(&big, 104).is_ok());
+    }
+
+    /// The combinations Linux refuses, whichever call asks for them, and
+    /// clone3's own rules.
+    #[test]
+    fn refused_combinations() {
+        let with = |flags| CloneArgs::from_clone(&[flags, 0, 0, 0, 0]).check();
+        assert_eq!(with(CLONE_SIGHAND), Err(errno::EINVAL));
+        assert_eq!(with(CLONE_THREAD | CLONE_VM), Err(errno::EINVAL));
+        assert_eq!(with(CLONE_FS | CLONE_NEWNS), Err(errno::EINVAL));
+        assert_eq!(with(CLONE_FS | CLONE_NEWUSER), Err(errno::EINVAL));
+        assert_eq!(
+            with(CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | CLONE_NEWPID),
+            Err(errno::EINVAL)
+        );
+        assert_eq!(with(CLONE_THREAD | CLONE_SIGHAND | CLONE_VM), Ok(()));
+        assert_eq!(with(CLONE_VM | 17), Ok(()));
+        let p = |w: &[u64]| {
+            let a = args(w);
+            CloneArgs::from_clone3(a.as_ptr() as u64, 88)
+        };
+        // A thread with an exit signal; CLONE_DETACHED; both handler flags.
+        assert_eq!(p(&[CLONE_VM | CLONE_SIGHAND | CLONE_THREAD, 0, 0, 0, 17]), Err(errno::EINVAL));
+        assert_eq!(p(&[CLONE_DETACHED, 0, 0, 0, 17]), Err(errno::EINVAL));
+        let got = p(&[CLONE_SIGHAND | CLONE_CLEAR_SIGHAND | CLONE_VM, 0, 0, 0, 17]).unwrap();
+        assert_eq!(got.check(), Err(errno::EINVAL));
+        // A cgroup, by descriptor.
+        let a = args(&[CLONE_INTO_CGROUP, 0, 0, 0, 17, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(CloneArgs::from_clone3(a.as_ptr() as u64, 88).unwrap().cgroup, Some(5));
     }
 }

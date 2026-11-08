@@ -380,6 +380,10 @@ pub fn busy<R>(f: impl FnOnce() -> R) -> R {
 /// is not here), and so are its waiters.
 pub fn forked_child() {
     RUNNING.store(false, SeqCst);
+    // The parent's children are not this process's.
+    for (pid, _) in &EXIT_SIGNALS {
+        pid.store(0, SeqCst);
+    }
     WAITERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     *NOTIFIED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     CHANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -926,6 +930,46 @@ mod watch {
                 wake_waiters();
             });
         }
+    }
+}
+
+/// The children of this process whose end Linux signals with another
+/// signal than `SIGCHLD` (`clone`'s exit signal; 0 for none), as (host
+/// pid, signal): the host's `SIGCHLD` for one's end stands for it
+/// ([`exit_signal`]). Read in signal handlers, so kept without a lock.
+static EXIT_SIGNALS: [(std::sync::atomic::AtomicI32, std::sync::atomic::AtomicU64); 64] =
+    [const { (std::sync::atomic::AtomicI32::new(0), std::sync::atomic::AtomicU64::new(0)) }; 64];
+
+/// Child `child` (host pid) was made with exit signal `sig`.
+pub fn set_exit_signal(child: i32, sig: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if sig == fwe_abi::signal::SIGCHLD {
+        return;
+    }
+    for (pid, s) in &EXIT_SIGNALS {
+        if pid.compare_exchange(0, -1, SeqCst, SeqCst).is_ok() {
+            s.store(sig, SeqCst);
+            pid.store(child, SeqCst);
+            return;
+        }
+    }
+}
+
+/// The signal child `child`'s end is told with, if not `SIGCHLD` (0: none).
+/// Async-signal-safe.
+pub fn exit_signal(child: i32) -> Option<u64> {
+    use std::sync::atomic::Ordering::SeqCst;
+    if child <= 0 {
+        return None;
+    }
+    EXIT_SIGNALS.iter().find(|(pid, _)| pid.load(SeqCst) == child).map(|(_, s)| s.load(SeqCst))
+}
+
+/// Child `child` was reaped: its exit signal goes.
+pub fn forget_exit_signal(child: i32) {
+    use std::sync::atomic::Ordering::SeqCst;
+    for (pid, _) in &EXIT_SIGNALS {
+        let _ = pid.compare_exchange(child, 0, SeqCst, SeqCst);
     }
 }
 

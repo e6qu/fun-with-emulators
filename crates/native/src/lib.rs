@@ -101,7 +101,9 @@ impl Platform for NativePlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
-        fwe_kernel::procreg::exiting(fwe_kernel::host::signal_to_linux(sig) as i32);
+        fwe_kernel::procreg::exiting(
+            fwe_kernel::host::signal_to_linux(sig) as i32 | fwe_kernel::coredump::status_bit(),
+        );
         // SAFETY: resetting the disposition, unblocking and raising `sig`
         // terminates the process with that signal.
         unsafe {
