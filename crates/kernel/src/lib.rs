@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod atime;
 pub mod bpf;
 pub mod caps;
 pub mod cgroupfs;
@@ -843,8 +844,10 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    let noted = atime::before(nr, &a);
     // SAFETY: the caller's guarantee, passed on.
     let r = unsafe { blocking_call(nr, a) }?;
+    atime::after(noted, r);
     // A write the host refused to a sealed memfd, and what a socket that
     // stands in for another kind reports, as Linux reports them.
     Some(linux_result(nr, &a, r))

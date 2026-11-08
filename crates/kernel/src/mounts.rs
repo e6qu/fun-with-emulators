@@ -265,6 +265,9 @@ pub struct Table {
     /// What this change propagates to other namespaces, carried out once
     /// it is made ([`store::Ns::update`]); never kept in the record.
     pub outbox: Vec<Propagation>,
+    /// The mounts `umount2(MNT_EXPIRE)` marked, not used since: the next
+    /// such call unmounts them.
+    pub expiring: Vec<u32>,
 }
 
 /// A change of a namespace's mounts that reaches the mounts of other
@@ -284,7 +287,13 @@ impl Table {
     /// The table a namespace starts with when nothing was mounted in it:
     /// the rootfs at `root_host` and what Linux always has mounted.
     pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>, cgroup_host: Option<&[u8]>) -> Table {
-        let mut t = Table { mounts: Vec::new(), next_id: 1, next_group: 1, outbox: Vec::new() };
+        let mut t = Table {
+            mounts: Vec::new(),
+            next_id: 1,
+            next_group: 1,
+            outbox: Vec::new(),
+            expiring: Vec::new(),
+        };
         let root = t.alloc();
         t.mounts.push(Mount {
             id: root,
@@ -1048,7 +1057,12 @@ impl Table {
     /// for the namespace's own root): the mount at `new_root` takes that
     /// mount's place, and that mount goes to `put_old` (a path under
     /// `new_root`). Returns where `put_old` is now.
-    pub fn pivot_root(&mut self, root: &[u8], new_root: &[u8], put_old: &[u8]) -> Result<Vec<u8>, i32> {
+    pub fn pivot_root(
+        &mut self,
+        root: &[u8],
+        new_root: &[u8],
+        put_old: &[u8],
+    ) -> Result<Vec<u8>, i32> {
         // In Linux's order of checks.
         let (r, root_rest) = self.locate(root);
         let r = r.clone();
@@ -1078,7 +1092,11 @@ impl Table {
         }
         let new_put = join(root, put_rel);
         let in_n = self.descendants(n.id);
-        let in_r: Vec<u32> = self.descendants(r.id).into_iter().filter(|d| *d != n.id && !in_n.contains(d)).collect();
+        let in_r: Vec<u32> = self
+            .descendants(r.id)
+            .into_iter()
+            .filter(|d| *d != n.id && !in_n.contains(d))
+            .collect();
         let r_is_top = r.parent == r.id;
         for m in self.mounts.iter_mut() {
             if m.id == n.id {
@@ -1198,6 +1216,10 @@ impl Table {
             e.bytes(&m.device);
             e.bytes(&m.options);
         }
+        e.u64(self.expiring.len() as u64);
+        for &id in &self.expiring {
+            e.u32(id);
+        }
     }
 
     pub fn decode(d: &mut crate::snapshot::Dec) -> Table {
@@ -1224,7 +1246,9 @@ impl Table {
                 options: d.bytes(),
             })
             .collect();
-        Table { mounts, next_id, next_group, outbox: Vec::new() }
+        let n = d.count(4);
+        let expiring = (0..n).map(|_| d.u32()).collect();
+        Table { mounts, next_id, next_group, outbox: Vec::new(), expiring }
     }
 }
 

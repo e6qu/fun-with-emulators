@@ -803,7 +803,7 @@ pub fn tty_error() -> i64 {
 #[cfg(target_os = "macos")]
 pub fn statfs_to_linux(s: &libc::statfs) -> fwe_abi::Statfs {
     use fwe_abi::statfs::*;
-    let mut flags = 0;
+    let mut flags = ST_VALID;
     if s.f_flags & libc::MNT_RDONLY as u32 != 0 {
         flags |= ST_RDONLY;
     }
@@ -841,7 +841,7 @@ pub fn statfs_to_linux(s: &libc::statfs) -> fwe_abi::Statfs {
         f_fsid: fsid(&s.f_fsid),
         f_namelen: s.f_namelen,
         f_frsize: s.f_frsize,
-        f_flags: 0,
+        f_flags: fwe_abi::statfs::ST_VALID,
         f_spare: [0; 4],
     }
 }

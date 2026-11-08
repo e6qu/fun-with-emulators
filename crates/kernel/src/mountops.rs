@@ -44,6 +44,12 @@ fn tmpfs_dir(mode: u32) -> Result<Vec<u8>, i32> {
     Ok(dir)
 }
 
+/// The access-time flag a new mount (or a remount) with `flags` gets if
+/// it names none: `relatime`, Linux's default.
+pub(crate) fn default_atime(flags: u64) -> u64 {
+    if flags & (ms::NOATIME | ms::STRICTATIME) == 0 { ms::RELATIME } else { 0 }
+}
+
 /// The `mode=` a filesystem's options give (octal), if any.
 fn mode_option(data: &[u8]) -> Option<u32> {
     data.split(|&b| b == b',')
@@ -238,6 +244,7 @@ impl<P: Platform> Kernel<P> {
         let ns = self.fs().mount_ns().clone();
         let r = if flags & ms::REMOUNT != 0 {
             let opts = (!data.is_empty() && flags & ms::BIND == 0).then(|| data.clone());
+            let flags = flags | default_atime(flags);
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0 {
             match self.mount_path(&source, true) {
@@ -290,7 +297,7 @@ impl<P: Platform> Kernel<P> {
                 Ok(v) => v,
                 Err(e) => return err(e),
             };
-            flags |= more;
+            flags |= more | default_atime(flags);
             let device = if source.is_empty() { kind.name().as_bytes().to_vec() } else { source };
             ns.update(|t| {
                 t.mount(&point, kind, src, root, flags, device, data);
@@ -315,17 +322,99 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let target = guest!(uaccess::read_cstr(target, uaccess::PATH_MAX));
-        let (point, _) = match self.mount_path(&target, flags & UMOUNT_NOFOLLOW == 0) {
+        crate::fs::UNMOUNTING.with(|u| u.set(true));
+        let found = self.mount_path(&target, flags & UMOUNT_NOFOLLOW == 0);
+        crate::fs::UNMOUNTING.with(|u| u.set(false));
+        let (point, _) = match found {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        match self.fs().mount_ns().clone().update(|t| t.umount(&point)) {
+        let ns = self.fs().mount_ns().clone();
+        let table = ns.table();
+        let (m, rest) = table.locate(&point);
+        if !rest.is_empty() || m.parent == m.id {
+            return err(errno::EINVAL);
+        }
+        let id = m.id;
+        if flags & MNT_EXPIRE != 0 {
+            // Not the caller's root; not in use; marked by a first call,
+            // unmounted by a second if nothing used it in between.
+            if point == self.fs().proc_root() {
+                return err(errno::EINVAL);
+            }
+            if self.mount_busy(&table, id) {
+                return err(errno::EBUSY);
+            }
+            if !table.expiring.contains(&id) {
+                let _ = ns.update(|t| {
+                    t.expiring.push(id);
+                    Ok(())
+                });
+                return err(errno::EAGAIN);
+            }
+        } else if flags & MNT_DETACH == 0 && self.mount_busy(&table, id) {
+            return err(errno::EBUSY);
+        }
+        match ns.update(|t| {
+            t.expiring.retain(|i| *i != id);
+            t.umount(&point)
+        }) {
             Ok(()) => {
                 crate::inotify::unmounted(&point);
                 0
             }
             Err(e) => err(e),
         }
+    }
+
+    /// Whether mount `id` is in use, as Linux refuses to unmount one that
+    /// is (`EBUSY`): something is mounted under it, the caller's working
+    /// directory or root is in it, or a file in it is open in an fwe
+    /// process.
+    fn mount_busy(&self, table: &crate::mounts::Table, id: u32) -> bool {
+        use crate::mounts::under;
+        let Some(m) = table.get(id) else { return false };
+        if table.mounts.iter().any(|c| c.parent == id && c.id != id) {
+            return true;
+        }
+        let fs = self.fs();
+        let cwd = fs.to_ns(fs.cwd());
+        if under(&cwd, &m.point).is_some()
+            || (fs.proc_root() != b"/" && under(fs.proc_root(), &m.point).is_some())
+        {
+            return true;
+        }
+        // Where its files are on the host, as a descriptor's path reads.
+        let roots: Vec<Vec<u8>> = match &m.source {
+            Source::Host(_) => m.host_path(b"").into_iter().collect(),
+            Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
+            Source::Synthetic => Vec::new(),
+        };
+        let roots: Vec<Vec<u8>> = roots
+            .into_iter()
+            .map(|r| {
+                use std::os::unix::ffi::{OsStrExt, OsStringExt};
+                std::fs::canonicalize(std::ffi::OsStr::from_bytes(&r))
+                    .map_or(r, |p| p.into_os_string().into_vec())
+            })
+            .collect();
+        if roots.is_empty() {
+            return false;
+        }
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let mut pids: Vec<i32> = crate::procreg::all().into_iter().map(|(p, _)| p).collect();
+        if !pids.contains(&me) {
+            pids.push(me);
+        }
+        pids.into_iter().any(|p| {
+            crate::procpid::fds(p).into_iter().any(|(_, t)| match t {
+                crate::procpid::FdTarget::Path(path) => {
+                    roots.iter().any(|r| under(&path, r).is_some())
+                }
+                _ => false,
+            })
+        })
     }
 
     /// `pivot_root(new_root, put_old)`: the mount at `new_root` becomes the

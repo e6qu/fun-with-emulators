@@ -82,7 +82,11 @@ capabilities. *crun, podman and containerd run standard images.*
   with peer groups kept and mount ids in `statx`;
 - namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
   `NS_GET_*` requests;
-- inotify, its events raised by fwe from every process's file calls.
+- inotify, its events raised by fwe from every process's file calls;
+- mounts as Linux has them: propagation (between peers, to slaves, across
+  namespaces), the `nodev`, `noexec`, `nosymfollow` and access-time flags
+  acted on, busy mounts refused, `MNT_EXPIRE`, and `pivot_root` of a
+  chroot.
 
 ## Left to 1.0
 
@@ -103,10 +107,6 @@ hardware.
 In order of what each item unblocks. The LTP counts are from the latest
 run.
 
-- [ ] **Mounts as Linux enforces them:** propagation between peers and to
-  slaves; `nodev`, `noexec`, `nosymfollow` and the access-time modes
-  acted on; a busy mount refused (`EBUSY`), with `MNT_DETACH` and
-  `MNT_EXPIRE` as Linux has them.
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).

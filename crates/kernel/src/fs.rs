@@ -240,6 +240,12 @@ impl Resolved {
     }
 }
 
+thread_local! {
+    /// This thread is looking up an unmount's target, which is no use of
+    /// the mount ([`Fs::resolve`], `MNT_EXPIRE`).
+    pub static UNMOUNTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The guest's view of the filesystem.
 pub struct Fs {
     /// The rootfs: the host directory of the initial namespace's root
@@ -1068,7 +1074,28 @@ impl Fs {
             // `AT_EMPTY_PATH` acts on its descriptor before resolving.
             return Err(errno::ENOENT);
         }
-        resolve_in(&self.view(), dirfd, path, follow_final)
+        let r = resolve_in(&self.view(), dirfd, path, follow_final)?;
+        // A mount marked to expire (`MNT_EXPIRE`) is in use again (but by
+        // the lookup of an unmount's own target).
+        let t = self.mnt.table();
+        if !t.expiring.is_empty()
+            && !UNMOUNTING.with(std::cell::Cell::get)
+            && let Some(ns) = &r.ns_path
+        {
+            let used: Vec<u32> = t
+                .expiring
+                .iter()
+                .copied()
+                .filter(|id| t.get(*id).is_some_and(|m| mounts::under(ns, &m.point).is_some()))
+                .collect();
+            if !used.is_empty() {
+                let _ = self.mnt.update(|t| {
+                    t.expiring.retain(|i| !used.contains(i));
+                    Ok(())
+                });
+            }
+        }
+        Ok(r)
     }
 
     fn view(&self) -> View<'_> {
@@ -1081,8 +1108,9 @@ impl Fs {
         }
     }
 
-    /// Resolve and read a whole file under the root (following symlinks).
-    /// Used to load the dynamic linker named by a guest executable.
+    /// Resolve and read a whole file under the root (following symlinks),
+    /// to run it: a program, or the dynamic linker it names (`EACCES` from
+    /// a `noexec` mount).
     pub fn read(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
         if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
             use crate::procfs::Entry;
@@ -1106,6 +1134,10 @@ impl Fs {
             };
         }
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        // Nothing is run from a mount that runs nothing.
+        if resolved.mount_flags & mounts::ms::NOEXEC != 0 {
+            return Err(errno::EACCES);
+        }
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         let fd = unsafe {
@@ -1144,6 +1176,10 @@ impl Fs {
     /// `path` names.
     pub fn read_head(&self, path: &[u8], len: usize) -> Result<Vec<u8>, i32> {
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        // Nothing is run from a mount that runs nothing.
+        if resolved.mount_flags & mounts::ms::NOEXEC != 0 {
+            return Err(errno::EACCES);
+        }
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         let fd = unsafe {
@@ -1851,6 +1887,15 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             Step::Link(target) => {
                 symlinks += 1;
                 if symlinks > MAX_SYMLINKS {
+                    return Err(errno::ELOOP);
+                }
+                // A mount whose links are not followed.
+                let nofollow = here
+                    .at
+                    .as_ref()
+                    .and_then(|(id, _)| table.get(*id))
+                    .is_some_and(|m| m.flags & mounts::ms::NOSYMFOLLOW != 0);
+                if nofollow {
                     return Err(errno::ELOOP);
                 }
                 if target.first() == Some(&b'/') {

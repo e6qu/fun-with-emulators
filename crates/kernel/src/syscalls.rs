@@ -120,7 +120,9 @@ impl<P: Platform> Kernel<P> {
             return e;
         }
         let plan = self.inotify_before(n, &a);
+        let noted = crate::atime::before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
+        crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
         // have given: closed again (by the guest's `close`, which also drops

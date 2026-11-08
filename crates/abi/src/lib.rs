@@ -1303,6 +1303,8 @@ pub mod statfs {
     pub const ST_NODIRATIME: i64 = 2048;
     pub const ST_RELATIME: i64 = 4096;
     pub const ST_NOSYMFOLLOW: i64 = 0x2000;
+    /// Set in every `f_flags`: they are filled in.
+    pub const ST_VALID: i64 = 0x0020;
     /// `msync` flags.
     pub const MS_ASYNC: u64 = 1;
     pub const MS_INVALIDATE: u64 = 2;

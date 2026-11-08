@@ -879,6 +879,14 @@ impl<P: Platform> Kernel<P> {
         fd: u64,
         offset: u64,
     ) -> i64 {
+        // Nothing of a mount that runs nothing is mapped to run.
+        if flags & mman::MAP_ANONYMOUS == 0
+            && prot & mman::PROT_EXEC != 0
+            && crate::fdmarks::origin(fd as i32)
+                .is_some_and(|o| o.flags & crate::mounts::ms::NOEXEC != 0)
+        {
+            return err(errno::EPERM);
+        }
         // A loop device maps the file it shows.
         let source = if flags & mman::MAP_ANONYMOUS == 0 {
             crate::loopdev::map_source(fd as i32, self.page_size)

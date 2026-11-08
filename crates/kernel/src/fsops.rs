@@ -557,6 +557,12 @@ impl<P: Platform> Kernel<P> {
                 crate::devnodes::linux_numbers_of_host(&st)
             };
             if let Some(n) = node {
+                // Not through a mount that has no devices.
+                if resolved.mount_flags & crate::mounts::ms::NODEV != 0 {
+                    // SAFETY: closing the node's own descriptor.
+                    unsafe { libc::close(fd) };
+                    return err(errno::EACCES);
+                }
                 let device = open_device(fd, n, flags, crate::devnodes::marked(&st));
                 // A device fwe makes of its node keeps the node's
                 // descriptor; another has the host's device opened for it.
@@ -820,6 +826,7 @@ impl<P: Platform> Kernel<P> {
                     f_bsize: page,
                     f_namelen: 255,
                     f_frsize: page,
+                    f_flags: fwe_abi::statfs::ST_VALID,
                     ..Default::default()
                 };
                 guest!(uaccess::write(buf, out));
@@ -2423,7 +2430,7 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
         use crate::mounts::ms;
         use fwe_abi::statfs::*;
         out.f_type = fstype.magic();
-        let mut f = 0;
+        let mut f = ST_VALID;
         for (m, st) in [
             (ms::RDONLY, ST_RDONLY),
             (ms::NOSUID, ST_NOSUID),

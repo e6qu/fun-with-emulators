@@ -2,9 +2,9 @@
 //! made with `fsopen`, `fsconfig` and `fsmount` and attached with
 //! `move_mount`; a detached copy of it (`open_tree`) attached beneath
 //! another mount; a reconfiguration through `fspick`; `mount_setattr`;
-//! the mounts as `statx`, `statmount` and `listmount` report them; and a
-//! mount under a shared one reaching a child's copy of the namespace. It
-//! prints what it observed.
+//! the mounts as `statx`, `statmount` and `listmount` report them; a mount
+//! under a shared one reaching a child's copy of the namespace; and the
+//! mount flags and a busy mount enforced. It prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates; the calls musl lacks are made with
@@ -60,6 +60,11 @@ unsafe extern "C" {
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
     fn _exit(code: i32) -> !;
+    fn umount2(target: *const c_char, flags: i32) -> i32;
+    fn mknod(path: *const c_char, mode: u32, dev: u64) -> i32;
+    fn symlink(target: *const c_char, path: *const c_char) -> i32;
+    fn execv(path: *const c_char, argv: *const *const c_char) -> i32;
+    fn __errno_location() -> *mut i32;
     fn syscall(n: i64, ...) -> i64;
 }
 
@@ -214,5 +219,31 @@ fn main() {
         waitpid(pid, &mut status, 0);
         println!("propagation: into the copied namespace {reached}, unmount too {}", x[0] == 1);
         umount(c(&b).as_ptr());
+
+        // The mount flags acted on, and a busy mount refused.
+        let errno = || *__errno_location();
+        const MS_NODEV: u64 = 4;
+        const MS_NOEXEC: u64 = 8;
+        const MS_NOSYMFOLLOW: u64 = 256;
+        let flags = MS_NODEV | MS_NOEXEC | MS_NOSYMFOLLOW;
+        mount(c("none").as_ptr(), c(&b).as_ptr(), c("tmpfs").as_ptr(), flags, std::ptr::null());
+        let node = format!("{b}/null");
+        mknod(c(&node).as_ptr(), 0o20666, (1 << 8) | 3);
+        let nodev = open(c(&node).as_ptr(), 2) == -1 && errno() == 13;
+        let prog = format!("{b}/prog");
+        std::fs::copy("/proc/self/exe", &prog).unwrap();
+        let prog_c = c(&prog);
+        let argv = [prog_c.as_ptr(), std::ptr::null()];
+        let noexec = execv(argv[0], argv.as_ptr()) == -1 && errno() == 13;
+        symlink(c(&node).as_ptr(), c(&format!("{b}/link")).as_ptr());
+        let nofollow = open(c(&format!("{b}/link")).as_ptr(), 0) == -1 && errno() == 40;
+        println!("enforced: nodev {nodev}, noexec {noexec}, nosymfollow {nofollow}");
+        let held = open(c(&format!("{b}/prog")).as_ptr(), 0);
+        let busy = umount(c(&b).as_ptr()) == -1 && errno() == 16;
+        close(held);
+        const MNT_EXPIRE: i32 = 4;
+        let first = umount2(c(&b).as_ptr(), MNT_EXPIRE) == -1 && errno() == 11;
+        let second = umount2(c(&b).as_ptr(), MNT_EXPIRE) == 0;
+        println!("unmount: busy refused {busy}, expire marks {first}, then unmounts {second}");
     }
 }

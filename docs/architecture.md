@@ -1033,6 +1033,19 @@ namespace's mounts are peers of the original's, and the groups' numbers
 are counted across namespaces), so a change made in one namespace is
 carried, once it is made, to the others' mount tables.
 
+A mount's flags are acted on: `nodev` refuses opening a device (`EACCES`),
+`noexec` running a program or mapping a file to execute (`EACCES`,
+`EPERM`), `nosymfollow` following a link (`ELOOP`), and `noatime`,
+`nodiratime` and `strictatime` set a read file's access time as Linux
+would (fwe notes it before the read and sets it after; a mount with none
+of them is `relatime`, Linux's default, left to the host). `statfs`
+reports the flags. A mount is busy, and its unmount refused (`EBUSY`),
+while something is mounted under it, the caller's working directory or
+root is in it, or a file in it is open in an fwe process; `MNT_DETACH`
+unmounts it anyway, and `MNT_EXPIRE` marks it on a first call and
+unmounts it on a second if nothing used it in between. `pivot_root`
+replaces the mount at the caller's root, the namespace's or a chroot's.
+
 The new mount API (`crates/kernel/src/mountapi.rs`) works on the same
 table. A filesystem context (`fsopen`, or `fspick` of a mounted filesystem)
 gathers a source, flags and options through `fsconfig`, checked as Linux
@@ -1297,8 +1310,8 @@ of these are to be lifted for 1.0 and which are not planned.
   keeps), so one passed to another process over a socket is a plain
   descriptor of its directory; `fspick` reconfigures the one mount, its
   `ro`, `rw` and options; a remount of a filesystem acts on the one mount; a
-  tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
-  always detaches). An overlay's layers must be host directories (not in
+  tmpfs's `size=` is not enforced; a mount is not busy for a process fwe
+  did not start, nor for another process's working directory. An overlay's layers must be host directories (not in
   another overlay); a directory a lower layer has cannot be renamed
   (`EXDEV`, as with `redirect_dir=off`); a rename that leaves a whiteout
   behind, and a `bind` over one, are two host steps, between which another

@@ -1126,7 +1126,13 @@ impl<P: Platform> Kernel<P> {
 
 /// A one-mount table of `m`, to encode a mount with ([`save`]).
 fn as_table(mounts: Vec<Mount>) -> crate::mounts::Table {
-    crate::mounts::Table { mounts, next_id: 0, next_group: 0, outbox: Vec::new() }
+    crate::mounts::Table {
+        mounts,
+        next_id: 0,
+        next_group: 0,
+        outbox: Vec::new(),
+        expiring: Vec::new(),
+    }
 }
 
 /// Write the process's contexts and detached trees into a fork snapshot or

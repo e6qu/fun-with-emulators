@@ -2806,13 +2806,16 @@ const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown pa
     beneath: 0, top first true, then the copy true\n\
     fspick: 0, read-only true, then rw\n\
     mount_setattr: 0, nodev true, shared true\n\
-    propagation: into the copied namespace true, unmount too true\n";
+    propagation: into the copied namespace true, unmount too true\n\
+    enforced: nodev true, noexec true, nosymfollow true\n\
+    unmount: busy refused true, expire marks true, then unmounts true\n";
 
 /// The new mount API: a tmpfs made through a filesystem context and
 /// attached from a detached mount, a detached copy attached beneath
 /// another mount, `fspick`, `mount_setattr`, `statx`, `statmount` and
-/// `listmount` agreeing on the mount, and a mount under a shared one
-/// propagating into a copied namespace.
+/// `listmount` agreeing on the mount, a mount under a shared one
+/// propagating into a copied namespace, the `nodev`, `noexec` and
+/// `nosymfollow` flags acted on, and a busy mount refused.
 #[test]
 fn the_new_mount_api_makes_and_attaches_mounts() {
     let out = fwe(&rust_guest("mountapi"), &[]);
