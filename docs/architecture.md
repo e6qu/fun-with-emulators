@@ -86,7 +86,8 @@ for (memory mapped writable and executable is one or the other at a time
 on macOS) and the file it maps, from which offset; the loaders add the
 program, its dynamic linker (each segment the file's as far as the file
 has contents, zeroed memory beyond) and the stack, and the break is the
-heap. Memory the native backend maps for the guest that the guest did not
+heap (up to 1 GiB after the program, reserved before the dynamic linker is
+placed, as much of it as the host has free). Memory the native backend maps for the guest that the guest did not
 ask for (code stubs, a stack's guard page) is listed as anonymous memory
 with the host's protections, so a program looking for free address space
 in the list does not pick it. Locking (`mlock`, `mlock2`, `mlockall`,

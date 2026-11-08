@@ -46,8 +46,10 @@ pub struct Note {
 /// Host signals are numbered below this.
 const SIGNALS: usize = 32;
 /// A note older than this is not taken for a signal that came with no
-/// sender: a signal is held by fwe's handlers only for a moment.
-const FRESH_NS: u64 = 1_000_000_000;
+/// sender (one whose sender has ended, or the host did not name): a signal
+/// is held by fwe's handlers only for a moment, though a loaded machine
+/// delivers it late.
+const FRESH_NS: u64 = 10_000_000_000;
 /// A note older than this is not taken for a signal from the process that
 /// left it: the sender names it, so only a slow delivery (a loaded machine,
 /// the VM's stand-in) separates them.

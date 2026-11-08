@@ -4,6 +4,7 @@
 # Every other test is to pass under fwe, but those for what is not planned
 # for 1.0 (ROADMAP.md).
 mq_open01 musl passes an empty queue name to the kernel, which gives ENOENT; the test expects glibc's EINVAL
+sbrk01 musl's sbrk refuses any increment (ENOMEM) without asking the kernel
 posix_fadvise02 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
 posix_fadvise03 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
 posix_fadvise04 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned

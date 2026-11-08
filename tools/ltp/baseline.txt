@@ -12,6 +12,7 @@ alarm05
 alarm06
 alarm07
 bind03
+brk02
 capget01
 capget02
 capset01
@@ -28,6 +29,7 @@ chown01
 chroot01
 chroot02
 chroot03
+chroot04
 clock_getres01
 clock_gettime01
 clock_gettime02
@@ -52,6 +54,7 @@ creat01
 creat03
 creat05
 creat06
+dirtypipe
 dup01
 dup02
 dup03
@@ -223,6 +226,7 @@ fstat02
 fstat02_64
 fstat03
 fstat03_64
+fstatat01
 fstatfs01
 fstatfs01_64
 fstatfs02
@@ -298,6 +302,19 @@ gettimeofday02
 getuid01
 getuid03
 getxattr01
+inotify_init1_01
+inotify_init1_02
+inotify01
+inotify02
+inotify04
+inotify05
+inotify06
+inotify07
+inotify08
+inotify09
+inotify10
+inotify11
+inotify12
 ioctl_loop01
 ioctl_loop02
 ioctl_loop03
@@ -329,6 +346,7 @@ link05
 link08
 listen01
 listmount01
+listmount02
 listmount03
 listmount04
 listxattr01
@@ -391,9 +409,12 @@ mmap21_02
 mount_setattr01
 mount_setattr02
 mount01
+mount03
 mount04
 mount05
 mount06
+mount07
+mount08
 move_mount01
 move_mount02
 move_mount03
@@ -428,6 +449,7 @@ msgsnd01
 msgsnd02
 msgsnd05
 msgsnd06
+msgstress01
 msync01
 msync02
 munlock01
@@ -472,6 +494,13 @@ pipe13
 pipe14
 pipe2_01
 pipe2_02
+pipeio_1
+pipeio_2
+pipeio_5
+pipeio_6
+pipeio_7
+pipeio_8
+pivot_root01
 poll01
 poll04
 posix_fadvise01
@@ -733,7 +762,9 @@ truncate02_64
 truncate03
 truncate03_64
 umount01
+umount02
 umount03
+umount2_02
 uname01
 uname02
 uname04

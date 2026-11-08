@@ -344,18 +344,26 @@ impl Brk {
     /// Default size of the reservation.
     pub const RESERVATION: u64 = 1 << 30;
 
-    /// Reserve `size` bytes of address space at page-aligned `start`.
+    /// Reserve up to `size` bytes of address space at page-aligned
+    /// `start`: as much of it as is free, halving the size while something
+    /// the host mapped is in the way (the break grows up to the next
+    /// mapping, as on Linux).
     ///
-    /// If the range is not available the break cannot grow; allocators then
-    /// fall back to `mmap`, as they do on Linux when `brk` fails.
+    /// If none is free the break cannot grow; allocators then fall back to
+    /// `mmap`, as they do on Linux when `brk` fails.
     pub fn reserve(start: u64, size: u64) -> Brk {
-        match crate::host::reserve_fixed(start, size) {
-            Ok(()) => {
-                track(start, size);
-                Brk { start, current: start, limit: start + size }
+        let mut size = size;
+        while size >= 1 << 16 {
+            match crate::host::reserve_fixed(start, size) {
+                Ok(()) => {
+                    track(start, size);
+                    return Brk { start, current: start, limit: start + size };
+                }
+                Err(crate::host::ReserveError::Occupied) => size /= 2,
+                Err(_) => break,
             }
-            Err(_) => Brk { start, current: start, limit: start },
         }
+        Brk { start, current: start, limit: start }
     }
 }
 
