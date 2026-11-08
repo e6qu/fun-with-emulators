@@ -220,7 +220,7 @@ impl<P: Platform> Kernel<P> {
                     if self.fs().proc_path(dirfd as i32, &path).as_deref()
                         == Some(b"/proc/self/status") =>
                 {
-                    self.synthetic_fd(anon_fd(&self.self_status()), dirfd as i32, &path)
+                    self.synthetic_fd(anon_fd(&self.self_status(), flags), dirfd as i32, &path)
                 }
                 crate::procfs::Entry::File(_)
                     if let Some(tid) = self.fs().proc_path(dirfd as i32, &path).and_then(|p| {
@@ -228,7 +228,7 @@ impl<P: Platform> Kernel<P> {
                         std::str::from_utf8(t).ok()?.parse::<i32>().ok()
                     }) =>
                 {
-                    self.synthetic_fd(anon_fd(&self.task_status(tid)), dirfd as i32, &path)
+                    self.synthetic_fd(anon_fd(&self.task_status(tid), flags), dirfd as i32, &path)
                 }
                 crate::procfs::Entry::File(content)
                     if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
@@ -248,7 +248,7 @@ impl<P: Platform> Kernel<P> {
                     };
                     match mark {
                         Ok(mark) => {
-                            let fd = anon_fd(&content);
+                            let fd = anon_fd(&content, flags);
                             if fd >= 0 {
                                 crate::fdmarks::mark(fd as i32, mark);
                             }
@@ -258,7 +258,7 @@ impl<P: Platform> Kernel<P> {
                     }
                 }
                 crate::procfs::Entry::File(content) => {
-                    self.synthetic_fd(anon_fd(&content), dirfd as i32, &path)
+                    self.synthetic_fd(anon_fd(&content, flags), dirfd as i32, &path)
                 }
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
@@ -554,6 +554,9 @@ impl<P: Platform> Kernel<P> {
         }
         if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
             crate::fdmarks::set_stand_in(fd, host);
+        }
+        if flags & fcntl::O_PATH != 0 {
+            crate::fdmarks::mark(fd, crate::fdmarks::Mark::Path);
         }
         fd as i64
     }
@@ -2464,32 +2467,49 @@ fn synth_stat(mode: u32, size: u64) -> Stat {
     }
 }
 
-/// An anonymous, seekable, readable fd preloaded with `content`, used to serve
-/// a synthetic `/proc` or `/sys` file. Backed by an immediately-unlinked temp
-/// file so it works on both Linux and macOS.
-fn anon_fd(content: &[u8]) -> i64 {
+/// An anonymous, seekable fd preloaded with `content`, open for what the
+/// guest's open `flags` ask (reading, writing or both), to serve a
+/// synthetic `/proc` or `/sys` file. Backed by an unlinked temporary file
+/// so it works on both Linux and macOS.
+fn anon_fd(content: &[u8], flags: u64) -> i64 {
     let mut template = *b"/tmp/fwe-proc-XXXXXX\0";
     // SAFETY: `template` is a NUL-terminated mutable buffer for mkstemp.
     let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
     if fd < 0 {
         return last_error();
     }
-    // SAFETY: `template` is the NUL-terminated name just created.
-    unsafe { libc::unlink(template.as_ptr().cast()) };
     let mut off = 0usize;
     while off < content.len() {
         // SAFETY: writing the remaining content to the temp fd.
         let n = unsafe { libc::write(fd, content[off..].as_ptr().cast(), content.len() - off) };
         if n <= 0 {
-            // SAFETY: closing the fd we created.
-            unsafe { libc::close(fd) };
+            // SAFETY: closing and removing the file we created.
+            unsafe {
+                libc::close(fd);
+                libc::unlink(template.as_ptr().cast());
+            }
             return last_error();
         }
         off += n as usize;
     }
-    // SAFETY: rewinding to the start for the guest's reads.
-    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-    fd as i64
+    // Opened again as the guest asked, to read or write only, so a read
+    // or write it was not opened for fails with `EBADF`, as on Linux.
+    let mode = match flags & fcntl::O_ACCMODE {
+        fcntl::O_WRONLY => libc::O_WRONLY,
+        fcntl::O_RDWR => libc::O_RDWR,
+        _ => libc::O_RDONLY,
+    };
+    // SAFETY: `template` names the file just made; plain host calls.
+    let guest = unsafe {
+        let g = libc::open(template.as_ptr().cast(), mode);
+        libc::close(fd);
+        libc::unlink(template.as_ptr().cast());
+        g
+    };
+    if guest < 0 {
+        return last_error();
+    }
+    guest as i64
 }
 
 /// Write back and drop from the host's cache the pages of the regular file

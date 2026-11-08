@@ -138,7 +138,10 @@ impl<P: Platform> Kernel<P> {
             | nr::PREADV
             | nr::PWRITEV
             | nr::PREADV2
-            | nr::PWRITEV2 => {
+            | nr::PWRITEV2
+            | nr::SPLICE
+            | nr::TEE
+            | nr::VMSPLICE => {
                 // SAFETY: the backend's guarantee for the guest pointers.
                 unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS))
             }
@@ -2437,6 +2440,91 @@ mod tests {
             r,
             k.syscall(nr::IOCTL, [fd, ioctl::TIOCGPTN, &mut n as *mut u32 as u64, 0, 0, 0])
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pipe() -> [i32; 2] {
+        let mut p = [0i32; 2];
+        // SAFETY: a valid out-parameter.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        p
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close_all(fds: &[i32]) {
+        for &fd in fds {
+            // SAFETY: closing descriptors the test made.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// `splice` moves a file's bytes from an offset into a pipe and on
+    /// into another file, leaving the file's own position; it refuses two
+    /// non-pipes, an offset for a pipe, an empty pipe asked not to wait,
+    /// and both ends of one pipe. (A host pipe's contents are as macOS
+    /// reports them.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn splice_moves_through_pipes() {
+        use std::io::{Read, Seek, Write};
+        use std::os::fd::AsRawFd;
+        let mut src = tempfile_in_tmp();
+        src.write_all(b"0123456789").unwrap();
+        let mut dst = tempfile_in_tmp();
+        let [r, w] = pipe();
+        let mut k = kernel();
+        let (s, d) = (src.as_raw_fd() as u64, dst.as_raw_fd() as u64);
+        let mut off: i64 = 2;
+        let n = k.syscall(nr::SPLICE, [s, &mut off as *mut i64 as u64, w as u64, 0, 5, 0]);
+        assert_eq!((n, off), (5, 7));
+        assert_eq!(src.stream_position().unwrap(), 10, "its own position is left");
+        assert_eq!(k.syscall(nr::SPLICE, [r as u64, 0, d, 0, 100, 0]), 5);
+        let mut got = String::new();
+        dst.rewind().unwrap();
+        dst.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "23456");
+        // Neither end a pipe; an offset of a pipe; nothing in it, not waiting.
+        assert_eq!(k.syscall(nr::SPLICE, [s, 0, d, 0, 1, 0]), err(errno::EINVAL));
+        assert_eq!(
+            k.syscall(nr::SPLICE, [r as u64, &mut off as *mut i64 as u64, d, 0, 1, 0]),
+            err(errno::ESPIPE)
+        );
+        assert_eq!(k.syscall(nr::SPLICE, [r as u64, 0, d, 0, 1, 2]), err(errno::EAGAIN));
+        assert_eq!(k.syscall(nr::SPLICE, [r as u64, 0, w as u64, 0, 1, 0]), err(errno::EINVAL));
+        close_all(&[r, w]);
+    }
+
+    /// `tee` copies a pipe's bytes into another and leaves them; `vmsplice`
+    /// fills a pipe from memory and refuses a full one asked not to wait.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tee_and_vmsplice() {
+        let ([r1, w1], [r2, w2]) = (pipe(), pipe());
+        let mut k = kernel();
+        let data = *b"hello";
+        let iov = [data.as_ptr() as u64, data.len() as u64];
+        assert_eq!(k.syscall(nr::VMSPLICE, [w1 as u64, iov.as_ptr() as u64, 1, 0, 0, 0]), 5);
+        assert_eq!(k.syscall(nr::TEE, [r1 as u64, w2 as u64, 3, 0, 0, 0]), 3);
+        let mut buf = [0u8; 8];
+        // SAFETY: valid buffers of their lengths.
+        let (a, b) = unsafe {
+            (
+                libc::read(r1, buf.as_mut_ptr().cast(), 8),
+                libc::read(r2, buf[5..].as_mut_ptr().cast(), 3),
+            )
+        };
+        assert_eq!((a, b, &buf), (5, 3, b"hellohel"));
+        // A pipe filled to its capacity takes nothing more without waiting.
+        let big = vec![0u8; 65_536];
+        let iov = [big.as_ptr() as u64, big.len() as u64];
+        assert_eq!(k.syscall(nr::VMSPLICE, [w1 as u64, iov.as_ptr() as u64, 1, 0, 0, 0]), 65_536);
+        assert_eq!(
+            k.syscall(nr::VMSPLICE, [w1 as u64, iov.as_ptr() as u64, 1, 2, 0, 0]),
+            err(errno::EAGAIN)
+        );
+        // Both ends of one pipe.
+        assert_eq!(k.syscall(nr::TEE, [r1 as u64, w1 as u64, 1, 0, 0, 0]), err(errno::EINVAL));
+        close_all(&[r1, w1, r2, w2]);
     }
 
     /// `FIOASYNC` turns `O_ASYNC` on and off, as on any Linux descriptor.

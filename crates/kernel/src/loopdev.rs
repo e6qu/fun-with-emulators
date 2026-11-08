@@ -776,7 +776,7 @@ pub fn map_source(fd: i32, page_size: u64) -> Option<Result<(OwnedFd, u64), i32>
     })())
 }
 
-/// For `sendfile`: read up to `len` bytes of the loop device `fd` is open
+/// For `sendfile` and `splice`: read up to `len` bytes of the loop device `fd` is open
 /// on into `buf`, at `pos` or at the descriptor's position (`None` for
 /// another descriptor).
 pub fn read_into(fd: i32, buf: &mut [u8], pos: Option<u64>) -> Option<i64> {
@@ -785,12 +785,13 @@ pub fn read_into(fd: i32, buf: &mut [u8], pos: Option<u64>) -> Option<i64> {
     Some(transfer(fd, n, &[iov], pos, false))
 }
 
-/// For `sendfile`: write `buf` to the loop device `fd` is open on, at the
-/// descriptor's position (`None` for another descriptor).
-pub fn write_from(fd: i32, buf: &[u8]) -> Option<i64> {
+/// For `sendfile` and `splice`: write `buf` to the loop device `fd` is
+/// open on, at `pos` or at the descriptor's position (`None` for another
+/// descriptor).
+pub fn write_at_pos(fd: i32, buf: &[u8], pos: Option<u64>) -> Option<i64> {
     let n = device_of(fd)?;
     let iov = libc::iovec { iov_base: buf.as_ptr() as *mut _, iov_len: buf.len() };
-    Some(transfer(fd, n, &[iov], None, true))
+    Some(transfer(fd, n, &[iov], pos, true))
 }
 
 // --- Requests ---
