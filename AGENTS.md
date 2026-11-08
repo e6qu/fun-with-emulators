@@ -70,7 +70,7 @@ Each document has one job; do not duplicate content across them.
 | [README.md](README.md) | What the project is, a short status, how to run and test it |
 | [PLAN.md](PLAN.md) | Goal, approach, scope, the 1.0 finish line, principles, how progress is measured |
 | [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 with "Done when" criteria, and what is not planned |
-| [docs/linux-on-macos.md](docs/linux-on-macos.md) | Linux to macOS: what Linux does, what macOS has, what fwe does; macOS to Linux: what happens on the host, what fwe does, what the guest sees |
+| [docs/linux-on-macos.md](docs/linux-on-macos.md) | How Linux programs run on macOS: which binaries run where and what costs least, how languages and runtimes fare, which instructions are rewritten, how the VM is used; Linux to macOS (what Linux does, what macOS has, what fwe does) and macOS to Linux (what happens on the host, what the guest sees) |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
