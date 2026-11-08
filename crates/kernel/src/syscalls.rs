@@ -529,6 +529,15 @@ impl<P: Platform> Kernel<P> {
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
             nr::PERSONALITY => personality(a[0]),
+            nr::SCHED_SETSCHEDULER => self.sys_sched_setscheduler(a[0], Some(a[1]), a[2]),
+            nr::SCHED_SETPARAM => self.sys_sched_setscheduler(a[0], None, a[1]),
+            nr::SCHED_GETSCHEDULER => self.sys_sched_getscheduler(a[0]),
+            nr::SCHED_GETPARAM => self.sys_sched_getparam(a[0], a[1]),
+            nr::SCHED_SETATTR => self.sys_sched_setattr(a[0], a[1], a[2]),
+            nr::SCHED_GETATTR => self.sys_sched_getattr(a[0], a[1], a[2], a[3]),
+            nr::SCHED_GET_PRIORITY_MAX => crate::sched::priority_bound(a[0], true),
+            nr::SCHED_GET_PRIORITY_MIN => crate::sched::priority_bound(a[0], false),
+            nr::SCHED_RR_GET_INTERVAL => self.sys_sched_rr_get_interval(a[0], a[1]),
             nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
@@ -1519,7 +1528,16 @@ impl<P: Platform> Kernel<P> {
         }
         match crate::pidns::host_arg(id) {
             // SAFETY: a signal 0 only checks that the process exists.
-            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => 0,
+            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => {
+                // Another user's process, without CAP_SYS_NICE: refused.
+                let owner = crate::procreg::ids(h);
+                if !self.creds.has(crate::caps::CAP_SYS_NICE)
+                    && ![owner[0], owner[1]].contains(&self.creds.euid)
+                {
+                    return err(errno::EPERM);
+                }
+                0
+            }
             _ => err(errno::ESRCH),
         }
     }

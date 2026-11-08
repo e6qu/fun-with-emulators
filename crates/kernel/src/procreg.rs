@@ -65,6 +65,9 @@ pub struct ProcRecord {
     /// Its nice value (-20 to 19, `setpriority`), which its children
     /// inherit.
     pub nice: i32,
+    /// Its scheduling policy and attributes ([`crate::sched`]), which its
+    /// children inherit.
+    pub sched: Sched,
     /// Its mappings as they were when it was forked, until it publishes
     /// its own (see [`crate::maps::publish`]): what a fork child inherits,
     /// recorded with the record it writes anyway.
@@ -73,6 +76,50 @@ pub struct ProcRecord {
 
 /// A host process, as its pid and its start time.
 pub type Proc = (i32, u64);
+
+/// A process's scheduling policy and attributes, as `sched_setattr` sets
+/// them (the nice value is the record's own).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sched {
+    pub policy: u32,
+    /// The real-time priority (1 to 99, for `SCHED_FIFO` and `SCHED_RR`).
+    pub priority: u32,
+    /// `SCHED_RESET_ON_FORK`.
+    pub reset_on_fork: bool,
+    /// `SCHED_DEADLINE`'s runtime, deadline and period, in nanoseconds.
+    pub runtime: u64,
+    pub deadline: u64,
+    pub period: u64,
+    /// The utilisation clamps (0 to 1024), and whether each was set.
+    pub util_min: Option<u32>,
+    pub util_max: Option<u32>,
+}
+
+impl Sched {
+    fn encode(&self, e: &mut Enc) {
+        e.u32(self.policy);
+        e.u32(self.priority);
+        e.bool(self.reset_on_fork);
+        e.u64(self.runtime);
+        e.u64(self.deadline);
+        e.u64(self.period);
+        for v in [self.util_min, self.util_max] {
+            e.bool(v.is_some());
+            e.u32(v.unwrap_or(0));
+        }
+    }
+
+    fn decode(d: &mut Dec) -> Sched {
+        let (policy, priority, reset_on_fork) = (d.u32(), d.u32(), d.bool());
+        let (runtime, deadline, period) = (d.u64(), d.u64(), d.u64());
+        let mut clamp = || {
+            let (set, v) = (d.bool(), d.u32());
+            set.then_some(v)
+        };
+        let (util_min, util_max) = (clamp(), clamp());
+        Sched { policy, priority, reset_on_fork, runtime, deadline, period, util_min, util_max }
+    }
+}
 
 fn put_procs(e: &mut Enc, ps: &[Proc]) {
     e.u64(ps.len() as u64);
@@ -153,6 +200,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
         e.u64(hard);
     }
     e.i32(r.nice);
+    r.sched.encode(&mut e);
     e.bytes(&r.maps);
     e.into_bytes()
 }
@@ -180,6 +228,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let n = d.count(20);
     let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let nice = d.i32();
+    let sched = Sched::decode(&mut d);
     let maps = d.bytes();
     d.finish().ok()?;
     Some(ProcRecord {
@@ -201,6 +250,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         ids,
         limits,
         nice,
+        sched,
         maps,
     })
 }
@@ -402,6 +452,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         ids: [0; 8],
         limits: Vec::new(),
         nice: 0,
+        sched: Sched::default(),
         maps: Vec::new(),
     });
     f(&mut r);
@@ -450,6 +501,18 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), ma
     let oom = mine.as_ref().map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min));
     let ids = mine.as_ref().map_or([0; 8], |r| r.ids);
     let nice = mine.as_ref().map_or(0, |r| r.nice);
+    // A child of a process that asked to reset on fork starts as an
+    // ordinary one, its nice value no less than 0, as on Linux.
+    let (sched, nice) = match mine.as_ref().map_or_else(Sched::default, |r| r.sched) {
+        s if s.reset_on_fork => {
+            use fwe_abi::sched::*;
+            let realtime = matches!(s.policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE);
+            let sched =
+                if realtime { Sched::default() } else { Sched { reset_on_fork: false, ..s } };
+            (sched, if realtime { 0 } else { nice.max(0) })
+        }
+        s => (s, nice),
+    };
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
     let cgroup = own_cgroup();
     // Kept what the child has already written of itself (its program).
@@ -465,6 +528,7 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), ma
         (r.oom_score_adj, r.oom_score_adj_min) = oom;
         r.ids = ids;
         r.nice = nice;
+        r.sched = sched;
         // Whichever of the two writes first, the child's mappings are there
         // from the start; the child's own stand.
         if r.maps.is_empty() {
@@ -485,6 +549,16 @@ pub fn nice(pid: i32) -> i32 {
         },
         |r| r.nice,
     )
+}
+
+/// Host process `pid`'s scheduling attributes, if fwe has its record.
+pub fn sched(pid: i32) -> Option<Sched> {
+    read(pid).map(|r| r.sched)
+}
+
+/// Host process `pid`'s scheduling attributes are now `s`.
+pub fn set_sched(pid: i32, s: Sched) -> Result<(), i32> {
+    change(pid, |r| r.sched = s)
 }
 
 /// Host process `pid`'s nice value is now `nice`.

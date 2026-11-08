@@ -47,6 +47,7 @@ pub mod procreg;
 pub mod pty;
 pub mod reaper;
 pub mod rlimits;
+mod sched;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;

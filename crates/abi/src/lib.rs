@@ -572,6 +572,39 @@ pub mod ioctl {
     pub const BLKGETDISKSEQ: u64 = 0x8008_1280;
 }
 
+/// Scheduling policies and `struct sched_attr` (`linux/sched.h`,
+/// `linux/sched/types.h`).
+pub mod sched {
+    pub const SCHED_OTHER: u32 = 0;
+    pub const SCHED_FIFO: u32 = 1;
+    pub const SCHED_RR: u32 = 2;
+    pub const SCHED_BATCH: u32 = 3;
+    pub const SCHED_IDLE: u32 = 5;
+    pub const SCHED_DEADLINE: u32 = 6;
+    /// Or'd into a policy: a child starts as an ordinary process.
+    pub const SCHED_RESET_ON_FORK: u32 = 0x4000_0000;
+
+    /// `sched_attr.sched_flags`.
+    pub const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+    pub const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+    pub const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+    pub const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+    pub const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+    pub const SCHED_FLAG_ALL: u64 = 0x7f;
+
+    /// The highest real-time priority.
+    pub const MAX_RT_PRIO: u32 = 99;
+
+    /// `struct sched_attr`'s sizes (without and with the utilisation
+    /// clamps) and fields: `size`, `sched_policy` (u32 at 0 and 4),
+    /// `sched_flags` (u64 at 8), `sched_nice`, `sched_priority` (i32 and
+    /// u32 at 16 and 20), `sched_runtime`, `sched_deadline`, `sched_period`
+    /// (u64 at 24, 32, 40), `sched_util_min`, `sched_util_max` (u32 at 48
+    /// and 52).
+    pub const ATTR_SIZE_VER0: usize = 48;
+    pub const ATTR_SIZE_VER1: usize = 56;
+}
+
 /// Loop devices (`linux/loop.h`): the requests on a loop device and on
 /// `/dev/loop-control`, the flags, and the layouts of `struct loop_info`
 /// (`OLD_*`), `struct loop_info64` (`INFO64_*`) and `struct loop_config`.
