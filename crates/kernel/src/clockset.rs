@@ -109,18 +109,21 @@ fn adjtimex(p: u64) -> i64 {
 impl<P: Platform> Kernel<P> {
     /// `clock_settime(id, tp)`.
     pub(crate) fn sys_clock_settime(&mut self, id: u64, tp: u64) -> i64 {
-        // A CPU-time clock is never set; one that names nothing is
-        // `EINVAL` (or `ESRCH`) first.
-        if let Some(r) = crate::syscalls::cpu_clock_ns(id) {
-            return err(r.err().unwrap_or(errno::EPERM));
-        }
-        if id != CLOCK_REALTIME {
+        // Only the real-time clock and the CPU-time ones can be asked to be
+        // set; what they are given is read first.
+        let cpu = crate::syscalls::cpu_clock_ns(id);
+        if cpu.is_none() && id != CLOCK_REALTIME {
             return err(errno::EINVAL);
         }
         let [sec, nsec]: [i64; 2] = match uaccess::read(tp) {
             Ok(t) => t,
             Err(e) => return err(e),
         };
+        // A CPU-time clock is never set; one that names nothing is
+        // `EINVAL` (or `ESRCH`) first.
+        if let Some(r) = cpu {
+            return err(r.err().unwrap_or(errno::EPERM));
+        }
         if !valid_settod(sec, nsec) {
             return err(errno::EINVAL);
         }
@@ -154,8 +157,9 @@ impl<P: Platform> Kernel<P> {
     /// `clock_adjtime(id, buf)`: the real-time clock's `adjtimex`; the
     /// others cannot be adjusted.
     pub(crate) fn sys_clock_adjtime(&mut self, id: u64, buf: u64) -> i64 {
-        if let Some(r) = crate::syscalls::cpu_clock_ns(id) {
-            return err(r.err().unwrap_or(errno::EOPNOTSUPP));
+        // A CPU-time clock cannot be adjusted, whatever it names.
+        if crate::syscalls::cpu_clock_ns(id).is_some() {
+            return err(errno::EOPNOTSUPP);
         }
         if !known(id) {
             return err(errno::EINVAL);

@@ -507,8 +507,11 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), ma
         s if s.reset_on_fork => {
             use fwe_abi::sched::*;
             let realtime = matches!(s.policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE);
-            let sched =
-                if realtime { Sched::default() } else { Sched { reset_on_fork: false, ..s } };
+            let sched = if realtime {
+                Sched::default()
+            } else {
+                Sched { reset_on_fork: false, util_min: None, util_max: None, ..s }
+            };
             (sched, if realtime { 0 } else { nice.max(0) })
         }
         s => (s, nice),
@@ -556,9 +559,19 @@ pub fn sched(pid: i32) -> Option<Sched> {
     read(pid).map(|r| r.sched)
 }
 
-/// Host process `pid`'s scheduling attributes are now `s`.
-pub fn set_sched(pid: i32, s: Sched) -> Result<(), i32> {
-    change(pid, |r| r.sched = s)
+/// Change host process `pid`'s scheduling attributes and nice value with
+/// `f`, under its record's lock (`f`'s error is the result, the record
+/// unchanged).
+pub fn change_sched(
+    pid: i32,
+    f: impl FnOnce(&Sched, i32) -> Result<(Sched, i32), i32>,
+) -> Result<(), i32> {
+    let mut out = Ok(());
+    change(pid, |r| match f(&r.sched, r.nice) {
+        Ok((s, nice)) => (r.sched, r.nice) = (s, nice),
+        Err(e) => out = Err(e),
+    })?;
+    out
 }
 
 /// Host process `pid`'s nice value is now `nice`.

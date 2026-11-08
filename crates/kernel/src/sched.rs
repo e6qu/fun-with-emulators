@@ -96,14 +96,21 @@ impl<P: Platform> Kernel<P> {
         crate::procreg::sched(host).unwrap_or_default()
     }
 
-    /// Whether the caller may change process `host`'s scheduling as asked,
-    /// by Linux's rules for a caller without `CAP_SYS_NICE`.
-    fn sched_allowed(&self, host: i32, cur: &Sched, policy: u32, req: &Request) -> bool {
+    /// Whether the caller may change process `host`'s scheduling from `cur`
+    /// (nice value `nice_now`) as asked, by Linux's rules for a caller
+    /// without `CAP_SYS_NICE`.
+    fn sched_allowed(
+        &self,
+        host: i32,
+        cur: &Sched,
+        nice_now: i32,
+        policy: u32,
+        req: &Request,
+    ) -> bool {
         if self.creds.has(crate::caps::CAP_SYS_NICE) {
             return true;
         }
         let limit = |res| crate::syscalls::own_limit_of(res);
-        let nice_now = crate::procreg::nice(host);
         // `RLIMIT_NICE` bounds the least nice value as 20 less it.
         let nice_ok = |nice: i32| (20 - nice) as u64 <= limit(resource::RLIMIT_NICE);
         if fair(policy) && req.nice.is_some_and(|n| n < nice_now && !nice_ok(n)) {
@@ -138,9 +145,17 @@ impl<P: Platform> Kernel<P> {
         !(cur.reset_on_fork && req.reset_on_fork == Some(false))
     }
 
-    /// Set process `host`'s scheduling as `req` asks, with Linux's checks.
-    fn sched_set(&mut self, host: i32, req: Request) -> Result<(), i32> {
-        let cur = self.sched_of(host);
+    /// What process `host`'s scheduling, `cur` with nice value `nice`,
+    /// becomes as `req` asks, in Linux's order: the policy and its
+    /// parameters (`EINVAL`), the caller's right (`EPERM`), then the
+    /// utilisation clamps (`EINVAL`).
+    fn sched_apply(
+        &self,
+        host: i32,
+        cur: &Sched,
+        nice: i32,
+        req: &Request,
+    ) -> Result<(Sched, i32), i32> {
         let policy = req.policy.unwrap_or(cur.policy);
         if !valid_policy(policy) {
             return Err(errno::EINVAL);
@@ -153,6 +168,9 @@ impl<P: Platform> Kernel<P> {
         {
             return Err(errno::EINVAL);
         }
+        if !self.sched_allowed(host, cur, nice, policy, req) {
+            return Err(errno::EPERM);
+        }
         let clamp_ok = |v: Option<u32>| v.is_none_or(|v| v <= CAPACITY || v == u32::MAX);
         if !clamp_ok(req.util_min) || !clamp_ok(req.util_max) {
             return Err(errno::EINVAL);
@@ -161,10 +179,6 @@ impl<P: Platform> Kernel<P> {
         let util_max = req.util_max.map_or(cur.util_max, |v| (v != u32::MAX).then_some(v));
         if util_min.unwrap_or(0) > util_max.unwrap_or(CAPACITY) {
             return Err(errno::EINVAL);
-        }
-        // A process fwe did not start is the host's to schedule.
-        if !self.sched_allowed(host, &cur, policy, &req) || crate::procreg::read(host).is_none() {
-            return Err(errno::EPERM);
         }
         let new = Sched {
             policy,
@@ -176,11 +190,23 @@ impl<P: Platform> Kernel<P> {
             util_min,
             util_max,
         };
-        crate::procreg::set_sched(host, new).map_err(|_| errno::ESRCH)?;
-        if let Some(nice) = req.nice.filter(|_| fair(policy)) {
-            crate::procreg::set_nice(host, nice.clamp(-20, 19)).map_err(|_| errno::ESRCH)?;
+        let nice = match req.nice.filter(|_| fair(policy)) {
+            Some(n) => n.clamp(-20, 19),
+            None => nice,
+        };
+        Ok((new, nice))
+    }
+
+    /// Set process `host`'s scheduling as `req` asks, under its record's
+    /// lock. A host process fwe did not start is the host's to schedule:
+    /// checked, then `EPERM`.
+    fn sched_set(&mut self, host: i32, req: Request) -> Result<(), i32> {
+        if crate::procreg::read(host).is_none() {
+            let nice = crate::procreg::nice(host);
+            self.sched_apply(host, &Sched::default(), nice, &req)?;
+            return Err(errno::EPERM);
         }
-        Ok(())
+        crate::procreg::change_sched(host, |cur, nice| self.sched_apply(host, cur, nice, &req))
     }
 
     /// `sched_setscheduler(pid, policy, param)` (`policy` `None`:
@@ -313,9 +339,15 @@ impl<P: Platform> Kernel<P> {
             let keep_params = sflags & SCHED_FLAG_KEEP_PARAMS != 0;
             let req = Request {
                 policy: (sflags & SCHED_FLAG_KEEP_POLICY == 0).then_some(policy),
-                reset_on_fork: Some(sflags & SCHED_FLAG_RESET_ON_FORK != 0),
+                // Kept with the policy, as Linux keeps it.
+                reset_on_fork: (sflags & SCHED_FLAG_KEEP_POLICY == 0)
+                    .then_some(sflags & SCHED_FLAG_RESET_ON_FORK != 0),
                 priority: if keep_params { cur.priority } else { u32_at(20) },
-                nice: (!keep_params).then_some((u32_at(16) as i32).clamp(-20, 19)),
+                nice: if keep_params {
+                    Some(crate::procreg::nice(host))
+                } else {
+                    Some((u32_at(16) as i32).clamp(-20, 19))
+                },
                 runtime: if keep_params { cur.runtime } else { u64_at(24) },
                 deadline: if keep_params { cur.deadline } else { u64_at(32) },
                 period: if keep_params { cur.period } else { u64_at(40) },
@@ -351,7 +383,10 @@ impl<P: Platform> Kernel<P> {
         let mut put32 = |at: usize, v: u32| a[at..at + 4].copy_from_slice(&v.to_le_bytes());
         put32(0, n as u32);
         put32(4, s.policy);
-        put32(16, if fair(s.policy) { crate::procreg::nice(host) as u32 } else { 0 });
+        // A real-time or deadline process has a priority or parameters; any
+        // other, its nice value.
+        let timed = rt(s.policy) || s.policy == SCHED_DEADLINE;
+        put32(16, if timed { 0 } else { crate::procreg::nice(host) as u32 });
         put32(20, s.priority);
         put32(48, s.util_min.unwrap_or(0));
         put32(52, s.util_max.unwrap_or(CAPACITY));

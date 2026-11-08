@@ -289,34 +289,27 @@ fn splice_inner(
     }
     let (ki, reads, _, fl_in) = kind(fd_in)?;
     let (ko, _, writes, fl_out) = kind(fd_out)?;
+    // In Linux's order: an offset for a pipe, the offsets themselves, then
+    // whether each end is open for its part.
+    if (ki == Kind::Pipe && off_in != 0) || (ko == Kind::Pipe && off_out != 0) {
+        return Err(errno::ESPIPE);
+    }
+    let pos_out = offset_at(off_out)?;
+    let pos_in = offset_at(off_in)?;
     if !reads || !writes {
         return Err(errno::EBADF);
     }
     let nonblock_of = |fl: i32| flags & SPLICE_F_NONBLOCK != 0 || fl & libc::O_NONBLOCK != 0;
     match (ki == Kind::Pipe, ko == Kind::Pipe) {
         (true, true) => {
-            if off_in != 0 || off_out != 0 {
-                return Err(errno::ESPIPE);
-            }
             if same_pipe(fd_in, fd_out) {
                 return Err(errno::EINVAL);
             }
             let nonblock = nonblock_of(fl_in | fl_out);
-            if !wait_data(fd_in, nonblock)? {
-                return Ok(0);
-            }
-            let room = wait_room(fd_out, nonblock)?;
-            let want = len.min(held(fd_in)).min(room).min(CHUNK as u64) as usize;
-            let mut buf = vec![0u8; want];
-            let n = read_from(fd_in, Kind::Pipe, &mut buf, None)?;
-            write_to(fd_out, Kind::Pipe, &buf[..n], None).map(|w| w as u64)
+            from_pipe(fd_in, nonblock, fd_out, Kind::Pipe, nonblock, None, len)
         }
         (true, false) => {
-            if off_in != 0 {
-                return Err(errno::ESPIPE);
-            }
-            let pos = offset_at(off_out)?;
-            if pos.is_some() && !matches!(ko, Kind::File | Kind::Block) {
+            if pos_out.is_some() && !matches!(ko, Kind::File | Kind::Block) {
                 return Err(errno::EINVAL);
             }
             if fl_out & libc::O_APPEND != 0 {
@@ -325,41 +318,126 @@ fn splice_inner(
             if !matches!(ko, Kind::File | Kind::Block | Kind::Socket | Kind::Char) {
                 return Err(errno::EINVAL);
             }
-            if !wait_data(fd_in, nonblock_of(fl_in))? {
-                return Ok(0);
+            let socket_nonblock = flags & SPLICE_F_NONBLOCK != 0 && ko == Kind::Socket;
+            let w =
+                from_pipe(fd_in, nonblock_of(fl_in), fd_out, ko, socket_nonblock, pos_out, len)?;
+            if let Some(p) = pos_out {
+                uaccess::write(off_out, (p + w) as i64)?;
             }
-            let want = len.min(held(fd_in)).min(CHUNK as u64) as usize;
-            let mut buf = vec![0u8; want];
-            let n = read_from(fd_in, Kind::Pipe, &mut buf, None)?;
-            let w = write_to(fd_out, ko, &buf[..n], pos)?;
-            if let Some(p) = pos {
-                uaccess::write(off_out, (p + w as u64) as i64)?;
-            }
-            Ok(w as u64)
+            Ok(w)
         }
         (false, true) => {
-            if off_out != 0 {
-                return Err(errno::ESPIPE);
-            }
-            let pos = offset_at(off_in)?;
-            if pos.is_some() && !matches!(ki, Kind::File | Kind::Block) {
+            if pos_in.is_some() && !matches!(ki, Kind::File | Kind::Block) {
                 return Err(errno::EINVAL);
             }
             if !matches!(ki, Kind::File | Kind::Block | Kind::Socket | Kind::Char) {
                 return Err(errno::EINVAL);
             }
+            if hung_up(fd_out) {
+                return Err(broken_pipe());
+            }
+            // What the pipe has room for, which a write of it fills
+            // without blocking or coming up short.
             let room = wait_room(fd_out, nonblock_of(fl_out))?;
             let want = len.min(room).min(CHUNK as u64) as usize;
             let mut buf = vec![0u8; want];
-            let n = read_from(fd_in, ki, &mut buf, pos)?;
+            let n = read_from(fd_in, ki, &mut buf, pos_in)?;
             let w = write_to(fd_out, Kind::Pipe, &buf[..n], None)?;
-            if let Some(p) = pos {
+            if let Some(p) = pos_in {
                 uaccess::write(off_in, (p + w as u64) as i64)?;
             }
             Ok(w as u64)
         }
         (false, false) => Err(errno::EINVAL),
     }
+}
+
+/// A write end of the pipe whose read end is `fd`, among the process's
+/// descriptors.
+fn write_end_of(fd: i32) -> Option<i32> {
+    let (_, peer) = pipe_ends(fd)?;
+    crate::fdtable::open_fds().into_iter().find(|&f| pipe_ends(f).is_some_and(|(h, _)| h == peer))
+}
+
+/// Whether a pipe's write end, or a socket, `fd` has no one left to read
+/// it.
+fn hung_up(fd: i32) -> bool {
+    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    // SAFETY: one pollfd, without waiting.
+    unsafe { libc::poll(&mut p, 1, 0) > 0 && p.revents & (libc::POLLHUP | libc::POLLERR) != 0 }
+}
+
+/// A write to a pipe or socket with no reader: `EPIPE`, and `SIGPIPE` for
+/// the process, as Linux sends them before taking anything.
+fn broken_pipe() -> i32 {
+    crate::signal::raise_self(fwe_abi::signal::SIGPIPE);
+    errno::EPIPE
+}
+
+/// The least a socket that `poll` reports writable takes without blocking.
+fn socket_low_water(fd: i32) -> u64 {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDLOWAT,
+            (&mut v as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    v.max(1) as u64
+}
+
+/// Up to `len` bytes of pipe `fd_in` written to `fd_out` (of kind `ko`, at
+/// `pos` or its position), taking from the pipe only what was written, as
+/// Linux does: the pipe cannot be read without taking what is read, so
+/// with a write end of it at hand, all it holds is taken and what was not
+/// written put back in order; without one, no more than the output takes
+/// now (a pipe's room; a socket asked not to wait, its low-water mark) or,
+/// for an output a write fills (a file, a device, a waiting socket), what
+/// is asked for.
+fn from_pipe(
+    fd_in: i32,
+    nonblock_in: bool,
+    fd_out: i32,
+    ko: Kind,
+    nonblock_out: bool,
+    pos: Option<u64>,
+    len: u64,
+) -> Result<u64, i32> {
+    if matches!(ko, Kind::Pipe | Kind::Socket) && hung_up(fd_out) {
+        return Err(broken_pipe());
+    }
+    if !wait_data(fd_in, nonblock_in)? {
+        return Ok(0);
+    }
+    let cap = match ko {
+        Kind::Pipe => wait_room(fd_out, nonblock_out)?,
+        Kind::Socket if nonblock_out => {
+            ready(fd_out, libc::POLLOUT, true)?;
+            socket_low_water(fd_out)
+        }
+        _ => u64::MAX,
+    };
+    let back = write_end_of(fd_in);
+    let take = match back {
+        Some(_) => held(fd_in),
+        None => len.min(held(fd_in)).min(cap),
+    };
+    let mut buf = vec![0u8; take.min(CHUNK as u64) as usize];
+    let n = read_from(fd_in, Kind::Pipe, &mut buf, None)?;
+    let want = (len.min(cap) as usize).min(n);
+    let w = write_to(fd_out, ko, &buf[..want], pos);
+    if let Some(b) = back {
+        let mut put = *w.as_ref().unwrap_or(&0);
+        while put < n {
+            put += write_to(b, Kind::Pipe, &buf[put..n], None)?;
+        }
+    }
+    w.map(|w| w as u64)
 }
 
 /// `tee(fd_in, fd_out, len, flags)`: up to `len` bytes of pipe `fd_in`
@@ -381,11 +459,7 @@ pub fn tee(fd_in: i32, fd_out: i32, len: u64, flags: u64) -> i64 {
             return Err(errno::EINVAL);
         }
         // The input pipe's write end, to put back what is read.
-        let (_, peer) = pipe_ends(fd_in).ok_or(errno::EINVAL)?;
-        let back = crate::fdtable::open_fds()
-            .into_iter()
-            .find(|&fd| pipe_ends(fd).is_some_and(|(h, _)| h == peer))
-            .ok_or(errno::EINVAL)?;
+        let back = write_end_of(fd_in).ok_or(errno::EINVAL)?;
         let nonblock = flags & SPLICE_F_NONBLOCK != 0 || (fl_in | fl_out) & libc::O_NONBLOCK != 0;
         if !wait_data(fd_in, nonblock)? {
             return Ok(0);
@@ -422,14 +496,15 @@ pub fn vmsplice(fd: i32, iov: u64, nr_segs: u64, flags: u64) -> i64 {
             return Err(errno::EBADF);
         }
         let bufs = uaccess::host_iovecs(iov, nr_segs, !to_pipe)?;
-        if k != Kind::Pipe {
-            return Err(errno::EBADF);
-        }
-        let nonblock = flags & SPLICE_F_NONBLOCK != 0 || fl & libc::O_NONBLOCK != 0;
+        // Nothing to move is done before the descriptor is looked at.
         let total: u64 = bufs.iter().map(|v| v.iov_len as u64).sum();
         if total == 0 {
             return Ok(0);
         }
+        if k != Kind::Pipe {
+            return Err(errno::EBADF);
+        }
+        let nonblock = flags & SPLICE_F_NONBLOCK != 0 || fl & libc::O_NONBLOCK != 0;
         // How much moves: what there is room for, or what the pipe holds.
         let mut left = if to_pipe {
             wait_room(fd, nonblock)?

@@ -777,6 +777,12 @@ impl<P: Platform> Kernel<P> {
                     let r = libc::fcntl(fd, libc::F_GETFL);
                     if r < 0 {
                         last_error()
+                    } else if crate::fdmarks::any_marks()
+                        && crate::fdmarks::marked(fd) == Some(crate::fdmarks::Mark::Path)
+                    {
+                        // An `O_PATH` descriptor's flags: that, and the
+                        // large-file flag every arm64 open has.
+                        (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
                     } else if crate::memfd::write_refused(fd) {
                         // Read-only on the host since it was sealed (see
                         // `memfd`), but open for writing as far as Linux goes.
@@ -2363,13 +2369,20 @@ fn release() -> String {
     if PERSONALITY.load(std::sync::atomic::Ordering::SeqCst) & UNAME26 == 0 {
         return RELEASE.to_string();
     }
-    let mut parts = RELEASE.splitn(3, '.');
-    let (_, minor, rest) = (parts.next(), parts.next().unwrap_or("0"), parts.next());
-    let minor: u32 = minor.parse().unwrap_or(0);
-    match rest {
-        Some(rest) => format!("2.6.{}.{rest}", 60 + minor),
-        None => format!("2.6.{}", 60 + minor),
-    }
+    // As Linux's `override_release`: the version's numbers (up to its
+    // third dot) replaced, what follows them kept.
+    let mut dots = 0;
+    let end = RELEASE
+        .char_indices()
+        .find(|&(_, c)| {
+            if c == '.' {
+                dots += 1;
+            }
+            dots >= 3 || !(c.is_ascii_digit() || c == '.')
+        })
+        .map_or(RELEASE.len(), |(i, _)| i);
+    let minor: u32 = RELEASE.split('.').nth(1).and_then(|m| m.parse().ok()).unwrap_or(0);
+    format!("2.6.{}{}", 60 + minor, &RELEASE[end..])
 }
 
 /// The remaining time of a `pselect6` or `ppoll` wait, run by `f`, whose

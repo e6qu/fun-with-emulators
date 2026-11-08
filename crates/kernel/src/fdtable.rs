@@ -183,6 +183,41 @@ pub fn set_limit(soft: u64, hard: u64) -> Result<(), i32> {
 
 /// The guest's open descriptors, in order.
 pub fn open_fds() -> Vec<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        // The host lists them in one call, where asking after each number
+        // in the guest's range would take thousands.
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut n = 64usize;
+        loop {
+            // SAFETY: zeroed bytes are valid `proc_fdinfo`s.
+            let mut buf: Vec<libc::proc_fdinfo> = vec![unsafe { std::mem::zeroed() }; n];
+            // SAFETY: a valid out-buffer of `n` entries.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    buf.as_mut_ptr().cast(),
+                    (n * size) as i32,
+                )
+            };
+            if got <= 0 {
+                break;
+            }
+            let count = got as usize / size;
+            if count < n {
+                let mut fds: Vec<i32> = buf[..count]
+                    .iter()
+                    .map(|f| f.proc_fd)
+                    .filter(|&fd| guest_visible(fd))
+                    .collect();
+                fds.sort_unstable();
+                return fds;
+            }
+            n *= 2;
+        }
+    }
     (0..guest_max())
         // SAFETY: F_GETFD only queries the descriptor.
         .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)

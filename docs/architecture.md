@@ -363,9 +363,12 @@ opens for writing, as on Linux), a rename or link across mounts with
 from a pipe what it holds, into one what room it has (as Linux would move
 its buffers), waiting for either unless asked not to, without the kernel
 lock; the other end is read and written as the guest's own `read` and
-`write` would be. `tee` takes the input pipe's data and puts it back
-through a write end of that pipe the process holds (the host cannot read a
-pipe without taking what it reads). An `O_PATH` descriptor is marked, and
+`write` would be. The host cannot read a pipe without taking what it
+reads, so a pipe's data is taken only as far as it can be written: all of
+it, with what is not written put back in order through a write end of that
+pipe the process holds (as `tee` puts back all it copies), or else no more
+than the output takes now; a pipe or socket with no one to read it fails
+with `EPIPE` before anything is taken. An `O_PATH` descriptor is marked, and
 the calls Linux refuses one (reads and writes, requests, mappings, changes
 through it, syncs, locks, seeks, listings and most of `fcntl`) fail with
 `EBADF`.
@@ -1149,9 +1152,11 @@ of these are to be lifted for 1.0 and which are not planned.
   through `/proc/self/fd` shares the original's offset. An `O_PATH |
   O_NOFOLLOW` open of a link in `/proc` or `/sys` fails with `ELOOP`
   (Linux gives a descriptor of the link). `tee` needs the process to hold
-  a write end of its input pipe (`EINVAL` otherwise), and data `splice`
-  took from a pipe and could not write is lost (Linux leaves it in the
-  pipe).
+  a write end of its input pipe (`EINVAL` otherwise). `splice` from a pipe
+  takes only what it writes when the process holds a write end of that
+  pipe; otherwise a write to a file or a waiting socket that a signal or an
+  error cuts short loses what it took and did not write (Linux leaves it in
+  the pipe).
 - **Descriptors:** what fwe keeps of an open file for `fcntl` (an owner
   thread, `F_SETSIG`'s signal, a lease) is kept per descriptor, so a
   duplicate's changes do not show in the original as they would on Linux;

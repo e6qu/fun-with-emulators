@@ -201,6 +201,11 @@ impl<P: Platform> Kernel<P> {
         };
         let r = self.open_path(dirfd, path, flags, mode);
         crate::fs::drop_fifo();
+        // An `O_PATH` descriptor, whatever kind of file it names (one of
+        // `/proc` or `/sys` too), is open for nothing but naming it.
+        if r >= 0 && flags & fcntl::O_PATH != 0 {
+            crate::fdmarks::mark(r as i32, crate::fdmarks::Mark::Path);
+        }
         r
     }
 
@@ -554,9 +559,6 @@ impl<P: Platform> Kernel<P> {
         }
         if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
             crate::fdmarks::set_stand_in(fd, host);
-        }
-        if flags & fcntl::O_PATH != 0 {
-            crate::fdmarks::mark(fd, crate::fdmarks::Mark::Path);
         }
         fd as i64
     }
