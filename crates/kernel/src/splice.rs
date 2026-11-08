@@ -78,6 +78,7 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
                 crate::fdmarks::Mark::Mq
                     | crate::fdmarks::Mark::FsContext(_)
                     | crate::fdmarks::Mark::Ns(_)
+                    | crate::fdmarks::Mark::Inotify(_)
             )
         );
     if special {
