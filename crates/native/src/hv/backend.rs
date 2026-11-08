@@ -360,6 +360,11 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
             thread::post_landed(lsig, host::sent_info(note));
         });
     } else {
+        // The host's own SIGINFO (Ctrl-T), no relay: nothing on Linux.
+        // Before the note is looked at for the siginfo.
+        if sig == host::KILL_RELAY && !host::kill_relayed() {
+            return;
+        }
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let info = unsafe { host::signal_info(sig, info) };
         // The relayed form of a guest's SIGKILL (see host::KILL_RELAY).

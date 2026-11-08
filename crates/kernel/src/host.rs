@@ -290,6 +290,14 @@ pub const KILL_RELAY: libc::c_int = libc::SIGINFO;
 #[cfg(not(target_os = "macos"))]
 pub const KILL_RELAY: libc::c_int = libc::SIGKILL;
 
+/// In the handler of [`KILL_RELAY`]: whether it is a guest's `SIGKILL`
+/// relayed by an fwe process, which leaves a note first, rather than the
+/// host's own `SIGINFO` (macOS's Ctrl-T status key, a `kill -INFO`), which
+/// Linux has no counterpart of and is dropped. Async-signal-safe.
+pub fn kill_relayed() -> bool {
+    crate::signote::take(KILL_RELAY).is_some()
+}
+
 /// The executable of process `pid`, if it can be read.
 #[cfg(target_os = "macos")]
 fn exe_of(pid: libc::pid_t) -> Option<Vec<u8>> {
@@ -343,7 +351,8 @@ pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
 
 /// `kill(pid, sig)` for a host signal and a `kill`-style `pid` (a process,
 /// 0 for the caller's group, or `-pgid`). A `SIGKILL` reaches fwe processes
-/// as [`KILL_RELAY`]. Returns 0 or a negated Linux errno.
+/// as [`KILL_RELAY`], with a note of its sender ([`kill_relayed`]). Returns
+/// 0 or a negated Linux errno.
 ///
 /// -1 is refused (`ESRCH`): on the host it is every process of the user, so
 /// a guest's -1 is resolved to fwe's own processes before it gets here
@@ -370,6 +379,11 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
         let mut result = fwe_abi::err(fwe_abi::errno::ESRCH);
         for t in targets {
             let s = if fwe.is_some() && exe_of(t) == fwe { KILL_RELAY } else { libc::SIGKILL };
+            if s == KILL_RELAY {
+                // The relay is taken only with a note of its sender: the
+                // host's own SIGINFO (macOS's Ctrl-T) is no kill.
+                crate::signote::note(t, KILL_RELAY);
+            }
             // SAFETY: plain host call.
             if unsafe { libc::kill(t, s) } == 0 {
                 result = 0;

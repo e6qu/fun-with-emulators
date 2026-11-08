@@ -250,8 +250,8 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
     // Only processes that are still members: a number left behind can name
     // a host pid that has since been given to another process.
     for h in hosts.into_iter().filter(|&h| h != init && member(h, ns.dir())) {
-        // SAFETY: plain host call.
-        unsafe { libc::kill(h, libc::SIGKILL) };
+        // Relayed, so a VM process takes its VM down first.
+        crate::host::kill_process(h, libc::SIGKILL);
     }
 }
 

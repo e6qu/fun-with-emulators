@@ -380,6 +380,10 @@ pub fn install_kill_relay() {
     #[cfg(target_os = "macos")]
     {
         extern "C" fn die(_: libc::c_int) {
+            if !fwe_kernel::host::kill_relayed() {
+                // The host's own SIGINFO (Ctrl-T): nothing on Linux.
+                return;
+            }
             // The pid from the system call itself, not libc's copy, which a
             // fork child has the parent's of until `fork` returns in it.
             // SAFETY: async-signal-safe calls ending the process.

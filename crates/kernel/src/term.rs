@@ -282,6 +282,10 @@ mod imp {
         for &(l, h) in CC {
             t.c_cc[h] = raw[17 + l];
         }
+        // The characters Linux has none of (the status key, Ctrl-T, and the
+        // delayed suspend, Ctrl-Y) disabled, as on Linux: 0 would be NUL.
+        t.c_cc[libc::VSTATUS] = libc::_POSIX_VDISABLE as libc::cc_t;
+        t.c_cc[libc::VDSUSP] = libc::_POSIX_VDISABLE as libc::cc_t;
         t.c_ispeed = 38400;
         t.c_ospeed = 38400;
         // SAFETY: `t` is a fully initialized termios.

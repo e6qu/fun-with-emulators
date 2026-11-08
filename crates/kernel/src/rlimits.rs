@@ -144,8 +144,11 @@ pub fn cpu_signal() -> bool {
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
     let used = (u.ru_utime.tv_sec + u.ru_stime.tv_sec) as u64;
     if hard != r::RLIM_INFINITY && used >= hard {
-        // SAFETY: plain host calls; the relay ends this process.
-        unsafe { libc::kill(libc::getpid(), crate::host::KILL_RELAY) };
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        crate::signote::note(me, crate::host::KILL_RELAY);
+        // SAFETY: plain host call; the relay ends this process.
+        unsafe { libc::kill(me, crate::host::KILL_RELAY) };
         return false;
     }
     let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

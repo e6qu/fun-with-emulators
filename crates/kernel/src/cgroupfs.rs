@@ -444,8 +444,8 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 return Err(errno::EINVAL);
             }
             for pid in members(cg, true).into_iter().filter(|&p| p > 0) {
-                // SAFETY: plain host call.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // Relayed, so a VM process takes its VM down first.
+                crate::host::kill_process(pid, libc::SIGKILL);
             }
             Ok(())
         }
