@@ -334,17 +334,32 @@ impl<P: Platform> Kernel<P> {
             || flags & fcntl::O_TMPFILE == fcntl::O_TMPFILE;
         if writes || flags & fcntl::O_CREAT != 0 {
             // A file that exists on a read-only mount may still be opened
-            // to read with O_CREAT.
-            let exists =
-                resolved.name_c().is_ok_and(|n| stat_at(resolved.dir.as_raw_fd(), &n).is_ok());
+            // to read with O_CREAT; a device, FIFO or socket to write as
+            // well (Linux refuses only regular files, directories and
+            // links), and one in an overlay is not copied up to be.
+            let found =
+                resolved.name_c().ok().and_then(|n| stat_at(resolved.dir.as_raw_fd(), &n).ok());
+            let exists = found.is_some();
+            let special = found.is_some_and(|st| {
+                crate::devnodes::marked(&st)
+                    || matches!(
+                        st.st_mode & libc::S_IFMT,
+                        libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO | libc::S_IFSOCK
+                    )
+            });
             if (writes || !exists)
+                && !special
                 && let Err(e) = resolved.writable()
             {
                 return err(e);
             }
             // In an overlay, the file is copied up to be written, or its
             // directory to make it in.
-            let how = if exists { writes.then_some(Change::Modify) } else { Some(Change::Create) };
+            let how = match (exists, special) {
+                (true, true) => None,
+                (true, false) => writes.then_some(Change::Modify),
+                (false, _) => Some(Change::Create),
+            };
             if flags & fcntl::O_PATH == 0
                 && let Some(how) = how
                 && let Err(e) = resolved.prepare(how)
@@ -505,7 +520,9 @@ impl<P: Platform> Kernel<P> {
             };
             if let Some(n) = node {
                 let device = open_device(fd, n, flags, crate::devnodes::marked(&st));
-                if device < 0 || crate::devnodes::marked(&st) {
+                // A device fwe makes of its node keeps the node's
+                // descriptor; another has the host's device opened for it.
+                if device < 0 || (crate::devnodes::marked(&st) && device != fd as i64) {
                     // SAFETY: closing the node's own descriptor.
                     unsafe { libc::close(fd) };
                 }
@@ -522,6 +539,9 @@ impl<P: Platform> Kernel<P> {
                             resolved.fstype,
                             None,
                         );
+                    }
+                    if crate::loopdev::is_loop_node(n) {
+                        crate::loopdev::opened(device as i32, n);
                     }
                     return device;
                 }
@@ -837,6 +857,12 @@ impl<P: Platform> Kernel<P> {
     ) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let (host, node) = if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
+            // A synthetic directory's descriptor, as `fstat` reports it.
+            if crate::synthdir::fstat_is_dir(dirfd as i32) {
+                use fwe_abi::stat as st;
+                guest!(uaccess::write(buf, statx_of(&synth_stat(st::S_IFDIR | 0o555, 0))));
+                return 0;
+            }
             let out = match stat_fd(dirfd as i32) {
                 Ok(s) => s,
                 Err(e) => return err(e),
@@ -1345,6 +1371,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_ftruncate(&mut self, fd: u64, len: u64) -> i64 {
+        if let Some(r) = crate::loopdev::ftruncate(fd as i32) {
+            return r;
+        }
         if let Err(e) = crate::memfd::check_resize(fd as i32, len as i64) {
             return err(e);
         }
@@ -1395,6 +1424,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_fallocate(&mut self, fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
+        if let Some(r) = crate::loopdev::fallocate(fd as i32, mode, offset, len) {
+            return r;
+        }
         if mode & fwe_abi::falloc::FALLOC_FL_KEEP_SIZE == 0 {
             let end = (offset as i64).saturating_add(len as i64);
             // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -2122,7 +2154,8 @@ fn as_node(mut s: Stat, node: Option<crate::devnodes::Node>) -> Stat {
 
 /// An `open` with Linux `flags` of a device: checked against the cgroup's
 /// device programs, then, for one of fwe's nodes (`node_file`, open on
-/// `fd`), the host device its numbers name.
+/// `fd`), the host device its numbers name, or `fd` itself for a loop
+/// device.
 fn open_device(fd: i32, node: crate::devnodes::Node, flags: u64, node_file: bool) -> i64 {
     use crate::bpf::{BPF_DEVCG_ACC_READ, BPF_DEVCG_ACC_WRITE};
     let access = match flags & fcntl::O_ACCMODE {
@@ -2135,6 +2168,14 @@ fn open_device(fd: i32, node: crate::devnodes::Node, flags: u64, node_file: bool
     }
     if !node_file {
         return fd as i64;
+    }
+    // A loop device is its node's descriptor, marked as the device by the
+    // caller ([`crate::loopdev`]).
+    if crate::loopdev::is_loop_node(node) {
+        return match crate::loopdev::check_open(node) {
+            Ok(()) => fd as i64,
+            Err(e) => err(e),
+        };
     }
     let Some(host) = crate::devnodes::host_device(node) else {
         return err(crate::devnodes::NO_DEVICE);

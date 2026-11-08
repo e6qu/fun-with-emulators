@@ -31,6 +31,7 @@ const MAX_SYMLINKS: u32 = 40;
 /// The device nodes every Linux system has in `/dev`, which the guest finds
 /// there whatever the rootfs holds: they are the host's own nodes (a rootfs
 /// unpacked without privileges has none, and Linux mounts `/dev` over it).
+/// The loop devices' nodes are there too ([`crate::loopdev::node_named`]).
 const DEVICES: &[&[u8]] = &[b"null", b"zero", b"full", b"random", b"urandom", b"tty"];
 
 /// `/dev` entries that are links into `/proc/self/fd`, as on Linux.
@@ -1461,14 +1462,27 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     };
     // The standard device nodes, in the rootfs's own /dev.
     let device = absolute.as_deref().and_then(|a| {
-        let name = a.strip_prefix(b"/dev/").filter(|n| DEVICES.contains(n))?;
-        let (m, _) = table.locate(&to_ns(v.proc_root, a));
-        is_rootfs(m, v.root_host).then(|| name.to_vec())
+        let name = a.strip_prefix(b"/dev/")?;
+        let own = crate::loopdev::node_named(name);
+        if !DEVICES.contains(&name) && own.is_none() {
+            return None;
+        }
+        let ns = to_ns(v.proc_root, a);
+        let (m, _) = table.locate(&ns);
+        is_rootfs(m, v.root_host).then(|| (name.to_vec(), own, ns, m.flags, m.fstype, m.id))
     });
-    if let Some(name) = device {
-        // The host has no /dev/full: fwe's own node stands in for it.
-        let dir: &[u8] = if name == b"full" { &fwe_devices()? } else { b"/dev" };
-        let dir = cstr(dir)?;
+    if let Some((name, own, ns, mount_flags, fstype, mount_id)) = device {
+        // The host has no /dev/full and no loop devices: fwe's own nodes
+        // stand in for them.
+        let own = match (&name[..], own) {
+            (b"full", _) => Some(full_node()),
+            (_, own) => own,
+        };
+        let dir = match own {
+            Some(node) => fwe_device(&name, node)?,
+            None => b"/dev".to_vec(),
+        };
+        let dir = cstr(&dir)?;
         // SAFETY: plain host call; the result is checked and owned.
         let dev = unsafe {
             libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
@@ -1477,7 +1491,11 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             return Err(e());
         }
         // SAFETY: `dev` is a fresh owned descriptor.
-        return Ok(Resolved::plain(unsafe { OwnedFd::from_raw_fd(dev) }, name));
+        let mut r = Resolved::plain(unsafe { OwnedFd::from_raw_fd(dev) }, name);
+        // Where it is in the namespace, which an open of it records.
+        (r.ns_path, r.mount_flags, r.fstype, r.mount_id) =
+            (Some(ns), mount_flags, fstype, mount_id);
+        return Ok(r);
     }
     let root_ns = v.proc_root.to_vec();
     // The directory with namespace path `ns`, entered from the root.
@@ -1907,18 +1925,26 @@ fn through_magic_link(rel: &[u8]) -> Option<(MagicLink, Vec<u8>)> {
 }
 
 /// fwe's directory of the device nodes Linux has and the host does not
-/// (`full`), made on first use.
-fn fwe_devices() -> Result<Vec<u8>, i32> {
+/// (`full`, the loop devices), with node `name` (of `node`) made in it on
+/// first use.
+fn fwe_device(name: &[u8], node: crate::devnodes::Node) -> Result<Vec<u8>, i32> {
     let dir = mounts::join(&shm::user_dir()?, format!("v{}-dev", crate::shared::FORMAT).as_bytes());
     let d = cstr(&dir)?;
     // SAFETY: a NUL-terminated path in fwe's private directory.
     unsafe { libc::mkdir(d.as_ptr(), 0o755) };
     let fd = open_host_dir(&dir)?;
-    let node = crate::devnodes::Node { kind: crate::devnodes::S_IFCHR, major: 1, minor: 7 };
-    match crate::devnodes::make(fd.as_raw_fd(), c"full", node, 0o666) {
+    // Linux's modes: anyone may use /dev/full, only root and the disk
+    // group a disk.
+    let perm = if node.kind == crate::devnodes::S_IFCHR && node.major == 1 { 0o666 } else { 0o660 };
+    match crate::devnodes::make_exact(fd.as_raw_fd(), &cstr(name)?, node, perm) {
         Ok(()) | Err(errno::EEXIST) => Ok(dir),
         Err(e) => Err(e),
     }
+}
+
+/// `/dev/full`'s numbers.
+fn full_node() -> crate::devnodes::Node {
+    crate::devnodes::Node { kind: crate::devnodes::S_IFCHR, major: 1, minor: 7 }
 }
 
 /// The directory holding what mount `m` shows, open, and that entry's name:

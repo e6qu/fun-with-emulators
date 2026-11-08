@@ -145,6 +145,9 @@ impl<P: Platform> Kernel<P> {
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
                     r
+                } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    r
                 } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
                     && is_dir_fd(a[0] as i32)
                 {
@@ -307,14 +310,11 @@ impl<P: Platform> Kernel<P> {
             nr::UMASK => self.sys_umask(a[0]),
             nr::PIPE2 => self.sys_pipe2(a[0], a[1]),
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
-            nr::FSYNC => {
+            nr::FSYNC | nr::FDATASYNC => match crate::loopdev::fsync(a[0] as i32) {
+                Some(r) => r,
                 // SAFETY: plain host call on a guest fd.
-                ret(unsafe { libc::fsync(a[0] as i32) })
-            }
-            nr::FDATASYNC => {
-                // SAFETY: plain host call on a guest fd.
-                ret(unsafe { libc::fsync(a[0] as i32) })
-            }
+                None => ret(unsafe { libc::fsync(a[0] as i32) }),
+            },
 
             // Memory.
             nr::BRK => self.sys_brk(a[0]),
@@ -946,6 +946,9 @@ impl<P: Platform> Kernel<P> {
         // The request is 32 bits (an `unsigned int`); a C library passing
         // an `int` sign-extends it.
         let req = req as u32 as u64;
+        if let Some(r) = self.loop_ioctl(fd, req, arg) {
+            return r;
+        }
         // SAFETY: in every arm the argument layouts match the host's; the host
         // validates guest pointers.
         unsafe {
@@ -1015,6 +1018,17 @@ impl<P: Platform> Kernel<P> {
                 ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
                 ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),
                 ioctl::FIONCLEX => ret(libc::fcntl(fd, libc::F_SETFD, 0)),
+                // `O_ASYNC` on or off, as `fcntl` sets it.
+                ioctl::FIOASYNC => {
+                    let on: i32 = guest!(uaccess::read(arg));
+                    let fl = self.sys_fcntl(fd as u64, fcntl::F_GETFL, 0);
+                    if fl < 0 {
+                        return fl;
+                    }
+                    let fl = fl as u64 & !fcntl::O_ASYNC;
+                    let fl = if on != 0 { fl | fcntl::O_ASYNC } else { fl };
+                    self.sys_fcntl(fd as u64, fcntl::F_SETFL, fl).min(0)
+                }
                 _ => {
                     if libc::fcntl(fd, libc::F_GETFD) < 0 {
                         last_error()
@@ -2423,6 +2437,27 @@ mod tests {
             r,
             k.syscall(nr::IOCTL, [fd, ioctl::TIOCGPTN, &mut n as *mut u32 as u64, 0, 0, 0])
         );
+    }
+
+    /// `FIOASYNC` turns `O_ASYNC` on and off, as on any Linux descriptor.
+    #[test]
+    fn fioasync_sets_o_async() {
+        let mut fds = [0i32; 2];
+        // SAFETY: a valid out-parameter.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = fds[0] as u64;
+        let mut k = kernel();
+        for on in [1i32, 0] {
+            let r = k.syscall(nr::IOCTL, [fd, ioctl::FIOASYNC, &on as *const i32 as u64, 0, 0, 0]);
+            assert_eq!(r, 0);
+            let fl = k.syscall(nr::FCNTL, [fd, fcntl::F_GETFL, 0, 0, 0, 0]);
+            assert_eq!(fl as u64 & fcntl::O_ASYNC != 0, on != 0);
+        }
+        // SAFETY: closing the pipe just made.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 
     /// `fadvise64` checks its descriptor and advice as Linux does.

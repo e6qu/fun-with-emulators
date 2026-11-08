@@ -533,6 +533,7 @@ pub mod ioctl {
     pub const FIONBIO: u64 = 0x5421;
     pub const FIOCLEX: u64 = 0x5451;
     pub const FIONCLEX: u64 = 0x5450;
+    pub const FIOASYNC: u64 = 0x5452;
     /// Network interface requests on a socket (`struct ifreq`).
     pub const SIOCGIFNAME: u64 = 0x8910;
     pub const SIOCGIFFLAGS: u64 = 0x8913;
@@ -543,6 +544,99 @@ pub mod ioctl {
     pub const IFF_UP: u16 = 0x1;
     pub const IFF_LOOPBACK: u16 = 0x8;
     pub const IFF_RUNNING: u16 = 0x40;
+
+    /// Block device requests (`linux/fs.h`).
+    pub const BLKROSET: u64 = 0x125d;
+    pub const BLKROGET: u64 = 0x125e;
+    pub const BLKRRPART: u64 = 0x125f;
+    pub const BLKGETSIZE: u64 = 0x1260;
+    pub const BLKFLSBUF: u64 = 0x1261;
+    pub const BLKRASET: u64 = 0x1262;
+    pub const BLKRAGET: u64 = 0x1263;
+    pub const BLKFRASET: u64 = 0x1264;
+    pub const BLKFRAGET: u64 = 0x1265;
+    pub const BLKSECTGET: u64 = 0x1267;
+    pub const BLKSSZGET: u64 = 0x1268;
+    pub const BLKBSZGET: u64 = 0x8008_1270;
+    pub const BLKBSZSET: u64 = 0x4008_1271;
+    pub const BLKGETSIZE64: u64 = 0x8008_1272;
+    pub const BLKDISCARD: u64 = 0x1277;
+    pub const BLKIOMIN: u64 = 0x1278;
+    pub const BLKIOOPT: u64 = 0x1279;
+    pub const BLKALIGNOFF: u64 = 0x127a;
+    pub const BLKPBSZGET: u64 = 0x127b;
+    pub const BLKDISCARDZEROES: u64 = 0x127c;
+    pub const BLKSECDISCARD: u64 = 0x127d;
+    pub const BLKROTATIONAL: u64 = 0x127e;
+    pub const BLKZEROOUT: u64 = 0x127f;
+    pub const BLKGETDISKSEQ: u64 = 0x8008_1280;
+}
+
+/// Loop devices (`linux/loop.h`): the requests on a loop device and on
+/// `/dev/loop-control`, the flags, and the layouts of `struct loop_info`
+/// (`OLD_*`), `struct loop_info64` (`INFO64_*`) and `struct loop_config`.
+pub mod loopdev {
+    pub const LOOP_SET_FD: u64 = 0x4c00;
+    pub const LOOP_CLR_FD: u64 = 0x4c01;
+    pub const LOOP_SET_STATUS: u64 = 0x4c02;
+    pub const LOOP_GET_STATUS: u64 = 0x4c03;
+    pub const LOOP_SET_STATUS64: u64 = 0x4c04;
+    pub const LOOP_GET_STATUS64: u64 = 0x4c05;
+    pub const LOOP_CHANGE_FD: u64 = 0x4c06;
+    pub const LOOP_SET_CAPACITY: u64 = 0x4c07;
+    pub const LOOP_SET_DIRECT_IO: u64 = 0x4c08;
+    pub const LOOP_SET_BLOCK_SIZE: u64 = 0x4c09;
+    pub const LOOP_CONFIGURE: u64 = 0x4c0a;
+    pub const LOOP_CTL_ADD: u64 = 0x4c80;
+    pub const LOOP_CTL_REMOVE: u64 = 0x4c81;
+    pub const LOOP_CTL_GET_FREE: u64 = 0x4c82;
+
+    pub const LO_FLAGS_READ_ONLY: u32 = 0x1;
+    pub const LO_FLAGS_AUTOCLEAR: u32 = 0x4;
+    pub const LO_FLAGS_PARTSCAN: u32 = 0x8;
+    pub const LO_FLAGS_DIRECT_IO: u32 = 0x10;
+
+    /// The name and key fields' sizes.
+    pub const LO_NAME_SIZE: usize = 64;
+    pub const LO_KEY_SIZE: usize = 32;
+
+    /// `struct loop_info`: `int lo_number`, `__kernel_old_dev_t lo_device`
+    /// (32 bits), `unsigned long lo_inode`, `__kernel_old_dev_t
+    /// lo_rdevice`, `int lo_offset`, `int lo_encrypt_type`, `int
+    /// lo_encrypt_key_size`, `int lo_flags`, `char lo_name[64]`, the key,
+    /// `unsigned long lo_init[2]` and four reserved bytes.
+    pub const OLD_SIZE: usize = 160;
+    pub const OLD_NUMBER: usize = 0;
+    pub const OLD_DEVICE: usize = 4;
+    pub const OLD_INODE: usize = 8;
+    pub const OLD_RDEVICE: usize = 16;
+    pub const OLD_OFFSET: usize = 20;
+    pub const OLD_ENCRYPT_TYPE: usize = 24;
+    pub const OLD_ENCRYPT_KEY_SIZE: usize = 28;
+    pub const OLD_FLAGS: usize = 32;
+    pub const OLD_NAME: usize = 36;
+
+    /// `struct loop_info64`: `__u64 lo_device, lo_inode, lo_rdevice,
+    /// lo_offset, lo_sizelimit`, `__u32 lo_number, lo_encrypt_type,
+    /// lo_encrypt_key_size, lo_flags`, `__u8 lo_file_name[64],
+    /// lo_crypt_name[64], lo_encrypt_key[32]`, `__u64 lo_init[2]`.
+    pub const INFO64_SIZE: usize = 232;
+    pub const INFO64_DEVICE: usize = 0;
+    pub const INFO64_INODE: usize = 8;
+    pub const INFO64_RDEVICE: usize = 16;
+    pub const INFO64_OFFSET: usize = 24;
+    pub const INFO64_SIZELIMIT: usize = 32;
+    pub const INFO64_NUMBER: usize = 40;
+    pub const INFO64_ENCRYPT_TYPE: usize = 44;
+    pub const INFO64_ENCRYPT_KEY_SIZE: usize = 48;
+    pub const INFO64_FLAGS: usize = 52;
+    pub const INFO64_FILE_NAME: usize = 56;
+    pub const INFO64_CRYPT_NAME: usize = 120;
+
+    /// `struct loop_config`: `__u32 fd, block_size`, the `loop_info64`,
+    /// and eight reserved `__u64`.
+    pub const CONFIG_SIZE: usize = 304;
+    pub const CONFIG_INFO: usize = 8;
 }
 
 /// `struct termios` fields (Linux asm-generic, arm64). The guest layout is
@@ -1027,6 +1121,7 @@ pub mod memfd {
 pub mod falloc {
     pub const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
     pub const FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+    pub const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
 }
 
 /// `statfs` values: the `f_type` fwe reports for the host filesystems it

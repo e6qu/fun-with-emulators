@@ -139,6 +139,9 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         "TMPDIR": guest_tmp,
         "LTPROOT": "/opt/ltp",
         "LTP_COLORIZE_OUTPUT": "0",
+        # A test given a device puts tmpfs on it, the filesystem fwe has
+        # (LTP's default is ext2).
+        "LTP_DEV_FS_TYPE": "tmpfs",
         "HOME": guest_tmp,
         "LANG": "C",
     }

@@ -26,6 +26,7 @@ mod fsops;
 pub mod futex;
 pub mod host;
 pub mod ipcops;
+pub mod loopdev;
 pub mod maps;
 pub mod memfd;
 pub mod mm;
@@ -831,8 +832,9 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
 /// `count` bytes from `input` to `output`, from the offset at `in_off` (a
 /// guest pointer, updated, leaving the file's own offset alone) or the
 /// file's, and for `copy_file_range` to the one at `out_off` likewise.
-/// The input must be a regular file, as Linux has it; `copy_file_range`
-/// needs both to be. Returns the bytes copied, or an errno when none were.
+/// The input must be a regular file or a block device (a loop device), as
+/// Linux has it; `copy_file_range` needs both to be regular files. Returns
+/// the bytes copied, or an errno when none were.
 fn copy_between(
     input: i32,
     in_off: u64,
@@ -853,9 +855,17 @@ fn copy_between(
             Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG)
         }
     };
+    // A loop device reads and writes as a block device: `sendfile` takes
+    // one, `copy_file_range` only regular files.
+    let device = |fd: i32| loopdev::device_of(fd).is_some();
+    let (in_dev, out_dev) = (device(input), device(output));
     match (regular(input), regular(output)) {
         (Err(e), _) | (_, Err(e)) => return err(e),
-        (Ok(false), _) => return err(errno::EINVAL),
+        _ if both_files && (in_dev || out_dev) => return err(errno::EINVAL),
+        _ if loopdev::is_control(input) || loopdev::is_control(output) => {
+            return err(errno::EINVAL);
+        }
+        (Ok(false), _) if !in_dev => return err(errno::EINVAL),
         (_, Ok(false)) if both_files => return err(errno::EINVAL),
         _ => {}
     }
@@ -874,22 +884,48 @@ fn copy_between(
     let mut failure = 0;
     while done < count {
         let want = (count - done).min(buf.len() as u64) as usize;
-        // SAFETY: `buf` holds at least `want` bytes.
-        let n = unsafe {
-            match ipos {
-                Some(p) => libc::pread(input, buf.as_mut_ptr().cast(), want, p),
-                None => libc::read(input, buf.as_mut_ptr().cast(), want),
+        let n = if in_dev {
+            match loopdev::read_into(input, &mut buf[..want], ipos.map(|p| p as u64)) {
+                Some(r) if r < 0 => {
+                    failure = -r as i32;
+                    break;
+                }
+                r => r.unwrap_or(0) as isize,
             }
+        } else {
+            // SAFETY: `buf` holds at least `want` bytes.
+            let n = unsafe {
+                match ipos {
+                    Some(p) => libc::pread(input, buf.as_mut_ptr().cast(), want, p),
+                    None => libc::read(input, buf.as_mut_ptr().cast(), want),
+                }
+            };
+            if n < 0 {
+                failure = host::errno_to_linux(host::last_errno());
+                break;
+            }
+            n
         };
-        if n < 0 {
-            failure = host::errno_to_linux(host::last_errno());
-            break;
-        }
         if n == 0 {
             break;
         }
         let mut sent = 0usize;
         while sent < n as usize {
+            if out_dev {
+                match loopdev::write_from(output, &buf[sent..n as usize]) {
+                    Some(w) if w > 0 => {
+                        sent += w as usize;
+                        continue;
+                    }
+                    w => {
+                        failure = match w {
+                            Some(w) if w < 0 => -w as i32,
+                            _ => errno::EIO,
+                        };
+                        break;
+                    }
+                }
+            }
             // SAFETY: the first `n` bytes of `buf` are initialized.
             let w = unsafe {
                 match opos {
@@ -1097,6 +1133,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
+    }
+    if let Some(r) = loopdev::io(nr, &a) {
+        return Some(r);
     }
     if nr == n::OPENAT {
         // A FIFO's open waits for the other end: here, without the lock,

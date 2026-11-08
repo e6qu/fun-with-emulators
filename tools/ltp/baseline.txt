@@ -44,6 +44,7 @@ close01
 close02
 confstr01
 connect01
+copy_file_range01
 copy_file_range03
 creat01
 creat03
@@ -103,6 +104,7 @@ execve01
 execve05
 execveat01
 execveat02
+execveat03
 execvp01
 exit_group01
 exit01
@@ -110,6 +112,7 @@ exit02
 faccessat01
 faccessat02
 faccessat201
+fallocate01
 fallocate02
 fallocate03
 fchdir01
@@ -180,6 +183,8 @@ fcntl30_64
 fcntl32
 fcntl32_64
 fdatasync01
+fgetxattr01
+fgetxattr02
 fgetxattr03
 flistxattr01
 flistxattr02
@@ -200,12 +205,17 @@ fork09
 fork10
 fork11
 fpathconf01
+fremovexattr01
+fremovexattr02
+fsetxattr01
+fspick01
 fstat02
 fstat02_64
 fstat03
 fstat03_64
 fstatfs02
 fstatfs02_64
+fsync01
 fsync02
 ftruncate01
 ftruncate01_64
@@ -228,6 +238,7 @@ getcwd01
 getcwd02
 getcwd03
 getcwd04
+getdents01
 getdomainname01
 getegid01
 getegid01_16
@@ -248,6 +259,7 @@ getpid01
 getppid01
 getppid02
 getpriority01
+getpriority02
 getrandom01
 getrandom02
 getrandom03
@@ -274,7 +286,15 @@ gettimeofday02
 getuid01
 getuid03
 getxattr01
+ioctl_loop01
+ioctl_loop02
+ioctl_loop03
+ioctl_loop04
+ioctl_loop06
+ioctl_loop07
 ioctl_ns07
+ioctl05
+ioctl06
 ioctl10
 keyctl07
 kill02
@@ -297,6 +317,7 @@ llistxattr03
 llseek01
 llseek02
 llseek03
+lremovexattr01
 lseek01
 lseek02
 lseek07
@@ -313,6 +334,7 @@ mincore02
 mincore03
 mincore04
 mkdir03
+mkdir09
 mkdirat01
 mkdirat02
 mknod01
@@ -345,6 +367,10 @@ mmap17
 mmap19
 mmap21_01
 mmap21_02
+mount01
+mount04
+mount05
+mount06
 mprotect02
 mprotect03
 mprotect04
@@ -416,6 +442,7 @@ posix_fadvise01
 posix_fadvise01_64
 prctl01
 prctl03
+prctl06
 pread01
 pread01_64
 pread02
@@ -450,6 +477,7 @@ read01
 read02
 read03
 read04
+readdir01
 readlink01
 readlinkat01
 readv01
@@ -457,7 +485,19 @@ readv02
 recvmsg02
 removexattr01
 removexattr02
+rename01
+rename03
+rename04
+rename05
+rename06
+rename07
+rename08
+rename10
+rename11
+rename13
 rename14
+rename15
+renameat01
 renameat201
 renameat202
 rmdir01
@@ -546,6 +586,7 @@ setsid01
 setsockopt03
 setuid01
 setuid03
+setxattr01
 shmat01
 shmat02
 shmat03
@@ -581,6 +622,11 @@ socket02
 socketpair02
 stat02
 stat02_64
+stat04
+stat04_64
+statfs01
+statfs01_64
+statvfs01
 statx01
 statx02
 string01
@@ -602,6 +648,8 @@ truncate02
 truncate02_64
 truncate03
 truncate03_64
+umount01
+umount03
 uname01
 uname02
 unlink05
@@ -612,7 +660,13 @@ unshare01
 unshare02
 unshare04
 unshare05
+utime01
+utime02
+utime03
+utime04
+utime05
 utime07
+utimensat01
 vfork01
 vfork02
 wait01
@@ -648,6 +702,7 @@ write05
 write06
 writev01
 writev02
+writev03
 writev05
 writev06
 writev07

@@ -2753,6 +2753,46 @@ fn proc_maps_lists_the_mappings() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `loopdev` guest prints.
+const LOOPDEV: &str = "free: true\n\
+    node: 0, block device: true, 7:N: true\n\
+    unattached: status true, size 0, read 0\n\
+    attach: 0\n\
+    busy: true\n\
+    size: 65536, sector size 512\n\
+    sys size: 128\n\
+    sys backing file: true\n\
+    read: 100, the file's: true\n\
+    read at the end: 84, the file's: true\n\
+    set status: 0\n\
+    size: 32768\n\
+    read at 0: 16, the file's at the offset: true\n\
+    write: 3\n\
+    written to the file after the offset: true\n\
+    write past the end: true\n\
+    seek: end 32768, past it true\n\
+    status: number true, offset 16384, limit 32768, name test\n\
+    mapped: true\n\
+    fork: child read true, position shared true\n\
+    remove attached: true\n\
+    detach: 0\n\
+    detached: again true, status true, size 0\n\
+    added: true, shown true\n\
+    removed: 0, gone true\n\
+    control read: true\n";
+
+/// A loop device set up and used as a program does: a free one from
+/// `/dev/loop-control`, a file attached and read, written and mapped
+/// through it from an offset within a size limit, its position shared
+/// with a fork child, `/sys/block` showing it, then detached; and a device
+/// added and removed.
+#[test]
+fn loop_devices_show_a_file() {
+    let out = fwe(&rust_guest("loopdev"), &[]);
+    assert_eq!(stdout(&out), LOOPDEV, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Run one scenario of the `memfd` guest and return its output.
 fn memfd(scenario: &str) -> String {
     let out = fwe(&rust_guest("memfd"), &[scenario]);
@@ -3217,6 +3257,15 @@ fn hv_runs_low_rust_programs() {
 fn hv_lists_the_mappings() {
     let Some(out) = fwe_hv(&rust_low_guest("maps"), &[]) else { return };
     assert_eq!(stdout(&out), MAPS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A loop device in the VM (see [`loop_devices_show_a_file`]): its
+/// mapping is of the attached file.
+#[test]
+fn hv_loop_devices_show_a_file() {
+    let Some(out) = fwe_hv(&rust_low_guest("loopdev"), &[]) else { return };
+    assert_eq!(stdout(&out), LOOPDEV, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

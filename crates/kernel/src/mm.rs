@@ -879,7 +879,24 @@ impl<P: Platform> Kernel<P> {
         fd: u64,
         offset: u64,
     ) -> i64 {
-        let r = self.mmap_call(addr, len, prot, flags, fd, offset);
+        // A loop device maps the file it shows.
+        let source = if flags & mman::MAP_ANONYMOUS == 0 {
+            crate::loopdev::map_source(fd as i32, self.page_size)
+        } else {
+            None
+        };
+        let r = match &source {
+            Some(Ok((file, start))) => match offset.checked_add(*start) {
+                Some(at) => {
+                    let file = std::os::fd::AsRawFd::as_raw_fd(file) as u64;
+                    self.mmap_call(addr, len, prot, flags, file, at)
+                }
+                None => err(errno::EOVERFLOW),
+            },
+            Some(Err(e)) => err(*e),
+            None => self.mmap_call(addr, len, prot, flags, fd, offset),
+        };
+        drop(source);
         if r < 0 {
             return r;
         }

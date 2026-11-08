@@ -59,6 +59,10 @@ pub enum Mark {
     OomScore { host: i32, legacy: bool, privileged: bool },
     /// An `AF_NETLINK` socket ([`crate::netlink`]).
     Netlink,
+    /// Loop device `N`'s node, open as the device ([`crate::loopdev`]).
+    Loop(u32),
+    /// `/dev/loop-control`'s node, open as the device.
+    LoopControl,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +92,11 @@ fn count(rec: Option<&Record>, up: bool) {
 }
 
 fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
+    // A mark however it came: made here, duplicated, or inherited through
+    // a VM fork or a re-execution ([`load`]).
+    if rec.mark.is_some() {
+        MARKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     count(Some(&rec), true);
     count(r.insert(fd, rec).as_ref(), false);
 }
@@ -137,7 +146,16 @@ pub fn opened(
 ) {
     let Some((dev, ino)) = identity(fd) else { return };
     let origin = Some(Origin { flags, fstype, ns_path, ovl, stand_in: None });
-    insert(&mut records(), fd, Record { dev, ino, origin, mark: None });
+    let mut r = records();
+    let mark = kept(&r, fd, dev, ino).and_then(|rec| rec.mark);
+    insert(&mut r, fd, Record { dev, ino, origin, mark });
+}
+
+/// The record of `fd` that is of the file `dev`, `ino`, which a new
+/// origin or mark of the same descriptor adds to (a device's node is
+/// marked as the device and records where it was opened).
+fn kept(r: &BTreeMap<i32, Record>, fd: i32, dev: u64, ino: u64) -> Option<Record> {
+    r.get(&fd).filter(|rec| (rec.dev, rec.ino) == (dev, ino)).cloned()
 }
 
 /// How many stand-in descriptors were made ([`set_stand_in`]), so that a
@@ -162,8 +180,8 @@ pub fn stand_in(fd: i32) -> Option<Vec<u8>> {
     origin(fd)?.stand_in
 }
 
-/// How many marks there are, so that a write looks for one only while
-/// there are any.
+/// How many marks were ever recorded, so that a call looks for one only
+/// once there have been any.
 static MARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether any descriptor was ever marked (so a write need not look).
@@ -173,9 +191,10 @@ pub fn any_marks() -> bool {
 
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
-    MARKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let Some((dev, ino)) = identity(fd) else { return };
-    insert(&mut records(), fd, Record { dev, ino, origin: None, mark: Some(mark) });
+    let mut r = records();
+    let origin = kept(&r, fd, dev, ino).and_then(|rec| rec.origin);
+    insert(&mut r, fd, Record { dev, ino, origin, mark: Some(mark) });
 }
 
 /// Where `fd` was opened, if fwe recorded it.
@@ -269,7 +288,12 @@ pub fn save(e: &mut Enc) {
             Some(Mark::OomScore { .. }) => 7,
             Some(Mark::Netlink) => 8,
             Some(Mark::Sysctl(_)) => 6,
+            Some(Mark::Loop(_)) => 9,
+            Some(Mark::LoopControl) => 10,
         });
+        if let Some(Mark::Loop(n)) = rec.mark {
+            e.u32(n);
+        }
         if let Some(Mark::Sysctl(i)) = rec.mark {
             e.u8(i);
         }
@@ -323,6 +347,8 @@ pub fn load(d: &mut Dec) {
             6 => Some(Mark::Sysctl(d.u8())),
             7 => Some(Mark::OomScore { host: d.i32(), legacy: d.bool(), privileged: d.bool() }),
             8 => Some(Mark::Netlink),
+            9 => Some(Mark::Loop(d.u32())),
+            10 => Some(Mark::LoopControl),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

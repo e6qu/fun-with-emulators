@@ -116,15 +116,43 @@ fn decode(buf: &[u8; 12], n: isize) -> Option<Node> {
     Some(Node { kind: w(0), major: w(4), minor: w(8) })
 }
 
-/// Make node `node` with permissions `perm` at `name` in directory `dir`.
+/// Make node `node` with permissions `perm` (less the umask) at `name` in
+/// directory `dir` (`EEXIST` if something is there). It is made whole
+/// under a temporary name and linked into place, so no process opens it
+/// half-made.
 pub fn make(dir: i32, name: &std::ffi::CStr, node: Node, perm: u32) -> Result<(), i32> {
+    make_node(dir, name, node, perm, false)
+}
+
+/// [`make`] with exactly the permissions `perm`, whatever the umask: one
+/// of fwe's own nodes.
+pub fn make_exact(dir: i32, name: &std::ffi::CStr, node: Node, perm: u32) -> Result<(), i32> {
+    make_node(dir, name, node, perm, true)
+}
+
+fn make_node(
+    dir: i32,
+    name: &std::ffi::CStr,
+    node: Node,
+    perm: u32,
+    exact: bool,
+) -> Result<(), i32> {
     #[cfg(target_os = "macos")]
     {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        // SAFETY: getpid cannot fail.
+        let pid = unsafe { libc::getpid() };
+        let tmp = std::ffi::CString::new(format!(
+            ".fwe-node-{pid}-{}",
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+        .map_err(|_| errno::EINVAL)?;
         // SAFETY: a NUL-terminated name; the file is fwe's to make.
         let fd = unsafe {
             libc::openat(
                 dir,
-                name.as_ptr(),
+                tmp.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 perm as libc::c_uint,
             )
@@ -136,24 +164,29 @@ pub fn make(dir: i32, name: &std::ffi::CStr, node: Node, perm: u32) -> Result<()
         buf[0..4].copy_from_slice(&node.kind.to_le_bytes());
         buf[4..8].copy_from_slice(&node.major.to_le_bytes());
         buf[8..12].copy_from_slice(&node.minor.to_le_bytes());
-        // SAFETY: valid buffers; plain host calls on the new file.
+        // SAFETY: valid buffers; plain host calls on the new file, then
+        // linking it to its name (which fails if the name is taken).
         let ok = unsafe {
             libc::fsetxattr(fd, ATTR.as_ptr(), buf.as_ptr().cast(), buf.len(), 0, 0) == 0
                 && libc::fchflags(fd, libc::UF_OPAQUE) == 0
+                && (!exact || libc::fchmod(fd, perm as libc::mode_t) == 0)
+                && libc::linkat(dir, tmp.as_ptr(), dir, name.as_ptr(), 0) == 0
         };
         let e = crate::host::errno_to_linux(crate::host::last_errno());
-        // SAFETY: closing the descriptor just made.
-        unsafe { libc::close(fd) };
+        // SAFETY: closing the descriptor just made, and removing the
+        // temporary name (the node keeps its own).
+        unsafe {
+            libc::close(fd);
+            libc::unlinkat(dir, tmp.as_ptr(), 0);
+        }
         if !ok {
-            // SAFETY: removing the file just made.
-            unsafe { libc::unlinkat(dir, name.as_ptr(), 0) };
             return Err(e);
         }
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (dir, name, node, perm);
+        let _ = (dir, name, node, perm, exact);
         Err(errno::EPERM)
     }
 }
