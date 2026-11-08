@@ -23,7 +23,9 @@ flowchart TD
     hv --> kernel
     nb --> elf
     hv --> elf
+    kernel --> elf
     kernel --> abi
+    nb --> abi
 ```
 
 - The **kernel crate** does not depend on how guest code runs. A backend
@@ -451,19 +453,21 @@ The model, numbers and relay are in
   `crates/kernel/src/synthdir.rs` serves `getdents64`, `lseek`, `fstat`
   and `close` of the directories from an in-memory list. An unknown path
   is `ENOENT`.
-- `/proc/self`: `exe`, `cmdline`, `stat`, `status`, `cgroup`,
-  `mountinfo`, `mounts`, `uid_map`, `gid_map`, `setgroups`, `maps`,
-  `smaps`, `auxv` (the vector the program started with), `fd`, `fdinfo`,
+- `/proc/self`: `exe`, `cwd`, `root`, `cmdline`, `stat`, `status`,
+  `cgroup`, `mountinfo`, `mounts`, `uid_map`, `gid_map`, `setgroups`,
+  `maps`, `smaps`, `auxv` (the vector the program started with),
+  `personality`, `oom_score`, `oom_adj`, `oom_score_adj`, `fd`, `fdinfo`,
   `ns`, `task/<tid>/{stat,status,comm}`. A process's state in `stat` is its
   main thread's: `S` while it waits in a system call.
 - `/proc` globals: `cpuinfo`, `meminfo`, `stat` (host CPU times and boot
-  time), `uptime`, `loadavg`, `cmdline`, `partitions`, `config.gz` (the
-  options of what fwe implements), `keys`, `key-users`,
+  time), `uptime`, `loadavg`, `cmdline`, `filesystems`, `partitions`,
+  `config.gz` (the options of what fwe implements), `keys`, `key-users`,
   `sysvipc/{shm,sem,msg}`, and under `/proc/sys`: `kernel/{ostype,
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
   overflowuid,overflowgid,threads-max,tainted}`, `fs/{nr_open,file-max,
   pipe-max-size,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
-  `vm/{overcommit_memory,mmap_min_addr,drop_caches}`, the IPC limits and a
+  `vm/{overcommit_memory,mmap_min_addr,drop_caches}`, `kernel/keys/*`,
+  the IPC limits and a
   network namespace's sysctls (`crates/kernel/src/sysctl.rs`).
 - `/sys`: `fs/cgroup` (a mount point), `devices/system/cpu/{online,possible}`
   and the loop devices' `block`, `dev/block` and `devices/virtual/block`
