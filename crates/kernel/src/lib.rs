@@ -286,6 +286,7 @@ impl<P: Platform> Kernel<P> {
         netlink::save(e, false);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
+        e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -343,6 +344,7 @@ impl<P: Platform> Kernel<P> {
         netlink::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
+        syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
@@ -552,6 +554,9 @@ impl<P: Platform> Kernel<P> {
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
+        // Kept across execve, as on Linux (whose set-ID exec, which fwe
+        // has none of, would clear some of it).
+        e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.into_bytes()
     }
 
@@ -580,8 +585,10 @@ impl<P: Platform> Kernel<P> {
         netlink::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
+        let persona = d.u32();
         d.finish()?;
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
+        syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
         let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;

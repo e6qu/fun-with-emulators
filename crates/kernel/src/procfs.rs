@@ -184,6 +184,7 @@ const DIRS: &[DirDef] = &[
             (b"oom_score", DT_REG),
             (b"maps", DT_REG),
             (b"smaps", DT_REG),
+            (b"personality", DT_REG),
         ],
     ),
     (
@@ -281,6 +282,13 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
         b"/proc/self/auxv" => Entry::File(info.auxv.clone()),
+        b"/proc/self/personality" => Entry::File(
+            format!(
+                "{:08x}\n",
+                crate::syscalls::PERSONALITY.load(std::sync::atomic::Ordering::SeqCst)
+            )
+            .into_bytes(),
+        ),
         p if crate::sysctl::read(p).is_some() => Entry::File(crate::sysctl::read(p).unwrap()),
         // The initial user namespace's: every id is itself.
         b"/proc/self/uid_map" | b"/proc/self/gid_map" => {

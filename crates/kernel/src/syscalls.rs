@@ -528,6 +528,7 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::PERSONALITY => personality(a[0]),
             nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
@@ -1061,7 +1062,7 @@ impl<P: Platform> Kernel<P> {
             None => (crate::ns::host_name(), b"(none)".to_vec()),
         };
         fill(&mut u.nodename, &host);
-        fill(&mut u.release, RELEASE.as_bytes());
+        fill(&mut u.release, release().as_bytes());
         fill(&mut u.version, b"#1 SMP PREEMPT");
         fill(&mut u.machine, b"aarch64");
         fill(&mut u.domainname, &domain);
@@ -1822,6 +1823,15 @@ impl<P: Platform> Kernel<P> {
 /// # Safety
 /// The set and timeout pointers are null or reference guest memory.
 pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
+    // SAFETY: the caller's guarantee, passed on.
+    with_remaining(timeout, || unsafe { pselect6_wait(nfds, sets, timeout) })
+}
+
+/// [`pselect6`]'s wait.
+///
+/// # Safety
+/// As for [`pselect6`].
+unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     const FD_SETSIZE: u64 = 1024;
     if nfds > FD_SETSIZE {
         return err(errno::EINVAL);
@@ -1895,6 +1905,15 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
 }
 
 pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
+    // SAFETY: the caller's guarantee, passed on.
+    with_remaining(timeout, || unsafe { ppoll_wait(fds, nfds, timeout) })
+}
+
+/// [`ppoll`]'s wait.
+///
+/// # Safety
+/// As for [`ppoll`].
+unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
     let ms = if timeout == 0 {
         -1
@@ -2289,6 +2308,74 @@ fn bytemuck_u32(words: &[u32]) -> Vec<u8> {
 /// it only has to be remembered (and shown), as it is kept across `execve`.
 pub(crate) static NO_NEW_PRIVS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// The process's personality (`personality`), kept across `fork` and
+/// `execve` as Linux keeps a task's. Linux keeps one per thread; fwe one
+/// per process, which a program setting it before an `execve` (`setarch`)
+/// cannot tell apart.
+pub(crate) static PERSONALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Personality flags fwe acts on: `select`'s timeout left as given, and
+/// `uname` reporting a 2.6 release. The others (address-space layout,
+/// `READ_IMPLIES_EXEC`) are kept and reported only.
+const STICKY_TIMEOUTS: u32 = 0x400_0000;
+const UNAME26: u32 = 0x2_0000;
+/// `PER_LINUX32`, which needs 32-bit execution, which the host lacks.
+const PER_LINUX32: u32 = 0x0008;
+
+/// `personality(persona)`: the old personality, the new one set unless
+/// `persona` is `0xffffffff`.
+fn personality(persona: u64) -> i64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    let persona = persona as u32;
+    let old = PERSONALITY.load(SeqCst);
+    if persona != 0xffff_ffff {
+        if persona & 0xff == PER_LINUX32 {
+            return err(errno::EINVAL);
+        }
+        PERSONALITY.store(persona, SeqCst);
+    }
+    old as i64
+}
+
+/// The kernel release `uname` reports: as a 2.6 one (`2.6.(60 + minor)`
+/// and the rest) with the `UNAME26` personality, for programs that cannot
+/// parse a later one.
+fn release() -> String {
+    if PERSONALITY.load(std::sync::atomic::Ordering::SeqCst) & UNAME26 == 0 {
+        return RELEASE.to_string();
+    }
+    let mut parts = RELEASE.splitn(3, '.');
+    let (_, minor, rest) = (parts.next(), parts.next().unwrap_or("0"), parts.next());
+    let minor: u32 = minor.parse().unwrap_or(0);
+    match rest {
+        Some(rest) => format!("2.6.{}.{rest}", 60 + minor),
+        None => format!("2.6.{}", 60 + minor),
+    }
+}
+
+/// The remaining time of a `pselect6` or `ppoll` wait, run by `f`, whose
+/// timeout is at guest `timeout`, written back there as Linux does (not
+/// with the `STICKY_TIMEOUTS` personality, nor for no timeout or a zero
+/// one; a failed write is not the call's).
+fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
+    let start = std::time::Instant::now();
+    let given = if timeout == 0 { None } else { uaccess::read::<Timespec>(timeout).ok() };
+    let r = f();
+    let sticky = PERSONALITY.load(std::sync::atomic::Ordering::SeqCst) & STICKY_TIMEOUTS != 0;
+    if let Some(ts) = given.filter(|t| (t.tv_sec, t.tv_nsec) != (0, 0))
+        && !sticky
+        && r != err(errno::EINVAL)
+        && ts.tv_sec >= 0
+        && (0..1_000_000_000).contains(&ts.tv_nsec)
+    {
+        let total = std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        let left = total.saturating_sub(start.elapsed());
+        let left = Timespec { tv_sec: left.as_secs() as i64, tv_nsec: left.subsec_nanos() as i64 };
+        let _ = uaccess::write(timeout, left);
+    }
+    r
+}
 
 /// The affinity `sched_setaffinity` set for this process, if it did.
 static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
