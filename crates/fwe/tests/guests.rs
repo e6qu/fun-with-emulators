@@ -1728,7 +1728,7 @@ fn debian_cargo_builds_and_tests_a_project() {
     );
     assert!(text.contains("running 1 test\n.\n"), "{text}");
     assert!(text.contains("test result: ok. 1 passed; 0 failed"), "{text}");
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(0), "{text}");
 }
 
 /// Debian's apt (fetched: `guests/debian/fetch/apt.txt`) installs a package
