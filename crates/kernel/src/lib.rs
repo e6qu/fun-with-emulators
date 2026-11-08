@@ -29,6 +29,8 @@ pub mod futex;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
+pub mod keys;
+mod keytypes;
 pub mod loopdev;
 pub mod maps;
 pub mod memfd;
@@ -444,6 +446,8 @@ impl<P: Platform> Kernel<P> {
         // program's).
         futex::process_started();
         sysvipc::process_leaving(true);
+        // The thread and process keyrings go; the session keyring stays.
+        keys::exec();
         // Limits another process left for this one (runc sets its
         // container's this way before it runs the program).
         self.take_pending_limits();
@@ -573,6 +577,8 @@ impl<P: Platform> Kernel<P> {
         mqueue::exec_closing(&self.creds);
         // Its inotify instances and open files the exec closes, likewise.
         inotify::exec_closing();
+        // The thread and process keyrings go; the session keyring stays.
+        keys::exec();
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));

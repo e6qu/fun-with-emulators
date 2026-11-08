@@ -256,6 +256,13 @@ impl<P: Platform> Kernel<P> {
                     self.synthetic_fd(anon_fd(&self.self_status(), flags), dirfd as i32, &path)
                 }
                 crate::procfs::Entry::File(_)
+                    if self.fs().proc_path(dirfd as i32, &path).as_deref()
+                        == Some(b"/proc/keys") =>
+                {
+                    let text = crate::keys::proc_keys(&self.key_caller());
+                    self.synthetic_fd(anon_fd(&text, flags), dirfd as i32, &path)
+                }
+                crate::procfs::Entry::File(_)
                     if let Some(tid) = self.fs().proc_path(dirfd as i32, &path).and_then(|p| {
                         let t = p.strip_prefix(b"/proc/self/task/")?.strip_suffix(b"/status")?;
                         std::str::from_utf8(t).ok()?.parse::<i32>().ok()

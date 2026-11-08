@@ -217,6 +217,8 @@ impl<P: Platform> Kernel<P> {
                 &t.inherit,
                 crate::maps::snapshot(),
             );
+            // It holds this process's session keyring.
+            crate::keys::forked(child);
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {

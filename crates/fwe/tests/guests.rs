@@ -2850,6 +2850,24 @@ const INOTIFY: &str = "watch: true, nothing yet true\n\
     fdinfo lists the watch true\n\
     removed 0: ignored true\n";
 
+/// What the `keys` guest prints.
+const KEYS: &str = "session true, key read true, described true\n\
+    child shares the session true, its key here true\n\
+    request refused true, negative key true\n\
+    revoked true\n\
+    listed true\n\
+    after exec: session key true, process keyring gone true\n";
+
+/// Keys and keyrings: a session keyring a fork child shares and adds to,
+/// a negative key from a request no helper answers, a revoked key,
+/// `/proc/keys`, and the keyrings `execve` keeps and drops.
+#[test]
+fn keys_are_kept_across_processes() {
+    let out = fwe(&rust_guest("keys"), &[]);
+    assert_eq!(stdout(&out), KEYS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// inotify: a watched directory hears what another process does in it,
 /// in Linux's order, `poll` sees the events, fdinfo lists the watch, and a
 /// removed watch reports `IN_IGNORED`.
@@ -3402,6 +3420,16 @@ fn hv_the_new_mount_api_makes_and_attaches_mounts() {
 fn hv_namespace_descriptors_name_and_join_namespaces() {
     let Some(out) = fwe_hv(&rust_low_guest("nsfd"), &[]) else { return };
     assert_eq!(stdout(&out), NSFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Keys in the VM (see [`keys_are_kept_across_processes`]): payloads and
+/// descriptions copied through guest memory, a forking and re-executing
+/// guest.
+#[test]
+fn hv_keys_are_kept_across_processes() {
+    let Some(out) = fwe_hv(&rust_low_guest("keys"), &[]) else { return };
+    assert_eq!(stdout(&out), KEYS, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

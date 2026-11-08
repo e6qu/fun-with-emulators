@@ -32,7 +32,8 @@ enum Space {
 }
 
 /// The sysctls of no namespace set from their defaults, by name: a record
-/// every fwe process sees (`fs.inotify.*`, `vm.drop_caches`).
+/// every fwe process sees (`fs.inotify.*`, `kernel.keys.*`,
+/// `vm.drop_caches`).
 #[derive(Clone, Debug, Default)]
 pub struct Globals(pub std::collections::BTreeMap<String, String>);
 
@@ -151,6 +152,42 @@ const SYSCTLS: &[Sysctl] = &[
         default: "32000",
         kind: Kind::Int(0, IPCMNI),
         space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"kernel/keys/gc_delay",
+        default: "300",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/keys/maxbytes",
+        default: "20000",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/keys/maxkeys",
+        default: "200",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/keys/persistent_keyring_expiry",
+        default: "259200",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/keys/root_maxbytes",
+        default: "25000000",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"kernel/keys/root_maxkeys",
+        default: "1000000",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
     },
     Sysctl {
         path: b"fs/inotify/max_queued_events",

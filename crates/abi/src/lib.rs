@@ -611,6 +611,93 @@ pub mod inotify {
     pub const MAX_USER_WATCHES: i64 = 8192;
 }
 
+/// Keys and keyrings (`linux/keyctl.h`): `add_key`, `request_key` and
+/// `keyctl`.
+pub mod keyctl {
+    /// The special keyrings a key id may name.
+    pub const KEY_SPEC_THREAD_KEYRING: i32 = -1;
+    pub const KEY_SPEC_PROCESS_KEYRING: i32 = -2;
+    pub const KEY_SPEC_SESSION_KEYRING: i32 = -3;
+    pub const KEY_SPEC_USER_KEYRING: i32 = -4;
+    pub const KEY_SPEC_USER_SESSION_KEYRING: i32 = -5;
+    pub const KEY_SPEC_GROUP_KEYRING: i32 = -6;
+    pub const KEY_SPEC_REQKEY_AUTH_KEY: i32 = -7;
+    pub const KEY_SPEC_REQUESTOR_KEYRING: i32 = -8;
+
+    /// `KEYCTL_SET_REQKEY_KEYRING`'s keyrings.
+    pub const KEY_REQKEY_DEFL_NO_CHANGE: i32 = -1;
+    pub const KEY_REQKEY_DEFL_DEFAULT: i32 = 0;
+    pub const KEY_REQKEY_DEFL_THREAD_KEYRING: i32 = 1;
+    pub const KEY_REQKEY_DEFL_PROCESS_KEYRING: i32 = 2;
+    pub const KEY_REQKEY_DEFL_SESSION_KEYRING: i32 = 3;
+    pub const KEY_REQKEY_DEFL_USER_KEYRING: i32 = 4;
+    pub const KEY_REQKEY_DEFL_USER_SESSION_KEYRING: i32 = 5;
+    pub const KEY_REQKEY_DEFL_GROUP_KEYRING: i32 = 6;
+    pub const KEY_REQKEY_DEFL_REQUESTOR_KEYRING: i32 = 7;
+
+    /// The operations.
+    pub const KEYCTL_GET_KEYRING_ID: u64 = 0;
+    pub const KEYCTL_JOIN_SESSION_KEYRING: u64 = 1;
+    pub const KEYCTL_UPDATE: u64 = 2;
+    pub const KEYCTL_REVOKE: u64 = 3;
+    pub const KEYCTL_CHOWN: u64 = 4;
+    pub const KEYCTL_SETPERM: u64 = 5;
+    pub const KEYCTL_DESCRIBE: u64 = 6;
+    pub const KEYCTL_CLEAR: u64 = 7;
+    pub const KEYCTL_LINK: u64 = 8;
+    pub const KEYCTL_UNLINK: u64 = 9;
+    pub const KEYCTL_SEARCH: u64 = 10;
+    pub const KEYCTL_READ: u64 = 11;
+    pub const KEYCTL_INSTANTIATE: u64 = 12;
+    pub const KEYCTL_NEGATE: u64 = 13;
+    pub const KEYCTL_SET_REQKEY_KEYRING: u64 = 14;
+    pub const KEYCTL_SET_TIMEOUT: u64 = 15;
+    pub const KEYCTL_ASSUME_AUTHORITY: u64 = 16;
+    pub const KEYCTL_GET_SECURITY: u64 = 17;
+    pub const KEYCTL_SESSION_TO_PARENT: u64 = 18;
+    pub const KEYCTL_REJECT: u64 = 19;
+    pub const KEYCTL_INSTANTIATE_IOV: u64 = 20;
+    pub const KEYCTL_INVALIDATE: u64 = 21;
+    pub const KEYCTL_GET_PERSISTENT: u64 = 22;
+    pub const KEYCTL_DH_COMPUTE: u64 = 23;
+    pub const KEYCTL_PKEY_QUERY: u64 = 24;
+    pub const KEYCTL_PKEY_ENCRYPT: u64 = 25;
+    pub const KEYCTL_PKEY_DECRYPT: u64 = 26;
+    pub const KEYCTL_PKEY_SIGN: u64 = 27;
+    pub const KEYCTL_PKEY_VERIFY: u64 = 28;
+    pub const KEYCTL_RESTRICT_KEYRING: u64 = 29;
+    pub const KEYCTL_MOVE: u64 = 30;
+    pub const KEYCTL_CAPABILITIES: u64 = 31;
+    pub const KEYCTL_WATCH_KEY: u64 = 32;
+
+    /// `KEYCTL_MOVE`'s flag.
+    pub const KEYCTL_MOVE_EXCL: u64 = 1;
+
+    /// Permission bits: possessor, user, group and other, a byte each.
+    pub const KEY_VIEW: u32 = 0x01;
+    pub const KEY_READ: u32 = 0x02;
+    pub const KEY_WRITE: u32 = 0x04;
+    pub const KEY_SEARCH: u32 = 0x08;
+    pub const KEY_LINK: u32 = 0x10;
+    pub const KEY_SETATTR: u32 = 0x20;
+    pub const KEY_ALL: u32 = 0x3f;
+    pub const KEY_POS_SHIFT: u32 = 24;
+    pub const KEY_USR_SHIFT: u32 = 16;
+    pub const KEY_GRP_SHIFT: u32 = 8;
+
+    /// `KEYCTL_CAPABILITIES`' bits.
+    pub const KEYCTL_CAPS0_CAPABILITIES: u8 = 0x01;
+    pub const KEYCTL_CAPS0_PERSISTENT_KEYRINGS: u8 = 0x02;
+    pub const KEYCTL_CAPS0_DIFFIE_HELLMAN: u8 = 0x04;
+    pub const KEYCTL_CAPS0_PUBLIC_KEY: u8 = 0x08;
+    pub const KEYCTL_CAPS0_BIG_KEY: u8 = 0x10;
+    pub const KEYCTL_CAPS0_INVALIDATE: u8 = 0x20;
+    pub const KEYCTL_CAPS0_RESTRICT_KEYRING: u8 = 0x40;
+    pub const KEYCTL_CAPS0_MOVE: u8 = 0x80;
+    pub const KEYCTL_CAPS1_NS_KEYRING_NAME: u8 = 0x01;
+    pub const KEYCTL_CAPS1_NS_KEY_TAG: u8 = 0x02;
+}
+
 /// The new mount API (`linux/mount.h`): `fsopen`, `fsconfig`, `fsmount`,
 /// `fspick`, `open_tree`, `move_mount`, `mount_setattr`, `statmount` and
 /// `listmount`.
