@@ -273,6 +273,18 @@ fn id_bytes(st: &libc::stat) -> [u8; 16] {
     b
 }
 
+/// The lower file a copy-up made `fd`'s file of (its device and inode),
+/// if it is such a copy.
+pub fn origin_of(fd: i32) -> Option<(u64, u64)> {
+    let v = crate::xattr::get_host(fd, ORIGIN).ok()?;
+    (v.len() == 16).then(|| {
+        (
+            u64::from_le_bytes(v[..8].try_into().unwrap()),
+            u64::from_le_bytes(v[8..].try_into().unwrap()),
+        )
+    })
+}
+
 /// The path in the overlay `l` of what descriptor `fd` (open on a file of
 /// one of its layers) is: where it is now in its layer, which a rename
 /// moves it with.

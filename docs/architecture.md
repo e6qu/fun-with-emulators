@@ -832,7 +832,10 @@ writing or not), attribute changes, creation, removal (`IN_DELETE` to the
 directory; for the file's last link, `IN_ATTRIB`, `IN_DELETE_SELF` and
 `IN_IGNORED`), renames (`IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie,
 `IN_MOVE_SELF`), and an unmount (`IN_UNMOUNT`). The watches are a record
-every process sees, each naming the file by host device and inode. An
+every process sees, each naming the file by host device and inode; a
+file of an overlay by the overlay and the lower file it is (a copy-up
+records that), so its watches keep it across a copy-up and do not see
+its layers' files changed through their own paths. An
 instance's descriptor is a host datagram socket bound to a path in fwe's
 private directory, to which the process raising an event sends it, so
 reading it, `poll` and `epoll` are the host's own; a read takes whole
@@ -1354,9 +1357,7 @@ of these are to be lifted for 1.0 and which are not planned.
   acting when another thread unblocks it (one the guest catches is
   handed on), and in the VM a caught one is not handed on either.
 - **inotify:** a change made by a program fwe does not run raises no
-  event; a watch is of the host file, so a file of an overlay is watched
-  as its layer's (another after its copy-up, and changes made through the
-  layer's own path show); `IN_DELETE_SELF` comes as the last link goes,
+  event; `IN_DELETE_SELF` comes as the last link goes,
   not as the last descriptor closes; a close raises its event once no
   descriptor of the open file is left in the process, not in every
   process, and one by `dup2` over a descriptor or `close_range` raises

@@ -406,6 +406,54 @@ fn identity(st: &libc::stat) -> (u64, u64, bool, u64) {
     )
 }
 
+/// The device an overlay's files are on to their watches: its own, so a
+/// watch through the overlay is not of a layer's file seen another way.
+fn overlay_dev(l: &crate::overlay::Layers) -> u64 {
+    (1 << 63) | (crate::shared::hash(l.paths().next().unwrap_or_default()) >> 1)
+}
+
+/// What a file of an overlay is to its watches: the lower file it was
+/// copied up from, or itself, on the overlay's device; a copy-up does not
+/// change it, as Linux's overlay keeps a file's inode.
+fn overlay_ident(fd: i32, dev: u64) -> Option<(u64, u64)> {
+    let ino = crate::overlay::origin_of(fd).map(|(_, i)| i).or_else(|| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then(|| identity(&st).1)
+    })?;
+    Some((dev, ino))
+}
+
+/// `s`, `name` in host directory `dir`, as seen through overlay `l`.
+fn through_overlay(mut s: Subject, dir: i32, name: &[u8], l: &crate::overlay::Layers) -> Subject {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dev = overlay_dev(l);
+    let file = std::ffi::CString::new(name).ok().and_then(|c| {
+        // SAFETY: a live directory and a NUL-terminated name; the
+        // descriptor is owned below.
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        // SAFETY: a fresh descriptor this owns.
+        (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    });
+    match file.and_then(|f| overlay_ident(f.as_raw_fd(), dev)) {
+        Some((d, i)) => (s.dev, s.ino) = (d, i),
+        None => s.dev = dev,
+    }
+    if s.parent.is_some()
+        && let Some(p) = overlay_ident(dir, dev)
+    {
+        s.parent = Some(p);
+    }
+    s
+}
+
 /// The subject `name` in directory `dir` (a host descriptor) is, not
 /// following a final link.
 pub fn subject_at(dir: i32, name: &[u8]) -> Option<Subject> {
@@ -436,9 +484,49 @@ pub fn subject_at(dir: i32, name: &[u8]) -> Option<Subject> {
     })
 }
 
+/// The subject what `r` resolved is (as an overlay shows it, in one).
+fn resolved_subject(r: &crate::fs::Resolved) -> Option<Subject> {
+    let dir = std::os::fd::AsRawFd::as_raw_fd(&r.dir);
+    let s = subject_at(dir, &r.name)?;
+    Some(match &r.ovl {
+        Some(o) => through_overlay(s, dir, &r.name, &o.layers),
+        None => s,
+    })
+}
+
 /// The subject a descriptor's file is, and where it is (its host path's
-/// directory and name).
+/// directory and name), as an overlay shows it if it was opened in one.
 pub fn subject_of_fd(fd: i32) -> Option<Subject> {
+    let mut s = host_subject_of_fd(fd)?;
+    if let Some(l) = fdmarks::origin(fd).and_then(|o| o.ovl) {
+        let dev = overlay_dev(&l);
+        if let Some(id) = overlay_ident(fd, dev) {
+            (s.dev, s.ino) = id;
+        }
+        let parent = crate::fs::host_path_of(fd).and_then(|p| {
+            let i = p.iter().rposition(|&b| b == b'/')?;
+            let c = std::ffi::CString::new(&p[..i.max(1)]).ok()?;
+            // SAFETY: a NUL-terminated path; the descriptor is closed below.
+            let d = unsafe {
+                libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            };
+            if d < 0 {
+                return None;
+            }
+            let id = overlay_ident(d, dev);
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(d) };
+            id
+        });
+        if s.parent.is_some() {
+            s.parent = parent;
+        }
+    }
+    Some(s)
+}
+
+/// [`subject_of_fd`] as the host has it.
+fn host_subject_of_fd(fd: i32) -> Option<Subject> {
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
@@ -860,7 +948,7 @@ impl<P: Platform> Kernel<P> {
     /// The subject `path` from `dirfd` names (`follow`ing a final link).
     fn subject_path(&self, dirfd: i32, path: &[u8], follow: bool) -> Option<Subject> {
         let r = self.fs().resolve(dirfd, path, follow).ok()?;
-        subject_at(std::os::fd::AsRawFd::as_raw_fd(&r.dir), &r.name)
+        resolved_subject(&r)
     }
 
     /// Before file call `nr`: what [`after`](Self::inotify_after) needs.
@@ -1190,8 +1278,7 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        let Some(s) = subject_at(std::os::fd::AsRawFd::as_raw_fd(&resolved.dir), &resolved.name)
-        else {
+        let Some(s) = resolved_subject(&resolved) else {
             return err(errno::ENOENT);
         };
         if mask & IN_ONLYDIR != 0 && !s.dir {
