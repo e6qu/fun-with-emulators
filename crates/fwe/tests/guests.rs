@@ -2805,12 +2805,14 @@ const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown pa
     listmount: listed true\n\
     beneath: 0, top first true, then the copy true\n\
     fspick: 0, read-only true, then rw\n\
-    mount_setattr: 0, nodev true, shared true\n";
+    mount_setattr: 0, nodev true, shared true\n\
+    propagation: into the copied namespace true, unmount too true\n";
 
 /// The new mount API: a tmpfs made through a filesystem context and
 /// attached from a detached mount, a detached copy attached beneath
-/// another mount, `fspick`, `mount_setattr`, and `statx`, `statmount` and
-/// `listmount` agreeing on the mount.
+/// another mount, `fspick`, `mount_setattr`, `statx`, `statmount` and
+/// `listmount` agreeing on the mount, and a mount under a shared one
+/// propagating into a copied namespace.
 #[test]
 fn the_new_mount_api_makes_and_attaches_mounts() {
     let out = fwe(&rust_guest("mountapi"), &[]);

@@ -166,8 +166,8 @@ pub struct Mount {
     /// Per-mount `MS_*` flags ([`ms::PER_MOUNT`]).
     pub flags: u64,
     /// Propagation: `MS_SHARED` (with [`Mount::peer`]), `MS_SLAVE` (with
-    /// [`Mount::master`]), both, `MS_UNBINDABLE`, or `MS_PRIVATE`. Kept and
-    /// shown, not acted on: a mount does not propagate.
+    /// [`Mount::master`]), both, `MS_UNBINDABLE`, or `MS_PRIVATE`; what is
+    /// mounted under a shared mount propagates ([`Table::propagate`]).
     pub propagation: u64,
     /// The peer group a shared mount is in (0: none).
     pub peer: u32,
@@ -259,15 +259,32 @@ pub struct Table {
     pub mounts: Vec<Mount>,
     /// The id the next mount gets.
     pub next_id: u32,
-    /// The id the next peer group gets.
+    /// The id the next peer group gets, when the shared count of them
+    /// cannot be had ([`store::next_group`]).
     pub next_group: u32,
+    /// What this change propagates to other namespaces, carried out once
+    /// it is made ([`store::Ns::update`]); never kept in the record.
+    pub outbox: Vec<Propagation>,
+}
+
+/// A change of a namespace's mounts that reaches the mounts of other
+/// namespaces in its peer group (or slaves of it), as propagation does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Propagation {
+    /// `tree` (its root first, points relative to it) was mounted at `at`,
+    /// a path in filesystem `source`, under a mount of peer group `group`;
+    /// the new mount's own group and master are `peer` and `master`.
+    Attach { group: u32, source: Source, at: Vec<u8>, tree: Vec<Mount>, peer: u32, master: u32 },
+    /// What was mounted at `at` in `source`, under a mount of `group`, was
+    /// unmounted.
+    Detach { group: u32, source: Source, at: Vec<u8> },
 }
 
 impl Table {
     /// The table a namespace starts with when nothing was mounted in it:
     /// the rootfs at `root_host` and what Linux always has mounted.
     pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>, cgroup_host: Option<&[u8]>) -> Table {
-        let mut t = Table { mounts: Vec::new(), next_id: 1, next_group: 1 };
+        let mut t = Table { mounts: Vec::new(), next_id: 1, next_group: 1, outbox: Vec::new() };
         let root = t.alloc();
         t.mounts.push(Mount {
             id: root,
@@ -412,9 +429,27 @@ impl Table {
         out
     }
 
-    /// Attach a new mount at `point`, onto whatever `point` resolves to.
+    /// Attach a new mount at `point`, onto whatever `point` resolves to,
+    /// and propagate it ([`Table::propagate`]).
     #[allow(clippy::too_many_arguments)]
     pub fn mount(
+        &mut self,
+        point: &[u8],
+        fstype: FsType,
+        source: Source,
+        root: Vec<u8>,
+        flags: u64,
+        device: Vec<u8>,
+        options: Vec<u8>,
+    ) -> u32 {
+        let id = self.mount_one(point, fstype, source, root, flags, device, options);
+        self.propagate(id);
+        id
+    }
+
+    /// [`Table::mount`] without propagating.
+    #[allow(clippy::too_many_arguments)]
+    fn mount_one(
         &mut self,
         point: &[u8],
         fstype: FsType,
@@ -450,10 +485,14 @@ impl Table {
         id
     }
 
+    /// A new peer group's id: unique across namespaces, whose mounts can be
+    /// peers.
     fn alloc_group(&mut self) -> u32 {
-        let g = self.next_group;
-        self.next_group += 1;
-        g
+        store::next_group().unwrap_or_else(|| {
+            let g = self.next_group;
+            self.next_group += 1;
+            g
+        })
     }
 
     fn get_mut(&mut self, id: u32) -> Option<&mut Mount> {
@@ -486,7 +525,7 @@ impl Table {
         if src.propagation & ms::UNBINDABLE != 0 {
             return Err(errno::EINVAL);
         }
-        let id = self.mount(
+        let id = self.mount_one(
             to,
             src.fstype,
             src.source.clone(),
@@ -517,6 +556,7 @@ impl Table {
                 copies.push((m.id, copy));
             }
         }
+        self.propagate(id);
         Ok(id)
     }
 
@@ -591,6 +631,7 @@ impl Table {
             self.mounts.push(Mount { id, parent, point, ..m.clone() });
             copies.push((m.id, id));
         }
+        self.propagate(root);
         Ok(root)
     }
 
@@ -618,14 +659,255 @@ impl Table {
         let id = m.id;
         let mut gone = self.descendants(id);
         gone.push(id);
+        // What it propagated to goes with it: the mount at the same place
+        // in each receiver, if nothing is mounted on that one.
+        let (parent, point) = (m.parent, m.point.clone());
+        if let Some(p) = self.get(parent)
+            && p.peer != 0
+            && let Some(at) = under(&point, &p.point).map(|r| join(&p.root, r))
+        {
+            self.outbox.push(Propagation::Detach { group: p.peer, source: p.source.clone(), at });
+        }
+        for (t, _) in self.receivers(parent) {
+            let Some(at) = self.counterpart(parent, &point, t) else { continue };
+            let copy = self
+                .mounts
+                .iter()
+                .find(|c| c.parent == t && c.id != t && c.point == at && !gone.contains(&c.id))
+                .map(|c| c.id);
+            if let Some(c) = copy
+                && !self.mounts.iter().any(|o| o.parent == c && o.id != c)
+            {
+                gone.push(c);
+            }
+        }
         self.mounts.retain(|m| !gone.contains(&m.id));
         Ok(())
+    }
+
+    /// The mounts a mount attached to `parent` propagates to: the other
+    /// members of its peer group, its group's slaves, and on through the
+    /// groups of slaves that are shared too. Each with whether it receives
+    /// as a peer (else as a slave).
+    fn receivers(&self, parent: u32) -> Vec<(u32, bool)> {
+        let Some(p) = self.get(parent) else { return Vec::new() };
+        if p.peer == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<(u32, bool)> = Vec::new();
+        let mut groups = vec![(p.peer, true)];
+        let mut seen = vec![p.peer];
+        while let Some((g, as_peer)) = groups.pop() {
+            for m in &self.mounts {
+                if m.id == parent || out.iter().any(|&(o, _)| o == m.id) {
+                    continue;
+                }
+                if m.peer == g {
+                    out.push((m.id, as_peer));
+                } else if m.master == g {
+                    out.push((m.id, false));
+                    if m.peer != 0 && !seen.contains(&m.peer) {
+                        seen.push(m.peer);
+                        groups.push((m.peer, false));
+                    }
+                } else {
+                    continue;
+                }
+            }
+        }
+        out
+    }
+
+    /// Where in mount `t` the place `point` of mount `parent` is, if `t`
+    /// shows it (it is of the same filesystem, below `t`'s root).
+    fn counterpart(&self, parent: u32, point: &[u8], t: u32) -> Option<Vec<u8>> {
+        let (p, t) = (self.get(parent)?, self.get(t)?);
+        if p.source != t.source {
+            return None;
+        }
+        let in_fs = join(&p.root, under(point, &p.point)?);
+        Some(join(&t.point, under(&in_fs, &t.root)?))
+    }
+
+    /// Propagate new mount `id` (and what is mounted under it) from its
+    /// parent, as Linux does: a copy at the same place in each receiver
+    /// ([`Table::receivers`]), a peer of `id` in a peer, a slave of `id`'s
+    /// group in a slave. A copy goes beneath a mount the receiver already
+    /// has there.
+    pub fn propagate(&mut self, id: u32) {
+        let Some(m) = self.get(id).cloned() else { return };
+        // For other namespaces' peers and slaves: what was mounted where,
+        // in the parent's filesystem.
+        if let Some(p) = self.get(m.parent).cloned()
+            && p.peer != 0
+            && let Some(at) = under(&m.point, &p.point).map(|r| join(&p.root, r))
+        {
+            let under_m = self.descendants(id);
+            let below: Vec<Mount> = under_m.iter().filter_map(|d| self.get(*d).cloned()).collect();
+            let tree = std::iter::once(m.clone())
+                .chain(parent_first(id, below))
+                .map(|d| {
+                    let point = under(&d.point, &m.point).unwrap_or(b"").to_vec();
+                    Mount { point, ..d }
+                })
+                .collect();
+            self.outbox.push(Propagation::Attach {
+                group: p.peer,
+                source: p.source.clone(),
+                at,
+                tree,
+                peer: m.peer,
+                master: m.master,
+            });
+        }
+        // The tree to copy: `id`, then what is under it, parents first.
+        let under_id = self.descendants(id);
+        // Not to itself (a bind of a shared mount is its peer already).
+        let targets: Vec<(u32, bool)> = self
+            .receivers(m.parent)
+            .into_iter()
+            .filter(|(t, _)| *t != id && !under_id.contains(t))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let below: Vec<Mount> = under_id.iter().filter_map(|d| self.get(*d).cloned()).collect();
+        let tree: Vec<Mount> = std::iter::once(m.clone()).chain(parent_first(id, below)).collect();
+        for (t, as_peer) in targets {
+            self.copy_to(&tree, &m, t, as_peer, None);
+        }
+    }
+
+    /// Copy `tree` (whose root `m` was mounted) into receiver `t`, as a peer
+    /// or a slave, at `at` if given, else at the counterpart of `m`'s place.
+    fn copy_to(&mut self, tree: &[Mount], m: &Mount, t: u32, as_peer: bool, at: Option<Vec<u8>>) {
+        {
+            let Some(at) = at.or_else(|| self.counterpart(m.parent, &m.point, t)) else { return };
+            let root = self.alloc();
+            let mut copies = vec![(m.id, root)];
+            let (peer, master) = if as_peer {
+                (m.peer, m.master)
+            } else {
+                (0, if m.peer != 0 { m.peer } else { m.master })
+            };
+            let propagation = match (peer != 0, master != 0) {
+                (true, true) => ms::SHARED | ms::SLAVE,
+                (true, false) => ms::SHARED,
+                (false, true) => ms::SLAVE,
+                (false, false) => ms::PRIVATE,
+            };
+            // Beneath what `t` has there already.
+            let above = self
+                .mounts
+                .iter()
+                .find(|c| c.parent == t && c.id != t && c.point == at)
+                .map(|c| c.id);
+            self.mounts.push(Mount {
+                id: root,
+                parent: t,
+                point: at.clone(),
+                peer,
+                master,
+                propagation,
+                ..m.clone()
+            });
+            if let Some(a) = above
+                && let Some(c) = self.get_mut(a)
+            {
+                c.parent = root;
+            }
+            for d in &tree[1..] {
+                let Some(&(_, parent)) = copies.iter().find(|(o, _)| *o == d.parent) else {
+                    continue;
+                };
+                let copy = self.alloc();
+                let point = join(&at, under(&d.point, &m.point).unwrap_or(b""));
+                self.mounts.push(Mount { id: copy, parent, point, ..d.clone() });
+                copies.push((d.id, copy));
+            }
+        }
+    }
+
+    /// Receive propagation `ev` from another namespace: its group's members
+    /// here (`peers`, as peers) and the slaves of it (`slaves`, the groups
+    /// receiving as slaves). Returns the groups of shared slaves found here,
+    /// whose members elsewhere receive too.
+    pub fn receive(&mut self, ev: &Propagation, peers: &[u32], slaves: &[u32]) -> Vec<u32> {
+        let (Propagation::Attach { source, at, .. } | Propagation::Detach { source, at, .. }) = ev;
+        let mut found: Vec<u32> = Vec::new();
+        let mut targets: Vec<(u32, bool)> = Vec::new();
+        let mut groups: Vec<(u32, bool)> = peers.iter().map(|&g| (g, true)).collect();
+        groups.extend(slaves.iter().map(|&g| (g, false)));
+        let mut seen: Vec<u32> = groups.iter().map(|&(g, _)| g).collect();
+        while let Some((g, as_peer)) = groups.pop() {
+            for m in &self.mounts {
+                if targets.iter().any(|&(t, _)| t == m.id) {
+                    continue;
+                }
+                if m.peer == g {
+                    targets.push((m.id, as_peer));
+                } else if m.master == g {
+                    targets.push((m.id, false));
+                    if m.peer != 0 && !seen.contains(&m.peer) {
+                        seen.push(m.peer);
+                        found.push(m.peer);
+                        groups.push((m.peer, false));
+                    }
+                }
+            }
+        }
+        for (t, as_peer) in targets {
+            let Some(tm) = self.get(t).cloned() else { continue };
+            if &tm.source != source {
+                continue;
+            }
+            let Some(rest) = under(at, &tm.root) else { continue };
+            let point = join(&tm.point, rest);
+            match ev {
+                Propagation::Attach { tree, peer, master, .. } => {
+                    let Some(root) = tree.first() else { continue };
+                    // The tree's points are relative to its root: placed
+                    // where it lands here.
+                    let m = Mount {
+                        peer: *peer,
+                        master: *master,
+                        point: point.clone(),
+                        ..root.clone()
+                    };
+                    let placed: Vec<Mount> = std::iter::once(m.clone())
+                        .chain(
+                            tree[1..]
+                                .iter()
+                                .map(|d| Mount { point: join(&point, &d.point), ..d.clone() }),
+                        )
+                        .collect();
+                    self.copy_to(&placed, &m, t, as_peer, Some(point));
+                }
+                Propagation::Detach { .. } => {
+                    let copy = self
+                        .mounts
+                        .iter()
+                        .find(|c| c.parent == t && c.id != t && c.point == point)
+                        .map(|c| c.id);
+                    if let Some(c) = copy
+                        && !self.mounts.iter().any(|o| o.parent == c && o.id != c)
+                    {
+                        self.mounts.retain(|o| o.id != c);
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Move the mount whose root is `from` to `to`.
     pub fn move_mount(&mut self, from: &[u8], to: &[u8]) -> Result<(), i32> {
         let (m, rest) = self.locate(from);
         if !rest.is_empty() || m.parent == m.id {
+            return Err(errno::EINVAL);
+        }
+        // Not out of a shared mount, as Linux has it.
+        if self.get(m.parent).is_some_and(|p| p.peer != 0) {
             return Err(errno::EINVAL);
         }
         let id = m.id;
@@ -645,6 +927,7 @@ impl Table {
                 m.point = join(to, under(&m.point, &old_point).unwrap_or(b""));
             }
         }
+        self.propagate(id);
         Ok(())
     }
 
@@ -933,7 +1216,7 @@ impl Table {
                 options: d.bytes(),
             })
             .collect();
-        Table { mounts, next_id, next_group }
+        Table { mounts, next_id, next_group, outbox: Vec::new() }
     }
 }
 
@@ -952,7 +1235,7 @@ impl crate::shared::Data for Table {
 /// A mount namespace's table where every process in the namespace finds
 /// it: a shared record ([`crate::shared`]).
 pub mod store {
-    use super::Table;
+    use super::{Propagation, Table};
     use crate::shared::Record;
     use std::sync::Arc;
 
@@ -999,9 +1282,97 @@ pub mod store {
             self.0.get()
         }
 
-        /// Change the table with `f`, for every process in the namespace.
+        /// Change the table with `f`, for every process in the namespace,
+        /// then carry what it propagates to the other namespaces.
         pub fn update<R>(&self, f: impl FnOnce(&mut Table) -> Result<R, i32>) -> Result<R, i32> {
-            self.0.update(f)
+            let mut out = Vec::new();
+            let r = self.0.update(|t| {
+                let r = f(t);
+                out = std::mem::take(&mut t.outbox);
+                r
+            })?;
+            for ev in out {
+                spread(self.dir(), &ev);
+            }
+            Ok(r)
+        }
+    }
+
+    /// The count of peer groups, which every namespace's share.
+    #[derive(Clone, Debug, Default)]
+    struct Groups(u32);
+
+    impl crate::shared::Data for Groups {
+        fn encode(&self, e: &mut crate::snapshot::Enc) {
+            e.u32(self.0);
+        }
+        fn decode(d: &mut crate::snapshot::Dec) -> Self {
+            Groups(d.u32())
+        }
+    }
+
+    /// A new peer group's id, unique across namespaces (so a group's
+    /// members in two namespaces are known as one group).
+    pub fn next_group() -> Option<u32> {
+        static G: std::sync::OnceLock<Option<Record<Groups>>> = std::sync::OnceLock::new();
+        let r = G.get_or_init(|| Record::named("mount-groups", 0, || Groups(1)).ok()).as_ref()?;
+        r.update(|g| {
+            let n = g.0.max(1);
+            g.0 = n + 1;
+            Ok(n)
+        })
+        .ok()
+    }
+
+    /// The mount namespaces live processes are in (and the initial ones),
+    /// by their records' directories.
+    fn namespaces() -> Vec<Vec<u8>> {
+        let prefix = format!("v{}-mnt-", crate::shared::FORMAT);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for (_, r) in crate::procreg::all() {
+            for d in r.ns {
+                let name = d.rsplit(|&b| b == b'/').next().unwrap_or_default();
+                if name.starts_with(prefix.as_bytes()) && !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+        out
+    }
+
+    /// Carry propagation `ev`, made in the namespace at `own`, to every
+    /// other namespace, and on through the groups of shared slaves there
+    /// (into `own` too, for those).
+    fn spread(own: &[u8], ev: &Propagation) {
+        let (Propagation::Attach { group, .. } | Propagation::Detach { group, .. }) = ev;
+        let all = namespaces();
+        let mut peers = vec![*group];
+        let mut slaves: Vec<u32> = Vec::new();
+        let mut done: Vec<u32> = vec![*group];
+        for pass in 0..8 {
+            let mut found: Vec<u32> = Vec::new();
+            for d in &all {
+                // The namespace it was made in has it already, but for the
+                // slave groups found since.
+                if pass == 0 && d == own {
+                    continue;
+                }
+                let Ok(ns) = Record::<Table>::join(d, 0) else { continue };
+                let _ = ns.update_maybe(|t| {
+                    let before = t.mounts.len();
+                    found.extend(t.receive(ev, &peers, &slaves));
+                    let changed = t.mounts.len() != before;
+                    Ok(((), changed))
+                });
+            }
+            found.retain(|g| !done.contains(g));
+            found.dedup();
+            if found.is_empty() {
+                break;
+            }
+            done.extend(&found);
+            peers.clear();
+            slaves = found;
         }
     }
 }
@@ -1164,6 +1535,68 @@ mod tests {
         let bm = t.get(b).unwrap();
         assert_eq!((bm.master, bm.propagation), (0, ms::PRIVATE));
         assert_eq!(t.get(a).unwrap().peer, 0);
+    }
+
+    /// What is mounted under a shared mount reaches its peers and its
+    /// slaves, a slave's mounts do not reach its master, and an unmount
+    /// takes the copies with it.
+    #[test]
+    fn mounts_propagate_to_peers_and_slaves() {
+        let mut t = table();
+        tmpfs(&mut t, b"/a");
+        t.set_propagation(b"/a", ms::SHARED, false).unwrap();
+        t.bind(b"/a", b"/b", false, 0).unwrap();
+        t.bind(b"/a", b"/s", false, 0).unwrap();
+        t.set_propagation(b"/s", ms::SLAVE, false).unwrap();
+        tmpfs(&mut t, b"/a/x");
+        let x = t.locate(b"/a/x/f").0.clone();
+        assert_eq!(x.point, b"/a/x");
+        let bx = t.locate(b"/b/x/f").0.clone();
+        let sx = t.locate(b"/s/x/f").0.clone();
+        assert_eq!((bx.point.as_slice(), bx.peer), (&b"/b/x"[..], x.peer));
+        assert_eq!((sx.point.as_slice(), sx.peer, sx.master), (&b"/s/x"[..], 0, x.peer));
+        // A slave's own mount stays its own.
+        tmpfs(&mut t, b"/s/y");
+        assert_eq!(t.locate(b"/a/y/f").0.point, b"/a");
+        // Unmounted from one peer, gone from all.
+        t.umount(b"/b/x").unwrap();
+        assert_eq!(t.locate(b"/a/x/f").0.point, b"/a");
+        assert_eq!(t.locate(b"/s/x/f").0.point, b"/s");
+    }
+
+    /// A namespace copied from another (`CLONE_NEWNS`) has peers of its
+    /// shared mounts: a mount in one reaches the other, and its unmount
+    /// takes the copy away.
+    #[test]
+    fn propagation_reaches_a_copied_namespace() {
+        let mut a = table();
+        tmpfs(&mut a, b"/m");
+        a.set_propagation(b"/m", ms::SHARED, false).unwrap();
+        let mut b = a.clone();
+        let group = a.locate(b"/m/x").0.peer;
+        a.outbox.clear();
+        tmpfs(&mut a, b"/m/x");
+        let ev = a.outbox.pop().expect("an attach to carry");
+        assert!(b.receive(&ev, &[group], &[]).is_empty());
+        let got = b.locate(b"/m/x/f").0.clone();
+        assert_eq!((got.point.as_slice(), got.peer), (&b"/m/x"[..], a.locate(b"/m/x/f").0.peer));
+        a.umount(b"/m/x").unwrap();
+        let ev = a.outbox.pop().expect("a detach to carry");
+        b.receive(&ev, &[group], &[]);
+        assert_eq!(b.locate(b"/m/x/f").0.point, b"/m");
+    }
+
+    /// A bind of a shared mount onto itself doubles what is there, each
+    /// copy going beneath the mount already there (Linux's tucking).
+    #[test]
+    fn binds_onto_a_shared_mount_double() {
+        let mut t = table();
+        tmpfs(&mut t, b"/r");
+        t.set_propagation(b"/r", ms::SHARED, false).unwrap();
+        for _ in 0..3 {
+            t.bind(b"/r", b"/r", false, 0).unwrap();
+        }
+        assert_eq!(t.mounts.iter().filter(|m| m.point == b"/r").count(), 8);
     }
 
     /// Unique ids sit above every old one.

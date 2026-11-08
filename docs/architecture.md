@@ -1023,7 +1023,15 @@ show it from the process's root, with each mount's options and its peer
 group (`shared:N`) and master (`master:N`). A bind of a shared mount joins
 its peer group, a new mount under a shared one gets a group of its own,
 and a shared mount made a slave receives from the group it left, as on
-Linux.
+Linux. A mount made under a shared mount propagates as Linux's does: a
+copy at the same place in the parent's peers (as their peer) and in the
+slaves of its group (as a slave, and on through slaves that are shared),
+beneath a mount already there, and its unmount takes the copies that
+have nothing mounted on them; a mount moved into a shared mount propagates
+there, and one under a shared mount cannot be moved (`EINVAL`). Peer groups span namespaces (a copied
+namespace's mounts are peers of the original's, and the groups' numbers
+are counted across namespaces), so a change made in one namespace is
+carried, once it is made, to the others' mount tables.
 
 The new mount API (`crates/kernel/src/mountapi.rs`) works on the same
 table. A filesystem context (`fsopen`, or `fspick` of a mounted filesystem)
@@ -1284,9 +1292,7 @@ of these are to be lifted for 1.0 and which are not planned.
 - **Mounts:** the filesystems mounted are tmpfs, `proc`, `sysfs`,
   `cgroup2`, `devpts`, `mqueue` and overlays, not one on a block device
   (ext4, XFS: `ENODEV`), so a loop device holds a file's bytes but no
-  filesystem to mount. Mounts do not propagate, between namespaces or
-  within one, whatever their propagation type (peer groups and masters
-  are kept and shown); a detached mount or a filesystem context is the
+  filesystem to mount. A detached mount or a filesystem context is the
   process's (a fork child or an `execve` keeps those whose descriptors it
   keeps), so one passed to another process over a socket is a plain
   descriptor of its directory; `fspick` reconfigures the one mount, its

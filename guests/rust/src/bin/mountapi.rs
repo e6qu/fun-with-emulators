@@ -2,7 +2,8 @@
 //! made with `fsopen`, `fsconfig` and `fsmount` and attached with
 //! `move_mount`; a detached copy of it (`open_tree`) attached beneath
 //! another mount; a reconfiguration through `fspick`; `mount_setattr`;
-//! and the mounts as `statx`, `statmount` and `listmount` report them. It
+//! the mounts as `statx`, `statmount` and `listmount` report them; and a
+//! mount under a shared one reaching a child's copy of the namespace. It
 //! prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
@@ -54,6 +55,11 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn access(path: *const c_char, mode: i32) -> i32;
     fn getpid() -> i32;
+    fn fork() -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+    fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
+    fn _exit(code: i32) -> !;
     fn syscall(n: i64, ...) -> i64;
 }
 
@@ -171,5 +177,42 @@ fn main() {
             line.contains(" shared:")
         );
         umount(c(&a).as_ptr());
+
+        // Propagation: a shared mount, a child in a copy of the namespace
+        // (its peer), a mount made under it here reaching the child there,
+        // and its unmount too.
+        mount(c("none").as_ptr(), c(&b).as_ptr(), c("tmpfs").as_ptr(), 0, std::ptr::null());
+        mount(std::ptr::null(), c(&b).as_ptr(), std::ptr::null(), MS_SHARED, std::ptr::null());
+        mkdir(c(&format!("{b}/sub")).as_ptr(), 0o755);
+        let (mut go, mut back) = ([0i32; 2], [0i32; 2]);
+        pipe(go.as_mut_ptr());
+        pipe(back.as_mut_ptr());
+        let pid = fork();
+        if pid == 0 {
+            unshare(CLONE_NEWNS);
+            write(back[1], b"r".as_ptr(), 1);
+            let mut x = [0u8; 1];
+            read(go[0], x.as_mut_ptr(), 1);
+            let there = std::fs::read(format!("{b}/sub/P")).is_ok();
+            write(back[1], [there as u8].as_ptr(), 1);
+            read(go[0], x.as_mut_ptr(), 1);
+            let gone = std::fs::read(format!("{b}/sub/P")).is_err();
+            write(back[1], [gone as u8].as_ptr(), 1);
+            _exit(0);
+        }
+        let mut x = [0u8; 1];
+        read(back[0], x.as_mut_ptr(), 1);
+        mount(c("none").as_ptr(), c(&format!("{b}/sub")).as_ptr(), c("tmpfs").as_ptr(), 0, std::ptr::null());
+        std::fs::write(format!("{b}/sub/P"), b"p").unwrap();
+        write(go[1], b"g".as_ptr(), 1);
+        read(back[0], x.as_mut_ptr(), 1);
+        let reached = x[0] == 1;
+        umount(c(&format!("{b}/sub")).as_ptr());
+        write(go[1], b"g".as_ptr(), 1);
+        read(back[0], x.as_mut_ptr(), 1);
+        let mut status = 0;
+        waitpid(pid, &mut status, 0);
+        println!("propagation: into the copied namespace {reached}, unmount too {}", x[0] == 1);
+        umount(c(&b).as_ptr());
     }
 }
