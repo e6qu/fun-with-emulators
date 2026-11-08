@@ -27,6 +27,7 @@ pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
+pub const CAP_SYS_TIME: u32 = 25;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_LEASE: u32 = 28;
 pub const CAP_SETFCAP: u32 = 31;
@@ -70,14 +71,20 @@ pub struct Caps {
     pub securebits: u32,
 }
 
+/// What fwe's processes may hold in the initial user namespace: every
+/// capability but `CAP_SYS_TIME`, as in a container, since the host's
+/// clock is not fwe's to set.
+pub const INITIAL: u64 = ALL & !(1 << CAP_SYS_TIME);
+
 impl Default for Caps {
-    /// Root's: every capability, nothing inheritable or ambient.
+    /// Root's: every capability it may have ([`INITIAL`]), nothing
+    /// inheritable or ambient.
     fn default() -> Self {
         Caps {
-            effective: ALL,
-            permitted: ALL,
+            effective: INITIAL,
+            permitted: INITIAL,
             inheritable: 0,
-            bounding: ALL,
+            bounding: INITIAL,
             ambient: 0,
             securebits: 0,
         }
@@ -315,9 +322,9 @@ mod tests {
         let mut c = Caps::default();
         c.set_keepcaps(1).unwrap();
         c.after_setuid((0, 0, 0), (1000, 1000, 1000));
-        assert_eq!((c.permitted, c.effective), (ALL, 0));
+        assert_eq!((c.permitted, c.effective), (INITIAL, 0));
         let b = bit(CAP_NET_BIND_SERVICE);
-        c.set(b, ALL, b).unwrap();
+        c.set(b, INITIAL, b).unwrap();
         assert_eq!(c.ambient_op(2, CAP_NET_BIND_SERVICE as u64), Ok(0));
         assert_eq!(c.ambient_op(2, CAP_SYS_ADMIN as u64), Err(errno::EPERM));
         c.on_exec(1000, 1000);

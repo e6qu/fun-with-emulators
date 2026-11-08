@@ -553,6 +553,10 @@ impl<P: Platform> Kernel<P> {
             // Time.
             nr::CLOCK_GETTIME => self.sys_clock_gettime(a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(a[0], a[1]),
+            nr::CLOCK_SETTIME => self.sys_clock_settime(a[0], a[1]),
+            nr::CLOCK_ADJTIME => self.sys_clock_adjtime(a[0], a[1]),
+            nr::SETTIMEOFDAY => self.sys_settimeofday(a[0], a[1]),
+            nr::ADJTIMEX => self.sys_adjtimex(a[0]),
             nr::GETTIMEOFDAY => {
                 // The C library fills these in itself, unchecked: copy out.
                 let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
@@ -1186,6 +1190,9 @@ impl<P: Platform> Kernel<P> {
             Ok(v) => v,
             Err(e) => return if data == 0 && e == err(errno::EINVAL) { 0 } else { e },
         };
+        if pid < 0 {
+            return err(errno::EINVAL);
+        }
         if pid != 0 && pid != thread::tgid() {
             return err(errno::ESRCH);
         }
@@ -2074,7 +2081,7 @@ impl<P: Platform> Kernel<P> {
 /// `CPUCLOCK_SCHED`, the time run), or user time alone (`CPUCLOCK_VIRT`).
 /// A thread's clock is of a thread of this process; 0 is the caller (or
 /// its process). `None` for any other clock id.
-fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
+pub(crate) fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
     let id = id as i32;
     if id >= 0 {
         return None;
