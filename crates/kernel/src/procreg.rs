@@ -492,18 +492,22 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
     set_namespaces(me(), ns);
 }
 
-/// A child `child` of this process starts in this process's cgroup, in the
-/// namespaces `ns`, with the line of ancestors and bound of `line`
-/// ([`child_line`]) and this process's mappings `maps` (see
-/// [`crate::maps::forked`]).
-pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), maps: Vec<u8>) {
-    let mine = read(me());
-    let oom = mine.as_ref().map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min));
-    let ids = mine.as_ref().map_or([0; 8], |r| r.ids);
-    let nice = mine.as_ref().map_or(0, |r| r.nice);
-    // A child of a process that asked to reset on fork starts as an
-    // ordinary one, its nice value no less than 0, as on Linux.
-    let (sched, nice) = match mine.as_ref().map_or_else(Sched::default, |r| r.sched) {
+/// What a fork child takes of this process's record, as it is when it
+/// forks: its ids, OOM adjustments, nice value and scheduling.
+#[derive(Clone, Debug, Default)]
+pub struct Inherit {
+    ids: [u32; 8],
+    oom: (i32, i32),
+    nice: i32,
+    sched: Sched,
+}
+
+/// What a child forked now inherits ([`Inherit`]): a child of a process
+/// that asked to reset on fork starts as an ordinary one, its nice value no
+/// less than 0, as on Linux.
+pub fn inherit() -> Inherit {
+    let Some(r) = read(me()) else { return Inherit::default() };
+    let (sched, nice) = match r.sched {
         s if s.reset_on_fork => {
             use fwe_abi::sched::*;
             let realtime = matches!(s.policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE);
@@ -512,10 +516,57 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), ma
             } else {
                 Sched { reset_on_fork: false, util_min: None, util_max: None, ..s }
             };
-            (sched, if realtime { 0 } else { nice.max(0) })
+            (sched, if realtime { 0 } else { r.nice.max(0) })
         }
-        s => (s, nice),
+        s => (s, r.nice),
     };
+    Inherit { ids: r.ids, oom: (r.oom_score_adj, r.oom_score_adj_min), nice, sched }
+}
+
+/// Write `i` for a child that starts on state handed to it.
+pub fn save_inherit(e: &mut Enc, i: &Inherit) {
+    for id in i.ids {
+        e.u32(id);
+    }
+    e.i32(i.oom.0);
+    e.i32(i.oom.1);
+    e.i32(i.nice);
+    i.sched.encode(e);
+}
+
+/// What [`save_inherit`] wrote.
+pub fn load_inherit(d: &mut Dec) -> Inherit {
+    let mut ids = [0u32; 8];
+    for id in &mut ids {
+        *id = d.u32();
+    }
+    let oom = (d.i32(), d.i32());
+    let nice = d.i32();
+    let sched = Sched::decode(d);
+    Inherit { ids, oom, nice, sched }
+}
+
+/// Set `r`'s inherited part.
+fn apply(r: &mut ProcRecord, i: &Inherit) {
+    r.ids = i.ids;
+    (r.oom_score_adj, r.oom_score_adj_min) = i.oom;
+    r.nice = i.nice;
+    r.sched = i.sched;
+}
+
+/// A child `child` of this process starts in this process's cgroup, in the
+/// namespaces `ns`, with the line of ancestors and bound of `line`
+/// ([`child_line`]), what it inherits (`inherit`, unless the child has
+/// written it already, see [`own_line`]) and this process's mappings `maps`
+/// (see [`crate::maps::forked`]).
+pub fn forked(
+    child: i32,
+    ns: Vec<Vec<u8>>,
+    line: &(Vec<Proc>, Option<Proc>),
+    inherit: &Inherit,
+    maps: Vec<u8>,
+) {
+    let mine = read(me());
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
     let cgroup = own_cgroup();
     // Kept what the child has already written of itself (its program).
@@ -525,13 +576,14 @@ pub fn forked(child: i32, ns: Vec<Vec<u8>>, line: &(Vec<Proc>, Option<Proc>), ma
         if r.exe.is_empty() {
             (r.comm, r.cmdline, r.exe) = (comm, cmdline, exe);
         }
+        // What the child wrote of itself already stands: it may have
+        // changed it since.
+        if r.lineage.is_empty() {
+            apply(r, inherit);
+        }
         (r.lineage, r.bound) = line.clone();
         // An ignored SIGCHLD is inherited, and so is the host's reaping.
         r.autoreap = crate::host::children_reaped_by_host();
-        (r.oom_score_adj, r.oom_score_adj_min) = oom;
-        r.ids = ids;
-        r.nice = nice;
-        r.sched = sched;
         // Whichever of the two writes first, the child's mappings are there
         // from the start; the child's own stand.
         if r.maps.is_empty() {
@@ -666,9 +718,14 @@ pub fn load_line(d: &mut Dec) -> (Vec<Proc>, Option<Proc>) {
 }
 
 /// This process (just forked) has the line of ancestors and bound `line`,
-/// and the mappings `maps` it inherited (see [`crate::maps::forked`]).
-pub fn own_line(line: &(Vec<Proc>, Option<Proc>), maps: Vec<u8>) {
+/// what it inherited of its parent's record (`inherit`), and the mappings
+/// `maps` it inherited (see [`crate::maps::forked`]): written by the child
+/// first, so it reads its own from the start.
+pub fn own_line(line: &(Vec<Proc>, Option<Proc>), inherit: &Inherit, maps: Vec<u8>) {
     let _ = change(me(), |r| {
+        if r.lineage.is_empty() {
+            apply(r, inherit);
+        }
         (r.lineage, r.bound) = line.clone();
         r.maps = maps;
     });

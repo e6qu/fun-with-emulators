@@ -48,6 +48,8 @@ pub struct ForkNs {
     /// The child's line of ancestors and the bound of its adoption (see
     /// [`crate::reaper`]).
     line: (Vec<crate::procreg::Proc>, Option<crate::procreg::Proc>),
+    /// What the child inherits of this process's record.
+    inherit: crate::procreg::Inherit,
 }
 
 impl<P: Platform> Kernel<P> {
@@ -190,7 +192,8 @@ impl<P: Platform> Kernel<P> {
         };
         let dirs = fs.ns_dirs();
         let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
-        Ok(ForkNs { saved, chain, nums, dirs, caps, line })
+        let inherit = crate::procreg::inherit();
+        Ok(ForkNs { saved, chain, nums, dirs, caps, line, inherit })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
@@ -207,7 +210,13 @@ impl<P: Platform> Kernel<P> {
         }
         if child > 0 {
             // It starts in this process's cgroup, in its namespaces.
-            crate::procreg::forked(child, t.dirs.clone(), &t.line, crate::maps::snapshot());
+            crate::procreg::forked(
+                child,
+                t.dirs.clone(),
+                &t.line,
+                &t.inherit,
+                crate::maps::snapshot(),
+            );
         }
         if child <= 0 {
             for (r, n) in t.chain.iter().zip(&t.nums) {
@@ -242,7 +251,7 @@ impl<P: Platform> Kernel<P> {
         // Its own record too: it may end before the parent writes it.
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
-        crate::procreg::own_line(&t.line, crate::maps::forked());
+        crate::procreg::own_line(&t.line, &t.inherit, crate::maps::forked());
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
@@ -260,5 +269,10 @@ impl<P: Platform> Kernel<P> {
     /// on state the parent hands it (a VM fork's).
     pub fn fork_line(t: &ForkNs) -> &(Vec<crate::procreg::Proc>, Option<crate::procreg::Proc>) {
         &t.line
+    }
+
+    /// What the child inherits of this process's record, likewise.
+    pub fn fork_inherit(t: &ForkNs) -> &crate::procreg::Inherit {
+        &t.inherit
     }
 }

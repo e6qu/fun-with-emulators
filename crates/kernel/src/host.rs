@@ -580,14 +580,18 @@ pub unsafe fn signal_info(
     {
         /// macOS's `SI_USER`.
         const SENT: i32 = 0x10001;
-        // (A signal another process sent may come with its sender and a
-        // code of 0, or with no sender, as when the sender has ended.)
-        let note = if code != SENT && code != 0 {
-            None
-        } else if pid == 0 {
+        // A signal another process sent may come with its sender and a
+        // code of 0, with no sender (as when the sender has ended), or with
+        // the code and pid of the sender's exit when it ended right after
+        // sending. A note names its sender, so one that sender left is
+        // taken whatever the code; with no sender, a note is taken for a
+        // signal sent (not one the host raised, as for a fault).
+        let note = if pid != 0 {
+            crate::signote::take_from(sig, pid)
+        } else if code == SENT || code == 0 {
             crate::signote::take(sig)
         } else {
-            crate::signote::take_from(sig, pid)
+            None
         };
         if let Some(n) = note {
             (code, pid, uid) = (SENT, n.pid, n.uid);
