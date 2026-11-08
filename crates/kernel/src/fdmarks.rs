@@ -66,6 +66,8 @@ pub enum Mark {
     /// An `O_PATH` descriptor: it names a file, which is not open to
     /// read, write or act on ([`refuses_path`]).
     Path,
+    /// A POSIX message queue's descriptor ([`crate::mqueue`]).
+    Mq,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,6 +354,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Loop(_)) => 9,
             Some(Mark::LoopControl) => 10,
             Some(Mark::Path) => 11,
+            Some(Mark::Mq) => 12,
         });
         if let Some(Mark::Loop(n)) = rec.mark {
             e.u32(n);
@@ -412,6 +415,7 @@ pub fn load(d: &mut Dec) {
             9 => Some(Mark::Loop(d.u32())),
             10 => Some(Mark::LoopControl),
             11 => Some(Mark::Path),
+            12 => Some(Mark::Mq),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

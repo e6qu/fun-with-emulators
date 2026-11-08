@@ -953,10 +953,14 @@ pub struct IpcContext {
     creds: crate::creds::Creds,
 }
 
-/// Whether system call `nr` is one of the IPC calls that may wait.
+/// Whether system call `nr` is one of the IPC calls that may wait (the
+/// System V ones and a POSIX message queue's send and receive).
 pub fn waits(nr: u64) -> bool {
     use fwe_abi::nr as n;
-    matches!(nr, n::SEMOP | n::SEMTIMEDOP | n::MSGSND | n::MSGRCV)
+    matches!(
+        nr,
+        n::SEMOP | n::SEMTIMEDOP | n::MSGSND | n::MSGRCV | n::MQ_TIMEDSEND | n::MQ_TIMEDRECEIVE
+    )
 }
 
 /// Run waiting IPC call `nr` (see [`waits`]) with `args`, in `ctx`, without
@@ -972,6 +976,8 @@ pub fn blocking(ctx: Result<IpcContext, i32>, nr: u64, a: [u64; 6]) -> i64 {
         n::SEMOP => semtimedop(&ctx, a[0], a[1], a[2], 0),
         n::SEMTIMEDOP => semtimedop(&ctx, a[0], a[1], a[2], a[3]),
         n::MSGSND => msgsnd(&ctx, a[0], a[1], a[2], a[3]),
+        n::MQ_TIMEDSEND => crate::mqueue::timedsend(&ctx.creds, a[0], a[1], a[2], a[3], a[4]),
+        n::MQ_TIMEDRECEIVE => crate::mqueue::timedreceive(a[0], a[1], a[2], a[3], a[4]),
         _ => msgrcv(&ctx, a[0], a[1], a[2], a[3], a[4]),
     }
 }

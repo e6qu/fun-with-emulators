@@ -142,7 +142,14 @@ fn bind_or_connect(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr, bind: bool) -
     // SAFETY: `hb` holds a valid host sockaddr of `a.len` bytes.
     let call =
         || unsafe { if bind { libc::bind(fd, p, a.len) } else { libc::connect(fd, p, a.len) } };
-    let Some(dir) = &a.dir else { return call() };
+    in_dir(a.dir.as_ref(), call)
+}
+
+/// Run `call` (a host call taking a relative path) from directory `dir`
+/// as this thread's working directory, if one is given; its result and
+/// `errno` are the call's.
+fn in_dir(dir: Option<&std::os::fd::OwnedFd>, call: impl FnOnce() -> i32) -> i32 {
+    let Some(dir) = dir else { return call() };
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
@@ -161,11 +168,52 @@ fn bind_or_connect(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr, bind: bool) -
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = dir;
+        let _ = (dir, call);
         // SAFETY: setting this thread's errno.
         unsafe { *libc::__errno_location() = libc::ENAMETOOLONG };
         -1
     }
+}
+
+/// Run `call` with the host `AF_UNIX` address of host path `path` (one of
+/// fwe's own sockets): one relative to the path's directory, from there,
+/// if the whole path is too long for `sun_path`. The call's result, or
+/// the Linux error making the address met.
+pub fn at_unix_path(
+    path: &[u8],
+    call: impl FnOnce(*const libc::sockaddr, libc::socklen_t) -> i32,
+) -> Result<i32, i32> {
+    let (dir, name) = if path.len() + 1 > UNIX_PATH_MAX {
+        let slash = path.iter().rposition(|&b| b == b'/').ok_or(errno::ENAMETOOLONG)?;
+        let c = std::ffi::CString::new(&path[..slash.max(1)]).map_err(|_| errno::EINVAL)?;
+        // SAFETY: a NUL-terminated path.
+        let fd =
+            unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        use std::os::fd::FromRawFd;
+        // SAFETY: a fresh descriptor this owns.
+        (Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }), &path[slash + 1..])
+    } else {
+        (None, path)
+    };
+    if name.is_empty() || name.len() + 1 > UNIX_PATH_MAX {
+        return Err(errno::ENAMETOOLONG);
+    }
+    // SAFETY: zeroed bytes are a valid `sockaddr_un`.
+    let mut a: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, &b) in a.sun_path.iter_mut().zip(name) {
+        *d = b as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.len() + 1) as libc::socklen_t;
+    #[cfg(not(target_os = "linux"))]
+    {
+        a.sun_len = len as u8;
+    }
+    let p = (&a as *const libc::sockaddr_un).cast();
+    Ok(in_dir(dir.as_ref(), || call(p, len)))
 }
 
 /// `src` is the guest's address; `total` is the family's size.

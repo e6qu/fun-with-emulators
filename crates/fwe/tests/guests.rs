@@ -2774,6 +2774,28 @@ fn kernel_calls_move_data_and_keep_settings() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `mqueue` guest prints.
+const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-exec true\n\
+    status: QSIZE:14         NOTIFY:0     SIGNO:0     NOTIFY_PID:0\n\
+    listed: true, file the same: true\n\
+    received: high/9 mid/5 low/1 low2/1\n\
+    empty: true\n\
+    signal: registered 0, shown true, came true, mesgq true, from the sender true, value 0x5eed\n\
+    thread: registered 0, came true, value 0x7ead\n\
+    unlinked: name gone true, still sends 0, receives kept\n\
+    made again: true, empty true\n";
+
+/// POSIX message queues: messages by priority, the status line, a queue
+/// that outlives its name, and the notifications another process's
+/// message sets off (a signal with the value and sender, and the C
+/// library's notification thread, through a netlink socket).
+#[test]
+fn message_queues_deliver_and_notify() {
+    let out = fwe(&rust_guest("mqueue"), &[]);
+    assert_eq!(stdout(&out), MQUEUE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `loopdev` guest prints.
 const LOOPDEV: &str = "free: true\n\
     node: 0, block device: true, 7:N: true\n\
@@ -3287,6 +3309,16 @@ fn hv_lists_the_mappings() {
 fn hv_kernel_calls_move_data_and_keep_settings() {
     let Some(out) = fwe_hv(&rust_low_guest("calls"), &[]) else { return };
     assert_eq!(stdout(&out), CALLS, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Message queues in the VM (see [`message_queues_deliver_and_notify`]):
+/// the messages, attributes and notification values are the guest's
+/// memory, translated, and a forking guest's processes each have a VM.
+#[test]
+fn hv_message_queues_deliver_and_notify() {
+    let Some(out) = fwe_hv(&rust_low_guest("mqueue"), &[]) else { return };
+    assert_eq!(stdout(&out), MQUEUE, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -4193,7 +4225,8 @@ fn overlay_mounts() {
 /// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
 /// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
 /// is not attached; limits set with `prlimit` from outside; netlink of a
-/// network namespace's `lo`.
+/// network namespace's `lo`, and in the host's, a socket whose requests
+/// are refused.
 #[test]
 fn container_runtime_calls() {
     assert_eq!(
@@ -4205,7 +4238,7 @@ fn container_runtime_calls() {
          prlimit of the child: ok\nchild: oom 500 nofile 100 200\npeer: self true uid 0\n\
          shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
          linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
-         attached as a device program: EINVAL\nnetlink outside: EAFNOSUPPORT\n\
+         attached as a device program: EINVAL\nnetlink outside: true answers -95\n\
          netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
     );
 }

@@ -664,7 +664,9 @@ signal arriving during one (a child's `SIGUSR1`, then its `SIGCHLD`) is
 taken after it with the `siginfo` macOS emptied; an fwe process that sends
 another a signal leaves a note of itself in the target's mailbox, beside
 its process record, which the target's handler reads then
-(`crates/kernel/src/signote.rs`). The parent
+(`crates/kernel/src/signote.rs`). The note also carries what the host
+signal cannot: the Linux `si_code` and value of a message queue's
+notification, which the handler gives the guest. The parent
 of a `fork` holds every signal blocked across the host call, so a child
 goes on only once its parent has unblocked them: a signal it sent sooner
 would lose its sender.
@@ -740,6 +742,39 @@ start time: what one that has gone leaves — attachments, undo adjustments,
 which are applied — is cleaned up by the next process that looks, so even
 one killed outright gives its semaphores back. `/proc/sysvipc/{shm,sem,msg}`
 list the namespace's objects.
+
+## POSIX message queues
+
+`mq_open` and the other queue calls (`crates/kernel/src/mqueue.rs`) work on
+an IPC namespace's queues. Each queue is a record of its own, in a
+directory inside its namespace's record, which names it and counts it
+against `fs.mqueue.queues_max` and the creator's `RLIMIT_MSGQUEUE`; the
+`fs.mqueue.*` limits are the namespace's sysctls, as `kernel.msgmni` is.
+The queue's record holds its owner, mode, attributes and messages (highest
+priority first, oldest first within one), the receivers waiting and the
+notification registered. A send or receive is one change of it under its
+lock; one that must wait (a full or empty queue) waits, without the kernel
+lock, for the record to change (`ETIMEDOUT` at the deadline, `EINTR` for a
+signal, restarted under `SA_RESTART`). The checks are Linux's, in its
+order. A descriptor is a host descriptor of a file in the queue's
+directory, opened with the guest's access mode and close-on-exec, which
+holds a shared `flock` on it; an unlinked queue is freed once nothing holds
+its file, as Linux frees one with its last descriptor. Reading a descriptor
+gives the queue's status line, and `/dev/mqueue` lists the namespace's
+queues, each file reading the same.
+
+A notification goes to the process that registered it, whichever process
+sends the message that makes the queue non-empty with no receiver
+waiting. A signal carries `SI_MESGQ`, the sender and the registered value:
+to the registering process itself it is posted directly; to another it is
+a host signal, with a note of what it carries (see Signals). For
+`SIGEV_THREAD` the C library makes a netlink socket and passes the kernel a
+cookie, which is sent to the socket when the notification fires, or when
+the registration is removed (by `mq_notify` or the owner closing a
+descriptor, which an `execve` closing it counts as). fwe gives that socket
+a host address in the namespace's directory (the guest's descriptor becomes
+a datagram socket bound there), so the process that sends the message can
+deliver the cookie.
 
 ## Event descriptors
 
@@ -840,7 +875,9 @@ container runtime asks of its loopback: `RTM_GETLINK` describes `lo`,
 up, anything else is answered with `EOPNOTSUPP`. The guest's descriptor is
 one end of a host datagram pair, fwe writing each reply to the other, so
 receiving and `epoll` are the host's own. In the initial namespace, whose
-interfaces are the host's, there is no netlink socket (`EAFNOSUPPORT`).
+interfaces are the host's, a socket can be made, and every request on it
+is answered with `EOPNOTSUPP`; it still carries a message queue's
+notification (see POSIX message queues).
 
 DNS needs no special support: the guest's resolver reads
 `/etc/resolv.conf` and `/etc/hosts` from the rootfs and talks to nameservers
@@ -1247,7 +1284,9 @@ of these are to be lifted for 1.0 and which are not planned.
   to a process group) that arrives while one of fwe's handlers runs comes
   with no sender; a blocked signal pending across an
   `execve` arrives with fwe's own pid as its sender;
-  `rt_sigqueueinfo` is not implemented; a signal that
+  `rt_sigqueueinfo` is not implemented, and a message queue's
+  notification by a real-time signal reaches only its own process; a
+  signal that
   arrives between a blocking call's start and its host wait can be noticed
   only when the call ends, except for `rt_sigsuspend`, `rt_sigtimedwait`
   and the masked waits, which close that window; a futex wait notices a
@@ -1270,14 +1309,17 @@ of these are to be lifted for 1.0 and which are not planned.
   test does) is slow; `SHM_INFO` reports no resident pages; a segment
   stays attached in a hypervisor-backend fork child without being counted
   for it; huge pages (`SHM_HUGETLB`) are refused, as without hugetlbfs.
+- **POSIX message queues:** `poll`, `select` and `epoll` see a queue's
+  descriptor as always ready; a queue's file in `/dev/mqueue` is read, not
+  opened as the queue or removed; a guest's `flock` of a queue's
+  descriptor is not held; `RLIMIT_MSGQUEUE` counts a user's queues in the
+  namespace, not in every namespace; a registration goes when its process
+  closes a descriptor of the queue with `close` or `execve`, not when
+  `dup2` or `close_range` replaces or closes one.
 - **Not implemented:**
-  - loop devices;
   - `ptrace`;
   - `inotify` and `fanotify`;
-  - `splice`, `tee` and `vmsplice`;
-  - POSIX message queues;
-  - `clock_settime`;
-  - `personality`, `kcmp` and `sched_setattr`;
+  - `kcmp`;
   - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`);
   - `io_uring`, `userfaultfd` and `perf_event_open`;
   - `rseq` and `membarrier` (optional for libc);

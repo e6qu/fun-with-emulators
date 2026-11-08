@@ -376,6 +376,12 @@ mount06
 mprotect02
 mprotect03
 mprotect04
+mq_notify01
+mq_notify02
+mq_notify03
+mq_timedreceive01
+mq_timedsend01
+mq_unlink01
 mremap02
 mremap04
 mremap09

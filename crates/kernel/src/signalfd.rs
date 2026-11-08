@@ -78,19 +78,24 @@ pub fn watched() -> u64 {
     WATCHED.load(Ordering::Acquire)
 }
 
-/// Build a minimal `signalfd_siginfo` for signal `sig`.
-pub fn siginfo(sig: u32, pid: u32, status: i32) -> [u8; SIGINFO_SIZE] {
-    siginfo_full(sig, 0, pid as i32, 0, status)
-}
-
-/// Build a `signalfd_siginfo` with its code, sender and status.
-pub fn siginfo_full(sig: u32, code: i32, pid: i32, uid: u32, status: i32) -> [u8; SIGINFO_SIZE] {
+/// Build a `signalfd_siginfo` for signal `sig` with its code, sender (as
+/// the guest sees it), status and value.
+pub fn siginfo_full(
+    sig: u32,
+    code: i32,
+    pid: i32,
+    uid: u32,
+    status: i32,
+    value: u64,
+) -> [u8; SIGINFO_SIZE] {
     let mut b = [0u8; SIGINFO_SIZE];
     b[0..4].copy_from_slice(&sig.to_ne_bytes()); // ssi_signo
     b[8..12].copy_from_slice(&code.to_ne_bytes()); // ssi_code
     b[12..16].copy_from_slice(&pid.to_ne_bytes()); // ssi_pid
     b[16..20].copy_from_slice(&uid.to_ne_bytes()); // ssi_uid
-    b[48..52].copy_from_slice(&status.to_ne_bytes()); // ssi_status
+    b[40..44].copy_from_slice(&status.to_ne_bytes()); // ssi_status
+    b[44..48].copy_from_slice(&(value as u32).to_ne_bytes()); // ssi_int
+    b[48..56].copy_from_slice(&value.to_ne_bytes()); // ssi_ptr
     b
 }
 
@@ -264,12 +269,14 @@ mod tests {
         assert_eq!(empty_read(fd), Some(err(errno::EAGAIN)));
 
         // An unwatched signal is not taken.
-        assert!(!deliver(9, siginfo(9, 1, 0)));
+        assert!(!deliver(9, siginfo_full(9, 0, 1, 0, 0, 0)));
         // A watched one is.
-        assert!(deliver(15, siginfo(15, 42, 0)));
+        assert!(deliver(15, siginfo_full(15, -3, 42, 0, 7, 0x1234)));
         let rec = read_one(fd).expect("one record");
-        assert_eq!(u32::from_ne_bytes(rec[0..4].try_into().unwrap()), 15);
-        assert_eq!(u32::from_ne_bytes(rec[12..16].try_into().unwrap()), 42);
+        let word = |at: usize| u32::from_ne_bytes(rec[at..at + 4].try_into().unwrap());
+        // `ssi_signo`, `ssi_pid`, `ssi_status`, `ssi_int` and `ssi_ptr`.
+        assert_eq!((word(0), word(12), word(40), word(44)), (15, 42, 7, 0x1234));
+        assert_eq!(u64::from_ne_bytes(rec[48..56].try_into().unwrap()), 0x1234);
 
         // Drained again.
         assert_eq!(empty_read(fd), Some(err(errno::EAGAIN)));

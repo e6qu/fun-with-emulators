@@ -848,7 +848,12 @@ impl<P: Platform> Kernel<P> {
         };
         let node =
             crate::devnodes::marked(&out).then(|| crate::devnodes::node_of(fd as i32)).flatten();
-        guest!(uaccess::write(buf, as_node(stat_to_linux(&out), node)));
+        let mut st = as_node(stat_to_linux(&out), node);
+        if let Some((mode, uid, gid)) = crate::mqueue::owner_of(fd as i32) {
+            // A message queue's descriptor: the queue's owner and mode.
+            (st.st_mode, st.st_uid, st.st_gid) = (fwe_abi::stat::S_IFREG | mode, uid, gid);
+        }
+        guest!(uaccess::write(buf, st));
         0
     }
 
@@ -887,6 +892,10 @@ impl<P: Platform> Kernel<P> {
             };
         };
         let mut x = statx_from(&host);
+        if let Some((mode, uid, gid)) = crate::mqueue::owner_of(dirfd as i32) {
+            x.stx_mode = (fwe_abi::stat::S_IFREG | mode) as u16;
+            (x.stx_uid, x.stx_gid) = (uid, gid);
+        }
         if let Some(n) = node {
             x.stx_mode = (n.kind | (x.stx_mode as u32 & 0o7777)) as u16;
             x.stx_rdev_major = n.major;

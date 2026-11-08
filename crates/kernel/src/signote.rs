@@ -9,10 +9,13 @@
 //! So an fwe process that sends another a signal first leaves a note of
 //! itself in the target's mailbox, a small file beside its process record
 //! ([`crate::procreg`]): one slot per host signal, with the sender's pid
-//! and user and when it was written. A handler given a signal with no
+//! and user, when it was written, and for a signal that carries more than
+//! its sender (one a message queue raises, `SI_MESGQ`) its Linux `si_code`
+//! and value. A handler given a signal with no
 //! sender takes the note for it, if a recent one is there ([`take`]); one
-//! given a sender clears that sender's note ([`clear`]), so a later signal
-//! from elsewhere (the terminal, the host) is not taken for it. Both are
+//! given a sender takes that sender's note ([`take_from`]), so a later
+//! signal from elsewhere (the terminal, the host) is not taken for it. Both
+//! are
 //! async-signal-safe: `pread` and `pwrite` on the process's own mailbox,
 //! which it opened as it started (and a fork child as it starts), in fwe's
 //! reserved descriptor range, so a handler takes no number the guest's
@@ -27,8 +30,19 @@ use std::sync::atomic::{AtomicI32, Ordering};
 static DIR: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// A slot: sender pid (`i32`), sender uid (`u32`), monotonic nanoseconds
-/// when written (`u64`).
-const SLOT: usize = 16;
+/// when written (`u64`), Linux `si_code` (`i32`, 0 for `SI_USER`), four
+/// bytes unused, and the value (`u64`).
+const SLOT: usize = 32;
+
+/// A sender's note, as a handler takes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Note {
+    pub pid: i32,
+    pub uid: u32,
+    /// Linux's `si_code`: `SI_USER` (0) for a plain `kill`.
+    pub code: i32,
+    pub value: u64,
+}
 /// Host signals are numbered below this.
 const SIGNALS: usize = 32;
 /// A note older than this is not taken: a signal is held by fwe's handlers
@@ -141,6 +155,12 @@ pub fn unnote(target: i32, sig: libc::c_int) {
 /// This process is about to send host signal `sig` to host process
 /// `target`: leave a note of itself there.
 pub fn note(target: i32, sig: libc::c_int) {
+    note_with(target, sig, 0, 0);
+}
+
+/// As [`note`], for a signal the target is to take with Linux `si_code`
+/// `code` and value `value` (a message queue's notification).
+pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
     let Some(off) = offset(sig) else { return };
     let mut buf = [0u8; 512];
     let Some(path) = mailbox(target, &mut buf) else { return };
@@ -150,6 +170,8 @@ pub fn note(target: i32, sig: libc::c_int) {
     slot[0..4].copy_from_slice(&me.to_ne_bytes());
     slot[4..8].copy_from_slice(&uid.to_ne_bytes());
     slot[8..16].copy_from_slice(&now_ns().to_ne_bytes());
+    slot[16..20].copy_from_slice(&code.to_ne_bytes());
+    slot[24..32].copy_from_slice(&value.to_ne_bytes());
     // SAFETY: a NUL-terminated path; a buffer of `SLOT` bytes.
     unsafe {
         let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
@@ -163,7 +185,7 @@ pub fn note(target: i32, sig: libc::c_int) {
 /// Read, and with `clear_if` (clearing only a note of that sender, or with
 /// 0 any), clear this process's note for host signal `sig`.
 /// Async-signal-safe.
-fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(i32, u32, u64)> {
+fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
     let off = offset(sig)?;
     // SAFETY: getpid cannot fail.
     if OWN_PID.load(Ordering::SeqCst) != unsafe { libc::getpid() } {
@@ -185,29 +207,34 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(i32, u32, u64)>
         n == SLOT as isize && pid != 0
     };
     crate::host::set_errno(saved);
+    let word = |at: usize| slot[at..at + 4].try_into().unwrap();
     got.then(|| {
-        (
-            i32::from_ne_bytes(slot[0..4].try_into().unwrap()),
-            u32::from_ne_bytes(slot[4..8].try_into().unwrap()),
-            u64::from_ne_bytes(slot[8..16].try_into().unwrap()),
-        )
+        let note = Note {
+            pid: i32::from_ne_bytes(word(0)),
+            uid: u32::from_ne_bytes(word(4)),
+            code: i32::from_ne_bytes(word(16)),
+            value: u64::from_ne_bytes(slot[24..32].try_into().unwrap()),
+        };
+        (note, u64::from_ne_bytes(slot[8..16].try_into().unwrap()))
     })
 }
 
 /// In the host handler, for host signal `sig` that came with no sender: the
-/// sender (host pid, host uid) a recent note names, the note taken.
-/// Async-signal-safe.
-pub fn take(sig: libc::c_int) -> Option<(i32, u32)> {
-    let (pid, uid, when) = read_note(sig, Some(0))?;
-    (now_ns().saturating_sub(when) < FRESH_NS).then_some((pid, uid))
+/// sender (host pid, host uid) a recent note names, and what it carries,
+/// the note taken. Async-signal-safe.
+pub fn take(sig: libc::c_int) -> Option<Note> {
+    let (note, when) = read_note(sig, Some(0))?;
+    (now_ns().saturating_sub(when) < FRESH_NS).then_some(note)
 }
 
 /// In the host handler, for host signal `sig` that came from `sender`: its
-/// note is spent. Async-signal-safe.
-pub fn clear(sig: libc::c_int, sender: i32) {
-    if sender > 0 {
-        let _ = read_note(sig, Some(sender));
+/// note, spent, if it left a recent one. Async-signal-safe.
+pub fn take_from(sig: libc::c_int, sender: i32) -> Option<Note> {
+    if sender <= 0 {
+        return None;
     }
+    let (note, when) = read_note(sig, Some(sender))?;
+    (note.pid == sender && now_ns().saturating_sub(when) < FRESH_NS).then_some(note)
 }
 
 /// Host process `pid`'s mailbox goes with its record.

@@ -34,6 +34,7 @@ pub mod mm;
 pub mod modes;
 mod mountops;
 pub mod mounts;
+pub mod mqueue;
 pub mod net;
 pub mod netlink;
 pub mod netns;
@@ -522,7 +523,9 @@ impl<P: Platform> Kernel<P> {
     /// beyond what the host keeps: the mount namespace and root (first, so
     /// that the new process finds its program in them, see
     /// [`Fs::adopt_exec_view`]), the credentials, the descriptor limit and
-    /// the umask (see [`Kernel::restore_exec_state`]).
+    /// the umask (see [`Kernel::restore_exec_state`]). Called once the exec
+    /// will happen, it also does what closing the message queues'
+    /// close-on-exec descriptors does ([`mqueue::exec_closing`]).
     pub fn exec_state(&self) -> Vec<u8> {
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
@@ -552,6 +555,9 @@ impl<P: Platform> Kernel<P> {
         fdmarks::save(&mut e);
         // The netlink sockets' host ends, which survive the host exec.
         netlink::save(&mut e, true);
+        // The message queues' descriptors the exec closes: their
+        // registrations go now, as Linux removes them as it closes them.
+        mqueue::exec_closing(&self.creds);
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -1147,6 +1153,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         return Some(e);
     }
     if let Some(r) = loopdev::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = mqueue::io(nr, &a) {
         return Some(r);
     }
     if nr == n::OPENAT {

@@ -1,8 +1,9 @@
 //! The sysctls fwe keeps per namespace, as Linux does: a network
 //! namespace's (`/proc/sys/net/...`, which container runtimes set) and an
 //! IPC namespace's (`kernel.shmmax`, `kernel.msgmni` and the like, the
-//! System V IPC limits). Each namespace of fwe's keeps its own values in
-//! its record ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
+//! System V IPC limits, and `fs.mqueue.*`, the message queues'). Each
+//! namespace of fwe's keeps its own values in its record
+//! ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
 //! `/proc/sys` shows and a write there changes, with Linux's checks. The
 //! initial network namespace's are Linux's defaults and cannot be changed
 //! (they would be the host's); the initial IPC namespace is fwe's own, so
@@ -10,6 +11,7 @@
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::errno;
+use fwe_abi::mqueue as mq;
 
 /// A sysctl fwe keeps: its path under `/proc/sys`, its default, and how a
 /// value written to it is checked and kept.
@@ -104,6 +106,36 @@ const SYSCTLS: &[Sysctl] = &[
         path: b"kernel/msgmni",
         default: "32000",
         kind: Kind::Int(0, IPCMNI),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"fs/mqueue/queues_max",
+        default: "256",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"fs/mqueue/msg_max",
+        default: "10",
+        kind: Kind::Int(mq::MIN_MSGMAX, mq::HARD_MSGMAX),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"fs/mqueue/msgsize_max",
+        default: "8192",
+        kind: Kind::Int(mq::MIN_MSGSIZEMAX, mq::HARD_MSGSIZEMAX),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"fs/mqueue/msg_default",
+        default: "10",
+        kind: Kind::Int(mq::MIN_MSGMAX, mq::HARD_MSGMAX),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"fs/mqueue/msgsize_default",
+        default: "8192",
+        kind: Kind::Int(mq::MIN_MSGSIZEMAX, mq::HARD_MSGSIZEMAX),
         space: Space::Ipc,
     },
 ];

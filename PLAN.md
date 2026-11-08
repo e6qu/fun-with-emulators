@@ -61,7 +61,9 @@ Out of scope:
 - the target programs (git, compilers, Node, Go, Rust, apt, a database, a
   web server) and container engines (podman, containerd) run unmodified,
   the VM's verified on real hardware;
-- LTP's system-call tests pass at 80% or more of those that apply;
+- every one of LTP's system-call tests passes, but those for what is not
+  planned for 1.0 and those that fail or skip on Linux too with the same
+  build (its C library's differences), each listed with the reason;
 - `strace` and `gdb` work on a guest program;
 - a signed release installs and runs them, with user documentation.
 

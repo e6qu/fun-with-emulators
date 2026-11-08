@@ -532,8 +532,7 @@ pub fn si_code_to_linux(code: i32) -> i32 {
     code
 }
 
-/// The Linux `siginfo` fields `(si_code, si_pid, si_uid, si_status)` of
-/// host signal `sig` delivered with `info`.
+/// The Linux `siginfo` of host signal `sig` delivered with `info`.
 ///
 /// macOS empties the `siginfo` of a signal left pending while blocked. For
 /// `SIGCHLD` the child it is about is then found with a `waitid` that
@@ -542,7 +541,10 @@ pub fn si_code_to_linux(code: i32) -> i32 {
 ///
 /// # Safety
 /// `info` is the `siginfo_t` the host passed a `SA_SIGINFO` handler.
-pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i32, i32, u32, i32) {
+pub unsafe fn signal_info(
+    sig: libc::c_int,
+    info: *const libc::siginfo_t,
+) -> crate::thread::SigInfo {
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
@@ -565,17 +567,34 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
         set_errno(saved);
     }
     // A signal sent by another fwe process left a note of its sender, for
-    // when it comes with none ([`crate::signote`]).
+    // when it comes with none, and of what it carries ([`crate::signote`]).
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut value = 0;
     #[cfg(target_os = "macos")]
     {
         /// macOS's `SI_USER`.
         const SENT: i32 = 0x10001;
-        if code == 0 && pid == 0 {
-            if let Some((p, u)) = crate::signote::take(sig) {
-                (code, pid, uid) = (SENT, p, u);
+        // (A signal another process sent may come with its sender and a
+        // code of 0.)
+        let note = if code == 0 && pid == 0 {
+            crate::signote::take(sig)
+        } else if code == SENT || code == 0 {
+            crate::signote::take_from(sig, pid)
+        } else {
+            None
+        };
+        if let Some(n) = note {
+            (code, pid, uid) = (SENT, n.pid, n.uid);
+            if n.code != 0 {
+                return crate::thread::SigInfo {
+                    code: n.code,
+                    pid,
+                    uid: uid_to_initial(uid),
+                    status: 0,
+                    value: n.value,
+                };
             }
-        } else if code == SENT {
-            crate::signote::clear(sig, pid);
+            value = n.value;
         }
     }
     let code = si_code_to_linux(code);
@@ -587,18 +606,23 @@ pub unsafe fn signal_info(sig: libc::c_int, info: *const libc::siginfo_t) -> (i3
         // that had stopped it).
         status = signal::SIGCONT as i32;
     }
-    (code, pid, uid_to_initial(uid), status)
+    crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value }
 }
 
-/// The siginfo of a signal host process `pid`, of host user `uid`, sent
-/// with `kill`, as [`signal_info`] gives it: for a fault signal another
-/// fwe process sent, which comes with the receiving thread's last fault in
-/// its siginfo instead (macOS fills a sent `SIGSEGV`, `SIGBUS`, `SIGILL`
-/// or `SIGFPE` so), known by the sender's note ([`crate::signote`]).
-pub fn sent_info(pid: i32, uid: u32) -> (i32, i32, u32, i32) {
-    /// macOS's `SI_USER`.
-    const SENT: i32 = 0x10001;
-    (si_code_to_linux(SENT), pid, uid_to_initial(uid), 0)
+/// The siginfo of a signal another fwe process sent, as its note
+/// ([`crate::signote`]) gives it, which [`signal_info`] gives: for a
+/// fault signal, which comes with the receiving thread's last fault in its
+/// siginfo instead (macOS fills a sent `SIGSEGV`, `SIGBUS`, `SIGILL` or
+/// `SIGFPE` so).
+pub fn sent_info(note: crate::signote::Note) -> crate::thread::SigInfo {
+    let code = if note.code != 0 { note.code } else { signal::SI_USER };
+    crate::thread::SigInfo {
+        code,
+        pid: note.pid,
+        uid: uid_to_initial(note.uid),
+        status: 0,
+        value: note.value,
+    }
 }
 
 /// Set the calling thread's host `errno`.

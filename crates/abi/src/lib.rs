@@ -572,6 +572,39 @@ pub mod ioctl {
     pub const BLKGETDISKSEQ: u64 = 0x8008_1280;
 }
 
+/// POSIX message queues (`linux/mqueue.h`, `asm-generic/siginfo.h`).
+pub mod mqueue {
+    /// Priorities run below this.
+    pub const MQ_PRIO_MAX: u64 = 32768;
+    /// `struct mq_attr`: `mq_flags`, `mq_maxmsg`, `mq_msgsize`,
+    /// `mq_curmsgs` and four reserved `long`s.
+    pub const ATTR_SIZE: usize = 64;
+    /// `sigev_notify`.
+    pub const SIGEV_SIGNAL: i32 = 0;
+    pub const SIGEV_NONE: i32 = 1;
+    pub const SIGEV_THREAD: i32 = 2;
+    /// `struct sigevent`: `sigev_value` (8 bytes), `sigev_signo`,
+    /// `sigev_notify`, then the union (64 bytes in all).
+    pub const SIGEVENT_SIZE: usize = 64;
+    /// A `SIGEV_THREAD` notification's cookie, sent to a netlink socket;
+    /// its last byte says why.
+    pub const NOTIFY_COOKIE_LEN: usize = 32;
+    pub const NOTIFY_WOKENUP: u8 = 1;
+    pub const NOTIFY_REMOVED: u8 = 2;
+    /// The limits a queue's attributes have (`HARD_MSGMAX`,
+    /// `HARD_MSGSIZEMAX`, `MIN_MSGMAX`, `MIN_MSGSIZEMAX`) and the IPC
+    /// namespace's defaults (`fs.mqueue.*`).
+    pub const HARD_MSGMAX: i64 = 65536;
+    pub const HARD_MSGSIZEMAX: i64 = 16 * 1024 * 1024;
+    pub const MIN_MSGMAX: i64 = 1;
+    pub const MIN_MSGSIZEMAX: i64 = 128;
+    pub const DFLT_QUEUESMAX: i64 = 256;
+    pub const DFLT_MSG: i64 = 10;
+    pub const DFLT_MSGMAX: i64 = 10;
+    pub const DFLT_MSGSIZE: i64 = 8192;
+    pub const DFLT_MSGSIZEMAX: i64 = 8192;
+}
+
 /// Scheduling policies and `struct sched_attr` (`linux/sched.h`,
 /// `linux/sched/types.h`).
 pub mod sched {

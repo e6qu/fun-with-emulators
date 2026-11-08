@@ -570,9 +570,13 @@ impl Fs {
             FsType::Proc => mounts::join(b"/proc", &fs_path),
             FsType::Sysfs => mounts::join(b"/sys", &fs_path),
             FsType::Devpts | FsType::Mqueue => {
-                // Directories of their own, empty until fwe fills them.
+                // Directories of their own: the message queues' holds a file
+                // of each queue's, which reads as its status line.
+                let queue = fs_path.strip_prefix(b"/").filter(|_| m.fstype == FsType::Mqueue);
                 return Some(if fs_path == b"/" {
                     crate::procfs::Entry::Dir
+                } else if let Some(status) = queue.and_then(crate::mqueue::status_of) {
+                    crate::procfs::Entry::File(status)
                 } else {
                     crate::procfs::Entry::Missing
                 });
@@ -892,10 +896,17 @@ impl Fs {
             let absolute = self.absolute(dirfd, path)?;
             let (m, fs_path) = self.mount_of(&absolute);
             return match m.fstype {
-                FsType::Devpts | FsType::Mqueue if fs_path == b"/" => Some(vec![
-                    (b".".to_vec(), crate::procfs::DT_DIR),
-                    (b"..".to_vec(), crate::procfs::DT_DIR),
-                ]),
+                FsType::Devpts | FsType::Mqueue if fs_path == b"/" => {
+                    let mut out = vec![
+                        (b".".to_vec(), crate::procfs::DT_DIR),
+                        (b"..".to_vec(), crate::procfs::DT_DIR),
+                    ];
+                    if m.fstype == FsType::Mqueue {
+                        let names = crate::mqueue::names();
+                        out.extend(names.into_iter().map(|n| (n, crate::procfs::DT_REG)));
+                    }
+                    Some(out)
+                }
                 _ => None,
             };
         };

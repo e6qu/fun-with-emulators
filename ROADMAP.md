@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 751 of 1534 (69% of the 1084 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 757 of 1534 (70% of the 1083 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -73,7 +73,10 @@ capabilities. *crun, podman and containerd run standard images.*
   tmpfs;
 - `splice`, `tee` and `vmsplice`; `personality`; the scheduling policies
   (`sched_setattr` and the rest); the clock refused as Linux refuses it
-  without `CAP_SYS_TIME`.
+  without `CAP_SYS_TIME`;
+- POSIX message queues per IPC namespace, with notifications across
+  processes (a signal with its value, or the C library's thread through a
+  netlink socket).
 
 ## Left to 1.0
 
@@ -96,7 +99,6 @@ run.
 
 - [ ] **Missing system calls LTP tests:**
   - `inotify` (and `fanotify` refused cleanly);
-  - POSIX message queues (`mq_open` and the rest);
   - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`).
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,
@@ -104,7 +106,7 @@ run.
 - [ ] **Ownership for non-root:** `chown` recorded and shown by `stat`,
   and permission checks for a guest that is not root (the `chown`,
   `fchown`, `lchown`, `creat` and `mkdir` failures).
-- [ ] **The correctness gaps LTP points at:**
+- [ ] **Every other failure LTP points at**, among them:
   - open-file-description locks;
   - `EPOLLEXCLUSIVE`;
   - `eventfd` and real-time signals across processes;
@@ -113,8 +115,10 @@ run.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 
-**Done when:** LTP's system-call tests pass at 80% or more of those that
-apply, in CI against the baseline; `strace` and `gdb` work on a guest
+**Done when:** every one of LTP's system-call tests passes, in CI against
+the baseline, but those for what is not planned for 1.0 and those that fail
+or skip on Linux too with the same build, each listed with the reason in
+`tools/ltp/exceptions.txt`; `strace` and `gdb` work on a guest
 program; the target programs and container engines keep passing.
 
 ### M5 — Release
