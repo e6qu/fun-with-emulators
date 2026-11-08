@@ -18,6 +18,8 @@ const EAGAIN: i32 = 11;
 const ENOENT: i32 = 2;
 const EINTR: i32 = 4;
 const SIGUSR1: i32 = 10;
+const F_GETFD: i32 = 1;
+const FD_CLOEXEC: i32 = 1;
 const SA_SIGINFO: u64 = 4;
 const SIGEV_SIGNAL: i32 = 0;
 const SIGEV_THREAD: i32 = 2;
@@ -60,6 +62,7 @@ unsafe extern "C" {
     fn mq_getattr(q: i32, attr: *mut MqAttr) -> i32;
     fn mq_notify(q: i32, ev: *const SigEvent) -> i32;
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn pread(fd: i32, buf: *mut u8, len: usize, off: i64) -> isize;
     fn getpid() -> i32;
     fn fork() -> i32;
@@ -137,7 +140,13 @@ fn main() {
         // The descriptor's file is the queue's: its mode and owner.
         let file = std::mem::ManuallyDrop::new(<std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(q));
         let mode = std::os::unix::fs::PermissionsExt::mode(&file.metadata().unwrap().permissions());
-        println!("open: {}, maxmsg {}, msgsize {}, mode {mode:o}", q >= 0, got.maxmsg, got.msgsize);
+        let cloexec = fcntl(q, F_GETFD) & FD_CLOEXEC != 0;
+        println!(
+            "open: {}, maxmsg {}, msgsize {}, mode {mode:o}, close-on-exec {cloexec}",
+            q >= 0,
+            got.maxmsg,
+            got.msgsize
+        );
 
         // Taken highest priority first, oldest first within one.
         for (m, p) in [(&b"low"[..], 1), (b"high", 9), (b"low2", 1), (b"mid", 5)] {

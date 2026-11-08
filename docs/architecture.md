@@ -771,9 +771,10 @@ a host signal, with a note of what it carries (see Signals). For
 `SIGEV_THREAD` the C library makes a netlink socket and passes the kernel a
 cookie, which is sent to the socket when the notification fires, or when
 the registration is removed (by `mq_notify` or the owner closing a
-descriptor). fwe gives that socket a host address in the queue's directory
-(the guest's descriptor becomes a datagram socket bound there), so the
-process that sends the message can deliver the cookie.
+descriptor, which an `execve` closing it counts as). fwe gives that socket
+a host address in the namespace's directory (the guest's descriptor becomes
+a datagram socket bound there), so the process that sends the message can
+deliver the cookie.
 
 ## Event descriptors
 
@@ -1311,7 +1312,10 @@ of these are to be lifted for 1.0 and which are not planned.
 - **POSIX message queues:** `poll`, `select` and `epoll` see a queue's
   descriptor as always ready; a queue's file in `/dev/mqueue` is read, not
   opened as the queue or removed; a guest's `flock` of a queue's
-  descriptor is not held.
+  descriptor is not held; `RLIMIT_MSGQUEUE` counts a user's queues in the
+  namespace, not in every namespace; a registration goes when its process
+  closes a descriptor of the queue with `close` or `execve`, not when
+  `dup2` or `close_range` replaces or closes one.
 - **Not implemented:**
   - `ptrace`;
   - `inotify` and `fanotify`;

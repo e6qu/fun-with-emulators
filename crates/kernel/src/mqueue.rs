@@ -225,6 +225,14 @@ fn host_path(fd: i32) -> Option<Vec<u8>> {
     }
 }
 
+/// Directory `dir` as the host names it (its links resolved), as a
+/// descriptor's path reads: the one key for a queue's records.
+fn canonical(dir: &[u8]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::canonicalize(std::ffi::OsStr::from_bytes(dir))
+        .map_or_else(|_| dir.to_vec(), |p| p.as_os_str().as_bytes().to_vec())
+}
+
 /// The queue's file in its directory, which each descriptor is open on.
 fn file_of(dir: &[u8]) -> Vec<u8> {
     [dir, b"/q"].concat()
@@ -368,6 +376,8 @@ fn wait_for<T>(
         }) {
             Ok(Try::Done(v)) => return Ok(v),
             Ok(Try::Wait) => {}
+            // The queue's record gone: it was freed under this descriptor.
+            Err(errno::ENOENT) => return Err(errno::EBADF),
             Err(e) => return Err(e),
         }
         if let Err(e) = r.wait_change(seen, until) {
@@ -434,6 +444,8 @@ fn sender(creds: &Creds) -> Sender {
 /// `mq_timedsend(fd, msg, len, prio, abs_timeout)`.
 pub fn timedsend(creds: &Creds, fd: u64, msg: u64, len: u64, prio: u64, ts: u64) -> i64 {
     let until = guest!(deadline(ts));
+    // An `unsigned int`.
+    let prio = prio as u32 as u64;
     if prio >= MQ_PRIO_MAX {
         return err(errno::EINVAL);
     }
@@ -444,7 +456,7 @@ pub fn timedsend(creds: &Creds, fd: u64, msg: u64, len: u64, prio: u64, ts: u64)
         return err(errno::EBADF);
     }
     let r = guest!(queue_at(&dir));
-    if len as i64 > r.get().msgsize {
+    if len > r.get().msgsize as u64 {
         return err(errno::EMSGSIZE);
     }
     let text = guest!(uaccess::read_bytes(msg, len as usize));
@@ -489,7 +501,7 @@ pub fn timedreceive(fd: u64, buf: u64, len: u64, prio: u64, ts: u64) -> i64 {
         return err(errno::EBADF);
     }
     let r = guest!(queue_at(&dir));
-    if (len as i64) < r.get().msgsize {
+    if len < r.get().msgsize as u64 {
         return err(errno::EMSGSIZE);
     }
     let me = (ipc::me(), crate::thread::tid());
@@ -559,7 +571,7 @@ pub fn names() -> Vec<Vec<u8>> {
 pub fn status_of(name: &[u8]) -> Option<Vec<u8>> {
     let ns = ipc::current()?;
     let dir = ns.get().mq_names.get(name)?.clone();
-    let q = queue_at(&[ns.dir(), b"/", &dir].concat()).ok()?;
+    let q = queue_at(&[&canonical(ns.dir())[..], b"/", &dir].concat()).ok()?;
     Some(status(&q.get()))
 }
 
@@ -659,12 +671,30 @@ pub fn closing(fd: i32, creds: &Creds) -> Option<impl FnOnce()> {
     })
 }
 
+/// The process is about to replace its program by a host `execve`, which
+/// closes its close-on-exec descriptors: what closing each queue's among
+/// them does (its registration removed), as Linux does as it closes them.
+pub fn exec_closing(creds: &Creds) {
+    if !fdmarks::any_marks() {
+        return;
+    }
+    for fd in crate::fdtable::open_fds() {
+        // SAFETY: plain host call on an open descriptor.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+            // The queue's freeing is left to the next look, once it is closed.
+            let _ = closing(fd, creds);
+        }
+    }
+}
+
 impl<P: Platform> Kernel<P> {
-    /// The process's IPC namespace, for its queues.
-    fn mq_namespace(&self) -> Result<Arc<Record<Ipc>>, i32> {
+    /// The process's IPC namespace, for its queues, and its directory.
+    fn mq_namespace(&self) -> Result<(Arc<Record<Ipc>>, Vec<u8>), i32> {
         let r = self.fs().ns.ipc.clone().or_else(ipc::initial).ok_or(errno::ENOMEM)?;
         ipc::set_current(&r);
-        Ok(r)
+        let dir = canonical(r.dir());
+        Ok((r, dir))
     }
 
     /// `mq_open(name, oflag, mode, attr)`.
@@ -684,7 +714,7 @@ impl<P: Platform> Kernel<P> {
             unsafe { libc::close(slot) };
             return err(errno::EMFILE);
         }
-        let ns = match self.mq_namespace() {
+        let (ns, ns_dir) = match self.mq_namespace() {
             Ok(n) => n,
             Err(e) => {
                 // SAFETY: the descriptor taken above.
@@ -692,7 +722,6 @@ impl<P: Platform> Kernel<P> {
                 return err(e);
             }
         };
-        let ns_dir = ns.dir().to_vec();
         let creds = self.creds.clone();
         let umask = self.fs().umask();
         let host_mode = match oflag as i32 & 3 {
@@ -705,6 +734,7 @@ impl<P: Platform> Kernel<P> {
             | if oflag & O_NONBLOCK != 0 { libc::O_NONBLOCK } else { 0 };
         let opened = ns.update_maybe(|t| {
             let freed = free_unheld(t, &ns_dir);
+            sweep_addresses(&ns_dir);
             let (dir, made) = match t.mq_names.get(&name) {
                 Some(d) => {
                     if oflag & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
@@ -817,6 +847,8 @@ impl<P: Platform> Kernel<P> {
         unsafe {
             libc::dup2(fd, slot);
             libc::close(fd);
+            // `dup2` clears the flag: a queue's descriptor is close-on-exec.
+            libc::fcntl(slot, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         fdmarks::mark(slot, Mark::Mq);
         slot as i64
@@ -825,8 +857,7 @@ impl<P: Platform> Kernel<P> {
     /// `mq_unlink(name)`: the name goes; the queue lives while it is open.
     pub(crate) fn sys_mq_unlink(&mut self, name: u64) -> i64 {
         let name = guest!(read_name(name));
-        let ns = guest!(self.mq_namespace());
-        let ns_dir = ns.dir().to_vec();
+        let (ns, ns_dir) = guest!(self.mq_namespace());
         let creds = self.creds.clone();
         let r = ns.update_maybe(|t| {
             let dir = t.mq_names.get(&name).ok_or(errno::ENOENT)?;
@@ -885,7 +916,8 @@ impl<P: Platform> Kernel<P> {
                 return Err(errno::EBUSY);
             }
             let path = if how == SIGEV_THREAD {
-                let path = notify_path(&dir);
+                let ns_dir = &dir[..dir.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                let path = notify_path(ns_dir);
                 crate::netlink::bind_for_notify(signo, &path)?
             } else {
                 Vec::new()
@@ -954,12 +986,34 @@ impl<P: Platform> Kernel<P> {
 
 /// A host address, in queue `dir`, no other socket is given: where a
 /// `SIGEV_THREAD` registration's socket is bound.
-fn notify_path(dir: &[u8]) -> Vec<u8> {
+fn notify_path(ns_dir: &[u8]) -> Vec<u8> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // SAFETY: getpid cannot fail.
     let pid = unsafe { libc::getpid() };
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    [dir, format!("/n{pid}-{n}").as_bytes()].concat()
+    [ns_dir, format!("/{NOTIFY_PREFIX}{pid}-{n}").as_bytes()].concat()
+}
+
+/// What the name of a `SIGEV_THREAD` socket's address starts with, then
+/// the binding process's pid.
+const NOTIFY_PREFIX: &str = "nl-";
+
+/// Remove the socket addresses in namespace directory `ns_dir` of
+/// processes that have gone (the binder removes its own as it closes the
+/// socket, which one killed outright does not).
+fn sweep_addresses(ns_dir: &[u8]) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(entries) = std::fs::read_dir(std::ffi::OsStr::from_bytes(ns_dir)) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name.as_bytes().strip_prefix(NOTIFY_PREFIX.as_bytes()) else { continue };
+        let pid = std::str::from_utf8(rest.split(|&b| b == b'-').next().unwrap_or_default())
+            .ok()
+            .and_then(|p| p.parse::<i32>().ok());
+        if pid.is_some_and(|p| crate::procreg::start_time(p).is_none()) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Check `fd` is a netlink socket, as `SIGEV_THREAD`'s `sigev_signo` must

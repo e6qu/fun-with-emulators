@@ -1,8 +1,9 @@
 //! The sysctls fwe keeps per namespace, as Linux does: a network
 //! namespace's (`/proc/sys/net/...`, which container runtimes set) and an
 //! IPC namespace's (`kernel.shmmax`, `kernel.msgmni` and the like, the
-//! System V IPC limits, and `fs.mqueue.*`, the message queues'). Each namespace of fwe's keeps its own values in
-//! its record ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
+//! System V IPC limits, and `fs.mqueue.*`, the message queues'). Each
+//! namespace of fwe's keeps its own values in its record
+//! ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
 //! `/proc/sys` shows and a write there changes, with Linux's checks. The
 //! initial network namespace's are Linux's defaults and cannot be changed
 //! (they would be the host's); the initial IPC namespace is fwe's own, so

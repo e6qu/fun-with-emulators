@@ -72,8 +72,10 @@ struct Sock {
     /// the initial one).
     net: Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
     /// The host path the guest's end is bound to, once a message queue's
-    /// notification is to come to it ([`bind_for_notify`]).
-    bound: Option<Vec<u8>>,
+    /// notification is to come to it ([`bind_for_notify`]), and the host
+    /// process that bound it (which alone removes it: a fork child that
+    /// closes its copy leaves it).
+    bound: Option<(Vec<u8>, i32)>,
 }
 
 /// The most a socket's queue holds, and the largest request: Linux's
@@ -171,7 +173,7 @@ fn room(fd: i32, peer: i32) {
 /// (its flags kept), and fwe's end is a new one connected to it.
 pub fn bind_for_notify(fd: i32, path: &[u8]) -> Result<Vec<u8>, i32> {
     let ino = inode(fd).ok_or(errno::EBADF)?;
-    if let Some(p) = socks(|m| m.get(&ino).and_then(|s| s.bound.clone())) {
+    if let Some((p, _)) = socks(|m| m.get(&ino).and_then(|s| s.bound.clone())) {
         return Ok(p);
     }
     let fresh = || {
@@ -236,7 +238,8 @@ pub fn bind_for_notify(fd: i32, path: &[u8]) -> Result<Vec<u8>, i32> {
         if let Some(mut s) = m.remove(&ino) {
             close(s.peer);
             s.peer = peer;
-            s.bound = Some(path.to_vec());
+            // SAFETY: getpid cannot fail.
+            s.bound = Some((path.to_vec(), unsafe { libc::getpid() }));
             m.insert(new_ino, s);
         }
     });
@@ -394,7 +397,9 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
             e.i32(s.ty);
             e.bool(s.admin);
             e.bool(s.bound.is_some());
-            e.bytes(s.bound.as_deref().unwrap_or_default());
+            let (path, by) = s.bound.clone().unwrap_or_default();
+            e.bytes(&path);
+            e.i32(by);
         }
     });
 }
@@ -402,12 +407,12 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
 /// What [`save`] wrote, in the new process (in the namespace it runs in,
 /// which an exec or fork keeps).
 pub(crate) fn load(d: &mut crate::snapshot::Dec) {
-    let n = d.count(30);
+    let n = d.count(34);
     let mut read = Vec::new();
     for _ in 0..n {
         let (ino, peer, port, ty, admin) = (d.u64(), d.i32(), d.u32(), d.i32(), d.bool());
-        let (some, path) = (d.bool(), d.bytes());
-        read.push((ino, peer, port, ty, admin, some.then_some(path)));
+        let (some, path, by) = (d.bool(), d.bytes(), d.i32());
+        read.push((ino, peer, port, ty, admin, some.then_some((path, by))));
     }
     let net = crate::netns::current();
     socks(|m| {
@@ -429,8 +434,12 @@ pub fn closed(fd: i32) {
     if let Some(s) = socks(|m| m.remove(&ino)) {
         // SAFETY: the host end is fwe's own.
         unsafe { libc::close(s.peer) };
-        // Its address (one no other socket is given) goes with it.
-        if let Some(c) = s.bound.and_then(|p| std::ffi::CString::new(p).ok()) {
+        // Its address (one no other socket is given) goes with it, in the
+        // process that bound it.
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let path = s.bound.filter(|&(_, by)| by == me).map(|(p, _)| p);
+        if let Some(c) = path.and_then(|p| std::ffi::CString::new(p).ok()) {
             // SAFETY: a NUL-terminated path in fwe's private directory.
             unsafe { libc::unlink(c.as_ptr()) };
         }

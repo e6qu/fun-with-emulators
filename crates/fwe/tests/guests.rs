@@ -2775,7 +2775,7 @@ fn kernel_calls_move_data_and_keep_settings() {
 }
 
 /// What the `mqueue` guest prints.
-const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640\n\
+const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-exec true\n\
     status: QSIZE:14         NOTIFY:0     SIGNO:0     NOTIFY_PID:0\n\
     listed: true, file the same: true\n\
     received: high/9 mid/5 low/1 low2/1\n\
