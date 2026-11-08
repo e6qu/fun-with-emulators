@@ -308,9 +308,14 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         let mut all: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
         libc::sigfillset(&mut all);
-        // Faults stay deliverable: the child's checked copies of guest
-        // memory recover from them, and a blocked one would end it.
-        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP, libc::SIGFPE] {
+        // Memory faults stay deliverable: the child's checked copies of
+        // guest memory recover from them, and a blocked one would end it.
+        // The other fault signals fwe raises nowhere before the child
+        // enters guest code, so they are held like the rest: one sent the
+        // moment the child exists arrives when it is ready for it (inside
+        // the host `fork` its handler would read the parent's mailbox, and
+        // take the signal for a fault).
+        for sig in [libc::SIGSEGV, libc::SIGBUS] {
             libc::sigdelset(&mut all, sig);
         }
         libc::sigdelset(&mut all, libc::SIGSYS);
