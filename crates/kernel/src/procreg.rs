@@ -888,6 +888,9 @@ pub fn reaped(pid: i32) {
 /// This process is ending with Linux wait status `status`: forget its
 /// record, and leave one of how it ended if a reaper might take it.
 pub fn exiting(status: i32) {
+    // Its files closed, as it ends (inotify's close events), and its
+    // instances gone.
+    crate::inotify::exiting();
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
     let me = me();

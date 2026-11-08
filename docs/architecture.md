@@ -842,7 +842,8 @@ queued, up to `fs.inotify.max_queued_events` (past it the reader gets
 an identical one is merged with it, as Linux merges them. `IN_ONESHOT`,
 `IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR` and
 `IN_DONT_FOLLOW` act as on Linux, the `fs.inotify.*` limits are
-enforced, and `/proc/<pid>/fdinfo` lists an instance's watches.
+enforced, and `/proc/<pid>/fdinfo` lists an instance's watches. `vm.drop_caches` takes the values Linux takes, and drops
+nothing (the host keeps its caches).
 
 ## Sockets
 
@@ -1358,7 +1359,15 @@ of these are to be lifted for 1.0 and which are not planned.
   layer's own path show); `IN_DELETE_SELF` comes as the last link goes,
   not as the last descriptor closes; a close raises its event once no
   descriptor of the open file is left in the process, not in every
-  process.
+  process, and one by `dup2` over a descriptor or `close_range` raises
+  none (an exit or `execve` does); an instance goes when the process that
+  made it closes it or ends, even if a child still holds a descriptor of
+  it; two processes raising events at once can leave an identical event
+  unmerged, or merge one with an event already read; a process that
+  started before any process watched anything notices the first watch
+  within a second.
+- **Working directory:** it follows a rename of its directory (or one
+  above it) by the process itself, not by another process.
 - **Event descriptors:** `EPOLLEXCLUSIVE` wakes every waiter; `timerfd`
   resolution and clock distinctions; `pselect6` does not write back the
   time left.

@@ -305,6 +305,10 @@ pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
     {
         return Err(fwe_abi::err(fwe_abi::errno::EBADF));
     }
+    // An inotify descriptor is no socket to the guest.
+    if let Some(e) = crate::inotify::refused(nr, a) {
+        return Err(e);
+    }
     Ok(())
 }
 

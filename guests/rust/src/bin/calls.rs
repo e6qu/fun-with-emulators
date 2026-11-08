@@ -2,8 +2,8 @@
 //! pipes (`splice` from a file's offset, `tee`, `vmsplice`), the
 //! personality, a scheduling policy set and read back (and a fork child
 //! that inherits it), the clock, which may be read but not set, a pipe's
-//! filesystem, and a `statx` request Linux refuses. It prints what it
-//! observed.
+//! filesystem, a `statx` request Linux refuses, and a working directory
+//! that moves with its directory. It prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates; the calls musl lacks are made with
@@ -145,6 +145,18 @@ fn main() {
         let mut sx = [0u8; 256];
         let bad = res(syscall(SYS_STATX, -100i64, c"/".as_ptr(), 0, 0x8000_0000u32, sx.as_mut_ptr()));
         println!("pipe's filesystem: {r}, pipefs {}; statx reserved bit refused {}", sf[0] == 0x5049_5045, bad == -(EINVAL as i64));
+
+        // The working directory moves with its directory.
+        let wd = format!("/tmp/fwe-calls-wd-{}", getpid());
+        std::fs::create_dir(&wd).unwrap();
+        std::env::set_current_dir(&wd).unwrap();
+        let moved = format!("{wd}-moved");
+        std::fs::rename(&wd, &moved).unwrap();
+        std::fs::write("here", b"x").unwrap();
+        let followed = std::path::Path::new(&format!("{moved}/here")).exists();
+        println!("working directory renamed: followed {followed}");
+        std::env::set_current_dir("/").unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
 
         for fd in [a[0], a[1], b[0], b[1], file] {
             close(fd);

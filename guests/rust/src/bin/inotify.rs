@@ -29,6 +29,9 @@ unsafe extern "C" {
     fn fork() -> i32;
     fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
     fn getpid() -> i32;
+    fn open(path: *const c_char, flags: i32, ...) -> i32;
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+    fn syscall(n: i64, ...) -> i64;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -36,6 +39,26 @@ unsafe extern "C" {
 fn errno() -> i32 {
     // SAFETY: musl's thread-local errno.
     unsafe { *__errno_location() }
+}
+
+/// The events as `kind name` words.
+fn described(got: &[(u32, u32, String)]) -> String {
+    got.iter()
+        .map(|(m, _, n)| {
+            let kind = match m & 0xfff {
+                0x100 => "create",
+                0x20 => "open",
+                0x2 => "modify",
+                0x8 => "close_write",
+                0x40 => "moved_from",
+                0x80 => "moved_to",
+                0x200 => "delete",
+                _ => "other",
+            };
+            format!("{kind} {n}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The events waiting on `fd`: (mask, cookie, name).
@@ -79,26 +102,32 @@ fn main() {
         let mut p = PollFd { fd, events: POLLIN, revents: 0 };
         let ready = poll(&mut p, 1, 1000) == 1 && p.revents & POLLIN != 0;
         let got = events(fd);
-        let names: Vec<String> = got
-            .iter()
-            .map(|(m, _, n)| {
-                let kind = match m & 0xfff {
-                    0x100 => "create",
-                    0x20 => "open",
-                    0x2 => "modify",
-                    0x8 => "close_write",
-                    0x40 => "moved_from",
-                    0x80 => "moved_to",
-                    0x200 => "delete",
-                    _ => "other",
-                };
-                format!("{kind} {n}")
-            })
-            .collect();
         let cookies: Vec<u32> = got.iter().filter(|(m, _, _)| m & 0xc0 != 0).map(|(_, c, _)| *c).collect();
         let paired = cookies.len() == 2 && cookies[0] == cookies[1] && cookies[0] != 0;
-        println!("ready {ready}: {}", names.join(", "));
+        println!("ready {ready}: {}", described(&got));
         println!("move cookies paired {paired}");
+
+        // A writer that ends without closing: its close comes as it ends.
+        let pid = fork();
+        if pid == 0 {
+            let f = CString::new(format!("{dir}/c")).unwrap();
+            let fd = open(f.as_ptr(), 0o101, 0o644);
+            write(fd, b"x".as_ptr(), 1);
+            _exit(0);
+        }
+        waitpid(pid, &mut status, 0);
+        println!("exit closes: {}", described(&events(fd)));
+
+        // An exchange: each moves where the other was, and nothing goes.
+        std::fs::write(format!("{dir}/d"), b"y").unwrap();
+        events(fd);
+        let (c, d) = (CString::new(format!("{dir}/c")).unwrap(), CString::new(format!("{dir}/d")).unwrap());
+        const RENAME_EXCHANGE: u32 = 2;
+        syscall(276, -100i64, c.as_ptr(), -100i64, d.as_ptr(), RENAME_EXCHANGE);
+        println!("exchange: {}", described(&events(fd)));
+        std::fs::remove_file(format!("{dir}/c")).unwrap();
+        std::fs::remove_file(format!("{dir}/d")).unwrap();
+        events(fd);
 
         let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap_or_default();
         println!("fdinfo lists the watch {}", info.contains(&format!("inotify wd:{wd} ")) && info.contains("mask:fff"));

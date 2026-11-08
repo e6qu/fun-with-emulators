@@ -1373,8 +1373,13 @@ impl<P: Platform> Kernel<P> {
     ) -> i64 {
         let old = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let new = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
-        let from = self.fs().absolute_path(olddirfd as i32, &old);
-        let to = self.fs().absolute_path(newdirfd as i32, &new);
+        // Where both are in the namespace's view, their directories'
+        // links followed: the working directory is kept so too.
+        let place = |dirfd: u64, p: &[u8]| {
+            self.fs().resolve(dirfd as i32, p, false).ok()?.ns_path
+        };
+        let from = place(olddirfd, &old);
+        let to = place(newdirfd, &new);
         let r = self.rename_paths(olddirfd, old, newdirfd, new, flags);
         // The working directory is a directory, wherever it moves: one
         // renamed with it is where it went (`RENAME_EXCHANGE`: each where
@@ -1382,13 +1387,14 @@ impl<P: Platform> Kernel<P> {
         if r == 0
             && let (Some(from), Some(to)) = (from, to)
         {
-            let cwd = self.fs().cwd().to_vec();
+            let cwd = self.fs().to_ns(self.fs().cwd());
             let moved = |a: &[u8], b: &[u8]| {
                 crate::mounts::under(&cwd, a).map(|rest| crate::mounts::join(b, rest))
             };
-            let now = moved(&from, &to)
-                .or_else(|| (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten());
-            if let Some(now) = now {
+            let now = moved(&from, &to).or_else(|| {
+                (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten()
+            });
+            if let Some(now) = now.and_then(|ns| self.fs().from_ns(&ns)) {
                 let fs = self.fs.as_mut().expect("filesystem configured");
                 let root = fs.proc_root().to_vec();
                 fs.set_root(root, now);

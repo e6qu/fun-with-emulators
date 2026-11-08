@@ -2763,7 +2763,8 @@ const CALLS: &str = "splice: 5, offset 7, position 10\n\
     sched: set 0, get 0, policy 2, priority 10\n\
     child's policy: 2\n\
     clock: read 0, set refused true\n\
-    pipe's filesystem: 0, pipefs true; statx reserved bit refused true\n";
+    pipe's filesystem: 0, pipefs true; statx reserved bit refused true\n\
+    working directory renamed: followed true\n";
 
 /// Data moved through pipes (`splice` from a file's offset, `tee`,
 /// `vmsplice`), the personality, a scheduling policy a fork child
@@ -2836,6 +2837,8 @@ fn namespace_descriptors_name_and_join_namespaces() {
 const INOTIFY: &str = "watch: true, nothing yet true\n\
     ready true: create a, open a, modify a, close_write a, moved_from a, moved_to b, delete b\n\
     move cookies paired true\n\
+    exit closes: create c, open c, modify c, close_write c\n\
+    exchange: moved_from c, moved_to d, moved_from d, moved_to c\n\
     fdinfo lists the watch true\n\
     removed 0: ignored true\n";
 

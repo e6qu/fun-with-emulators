@@ -139,10 +139,53 @@ fn alive(p: Proc) -> bool {
     p == crate::sysvipc::me() || crate::procreg::alive(p)
 }
 
-/// The registry, every process's.
+static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
+/// When this process last found no registry (monotonic milliseconds).
+static MISSED: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn registry_dir() -> Option<Vec<u8>> {
+    let mut d = crate::fs::shm::user_dir().ok()?;
+    d.extend_from_slice(format!("/v{}-inotify", crate::shared::FORMAT).as_bytes());
+    Some(d)
+}
+
+/// The registry, every process's, if any process has made it (it lasts,
+/// once made). A process that finds none looks again a second later at
+/// the soonest, so a file call costs nothing while nothing is watched.
 pub fn registry() -> Option<&'static Record<Registry>> {
-    static R: OnceLock<Option<Record<Registry>>> = OnceLock::new();
-    R.get_or_init(|| Record::named("inotify", 0, Registry::default).ok()).as_ref()
+    if let Some(r) = REGISTRY.get() {
+        return Some(r);
+    }
+    let missed = MISSED.load(Ordering::Relaxed);
+    let now = now_ms();
+    if missed != 0 && now.saturating_sub(missed) < 1000 {
+        return None;
+    }
+    match registry_dir().and_then(|d| Record::join(&d, 0).ok()) {
+        Some(r) => {
+            let _ = REGISTRY.set(r);
+            REGISTRY.get()
+        }
+        None => {
+            MISSED.store(now, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// The registry, made if no process has made it yet.
+fn make_registry() -> Option<&'static Record<Registry>> {
+    if let Some(r) = registry() {
+        return Some(r);
+    }
+    let r = Record::named("inotify", 0, Registry::default).ok()?;
+    let _ = REGISTRY.set(r);
+    REGISTRY.get()
 }
 
 /// Whether anything is watched: the generation of the registry last
@@ -243,30 +286,75 @@ fn event(wd: i32, mask: u32, cookie: u32, name: &[u8]) -> Vec<u8> {
 }
 
 /// Queue an event on instance `inst`: merged with the one before it if
-/// identical, dropped past the queue's limit (the reader then hears of
-/// the overflow).
-fn send(inst: &[u8], ev: &[u8], max: i64) {
-    let Some(q) = queue_words(inst) else { return };
+/// identical; past the queue's limit, dropped, the queue's last event
+/// then saying so (`IN_Q_OVERFLOW`, once until it is read). Whether the
+/// instance is still there (its socket gone: its process ended).
+fn send(inst: &[u8], ev: &[u8], max: i64) -> bool {
+    let Some(q) = queue_words(inst) else { return false };
     let h = crate::shared::hash(ev) | 1;
     if q[0].load(Ordering::SeqCst) > 0 && q[2].load(Ordering::SeqCst) == h {
-        return;
+        return true;
     }
     if q[0].fetch_add(1, Ordering::SeqCst) as i64 >= max {
         q[0].fetch_sub(1, Ordering::SeqCst);
-        q[1].store(1, Ordering::SeqCst);
-        return;
+        if q[1].swap(1, Ordering::SeqCst) == 0 {
+            return datagram(inst, &event(-1, IN_Q_OVERFLOW, 0, b"")) != Gone;
+        }
+        return true;
     }
     q[2].store(h, Ordering::SeqCst);
-    let sent = sender(|s| {
+    match datagram(inst, ev) {
+        Sent::Yes => true,
+        Sent::Gone => false,
+        Sent::No => {
+            q[0].fetch_sub(1, Ordering::SeqCst);
+            if q[1].swap(1, Ordering::SeqCst) == 0 {
+                let _ = datagram(inst, &event(-1, IN_Q_OVERFLOW, 0, b""));
+            }
+            true
+        }
+    }
+}
+
+/// What sending a datagram came to.
+#[derive(PartialEq, Eq)]
+enum Sent {
+    Yes,
+    /// Not sent: the queue is full.
+    No,
+    /// Nobody is there.
+    Gone,
+}
+use Sent::Gone;
+
+/// Send `ev` to instance `inst`'s socket.
+fn datagram(inst: &[u8], ev: &[u8]) -> Sent {
+    let r = sender(|s| {
         // SAFETY: a valid buffer and address of the lengths given.
         crate::net::at_unix_path(inst, |a, l| unsafe {
             libc::sendto(s, ev.as_ptr().cast(), ev.len(), libc::MSG_DONTWAIT, a, l) as i32
         })
     });
-    if sent != Ok(ev.len() as i32) {
-        q[0].fetch_sub(1, Ordering::SeqCst);
-        q[1].store(1, Ordering::SeqCst);
+    match r {
+        Ok(n) if n == ev.len() as i32 => Sent::Yes,
+        _ => match crate::host::last_errno() {
+            libc::ENOENT | libc::ECONNREFUSED => Sent::Gone,
+            _ => Sent::No,
+        },
     }
+}
+
+/// Instance `inst` has gone without being closed (its process ended):
+/// its watches and its files go too.
+fn forget(inst: &[u8]) {
+    let Some(r) = registry() else { return };
+    let _ = r.update_maybe(|t| {
+        let before = (t.instances.len(), t.watches.len());
+        t.instances.retain(|i| i.path != inst);
+        t.watches.retain(|w| w.inst != inst);
+        Ok(((), before != (t.instances.len(), t.watches.len())))
+    });
+    remove_files(inst);
 }
 
 /// Run `f` with this process's socket for sending events.
@@ -391,14 +479,23 @@ pub fn raise(s: &Subject, mask: u32, cookie: u32) {
     // A directory's events say so, but what it hears of itself moving.
     let isdir = if s.dir && mask & IN_MOVE_SELF == 0 { IN_ISDIR } else { 0 };
     let mut spent: Vec<(Vec<u8>, i32)> = Vec::new();
+    let mut gone: Vec<Vec<u8>> = Vec::new();
     if let Some((pdev, pino)) = s.parent
         && mask & CHILD_EVENTS != 0
     {
         for w in reg.watches.iter().filter(|w| w.dev == pdev && w.ino == pino) {
-            if w.mask & mask == 0 || (w.mask & IN_EXCL_UNLINK != 0 && s.nlink == 0 && !s.dir) {
+            // `IN_EXCL_UNLINK` passes over what is done through an open
+            // file that has been unlinked.
+            const THROUGH_FILE: u32 =
+                IN_ACCESS | IN_MODIFY | IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
+            let unlinked = s.nlink == 0 && !s.dir && mask & THROUGH_FILE != 0;
+            if w.mask & mask == 0 || (w.mask & IN_EXCL_UNLINK != 0 && unlinked) {
                 continue;
             }
-            send(&w.inst, &event(w.wd, mask | isdir, cookie, &s.name), max);
+            if !send(&w.inst, &event(w.wd, mask | isdir, cookie, &s.name), max) {
+                gone.push(w.inst.clone());
+                continue;
+            }
             if w.mask & IN_ONESHOT != 0 {
                 spent.push((w.inst.clone(), w.wd));
             }
@@ -410,10 +507,16 @@ pub fn raise(s: &Subject, mask: u32, cookie: u32) {
         if mask & ENTRY_ONLY != 0 || w.mask & mask == 0 || spent.contains(&(w.inst.clone(), w.wd)) {
             continue;
         }
-        send(&w.inst, &event(w.wd, mask | isdir, cookie, b""), max);
+        if !send(&w.inst, &event(w.wd, mask | isdir, cookie, b""), max) {
+            gone.push(w.inst.clone());
+            continue;
+        }
         if w.mask & IN_ONESHOT != 0 {
             spent.push((w.inst.clone(), w.wd));
         }
+    }
+    for g in &gone {
+        forget(g);
     }
     if !spent.is_empty() {
         drop_watches(|w| spent.contains(&(w.inst.clone(), w.wd)), 0);
@@ -475,10 +578,16 @@ pub fn cookie() -> u32 {
 /// waiting for one unless the descriptor is non-blocking. `None` for
 /// another descriptor.
 pub fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
+    read_events(fd, buf, len, true)
+}
+
+/// [`try_read`], waiting for an event only if `wait` (and the
+/// descriptor blocks).
+fn read_events(fd: i32, buf: u64, len: u64, wait: bool) -> Option<i64> {
     let path = instance_of(fd)?;
     let q = queue_words(&path)?;
     // SAFETY: plain host call.
-    let nonblock = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0;
+    let nonblock = !wait || unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0;
     let mut out: Vec<u8> = Vec::new();
     loop {
         match crate::netlink::next_len(fd) {
@@ -495,22 +604,14 @@ pub fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
                 if got <= 0 {
                     continue;
                 }
-                if q[0].fetch_sub(1, Ordering::SeqCst) == 1 {
+                let mask = u32::from_ne_bytes(ev[4..8].try_into().unwrap());
+                if mask == IN_Q_OVERFLOW {
+                    // The overflow, counted apart: one may come again.
+                    q[1].store(0, Ordering::SeqCst);
+                } else if q[0].fetch_sub(1, Ordering::SeqCst) == 1 {
                     q[2].store(0, Ordering::SeqCst);
                 }
                 out.extend_from_slice(&ev[..got as usize]);
-            }
-            None if q[1].swap(0, Ordering::SeqCst) != 0 => {
-                let ev = event(-1, IN_Q_OVERFLOW, 0, b"");
-                if out.len() + ev.len() > len as usize {
-                    q[1].store(1, Ordering::SeqCst);
-                    if out.is_empty() {
-                        return Some(err(errno::EINVAL));
-                    }
-                    break;
-                }
-                out.extend_from_slice(&ev);
-                break;
             }
             None if !out.is_empty() => break,
             None if nonblock => return Some(err(errno::EAGAIN)),
@@ -530,12 +631,154 @@ pub fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
     }
 }
 
-/// A write to an instance's descriptor: refused (`EINVAL`), as Linux
-/// has no write for one. `None` for another descriptor or call.
-pub fn refuse_write(nr: u64, a: &[u64; 6]) -> Option<i64> {
+/// A read or write of an instance's descriptor other than `read`: a
+/// write refused (`EINVAL`), as Linux has none; a positioned one too
+/// (`ESPIPE`); `readv` filling each buffer with whole events in turn.
+/// `None` for another descriptor or call.
+pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
-    let write = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2);
-    (write && instance_of(a[0] as i32).is_some()).then(|| err(errno::EINVAL))
+    if !matches!(
+        nr,
+        n::WRITE
+            | n::WRITEV
+            | n::PWRITE64
+            | n::PWRITEV
+            | n::PWRITEV2
+            | n::READV
+            | n::PREAD64
+            | n::PREADV
+            | n::PREADV2
+    ) {
+        return None;
+    }
+    let fd = a[0] as i32;
+    instance_of(fd)?;
+    Some(match nr {
+        n::WRITE | n::WRITEV => err(errno::EINVAL),
+        n::READV => {
+            let iov = match uaccess::read_bytes(a[1], (a[2] as usize).min(1024) * 16) {
+                Ok(b) => b,
+                Err(e) => return Some(err(e)),
+            };
+            let mut total = 0i64;
+            for (i, c) in iov.chunks_exact(16).enumerate() {
+                let base = u64::from_ne_bytes(c[0..8].try_into().unwrap());
+                let len = u64::from_ne_bytes(c[8..16].try_into().unwrap());
+                if len == 0 {
+                    continue;
+                }
+                match read_events(fd, base, len, i == 0 || total == 0) {
+                    Some(r) if r > 0 => total += r,
+                    Some(r) if total == 0 => return Some(r),
+                    _ => break,
+                }
+            }
+            total
+        }
+        _ => err(errno::ESPIPE),
+    })
+}
+
+/// A socket call on an instance's descriptor, which is no socket to the
+/// guest: `ENOTSOCK`.
+pub fn refused(nr: u64, a: &[u64; 6]) -> Option<i64> {
+    use fwe_abi::nr as n;
+    let socket = matches!(
+        nr,
+        n::RECVFROM
+            | n::RECVMSG
+            | n::RECVMMSG
+            | n::SENDTO
+            | n::SENDMSG
+            | n::SENDMMSG
+            | n::GETSOCKOPT
+            | n::SETSOCKOPT
+            | n::GETSOCKNAME
+            | n::GETPEERNAME
+            | n::SHUTDOWN
+            | n::BIND
+            | n::CONNECT
+            | n::LISTEN
+            | n::ACCEPT
+            | n::ACCEPT4
+    );
+    (socket && fdmarks::any_marks() && instance_of(a[0] as i32).is_some())
+        .then(|| err(errno::ENOTSOCK))
+}
+
+/// The process is ending: each open file not open elsewhere in it is
+/// closed (its close raised), and its instances go.
+pub fn exiting() {
+    if watching() {
+        for fd in crate::fdtable::open_fds() {
+            close_event(fd);
+        }
+    }
+    drop_own(|_| true);
+}
+
+/// The process is about to replace its program by a host `execve`, which
+/// closes its close-on-exec descriptors: their closes raised, and the
+/// instances among them gone.
+pub fn exec_closing() {
+    let mut cloexec = Vec::new();
+    for fd in crate::fdtable::open_fds() {
+        // SAFETY: plain host call on an open descriptor.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+            if watching() {
+                close_event(fd);
+            }
+            if let Some(p) = instance_of(fd) {
+                cloexec.push(p);
+            }
+        }
+    }
+    if !cloexec.is_empty() {
+        drop_own(|p| cloexec.iter().any(|c| c == p));
+    }
+}
+
+/// Raise the close of descriptor `fd`, if it is a file's and the process
+/// has no other descriptor of it.
+fn close_event(fd: i32) {
+    if instance_of(fd).is_some() || fdmarks::shared_elsewhere(fd) {
+        return;
+    }
+    let Some(s) = subject_of_fd(fd) else { return };
+    // SAFETY: plain host call.
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    raise(
+        &s,
+        if fl & libc::O_ACCMODE != libc::O_RDONLY { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE },
+        0,
+    );
+}
+
+/// Remove this process's instances whose paths `which` picks, with their
+/// watches and files.
+fn drop_own(which: impl Fn(&[u8]) -> bool) {
+    let Some(r) = registry() else { return };
+    let me = crate::sysvipc::me();
+    // Most processes have none: no need to take the lock.
+    if !r.get().instances.iter().any(|i| i.owner == me && which(&i.path)) {
+        return;
+    }
+    let gone = r.update_maybe(|t| {
+        let gone: Vec<Vec<u8>> = t
+            .instances
+            .iter()
+            .filter(|i| i.owner == me && which(&i.path))
+            .map(|i| i.path.clone())
+            .collect();
+        t.instances.retain(|i| !gone.contains(&i.path));
+        t.watches.retain(|w| !gone.contains(&w.inst));
+        let changed = !gone.is_empty();
+        Ok((gone, changed))
+    });
+    for p in gone.unwrap_or_default() {
+        remove_files(&p);
+    }
 }
 
 /// `fd` is closed: an instance it was the last descriptor of goes, with
@@ -604,8 +847,8 @@ pub(crate) fn load(d: &mut Dec) {
 pub enum Plan {
     /// A close of a descriptor of `s`, open to write or not.
     Close(Subject, bool),
-    /// An open that may create: whether the file was there.
-    Open(bool),
+    /// An open that may create or truncate: whether the file was there.
+    Open { existed: bool, truncates: bool },
     /// An unlink of `s`.
     Unlink(Subject),
     /// A rename of `s`, from directory `from` to directory `to` (and
@@ -637,9 +880,14 @@ impl<P: Platform> Kernel<P> {
                 let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                 Some(Plan::Close(s, fl & libc::O_ACCMODE != libc::O_RDONLY))
             }
-            nr::OPENAT if a[2] & fcntl::O_CREAT != 0 => {
+            nr::OPENAT | nr::OPENAT2 => {
+                let flags = if n == nr::OPENAT { a[2] } else { uaccess::read::<u64>(a[2]).ok()? };
+                if flags & (fcntl::O_CREAT | fcntl::O_TRUNC) == 0 {
+                    return None;
+                }
                 let p = path(a[1])?;
-                Some(Plan::Open(self.subject_path(a[0] as i32, &p, true).is_some()))
+                let existed = self.subject_path(a[0] as i32, &p, true).is_some();
+                Some(Plan::Open { existed, truncates: flags & fcntl::O_TRUNC != 0 })
             }
             nr::UNLINKAT => {
                 let p = path(a[1])?;
@@ -680,10 +928,14 @@ impl<P: Platform> Kernel<P> {
             }
             (nr::OPENAT | nr::OPENAT2, plan) => {
                 let Some(s) = subject_of_fd(r as i32) else { return };
-                if matches!(plan, Some(Plan::Open(false))) {
+                if let Some(Plan::Open { existed: false, .. }) = plan {
                     raise(&s, IN_CREATE, 0);
                 }
                 raise(&s, IN_OPEN, 0);
+                // A file that was there, truncated as it opens.
+                if let Some(Plan::Open { existed: true, truncates: true }) = plan {
+                    raise(&s, IN_MODIFY, 0);
+                }
             }
             (nr::MKDIRAT | nr::MKNODAT, _) => {
                 if let Some(s) = path(a[1]).and_then(|p| self.subject_path(a[0] as i32, &p, false))
@@ -719,18 +971,36 @@ impl<P: Platform> Kernel<P> {
                 }
             }
             (nr::RENAMEAT | nr::RENAMEAT2, Some(Plan::Rename { s, to, to_name, over })) => {
-                let c = cookie();
-                raise(&Subject { dir: s.dir, ..s.clone() }, IN_MOVED_FROM, c);
-                let moved = Subject { parent: to, name: to_name, ..s.clone() };
-                raise(&moved, IN_MOVED_TO, c);
-                raise(&Subject { parent: None, ..s.clone() }, IN_MOVE_SELF, 0);
-                if let Some(o) = over
-                    && (o.dev, o.ino) != (s.dev, s.ino)
-                    && (o.dir || o.nlink <= 1)
-                {
-                    deleted(&o);
+                // Two names of one file: nothing moved.
+                if over.as_ref().is_some_and(|o| (o.dev, o.ino) == (s.dev, s.ino)) {
+                    return;
+                }
+                const RENAME_EXCHANGE: u64 = 2;
+                let exchange = n == nr::RENAMEAT2 && a[4] & RENAME_EXCHANGE != 0;
+                let moves = |s: &Subject, to: Option<(u64, u64)>, to_name: Vec<u8>| {
+                    let c = cookie();
+                    raise(s, IN_MOVED_FROM, c);
+                    raise(&Subject { parent: to, name: to_name, ..s.clone() }, IN_MOVED_TO, c);
+                    raise(&Subject { parent: None, ..s.clone() }, IN_MOVE_SELF, 0);
+                };
+                moves(&s, to, to_name);
+                match over {
+                    // Each where the other was.
+                    Some(o) if exchange => moves(&o, s.parent, s.name.clone()),
+                    // What was there is gone, its last link with it.
+                    Some(o) if o.dir || o.nlink <= 1 => {
+                        if !o.dir {
+                            raise(&Subject { parent: None, nlink: 0, ..o.clone() }, IN_ATTRIB, 0);
+                        }
+                        deleted(&o);
+                    }
+                    Some(o) => {
+                        raise(&Subject { parent: None, nlink: o.nlink - 1, ..o }, IN_ATTRIB, 0)
+                    }
+                    None => {}
                 }
             }
+            (nr::FCHOWNAT, _) if a[2] as u32 == u32::MAX && a[3] as u32 == u32::MAX => {}
             (nr::FCHMODAT | nr::FCHMODAT2 | nr::FCHOWNAT, _) => {
                 let follow = n == nr::FCHMODAT
                     || a[if n == nr::FCHOWNAT { 4 } else { 3 }] & fcntl::AT_SYMLINK_NOFOLLOW == 0;
@@ -752,8 +1022,25 @@ impl<P: Platform> Kernel<P> {
                     }
                     _ => subject_of_fd(a[0] as i32),
                 };
+                // Both times set is an attribute change; one alone, an
+                // access or a modification, as Linux reports them.
+                const UTIME_OMIT: i64 = (1 << 30) - 2;
+                let (atime, mtime) = if a[2] == 0 {
+                    (true, true)
+                } else {
+                    match uaccess::read::<[i64; 4]>(a[2]) {
+                        Ok(t) => (t[1] != UTIME_OMIT, t[3] != UTIME_OMIT),
+                        Err(_) => return,
+                    }
+                };
+                let mask = match (atime, mtime) {
+                    (true, true) => IN_ATTRIB,
+                    (true, false) => IN_ACCESS,
+                    (false, true) => IN_MODIFY,
+                    (false, false) => return,
+                };
                 if let Some(s) = s {
-                    raise(&s, IN_ATTRIB, 0);
+                    raise(&s, mask, 0);
                 }
             }
             (nr::SETXATTR | nr::REMOVEXATTR | nr::LSETXATTR | nr::LREMOVEXATTR, _) => {
@@ -764,6 +1051,7 @@ impl<P: Platform> Kernel<P> {
                     raise(&s, IN_ATTRIB, 0);
                 }
             }
+            (nr::FCHOWN, _) if a[1] as u32 == u32::MAX && a[2] as u32 == u32::MAX => {}
             (nr::FCHMOD | nr::FCHOWN | nr::FSETXATTR | nr::FREMOVEXATTR, _) => {
                 if let Some(s) = subject_of_fd(a[0] as i32) {
                     raise(&s, IN_ATTRIB, 0);
@@ -785,7 +1073,7 @@ impl<P: Platform> Kernel<P> {
         if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
             return err(errno::EINVAL);
         }
-        let Some(r) = registry() else { return err(errno::ENOMEM) };
+        let Some(r) = make_registry() else { return err(errno::ENOMEM) };
         let uid = self.creds.uid;
         let me = crate::sysvipc::me();
         static N: AtomicU32 = AtomicU32::new(0);
@@ -979,10 +1267,31 @@ impl<P: Platform> Kernel<P> {
 /// `IN_MODIFY`), after file call `nr` returned `r`.
 pub fn after_io(nr: u64, a: &[u64; 6], r: i64) {
     use fwe_abi::nr as n;
-    if r <= 0 && !matches!(nr, n::FTRUNCATE | n::FALLOCATE) || r < 0 || !watching() {
+    let io = matches!(
+        nr,
+        n::READ
+            | n::READV
+            | n::PREAD64
+            | n::PREADV
+            | n::PREADV2
+            | n::WRITE
+            | n::WRITEV
+            | n::PWRITE64
+            | n::PWRITEV
+            | n::PWRITEV2
+            | n::FTRUNCATE
+            | n::FALLOCATE
+            | n::SENDFILE
+            | n::SPLICE
+            | n::COPY_FILE_RANGE
+            | n::GETDENTS64
+    );
+    let any = matches!(nr, n::FTRUNCATE | n::FALLOCATE | n::GETDENTS64);
+    if !io || r < 0 || (r == 0 && !any) || !watching() {
         return;
     }
     let (fd, mask) = match nr {
+        n::GETDENTS64 => (a[0], IN_ACCESS),
         n::READ | n::READV | n::PREAD64 | n::PREADV | n::PREADV2 => (a[0], IN_ACCESS),
         n::WRITE
         | n::WRITEV

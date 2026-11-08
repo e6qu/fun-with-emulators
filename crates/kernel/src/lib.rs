@@ -570,6 +570,8 @@ impl<P: Platform> Kernel<P> {
         // The message queues' descriptors the exec closes: their
         // registrations go now, as Linux removes them as it closes them.
         mqueue::exec_closing(&self.creds);
+        // Its inotify instances and open files the exec closes, likewise.
+        inotify::exec_closing();
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -1177,7 +1179,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Some(r) = nsfd::io(nr, &a) {
         return Some(r);
     }
-    if let Some(r) = inotify::refuse_write(nr, &a) {
+    if let Some(r) = inotify::io(nr, &a) {
         return Some(r);
     }
     if nr == n::OPENAT {
