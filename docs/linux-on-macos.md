@@ -36,11 +36,12 @@ This document explains how that works, in two directions:
   signal, a key stroke, a child ending, a file changing, a clock firing, an
   error) and what the guest sees of it.
 
-Before those two parts come five sections on how a program gets to run at
-all: which backend a binary gets and why, which binaries need the least
-translation (with examples of real software in each category), how
-common languages and runtimes fare, which instructions the native backend
-rewrites, and how the VM backend uses the hypervisor.
+Before those two parts, an overview of the two kernels and five sections
+on how a program gets to run at all: which backend a binary gets and why,
+which binaries need the least translation (with examples of real software
+in each category), how common languages and runtimes fare, which
+instructions the native backend rewrites, and how the VM backend uses the
+hypervisor.
 
 How fwe's own parts are built is in [architecture.md](architecture.md);
 where fwe still differs from Linux is in its
@@ -140,7 +141,7 @@ sums up where they differ, and the next sections explain each row.
 | Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB |
 | Guest code | in the `fwe` process, on the CPU, after rewriting | at EL0 in a Hypervisor.framework VM, unmodified |
 | Page size the guest sees | 16 KiB (the host's) | 4 KiB (Linux's usual) |
-| Guest addresses | host addresses | host addresses, except ranges the guest placed outside fwe's slab, which are translated |
+| Guest addresses | host addresses | host addresses, except fixed-address ranges outside the memory fwe set aside for the VM (the *slab*), such as a low-linked image, which are translated |
 | System calls go to | the kernel crate | the same kernel crate |
 | Host signals reach the guest | handler rewrites the interrupted guest context | handler stops the vCPU, the run loop delivers |
 
@@ -151,8 +152,8 @@ sums up where they differ, and the next sections explain each row.
 On Linux, an arm64 process owns its whole lower address space. A program
 that is not position-independent (an `ET_EXEC` ELF file) was linked to run
 at one fixed address and carries no relocations that would let it run
-anywhere else; the usual toolchains put it at `0x400000`, just above 4 MiB,
-and Go puts static programs at `0x10000`.
+anywhere else; the usual toolchains put it at `0x400000` (4 MiB), and Go
+puts static programs at `0x10000` (64 KiB).
 
 macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO` at address
 0: nothing can be mapped below 4 GiB, and Apple's loader refuses a smaller
@@ -216,12 +217,12 @@ native backend their code is rewritten as it is mapped executable.
 ### Across execve
 
 A program can `execve` a program of the other kind: a shell in the VM can
-run a native `ls`, and a native `make` can run a low-linked `gcc`. When a
-native process execs a program that needs the VM, or when the caller is
-itself in the VM, fwe re-executes itself on the new program: the host
-process image is replaced by a fresh `fwe`, which makes the same decision
-again for the new program. A native process execing another native
-program, with no other threads, replaces its program in place. What
+run a native `ls`, and a native `make` can run a low-linked `gcc`. When
+the new program needs the VM, when the caller is itself in the VM, or when
+the caller has other live threads, fwe re-executes itself on the new
+program: the host process image is replaced by a fresh `fwe`, which makes
+the same decision again for the new program. A single-threaded native
+process execing another native program replaces its program in place. What
 crosses an `execve` either way is under [execve](#execve).
 
 ## Which binaries need the least translation
@@ -242,9 +243,9 @@ stay as they are:
   program and its libraries map is scanned once, word by word, when it is
   mapped executable. A static program has one image to scan; a dynamic one
   also has its dynamic linker and every library it maps. Under `--strace`
-  fwe notes each image it prepared, with what it found, as
+  fwe notes what it found in the program and its dynamic linker as
   `prepared exe <addr>+<len>: N system calls, M stubs, K x18 uses left
-  unrewritten` (and `interp` for the dynamic linker).
+  unrewritten` (`interp` for the dynamic linker).
 - **`svc #0` costs nothing extra to rewrite**: it is replaced in place by
   one `brk` word, no stub. It does cost a trap each time it runs, which is
   the system call's own cost.
@@ -377,8 +378,8 @@ A musl program names `/lib/ld-musl-aarch64.so.1`, which is musl's C
 library and dynamic linker in one; static musl programs have no
 interpreter at all. Both run natively when position-independent, as all
 of Alpine's are (tested: Alpine's root filesystem, busybox and the
-container engines). musl makes the same system calls glibc does for the
-same work, through the same `svc #0`.
+container engines). musl enters the kernel through the same `svc #0` as
+glibc, so fwe treats the two alike.
 
 ### Rust
 
@@ -397,7 +398,7 @@ uses threads and futexes through libc, both covered.
 
 Go does not use the C library: its runtime makes system calls itself with
 `svc #0`, starts its own threads with `clone`, parks them on futexes,
-installs a handler for every signal on an alternate stack, and preempts
+installs a handler for nearly every signal on an alternate stack, and preempts
 long-running goroutines by sending the thread running them `SIGURG` with
 `tgkill`. fwe meets each of these the same way as for C: the `svc`s are
 rewritten (native) or trapped (VM), `clone` makes a host thread (with its
@@ -447,16 +448,17 @@ generally built and from fwe's mechanisms, not observed:
   (HotSpot treats `x18` as reserved only on platforms that reserve it,
   which Linux does not), those uses are not rewritten and would lose their
   value whenever macOS clears `x18`; this is the largest risk natively.
-  In the VM, generated code runs as it is, but a JVM is a PIE and fwe
-  does not put PIEs in the VM.
+  In the VM, generated code would run as it is, but a PIE `java`
+  launcher never goes to the VM.
 - **Safepoints and null checks:** HotSpot relies on `SIGSEGV` from
   deliberately protected pages. fwe delivers a guest fault to the guest's
   handler with Linux's frame, and turns the `SIGBUS` macOS reports for
   some protection faults into the `SIGSEGV` Linux sends
   ([Faults in guest code](#faults-in-guest-code)).
 - **Threads and memory sizing:** many threads with futexes are supported.
-  The JVM sizes its heap from `/proc/meminfo` and cgroup limits, which
-  under fwe are fixed figures and unenforced limits
+  The JVM sizes its heap from the machine's memory (`sysinfo`,
+  `/proc/meminfo`) and cgroup limits, which under fwe are fixed figures and
+  unenforced limits
   ([Memory pressure](#memory-pressure), [cgroups](#cgroups)).
 - **Tools:** debugging and attach mechanisms that use `ptrace` or
   `process_vm_readv` fail with `ENOSYS` ([Not available](#not-available)).
@@ -464,32 +466,36 @@ generally built and from fwe's mechanisms, not observed:
 ### Wine
 
 Not tested by fwe. This is an analysis of how Wine for Linux would meet
-fwe's mechanisms, not a claim that it works.
+fwe's mechanisms, from how Wine is generally built, not a claim that it
+works.
 
 - **Which Wine:** fwe runs only arm64 Linux code, so it would have to be
-  an arm64 build of Wine. That runs Windows programs built for ARM64.
+  an arm64 build of Wine, which runs Windows programs built for ARM64.
   Running x86 or x64 Windows programs would additionally need an x86
-  emulator inside the arm64 process (Wine on arm64 provides for one
-  through its WoW64 and ARM64EC support, with emulators such as FEX), or
-  an x86 Wine under an x86-to-arm64 emulator such as box64; fwe adds no
-  x86 emulation of its own.
-- **Backend:** Wine's Linux builds start Windows programs through
-  `wine-preloader`, a static non-PIE executable linked at a fixed low
-  address, which reserves
-  the low address ranges Windows programs expect (with `MAP_FIXED`
-  mappings) before it loads the dynamic linker and Wine itself. Linked
-  low, it would run in the VM, the only backend that can give a program
-  memory below 4 GiB: there a fixed mapping anywhere below fwe's code page
-  near 1 TiB is backed by slab memory and translated, and a fixed mapping
-  above that fails with `ENOMEM`. Each reservation takes slab space,
-  which is 7/16 of the guest-physical space the host offers (28 GiB on an
-  M1 or M2). The VM also gives the 4 KiB pages Windows memory management
-  assumes; natively the guest's pages are 16 KiB.
+  emulator inside the arm64 process (Wine on arm64 can load one, such as
+  FEX, through its WoW64 and ARM64EC support), or an x64 Wine run under an
+  x86-to-arm64 emulator such as box64; fwe adds no x86 emulation of its
+  own.
+- **Pages:** Wine assumes Windows' 4 KiB pages (Asahi Linux, whose kernel
+  uses 16 KiB pages, runs Wine and x86 emulation in a 4 KiB-page VM).
+  Natively the guest's pages are 16 KiB; in the VM they are 4 KiB.
+- **Backend:** Wine's Linux builds have traditionally started Windows
+  programs through `wine-preloader`, a static non-PIE executable linked at
+  a fixed low address, which reserves the low address ranges Windows
+  programs expect (with `MAP_FIXED` mappings) before it loads the dynamic
+  linker and Wine itself. Linked low, it would run in the VM, the only
+  backend that can give a program memory below 4 GiB. There a fixed
+  mapping that ends below fwe's code page near 1 TiB is accepted, backed
+  by slab memory (and translated when it lies outside the slab), and one
+  beyond it fails with `ENOMEM`. Each reservation, even `PROT_NONE`, takes
+  its size out of the slab, which is 7/16 of the guest-physical space the
+  host offers (28 GiB on an M1 or M2).
 - **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`, which
   Wine's arm64 build follows. In the VM `x18` is the guest's own and
-  survives; natively, code using it would go through stubs, and Windows
-  code Wine maps and makes executable would have its `x18` uses left
-  unrewritten. Another reason it belongs in the VM.
+  survives. Natively, ELF code using it would go through stubs, and Windows
+  code Wine writes into memory and then makes executable would be treated
+  as JIT code, its `x18` uses left unrewritten. Another reason it belongs
+  in the VM.
 - **wineserver:** a separate process the Wine processes talk to over Unix
   sockets, passing descriptors with `SCM_RIGHTS` (supported; received
   descriptors are not held to `RLIMIT_NOFILE`), sharing memory through
@@ -498,13 +504,13 @@ fwe's mechanisms, not a claim that it works.
   uses ordinary signals for this, which fwe relays).
 - **Signals:** Wine handles `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGTRAP`
   on an alternate stack to emulate Windows exceptions; fwe delivers
-  faults to guest handlers with Linux frames, honours `sigaltstack`, and
-  in the VM reports alignment faults as `SIGBUS` and `brk` as `SIGTRAP`.
+  faults to guest handlers with Linux frames and honours `sigaltstack`; in
+  the VM a misaligned pc or sp is `SIGBUS` and a `brk` is `SIGTRAP`.
 - **What would block parts of it:** there is no `ptrace`, no
-  `process_vm_readv`/`writev` and no `/proc/<pid>/mem` of another process
-  under fwe, so whatever Wine implements with them (reading or writing
-  another process's memory, debugging) would fail. Whether that blocks
-  ordinary programs is unknown.
+  `process_vm_readv`/`writev` and no `/proc/<pid>/mem` under fwe, so
+  whatever Wine implements with them (reading or writing another
+  process's memory, debugging) would fail. Whether that blocks ordinary
+  programs is unknown.
 
 ## Which instructions get translated, and how
 
@@ -1321,18 +1327,14 @@ path and is then `execve`.
 
 #### The ELF loader and dynamic linker
 
-Linux's kernel loads the program and its dynamic linker; fwe's loader does
-the same job:
-
-- The loader (`crates/native/src/loader.rs`, the VM's in `hv/backend.rs`)
-  maps each `PT_LOAD` segment, a PIE at a base it picks, code first
-  writable so the native backend can rewrite it.
-- A `PT_INTERP` (`/lib/ld-linux-aarch64.so.1`, `/lib/ld-musl-aarch64.so.1`)
-  is resolved in the guest's root and loaded too; the guest starts at its
-  entry with `AT_BASE` and `AT_ENTRY` set as Linux sets them.
-- The dynamic linker then works as on Linux: it maps libraries through
-  fwe's `openat` and `mmap`, relocates and sets the thread pointer. Real
-  glibc and musl run unmodified.
+Linux's kernel loads the program and its dynamic linker; fwe's loader
+(`crates/native/src/loader.rs`, the VM's in `hv/backend.rs`) does the same
+job. It maps each `PT_LOAD` segment, a PIE at a base it picks, code first
+writable so the native backend can rewrite it, then loads the dynamic
+linker and starts there, as described under
+[The dynamic linker](#the-dynamic-linker). From then on real glibc and
+musl run unmodified: the dynamic linker maps libraries through fwe's
+`openat` and `mmap`, relocates them and sets the thread pointer.
 
 #### wait
 
