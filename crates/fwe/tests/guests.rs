@@ -2764,7 +2764,8 @@ const CALLS: &str = "splice: 5, offset 7, position 10\n\
     child's policy: 2\n\
     clock: read 0, set refused true\n\
     pipe's filesystem: 0, pipefs true; statx reserved bit refused true\n\
-    working directory renamed: followed true\n";
+    working directory renamed: followed true\n\
+    a /proc link's O_PATH descriptor: a link true, reads it true; unknown fstatat flag refused true\n";
 
 /// Data moved through pipes (`splice` from a file's offset, `tee`,
 /// `vmsplice`), the personality, a scheduling policy a fork child

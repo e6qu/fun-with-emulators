@@ -80,6 +80,11 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(target) if follow && target.starts_with(b"/") => {
                     self.mount_path(&target, true)
                 }
+                // A descriptor of a link (not mounted on: Linux follows no
+                // magic link to a link).
+                Entry::Fd { fd, .. } if follow && crate::fdmarks::proc_link(fd).is_some() => {
+                    Err(errno::ENOENT)
+                }
                 Entry::Fd { fd, .. } if follow => {
                     // The file itself, where it was opened.
                     let ns = self.fs().fd_ns_path(fd).ok_or(errno::EINVAL)?;
@@ -387,7 +392,11 @@ impl<P: Platform> Kernel<P> {
             Some(c) => c == id,
             None => under(&fs.to_ns(fs.cwd()), &m.point).is_some(),
         };
-        if cwd_in || (fs.proc_root() != b"/" && under(fs.proc_root(), &m.point).is_some()) {
+        let root_in = match fs.root_mount().filter(|r| table.get(*r).is_some()) {
+            Some(r) => r == id,
+            None => fs.proc_root() != b"/" && under(fs.proc_root(), &m.point).is_some(),
+        };
+        if cwd_in || root_in {
             return true;
         }
         // A file opened through it here.
@@ -483,16 +492,22 @@ impl<P: Platform> Kernel<P> {
         };
         let fs = self.fs.as_mut().expect("filesystem configured");
         let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
+        let root_mount = fs.mounts().locate(&root).0.id;
         fs.set_root(root, cwd);
+        fs.set_mounts(root_mount, 0);
         0
     }
 
     /// `chroot(path)`.
     pub(crate) fn sys_chroot(&mut self, path: u64) -> i64 {
-        if !self.creds.has_chroot() {
-            return err(errno::EPERM);
-        }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if !self.creds.has_chroot() {
+            // Linux looks the directory up, and checks it may be entered,
+            // before the privilege.
+            const X_OK: u64 = 1;
+            let r = self.access_path(fwe_abi::fcntl::AT_FDCWD as i32, &path, X_OK, true, true);
+            return if r < 0 { r } else { err(errno::EPERM) };
+        }
         let (ns, is_dir) = match self.mount_path(&path, true) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -507,7 +522,10 @@ impl<P: Platform> Kernel<P> {
         let cwd = crate::mounts::under(&cwd_ns, &ns)
             .map(|r| crate::mounts::join(b"/", r))
             .unwrap_or_else(|| b"/".to_vec());
+        let root_mount = fs.mounts().locate(&ns).0.id;
+        let cwd_mount = fs.cwd_mount().unwrap_or(0);
         fs.set_root(ns, cwd);
+        fs.set_mounts(root_mount, cwd_mount);
         0
     }
 }

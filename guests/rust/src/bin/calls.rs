@@ -158,6 +158,26 @@ fn main() {
         std::env::set_current_dir("/").unwrap();
         std::fs::remove_dir_all(&moved).unwrap();
 
+        // An `O_PATH | O_NOFOLLOW` descriptor of a `/proc` link names the
+        // link: it stats and reads as one. And `fstatat` refuses a flag it
+        // does not know.
+        const O_PATH: i32 = 0o10000000;
+        const O_NOFOLLOW: i32 = 0o100000;
+        let link = open(c"/proc/self/exe".as_ptr(), O_PATH | O_NOFOLLOW);
+        let mut st = [0u8; 128];
+        syscall(80, link, st.as_mut_ptr());
+        let mode = u32::from_ne_bytes(st[16..20].try_into().unwrap());
+        let mut buf = [0u8; 256];
+        let n = syscall(78, link, c"".as_ptr(), buf.as_mut_ptr(), buf.len());
+        let target = std::fs::read_link("/proc/self/exe").unwrap();
+        let reads = n > 0 && buf[..n as usize] == *target.as_os_str().as_encoded_bytes();
+        close(link);
+        let bad = res(syscall(79, -100i64, c"/".as_ptr(), st.as_mut_ptr(), 9999)) == -(EINVAL as i64);
+        println!(
+            "a /proc link's O_PATH descriptor: a link {}, reads it {reads}; unknown fstatat flag refused {bad}",
+            mode & 0o170000 == 0o120000
+        );
+
         for fd in [a[0], a[1], b[0], b[1], file] {
             close(fd);
         }

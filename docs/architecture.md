@@ -927,7 +927,10 @@ a reader or writer of it: like one of a device or socket the host cannot
 open, or of a symbolic link itself (`O_NOFOLLOW`), it is a stand-in that
 names the file, whose `fstat`, `readlinkat`, `faccessat2`, `utimensat` and
 fdinfo are the file's and through whose `/proc/self/fd` link the file is
-opened again.
+opened again. One of a link of fwe's `/proc` or `/sys` names that link: it
+stats and reads as the link, its own `/proc/self/fd` link reads the link's
+path, and nothing is mounted through it (`ENOENT`, as Linux follows no
+magic link to a link).
 
 ## Terminals and job control
 
@@ -1272,9 +1275,7 @@ of these are to be lifted for 1.0 and which are not planned.
   `F_SEAL_WRITE` succeeds although a writable shared mapping exists
   (Linux fails it with `EBUSY`), does not reach the descriptors another
   process holds, and gives the file a new inode number. A memfd reopened
-  through `/proc/self/fd` shares the original's offset. An `O_PATH |
-  O_NOFOLLOW` open of a link in `/proc` or `/sys` fails with `ELOOP`
-  (Linux gives a descriptor of the link). `tee` needs the process to hold
+  through `/proc/self/fd` shares the original's offset. `tee` needs the process to hold
   a write end of its input pipe (`EINVAL` otherwise). `splice` from a pipe
   takes only what it writes when the process holds a write end of that
   pipe; otherwise a write to a file or a waiting socket that a signal or an

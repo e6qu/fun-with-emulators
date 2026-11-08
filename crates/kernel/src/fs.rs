@@ -263,6 +263,9 @@ pub struct Fs {
     /// The mount it was entered through (0 when not known), which it stays
     /// in when another is mounted over it, as on Linux.
     cwd_mount: u32,
+    /// The mount the root was set in (0 when not known), which it stays in
+    /// when another is mounted over it.
+    root_mount: u32,
     umask: u32,
     proc: crate::procfs::ProcInfo,
     /// The process's other namespaces.
@@ -277,6 +280,7 @@ impl Fs {
         e.i32(self.root.as_raw_fd());
         e.bytes(&self.cwd);
         e.u32(self.cwd_mount);
+        e.u32(self.root_mount);
         e.bytes(&self.root_host);
         e.bytes(self.mnt.dir());
         e.u64(self.mnt.id());
@@ -301,6 +305,7 @@ impl Fs {
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
         let cwd = d.bytes();
         let cwd_mount = d.u32();
+        let root_mount = d.u32();
         let root_host = d.bytes();
         let (dir, id) = (d.bytes(), d.u64());
         let mnt = match Ns::join(&dir, id) {
@@ -315,6 +320,7 @@ impl Fs {
             root,
             cwd,
             cwd_mount,
+            root_mount,
             root_host,
             mnt,
             proc_root: d.bytes(),
@@ -395,6 +401,7 @@ impl Fs {
             root,
             cwd: b"/".to_vec(),
             cwd_mount: 0,
+            root_mount: 0,
             root_host,
             mnt,
             proc_root: b"/".to_vec(),
@@ -537,13 +544,24 @@ impl Fs {
     pub fn set_root(&mut self, root: Vec<u8>, cwd: Vec<u8>) {
         self.proc_root = root;
         self.cwd = cwd;
-        self.cwd_mount = 0;
         self.republish();
+    }
+
+    /// The mounts the root and the working directory are in now (0: not
+    /// known), as `chroot`, `pivot_root` and `setns` leave them.
+    pub fn set_mounts(&mut self, root: u32, cwd: u32) {
+        self.root_mount = root;
+        self.cwd_mount = cwd;
     }
 
     /// The mount the working directory is in, if fwe knows it.
     pub fn cwd_mount(&self) -> Option<u32> {
         (self.cwd_mount != 0).then_some(self.cwd_mount)
+    }
+
+    /// The mount the root is in, if fwe knows it.
+    pub fn root_mount(&self) -> Option<u32> {
+        (self.root_mount != 0).then_some(self.root_mount)
     }
 
     /// The namespace path of `path`, an absolute guest path.
@@ -778,6 +796,10 @@ impl Fs {
         }
         if let Some(t) = crate::nsfd::target(fd) {
             return t;
+        }
+        // A descriptor of a `/proc` link: the link's path.
+        if let Some(link) = crate::fdmarks::proc_link(fd).and_then(|ns| self.from_ns(&ns)) {
+            return link;
         }
         if crate::inotify::instance_of(fd).is_some() {
             return b"anon_inode:inotify".to_vec();

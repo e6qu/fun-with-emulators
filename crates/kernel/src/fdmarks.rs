@@ -81,6 +81,9 @@ pub enum Mark {
     Ns(u32),
     /// An inotify instance, by its number ([`crate::inotify`]).
     Inotify(u32),
+    /// An `O_PATH | O_NOFOLLOW` descriptor of a link of fwe's `/proc` (a
+    /// stand-in, its origin's path the link's), which names the link.
+    ProcLink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,7 +308,16 @@ pub fn origin(fd: i32) -> Option<Origin> {
 
 /// Whether `fd` is an `O_PATH` descriptor (a detached mount's is one).
 pub fn is_path(fd: i32) -> bool {
-    any_marks() && matches!(marked(fd), Some(Mark::Path | Mark::Detached(_)))
+    any_marks() && matches!(marked(fd), Some(Mark::Path | Mark::Detached(_) | Mark::ProcLink))
+}
+
+/// The namespace path of the `/proc` link `fd` names, if it is an
+/// `O_PATH | O_NOFOLLOW` descriptor of one ([`Mark::ProcLink`]).
+pub fn proc_link(fd: i32) -> Option<Vec<u8>> {
+    if !any_marks() || marked(fd) != Some(Mark::ProcLink) {
+        return None;
+    }
+    origin(fd).map(|o| o.ns_path)
 }
 
 /// What `fd` stands in for, if anything.
@@ -403,6 +415,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Detached(_)) => 14,
             Some(Mark::Ns(_)) => 15,
             Some(Mark::Inotify(_)) => 16,
+            Some(Mark::ProcLink) => 17,
         });
         if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
             rec.mark
@@ -474,6 +487,7 @@ pub fn load(d: &mut Dec) {
             14 => Some(Mark::Detached(d.u32())),
             15 => Some(Mark::Ns(d.u32())),
             16 => Some(Mark::Inotify(d.u32())),
+            17 => Some(Mark::ProcLink),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

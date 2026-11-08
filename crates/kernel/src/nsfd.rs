@@ -373,6 +373,7 @@ impl<P: Platform> Kernel<P> {
                 fs.set_mount_ns(Arc::new(ns));
                 // At the namespace's root, as Linux leaves the caller.
                 fs.set_root(b"/".to_vec(), b"/".to_vec());
+                fs.set_mounts(0, 0);
             }
         }
         Ok(())

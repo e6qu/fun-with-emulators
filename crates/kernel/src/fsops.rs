@@ -212,8 +212,9 @@ impl<P: Platform> Kernel<P> {
         let r = self.open_path(dirfd, path, flags, mode);
         crate::fs::drop_fifo();
         // An `O_PATH` descriptor, whatever kind of file it names (one of
-        // `/proc` or `/sys` too), is open for nothing but naming it.
-        if r >= 0 && flags & fcntl::O_PATH != 0 {
+        // `/proc` or `/sys` too), is open for nothing but naming it (one of
+        // a `/proc` link is marked as that already).
+        if r >= 0 && flags & fcntl::O_PATH != 0 && crate::fdmarks::proc_link(r as i32).is_none() {
             crate::fdmarks::mark(r as i32, crate::fdmarks::Mark::Path);
         }
         r
@@ -294,13 +295,13 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::procfs::Entry::Symlink(target) if namespace_inode(&target).is_some() => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
-                        return err(errno::ELOOP);
+                        return self.open_proc_link(dirfd as i32, &path, flags);
                     }
                     self.open_ns_path(dirfd as i32, &path, &target, flags)
                 }
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
-                        return err(errno::ELOOP);
+                        return self.open_proc_link(dirfd as i32, &path, flags);
                     }
                     // Follow the link, from the directory it is in.
                     let target = self.fs().link_target(dirfd as i32, &path, &target);
@@ -308,7 +309,11 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::procfs::Entry::Fd { fd, target } => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
-                        return err(errno::ELOOP);
+                        return self.open_proc_link(dirfd as i32, &path, flags);
+                    }
+                    // A descriptor of a link: followed, a link again.
+                    if crate::fdmarks::proc_link(fd).is_some() {
+                        return self.open_proc_link(dirfd as i32, &path, flags);
                     }
                     if crate::fs::has_path(fd, &target) {
                         // Reopen the file, as Linux does: the same one, in
@@ -624,16 +629,24 @@ impl<P: Platform> Kernel<P> {
             path = b".".to_vec();
         }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        if self.fs().synthetic(dirfd as i32, &path).is_some() {
-            return self.access_synthetic(
-                dirfd as i32,
-                &path,
-                mode,
-                follow,
-                flags & fcntl::AT_EACCESS != 0,
-            );
+        self.access_path(dirfd as i32, &path, mode, follow, flags & fcntl::AT_EACCESS != 0)
+    }
+
+    /// Whether `path` (from `dirfd`; followed if `follow`) allows the access
+    /// `mode` asks (`R_OK`, `W_OK`, `X_OK`): 0, or the error, as `faccessat`
+    /// (with `eaccess`, `AT_EACCESS`) reports it.
+    pub(crate) fn access_path(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        mode: u64,
+        follow: bool,
+        eaccess: bool,
+    ) -> i64 {
+        if self.fs().synthetic(dirfd, path).is_some() {
+            return self.access_synthetic(dirfd, path, mode, follow, eaccess);
         }
-        let r = match self.fs().resolve(dirfd as i32, &path, follow) {
+        let r = match self.fs().resolve(dirfd, path, follow) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -853,6 +866,17 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_newfstatat(&mut self, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
+        // The flags Linux's `vfs_statx` takes; any other is refused.
+        const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+        if flags
+            & !(fcntl::AT_SYMLINK_NOFOLLOW
+                | fcntl::AT_NO_AUTOMOUNT
+                | fcntl::AT_EMPTY_PATH
+                | AT_STATX_SYNC_TYPE)
+            != 0
+        {
+            return err(errno::EINVAL);
+        }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
             return self.sys_fstat(dirfd, buf);
@@ -912,7 +936,45 @@ impl<P: Platform> Kernel<P> {
         Ok(as_node(stat_to_linux(&s), node))
     }
 
+    /// `open` with `O_NOFOLLOW` of the link of fwe's `/proc` at `path`:
+    /// with `O_PATH`, a stand-in descriptor that names the link
+    /// ([`crate::fdmarks::Mark::ProcLink`]); else `ELOOP`, as for any link.
+    fn open_proc_link(&self, dirfd: i32, path: &[u8], flags: u64) -> i64 {
+        if flags & fcntl::O_PATH == 0 {
+            return err(errno::ELOOP);
+        }
+        let Some(absolute) = self.fs().absolute_path(dirfd, path) else {
+            return err(errno::ENOENT);
+        };
+        let ns = self.fs().to_ns(&absolute);
+        let (m, _) = self.fs().mount_of(&absolute);
+        let cloexec = if flags & fcntl::O_CLOEXEC != 0 { libc::O_CLOEXEC } else { 0 };
+        // SAFETY: a constant NUL-terminated path.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | cloexec) };
+        if fd < 0 {
+            return last_error();
+        }
+        crate::fdmarks::opened(fd, ns, m.id, m.flags, m.fstype, None);
+        crate::fdmarks::mark(fd, crate::fdmarks::Mark::ProcLink);
+        fd as i64
+    }
+
+    /// The guest path of the `/proc` link `fd` names, if it is a descriptor
+    /// of one ([`Self::open_proc_link`]).
+    fn proc_link_path(&self, fd: i32) -> Option<Vec<u8>> {
+        crate::fdmarks::proc_link(fd).and_then(|ns| self.fs().from_ns(&ns))
+    }
+
     pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
+        if let Some(link) = self.proc_link_path(fd as i32) {
+            return match self.linux_stat(fcntl::AT_FDCWD as i32, &link, false, 0) {
+                Ok(st) => {
+                    guest!(uaccess::write(buf, st));
+                    0
+                }
+                Err(e) => err(e),
+            };
+        }
         if let Some(n) = crate::nsfd::of(fd as i32) {
             guest!(uaccess::write(buf, ns_stat(n.id)));
             return 0;
@@ -1048,6 +1110,21 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if path.is_empty()
+            && let Some(link) = self.proc_link_path(dirfd as i32)
+        {
+            // A link of fwe's `/proc`: what it says now.
+            return match self.fs().synthetic(fcntl::AT_FDCWD as i32, &link) {
+                Some(
+                    crate::procfs::Entry::Symlink(target) | crate::procfs::Entry::Fd { target, .. },
+                ) => {
+                    let n = target.len().min(size as usize);
+                    guest!(uaccess::write_from(buf, &target[..n]));
+                    n as i64
+                }
+                _ => err(errno::ENOENT),
+            };
+        }
         if path.is_empty() {
             // The symbolic link an O_PATH | O_NOFOLLOW descriptor names (a
             // stand-in); any other descriptor has no link to read.
