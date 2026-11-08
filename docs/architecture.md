@@ -1453,8 +1453,7 @@ of these are to be lifted for 1.0 and which are not planned.
 - **Keys:** `request_key` runs no `/sbin/request-key` helper even when the
   root has one, so a key it would construct is negative and
   `KEYCTL_INSTANTIATE`, `NEGATE`, `REJECT` and `ASSUME_AUTHORITY` have no
-  authorisation key to act under; a keyring joined by name is found in
-  any user namespace, not only the caller's.
+  authorisation key to act under.
 - **Not implemented:**
   - `ptrace`;
   - `fanotify`;

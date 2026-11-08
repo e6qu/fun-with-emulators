@@ -95,6 +95,9 @@ pub struct Key {
     pub restrict: Restrict,
     /// Bytes charged to the owner's quota.
     pub quota: u32,
+    /// The user namespace it was made in (its record's directory; empty
+    /// for the initial one), where a keyring is found by name.
+    pub ns: Vec<u8>,
 }
 
 impl Key {
@@ -188,6 +191,7 @@ impl Data for Store {
                 }
             }
             e.u32(k.quota);
+            e.bytes(&k.ns);
         }
         e.u64(self.holders.len() as u64);
         for h in &self.holders {
@@ -228,6 +232,7 @@ impl Data for Store {
                 _ => Restrict::None,
             };
             let quota = d.u32();
+            let ns = d.bytes();
             let k = Key {
                 serial,
                 kind,
@@ -243,6 +248,7 @@ impl Data for Store {
                 links,
                 restrict,
                 quota,
+                ns,
             };
             s.keys.insert(serial, k);
         }
@@ -302,6 +308,8 @@ pub struct Caller {
     pub groups: Vec<u32>,
     pub admin: bool,
     pub setuid: bool,
+    /// The user namespace (its record's directory; empty: the initial one).
+    pub userns: Vec<u8>,
 }
 
 /// This process's identity: host pid and start time.
@@ -405,6 +413,7 @@ impl Store {
                 links: Vec::new(),
                 restrict: Restrict::None,
                 quota,
+                ns: Vec::new(),
             },
         );
         Ok(serial)
@@ -412,7 +421,9 @@ impl Store {
 
     /// A new keyring for the caller, as the kernel makes one for a process.
     fn new_ring(&mut self, c: &Caller, desc: &[u8], perm: u32) -> Result<i32, i32> {
-        self.alloc("keyring", desc, c.uid, c.gid, perm, 0, Vec::new(), true)
+        let r = self.alloc("keyring", desc, c.uid, c.gid, perm, 0, Vec::new(), true)?;
+        self.keys.get_mut(&r).unwrap().ns = c.userns.clone();
+        Ok(r)
     }
 
     /// User `uid`'s keyrings, made if missing: the user keyring and the
@@ -607,7 +618,7 @@ impl Store {
                         k.is_keyring()
                             && k.desc == n
                             && k.flags & (UID_KEYRING | INVALIDATED | REVOKED) == 0
-                            && k.uid == c.uid
+                            && k.ns == c.userns
                     })
                     .find(|k| Self::granted(k, c, false) & KEY_SEARCH != 0)
                     .map(|k| k.serial);
@@ -959,6 +970,7 @@ impl<P: Platform> Kernel<P> {
             groups: c.groups.iter().filter_map(|g| crate::userns::from_ns(*g, true)).collect(),
             admin: c.has(crate::caps::CAP_SYS_ADMIN),
             setuid: c.has(crate::caps::CAP_SETUID),
+            userns: self.fs.as_ref().map_or_else(Vec::new, |f| f.ns.user_dir()),
         }
     }
 
@@ -1038,6 +1050,7 @@ impl<P: Platform> Kernel<P> {
                     perm |= KEY_WRITE << KEY_POS_SHIFT;
                 }
                 let key = s.alloc(&kind, &desc, c.uid, c.gid, perm, 0, prep.payload, false)?;
+                s.keys.get_mut(&key).unwrap().ns = c.userns.clone();
                 if let Err(e) = s.link(dest, key) {
                     s.keys.remove(&key);
                     return Err(e);
@@ -1903,6 +1916,7 @@ mod tests {
             groups: vec![1000],
             admin: false,
             setuid: false,
+            userns: Vec::new(),
         }
     }
 
