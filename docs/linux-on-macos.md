@@ -467,9 +467,10 @@ generally built and from fwe's mechanisms, not observed:
 
 ### Wine
 
-Not tested by fwe. This is an analysis of how Wine for Linux would meet
-fwe's mechanisms, from how Wine is generally built, not a claim that it
-works.
+Not tested by fwe yet (it is on the
+[roadmap](../ROADMAP.md#m4--compatibility)). This is an analysis of how
+Wine for Linux would meet fwe's mechanisms, from how Wine is generally
+built, not a claim that it works.
 
 - **Which Wine:** fwe runs only arm64 Linux code, so it would have to be
   an arm64 build of Wine, which runs Windows programs built for ARM64.

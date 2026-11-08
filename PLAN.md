@@ -46,7 +46,8 @@ In scope:
 - the Linux userspace ABI on arm64: system calls, ELF loading, signals,
   `/proc`, `/sys`, `/dev`, ioctls, namespaces and cgroups;
 - distributions' userland (Debian, Alpine);
-- container engines and standard images.
+- container engines and standard images;
+- Wine, for ARM64 Windows console programs.
 
 Out of scope:
 - kernel modules and private kernel interfaces;
@@ -59,12 +60,14 @@ Out of scope:
 1.0 is reached when all of these hold, as M2, M4 and M5 of
 [ROADMAP.md](ROADMAP.md) define them:
 - the target programs (git, compilers, Node, Go, Rust, apt, a database, a
-  web server) and container engines (podman, containerd) run unmodified,
+  web server) and container engines (Docker, podman, containerd) run
+  unmodified, building and running images, rootless podman included,
   the VM's verified on real hardware;
 - every one of LTP's system-call tests passes, but those for what is not
   planned for 1.0 and those that fail or skip on Linux too with the same
   build (its C library's differences), each listed with the reason;
 - `strace` and `gdb` work on a guest program;
+- Wine runs ARM64 Windows console programs;
 - a signed release installs and runs them, with user documentation.
 
 What 1.0 leaves out is listed in the roadmap under "Not planned for 1.0".
