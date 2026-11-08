@@ -2,8 +2,10 @@
 
 How each part of fwe works, and where it still differs from Linux. How each
 Linux concept maps onto macOS (system calls, memory, processes, signals,
-namespaces and the rest) is in [linux-on-macos.md](linux-on-macos.md); the
-hypervisor backend is in [hypervisor.md](hypervisor.md).
+namespaces and the rest), and how host events (signals, key strokes,
+children ending, errors) reach the guest, is in
+[linux-on-macos.md](linux-on-macos.md); the hypervisor backend is in
+[hypervisor.md](hypervisor.md).
 
 ## Components
 
@@ -199,17 +201,12 @@ site no longer matches.
 
 ### Faults
 
-The native backend's fault handler (`crates/native/src/trap.rs`) tells
-apart:
-- a fault in fwe's checked copy routine: resumed at its recovery point;
-- a fetch from or write to write+exec guest memory, by the guest or by fwe
-  for it: the page switched and the access retried (see
-  [linux-on-macos.md](linux-on-macos.md#writeexec-memory));
-- `mrs` of `CTR_EL0` (`SIGILL`): emulated;
-- a fault signal another fwe process sent (it left a note): a signal for
-  the guest;
-- any other fault in guest code: the guest's signal; in fwe's own code:
-  fatal.
+The native backend's fault handlers (`on_fault` and `on_sigtrap` in
+`crates/native/src/trap.rs`) sort each host fault signal into a system
+call, an emulated instruction, a write+exec page switch, a recovered
+checked copy, a signal another process sent, a signal for the guest, or a
+fatal fault in fwe's own code; what each becomes for the guest is in
+[linux-on-macos.md](linux-on-macos.md#faults-in-guest-code).
 
 ## Memory bookkeeping
 
@@ -309,8 +306,10 @@ The fork, vfork, execve and wait models are drawn in
 
 ## Signals
 
-The model, numbers and relay are in
-[linux-on-macos.md](linux-on-macos.md#signals). Inside fwe
+The Linux side (numbers, dispositions, sending) is in
+[linux-on-macos.md](linux-on-macos.md#signals), and how a host signal
+reaches the guest in
+[linux-on-macos.md](linux-on-macos.md#host-signals). Inside fwe
 (`crates/kernel/src/signal.rs`, `thread.rs`, `signote.rs`):
 
 - **Pending sets** are atomics in host thread-locals (the host handler
@@ -336,9 +335,6 @@ The model, numbers and relay are in
 - **Before a re-exec,** the whole guest mask goes on the host, and signals
   fwe holds pending that the guest blocks are re-raised on the thread,
   which the host `execve` keeps.
-- **Synchronous faults** (`SIGSEGV`, `SIGBUS`, `SIGILL`) go to a handler at
-  the fault, or kill the process with that signal (after a register and
-  code dump under `--strace`).
 - **Frames:** an arm64 `rt_sigframe` with Linux's `ucontext`/`sigcontext`
   and an `fpsimd_context` record, on the guest stack or the alternate
   stack under `SA_ONSTACK` (a handler already on it continues from its
@@ -572,12 +568,12 @@ The model, numbers and relay are in
   `RTM_NEWLINK` needs `CAP_NET_ADMIN`.
 - DNS needs nothing special: the resolver reads `/etc/resolv.conf` and
   `/etc/hosts` from the rootfs.
-- Terminals: `termios` translation in `crates/kernel/src/term.rs`;
-  `TIOCGWINSZ`/`TIOCSWINSZ` pass through, `TIOCGPGRP`/`TIOCSPGRP` map to
-  `tcgetpgrp`/`tcsetpgrp`, `TIOCSCTTY`/`TIOCNOTTY` pass through; process
-  groups and sessions are the host's. A closed pty master keeps its number
-  mapped (`crates/kernel/src/pty.rs`), since another process may still hold
-  it.
+- Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
+  terminal requests in `Kernel::sys_ioctl`, ptys in
+  `crates/kernel/src/pty.rs` (what each maps to is in
+  [linux-on-macos.md](linux-on-macos.md#terminals-and-key-strokes)). A
+  closed pty master keeps its number mapped, since another process may
+  still hold it.
 
 ## Containers
 
@@ -690,9 +686,10 @@ are to be lifted for 1.0 and which are not planned.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
 - `clone3` has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid`
-  reports no `rusage`; a process a signal ends writes no core file and its
-  status never has the core-dump bit; a process killed by a real-time
-  signal exits with status 128 + the signal.
+  reports no `rusage`; a process a signal ends writes no Linux core file,
+  and its status has the core-dump bit only if macOS dumped a core of its
+  own; a process killed by a real-time signal exits with status 128 + the
+  signal.
 - A `CLONE_PARENT` child's parent is the caller's for `getppid`, `/proc`
   and adoption, but on the host it is the caller's child, which the
   caller's parent cannot `wait` for (nor gets `SIGCHLD` of) while the
@@ -844,6 +841,11 @@ are to be lifted for 1.0 and which are not planned.
   20 ms; a call rerun after an interruption the guest does not see starts
   its timeout over.
 - A fault signal sent by a process fwe did not start is taken as a fault.
+- Any `SIGINFO` from outside fwe ends the process as `SIGKILL` would, since
+  fwe relays a guest's `SIGKILL` as `SIGINFO`: a macOS terminal sends one
+  for Ctrl-T, its status key, in canonical mode. A guest's `TCSETS` sets
+  the terminal's macOS-only control characters (`VSTATUS`, `VDSUSP`) to 0,
+  which macOS reads as the NUL character, not as disabled.
 - A process-wide signal left at its default action and sent while every
   thread blocks it stays with the thread macOS parked it on rather than
   acting when another thread unblocks it (a caught one is handed on,

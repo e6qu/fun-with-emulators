@@ -70,17 +70,17 @@ Each document has one job; do not duplicate content across them.
 | [README.md](README.md) | What the project is, a short status, how to run and test it |
 | [PLAN.md](PLAN.md) | Goal, approach, scope, the 1.0 finish line, principles, how progress is measured |
 | [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 with "Done when" criteria, and what is not planned |
-| [docs/linux-on-macos.md](docs/linux-on-macos.md) | How each Linux concept maps onto macOS: what Linux does, what macOS has, what fwe does |
+| [docs/linux-on-macos.md](docs/linux-on-macos.md) | Linux to macOS: what Linux does, what macOS has, what fwe does; macOS to Linux: what happens on the host, what fwe does, what the guest sees |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
 
 A PR that changes behaviour updates them in the same PR: tick the roadmap
 item its tests prove, remove a lifted limitation from
-`docs/architecture.md` and the roadmap, update
-`docs/linux-on-macos.md` where how fwe maps a Linux feature changes, and
-keep module-level doc comments in the code consistent with what the code
-now does. Docs state what is true now: no history of how it got there.
+`docs/architecture.md` and the roadmap, update `docs/linux-on-macos.md`
+where how fwe maps a Linux feature, or passes a host event to the guest,
+changes, and keep module-level doc comments in the code consistent with
+what the code now does. Docs state what is true now: no history of how it got there.
 
 ## Conventions
 

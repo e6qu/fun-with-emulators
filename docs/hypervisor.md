@@ -48,8 +48,9 @@ The code is in `crates/native/src/hv/`.
 - **Pointer authentication and BTI**, where the vCPUs' ID registers offer
   them (see [linux-on-macos.md](linux-on-macos.md#cache-maintenance-pac-and-bti)).
 - **Signals:** dispositions are passed to the host as in the native
-  backend, and each vCPU thread runs under the host mask the guest's mask
-  calls for. The handler records the signal and stops the vCPU
+  backend (see
+  [linux-on-macos.md](linux-on-macos.md#host-signals)), and each vCPU
+  thread runs under the host mask the guest's mask calls for. The handler records the signal and stops the vCPU
   (`hv_vcpus_exit`), and the run loop delivers it, so a signal reaches a
   guest spinning without system calls. The framework's own threads are
   created with every guest signal blocked.

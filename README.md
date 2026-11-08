@@ -28,7 +28,7 @@ LTP's system-call tests pass at 877 of 1550 (75% of those that apply).
 |---|---|
 | [PLAN.md](PLAN.md) | Goal, approach, scope and the 1.0 finish line |
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
-| [docs/linux-on-macos.md](docs/linux-on-macos.md) | How each Linux concept (system calls, memory, processes, signals, namespaces, cgroups…) maps onto macOS |
+| [docs/linux-on-macos.md](docs/linux-on-macos.md) | How each Linux concept (system calls, memory, processes, signals, namespaces, cgroups…) maps onto macOS, and how host events (signals, key strokes, children ending, errors…) reach the guest |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
