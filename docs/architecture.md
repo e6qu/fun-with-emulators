@@ -1,13 +1,36 @@
 # Architecture
 
-How each part of fwe works, and where it still differs from Linux. How each
-Linux concept maps onto macOS (system calls, memory, processes, signals,
-namespaces and the rest), and how host events (signals, key strokes,
-children ending, errors) reach the guest, is in
-[linux-on-macos.md](linux-on-macos.md); the hypervisor backend is in
-[hypervisor.md](hypervisor.md).
+## Summary
+
+fwe is a Linux kernel written as an ordinary macOS program. Each guest
+process is one `fwe` process holding the guest's code and memory, a
+*backend* that runs the guest's code and catches its system calls, and the
+*kernel crate*, which carries out each call with macOS's own system calls
+and keeps whatever Linux state macOS has no place for. Two backends exist:
+the native one runs guest code inside the fwe process after rewriting a
+few instructions, and the hypervisor one runs it in a small VM. Both hand
+every system call to the same kernel crate.
+
+This document describes how those parts are built and how they work
+together: the crates and what each is for, the path a system call takes,
+each backend's own machinery, and then the kernel crate area by area —
+memory, processes, threads, signals, files, events, IPC, sockets and
+terminals, containers. It ends with the
+[known limitations](#known-limitations): where fwe still differs from
+Linux.
+
+What each Linux primitive becomes on macOS, and how host events (signals,
+key strokes, children ending, errors) reach the guest, is explained in
+[linux-on-macos.md](linux-on-macos.md); this document links there rather
+than repeating it. The hypervisor backend's own rules, testing and
+operation are in [hypervisor.md](hypervisor.md).
 
 ## Components
+
+fwe is a Cargo workspace of five crates. The `fwe` command hands the
+program to `crates/native`, which picks a backend for it; both backends lean on the kernel crate for every system
+call, and everything that knows Linux's numbers and layouts takes them
+from the ABI crate:
 
 ```mermaid
 flowchart TD
@@ -38,7 +61,8 @@ flowchart TD
   carrying out memory calls (`Platform::memory`).
 - The **native backend** runs guest code in-process after rewriting the
   instructions macOS cannot let a Linux process run unchanged. It carries
-  every position-independent binary.
+  every position-independent binary, and fixed-address ones linked at or
+  above 4 GiB.
 - The **hypervisor backend** runs the guest at EL0 in a
   Hypervisor.framework VM. fwe picks it automatically for a non-PIE
   executable linked below 4 GiB, which the native backend cannot map.
@@ -54,8 +78,13 @@ flowchart TD
 
 ## System calls
 
-The path from `svc` to the host is drawn in
-[linux-on-macos.md](linux-on-macos.md#system-call-entry). Inside fwe:
+A system call starts in a backend: the native backend's trap handler or
+the VM's run loop catches the guest's `svc`, reads the number and
+arguments from the guest's registers, and hands them to the kernel crate
+(the path from `svc` to the host is drawn in
+[linux-on-macos.md](linux-on-macos.md#system-call-entry)). Seccomp
+filters see the call first. Then the kernel crate either runs it under its
+lock or, for a call that may block, without it. Inside fwe:
 
 - **One kernel lock.** Most calls run under a single lock through
   `Kernel::enter_syscall`.
@@ -82,7 +111,9 @@ The path from `svc` to the host is drawn in
 
 ### Guest memory access
 
-Whatever the kernel reads or writes of guest memory goes through
+A system call's arguments are often pointers into guest memory, and a bad
+one must fail the call with `EFAULT` rather than crash fwe. Whatever the
+kernel reads or writes of guest memory goes through
 `crates/kernel/src/uaccess.rs` (typed values, strings, string arrays, byte
 ranges):
 
@@ -99,6 +130,8 @@ ranges):
 
 ### Tracing
 
+fwe can show what a guest asks of it, much as `strace` does on Linux:
+
 - `--strace` prints each call with its arguments (paths and names as
   strings) and result, and the backend's notes (what was loaded and
   prepared), to standard error.
@@ -112,12 +145,20 @@ ranges):
 
 ## Native backend
 
+The native backend (`crates/native`) runs guest code in the fwe process.
+Its parts are the loader, the code preparation that rewrites guest
+instructions, the trap handlers that turn host signals into system calls,
+signals and faults for the guest, and the machinery for threads and
+`fork`.
+
 ### Loading
 
 - The loader (`crates/native/src/loader.rs`) reserves the image's span (a
   PIE where the host picks), copies each `PT_LOAD` segment in, writable,
   rewrites its code (below) and then sets the final protections. Space for
-  code stubs is reserved right after the image, within branch range.
+  code stubs is reserved right after the image, within branch range. A
+  16 KiB host page shared by several segments gets the union of their
+  protections.
 - The break is reserved after the image and its stub space (up to 1 GiB,
   halved while something is in the way) before the dynamic linker is
   placed. The stack is 8 MiB with a guard page.
@@ -132,76 +173,40 @@ ranges):
 
 ### Rewriting guest code
 
-Before any guest code becomes executable (the loader's images, and every
-`mmap`/`mprotect` with `PROT_EXEC`), the native backend rewrites three
-kinds of instruction (`crates/native/src/rewrite.rs`). arm64 instructions
-are aligned 4-byte words, so scanning aligned words finds each one.
+Which instructions are rewritten, why, what they become, and which parts
+of a binary are scanned is explained in
+[linux-on-macos.md](linux-on-macos.md#which-instructions-get-translated-and-how).
+The pieces that do it:
 
-| Instruction | Becomes |
-|---|---|
-| `svc #0` | `brk #0x4c58` |
-| `mrs`/`msr` of `TPIDR_EL0` | a branch to a stub that reads or writes the guest thread pointer in a slot of the host thread's TSD (found through `TPIDRRO_EL0`) |
-| any instruction naming `x18` | a branch to a stub that keeps the guest's `x18` in another TSD slot |
+- `crates/native/src/rewrite.rs` scans a range word by word, rewrites
+  `svc #0` in place, and builds a stub for each thread-pointer or `x18`
+  site;
+- `crates/native/src/decode.rs` decodes the operands of an instruction
+  naming `x18`, so the stub can substitute a scratch register, adjust an
+  `sp` offset or rebuild a PC-relative or branch form;
+- `crates/native/src/prepare.rs` groups sites so that one stub region
+  reaches each group (a quarter of the branch range apart at most), takes
+  the region from the loader's arena or reserves one near the code, writes
+  the stubs, points each site at its stub and invalidates the instruction
+  cache;
+- the kernel crate asks for preparation through
+  `Platform::prepare_exec` whenever guest memory is to become executable
+  (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
+  passing the code ranges it knows from the file's sections and unwind
+  table; a failure is traced (see [Tracing](#tracing)).
 
-The `x18` stub saves two scratch registers below `sp` (Linux arm64 has no
-red zone), loads the slot into one, runs the instruction with `x18`
-replaced by it, writes the slot back if the instruction wrote `x18`,
-restores the scratch registers and branches back. macOS preserves every
-other register across preemption, so the scratch register is safe.
-
-`crates/native/src/decode.rs` covers:
-- every data-processing class (immediate, register, carry, logical,
-  bitfield, conditional, one- to three-source), floating-point and vector
-  element moves to and from general registers;
-- every general and SIMD load/store form, structure loads and stores,
-  exclusives, acquire/release and the LSE atomics;
-- PC-relative forms (`adr`, `adrp`, literal loads), materialised from the
-  original pc;
-- compare- and test-branches, through a full-range branch in the stub;
-- indirect branches through `x18`, via `x16`/`x17`;
-- code using `sp`: the stub pushes 32 bytes, so a spill of `x18` through
-  `sp` or `mov x18, sp` has its immediate adjusted, and where no immediate
-  can absorb the push a third scratch register stands in for the original
-  `sp`.
-
-Left alone, and counted per image under `--strace`: load/store writeback
-onto `sp`, writes to `sp`, `casp` and the pointer-authenticated loads.
-
-The trap handler keeps the slot and the kernel's register view in step: it
-reads the guest's `x18` into `Regs` and writes it back on return, so a
-signal frame carries the real value, `rt_sigreturn` restores it, and a
-cloned thread starts with its parent's. Correctness never depends on the
+The trap handler keeps the `x18` slot and the kernel's register view in
+step: it reads the guest's `x18` into `Regs` and writes it back on return,
+so a signal frame carries the real value, `rt_sigreturn` restores it, and
+a cloned thread starts with its parent's. Correctness never depends on the
 host preserving `x18`; macOS 26.4's custom-`x18` ABI is only probed
 (`fwe --host-info`), not used: switching it at every trap costs two host
 calls, and one of them could hang.
 
-**What is scanned.** A data word that happens to encode one of these
-instructions must not be patched:
-- only `SHF_EXECINSTR` sections are scanned (`Elf::exec_ranges`), so the
-  tables that share an executable segment with the code are never
-  touched; for a file-backed `mmap` the kernel maps the file for a moment
-  to read its section headers (`Elf::exec_file_ranges`);
-- inside them, `x18` is rewritten only within the ranges the unwind table
-  (`.eh_frame`, `crates/elf/src/unwind.rs`) covers, since hand-written
-  assembly keeps constant tables in `.text` (OpenSSL's `libcrypto` has
-  over a thousand data words that decode as `x18` instructions); a literal
-  load that is itself code marks its target as a literal pool;
-- system calls and thread-pointer accesses are rewritten throughout the
-  executable sections;
-- without a usable unwind table, the whole of each executable section is
-  code; without section headers, the whole executable segment is;
-- code a guest makes executable after mapping it (a JIT's) has only system
-  calls and thread-pointer accesses rewritten: JIT compilers for Linux
-  arm64 leave `x18` alone (V8 reserves it) and their pages hold data.
-
-**Stubs** are placed within `b` range (128 MiB) of their sites: in the
-arena after the loaded image, or, for code mapped later, in regions found
-by probing near the code. Preparing code twice is harmless: a rewritten
-site no longer matches.
-
 ### Faults
 
-The native backend's fault handlers (`on_fault` and `on_sigtrap` in
+Natively, every trap the guest's code takes arrives as a host signal. The
+native backend's fault handlers (`on_fault` and `on_sigtrap` in
 `crates/native/src/trap.rs`) sort each host fault signal into a system
 call, an emulated instruction, a write+exec page switch, a recovered
 checked copy, a signal another process sent, a signal for the guest, or a
@@ -209,6 +214,11 @@ fatal fault in fwe's own code; what each becomes for the guest is in
 [linux-on-macos.md](linux-on-macos.md#faults-in-guest-code).
 
 ## Memory bookkeeping
+
+Both backends carry out the guest's memory calls (natively with host
+calls, in the VM on its page tables, see
+[linux-on-macos.md](linux-on-macos.md#memory)); the kernel crate keeps the
+records Linux would keep about them:
 
 - **Ownership:** every guest range (images, stubs, stack, break,
   mappings) is recorded (`fwe_kernel::mm::track`) and removed when
@@ -239,7 +249,9 @@ fatal fault in fwe's own code; what each becomes for the guest is in
 ## Processes
 
 The fork, vfork, execve and wait models are drawn in
-[linux-on-macos.md](linux-on-macos.md#processes). Inside fwe:
+[linux-on-macos.md](linux-on-macos.md#processes). Making and replacing
+processes touches every part of fwe, so this section lists what each part
+does for it, then the per-process state fwe keeps. Inside fwe:
 
 - **fork locking:** `fwe_kernel::fork_locked` holds the kernel lock and
   every kernel registry lock across a host `fork`, so the child (which has
@@ -289,6 +301,9 @@ The fork, vfork, execve and wait models are drawn in
 
 ## Threads and futexes
 
+Threads are host threads, so most of their work is scheduling the host
+already does; fwe adds Linux's thread identity and futexes:
+
 - A guest thread is a host thread running guest code; `CLONE_SETTLS`,
   `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
   act as on Linux.
@@ -309,8 +324,9 @@ The fork, vfork, execve and wait models are drawn in
 The Linux side (numbers, dispositions, sending) is in
 [linux-on-macos.md](linux-on-macos.md#signals), and how a host signal
 reaches the guest in
-[linux-on-macos.md](linux-on-macos.md#host-signals). Inside fwe
-(`crates/kernel/src/signal.rs`, `thread.rs`, `signote.rs`):
+[linux-on-macos.md](linux-on-macos.md#host-signals). The machinery behind
+them lives in the kernel crate (`crates/kernel/src/signal.rs`,
+`thread.rs`, `signote.rs`), with the backends' handlers feeding it:
 
 - **Pending sets** are atomics in host thread-locals (the host handler
   records into them), registered by tid so another thread can target one.
@@ -344,6 +360,11 @@ reaches the guest in
 
 ## Files
 
+Every file operation starts with a guest path or descriptor and ends with
+a host call on a host descriptor. In between, fwe resolves the path in the
+guest's own root and mount table, keeps the descriptors it needs out of
+the guest's reach, and translates what comes back.
+
 ### Paths and mounts
 
 - The guest's root is a host directory (`fwe --root DIR`, else the host's
@@ -367,6 +388,9 @@ reaches the guest in
   `/dev/shm` path.
 
 ### Descriptors
+
+Guest descriptors are host descriptors, which keeps I/O direct; the work
+is in keeping fwe's own descriptors apart and Linux's limits exact:
 
 - Guest descriptors are host descriptors. fwe's own (the rootfs handle,
   pipe ends behind eventfd and signalfd, a vfork parent's pipe, the
@@ -396,6 +420,9 @@ reaches the guest in
   `/proc` or `/sys` names that link.
 
 ### File contents and metadata
+
+What the guest reads about files, and the file features macOS lacks or
+shapes differently:
 
 - `stat`/`statx` are translated to the arm64 Linux layout; `getdents64`
   is built from `getdirentries`, re-reading from the directory position
@@ -449,6 +476,8 @@ reaches the guest in
 
 ### /proc and /sys
 
+`/proc` and `/sys` are generated, not stored:
+
 - A path in a `proc` or `sysfs` mount is answered by
   `crates/kernel/src/procfs.rs` (`procpid.rs` for another process's
   `/proc/<pid>`), from an anonymous seekable descriptor;
@@ -485,6 +514,10 @@ reaches the guest in
 
 ## Event descriptors and inotify
 
+The Linux event descriptors are built on kqueues and pipes (the mapping is
+in [linux-on-macos.md](linux-on-macos.md#waiting-and-events)); here is how
+each behaves inside fwe:
+
 - **epoll** (`crates/kernel/src/epoll.rs`): `epoll_ctl` checks as Linux
   does, in its order (`EBADF`, `EPERM` for a regular file or directory,
   `EINVAL`, `ELOOP` for loops and nesting past Linux's limit, `EEXIST`,
@@ -515,6 +548,9 @@ reaches the guest in
     `/proc/self/fdinfo` lists the watches.
 
 ## IPC
+
+System V IPC, POSIX message queues and keys are fwe's own, kept in shared
+records ([linux-on-macos.md](linux-on-macos.md#ipc)). Their details:
 
 - **System V** (`crates/kernel/src/sysvipc.rs`, `ipcops.rs`): the record
   holds keys, owners, permissions, times, semaphore values and undo
@@ -547,6 +583,8 @@ reaches the guest in
 
 ## Sockets and terminals
 
+Sockets and terminals are the host's; fwe translates their interfaces:
+
 - `crates/kernel/src/net.rs` translates addresses, flags and options (see
   [linux-on-macos.md](linux-on-macos.md#sockets)). A Unix socket gets
   Linux's buffer sizes; reading an unconnected Unix stream socket fails
@@ -577,7 +615,9 @@ reaches the guest in
 
 ## Containers
 
-Namespaces, cgroups, credentials, seccomp and devices are mapped in
+Container runtimes need namespaces, mounts, cgroups, credentials, seccomp
+and devices, none of which macOS offers to an unprivileged process; how
+each is mapped is in
 [linux-on-macos.md](linux-on-macos.md#namespaces). Inside fwe:
 
 - **Shared records** (`crates/kernel/src/shared.rs`, collected by
@@ -640,6 +680,8 @@ Namespaces, cgroups, credentials, seccomp and devices are mapped in
 
 ## Other calls
 
+Calls that fit none of the areas above:
+
 - `pselect6` turns its sets into a `poll`; it and `ppoll` write back the
   time left unless the personality has `STICKY_TIMEOUTS`.
 - `personality` is per process across `fork` and `execve`; `UNAME26`
@@ -659,8 +701,9 @@ Namespaces, cgroups, credentials, seccomp and devices are mapped in
 
 ## Known limitations
 
-Where fwe still differs from Linux. The [roadmap](../ROADMAP.md) says which
-are to be lifted for 1.0 and which are not planned.
+Where fwe still differs from Linux, grouped by area. Each item is
+something a Linux program could notice. The [roadmap](../ROADMAP.md) says
+which are to be lifted for 1.0 and which are not planned.
 
 **Execution**
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
