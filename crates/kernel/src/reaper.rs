@@ -973,6 +973,63 @@ pub fn forget_exit_signal(child: i32) {
     }
 }
 
+/// A child's `SIGCHLD`, which Linux sends before `wait` can report the
+/// child, may come from the host after `wait` returned (macOS wakes the
+/// waiter first), and interrupt the guest's next call. So a `wait` that
+/// reaps a child whose `SIGCHLD` has not landed yet gives it then
+/// ([`reaped_child_signal`]), and the host's, when it comes, is dropped
+/// ([`child_signal_landed`]). The pids are kept in two small rings, without
+/// a lock: the host's signal lands in a handler.
+static GIVEN: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
+static LANDED: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
+static GIVEN_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LANDED_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn ring_take(ring: &[AtomicI32; 64], pid: i32) -> bool {
+    ring.iter().any(|s| s.compare_exchange(pid, 0, SeqCst, SeqCst).is_ok())
+}
+
+fn ring_put(ring: &[AtomicI32; 64], at: &std::sync::atomic::AtomicUsize, pid: i32) {
+    ring[at.fetch_add(1, SeqCst) % ring.len()].store(pid, SeqCst);
+}
+
+/// The host's `SIGCHLD` for child `pid`'s end landed: whether it is to be
+/// dropped, its `wait` having given it already. Async-signal-safe.
+pub fn child_signal_landed(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if ring_take(&GIVEN, pid) {
+        return true;
+    }
+    ring_put(&LANDED, &LANDED_AT, pid);
+    false
+}
+
+/// A `wait` reaped child `pid`, which ended so (`info`): its `SIGCHLD`
+/// given now unless it has landed, for the guest to take as `wait`
+/// returns.
+pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
+    // Its own exit signal, if not SIGCHLD (none: nothing to give).
+    let sig = match exit_signal(pid) {
+        Some(0) => return,
+        Some(s) => s,
+        None => fwe_abi::signal::SIGCHLD,
+    };
+    let taken = (crate::signal::caught() | crate::signalfd::watched()) & (1 << (sig - 1)) != 0;
+    if pid <= 0 || !taken {
+        return;
+    }
+    // Marked given first: the host's landing from now on is dropped.
+    ring_put(&GIVEN, &GIVEN_AT, pid);
+    if ring_take(&LANDED, pid) {
+        // It had landed: nothing owed.
+        ring_take(&GIVEN, pid);
+        return;
+    }
+    crate::thread::post_process(sig, info);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

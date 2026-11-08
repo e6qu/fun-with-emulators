@@ -347,6 +347,22 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     }
 }
 
+/// A `wait` reaped host process `pid`, which ended with Linux wait status
+/// `wstatus`: its `SIGCHLD` given now if the host's has not landed, as
+/// Linux sends it before `wait` returns ([`reaper::reaped_child_signal`]).
+fn reaped_signal(pid: i32, wstatus: i32) {
+    use fwe_abi::wait as w;
+    let (code, status) = match wstatus & 0x7f {
+        0 => (w::CLD_EXITED, (wstatus >> 8) & 0xff),
+        sig if wstatus & 0x80 != 0 => (w::CLD_DUMPED, sig),
+        sig => (w::CLD_KILLED, sig),
+    };
+    // SAFETY: getuid cannot fail; a child of fwe's is this user's.
+    let uid = host::uid_to_initial(unsafe { libc::getuid() });
+    let info = thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
+    reaper::reaped_child_signal(pid, info);
+}
+
 /// Encode a host `wait` status into the Linux layout a guest expects.
 /// Host process `pid` ended so.
 fn linux_wstatus(pid: i32, status: libc::c_int) -> i32 {
@@ -555,6 +571,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     }
     let guest = fwe_kernel::pidns::guest_ret(r as i64);
     if r > 0 && !libc::WIFSTOPPED(status) && !libc::WIFCONTINUED(status) {
+        reaped_signal(r, linux_wstatus(r, status));
         // Reaped: its numbers are free again, and its records go.
         reaper::busy(|| {
             fwe_kernel::pidns::reaped(r);
@@ -728,6 +745,12 @@ fn waitid_host(
         if options & w::WNOWAIT == 0
             && matches!(code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
         {
+            let wstatus = if code == w::CLD_EXITED {
+                (status & 0xff) << 8
+            } else {
+                status | if code == w::CLD_DUMPED { 0x80 } else { 0 }
+            };
+            reaped_signal(pid, wstatus);
             // Reaped: its numbers are free again, and its records go.
             reaper::busy(|| {
                 fwe_kernel::pidns::reaped(pid);

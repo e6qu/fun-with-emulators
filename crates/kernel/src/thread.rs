@@ -427,6 +427,10 @@ pub fn post_landed(sig: u64, info: SigInfo) {
     // A child's end that Linux tells with its own exit signal (or none).
     let sig = match sig {
         signal::SIGCHLD if matches!(info.code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) => {
+            if crate::reaper::child_signal_landed(info.pid) {
+                // Given already, by the `wait` that reaped it.
+                return;
+            }
             match crate::reaper::exit_signal(info.pid) {
                 Some(0) => return,
                 Some(s) => s,
