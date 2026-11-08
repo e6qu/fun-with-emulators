@@ -476,7 +476,7 @@ The model, numbers and relay are in
   `socket:[ino]`, `anon_inode:[eventfd]` and the like; opening one reopens
   the file or, for an object with no path, duplicates the descriptor.
 - `/proc/<pid>` of another process: `stat`, `status`, `cmdline`, `comm`,
-  `exe`, `cgroup`, `ns`, `fd`, `fdinfo`, `oom_score_adj` and the maps, from
+  `exe`, `cgroup`, `ns`, `fd`, `oom_score_adj` and the maps, from
   its records and what the host reports. `oom_score_adj` is inherited
   (going below the last value a privileged process set takes
   `CAP_SYS_RESOURCE`).
@@ -484,8 +484,9 @@ The model, numbers and relay are in
 ## Event descriptors and inotify
 
 - **epoll** (`crates/kernel/src/epoll.rs`): `epoll_ctl` checks as Linux
-  does, in its order (`EPERM` for a regular file or directory, `EINVAL`,
-  `EEXIST`, `ENOENT`, `ELOOP` for loops and nesting past Linux's limit). A
+  does, in its order (`EBADF`, `EPERM` for a regular file or directory,
+  `EINVAL`, `ELOOP` for loops and nesting past Linux's limit, `EEXIST`,
+  `ENOENT`). A
   socket watched for `EPOLLRDHUP` alone has a read filter at a low-water
   mark no read reaches, so only the end fires.
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
@@ -509,7 +510,7 @@ The model, numbers and relay are in
     read) and keep the last event, so an identical one is merged;
   - `IN_ONESHOT`, `IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`,
     `IN_ONLYDIR`, `IN_DONT_FOLLOW` and the `fs.inotify.*` limits act;
-    `/proc/<pid>/fdinfo` lists the watches.
+    `/proc/self/fdinfo` lists the watches.
 
 ## IPC
 
@@ -794,8 +795,7 @@ are to be lifted for 1.0 and which are not planned.
   listing position.
 
 **Namespaces and cgroups**
-- A network namespace has only loopback (no `veth`; its port numbers are
-  unique within a process rather than the namespace); a datagram to one of
+- A network namespace has only loopback (no `veth`); a datagram to one of
   its ports nobody bound by number goes to the host loopback port of that
   number; a port is freed when the last descriptor of its socket in the
   binding process closes; the initial namespace's sysctls cannot change.
