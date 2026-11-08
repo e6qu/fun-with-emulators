@@ -5,9 +5,8 @@
 //! filesystems (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`) are fwe's
 //! own, an overlay stacks directories the guest names
 //! ([`crate::overlay`]), and a bind mount shows a directory or file the
-//! guest names. Mounts
-//! do not propagate between namespaces: each is private, whatever its
-//! propagation type says.
+//! guest names. A mount made under a shared mount propagates to its peers
+//! and slaves, in this namespace and others ([`crate::mounts`]).
 
 use crate::mounts::{FsType, Source, ms};
 use crate::{Kernel, Platform, guest, uaccess};

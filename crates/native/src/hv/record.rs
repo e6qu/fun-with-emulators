@@ -6,7 +6,7 @@
 //! `hv_vcpu_run` calls every half second.
 //!
 //! It is for runs on real hardware, where a kernel crash can follow the
-//! backend's use of the framework (four did on the development Mac, see
+//! backend's use of the framework (see the safety rules in
 //! `docs/hypervisor.md`): the record shows what every VM process was doing
 //! up to the crash. A watchdog reset loses what the system had not yet
 //! written, so each line is written synchronously: to a file (`file:PATH`),

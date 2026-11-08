@@ -3,10 +3,10 @@
 //! CPU emulator as a library, loaded with `dlopen` only in this mode.
 //!
 //! It exists so the VM backend can be developed and tested without a real
-//! VM: the development Mac went down four times while the backend was built
-//! (see `docs/hypervisor.md`). It can never prove the real backend works —
-//! only the real framework on real hardware can — so VM changes still run
-//! there now and then.
+//! VM: misusing the framework can bring the machine down (see the safety
+//! rules in `docs/hypervisor.md`). It can never prove the real backend
+//! works — only the real framework on real hardware can — so VM changes
+//! still run there now and then.
 //!
 //! What it models, as the backend sees it:
 //!
