@@ -242,6 +242,12 @@ records Linux would keep about them:
 - **Locking** (`mlock`, `mlock2`, `mlockall`, `MAP_LOCKED`) brings memory
   in and marks it locked for `smaps`, `VmLck` and the next lock's
   `RLIMIT_MEMLOCK` check; nothing is wired.
+- **Sealing** (`mseal`): a flag on the mapping in Linux's view, carried
+  across `fork`; `munmap`, `mprotect`, `mremap`, a `MAP_FIXED` `mmap` over
+  it and a discarding `madvise` of read-only anonymous memory fail with
+  `EPERM`.
+- `remap_file_pages` maps the range of a shared file mapping afresh at the
+  page asked for, as Linux has done since it dropped non-linear mappings.
 - `POSIX_FADV_DONTNEED` writes a range's changes back and drops its pages
   from the host's cache (a shared mapping of it, synced and invalidated).
 - Write+exec memory is recorded in `crates/kernel/src/mm.rs` and handled
@@ -323,7 +329,9 @@ already does; fwe adds Linux's thread identity and futexes:
 - Futexes (`crates/kernel/src/futex.rs`) wait outside the kernel lock. A
   wake takes waiters off the queue oldest first and marks each woken, so it
   reports exactly how many it woke. `FUTEX_WAIT_BITSET`/`WAKE_BITSET` match
-  by bits; `FUTEX_CMP_REQUEUE` moves waiters.
+  by bits; `FUTEX_CMP_REQUEUE` moves waiters. `futex_waitv` waits on up
+  to 128 at once, private ones in the process's queues and shared ones in
+  slots of the shared table, and returns the index of the one woken.
 - A shared futex's waiters are in a slot table every fwe process maps
   (`crates/kernel/src/sharedfutex.rs`), keyed by Mach memory object and
   offset for shared memory and by process and address for private memory.
@@ -404,6 +412,12 @@ the guest's reach, and translates what comes back.
 - Read-only mounts fail writes with `EROFS` (devices, FIFOs and sockets
   still open for writing), a rename or link across mounts fails with
   `EXDEV`, removing a mount's root with `EBUSY`.
+- `openat2` (`crates/kernel/src/openat2.rs`) walks the path itself for
+  its `resolve` rules (no symlinks, no `/proc` magic links, no mount
+  crossed, nothing above the directory, the directory as the root), then
+  opens what it reached as `openat` would.
+- A host symbolic link into fwe's `/proc` or `/sys` (`/etc/mtab`, say) is
+  opened and `stat`ed as the file it leads to.
 - `/dev/shm` is reached by any path that leads there, symlinks included,
   whether or not the rootfs has a `/dev`; its files report their
   `/dev/shm` path.
@@ -542,8 +556,8 @@ each behaves inside fwe:
 - **epoll** (`crates/kernel/src/epoll.rs`): `epoll_ctl` checks as Linux
   does, in its order (`EBADF`, `EPERM` for a regular file or directory,
   `EINVAL`, `ELOOP` for loops and nesting past Linux's limit, `EEXIST`,
-  `ENOENT`). A
-  socket watched for `EPOLLRDHUP` alone has a read filter at a low-water
+  `ENOENT`). Waits keep nanoseconds, as `epoll_pwait2`'s `timespec`
+  gives them. A socket watched for `EPOLLRDHUP` alone has a read filter at a low-water
   mark no read reaches, so only the end fires.
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.

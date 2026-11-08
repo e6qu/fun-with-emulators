@@ -93,7 +93,9 @@ capabilities. *crun, podman and containerd run standard images.*
   `rt_tgsigqueueinfo`), core dumps with the core-dump bit, the core,
   stack, CPU and process-count limits, `clone3` into a cgroup and with
   handlers cleared, `CLONE_VM` processes, and `getcpu`, `syslog`,
-  `membarrier`, `readahead`, `sync_file_range` and `vhangup`.
+  `membarrier`, `readahead`, `sync_file_range` and `vhangup`;
+- `openat2` with its `resolve` rules, `epoll_pwait2`, `mseal`,
+  `futex_waitv` and `remap_file_pages`.
 
 ## Left to 1.0
 

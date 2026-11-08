@@ -1701,12 +1701,11 @@ noted under `--strace`):
 - pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`);
 - POSIX timers (`timer_create` and the rest);
 - `io_uring`, the AIO calls, `userfaultfd`, `perf_event_open`, `fanotify`,
-  `kcmp`, `landlock`, `rseq`, `futex_waitv`,
+  `kcmp`, `landlock`, `rseq`,
   `name_to_handle_at`/`open_by_handle_at`;
-- `epoll_pwait2`, `sendmmsg`/`recvmmsg`, `times`,
-  `ioprio_get`/`ioprio_set`, the `pkey_*` calls, `process_madvise`,
-  `process_mrelease`, `memfd_secret`, `cachestat`, `map_shadow_stack`,
-  `remap_file_pages`, the `lsm_*` calls;
+- `sendmmsg`/`recvmmsg`, `times`, `ioprio_get`/`ioprio_set`, the `pkey_*`
+  calls, `process_madvise`, `process_mrelease`, `memfd_secret`,
+  `cachestat`, `map_shadow_stack`, the `lsm_*` calls;
 - `sync`, `syncfs`;
 - loading kernel modules (`delete_module` finds none), `kexec`, `reboot`,
   swap, quotas, NUMA policy, `acct`.
