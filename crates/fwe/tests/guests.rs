@@ -1292,7 +1292,7 @@ fn alpine_crun_runs_an_image() {
         "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
          Read-only file system\nOperation not permitted\n\
          core fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero\n\
-         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/sys\n3.20.10\n"
+         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n"
     );
     assert_eq!(out.status.code(), Some(0));
 }
