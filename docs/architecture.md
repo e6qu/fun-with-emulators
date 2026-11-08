@@ -863,8 +863,9 @@ reaches (no keyring links it, no live process or user holds it) goes, as
 do invalidated keys, and revoked or expired ones after
 `kernel.keys.gc_delay` seconds. Possession (a key the caller's keyrings
 reach through keyrings it may search) adds a key's possessor permissions;
-quotas are each user's keys and bytes against `kernel.keys.maxkeys` and
-`maxbytes` (`root_*` for root). The types (`crates/kernel/src/keytypes.rs`)
+quotas are each user's keys and bytes (each key's description and what
+its type charges, each keyring link four bytes) against
+`kernel.keys.maxkeys` and `maxbytes` (`root_*` for root). The types (`crates/kernel/src/keytypes.rs`)
 are `keyring`, `user`, `logon`, `big_key`, `dns_resolver`, `asymmetric`
 (X.509 certificates and PKCS#8 RSA keys) and `encrypted`, with Linux's
 payload rules; `KEYCTL_DH_COMPUTE`, the public-key operations and keyring
@@ -1453,7 +1454,9 @@ of these are to be lifted for 1.0 and which are not planned.
 - **Keys:** `request_key` runs no `/sbin/request-key` helper even when the
   root has one, so a key it would construct is negative and
   `KEYCTL_INSTANTIATE`, `NEGATE`, `REJECT` and `ASSUME_AUTHORITY` have no
-  authorisation key to act under.
+  authorisation key to act under; asymmetric keys are RSA only (an ECDSA
+  or other certificate is refused with `ENOPKG`), and a certificate signed
+  with SHA-3 or Streebog has no signature a restriction can check.
 - **Not implemented:**
   - `ptrace`;
   - `fanotify`;

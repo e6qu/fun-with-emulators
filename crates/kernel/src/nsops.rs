@@ -134,6 +134,8 @@ impl<P: Platform> Kernel<P> {
         // Limits left for this process are its own before its child
         // inherits them.
         self.take_pending_limits();
+        // And so are its keyrings.
+        crate::keys::before_fork();
         if flags & CLONE_NEWTIME != 0 {
             return Err(errno::EINVAL);
         }

@@ -753,6 +753,10 @@ pub fn thread_exit_cleanup() {
     if pidns::nested() && thread::tid() != thread::tgid() {
         pidns::release_thread(thread::tid());
     }
+    // Its thread keyring goes with it.
+    if thread::tid() != thread::tgid() {
+        keys::thread_exit(thread::tid());
+    }
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {

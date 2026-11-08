@@ -34,6 +34,24 @@ pub fn readable(kind: &str) -> bool {
     matches!(kind, "keyring" | "user" | "big_key" | "dns_resolver" | "encrypted")
 }
 
+/// The bytes a key of `kind` with (prepared) payload `payload` charges its
+/// owner's quota besides its description, as Linux's types reserve them: a
+/// `big_key` kept in a file only its handle, an asymmetric key a fixed
+/// amount, an encrypted key its decrypted data and blob.
+pub fn charge(kind: &str, payload: &[u8]) -> usize {
+    match kind {
+        "big_key" if payload.len() > BIG_FILE_THRESHOLD => BIG_FILE_CHARGE,
+        "asymmetric" => ASYMMETRIC_CHARGE,
+        "encrypted" => crypto::encrypted_charge(payload),
+        _ => payload.len(),
+    }
+}
+
+/// What a `big_key` kept in a file charges (its handle).
+const BIG_FILE_CHARGE: usize = 16;
+/// What an asymmetric key charges.
+const ASYMMETRIC_CHARGE: usize = 100;
+
 /// Check and prepare the payload `data` of a new key of `kind` described
 /// `desc` (`None`: none given).
 pub fn preparse(
@@ -217,16 +235,20 @@ pub(crate) mod crypto {
         Ok(EncryptedKey { format, master_desc, datalen, iv, decrypted })
     }
 
-    /// The payload of the master key an encrypted key names: a `user` key
-    /// (else a `logon` key) of that whole description the caller's keyrings
-    /// reach, as Linux's `request_user_key` finds it.
+    /// The payload of the master key an encrypted key names (`user:name`):
+    /// the `user` key `name` the caller's keyrings reach, as Linux's
+    /// `request_master_key` finds it.
     fn master<'a>(s: &'a Store, c: &'a Caller) -> impl Fn(&[u8]) -> Option<Vec<u8>> + 'a {
         move |desc: &[u8]| {
-            ["user", "logon"].iter().find_map(|kind| {
-                let k = s.search_process(c, kind, desc).ok()?;
-                Some(s.keys.get(&k)?.payload.clone())
-            })
+            let name = desc.strip_prefix(b"user:")?;
+            let k = s.search_process(c, "user", name).ok()?;
+            Some(s.keys.get(&k)?.payload.clone())
         }
+    }
+
+    /// What an encrypted key of payload `p` charges its owner.
+    pub fn encrypted_charge(p: &[u8]) -> usize {
+        decode(p).map_or(p.len(), |k| k.quota_len())
     }
 
     pub fn encrypted_new(s: &Store, c: &Caller, desc: &[u8], data: &[u8]) -> Result<Prepared, i32> {

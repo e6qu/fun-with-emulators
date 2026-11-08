@@ -46,10 +46,14 @@ const ROOT_CAN_CLEAR: u32 = 32;
 
 /// How long a key whose construction failed stays negative.
 const NEGATIVE_TIMEOUT: u64 = 60;
+/// What each link in a keyring costs its owner's quota.
+const LINK_BYTES: u64 = 4;
 /// The deepest nesting of keyrings a search descends.
 const MAX_DEPTH: usize = 6;
-/// The largest payload `add_key` and `KEYCTL_UPDATE` take.
+/// The largest payload `add_key` takes.
 const MAX_PAYLOAD: usize = 1024 * 1024 - 1;
+/// The largest payload `KEYCTL_UPDATE` takes (a page).
+const PAGE: usize = 4096;
 /// The longest description (a page, with its NUL).
 const MAX_DESC: usize = 4095;
 /// The kernel's `INVALID_GID` (a user keyring has no group).
@@ -156,6 +160,8 @@ pub struct Store {
     pub keys: BTreeMap<i32, Key>,
     pub holders: Vec<Holder>,
     pub users: Vec<UserRings>,
+    /// A change was made, so the record is written back (never kept).
+    pub touched: bool,
 }
 
 impl Data for Store {
@@ -319,13 +325,20 @@ fn me() -> (i32, u64) {
     (pid, crate::procreg::host_info(pid).map_or(0, |i| i.0))
 }
 
-/// What a lookup of a key id allows (Linux's `KEY_LOOKUP_*`).
+/// How a key id is looked up (Linux's `KEY_LOOKUP_*`): whether a missing
+/// special keyring is made, and whether a key whose state makes it unusable
+/// (negative; with `partial`, revoked or expired instead) is still found.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Look {
-    /// Make a special keyring missing.
-    Create,
-    /// Neither.
-    Plain,
+struct Look {
+    create: bool,
+    partial: bool,
+}
+
+impl Look {
+    const PLAIN: Look = Look { create: false, partial: false };
+    const CREATE: Look = Look { create: true, partial: false };
+    const PARTIAL: Look = Look { create: false, partial: true };
+    const CREATE_PARTIAL: Look = Look { create: true, partial: true };
 }
 
 impl Store {
@@ -334,10 +347,23 @@ impl Store {
     }
 
     fn holder_mut(&mut self, c: &Caller) -> &mut Holder {
+        self.touched = true;
         if let Some(i) = self.holders.iter().position(|h| h.pid == c.pid && h.start == c.start) {
             return &mut self.holders[i];
         }
-        self.holders.push(Holder { pid: c.pid, start: c.start, ..Holder::default() });
+        // A fork child's first: its parent's session and request default,
+        // as they were when it forked.
+        let (session, reqkey) = match *INHERIT.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((parent, session, reqkey)) if parent != c.pid => (session, reqkey),
+            _ => (0, 0),
+        };
+        self.holders.push(Holder {
+            pid: c.pid,
+            start: c.start,
+            session,
+            reqkey,
+            ..Holder::default()
+        });
         self.holders.last_mut().unwrap()
     }
 
@@ -353,12 +379,21 @@ impl Store {
         }
     }
 
-    /// The keys user `uid` owns, and their bytes, charged to its quota.
+    /// The keys user `uid` owns, and their bytes, charged to its quota: a
+    /// keyring's description and its links, another key's description and
+    /// what its type charges for its payload.
     fn usage(&self, uid: u32) -> (u64, u64) {
-        self.keys
-            .values()
-            .filter(|k| k.uid == uid && k.flags & IN_QUOTA != 0)
-            .fold((0, 0), |(n, b), k| (n + 1, b + k.quota as u64))
+        self.keys.values().filter(|k| k.uid == uid && k.flags & IN_QUOTA != 0).fold(
+            (0, 0),
+            |(n, b), k| {
+                let bytes = if k.is_keyring() {
+                    k.desc.len() as u64 + 1 + LINK_BYTES * k.links.len() as u64
+                } else {
+                    k.quota as u64
+                };
+                (n + 1, b + bytes)
+            },
+        )
     }
 
     /// User `uid`'s quota limits: keys and bytes.
@@ -391,10 +426,11 @@ impl Store {
         payload: Vec<u8>,
         overrun: bool,
     ) -> Result<i32, i32> {
-        let quota = (desc.len() + 1 + payload.len()) as u32;
+        let quota = (desc.len() + 1 + crate::keytypes::charge(kind, &payload)) as u32;
         if !overrun && uid != NO_ID && !self.quota_ok(uid, true, quota as u64) {
             return Err(errno::EDQUOT);
         }
+        self.touched = true;
         let serial = self.serial();
         self.keys.insert(
             serial,
@@ -544,7 +580,7 @@ impl Store {
             KEY_SPEC_THREAD_KEYRING => {
                 let mut r = self.thread_of(c);
                 if r == 0 || !self.live(r) {
-                    if look != Look::Create {
+                    if !look.create {
                         return Err(errno::ENOKEY);
                     }
                     let perm = (KEY_ALL << KEY_POS_SHIFT) | (KEY_VIEW << KEY_USR_SHIFT);
@@ -559,7 +595,7 @@ impl Store {
             KEY_SPEC_PROCESS_KEYRING => {
                 let mut r = self.process_of(c);
                 if r == 0 || !self.live(r) {
-                    if look != Look::Create {
+                    if !look.create {
                         return Err(errno::ENOKEY);
                     }
                     let perm = (KEY_ALL << KEY_POS_SHIFT) | (KEY_VIEW << KEY_USR_SHIFT);
@@ -570,9 +606,12 @@ impl Store {
             }
             KEY_SPEC_SESSION_KEYRING => {
                 let own = self.holder(c).map_or(0, |h| h.session);
-                if own != 0 && self.live(own) {
+                let user_session =
+                    self.users.iter().find(|u| u.uid == c.uid).map_or(0, |u| u.session);
+                if own != 0 && self.live(own) && !(look.create && own == user_session) {
                     own
-                } else if look == Look::Create {
+                } else if look.create {
+                    // None of its own (or the user's): a new one, joined.
                     self.join(c, None)?
                 } else {
                     // The user's session keyring becomes the session's.
@@ -596,6 +635,16 @@ impl Store {
         let possessed = id < 0 || self.possessed(c).contains(&serial);
         if need != 0 {
             let k = &self.keys[&serial];
+            // A negative key is no use but to a partial lookup, which
+            // takes a revoked or expired key as unusable instead.
+            if !look.partial && k.negative() {
+                return Err(if k.reject != 0 { k.reject } else { errno::ENOKEY });
+            }
+            if look.partial
+                && let Some(e) = k.invalid(now())
+            {
+                return Err(e);
+            }
             if Self::granted(k, c, possessed) & need != need {
                 return Err(errno::EACCES);
             }
@@ -606,9 +655,12 @@ impl Store {
     /// Join a session keyring: a new anonymous one (`name` none), or the
     /// keyring named `name` the caller may search, made if there is none.
     fn join(&mut self, c: &Caller, name: Option<&[u8]>) -> Result<i32, i32> {
-        let perm = (KEY_ALL << KEY_POS_SHIFT) | ((KEY_VIEW | KEY_READ | KEY_LINK) << KEY_USR_SHIFT);
+        // An anonymous one is the process's own, past the quota; a named
+        // one may be joined by others, and is charged.
+        let anon = (KEY_ALL << KEY_POS_SHIFT) | ((KEY_VIEW | KEY_READ) << KEY_USR_SHIFT);
+        let named = anon | (KEY_LINK << KEY_USR_SHIFT);
         let r = match name {
-            None => self.new_ring(c, b"_ses", perm)?,
+            None => self.new_ring(c, b"_ses", anon)?,
             Some(n) if n.first() == Some(&b'.') => return Err(errno::EPERM),
             Some(n) => {
                 let found = self
@@ -624,7 +676,12 @@ impl Store {
                     .map(|k| k.serial);
                 match found {
                     Some(r) => r,
-                    None => self.new_ring(c, n, perm)?,
+                    None => {
+                        let r =
+                            self.alloc("keyring", n, c.uid, c.gid, named, 0, Vec::new(), false)?;
+                        self.keys.get_mut(&r).unwrap().ns = c.userns.clone();
+                        r
+                    }
                 }
             }
         };
@@ -670,9 +727,8 @@ impl Store {
 
     /// Whether key `key` may be linked into keyring `ring` by its
     /// restriction.
-    fn restriction_allows(&self, ring: i32, key: i32) -> Result<(), i32> {
+    fn restriction_allows(&self, ring: i32, k: &Key) -> Result<(), i32> {
         let Some(r) = self.keys.get(&ring) else { return Err(errno::ENOKEY) };
-        let Some(k) = self.keys.get(&key) else { return Err(errno::ENOKEY) };
         match &r.restrict {
             Restrict::None => Ok(()),
             Restrict::RejectAll => Err(errno::EPERM),
@@ -698,13 +754,18 @@ impl Store {
     /// Link `key` into keyring `ring`, displacing a key of the same type
     /// and description there, as Linux's `__key_link` does.
     fn link(&mut self, ring: i32, key: i32) -> Result<(), i32> {
-        if !self.keys.get(&ring).is_some_and(Key::is_keyring) {
+        let r = self.keys.get(&ring).ok_or(errno::ENOKEY)?;
+        if !r.is_keyring() {
             return Err(errno::ENOTDIR);
         }
-        if self.keys[&ring].links.contains(&key) {
+        if let Some(e) = r.invalid(now()) {
+            return Err(e);
+        }
+        if r.links.contains(&key) {
             return Ok(());
         }
-        let k = &self.keys[&key];
+        let k = self.keys[&key].clone();
+        self.restriction_allows(ring, &k)?;
         if k.is_keyring() {
             if self.reaches(key, ring) {
                 return Err(errno::EDEADLK);
@@ -713,17 +774,21 @@ impl Store {
                 return Err(errno::ELOOP);
             }
         }
-        self.restriction_allows(ring, key)?;
-        let (kind, desc) = (k.kind.clone(), k.desc.clone());
         let same: Vec<i32> = self.keys[&ring]
             .links
             .iter()
             .copied()
-            .filter(|l| self.keys.get(l).is_some_and(|o| o.kind == kind && o.desc == desc))
+            .filter(|l| self.keys.get(l).is_some_and(|o| o.kind == k.kind && o.desc == k.desc))
             .collect();
+        // A new link costs the keyring's owner a link's bytes.
+        let owner = self.keys[&ring].uid;
+        if same.is_empty() && owner != NO_ID && !self.quota_ok(owner, false, LINK_BYTES) {
+            return Err(errno::EDQUOT);
+        }
         let r = self.keys.get_mut(&ring).unwrap();
         r.links.retain(|l| !same.contains(l));
         r.links.push(key);
+        self.touched = true;
         Ok(())
     }
 
@@ -860,6 +925,10 @@ impl Store {
             }
             if let Some(k) = self.keys.get(&r) {
                 frontier.extend(k.links.iter().copied());
+                // The key a keyring's restriction trusts lives as long.
+                if let Restrict::KeyOrKeyring(t, _) = k.restrict {
+                    frontier.push(t);
+                }
             }
         }
         self.keys.retain(|s, _| reached.contains(s));
@@ -893,8 +962,22 @@ fn with<R>(f: impl FnOnce(&mut Store) -> (R, bool)) -> Result<R, i32> {
     })
 }
 
+/// What a fork child inherits of this process's keyrings, noted before the
+/// fork (so the child has it, copied): (this process's pid, its session
+/// keyring, its request default).
+static INHERIT: std::sync::Mutex<Option<(i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Before a fork: what the child is to hold ([`INHERIT`]).
+pub fn before_fork() {
+    let Some(st) = existing() else { return };
+    let (pid, start) = me();
+    let held = st.get().holders.iter().find(|h| h.pid == pid && h.start == start).cloned();
+    *INHERIT.lock().unwrap_or_else(|e| e.into_inner()) = held.map(|h| (pid, h.session, h.reqkey));
+}
+
 /// The keyrings a fork child holds: its parent's session, and the request
-/// default; no thread or process keyring.
+/// default; no thread or process keyring. Written by the parent unless the
+/// child has used its keyrings first.
 pub fn forked(child: i32) {
     let Some(st) = existing() else { return };
     let (pid, start) = me();
@@ -906,6 +989,9 @@ pub fn forked(child: i32) {
         let Some(h) = s.holders.iter().find(|h| h.pid == pid && h.start == start).cloned() else {
             return ((), false);
         };
+        if s.holders.iter().any(|o| o.pid == child && o.start == cstart) {
+            return ((), false);
+        }
         s.holders.retain(|o| o.pid != child);
         s.holders.push(Holder {
             pid: child,
@@ -934,6 +1020,23 @@ pub fn exec() {
         h.process = 0;
         h.threads.clear();
         ((), changed)
+    });
+}
+
+/// Thread `tid` of this process ended: its thread keyring goes.
+pub fn thread_exit(tid: i32) {
+    let Some(st) = existing() else { return };
+    let (pid, start) = me();
+    let holds =
+        |h: &Holder| h.pid == pid && h.start == start && h.threads.iter().any(|(t, _)| *t == tid);
+    if !st.get().holders.iter().any(holds) {
+        return;
+    }
+    let _ = with(|s| {
+        if let Some(h) = s.holders.iter_mut().find(|h| h.pid == pid && h.start == start) {
+            h.threads.retain(|(t, _)| *t != tid);
+        }
+        ((), true)
     });
 }
 
@@ -974,6 +1077,9 @@ impl<P: Platform> Kernel<P> {
         plen: u64,
         ring: u64,
     ) -> i64 {
+        if plen as usize > MAX_PAYLOAD {
+            return err(errno::EINVAL);
+        }
         let kind = guest!(read_type(ty));
         if kind.first() == Some(&b'.') {
             return err(errno::EPERM);
@@ -990,9 +1096,6 @@ impl<P: Platform> Kernel<P> {
         if desc.as_deref().is_some_and(|d| d.first() == Some(&b'.')) && kind == b"keyring" {
             return err(errno::EPERM);
         }
-        if plen as usize > MAX_PAYLOAD {
-            return err(errno::EINVAL);
-        }
         let data = if plen > 0 {
             if payload == 0 {
                 return err(errno::EFAULT);
@@ -1005,7 +1108,7 @@ impl<P: Platform> Kernel<P> {
         let c = self.key_caller();
         let r = with(|s| {
             let r = (|| {
-                let (dest, _) = s.lookup(&c, ring as i32, Look::Create, KEY_WRITE)?;
+                let (dest, _) = s.lookup(&c, ring as i32, Look::CREATE, KEY_WRITE)?;
                 if !s.keys[&dest].is_keyring() {
                     return Err(errno::ENOTDIR);
                 }
@@ -1014,23 +1117,47 @@ impl<P: Platform> Kernel<P> {
                     desc = prep.desc.clone();
                 }
                 let Some(desc) = desc.clone() else { return Err(errno::EINVAL) };
-                // An existing key of the type and description in the
-                // keyring is updated, if the type allows it.
-                if kind != "keyring"
-                    && crate::keytypes::updatable(&kind)
-                    && let Some(&old) = s.keys[&dest]
-                        .links
-                        .iter()
-                        .find(|l| s.keys.get(l).is_some_and(|k| k.kind == kind && k.desc == desc))
+                // What the keyring's restriction allows in, first.
+                let probe = Key {
+                    serial: 0,
+                    kind: kind.clone(),
+                    desc: desc.clone(),
+                    uid: c.uid,
+                    gid: c.gid,
+                    perm: 0,
+                    flags: 0,
+                    expiry: 0,
+                    revoked_at: 0,
+                    reject: 0,
+                    payload: prep.payload.clone(),
+                    links: Vec::new(),
+                    restrict: Restrict::None,
+                    quota: 0,
+                    ns: Vec::new(),
+                };
+                s.restriction_allows(dest, &probe)?;
+                if let Some(e) = s.keys[&dest].invalid(now()) {
+                    return Err(e);
+                }
+                // An existing usable key of the type and description in the
+                // keyring is updated, if the type allows it and the caller
+                // may write it.
+                if crate::keytypes::updatable(&kind)
+                    && let Some(&old) = s.keys[&dest].links.iter().find(|l| {
+                        s.keys.get(l).is_some_and(|k| {
+                            k.kind == kind
+                                && k.desc == desc
+                                && k.flags & (REVOKED | INVALIDATED) == 0
+                        })
+                    })
                 {
                     let possessed = s.possessed(&c).contains(&old);
-                    let k = &s.keys[&old];
-                    if Store::granted(k, &c, possessed) & KEY_WRITE != 0
-                        && k.invalid(now()).is_none()
-                    {
-                        update_payload(s, old, prep.payload)?;
-                        return Ok(old);
+                    if Store::granted(&s.keys[&old], &c, possessed) & KEY_WRITE == 0 {
+                        return Err(errno::EACCES);
                     }
+                    update_payload(s, old, prep.payload)?;
+                    s.touched = true;
+                    return Ok(old);
                 }
                 let mut perm = ((KEY_VIEW | KEY_SEARCH | KEY_LINK | KEY_SETATTR) << KEY_POS_SHIFT)
                     | (KEY_VIEW << KEY_USR_SHIFT);
@@ -1073,17 +1200,17 @@ impl<P: Platform> Kernel<P> {
             Some(guest!(uaccess::read_cstr(callout, MAX_DESC + 1)))
         };
         let kind = String::from_utf8_lossy(&kind).into_owned();
-        if !crate::keytypes::known(&kind) {
-            return err(errno::ENOKEY);
-        }
         let c = self.key_caller();
         let r = with(|s| {
             let r = (|| {
                 // The destination: the given keyring, or the default.
                 let dest = match dest as i32 {
                     0 => None,
-                    d => Some(s.lookup(&c, d, Look::Create, KEY_WRITE)?.0),
+                    d => Some(s.lookup(&c, d, Look::CREATE, KEY_WRITE)?.0),
                 };
+                if !crate::keytypes::known(&kind) {
+                    return Err(errno::ENOKEY);
+                }
                 match s.search_process(&c, &kind, &desc) {
                     Ok(k) => {
                         if let Some(d) = dest {
@@ -1106,14 +1233,15 @@ impl<P: Platform> Kernel<P> {
                         if Store::granted(&s.keys[&d], &c, possessed) & KEY_WRITE == 0 {
                             return Err(errno::EACCES);
                         }
-                        let perm = ((KEY_VIEW
-                            | KEY_SEARCH
-                            | KEY_LINK
-                            | KEY_SETATTR
-                            | KEY_READ
-                            | KEY_WRITE)
+                        let mut perm = ((KEY_VIEW | KEY_SEARCH | KEY_LINK | KEY_SETATTR)
                             << KEY_POS_SHIFT)
                             | (KEY_VIEW << KEY_USR_SHIFT);
+                        if crate::keytypes::readable(&kind) {
+                            perm |= KEY_READ << KEY_POS_SHIFT;
+                        }
+                        if kind == "keyring" || crate::keytypes::updatable(&kind) {
+                            perm |= KEY_WRITE << KEY_POS_SHIFT;
+                        }
                         let key =
                             s.alloc(&kind, &desc, c.uid, c.gid, perm, 0, Vec::new(), false)?;
                         // No helper instantiates it: negated, as a failed
@@ -1131,9 +1259,8 @@ impl<P: Platform> Kernel<P> {
                     Err(e) => Err(e),
                 }
             })();
-            // Changed when a special keyring was made or a key linked or
-            // made: written whenever anything could have been.
-            (r, true)
+            let changed = s.touched;
+            (r, changed)
         });
         match r {
             Ok(Ok(k)) => k as i64,
@@ -1147,8 +1274,11 @@ impl<P: Platform> Kernel<P> {
         let id = a[0] as i32;
         match op {
             KEYCTL_GET_KEYRING_ID => {
-                let look = if a[1] != 0 { Look::Create } else { Look::Plain };
-                result(with(|s| (s.lookup(&c, id, look, 0).map(|(k, _)| k as i64), true)))
+                let look = if a[1] != 0 { Look::CREATE } else { Look::PLAIN };
+                result(with(|s| {
+                    let r = s.lookup(&c, id, look, 0).map(|(k, _)| k as i64);
+                    (r, s.touched)
+                }))
             }
             KEYCTL_JOIN_SESSION_KEYRING => {
                 let name = if a[0] == 0 {
@@ -1163,7 +1293,7 @@ impl<P: Platform> Kernel<P> {
                 result(with(|s| (s.join(&c, name.as_deref()).map(i64::from), true)))
             }
             KEYCTL_UPDATE => {
-                if a[2] as usize > MAX_PAYLOAD {
+                if a[2] as usize > PAGE {
                     return err(errno::EINVAL);
                 }
                 let data = if a[2] > 0 {
@@ -1176,7 +1306,7 @@ impl<P: Platform> Kernel<P> {
                 };
                 result(with(|s| {
                     let r = (|| {
-                        let (k, _) = s.lookup(&c, id, Look::Create, KEY_WRITE)?;
+                        let (k, _) = s.lookup(&c, id, Look::PLAIN, KEY_WRITE)?;
                         let kind = s.keys[&k].kind.clone();
                         if !crate::keytypes::updatable(&kind) {
                             return Err(errno::EOPNOTSUPP);
@@ -1195,8 +1325,8 @@ impl<P: Platform> Kernel<P> {
             }
             KEYCTL_REVOKE => result(with(|s| {
                 let r = (|| {
-                    let k = match s.lookup(&c, id, Look::Plain, KEY_WRITE) {
-                        Err(errno::EACCES) => s.lookup(&c, id, Look::Plain, KEY_SETATTR)?.0,
+                    let k = match s.lookup(&c, id, Look::PLAIN, KEY_WRITE) {
+                        Err(errno::EACCES) => s.lookup(&c, id, Look::PLAIN, KEY_SETATTR)?.0,
                         r => r?.0,
                     };
                     let key = s.keys.get_mut(&k).unwrap();
@@ -1220,7 +1350,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 result(with(|s| {
                     let r = (|| {
-                        let (k, _) = s.lookup(&c, id, Look::Create, KEY_SETATTR)?;
+                        let (k, _) = s.lookup(&c, id, Look::CREATE_PARTIAL, KEY_SETATTR)?;
                         let key = s.keys.get_mut(&k).unwrap();
                         if key.uid != c.uid && !c.admin {
                             return Err(errno::EACCES);
@@ -1233,7 +1363,7 @@ impl<P: Platform> Kernel<P> {
             }
             KEYCTL_DESCRIBE => {
                 let r = with(|s| {
-                    let r = s.lookup(&c, id, Look::Plain, KEY_VIEW).map(|(k, _)| {
+                    let r = s.lookup(&c, id, Look::PARTIAL, KEY_VIEW).map(|(k, _)| {
                         let k = &s.keys[&k];
                         let uid = to_ns_id(k.uid, false);
                         let gid = to_ns_id(k.gid, true);
@@ -1242,15 +1372,15 @@ impl<P: Platform> Kernel<P> {
                         d.push(0);
                         d
                     });
-                    (r, true)
+                    (r, s.touched)
                 });
                 self.copy_out(r, a[1], a[2], false)
             }
             KEYCTL_CLEAR => result(with(|s| {
                 let r = (|| {
-                    let k = match s.lookup(&c, id, Look::Create, KEY_WRITE) {
+                    let k = match s.lookup(&c, id, Look::CREATE, KEY_WRITE) {
                         Err(errno::EACCES) if c.admin => {
-                            let (k, _) = s.lookup(&c, id, Look::Create, 0)?;
+                            let (k, _) = s.lookup(&c, id, Look::CREATE, 0)?;
                             if s.keys[&k].flags & ROOT_CAN_CLEAR == 0 {
                                 return Err(errno::EACCES);
                             }
@@ -1269,8 +1399,8 @@ impl<P: Platform> Kernel<P> {
             })),
             KEYCTL_LINK => result(with(|s| {
                 let r = (|| {
-                    let (ring, _) = s.lookup(&c, a[1] as i32, Look::Create, KEY_WRITE)?;
-                    let (k, _) = s.lookup(&c, id, Look::Create, KEY_LINK)?;
+                    let (ring, _) = s.lookup(&c, a[1] as i32, Look::CREATE, KEY_WRITE)?;
+                    let (k, _) = s.lookup(&c, id, Look::CREATE, KEY_LINK)?;
                     if let Some(e) = s.keys[&k].invalid(now()) {
                         return Err(e);
                     }
@@ -1281,9 +1411,9 @@ impl<P: Platform> Kernel<P> {
             })),
             KEYCTL_UNLINK => result(with(|s| {
                 let r = (|| {
-                    let (ring, _) = s.lookup(&c, a[1] as i32, Look::Plain, KEY_WRITE)?;
+                    let (ring, _) = s.lookup(&c, a[1] as i32, Look::PLAIN, KEY_WRITE)?;
                     // The key is only named: no permission on it is needed.
-                    let (k, _) = s.lookup(&c, id, Look::Plain, 0)?;
+                    let (k, _) = s.lookup(&c, id, Look::PLAIN, 0)?;
                     let r = s.keys.get_mut(&ring).unwrap();
                     if !r.is_keyring() {
                         return Err(errno::ENOTDIR);
@@ -1303,10 +1433,10 @@ impl<P: Platform> Kernel<P> {
                 let kind = String::from_utf8_lossy(&kind).into_owned();
                 result(with(|s| {
                     let r = (|| {
-                        let (ring, _) = s.lookup(&c, id, Look::Plain, KEY_SEARCH)?;
+                        let (ring, _) = s.lookup(&c, id, Look::PLAIN, KEY_SEARCH)?;
                         let dest = match a[3] as i32 {
                             0 => None,
-                            d => Some(s.lookup(&c, d, Look::Create, KEY_WRITE)?.0),
+                            d => Some(s.lookup(&c, d, Look::CREATE, KEY_WRITE)?.0),
                         };
                         if !s.keys[&ring].is_keyring() {
                             return Err(errno::ENOTDIR);
@@ -1321,13 +1451,15 @@ impl<P: Platform> Kernel<P> {
                         }
                         Ok(k as i64)
                     })();
-                    (r, true)
+                    (r, s.touched)
                 }))
             }
             KEYCTL_READ => {
                 let r = with(|s| {
                     let r = (|| -> Result<(Vec<u8>, bool), i32> {
-                        let (k, possessed) = s.lookup(&c, id, Look::Plain, 0)?;
+                        // Any failure to find it is ENOKEY, as Linux has it.
+                        let (k, possessed) =
+                            s.lookup(&c, id, Look::PLAIN, 0).map_err(|_| errno::ENOKEY)?;
                         let key = &s.keys[&k];
                         if key.negative() {
                             return Err(if key.reject != 0 { key.reject } else { errno::ENOKEY });
@@ -1347,7 +1479,7 @@ impl<P: Platform> Kernel<P> {
                         }
                         crate::keytypes::read(s, &c, k, a[2] as usize).map(|d| (d, false))
                     })();
-                    (r, true)
+                    (r, s.touched)
                 });
                 self.copy_out(r.map(|r| r.map(|(d, _)| d)), a[1], a[2], false)
             }
@@ -1365,10 +1497,10 @@ impl<P: Platform> Kernel<P> {
                     match id {
                         KEY_REQKEY_DEFL_NO_CHANGE => return Ok(old as i64),
                         KEY_REQKEY_DEFL_THREAD_KEYRING => {
-                            s.lookup(&c, KEY_SPEC_THREAD_KEYRING, Look::Create, 0)?;
+                            s.lookup(&c, KEY_SPEC_THREAD_KEYRING, Look::CREATE, 0)?;
                         }
                         KEY_REQKEY_DEFL_PROCESS_KEYRING => {
-                            s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::Create, 0)?;
+                            s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::CREATE, 0)?;
                         }
                         KEY_REQKEY_DEFL_DEFAULT
                         | KEY_REQKEY_DEFL_SESSION_KEYRING
@@ -1384,7 +1516,7 @@ impl<P: Platform> Kernel<P> {
             })),
             KEYCTL_SET_TIMEOUT => result(with(|s| {
                 let r = (|| {
-                    let (k, _) = s.lookup(&c, id, Look::Create, KEY_SETATTR)?;
+                    let (k, _) = s.lookup(&c, id, Look::CREATE_PARTIAL, KEY_SETATTR)?;
                     let key = s.keys.get_mut(&k).unwrap();
                     key.expiry = if a[1] == 0 { 0 } else { now() + a[1] as u32 as u64 };
                     Ok(0)
@@ -1398,23 +1530,23 @@ impl<P: Platform> Kernel<P> {
             },
             KEYCTL_GET_SECURITY => {
                 let r = with(|s| {
-                    let r = match s.lookup(&c, id, Look::Plain, KEY_VIEW) {
+                    let r = match s.lookup(&c, id, Look::PARTIAL, KEY_VIEW) {
                         // Viewing a key under construction needs its
                         // authorisation key, which there is none of.
                         Err(errno::EACCES) => Err(errno::ENOKEY),
                         // No security module labels it: an empty label.
                         r => r.map(|_| vec![0u8]),
                     };
-                    (r, true)
+                    (r, s.touched)
                 });
                 self.copy_out(r, a[1], a[2], true)
             }
             KEYCTL_SESSION_TO_PARENT => self.session_to_parent(&c),
             KEYCTL_INVALIDATE => result(with(|s| {
                 let r = (|| {
-                    let k = match s.lookup(&c, id, Look::Plain, KEY_SEARCH) {
+                    let k = match s.lookup(&c, id, Look::PLAIN, KEY_SEARCH) {
                         Err(errno::EACCES) if c.admin => {
-                            let (k, _) = s.lookup(&c, id, Look::Plain, 0)?;
+                            let (k, _) = s.lookup(&c, id, Look::PLAIN, 0)?;
                             if s.keys[&k].flags & ROOT_CAN_CLEAR == 0 {
                                 return Err(errno::EACCES);
                             }
@@ -1440,9 +1572,9 @@ impl<P: Platform> Kernel<P> {
                 }
                 result(with(|s| {
                     let r = (|| {
-                        let (k, _) = s.lookup(&c, id, Look::Plain, KEY_LINK)?;
-                        let (from, _) = s.lookup(&c, a[1] as i32, Look::Plain, KEY_WRITE)?;
-                        let (to, _) = s.lookup(&c, a[2] as i32, Look::Create, KEY_WRITE)?;
+                        let (k, _) = s.lookup(&c, id, Look::PLAIN, KEY_LINK)?;
+                        let (from, _) = s.lookup(&c, a[1] as i32, Look::PLAIN, KEY_WRITE)?;
+                        let (to, _) = s.lookup(&c, a[2] as i32, Look::CREATE, KEY_WRITE)?;
                         if !s.keys[&from].is_keyring() || !s.keys[&to].is_keyring() {
                             return Err(errno::ENOTDIR);
                         }
@@ -1453,9 +1585,6 @@ impl<P: Platform> Kernel<P> {
                             return Err(errno::ENOENT);
                         }
                         let key = &s.keys[&k];
-                        if key.is_keyring() && s.reaches(k, to) {
-                            return Err(errno::EDEADLK);
-                        }
                         if a[3] & KEYCTL_MOVE_EXCL != 0 {
                             let (kind, desc) = (key.kind.clone(), key.desc.clone());
                             if s.keys[&to].links.iter().any(|l| {
@@ -1463,6 +1592,9 @@ impl<P: Platform> Kernel<P> {
                             }) {
                                 return Err(errno::EEXIST);
                             }
+                        }
+                        if s.keys[&k].is_keyring() && s.reaches(k, to) {
+                            return Err(errno::EDEADLK);
                         }
                         s.link(to, k)?;
                         s.keys.get_mut(&from).unwrap().links.retain(|l| *l != k);
@@ -1526,7 +1658,7 @@ impl<P: Platform> Kernel<P> {
         }
         result(with(|s| {
             let r = (|| {
-                let (k, _) = s.lookup(c, id, Look::Create, KEY_SETATTR)?;
+                let (k, _) = s.lookup(c, id, Look::CREATE_PARTIAL, KEY_SETATTR)?;
                 let key = s.keys[&k].clone();
                 if let Some(u) = kuid
                     && u != key.uid
@@ -1541,7 +1673,8 @@ impl<P: Platform> Kernel<P> {
                 if let Some(g) = kgid
                     && g != key.gid
                     && !c.admin
-                    && (key.uid != c.uid || (g != c.gid && !c.groups.contains(&g)))
+                    && g != c.gid
+                    && !c.groups.contains(&g)
                 {
                     return Err(errno::EACCES);
                 }
@@ -1575,7 +1708,7 @@ impl<P: Platform> Kernel<P> {
         }
         result(with(|s| {
             let r = (|| {
-                let (d, _) = s.lookup(c, dest, Look::Create, KEY_WRITE)?;
+                let (d, _) = s.lookup(c, dest, Look::CREATE, KEY_WRITE)?;
                 s.user_rings(kuid);
                 let i = s.users.iter().position(|u| u.uid == kuid).unwrap();
                 let mut p = s.users[i].persistent;
@@ -1605,20 +1738,34 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `KEYCTL_SESSION_TO_PARENT`: the caller's session keyring becomes its
-    /// parent's, when the parent is an fwe process of the same user.
+    /// parent's, as Linux allows it: the parent an fwe process whose user
+    /// and group ids (real, effective, saved) are all the caller's
+    /// effective ones, and both session keyrings that user's.
     fn session_to_parent(&self, c: &Caller) -> i64 {
         // SAFETY: getppid cannot fail.
         let ppid = unsafe { libc::getppid() };
         let Some(pstart) = crate::procreg::host_info(ppid).map(|i| i.0) else {
             return err(errno::EPERM);
         };
-        if crate::procreg::read(ppid).is_none() {
+        let Some(rec) = crate::procreg::read(ppid) else { return err(errno::EPERM) };
+        let euid =
+            crate::userns::from_ns(self.creds.euid, false).unwrap_or(crate::userns::OVERFLOW);
+        let egid = crate::userns::from_ns(self.creds.egid, true).unwrap_or(crate::userns::OVERFLOW);
+        let ids = rec.ids;
+        if ids[0..3].iter().any(|&u| u != euid) || ids[4..7].iter().any(|&g| g != egid) {
             return err(errno::EPERM);
         }
         result(with(|s| {
             let r = (|| {
-                let (ses, _) = s.lookup(c, KEY_SPEC_SESSION_KEYRING, Look::Plain, KEY_LINK)?;
+                let (ses, _) = s.lookup(c, KEY_SPEC_SESSION_KEYRING, Look::PLAIN, KEY_LINK)?;
                 let parent = Caller { pid: ppid, start: pstart, ..c.clone() };
+                let theirs = s.holder(&parent).map_or(0, |h| h.session);
+                let owner = |k: i32| s.keys.get(&k).map(|k| k.uid);
+                if owner(ses) != Some(euid)
+                    || (theirs != 0 && owner(theirs).is_some_and(|u| u != euid))
+                {
+                    return Err(errno::EPERM);
+                }
                 s.holder_mut(&parent).session = ses;
                 Ok(0)
             })();
@@ -1663,13 +1810,13 @@ impl<P: Platform> Kernel<P> {
                 // The prime, the private key, then the base, as Linux reads
                 // them.
                 for id in [ids[1], ids[0], ids[2]] {
-                    let (k, _) = s.lookup(c, id, Look::Plain, KEY_READ)?;
+                    let (k, _) = s.lookup(c, id, Look::PLAIN, KEY_READ)?;
                     let key = &s.keys[&k];
-                    if let Some(e) = key.invalid(now()) {
-                        return Err(e);
-                    }
                     if key.kind != "user" {
                         return Err(errno::EOPNOTSUPP);
+                    }
+                    if let Some(e) = key.invalid(now()) {
+                        return Err(e);
                     }
                     out.push(key.payload.clone());
                 }
@@ -1728,7 +1875,7 @@ impl<P: Platform> Kernel<P> {
         let info = String::from_utf8_lossy(&info).into_owned();
         let r = with(|s| {
             let r = (|| {
-                let (k, _) = s.lookup(c, id, Look::Plain, KEY_SEARCH)?;
+                let (k, _) = s.lookup(c, id, Look::PLAIN, KEY_SEARCH)?;
                 let key = &s.keys[&k];
                 if let Some(e) = key.invalid(now()) {
                     return Err(e);
@@ -1820,7 +1967,7 @@ impl<P: Platform> Kernel<P> {
         };
         result(with(|s| {
             let r = (|| {
-                let (ring, _) = s.lookup(c, id, Look::Plain, KEY_SETATTR)?;
+                let (ring, _) = s.lookup(c, id, Look::PLAIN, KEY_SETATTR)?;
                 let parsed = match (&ty, &restriction) {
                     (None, None) => Restrict::RejectAll,
                     (None, Some(_)) | (Some(_), None) => return Err(errno::EINVAL),
@@ -1920,7 +2067,7 @@ fn parse_serial(t: &str) -> Option<i32> {
 /// Replace key `k`'s payload with `payload`, its owner's quota allowing.
 fn update_payload(s: &mut Store, k: i32, payload: Vec<u8>) -> Result<(), i32> {
     let key = &s.keys[&k];
-    let quota = (key.desc.len() + 1 + payload.len()) as u32;
+    let quota = (key.desc.len() + 1 + crate::keytypes::charge(&key.kind, &payload)) as u32;
     if quota > key.quota && !s.quota_ok(key.uid, false, (quota - key.quota) as u64) {
         return Err(errno::EDQUOT);
     }
@@ -1940,23 +2087,22 @@ fn update_payload(s: &mut Store, k: i32, payload: Vec<u8>) -> Result<(), i32> {
 /// `KEYCTL_SET_REQKEY_KEYRING` choice.
 fn default_dest(s: &mut Store, c: &Caller) -> Result<i32, i32> {
     let choice = s.holder(c).map_or(0, |h| h.reqkey);
-    let order: &[i32] = match choice {
-        KEY_REQKEY_DEFL_THREAD_KEYRING => &[KEY_SPEC_THREAD_KEYRING],
-        KEY_REQKEY_DEFL_PROCESS_KEYRING => &[KEY_SPEC_PROCESS_KEYRING],
-        KEY_REQKEY_DEFL_SESSION_KEYRING => &[KEY_SPEC_SESSION_KEYRING],
-        KEY_REQKEY_DEFL_USER_KEYRING => &[KEY_SPEC_USER_KEYRING],
-        KEY_REQKEY_DEFL_USER_SESSION_KEYRING => &[KEY_SPEC_USER_SESSION_KEYRING],
-        // The default: the first of thread, process and session keyring
-        // the caller has.
-        _ => &[KEY_SPEC_THREAD_KEYRING, KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_SESSION_KEYRING],
-    };
-    for &r in order {
-        let look = if order.len() == 1 { Look::Create } else { Look::Plain };
-        if let Ok((k, _)) = s.lookup(c, r, look, 0) {
-            return Ok(k);
-        }
+    if choice == KEY_REQKEY_DEFL_USER_KEYRING {
+        return Ok(s.user_rings(c.uid).user);
     }
-    Err(errno::ENOKEY)
+    // From the chosen keyring on, the first the caller has: thread,
+    // process, session, then its user's session keyring. None is made.
+    let start = match choice {
+        KEY_REQKEY_DEFL_PROCESS_KEYRING => 1,
+        KEY_REQKEY_DEFL_SESSION_KEYRING => 2,
+        KEY_REQKEY_DEFL_USER_SESSION_KEYRING => 3,
+        _ => 0,
+    };
+    let own = [s.thread_of(c), s.process_of(c), s.holder(c).map_or(0, |h| h.session)];
+    if let Some(&r) = own.iter().skip(start).find(|&&r| r != 0 && s.live(r)) {
+        return Ok(r);
+    }
+    Ok(s.user_rings(c.uid).session)
 }
 
 /// A key type's name, as `add_key`, `request_key` and `keyctl` copy it: at
@@ -1984,7 +2130,7 @@ fn result(r: Result<Result<i64, i32>, i32>) -> i64 {
 
 /// `/proc/keys`: the keys the reader may view.
 pub fn proc_keys(c: &Caller) -> Vec<u8> {
-    let Some(st) = store() else { return Vec::new() };
+    let Some(st) = existing() else { return Vec::new() };
     let s = st.get();
     let possessed = s.possessed(c);
     let now = now();
@@ -2035,7 +2181,7 @@ pub fn proc_keys(c: &Caller) -> Vec<u8> {
 
 /// `/proc/key-users`: each user's keys and quota.
 pub fn proc_key_users() -> Vec<u8> {
-    let Some(st) = store() else { return Vec::new() };
+    let Some(st) = existing() else { return Vec::new() };
     let s = st.get();
     let mut uids: Vec<u32> = s.keys.values().map(|k| k.uid).filter(|u| *u != NO_ID).collect();
     uids.extend(s.users.iter().map(|u| u.uid));
@@ -2117,8 +2263,8 @@ mod tests {
     fn process_keyring_search_and_possession() {
         let c = caller();
         let mut s = Store::default();
-        assert_eq!(s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::Plain, 0), Err(errno::ENOKEY));
-        let (p, possessed) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::Create, 0).unwrap();
+        assert_eq!(s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::PLAIN, 0), Err(errno::ENOKEY));
+        let (p, possessed) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::CREATE, 0).unwrap();
         assert!(possessed);
         let k = user(&mut s, &c, b"k");
         s.link(p, k).unwrap();
@@ -2151,12 +2297,64 @@ mod tests {
     fn possessor_permissions_add_to_the_user_s() {
         let c = caller();
         let mut s = Store::default();
-        let (p, _) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::Create, 0).unwrap();
+        let (p, _) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::CREATE, 0).unwrap();
         let k = user(&mut s, &c, b"k");
         s.keys.get_mut(&k).unwrap().perm = KEY_ALL << KEY_POS_SHIFT;
-        assert_eq!(s.lookup(&c, k, Look::Plain, KEY_VIEW), Err(errno::EACCES));
+        assert_eq!(s.lookup(&c, k, Look::PLAIN, KEY_VIEW), Err(errno::EACCES));
         s.link(p, k).unwrap();
-        assert_eq!(s.lookup(&c, k, Look::Plain, KEY_VIEW), Ok((k, true)));
+        assert_eq!(s.lookup(&c, k, Look::PLAIN, KEY_VIEW), Ok((k, true)));
+    }
+
+    /// A keyring's restriction keeps the key it trusts, though nothing
+    /// else links it.
+    #[test]
+    fn a_restriction_keeps_its_signer() {
+        let c = caller();
+        let mut s = Store::default();
+        let u = s.user_rings(c.uid);
+        let r = ring(&mut s, &c, b"restricted");
+        s.link(u.user, r).unwrap();
+        let signer = user(&mut s, &c, b"signer");
+        s.keys.get_mut(&r).unwrap().restrict = Restrict::KeyOrKeyring(signer, false);
+        s.collect();
+        assert!(s.keys.contains_key(&signer));
+    }
+
+    /// A negative key fails a full lookup with its error; a partial one
+    /// finds it. A revoked key fails a partial lookup, and a revoked
+    /// keyring takes no link.
+    #[test]
+    fn lookups_check_the_key_s_state() {
+        let c = caller();
+        let mut s = Store::default();
+        let (p, _) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::CREATE, 0).unwrap();
+        let k = user(&mut s, &c, b"k");
+        s.link(p, k).unwrap();
+        s.keys.get_mut(&k).unwrap().flags |= NEGATIVE;
+        s.keys.get_mut(&k).unwrap().reject = errno::EKEYREJECTED;
+        assert_eq!(s.lookup(&c, k, Look::PLAIN, KEY_VIEW), Err(errno::EKEYREJECTED));
+        assert!(s.lookup(&c, k, Look::PARTIAL, KEY_VIEW).is_ok());
+        let k2 = user(&mut s, &c, b"k2");
+        s.link(p, k2).unwrap();
+        s.keys.get_mut(&k2).unwrap().flags |= REVOKED;
+        assert_eq!(s.lookup(&c, k2, Look::PARTIAL, KEY_VIEW), Err(errno::EKEYREVOKED));
+        s.keys.get_mut(&p).unwrap().flags |= REVOKED;
+        let k3 = user(&mut s, &c, b"k3");
+        assert_eq!(s.link(p, k3), Err(errno::EKEYREVOKED));
+    }
+
+    /// Each link costs its keyring's owner bytes of their quota.
+    #[test]
+    fn links_are_charged() {
+        let c = caller();
+        let mut s = Store::default();
+        let r = ring(&mut s, &c, b"r");
+        let (_, before) = s.usage(c.uid);
+        let k = user(&mut s, &c, b"k");
+        let (_, with_key) = s.usage(c.uid);
+        s.link(r, k).unwrap();
+        assert_eq!(s.usage(c.uid).1, with_key + LINK_BYTES);
+        assert!(with_key > before);
     }
 
     /// The store survives its encoding.
@@ -2164,7 +2362,7 @@ mod tests {
     fn store_round_trips() {
         let c = caller();
         let mut s = Store::default();
-        let (p, _) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::Create, 0).unwrap();
+        let (p, _) = s.lookup(&c, KEY_SPEC_PROCESS_KEYRING, Look::CREATE, 0).unwrap();
         let k = user(&mut s, &c, b"k");
         s.link(p, k).unwrap();
         s.keys.get_mut(&p).unwrap().restrict = Restrict::KeyOrKeyring(k, true);
