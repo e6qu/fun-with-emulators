@@ -404,7 +404,7 @@ pub(crate) fn any_mapped(start: u64, len: u64) -> bool {
 }
 
 /// Whether all of guest range `[start, start + len)` is mapped.
-fn mapped(start: u64, len: u64) -> bool {
+pub(crate) fn mapped(start: u64, len: u64) -> bool {
     // A backend that knows the guest's memory says (the VM's); the host
     // knows what it has mapped.
     if !crate::uaccess::valid(start, len, false) {
