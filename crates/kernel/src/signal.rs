@@ -297,6 +297,7 @@ pub fn restartable(nr: u64, args: &[u64; 6]) -> bool {
         | n::SENDTO
         | n::SENDMSG
         | n::OPENAT
+        | n::OPENAT2
         | n::IOCTL
         | n::FLOCK
         | n::FCNTL

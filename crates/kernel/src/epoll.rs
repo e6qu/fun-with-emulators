@@ -300,6 +300,38 @@ pub unsafe fn pwait(
     sigmask: u64,
     sigsetsize: u64,
 ) -> i64 {
+    // A negative timeout waits for ever.
+    let ns = if (timeout as i32) < 0 { -1 } else { i64::from(timeout as i32) * 1_000_000 };
+    let _ = (sigmask, sigsetsize);
+    // SAFETY: as the caller guarantees.
+    unsafe { pwait_ns(epfd, events, maxevents, ns) }
+}
+
+/// `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)`:
+/// as `epoll_pwait`, the timeout a `timespec` (null: none).
+///
+/// # Safety
+/// As [`pwait`].
+pub unsafe fn pwait2(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> i64 {
+    let ns = if timeout == 0 {
+        -1
+    } else {
+        let ts: fwe_abi::Timespec = crate::guest!(crate::uaccess::read(timeout));
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return fwe_abi::err(fwe_abi::errno::EINVAL);
+        }
+        ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec)
+    };
+    // SAFETY: as the caller guarantees.
+    unsafe { pwait_ns(epfd, events, maxevents, ns) }
+}
+
+/// The wait of `epoll_pwait` and `epoll_pwait2`, for `ns` nanoseconds (-1:
+/// for ever).
+///
+/// # Safety
+/// `events` must point to space for `maxevents` `epoll_event`s.
+unsafe fn pwait_ns(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     if (maxevents as libc::c_int) <= 0 {
         return fwe_abi::err(fwe_abi::errno::EINVAL);
     }
@@ -312,15 +344,14 @@ pub unsafe fn pwait(
                 epfd as libc::c_int,
                 events as *mut libc::c_void,
                 maxevents as libc::c_int,
-                timeout as libc::c_int,
-                sigmask as *const libc::c_void,
-                sigsetsize as libc::size_t,
+                if ns < 0 { -1 } else { (ns + 999_999) / 1_000_000 } as libc::c_int,
+                std::ptr::null::<libc::c_void>(),
+                8 as libc::size_t,
             )
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (sigmask, sigsetsize);
         // SAFETY: plain host call; F_GETFD only queries.
         if unsafe { libc::fcntl(epfd as i32, libc::F_GETFD) } < 0 {
             return fwe_abi::err(fwe_abi::errno::EBADF);
@@ -329,7 +360,7 @@ pub unsafe fn pwait(
             return fwe_abi::err(fwe_abi::errno::EINVAL);
         }
         // SAFETY: the caller guarantees `events` spans `maxevents` entries.
-        unsafe { pwait_kqueue(epfd, events, maxevents, timeout) }
+        unsafe { pwait_kqueue(epfd, events, maxevents, ns) }
     }
 }
 
@@ -407,10 +438,9 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
 /// which the host does not report ([`crate::fifo`]), and for a signal to
 /// deliver.
 #[cfg(not(target_os = "linux"))]
-unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> i64 {
+unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     use fwe_abi::epoll::*;
     let ep = epfd as i32;
-    let ms = timeout as i32;
     let max = maxevents as usize;
     let fifos: Vec<(i32, u64, u32)> = interest(|m| {
         m.get(&ep).map_or_else(Vec::new, |l| {
@@ -424,14 +454,15 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
     .filter(|&(fd, ..)| crate::fifo::is_reader(fd))
     .collect();
     if fifos.is_empty() {
-        let ready = match kevent_wait(ep, max, ms) {
+        let ready = match kevent_wait(ep, max, ns) {
             Ok(r) => r,
             Err(e) => return e,
         };
         return write_events(events, &ready);
     }
     let deadline =
-        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+        (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
+    let slice = i64::from(crate::fifo::SLICE_MS) * 1_000_000;
     loop {
         // FIFOs whose writers have gone, or with bytes a probe kept.
         let mut ready: Vec<(i32, u32, u64)> = Vec::new();
@@ -456,11 +487,10 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> 
         ready.truncate(max);
         let wait = if ready.is_empty() {
             match deadline {
-                None => crate::fifo::SLICE_MS,
+                None => slice,
                 Some(d) => {
-                    let left =
-                        d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
-                    left.min(crate::fifo::SLICE_MS)
+                    let left = d.saturating_duration_since(std::time::Instant::now()).as_nanos();
+                    (left.min(i64::MAX as u128) as i64).min(slice)
                 }
             }
         } else {
@@ -586,13 +616,13 @@ fn is_unix(fd: i32) -> bool {
 /// (kqueue reports reading and writing separately; epoll as one event).
 /// A one-shot entry that reports is disarmed.
 #[cfg(not(target_os = "linux"))]
-fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, i64> {
+fn kevent_wait(epfd: i32, room: usize, ns: i64) -> Result<Vec<(i32, u32, u64)>, i64> {
     let deadline =
-        (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
-    let mut wait = ms;
+        (ns > 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
+    let mut wait = ns;
     loop {
         let (ready, _) = kevent_once(epfd, room, wait)?;
-        if !ready.is_empty() || ms == 0 {
+        if !ready.is_empty() || ns == 0 {
             return Ok(ready);
         }
         // Nothing the guest asked for (or the events went to another
@@ -603,7 +633,7 @@ fn kevent_wait(epfd: i32, room: usize, ms: i32) -> Result<Vec<(i32, u32, u64)>, 
             if left.is_zero() {
                 return Ok(ready);
             }
-            wait = left.as_millis().clamp(1, i32::MAX as u128) as i32;
+            wait = left.as_nanos().clamp(1, i64::MAX as u128) as i64;
         }
     }
 }
@@ -615,7 +645,7 @@ type Ready = Vec<(i32, u32, u64)>;
 /// One `kevent` wait for [`kevent_wait`]: the events as the guest asked
 /// for them, and how many the host reported.
 #[cfg(not(target_os = "linux"))]
-fn kevent_once(epfd: i32, room: usize, ms: i32) -> Result<(Ready, usize), i64> {
+fn kevent_once(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
     use fwe_abi::epoll::*;
     if room == 0 {
         return Ok((Vec::new(), 0));
@@ -633,8 +663,11 @@ fn kevent_once(epfd: i32, room: usize, ms: i32) -> Result<(Ready, usize), i64> {
     ];
     // The wait is for the kqueue to have events, or a signal for the
     // guest, however soon it lands ([`crate::thread::wait_ready`]); the
-    // events are then taken without waiting.
-    if ms != 0 {
+    // events are then taken without waiting. The wait is in whole
+    // milliseconds, rounded up.
+    if ns != 0 {
+        let ms =
+            if ns < 0 { -1 } else { (ns as u64).div_ceil(1_000_000).min(i32::MAX as u64) as i32 };
         let mut kq = [libc::pollfd { fd: epfd, events: libc::POLLIN, revents: 0 }];
         match crate::thread::wait_ready(&mut kq, ms) {
             Ok(0) => return Ok((Vec::new(), 0)),

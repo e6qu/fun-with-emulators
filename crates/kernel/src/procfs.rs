@@ -172,6 +172,7 @@ const DIRS: &[DirDef] = &[
         b"/proc",
         &[
             (b"self", DT_DIR),
+            (b"version", DT_REG),
             (b"cpuinfo", DT_REG),
             (b"meminfo", DT_REG),
             (b"stat", DT_REG),
@@ -337,6 +338,10 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/keys" => Entry::File(Vec::new()),
         b"/proc/key-users" => Entry::File(crate::keys::proc_key_users()),
         b"/proc/stat" => Entry::File(stat(info.ncpu)),
+        // The kernel, as `uname` gives it (no compiler built fwe's).
+        b"/proc/version" => Entry::File(
+            format!("Linux version {RELEASE} (fwe@fwe) (fwe) #1 SMP PREEMPT\n").into_bytes(),
+        ),
         b"/proc/uptime" => Entry::File(format!("{:.2} 0.00\n", crate::host::uptime()).into_bytes()),
         b"/proc/loadavg" => {
             let [one, five, fifteen] = crate::host::load_averages();

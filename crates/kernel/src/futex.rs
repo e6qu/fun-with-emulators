@@ -133,6 +133,142 @@ pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, 
     }
 }
 
+/// `futex_waitv`'s most futexes.
+const WAITV_MAX: u64 = 128;
+/// `struct futex_waitv`'s flags: the word's size (only 32 bits), NUMA and
+/// memory-policy keys (not offered), private.
+const FUTEX2_SIZE_U32: u32 = 2;
+const FUTEX2_SIZE_MASK: u32 = 3;
+const FUTEX2_NUMA: u32 = 4;
+const FUTEX2_MPOL: u32 = 8;
+const FUTEX2_PRIVATE: u32 = 128;
+
+/// One futex `futex_waitv` waits on: in this process's queues, or in a
+/// slot of the shared table ([`shared`]).
+enum Held {
+    Queued(Arc<Waiter>),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Slot(usize),
+}
+
+impl Held {
+    fn woken(&self) -> bool {
+        match self {
+            Held::Queued(w) => w.woken.load(Ordering::SeqCst),
+            #[cfg(target_os = "macos")]
+            Held::Slot(i) => shared::woken(*i),
+            #[cfg(not(target_os = "macos"))]
+            Held::Slot(_) => false,
+        }
+    }
+}
+
+/// `futex_waitv(waiters, nr, flags, timeout, clockid)`: wait on every
+/// futex of `waiters` at once (while each word holds its value), until a
+/// wake of any of them, whose index is the result, or the absolute
+/// `timeout` on `clockid`. Must be called without the kernel lock held.
+///
+/// # Safety
+/// The guest pointers are checked as they are read.
+pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u64) -> i64 {
+    // In Linux's order: the arguments, the timeout, then the futexes.
+    if flags != 0 || nr == 0 || nr > WAITV_MAX || waiters == 0 {
+        return err(errno::EINVAL);
+    }
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        // Linux's clock ids.
+        let realtime = match clockid {
+            fwe_abi::clock::CLOCK_MONOTONIC => false,
+            fwe_abi::clock::CLOCK_REALTIME => true,
+            _ => return err(errno::EINVAL),
+        };
+        crate::guest!(wait_deadline_abs(timeout, realtime))
+    };
+    let raw = crate::guest!(crate::uaccess::read_bytes(waiters, nr as usize * 24));
+    let mut list: Vec<(u64, u32, bool)> = Vec::new();
+    for w in raw.chunks_exact(24) {
+        let val = u64::from_ne_bytes(w[0..8].try_into().unwrap());
+        let uaddr = u64::from_ne_bytes(w[8..16].try_into().unwrap());
+        let f = u32::from_ne_bytes(w[16..20].try_into().unwrap());
+        let reserved = u32::from_ne_bytes(w[20..24].try_into().unwrap());
+        let known = FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FUTEX2_PRIVATE;
+        if f & !known != 0
+            || reserved != 0
+            || f & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32
+            || f & (FUTEX2_NUMA | FUTEX2_MPOL) != 0
+            || val > u64::from(u32::MAX)
+            || uaddr % 4 != 0
+        {
+            return err(errno::EINVAL);
+        }
+        list.push((uaddr, val as u32, f & FUTEX2_PRIVATE != 0));
+    }
+    let table = table();
+    let mut held: Vec<Held> = Vec::new();
+    // Every one queued, then every word checked: a wake after a change of
+    // a word finds its waiter, as for one futex.
+    let done = |held: Vec<Held>, queues: &mut Queues, e: i32| -> i64 {
+        let mut woken = None;
+        for (i, h) in held.into_iter().enumerate() {
+            let was = match h {
+                Held::Queued(w) => leave(queues, &w, 0) == 0 && w.woken.load(Ordering::SeqCst),
+                #[cfg(target_os = "macos")]
+                Held::Slot(s) => shared::leave(s),
+                #[cfg(not(target_os = "macos"))]
+                Held::Slot(_) => false,
+            };
+            if was {
+                woken = Some(i as i64);
+            }
+        }
+        woken.unwrap_or(err(e))
+    };
+    let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+    for &(uaddr, val, private) in &list {
+        if let Err(e) = load(uaddr) {
+            return done(held, &mut queues, e);
+        }
+        #[cfg(target_os = "macos")]
+        if !private && let Some(slot) = shared::enter(uaddr) {
+            match slot {
+                Ok(i) => held.push(Held::Slot(i)),
+                Err(e) => return done(held, &mut queues, e),
+            }
+            continue;
+        }
+        let _ = (private, val);
+        let me = Arc::new(Waiter { bits: u32::MAX, woken: AtomicBool::new(false) });
+        queues.entry(key(uaddr)).or_default().push_back(me.clone());
+        held.push(Held::Queued(me));
+    }
+    if list.iter().any(|&(uaddr, val, _)| load(uaddr) != Ok(val)) {
+        return done(held, &mut queues, errno::EAGAIN);
+    }
+    // Shared slots are looked at between slices; a private wake notifies.
+    let slice_most = if held.iter().any(|h| matches!(h, Held::Slot(_))) {
+        Duration::from_millis(1)
+    } else {
+        SIGNAL_CHECK
+    };
+    loop {
+        if held.iter().any(Held::woken) {
+            return done(held, &mut queues, errno::EAGAIN);
+        }
+        if crate::thread::deliverable() != 0 {
+            return done(held, &mut queues, errno::EINTR);
+        }
+        let now = Instant::now();
+        let slice = match deadline {
+            Some(d) if now >= d => return done(held, &mut queues, errno::ETIMEDOUT),
+            Some(d) => (d - now).min(slice_most),
+            None => slice_most,
+        };
+        queues = table.cv.wait_timeout(queues, slice).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
 /// This process starts, or runs another program: no thread of it waits on
 /// a shared futex ([`shared`]).
 pub fn process_started() {

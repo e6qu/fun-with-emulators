@@ -297,6 +297,7 @@ impl<P: Platform> Kernel<P> {
 
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),
+            nr::OPENAT2 => self.sys_openat2(a[0], a[1], a[2], a[3]),
             nr::FACCESSAT => self.sys_faccessat(a[0], a[1], a[2], 0),
             nr::FACCESSAT2 => self.sys_faccessat(a[0], a[1], a[2], a[3]),
             nr::NEWFSTATAT => self.sys_newfstatat(a[0], a[1], a[2], a[3]),
@@ -358,6 +359,8 @@ impl<P: Platform> Kernel<P> {
             nr::CHROOT => self.sys_chroot(a[0]),
             nr::MMAP => self.sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
             nr::MUNMAP => self.sys_munmap(a[0], a[1]),
+            nr::MSEAL => self.sys_mseal(a[0], a[1], a[2]),
+            nr::REMAP_FILE_PAGES => self.sys_remap_file_pages(a[0], a[1], a[2], a[3], a[4]),
             nr::MPROTECT => self.sys_mprotect(a[0], a[1], a[2]),
             nr::MADVISE => self.sys_madvise(a[0], a[1], a[2]),
             nr::MSYNC => self.sys_msync(a[0], a[1], a[2]),
