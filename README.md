@@ -1,8 +1,39 @@
 # fun-with-emulators
 
-Run unmodified Linux arm64 binaries on macOS (Apple Silicon), in-process and
-at native speed. `fwe` implements the Linux kernel's userspace ABI rather
-than running a Linux kernel: like Wine, but for Linux. Written in Rust.
+Run unmodified Linux arm64 binaries on macOS (Apple Silicon). `fwe`
+implements the Linux kernel's userspace ABI rather than running a Linux
+kernel: like Wine, but for Linux. Written in Rust.
+
+## How it works
+
+A Mac with Apple Silicon has the same processor architecture as an arm64
+Linux machine, so a Linux program's instructions can run on it directly.
+What differs is the kernel. `fwe` plays the Linux kernel: each guest
+process is one `fwe` process, which catches every system call the program
+makes, carries it out with macOS's own calls, and turns what macOS reports
+(signals, key strokes, children ending, errors) into what Linux would have
+said. Files, sockets and terminals are the host's; what macOS lacks
+(namespaces, cgroups, epoll, inotify, System V IPC, keyrings and more)
+`fwe` provides itself, shared between its processes.
+
+Programs run in one of two backends, chosen per program:
+
+- **Native.** The program runs inside the `fwe` process, on the CPU, at
+  native speed. Before its code may execute, `fwe` rewrites the few
+  instructions macOS cannot let a Linux program run unchanged: each
+  system call (`svc #0`) becomes a trap into `fwe`, and accesses to the
+  thread pointer and to the `x18` register, which macOS reserves, go
+  through short stubs. Every position-independent program runs this way,
+  which is most of what a Linux distribution ships.
+- **Hypervisor.** A program linked at a fixed address below 4 GiB cannot
+  be placed in a macOS process, which reserves that range. `fwe` runs it
+  in a small Hypervisor.framework VM instead: the program's code runs
+  unmodified at EL0 with an address space of its own, and each system
+  call leaves the VM and is served by the same code as in the native
+  backend.
+
+[docs/linux-on-macos.md](docs/linux-on-macos.md) explains all of this in
+detail.
 
 ## Status
 
@@ -28,7 +59,7 @@ LTP's system-call tests pass at 877 of 1550 (75% of those that apply).
 |---|---|
 | [PLAN.md](PLAN.md) | Goal, approach, scope and the 1.0 finish line |
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
-| [docs/linux-on-macos.md](docs/linux-on-macos.md) | How each Linux concept (system calls, memory, processes, signals, namespaces, cgroups…) maps onto macOS, and how host events (signals, key strokes, children ending, errors…) reach the guest |
+| [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run in which backend, which instructions are rewritten, how the VM is used; how each Linux concept (system calls, memory, processes, signals, namespaces, cgroups…) maps onto macOS, and how host events (signals, key strokes, children ending, errors…) reach the guest |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
