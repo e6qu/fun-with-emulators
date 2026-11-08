@@ -28,9 +28,9 @@ operation are in [hypervisor.md](hypervisor.md).
 ## Components
 
 fwe is a Cargo workspace of five crates. The `fwe` command hands the
-program to `crates/native`, which picks a backend for it; both backends lean on the kernel crate for every system
-call, and everything that knows Linux's numbers and layouts takes them
-from the ABI crate:
+program to `crates/native`, which picks a backend for it; both backends
+lean on the kernel crate for every system call, and everything that knows
+Linux's numbers and layouts takes them from the ABI crate:
 
 ```mermaid
 flowchart TD
