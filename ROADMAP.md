@@ -83,6 +83,8 @@ capabilities. *crun, podman and containerd run standard images.*
 - namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
   `NS_GET_*` requests;
 - inotify, its events raised by fwe from every process's file calls;
+- keys and keyrings (`add_key`, `request_key`, `keyctl`), shared by every
+  process, with Diffie-Hellman, asymmetric and encrypted keys;
 - mounts as Linux has them: propagation (between peers, to slaves, across
   namespaces), the `nodev`, `noexec`, `nosymfollow` and access-time flags
   acted on, busy mounts refused, `MNT_EXPIRE`, and `pivot_root` of a
