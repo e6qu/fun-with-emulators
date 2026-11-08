@@ -2308,17 +2308,6 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// `/dev/shm`: Linux mounts a tmpfs there that every process on the
-/// machine shares. fwe keeps one directory for it per rootfs (the host's
-/// `/` included), private to the user, shared by every fwe process that
-/// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
-/// user's temporary directory. Unlike a tmpfs it outlives the processes,
-/// until the host clears its temporary files.
-/// A `/proc` path naming a process by pid: `Ok` with the reader's own as
-/// `/proc/self/...` (any other path unchanged), or `Err` with another's
-/// host pid (if it is in the reader's pid namespace), pid and the rest of
-/// the path.
-#[allow(clippy::type_complexity)]
 /// The files of `/proc/self/task/<tid>`.
 const TASK_FILES: &[&[u8]] = &[b"stat", b"status", b"comm"];
 
@@ -2364,6 +2353,11 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
     }
 }
 
+/// A `/proc` path naming a process by pid: `Ok` with the reader's own as
+/// `/proc/self/...` (any other path unchanged), or `Err` with another's
+/// host pid (if it is in the reader's pid namespace), pid and the rest of
+/// the path.
+#[allow(clippy::type_complexity)]
 fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)> {
     let Some(rest) = absolute.strip_prefix(b"/proc/") else { return Ok(absolute.to_vec()) };
     let (num, sub) = match rest.iter().position(|&b| b == b'/') {
@@ -2421,6 +2415,12 @@ fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
     }
 }
 
+/// `/dev/shm`: Linux mounts a tmpfs there that every process on the
+/// machine shares. fwe keeps one directory for it per rootfs (the host's
+/// `/` included), private to the user, shared by every fwe process that
+/// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
+/// user's temporary directory. Unlike a tmpfs it outlives the processes,
+/// until the host clears its temporary files.
 pub(crate) mod shm {
     use super::{OwnedFd, e, fd_path};
     use fwe_abi::errno;
