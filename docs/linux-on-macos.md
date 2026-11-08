@@ -560,8 +560,10 @@ sequenceDiagram
 | `struct stat`, `statx` | different layout | translated |
 | `getdents64` | `getdirentries` | built from it |
 | record locks (`F_SETLK`) | POSIX locks, different `struct flock` | translated; the host's, so they hold against host processes too |
-| OFD locks (`F_OFD_*`) | none | `EINVAL`, as on a kernel before 3.15 |
-| leases, `F_SETSIG`, thread owners, `F_SETPIPE_SZ` | none | recorded and read back, no effect (`crates/kernel/src/fdstate.rs`) |
+| OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
+| leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits for it, up to `fs.lease-break-time` |
+| `F_SETSIG`, thread owners | `SIGIO` to a process or group | kept per descriptor (`crates/kernel/src/fdstate.rs`); a host `SIGIO` for a descriptor with a chosen signal arrives as that signal, with `si_fd` and `si_band` |
+| pipe size (`F_SETPIPE_SZ`) | fixed, 64 KiB at most | reported from the host pipe; a size set above 64 KiB holds no more |
 | extended attributes | own namespace (`com.apple.`) | Linux names stored as host attributes of the same name; Linux's rules per namespace; `system.` ACLs not kept |
 | mode bits; root passes them | owner's bits enforced on the owner | a mode denying its owner is kept in an attribute (`UF_NODUMP` flags the file), the host file keeps owner read/write (`crates/kernel/src/modes.rs`) |
 | FIFO hang-up in `poll`/`epoll` | `POLLHUP` once the last writer goes | macOS reports nothing; fwe asks `select` between short slices (`crates/kernel/src/fifo.rs`) |
