@@ -14,10 +14,10 @@
 //! left alone rather than risk a wrong rewrite. The PC-relative forms,
 //! compare/test branches and indirect branches through `x18` have their own
 //! decoders here, since their stubs differ. What is still left alone — a
-//! load/store with writeback onto `sp` or a register offset from `sp`,
-//! flag-setting, shifted or extended arithmetic from `sp`, `casp` and the
-//! pointer-authenticated loads — is found by [`names_x18`], which knows the
-//! register fields of every non-SIMD group, so it can be counted exactly.
+//! load/store with writeback onto `sp`, a result written to `sp`, `casp`
+//! and the pointer-authenticated loads — is found by [`names_x18`], which
+//! knows the register fields of every non-SIMD group, so it can be counted
+//! exactly.
 
 /// A register operand: its field position (low bit) and access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,11 +1,11 @@
 //! inotify: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, and
 //! the events fwe raises as its processes act on files.
 //!
-//! The host's file events (`kqueue`, FSEvents) say neither which name a
-//! directory gained nor that a file was opened, read or closed, so fwe
-//! raises Linux's events itself, from the calls of every fwe process that
-//! act on a watched file or on a file in a watched directory: what is
-//! done by a program fwe does not run is not seen.
+//! The host's file events (`kqueue`, which names nothing, and FSEvents,
+//! which reports paths after the fact) never say that a file was opened,
+//! read or closed, so fwe raises Linux's events itself, from the calls of
+//! every fwe process that act on a watched file or on a file in a watched
+//! directory: what is done by a program fwe does not run is not seen.
 //!
 //! The watches are a record every process sees ([`crate::shared::Record`]):
 //! each names its instance, its watch descriptor, the file (host device

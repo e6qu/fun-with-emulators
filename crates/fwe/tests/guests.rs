@@ -41,7 +41,7 @@ fn run_bounded(mut cmd: Command) -> Output {
 /// backend). A VM process must never be killed with its VM alive, so the
 /// command runs in a process group of its own; on timeout the group gets
 /// `SIGTERM`, which every VM process catches to tear its VM down first,
-/// and only a group still alive 5 s later gets `SIGKILL`. Afterwards no
+/// and only a leader still alive 5 s later gets `SIGKILL`. Afterwards no
 /// process of the group may be left (a fork child outliving its test would
 /// keep a VM running alongside the next one): the test fails if one is.
 fn run_vm_bounded(cmd: Command) -> Output {
@@ -3129,8 +3129,8 @@ fn unicorn_present() -> bool {
 fn hv_mode() -> Option<&'static HvMode> {
     static MODE: OnceLock<Option<HvMode>> = OnceLock::new();
     MODE.get_or_init(|| {
-        // The real framework only on request: the development Mac went down
-        // four times while this backend was built (docs/hypervisor.md), so a
+        // The real framework only on request: misusing it can bring the
+        // machine down (the safety rules in docs/hypervisor.md), so a
         // plain `cargo test` never starts a VM. Only a machine whose crash
         // costs nothing (the self-hosted runner) sets this.
         if std::env::var_os("FWE_HV_TESTS").is_none_or(|v| v != "1") {
@@ -3164,9 +3164,8 @@ fn hv_mode() -> Option<&'static HvMode> {
 
 /// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
 fn real_fwe() -> Option<PathBuf> {
-    // Never alongside another hypervisor client: three of the crashes
-    // came while one (Podman's krunkit, with nested virtualization) ran
-    // beside these tests (docs/hypervisor.md).
+    // Never alongside another hypervisor client, such as Podman's krunkit
+    // (the safety rules in docs/hypervisor.md).
     if let Some(other) = other_hypervisor_client() {
         eprintln!(
             "skipped: another hypervisor client is running ({other}); \

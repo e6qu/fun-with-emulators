@@ -3,10 +3,10 @@
 //! CPU emulator as a library, loaded with `dlopen` only in this mode.
 //!
 //! It exists so the VM backend can be developed and tested without a real
-//! VM: the development Mac went down four times while the backend was built
-//! (see `docs/hypervisor.md`). It can never prove the real backend works —
-//! only the real framework on real hardware can — so VM changes still run
-//! there now and then.
+//! VM: misusing the framework can bring the machine down (see the safety
+//! rules in `docs/hypervisor.md`). It can never prove the real backend
+//! works — only the real framework on real hardware can — so VM changes
+//! still run there now and then.
 //!
 //! What it models, as the backend sees it:
 //!
@@ -21,8 +21,8 @@
 //!   memory whose most was RWX or RW, whatever the flags, but refused a
 //!   vfork child's code, which could only ever be read (an inferred rule,
 //!   to be confirmed on real hardware).
-//! - **Stage 1 is fwe's own tables**, read from guest memory at the first
-//!   run: they must map identity blocks, and only what they let EL0 touch is
+//! - **Stage 1 is fwe's own tables**, walked as the hardware walks them
+//!   and cached until fwe's TLB stub runs; only what they let EL0 touch is
 //!   mapped for the emulated CPU.
 //! - **EL0 exceptions go through the vector to `hvc`**: an `svc`, `brk`,
 //!   undefined instruction, alignment fault or trapped system instruction

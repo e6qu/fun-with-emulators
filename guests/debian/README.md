@@ -1,9 +1,8 @@
 # Vendored Debian programs (test fixture)
 
 Unmodified GNU coreutils, bash, git, SQLite and lighttpd from Debian 12
-(bookworm) for `aarch64`,
-vendored so the end-to-end tests can run **real distribution binaries** — the
-M1 goal of running programs from a Debian rootfs. They are dynamically linked
+(bookworm) for `aarch64`, vendored so the end-to-end tests can run **real
+distribution binaries** from a Debian rootfs. They are dynamically linked
 against glibc and run against the glibc runtime vendored under `guests/glibc`
 (`/lib/ld-linux-aarch64.so.1` and `/lib/libc.so.6`).
 
@@ -17,9 +16,9 @@ against glibc and run against the glibc runtime vendored under `guests/glibc`
 | `bin/sort` | Sort lines. |
 | `bin/ls` | List a directory; pulls in a shared-library graph. |
 | `bin/bash` | The GNU Bourne-Again shell; needs `libtinfo.so.6`. |
-| `bin/git` | Git, the first of M2's target programs; needs `libpcre2-8.so.0` and `libz.so.1`. |
-| `bin/sqlite3` | The SQLite shell, M2's database; needs `libsqlite3.so.0`, `libreadline.so.8` and `libz.so.1`. |
-| `bin/lighttpd` | The lighttpd web server, M2's web server; needs `libpcre2-8.so.0`, `libnettle.so.8` and `libxxhash.so.0`. |
+| `bin/git` | Git; needs `libpcre2-8.so.0` and `libz.so.1`. |
+| `bin/sqlite3` | The SQLite shell; needs `libsqlite3.so.0`, `libreadline.so.8` and `libz.so.1`. |
+| `bin/lighttpd` | The lighttpd web server; needs `libpcre2-8.so.0`, `libnettle.so.8` and `libxxhash.so.0`. |
 | `lighttpd/mod_cgi.so`, `lighttpd/mod_dirlisting.so` | lighttpd modules, loaded from `/usr/lib/lighttpd`. |
 | `lib/libselinux.so.1` | Needed by `ls`; in turn needs `libpcre2-8.so.0`. |
 | `lib/libpcre2-8.so.0` | Needed by `libselinux`. |

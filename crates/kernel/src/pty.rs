@@ -2,8 +2,8 @@
 //!
 //! Linux allocates a pty by opening `/dev/ptmx` (yielding a master), reading
 //! the slave number with the `TIOCGPTN` ioctl, unlocking it with `TIOCSPTLCK`,
-//! and opening `/dev/pts/<n>`. macOS has neither `/dev/ptmx` nor those ioctls;
-//! it uses `posix_openpt`/`grantpt`/`unlockpt`/`ptsname`. Those four are also
+//! and opening `/dev/pts/<n>`. macOS's `/dev/ptmx` takes none of those
+//! ioctls; it uses `posix_openpt`/`grantpt`/`unlockpt`/`ptsname`. Those four are also
 //! available on Linux, so this module uses them uniformly and presents the
 //! Linux interface to the guest:
 //!
