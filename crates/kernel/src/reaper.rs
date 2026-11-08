@@ -702,6 +702,11 @@ mod watch {
         }
     }
 
+    /// How long a signal sent to a followed process is given to stop or
+    /// continue it, and how long it is looked for often.
+    const SIGNAL_SETTLES: std::time::Duration = std::time::Duration::from_secs(5);
+    const SIGNAL_SOON: std::time::Duration = std::time::Duration::from_millis(50);
+
     struct Watcher {
         kq: i32,
         watched: HashSet<i32>,
@@ -839,13 +844,24 @@ mod watch {
         // nothing else will be reported for them.
         let mut ending: HashSet<(i32, Option<u64>)> = HashSet::new();
         // Followed processes sent a signal, looked at until it has stopped
-        // or continued them or a little while has passed (a stop takes
-        // effect as the process gets to it).
+        // or continued them or [`SIGNAL_SETTLES`] has passed. The host
+        // tells of a signal sent, not of the stop it makes, which takes
+        // effect as the process gets to it: on a busy host, long after.
         let mut signalled: std::collections::HashMap<i32, std::time::Instant> = Default::default();
         let soon = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+        let later = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
         loop {
             let idle = ending.is_empty() && signalled.is_empty();
-            let timeout = if idle { std::ptr::null() } else { &soon as *const _ };
+            // Often at first, where a stop usually is; less so after.
+            let fresh =
+                !ending.is_empty() || signalled.values().any(|sent| sent.elapsed() < SIGNAL_SOON);
+            let timeout = if idle {
+                std::ptr::null()
+            } else if fresh {
+                &soon as *const _
+            } else {
+                &later as *const _
+            };
             // SAFETY: valid out-buffer; blocks until something happens (or
             // briefly, while an end is under way).
             let n = unsafe {
@@ -876,14 +892,11 @@ mod watch {
                         w.stopped.remove(&pid);
                         CHANGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.pid != pid);
                     } else if ev.fflags & libc::NOTE_SIGNAL != 0 && pid != me {
-                        let until =
-                            std::time::Instant::now() + std::time::Duration::from_millis(50);
-                        signalled.insert(pid, until);
+                        signalled.insert(pid, std::time::Instant::now());
                     }
                 }
                 // Those of them that stopped or continued.
-                let now = std::time::Instant::now();
-                signalled.retain(|&pid, until| {
+                signalled.retain(|&pid, sent| {
                     let sig = procreg::stopped_by(pid);
                     let was = w.stopped.get(&pid).copied().unwrap_or(false);
                     if sig.is_some() != was {
@@ -895,7 +908,7 @@ mod watch {
                         }
                         return false;
                     }
-                    now < *until
+                    sent.elapsed() < SIGNAL_SETTLES
                 });
                 // Those that have ended by now: a zombie, or gone.
                 ending.retain(|&(pid, start)| {
