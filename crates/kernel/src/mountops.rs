@@ -254,13 +254,18 @@ impl<P: Platform> Kernel<P> {
             let flags = if named == 0 { flags } else { flags | default_atime(flags) };
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0 {
-            match self.mount_path(&source, true) {
+            // A file fwe serves from the host outside any mount (the
+            // standard device nodes): that host file.
+            let device = self.fs().device_host(&source);
+            let from = match device {
+                Some(_) => Err(errno::EINVAL),
+                None => self.mount_path(&source, true),
+            };
+            match from {
                 Ok((from, _)) => {
                     ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0, 0).map(|_| ()))
                 }
-                // A file fwe serves from the host outside any mount (the
-                // standard device nodes): that host file.
-                Err(errno::EINVAL) => match self.host_source(&source) {
+                Err(errno::EINVAL) => match device.or_else(|| self.host_source(&source)) {
                     Some(host) => ns.update(|t| {
                         t.mount(
                             &point,

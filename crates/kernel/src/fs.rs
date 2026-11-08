@@ -1293,6 +1293,23 @@ impl Fs {
         host_to_ns(&self.mnt.table(), &fd_path(fd)?)
     }
 
+    /// The host file `path` stands for, if it names one of the standard
+    /// device nodes fwe serves in the rootfs's own `/dev` (see
+    /// [`resolve_in`]): what a bind mount of it shows.
+    pub fn device_host(&self, path: &[u8]) -> Option<Vec<u8>> {
+        let absolute = self.absolute_path(fcntl::AT_FDCWD as i32, path)?;
+        let name = absolute.strip_prefix(b"/dev/")?;
+        if !DEVICES.contains(&name) && crate::loopdev::node_named(name).is_none() {
+            return None;
+        }
+        if !is_rootfs(&self.mount_of(&absolute).0, &self.root_host) {
+            return None;
+        }
+        let r = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
+        let dir = fd_path(r.dir.as_raw_fd())?;
+        Some(mounts::join(&dir, &r.name))
+    }
+
     /// Set the working directory to the resolved `path`.
     pub fn chdir(&mut self, dirfd: i32, path: &[u8]) -> Result<(), i32> {
         let resolved = self.resolve(dirfd, path, true)?;

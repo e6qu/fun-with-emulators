@@ -277,5 +277,19 @@ fn main() {
         let still = atime_after_read(recent) > recent;
         println!("atime: noatime keeps {kept}, strictatime moves {moved}, remount keeps the mode {still}");
         umount(c(&b).as_ptr());
+
+        // A standard device node bound over a file (as runtimes mask
+        // paths with /dev/null): the file is the device now.
+        let masked = format!("{base}/masked");
+        std::fs::write(&masked, b"secret").unwrap();
+        const MS_BIND: u64 = 4096;
+        let r = mount(c("/dev/null").as_ptr(), c(&masked).as_ptr(), std::ptr::null(), MS_BIND, std::ptr::null());
+        let is_dev = {
+            use std::os::unix::fs::FileTypeExt;
+            std::fs::metadata(&masked).map(|m| m.file_type().is_char_device()).unwrap_or(false)
+        };
+        let empty = std::fs::read(&masked).map(|d| d.is_empty()).unwrap_or(false);
+        println!("device bind: {r}, a device {is_dev}, reads empty {empty}");
+        umount(c(&masked).as_ptr());
     }
 }

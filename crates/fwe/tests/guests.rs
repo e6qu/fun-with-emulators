@@ -2810,7 +2810,8 @@ const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown pa
     propagation: into the copied namespace true, unmount too true\n\
     enforced: nodev true, noexec true (mprotect too true), nosymfollow true\n\
     unmount: busy refused true, expire marks true, then unmounts true\n\
-    atime: noatime keeps true, strictatime moves true, remount keeps the mode true\n";
+    atime: noatime keeps true, strictatime moves true, remount keeps the mode true\n\
+    device bind: 0, a device true, reads empty true\n";
 
 /// The new mount API: a tmpfs made through a filesystem context and
 /// attached from a detached mount, a detached copy attached beneath
