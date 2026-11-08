@@ -1087,7 +1087,15 @@ stops being a subreaper keeps those it adopted.
 the maps), from their records and what the host reports of their
 descriptors; `/proc/self/ns` names each namespace, its links followed by
 `stat` to the namespace itself (its number the inode, as nsfs shows it),
-and `/proc/self/fdinfo` describes each descriptor. A process's
+and `/proc/self/fdinfo` describes each descriptor. Opening a `/proc/<pid>/ns`
+link gives a namespace descriptor (`crates/kernel/src/nsfd.rs`), which
+names the namespace's record: it stats as that namespace, refuses a read
+or write as nsfs does, answers the `NS_GET_*` requests (the type; a pid or
+user namespace's parent, and an owner, when the caller can see it, as
+Linux decides; a user namespace's owner; a mount namespace's id), and is
+what `setns` joins, as `unshare` moves the process to a new namespace (a
+pid namespace for its children; a user namespace with every capability in
+it). A process's
 `oom_score_adj` is in its record, inherited by its children (going below
 the last value a privileged process set takes `CAP_SYS_RESOURCE`), and so
 are its user and group ids, which its files there are owned by.
@@ -1251,8 +1259,11 @@ of these are to be lifted for 1.0 and which are not planned.
   (ext4, XFS: `ENODEV`), so a loop device holds a file's bytes but no
   filesystem to mount. Mounts do not propagate, between namespaces or
   within one, whatever their propagation type (peer groups and masters
-  are kept and shown); a detached mount or a filesystem context does not
-  survive an `execve`; a remount of a filesystem acts on the one mount; a
+  are kept and shown); a detached mount or a filesystem context is the
+  process's (a fork child or an `execve` keeps those whose descriptors it
+  keeps), so one passed to another process over a socket is a plain
+  descriptor of its directory; `fspick` reconfigures the one mount, its
+  `ro`, `rw` and options; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
   always detaches). An overlay's layers must be host directories (not in
   another overlay); a directory a lower layer has cannot be renamed
@@ -1271,7 +1282,8 @@ of these are to be lifted for 1.0 and which are not planned.
   port is freed
   when the last descriptor of its socket in the binding process closes;
   capabilities are the process's, not qualified by user namespace;
-  `setns` is not implemented; a pid namespace's init killed from outside
+  the owning user namespace `NS_GET_USERNS` reports for a namespace of
+  another kind is the caller's; a pid namespace's init killed from outside
   fwe after its parent ran another program (`execve`) ends its namespace
   only once that parent reaps it or a reaper sees it gone; a reaper sees
   an adopted orphan's state after each signal it is sent, so a stop and a

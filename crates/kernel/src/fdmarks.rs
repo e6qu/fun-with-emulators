@@ -74,6 +74,9 @@ pub enum Mark {
     /// A detached mount tree (`fsmount`, `open_tree`), by its number: an
     /// `O_PATH` descriptor ([`crate::mountapi`]).
     Detached(u32),
+    /// A namespace (`/proc/<pid>/ns/<kind>` opened), by its number
+    /// ([`crate::nsfd`]).
+    Ns(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,8 +371,9 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Mq) => 12,
             Some(Mark::FsContext(_)) => 13,
             Some(Mark::Detached(_)) => 14,
+            Some(Mark::Ns(_)) => 15,
         });
-        if let Some(Mark::FsContext(n) | Mark::Detached(n)) = rec.mark {
+        if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n)) = rec.mark {
             e.u32(n);
         }
         if let Some(Mark::Loop(n)) = rec.mark {
@@ -434,6 +438,7 @@ pub fn load(d: &mut Dec) {
             12 => Some(Mark::Mq),
             13 => Some(Mark::FsContext(d.u32())),
             14 => Some(Mark::Detached(d.u32())),
+            15 => Some(Mark::Ns(d.u32())),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

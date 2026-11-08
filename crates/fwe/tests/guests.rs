@@ -2817,6 +2817,21 @@ fn the_new_mount_api_makes_and_attaches_mounts() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `nsfd` guest prints.
+const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
+    nstype 0x4000000, parent of a UTS namespace refused true\n\
+    setns: 0, own name true, back true\n\
+    wrong type refused true\n";
+
+/// Namespace descriptors: `/proc/self/ns/uts` opened as nsfs shows it,
+/// the `NS_GET_*` requests, and `setns` back into the namespace it names.
+#[test]
+fn namespace_descriptors_name_and_join_namespaces() {
+    let out = fwe(&rust_guest("nsfd"), &[]);
+    assert_eq!(stdout(&out), NSFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `loopdev` guest prints.
 const LOOPDEV: &str = "free: true\n\
     node: 0, block device: true, 7:N: true\n\
@@ -3350,6 +3365,15 @@ fn hv_message_queues_deliver_and_notify() {
 fn hv_the_new_mount_api_makes_and_attaches_mounts() {
     let Some(out) = fwe_hv(&rust_low_guest("mountapi"), &[]) else { return };
     assert_eq!(stdout(&out), MOUNTAPI, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Namespace descriptors in the VM (see
+/// [`namespace_descriptors_name_and_join_namespaces`]).
+#[test]
+fn hv_namespace_descriptors_name_and_join_namespaces() {
+    let Some(out) = fwe_hv(&rust_low_guest("nsfd"), &[]) else { return };
+    assert_eq!(stdout(&out), NSFD, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

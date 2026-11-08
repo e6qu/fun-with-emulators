@@ -757,6 +757,9 @@ impl Fs {
         if crate::signalfd::is_signalfd(fd) {
             return b"anon_inode:[signalfd]".to_vec();
         }
+        if let Some(t) = crate::nsfd::target(fd) {
+            return t;
+        }
         // SAFETY: an all-zero stat is a valid out-parameter.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `st` is a valid out-parameter.
@@ -874,6 +877,17 @@ impl Fs {
     pub fn proc_path(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
         let p = self.synthetic_path(dirfd, path)?;
         own_or_other(&p).ok()
+    }
+
+    /// The process a `/proc/<pid>/...` path (from `dirfd`) is about and the
+    /// rest of the path: `None` for the caller (`self` or its own pid),
+    /// else its host pid (`None` inside when it has none), with the rest.
+    pub fn proc_target(&self, dirfd: i32, path: &[u8]) -> Option<(Option<Option<i32>>, Vec<u8>)> {
+        let p = self.synthetic_path(dirfd, path)?;
+        match own_or_other(&p) {
+            Ok(own) => Some((None, own.strip_prefix(b"/proc/self")?.to_vec())),
+            Err((host, _, sub)) => Some((Some(host), sub)),
+        }
     }
 
     /// The path in fwe's synthetic tree (`/proc/...`, `/sys/...`) that

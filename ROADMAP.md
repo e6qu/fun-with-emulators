@@ -79,7 +79,9 @@ capabilities. *crun, podman and containerd run standard images.*
   netlink socket).
 - the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`,
   `open_tree`, `move_mount`, `mount_setattr`, `statmount`, `listmount`),
-  with peer groups kept and mount ids in `statx`.
+  with peer groups kept and mount ids in `statx`;
+- namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
+  `NS_GET_*` requests.
 
 ## Left to 1.0
 
@@ -101,9 +103,7 @@ In order of what each item unblocks. The LTP counts are from the latest
 run.
 
 - [ ] **Missing system calls LTP tests:**
-  - `inotify` (and `fanotify` refused cleanly);
-  - namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
-    `NS_GET_*` requests.
+  - `inotify` (and `fanotify` refused cleanly).
 - [ ] **Mounts as Linux enforces them:** propagation between peers and to
   slaves; `nodev`, `noexec`, `nosymfollow` and the access-time modes
   acted on; a busy mount refused (`EBUSY`), with `MNT_DETACH` and

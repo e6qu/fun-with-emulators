@@ -507,9 +507,7 @@ impl Table {
                 .filter(|m| self.is_below(m.id, src.id))
                 .cloned()
                 .collect();
-            let mut below = below;
-            below.sort_by_key(|m| m.point.len());
-            for m in below {
+            for m in parent_first(src.id, below) {
                 let Some(&(_, parent)) = copies.iter().find(|(o, _)| *o == m.parent) else {
                     continue;
                 };
@@ -539,15 +537,14 @@ impl Table {
         }
         let mut tree = vec![Mount { point: Vec::new(), root: src.fs_path(&rest), ..src.clone() }];
         if recursive {
-            let mut below: Vec<Mount> = self
+            let below: Vec<Mount> = self
                 .mounts
                 .iter()
                 .filter(|m| under(&m.point, from).is_some_and(|r| !r.is_empty()))
                 .filter(|m| self.is_below(m.id, src.id))
                 .cloned()
                 .collect();
-            below.sort_by_key(|m| m.point.len());
-            for m in below {
+            for m in parent_first(src.id, below) {
                 let point = under(&m.point, from).unwrap_or(b"").to_vec();
                 tree.push(Mount { point, ..m });
             }
@@ -651,6 +648,43 @@ impl Table {
         Ok(())
     }
 
+    /// Move the mount whose root is `from` beneath the mount whose root is
+    /// `to`: between that one and what it is attached to, keeping its id.
+    pub fn move_beneath(&mut self, from: &[u8], to: &[u8]) -> Result<(), i32> {
+        let (m, rest) = self.locate(from);
+        if !rest.is_empty() || m.parent == m.id {
+            return Err(errno::EINVAL);
+        }
+        let (id, old_point) = (m.id, m.point.clone());
+        let (top, rest) = self.locate(to);
+        if !rest.is_empty() || top.parent == top.id {
+            return Err(errno::EINVAL);
+        }
+        let (top, below) = (top.id, top.parent);
+        if top == id || self.is_below(top, id) || self.is_below(id, top) {
+            return Err(errno::EINVAL);
+        }
+        // What was stacked on it stays where it was, on what it was on.
+        let parent = self.get(id).map_or(0, |m| m.parent);
+        for o in self.mounts.iter_mut() {
+            if o.parent == id && o.point == old_point {
+                o.parent = parent;
+            }
+        }
+        let moved = self.descendants(id);
+        for o in self.mounts.iter_mut() {
+            if o.id == id {
+                o.parent = below;
+                o.point = to.to_vec();
+            } else if o.id == top {
+                o.parent = id;
+            } else if moved.contains(&o.id) {
+                o.point = join(to, under(&o.point, &old_point).unwrap_or(b""));
+            }
+        }
+        Ok(())
+    }
+
     /// Change the per-mount flags of the mount whose root is `path`, and
     /// its filesystem's options if `data` is given. A remount of a
     /// filesystem acts on the one mount: what is mounted twice is two
@@ -694,6 +728,19 @@ impl Table {
     fn change_propagation(&mut self, id: u32, how: u64) {
         let Some(m) = self.get(id).cloned() else { return };
         let others = m.peer != 0 && self.mounts.iter().any(|o| o.id != id && o.peer == m.peer);
+        if m.peer != 0 && !others && how != ms::SHARED {
+            // The last of its group leaves it: the group's slaves receive
+            // from what it received from, or from nothing.
+            for s in self.mounts.iter_mut().filter(|s| s.master == m.peer) {
+                s.master = m.master;
+                if s.master == 0 {
+                    s.propagation &= !ms::SLAVE;
+                    if s.propagation & (ms::SHARED | ms::UNBINDABLE) == 0 {
+                        s.propagation = ms::PRIVATE;
+                    }
+                }
+            }
+        }
         let (peer, master) = match how {
             ms::SHARED if m.peer == 0 => (self.alloc_group(), m.master),
             ms::SHARED => (m.peer, m.master),
@@ -793,7 +840,7 @@ impl Table {
                 b" ",
                 &escape(&m.device),
                 b" ",
-                &m.options,
+                &escape(&m.options),
                 b"\n",
             ]
             .concat();
@@ -823,7 +870,7 @@ impl Table {
                 b" ",
                 m.fstype.name().as_bytes(),
                 b" ",
-                &opts,
+                &escape(&opts),
                 b" 0 0\n",
             ]
             .concat();
@@ -959,6 +1006,27 @@ pub mod store {
     }
 }
 
+/// `mounts`, the copies under mount `root` of a tree, in an order where
+/// each comes after the one it is attached to.
+fn parent_first(root: u32, mut mounts: Vec<Mount>) -> Vec<Mount> {
+    let mut placed = vec![root];
+    let mut out = Vec::with_capacity(mounts.len());
+    while !mounts.is_empty() {
+        let before = mounts.len();
+        let (ready, rest): (Vec<Mount>, Vec<Mount>) =
+            mounts.into_iter().partition(|m| placed.contains(&m.parent));
+        placed.extend(ready.iter().map(|m| m.id));
+        out.extend(ready);
+        mounts = rest;
+        if mounts.len() == before {
+            // Attached to nothing copied: left out, as a copy has no place
+            // for them.
+            break;
+        }
+    }
+    out
+}
+
 /// A path as `mountinfo` writes it: space, tab, newline and backslash as
 /// octal escapes.
 fn escape(p: &[u8]) -> Vec<u8> {
@@ -1061,6 +1129,41 @@ mod tests {
         // Not beneath the root, nor beneath a path that is no mount's root.
         assert_eq!(t.attach_tree(&tree, b"/", true), Err(errno::EINVAL));
         assert_eq!(t.attach_tree(&tree, b"/b/x", true), Err(errno::EINVAL));
+    }
+
+    /// An attached mount moved beneath another keeps its id, and a
+    /// recursive copy then keeps both, in order.
+    #[test]
+    fn a_mount_moved_beneath_keeps_its_id() {
+        let mut t = table();
+        tmpfs(&mut t, b"/a");
+        let top = tmpfs(&mut t, b"/a/b");
+        let n = tmpfs(&mut t, b"/n");
+        t.move_beneath(b"/n", b"/a/b").unwrap();
+        assert_eq!(t.get(n).unwrap().point, b"/a/b");
+        assert_eq!(t.get(top).unwrap().parent, n);
+        assert_eq!(t.locate(b"/a/b/x").0.id, top);
+        let tree = t.copy_tree(b"/a", true).unwrap();
+        t.attach_tree(&tree, b"/c", false).unwrap();
+        let shown = t.locate(b"/c/b/x").0;
+        assert_eq!((shown.point.as_slice(), shown.parent != top), (&b"/c/b"[..], true));
+        assert_eq!(t.locate(b"/c/b").0.source, t.get(top).unwrap().source);
+    }
+
+    /// When the last of a group leaves it, its slaves receive from what it
+    /// received from: here nothing, so they are private.
+    #[test]
+    fn slaves_of_a_dissolved_group_go_private() {
+        let mut t = table();
+        let a = tmpfs(&mut t, b"/a");
+        t.set_propagation(b"/a", ms::SHARED, false).unwrap();
+        let b = t.bind(b"/a", b"/b", false, 0).unwrap();
+        t.set_propagation(b"/b", ms::SLAVE, false).unwrap();
+        assert_ne!(t.get(b).unwrap().master, 0);
+        t.set_propagation(b"/a", ms::PRIVATE, false).unwrap();
+        let bm = t.get(b).unwrap();
+        assert_eq!((bm.master, bm.propagation), (0, ms::PRIVATE));
+        assert_eq!(t.get(a).unwrap().peer, 0);
     }
 
     /// Unique ids sit above every old one.

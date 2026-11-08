@@ -138,7 +138,9 @@ fn anon_file() -> Result<i32, i32> {
 fn tree_fd(root: &Mount) -> Result<i32, i32> {
     let host = match &root.source {
         Source::Host(_) => root.host_path(b""),
-        Source::Overlay(l) => l.upper.clone().or_else(|| l.lowers.first().cloned()),
+        Source::Overlay(l) => {
+            l.upper.clone().or_else(|| l.lowers.first().cloned()).map(|d| join(&d, &root.root))
+        }
         Source::Synthetic => None,
     };
     let path = match host {
@@ -215,8 +217,6 @@ fn known_param(kind: FsType, key: &[u8]) -> bool {
         FsType::Devpts => &[b"uid", b"gid", b"mode", b"ptmxmode", b"newinstance", b"max"],
         FsType::Overlay => &[
             b"lowerdir",
-            b"lowerdir+",
-            b"datadir+",
             b"upperdir",
             b"workdir",
             b"default_permissions",
@@ -237,6 +237,7 @@ fn known_param(kind: FsType, key: &[u8]) -> bool {
 /// A parameter's value, as `fsconfig` gives one.
 enum Value {
     Flag,
+    /// A string, or a path (`FSCONFIG_SET_PATH`).
     String(Vec<u8>),
     Other,
 }
@@ -256,6 +257,15 @@ fn parse_param(c: &mut Context, key: &[u8], value: Value) -> Result<(), i32> {
         } else {
             c.clear |= flag;
             c.set &= !flag;
+        }
+        return Ok(());
+    }
+    if c.kind == FsType::Overlay && key == b"lowerdir+" {
+        // One more lower layer, below those given: `lowerdir`'s list grows.
+        let Value::String(v) = value else { return fail("lowerdir+: a path is wanted".into()) };
+        match c.options.iter().position(|o| o.starts_with(b"lowerdir=")) {
+            Some(i) => c.options[i].extend_from_slice(&[b":", &v[..]].concat()),
+            None => c.options.push([&b"lowerdir="[..], &v].concat()),
         }
         return Ok(());
     }
@@ -534,8 +544,7 @@ impl<P: Platform> Kernel<P> {
                 Value::Other
             }
             FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
-                guest!(uaccess::read_cstr(value, uaccess::PATH_MAX));
-                Value::Other
+                Value::String(guest!(uaccess::read_cstr(value, uaccess::PATH_MAX)))
             }
             FSCONFIG_SET_FD => {
                 // SAFETY: a valid out-parameter.
@@ -711,11 +720,9 @@ impl<P: Platform> Kernel<P> {
             return self.sys_openat(dfd, path, oflags, 0);
         }
         // A detached tree of one in the caller's namespace.
-        if let Some(k) = tree_key(dfd as i32).filter(|_| name.is_empty() && empty) {
-            let Some(tree) = with(&TREES, |m| m.get(&k).cloned()) else {
-                return err(errno::EINVAL);
-            };
-            return self.tree_descriptor(tree, cloexec);
+        // Not of a detached one: it is in no namespace of the caller's.
+        if tree_key(dfd as i32).is_some() && name.is_empty() && empty {
+            return err(errno::EINVAL);
         }
         let ns = guest!(self.ns_path_at(dfd as i32, &name, empty, follow));
         let tree = guest!(self.fs().mount_ns().table().copy_tree(&ns, flags & AT_RECURSIVE != 0));
@@ -777,6 +784,8 @@ impl<P: Platform> Kernel<P> {
         let beneath = flags & MOVE_MOUNT_BENEATH != 0;
         let ns = self.fs().mount_ns().clone();
         let r = match source {
+            // A detached tree has no group to give.
+            Ok(_) if flags & MOVE_MOUNT_SET_GROUP != 0 => Err(errno::EINVAL),
             Ok(k) => {
                 let Some(tree) = with(&TREES, |m| m.get(&k).cloned()) else {
                     return err(errno::EINVAL);
@@ -792,7 +801,13 @@ impl<P: Platform> Kernel<P> {
             Err(from) if flags & MOVE_MOUNT_SET_GROUP != 0 => ns.update(|t| {
                 let (f, rest) = t.locate(&from);
                 let (to_m, to_rest) = t.locate(&to);
-                if !rest.is_empty() || !to_rest.is_empty() {
+                // Both mounts' roots, of one filesystem, the source's root
+                // holding the target's.
+                if !rest.is_empty()
+                    || !to_rest.is_empty()
+                    || f.source != to_m.source
+                    || under(&to_m.root, &f.root).is_none()
+                {
                     return Err(errno::EINVAL);
                 }
                 let (peer, master, id) = (f.peer, f.master, to_m.id);
@@ -808,18 +823,7 @@ impl<P: Platform> Kernel<P> {
                 Ok(())
             }),
             Err(from) => ns.update(|t| {
-                if beneath {
-                    // Moved as a tree, beneath the target.
-                    let (m, rest) = t.locate(&from);
-                    if !rest.is_empty() || m.parent == m.id {
-                        return Err(errno::EINVAL);
-                    }
-                    let tree = t.copy_tree(&from, true)?;
-                    t.umount(&from)?;
-                    t.attach_tree(&tree, &to, true).map(|_| ())
-                } else {
-                    t.move_mount(&from, &to)
-                }
+                if beneath { t.move_beneath(&from, &to) } else { t.move_mount(&from, &to) }
             }),
         };
         match r {
@@ -883,8 +887,15 @@ impl<P: Platform> Kernel<P> {
         if (set | clr) & MOUNT_ATTR_IDMAP != 0 {
             return err(errno::EINVAL);
         }
-        // An access-time mode is set by clearing them all first.
-        if set & MOUNT_ATTR__ATIME != 0 && clr & MOUNT_ATTR__ATIME != MOUNT_ATTR__ATIME {
+        // The access-time modes are a value, not bits: cleared all at
+        // once, and set to one of them.
+        if clr & MOUNT_ATTR__ATIME != 0 && clr & MOUNT_ATTR__ATIME != MOUNT_ATTR__ATIME {
+            return err(errno::EINVAL);
+        }
+        if !matches!(
+            set & MOUNT_ATTR__ATIME,
+            MOUNT_ATTR_RELATIME | MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME
+        ) {
             return err(errno::EINVAL);
         }
         let (add, remove) = {
@@ -892,6 +903,8 @@ impl<P: Platform> Kernel<P> {
             let mut remove = attr_to_ms(clr);
             if clr & MOUNT_ATTR__ATIME == MOUNT_ATTR__ATIME {
                 remove |= ATIME_MS;
+                add |= atime_ms(set & MOUNT_ATTR__ATIME);
+            } else if set & MOUNT_ATTR__ATIME != 0 {
                 add |= atime_ms(set & MOUNT_ATTR__ATIME);
             }
             (add, remove)
@@ -1088,7 +1101,7 @@ impl<P: Platform> Kernel<P> {
         let mut found: Vec<u64> = table
             .mounts
             .iter()
-            .filter(|m| m.id != parent.id && self.reachable(m))
+            .filter(|m| (from_root || m.id != parent.id) && self.reachable(m))
             .filter(|m| from_root || table.is_below(m.id, parent.id))
             .map(Mount::unique_id)
             .collect();
@@ -1108,6 +1121,112 @@ impl<P: Platform> Kernel<P> {
         let bytes: Vec<u8> = out.iter().flat_map(|u| u.to_ne_bytes()).collect();
         guest!(uaccess::write_from(ids, &bytes));
         out.len() as i64
+    }
+}
+
+/// A one-mount table of `m`, to encode a mount with ([`save`]).
+fn as_table(mounts: Vec<Mount>) -> crate::mounts::Table {
+    crate::mounts::Table { mounts, next_id: 0, next_group: 0 }
+}
+
+/// Write the process's contexts and detached trees into a fork snapshot or
+/// exec state (their descriptors go with it: [`crate::fdmarks`]).
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    e.u32(NEXT.load(Ordering::Relaxed));
+    with(&CONTEXTS, |m| {
+        e.u64(m.len() as u64);
+        for (&k, c) in m.iter() {
+            e.u32(k);
+            // The kind, and what `CMD_CREATE` made if it has, ride on a
+            // mount.
+            let (source, root, flags) =
+                c.made.clone().unwrap_or((Source::Synthetic, b"/".to_vec(), 0));
+            let carrier = Mount {
+                id: 0,
+                parent: 0,
+                point: Vec::new(),
+                fstype: c.kind,
+                source,
+                root,
+                flags,
+                propagation: ms::PRIVATE,
+                peer: 0,
+                master: 0,
+                device: Vec::new(),
+                options: Vec::new(),
+            };
+            as_table(vec![carrier]).encode(e);
+            e.bool(c.made.is_some());
+            e.u8(c.phase as u8);
+            e.bool(c.source.is_some());
+            e.bytes(c.source.as_deref().unwrap_or_default());
+            e.u64(c.set);
+            e.u64(c.clear);
+            e.u64(c.options.len() as u64);
+            for o in &c.options {
+                e.bytes(o);
+            }
+            e.u64(c.picked.unwrap_or(0));
+            e.u64(c.log.len() as u64);
+            for l in &c.log {
+                e.bytes(l);
+            }
+        }
+    });
+    with(&TREES, |m| {
+        e.u64(m.len() as u64);
+        for (&k, tree) in m.iter() {
+            e.u32(k);
+            as_table(tree.clone()).encode(e);
+        }
+    });
+}
+
+/// What [`save`] wrote, in the new process.
+pub(crate) fn load(d: &mut crate::snapshot::Dec) {
+    NEXT.store(d.u32(), Ordering::Relaxed);
+    let n = d.count(8);
+    for _ in 0..n {
+        let k = d.u32();
+        let t = crate::mounts::Table::decode(d);
+        let made = d.bool();
+        let phase = match d.u8() {
+            0 => Phase::Create,
+            1 => Phase::AwaitingMount,
+            2 => Phase::Reconf,
+            _ => Phase::Failed,
+        };
+        let source = if d.bool() {
+            Some(d.bytes())
+        } else {
+            d.bytes();
+            None
+        };
+        let (set, clear) = (d.u64(), d.u64());
+        let n = d.count(8);
+        let options = (0..n).map(|_| d.bytes()).collect();
+        let picked = Some(d.u64()).filter(|&p| p != 0);
+        let n = d.count(8);
+        let log = (0..n).map(|_| d.bytes()).collect();
+        let Some(m) = t.mounts.into_iter().next() else { continue };
+        let c = Context {
+            kind: m.fstype,
+            phase,
+            source,
+            set,
+            clear,
+            options,
+            made: made.then_some((m.source, m.root, m.flags)),
+            picked,
+            log,
+        };
+        with(&CONTEXTS, |map| map.insert(k, c));
+    }
+    let n = d.count(8);
+    for _ in 0..n {
+        let k = d.u32();
+        let t = crate::mounts::Table::decode(d);
+        with(&TREES, |m| m.insert(k, t.mounts));
     }
 }
 

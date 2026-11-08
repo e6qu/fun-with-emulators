@@ -40,6 +40,7 @@ pub mod net;
 pub mod netlink;
 pub mod netns;
 pub mod ns;
+pub mod nsfd;
 pub mod nsops;
 pub mod overlay;
 pub mod pidns;
@@ -287,6 +288,8 @@ impl<P: Platform> Kernel<P> {
         e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
         netlink::save(e, false);
+        mountapi::save(e);
+        nsfd::save(e);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
@@ -345,6 +348,8 @@ impl<P: Platform> Kernel<P> {
         let trace_file = d.bytes();
         fdmarks::load(d);
         netlink::load(d);
+        mountapi::load(d);
+        nsfd::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
@@ -556,6 +561,8 @@ impl<P: Platform> Kernel<P> {
         fdmarks::save(&mut e);
         // The netlink sockets' host ends, which survive the host exec.
         netlink::save(&mut e, true);
+        mountapi::save(&mut e);
+        nsfd::save(&mut e);
         // The message queues' descriptors the exec closes: their
         // registrations go now, as Linux removes them as it closes them.
         mqueue::exec_closing(&self.creds);
@@ -591,6 +598,8 @@ impl<P: Platform> Kernel<P> {
         rlimits::load(&mut d);
         fdmarks::load(&mut d);
         netlink::load(&mut d);
+        mountapi::load(&mut d);
+        nsfd::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         let persona = d.u32();
@@ -1157,6 +1166,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         return Some(r);
     }
     if let Some(r) = mqueue::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = nsfd::io(nr, &a) {
         return Some(r);
     }
     if nr == n::OPENAT {

@@ -101,6 +101,16 @@ fn statx_of(s: &Stat) -> Statx {
     }
 }
 
+/// A namespace, as nsfs shows one: its number is the inode, on nsfs's
+/// device.
+fn ns_stat(ino: u64) -> Stat {
+    let mut s = synth_stat(fwe_abi::stat::S_IFREG | 0o444, 0);
+    s.st_ino = ino;
+    let (major, minor) = crate::nsfd::NSFS_DEV;
+    s.st_dev = crate::devnodes::makedev(major, minor);
+    s
+}
+
 /// The number of the namespace a `/proc/<pid>/ns` link's target names
 /// (`pid:[4026531836]`), if it is one.
 fn namespace_inode(target: &[u8]) -> Option<u64> {
@@ -209,6 +219,23 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    /// Open the namespace `/proc/<pid>/ns/<kind>` (`path` from `dirfd`)
+    /// names, its link reading `link`.
+    fn open_ns_path(&mut self, dirfd: i32, path: &[u8], link: &[u8], flags: u64) -> i64 {
+        let Some((who, sub)) = self.fs().proc_target(dirfd, path) else {
+            return err(errno::ENOENT);
+        };
+        let Some(name) = sub.strip_prefix(b"/ns/") else { return err(errno::ENOENT) };
+        let dirs = match who {
+            None => self.fs().ns_dirs(),
+            Some(host) => match host.and_then(crate::procreg::read) {
+                Some(rec) => rec.ns,
+                None => return err(errno::ENOENT),
+            },
+        };
+        self.open_ns(name, &dirs, link, flags)
+    }
+
     /// `openat` of `path`, read from the guest.
     fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         // Pseudo-terminal devices are synthesized, not served from the rootfs.
@@ -264,6 +291,12 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::procfs::Entry::File(content) => {
                     self.synthetic_fd(anon_fd(&content, flags), dirfd as i32, &path)
+                }
+                crate::procfs::Entry::Symlink(target) if namespace_inode(&target).is_some() => {
+                    if flags & fcntl::O_NOFOLLOW != 0 {
+                        return err(errno::ELOOP);
+                    }
+                    self.open_ns_path(dirfd as i32, &path, &target, flags)
                 }
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
@@ -768,7 +801,14 @@ impl<P: Platform> Kernel<P> {
         if unsafe { libc::fstat(fd, &mut st) } == 0 {
             const PIPEFS_MAGIC: i64 = 0x5049_5045;
             const SOCKFS_MAGIC: i64 = 0x534f_434b;
+            const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
+            // An eventfd, timerfd, signalfd or the like is an anonymous
+            // inode, whatever stands in for it on the host.
+            let anon = crate::specialfd::anon_name(fd).is_some()
+                || crate::signalfd::is_signalfd(fd)
+                || crate::bpf::prog_of(fd).is_some();
             let magic = match st.st_mode & libc::S_IFMT {
+                _ if anon => Some(ANON_INODE_FS_MAGIC),
                 libc::S_IFIFO if crate::fs::fd_path(fd).is_none() => Some(PIPEFS_MAGIC),
                 libc::S_IFSOCK => Some(SOCKFS_MAGIC),
                 _ => None,
@@ -825,12 +865,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                 Entry::Symlink(t) if follow => {
                     if let Some(ino) = namespace_inode(&t) {
-                        // A namespace, as nsfs shows one: its number is
-                        // the inode, on nsfs's device.
-                        let mut s = synth_stat(st::S_IFREG | 0o444, 0);
-                        s.st_ino = ino;
-                        s.st_dev = crate::devnodes::makedev(0, 4);
-                        return Ok(s);
+                        return Ok(ns_stat(ino));
                     }
                     if depth >= 40 {
                         return Err(errno::ELOOP);
@@ -863,6 +898,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
+        if let Some(n) = crate::nsfd::of(fd as i32) {
+            guest!(uaccess::write(buf, ns_stat(n.id)));
+            return 0;
+        }
         if crate::synthdir::fstat_is_dir(fd as i32) {
             use fwe_abi::stat as st;
             guest!(uaccess::write(buf, synth_stat(st::S_IFDIR | 0o555, 0)));
@@ -908,11 +947,13 @@ impl<P: Platform> Kernel<P> {
         }
         let empty = path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0;
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        // The mount it is in: its id, or its unique id if asked for, as
+        // The mount it is in, if asked for: its id, or its unique id, as
         // Linux reports one or the other.
-        let mount = self.statx_mount(dirfd as i32, &path, empty, follow);
+        use fwe_abi::statx_mask::{STATX_MNT_ID, STATX_MNT_ID_UNIQUE};
+        let wants_mount = mask as u32 & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE) != 0;
+        let mount =
+            wants_mount.then(|| self.statx_mount(dirfd as i32, &path, empty, follow)).flatten();
         let with_mount = |mut x: Statx| {
-            use fwe_abi::statx_mask::{STATX_MNT_ID, STATX_MNT_ID_UNIQUE};
             if let Some(m) = &mount {
                 if mask as u32 & STATX_MNT_ID_UNIQUE != 0 {
                     x.stx_mnt_id = m.unique_id();
@@ -924,6 +965,10 @@ impl<P: Platform> Kernel<P> {
             }
             x
         };
+        if empty && let Some(n) = crate::nsfd::of(dirfd as i32) {
+            guest!(uaccess::write(buf, with_mount(statx_of(&ns_stat(n.id)))));
+            return 0;
+        }
         let (host, node) = if empty {
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {

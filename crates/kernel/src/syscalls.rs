@@ -183,6 +183,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::netlink::closed(fd);
                 crate::mountapi::closed(fd);
+                crate::nsfd::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
@@ -529,6 +530,7 @@ impl<P: Platform> Kernel<P> {
             | nr::MQ_TIMEDSEND
             | nr::MQ_TIMEDRECEIVE => crate::ipcops::blocking(self.ipc_context(), n, a),
             nr::MQ_OPEN => self.sys_mq_open(a[0], a[1], a[2], a[3]),
+            nr::SETNS => self.sys_setns(a[0], a[1]),
             nr::FSOPEN => self.sys_fsopen(a[0], a[1]),
             nr::FSCONFIG => self.sys_fsconfig(a[0], a[1], a[2], a[3], a[4]),
             nr::FSMOUNT => self.sys_fsmount(a[0], a[1], a[2]),
@@ -1001,6 +1003,9 @@ impl<P: Platform> Kernel<P> {
         // an `int` sign-extends it.
         let req = req as u32 as u64;
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = self.ns_ioctl(fd, req, arg) {
             return r;
         }
         // SAFETY: in every arm the argument layouts match the host's; the host
