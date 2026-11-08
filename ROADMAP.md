@@ -106,7 +106,7 @@ run.
 - [ ] **Ownership for non-root:** `chown` recorded and shown by `stat`,
   and permission checks for a guest that is not root (the `chown`,
   `fchown`, `lchown`, `creat` and `mkdir` failures).
-- [ ] **The correctness gaps LTP points at:**
+- [ ] **Every other failure LTP points at**, among them:
   - open-file-description locks;
   - `EPOLLEXCLUSIVE`;
   - `eventfd` and real-time signals across processes;
@@ -115,8 +115,10 @@ run.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 
-**Done when:** LTP's system-call tests pass at 80% or more of those that
-apply, in CI against the baseline; `strace` and `gdb` work on a guest
+**Done when:** every one of LTP's system-call tests passes, in CI against
+the baseline, but those for what is not planned for 1.0 and those that fail
+or skip on Linux too with the same build, each listed with the reason in
+`tools/ltp/exceptions.txt`; `strace` and `gdb` work on a guest
 program; the target programs and container engines keep passing.
 
 ### M5 — Release

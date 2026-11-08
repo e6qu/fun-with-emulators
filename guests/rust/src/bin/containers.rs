@@ -856,12 +856,9 @@ fn main() {
                 at[4..8].copy_from_slice(&prog.to_ne_bytes());
                 at[8..12].copy_from_slice(&6u32.to_ne_bytes()); // BPF_CGROUP_DEVICE
                 println!("attached as a device program: {}", r(syscall(280, 8, at.as_ptr(), 32)));
-                // Netlink: none in the host's namespace; lo in one's own.
-                println!("netlink outside: {}", r(socket(16, 3, 0) as i64));
-                unshare(CLONE_NEWNET);
-                let nl = socket(16, 3, 0);
-                println!("netlink inside: {}", nl >= 0);
-                let link = |up: Option<bool>| -> u32 {
+                // Netlink: in the host's namespace a socket that describes
+                // no interface; lo in one's own.
+                let link = |nl: i32, up: Option<bool>| -> u32 {
                     // RTM_GETLINK of index 1, or RTM_NEWLINK setting IFF_UP.
                     let mut m = vec![0u8; 32];
                     m[0..4].copy_from_slice(&32u32.to_ne_bytes());
@@ -884,9 +881,15 @@ fn main() {
                         i32::from_ne_bytes(reply[16..20].try_into().unwrap()) as u32
                     }
                 };
-                println!("lo flags: {:#x}", link(None));
-                println!("set up: {}", link(Some(true)) as i32);
-                println!("lo flags then: {:#x}", link(None));
+                let outside = socket(16, 3, 0);
+                println!("netlink outside: {} answers {}", outside >= 0, link(outside, None) as i32);
+                close(outside);
+                unshare(CLONE_NEWNET);
+                let nl = socket(16, 3, 0);
+                println!("netlink inside: {}", nl >= 0);
+                println!("lo flags: {:#x}", link(nl, None));
+                println!("set up: {}", link(nl, Some(true)) as i32);
+                println!("lo flags then: {:#x}", link(nl, None));
             }
             Some("fd-edges") => {
                 let r = |v: i64| res(v);
