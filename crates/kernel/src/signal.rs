@@ -237,12 +237,6 @@ pub fn relayed(sig: u64) -> bool {
         )
 }
 
-/// Whether `sig` is one of the fault signals the backend handles itself
-/// (`SIGTRAP`, `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`). The host cannot say
-/// whether such a signal was raised by an instruction or sent, so when the
-/// process sends one to itself it is emulated, like a real-time signal,
-/// rather than sent through the host.
-/// This host process.
 /// Send Linux signal `sig`, which the host has no equivalent of, to fwe
 /// process `host` (not this one), with `code` and `value`: queued in its
 /// mailbox, and the process woken to take it ([`crate::signote::queue`]).

@@ -421,12 +421,16 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
                 crate::thread::wake_others(crate::host::WAKE_SIGNAL);
             } else if let Some(h) = crate::host::signal_to_host(sig) {
                 // Another process: a host signal, with a note of what it
-                // carries. A real-time signal, which the host lacks, cannot
-                // reach it.
+                // carries.
                 crate::signote::note_with(n.owner.0, h, info.code, info.value);
                 if crate::host::kill_process(n.owner.0, h) != 0 {
                     crate::signote::unnote(n.owner.0, h);
                 }
+            } else {
+                // One the host lacks (a real-time signal): queued in the
+                // owner's mailbox. A notification that cannot be delivered
+                // is lost, as Linux's is when its receiver has gone.
+                crate::signal::send_unhosted(n.owner.0, sig, info.code, info.value);
             }
         }
         _ => {}

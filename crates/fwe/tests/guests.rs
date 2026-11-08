@@ -2784,6 +2784,7 @@ const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-ex
     received: high/9 mid/5 low/1 low2/1\n\
     empty: true\n\
     signal: registered 0, shown true, came true, mesgq true, from the sender true, value 0x5eed\n\
+    real-time signal: registered 0, came true, mesgq true, from the sender true, value 0x7e47\n\
     thread: registered 0, came true, value 0x7ead\n\
     unlinked: name gone true, still sends 0, receives kept\n\
     made again: true, empty true\n";

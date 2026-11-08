@@ -43,10 +43,9 @@ const SUPPORTED: u64 = cl::CLONE_VM
 pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, tls, child_tid, .. } = a;
 
-    // A clone without CLONE_THREAD is a new process (fork). CLONE_VM without
-    // CLONE_THREAD shares the address space with a new process; only the
-    // vfork form, where the parent waits for the child to exec or exit, is
-    // supported (as a fork).
+    // A clone without CLONE_THREAD is a new process (fork); with CLONE_VM it
+    // shares the guest's memory with it, and with CLONE_VFORK the parent
+    // waits for the child to exec or exit.
     if flags & cl::CLONE_THREAD == 0 {
         let (share, wait) = (flags & cl::CLONE_VM != 0, flags & cl::CLONE_VFORK != 0);
         return crate::process::do_fork(parent, a, share, wait);
