@@ -1043,50 +1043,58 @@ impl Table {
         };
     }
 
-    /// `pivot_root(new_root, put_old)`: the mount whose root is `new_root`
-    /// becomes the namespace's root, and the old root goes to `put_old`
-    /// (a path under `new_root`). Paths are in the old view; returns
-    /// `put_old` in the new one.
-    pub fn pivot_root(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<Vec<u8>, i32> {
-        let (new, rest) = self.locate(new_root);
-        if !rest.is_empty() {
+    /// `pivot_root(new_root, put_old)` for a process whose root is the
+    /// root of the mount at `root` (a path in the namespace's view; `/`
+    /// for the namespace's own root): the mount at `new_root` takes that
+    /// mount's place, and that mount goes to `put_old` (a path under
+    /// `new_root`). Returns where `put_old` is now.
+    pub fn pivot_root(&mut self, root: &[u8], new_root: &[u8], put_old: &[u8]) -> Result<Vec<u8>, i32> {
+        // In Linux's order of checks.
+        let (r, root_rest) = self.locate(root);
+        let r = r.clone();
+        let (n, new_rest) = self.locate(new_root);
+        let n = n.clone();
+        let o = self.locate(put_old).0.clone();
+        let shared = |id: u32| self.get(id).is_some_and(|m| m.peer != 0);
+        if o.peer != 0 || shared(n.parent) || (r.parent != r.id && shared(r.parent)) {
             return Err(errno::EINVAL);
         }
-        let old = self.root().clone();
-        if new.id == old.id {
+        if n.id == r.id || o.id == r.id {
             return Err(errno::EBUSY);
         }
-        let new = new.clone();
-        let Some(old_rel) = under(put_old, new_root) else { return Err(errno::EINVAL) };
-        let old_point = if old_rel.is_empty() { b"/".to_vec() } else { old_rel.to_vec() };
-        // `put_old` must be in the new root's tree.
-        let (holder, _) = self.locate(put_old);
-        let holder = holder.id;
-        if holder != new.id && !self.is_below(holder, new.id) {
+        // The caller's root and the new one must be mounts' roots.
+        if !root_rest.is_empty() || !new_rest.is_empty() {
             return Err(errno::EINVAL);
         }
-        let in_new = self.descendants(new.id);
-        let new_point = new.point.clone();
+        if !self.is_below(n.id, r.id) {
+            return Err(errno::EINVAL);
+        }
+        // `put_old` must be in the new root's tree.
+        let Some(put_rel) = under(put_old, &n.point) else { return Err(errno::EINVAL) };
+        let (holder, _) = self.locate(put_old);
+        let holder = holder.id;
+        if holder != n.id && !self.is_below(holder, n.id) {
+            return Err(errno::EINVAL);
+        }
+        let new_put = join(root, put_rel);
+        let in_n = self.descendants(n.id);
+        let in_r: Vec<u32> = self.descendants(r.id).into_iter().filter(|d| *d != n.id && !in_n.contains(d)).collect();
+        let r_is_top = r.parent == r.id;
         for m in self.mounts.iter_mut() {
-            if m.id == new.id {
-                m.parent = m.id;
-                m.point = b"/".to_vec();
-            } else if in_new.contains(&m.id) {
-                m.point = join(b"/", under(&m.point, &new_point).unwrap_or(b""));
-            } else {
-                // The old tree moves under `put_old`.
-                m.point = join(&old_point, &m.point);
+            if m.id == n.id {
+                // Where the old root was (the namespace's root, if it was).
+                m.parent = if r_is_top { n.id } else { r.parent };
+                m.point = root.to_vec();
+            } else if in_n.contains(&m.id) {
+                m.point = join(root, under(&m.point, &n.point).unwrap_or(b""));
+            } else if m.id == r.id {
+                m.parent = holder;
+                m.point = new_put.clone();
+            } else if in_r.contains(&m.id) {
+                m.point = join(&new_put, under(&m.point, root).unwrap_or(b""));
             }
         }
-        // The old root, until now its own parent, hangs from the mount
-        // holding `put_old` in the new tree. The bottom mount at `/` of the
-        // old tree (the old root may be a stack) is the one re-parented.
-        let bottom = self.mounts.iter().find(|m| m.id == m.parent && m.id != new.id).map(|m| m.id);
-        if let Some(b) = bottom {
-            let m = self.mounts.iter_mut().find(|m| m.id == b).unwrap();
-            m.parent = holder;
-        }
-        Ok(old_point)
+        Ok(new_put)
     }
 
     /// `/proc/self/mountinfo` for a process whose root is `root` (a path in
@@ -1667,7 +1675,7 @@ mod tests {
             vec![],
         );
         tmpfs(&mut t, b"/bundle/rootfs/dev");
-        let old = t.pivot_root(b"/bundle/rootfs", b"/bundle/rootfs").unwrap();
+        let old = t.pivot_root(b"/", b"/bundle/rootfs", b"/bundle/rootfs").unwrap();
         assert_eq!(old, b"/");
         // The old root is stacked over the new one until unmounted.
         assert_eq!(t.locate(b"/etc").0.host_path(b"/etc").unwrap(), b"/host/root/etc");
@@ -1687,7 +1695,7 @@ mod tests {
     fn pivot_root_with_put_old() {
         let mut t = table();
         tmpfs(&mut t, b"/new");
-        let old = t.pivot_root(b"/new", b"/new/old").unwrap();
+        let old = t.pivot_root(b"/", b"/new", b"/new/old").unwrap();
         assert_eq!(old, b"/old");
         assert_eq!(t.locate(b"/x").0.fstype, FsType::Tmpfs);
         let (m, rest) = t.locate(b"/old/etc");

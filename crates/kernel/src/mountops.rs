@@ -349,25 +349,31 @@ impl<P: Platform> Kernel<P> {
         if !new_dir || !old_dir {
             return err(errno::ENOTDIR);
         }
-        // Only a process whose root is the namespace's can pivot it.
-        if self.fs().proc_root() != b"/" {
-            return err(errno::EINVAL);
-        }
+        // The mount at the caller's root (which must be one's root) is the
+        // one replaced: the namespace's, or a chroot's.
+        let root = self.fs().proc_root().to_vec();
         let cwd_ns = self.fs().to_ns(self.fs().cwd());
         let ns = self.fs().mount_ns().clone();
-        let old_point = match ns.update(|t| t.pivot_root(&new_ns, &old_ns)) {
+        let new_put = match ns.update(|t| t.pivot_root(&root, &new_ns, &old_ns)) {
             Ok(p) => p,
             Err(e) => return err(e),
         };
-        // A working directory at the old root moves to the new one, as
-        // Linux moves it.
-        let cwd = match crate::mounts::under(&cwd_ns, &new_ns) {
-            Some(rest) => crate::mounts::join(b"/", rest),
-            None if cwd_ns == b"/" => b"/".to_vec(),
-            None => crate::mounts::join(&old_point, &cwd_ns),
+        // A working directory at the root stays there (the new root now);
+        // one in the new root's tree, or in the old one's, moves with it,
+        // as Linux has it.
+        use crate::mounts::{join, under};
+        let cwd_ns = if cwd_ns == root {
+            cwd_ns
+        } else if let Some(rest) = under(&cwd_ns, &new_ns) {
+            join(&root, rest)
+        } else if let Some(rest) = under(&cwd_ns, &root) {
+            join(&new_put, rest)
+        } else {
+            cwd_ns
         };
         let fs = self.fs.as_mut().expect("filesystem configured");
-        fs.set_root(b"/".to_vec(), cwd);
+        let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
+        fs.set_root(root, cwd);
         0
     }
 
