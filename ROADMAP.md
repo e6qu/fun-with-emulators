@@ -116,7 +116,6 @@ run.
   and permission checks for a guest that is not root (the `chown`,
   `fchown`, `lchown`, `creat` and `mkdir` failures).
 - [ ] **Every other failure LTP points at**, among them:
-  - open-file-description locks;
   - `EPOLLEXCLUSIVE`;
   - `eventfd` and real-time signals across processes;
   - core dumps and the core-dump bit;

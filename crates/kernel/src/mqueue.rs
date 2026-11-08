@@ -414,6 +414,7 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
                 uid: by.uid,
                 status: 0,
                 value: n.value,
+                poll: None,
             };
             if n.owner == ipc::me() {
                 crate::thread::post_process(sig, info);

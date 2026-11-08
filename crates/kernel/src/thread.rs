@@ -13,7 +13,7 @@
 
 use fwe_abi::{Stack, signal};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The process (thread-group) id, shared by all threads. Set once at startup.
@@ -122,6 +122,9 @@ pub struct SigInfo {
     /// The value a queued signal carries (`si_value`: `SI_QUEUE`,
     /// `SI_MESGQ`).
     pub value: u64,
+    /// For a signal of I/O readiness (an owned descriptor's `F_SETSIG`
+    /// signal): the descriptor, and the events (`si_band`).
+    pub poll: Option<(i32, i64)>,
 }
 
 #[derive(Default)]
@@ -131,6 +134,9 @@ struct SigSlot {
     uid: AtomicU32,
     status: AtomicI32,
     value: AtomicU64,
+    /// `poll`'s descriptor (-1: none) and events.
+    poll_fd: AtomicI32,
+    band: AtomicI64,
 }
 
 impl SigSlot {
@@ -141,6 +147,8 @@ impl SigSlot {
             uid: AtomicU32::new(0),
             status: AtomicI32::new(0),
             value: AtomicU64::new(0),
+            poll_fd: AtomicI32::new(-1),
+            band: AtomicI64::new(0),
         }
     }
 }
@@ -184,6 +192,9 @@ impl Pending {
         slot.uid.store(info.uid, Ordering::Relaxed);
         slot.status.store(info.status, Ordering::Relaxed);
         slot.value.store(info.value, Ordering::Relaxed);
+        let (fd, band) = info.poll.unwrap_or((-1, 0));
+        slot.poll_fd.store(fd, Ordering::Relaxed);
+        slot.band.store(band, Ordering::Relaxed);
         self.bits.fetch_or(1 << (sig - 1), Ordering::Release);
     }
 
@@ -199,6 +210,10 @@ impl Pending {
             uid: slot.uid.load(Ordering::Relaxed),
             status: slot.status.load(Ordering::Relaxed),
             value: slot.value.load(Ordering::Relaxed),
+            poll: match slot.poll_fd.load(Ordering::Relaxed) {
+                -1 => None,
+                fd => Some((fd, slot.band.load(Ordering::Relaxed))),
+            },
         })
     }
 
@@ -461,7 +476,7 @@ mod tests {
     #[test]
     fn pending_is_per_thread_and_carries_info() {
         register_current();
-        let info = SigInfo { code: -6, pid: 7, uid: 8, status: 0, value: 9 };
+        let info = SigInfo { code: -6, pid: 7, uid: 8, status: 0, value: 9, poll: None };
         post_self(signal::SIGUSR1, info);
         assert_eq!(pending() & (1 << (signal::SIGUSR1 - 1)), 1 << (signal::SIGUSR1 - 1));
         // Another thread does not see it.

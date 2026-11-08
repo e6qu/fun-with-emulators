@@ -154,6 +154,18 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Ipc,
     },
     Sysctl {
+        path: b"fs/lease-break-time",
+        default: "45",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"fs/pipe-max-size",
+        default: "1048576",
+        kind: Kind::Int(4096, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
         path: b"kernel/keys/gc_delay",
         default: "300",
         kind: Kind::Int(0, INT_MAX),

@@ -41,16 +41,20 @@ pub(crate) fn flock(fd: u64, op: u64) -> i64 {
     }
 }
 
-/// `fcntl(fd, F_SETLK or F_SETLKW, lock)`: a record lock in Linux layout.
-/// `F_SETLKW` waits for a conflicting lock to go, so it runs without the
-/// kernel lock ([`crate::blocking_syscall`]).
+/// `fcntl(fd, F_SETLK or F_SETLKW, lock)`, or their open-file-description
+/// forms (`F_OFD_SETLK`, `F_OFD_SETLKW`, whose lock names no pid): a record
+/// lock in Linux layout. The waiting forms wait for a conflicting lock to
+/// go, so they run without the kernel lock ([`crate::blocking_syscall`]).
 pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
     let lock: fwe_abi::Flock = guest!(uaccess::read(arg));
+    if matches!(cmd, fcntl::F_OFD_SETLK | fcntl::F_OFD_SETLKW) && lock.l_pid != 0 {
+        return err(errno::EINVAL);
+    }
     let lock = match host::flock_to_host(&lock) {
         Ok(l) => l,
         Err(e) => return err(e),
     };
-    let hcmd = if cmd == fcntl::F_SETLKW { libc::F_SETLKW } else { libc::F_SETLK };
+    let Some(hcmd) = host::lock_cmd(cmd) else { return err(errno::EINVAL) };
     // SAFETY: `lock` is a valid host `struct flock`.
     ret(unsafe { libc::fcntl(fd, hcmd, &lock) })
 }
@@ -839,13 +843,17 @@ impl<P: Platform> Kernel<P> {
                 fcntl::F_SETFL => {
                     ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
                 }
-                fcntl::F_GETLK => {
+                fcntl::F_GETLK | fcntl::F_OFD_GETLK => {
                     let asked: fwe_abi::Flock = guest!(uaccess::read(arg));
+                    if cmd == fcntl::F_OFD_GETLK && asked.l_pid != 0 {
+                        return err(errno::EINVAL);
+                    }
                     let mut lock = match host::flock_to_host(&asked) {
                         Ok(l) => l,
                         Err(e) => return err(e),
                     };
-                    if libc::fcntl(fd, libc::F_GETLK, &mut lock) < 0 {
+                    let hcmd = host::lock_cmd(cmd).unwrap_or(libc::F_GETLK);
+                    if libc::fcntl(fd, hcmd, &mut lock) < 0 {
                         return last_error();
                     }
                     // Nothing in the way: Linux changes only the type (the
@@ -859,7 +867,9 @@ impl<P: Platform> Kernel<P> {
                     guest!(uaccess::write(arg, answer));
                     0
                 }
-                fcntl::F_SETLK | fcntl::F_SETLKW => set_record_lock(fd, cmd, arg),
+                fcntl::F_SETLK | fcntl::F_SETLKW | fcntl::F_OFD_SETLK | fcntl::F_OFD_SETLKW => {
+                    set_record_lock(fd, cmd, arg)
+                }
                 fcntl::F_ADD_SEALS => crate::memfd::add_seals(fd, arg),
                 fcntl::F_GET_SEALS => crate::memfd::get_seals(fd),
                 fcntl::F_SETOWN => {
@@ -902,14 +912,14 @@ impl<P: Platform> Kernel<P> {
                 fcntl::F_SETSIG if arg > signal::NSIG => err(errno::EINVAL),
                 fcntl::F_SETSIG => {
                     crate::fdstate::update(fd, |s| s.sig = arg as u32);
+                    crate::leases::signal_set(fd, arg as u32);
                     0
                 }
                 fcntl::F_GETSIG => crate::fdstate::get(fd).sig as i64,
                 fcntl::F_SETLEASE => self.set_lease(fd, arg),
-                fcntl::F_GETLEASE => {
-                    i64::from(crate::fdstate::get(fd).lease.unwrap_or(fcntl::F_UNLCK))
-                }
+                fcntl::F_GETLEASE => i64::from(crate::leases::get(fd)),
                 fcntl::F_GETPIPE_SZ | fcntl::F_SETPIPE_SZ => self.pipe_size(fd, cmd, arg),
+                fcntl::F_CREATED_QUERY => i64::from(crate::fdstate::get(fd).created),
                 _ => err(errno::EINVAL),
             }
         }
@@ -972,8 +982,17 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EAGAIN);
         }
-        crate::fdstate::update(fd, |s| s.lease = (kind != fcntl::F_UNLCK).then_some(kind));
-        0
+        // The file as the host knows it, as opens find it.
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut host: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above, on the guest's descriptor.
+        if unsafe { libc::fstat(fd, &mut host) } != 0 {
+            return last_error();
+        }
+        match crate::leases::set(fd, host.st_dev as u64, host.st_ino, kind) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
     }
 
     /// `F_GETPIPE_SZ` and `F_SETPIPE_SZ` of a pipe or FIFO: its capacity, and
@@ -990,18 +1009,15 @@ impl<P: Platform> Kernel<P> {
         if cmd == fcntl::F_GETPIPE_SZ {
             return crate::fdstate::pipe_size(id) as i64;
         }
-        let Some(size) = crate::fdstate::round_pipe_size(arg) else {
+        let Some(size) = crate::fdstate::round_pipe_size(arg, self.page_size) else {
             return err(errno::EINVAL);
         };
-        /// `/proc/sys/fs/pipe-max-size`.
-        const PIPE_MAX: u64 = 1_048_576;
-        if size > PIPE_MAX && !self.creds.has(crate::caps::CAP_SYS_RESOURCE) {
+        if size > crate::fdstate::pipe_max_size() && !self.creds.has(crate::caps::CAP_SYS_RESOURCE)
+        {
             return err(errno::EPERM);
         }
-        let mut held: libc::c_int = 0;
-        // SAFETY: a valid out-parameter for FIONREAD.
-        unsafe { libc::ioctl(fd, libc::FIONREAD, &mut held) };
-        if (held as u64) > size {
+        // What the pipe holds, which the host gives through either end.
+        if st.st_size as u64 > size {
             return err(errno::EBUSY);
         }
         crate::fdstate::set_pipe_size(id, size);

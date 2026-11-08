@@ -32,6 +32,7 @@ pub mod ipcops;
 pub mod keycrypto;
 pub mod keys;
 mod keytypes;
+pub mod leases;
 pub mod loopdev;
 pub mod maps;
 pub mod memfd;
@@ -846,7 +847,7 @@ pub fn wake_futex(addr: u64, count: u32) {
 
 /// Run a system call that must not hold the kernel lock because it can block:
 /// `futex`, the sleeps, `epoll_pwait`, `ppoll`, `rt_sigsuspend`, the socket
-/// calls that wait, `flock` and `fcntl`'s `F_SETLKW` (waiting for another
+/// calls that wait, `flock` and `fcntl`'s `F_SETLKW` and `F_OFD_SETLKW` (waiting for another
 /// process's lock), and `read`/`write` and their vectored and positioned forms (a pipe, socket
 /// or terminal blocks until the other side acts, and the other side may be a
 /// guest thread that needs the lock). Returns `None` for any other call,
@@ -1345,7 +1346,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         // SAFETY: caller guarantees the signal set pointer.
         n::RT_SIGSUSPEND => unsafe { signal::sigsuspend(a[0], a[1]) },
         n::FLOCK => syscalls::flock(a[0], a[1]),
-        n::FCNTL if a[1] == fwe_abi::fcntl::F_SETLKW => {
+        n::FCNTL if a[1] == fwe_abi::fcntl::F_SETLKW || a[1] == fwe_abi::fcntl::F_OFD_SETLKW => {
             syscalls::set_record_lock(a[0] as i32, a[1], a[2])
         }
 
