@@ -1,64 +1,62 @@
 # Linux on macOS
 
-fwe runs Linux arm64 programs on macOS arm64. Everything that crosses
-between the two kernels goes one of two ways, and this document is in two
-parts to match:
+## Summary
 
-- **[Linux to macOS](#linux-to-macos)**: what the guest asks for (a
-  system call, an instruction, an address) and what it becomes on the host.
-  For each Linux primitive: what Linux does, what macOS has, and how fwe
-  translates it.
+fwe runs Linux programs built for arm64 on a Mac with Apple Silicon. Both
+sides use the same processor, so a Linux program's instructions can run
+on the Mac's CPU as they are. What differs is everything around the
+instructions: the two kernels. A Linux program asks the Linux kernel for
+files, memory, processes and signals in Linux's terms, and expects to hear
+back in Linux's terms about key strokes, children ending, data arriving and
+errors. fwe stands in for that kernel. It catches each request the program
+makes, carries it out with what macOS offers, and turns whatever macOS
+reports back into what Linux would have said.
+
+fwe does this one of two ways, and picks the way per program:
+
+- **The native backend** runs the program inside the fwe process itself.
+  Before any of the program's code may run, fwe rewrites the few
+  instructions macOS cannot let a Linux program execute unchanged: the
+  system-call instruction, accesses to the thread pointer, and uses of the
+  `x18` register. Everything else runs unmodified on the CPU.
+- **The VM backend** runs the program in a small virtual machine made with
+  macOS's Hypervisor.framework. There the program has an address space of
+  its own and nothing is rewritten; each system call leaves the VM and is
+  served by the same code as in the native backend. fwe uses it only for
+  programs the native backend cannot place in memory: non-position-
+  independent executables linked below 4 GiB.
+
+This document explains how that works, in two directions:
+
+- **[Linux to macOS](#linux-to-macos)**: what the guest asks for (a system
+  call, an instruction, an address) and what it becomes on the host. For
+  each Linux primitive: what Linux does, what macOS has, and what fwe does
+  to bridge them.
 - **[macOS to Linux](#macos-to-linux)**: what happens on the host (a
   signal, a key stroke, a child ending, a file changing, a clock firing, an
   error) and what the guest sees of it.
 
+Before those two parts come five sections on how a program gets to run at
+all: which backend a binary gets and why, which binaries need the least
+translation (with examples of real software in each category), how
+common languages and runtimes fare, which instructions the native backend
+rewrites, and how the VM backend uses the hypervisor.
+
 How fwe's own parts are built is in [architecture.md](architecture.md);
 where fwe still differs from Linux is in its
-[known limitations](architecture.md#known-limitations); the hypervisor
-backend's VM and its safety rules are in [hypervisor.md](hypervisor.md).
-
-```mermaid
-flowchart LR
-    subgraph guest["Linux guest: unmodified arm64 code, glibc or musl"]
-        prog["program"]
-    end
-    subgraph fwe["fwe: one host process per guest process"]
-        be["backend: native trap handlers, or the VM run loop"]
-        k["kernel crate: Linux semantics, records, translation"]
-    end
-    subgraph host["macOS"]
-        xnu["XNU: system calls, signals, kqueue, tty, files, sockets, clocks"]
-        world["the terminal, a shell, other processes, other fwe processes"]
-    end
-    prog -- "svc 0: a Linux system call, Linux numbers" --> be
-    be --> k
-    k -- "libc calls with macOS values" --> xnu
-    xnu -- "results, host errno, kqueue events" --> k
-    xnu -- "host signals: key strokes, timers, children, faults, kill" --> be
-    world -- "kill, key strokes, file changes, connections" --> xnu
-    k -- "x0 = result or minus a Linux errno, Linux structures" --> be
-    be -- "resume, or enter a handler with a Linux signal frame" --> prog
-```
-
-Both are arm64, so a guest's instructions run unchanged on the CPU. Only
-what the two kernels define differently has to be bridged: the system-call
-interface, a few registers macOS reserves, the address space, every kernel
-object macOS lacks or shapes differently, and every event macOS reports in
-its own terms.
-
-Two execution backends do this:
-
-| | Native backend | Hypervisor (VM) backend |
-|---|---|---|
-| Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB |
-| Guest code | in the `fwe` process, on the CPU, after rewriting | at EL0 in a Hypervisor.framework VM, unmodified |
-| Page size the guest sees | 16 KiB (the host's) | 4 KiB (Linux's usual) |
-| Guest addresses | host addresses | host addresses, except ranges the guest placed outside fwe's slab, which are translated |
-| System calls go to | the kernel crate | the same kernel crate |
-| Host signals reach the guest | handler rewrites the interrupted guest context | handler stops the vCPU, the run loop delivers |
+[known limitations](architecture.md#known-limitations); running the VM
+backend, its safety rules and its tests are in
+[hypervisor.md](hypervisor.md).
 
 ## Contents
 
+- [Two kernels, one CPU](#two-kernels-one-cpu)
+- [Which binaries run where, and why](#which-binaries-run-where-and-why)
+- [Which binaries need the least translation](#which-binaries-need-the-least-translation)
+- [Languages and runtimes](#languages-and-runtimes): C and C++, musl,
+  Rust, Go, Python, Node.js, Java, Wine
+- [Which instructions get translated, and how](#which-instructions-get-translated-and-how)
+- [How the VM is actually used](#how-the-vm-is-actually-used)
 - [Linux to macOS](#linux-to-macos)
   - [The CPU](#the-cpu): system call entry and return, registers and
     errno, TLS, `x18`, cache maintenance, PAC and BTI, auxv and hwcaps,
@@ -96,10 +94,787 @@ Two execution backends do this:
   - [Errors](#errors)
   - [Host identity and machine state](#host-identity-and-machine-state)
 
+## Two kernels, one CPU
+
+Every guest process is one host process: a copy of `fwe` that holds the
+guest's code and memory and a Linux kernel of its own making, the *kernel
+crate*. The guest's code talks to the kernel crate through a *backend*,
+which catches the guest's system calls and delivers signals into it; the
+kernel crate talks to macOS through ordinary C library calls. Other fwe
+processes are other guest processes, and what Linux keeps in one kernel
+for all of them (mount tables, namespaces, IPC objects) fwe keeps in
+records they share.
+
+```mermaid
+flowchart LR
+    subgraph guest["Linux guest: unmodified arm64 code, glibc or musl"]
+        prog["program"]
+    end
+    subgraph fwe["fwe: one host process per guest process"]
+        be["backend: native trap handlers, or the VM run loop"]
+        k["kernel crate: Linux semantics, records, translation"]
+    end
+    subgraph host["macOS"]
+        xnu["XNU: system calls, signals, kqueue, tty, files, sockets, clocks"]
+        world["the terminal, a shell, other processes, other fwe processes"]
+    end
+    prog -- "svc 0: a Linux system call, Linux numbers" --> be
+    be --> k
+    k -- "libc calls with macOS values" --> xnu
+    xnu -- "results, host errno, kqueue events" --> k
+    xnu -- "host signals: key strokes, timers, children, faults, kill" --> be
+    world -- "kill, key strokes, file changes, connections" --> xnu
+    k -- "x0 = result or minus a Linux errno, Linux structures" --> be
+    be -- "resume, or enter a handler with a Linux signal frame" --> prog
+```
+
+Because both sides are arm64, only what the two kernels define differently
+has to be bridged: the system-call interface, a few registers macOS
+reserves, the address space, every kernel object macOS lacks or shapes
+differently, and every event macOS reports in its own terms. The two
+backends bridge the first three differently and share the rest; the table
+sums up where they differ, and the next sections explain each row.
+
+| | Native backend | Hypervisor (VM) backend |
+|---|---|---|
+| Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB |
+| Guest code | in the `fwe` process, on the CPU, after rewriting | at EL0 in a Hypervisor.framework VM, unmodified |
+| Page size the guest sees | 16 KiB (the host's) | 4 KiB (Linux's usual) |
+| Guest addresses | host addresses | host addresses, except ranges the guest placed outside fwe's slab, which are translated |
+| System calls go to | the kernel crate | the same kernel crate |
+| Host signals reach the guest | handler rewrites the interrupted guest context | handler stops the vCPU, the run loop delivers |
+
+## Which binaries run where, and why
+
+### The low 4 GiB
+
+On Linux, an arm64 process owns its whole lower address space. A program
+that is not position-independent (an `ET_EXEC` ELF file) was linked to run
+at one fixed address and carries no relocations that would let it run
+anywhere else; the usual toolchains put it at `0x400000`, just above 4 MiB,
+and Go puts static programs at `0x10000`.
+
+macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO` at address
+0: nothing can be mapped below 4 GiB, and Apple's loader refuses a smaller
+`__PAGEZERO` on Apple Silicon. Since the native backend runs the guest
+inside the fwe process, at the addresses the guest uses, a program linked
+below 4 GiB has nowhere to go there. Everything else does: a
+position-independent program (`ET_DYN`, a PIE) can be placed wherever
+macOS has room, and an `ET_EXEC` program linked at or above 4 GiB can be
+placed at its own address.
+
+### How fwe decides
+
+When fwe starts a program it reads the ELF file and asks one question
+(`needs_vm` in `crates/native/src/lib.rs`): is this a non-PIE executable
+whose lowest loaded page lies below 4 GiB? If so, it runs in the VM; if
+not, natively. Nothing else about the program matters: static or dynamic,
+glibc or musl, C, Rust or Go.
+
+```mermaid
+flowchart TD
+    start["fwe program args"] --> elf{"ELF type"}
+    elf -- "ET_DYN (PIE)" --> native["native backend: placed where macOS has room"]
+    elf -- "ET_EXEC" --> where{"lowest page below 4 GiB?"}
+    where -- no --> native2["native backend: placed at its link address"]
+    where -- yes --> vm["VM backend: Hypervisor.framework"]
+```
+
+| Binary | Example | Backend |
+|---|---|---|
+| dynamic PIE | Debian's `bash`, `git`, coreutils, Node.js | native |
+| static PIE | `musl-gcc -static-pie`, Rust's `+crt-static` with PIE | native |
+| static non-PIE linked at or above 4 GiB | fwe's own test guests, linked at 1 TiB (`--image-base=0x10000000000`) | native |
+| non-PIE linked below 4 GiB, dynamic | Debian's `python3.11`, GCC and clang, at `0x400000` | VM |
+| non-PIE linked below 4 GiB, static | static Go programs at `0x10000`; fwe's "rust-low" test guests | VM |
+
+"Low-linked" in this documentation and the tests means the last two rows.
+fwe's test suite builds its Rust guests twice: once at 1 TiB to run
+natively, and once at the toolchain's default (low) address, as
+`target/guests/rust-low`, to exercise the VM backend with the same
+programs.
+
+The VM backend needs `fwe` signed with the hypervisor entitlement and a
+bare-metal Mac. Without it, a low-linked program fails to start with a
+message saying so and status 126 ([hypervisor.md](hypervisor.md#running-it-apple-silicon-no-root)).
+
+### The dynamic linker
+
+A dynamically linked program names its dynamic linker in a `PT_INTERP`
+header (`/lib/ld-linux-aarch64.so.1` for glibc,
+`/lib/ld-musl-aarch64.so.1` for musl). Linux loads both and starts the
+dynamic linker, which then maps the program's libraries. fwe does the
+same in both backends: it resolves the interpreter in the guest's root
+filesystem, loads it beside the program and starts there, with `AT_BASE`
+and `AT_ENTRY` set as Linux sets them. Dynamic linkers are always
+position-independent, and fwe requires that (`ELIBBAD` from an `execve`
+otherwise), so the interpreter never decides the backend: only the
+program does. The libraries the dynamic linker maps later are PIC shared
+objects, mapped through fwe's `openat` and `mmap` like any file; in the
+native backend their code is rewritten as it is mapped executable.
+
+### Across execve
+
+A program can `execve` a program of the other kind: a shell in the VM can
+run a native `ls`, and a native `make` can run a low-linked `gcc`. When a
+native process execs a program that needs the VM, or when the caller is
+itself in the VM, fwe re-executes itself on the new program: the host
+process image is replaced by a fresh `fwe`, which makes the same decision
+again for the new program. A native process execing another native
+program, with no other threads, replaces its program in place. What
+crosses an `execve` either way is under [execve](#execve).
+
+## Which binaries need the least translation
+
+Every guest pays for the system calls it makes, since each one leaves
+guest code and enters fwe. Beyond that, how much work fwe does for a
+program depends on what kind of program it is, and the two backends charge
+for different things. None of this changes what a program computes; it
+changes how much fwe does at load time and how often the guest stops
+running its own code.
+
+### What the native backend charges for
+
+Natively, cost comes from preparing code and from instructions that cannot
+stay as they are:
+
+- **Preparing code is a one-time scan.** Every executable section the
+  program and its libraries map is scanned once, word by word, when it is
+  mapped executable. A static program has one image to scan; a dynamic one
+  also has its dynamic linker and every library it maps. Under `--strace`
+  fwe notes each image it prepared, with what it found, as
+  `prepared exe <addr>+<len>: N system calls, M stubs, K x18 uses left
+  unrewritten` (and `interp` for the dynamic linker).
+- **`svc #0` costs nothing extra to rewrite**: it is replaced in place by
+  one `brk` word, no stub. It does cost a trap each time it runs, which is
+  the system call's own cost.
+- **Thread-pointer and `x18` instructions need stubs.** Each `mrs`/`msr`
+  of `TPIDR_EL0` and each instruction naming `x18` becomes a branch to a
+  short stub and back: a few extra instructions every time it runs, no
+  trap. Code that reads the thread pointer in a hot loop (thread-local
+  variables) runs a few instructions slower there; code that uses `x18` as
+  a general register (rare: Linux toolchains seldom allocate it) pays per
+  use, and a few `x18` forms cannot be rewritten at all (counted as
+  "left unrewritten", see [what is not translated](#what-is-not-translated)).
+- **A trapped register read costs a host signal.** `mrs` of `CTR_EL0` traps
+  on macOS and is emulated in fwe's `SIGILL` handler: code that reads it
+  once (C libraries do, at startup) loses nothing, code that reads it
+  often pays a trap each time.
+- **Write+exec memory costs page flips.** A JIT compiler that maps memory
+  writable and executable gets each page made executable on its first
+  instruction fetch (with its code prepared) and writable again on its
+  next write: two faults per round trip on one page
+  ([Write+exec memory](#writeexec-memory)). JITs that keep writing code
+  and data into the same pages pay for every switch.
+- **`fork` is a host `fork`** with copy-on-write memory, after fwe has
+  paused the parent's other guest threads ([fork](#fork)).
+- **An image without section headers or unwind tables** is scanned whole,
+  which is slower and less precise ([what is scanned](#what-is-scanned)).
+
+### What the VM backend charges for
+
+In the VM nothing is rewritten and nothing is scanned: the program's code
+is loaded as it is and runs as it is. The costs move elsewhere:
+
+- **Every system call is a VM exit**: the guest's `svc` enters fwe's
+  vector, which leaves the VM, and fwe reads and writes the vCPU's
+  registers through the framework before and after the call.
+- **Every exception leaves the VM too**: faults, `brk`, a trapped
+  `CNTPCT_EL0` read, `wfi`/`wfe`.
+- **Memory calls edit page tables**, and one that takes access away
+  (`munmap`, a narrowing `mprotect`) has every vCPU invalidate its TLBs
+  before it resumes.
+- **A private file mapping is a copy** of the file's data taken when it is
+  mapped, rather than a host mapping of the file.
+- **`fork` starts a new fwe process and sends it a copy of every page of
+  guest memory that exists**, with the parent's vCPUs stopped while it is
+  sent; `vfork` fetches pages on first touch instead ([fork](#fork)).
+- **`execve` always re-executes fwe**, with a new VM.
+- A JIT's write+exec memory and `x18` cost nothing extra here.
+
+### Choosing, and what runs best
+
+Since fwe picks the backend from the binary, the practical choice is how a
+program is built. The table compares the two for the things that differ.
+
+| Program trait | Native | VM |
+|---|---|---|
+| PIE, or non-PIE linked at or above 4 GiB | runs here | — |
+| non-PIE linked below 4 GiB | cannot run | runs here |
+| static | one image prepared | loaded as is |
+| dynamic | the dynamic linker and each library prepared as mapped | loaded as is; private file mappings copied |
+| system call | a `brk` trap, a host signal handler | a vCPU exit and register transfers |
+| thread-local variables (`TPIDR_EL0`) | a stub branch per access | the hardware register |
+| code using `x18` | a stub branch per use; a few forms unrewritten | the hardware register |
+| reading `CTR_EL0` | a trap per read | read by the guest |
+| reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
+| JIT, write+exec pages | a fault per switch between writing and running | no faults |
+| `mmap`/`munmap` heavy | host calls | page-table edits, TLB invalidation on unmap |
+| `fork` heavy | host `fork`, copy-on-write | new process, all memory copied |
+| `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | new process fetching pages, then a re-exec |
+
+A program runs with the least translation when it is position-independent
+(so it runs natively, where a system call does not leave a VM), keeps its
+code apart from its data in sections the unwind table describes (as
+compiler output does), leaves `x18` alone, and does not switch pages
+between writing and executing. A program that only runs in the VM pays
+nothing for its code, and its costs grow with how often it makes system
+calls, maps and unmaps memory, and forks.
+
+### Examples
+
+The table puts real software in each of these categories. Most of it is
+what fwe's end-to-end tests run (`crates/fwe/tests/guests.rs`, with the
+binaries described in `guests/debian/README.md`, `guests/alpine/README.md`
+and the fetch manifests beside them); the rows marked "not tested by fwe"
+name software only for a well-known property that puts it in the
+category, not as a claim that it runs.
+
+| Category | Software | Why it is there |
+|---|---|---|
+| native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library are scanned once as mapped; the rewrites are their system calls and thread-pointer accesses |
+| native, Go built as PIE | Alpine's podman and containerd (tested) | Alpine builds its packages position-independent, Go programs included, so they run natively; Debian's podman, containerd and runc are non-PIE and would need the VM |
+| native, C with musl | Alpine's crun, busybox from the Alpine root (tested) | musl PIEs; crun runs its sealed copy from a memfd, which fwe's `execveat` supports |
+| native, many libraries | Debian's Rust toolchain: `cargo`, `rustc` with its LLVM library (tested) | a large dynamic PIE: preparation scans a few very large libraries once each |
+| native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code is prepared as JIT code each time it becomes executable (system calls and thread-pointer accesses only); OpenSSL's assembly in the same process keeps constant tables among its code, which the unwind-table rule leaves alone |
+| native, JIT | the JVM (not tested by fwe) | a JIT compiler with a large code cache and many threads; see [Java](#java-and-the-jvm) |
+| VM, interpreter | Debian's Python 3.11 (tested) | Debian links it non-PIE at `0x400000`; its C extension modules are loaded as they are |
+| VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld`, which they run, are PIEs and run natively, so every compiler stage is an `execve` between the backends |
+| VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; the `go` command starts its tools with `vfork` |
+| fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child is a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend, or starts in the VM, re-executes fwe |
+| system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each is a trap natively or a VM exit |
+| uses `x18` as Linux allows | hand-written assembly that allocates it (rare in compiler output); Wine on arm64, which keeps the Windows thread block in `x18` (not tested by fwe) | natively each use goes through a stub, and JIT code's uses are not rewritten; in the VM `x18` is the guest's own |
+
+## Languages and runtimes
+
+fwe runs machine code and makes no distinction between languages. What
+differs between them is how their programs are linked (which decides the
+backend) and how their runtimes use the kernel: threads, signals, memory
+and code generation. This section takes common languages and runtimes in
+turn and says how fwe meets what each needs. Where something is not
+tested by fwe, the text says so and infers only from mechanisms the code
+has.
+
+### C and C++ on glibc
+
+The common case: a dynamically linked PIE naming `/lib/ld-linux-aarch64.so.1`.
+fwe loads the program and glibc's dynamic linker
+([The dynamic linker](#the-dynamic-linker)), and from there glibc runs as
+it would on Linux: `ld.so` reads `/etc/ld.so.cache` and the libraries from
+the guest's root filesystem, maps them with fwe's `mmap`, applies
+relocations and RELRO, and sets up thread-local storage with `msr
+tpidr_el0`, which the native backend rewrites. The guest's environment is
+fwe's own, and `AT_SECURE` is 0, so `LD_LIBRARY_PATH`, `LD_PRELOAD` and
+the rest act as on Linux. There is no vDSO, so `clock_gettime` and
+`gettimeofday` are real system calls. A non-PIE glibc program linked low
+runs the same way in the VM (tested with a small program of that shape
+and with Debian's Python, GCC and clang). C++ adds nothing fwe sees:
+`libstdc++` is one more library, and exceptions unwind in user space.
+
+### musl and Alpine
+
+A musl program names `/lib/ld-musl-aarch64.so.1`, which is musl's C
+library and dynamic linker in one; static musl programs have no
+interpreter at all. Both run natively when position-independent, as all
+of Alpine's are (tested: Alpine's root filesystem, busybox and the
+container engines). musl makes the same system calls glibc does for the
+same work, through the same `svc #0`.
+
+### Rust
+
+Rust programs are C-like to fwe. The default target
+(`aarch64-unknown-linux-gnu`) builds dynamic PIEs against glibc, which run
+natively; Debian's `rustc` and `cargo` are such programs and build and
+test a project under fwe (tested). A static build for
+`aarch64-unknown-linux-musl` is a PIE or not depending on how it is
+linked: fwe's own test guests are static musl programs linked directly
+with `ld.lld`, non-PIE, and they run natively only because they are given
+an image base at 1 TiB; built again at the default address, as the
+"rust-low" guests, they need the VM (both tested). Rust's standard library
+uses threads and futexes through libc, both covered.
+
+### Go
+
+Go does not use the C library: its runtime makes system calls itself with
+`svc #0`, starts its own threads with `clone`, parks them on futexes,
+installs a handler for every signal on an alternate stack, and preempts
+long-running goroutines by sending the thread running them `SIGURG` with
+`tgkill`. fwe meets each of these the same way as for C: the `svc`s are
+rewritten (native) or trapped (VM), `clone` makes a host thread (with its
+own vCPU in the VM), and a `tgkill` of a caught signal is posted to that
+thread directly and the thread woken ([Sending a
+signal](#sending-a-signal)), which in the VM stops its vCPU even in a
+loop with no system calls.
+
+Which backend a Go program gets depends on how it was linked. Debian's Go
+1.19 toolchain is linked low, non-PIE, as are the static executables it
+builds by default: all run in the VM (tested: the `go` command builds,
+runs and tests a module with goroutines). Go programs built as PIEs, as
+Alpine builds podman and containerd, run natively (tested). The `go`
+command starts its tools with `vfork`, which fwe supports in both
+backends.
+
+### Python and other interpreters
+
+An interpreter is an ordinary program to fwe; the scripts it runs are
+data. Debian's Python 3.11 is linked non-PIE at `0x400000`, so it runs in
+the VM, and its test covers C extension modules, threads, sockets,
+asyncio, `ctypes` and libffi closures, signals, `fork`, `subprocess` and a
+process pool sharing POSIX semaphores through `/dev/shm`. A Python built
+as a PIE would run natively. bash, an interpreter of shell scripts, runs
+natively (tested).
+
+### Node.js and V8
+
+Debian's Node.js 18 is a dynamic PIE and runs natively (tested: V8's JIT
+on a hot function, ICU, OpenSSL digests, zlib, timers and promises, a
+child process, an HTTP server and client, and a worker thread). V8
+generates code at run time; each time a page of it becomes executable,
+fwe prepares it as JIT code: system calls and thread-pointer accesses are
+rewritten, `x18` is not, which suits V8 since it reserves `x18`
+([What is scanned](#what-is-scanned)).
+
+### Java and the JVM
+
+Not tested by fwe. What follows is inferred from how a HotSpot JVM is
+generally built and from fwe's mechanisms, not observed:
+
+- **Backend:** a `java` launcher built as a PIE, as Debian builds its
+  programs by default, would run natively; the JVM itself is a shared library (`libjvm.so`).
+- **JIT code:** HotSpot generates code into a code cache. Natively, each
+  page becomes executable through an `mprotect` or a write+exec fault,
+  and is then prepared as JIT code. If its generated code uses `x18`
+  (HotSpot treats `x18` as reserved only on platforms that reserve it,
+  which Linux does not), those uses are not rewritten and would lose their
+  value whenever macOS clears `x18`; this is the largest risk natively.
+  In the VM, generated code runs as it is, but a JVM is a PIE and fwe
+  does not put PIEs in the VM.
+- **Safepoints and null checks:** HotSpot relies on `SIGSEGV` from
+  deliberately protected pages. fwe delivers a guest fault to the guest's
+  handler with Linux's frame, and turns the `SIGBUS` macOS reports for
+  some protection faults into the `SIGSEGV` Linux sends
+  ([Faults in guest code](#faults-in-guest-code)).
+- **Threads and memory sizing:** many threads with futexes are supported.
+  The JVM sizes its heap from `/proc/meminfo` and cgroup limits, which
+  under fwe are fixed figures and unenforced limits
+  ([Memory pressure](#memory-pressure), [cgroups](#cgroups)).
+- **Tools:** debugging and attach mechanisms that use `ptrace` or
+  `process_vm_readv` fail with `ENOSYS` ([Not available](#not-available)).
+
+### Wine
+
+Not tested by fwe. This is an analysis of how Wine for Linux would meet
+fwe's mechanisms, not a claim that it works.
+
+- **Which Wine:** fwe runs only arm64 Linux code, so it would have to be
+  an arm64 build of Wine. That runs Windows programs built for ARM64.
+  Running x86 or x64 Windows programs would additionally need an x86
+  emulator inside the arm64 process (Wine on arm64 provides for one
+  through its WoW64 and ARM64EC support, with emulators such as FEX), or
+  an x86 Wine under an x86-to-arm64 emulator such as box64; fwe adds no
+  x86 emulation of its own.
+- **Backend:** Wine's Linux builds start Windows programs through
+  `wine-preloader`, a static non-PIE executable linked at a fixed low
+  address, which reserves
+  the low address ranges Windows programs expect (with `MAP_FIXED`
+  mappings) before it loads the dynamic linker and Wine itself. Linked
+  low, it would run in the VM, the only backend that can give a program
+  memory below 4 GiB: there a fixed mapping anywhere below fwe's code page
+  near 1 TiB is backed by slab memory and translated, and a fixed mapping
+  above that fails with `ENOMEM`. Each reservation takes slab space,
+  which is 7/16 of the guest-physical space the host offers (28 GiB on an
+  M1 or M2). The VM also gives the 4 KiB pages Windows memory management
+  assumes; natively the guest's pages are 16 KiB.
+- **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`, which
+  Wine's arm64 build follows. In the VM `x18` is the guest's own and
+  survives; natively, code using it would go through stubs, and Windows
+  code Wine maps and makes executable would have its `x18` uses left
+  unrewritten. Another reason it belongs in the VM.
+- **wineserver:** a separate process the Wine processes talk to over Unix
+  sockets, passing descriptors with `SCM_RIGHTS` (supported; received
+  descriptors are not held to `RLIMIT_NOFILE`), sharing memory through
+  `MAP_SHARED` file mappings and memfds (supported; in the VM, shared
+  mappings are segments), and signalling threads to suspend them (Wine
+  uses ordinary signals for this, which fwe relays).
+- **Signals:** Wine handles `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGTRAP`
+  on an alternate stack to emulate Windows exceptions; fwe delivers
+  faults to guest handlers with Linux frames, honours `sigaltstack`, and
+  in the VM reports alignment faults as `SIGBUS` and `brk` as `SIGTRAP`.
+- **What would block parts of it:** there is no `ptrace`, no
+  `process_vm_readv`/`writev` and no `/proc/<pid>/mem` of another process
+  under fwe, so whatever Wine implements with them (reading or writing
+  another process's memory, debugging) would fail. Whether that blocks
+  ordinary programs is unknown.
+
+## Which instructions get translated, and how
+
+This section is about the native backend; the VM backend translates no
+instructions ([How the VM is actually used](#how-the-vm-is-actually-used)).
+
+### What runs unchanged
+
+Almost everything. Linux and macOS run on the same CPU with the same
+instruction set, so arithmetic, loads and stores, branches, floating point
+and SIMD, atomics and cache maintenance run directly on the processor, at
+full speed, in the fwe process. Only instructions whose meaning depends on
+which kernel is underneath need help, and there are four kinds.
+
+| Instruction | What Linux expects | Why it cannot run unchanged on macOS | What fwe does |
+|---|---|---|---|
+| `svc #0` | a Linux system call, number in `x8` | it would enter the macOS kernel, which reads `x16` and other numbers | rewritten in place to `brk #0x4c58` |
+| `mrs`/`msr` of `TPIDR_EL0` | the thread pointer, which the program owns | macOS does not preserve `TPIDR_EL0` for user code | rewritten to a branch to a stub |
+| any instruction naming `x18` | an ordinary register | macOS clears `x18` on every exception return, preemption included | rewritten to a branch to a stub |
+| `mrs <Xt>, ctr_el0` | readable at EL0 | macOS traps it | left alone; emulated when it traps |
+
+### System calls: svc becomes brk
+
+A Linux system call is `svc #0`. In a macOS process it would enter the
+macOS kernel, which uses `svc #0x80`, takes the number from `x16` and
+numbers its calls differently: the call would be wrong or fail. So before
+guest code may execute, every `svc #0` is overwritten with a breakpoint
+instruction carrying a mark of fwe's own (`0x4c58`, "LX"):
+
+| | Assembly | Word | Bytes in memory |
+|---|---|---|---|
+| In the Linux binary | `svc #0` | `0xd4000001` | `01 00 00 d4` |
+| In memory under fwe | `brk #0x4c58` | `0xd4298b00` | `00 8b 29 d4` |
+
+Executing the `brk` raises `SIGTRAP` on the thread. fwe's handler
+(`on_sigtrap` in `crates/native/src/trap.rs`) checks that the instruction
+at the saved pc is its own `brk`, reads the number from `x8` and the
+arguments from `x0`–`x5` in the saved context, runs the call, writes the
+result into `x0`, advances the pc past the `brk` and returns from the
+handler, which resumes the guest. A `brk` with any other immediate is the
+guest's own breakpoint and becomes a `SIGTRAP` for the guest.
+
+### The thread pointer: a stub per access
+
+Linux programs keep their thread-local storage at the address in
+`TPIDR_EL0` and read it with `mrs xN, tpidr_el0` wherever a thread-local
+variable is used; the C library sets it with `msr`. macOS does not keep
+that register for user code, so fwe keeps each guest thread's value in a
+slot of the host thread's own thread-specific data (a `pthread` key fwe
+created), which macOS points the read-only register `TPIDRRO_EL0` at.
+Each access becomes a branch to a stub that uses the slot:
+
+```text
+Linux binary                  under fwe
+------------                  ---------
+mrs  x0, tpidr_el0            b    stub
+                              ...
+                         stub:
+                              mrs  x0, tpidrro_el0      // host thread's TSD
+                              and  x0, x0, #~7          // low three bits cleared
+                              ldr  x0, [x0, #tp_slot]   // the guest's thread pointer
+                              b    <next instruction>
+```
+
+A write (`msr tpidr_el0, xN`) saves a scratch register below `sp` (Linux
+arm64 has no red zone, so nothing lives there), finds the slot the same
+way, stores the value and restores the scratch register. A read into
+`xzr` does nothing and becomes a `nop`.
+
+### x18: a stub per use
+
+On Linux `x18` is an ordinary register. macOS reserves it for itself and
+clears it whenever the kernel returns to user code, including after
+preemption, so a value the guest keeps there can vanish between any two
+instructions. fwe therefore keeps the guest's `x18` in a second slot of
+the host thread's data and rewrites every instruction that names `x18` to
+use an ordinary register in its place:
+
+```text
+Linux binary                  under fwe
+------------                  ---------
+ldr  x0, [x18, #8]            b    stub
+                              ...
+                         stub:
+                              str  x1, [sp, #-16]!      // two scratch registers
+                              str  x2, [sp, #-16]!      // the instruction does not use
+                              mrs  x2, tpidrro_el0
+                              and  x2, x2, #~7
+                              ldr  x1, [x2, #x18_slot]  // x1 = the guest's x18
+                              ldr  x0, [x1, #8]         // the instruction, x18 -> x1
+                              ldr  x2, [sp], #16
+                              ldr  x1, [sp], #16
+                              b    <next instruction>
+```
+
+An instruction that writes `x18` stores the scratch register back into the
+slot before the scratch registers are restored. macOS preserves every
+register but `x18`, so the scratch register holds its value across
+preemption. Some forms need more than substitution, and
+`crates/native/src/decode.rs` covers:
+
+- every data-processing class (immediate, register, carry, logical,
+  bitfield, conditional, one- to three-source), floating-point and vector
+  element moves to and from general registers;
+- every general and SIMD load/store form, structure loads and stores,
+  exclusives, acquire/release and the LSE atomics;
+- PC-relative forms (`adr`, `adrp`, literal loads), materialised from the
+  original pc;
+- compare- and test-branches, through a full-range branch in the stub;
+- indirect branches through `x18`, via `x16`/`x17`;
+- code using `sp`: the stub pushes 32 bytes, so a spill of `x18` through
+  `sp` or `mov x18, sp` has its immediate adjusted, and where no immediate
+  can absorb the push a third scratch register stands in for the original
+  `sp`.
+
+fwe's trap handlers keep the slot and the kernel's view of the registers
+in step: a system call or a signal frame sees the guest's real `x18`,
+`rt_sigreturn` restores it, and a new thread starts with its creator's.
+macOS 26.4 has an opt-in mode that preserves `x18`; fwe only probes it
+(`fwe --host-info`) and does not rely on it, since switching it at every
+trap costs two host calls and one of them could hang.
+
+### CTR_EL0: emulated when it traps
+
+Linux lets user code read `CTR_EL0`, the cache-type register, to learn the
+cache line sizes before flushing code it wrote. macOS traps the read,
+which arrives as `SIGILL`. The instruction is not rewritten: fwe's fault
+handler recognises `mrs <Xt>, ctr_el0` (`0xd53b0020` with `Xt` in the low
+five bits), puts Apple Silicon's value in `Xt` without the bits that let
+code skip cache maintenance (`crates/native/src/hwcap.rs`), and resumes
+after it.
+
+### When code is prepared
+
+The rewriting happens whenever guest memory is about to become executable,
+while it is still writable and before any thread can run it
+(`crates/native/src/prepare.rs`):
+
+- **Loading a program**: the loader copies each segment into writable
+  memory, prepares the executable sections, then sets the segments' final
+  protections. The dynamic linker is prepared the same way.
+- **`mmap` with `PROT_EXEC`**: the dynamic linker mapping a library, or
+  any program mapping code. For a file, fwe reads the file's section
+  headers to prepare only its executable sections.
+- **`mprotect` adding `PROT_EXEC`**: code a program made executable after
+  writing it (a JIT's).
+- **The first instruction fetch from write+exec memory**: such a page is
+  kept writable on the host and prepared when it is first executed
+  ([Write+exec memory](#writeexec-memory)).
+
+Preparing code twice is harmless: a rewritten site no longer matches.
+fwe's own `rt_sigreturn` trampoline (`movz x8, #139; svc #0`) is prepared
+like guest code.
+
+### What is scanned
+
+arm64 instructions are aligned 4-byte words, so scanning aligned words
+finds every instruction exactly. The risk is the other way: a data word
+that happens to encode one of these instructions must not be patched.
+So:
+
+- only `SHF_EXECINSTR` sections are scanned (`Elf::exec_ranges`), so the
+  tables that share an executable segment with the code are never
+  touched; for a file-backed `mmap` the kernel maps the file for a moment
+  to read its section headers (`Elf::exec_file_ranges`);
+- inside them, `x18` is rewritten only within the ranges the unwind table
+  (`.eh_frame`, `crates/elf/src/unwind.rs`) covers, since hand-written
+  assembly keeps constant tables in `.text` (OpenSSL's `libcrypto` has
+  over a thousand data words that decode as `x18` instructions); a literal
+  load that is itself code marks its target as a literal pool;
+- system calls and thread-pointer accesses are rewritten throughout the
+  executable sections;
+- without a usable unwind table, the whole of each executable section is
+  code; without section headers, the whole executable segment is;
+- code a guest makes executable after mapping it (a JIT's) has only system
+  calls and thread-pointer accesses rewritten: JIT compilers for Linux
+  arm64 leave `x18` alone (V8 reserves it) and their pages hold data.
+
+### Where the stubs go
+
+A stub must be within reach of a `b` instruction (128 MiB either way) from
+the instruction it replaces. For a loaded program, fwe reserves stub space
+right after the image, sized from a count of the sites it will need. For
+code mapped later, it reserves regions near the code, searching outward
+from it. If no room can be found the preparation fails: the guest's
+`mmap` or `mprotect` gets `ENOMEM`, and `--strace` notes why.
+
+### What is not translated
+
+- Load/store writeback onto `sp`, writes to `sp`, `casp` and the
+  pointer-authenticated loads that name `x18` are left alone and counted
+  per image under `--strace` ("x18 uses left unrewritten").
+- `x18` uses in JIT code, as above.
+- Pointer authentication is not offered natively (`AT_HWCAP` has no
+  `PACA`/`PACG`), since the host owns the keys; programs then use the
+  instructions' no-op forms.
+- Everything else, including cache maintenance (`dc`, `ic`), which macOS
+  allows at EL0.
+
+## How the VM is actually used
+
+The VM backend does not run a Linux kernel in the VM. It uses the
+hardware's virtualization only to give the guest an address space of its
+own, starting at address 0, and to catch the guest's system calls and
+faults. The VM has no devices, no firmware and no operating system: just
+the guest's code at EL0, a page of fwe's code at EL1, and page tables fwe
+writes. Every system call still goes to the same kernel crate as in the
+native backend. The code is in `crates/native/src/hv/`.
+
+### Hypervisor.framework in brief
+
+macOS's Hypervisor.framework lets an ordinary process (signed with the
+`com.apple.security.hypervisor` entitlement, no root) make one VM and run
+virtual CPUs in it:
+
+- `hv_vm_create` makes the VM for the process; `hv_vm_map` maps ranges of
+  the process's memory into the VM's "physical" address space (the IPA
+  space) — the *stage 2* translation, which the framework owns;
+- `hv_vcpu_create` makes a vCPU on the calling thread, which alone may use
+  it; `hv_vcpu_run` runs the guest on it until something makes it exit,
+  and returns why;
+- `hv_vcpus_exit` makes running vCPUs exit, from any thread.
+
+Inside the VM the guest's own page tables — *stage 1* — translate its
+virtual addresses to IPAs, as a Linux kernel's tables would. fwe writes
+those tables itself.
+
+### What fwe sets up
+
+When a low-linked program starts, fwe:
+
+1. reserves the **slab**, one range of host memory at 512 GiB that will
+   hold all of the guest's private memory, and maps it into the VM once,
+   with a region of fwe's own (a pool for page tables and a code page);
+   stage 2 then stays as it is for the life of the VM, apart from shared
+   memory ([Memory](#memory) has the layout);
+2. writes the **code page**, which sits at the top of the guest's 40-bit
+   address space and is mapped for EL1 only: an exception vector whose
+   sixteen entries are each `hvc #2; b .`, and a TLB-invalidation stub
+   (`tlbi vmalle1is; dsb ish; isb; eret`);
+3. creates the first **vCPU** and sets its EL1 registers: the stage-1
+   translation regime (4 KiB pages, 40-bit addresses, `TTBR0_EL1` at fwe's
+   tables), `VBAR_EL1` at the vector, FP/SIMD enabled, EL0 allowed to read
+   the counters and to do the cache maintenance, `dc zva` and `wfi`/`wfe`
+   Linux allows user code, and pointer authentication and BTI as Linux
+   enables them where the vCPU offers them;
+4. **loads** the program at its link address (backed by slab memory and
+   translated, since the slab is not at that address), the dynamic linker,
+   the stack and the break, writing stage-1 entries for each;
+5. **runs** the vCPU at EL0 at the entry point.
+
+### A system call in the VM
+
+The guest's `svc #0` is unchanged. At EL0 it takes an exception to EL1,
+which runs fwe's vector entry, whose `hvc #2` makes the vCPU exit to fwe
+(`hvc #0` is avoided, as the framework may take it for a firmware call).
+fwe's run loop sees an exit caused by `hvc` and reads the reason the guest
+entered EL1 from `ESR_EL1`: exception class `0x15`, a 64-bit `svc`. It
+reads the guest's registers, runs the call, and resumes the vCPU after the
+`svc` at EL0.
+
+```mermaid
+sequenceDiagram
+    participant G as Guest code at EL0
+    participant V as fwe vector at EL1
+    participant L as vCPU run loop (fwe thread)
+    participant K as Kernel crate
+    participant M as macOS
+    G->>V: svc 0, exception to EL1
+    V->>L: hvc 2, the vCPU exits, hv_vcpu_run returns
+    L->>L: ESR_EL1 class 0x15 (SVC64), registers read
+    L->>K: guest pointers checked and translated, system call
+    K->>M: libc call(s)
+    M-->>K: result
+    K-->>L: x0 = result or minus a Linux errno
+    L->>G: registers written, hv_vcpu_run resumes at EL0 after the svc
+```
+
+The kernel crate never walks the guest's page tables. Before a call, the
+run loop checks each pointer argument against the guest's mappings
+(`EFAULT` if the guest could not use it) and turns it into a host address:
+the same address for most memory, or the slab address behind a translated
+range such as the low-linked image ([Pages and
+translation](#pages-and-translation)).
+
+### Faults, breakpoints and other exits
+
+Every other exception the guest takes at EL0 goes through the same vector
+and `hvc`, and fwe reads its class from `ESR_EL1`: a data or instruction
+abort, a `brk`, a misaligned pc or sp, an unknown instruction. Each becomes
+the Linux signal Linux would send, except an abort that is only a page not
+fetched yet (a `vfork` child's) or a stale TLB entry, which is fixed and
+retried. A few things exit the vCPU directly instead of through the
+vector: an access to an IPA nothing is mapped at (a stage-2 abort), `wfi`
+or `wfe`, and a read of a system register the framework traps. The full
+list is under [Faults in guest code](#faults-in-guest-code), and the run
+loop's flow in [hypervisor.md](hypervisor.md#the-run-loop).
+
+### Counters and timers
+
+The guest reads time from the counter registers, as Linux programs do.
+`CNTVCT_EL0`, the virtual counter, is read directly. Every vCPU of a
+process uses the same virtual counter offset (a fork child takes its
+parent's), so all threads see one clock. A read of `CNTPCT_EL0`, the
+physical counter Linux also lets user code read, is trapped by the
+framework and emulated from the host's counter minus that offset, so both
+give the same time. The guest cannot program the timers itself; its
+sleeps, interval timers and `timerfd`s are system calls fwe serves with
+the host's, and a virtual-timer exit simply resumes the vCPU.
+
+### Threads
+
+Each guest thread is a host thread with a vCPU of its own, created on it,
+since the framework lets only the creating thread use a vCPU. All vCPUs
+share the VM, so they share the guest's page tables and memory. A new
+thread's vCPU starts with its creator's registers, `x0` = 0, the new
+stack, and `TPIDR_EL0` from `CLONE_SETTLS` (the guest's thread pointer and
+`x18` are simply its own registers here).
+
+### Signals into a running vCPU
+
+A host signal for the guest arrives on a thread whose vCPU may be running
+guest code, where no handler of fwe's could rewrite the guest's
+registers. So fwe's handler records the signal pending and calls
+`hv_vcpus_exit` on that thread's own vCPU; `hv_vcpu_run` returns with an
+exit marked *canceled*, and the run loop delivers the signal by building
+Linux's frame and resuming the vCPU in the guest's handler. This reaches
+even a guest spinning without system calls. The framework's own threads
+are created with every guest signal blocked, so the host delivers guest
+signals only to vCPU threads, each running under the mask its guest
+thread's mask calls for ([A host signal reaching a guest
+thread](#a-host-signal-reaching-a-guest-thread)).
+
+### Memory changes and the TLB
+
+The guest's `mmap`, `munmap`, `mprotect` and `brk` edit stage 1 and
+nothing else: slab memory is handed out and taken back, never replaced
+behind the VM. Granting access needs nothing more, but taking it away
+needs every vCPU's TLB invalidated before the guest relies on the change.
+fwe counts such edits; a vCPU resuming after one runs the TLB stub at EL1
+first, which invalidates the TLBs of every vCPU and returns to the guest
+where it was. Memory and tables given back are reused only after such a
+flush. The precise rules are in
+[hypervisor.md](hypervisor.md#how-it-works).
+
+### fork, execve and the end of a VM process
+
+A VM belongs to one process: a host `fork` child could not use the
+parent's VM, and would end with a VM it inherited. So a VM process never
+forks on the host. A guest `fork` starts a fresh `fwe --hv-fork-child`
+that builds a VM of its own and receives the parent's memory and kernel
+state ([fork](#fork)); `execve` re-executes fwe, which picks the backend
+the new program needs ([execve](#execve)).
+
+A process that ends with its VM alive can bring the whole Mac down, so
+every way out of a VM process (`exit_group`, the last thread's exit, a
+fatal signal, fwe's own errors and panics, `execve`) first stops every
+vCPU, has each thread destroy its own, and destroys the VM. Signals that
+would end the process are caught so this can happen, and a guest's
+`SIGKILL` to another fwe process is relayed as a catchable signal
+(`SIGINFO`) for the same reason. Only a `SIGKILL` from outside fwe cannot
+be intercepted. The rules and why they exist are in
+[hypervisor.md](hypervisor.md#never-end-a-vm-process-abnormally).
+
 ## Linux to macOS
 
-Each table below reads **Linux | macOS | fwe**: what the guest asks for,
-what the host has, and what fwe makes of it. A few calls going in and the
+This part goes through Linux's primitives one by one. Most comparisons are
+tables that read **Linux | macOS | fwe**: what the guest asks for, what the
+host has, and what fwe makes of it, with the prose around each table
+saying why. To give a feel for it, here are a few calls going in and the
 host calls coming out:
 
 | Guest call (Linux) | What fwe does | Host call(s) (macOS) |
@@ -112,7 +887,14 @@ host calls coming out:
 
 ### The CPU
 
+The processor is shared, so this section is about the conventions the two
+kernels lay over it: how a program calls the kernel, which registers the
+kernel lets it own, and what the kernel tells it about the CPU at
+startup.
+
 #### System call entry
+
+Both kernels are entered with `svc`, but they agree on nothing else:
 
 | | Linux arm64 | macOS arm64 |
 |---|---|---|
@@ -122,16 +904,13 @@ host calls coming out:
 | Error report | `x0` = −errno (−1 to −4095) | carry flag set, `x0` = errno (macOS numbering) |
 
 A Linux `svc #0` executed in a macOS process would enter the macOS kernel
-with a meaningless number, so fwe intercepts every guest system call:
-
-- **Native backend:** before guest code becomes executable, each `svc #0`
-  is rewritten to `brk #0x4c58` (`crates/native/src/rewrite.rs`). The
-  `brk` raises `SIGTRAP`; fwe's handler reads `x8` and `x0`–`x5` from the
-  saved context, runs the call and resumes after the `brk` with the result
-  in `x0`.
-- **VM backend:** the guest's `svc #0` takes an exception to EL1; fwe's
-  vector runs `hvc #2`, the vCPU exits and the backend reads `ESR_EL1`
-  (exception class `0x15`, SVC64). Nothing is rewritten.
+with a meaningless number, so fwe intercepts every guest system call
+before it gets there. The native backend rewrites each `svc #0` to a
+`brk` that traps into fwe
+([System calls: svc becomes brk](#system-calls-svc-becomes-brk)); in the
+VM the `svc` takes an exception to fwe's vector, which leaves the VM
+([A system call in the VM](#a-system-call-in-the-vm)). Either way the call
+then takes the same path:
 
 ```mermaid
 sequenceDiagram
@@ -156,6 +935,11 @@ interrupted by a signal returns or restarts as described under
 
 #### Registers and the thread pointer
 
+Linux gives user code every general register and the thread-pointer
+register; macOS keeps two of them for itself and traps a register read
+Linux allows. In the VM the guest has the CPU's registers to itself, so
+only the native backend has to work around this:
+
 | Register | Linux | macOS | fwe, native | fwe, VM |
 |---|---|---|---|---|
 | `TPIDR_EL0` | the thread pointer (TLS), set with `msr` | not preserved for user code | every `mrs`/`msr` of it branches to a stub that keeps the guest's value in a slot of the host thread's TSD, found through `TPIDRRO_EL0` | the guest's own |
@@ -164,11 +948,12 @@ interrupted by a signal returns or restarts as described under
 | `CNTPCT_EL0` | readable at EL0 | readable | read by the guest | trapped by the hypervisor, emulated from the virtual counter the guest sees |
 
 `clone` with `CLONE_SETTLS` writes the new thread's TSD slot (native) or its
-vCPU's `TPIDR_EL0` (VM). The `x18` rewriting, its coverage and the code
-discovery it depends on are in
-[architecture.md](architecture.md#rewriting-guest-code).
+vCPU's `TPIDR_EL0` (VM). How the stubs work is under
+[Which instructions get translated](#which-instructions-get-translated-and-how).
 
 #### Cache maintenance, PAC and BTI
+
+Three CPU features depend on what the kernel allows or sets up:
 
 - **Cache maintenance** is allowed at EL0 on both systems, so a JIT's own
   `dc`/`ic` instructions work in the native backend. Code fwe itself writes
@@ -187,6 +972,9 @@ discovery it depends on are in
 
 #### auxv, hwcaps and the vDSO
 
+A Linux program learns about its machine from what the kernel puts on its
+initial stack. fwe builds that stack as Linux does, in both backends:
+
 - The initial stack is Linux's: strings, `AT_RANDOM` bytes, the auxiliary
   vector, `envp`, `argv`, `argc`, 16-byte aligned, on a fresh 8 MiB stack
   with a guard page (`crates/native/src/stack.rs`).
@@ -201,6 +989,12 @@ discovery it depends on are in
   other.
 
 ### Memory
+
+A Linux process expects to own its address space, with 4 KiB pages and
+memory it may map writable and executable at once. macOS gives a process
+an address space it shares with its own loader and libraries, starting at
+4 GiB, with 16 KiB pages and no write+exec memory. This section shows how
+each backend lays the guest out, then goes through the memory calls.
 
 #### Address-space layout
 
@@ -269,15 +1063,22 @@ flowchart LR
   is its host address. One placed outside the slab (the low image, a
   `MAP_FIXED` address) is backed by slab memory elsewhere and recorded as a
   translated range.
+- The IPA space is as large as the host offers, up to 40 bits; an M1 or M2
+  offers 36 bits (64 GiB), and the slab is 7/16 of it.
 
 #### Pages and translation
+
+The two backends differ most in how a guest address becomes a place in
+memory:
 
 | | Linux | macOS | fwe |
 |---|---|---|---|
 | Page size | 4 KiB on most arm64 kernels; 16 and 64 KiB exist | 16 KiB | native: the host's 16 KiB, reported in `AT_PAGESZ` (the arm64 ABI allows it); VM: 4 KiB |
 | Translation | one stage, the kernel's tables | one stage, XNU's pmap | native: XNU's; VM: two stages, fwe's stage 1 and the framework's stage 2 |
 
-In the VM, both stages are real hardware translation:
+Natively, a guest address is a host address and macOS translates it as it
+does for any of its own processes. In the VM, both stages are real
+hardware translation:
 
 - **Stage 1** is fwe's own page tables (`crates/native/src/hv/pagetables.rs`):
   4 KiB granule, 40-bit space, level-3 pages only, each page's EL0
@@ -304,6 +1105,11 @@ given one buffer that runs over the edge of a translated range has no
 single host address and fails with `EINVAL`.
 
 #### The mmap family
+
+Linux's memory calls act on the kernel's records of a process's mappings.
+Natively, fwe passes them to the host's own calls with the guest's
+addresses, and fills in what macOS does differently; in the VM, it carries
+them out on the slab and the guest's page tables:
 
 | Call | Linux | fwe, native | fwe, VM |
 |---|---|---|---|
@@ -338,6 +1144,9 @@ keeps such memory writable on the host and records it
 
 #### Shared memory and memfd
 
+Linux has several kinds of shared memory macOS lacks or keeps
+machine-wide. fwe builds each from files the fwe processes share:
+
 | Linux | macOS | fwe |
 |---|---|---|
 | `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone |
@@ -345,6 +1154,11 @@ keeps such memory writable on the host and records it
 | System V shared memory | own `shmget` | see [System V IPC](#system-v-ipc) |
 
 ### Processes
+
+Each guest process is a host process, so process ids, parents and exit
+statuses are real host ones and host tools see them. What needs work is
+how processes are made and replaced: copying a process whose memory fwe
+has rewritten or placed in a VM, and starting a new program in place.
 
 #### fork
 
@@ -359,7 +1173,10 @@ parent's other threads keep running, gives the child none of the parent's
 kqueues, and does not restore a signal mask from a handler frame the child
 did not take. A VM cannot be forked at all.
 
-**Native backend** (`crates/native/src/process.rs`, `quiesce.rs`):
+**Native backend** (`crates/native/src/process.rs`, `quiesce.rs`): fwe
+holds every lock a child could need, pauses the parent's other threads
+while they run guest code, and only then forks, so the child starts from
+one consistent instant:
 
 ```mermaid
 sequenceDiagram
@@ -398,7 +1215,9 @@ child's mappings (`mmap`, `munmap`) stay its own. In the native backend
 VM backend treats any clone without `CLONE_THREAD` as a `fork` or `vfork`.
 
 **VM backend** (`crates/native/src/hv/fork.rs`): the child is a fresh
-`fwe --hv-fork-child` started with `posix_spawn`, never a host fork.
+`fwe --hv-fork-child` started with `posix_spawn`, never a host fork. The
+parent hands it its kernel state over a Mach port and its memory over a
+socket, and the child builds a VM of its own around them:
 
 ```mermaid
 sequenceDiagram
@@ -446,6 +1265,11 @@ sequenceDiagram
 
 #### Threads, clone and futexes
 
+A Linux thread is a task that shares its process's memory and descriptors;
+a guest thread is a host thread, so the host schedules it. Linux's `clone`
+is far more general than macOS's `pthread_create`, and futexes have no
+direct macOS counterpart for the shared case:
+
 | | Linux | macOS | fwe |
 |---|---|---|---|
 | Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native) or a host thread with its own vCPU (VM) |
@@ -463,7 +1287,11 @@ the given stack and no alternate stack. Its exit clears and wakes its
 
 Linux replaces the address space in place, keeping the pid, descriptors
 not marked close-on-exec, the signal mask, pending signals and ignored
-dispositions. fwe does it one of two ways:
+dispositions. fwe does it one of two ways. When the new program can run
+natively and the caller is a native process with no other threads, it
+unmaps the old program and loads the new one in place. Otherwise it runs
+the host's `execve` on `fwe` itself, passing what must survive on the
+command line, and the new fwe picks the backend the new program needs:
 
 ```mermaid
 flowchart TD
@@ -477,7 +1305,7 @@ flowchart TD
     reexec --> pick["new fwe picks the backend the program needs"]
 ```
 
-What crosses an `execve`:
+What crosses an `execve`, and how:
 
 | State | How |
 |---|---|
@@ -493,6 +1321,9 @@ path and is then `execve`.
 
 #### The ELF loader and dynamic linker
 
+Linux's kernel loads the program and its dynamic linker; fwe's loader does
+the same job:
+
 - The loader (`crates/native/src/loader.rs`, the VM's in `hv/backend.rs`)
   maps each `PT_LOAD` segment, a PIE at a base it picks, code first
   writable so the native backend can rewrite it.
@@ -504,6 +1335,9 @@ path and is then `execve`.
   glibc and musl run unmodified.
 
 #### wait
+
+Waiting for children mostly passes through, since the children are real
+host processes; the flags and pid arguments need translating:
 
 | | Linux | macOS | fwe |
 |---|---|---|---|
@@ -519,6 +1353,12 @@ status word, `rusage`, `SIGCHLD`) is under
 [Children ending](#children-ending).
 
 ### Signals
+
+Both kernels have signals, with the same idea and mostly the same
+behaviour, but different numbers, different structures, and a different
+idea of what a blocked signal keeps. This section covers the guest's side:
+numbers, dispositions, and sending. How a signal from the host reaches the
+guest is under [Host signals](#host-signals).
 
 #### Numbers
 
@@ -546,6 +1386,9 @@ from elsewhere is under
 
 #### Dispositions, masks and frames
 
+The guest's signal state lives in the kernel crate; the host's is set to
+whatever lets fwe see each signal it must handle:
+
 | | Linux | macOS | fwe |
 |---|---|---|---|
 | Dispositions | per process | per process, macOS numbers | in the kernel crate, each passed to the host (`Platform::set_host_signal`) as catch, default or ignore ([which](#who-acts-on-a-signal)) |
@@ -557,6 +1400,11 @@ A signal ignored when fwe starts (`nohup`, a shell's background job)
 starts out ignored in the guest, as across a Linux `execve`.
 
 #### Sending a signal
+
+A signal the guest sends to another process becomes a host `kill`, with
+the pid and number translated. Signals the host does not have, and
+signals aimed at one thread, are recorded by fwe directly and the target
+woken with the wake signal:
 
 | Guest call | fwe | Host |
 |---|---|---|
@@ -576,6 +1424,14 @@ starts out ignored in the guest, as across a Linux `execve`.
   with it.
 
 ### Files and descriptors
+
+A Linux process sees a filesystem through its root and its mount
+namespace; a macOS process sees the one host filesystem. fwe resolves
+every guest path itself, so that the guest's root, mounts and symlinks
+behave as Linux's, and only then hands the host a single path component
+to open. The descriptors it gets back are the guest's descriptors, so
+reads and writes go straight to the host. The table lists each piece and
+how it is bridged:
 
 | Linux | macOS | fwe |
 |---|---|---|
@@ -598,6 +1454,10 @@ starts out ignored in the guest, as across a Linux `execve`.
 
 #### /proc, /sys and /dev
 
+Linux programs read much of what they know about themselves and the
+machine from `/proc` and `/sys`, which macOS does not have. fwe serves
+them as filesystems of its own:
+
 - `proc` and `sysfs` mounts are fwe's own filesystems
   (`crates/kernel/src/procfs.rs`, `procpid.rs`, `synthdir.rs`): content is
   generated from fwe's records and the host (`proc_pidinfo`, `sysctl`),
@@ -615,6 +1475,10 @@ starts out ignored in the guest, as across a Linux `execve`.
 
 ### Waiting and events
 
+Linux has a family of descriptors for waiting on many things at once;
+macOS has one mechanism, `kqueue`. fwe builds each Linux descriptor from
+a kqueue, a pipe, or both, so that the guest can mix them in one `epoll`:
+
 | Linux | macOS | fwe |
 |---|---|---|
 | `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR`, `EPOLLONESHOT` → `EV_ONESHOT`, data in `udata`; `epoll_event` is 16 bytes on arm64; how events come back is under [Network events](#network-events) |
@@ -629,6 +1493,11 @@ settings are recorded and rebuilt in the child at the same numbers.
 ### IPC
 
 #### Sockets
+
+Guest sockets are host sockets, so connections reach real networks and
+real host programs. The differences are in encoding: address families,
+the `sockaddr` header, flags folded into other arguments, and Unix-socket
+names macOS does not support:
 
 | Linux | macOS | fwe |
 |---|---|---|
@@ -702,13 +1571,17 @@ A record's name carries a format number, so another fwe build never reads
 it. A record no live process holds is collected when a namespace is made
 and when a fresh fwe starts.
 
+The next sections build on these records: namespaces, cgroups and mounts
+are the container features, followed by credentials, seccomp and devices.
+
 ### Namespaces
 
 macOS has no namespaces. fwe makes each one as a shared record that the
 processes in it name; a process in an initial namespace sees the host's
 (host name, host pids). `clone` and `unshare` make them
 (`crates/kernel/src/nsops.rs`), `setns` joins one through a
-`/proc/<pid>/ns/*` descriptor (`nsfd.rs`).
+`/proc/<pid>/ns/*` descriptor (`nsfd.rs`). What each kind of namespace
+holds:
 
 | Namespace | What fwe does |
 |---|---|
@@ -723,8 +1596,9 @@ processes in it name; a process in an initial namespace sees the host's
 ### cgroups
 
 macOS has no cgroups and no unprivileged way to hold a process to a
-memory or CPU budget. fwe keeps one cgroup v2 tree for the user's fwe processes, as real
-directories with interface files (`crates/kernel/src/cgroupfs.rs`):
+memory or CPU budget. fwe keeps one cgroup v2 tree for the user's fwe
+processes, as real directories with interface files
+(`crates/kernel/src/cgroupfs.rs`):
 
 - `mkdir`/`rmdir`, `cgroup.procs`, `cgroup.subtree_control` with Linux's
   rules; `cgroup.events`, `pids.current`, `memory.current` and `cpu.stat`
@@ -740,7 +1614,8 @@ directories with interface files (`crates/kernel/src/cgroupfs.rs`):
 macOS mounts are system-wide and need root; there are no mount
 namespaces, no bind or overlay mounts of Linux's kind and no propagation.
 fwe's mounts exist only in its tables (`crates/kernel/src/mounts.rs`,
-`mountops.rs`, `mountapi.rs`, `overlay.rs`):
+`mountops.rs`, `mountapi.rs`, `overlay.rs`), and its path resolver
+follows them:
 
 - a mount shows a host directory (rootfs, bind source, a tmpfs's backing
   directory), an overlay of several, or one of fwe's filesystems (`proc`,
@@ -756,6 +1631,11 @@ fwe's mounts exist only in its tables (`crates/kernel/src/mounts.rs`,
   clone, each change built in the work directory and renamed into place.
 
 ### Credentials and capabilities
+
+On macOS a process runs as the user who started it and only root can
+change that. Linux programs, and container runtimes above all, expect to
+be root inside, to change ids, and to hold capabilities. fwe keeps the
+guest's identity virtual:
 
 | Linux | macOS | fwe |
 |---|---|---|
@@ -779,6 +1659,9 @@ with `ENOSYS`, as with no tracer or listener.
 
 ### Devices
 
+Device nodes on macOS can only be made by root, and Linux's device numbers
+mean nothing there. fwe keeps its own:
+
 - `mknod` of a device, which the host lets only its root do, makes an
   empty file flagged `UF_OPAQUE` with the Linux type and numbers in an
   attribute (`crates/kernel/src/devnodes.rs`); opening it opens the host
@@ -788,6 +1671,10 @@ with `ENOSYS`, as with no tracer or listener.
   writes and requests on the attached file.
 
 ### Time, scheduling and limits
+
+Clocks, scheduling and resource limits exist on both sides with different
+sets and rules. fwe maps what has a host counterpart and keeps the rest
+itself:
 
 | Linux | macOS | fwe |
 |---|---|---|
@@ -800,8 +1687,9 @@ with `ENOSYS`, as with no tracer or listener.
 
 ### Not available
 
-These fail with `ENOSYS` (any call not dispatched in
-`crates/kernel/src/syscalls.rs` does, noted under `--strace`):
+A few Linux facilities have no implementation yet. These fail with
+`ENOSYS` (any call not dispatched in `crates/kernel/src/syscalls.rs` does,
+noted under `--strace`):
 
 - `ptrace` and `process_vm_readv`/`writev`;
 - pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`);
@@ -822,8 +1710,9 @@ These fail with `ENOSYS` (any call not dispatched in
 
 Things happen on the host that a Linux program expects to hear about from
 its kernel: a key pressed, a signal sent, a child ending, data arriving, a
-timer firing, a call failing. Each reaches the guest through one of a few
-channels:
+timer firing, a call failing. macOS reports each of them in its own terms,
+and fwe has to turn the report into what a Linux kernel would have said.
+Each reaches the guest through one of a few channels:
 
 | Channel on macOS | What fwe does with it | What the guest gets |
 |---|---|---|
@@ -833,17 +1722,27 @@ channels:
 | host state read when asked | `proc_pidinfo`, `sysctl`, `gethostname`, `sysconf` | `/proc`, `uname`, `sysinfo` |
 | another fwe process | shared records and signal notes | what one Linux kernel would show |
 
-The rows below read **on macOS | what fwe does | what the guest sees**.
+The sections below follow these channels, starting with the busiest:
+signals. Their tables read **on macOS | what fwe does | what the guest
+sees**.
 
 ### Host signals
 
+Most host events reach a Linux program as signals: key strokes, a resized
+terminal, a child ending, a timer expiring, a `kill` from a shell. They
+arrive at the fwe process as macOS signals, with macOS numbers and a macOS
+`siginfo`, and must reach the right guest thread as Linux signals, with a
+Linux frame, at the moment Linux would deliver them.
+
 #### Who acts on a signal
 
-The host never blocks a signal fwe catches, whatever the guest's mask:
-macOS empties the `siginfo` of a signal it holds blocked, and Linux keeps
-the sender. So fwe catches each signal the guest must see with its sender,
-keeps it pending itself while the guest blocks it, and leaves to the host
-only the actions the host can take as Linux would (`Kernel::sync_host_signal`):
+The first question for each signal is who carries out its action: the host
+or fwe. The host never blocks a signal fwe catches, whatever the guest's
+mask: macOS empties the `siginfo` of a signal it holds blocked, and Linux
+keeps the sender. So fwe catches each signal the guest must see with its
+sender, keeps it pending itself while the guest blocks it, and leaves to
+the host only the actions the host can take as Linux would
+(`Kernel::sync_host_signal`):
 
 | Guest's disposition | Host disposition | Why |
 |---|---|---|
@@ -861,6 +1760,11 @@ handlers run with every signal blocked. `SIGCHLD`'s `SA_NOCLDSTOP` and
 `SA_NOCLDWAIT` are passed to the host with it.
 
 #### A host signal reaching a guest thread
+
+A caught signal runs fwe's handler on whichever thread macOS chose. What
+happens next depends on what that thread was doing: running guest code,
+or waiting in a host call fwe made for the guest. The diagram shows the
+four cases:
 
 ```mermaid
 sequenceDiagram
@@ -915,6 +1819,11 @@ sequenceDiagram
 
 #### siginfo and the sender
 
+A Linux handler can ask who sent its signal and why. macOS's `siginfo`
+carries much the same, in different codes and with host pids and uids,
+and sometimes nothing at all. fwe translates what macOS gives and fills
+the gaps from notes fwe processes leave each other:
+
 | On macOS | What fwe does (`host::signal_info`) | What the guest sees |
 |---|---|---|
 | `si_code` of a sent signal (`SI_USER` = `0x10001`, `SI_QUEUE`, `SI_TIMER`, `SI_ASYNCIO`, `SI_MESGQ`) | translated (`host::si_code_to_linux`); the `SIGCHLD` and fault codes are the same on both | Linux's `si_code` (`SI_USER` = 0 …) |
@@ -927,6 +1836,10 @@ sequenceDiagram
 
 #### Signals with no counterpart
 
+Some signals exist on one side only. macOS's two extra signals are fwe's
+own tools, so fwe must decide what one means when it comes from somewhere
+else; Linux's extra signals never come from the host at all:
+
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | `SIGEMT` (7), from fwe itself | the wake signal: interrupts a thread blocked in a host call so it notices a signal recorded for it; nothing is recorded | the signal it was woken for |
@@ -938,6 +1851,9 @@ sequenceDiagram
 | a guest killed by one of those (default action) | no host signal to die of: exits with 128 + the signal | the parent sees exit status 128 + the signal |
 
 #### Where each signal comes from
+
+To close the signal story, here is each source on the host, the signal
+macOS sends for it, and where its fuller explanation is:
 
 | Host source | Host signal | What fwe does | What the guest sees |
 |---|---|---|---|
@@ -956,10 +1872,13 @@ sequenceDiagram
 
 ### Faults in guest code
 
-In the native backend a fault in guest code is a host signal to fwe's
-fault handler (`on_fault` and `on_sigtrap` in `crates/native/src/trap.rs`).
-In the VM it is an exception the run loop reads from `ESR_EL1`
-([hypervisor.md](hypervisor.md#the-run-loop)); the host sends no signal.
+When guest code does something the CPU refuses — touches an unmapped
+address, executes an undefined instruction, hits a breakpoint — Linux
+sends the program a signal. Under fwe the CPU's report reaches fwe
+differently per backend. In the native backend a fault in guest code is a
+host signal to fwe's fault handler (`on_fault` and `on_sigtrap` in
+`crates/native/src/trap.rs`), and not every such signal is a fault the
+guest should see: some are fwe's own traps.
 
 | On macOS (native) | What fwe does | What the guest sees |
 |---|---|---|
@@ -973,6 +1892,10 @@ In the VM it is an exception the run loop reads from `ESR_EL1`
 | a fault signal with a note from another fwe process | a sent signal, not a fault | that signal, with its sender |
 | a fault in fwe's checked copy of guest memory | the copy stops at its recovery point | the call fails with `EFAULT` |
 | a fault in fwe's own code anywhere else | fatal | the process dies of that signal |
+
+In the VM a fault is an exception the run loop reads from `ESR_EL1`
+([hypervisor.md](hypervisor.md#the-run-loop)); the host sends no signal.
+Each exception becomes Linux's signal for it:
 
 | VM exception | What the guest sees |
 |---|---|
@@ -993,7 +1916,10 @@ process dies of the signal (natively after a register and code dump under
 The terminal is the host's: the guest's standard descriptors are the
 terminal's host descriptors, and the line discipline that turns key
 strokes into characters and signals is macOS's, set from the guest's
-`termios`.
+`termios`. So a key stroke that means a signal (Ctrl-C, Ctrl-Z) becomes a
+macOS signal to the foreground process group, which fwe then relays as
+above. Ctrl-C makes a good example; the three branches are the three
+things a guest can have chosen for `SIGINT`:
 
 ```mermaid
 sequenceDiagram
@@ -1022,6 +1948,9 @@ sequenceDiagram
 
 #### Key strokes
 
+Each special key, what macOS does with it, and what the guest ends up
+seeing:
+
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | Ctrl-C (`VINTR`, with `ISIG`): `SIGINT` to the foreground group | relayed (sequence above) | `SIGINT` |
@@ -1034,6 +1963,9 @@ sequenceDiagram
 | the window resized: `SIGWINCH` | relayed | `SIGWINCH`; `TIOCGWINSZ` the new size |
 
 #### termios and terminal requests
+
+The guest configures the line discipline with Linux's `termios` and
+`ioctl` requests, which fwe translates to macOS's:
 
 | Linux | macOS | fwe (`crates/kernel/src/term.rs`, `sys_ioctl`) |
 |---|---|---|
@@ -1048,6 +1980,10 @@ sequenceDiagram
 
 #### Job control and ptys
 
+Process groups, sessions and the controlling terminal are the host's, so a
+guest shell and a host shell share job control on one terminal. Linux's
+pseudo-terminal interface is mapped onto macOS's:
+
 | Linux | macOS | fwe |
 |---|---|---|
 | process groups and sessions (`setpgid`, `setsid`, `getpgid`, `getsid`) | the host's | the host's, with ids mapped through the guest's pid namespace; fwe records each process's group |
@@ -1055,6 +1991,12 @@ sequenceDiagram
 | `/dev/ptmx`, `TIOCGPTN`, `TIOCSPTLCK`, `/dev/pts/N` | `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `/dev/ttysNNN` | `/dev/ptmx` allocates with `posix_openpt` and numbers the slave; `TIOCGPTN` returns that number; `TIOCSPTLCK` is accepted (the slave is unlocked already); `/dev/pts/N` opens the host slave (`crates/kernel/src/pty.rs`) |
 
 ### Children ending
+
+A child guest process is a host child process, so when it ends macOS
+tells the parent with `SIGCHLD` and a status word, both in macOS's terms.
+fwe translates the signal and the status, and records how the child ended
+so that what Linux shows and macOS cannot (a Linux-only signal, an
+adopter) comes out right:
 
 ```mermaid
 sequenceDiagram
@@ -1074,6 +2016,8 @@ sequenceDiagram
     P->>P: status word rewritten, pid mapped, the child's records released
     P-->>G: the child's pid, status 0x300
 ```
+
+Each way a child can change, and what the parent's guest sees:
 
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
@@ -1107,6 +2051,11 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 
 ### A process killed from the host
 
+A guest process can be signalled by any host program, not only by other
+guests: a `kill` in a host shell, Activity Monitor, `launchctl`. Such a
+sender leaves no note, so the guest learns what macOS's `siginfo` says;
+and the signals fwe uses for itself mean what they mean to fwe:
+
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | `kill -TERM <pid>` (or `-INT`, `-HUP`, `-USR1` …) from a host shell or any process fwe does not run | a host signal like any other; the sender is a host pid with no note | the signal, `si_code` `SI_USER`, `si_pid` the sender in the initial pid namespace (0 from inside a nested one), `si_uid` 0 if it runs as fwe's user, else 65534 |
@@ -1118,6 +2067,11 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 | `kill -SEGV <pid>` (a fault signal) from a process fwe does not run | macOS gives it the thread's last fault, and no note says it was sent | taken as a fault ([limitations](architecture.md#known-limitations)) |
 
 ### Files changing on the host
+
+The guest's files are host files, so host programs can change them at any
+time. What the guest notices depends on how it looks: through a shared
+mapping it sees the change, through inotify it sees only what other fwe
+processes do, since fwe raises inotify events itself:
 
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
@@ -1135,6 +2089,8 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 
 Guest sockets are host sockets: connections, data and the ports in the
 initial network namespace are the host's, shared with every host program.
+What arrives does so as `kqueue` events, which fwe turns into `epoll`
+events with Linux's meaning for each kind of descriptor:
 
 | On macOS | What fwe does (`crates/kernel/src/epoll.rs`) | What the guest sees |
 |---|---|---|
@@ -1154,6 +2110,10 @@ initial network namespace are the host's, shared with every host program.
 
 ### Clocks and timers
 
+Time comes from the host's clocks, so the guest's time is the Mac's. Linux
+has more clocks than macOS; fwe reads each from the host clock that means
+the same:
+
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | the host's realtime clock, set by the user or NTP | `CLOCK_REALTIME`, `TAI`, `*_COARSE`, `*_ALARM` read it | the host's time; the guest cannot set it (`EPERM`) |
@@ -1165,6 +2125,10 @@ initial network namespace are the host's, shared with every host program.
 | VM: the guest reads the counter | `CNTVCT_EL0` is the vCPU's virtual counter; a `CNTPCT_EL0` read is emulated from it | one counter, as on Linux |
 
 ### Memory pressure
+
+macOS manages memory its own way (compression, swap files) and has no OOM
+killer that Linux programs could observe. fwe does not pass the host's
+memory state through:
 
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
@@ -1195,6 +2159,10 @@ Linux's order, a kill of another process with a real-time signal is
 [architecture.md](architecture.md).
 
 ### Host identity and machine state
+
+Finally, what the guest learns about who it is and what machine it runs
+on. fwe presents the host user as root, as a rootless container does, and
+the machine as a Linux machine with the host's CPUs, uptime and load:
 
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
