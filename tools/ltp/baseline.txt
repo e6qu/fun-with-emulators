@@ -1,5 +1,6 @@
 # LTP system-call tests that pass under fwe in every one of three runs
 # (tools/ltp/run.py --update writes one run's; keep only the steady ones).
+abort01
 accept01
 accept4_01
 access02
@@ -42,12 +43,17 @@ clock_gettime02
 clock_gettime04
 clock_nanosleep04
 clone01
+clone02
 clone03
 clone04
 clone05
 clone06
 clone07
+clone09
 clone11
+clone301
+clone302
+clone303
 clone304
 close_range02
 close01
@@ -60,6 +66,7 @@ creat01
 creat03
 creat05
 creat06
+delete_module02
 dirtypipe
 dup01
 dup02
@@ -108,6 +115,7 @@ eventfd01
 eventfd02
 eventfd03
 eventfd2_01
+execl01
 execle01
 execlp01
 execv01
@@ -134,6 +142,8 @@ fchmod03
 fchmod04
 fchmodat01
 fchmodat02
+fchmodat2_01
+fchmodat2_02
 fchown01
 fcntl01
 fcntl01_64
@@ -201,6 +211,8 @@ fcntl34
 fcntl34_64
 fcntl36
 fcntl36_64
+fcntl37
+fcntl37_64
 fcntl40
 fcntl40_64
 fdatasync01
@@ -225,6 +237,7 @@ fork08
 fork09
 fork10
 fork11
+fork13
 fpathconf01
 fremovexattr01
 fremovexattr02
@@ -266,6 +279,8 @@ futex_wake01
 futex_wake02
 futex_wake03
 futex_wake05
+getcpu01
+getcpu02
 getcwd01
 getcwd02
 getcwd03
@@ -383,6 +398,7 @@ kill05
 kill06
 kill08
 kill10
+kill11
 kill12
 lgetxattr01
 lgetxattr02
@@ -409,6 +425,7 @@ lstat01
 lstat01_64
 madvise01
 madvise03
+membarrier01
 memcmp01
 memcpy01
 memfd_create02
@@ -551,8 +568,11 @@ poll04
 posix_fadvise01
 posix_fadvise01_64
 prctl01
+prctl02
 prctl03
+prctl05
 prctl06
+prctl08
 pread01
 pread01_64
 pread02
@@ -587,6 +607,7 @@ read01
 read02
 read03
 read04
+readahead01
 readdir01
 readlink01
 readlinkat01
@@ -622,7 +643,11 @@ rt_sigaction02
 rt_sigaction03
 rt_sigprocmask01
 rt_sigprocmask02
+rt_sigqueueinfo01
+rt_sigqueueinfo02
 rt_sigsuspend01
+rt_sigtimedwait01
+rt_tgsigqueueinfo01
 sbrk02
 sched_get_priority_max01
 sched_get_priority_max02
@@ -721,9 +746,12 @@ setreuid03
 setreuid04
 setreuid05
 setreuid06
+setrlimit01
 setrlimit02
 setrlimit03
+setrlimit04
 setrlimit05
+setrlimit06
 setsid01
 setsockopt03
 settimeofday02
@@ -743,21 +771,27 @@ shmctl08
 shmdt01
 shmdt02
 shmget02
+shmget03
 shmget04
 shutdown01
 shutdown02
+sigaction01
 sigaction02
 sigaltstack01
 sigaltstack02
+sighold02
 signal01
 signal02
 signal03
 signal04
 signal05
 signalfd01
+signalfd02
 signalfd4_01
+signalfd4_02
 sigpending02
 sigprocmask01
+sigrelse01
 sigsuspend01
 sigsuspend02
 sigwait01
@@ -795,14 +829,19 @@ string01
 symlink02
 symlink04
 symlinkat01
+sync_file_range01
 syscall01
 syscall02
 sysconf01
 sysinfo01
 sysinfo02
+syslog11
+syslog12
 tee01
 tee02
 tgkill01
+tgkill02
+tgkill03
 time01
 timerfd_settime02
 times01
@@ -836,6 +875,8 @@ utime07
 utimensat01
 vfork01
 vfork02
+vhangup01
+vhangup02
 vmsplice01
 vmsplice02
 vmsplice03
@@ -854,7 +895,9 @@ waitid06
 waitid07
 waitid08
 waitid09
+waitid10
 waitid11
+waitpid01
 waitpid03
 waitpid04
 waitpid06

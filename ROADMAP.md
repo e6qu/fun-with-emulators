@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 877 of 1550 (75% of the 1176 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 920 of 1550 (77% of the 1190 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -76,7 +76,7 @@ capabilities. *crun, podman and containerd run standard images.*
   without `CAP_SYS_TIME`;
 - POSIX message queues per IPC namespace, with notifications across
   processes (a signal with its value, or the C library's thread through a
-  netlink socket).
+  netlink socket), or a real-time signal;
 - the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`,
   `open_tree`, `move_mount`, `mount_setattr`, `statmount`, `listmount`),
   with peer groups kept and mount ids in `statx`;
@@ -88,7 +88,12 @@ capabilities. *crun, podman and containerd run standard images.*
 - mounts as Linux has them: propagation (between peers, to slaves, across
   namespaces), the `nodev`, `noexec`, `nosymfollow` and access-time flags
   acted on, busy mounts refused, `MNT_EXPIRE`, and `pivot_root` of a
-  chroot.
+  chroot;
+- real-time signals across processes (`rt_sigqueueinfo`,
+  `rt_tgsigqueueinfo`), core dumps with the core-dump bit, the core,
+  stack, CPU and process-count limits, `clone3` into a cgroup and with
+  handlers cleared, `CLONE_VM` processes, and `getcpu`, `syslog`,
+  `membarrier`, `readahead`, `sync_file_range` and `vhangup`.
 
 ## Left to 1.0
 
@@ -117,8 +122,7 @@ run.
   `fchown`, `lchown`, `creat` and `mkdir` failures).
 - [ ] **Every other failure LTP points at**, among them:
   - `EPOLLEXCLUSIVE`;
-  - `eventfd` and real-time signals across processes;
-  - core dumps and the core-dump bit;
+  - `eventfd` across processes;
   - `rename`, `statx`, `mremap`, `madvise` details.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.

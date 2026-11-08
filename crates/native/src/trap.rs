@@ -389,7 +389,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         } else {
             fwe_kernel::CloneArgs::from_clone3(regs.x[0], regs.x[1])
         };
-        let r = match a {
+        let r = match a.and_then(|a| a.check().map(|()| a)) {
             Ok(a) => crate::threads::do_clone(&regs, a),
             Err(e) => fwe_abi::err(e),
         };
@@ -454,8 +454,19 @@ fn take_async(
     ctx: *mut libc::c_void,
     in_guest: bool,
 ) {
+    if sig == libc::SIGXCPU && !fwe_kernel::rlimits::cpu_signal() {
+        // Past the hard CPU limit: the process ends.
+        return;
+    }
+    // A wait this thread is about to begin, or is in, ends for it.
+    thread::poke_wait();
     let record = || {
-        if sig != host::WAKE_SIGNAL {
+        if sig == host::WAKE_SIGNAL {
+            // Signals the host lacks, queued by another process.
+            fwe_kernel::signote::drain(|lsig, note| {
+                thread::post_landed(lsig, host::sent_info(note));
+            });
+        } else {
             let info = sent();
             let lsig = host::signal_to_linux(sig);
             if REROUTING.with(Cell::get) {
@@ -640,6 +651,11 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         return;
     }
 
+    // It ends of the fault: its core first, as Linux dumps it.
+    if let Some(k) = kernel().as_mut() {
+        k.dump_core(lsig, Some(&regs));
+    }
+    fwe_kernel::procreg::ending(lsig as i32 | fwe_kernel::coredump::status_bit());
     let tracing = kernel().as_ref().is_some_and(|k| k.tracer.enabled);
     if tracing {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.

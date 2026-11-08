@@ -11,8 +11,10 @@ use crate::shared::Data;
 use crate::snapshot::{Dec, Enc};
 use std::collections::BTreeMap;
 
-/// The largest pid (`/proc/sys/kernel/pid_max`).
-pub const PID_MAX: i32 = 4_194_304;
+/// The largest pid a namespace numbers: below `kernel.pid_max`.
+fn pid_max() -> i32 {
+    crate::sysctl::number(b"kernel/pid_max").map_or(4_194_304, |n| n as i32)
+}
 
 /// One pid namespace.
 #[derive(Clone, Default, Debug)]
@@ -73,15 +75,16 @@ impl PidNs {
 
     /// A free number, recorded for `entry`.
     pub fn alloc(&mut self, entry: Entry) -> Option<i32> {
-        let start = self.next.max(1);
+        let max = pid_max();
+        let start = if self.next >= max { 1 } else { self.next.max(1) };
         let mut n = start;
         loop {
             if let std::collections::btree_map::Entry::Vacant(v) = self.pids.entry(n) {
                 v.insert(entry);
-                self.next = if n >= PID_MAX { 1 } else { n + 1 };
+                self.next = if n + 1 >= max { 1 } else { n + 1 };
                 return Some(n);
             }
-            n = if n >= PID_MAX { 1 } else { n + 1 };
+            n = if n + 1 >= max { 1 } else { n + 1 };
             if n == start {
                 return None;
             }
@@ -247,8 +250,8 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
     // Only processes that are still members: a number left behind can name
     // a host pid that has since been given to another process.
     for h in hosts.into_iter().filter(|&h| h != init && member(h, ns.dir())) {
-        // SAFETY: plain host call.
-        unsafe { libc::kill(h, libc::SIGKILL) };
+        // Relayed, so a VM process takes its VM down first.
+        crate::host::kill_process(h, libc::SIGKILL);
     }
 }
 

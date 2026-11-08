@@ -23,15 +23,18 @@ pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_ADMIN: u32 = 12;
 pub const CAP_IPC_LOCK: u32 = 14;
 pub const CAP_IPC_OWNER: u32 = 15;
+pub const CAP_SYS_MODULE: u32 = 16;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_TIME: u32 = 25;
+pub const CAP_SYS_TTY_CONFIG: u32 = 26;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_LEASE: u32 = 28;
 pub const CAP_SETFCAP: u32 = 31;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
+pub const CAP_SYSLOG: u32 = 34;
 /// The highest capability (`CAP_CHECKPOINT_RESTORE`).
 pub const CAP_LAST_CAP: u32 = 40;
 /// Every capability.

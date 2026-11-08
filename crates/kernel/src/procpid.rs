@@ -209,6 +209,7 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"oom_score_adj", DT_REG),
     (b"oom_adj", DT_REG),
     (b"oom_score", DT_REG),
+    (b"timerslack_ns", DT_REG),
     (b"ns", DT_DIR),
     (b"fd", DT_DIR),
     (b"task", DT_DIR),
@@ -371,6 +372,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
             Entry::File(oom_file(sub, rec.oom_score_adj))
         }
+        b"/timerslack_ns" => Entry::File(format!("{}\n", rec.slack.0).into_bytes()),
         b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
             Some(u) => {
                 let n = u.get();
@@ -498,10 +500,21 @@ pub fn oom_write(mark: crate::fdmarks::Mark, data: &[u8], len: u64) -> i64 {
 /// `oom_score_adj` file opened for writing, what the write does (see
 /// [`crate::specialwrite`]).
 pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
-    let mark @ crate::fdmarks::Mark::OomScore { .. } = crate::fdmarks::marked(fd)? else {
-        return None;
-    };
-    Some(oom_write(mark, &data[..data.len().min(64)], len))
+    match crate::fdmarks::marked(fd)? {
+        mark @ crate::fdmarks::Mark::OomScore { .. } => {
+            Some(oom_write(mark, &data[..data.len().min(64)], len))
+        }
+        crate::fdmarks::Mark::TimerSlack { host } => {
+            use fwe_abi::{err, errno};
+            let text = String::from_utf8_lossy(&data[..data.len().min(64)]);
+            let Ok(v) = text.trim().parse::<u64>() else { return Some(err(errno::EINVAL)) };
+            Some(match crate::procreg::set_slack(host, v) {
+                Ok(()) => len as i64,
+                Err(_) => err(errno::ESRCH),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// What one of another process's descriptors is open on, as the host

@@ -1219,8 +1219,10 @@ inherit by sharing for it. The parent waits on a close-on-exec pipe only
 the child holds, so it resumes when the child execs or exits, and sees
 what the child wrote meanwhile. fwe's own memory is not shared, so the
 child's mappings (`mmap`, `munmap`) stay its own. In the native backend
-`CLONE_VM` without `CLONE_VFORK` or `CLONE_THREAD` fails with `ENOSYS`; the
-VM backend treats any clone without `CLONE_THREAD` as a `fork` or `vfork`.
+`CLONE_VM` without `CLONE_VFORK` is the same fork without the wait: parent
+and child share the memory mapped at the fork while both run. The VM
+backend refuses it (`ENOSYS`), since the same memory may never be in two
+VMs at once.
 
 **VM backend** (`crates/native/src/hv/fork.rs`): the child is a fresh
 `fwe --hv-fork-child` started with `posix_spawn`, never a host fork. The
@@ -1282,7 +1284,7 @@ direct macOS counterpart for the shared case:
 |---|---|---|---|
 | Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native) or a host thread with its own vCPU (VM) |
 | `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either in the VM; natively `EINVAL` without a stack, `ENOSYS` without `CLONE_VM`); the native backend accepts `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`, `DETACHED` and fails others with `ENOSYS` |
-| `clone3` | `struct clone_args` | — | read and treated as the `clone` it describes; `CLONE_PIDFD`, `CLONE_INTO_CGROUP`, `CLONE_CLEAR_SIGHAND` and `set_tid` fail with `ENOSYS` |
+| `clone3` | `struct clone_args` | — | read and treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers; `CLONE_PIDFD` and `set_tid` fail with `ENOSYS` |
 | Per-thread state | in the task | — | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
 | futex, private | a wait queue per address | `__ulock_wait`/`__ulock_wake` (private) | per-process wait queues, outside the kernel lock |
 | futex, shared | keyed by the page's backing object | `__ulock_wait2` with `UL_COMPARE_AND_WAIT_SHARED` | a slot table every fwe process maps, keyed as Linux keys a shared futex (Mach memory object + offset); each waiter sleeps on its slot's word, so a wake knows whom it woke |
@@ -1397,7 +1399,7 @@ whatever lets fwe see each signal it must handle:
 |---|---|---|---|
 | Dispositions | per process | per process, macOS numbers | in the kernel crate, each passed to the host (`Platform::set_host_signal`) as catch, default or ignore ([which](#who-acts-on-a-signal)) |
 | Mask, alternate stack | per thread | per thread | per thread, in host thread-locals; the host thread's own mask blocks only what the host must hold back |
-| Pending instances | one per standard signal; real-time signals queued | one per signal, `siginfo` lost while blocked | one per signal number; a standard signal keeps its first `siginfo`, a real-time one its latest |
+| Pending instances | one per standard signal; real-time signals queued | one per signal, `siginfo` lost while blocked | one per signal number; a standard signal keeps its first `siginfo`, a real-time one its latest; from another process, signals the host lacks wait in a queue of 64 in the target's mailbox |
 | Signal frame | `rt_sigframe` with `ucontext`, `fpsimd_context` | Darwin `ucontext`, `mcontext64` | Linux's layout, built on the guest stack (or alternate stack); return through `sa_restorer` or fwe's `rt_sigreturn` trampoline |
 
 A signal ignored when fwe starts (`nohup`, a shell's background job)
@@ -1415,7 +1417,7 @@ woken with the wake signal:
 | `kill(pid, sig)` to another process, for a signal the host has | pid mapped out of the pid namespace; permission checked as on Linux; a note of the sender left in the target's mailbox if it is an fwe process (`crates/kernel/src/signote.rs`) | `kill(<host pid>, <host signal>)` |
 | `kill` with `SIGKILL` | the same | an fwe target is sent `SIGINFO` (the kill relay), so a VM process can tear its VM down first; any other process the real `SIGKILL` |
 | `kill` of itself with a fault signal (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | recorded directly, since macOS's `siginfo` cannot tell a sent one from a fault | none |
-| `kill`/`tgkill` with a real-time signal (or `SIGSTKFLT`, `SIGPWR`) | recorded directly within the process; to another process `EINVAL` | `SIGEMT` to wake the target thread |
+| `kill`/`tgkill`/`rt_sigqueueinfo` with a real-time signal (or `SIGSTKFLT`, `SIGPWR`) | recorded directly within the process; to another fwe process queued in its mailbox with the sender, code and value (`signal::send_unhosted`); to a process that is not fwe's `EINVAL` | `SIGEMT` to wake the target |
 | `tgkill(tgid, tid, sig)`, a signal the guest catches or a fault signal | posted to that thread directly, which a relayed host signal could not target | `SIGEMT` to wake it |
 | `tgkill` of a signal the host acts on | — | `pthread_kill(<host thread>, <host signal>)` |
 | `kill(-1, sig)` | only the caller's pid namespace or its run of fwe, never other host processes | `kill` of each |
@@ -1686,7 +1688,7 @@ itself:
 | setting the clock (`CAP_SYS_TIME`) | root | refused with `EPERM` after Linux's argument checks, as in a container |
 | interval timers (`setitimer`, `alarm`) | the same, at most 100,000,000 s | the host's |
 | nice, scheduling policies | own scheduler | kept in the process record with Linux's checks, inherited; the host schedules every process alike |
-| `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`); `NOFILE` is virtual, below fwe's reserved descriptors; `CPU`, `FSIZE`, `DATA`, `STACK`, `CORE`, `NPROC`, `AS` are the host's |
+| `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, `CORE`, `STACK`, `CPU`, `NPROC`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`): `CORE` for fwe's core dumps, `STACK` for the guest's stack, `CPU`'s hard limit and `NPROC` enforced by fwe; `NOFILE` is virtual, below fwe's reserved descriptors; `FSIZE`, `DATA`, `AS` are the host's |
 | `personality` | none | kept per process; `UNAME26` and `STICKY_TIMEOUTS` act |
 
 ### Not available
@@ -1697,18 +1699,17 @@ noted under `--strace`):
 
 - `ptrace` and `process_vm_readv`/`writev`;
 - pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`);
-- POSIX timers (`timer_create` and the rest), `rt_sigqueueinfo`,
-  `rt_tgsigqueueinfo`;
+- POSIX timers (`timer_create` and the rest);
 - `io_uring`, the AIO calls, `userfaultfd`, `perf_event_open`, `fanotify`,
-  `kcmp`, `landlock`, `rseq`, `membarrier`, `futex_waitv`,
+  `kcmp`, `landlock`, `rseq`, `futex_waitv`,
   `name_to_handle_at`/`open_by_handle_at`;
-- `epoll_pwait2`, `sendmmsg`/`recvmmsg`, `times`, `getcpu`,
+- `epoll_pwait2`, `sendmmsg`/`recvmmsg`, `times`,
   `ioprio_get`/`ioprio_set`, the `pkey_*` calls, `process_madvise`,
   `process_mrelease`, `memfd_secret`, `cachestat`, `map_shadow_stack`,
   `remap_file_pages`, the `lsm_*` calls;
-- `sync`, `syncfs`, `sync_file_range`, `readahead`;
-- kernel modules, `kexec`, `reboot`, swap, quotas, NUMA policy, `acct`,
-  `syslog`, `vhangup`.
+- `sync`, `syncfs`;
+- loading kernel modules (`delete_module` finds none), `kexec`, `reboot`,
+  swap, quotas, NUMA policy, `acct`.
 
 ## macOS to Linux
 
@@ -1849,10 +1850,10 @@ else; Linux's extra signals never come from the host at all:
 | `SIGEMT` (7), from fwe itself | the wake signal: interrupts a thread blocked in a host call so it notices a signal recorded for it; nothing is recorded | the signal it was woken for |
 | `SIGEMT` from any other process | the same: it only interrupts | nothing; an interrupted call runs again |
 | `SIGINFO` (29), from another fwe process | the kill relay, sent instead of an uncatchable `SIGKILL`: a native process kills itself with `SIGKILL`, a VM process tears its VM down first (see [hypervisor.md](hypervisor.md#never-end-a-vm-process-abnormally)) | death by `SIGKILL` |
-| `SIGINFO` from anywhere else (`kill -INFO`, Ctrl-T in a terminal) | taken as the kill relay all the same | death by `SIGKILL` |
+| `SIGINFO` from anywhere else (`kill -INFO`) | no note came with it, so it is no relay: dropped, as Linux has no such signal | nothing |
 | a child killed by a host signal with no Linux number | `host::signal_to_linux` gives `SIGABRT` | a child killed by `SIGABRT` |
-| Linux's `SIGSTKFLT`, `SIGPWR` and real-time signals | never come from the host; recorded and delivered within the process only | delivered with fwe's own `siginfo` |
-| a guest killed by one of those (default action) | no host signal to die of: exits with 128 + the signal | the parent sees exit status 128 + the signal |
+| Linux's `SIGSTKFLT`, `SIGPWR` and real-time signals | never come from the host; recorded within the process, or queued in another fwe process's mailbox and that process woken with `SIGEMT` | delivered with fwe's own `siginfo` |
+| a guest killed by one of those (default action) | no host signal to die of: leaves its Linux status beside its record, then exits with 128 + the signal | an fwe parent sees it killed by that signal; a host shell sees 128 + the signal |
 
 #### Where each signal comes from
 
@@ -1861,14 +1862,14 @@ macOS sends for it, and where its fuller explanation is:
 
 | Host source | Host signal | What fwe does | What the guest sees |
 |---|---|---|---|
-| a key in the terminal | `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGINFO` | relayed (`SIGINFO` is the kill relay) | see [Terminals and key strokes](#terminals-and-key-strokes) |
+| a key in the terminal | `SIGINT`, `SIGQUIT`, `SIGTSTP` | relayed | see [Terminals and key strokes](#terminals-and-key-strokes) |
 | the terminal resized | `SIGWINCH` (28 on both) | relayed; the host's default (ignore) unless the guest catches it | `SIGWINCH`; `TIOCGWINSZ` reads the new size |
 | the terminal closed or its session leader gone | `SIGHUP` | relayed | `SIGHUP`, death by default |
 | a host shell's `kill`, `launchctl`, any process | any | relayed, sender translated | see [A process killed from the host](#a-process-killed-from-the-host) |
 | a write to a pipe with no reader | `SIGPIPE` on the writing thread | relayed to that thread; with the guest ignoring it, only `EPIPE` | `SIGPIPE`, `EPIPE` |
 | a write to a socket whose peer has gone | none (`SO_NOSIGPIPE`) | fwe raises `SIGPIPE` on the thread unless `MSG_NOSIGNAL` | `SIGPIPE`, `EPIPE` |
 | a write past `RLIMIT_FSIZE` | `SIGXFSZ` on the writing thread | relayed to that thread | `SIGXFSZ`, `EFBIG` |
-| CPU time past `RLIMIT_CPU`'s soft limit | `SIGXCPU` | relayed; the host sends no `SIGKILL` at the hard limit | `SIGXCPU` |
+| CPU time past `RLIMIT_CPU`'s soft limit | `SIGXCPU` | relayed, and the host's soft limit raised a second; past the hard limit fwe ends the process with `SIGKILL`, which macOS does not send | `SIGXCPU` each second, then `SIGKILL` |
 | an interval timer expiring | `SIGALRM`, `SIGVTALRM`, `SIGPROF` (same numbers) | relayed | the timer's signal |
 | a child stopping, continuing or ending | `SIGCHLD` (20) | relayed as 17 | see [Children ending](#children-ending) |
 | descriptor readiness under `O_ASYNC`, out-of-band data | `SIGIO` (23), `SIGURG` (16) | relayed as 29 and 23; `SIGIO` turned into the descriptor's `F_SETSIG` signal | see [Network events](#network-events) |
@@ -1958,10 +1959,10 @@ seeing:
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | Ctrl-C (`VINTR`, with `ISIG`): `SIGINT` to the foreground group | relayed (sequence above) | `SIGINT` |
-| Ctrl-\\ (`VQUIT`): `SIGQUIT` | relayed; a default ends the process with the host `SIGQUIT` | `SIGQUIT`; no Linux core file |
+| Ctrl-\\ (`VQUIT`): `SIGQUIT` | relayed; a default ends the process with the host `SIGQUIT` | `SIGQUIT`; a core file, as Linux writes one, if `RLIMIT_CORE` allows |
 | Ctrl-Z (`VSUSP`): `SIGTSTP` (18) | relayed as 20; a default stop is fwe's: it stops itself with the host `SIGTSTP` | `SIGTSTP`; the shell sees the job stopped by `SIGTSTP` |
 | `fg`/`bg`: `SIGCONT` (19) | the host continues the process; a guest handler is entered | `SIGCONT` (18) |
-| Ctrl-T (`VSTATUS`, macOS only, in canonical mode): `SIGINFO` to the foreground group | `SIGINFO` is the kill relay | death by `SIGKILL` |
+| Ctrl-T (`VSTATUS`, macOS only): `SIGINFO` to the foreground group | no note came with it, so it is no kill relay: dropped; once the guest sets its `termios`, which has no such key, Ctrl-T and Ctrl-Y (`VDSUSP`) are disabled (`_POSIX_VDISABLE`) | nothing; with the keys disabled, the character as input |
 | Ctrl-D, Ctrl-S/Ctrl-Q, erase, kill, `VLNEXT` and the rest of canonical editing | done by the host's line discipline as the guest's `termios` sets it | the edited line; `read` returns 0 at end of file |
 | a background job reads (or, with `TOSTOP`, writes) the terminal: `SIGTTIN`/`SIGTTOU` | relayed; a default stop is fwe's, as for `SIGTSTP` | the job stops |
 | the window resized: `SIGWINCH` | relayed | `SIGWINCH`; `TIOCGWINSZ` the new size |
@@ -2026,10 +2027,10 @@ Each way a child can change, and what the parent's guest sees:
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | a child exited with code *n* | status word kept | `n << 8` |
-| a child killed by a host signal | the signal mapped (`host::signal_to_linux`), the core bit kept | Linux's signal number, `0x80` if a core was dumped |
+| a child killed by a host signal | the Linux status the child left beside its record (`procreg::ending`), with the core bit if fwe wrote a core; else the signal mapped (`host::signal_to_linux`) | Linux's signal number, `0x80` if a core was dumped |
 | a child stopped | the stop signal mapped | `sig << 8 \| 0x7f` |
 | a child continued | — | `0xffff` |
-| a guest child ended by a Linux-only signal | it exited with 128 + the signal | exit status 128 + the signal |
+| a guest child ended by a Linux-only signal | it exited with 128 + the signal, leaving its Linux status beside its record | killed by that signal |
 | `SIGCHLD` `siginfo`: `CLD_KILLED`/`CLD_DUMPED`/`CLD_STOPPED` | `si_status` mapped to Linux's signal | Linux's signal number |
 | `SIGCHLD` `siginfo`: `CLD_CONTINUED` | `si_status` is what stopped it on macOS; set to what continued it | `SIGCONT`, as Linux reports |
 | `rusage` from `wait4` | `ru_maxrss` from bytes to KiB | Linux's `rusage` |
@@ -2065,7 +2066,7 @@ and the signals fwe uses for itself mean what they mean to fwe:
 | `kill -TERM <pid>` (or `-INT`, `-HUP`, `-USR1` …) from a host shell or any process fwe does not run | a host signal like any other; the sender is a host pid with no note | the signal, `si_code` `SI_USER`, `si_pid` the sender in the initial pid namespace (0 from inside a nested one), `si_uid` 0 if it runs as fwe's user, else 65534 |
 | `kill -9` of a native process | none: the host ends it at once, no handler runs | its parent sees death by `SIGKILL`; a reaper that finds it gone records it |
 | `kill -9` of a VM process | none: it ends with its VM alive, which can bring the machine down ([hypervisor.md](hypervisor.md#never-end-a-vm-process-abnormally)) | — |
-| `kill -INFO <pid>` | the kill relay: `SIGKILL`, the VM torn down first | death by `SIGKILL` |
+| `kill -INFO <pid>` | no note came with it, so it is no kill relay: dropped | nothing |
 | `kill -EMT <pid>` | the wake signal: only interrupts | nothing |
 | `kill -STOP`, `kill -CONT` | the host's own | the process stops and continues; a parent's `wait` with `WUNTRACED` sees the stop by `SIGSTOP` (19) |
 | `kill -SEGV <pid>` (a fault signal) from a process fwe does not run | macOS gives it the thread's last fault, and no note says it was sent | taken as a fault ([limitations](architecture.md#known-limitations)) |
@@ -2158,8 +2159,7 @@ into the Linux errno of the same meaning, by a table searched in order:
 Where the two kernels give different errors for the same case, the call
 answers as Linux does: reading an unconnected Unix stream socket is
 `EINVAL` rather than `ENOTCONN`, `epoll_ctl` checks its arguments in
-Linux's order, a kill of another process with a real-time signal is
-`EINVAL`, and so on; each is documented with its call in
+Linux's order, and so on; each is documented with its call in
 [architecture.md](architecture.md).
 
 ### Host identity and machine state

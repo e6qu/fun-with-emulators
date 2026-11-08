@@ -208,12 +208,8 @@ pub fn thread_state(t: libc::pthread_t) -> Option<(u64, u64, bool)> {
 /// Host resource for a Linux resource limit, if the host has it.
 pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
     Some(match resource {
-        resource::RLIMIT_CPU => libc::RLIMIT_CPU as libc::c_int,
         resource::RLIMIT_FSIZE => libc::RLIMIT_FSIZE as libc::c_int,
         resource::RLIMIT_DATA => libc::RLIMIT_DATA as libc::c_int,
-        resource::RLIMIT_STACK => libc::RLIMIT_STACK as libc::c_int,
-        resource::RLIMIT_CORE => libc::RLIMIT_CORE as libc::c_int,
-        resource::RLIMIT_NPROC => libc::RLIMIT_NPROC as libc::c_int,
         resource::RLIMIT_NOFILE => libc::RLIMIT_NOFILE as libc::c_int,
         resource::RLIMIT_AS => libc::RLIMIT_AS as libc::c_int,
         _ => return None,
@@ -291,6 +287,16 @@ pub const WAKE_SIGNAL: libc::c_int = libc::SIGPWR;
 /// simply dies of `SIGKILL`. Other processes get the real `SIGKILL`.
 #[cfg(target_os = "macos")]
 pub const KILL_RELAY: libc::c_int = libc::SIGINFO;
+#[cfg(not(target_os = "macos"))]
+pub const KILL_RELAY: libc::c_int = libc::SIGKILL;
+
+/// In the handler of [`KILL_RELAY`]: whether it is a guest's `SIGKILL`
+/// relayed by an fwe process, which leaves a note first, rather than the
+/// host's own `SIGINFO` (macOS's Ctrl-T status key, a `kill -INFO`), which
+/// Linux has no counterpart of and is dropped. Async-signal-safe.
+pub fn kill_relayed() -> bool {
+    crate::signote::take(KILL_RELAY).is_some()
+}
 
 /// The executable of process `pid`, if it can be read.
 #[cfg(target_os = "macos")]
@@ -304,11 +310,14 @@ fn exe_of(pid: libc::pid_t) -> Option<Vec<u8>> {
     })
 }
 
-/// The pids of a process group (`pgid` > 0) or, for 0, of every process.
+/// The pids of process group `pgid` (none for a number that is not one).
 #[cfg(target_os = "macos")]
 fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    // <sys/proc_info.h>: PROC_ALL_PIDS, PROC_PGRP_ONLY.
-    let (kind, arg): (u32, u32) = if pgid > 0 { (2, pgid as u32) } else { (1, 0) };
+    if pgid <= 0 {
+        return Vec::new();
+    }
+    // <sys/proc_info.h>: PROC_PGRP_ONLY.
+    let (kind, arg): (u32, u32) = (2, pgid as u32);
     // SAFETY: sizing, then filling, a buffer of pids.
     unsafe {
         let n = libc::proc_listpids(kind, arg, std::ptr::null_mut(), 0);
@@ -328,11 +337,30 @@ fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
     }
 }
 
+/// The processes of host process group `pgid` that are fwe's.
+pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
+    #[cfg(target_os = "macos")]
+    let all = pids_of(pgid);
+    #[cfg(not(target_os = "macos"))]
+    let all: Vec<libc::pid_t> = {
+        let _ = pgid;
+        Vec::new()
+    };
+    all.into_iter().filter(|&p| crate::procreg::read(p).is_some()).collect()
+}
+
 /// `kill(pid, sig)` for a host signal and a `kill`-style `pid` (a process,
-/// 0 for the caller's group, `-pgid`, or -1 for every process but the
-/// caller and init). A `SIGKILL` reaches fwe processes as [`KILL_RELAY`].
-/// Returns 0 or a negated Linux errno.
+/// 0 for the caller's group, or `-pgid`). A `SIGKILL` reaches fwe processes
+/// as [`KILL_RELAY`], with a note of its sender ([`kill_relayed`]). Returns
+/// 0 or a negated Linux errno.
+///
+/// -1 is refused (`ESRCH`): on the host it is every process of the user, so
+/// a guest's -1 is resolved to fwe's own processes before it gets here
+/// ([`kill_process`] sends to each).
 pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
+    if pid == -1 {
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
     #[cfg(target_os = "macos")]
     if sig == libc::SIGKILL {
         // SAFETY: plain host calls.
@@ -340,7 +368,6 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
         let mut targets = match pid {
             p if p > 0 => vec![p],
             0 => pids_of(group),
-            -1 => pids_of(0).into_iter().filter(|&p| p != me && p != 1).collect(),
             p => pids_of(-p),
         };
         if targets.is_empty() {
@@ -352,6 +379,11 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
         let mut result = fwe_abi::err(fwe_abi::errno::ESRCH);
         for t in targets {
             let s = if fwe.is_some() && exe_of(t) == fwe { KILL_RELAY } else { libc::SIGKILL };
+            if s == KILL_RELAY {
+                // The relay is taken only with a note of its sender: the
+                // host's own SIGINFO (macOS's Ctrl-T) is no kill.
+                crate::signote::note(t, KILL_RELAY);
+            }
             // SAFETY: plain host call.
             if unsafe { libc::kill(t, s) } == 0 {
                 result = 0;
@@ -363,6 +395,16 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     }
     // SAFETY: plain host call.
     ret(unsafe { libc::kill(pid, sig) })
+}
+
+/// `kill` of one host process `pid`: a pid that is not one (0, or
+/// negative, which the host takes for a group or every process) is refused
+/// (`ESRCH`), so a number from a guest or a record never signals more.
+pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
+    if pid <= 0 {
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
+    kill(pid, sig)
 }
 
 pub fn empty_sigset() -> libc::sigset_t {
@@ -617,9 +659,20 @@ pub unsafe fn signal_info(
             value = n.value;
         }
     }
-    let code = si_code_to_linux(code);
+    let mut code = si_code_to_linux(code);
+    // A child that ended of a Linux signal, as it recorded
+    // ([`crate::procreg::ending`]).
+    let ended = (sig == libc::SIGCHLD
+        && matches!(code, wait::CLD_EXITED | wait::CLD_KILLED | wait::CLD_DUMPED))
+    .then(|| crate::procreg::end_status(pid))
+    .flatten();
+    if let Some(s) = ended {
+        code = if s & 0x80 != 0 { wait::CLD_DUMPED } else { wait::CLD_KILLED };
+    }
     let killed = matches!(code, wait::CLD_KILLED | wait::CLD_DUMPED | wait::CLD_STOPPED);
-    if sig == libc::SIGCHLD && killed {
+    if let Some(s) = ended {
+        status = s & 0x7f;
+    } else if sig == libc::SIGCHLD && killed {
         status = signal_to_linux(status) as i32;
     } else if sig == libc::SIGCHLD && code == wait::CLD_CONTINUED {
         // What continued it, as Linux reports (the host gives the signal

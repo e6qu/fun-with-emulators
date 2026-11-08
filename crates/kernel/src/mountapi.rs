@@ -83,6 +83,12 @@ fn context_key(fd: i32) -> Option<u32> {
     }
 }
 
+/// Whether `fd` is a filesystem context's descriptor (an anonymous inode
+/// on Linux: `anon_inode:[fscontext]`, mode 0600 of no file type).
+pub fn is_context(fd: i32) -> bool {
+    context_key(fd).is_some()
+}
+
 /// The detached tree `fd` is a descriptor of.
 fn tree_key(fd: i32) -> Option<u32> {
     match fdmarks::any_marks().then(|| fdmarks::marked(fd)).flatten() {

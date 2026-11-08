@@ -385,7 +385,8 @@ fn main() {
                 let n = readlink(c("/proc/self/cwd").as_ptr(), buf.as_mut_ptr(), 64);
                 println!("cwd: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
             }
-            // A network namespace's own sysctls; the initial one's are fixed.
+            // A network namespace's own sysctls, a new one's from Linux's
+            // defaults whatever the initial one's are.
             Some("sysctl") => {
                 let path = "/proc/sys/net/ipv4/ping_group_range";
                 let show = || std::fs::read_to_string(path).unwrap().replace('\t', " ");
@@ -399,12 +400,13 @@ fn main() {
                     print!("new: {}", show());
                     std::fs::write(path, "0 2147483647").unwrap();
                     print!("set: {}", show());
-                    let bad = std::fs::write(path, "5 1").map_or_else(|e| e.to_string(), |_| "ok".into());
-                    println!("backwards: {bad}");
+                    std::fs::write(path, "5 1").unwrap();
+                    print!("backwards: {}", show());
                     _exit(0);
                 }
                 waitpid(-1, std::ptr::null_mut(), 0);
                 print!("initial after: {}", show());
+                std::fs::write(path, "1 0").unwrap();
                 let listed: Vec<String> = std::fs::read_dir("/proc/sys/net/ipv4")
                     .unwrap()
                     .map(|e| e.unwrap().file_name().into_string().unwrap())

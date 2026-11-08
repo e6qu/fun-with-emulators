@@ -230,6 +230,16 @@ pub mod prctl {
     pub const PR_SET_DUMPABLE: u64 = 4;
     pub const PR_SET_NAME: u64 = 15;
     pub const PR_GET_NAME: u64 = 16;
+    pub const PR_GET_TIMERSLACK: u64 = 30;
+    pub const PR_SET_THP_DISABLE: u64 = 41;
+    pub const PR_GET_THP_DISABLE: u64 = 42;
+    pub const PR_GET_SPECULATION_CTRL: u64 = 52;
+    pub const PR_SET_SPECULATION_CTRL: u64 = 53;
+    pub const PR_SPEC_STORE_BYPASS: u64 = 0;
+    pub const PR_SPEC_INDIRECT_BRANCH: u64 = 1;
+    pub const PR_SPEC_L1D_FLUSH: u64 = 2;
+    pub const PR_SPEC_NOT_AFFECTED: i64 = 0;
+    pub const PR_SET_TIMERSLACK: u64 = 29;
     pub const PR_GET_KEEPCAPS: u64 = 7;
     pub const PR_SET_KEEPCAPS: u64 = 8;
     pub const PR_GET_SECCOMP: u64 = 21;

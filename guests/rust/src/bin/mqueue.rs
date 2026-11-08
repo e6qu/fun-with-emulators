@@ -1,8 +1,8 @@
 //! POSIX message queues: messages taken by priority, the status line a
 //! queue's descriptor reads as (and its file in the mqueue filesystem,
 //! which lists it), a queue that outlives its name while it is
-//! open, and notifications another process's message sets off (a signal
-//! carrying the registered value and the sender, and a notification thread
+//! open, and notifications another process's message sets off (a signal,
+//! standard or real-time, carrying the registered value and the sender, and a notification thread
 //! the C library runs). It prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
@@ -18,6 +18,8 @@ const EAGAIN: i32 = 11;
 const ENOENT: i32 = 2;
 const EINTR: i32 = 4;
 const SIGUSR1: i32 = 10;
+/// A real-time signal (`SIGRTMIN` + 8).
+const SIGRT: i32 = 40;
 const F_GETFD: i32 = 1;
 const FD_CLOEXEC: i32 = 1;
 const SA_SIGINFO: u64 = 4;
@@ -196,6 +198,22 @@ fn main() {
         let came = wait_until(|| VALUE.load(Ordering::SeqCst) != 0);
         println!(
             "signal: registered {registered}, shown {shows}, came {came}, mesgq {}, from the sender {}, value {:#x}",
+            CODE.load(Ordering::SeqCst) == SI_MESGQ,
+            SENDER.load(Ordering::SeqCst) == child,
+            VALUE.load(Ordering::SeqCst)
+        );
+        mq_receive(q, buf.as_mut_ptr(), buf.len(), std::ptr::null_mut());
+
+        // The same with a real-time signal, which the host lacks.
+        CODE.store(0, Ordering::SeqCst);
+        VALUE.store(0, Ordering::SeqCst);
+        sigaction(SIGRT, &act, std::ptr::null_mut());
+        let ev = SigEvent { value: 0x7e47, signo: SIGRT, ..ev };
+        let registered = mq_notify(q, &ev);
+        let child = send_from_child(q, b"ping");
+        let came = wait_until(|| VALUE.load(Ordering::SeqCst) != 0);
+        println!(
+            "real-time signal: registered {registered}, came {came}, mesgq {}, from the sender {}, value {:#x}",
             CODE.load(Ordering::SeqCst) == SI_MESGQ,
             SENDER.load(Ordering::SeqCst) == child,
             VALUE.load(Ordering::SeqCst)

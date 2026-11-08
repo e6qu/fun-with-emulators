@@ -128,22 +128,6 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
 /// it; `execve` closes it once the new program is certain to load.
 static VFORK_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// `fork` (a non-thread `clone`): duplicate the process with host `fork`.
-/// The child continues with `x0` = 0 (on `child_stack` if one was given);
-/// the parent gets the child pid.
-///
-/// A multithreaded guest forks with the kernel lock and every kernel
-/// registry lock held ([`fwe_kernel::fork_locked`]), so the child, which has
-/// only the forking thread, cannot inherit a lock another thread held, and
-/// with the other threads that run guest code stopped
-/// ([`crate::quiesce`]), so the child sees one instant of memory.
-///
-/// With `vfork` (`CLONE_VM | CLONE_VFORK`, as `posix_spawn` and `vfork` use)
-/// the child shares the guest's memory with the parent, and the parent
-/// waits until the child has called `execve` or exited, as Linux suspends
-/// it; what the child writes before then (glibc's `posix_spawn` reporting an
-/// exec failure, say) the parent sees. Its own mappings are its own: an
-/// `mmap` or `munmap` in the child does not reach the parent.
 /// Both ends of a new pipe moved into fwe's reserved range, or both closed
 /// and the error (`EAGAIN`: the range is full).
 pub(crate) fn reserve_pair(fds: [i32; 2]) -> Result<[i32; 2], i32> {
@@ -161,13 +145,31 @@ pub(crate) fn reserve_pair(fds: [i32; 2]) -> Result<[i32; 2], i32> {
     }
 }
 
-pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
+/// `fork` (a non-thread `clone`): duplicate the process with host `fork`.
+/// The child continues with `x0` = 0 (on `child_stack` if one was given);
+/// the parent gets the child pid.
+///
+/// A multithreaded guest forks with the kernel lock and every kernel
+/// registry lock held ([`fwe_kernel::fork_locked`]), so the child, which has
+/// only the forking thread, cannot inherit a lock another thread held, and
+/// with the other threads that run guest code stopped
+/// ([`crate::quiesce`]), so the child sees one instant of memory.
+///
+/// With `share` (`CLONE_VM`) the child shares the guest's memory, as it is
+/// mapped at the fork, with the parent: what either writes there the other
+/// sees. Its own mappings are its own: an `mmap` or `munmap` in the child
+/// does not reach the parent, nor one in the parent the child. With `wait`
+/// (`CLONE_VFORK`, as `posix_spawn` and `vfork` use) the parent waits until
+/// the child has called `execve` or exited, as Linux suspends it; what the
+/// child writes before then (glibc's `posix_spawn` reporting an exec
+/// failure, say) the parent sees.
+pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
     // A pipe whose write end only the child holds: it closes when the child
     // execs (it is close-on-exec) or exits, which ends the parent's wait.
     let mut done = [-1i32; 2];
-    if vfork {
+    if wait {
         // SAFETY: plain host call with a 2-element array.
         if unsafe { libc::pipe(done.as_mut_ptr()) } != 0 {
             return fwe_kernel::host::last_error();
@@ -182,7 +184,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
         let mut kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
-        let token = match k.fork_begin(flags) {
+        let token = match k.fork_begin(&a) {
             Ok(t) => t,
             Err(e) => {
                 for fd in done.into_iter().filter(|&fd| fd >= 0) {
@@ -193,11 +195,12 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
             }
         };
         let kqueues = fwe_kernel::kqueue_state();
-        // A vfork child shares the guest's memory: its private parts are
-        // shared for the fork, then copied again by any later one (in either
-        // process). The kernel lock keeps the guest's mappings as they are.
+        // A child of CLONE_VM shares the guest's memory: its private parts
+        // are shared for the fork, then copied again by any later one (in
+        // either process). The kernel lock keeps the guest's mappings as
+        // they are.
         let share =
-            if vfork { region::private_parts(&fwe_kernel::mm::tracked()) } else { Vec::new() };
+            if share { region::private_parts(&fwe_kernel::mm::tracked()) } else { Vec::new() };
         let set_shared = |on: bool| {
             for &(start, len) in &share {
                 region::set_shared_on_fork(start, len, on);
@@ -237,7 +240,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
         // blocked mask and alternate stack carry over; pending signals do
         // not.
         trap::ensure_thread_altstack();
-        if vfork {
+        if wait {
             // SAFETY: closing the read end the parent uses.
             unsafe { libc::close(done[0]) };
             VFORK_DONE.store(done[1], Ordering::SeqCst);
@@ -268,7 +271,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, vfork: bool) -> i64 {
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
         let _ = fwe_kernel::uaccess::write(parent_tid, shown);
     }
-    if vfork {
+    if wait {
         // SAFETY: plain host calls on the pipe opened above.
         unsafe {
             libc::close(done[1]);
@@ -305,9 +308,14 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         let mut all: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
         libc::sigfillset(&mut all);
-        // Faults stay deliverable: the child's checked copies of guest
-        // memory recover from them, and a blocked one would end it.
-        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP, libc::SIGFPE] {
+        // Memory faults stay deliverable: the child's checked copies of
+        // guest memory recover from them, and a blocked one would end it.
+        // The other fault signals fwe raises nowhere before the child
+        // enters guest code, so they are held like the rest: one sent the
+        // moment the child exists arrives when it is ready for it (inside
+        // the host `fork` its handler would read the parent's mailbox, and
+        // take the signal for a fault).
+        for sig in [libc::SIGSEGV, libc::SIGBUS] {
             libc::sigdelset(&mut all, sig);
         }
         libc::sigdelset(&mut all, libc::SIGSYS);
@@ -315,6 +323,11 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         let pid = fork();
         // What a failed fork left, kept for the caller across the calls below.
         let saved = host::last_errno();
+        if pid == 0 {
+            // Before any signal sent to the child can be taken: the
+            // parent's pending ones are not the child's.
+            thread::forked();
+        }
         if pid != 0 {
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
             if go[1] >= 0 {
@@ -339,8 +352,32 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     }
 }
 
+/// A `wait` reaped host process `pid`, which ended with Linux wait status
+/// `wstatus`: its `SIGCHLD` given now if the host's has not landed, as
+/// Linux sends it before `wait` returns ([`reaper::reaped_child_signal`]).
+fn reaped_signal(pid: i32, wstatus: i32) {
+    use fwe_abi::wait as w;
+    let (code, status) = match wstatus & 0x7f {
+        0 => (w::CLD_EXITED, (wstatus >> 8) & 0xff),
+        sig if wstatus & 0x80 != 0 => (w::CLD_DUMPED, sig),
+        sig => (w::CLD_KILLED, sig),
+    };
+    // SAFETY: getuid cannot fail; a child of fwe's is this user's.
+    let uid = host::uid_to_initial(unsafe { libc::getuid() });
+    let info = thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
+    reaper::reaped_child_signal(pid, info);
+}
+
 /// Encode a host `wait` status into the Linux layout a guest expects.
-fn linux_wstatus(status: libc::c_int) -> i32 {
+/// Host process `pid` ended so.
+fn linux_wstatus(pid: i32, status: libc::c_int) -> i32 {
+    if (libc::WIFEXITED(status) || libc::WIFSIGNALED(status))
+        && let Some(s) = fwe_kernel::procreg::end_status(pid)
+    {
+        // It ended of a Linux signal, as it recorded: one the host lacks,
+        // ignores by default, or with the core fwe dumped.
+        return s;
+    }
     if libc::WIFEXITED(status) {
         (libc::WEXITSTATUS(status) & 0xff) << 8
     } else if libc::WIFSIGNALED(status) {
@@ -511,11 +548,26 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     // SAFETY: an all-zero rusage is a valid out-parameter.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: `status` and `usage` are valid out-parameters.
-    let r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
+    let mut r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
+    if r < 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
+        // The child's own SIGCHLD may interrupt the wait before the host
+        // reports the child: Linux reports a child that is ready over the
+        // signal, so it is looked for once more.
+        // SAFETY: as above.
+        let again =
+            unsafe { libc::wait4(pid, &mut status, host_options | libc::WNOHANG, &mut usage) };
+        if again > 0 {
+            r = again;
+        } else {
+            host::set_errno(libc::EINTR);
+        }
+    }
     if r < 0 {
         return fwe_kernel::host::last_error();
     }
-    if r > 0 && wstatus != 0 && fwe_kernel::uaccess::write(wstatus, linux_wstatus(status)).is_err()
+    if r > 0
+        && wstatus != 0
+        && fwe_kernel::uaccess::write(wstatus, linux_wstatus(r, status)).is_err()
     {
         return err(errno::EFAULT);
     }
@@ -524,6 +576,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     }
     let guest = fwe_kernel::pidns::guest_ret(r as i64);
     if r > 0 && !libc::WIFSTOPPED(status) && !libc::WIFCONTINUED(status) {
+        reaped_signal(r, linux_wstatus(r, status));
         // Reaped: its numbers are free again, and its records go.
         reaper::busy(|| {
             fwe_kernel::pidns::reaped(r);
@@ -653,7 +706,18 @@ fn waitid_host(
     // SAFETY: an all-zero siginfo is a valid out-parameter.
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `si` is a valid out-parameter.
-    if unsafe { libc::waitid(idtype, id, &mut si, host_options) } != 0 {
+    let mut r = unsafe { libc::waitid(idtype, id, &mut si, host_options) };
+    if r != 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
+        // As for `wait4`: a child ready is reported over its own signal.
+        // SAFETY: as above.
+        r = unsafe { libc::waitid(idtype, id, &mut si, host_options | libc::WNOHANG) };
+        // SAFETY: `si` was filled by the host.
+        if r != 0 || unsafe { si.si_pid() } == 0 {
+            host::set_errno(libc::EINTR);
+            r = -1;
+        }
+    }
+    if r != 0 {
         return fwe_kernel::host::last_error();
     }
     let mut words = [0i32; 32]; // a 128-byte siginfo_t
@@ -661,8 +725,17 @@ fn waitid_host(
     let (pid, uid, status) =
         unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
     if pid != 0 {
-        let code = si.si_code;
+        // It ended of a Linux signal, as it recorded (see `linux_wstatus`).
+        let ended = matches!(si.si_code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
+            .then(|| fwe_kernel::procreg::end_status(pid))
+            .flatten();
+        let code = match ended {
+            Some(s) if s & 0x80 != 0 => w::CLD_DUMPED,
+            Some(_) => w::CLD_KILLED,
+            None => si.si_code,
+        };
         let status = match code {
+            _ if ended.is_some() => ended.unwrap_or(0) & 0x7f,
             w::CLD_KILLED | w::CLD_DUMPED | w::CLD_STOPPED => host::signal_to_linux(status) as i32,
             // What continued it, as Linux reports (the host gives the
             // signal that had stopped it).
@@ -677,6 +750,12 @@ fn waitid_host(
         if options & w::WNOWAIT == 0
             && matches!(code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
         {
+            let wstatus = if code == w::CLD_EXITED {
+                (status & 0xff) << 8
+            } else {
+                status | if code == w::CLD_DUMPED { 0x80 } else { 0 }
+            };
+            reaped_signal(pid, wstatus);
             // Reaped: its numbers are free again, and its records go.
             reaper::busy(|| {
                 fwe_kernel::pidns::reaped(pid);

@@ -59,6 +59,9 @@ pub enum Mark {
     /// host process `host`, opened for writing by a process that may lower
     /// it (`privileged`: `CAP_SYS_RESOURCE`).
     OomScore { host: i32, legacy: bool, privileged: bool },
+    /// `/proc/<pid>/timerslack_ns` of host process `host`, opened for
+    /// writing.
+    TimerSlack { host: i32 },
     /// An `AF_NETLINK` socket ([`crate::netlink`]).
     Netlink,
     /// Loop device `N`'s node, open as the device ([`crate::loopdev`]).
@@ -416,7 +419,11 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Ns(_)) => 15,
             Some(Mark::Inotify(_)) => 16,
             Some(Mark::ProcLink) => 17,
+            Some(Mark::TimerSlack { .. }) => 18,
         });
+        if let Some(Mark::TimerSlack { host }) = rec.mark {
+            e.i32(host);
+        }
         if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
             rec.mark
         {
@@ -488,6 +495,7 @@ pub fn load(d: &mut Dec) {
             15 => Some(Mark::Ns(d.u32())),
             16 => Some(Mark::Inotify(d.u32())),
             17 => Some(Mark::ProcLink),
+            18 => Some(Mark::TimerSlack { host: d.i32() }),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

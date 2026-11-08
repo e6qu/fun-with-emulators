@@ -188,7 +188,8 @@ The pieces that do it:
   reaches each group (a quarter of the branch range apart at most), takes
   the region from the loader's arena or reserves one near the code, writes
   the stubs, points each site at its stub and invalidates the instruction
-  cache;
+  cache; code the guest mapped without a fixed address, which the host put
+  where no region is within reach, is mapped again where there is room;
 - the kernel crate asks for preparation through
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
@@ -286,9 +287,21 @@ does for it, then the per-process state fwe keeps. Inside fwe:
   `sched_*` calls (`crates/kernel/src/sched.rs`) are kept in the record
   with Linux's checks and inherited (`SCHED_RESET_ON_FORK` honoured); the
   host's scheduling is untouched. Policies are per process.
-- **Resource limits:** those the host lacks, and `RLIMIT_MEMLOCK`, are
-  fwe's (`crates/kernel/src/rlimits.rs`); the others are the host's.
-  `RLIMIT_NOFILE` is virtual (see [Descriptors](#descriptors)).
+- **Resource limits:** those the host lacks, and `RLIMIT_MEMLOCK`,
+  `CORE`, `STACK`, `CPU` and `NPROC`, are fwe's
+  (`crates/kernel/src/rlimits.rs`); the others are the host's.
+  `RLIMIT_NOFILE` is virtual (see [Descriptors](#descriptors)). Past the
+  CPU soft limit the host's `SIGXCPU` comes each second, and past the
+  hard one fwe ends the process with `SIGKILL`; `RLIMIT_NPROC` is checked
+  at `fork` against the user's fwe processes.
+- **Core dumps** (`crates/kernel/src/coredump.rs`): a signal whose default
+  dumps core leaves an ELF core (the thread's registers, the process, and
+  the mappings Linux's default `coredump_filter` dumps), named by
+  `kernel.core_pattern` and `core_uses_pid` and cut short at
+  `RLIMIT_CORE`. The host's own core limit is 0.
+- **End status:** a process a signal ends leaves its Linux wait status
+  beside its record (`procreg::ending`), so its parent reads the signal
+  and core bit Linux would report even for a signal the host lacks.
 - **Interval timers** are the host's; one longer than the host takes
   (100,000,000 s) gets the host's longest and reads back as asked.
   CPU-time clocks are the host thread's or process's CPU time.
@@ -341,6 +354,14 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
 - **Wake signal:** a signal recorded without a host signal (real-time,
   emulated faults, caught `tgkill`) wakes its target thread, or every
   thread, with `SIGEMT`.
+- **Wake pipes:** every host signal a thread takes writes a byte to that
+  thread's pipe (`thread::poke_wait`), and `poll`, `select` and the
+  `epoll` waits watch it beside the guest's descriptors
+  (`thread::wait_ready`), so a signal that lands after such a wait looked
+  for pending ones, and before the host wait began, still ends it.
+- **Signals the host lacks, between processes:** queued in the target's
+  mailbox (up to 64, with sender, code and value) and the target woken
+  with `SIGEMT`; its wake handler moves them onto its pending sets.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.
@@ -694,7 +715,14 @@ Calls that fit none of the areas above:
   ext4's type (or the mount's type and flags); `msync` is the host's.
 - `prctl`: thread name, capability bounding set and ambient set,
   keepcaps, securebits, child subreaper, `no_new_privs`, seccomp,
-  dumpability and parent-death signal; others fail with `EINVAL`.
+  dumpability, parent-death signal, timer slack, transparent huge pages
+  and speculation control (reported as not affected); others fail with
+  `EINVAL`.
+- `getcpu`, `vhangup`, `readahead`, `sync_file_range`, `delete_module`,
+  `syslog` (an empty kernel log) and `membarrier` check their arguments
+  and permissions as Linux does (`crates/kernel/src/calls.rs`);
+  `rt_sigqueueinfo` and `rt_tgsigqueueinfo` send with the caller's
+  `siginfo`.
 - `sysinfo` reports the host's uptime and load with the fixed memory
   figures of `/proc/meminfo`; `vm.drop_caches` accepts Linux's values and
   drops nothing.
@@ -728,11 +756,11 @@ which are to be lifted for 1.0 and which are not planned.
   shared.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
-- `clone3` has no pidfds, chosen tids or cgroups (`ENOSYS`); `waitid`
-  reports no `rusage`; a process a signal ends writes no Linux core file,
-  and its status has the core-dump bit only if macOS dumped a core of its
-  own; a process killed by a real-time signal exits with status 128 + the
-  signal.
+- `clone3` has no pidfds or chosen tids (`ENOSYS`); `waitid` reports no
+  `rusage`; a core file holds the dying thread's registers only, and a
+  `core_pattern` piping to a program dumps none; a process ended by a
+  signal the host lacks exits on the host with status 128 + the signal,
+  which only a parent that is not fwe's sees.
 - A `CLONE_PARENT` child's parent is the caller's for `getppid`, `/proc`
   and adoption, but on the host it is the caller's child, which the
   caller's parent cannot `wait` for (nor gets `SIGCHLD` of) while the
@@ -741,10 +769,9 @@ which are to be lifted for 1.0 and which are not planned.
   a new thread does not inherit its creator's name.
 
 **Resources**
-- The limits the host keeps (`RLIMIT_NPROC`, `RLIMIT_STACK`, `RLIMIT_CPU`
-  and the like) cannot be raised past the host's hard limit, even by
-  root, and the host acts on them as macOS does (no `SIGKILL` at the hard
-  CPU limit).
+- The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),
+  and the CPU and process-count limits fwe keeps on top of the host's,
+  cannot be raised past the host's hard limit, even by root.
 - Limits set on another process with `prlimit` take effect at its next
   limit call, `fork` or `execve`; reading another's reports what was set
   for it, else the caller's own.
@@ -866,12 +893,10 @@ which are to be lifted for 1.0 and which are not planned.
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`).
 
 **Signals**
-- A real-time signal (`SIGRTMIN` and up) can only be sent within the
-  process (`EINVAL` to another); no signal is queued: one is pending per
-  number, a real-time one keeping its latest `siginfo`;
-  `rt_sigqueueinfo` and `rt_tgsigqueueinfo` are not implemented, and a
-  message queue's notification by a real-time signal reaches only its own
-  process.
+- Once taken from the mailbox, one signal is pending per number, a
+  real-time one keeping its latest `siginfo`, rather than each queued; a
+  signal the host lacks reaches only fwe's processes (`EINVAL` to any
+  other).
 - A blocked signal whose action the host applies (ignored, or a default
   that ignores or continues) loses its sender, which matters only if a
   handler is installed before it is unblocked; a signal from outside fwe
@@ -879,16 +904,11 @@ which are to be lifted for 1.0 and which are not planned.
   no sender; a blocked signal pending across an `execve` arrives with
   fwe's own pid as sender.
 - A signal arriving between a blocking call's start and its host wait is
-  noticed only when the call ends, except for `rt_sigsuspend`,
-  `rt_sigtimedwait` and the masked waits; a futex wait notices one within
-  20 ms; a call rerun after an interruption the guest does not see starts
+  noticed only when the call ends, except for `poll`, `select`, the `epoll`
+  waits, `rt_sigsuspend` and `rt_sigtimedwait`; a futex wait notices one
+  within 20 ms; a call rerun after an interruption the guest does not see starts
   its timeout over.
 - A fault signal sent by a process fwe did not start is taken as a fault.
-- Any `SIGINFO` from outside fwe ends the process as `SIGKILL` would, since
-  fwe relays a guest's `SIGKILL` as `SIGINFO`: a macOS terminal sends one
-  for Ctrl-T, its status key, in canonical mode. A guest's `TCSETS` sets
-  the terminal's macOS-only control characters (`VSTATUS`, `VDSUSP`) to 0,
-  which macOS reads as the NUL character, not as disabled.
 - A process-wide signal left at its default action and sent while every
   thread blocks it stays with the thread macOS parked it on rather than
   acting when another thread unblocks it (a caught one is handed on,

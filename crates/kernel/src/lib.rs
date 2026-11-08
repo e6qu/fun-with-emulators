@@ -12,10 +12,12 @@
 
 pub mod atime;
 pub mod bpf;
+pub mod calls;
 pub mod caps;
 pub mod cgroupfs;
 mod clockset;
 pub mod cloneargs;
+pub mod coredump;
 pub mod creds;
 pub mod devnodes;
 pub mod epoll;
@@ -262,6 +264,8 @@ impl<P: Platform> Kernel<P> {
     pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
         // Before any handler may need to read a note of a sender.
         signote::init();
+        #[cfg(not(test))]
+        rlimits::host_core_off();
         // Before any thread could wait. (Not in the unit tests, which are
         // one process making many kernels while others wait.)
         #[cfg(not(test))]
@@ -300,6 +304,9 @@ impl<P: Platform> Kernel<P> {
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
+        e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
+        e.bool(coredump::UNDUMPABLE.load(std::sync::atomic::Ordering::Relaxed));
+        rlimits::save(e);
         match &self.fs {
             Some(fs) => {
                 e.bool(true);
@@ -316,8 +323,16 @@ impl<P: Platform> Kernel<P> {
             e.u32(g);
         }
         c.caps.encode(e);
+        let clear = nsops::CLEAR_SIGHAND.load(std::sync::atomic::Ordering::SeqCst);
         for a in &self.sigactions {
-            for v in [a.handler, a.flags, a.restorer, a.mask] {
+            // A child of CLONE_CLEAR_SIGHAND has the defaults.
+            let (handler, flags, mask) = if clear {
+                let ignored = a.handler == absig::SIG_IGN;
+                (if ignored { absig::SIG_IGN } else { absig::SIG_DFL }, 0, 0)
+            } else {
+                (a.handler, a.flags, a.mask)
+            };
+            for v in [handler, flags, a.restorer, mask] {
                 e.u64(v);
             }
         }
@@ -361,6 +376,9 @@ impl<P: Platform> Kernel<P> {
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
+        syscalls::THP_DISABLE.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
+        coredump::UNDUMPABLE.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
+        rlimits::load(d);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
@@ -587,6 +605,7 @@ impl<P: Platform> Kernel<P> {
         // Kept across execve, as on Linux (whose set-ID exec, which fwe
         // has none of, would clear some of it).
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
+        e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
         e.into_bytes()
     }
 
@@ -619,7 +638,9 @@ impl<P: Platform> Kernel<P> {
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         let persona = d.u32();
+        let thp = d.bool();
         d.finish()?;
+        syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
@@ -692,7 +713,7 @@ impl<P: Platform> Kernel<P> {
         if regs.x[8] == fwe_abi::nr::RT_SIGRETURN {
             if !self.sys_rt_sigreturn(regs) {
                 // A frame the guest cannot read back: Linux kills it.
-                self.terminate_by(absig::SIGSEGV);
+                self.terminate_with(absig::SIGSEGV, Some(regs));
             }
             // Traced after the frame is restored: `x8` is the interrupted
             // code's now.
