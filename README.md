@@ -22,10 +22,15 @@ Container engines run standard images: crun, podman and containerd run
 
 LTP's system-call tests pass at 877 of 1550 (75% of those that apply).
 
-[ROADMAP.md](ROADMAP.md) has what is done and what is left to 1.0;
-[PLAN.md](PLAN.md) has the goal and scope;
-[docs/architecture.md](docs/architecture.md) explains how it works and its
-current limitations.
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [PLAN.md](PLAN.md) | Goal, approach, scope and the 1.0 finish line |
+| [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
+| [docs/linux-on-macos.md](docs/linux-on-macos.md) | How each Linux concept (system calls, memory, processes, signals, namespaces, cgroups…) maps onto macOS |
+| [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
+| [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
 ## Usage
 
@@ -54,7 +59,7 @@ Debian rootfs.
 | `guests/musl`, `guests/glibc`, `guests/debian`, `guests/alpine` | Vendored or fetched binaries the tests run, with their provenance |
 | `tools/gen-abi.py` | Generates the ABI tables from Linux's UAPI headers |
 | `tools/ltp` | Builds LTP and runs its system-call tests against the baseline |
-| `docs/` | How fwe works, and the hypervisor backend |
+| `docs/` | Linux on macOS, the architecture, and the hypervisor backend |
 
 ## Testing
 
