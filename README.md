@@ -12,9 +12,9 @@ What differs is the kernel. `fwe` plays the Linux kernel: each guest
 process is one `fwe` process, which catches every system call the program
 makes, carries it out with macOS's own calls, and turns what macOS reports
 (signals, key strokes, children ending, errors) into what Linux would have
-said. Files, sockets and terminals are the host's; what macOS lacks
-(namespaces, cgroups, epoll, inotify, System V IPC, keyrings and more)
-`fwe` provides itself, shared between its processes.
+said. Files, sockets and terminals are the host's; what macOS lacks or
+shapes differently (namespaces, cgroups, epoll, inotify, System V IPC,
+keyrings and more) `fwe` provides itself, shared between its processes.
 
 Programs run in one of two backends, chosen per program:
 
