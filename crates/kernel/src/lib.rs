@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod atime;
 pub mod bpf;
 pub mod caps;
 pub mod cgroupfs;
@@ -26,12 +27,14 @@ pub mod fs;
 mod fsops;
 pub mod futex;
 pub mod host;
+pub mod inotify;
 pub mod ipcops;
 pub mod loopdev;
 pub mod maps;
 pub mod memfd;
 pub mod mm;
 pub mod modes;
+pub mod mountapi;
 mod mountops;
 pub mod mounts;
 pub mod mqueue;
@@ -39,6 +42,7 @@ pub mod net;
 pub mod netlink;
 pub mod netns;
 pub mod ns;
+pub mod nsfd;
 pub mod nsops;
 pub mod overlay;
 pub mod pidns;
@@ -286,6 +290,9 @@ impl<P: Platform> Kernel<P> {
         e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
         netlink::save(e, false);
+        mountapi::save(e);
+        inotify::save(e);
+        nsfd::save(e);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
@@ -344,6 +351,9 @@ impl<P: Platform> Kernel<P> {
         let trace_file = d.bytes();
         fdmarks::load(d);
         netlink::load(d);
+        mountapi::load(d);
+        inotify::load(d);
+        nsfd::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
@@ -555,9 +565,14 @@ impl<P: Platform> Kernel<P> {
         fdmarks::save(&mut e);
         // The netlink sockets' host ends, which survive the host exec.
         netlink::save(&mut e, true);
+        mountapi::save(&mut e);
+        inotify::save(&mut e);
+        nsfd::save(&mut e);
         // The message queues' descriptors the exec closes: their
         // registrations go now, as Linux removes them as it closes them.
         mqueue::exec_closing(&self.creds);
+        // Its inotify instances and open files the exec closes, likewise.
+        inotify::exec_closing();
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
@@ -590,6 +605,9 @@ impl<P: Platform> Kernel<P> {
         rlimits::load(&mut d);
         fdmarks::load(&mut d);
         netlink::load(&mut d);
+        mountapi::load(&mut d);
+        inotify::load(&mut d);
+        nsfd::load(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         let persona = d.u32();
@@ -826,8 +844,10 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    let noted = atime::before(nr, &a);
     // SAFETY: the caller's guarantee, passed on.
     let r = unsafe { blocking_call(nr, a) }?;
+    atime::after(noted, r);
     // A write the host refused to a sealed memfd, and what a socket that
     // stands in for another kind reports, as Linux reports them.
     Some(linux_result(nr, &a, r))
@@ -838,6 +858,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
 /// another kind, a read of an unconnected Unix socket, and the `SIGPIPE` a
 /// socket write to a closed peer raises.
 pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
+    inotify::after_io(nr, a, r);
     let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
     let r = net::linux_read_error(nr, a[0] as i32, r);
     if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
@@ -1158,6 +1179,12 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Some(r) = mqueue::io(nr, &a) {
         return Some(r);
     }
+    if let Some(r) = nsfd::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = inotify::io(nr, &a) {
+        return Some(r);
+    }
     if nr == n::OPENAT {
         // A FIFO's open waits for the other end: here, without the lock,
         // and the locked open takes what this one opened.
@@ -1192,6 +1219,12 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // SAFETY: caller guarantees the buffer spans the length.
             if let Some(r) = unsafe { signalfd::try_read(fd, buf, len) } {
+                return Some(r);
+            }
+            if let Some(r) = mountapi::read(fd, buf, len) {
+                return Some(r);
+            }
+            if let Some(r) = inotify::try_read(fd, buf, len) {
                 return Some(r);
             }
             if seqpacket::is(fd) {

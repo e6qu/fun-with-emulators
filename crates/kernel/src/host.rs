@@ -548,6 +548,12 @@ pub unsafe fn signal_info(
     // SAFETY: guaranteed by the caller.
     let (mut code, mut pid, mut uid, mut status) =
         unsafe { ((*info).si_code, (*info).si_pid(), (*info).si_uid(), (*info).si_status()) };
+    if let Some(slot) = LAST_HOST_INFO.get(sig as usize) {
+        slot.store(
+            ((code as u32 as u64) << 32) | pid as u32 as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
     if sig == libc::SIGCHLD && pid == 0 {
         let saved = last_errno();
         // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
@@ -574,12 +580,16 @@ pub unsafe fn signal_info(
     {
         /// macOS's `SI_USER`.
         const SENT: i32 = 0x10001;
-        // (A signal another process sent may come with its sender and a
-        // code of 0.)
-        let note = if code == 0 && pid == 0 {
-            crate::signote::take(sig)
-        } else if code == SENT || code == 0 {
+        // A signal another process sent may come with its sender and a
+        // code of 0, with no sender (as when the sender has ended), or with
+        // the code and pid of the sender's exit when it ended right after
+        // sending. A note names its sender, so one that sender left is
+        // taken whatever the code; with no sender, a note is taken for a
+        // signal sent (not one the host raised, as for a fault).
+        let note = if pid != 0 {
             crate::signote::take_from(sig, pid)
+        } else if code == SENT || code == 0 {
+            crate::signote::take(sig)
         } else {
             None
         };
@@ -607,6 +617,18 @@ pub unsafe fn signal_info(
         status = signal::SIGCONT as i32;
     }
     crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value }
+}
+
+/// The code and sender the host last gave each host signal, as
+/// `(code << 32) | pid`, for the trace of a signal's delivery.
+static LAST_HOST_INFO: [std::sync::atomic::AtomicU64; 32] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+
+/// What the host last gave host signal `sig`: its code and sender.
+pub fn last_host_info(sig: libc::c_int) -> (i32, i32) {
+    let v =
+        LAST_HOST_INFO.get(sig as usize).map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst));
+    ((v >> 32) as u32 as i32, v as u32 as i32)
 }
 
 /// The siginfo of a signal another fwe process sent, as its note
@@ -803,7 +825,7 @@ pub fn tty_error() -> i64 {
 #[cfg(target_os = "macos")]
 pub fn statfs_to_linux(s: &libc::statfs) -> fwe_abi::Statfs {
     use fwe_abi::statfs::*;
-    let mut flags = 0;
+    let mut flags = ST_VALID;
     if s.f_flags & libc::MNT_RDONLY as u32 != 0 {
         flags |= ST_RDONLY;
     }
@@ -841,7 +863,7 @@ pub fn statfs_to_linux(s: &libc::statfs) -> fwe_abi::Statfs {
         f_fsid: fsid(&s.f_fsid),
         f_namelen: s.f_namelen,
         f_frsize: s.f_frsize,
-        f_flags: 0,
+        f_flags: fwe_abi::statfs::ST_VALID,
         f_spare: [0; 4],
     }
 }

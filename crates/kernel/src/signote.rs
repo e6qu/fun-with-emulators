@@ -45,9 +45,15 @@ pub struct Note {
 }
 /// Host signals are numbered below this.
 const SIGNALS: usize = 32;
-/// A note older than this is not taken: a signal is held by fwe's handlers
-/// only for a moment.
-const FRESH_NS: u64 = 1_000_000_000;
+/// A note older than this is not taken for a signal that came with no
+/// sender (one whose sender has ended, or the host did not name): a signal
+/// is held by fwe's handlers only for a moment, though a loaded machine
+/// delivers it late.
+const FRESH_NS: u64 = 10_000_000_000;
+/// A note older than this is not taken for a signal from the process that
+/// left it: the sender names it, so only a slow delivery (a loaded machine,
+/// the VM's stand-in) separates them.
+const SENDER_FRESH_NS: u64 = 60_000_000_000;
 
 /// This process's own mailbox, open (-1: not yet), and the pid it is of.
 static OWN: AtomicI32 = AtomicI32::new(-1);
@@ -234,7 +240,7 @@ pub fn take_from(sig: libc::c_int, sender: i32) -> Option<Note> {
         return None;
     }
     let (note, when) = read_note(sig, Some(sender))?;
-    (note.pid == sender && now_ns().saturating_sub(when) < FRESH_NS).then_some(note)
+    (note.pid == sender && now_ns().saturating_sub(when) < SENDER_FRESH_NS).then_some(note)
 }
 
 /// Host process `pid`'s mailbox goes with its record.

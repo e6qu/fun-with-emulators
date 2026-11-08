@@ -86,7 +86,8 @@ for (memory mapped writable and executable is one or the other at a time
 on macOS) and the file it maps, from which offset; the loaders add the
 program, its dynamic linker (each segment the file's as far as the file
 has contents, zeroed memory beyond) and the stack, and the break is the
-heap. Memory the native backend maps for the guest that the guest did not
+heap (up to 1 GiB after the program, reserved before the dynamic linker is
+placed, as much of it as the host has free). Memory the native backend maps for the guest that the guest did not
 ask for (code stubs, a stack's guard page) is listed as anonymous memory
 with the host's protections, so a program looking for free address space
 in the list does not pick it. Locking (`mlock`, `mlock2`, `mlockall`,
@@ -821,6 +822,33 @@ the thread blocks and some signalfd watches is moved onto that signalfd
 instead (including the `SIGCHLD` of a child exiting), and a call it
 interrupted runs again.
 
+## inotify
+
+fwe raises inotify's events itself (`crates/kernel/src/inotify.rs`): the
+host's file events say neither which name a directory gained nor that a
+file was opened, read or closed. Every fwe process's file calls raise
+Linux's events for a watched file and for a file in a watched directory
+(with its name): opening, reading, writing and truncating, closing (for
+writing or not), attribute changes, creation, removal (`IN_DELETE` to the
+directory; for the file's last link, `IN_ATTRIB`, `IN_DELETE_SELF` and
+`IN_IGNORED`), renames (`IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie,
+`IN_MOVE_SELF`), and an unmount (`IN_UNMOUNT`). The watches are a record
+every process sees, each naming the file by host device and inode; a
+file of an overlay by the overlay and the lower file it is (a copy-up
+records that), so its watches keep it across a copy-up and do not see
+its layers' files changed through their own paths. An
+instance's descriptor is a host datagram socket bound to a path in fwe's
+private directory, to which the process raising an event sends it, so
+reading it, `poll` and `epoll` are the host's own; a read takes whole
+events, as many as fit. Shared words beside the socket count what is
+queued, up to `fs.inotify.max_queued_events` (past it the reader gets
+`IN_Q_OVERFLOW` once it has read the rest), and keep the last event, so
+an identical one is merged with it, as Linux merges them. `IN_ONESHOT`,
+`IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR` and
+`IN_DONT_FOLLOW` act as on Linux, the `fs.inotify.*` limits are
+enforced, and `/proc/<pid>/fdinfo` lists an instance's watches. `vm.drop_caches` takes the values Linux takes, and drops
+nothing (the host keeps its caches).
+
 ## Sockets
 
 Socket calls (`crates/kernel/src/net.rs`) pass through on Linux. macOS has
@@ -900,7 +928,10 @@ a reader or writer of it: like one of a device or socket the host cannot
 open, or of a symbolic link itself (`O_NOFOLLOW`), it is a stand-in that
 names the file, whose `fstat`, `readlinkat`, `faccessat2`, `utimensat` and
 fdinfo are the file's and through whose `/proc/self/fd` link the file is
-opened again.
+opened again. One of a link of fwe's `/proc` or `/sys` names that link: it
+stats and reads as the link, its own `/proc/self/fd` link reads the link's
+path, and nothing is mounted through it (`ENOENT`, as Linux follows no
+magic link to a link).
 
 ## Terminals and job control
 
@@ -992,7 +1023,58 @@ overlay), or one of fwe's own filesystems (`proc`, `sysfs`, `devpts`,
 `mqueue`; `cgroup2` is the shared tree). `mount` (new mounts, bind and
 recursive bind, move, remount, propagation), `umount2`, `pivot_root` and
 `chroot` act on it, and `/proc/self/mountinfo` and `/proc/self/mounts`
-show it from the process's root.
+show it from the process's root, with each mount's options and its peer
+group (`shared:N`) and master (`master:N`). A bind of a shared mount joins
+its peer group, a new mount under a shared one gets a group of its own,
+and a shared mount made a slave receives from the group it left, as on
+Linux. A mount made under a shared mount propagates as Linux's does: it
+and what is under it are shared (each in a group of its own if it had
+none), and a copy goes to the same place in the parent's peers (peers of
+the tree's mounts) and in the slaves of its group and on through slaves
+that are shared (slaves of them, the copies in one shared slave group
+peers of each other), beneath a mount already there. Its unmount takes
+each copy whose mounts are all copies of the unmounted tree's, a mount
+stacked on the copy taking its place; a mount moved into a shared mount
+propagates there, and one under a shared mount cannot be moved
+(`EINVAL`). Peer groups span namespaces (a copied namespace's mounts are
+peers of the original's, and the groups' numbers are counted across
+namespaces), so a change made in one namespace is carried, once it is
+made, to the others' mount tables, and a mount made a slave receives from
+its group if the group has members in any namespace. A namespace copied
+into another user namespace than the original's owner (`unshare -Urm`)
+has slaves of the original's shared mounts instead, so what it mounts does
+not reach back.
+
+A mount's flags are acted on: `nodev` refuses opening a device (`EACCES`),
+`noexec` running a program or mapping a file to execute (`EACCES`,
+`EPERM`), `nosymfollow` following a link (`ELOOP`), and `noatime`,
+`nodiratime` and `strictatime` set a read file's access time as Linux
+would (fwe notes it before the read and, where the host left another,
+sets it after; a mount with none of them is `relatime`, Linux's default,
+left to the host); a mapping of a file of a `noexec` mount cannot be made
+executable later either (`mprotect`, `EACCES`). A remount that names no
+access-time mode keeps the mount's. `statfs` reports the flags. A mount
+is busy, and its unmount refused (`EBUSY`), while something is mounted
+under it, the caller's working directory or root is in it (the working
+directory in the mount it was entered through, not one mounted over it
+since), or a file opened through it is open in the process or, by its
+host path, in another fwe process of the namespace; `MNT_DETACH`
+unmounts it anyway, and `MNT_EXPIRE` marks it on a first call and
+unmounts it on a second if nothing used it in between. `pivot_root`
+replaces the mount at the caller's root, the namespace's or a chroot's.
+
+The new mount API (`crates/kernel/src/mountapi.rs`) works on the same
+table. A filesystem context (`fsopen`, or `fspick` of a mounted filesystem)
+gathers a source, flags and options through `fsconfig`, checked as Linux
+checks them (an unknown parameter is refused and logged, and reading the
+context's descriptor gives the log), and `CMD_CREATE` makes the filesystem
+as `mount` would. `fsmount` and `open_tree` with `OPEN_TREE_CLONE` give a
+detached mount, a copy kept by the process against an `O_PATH` descriptor,
+which `mount_setattr` can change and `move_mount` attaches, beneath the
+mount at the target with `MOVE_MOUNT_BENEATH`. `statx` reports a file's
+mount id (or its unique id, for `STATX_MNT_ID_UNIQUE`), which
+`statmount` describes and `listmount` lists; a mount the caller cannot
+reach from its root is refused to it without `CAP_SYS_ADMIN`.
 
 An overlay (`crates/kernel/src/overlay.rs`) is resolved as Linux's
 `overlay` filesystem resolves it: each name in the upper layer, then in
@@ -1070,7 +1152,15 @@ stops being a subreaper keeps those it adopted.
 the maps), from their records and what the host reports of their
 descriptors; `/proc/self/ns` names each namespace, its links followed by
 `stat` to the namespace itself (its number the inode, as nsfs shows it),
-and `/proc/self/fdinfo` describes each descriptor. A process's
+and `/proc/self/fdinfo` describes each descriptor. Opening a `/proc/<pid>/ns`
+link gives a namespace descriptor (`crates/kernel/src/nsfd.rs`), which
+names the namespace's record: it stats as that namespace, refuses a read
+or write as nsfs does, answers the `NS_GET_*` requests (the type; a pid or
+user namespace's parent, and an owner, when the caller can see it, as
+Linux decides; a user namespace's owner; a mount namespace's id), and is
+what `setns` joins, as `unshare` moves the process to a new namespace (a
+pid namespace for its children; a user namespace with every capability in
+it). A process's
 `oom_score_adj` is in its record, inherited by its children (going below
 the last value a privileged process set takes `CAP_SYS_RESOURCE`), and so
 are its user and group ids, which its files there are owned by.
@@ -1186,9 +1276,7 @@ of these are to be lifted for 1.0 and which are not planned.
   `F_SEAL_WRITE` succeeds although a writable shared mapping exists
   (Linux fails it with `EBUSY`), does not reach the descriptors another
   process holds, and gives the file a new inode number. A memfd reopened
-  through `/proc/self/fd` shares the original's offset. An `O_PATH |
-  O_NOFOLLOW` open of a link in `/proc` or `/sys` fails with `ELOOP`
-  (Linux gives a descriptor of the link). `tee` needs the process to hold
+  through `/proc/self/fd` shares the original's offset. `tee` needs the process to hold
   a write end of its input pipe (`EINVAL` otherwise). `splice` from a pipe
   takes only what it writes when the process holds a write end of that
   pipe; otherwise a write to a file or a waiting socket that a signal or an
@@ -1232,10 +1320,16 @@ of these are to be lifted for 1.0 and which are not planned.
 - **Mounts:** the filesystems mounted are tmpfs, `proc`, `sysfs`,
   `cgroup2`, `devpts`, `mqueue` and overlays, not one on a block device
   (ext4, XFS: `ENODEV`), so a loop device holds a file's bytes but no
-  filesystem to mount. Mounts do not propagate between namespaces, whatever their
-  propagation type; a remount of a filesystem acts on the one mount; a
-  tmpfs's `size=` is not enforced; a mount cannot be busy (`umount2`
-  always detaches). An overlay's layers must be host directories (not in
+  filesystem to mount. A detached mount or a filesystem context is the
+  process's (a fork child or an `execve` keeps those whose descriptors it
+  keeps), so one passed to another process over a socket is a plain
+  descriptor of its directory; `fspick` reconfigures the one mount, its
+  `ro`, `rw` and options; a remount of a filesystem acts on the one mount; a
+  tmpfs's `size=` is not enforced; a mount is not busy for a process fwe
+  did not start, nor for another process's working directory, nor for a
+  file another process opened at a host path two mounts share (a bind of
+  one directory, a lower layer two overlays have); setting an access time
+  the host left otherwise changes the file's change time too. An overlay's layers must be host directories (not in
   another overlay); a directory a lower layer has cannot be renamed
   (`EXDEV`, as with `redirect_dir=off`); a rename that leaves a whiteout
   behind, and a `bind` over one, are two host steps, between which another
@@ -1252,7 +1346,8 @@ of these are to be lifted for 1.0 and which are not planned.
   port is freed
   when the last descriptor of its socket in the binding process closes;
   capabilities are the process's, not qualified by user namespace;
-  `setns` is not implemented; a pid namespace's init killed from outside
+  the owning user namespace `NS_GET_USERNS` reports for a namespace of
+  another kind is the caller's; a pid namespace's init killed from outside
   fwe after its parent ran another program (`execve`) ends its namespace
   only once that parent reaps it or a reaper sees it gone; a reaper sees
   an adopted orphan's state after each signal it is sent, so a stop and a
@@ -1298,6 +1393,19 @@ of these are to be lifted for 1.0 and which are not planned.
   thread blocked it stays with the thread macOS parked it on, rather than
   acting when another thread unblocks it (one the guest catches is
   handed on), and in the VM a caught one is not handed on either.
+- **inotify:** a change made by a program fwe does not run raises no
+  event; `IN_DELETE_SELF` comes as the last link goes,
+  not as the last descriptor closes; a close raises its event once no
+  descriptor of the open file is left in the process, not in every
+  process, and one by `dup2` over a descriptor or `close_range` raises
+  none (an exit or `execve` does); an instance goes when the process that
+  made it closes it or ends, even if a child still holds a descriptor of
+  it; two processes raising events at once can leave an identical event
+  unmerged, or merge one with an event already read; a process that
+  started before any process watched anything notices the first watch
+  within a second.
+- **Working directory:** it follows a rename of its directory (or one
+  above it) by the process itself, not by another process.
 - **Event descriptors:** `EPOLLEXCLUSIVE` wakes every waiter; `timerfd`
   resolution and clock distinctions; `pselect6` does not write back the
   time left.
@@ -1318,9 +1426,8 @@ of these are to be lifted for 1.0 and which are not planned.
   `dup2` or `close_range` replaces or closes one.
 - **Not implemented:**
   - `ptrace`;
-  - `inotify` and `fanotify`;
+  - `fanotify`;
   - `kcmp`;
-  - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`);
   - `io_uring`, `userfaultfd` and `perf_event_open`;
   - `rseq` and `membarrier` (optional for libc);
   - `name_to_handle_at` and the AIO calls.

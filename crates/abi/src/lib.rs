@@ -398,6 +398,8 @@ pub mod statx_mask {
     pub const STATX_SIZE: u32 = 0x0200;
     pub const STATX_BLOCKS: u32 = 0x0400;
     pub const STATX_BASIC_STATS: u32 = 0x07ff;
+    pub const STATX_MNT_ID: u32 = 0x1000;
+    pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 }
 
 /// Clock identifiers (`linux/time.h`).
@@ -570,6 +572,105 @@ pub mod ioctl {
     pub const BLKROTATIONAL: u64 = 0x127e;
     pub const BLKZEROOUT: u64 = 0x127f;
     pub const BLKGETDISKSEQ: u64 = 0x8008_1280;
+}
+
+/// inotify (`linux/inotify.h`).
+pub mod inotify {
+    pub const IN_ACCESS: u32 = 0x0000_0001;
+    pub const IN_MODIFY: u32 = 0x0000_0002;
+    pub const IN_ATTRIB: u32 = 0x0000_0004;
+    pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+    pub const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+    pub const IN_OPEN: u32 = 0x0000_0020;
+    pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+    pub const IN_MOVED_TO: u32 = 0x0000_0080;
+    pub const IN_CREATE: u32 = 0x0000_0100;
+    pub const IN_DELETE: u32 = 0x0000_0200;
+    pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+    pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+    pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+    pub const IN_UNMOUNT: u32 = 0x0000_2000;
+    pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+    pub const IN_IGNORED: u32 = 0x0000_8000;
+    pub const IN_ONLYDIR: u32 = 0x0100_0000;
+    pub const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+    pub const IN_EXCL_UNLINK: u32 = 0x0400_0000;
+    pub const IN_MASK_CREATE: u32 = 0x1000_0000;
+    pub const IN_MASK_ADD: u32 = 0x2000_0000;
+    pub const IN_ISDIR: u32 = 0x4000_0000;
+    pub const IN_ONESHOT: u32 = 0x8000_0000;
+    /// `inotify_init1`'s flags: `O_NONBLOCK` and `O_CLOEXEC`.
+    pub const IN_NONBLOCK: u64 = 0o4000;
+    pub const IN_CLOEXEC: u64 = 0o2000000;
+    /// `struct inotify_event` without its name: `wd`, `mask`, `cookie`,
+    /// `len`.
+    pub const EVENT_SIZE: usize = 16;
+    /// The defaults of `fs.inotify.*`.
+    pub const MAX_QUEUED_EVENTS: i64 = 16384;
+    pub const MAX_USER_INSTANCES: i64 = 128;
+    pub const MAX_USER_WATCHES: i64 = 8192;
+}
+
+/// The new mount API (`linux/mount.h`): `fsopen`, `fsconfig`, `fsmount`,
+/// `fspick`, `open_tree`, `move_mount`, `mount_setattr`, `statmount` and
+/// `listmount`.
+pub mod mount_api {
+    pub const FSOPEN_CLOEXEC: u64 = 1;
+    pub const FSPICK_CLOEXEC: u64 = 1;
+    pub const FSPICK_SYMLINK_NOFOLLOW: u64 = 2;
+    pub const FSPICK_NO_AUTOMOUNT: u64 = 4;
+    pub const FSPICK_EMPTY_PATH: u64 = 8;
+    pub const FSCONFIG_SET_FLAG: u64 = 0;
+    pub const FSCONFIG_SET_STRING: u64 = 1;
+    pub const FSCONFIG_SET_BINARY: u64 = 2;
+    pub const FSCONFIG_SET_PATH: u64 = 3;
+    pub const FSCONFIG_SET_PATH_EMPTY: u64 = 4;
+    pub const FSCONFIG_SET_FD: u64 = 5;
+    pub const FSCONFIG_CMD_CREATE: u64 = 6;
+    pub const FSCONFIG_CMD_RECONFIGURE: u64 = 7;
+    pub const FSCONFIG_CMD_CREATE_EXCL: u64 = 8;
+    pub const FSMOUNT_CLOEXEC: u64 = 1;
+    pub const MOUNT_ATTR_RDONLY: u64 = 0x1;
+    pub const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    pub const MOUNT_ATTR_NODEV: u64 = 0x4;
+    pub const MOUNT_ATTR_NOEXEC: u64 = 0x8;
+    pub const MOUNT_ATTR__ATIME: u64 = 0x70;
+    pub const MOUNT_ATTR_RELATIME: u64 = 0x0;
+    pub const MOUNT_ATTR_NOATIME: u64 = 0x10;
+    pub const MOUNT_ATTR_STRICTATIME: u64 = 0x20;
+    pub const MOUNT_ATTR_NODIRATIME: u64 = 0x80;
+    pub const MOUNT_ATTR_IDMAP: u64 = 0x10_0000;
+    pub const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x20_0000;
+    pub const OPEN_TREE_CLONE: u64 = 1;
+    pub const OPEN_TREE_CLOEXEC: u64 = 0o2000000;
+    pub const AT_RECURSIVE: u64 = 0x8000;
+    pub const MOVE_MOUNT_F_SYMLINKS: u64 = 0x1;
+    pub const MOVE_MOUNT_F_AUTOMOUNTS: u64 = 0x2;
+    pub const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x4;
+    pub const MOVE_MOUNT_T_SYMLINKS: u64 = 0x10;
+    pub const MOVE_MOUNT_T_AUTOMOUNTS: u64 = 0x20;
+    pub const MOVE_MOUNT_T_EMPTY_PATH: u64 = 0x40;
+    pub const MOVE_MOUNT_SET_GROUP: u64 = 0x100;
+    pub const MOVE_MOUNT_BENEATH: u64 = 0x200;
+    pub const MOVE_MOUNT__MASK: u64 = 0x377;
+    /// `struct mount_attr`: `attr_set`, `attr_clr`, `propagation`,
+    /// `userns_fd` (32 bytes).
+    pub const MOUNT_ATTR_SIZE_VER0: u64 = 32;
+    pub const STATMOUNT_SB_BASIC: u64 = 0x1;
+    pub const STATMOUNT_MNT_BASIC: u64 = 0x2;
+    pub const STATMOUNT_PROPAGATE_FROM: u64 = 0x4;
+    pub const STATMOUNT_MNT_ROOT: u64 = 0x8;
+    pub const STATMOUNT_MNT_POINT: u64 = 0x10;
+    pub const STATMOUNT_FS_TYPE: u64 = 0x20;
+    pub const STATMOUNT_MNT_NS_ID: u64 = 0x40;
+    pub const STATMOUNT_MNT_OPTS: u64 = 0x80;
+    /// `struct statmount` without its strings.
+    pub const STATMOUNT_SIZE: usize = 512;
+    /// `struct mnt_id_req`: `size`, `spare`, `mnt_id`, `param`, then
+    /// (version 1) `mnt_ns_id`.
+    pub const MNT_ID_REQ_SIZE_VER0: u32 = 24;
+    pub const MNT_ID_REQ_SIZE_VER1: u32 = 32;
+    pub const LSMT_ROOT: u64 = u64::MAX;
 }
 
 /// POSIX message queues (`linux/mqueue.h`, `asm-generic/siginfo.h`).
@@ -1201,6 +1302,9 @@ pub mod statfs {
     pub const ST_NOATIME: i64 = 1024;
     pub const ST_NODIRATIME: i64 = 2048;
     pub const ST_RELATIME: i64 = 4096;
+    pub const ST_NOSYMFOLLOW: i64 = 0x2000;
+    /// Set in every `f_flags`: they are filled in.
+    pub const ST_VALID: i64 = 0x0020;
     /// `msync` flags.
     pub const MS_ASYNC: u64 = 1;
     pub const MS_INVALIDATE: u64 = 2;

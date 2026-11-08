@@ -44,6 +44,12 @@ fn tmpfs_dir(mode: u32) -> Result<Vec<u8>, i32> {
     Ok(dir)
 }
 
+/// The access-time flag a new mount (or a remount) with `flags` gets if
+/// it names none: `relatime`, Linux's default.
+pub(crate) fn default_atime(flags: u64) -> u64 {
+    if flags & (ms::NOATIME | ms::STRICTATIME) == 0 { ms::RELATIME } else { 0 }
+}
+
 /// The `mode=` a filesystem's options give (octal), if any.
 fn mode_option(data: &[u8]) -> Option<u32> {
     data.split(|&b| b == b',')
@@ -57,12 +63,27 @@ impl<P: Platform> Kernel<P> {
     /// program's file, `/proc/self/fd/N` the open file's). Fails with
     /// `EINVAL` for one fwe cannot place.
     fn mount_path(&self, path: &[u8], follow: bool) -> Result<(Vec<u8>, bool), i32> {
-        if let Some(entry) = self.fs().synthetic(fwe_abi::fcntl::AT_FDCWD as i32, path) {
+        self.mount_path_at(fwe_abi::fcntl::AT_FDCWD as i32, path, follow)
+    }
+
+    /// [`mount_path`](Self::mount_path) of `path` from directory `dirfd`.
+    pub(crate) fn mount_path_at(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<(Vec<u8>, bool), i32> {
+        if let Some(entry) = self.fs().synthetic(dirfd, path) {
             use crate::procfs::Entry;
             return match entry {
                 Entry::Missing => Err(errno::ENOENT),
                 Entry::Symlink(target) if follow && target.starts_with(b"/") => {
                     self.mount_path(&target, true)
+                }
+                // A descriptor of a link (not mounted on: Linux follows no
+                // magic link to a link).
+                Entry::Fd { fd, .. } if follow && crate::fdmarks::proc_link(fd).is_some() => {
+                    Err(errno::ENOENT)
                 }
                 Entry::Fd { fd, .. } if follow => {
                     // The file itself, where it was opened.
@@ -77,16 +98,16 @@ impl<P: Platform> Kernel<P> {
                     Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
                 }
                 Entry::Dir => {
-                    let absolute = crate::fs::normalize(self.fs().cwd(), path);
+                    let absolute = self.fs().absolute_path(dirfd, path).ok_or(errno::EBADF)?;
                     Ok((self.fs().to_ns(&absolute), true))
                 }
                 _ => {
-                    let absolute = crate::fs::normalize(self.fs().cwd(), path);
+                    let absolute = self.fs().absolute_path(dirfd, path).ok_or(errno::EBADF)?;
                     Ok((self.fs().to_ns(&absolute), false))
                 }
             };
         }
-        let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, path, follow)?;
+        let r = self.fs().resolve(dirfd, path, follow)?;
         let name = r.name_c()?;
         // It must exist.
         // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
@@ -105,6 +126,36 @@ impl<P: Platform> Kernel<P> {
         }
         let ns = r.ns_path.ok_or(errno::EINVAL)?;
         Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
+    }
+
+    /// A new filesystem of `kind` with options `data`: where it is, the
+    /// path inside it a mount shows, and the mount flags it imposes (an
+    /// overlay with nothing to write to is read-only, as on Linux).
+    pub(crate) fn new_filesystem(
+        &self,
+        kind: FsType,
+        data: &[u8],
+    ) -> Result<(Source, Vec<u8>, u64), i32> {
+        let mut root = b"/".to_vec();
+        let mut flags = 0;
+        let src = match kind {
+            FsType::Tmpfs => Source::Host(tmpfs_dir(mode_option(data).unwrap_or(0o1777))?),
+            FsType::Cgroup2 => {
+                // The hierarchy from the cgroup namespace's root.
+                let dir = crate::cgroupfs::tree_dir()?;
+                root = self.fs().ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
+                Source::Host(dir)
+            }
+            FsType::Overlay => {
+                let layers = self.overlay_layers(data)?;
+                if layers.upper.is_none() {
+                    flags |= ms::RDONLY;
+                }
+                Source::Overlay(std::sync::Arc::new(layers))
+            }
+            _ => Source::Synthetic,
+        };
+        Ok((src, root, flags))
     }
 
     /// The host file `path` resolves to when it is one fwe serves from the
@@ -187,6 +238,7 @@ impl<P: Platform> Kernel<P> {
             if p == 0 { Ok(Vec::new()) } else { uaccess::read_cstr(p, uaccess::PATH_MAX) }
         };
         let source = guest!(read_opt(source));
+        let fstype_ptr = fstype;
         let fstype = guest!(read_opt(fstype));
         // `data` is a page of options, a string for the filesystems fwe has.
         let data = guest!(read_opt(data));
@@ -197,15 +249,23 @@ impl<P: Platform> Kernel<P> {
         let ns = self.fs().mount_ns().clone();
         let r = if flags & ms::REMOUNT != 0 {
             let opts = (!data.is_empty() && flags & ms::BIND == 0).then(|| data.clone());
+            // With no access-time mode named the mount keeps its own.
+            let named = flags & (ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME);
+            let flags = if named == 0 { flags } else { flags | default_atime(flags) };
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0 {
-            match self.mount_path(&source, true) {
+            // A file fwe serves from the host outside any mount (the
+            // standard device nodes): that host file.
+            let device = self.fs().device_host(&source);
+            let from = match device {
+                Some(_) => Err(errno::EINVAL),
+                None => self.mount_path(&source, true),
+            };
+            match from {
                 Ok((from, _)) => {
                     ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0, 0).map(|_| ()))
                 }
-                // A file fwe serves from the host outside any mount (the
-                // standard device nodes): that host file.
-                Err(errno::EINVAL) => match self.host_source(&source) {
+                Err(errno::EINVAL) => match device.or_else(|| self.host_source(&source)) {
                     Some(host) => ns.update(|t| {
                         t.mount(
                             &point,
@@ -238,40 +298,18 @@ impl<P: Platform> Kernel<P> {
             if !is_dir {
                 return err(errno::ENOTDIR);
             }
+            // A new mount names its filesystem's type.
+            if fstype_ptr == 0 {
+                return err(errno::EINVAL);
+            }
             // `cgroup` names the v2 hierarchy when that is the one there is.
             let name: &[u8] = if fstype == b"cgroup" { b"cgroup2" } else { &fstype };
             let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
-            let mut root = b"/".to_vec();
-            let src = match kind {
-                FsType::Tmpfs => match tmpfs_dir(mode_option(&data).unwrap_or(0o1777)) {
-                    Ok(dir) => Source::Host(dir),
-                    Err(e) => return err(e),
-                },
-                FsType::Cgroup2 => match crate::cgroupfs::tree_dir() {
-                    // The hierarchy from the cgroup namespace's root.
-                    Ok(dir) => {
-                        root = self
-                            .fs()
-                            .ns
-                            .cgroup
-                            .as_ref()
-                            .map_or(b"/".to_vec(), |c| c.get().root.clone());
-                        Source::Host(dir)
-                    }
-                    Err(e) => return err(e),
-                },
-                FsType::Overlay => match self.overlay_layers(&data) {
-                    Ok(layers) => {
-                        if layers.upper.is_none() {
-                            // Nothing to write to: read-only, as on Linux.
-                            flags |= ms::RDONLY;
-                        }
-                        Source::Overlay(std::sync::Arc::new(layers))
-                    }
-                    Err(e) => return err(e),
-                },
-                _ => Source::Synthetic,
+            let (src, root, more) = match self.new_filesystem(kind, &data) {
+                Ok(v) => v,
+                Err(e) => return err(e),
             };
+            flags |= more | default_atime(flags);
             let device = if source.is_empty() { kind.name().as_bytes().to_vec() } else { source };
             ns.update(|t| {
                 t.mount(&point, kind, src, root, flags, device, data);
@@ -284,8 +322,10 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// `umount2(target, flags)`. A mount is always detached at once
-    /// (`MNT_DETACH`): fwe does not track what keeps it busy.
+    /// `umount2(target, flags)`: a mount in use is refused (`EBUSY`, see
+    /// [`Self::mount_busy`]) unless detached (`MNT_DETACH`) or forced; with
+    /// `MNT_EXPIRE` an unused one is first marked (`EAGAIN`), and unmounted
+    /// by the next such call if nothing used it in between.
     pub(crate) fn sys_umount2(&mut self, target: u64, flags: u64) -> i64 {
         if !self.creds.has_admin() {
             return err(errno::EPERM);
@@ -296,14 +336,120 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let target = guest!(uaccess::read_cstr(target, uaccess::PATH_MAX));
-        let (point, _) = match self.mount_path(&target, flags & UMOUNT_NOFOLLOW == 0) {
+        crate::fs::UNMOUNTING.with(|u| u.set(true));
+        let found = self.mount_path(&target, flags & UMOUNT_NOFOLLOW == 0);
+        crate::fs::UNMOUNTING.with(|u| u.set(false));
+        let (point, _) = match found {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        match self.fs().mount_ns().clone().update(|t| t.umount(&point)) {
-            Ok(()) => 0,
+        let ns = self.fs().mount_ns().clone();
+        let table = ns.table();
+        let (m, rest) = table.locate(&point);
+        if !rest.is_empty() || m.parent == m.id {
+            return err(errno::EINVAL);
+        }
+        let id = m.id;
+        if flags & MNT_EXPIRE != 0 {
+            // Not the caller's root; not in use; marked by a first call,
+            // unmounted by a second if nothing used it in between.
+            if point == self.fs().proc_root() {
+                return err(errno::EINVAL);
+            }
+            if self.mount_busy(&table, id) {
+                return err(errno::EBUSY);
+            }
+            if !table.expiring.contains(&id) {
+                let _ = ns.update(|t| {
+                    t.expiring.push(id);
+                    Ok(())
+                });
+                return err(errno::EAGAIN);
+            }
+        } else if flags & MNT_DETACH == 0 && self.mount_busy(&table, id) {
+            return err(errno::EBUSY);
+        }
+        match ns.update(|t| {
+            t.expiring.retain(|i| *i != id);
+            t.umount(&point)
+        }) {
+            Ok(()) => {
+                crate::inotify::unmounted(&point);
+                0
+            }
             Err(e) => err(e),
         }
+    }
+
+    /// Whether mount `id` is in use, as Linux refuses to unmount one that
+    /// is (`EBUSY`): something is mounted under it, the caller's working
+    /// directory or root is in it, or a file opened through it is open in
+    /// this process or, as far as the host can tell, another fwe process
+    /// of the namespace.
+    fn mount_busy(&self, table: &crate::mounts::Table, id: u32) -> bool {
+        use crate::mounts::under;
+        let Some(m) = table.get(id) else { return false };
+        if table.mounts.iter().any(|c| c.parent == id && c.id != id) {
+            return true;
+        }
+        let fs = self.fs();
+        let cwd_in = match fs.cwd_mount().filter(|c| table.get(*c).is_some()) {
+            Some(c) => c == id,
+            None => under(&fs.to_ns(fs.cwd()), &m.point).is_some(),
+        };
+        let root_in = match fs.root_mount().filter(|r| table.get(*r).is_some()) {
+            Some(r) => r == id,
+            None => fs.proc_root() != b"/" && under(fs.proc_root(), &m.point).is_some(),
+        };
+        if cwd_in || root_in {
+            return true;
+        }
+        // A file opened through it here.
+        if crate::fdmarks::open_in(id) {
+            return true;
+        }
+        // One open in another fwe process of the namespace, by where it is
+        // on the host: in this mount's files and in no other mount's as
+        // deeply (a path two mounts share, as a bind of one directory or a
+        // lower layer two overlays have, could be either's).
+        let canonical = |r: &[u8]| -> Vec<u8> {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            std::fs::canonicalize(std::ffi::OsStr::from_bytes(r))
+                .map_or_else(|_| r.to_vec(), |p| p.into_os_string().into_vec())
+        };
+        let roots_of = |m: &crate::mounts::Mount| -> Vec<Vec<u8>> {
+            let roots: Vec<Vec<u8>> = match &m.source {
+                Source::Host(_) => m.host_path(b"").into_iter().collect(),
+                Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
+                Source::Synthetic => Vec::new(),
+            };
+            roots.iter().map(|r| canonical(r)).collect()
+        };
+        let roots = roots_of(m);
+        if roots.is_empty() {
+            return false;
+        }
+        let others: Vec<Vec<u8>> =
+            table.mounts.iter().filter(|o| o.id != id).flat_map(roots_of).collect();
+        let deepest = |path: &[u8], roots: &[Vec<u8>]| {
+            roots.iter().filter(|r| under(path, r).is_some()).map(Vec::len).max()
+        };
+        let ours = |path: &[u8]| match deepest(path, &roots) {
+            Some(d) => deepest(path, &others).is_none_or(|o| o < d),
+            None => false,
+        };
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let ns = fs.mount_ns().dir().to_vec();
+        crate::procreg::all()
+            .into_iter()
+            .filter(|(p, r)| *p != me && r.ns.first().is_none_or(|d| *d == ns))
+            .any(|(p, _)| {
+                crate::procpid::fds(p).into_iter().any(|(_, t)| match t {
+                    crate::procpid::FdTarget::Path(path) => ours(&path),
+                    _ => false,
+                })
+            })
     }
 
     /// `pivot_root(new_root, put_old)`: the mount at `new_root` becomes the
@@ -327,34 +473,46 @@ impl<P: Platform> Kernel<P> {
         if !new_dir || !old_dir {
             return err(errno::ENOTDIR);
         }
-        // Only a process whose root is the namespace's can pivot it.
-        if self.fs().proc_root() != b"/" {
-            return err(errno::EINVAL);
-        }
+        // The mount at the caller's root (which must be one's root) is the
+        // one replaced: the namespace's, or a chroot's.
+        let root = self.fs().proc_root().to_vec();
         let cwd_ns = self.fs().to_ns(self.fs().cwd());
         let ns = self.fs().mount_ns().clone();
-        let old_point = match ns.update(|t| t.pivot_root(&new_ns, &old_ns)) {
+        let new_put = match ns.update(|t| t.pivot_root(&root, &new_ns, &old_ns)) {
             Ok(p) => p,
             Err(e) => return err(e),
         };
-        // A working directory at the old root moves to the new one, as
-        // Linux moves it.
-        let cwd = match crate::mounts::under(&cwd_ns, &new_ns) {
-            Some(rest) => crate::mounts::join(b"/", rest),
-            None if cwd_ns == b"/" => b"/".to_vec(),
-            None => crate::mounts::join(&old_point, &cwd_ns),
+        // A working directory at the root stays there (the new root now);
+        // one in the new root's tree, or in the old one's, moves with it,
+        // as Linux has it.
+        use crate::mounts::{join, under};
+        let cwd_ns = if cwd_ns == root {
+            cwd_ns
+        } else if let Some(rest) = under(&cwd_ns, &new_ns) {
+            join(&root, rest)
+        } else if let Some(rest) = under(&cwd_ns, &root) {
+            join(&new_put, rest)
+        } else {
+            cwd_ns
         };
         let fs = self.fs.as_mut().expect("filesystem configured");
-        fs.set_root(b"/".to_vec(), cwd);
+        let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
+        let root_mount = fs.mounts().locate(&root).0.id;
+        fs.set_root(root, cwd);
+        fs.set_mounts(root_mount, 0);
         0
     }
 
     /// `chroot(path)`.
     pub(crate) fn sys_chroot(&mut self, path: u64) -> i64 {
-        if !self.creds.has_chroot() {
-            return err(errno::EPERM);
-        }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if !self.creds.has_chroot() {
+            // Linux looks the directory up, and checks it may be entered,
+            // before the privilege.
+            const X_OK: u64 = 1;
+            let r = self.access_path(fwe_abi::fcntl::AT_FDCWD as i32, &path, X_OK, true, true);
+            return if r < 0 { r } else { err(errno::EPERM) };
+        }
         let (ns, is_dir) = match self.mount_path(&path, true) {
             Ok(v) => v,
             Err(e) => return err(e),
@@ -369,7 +527,10 @@ impl<P: Platform> Kernel<P> {
         let cwd = crate::mounts::under(&cwd_ns, &ns)
             .map(|r| crate::mounts::join(b"/", r))
             .unwrap_or_else(|| b"/".to_vec());
+        let root_mount = fs.mounts().locate(&ns).0.id;
+        let cwd_mount = fs.cwd_mount().unwrap_or(0);
         fs.set_root(ns, cwd);
+        fs.set_mounts(root_mount, cwd_mount);
         0
     }
 }

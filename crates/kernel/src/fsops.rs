@@ -101,6 +101,16 @@ fn statx_of(s: &Stat) -> Statx {
     }
 }
 
+/// A namespace, as nsfs shows one: its number is the inode, on nsfs's
+/// device.
+fn ns_stat(ino: u64) -> Stat {
+    let mut s = synth_stat(fwe_abi::stat::S_IFREG | 0o444, 0);
+    s.st_ino = ino;
+    let (major, minor) = crate::nsfd::NSFS_DEV;
+    s.st_dev = crate::devnodes::makedev(major, minor);
+    s
+}
+
 /// The number of the namespace a `/proc/<pid>/ns` link's target names
 /// (`pid:[4026531836]`), if it is one.
 fn namespace_inode(target: &[u8]) -> Option<u64> {
@@ -121,11 +131,11 @@ fn pts_number(path: &[u8]) -> Option<u32> {
     std::str::from_utf8(rest).ok()?.parse().ok()
 }
 
-fn major(dev: u64) -> u32 {
+pub(crate) fn major(dev: u64) -> u32 {
     (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff)) as u32
 }
 
-fn minor(dev: u64) -> u32 {
+pub(crate) fn minor(dev: u64) -> u32 {
     (((dev >> 12) & 0xffff_ff00) | (dev & 0xff)) as u32
 }
 
@@ -202,11 +212,29 @@ impl<P: Platform> Kernel<P> {
         let r = self.open_path(dirfd, path, flags, mode);
         crate::fs::drop_fifo();
         // An `O_PATH` descriptor, whatever kind of file it names (one of
-        // `/proc` or `/sys` too), is open for nothing but naming it.
-        if r >= 0 && flags & fcntl::O_PATH != 0 {
+        // `/proc` or `/sys` too), is open for nothing but naming it (one of
+        // a `/proc` link is marked as that already).
+        if r >= 0 && flags & fcntl::O_PATH != 0 && crate::fdmarks::proc_link(r as i32).is_none() {
             crate::fdmarks::mark(r as i32, crate::fdmarks::Mark::Path);
         }
         r
+    }
+
+    /// Open the namespace `/proc/<pid>/ns/<kind>` (`path` from `dirfd`)
+    /// names, its link reading `link`.
+    fn open_ns_path(&mut self, dirfd: i32, path: &[u8], link: &[u8], flags: u64) -> i64 {
+        let Some((who, sub)) = self.fs().proc_target(dirfd, path) else {
+            return err(errno::ENOENT);
+        };
+        let Some(name) = sub.strip_prefix(b"/ns/") else { return err(errno::ENOENT) };
+        let dirs = match who {
+            None => self.fs().ns_dirs(),
+            Some(host) => match host.and_then(crate::procreg::read) {
+                Some(rec) => rec.ns,
+                None => return err(errno::ENOENT),
+            },
+        };
+        self.open_ns(name, &dirs, link, flags)
     }
 
     /// `openat` of `path`, read from the guest.
@@ -265,9 +293,15 @@ impl<P: Platform> Kernel<P> {
                 crate::procfs::Entry::File(content) => {
                     self.synthetic_fd(anon_fd(&content, flags), dirfd as i32, &path)
                 }
+                crate::procfs::Entry::Symlink(target) if namespace_inode(&target).is_some() => {
+                    if flags & fcntl::O_NOFOLLOW != 0 {
+                        return self.open_proc_link(dirfd as i32, &path, flags);
+                    }
+                    self.open_ns_path(dirfd as i32, &path, &target, flags)
+                }
                 crate::procfs::Entry::Symlink(target) => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
-                        return err(errno::ELOOP);
+                        return self.open_proc_link(dirfd as i32, &path, flags);
                     }
                     // Follow the link, from the directory it is in.
                     let target = self.fs().link_target(dirfd as i32, &path, &target);
@@ -275,7 +309,11 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::procfs::Entry::Fd { fd, target } => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
-                        return err(errno::ELOOP);
+                        return self.open_proc_link(dirfd as i32, &path, flags);
+                    }
+                    // A descriptor of a link: followed, a link again.
+                    if crate::fdmarks::proc_link(fd).is_some() {
+                        return self.open_proc_link(dirfd as i32, &path, flags);
                     }
                     if crate::fs::has_path(fd, &target) {
                         // Reopen the file, as Linux does: the same one, in
@@ -524,6 +562,12 @@ impl<P: Platform> Kernel<P> {
                 crate::devnodes::linux_numbers_of_host(&st)
             };
             if let Some(n) = node {
+                // Not through a mount that has no devices.
+                if resolved.mount_flags & crate::mounts::ms::NODEV != 0 {
+                    // SAFETY: closing the node's own descriptor.
+                    unsafe { libc::close(fd) };
+                    return err(errno::EACCES);
+                }
                 let device = open_device(fd, n, flags, crate::devnodes::marked(&st));
                 // A device fwe makes of its node keeps the node's
                 // descriptor; another has the host's device opened for it.
@@ -540,6 +584,7 @@ impl<P: Platform> Kernel<P> {
                         crate::fdmarks::opened(
                             device as i32,
                             ns,
+                            resolved.mount_id,
                             resolved.mount_flags,
                             resolved.fstype,
                             None,
@@ -555,7 +600,14 @@ impl<P: Platform> Kernel<P> {
         let layers = resolved.ovl.as_ref().map(|o| o.layers.clone());
         if resolved.ns_path.is_some() || layers.is_some() || stand_in {
             let ns = resolved.ns_path.clone().unwrap_or_default();
-            crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype, layers);
+            crate::fdmarks::opened(
+                fd,
+                ns,
+                resolved.mount_id,
+                resolved.mount_flags,
+                resolved.fstype,
+                layers,
+            );
         }
         if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
             crate::fdmarks::set_stand_in(fd, host);
@@ -577,16 +629,24 @@ impl<P: Platform> Kernel<P> {
             path = b".".to_vec();
         }
         let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-        if self.fs().synthetic(dirfd as i32, &path).is_some() {
-            return self.access_synthetic(
-                dirfd as i32,
-                &path,
-                mode,
-                follow,
-                flags & fcntl::AT_EACCESS != 0,
-            );
+        self.access_path(dirfd as i32, &path, mode, follow, flags & fcntl::AT_EACCESS != 0)
+    }
+
+    /// Whether `path` (from `dirfd`; followed if `follow`) allows the access
+    /// `mode` asks (`R_OK`, `W_OK`, `X_OK`): 0, or the error, as `faccessat`
+    /// (with `eaccess`, `AT_EACCESS`) reports it.
+    pub(crate) fn access_path(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        mode: u64,
+        follow: bool,
+        eaccess: bool,
+    ) -> i64 {
+        if self.fs().synthetic(dirfd, path).is_some() {
+            return self.access_synthetic(dirfd, path, mode, follow, eaccess);
         }
-        let r = match self.fs().resolve(dirfd as i32, &path, follow) {
+        let r = match self.fs().resolve(dirfd, path, follow) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -760,6 +820,40 @@ impl<P: Platform> Kernel<P> {
     /// `fstatfs(fd, buf)`.
     pub(crate) fn sys_fstatfs(&mut self, fd: u64, buf: u64) -> i64 {
         let fd = fd as i32;
+        // A pipe's or socket's filesystem is the kernel's own (pipefs,
+        // sockfs), which the host does not report.
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } == 0 {
+            const PIPEFS_MAGIC: i64 = 0x5049_5045;
+            const SOCKFS_MAGIC: i64 = 0x534f_434b;
+            const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
+            // An eventfd, timerfd, signalfd or the like is an anonymous
+            // inode, whatever stands in for it on the host.
+            let anon = crate::specialfd::anon_name(fd).is_some()
+                || crate::signalfd::is_signalfd(fd)
+                || crate::bpf::prog_of(fd).is_some();
+            let magic = match st.st_mode & libc::S_IFMT {
+                _ if anon => Some(ANON_INODE_FS_MAGIC),
+                libc::S_IFIFO if crate::fs::fd_path(fd).is_none() => Some(PIPEFS_MAGIC),
+                libc::S_IFSOCK => Some(SOCKFS_MAGIC),
+                _ => None,
+            };
+            if let Some(f_type) = magic {
+                let page = 4096;
+                let out = fwe_abi::Statfs {
+                    f_type,
+                    f_bsize: page,
+                    f_namelen: 255,
+                    f_frsize: page,
+                    f_flags: fwe_abi::statfs::ST_VALID,
+                    ..Default::default()
+                };
+                guest!(uaccess::write(buf, out));
+                return 0;
+            }
+        }
         if let Some(o) = crate::fdmarks::origin(fd) {
             return statfs_fd(fd, buf, Some((o.fstype, o.flags)));
         }
@@ -772,6 +866,17 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_newfstatat(&mut self, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
+        // The flags Linux's `vfs_statx` takes; any other is refused.
+        const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+        if flags
+            & !(fcntl::AT_SYMLINK_NOFOLLOW
+                | fcntl::AT_NO_AUTOMOUNT
+                | fcntl::AT_EMPTY_PATH
+                | AT_STATX_SYNC_TYPE)
+            != 0
+        {
+            return err(errno::EINVAL);
+        }
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
             return self.sys_fstat(dirfd, buf);
@@ -799,12 +904,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                 Entry::Symlink(t) if follow => {
                     if let Some(ino) = namespace_inode(&t) {
-                        // A namespace, as nsfs shows one: its number is
-                        // the inode, on nsfs's device.
-                        let mut s = synth_stat(st::S_IFREG | 0o444, 0);
-                        s.st_ino = ino;
-                        s.st_dev = crate::devnodes::makedev(0, 4);
-                        return Ok(s);
+                        return Ok(ns_stat(ino));
                     }
                     if depth >= 40 {
                         return Err(errno::ELOOP);
@@ -836,7 +936,49 @@ impl<P: Platform> Kernel<P> {
         Ok(as_node(stat_to_linux(&s), node))
     }
 
+    /// `open` with `O_NOFOLLOW` of the link of fwe's `/proc` at `path`:
+    /// with `O_PATH`, a stand-in descriptor that names the link
+    /// ([`crate::fdmarks::Mark::ProcLink`]); else `ELOOP`, as for any link.
+    fn open_proc_link(&self, dirfd: i32, path: &[u8], flags: u64) -> i64 {
+        if flags & fcntl::O_PATH == 0 {
+            return err(errno::ELOOP);
+        }
+        let Some(absolute) = self.fs().absolute_path(dirfd, path) else {
+            return err(errno::ENOENT);
+        };
+        let ns = self.fs().to_ns(&absolute);
+        let (m, _) = self.fs().mount_of(&absolute);
+        let cloexec = if flags & fcntl::O_CLOEXEC != 0 { libc::O_CLOEXEC } else { 0 };
+        // SAFETY: a constant NUL-terminated path.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | cloexec) };
+        if fd < 0 {
+            return last_error();
+        }
+        crate::fdmarks::opened(fd, ns, m.id, m.flags, m.fstype, None);
+        crate::fdmarks::mark(fd, crate::fdmarks::Mark::ProcLink);
+        fd as i64
+    }
+
+    /// The guest path of the `/proc` link `fd` names, if it is a descriptor
+    /// of one ([`Self::open_proc_link`]).
+    fn proc_link_path(&self, fd: i32) -> Option<Vec<u8>> {
+        crate::fdmarks::proc_link(fd).and_then(|ns| self.fs().from_ns(&ns))
+    }
+
     pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
+        if let Some(link) = self.proc_link_path(fd as i32) {
+            return match self.linux_stat(fcntl::AT_FDCWD as i32, &link, false, 0) {
+                Ok(st) => {
+                    guest!(uaccess::write(buf, st));
+                    0
+                }
+                Err(e) => err(e),
+            };
+        }
+        if let Some(n) = crate::nsfd::of(fd as i32) {
+            guest!(uaccess::write(buf, ns_stat(n.id)));
+            return 0;
+        }
         if crate::synthdir::fstat_is_dir(fd as i32) {
             use fwe_abi::stat as st;
             guest!(uaccess::write(buf, synth_stat(st::S_IFDIR | 0o555, 0)));
@@ -862,15 +1004,54 @@ impl<P: Platform> Kernel<P> {
         dirfd: u64,
         path: u64,
         flags: u64,
-        _mask: u64,
+        mask: u64,
         buf: u64,
     ) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        let (host, node) = if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
+        // Linux's checks of the request: the reserved mask bit, both sync
+        // types at once, an unknown flag.
+        const STATX_RESERVED: u64 = 0x8000_0000;
+        const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+        let known = fcntl::AT_SYMLINK_NOFOLLOW
+            | fcntl::AT_NO_AUTOMOUNT
+            | fcntl::AT_EMPTY_PATH
+            | AT_STATX_SYNC_TYPE;
+        if mask & STATX_RESERVED != 0
+            || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+            || flags & !known != 0
+        {
+            return err(errno::EINVAL);
+        }
+        let empty = path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0;
+        let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
+        // The mount it is in, if asked for: its id, or its unique id, as
+        // Linux reports one or the other.
+        use fwe_abi::statx_mask::{STATX_MNT_ID, STATX_MNT_ID_UNIQUE};
+        let wants_mount = mask as u32 & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE) != 0;
+        let mount =
+            wants_mount.then(|| self.statx_mount(dirfd as i32, &path, empty, follow)).flatten();
+        let with_mount = |mut x: Statx| {
+            if let Some(m) = &mount {
+                if mask as u32 & STATX_MNT_ID_UNIQUE != 0 {
+                    x.stx_mnt_id = m.unique_id();
+                    x.stx_mask |= STATX_MNT_ID_UNIQUE;
+                } else {
+                    x.stx_mnt_id = u64::from(m.id);
+                    x.stx_mask |= STATX_MNT_ID;
+                }
+            }
+            x
+        };
+        if empty && let Some(n) = crate::nsfd::of(dirfd as i32) {
+            guest!(uaccess::write(buf, with_mount(statx_of(&ns_stat(n.id)))));
+            return 0;
+        }
+        let (host, node) = if empty {
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {
                 use fwe_abi::stat as st;
-                guest!(uaccess::write(buf, statx_of(&synth_stat(st::S_IFDIR | 0o555, 0))));
+                let x = with_mount(statx_of(&synth_stat(st::S_IFDIR | 0o555, 0)));
+                guest!(uaccess::write(buf, x));
                 return 0;
             }
             let out = match stat_fd(dirfd as i32) {
@@ -882,10 +1063,9 @@ impl<P: Platform> Kernel<P> {
                 .flatten();
             (out, node)
         } else {
-            let follow = flags & fcntl::AT_SYMLINK_NOFOLLOW == 0;
             return match self.linux_stat(dirfd as i32, &path, follow, 0) {
                 Ok(st) => {
-                    guest!(uaccess::write(buf, statx_of(&st)));
+                    guest!(uaccess::write(buf, with_mount(statx_of(&st))));
                     0
                 }
                 Err(e) => err(e),
@@ -902,12 +1082,49 @@ impl<P: Platform> Kernel<P> {
             x.stx_rdev_minor = n.minor;
             x.stx_size = 0;
         }
-        guest!(uaccess::write(buf, x));
+        guest!(uaccess::write(buf, with_mount(x)));
         0
+    }
+
+    /// The mount `path` from `dirfd` (or with `empty`, the file `dirfd` is
+    /// open on) is in, if fwe can place it.
+    fn statx_mount(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        empty: bool,
+        follow: bool,
+    ) -> Option<crate::mounts::Mount> {
+        let fs = self.fs();
+        let table = fs.mount_ns().table();
+        // A path's own mount: the one at it, for a mount point.
+        let ns = if empty {
+            fs.fd_ns_path(dirfd)?
+        } else if let Some(ns) = fs.resolve(dirfd, path, follow).ok().and_then(|r| r.ns_path) {
+            ns
+        } else {
+            fs.to_ns(&fs.absolute_path(dirfd, path)?)
+        };
+        Some(table.locate(&ns).0.clone())
     }
 
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        if path.is_empty()
+            && let Some(link) = self.proc_link_path(dirfd as i32)
+        {
+            // A link of fwe's `/proc`: what it says now.
+            return match self.fs().synthetic(fcntl::AT_FDCWD as i32, &link) {
+                Some(
+                    crate::procfs::Entry::Symlink(target) | crate::procfs::Entry::Fd { target, .. },
+                ) => {
+                    let n = target.len().min(size as usize);
+                    guest!(uaccess::write_from(buf, &target[..n]));
+                    n as i64
+                }
+                _ => err(errno::ENOENT),
+            };
+        }
         if path.is_empty() {
             // The symbolic link an O_PATH | O_NOFOLLOW descriptor names (a
             // stand-in); any other descriptor has no link to read.
@@ -1246,8 +1463,44 @@ impl<P: Platform> Kernel<P> {
         newpath: u64,
         flags: u64,
     ) -> i64 {
-        let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
-        let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
+        let old = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
+        let new = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
+        // Where both are in the namespace's view, their directories'
+        // links followed: the working directory is kept so too.
+        let place = |dirfd: u64, p: &[u8]| self.fs().resolve(dirfd as i32, p, false).ok()?.ns_path;
+        let from = place(olddirfd, &old);
+        let to = place(newdirfd, &new);
+        let r = self.rename_paths(olddirfd, old, newdirfd, new, flags);
+        // The working directory is a directory, wherever it moves: one
+        // renamed with it is where it went (`RENAME_EXCHANGE`: each where
+        // the other was).
+        if r == 0
+            && let (Some(from), Some(to)) = (from, to)
+        {
+            let cwd = self.fs().to_ns(self.fs().cwd());
+            let moved = |a: &[u8], b: &[u8]| {
+                crate::mounts::under(&cwd, a).map(|rest| crate::mounts::join(b, rest))
+            };
+            let now = moved(&from, &to)
+                .or_else(|| (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten());
+            if let Some(now) = now.and_then(|ns| self.fs().from_ns(&ns)) {
+                let fs = self.fs.as_mut().expect("filesystem configured");
+                let root = fs.proc_root().to_vec();
+                fs.set_root(root, now);
+            }
+        }
+        r
+    }
+
+    /// [`sys_renameat2`](Self::sys_renameat2) of paths read.
+    fn rename_paths(
+        &mut self,
+        olddirfd: u64,
+        oldpath: Vec<u8>,
+        newdirfd: u64,
+        newpath: Vec<u8>,
+        flags: u64,
+    ) -> i64 {
         let how = match rename_mode(flags) {
             Ok(how) => how,
             Err(e) => return err(e),
@@ -1599,7 +1852,7 @@ impl<P: Platform> Kernel<P> {
         {
             let ns = self.fs().to_ns(&absolute);
             let (m, _) = self.fs().mount_of(&absolute);
-            crate::fdmarks::opened(fd as i32, ns, m.flags, m.fstype, None);
+            crate::fdmarks::opened(fd as i32, ns, m.id, m.flags, m.fstype, None);
         }
         fd
     }
@@ -2061,7 +2314,7 @@ impl<P: Platform> Kernel<P> {
             }
             libc::fcntl(fd, libc::F_SETFD, fd_flags);
         }
-        crate::fdmarks::opened(fd, o.ns_path, o.flags, o.fstype, o.ovl);
+        crate::fdmarks::opened(fd, o.ns_path, o.mount, o.flags, o.fstype, o.ovl);
         if dir {
             crate::overlay::moved(fd);
         }
@@ -2262,7 +2515,7 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
         use crate::mounts::ms;
         use fwe_abi::statfs::*;
         out.f_type = fstype.magic();
-        let mut f = 0;
+        let mut f = ST_VALID;
         for (m, st) in [
             (ms::RDONLY, ST_RDONLY),
             (ms::NOSUID, ST_NOSUID),
@@ -2271,6 +2524,7 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
             (ms::NOATIME, ST_NOATIME),
             (ms::NODIRATIME, ST_NODIRATIME),
             (ms::RELATIME, ST_RELATIME),
+            (ms::NOSYMFOLLOW, ST_NOSYMFOLLOW),
         ] {
             if flags & m != 0 {
                 f |= st;

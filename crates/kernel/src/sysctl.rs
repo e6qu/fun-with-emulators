@@ -27,6 +27,50 @@ struct Sysctl {
 enum Space {
     Net,
     Ipc,
+    /// The rest: fwe's own, every process's ([`Globals`]).
+    Global,
+}
+
+/// The sysctls of no namespace set from their defaults, by name: a record
+/// every fwe process sees (`fs.inotify.*`, `vm.drop_caches`).
+#[derive(Clone, Debug, Default)]
+pub struct Globals(pub std::collections::BTreeMap<String, String>);
+
+impl crate::shared::Data for Globals {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.u64(self.0.len() as u64);
+        for (k, v) in &self.0 {
+            e.bytes(k.as_bytes());
+            e.bytes(v.as_bytes());
+        }
+    }
+    fn decode(d: &mut crate::snapshot::Dec) -> Self {
+        let n = d.count(16);
+        Globals(
+            (0..n)
+                .map(|_| {
+                    let (k, v) = (d.bytes(), d.bytes());
+                    (
+                        String::from_utf8_lossy(&k).into_owned(),
+                        String::from_utf8_lossy(&v).into_owned(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+fn globals() -> Option<&'static crate::shared::Record<Globals>> {
+    static G: std::sync::OnceLock<Option<crate::shared::Record<Globals>>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(|| crate::shared::Record::named("sysctl", 0, Globals::default).ok()).as_ref()
+}
+
+/// The value of the sysctl at `path` (under `/proc/sys`, `fs/inotify/...`)
+/// as a number, if it is one fwe keeps.
+pub fn number(path: &[u8]) -> Option<i64> {
+    let i = SYSCTLS.iter().position(|s| s.path == path)?;
+    value(i).trim().parse().ok()
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +153,25 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Ipc,
     },
     Sysctl {
+        path: b"fs/inotify/max_queued_events",
+        default: "16384",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"fs/inotify/max_user_instances",
+        default: "128",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"fs/inotify/max_user_watches",
+        default: "8192",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
+    Sysctl {
         path: b"fs/mqueue/queues_max",
         default: "256",
         kind: Kind::Int(0, INT_MAX),
@@ -151,6 +214,7 @@ fn value(i: usize) -> String {
     let set = match SYSCTLS[i].space {
         Space::Net => crate::netns::current().and_then(|n| n.get().sysctls.get(&name).cloned()),
         Space::Ipc => crate::sysvipc::current().and_then(|r| r.get().sysctls.get(&name).cloned()),
+        Space::Global => globals().and_then(|r| r.get().0.get(&name).cloned()),
     };
     set.unwrap_or_else(|| SYSCTLS[i].default.to_string())
 }
@@ -199,7 +263,7 @@ pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result
     let i = index(path)?;
     let allowed = match SYSCTLS[i].space {
         Space::Net => crate::netns::current().is_some() && creds.has(crate::caps::CAP_NET_ADMIN),
-        Space::Ipc => creds.has(crate::caps::CAP_DAC_OVERRIDE),
+        Space::Ipc | Space::Global => creds.has(crate::caps::CAP_DAC_OVERRIDE),
     };
     Some(if allowed { Ok(Mark::Sysctl(i as u8)) } else { Err(errno::EACCES) })
 }
@@ -257,6 +321,15 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
             };
             ipc.update(|t| {
                 t.sysctls.insert(name.clone(), kept.clone());
+                Ok(())
+            })
+        }
+        Space::Global => {
+            let Some(r) = globals() else {
+                return Some(fwe_abi::err(errno::ENOMEM));
+            };
+            r.update(|t| {
+                t.0.insert(name.clone(), kept.clone());
                 Ok(())
             })
         }

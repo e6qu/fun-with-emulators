@@ -119,7 +119,11 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_limit(n, &a) {
             return e;
         }
+        let plan = self.inotify_before(n, &a);
+        let noted = crate::atime::before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
+        crate::atime::after(noted, r);
+        self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
         // have given: closed again (by the guest's `close`, which also drops
         // what fwe keeps for one), and the call fails.
@@ -182,6 +186,9 @@ impl<P: Platform> Kernel<P> {
                     crate::netns::closed(fd, mark);
                 }
                 crate::netlink::closed(fd);
+                crate::mountapi::closed(fd);
+                crate::nsfd::closed(fd);
+                crate::inotify::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
@@ -528,6 +535,19 @@ impl<P: Platform> Kernel<P> {
             | nr::MQ_TIMEDSEND
             | nr::MQ_TIMEDRECEIVE => crate::ipcops::blocking(self.ipc_context(), n, a),
             nr::MQ_OPEN => self.sys_mq_open(a[0], a[1], a[2], a[3]),
+            nr::SETNS => self.sys_setns(a[0], a[1]),
+            nr::INOTIFY_INIT1 => self.sys_inotify_init1(a[0]),
+            nr::INOTIFY_ADD_WATCH => self.sys_inotify_add_watch(a[0], a[1], a[2]),
+            nr::INOTIFY_RM_WATCH => self.sys_inotify_rm_watch(a[0], a[1]),
+            nr::FSOPEN => self.sys_fsopen(a[0], a[1]),
+            nr::FSCONFIG => self.sys_fsconfig(a[0], a[1], a[2], a[3], a[4]),
+            nr::FSMOUNT => self.sys_fsmount(a[0], a[1], a[2]),
+            nr::FSPICK => self.sys_fspick(a[0], a[1], a[2]),
+            nr::OPEN_TREE => self.sys_open_tree(a[0], a[1], a[2]),
+            nr::MOVE_MOUNT => self.sys_move_mount(a[0], a[1], a[2], a[3], a[4]),
+            nr::MOUNT_SETATTR => self.sys_mount_setattr(a[0], a[1], a[2], a[3], a[4]),
+            nr::STATMOUNT => self.sys_statmount(a[0], a[1], a[2], a[3]),
+            nr::LISTMOUNT => self.sys_listmount(a[0], a[1], a[2], a[3]),
             nr::MQ_UNLINK => self.sys_mq_unlink(a[0]),
             nr::MQ_NOTIFY => self.sys_mq_notify(a[0], a[1]),
             nr::MQ_GETSETATTR => self.sys_mq_getsetattr(a[0], a[1], a[2]),
@@ -800,9 +820,7 @@ impl<P: Platform> Kernel<P> {
                     let r = libc::fcntl(fd, libc::F_GETFL);
                     if r < 0 {
                         last_error()
-                    } else if crate::fdmarks::any_marks()
-                        && crate::fdmarks::marked(fd) == Some(crate::fdmarks::Mark::Path)
-                    {
+                    } else if crate::fdmarks::is_path(fd) {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
@@ -993,6 +1011,9 @@ impl<P: Platform> Kernel<P> {
         // an `int` sign-extends it.
         let req = req as u32 as u64;
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = self.ns_ioctl(fd, req, arg) {
             return r;
         }
         // SAFETY: in every arm the argument layouts match the host's; the host
@@ -2812,7 +2833,11 @@ mod tests {
         assert_eq!(k.syscall(nr::MINCORE, [p + 1, page, v, 0, 0, 0]), err(errno::EINVAL));
         // SAFETY: unmapping the second page of the test's mapping.
         unsafe { libc::munmap((p + page) as *mut libc::c_void, page as usize) };
-        assert_eq!(k.syscall(nr::MINCORE, [p, 2 * page, v, 0, 0, 0]), err(errno::ENOMEM));
+        let r = k.syscall(nr::MINCORE, [p, 2 * page, v, 0, 0, 0]);
+        // Unless another test's thread has mapped the freed page since.
+        if !crate::mm::mapped(p + page, page) {
+            assert_eq!(r, err(errno::ENOMEM));
+        }
         // SAFETY: unmapping the rest.
         unsafe { libc::munmap(p as *mut libc::c_void, page as usize) };
     }

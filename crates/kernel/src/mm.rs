@@ -344,18 +344,26 @@ impl Brk {
     /// Default size of the reservation.
     pub const RESERVATION: u64 = 1 << 30;
 
-    /// Reserve `size` bytes of address space at page-aligned `start`.
+    /// Reserve up to `size` bytes of address space at page-aligned
+    /// `start`: as much of it as is free, halving the size while something
+    /// the host mapped is in the way (the break grows up to the next
+    /// mapping, as on Linux).
     ///
-    /// If the range is not available the break cannot grow; allocators then
-    /// fall back to `mmap`, as they do on Linux when `brk` fails.
+    /// If none is free the break cannot grow; allocators then fall back to
+    /// `mmap`, as they do on Linux when `brk` fails.
     pub fn reserve(start: u64, size: u64) -> Brk {
-        match crate::host::reserve_fixed(start, size) {
-            Ok(()) => {
-                track(start, size);
-                Brk { start, current: start, limit: start + size }
+        let mut size = size;
+        while size >= 1 << 16 {
+            match crate::host::reserve_fixed(start, size) {
+                Ok(()) => {
+                    track(start, size);
+                    return Brk { start, current: start, limit: start + size };
+                }
+                Err(crate::host::ReserveError::Occupied) => size /= 2,
+                Err(_) => break,
             }
-            Err(_) => Brk { start, current: start, limit: start },
         }
+        Brk { start, current: start, limit: start }
     }
 }
 
@@ -404,7 +412,7 @@ pub(crate) fn any_mapped(start: u64, len: u64) -> bool {
 }
 
 /// Whether all of guest range `[start, start + len)` is mapped.
-fn mapped(start: u64, len: u64) -> bool {
+pub(crate) fn mapped(start: u64, len: u64) -> bool {
     // A backend that knows the guest's memory says (the VM's); the host
     // knows what it has mapped.
     if !crate::uaccess::valid(start, len, false) {
@@ -777,7 +785,11 @@ mod tests {
         // A hole in the range is ENOMEM.
         // SAFETY: unmapping the test's own mapping.
         unsafe { libc::munmap(none as *mut _, len) };
-        assert_eq!(dontneed(none, len as u64), err(errno::ENOMEM));
+        let r = dontneed(none, len as u64);
+        // Unless another test's thread has mapped some of it since.
+        if !any_mapped(none, len as u64) {
+            assert_eq!(r, err(errno::ENOMEM));
+        }
         // SAFETY: unmapping the test's own mappings.
         unsafe {
             libc::munmap(private as *mut _, len);
@@ -879,6 +891,14 @@ impl<P: Platform> Kernel<P> {
         fd: u64,
         offset: u64,
     ) -> i64 {
+        // Nothing of a mount that runs nothing is mapped to run, then or
+        // later.
+        let noexec = flags & mman::MAP_ANONYMOUS == 0
+            && crate::fdmarks::origin(fd as i32)
+                .is_some_and(|o| o.flags & crate::mounts::ms::NOEXEC != 0);
+        if noexec && prot & mman::PROT_EXEC != 0 {
+            return err(errno::EPERM);
+        }
         // A loop device maps the file it shows.
         let source = if flags & mman::MAP_ANONYMOUS == 0 {
             crate::loopdev::map_source(fd as i32, self.page_size)
@@ -911,6 +931,9 @@ impl<P: Platform> Kernel<P> {
         let len = self.page_up(len);
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
         let locked = crate::maps::record().mapped(r as u64, len, prot, shared, object);
+        if noexec {
+            crate::maps::record().no_exec(r as u64, len);
+        }
         if flags & mman::MAP_LOCKED != 0 {
             crate::maps::record().lock(r as u64, len, true);
             populate(r as u64, len, self.page_size);
@@ -935,6 +958,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        if prot & mman::PROT_EXEC != 0 && crate::maps::record().any_noexec(addr, self.page_up(len))
+        {
+            return err(errno::EACCES);
+        }
         let r = self.mprotect_call(addr, len, prot);
         if r == 0 {
             let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);

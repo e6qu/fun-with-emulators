@@ -19,7 +19,9 @@ use std::sync::Mutex;
 /// Where an open file was opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Origin {
-    /// The mount's flags and filesystem type.
+    /// The mount (its id in the namespace's table), its flags and its
+    /// filesystem's type.
+    pub mount: u32,
     pub flags: u64,
     pub fstype: FsType,
     /// The file's path in the mount namespace's view, as it was opened
@@ -68,6 +70,20 @@ pub enum Mark {
     Path,
     /// A POSIX message queue's descriptor ([`crate::mqueue`]).
     Mq,
+    /// A filesystem context of the new mount API (`fsopen`, `fspick`),
+    /// by its number ([`crate::mountapi`]).
+    FsContext(u32),
+    /// A detached mount tree (`fsmount`, `open_tree`), by its number: an
+    /// `O_PATH` descriptor ([`crate::mountapi`]).
+    Detached(u32),
+    /// A namespace (`/proc/<pid>/ns/<kind>` opened), by its number
+    /// ([`crate::nsfd`]).
+    Ns(u32),
+    /// An inotify instance, by its number ([`crate::inotify`]).
+    Inotify(u32),
+    /// An `O_PATH | O_NOFOLLOW` descriptor of a link of fwe's `/proc` (a
+    /// stand-in, its origin's path the link's), which names the link.
+    ProcLink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,15 +101,39 @@ static RECORDS: Mutex<BTreeMap<i32, Record>> = Mutex::new(BTreeMap::new());
 /// checks for one only while there are any ([`cgroup_file`]).
 static CGROUP_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many records are of files of a mount whose access times fwe keeps
+/// itself (`noatime`, `nodiratime` or `strictatime`), so that a read looks
+/// for one only while there are any ([`atime_files`]).
+static ATIME_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn count(rec: Option<&Record>, up: bool) {
+    use crate::mounts::ms;
     use std::sync::atomic::Ordering::SeqCst;
-    if rec.and_then(|r| r.origin.as_ref()).is_some_and(|o| o.fstype == FsType::Cgroup2) {
+    let Some(o) = rec.and_then(|r| r.origin.as_ref()) else { return };
+    let bump = |c: &std::sync::atomic::AtomicUsize| {
         if up {
-            CGROUP_FILES.fetch_add(1, SeqCst);
+            c.fetch_add(1, SeqCst);
         } else {
-            CGROUP_FILES.fetch_sub(1, SeqCst);
+            c.fetch_sub(1, SeqCst);
         }
+    };
+    if o.fstype == FsType::Cgroup2 {
+        bump(&CGROUP_FILES);
     }
+    if o.flags & (ms::NOATIME | ms::NODIRATIME | ms::STRICTATIME) != 0 {
+        bump(&ATIME_FILES);
+    }
+}
+
+/// Whether a file opened through mount `id` is open here.
+pub fn open_in(id: u32) -> bool {
+    records().values().any(|r| r.origin.as_ref().is_some_and(|o| o.mount == id))
+}
+
+/// Whether any recorded file is of a mount whose access times fwe keeps
+/// ([`crate::atime`]).
+pub fn atime_files() -> bool {
+    ATIME_FILES.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
 fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
@@ -145,12 +185,13 @@ fn record(fd: i32) -> Option<Record> {
 pub fn opened(
     fd: i32,
     ns_path: Vec<u8>,
+    mount: u32,
     flags: u64,
     fstype: FsType,
     ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 ) {
     let Some((dev, ino)) = identity(fd) else { return };
-    let origin = Some(Origin { flags, fstype, ns_path, ovl, stand_in: None });
+    let origin = Some(Origin { mount, flags, fstype, ns_path, ovl, stand_in: None });
     let mut r = records();
     let mark = kept(&r, fd, dev, ino).and_then(|rec| rec.mark);
     insert(&mut r, fd, Record { dev, ino, origin, mark });
@@ -204,7 +245,7 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
     if !any_marks() {
         return false;
     }
-    let path = |fd: u64| marked(fd as i32) == Some(Mark::Path);
+    let path = |fd: u64| is_path(fd as i32);
     match nr {
         n::READ
         | n::READV
@@ -263,6 +304,20 @@ pub fn mark(fd: i32, mark: Mark) {
 /// Where `fd` was opened, if fwe recorded it.
 pub fn origin(fd: i32) -> Option<Origin> {
     record(fd)?.origin
+}
+
+/// Whether `fd` is an `O_PATH` descriptor (a detached mount's is one).
+pub fn is_path(fd: i32) -> bool {
+    any_marks() && matches!(marked(fd), Some(Mark::Path | Mark::Detached(_) | Mark::ProcLink))
+}
+
+/// The namespace path of the `/proc` link `fd` names, if it is an
+/// `O_PATH | O_NOFOLLOW` descriptor of one ([`Mark::ProcLink`]).
+pub fn proc_link(fd: i32) -> Option<Vec<u8>> {
+    if !any_marks() || marked(fd) != Some(Mark::ProcLink) {
+        return None;
+    }
+    origin(fd).map(|o| o.ns_path)
 }
 
 /// What `fd` stands in for, if anything.
@@ -330,6 +385,7 @@ pub fn save(e: &mut Enc) {
         match &rec.origin {
             Some(o) => {
                 e.bool(true);
+                e.u32(o.mount);
                 e.u64(o.flags);
                 e.u32(o.fstype as u32);
                 e.bytes(&o.ns_path);
@@ -355,7 +411,17 @@ pub fn save(e: &mut Enc) {
             Some(Mark::LoopControl) => 10,
             Some(Mark::Path) => 11,
             Some(Mark::Mq) => 12,
+            Some(Mark::FsContext(_)) => 13,
+            Some(Mark::Detached(_)) => 14,
+            Some(Mark::Ns(_)) => 15,
+            Some(Mark::Inotify(_)) => 16,
+            Some(Mark::ProcLink) => 17,
         });
+        if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
+            rec.mark
+        {
+            e.u32(n);
+        }
         if let Some(Mark::Loop(n)) = rec.mark {
             e.u32(n);
         }
@@ -388,6 +454,7 @@ pub fn load(d: &mut Dec) {
         let fd = d.i32();
         let (dev, ino) = (d.u64(), d.u64());
         let origin = if d.bool() {
+            let mount = d.u32();
             let (flags, fstype, ns_path) = (d.u64(), FsType::from_code(d.u32()), d.bytes());
             let ovl = d.bool().then(|| std::sync::Arc::new(crate::overlay::Layers::decode(d)));
             let (some, path) = (d.bool(), d.bytes());
@@ -395,7 +462,7 @@ pub fn load(d: &mut Dec) {
             if stand_in.is_some() {
                 STAND_INS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            Some(Origin { flags, fstype, ns_path, ovl, stand_in })
+            Some(Origin { mount, flags, fstype, ns_path, ovl, stand_in })
         } else {
             None
         };
@@ -416,6 +483,11 @@ pub fn load(d: &mut Dec) {
             10 => Some(Mark::LoopControl),
             11 => Some(Mark::Path),
             12 => Some(Mark::Mq),
+            13 => Some(Mark::FsContext(d.u32())),
+            14 => Some(Mark::Detached(d.u32())),
+            15 => Some(Mark::Ns(d.u32())),
+            16 => Some(Mark::Inotify(d.u32())),
+            17 => Some(Mark::ProcLink),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

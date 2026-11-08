@@ -379,6 +379,7 @@ pub(super) fn fork(
     };
     let number = Kernel::<HvPlatform>::fork_number(&token);
     let line = Kernel::<HvPlatform>::fork_line(&token).clone();
+    let inherit = Kernel::<HvPlatform>::fork_inherit(&token).clone();
     // The child writes one byte here once it is ready to run; its end is
     // close-on-exec there, so a vfork parent also sees it close on exec. It
     // is made and the parent's write end closed under the kernel lock, so
@@ -434,6 +435,7 @@ pub(super) fn fork(
         e.u64(child_tid);
         e.i32(number);
         fwe_kernel::procreg::save_line(&mut e, &line);
+        fwe_kernel::procreg::save_inherit(&mut e, &inherit);
         e.bool(vfork);
         e.i32(word[1]);
         e.i32(sv[1]);
@@ -775,6 +777,7 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let child_tid = d.u64();
     let number = d.i32();
     let line = fwe_kernel::procreg::load_line(&mut d);
+    let inherit = fwe_kernel::procreg::load_inherit(&mut d);
     let vfork = d.bool();
     let word = d.i32();
     let sock = d.i32();
@@ -794,7 +797,7 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     }
     // Its own record too: it may end before the parent writes it.
     // With its mappings, for other processes' `/proc/<pid>/maps`.
-    fwe_kernel::procreg::own_line(&line, fwe_kernel::maps::forked());
+    fwe_kernel::procreg::own_line(&line, &inherit, fwe_kernel::maps::forked());
     fwe_kernel::reaper::start_if_reaper();
     d.finish()?;
     backend::become_vm_process()?;

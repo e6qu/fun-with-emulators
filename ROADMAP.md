@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 757 of 1534 (70% of the 1083 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 826 of 1550 (73% of the 1138 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -77,6 +77,16 @@ capabilities. *crun, podman and containerd run standard images.*
 - POSIX message queues per IPC namespace, with notifications across
   processes (a signal with its value, or the C library's thread through a
   netlink socket).
+- the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`,
+  `open_tree`, `move_mount`, `mount_setattr`, `statmount`, `listmount`),
+  with peer groups kept and mount ids in `statx`;
+- namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
+  `NS_GET_*` requests;
+- inotify, its events raised by fwe from every process's file calls;
+- mounts as Linux has them: propagation (between peers, to slaves, across
+  namespaces), the `nodev`, `noexec`, `nosymfollow` and access-time flags
+  acted on, busy mounts refused, `MNT_EXPIRE`, and `pivot_root` of a
+  chroot.
 
 ## Left to 1.0
 
@@ -97,9 +107,6 @@ hardware.
 In order of what each item unblocks. The LTP counts are from the latest
 run.
 
-- [ ] **Missing system calls LTP tests:**
-  - `inotify` (and `fanotify` refused cleanly);
-  - the new mount API (`open_tree`, `fsopen`, `fspick`, `statmount`).
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).
@@ -147,4 +154,7 @@ for it fall back:
 - x86_64 Linux binaries;
 - `kcmp`: macOS cannot tell whether two descriptors share an open file
   description, and programs that use it (CRIU, systemd) fall back;
+- `fanotify`: its permission events would hold every process's file
+  calls on another's answer; it is refused (`ENOSYS`), and programs fall
+  back to inotify;
 - graphical programs.

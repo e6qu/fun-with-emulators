@@ -71,7 +71,16 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
         || crate::signalfd::is_signalfd(fd)
         || crate::bpf::prog_of(fd).is_some()
         || crate::synthdir::path_of(fd).is_some()
-        || crate::netlink::is(fd);
+        || crate::netlink::is(fd)
+        || matches!(
+            crate::fdmarks::any_marks().then(|| crate::fdmarks::marked(fd)).flatten(),
+            Some(
+                crate::fdmarks::Mark::Mq
+                    | crate::fdmarks::Mark::FsContext(_)
+                    | crate::fdmarks::Mark::Ns(_)
+                    | crate::fdmarks::Mark::Inotify(_)
+            )
+        );
     if special {
         return Ok((Kind::Other, reads, writes, fl));
     }

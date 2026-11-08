@@ -810,6 +810,13 @@ pub fn load_image(
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
+    // The break starts after the main image and its stub space, reserved
+    // before anything else is mapped (the dynamic linker would land there).
+    let brk = Brk::reserve(
+        loaded.stub_arena.end.max((loaded.end + page - 1) & !(page - 1)),
+        Brk::RESERVATION,
+    );
+
     // A dynamically linked executable names an interpreter (the dynamic
     // linker); load it too and start the guest there. It maps the executable's
     // libraries itself through our mmap and openat.
@@ -842,12 +849,6 @@ pub fn load_image(
     };
     let entry = interp.map_or(loaded.entry, |i| i.entry);
     let interp_base = interp.map_or(0, |i| i.load_base);
-
-    // The break starts after the main image and its stub space.
-    let brk = Brk::reserve(
-        loaded.stub_arena.end.max((loaded.end + page - 1) & !(page - 1)),
-        Brk::RESERVATION,
-    );
 
     // A fresh thread stack, with an inaccessible guard page below it.
     // SAFETY: a fresh mapping owned by the guest.

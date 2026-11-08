@@ -2762,7 +2762,10 @@ const CALLS: &str = "splice: 5, offset 7, position 10\n\
     personality: was 0, now 0x20000, release 2.6: true\n\
     sched: set 0, get 0, policy 2, priority 10\n\
     child's policy: 2\n\
-    clock: read 0, set refused true\n";
+    clock: read 0, set refused true\n\
+    pipe's filesystem: 0, pipefs true; statx reserved bit refused true\n\
+    working directory renamed: followed true\n\
+    a /proc link's O_PATH descriptor: a link true, reads it true; unknown fstatat flag refused true\n";
 
 /// Data moved through pipes (`splice` from a file's offset, `tee`,
 /// `vmsplice`), the personality, a scheduling policy a fork child
@@ -2793,6 +2796,67 @@ const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-ex
 fn message_queues_deliver_and_notify() {
     let out = fwe(&rust_guest("mqueue"), &[]);
     assert_eq!(stdout(&out), MQUEUE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `mountapi` guest prints.
+const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown parameter 'bogus'\", create 0, attached 0\n\
+    mounted: options rw,noexec,relatime\n\
+    statmount: 0, same id true, type tmpfs, point true\n\
+    listmount: listed true\n\
+    beneath: 0, top first true, then the copy true\n\
+    fspick: 0, read-only true, then rw\n\
+    mount_setattr: 0, nodev true, shared true\n\
+    propagation: into the copied namespace true, unmount too true\n\
+    enforced: nodev true, noexec true (mprotect too true), nosymfollow true\n\
+    unmount: busy refused true, expire marks true, then unmounts true\n\
+    atime: noatime keeps true, strictatime moves true, remount keeps the mode true\n\
+    device bind: 0, a device true, reads empty true\n";
+
+/// The new mount API: a tmpfs made through a filesystem context and
+/// attached from a detached mount, a detached copy attached beneath
+/// another mount, `fspick`, `mount_setattr`, `statx`, `statmount` and
+/// `listmount` agreeing on the mount, a mount under a shared one
+/// propagating into a copied namespace, the `nodev`, `noexec` and
+/// `nosymfollow` flags acted on, and a busy mount refused.
+#[test]
+fn the_new_mount_api_makes_and_attaches_mounts() {
+    let out = fwe(&rust_guest("mountapi"), &[]);
+    assert_eq!(stdout(&out), MOUNTAPI, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `nsfd` guest prints.
+const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
+    nstype 0x4000000, parent of a UTS namespace refused true\n\
+    setns: 0, own name true, back true\n\
+    wrong type refused true\n";
+
+/// Namespace descriptors: `/proc/self/ns/uts` opened as nsfs shows it,
+/// the `NS_GET_*` requests, and `setns` back into the namespace it names.
+#[test]
+fn namespace_descriptors_name_and_join_namespaces() {
+    let out = fwe(&rust_guest("nsfd"), &[]);
+    assert_eq!(stdout(&out), NSFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `inotify` guest prints.
+const INOTIFY: &str = "watch: true, nothing yet true\n\
+    ready true: create a, open a, modify a, close_write a, moved_from a, moved_to b, delete b\n\
+    move cookies paired true\n\
+    exit closes: create c, open c, modify c, close_write c\n\
+    exchange: moved_from c, moved_to d, moved_from d, moved_to c\n\
+    fdinfo lists the watch true\n\
+    removed 0: ignored true\n";
+
+/// inotify: a watched directory hears what another process does in it,
+/// in Linux's order, `poll` sees the events, fdinfo lists the watch, and a
+/// removed watch reports `IN_IGNORED`.
+#[test]
+fn inotify_reports_another_process_s_changes() {
+    let out = fwe(&rust_guest("inotify"), &[]);
+    assert_eq!(stdout(&out), INOTIFY, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -3319,6 +3383,34 @@ fn hv_kernel_calls_move_data_and_keep_settings() {
 fn hv_message_queues_deliver_and_notify() {
     let Some(out) = fwe_hv(&rust_low_guest("mqueue"), &[]) else { return };
     assert_eq!(stdout(&out), MQUEUE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The new mount API in the VM (see
+/// [`the_new_mount_api_makes_and_attaches_mounts`]): its structures are
+/// the guest's memory, translated.
+#[test]
+fn hv_the_new_mount_api_makes_and_attaches_mounts() {
+    let Some(out) = fwe_hv(&rust_low_guest("mountapi"), &[]) else { return };
+    assert_eq!(stdout(&out), MOUNTAPI, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Namespace descriptors in the VM (see
+/// [`namespace_descriptors_name_and_join_namespaces`]).
+#[test]
+fn hv_namespace_descriptors_name_and_join_namespaces() {
+    let Some(out) = fwe_hv(&rust_low_guest("nsfd"), &[]) else { return };
+    assert_eq!(stdout(&out), NSFD, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// inotify in the VM (see [`inotify_reports_another_process_s_changes`]):
+/// a forking guest, its events read into guest memory, translated.
+#[test]
+fn hv_inotify_reports_another_process_s_changes() {
+    let Some(out) = fwe_hv(&rust_low_guest("inotify"), &[]) else { return };
+    assert_eq!(stdout(&out), INOTIFY, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

@@ -240,6 +240,12 @@ impl Resolved {
     }
 }
 
+thread_local! {
+    /// This thread is looking up an unmount's target, which is no use of
+    /// the mount ([`Fs::resolve`], `MNT_EXPIRE`).
+    pub static UNMOUNTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The guest's view of the filesystem.
 pub struct Fs {
     /// The rootfs: the host directory of the initial namespace's root
@@ -254,6 +260,12 @@ pub struct Fs {
     /// Current working directory, a normalized absolute path from the
     /// process's root.
     cwd: Vec<u8>,
+    /// The mount it was entered through (0 when not known), which it stays
+    /// in when another is mounted over it, as on Linux.
+    cwd_mount: u32,
+    /// The mount the root was set in (0 when not known), which it stays in
+    /// when another is mounted over it.
+    root_mount: u32,
     umask: u32,
     proc: crate::procfs::ProcInfo,
     /// The process's other namespaces.
@@ -267,6 +279,8 @@ impl Fs {
         use std::os::fd::AsRawFd;
         e.i32(self.root.as_raw_fd());
         e.bytes(&self.cwd);
+        e.u32(self.cwd_mount);
+        e.u32(self.root_mount);
         e.bytes(&self.root_host);
         e.bytes(self.mnt.dir());
         e.u64(self.mnt.id());
@@ -290,6 +304,8 @@ impl Fs {
         // and owned by nothing else in this process.
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
         let cwd = d.bytes();
+        let cwd_mount = d.u32();
+        let root_mount = d.u32();
         let root_host = d.bytes();
         let (dir, id) = (d.bytes(), d.u64());
         let mnt = match Ns::join(&dir, id) {
@@ -303,6 +319,8 @@ impl Fs {
         Fs {
             root,
             cwd,
+            cwd_mount,
+            root_mount,
             root_host,
             mnt,
             proc_root: d.bytes(),
@@ -382,6 +400,8 @@ impl Fs {
         Ok(Fs {
             root,
             cwd: b"/".to_vec(),
+            cwd_mount: 0,
+            root_mount: 0,
             root_host,
             mnt,
             proc_root: b"/".to_vec(),
@@ -525,6 +545,23 @@ impl Fs {
         self.proc_root = root;
         self.cwd = cwd;
         self.republish();
+    }
+
+    /// The mounts the root and the working directory are in now (0: not
+    /// known), as `chroot`, `pivot_root` and `setns` leave them.
+    pub fn set_mounts(&mut self, root: u32, cwd: u32) {
+        self.root_mount = root;
+        self.cwd_mount = cwd;
+    }
+
+    /// The mount the working directory is in, if fwe knows it.
+    pub fn cwd_mount(&self) -> Option<u32> {
+        (self.cwd_mount != 0).then_some(self.cwd_mount)
+    }
+
+    /// The mount the root is in, if fwe knows it.
+    pub fn root_mount(&self) -> Option<u32> {
+        (self.root_mount != 0).then_some(self.root_mount)
     }
 
     /// The namespace path of `path`, an absolute guest path.
@@ -757,6 +794,16 @@ impl Fs {
         if crate::signalfd::is_signalfd(fd) {
             return b"anon_inode:[signalfd]".to_vec();
         }
+        if let Some(t) = crate::nsfd::target(fd) {
+            return t;
+        }
+        // A descriptor of a `/proc` link: the link's path.
+        if let Some(link) = crate::fdmarks::proc_link(fd).and_then(|ns| self.from_ns(&ns)) {
+            return link;
+        }
+        if crate::inotify::instance_of(fd).is_some() {
+            return b"anon_inode:inotify".to_vec();
+        }
         // SAFETY: an all-zero stat is a valid out-parameter.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `st` is a valid out-parameter.
@@ -860,6 +907,9 @@ impl Fs {
                 insns.len() / 8
             ));
         }
+        if let Some(lines) = crate::inotify::fdinfo(fd) {
+            out.push_str(&lines);
+        }
         out.into_bytes()
     }
 
@@ -874,6 +924,17 @@ impl Fs {
     pub fn proc_path(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
         let p = self.synthetic_path(dirfd, path)?;
         own_or_other(&p).ok()
+    }
+
+    /// The process a `/proc/<pid>/...` path (from `dirfd`) is about and the
+    /// rest of the path: `None` for the caller (`self` or its own pid),
+    /// else its host pid (`None` inside when it has none), with the rest.
+    pub fn proc_target(&self, dirfd: i32, path: &[u8]) -> Option<(Option<Option<i32>>, Vec<u8>)> {
+        let p = self.synthetic_path(dirfd, path)?;
+        match own_or_other(&p) {
+            Ok(own) => Some((None, own.strip_prefix(b"/proc/self")?.to_vec())),
+            Err((host, _, sub)) => Some((Some(host), sub)),
+        }
     }
 
     /// The path in fwe's synthetic tree (`/proc/...`, `/sys/...`) that
@@ -1048,7 +1109,28 @@ impl Fs {
             // `AT_EMPTY_PATH` acts on its descriptor before resolving.
             return Err(errno::ENOENT);
         }
-        resolve_in(&self.view(), dirfd, path, follow_final)
+        let r = resolve_in(&self.view(), dirfd, path, follow_final)?;
+        // A mount marked to expire (`MNT_EXPIRE`) is in use again (but by
+        // the lookup of an unmount's own target).
+        let t = self.mnt.table();
+        if !t.expiring.is_empty()
+            && !UNMOUNTING.with(std::cell::Cell::get)
+            && let Some(ns) = &r.ns_path
+        {
+            let used: Vec<u32> = t
+                .expiring
+                .iter()
+                .copied()
+                .filter(|id| t.get(*id).is_some_and(|m| mounts::under(ns, &m.point).is_some()))
+                .collect();
+            if !used.is_empty() {
+                let _ = self.mnt.update(|t| {
+                    t.expiring.retain(|i| !used.contains(i));
+                    Ok(())
+                });
+            }
+        }
+        Ok(r)
     }
 
     fn view(&self) -> View<'_> {
@@ -1061,8 +1143,9 @@ impl Fs {
         }
     }
 
-    /// Resolve and read a whole file under the root (following symlinks).
-    /// Used to load the dynamic linker named by a guest executable.
+    /// Resolve and read a whole file under the root (following symlinks),
+    /// to run it: a program, or the dynamic linker it names (`EACCES` from
+    /// a `noexec` mount).
     pub fn read(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
         if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
             use crate::procfs::Entry;
@@ -1086,6 +1169,10 @@ impl Fs {
             };
         }
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        // Nothing is run from a mount that runs nothing.
+        if resolved.mount_flags & mounts::ms::NOEXEC != 0 {
+            return Err(errno::EACCES);
+        }
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         let fd = unsafe {
@@ -1206,6 +1293,23 @@ impl Fs {
         host_to_ns(&self.mnt.table(), &fd_path(fd)?)
     }
 
+    /// The host file `path` stands for, if it names one of the standard
+    /// device nodes fwe serves in the rootfs's own `/dev` (see
+    /// [`resolve_in`]): what a bind mount of it shows.
+    pub fn device_host(&self, path: &[u8]) -> Option<Vec<u8>> {
+        let absolute = self.absolute_path(fcntl::AT_FDCWD as i32, path)?;
+        let name = absolute.strip_prefix(b"/dev/")?;
+        if !DEVICES.contains(&name) && crate::loopdev::node_named(name).is_none() {
+            return None;
+        }
+        if !is_rootfs(&self.mount_of(&absolute).0, &self.root_host) {
+            return None;
+        }
+        let r = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
+        let dir = fd_path(r.dir.as_raw_fd())?;
+        Some(mounts::join(&dir, &r.name))
+    }
+
     /// Set the working directory to the resolved `path`.
     pub fn chdir(&mut self, dirfd: i32, path: &[u8]) -> Result<(), i32> {
         let resolved = self.resolve(dirfd, path, true)?;
@@ -1216,6 +1320,7 @@ impl Fs {
         };
         drop(child);
         let guest = resolved.ns_path.as_deref().and_then(|ns| self.from_ns(ns));
+        self.cwd_mount = resolved.mount_id;
         self.cwd = match guest {
             Some(g) => g,
             None => {
@@ -1247,6 +1352,7 @@ impl Fs {
         match opened.or(fallback) {
             Some(guest) => {
                 self.cwd = guest;
+                self.cwd_mount = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
                 self.republish();
                 Ok(())
             }
@@ -1831,6 +1937,15 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             Step::Link(target) => {
                 symlinks += 1;
                 if symlinks > MAX_SYMLINKS {
+                    return Err(errno::ELOOP);
+                }
+                // A mount whose links are not followed.
+                let nofollow = here
+                    .at
+                    .as_ref()
+                    .and_then(|(id, _)| table.get(*id))
+                    .is_some_and(|m| m.flags & mounts::ms::NOSYMFOLLOW != 0);
+                if nofollow {
                     return Err(errno::ELOOP);
                 }
                 if target.first() == Some(&b'/') {
