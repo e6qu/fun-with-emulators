@@ -1132,6 +1132,7 @@ fn as_table(mounts: Vec<Mount>) -> crate::mounts::Table {
         next_group: 0,
         outbox: Vec::new(),
         expiring: Vec::new(),
+        owner: Vec::new(),
     }
 }
 

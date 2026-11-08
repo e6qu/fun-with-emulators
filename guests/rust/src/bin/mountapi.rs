@@ -237,7 +237,13 @@ fn main() {
         let noexec = execv(argv[0], argv.as_ptr()) == -1 && errno() == 13;
         symlink(c(&node).as_ptr(), c(&format!("{b}/link")).as_ptr());
         let nofollow = open(c(&format!("{b}/link")).as_ptr(), 0) == -1 && errno() == 40;
-        println!("enforced: nodev {nodev}, noexec {noexec}, nosymfollow {nofollow}");
+        // A mapping of a file there may not be made executable later either.
+        let pfd = open(prog_c.as_ptr(), 0);
+        let map = syscall(222, 0i64, 4096i64, 1i64, 2i64, pfd as i64, 0i64);
+        let no_mprotect = syscall(226, map, 4096i64, 5i64) == -1 && errno() == 13;
+        syscall(215, map, 4096i64);
+        close(pfd);
+        println!("enforced: nodev {nodev}, noexec {noexec} (mprotect too {no_mprotect}), nosymfollow {nofollow}");
         let held = open(c(&format!("{b}/prog")).as_ptr(), 0);
         let busy = umount(c(&b).as_ptr()) == -1 && errno() == 16;
         close(held);
@@ -245,5 +251,31 @@ fn main() {
         let first = umount2(c(&b).as_ptr(), MNT_EXPIRE) == -1 && errno() == 11;
         let second = umount2(c(&b).as_ptr(), MNT_EXPIRE) == 0;
         println!("unmount: busy refused {busy}, expire marks {first}, then unmounts {second}");
+
+        // Access times: kept on a noatime mount though relatime would move
+        // them, moved on a strictatime one though relatime would not, and a
+        // remount that names none keeps the mount's.
+        const MS_REMOUNT: u64 = 32;
+        const MS_NOATIME: u64 = 1024;
+        const MS_STRICTATIME: u64 = 1 << 24;
+        mount(c("none").as_ptr(), c(&b).as_ptr(), c("tmpfs").as_ptr(), MS_NOATIME, std::ptr::null());
+        let file = format!("{b}/f");
+        std::fs::write(&file, b"x").unwrap();
+        let atime_after_read = |set: i64| {
+            use std::os::unix::fs::MetadataExt;
+            let times = [set, 0i64, 0, (1 << 30) - 2];
+            syscall(88, -100i64, c(&file).as_ptr(), times.as_ptr(), 0);
+            std::fs::read(&file).unwrap();
+            std::fs::metadata(&file).unwrap().atime()
+        };
+        let kept = atime_after_read(1000) == 1000;
+        let recent = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 60;
+        let remount = |flags: u64| mount(c("none").as_ptr(), c(&b).as_ptr(), std::ptr::null(), MS_REMOUNT | flags, std::ptr::null());
+        remount(MS_STRICTATIME);
+        let moved = atime_after_read(recent) > recent;
+        remount(0);
+        let still = atime_after_read(recent) > recent;
+        println!("atime: noatime keeps {kept}, strictatime moves {moved}, remount keeps the mode {still}");
+        umount(c(&b).as_ptr());
     }
 }

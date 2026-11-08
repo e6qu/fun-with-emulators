@@ -2,8 +2,10 @@
 //! `nodiratime` (never for a directory) and `strictatime` (on every
 //! read). The host updates a file's access time by its own rule, so a read
 //! of a file opened through such a mount has its access time noted before
-//! and set after, as Linux would have left it. A mount with none of them
-//! is `relatime`, Linux's default, which is left to the host.
+//! and, where the host left another, set after as Linux would have left
+//! it. Setting it changes the host's change time too, which is why it is
+//! set only then. A mount with none of them is `relatime`, Linux's
+//! default, which is left to the host.
 
 use crate::mounts::ms;
 use fwe_abi::nr;
@@ -30,7 +32,7 @@ fn read_fd(n: u64, a: &[u64; 6]) -> Option<i32> {
 /// or `strictatime` mount needs afterwards.
 pub fn before(n: u64, a: &[u64; 6]) -> Option<Before> {
     let fd = read_fd(n, a)?;
-    if !crate::fdmarks::any_marks() {
+    if !crate::fdmarks::atime_files() {
         return None;
     }
     let flags = crate::fdmarks::origin(fd)?.flags;
@@ -65,8 +67,25 @@ pub fn after(b: Option<Before>, r: i64) {
     if r < 0 {
         return;
     }
-    let atime =
-        if b.keep { b.atime } else { libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW } };
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    if unsafe { libc::fstat(b.fd, &mut st) } != 0 {
+        return;
+    }
+    let now = (st.st_atime, st.st_atime_nsec);
+    let atime = if b.keep {
+        if now == (b.atime.tv_sec, b.atime.tv_nsec) {
+            return;
+        }
+        b.atime
+    } else {
+        // Updated: the host did, if it moved it on.
+        if now > (b.atime.tv_sec, b.atime.tv_nsec) {
+            return;
+        }
+        libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW }
+    };
     let times = [atime, libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }];
     // SAFETY: a valid times array; the descriptor is the guest's.
     unsafe { libc::futimens(b.fd, times.as_ptr()) };

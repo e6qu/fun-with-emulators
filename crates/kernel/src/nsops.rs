@@ -71,14 +71,15 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         let fs = self.fs.as_mut().expect("filesystem configured");
+        if let Err(e) = fs.ns.unshare(flags) {
+            return err(e);
+        }
+        // Owned by the user namespace it is made in, a new one included.
         if flags & CLONE_NEWNS != 0 {
-            match fs.mount_ns().copy() {
+            match fs.mount_ns().copy(&fs.ns.user_dir()) {
                 Ok(copy) => fs.set_mount_ns(Arc::new(copy)),
                 Err(e) => return err(e),
             }
-        }
-        if let Err(e) = fs.ns.unshare(flags) {
-            return err(e);
         }
         if new_user {
             self.creds.caps = caps_in_new_userns();
@@ -169,7 +170,11 @@ impl<P: Platform> Kernel<P> {
         };
         ns.pid = child_pid_ns.clone();
         ns.pid_children = child_pid_ns.clone();
-        let mnt = if new & CLONE_NEWNS != 0 { Some(Arc::new(fs.mount_ns().copy()?)) } else { None };
+        let mnt = if new & CLONE_NEWNS != 0 {
+            Some(Arc::new(fs.mount_ns().copy(&ns.user_dir())?))
+        } else {
+            None
+        };
         // Numbered last, so that nothing after it can fail and leave the
         // numbers taken.
         let chain = pidns::chain_from(child_pid_ns);

@@ -62,6 +62,9 @@ pub struct Area {
     pub prot: u64,
     pub shared: bool,
     pub locked: bool,
+    /// It maps a file of a `noexec` mount, so it may not be made
+    /// executable (Linux's `VM_MAYEXEC` clear).
+    pub noexec: bool,
     /// What it maps; anonymous memory has offset 0 throughout.
     pub object: Object,
 }
@@ -91,6 +94,7 @@ impl Area {
             prot,
             shared: false,
             locked: false,
+            noexec: false,
             object: Object { name, dev: 0, ino: 0, offset: 0 },
         }
     }
@@ -156,6 +160,7 @@ impl Record {
             }
             e.bool(a.shared);
             e.bool(a.locked);
+            e.bool(a.noexec);
             match &a.object.name {
                 Name::Anonymous => e.u8(0),
                 Name::Heap => e.u8(1),
@@ -176,11 +181,11 @@ impl Record {
         r.lock_future = d.bool();
         r.exe = d.bytes();
         r.exe_id = (d.u64(), d.u64());
-        let n = d.count(8 * 6 + 3);
+        let n = d.count(8 * 6 + 4);
         for _ in 0..n {
             let (start, end, prot, dev, ino, offset) =
                 (d.u64(), d.u64(), d.u64(), d.u64(), d.u64(), d.u64());
-            let (shared, locked) = (d.bool(), d.bool());
+            let (shared, locked, noexec) = (d.bool(), d.bool(), d.bool());
             let name = match d.u8() {
                 1 => Name::Heap,
                 2 => Name::Stack,
@@ -189,7 +194,7 @@ impl Record {
                 _ => Name::Anonymous,
             };
             let object = Object { name, dev, ino, offset };
-            r.areas.insert(start, end, Area { prot, shared, locked, object });
+            r.areas.insert(start, end, Area { prot, shared, locked, noexec, object });
         }
         r
     }
@@ -208,7 +213,7 @@ impl Record {
     ) -> bool {
         let locked = self.lock_future;
         let object = object.unwrap_or(Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 });
-        self.areas.insert(start, start + len, Area { prot, shared, locked, object });
+        self.areas.insert(start, start + len, Area { prot, shared, locked, noexec: false, object });
         locked
     }
 
@@ -225,6 +230,17 @@ impl Record {
 
     /// The guest changed the protections of `[start, start + len)` to
     /// `prot`.
+    /// The mapping `[start, start + len)` is of a file of a `noexec` mount.
+    pub fn no_exec(&mut self, start: u64, len: u64) {
+        self.areas.update(start, start + len, |a| Area { noexec: true, ..a.clone() });
+    }
+
+    /// Whether any of `[start, start + len)` maps a file of a `noexec`
+    /// mount.
+    pub fn any_noexec(&self, start: u64, len: u64) -> bool {
+        self.areas.pieces(start, start + len).iter().any(|p| p.value.noexec)
+    }
+
     pub fn protected(&mut self, start: u64, len: u64, prot: u64) {
         self.areas.update(start, start + len, |a| Area { prot, ..a.clone() });
     }
@@ -313,7 +329,7 @@ impl Record {
                 offset: ph.offset.saturating_sub(ph.vaddr + bias - start),
             };
             if file_end > start {
-                let area = Area { prot, shared: false, locked: false, object };
+                let area = Area { prot, shared: false, locked: false, noexec: false, object };
                 self.areas.insert(start, file_end, area);
             }
             if end > file_end {

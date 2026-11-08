@@ -1023,25 +1023,38 @@ show it from the process's root, with each mount's options and its peer
 group (`shared:N`) and master (`master:N`). A bind of a shared mount joins
 its peer group, a new mount under a shared one gets a group of its own,
 and a shared mount made a slave receives from the group it left, as on
-Linux. A mount made under a shared mount propagates as Linux's does: a
-copy at the same place in the parent's peers (as their peer) and in the
-slaves of its group (as a slave, and on through slaves that are shared),
-beneath a mount already there, and its unmount takes the copies that
-have nothing mounted on them; a mount moved into a shared mount propagates
-there, and one under a shared mount cannot be moved (`EINVAL`). Peer groups span namespaces (a copied
-namespace's mounts are peers of the original's, and the groups' numbers
-are counted across namespaces), so a change made in one namespace is
-carried, once it is made, to the others' mount tables.
+Linux. A mount made under a shared mount propagates as Linux's does: it
+and what is under it are shared (each in a group of its own if it had
+none), and a copy goes to the same place in the parent's peers (peers of
+the tree's mounts) and in the slaves of its group and on through slaves
+that are shared (slaves of them, the copies in one shared slave group
+peers of each other), beneath a mount already there. Its unmount takes
+each copy whose mounts are all copies of the unmounted tree's, a mount
+stacked on the copy taking its place; a mount moved into a shared mount
+propagates there, and one under a shared mount cannot be moved
+(`EINVAL`). Peer groups span namespaces (a copied namespace's mounts are
+peers of the original's, and the groups' numbers are counted across
+namespaces), so a change made in one namespace is carried, once it is
+made, to the others' mount tables, and a mount made a slave receives from
+its group if the group has members in any namespace. A namespace copied
+into another user namespace than the original's owner (`unshare -Urm`)
+has slaves of the original's shared mounts instead, so what it mounts does
+not reach back.
 
 A mount's flags are acted on: `nodev` refuses opening a device (`EACCES`),
 `noexec` running a program or mapping a file to execute (`EACCES`,
 `EPERM`), `nosymfollow` following a link (`ELOOP`), and `noatime`,
 `nodiratime` and `strictatime` set a read file's access time as Linux
-would (fwe notes it before the read and sets it after; a mount with none
-of them is `relatime`, Linux's default, left to the host). `statfs`
-reports the flags. A mount is busy, and its unmount refused (`EBUSY`),
-while something is mounted under it, the caller's working directory or
-root is in it, or a file in it is open in an fwe process; `MNT_DETACH`
+would (fwe notes it before the read and, where the host left another,
+sets it after; a mount with none of them is `relatime`, Linux's default,
+left to the host); a mapping of a file of a `noexec` mount cannot be made
+executable later either (`mprotect`, `EACCES`). A remount that names no
+access-time mode keeps the mount's. `statfs` reports the flags. A mount
+is busy, and its unmount refused (`EBUSY`), while something is mounted
+under it, the caller's working directory or root is in it (the working
+directory in the mount it was entered through, not one mounted over it
+since), or a file opened through it is open in the process or, by its
+host path, in another fwe process of the namespace; `MNT_DETACH`
 unmounts it anyway, and `MNT_EXPIRE` marks it on a first call and
 unmounts it on a second if nothing used it in between. `pivot_root`
 replaces the mount at the caller's root, the namespace's or a chroot's.
@@ -1311,7 +1324,10 @@ of these are to be lifted for 1.0 and which are not planned.
   descriptor of its directory; `fspick` reconfigures the one mount, its
   `ro`, `rw` and options; a remount of a filesystem acts on the one mount; a
   tmpfs's `size=` is not enforced; a mount is not busy for a process fwe
-  did not start, nor for another process's working directory. An overlay's layers must be host directories (not in
+  did not start, nor for another process's working directory, nor for a
+  file another process opened at a host path two mounts share (a bind of
+  one directory, a lower layer two overlays have); setting an access time
+  the host left otherwise changes the file's change time too. An overlay's layers must be host directories (not in
   another overlay); a directory a lower layer has cannot be renamed
   (`EXDEV`, as with `redirect_dir=off`); a rename that leaves a whiteout
   behind, and a `bind` over one, are two host steps, between which another

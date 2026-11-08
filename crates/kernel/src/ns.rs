@@ -128,6 +128,12 @@ pub fn host_name() -> Vec<u8> {
 }
 
 impl Namespaces {
+    /// The directory of the user namespace's record (empty for the initial
+    /// one).
+    pub fn user_dir(&self) -> Vec<u8> {
+        self.user.as_ref().map_or_else(Vec::new, |u| u.dir().to_vec())
+    }
+
     /// The host name `uname` and `/proc/sys/kernel/hostname` report.
     pub fn hostname(&self) -> Vec<u8> {
         match &self.uts {

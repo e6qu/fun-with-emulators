@@ -579,6 +579,7 @@ impl<P: Platform> Kernel<P> {
                         crate::fdmarks::opened(
                             device as i32,
                             ns,
+                            resolved.mount_id,
                             resolved.mount_flags,
                             resolved.fstype,
                             None,
@@ -594,7 +595,14 @@ impl<P: Platform> Kernel<P> {
         let layers = resolved.ovl.as_ref().map(|o| o.layers.clone());
         if resolved.ns_path.is_some() || layers.is_some() || stand_in {
             let ns = resolved.ns_path.clone().unwrap_or_default();
-            crate::fdmarks::opened(fd, ns, resolved.mount_flags, resolved.fstype, layers);
+            crate::fdmarks::opened(
+                fd,
+                ns,
+                resolved.mount_id,
+                resolved.mount_flags,
+                resolved.fstype,
+                layers,
+            );
         }
         if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
             crate::fdmarks::set_stand_in(fd, host);
@@ -1767,7 +1775,7 @@ impl<P: Platform> Kernel<P> {
         {
             let ns = self.fs().to_ns(&absolute);
             let (m, _) = self.fs().mount_of(&absolute);
-            crate::fdmarks::opened(fd as i32, ns, m.flags, m.fstype, None);
+            crate::fdmarks::opened(fd as i32, ns, m.id, m.flags, m.fstype, None);
         }
         fd
     }
@@ -2229,7 +2237,7 @@ impl<P: Platform> Kernel<P> {
             }
             libc::fcntl(fd, libc::F_SETFD, fd_flags);
         }
-        crate::fdmarks::opened(fd, o.ns_path, o.flags, o.fstype, o.ovl);
+        crate::fdmarks::opened(fd, o.ns_path, o.mount, o.flags, o.fstype, o.ovl);
         if dir {
             crate::overlay::moved(fd);
         }

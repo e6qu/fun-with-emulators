@@ -244,7 +244,9 @@ impl<P: Platform> Kernel<P> {
         let ns = self.fs().mount_ns().clone();
         let r = if flags & ms::REMOUNT != 0 {
             let opts = (!data.is_empty() && flags & ms::BIND == 0).then(|| data.clone());
-            let flags = flags | default_atime(flags);
+            // With no access-time mode named the mount keeps its own.
+            let named = flags & (ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME);
+            let flags = if named == 0 { flags } else { flags | default_atime(flags) };
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0 {
             match self.mount_path(&source, true) {
@@ -310,8 +312,10 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// `umount2(target, flags)`. A mount is always detached at once
-    /// (`MNT_DETACH`): fwe does not track what keeps it busy.
+    /// `umount2(target, flags)`: a mount in use is refused (`EBUSY`, see
+    /// [`Self::mount_busy`]) unless detached (`MNT_DETACH`) or forced; with
+    /// `MNT_EXPIRE` an unused one is first marked (`EAGAIN`), and unmounted
+    /// by the next such call if nothing used it in between.
     pub(crate) fn sys_umount2(&mut self, target: u64, flags: u64) -> i64 {
         if !self.creds.has_admin() {
             return err(errno::EPERM);
@@ -369,8 +373,9 @@ impl<P: Platform> Kernel<P> {
 
     /// Whether mount `id` is in use, as Linux refuses to unmount one that
     /// is (`EBUSY`): something is mounted under it, the caller's working
-    /// directory or root is in it, or a file in it is open in an fwe
-    /// process.
+    /// directory or root is in it, or a file opened through it is open in
+    /// this process or, as far as the host can tell, another fwe process
+    /// of the namespace.
     fn mount_busy(&self, table: &crate::mounts::Table, id: u32) -> bool {
         use crate::mounts::under;
         let Some(m) = table.get(id) else { return false };
@@ -378,43 +383,59 @@ impl<P: Platform> Kernel<P> {
             return true;
         }
         let fs = self.fs();
-        let cwd = fs.to_ns(fs.cwd());
-        if under(&cwd, &m.point).is_some()
-            || (fs.proc_root() != b"/" && under(fs.proc_root(), &m.point).is_some())
-        {
+        let cwd_in = match fs.cwd_mount().filter(|c| table.get(*c).is_some()) {
+            Some(c) => c == id,
+            None => under(&fs.to_ns(fs.cwd()), &m.point).is_some(),
+        };
+        if cwd_in || (fs.proc_root() != b"/" && under(fs.proc_root(), &m.point).is_some()) {
             return true;
         }
-        // Where its files are on the host, as a descriptor's path reads.
-        let roots: Vec<Vec<u8>> = match &m.source {
-            Source::Host(_) => m.host_path(b"").into_iter().collect(),
-            Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
-            Source::Synthetic => Vec::new(),
+        // A file opened through it here.
+        if crate::fdmarks::open_in(id) {
+            return true;
+        }
+        // One open in another fwe process of the namespace, by where it is
+        // on the host: in this mount's files and in no other mount's as
+        // deeply (a path two mounts share, as a bind of one directory or a
+        // lower layer two overlays have, could be either's).
+        let canonical = |r: &[u8]| -> Vec<u8> {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            std::fs::canonicalize(std::ffi::OsStr::from_bytes(r))
+                .map_or_else(|_| r.to_vec(), |p| p.into_os_string().into_vec())
         };
-        let roots: Vec<Vec<u8>> = roots
-            .into_iter()
-            .map(|r| {
-                use std::os::unix::ffi::{OsStrExt, OsStringExt};
-                std::fs::canonicalize(std::ffi::OsStr::from_bytes(&r))
-                    .map_or(r, |p| p.into_os_string().into_vec())
-            })
-            .collect();
+        let roots_of = |m: &crate::mounts::Mount| -> Vec<Vec<u8>> {
+            let roots: Vec<Vec<u8>> = match &m.source {
+                Source::Host(_) => m.host_path(b"").into_iter().collect(),
+                Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
+                Source::Synthetic => Vec::new(),
+            };
+            roots.iter().map(|r| canonical(r)).collect()
+        };
+        let roots = roots_of(m);
         if roots.is_empty() {
             return false;
         }
+        let others: Vec<Vec<u8>> =
+            table.mounts.iter().filter(|o| o.id != id).flat_map(roots_of).collect();
+        let deepest = |path: &[u8], roots: &[Vec<u8>]| {
+            roots.iter().filter(|r| under(path, r).is_some()).map(Vec::len).max()
+        };
+        let ours = |path: &[u8]| match deepest(path, &roots) {
+            Some(d) => deepest(path, &others).is_none_or(|o| o < d),
+            None => false,
+        };
         // SAFETY: getpid cannot fail.
         let me = unsafe { libc::getpid() };
-        let mut pids: Vec<i32> = crate::procreg::all().into_iter().map(|(p, _)| p).collect();
-        if !pids.contains(&me) {
-            pids.push(me);
-        }
-        pids.into_iter().any(|p| {
-            crate::procpid::fds(p).into_iter().any(|(_, t)| match t {
-                crate::procpid::FdTarget::Path(path) => {
-                    roots.iter().any(|r| under(&path, r).is_some())
-                }
-                _ => false,
+        let ns = fs.mount_ns().dir().to_vec();
+        crate::procreg::all()
+            .into_iter()
+            .filter(|(p, r)| *p != me && r.ns.first().is_none_or(|d| *d == ns))
+            .any(|(p, _)| {
+                crate::procpid::fds(p).into_iter().any(|(_, t)| match t {
+                    crate::procpid::FdTarget::Path(path) => ours(&path),
+                    _ => false,
+                })
             })
-        })
     }
 
     /// `pivot_root(new_root, put_old)`: the mount at `new_root` becomes the
