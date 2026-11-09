@@ -282,9 +282,10 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
     let word = slot.state.as_ptr().cast::<libc::c_void>();
     loop {
         let cur = slot.state.load(SeqCst);
-        if st(cur) == WOKEN || crate::futex::load(uaddr) != Ok(val) {
-            // Woken, or the word changed under it (a spurious wakeup, which
-            // a futex's caller allows for, rather than risk missing a wake).
+        // Only a wake ends the wait (or moves it, a requeue): as on Linux,
+        // the word is compared once, as the wait begins, and a change to it
+        // afterwards wakes nobody.
+        if st(cur) == WOKEN {
             let _ = give_back(slot);
             return 0;
         }
