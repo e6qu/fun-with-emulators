@@ -39,8 +39,21 @@ HARD_LIMIT = 300
 # run beside them (four at a time, where LTP runs one) would otherwise see
 # and change.
 IPC_TESTS = re.compile(r"^(shm|sem|msg|ipc|mq_)")
-# A test that runs away with processes must not take the host with it.
-PROCESS_LIMIT = 1500
+# A test that runs away with processes must not take the host with it: the
+# tests have this many processes beyond those the user had as the run began
+# (a host's limit counts all of the user's, and a CI runner's user has
+# hundreds of its own; futex_cmp_requeue01 forks a thousand).
+PROCESS_HEADROOM = 1500
+
+
+def process_limit():
+    """The user's process limit for the tests: what it runs now, and
+    PROCESS_HEADROOM more."""
+    found = subprocess.run(["ps", "-U", str(os.getuid()), "-o", "pid="], capture_output=True, text=True)
+    return len(found.stdout.split()) + PROCESS_HEADROOM
+
+
+PROCESS_LIMIT = process_limit()
 
 
 def prepare(root):
@@ -185,7 +198,8 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         command = [fwe, "--root", root, busybox, "unshare", "-i", "--", prog, *argv[1:]]
     with tempfile.TemporaryFile(dir=work) as log:
         proc = subprocess.Popen(
-            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null; exec "$@"', "sh", *command],
+            # (At most the host's hard limit, when that is lower.)
+            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null || ulimit -u "$(ulimit -H -u)"; exec "$@"', "sh", *command],
             cwd=tmp,
             env=env,
             stdin=subprocess.DEVNULL,
