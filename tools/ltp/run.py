@@ -243,11 +243,12 @@ def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             time.sleep(1)
 
 
-# Tests that change a machine-wide setting (a sysctl) and put it back as
+# Tests that change a machine-wide setting (a sysctl: fork13 lowers
+# kernel.pid_max, which getpid01 checks pids against) and put it back as
 # they end: run one at a time, after the rest, so that none of them takes
 # another's change for the setting to restore, nor runs while another's is
 # in force.
-SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04)(_64)?$")
+SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13)(_64)?$")
 
 
 def main():
