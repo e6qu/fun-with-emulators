@@ -39,8 +39,21 @@ HARD_LIMIT = 300
 # run beside them (four at a time, where LTP runs one) would otherwise see
 # and change.
 IPC_TESTS = re.compile(r"^(shm|sem|msg|ipc|mq_)")
-# A test that runs away with processes must not take the host with it.
-PROCESS_LIMIT = 1500
+# A test that runs away with processes must not take the host with it: the
+# tests have this many processes beyond those the user had as the run began
+# (a host's limit counts all of the user's, and a CI runner's user has
+# hundreds of its own; futex_cmp_requeue01 forks a thousand).
+PROCESS_HEADROOM = 1500
+
+
+def process_limit():
+    """The user's process limit for the tests: what it runs now, and
+    PROCESS_HEADROOM more."""
+    found = subprocess.run(["ps", "-U", str(os.getuid()), "-o", "pid="], capture_output=True, text=True)
+    return len(found.stdout.split()) + PROCESS_HEADROOM
+
+
+PROCESS_LIMIT = process_limit()
 
 
 def prepare(root):
@@ -107,6 +120,24 @@ def end_session(sid):
             pass
 
 
+def end_leftovers(fwe, root):
+    """End what tests left running outside their sessions (a child stopped
+    and orphaned, a daemon of its own): every process of this fwe on this
+    root, once no test runs. Returns how many there were. They count
+    against the user's processes, which a test that forks a thousand
+    (futex_cmp_requeue01) needs."""
+    found = subprocess.run(
+        ["pgrep", "-f", "^" + re.escape(f"{fwe} --root {root} ")], capture_output=True, text=True
+    )
+    pids = [int(p) for p in found.stdout.split() if int(p) > 0]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return len(pids)
+
+
 def stacks(sid, work):
     """The stacks of the processes of session `sid`, as macOS's `sample`
     takes them: fwe's own frames, a few lines a thread."""
@@ -167,7 +198,8 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         command = [fwe, "--root", root, busybox, "unshare", "-i", "--", prog, *argv[1:]]
     with tempfile.TemporaryFile(dir=work) as log:
         proc = subprocess.Popen(
-            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null; exec "$@"', "sh", *command],
+            # (At most the host's hard limit, when that is lower.)
+            ["/bin/sh", "-c", f'ulimit -u {PROCESS_LIMIT} 2>/dev/null || ulimit -u "$(ulimit -H -u)"; exec "$@"', "sh", *command],
             cwd=tmp,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -211,11 +243,12 @@ def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             time.sleep(1)
 
 
-# Tests that change a machine-wide setting (a sysctl) and put it back as
+# Tests that change a machine-wide setting (a sysctl: fork13 lowers
+# kernel.pid_max, which getpid01 checks pids against) and put it back as
 # they end: run one at a time, after the rest, so that none of them takes
 # another's change for the setting to restore, nor runs while another's is
 # in force.
-SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04)(_64)?$")
+SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13)(_64)?$")
 
 
 def main():
@@ -255,6 +288,9 @@ def main():
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, args.hard_limit) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
                 report(*fut.result())
+        left = end_leftovers(fwe, root)
+        if left:
+            print(f"ended {left} processes tests left running")
         for n, a in serial:
             report(*run_guarded(fwe, root, work, n, a, args.hard_limit))
     finally:
@@ -295,6 +331,7 @@ def main():
         argv_of = dict(tests)
         work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
         try:
+            end_leftovers(fwe, root)
             again = {n: run_guarded(fwe, root, work, n, argv_of[n]) for n in regressed}
         finally:
             shutil.rmtree(work, ignore_errors=True)

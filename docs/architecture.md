@@ -844,9 +844,18 @@ which are to be lifted for 1.0 and which are not planned.
   change how the host schedules.
 
 **Memory**
-- Native: `mremap` cannot grow a mapping (`ENOMEM`; C libraries fall back
-  to allocating and copying); `MADV_DONTNEED` on a private file mapping
-  keeps modified pages where Linux restores the file's.
+- Native: `mremap` does not grow or move code (an executable mapping,
+  prepared where it is: `ENOMEM`); a grown shared anonymous mapping's new
+  part is new memory, not shared with processes that share the rest;
+  `MADV_DONTNEED` on a private file mapping keeps modified pages where
+  Linux restores the file's.
+- `vm.max_map_count` is not enforced, and each mapping change publishes
+  the whole mapping list, so a process with tens of thousands of
+  mappings is slow to change them.
+- VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
+  `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
+  nothing.
+- `/proc/<pid>/pagemap` and `coredump_filter` are not there.
 - Native: write+exec memory takes a fault each time a page goes from being
   written to being run or back, slow for code that does both to one page
   often; a host call writing into such a page while it is executable (a

@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 978 of 1550 (81% of the 1212 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 992 of 1550 (82% of the 1211 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -107,7 +107,10 @@ capabilities. *crun, podman and containerd run standard images.*
 - sockets checked and numbered as Linux has them: arguments in Linux's
   order, the IP, IPv6, TCP and socket options translated, `MSG_MORE`,
   `sendmmsg`/`recvmmsg`, `connect` to `AF_UNSPEC`, `IPV6_ADDRFORM`,
-  abstract names freed with their socket, and the interface requests.
+  abstract names freed with their socket, and the interface requests;
+- memory calls as Linux has them: `mremap` grows and moves mappings,
+  `madvise` and `msync` checked per mapping, `MADV_WIPEONFORK`,
+  `MADV_HWPOISON`, stacks that grow down, and shared `/dev/zero`.
 
 ## Left to 1.0
 
@@ -137,7 +140,8 @@ run.
 - [ ] **Every other failure LTP points at**, among them:
   - `EPOLLEXCLUSIVE`;
   - `eventfd` across processes;
-  - `rename`, `statx`, `mremap`, `madvise` details.
+  - `rename` and `statx` details, `vm.max_map_count`,
+    `/proc/<pid>/pagemap` and `coredump_filter`.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its

@@ -225,6 +225,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // The child's pid: in the child, its own namespace's; in the
         // parent, as the parent sees it.
         let shown = if pid == 0 { k.fork_child(token) } else { k.fork_parent(token, pid) };
+        // A child with memory of its own has none of what was to be wiped.
+        if pid == 0 && share.is_empty() {
+            fwe_kernel::mm::forked_child();
+        }
         (if pid < 0 { e } else { pid as i64 }, kqueues, shown)
     };
     if pid < 0 {
