@@ -590,6 +590,8 @@ fn main() {
             // it while a child in its own namespace has it.
             // SAFETY: plain calls; the child waits until killed.
             unsafe {
+                let mut ready = [0i32; 2];
+                pipe(ready.as_mut_ptr());
                 let pid = fork();
                 if pid == 0 {
                     unshare(CLONE_NEWNET);
@@ -597,10 +599,13 @@ fn main() {
                     let l = std::net::TcpListener::bind("127.0.0.1:18082").unwrap();
                     println!("inside: {}", l.local_addr().unwrap());
                     std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    write(ready[1], b"x".as_ptr(), 1);
                     pause();
                     _exit(0);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Once the child holds its port.
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
                 let outside = std::net::TcpListener::bind("127.0.0.1:18082");
                 println!("outside too: {}", outside.is_ok());
                 kill(pid, SIGKILL);

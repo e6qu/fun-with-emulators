@@ -71,6 +71,7 @@ pub mod signal;
 pub mod signalfd;
 pub mod signote;
 pub mod snapshot;
+pub mod sockopt;
 pub mod specialfd;
 pub mod specialwrite;
 pub mod splice;
@@ -670,6 +671,7 @@ impl<P: Platform> Kernel<P> {
             groups,
             caps,
         };
+        creds::note_dac_override(self.creds.has(caps::CAP_DAC_OVERRIDE));
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
         let _ = fdtable::set_limit(soft, hard);
@@ -907,6 +909,7 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     inotify::after_io(nr, a, r);
     let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
     let r = net::linux_read_error(nr, a[0] as i32, r);
+    let r = net::linux_send_error(nr, a[0] as i32, r);
     if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
         sigpipe_for_socket(nr, a);
     }
@@ -1055,9 +1058,6 @@ fn copy_between(
     if done == 0 && failure != 0 { err(failure) } else { done as i64 }
 }
 
-/// A write to a socket whose peer has gone raises `SIGPIPE`, unless the send
-/// said `MSG_NOSIGNAL`. fwe's sockets never let the host raise it (they are
-/// all `SO_NOSIGPIPE`, so that the flag can be honoured), so it does.
 /// `preadv`/`pwritev` (and with `v2`, `preadv2`/`pwritev2`, whose offset
 /// -1 is the file's own position and whose `RWF_*` `flags` qualify the
 /// call): vectored I/O on `fd` at `offset`. On arm64 Linux the 64-bit
@@ -1148,6 +1148,28 @@ fn vectored_at(
 /// A vectored read (or `write`) of no buffers: nothing moves, but the
 /// descriptor must be open for it, as on Linux (the host refuses the
 /// call outright).
+/// The `n` bytes from byte `at` of the buffers `iov`.
+fn iovecs_part(iov: &[libc::iovec], at: u64, n: u64) -> Vec<libc::iovec> {
+    let (mut skip, mut left) = (at as usize, n as usize);
+    let mut out = Vec::new();
+    for v in iov {
+        if left == 0 {
+            break;
+        }
+        if skip >= v.iov_len {
+            skip -= v.iov_len;
+            continue;
+        }
+        let len = (v.iov_len - skip).min(left);
+        // SAFETY: `skip` is within the buffer.
+        let base = unsafe { v.iov_base.cast::<u8>().add(skip) };
+        out.push(libc::iovec { iov_base: base.cast(), iov_len: len });
+        left -= len;
+        skip = 0;
+    }
+    out
+}
+
 fn no_buffers(fd: i32, write: bool) -> i64 {
     // SAFETY: plain host call on the guest's descriptor.
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1191,6 +1213,9 @@ fn append_vectored(fd: i32, iov: &[libc::iovec], offset: i64) -> isize {
     }
 }
 
+/// A write to a socket whose peer has gone raises `SIGPIPE`, unless the send
+/// said `MSG_NOSIGNAL`. fwe's sockets never let the host raise it (they are
+/// all `SO_NOSIGPIPE`, so that the flag can be honoured), so it does.
 fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
     use fwe_abi::nr as n;
     const MSG_NOSIGNAL: u64 = 0x4000;
@@ -1198,6 +1223,7 @@ fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
         n::WRITE | n::WRITEV | n::PWRITE64 | n::SENDFILE => false,
         n::SENDTO => a[3] & MSG_NOSIGNAL != 0,
         n::SENDMSG => a[2] & MSG_NOSIGNAL != 0,
+        n::SENDMMSG => a[3] & MSG_NOSIGNAL != 0,
         _ => return,
     };
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -1322,6 +1348,20 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // A socket holding bytes back for `MSG_MORE`: they go first.
+            if net::corked(fd) {
+                // SAFETY: the guest buffer spans the length.
+                return Some(unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) });
+            }
+            // A pipe holding less than the host's: as much as it has room for.
+            let write = |at: u64, n: u64| {
+                // SAFETY: the host validates the guest buffer; `at + n` is
+                // within its length.
+                host::ret(unsafe { libc::write(fd, (buf + at) as *const _, n as usize) } as i64)
+            };
+            if let Some(r) = fdstate::capped_write(fd, len, write) {
+                return Some(r);
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
@@ -1341,7 +1381,18 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
                 let special = specialwrite::Source::Host(&iov);
-                match specialwrite::write(a[0] as i32, special, specialwrite::total(&iov)) {
+                let total = specialwrite::total(&iov);
+                let capped = |at: u64, n: u64| {
+                    let part = iovecs_part(&iov, at, n);
+                    // SAFETY: as for readv: a part of the same buffers.
+                    host::ret(
+                        unsafe { libc::writev(a[0] as i32, part.as_ptr(), part.len() as i32) }
+                            as i64,
+                    )
+                };
+                match specialwrite::write(a[0] as i32, special, total)
+                    .or_else(|| fdstate::capped_write(a[0] as i32, total, capped))
+                {
                     Some(r) => r,
                     // SAFETY: as for readv.
                     None => host::ret(unsafe {
@@ -1426,6 +1477,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::SENDMSG => unsafe { net::sendmsg(a[0], a[1], a[2]) },
         // SAFETY: caller guarantees the msghdr.
         n::RECVMSG => unsafe { net::recvmsg(a[0], a[1], a[2]) },
+        // SAFETY: caller guarantees the message vector.
+        n::SENDMMSG => unsafe { net::sendmmsg(a[0], a[1], a[2], a[3]) },
+        // SAFETY: caller guarantees the message vector and timeout.
+        n::RECVMMSG => unsafe { net::recvmmsg(a[0], a[1], a[2], a[3], a[4]) },
         _ => return None,
     })
 }

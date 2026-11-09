@@ -212,6 +212,11 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             Ok(n)
         };
     };
+    // Nothing is ready until the host says so (whatever the caller's
+    // `revents` held).
+    for f in fds.iter_mut() {
+        f.revents = 0;
+    }
     let mut all: Vec<libc::pollfd> = fds.to_vec();
     all.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
     // The timer only for a wait with a deadline: one an earlier wait left

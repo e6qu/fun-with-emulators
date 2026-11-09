@@ -518,7 +518,14 @@ shapes differently:
   through. Owner thread, `F_SETSIG`'s signal, whether the open made the
   file (`F_CREATED_QUERY`) and pipe sizes (`F_SETPIPE_SZ`,
   `fs.pipe-max-size`) are kept by fwe (`crates/kernel/src/fdstate.rs`) and
-  checked as Linux checks them. A host `SIGIO` for a descriptor with a
+  checked as Linux checks them. A pipe given less than the host's capacity
+  holds no more: the writing process keeps the page buffers its writes
+  made, as Linux fills them (a write's tail shorter than a page joins the
+  last buffer if it fits whole, a read frees a buffer once it has read all
+  of it), learns from the bytes the host pipe holds how far reads have
+  gone, and cuts each write to the room left, waiting for more while
+  blocking. A full pipe is not writable to `poll`, `select` and `epoll`,
+  which look at it each millisecond. A host `SIGIO` for a descriptor with a
   chosen signal arrives as that signal, with `si_fd` and `si_band`.
 - **Leases** (`crates/kernel/src/leases.rs`): a record every fwe process
   shares. An open or truncation that conflicts with a lease signals its
@@ -645,10 +652,19 @@ records ([linux-on-macos.md](linux-on-macos.md#ipc)). Their details:
 
 Sockets and terminals are the host's; fwe translates their interfaces:
 
-- `crates/kernel/src/net.rs` translates addresses, flags and options (see
-  [linux-on-macos.md](linux-on-macos.md#sockets)). A Unix socket gets
-  Linux's buffer sizes; reading an unconnected Unix stream socket fails
-  with `EINVAL`; `shutdown` of one whose peer has gone succeeds.
+- `crates/kernel/src/net.rs` translates addresses, flags and options,
+  with `crates/kernel/src/sockopt.rs` for the IP, IPv6 and TCP options
+  (see [linux-on-macos.md](linux-on-macos.md#sockets)), and checks each
+  call's arguments in Linux's order before the host sees them. A Unix
+  socket gets Linux's buffer sizes; reading an unconnected Unix stream
+  socket fails with `EINVAL`; `shutdown` of one whose peer has gone
+  succeeds. What the host has no place for is kept per descriptor in the
+  process: bytes `MSG_MORE` holds back, multicast groups a TCP socket
+  joined, the options fwe keeps, and which IPv6 sockets `IPV6_ADDRFORM`
+  made IPv4. The calls run without the kernel lock, so whether the caller
+  passes permission bits (`CAP_DAC_OVERRIDE`), which a connect to a Unix
+  socket's node needs, is published after each system call
+  (`creds::dac_override`).
 - `AF_UNIX` paths resolve like file paths (`fs::resolve_host`; the socket
   calls run without the kernel lock, so the process's root and working
   directory are published for them). `bind` follows no final symlink and
@@ -855,7 +871,10 @@ which are to be lifted for 1.0 and which are not planned.
   original.
 - A pipe holds at most what the host's does (64 KiB): a new pipe's
   capacity is that, not Linux's 16 pages, and one set larger with
-  `F_SETPIPE_SZ` still holds no more.
+  `F_SETPIPE_SZ` still holds no more. A smaller capacity is kept by the
+  process that writes: writes from two processes into a pipe sharing it
+  are each held to the room one of them sees, and `splice`, `tee` and
+  `vmsplice` into it count its room in bytes, not page buffers.
 - `pwritev2` with `RWF_APPEND` sets `O_APPEND` on the open file for the
   call, which another writer sharing it sees meanwhile.
 - Descriptors received with `SCM_RIGHTS` are not held to the guest's
@@ -965,9 +984,7 @@ which are to be lifted for 1.0 and which are not planned.
 **Event descriptors and inotify**
 - `EPOLLEXCLUSIVE` wakes every waiter; `timerfd` measures
   `TFD_TIMER_ABSTIME` against the realtime clock whatever its clock, and a
-  periodic timer's first expiry is its interval; a pipe keeps the host's
-  capacity whatever `F_SETPIPE_SZ` set (`F_GETPIPE_SZ` reports the size
-  set).
+  periodic timer's first expiry is its interval.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in
@@ -989,6 +1006,14 @@ which are to be lifted for 1.0 and which are not planned.
   not held; `RLIMIT_MSGQUEUE` counts the user's queues in the namespace
   only; a registration goes with `close` or `execve` of a descriptor, not
   `dup2` or `close_range`.
+- Sockets: what fwe keeps of a socket (`MSG_MORE`'s bytes held back, a
+  TCP socket's multicast groups, kept options, `IPV6_ADDRFORM`) is the
+  process's, per descriptor, so a duplicate or another process sharing
+  the socket does not see it; a socket closed with bytes held back sends
+  them without waiting. An abstract name whose socket is bound but not
+  listening counts as free. Options whose data comes in control messages
+  (`IP_PKTINFO`, `IP_RECVTTL`, `SO_TIMESTAMP`) are refused, and so is
+  `TCP_INFO`.
 - Keys: no `/sbin/request-key` helper runs, so a constructed key is
   negative and `KEYCTL_INSTANTIATE`, `NEGATE`, `REJECT` and
   `ASSUME_AUTHORITY` have no authorisation key; asymmetric keys are RSA
