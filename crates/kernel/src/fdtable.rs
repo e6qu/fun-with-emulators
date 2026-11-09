@@ -303,6 +303,7 @@ pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
         || (nr == fwe_abi::nr::EPOLL_CTL && bad(a[2]))
         || (nr == fwe_abi::nr::SENDFILE && bad(a[1]))
         || (nr == fwe_abi::nr::SYMLINKAT && bad(a[1]))
+        || (nr == fwe_abi::nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS == 0 && bad(a[4]))
         || crate::fdmarks::refuses_path(nr, a)
     {
         return Err(fwe_abi::err(fwe_abi::errno::EBADF));

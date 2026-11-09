@@ -1127,8 +1127,10 @@ them out on the slab and the guest's page tables:
 | `MAP_FIXED`, `MAP_FIXED_NOREPLACE` | replace / refuse to replace | host `MAP_FIXED`; `NOREPLACE` checks where macOS put it (`EEXIST`) | page-table edit; over slab memory at its own address, that memory is reused, zeroed |
 | `munmap` | | host `munmap` | removes the pages from stage 1 and flushes TLBs; the slab range is zeroed before reuse |
 | `mprotect` | | host `mprotect`; adding `PROT_EXEC` prepares the code first | stage-1 permission edit |
-| `mremap` | grow, shrink, move | shrink only; growing fails with `ENOMEM`, and C libraries fall back to allocate-and-copy | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
+| `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part, found by the host's name for the mapped file); move with Mach's `mach_vm_remap`, which takes the pages, their contents and sharing to the new place, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
 | `madvise(MADV_DONTNEED)` | private anonymous pages read as zero again | each private anonymous piece replaced by a fresh mapping (macOS's own keeps the data) | private pages read as zero again, or as the file for a private file mapping; shared memory keeps its contents |
+| `madvise` other advice | hints; `MADV_FREE`, `MADV_REMOVE`, `MADV_WIPEONFORK` | hints given to the host, never failing for mapped memory; the advice and each mapping in the range checked as Linux checks them; `MADV_WIPEONFORK` ranges zeroed in a fork child | the same, but a fork child keeps `MADV_WIPEONFORK` memory |
+| `MAP_SHARED` of `/dev/zero` | shared anonymous memory | shared anonymous memory (macOS cannot map the device) | the same |
 | `mlock` family | wires pages | pages brought in and counted against `RLIMIT_MEMLOCK`, not wired | the same |
 | `mincore` | residency per page | the host's residency | by 16 KiB host pages |
 

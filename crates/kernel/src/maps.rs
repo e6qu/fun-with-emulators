@@ -65,6 +65,9 @@ pub struct Area {
     /// It maps a file of a `noexec` mount, so it may not be made
     /// executable (Linux's `VM_MAYEXEC` clear).
     pub noexec: bool,
+    /// A shared mapping of a file not open for writing, so it may not be
+    /// made writable (Linux's `VM_MAYWRITE` clear).
+    pub nowrite: bool,
     /// Sealed (`mseal`): not to be unmapped, moved, remapped over, have
     /// its protections changed or, read-only and anonymous, be discarded.
     pub sealed: bool,
@@ -98,6 +101,7 @@ impl Area {
             shared: false,
             locked: false,
             noexec: false,
+            nowrite: false,
             sealed: false,
             object: Object { name, dev: 0, ino: 0, offset: 0 },
         }
@@ -165,6 +169,7 @@ impl Record {
             e.bool(a.shared);
             e.bool(a.locked);
             e.bool(a.noexec);
+            e.bool(a.nowrite);
             e.bool(a.sealed);
             match &a.object.name {
                 Name::Anonymous => e.u8(0),
@@ -186,11 +191,12 @@ impl Record {
         r.lock_future = d.bool();
         r.exe = d.bytes();
         r.exe_id = (d.u64(), d.u64());
-        let n = d.count(8 * 6 + 5);
+        let n = d.count(8 * 6 + 6);
         for _ in 0..n {
             let (start, end, prot, dev, ino, offset) =
                 (d.u64(), d.u64(), d.u64(), d.u64(), d.u64(), d.u64());
-            let (shared, locked, noexec, sealed) = (d.bool(), d.bool(), d.bool(), d.bool());
+            let (shared, locked, noexec, nowrite, sealed) =
+                (d.bool(), d.bool(), d.bool(), d.bool(), d.bool());
             let name = match d.u8() {
                 1 => Name::Heap,
                 2 => Name::Stack,
@@ -199,7 +205,8 @@ impl Record {
                 _ => Name::Anonymous,
             };
             let object = Object { name, dev, ino, offset };
-            r.areas.insert(start, end, Area { prot, shared, locked, noexec, sealed, object });
+            let area = Area { prot, shared, locked, noexec, nowrite, sealed, object };
+            r.areas.insert(start, end, area);
         }
         r
     }
@@ -218,7 +225,8 @@ impl Record {
     ) -> bool {
         let locked = self.lock_future;
         let object = object.unwrap_or(Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 });
-        let area = Area { prot, shared, locked, noexec: false, sealed: false, object };
+        let area =
+            Area { prot, shared, locked, noexec: false, nowrite: false, sealed: false, object };
         self.areas.insert(start, start + len, area);
         locked
     }
@@ -275,6 +283,17 @@ impl Record {
     /// The mapping `[start, start + len)` is of a file of a `noexec` mount.
     pub fn no_exec(&mut self, start: u64, len: u64) {
         self.areas.update(start, start + len, |a| Area { noexec: true, ..a.clone() });
+    }
+
+    /// The mapping `[start, start + len)` shares a file not open for
+    /// writing.
+    pub fn no_write(&mut self, start: u64, len: u64) {
+        self.areas.update(start, start + len, |a| Area { nowrite: true, ..a.clone() });
+    }
+
+    /// Whether any of `[start, start + len)` may not be made writable.
+    pub fn any_nowrite(&self, start: u64, len: u64) -> bool {
+        self.areas.pieces(start, start + len).iter().any(|p| p.value.nowrite)
     }
 
     /// Whether any of `[start, start + len)` maps a file of a `noexec`
@@ -376,6 +395,7 @@ impl Record {
                     shared: false,
                     locked: false,
                     noexec: false,
+                    nowrite: false,
                     sealed: false,
                     object,
                 };

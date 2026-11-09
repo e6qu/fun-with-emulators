@@ -3489,6 +3489,42 @@ mod tests {
         let _ = k.syscall(nr::MUNMAP, [at, len, 0, 0, 0, 0]);
     }
 
+    /// `mremap`: checked as Linux checks it; a range grows in place with
+    /// its contents, or moves with them (`MREMAP_MAYMOVE`, or to a place
+    /// asked for with `MREMAP_FIXED`), the grown part zero.
+    #[test]
+    fn mappings_grow_and_move_with_their_contents() {
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let page = k.page_size;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let rw = PROT_READ | PROT_WRITE;
+        let p = k.syscall(nr::MMAP, [0, 2 * page, rw, anon, u64::MAX, 0]) as u64;
+        // SAFETY: the two pages just mapped.
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0x5a, 2 * page as usize) };
+        let mut remap = |a: [u64; 5]| k.syscall(nr::MREMAP, [a[0], a[1], a[2], a[3], a[4], 0]);
+        assert_eq!(remap([p + 1, page, page, 0, 0]), err(errno::EINVAL));
+        assert_eq!(remap([p, page, page, MREMAP_FIXED, p + 8 * page]), err(errno::EINVAL));
+        assert_eq!(
+            remap([p, 2 * page, 2 * page, MREMAP_MAYMOVE | MREMAP_FIXED, p + page]),
+            err(errno::EINVAL)
+        );
+        let q = remap([p, 2 * page, 4 * page, MREMAP_MAYMOVE, 0]) as u64;
+        assert!(q as i64 > 0, "mremap: {}", q as i64);
+        // SAFETY: the four pages it now has.
+        let bytes = unsafe { std::slice::from_raw_parts(q as *const u8, 4 * page as usize) };
+        assert!(bytes[..2 * page as usize].iter().all(|&b| b == 0x5a));
+        assert!(bytes[2 * page as usize..].iter().all(|&b| b == 0));
+        // Moved where asked, the old place no longer mapped.
+        let to = k.syscall(nr::MMAP, [0, 4 * page, rw, anon, u64::MAX, 0]) as u64;
+        let mut remap = |a: [u64; 5]| k.syscall(nr::MREMAP, [a[0], a[1], a[2], a[3], a[4], 0]);
+        assert_eq!(remap([q, 4 * page, 4 * page, MREMAP_MAYMOVE | MREMAP_FIXED, to]), to as i64);
+        // SAFETY: the first page at its new place.
+        assert_eq!(unsafe { *(to as *const u8) }, 0x5a);
+        assert_eq!(remap([q, page, page, MREMAP_MAYMOVE, 0]), err(errno::EFAULT));
+        let _ = k.syscall(nr::MUNMAP, [to, 4 * page, 0, 0, 0, 0]);
+    }
+
     /// A process descriptor: refused for what names no process or with
     /// flags Linux lacks; one of this process, non-blocking as asked, has
     /// not ended, and reads as pidfs shows one.

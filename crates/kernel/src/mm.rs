@@ -4,6 +4,7 @@ use crate::host::{last_error, ret};
 use crate::{Kernel, MemCall, Platform};
 use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
 /// The program break: a reserved region after the executable image that
@@ -90,6 +91,51 @@ pub fn tracked() -> Vec<(u64, u64)> {
     guest_maps().iter().map(|(&s, &e)| (s, e - s)).collect()
 }
 
+/// Host ranges given `MADV_WIPEONFORK`: a fork child finds them zero
+/// ([`forked_child`]), and so does its own child.
+static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn wipe_on_fork() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    WIPE_ON_FORK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// In a fork child: the ranges given `MADV_WIPEONFORK` are zero, as Linux
+/// gives the child new memory there. They are zeroed in place, the
+/// mappings left as they are (a backend may map the memory itself),
+/// writable for the moment if they are not.
+pub fn forked_child() {
+    // Kept as start and end.
+    let ranges: Vec<(u64, u64)> = wipe_on_fork().iter().map(|(&a, &e)| (a, e - a)).collect();
+    for (addr, len) in ranges {
+        let prot = region_prot(addr);
+        // SAFETY: memory of the process's own that it mapped, made
+        // writable for the zeroing and given back its protection.
+        unsafe {
+            let p = addr as *mut libc::c_void;
+            if prot & libc::PROT_WRITE == 0 {
+                libc::mprotect(p, len as usize, libc::PROT_READ | libc::PROT_WRITE);
+            }
+            std::ptr::write_bytes(addr as *mut u8, 0, len as usize);
+            if prot & libc::PROT_WRITE == 0 {
+                libc::mprotect(p, len as usize, prot);
+            }
+        }
+    }
+}
+
+/// The host protection of the memory at host address `addr`.
+fn region_prot(addr: u64) -> libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        region::query(addr).map_or(libc::PROT_READ | libc::PROT_WRITE, |r| r.protection)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = addr;
+        libc::PROT_READ | libc::PROT_WRITE
+    }
+}
+
 /// Guest memory the guest mapped both writable and executable, host
 /// addresses `start -> end`. macOS never maps memory so, so the host keeps
 /// these writable only: in the hypervisor backend the VM alone executes
@@ -130,6 +176,7 @@ fn wants_write_exec(prot: u64) -> bool {
 /// Unmap all guest memory (the old program, at `execve`).
 pub fn release_guest_memory() {
     write_exec().clear();
+    wipe_on_fork().clear();
     crate::maps::clear();
     let ranges = std::mem::take(&mut *guest_maps());
     for (start, end) in ranges {
@@ -673,6 +720,52 @@ pub mod region {
         Some(Some((top.obj_id, basic.offset + (addr - start))))
     }
 
+    /// Move the pages of `[from, from + len)` to `to`, over whatever is
+    /// there, contents and all (Mach's remap of the same memory, not a
+    /// copy), inherited by a fork as they were. The old range is left
+    /// mapped, for the caller to let go. Whether it moved.
+    pub fn move_pages(from: u64, to: u64, len: u64) -> bool {
+        unsafe extern "C" {
+            fn mach_vm_remap(
+                target: libc::mach_port_t,
+                address: *mut u64,
+                size: u64,
+                mask: u64,
+                flags: c_int,
+                source: libc::mach_port_t,
+                source_address: u64,
+                copy: libc::boolean_t,
+                cur: *mut c_int,
+                max: *mut c_int,
+                inheritance: c_uint,
+            ) -> libc::kern_return_t;
+        }
+        // VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE
+        const FIXED_OVERWRITE: c_int = 0x4000;
+        let inherit =
+            if query(from).is_some_and(|r| r.private) { VM_INHERIT_COPY } else { VM_INHERIT_SHARE };
+        let mut at = to;
+        let (mut cur, mut max) = (0, 0);
+        // SAFETY: this task's own memory, a range the caller owns at both
+        // ends; the protections come back through valid out-parameters.
+        let kr = unsafe {
+            mach_vm_remap(
+                mach_task_self_,
+                &mut at,
+                len,
+                0,
+                FIXED_OVERWRITE,
+                mach_task_self_,
+                from,
+                0,
+                &mut cur,
+                &mut max,
+                inherit,
+            )
+        };
+        kr == 0 && at == to
+    }
+
     pub fn query(addr: u64) -> Option<Region> {
         let (start, size, basic) = query_flavor::<BasicInfo>(addr, VM_REGION_BASIC_INFO_64)?;
         let (_, _, ext) = query_flavor::<ExtendedInfo>(start, VM_REGION_EXTENDED_INFO)?;
@@ -891,6 +984,39 @@ impl<P: Platform> Kernel<P> {
         fd: u64,
         offset: u64,
     ) -> i64 {
+        // A file's offset is checked, then its descriptor, before anything
+        // else, as Linux checks them.
+        if flags & mman::MAP_ANONYMOUS == 0 {
+            if offset & (self.page_size - 1) != 0 {
+                return err(errno::EINVAL);
+            }
+            // (A guest's call never names fwe's own descriptors, which its
+            // System V segments are mapped through.)
+            // SAFETY: F_GETFD only queries the descriptor.
+            if unsafe { libc::fcntl(fd as i32, libc::F_GETFD) } < 0 {
+                return err(errno::EBADF);
+            }
+            // `MAP_SHARED_VALIDATE`: a flag past Linux's legacy ones (and
+            // its huge-page size bits) is one no file here supports, not
+            // even `MAP_SYNC`, which needs DAX.
+            const LEGACY: u64 = mman::MAP_TYPE
+                | mman::MAP_FIXED
+                | mman::MAP_ANONYMOUS
+                | mman::MAP_DENYWRITE
+                | mman::MAP_EXECUTABLE
+                | mman::MAP_GROWSDOWN
+                | mman::MAP_LOCKED
+                | mman::MAP_NORESERVE
+                | mman::MAP_POPULATE
+                | mman::MAP_NONBLOCK
+                | mman::MAP_STACK
+                | mman::MAP_HUGETLB
+                | mman::MAP_FIXED_NOREPLACE
+                | 0x3f << 26;
+            if flags & mman::MAP_TYPE == mman::MAP_SHARED_VALIDATE && flags & !LEGACY != 0 {
+                return err(errno::EOPNOTSUPP);
+            }
+        }
         // Nothing of a mount that runs nothing is mapped to run, then or
         // later.
         let noexec = flags & mman::MAP_ANONYMOUS == 0
@@ -908,6 +1034,19 @@ impl<P: Platform> Kernel<P> {
             crate::loopdev::map_source(fd as i32, self.page_size)
         } else {
             None
+        };
+        // A shared mapping of a file open only for reading may not be made
+        // writable later.
+        // SAFETY: F_GETFL only queries the descriptor.
+        let nowrite = flags & mman::MAP_ANONYMOUS == 0
+            && flags & mman::MAP_TYPE != mman::MAP_PRIVATE
+            && unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY;
+        // `/dev/zero` maps new memory, shared between the processes that
+        // share the mapping (the host has no mapping of the device).
+        let flags = if flags & mman::MAP_ANONYMOUS == 0 && is_dev_zero(fd as i32) {
+            flags | mman::MAP_ANONYMOUS
+        } else {
+            flags
         };
         let r = match &source {
             Some(Ok((file, start))) => match offset.checked_add(*start) {
@@ -937,6 +1076,9 @@ impl<P: Platform> Kernel<P> {
         let locked = crate::maps::record().mapped(r as u64, len, prot, shared, object);
         if noexec {
             crate::maps::record().no_exec(r as u64, len);
+        }
+        if nowrite {
+            crate::maps::record().no_write(r as u64, len);
         }
         if flags & mman::MAP_LOCKED != 0 {
             crate::maps::record().lock(r as u64, len, true);
@@ -1057,6 +1199,8 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         if prot & mman::PROT_EXEC != 0 && crate::maps::record().any_noexec(addr, self.page_up(len))
+            || prot & mman::PROT_WRITE != 0
+                && crate::maps::record().any_nowrite(addr, self.page_up(len))
         {
             return err(errno::EACCES);
         }
@@ -1079,6 +1223,9 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         new_addr: u64,
     ) -> i64 {
+        if let Err(e) = self.mremap_check(old, old_len, new_len, flags, new_addr) {
+            return err(e);
+        }
         if self.sealed(old, old_len)
             || (flags & mman::MREMAP_FIXED != 0 && self.sealed(new_addr, new_len))
         {
@@ -1543,6 +1690,7 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             untrack(host as u64, self.page_up(len));
             remove_range(&mut write_exec(), host as u64, self.page_up(len));
+            remove_range(&mut wipe_on_fork(), host as u64, self.page_up(len));
         }
         r
     }
@@ -1596,7 +1744,12 @@ impl<P: Platform> Kernel<P> {
             // constant pools and metadata in its code pages), and JITs leave
             // x18 alone: only its system calls and thread-pointer accesses
             // are translated (see [`JIT_CODE`]).
-            if let Err(e) = self.platform.prepare_exec(a as u64, self.page_up(len), JIT_CODE) {
+            // Only what the file has (a page past its end has nothing to
+            // read, and faults).
+            let backed = self.backed_len(addr, self.page_up(len));
+            if backed > 0
+                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE)
+            {
                 return self.prepare_failed(e);
             }
         }
@@ -1613,6 +1766,23 @@ impl<P: Platform> Kernel<P> {
             self.platform.protect_guest(addr, self.page_up(len), prot);
         }
         r
+    }
+
+    /// How much of guest range `[addr, addr + len)`, from its start, has
+    /// something behind it: all of it, but for a file mapping the pages up
+    /// to the file's end.
+    fn backed_len(&self, addr: u64, len: u64) -> u64 {
+        use crate::vmas::Mapping;
+        let Some(p) = crate::maps::record().areas_in(addr, addr + len).into_iter().next() else {
+            return len;
+        };
+        let area = p.value.at(addr.saturating_sub(p.start));
+        if !matches!(area.object.name, crate::maps::Name::Path(_) | crate::maps::Name::Exe) {
+            return len;
+        }
+        let Some(path) = region_file(crate::uaccess::g2h(addr)) else { return len };
+        let Ok(meta) = std::fs::metadata(std::ffi::OsStr::from_bytes(&path)) else { return len };
+        self.page_up(meta.len().saturating_sub(area.object.offset)).min(len)
     }
 
     /// A fault the guest took at host address `addr`, fetching an
@@ -1653,10 +1823,29 @@ impl<P: Platform> Kernel<P> {
         if crate::uaccess::crosses(addr, len) {
             return err(errno::EINVAL);
         }
-        let host = crate::uaccess::g2h(addr);
-        // SAFETY: syncing guest memory at the guest's request; the host
-        // checks the range is mapped.
-        ret(unsafe { libc::msync(host as *mut libc::c_void, len as usize, flags) })
+        // Each mapping in the range synced; locked memory is not to be
+        // invalidated (`EBUSY`), and a hole fails the call (`ENOMEM`) once
+        // the rest is synced, as Linux has it.
+        let areas = crate::maps::record().areas_in(addr, addr + len);
+        if flags & libc::MS_INVALIDATE != 0 && areas.iter().any(|p| p.value.locked) {
+            return err(errno::EBUSY);
+        }
+        let mut at = addr;
+        let mut hole = false;
+        for p in &areas {
+            hole |= p.start > at;
+            at = p.end;
+            let host = crate::uaccess::g2h(p.start);
+            // SAFETY: syncing guest memory at the guest's request, a range
+            // that is mapped.
+            let r = ret(unsafe {
+                libc::msync(host as *mut libc::c_void, (p.end - p.start) as usize, flags)
+            });
+            if r < 0 {
+                return r;
+            }
+        }
+        if hole || at < addr + len { err(errno::ENOMEM) } else { 0 }
     }
 
     /// `mlock`, `mlock2` (`flags`) and `munlock` (`lock` false): the range,
@@ -1715,6 +1904,73 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
+        let hole = match self.madvise_check(addr, len, advice) {
+            Ok(None) => return 0,
+            Ok(Some(hole)) => hole,
+            Err(e) => return err(e),
+        };
+        if !hole {
+            return self.madvise_apply(addr, len, advice);
+        }
+        // Given to each mapping in the range, then the hole reported.
+        let end = addr + self.page_up(len);
+        for p in crate::maps::record().areas_in(addr, end) {
+            let r = self.madvise_apply(p.start, p.end - p.start, advice);
+            if r < 0 {
+                return r;
+            }
+        }
+        err(errno::ENOMEM)
+    }
+
+    /// `madvise`'s arguments, checked as Linux checks them: advice it
+    /// knows (no `MADV_MERGEABLE` without KSM), an aligned start, a range
+    /// that does not wrap (`EINVAL`); then each mapping in the range for the
+    /// advice: discarding locked memory, freeing or wiping on fork memory
+    /// that is not private and anonymous, removing pages of what is not a
+    /// shared file (`EINVAL`). `None` for an empty range (nothing to do),
+    /// else whether the range has a hole, which fails the call (`ENOMEM`)
+    /// once the advice is given to the rest.
+    fn madvise_check(&self, addr: u64, len: u64, advice: u64) -> Result<Option<bool>, i32> {
+        const KNOWN: [u64; 25] = [
+            0, 1, 2, 3, 4, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 100, 101,
+            102, 103,
+        ];
+        let end = addr.checked_add(self.page_up(len)).filter(|_| len <= u64::MAX - self.page_size);
+        if !KNOWN.contains(&advice) || addr & (self.page_size - 1) != 0 || end.is_none() {
+            return Err(errno::EINVAL);
+        }
+        if len == 0 {
+            return Ok(None);
+        }
+        let end = end.unwrap_or(addr);
+        let areas = crate::maps::record().areas_in(addr, end);
+        let mut at = addr;
+        let mut hole = false;
+        for p in &areas {
+            hole |= p.start > at;
+            at = p.end;
+            let a = &p.value;
+            use crate::maps::Name;
+            let anonymous =
+                !a.shared && matches!(a.object.name, Name::Anonymous | Name::Heap | Name::Stack);
+            let file = matches!(a.object.name, Name::Path(_) | Name::Exe);
+            let bad = match advice {
+                // MADV_DONTNEED, MADV_FREE, MADV_REMOVE: not locked memory.
+                4 | 8 | 9 if a.locked => true,
+                8 | 18 => !anonymous,
+                9 => !(file && a.shared),
+                _ => false,
+            };
+            if bad {
+                return Err(errno::EINVAL);
+            }
+        }
+        Ok(Some(hole || at < end))
+    }
+
+    /// [`Self::sys_madvise`]'s advice given, the arguments checked.
+    fn madvise_apply(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
         // Sealed memory, read-only and anonymous, is not to be discarded:
         // MADV_DONTNEED, FREE, REMOVE, DONTFORK, WIPEONFORK and
         // DONTNEED_LOCKED.
@@ -1753,10 +2009,22 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             mman::MADV_NORMAL | mman::MADV_RANDOM | mman::MADV_SEQUENTIAL | mman::MADV_WILLNEED => {
+                // Hints, which Linux takes for any mapped memory (the host
+                // refuses some, for memory it may not read).
                 // SAFETY: advisory call on guest memory; values match the host's.
-                ret(unsafe {
+                unsafe {
                     libc::madvise(host as *mut libc::c_void, len as usize, advice as libc::c_int)
-                })
+                };
+                0
+            }
+            // MADV_WIPEONFORK, MADV_KEEPONFORK
+            18 => {
+                add_range(&mut wipe_on_fork(), host, len);
+                0
+            }
+            19 => {
+                remove_range(&mut wipe_on_fork(), host, len);
+                0
             }
             // Other advice (huge pages, dump control, ...) has no host
             // equivalent and no effect on program semantics.
@@ -1764,6 +2032,59 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
+    /// `mremap`'s arguments, checked as Linux checks them: its flags, an
+    /// aligned old address, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` only with
+    /// `MREMAP_MAYMOVE` (the latter keeping the size), a new length, an
+    /// aligned new address that does not overlap the old range (`EINVAL`);
+    /// then the old range, which must be mapped, one mapping without a gap
+    /// (`EFAULT`).
+    fn mremap_check(
+        &self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        flags: u64,
+        new_addr: u64,
+    ) -> Result<(), i32> {
+        use mman::{MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE};
+        let page = self.page_size;
+        let may_move = flags & MREMAP_MAYMOVE != 0;
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+            || old & (page - 1) != 0
+            || flags & MREMAP_FIXED != 0 && !may_move
+            || flags & MREMAP_DONTUNMAP != 0 && (!may_move || old_len != new_len)
+            || self.page_up(new_len) == 0
+        {
+            return Err(errno::EINVAL);
+        }
+        let (old_len, new_len) = (self.page_up(old_len), self.page_up(new_len));
+        if flags & MREMAP_FIXED != 0
+            && (new_addr & (page - 1) != 0
+                || new_addr < old + old_len && old < new_addr.saturating_add(new_len))
+        {
+            return Err(errno::EINVAL);
+        }
+        let areas = crate::maps::record().areas_in(old, old + old_len.max(page));
+        let mut at = old;
+        for p in &areas {
+            if p.start > at {
+                break;
+            }
+            at = p.end;
+        }
+        if areas.is_empty() || at < old + old_len.max(page) {
+            return Err(errno::EFAULT);
+        }
+        Ok(())
+    }
+
+    /// `mremap`, checked already ([`Self::mremap_check`]): a range shrunk
+    /// in place, grown in place where the space after it is free, or moved
+    /// (`MREMAP_MAYMOVE`, `MREMAP_FIXED`) with its pages, which keep their
+    /// contents and sharing. A grown part continues the mapping: the same
+    /// file, further on, or new anonymous memory. Code (an executable
+    /// mapping, which fwe has prepared where it is) is not grown or moved
+    /// (`ENOMEM`).
     fn mremap_call(
         &mut self,
         old: u64,
@@ -1776,16 +2097,16 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = self.platform.memory(call, &mut self.brk) {
             return r;
         }
-        if old & (self.page_size - 1) != 0 || new_len == 0 {
-            return err(errno::EINVAL);
-        }
         let old_len = self.page_up(old_len);
         let new_len = self.page_up(new_len);
-        if crate::uaccess::crosses(old, old_len) {
+        let fixed = flags & mman::MREMAP_FIXED != 0;
+        if crate::uaccess::crosses(old, old_len)
+            || fixed && crate::uaccess::crosses(new_addr, new_len)
+        {
             return err(errno::EINVAL);
         }
         let host = crate::uaccess::g2h(old);
-        if new_len <= old_len {
+        if new_len <= old_len && !fixed {
             if new_len < old_len {
                 let tail = host + new_len;
                 // The VM lets go of the tail before the host frees it.
@@ -1796,17 +2117,177 @@ impl<P: Platform> Kernel<P> {
             }
             return old as i64;
         }
-        if flags & mman::MREMAP_MAYMOVE == 0 {
-            // Cannot grow in place yet. Like Linux, report EFAULT for an
-            // unmapped source range and ENOMEM otherwise.
-            // SAFETY: msync only inspects the mapping state of the range.
-            let mapped =
-                unsafe { libc::msync(host as *mut libc::c_void, old_len as usize, libc::MS_ASYNC) }
-                    == 0;
-            return err(if mapped { errno::ENOMEM } else { errno::EFAULT });
+        let areas = crate::maps::record().areas_in(old, old + old_len);
+        if areas.iter().any(|p| p.value.prot & mman::PROT_EXEC != 0) {
+            return err(errno::ENOMEM);
         }
-        err(errno::ENOMEM)
+        // What a grown part continues: the last mapping, from its end.
+        use crate::vmas::Mapping;
+        let Some(last) = areas.last().map(|p| (p.value.at(p.end - p.start), p.end)) else {
+            return err(errno::EFAULT);
+        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = last;
+            // SAFETY: the guest's own memory, as it asks; the host is Linux.
+            let r = unsafe {
+                libc::mremap(
+                    host as *mut libc::c_void,
+                    old_len as usize,
+                    new_len as usize,
+                    flags as i32,
+                    crate::uaccess::g2h(new_addr) as *mut libc::c_void,
+                )
+            };
+            if r == libc::MAP_FAILED {
+                return last_error();
+            }
+            untrack(host, old_len);
+            track(r as u64, new_len);
+            if r as u64 == crate::uaccess::g2h(new_addr) && fixed {
+                new_addr as i64
+            } else {
+                r as i64
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (area, end) = last;
+            let extra = new_len.saturating_sub(old_len);
+            // In place, where the space after it is free.
+            if !fixed
+                && !any_mapped(old + old_len, extra)
+                && self.grow_at(host + old_len, extra, &area, host + (end - old))
+            {
+                track(host + old_len, extra);
+                if let Err(e) = self.platform.map_guest(old + old_len, extra, area.prot) {
+                    return err(e);
+                }
+                return old as i64;
+            }
+            if flags & mman::MREMAP_MAYMOVE == 0 {
+                return err(errno::ENOMEM);
+            }
+            // Where it goes: the place asked for, emptied, or a new one.
+            let (dest, guest) = if fixed {
+                let r = self.munmap_call(new_addr, new_len);
+                if r < 0 {
+                    return r;
+                }
+                (crate::uaccess::g2h(new_addr), new_addr)
+            } else {
+                // SAFETY: a fresh inaccessible reservation for the move.
+                let p = unsafe {
+                    libc::mmap(
+                        MMAP_HINT as *mut libc::c_void,
+                        new_len as usize,
+                        libc::PROT_NONE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                        -1,
+                        0,
+                    )
+                };
+                if p == libc::MAP_FAILED {
+                    return err(errno::ENOMEM);
+                }
+                (p as u64, p as u64)
+            };
+            let keep = old_len.min(new_len);
+            if !region::move_pages(host, dest, keep)
+                || extra > 0 && !self.grow_at(dest + old_len, extra, &area, host + (end - old))
+            {
+                if !fixed {
+                    // SAFETY: the reservation made above, nothing else.
+                    unsafe { libc::munmap(dest as *mut libc::c_void, new_len as usize) };
+                }
+                return err(errno::ENOMEM);
+            }
+            // The old range: let go, or with `MREMAP_DONTUNMAP` mapped still,
+            // its memory new (zero, for private anonymous memory).
+            self.platform.unmap_guest(old, old_len);
+            if flags & mman::MREMAP_DONTUNMAP != 0 {
+                let prot = host_prot(areas[0].value.prot);
+                map_fixed_anon(host, old_len, prot);
+            } else {
+                self.unmap_host(host, old_len);
+                untrack(host, old_len);
+            }
+            // `MADV_WIPEONFORK` stays with the memory it was given.
+            let wiped = wipe_on_fork().range(..host + old_len).any(|(_, &end)| end > host);
+            remove_range(&mut wipe_on_fork(), host, old_len);
+            if wiped {
+                add_range(&mut wipe_on_fork(), dest, keep);
+            }
+            track(dest, new_len);
+            if let Err(e) = self.platform.map_guest(guest, new_len, area.prot) {
+                return err(e);
+            }
+            guest as i64
+        }
     }
+
+    /// Map `[at, at + len)` as the continuation of mapping `area`, whose
+    /// last part ends at host address `end_of` (its file there, further on,
+    /// or anonymous memory like it). Whether it did.
+    #[cfg(target_os = "macos")]
+    fn grow_at(&mut self, at: u64, len: u64, area: &crate::maps::Area, end_of: u64) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let prot = host_prot(area.prot);
+        let share = if area.shared { libc::MAP_SHARED } else { libc::MAP_PRIVATE };
+        let file = match &area.object.name {
+            crate::maps::Name::Path(_) | crate::maps::Name::Exe => region_file(end_of - 1),
+            _ => None,
+        };
+        let Some(path) = file else {
+            // SAFETY: a fixed mapping over a range the caller found free.
+            let p = unsafe {
+                libc::mmap(
+                    at as *mut libc::c_void,
+                    len as usize,
+                    prot,
+                    share | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            return p as u64 == at;
+        };
+        let Ok(c) = std::ffi::CString::new(path) else { return false };
+        let mode = if area.shared && area.prot & mman::PROT_WRITE != 0 {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        // SAFETY: a NUL-terminated path; the descriptor is closed below,
+        // the mapping keeping the file.
+        unsafe {
+            let fd = libc::open(c.as_ptr(), mode | libc::O_CLOEXEC);
+            if fd < 0 {
+                return false;
+            }
+            let p = libc::mmap(
+                at as *mut libc::c_void,
+                len as usize,
+                prot,
+                share | libc::MAP_FIXED,
+                fd,
+                area.object.offset as libc::off_t,
+            );
+            libc::close(fd);
+            p as u64 == at
+        }
+    }
+}
+
+/// Whether `fd` is `/dev/zero`.
+fn is_dev_zero(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+    ok && crate::devnodes::linux_numbers_of_host(&st).is_some_and(|n| (n.major, n.minor) == (1, 5))
 }
 
 /// The host path of the file mapped at host address `addr`.
