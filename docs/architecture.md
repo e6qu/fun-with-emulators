@@ -586,7 +586,7 @@ shapes differently:
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
   overflowuid,overflowgid,threads-max,tainted}`,
   `kernel/random/{entropy_avail,poolsize}`, `fs/{nr_open,file-max,
-  pipe-max-size,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
+  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
   `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
   `kernel/keys/*`, the IPC limits and a network namespace's sysctls
   (`crates/kernel/src/sysctl.rs`). `fs.nr_open` bounds `RLIMIT_NOFILE` and

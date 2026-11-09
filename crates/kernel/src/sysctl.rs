@@ -275,6 +275,21 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Global,
     },
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
+    // Pipe buffer pages a user may hold before new pipes get the least
+    // (soft) or none (hard, 0: no limit): Linux's defaults. A privileged
+    // process (every root one) is not held to them.
+    Sysctl {
+        path: b"fs/pipe-user-pages-soft",
+        default: "16384",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"fs/pipe-user-pages-hard",
+        default: "0",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
     // The most descriptors a process may have: its `RLIMIT_NOFILE` and a
     // copy of a shared descriptor table are bounded by it.
     Sysctl {
