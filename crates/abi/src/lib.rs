@@ -1051,12 +1051,37 @@ pub mod wait {
     pub const P_ALL: u64 = 0;
     pub const P_PID: u64 = 1;
     pub const P_PGID: u64 = 2;
+    pub const P_PIDFD: u64 = 3;
     /// `si_code` values for `SIGCHLD`.
     pub const CLD_EXITED: i32 = 1;
     pub const CLD_KILLED: i32 = 2;
     pub const CLD_DUMPED: i32 = 3;
     pub const CLD_STOPPED: i32 = 5;
     pub const CLD_CONTINUED: i32 = 6;
+}
+
+/// Process descriptors (`linux/pidfd.h`, `linux/pidfs.h`).
+pub mod pidfd {
+    /// `pidfd_open` flags: `O_NONBLOCK` and `O_EXCL`.
+    pub const PIDFD_NONBLOCK: u64 = 0o4000;
+    pub const PIDFD_THREAD: u64 = 0o200;
+    /// `pidfd_send_signal` flags: whom the signal is for.
+    pub const PIDFD_SIGNAL_THREAD: u64 = 1;
+    pub const PIDFD_SIGNAL_THREAD_GROUP: u64 = 2;
+    pub const PIDFD_SIGNAL_PROCESS_GROUP: u64 = 4;
+    /// The `ioctl` requests' type (`PIDFS_IOCTL_MAGIC`) and numbers.
+    pub const PIDFS_IOCTL_MAGIC: u64 = 0xff;
+    pub const PIDFD_GET_CGROUP_NAMESPACE: u64 = 1;
+    pub const PIDFD_GET_TIME_FOR_CHILDREN_NAMESPACE: u64 = 10;
+    pub const PIDFD_GET_INFO: u64 = 11;
+    /// `struct pidfd_info`'s `mask` bits.
+    pub const PIDFD_INFO_PID: u64 = 1;
+    pub const PIDFD_INFO_CREDS: u64 = 2;
+    pub const PIDFD_INFO_CGROUPID: u64 = 4;
+    pub const PIDFD_INFO_EXIT: u64 = 8;
+    /// `struct pidfd_info`'s first size, and the size of the one fwe fills.
+    pub const PIDFD_INFO_SIZE_VER0: u64 = 64;
+    pub const PIDFD_INFO_SIZE_VER1: u64 = 72;
 }
 
 /// `getrusage` targets and `setitimer` timers.

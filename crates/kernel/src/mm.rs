@@ -1301,6 +1301,11 @@ fn populate(start: u64, len: u64, page: u64) {
     }
 }
 
+/// Where the host is asked to put a mapping the guest left to it (2 TiB):
+/// above the program, its break and fwe's own memory, below the top of
+/// the address space a guest may use.
+const MMAP_HINT: u64 = 0x200_0000_0000;
+
 impl<P: Platform> Kernel<P> {
     /// `a` rounded up to a page; past the last page, the last page's start
     /// (what no range fits in, so a call given it fails as too long).
@@ -1381,6 +1386,14 @@ impl<P: Platform> Kernel<P> {
                 haddr = at;
                 hflags |= libc::MAP_FIXED;
                 placed = true;
+            } else if addr == 0 {
+                // Left to the host, a mapping goes in the first gap it fits,
+                // among the program's image, its break and fwe's own memory,
+                // where code may find no room for its stubs within reach (a
+                // library a dynamic loader maps). From a place well above
+                // them, mappings fill upwards, the space past the latest one
+                // free.
+                haddr = MMAP_HINT;
             }
         }
 

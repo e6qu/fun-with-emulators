@@ -543,7 +543,15 @@ impl<P: Platform> Kernel<P> {
             | nr::MQ_TIMEDSEND
             | nr::MQ_TIMEDRECEIVE => crate::ipcops::blocking(self.ipc_context(), n, a),
             nr::MQ_OPEN => self.sys_mq_open(a[0], a[1], a[2], a[3]),
-            nr::SETNS => self.sys_setns(a[0], a[1]),
+            nr::SETNS => match crate::pidfd::of(a[0] as i32) {
+                Some(t) => self.setns_pidfd(a[0] as i32, t, a[1]),
+                None => self.sys_setns(a[0], a[1]),
+            },
+            nr::PIDFD_OPEN => self.sys_pidfd_open(a[0], a[1]),
+            nr::PIDFD_SEND_SIGNAL => self.sys_pidfd_send_signal(a[0], a[1], a[2], a[3]),
+            // The backends finish it without the lock (it waits for the
+            // target); the same, reached here.
+            nr::PIDFD_GETFD => crate::pidfd::getfd(self.getfd_request(a[0], a[1], a[2])),
             nr::INOTIFY_INIT1 => self.sys_inotify_init1(a[0]),
             nr::INOTIFY_ADD_WATCH => self.sys_inotify_add_watch(a[0], a[1], a[2]),
             nr::INOTIFY_RM_WATCH => self.sys_inotify_rm_watch(a[0], a[1]),
@@ -842,6 +850,9 @@ impl<P: Platform> Kernel<P> {
                     let r = libc::fcntl(fd, libc::F_GETFL);
                     if r < 0 {
                         last_error()
+                    } else if let Some(t) = crate::pidfd::of(fd) {
+                        // Read-write, and non-blocking as it was made or set.
+                        (fcntl::O_RDWR | if t.nonblock { fcntl::O_NONBLOCK } else { 0 }) as i64
                     } else if crate::fdmarks::is_path(fd) {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
@@ -854,6 +865,10 @@ impl<P: Platform> Kernel<P> {
                     } else {
                         host::status_flags_to_linux(r) as i64
                     }
+                }
+                fcntl::F_SETFL if crate::pidfd::of(fd).is_some() => {
+                    crate::pidfd::set_nonblock(fd, arg & fcntl::O_NONBLOCK != 0);
+                    0
                 }
                 fcntl::F_SETFL => {
                     ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
@@ -1048,6 +1063,9 @@ impl<P: Platform> Kernel<P> {
             return r;
         }
         if let Some(r) = self.ns_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
             return r;
         }
         // SAFETY: in every arm the argument layouts match the host's; the host
@@ -1280,12 +1298,12 @@ impl<P: Platform> Kernel<P> {
             PR_SET_DUMPABLE => err(errno::EINVAL),
             PR_GET_DUMPABLE => i64::from(!crate::coredump::UNDUMPABLE.load(Relaxed)),
             PR_SET_PDEATHSIG if arg2 <= signal::NSIG => {
-                thread::set_pdeathsig(arg2);
+                crate::pdeath::set(arg2);
                 0
             }
             PR_SET_PDEATHSIG => err(errno::EINVAL),
             PR_GET_PDEATHSIG => {
-                guest!(uaccess::write(arg2, thread::pdeathsig() as i32));
+                guest!(uaccess::write(arg2, crate::pdeath::get() as i32));
                 0
             }
             _ => err(errno::EINVAL),
@@ -2940,9 +2958,10 @@ mod tests {
         assert_eq!(k.syscall(nr::MINCORE, [p + 1, page, v, 0, 0, 0]), err(errno::EINVAL));
         // SAFETY: unmapping the second page of the test's mapping.
         unsafe { libc::munmap((p + page) as *mut libc::c_void, page as usize) };
+        let before = crate::mm::mapped(p + page, page);
         let r = k.syscall(nr::MINCORE, [p, 2 * page, v, 0, 0, 0]);
-        // Unless another test's thread has mapped the freed page since.
-        if !crate::mm::mapped(p + page, page) {
+        // Unless another test's thread mapped the freed page meanwhile.
+        if !before && !crate::mm::mapped(p + page, page) {
             assert_eq!(r, err(errno::ENOMEM));
         }
         // SAFETY: unmapping the rest.
@@ -3057,6 +3076,8 @@ mod tests {
         let mut sig = 0i32;
         assert_eq!(call(PR_GET_PDEATHSIG, &mut sig as *mut _ as u64), 0);
         assert_eq!(sig, 9);
+        // None again: the test's process is sent nothing as its parent ends.
+        assert_eq!(call(PR_SET_PDEATHSIG, 0), 0);
         assert_eq!(call(1000, 0), err(errno::EINVAL));
     }
 
@@ -3255,6 +3276,39 @@ mod tests {
             k.syscall(nr::MMAP, [at, len, PROT_READ | PROT_EXEC, anon | MAP_FIXED, u64::MAX, 0]);
         assert_eq!(r, err(errno::ENOMEM));
         let _ = k.syscall(nr::MUNMAP, [at, len, 0, 0, 0, 0]);
+    }
+
+    /// A process descriptor: refused for what names no process or with
+    /// flags Linux lacks; one of this process, non-blocking as asked, has
+    /// not ended, and reads as pidfs shows one.
+    #[test]
+    fn process_descriptors_are_checked() {
+        use fwe_abi::pidfd::PIDFD_NONBLOCK;
+        let mut k = kernel();
+        let mut call = |n: u64, a: [u64; 4]| k.syscall(n, [a[0], a[1], a[2], a[3], 0, 0]);
+        assert_eq!(call(nr::PIDFD_OPEN, [-1i64 as u64, 0, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call(nr::PIDFD_OPEN, [1, 1, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call(nr::PIDFD_SEND_SIGNAL, [0, 0, 0, 8]), err(errno::EINVAL));
+        assert_eq!(call(nr::PIDFD_SEND_SIGNAL, [0, 0, 0, 3]), err(errno::EINVAL));
+        assert_eq!(call(nr::PIDFD_GETFD, [0, 0, 1, 0]), err(errno::EINVAL));
+        #[cfg(target_os = "macos")]
+        {
+            let fd = call(nr::PIDFD_OPEN, [u64::from(std::process::id()), PIDFD_NONBLOCK, 0, 0]);
+            assert!(fd >= 0, "pidfd_open: {fd}");
+            assert!(!crate::pidfd::ended(fd as i32));
+            let fl = call(nr::FCNTL, [fd as u64, fcntl::F_GETFL, 0, 0]) as u64;
+            assert_eq!(fl, fcntl::O_RDWR | fcntl::O_NONBLOCK);
+            assert_eq!(call(nr::FCNTL, [fd as u64, fcntl::F_SETFL, 0, 0]), 0);
+            assert_eq!(call(nr::FCNTL, [fd as u64, fcntl::F_GETFL, 0, 0]) as u64, fcntl::O_RDWR);
+            // Not a process descriptor: a waitid on it names nothing.
+            assert_eq!(crate::pidfd::wait_target(0), Err(errno::EBADF));
+            assert_eq!(
+                crate::pidfd::wait_target(fd as i32),
+                Ok((std::process::id() as i32, false))
+            );
+            assert_eq!(call(nr::CLOSE, [fd as u64, 0, 0, 0]), 0);
+        }
+        let _ = PIDFD_NONBLOCK;
     }
 
     /// `prctl`'s options that take no further arguments refuse them, and

@@ -369,6 +369,8 @@ fn fork_with_signals_held(
 /// Linux sends it before `wait` returns ([`reaper::reaped_child_signal`]).
 fn reaped_signal(pid: i32, wstatus: i32) {
     use fwe_abi::wait as w;
+    // What a process descriptor of it reports from now on.
+    fwe_kernel::pidfd::reaped(pid, wstatus);
     let (code, status) = match wstatus & 0x7f {
         0 => (w::CLD_EXITED, (wstatus >> 8) & 0xff),
         sig if wstatus & 0x80 != 0 => (w::CLD_DUMPED, sig),
@@ -620,7 +622,17 @@ pub fn do_waitid(regs: &Regs) -> i64 {
     if options & !known != 0 || options & (w::WEXITED | w::WSTOPPED | w::WCONTINUED) == 0 {
         return err(errno::EINVAL);
     }
+    // A process descriptor names its process; one made non-blocking waits
+    // as `WNOHANG` does, failing with `EAGAIN` when nothing has changed.
+    let mut nonblock = false;
     let (idtype, id) = match idtype {
+        w::P_PIDFD => match fwe_kernel::pidfd::wait_target(id as i32) {
+            Ok((host, nb)) => {
+                nonblock = nb;
+                (libc::P_PID, host as libc::id_t)
+            }
+            Err(e) => return err(e),
+        },
         w::P_ALL => (libc::P_ALL, 0),
         w::P_PID if id as i32 <= 0 => return err(errno::EINVAL),
         w::P_PGID if (id as i32) < 0 => return err(errno::EINVAL),
@@ -636,6 +648,7 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         },
         _ => return err(errno::EINVAL),
     };
+    let options = if nonblock { options | w::WNOHANG } else { options };
     let mut host_options = 0;
     for (linux, host) in [
         (w::WNOHANG, libc::WNOHANG),
@@ -658,6 +671,9 @@ pub fn do_waitid(regs: &Regs) -> i64 {
     };
     if !reaper::active() {
         let r = waitid_host(idtype, id, host_options, infop, options);
+        if nonblock && r == 0 {
+            return err(errno::EAGAIN);
+        }
         return if r < 0 { r } else { zero_rusage() };
     }
     let sel = match idtype {
@@ -692,6 +708,9 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         },
         options & w::WNOWAIT != 0,
     );
+    if nonblock && r == 0 {
+        return err(errno::EAGAIN);
+    }
     if r < 0 { r } else { zero_rusage() }
 }
 

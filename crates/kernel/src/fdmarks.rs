@@ -87,6 +87,10 @@ pub enum Mark {
     /// An `O_PATH | O_NOFOLLOW` descriptor of a link of fwe's `/proc` (a
     /// stand-in, its origin's path the link's), which names the link.
     ProcLink,
+    /// A process descriptor of host process `host` (for one of its threads,
+    /// thread `tid`; 0 for the process), `PIDFD_NONBLOCK` if `nonblock`
+    /// ([`crate::pidfd`]).
+    Pid { host: i32, tid: i32, nonblock: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,6 +332,15 @@ pub fn marked(fd: i32) -> Option<Mark> {
     record(fd)?.mark
 }
 
+/// Every marked descriptor, with its mark (whether or not it is still
+/// open).
+pub fn marks() -> Vec<(i32, Mark)> {
+    if !any_marks() {
+        return Vec::new();
+    }
+    records().iter().filter_map(|(&fd, r)| Some((fd, r.mark?))).collect()
+}
+
 /// `fd` was closed.
 pub fn closed(fd: i32) {
     take(&mut records(), fd);
@@ -420,7 +433,13 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Inotify(_)) => 16,
             Some(Mark::ProcLink) => 17,
             Some(Mark::TimerSlack { .. }) => 18,
+            Some(Mark::Pid { .. }) => 19,
         });
+        if let Some(Mark::Pid { host, tid, nonblock }) = rec.mark {
+            e.i32(host);
+            e.i32(tid);
+            e.bool(nonblock);
+        }
         if let Some(Mark::TimerSlack { host }) = rec.mark {
             e.i32(host);
         }
@@ -496,6 +515,7 @@ pub fn load(d: &mut Dec) {
             16 => Some(Mark::Inotify(d.u32())),
             17 => Some(Mark::ProcLink),
             18 => Some(Mark::TimerSlack { host: d.i32() }),
+            19 => Some(Mark::Pid { host: d.i32(), tid: d.i32(), nonblock: d.bool() }),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

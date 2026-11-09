@@ -52,6 +52,8 @@ pub mod nsfd;
 pub mod nsops;
 mod openat2;
 pub mod overlay;
+pub mod pdeath;
+pub mod pidfd;
 pub mod pidns;
 pub mod procfs;
 pub mod procpid;
@@ -358,6 +360,7 @@ impl<P: Platform> Kernel<P> {
         synthdir::save(e);
         pty::save(e);
         epoll::save(e);
+        pidfd::save(e);
     }
 
     /// The kernel [`Kernel::save_for_fork`] described, in the fork child,
@@ -426,6 +429,7 @@ impl<P: Platform> Kernel<P> {
         synthdir::restore(d);
         pty::restore(d);
         epoll::restore(d);
+        pidfd::restore(d, false);
         if let Some(fs) = &k.fs {
             fs.publish();
         }
@@ -593,6 +597,10 @@ impl<P: Platform> Kernel<P> {
         mountapi::save(&mut e);
         inotify::save(&mut e);
         nsfd::save(&mut e);
+        // Process descriptors, which the host exec closes (kqueues).
+        pidfd::save(&mut e);
+        // The parent-death signal, whose watch the exec ends.
+        pdeath::save(&mut e);
         // The message queues' descriptors the exec closes: their
         // registrations go now, as Linux removes them as it closes them.
         mqueue::exec_closing(&self.creds);
@@ -636,6 +644,8 @@ impl<P: Platform> Kernel<P> {
         mountapi::load(&mut d);
         inotify::load(&mut d);
         nsfd::load(&mut d);
+        pidfd::restore(&mut d, true);
+        pdeath::restore(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
         let persona = d.u32();
@@ -850,6 +860,7 @@ pub fn kqueue_state() -> Vec<u8> {
     let mut e = snapshot::Enc::new();
     specialfd::save(&mut e);
     epoll::save(&mut e);
+    pidfd::save(&mut e);
     e.into_bytes()
 }
 
@@ -859,6 +870,7 @@ pub fn restore_kqueues(state: &[u8]) {
     let mut d = snapshot::Dec::new(state);
     specialfd::restore(&mut d);
     epoll::restore(&mut d);
+    pidfd::restore(&mut d, false);
 }
 
 /// Wake up to `count` waiters on the futex word at `addr`, whether they

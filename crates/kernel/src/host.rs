@@ -407,6 +407,13 @@ pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     kill(pid, sig)
 }
 
+/// Whether host process `pid` exists (a zombie does), whether or not this
+/// user may signal it.
+pub fn process_exists(pid: libc::pid_t) -> bool {
+    let r = kill_process(pid, 0);
+    r == 0 || r == fwe_abi::err(fwe_abi::errno::EPERM)
+}
+
 pub fn empty_sigset() -> libc::sigset_t {
     // SAFETY: an all-zero sigset_t is valid storage; sigemptyset initializes it.
     unsafe {

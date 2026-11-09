@@ -16,6 +16,9 @@ pub struct CloneArgs {
     pub child_tid: u64,
     /// `CLONE_INTO_CGROUP`'s descriptor of the cgroup the child starts in.
     pub cgroup: Option<i32>,
+    /// Where `CLONE_PIDFD` puts the child's process descriptor (`clone`'s
+    /// `parent_tid`, `clone3`'s `pidfd`).
+    pub pidfd: u64,
 }
 
 impl CloneArgs {
@@ -28,6 +31,7 @@ impl CloneArgs {
             tls: x[3],
             child_tid: x[4],
             cgroup: None,
+            pidfd: if x[0] & CLONE_PIDFD != 0 { x[2] } else { 0 },
         }
     }
 
@@ -43,15 +47,19 @@ impl CloneArgs {
             || (f & CLONE_SIGHAND != 0 && f & CLONE_VM == 0)
             || (f & CLONE_THREAD != 0 && f & (CLONE_NEWUSER | CLONE_NEWPID) != 0)
             || both(CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
+            // A process descriptor is of a process, and `clone`'s goes where
+            // the parent's copy of the tid would.
+            || (f & CLONE_PIDFD != 0 && f & (CLONE_THREAD | CLONE_DETACHED) != 0)
+            || (f & CLONE_PIDFD != 0 && self.pidfd == self.parent_tid && both(CLONE_PIDFD, CLONE_PARENT_SETTID))
         {
             return Err(errno::EINVAL);
         }
         Ok(())
     }
 
-    /// `clone3(args, size)`: read the guest's `struct clone_args`. Features
-    /// fwe does not have (a pidfd, chosen tids) fail with `ENOSYS`, so a C
-    /// library falls back to `clone`.
+    /// `clone3(args, size)`: read the guest's `struct clone_args`. Chosen
+    /// tids, which fwe does not have, fail with `ENOSYS`, so a C library
+    /// falls back to `clone`.
     pub fn from_clone3(args: u64, size: u64) -> Result<CloneArgs, i32> {
         if size < CLONE_ARGS_SIZE_VER0 {
             return Err(errno::EINVAL);
@@ -72,7 +80,7 @@ impl CloneArgs {
         }
         let [
             flags,
-            _pidfd,
+            pidfd,
             child_tid,
             parent_tid,
             exit_signal,
@@ -97,7 +105,7 @@ impl CloneArgs {
         if (stack == 0) != (stack_size == 0) {
             return Err(errno::EINVAL);
         }
-        if flags & CLONE_PIDFD != 0 || set_tid_size != 0 {
+        if set_tid_size != 0 {
             return Err(errno::ENOSYS);
         }
         Ok(CloneArgs {
@@ -108,6 +116,7 @@ impl CloneArgs {
             tls,
             child_tid,
             cgroup: (flags & CLONE_INTO_CGROUP != 0).then_some(cgroup as i32),
+            pidfd: if flags & CLONE_PIDFD != 0 { pidfd } else { 0 },
         })
     }
 }
@@ -136,6 +145,7 @@ mod tests {
                 tls: 0x50,
                 child_tid: 0x30,
                 cgroup: None,
+                pidfd: 0,
             }
         );
         // A fork: no flags, SIGCHLD as the exit signal, the parent's stack.
@@ -144,13 +154,31 @@ mod tests {
         assert_eq!((got.flags, got.stack), (17, 0));
     }
 
+    /// `CLONE_PIDFD`'s descriptor goes to `clone`'s parent-tid word, which
+    /// `CLONE_PARENT_SETTID` cannot then have, or to `clone3`'s own field;
+    /// a thread has none.
+    #[test]
+    fn clone_pidfd_goes_where_asked() {
+        let a = CloneArgs::from_clone(&[CLONE_PIDFD | 17, 0, 0x40, 0, 0, 0]);
+        assert_eq!((a.pidfd, a.check()), (0x40, Ok(())));
+        let a = CloneArgs::from_clone(&[CLONE_PIDFD | CLONE_PARENT_SETTID | 17, 0, 0x40, 0, 0, 0]);
+        assert_eq!(a.check(), Err(errno::EINVAL));
+        let thread = CLONE_PIDFD | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM;
+        assert_eq!(
+            CloneArgs::from_clone(&[thread, 0x1000, 0x40, 0, 0, 0]).check(),
+            Err(errno::EINVAL)
+        );
+        let raw = args(&[CLONE_PIDFD | CLONE_PARENT_SETTID, 0x50, 0, 0x40, 17]);
+        let a = CloneArgs::from_clone3(raw.as_ptr() as u64, 88).unwrap();
+        assert_eq!((a.pidfd, a.parent_tid, a.check()), (0x50, 0x40, Ok(())));
+    }
+
     #[test]
     fn clone3_refuses_what_it_cannot_do() {
         let p = |a: &Vec<u64>, size| CloneArgs::from_clone3(a.as_ptr() as u64, size);
         assert_eq!(p(&args(&[]), 56), Err(errno::EINVAL));
         assert_eq!(p(&args(&[17]), 64), Err(errno::EINVAL), "exit signal in flags");
         assert_eq!(p(&args(&[0, 0, 0, 0, 0, 0x1000]), 64), Err(errno::EINVAL), "stack, no size");
-        assert_eq!(p(&args(&[CLONE_PIDFD]), 64), Err(errno::ENOSYS));
         assert_eq!(p(&args(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), 88), Err(errno::ENOSYS));
         // Unknown trailing fields must be zero.
         let mut big = args(&[]);

@@ -257,6 +257,21 @@ const ENTRY: usize = 32;
 /// a full queue refuses a real-time one (`EAGAIN`). The caller wakes the
 /// target.
 pub fn queue(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
+    put(target, sig, code, value)
+}
+
+/// What a queue entry holds in place of a signal for a request of a
+/// descriptor ([`request_fd`]): above every signal number.
+const FD_REQUEST: u64 = 0x1_0000;
+
+/// Ask host process `target` (woken by the caller) for its descriptor
+/// `fd`, to be sent to this process's reply socket `token`
+/// ([`fd_reply_socket`]).
+pub fn request_fd(target: i32, fd: i32, token: u64) -> Result<(), i32> {
+    put(target, FD_REQUEST, fd, token)
+}
+
+fn put(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
     let mut buf = [0u8; 512];
     let path = mailbox(target, &mut buf).ok_or(fwe_abi::errno::ESRCH)?;
     // SAFETY: plain host calls.
@@ -340,7 +355,13 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
     for e in q[..n.max(0) as usize].chunks_exact(ENTRY) {
         let word = |at: usize| e[at..at + 4].try_into().unwrap();
         let sig = i32::from_ne_bytes(word(0));
-        if sig > 0 {
+        if sig as u64 == FD_REQUEST {
+            answer_fd(
+                i32::from_ne_bytes(word(4)),
+                i32::from_ne_bytes(word(12)),
+                u64::from_ne_bytes(e[16..24].try_into().unwrap()),
+            );
+        } else if sig > 0 {
             post(
                 sig as u64,
                 Note {
@@ -370,6 +391,209 @@ pub fn take_from(sig: libc::c_int, sender: i32) -> Option<Note> {
     }
     let (note, when) = read_note(sig, Some(sender))?;
     (note.pid == sender && now_ns().saturating_sub(when) < SENDER_FRESH_NS).then_some(note)
+}
+
+/// A socket a descriptor another process sends is received on.
+pub struct Reply {
+    pub sock: i32,
+    pub token: u64,
+    /// Its path, removed with it.
+    pub path: Vec<u8>,
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        // SAFETY: the socket made for this reply, and its path.
+        unsafe {
+            libc::close(self.sock);
+            if let Ok(c) = std::ffi::CString::new(self.path.clone()) {
+                libc::unlink(c.as_ptr());
+            }
+        }
+    }
+}
+
+/// Write `n` in decimal into `buf` at `*at`. Async-signal-safe.
+fn put_decimal(mut n: u64, buf: &mut [u8], at: &mut usize) -> Option<()> {
+    let mut d = [0u8; 20];
+    let mut len = 0;
+    loop {
+        d[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if *at + len > buf.len() {
+        return None;
+    }
+    for i in (0..len).rev() {
+        buf[*at] = d[i];
+        *at += 1;
+    }
+    Some(())
+}
+
+fn put_bytes(b: &[u8], buf: &mut [u8], at: &mut usize) -> Option<()> {
+    buf.get_mut(*at..*at + b.len())?.copy_from_slice(b);
+    *at += b.len();
+    Some(())
+}
+
+/// The longest path a host `AF_UNIX` address holds, its NUL included.
+const SUN_PATH: usize = 104;
+
+/// The path of process `pid`'s reply socket `token`, NUL-terminated, in
+/// `buf`: `<records>/<pid>.fd<token>`, or where that is too long for a
+/// socket's address, `/tmp/fwe-<uid>-fd/<pid>.fd<token>` (a directory only
+/// the user may use, [`fd_reply_socket`]). Its length. Async-signal-safe.
+fn reply_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH]) -> Option<usize> {
+    let dir = DIR.get()?;
+    let name = |buf: &mut [u8; SUN_PATH], at: &mut usize| {
+        put_bytes(b"/", buf, at)?;
+        put_decimal(u64::from(pid.unsigned_abs()), buf, at)?;
+        put_bytes(b".fd", buf, at)?;
+        put_decimal(token, buf, at)?;
+        (*at < SUN_PATH).then(|| buf[*at] = 0)
+    };
+    let mut at = 0;
+    if put_bytes(dir, buf, &mut at).and_then(|()| name(buf, &mut at)).is_some() {
+        return Some(at);
+    }
+    at = 0;
+    put_bytes(b"/tmp/fwe-", buf, &mut at)?;
+    // SAFETY: getuid cannot fail.
+    put_decimal(u64::from(unsafe { libc::getuid() }), buf, &mut at)?;
+    put_bytes(b"-fd", buf, &mut at)?;
+    name(buf, &mut at)?;
+    Some(at)
+}
+
+/// A new reply socket, bound where [`reply_path`] says, out of the
+/// guest's descriptor range.
+pub fn fd_reply_socket() -> Option<Reply> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let mut buf = [0u8; SUN_PATH];
+    let len = reply_path(me, token, &mut buf)?;
+    let path = buf[..len].to_vec();
+    if !path.starts_with(DIR.get()?) {
+        // The short directory: made only the user's, or refused if it is
+        // anything else.
+        let slash = path.iter().rposition(|&b| b == b'/')?;
+        let d = std::ffi::CString::new(&path[..slash]).ok()?;
+        // SAFETY: a NUL-terminated path; zeroed bytes are a valid `stat`.
+        unsafe {
+            libc::mkdir(d.as_ptr(), 0o700);
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::lstat(d.as_ptr(), &mut st) != 0
+                || st.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || st.st_uid != libc::getuid()
+                || st.st_mode & 0o077 != 0
+            {
+                return None;
+            }
+        }
+    }
+    // SAFETY: plain host call.
+    let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    let sock = crate::fdtable::reserve(sock).ok()?;
+    let reply = Reply { sock, token, path };
+    // SAFETY: a valid address of the length given.
+    let bound = crate::net::at_unix_path(&reply.path, |a, l| unsafe { libc::bind(sock, a, l) });
+    (bound == Ok(0)).then_some(reply)
+}
+
+/// In the wake handler: send this process's descriptor `fd` to process
+/// `caller`'s reply socket `token`, as `SCM_RIGHTS`, beside the host
+/// errno (0) of the answer; a descriptor the guest has no such number of
+/// is answered with `EBADF`. Async-signal-safe.
+fn answer_fd(caller: i32, fd: i32, token: u64) {
+    let mut path = [0u8; SUN_PATH];
+    let Some(len) = reply_path(caller, token, &mut path) else { return };
+    let saved = crate::host::last_errno();
+    // SAFETY: zeroed bytes are a valid `sockaddr_un`, `msghdr` and control
+    // buffer; plain host calls on a socket made and closed here, and on
+    // the guest's descriptor `fd`, only sent.
+    unsafe {
+        let s = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0);
+        let mut a: libc::sockaddr_un = std::mem::zeroed();
+        a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (o, &b) in a.sun_path.iter_mut().zip(&path[..len]) {
+            *o = b as libc::c_char;
+        }
+        let alen = (2 + len + 1) as libc::socklen_t;
+        #[cfg(not(target_os = "linux"))]
+        {
+            a.sun_len = alen as u8;
+        }
+        if s >= 0 && libc::connect(s, (&a as *const libc::sockaddr_un).cast(), alen) == 0 {
+            let valid =
+                fd >= 0 && fd < crate::fdtable::guest_max() && libc::fcntl(fd, libc::F_GETFD) >= 0;
+            let mut answer: i32 = if valid { 0 } else { libc::EBADF };
+            let mut iov = libc::iovec { iov_base: (&mut answer as *mut i32).cast(), iov_len: 4 };
+            let mut ctl = [0u64; 4];
+            let mut m: libc::msghdr = std::mem::zeroed();
+            m.msg_iov = &mut iov;
+            m.msg_iovlen = 1;
+            if valid {
+                let c = ctl.as_mut_ptr().cast::<libc::cmsghdr>();
+                (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+                (*c).cmsg_level = libc::SOL_SOCKET;
+                (*c).cmsg_type = libc::SCM_RIGHTS;
+                *(libc::CMSG_DATA(c) as *mut i32) = fd;
+                m.msg_control = ctl.as_mut_ptr().cast();
+                m.msg_controllen = libc::CMSG_SPACE(4) as _;
+            }
+            if libc::sendmsg(s, &m, 0) < 0 && valid {
+                // One the host passes on no socket (a kqueue): its error.
+                let mut refused = crate::host::last_errno();
+                let mut again =
+                    libc::iovec { iov_base: (&mut refused as *mut i32).cast(), iov_len: 4 };
+                m.msg_iov = &mut again;
+                m.msg_control = std::ptr::null_mut();
+                m.msg_controllen = 0;
+                libc::sendmsg(s, &m, 0);
+            }
+        }
+        if s >= 0 {
+            libc::close(s);
+        }
+    }
+    crate::host::set_errno(saved);
+}
+
+/// What arrived on reply socket `sock`: the host errno of the answer (0
+/// for none) and the descriptor sent (-1 for none).
+pub fn receive_fd(sock: i32) -> (i32, i32) {
+    let mut answer: i32 = 0;
+    let mut ctl = [0u64; 4];
+    // SAFETY: zeroed bytes are a valid `msghdr`; buffers of their stated
+    // lengths; the control data read as the host wrote it.
+    unsafe {
+        let mut iov = libc::iovec { iov_base: (&mut answer as *mut i32).cast(), iov_len: 4 };
+        let mut m: libc::msghdr = std::mem::zeroed();
+        m.msg_iov = &mut iov;
+        m.msg_iovlen = 1;
+        m.msg_control = ctl.as_mut_ptr().cast();
+        m.msg_controllen = std::mem::size_of_val(&ctl) as _;
+        if libc::recvmsg(sock, &mut m, libc::MSG_DONTWAIT) < 4 {
+            return (libc::EAGAIN, -1);
+        }
+        let c = libc::CMSG_FIRSTHDR(&m);
+        let fd = if !c.is_null()
+            && (*c).cmsg_level == libc::SOL_SOCKET
+            && (*c).cmsg_type == libc::SCM_RIGHTS
+        {
+            *(libc::CMSG_DATA(c) as *const i32)
+        } else {
+            -1
+        };
+        (answer, fd)
+    }
 }
 
 /// Host process `pid`'s mailbox goes with its record.

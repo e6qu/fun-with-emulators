@@ -8,7 +8,9 @@ Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
 The root is a root filesystem with LTP in /opt/ltp (tools/ltp/build.sh
 makes it, of Alpine's minirootfs). Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
 <args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
-own per-test timeout and a hard limit above that. A test passes when it exits 0; LTP's exit status
+own per-test timeout and a hard limit above that; `--jobs` run at once, but
+those that change a machine-wide setting (see SERIAL) run one at a time,
+after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
 `--update` rewrites it from the run. The pass rate is printed either way.
@@ -209,6 +211,13 @@ def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             time.sleep(1)
 
 
+# Tests that change a machine-wide setting (a sysctl) and put it back as
+# they end: run one at a time, after the rest, so that none of them takes
+# another's change for the setting to restore, nor runs while another's is
+# in force.
+SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04)(_64)?$")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fwe", required=True)
@@ -230,14 +239,24 @@ def main():
     work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
     results = {}
     try:
+        done = 0
+
+        def report(name, outcome, secs, tail):
+            nonlocal done
+            done += 1
+            results[name] = outcome
+            print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
+            if args.show and outcome not in ("pass", "conf", "script", "missing"):
+                print("    " + tail.replace("\n", "\n    "), flush=True)
+
+        parallel = [(n, a) for n, a in tests if not SERIAL.match(n)]
+        serial = [(n, a) for n, a in tests if SERIAL.match(n)]
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-            futures = [pool.submit(run_guarded, fwe, root, work, n, a, args.hard_limit) for n, a in tests]
-            for done, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-                name, outcome, secs, tail = fut.result()
-                results[name] = outcome
-                print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
-                if args.show and outcome not in ("pass", "conf", "script", "missing"):
-                    print("    " + tail.replace("\n", "\n    "), flush=True)
+            futures = [pool.submit(run_guarded, fwe, root, work, n, a, args.hard_limit) for n, a in parallel]
+            for fut in concurrent.futures.as_completed(futures):
+                report(*fut.result())
+        for n, a in serial:
+            report(*run_guarded(fwe, root, work, n, a, args.hard_limit))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

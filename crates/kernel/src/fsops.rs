@@ -119,6 +119,16 @@ fn ns_stat(ino: u64) -> Stat {
     s
 }
 
+/// A process descriptor of host process `host`, as pidfs shows one: a
+/// file only its owner may use, its inode the process's.
+fn pidfd_stat(host: i32) -> Stat {
+    let mut s = synth_stat(fwe_abi::stat::S_IFREG | 0o700, 0);
+    s.st_ino = host as u64;
+    let (major, minor) = crate::nsfd::NSFS_DEV;
+    s.st_dev = crate::devnodes::makedev(major, minor + 1);
+    s
+}
+
 /// The number of the namespace a `/proc/<pid>/ns` link's target names
 /// (`pid:[4026531836]`), if it is one.
 fn namespace_inode(target: &[u8]) -> Option<u64> {
@@ -1077,6 +1087,10 @@ impl<P: Platform> Kernel<P> {
             guest!(uaccess::write(buf, ns_stat(n.id)));
             return 0;
         }
+        if let Some(t) = crate::pidfd::of(fd as i32) {
+            guest!(uaccess::write(buf, pidfd_stat(t.host)));
+            return 0;
+        }
         if crate::synthdir::fstat_is_dir(fd as i32) {
             use fwe_abi::stat as st;
             guest!(uaccess::write(buf, synth_stat(st::S_IFDIR | 0o555, 0)));
@@ -1142,6 +1156,10 @@ impl<P: Platform> Kernel<P> {
         };
         if empty && let Some(n) = crate::nsfd::of(dirfd as i32) {
             guest!(uaccess::write(buf, with_mount(statx_of(&ns_stat(n.id)))));
+            return 0;
+        }
+        if empty && let Some(t) = crate::pidfd::of(dirfd as i32) {
+            guest!(uaccess::write(buf, with_mount(statx_of(&pidfd_stat(t.host)))));
             return 0;
         }
         let (host, node) = if empty {
