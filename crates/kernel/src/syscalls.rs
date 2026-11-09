@@ -61,8 +61,10 @@ pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
 
 pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> i64 {
     const TIMER_ABSTIME: u64 = 1;
+    // A thread's CPU-time clock cannot be slept on (a C library turns
+    // this into `EINVAL`).
     if matches!(id, clock::CLOCK_THREAD_CPUTIME_ID) {
-        return err(errno::EINVAL);
+        return err(errno::EOPNOTSUPP);
     }
     let Some(hid) = host::clock_to_host(id) else {
         return err(errno::EINVAL);
@@ -1983,6 +1985,33 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     with_remaining(timeout, || unsafe { pselect6_wait(nfds, sets, timeout) })
 }
 
+/// What the host reported ready on `p` as Linux reports it: a regular
+/// file is readable and writable but has no urgent data (`POLLPRI`, which
+/// the host gives it), and a pipe or FIFO whose writers have gone with
+/// nothing left to read has hung up (`POLLHUP`) but is not readable.
+fn linux_revents(p: &mut libc::pollfd) {
+    if p.revents == 0 || p.revents & libc::POLLNVAL != 0 {
+        return;
+    }
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstat(p.fd, &mut st) } != 0 {
+        return;
+    }
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => p.revents &= !libc::POLLPRI,
+        libc::S_IFIFO if p.revents & libc::POLLHUP != 0 => {
+            let mut queued: libc::c_int = 0;
+            // SAFETY: a valid out-parameter for FIONREAD.
+            if unsafe { libc::ioctl(p.fd, libc::FIONREAD, &mut queued) } == 0 && queued == 0 {
+                p.revents &= !libc::POLLIN;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A `struct timespec` timeout at guest `timeout` in nanoseconds (-1 for a
 /// null pointer: without bound), or the call's error for a bad one.
 fn timeout_ns(timeout: u64) -> Result<i64, i64> {
@@ -2036,6 +2065,9 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     if let Err(e) = crate::thread::wait_ready_ns(&mut fds, ns) {
         return err(e);
     }
+    for p in &mut fds {
+        linux_revents(p);
+    }
     if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
         return err(errno::EBADF);
     }
@@ -2077,6 +2109,10 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
 /// As for [`ppoll`].
 unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
+    // More than a process may have open, before the array is read.
+    if nfds > crate::fdtable::limit().0 {
+        return err(errno::EINVAL);
+    }
     let ns = match timeout_ns(timeout) {
         Ok(ns) => ns,
         Err(e) => return e,
@@ -2108,6 +2144,9 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         guest!(uaccess::read_into(fds, bytes));
         return match crate::thread::wait_ready_ns(&mut set, ns) {
             Ok(n) => {
+                for p in &mut set {
+                    linux_revents(p);
+                }
                 for (i, p) in set.iter().enumerate() {
                     let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
                     guest!(uaccess::write(at, p.revents));
