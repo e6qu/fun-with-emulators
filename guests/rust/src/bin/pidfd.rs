@@ -308,13 +308,20 @@ fn main() {
         // A descriptor a fork child inherits: it sees its sibling end.
         let (sibling, go) = waiting_child(0);
         let fd = syscall(SYS_PIDFD_OPEN, i64::from(sibling), 0i64) as i32;
+        let mut looked = [0i32; 2];
+        pipe(looked.as_mut_ptr());
         let watcher = fork();
         if watcher == 0 {
             let before = readable(fd, 0);
+            // The sibling ends only once it has looked.
+            write(looked[1], b"l".as_ptr().cast(), 1);
             let after = readable(fd, 5000);
             _exit(if !before && after { 0 } else { 1 });
         }
-        usleep(50_000);
+        let mut b = 0u8;
+        read(looked[0], (&mut b as *mut u8).cast(), 1);
+        close(looked[0]);
+        close(looked[1]);
         write(go, b"g".as_ptr().cast(), 1);
         let mut status = 0;
         libc_waitpid(watcher, &mut status);
