@@ -1032,9 +1032,9 @@ which are to be lifted for 1.0 and which are not planned.
   `TFD_TIMER_ABSTIME` against the realtime clock whatever its clock, and a
   periodic timer's first expiry is its interval.
 - A `poll`, `select` or `epoll` timeout on an idle host ends a quarter to
-  half a millisecond late (the host's wake from its timer), past what
-  LTP's timer tests allow for the longer timeouts; a busy host wakes
-  sooner.
+  half a millisecond late (the host's wake from its timer), and any sleep
+  on a loaded CI runner can end milliseconds late: past what LTP's timer
+  tests allow, so they are not in its baseline.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in

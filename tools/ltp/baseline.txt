@@ -57,7 +57,6 @@ clock_gettime01
 clock_gettime02
 clock_gettime04
 clock_nanosleep01
-clock_nanosleep02
 clock_nanosleep04
 clone01
 clone02
@@ -319,7 +318,6 @@ futex_wait01
 futex_wait02
 futex_wait03
 futex_wait04
-futex_wait05
 futex_wait06
 futex_wait07
 futex_waitv01
