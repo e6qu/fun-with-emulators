@@ -17,6 +17,28 @@
 //! lock to post would deadlock. Both return `None` for a descriptor that is not
 //! one of ours, so the caller falls back to the normal host `read`/`write`.
 
+/// Whether `fd` is a timerfd that does not block, if it is one.
+pub fn timer_nonblock(fd: i32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    imp::timer_nonblock(fd)
+}
+
+/// `F_SETFL`'s `O_NONBLOCK` on timerfd `fd`: whether it was one.
+pub fn set_timer_nonblock(fd: i32, on: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (fd, on);
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    imp::set_timer_nonblock(fd, on)
+}
+
 /// Handle `read` for an emulated descriptor. `Some(result)` if `fd` is one of
 /// ours (possibly blocking without the kernel lock); `None` otherwise.
 ///
@@ -222,18 +244,18 @@ mod imp {
         nonblock: bool,
         interval: (i64, i64),
         value: (i64, i64),
-        /// How it is armed: the period in milliseconds, whether it repeats,
-        /// and when (monotonic milliseconds) it first fires; 0 when disarmed.
-        period_ms: i64,
+        /// How it is armed: the period in nanoseconds, whether it repeats,
+        /// and when (monotonic nanoseconds) it first fires; 0 when disarmed.
+        period_ns: i64,
         periodic: bool,
-        first_at_ms: i64,
+        first_at_ns: i64,
     }
 
-    fn now_ms() -> i64 {
+    fn now_ns() -> i64 {
         let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: valid timespec out-parameter.
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
-        t.tv_sec.saturating_mul(1000) + t.tv_nsec / 1_000_000
+        t.tv_sec.saturating_mul(1_000_000_000) + t.tv_nsec
     }
 
     pub(super) fn save(e: &mut crate::snapshot::Enc) {
@@ -255,9 +277,9 @@ mod imp {
                     for v in [t.interval.0, t.interval.1, t.value.0, t.value.1] {
                         e.i64(v);
                     }
-                    e.i64(t.period_ms);
+                    e.i64(t.period_ns);
                     e.bool(t.periodic);
-                    e.i64(t.first_at_ms);
+                    e.i64(t.first_at_ns);
                 }
             })
         })
@@ -282,26 +304,26 @@ mod imp {
                     nonblock: d.bool(),
                     interval: (d.i64(), d.i64()),
                     value: (d.i64(), d.i64()),
-                    period_ms: d.i64(),
+                    period_ns: d.i64(),
                     periodic: d.bool(),
-                    first_at_ms: d.i64(),
+                    first_at_ns: d.i64(),
                 })
             }
         });
         for s in reg.values() {
             let Special::Timer(t) = s else { continue };
             let ce = cloexec.get(&t.kq).copied().unwrap_or(false);
-            if !crate::snapshot::fresh_kqueue_at(t.kq, ce) || t.first_at_ms == 0 {
+            if !crate::snapshot::fresh_kqueue_at(t.kq, ce) || t.first_at_ns == 0 {
                 continue;
             }
             // A one-shot timer fires once what was left of its time is up —
             // at once if it is up already and its expiration was not read; a
             // periodic one keeps its period, losing expirations not yet read.
             let (period, extra) = if t.periodic {
-                (t.period_ms, libc::EV_ENABLE)
+                (t.period_ns, libc::EV_ENABLE)
             } else {
                 // A kqueue timer of 0 fires at once.
-                ((t.first_at_ms - now_ms()).max(0), libc::EV_ENABLE | libc::EV_ONESHOT)
+                ((t.first_at_ns - now_ns()).max(0), libc::EV_ENABLE | libc::EV_ONESHOT)
             };
             let change = timer_kevent(libc::EV_ADD | extra, period);
             // SAFETY: single-change kevent with no event list.
@@ -381,8 +403,20 @@ mod imp {
         rfd as i64
     }
 
-    pub unsafe fn timerfd_create(_clockid: u64, flags: u64) -> i64 {
+    pub unsafe fn timerfd_create(clockid: u64, flags: u64) -> i64 {
+        use fwe_abi::clock::*;
         use fwe_abi::timerfd::*;
+        // The clocks a timer may follow, and the flags Linux knows.
+        let clocks = [
+            CLOCK_REALTIME,
+            CLOCK_MONOTONIC,
+            CLOCK_BOOTTIME,
+            CLOCK_REALTIME_ALARM,
+            CLOCK_BOOTTIME_ALARM,
+        ];
+        if !clocks.contains(&clockid) || flags & !(TFD_NONBLOCK | TFD_CLOEXEC) != 0 {
+            return err(errno::EINVAL);
+        }
         // SAFETY: plain host call.
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
@@ -399,9 +433,9 @@ mod imp {
                     nonblock: flags & TFD_NONBLOCK != 0,
                     interval: (0, 0),
                     value: (0, 0),
-                    period_ms: 0,
+                    period_ns: 0,
                     periodic: false,
-                    first_at_ms: 0,
+                    first_at_ns: 0,
                 }),
             )
         });
@@ -411,8 +445,20 @@ mod imp {
     pub unsafe fn timerfd_settime(fd: u64, flags: u64, new_value: u64, old_value: u64) -> i64 {
         use fwe_abi::timerfd::*;
         let fd = fd as i32;
-        // Read the requested interval and value.
+        // In Linux's order: the flags, the new time, then the descriptor.
+        if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
+            return err(errno::EINVAL);
+        }
         let [iv_s, iv_ns, val_s, val_ns]: [i64; 4] = guest!(uaccess::read(new_value));
+        if [iv_ns, val_ns].iter().any(|ns| !(0..1_000_000_000).contains(ns))
+            || iv_s < 0
+            || val_s < 0
+        {
+            return err(errno::EINVAL);
+        }
+        if let Err(e) = timer_fd_check(fd) {
+            return err(e);
+        }
 
         let (prev_iv, prev_val, kq) = match with_reg(|m| match m.get_mut(&fd) {
             Some(Special::Timer(t)) => {
@@ -431,8 +477,8 @@ mod imp {
             guest!(uaccess::write(old_value, [prev_iv.0, prev_iv.1, prev_val.0, prev_val.1]));
         }
 
-        let value_ms = val_s.saturating_mul(1000) + val_ns / 1_000_000;
-        let interval_ms = iv_s.saturating_mul(1000) + iv_ns / 1_000_000;
+        let value = val_s.saturating_mul(1_000_000_000).saturating_add(val_ns);
+        let interval = iv_s.saturating_mul(1_000_000_000).saturating_add(iv_ns);
 
         // Disarm when it_value is zero.
         if val_s == 0 && val_ns == 0 {
@@ -446,21 +492,21 @@ mod imp {
         // kqueue fires relative; approximate an absolute deadline against now,
         // and periodic timers fire every it_interval (the distinct initial
         // it_value is not modelled when an interval is set).
-        let mut first_ms = value_ms;
+        let mut first = value;
         if flags & TFD_TIMER_ABSTIME != 0 {
             let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
             // SAFETY: valid timespec out-parameter.
             unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
-            let now_ms = now.tv_sec.saturating_mul(1000) + now.tv_nsec / 1_000_000;
-            first_ms = (value_ms - now_ms).max(1);
+            let now = now.tv_sec.saturating_mul(1_000_000_000) + now.tv_nsec;
+            first = (value - now).max(1);
         }
-        let periodic = interval_ms > 0;
-        let period = if periodic { interval_ms } else { first_ms }.max(1);
+        let periodic = interval > 0;
+        let period = if periodic { interval } else { first }.max(1);
         let mut extra = libc::EV_ENABLE;
         if !periodic {
             extra |= libc::EV_ONESHOT;
         }
-        armed(fd, period, periodic, now_ms() + first_ms.max(1));
+        armed(fd, period, periodic, now_ns() + first.max(1));
         let change = timer_kevent(libc::EV_ADD | extra, period);
         // SAFETY: single-change kevent with no event list.
         let r = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
@@ -468,46 +514,85 @@ mod imp {
     }
 
     /// Record how timer `fd` is armed, for a fork child to re-arm it.
-    fn armed(fd: i32, period_ms: i64, periodic: bool, first_at_ms: i64) {
+    fn armed(fd: i32, period_ns: i64, periodic: bool, first_at_ns: i64) {
         with_reg(|m| {
             if let Some(Special::Timer(t)) = m.get_mut(&fd) {
-                (t.period_ms, t.periodic, t.first_at_ms) = (period_ms, periodic, first_at_ms);
+                (t.period_ns, t.periodic, t.first_at_ns) = (period_ns, periodic, first_at_ns);
             }
         })
     }
 
     /// What is left until timer `t` next expires at monotonic time `now`
-    /// (milliseconds), as `(seconds, nanoseconds)`: zero when disarmed, or
+    /// (nanoseconds), as `(seconds, nanoseconds)`: zero when disarmed, or
     /// a one-shot timer that has expired.
     fn time_left(t: &TimerFd, now: i64) -> (i64, i64) {
-        if t.first_at_ms == 0 {
+        if t.first_at_ns == 0 {
             return (0, 0);
         }
-        let left = if now < t.first_at_ms {
-            t.first_at_ms - now
-        } else if t.periodic && t.period_ms > 0 {
-            t.period_ms - (now - t.first_at_ms) % t.period_ms
+        let left = if now < t.first_at_ns {
+            t.first_at_ns - now
+        } else if t.periodic && t.period_ns > 0 {
+            t.period_ns - (now - t.first_at_ns) % t.period_ns
         } else {
             0
         };
-        (left / 1000, left % 1000 * 1_000_000)
+        (left / 1_000_000_000, left % 1_000_000_000)
     }
 
-    fn timer_kevent(flags: u16, period_ms: i64) -> libc::kevent {
+    /// The host timer of a timerfd, in nanoseconds and on time
+    /// (`NOTE_CRITICAL`: the host's usual leeway can make it fire a
+    /// millisecond or more late).
+    fn timer_kevent(flags: u16, period_ns: i64) -> libc::kevent {
         libc::kevent {
             ident: 1,
             filter: libc::EVFILT_TIMER,
             flags,
-            fflags: 0,
-            data: period_ms as libc::intptr_t,
+            fflags: libc::NOTE_NSECONDS | libc::NOTE_CRITICAL,
+            data: period_ns as libc::intptr_t,
             udata: std::ptr::null_mut(),
         }
     }
 
+    /// `fd` is open (`EBADF`) and a timerfd (`EINVAL`).
+    fn timer_fd_check(fd: i32) -> Result<(), i32> {
+        // SAFETY: F_GETFD only queries.
+        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(errno::EBADF);
+        }
+        if with_reg(|m| matches!(m.get(&fd), Some(Special::Timer(_)))) {
+            Ok(())
+        } else {
+            Err(errno::EINVAL)
+        }
+    }
+
+    /// Whether `fd` is a timerfd that does not block, if it is one.
+    pub fn timer_nonblock(fd: i32) -> Option<bool> {
+        with_reg(|m| match m.get(&fd) {
+            Some(Special::Timer(t)) => Some(t.nonblock),
+            _ => None,
+        })
+    }
+
+    /// `F_SETFL`'s `O_NONBLOCK` on timerfd `fd` (which the host takes on no
+    /// kqueue): whether it was one.
+    pub fn set_timer_nonblock(fd: i32, on: bool) -> bool {
+        with_reg(|m| match m.get_mut(&fd) {
+            Some(Special::Timer(t)) => {
+                t.nonblock = on;
+                true
+            }
+            _ => false,
+        })
+    }
+
     pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
         let fd = fd as i32;
+        if let Err(e) = timer_fd_check(fd) {
+            return err(e);
+        }
         match with_reg(|m| match m.get(&fd) {
-            Some(Special::Timer(t)) => Some((t.interval, time_left(t, now_ms()))),
+            Some(Special::Timer(t)) => Some((t.interval, time_left(t, now_ns()))),
             _ => None,
         }) {
             Some((iv, val)) => {
@@ -588,7 +673,7 @@ mod imp {
                 // child must find it.
                 let one_shot = with_reg(|m| match m.get_mut(&fd) {
                     Some(Special::Timer(t)) if !t.periodic => {
-                        t.first_at_ms = 0;
+                        t.first_at_ns = 0;
                         true
                     }
                     _ => false,

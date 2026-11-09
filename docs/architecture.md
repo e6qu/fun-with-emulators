@@ -383,10 +383,13 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   emulated faults, caught `tgkill`) wakes its target thread, or every
   thread, with `SIGEMT`.
 - **Wake pipes:** every host signal a thread takes writes a byte to that
-  thread's pipe (`thread::poke_wait`), and `poll`, `select` and the
-  `epoll` waits watch it beside the guest's descriptors
-  (`thread::wait_ready`), so a signal that lands after such a wait looked
-  for pending ones, and before the host wait began, still ends it.
+  thread's pipe (`thread::poke_wait`), and the sleeps, `poll`, `select`
+  and the `epoll` waits watch it beside the guest's descriptors
+  (`thread::wait_ready_ns`), so a signal that lands after such a wait
+  looked for pending ones, and before the host wait began, still ends it.
+  Their time is kept by a kqueue timer of the thread's with
+  `NOTE_CRITICAL`, which the host does not coalesce. A futex wait close to
+  its deadline sleeps the same way, a wake writing to its pipe.
 - **Signals the host lacks, between processes:** queued in the target's
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets.
@@ -960,9 +963,11 @@ which are to be lifted for 1.0 and which are not planned.
   except in the VM).
 
 **Event descriptors and inotify**
-- `EPOLLEXCLUSIVE` wakes every waiter; `timerfd` has millisecond
-  resolution, measures `TFD_TIMER_ABSTIME` against the realtime clock
-  whatever its clock, and a periodic timer's first expiry is its interval.
+- `EPOLLEXCLUSIVE` wakes every waiter; `timerfd` measures
+  `TFD_TIMER_ABSTIME` against the realtime clock whatever its clock, and a
+  periodic timer's first expiry is its interval; a pipe keeps the host's
+  capacity whatever `F_SETPIPE_SZ` set (`F_GETPIPE_SZ` reports the size
+  set).
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in

@@ -858,6 +858,8 @@ impl<P: Platform> Kernel<P> {
                     let r = libc::fcntl(fd, libc::F_GETFL);
                     if r < 0 {
                         last_error()
+                    } else if let Some(nb) = crate::specialfd::timer_nonblock(fd) {
+                        (fcntl::O_RDWR | if nb { fcntl::O_NONBLOCK } else { 0 }) as i64
                     } else if let Some(t) = crate::pidfd::of(fd) {
                         // Read-write, and non-blocking as it was made or set.
                         (fcntl::O_RDWR | if t.nonblock { fcntl::O_NONBLOCK } else { 0 }) as i64
@@ -873,6 +875,10 @@ impl<P: Platform> Kernel<P> {
                     } else {
                         host::status_flags_to_linux(r) as i64
                     }
+                }
+                fcntl::F_SETFL if crate::specialfd::timer_nonblock(fd).is_some() => {
+                    crate::specialfd::set_timer_nonblock(fd, arg & fcntl::O_NONBLOCK != 0);
+                    0
                 }
                 fcntl::F_SETFL if crate::pidfd::of(fd).is_some() => {
                     crate::pidfd::set_nonblock(fd, arg & fcntl::O_NONBLOCK != 0);
