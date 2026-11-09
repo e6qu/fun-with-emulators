@@ -147,6 +147,8 @@ impl<P: Platform> Kernel<P> {
     /// inherits it. The caller holds the kernel lock until
     /// [`Kernel::fork_parent`] or [`Kernel::fork_child`].
     pub fn fork_begin(&mut self, a: &crate::CloneArgs) -> Result<ForkNs, i32> {
+        // The mappings the child inherits are the parent's, published.
+        crate::maps::flush();
         // `CLONE_PIDFD`: the descriptor, and that it can be put where it
         // goes, before anything else is done for the child.
         let pidfd = if a.flags & CLONE_PIDFD != 0 {

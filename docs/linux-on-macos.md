@@ -1493,8 +1493,8 @@ a kqueue, a pipe, or both, so that the guest can mix them in one `epoll`:
 
 | Linux | macOS | fwe |
 |---|---|---|
-| `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR` (a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen, as Linux reports it only once written to), `EPOLLONESHOT` → `EV_ONESHOT`, data in `udata`; `epoll_event` is 16 bytes on arm64; how events come back is under [Network events](#network-events) |
-| `eventfd` | none | a pipe plus a 64-bit counter; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
+| `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR` (a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen, as Linux reports it only once written to), `EPOLLONESHOT` → `EV_ONESHOT`, `EPOLLEXCLUSIVE` → a count of a pipe's writes every fwe process shares, of which each woken set must take one to report it, data in `udata`; `epoll_event` is 16 bytes on arm64; how events come back is under [Network events](#network-events) |
+| `eventfd` | none | a pipe plus a 64-bit counter in a shared page, so a fork child shares it; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
 | `timerfd` | none | a kqueue with one `EVFILT_TIMER`, in nanoseconds and on time (`NOTE_CRITICAL`) |
 | `signalfd` | none | a readiness pipe plus a queue of `signalfd_siginfo`; a pending signal the thread blocks and a signalfd watches moves onto it |
 | inotify | `kqueue` vnode events (no names), FSEvents (paths, after the fact); neither reports open, read or close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |
@@ -1576,8 +1576,10 @@ What Linux keeps in one kernel for every process — mount tables,
 namespaces, the cgroup tree, loop devices, IPC objects, keys, inotify
 watches, shared futexes — must be seen by every fwe process. It lives in
 fwe's private directory on the host (`crates/kernel/src/shared.rs`): a
-directory per record, its data replaced whole under a lock, and a mapped
-generation count so a process rereads only after another changed it.
+directory per record, its data changed under a lock (written whole, or
+for System V IPC's objects each change appended to a journal beside it),
+and a mapped generation count so a process rereads only after another
+changed it.
 
 ```mermaid
 flowchart LR

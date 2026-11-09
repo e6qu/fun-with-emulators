@@ -8,12 +8,15 @@ Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
 The root is a root filesystem with LTP in /opt/ltp (tools/ltp/build.sh
 makes it, of Alpine's minirootfs). Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
 <args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
-own per-test timeout and a hard limit above that; `--jobs` run at once, but
-those that change a machine-wide setting (see SERIAL) run one at a time,
-after the rest. A test passes when it exits 0; LTP's exit status
+own per-test timeout and a hard limit above that (twice it for the slow
+ones, which start first; a minute for one not in the baseline); `--jobs`
+run at once, but those that change a machine-wide setting (see SERIAL) run
+one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
 `--update` rewrites it from the run. The pass rate is printed either way.
+The tests in exceptions.txt, which fail on Linux too, are not run, and do not
+count as applicable.
 """
 
 import argparse
@@ -30,10 +33,20 @@ import time
 
 # LTP's exit statuses (include/tst_res_flags.h), as bits.
 TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
+# Tests that take tens of seconds or more, however well fwe does: started
+# first.
+SLOW = re.compile(
+    r"^(shmget03|fcntl14|fcntl14_64|rename11|renameat01|shmctl05|inotify11"
+    r"|semop05|msgstress01|preadv203|preadv203_64|linkat02|fork14|munmap04|fallocate06)$"
+)
+
 # A hard limit on each test, over LTP's own (30 s per run by default, times
 # LTP_TIMEOUT_MUL below; tests that run longer raise it themselves and
 # report as they go).
 HARD_LIMIT = 300
+# A test not in the baseline fails already: it is not given the time a
+# regression would be, so one that hangs costs a minute, not five.
+FAILING_LIMIT = 60
 # The System V IPC and message queue tests: each runs in an IPC namespace of
 # its own. They fill, count and limit what a namespace holds, which tests
 # run beside them (four at a time, where LTP runs one) would otherwise see
@@ -258,12 +271,23 @@ def main():
     ap.add_argument("--fwe", required=True)
     ap.add_argument("--root", required=True, help="a root filesystem with LTP in /opt/ltp")
     ap.add_argument("--baseline", default=os.path.join(os.path.dirname(__file__), "baseline.txt"))
+    ap.add_argument(
+        "--exceptions",
+        default=os.path.join(os.path.dirname(__file__), "exceptions.txt"),
+        help="tests not run: they fail on Linux too, the file says why",
+    )
     ap.add_argument("--update", action="store_true", help="rewrite the baseline from this run")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--only", help="run only the tests whose name matches")
     ap.add_argument("--results", help="write every outcome to this file")
     ap.add_argument("--show", action="store_true", help="print the output of each test that does not pass")
     ap.add_argument("--hard-limit", type=int, default=HARD_LIMIT, help="seconds before a test is ended")
+    ap.add_argument(
+        "--failing-limit",
+        type=int,
+        default=FAILING_LIMIT,
+        help="seconds before a test not in the baseline is ended",
+    )
     args = ap.parse_args()
 
     fwe = os.path.abspath(args.fwe)
@@ -271,9 +295,28 @@ def main():
     tests = entries(os.path.join(root, "opt", "ltp"))
     if args.only:
         tests = [t for t in tests if re.search(args.only, t[0])]
+    # The exceptions are not run (some wait out their whole timeout).
+    excepted = set()
+    if os.path.exists(args.exceptions):
+        with open(args.exceptions) as f:
+            excepted = {line.split()[0] for line in f if line.strip() and not line.startswith("#")}
+    results = {n: "exception" for n, _ in tests if n in excepted}
+    with open(args.baseline) as f:
+        passing = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+    if args.update:
+        passing = {n for n, _ in tests}
+
+    def limit(name):
+        # A slow test is given twice the time, passing yet or not: its
+        # time is mostly the host's (fork14's thousands of forks of a
+        # process with thousands of mappings).
+        if SLOW.match(name):
+            return 2 * args.hard_limit
+        return args.hard_limit if name in passing else min(args.failing_limit, args.hard_limit)
+
+    tests = [t for t in tests if t[0] not in excepted]
     work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
     os.chmod(work, 0o1777)
-    results = {}
     try:
         done = 0
 
@@ -286,16 +329,19 @@ def main():
                 print("    " + tail.replace("\n", "\n    "), flush=True)
 
         parallel = [(n, a) for n, a in tests if not SERIAL.match(n)]
+        # The long ones first, so that the many short ones fill in beside
+        # them rather than leaving them to run on alone at the end.
+        parallel.sort(key=lambda t: not SLOW.match(t[0]))
         serial = [(n, a) for n, a in tests if SERIAL.match(n)]
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-            futures = [pool.submit(run_guarded, fwe, root, work, n, a, args.hard_limit) for n, a in parallel]
+            futures = [pool.submit(run_guarded, fwe, root, work, n, a, limit(n)) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
                 report(*fut.result())
         left = end_leftovers(fwe, root)
         if left:
             print(f"ended {left} processes tests left running")
         for n, a in serial:
-            report(*run_guarded(fwe, root, work, n, a, args.hard_limit))
+            report(*run_guarded(fwe, root, work, n, a, limit(n)))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -309,7 +355,7 @@ def main():
         counts[outcome] = counts.get(outcome, 0) + 1
     passed = counts.get("pass", 0)
     run = len(results) - counts.get("script", 0) - counts.get("missing", 0)
-    applicable = run - counts.get("conf", 0)
+    applicable = run - counts.get("conf", 0) - counts.get("exception", 0)
     print("\noutcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     print(f"passed {passed} of {run} run ({100 * passed / max(run, 1):.1f}%), "
           f"{passed} of {applicable} applicable ({100 * passed / max(applicable, 1):.1f}%)")

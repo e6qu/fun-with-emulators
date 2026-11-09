@@ -495,7 +495,7 @@ pub(crate) fn mapped(start: u64, len: u64) -> bool {
 /// Whether all of host range `[host, host + len)` is mapped, as Mach's
 /// regions say (`mincore` does not fail for a hole on macOS).
 #[cfg(target_os = "macos")]
-fn host_mapped(host: u64, len: u64) -> bool {
+pub(crate) fn host_mapped(host: u64, len: u64) -> bool {
     let end = host.saturating_add(len);
     let mut at = host;
     while at < end {
@@ -510,7 +510,7 @@ fn host_mapped(host: u64, len: u64) -> bool {
 /// Whether all of host range `[host, host + len)` is mapped: `mincore`
 /// fails with `ENOMEM` for a hole, and has no other effect.
 #[cfg(not(target_os = "macos"))]
-fn host_mapped(host: u64, len: u64) -> bool {
+pub(crate) fn host_mapped(host: u64, len: u64) -> bool {
     // SAFETY: plain host call.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
     let mut vec = [0u8; 4096];
@@ -1041,6 +1041,10 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EOPNOTSUPP);
             }
         }
+        // No more mappings than `vm.max_map_count` allows.
+        if too_many_maps(0) {
+            return err(errno::ENOMEM);
+        }
         // Nothing of a mount that runs nothing is mapped to run, then or
         // later.
         let noexec = flags & mman::MAP_ANONYMOUS == 0
@@ -1209,6 +1213,15 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+        // Unmapping the middle of a mapping makes two of it: not past
+        // `vm.max_map_count`.
+        let end = addr.saturating_add(self.page_up(len));
+        let splits = crate::maps::record()
+            .span_at(addr)
+            .is_some_and(|(start, stop)| start < addr && stop > end);
+        if splits && too_many_maps(1) {
+            return err(errno::ENOMEM);
+        }
         if self.sealed(addr, len) {
             return err(errno::EPERM);
         }
@@ -2363,6 +2376,14 @@ fn is_dev_zero(fd: i32) -> bool {
     // SAFETY: as above.
     let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
     ok && crate::devnodes::linux_numbers_of_host(&st).is_some_and(|n| (n.major, n.minor) == (1, 5))
+}
+
+/// Whether `extra` more mappings would pass `vm.max_map_count` (Linux
+/// refuses a new one once there are more than it). Read only where a
+/// process has many: below a thousand, none passes.
+fn too_many_maps(extra: usize) -> bool {
+    let n = crate::maps::record().count() + extra;
+    n >= 1024 && crate::sysctl::number(b"vm/max_map_count").is_some_and(|max| n as i64 > max.max(0))
 }
 
 /// The host path of the file mapped at host address `addr`.

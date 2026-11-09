@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 1060 of 1550 (88% of the 1207 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 1072 of 1551 (90% of the 1190 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -139,10 +139,8 @@ run.
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).
 - [ ] **Every other failure LTP points at**, among them:
-  - `EPOLLEXCLUSIVE`;
-  - `eventfd` across processes;
-  - `rename` and `statx` details, `vm.max_map_count`,
-    `/proc/<pid>/pagemap` and `coredump_filter`.
+  - `rename` and `statx` details, `/proc/<pid>/pagemap` and
+    `coredump_filter`.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
@@ -204,6 +202,9 @@ for it fall back:
 - `fanotify`: its permission events would hold every process's file
   calls on another's answer; it is refused (`ENOSYS`), and programs fall
   back to inotify;
+- CPU affinity: macOS has none, so `sched_setaffinity` is accepted and
+  pins nothing, and a test of how the scheduler shares one CPU (`nice05`)
+  cannot hold;
 - graphical programs, Wine's included;
 - x86 and x64 Windows programs under Wine (an x86 emulator such as FEX
   inside Wine, or box64 under it).

@@ -32,7 +32,7 @@ jobs:
       matrix:
         os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    # A full run takes about 10 minutes; a hang fails instead of holding the
+    # A full run takes about 15 minutes; a hang fails instead of holding the
     # runner for GitHub's six hours.
     timeout-minutes: 45
     steps:
@@ -75,7 +75,8 @@ jobs:
           status=${PIPESTATUS[0]}
           if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
           exit "$status"
-      - run: cargo test
+      # The rest: the VM's tests ran in the step above.
+      - run: cargo test -- --skip hv_
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.

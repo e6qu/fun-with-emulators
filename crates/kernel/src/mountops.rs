@@ -138,7 +138,14 @@ impl<P: Platform> Kernel<P> {
         let mut root = b"/".to_vec();
         let mut flags = 0;
         let src = match kind {
-            FsType::Tmpfs => Source::Host(tmpfs_dir(mode_option(data).unwrap_or(0o1777))?),
+            FsType::Tmpfs => {
+                let dir = tmpfs_dir(mode_option(data).unwrap_or(0o1777))?;
+                // A size asked for is kept beside it ([`crate::tmpfs`]).
+                if let Some(limit) = crate::tmpfs::size_option(data) {
+                    crate::tmpfs::mounted(&dir, limit);
+                }
+                Source::Host(dir)
+            }
             FsType::Cgroup2 => {
                 // The hierarchy from the cgroup namespace's root.
                 let dir = crate::cgroupfs::tree_dir()?;

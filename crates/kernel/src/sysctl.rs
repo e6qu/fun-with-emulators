@@ -276,6 +276,12 @@ const SYSCTLS: &[Sysctl] = &[
     },
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
     Sysctl {
+        path: b"vm/max_map_count",
+        default: "65530",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
         path: b"fs/mqueue/queues_max",
         default: "256",
         kind: Kind::Int(0, INT_MAX),

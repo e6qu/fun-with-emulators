@@ -52,6 +52,11 @@ impl<V: Mapping> Vmas<V> {
         self.map.is_empty()
     }
 
+    /// How many mappings there are.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
     /// The mapping containing `addr`.
     pub fn get(&self, addr: u64) -> Option<Piece<&V>> {
         let (&start, (end, value)) = self.map.range(..=addr).next_back()?;
@@ -59,6 +64,16 @@ impl<V: Mapping> Vmas<V> {
     }
 
     /// The parts of `[start, end)` that are mapped, cut to it, in order.
+    /// The mappings that overlap `[start, end)`, whole and unclipped.
+    pub fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = Piece<&V>> {
+        let before = self.map.range(..start).next_back().filter(|(_, (e, _))| *e > start);
+        before.into_iter().chain(self.map.range(start..end)).map(|(&start, (end, value))| Piece {
+            start,
+            end: *end,
+            value,
+        })
+    }
+
     pub fn pieces(&self, start: u64, end: u64) -> Vec<Piece<V>> {
         let mut out = Vec::new();
         // The mapping that may begin before `start`.
