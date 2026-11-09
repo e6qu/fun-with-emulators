@@ -36,7 +36,7 @@ TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
 # Tests that take tens of seconds or more, however well fwe does: started
 # first.
 SLOW = re.compile(
-    r"^(shmget03|fork13|fcntl14|fcntl14_64|rename11|renameat01|shmctl05|inotify11"
+    r"^(shmget03|fcntl14|fcntl14_64|rename11|renameat01|shmctl05|inotify11"
     r"|semop05|msgstress01|preadv203|preadv203_64|linkat02|fork14|munmap04|fallocate06)$"
 )
 
