@@ -24,3 +24,4 @@ readlinkat02 musl's readlinkat passes a one-byte buffer of its own for a size of
 pathconf02 musl's pathconf answers from a table without asking the kernel about the path, so its error cases succeed
 nice05 not planned (ROADMAP.md): it pins its processes to one CPU, which macOS cannot, and measures how the scheduler shares it
 close_range01 not planned (ROADMAP.md): its child shares the parent's descriptor table without its memory (CLONE_FILES without CLONE_VM), which macOS processes cannot
+setgroups03 musl's NGROUPS is 32 (glibc's is NGROUPS_MAX), so its setgroups(NGROUPS + 1) is in range and succeeds

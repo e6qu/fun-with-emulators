@@ -769,6 +769,11 @@ impl<P: Platform> Kernel<P> {
     fn sys_getgroups(&self, size: u64, list: u64) -> i64 {
         let groups = self.creds.groups();
         let n = groups.len();
+        // The size is an int: a negative one is refused.
+        if (size as i32) < 0 {
+            return err(errno::EINVAL);
+        }
+        let size = u64::from(size as u32);
         if size == 0 {
             return n as i64;
         }

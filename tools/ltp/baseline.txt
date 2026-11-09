@@ -343,6 +343,7 @@ geteuid01
 geteuid02
 getgid01
 getgid03
+getgroups01
 getgroups03
 gethostname01
 getitimer01
