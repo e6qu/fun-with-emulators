@@ -76,6 +76,8 @@ jobs:
           if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
           exit "$status"
       - run: cargo test
+      - if: always()
+        run: cat /tmp/fwe-kills.log || true
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.

@@ -379,6 +379,29 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
         let mut result = fwe_abi::err(fwe_abi::errno::ESRCH);
         for t in targets {
             let s = if fwe.is_some() && exe_of(t) == fwe { KILL_RELAY } else { libc::SIGKILL };
+            let line = format!(
+                "[fwe {me} {:?}] DEBUG SIGKILL to {t} (asked {pid}) as {}: {}\n",
+                exe_of(t).is_some(),
+                if s == KILL_RELAY { "relay" } else { "real" },
+                std::backtrace::Backtrace::force_capture()
+                    .to_string()
+                    .lines()
+                    .filter(|l| l.contains("fwe_"))
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            eprint!("{line}");
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/fwe-kills.log")
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
             if s == KILL_RELAY {
                 // The relay is taken only with a note of its sender: the
                 // host's own SIGINFO (macOS's Ctrl-T) is no kill.

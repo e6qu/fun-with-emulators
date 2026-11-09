@@ -101,6 +101,7 @@ impl Platform for NativePlatform {
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
+        eprintln!("[fwe {}] DEBUG kill_self {sig}", std::process::id());
         fwe_kernel::procreg::exiting(
             fwe_kernel::host::signal_to_linux(sig) as i32 | fwe_kernel::coredump::status_bit(),
         );
@@ -392,6 +393,8 @@ pub fn install_kill_relay() {
                 const SYS_GETPID: libc::c_int = 20;
                 #[allow(deprecated)]
                 let me = libc::syscall(SYS_GETPID) as libc::pid_t;
+                let msg = b"[fwe] DEBUG relay taken, dying\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
                 libc::kill(me, libc::SIGKILL)
             };
         }
