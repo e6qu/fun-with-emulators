@@ -2895,10 +2895,12 @@ impl<P: Platform> Kernel<P> {
         how: Change,
     ) -> Result<Resolved, i32> {
         let mut r = self.fs().resolve(dirfd as i32, path, follow)?;
-        r.writable()?;
+        // A mount's root is busy whatever the mount: the change is the
+        // directory's above it (a read-only mount's root too).
         if r.mount_root && !mount_root_ok {
             return Err(errno::EBUSY);
         }
+        r.writable()?;
         r.prepare(how)?;
         Ok(r)
     }
