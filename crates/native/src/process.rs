@@ -208,10 +208,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         };
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
-            // SAFETY: plain host call; the child continues with only the
-            // calling thread, as on Linux.
             let pid = crate::quiesce::fork_stopped(|| {
                 fork_with_signals_held(
+                    // SAFETY: plain host call; the child continues with only
+                    // the calling thread, as on Linux.
                     || unsafe { libc::fork() },
                     // Before the parent takes signals again: a child that
                     // ends at once is told of with its own signal.
