@@ -349,6 +349,7 @@ getitimer01
 getitimer02
 getpagesize01
 getpeername01
+getpgid01
 getpgid02
 getpgrp01
 getpid01
@@ -995,6 +996,7 @@ timerfd_gettime01
 timerfd_settime01
 timerfd_settime02
 times01
+times03
 tkill01
 tkill02
 truncate02

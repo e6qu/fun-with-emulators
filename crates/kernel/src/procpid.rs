@@ -43,11 +43,16 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             )
         } != bsize
         {
-            // A zombie, which the host answers for only in its
-            // `kinfo_proc`: what it kept, nothing running.
-            let z = crate::procreg::zombie_info(pid)?;
+            // A zombie, or another user's process, which the host answers
+            // for only in its `kinfo_proc`: what it keeps, no usage.
+            let z = crate::procreg::kinfo(pid)?;
             return Some(HostInfo {
-                state: b'Z',
+                state: match z.state {
+                    2 => b'R',
+                    4 => b'T',
+                    5 => b'Z',
+                    _ => b'S',
+                },
                 ppid: crate::reaper::parent_of(pid, z.ppid),
                 pgid: z.pgid,
                 // SAFETY: plain host call.
@@ -382,10 +387,18 @@ pub fn user_record(dirs: &[Vec<u8>]) -> Option<crate::shared::Record<crate::user
 /// process `pid` of the reader's pid namespace behind host pid `host`.
 pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
     let Some(rec) = crate::procreg::read(host) else {
-        // A process fwe has no record of: only that it exists (one of
-        // another user's, such as the host's process 1, too).
+        // A process fwe has no record of (one of another user's, such as
+        // the host's process 1, too): that it exists, and what the host
+        // tells of it.
         return match sub {
             b"" if crate::host::process_exists(host) => Entry::Dir,
+            b"/stat" => match host_info(host) {
+                Some(h) => {
+                    let comm = crate::procreg::kinfo(host).map(|k| k.comm).unwrap_or_default();
+                    Entry::File(stat_line(pid, &comm, &h))
+                }
+                None => Entry::Missing,
+            },
             _ => Entry::Missing,
         };
     };

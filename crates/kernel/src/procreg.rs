@@ -859,20 +859,25 @@ pub fn stopped_by(pid: i32) -> Option<i32> {
     }
 }
 
-/// What the host keeps of a zombie, which `proc_pidinfo` does not answer
-/// for.
-pub struct Zombie {
+/// What the host keeps of any process in its `kinfo_proc`, which it
+/// gives for a zombie, and for another user's process, where
+/// `proc_pidinfo` answers nothing.
+pub struct Kinfo {
     /// Its start, in microseconds since the epoch.
     pub start: u64,
     pub ppid: i32,
     pub pgid: i32,
+    /// The host's state (`SIDL` 1, `SRUN` 2, `SSLEEP` 3, `SSTOP` 4,
+    /// `SZOMB` 5).
+    pub state: u8,
+    pub comm: Vec<u8>,
 }
 
-/// Host process `pid`, if it is a zombie: from its `kinfo_proc`, which the
-/// libc crate does not describe (648 bytes: the start time at 0, the
-/// state at 36, the parent and process group at 560 and 564).
+/// Host process `pid`'s `kinfo_proc`, which the libc crate does not
+/// describe (648 bytes: the start time at 0, the state at 36, the command
+/// name at 243, the parent and process group at 560 and 564).
 #[cfg(target_os = "macos")]
-pub fn zombie_info(pid: i32) -> Option<Zombie> {
+pub fn kinfo(pid: i32) -> Option<Kinfo> {
     const SIZE: usize = 648;
     let mut buf = [0u8; SIZE];
     let mut len = SIZE;
@@ -888,22 +893,30 @@ pub fn zombie_info(pid: i32) -> Option<Zombie> {
             0,
         )
     };
-    // SZOMB is 5.
-    if r != 0 || len != SIZE || buf[36] != 5 {
+    // A pid with no process gives an empty answer.
+    if r != 0 || len != SIZE {
         return None;
     }
     let i64_at = |at: usize| i64::from_ne_bytes(buf[at..at + 8].try_into().unwrap());
     let i32_at = |at: usize| i32::from_ne_bytes(buf[at..at + 4].try_into().unwrap());
-    Some(Zombie {
+    let comm = &buf[243..243 + 17];
+    Some(Kinfo {
         start: (i64_at(0).max(0) as u64) * 1_000_000 + i32_at(8).max(0) as u64,
         ppid: i32_at(560),
         pgid: i32_at(564),
+        state: buf[36],
+        comm: comm[..comm.iter().position(|&b| b == 0).unwrap_or(comm.len())].to_vec(),
     })
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn zombie_info(_: i32) -> Option<Zombie> {
+pub fn kinfo(_: i32) -> Option<Kinfo> {
     None
+}
+
+/// Host process `pid`'s `kinfo_proc`, if it is a zombie.
+pub fn zombie_info(pid: i32) -> Option<Kinfo> {
+    kinfo(pid).filter(|k| k.state == 5)
 }
 
 /// Whether host process `p` is alive (not ended, nor a zombie) and the one

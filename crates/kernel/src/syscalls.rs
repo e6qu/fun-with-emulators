@@ -652,6 +652,31 @@ impl<P: Platform> Kernel<P> {
                 guest!(host::write_rusage(a[1], &usage));
                 0
             }
+            nr::TIMES => {
+                // The process's and its reaped children's times in clock
+                // ticks (`USER_HZ`, 100 a second), and the ticks since boot.
+                let ticks = |tv: libc::timeval| {
+                    (tv.tv_sec.max(0) as u64) * 100 + (host::usec(tv).max(0) as u64) / 10_000
+                };
+                let usage = |who| {
+                    // SAFETY: an all-zero rusage is a valid out-parameter.
+                    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+                    // SAFETY: as above.
+                    unsafe { libc::getrusage(who, &mut u) };
+                    u
+                };
+                if a[0] != 0 {
+                    let (me, children) = (usage(libc::RUSAGE_SELF), usage(libc::RUSAGE_CHILDREN));
+                    let tms = [
+                        ticks(me.ru_utime),
+                        ticks(me.ru_stime),
+                        ticks(children.ru_utime),
+                        ticks(children.ru_stime),
+                    ];
+                    guest!(uaccess::write(a[0], tms));
+                }
+                (host::uptime() * 100.0) as i64
+            }
             nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
             nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
             nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),

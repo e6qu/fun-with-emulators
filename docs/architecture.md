@@ -601,8 +601,8 @@ shapes differently:
   its records and what the host reports. `oom_score_adj` is inherited
   (going below the last value a privileged process set takes
   `CAP_SYS_RESOURCE`). A host process fwe did not start (outside a pid
-  namespace, any process number names the host's, 1 its `launchd`) is an
-  empty directory while it exists. A zombie keeps its record until it is
+  namespace, any process number names the host's, 1 its `launchd`) is a
+  directory with its `stat`, from what the host keeps of it. A zombie keeps its record until it is
   reaped, so its `/proc/<pid>` is there, its state `Z` (the host answers
   for a zombie only in its `kinfo_proc`).
 
