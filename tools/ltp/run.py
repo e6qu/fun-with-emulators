@@ -107,6 +107,24 @@ def end_session(sid):
             pass
 
 
+def end_leftovers(fwe, root):
+    """End what tests left running outside their sessions (a child stopped
+    and orphaned, a daemon of its own): every process of this fwe on this
+    root, once no test runs. Returns how many there were. They count
+    against the user's processes, which a test that forks a thousand
+    (futex_cmp_requeue01) needs."""
+    found = subprocess.run(
+        ["pgrep", "-f", "^" + re.escape(f"{fwe} --root {root} ")], capture_output=True, text=True
+    )
+    pids = [int(p) for p in found.stdout.split() if int(p) > 0]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return len(pids)
+
+
 def stacks(sid, work):
     """The stacks of the processes of session `sid`, as macOS's `sample`
     takes them: fwe's own frames, a few lines a thread."""
@@ -255,6 +273,9 @@ def main():
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, args.hard_limit) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
                 report(*fut.result())
+        left = end_leftovers(fwe, root)
+        if left:
+            print(f"ended {left} processes tests left running")
         for n, a in serial:
             report(*run_guarded(fwe, root, work, n, a, args.hard_limit))
     finally:
@@ -295,6 +316,7 @@ def main():
         argv_of = dict(tests)
         work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
         try:
+            end_leftovers(fwe, root)
             again = {n: run_guarded(fwe, root, work, n, argv_of[n]) for n in regressed}
         finally:
             shutil.rmtree(work, ignore_errors=True)
