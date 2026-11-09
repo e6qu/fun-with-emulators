@@ -331,20 +331,25 @@ impl<P: Platform> Kernel<P> {
         if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return err(errno::EBADF);
         }
-        let t = match of(fd) {
-            Some(t) => {
-                if ended(fd) {
-                    return err(errno::ESRCH);
-                }
-                t
-            }
+        let (t, gone) = match of(fd) {
+            Some(t) => (t, ended(fd)),
             None => match proc_dir_target(fd) {
-                Some(host) => Target { host, tid: 0, nonblock: false },
+                Some(host) => (Target { host, tid: 0, nonblock: false }, false),
                 None => return err(errno::EBADF),
             },
         };
         if sig > fwe_abi::signal::NSIG {
             return err(errno::EINVAL);
+        }
+        // The information given is checked before the process is: one
+        // for another signal is refused whether or not it has ended.
+        let raw: Option<[u8; 128]> =
+            if info != 0 { Some(guest!(uaccess::read(info))) } else { None };
+        if raw.is_some_and(|r| u64::from(u32::from_ne_bytes(r[0..4].try_into().unwrap())) != sig) {
+            return err(errno::EINVAL);
+        }
+        if gone {
+            return err(errno::ESRCH);
         }
         // SAFETY: getpid cannot fail.
         let me = unsafe { libc::getpid() };
@@ -354,11 +359,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let thread_scope = flags & PIDFD_SIGNAL_THREAD != 0 || (flags == 0 && t.tid != 0);
-        if info != 0 {
-            let raw: [u8; 128] = guest!(uaccess::read(info));
-            if u64::from(u32::from_ne_bytes(raw[0..4].try_into().unwrap())) != sig {
-                return err(errno::EINVAL);
-            }
+        if raw.is_some() {
             let tid = thread_scope.then_some(if t.tid != 0 { t.tid } else { pid });
             return self.queue_info(pid, tid, sig, info);
         }
