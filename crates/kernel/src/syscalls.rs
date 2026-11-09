@@ -134,7 +134,7 @@ impl<P: Platform> Kernel<P> {
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
-        crate::creds::note_dac_override(self.creds.has(crate::caps::CAP_DAC_OVERRIDE));
+        crate::creds::publish(&self.creds);
         crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
@@ -703,17 +703,6 @@ impl<P: Platform> Kernel<P> {
                 err(errno::ENOSYS)
             }
         }
-    }
-
-    /// Shared `chown` policy against the virtual credentials. `chown(-1, -1)`
-    /// is always a no-op; otherwise only a virtual root may change ownership,
-    /// and it is a no-op on the host file (we do not run as root, and tracking
-    /// shadow ownership is not yet implemented).
-    pub(crate) fn chown_check(&self, uid: u32, gid: u32) -> i64 {
-        if uid == u32::MAX && gid == u32::MAX {
-            return 0;
-        }
-        if self.creds.has(crate::caps::CAP_CHOWN) { 0 } else { err(errno::EPERM) }
     }
 
     fn sys_getresuid(&self, rp: u64, ep: u64, sp: u64) -> i64 {
@@ -2856,6 +2845,16 @@ mod tests {
         }
     }
 
+    /// Held by a test that maps memory through the kernel: the tests share
+    /// the process's address space and its record of the guest's mappings,
+    /// and one that unmaps, moves or probes an address it gave up (as
+    /// `mremap` of a moved range does) must not reach another's mapping the
+    /// host put there meanwhile.
+    fn mapping_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn kernel() -> Kernel<TestPlatform> {
         // SAFETY: plain host call.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
@@ -3126,8 +3125,12 @@ mod tests {
         assert_eq!(&b, b"kept");
     }
 
+    /// A new unnamed file in the host's temporary directory: a name of its
+    /// own each time, as tests run at once.
     fn tempfile_in_tmp() -> std::fs::File {
-        let path = std::env::temp_dir().join(format!("fwe-fadvise-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("fwe-test-{}-{n}", std::process::id()));
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -3144,6 +3147,7 @@ mod tests {
     /// needs a backend's fault handling: LTP's `mincore01` checks it.)
     #[test]
     fn mincore_reports_residency() {
+        let _mapping = mapping_lock();
         let mut k = kernel();
         let page = k.page_size;
         // SAFETY: a fresh anonymous mapping for the test.
@@ -3246,6 +3250,7 @@ mod tests {
 
     #[test]
     fn msync_syncs_a_mapping() {
+        let _mapping = mapping_lock();
         use fwe_abi::statfs::{MS_ASYNC, MS_SYNC};
         let mut k = kernel();
         let len = k.page_size;
@@ -3345,6 +3350,7 @@ mod tests {
 
     #[test]
     fn executable_mappings_are_prepared() {
+        let _mapping = mapping_lock();
         let mut k = kernel();
         let len = k.page_size;
         let p = k.syscall(nr::MMAP, [0, len, 5 /* R|X */, 0x22 /* PRIVATE|ANON */, u64::MAX, 0]);
@@ -3355,6 +3361,7 @@ mod tests {
 
     #[test]
     fn brk_grows_and_shrinks() {
+        let _mapping = mapping_lock();
         let mut k = kernel();
         let size = 64 * k.page_size;
         // Find free address space for the reservation. Other tests map memory
@@ -3464,6 +3471,7 @@ mod tests {
     /// mapping cannot move, and fails.
     #[test]
     fn code_without_room_for_stubs_moves_unless_fixed() {
+        let _mapping = mapping_lock();
         use fwe_abi::mman::*;
         let mut k = kernel();
         let len = k.page_size;
@@ -3487,6 +3495,7 @@ mod tests {
     /// asked for with `MREMAP_FIXED`), the grown part zero.
     #[test]
     fn mappings_grow_and_move_with_their_contents() {
+        let _mapping = mapping_lock();
         use fwe_abi::mman::*;
         let mut k = kernel();
         let page = k.page_size;

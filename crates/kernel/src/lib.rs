@@ -52,6 +52,7 @@ pub mod nsfd;
 pub mod nsops;
 mod openat2;
 pub mod overlay;
+pub mod owners;
 pub mod pdeath;
 pub mod pidfd;
 pub mod pidns;
@@ -274,6 +275,13 @@ impl<P: Platform> Kernel<P> {
         // one process making many kernels while others wait.)
         #[cfg(not(test))]
         futex::process_started();
+        // The guest's umask is fwe's to apply: the host's would take more
+        // bits off what the guest asked for.
+        #[cfg(not(test))]
+        // SAFETY: plain host call.
+        unsafe {
+            libc::umask(0)
+        };
         maps::set_page_size(page_size);
         Kernel {
             platform,
@@ -559,6 +567,22 @@ impl<P: Platform> Kernel<P> {
         Ok(target)
     }
 
+    /// Whether the caller may run the program at guest path `path`: only a
+    /// regular file whose bits let it (`EACCES`; root needs one execute
+    /// bit set).
+    pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
+        use fwe_abi::{errno, fcntl};
+        let Some(fs) = self.fs.as_ref() else { return Ok(()) };
+        if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
+            && let Ok(name) = r.name_c()
+            && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
+            && (st.st_mode & libc::S_IFMT != libc::S_IFREG || !self.permits(&st, 1))
+        {
+            return Err(errno::EACCES);
+        }
+        Ok(())
+    }
+
     /// What an `execve` that re-executes fwe carries into the new process
     /// beyond what the host keeps: the mount namespace and root (first, so
     /// that the new process finds its program in them, see
@@ -671,7 +695,7 @@ impl<P: Platform> Kernel<P> {
             groups,
             caps,
         };
-        creds::note_dac_override(self.creds.has(caps::CAP_DAC_OVERRIDE));
+        creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
         let _ = fdtable::set_limit(soft, hard);

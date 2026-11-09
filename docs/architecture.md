@@ -487,9 +487,25 @@ shapes differently:
   when translated entries outgrow the guest's buffer.
 - **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner
   is kept in `org.fwe.mode`, the file flagged `UF_NODUMP`; `stat` reports
-  it, and fwe holds a caller without the capabilities to the owner's bits
-  of it. A file made by something else that the host refuses root is
+  it. A file made by something else that the host refuses root is
   converted the first time.
+- **Owners** (`crates/kernel/src/owners.rs`): a file whose owner is not
+  root (fwe's user) keeps it in `org.fwe.owner`, under the same flag;
+  `stat` reports it. A new file is its maker's (its file-system user, and
+  group or a set-group-ID directory's), and `chown` changes the record
+  under Linux's rules. Permission checks are fwe's
+  (`creds::Access::permits`): opening a file, changing a directory's
+  entries (and the sticky bit's restriction), searching each directory of
+  a path, `chdir`, `chmod`, `utimensat`, extended attributes and `execve`
+  (root too needs an execute bit), `O_NOATIME` (the owner's), by the
+  owner's, group's or others' bits against the caller's file-system ids,
+  `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` passing them. The checks
+  outside the kernel lock (the path walk, a connect to a Unix socket's
+  node) use the credentials published after each system call
+  (`creds::access`). Without a root filesystem the host's own files and
+  directories (root's, no owner kept) are left to the host's checks.
+  fwe's own umask on the host is 0: the guest's umask is applied by fwe,
+  and its files are made with the modes it asked for.
 - **Extended attributes** (`crates/kernel/src/xattr.rs`): a list shows
   only Linux's namespaces; `trusted.` ones are hidden from callers without
   `CAP_SYS_ADMIN`; `user.` ones are for regular files and directories
@@ -909,10 +925,10 @@ which are to be lifted for 1.0 and which are not planned.
   makes opens a device only for those numbers (`ENXIO` otherwise), lists
   as a regular file in `getdents64`, and `/dev`'s listing does not show
   fwe's own.
-- File owners other than fwe's user read as 65534, and a `chown` does not
-  show in a later `stat`. A caller without the capabilities is held only to
-  the owner's bits of a kept mode, and a directory's search bit is not
-  enforced for it.
+- A file owner other than fwe's user, not given by the guest, reads as
+  65534. Without a root filesystem, the host's own files are not held to
+  their bits for a guest that is not root. Access control lists are not
+  kept, and `fs.protected_*` restrictions are not enforced.
 - The working directory follows a rename of its directory (or one above
   it) by the process itself, not by another process.
 - A `sendto` to an `AF_UNIX` path longer than the host's 103 bytes once

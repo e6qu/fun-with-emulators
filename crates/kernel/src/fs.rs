@@ -1199,6 +1199,11 @@ impl Fs {
         Ok(r)
     }
 
+    /// Whether the guest's root is the host's own (no root filesystem).
+    pub fn root_is_host(&self) -> bool {
+        self.root_host == b"/"
+    }
+
     fn view(&self) -> View<'_> {
         View {
             root: self.root.as_raw_fd(),
@@ -1634,6 +1639,38 @@ pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
 /// Resolve `path` relative to `dirfd` in the view `v`: the work of
 /// [`Fs::resolve`], also done for the socket calls that run without the
 /// kernel lock ([`resolve_host`]).
+/// The guest's metadata of the file open as `fd`: its kept mode and
+/// owner ([`crate::modes`], [`crate::owners`]).
+fn guest_stat(fd: i32) -> Option<libc::stat> {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    let perm = crate::modes::guest_perm_fd(fd, &st);
+    let owner = crate::owners::of_fd(fd, &st);
+    crate::modes::apply(&mut st, perm);
+    crate::owners::apply(&mut st, owner);
+    Some(st)
+}
+
+/// [`guest_stat`] of `name` in directory `dir`, followed if it is a link.
+pub(crate) fn guest_stat_at(dir: i32, name: &std::ffi::CStr) -> Option<libc::stat> {
+    // SAFETY: a NUL-terminated name in a live directory; the descriptor is
+    // closed below.
+    let fd = unsafe {
+        libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)
+    };
+    if fd < 0 {
+        return None;
+    }
+    let st = guest_stat(fd);
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    st
+}
+
 fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
     let table = v.ns.table();
     let absolute = if path.first() == Some(&b'/') {
@@ -1787,7 +1824,21 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         })
     };
 
+    // Each step needs search permission on the directory it looks in, for
+    // a caller that does not pass permission bits, in a root filesystem
+    // (the host's own directories, without one, are searched as the host
+    // user searches them: they are all its own).
+    let access = crate::creds::access();
+    let check_search = !access.searches_any() && v.root_host != b"/";
     while let Some(comp) = pending.pop() {
+        if check_search
+            && !here.phantom
+            && let Some(st) = guest_stat(here.dir.as_raw_fd())
+            && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && !access.permits(&st, 1)
+        {
+            return Err(errno::EACCES);
+        }
         if comp == b".." {
             match &here.at {
                 // At the process's root `..` stays put.

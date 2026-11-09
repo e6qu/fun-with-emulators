@@ -144,9 +144,13 @@ pub fn uid_to_initial(uid: u32) -> u32 {
 /// [`uid_to_linux`] for group ids: fwe's own group is the guest's root
 /// group.
 pub fn gid_to_linux(gid: u32) -> u32 {
+    crate::userns::to_ns(gid_to_initial(gid), true)
+}
+
+/// [`gid_to_linux`] in the initial user namespace's terms.
+pub fn gid_to_initial(gid: u32) -> u32 {
     // SAFETY: plain host call.
-    let id = if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID };
-    crate::userns::to_ns(id, true)
+    if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID }
 }
 
 /// Host clock for a Linux clock id.
