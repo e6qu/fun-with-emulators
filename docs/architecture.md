@@ -326,6 +326,10 @@ already does; fwe adds Linux's thread identity and futexes:
 - A guest thread is a host thread running guest code; `CLONE_SETTLS`,
   `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
   act as on Linux.
+- Thread ids: the main thread's is the pid; another's comes from its pid
+  namespace, or outside one from a counter every fwe process shares,
+  numbered from 100000 (past every macOS pid, so a thread's number never
+  names another process) and wrapping below 4194304.
 - Futexes (`crates/kernel/src/futex.rs`) wait outside the kernel lock. A
   wake takes waiters off the queue oldest first and marks each woken, so it
   reports exactly how many it woke. `FUTEX_WAIT_BITSET`/`WAKE_BITSET` match
