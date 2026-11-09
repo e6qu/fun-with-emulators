@@ -2958,9 +2958,10 @@ mod tests {
         assert_eq!(k.syscall(nr::MINCORE, [p + 1, page, v, 0, 0, 0]), err(errno::EINVAL));
         // SAFETY: unmapping the second page of the test's mapping.
         unsafe { libc::munmap((p + page) as *mut libc::c_void, page as usize) };
+        let before = crate::mm::mapped(p + page, page);
         let r = k.syscall(nr::MINCORE, [p, 2 * page, v, 0, 0, 0]);
-        // Unless another test's thread has mapped the freed page since.
-        if !crate::mm::mapped(p + page, page) {
+        // Unless another test's thread mapped the freed page meanwhile.
+        if !before && !crate::mm::mapped(p + page, page) {
             assert_eq!(r, err(errno::ENOMEM));
         }
         // SAFETY: unmapping the rest.

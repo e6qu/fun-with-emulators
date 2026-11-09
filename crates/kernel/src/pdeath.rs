@@ -71,12 +71,11 @@ fn watch(parent: i32) {
     if parent <= 1 {
         return;
     }
-    // SAFETY: plain host calls on a kqueue of this thread's own.
+    // SAFETY: plain host calls on a kqueue of this thread's own, in fwe's
+    // reserved range, where the guest's closing of its descriptors (as a
+    // program does before an `execve`) does not reach it.
     unsafe {
-        let kq = libc::kqueue();
-        if kq < 0 {
-            return;
-        }
+        let Ok(kq) = crate::fdtable::reserve(libc::kqueue()) else { return };
         let ev = libc::kevent {
             ident: parent as libc::uintptr_t,
             filter: libc::EVFILT_PROC,
@@ -91,10 +90,17 @@ fn watch(parent: i32) {
             return;
         }
         let mut out: libc::kevent = std::mem::zeroed();
-        while libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null()) < 0
-            && crate::host::last_errno() == libc::EINTR
-        {}
+        let n = loop {
+            let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null());
+            if n >= 0 || crate::host::last_errno() != libc::EINTR {
+                break n;
+            }
+        };
         libc::close(kq);
+        // Only the parent's end sends it, never a failed wait.
+        if n != 1 || out.fflags & libc::NOTE_EXIT == 0 {
+            return;
+        }
     }
     deliver(SIG.load(SeqCst));
 }

@@ -63,6 +63,7 @@ unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn chdir(path: *const c_char) -> i32;
     fn pipe(fds: *mut i32) -> i32;
+    fn usleep(us: u32) -> i32;
     fn read(fd: i32, buf: *mut c_void, len: usize) -> isize;
     fn write(fd: i32, buf: *const c_void, len: usize) -> isize;
     fn close(fd: i32) -> i32;
@@ -253,6 +254,19 @@ fn main() {
         let mut b = 0u8;
         let gone = came && read(held[0], (&mut b as *mut u8).cast(), 1) == 0;
         println!("parent-death signal: the orphan ended {gone}");
+
+        // A parent-death signal is not sent while the parent lives, though
+        // the child closes every descriptor it has (as a program does
+        // before an `execve`).
+        let pid = fork();
+        if pid == 0 {
+            prctl(PR_SET_PDEATHSIG, SIGKILL as u64);
+            syscall(436, 3i64, i64::from(u32::MAX), 0i64); // close_range
+            usleep(200_000);
+            _exit(0);
+        }
+        waitpid(pid, &mut status, 0);
+        println!("and not before: {:?}", ended(status));
     }
 }
 

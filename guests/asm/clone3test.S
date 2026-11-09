@@ -3,7 +3,8 @@
 // it runs at the top of the stack it was given, records the result and exits;
 // the parent checks the parent tid word, joins on the CLONE_CHILD_CLEARTID
 // futex and checks the result. Then a too-small structure is EINVAL and a
-// pidfd request (unsupported) ENOSYS. Exit 0 on success.
+// pidfd request with a null address for the descriptor EFAULT. Exit 0 on
+// success.
     .text
     .globl _start
 _start:
@@ -49,12 +50,12 @@ parent_wait:
     svc     #0
     cmn     x0, #22
     b.ne    fail
-    // CLONE_PIDFD, which fwe does not provide: ENOSYS
+    // CLONE_PIDFD with nowhere to put the descriptor: EFAULT
     adr     x0, pidfd_args
     mov     x1, #64
     mov     x8, #435
     svc     #0
-    cmn     x0, #38
+    cmn     x0, #14
     b.ne    fail
     mov     x0, #0
     b       exit

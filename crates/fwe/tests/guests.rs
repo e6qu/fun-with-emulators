@@ -2913,7 +2913,8 @@ const PROCSIG: &str = "queued to -1: true\n\
     memory shared: {shared}\n\
     cpu limit: SIGXCPU true, then true\n\
     timer slack: 70000, shown 70000, the child's true\n\
-    parent-death signal: the orphan ended true\n";
+    parent-death signal: the orphan ended true\n\
+    and not before: (0, false)\n";
 
 /// Signals between processes and how processes end: a queued real-time
 /// signal, `rt_sigqueueinfo` to -1 refused, signals the moment a child is
