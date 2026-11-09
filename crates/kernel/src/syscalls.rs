@@ -1991,6 +1991,38 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     with_remaining(timeout, || unsafe { pselect6_wait(nfds, sets, timeout) })
 }
 
+/// A wait of up to `ns` nanoseconds (-1: without bound) for `set`
+/// ([`crate::thread::wait_ready_ns`]), with what is ready as Linux reports
+/// it ([`linux_revents`]): how many descriptors are. A pipe given less than
+/// the host's capacity is not writable while full, which the host does not
+/// know: it is looked at each millisecond until it has room.
+fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
+    use std::time::{Duration, Instant};
+    let deadline = (ns >= 0).then(|| Instant::now() + Duration::from_nanos(ns as u64));
+    loop {
+        let mut ask = set.to_vec();
+        let mut full = false;
+        for p in &mut ask {
+            if p.events & libc::POLLOUT != 0 && crate::fdstate::pipe_full(p.fd) {
+                p.events &= !libc::POLLOUT;
+                full = true;
+            }
+        }
+        let left =
+            deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_nanos() as i64);
+        let wait = if full && !(0..1_000_000).contains(&left) { 1_000_000 } else { left };
+        crate::thread::wait_ready_ns(&mut ask, wait)?;
+        for (p, a) in set.iter_mut().zip(&ask) {
+            p.revents = a.revents;
+            linux_revents(p);
+        }
+        let n = set.iter().filter(|p| p.revents != 0).count() as i32;
+        if n > 0 || !full || deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(n);
+        }
+    }
+}
+
 /// What the host reported ready on `p` as Linux reports it: a regular
 /// file is readable and writable but has no urgent data (`POLLPRI`, which
 /// the host gives it), and a pipe or FIFO whose writers have gone with
@@ -2068,11 +2100,8 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
         Err(e) => return e,
     };
     // On time, and ended by a signal however soon it lands.
-    if let Err(e) = crate::thread::wait_ready_ns(&mut fds, ns) {
+    if let Err(e) = poll_linux(&mut fds, ns) {
         return err(e);
-    }
-    for p in &mut fds {
-        linux_revents(p);
     }
     if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
         return err(errno::EBADF);
@@ -2148,11 +2177,8 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
             )
         };
         guest!(uaccess::read_into(fds, bytes));
-        return match crate::thread::wait_ready_ns(&mut set, ns) {
+        return match poll_linux(&mut set, ns) {
             Ok(n) => {
-                for p in &mut set {
-                    linux_revents(p);
-                }
                 for (i, p) in set.iter().enumerate() {
                     let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
                     guest!(uaccess::write(at, p.revents));

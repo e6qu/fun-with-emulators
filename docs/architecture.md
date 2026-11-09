@@ -518,7 +518,14 @@ shapes differently:
   through. Owner thread, `F_SETSIG`'s signal, whether the open made the
   file (`F_CREATED_QUERY`) and pipe sizes (`F_SETPIPE_SZ`,
   `fs.pipe-max-size`) are kept by fwe (`crates/kernel/src/fdstate.rs`) and
-  checked as Linux checks them. A host `SIGIO` for a descriptor with a
+  checked as Linux checks them. A pipe given less than the host's capacity
+  holds no more: the writing process keeps the page buffers its writes
+  made, as Linux fills them (a write's tail shorter than a page joins the
+  last buffer if it fits whole, a read frees a buffer once it has read all
+  of it), learns from the bytes the host pipe holds how far reads have
+  gone, and cuts each write to the room left, waiting for more while
+  blocking. A full pipe is not writable to `poll`, `select` and `epoll`,
+  which look at it each millisecond. A host `SIGIO` for a descriptor with a
   chosen signal arrives as that signal, with `si_fd` and `si_band`.
 - **Leases** (`crates/kernel/src/leases.rs`): a record every fwe process
   shares. An open or truncation that conflicts with a lease signals its
@@ -855,7 +862,10 @@ which are to be lifted for 1.0 and which are not planned.
   original.
 - A pipe holds at most what the host's does (64 KiB): a new pipe's
   capacity is that, not Linux's 16 pages, and one set larger with
-  `F_SETPIPE_SZ` still holds no more.
+  `F_SETPIPE_SZ` still holds no more. A smaller capacity is kept by the
+  process that writes: writes from two processes into a pipe sharing it
+  are each held to the room one of them sees, and `splice`, `tee` and
+  `vmsplice` into it count its room in bytes, not page buffers.
 - `pwritev2` with `RWF_APPEND` sets `O_APPEND` on the open file for the
   call, which another writer sharing it sees meanwhile.
 - Descriptors received with `SCM_RIGHTS` are not held to the guest's
@@ -965,9 +975,7 @@ which are to be lifted for 1.0 and which are not planned.
 **Event descriptors and inotify**
 - `EPOLLEXCLUSIVE` wakes every waiter; `timerfd` measures
   `TFD_TIMER_ABSTIME` against the realtime clock whatever its clock, and a
-  periodic timer's first expiry is its interval; a pipe keeps the host's
-  capacity whatever `F_SETPIPE_SZ` set (`F_GETPIPE_SZ` reports the size
-  set).
+  periodic timer's first expiry is its interval.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in

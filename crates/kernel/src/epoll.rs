@@ -6,6 +6,11 @@
 //! or two `kevent` filters (`EVFILT_READ` for `EPOLLIN`, `EVFILT_WRITE` for
 //! `EPOLLOUT`), and the caller's `epoll_event.data` word rides in the kevent
 //! `udata`. `EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`.
+//! The host's edge-triggered read filter on a pipe fires after a read too,
+//! which Linux's does not: the read end is reported only once it holds more
+//! than when last seen. A pipe with a capacity smaller than the host's
+//! ([`crate::fdstate::pipe_full`]) is not writable while full, which the
+//! host does not know: its `EVFILT_WRITE` events are dropped then.
 //!
 //! A kqueue is not passed on to a child process, so each epoll descriptor's
 //! interest list is also recorded here ([`save`], [`restore`]): a fork
@@ -43,6 +48,7 @@ pub fn closed(fd: i32) {
             }
         });
         EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
     }
 }
 
@@ -558,6 +564,40 @@ fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn edge_clear(epfd: i32, fd: i32) {
     EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
+}
+
+/// What edge-triggered pipe read ends in epoll sets held when last
+/// reported: (set, descriptor, bytes).
+#[cfg(not(target_os = "linux"))]
+static HELD: std::sync::Mutex<Vec<(i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a pipe read end `fd` holding `bytes` has had data written since
+/// set `epfd` last saw it, which is an edge to Linux (the host's
+/// edge-triggered read filter fires on reads too).
+#[cfg(not(target_os = "linux"))]
+fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
+    let mut h = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    match h.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
+        Some(k) => {
+            let grew = bytes > k.2;
+            k.2 = bytes;
+            grew
+        }
+        None => {
+            h.push((epfd, fd, bytes));
+            true
+        }
+    }
+}
+
+/// Whether `fd` is a pipe or FIFO.
+#[cfg(not(target_os = "linux"))]
+fn is_pipe(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFIFO }
 }
 
 /// Whether `fd`'s entry in set `epfd` still reports (a one-shot entry stops
@@ -621,9 +661,15 @@ fn kevent_wait(epfd: i32, room: usize, ns: i64) -> Result<Vec<(i32, u32, u64)>, 
         (ns > 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
     let mut wait = ns;
     loop {
-        let (ready, _) = kevent_once(epfd, room, wait)?;
+        let (ready, reported) = kevent_once(epfd, room, wait)?;
         if !ready.is_empty() || ns == 0 {
             return Ok(ready);
+        }
+        // What the host reports that the guest is not told of (a full
+        // pipe's room, by level) is reported again at once: looked at
+        // again each millisecond.
+        if reported > 0 {
+            crate::thread::nap_ns(1_000_000);
         }
         // Nothing the guest asked for (or the events went to another
         // thread's wait): wait on, for what is left of the time (Linux never
@@ -643,9 +689,36 @@ fn kevent_wait(epfd: i32, room: usize, ns: i64) -> Result<Vec<(i32, u32, u64)>, 
 type Ready = Vec<(i32, u32, u64)>;
 
 /// One `kevent` wait for [`kevent_wait`]: the events as the guest asked
-/// for them, and how many the host reported.
+/// for them, and how many the host reported. Events the guest is not told
+/// of (a full pipe's room) take no place of `room`: the events after them
+/// are taken too, without waiting.
 #[cfg(not(target_os = "linux"))]
 fn kevent_once(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
+    let (mut ready, mut reported) = kevent_take(epfd, room, ns)?;
+    let mut last = reported;
+    for _ in 0..4 {
+        if ready.len() >= room || last <= ready.len() {
+            break;
+        }
+        let (more, n) = kevent_take(epfd, room - ready.len(), 0)?;
+        if n == 0 {
+            break;
+        }
+        reported += n;
+        last = n;
+        for (fd, bits, data) in more {
+            match ready.iter_mut().find(|r| r.0 == fd) {
+                Some(r) => r.1 |= bits,
+                None => ready.push((fd, bits, data)),
+            }
+        }
+    }
+    Ok((ready, reported))
+}
+
+/// One `kevent` wait of [`kevent_once`].
+#[cfg(not(target_os = "linux"))]
+fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
     use fwe_abi::epoll::*;
     if room == 0 {
         return Ok((Vec::new(), 0));
@@ -701,11 +774,19 @@ fn kevent_once(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
                 bits |= EPOLLIN | EPOLLRDHUP | if is_unix(fd) { EPOLLHUP } else { 0 }
             }
             libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { EPOLLIN } else { 0 },
+            // Edge-triggered, a pipe is readable anew only once written to.
+            libc::EVFILT_READ
+                if ev.flags & libc::EV_CLEAR != 0
+                    && is_pipe(fd)
+                    && !pipe_grew(epfd, fd, ev.data as i64) => {}
             libc::EVFILT_READ => bits |= EPOLLIN,
             // A pipe whose readers have gone is an error to write to; a
             // socket whose writing side is shut stays writable (a write
             // fails at once).
             libc::EVFILT_WRITE if eof && !is_socket(fd) => bits |= EPOLLOUT | EPOLLERR,
+            // A pipe given less than the host's capacity is not writable
+            // while full, which the host does not know.
+            libc::EVFILT_WRITE if crate::fdstate::pipe_full(fd) => {}
             libc::EVFILT_WRITE => bits |= EPOLLOUT,
             _ => {}
         }

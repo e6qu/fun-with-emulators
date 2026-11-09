@@ -1453,7 +1453,7 @@ how it is bridged:
 | OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
 | leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits for it, up to `fs.lease-break-time` |
 | `F_SETSIG`, thread owners | `SIGIO` to a process or group | kept per descriptor (`crates/kernel/src/fdstate.rs`); see [Network events](#network-events) for how a host `SIGIO` arrives |
-| pipe size (`F_SETPIPE_SZ`) | fixed, 64 KiB at most | reported from the host pipe; a size set above 64 KiB holds no more |
+| pipe size (`F_SETPIPE_SZ`) | fixed, 64 KiB at most | kept by fwe and reported as set; a smaller pipe holds no more than Linux's would, its writes cut to the room left in its page buffers and its write end not writable to `poll` or `epoll` while full; one set above 64 KiB holds no more than the host's |
 | extended attributes | own namespace (`com.apple.`) | Linux names stored as host attributes of the same name; Linux's rules per namespace; only Linux's namespaces are listed; `system.` ACLs not kept |
 | mode bits; root passes them | owner's bits enforced on the owner | a mode denying its owner is kept in an attribute (`UF_NODUMP` flags the file), the host file keeps owner read/write (`crates/kernel/src/modes.rs`) |
 | FIFO hang-up in `poll`/`epoll` | `POLLHUP` once the last writer goes | macOS reports nothing; fwe asks `select` between short slices (`crates/kernel/src/fifo.rs`) |
@@ -1489,7 +1489,7 @@ a kqueue, a pipe, or both, so that the guest can mix them in one `epoll`:
 
 | Linux | macOS | fwe |
 |---|---|---|
-| `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR`, `EPOLLONESHOT` → `EV_ONESHOT`, data in `udata`; `epoll_event` is 16 bytes on arm64; how events come back is under [Network events](#network-events) |
+| `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR` (a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen, as Linux reports it only once written to), `EPOLLONESHOT` → `EV_ONESHOT`, data in `udata`; `epoll_event` is 16 bytes on arm64; how events come back is under [Network events](#network-events) |
 | `eventfd` | none | a pipe plus a 64-bit counter; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
 | `timerfd` | none | a kqueue with one `EVFILT_TIMER`, in nanoseconds and on time (`NOTE_CRITICAL`) |
 | `signalfd` | none | a readiness pipe plus a queue of `signalfd_siginfo`; a pending signal the thread blocks and a signalfd watches moves onto it |

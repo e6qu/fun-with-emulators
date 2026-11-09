@@ -102,6 +102,7 @@ epoll_pwait04
 epoll_pwait05
 epoll_pwait06
 epoll_wait01
+epoll_wait06
 epoll_wait03
 epoll_wait04
 epoll_wait05
@@ -580,6 +581,7 @@ pipe13
 pipe14
 pipe2_01
 pipe2_02
+pipe2_04
 pipeio_1
 pipeio_2
 pipeio_5

@@ -1148,6 +1148,28 @@ fn vectored_at(
 /// A vectored read (or `write`) of no buffers: nothing moves, but the
 /// descriptor must be open for it, as on Linux (the host refuses the
 /// call outright).
+/// The `n` bytes from byte `at` of the buffers `iov`.
+fn iovecs_part(iov: &[libc::iovec], at: u64, n: u64) -> Vec<libc::iovec> {
+    let (mut skip, mut left) = (at as usize, n as usize);
+    let mut out = Vec::new();
+    for v in iov {
+        if left == 0 {
+            break;
+        }
+        if skip >= v.iov_len {
+            skip -= v.iov_len;
+            continue;
+        }
+        let len = (v.iov_len - skip).min(left);
+        // SAFETY: `skip` is within the buffer.
+        let base = unsafe { v.iov_base.cast::<u8>().add(skip) };
+        out.push(libc::iovec { iov_base: base.cast(), iov_len: len });
+        left -= len;
+        skip = 0;
+    }
+    out
+}
+
 fn no_buffers(fd: i32, write: bool) -> i64 {
     // SAFETY: plain host call on the guest's descriptor.
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1322,6 +1344,15 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // A pipe holding less than the host's: as much as it has room for.
+            let write = |at: u64, n: u64| {
+                // SAFETY: the host validates the guest buffer; `at + n` is
+                // within its length.
+                host::ret(unsafe { libc::write(fd, (buf + at) as *const _, n as usize) } as i64)
+            };
+            if let Some(r) = fdstate::capped_write(fd, len, write) {
+                return Some(r);
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
         }
@@ -1341,7 +1372,18 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
                 let special = specialwrite::Source::Host(&iov);
-                match specialwrite::write(a[0] as i32, special, specialwrite::total(&iov)) {
+                let total = specialwrite::total(&iov);
+                let capped = |at: u64, n: u64| {
+                    let part = iovecs_part(&iov, at, n);
+                    // SAFETY: as for readv: a part of the same buffers.
+                    host::ret(
+                        unsafe { libc::writev(a[0] as i32, part.as_ptr(), part.len() as i32) }
+                            as i64,
+                    )
+                };
+                match specialwrite::write(a[0] as i32, special, total)
+                    .or_else(|| fdstate::capped_write(a[0] as i32, total, capped))
+                {
                     Some(r) => r,
                     // SAFETY: as for readv.
                     None => host::ret(unsafe {
