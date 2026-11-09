@@ -86,17 +86,23 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
         }
         ts = Timespec { tv_sec: sec, tv_nsec: nsec };
     }
-    let host_ts = libc::timespec { tv_sec: ts.tv_sec, tv_nsec: ts.tv_nsec };
-    let mut left = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: valid in- and out-parameters.
-    if unsafe { libc::nanosleep(&host_ts, &mut left) } == 0 {
-        return 0;
+    // On time, as Linux wakes within its timer slack (the host's own
+    // sleeps can end a millisecond late), and ended by a signal however
+    // soon it lands ([`crate::thread::wait_ready_ns`]).
+    let ns = ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec);
+    let start = std::time::Instant::now();
+    match crate::thread::wait_ready_ns(&mut [], ns) {
+        Ok(_) => 0,
+        Err(e) => {
+            if rem != 0 && flags & TIMER_ABSTIME == 0 {
+                let spent = start.elapsed().as_nanos().min(i64::MAX as u128) as i64;
+                let left = (ns - spent).max(0);
+                let left = Timespec { tv_sec: left / 1_000_000_000, tv_nsec: left % 1_000_000_000 };
+                guest!(uaccess::write(rem, left));
+            }
+            err(e)
+        }
     }
-    let e = last_error();
-    if rem != 0 && flags & TIMER_ABSTIME == 0 {
-        guest!(uaccess::write(rem, Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec }));
-    }
-    e
 }
 
 /// The host process whose `/proc/<pid>/maps` descriptor `fd` is open on,
@@ -1977,6 +1983,19 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     with_remaining(timeout, || unsafe { pselect6_wait(nfds, sets, timeout) })
 }
 
+/// A `struct timespec` timeout at guest `timeout` in nanoseconds (-1 for a
+/// null pointer: without bound), or the call's error for a bad one.
+fn timeout_ns(timeout: u64) -> Result<i64, i64> {
+    if timeout == 0 {
+        return Ok(-1);
+    }
+    let ts: Timespec = uaccess::read(timeout).map_err(err)?;
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(err(errno::EINVAL));
+    }
+    Ok(ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec))
+}
+
 /// [`pselect6`]'s wait.
 ///
 /// # Safety
@@ -2009,20 +2028,13 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
             (ev != 0).then_some(libc::pollfd { fd: fd as i32, events: ev, revents: 0 })
         })
         .collect();
-    let ms = if timeout == 0 {
-        -1
-    } else {
-        let ts: Timespec = guest!(uaccess::read(timeout));
-        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-            return err(errno::EINVAL);
-        }
-        let ms = ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
-        ms.min(i32::MAX as i64) as i32
+    let ns = match timeout_ns(timeout) {
+        Ok(ns) => ns,
+        Err(e) => return e,
     };
-    // SAFETY: `fds` is a valid array of its length.
-    let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
-    if r < 0 {
-        return last_error();
+    // On time, and ended by a signal however soon it lands.
+    if let Err(e) = crate::thread::wait_ready_ns(&mut fds, ns) {
+        return err(e);
     }
     if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
         return err(errno::EBADF);
@@ -2065,16 +2077,11 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
 /// As for [`ppoll`].
 unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
-    let ms = if timeout == 0 {
-        -1
-    } else {
-        let ts: Timespec = guest!(uaccess::read(timeout));
-        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-            return err(errno::EINVAL);
-        }
-        let ms = ts.tv_sec.saturating_mul(1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000);
-        ms.min(i32::MAX as i64) as i32
+    let ns = match timeout_ns(timeout) {
+        Ok(ns) => ns,
+        Err(e) => return e,
     };
+    let ms = if ns < 0 { -1 } else { (ns as u64).div_ceil(1_000_000).min(i32::MAX as u64) as i32 };
     // The read ends of named FIFOs it watches, whose writers' end the
     // host does not report ([`crate::fifo`]): waited for in slices,
     // looked at between them.
@@ -2099,7 +2106,7 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
             )
         };
         guest!(uaccess::read_into(fds, bytes));
-        return match crate::thread::wait_ready(&mut set, ms) {
+        return match crate::thread::wait_ready_ns(&mut set, ns) {
             Ok(n) => {
                 for (i, p) in set.iter().enumerate() {
                     let at = fds + (i * size_of::<Pollfd>() + 6) as u64;

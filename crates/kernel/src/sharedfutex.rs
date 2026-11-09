@@ -304,6 +304,12 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
             Some(d) => (d - now).min(crate::futex::SIGNAL_CHECK),
             None => crate::futex::SIGNAL_CHECK,
         };
+        if let Some(step) = deadline.and_then(|d| crate::futex::near(d, now)) {
+            // Close to the deadline: on time, looking for the wake between
+            // short steps.
+            crate::futex::precise_sleep(step);
+            continue;
+        }
         // SAFETY: the slot's word, in fwe's shared table; the host sleeps
         // while it still reads `cur`.
         unsafe {

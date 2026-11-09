@@ -83,20 +83,23 @@ pub fn init_main(pid: i32) {
 /// signal that lands after such a wait looked for pending signals, and
 /// before the host wait began, still ends it. Kept without a lock: the
 /// handler reads it.
-static WAIT_PIPES: [(AtomicU64, AtomicI32, AtomicI32); 256] =
-    [const { (AtomicU64::new(0), AtomicI32::new(-1), AtomicI32::new(-1)) }; 256];
+static WAIT_PIPES: [(AtomicU64, AtomicI32, AtomicI32, AtomicI32); 256] =
+    [const { (AtomicU64::new(0), AtomicI32::new(-1), AtomicI32::new(-1), AtomicI32::new(-1)) };
+        256];
 
 fn self_id() -> u64 {
     // SAFETY: pthread_self cannot fail; async-signal-safe.
     unsafe { libc::pthread_self() as u64 }
 }
 
-/// The calling thread's wake pipe's read end, made on first use (none if
-/// every slot is taken or no pipe can be made).
-fn wait_pipe() -> Option<i32> {
+/// The calling thread's wake pipe's read end and timer kqueue (-1 for
+/// none, [`wait_timer`]), made on first use (none if every slot is taken or
+/// no pipe can be made).
+fn wait_pipe() -> Option<(i32, i32)> {
     let me = self_id();
-    if let Some((_, r, _)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
-        return Some(r.load(Ordering::SeqCst)).filter(|&r| r >= 0);
+    if let Some((_, r, _, tq)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
+        let r = r.load(Ordering::SeqCst);
+        return (r >= 0).then(|| (r, tq.load(Ordering::SeqCst)));
     }
     let mut p = [-1i32; 2];
     // SAFETY: a valid out-array; the ends are made non-blocking and moved
@@ -112,17 +115,22 @@ fn wait_pipe() -> Option<i32> {
     let (Ok(r), Ok(w)) = (crate::fdtable::reserve(p[0]), crate::fdtable::reserve(p[1])) else {
         return None;
     };
-    for (t, rs, ws) in &WAIT_PIPES {
+    let timer = wait_timer();
+    for (t, rs, ws, tq) in &WAIT_PIPES {
         if t.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             rs.store(r, Ordering::SeqCst);
             ws.store(w, Ordering::SeqCst);
-            return Some(r);
+            tq.store(timer, Ordering::SeqCst);
+            return Some((r, timer));
         }
     }
-    // SAFETY: the pipe made above, not kept.
+    // SAFETY: the pipe and kqueue made above, not kept.
     unsafe {
         libc::close(r);
         libc::close(w);
+        if timer >= 0 {
+            libc::close(timer);
+        }
     }
     None
 }
@@ -131,7 +139,7 @@ fn wait_pipe() -> Option<i32> {
 /// wake pipe. Async-signal-safe.
 pub fn poke_wait() {
     let me = self_id();
-    if let Some((_, _, w)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
+    if let Some((_, _, w, _)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
         let saved = crate::host::last_errno();
         // SAFETY: one byte to the thread's own pipe; a full pipe is woken
         // already.
@@ -143,11 +151,15 @@ pub fn poke_wait() {
 /// The calling thread's wake pipe goes, as it exits.
 fn drop_wait_pipe() {
     let me = self_id();
-    if let Some((t, r, w)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
-        // SAFETY: the thread's own pipe, no longer used.
+    if let Some((t, r, w, tq)) = WAIT_PIPES.iter().find(|(t, ..)| t.load(Ordering::SeqCst) == me) {
+        // SAFETY: the thread's own pipe and kqueue, no longer used.
         unsafe {
             libc::close(r.swap(-1, Ordering::SeqCst));
             libc::close(w.swap(-1, Ordering::SeqCst));
+            let q = tq.swap(-1, Ordering::SeqCst);
+            if q >= 0 {
+                libc::close(q);
+            }
         }
         t.store(0, Ordering::SeqCst);
     }
@@ -155,26 +167,43 @@ fn drop_wait_pipe() {
 
 /// In a fork child: the parent's wake pipes are its own (the forking
 /// thread's is shared with the parent), so they go; this thread makes its
-/// own when it next waits.
+/// own when it next waits. (Their timer kqueues the host did not pass on;
+/// their numbers are only forgotten.)
 fn forget_wait_pipes() {
-    for (t, r, w) in &WAIT_PIPES {
+    for (t, r, w, tq) in &WAIT_PIPES {
         if t.swap(0, Ordering::SeqCst) != 0 {
             // SAFETY: inherited descriptors of fwe's, no longer used here.
             unsafe {
                 libc::close(r.swap(-1, Ordering::SeqCst));
                 libc::close(w.swap(-1, Ordering::SeqCst));
             }
+            tq.store(-1, Ordering::SeqCst);
         }
     }
 }
 
-/// `poll` of `fds` for up to `ms` milliseconds (-1: without bound), ended
+/// `poll` of `fds` for up to `ms` milliseconds (-1: without bound); see
+/// [`wait_ready_ns`].
+pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
+    wait_ready_ns(fds, if ms < 0 { -1 } else { i64::from(ms) * 1_000_000 })
+}
+
+/// `poll` of `fds` for up to `ns` nanoseconds (-1: without bound), ended
 /// as well by a signal for the guest (`EINTR`): one pending as the wait
 /// starts, or one that lands during it, however soon. A signal the thread
 /// blocks for a `signalfd` is moved onto it, so the wait sees that
 /// descriptor ready. Returns how many of `fds` are ready.
-pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
-    let Some(wake) = wait_pipe() else {
+///
+/// The time is kept by a timer of the host's that wakes on time
+/// ([`wait_timer`]): a `poll` timeout of its own, as the host's other
+/// timers, can end a millisecond or more late (macOS coalesces timers),
+/// where Linux wakes within its timer slack.
+pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
+    use std::time::{Duration, Instant};
+    let deadline = (ns >= 0).then(|| Instant::now() + Duration::from_nanos(ns as u64));
+    let Some((wake, timer)) = wait_pipe() else {
+        let ms =
+            if ns < 0 { -1 } else { (ns as u64).div_ceil(1_000_000).min(i32::MAX as u64) as i32 };
         // SAFETY: a valid array of `fds.len()` entries.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
         return if n < 0 {
@@ -183,10 +212,11 @@ pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
             Ok(n)
         };
     };
-    let deadline =
-        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
     let mut all: Vec<libc::pollfd> = fds.to_vec();
     all.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
+    if timer >= 0 {
+        all.push(libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 });
+    }
     loop {
         // What woke it before is spent; a signal from now on writes again.
         let mut b = [0u8; 64];
@@ -196,29 +226,112 @@ pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
         if deliverable() != 0 {
             return Err(fwe_abi::errno::EINTR);
         }
-        let left = match deadline {
+        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let poll_ms = match left {
             None => -1,
-            Some(d) => d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32,
+            Some(l) if l.is_zero() => 0,
+            Some(l) if timer >= 0 => {
+                arm_timer(timer, l);
+                -1
+            }
+            Some(l) => l.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
         };
         for p in &mut all {
             p.revents = 0;
         }
         // SAFETY: a valid array of `all.len()` entries.
-        let n = unsafe { libc::poll(all.as_mut_ptr(), all.len() as libc::nfds_t, left) };
+        let n = unsafe { libc::poll(all.as_mut_ptr(), all.len() as libc::nfds_t, poll_ms) };
         if n < 0 && crate::host::last_errno() != libc::EINTR {
             return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
-        let woke = all[fds.len()].revents != 0;
-        let ready = n.max(0) - i32::from(woke);
+        let ready = all[..fds.len()].iter().filter(|p| p.revents != 0).count() as i32;
         if ready > 0 {
             for (f, a) in fds.iter_mut().zip(&all) {
                 f.revents = a.revents;
             }
             return Ok(ready);
         }
-        if n == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(0);
         }
+    }
+}
+
+/// The write end of the calling thread's wake pipe, which another thread
+/// writes to end this one's [`nap_ns`] (-1 if it has none).
+pub fn poke_fd() -> i32 {
+    if wait_pipe().is_none() {
+        return -1;
+    }
+    let me = self_id();
+    WAIT_PIPES
+        .iter()
+        .find(|(t, ..)| t.load(Ordering::SeqCst) == me)
+        .map_or(-1, |(_, _, w, _)| w.load(Ordering::SeqCst))
+}
+
+/// Sleep for up to `ns` nanoseconds on time ([`wait_ready_ns`]), or until
+/// the thread's wake pipe is written: a signal, or another thread writing
+/// to [`poke_fd`]. What woke it is spent.
+pub fn nap_ns(ns: i64) {
+    let after = std::time::Duration::from_nanos(ns.max(0) as u64);
+    let Some((wake, timer)) = wait_pipe() else {
+        std::thread::sleep(after);
+        return;
+    };
+    let mut all = [
+        libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 },
+    ];
+    let (n, ms) = if timer >= 0 {
+        arm_timer(timer, after);
+        (2, -1)
+    } else {
+        (1, after.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
+    };
+    // SAFETY: a valid array of at least `n` entries.
+    unsafe { libc::poll(all.as_mut_ptr(), n, ms) };
+    let mut b = [0u8; 64];
+    // SAFETY: the thread's own non-blocking pipe and a buffer of its length.
+    while unsafe { libc::read(wake, b.as_mut_ptr().cast(), b.len()) } > 0 {}
+}
+
+/// Set the thread's timer kqueue `kq` to fire once, `after` from now, on
+/// time (`NOTE_CRITICAL`), what it held before spent.
+#[cfg(target_os = "macos")]
+fn arm_timer(kq: i32, after: std::time::Duration) {
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: zeroed kevents are valid out-parameters; plain host calls on
+    // the thread's own kqueue.
+    unsafe {
+        let mut spent: [libc::kevent; 4] = std::mem::zeroed();
+        libc::kevent(kq, std::ptr::null(), 0, spent.as_mut_ptr(), 4, &zero);
+        let ev = libc::kevent {
+            ident: 1,
+            filter: libc::EVFILT_TIMER,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_NSECONDS | libc::NOTE_CRITICAL,
+            data: after.as_nanos().min(i64::MAX as u128) as isize,
+            udata: std::ptr::null_mut(),
+        };
+        libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm_timer(_: i32, _: std::time::Duration) {}
+
+/// A kqueue for the calling thread's timed waits (-1 where the host has
+/// none, or it cannot be made).
+fn wait_timer() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: plain host call.
+        crate::fdtable::reserve(unsafe { libc::kqueue() }).unwrap_or(-1)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        -1
     }
 }
 
