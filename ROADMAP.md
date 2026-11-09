@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 958 of 1550 (79% of the 1211 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 952 of 1550 (79% of the 1211 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:

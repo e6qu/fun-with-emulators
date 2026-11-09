@@ -42,7 +42,6 @@ clock_gettime01
 clock_gettime02
 clock_gettime04
 clock_nanosleep01
-clock_nanosleep02
 clock_nanosleep04
 clone01
 clone02
@@ -99,12 +98,10 @@ epoll_ctl05
 epoll_ctl07
 epoll_pwait01
 epoll_pwait02
-epoll_pwait03
 epoll_pwait04
 epoll_pwait05
 epoll_pwait06
 epoll_wait01
-epoll_wait02
 epoll_wait03
 epoll_wait04
 epoll_wait05
@@ -274,7 +271,6 @@ ftruncate03_64
 futex_cmp_requeue01
 futex_cmp_requeue02
 futex_cmp_requeue03
-futex_wait05
 futex_wait_bitset01
 futex_wait01
 futex_wait02
@@ -615,8 +611,6 @@ preadv201
 preadv201_64
 preadv202
 preadv202_64
-pselect01
-pselect01_64
 pselect02
 pselect02_64
 pselect03

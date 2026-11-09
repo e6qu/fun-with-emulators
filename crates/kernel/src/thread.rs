@@ -214,7 +214,10 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     };
     let mut all: Vec<libc::pollfd> = fds.to_vec();
     all.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
-    if timer >= 0 {
+    // The timer only for a wait with a deadline: one an earlier wait left
+    // fired (its event unread) keeps the kqueue readable until it is armed
+    // again, which an unbounded wait never does.
+    if timer >= 0 && deadline.is_some() {
         all.push(libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 });
     }
     loop {
