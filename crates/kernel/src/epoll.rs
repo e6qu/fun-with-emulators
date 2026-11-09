@@ -197,7 +197,10 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
             return err(errno::EBADF);
         }
         let kind = st.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFREG || kind == libc::S_IFDIR {
+        // A mounts file polls (for its namespace's changes); other files
+        // and directories are always ready, so cannot be watched.
+        let mounts = crate::mountwatch::is(target);
+        if (kind == libc::S_IFREG && !mounts) || kind == libc::S_IFDIR {
             return err(errno::EPERM);
         }
         if ep == target || !is_epoll(ep) {
@@ -227,8 +230,13 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
             EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD => {}
             _ => return err(errno::EINVAL),
         }
-        // SAFETY: plain host calls on the guest's descriptors.
-        let r = unsafe { ctl_kqueue(epfd, op, fd, entry.unwrap_or((0, 0))) };
+        // A mounts file is fwe's to watch, not the host's.
+        let r = if mounts {
+            0
+        } else {
+            // SAFETY: plain host calls on the guest's descriptors.
+            unsafe { ctl_kqueue(epfd, op, fd, entry.unwrap_or((0, 0))) }
+        };
         // A device the host cannot watch (`/dev/zero`) is one Linux cannot
         // poll either.
         if r == err(errno::EINVAL) && kind == libc::S_IFCHR {
@@ -460,9 +468,10 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
 }
 
 /// `epoll_pwait` on a kqueue. A set that watches the read end of a named
-/// FIFO waits in slices, looking between them for the end of its writers,
-/// which the host does not report ([`crate::fifo`]), and for a signal to
-/// deliver.
+/// FIFO, or a mounts file, waits in slices, looking between them for the
+/// end of the FIFO's writers, which the host does not report
+/// ([`crate::fifo`]), or a change of the mounts ([`crate::mountwatch`]),
+/// and for a signal to deliver.
 #[cfg(not(target_os = "linux"))]
 unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     use fwe_abi::epoll::*;
@@ -479,6 +488,14 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     .into_iter()
     .filter(|&(fd, ..)| crate::fifo::is_reader(fd))
     .collect();
+    let mounts: Vec<(i32, u64, u32)> = interest(|m| {
+        m.get(&ep).map_or_else(Vec::new, |l| {
+            l.iter()
+                .filter(|&(&fd, _)| crate::mountwatch::is(fd))
+                .map(|(&fd, &(ev, d))| (fd, d, ev))
+                .collect()
+        })
+    });
     let exclusive: Vec<i32> = interest(|m| {
         m.get(&ep).map_or_else(Vec::new, |l| {
             l.iter()
@@ -487,10 +504,10 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
                 .collect()
         })
     });
-    if fifos.is_empty() && !exclusive.is_empty() {
+    if fifos.is_empty() && mounts.is_empty() && !exclusive.is_empty() {
         return wait_exclusive(ep, events, max, ns, &exclusive);
     }
-    if fifos.is_empty() {
+    if fifos.is_empty() && mounts.is_empty() {
         let ready = match kevent_wait(ep, max, ns) {
             Ok(r) => r,
             Err(e) => return e,
@@ -521,6 +538,20 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
                 edge_clear(ep, fd);
             }
         }
+        // Mounts files whose namespace's mounts changed; one watched for
+        // reading is always readable, as a file is.
+        for &(fd, data, ev) in &mounts {
+            if !armed(ep, fd) {
+                continue;
+            }
+            let mut bits = ev & EPOLLIN;
+            if crate::mountwatch::changed(fd) == Some(true) {
+                bits |= EPOLLERR | (ev & EPOLLPRI);
+            }
+            if bits != 0 && !ready.iter().any(|r| r.0 == fd) {
+                ready.push((fd, bits, data));
+            }
+        }
         ready.truncate(max);
         let wait = if ready.is_empty() {
             match deadline {
@@ -546,7 +577,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             }
         }
         for &(fd, ..) in &ready {
-            if fifos.iter().any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
+            if fifos.iter().chain(&mounts).any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
                 disarm(ep, fd);
             }
         }
@@ -743,7 +774,7 @@ fn armed(epfd: i32, fd: i32) -> bool {
     interest(|m| {
         m.get(&epfd)
             .and_then(|l| l.get(&fd))
-            .is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP) != 0)
+            .is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI) != 0)
     })
 }
 
@@ -754,7 +785,7 @@ fn disarm(epfd: i32, fd: i32) {
     use fwe_abi::epoll::*;
     let data = interest(|m| {
         let e = m.get_mut(&epfd)?.get_mut(&fd)?;
-        e.0 &= !(EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+        e.0 &= !(EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI);
         Some(e.1)
     });
     let Some(data) = data else { return };

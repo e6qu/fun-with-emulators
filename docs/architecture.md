@@ -617,7 +617,11 @@ each behaves inside fwe:
   `EINVAL`, `ELOOP` for loops and nesting past Linux's limit, `EEXIST`,
   `ENOENT`). Waits keep nanoseconds, as `epoll_pwait2`'s `timespec`
   gives them. A socket watched for `EPOLLRDHUP` alone has a read filter at a low-water
-  mark no read reaches, so only the end fires.
+  mark no read reaches, so only the end fires. A mounts file (`/proc/<pid>/mounts`, `mountinfo`)
+  reports `POLLERR | POLLPRI` to `poll` and `epoll` once its namespace's
+  mounts changed since it was opened or last polled
+  (`crates/kernel/src/mountwatch.rs`: the namespace record's generation,
+  looked at in slices).
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
   An eventfd's counter is a shared page with a lock word in it, so a fork

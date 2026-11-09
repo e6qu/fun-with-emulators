@@ -128,6 +128,7 @@ epoll_wait05
 epoll_wait07
 epoll_wait08
 epoll_wait09
+epoll_wait10
 epoll_wait11
 epoll_wait12
 epoll_wait13

@@ -201,6 +201,7 @@ impl<P: Platform> Kernel<P> {
             nr::CLOSE => {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
+                crate::mountwatch::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);
@@ -2090,6 +2091,12 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
                 p.events &= !libc::POLLOUT;
                 full = true;
             }
+            // A mounts file's change is fwe's to tell, in slices: the host
+            // would report its urgent data at once.
+            if crate::mountwatch::is(p.fd) {
+                p.events &= !libc::POLLPRI;
+                full = true;
+            }
         }
         let left =
             deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_nanos() as i64);
@@ -2104,6 +2111,9 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         for ((p, a), &w) in set.iter_mut().zip(&ask).zip(&writable) {
             p.revents = a.revents | if w { libc::POLLOUT } else { 0 };
             linux_revents(p);
+            if crate::mountwatch::changed(p.fd) == Some(true) {
+                p.revents |= libc::POLLERR | (p.events & libc::POLLPRI);
+            }
         }
         let n = set.iter().filter(|p| p.revents != 0).count() as i32;
         if n > 0 || !full || deadline.is_some_and(|d| Instant::now() >= d) {

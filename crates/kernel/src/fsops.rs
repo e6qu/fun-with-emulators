@@ -372,7 +372,13 @@ impl<P: Platform> Kernel<P> {
                     }
                 }
                 crate::procfs::Entry::File(content) => {
-                    self.synthetic_fd(anon_fd(&content, flags), dirfd as i32, &path)
+                    let fd = self.synthetic_fd(anon_fd(&content, flags), dirfd as i32, &path);
+                    // A mounts file reports its namespace's changes.
+                    let p = self.fs().proc_path(dirfd as i32, &path).unwrap_or_default();
+                    if fd >= 0 && matches!(&p[..], b"/proc/self/mounts" | b"/proc/self/mountinfo") {
+                        crate::mountwatch::opened(fd as i32, self.fs().mount_ns().clone());
+                    }
+                    fd
                 }
                 crate::procfs::Entry::Symlink(target) if namespace_inode(&target).is_some() => {
                     if flags & fcntl::O_NOFOLLOW != 0 {
