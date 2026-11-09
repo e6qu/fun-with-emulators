@@ -188,8 +188,12 @@ The pieces that do it:
   reaches each group (a quarter of the branch range apart at most), takes
   the region from the loader's arena or reserves one near the code, writes
   the stubs, points each site at its stub and invalidates the instruction
-  cache; code the guest mapped without a fixed address, which the host put
-  where no region is within reach, is mapped again where there is room;
+  cache. A mapping the guest leaves to the host is asked for at 2 TiB,
+  above the program, its break and fwe's own memory, so that mappings fill
+  upwards with free space past the latest (in the gaps below, a library's
+  code could find no stub region within reach); code mapped without a
+  fixed address that still finds none is mapped again where there is
+  room;
 - the kernel crate asks for preparation through
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
