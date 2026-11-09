@@ -237,12 +237,15 @@ records Linux would keep about them:
   the guest did not ask for (code stubs, a guard page) is listed as
   anonymous with the host's protections, so a program looking for free
   space does not pick it.
-- **Other processes:** each process publishes its record after every
-  change in a shared file beside its process record (a sequence word odd
-  while it is written). Another process's `/proc/<pid>/maps` and `smaps`
+- **Other processes:** each process publishes its record in a shared
+  file beside its process record (a sequence word odd while it is
+  written) before its next system call that is not a memory call, and
+  before a `fork`, so a run of mapping calls publishes once. Another process's `/proc/<pid>/maps` and `smaps`
   read it, with resident pages from the host (`proc_pidinfo`).
   `PROCMAP_QUERY` answers for any of them, with the mapped file's GNU
   build ID.
+- **`vm.max_map_count`** (65530 by default) limits the mappings: an
+  `mmap`, or an `munmap` that splits one, past it fails with `ENOMEM`.
 - **Locking** (`mlock`, `mlock2`, `mlockall`, `MAP_LOCKED`) brings memory
   in and marks it locked for `smaps`, `VmLck` and the next lock's
   `RLIMIT_MEMLOCK` check; nothing is wired.
@@ -339,6 +342,9 @@ does for it, then the per-process state fwe keeps. Inside fwe:
 Threads are host threads, so most of their work is scheduling the host
 already does; fwe adds Linux's thread identity and futexes:
 
+- Guest threads run at the host's user-interactive quality of service,
+  so the host wakes them on time when it is busy, as Linux wakes a
+  sleeping task.
 - A guest thread is a host thread running guest code; `CLONE_SETTLS`,
   `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
   act as on Linux.
@@ -396,10 +402,12 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.
-- **Notes:** a sender writes a slot per host signal in the target's
-  mailbox (pid, uid, time, and for `SI_MESGQ` the code and value) with
-  `pwrite`; the target's handler reads it with `pread`, both
-  async-signal-safe, the mailbox held in fwe's reserved descriptor range.
+- **Notes:** a sender writes a note in one of eight slots per host
+  signal in the target's mailbox (pid, uid, time, and for `SI_MESGQ` the
+  code and value) with `pwrite`, a free one or else the oldest; the
+  target's handler reads the note of the sender the host names, or the
+  oldest, with `pread`, both async-signal-safe, the mailbox held in fwe's
+  reserved descriptor range.
 - **Before a re-exec,** the whole guest mask goes on the host, and signals
   fwe holds pending that the guest blocks are re-raised on the thread,
   which the host `execve` keeps.
@@ -609,6 +617,13 @@ each behaves inside fwe:
   mark no read reaches, so only the end fires.
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
+  An eventfd's counter is a shared page with a lock word in it, so a fork
+  child and its parent count on one counter, as Linux's do.
+- **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
+  fwe process maps counts, for each pipe a set watches exclusively, its
+  writes and the writes a waiter took. A set a write woke reports it only
+  if it takes one; the others wait for the next write. An edge-triggered
+  set sees such a pipe readable anew when it was written to.
 - **Fork:** of the epoll and timerfd kqueues a host fork child rebuilds
   (see [linux-on-macos.md](linux-on-macos.md#waiting-and-events)), a
   one-shot timer that expired unread is readable in the child at once.
@@ -643,7 +658,10 @@ records ([linux-on-macos.md](linux-on-macos.md#ipc)). Their details:
   `SHM_REMAP`; a fork child counts its parent's attachments; `execve` and
   exit detach. A wait ends with `EINTR` for a signal, `EIDRM` if the object
   goes, `EAGAIN` at `semtimedop`'s timeout. A process is known by pid and
-  start time.
+  start time. Each change goes to the record's journal as the objects it
+  changed, and an index (by key, by slot, and of the objects that name
+  processes) finds objects without looking at each, so a namespace of
+  thousands of objects costs a call what it changes.
 - **POSIX message queues** (`crates/kernel/src/mqueue.rs`): each queue is
   counted against `fs.mqueue.queues_max` and the creator's
   `RLIMIT_MSGQUEUE`; messages by priority, oldest first; a wait ends with
@@ -822,9 +840,8 @@ which are to be lifted for 1.0 and which are not planned.
   completing) may or may not reach the child.
 - A fork child: an epoll or timerfd descriptor duplicated with `dup` is
   gone (only the original number is rebuilt); a periodic timerfd restarts
-  its period and loses unread expirations; eventfd counters and signalfd
-  queues are the child's own copies while their readiness pipes are
-  shared.
+  its period and loses unread expirations; signalfd queues are the
+  child's own copies while their readiness pipes are shared.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
 - `clone3` has no chosen tids (`ENOSYS`); `waitid` reports no
@@ -865,9 +882,6 @@ which are to be lifted for 1.0 and which are not planned.
   part is new memory, not shared with processes that share the rest;
   `MADV_DONTNEED` on a private file mapping keeps modified pages where
   Linux restores the file's.
-- `vm.max_map_count` is not enforced, and each mapping change publishes
-  the whole mapping list, so a process with tens of thousands of
-  mappings is slow to change them.
 - VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
   `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
   nothing.
@@ -936,6 +950,11 @@ which are to be lifted for 1.0 and which are not planned.
   directory).
 
 **Mounts**
+- A tmpfs's `size=` is kept beside its directory: what its files take
+  on the host is counted (again when the count is a quarter second old),
+  a write past the size writes what fits or fails with `ENOSPC`,
+  `fallocate` fits whole or fails, and `statfs` reports the size and what
+  is left. Its files are host files, so their blocks are the host's.
 - Mountable filesystems are tmpfs, `proc`, `sysfs`, `cgroup2`, `devpts`,
   `mqueue` and overlays, not one on a block device (ext4, XFS: `ENODEV`),
   so a loop device holds bytes but no filesystem to mount.
@@ -946,7 +965,7 @@ which are to be lifted for 1.0 and which are not planned.
 - A detached mount or filesystem context is the process's (kept across
   `fork` and `execve` with its descriptor), so one passed over a socket is
   a plain descriptor of its directory; `fspick` and a remount reconfigure
-  the one mount; a tmpfs's `size=` is not enforced.
+  the one mount.
 - A mount is not busy for a process fwe did not start, for another
   process's working directory, or for a file another process opened at a
   host path two mounts share (a bind, a lower layer two overlays have).
@@ -1007,9 +1026,15 @@ which are to be lifted for 1.0 and which are not planned.
   except in the VM).
 
 **Event descriptors and inotify**
-- `EPOLLEXCLUSIVE` wakes every waiter; `timerfd` measures
+- `EPOLLEXCLUSIVE` wakes one waiter only for a pipe, and counts only
+  the writes fwe's processes make with `write` and `writev`: a socket or a
+  pipe another program writes to wakes every waiter; `timerfd` measures
   `TFD_TIMER_ABSTIME` against the realtime clock whatever its clock, and a
   periodic timer's first expiry is its interval.
+- A `poll`, `select` or `epoll` timeout on an idle host ends a quarter to
+  half a millisecond late (the host's wake from its timer), past what
+  LTP's timer tests allow for the longer timeouts; a busy host wakes
+  sooner.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in

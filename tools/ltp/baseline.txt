@@ -57,6 +57,7 @@ clock_gettime01
 clock_gettime02
 clock_gettime04
 clock_nanosleep01
+clock_nanosleep02
 clock_nanosleep04
 clone01
 clone02
@@ -114,6 +115,7 @@ epoll_ctl02
 epoll_ctl03
 epoll_ctl04
 epoll_ctl05
+epoll_ctl06
 epoll_ctl07
 epoll_pwait01
 epoll_pwait02
@@ -133,10 +135,15 @@ epoll_wait12
 epoll_wait13
 epoll_wait14
 epoll_wait15
+epoll_wait16
 eventfd01
 eventfd02
 eventfd03
+eventfd04
+eventfd05
 eventfd2_01
+eventfd2_02
+eventfd2_03
 execl01
 execle01
 execlp01
@@ -159,6 +166,9 @@ faccessat202
 fallocate01
 fallocate02
 fallocate03
+fallocate04
+fallocate05
+fallocate06
 fchdir01
 fchdir02
 fchdir03
@@ -309,6 +319,7 @@ futex_wait01
 futex_wait02
 futex_wait03
 futex_wait04
+futex_wait05
 futex_wait06
 futex_wait07
 futex_waitv01
@@ -459,6 +470,7 @@ link02
 link04
 link05
 link08
+linkat02
 listen01
 listmount01
 listmount02
@@ -600,6 +612,7 @@ munlock02
 munlockall01
 munmap01
 munmap03
+munmap04
 nanosleep02
 nanosleep04
 newuname01
@@ -791,6 +804,7 @@ semctl07
 semctl09
 semget01
 semget02
+semget05
 semop01
 semop02
 semop03
@@ -884,6 +898,7 @@ shmctl01
 shmctl02
 shmctl03
 shmctl04
+shmctl05
 shmctl07
 shmctl08
 shmdt01
