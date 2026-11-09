@@ -134,7 +134,7 @@ impl<P: Platform> Kernel<P> {
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
-        crate::creds::note_dac_override(self.creds.has(crate::caps::CAP_DAC_OVERRIDE));
+        crate::creds::publish(&self.creds);
         crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
@@ -703,17 +703,6 @@ impl<P: Platform> Kernel<P> {
                 err(errno::ENOSYS)
             }
         }
-    }
-
-    /// Shared `chown` policy against the virtual credentials. `chown(-1, -1)`
-    /// is always a no-op; otherwise only a virtual root may change ownership,
-    /// and it is a no-op on the host file (we do not run as root, and tracking
-    /// shadow ownership is not yet implemented).
-    pub(crate) fn chown_check(&self, uid: u32, gid: u32) -> i64 {
-        if uid == u32::MAX && gid == u32::MAX {
-            return 0;
-        }
-        if self.creds.has(crate::caps::CAP_CHOWN) { 0 } else { err(errno::EPERM) }
     }
 
     fn sys_getresuid(&self, rp: u64, ep: u64, sp: u64) -> i64 {

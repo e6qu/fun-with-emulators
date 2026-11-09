@@ -168,6 +168,8 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             # A shell script: LTP's shell library is not built.
             return name, "script", 0.0, ""
     tmp = tempfile.mkdtemp(prefix=name[:40] + ".", dir=work)
+    # Open to every user, as /tmp is: tests drop to an unprivileged user.
+    os.chmod(tmp, 0o1777)
     guest_tmp = "/" + os.path.relpath(tmp, root)
     env = {
         "PATH": f"{bindir}:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -270,6 +272,7 @@ def main():
     if args.only:
         tests = [t for t in tests if re.search(args.only, t[0])]
     work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+    os.chmod(work, 0o1777)
     results = {}
     try:
         done = 0
@@ -330,6 +333,7 @@ def main():
         # missed its moment. One that passes so is named, not failed.
         argv_of = dict(tests)
         work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+        os.chmod(work, 0o1777)
         try:
             end_leftovers(fwe, root)
             again = {n: run_guarded(fwe, root, work, n, argv_of[n]) for n in regressed}

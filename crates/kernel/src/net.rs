@@ -60,7 +60,12 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         raw[1..].hash(&mut h);
         let dir = abstract_dir();
-        let _ = std::fs::create_dir_all(&dir);
+        // Private to fwe's user, whatever the host's umask (fwe sets it to
+        // 0, the guest's being its own to apply).
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+        }
         let p = dir.join(format!("{:016x}", h.finish()));
         let name = p.with_extension("name");
         if !name.exists() {
@@ -221,6 +226,49 @@ fn bind_or_connect(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr, bind: bool) -
 /// Run `call` (a host call taking a relative path) from directory `dir`
 /// as this thread's working directory, if one is given; its result and
 /// `errno` are the call's.
+/// A socket node `name` in directory `dir`, as `mknod` makes one: a Unix
+/// socket bound there, from the directory, and closed, leaving the node.
+pub fn make_socket_node(dir: i32, name: &std::ffi::CStr, perm: u32) -> Result<(), i32> {
+    let bytes = name.to_bytes();
+    if bytes.len() + 1 > UNIX_PATH_MAX {
+        return Err(errno::ENAMETOOLONG);
+    }
+    // SAFETY: duplicating a live directory descriptor, owned below.
+    let d = unsafe { libc::fcntl(dir, libc::F_DUPFD_CLOEXEC, 0) };
+    if d < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    use std::os::fd::FromRawFd;
+    // SAFETY: the fresh duplicate.
+    let d = unsafe { std::os::fd::OwnedFd::from_raw_fd(d) };
+    let mut sa = empty_sockaddr();
+    #[cfg(not(target_os = "linux"))]
+    {
+        sa[0] = (2 + bytes.len() + 1) as u8;
+        sa[1] = libc::AF_UNIX as u8;
+    }
+    #[cfg(target_os = "linux")]
+    sa[..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+    sa[2..2 + bytes.len()].copy_from_slice(bytes);
+    // SAFETY: a fresh socket of this function's, closed below.
+    let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if s < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    let len = (2 + bytes.len() + 1) as libc::socklen_t;
+    // SAFETY: a valid host sockaddr of `len` bytes.
+    let r = in_dir(Some(&d), || unsafe { libc::bind(s, sa.as_ptr().cast(), len) });
+    let e = crate::host::last_errno();
+    // SAFETY: closing the socket made above; the node stays.
+    unsafe { libc::close(s) };
+    if r != 0 {
+        return Err(crate::host::errno_to_linux(e));
+    }
+    // SAFETY: a NUL-terminated name in a live directory.
+    unsafe { libc::fchmodat(dir, name.as_ptr(), perm as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW) };
+    Ok(())
+}
+
 fn in_dir(dir: Option<&std::os::fd::OwnedFd>, call: impl FnOnce() -> i32) -> i32 {
     let Some(dir) = dir else { return call() };
     #[cfg(target_os = "macos")]
@@ -766,6 +814,9 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
                 if libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
                     && st.st_mode & libc::S_IFMT == libc::S_IFSOCK
                 {
+                    // The node is its maker's ([`crate::owners`]).
+                    let a = crate::creds::access();
+                    let _ = crate::owners::keep_at(dir, &name, (a.fsuid, a.fsgid));
                     libc::fchmodat(
                         dir,
                         name.as_ptr(),

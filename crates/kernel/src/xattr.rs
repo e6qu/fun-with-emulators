@@ -58,17 +58,21 @@ pub fn space(name: &[u8]) -> Result<Space, i32> {
 pub struct Kind {
     /// A regular file or a directory (a device node fwe made is neither).
     pub plain: bool,
-    /// Its kept mode, if its mode denies its owner ([`crate::modes`]).
-    pub kept: Option<u32>,
+    /// Its guest mode (with its type) and owner, for the permission
+    /// check ([`crate::modes`], [`crate::owners`]).
+    pub meta: (u32, u32, u32),
 }
 
 impl Kind {
-    /// The kind of the file whose host metadata is `st`, with its kept mode.
-    pub fn of(st: &libc::stat, kept: Option<u32>) -> Kind {
+    /// The kind of the file whose host metadata is `st`, with its guest
+    /// mode and owner.
+    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+    pub fn of(st: &libc::stat, perm: u32, owner: (u32, u32)) -> Kind {
         let kind = st.st_mode & libc::S_IFMT;
         let plain =
             (kind == libc::S_IFREG && !crate::devnodes::marked(st)) || kind == libc::S_IFDIR;
-        Kind { plain, kept }
+        let mode = (st.st_mode as u32 & libc::S_IFMT as u32) | perm;
+        Kind { plain, meta: (mode, owner.0, owner.1) }
     }
 }
 
@@ -77,19 +81,17 @@ pub struct Who {
     /// `CAP_SYS_ADMIN`, and `CAP_SETFCAP`.
     pub admin: bool,
     pub setfcap: bool,
-    /// Whether it passes permission bits to read, and to write.
+    /// Whether it may read the file, and write it: by its permission
+    /// bits, or passing them.
     pub read_any: bool,
     pub write_any: bool,
     pub kind: Kind,
 }
 
 impl Who {
-    /// Whether the file's own permission bits let it do `want` (`R_OK`,
-    /// `W_OK`): as the file's owner, of a kept mode (the host checks the
-    /// rest).
+    /// Whether it may do `want` (`R_OK`, `W_OK`) to the file.
     fn bits_allow(&self, want: u32) -> bool {
-        let passes = if want & 2 != 0 { self.write_any } else { self.read_any };
-        passes || self.kind.kept.is_none_or(|k| crate::modes::owner_allows(k, want))
+        if want & 2 != 0 { self.write_any } else { self.read_any }
     }
 
     /// Whether `name` (in `space`) may be read: `ENODATA` where Linux hides
@@ -327,19 +329,19 @@ mod tests {
 
     #[test]
     fn rules_by_namespace() {
-        let file = Kind { plain: true, kept: None };
+        let file = Kind { plain: true, meta: (0o100644, 0, 0) };
         let user =
-            Who { admin: false, setfcap: false, read_any: false, write_any: false, kind: file };
+            Who { admin: false, setfcap: false, read_any: true, write_any: true, kind: file };
         assert_eq!(user.may_read(Space::Trusted), Err(errno::ENODATA));
         assert_eq!(user.may_write(b"trusted.x", Space::Trusted), Err(errno::EPERM));
         assert_eq!(user.may_write(b"user.x", Space::User), Ok(()));
         assert_eq!(user.may_write(b"security.selinux", Space::Security), Err(errno::EPERM));
         assert!(!user.shows(b"trusted.x") && user.shows(b"user.x") && !user.shows(b"org.fwe.dev"));
-        let read_only = Kind { plain: true, kept: Some(0o444) };
-        let user = Who { kind: read_only, ..user };
+        let read_only = Kind { plain: true, meta: (0o100444, 0, 0) };
+        let user = Who { kind: read_only, write_any: false, ..user };
         assert_eq!(user.may_write(b"user.x", Space::User), Err(errno::EACCES));
         assert_eq!(user.may_read(Space::User), Ok(()));
-        let node = Kind { plain: false, kept: None };
+        let node = Kind { plain: false, meta: (0o20644, 0, 0) };
         let node = Who { admin: true, setfcap: true, read_any: true, write_any: true, kind: node };
         assert_eq!(node.may_write(b"user.x", Space::User), Err(errno::EPERM));
         assert_eq!(node.may_read(Space::User), Err(errno::ENODATA));
@@ -360,7 +362,7 @@ mod tests {
             setfcap: true,
             read_any: true,
             write_any: true,
-            kind: Kind { plain: true, kept: None },
+            kind: Kind { plain: true, meta: (0o100644, 0, 0) },
         };
         set(&t, b"user.a", b"1", 0).unwrap();
         set(&t, b"trusted.b", b"22", CREATE).unwrap();

@@ -68,7 +68,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
     let fs = k.fs.as_ref().expect("filesystem configured");
-
+    k.may_exec(&path).map_err(err)?;
     let file = fs.read(&path).map_err(err)?;
     // A program only the VM can run, or an exec from a process with other
     // threads (which must end): replace this process with a fresh fwe.
@@ -180,7 +180,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         };
     }
 
-    let (pid, kqueues, shown) = {
+    let (pid, shown) = {
         let mut kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
@@ -224,12 +224,19 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         let e = fwe_kernel::host::last_error();
         // The child's pid: in the child, its own namespace's; in the
         // parent, as the parent sees it.
-        let shown = if pid == 0 { k.fork_child(token) } else { k.fork_parent(token, pid) };
+        let shown = if pid == 0 {
+            // The kqueues first, at their numbers, before anything the child
+            // starts (a reaper's thread) makes descriptors of its own.
+            fwe_kernel::restore_kqueues(&kqueues);
+            k.fork_child(token)
+        } else {
+            k.fork_parent(token, pid)
+        };
         // A child with memory of its own has none of what was to be wiped.
         if pid == 0 && share.is_empty() {
             fwe_kernel::mm::forked_child();
         }
-        (if pid < 0 { e } else { pid as i64 }, kqueues, shown)
+        (if pid < 0 { e } else { pid as i64 }, shown)
     };
     if pid < 0 {
         let e = pid;
@@ -258,7 +265,6 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             VFORK_DONE.store(-1, Ordering::SeqCst);
         }
         thread::init_main(shown);
-        fwe_kernel::restore_kqueues(&kqueues);
         LIVE_THREADS.store(1, Ordering::SeqCst);
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
             // Best effort, as for Linux's own write of the word.

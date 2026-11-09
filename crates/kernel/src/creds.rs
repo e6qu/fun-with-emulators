@@ -14,21 +14,89 @@
 
 use fwe_abi::{err, errno};
 
-/// Whether the process passes files' permission bits (`CAP_DAC_OVERRIDE`),
-/// as of its last system call ([`note_dac_override`]): for what fwe checks
-/// in the calls that run without the kernel (connecting to a Unix socket's
-/// file). Credentials change only in system calls.
-static DAC_OVERRIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Whether the process passes files' permission bits ([`DAC_OVERRIDE`]).
-pub fn dac_override() -> bool {
-    DAC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
+/// What a file permission check needs of a caller: its file-system ids
+/// and groups (initial-namespace ids), and whether it passes permission
+/// bits (`CAP_DAC_OVERRIDE`) or reads and searches anything
+/// (`CAP_DAC_READ_SEARCH`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Access {
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub groups: Vec<u32>,
+    pub dac_override: bool,
+    pub dac_read_search: bool,
 }
 
-/// Record whether the process passes files' permission bits, after a
-/// system call that may have changed it.
-pub fn note_dac_override(yes: bool) {
-    DAC_OVERRIDE.store(yes, std::sync::atomic::Ordering::Relaxed);
+impl Access {
+    /// The access `c` has.
+    pub fn of(c: &Creds) -> Access {
+        Access {
+            fsuid: c.fsuid,
+            fsgid: c.fsgid,
+            groups: c.groups().to_vec(),
+            dac_override: c.has(crate::caps::CAP_DAC_OVERRIDE),
+            dac_read_search: c.has(crate::caps::CAP_DAC_READ_SEARCH),
+        }
+    }
+
+    /// Whether it may do `want` (`R_OK`, `W_OK`, `X_OK` bits) to a file
+    /// whose guest metadata (owner and mode) is `st`, as Linux's
+    /// permission check has it: `CAP_DAC_OVERRIDE` passes all but running
+    /// a file nobody may run, `CAP_DAC_READ_SEARCH` reading and searching;
+    /// else the owner's, the group's or the others' bits.
+    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+    pub fn permits(&self, st: &libc::stat, want: u32) -> bool {
+        let dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        if self.dac_override {
+            return want & 1 == 0 || dir || st.st_mode & 0o111 != 0;
+        }
+        if self.dac_read_search && want & 2 == 0 && (want & 1 == 0 || dir) {
+            return true;
+        }
+        let shift = if self.fsuid == st.st_uid {
+            6
+        } else if self.fsgid == st.st_gid || self.groups.contains(&st.st_gid) {
+            3
+        } else {
+            0
+        };
+        (st.st_mode as u32 >> shift) & want == want
+    }
+
+    /// Whether it passes every directory's search bits.
+    pub fn searches_any(&self) -> bool {
+        self.dac_override || self.dac_read_search
+    }
+}
+
+/// The process's [`Access`], as of its last system call ([`publish`]): for
+/// what fwe checks outside the kernel (the path walk, a connect to a Unix
+/// socket's file). Credentials change only in system calls.
+static ACCESS: std::sync::RwLock<Option<Access>> = std::sync::RwLock::new(None);
+
+/// The process's [`Access`] (root's before any is published).
+pub fn access() -> Access {
+    ACCESS.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Access {
+        fsuid: 0,
+        fsgid: 0,
+        groups: Vec::new(),
+        dac_override: true,
+        dac_read_search: true,
+    })
+}
+
+/// Whether the process passes files' permission bits.
+pub fn dac_override() -> bool {
+    ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|a| a.dac_override)
+}
+
+/// Publish the access `c` gives, after a system call that may have
+/// changed it (written only when it did).
+pub fn publish(c: &Creds) {
+    let now = Access::of(c);
+    if ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref() != Some(&now) {
+        *ACCESS.write().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    }
 }
 
 /// `(uid_t)-1`: "leave unchanged" in the `setre*`/`setres*` calls.
@@ -340,6 +408,32 @@ impl Creds {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+    fn permission_bits_by_owner_group_and_others() {
+        // SAFETY: zeroed bytes are a valid `stat`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_mode = (libc::S_IFREG as u32 | 0o640) as libc::mode_t;
+        (st.st_uid, st.st_gid) = (1000, 100);
+        let who = |fsuid, fsgid, groups: Vec<u32>| Access {
+            fsuid,
+            fsgid,
+            groups,
+            dac_override: false,
+            dac_read_search: false,
+        };
+        assert!(who(1000, 1, vec![]).permits(&st, 6));
+        assert!(who(2, 100, vec![]).permits(&st, 4) && !who(2, 100, vec![]).permits(&st, 2));
+        assert!(who(2, 3, vec![100]).permits(&st, 4));
+        assert!(!who(2, 3, vec![]).permits(&st, 4));
+        // The capabilities: all but running what nobody may run; reading.
+        let root = Access { dac_override: true, ..who(0, 0, vec![]) };
+        assert!(root.permits(&st, 6) && !root.permits(&st, 1));
+        let reader = Access { dac_read_search: true, ..who(2, 3, vec![]) };
+        assert!(reader.permits(&st, 4) && !reader.permits(&st, 2));
+    }
+
     use super::*;
     use fwe_abi::errno;
 

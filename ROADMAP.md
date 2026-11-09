@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 992 of 1550 (82% of the 1211 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 1060 of 1550 (88% of the 1207 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -110,7 +110,11 @@ capabilities. *crun, podman and containerd run standard images.*
   abstract names freed with their socket, and the interface requests;
 - memory calls as Linux has them: `mremap` grows and moves mappings,
   `madvise` and `msync` checked per mapping, `MADV_WIPEONFORK`,
-  `MADV_HWPOISON`, stacks that grow down, and shared `/dev/zero`.
+  `MADV_HWPOISON`, stacks that grow down, and shared `/dev/zero`;
+- ownership for a guest that is not root: owners kept and shown by `stat`,
+  `chown` and creation as Linux has them, and Linux's permission checks
+  (opening, directories' entries and search bits, the sticky bit, `chmod`,
+  `utimensat`, extended attributes, `execve`).
 
 ## Left to 1.0
 
@@ -134,9 +138,6 @@ run.
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).
-- [ ] **Ownership for non-root:** `chown` recorded and shown by `stat`,
-  and permission checks for a guest that is not root (the `chown`,
-  `fchown`, `lchown`, `creat` and `mkdir` failures).
 - [ ] **Every other failure LTP points at**, among them:
   - `EPOLLEXCLUSIVE`;
   - `eventfd` across processes;

@@ -19,3 +19,6 @@ sigwaitinfo01 musl's sigwaitinfo retries a wait the kernel ends with EINTR, so t
 remap_file_pages01 musl's SHMLBA is 4096; with fwe's 16 KiB pages the test's granule (SHMLBA / page size) is 0 and it maps nothing, as on a Linux kernel with 16 KiB pages
 recvmmsg01 musl's recvmmsg clears the padding of each message header before the call, so its bad-vector case faults in the C library
 mremap06 it moves SHMLBA-sized pieces; musl's SHMLBA is 4096, so with fwe's 16 KiB pages its addresses are unaligned (EINVAL), as on a Linux kernel with 16 KiB pages
+readlink03 musl's readlink passes a one-byte buffer of its own for a size of 0, so the kernel never sees the size the test expects EINVAL for
+readlinkat02 musl's readlinkat passes a one-byte buffer of its own for a size of 0, so the kernel never sees the size the test expects EINVAL for
+pathconf02 musl's pathconf answers from a table without asking the kernel about the path, so its error cases succeed

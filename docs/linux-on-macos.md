@@ -1667,7 +1667,8 @@ guest's identity virtual:
 |---|---|---|
 | real/effective/saved/fs uids and gids, groups | the host process's, changeable only by root | virtual (`crates/kernel/src/creds.rs`), default root (0), Linux's `set*id` rules |
 | capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start |
-| `chown` | changes the owner | accepted for a privileged caller, not applied to the host file |
+| `chown` | changes the owner | kept in an attribute (`org.fwe.owner`, `crates/kernel/src/owners.rs`) under Linux's rules, and shown by `stat`; the host file stays fwe's user's |
+| permission bits for a caller that is not root | the host's, for the host user | fwe's check by the guest's owner, mode and file-system ids, and each directory's search bit along a path (in a root filesystem) |
 | file capabilities, set-ID programs | set-ID bits | none: `execve` follows Linux's rules for a file with neither |
 
 How host users and file owners look to the guest is under
@@ -2105,7 +2106,7 @@ processes do, since fwe raises inotify events itself:
 | a host process writes a file the guest mapped privately | native: a host private mapping; VM: a copy taken when mapped | native: as the host shows it; VM: never |
 | a host process holds a POSIX record lock or an OFD lock | guest locks are host locks | the conflict |
 | a file owned by another host user | owner translated | owner 65534 |
-| a file fwe's user owns | owner translated | owner 0 (root) |
+| a file fwe's user owns | owner translated | owner 0 (root), or the owner the guest gave it |
 | the host's own extended attributes (`com.apple.*`) | not listed | only Linux's namespaces |
 | a guest's working directory renamed by another process | fwe keeps the path ([limitations](architecture.md#known-limitations)) | the old path |
 

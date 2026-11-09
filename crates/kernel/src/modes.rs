@@ -55,7 +55,14 @@ pub fn guest_perm_fd(fd: i32, st: &libc::stat) -> u32 {
     if !marked(st) {
         return host;
     }
-    read_fd(fd).unwrap_or(host)
+    // By its path where the descriptor reads no attribute (one opened only
+    // to search a directory).
+    read_fd(fd)
+        .or_else(|| {
+            let p = std::ffi::CString::new(crate::fs::fd_path(fd)?).ok()?;
+            read_path(&p)
+        })
+        .unwrap_or(host)
 }
 
 /// [`guest_perm_fd`] for `name` in directory `dir`.
@@ -189,8 +196,12 @@ fn mark_fd(fd: i32, st: &libc::stat, perm: Option<u32>) -> Result<(), i32> {
                 }
             }
             // The flag is fwe's only where the attribute is: one a user
-            // set on a file of their own stays.
-            None if marked(st) && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0 => {
+            // set on a file of their own stays, and so does one a kept
+            // owner needs.
+            None if marked(st)
+                && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0
+                && !crate::owners::kept_fd(fd) =>
+            {
                 libc::fchflags(fd, st.st_flags & !MARK);
             }
             None => {}
@@ -220,7 +231,8 @@ fn mark_path(path: &CStr, st: &libc::stat, perm: Option<u32>) -> Result<(), i32>
                 }
             }
             None if marked(st)
-                && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0 =>
+                && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0
+                && !crate::owners::kept_path(path) =>
             {
                 libc::lchflags(path.as_ptr(), st.st_flags & !MARK);
             }
@@ -228,6 +240,33 @@ fn mark_path(path: &CStr, st: &libc::stat, perm: Option<u32>) -> Result<(), i32>
         }
     }
     Ok(())
+}
+
+/// Whether the file open as `fd` has a mode kept.
+pub fn kept_fd(fd: i32) -> bool {
+    read_fd(fd).is_some()
+}
+
+/// Whether the file at `path` (not followed) has a mode kept.
+pub fn kept_path(path: &CStr) -> bool {
+    read_path(path).is_some()
+}
+
+/// Set (`on`) or clear the flag that marks kept metadata on the file open
+/// as `fd`, whose metadata was `st` (for [`crate::owners`]).
+#[cfg(target_os = "macos")]
+pub fn set_mark_fd(fd: i32, st: &libc::stat, on: bool) {
+    let flags = if on { st.st_flags | MARK } else { st.st_flags & !MARK };
+    // SAFETY: plain host call on an open descriptor.
+    unsafe { libc::fchflags(fd, flags) };
+}
+
+/// [`set_mark_fd`] by path, the link itself.
+#[cfg(target_os = "macos")]
+pub fn set_mark_path(path: &CStr, st: &libc::stat, on: bool) {
+    let flags = if on { st.st_flags | MARK } else { st.st_flags & !MARK };
+    // SAFETY: a NUL-terminated path.
+    unsafe { libc::lchflags(path.as_ptr(), flags) };
 }
 
 // Linux hosts run only the kernel's unit tests: the host's own mode is the
