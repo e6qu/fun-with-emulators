@@ -598,6 +598,7 @@ impl<P: Platform> Kernel<P> {
 /// A `pidfd_getfd` of another process's descriptor, to finish without the
 /// kernel lock ([`getfd`]).
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct GetFd {
     host: i32,
     fd: i32,

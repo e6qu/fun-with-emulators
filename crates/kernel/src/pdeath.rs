@@ -103,6 +103,7 @@ fn watch(parent: i32) {
 fn watch(_: i32) {}
 
 /// Send `sig` (a Linux signal) to this process, as the parent's end does.
+#[cfg(target_os = "macos")]
 fn deliver(sig: u64) {
     if sig == 0 {
         return;
