@@ -3115,8 +3115,12 @@ mod tests {
         assert_eq!(&b, b"kept");
     }
 
+    /// A new unnamed file in the host's temporary directory: a name of its
+    /// own each time, as tests run at once.
     fn tempfile_in_tmp() -> std::fs::File {
-        let path = std::env::temp_dir().join(format!("fwe-fadvise-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("fwe-test-{}-{n}", std::process::id()));
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
