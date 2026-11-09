@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 943 of 1550 (78% of the 1213 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 952 of 1550 (79% of the 1211 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -98,7 +98,10 @@ capabilities. *crun, podman and containerd run standard images.*
   `futex_waitv` and `remap_file_pages`;
 - process descriptors: `pidfd_open`, `CLONE_PIDFD`, `pidfd_send_signal`,
   `pidfd_getfd`, `waitid(P_PIDFD)`, `PIDFD_GET_INFO` and the namespace
-  requests, and `setns` with one.
+  requests, and `setns` with one;
+- sleeps and timeouts on time (a precise host timer per thread), `poll`
+  and `select` events as Linux reports them, timerfd's checks and flags,
+  and shared futexes requeued.
 
 ## Left to 1.0
 

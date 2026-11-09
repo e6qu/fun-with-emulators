@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 struct Waiter {
     bits: u32,
     woken: AtomicBool,
+    /// Its thread's wake pipe, written as it is woken, to end a wait close
+    /// to its deadline at once ([`crate::thread::nap_ns`]); -1 for none.
+    poke: i32,
 }
 
 /// The private futexes' wait queues, keyed by the guest address of the
@@ -239,7 +242,11 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
             continue;
         }
         let _ = (private, val);
-        let me = Arc::new(Waiter { bits: u32::MAX, woken: AtomicBool::new(false) });
+        let me = Arc::new(Waiter {
+            bits: u32::MAX,
+            woken: AtomicBool::new(false),
+            poke: crate::thread::poke_fd(),
+        });
         queues.entry(key(uaddr)).or_default().push_back(me.clone());
         held.push(Held::Queued(me));
     }
@@ -265,6 +272,12 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
             Some(d) => (d - now).min(slice_most),
             None => slice_most,
         };
+        if let Some(step) = deadline.and_then(|d| near(d, now)) {
+            drop(queues);
+            precise_sleep(step);
+            queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
         queues = table.cv.wait_timeout(queues, slice).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
@@ -366,7 +379,8 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
         Ok(_) => return err(errno::EAGAIN),
         Err(e) => return err(e),
     }
-    let me = Arc::new(Waiter { bits, woken: AtomicBool::new(false) });
+    let me =
+        Arc::new(Waiter { bits, woken: AtomicBool::new(false), poke: crate::thread::poke_fd() });
     queues.entry(key(uaddr)).or_default().push_back(me.clone());
     loop {
         if me.woken.load(Ordering::SeqCst) {
@@ -401,8 +415,29 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
             Some(d) => (d - now).min(SIGNAL_CHECK),
             None => SIGNAL_CHECK,
         };
+        if let Some(d) = deadline.filter(|&d| near(d, now).is_some() && me.poke >= 0) {
+            // Close to the deadline: on time, a wake ending it at once.
+            drop(queues);
+            crate::thread::nap_ns(d.saturating_duration_since(now).as_nanos() as i64);
+            queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
         queues = table.cv.wait_timeout(queues, slice).unwrap_or_else(|e| e.into_inner()).0;
     }
+}
+
+/// How long to sleep on time before looking again, when deadline `d` is
+/// close enough (from `now`) that the host's usual waits, which can end a
+/// millisecond or more late, would miss it as Linux would not.
+pub(crate) fn near(d: Instant, now: Instant) -> Option<Duration> {
+    let left = d.saturating_duration_since(now);
+    (left <= SIGNAL_CHECK).then(|| left.min(Duration::from_millis(1)))
+}
+
+/// Sleep for `d` on time ([`crate::thread::wait_ready_ns`]); a signal
+/// ends it early, for the caller to see.
+pub(crate) fn precise_sleep(d: Duration) {
+    let _ = crate::thread::wait_ready_ns(&mut [], d.as_nanos().min(i64::MAX as u128) as i64);
 }
 
 type Queues = HashMap<u64, VecDeque<Arc<Waiter>>>;
@@ -454,10 +489,17 @@ pub fn forked_child() {
     table().queues.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
-/// Mark `woken` woken and let them see it.
+/// Mark `woken` woken and let them see it. Called with the queues locked:
+/// a woken waiter cannot have left (nor its thread ended) meanwhile, so its
+/// wake pipe is still its own.
 fn wake_all_of(table: &Table, woken: &[Arc<Waiter>]) {
     for w in woken {
         w.woken.store(true, Ordering::SeqCst);
+        if w.poke >= 0 {
+            // SAFETY: one byte to the waiting thread's own non-blocking
+            // pipe; a full pipe is woken already.
+            unsafe { libc::write(w.poke, b"f".as_ptr().cast(), 1) };
+        }
     }
     if !woken.is_empty() {
         table.cv.notify_all();

@@ -41,6 +41,7 @@ clock_getres01
 clock_gettime01
 clock_gettime02
 clock_gettime04
+clock_nanosleep01
 clock_nanosleep04
 clone01
 clone02
@@ -267,6 +268,7 @@ ftruncate01
 ftruncate01_64
 ftruncate03
 ftruncate03_64
+futex_cmp_requeue01
 futex_cmp_requeue02
 futex_cmp_requeue03
 futex_wait_bitset01
@@ -586,9 +588,11 @@ pipeio_7
 pipeio_8
 pivot_root01
 poll01
+poll03
 poll04
 posix_fadvise01
 posix_fadvise01_64
+ppoll01
 prctl01
 prctl02
 prctl03
@@ -866,6 +870,11 @@ tgkill01
 tgkill02
 tgkill03
 time01
+timerfd01
+timerfd02
+timerfd_create01
+timerfd_gettime01
+timerfd_settime01
 timerfd_settime02
 times01
 tkill01
