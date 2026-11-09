@@ -596,6 +596,51 @@ impl Fs {
 
     /// A synthetic `/proc` or `/sys` entry for `path`, if it names one. Only
     /// absolute paths and `AT_FDCWD`-relative paths are considered.
+    /// As [`synthetic`](Self::synthetic), following a symbolic link of the
+    /// host's that `path` ends in (`/etc/mtab` to `/proc/self/mounts`, say):
+    /// what the link leads to, if that is fwe's.
+    pub fn synthetic_followed(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
+        if let Some(e) = self.synthetic(dirfd, path) {
+            return Some(e);
+        }
+        self.synthetic(fcntl::AT_FDCWD as i32, &self.synthetic_target(dirfd, path)?)
+    }
+
+    /// The path in fwe's `/proc` or `/sys` that the host's symbolic link
+    /// `path` ends in leads to (through further links of the host's), if
+    /// it leads there.
+    pub fn synthetic_target(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
+        let mut at = self.absolute(dirfd, path)?;
+        for _ in 0..40 {
+            let r = self.resolve(fcntl::AT_FDCWD as i32, &at, false).ok()?;
+            let name = std::ffi::CString::new(r.name.clone()).ok()?;
+            let mut target = vec![0u8; crate::uaccess::PATH_MAX];
+            // SAFETY: a NUL-terminated name in an open directory, and a
+            // buffer of its length; not a link, it fails (EINVAL).
+            let n = unsafe {
+                libc::readlinkat(
+                    r.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    target.as_mut_ptr().cast(),
+                    target.len(),
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            target.truncate(n as usize);
+            at = if target.starts_with(b"/") {
+                target
+            } else {
+                mounts::join(&normalize(&at, b".."), &target)
+            };
+            if self.synthetic(fcntl::AT_FDCWD as i32, &at).is_some() {
+                return Some(at);
+            }
+        }
+        None
+    }
+
     pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
         if path.is_empty() {
             // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).

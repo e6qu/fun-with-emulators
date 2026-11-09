@@ -319,10 +319,20 @@ pub mod nr {
     pub const LSM_GET_SELF_ATTR: u64 = 459;
     pub const LSM_SET_SELF_ATTR: u64 = 460;
     pub const LSM_LIST_MODULES: u64 = 461;
+    pub const MSEAL: u64 = 462;
+    pub const SETXATTRAT: u64 = 463;
+    pub const GETXATTRAT: u64 = 464;
+    pub const LISTXATTRAT: u64 = 465;
+    pub const REMOVEXATTRAT: u64 = 466;
+    pub const OPEN_TREE_ATTR: u64 = 467;
+    pub const FILE_GETATTR: u64 = 468;
+    pub const FILE_SETATTR: u64 = 469;
+    pub const LISTNS: u64 = 470;
+    pub const RSEQ_SLICE_YIELD: u64 = 471;
 }
 
 /// One past the highest system call number in the table.
-pub const SYSCALL_COUNT: u64 = 462;
+pub const SYSCALL_COUNT: u64 = 472;
 
 /// Name of a Linux arm64 system call, if known.
 pub fn syscall_name(nr: u64) -> Option<&'static str> {
@@ -644,6 +654,16 @@ pub fn syscall_name(nr: u64) -> Option<&'static str> {
         459 => "lsm_get_self_attr",
         460 => "lsm_set_self_attr",
         461 => "lsm_list_modules",
+        462 => "mseal",
+        463 => "setxattrat",
+        464 => "getxattrat",
+        465 => "listxattrat",
+        466 => "removexattrat",
+        467 => "open_tree_attr",
+        468 => "file_getattr",
+        469 => "file_setattr",
+        470 => "listns",
+        471 => "rseq_slice_yield",
         _ => return None,
     })
 }
@@ -781,7 +801,10 @@ pub mod errno {
     pub const ENOTRECOVERABLE: i32 = 131;
     pub const ERFKILL: i32 = 132;
     pub const EHWPOISON: i32 = 133;
+    pub const EFTYPE: i32 = 134;
     pub const EDEADLOCK: i32 = 35;
+    pub const EFSBADCRC: i32 = 74;
+    pub const EFSCORRUPTED: i32 = 117;
     pub const EWOULDBLOCK: i32 = 11;
 }
 
@@ -919,6 +942,7 @@ pub fn errno_name(errno: i32) -> Option<&'static str> {
         131 => "ENOTRECOVERABLE",
         132 => "ERFKILL",
         133 => "EHWPOISON",
+        134 => "EFTYPE",
         _ => return None,
     })
 }

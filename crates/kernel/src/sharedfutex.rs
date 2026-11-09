@@ -318,6 +318,24 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
     }
 }
 
+/// `futex_waitv`'s wait on the shared futex at guest `uaddr` (its word
+/// read first): the slot it waits in, or `None` where the word's memory
+/// has no shared identity (a private futex's queue then takes it).
+pub fn enter(uaddr: u64) -> Option<Result<usize, i32>> {
+    let (t, key) = (table()?, key_of(host_of(uaddr))?);
+    Some(take_slot(t, key, u32::MAX).map(|(i, _)| i).ok_or(errno::ENOMEM))
+}
+
+/// Whether slot `i` ([`enter`]) has been woken.
+pub fn woken(i: usize) -> bool {
+    table().is_some_and(|t| st(t[i].state.load(SeqCst)) == WOKEN)
+}
+
+/// Leave slot `i` ([`enter`]): whether it was woken meanwhile.
+pub fn leave(i: usize) -> bool {
+    table().is_some_and(|t| give_back(&t[i]).is_err())
+}
+
 /// Wake up to `count` waiters of the futex at guest `uaddr` waiting for
 /// any of `bits`, oldest first: the number woken.
 pub fn wake(uaddr: u64, count: u32, bits: u32) -> i64 {

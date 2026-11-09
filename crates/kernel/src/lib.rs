@@ -50,6 +50,7 @@ pub mod netns;
 pub mod ns;
 pub mod nsfd;
 pub mod nsops;
+mod openat2;
 pub mod overlay;
 pub mod pidns;
 pub mod procfs;
@@ -1226,9 +1227,21 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
         return None;
     }
+    if nr == n::OPENAT2 {
+        // Likewise, for a path walked as `openat` walks it (its `how`
+        // checked by the locked call).
+        if let Ok([flags, _, 0]) = uaccess::read::<[u64; 3]>(a[2])
+            && let Err(e) = fs::open_fifo_unlocked(a[0] as i32, a[1], flags)
+        {
+            return Some(fwe_abi::err(e));
+        }
+        return None;
+    }
     Some(match nr {
         // SAFETY: caller guarantees the futex word and timeout are valid.
         n::FUTEX => unsafe { futex::op_full(a[0], a[1], a[2] as u32, a[3], a[4], a[5] as u32) },
+        // SAFETY: the guest pointers are checked as they are read.
+        n::FUTEX_WAITV => unsafe { futex::waitv(a[0], a[1], a[2], a[3], a[4]) },
         // On macOS `nanosleep` reads and writes its arguments in the C
         // library, unchecked, so it goes through `clock_nanosleep`'s copies.
         // SAFETY: the arguments are checked guest pointers.
@@ -1240,6 +1253,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         // SAFETY: caller guarantees the events and sigmask pointers are valid.
         n::EPOLL_PWAIT => unsafe {
             signal::with_call_mask(a[4], || epoll::pwait(a[0], a[1], a[2], a[3], 0, 0))
+        },
+        // SAFETY: as for `epoll_pwait`; the timeout is a checked pointer.
+        n::EPOLL_PWAIT2 => unsafe {
+            signal::with_call_mask(a[4], || epoll::pwait2(a[0], a[1], a[2], a[3]))
         },
         // read/write on an eventfd/timerfd/signalfd can block and must not hold
         // the kernel lock; `try_*` returns None for any other descriptor, so a

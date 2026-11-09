@@ -195,6 +195,30 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     Ok(out)
 }
 
+/// What a path names, as a walk sees it ([`Kernel::link_kind`]).
+pub(crate) enum LinkKind {
+    /// Not a link (or nothing there yet, with the error).
+    None,
+    /// A symbolic link, and its target.
+    Symlink(Vec<u8>),
+    /// One of `/proc`'s links to an open file or a place (`exe`, `cwd`,
+    /// `root`, `fd/<n>`, `ns/<kind>`, `map_files/...`).
+    Magic,
+}
+
+/// Whether `/proc` path `abs`, a link there, is one of its magic links.
+fn magic_link(abs: &[u8]) -> bool {
+    let Some(rest) = abs.strip_prefix(b"/proc/") else { return false };
+    let (parent, name) = match rest.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => return false,
+    };
+    matches!(name, b"exe" | b"cwd" | b"root")
+        || parent.ends_with(b"/fd")
+        || parent.ends_with(b"/ns")
+        || parent.ends_with(b"/map_files")
+}
+
 /// The access (`R_OK`, `W_OK` bits) an `open` with Linux `flags` asks of
 /// an existing file.
 fn open_wants(flags: u64) -> u32 {
@@ -222,6 +246,11 @@ impl<P: Platform> Kernel<P> {
                 return err(e);
             }
         };
+        self.open_with(dirfd, path, flags, mode)
+    }
+
+    /// `openat` of guest path `path` (`openat2`'s too, once walked).
+    pub(crate) fn open_with(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         let r = self.open_path(dirfd, path, flags, mode);
         crate::fs::drop_fifo();
         // An `O_PATH` descriptor, whatever kind of file it names (one of
@@ -250,8 +279,21 @@ impl<P: Platform> Kernel<P> {
         self.open_ns(name, &dirs, link, flags)
     }
 
-    /// `openat` of `path`, read from the guest.
+    /// `openat` of `path`, read from the guest. A symbolic link of the
+    /// host's to a file of fwe's `/proc` or `/sys` (`/etc/mtab`), which the
+    /// host cannot open, is opened as that file.
     pub(crate) fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
+        let r = self.open_path_once(dirfd, path.clone(), flags, mode);
+        if (r == err(errno::ENOENT) || r == err(errno::ELOOP))
+            && flags & fcntl::O_NOFOLLOW == 0
+            && let Some(to) = self.fs().synthetic_target(dirfd as i32, &path)
+        {
+            return self.open_path_once(fcntl::AT_FDCWD as u64, to, flags, mode);
+        }
+        r
+    }
+
+    fn open_path_once(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         // Pseudo-terminal devices are synthesized, not served from the rootfs.
         if path == b"/dev/ptmx" {
             return crate::pty::open_master(flags);
@@ -939,6 +981,20 @@ impl<P: Platform> Kernel<P> {
     /// node of fwe's as the device, or the host file. `depth` counts the
     /// links followed.
     fn linux_stat(&self, dirfd: i32, path: &[u8], follow: bool, depth: u32) -> Result<Stat, i32> {
+        match self.stat_once(dirfd, path, follow, depth) {
+            // A link of the host's to a file of fwe's, which the host cannot
+            // follow: that file.
+            Err(errno::ENOENT | errno::ELOOP) if follow && depth < 40 => {
+                match self.fs().synthetic_target(dirfd, path) {
+                    Some(to) => self.stat_once(fcntl::AT_FDCWD as i32, &to, true, depth + 1),
+                    None => self.stat_once(dirfd, path, follow, depth),
+                }
+            }
+            r => r,
+        }
+    }
+
+    fn stat_once(&self, dirfd: i32, path: &[u8], follow: bool, depth: u32) -> Result<Stat, i32> {
         use crate::procfs::Entry;
         use fwe_abi::stat as st;
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
@@ -1148,6 +1204,43 @@ impl<P: Platform> Kernel<P> {
             fs.to_ns(&fs.absolute_path(dirfd, path)?)
         };
         Some(table.locate(&ns).0.clone())
+    }
+
+    /// What absolute path `abs` names, as a walk sees it: a link and its
+    /// target, or no link (`ENOENT` if nothing is there).
+    pub(crate) fn link_kind(&self, abs: &[u8]) -> Result<LinkKind, i32> {
+        use crate::procfs::Entry;
+        let cwd = fcntl::AT_FDCWD as i32;
+        if let Some(e) = self.fs().synthetic(cwd, abs) {
+            return match e {
+                Entry::Symlink(_) if magic_link(abs) => Ok(LinkKind::Magic),
+                Entry::Symlink(t) => Ok(LinkKind::Symlink(t)),
+                Entry::Fd { .. } => Ok(LinkKind::Magic),
+                Entry::Missing => Err(errno::ENOENT),
+                Entry::File(_) | Entry::Dir => Ok(LinkKind::None),
+            };
+        }
+        let st = self.linux_stat(cwd, abs, false, 0)?;
+        if st.st_mode & fwe_abi::stat::S_IFMT != fwe_abi::stat::S_IFLNK {
+            return Ok(LinkKind::None);
+        }
+        let (dir, name) = self.resolve_c(cwd as u64, abs, false)?;
+        let mut target = vec![0u8; uaccess::PATH_MAX];
+        // SAFETY: a NUL-terminated name in an open directory, and a buffer
+        // of its length.
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if n < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        target.truncate(n as usize);
+        Ok(LinkKind::Symlink(target))
     }
 
     pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {

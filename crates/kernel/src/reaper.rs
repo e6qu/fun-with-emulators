@@ -943,7 +943,7 @@ static EXIT_SIGNALS: [(std::sync::atomic::AtomicI32, std::sync::atomic::AtomicU6
 /// Child `child` (host pid) was made with exit signal `sig`.
 pub fn set_exit_signal(child: i32, sig: u64) {
     use std::sync::atomic::Ordering::SeqCst;
-    if sig == fwe_abi::signal::SIGCHLD {
+    if sig == fwe_abi::signal::SIGCHLD || exit_signal(child).is_some() {
         return;
     }
     for (pid, s) in &EXIT_SIGNALS {

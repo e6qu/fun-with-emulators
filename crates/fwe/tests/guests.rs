@@ -1410,7 +1410,11 @@ fn alpine_podman_runs_an_image() {
         cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
         cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
-        eprintln!("--- podman {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        eprintln!(
+            "--- podman {args:?} ({}) stderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         // A `run` ends with its container's status; one killed hung.
         if !out.status.success() && (args[0] != "run" || out.status.code().is_none()) {
             print_last_calls(&trace);
@@ -2908,6 +2912,30 @@ fn hv_process_signals_and_ends() {
     let Some(out) = fwe_hv(&rust_low_guest("procsig"), &[]) else { return };
     let expected = PROCSIG.replace("{shared}", "refused");
     assert_eq!(stdout(&out), expected, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `calls2` guest prints.
+const CALLS2: &str = "openat2: plain true, beneath ../ true, no symlinks true, in root true\n\
+    epoll_pwait2: none 0 after the timeout true, then 1 with 7\n\
+    mseal: 0, munmap refused true, mprotect refused true\n\
+    futex_waitv: woken on 1\n\
+    remap_file_pages: 0, first page showed 0, now 3\n";
+
+/// Newer calls: `openat2`'s resolve rules, `epoll_pwait2`, `mseal`,
+/// `futex_waitv` and `remap_file_pages`.
+#[test]
+fn newer_calls() {
+    let out = fwe(&rust_guest("calls2"), &[]);
+    assert_eq!(stdout(&out), CALLS2, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The same in the VM (see [`newer_calls`]).
+#[test]
+fn hv_newer_calls() {
+    let Some(out) = fwe_hv(&rust_low_guest("calls2"), &[]) else { return };
+    assert_eq!(stdout(&out), CALLS2, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

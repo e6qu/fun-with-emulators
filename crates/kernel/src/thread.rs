@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 /// The process (thread-group) id, shared by all threads. Set once at startup.
 static TGID: AtomicI32 = AtomicI32::new(0);
 /// Next thread id to hand out. Thread ids are unique within the process.
-static NEXT_TID: AtomicI32 = AtomicI32::new(0);
+static NEXT_TID: AtomicI32 = AtomicI32::new(TID_FIRST);
 
 thread_local! {
     static TID: Cell<i32> = const { Cell::new(0) };
@@ -61,7 +61,9 @@ pub fn set_pdeathsig(sig: u64) {
 /// ([`forked`]).
 pub fn init_main(pid: i32) {
     TGID.store(pid, Ordering::SeqCst);
-    NEXT_TID.store(pid + 1, Ordering::SeqCst);
+    // Without the shared counter: numbers past every host pid, this
+    // process's own.
+    NEXT_TID.store(TID_FIRST + (pid % 40) * 100_000, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
     // An end status left by an earlier process of this number.
     // SAFETY: getpid cannot fail.
@@ -278,8 +280,44 @@ pub fn tgid() -> i32 {
     TGID.load(Ordering::SeqCst)
 }
 
+/// The first thread id outside a pid namespace of fwe's: above every
+/// host pid (macOS's end at 99999), so a thread's number never names
+/// another process, and below Linux's largest `pid_max`, where the
+/// numbers wrap.
+const TID_FIRST: i32 = 100_000;
+const TID_END: i32 = 4_194_304;
+
+/// A thread id outside a pid namespace of fwe's: the next of a counter
+/// every fwe process shares (a file beside the process records, taken in
+/// turn with `flock`), so no two live threads have the same one.
+fn shared_tid() -> Option<i32> {
+    let dir = crate::procreg::records_dir()?;
+    let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
+    // SAFETY: a NUL-terminated path in fwe's private directory; a 4-byte
+    // buffer; the descriptor is closed below.
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+        if fd < 0 {
+            return None;
+        }
+        libc::flock(fd, libc::LOCK_EX);
+        let mut b = [0u8; 4];
+        let n = match libc::pread(fd, b.as_mut_ptr().cast(), 4, 0) {
+            4 => i32::from_ne_bytes(b),
+            _ => TID_FIRST,
+        };
+        let n = if (TID_FIRST..TID_END).contains(&n) { n } else { TID_FIRST };
+        let next = if n + 1 >= TID_END { TID_FIRST } else { n + 1 };
+        libc::pwrite(fd, next.to_ne_bytes().as_ptr().cast(), 4, 0);
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+        Some(n)
+    }
+}
+
 /// Allocate a fresh thread id for a new thread: in a pid namespace of
-/// fwe's, a number from it (threads and processes share the numbers).
+/// fwe's, a number from it (threads and processes share the numbers);
+/// outside one, a number no host process has ([`shared_tid`]).
 pub fn alloc_tid() -> i32 {
     if crate::pidns::nested() {
         // SAFETY: getpid cannot fail.
@@ -289,7 +327,7 @@ pub fn alloc_tid() -> i32 {
             return nums[0];
         }
     }
-    NEXT_TID.fetch_add(1, Ordering::SeqCst)
+    shared_tid().unwrap_or_else(|| NEXT_TID.fetch_add(1, Ordering::SeqCst))
 }
 
 /// Record this host thread's guest thread id (called when a thread starts).
@@ -724,6 +762,16 @@ pub fn set_altstack(stack: Stack) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread's number is no host process's (macOS's pids end at
+    /// 99999), and no two are given out alike.
+    #[test]
+    fn thread_ids_never_name_a_host_process() {
+        let (a, b) = (alloc_tid(), alloc_tid());
+        assert!((TID_FIRST..TID_END).contains(&a), "{a}");
+        assert!((TID_FIRST..TID_END).contains(&b), "{b}");
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn pending_is_per_thread_and_carries_info() {

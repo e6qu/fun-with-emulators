@@ -467,9 +467,10 @@ generally built and from fwe's mechanisms, not observed:
 
 ### Wine
 
-Not tested by fwe. This is an analysis of how Wine for Linux would meet
-fwe's mechanisms, from how Wine is generally built, not a claim that it
-works.
+Not tested by fwe yet (it is on the
+[roadmap](../ROADMAP.md#m4--compatibility)). This is an analysis of how
+Wine for Linux would meet fwe's mechanisms, from how Wine is generally
+built, not a claim that it works.
 
 - **Which Wine:** fwe runs only arm64 Linux code, so it would have to be
   an arm64 build of Wine, which runs Windows programs built for ARM64.
@@ -1701,12 +1702,11 @@ noted under `--strace`):
 - pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`);
 - POSIX timers (`timer_create` and the rest);
 - `io_uring`, the AIO calls, `userfaultfd`, `perf_event_open`, `fanotify`,
-  `kcmp`, `landlock`, `rseq`, `futex_waitv`,
+  `kcmp`, `landlock`, `rseq`,
   `name_to_handle_at`/`open_by_handle_at`;
-- `epoll_pwait2`, `sendmmsg`/`recvmmsg`, `times`,
-  `ioprio_get`/`ioprio_set`, the `pkey_*` calls, `process_madvise`,
-  `process_mrelease`, `memfd_secret`, `cachestat`, `map_shadow_stack`,
-  `remap_file_pages`, the `lsm_*` calls;
+- `sendmmsg`/`recvmmsg`, `times`, `ioprio_get`/`ioprio_set`, the `pkey_*`
+  calls, `process_madvise`, `process_mrelease`, `memfd_secret`,
+  `cachestat`, `map_shadow_stack`, the `lsm_*` calls;
 - `sync`, `syncfs`;
 - loading kernel modules (`delete_module` finds none), `kexec`, `reboot`,
   swap, quotas, NUMA policy, `acct`.

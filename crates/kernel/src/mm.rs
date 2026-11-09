@@ -899,6 +899,10 @@ impl<P: Platform> Kernel<P> {
         if noexec && prot & mman::PROT_EXEC != 0 {
             return err(errno::EPERM);
         }
+        // Not over a sealed mapping.
+        if flags & mman::MAP_FIXED != 0 && self.sealed(addr, len) {
+            return err(errno::EPERM);
+        }
         // A loop device maps the file it shows.
         let source = if flags & mman::MAP_ANONYMOUS == 0 {
             crate::loopdev::map_source(fd as i32, self.page_size)
@@ -946,7 +950,98 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    /// Whether `[addr, addr + len)` (page-aligned `addr`) has a sealed
+    /// mapping (`mseal`), which most changes may not touch (`EPERM`).
+    fn sealed(&self, addr: u64, len: u64) -> bool {
+        addr & (self.page_size - 1) == 0
+            && crate::maps::record().any_sealed(addr, addr.saturating_add(self.page_up(len)))
+    }
+
+    /// `mseal(addr, len, flags)`: seal the mappings of the range, every
+    /// page of which must be mapped.
+    pub(crate) fn sys_mseal(&mut self, addr: u64, len: u64, flags: u64) -> i64 {
+        if flags != 0 || addr & (self.page_size - 1) != 0 {
+            return err(errno::EINVAL);
+        }
+        // A length that rounds past the end of the address space.
+        if len.checked_add(self.page_size - 1).is_none() {
+            return err(errno::EINVAL);
+        }
+        let len = self.page_up(len);
+        if len == 0 {
+            return 0;
+        }
+        let Some(end) = addr.checked_add(len) else { return err(errno::EINVAL) };
+        let r = crate::maps::record().seal(addr, end);
+        match r {
+            Ok(()) => {
+                crate::maps::publish();
+                0
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    /// `remap_file_pages(start, size, prot, pgoff, flags)`, as Linux does it
+    /// since it stopped keeping non-linear mappings: the range of a shared
+    /// file mapping mapped afresh at page `pgoff` of its file.
+    pub(crate) fn sys_remap_file_pages(
+        &mut self,
+        start: u64,
+        size: u64,
+        prot: u64,
+        pgoff: u64,
+        flags: u64,
+    ) -> i64 {
+        let mask = !(self.page_size - 1);
+        let (start, size) = (start & mask, size & mask);
+        if prot != 0 || flags & !mman::MAP_NONBLOCK != 0 {
+            return err(errno::EINVAL);
+        }
+        let (Some(end), Some(offset)) =
+            (start.checked_add(size), pgoff.checked_mul(self.page_size))
+        else {
+            return err(errno::EINVAL);
+        };
+        if end <= start {
+            return err(errno::EINVAL);
+        }
+        // One shared mapping of a file, the whole range in it.
+        let areas = crate::maps::record().areas_in(start, end);
+        let area = match &areas[..] {
+            [p] if p.start <= start && p.end >= end && p.value.shared => p.value.clone(),
+            _ => return err(errno::EINVAL),
+        };
+        if !matches!(area.object.name, crate::maps::Name::Exe | crate::maps::Name::Path(_)) {
+            return err(errno::EINVAL);
+        }
+        let Some(file) = region_file(crate::uaccess::g2h(start)) else {
+            return err(errno::EINVAL);
+        };
+        let write = area.prot & mman::PROT_WRITE != 0;
+        let Ok(c) = std::ffi::CString::new(file) else { return err(errno::EINVAL) };
+        // SAFETY: a NUL-terminated path; the descriptor is closed below.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                if write { libc::O_RDWR } else { libc::O_RDONLY } | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return crate::host::last_error();
+        }
+        let locked = if area.locked { mman::MAP_LOCKED } else { 0 };
+        let flags = mman::MAP_SHARED | mman::MAP_FIXED | mman::MAP_POPULATE | locked;
+        let r = self.sys_mmap(start, size, area.prot, flags, fd as u64, offset);
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+        if r < 0 { r } else { 0 }
+    }
+
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
+        if self.sealed(addr, len) {
+            return err(errno::EPERM);
+        }
         let r = self.munmap_call(addr, len);
         if r == 0 {
             crate::maps::record().unmapped(addr, self.page_up(len));
@@ -958,6 +1053,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        if self.sealed(addr, len) {
+            return err(errno::EPERM);
+        }
         if prot & mman::PROT_EXEC != 0 && crate::maps::record().any_noexec(addr, self.page_up(len))
         {
             return err(errno::EACCES);
@@ -981,6 +1079,11 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         new_addr: u64,
     ) -> i64 {
+        if self.sealed(old, old_len)
+            || (flags & mman::MREMAP_FIXED != 0 && self.sealed(new_addr, new_len))
+        {
+            return err(errno::EPERM);
+        }
         let kept = if flags & mman::MREMAP_DONTUNMAP != 0 {
             crate::maps::record().areas_in(old, old + self.page_up(old_len))
         } else {
@@ -1199,8 +1302,10 @@ fn populate(start: u64, len: u64, page: u64) {
 }
 
 impl<P: Platform> Kernel<P> {
+    /// `a` rounded up to a page; past the last page, the last page's start
+    /// (what no range fits in, so a call given it fails as too long).
     fn page_up(&self, a: u64) -> u64 {
-        (a + self.page_size - 1) & !(self.page_size - 1)
+        a.saturating_add(self.page_size - 1) & !(self.page_size - 1)
     }
 
     fn brk_call(&mut self, addr: u64) -> i64 {
@@ -1597,6 +1702,16 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
+        // Sealed memory, read-only and anonymous, is not to be discarded:
+        // MADV_DONTNEED, FREE, REMOVE, DONTFORK, WIPEONFORK and
+        // DONTNEED_LOCKED.
+        if matches!(advice, 4 | 8 | 9 | 10 | 18 | 24)
+            && addr & (self.page_size - 1) == 0
+            && crate::maps::record()
+                .any_sealed_read_only(addr, addr.saturating_add(self.page_up(len)))
+        {
+            return err(errno::EPERM);
+        }
         let call = MemCall::Madvise { addr, len, advice };
         if let Some(r) = self.platform.memory(call, &mut self.brk) {
             return r;
@@ -1679,4 +1794,24 @@ impl<P: Platform> Kernel<P> {
         }
         err(errno::ENOMEM)
     }
+}
+
+/// The host path of the file mapped at host address `addr`.
+#[cfg(target_os = "macos")]
+fn region_file(addr: u64) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: a buffer of its stated length.
+    let n = unsafe {
+        libc::proc_regionfilename(libc::getpid(), addr, buf.as_mut_ptr().cast(), buf.len() as u32)
+    };
+    (n > 0).then(|| {
+        buf.truncate(n as usize);
+        buf
+    })
+}
+
+/// Another host than macOS has no fwe mappings to name.
+#[cfg(not(target_os = "macos"))]
+fn region_file(_addr: u64) -> Option<Vec<u8>> {
+    None
 }

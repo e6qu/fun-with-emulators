@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 920 of 1550 (77% of the 1190 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 930 of 1550 (78% of the 1200 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -93,7 +93,9 @@ capabilities. *crun, podman and containerd run standard images.*
   `rt_tgsigqueueinfo`), core dumps with the core-dump bit, the core,
   stack, CPU and process-count limits, `clone3` into a cgroup and with
   handlers cleared, `CLONE_VM` processes, and `getcpu`, `syslog`,
-  `membarrier`, `readahead`, `sync_file_range` and `vhangup`.
+  `membarrier`, `readahead`, `sync_file_range` and `vhangup`;
+- `openat2` with its `resolve` rules, `epoll_pwait2`, `mseal`,
+  `futex_waitv` and `remap_file_pages`.
 
 ## Left to 1.0
 
@@ -126,12 +128,33 @@ run.
   - `rename`, `statx`, `mremap`, `madvise` details.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
+- [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
+  containerd and runc, and the `docker` CLI) runs unmodified: it loads an
+  image, runs a container of it (`docker run`, with `--network=none` or
+  the host's network, since veth bridges are not planned) and builds one
+  from a Dockerfile (`docker build`, BuildKit). `dockerd` starts with
+  `--bridge=none --iptables=false`.
+- [ ] **Podman, further:** beyond M3's root `podman run`: `podman build`
+  (Buildah) from a Containerfile, rootless podman as an ordinary user (a
+  user namespace with the user's `/etc/subuid` ranges, overlay storage),
+  `podman pull` from a registry, and Debian's podman (non-PIE, so in the
+  VM) as well as Alpine's.
+- [ ] **Wine:** a distribution's arm64 Wine runs ARM64 Windows console
+  programs unmodified: `wineboot` sets up a prefix, `wine cmd /c` runs a
+  batch command, and a C program built for ARM64 Windows runs with its
+  files, threads, exceptions and child processes. What
+  [linux-on-macos.md](docs/linux-on-macos.md#wine) expects it to need:
+  its preloader's low, fixed mappings (the VM), Windows' `x18` kept,
+  `wineserver` over Unix sockets with passed descriptors and shared
+  memory, and faults handed to its handlers as Windows exceptions.
 
 **Done when:** every one of LTP's system-call tests passes, in CI against
 the baseline, but those for what is not planned for 1.0 and those that fail
 or skip on Linux too with the same build, each listed with the reason in
 `tools/ltp/exceptions.txt`; `strace` and `gdb` work on a guest
-program; the target programs and container engines keep passing.
+program; Docker and podman build and run images, rootless podman
+included, and Wine runs ARM64 Windows console programs, each tested end
+to end in CI; the target programs and container engines keep passing.
 
 ### M5 — Release
 
@@ -162,4 +185,6 @@ for it fall back:
 - `fanotify`: its permission events would hold every process's file
   calls on another's answer; it is refused (`ENOSYS`), and programs fall
   back to inotify;
-- graphical programs.
+- graphical programs, Wine's included;
+- x86 and x64 Windows programs under Wine (an x86 emulator such as FEX
+  inside Wine, or box64 under it).

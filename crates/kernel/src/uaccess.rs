@@ -490,6 +490,7 @@ pub fn pointer_args(nr: u64) -> u8 {
     match nr {
         n::READ | n::WRITE | n::PREAD64 | n::PWRITE64 => 0b10,
         n::OPENAT | n::MKDIRAT | n::MKNODAT | n::UNLINKAT | n::FCHMODAT | n::FCHOWNAT => 0b10,
+        n::OPENAT2 => 0b110,
         n::FACCESSAT | n::FACCESSAT2 => 0b10,
         n::CHDIR | n::CHROOT => 0b1,
         n::NEWFSTATAT | n::READLINKAT => 0b110,
@@ -514,6 +515,7 @@ pub fn pointer_args(nr: u64) -> u8 {
         // The timeout (argument 3) is a pointer only for the waits; the
         // backend translates it then (see `futex_pointer_args`).
         n::FUTEX => 0b1_0001,
+        n::FUTEX_WAITV => 0b1001,
         n::PRLIMIT64 => 0b1100,
         n::GETRLIMIT | n::SETRLIMIT => 0b10,
         n::GETRUSAGE => 0b10,
@@ -528,6 +530,7 @@ pub fn pointer_args(nr: u64) -> u8 {
         n::PSELECT6 => 0b11_1110,
         n::EPOLL_CTL => 0b1000,
         n::EPOLL_PWAIT => 0b1_0010,
+        n::EPOLL_PWAIT2 => 0b1_1010,
         n::SIGNALFD4 => 0b10,
         n::TIMERFD_SETTIME => 0b1100,
         n::TIMERFD_GETTIME => 0b10,

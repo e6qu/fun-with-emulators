@@ -208,10 +208,16 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         };
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
-            // SAFETY: plain host call; the child continues with only the
-            // calling thread, as on Linux.
-            let pid =
-                crate::quiesce::fork_stopped(|| fork_with_signals_held(|| unsafe { libc::fork() }));
+            let pid = crate::quiesce::fork_stopped(|| {
+                fork_with_signals_held(
+                    // SAFETY: plain host call; the child continues with only
+                    // the calling thread, as on Linux.
+                    || unsafe { libc::fork() },
+                    // Before the parent takes signals again: a child that
+                    // ends at once is told of with its own signal.
+                    |child| reaper::set_exit_signal(child, flags & cl::CSIGNAL),
+                )
+            });
             set_shared(false);
             pid
         });
@@ -296,7 +302,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
 /// The child goes on only once the parent has unblocked them: a signal the
 /// child sends its parent sooner would be left pending, and macOS empties
 /// the `siginfo` of a signal it holds blocked, so its sender would be lost.
-fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
+fn fork_with_signals_held(
+    fork: impl FnOnce() -> libc::pid_t,
+    in_parent: impl FnOnce(libc::pid_t),
+) -> libc::pid_t {
     let mut go = [-1i32; 2];
     // SAFETY: a valid out-array; on failure the fork goes on without it.
     if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
@@ -327,6 +336,9 @@ fn fork_with_signals_held(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
             // Before any signal sent to the child can be taken: the
             // parent's pending ones are not the child's.
             thread::forked();
+        }
+        if pid > 0 {
+            in_parent(pid);
         }
         if pid != 0 {
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());

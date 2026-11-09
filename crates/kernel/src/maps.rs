@@ -65,6 +65,9 @@ pub struct Area {
     /// It maps a file of a `noexec` mount, so it may not be made
     /// executable (Linux's `VM_MAYEXEC` clear).
     pub noexec: bool,
+    /// Sealed (`mseal`): not to be unmapped, moved, remapped over, have
+    /// its protections changed or, read-only and anonymous, be discarded.
+    pub sealed: bool,
     /// What it maps; anonymous memory has offset 0 throughout.
     pub object: Object,
 }
@@ -95,6 +98,7 @@ impl Area {
             shared: false,
             locked: false,
             noexec: false,
+            sealed: false,
             object: Object { name, dev: 0, ino: 0, offset: 0 },
         }
     }
@@ -161,6 +165,7 @@ impl Record {
             e.bool(a.shared);
             e.bool(a.locked);
             e.bool(a.noexec);
+            e.bool(a.sealed);
             match &a.object.name {
                 Name::Anonymous => e.u8(0),
                 Name::Heap => e.u8(1),
@@ -181,11 +186,11 @@ impl Record {
         r.lock_future = d.bool();
         r.exe = d.bytes();
         r.exe_id = (d.u64(), d.u64());
-        let n = d.count(8 * 6 + 4);
+        let n = d.count(8 * 6 + 5);
         for _ in 0..n {
             let (start, end, prot, dev, ino, offset) =
                 (d.u64(), d.u64(), d.u64(), d.u64(), d.u64(), d.u64());
-            let (shared, locked, noexec) = (d.bool(), d.bool(), d.bool());
+            let (shared, locked, noexec, sealed) = (d.bool(), d.bool(), d.bool(), d.bool());
             let name = match d.u8() {
                 1 => Name::Heap,
                 2 => Name::Stack,
@@ -194,7 +199,7 @@ impl Record {
                 _ => Name::Anonymous,
             };
             let object = Object { name, dev, ino, offset };
-            r.areas.insert(start, end, Area { prot, shared, locked, noexec, object });
+            r.areas.insert(start, end, Area { prot, shared, locked, noexec, sealed, object });
         }
         r
     }
@@ -213,7 +218,8 @@ impl Record {
     ) -> bool {
         let locked = self.lock_future;
         let object = object.unwrap_or(Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 });
-        self.areas.insert(start, start + len, Area { prot, shared, locked, noexec: false, object });
+        let area = Area { prot, shared, locked, noexec: false, sealed: false, object };
+        self.areas.insert(start, start + len, area);
         locked
     }
 
@@ -221,6 +227,42 @@ impl Record {
     /// segment, whose file is fwe's).
     pub fn rename(&mut self, start: u64, len: u64, object: Object) {
         self.areas.update(start, start + len, |a| Area { object: object.clone(), ..a.clone() });
+    }
+
+    /// Seal `[start, end)` (`mseal`): every page of it mapped, else
+    /// `ENOMEM`.
+    pub fn seal(&mut self, start: u64, end: u64) -> Result<(), i32> {
+        let mut at = start;
+        for p in self.areas.iter().filter(|p| p.end > start && p.start < end) {
+            if p.start > at {
+                return Err(fwe_abi::errno::ENOMEM);
+            }
+            at = p.end;
+        }
+        if at < end {
+            return Err(fwe_abi::errno::ENOMEM);
+        }
+        self.areas.update(start, end, |a| Area { sealed: true, ..a.clone() });
+        Ok(())
+    }
+
+    /// Whether any of `[start, end)` is sealed.
+    pub fn any_sealed(&self, start: u64, end: u64) -> bool {
+        self.areas.iter().any(|p| p.end > start && p.start < end && p.value.sealed)
+    }
+
+    /// Whether any of `[start, end)` is sealed, private, anonymous and not
+    /// writable: memory `madvise` may not discard.
+    pub fn any_sealed_read_only(&self, start: u64, end: u64) -> bool {
+        self.areas.iter().any(|p| {
+            let a = p.value;
+            p.end > start
+                && p.start < end
+                && a.sealed
+                && !a.shared
+                && !matches!(a.object.name, Name::Exe | Name::Path(_))
+                && a.prot & fwe_abi::mman::PROT_WRITE == 0
+        })
     }
 
     /// The guest unmapped `[start, start + len)`.
@@ -329,7 +371,14 @@ impl Record {
                 offset: ph.offset.saturating_sub(ph.vaddr + bias - start),
             };
             if file_end > start {
-                let area = Area { prot, shared: false, locked: false, noexec: false, object };
+                let area = Area {
+                    prot,
+                    shared: false,
+                    locked: false,
+                    noexec: false,
+                    sealed: false,
+                    object,
+                };
                 self.areas.insert(start, file_end, area);
             }
             if end > file_end {

@@ -259,6 +259,7 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
             | n::SENDFILE
             | n::EPOLL_CTL
             | n::EPOLL_PWAIT
+            | n::EPOLL_PWAIT2
             | n::BIND
             | n::CONNECT
             | n::LISTEN
@@ -274,6 +275,7 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
             | n::SETSOCKOPT
             | n::GETSOCKOPT
             | n::OPENAT
+            | n::OPENAT2
             | n::NEWFSTATAT
             | n::FACCESSAT
             | n::FACCESSAT2
@@ -335,6 +337,7 @@ pub fn made(nr: u64, a: &[u64; 6], result: i64) -> Vec<i32> {
     }
     match nr {
         n::OPENAT
+        | n::OPENAT2
         | n::DUP
         | n::EPOLL_CREATE1
         | n::EVENTFD2
