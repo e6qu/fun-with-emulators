@@ -275,6 +275,14 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Global,
     },
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
+    // The most descriptors a process may have: its `RLIMIT_NOFILE` and a
+    // copy of a shared descriptor table are bounded by it.
+    Sysctl {
+        path: b"fs/nr_open",
+        default: "1048576",
+        kind: Kind::Int(64, 2_147_483_584),
+        space: Space::Global,
+    },
     Sysctl {
         path: b"vm/max_map_count",
         default: "65530",

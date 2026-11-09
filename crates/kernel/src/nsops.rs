@@ -40,6 +40,10 @@ fn caps_in_new_userns() -> crate::caps::Caps {
 pub(crate) static CLEAR_SIGHAND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether this process was made sharing its parent's descriptor table
+/// (`CLONE_FILES`, which a host fork copies), until it unshares it.
+static FILES_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct ForkNs {
     /// The parent's own, while it has the child's for the fork.
     saved: Option<(Arc<crate::mounts::store::Ns>, Namespaces)>,
@@ -61,6 +65,8 @@ pub struct ForkNs {
     cgroup: Option<Vec<u8>>,
     /// Its handlers are reset (`CLONE_CLEAR_SIGHAND`).
     clear_sighand: bool,
+    /// It shares its parent's descriptor table (`CLONE_FILES`).
+    files: bool,
     /// The signal its end is told with.
     exit_signal: u64,
     /// `CLONE_PIDFD`: the descriptor made ready for the child, and where it
@@ -75,6 +81,19 @@ impl<P: Platform> Kernel<P> {
         let unshared = CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_VM;
         if flags & !(unshared | SUPPORTED) != 0 {
             return err(errno::EINVAL);
+        }
+        // A descriptor table shared with another process, or with other
+        // threads, is copied: past `fs.nr_open` descriptors it cannot be.
+        if flags & CLONE_FILES != 0
+            && (FILES_SHARED.load(std::sync::atomic::Ordering::SeqCst)
+                || crate::thread::live_threads() > 1)
+        {
+            let nr_open = crate::sysctl::number(b"fs/nr_open").unwrap_or(1 << 20);
+            let slots = crate::fdtable::open_fds().last().map_or(0, |&fd| i64::from(fd) + 1);
+            if slots > nr_open {
+                return err(errno::EMFILE);
+            }
+            FILES_SHARED.store(false, std::sync::atomic::Ordering::SeqCst);
         }
         if flags & SUPPORTED == 0 {
             return 0;
@@ -283,6 +302,7 @@ impl<P: Platform> Kernel<P> {
             inherit,
             cgroup,
             clear_sighand,
+            files: flags & fwe_abi::clone::CLONE_FILES != 0,
             exit_signal,
             pidfd: None,
         })
@@ -364,6 +384,7 @@ impl<P: Platform> Kernel<P> {
         if t.clear_sighand {
             self.clear_handlers();
         }
+        FILES_SHARED.store(t.files, std::sync::atomic::Ordering::SeqCst);
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();

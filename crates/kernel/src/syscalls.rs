@@ -1863,6 +1863,14 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EPERM);
         }
+        // Nor past `fs.nr_open`.
+        if let Some(n) = &n
+            && res == resource::RLIMIT_NOFILE
+            && crate::sysctl::number(b"fs/nr_open")
+                .is_some_and(|max| n.rlim_max > max.max(0) as u64)
+        {
+            return err(errno::EPERM);
+        }
         if old != 0 {
             let had = match crate::procreg::pending_limit(target, res as u32) {
                 Some(l) => l,
