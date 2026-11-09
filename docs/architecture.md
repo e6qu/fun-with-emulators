@@ -852,7 +852,10 @@ which are to be lifted for 1.0 and which are not planned.
 - `vm.max_map_count` is not enforced, and each mapping change publishes
   the whole mapping list, so a process with tens of thousands of
   mappings is slow to change them.
-- VM: a fork child keeps the memory `MADV_WIPEONFORK` was given.
+- VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
+  `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
+  nothing.
+- `/proc/<pid>/pagemap` and `coredump_filter` are not there.
 - Native: write+exec memory takes a fault each time a page goes from being
   written to being run or back, slow for code that does both to one page
   often; a host call writing into such a page while it is executable (a

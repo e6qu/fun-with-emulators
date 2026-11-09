@@ -91,6 +91,28 @@ pub fn tracked() -> Vec<(u64, u64)> {
     guest_maps().iter().map(|(&s, &e)| (s, e - s)).collect()
 }
 
+/// `MAP_GROWSDOWN` mappings, guest start to end: a fault in the space
+/// just below one grows it down ([`Kernel::stack_fault`]; the native
+/// backend's, whose guest addresses are host addresses).
+static GROWS_DOWN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn grows_down() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    GROWS_DOWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Guest ranges `MADV_HWPOISON` poisoned: inaccessible, and an access to
+/// them is a `SIGBUS` ([`poisoned`]), as Linux reports a memory failure.
+static POISONED: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn poisoned_ranges() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    POISONED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether guest address `addr` is in memory `MADV_HWPOISON` poisoned.
+pub fn poisoned(addr: u64) -> bool {
+    poisoned_ranges().range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
+}
+
 /// Host ranges given `MADV_WIPEONFORK`: a fork child finds them zero
 /// ([`forked_child`]), and so does its own child.
 static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
@@ -177,6 +199,8 @@ fn wants_write_exec(prot: u64) -> bool {
 pub fn release_guest_memory() {
     write_exec().clear();
     wipe_on_fork().clear();
+    grows_down().clear();
+    poisoned_ranges().clear();
     crate::maps::clear();
     let ranges = std::mem::take(&mut *guest_maps());
     for (start, end) in ranges {
@@ -1080,6 +1104,10 @@ impl<P: Platform> Kernel<P> {
         if nowrite {
             crate::maps::record().no_write(r as u64, len);
         }
+        remove_range(&mut grows_down(), r as u64, len);
+        if flags & mman::MAP_GROWSDOWN != 0 {
+            grows_down().insert(r as u64, r as u64 + len);
+        }
         if flags & mman::MAP_LOCKED != 0 {
             crate::maps::record().lock(r as u64, len, true);
             populate(r as u64, len, self.page_size);
@@ -1691,6 +1719,8 @@ impl<P: Platform> Kernel<P> {
             untrack(host as u64, self.page_up(len));
             remove_range(&mut write_exec(), host as u64, self.page_up(len));
             remove_range(&mut wipe_on_fork(), host as u64, self.page_up(len));
+            remove_range(&mut grows_down(), addr, self.page_up(len));
+            remove_range(&mut poisoned_ranges(), addr, self.page_up(len));
         }
         r
     }
@@ -1783,6 +1813,40 @@ impl<P: Platform> Kernel<P> {
         let Some(path) = region_file(crate::uaccess::g2h(addr)) else { return len };
         let Ok(meta) = std::fs::metadata(std::ffi::OsStr::from_bytes(&path)) else { return len };
         self.page_up(meta.len().saturating_sub(area.object.offset)).min(len)
+    }
+
+    /// A fault the guest took at host address `addr`: if it is below a
+    /// `MAP_GROWSDOWN` mapping, which nothing else is within Linux's guard
+    /// gap (256 pages) of where it would then start, the mapping grows
+    /// down to `addr`'s page, as Linux grows a stack, and the access is
+    /// retried. Whether it grew.
+    pub fn stack_fault(&mut self, addr: u64) -> bool {
+        const GAP_PAGES: u64 = 256;
+        let page = self.page_size;
+        let Some((start, end)) = grows_down().range(addr..).next().map(|(&s, &e)| (s, e)) else {
+            return false;
+        };
+        let new_start = addr & !(page - 1);
+        let gap = GAP_PAGES * page;
+        let below = crate::maps::record().areas_in(new_start.saturating_sub(gap), new_start);
+        if !below.is_empty() || any_mapped(new_start, start - new_start) {
+            return false;
+        }
+        let area = crate::maps::record().areas_in(start, start + page);
+        let Some(top) = area.first() else { return false };
+        let prot = host_prot(top.value.prot);
+        let host = crate::uaccess::g2h(new_start);
+        if !map_fixed_anon(host, start - new_start, prot) {
+            return false;
+        }
+        track(host, start - new_start);
+        crate::maps::record().mapped(new_start, start - new_start, top.value.prot, false, None);
+        let mut g = grows_down();
+        g.remove(&start);
+        g.insert(new_start, end);
+        drop(g);
+        crate::maps::publish();
+        true
     }
 
     /// A fault the guest took at host address `addr`, fetching an
@@ -1904,6 +1968,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
+        // MADV_HWPOISON and MADV_SOFT_OFFLINE are the administrator's.
+        if matches!(advice, 100 | 101) && !self.creds.has(crate::caps::CAP_SYS_ADMIN) {
+            return err(errno::EPERM);
+        }
         let hole = match self.madvise_check(addr, len, advice) {
             Ok(None) => return 0,
             Ok(Some(hole)) => hole,
@@ -2015,6 +2083,13 @@ impl<P: Platform> Kernel<P> {
                 unsafe {
                     libc::madvise(host as *mut libc::c_void, len as usize, advice as libc::c_int)
                 };
+                0
+            }
+            // MADV_HWPOISON: the pages fail, as memory that broke does.
+            100 => {
+                // SAFETY: guest memory the guest asked to poison.
+                unsafe { libc::mprotect(host as *mut libc::c_void, len as usize, libc::PROT_NONE) };
+                add_range(&mut poisoned_ranges(), addr, len);
                 0
             }
             // MADV_WIPEONFORK, MADV_KEEPONFORK

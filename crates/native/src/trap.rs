@@ -643,10 +643,20 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if kernel().as_mut().is_some_and(|k| k.write_exec_fault(addr, exec)) {
         return;
     }
+    // Below a stack that grows down (`MAP_GROWSDOWN`): it grows, and the
+    // access is retried.
+    if sig == libc::SIGSEGV && !exec && kernel().as_mut().is_some_and(|k| k.stack_fault(addr)) {
+        return;
+    }
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
-    let lsig = linux_fault_signal(sig, addr, mc.es.esr);
+    // Memory `MADV_HWPOISON` poisoned fails with a bus error.
+    let lsig = if fwe_kernel::mm::poisoned(addr) {
+        fwe_abi::signal::SIGBUS
+    } else {
+        linux_fault_signal(sig, addr, mc.es.esr)
+    };
     let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr));
     if delivered {
         settle(&mut regs);
