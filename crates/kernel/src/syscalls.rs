@@ -3249,22 +3249,15 @@ mod tests {
         use fwe_abi::statfs::{MS_ASYNC, MS_SYNC};
         let mut k = kernel();
         let len = k.page_size;
-        // SAFETY: a fresh anonymous mapping, unmapped below.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        } as u64;
+        // A shared anonymous mapping the guest made (PROT_READ | WRITE,
+        // MAP_SHARED | MAP_ANONYMOUS).
+        let p = k.syscall(nr::MMAP, [0, len, 3, 0x21, u64::MAX, 0]) as u64;
         assert_eq!(k.syscall(nr::MSYNC, [p, len, MS_SYNC, 0, 0, 0]), 0);
         assert_eq!(k.syscall(nr::MSYNC, [p, len, MS_SYNC | MS_ASYNC, 0, 0, 0]), err(errno::EINVAL));
         assert_eq!(k.syscall(nr::MSYNC, [p + 1, len, MS_SYNC, 0, 0, 0]), err(errno::EINVAL));
-        // SAFETY: unmapping the mapping made above.
-        unsafe { libc::munmap(p as *mut _, len as usize) };
+        // Unmapped, a hole.
+        assert_eq!(k.syscall(nr::MUNMAP, [p, len, 0, 0, 0, 0]), 0);
+        assert_eq!(k.syscall(nr::MSYNC, [p, len, MS_SYNC, 0, 0, 0]), err(errno::ENOMEM));
     }
 
     /// The `prctl` options in use: a thread name, the capability bounding
