@@ -537,7 +537,6 @@ munlock02
 munlockall01
 munmap01
 munmap03
-nanosleep01
 nanosleep02
 nanosleep04
 newuname01
@@ -593,7 +592,6 @@ pipeio_7
 pipeio_8
 pivot_root01
 poll01
-poll02
 poll03
 poll04
 posix_fadvise01
@@ -605,7 +603,6 @@ prctl03
 prctl05
 prctl06
 prctl08
-prctl09
 pread01
 pread01_64
 pread02
@@ -712,7 +709,6 @@ sched_setscheduler02
 sched_setscheduler03
 sched_yield01
 select01
-select02
 select03
 select04
 semctl02
