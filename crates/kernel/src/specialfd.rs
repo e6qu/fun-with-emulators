@@ -7,7 +7,9 @@
 //! - **eventfd** is backed by a pipe plus a 64-bit counter. The pipe holds one
 //!   byte exactly while the counter is non-zero, so the read end (the fd handed
 //!   to the guest) is readable — and pollable by `kqueue`, hence by our
-//!   `epoll` — precisely when a read would succeed.
+//!   `epoll` — precisely when a read would succeed. The counter is in a page
+//!   of shared memory, with a lock word, so that a fork child, which shares
+//!   the pipe, shares the counter too.
 //! - **timerfd** is a `kqueue` holding one `EVFILT_TIMER`. `read` collects the
 //!   expiration count with `kevent`; the kqueue fd is pollable by our `epoll`.
 //!
@@ -16,6 +18,21 @@
 //! consumer blocking under the kernel lock while the producer needs that same
 //! lock to post would deadlock. Both return `None` for a descriptor that is not
 //! one of ours, so the caller falls back to the normal host `read`/`write`.
+
+/// Whether `fd` is an emulated eventfd that may be written to: its count
+/// short of its maximum (its pipe's read end, which the guest holds, never
+/// is writable to the host).
+pub fn eventfd_writable(fd: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        imp::writable(fd)
+    }
+}
 
 /// Whether `fd` is a timerfd that does not block, if it is one.
 pub fn timer_nonblock(fd: i32) -> Option<bool> {
@@ -233,9 +250,70 @@ mod imp {
         /// Read end (the fd the guest holds) and write end of the readiness pipe.
         rfd: i32,
         wfd: i32,
-        count: u64,
+        /// The address of its [`Shared`] counter.
+        shared: usize,
+        /// Whether that is a mapping of its own (not this process's heap).
+        mapped: bool,
         semaphore: bool,
         nonblock: bool,
+    }
+
+    /// An eventfd's counter, in shared memory (a fork child's is its
+    /// parent's), and the lock its changes, with the pipe's, are made under.
+    #[repr(C)]
+    struct Shared {
+        magic: std::sync::atomic::AtomicU64,
+        lock: std::sync::atomic::AtomicU32,
+        count: std::sync::atomic::AtomicU64,
+    }
+
+    const MAGIC: u64 = 0x6677_655f_6576_6664;
+
+    /// A new shared counter holding `count`: its address, and whether it
+    /// is a mapping of its own. Should the host give no shared page, the
+    /// counter is this process's own memory.
+    fn new_shared(count: u64) -> (usize, bool) {
+        // SAFETY: a fresh shared anonymous page of this module's.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<Shared>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            let own = Box::leak(Box::new(Shared {
+                magic: MAGIC.into(),
+                lock: 0.into(),
+                count: count.into(),
+            }));
+            return (own as *const Shared as usize, false);
+        }
+        // SAFETY: the page just mapped, zeroed, large enough for a `Shared`.
+        let sh = unsafe { &*(p as *const Shared) };
+        sh.count.store(count, std::sync::atomic::Ordering::SeqCst);
+        sh.magic.store(MAGIC, std::sync::atomic::Ordering::SeqCst);
+        (p as usize, true)
+    }
+
+    /// Run `f` on the counter at `shared` under its lock (shared with every
+    /// process the eventfd is in).
+    fn locked<R>(shared: usize, f: impl FnOnce(&mut u64) -> R) -> R {
+        use std::sync::atomic::Ordering;
+        // SAFETY: the eventfd's own mapped `Shared`, mapped for as long as
+        // the descriptor is registered.
+        let sh = unsafe { &*(shared as *const Shared) };
+        while sh.lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::thread::yield_now();
+        }
+        let mut c = sh.count.load(Ordering::SeqCst);
+        let r = f(&mut c);
+        sh.count.store(c, Ordering::SeqCst);
+        sh.lock.store(0, Ordering::Release);
+        r
     }
 
     struct TimerFd {
@@ -265,7 +343,9 @@ mod imp {
                     e.u8(0);
                     e.i32(ev.rfd);
                     e.i32(ev.wfd);
-                    e.u64(ev.count);
+                    // Only a mapped counter is shared with a fork child.
+                    e.u64(if ev.mapped { ev.shared as u64 } else { 0 });
+                    e.u64(locked(ev.shared, |c| *c));
                     e.bool(ev.semaphore);
                     e.bool(ev.nonblock);
                 }
@@ -289,10 +369,22 @@ mod imp {
         let mut cloexec = std::collections::HashMap::new();
         let reg = crate::snapshot::read_fd_map(d, |d| {
             if d.u8() == 0 {
+                let (rfd, wfd, at, count) = (d.i32(), d.i32(), d.u64() as usize, d.u64());
+                // A fork child has its parent's counter mapped at the same
+                // place; anything else gets a new one, holding the count.
+                // SAFETY: read only where the region is mapped.
+                let inherited = at != 0
+                    && crate::mm::host_mapped(at as u64, 1)
+                    && unsafe { &*(at as *const Shared) }
+                        .magic
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        == MAGIC;
+                let (shared, mapped) = if inherited { (at, true) } else { new_shared(count) };
                 Special::Event(EventFd {
-                    rfd: d.i32(),
-                    wfd: d.i32(),
-                    count: d.u64(),
+                    rfd,
+                    wfd,
+                    shared,
+                    mapped,
                     semaphore: d.bool(),
                     nonblock: d.bool(),
                 })
@@ -337,6 +429,14 @@ mod imp {
     fn with_reg<R>(f: impl FnOnce(&mut HashMap<i32, Special>) -> R) -> R {
         let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
         f(g.get_or_insert_with(HashMap::new))
+    }
+
+    pub(super) fn writable(fd: i32) -> bool {
+        let shared = with_reg(|m| match m.get(&fd) {
+            Some(Special::Event(e)) => Some(e.shared),
+            _ => None,
+        });
+        shared.is_some_and(|sh| locked(sh, |c| *c < u64::MAX - 1))
     }
 
     pub(super) fn anon_name(fd: i32) -> Option<&'static str> {
@@ -388,10 +488,18 @@ mod imp {
         if flags & EFD_CLOEXEC != 0 {
             set_cloexec(rfd);
         }
+        if flags & EFD_NONBLOCK != 0 {
+            // SAFETY: plain host calls on the descriptor just made.
+            unsafe {
+                libc::fcntl(rfd, libc::F_SETFL, libc::fcntl(rfd, libc::F_GETFL) | libc::O_NONBLOCK)
+            };
+        }
+        let (shared, mapped) = new_shared(initval);
         let ev = EventFd {
             rfd,
             wfd,
-            count: initval,
+            shared,
+            mapped,
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: flags & EFD_NONBLOCK != 0,
         };
@@ -627,21 +735,35 @@ mod imp {
                         let Some(Special::Event(e)) = m.get_mut(&fd) else {
                             return Some(err(errno::EBADF));
                         };
-                        if e.count > 0 {
-                            let v = if e.semaphore { 1 } else { e.count };
-                            e.count -= v;
-                            if e.count == 0 {
-                                // SAFETY: a byte is present when count drops to 0.
-                                unsafe { drain(e.rfd) };
+                        let (rfd, semaphore) = (e.rfd, e.semaphore);
+                        let taken = locked(e.shared, |count| {
+                            if *count == 0 {
+                                return None;
                             }
-                            Some(match uaccess::write(buf, v) {
+                            let v = if semaphore { 1 } else { *count };
+                            *count -= v;
+                            if *count == 0 {
+                                // SAFETY: a byte is present while the count is
+                                // not 0.
+                                unsafe { drain(rfd) };
+                            }
+                            Some(v)
+                        });
+                        match taken {
+                            Some(v) => Some(match uaccess::write(buf, v) {
                                 Ok(()) => 8,
                                 Err(e) => err(e),
-                            })
-                        } else if e.nonblock {
-                            Some(err(errno::EAGAIN))
-                        } else {
-                            None
+                            }),
+                            // Non-blocking as the descriptor is now (its
+                            // own flag, which `fcntl` shows and changes).
+                            // SAFETY: F_GETFL only queries the descriptor.
+                            None if unsafe { libc::fcntl(rfd, libc::F_GETFL) }
+                                & libc::O_NONBLOCK
+                                != 0 =>
+                            {
+                                Some(err(errno::EAGAIN))
+                            }
+                            None => None,
                         }
                     });
                     if let Some(r) = got {
@@ -713,18 +835,21 @@ mod imp {
             let Some(Special::Event(e)) = m.get_mut(&fd) else {
                 return err(errno::EBADF);
             };
-            // eventfd caps at u64::MAX - 1; overflow would block, which we
-            // report as EAGAIN (the counter reaching this is not expected).
-            if add > u64::MAX - 1 - e.count {
-                return err(errno::EAGAIN);
-            }
-            let was_zero = e.count == 0;
-            e.count += add;
-            if was_zero && e.count > 0 {
-                // SAFETY: the pipe holds at most one byte.
-                unsafe { poke(e.wfd) };
-            }
-            8
+            let wfd = e.wfd;
+            locked(e.shared, |count| {
+                // eventfd caps at u64::MAX - 1; overflow would block, which we
+                // report as EAGAIN (the counter reaching this is not expected).
+                if add > u64::MAX - 1 - *count {
+                    return err(errno::EAGAIN);
+                }
+                let was_zero = *count == 0;
+                *count += add;
+                if was_zero && *count > 0 {
+                    // SAFETY: the pipe holds at most one byte.
+                    unsafe { poke(wfd) };
+                }
+                8
+            })
         }))
     }
 
@@ -737,6 +862,11 @@ mod imp {
                 Special::Event(e) => {
                     libc::close(e.rfd);
                     libc::close(e.wfd);
+                    // This process's mapping of the counter (another that
+                    // shares it keeps its own).
+                    if e.mapped {
+                        libc::munmap(e.shared as *mut libc::c_void, std::mem::size_of::<Shared>());
+                    }
                 }
                 Special::Timer(t) => {
                     libc::close(t.kq);

@@ -300,6 +300,7 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
         | n::SENDMMSG
         | n::RECVMMSG => path(a[0]),
         n::SPLICE | n::COPY_FILE_RANGE => path(a[0]) || path(a[2]),
+        n::EPOLL_CTL => path(a[0]) || path(a[2]),
         n::TEE | n::SENDFILE => path(a[0]) || path(a[1]),
         n::MMAP => a[3] & mman::MAP_ANONYMOUS == 0 && path(a[4]),
         n::FCNTL => {

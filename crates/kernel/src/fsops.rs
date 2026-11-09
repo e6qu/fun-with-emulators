@@ -1961,13 +1961,24 @@ impl<P: Platform> Kernel<P> {
                 }
             }
         }
+        // What a tmpfs with a size has no room for (punching a hole frees).
+        if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE == 0
+            && let Err(e) = crate::tmpfs::allocate(fd as i32, offset, len)
+        {
+            return err(e);
+        }
         if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0
             && crate::memfd::write_refused(fd as i32)
         {
             return err(errno::EPERM);
         }
         match crate::host::fallocate(fd as i32, mode, offset as i64, len as i64) {
-            Ok(()) => 0,
+            Ok(()) => {
+                if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0 {
+                    crate::tmpfs::freed(fd as i32);
+                }
+                0
+            }
             Err(e) => err(e),
         }
     }
@@ -1982,6 +1993,7 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = make_pipe(&mut fds, flags) {
             return err(e);
         }
+        crate::exclusive::made(fds[0]);
         // Its ends, one pipe; its capacity, as the maker's privilege and
         // `pipe-max-size` allow.
         let id = |fd: i32| {
@@ -3010,6 +3022,11 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
         return last_error();
     }
     let mut out = host::statfs_to_linux(&s);
+    // A tmpfs with a size: that, and what is left of it.
+    if let Some((size, left)) = crate::fs::fd_path(fd).and_then(|p| crate::tmpfs::space(&p)) {
+        let b = out.f_bsize.max(1) as u64;
+        (out.f_blocks, out.f_bfree, out.f_bavail) = (size / b, left / b, left / b);
+    }
     if let Some((fstype, flags)) = mount {
         use crate::mounts::ms;
         use fwe_abi::statfs::*;

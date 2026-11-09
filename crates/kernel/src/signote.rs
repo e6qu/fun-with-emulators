@@ -8,7 +8,8 @@
 //!
 //! So an fwe process that sends another a signal first leaves a note of
 //! itself in the target's mailbox, a small file beside its process record
-//! ([`crate::procreg`]): one slot per host signal, with the sender's pid
+//! ([`crate::procreg`]): a few slots per host signal (several processes
+//! may send one at once, which the host merges), each with the sender's pid
 //! and user, when it was written, and for a signal that carries more than
 //! its sender (one a message queue raises, `SI_MESGQ`) its Linux `si_code`
 //! and value. A handler given a signal with no
@@ -45,6 +46,9 @@ pub struct Note {
 }
 /// Host signals are numbered below this.
 const SIGNALS: usize = 32;
+/// Slots for each signal: notes of senders whose signals the host may
+/// have merged, taken one at a time.
+const PER_SIGNAL: usize = 8;
 /// A note older than this is not taken for a signal that came with no
 /// sender (one whose sender has ended, or the host did not name): a signal
 /// is held by fwe's handlers only for a moment, though a loaded machine
@@ -131,8 +135,20 @@ fn now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// Where the slots of host signal `sig` start.
 fn offset(sig: libc::c_int) -> Option<libc::off_t> {
-    (1..SIGNALS as libc::c_int).contains(&sig).then(|| sig as libc::off_t * SLOT as libc::off_t)
+    (1..SIGNALS as libc::c_int)
+        .contains(&sig)
+        .then(|| (sig as usize * PER_SIGNAL * SLOT) as libc::off_t)
+}
+
+/// The pid and time of slot `i` of `slots`.
+fn slot_of(slots: &[u8], i: usize) -> (i32, u64) {
+    let s = &slots[i * SLOT..(i + 1) * SLOT];
+    (
+        i32::from_ne_bytes(s[0..4].try_into().unwrap()),
+        u64::from_ne_bytes(s[8..16].try_into().unwrap()),
+    )
 }
 
 /// The signal [`note`] was for could not be sent: take the note back, if
@@ -141,19 +157,24 @@ pub fn unnote(target: i32, sig: libc::c_int) {
     let Some(off) = offset(sig) else { return };
     let mut buf = [0u8; 512];
     let Some(path) = mailbox(target, &mut buf) else { return };
-    let mut slot = [0u8; SLOT];
-    // SAFETY: a NUL-terminated path; buffers of `SLOT` bytes.
+    let mut slots = [0u8; PER_SIGNAL * SLOT];
+    // SAFETY: a NUL-terminated path; buffers of their lengths.
     unsafe {
         let fd = libc::open(path, libc::O_RDWR | libc::O_CLOEXEC);
         if fd < 0 {
             return;
         }
+        libc::flock(fd, libc::LOCK_EX);
         let me = libc::getpid();
-        if libc::pread(fd, slot.as_mut_ptr().cast(), SLOT, off) == SLOT as isize
-            && i32::from_ne_bytes(slot[0..4].try_into().unwrap()) == me
-        {
-            libc::pwrite(fd, [0u8; SLOT].as_ptr().cast(), SLOT, off);
+        let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
+        // This process's latest note there.
+        let mine = (0..n / SLOT)
+            .filter(|&i| slot_of(&slots, i).0 == me)
+            .max_by_key(|&i| slot_of(&slots, i).1);
+        if let Some(i) = mine {
+            libc::pwrite(fd, [0u8; SLOT].as_ptr().cast(), SLOT, off + (i * SLOT) as libc::off_t);
         }
+        libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
     }
 }
@@ -178,11 +199,23 @@ pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
     slot[8..16].copy_from_slice(&now_ns().to_ne_bytes());
     slot[16..20].copy_from_slice(&code.to_ne_bytes());
     slot[24..32].copy_from_slice(&value.to_ne_bytes());
-    // SAFETY: a NUL-terminated path; a buffer of `SLOT` bytes.
+    // A free slot of the signal's, or the oldest note's, under the
+    // mailbox's lock (other senders write there too).
+    let mut slots = [0u8; PER_SIGNAL * SLOT];
+    // SAFETY: a NUL-terminated path; buffers of their lengths.
     unsafe {
         let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
         if fd >= 0 {
-            libc::pwrite(fd, slot.as_ptr().cast(), SLOT, off);
+            libc::flock(fd, libc::LOCK_EX);
+            let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
+            let len = slots.len();
+            slots[n.min(len)..].fill(0);
+            let at = (0..PER_SIGNAL)
+                .find(|&i| slot_of(&slots, i).0 == 0)
+                .or_else(|| (0..PER_SIGNAL).min_by_key(|&i| slot_of(&slots, i).1))
+                .unwrap_or(0);
+            libc::pwrite(fd, slot.as_ptr().cast(), SLOT, off + (at * SLOT) as libc::off_t);
+            libc::flock(fd, libc::LOCK_UN);
             libc::close(fd);
         }
     }
@@ -211,17 +244,33 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
     };
     let fd = opened.unwrap_or_else(|| OWN.load(Ordering::SeqCst));
     let saved = crate::host::last_errno();
+    let mut slots = [0u8; PER_SIGNAL * SLOT];
     let mut slot = [0u8; SLOT];
-    // SAFETY: fwe's own descriptor of the mailbox; a buffer of `SLOT`
-    // bytes.
+    // SAFETY: fwe's own descriptor of the mailbox; buffers of their
+    // lengths.
     let got = unsafe {
-        let n = libc::pread(fd, slot.as_mut_ptr().cast(), SLOT, off);
-        let pid = i32::from_ne_bytes(slot[0..4].try_into().unwrap());
-        if n == SLOT as isize && pid != 0 && clear_if.is_none_or(|c| c == 0 || c == pid) {
-            let zero = [0u8; SLOT];
-            libc::pwrite(fd, zero.as_ptr().cast(), SLOT, off);
+        let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
+        let now = now_ns();
+        // The note of the sender named, or (none named) the oldest recent
+        // one: the signal the host merged others into came first.
+        let pick = (0..n / SLOT)
+            .filter(|&i| {
+                let (pid, when) = slot_of(&slots, i);
+                pid != 0
+                    && match clear_if {
+                        Some(c) if c != 0 => pid == c,
+                        _ => now.saturating_sub(when) < FRESH_NS,
+                    }
+            })
+            .min_by_key(|&i| slot_of(&slots, i).1);
+        if let Some(i) = pick {
+            slot.copy_from_slice(&slots[i * SLOT..(i + 1) * SLOT]);
+            if clear_if.is_some() {
+                let zero = [0u8; SLOT];
+                libc::pwrite(fd, zero.as_ptr().cast(), SLOT, off + (i * SLOT) as libc::off_t);
+            }
         }
-        n == SLOT as isize && pid != 0
+        pick.is_some()
     };
     if let Some(fd) = opened {
         // SAFETY: the descriptor opened above.
@@ -246,7 +295,7 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
 /// `si_code` and the value. A sender queues one under the mailbox's lock
 /// ([`queue`]), then wakes the target with [`crate::host::WAKE_SIGNAL`],
 /// whose handler takes them all ([`drain`]).
-const QUEUE_AT: usize = SIGNALS * SLOT;
+const QUEUE_AT: usize = SIGNALS * PER_SIGNAL * SLOT;
 /// Entries in the queue: as many signals as may wait for a process.
 const QUEUE_LEN: usize = 64;
 const ENTRY: usize = 32;

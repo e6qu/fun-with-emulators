@@ -125,6 +125,9 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
 
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        // Mappings changed by memory calls are published before any other
+        // call ([`crate::maps::publish`]).
+        crate::maps::flush_before(n);
         if let Err(e) = crate::fdtable::check_args(n, &a) {
             return e;
         }
@@ -183,8 +186,16 @@ impl<P: Platform> Kernel<P> {
                 {
                     crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 } else {
-                    // SAFETY: plain host call; SEEK_SET/CUR/END match.
-                    ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, a[2] as i32) })
+                    // SEEK_SET, CUR and END match; Linux's SEEK_DATA and
+                    // SEEK_HOLE are 3 and 4, the host's the other way round.
+                    let whence = match a[2] {
+                        0..=2 => a[2] as i32,
+                        3 => libc::SEEK_DATA,
+                        4 => libc::SEEK_HOLE,
+                        _ => return err(errno::EINVAL),
+                    };
+                    // SAFETY: plain host call.
+                    ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, whence) })
                 }
             }
             nr::CLOSE => {
@@ -2060,6 +2071,12 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     loop {
         let mut ask = set.to_vec();
         let mut full = false;
+        // An eventfd that may be written to is writable: its pipe's read
+        // end, which the host watches, never is.
+        let writable: Vec<bool> = set
+            .iter()
+            .map(|p| p.events & libc::POLLOUT != 0 && crate::specialfd::eventfd_writable(p.fd))
+            .collect();
         for p in &mut ask {
             if p.events & libc::POLLOUT != 0 && crate::fdstate::pipe_full(p.fd) {
                 p.events &= !libc::POLLOUT;
@@ -2068,10 +2085,16 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         }
         let left =
             deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_nanos() as i64);
-        let wait = if full && !(0..1_000_000).contains(&left) { 1_000_000 } else { left };
+        let wait = if writable.contains(&true) {
+            0
+        } else if full && !(0..1_000_000).contains(&left) {
+            1_000_000
+        } else {
+            left
+        };
         crate::thread::wait_ready_ns(&mut ask, wait)?;
-        for (p, a) in set.iter_mut().zip(&ask) {
-            p.revents = a.revents;
+        for ((p, a), &w) in set.iter_mut().zip(&ask).zip(&writable) {
+            p.revents = a.revents | if w { libc::POLLOUT } else { 0 };
             linux_revents(p);
         }
         let n = set.iter().filter(|p| p.revents != 0).count() as i32;
@@ -2377,18 +2400,19 @@ impl<P: Platform> Kernel<P> {
         Ok(match which {
             prio::PROCESS if who == 0 => vec![me],
             prio::PROCESS => crate::pidns::to_host(who)
-                .filter(|&h| h == me || crate::procreg::start_time(h).is_some())
+                .filter(|&h| h > 0 && (h == me || crate::procreg::start_time(h).is_some()))
                 .into_iter()
                 .collect(),
             prio::PGRP => {
                 let group = if who == 0 {
                     my_group
                 } else {
-                    match crate::pidns::to_host(who) {
+                    match crate::pidns::to_host(who).filter(|&g| g > 0) {
                         Some(g) => g,
                         None => return Ok(Vec::new()),
                     }
                 };
+                // (A process gone meanwhile has no group: -1, never one's.)
                 // SAFETY: plain host call.
                 seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect()
             }

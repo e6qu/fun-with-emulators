@@ -21,6 +21,7 @@ pub mod coredump;
 pub mod creds;
 pub mod devnodes;
 pub mod epoll;
+pub mod exclusive;
 pub mod fdmarks;
 pub mod fdstate;
 pub mod fdtable;
@@ -82,6 +83,7 @@ pub mod sysctl;
 pub mod sysvipc;
 pub mod term;
 pub mod thread;
+pub mod tmpfs;
 pub mod trace;
 pub mod uaccess;
 pub mod userns;
@@ -916,6 +918,8 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    // What other processes may look at, current before this one waits.
+    maps::flush_before(nr);
     let noted = atime::before(nr, &a);
     // SAFETY: the caller's guarantee, passed on.
     let r = unsafe { blocking_call(nr, a) }?;
@@ -931,6 +935,9 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
 /// socket write to a closed peer raises.
 pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     inotify::after_io(nr, a, r);
+    if r > 0 && matches!(nr, fwe_abi::nr::WRITE | fwe_abi::nr::WRITEV) {
+        exclusive::wrote(a[0] as i32);
+    }
     let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
     let r = net::linux_read_error(nr, a[0] as i32, r);
     let r = net::linux_send_error(nr, a[0] as i32, r);
@@ -1377,6 +1384,11 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 // SAFETY: the guest buffer spans the length.
                 return Some(unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) });
             }
+            // A file of a tmpfs with a size: as much as fits.
+            let len = match tmpfs::room(fd, None, len) {
+                Ok(n) => n,
+                Err(e) => return Some(fwe_abi::err(e)),
+            };
             // A pipe holding less than the host's: as much as it has room for.
             let write = |at: u64, n: u64| {
                 // SAFETY: the host validates the guest buffer; `at + n` is
@@ -1404,8 +1416,15 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
-                let special = specialwrite::Source::Host(&iov);
                 let total = specialwrite::total(&iov);
+                // A file of a tmpfs with a size: as much as fits.
+                let fits = match tmpfs::room(a[0] as i32, None, total) {
+                    Ok(n) => n,
+                    Err(e) => return Some(fwe_abi::err(e)),
+                };
+                let iov = if fits < total { iovecs_part(&iov, 0, fits) } else { iov };
+                let total = fits;
+                let special = specialwrite::Source::Host(&iov);
                 let capped = |at: u64, n: u64| {
                     let part = iovecs_part(&iov, at, n);
                     // SAFETY: as for readv: a part of the same buffers.
@@ -1434,10 +1453,14 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             let special = specialwrite::Source::Guest(a[1]);
             match specialwrite::write(a[0] as i32, special, a[2]) {
                 Some(r) => r,
-                // SAFETY: the host validates the guest buffer.
-                None => host::ret(unsafe {
-                    libc::pwrite(a[0] as i32, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
-                } as i64),
+                // A file of a tmpfs with a size: as much as fits.
+                None => match tmpfs::room(a[0] as i32, Some(a[3]), a[2]) {
+                    // SAFETY: the host validates the guest buffer.
+                    Ok(n) => host::ret(unsafe {
+                        libc::pwrite(a[0] as i32, a[1] as *const _, n as usize, a[3] as libc::off_t)
+                    } as i64),
+                    Err(e) => fwe_abi::err(e),
+                },
             }
         }
         n::PREADV => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, 0, false, false),

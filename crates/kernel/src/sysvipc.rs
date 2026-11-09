@@ -19,7 +19,7 @@
 use crate::shared::{Data, Record};
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 // `ipc.h`, `shm.h`, `sem.h`, `msg.h`.
@@ -192,10 +192,10 @@ impl Obj {
 #[derive(Clone, Debug, Default)]
 pub struct Ipc {
     /// By kind and id.
-    pub objs: BTreeMap<(u8, i32), Obj>,
+    pub objs: Tracked<(u8, i32), Obj>,
     /// Each kind's slots' sequence numbers (an id is the slot and the
     /// sequence, so one reused is a new id).
-    pub seqs: BTreeMap<(u8, i32), u16>,
+    pub seqs: Tracked<(u8, i32), u16>,
     /// The namespace's sysctls (`kernel.shmmax` and the like) set from
     /// their defaults, by name ([`crate::sysctl`]).
     pub sysctls: BTreeMap<String, String>,
@@ -208,6 +208,76 @@ pub struct Ipc {
     pub mq_live: BTreeMap<Vec<u8>, (u32, u64)>,
     /// The number the next queue's directory takes.
     pub mq_seq: u64,
+    /// What finds objects without looking at each: kept up to date from
+    /// the objects changed since it last looked, not recorded.
+    index: Lazy,
+}
+
+/// The objects by key, the slots in use, and those that hold processes.
+#[derive(Clone, Debug, Default)]
+struct Index {
+    /// (kind, key) to id, of objects with a key not marked for removal.
+    by_key: HashMap<(u8, i32), i32>,
+    /// (kind, id) to the key it is found by above.
+    key_of: HashMap<(u8, i32), i32>,
+    /// (kind, slot) to the id in it.
+    slots: HashMap<(u8, i32), i32>,
+    /// Each kind's count of slots in use, and the lowest that may be free.
+    used: [(usize, i32); 3],
+    /// Objects that name processes (attachments, waiters, undo
+    /// adjustments) or are marked for removal: what [`Ipc::reap`] looks at.
+    holders: BTreeSet<(u8, i32)>,
+}
+
+/// An [`Index`] that reading data may bring up to date.
+#[derive(Debug, Default)]
+struct Lazy(Mutex<Index>);
+
+impl Clone for Lazy {
+    fn clone(&self) -> Self {
+        Lazy(Mutex::new(self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()))
+    }
+}
+
+impl Index {
+    /// Object `(kind, id)` is now `o` (or gone).
+    fn reindex(&mut self, kind: u8, id: i32, o: Option<&Obj>) {
+        if let Some(key) = self.key_of.remove(&(kind, id))
+            && self.by_key.get(&(kind, key)) == Some(&id)
+        {
+            self.by_key.remove(&(kind, key));
+        }
+        self.holders.remove(&(kind, id));
+        let slot = (kind, id % IPCMNI);
+        let used = &mut self.used[kind as usize % 3];
+        match o {
+            Some(o) => {
+                if self.slots.insert(slot, id).is_none() {
+                    used.0 += 1;
+                }
+                if o.key != IPC_PRIVATE && !o.removed {
+                    self.by_key.insert((kind, o.key), id);
+                    self.key_of.insert((kind, id), o.key);
+                }
+                let holds = o.removed
+                    || match &o.body {
+                        Body::Shm(s) => !s.attached.is_empty(),
+                        Body::Sem(s) => !s.waiting.is_empty() || !s.undo.is_empty(),
+                        Body::Msg(_) => false,
+                    };
+                if holds {
+                    self.holders.insert((kind, id));
+                }
+            }
+            None => {
+                if self.slots.get(&slot) == Some(&id) {
+                    self.slots.remove(&slot);
+                    used.0 -= 1;
+                    used.1 = used.1.min(slot.1);
+                }
+            }
+        }
+    }
 }
 
 impl Ipc {
@@ -286,79 +356,112 @@ fn get_proc(d: &mut Dec) -> Proc {
     (d.i32(), d.u64())
 }
 
-impl Data for Ipc {
-    fn encode(&self, e: &mut Enc) {
+fn put_obj(e: &mut Enc, id: i32, o: &Obj) {
+    e.i32(id);
+    e.i32(o.key);
+    put_perm(e, &o.perm);
+    e.u64(o.ctime as u64);
+    e.bool(o.removed);
+    match &o.body {
+        Body::Shm(s) => {
+            e.u8(0);
+            e.u64(s.size);
+            e.i32(s.cpid);
+            e.i32(s.lpid);
+            e.u64(s.atime as u64);
+            e.u64(s.dtime as u64);
+            e.bool(s.locked);
+            e.u64(s.attached.len() as u64);
+            for &(p, n) in &s.attached {
+                put_proc(e, p);
+                e.u32(n);
+            }
+        }
+        Body::Sem(s) => {
+            e.u8(1);
+            e.u64(s.otime as u64);
+            e.u64(s.vals.len() as u64);
+            for &(v, pid) in &s.vals {
+                e.i32(v);
+                e.i32(pid);
+            }
+            e.u64(s.waiting.len() as u64);
+            for &(p, n, z) in &s.waiting {
+                put_proc(e, p);
+                e.u32(n as u32);
+                e.bool(z);
+            }
+            e.u64(s.undo.len() as u64);
+            for (p, adj) in &s.undo {
+                put_proc(e, *p);
+                e.u64(adj.len() as u64);
+                for &(n, a) in adj {
+                    e.u32(n as u32);
+                    e.i32(a);
+                }
+            }
+        }
+        Body::Msg(m) => {
+            e.u8(2);
+            e.u64(m.stime as u64);
+            e.u64(m.rtime as u64);
+            e.u64(m.qbytes);
+            e.i32(m.lspid);
+            e.i32(m.lrpid);
+            e.u64(m.msgs.len() as u64);
+            for (t, text) in &m.msgs {
+                e.u64(*t as u64);
+                e.bytes(text);
+            }
+        }
+    }
+}
+
+fn get_obj(d: &mut Dec) -> (i32, Obj) {
+    let (id, key, perm, ctime, removed) = (d.i32(), d.i32(), get_perm(d), d.u64() as i64, d.bool());
+    let body = match d.u8() {
+        0 => {
+            let (size, cpid, lpid, atime, dtime, locked) =
+                (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64, d.bool());
+            let n = d.count(16);
+            let attached = (0..n).map(|_| (get_proc(d), d.u32())).collect();
+            Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked })
+        }
+        1 => {
+            let otime = d.u64() as i64;
+            let n = d.count(8);
+            let vals = (0..n).map(|_| (d.i32(), d.i32())).collect();
+            let n = d.count(17);
+            let waiting = (0..n).map(|_| (get_proc(d), d.u32() as u16, d.bool())).collect();
+            let n = d.count(20);
+            let undo = (0..n)
+                .map(|_| {
+                    let p = get_proc(d);
+                    let m = d.count(8);
+                    (p, (0..m).map(|_| (d.u32() as u16, d.i32())).collect())
+                })
+                .collect();
+            Body::Sem(Sem { otime, vals, waiting, undo })
+        }
+        _ => {
+            let (stime, rtime, qbytes, lspid, lrpid) =
+                (d.u64() as i64, d.u64() as i64, d.u64(), d.i32(), d.i32());
+            let n = d.count(16);
+            let msgs = (0..n).map(|_| (d.u64() as i64, d.bytes())).collect();
+            Body::Msg(Msg { stime, rtime, qbytes, lspid, lrpid, msgs })
+        }
+    };
+    (id, Obj { key, perm, ctime, removed, body })
+}
+
+impl Ipc {
+    /// What is small and kept whole, in a change as in the data: the
+    /// sysctls and the POSIX message queues.
+    fn put_rest(&self, e: &mut Enc) {
         e.u64(self.sysctls.len() as u64);
         for (k, v) in &self.sysctls {
             e.bytes(k.as_bytes());
             e.bytes(v.as_bytes());
-        }
-        e.u64(self.seqs.len() as u64);
-        for (&(k, slot), &seq) in &self.seqs {
-            e.u8(k);
-            e.i32(slot);
-            e.u32(seq as u32);
-        }
-        e.u64(self.objs.len() as u64);
-        for (&(_, id), o) in &self.objs {
-            e.i32(id);
-            e.i32(o.key);
-            put_perm(e, &o.perm);
-            e.u64(o.ctime as u64);
-            e.bool(o.removed);
-            match &o.body {
-                Body::Shm(s) => {
-                    e.u8(0);
-                    e.u64(s.size);
-                    e.i32(s.cpid);
-                    e.i32(s.lpid);
-                    e.u64(s.atime as u64);
-                    e.u64(s.dtime as u64);
-                    e.bool(s.locked);
-                    e.u64(s.attached.len() as u64);
-                    for &(p, n) in &s.attached {
-                        put_proc(e, p);
-                        e.u32(n);
-                    }
-                }
-                Body::Sem(s) => {
-                    e.u8(1);
-                    e.u64(s.otime as u64);
-                    e.u64(s.vals.len() as u64);
-                    for &(v, pid) in &s.vals {
-                        e.i32(v);
-                        e.i32(pid);
-                    }
-                    e.u64(s.waiting.len() as u64);
-                    for &(p, n, z) in &s.waiting {
-                        put_proc(e, p);
-                        e.u32(n as u32);
-                        e.bool(z);
-                    }
-                    e.u64(s.undo.len() as u64);
-                    for (p, adj) in &s.undo {
-                        put_proc(e, *p);
-                        e.u64(adj.len() as u64);
-                        for &(n, a) in adj {
-                            e.u32(n as u32);
-                            e.i32(a);
-                        }
-                    }
-                }
-                Body::Msg(m) => {
-                    e.u8(2);
-                    e.u64(m.stime as u64);
-                    e.u64(m.rtime as u64);
-                    e.u64(m.qbytes);
-                    e.i32(m.lspid);
-                    e.i32(m.lrpid);
-                    e.u64(m.msgs.len() as u64);
-                    for (t, text) in &m.msgs {
-                        e.u64(*t as u64);
-                        e.bytes(text);
-                    }
-                }
-            }
         }
         e.u64(self.mq_names.len() as u64);
         for (name, dir) in &self.mq_names {
@@ -374,72 +477,230 @@ impl Data for Ipc {
         e.u64(self.mq_seq);
     }
 
-    fn decode(d: &mut Dec) -> Self {
-        let mut ipc = Ipc::default();
+    fn get_rest(&mut self, d: &mut Dec) {
+        self.sysctls.clear();
         let n = d.count(16);
         for _ in 0..n {
             let (k, v) = (d.bytes(), d.bytes());
-            ipc.sysctls.insert(
+            self.sysctls.insert(
                 String::from_utf8_lossy(&k).into_owned(),
                 String::from_utf8_lossy(&v).into_owned(),
             );
         }
-        let n = d.count(9);
-        for _ in 0..n {
-            let (k, slot, seq) = (d.u8(), d.i32(), d.u32() as u16);
-            ipc.seqs.insert((k, slot), seq);
-        }
-        let n = d.count(30);
-        for _ in 0..n {
-            let (id, key, perm, ctime, removed) =
-                (d.i32(), d.i32(), get_perm(d), d.u64() as i64, d.bool());
-            let body = match d.u8() {
-                0 => {
-                    let (size, cpid, lpid, atime, dtime, locked) =
-                        (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64, d.bool());
-                    let n = d.count(16);
-                    let attached = (0..n).map(|_| (get_proc(d), d.u32())).collect();
-                    Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked })
-                }
-                1 => {
-                    let otime = d.u64() as i64;
-                    let n = d.count(8);
-                    let vals = (0..n).map(|_| (d.i32(), d.i32())).collect();
-                    let n = d.count(17);
-                    let waiting = (0..n).map(|_| (get_proc(d), d.u32() as u16, d.bool())).collect();
-                    let n = d.count(20);
-                    let undo = (0..n)
-                        .map(|_| {
-                            let p = get_proc(d);
-                            let m = d.count(8);
-                            (p, (0..m).map(|_| (d.u32() as u16, d.i32())).collect())
-                        })
-                        .collect();
-                    Body::Sem(Sem { otime, vals, waiting, undo })
-                }
-                _ => {
-                    let (stime, rtime, qbytes, lspid, lrpid) =
-                        (d.u64() as i64, d.u64() as i64, d.u64(), d.i32(), d.i32());
-                    let n = d.count(16);
-                    let msgs = (0..n).map(|_| (d.u64() as i64, d.bytes())).collect();
-                    Body::Msg(Msg { stime, rtime, qbytes, lspid, lrpid, msgs })
-                }
-            };
-            let obj = Obj { key, perm, ctime, removed, body };
-            ipc.objs.insert((obj.kind() as u8, id), obj);
-        }
+        self.mq_names.clear();
         let n = d.count(16);
         for _ in 0..n {
             let (name, dir) = (d.bytes(), d.bytes());
-            ipc.mq_names.insert(name, dir);
+            self.mq_names.insert(name, dir);
         }
+        self.mq_live.clear();
         let n = d.count(20);
         for _ in 0..n {
             let (dir, uid, bytes) = (d.bytes(), d.u32(), d.u64());
-            ipc.mq_live.insert(dir, (uid, bytes));
+            self.mq_live.insert(dir, (uid, bytes));
         }
-        ipc.mq_seq = d.u64();
+        self.mq_seq = d.u64();
+    }
+}
+
+impl Data for Ipc {
+    fn encode(&self, e: &mut Enc) {
+        self.put_rest(e);
+        e.u64(self.seqs.len() as u64);
+        for (&(k, slot), &seq) in self.seqs.iter() {
+            e.u8(k);
+            e.i32(slot);
+            e.u32(seq as u32);
+        }
+        e.u64(self.objs.len() as u64);
+        for (&(_, id), o) in self.objs.iter() {
+            put_obj(e, id, o);
+        }
+    }
+
+    fn decode(d: &mut Dec) -> Self {
+        let mut ipc = Ipc::default();
+        ipc.get_rest(d);
+        let n = d.count(9);
+        for _ in 0..n {
+            let (k, slot, seq) = (d.u8(), d.i32(), d.u32() as u16);
+            ipc.seqs.set((k, slot), Some(seq));
+        }
+        let n = d.count(30);
+        for _ in 0..n {
+            let (id, obj) = get_obj(d);
+            ipc.objs.set((obj.kind() as u8, id), Some(obj));
+        }
         ipc
+    }
+
+    /// The objects and slots changed, each as it is now (or gone), with
+    /// the rest whole.
+    fn changes(&mut self, e: &mut Enc) -> bool {
+        self.put_rest(e);
+        let seqs = self.seqs.take_changed();
+        e.u64(seqs.len() as u64);
+        for (k, slot) in seqs {
+            e.u8(k);
+            e.i32(slot);
+            match self.seqs.get(&(k, slot)) {
+                Some(&seq) => {
+                    e.bool(true);
+                    e.u32(seq as u32);
+                }
+                None => e.bool(false),
+            }
+        }
+        let objs = self.objs.take_changed();
+        e.u64(objs.len() as u64);
+        for (k, id) in objs {
+            e.u8(k);
+            match self.objs.get(&(k, id)) {
+                Some(o) => {
+                    e.bool(true);
+                    put_obj(e, id, o);
+                }
+                None => {
+                    e.bool(false);
+                    e.i32(id);
+                }
+            }
+        }
+        true
+    }
+
+    fn apply(&mut self, d: &mut Dec) {
+        self.get_rest(d);
+        let n = d.count(6);
+        for _ in 0..n {
+            let (k, slot) = (d.u8(), d.i32());
+            let seq = d.bool().then(|| d.u32() as u16);
+            self.seqs.set((k, slot), seq);
+        }
+        let n = d.count(6);
+        for _ in 0..n {
+            let k = d.u8();
+            if d.bool() {
+                let (id, o) = get_obj(d);
+                self.objs.set((k, id), Some(o));
+            } else {
+                let id = d.i32();
+                self.objs.set((k, id), None);
+            }
+        }
+    }
+}
+
+/// A map that keeps which keys changed since it was last asked
+/// ([`Tracked::take_changed`]): what a record's change holds.
+#[derive(Debug)]
+pub struct Tracked<K, V> {
+    map: BTreeMap<K, V>,
+    changed: BTreeSet<K>,
+    /// The keys set since an index over the map last looked
+    /// ([`Tracked::take_unindexed`]).
+    unindexed: Mutex<BTreeSet<K>>,
+}
+
+impl<K, V> Default for Tracked<K, V> {
+    fn default() -> Self {
+        Tracked { map: BTreeMap::new(), changed: BTreeSet::new(), unindexed: Mutex::default() }
+    }
+}
+
+impl<K: Clone, V: Clone> Clone for Tracked<K, V> {
+    fn clone(&self) -> Self {
+        Tracked {
+            map: self.map.clone(),
+            changed: self.changed.clone(),
+            unindexed: Mutex::new(self.unindexed.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
+    }
+}
+
+impl<K: Ord + Clone, V> Tracked<K, V> {
+    /// `k` changed: for the record's change, and for indexes.
+    fn mark(&mut self, k: &K) {
+        self.changed.insert(k.clone());
+        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).insert(k.clone());
+    }
+    pub fn get(&self, k: &K) -> Option<&V> {
+        self.map.get(k)
+    }
+    /// The value at `k`, to change: `k` counts as changed.
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        if !self.map.contains_key(k) {
+            return None;
+        }
+        self.mark(k);
+        self.map.get_mut(k)
+    }
+    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+        self.mark(&k);
+        self.map.insert(k, v)
+    }
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        let v = self.map.remove(k)?;
+        self.mark(k);
+        Some(v)
+    }
+    pub fn contains_key(&self, k: &K) -> bool {
+        self.map.contains_key(k)
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, K, V> {
+        self.map.iter()
+    }
+    pub fn keys(&self) -> std::collections::btree_map::Keys<'_, K, V> {
+        self.map.keys()
+    }
+    pub fn values(&self) -> std::collections::btree_map::Values<'_, K, V> {
+        self.map.values()
+    }
+    pub fn range<R: std::ops::RangeBounds<K>>(
+        &self,
+        r: R,
+    ) -> std::collections::btree_map::Range<'_, K, V> {
+        self.map.range(r)
+    }
+    /// Run `f` on each entry: those it says it changed count as changed.
+    pub fn each_mut(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
+        let unindexed = self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in self.map.iter_mut() {
+            if f(k, v) {
+                self.changed.insert(k.clone());
+                unindexed.insert(k.clone());
+            }
+        }
+    }
+    /// Set `k` to `v` (or none) without counting it as changed: for data
+    /// read, or changes applied.
+    pub fn set(&mut self, k: K, v: Option<V>) {
+        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).insert(k.clone());
+        match v {
+            Some(v) => self.map.insert(k, v),
+            None => self.map.remove(&k),
+        };
+    }
+    /// The keys changed since last asked.
+    pub fn take_changed(&mut self) -> Vec<K> {
+        std::mem::take(&mut self.changed).into_iter().collect()
+    }
+    /// The keys set since an index last asked.
+    fn take_unindexed(&self) -> BTreeSet<K> {
+        std::mem::take(&mut *self.unindexed.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl<K: Ord + Clone, V> std::ops::Index<&K> for Tracked<K, V> {
+    type Output = V;
+    fn index(&self, k: &K) -> &V {
+        &self.map[k]
     }
 }
 
@@ -504,29 +765,46 @@ impl Ipc {
         body: Body,
         limit: usize,
     ) -> Result<i32, i32> {
-        let used: Vec<i32> = self
-            .objs
-            .keys()
-            .filter(|&&(k, _)| k == kind as u8)
-            .map(|&(_, id)| id % IPCMNI)
-            .collect();
-        if used.len() >= limit {
-            return Err(errno::ENOSPC);
-        }
-        let slot = (0..IPCMNI).find(|s| !used.contains(s)).ok_or(errno::ENOSPC)?;
-        let seq = self.seqs.entry((kind as u8, slot)).or_insert(0);
-        let id = *seq as i32 * IPCMNI + slot;
-        *seq = seq.wrapping_add(1) % (i32::MAX / IPCMNI) as u16;
+        let slot = {
+            let mut idx = self.index();
+            let k = kind as u8;
+            if idx.used[k as usize % 3].0 >= limit {
+                return Err(errno::ENOSPC);
+            }
+            let from = idx.used[k as usize % 3].1;
+            let slot =
+                (from..IPCMNI).find(|&s| !idx.slots.contains_key(&(k, s))).ok_or(errno::ENOSPC)?;
+            // The slots below it are all in use.
+            idx.used[k as usize % 3].1 = slot + 1;
+            slot
+        };
+        let seq = self.seqs.get(&(kind as u8, slot)).copied().unwrap_or(0);
+        let id = seq as i32 * IPCMNI + slot;
+        self.seqs.insert((kind as u8, slot), seq.wrapping_add(1) % (i32::MAX / IPCMNI) as u16);
         self.objs.insert((kind as u8, id), Obj { key, perm, ctime: now(), removed: false, body });
         Ok(id)
     }
 
     /// The object of `kind` with `key` (not one marked for removal).
     pub fn by_key(&self, kind: Kind, key: i32) -> Option<i32> {
-        self.objs
-            .iter()
-            .find(|(_, o)| o.kind() == kind && o.key == key && !o.removed)
-            .map(|(&(_, id), _)| id)
+        if key == IPC_PRIVATE {
+            return self
+                .objs
+                .iter()
+                .find(|(_, o)| o.kind() == kind && o.key == key && !o.removed)
+                .map(|(&(_, id), _)| id);
+        }
+        self.index().by_key.get(&(kind as u8, key)).copied()
+    }
+
+    /// The index, brought up to date with the objects changed since it
+    /// last looked.
+    fn index(&self) -> std::sync::MutexGuard<'_, Index> {
+        let mut idx = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (kind, id) in self.objs.take_unindexed() {
+            idx.reindex(kind, id, self.objs.get(&(kind, id)));
+        }
+        idx
     }
 
     /// The object of `kind` with id `id`.
@@ -556,7 +834,7 @@ impl Ipc {
     }
 
     pub fn count(&self, kind: Kind) -> usize {
-        self.objs.values().filter(|o| o.kind() == kind).count()
+        self.index().used[kind as usize % 3].0
     }
 
     /// What processes that have gone left: their attachments and undo
@@ -565,30 +843,41 @@ impl Ipc {
     pub fn reap(&mut self, r: &Record<Ipc>) -> bool {
         let mut changed = false;
         let mut gone_segments = Vec::new();
-        for (&(_, id), o) in self.objs.iter_mut() {
+        // Only objects that name processes, or are marked for removal.
+        let holders: Vec<(u8, i32)> = self.index().holders.iter().copied().collect();
+        for k in holders {
+            let Some(o) = self.objs.get(&k) else { continue };
+            let stale = match &o.body {
+                Body::Shm(s) => {
+                    (o.removed && s.attached.is_empty())
+                        || s.attached.iter().any(|&(p, _)| !alive(p))
+                }
+                Body::Sem(s) => {
+                    s.waiting.iter().any(|&(p, _, _)| !alive(p))
+                        || s.undo.iter().any(|(p, _)| !alive(*p))
+                }
+                Body::Msg(_) => false,
+            };
+            let Some(o) = self.objs.get_mut(&k).filter(|_| stale) else { continue };
             match &mut o.body {
                 Body::Shm(s) => {
-                    let before = s.attached.len();
                     s.attached.retain(|&(p, _)| alive(p));
-                    changed |= s.attached.len() != before;
                     if o.removed && s.attached.is_empty() {
-                        gone_segments.push(id);
+                        gone_segments.push(k.1);
                     }
                 }
                 Body::Sem(s) => {
-                    let before = s.waiting.len();
                     s.waiting.retain(|&(p, _, _)| alive(p));
-                    changed |= s.waiting.len() != before;
                     let (gone, live): (Vec<_>, Vec<_>) =
                         std::mem::take(&mut s.undo).into_iter().partition(|(p, _)| !alive(*p));
                     s.undo = live;
                     for (_, adj) in gone {
                         apply_undo(s, &adj);
-                        changed = true;
                     }
                 }
                 Body::Msg(_) => {}
             }
+            changed = true;
         }
         for id in gone_segments {
             self.objs.remove(&(Kind::Shm as u8, id));
@@ -783,14 +1072,16 @@ pub fn process_leaving(exec: bool) {
             }
         }
         if !exec {
-            for o in t.objs.values_mut() {
+            t.objs.each_mut(|_, o| {
                 if let Body::Sem(s) = &mut o.body
                     && let Some(i) = s.undo.iter().position(|(p, _)| *p == me)
                 {
                     let (_, adj) = s.undo.remove(i);
                     apply_undo(s, &adj);
+                    return true;
                 }
-            }
+                false
+            });
         }
         t.reap(&r);
         Ok(())
@@ -870,6 +1161,49 @@ pub fn proc_listing(r: &Record<Ipc>, kind: Kind) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Changes reach another process's copy through the journal, and the
+    /// data written whole when the journal outgrows it, in order.
+    #[test]
+    fn changes_reach_another_process() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("fwe-ipc-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.as_os_str().as_bytes().to_vec();
+        // Two processes' views of one namespace.
+        let a = Record::<Ipc>::at(d.clone(), Ipc::default).unwrap();
+        let b = Record::<Ipc>::at(d.clone(), Ipc::default).unwrap();
+        let mut live: Vec<(i32, i32)> = Vec::new();
+        for key in 0..3000 {
+            let r = if key % 3 == 0 { &a } else { &b };
+            let sem = Sem { vals: vec![(key, 0)], ..Sem::default() };
+            let id = r.update(|t| t.create(Kind::Sem, key, Perm::default(), Body::Sem(sem), 32000));
+            live.push((id.unwrap(), key));
+            if key % 5 == 0 {
+                let (gone, _) = live.remove(0);
+                let other = if key % 2 == 0 { &a } else { &b };
+                other
+                    .update(|t| t.objs.remove(&(Kind::Sem as u8, gone)).map(|_| ()).ok_or(0))
+                    .unwrap();
+            }
+        }
+        // A third process, which reads it from the start.
+        let c = Record::<Ipc>::join(&d, 0).unwrap();
+        for r in [&a, &b, &c] {
+            let t = r.get();
+            assert_eq!(t.count(Kind::Sem), live.len());
+            for &(id, key) in &live {
+                let o = &t.objs[&(Kind::Sem as u8, id)];
+                assert_eq!(o.key, key);
+                let Body::Sem(s) = &o.body else { panic!() };
+                assert_eq!(s.vals, vec![(key, 0)]);
+            }
+        }
+        // The journal never outgrows the data by much.
+        let size = |n: &str| std::fs::metadata(dir.join(n)).map_or(0, |m| m.len());
+        assert!(size("journal") <= size("data").max(64 << 10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn objects_survive_their_encoding() {

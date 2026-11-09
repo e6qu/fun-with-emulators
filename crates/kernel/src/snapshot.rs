@@ -116,6 +116,14 @@ impl<'a> Dec<'a> {
         let n = self.count(16);
         (0..n).map(|_| (self.u64(), self.u64())).collect()
     }
+    /// Whether everything has been read.
+    pub fn at_end(&self) -> bool {
+        self.bad || self.at == self.buf.len()
+    }
+    /// Whether everything read so far was there.
+    pub fn whole(&self) -> bool {
+        !self.bad
+    }
     /// Whether everything read was there and nothing is left over.
     pub fn finish(&self) -> Result<(), String> {
         if self.bad || self.at != self.buf.len() {

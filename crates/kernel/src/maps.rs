@@ -13,8 +13,9 @@
 //! as anonymous memory with the host's protections, so a program looking
 //! for free address space in the list does not pick it.
 //!
-//! Each process publishes its record after every change, in a shared file
-//! beside its process record ([`publish`]), which another process reads
+//! Each process publishes its record once it changed, before its next
+//! system call that is not a memory call and before a fork, in a shared
+//! file beside its process record ([`publish`]), which another process reads
 //! for `/proc/<pid>/maps` ([`of_process`]). A fork child, until its first
 //! change, is described by what it inherited, kept in its process record
 //! ([`forked`]), so a fork makes no file.
@@ -241,7 +242,7 @@ impl Record {
     /// `ENOMEM`.
     pub fn seal(&mut self, start: u64, end: u64) -> Result<(), i32> {
         let mut at = start;
-        for p in self.areas.iter().filter(|p| p.end > start && p.start < end) {
+        for p in self.areas.overlapping(start, end) {
             if p.start > at {
                 return Err(fwe_abi::errno::ENOMEM);
             }
@@ -256,17 +257,15 @@ impl Record {
 
     /// Whether any of `[start, end)` is sealed.
     pub fn any_sealed(&self, start: u64, end: u64) -> bool {
-        self.areas.iter().any(|p| p.end > start && p.start < end && p.value.sealed)
+        self.areas.overlapping(start, end).any(|p| p.value.sealed)
     }
 
     /// Whether any of `[start, end)` is sealed, private, anonymous and not
     /// writable: memory `madvise` may not discard.
     pub fn any_sealed_read_only(&self, start: u64, end: u64) -> bool {
-        self.areas.iter().any(|p| {
+        self.areas.overlapping(start, end).any(|p| {
             let a = p.value;
-            p.end > start
-                && p.start < end
-                && a.sealed
+            a.sealed
                 && !a.shared
                 && !matches!(a.object.name, Name::Exe | Name::Path(_))
                 && a.prot & fwe_abi::mman::PROT_WRITE == 0
@@ -440,6 +439,16 @@ impl Record {
     }
 
     /// The mappings, cut to `[start, end)`.
+    /// The mapping `addr` is in, whole: its start and end.
+    pub fn span_at(&self, addr: u64) -> Option<(u64, u64)> {
+        self.areas.get(addr).map(|p| (p.start, p.end))
+    }
+
+    /// How many mappings there are (what `vm.max_map_count` limits).
+    pub fn count(&self) -> usize {
+        self.areas.len()
+    }
+
     pub fn areas_in(&self, start: u64, end: u64) -> Vec<Piece<Area>> {
         self.areas.pieces(start, end)
     }
@@ -615,9 +624,47 @@ pub fn forked() -> Vec<u8> {
     snapshot()
 }
 
-/// Publish this process's mappings for other processes to read (after
-/// each change, and in a new program).
+/// The mappings changed since they were last published.
+static STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process's mappings changed: they are published before its next
+/// call that is not a memory call ([`flush`]). No other process can learn
+/// of a mapping before then, and a run of mapping calls (a program making
+/// thousands) publishes them once, not once each.
 pub fn publish() {
+    STALE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Before system call `nr`: publish the mappings if they changed, unless
+/// `nr` is a memory call (one that only changes them again).
+pub fn flush_before(nr: u64) {
+    use fwe_abi::nr as n;
+    if !matches!(
+        nr,
+        n::MMAP
+            | n::MUNMAP
+            | n::MPROTECT
+            | n::MREMAP
+            | n::MADVISE
+            | n::BRK
+            | n::MLOCK
+            | n::MLOCK2
+            | n::MUNLOCK
+            | n::MINCORE
+    ) {
+        flush();
+    }
+}
+
+/// Publish the mappings if they changed since last published.
+pub fn flush() {
+    if STALE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        publish_now();
+    }
+}
+
+/// Publish this process's mappings for other processes to read now.
+pub fn publish_now() {
     let body = snapshot();
     let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: getpid cannot fail.

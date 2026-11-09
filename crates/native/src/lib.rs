@@ -731,9 +731,26 @@ pub fn hostname() -> Vec<u8> {
     fwe_kernel::ns::host_name()
 }
 
+/// Have the host schedule the calling thread, one running guest code, as
+/// interactive work (`QOS_CLASS_USER_INTERACTIVE`): a guest's sleeps,
+/// timeouts and wakes are then on time on a loaded machine, as Linux's
+/// scheduler keeps them, rather than left behind the host's default work.
+pub fn interactive() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos: u32, relative: i32) -> i32;
+        }
+        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+        // SAFETY: changes only how the host schedules this thread.
+        unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    }
+}
+
 /// Load the Linux executable at `path` and run it with `args` (including
 /// `argv[0]`) and `env`. Returns only on failure to start the program.
 pub fn run(path: &Path, args: &[OsString], env: &[OsString], options: &Options) -> Error {
+    interactive();
     match start(path, args, env, options) {
         Ok(never) => match never {},
         Err(e) => e,

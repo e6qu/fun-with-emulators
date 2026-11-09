@@ -106,7 +106,7 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
 }
 
 /// A pipe end's identity and its other end's, as the host knows them.
-fn pipe_ends(fd: i32) -> Option<(u64, u64)> {
+pub(crate) fn pipe_ends(fd: i32) -> Option<(u64, u64)> {
     #[cfg(target_os = "macos")]
     {
         // `struct pipe_fdinfo` (184 bytes): the pipe's handle at 160, its

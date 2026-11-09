@@ -49,6 +49,7 @@ pub fn closed(fd: i32) {
         });
         EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
         HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
+        WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
     }
 }
 
@@ -202,13 +203,27 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         if ep == target || !is_epoll(ep) {
             return err(errno::EINVAL);
         }
+        // `EPOLLEXCLUSIVE`: only when adding, not of a set, and with no
+        // flags it cannot honour.
+        if let Some((ev, _)) = entry
+            && ev & EPOLLEXCLUSIVE != 0
+        {
+            let ok = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET;
+            if op == EPOLL_CTL_MOD || is_epoll(target) || ev & !(ok | EPOLLEXCLUSIVE) != 0 {
+                return err(errno::EINVAL);
+            }
+        }
         if op == EPOLL_CTL_ADD && is_epoll(target) && nesting_refused(ep, target) {
             return err(errno::ELOOP);
         }
-        let listed = interest(|m| m.get(&ep).is_some_and(|l| l.contains_key(&target)));
+        let listed = interest(|m| m.get(&ep).and_then(|l| l.get(&target)).map(|&(ev, _)| ev));
         match op {
-            EPOLL_CTL_ADD if listed => return err(errno::EEXIST),
-            EPOLL_CTL_DEL | EPOLL_CTL_MOD if !listed => return err(errno::ENOENT),
+            EPOLL_CTL_ADD if listed.is_some() => return err(errno::EEXIST),
+            EPOLL_CTL_DEL | EPOLL_CTL_MOD if listed.is_none() => return err(errno::ENOENT),
+            // An exclusive entry cannot be changed, only removed.
+            EPOLL_CTL_MOD if listed.is_some_and(|ev| ev & EPOLLEXCLUSIVE != 0) => {
+                return err(errno::EINVAL);
+            }
             EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD => {}
             _ => return err(errno::EINVAL),
         }
@@ -220,6 +235,11 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
             return err(errno::EPERM);
         }
         if r == 0 {
+            if let Some((ev, _)) = entry
+                && ev & EPOLLEXCLUSIVE != 0
+            {
+                crate::exclusive::watch(target);
+            }
             // A changed entry is looked at afresh, edge-triggered or not.
             edge_clear(epfd as i32, fd as i32);
             interest(|m| {
@@ -459,6 +479,17 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     .into_iter()
     .filter(|&(fd, ..)| crate::fifo::is_reader(fd))
     .collect();
+    let exclusive: Vec<i32> = interest(|m| {
+        m.get(&ep).map_or_else(Vec::new, |l| {
+            l.iter()
+                .filter(|(_, (ev, _))| ev & EPOLLEXCLUSIVE != 0 && ev & EPOLLIN != 0)
+                .map(|(&fd, _)| fd)
+                .collect()
+        })
+    });
+    if fifos.is_empty() && !exclusive.is_empty() {
+        return wait_exclusive(ep, events, max, ns, &exclusive);
+    }
     if fifos.is_empty() {
         let ready = match kevent_wait(ep, max, ns) {
             Ok(r) => r,
@@ -528,6 +559,88 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     }
 }
 
+/// `epoll_pwait` on a set with entries added with `EPOLLEXCLUSIVE`
+/// (`exclusive`, those for reading): of the sets a write woke, only the
+/// one that takes it ([`crate::exclusive::take`]) reports it; the others
+/// wait on. What is ready when the call starts is reported, as Linux
+/// reports readiness to whoever asks.
+#[cfg(not(target_os = "linux"))]
+fn wait_exclusive(ep: i32, events: u64, max: usize, ns: i64, exclusive: &[i32]) -> i64 {
+    use fwe_abi::epoll::*;
+    let ready = match kevent_wait(ep, max, 0) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if !ready.is_empty() || ns == 0 {
+        for &(fd, bits, _) in &ready {
+            if bits & EPOLLIN != 0 && exclusive.contains(&fd) {
+                crate::exclusive::take_all(fd);
+            }
+        }
+        return write_events(events, &ready);
+    }
+    let deadline =
+        (ns > 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
+    let left = || {
+        deadline.map_or(-1, |d| {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            left.as_nanos().min(i64::MAX as u128) as i64
+        })
+    };
+    loop {
+        let mut ready = match kevent_wait(ep, max, left()) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        // Woken by a write to a pipe watched exclusively: only if this set
+        // takes it. A hang-up or error is everyone's.
+        let mut lost = None;
+        ready.retain(|&(fd, bits, _)| {
+            let only_input = bits & (EPOLLHUP | EPOLLERR) == 0 && bits & EPOLLIN != 0;
+            if only_input && exclusive.contains(&fd) && !crate::exclusive::take(fd) {
+                lost = Some(fd);
+                return false;
+            }
+            true
+        });
+        let Some(fd) = lost.filter(|_| ready.is_empty()) else {
+            return write_events(events, &ready);
+        };
+        // Another set took it. The pipe may stay ready (by level) until it
+        // is read: wait for the next write, in slices, for a signal.
+        let seen = crate::exclusive::writes(fd).unwrap_or(0);
+        loop {
+            let ns = left();
+            if ns == 0 {
+                return write_events(events, &[]);
+            }
+            if crate::thread::deliverable() != 0 {
+                return fwe_abi::err(fwe_abi::errno::EINTR);
+            }
+            let slice = std::time::Duration::from_millis(10);
+            let slice =
+                if ns > 0 { slice.min(std::time::Duration::from_nanos(ns as u64)) } else { slice };
+            crate::exclusive::wait_for_write(fd, seen, slice);
+            if crate::exclusive::writes(fd) != Some(seen) {
+                break;
+            }
+            // Meanwhile, what else of the set is ready.
+            let others: Ready = match kevent_wait(ep, max, 0) {
+                Ok(r) => r,
+                Err(e) => return e,
+            }
+            .into_iter()
+            .filter(|&(fd, bits, _)| {
+                !(exclusive.contains(&fd) && bits & (EPOLLHUP | EPOLLERR) == 0)
+            })
+            .collect();
+            if !others.is_empty() {
+                return write_events(events, &others);
+            }
+        }
+    }
+}
+
 /// Write `ready` events to the guest's `events` array.
 #[cfg(not(target_os = "linux"))]
 fn write_events(events: u64, ready: &[(i32, u32, u64)]) -> i64 {
@@ -565,6 +678,7 @@ fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
 fn edge_clear(epfd: i32, fd: i32) {
     EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
     HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
+    WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
 }
 
 /// What edge-triggered pipe read ends in epoll sets held when last
@@ -572,11 +686,32 @@ fn edge_clear(epfd: i32, fd: i32) {
 #[cfg(not(target_os = "linux"))]
 static HELD: std::sync::Mutex<Vec<(i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
 
+/// The writes each set saw counted of each pipe watched exclusively it
+/// watches: `(epfd, fd, writes)`.
+#[cfg(not(target_os = "linux"))]
+static WRITES: std::sync::Mutex<Vec<(i32, i32, u64)>> = std::sync::Mutex::new(Vec::new());
+
 /// Whether a pipe read end `fd` holding `bytes` has had data written since
 /// set `epfd` last saw it, which is an edge to Linux (the host's
 /// edge-triggered read filter fires on reads too).
 #[cfg(not(target_os = "linux"))]
 fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
+    // A pipe whose writes are counted (one watched exclusively): written
+    // to since, whatever it holds now.
+    if let Some(w) = crate::exclusive::writes(fd) {
+        let mut seen = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        return match seen.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
+            Some(k) => {
+                let grew = w > k.2;
+                k.2 = w;
+                grew
+            }
+            None => {
+                seen.push((epfd, fd, w));
+                true
+            }
+        };
+    }
     let mut h = HELD.lock().unwrap_or_else(|e| e.into_inner());
     match h.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
         Some(k) => {

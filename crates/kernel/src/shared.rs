@@ -2,9 +2,15 @@
 //! on the host, as a kernel keeps state every process sees in its own
 //! memory. Mount tables, namespaces and the cgroup tree are such records.
 //!
-//! A record is a directory holding its data (replaced whole by each change,
-//! under a lock) and a generation count each process maps, so a process
-//! rereads the data only when another has changed it.
+//! A record is a directory holding its data and a generation count each
+//! process maps, so a process rereads the data only when another has
+//! changed it. Each change, made under a lock, counts a generation. A type
+//! that keeps its changes ([`Data::changes`]) has each appended to a
+//! journal beside the data, which a process applies to its copy, until the
+//! journal outgrows the data and the data is written whole again; others
+//! are written whole each time. A record of thousands of objects (System V
+//! IPC's) so costs a change what the change holds, not what the record
+//! does.
 
 use crate::host::{errno_to_linux, last_errno};
 use crate::snapshot::{Dec, Enc};
@@ -22,6 +28,26 @@ pub trait Data: Clone + Default + Send + Sync + 'static {
     fn valid(&self) -> bool {
         true
     }
+    /// The changes made since the data was read or last asked, encoded
+    /// for [`Data::apply`] and forgotten: `false` for a type that does not
+    /// keep them, which is written whole each time.
+    fn changes(&mut self, _e: &mut Enc) -> bool {
+        false
+    }
+    /// Apply changes [`Data::changes`] encoded (keeping none of them as
+    /// changes of its own).
+    fn apply(&mut self, _d: &mut Dec) {}
+}
+
+/// The size a journal may reach before the data is written whole, when
+/// the data is smaller.
+const JOURNAL_MIN: u64 = 64 << 10;
+
+/// The bytes of the file at host path `p`.
+fn read_path(p: &[u8]) -> Result<Vec<u8>, i32> {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read(std::ffi::OsStr::from_bytes(p))
+        .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
 }
 
 fn e() -> i32 {
@@ -89,6 +115,18 @@ fn wake_all(word: &AtomicU64) {
     let _ = word;
 }
 
+/// Sleep up to `slice` while shared word `word` reads `seen`.
+pub(crate) fn wait_word_for(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
+    if word.load(Ordering::Acquire) == seen {
+        wait_word(word, seen, slice);
+    }
+}
+
+/// Wake every process waiting for shared word `word` to change.
+pub(crate) fn wake_word(word: &AtomicU64) {
+    wake_all(word);
+}
+
 /// FNV-1a: stable across processes and fwe builds.
 pub fn hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
@@ -98,7 +136,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 13;
+pub const FORMAT: u32 = 14;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -164,7 +202,9 @@ impl<T: Data> Record<T> {
         let r = Record::open(dir, id, true)?;
         r.with_lock(|| {
             if r.read_file().is_err() {
-                r.write_file(&initial())?;
+                let at = r.generation() + 1;
+                r.write_file(at, &initial())?;
+                r.advance(at);
             }
             Ok(())
         })?;
@@ -232,22 +272,103 @@ impl<T: Data> Record<T> {
         [&self.dir[..], b"/data"].concat()
     }
 
-    fn read_file(&self) -> Result<T, i32> {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = std::fs::read(std::ffi::OsStr::from_bytes(&self.data_path()))
-            .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
+    fn journal_path(&self) -> Vec<u8> {
+        [&self.dir[..], b"/journal"].concat()
+    }
+
+    /// The data as last written whole, and the generation it is at.
+    fn read_file(&self) -> Result<(u64, T), i32> {
+        let bytes = read_path(&self.data_path())?;
         let mut d = Dec::new(&bytes);
+        let at = d.u64();
         let t = T::decode(&mut d);
         d.finish().map_err(|_| errno::EIO)?;
         if !t.valid() {
             return Err(errno::EIO);
         }
-        Ok(t)
+        Ok((at, t))
     }
 
-    fn write_file(&self, t: &T) -> Result<(), i32> {
+    /// The generation the data written whole is at.
+    fn file_generation(&self) -> Result<u64, i32> {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        let mut f = std::fs::File::open(std::ffi::OsStr::from_bytes(&self.data_path()))
+            .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
+        let mut b = [0u8; 8];
+        f.read_exact(&mut b).map_err(|_| errno::EIO)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    /// The journal's changes after generation `after`, one per generation
+    /// from `after + 1` on, each with its generation. A change written
+    /// again for the same generation (its writer ended before the change
+    /// counted) stands for the one before it.
+    fn journal_after(&self, after: u64) -> Vec<(u64, Vec<u8>)> {
+        let Ok(bytes) = read_path(&self.journal_path()) else { return Vec::new() };
+        let mut d = Dec::new(&bytes);
+        let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        while !d.at_end() {
+            let (at, body) = (d.u64(), d.bytes());
+            if !d.whole() {
+                // One being written as this read.
+                break;
+            }
+            out.retain(|&(g, _)| g < at);
+            if at > after {
+                out.push((at, body));
+            }
+        }
+        out
+    }
+
+    /// The data at generation `seen` and the changes after it, applied:
+    /// the data and the generation it is now at (`Err` for changes
+    /// missing between).
+    fn apply_after(&self, seen: u64, base: &T) -> Result<(u64, T), i32> {
+        let changes = self.journal_after(seen);
+        let mut t = base.clone();
+        let mut at = seen;
+        for (g, body) in changes {
+            if g != at + 1 {
+                return Err(errno::EIO);
+            }
+            let mut d = Dec::new(&body);
+            t.apply(&mut d);
+            d.finish().map_err(|_| errno::EIO)?;
+            at = g;
+        }
+        Ok((at, t))
+    }
+
+    /// The data as it is now and the generation it is at: `cached` (at
+    /// generation `seen`) brought up to date from the journal when it
+    /// holds every change since, else read whole. What a change made
+    /// meanwhile tore is read again.
+    fn read_current(&self, seen: u64, cached: &Arc<T>) -> Result<(u64, Arc<T>), i32> {
+        let mut last = Err(errno::EIO);
+        for _ in 0..100 {
+            let now = self.generation.load(Ordering::SeqCst);
+            let read = match self.file_generation() {
+                Ok(whole) if seen != u64::MAX && whole <= seen => self.apply_after(seen, cached),
+                Ok(_) => self.read_file().and_then(|(whole, t)| self.apply_after(whole, &t)),
+                Err(e) => Err(e),
+            };
+            match read {
+                Ok((at, t)) if at == now => return Ok((at, Arc::new(t))),
+                Ok((at, t)) => last = Ok((at, Arc::new(t))),
+                Err(e) => last = Err(e),
+            }
+            std::thread::yield_now();
+        }
+        last
+    }
+
+    /// Under the lock: write `t` whole at generation `at`.
+    fn write_file(&self, at: u64, t: &T) -> Result<(), i32> {
         use std::os::unix::ffi::OsStrExt;
         let mut enc = Enc::new();
+        enc.u64(at);
         t.encode(&mut enc);
         // SAFETY: getpid cannot fail.
         let pid = unsafe { libc::getpid() };
@@ -259,9 +380,75 @@ impl<T: Data> Record<T> {
         if unsafe { libc::rename(from.as_ptr(), to.as_ptr()) } != 0 {
             return Err(e());
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        wake_all(self.generation);
         Ok(())
+    }
+
+    /// Under the lock: the change made at generation `at`, appended to
+    /// the journal in one write.
+    fn append_journal(&self, at: u64, body: Vec<u8>) -> Result<(), i32> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let mut enc = Enc::new();
+        enc.u64(at);
+        enc.bytes(&body);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(std::ffi::OsStr::from_bytes(&self.journal_path()))
+            .and_then(|mut f| f.write_all(&enc.into_bytes()))
+            .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
+    }
+
+    /// Under the lock: the generation moves to `at`, for every process.
+    fn advance(&self, at: u64) {
+        self.generation.store(at, Ordering::SeqCst);
+        wake_all(self.generation);
+    }
+
+    /// Under the lock: the data as it is now, the cached copy taken when
+    /// it is current (no other process changed it since), else read.
+    fn take_locked(&self) -> Result<T, i32> {
+        let now = self.generation.load(Ordering::SeqCst);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let held = std::mem::replace(&mut *cache, (u64::MAX, Arc::new(T::default())));
+        if held.0 == now {
+            return Ok(Arc::try_unwrap(held.1).unwrap_or_else(|a| (*a).clone()));
+        }
+        let (_, t) = self.read_current(held.0, &held.1)?;
+        Ok(Arc::try_unwrap(t).unwrap_or_else(|a| (*a).clone()))
+    }
+
+    /// Under the lock: `t` is the data now, for every process. A type
+    /// that keeps its changes has them appended to the journal; the data
+    /// is written whole once the journal outgrows it.
+    fn put_locked(&self, mut t: T) -> Result<(), i32> {
+        use std::os::unix::ffi::OsStrExt;
+        let at = self.generation.load(Ordering::SeqCst) + 1;
+        let mut changes = Enc::new();
+        let kept = t.changes(&mut changes);
+        let size =
+            |p: &[u8]| std::fs::metadata(std::ffi::OsStr::from_bytes(p)).map_or(0, |m| m.len());
+        let (whole, journal) = (size(&self.data_path()), size(&self.journal_path()));
+        let changes = changes.into_bytes();
+        if kept && whole > 0 && journal + changes.len() as u64 <= whole.max(JOURNAL_MIN) {
+            self.append_journal(at, changes)?;
+        } else {
+            self.write_file(at, &t)?;
+            if journal > 0 {
+                let _ = std::fs::write(std::ffi::OsStr::from_bytes(&self.journal_path()), b"");
+            }
+        }
+        self.advance(at);
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = (at, Arc::new(t));
+        Ok(())
+    }
+
+    /// Under the lock: `t`, which `f` left as it was, is the cached copy
+    /// again.
+    fn restore_locked(&self, mut t: T) {
+        t.changes(&mut Enc::new());
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            (self.generation.load(Ordering::SeqCst), Arc::new(t));
     }
 
     /// Run `f` holding the record's lock.
@@ -314,9 +501,9 @@ impl<T: Data> Record<T> {
         let now = self.generation.load(Ordering::SeqCst);
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.0 != now
-            && let Ok(t) = self.read_file()
+            && let Ok(fresh) = self.read_current(cache.0, &cache.1)
         {
-            *cache = (now, Arc::new(t));
+            *cache = fresh;
         }
         cache.1.clone()
     }
@@ -324,9 +511,9 @@ impl<T: Data> Record<T> {
     /// Change the data with `f`, for every process.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> Result<R, i32>) -> Result<R, i32> {
         self.with_lock(|| {
-            let mut t = self.read_file()?;
+            let mut t = self.take_locked()?;
             let r = f(&mut t)?;
-            self.write_file(&t)?;
+            self.put_locked(t)?;
             Ok(r)
         })
     }
@@ -339,10 +526,12 @@ impl<T: Data> Record<T> {
         f: impl FnOnce(&mut T) -> Result<(R, bool), i32>,
     ) -> Result<R, i32> {
         self.with_lock(|| {
-            let mut t = self.read_file()?;
+            let mut t = self.take_locked()?;
             let (r, changed) = f(&mut t)?;
             if changed {
-                self.write_file(&t)?;
+                self.put_locked(t)?;
+            } else {
+                self.restore_locked(t);
             }
             Ok(r)
         })
