@@ -2845,6 +2845,16 @@ mod tests {
         }
     }
 
+    /// Held by a test that maps memory through the kernel: the tests share
+    /// the process's address space and its record of the guest's mappings,
+    /// and one that unmaps, moves or probes an address it gave up (as
+    /// `mremap` of a moved range does) must not reach another's mapping the
+    /// host put there meanwhile.
+    fn mapping_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn kernel() -> Kernel<TestPlatform> {
         // SAFETY: plain host call.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
@@ -3137,6 +3147,7 @@ mod tests {
     /// needs a backend's fault handling: LTP's `mincore01` checks it.)
     #[test]
     fn mincore_reports_residency() {
+        let _mapping = mapping_lock();
         let mut k = kernel();
         let page = k.page_size;
         // SAFETY: a fresh anonymous mapping for the test.
@@ -3239,6 +3250,7 @@ mod tests {
 
     #[test]
     fn msync_syncs_a_mapping() {
+        let _mapping = mapping_lock();
         use fwe_abi::statfs::{MS_ASYNC, MS_SYNC};
         let mut k = kernel();
         let len = k.page_size;
@@ -3338,6 +3350,7 @@ mod tests {
 
     #[test]
     fn executable_mappings_are_prepared() {
+        let _mapping = mapping_lock();
         let mut k = kernel();
         let len = k.page_size;
         let p = k.syscall(nr::MMAP, [0, len, 5 /* R|X */, 0x22 /* PRIVATE|ANON */, u64::MAX, 0]);
@@ -3348,6 +3361,7 @@ mod tests {
 
     #[test]
     fn brk_grows_and_shrinks() {
+        let _mapping = mapping_lock();
         let mut k = kernel();
         let size = 64 * k.page_size;
         // Find free address space for the reservation. Other tests map memory
@@ -3457,6 +3471,7 @@ mod tests {
     /// mapping cannot move, and fails.
     #[test]
     fn code_without_room_for_stubs_moves_unless_fixed() {
+        let _mapping = mapping_lock();
         use fwe_abi::mman::*;
         let mut k = kernel();
         let len = k.page_size;
@@ -3480,6 +3495,7 @@ mod tests {
     /// asked for with `MREMAP_FIXED`), the grown part zero.
     #[test]
     fn mappings_grow_and_move_with_their_contents() {
+        let _mapping = mapping_lock();
         use fwe_abi::mman::*;
         let mut k = kernel();
         let page = k.page_size;
