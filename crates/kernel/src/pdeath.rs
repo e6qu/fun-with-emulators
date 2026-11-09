@@ -24,11 +24,13 @@ static WATCHING: AtomicBool = AtomicBool::new(false);
 pub fn set(sig: u64) {
     SIG.store(sig, SeqCst);
     if sig != 0 && !WATCHING.swap(true, SeqCst) {
-        // SAFETY: getppid cannot fail.
-        let parent = unsafe { libc::getppid() };
-        let started =
-            std::thread::Builder::new().name("fwe-pdeath".into()).spawn(move || watch(parent));
+        // The parent is watched from now on, before the call returns: a
+        // parent that ends right after (as the child tells it to) is seen.
+        let Some(kq) = watch_parent() else { return };
+        let started = std::thread::Builder::new().name("fwe-pdeath".into()).spawn(move || wait(kq));
         if started.is_err() {
+            // SAFETY: the kqueue made above, of no one else's.
+            unsafe { libc::close(kq) };
             WATCHING.store(false, SeqCst);
         }
     }
@@ -56,26 +58,21 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     set(d.u64());
 }
 
-/// The watching thread: wait for host process `parent` to end, then send
-/// the signal.
+/// A kqueue watching this process's host parent for its end, made by the
+/// calling thread; none if the parent has ended already (an adopted
+/// orphan's host parent is `launchd`), which sends nothing, as on Linux.
 #[cfg(target_os = "macos")]
-fn watch(parent: i32) {
-    // Signals are for the guest's threads, never this one.
-    // SAFETY: plain host calls on a valid signal set.
-    unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-    }
-    // An adopted orphan's host parent is `launchd`: its parent has ended.
+fn watch_parent() -> Option<i32> {
+    // SAFETY: getppid cannot fail.
+    let parent = unsafe { libc::getppid() };
     if parent <= 1 {
-        return;
+        return None;
     }
-    // SAFETY: plain host calls on a kqueue of this thread's own, in fwe's
-    // reserved range, where the guest's closing of its descriptors (as a
-    // program does before an `execve`) does not reach it.
+    // SAFETY: plain host calls on a kqueue of fwe's own, in its reserved
+    // range, where the guest's closing of its descriptors (as a program
+    // does before an `execve`) does not reach it.
     unsafe {
-        let Ok(kq) = crate::fdtable::reserve(libc::kqueue()) else { return };
+        let kq = crate::fdtable::reserve(libc::kqueue()).ok()?;
         let ev = libc::kevent {
             ident: parent as libc::uintptr_t,
             filter: libc::EVFILT_PROC,
@@ -84,11 +81,30 @@ fn watch(parent: i32) {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        // A parent already gone sends nothing.
         if libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) != 0 {
             libc::close(kq);
-            return;
+            return None;
         }
+        Some(kq)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_parent() -> Option<i32> {
+    None
+}
+
+/// On a thread of fwe's: wait on kqueue `kq` ([`watch_parent`]) for the
+/// parent's end, then send the signal.
+#[cfg(target_os = "macos")]
+fn wait(kq: i32) {
+    // Signals are for the guest's threads, never this one.
+    // SAFETY: plain host calls on a valid signal set and the kqueue the
+    // thread was given, which it closes.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
         let mut out: libc::kevent = std::mem::zeroed();
         let n = loop {
             let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null());
@@ -106,7 +122,7 @@ fn watch(parent: i32) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn watch(_: i32) {}
+fn wait(_: i32) {}
 
 /// Send `sig` (a Linux signal) to this process, as the parent's end does.
 #[cfg(target_os = "macos")]
