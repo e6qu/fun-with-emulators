@@ -652,10 +652,19 @@ records ([linux-on-macos.md](linux-on-macos.md#ipc)). Their details:
 
 Sockets and terminals are the host's; fwe translates their interfaces:
 
-- `crates/kernel/src/net.rs` translates addresses, flags and options (see
-  [linux-on-macos.md](linux-on-macos.md#sockets)). A Unix socket gets
-  Linux's buffer sizes; reading an unconnected Unix stream socket fails
-  with `EINVAL`; `shutdown` of one whose peer has gone succeeds.
+- `crates/kernel/src/net.rs` translates addresses, flags and options,
+  with `crates/kernel/src/sockopt.rs` for the IP, IPv6 and TCP options
+  (see [linux-on-macos.md](linux-on-macos.md#sockets)), and checks each
+  call's arguments in Linux's order before the host sees them. A Unix
+  socket gets Linux's buffer sizes; reading an unconnected Unix stream
+  socket fails with `EINVAL`; `shutdown` of one whose peer has gone
+  succeeds. What the host has no place for is kept per descriptor in the
+  process: bytes `MSG_MORE` holds back, multicast groups a TCP socket
+  joined, the options fwe keeps, and which IPv6 sockets `IPV6_ADDRFORM`
+  made IPv4. The calls run without the kernel lock, so whether the caller
+  passes permission bits (`CAP_DAC_OVERRIDE`), which a connect to a Unix
+  socket's node needs, is published after each system call
+  (`creds::dac_override`).
 - `AF_UNIX` paths resolve like file paths (`fs::resolve_host`; the socket
   calls run without the kernel lock, so the process's root and working
   directory are published for them). `bind` follows no final symlink and
@@ -997,6 +1006,14 @@ which are to be lifted for 1.0 and which are not planned.
   not held; `RLIMIT_MSGQUEUE` counts the user's queues in the namespace
   only; a registration goes with `close` or `execve` of a descriptor, not
   `dup2` or `close_range`.
+- Sockets: what fwe keeps of a socket (`MSG_MORE`'s bytes held back, a
+  TCP socket's multicast groups, kept options, `IPV6_ADDRFORM`) is the
+  process's, per descriptor, so a duplicate or another process sharing
+  the socket does not see it; a socket closed with bytes held back sends
+  them without waiting. An abstract name whose socket is bound but not
+  listening counts as free. Options whose data comes in control messages
+  (`IP_PKTINFO`, `IP_RECVTTL`, `SO_TIMESTAMP`) are refused, and so is
+  `TCP_INFO`.
 - Keys: no `/sbin/request-key` helper runs, so a constructed key is
   negative and `KEYCTL_INSTANTIATE`, `NEGATE`, `REJECT` and
   `ASSUME_AUTHORITY` have no authorisation key; asymmetric keys are RSA

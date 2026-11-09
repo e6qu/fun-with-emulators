@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 954 of 1550 (79% of the 1211 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 978 of 1550 (81% of the 1212 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -101,7 +101,13 @@ capabilities. *crun, podman and containerd run standard images.*
   requests, and `setns` with one;
 - sleeps and timeouts on time (a precise host timer per thread), `poll`
   and `select` events as Linux reports them, timerfd's checks and flags,
-  and shared futexes requeued.
+  and shared futexes requeued;
+- a pipe's capacity held to what `F_SETPIPE_SZ` set, and edge-triggered
+  `epoll` on a pipe as Linux reports it;
+- sockets checked and numbered as Linux has them: arguments in Linux's
+  order, the IP, IPv6, TCP and socket options translated, `MSG_MORE`,
+  `sendmmsg`/`recvmmsg`, `connect` to `AF_UNSPEC`, `IPV6_ADDRFORM`,
+  abstract names freed with their socket, and the interface requests.
 
 ## Left to 1.0
 

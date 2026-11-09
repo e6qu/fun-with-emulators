@@ -550,10 +550,16 @@ pub mod ioctl {
     pub const FIOASYNC: u64 = 0x5452;
     /// Network interface requests on a socket (`struct ifreq`).
     pub const SIOCGIFNAME: u64 = 0x8910;
+    pub const SIOCGIFCONF: u64 = 0x8912;
     pub const SIOCGIFFLAGS: u64 = 0x8913;
     pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const SIOCGIFADDR: u64 = 0x8915;
+    pub const SIOCGIFNETMASK: u64 = 0x891b;
     pub const SIOCGIFMTU: u64 = 0x8921;
+    pub const SIOCSIFMTU: u64 = 0x8922;
     pub const SIOCGIFINDEX: u64 = 0x8933;
+    /// Whether a TCP socket's reading is at its urgent mark.
+    pub const SIOCATMARK: u64 = 0x8905;
     /// `IFF_*` interface flags.
     pub const IFF_UP: u16 = 0x1;
     pub const IFF_LOOPBACK: u16 = 0x8;
@@ -1207,7 +1213,10 @@ pub mod socket {
     pub const MSG_DONTWAIT: u64 = 0x40;
     pub const MSG_EOR: u64 = 0x80;
     pub const MSG_WAITALL: u64 = 0x100;
+    pub const MSG_ERRQUEUE: u64 = 0x2000;
+    pub const MSG_WAITFORONE: u64 = 0x10000;
     pub const MSG_NOSIGNAL: u64 = 0x4000;
+    pub const MSG_MORE: u64 = 0x8000;
 }
 
 /// `eventfd2` flags (`sys/eventfd.h`).

@@ -14,6 +14,23 @@
 
 use fwe_abi::{err, errno};
 
+/// Whether the process passes files' permission bits (`CAP_DAC_OVERRIDE`),
+/// as of its last system call ([`note_dac_override`]): for what fwe checks
+/// in the calls that run without the kernel (connecting to a Unix socket's
+/// file). Credentials change only in system calls.
+static DAC_OVERRIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the process passes files' permission bits ([`DAC_OVERRIDE`]).
+pub fn dac_override() -> bool {
+    DAC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record whether the process passes files' permission bits, after a
+/// system call that may have changed it.
+pub fn note_dac_override(yes: bool) {
+    DAC_OVERRIDE.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `(uid_t)-1`: "leave unchanged" in the `setre*`/`setres*` calls.
 const KEEP: u32 = u32::MAX;
 

@@ -52,6 +52,8 @@ pub struct Net {
     pub ports: std::collections::BTreeMap<(u8, u16), u16>,
     /// Its sysctls set (see [`crate::sysctl`]), by path under `/proc/sys`.
     pub sysctls: std::collections::BTreeMap<String, String>,
+    /// `lo`'s MTU set (`SIOCSIFMTU`; 0: Linux's 65536).
+    pub lo_mtu: u32,
 }
 
 impl Data for Net {
@@ -68,6 +70,7 @@ impl Data for Net {
             e.bytes(k.as_bytes());
             e.bytes(v.as_bytes());
         }
+        e.u32(self.lo_mtu);
     }
     fn decode(d: &mut Dec) -> Self {
         let lo_up = d.bool();
@@ -76,7 +79,8 @@ impl Data for Net {
         let n = d.count(16);
         let text = |d: &mut Dec| String::from_utf8_lossy(&d.bytes()).into_owned();
         let sysctls = (0..n).map(|_| (text(d), text(d))).collect();
-        Net { lo_up, ports, sysctls }
+        let lo_mtu = d.u32();
+        Net { lo_up, ports, sysctls, lo_mtu }
     }
 }
 

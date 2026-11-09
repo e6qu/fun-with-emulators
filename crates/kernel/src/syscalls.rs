@@ -134,6 +134,7 @@ impl<P: Platform> Kernel<P> {
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
+        crate::creds::note_dac_override(self.creds.has(crate::caps::CAP_DAC_OVERRIDE));
         crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
@@ -198,6 +199,7 @@ impl<P: Platform> Kernel<P> {
                     crate::netns::closed(fd, mark);
                 }
                 crate::netlink::closed(fd);
+                crate::net::closed(fd);
                 crate::mountapi::closed(fd);
                 crate::nsfd::closed(fd);
                 crate::inotify::closed(fd);
@@ -297,7 +299,10 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             // SAFETY: the option buffer is validated by the host/impl.
-            nr::SETSOCKOPT => unsafe { crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4]) },
+            nr::SETSOCKOPT => unsafe {
+                let admin = self.creds.has(crate::caps::CAP_NET_ADMIN);
+                crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4], admin)
+            },
             // SAFETY: the out buffers are validated by the host/impl.
             nr::GETSOCKOPT => unsafe { crate::net::getsockopt(a[0], a[1], a[2], a[3], a[4]) },
             // SAFETY: no pointers.
@@ -1108,6 +1113,11 @@ impl<P: Platform> Kernel<P> {
                 | ioctl::SIOCSIFFLAGS
                 | ioctl::SIOCGIFINDEX
                 | ioctl::SIOCGIFMTU
+                | ioctl::SIOCSIFMTU
+                | ioctl::SIOCGIFADDR
+                | ioctl::SIOCGIFNETMASK
+                | ioctl::SIOCGIFCONF
+                | ioctl::SIOCATMARK
                 | ioctl::SIOCGIFNAME => self.interface_ioctl(fd, req, arg),
                 ioctl::TCSETS | ioctl::TCSETSW | ioctl::TCSETSF => {
                     crate::term::tcsetattr(fd, req, arg)
@@ -1397,10 +1407,6 @@ impl<P: Platform> Kernel<P> {
     /// initial one they are the host's, with Linux's `lo` for its `lo0`.
     fn interface_ioctl(&mut self, fd: i32, req: u64, arg: u64) -> i64 {
         use ioctl::*;
-        let mut ifr = [0u8; 40];
-        guest!(uaccess::read_into(arg, &mut ifr));
-        let name_end = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
-        let name = ifr[..name_end].to_vec();
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out-parameter.
@@ -1409,9 +1415,33 @@ impl<P: Platform> Kernel<P> {
             let open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
             return err(if open { errno::ENOTTY } else { errno::EBADF });
         }
+        if req == SIOCATMARK {
+            return crate::net::at_mark(fd, arg);
+        }
+        let net = self.fs().ns.net.clone();
+        if req == SIOCGIFCONF {
+            let addrs = match &net {
+                Some(n) if n.get().lo_up => vec![(b"lo".to_vec(), [127, 0, 0, 1], [255, 0, 0, 0])],
+                Some(_) => Vec::new(),
+                None => host_ipv4_addrs(),
+            };
+            return ifconf(arg, &addrs);
+        }
+        let mut ifr = [0u8; 40];
+        guest!(uaccess::read_into(arg, &mut ifr));
+        let name_end = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
+        let name = ifr[..name_end].to_vec();
         let put16 = |v: u16| uaccess::write(arg + 16, v);
         let put32 = |v: i32| uaccess::write(arg + 16, v);
-        if let Some(net) = self.fs().ns.net.clone() {
+        // An address (`SIOCGIFADDR`) or mask as a `sockaddr_in` in the
+        // request.
+        let put_addr = |a: [u8; 4]| {
+            let mut sin = [0u8; 16];
+            sin[..2].copy_from_slice(&(fwe_abi::socket::AF_INET as u16).to_ne_bytes());
+            sin[4..8].copy_from_slice(&a);
+            uaccess::write(arg + 16, sin)
+        };
+        if let Some(net) = net {
             let is_lo = name == b"lo";
             return match req {
                 SIOCGIFNAME => {
@@ -1449,7 +1479,35 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 SIOCGIFMTU => {
-                    guest!(put32(65536));
+                    let mtu = net.get().lo_mtu;
+                    guest!(put32(if mtu == 0 { 65536 } else { mtu as i32 }));
+                    0
+                }
+                SIOCSIFMTU => {
+                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                        return err(errno::EPERM);
+                    }
+                    // At least an Ethernet frame's minimum (ETH_MIN_MTU).
+                    let mtu = i32::from_ne_bytes(ifr[16..20].try_into().unwrap());
+                    if mtu < 68 {
+                        return err(errno::EINVAL);
+                    }
+                    match net.update(|n| {
+                        n.lo_mtu = mtu as u32;
+                        Ok(())
+                    }) {
+                        Ok(()) => 0,
+                        Err(e) => err(e),
+                    }
+                }
+                // An interface down has no address.
+                SIOCGIFADDR | SIOCGIFNETMASK if !net.get().lo_up => err(errno::EADDRNOTAVAIL),
+                SIOCGIFADDR => {
+                    guest!(put_addr([127, 0, 0, 1]));
+                    0
+                }
+                SIOCGIFNETMASK => {
+                    guest!(put_addr([255, 0, 0, 0]));
                     0
                 }
                 _ => err(errno::EINVAL),
@@ -1499,6 +1557,17 @@ impl<P: Platform> Kernel<P> {
                     guest!(put32(i32::from_ne_bytes(h[16..20].try_into().unwrap())));
                 }
                 0
+            }
+            SIOCGIFADDR | SIOCGIFNETMASK => {
+                let shown: &[u8] = &name;
+                match host_ipv4_addrs().into_iter().find(|(n, ..)| n == shown) {
+                    Some((_, addr, mask)) => {
+                        guest!(put_addr(if req == SIOCGIFADDR { addr } else { mask }));
+                        0
+                    }
+                    None if host_index(&cname) == 0 => err(errno::ENODEV),
+                    None => err(errno::EADDRNOTAVAIL),
+                }
             }
             // The host's interfaces are not the guest's to change.
             _ => err(errno::EPERM),
@@ -2233,6 +2302,70 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
             return if n < 0 { last_error() } else { n as i64 };
         }
     }
+}
+
+/// The host's interfaces' IPv4 addresses, as (name as Linux has it, its
+/// address, its mask): `lo0` is Linux's `lo`.
+fn host_ipv4_addrs() -> Vec<(Vec<u8>, [u8; 4], [u8; 4])> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills the list, freed below; each entry's
+    // pointers are valid until then.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let i = &*at;
+            if !i.ifa_addr.is_null() && i32::from((*i.ifa_addr).sa_family) == libc::AF_INET {
+                let name = std::ffi::CStr::from_ptr(i.ifa_name).to_bytes();
+                let name = if name == b"lo0" { b"lo".to_vec() } else { name.to_vec() };
+                let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
+                let mask = if i.ifa_netmask.is_null() {
+                    [0; 4]
+                } else {
+                    (*(i.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes()
+                };
+                out.push((name, sin.sin_addr.s_addr.to_ne_bytes(), mask));
+            }
+            at = i.ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    out
+}
+
+/// The host interface index of `name` (0: none).
+fn host_index(name: &std::ffi::CStr) -> u32 {
+    // SAFETY: a NUL-terminated name.
+    unsafe { libc::if_nametoindex(name.as_ptr()) }
+}
+
+/// `SIOCGIFCONF` into the guest's `struct ifconf` at `arg`: an `ifreq` of
+/// name and `sockaddr_in` for each of `addrs`, as many as its buffer
+/// holds, and the bytes they take; with no buffer, the bytes all would.
+fn ifconf(arg: u64, addrs: &[(Vec<u8>, [u8; 4], [u8; 4])]) -> i64 {
+    const IFREQ: usize = 40;
+    let len: i32 = guest!(uaccess::read(arg));
+    let buf: u64 = guest!(uaccess::read(arg + 8));
+    if buf == 0 {
+        guest!(uaccess::write(arg, (addrs.len() * IFREQ) as i32));
+        return 0;
+    }
+    let room = len.max(0) as usize / IFREQ;
+    let mut out = Vec::new();
+    for (name, addr, _) in addrs.iter().take(room) {
+        let mut r = [0u8; IFREQ];
+        let n = name.len().min(15);
+        r[..n].copy_from_slice(&name[..n]);
+        r[16..18].copy_from_slice(&(fwe_abi::socket::AF_INET as u16).to_ne_bytes());
+        r[20..24].copy_from_slice(addr);
+        out.extend_from_slice(&r);
+    }
+    guest!(uaccess::write_from(buf, &out));
+    guest!(uaccess::write(arg, out.len() as i32));
+    0
 }
 
 /// The calling process's own limit of Linux resource `res` (soft, hard):

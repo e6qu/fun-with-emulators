@@ -245,7 +245,7 @@ pub fn any_marks() -> bool {
 /// Whether system call `nr` (arguments `a`) names an `O_PATH` descriptor
 /// where Linux needs one open for I/O (it then fails with `EBADF`): reads
 /// and writes, requests, mappings, changes through the descriptor, syncs,
-/// locks, seeks, listings, extended attributes, and every `fcntl` but
+/// locks, seeks, listings, extended attributes, socket calls, and every `fcntl` but
 /// those that duplicate it or read or set its descriptor flags.
 pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
     use fwe_abi::{fcntl, mman, nr as n};
@@ -282,7 +282,23 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
         | n::SYNC_FILE_RANGE
         | n::SYNCFS
         | n::READAHEAD
-        | n::VMSPLICE => path(a[0]),
+        | n::VMSPLICE
+        | n::ACCEPT
+        | n::ACCEPT4
+        | n::BIND
+        | n::CONNECT
+        | n::LISTEN
+        | n::GETSOCKNAME
+        | n::GETPEERNAME
+        | n::SETSOCKOPT
+        | n::GETSOCKOPT
+        | n::SHUTDOWN
+        | n::SENDTO
+        | n::RECVFROM
+        | n::SENDMSG
+        | n::RECVMSG
+        | n::SENDMMSG
+        | n::RECVMMSG => path(a[0]),
         n::SPLICE | n::COPY_FILE_RANGE => path(a[0]) || path(a[2]),
         n::TEE | n::SENDFILE => path(a[0]) || path(a[1]),
         n::MMAP => a[3] & mman::MAP_ANONYMOUS == 0 && path(a[4]),
