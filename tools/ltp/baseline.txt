@@ -362,6 +362,7 @@ getrandom01
 getrandom02
 getrandom03
 getrandom04
+getrandom05
 getresgid01
 getresgid02
 getresgid03
@@ -415,6 +416,7 @@ ioctl_ns06
 ioctl_ns07
 ioctl05
 ioctl06
+ioctl07
 ioctl10
 ioctl_pidfd01
 ioctl_pidfd02
@@ -659,6 +661,7 @@ pipe08
 pipe09
 pipe10
 pipe11
+pipe12
 pipe13
 pipe14
 pipe2_01

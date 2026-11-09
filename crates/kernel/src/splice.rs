@@ -146,7 +146,7 @@ fn same_pipe(a: i32, b: i32) -> bool {
 
 /// What a pipe end's pipe holds now: the host's `st_size` of either end
 /// (`FIONREAD` counts it only at the read end).
-fn held(fd: i32) -> u64 {
+pub(crate) fn held(fd: i32) -> u64 {
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.

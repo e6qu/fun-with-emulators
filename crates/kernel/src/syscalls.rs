@@ -732,7 +732,15 @@ impl<P: Platform> Kernel<P> {
             // here (e.g. through the plain `syscall` helper) is unsupported.
 
             // Randomness.
-            nr::GETRANDOM => self.sys_getrandom(a[0], a[1]),
+            nr::GETRANDOM => {
+                // GRND_NONBLOCK, GRND_RANDOM and GRND_INSECURE, but not the
+                // last two at once.
+                let flags = a[2] as u32;
+                if flags & !7 != 0 || flags & 6 == 6 {
+                    return err(errno::EINVAL);
+                }
+                self.sys_getrandom(a[0], a[1])
+            }
 
             // Not implemented yet. rseq and membarrier are optional for libc.
             _ => {
@@ -1118,6 +1126,12 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
             return r;
         }
+        // `RNDGETENTCNT` on `/dev/random` or `/dev/urandom`: the entropy
+        // count, full as Linux's is (`kernel.random.entropy_avail`).
+        if req == 0x8004_5200 && is_random_device(fd) {
+            guest!(uaccess::write(arg, 256i32));
+            return 0;
+        }
         // SAFETY: in every arm the argument layouts match the host's; the host
         // validates guest pointers.
         unsafe {
@@ -1188,6 +1202,13 @@ impl<P: Platform> Kernel<P> {
                 },
                 // The slave is unlocked at allocation; accept the lock request.
                 ioctl::TIOCSPTLCK => 0,
+                // A pipe's either end counts what the pipe holds (the
+                // host's write end counts nothing).
+                ioctl::FIONREAD if crate::splice::pipe_ends(fd).is_some() => {
+                    let held = crate::splice::held(fd).min(i32::MAX as u64) as i32;
+                    guest!(uaccess::write(arg, held));
+                    0
+                }
                 ioctl::FIONREAD => ret(libc::ioctl(fd, libc::FIONREAD, arg as *mut libc::c_int)),
                 ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
                 ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),
@@ -2150,6 +2171,16 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             return Ok(n);
         }
     }
+}
+
+/// Whether `fd` is `/dev/random` or `/dev/urandom` (Linux's 1:8, 1:9).
+fn is_random_device(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+    ok && crate::devnodes::linux_numbers_of_host(&st)
+        .is_some_and(|n| n.major == 1 && (n.minor == 8 || n.minor == 9))
 }
 
 /// What the host reported ready on `p` as Linux reports it: a regular

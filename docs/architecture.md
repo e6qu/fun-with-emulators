@@ -584,7 +584,8 @@ shapes differently:
   `config.gz` (the options of what fwe implements), `keys`, `key-users`,
   `sysvipc/{shm,sem,msg}`, and under `/proc/sys`: `kernel/{ostype,
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
-  overflowuid,overflowgid,threads-max,tainted}`, `fs/{nr_open,file-max,
+  overflowuid,overflowgid,threads-max,tainted}`,
+  `kernel/random/{entropy_avail,poolsize}`, `fs/{nr_open,file-max,
   pipe-max-size,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
   `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
   `kernel/keys/*`, the IPC limits and a network namespace's sysctls
