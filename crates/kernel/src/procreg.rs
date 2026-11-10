@@ -641,10 +641,16 @@ pub fn forked(
     let mine = read(me());
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
     let cgroup = cgroup.map_or_else(own_cgroup, <[u8]>::to_vec);
-    // Kept what the child has already written of itself (its program).
+    // Kept what the child has already written of itself (its program,
+    // and its namespaces and cgroup, which it may have changed since).
     let _ = change(child, |r| {
-        r.cgroup = cgroup;
-        r.ns = ns;
+        let child_wrote = !r.lineage.is_empty();
+        if !child_wrote || r.cgroup.is_empty() {
+            r.cgroup = cgroup;
+        }
+        if !child_wrote {
+            r.ns = ns;
+        }
         if r.exe.is_empty() {
             (r.comm, r.cmdline, r.exe) = (comm, cmdline, exe);
         }
@@ -801,13 +807,21 @@ pub fn load_line(d: &mut Dec) -> (Vec<Proc>, Option<Proc>) {
 }
 
 /// This process (just forked) has the line of ancestors and bound `line`,
-/// what it inherited of its parent's record (`inherit`), and the mappings
-/// `maps` it inherited (see [`crate::maps::forked`]): written by the child
-/// first, so it reads its own from the start.
-pub fn own_line(line: &(Vec<Proc>, Option<Proc>), inherit: &Inherit, maps: Vec<u8>) {
+/// what it inherited of its parent's record (`inherit`), the namespaces
+/// `ns` it starts in, and the mappings `maps` it inherited (see
+/// [`crate::maps::forked`]): written by the child first, so it reads its
+/// own from the start, and the parent's later write ([`forked`]) keeps
+/// what it changed since (a namespace it unshared, say).
+pub fn own_line(
+    line: &(Vec<Proc>, Option<Proc>),
+    inherit: &Inherit,
+    ns: Vec<Vec<u8>>,
+    maps: Vec<u8>,
+) {
     let _ = change(me(), |r| {
         if r.lineage.is_empty() {
             apply(r, inherit);
+            r.ns = ns;
         }
         (r.lineage, r.bound) = line.clone();
         r.maps = maps;
