@@ -167,6 +167,12 @@ signals and faults for the guest, and the machinery for threads and
   one fails with the caller intact. A re-exec checks only that it is an
   ELF file before the host `execve`, so a later failure ends the
   process.
+- **Busy programs** (`crates/kernel/src/textbusy.rs`): a page every fwe
+  process maps holds each process's program and a ring of the files
+  opened lately for writing; an open to write a running program's file,
+  and a run of a file some process still holds open to write (which the
+  host confirms), fail with `ETXTBSY`. A writer whose ring entry was
+  overwritten by later opens goes unseen.
 - A program given by a host path inside the rootfs gets its guest path as
   `argv[0]` and `AT_EXECFN` (Python finds its installation so);
   `--argv0` overrides it.
@@ -564,7 +570,8 @@ shapes differently:
   whole or not at all (`EAGAIN`).
 - **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`): immutable,
   append-only and no-dump are the host's user flags of the same meaning,
-  which it enforces; setting the first two takes `CAP_LINUX_IMMUTABLE`,
+  which it enforces (no-dump also marks a kept mode, see Modes, so such a
+  file does not show it); setting the first two takes `CAP_LINUX_IMMUTABLE`,
   and such a file's extended attributes cannot change. An append-only
   file's times may be set to now (the host refuses it, so the flag is
   lifted for the change), not to a time. `O_NOATIME` (a descriptor's own,

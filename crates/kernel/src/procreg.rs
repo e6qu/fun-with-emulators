@@ -1092,6 +1092,8 @@ pub fn exiting(status: i32) {
     // Its files closed, as it ends (inotify's close events), and its
     // instances gone.
     crate::inotify::exiting();
+    // The program it runs no longer.
+    crate::textbusy::exiting();
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
     let me = me();

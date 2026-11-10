@@ -435,6 +435,14 @@ impl Fs {
             None => self.file_id(&exe),
         };
         crate::maps::record().set_exe(exe.clone(), id.unwrap_or((0, 0)));
+        // The program's file is busy while it runs (`ETXTBSY`).
+        let host_id = match exe_fd {
+            Some(fd) => crate::fsops::host_identity(fd),
+            None => self.file_id(&exe),
+        };
+        if let Some((dev, ino)) = host_id {
+            crate::textbusy::running(dev, ino);
+        }
         crate::maps::publish();
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
     }

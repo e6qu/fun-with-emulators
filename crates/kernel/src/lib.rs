@@ -86,6 +86,7 @@ mod syscalls;
 pub mod sysctl;
 pub mod sysvipc;
 pub mod term;
+pub mod textbusy;
 pub mod thread;
 pub mod tmpfile;
 pub mod tmpfs;
@@ -576,16 +577,21 @@ impl<P: Platform> Kernel<P> {
 
     /// Whether the caller may run the program at guest path `path`: only a
     /// regular file whose bits let it (`EACCES`; root needs one execute
-    /// bit set).
+    /// bit set), and that no process has open for writing (`ETXTBSY`).
     pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
         use fwe_abi::{errno, fcntl};
         let Some(fs) = self.fs.as_ref() else { return Ok(()) };
         if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
-            && (st.st_mode & libc::S_IFMT != libc::S_IFREG || !self.permits(&st, 1))
         {
-            return Err(errno::EACCES);
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG || !self.permits(&st, 1) {
+                return Err(errno::EACCES);
+            }
+            // Not a file open for writing.
+            if host_file_busy(&st) {
+                return Err(errno::ETXTBSY);
+            }
         }
         Ok(())
     }
@@ -967,6 +973,12 @@ fn is_regular(fd: i32) -> bool {
 /// The input must be a regular file or a block device (a loop device), as
 /// Linux has it; `copy_file_range` needs both to be regular files. Returns
 /// the bytes copied, or an errno when none were.
+/// Whether the file of host status `st` is open for writing.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+fn host_file_busy(st: &libc::stat) -> bool {
+    textbusy::is_being_written(st.st_dev as u64, st.st_ino as u64)
+}
+
 /// `copy_file_range`'s checks, in Linux's order: the descriptors
 /// (`EBADF`), the offsets (`EFAULT`), the flags (`EINVAL`); directories
 /// (`EISDIR`), anything but regular files (`EINVAL`), a descriptor not open

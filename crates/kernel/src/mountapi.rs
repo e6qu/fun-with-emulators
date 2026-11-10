@@ -1059,6 +1059,10 @@ impl<P: Platform> Kernel<P> {
     /// reports them.
     #[allow(clippy::unnecessary_cast)] // `dev_t` differs by host
     fn mount_device(&self, m: &Mount) -> (u32, u32) {
+        // A tmpfs is a device of its own, as its files' `stat` gives it.
+        if m.fstype == crate::mounts::FsType::Tmpfs {
+            return (0, 20 + m.id);
+        }
         let st = m.host_path(b"").and_then(|p| std::ffi::CString::new(p).ok()).and_then(|c| {
             // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
             let mut st: libc::stat = unsafe { std::mem::zeroed() };

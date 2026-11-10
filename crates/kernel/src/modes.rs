@@ -48,6 +48,18 @@ pub fn marked(_st: &libc::stat) -> bool {
     false
 }
 
+/// Whether the file open as `fd`, with host metadata `st`, has the host's
+/// no-dump flag of its own (`FS_NODUMP_FL`), not as the mark of a kept
+/// mode.
+pub fn nodump_fd(fd: i32, st: &libc::stat) -> bool {
+    marked(st) && read_fd(fd).is_none()
+}
+
+/// [`nodump_fd`] for `name` in directory `dir`.
+pub fn nodump_at(dir: i32, name: &CStr, st: &libc::stat) -> bool {
+    marked(st) && path_of(dir, name).and_then(|p| read_path(&p)).is_none()
+}
+
 /// The guest's permission bits of the file whose host metadata is `st`:
 /// its kept mode, read through `fd` (open on it) if it has one.
 pub fn guest_perm_fd(fd: i32, st: &libc::stat) -> u32 {

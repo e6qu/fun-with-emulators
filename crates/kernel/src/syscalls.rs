@@ -2254,7 +2254,7 @@ impl<P: Platform> Kernel<P> {
             if host & libc::UF_APPEND != 0 {
                 f |= FS_APPEND_FL;
             }
-            if host & libc::UF_NODUMP != 0 {
+            if crate::modes::nodump_fd(fd, &st) {
                 f |= FS_NODUMP_FL;
             }
             guest!(uaccess::write(arg, f));
@@ -2278,7 +2278,9 @@ impl<P: Platform> Kernel<P> {
         if f & FS_APPEND_FL != 0 {
             want |= libc::UF_APPEND;
         }
-        if f & FS_NODUMP_FL != 0 {
+        // The flag also marks a kept mode, which stays marked.
+        let kept = crate::modes::marked(&st) && !crate::modes::nodump_fd(fd, &st);
+        if f & FS_NODUMP_FL != 0 || kept {
             want |= libc::UF_NODUMP;
         }
         if (want ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {

@@ -52,15 +52,16 @@ const STATX_ATTR_APPEND: u64 = 0x20;
 const STATX_ATTR_NODUMP: u64 = 0x40;
 const STATX_ATTRS_KNOWN: u64 = STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP;
 
-/// The `statx` attributes of a file with host status `s`.
+/// The `statx` attributes of a file with host status `s`, no-dump if
+/// `nodump` (the host's flag is also the mark of a kept mode, see
+/// [`crate::modes::nodump_fd`]).
 #[cfg(target_os = "macos")]
-fn statx_attributes(s: &libc::stat) -> u64 {
+fn statx_attributes(s: &libc::stat, nodump: bool) -> u64 {
     let f = s.st_flags;
-    let mut a = 0;
+    let mut a = if nodump { STATX_ATTR_NODUMP } else { 0 };
     for (host, linux) in [
         (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE, STATX_ATTR_IMMUTABLE),
         (libc::UF_APPEND | libc::SF_APPEND, STATX_ATTR_APPEND),
-        (libc::UF_NODUMP, STATX_ATTR_NODUMP),
     ] {
         if f & host != 0 {
             a |= linux;
@@ -70,8 +71,8 @@ fn statx_attributes(s: &libc::stat) -> u64 {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn statx_attributes(_: &libc::stat) -> u64 {
-    0
+fn statx_attributes(_: &libc::stat, nodump: bool) -> u64 {
+    if nodump { STATX_ATTR_NODUMP } else { 0 }
 }
 
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
@@ -86,7 +87,7 @@ fn statx_from(s: &libc::stat) -> Statx {
     Statx {
         stx_mask: statx_mask::STATX_BASIC_STATS,
         stx_blksize: s.st_blksize as u32,
-        stx_attributes: statx_attributes(s),
+        stx_attributes: statx_attributes(s, false),
         stx_nlink: s.st_nlink as u32,
         stx_uid: crate::userns::to_ns(s.st_uid, false),
         stx_gid: crate::userns::to_ns(s.st_gid, true),
@@ -208,6 +209,14 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 /// Host metadata of open descriptor `fd`, with the guest's permission
 /// bits ([`crate::modes`]).
 /// `fstat` of `fd` in Linux's layout (the host's view of the file).
+/// The host device and inode of the file open as `fd`.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
+    let mut st = zeroed_stat();
+    // SAFETY: plain host call with a valid out-parameter.
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+}
+
 pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
     stat_fd(fd).map(|s| stat_to_linux_fd(fd, &s))
 }
@@ -670,6 +679,10 @@ impl<P: Platform> Kernel<P> {
             // `st_dev` is narrower on macOS.
             #[allow(clippy::unnecessary_cast)]
             let dev = st.st_dev as u64;
+            // A running program's file is not to be written.
+            if write && crate::textbusy::is_running(dev, st.st_ino) {
+                return err(errno::ETXTBSY);
+            }
             if let Err(e) = crate::leases::break_for(dev, st.st_ino, write, nonblock) {
                 return err(e);
             }
@@ -813,6 +826,13 @@ impl<P: Platform> Kernel<P> {
         // An O_PATH descriptor is of the node itself, the device untouched.
         // SAFETY: a valid out-parameter.
         if flags & fcntl::O_PATH == 0 && unsafe { libc::fstat(fd, &mut st) } == 0 {
+            // A file open to write, which is not to be run meanwhile.
+            if st.st_mode & libc::S_IFMT == libc::S_IFREG
+                && flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
+            {
+                #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+                crate::textbusy::opened_for_writing(st.st_dev as u64, st.st_ino);
+            }
             let node = if crate::devnodes::marked(&st) {
                 crate::devnodes::node_of(fd)
             } else {
@@ -1225,7 +1245,8 @@ impl<P: Platform> Kernel<P> {
                         let node = crate::devnodes::marked(&s)
                             .then(|| crate::devnodes::node_of(fd))
                             .flatten();
-                        return Ok((as_node(stat_to_linux(&s), node), statx_attributes(&s)));
+                        let attrs = statx_attributes(&s, crate::modes::nodump_fd(fd, &s));
+                        return Ok((as_node(stat_to_linux(&s), node), attrs));
                     }
                     Entry::Fd { target, .. } => {
                         synth_stat(st::S_IFLNK | 0o700, target.len() as u64)
@@ -1246,7 +1267,8 @@ impl<P: Platform> Kernel<P> {
         if r.ns_path.is_some() && r.fstype == crate::mounts::FsType::Tmpfs {
             on_tmpfs(&mut out, r.mount_id);
         }
-        Ok((out, statx_attributes(&s)))
+        let nodump = crate::modes::nodump_at(r.dir.as_raw_fd(), &name, &s);
+        Ok((out, statx_attributes(&s, nodump)))
     }
 
     /// `open` with `O_NOFOLLOW` of the link of fwe's `/proc` at `path`:
@@ -1396,6 +1418,7 @@ impl<P: Platform> Kernel<P> {
             };
         };
         let mut x = statx_from(&host);
+        x.stx_attributes = statx_attributes(&host, crate::modes::nodump_fd(dirfd as i32, &host));
         if let Some(m) = tmpfs_of(dirfd as i32, &host) {
             let mut st = stat_to_linux(&host);
             on_tmpfs(&mut st, m);
