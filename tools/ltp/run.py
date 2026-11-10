@@ -14,7 +14,10 @@ run at once, but those that change a machine-wide setting or measure time
 (see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
-`--update` rewrites it from the run. The pass rate is printed either way.
+`--update` rewrites it from the run. A regression is run again alone; a
+timer test that then fails only by sleeping too long is measured against
+the host's own timers (hosttimer.c), and named, not failed, if they miss
+the same threshold natively. The pass rate is printed either way.
 The tests in exceptions.txt, which fail or skip on Linux too or test what is
 not planned, are not run, and do not count as applicable; a test that skips
 and is not among them is named (what fwe still lacks).
@@ -242,9 +245,51 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         log.seek(0)
         out = log.read()
     shutil.rmtree(tmp, ignore_errors=True)
-    keep = 400 if outcome == "timeout" else 40
+    # (A timer test's every measurement, for `host_timers_late`.)
+    keep = 400 if outcome == "timeout" or b"slept for too long" in out else 40
     tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
     return name, outcome, time.monotonic() - start, tail
+
+
+TIMER_SET = re.compile(r"sleeping for (\d+)us (\d+) iterations, threshold ([\d.]+)us")
+TRUNC_MEAN = re.compile(r"trunc mean ([\d.]+)us")
+
+
+def host_timers_late(work, tail):
+    """For a timer test (LTP's tst_timer_test) whose only failures are
+    sleeps that ended too late: the host's own timers measured on each
+    sleep it failed (hosttimer.c, up to three rounds), as lines, if they
+    missed the same threshold natively. Empty if they did not, or the test
+    failed otherwise."""
+    lines = tail.splitlines()
+    fails = [line for line in lines if "TFAIL" in line]
+    if not fails or any("slept for too long" not in line for line in fails):
+        return []
+    late_sets = []
+    for i, line in enumerate(lines):
+        m = TIMER_SET.search(line)
+        mean = next((TRUNC_MEAN.search(x) for x in lines[i + 1:i + 3] if TRUNC_MEAN.search(x)), None)
+        if m and mean:
+            usec, n, threshold = int(m[1]), int(m[2]), float(m[3])
+            if float(mean[1]) > usec + threshold:
+                late_sets.append((usec, n, threshold))
+    if not late_sets:
+        return []
+    probe = os.path.join(work, "hosttimer")
+    if not os.path.exists(probe):
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosttimer.c")
+        if subprocess.run(["cc", "-O2", "-o", probe, source]).returncode != 0:
+            return []
+    found = []
+    for usec, n, threshold in late_sets:
+        for _ in range(3):
+            r = subprocess.run([probe, str(usec), str(n), str(threshold)], capture_output=True, text=True)
+            if r.returncode == 1:
+                found.append(r.stdout.strip())
+                break
+        else:
+            return []
+    return found
 
 
 def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
@@ -408,6 +453,21 @@ def main():
             if again[n][1] != "pass" and args.show:
                 print(f"--- {n} ({again[n][1]}), run again:\n" + again[n][3])
         regressed = [n for n in regressed if again[n][1] != "pass"]
+        # A timer test the host's own timers fail too: the host cannot
+        # time as LTP asks (a CI runner, a virtual machine, is late now and
+        # then by milliseconds), so it is named with the evidence, not
+        # failed. One the host meets is fwe's to fix.
+        work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+        try:
+            host_late = {n: host_timers_late(work, again[n][3]) for n in regressed}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        host_late = {n: v for n, v in host_late.items() if v}
+        if host_late:
+            print(f"late as the host's own timers are ({len(host_late)}): " + " ".join(host_late))
+            for n, found in host_late.items():
+                print(f"    {n}: " + "; ".join(found))
+        regressed = [n for n in regressed if n not in host_late]
     if regressed:
         print(f"REGRESSED ({len(regressed)}): " + " ".join(f"{n}={results[n]}" for n in regressed))
         return 1
