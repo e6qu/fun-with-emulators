@@ -50,7 +50,10 @@ fn stat_to_linux(s: &libc::stat) -> Stat {
 const STATX_ATTR_IMMUTABLE: u64 = 0x10;
 const STATX_ATTR_APPEND: u64 = 0x20;
 const STATX_ATTR_NODUMP: u64 = 0x40;
-const STATX_ATTRS_KNOWN: u64 = STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP;
+/// `STATX_ATTR_MOUNT_ROOT`: the root of a mount.
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
+const STATX_ATTRS_KNOWN: u64 =
+    STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP | STATX_ATTR_MOUNT_ROOT;
 
 /// The `statx` attributes of a file with host status `s`, no-dump if
 /// `nodump` (the host's flag is also the mark of a kept mode, see
@@ -1429,6 +1432,9 @@ impl<P: Platform> Kernel<P> {
                 Ok((st, attrs)) => {
                     let mut x = statx_of(&st);
                     x.stx_attributes = attrs;
+                    if self.mount_root(dirfd as i32, &path, false) {
+                        x.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
+                    }
                     x.stx_attributes_mask = STATX_ATTRS_KNOWN;
                     guest!(uaccess::write(buf, with_mount(x)));
                     0
@@ -1438,6 +1444,9 @@ impl<P: Platform> Kernel<P> {
         };
         let mut x = statx_from(&host);
         x.stx_attributes = statx_attributes(&host, crate::modes::nodump_fd(dirfd as i32, &host));
+        if self.mount_root(dirfd as i32, &path, true) {
+            x.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
+        }
         if let Some(m) = tmpfs_of(dirfd as i32, &host) {
             let mut st = stat_to_linux(&host);
             on_tmpfs(&mut st, m);
@@ -1461,6 +1470,18 @@ impl<P: Platform> Kernel<P> {
 
     /// The mount `path` from `dirfd` (or with `empty`, the file `dirfd` is
     /// open on) is in, if fwe can place it.
+    /// Whether what `path` from `dirfd` names (`dirfd` itself, `empty`)
+    /// is the root of a mount, by where it is in the namespace.
+    fn mount_root(&self, dirfd: i32, path: &[u8], empty: bool) -> bool {
+        let fs = self.fs();
+        let ns = if empty {
+            fs.fd_ns_path(dirfd)
+        } else {
+            fs.absolute_path(dirfd, path).map(|a| fs.to_ns(&a))
+        };
+        ns.is_some_and(|ns| fs.mount_ns().table().locate(&ns).0.point == ns)
+    }
+
     fn statx_mount(
         &self,
         dirfd: i32,

@@ -14,6 +14,7 @@ pub mod acct;
 pub mod aio;
 pub mod atime;
 pub mod bpf;
+pub mod bpfcheck;
 pub mod bpfmap;
 pub mod calls;
 pub mod caps;

@@ -1,8 +1,7 @@
-# LTP system-call tests that fail on Linux too with this build and
-# configuration (LTP_DEV_FS_TYPE=tmpfs, as tools/ltp/run.py runs them), and
-# why.
-# Every other test is to pass under fwe, but those for what is not planned
-# for 1.0 (ROADMAP.md).
+# LTP system-call tests that fail or skip on Linux too with this build and
+# configuration (LTP_DEV_FS_TYPE=tmpfs, as tools/ltp/run.py runs them), or
+# that test what is not planned for 1.0 (ROADMAP.md), and why. They are not
+# run. Every other test is to pass under fwe.
 mq_open01 musl passes an empty queue name to the kernel, which gives ENOENT; the test expects glibc's EINVAL
 sbrk01 musl's sbrk refuses any increment (ENOMEM) without asking the kernel
 posix_fadvise02 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
@@ -61,3 +60,276 @@ setdomainname03 not planned (ROADMAP.md): it sets the host name or domain name o
 splice06 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
 ioctl_loop05 its image must be on a file system of a block device, whose block size it reads; fwe's root is a directory of the Mac's, of no device (as a tmpfs on Linux, where it breaks the same way)
 ptrace11 it attaches to pid 1, which outside a pid namespace of fwe's is the Mac's launchd, not a process fwe can trace
+# Tests that skip (TCONF) here, as they would on Linux with this build, or
+# for what is not planned.
+arch_prctl01 an x86 test
+bind06 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+bpf_prog05 it runs eBPF without CAP_BPF or CAP_SYS_ADMIN, which kernel.unprivileged_bpf_disabled (2, as distributions set it) refuses
+bpf_prog06 it runs eBPF without CAP_BPF or CAP_SYS_ADMIN, which kernel.unprivileged_bpf_disabled (2, as distributions set it) refuses
+bpf_prog07 it runs eBPF without CAP_BPF or CAP_SYS_ADMIN, which kernel.unprivileged_bpf_disabled (2, as distributions set it) refuses
+cacheflush01 musl has no such function
+cachestat01 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+cachestat03 not planned (ROADMAP.md): huge pages
+chown01_16 the 16-bit uid and gid calls, which arm64 does not have
+chown02_16 the 16-bit uid and gid calls, which arm64 does not have
+chown03_16 the 16-bit uid and gid calls, which arm64 does not have
+chown04_16 the 16-bit uid and gid calls, which arm64 does not have
+chown05_16 the 16-bit uid and gid calls, which arm64 does not have
+clock_gettime03 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
+clock_nanosleep03 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
+delete_module01 it loads a test kernel module, which the build does not have
+delete_module03 it loads a test kernel module, which the build does not have
+eventfd06 not built: the build has no libaio
+fanotify01 not planned (ROADMAP.md): fanotify
+fanotify02 not planned (ROADMAP.md): fanotify
+fanotify03 not planned (ROADMAP.md): fanotify
+fanotify04 not planned (ROADMAP.md): fanotify
+fanotify05 not planned (ROADMAP.md): fanotify
+fanotify06 not planned (ROADMAP.md): fanotify
+fanotify07 not planned (ROADMAP.md): fanotify
+fanotify08 not planned (ROADMAP.md): fanotify
+fanotify09 not planned (ROADMAP.md): fanotify
+fanotify10 not planned (ROADMAP.md): fanotify
+fanotify11 not planned (ROADMAP.md): fanotify
+fanotify12 not planned (ROADMAP.md): fanotify
+fanotify13 not planned (ROADMAP.md): fanotify
+fanotify14 not planned (ROADMAP.md): fanotify
+fanotify15 not planned (ROADMAP.md): fanotify
+fanotify16 not planned (ROADMAP.md): fanotify
+fanotify17 not planned (ROADMAP.md): fanotify
+fanotify18 not planned (ROADMAP.md): fanotify
+fanotify19 not planned (ROADMAP.md): fanotify
+fanotify20 not planned (ROADMAP.md): fanotify
+fanotify21 not planned (ROADMAP.md): fanotify
+fanotify22 the root filesystem lacks the tool it runs
+fanotify23 not planned (ROADMAP.md): fanotify
+fanotify24 not planned (ROADMAP.md): fanotify
+fanotify25 not planned (ROADMAP.md): fanotify
+fchown01_16 the 16-bit uid and gid calls, which arm64 does not have
+fchown02_16 the 16-bit uid and gid calls, which arm64 does not have
+fchown03_16 the 16-bit uid and gid calls, which arm64 does not have
+fchown04_16 the 16-bit uid and gid calls, which arm64 does not have
+fchown05_16 the 16-bit uid and gid calls, which arm64 does not have
+fdatasync03 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+file_attr02 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+file_attr03 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+finit_module01 it loads a test kernel module, which the build does not have
+finit_module02 it loads a test kernel module, which the build does not have
+fork05 an x86 test
+fsetxattr02 not planned (ROADMAP.md): it needs a RAM disk block device
+fsync04 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ftruncate04 it needs mandatory locking, which Linux has not had since 5.15
+ftruncate04_64 it needs mandatory locking, which Linux has not had since 5.15
+futex_wake04 not planned (ROADMAP.md): huge pages
+futimesat01 arm64 has no futimesat system call
+get_mempolicy01 not built: the build has no libnuma
+get_mempolicy02 not built: the build has no libnuma
+getcontext01 musl has no such function
+geteuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+geteuid02_16 the 16-bit uid and gid calls, which arm64 does not have
+getgid01_16 the 16-bit uid and gid calls, which arm64 does not have
+getgid03_16 the 16-bit uid and gid calls, which arm64 does not have
+getgroups01_16 the 16-bit uid and gid calls, which arm64 does not have
+getgroups03_16 the 16-bit uid and gid calls, which arm64 does not have
+gethostid01 musl has no such function
+getresgid01_16 the 16-bit uid and gid calls, which arm64 does not have
+getresgid02_16 the 16-bit uid and gid calls, which arm64 does not have
+getresgid03_16 the 16-bit uid and gid calls, which arm64 does not have
+getresuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+getresuid02_16 the 16-bit uid and gid calls, which arm64 does not have
+getresuid03_16 the 16-bit uid and gid calls, which arm64 does not have
+getuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+getuid03_16 the 16-bit uid and gid calls, which arm64 does not have
+getxattr03 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+getxattr04 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+getxattr05 not built: the build lacks the XFS quota and ACL headers
+init_module01 it loads a test kernel module, which the build does not have
+init_module02 it loads a test kernel module, which the build does not have
+io_cancel02 not built: the build has no libaio
+io_destroy01 not built: the build has no libaio
+io_getevents02 not built: the build has no libaio
+io_pgetevents01 not built: the build has no libaio
+io_pgetevents02 not built: the build has no libaio
+io_setup01 not built: the build has no libaio
+io_submit01 not built: the build has no libaio
+io_uring01 not planned (ROADMAP.md): io_uring
+io_uring02 not planned (ROADMAP.md): io_uring
+io_uring03 not planned (ROADMAP.md): io_uring
+io_uring04 not planned (ROADMAP.md): io_uring
+ioctl03 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+ioctl08 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ioctl09 the root filesystem lacks the tool it runs
+ioctl_ficlone01 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ioctl_ficlone03 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ioctl_ficlonerange01 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ioctl_ficlonerange02 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ioctl_fiemap01 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+ioctl_getlbmd01 not planned (ROADMAP.md): it needs a block device with integrity metadata
+ioctl_sg01 not planned (ROADMAP.md): it needs a SCSI device
+ioperm01 an x86 test
+ioperm02 an x86 test
+iopl01 an x86 test
+iopl02 an x86 test
+kcmp01 not planned (ROADMAP.md): kcmp
+kcmp02 not planned (ROADMAP.md): kcmp
+kcmp03 not planned (ROADMAP.md): kcmp
+kill13 it needs a kernel built with the undefined-behaviour sanitizer
+listxattr04 not built: the build lacks the XFS quota and ACL headers
+lseek11 the host's file system (APFS) reports a small file's holes as data, which the test takes for a file system without SEEK_DATA and SEEK_HOLE
+lsm_get_self_attr01 it needs a security module that keeps a process's attributes (SELinux, AppArmor, Smack); Linux's capabilities alone keep none, as on a kernel without them
+lsm_get_self_attr03 it needs a security module that keeps a process's attributes (SELinux, AppArmor, Smack); Linux's capabilities alone keep none, as on a kernel without them
+lsm_set_self_attr01 it needs a security module that keeps a process's attributes (SELinux, AppArmor, Smack); Linux's capabilities alone keep none, as on a kernel without them
+madvise06 not planned (ROADMAP.md): swap
+madvise09 not planned (ROADMAP.md): swap
+madvise11 not planned (ROADMAP.md): it injects hardware memory errors
+madvise12 it needs Linux 6.13; fwe reports 6.12
+mallinfo02 musl has no such function
+mallinfo2_01 musl has no such function
+mallopt01 musl has no such function
+mbind01 not built: the build has no libnuma
+mbind02 not built: the build has no libnuma
+mbind03 not built: the build has no libnuma
+mbind04 not built: the build has no libnuma
+memfd_create03 not planned (ROADMAP.md): huge pages
+memfd_create04 not planned (ROADMAP.md): huge pages
+migrate_pages01 not built: the build has no libnuma
+migrate_pages02 not built: the build has no libnuma
+migrate_pages03 not built: the build has no libnuma
+mmap16 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+mmap22 not planned (ROADMAP.md): cgroup memory limits, under which it waits for MAP_DROPPABLE pages to be reclaimed
+mmap23 an x86 test
+mmap24 an x86 test
+modify_ldt01 an x86 test
+modify_ldt02 an x86 test
+move_pages01 not built: the build has no libnuma
+move_pages02 not built: the build has no libnuma
+move_pages03 not built: the build has no libnuma
+move_pages04 not built: the build has no libnuma
+move_pages05 not built: the build has no libnuma
+move_pages06 not built: the build has no libnuma
+move_pages07 not built: the build has no libnuma
+move_pages09 not built: the build has no libnuma
+move_pages10 not built: the build has no libnuma
+move_pages11 not built: the build has no libnuma
+move_pages12 not built: the build has no libnuma
+msgctl05 musl's IPC structures have no time_high fields
+msync04 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+perf_event_open01 not planned (ROADMAP.md): perf events
+perf_event_open02 not planned (ROADMAP.md): perf events
+perf_event_open03 an x86 test
+pidfd_getfd01 not planned (ROADMAP.md): kcmp
+pidfd_send_signal03 not planned (ROADMAP.md): chosen pids
+pkey01 the CPU has no protection keys (arm64's need FEAT_S1POE), so none can be allocated, as on Linux without them
+prctl07 not built: the build has no libcap
+prctl10 an x86 test
+preadv03 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+preadv03_64 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+process_madvise01 not planned (ROADMAP.md): swap
+profil01 musl has no such function
+ptrace04 an x86 test
+ptrace07 an x86 test
+ptrace08 an x86 test
+ptrace09 an x86 test
+ptrace10 an x86 test
+pwritev03 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+pwritev03_64 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+quotactl01 not planned (ROADMAP.md): disk quotas
+quotactl02 not built: the build lacks the XFS quota and ACL headers
+quotactl03 not built: the build lacks the XFS quota and ACL headers
+quotactl04 not planned (ROADMAP.md): disk quotas
+quotactl05 not built: the build lacks the XFS quota and ACL headers
+quotactl06 not planned (ROADMAP.md): disk quotas
+quotactl07 not built: the build lacks the XFS quota and ACL headers
+quotactl08 not planned (ROADMAP.md): disk quotas
+quotactl09 not planned (ROADMAP.md): disk quotas
+readahead02 not planned (ROADMAP.md): the page cache's figures (/proc/self/io, /proc/meminfo's Cached), which the host's cache does not report
+readdir21 arm64 has no readdir system call
+recvmsg03 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+sbrk03 an x86 test
+semctl08 musl's IPC structures have no time_high fields
+sendto02 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+sendto03 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+set_mempolicy01 not built: the build has no libnuma
+set_mempolicy02 not built: the build has no libnuma
+set_mempolicy03 not built: the build has no libnuma
+set_mempolicy04 not built: the build has no libnuma
+set_thread_area01 an x86 test
+set_thread_area02 an x86 test
+setfsgid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setfsgid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setfsgid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setfsuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setfsuid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setfsuid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setfsuid04_16 the 16-bit uid and gid calls, which arm64 does not have
+setgid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setgid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setgid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setgroups01_16 the 16-bit uid and gid calls, which arm64 does not have
+setgroups02_16 the 16-bit uid and gid calls, which arm64 does not have
+setgroups03_16 the 16-bit uid and gid calls, which arm64 does not have
+setregid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setregid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setregid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setregid04_16 the 16-bit uid and gid calls, which arm64 does not have
+setresgid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setresgid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setresgid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setresgid04_16 the 16-bit uid and gid calls, which arm64 does not have
+setresuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setresuid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setresuid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setresuid04_16 the 16-bit uid and gid calls, which arm64 does not have
+setresuid05_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid02_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid04_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid05_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid06_16 the 16-bit uid and gid calls, which arm64 does not have
+setreuid07_16 the 16-bit uid and gid calls, which arm64 does not have
+setsockopt02 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+setsockopt06 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+setsockopt07 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+setsockopt08 not planned (ROADMAP.md): it needs a packet filter (netfilter)
+setsockopt09 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+setsockopt10 not planned (ROADMAP.md): kernel TLS
+setsockopt11 not planned (ROADMAP.md): it needs a packet, raw, SCTP, RDS or TUN socket
+setuid01_16 the 16-bit uid and gid calls, which arm64 does not have
+setuid03_16 the 16-bit uid and gid calls, which arm64 does not have
+setuid04_16 the 16-bit uid and gid calls, which arm64 does not have
+sgetmask01 arm64 has no ssetmask system call
+shmctl06 musl's IPC structures have no time_high fields
+signal06 an x86 test
+socketcall01 arm64 has no socketcall system call
+socketcall02 arm64 has no socketcall system call
+socketcall03 arm64 has no socketcall system call
+ssetmask01 arm64 has no ssetmask system call
+statx05 the root filesystem lacks the tool it runs
+statx06 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+statx07 the root filesystem lacks the tool it runs
+statx09 not planned (ROADMAP.md): fs-verity
+statx10 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+statx11 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+swapoff01 not planned (ROADMAP.md): swap
+swapoff02 not planned (ROADMAP.md): swap
+swapon01 not planned (ROADMAP.md): swap
+swapon02 not planned (ROADMAP.md): swap
+swapon03 not planned (ROADMAP.md): swap
+swapon04 not planned (ROADMAP.md): swap
+switch01 it tests a PowerPC system call
+sync01 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+sync_file_range02 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+syncfs01 not planned (ROADMAP.md): it needs a disk filesystem (ext4, XFS, btrfs) on a block device
+sysctl01 arm64 has no _sysctl system call
+sysctl03 arm64 has no _sysctl system call
+sysctl04 arm64 has no _sysctl system call
+sysfs01 arm64 has no sysfs system call
+sysfs02 arm64 has no sysfs system call
+sysfs03 arm64 has no sysfs system call
+sysfs04 arm64 has no sysfs system call
+sysfs05 arm64 has no sysfs system call
+sysinfo03 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
+timerfd04 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
+ustat01 arm64 has no ustat system call
+ustat02 arm64 has no ustat system call

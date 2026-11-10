@@ -58,27 +58,32 @@ against a baseline. Beyond M3:
   processes; priorities, scheduling policies and CPU-time clocks; POSIX
   timers; ptrace of processes and threads (see below); robust futexes
   released as their owner ends, and `get_robust_list` of any thread;
-  zombies in `/proc`.
+  zombies in `/proc`; real-time signals queued; process accounting
+  (`acct`); I/O priorities.
 - **Memory:** `mremap`, `madvise` and `msync` as Linux has them; the `mlock`
   family with accounting; `mincore`; `mseal`; `remap_file_pages`;
   `/proc/<pid>/maps`, `smaps` with `PROCMAP_QUERY`, `/proc/self/mem` and
   `pagemap`.
 - **Files:** `preadv2`/`pwritev2`; `openat2`; `O_TMPFILE`; file handles;
   `ETXTBSY`; `fcntl` owners, signals, OFD locks, leases and pipe sizes;
-  `splice`, `tee`, `vmsplice`; inotify; owners and Linux's permission
-  checks for a guest that is not root; loop devices.
+  `splice`, `tee`, `vmsplice`; inotify and dnotify; native AIO;
+  `sync`/`syncfs`; `file_getattr`/`file_setattr`; `cachestat`; owners and
+  Linux's permission checks for a guest that is not root; loop devices.
 - **Mounts and namespaces:** the new mount API (`fsopen` to `listmount`);
   propagation and mount flags acted on; `pivot_root` of a chroot; namespace
   descriptors with `setns` and the `NS_GET_*` requests.
 - **IPC and sockets:** System V IPC and POSIX message queues per IPC
   namespace; keys and keyrings; socket arguments, options and requests as
-  Linux checks them; `sendmmsg`/`recvmmsg`; eBPF maps and socket filters.
+  Linux checks them; `sendmmsg`/`recvmmsg`; eBPF maps and socket filters,
+  their map accesses checked as they load; the IPC ids `kernel.*_next_id`
+  chooses.
 - **Waiting and time:** sleeps, timeouts, `poll`, `select` and timerfd as
   Linux reports them; `epoll_pwait2`; `futex_waitv`, requeue, bitsets and
   shared futexes.
 - **Other calls:** `personality`, `getcpu`, `syslog`, `membarrier`,
-  `readahead`, `sync_file_range`, `vhangup`, `reboot`, strict seccomp, and
-  the clock refused as Linux refuses it without `CAP_SYS_TIME`.
+  `readahead`, `sync_file_range`, `vhangup`, `reboot`, strict seccomp, the
+  LSM calls, protection keys as on a CPU without them, and the clock
+  refused as Linux refuses it without `CAP_SYS_TIME`.
 
 ## Left to 1.0
 
@@ -99,8 +104,12 @@ hardware.
   attached to (stops, registers, memory, breakpoints, single-stepping,
   fork, clone and exit events, the thread pointer); left is `strace` and
   `gdb` themselves tracing and debugging a guest program.
-- [ ] **The last LTP failures:** `fork14`, `prctl09` and `select02` pass
-  alone but not always under a full run's load.
+- [ ] **The last LTP failures and skips:** `fork14`, `prctl09` and
+  `select02` pass alone but not always under a full run's load; and the
+  calls the remaining skips need: landlock, `process_vm_readv` and
+  `process_vm_writev`, and userfaultfd (with `mremap`'s
+  `MREMAP_DONTUNMAP` of one). The runner names every skip that is not an
+  exception.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries without section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
@@ -146,8 +155,10 @@ userland and podman with it, following the documentation.
 Calls for these are refused (`ENOSYS`, `EINVAL` or `EPERM`) unless noted, so
 programs that probe for them fall back.
 - **io_uring:** refused; programs fall back to ordinary system calls.
-- **Networking beyond loopback in namespaces** (veth, bridges, firewalling,
-  raw sockets, TUN): a new network namespace has loopback only.
+- **Networking beyond loopback and the host's sockets** (veth, bridges,
+  firewalling, raw and packet sockets, SCTP, RDS, TUN, kernel TLS): a new
+  network namespace has loopback only, and other protocols fail with
+  `EAFNOSUPPORT` or `ENOPROTOOPT`.
 - **`kcmp`:** macOS cannot tell whether two descriptors share an open file
   description.
 - **Chosen pids** (`clone3`'s `set_tid`, `/proc/sys/kernel/ns_last_pid`):
@@ -159,8 +170,21 @@ programs that probe for them fall back.
   gets a copy.
 - **Pipes over 64 KiB:** a host pipe holds no more, so a pipe starts at
   64 KiB, not Linux's 256 KiB with 16 KiB pages.
-- **Setting the clock:** fwe's root lacks `CAP_SYS_TIME`, as in a
-  container; the Mac's clock is only read.
+- **Setting the clock, and time namespaces:** fwe's root lacks
+  `CAP_SYS_TIME`, as in a container, which setting the clock and a time
+  namespace's offsets need; the Mac's clock is only read, and
+  `CLONE_NEWTIME` fails with `EINVAL`.
+- **Disk filesystems and block devices** (ext4, XFS, btrfs, quotas,
+  fs-verity, RAM disks, SCSI): files are the host's, on its filesystem;
+  fwe mounts tmpfs, proc, sysfs, cgroup2, devpts, mqueue and overlay, and
+  its loop devices hold no filesystem.
+- **Swap, huge pages and memory error injection:** the host manages
+  memory; `swapon` fails with `ENOSYS`, as on a kernel without swap.
+- **cgroup resource limits but `pids.max`** (memory, CPU, I/O): accepted,
+  not enforced; the host shares its resources alike.
+- **The page cache's figures** (`/proc/meminfo`'s `Cached`,
+  `/proc/<pid>/io`): the host's cache does not report them per process.
+- **perf events:** `perf_event_open` fails with `ENOSYS`.
 - **Setting the initial UTS namespace's names:** they are the Mac's; a new
   UTS namespace's are the guest's to set.
 - **CPU affinity:** macOS has none; `sched_setaffinity` is accepted and pins

@@ -683,7 +683,10 @@ impl<P: Platform> Kernel<P> {
             nr::SETPRIORITY => self.sys_setpriority(a[0], a[1] as i32, a[2] as i32),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
             nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
-            nr::BPF if !self.creds.has_admin() => err(errno::EPERM),
+            // `CAP_BPF` or `CAP_SYS_ADMIN`, as Linux's `bpf_capable`.
+            nr::BPF if !self.creds.has_admin() && !self.creds.has(crate::caps::CAP_BPF) => {
+                err(errno::EPERM)
+            }
             nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
             nr::CAPSET => self.sys_capset(a[0], a[1]),
             nr::SCHED_YIELD => {
@@ -698,6 +701,18 @@ impl<P: Platform> Kernel<P> {
             nr::DELETE_MODULE => self.sys_delete_module(a[0]),
             nr::SYSLOG => self.sys_syslog(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0], a[1]),
+            nr::IOPRIO_GET => self.sys_ioprio_get(a[0], a[1]),
+            nr::IOPRIO_SET => self.sys_ioprio_set(a[0], a[1], a[2]),
+            nr::CACHESTAT => self.sys_cachestat(a[0], a[1], a[2], a[3]),
+            // Protection keys: the CPU has none (arm64's need FEAT_S1POE),
+            // so none can be allocated, as Linux answers without them.
+            nr::PKEY_ALLOC => match (a[0], a[1] & !3) {
+                (0, 0) => err(errno::ENOSPC),
+                _ => err(errno::EINVAL),
+            },
+            nr::PKEY_FREE => err(errno::EINVAL),
+            nr::PKEY_MPROTECT if a[3] as i32 == -1 => self.sys_mprotect(a[0], a[1], a[2]),
+            nr::PKEY_MPROTECT => err(errno::EINVAL),
             nr::LSM_LIST_MODULES => self.sys_lsm_list_modules(a[0], a[1], a[2]),
             nr::LSM_GET_SELF_ATTR => self.sys_lsm_get_self_attr(a[0], a[2], a[3]),
             nr::LSM_SET_SELF_ATTR => self.sys_lsm_set_self_attr(a[1], a[2], a[3]),

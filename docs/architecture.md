@@ -395,6 +395,9 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
 
 - **Pending sets** are atomics in host thread-locals (the host handler
   records into them), registered by tid so another thread can target one.
+  A real-time signal already pending is queued behind it, with its own
+  `siginfo`, in a lock-free table of the set, oldest first; taking the
+  signal moves the next one up.
 - **fwe's handlers** start and end with every signal blocked, so the
   backend always knows whether it interrupted guest code or its own. Each
   thread otherwise runs under a host mask that blocks only the
@@ -760,6 +763,20 @@ each behaves inside fwe:
   - `IN_ONESHOT`, `IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`,
     `IN_ONLYDIR`, `IN_DONT_FOLLOW` and the `fs.inotify.*` limits act;
     `/proc/self/fdinfo` lists the watches.
+- **dnotify** (`crates/kernel/src/dnotify.rs`): an `F_NOTIFY` watch is a
+  watch in inotify's record that names its owner and descriptor, so the
+  same events reach it; an event is a signal, the descriptor's `F_SETSIG`
+  one with `si_fd` (or `SIGIO`). The owner's own events are posted as the
+  call runs; another process's reach it as a `SIGIO` note naming the
+  descriptor, which it turns into that signal. `DN_RENAME` hears a rename
+  within the directory only, as Linux's does.
+- **AIO** (`crates/kernel/src/aio.rs`): a context is the process's (not a
+  fork child's), named by a read-only page of zeros it maps, whose missing
+  magic number sends libaio's `io_getevents` to the system call. A
+  request is carried out as `io_submit` takes it, as Linux carries out one
+  without `O_DIRECT`, and its completion queued; a poll of a descriptor
+  not yet ready waits until `io_getevents` finds it ready.
+  `io_submit`, `io_getevents` and `io_cancel` run without the kernel lock.
 
 ## IPC
 
@@ -944,6 +961,19 @@ Calls that fit none of the areas above:
   and permissions as Linux does (`crates/kernel/src/calls.rs`);
   `rt_sigqueueinfo` and `rt_tgsigqueueinfo` send with the caller's
   `siginfo`.
+- `acct` (`crates/kernel/src/acct.rs`): the accounting file's host path
+  is kept in a file of fwe's for the pid namespace, and each ending
+  process looks for it and appends its `struct acct_v3`: times, memory and
+  faults from its usage, `AFORK` for a fork child that ran no program.
+- `cachestat` counts a file's resident pages with `mincore` of a mapping
+  of the range; `ioprio_set` checks and keeps the caller's I/O priority,
+  which nothing applies.
+- A socket filter is checked as it loads (`crate::bpfcheck`): each path is
+  followed with what is known of each register, and a map access at a
+  known offset outside the value is refused, as Linux's verifier refuses
+  it; one at an offset only the run knows is checked by the interpreter.
+- The LSM calls report Linux's capabilities as the one security module
+  (`/sys/kernel/security/lsm`), which keeps no attributes of a process.
 - `sysinfo` reports the host's uptime and load with the fixed memory
   figures of `/proc/meminfo`; `vm.drop_caches` accepts Linux's values and
   drops nothing.
@@ -998,10 +1028,14 @@ which are to be lifted for 1.0 and which are not planned.
   descriptor fwe stands in for (an eventfd, a timerfd, a signalfd) gives
   the host object behind it, as one passed over a socket does, and waits
   while the target is stopped.
-- A process ended by a signal fwe cannot catch (`SIGKILL`, or one from
-  outside fwe that the host applies) leaves the robust futexes it held
-  as they were, so their next locker waits rather than getting
-  `EOWNERDEAD`.
+- A native process ended by `SIGKILL`, or any process ended by a signal
+  from outside fwe that the host applies, leaves the robust futexes it
+  held as they were (their next locker waits rather than getting
+  `EOWNERDEAD`) and writes no accounting record; a VM process takes a
+  `SIGKILL` from fwe as its own ending, with both.
+- An I/O priority set for another process (`ioprio_set`) is checked and
+  accepted but not kept: `ioprio_get` reports that process's as (none,
+  0).
 - A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
   process ends (Linux sends it when the parent thread does); a new thread
   does not inherit its creator's name.
@@ -1147,10 +1181,10 @@ which are to be lifted for 1.0 and which are not planned.
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`).
 
 **Signals**
-- Once taken from the mailbox, one signal is pending per number, a
-  real-time one keeping its latest `siginfo`, rather than each queued; a
-  signal the host lacks reaches only fwe's processes (`EINVAL` to any
-  other).
+- A thread's and a process's pending sets queue up to 64 real-time
+  signals beyond one of each number, and drop more (Linux queues up to
+  `RLIMIT_SIGPENDING`, and `sigqueue` then fails with `EAGAIN`); a signal
+  the host lacks reaches only fwe's processes (`EINVAL` to any other).
 - A blocked signal whose action the host applies (ignored, or a default
   that ignores or continues) loses its sender, which matters only if a
   handler is installed before it is unblocked; a signal from outside fwe
