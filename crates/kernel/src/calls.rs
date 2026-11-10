@@ -482,7 +482,10 @@ impl<P: Platform> Kernel<P> {
             // Another process's other thread: the host signals processes.
             return err(errno::ESRCH);
         }
-        let Some(h) = crate::host::signal_to_host(s) else {
+        // One the host lacks, or SIGTRAP (which the host would merge with
+        // the target's next system-call trap): through the mailbox.
+        let h = crate::host::signal_to_host(s).filter(|_| s != fwe_abi::signal::SIGTRAP);
+        let Some(h) = h else {
             return crate::signal::send_unhosted(host, s, code, value);
         };
         crate::signote::note_with(host, h, code, value);

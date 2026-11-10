@@ -105,6 +105,7 @@ unsafe extern "C" {
     fn waitid(idtype: i32, id: u32, info: *mut SigInfo, options: i32) -> i32;
     fn getrusage(who: i32, usage: *mut Rusage) -> i32;
     fn pipe(fds: *mut i32) -> i32;
+    fn poll(fds: *mut libc_pollfd, n: u64, timeout: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn close(fd: i32) -> i32;
@@ -139,6 +140,15 @@ fn set(sigs: &[i32]) -> SigSet {
 }
 
 static HITS: AtomicUsize = AtomicUsize::new(0);
+/// `struct pollfd`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct libc_pollfd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
 static LAST_SIG: AtomicI32 = AtomicI32::new(0);
 static LAST_PID: AtomicI32 = AtomicI32::new(0);
 static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
@@ -600,6 +610,55 @@ fn main() {
                     LAST_TID.load(Ordering::SeqCst) == tid
                 );
             }
+        }
+        // SIGTRAP from another process, to one busy making system calls
+        // (which fwe traps with `brk`, whose SIGTRAP the host would merge a
+        // sent one with): each taken.
+        "trap-from-other" => {
+            static ACK: AtomicI32 = AtomicI32::new(-1);
+            extern "C" fn acked(_: i32) {
+                // SAFETY: a pipe's write end, written once.
+                unsafe { write(ACK.load(Ordering::SeqCst), b"a".as_ptr(), 1) };
+            }
+            let mut p = [0i32; 2];
+            // SAFETY: a valid out-array.
+            unsafe { pipe(p.as_mut_ptr()) };
+            ACK.store(p[1], Ordering::SeqCst);
+            let pid = child(|| {
+                let act = SigAction {
+                    handler: acked as *const () as usize,
+                    mask: SigSet([0; 16]),
+                    flags: 0,
+                    restorer: 0,
+                };
+                // SAFETY: a valid sigaction; plain calls.
+                unsafe {
+                    sigaction(SIGTRAP, &act, std::ptr::null_mut());
+                    write(p[1], b"r".as_ptr(), 1);
+                    loop {
+                        getppid();
+                    }
+                }
+            });
+            let mut b = [0u8; 1];
+            // SAFETY: plain calls on the pipe and the child.
+            let lost = unsafe {
+                read(p[0], b.as_mut_ptr(), 1);
+                let mut lost = 0;
+                for _ in 0..100 {
+                    kill(pid, SIGTRAP);
+                    let mut fds = [libc_pollfd { fd: p[0], events: 1, revents: 0 }];
+                    if poll(fds.as_mut_ptr(), 1, 2000) == 1 {
+                        read(p[0], b.as_mut_ptr(), 1);
+                    } else {
+                        lost += 1;
+                    }
+                }
+                kill(pid, SIGKILL);
+                lost
+            };
+            wait_status(pid);
+            println!("SIGTRAP from another process: lost {lost} of 100");
         }
         // A real-time signal sent to the process itself.
         "rt-self" => {

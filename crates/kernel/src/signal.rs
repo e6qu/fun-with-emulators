@@ -799,6 +799,16 @@ impl<P: Platform> Kernel<P> {
         {
             return send_unhosted(target as i32, sig, signal::SI_USER, 0);
         }
+        // SIGTRAP to another of fwe's processes goes through its mailbox:
+        // the host would merge it with the trap of that process's next
+        // system call (fwe's `brk`, a SIGTRAP too), and it would be lost.
+        if sig == signal::SIGTRAP
+            && target > 0
+            && !to_self
+            && crate::procreg::read(target as i32).is_some()
+        {
+            return send_unhosted(target as i32, sig, signal::SI_USER, 0);
+        }
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
             // A namespace's init takes its namespace with it.
             let led = (sig == signal::SIGKILL && target > 0)

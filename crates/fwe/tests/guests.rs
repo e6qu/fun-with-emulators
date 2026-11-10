@@ -2378,6 +2378,13 @@ fn signalfd_gets_signal_landing_on_futex_waiter() {
     assert_eq!(signals("signalfd-join"), "reader got 128 bytes for signal 10\n");
 }
 
+/// A SIGTRAP from another process reaches one busy making system calls,
+/// whose own traps are SIGTRAPs too (which the host would merge it with).
+#[test]
+fn sigtrap_from_another_process_is_not_lost() {
+    assert_eq!(signals("trap-from-other"), "SIGTRAP from another process: lost 0 of 100\n");
+}
+
 /// `ppoll` waits under the mask it is given, so a signal blocked outside it
 /// interrupts it and runs the handler.
 #[test]
