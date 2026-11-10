@@ -134,9 +134,21 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::fdtable::check_limit(n, &a) {
             return e;
         }
+        // What a Landlock domain does not allow ([`crate::landlock`]).
+        let no_truncate = if crate::landlock::active() {
+            match self.landlock_before(n, &a) {
+                Ok(t) => t,
+                Err(e) => return err(e),
+            }
+        } else {
+            false
+        };
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
+        if no_truncate && r >= 0 && matches!(n, nr::OPENAT | nr::OPENAT2) {
+            crate::landlock::opened_without_truncate(r as i32);
+        }
         crate::creds::publish(&self.creds);
         crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
@@ -222,6 +234,7 @@ impl<P: Platform> Kernel<P> {
                 crate::nsfd::closed(fd);
                 crate::inotify::closed(fd);
                 crate::dnotify::closed(fd);
+                crate::landlock::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
@@ -622,6 +635,17 @@ impl<P: Platform> Kernel<P> {
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
             nr::ACCT => self.sys_acct(a[0]),
+            nr::LANDLOCK_CREATE_RULESET => {
+                crate::landlock::create_ruleset(a[0], a[1], a[2]).unwrap_or_else(err)
+            }
+            nr::LANDLOCK_ADD_RULE => {
+                crate::landlock::add_rule(a[0] as i32, a[1], a[2], a[3]).unwrap_or_else(err)
+            }
+            nr::LANDLOCK_RESTRICT_SELF => {
+                let privileged = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
+                    || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+                crate::landlock::restrict_self(a[0] as i32, a[1], privileged).unwrap_or_else(err)
+            }
             nr::PROCESS_VM_READV => self.sys_process_vm(false, a),
             nr::PROCESS_VM_WRITEV => self.sys_process_vm(true, a),
             nr::IO_SETUP => self.sys_io_setup(a[0], a[1]),

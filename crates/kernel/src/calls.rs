@@ -13,9 +13,10 @@ const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 1;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
 const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 4;
 
-/// The security modules fwe has: Linux's capabilities alone
-/// (`LSM_ID_CAPABILITY`), which keep no attributes of a process.
-const LSM_IDS: [u64; 1] = [100];
+/// The security modules fwe has: Linux's capabilities and Landlock
+/// (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`), which keep no attributes of a
+/// process.
+const LSM_IDS: [u64; 2] = [100, 110];
 
 /// `struct lsm_ctx`'s header: `id`, `flags`, `len` and `ctx_len`.
 const LSM_CTX_HEADER: u64 = 32;

@@ -105,6 +105,8 @@ CONFIG_CGROUP_BPF=y
 CONFIG_CGROUP_DEVICE=y
 CONFIG_SECURITY=y
 CONFIG_SECURITYFS=y
+CONFIG_SECURITY_LANDLOCK=y
+CONFIG_LSM=\"capability,landlock\"
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 CONFIG_BPF=y
@@ -285,7 +287,7 @@ const DIRS: &[DirDef] = &[
         ],
     ),
     (b"/sys/kernel", &[(b"security", DT_DIR)]),
-    // securityfs: the security modules, Linux's capabilities alone.
+    // securityfs: the security modules, Linux's capabilities and Landlock.
     (b"/sys/kernel/security", &[(b"lsm", DT_REG)]),
     // Where the cgroup hierarchy is mounted.
     (b"/sys/fs", &[(b"cgroup", DT_DIR)]),
@@ -398,7 +400,7 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),
         b"/proc/sys/vm/mmap_min_addr" => Entry::File(b"65536\n".to_vec()),
         // No newline, as Linux writes it.
-        b"/sys/kernel/security/lsm" => Entry::File(b"capability".to_vec()),
+        b"/sys/kernel/security/lsm" => Entry::File(b"capability,landlock".to_vec()),
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {
             Entry::File(cpu_range(info.ncpu))
         }

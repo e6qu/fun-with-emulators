@@ -41,6 +41,8 @@ pub mod ipcops;
 pub mod keycrypto;
 pub mod keys;
 mod keytypes;
+pub mod landlock;
+mod landlockops;
 pub mod leases;
 pub mod loopdev;
 pub mod maps;
@@ -397,6 +399,7 @@ impl<P: Platform> Kernel<P> {
         pidfd::save(e);
         // A tracer that follows the child ([`ptrace::fork_event`]).
         ptrace::save_fork(e);
+        landlock::save(e);
     }
 
     /// The kernel [`Kernel::save_for_fork`] described, in the fork child,
@@ -467,6 +470,7 @@ impl<P: Platform> Kernel<P> {
         epoll::restore(d);
         pidfd::restore(d, false);
         ptrace::load_fork(d);
+        landlock::load(d);
         acct::forked_child();
         aio::forget_all();
         if let Some(fs) = &k.fs {
@@ -617,6 +621,9 @@ impl<P: Platform> Kernel<P> {
     /// bit set), and that no process has open for writing (`ETXTBSY`).
     pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
         use fwe_abi::{errno, fcntl};
+        if landlock::active() {
+            self.landlock_exec(path)?;
+        }
         let Some(fs) = self.fs.as_ref() else { return Ok(()) };
         if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
             && let Ok(name) = r.name_c()
@@ -697,6 +704,8 @@ impl<P: Platform> Kernel<P> {
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
         // Traced on, by the same tracer ([`ptrace::restore`]).
         e.u32(ptrace::exec_state() as u32);
+        // Its Landlock domain, which a program run keeps.
+        landlock::save(&mut e);
         e.into_bytes()
     }
 
@@ -733,6 +742,7 @@ impl<P: Platform> Kernel<P> {
         let persona = d.u32();
         let thp = d.bool();
         let tracer = d.u32() as i32;
+        landlock::load(&mut d);
         d.finish()?;
         ptrace::restore(tracer);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
@@ -1729,7 +1739,13 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         // Socket calls that can block run without the kernel lock, so a thread
         // waiting in accept/recv does not stall the threads meant to feed it.
         // SAFETY: caller guarantees the sockaddr pointer.
-        n::CONNECT => unsafe { net::connect(a[0], a[1], a[2]) },
+        n::CONNECT => {
+            match landlock::active().then(|| landlockops::check_connect(a[0] as i32, a[1], a[2])) {
+                Some(Err(e)) => fwe_abi::err(e),
+                // SAFETY: the backend's guarantee for the guest pointers.
+                _ => unsafe { net::connect(a[0], a[1], a[2]) },
+            }
+        }
         n::ACCEPT | n::ACCEPT4 => {
             let flags = if nr == n::ACCEPT4 { a[3] } else { 0 };
             // SAFETY: caller guarantees the out pointers.

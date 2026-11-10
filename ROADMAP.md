@@ -59,7 +59,8 @@ against a baseline. Beyond M3:
   timers; ptrace of processes and threads (see below); robust futexes
   released as their owner ends, and `get_robust_list` of any thread;
   zombies in `/proc`; real-time signals queued; process accounting
-  (`acct`); I/O priorities; `process_vm_readv` and `process_vm_writev`.
+  (`acct`); I/O priorities; `process_vm_readv` and `process_vm_writev`;
+  Landlock.
 - **Memory:** `mremap`, `madvise` and `msync` as Linux has them; the `mlock`
   family with accounting; `mincore`; `mseal`; `remap_file_pages`;
   `/proc/<pid>/maps`, `smaps` with `PROCMAP_QUERY`, `/proc/self/mem` and
@@ -106,8 +107,8 @@ hardware.
   `gdb` themselves tracing and debugging a guest program.
 - [ ] **The last LTP failures and skips:** `fork14`, `prctl09` and
   `select02` pass alone but not always under a full run's load; and the
-  calls the remaining skips need: landlock and userfaultfd (with
-  `mremap`'s `MREMAP_DONTUNMAP` of one). The runner names every skip that is not an
+  calls the remaining skips need: userfaultfd (with `mremap`'s
+  `MREMAP_DONTUNMAP` of one). The runner names every skip that is not an
   exception.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries without section headers, when a program needs them.

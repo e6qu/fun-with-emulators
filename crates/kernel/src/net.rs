@@ -56,9 +56,6 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
         // Abstract namespace: no macOS equivalent. Map the name to a stable
         // file under a per-host temp directory so peers rendezvous, the
         // name kept beside it (`<file>.name`) to be reported back.
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        raw[1..].hash(&mut h);
         let dir = abstract_dir();
         // Private to fwe's user, whatever the host's umask (fwe sets it to
         // 0, the guest's being its own to apply).
@@ -66,7 +63,7 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
             use std::os::unix::fs::DirBuilderExt;
             let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
         }
-        let p = dir.join(format!("{:016x}", h.finish()));
+        let p = abstract_file(&raw[1..]);
         let name = p.with_extension("name");
         if !name.exists() {
             let _ = std::fs::write(&name, &raw[1..]);
@@ -111,6 +108,21 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
     }
     let perm = crate::modes::guest_perm_at(dir, &name, &st);
     if crate::modes::owner_allows(perm, 2) { Ok(()) } else { Err(errno::EACCES) }
+}
+
+/// The file abstract name `name` (without its leading NUL) stands as.
+fn abstract_file(name: &[u8]) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    abstract_dir().join(format!("{:016x}", h.finish()))
+}
+
+/// The host process that bound abstract name `name`, if one did (for a
+/// Landlock domain that scopes abstract sockets).
+pub fn abstract_owner(name: &[u8]) -> Option<i32> {
+    let b = std::fs::read(abstract_file(name).with_extension("owner")).ok()?;
+    Some(i32::from_ne_bytes(b.get(..4)?.try_into().ok()?))
 }
 
 /// Where abstract names' files are: each network namespace has its own.
@@ -794,6 +806,12 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, true, &a.guest);
     }
+    // Who bound an abstract name, beside its file.
+    if r == 0 && src[..2] == 1u16.to_ne_bytes() && src.get(2) == Some(&0) {
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let _ = std::fs::write(abstract_file(&src[3..]).with_extension("owner"), me.to_ne_bytes());
+    }
     if r == 0
         && let Some(plan) = plan
     {
@@ -869,13 +887,18 @@ fn take_socket_mode(fd: i32) -> Option<u32> {
     Some(m.swap_remove(i).2)
 }
 
-/// `listen(fd, backlog)`.
+/// `listen(fd, backlog)`. Linux queues one connection more than the
+/// backlog (and takes any past `net.core.somaxconn`, or negative, as that),
+/// the host no more than it: the host is given one more.
 ///
 /// # Safety
 /// No pointer arguments.
 pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
+    const SOMAXCONN: i32 = 4096;
+    let b = backlog as i32;
+    let b = if (0..=SOMAXCONN).contains(&b) { b } else { SOMAXCONN };
     // SAFETY: plain host call.
-    ret(unsafe { libc::listen(fd as i32, backlog as i32) } as i64)
+    ret(unsafe { libc::listen(fd as i32, b + 1) } as i64)
 }
 
 /// `connect(fd, addr, addrlen)`.

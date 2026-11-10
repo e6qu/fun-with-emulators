@@ -502,6 +502,16 @@ kill08
 kill10
 kill11
 kill12
+landlock01
+landlock02
+landlock03
+landlock04
+landlock05
+landlock06
+landlock07
+landlock08
+landlock09
+landlock10
 lchown01
 lchown01_16
 lchown02

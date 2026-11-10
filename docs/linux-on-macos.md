@@ -990,7 +990,7 @@ and `futex_waitv` run without the kernel lock.
 | `getrusage`, `times` | The host's usage; `RUSAGE_THREAD` reports the process's; `times` in 100 Hz ticks since boot. | `getrusage` |
 | `pidfd_open`, `pidfd_getfd` | A process descriptor is a kqueue watching the process's exit; `pidfd_getfd` asks the target for the descriptor through its signal mailbox. | `kqueue`/`kevent`, `sendmsg`/`recvmsg` |
 | `personality` | Kept per process; `PER_LINUX32` fails with `EINVAL`. | none |
-| `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); each process of the pid namespace appends its `struct acct_v3` as it ends | `open`, `write` |
+| `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); an ending process appends its `struct acct_v3` to the nearest pid namespace's, its own or one above, with accounting on | `open`, `write` |
 
 **`clone` of a thread**: the new thread starts with its creator's
 registers, `x0` = 0, the given stack, the creator's signal mask, and
@@ -1266,7 +1266,7 @@ can block run without the kernel lock (`blocking_call` in
 | `socket`, `socketpair` | family, type and protocol checked; `SOCK_NONBLOCK`/`SOCK_CLOEXEC` applied after; every socket `SO_NOSIGPIPE`; a Unix socket gets Linux's 212,992-byte buffers; `SOCK_SEQPACKET` Unix sockets are framed streams; `socketpair` of a non-Unix family is `EOPNOTSUPP` | `socket`, `socketpair`, `fcntl`, `setsockopt` |
 | `socket(AF_NETLINK)` and calls on it | `NETLINK_ROUTE` only, `SOCK_RAW` or `SOCK_DGRAM`; fwe answers each request; `bind`, `connect`, `getsockname`, `getpeername` and `SOL_NETLINK` options are fwe's | `socketpair(AF_UNIX, SOCK_DGRAM)`, `send`, `recv` |
 | `bind`, `connect` | address checked against the socket's family and translated; a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`); ports mapped in an fwe network namespace; a bound Unix node gets the socket's mode less the umask, and the guest's owner; `connect` to `AF_UNSPEC` disconnects | `bind`, `connect` (from the path's directory with `pthread_fchdir_np` for a long path), `fchmodat` |
-| `listen` | passed through | `listen` |
+| `listen` | the host given one more than the backlog, as Linux queues one connection past it (a negative backlog or one past `somaxconn` taken as 4096) | `listen` |
 | `accept`, `accept4` | peer address translated back; flags applied; a `SOCK_SEQPACKET` listener's connection marked as one; past `RLIMIT_NOFILE` closed, `EMFILE` | `accept`, `fcntl`, `setsockopt` |
 | `getsockname`, `getpeername` | host address translated back; a Unix path is reported as the guest gave it; namespace ports mapped back; `IPV6_ADDRFORM` view applied | `getsockname`, `getpeername` |
 | `sendto`, `sendmsg`, `recvfrom`, `recvmsg` | flags mapped; addresses translated; `SCM_RIGHTS` re-encoded; `MSG_MORE` held back on TCP and UDP; `MSG_ERRQUEUE` on an IP socket `EAGAIN`; a peer's eBPF socket filter applied on send; `SIGPIPE` raised by fwe unless `MSG_NOSIGNAL` | `sendmsg`, `recv`, `recvfrom`, `recvmsg` |
@@ -1427,7 +1427,7 @@ otherwise.
 | `reboot` | `CAP_SYS_BOOT` and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
 | `vhangup` | `CAP_SYS_TTY_CONFIG`, then nothing | none |
 | `delete_module` | `CAP_SYS_MODULE`, the name read, then `ENOENT`: no module is loaded | none |
-| `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities are the one module (`LSM_ID_CAPABILITY`, `/sys/kernel/security/lsm` reads `capability`); it keeps no attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
+| `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities and Landlock are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`; `/sys/kernel/security/lsm` reads `capability,landlock`); neither keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
 
 **`uname`**: the release is fixed (`RELEASE` in
 `crates/kernel/src/syscalls.rs`), with `UNAME26` replacing its version
@@ -1451,6 +1451,7 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 |---|---|---|
 | `ptrace` | `TRACEME`, `ATTACH`, `SEIZE`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `mmap` of a shared page, `__ulock_wait2`/`__ulock_wake`, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
+| `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path, TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); the domain is the process's, carried by `fork` and `execve` | none |
 | `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
 
 **`ptrace`**: each traced thread has a mailbox, a page in fwe's private
@@ -2266,7 +2267,7 @@ Any call not dispatched in `crates/kernel/src/syscalls.rs` fails with
 - `kcmp`;
 - `io_uring_setup` and the rest;
 - `userfaultfd`, `perf_event_open`, `fanotify_init`/`fanotify_mark`;
-- the `landlock_*` calls, `rseq`;
+- `rseq`;
 - the `futex_wait`, `futex_wake` and `futex_requeue` calls (`futex` and
   `futex_waitv` work);
 - the `*xattrat` calls, `open_tree_attr`, `listns`;

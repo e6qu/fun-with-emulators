@@ -362,6 +362,8 @@ pub fn forked() {
     with_own(Pending::clear);
     crate::acct::forked_child();
     crate::aio::forget_all();
+    // A restricted process's child is in its domain: it says so.
+    crate::landlock::publish();
     // A new process starts with no robust list, as Linux's does.
     ROBUST_LIST.with(|c| c.set((0, 0)));
 }
