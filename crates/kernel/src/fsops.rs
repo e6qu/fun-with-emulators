@@ -488,6 +488,33 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn sys_openat_bytes(&mut self, dirfd: u64, path: &[u8], flags: u64, mode: u64) -> i64 {
+        // `O_TMPFILE`: a new file under a hidden name in the directory, for
+        // writing ([`crate::tmpfile`]).
+        if flags & fcntl::O_TMPFILE == fcntl::O_TMPFILE {
+            if flags & fcntl::O_ACCMODE == fcntl::O_RDONLY {
+                return err(errno::EINVAL);
+            }
+            let dir = match self.fs().resolve(dirfd as i32, path, true) {
+                Ok(r) => r,
+                Err(e) => return err(e),
+            };
+            match dir.name_c().ok().and_then(|n| stat_at(dir.dir.as_raw_fd(), &n).ok()) {
+                Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+                Some(_) => return err(errno::ENOTDIR),
+                None => return err(errno::ENOENT),
+            }
+            let mut name = path.to_vec();
+            if !name.ends_with(b"/") {
+                name.push(b'/');
+            }
+            name.extend_from_slice(&crate::tmpfile::fresh_name());
+            let made = flags & !fcntl::O_TMPFILE | fcntl::O_CREAT | fcntl::O_EXCL;
+            let fd = self.sys_openat_bytes(dirfd, &name, made, mode);
+            if fd >= 0 {
+                crate::tmpfile::made(fd as i32, flags & fcntl::O_EXCL != 0);
+            }
+            return fd;
+        }
         // With O_PATH every flag but these is ignored, as on Linux: nothing
         // is made, truncated or opened for writing.
         let flags = if flags & fcntl::O_PATH != 0 {
@@ -1642,6 +1669,14 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: `name` NUL-terminated; `dir` live.
         let r = self.change_in(d, || ret(unsafe { libc::unlinkat(d, name.as_ptr(), host_flags) }));
+        // A directory holding nothing but `O_TMPFILE` files is empty to
+        // Linux, whose have no names: their hidden ones go, and it goes.
+        let r = if r == err(errno::ENOTEMPTY) && crate::tmpfile::clear_hidden(d, &name) {
+            // SAFETY: as above.
+            self.change_in(d, || ret(unsafe { libc::unlinkat(d, name.as_ptr(), host_flags) }))
+        } else {
+            r
+        };
         if r == err(errno::EPERM) && host_flags == 0 {
             // macOS refuses to unlink a directory with EPERM; Linux says
             // what it is.
@@ -1692,9 +1727,22 @@ impl<P: Platform> Kernel<P> {
         newpath: u64,
         flags: u64,
     ) -> i64 {
+        if flags & !(fcntl::AT_SYMLINK_FOLLOW | fcntl::AT_EMPTY_PATH) != 0 {
+            return err(errno::EINVAL);
+        }
         let oldpath = guest!(uaccess::read_cstr(oldpath, uaccess::PATH_MAX));
         let newpath = guest!(uaccess::read_cstr(newpath, uaccess::PATH_MAX));
         let follow = flags & fcntl::AT_SYMLINK_FOLLOW != 0;
+        // A file fwe makes up (under `/proc` or `/sys`) is on another
+        // filesystem than anything it could be linked into.
+        if !oldpath.is_empty()
+            && matches!(
+                self.fs().synthetic(olddirfd as i32, &oldpath),
+                Some(crate::procfs::Entry::File(_) | crate::procfs::Entry::Dir)
+            )
+        {
+            return err(errno::EXDEV);
+        }
         if oldpath.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 {
             // A name for the descriptor's own file (an O_TMPFILE one, say).
             return self.link_fd(olddirfd as i32, newdirfd, &newpath);
@@ -2119,7 +2167,8 @@ impl<P: Platform> Kernel<P> {
         let cgroup = crate::fdmarks::origin(fd as i32)
             .is_some_and(|o| o.fstype == crate::mounts::FsType::Cgroup2);
         let hide = |name: &[u8]| {
-            cgroup && (name == crate::cgroupfs::PRIVATE || name.ends_with(b".fwe-new"))
+            (cgroup && (name == crate::cgroupfs::PRIVATE || name.ends_with(b".fwe-new")))
+                || name.starts_with(crate::tmpfile::PREFIX)
         };
         getdents64(fd as i32, buf, count as usize, &hide)
     }

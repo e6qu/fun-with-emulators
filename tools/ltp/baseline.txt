@@ -480,6 +480,7 @@ link02
 link04
 link05
 link08
+linkat01
 linkat02
 listen01
 listmount01
@@ -654,6 +655,7 @@ open_by_handle_at01
 open_by_handle_at02
 openat01
 openat02
+openat04
 openat201
 openat202
 openat203

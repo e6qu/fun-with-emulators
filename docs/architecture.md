@@ -563,6 +563,12 @@ shapes differently:
   enforces; setting them takes `CAP_LINUX_IMMUTABLE`, and such a file's
   extended attributes cannot change. `O_NOATIME` (a descriptor's own,
   the host has none) leaves the access time as a `noatime` mount does.
+- **`O_TMPFILE`** (`crates/kernel/src/tmpfile.rs`): the file is made
+  under a hidden name in its directory (`getdents` leaves it out, `rmdir`
+  of a directory holding only such names removes them), which goes when
+  the descriptor is closed, or at once with `O_EXCL`; `linkat` gives it a
+  name through `/proc/self/fd`. A kept mode the host lacks (one without
+  the owner's read and write) is not carried to the name it is given.
 - **File handles** (`crates/kernel/src/handles.rs`): a handle names the
   host file system and inode, which the host turns back into a path
   (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes

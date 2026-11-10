@@ -86,6 +86,7 @@ pub mod sysctl;
 pub mod sysvipc;
 pub mod term;
 pub mod thread;
+pub mod tmpfile;
 pub mod tmpfs;
 pub mod trace;
 pub mod uaccess;

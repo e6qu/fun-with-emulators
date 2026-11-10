@@ -204,6 +204,7 @@ impl<P: Platform> Kernel<P> {
                 crate::mountwatch::closed(fd);
                 crate::atime::closed(fd);
                 crate::memfd::closed(fd);
+                crate::tmpfile::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);
