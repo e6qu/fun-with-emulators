@@ -949,6 +949,14 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     r
 }
 
+/// Whether `fd` is a regular file.
+fn is_regular(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG }
+}
+
 /// `sendfile` (`both_files` false) and `copy_file_range` (true): copy up to
 /// `count` bytes from `input` to `output`, from the offset at `in_off` (a
 /// guest pointer, updated, leaving the file's own offset alone) or the
@@ -978,6 +986,15 @@ fn copy_between(
     };
     // A loop device reads and writes as a block device: `sendfile` takes
     // one, `copy_file_range` only regular files.
+    // The input open for reading, the output for writing.
+    // SAFETY: F_GETFL only queries the descriptors.
+    let (iacc, oacc) =
+        unsafe { (libc::fcntl(input, libc::F_GETFL), libc::fcntl(output, libc::F_GETFL)) };
+    if (iacc >= 0 && iacc & libc::O_ACCMODE == libc::O_WRONLY)
+        || (oacc >= 0 && oacc & libc::O_ACCMODE == libc::O_RDONLY)
+    {
+        return err(errno::EBADF);
+    }
     let device = |fd: i32| loopdev::device_of(fd).is_some();
     let (in_dev, out_dev) = (device(input), device(output));
     match (regular(input), regular(output)) {
@@ -1461,10 +1478,31 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 Some(r) => r,
                 // A file of a tmpfs with a size: as much as fits.
                 None => match tmpfs::room(a[0] as i32, Some(a[3]), a[2]) {
-                    // SAFETY: the host validates the guest buffer.
-                    Ok(n) => host::ret(unsafe {
-                        libc::pwrite(a[0] as i32, a[1] as *const _, n as usize, a[3] as libc::off_t)
-                    } as i64),
+                    Ok(n) => {
+                        let fd = a[0] as i32;
+                        // SAFETY: F_GETFL only queries the descriptor.
+                        let append =
+                            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_APPEND != 0;
+                        if append && is_regular(fd) {
+                            // Linux appends whatever the offset, leaving the
+                            // file's own offset where it was.
+                            // SAFETY: plain host calls; the host validates the
+                            // guest buffer.
+                            unsafe {
+                                let at = libc::lseek(fd, 0, libc::SEEK_CUR);
+                                let r = libc::write(fd, a[1] as *const _, n as usize);
+                                if at >= 0 {
+                                    libc::lseek(fd, at, libc::SEEK_SET);
+                                }
+                                host::ret(r as i64)
+                            }
+                        } else {
+                            // SAFETY: the host validates the guest buffer.
+                            host::ret(unsafe {
+                                libc::pwrite(fd, a[1] as *const _, n as usize, a[3] as libc::off_t)
+                            } as i64)
+                        }
+                    }
                     Err(e) => fwe_abi::err(e),
                 },
             }

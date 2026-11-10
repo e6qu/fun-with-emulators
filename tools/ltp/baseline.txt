@@ -151,6 +151,7 @@ execve01
 execve02
 execve03
 execve05
+execve06
 execveat01
 execveat02
 execveat03
@@ -260,6 +261,7 @@ fcntl37_64
 fcntl40
 fcntl40_64
 fdatasync01
+fdatasync02
 fgetxattr01
 fgetxattr02
 fgetxattr03
@@ -306,6 +308,7 @@ fstatfs02
 fstatfs02_64
 fsync01
 fsync02
+fsync03
 ftruncate01
 ftruncate01_64
 ftruncate03
@@ -634,6 +637,7 @@ open04
 open06
 open07
 open09
+open11
 open15
 openat01
 openat201
@@ -711,6 +715,8 @@ pwrite02
 pwrite02_64
 pwrite03
 pwrite03_64
+pwrite04
+pwrite04_64
 pwritev01
 pwritev01_64
 pwritev02
@@ -822,6 +828,8 @@ send01
 send02
 sendfile02
 sendfile02_64
+sendfile03
+sendfile03_64
 sendfile04
 sendfile04_64
 sendfile05
@@ -862,6 +870,7 @@ setpgid03
 setpgrp01
 setpgrp02
 setpriority01
+setpriority02
 setregid01
 setregid02
 setregid03

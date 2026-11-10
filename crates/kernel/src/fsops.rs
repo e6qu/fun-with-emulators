@@ -302,6 +302,24 @@ impl<P: Platform> Kernel<P> {
     /// host's to a file of fwe's `/proc` or `/sys` (`/etc/mtab`), which the
     /// host cannot open, is opened as that file.
     pub(crate) fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
+        let r = self.open_path_inner(dirfd, path, flags, mode);
+        // `O_CREAT` of a directory that exists (through a link too) is
+        // `EISDIR`, which the host lets open.
+        if r >= 0 && flags & fcntl::O_CREAT != 0 {
+            // SAFETY: an all-zero `stat` is a valid out-parameter.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as above, on the descriptor just opened.
+            if unsafe { libc::fstat(r as i32, &mut st) } == 0
+                && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            {
+                let _ = self.syscall(fwe_abi::nr::CLOSE, [r as u64, 0, 0, 0, 0, 0]);
+                return err(errno::EISDIR);
+            }
+        }
+        r
+    }
+
+    fn open_path_inner(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         let r = self.open_path_once(dirfd, path.clone(), flags, mode);
         if (r == err(errno::ENOENT) || r == err(errno::ELOOP))
             && flags & fcntl::O_NOFOLLOW == 0

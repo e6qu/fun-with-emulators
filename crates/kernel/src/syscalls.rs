@@ -369,8 +369,20 @@ impl<P: Platform> Kernel<P> {
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
             nr::FSYNC | nr::FDATASYNC => match crate::loopdev::fsync(a[0] as i32) {
                 Some(r) => r,
-                // SAFETY: plain host call on a guest fd.
-                None => ret(unsafe { libc::fsync(a[0] as i32) }),
+                None => {
+                    // A pipe, socket or character device has nothing to
+                    // sync: `EINVAL`, as Linux has it.
+                    // SAFETY: an all-zero `stat` is a valid out-parameter.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: as above.
+                    let ok = unsafe { libc::fstat(a[0] as i32, &mut st) } == 0;
+                    let kind = st.st_mode & libc::S_IFMT;
+                    if ok && matches!(kind, libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR) {
+                        return err(errno::EINVAL);
+                    }
+                    // SAFETY: plain host call on a guest fd.
+                    ret(unsafe { libc::fsync(a[0] as i32) })
+                }
             },
 
             // Memory.
@@ -2495,7 +2507,7 @@ impl<P: Platform> Kernel<P> {
         Ok(match which {
             prio::PROCESS if who == 0 => vec![me],
             prio::PROCESS => crate::pidns::to_host(who)
-                .filter(|&h| h > 0 && (h == me || crate::procreg::start_time(h).is_some()))
+                .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
                 .into_iter()
                 .collect(),
             prio::PGRP => {

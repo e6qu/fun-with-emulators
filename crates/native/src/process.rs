@@ -39,8 +39,13 @@ type ExecArgs = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 /// The argument and environment arrays of an `execve`.
 fn read_exec_args(argv: u64, envp: u64) -> Result<ExecArgs, i64> {
     use fwe_kernel::uaccess;
-    let args = uaccess::read_cstr_array(argv, ARG_MAX).map_err(err)?;
+    let mut args = uaccess::read_cstr_array(argv, ARG_MAX).map_err(err)?;
     let env = uaccess::read_cstr_array(envp, ARG_MAX).map_err(err)?;
+    // No arguments at all: the program gets one empty one, as Linux gives
+    // it, so its `argv[0]` is a string.
+    if args.is_empty() {
+        args.push(Vec::new());
+    }
     Ok((args, env))
 }
 

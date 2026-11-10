@@ -1189,6 +1189,8 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
             (Ok(a), Ok(e)) => (a, e),
             (Err(e), _) | (_, Err(e)) => return err(e),
         };
+    // No arguments at all: one empty one, as Linux gives the program.
+    let argv = if argv.is_empty() { vec![Vec::new()] } else { argv };
     let guard = kernel();
     let k = guard.as_ref().unwrap();
     if let Err(e) = k.may_exec(&path) {
