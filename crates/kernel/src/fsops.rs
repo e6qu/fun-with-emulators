@@ -263,7 +263,13 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if unsafe { libc::fstat(fd, &mut out) } < 0 {
         return Err(host::errno_to_linux(host::last_errno()));
     }
-    if crate::mountapi::is_context(fd) {
+    // A program or map of bpf's is one of fwe's unlinked files.
+    let bpf = || {
+        out.st_mode & libc::S_IFMT == libc::S_IFREG
+            && out.st_nlink == 0
+            && crate::bpf::is_bpf_fd(fd)
+    };
+    if crate::mountapi::is_context(fd) || bpf() {
         // An anonymous inode: owner read and write, of no file type.
         out.st_mode = 0o600;
         let owner = crate::owners::host_owner(&out);
@@ -1120,7 +1126,7 @@ impl<P: Platform> Kernel<P> {
             // inode, whatever stands in for it on the host.
             let anon = crate::specialfd::anon_name(fd).is_some()
                 || crate::signalfd::is_signalfd(fd)
-                || crate::bpf::prog_of(fd).is_some();
+                || crate::bpf::is_bpf_fd(fd);
             let magic = match st.st_mode & libc::S_IFMT {
                 _ if anon => Some(ANON_INODE_FS_MAGIC),
                 libc::S_IFIFO if crate::fs::fd_path(fd).is_none() => Some(PIPEFS_MAGIC),

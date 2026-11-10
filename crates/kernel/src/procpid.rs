@@ -663,6 +663,68 @@ fn target_of(host: i32, fd: i32, kind: i32) -> Option<FdTarget> {
     })
 }
 
+/// The handle of the socket a connected Unix socket, descriptor `fd` of
+/// host process `host`, is connected to: what [`socket_id`] gives for
+/// the other end.
+pub fn socket_peer(host: i32, fd: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let at = peer_offset()?;
+        let b = socket_info(host, fd)?;
+        let v = u64::from_ne_bytes(b[at..at + 8].try_into().ok()?);
+        (v != 0).then_some(v)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (host, fd);
+        None
+    }
+}
+
+/// `PROC_PIDFDSOCKETINFO` of descriptor `fd` of host process `host`.
+#[cfg(target_os = "macos")]
+fn socket_info(host: i32, fd: i32) -> Option<Vec<u8>> {
+    const SOCKET: i32 = 3;
+    const SOCKET_SIZE: usize = 792;
+    let mut b = vec![0u8; SOCKET_SIZE];
+    // SAFETY: a valid out-buffer of its size.
+    let n = unsafe {
+        libc::proc_pidfdinfo(host, fd, SOCKET, b.as_mut_ptr().cast(), SOCKET_SIZE as i32)
+    };
+    (n as usize == SOCKET_SIZE).then_some(b)
+}
+
+/// Where in a Unix socket's [`socket_info`] its peer's handle is
+/// (`unsi_conn_so`): found once, on a pair of fwe's own, as the place in
+/// one end's that holds the other's handle.
+#[cfg(target_os = "macos")]
+fn peer_offset() -> Option<usize> {
+    static AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let mut sv = [-1i32; 2];
+        // SAFETY: a valid out-array.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let found = (|| {
+            let a = socket_info(me, sv[0])?;
+            let other = socket_id(me, sv[1])?;
+            // Past the socket's own handle (at 160).
+            (168..a.len() - 8)
+                .step_by(8)
+                .find(|&i| u64::from_ne_bytes(a[i..i + 8].try_into().unwrap()) == other)
+        })();
+        // SAFETY: closing the pair just made.
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+        found
+    })
+}
+
 /// A socket's identity as every process names it: the host's kernel handle
 /// of descriptor `fd` of host process `host` (its `fstat` inode is a
 /// number only that process can read).

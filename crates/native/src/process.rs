@@ -467,8 +467,16 @@ pub fn do_wait4(regs: &Regs) -> i64 {
             host_options |= host;
         }
     }
+    if fwe_kernel::ptrace::tracing() {
+        return wait4_tracer(pid, host_options, wstatus, rusage);
+    }
     if !reaper::active() {
-        return wait4_host(pid, host_options, wstatus, rusage);
+        let r = wait4_host(pid, host_options, wstatus, rusage);
+        // A child that began to be traced while this waited, and stopped.
+        if r == err(errno::EINTR) && fwe_kernel::ptrace::tracing() {
+            return wait4_tracer(pid, host_options, wstatus, rusage);
+        }
+        return r;
     }
     // A reaper: its own children, and those it adopted.
     let sel = match pid {
@@ -569,6 +577,48 @@ fn reaper_wait(
 
 /// `wait4` of the host's children (`pid` is the host's), the result
 /// written in Linux's layout.
+/// `wait4` of a tracer: a stop of one of its tracees first (which the host
+/// does not see: a tracee stops in fwe, [`fwe_kernel::ptrace`]), then its
+/// children as the host reports them, looking again as tracees stop.
+fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
+    // SAFETY: plain host calls.
+    let pgid_of = |p: i32| unsafe { libc::getpgid(p) };
+    // SAFETY: as above.
+    let my_pgid = unsafe { libc::getpgrp() };
+    let wanted = |p: i32| match pid {
+        -1 => true,
+        0 => pgid_of(p) == my_pgid,
+        p if p > 0 => p == pid,
+        p => pgid_of(p) == -p,
+    };
+    loop {
+        let seen = fwe_kernel::ptrace::inbox_generation();
+        if let Some((p, status)) = fwe_kernel::ptrace::take_stop(wanted, false) {
+            if wstatus != 0 && fwe_kernel::uaccess::write(wstatus, status).is_err() {
+                return err(errno::EFAULT);
+            }
+            if rusage != 0 && fwe_kernel::uaccess::write(rusage, [0u64; 18]).is_err() {
+                return err(errno::EFAULT);
+            }
+            return fwe_kernel::pidns::guest_ret(p as i64);
+        }
+        let r = wait4_host(pid, host_options | libc::WNOHANG, wstatus, rusage);
+        // A traced process that is not a child is no host child to wait for.
+        let traced_other =
+            r == err(errno::ECHILD) && (pid > 0 && fwe_kernel::ptrace::traces(pid) || pid == -1);
+        if r != 0 && !(traced_other && pid > 0) {
+            return r;
+        }
+        if host_options & libc::WNOHANG != 0 {
+            return 0;
+        }
+        if fwe_kernel::thread::deliverable() != 0 {
+            return err(errno::EINTR);
+        }
+        fwe_kernel::ptrace::wait_for_stop(seen, std::time::Duration::from_millis(20));
+    }
+}
+
 fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     if host_options & libc::WNOHANG != 0 && pid > 0 && reaper::init_unreapable(pid) {
         return 0;

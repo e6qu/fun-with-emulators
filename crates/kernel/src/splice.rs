@@ -69,7 +69,7 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
     let special = crate::loopdev::is_control(fd)
         || crate::specialfd::anon_name(fd).is_some()
         || crate::signalfd::is_signalfd(fd)
-        || crate::bpf::prog_of(fd).is_some()
+        || crate::bpf::is_bpf_fd(fd)
         || crate::synthdir::path_of(fd).is_some()
         || crate::netlink::is(fd)
         || matches!(

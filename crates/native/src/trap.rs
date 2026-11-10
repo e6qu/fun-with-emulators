@@ -331,6 +331,12 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         unsafe { libc::_exit(127) }
     }
     reroute_parked();
+    // A traced process stopping at system calls: the entry's stop, where
+    // the tracer may change the registers.
+    let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
+    if syscall_stops {
+        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs);
+    }
     let nr = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The process's seccomp filters decide first, for every call.
@@ -373,8 +379,12 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         };
         match r {
             // Return from the handler into the new program, which also
-            // leaves the signal stack and restores the guest's mask.
-            Ok(new) => regs = new,
+            // leaves the signal stack and restores the guest's mask; a
+            // traced process stops there first.
+            Ok(new) => {
+                regs = new;
+                kernel().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+            }
             Err(r) => kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r),
         }
         settle(&mut regs);
@@ -431,6 +441,10 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
     } else {
         kernel().as_mut().unwrap().enter_syscall(&mut regs);
+    }
+    // The exit's stop, its result in `x0`.
+    if syscall_stops {
+        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs);
     }
     settle(&mut regs);
     regs_to(mc, &regs);

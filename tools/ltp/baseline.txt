@@ -25,6 +25,8 @@ bind02
 bind03
 bind04
 bind05
+bpf_map01
+bpf_prog01
 brk01
 brk02
 capget01
@@ -737,6 +739,11 @@ pselect02
 pselect02_64
 pselect03
 pselect03_64
+ptrace01
+ptrace02
+ptrace03
+ptrace05
+ptrace06
 pwrite01
 pwrite01_64
 pwrite02
@@ -764,6 +771,8 @@ readlinkat01
 readv01
 readv02
 realpath01
+reboot01
+reboot02
 recv01
 recvfrom01
 recvmsg01
@@ -834,6 +843,7 @@ sched_setscheduler01
 sched_setscheduler02
 sched_setscheduler03
 sched_yield01
+seccomp01
 select01
 select03
 select04

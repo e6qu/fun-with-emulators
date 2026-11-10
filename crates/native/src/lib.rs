@@ -1034,10 +1034,21 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     // Signals the guest inherits as ignored stay ignored; the rest go to
     // their default action until the guest says otherwise.
     KERNEL.lock().unwrap().as_mut().unwrap().adopt_host_signals();
+    // A traced program, re-executed by fwe, stops for its tracer before its
+    // first instruction, as after any `execve`.
+    let traced = fwe_kernel::ptrace::traced().then(|| {
+        let mut regs = fwe_kernel::Regs { sp, pc: entry, ..fwe_kernel::Regs::default() };
+        KERNEL.lock().unwrap().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+        regs
+    });
     // From here on this thread runs guest code, which may use x18 freely;
     // the trap handlers leave the mode while they run host code.
     trap::prepare_guest_entry();
-    trap::enter_guest(sp, entry)
+    match traced {
+        // SAFETY: the registers of the program's entry, as the tracer left them.
+        Some(regs) => unsafe { trap::enter_guest_full(&regs) },
+        None => trap::enter_guest(sp, entry),
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

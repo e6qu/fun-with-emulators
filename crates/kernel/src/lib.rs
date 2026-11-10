@@ -12,6 +12,7 @@
 
 pub mod atime;
 pub mod bpf;
+pub mod bpfmap;
 pub mod calls;
 pub mod caps;
 pub mod cgroupfs;
@@ -65,6 +66,7 @@ pub mod procfs;
 pub mod procmem;
 pub mod procpid;
 pub mod procreg;
+pub mod ptrace;
 pub mod pty;
 pub mod reaper;
 pub mod rlimits;
@@ -672,6 +674,8 @@ impl<P: Platform> Kernel<P> {
         // has none of, would clear some of it).
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
+        // Traced on, by the same tracer ([`ptrace::restore`]).
+        e.u32(ptrace::exec_state() as u32);
         e.into_bytes()
     }
 
@@ -707,7 +711,9 @@ impl<P: Platform> Kernel<P> {
         let nnp = d.bool();
         let persona = d.u32();
         let thp = d.bool();
+        let tracer = d.u32() as i32;
         d.finish()?;
+        ptrace::restore(tracer);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
@@ -1522,6 +1528,13 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             if memfd::grow_refused(fd, None, len) {
                 return Some(fwe_abi::err(fwe_abi::errno::EPERM));
             }
+            // A socket whose peer filters what arrives: none of it (dropped
+            // as if sent), or its first part.
+            let (sent, len) = match bpf::filter_send(fd, len) {
+                Some(0) => return Some(len as i64),
+                Some(keep) => (len, keep),
+                None => (len, len),
+            };
             // A file of a tmpfs with a size: as much as fits.
             let len = match tmpfs::room(fd, None, len) {
                 Ok(n) => n,
@@ -1541,7 +1554,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 return Some(r);
             }
             // SAFETY: the host validates the guest buffer.
-            host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64)
+            let r = host::ret(unsafe { libc::write(fd, buf as *const _, len as usize) } as i64);
+            // A part the filter let in reports the whole as sent.
+            if r == len as i64 && len < sent { sent as i64 } else { r }
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),

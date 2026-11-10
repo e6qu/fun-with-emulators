@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 1150 of 1551 (97% of the 1184 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 1160 of 1551 (99.7% of the 1164 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -136,8 +136,10 @@ In order of what each item unblocks. The LTP counts are from the latest
 run.
 
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
-  and debug a guest program (attach, system-call stops, registers, memory,
-  breakpoints, signals).
+  and debug a guest program. Tracing a child or an attached process,
+  signal and system-call stops, registers, memory and breakpoints work;
+  left are single-stepping, the fork, clone and exit events (`strace -f`),
+  stops of a tracee's other threads, and `waitid` of a tracee's stops.
 - [ ] **Every other failure LTP points at**, among them:
   - `fs.protected_hardlinks` and `protected_symlinks`, robust futex
     lists of other processes.
@@ -208,6 +210,12 @@ for it fall back:
   `CLOSE_RANGE_UNSHARE` act as Linux's on it);
 - pipes of more than 64 KiB, which a host pipe cannot hold: a pipe
   starts with 64 KiB where Linux with 16 KiB pages gives 256 KiB (`fcntl35`);
+- setting the clock (`settimeofday`, `clock_settime`, `adjtimex` and
+  `clock_adjtime` that change it): fwe's root lacks `CAP_SYS_TIME`, as in
+  a container, so the Mac's clock is only read;
+- setting the host name or NIS domain name in the initial UTS namespace:
+  it is the Mac's, read and never set (`EPERM`); a new UTS namespace's
+  names are the guest's to set;
 - CPU affinity: macOS has none, so `sched_setaffinity` is accepted and
   pins nothing, and a test of how the scheduler shares one CPU (`nice05`)
   cannot hold;

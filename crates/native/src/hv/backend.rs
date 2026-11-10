@@ -768,7 +768,10 @@ fn start(
     thread::set_mask(inherited_mask);
     *kernel() = Some(k);
 
-    let regs = Regs { sp: image.sp, pc: entry, ..Regs::default() };
+    let mut regs = Regs { sp: image.sp, pc: entry, ..Regs::default() };
+    // A traced program stops for its tracer before its first instruction,
+    // as after any `execve`.
+    kernel().as_mut().unwrap().ptrace_exec_stop(&mut regs);
     vcpu.run(regs)
 }
 
@@ -1432,6 +1435,11 @@ fn host_buffer(n: u64, i: usize, a: &[u64; 6]) -> Option<(u64, bool)> {
 /// Run the system call in `regs` (number in `x8`), leaving its result and
 /// any signal delivery in `regs`.
 fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
+    // A traced process stopping at system calls: the entry's stop.
+    let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
+    if syscall_stops {
+        kernel().as_mut().unwrap().ptrace_syscall_stop(regs);
+    }
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The process's seccomp filters decide first, for every call.
@@ -1543,4 +1551,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // Guest addresses only from here on (a signal frame, say).
     uaccess::clear_host_args();
     kernel().as_mut().unwrap().finish_syscall(regs, n, &args, result);
+    // The exit's stop, its result in `x0`.
+    if syscall_stops {
+        kernel().as_mut().unwrap().ptrace_syscall_stop(regs);
+    }
 }

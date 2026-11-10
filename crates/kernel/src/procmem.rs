@@ -129,38 +129,54 @@ fn mapped(addr: u64) -> bool {
 /// Write `data` to guest address `addr`, within one page, as Linux's
 /// forced write does: whether it was written.
 fn force_write(addr: u64, data: &[u8]) -> bool {
+    use fwe_abi::mman::{PROT_EXEC, PROT_WRITE};
     let area = match crate::maps::record().areas_in(addr, addr.saturating_add(1)).first() {
         Some(p) => p.value.clone(),
         None => return false,
     };
-    if area.prot & fwe_abi::mman::PROT_WRITE != 0 {
+    if area.prot & PROT_WRITE != 0 && area.prot & PROT_EXEC == 0 {
         return uaccess::write_from(addr, data).is_ok();
     }
     // Read-only shared memory stays as it is.
-    if area.shared {
+    if area.shared && area.prot & PROT_WRITE == 0 {
         return false;
     }
-    // Private memory: the host page made writable for the write (a copy
-    // of its own, for a file's), then given its protection back.
+    // Private memory, or code: the host page made writable for the write
+    // (a copy of its own, for a file's; not executable meanwhile, which
+    // the host allows no page at once), its instructions fetched afresh,
+    // then given its protection back.
     let host_page_size = crate::mm::host_page_size();
     let host = uaccess::g2h(addr);
     let page = host & !(host_page_size - 1);
     let prot = crate::mm::host_prot_at(page);
+    let writable = (prot & !libc::PROT_EXEC) | libc::PROT_WRITE | libc::PROT_READ;
     // SAFETY: the process's own private memory, given back its protection.
     unsafe {
-        if libc::mprotect(
-            page as *mut libc::c_void,
-            host_page_size as usize,
-            prot | libc::PROT_WRITE,
-        ) != 0
-        {
+        if libc::mprotect(page as *mut libc::c_void, host_page_size as usize, writable) != 0 {
             return false;
         }
     }
     let r = uaccess::write_from(addr, data).is_ok();
+    if prot & libc::PROT_EXEC != 0 {
+        flush_icache(host, data.len());
+    }
     // SAFETY: as above.
     unsafe { libc::mprotect(page as *mut libc::c_void, host_page_size as usize, prot) };
     r
+}
+
+/// Make the processor fetch the `len` bytes of code at host `addr` afresh.
+fn flush_icache(addr: u64, len: usize) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sys_icache_invalidate(start: *mut libc::c_void, len: libc::size_t);
+        }
+        // SAFETY: the process's own mapped memory.
+        unsafe { sys_icache_invalidate(addr as *mut libc::c_void, len) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (addr, len);
 }
 
 /// Read `len` bytes of `pagemap` at `pos` into the guest buffer `buf`:
@@ -216,4 +232,34 @@ fn read_pagemap(pos: u64, buf: u64, len: u64) -> Result<u64, i32> {
     let bytes: Vec<u8> = entries.iter().flat_map(|e| e.to_ne_bytes()).collect();
     uaccess::write_from(buf, &bytes)?;
     Ok(bytes.len() as u64)
+}
+
+/// Read `dst.len()` bytes of this process's memory at `addr`, as a tracer
+/// reads it: all of it, or `Err` where some is not mapped or readable.
+pub fn read_forced(addr: u64, dst: &mut [u8]) -> Result<(), i32> {
+    let mut done = 0;
+    while done < dst.len() {
+        let at = addr.checked_add(done as u64).ok_or(errno::EIO)?;
+        let n = in_page(at, (dst.len() - done) as u64) as usize;
+        if !mapped(at) || uaccess::read_into(at, &mut dst[done..done + n]).is_err() {
+            return Err(errno::EIO);
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Write `src` to this process's memory at `addr`, as a tracer writes it
+/// (read-only private memory too): all of it, or `EIO`.
+pub fn write_forced(addr: u64, src: &[u8]) -> Result<(), i32> {
+    let mut done = 0;
+    while done < src.len() {
+        let at = addr.checked_add(done as u64).ok_or(errno::EIO)?;
+        let n = in_page(at, (src.len() - done) as u64) as usize;
+        if !force_write(at, &src[done..done + n]) {
+            return Err(errno::EIO);
+        }
+        done += n;
+    }
+    Ok(())
 }

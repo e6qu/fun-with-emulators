@@ -432,6 +432,33 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   trampoline the backend maps at startup. `rt_sigreturn` restores
   registers, mask and alternate stack.
 
+### ptrace
+
+`crates/kernel/src/ptrace.rs`. macOS lets no process read another's
+memory or threads, so a tracee does its tracer's work itself:
+
+- **Mailbox:** a page per tracee in fwe's private directory
+  (`ptrace-<pid>`), mapped by it and its tracer: the stop's wait status,
+  the general and FP registers, the `siginfo`, the options, and one
+  request at a time with its result, handed over through shared host
+  address waits.
+- **Stops:** a signal about to be delivered (every one but `SIGKILL`, the
+  host catching even ignored ones while traced, and `SIGSTOP` sent to a
+  tracee as fwe's), a fault (a breakpoint's `SIGTRAP`), the program after
+  `execve` (or the exec event), and each system call's entry and exit
+  under `PTRACE_SYSCALL`. The tracee writes its state, tells its tracer
+  (its inbox page's generation, `SIGCHLD` and the wake signal) and serves
+  requests until told to go on, with the signal the tracer chose; the
+  registers the tracer changed are the ones it goes on with.
+- **The tracer** reads and writes registers, `siginfo` and options in
+  the mailbox, and asks the tracee for memory: `PEEK`/`POKE`, written as
+  `/proc/self/mem` writes (code too, its instructions fetched afresh).
+  Its `wait4` reports a tracee's stop from its inbox before the host's
+  children, looking again as tracees stop.
+- **Attaching** makes the target's mailbox and sends it `SIGSTOP` as
+  fwe's; the target begins to be traced as it takes it. Only a process of
+  fwe's can be traced.
+
 ## Files
 
 Every file operation starts with a guest path or descriptor and ends with
@@ -841,9 +868,17 @@ each is mapped is in
   are kept in the cgroup's directory, so they outlive the runtime that
   attached them. The eBPF interpreter checks each access against the
   context and stack and stops a program that runs too long. Other program
-  types load (libraries probe with them) but do not attach (`EINVAL`);
-  `/proc/self/fdinfo` shows a program's type, id and tag (the first 8 bytes
-  of its instructions' SHA-1).
+  types load (libraries probe with them) but do not attach (`EINVAL`),
+  except socket filters; `/proc/self/fdinfo` shows a program's type, id
+  and tag (the first 8 bytes of its instructions' SHA-1).
+- **eBPF maps and socket filters** (`crates/kernel/src/bpfmap.rs`,
+  `bpf.rs`): array and hash maps, each an unlinked file of fwe's that its
+  descriptors share; a socket filter may use maps and their helpers, and
+  attached with `SO_ATTACH_BPF` runs on what this process sends to the
+  socket (by its connected peer, which the host's socket record names),
+  keeping what it returns of the data. A filter attached by another
+  process is not seen, nor one on a socket that is not connected; classic
+  socket filters (`SO_ATTACH_FILTER`) are not taken.
 - **Loop devices** (`crates/kernel/src/loopdev.rs`): eight at first. An
   open device is its node's descriptor, marked, whose position the host
   keeps; reads and writes are in whole sectors from the attached file's
@@ -886,6 +921,11 @@ something a Linux program could notice. The [roadmap](../ROADMAP.md) says
 which are to be lifted for 1.0 and which are not planned.
 
 **Execution**
+- ptrace stops only the thread that stops (the tracee's other threads go
+  on), and has no single-stepping (`EIO`), no fork, clone, exit or
+  seccomp events, no change of the system call's number at its entry,
+  and no `PTRACE_INTERRUPT`/`LISTEN`; `waitid` does not report a tracee's
+  stops (`wait4` does).
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
   which needs `fwe` signed with the hypervisor entitlement and a
   bare-metal Apple Silicon Mac; that backend is verified on its stand-in,
@@ -1009,7 +1049,7 @@ which are to be lifted for 1.0 and which are not planned.
 - A file owner other than fwe's user, not given by the guest, reads as
   65534. Without a root filesystem, the host's own files are not held to
   their bits for a guest that is not root. Access control lists are not
-  kept, and `fs.protected_*` restrictions are not enforced.
+  kept, nor `fs.protected_fifos` and `fs.protected_regular`.
 - The working directory follows a rename of its directory (or one above
   it) by the process itself, not by another process.
 - A `sendto` to an `AF_UNIX` path longer than the host's 103 bytes once
