@@ -242,6 +242,8 @@ mod imp {
         "    ret",
         ".globl _fwe_uaccess_cas32",
         "_fwe_uaccess_cas32:",
+        // (Every Apple Silicon core has the atomics of ARMv8.1, LSE.)
+        "    .arch_extension lse",
         "    casal w1, w2, [x0]",
         "    str w1, [x3]",
         "    mov x0, #0",
