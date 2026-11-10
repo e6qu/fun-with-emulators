@@ -298,7 +298,7 @@ fn lock(pid: i32) -> Option<std::fs::File> {
         .ok()?;
     use std::os::fd::AsRawFd;
     // SAFETY: plain host call on the file just opened; the lock goes with it.
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    crate::shared::lock_exclusive(f.as_raw_fd());
     Some(f)
 }
 

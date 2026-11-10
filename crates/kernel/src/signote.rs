@@ -166,7 +166,7 @@ pub fn unnote(target: i32, sig: libc::c_int) {
         if fd < 0 {
             return;
         }
-        libc::flock(fd, libc::LOCK_EX);
+        crate::shared::lock_exclusive(fd);
         let me = libc::getpid();
         let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
         // This process's latest note there.
@@ -208,7 +208,7 @@ pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
     unsafe {
         let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
         if fd >= 0 {
-            libc::flock(fd, libc::LOCK_EX);
+            crate::shared::lock_exclusive(fd);
             let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
             let len = slots.len();
             slots[n.min(len)..].fill(0);
@@ -470,7 +470,7 @@ fn put(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32
         if fd < 0 {
             return Err(fwe_abi::errno::ESRCH);
         }
-        libc::flock(fd, libc::LOCK_EX);
+        crate::shared::lock_exclusive(fd);
         let mut q = [0u8; QUEUE_LEN * ENTRY];
         let n = libc::pread(fd, q.as_mut_ptr().cast(), q.len(), QUEUE_AT as libc::off_t);
         if n < q.len() as isize {
@@ -529,7 +529,7 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
     let mut q = [0u8; QUEUE_LEN * ENTRY];
     // SAFETY: fwe's descriptor of the mailbox; a buffer of its length.
     let n = unsafe {
-        libc::flock(fd, libc::LOCK_EX);
+        crate::shared::lock_exclusive(fd);
         let n = libc::pread(fd, q.as_mut_ptr().cast(), q.len(), QUEUE_AT as libc::off_t);
         if n > 0 {
             let zero = [0u8; QUEUE_LEN * ENTRY];

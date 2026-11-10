@@ -430,7 +430,7 @@ fn shared_tid() -> Option<i32> {
         if fd < 0 {
             return None;
         }
-        libc::flock(fd, libc::LOCK_EX);
+        crate::shared::lock_exclusive(fd);
         let mut b = [0u8; 4];
         let n = match libc::pread(fd, b.as_mut_ptr().cast(), 4, 0) {
             4 => i32::from_ne_bytes(b),

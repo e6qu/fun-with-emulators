@@ -149,6 +149,35 @@ fn fresh_name(kind: &str) -> String {
     format!("{kind}-{pid}-{now}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Take the exclusive `flock` of `fd`, one of fwe's own locks, as Linux
+/// takes a lock of its kernel's: the thread is not asleep while it waits
+/// (it gives up the processor between tries), so `/proc` shows it running,
+/// never sleeping in a wait the guest did not ask for, which a program
+/// that waits for another to sleep (in `pause`, say) would take for that.
+/// A wait past a second blocks. Async-signal-safe.
+pub fn lock_exclusive(fd: i32) {
+    let now = || {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid out-parameter.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+        t.tv_sec * 1_000_000_000 + t.tv_nsec
+    };
+    // (The caller's `errno`, as a signal handler that calls this needs.)
+    let saved = crate::host::last_errno();
+    let start = now();
+    // SAFETY: plain host calls on the caller's descriptor.
+    unsafe {
+        while libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+            if crate::host::last_errno() != libc::EWOULDBLOCK || now() - start > 1_000_000_000 {
+                libc::flock(fd, libc::LOCK_EX);
+                break;
+            }
+            libc::sched_yield();
+        }
+    }
+    crate::host::set_errno(saved);
+}
+
 /// One record, as this process sees it.
 pub struct Record<T: Data> {
     /// The record's directory.
@@ -461,11 +490,10 @@ impl<T: Data> Record<T> {
         if fd < 0 {
             return Err(e());
         }
-        // SAFETY: plain host calls on the descriptor just opened; the lock
-        // goes with it.
-        unsafe { libc::flock(fd, libc::LOCK_EX) };
+        lock_exclusive(fd);
         let r = f();
-        // SAFETY: as above.
+        // SAFETY: plain host call on the descriptor just opened; the lock
+        // goes with it.
         unsafe { libc::close(fd) };
         r
     }

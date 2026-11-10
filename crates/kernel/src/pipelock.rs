@@ -80,7 +80,7 @@ impl MakeLock {
             return None;
         }
         // SAFETY: plain host call on the descriptor just opened.
-        unsafe { libc::flock(fd, libc::LOCK_EX) };
+        crate::shared::lock_exclusive(fd);
         Some(MakeLock(fd))
     }
 }

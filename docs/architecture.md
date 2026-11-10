@@ -686,7 +686,9 @@ shapes differently:
   `maps`, `smaps`, `auxv` (the vector the program started with),
   `personality`, `oom_score`, `oom_adj`, `oom_score_adj`, `fd`, `fdinfo`,
   `ns`, `task/<tid>/{stat,status,comm}`. A process's state in `stat` is its
-  main thread's: `S` while it waits in a system call.
+  main thread's: `S` while it waits in a system call, never while it waits
+  for one of fwe's own locks (it stays runnable, as a Linux task waiting
+  on a kernel lock is not asleep).
 - `/proc` globals: `cpuinfo`, `meminfo`, `stat` (host CPU times and boot
   time), `uptime`, `loadavg`, `cmdline`, `filesystems`, `partitions`,
   `config.gz` (the options of what fwe implements), `keys`, `key-users`,
