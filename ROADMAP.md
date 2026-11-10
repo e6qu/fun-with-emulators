@@ -208,6 +208,12 @@ for it fall back:
   `CLOSE_RANGE_UNSHARE` act as Linux's on it);
 - pipes of more than 64 KiB, which a host pipe cannot hold: a pipe
   starts with 64 KiB where Linux with 16 KiB pages gives 256 KiB (`fcntl35`);
+- setting the clock (`settimeofday`, `clock_settime`, `adjtimex` and
+  `clock_adjtime` that change it): fwe's root lacks `CAP_SYS_TIME`, as in
+  a container, so the Mac's clock is only read;
+- setting the host name or NIS domain name in the initial UTS namespace:
+  it is the Mac's, read and never set (`EPERM`); a new UTS namespace's
+  names are the guest's to set;
 - CPU affinity: macOS has none, so `sched_setaffinity` is accepted and
   pins nothing, and a test of how the scheduler shares one CPU (`nice05`)
   cannot hold;

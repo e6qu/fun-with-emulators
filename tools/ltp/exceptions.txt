@@ -41,3 +41,21 @@ sendmsg01 musl's sendmsg copies msg_control into a buffer of its own before the 
 gethostbyname_r01 musl's gethostbyname_r takes the all-digit name for a numeric address and succeeds without asking the kernel; the test expects glibc's ERANGE
 nftw01 musl's nftw reports a file again when a symbolic link leads back to it; the test expects glibc's, which reports each file once
 nftw6401 musl's nftw reports a file again when a symbolic link leads back to it; the test expects glibc's, which reports each file once
+adjtimex01 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+adjtimex02 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+clock_adjtime01 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+clock_adjtime02 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+clock_settime01 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+clock_settime02 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+clock_settime03 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+clock_settime04 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+leapsec01 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+settimeofday01 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+stime01 not planned (ROADMAP.md): it sets the clock, and fwe's root lacks CAP_SYS_TIME, as in a container
+sethostname01 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+sethostname02 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+sethostname03 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+setdomainname01 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+setdomainname02 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+setdomainname03 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+splice06 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
