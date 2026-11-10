@@ -589,6 +589,7 @@ impl<P: Platform> Kernel<P> {
                 guest!(uaccess::write(a[2], len));
                 0
             }
+            nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2], a[3], a[4]),
@@ -1701,7 +1702,34 @@ impl<P: Platform> Kernel<P> {
             // The backends end a thread of several before taking the
             // kernel lock; the last one takes the process with it.
             Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
+            Action::KillStrict => self.terminate_by(signal::SIGKILL),
         }
+    }
+
+    /// `reboot(magic, magic2, cmd)`, checked as Linux checks it: the
+    /// caller's `CAP_SYS_BOOT` (`EPERM`), the magic numbers and the command
+    /// (`EINVAL`). Ctrl-Alt-Del's setting is taken (there is no console to
+    /// press it on); a restart, halt or power off is refused (`EPERM`):
+    /// fwe's processes never stop the host.
+    fn sys_reboot(&mut self, magic: u64, magic2: u64, cmd: u64) -> i64 {
+        const MAGIC1: u32 = 0xfee1_dead;
+        const MAGIC2: [u32; 4] = [672_274_793, 85_072_278, 369_367_448, 537_993_216];
+        const CAD_ON: u32 = 0x89ab_cdef;
+        const CAD_OFF: u32 = 0;
+        const STOPS: [u32; 6] =
+            [0x0123_4567, 0xcdef_0123, 0x4321_fedc, 0xa1b2_c3d4, 0xd000_fce2, 0x4558_4543];
+        if !self.creds.has(crate::caps::CAP_SYS_BOOT) {
+            return err(errno::EPERM);
+        }
+        if magic as u32 != MAGIC1 || !MAGIC2.contains(&(magic2 as u32)) {
+            return err(errno::EINVAL);
+        }
+        match cmd as u32 {
+            CAD_ON | CAD_OFF => {}
+            c if STOPS.contains(&c) => return err(errno::EPERM),
+            _ => return err(errno::EINVAL),
+        }
+        0
     }
 
     /// `seccomp(op, flags, args)`.

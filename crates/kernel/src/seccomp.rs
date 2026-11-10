@@ -72,6 +72,8 @@ pub enum Action {
     Trap(u16),
     KillThread,
     KillProcess,
+    /// Strict mode's end for a call it does not allow: `SIGKILL`.
+    KillStrict,
 }
 
 const BPF_LD: u16 = 0x00;
@@ -257,7 +259,7 @@ pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
             if matches!(nr, n::READ | n::WRITE | n::EXIT | n::RT_SIGRETURN) {
                 Action::Allow
             } else {
-                Action::KillThread
+                Action::KillStrict
             }
         }
         _ => {

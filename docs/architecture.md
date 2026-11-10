@@ -1009,7 +1009,7 @@ which are to be lifted for 1.0 and which are not planned.
 - A file owner other than fwe's user, not given by the guest, reads as
   65534. Without a root filesystem, the host's own files are not held to
   their bits for a guest that is not root. Access control lists are not
-  kept, and `fs.protected_*` restrictions are not enforced.
+  kept, nor `fs.protected_fifos` and `fs.protected_regular`.
 - The working directory follows a rename of its directory (or one above
   it) by the process itself, not by another process.
 - A `sendto` to an `AF_UNIX` path longer than the host's 103 bytes once
