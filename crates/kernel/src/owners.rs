@@ -114,10 +114,15 @@ fn fstatat(dir: i32, name: &CStr) -> Result<libc::stat, i32> {
     if r != 0 { Err(last()) } else { Ok(st) }
 }
 
+/// The host path of `name` in directory `dir`, if the host takes one so
+/// long (a longer one is reached through a descriptor instead).
 fn path_of(dir: i32, name: &CStr) -> Option<std::ffi::CString> {
     let mut p = crate::fs::fd_path(dir)?;
     p.push(b'/');
     p.extend_from_slice(name.to_bytes());
+    if p.len() >= libc::PATH_MAX as usize {
+        return None;
+    }
     std::ffi::CString::new(p).ok()
 }
 
