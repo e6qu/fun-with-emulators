@@ -59,3 +59,4 @@ setdomainname01 not planned (ROADMAP.md): it sets the host name or domain name o
 setdomainname02 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
 setdomainname03 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
 splice06 not planned (ROADMAP.md): it sets the host name or domain name of the initial UTS namespace, which is the Mac's and never set
+ioctl_loop05 its image must be on a file system of a block device, whose block size it reads; fwe's root is a directory of the Mac's, of no device (as a tmpfs on Linux, where it breaks the same way)
