@@ -495,6 +495,11 @@ impl<P: Platform> Kernel<P> {
             }
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(info) = thread::take_pending(sig) else { continue };
+            // fwe's nudge of a seized thread: no signal for the guest.
+            if sig == signal::SIGSTOP && info.code == crate::ptrace::POKE_CODE {
+                self.ptrace_poked(regs);
+                continue;
+            }
             // Traced: the tracer sees the signal first, and says which to
             // deliver (none, this one, or another).
             let (sig, info) = if sig != signal::SIGKILL
@@ -512,6 +517,10 @@ impl<P: Platform> Kernel<P> {
                 signal::SIG_IGN => {}
                 signal::SIG_DFL => match signal::default_action(sig) {
                     signal::Default::Terminate => self.terminate_with(sig, Some(regs)),
+                    // A seized thread's group-stop is its tracer's to end.
+                    signal::Default::Stop if crate::ptrace::seized() => {
+                        self.ptrace_group_stop(regs, sig, info);
+                    }
                     signal::Default::Stop => {
                         if let Some(h) = host::signal_to_host(sig) {
                             self.platform.stop_self(h);

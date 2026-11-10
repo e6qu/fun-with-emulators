@@ -6,8 +6,10 @@
 //! signal mailbox ([`crate::signote::request_mem`]); the process carries
 //! it out in its wake handler, with the host's copies of its own task,
 //! which report an address with nothing behind it rather than fault, and
-//! wakes the caller on a reply socket. The caller's own memory is copied
-//! directly.
+//! wakes the caller on a reply socket. A tracee of the caller's stopped
+//! in a ptrace stop serves only its tracer's requests: its memory goes
+//! through its ptrace mailbox ([`crate::ptrace::tracee_memory`]). The
+//! caller's own memory is copied directly.
 
 use crate::{Kernel, Platform, uaccess};
 use fwe_abi::{err, errno};
@@ -119,6 +121,28 @@ impl<P: Platform> Kernel<P> {
                 }
             }
             if done == 0 { -i64::from(errno::EFAULT) } else { done as i64 }
+        } else if crate::ptrace::traces_stopped(host) {
+            // A tracee of this process, stopped: its memory through its
+            // mailbox, as its stop serves no other request.
+            let mut done = 0usize;
+            for &(base, len) in &remote {
+                let n = (len as usize).min(data.len() - done);
+                if n == 0 {
+                    continue;
+                }
+                match crate::ptrace::tracee_memory(host, base, &mut data[done..done + n], write) {
+                    Ok(k) if k == n => done += k,
+                    Ok(k) => {
+                        done += k;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+                if done == data.len() {
+                    break;
+                }
+            }
+            if done == 0 { -i64::from(errno::EFAULT) } else { done as i64 }
         } else {
             match remote_copy(host, write, &remote, &mut data) {
                 Ok(n) => n,
@@ -137,6 +161,13 @@ impl<P: Platform> Kernel<P> {
         }
         moved
     }
+}
+
+/// Copy between process `host`'s memory at `addr` and `data` (into it if
+/// `write`): the bytes moved.
+pub fn remote(host: i32, addr: u64, data: &mut [u8], write: bool) -> Result<usize, i32> {
+    let n = remote_copy(host, write, &[(addr, data.len() as u64)], data)?;
+    Ok(n.max(0) as usize)
 }
 
 /// Have process `host` copy between its `remote` ranges and `data`: the

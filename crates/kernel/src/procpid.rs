@@ -238,6 +238,7 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"oom_score", DT_REG),
     (b"coredump_filter", DT_REG),
     (b"timerslack_ns", DT_REG),
+    (b"mem", DT_REG),
     (b"ns", DT_DIR),
     (b"fd", DT_DIR),
     (b"task", DT_DIR),
@@ -431,6 +432,8 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         }
         b"/coredump_filter" => Entry::File(crate::coredump::FILTER.to_vec()),
         b"/timerslack_ns" => Entry::File(format!("{}\n", rec.slack.0).into_bytes()),
+        // Read and written by address (`crate::procmem`).
+        b"/mem" => Entry::File(Vec::new()),
         b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
             Some(u) => {
                 let n = u.get();
@@ -457,6 +460,13 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
                 };
             }
             if let Some(t) = sub.strip_prefix(b"/task/") {
+                // A thread's memory is its process's.
+                if let Some(t) = t.strip_suffix(b"/mem") {
+                    return match entry(host, pid, &[b"/task/", t].concat()) {
+                        Entry::Dir => Entry::File(Vec::new()),
+                        other => other,
+                    };
+                }
                 // Its threads, as it published them (the main thread always).
                 let listed = t == pid.to_string().as_bytes()
                     || std::str::from_utf8(t)

@@ -2861,6 +2861,27 @@ fn ptrace_traces_a_child() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `debugger` guest prints.
+const DEBUGGER: &str = "seize: 0, running true\n\
+    interrupt: 0, stopped true, event stop true\n\
+    sigmask: get 0, SIGUSR1 blocked true, set 0, now true\n\
+    mem: read true, write true\n\
+    syscall info: size true, entry true, number 173, exit true\n\
+    group stop: delivery true, event true, listen 0, stays true, continued true\n\
+    killed: true\n";
+
+/// What debuggers ask of ptrace beyond its basics: a seized child runs
+/// on until interrupted, which stops it with an event stop; the system
+/// call it stops at is described; its signal mask is read and set; a
+/// group-stop is an event stop, listened to until `SIGCONT`; and its
+/// memory is read and written through `/proc/<pid>/mem`.
+#[test]
+fn ptrace_serves_debuggers() {
+    let out = fwe(&rust_guest("debugger"), &[]);
+    assert_eq!(stdout(&out), DEBUGGER, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `robust` guest prints.
 const ROBUST: &str = "exited holder: owner dead true, recovered true\n\
     killed holder: signal 15, owner dead true, recovered true\n\
@@ -3631,6 +3652,14 @@ fn hv_process_descriptors_name_processes() {
 fn hv_ptrace_traces_a_child() {
     let Some(out) = fwe_hv(&rust_low_guest("ptrace"), &[]) else { return };
     assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What debuggers ask of ptrace, in the VM (see [`ptrace_serves_debuggers`]).
+#[test]
+fn hv_ptrace_serves_debuggers() {
+    let Some(out) = fwe_hv(&rust_low_guest("debugger"), &[]) else { return };
+    assert_eq!(stdout(&out), DEBUGGER, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
