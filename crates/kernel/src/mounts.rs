@@ -1492,12 +1492,47 @@ pub mod store {
     /// reaches there).
     fn spread(own: &[u8], ev: &Propagation) {
         for d in namespaces().into_iter().filter(|d| d != own) {
-            let Ok(ns) = Record::<Table>::join(&d, 0) else { continue };
-            let _ = ns.update_maybe(|t| {
+            // A namespace whose record cannot be read a moment (another
+            // process replacing it) is tried again; one that still cannot
+            // is said, as it misses the propagation.
+            let mut tries = 0;
+            let ns = loop {
+                match Record::<Table>::join(&d, 0) {
+                    Ok(ns) => break Some(ns),
+                    // A namespace no process is in any more.
+                    Err(_)
+                        if !std::path::Path::new(
+                            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&d),
+                        )
+                        .exists() =>
+                    {
+                        break None;
+                    }
+                    Err(e) if tries == 10 => {
+                        eprintln!(
+                            "fwe: mount propagation to {} skipped: errno {e}",
+                            String::from_utf8_lossy(&d)
+                        );
+                        break None;
+                    }
+                    Err(_) => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            };
+            let Some(ns) = ns else { continue };
+            let r = ns.update_maybe(|t| {
                 let before = t.mounts.clone();
                 t.receive(ev);
                 Ok(((), t.mounts != before))
             });
+            if let Err(e) = r {
+                eprintln!(
+                    "fwe: mount propagation to {} failed: errno {e}",
+                    String::from_utf8_lossy(&d)
+                );
+            }
         }
     }
 

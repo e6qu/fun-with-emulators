@@ -355,7 +355,10 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
         };
         // A zombie has ended (Linux lists it in no cgroup either): its
         // record goes, and how it ended is kept for whoever reaps it.
-        match read(pid).filter(|r| alive((pid, r.start))) {
+        // Read again once before it is taken for gone: another process may
+        // have been replacing the record, or the host not yet answered.
+        let live = || read(pid).filter(|r| alive((pid, r.start)));
+        match live().or_else(live) {
             Some(r) => out.push((pid, r)),
             None => gone(pid),
         }
