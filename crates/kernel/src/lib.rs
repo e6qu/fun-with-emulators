@@ -381,6 +381,8 @@ impl<P: Platform> Kernel<P> {
         pty::save(e);
         epoll::save(e);
         pidfd::save(e);
+        // A tracer that follows the child ([`ptrace::fork_event`]).
+        ptrace::save_fork(e);
     }
 
     /// The kernel [`Kernel::save_for_fork`] described, in the fork child,
@@ -450,6 +452,7 @@ impl<P: Platform> Kernel<P> {
         pty::restore(d);
         epoll::restore(d);
         pidfd::restore(d, false);
+        ptrace::load_fork(d);
         if let Some(fs) = &k.fs {
             fs.publish();
         }

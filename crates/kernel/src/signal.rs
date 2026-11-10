@@ -536,6 +536,11 @@ impl<P: Platform> Kernel<P> {
     /// Terminate the process as killed by `sig`, dumping core if `sig` does
     /// (with registers `regs`, where they are known).
     pub fn terminate_with(&mut self, sig: u64, regs: Option<&Regs>) -> ! {
+        // A traced process tells its tracer it is ending first (not for
+        // SIGKILL, as Linux).
+        if sig != signal::SIGKILL {
+            self.ptrace_exit_stop(sig as i32);
+        }
         self.dump_core(sig, regs);
         crate::procreg::ending(sig as i32 | crate::coredump::status_bit());
         match crate::host::signal_to_host(sig) {
@@ -661,6 +666,15 @@ impl<P: Platform> Kernel<P> {
     /// returning `true` if a handler was entered. When `false`, the caller
     /// takes the default action (terminate).
     pub fn deliver_fault(&mut self, regs: &mut Regs, sig: u64, addr: u64) -> bool {
+        // A breakpoint of a step a tracer asked for: the step's stop.
+        if sig == signal::SIGTRAP && crate::ptrace::traced() && crate::ptrace::step_hit(regs.pc) {
+            const TRAP_TRACE: i32 = 2;
+            let info = SigInfo { code: TRAP_TRACE, ..SigInfo::default() };
+            if let Some((s, i)) = self.ptrace_signal_stop(regs, sig, info) {
+                thread::post_process(s, i);
+            }
+            return true;
+        }
         let info = SigInfo { code: signal::SI_KERNEL, ..SigInfo::default() };
         // Traced: the tracer sees the fault first (a breakpoint's SIGTRAP,
         // say), and the guest goes on as it leaves the registers, or takes

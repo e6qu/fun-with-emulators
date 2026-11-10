@@ -46,13 +46,35 @@ pub const PTRACE_SETREGSET: u64 = 0x4205;
 pub const PTRACE_SEIZE: u64 = 0x4206;
 
 pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
+pub const PTRACE_O_TRACEFORK: u64 = 0x2;
+pub const PTRACE_O_TRACEVFORK: u64 = 0x4;
+pub const PTRACE_O_TRACECLONE: u64 = 0x8;
 pub const PTRACE_O_TRACEEXEC: u64 = 0x10;
-/// The options fwe takes (the others need events it does not raise).
-const KNOWN_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC | 0x0010_0000;
+pub const PTRACE_O_TRACEVFORKDONE: u64 = 0x20;
+pub const PTRACE_O_TRACEEXIT: u64 = 0x40;
+pub const PTRACE_O_EXITKILL: u64 = 0x10_0000;
+/// The options fwe takes (not `PTRACE_O_TRACESECCOMP` or
+/// `PTRACE_O_SUSPEND_SECCOMP`, which need seccomp's tracer return).
+const KNOWN_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
+    | PTRACE_O_TRACEFORK
+    | PTRACE_O_TRACEVFORK
+    | PTRACE_O_TRACECLONE
+    | PTRACE_O_TRACEEXEC
+    | PTRACE_O_TRACEVFORKDONE
+    | PTRACE_O_TRACEEXIT
+    | PTRACE_O_EXITKILL;
+pub const PTRACE_EVENT_FORK: i32 = 1;
+pub const PTRACE_EVENT_VFORK: i32 = 2;
+pub const PTRACE_EVENT_CLONE: i32 = 3;
 pub const PTRACE_EVENT_EXEC: i32 = 4;
+pub const PTRACE_EVENT_VFORK_DONE: i32 = 5;
+pub const PTRACE_EVENT_EXIT: i32 = 6;
 
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
+/// The system call's number (`x8` at a system call's stop), to read and
+/// change (-1 skips the call).
+const NT_ARM_SYSTEM_CALL: u64 = 0x404;
 /// `struct user_pt_regs`: x0-x30, sp, pc, pstate.
 const PRSTATUS_SIZE: usize = 34 * 8;
 /// `struct user_fpsimd_state`: v0-v31, fpsr, fpcr, two reserved words.
@@ -82,6 +104,9 @@ const PAGE: usize = 4096;
 const RUNNING: u64 = 0;
 const STOPPED: u64 = 1;
 const REPORTED: u64 = 2;
+/// Ended, its wait status for a tracer that is not its parent (whose host
+/// `wait` does not see it).
+const EXITED: u64 = 3;
 
 /// Requests: memory, and going on (the signal in [`W_DATA`]).
 const OP_PEEK: u64 = 1;
@@ -89,6 +114,7 @@ const OP_POKE: u64 = 2;
 const OP_CONT: u64 = 3;
 const OP_SYSCALL: u64 = 4;
 const OP_DETACH: u64 = 5;
+const OP_STEP: u64 = 6;
 
 /// A mapped mailbox or inbox page.
 struct Page(&'static [AtomicU64]);
@@ -242,14 +268,129 @@ fn end() {
 
 /// In a fork child: not traced (its parent's tracer does not trace it).
 pub fn forked_child() {
+    let follow = FOLLOW.swap(0, Ordering::AcqRel);
     TRACED.store(false, Ordering::Release);
     SYSCALLS.store(false, Ordering::Release);
+    // Its parent's tracer follows it (`PTRACE_O_TRACEFORK` and the like):
+    // traced from the start, and stopped first by SIGSTOP, as Linux
+    // starts it.
+    if follow > 0 && begin(follow).is_ok() {
+        // With its parent's options, as Linux gives them.
+        if let Some(mb) = open(&mailbox_name(me()), false) {
+            mb.word(W_OPTIONS).store(FOLLOW_OPTIONS.load(Ordering::Acquire), Ordering::Release);
+        }
+        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+        crate::thread::post_process(fwe_abi::signal::SIGSTOP, info);
+    }
+}
+
+/// The tracer a fork child is to be traced by (0: none), set by its parent
+/// just before it forks ([`fork_event`]).
+static FOLLOW: AtomicI32 = AtomicI32::new(0);
+static FOLLOW_OPTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The event a process clone with `flags` raises in a traced parent, if
+/// its tracer asked for it; the child is then traced too.
+pub fn fork_event(flags: u64) -> Option<i32> {
+    use fwe_abi::clone as cl;
+    if !traced() || flags & cl::CLONE_THREAD != 0 {
+        return None;
+    }
+    let (event, option) = if flags & cl::CLONE_VFORK != 0 {
+        (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
+    } else if flags & cl::CSIGNAL == fwe_abi::signal::SIGCHLD {
+        (PTRACE_EVENT_FORK, PTRACE_O_TRACEFORK)
+    } else {
+        (PTRACE_EVENT_CLONE, PTRACE_O_TRACECLONE)
+    };
+    let opts = options();
+    if opts & option == 0 {
+        return None;
+    }
+    FOLLOW_OPTIONS.store(opts, Ordering::Release);
+    FOLLOW.store(TRACER.load(Ordering::Acquire), Ordering::Release);
+    Some(event)
+}
+
+/// Into a fork snapshot (the VM backend's child, a fresh process): the
+/// tracer that follows the child, and its options.
+pub fn save_fork(e: &mut crate::snapshot::Enc) {
+    e.i32(FOLLOW.load(Ordering::Acquire));
+    e.u64(FOLLOW_OPTIONS.load(Ordering::Acquire));
+}
+
+/// From a fork snapshot, in the child: followed as [`forked_child`] is.
+pub fn load_fork(d: &mut crate::snapshot::Dec) {
+    FOLLOW.store(d.i32(), Ordering::Release);
+    FOLLOW_OPTIONS.store(d.u64(), Ordering::Release);
+    forked_child();
+}
+
+/// The fork is done (in the parent): no child is to follow any more.
+pub fn fork_done() {
+    FOLLOW.store(0, Ordering::Release);
+}
+
+std::thread_local! {
+    /// A fork's event waiting for the call's result to be in the
+    /// registers: the event, the clone's flags and the child's pid.
+    static NOTED: std::cell::Cell<Option<(i32, u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Note fork event `event` of a clone with `flags` that made `child`, for
+/// [`take_noted_fork`] once the call's result is in the registers.
+pub fn note_fork(event: i32, flags: u64, child: u64) {
+    NOTED.with(|n| n.set(Some((event, flags, child))));
+}
+
+/// The fork event [`note_fork`] noted, if any.
+pub fn take_noted_fork() -> Option<(i32, u64, u64)> {
+    NOTED.with(std::cell::Cell::take)
 }
 
 /// As this process ends: its mailbox goes.
-pub fn exiting() {
+pub fn exiting(status: i32) {
     if traced() {
-        end();
+        let tracer = TRACER.load(Ordering::Acquire);
+        // SAFETY: getppid cannot fail.
+        let parent = unsafe { libc::getppid() };
+        match open(&mailbox_name(me()), false) {
+            // A tracer that is not the parent learns of the end from the
+            // mailbox, which it then removes ([`take_stop`]).
+            Some(mb) if tracer != parent && alive(tracer) => {
+                TRACED.store(false, Ordering::Release);
+                mb.word(W_STATUS).store(status as u32 as u64, Ordering::Release);
+                mb.word(W_STATE).store(EXITED, Ordering::Release);
+                if let Some(inbox) = open(&inbox_name(tracer), false) {
+                    inbox.word(0).fetch_add(1, Ordering::AcqRel);
+                    wake_word(inbox.word(0));
+                }
+                crate::host::kill_process(tracer, libc::SIGCHLD);
+                crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+            }
+            _ => end(),
+        }
+    }
+    // A tracer that ends takes the tracees that asked it to with it
+    // (`PTRACE_O_EXITKILL`).
+    if let Some(inbox) = open(&inbox_name(me()), false) {
+        for slot in &inbox.0[1..] {
+            let pid = slot.load(Ordering::Acquire) as i32;
+            if pid <= 0 {
+                continue;
+            }
+            if let Some(mb) = open(&mailbox_name(pid), false)
+                && mb.word(W_TRACER).load(Ordering::Acquire) == me() as u64
+                && mb.word(W_OPTIONS).load(Ordering::Acquire) & PTRACE_O_EXITKILL != 0
+            {
+                crate::host::kill_process(pid, libc::SIGKILL);
+            }
+        }
+        drop(inbox);
+        if let Some(c) = path(&inbox_name(me())) {
+            // SAFETY: a NUL-terminated path of fwe's.
+            unsafe { libc::unlink(c.as_ptr()) };
+        }
     }
 }
 
@@ -272,12 +413,14 @@ pub enum Resume {
     Cont(u64),
     /// Go on, stopping at the next system call's entry or exit.
     Syscall(u64),
+    /// Run one instruction, then stop ([`arm_step`]).
+    Step(u64),
 }
 
 impl Resume {
     pub fn signal(self) -> u64 {
         match self {
-            Resume::Cont(s) | Resume::Syscall(s) => s,
+            Resume::Cont(s) | Resume::Syscall(s) | Resume::Step(s) => s,
         }
     }
 }
@@ -354,6 +497,10 @@ pub fn stop(regs: &mut crate::Regs, status: i32, siginfo: &[u8; 128], event: u64
                 resume = Some(Resume::Cont(data));
                 0
             }
+            OP_STEP => {
+                resume = Some(Resume::Step(data));
+                0
+            }
             _ => -(errno::EIO as i64),
         };
         mb.word(W_RESULT).store(result as u64, Ordering::Release);
@@ -365,6 +512,11 @@ pub fn stop(regs: &mut crate::Regs, status: i32, siginfo: &[u8; 128], event: u64
             wake_word(mb.word(W_DONE));
             if op == OP_DETACH {
                 end();
+            }
+            // One instruction to run: the step's breakpoints (none where
+            // the instruction cannot be read, which then faults and stops).
+            if matches!(r, Resume::Step(_)) {
+                arm_step(regs);
             }
             break r;
         }
@@ -404,6 +556,91 @@ fn get_regs(mb: &Page, regs: &mut crate::Regs) {
     }
     regs.fp.fpsr = u32::from_le_bytes(f[512..516].try_into().unwrap());
     regs.fp.fpcr = u32::from_le_bytes(f[516..520].try_into().unwrap());
+}
+
+// --- single-stepping ------------------------------------------------------------
+//
+// One instruction is run by planting a breakpoint of fwe's (`brk #0x4c59`)
+// where it may go next and going on: a branch's target and the next
+// instruction for a conditional one, the register's address for one
+// through a register, the next instruction for any other. Taking that
+// breakpoint puts the instructions back and stops (`TRAP_TRACE`).
+
+/// `brk #0x4c59`.
+const STEP_BRK: u32 = 0xd420_0000 | (0x4c59 << 5);
+/// Where breakpoints of a step are, and the instructions they replaced.
+static STEPS: std::sync::Mutex<Vec<(u64, [u8; 4])>> = std::sync::Mutex::new(Vec::new());
+
+/// Where the instruction `insn` at `pc` may go next, with registers `x`.
+pub fn next_pcs(insn: u32, pc: u64, x: &[u64; 31]) -> Vec<u64> {
+    let sext = |v: u32, bits: u32| ((v as i64) << (64 - bits)) >> (64 - bits);
+    let rel = |imm: u32, bits: u32| pc.wrapping_add((sext(imm, bits) * 4) as u64);
+    let next = pc.wrapping_add(4);
+    let reg = |n: u32| if n == 31 { 0 } else { x[n as usize] };
+    // An address with its pointer authentication code taken off.
+    let strip = |a: u64| a & 0x0000_ffff_ffff_ffff;
+    if insn & 0x7c00_0000 == 0x1400_0000 {
+        // B, BL
+        vec![rel(insn & 0x03ff_ffff, 26)]
+    } else if insn & 0xff00_0010 == 0x5400_0000 || insn & 0x7e00_0000 == 0x3400_0000 {
+        // B.cond; CBZ, CBNZ
+        vec![next, rel((insn >> 5) & 0x7ffff, 19)]
+    } else if insn & 0x7e00_0000 == 0x3600_0000 {
+        // TBZ, TBNZ
+        vec![next, rel((insn >> 5) & 0x3fff, 14)]
+    } else if insn & 0xfe00_0000 == 0xd600_0000 {
+        // BR, BLR, RET and their authenticated forms.
+        let opc = (insn >> 21) & 0xf;
+        let rn = (insn >> 5) & 0x1f;
+        match opc {
+            // RETAA, RETAB: through x30, which they name by none.
+            2 if rn == 31 => vec![strip(x[30])],
+            0..=2 | 8 | 9 => vec![strip(reg(rn))],
+            _ => vec![next],
+        }
+    } else {
+        vec![next]
+    }
+}
+
+/// Plant the breakpoints of one step from `regs`: whether it could.
+fn arm_step(regs: &crate::Regs) -> bool {
+    // A step left unfinished (another stop came first) is put back.
+    for (at, orig) in STEPS.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        let _ = crate::procmem::write_forced(at, &orig);
+    }
+    let mut b = [0u8; 4];
+    if crate::procmem::read_forced(regs.pc, &mut b).is_err() {
+        return false;
+    }
+    let insn = u32::from_le_bytes(b);
+    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    for at in next_pcs(insn, regs.pc, &regs.x) {
+        if steps.iter().any(|&(a, _)| a == at) {
+            continue;
+        }
+        let mut orig = [0u8; 4];
+        if crate::procmem::read_forced(at, &mut orig).is_err()
+            || crate::procmem::write_forced(at, &STEP_BRK.to_le_bytes()).is_err()
+        {
+            continue;
+        }
+        steps.push((at, orig));
+    }
+    !steps.is_empty()
+}
+
+/// Whether a breakpoint at `pc` is a step's: if so, every one of the step
+/// is taken out.
+pub fn step_hit(pc: u64) -> bool {
+    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !steps.iter().any(|&(a, _)| a == pc) {
+        return false;
+    }
+    for (at, orig) in steps.drain(..) {
+        let _ = crate::procmem::write_forced(at, &orig);
+    }
+    true
 }
 
 /// A word of this process's memory, as the tracer reads it (`EIO` where
@@ -507,7 +744,20 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32)>
         if mb.word(W_TRACER).load(Ordering::Acquire) != me() as u64 || !wanted(pid) {
             continue;
         }
-        if mb.word(W_STATE).load(Ordering::Acquire) == STOPPED {
+        let state = mb.word(W_STATE).load(Ordering::Acquire);
+        if state == EXITED {
+            let status = mb.word(W_STATUS).load(Ordering::Acquire) as i32;
+            if !peek {
+                drop(mb);
+                if let Some(c) = path(&mailbox_name(pid)) {
+                    // SAFETY: a NUL-terminated path of fwe's.
+                    unsafe { libc::unlink(c.as_ptr()) };
+                }
+                let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+            return Some((pid, status));
+        }
+        if state == STOPPED {
             if !peek {
                 mb.word(W_STATE).store(REPORTED, Ordering::Release);
             }
@@ -538,6 +788,7 @@ pub fn resume(pid: i32, op: u64, sig: u64) -> Result<(), i32> {
     let op = match op {
         PTRACE_CONT => OP_CONT,
         PTRACE_SYSCALL => OP_SYSCALL,
+        PTRACE_SINGLESTEP => OP_STEP,
         _ => OP_DETACH,
     };
     ask(&mb, pid, op, 0, sig).map(|_| ())
@@ -549,6 +800,7 @@ pub fn get_regset(pid: i32, kind: u64) -> Result<Vec<u8>, i32> {
     match kind {
         NT_PRSTATUS => Ok(mb.bytes(REGS_AT, PRSTATUS_SIZE)),
         NT_PRFPREG => Ok(mb.bytes(FPREGS_AT, PRFPREG_SIZE)),
+        NT_ARM_SYSTEM_CALL => Ok(mb.bytes(REGS_AT + 8 * 8, 8)[..4].to_vec()),
         _ => Err(errno::EINVAL),
     }
 }
@@ -560,6 +812,12 @@ pub fn set_regset(pid: i32, kind: u64, data: &[u8]) -> Result<(), i32> {
     let (at, size) = match kind {
         NT_PRSTATUS => (REGS_AT, PRSTATUS_SIZE),
         NT_PRFPREG => (FPREGS_AT, PRFPREG_SIZE),
+        // `x8`, from the number's 32 bits, sign-extended.
+        NT_ARM_SYSTEM_CALL => {
+            let n = i32::from_le_bytes(data.get(..4).ok_or(errno::EINVAL)?.try_into().unwrap());
+            mb.put(REGS_AT + 8 * 8, &(n as i64 as u64).to_le_bytes());
+            return Ok(());
+        }
         _ => return Err(errno::EINVAL),
     };
     let mut all = mb.bytes(at, size);
@@ -703,6 +961,52 @@ impl<P: crate::Platform> crate::Kernel<P> {
         }
     }
 
+    /// An event's stop (`event`, `PTRACE_EVENT_*`), with message `msg`
+    /// (what `PTRACE_GETEVENTMSG` gives: a new child's pid, an exit
+    /// status).
+    pub fn ptrace_event_stop(&mut self, regs: &mut crate::Regs, event: i32, msg: u64) {
+        if !traced() {
+            return;
+        }
+        let trap = fwe_abi::signal::SIGTRAP;
+        let info = crate::thread::SigInfo { code: trap as i32 | event << 8, ..Default::default() };
+        let si = crate::signal::siginfo_bytes(trap, info);
+        let r = stop(regs, stop_status(trap, event), &si, msg);
+        if r.signal() != 0 {
+            let info =
+                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+            crate::thread::post_process(r.signal(), info);
+        }
+    }
+
+    /// The exit event's stop (`PTRACE_O_TRACEEXIT`), as the process ends
+    /// with wait status `status`.
+    pub fn ptrace_exit_stop(&mut self, status: i32) {
+        if traced() && options() & PTRACE_O_TRACEEXIT != 0 {
+            let mut regs = crate::Regs::default();
+            self.ptrace_event_stop(&mut regs, PTRACE_EVENT_EXIT, status as u32 as u64);
+        }
+    }
+
+    /// The stops of a fork a backend noted ([`note_fork`]): the parent's
+    /// event, and for a vfork the vfork-done event.
+    pub fn ptrace_fork_stops(&mut self, regs: &mut crate::Regs) {
+        if let Some((event, flags, child)) = take_noted_fork() {
+            self.ptrace_event_stop(regs, event, child);
+            if flags & fwe_abi::clone::CLONE_VFORK != 0 {
+                self.ptrace_vfork_done(regs, child);
+            }
+        }
+    }
+
+    /// The vfork-done event's stop (`PTRACE_O_TRACEVFORKDONE`), the
+    /// child `child` having let its parent go on.
+    pub fn ptrace_vfork_done(&mut self, regs: &mut crate::Regs, child: u64) {
+        if traced() && options() & PTRACE_O_TRACEVFORKDONE != 0 {
+            self.ptrace_event_stop(regs, PTRACE_EVENT_VFORK_DONE, child);
+        }
+    }
+
     /// A system call's entry or exit stop (`PTRACE_SYSCALL`).
     pub fn ptrace_syscall_stop(&mut self, regs: &mut crate::Regs) {
         if !stops_at_syscalls() {
@@ -791,7 +1095,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
                 stopped(target)?;
                 Err(errno::EIO)
             }
-            PTRACE_CONT | PTRACE_SYSCALL | PTRACE_DETACH => {
+            PTRACE_CONT | PTRACE_SYSCALL | PTRACE_DETACH | PTRACE_SINGLESTEP => {
                 if data > fwe_abi::signal::NSIG {
                     stopped(target)?;
                     return Err(errno::EIO);
@@ -849,6 +1153,27 @@ fn get_own_siginfo() -> Option<[u8; 128]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_follows_every_kind_of_branch() {
+        let mut x = [0u64; 31];
+        x[3] = 0x9000;
+        x[30] = 0x7000;
+        let pc = 0x1000;
+        // b .+8; bl .-4
+        assert_eq!(next_pcs(0x1400_0002, pc, &x), vec![0x1008]);
+        assert_eq!(next_pcs(0x97ff_ffff, pc, &x), vec![0xffc]);
+        // b.eq .+16; cbz x0, .+8; tbnz w1, #3, .-8
+        assert_eq!(next_pcs(0x5400_0080, pc, &x), vec![0x1004, 0x1010]);
+        assert_eq!(next_pcs(0xb400_0040, pc, &x), vec![0x1004, 0x1008]);
+        assert_eq!(next_pcs(0x371f_ffc1, pc, &x), vec![0x1004, 0xff8]);
+        // br x3; ret; retaa (x30, its code taken off); an add
+        assert_eq!(next_pcs(0xd61f_0060, pc, &x), vec![0x9000]);
+        assert_eq!(next_pcs(0xd65f_03c0, pc, &x), vec![0x7000]);
+        x[30] = 0x0012_0000_0000_7000;
+        assert_eq!(next_pcs(0xd65f_0bff, pc, &x), vec![0x7000]);
+        assert_eq!(next_pcs(0x9100_0400, pc, &x), vec![0x1004]);
+    }
 
     #[test]
     fn stop_statuses_are_linuxs() {
