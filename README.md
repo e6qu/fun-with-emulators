@@ -30,7 +30,7 @@ Unmodified Debian programs run natively against glibc or musl (coreutils,
 bash, git, SQLite, lighttpd, Node.js, rustc with Cargo, apt) and in the VM
 (Python, GCC, clang, Go; verified on a software stand-in for the framework,
 not yet on real hardware). crun, podman and containerd run the `alpine`
-image. LTP's system-call tests pass at 1161 of the 1164 that apply.
+image. LTP's system-call tests pass at 1190 of the 1198 that apply.
 [ROADMAP.md](ROADMAP.md) has the details and what is left to 1.0.
 
 ## Documentation

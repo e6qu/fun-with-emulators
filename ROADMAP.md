@@ -13,7 +13,7 @@ in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests pass at 1161 of the 1164 that apply (1551 run) |
+| M4 Compatibility | In progress: LTP's system-call tests pass at 1190 of the 1198 that apply (1551 run) |
 | M5 Release | Not started |
 
 What runs unmodified, with its output checked in CI:

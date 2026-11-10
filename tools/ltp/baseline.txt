@@ -9,6 +9,8 @@ access01
 access02
 access03
 access04
+acct01
+acct02
 add_key01
 add_key02
 add_key03
@@ -27,8 +29,13 @@ bind04
 bind05
 bpf_map01
 bpf_prog01
+bpf_prog02
+bpf_prog03
+bpf_prog04
 brk01
 brk02
+cachestat02
+cachestat04
 capget01
 capget02
 capset01
@@ -265,6 +272,10 @@ fcntl36
 fcntl36_64
 fcntl37
 fcntl37_64
+fcntl38
+fcntl38_64
+fcntl39
+fcntl39_64
 fcntl40
 fcntl40_64
 fdatasync01
@@ -272,6 +283,9 @@ fdatasync02
 fgetxattr01
 fgetxattr02
 fgetxattr03
+file_attr01
+file_attr04
+file_attr05
 flistxattr01
 flistxattr02
 flistxattr03
@@ -414,6 +428,13 @@ inotify09
 inotify10
 inotify11
 inotify12
+io_cancel01
+io_destroy02
+io_getevents01
+io_setup02
+io_submit02
+io_submit03
+io_submit04
 ioctl01
 ioctl_loop01
 ioctl_loop02
@@ -439,6 +460,10 @@ ioctl_pidfd03
 ioctl_pidfd04
 ioctl_pidfd05
 ioctl_pidfd06
+ioprio_get01
+ioprio_set01
+ioprio_set02
+ioprio_set03
 keyctl01
 keyctl02
 keyctl03
@@ -507,6 +532,9 @@ lremovexattr01
 lseek01
 lseek02
 lseek07
+lsm_get_self_attr02
+lsm_list_modules01
+lsm_list_modules02
 lstat01
 lstat01_64
 lstat02
@@ -618,8 +646,11 @@ msgctl12
 msgget01
 msgget02
 msgget03
+msgget04
+msgget05
 msgrcv01
 msgrcv02
+msgrcv03
 msgrcv05
 msgrcv06
 msgrcv07
@@ -966,6 +997,8 @@ shmdt02
 shmget02
 shmget03
 shmget04
+shmget05
+shmget06
 shutdown01
 shutdown02
 sigaction01
@@ -1031,6 +1064,7 @@ statx02
 statx03
 statx04
 statx08
+statx12
 stime02
 string01
 symlink02
