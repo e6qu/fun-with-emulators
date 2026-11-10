@@ -235,6 +235,7 @@ impl<P: Platform> Kernel<P> {
                 crate::inotify::closed(fd);
                 crate::dnotify::closed(fd);
                 crate::landlock::closed(fd);
+                crate::loopdev::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {

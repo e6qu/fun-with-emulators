@@ -3112,6 +3112,7 @@ const LOOPDEV: &str = "free: true\n\
     remove attached: true\n\
     detach: 0\n\
     detached: again true, status true, size 0\n\
+    run down: held true, closed true\n\
     added: true, shown true\n\
     removed: 0, gone true\n\
     control read: true\n";
@@ -3119,8 +3120,9 @@ const LOOPDEV: &str = "free: true\n\
 /// A loop device set up and used as a program does: a free one from
 /// `/dev/loop-control`, a file attached and read, written and mapped
 /// through it from an offset within a size limit, its position shared
-/// with a fork child, `/sys/block` showing it, then detached; and a device
-/// added and removed.
+/// with a fork child, `/sys/block` showing it, then detached (run down,
+/// so another process cannot attach it, until closed); and a device added
+/// and removed.
 #[test]
 fn loop_devices_show_a_file() {
     let out = fwe(&rust_guest("loopdev"), &[]);

@@ -20,7 +20,12 @@
 //!
 //! fwe does not count a device's openers across processes, so
 //! `LOOP_CLR_FD` detaches at once (Linux waits for the last close when
-//! another opener remains), `LO_FLAGS_AUTOCLEAR` is kept and shown but
+//! another opener remains); the device is then run down, as Linux's is
+//! when the caller is its only opener, until the caller's descriptors of
+//! it close or the caller ends: another `LOOP_CLR_FD` finds nothing
+//! attached (`ENXIO`), and no one attaches it (`EBUSY`) or is given it as
+//! free, so a detach retried until `ENXIO` never detaches what another
+//! process attached after it, `LO_FLAGS_AUTOCLEAR` is kept and shown but
 //! detaches nothing on the last close, and `LOOP_CTL_REMOVE` removes an
 //! unattached device even while open. A device `LOOP_CTL_GET_FREE` named is
 //! not named to another process for a few seconds, until it is attached,
@@ -111,7 +116,17 @@ struct Device {
     diskseq: u64,
     /// The host process `LOOP_CTL_GET_FREE` named it to, and when.
     claim: Option<(i32, u64)>,
+    /// The host process whose `LOOP_CLR_FD` detached it, while that
+    /// process holds it open (run down: not to be attached again yet).
+    rundown: Option<i32>,
     bound: Option<Binding>,
+}
+
+impl Device {
+    /// Whether it is run down by a process that still holds it.
+    fn run_down(&self) -> bool {
+        self.rundown.is_some_and(alive)
+    }
 }
 
 /// Every loop device.
@@ -139,6 +154,7 @@ impl Loops {
             soft_block: 0,
             diskseq: self.seq,
             claim: None,
+            rundown: None,
             bound: None,
         };
         self.devices.insert(n, d);
@@ -159,6 +175,7 @@ impl Data for Loops {
             let (pid, at) = d.claim.unwrap_or_default();
             e.i32(pid);
             e.u64(at);
+            e.i32(d.rundown.unwrap_or(0));
             e.bool(d.bound.is_some());
             if let Some(b) = &d.bound {
                 match &b.backing {
@@ -191,11 +208,12 @@ impl Data for Loops {
     fn decode(d: &mut Dec) -> Self {
         let seq = d.u64();
         let mut devices = BTreeMap::new();
-        // An unattached device's 39 bytes at least.
-        for _ in 0..d.count(39) {
+        // An unattached device's 43 bytes at least.
+        for _ in 0..d.count(43) {
             let n = d.u32();
             let (ra_pages, read_only, soft_block, diskseq) = (d.u64(), d.bool(), d.u32(), d.u64());
             let (claimed, pid, at) = (d.bool(), d.i32(), d.u64());
+            let rundown = Some(d.i32()).filter(|&p| p != 0);
             let bound = d.bool().then(|| {
                 let backing = match d.u8() {
                     0 => Backing::File { host: d.bytes(), dev: d.u64(), ino: d.u64() },
@@ -224,7 +242,10 @@ impl Data for Loops {
                 }
             });
             let claim = claimed.then_some((pid, at));
-            devices.insert(n, Device { ra_pages, read_only, soft_block, diskseq, claim, bound });
+            devices.insert(
+                n,
+                Device { ra_pages, read_only, soft_block, diskseq, claim, rundown, bound },
+            );
         }
         Loops { devices, seq }
     }
@@ -256,6 +277,28 @@ fn host_pid() -> i32 {
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks the process exists.
     unsafe { libc::kill(pid, 0) == 0 || crate::host::last_errno() == libc::EPERM }
+}
+
+/// Descriptor `fd` is being closed: a device this process ran down
+/// ([`Device::rundown`]) may be attached again once none of its
+/// descriptors holds it.
+pub fn closed(fd: i32) {
+    let Some(Mark::Loop(n)) = fdmarks::marked(fd) else { return };
+    if fdmarks::marks().iter().any(|&(o, m)| o != fd && m == Mark::Loop(n)) {
+        return;
+    }
+    let me = host_pid();
+    let mine = |l: &Loops| l.devices.get(&n).is_some_and(|d| d.rundown == Some(me));
+    if state().is_ok_and(|l| mine(&l)) {
+        let _ = update(|l| {
+            if let Some(d) = l.devices.get_mut(&n)
+                && d.rundown == Some(me)
+            {
+                d.rundown = None;
+            }
+            Ok(())
+        });
+    }
 }
 
 fn last() -> i32 {
@@ -1028,7 +1071,7 @@ impl<P: Platform> Kernel<P> {
         let dev_writes = access(dev_fd)?.1;
         update(|l| {
             let d = l.devices.get(&n).ok_or(errno::ENXIO)?;
-            if d.bound.is_some() {
+            if d.bound.is_some() || d.run_down() && d.rundown != Some(host_pid()) {
                 return Err(errno::EBUSY);
             }
             let a = self.attach_source(file)?;
@@ -1053,6 +1096,7 @@ impl<P: Platform> Kernel<P> {
             let seq = l.seq;
             let d = l.devices.get_mut(&n).ok_or(errno::ENXIO)?;
             d.claim = None;
+            d.rundown = None;
             d.soft_block = 0;
             d.diskseq = seq;
             d.bound = Some(Binding {
@@ -1148,6 +1192,7 @@ impl<P: Platform> Kernel<P> {
                 if d.bound.take().is_none() {
                     return Err(errno::ENXIO);
                 }
+                d.rundown = Some(host_pid());
                 d.soft_block = 0;
                 d.diskseq = seq;
                 l.seq = seq;
@@ -1363,7 +1408,7 @@ fn control(req: u64, arg: u64) -> Result<i64, i32> {
                 return Err(errno::EINVAL);
             }
             let d = l.devices.get(&(n as u32)).ok_or(errno::ENODEV)?;
-            if d.bound.is_some() {
+            if d.bound.is_some() || d.run_down() {
                 return Err(errno::EBUSY);
             }
             l.devices.remove(&(n as u32));
@@ -1375,7 +1420,7 @@ fn control(req: u64, arg: u64) -> Result<i64, i32> {
                 let held = d.claim.is_some_and(|(pid, at)| {
                     pid != me && now.saturating_sub(at) < CLAIM && alive(pid)
                 });
-                (d.bound.is_none() && !held).then_some(n)
+                (d.bound.is_none() && !held && !d.run_down()).then_some(n)
             });
             let n = match free {
                 Some(n) => n,
