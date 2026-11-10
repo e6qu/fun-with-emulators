@@ -376,10 +376,10 @@ pub fn run() -> Vec<i32> {
 /// Host process `pid`, which has a record, has gone: forget its record. It
 /// ended without leaving one of how it ended (it was killed by `SIGKILL`,
 /// which it cannot see coming), so leave that for it if a reaper might
-/// take it.
+/// take it. A zombie has ended too, but its record stays until it is
+/// reaped: `/proc/<pid>` shows it, as Linux shows a zombie.
 pub fn gone(pid: i32) {
     let _lock = lock(pid);
-    // A zombie has ended: its record goes now, not once it is reaped.
     if let Some(r) = read_any(pid)
         && !alive((pid, r.start))
     {
@@ -402,7 +402,10 @@ pub fn gone(pid: i32) {
                 bound: r.bound,
             });
         }
-        remove(pid);
+        let zombie = host_info(pid).is_some_and(|(start, _, z)| z && start == r.start);
+        if !zombie {
+            remove(pid);
+        }
     }
 }
 
@@ -856,6 +859,66 @@ pub fn stopped_by(pid: i32) -> Option<i32> {
     }
 }
 
+/// What the host keeps of any process in its `kinfo_proc`, which it
+/// gives for a zombie, and for another user's process, where
+/// `proc_pidinfo` answers nothing.
+pub struct Kinfo {
+    /// Its start, in microseconds since the epoch.
+    pub start: u64,
+    pub ppid: i32,
+    pub pgid: i32,
+    /// The host's state (`SIDL` 1, `SRUN` 2, `SSLEEP` 3, `SSTOP` 4,
+    /// `SZOMB` 5).
+    pub state: u8,
+    pub comm: Vec<u8>,
+}
+
+/// Host process `pid`'s `kinfo_proc`, which the libc crate does not
+/// describe (648 bytes: the start time at 0, the state at 36, the command
+/// name at 243, the parent and process group at 560 and 564).
+#[cfg(target_os = "macos")]
+pub fn kinfo(pid: i32) -> Option<Kinfo> {
+    const SIZE: usize = 648;
+    let mut buf = [0u8; SIZE];
+    let mut len = SIZE;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: a valid name and out-buffer of `len` bytes.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // A pid with no process gives an empty answer.
+    if r != 0 || len != SIZE {
+        return None;
+    }
+    let i64_at = |at: usize| i64::from_ne_bytes(buf[at..at + 8].try_into().unwrap());
+    let i32_at = |at: usize| i32::from_ne_bytes(buf[at..at + 4].try_into().unwrap());
+    let comm = &buf[243..243 + 17];
+    Some(Kinfo {
+        start: (i64_at(0).max(0) as u64) * 1_000_000 + i32_at(8).max(0) as u64,
+        ppid: i32_at(560),
+        pgid: i32_at(564),
+        state: buf[36],
+        comm: comm[..comm.iter().position(|&b| b == 0).unwrap_or(comm.len())].to_vec(),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn kinfo(_: i32) -> Option<Kinfo> {
+    None
+}
+
+/// Host process `pid`'s `kinfo_proc`, if it is a zombie.
+pub fn zombie_info(pid: i32) -> Option<Kinfo> {
+    kinfo(pid).filter(|k| k.state == 5)
+}
+
 /// Whether host process `p` is alive (not ended, nor a zombie) and the one
 /// that started then.
 pub fn alive(p: Proc) -> bool {
@@ -880,13 +943,15 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
             )
         };
         // SZOMB is 5.
-        (n == size).then(|| {
-            (
+        if n == size {
+            return Some((
                 info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
                 info.pbi_ppid as i32,
                 info.pbi_status == 5,
-            )
-        })
+            ));
+        }
+        // The host tells nothing of a zombie that way: its `kinfo_proc`.
+        zombie_info(pid).map(|z| (z.start, z.ppid, true))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1006,8 +1071,8 @@ pub fn reaped(pid: i32) {
     }
 }
 
-/// This process is ending with Linux wait status `status`: forget its
-/// record, and leave one of how it ended if a reaper might take it.
+/// This process is ending with Linux wait status `status`: leave a record
+/// of how it ended if a reaper might take it.
 pub fn exiting(status: i32) {
     // Its files closed, as it ends (inotify's close events), and its
     // instances gone.
@@ -1045,7 +1110,9 @@ pub fn exiting(status: i32) {
             write_ended(&ended);
         }
     }
-    remove(me);
+    // The record stays while the process is a zombie, for `/proc/<pid>`:
+    // whoever reaps it, or finds it gone from the host, removes it
+    // ([`reaped`], [`gone`]).
 }
 
 /// The host reaped the children of `parent` as they ended (it ignores

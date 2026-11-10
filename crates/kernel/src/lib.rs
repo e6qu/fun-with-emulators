@@ -44,6 +44,7 @@ pub mod modes;
 pub mod mountapi;
 mod mountops;
 pub mod mounts;
+pub mod mountwatch;
 pub mod mqueue;
 pub mod net;
 pub mod netlink;

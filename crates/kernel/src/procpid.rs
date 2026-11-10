@@ -43,7 +43,28 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             )
         } != bsize
         {
-            return None;
+            // A zombie, or another user's process, which the host answers
+            // for only in its `kinfo_proc`: what it keeps, no usage.
+            let z = crate::procreg::kinfo(pid)?;
+            return Some(HostInfo {
+                state: match z.state {
+                    2 => b'R',
+                    4 => b'T',
+                    5 => b'Z',
+                    _ => b'S',
+                },
+                ppid: crate::reaper::parent_of(pid, z.ppid),
+                pgid: z.pgid,
+                // SAFETY: plain host call.
+                sid: unsafe { libc::getsid(pid) },
+                nice: 0,
+                threads: 1,
+                rss_bytes: 0,
+                vsize: 0,
+                utime: 0,
+                stime: 0,
+                start: ticks_since_boot(z.start as f64 / 1e6),
+            });
         }
         // SAFETY: as above.
         let mut t: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
@@ -67,12 +88,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             _ => b'S', // SIDL, SSLEEP
         };
         let ns_to_ticks = |ns: u64| ns * HZ / 1_000_000_000;
-        let boot = crate::host::uptime();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
         let started = b.pbi_start_tvsec as f64 + b.pbi_start_tvusec as f64 / 1e6;
-        let since_boot = (started - (now - boot)).max(0.0);
         // SAFETY: plain host call.
         let sid = unsafe { libc::getsid(pid) };
         Some(HostInfo {
@@ -87,7 +103,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
             vsize: if have_task { t.pti_virtual_size } else { 0 },
             utime: if have_task { ns_to_ticks(mach_to_ns(t.pti_total_user)) } else { 0 },
             stime: if have_task { ns_to_ticks(mach_to_ns(t.pti_total_system)) } else { 0 },
-            start: (since_boot * HZ as f64) as u64,
+            start: ticks_since_boot(started),
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -95,6 +111,17 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         let _ = pid;
         None
     }
+}
+
+/// When a process that started at `started` (seconds since the epoch)
+/// did, in clock ticks since the host booted.
+#[cfg(target_os = "macos")]
+fn ticks_since_boot(started: f64) -> u64 {
+    let boot = crate::host::uptime();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    ((started - (now - boot)).max(0.0) * HZ as f64) as u64
 }
 
 /// Linux's state of host process `pid`, which the host has running: its
@@ -360,10 +387,18 @@ pub fn user_record(dirs: &[Vec<u8>]) -> Option<crate::shared::Record<crate::user
 /// process `pid` of the reader's pid namespace behind host pid `host`.
 pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
     let Some(rec) = crate::procreg::read(host) else {
-        // A process fwe has no record of: only that it exists (one of
-        // another user's, such as the host's process 1, too).
+        // A process fwe has no record of (one of another user's, such as
+        // the host's process 1, too): that it exists, and what the host
+        // tells of it.
         return match sub {
             b"" if crate::host::process_exists(host) => Entry::Dir,
+            b"/stat" => match host_info(host) {
+                Some(h) => {
+                    let comm = crate::procreg::kinfo(host).map(|k| k.comm).unwrap_or_default();
+                    Entry::File(stat_line(pid, &comm, &h))
+                }
+                None => Entry::Missing,
+            },
             _ => Entry::Missing,
         };
     };

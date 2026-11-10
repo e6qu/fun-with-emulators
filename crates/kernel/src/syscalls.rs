@@ -201,6 +201,7 @@ impl<P: Platform> Kernel<P> {
             nr::CLOSE => {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
+                crate::mountwatch::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);
@@ -651,6 +652,31 @@ impl<P: Platform> Kernel<P> {
                 guest!(host::write_rusage(a[1], &usage));
                 0
             }
+            nr::TIMES => {
+                // The process's and its reaped children's times in clock
+                // ticks (`USER_HZ`, 100 a second), and the ticks since boot.
+                let ticks = |tv: libc::timeval| {
+                    (tv.tv_sec.max(0) as u64) * 100 + (host::usec(tv).max(0) as u64) / 10_000
+                };
+                let usage = |who| {
+                    // SAFETY: an all-zero rusage is a valid out-parameter.
+                    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+                    // SAFETY: as above.
+                    unsafe { libc::getrusage(who, &mut u) };
+                    u
+                };
+                if a[0] != 0 {
+                    let (me, children) = (usage(libc::RUSAGE_SELF), usage(libc::RUSAGE_CHILDREN));
+                    let tms = [
+                        ticks(me.ru_utime),
+                        ticks(me.ru_stime),
+                        ticks(children.ru_utime),
+                        ticks(children.ru_stime),
+                    ];
+                    guest!(uaccess::write(a[0], tms));
+                }
+                (host::uptime() * 100.0) as i64
+            }
             nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
             nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
             nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),
@@ -706,7 +732,15 @@ impl<P: Platform> Kernel<P> {
             // here (e.g. through the plain `syscall` helper) is unsupported.
 
             // Randomness.
-            nr::GETRANDOM => self.sys_getrandom(a[0], a[1]),
+            nr::GETRANDOM => {
+                // GRND_NONBLOCK, GRND_RANDOM and GRND_INSECURE, but not the
+                // last two at once.
+                let flags = a[2] as u32;
+                if flags & !7 != 0 || flags & 6 == 6 {
+                    return err(errno::EINVAL);
+                }
+                self.sys_getrandom(a[0], a[1])
+            }
 
             // Not implemented yet. rseq and membarrier are optional for libc.
             _ => {
@@ -743,6 +777,11 @@ impl<P: Platform> Kernel<P> {
     fn sys_getgroups(&self, size: u64, list: u64) -> i64 {
         let groups = self.creds.groups();
         let n = groups.len();
+        // The size is an int: a negative one is refused.
+        if (size as i32) < 0 {
+            return err(errno::EINVAL);
+        }
+        let size = u64::from(size as u32);
         if size == 0 {
             return n as i64;
         }
@@ -1087,6 +1126,12 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
             return r;
         }
+        // `RNDGETENTCNT` on `/dev/random` or `/dev/urandom`: the entropy
+        // count, full as Linux's is (`kernel.random.entropy_avail`).
+        if req == 0x8004_5200 && is_random_device(fd) {
+            guest!(uaccess::write(arg, 256i32));
+            return 0;
+        }
         // SAFETY: in every arm the argument layouts match the host's; the host
         // validates guest pointers.
         unsafe {
@@ -1157,6 +1202,13 @@ impl<P: Platform> Kernel<P> {
                 },
                 // The slave is unlocked at allocation; accept the lock request.
                 ioctl::TIOCSPTLCK => 0,
+                // A pipe's either end counts what the pipe holds (the
+                // host's write end counts nothing).
+                ioctl::FIONREAD if crate::splice::pipe_ends(fd).is_some() => {
+                    let held = crate::splice::held(fd).min(i32::MAX as u64) as i32;
+                    guest!(uaccess::write(arg, held));
+                    0
+                }
                 ioctl::FIONREAD => ret(libc::ioctl(fd, libc::FIONREAD, arg as *mut libc::c_int)),
                 ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
                 ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),
@@ -1863,6 +1915,14 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EPERM);
         }
+        // Nor past `fs.nr_open`.
+        if let Some(n) = &n
+            && res == resource::RLIMIT_NOFILE
+            && crate::sysctl::number(b"fs/nr_open")
+                .is_some_and(|max| n.rlim_max > max.max(0) as u64)
+        {
+            return err(errno::EPERM);
+        }
         if old != 0 {
             let had = match crate::procreg::pending_limit(target, res as u32) {
                 Some(l) => l,
@@ -2082,6 +2142,12 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
                 p.events &= !libc::POLLOUT;
                 full = true;
             }
+            // A mounts file's change is fwe's to tell, in slices: the host
+            // would report its urgent data at once.
+            if crate::mountwatch::is(p.fd) {
+                p.events &= !libc::POLLPRI;
+                full = true;
+            }
         }
         let left =
             deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_nanos() as i64);
@@ -2096,12 +2162,25 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         for ((p, a), &w) in set.iter_mut().zip(&ask).zip(&writable) {
             p.revents = a.revents | if w { libc::POLLOUT } else { 0 };
             linux_revents(p);
+            if crate::mountwatch::changed(p.fd) == Some(true) {
+                p.revents |= libc::POLLERR | (p.events & libc::POLLPRI);
+            }
         }
         let n = set.iter().filter(|p| p.revents != 0).count() as i32;
         if n > 0 || !full || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(n);
         }
     }
+}
+
+/// Whether `fd` is `/dev/random` or `/dev/urandom` (Linux's 1:8, 1:9).
+fn is_random_device(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+    ok && crate::devnodes::linux_numbers_of_host(&st)
+        .is_some_and(|n| n.major == 1 && (n.minor == 8 || n.minor == 9))
 }
 
 /// What the host reported ready on `p` as Linux reports it: a regular

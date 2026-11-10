@@ -1017,8 +1017,22 @@ pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
         Some(s) => s,
         None => fwe_abi::signal::SIGCHLD,
     };
-    let taken = (crate::signal::caught() | crate::signalfd::watched()) & (1 << (sig - 1)) != 0;
-    if pid <= 0 || !taken {
+    let bit = 1 << (sig - 1);
+    let taken = (crate::signal::caught() | crate::signalfd::watched()) & bit != 0;
+    if pid <= 0 {
+        return;
+    }
+    if !taken {
+        // Neither caught nor watched: Linux discarded it as the child
+        // ended unless the thread blocked it then, so the host's landing
+        // later (once the guest may block it) is dropped, unless blocked
+        // now, when it stays pending as Linux's would.
+        if crate::thread::mask() & bit == 0 {
+            ring_put(&GIVEN, &GIVEN_AT, pid);
+            if ring_take(&LANDED, pid) {
+                ring_take(&GIVEN, pid);
+            }
+        }
         return;
     }
     // Marked given first: the host's landing from now on is dropped.

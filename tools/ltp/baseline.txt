@@ -128,6 +128,7 @@ epoll_wait05
 epoll_wait07
 epoll_wait08
 epoll_wait09
+epoll_wait10
 epoll_wait11
 epoll_wait12
 epoll_wait13
@@ -342,12 +343,14 @@ geteuid01
 geteuid02
 getgid01
 getgid03
+getgroups01
 getgroups03
 gethostname01
 getitimer01
 getitimer02
 getpagesize01
 getpeername01
+getpgid01
 getpgid02
 getpgrp01
 getpid01
@@ -359,6 +362,7 @@ getrandom01
 getrandom02
 getrandom03
 getrandom04
+getrandom05
 getresgid01
 getresgid02
 getresgid03
@@ -412,6 +416,7 @@ ioctl_ns06
 ioctl_ns07
 ioctl05
 ioctl06
+ioctl07
 ioctl10
 ioctl_pidfd01
 ioctl_pidfd02
@@ -656,6 +661,7 @@ pipe08
 pipe09
 pipe10
 pipe11
+pipe12
 pipe13
 pipe14
 pipe2_01
@@ -751,6 +757,7 @@ request_key04
 request_key05
 request_key06
 rmdir01
+rmdir02
 rmdir03
 rt_sigaction01
 rt_sigaction02
@@ -792,6 +799,7 @@ sched_yield01
 select01
 select03
 select04
+semctl01
 semctl02
 semctl03
 semctl04
@@ -993,6 +1001,7 @@ timerfd_gettime01
 timerfd_settime01
 timerfd_settime02
 times01
+times03
 tkill01
 tkill02
 truncate02
@@ -1014,6 +1023,7 @@ unlink10
 unlinkat01
 unshare01
 unshare02
+unshare03
 unshare04
 unshare05
 utime01

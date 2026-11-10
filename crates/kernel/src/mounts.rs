@@ -1416,6 +1416,11 @@ pub mod store {
             self.0.id()
         }
 
+        /// The table's generation: every change moves it.
+        pub fn generation(&self) -> u64 {
+            self.0.generation()
+        }
+
         /// The table as it is now.
         pub fn table(&self) -> Arc<Table> {
             self.0.get()

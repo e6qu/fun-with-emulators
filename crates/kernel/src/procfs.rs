@@ -362,10 +362,12 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         // Nothing has tainted fwe's kernel.
         b"/proc/sys/kernel/tainted" => Entry::File(b"0\n".to_vec()),
         b"/proc/sys/fs/lease-break-time" => Entry::File(b"45\n".to_vec()),
+        // Linux's pool is full from boot.
+        b"/proc/sys/kernel/random/entropy_avail" => Entry::File(b"256\n".to_vec()),
+        b"/proc/sys/kernel/random/poolsize" => Entry::File(b"256\n".to_vec()),
         // The kernel was given no command line.
         b"/proc/cmdline" => Entry::File(b"\n".to_vec()),
         b"/proc/config.gz" => Entry::File(config_gz()),
-        b"/proc/sys/fs/nr_open" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/fs/file-max" => Entry::File(b"9223372036854775807\n".to_vec()),
         b"/proc/sys/fs/pipe-max-size" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),

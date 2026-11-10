@@ -584,11 +584,13 @@ shapes differently:
   `config.gz` (the options of what fwe implements), `keys`, `key-users`,
   `sysvipc/{shm,sem,msg}`, and under `/proc/sys`: `kernel/{ostype,
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
-  overflowuid,overflowgid,threads-max,tainted}`, `fs/{nr_open,file-max,
-  pipe-max-size,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
-  `vm/{overcommit_memory,mmap_min_addr,drop_caches}`, `kernel/keys/*`,
-  the IPC limits and a
-  network namespace's sysctls (`crates/kernel/src/sysctl.rs`).
+  overflowuid,overflowgid,threads-max,tainted}`,
+  `kernel/random/{entropy_avail,poolsize}`, `fs/{nr_open,file-max,
+  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
+  `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
+  `kernel/keys/*`, the IPC limits and a network namespace's sysctls
+  (`crates/kernel/src/sysctl.rs`). `fs.nr_open` bounds `RLIMIT_NOFILE` and
+  the copy of a shared descriptor table `unshare(CLONE_FILES)` makes.
 - `/sys`: `fs/cgroup` (a mount point), `devices/system/cpu/{online,possible}`
   and the loop devices' `block`, `dev/block` and `devices/virtual/block`
   entries.
@@ -600,8 +602,10 @@ shapes differently:
   its records and what the host reports. `oom_score_adj` is inherited
   (going below the last value a privileged process set takes
   `CAP_SYS_RESOURCE`). A host process fwe did not start (outside a pid
-  namespace, any process number names the host's, 1 its `launchd`) is an
-  empty directory while it exists.
+  namespace, any process number names the host's, 1 its `launchd`) is a
+  directory with its `stat`, from what the host keeps of it. A zombie keeps its record until it is
+  reaped, so its `/proc/<pid>` is there, its state `Z` (the host answers
+  for a zombie only in its `kinfo_proc`).
 
 ## Event descriptors and inotify
 
@@ -614,7 +618,11 @@ each behaves inside fwe:
   `EINVAL`, `ELOOP` for loops and nesting past Linux's limit, `EEXIST`,
   `ENOENT`). Waits keep nanoseconds, as `epoll_pwait2`'s `timespec`
   gives them. A socket watched for `EPOLLRDHUP` alone has a read filter at a low-water
-  mark no read reaches, so only the end fires.
+  mark no read reaches, so only the end fires. A mounts file (`/proc/<pid>/mounts`, `mountinfo`)
+  reports `POLLERR | POLLPRI` to `poll` and `epoll` once its namespace's
+  mounts changed since it was opened or last polled
+  (`crates/kernel/src/mountwatch.rs`: the namespace record's generation,
+  looked at in slices).
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
   An eventfd's counter is a shared page with a lock word in it, so a fork
