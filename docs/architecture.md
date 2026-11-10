@@ -437,8 +437,9 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
 `crates/kernel/src/ptrace.rs`. macOS lets no process read another's
 memory or threads, so a tracee does its tracer's work itself:
 
-- **Mailbox:** a page per tracee in fwe's private directory
-  (`ptrace-<pid>`), mapped by it and its tracer: the stop's wait status,
+- **Mailbox:** a page per traced thread in fwe's private directory
+  (`ptrace-<id>`, a process's pid for its main thread, a tid for
+  another), mapped by it and its tracer, naming the process it is in: the stop's wait status,
   the general and FP registers, the `siginfo`, the options, and one
   request at a time with its result, handed over through shared host
   address waits.
@@ -460,7 +461,10 @@ memory or threads, so a tracee does its tracer's work itself:
 - **Events:** a fork, vfork or clone a tracer follows
   (`PTRACE_O_TRACEFORK` and the like) stops the parent with the event and
   starts the child traced, stopped by `SIGSTOP`, with its parent's options
-  (in the VM backend through the fork's snapshot); the exit event comes
+  (in the VM backend through the fork's snapshot); a thread it follows
+  (`PTRACE_O_TRACECLONE`) starts traced the same way, stops on its own
+  while the process's other threads go on, and its end is reported to the
+  tracer by its tid; the exit event comes
   before a process ends, and `PTRACE_O_EXITKILL` ends a tracer's tracees
   with it.
 - **Single-stepping** plants a breakpoint of fwe's (`brk #0x4c59`) where
@@ -933,11 +937,10 @@ something a Linux program could notice. The [roadmap](../ROADMAP.md) says
 which are to be lifted for 1.0 and which are not planned.
 
 **Execution**
-- ptrace traces processes, not threads: a tracee's other threads go on
-  while it stops, a new thread is not followed, and a thread cannot be
-  attached to on its own. There is no seccomp event, no `NT_ARM_TLS` or
-  hardware breakpoint and watchpoint register set, and no
-  `PTRACE_INTERRUPT`/`LISTEN`; a single step over an exclusive load and
+- ptrace cannot attach to a thread of another process other than its
+  main one (fwe sends no signal to another process's thread). There is no
+  seccomp event, no hardware breakpoint or watchpoint (their register
+  sets say there are none), and no `PTRACE_INTERRUPT`/`LISTEN`; a single step over an exclusive load and
   store loops, as a breakpoint between them clears the monitor.
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
   which needs `fwe` signed with the hypervisor entitlement and a

@@ -1,10 +1,13 @@
 //! ptrace: a child traced (`PTRACE_TRACEME`) stops for a signal; its
 //! memory is read and written (`PEEKDATA`, `POKEDATA`, the write seen in
-//! its exit status) and its registers read (`GETREGSET`); its system calls
+//! its exit status) and its registers and thread pointer read
+//! (`GETREGSET`); its system calls
 //! stop at entry and exit (`PTRACE_SYSCALL`, `PTRACE_O_TRACESYSGOOD`), the
 //! number and result in its registers; a fork it makes is followed
 //! (`PTRACE_O_TRACEFORK`, the new child stopping first, exit events for
-//! both); `waitid` reports a stop (`CLD_TRAPPED`); it runs to its end one
+//! both); a thread it starts is followed (`PTRACE_O_TRACECLONE`, the
+//! thread stopping first under its own id, its end reported); `waitid`
+//! reports a stop (`CLD_TRAPPED`); it runs to its end one
 //! instruction at a time (`PTRACE_SINGLESTEP`); and a breakpoint planted
 //! in its code stops it there. It prints what it observed.
 //!
@@ -31,10 +34,13 @@ const PTRACE_GETEVENTMSG: c_long = 0x4201;
 const PTRACE_GETREGSET: c_long = 0x4204;
 const PTRACE_O_TRACESYSGOOD: c_long = 1;
 const PTRACE_O_TRACEFORK: c_long = 2;
+const PTRACE_O_TRACECLONE: c_long = 8;
 const PTRACE_O_TRACEEXIT: c_long = 0x40;
 const PTRACE_EVENT_FORK: i32 = 1;
+const PTRACE_EVENT_CLONE: i32 = 3;
 const PTRACE_EVENT_EXIT: i32 = 6;
 const NT_PRSTATUS: c_long = 1;
+const NT_ARM_TLS: c_long = 0x401;
 const WALL: c_int = 0x4000_0000;
 const P_PID: c_int = 1;
 const WSTOPPED: c_int = 2;
@@ -109,6 +115,10 @@ fn main() {
     let (r, size) = regs(c);
     let text = main as *const () as u64;
     println!("regs: {size} bytes, pc near the code {}", r[32].abs_diff(text) < 1 << 24);
+    let mut tp = 0u64;
+    let mut iov = [&mut tp as *mut u64 as u64, 8];
+    ptrace(PTRACE_GETREGSET, c, NT_ARM_TLS as u64, iov.as_mut_ptr() as u64);
+    println!("thread pointer: set {}", tp != 0 && iov[1] == 8);
     ptrace(PTRACE_POKEDATA, c, SECRET.as_ptr() as u64, 42);
     ptrace(PTRACE_CONT, c, 0, 0);
     println!("poke: exit {}", exit_code(wait(c)));
@@ -182,6 +192,42 @@ fn main() {
     }
     println!(
         "fork: events {forks}, new child stopped {new_stopped}, exit events {exit_events}, exits {exits}"
+    );
+
+    // A thread followed.
+    let c = traced_child(|| std::thread::spawn(|| 5).join().unwrap_or(0));
+    wait(c);
+    ptrace(PTRACE_SETOPTIONS, c, 0, PTRACE_O_TRACECLONE as u64);
+    ptrace(PTRACE_CONT, c, 0, 0);
+    let (mut clones, mut thread_stopped, mut thread_ends, mut code) = (0, 0, 0, -1);
+    let mut new = 0;
+    loop {
+        let mut st = 0;
+        // SAFETY: a valid out-parameter.
+        let w = unsafe { waitpid(-1, &mut st, WALL) };
+        if w < 0 {
+            break;
+        }
+        if st & 0x7f == 0 {
+            if w == c {
+                code = exit_code(st);
+                break;
+            }
+            thread_ends += i32::from(w == new);
+            continue;
+        }
+        if st >> 16 == PTRACE_EVENT_CLONE {
+            let mut msg = 0u64;
+            ptrace(PTRACE_GETEVENTMSG, w, 0, &mut msg as *mut u64 as u64);
+            new = msg as c_int;
+            clones += 1;
+        } else if w != c && stopsig(st) == SIGSTOP {
+            thread_stopped += i32::from(w == new);
+        }
+        ptrace(PTRACE_CONT, w, 0, 0);
+    }
+    println!(
+        "thread: events {clones}, new thread stopped {thread_stopped}, its end {thread_ends}, exit {code}"
     );
 
     // waitid of a stop.

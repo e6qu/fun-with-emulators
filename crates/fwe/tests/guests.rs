@@ -2819,16 +2819,19 @@ fn process_descriptors_name_processes() {
 const PTRACE: &str = "stop: signal 19\n\
     peek: true\n\
     regs: 272 bytes, pc near the code true\n\
+    thread pointer: set true\n\
     poke: exit 7\n\
     syscalls: write stopped at entry true, its result -9\n\
     fork: events 1, new child stopped 1, exit events 2, exits 2\n\
+    thread: events 1, new thread stopped 1, its end 1, exit 5\n\
     waitid: signal true, trapped true, status 19\n\
     step: exit 21, stepped true\n\
     breakpoint: signal 5, at work true, argument 10, exit 21\n";
 
 /// ptrace: a traced child stops for a signal, has its memory read and
 /// written and its registers read, stops at a system call's entry and
-/// exit, has a fork it makes followed, is reported by `waitid`, runs one
+/// exit, has a fork and a thread it makes followed, is reported by
+/// `waitid`, runs one
 /// instruction at a time to its end and stops at a breakpoint.
 #[test]
 fn ptrace_traces_a_child() {

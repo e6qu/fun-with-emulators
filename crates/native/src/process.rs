@@ -593,14 +593,15 @@ fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     };
     loop {
         let seen = fwe_kernel::ptrace::inbox_generation();
-        if let Some((p, status)) = fwe_kernel::ptrace::take_stop(wanted, false) {
+        if let Some((p, status, thread)) = fwe_kernel::ptrace::take_stop(wanted, false) {
             if wstatus != 0 && fwe_kernel::uaccess::write(wstatus, status).is_err() {
                 return err(errno::EFAULT);
             }
             if rusage != 0 && fwe_kernel::uaccess::write(rusage, [0u64; 18]).is_err() {
                 return err(errno::EFAULT);
             }
-            return fwe_kernel::pidns::guest_ret(p as i64);
+            // A thread is named by its tid, a process as the guest knows it.
+            return if thread { p as i64 } else { fwe_kernel::pidns::guest_ret(p as i64) };
         }
         let r = wait4_host(pid, host_options | libc::WNOHANG, wstatus, rusage);
         // A traced process that is not a child is no host child to wait for.
@@ -640,12 +641,13 @@ fn waitid_tracer(
     let peek = options & fwe_abi::wait::WNOWAIT != 0;
     loop {
         let seen = fwe_kernel::ptrace::inbox_generation();
-        if let Some((p, status)) = fwe_kernel::ptrace::take_stop(wanted, peek) {
+        if let Some((p, status, thread)) = fwe_kernel::ptrace::take_stop(wanted, peek) {
             if infop != 0 {
                 let mut words = [0i32; 32];
                 words[0] = fwe_abi::signal::SIGCHLD as i32;
                 words[2] = CLD_TRAPPED;
-                words[4] = fwe_kernel::pidns::guest_ret(i64::from(p)) as i32;
+                words[4] =
+                    if thread { p } else { fwe_kernel::pidns::guest_ret(i64::from(p)) as i32 };
                 words[5] = fwe_kernel::procreg::ids(p)[0] as i32;
                 words[6] = (status >> 8) & 0xffff;
                 if fwe_kernel::uaccess::write(infop, words).is_err() {
