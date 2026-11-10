@@ -156,7 +156,7 @@ pub(crate) fn held(fd: i32) -> u64 {
 
 /// The room a pipe's write end `fd` has: its capacity (as set, at most
 /// what a host pipe takes) less what it holds.
-fn room(fd: i32) -> u64 {
+pub(crate) fn room(fd: i32) -> u64 {
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.

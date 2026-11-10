@@ -75,6 +75,10 @@ pub struct ProcRecord {
     /// Its main thread's timer slack and the default a slack of 0 restores
     /// (`PR_SET_TIMERSLACK`, `/proc/<pid>/timerslack_ns`), in nanoseconds.
     pub slack: (u64, u64),
+    /// Whether it has run a program of its own since its fork (Linux's
+    /// `PF_FORKNOEXEC` cleared): a parent may no longer move it to another
+    /// process group.
+    pub execed: bool,
 }
 
 /// A host process, as its pid and its start time.
@@ -212,6 +216,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     e.bytes(&r.maps);
     e.u64(r.slack.0);
     e.u64(r.slack.1);
+    e.bool(r.execed);
     e.into_bytes()
 }
 
@@ -241,6 +246,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let sched = Sched::decode(&mut d);
     let maps = d.bytes();
     let slack = (d.u64(), d.u64());
+    let execed = d.bool();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -264,6 +270,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         sched,
         maps,
         slack,
+        execed,
     })
 }
 
@@ -498,6 +505,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         sched: Sched::default(),
         maps: Vec::new(),
         slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
+        execed: false,
     });
     f(&mut r);
     write(pid, &r);
@@ -523,6 +531,7 @@ pub fn own_program(exe: &[u8], cmdline: &[u8]) {
         r.exe = exe.to_vec();
         r.cmdline = cmdline.to_vec();
         r.comm = comm;
+        r.execed = true;
     });
 }
 

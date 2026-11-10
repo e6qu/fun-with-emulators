@@ -58,6 +58,7 @@ pub mod owners;
 pub mod pdeath;
 pub mod pidfd;
 pub mod pidns;
+pub mod pipelock;
 pub mod procfs;
 pub mod procpid;
 pub mod procreg;
@@ -1397,6 +1398,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 host::ret(unsafe { libc::write(fd, (buf + at) as *const _, n as usize) } as i64)
             };
             if let Some(r) = fdstate::capped_write(fd, len, write) {
+                return Some(r);
+            }
+            // A pipe write Linux makes whole: whole.
+            if let Some(r) = pipelock::whole_write(fd, len, write) {
                 return Some(r);
             }
             // SAFETY: the host validates the guest buffer.

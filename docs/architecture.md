@@ -551,6 +551,12 @@ shapes differently:
   blocking. A full pipe is not writable to `poll`, `select` and `epoll`,
   which look at it each millisecond. A host `SIGIO` for a descriptor with a
   chosen signal arrives as that signal, with `si_fd` and `si_band`.
+- **Whole pipe writes** (`crates/kernel/src/pipelock.rs`): a write of up
+  to Linux's `PIPE_BUF` (4096 bytes) to a pipe arrives whole, never
+  interleaved with another writer's, where the host keeps only 512 whole:
+  writers of one take turns through an `flock` on one of 64 lock files in
+  fwe's private directory, chosen by the pipe's identity; one that does
+  not wait is written whole or not at all (`EAGAIN`).
 - **Leases** (`crates/kernel/src/leases.rs`): a record every fwe process
   shares. An open or truncation that conflicts with a lease signals its
   holder and waits until the lease is let go or downgraded, or for

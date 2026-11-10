@@ -411,6 +411,21 @@ impl<P: Platform> Kernel<P> {
                     (Ok(_), Err(_)) => return err(errno::EPERM),
                     (Err(e), _) => return err(e),
                 };
+                // A child of the caller's session that has run a program of
+                // its own may not be moved (`EACCES`), whatever the group:
+                // Linux tells that before the group's checks, the host after.
+                // SAFETY: plain host calls.
+                let (me, sid) = unsafe { (libc::getpid(), libc::getsid(0)) };
+                if pid != 0
+                    && pid != me
+                    // SAFETY: as above.
+                    && unsafe { libc::getsid(pid) } == sid
+                    && crate::procreg::read(pid).is_some_and(|r| {
+                        r.execed && r.lineage.first().is_some_and(|&(p, _)| p == me)
+                    })
+                {
+                    return err(errno::EACCES);
+                }
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setpgid(pid, pgid) });
                 if r == 0 {
@@ -1151,6 +1166,7 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
+                ioctl::TCGETA => crate::term::tcgeta(fd, arg),
                 ioctl::PROCMAP_QUERY if let Some(pid) = maps_of_fd(fd) => {
                     self.procmap_query(pid, arg)
                 }

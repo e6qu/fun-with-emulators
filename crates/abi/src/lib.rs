@@ -532,6 +532,8 @@ pub mod ioctl {
     /// (`_IOWR('f', 17, struct procmap_query)`).
     pub const PROCMAP_QUERY: u64 = 0xc068_6611;
     pub const TCGETS: u64 = 0x5401;
+    /// The old `struct termio` form of `TCGETS`.
+    pub const TCGETA: u64 = 0x5405;
     pub const TCSETS: u64 = 0x5402;
     pub const TCSETSW: u64 = 0x5403;
     pub const TCSETSF: u64 = 0x5404;

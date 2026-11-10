@@ -401,6 +401,7 @@ inotify09
 inotify10
 inotify11
 inotify12
+ioctl01
 ioctl_loop01
 ioctl_loop02
 ioctl_loop03
@@ -669,6 +670,8 @@ pipe2_02
 pipe2_04
 pipeio_1
 pipeio_2
+pipeio_3
+pipeio_4
 pipeio_5
 pipeio_6
 pipeio_7
@@ -855,6 +858,7 @@ setns01
 setns02
 setpgid01
 setpgid02
+setpgid03
 setpgrp01
 setpgrp02
 setpriority01

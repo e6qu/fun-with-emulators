@@ -25,6 +25,23 @@ pub unsafe fn tcgetattr(fd: i32, arg: u64) -> i64 {
     }
 }
 
+/// `TCGETA`: the terminal's settings as an old `struct termio` at `arg`.
+///
+/// # Safety
+/// `arg` is a guest address, checked as it is written.
+pub unsafe fn tcgeta(fd: i32, arg: u64) -> i64 {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the host validates arg.
+    unsafe {
+        crate::host::ret(libc::ioctl(fd, libc::TCGETA, arg as *mut libc::c_void) as i64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: as above.
+    unsafe {
+        imp::tcgeta(fd, arg)
+    }
+}
+
 /// `TCSETS`/`TCSETSW`/`TCSETSF` (selected by `action`): apply the guest
 /// `termios` at `arg`.
 ///
@@ -239,11 +256,38 @@ mod imp {
     }
 
     pub unsafe fn tcgetattr(fd: i32, arg: u64) -> i64 {
+        let out = match linux_termios(fd) {
+            Ok(out) => out,
+            Err(e) => return e,
+        };
+        guest!(crate::uaccess::write_from(arg, &out));
+        0
+    }
+
+    /// `TCGETA`: the old `struct termio` (16-bit flags, eight control
+    /// characters) of the terminal's settings.
+    pub unsafe fn tcgeta(fd: i32, arg: u64) -> i64 {
+        let t = match linux_termios(fd) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let mut out = [0u8; 18];
+        for i in 0..4 {
+            out[i * 2..i * 2 + 2].copy_from_slice(&t[i * 4..i * 4 + 2]);
+        }
+        // c_line, then the first eight control characters.
+        out[8..17].copy_from_slice(&t[16..25]);
+        guest!(crate::uaccess::write_from(arg, &out));
+        0
+    }
+
+    /// The terminal's settings as a Linux `termios`.
+    fn linux_termios(fd: i32) -> Result<[u8; TERMIOS_SIZE], i64> {
         // SAFETY: a zeroed termios is a valid out-parameter.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: plain host call.
         if unsafe { libc::tcgetattr(fd, &mut t) } < 0 {
-            return tty_error();
+            return Err(tty_error());
         }
         let iflag = h2l(t.c_iflag, IFLAG);
         let oflag = h2l(t.c_oflag, OFLAG);
@@ -259,8 +303,7 @@ mod imp {
         }
         // c_line (out[16]) stays 0.
         out[17..17 + NCCS].copy_from_slice(&cc);
-        guest!(crate::uaccess::write_from(arg, &out));
-        0
+        Ok(out)
     }
 
     pub unsafe fn tcsetattr(fd: i32, action: u64, arg: u64) -> i64 {
