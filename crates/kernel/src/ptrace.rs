@@ -21,7 +21,7 @@
 
 use crate::shared::{wait_word_for, wake_word};
 use fwe_abi::errno;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 pub const PTRACE_TRACEME: u64 = 0;
@@ -75,6 +75,13 @@ const NT_PRFPREG: u64 = 2;
 /// The system call's number (`x8` at a system call's stop), to read and
 /// change (-1 skips the call).
 const NT_ARM_SYSTEM_CALL: u64 = 0x404;
+/// The thread pointer.
+const NT_ARM_TLS: u64 = 0x401;
+/// The hardware breakpoint and watchpoint registers: none here (their
+/// `dbg_info` says 0 of each), so a debugger plants breakpoints in the
+/// code and watches by stepping.
+const NT_ARM_HW_BREAK: u64 = 0x402;
+const NT_ARM_HW_WATCH: u64 = 0x403;
 /// `struct user_pt_regs`: x0-x30, sp, pc, pstate.
 const PRSTATUS_SIZE: usize = 34 * 8;
 /// `struct user_fpsimd_state`: v0-v31, fpsr, fpcr, two reserved words.
@@ -92,6 +99,10 @@ const W_DATA: usize = 7;
 const W_RESULT: usize = 8;
 const W_OPTIONS: usize = 9;
 const W_EVENTMSG: usize = 10;
+/// The host process the tracee (a process, or a thread of it) is.
+const W_PROC: usize = 11;
+/// The tracee's thread pointer (`TPIDR_EL0`, `NT_ARM_TLS`).
+const W_TLS: usize = 12;
 /// Where the `siginfo`, the general registers and the FP registers are
 /// kept, in bytes.
 const SIGINFO_AT: usize = 256;
@@ -207,35 +218,82 @@ fn alive(pid: i32) -> bool {
 
 // --- the tracee ----------------------------------------------------------------
 
-/// Whether this process is traced, by whom (host pid), and with which
-/// options; whether it stops at system calls.
-static TRACED: AtomicBool = AtomicBool::new(false);
-static TRACER: AtomicI32 = AtomicI32::new(0);
-static SYSCALLS: AtomicBool = AtomicBool::new(false);
+// A thread is traced, as on Linux: each traced thread has a mailbox of its
+// own, named by its tid (the main thread's by the process's pid), and stops
+// on its own while the others go on.
+std::thread_local! {
+    /// Whether this thread is traced, by whom (host pid), and whether it
+    /// stops at system calls.
+    static TRACED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TRACER: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    static SYSCALLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// Whether this process is traced.
+/// How many of this process's threads are traced (the host catches every
+/// signal while any is), and which besides the main thread.
+static ANY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static THREADS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether this thread is traced.
 pub fn traced() -> bool {
-    TRACED.load(Ordering::Acquire)
+    TRACED.with(std::cell::Cell::get)
 }
 
-/// Whether it stops at each system call's entry and exit.
+/// Whether any thread of this process is traced.
+pub fn any_traced() -> bool {
+    ANY.load(Ordering::Acquire) > 0
+}
+
+fn tracer() -> i32 {
+    TRACER.with(std::cell::Cell::get)
+}
+
+/// This thread traced (or not any more).
+fn set_traced(on: bool) {
+    if TRACED.with(|t| t.replace(on)) != on {
+        if on {
+            ANY.fetch_add(1, Ordering::AcqRel);
+        } else {
+            ANY.fetch_sub(1, Ordering::AcqRel);
+        }
+        let id = self_id();
+        if id != me() {
+            let mut t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            t.retain(|&x| x != id);
+            if on {
+                t.push(id);
+            }
+        }
+    }
+}
+
+/// Whether this thread stops at each system call's entry and exit.
 pub fn stops_at_syscalls() -> bool {
-    traced() && SYSCALLS.load(Ordering::Acquire)
+    traced() && SYSCALLS.with(std::cell::Cell::get)
 }
 
-/// This process is traced by host process `tracer` from now on.
+/// What names this thread's mailbox: the process's host pid for its main
+/// thread, its tid for another.
+fn self_id() -> i32 {
+    let tid = crate::thread::tid();
+    if tid == 0 || tid == crate::thread::tgid() { me() } else { tid }
+}
+
+/// This thread is traced by host process `tracer` from now on.
 fn begin(tracer: i32) -> Result<(), i32> {
-    let mb = open(&mailbox_name(me()), true).ok_or(errno::ENOMEM)?;
+    let id = self_id();
+    let mb = open(&mailbox_name(id), true).ok_or(errno::ENOMEM)?;
     for w in [W_STATE, W_REQ, W_DONE, W_OPTIONS, W_EVENTMSG] {
         mb.word(w).store(0, Ordering::Release);
     }
     mb.word(W_TRACER).store(tracer as u64, Ordering::Release);
-    TRACER.store(tracer, Ordering::Release);
-    SYSCALLS.store(false, Ordering::Release);
-    TRACED.store(true, Ordering::Release);
+    mb.word(W_PROC).store(me() as u64, Ordering::Release);
+    TRACER.with(|t| t.set(tracer));
+    SYSCALLS.with(|t| t.set(false));
+    set_traced(true);
     // Its tracer looks for its stops in its inbox.
     if let Some(inbox) = open(&inbox_name(tracer), true) {
-        let pid = me() as u64;
+        let pid = id as u64;
         let slots = &inbox.0[1..];
         if !slots.iter().any(|s| s.load(Ordering::Acquire) == pid) {
             for s in slots {
@@ -256,11 +314,11 @@ pub fn traceme(parent: i32) -> Result<(), i32> {
     begin(parent)
 }
 
-/// Tracing ends (detached, or the tracer gone).
+/// This thread's tracing ends (detached, or the tracer gone).
 fn end() {
-    TRACED.store(false, Ordering::Release);
-    SYSCALLS.store(false, Ordering::Release);
-    if let Some(c) = path(&mailbox_name(me())) {
+    set_traced(false);
+    SYSCALLS.with(|t| t.set(false));
+    if let Some(c) = path(&mailbox_name(self_id())) {
         // SAFETY: a NUL-terminated path of fwe's.
         unsafe { libc::unlink(c.as_ptr()) };
     }
@@ -269,14 +327,17 @@ fn end() {
 /// In a fork child: not traced (its parent's tracer does not trace it).
 pub fn forked_child() {
     let follow = FOLLOW.swap(0, Ordering::AcqRel);
-    TRACED.store(false, Ordering::Release);
-    SYSCALLS.store(false, Ordering::Release);
+    TRACED.with(|t| t.set(false));
+    SYSCALLS.with(|t| t.set(false));
+    ANY.store(0, Ordering::Release);
+    THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // Its parent's tracer follows it (`PTRACE_O_TRACEFORK` and the like):
     // traced from the start, and stopped first by SIGSTOP, as Linux
     // starts it.
     if follow > 0 && begin(follow).is_ok() {
         // With its parent's options, as Linux gives them.
-        if let Some(mb) = open(&mailbox_name(me()), false) {
+        if let Some(mb) = open(&mailbox_name(self_id()), false) {
             mb.word(W_OPTIONS).store(FOLLOW_OPTIONS.load(Ordering::Acquire), Ordering::Release);
         }
         let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
@@ -289,12 +350,21 @@ pub fn forked_child() {
 static FOLLOW: AtomicI32 = AtomicI32::new(0);
 static FOLLOW_OPTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// The event a process clone with `flags` raises in a traced parent, if
-/// its tracer asked for it; the child is then traced too.
+/// The event a clone with `flags` raises in a traced thread, if its tracer
+/// asked for it; the new process or thread is then traced too (a thread
+/// once the backend names it, [`new_thread`]).
 pub fn fork_event(flags: u64) -> Option<i32> {
     use fwe_abi::clone as cl;
-    if !traced() || flags & cl::CLONE_THREAD != 0 {
+    if !traced() {
         return None;
+    }
+    if flags & cl::CLONE_THREAD != 0 {
+        let opts = options();
+        if opts & PTRACE_O_TRACECLONE == 0 {
+            return None;
+        }
+        NEW_THREAD.with(|n| n.set(Some((tracer(), opts))));
+        return Some(PTRACE_EVENT_CLONE);
     }
     let (event, option) = if flags & cl::CLONE_VFORK != 0 {
         (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
@@ -308,8 +378,67 @@ pub fn fork_event(flags: u64) -> Option<i32> {
         return None;
     }
     FOLLOW_OPTIONS.store(opts, Ordering::Release);
-    FOLLOW.store(TRACER.load(Ordering::Acquire), Ordering::Release);
+    FOLLOW.store(tracer(), Ordering::Release);
     Some(event)
+}
+
+std::thread_local! {
+    /// The tracer and options a thread this one is making is to be traced
+    /// with ([`fork_event`]).
+    static NEW_THREAD: std::cell::Cell<Option<(i32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// New threads to be traced as they start, by tid: their tracer and
+/// options.
+static PENDING: std::sync::Mutex<Vec<(i32, i32, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// A backend made thread `tid` for this thread's clone: traced as it
+/// starts, if its tracer follows it.
+pub fn new_thread(tid: i32) {
+    if let Some((tracer, opts)) = NEW_THREAD.with(std::cell::Cell::take) {
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push((tid, tracer, opts));
+    }
+}
+
+/// Thread `tid` starts: traced from the start if its tracer follows it,
+/// with its creator's options, and stopped first by SIGSTOP.
+pub fn thread_started(tid: i32) {
+    let found = {
+        let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let i = p.iter().position(|e| e.0 == tid);
+        i.map(|i| p.swap_remove(i))
+    };
+    let Some((_, tracer, opts)) = found else { return };
+    if begin(tracer).is_ok() {
+        if let Some(mb) = open(&mailbox_name(self_id()), false) {
+            mb.word(W_OPTIONS).store(opts, Ordering::Release);
+        }
+        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+        crate::thread::post_thread(tid, fwe_abi::signal::SIGSTOP, info);
+    }
+}
+
+/// This thread ends (the process going on): a tracer is told, as of any
+/// tracee that is not its child.
+pub fn thread_exiting() {
+    if traced() && self_id() != me() {
+        report_end(self_id(), tracer(), 0);
+        set_traced(false);
+    }
+}
+
+/// Tell `tracer` that tracee `id` ended with wait status `status`, through
+/// its mailbox, which the tracer then removes ([`take_stop`]).
+fn report_end(id: i32, tracer: i32, status: i32) {
+    let Some(mb) = open(&mailbox_name(id), false) else { return };
+    mb.word(W_STATUS).store(status as u32 as u64, Ordering::Release);
+    mb.word(W_STATE).store(EXITED, Ordering::Release);
+    if let Some(inbox) = open(&inbox_name(tracer), false) {
+        inbox.word(0).fetch_add(1, Ordering::AcqRel);
+        wake_word(inbox.word(0));
+    }
+    crate::host::kill_process(tracer, libc::SIGCHLD);
+    crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
 }
 
 /// Into a fork snapshot (the VM backend's child, a fresh process): the
@@ -329,6 +458,7 @@ pub fn load_fork(d: &mut crate::snapshot::Dec) {
 /// The fork is done (in the parent): no child is to follow any more.
 pub fn fork_done() {
     FOLLOW.store(0, Ordering::Release);
+    NEW_THREAD.with(std::cell::Cell::take);
 }
 
 std::thread_local! {
@@ -350,25 +480,29 @@ pub fn take_noted_fork() -> Option<(i32, u64, u64)> {
 
 /// As this process ends: its mailbox goes.
 pub fn exiting(status: i32) {
+    // Its other traced threads end with it: their tracers are told.
+    let others = std::mem::take(&mut *THREADS.lock().unwrap_or_else(|e| e.into_inner()));
+    for id in others {
+        if id == self_id() {
+            continue;
+        }
+        if let Some(mb) = open(&mailbox_name(id), false) {
+            let t = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
+            drop(mb);
+            report_end(id, t, status);
+        }
+    }
     if traced() {
-        let tracer = TRACER.load(Ordering::Acquire);
+        let tracer = tracer();
         // SAFETY: getppid cannot fail.
         let parent = unsafe { libc::getppid() };
-        match open(&mailbox_name(me()), false) {
-            // A tracer that is not the parent learns of the end from the
-            // mailbox, which it then removes ([`take_stop`]).
-            Some(mb) if tracer != parent && alive(tracer) => {
-                TRACED.store(false, Ordering::Release);
-                mb.word(W_STATUS).store(status as u32 as u64, Ordering::Release);
-                mb.word(W_STATE).store(EXITED, Ordering::Release);
-                if let Some(inbox) = open(&inbox_name(tracer), false) {
-                    inbox.word(0).fetch_add(1, Ordering::AcqRel);
-                    wake_word(inbox.word(0));
-                }
-                crate::host::kill_process(tracer, libc::SIGCHLD);
-                crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
-            }
-            _ => end(),
+        // A tracer that is not the parent learns of the end from the
+        // mailbox (the parent from the host's `wait`).
+        if (tracer != parent || self_id() != me()) && alive(tracer) {
+            report_end(self_id(), tracer, status);
+            set_traced(false);
+        } else {
+            end();
         }
     }
     // A tracer that ends takes the tracees that asked it to with it
@@ -396,7 +530,7 @@ pub fn exiting(status: i32) {
 
 /// What a re-executed fwe must know: the tracer (0: none).
 pub fn exec_state() -> i32 {
-    if traced() { TRACER.load(Ordering::Acquire) } else { 0 }
+    if traced() { tracer() } else { 0 }
 }
 
 /// In a re-executed fwe: traced by `tracer` again, as before `execve`.
@@ -427,23 +561,30 @@ impl Resume {
 
 /// The options the tracer set.
 pub fn options() -> u64 {
-    open(&mailbox_name(me()), false).map_or(0, |mb| mb.word(W_OPTIONS).load(Ordering::Acquire))
+    open(&mailbox_name(self_id()), false).map_or(0, |mb| mb.word(W_OPTIONS).load(Ordering::Acquire))
 }
 
 /// Stop for the tracer with wait status `status` and `siginfo` (128
 /// bytes), the registers `regs` its to read and change, until it says to
 /// go on: how. Not traced, or the tracer gone: `Cont(0)`, or the signal
 /// the stop was for.
-pub fn stop(regs: &mut crate::Regs, status: i32, siginfo: &[u8; 128], event: u64) -> Resume {
+pub fn stop(
+    regs: &mut crate::Regs,
+    tls: &mut u64,
+    status: i32,
+    siginfo: &[u8; 128],
+    event: u64,
+) -> Resume {
     let sig = ((status >> 8) & 0x7f) as u64;
     let passing = if status >> 16 == 0 && sig != libc::SIGTRAP as u64 { sig } else { 0 };
-    let Some(mb) = open(&mailbox_name(me()), false) else { return Resume::Cont(passing) };
-    let tracer = TRACER.load(Ordering::Acquire);
+    let Some(mb) = open(&mailbox_name(self_id()), false) else { return Resume::Cont(passing) };
+    let tracer = tracer();
     if !alive(tracer) {
         end();
         return Resume::Cont(passing);
     }
     put_regs(&mb, regs);
+    mb.word(W_TLS).store(*tls, Ordering::Release);
     mb.put(SIGINFO_AT, siginfo);
     mb.word(W_EVENTMSG).store(event, Ordering::Release);
     mb.word(W_STATUS).store(status as u32 as u64, Ordering::Release);
@@ -506,7 +647,8 @@ pub fn stop(regs: &mut crate::Regs, status: i32, siginfo: &[u8; 128], event: u64
         mb.word(W_RESULT).store(result as u64, Ordering::Release);
         if let Some(r) = resume {
             get_regs(&mb, regs);
-            SYSCALLS.store(matches!(r, Resume::Syscall(_)), Ordering::Release);
+            *tls = mb.word(W_TLS).load(Ordering::Acquire);
+            SYSCALLS.with(|t| t.set(matches!(r, Resume::Syscall(_))));
             mb.word(W_STATE).store(RUNNING, Ordering::Release);
             mb.word(W_DONE).store(req, Ordering::Release);
             wake_word(mb.word(W_DONE));
@@ -568,8 +710,12 @@ fn get_regs(mb: &Page, regs: &mut crate::Regs) {
 
 /// `brk #0x4c59`.
 const STEP_BRK: u32 = 0xd420_0000 | (0x4c59 << 5);
-/// Where breakpoints of a step are, and the instructions they replaced.
-static STEPS: std::sync::Mutex<Vec<(u64, [u8; 4])>> = std::sync::Mutex::new(Vec::new());
+std::thread_local! {
+    /// Where breakpoints of this thread's step are, and the instructions
+    /// they replaced.
+    static STEPS: std::cell::RefCell<Vec<(u64, [u8; 4])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Where the instruction `insn` at `pc` may go next, with registers `x`.
 pub fn next_pcs(insn: u32, pc: u64, x: &[u64; 31]) -> Vec<u64> {
@@ -606,7 +752,7 @@ pub fn next_pcs(insn: u32, pc: u64, x: &[u64; 31]) -> Vec<u64> {
 /// Plant the breakpoints of one step from `regs`: whether it could.
 fn arm_step(regs: &crate::Regs) -> bool {
     // A step left unfinished (another stop came first) is put back.
-    for (at, orig) in STEPS.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+    for (at, orig) in STEPS.with(|s| std::mem::take(&mut *s.borrow_mut())) {
         let _ = crate::procmem::write_forced(at, &orig);
     }
     let mut b = [0u8; 4];
@@ -614,7 +760,7 @@ fn arm_step(regs: &crate::Regs) -> bool {
         return false;
     }
     let insn = u32::from_le_bytes(b);
-    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut steps = Vec::new();
     for at in next_pcs(insn, regs.pc, &regs.x) {
         if steps.iter().any(|&(a, _)| a == at) {
             continue;
@@ -627,20 +773,22 @@ fn arm_step(regs: &crate::Regs) -> bool {
         }
         steps.push((at, orig));
     }
-    !steps.is_empty()
+    let planted = !steps.is_empty();
+    STEPS.with(|s| *s.borrow_mut() = steps);
+    planted
 }
 
 /// Whether a breakpoint at `pc` is a step's: if so, every one of the step
 /// is taken out.
 pub fn step_hit(pc: u64) -> bool {
-    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
-    if !steps.iter().any(|&(a, _)| a == pc) {
-        return false;
-    }
-    for (at, orig) in steps.drain(..) {
+    let steps = STEPS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.iter().any(|&(a, _)| a == pc) { std::mem::take(&mut *s) } else { Vec::new() }
+    });
+    for &(at, orig) in &steps {
         let _ = crate::procmem::write_forced(at, &orig);
     }
-    true
+    !steps.is_empty()
 }
 
 /// A word of this process's memory, as the tracer reads it (`EIO` where
@@ -665,13 +813,36 @@ pub fn stop_status(sig: u64, event: i32) -> i32 {
 
 // --- the tracer ----------------------------------------------------------------
 
-/// The tracee host process `pid`'s mailbox, if this process traces it.
+/// The host process a tracee's mailbox says it is in.
+fn proc_of(mb: &Page) -> i32 {
+    mb.word(W_PROC).load(Ordering::Acquire) as i32
+}
+
+/// Tracee `pid`'s mailbox (a process's pid, or a thread's tid), if this
+/// process traces it.
 fn tracee(pid: i32) -> Result<Page, i32> {
     let mb = open(&mailbox_name(pid), false).ok_or(errno::ESRCH)?;
-    if mb.word(W_TRACER).load(Ordering::Acquire) != me() as u64 || !alive(pid) {
+    if mb.word(W_TRACER).load(Ordering::Acquire) != me() as u64
+        || mb.word(W_STATE).load(Ordering::Acquire) == EXITED
+        || !alive(proc_of(&mb))
+    {
         return Err(errno::ESRCH);
     }
     Ok(mb)
+}
+
+/// The tracee a tracer names by `pid` (a traced thread's tid, or a process's
+/// pid as the guest names it), as its mailbox is named.
+pub fn target_of(pid: i32) -> Option<i32> {
+    if pid > 0 && open(&mailbox_name(pid), false).is_some() {
+        return Some(pid);
+    }
+    crate::pidns::to_host(pid)
+}
+
+/// The host process tracee `id` is in.
+pub fn process_of(id: i32) -> i32 {
+    open(&mailbox_name(id), false).map_or(id, |mb| proc_of(&mb))
 }
 
 /// The tracee host process `pid`'s mailbox, if this process traces it and
@@ -696,9 +867,10 @@ fn ask(mb: &Page, pid: i32, op: u64, addr: u64, data: u64) -> Result<i64, i32> {
         if done == req {
             break;
         }
-        if !alive(pid) {
+        if !alive(proc_of(mb)) {
             return Err(errno::ESRCH);
         }
+        let _ = pid;
         wait_word_for(mb.word(W_DONE), done, Duration::from_millis(100));
     }
     let r = mb.word(W_RESULT).load(Ordering::Acquire) as i64;
@@ -727,9 +899,10 @@ pub fn wait_for_stop(seen: u64, slice: Duration) {
     }
 }
 
-/// A stop of a tracee `wanted` accepts (by host pid) not yet reported:
-/// its pid and wait status, reported now unless `peek`.
-pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32)> {
+/// A stop of a tracee `wanted` accepts (by host pid, or a thread's tid)
+/// not yet reported: its id, wait status and whether it is a thread,
+/// reported now unless `peek`.
+pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, bool)> {
     let inbox = open(&inbox_name(me()), false)?;
     for slot in &inbox.0[1..] {
         let pid = slot.load(Ordering::Acquire) as i32;
@@ -745,6 +918,7 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32)>
             continue;
         }
         let state = mb.word(W_STATE).load(Ordering::Acquire);
+        let thread = proc_of(&mb) != pid;
         if state == EXITED {
             let status = mb.word(W_STATUS).load(Ordering::Acquire) as i32;
             if !peek {
@@ -755,13 +929,13 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32)>
                 }
                 let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
             }
-            return Some((pid, status));
+            return Some((pid, status, thread));
         }
         if state == STOPPED {
             if !peek {
                 mb.word(W_STATE).store(REPORTED, Ordering::Release);
             }
-            return Some((pid, mb.word(W_STATUS).load(Ordering::Acquire) as i32));
+            return Some((pid, mb.word(W_STATUS).load(Ordering::Acquire) as i32, thread));
         }
     }
     None
@@ -801,6 +975,8 @@ pub fn get_regset(pid: i32, kind: u64) -> Result<Vec<u8>, i32> {
         NT_PRSTATUS => Ok(mb.bytes(REGS_AT, PRSTATUS_SIZE)),
         NT_PRFPREG => Ok(mb.bytes(FPREGS_AT, PRFPREG_SIZE)),
         NT_ARM_SYSTEM_CALL => Ok(mb.bytes(REGS_AT + 8 * 8, 8)[..4].to_vec()),
+        NT_ARM_TLS => Ok(mb.word(W_TLS).load(Ordering::Acquire).to_le_bytes().to_vec()),
+        NT_ARM_HW_BREAK | NT_ARM_HW_WATCH => Ok(vec![0; 8]),
         _ => Err(errno::EINVAL),
     }
 }
@@ -816,6 +992,11 @@ pub fn set_regset(pid: i32, kind: u64, data: &[u8]) -> Result<(), i32> {
         NT_ARM_SYSTEM_CALL => {
             let n = i32::from_le_bytes(data.get(..4).ok_or(errno::EINVAL)?.try_into().unwrap());
             mb.put(REGS_AT + 8 * 8, &(n as i64 as u64).to_le_bytes());
+            return Ok(());
+        }
+        NT_ARM_TLS => {
+            let tp = u64::from_le_bytes(data.get(..8).ok_or(errno::EINVAL)?.try_into().unwrap());
+            mb.word(W_TLS).store(tp, Ordering::Release);
             return Ok(());
         }
         _ => return Err(errno::EINVAL),
@@ -855,6 +1036,7 @@ pub fn event_msg(pid: i32) -> Result<u64, i32> {
 
 /// Whether host process `pid` is traced by any process.
 pub fn is_traced(pid: i32) -> bool {
+    // (The process's main thread's mailbox.)
     open(&mailbox_name(pid), false)
         .is_some_and(|mb| alive(mb.word(W_TRACER).load(Ordering::Acquire) as i32))
 }
@@ -876,6 +1058,7 @@ pub fn attach(pid: i32) -> Result<(), i32> {
         mb.word(w).store(0, Ordering::Release);
     }
     mb.word(W_TRACER).store(me() as u64, Ordering::Release);
+    mb.word(W_PROC).store(pid as u64, Ordering::Release);
     let inbox = open(&inbox_name(me()), true).ok_or(errno::ENOMEM)?;
     let slots = &inbox.0[1..];
     if !slots.iter().any(|s| s.load(Ordering::Acquire) == pid as u64)
@@ -891,7 +1074,7 @@ pub fn attach(pid: i32) -> Result<(), i32> {
 /// Whether taking `sig` begins this process's tracing: a SIGSTOP a tracer
 /// sent as it attached (its mailbox names a live tracer).
 pub fn attached(sig: u64) -> bool {
-    if sig != fwe_abi::signal::SIGSTOP || traced() {
+    if sig != fwe_abi::signal::SIGSTOP || traced() || self_id() != me() {
         return false;
     }
     let Some(mb) = open(&mailbox_name(me()), false) else { return false };
@@ -899,9 +1082,10 @@ pub fn attached(sig: u64) -> bool {
     if tracer <= 0 || !alive(tracer) {
         return false;
     }
-    TRACER.store(tracer, Ordering::Release);
-    SYSCALLS.store(false, Ordering::Release);
-    TRACED.store(true, Ordering::Release);
+    mb.word(W_PROC).store(me() as u64, Ordering::Release);
+    TRACER.with(|t| t.set(tracer));
+    SYSCALLS.with(|t| t.set(false));
+    set_traced(true);
     true
 }
 
@@ -911,6 +1095,24 @@ impl<P: crate::Platform> crate::Kernel<P> {
         for sig in 1..=fwe_abi::signal::NSIG {
             self.sync_host_signal(sig);
         }
+    }
+
+    /// [`stop`], with the calling thread's thread pointer, which the tracer
+    /// may read and change.
+    fn stop_with_tls(
+        &mut self,
+        regs: &mut crate::Regs,
+        status: i32,
+        siginfo: &[u8; 128],
+        event: u64,
+    ) -> Resume {
+        let mut tls = self.platform.thread_pointer();
+        let before = tls;
+        let r = stop(regs, &mut tls, status, siginfo, event);
+        if tls != before {
+            self.platform.set_thread_pointer(tls);
+        }
+        r
     }
 
     /// A signal-delivery stop for `sig` raised with `info`: the signal to
@@ -926,7 +1128,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
             self.resync_for_tracing();
         }
         let si = crate::signal::siginfo_bytes(sig, info);
-        let r = stop(regs, stop_status(sig, 0), &si, 0);
+        let r = self.stop_with_tls(regs, stop_status(sig, 0), &si, 0);
         if !traced() {
             self.resync_for_tracing();
         }
@@ -955,7 +1157,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
         let si = crate::signal::siginfo_bytes(trap, info);
         let msg = crate::thread::tgid() as u64;
-        let r = stop(regs, stop_status(trap, event), &si, msg);
+        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg);
         if r.signal() != 0 {
             crate::thread::post_process(r.signal(), info);
         }
@@ -971,7 +1173,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         let trap = fwe_abi::signal::SIGTRAP;
         let info = crate::thread::SigInfo { code: trap as i32 | event << 8, ..Default::default() };
         let si = crate::signal::siginfo_bytes(trap, info);
-        let r = stop(regs, stop_status(trap, event), &si, msg);
+        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg);
         if r.signal() != 0 {
             let info =
                 crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
@@ -1017,7 +1219,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         let info =
             crate::thread::SigInfo { code: fwe_abi::signal::SIGTRAP as i32, ..Default::default() };
         let si = crate::signal::siginfo_bytes(fwe_abi::signal::SIGTRAP, info);
-        let r = stop(regs, stop_status(trap, 0), &si, 0);
+        let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, 0);
         if r.signal() != 0 {
             let info =
                 crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
@@ -1056,7 +1258,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
                 Err(e) => err(e),
             };
         }
-        let Some(target) = crate::pidns::to_host(pid as i32).filter(|&h| alive(h)) else {
+        let Some(target) = target_of(pid as i32).filter(|&t| alive(process_of(t))) else {
             return err(errno::ESRCH);
         };
         if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
@@ -1080,7 +1282,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
             if !traces(target) {
                 return err(errno::ESRCH);
             }
-            crate::host::kill_process(target, libc::SIGKILL);
+            crate::host::kill_process(process_of(target), libc::SIGKILL);
             return 0;
         }
         let r: Result<i64, i32> = (|| match request {
@@ -1146,7 +1348,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
 
 /// The `siginfo` this process's tracer left in its mailbox.
 fn get_own_siginfo() -> Option<[u8; 128]> {
-    let mb = open(&mailbox_name(me()), false)?;
+    let mb = open(&mailbox_name(self_id()), false)?;
     mb.bytes(SIGINFO_AT, 128).try_into().ok()
 }
 

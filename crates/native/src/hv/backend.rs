@@ -29,6 +29,22 @@ thread_local! {
 pub struct HvPlatform;
 
 impl Platform for HvPlatform {
+    fn thread_pointer(&self) -> u64 {
+        let mut v = 0;
+        if let Some(id) = VCPU.with(Cell::get) {
+            // SAFETY: reading a system register of this thread's vCPU.
+            hvf(|| unsafe { hv_vcpu_get_sys_reg(id, HV_SYS_REG_TPIDR_EL0, &mut v) });
+        }
+        v
+    }
+
+    fn set_thread_pointer(&mut self, tp: u64) {
+        if let Some(id) = VCPU.with(Cell::get) {
+            // SAFETY: writing a system register of this thread's vCPU.
+            hvf(|| unsafe { hv_vcpu_set_sys_reg(id, HV_SYS_REG_TPIDR_EL0, tp) });
+        }
+    }
+
     fn prepare_exec(
         &mut self,
         _addr: u64,
@@ -1336,6 +1352,8 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         return err(errno::EINVAL);
     }
     let tid = thread::alloc_tid();
+    // Traced from its start if the tracer follows new threads.
+    fwe_kernel::ptrace::new_thread(tid);
     if flags & cl::CLONE_PARENT_SETTID != 0 && ptid != 0 {
         let _ = uaccess::write(ptid, tid);
     }

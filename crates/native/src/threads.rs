@@ -61,6 +61,8 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     }
 
     let tid = thread::alloc_tid();
+    // Traced from its start if the tracer follows new threads.
+    fwe_kernel::ptrace::new_thread(tid);
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
         let _ = fwe_kernel::uaccess::write(parent_tid, tid);
     }

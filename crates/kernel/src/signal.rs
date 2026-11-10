@@ -299,7 +299,7 @@ fn me_host() -> i64 {
 fn owned(sig: u64) -> bool {
     // A traced process stops for each signal it takes ([`crate::ptrace`]):
     // even SIGSTOP comes to it as fwe's, not the host's.
-    crate::ptrace::traced() && sig != signal::SIGKILL
+    crate::ptrace::any_traced() && sig != signal::SIGKILL
         || matches!(
             sig,
             signal::SIGTRAP | signal::SIGSEGV | signal::SIGBUS | signal::SIGILL | signal::SIGFPE
@@ -421,7 +421,7 @@ impl<P: Platform> Kernel<P> {
             signal::default_action(sig),
             signal::Default::Terminate | signal::Default::Stop
         );
-        let traced = crate::ptrace::traced();
+        let traced = crate::ptrace::any_traced();
         let how = match action.handler {
             // A traced process stops for every signal, ignored ones too.
             _ if watched || traced => HostSignal::Catch { flags: action.flags },

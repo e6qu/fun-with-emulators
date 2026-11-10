@@ -448,6 +448,8 @@ pub fn alloc_tid() -> i32 {
 /// Record this host thread's guest thread id (called when a thread starts).
 pub fn set_tid(tid: i32) {
     TID.with(|t| t.set(tid));
+    // A thread a tracer follows begins traced.
+    crate::ptrace::thread_started(tid);
     // A new thread: its creator's timer slack, as its own and its default.
     let mut handoff = SLACK_HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = handoff.iter().position(|&(t, _)| t == tid) {

@@ -78,6 +78,18 @@ impl NativePlatform {
 }
 
 impl Platform for NativePlatform {
+    fn thread_pointer(&self) -> u64 {
+        let key = (thread_pointer_slot() / 8) as libc::pthread_key_t;
+        // SAFETY: `key` is the process-wide key fwe allocated for the slot.
+        unsafe { libc::pthread_getspecific(key) as u64 }
+    }
+
+    fn set_thread_pointer(&mut self, tp: u64) {
+        let key = (thread_pointer_slot() / 8) as libc::pthread_key_t;
+        // SAFETY: as above.
+        unsafe { libc::pthread_setspecific(key, tp as *const libc::c_void) };
+    }
+
     fn prepare_exec(
         &mut self,
         addr: u64,

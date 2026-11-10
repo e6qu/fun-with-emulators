@@ -241,6 +241,15 @@ pub trait Platform {
     /// process by other processes, the terminal or the host itself reach
     /// the guest as the guest asked.
     fn set_host_signal(&mut self, _sig: u64, _how: HostSignal) {}
+
+    /// The calling thread's guest thread pointer (`TPIDR_EL0`), for a
+    /// tracer to read (`NT_ARM_TLS`).
+    fn thread_pointer(&self) -> u64 {
+        0
+    }
+
+    /// Set the calling thread's guest thread pointer (a tracer changed it).
+    fn set_thread_pointer(&mut self, _tp: u64) {}
 }
 
 /// How the host should treat one signal on the guest's behalf.
@@ -857,6 +866,8 @@ pub fn thread_exit_cleanup() {
     if thread::tid() != thread::tgid() {
         keys::thread_exit(thread::tid());
     }
+    // A traced thread's tracer learns of its end.
+    ptrace::thread_exiting();
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {
