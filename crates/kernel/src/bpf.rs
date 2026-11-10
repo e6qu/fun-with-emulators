@@ -762,6 +762,21 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                 BPF_PROG_TYPE_CGROUP_DEVICE => load(&bytes).map(|_| Vec::new())?,
                 BPF_PROG_TYPE_SOCKET_FILTER => {
                     load_filter(&bytes)?;
+                    let insns: Vec<Insn> = bytes.chunks(8).map(Insn::decode).collect();
+                    let sizes = |fd| crate::bpfmap::of(fd).map(|m| m.value_size);
+                    if let Err(msg) = crate::bpfcheck::check(&insns, sizes) {
+                        // The verifier's log (`log_level`, `log_size`,
+                        // `log_buf`), NUL-terminated.
+                        let (level, room, buf) =
+                            (word(&a, 24), word(&a, 28) as usize, dword(&a, 32));
+                        if level != 0 && room > 0 && buf != 0 {
+                            let mut text = msg.into_bytes();
+                            text.truncate(room - 1);
+                            text.push(0);
+                            crate::uaccess::write_from(buf, &text)?;
+                        }
+                        return Err(errno::EACCES);
+                    }
                     resolve_maps(&bytes)?
                 }
                 _ => Vec::new(),

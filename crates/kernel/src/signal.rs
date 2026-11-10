@@ -194,6 +194,12 @@ fn route_io_signal() {
         return;
     }
     let Some(info) = thread::take_pending(signal::SIGIO) else { return };
+    // Another process's dnotify event on a watch of this one's: the
+    // descriptor's signal ([`crate::dnotify`]).
+    if info.code == crate::dnotify::POLL_MSG && info.poll.is_none() {
+        crate::dnotify::post(info.value as u32 as i32);
+        return;
+    }
     // Only the host's own: another process's (a lease break's) names it.
     if info.code != signal::SI_KERNEL || info.pid != 0 {
         thread::post_process(signal::SIGIO, info);
@@ -790,6 +796,16 @@ impl<P: Platform> Kernel<P> {
             && target > 0
             && !to_self
             && crate::ptrace::is_traced(target as i32)
+        {
+            return send_unhosted(target as i32, sig, signal::SI_USER, 0);
+        }
+        // SIGTRAP to another of fwe's processes goes through its mailbox:
+        // the host would merge it with the trap of that process's next
+        // system call (fwe's `brk`, a SIGTRAP too), and it would be lost.
+        if sig == signal::SIGTRAP
+            && target > 0
+            && !to_self
+            && crate::procreg::read(target as i32).is_some()
         {
             return send_unhosted(target as i32, sig, signal::SI_USER, 0);
         }

@@ -1,7 +1,8 @@
 //! Small system calls with little state of their own: `getcpu`,
 //! `vhangup`, `readahead`, `sync_file_range`, `delete_module`, `syslog`,
-//! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, each checked
-//! as Linux checks its arguments.
+//! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, and the LSM
+//! calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`),
+//! each checked as Linux checks its arguments.
 
 use crate::{Kernel, Platform, guest, thread, uaccess};
 use fwe_abi::{err, errno, signal as sig};
@@ -11,6 +12,17 @@ use std::sync::atomic::Ordering::SeqCst;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 1;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
 const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 4;
+
+/// The security modules fwe has: Linux's capabilities alone
+/// (`LSM_ID_CAPABILITY`), which keep no attributes of a process.
+const LSM_IDS: [u64; 1] = [100];
+
+/// `struct lsm_ctx`'s header: `id`, `flags`, `len` and `ctx_len`.
+const LSM_CTX_HEADER: u64 = 32;
+
+/// The I/O priority `ioprio_set` gave this process ((none, 0) until one
+/// is set, as Linux reports a task with none).
+static IOPRIO: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// `membarrier`'s commands.
 const MEMBARRIER_CMD_QUERY: u64 = 0;
@@ -209,6 +221,172 @@ impl<P: Platform> Kernel<P> {
     /// `membarrier(cmd, flags, cpu_id)`: a barrier across the process's
     /// threads (or every process: no other runs code of this process's,
     /// so the same), the private ones only once registered for.
+    /// `lsm_list_modules(ids, size, flags)`: the security modules' ids.
+    pub(crate) fn sys_lsm_list_modules(&mut self, ids: u64, size: u64, flags: u64) -> i64 {
+        if flags != 0 {
+            return err(errno::EINVAL);
+        }
+        let given: u32 = guest!(uaccess::read(size));
+        let total = (LSM_IDS.len() * 8) as u32;
+        guest!(uaccess::write(size, total));
+        if given < total {
+            return err(errno::E2BIG);
+        }
+        for (i, id) in LSM_IDS.iter().enumerate() {
+            guest!(uaccess::write(ids + 8 * i as u64, *id));
+        }
+        LSM_IDS.len() as i64
+    }
+
+    /// `lsm_get_self_attr(attr, ctx, size, flags)`: no module keeps
+    /// attributes of a process (`EOPNOTSUPP`).
+    pub(crate) fn sys_lsm_get_self_attr(&mut self, attr: u64, size: u64, flags: u64) -> i64 {
+        const LSM_FLAG_SINGLE: u64 = 1;
+        if attr == 0 || flags & !LSM_FLAG_SINGLE != 0 {
+            return err(errno::EINVAL);
+        }
+        let _: u32 = guest!(uaccess::read(size));
+        err(errno::EOPNOTSUPP)
+    }
+
+    /// `lsm_set_self_attr(attr, ctx, size, flags)`: the context checked
+    /// as Linux checks it, then `EOPNOTSUPP`, as no module takes one.
+    pub(crate) fn sys_lsm_set_self_attr(&mut self, ctx: u64, size: u64, flags: u64) -> i64 {
+        if flags != 0 || size < LSM_CTX_HEADER {
+            return err(errno::EINVAL);
+        }
+        if size > 4096 {
+            return err(errno::E2BIG);
+        }
+        let b = guest!(uaccess::read_bytes(ctx, size as usize));
+        let word = |at: usize| u64::from_ne_bytes(b[at..at + 8].try_into().unwrap());
+        let (len, ctx_len) = (word(16), word(24));
+        if size < len || size < ctx_len + LSM_CTX_HEADER || len < ctx_len + LSM_CTX_HEADER {
+            return err(errno::EINVAL);
+        }
+        err(errno::EOPNOTSUPP)
+    }
+
+    /// The process `ioprio_get`/`ioprio_set` name: this one (`Ok(true)`),
+    /// another (`Ok(false)`), or none (`ESRCH`), and `EINVAL` for an
+    /// unknown `which`.
+    fn ioprio_target(&self, which: u64, who: u64) -> Result<bool, i32> {
+        const IOPRIO_WHO_PROCESS: u64 = 1;
+        const IOPRIO_WHO_PGRP: u64 = 2;
+        const IOPRIO_WHO_USER: u64 = 3;
+        let who = who as i32;
+        match which {
+            IOPRIO_WHO_PROCESS => {
+                if who == 0 || who == thread::tgid() || thread::host_thread(who).is_some() {
+                    return Ok(true);
+                }
+                match crate::pidns::to_host(who) {
+                    Some(h) if crate::host::process_exists(h) => Ok(false),
+                    _ => Err(errno::ESRCH),
+                }
+            }
+            IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => Ok(who == 0),
+            _ => Err(errno::EINVAL),
+        }
+    }
+
+    /// `ioprio_get(which, who)`: the I/O priority this process set, (none,
+    /// 0) for another, which fwe keeps none of.
+    pub(crate) fn sys_ioprio_get(&mut self, which: u64, who: u64) -> i64 {
+        match self.ioprio_target(which, who) {
+            Ok(true) => IOPRIO.load(SeqCst),
+            Ok(false) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `ioprio_set(which, who, ioprio)`: checked as Linux checks it; the
+    /// host has no I/O priorities to apply it to.
+    pub(crate) fn sys_ioprio_set(&mut self, which: u64, who: u64, prio: u64) -> i64 {
+        const CLASS_NONE: u64 = 0;
+        const CLASS_RT: u64 = 1;
+        const CLASS_BE: u64 = 2;
+        const CLASS_IDLE: u64 = 3;
+        let prio = prio as u16 as u64;
+        let (class, level) = (prio >> 13, prio & 7);
+        let high = prio & 0x1ff8;
+        match class {
+            CLASS_RT if !self.creds.has(crate::caps::CAP_SYS_NICE) && !self.creds.has_admin() => {
+                return err(errno::EPERM);
+            }
+            CLASS_RT | CLASS_BE if high != 0 => return err(errno::EINVAL),
+            CLASS_NONE if prio != 0 => return err(errno::EINVAL),
+            CLASS_RT | CLASS_BE | CLASS_IDLE | CLASS_NONE => {}
+            _ => return err(errno::EINVAL),
+        }
+        let _ = level;
+        match self.ioprio_target(which, who) {
+            Ok(true) => {
+                IOPRIO.store(prio as i64, SeqCst);
+                0
+            }
+            Ok(false) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// `cachestat(fd, range, cstat, flags)`: how many of a file's pages in
+    /// `range` the host has in memory (`mincore` of a mapping of them);
+    /// none for any other kind of file.
+    pub(crate) fn sys_cachestat(&mut self, fd: u64, range: u64, out: u64, flags: u64) -> i64 {
+        let fd = fd as i32;
+        if !crate::fdtable::guest_visible(fd)
+            || crate::fdmarks::marked(fd) == Some(crate::fdmarks::Mark::Path)
+            // SAFETY: plain host call.
+            || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0
+        {
+            return err(errno::EBADF);
+        }
+        let r: [u64; 2] = guest!(uaccess::read(range));
+        if flags != 0 {
+            return err(errno::EINVAL);
+        }
+        let page = self.page_size;
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { libc::fstat(fd, &mut st) };
+        let mut cached = 0u64;
+        // fwe's `/proc` and `/sys` files are its own, of no page cache.
+        let own = crate::fdmarks::origin(fd).is_some_and(|o| {
+            matches!(o.fstype, crate::mounts::FsType::Proc | crate::mounts::FsType::Sysfs)
+        });
+        if !own && st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size > 0 {
+            let size = st.st_size as u64;
+            let first = r[0] / page * page;
+            let end = if r[1] == 0 { size } else { r[0].saturating_add(r[1]).min(size) };
+            if end > first {
+                let len = (end - first) as usize;
+                // SAFETY: a fresh read-only shared mapping of the file,
+                // unmapped below; `mincore` fills one byte a page.
+                unsafe {
+                    let m = libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        fd,
+                        first as libc::off_t,
+                    );
+                    if m != libc::MAP_FAILED {
+                        let mut vec = vec![0u8; len.div_ceil(page as usize)];
+                        if libc::mincore(m, len, vec.as_mut_ptr().cast()) == 0 {
+                            cached = vec.iter().filter(|&&b| b & 1 != 0).count() as u64;
+                        }
+                        libc::munmap(m, len);
+                    }
+                }
+            }
+        }
+        guest!(uaccess::write(out, [cached, 0u64, 0, 0, 0]));
+        0
+    }
+
     pub(crate) fn sys_membarrier(&mut self, cmd: u64, flags: u64) -> i64 {
         if flags != 0 {
             return err(errno::EINVAL);
@@ -304,7 +482,10 @@ impl<P: Platform> Kernel<P> {
             // Another process's other thread: the host signals processes.
             return err(errno::ESRCH);
         }
-        let Some(h) = crate::host::signal_to_host(s) else {
+        // One the host lacks, or SIGTRAP (which the host would merge with
+        // the target's next system-call trap): through the mailbox.
+        let h = crate::host::signal_to_host(s).filter(|_| s != fwe_abi::signal::SIGTRAP);
+        let Some(h) = h else {
             return crate::signal::send_unhosted(host, s, code, value);
         };
         crate::signote::note_with(host, h, code, value);

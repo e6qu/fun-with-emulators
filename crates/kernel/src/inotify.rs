@@ -263,6 +263,10 @@ fn queue_words(path: &[u8]) -> Option<&'static [AtomicU64; 3]> {
 
 /// Remove instance `path`'s files.
 fn remove_files(path: &[u8]) {
+    // A dnotify watch has no files.
+    if crate::dnotify::is_dnotify(path) {
+        return;
+    }
     for p in [path.to_vec(), [path, b".q"].concat()] {
         if let Ok(c) = std::ffi::CString::new(p) {
             // SAFETY: a NUL-terminated path in fwe's private directory.
@@ -290,6 +294,11 @@ fn event(wd: i32, mask: u32, cookie: u32, name: &[u8]) -> Vec<u8> {
 /// then saying so (`IN_Q_OVERFLOW`, once until it is read). Whether the
 /// instance is still there (its socket gone: its process ended).
 fn send(inst: &[u8], ev: &[u8], max: i64) -> bool {
+    // A dnotify watch's event is a signal to its owner.
+    if crate::dnotify::is_dnotify(inst) {
+        let mask = ev.get(4..8).map_or(0, |m| u32::from_ne_bytes(m.try_into().unwrap()));
+        return crate::dnotify::deliver(inst, mask);
+    }
     let Some(q) = queue_words(inst) else { return false };
     let h = crate::shared::hash(ev) | 1;
     if q[0].load(Ordering::SeqCst) > 0 && q[2].load(Ordering::SeqCst) == h {
@@ -394,7 +403,8 @@ const CHILD_EVENTS: u32 = IN_ACCESS
     | IN_MOVED_FROM
     | IN_MOVED_TO
     | IN_CREATE
-    | IN_DELETE;
+    | IN_DELETE
+    | crate::dnotify::IN_DN_RENAME;
 
 #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
 fn identity(st: &libc::stat) -> (u64, u64, bool, u64) {
@@ -590,7 +600,8 @@ pub fn raise(s: &Subject, mask: u32, cookie: u32) {
         }
     }
     // What only a directory hears of an entry, not the file itself.
-    const ENTRY_ONLY: u32 = IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO;
+    const ENTRY_ONLY: u32 =
+        IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | crate::dnotify::IN_DN_RENAME;
     for w in reg.watches.iter().filter(|w| w.dev == s.dev && w.ino == s.ino) {
         if mask & ENTRY_ONLY != 0 || w.mask & mask == 0 || spent.contains(&(w.inst.clone(), w.wd)) {
             continue;
@@ -1068,6 +1079,10 @@ impl<P: Platform> Kernel<P> {
                 let moves = |s: &Subject, to: Option<(u64, u64)>, to_name: Vec<u8>| {
                     let c = cookie();
                     raise(s, IN_MOVED_FROM, c);
+                    // Within one directory: a rename to dnotify.
+                    if s.parent == to {
+                        raise(s, crate::dnotify::IN_DN_RENAME, 0);
+                    }
                     raise(&Subject { parent: to, name: to_name, ..s.clone() }, IN_MOVED_TO, c);
                     raise(&Subject { parent: None, ..s.clone() }, IN_MOVE_SELF, 0);
                 };

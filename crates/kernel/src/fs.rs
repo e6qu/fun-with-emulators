@@ -1819,6 +1819,17 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             let here = match overlay_here(&table, &root_ns, dirfd)? {
                 Some(here) => here,
                 None => {
+                    // A path relative to something that is not a directory
+                    // names nothing (`ENOTDIR`).
+                    // SAFETY: an all-zero `stat` is a valid out-parameter.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: plain host call with a valid out-parameter.
+                    if unsafe { libc::fstat(dirfd, &mut st) } != 0 {
+                        return Err(errno::EBADF);
+                    }
+                    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                        return Err(errno::ENOTDIR);
+                    }
                     let ns = fd_path(dirfd)
                         .and_then(|h| host_to_ns(&table, &h))
                         .filter(|ns| mounts::under(ns, &root_ns).is_some());

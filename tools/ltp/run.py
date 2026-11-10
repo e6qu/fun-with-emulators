@@ -15,8 +15,9 @@ one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
 `--update` rewrites it from the run. The pass rate is printed either way.
-The tests in exceptions.txt, which fail on Linux too, are not run, and do not
-count as applicable.
+The tests in exceptions.txt, which fail or skip on Linux too or test what is
+not planned, are not run, and do not count as applicable; a test that skips
+and is not among them is named (what fwe still lacks).
 """
 
 import argparse
@@ -374,6 +375,9 @@ def main():
     newly = sorted(n for n, o in results.items() if o == "pass" and n not in set(baseline))
     if newly:
         print(f"passing, not in the baseline ({len(newly)}): " + " ".join(newly))
+    skipped = sorted(n for n, o in results.items() if o == "conf")
+    if skipped:
+        print(f"skipped, not in the exceptions ({len(skipped)}): " + " ".join(skipped))
     if regressed:
         # Once more, alone: a test timed against a loaded machine may have
         # missed its moment. One that passes so is named, not failed.

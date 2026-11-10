@@ -317,6 +317,15 @@ pub mod fcntl {
     pub const F_GETOWN: u64 = 9;
     pub const F_SETSIG: u64 = 10;
     pub const F_GETSIG: u64 = 11;
+    /// dnotify: `F_NOTIFY` and the events it asks for.
+    pub const F_NOTIFY: u64 = 1026;
+    pub const DN_ACCESS: u64 = 0x1;
+    pub const DN_MODIFY: u64 = 0x2;
+    pub const DN_CREATE: u64 = 0x4;
+    pub const DN_DELETE: u64 = 0x8;
+    pub const DN_RENAME: u64 = 0x10;
+    pub const DN_ATTRIB: u64 = 0x20;
+    pub const DN_MULTISHOT: u64 = 0x8000_0000;
     pub const F_SETOWN_EX: u64 = 15;
     pub const F_GETOWN_EX: u64 = 16;
     pub const F_SETLEASE: u64 = 1024;

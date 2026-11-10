@@ -2378,6 +2378,13 @@ fn signalfd_gets_signal_landing_on_futex_waiter() {
     assert_eq!(signals("signalfd-join"), "reader got 128 bytes for signal 10\n");
 }
 
+/// A SIGTRAP from another process reaches one busy making system calls,
+/// whose own traps are SIGTRAPs too (which the host would merge it with).
+#[test]
+fn sigtrap_from_another_process_is_not_lost() {
+    assert_eq!(signals("trap-from-other"), "SIGTRAP from another process: lost 0 of 100\n");
+}
+
 /// `ppoll` waits under the mask it is given, so a signal blocked outside it
 /// interrupts it and runs the handler.
 #[test]
@@ -3014,6 +3021,38 @@ fn newer_calls() {
 fn hv_newer_calls() {
     let Some(out) = fwe_hv(&rust_low_guest("calls2"), &[]) else { return };
     assert_eq!(stdout(&out), CALLS2, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `calls3` guest prints.
+const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, same true\n\
+    aio poll: before 0, after 1 with data 3 res 1, eventfd 1\n\
+    aio destroy: 0, again refused true\n\
+    acct: on 0, off 0, record true, version 3, exit status 0x300, forked true\n\
+    dnotify: 2 signals, parent's true, inner's true\n\
+    real-time queue: [1, 2, 3]\n\
+    file attributes: set 0, get 0, no-dump true\n\
+    lsm: 1 module, id 100, size 8\n\
+    sync: 0, syncfs 0, file/ ENOTDIR\n\
+    msg_next_id: id true, then -1\n";
+
+/// More calls: native AIO (a poll that waits, an eventfd signalled),
+/// process accounting, dnotify, queued real-time signals, file attributes,
+/// the security modules, `sync`, a trailing slash on a file and
+/// `kernel.msg_next_id`.
+#[test]
+fn more_calls() {
+    let out = fwe(&rust_guest("calls3"), &[]);
+    assert_eq!(stdout(&out), CALLS3, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The same in the VM (see [`more_calls`]): AIO's buffers and the ring
+/// through the guest's translated memory.
+#[test]
+fn hv_more_calls() {
+    let Some(out) = fwe_hv(&rust_low_guest("calls3"), &[]) else { return };
+    assert_eq!(stdout(&out), CALLS3, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

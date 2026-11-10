@@ -78,8 +78,12 @@ CONFIG_EPOLL=y
 CONFIG_SIGNALFD=y
 CONFIG_TIMERFD=y
 CONFIG_EVENTFD=y
+CONFIG_AIO=y
+CONFIG_DNOTIFY=y
+CONFIG_INOTIFY_USER=y
 CONFIG_SHMEM=y
 CONFIG_TMPFS=y
+CONFIG_TMPFS_XATTR=y
 CONFIG_BLOCK=y
 CONFIG_BLK_DEV=y
 CONFIG_BLK_DEV_LOOP=y
@@ -89,12 +93,18 @@ CONFIG_UNIX98_PTYS=y
 CONFIG_NAMESPACES=y
 CONFIG_UTS_NS=y
 CONFIG_IPC_NS=y
+CONFIG_SYSVIPC=y
+CONFIG_CHECKPOINT_RESTORE=y
+CONFIG_BSD_PROCESS_ACCT=y
+CONFIG_BSD_PROCESS_ACCT_V3=y
 CONFIG_USER_NS=y
 CONFIG_PID_NS=y
 CONFIG_NET_NS=y
 CONFIG_CGROUPS=y
 CONFIG_CGROUP_BPF=y
 CONFIG_CGROUP_DEVICE=y
+CONFIG_SECURITY=y
+CONFIG_SECURITYFS=y
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 CONFIG_BPF=y
@@ -264,7 +274,19 @@ const DIRS: &[DirDef] = &[
         ],
     ),
     (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
-    (b"/sys", &[(b"devices", DT_DIR), (b"fs", DT_DIR), (b"block", DT_DIR), (b"dev", DT_DIR)]),
+    (
+        b"/sys",
+        &[
+            (b"devices", DT_DIR),
+            (b"fs", DT_DIR),
+            (b"block", DT_DIR),
+            (b"dev", DT_DIR),
+            (b"kernel", DT_DIR),
+        ],
+    ),
+    (b"/sys/kernel", &[(b"security", DT_DIR)]),
+    // securityfs: the security modules, Linux's capabilities alone.
+    (b"/sys/kernel/security", &[(b"lsm", DT_REG)]),
     // Where the cgroup hierarchy is mounted.
     (b"/sys/fs", &[(b"cgroup", DT_DIR)]),
     (b"/sys/fs/cgroup", &[]),
@@ -375,6 +397,8 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/sys/fs/pipe-max-size" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),
         b"/proc/sys/vm/mmap_min_addr" => Entry::File(b"65536\n".to_vec()),
+        // No newline, as Linux writes it.
+        b"/sys/kernel/security/lsm" => Entry::File(b"capability".to_vec()),
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {
             Entry::File(cpu_range(info.ncpu))
         }
