@@ -10,8 +10,8 @@ makes it, of Alpine's minirootfs). Each entry of LTP's runtest/syscalls runs as 
 <args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
 own per-test timeout and a hard limit above that (twice it for the slow
 ones, which start first; a minute for one not in the baseline); `--jobs`
-run at once, but those that change a machine-wide setting (see SERIAL) run
-one at a time, after the rest. A test passes when it exits 0; LTP's exit status
+run at once, but those that change a machine-wide setting or measure time
+(see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
 `--update` rewrites it from the run. The pass rate is printed either way.
@@ -194,10 +194,11 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         # (LTP's default is ext2).
         "LTP_DEV_FS_TYPE": "tmpfs",
         # A fork under fwe takes milliseconds, not Linux's tenth of one: a
-        # test that forks thousands of times (fork14) is given eight times
-        # LTP's time. One that runs for a set time instead (fork13's ten
-        # minutes) runs a tenth of it: the same checks, fewer rounds.
-        "LTP_TIMEOUT_MUL": "8",
+        # test is given eight times LTP's time, a slow one (fork14's
+        # thousands of forks) sixteen, as its hard limit is doubled. One
+        # that runs for a set time instead (fork13's ten minutes) runs a
+        # tenth of it: the same checks, fewer rounds.
+        "LTP_TIMEOUT_MUL": "16" if SLOW.match(name) else "8",
         "LTP_RUNTIME_MUL": "0.1",
         "HOME": guest_tmp,
         "LANG": "C",
@@ -259,12 +260,19 @@ def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             time.sleep(1)
 
 
-# Tests that change a machine-wide setting (a sysctl: fork13 lowers
-# kernel.pid_max, which getpid01 checks pids against) and put it back as
-# they end: run one at a time, after the rest, so that none of them takes
-# another's change for the setting to restore, nor runs while another's is
-# in force.
-SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13)(_64)?$")
+# Tests run one at a time, after the rest: those that change a
+# machine-wide setting (a sysctl: fork13 lowers kernel.pid_max, which
+# getpid01 checks pids against) and put it back as they end, so that none
+# takes another's change for the setting to restore, nor runs while
+# another's is in force; and those that measure time (how late a sleep or a
+# timeout ends, timer slack) or need the host's processors (fork14's 16384
+# forks of a process with as many mappings, quadratic on the host), which a
+# loaded machine makes miss.
+SERIAL = re.compile(
+    r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13"
+    r"|fork14|prctl09|select02|poll02|pselect01|epoll_pwait03|epoll_wait02"
+    r"|clock_gettime04|clock_nanosleep02|nanosleep01|futex_wait05|pipe15)(_64)?$"
+)
 
 
 def main():
@@ -334,6 +342,10 @@ def main():
         # them rather than leaving them to run on alone at the end.
         parallel.sort(key=lambda t: not SLOW.match(t[0]))
         serial = [(n, a) for n, a in tests if SERIAL.match(n)]
+        # The slow ones last: what they leave the host to do as they end
+        # (fork14's thousands of large address spaces torn down) would
+        # disturb the timing of the next.
+        serial.sort(key=lambda t: bool(SLOW.match(t[0])))
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, limit(n)) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
