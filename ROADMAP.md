@@ -105,11 +105,9 @@ hardware.
   attached to (stops, registers, memory, breakpoints, single-stepping,
   fork, clone and exit events, the thread pointer); left is `strace` and
   `gdb` themselves tracing and debugging a guest program.
-- [ ] **The last LTP failures and skips:** `fork14`, `prctl09` and
-  `select02` pass alone but not always under a full run's load; and the
-  calls the remaining skips need: userfaultfd (with `mremap`'s
-  `MREMAP_DONTUNMAP` of one). The runner names every skip that is not an
-  exception.
+- [ ] **The last LTP failures:** `fork14`, `prctl09` and `select02` pass
+  alone but not always under a full run's load. Every skip is an
+  exception with its reason; the runner names any that is not.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries without section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
@@ -185,6 +183,10 @@ programs that probe for them fall back.
 - **The page cache's figures** (`/proc/meminfo`'s `Cached`,
   `/proc/<pid>/io`): the host's cache does not report them per process.
 - **perf events:** `perf_event_open` fails with `ENOSYS`.
+- **userfaultfd:** a page fault handed to another thread to resolve would
+  have fwe block the faulting thread in its signal handler, natively and
+  in the VM; few programs use it (CRIU, QEMU's post-copy migration).
+  `userfaultfd` fails with `ENOSYS`, and there is no `/dev/userfaultfd`.
 - **Setting the initial UTS namespace's names:** they are the Mac's; a new
   UTS namespace's are the guest's to set.
 - **CPU affinity:** macOS has none; `sched_setaffinity` is accepted and pins
