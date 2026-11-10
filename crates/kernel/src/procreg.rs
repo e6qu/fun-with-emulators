@@ -1068,6 +1068,21 @@ pub fn take_ended(e: &Ended) -> bool {
     ended_path(e.pid, e.start).is_some_and(|p| std::fs::remove_file(OsStr::from_bytes(&p)).is_ok())
 }
 
+/// Reap ended process `e`, adopted: take the account of how it ended, and
+/// its record with it, under the record's lock, so that no one finding it
+/// gone ([`gone`]) takes it for one killed outright and records a second
+/// end. Whoever takes the account reaps the process.
+pub fn take_adopted_end(e: &Ended) -> bool {
+    let _lock = lock(e.pid);
+    if !take_ended(e) {
+        return false;
+    }
+    if read_any(e.pid).is_some_and(|r| r.start == e.start) && !alive((e.pid, e.start)) {
+        remove(e.pid);
+    }
+    true
+}
+
 /// Child `pid` was reaped by its parent: forget it, and how it ended.
 pub fn reaped(pid: i32) {
     forget_end(pid);
