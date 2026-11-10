@@ -531,7 +531,13 @@ shapes differently:
   `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` passing them. The checks
   outside the kernel lock (the path walk, a connect to a Unix socket's
   node) use the credentials published after each system call
-  (`creds::access`). Without a root filesystem the host's own files and
+  (`creds::access`). With `fs.protected_symlinks` on, a link in a sticky
+  directory anyone may write to is followed only by its owner or where the
+  directory's owner owns it (`EACCES`); with `fs.protected_hardlinks` on,
+  a file is linked to only by its owner (or `CAP_FOWNER`) or by one who
+  may read and write it, a regular file not set-ID (`EPERM`). Both are
+  off by default, as in Linux's kernel, and read again only when a sysctl
+  changes. Without a root filesystem the host's own files and
   directories (root's, no owner kept) are left to the host's checks.
   fwe's own umask on the host is 0: the guest's umask is applied by fwe,
   and its files are made with the modes it asked for.
@@ -632,7 +638,8 @@ shapes differently:
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
   overflowuid,overflowgid,threads-max,tainted}`,
   `kernel/random/{entropy_avail,poolsize}`, `fs/{nr_open,file-max,
-  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
+  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time,
+  protected_symlinks,protected_hardlinks}`, `fs/inotify/*`, `fs/mqueue/*`,
   `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
   `kernel/keys/*`, the IPC limits and a network namespace's sysctls
   (`crates/kernel/src/sysctl.rs`). `fs.nr_open` bounds `RLIMIT_NOFILE` and

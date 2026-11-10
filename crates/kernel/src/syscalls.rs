@@ -575,7 +575,7 @@ impl<P: Platform> Kernel<P> {
                 let pid = a[0] as i32;
                 if pid != 0 && pid != thread::tid() {
                     return err(
-                        if crate::pidns::to_host(pid).is_some()
+                        if crate::pidns::to_host(pid).is_some_and(host::process_exists)
                             || thread::host_thread(pid).is_some()
                         {
                             errno::EPERM

@@ -1671,9 +1671,29 @@ pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
     })
 }
 
-/// Resolve `path` relative to `dirfd` in the view `v`: the work of
-/// [`Fs::resolve`], also done for the socket calls that run without the
-/// kernel lock ([`resolve_host`]).
+/// Whether a caller of file-system user `fsuid` may follow the symbolic
+/// link `name` in directory `dir`, with `fs.protected_symlinks` on: one in
+/// a sticky directory anyone may write to only if it is the caller's, or
+/// the directory's owner's (`EACCES`).
+fn may_follow(dir: i32, name: &std::ffi::CStr, fsuid: u32) -> Result<(), i32> {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Ok(());
+    }
+    let owner = crate::owners::of_at(dir, name, &st).0;
+    if owner == fsuid {
+        return Ok(());
+    }
+    let Some(parent) = guest_stat(dir) else { return Ok(()) };
+    let open = (libc::S_ISVTX | libc::S_IWOTH) as libc::mode_t;
+    if parent.st_mode & open != open || parent.st_uid == owner {
+        return Ok(());
+    }
+    Err(errno::EACCES)
+}
+
 /// The guest's metadata of the file open as `fd`: its kept mode and
 /// owner ([`crate::modes`], [`crate::owners`]).
 fn guest_stat(fd: i32) -> Option<libc::stat> {
@@ -1706,6 +1726,9 @@ pub(crate) fn guest_stat_at(dir: i32, name: &std::ffi::CStr) -> Option<libc::sta
     st
 }
 
+/// Resolve `path` relative to `dirfd` in the view `v`: the work of
+/// [`Fs::resolve`], also done for the socket calls that run without the
+/// kernel lock ([`resolve_host`]).
 fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
     let table = v.ns.table();
     let absolute = if path.first() == Some(&b'/') {
@@ -2090,6 +2113,9 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 symlinks += 1;
                 if symlinks > MAX_SYMLINKS {
                     return Err(errno::ELOOP);
+                }
+                if here.ovl.is_none() && crate::sysctl::protected_links().0 {
+                    may_follow(here.dir.as_raw_fd(), &comp_c, access.fsuid)?;
                 }
                 // A mount whose links are not followed.
                 let nofollow = here

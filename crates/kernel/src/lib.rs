@@ -599,7 +599,12 @@ impl<P: Platform> Kernel<P> {
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
         {
-            if st.st_mode & libc::S_IFMT != libc::S_IFREG || !self.permits(&st, 1) {
+            // Not a regular file, not to be run by the caller, or on a
+            // `noexec` mount, before any writer is looked for.
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG
+                || !self.permits(&st, 1)
+                || r.mount_flags & mounts::ms::NOEXEC != 0
+            {
                 return Err(errno::EACCES);
             }
             // Not a file open for writing.

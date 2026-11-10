@@ -1898,6 +1898,11 @@ impl<P: Platform> Kernel<P> {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
         }
+        if crate::sysctl::protected_links().1
+            && let Err(e) = self.may_hardlink(&old)
+        {
+            return err(e);
+        }
         let (mut old, mut new) = (old, new);
         if let Err(e) = old.prepare(Change::Modify) {
             return err(e);
@@ -1917,6 +1922,25 @@ impl<P: Platform> Kernel<P> {
             Err(e) if made == 0 => err(e),
             _ => made,
         }
+    }
+
+    /// Whether the caller may link to the file `old` names, with
+    /// `fs.protected_hardlinks` on: its owner (or `CAP_FOWNER`), or one who
+    /// may read and write it, a regular file that is not set-user-ID or
+    /// set-group-ID and executable by its group (`EPERM`).
+    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+    fn may_hardlink(&self, old: &crate::fs::Resolved) -> Result<(), i32> {
+        let name = old.name_c()?;
+        let st = stat_at(old.dir.as_raw_fd(), &name)?;
+        let c = &self.creds;
+        if c.fsuid == st.st_uid || c.has(crate::caps::CAP_FOWNER) {
+            return Ok(());
+        }
+        let mode = st.st_mode as u32;
+        let safe = mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+            && mode & 0o4000 == 0
+            && mode & 0o2010 != 0o2010;
+        if safe && self.permits(&st, 6) { Ok(()) } else { Err(errno::EPERM) }
     }
 
     pub(crate) fn sys_renameat2(
