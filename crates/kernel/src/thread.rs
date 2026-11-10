@@ -361,6 +361,7 @@ pub fn forked() {
     PROCESS.clear();
     with_own(Pending::clear);
     crate::acct::forked_child();
+    crate::aio::forget_all();
     // A new process starts with no robust list, as Linux's does.
     ROBUST_LIST.with(|c| c.set((0, 0)));
 }

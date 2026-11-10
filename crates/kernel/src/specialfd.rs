@@ -92,6 +92,21 @@ pub unsafe fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
     }
 }
 
+/// Add 1 to eventfd `fd`'s count, as the kernel signals one (an AIO
+/// completion's `IOCB_FLAG_RESFD`): whether `fd` is an eventfd.
+pub fn eventfd_signal(fd: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let one = 1u64;
+        // SAFETY: an 8-byte buffer on the stack.
+        unsafe { libc::write(fd, (&one as *const u64).cast(), 8) == 8 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        imp::add_to(fd, 1) >= 0
+    }
+}
+
 /// Handle `close` for an emulated descriptor. `Some(result)` if `fd` was ours
 /// (its host resources are released); `None` otherwise.
 pub fn try_close(fd: i32) -> Option<i64> {
@@ -831,7 +846,12 @@ mod imp {
         if add == u64::MAX {
             return Some(err(errno::EINVAL));
         }
-        Some(with_reg(|m| {
+        Some(add_to(fd, add))
+    }
+
+    /// Add `add` to eventfd `fd`'s count: 8, or `EAGAIN` past its maximum.
+    pub fn add_to(fd: i32, add: u64) -> i64 {
+        with_reg(|m| {
             let Some(Special::Event(e)) = m.get_mut(&fd) else {
                 return err(errno::EBADF);
             };
@@ -850,7 +870,7 @@ mod imp {
                 }
                 8
             })
-        }))
+        })
     }
 
     pub fn close(fd: i32) -> Option<i64> {

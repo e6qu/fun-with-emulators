@@ -11,6 +11,7 @@
 //! them.
 
 pub mod acct;
+pub mod aio;
 pub mod atime;
 pub mod bpf;
 pub mod bpfmap;
@@ -465,6 +466,7 @@ impl<P: Platform> Kernel<P> {
         pidfd::restore(d, false);
         ptrace::load_fork(d);
         acct::forked_child();
+        aio::forget_all();
         if let Some(fs) = &k.fs {
             fs.publish();
         }
@@ -536,6 +538,7 @@ impl<P: Platform> Kernel<P> {
         thread::set_clear_child_tid(0);
         thread::set_robust_list(0, 0);
         acct::exec();
+        aio::forget_all();
         // The saved IDs become the effective ones, as Linux's execve sets
         // them (no set-user-ID programs here).
         let saved = (self.creds.suid, self.creds.sgid);
@@ -1693,6 +1696,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 Err(e) => fwe_abi::err(e),
             }
         }
+        n::IO_SUBMIT => aio::submit(a[0], a[1], a[2]),
+        n::IO_GETEVENTS => aio::getevents(a[0], a[1] as i64, a[2] as i64, a[3], a[4]),
+        n::IO_PGETEVENTS => aio::pgetevents(a),
+        n::IO_CANCEL => aio::cancel(a[0], a[1], a[2]),
         // SAFETY: caller guarantees the pollfd array and timeout pointers.
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // The sixth argument points to `{ const sigset_t *ss; size_t len }`.

@@ -622,6 +622,8 @@ impl<P: Platform> Kernel<P> {
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
             nr::ACCT => self.sys_acct(a[0]),
+            nr::IO_SETUP => self.sys_io_setup(a[0], a[1]),
+            nr::IO_DESTROY => self.sys_io_destroy(a[0]),
             #[cfg(target_os = "macos")]
             nr::FILE_GETATTR | nr::FILE_SETATTR => self.sys_file_attr(n == nr::FILE_SETATTR, a),
             nr::PTRACE => self.sys_ptrace(a[0], a[1], a[2], a[3]),

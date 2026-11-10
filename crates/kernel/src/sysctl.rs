@@ -223,6 +223,13 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(-1, INT_MAX),
         space: Space::Ipc,
     },
+    // The most AIO events all contexts may hold.
+    Sysctl {
+        path: b"fs/aio-max-nr",
+        default: "65536",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
     Sysctl {
         path: b"fs/lease-break-time",
         default: "45",
