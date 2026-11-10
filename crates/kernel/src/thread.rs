@@ -357,6 +357,8 @@ fn wait_timer() -> i32 {
 pub fn forked() {
     PROCESS.clear();
     with_own(Pending::clear);
+    // A new process starts with no robust list, as Linux's does.
+    ROBUST_LIST.with(|c| c.set((0, 0)));
 }
 
 /// Linux's timer slack for a process that never set one, in nanoseconds.
@@ -434,6 +436,8 @@ fn shared_tid() -> Option<i32> {
         // the slot of each tid, after the counter.
         let me = libc::getpid();
         libc::pwrite(fd, me.to_ne_bytes().as_ptr().cast(), 4, owner_at(n));
+        // The number's robust list is the new thread's, none yet.
+        publish_robust(n, me, 0);
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
         Some(n)
@@ -547,12 +551,137 @@ pub fn clear_child_tid() -> u64 {
     CLEAR_CHILD_TID.with(Cell::get)
 }
 
+/// Record this thread's robust-futex list (`set_robust_list`): for its
+/// process's other threads in its registry entry, for other processes in
+/// the shared record ([`publish_robust`]).
 pub fn set_robust_list(head: u64, len: u64) {
     ROBUST_LIST.with(|c| c.set((head, len)));
+    let me = tid();
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = threads.iter_mut().find(|r| r.tid == me) {
+        r.robust = head;
+    }
+    drop(threads);
+    // SAFETY: getpid cannot fail.
+    let host = unsafe { libc::getpid() };
+    if me == tgid() {
+        publish_robust(host, host, head);
+    } else if !crate::pidns::nested() {
+        publish_robust(me, host, head);
+    }
 }
 
 pub fn robust_list() -> (u64, u64) {
     ROBUST_LIST.with(Cell::get)
+}
+
+/// This thread's robust-list head, taken as it ends (its futexes are
+/// released once).
+pub fn take_robust_list() -> u64 {
+    ROBUST_LIST.with(|c| c.replace((0, 0))).0
+}
+
+/// The process's other threads' robust-list heads, with their tids, taken
+/// as the process ends or runs another program.
+pub fn take_others_robust() -> Vec<(i32, u64)> {
+    let me = tid();
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads
+        .iter_mut()
+        .filter(|r| r.tid != me && r.robust != 0)
+        .map(|r| (r.tid, std::mem::take(&mut r.robust)))
+        .collect()
+}
+
+/// Another thread of this process's robust-list head, if it is one.
+pub fn robust_list_of(tid: i32) -> Option<u64> {
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter().find(|r| r.tid == tid).map(|r| r.robust)
+}
+
+// Robust-list heads for other processes to read (`get_robust_list`), in a
+// file beside the process records: a slot per main thread (by host pid)
+// and per thread number of fwe's ([`shared_tid`]), holding the owner's
+// host pid, when it was written (microseconds since the epoch) and the
+// head. A main thread's slot written before its process started is a
+// former process's; a thread number's is cleared when it is given out.
+
+const ROBUST_SLOT: i64 = 24;
+
+fn robust_path() -> Option<std::ffi::CString> {
+    let dir = crate::procreg::records_dir()?;
+    std::ffi::CString::new([&dir[..], b"/robust"].concat()).ok()
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
+/// Record slot `id`'s (a host pid or a thread number) robust-list head.
+fn publish_robust(id: i32, owner: i32, head: u64) {
+    if !(1..TID_END).contains(&id) {
+        return;
+    }
+    let Some(path) = robust_path() else { return };
+    let mut b = [0u8; ROBUST_SLOT as usize];
+    b[..4].copy_from_slice(&owner.to_ne_bytes());
+    b[8..16].copy_from_slice(&now_micros().to_ne_bytes());
+    b[16..].copy_from_slice(&head.to_ne_bytes());
+    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
+    // below.
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+        if fd >= 0 {
+            libc::pwrite(
+                fd,
+                b.as_ptr().cast(),
+                b.len(),
+                (i64::from(id) * ROBUST_SLOT) as libc::off_t,
+            );
+            libc::close(fd);
+        }
+    }
+}
+
+/// Another process's thread's robust-list head: `host` the main thread of
+/// that host process, or `tid` one of its other threads (a number of
+/// fwe's, of process `host`). `None` if the slot is not that thread's,
+/// which then has no list.
+pub fn published_robust(host: i32, tid: Option<i32>) -> Option<u64> {
+    let id = tid.unwrap_or(host);
+    if !(1..TID_END).contains(&id) {
+        return None;
+    }
+    let path = robust_path()?;
+    let mut b = [0u8; ROBUST_SLOT as usize];
+    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
+    // below.
+    let n = unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return None;
+        }
+        let n = libc::pread(
+            fd,
+            b.as_mut_ptr().cast(),
+            b.len(),
+            (i64::from(id) * ROBUST_SLOT) as libc::off_t,
+        );
+        libc::close(fd);
+        n
+    };
+    let owner = i32::from_ne_bytes(b[..4].try_into().unwrap());
+    let written = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+    let head = u64::from_ne_bytes(b[16..].try_into().unwrap());
+    if n != ROBUST_SLOT as isize || owner != host {
+        return None;
+    }
+    if tid.is_none() && crate::procreg::start_time(host).is_none_or(|start| written < start) {
+        return None;
+    }
+    Some(head)
 }
 
 /// What a pending signal carries into the handler's `siginfo`.
@@ -693,6 +822,8 @@ struct Registered {
     pending: Arc<Pending>,
     /// The host thread, or 0 while it is being created.
     host: libc::pthread_t,
+    /// Its robust-futex list's head (`set_robust_list`).
+    robust: u64,
 }
 
 /// Every live guest thread's pending set, by tid.
@@ -753,7 +884,7 @@ pub fn register(tid: i32) -> Arc<Pending> {
         SLACK_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).push((tid, s));
     }
     let pending = Arc::new(Pending::new());
-    let entry = Registered { tid, pending: pending.clone(), host: 0 };
+    let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0 };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
     directed_add(tid, Arc::as_ptr(&pending));
     publish_tids(&tids());

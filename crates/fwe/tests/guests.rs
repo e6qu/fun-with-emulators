@@ -2827,6 +2827,7 @@ const PTRACE: &str = "stop: signal 19\n\
     waitid: signal true, trapped true, status 19\n\
     step: exit 21, stepped true\n\
     attach: listed true, tgkill true, attached true, signal 19, pc true, detached true\n\
+    robust lists: process true, thread true\n\
     breakpoint: signal 5, at work true, argument 10, exit 21\n";
 
 /// ptrace: a traced child stops for a signal, has its memory read and
@@ -2838,6 +2839,21 @@ const PTRACE: &str = "stop: signal 19\n\
 fn ptrace_traces_a_child() {
     let out = fwe(&rust_guest("ptrace"), &[]);
     assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `robust` guest prints.
+const ROBUST: &str = "exited holder: owner dead true, recovered true\n\
+    killed holder: signal 15, owner dead true, recovered true\n\
+    thread holder: started true, owner dead true, recovered true\n";
+
+/// Robust mutexes whose holder ends without unlocking: a process that
+/// exits or is killed, and a thread that ends with the raw `exit` call,
+/// a waiter woken. The next to lock each learns its owner died.
+#[test]
+fn robust_mutexes_report_a_dead_owner() {
+    let out = fwe(&rust_guest("robust"), &[]);
+    assert_eq!(stdout(&out), ROBUST, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -3558,6 +3574,15 @@ fn hv_process_descriptors_name_processes() {
 fn hv_ptrace_traces_a_child() {
     let Some(out) = fwe_hv(&rust_low_guest("ptrace"), &[]) else { return };
     assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Robust mutexes in the VM (see [`robust_mutexes_report_a_dead_owner`]):
+/// the futex words are released through the guest's translated memory.
+#[test]
+fn hv_robust_mutexes_report_a_dead_owner() {
+    let Some(out) = fwe_hv(&rust_low_guest("robust"), &[]) else { return };
+    assert_eq!(stdout(&out), ROBUST, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

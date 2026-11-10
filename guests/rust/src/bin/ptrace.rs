@@ -12,7 +12,8 @@
 //! in its code stops it there; and a thread of a running process that is
 //! not traced is listed in `/proc/<pid>/task`, reached by `tgkill`, and
 //! attached to on its own (`PTRACE_ATTACH` of its tid), stopping while its
-//! process goes on. It prints what it observed.
+//! process goes on, and its process's and its own robust futex lists read
+//! (`get_robust_list`). It prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
@@ -23,6 +24,8 @@ const SYS_PTRACE: c_long = 117;
 const SYS_WRITE: c_long = 64;
 const SYS_GETTID: c_long = 178;
 const SYS_TGKILL: c_long = 131;
+const SYS_SET_ROBUST_LIST: c_long = 99;
+const SYS_GET_ROBUST_LIST: c_long = 100;
 const PTRACE_ATTACH: c_long = 16;
 const PTRACE_DETACH: c_long = 17;
 const SIGSTOP: c_int = 19;
@@ -269,6 +272,24 @@ fn main() {
     println!("step: exit {}, stepped {}", exit_code(st), steps > 10);
 
     // A thread of a running process attached to on its own.
+    static MAIN_HEAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static THREAD_HEAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    // An empty robust list: its head pointing at itself.
+    fn set_robust(head: &'static [AtomicU64; 3]) -> u64 {
+        let at = head.as_ptr() as u64;
+        head[0].store(at, Ordering::SeqCst);
+        // SAFETY: the head lives for the whole program.
+        unsafe { syscall(SYS_SET_ROBUST_LIST, at as c_long, 24 as c_long) };
+        at
+    }
+    fn get_robust(pid: c_int) -> (u64, u64) {
+        let (mut head, mut len) = (0u64, 0u64);
+        // SAFETY: valid out-pointers.
+        let r = unsafe {
+            syscall(SYS_GET_ROBUST_LIST, pid as c_long, &mut head as *mut u64 as c_long, &mut len as *mut u64 as c_long)
+        };
+        if r == 0 { (head, len) } else { (0, 0) }
+    }
     let mut fds = [0 as c_int; 2];
     // SAFETY: a valid out-array; plain calls; the child ends by SIGKILL.
     let c = unsafe {
@@ -276,7 +297,9 @@ fn main() {
         let c = fork();
         if c == 0 {
             let w = fds[1];
+            set_robust(&MAIN_HEAD);
             std::thread::spawn(move || {
+                set_robust(&THREAD_HEAD);
                 let tid = syscall(SYS_GETTID) as i32;
                 write(w, tid.to_ne_bytes().as_ptr(), 4);
                 loop {
@@ -302,6 +325,8 @@ fn main() {
     let sig = stopsig(wait(tid));
     let (r, _) = regs(tid);
     let detached = ptrace(PTRACE_DETACH, tid, 0, 0) == 0;
+    let process_list = get_robust(c) == (MAIN_HEAD.as_ptr() as u64, 24);
+    let thread_list = get_robust(tid) == (THREAD_HEAD.as_ptr() as u64, 24);
     // SAFETY: plain calls on the child.
     unsafe {
         kill(c, 9);
@@ -311,6 +336,7 @@ fn main() {
         "attach: listed {listed}, tgkill {reached}, attached {attached}, signal {sig}, pc {}, detached {detached}",
         r[32] != 0
     );
+    println!("robust lists: process {process_list}, thread {thread_list}");
 
     // A breakpoint.
     let c = traced_child(|| work(10));

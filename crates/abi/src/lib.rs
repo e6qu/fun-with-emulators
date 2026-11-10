@@ -1044,6 +1044,13 @@ pub mod futex {
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
     pub const FUTEX_CLOCK_REALTIME: u64 = 256;
     pub const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    /// A futex word's bits for robust lists: waiters are blocked on it,
+    /// its owner ended holding it, and the owner's thread id.
+    pub const FUTEX_WAITERS: u32 = 0x8000_0000;
+    pub const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+    pub const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+    /// The most entries of a robust list released as a thread ends.
+    pub const ROBUST_LIST_LIMIT: usize = 2048;
 }
 
 /// `wait4`/`waitid` options (`linux/wait.h`).

@@ -78,6 +78,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // A program only the VM can run, or an exec from a process with other
     // threads (which must end): replace this process with a fresh fwe.
     if crate::needs_vm(&file) || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
+        fwe_kernel::release_robust_lists();
         let state = k.exec_state();
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
@@ -96,7 +97,9 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env_refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
     // The point of no return: the old program's memory goes, and a vfork
-    // parent may resume.
+    // parent may resume. The robust futexes its threads hold are released
+    // first.
+    fwe_kernel::release_robust_lists();
     fwe_kernel::mm::release_guest_memory();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {

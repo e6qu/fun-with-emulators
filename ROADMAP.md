@@ -140,9 +140,8 @@ run.
   (stops, registers, memory, breakpoints, single-stepping, fork, clone
   and exit events, the thread pointer), and attached to, running threads
   too; left is running strace and gdb themselves against it.
-- [ ] **Every other failure LTP points at**, among them:
-  - `fs.protected_hardlinks` and `protected_symlinks`, robust futex
-    lists of other processes.
+- [ ] **Every other failure LTP points at:** `fork14`, `prctl09` and
+  `select02` pass alone but not always under a full run's load.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its

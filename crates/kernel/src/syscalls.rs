@@ -573,24 +573,33 @@ impl<P: Platform> Kernel<P> {
                 thread::set_robust_list(a[0], a[1]);
                 0
             }
-            // The caller's own list; another thread's or process's needs a
-            // tracer's standing, which nothing has.
+            // Any thread's list, another process's to a caller that may
+            // trace it; the length is always the head's size, as Linux's.
             nr::GET_ROBUST_LIST => {
                 let pid = a[0] as i32;
-                if pid != 0 && pid != thread::tid() {
-                    return err(
-                        if crate::pidns::to_host(pid).is_some_and(host::process_exists)
-                            || thread::host_thread(pid).is_some()
-                        {
-                            errno::EPERM
-                        } else {
-                            errno::ESRCH
-                        },
-                    );
-                }
-                let (head, len) = thread::robust_list();
+                let head = if pid == 0 || pid == thread::tid() {
+                    thread::robust_list().0
+                } else if let Some(head) = thread::robust_list_of(pid) {
+                    head
+                } else {
+                    // Another process's thread: its host process and, for
+                    // one not its main thread, its number.
+                    let target = match thread::owner_of_tid(pid) {
+                        Some(owner) => Some((owner, Some(pid))),
+                        None => crate::pidns::to_host(pid)
+                            .filter(|&h| host::process_exists(h))
+                            .map(|h| (h, None)),
+                    };
+                    let Some((owner, tid)) = target else {
+                        return err(errno::ESRCH);
+                    };
+                    if !self.may_trace(owner) {
+                        return err(errno::EPERM);
+                    }
+                    thread::published_robust(owner, tid).unwrap_or(0)
+                };
                 guest!(uaccess::write(a[1], head));
-                guest!(uaccess::write(a[2], len));
+                guest!(uaccess::write(a[2], 24u64));
                 0
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),

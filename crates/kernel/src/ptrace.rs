@@ -1246,7 +1246,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// `ptrace_may_access` for attaching): `CAP_SYS_PTRACE`, or the same
     /// real, effective and saved ids as the target's, and the target
     /// dumpable.
-    fn may_trace(&self, target: i32) -> bool {
+    pub(crate) fn may_trace(&self, target: i32) -> bool {
         if self.creds.has(crate::caps::CAP_SYS_PTRACE) {
             return true;
         }

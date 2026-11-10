@@ -1228,6 +1228,8 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     // runnable, there is no way back.
     let state = k.exec_state();
     let before_exec = || {
+        // The robust futexes its threads hold, while its memory is there.
+        fwe_kernel::release_robust_lists();
         // A vfork child's changes reach its parent before it goes on.
         mem::finish_lazy();
         teardown();

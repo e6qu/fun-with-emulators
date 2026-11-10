@@ -379,6 +379,15 @@ already does; fwe adds Linux's thread identity and futexes:
   reused; a dead owner's slot is freed by the next process that looks.
 - Waiters check every 20 ms for a signal they should take, and return
   `EINTR` for it.
+- Robust futex lists (`set_robust_list`): as a thread ends, and for
+  every thread as its process ends or runs another program, each word on
+  its list it still owns is marked `FUTEX_OWNER_DIED` (by a
+  compare-and-swap that survives a fault in the guest's memory) and a
+  waiter woken, as Linux's `exit_robust_list` does. Each thread's list is
+  in its registry entry for the process's other threads, and in a file
+  beside the process records for other processes' `get_robust_list`
+  (by host pid for a main thread, by number for another; a main thread's
+  written before its process started is a former process's).
 
 ## Signals
 
@@ -985,6 +994,10 @@ which are to be lifted for 1.0 and which are not planned.
   descriptor fwe stands in for (an eventfd, a timerfd, a signalfd) gives
   the host object behind it, as one passed over a socket does, and waits
   while the target is stopped.
+- A process ended by a signal fwe cannot catch (`SIGKILL`, or one from
+  outside fwe that the host applies) leaves the robust futexes it held
+  as they were, so their next locker waits rather than getting
+  `EOWNERDEAD`.
 - A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
   process ends (Linux sends it when the parent thread does); a new thread
   does not inherit its creator's name.

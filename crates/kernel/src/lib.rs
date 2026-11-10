@@ -868,6 +868,9 @@ pub fn thread_exit_cleanup() {
     }
     // A traced thread's tracer learns of its end.
     ptrace::thread_exiting();
+    // The robust futexes it still holds, then its `set_tid_address` word,
+    // as Linux releases them.
+    futex::release_robust(thread::take_robust_list(), thread::tid());
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {
@@ -875,6 +878,16 @@ pub fn thread_exit_cleanup() {
         if uaccess::write(addr, 0u32).is_ok() {
             wake_futex(addr, 1);
         }
+    }
+}
+
+/// Release every thread's robust futexes (`set_robust_list`) as the
+/// process ends or runs another program, its memory still there: Linux
+/// releases each thread's as the thread ends.
+pub fn release_robust_lists() {
+    futex::release_robust(thread::take_robust_list(), thread::tid());
+    for (tid, head) in thread::take_others_robust() {
+        futex::release_robust(head, tid);
     }
 }
 

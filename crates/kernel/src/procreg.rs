@@ -965,8 +965,10 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
                 info.pbi_status == 5,
             ));
         }
-        // The host tells nothing of a zombie that way: its `kinfo_proc`.
-        zombie_info(pid).map(|z| (z.start, z.ppid, true))
+        // The host tells nothing that way of a zombie, nor of a process
+        // still ending (its descriptors not yet closed, so not gone): its
+        // `kinfo_proc`.
+        kinfo(pid).map(|k| (k.start, k.ppid, k.state == 5))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1089,6 +1091,8 @@ pub fn reaped(pid: i32) {
 /// This process is ending with Linux wait status `status`: leave a record
 /// of how it ended if a reaper might take it.
 pub fn exiting(status: i32) {
+    // The robust futexes its threads hold.
+    crate::release_robust_lists();
     // Its files closed, as it ends (inotify's close events), and its
     // instances gone.
     crate::inotify::exiting();
