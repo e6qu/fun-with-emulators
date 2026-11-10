@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 1082 of 1551 (91% of the 1188 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 1150 of 1551 (97% of the 1184 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -139,8 +139,8 @@ run.
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).
 - [ ] **Every other failure LTP points at**, among them:
-  - `rename` and `statx` details, `/proc/<pid>/pagemap` and
-    `coredump_filter`.
+  - `fs.protected_hardlinks` and `protected_symlinks`, robust futex
+    lists of other processes.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
@@ -206,6 +206,8 @@ for it fall back:
   memory (`CLONE_FILES` without `CLONE_VM`): two macOS processes cannot
   share one, so the child has a copy (`unshare(CLONE_FILES)` and
   `CLOSE_RANGE_UNSHARE` act as Linux's on it);
+- pipes of more than 64 KiB, which a host pipe cannot hold: a pipe
+  starts with 64 KiB where Linux with 16 KiB pages gives 256 KiB (`fcntl35`);
 - CPU affinity: macOS has none, so `sched_setaffinity` is accepted and
   pins nothing, and a test of how the scheduler shares one CPU (`nice05`)
   cannot hold;

@@ -236,6 +236,7 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"oom_score_adj", DT_REG),
     (b"oom_adj", DT_REG),
     (b"oom_score", DT_REG),
+    (b"coredump_filter", DT_REG),
     (b"timerslack_ns", DT_REG),
     (b"ns", DT_DIR),
     (b"fd", DT_DIR),
@@ -305,7 +306,7 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
     format!(
         "Name:\t{}\nUmask:\t{:04o}\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\n\
          Uid:\t{}\nGid:\t{}\nFDSize:\t64\nGroups:\t{groups}\nNStgid:\t{pid}\nNSpid:\t{pid}\nNSpgid:\t{}\nNSsid:\t{}\n\
-         VmSize:\t{} kB\nVmLck:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nSigQ:\t0/63448\n{caps}NoNewPrivs:\t{}\nSeccomp:\t{}\n\
+         VmSize:\t{} kB\nVmLck:\t{} kB\nVmRSS:\t{} kB\nVmSwap:\t0 kB\nThreads:\t{}\nSigQ:\t0/63448\n{caps}NoNewPrivs:\t{}\nSeccomp:\t{}\n\
          Seccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         String::from_utf8_lossy(comm),
         c.umask,
@@ -428,6 +429,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
             Entry::File(oom_file(sub, rec.oom_score_adj))
         }
+        b"/coredump_filter" => Entry::File(crate::coredump::FILTER.to_vec()),
         b"/timerslack_ns" => Entry::File(format!("{}\n", rec.slack.0).into_bytes()),
         b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
             Some(u) => {

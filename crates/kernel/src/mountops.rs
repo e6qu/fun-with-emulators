@@ -530,12 +530,13 @@ impl<P: Platform> Kernel<P> {
         // has a path only if it is inside.
         let fs = self.fs.as_mut().expect("filesystem configured");
         let cwd_ns = fs.to_ns(fs.cwd());
-        let cwd = crate::mounts::under(&cwd_ns, &ns)
-            .map(|r| crate::mounts::join(b"/", r))
-            .unwrap_or_else(|| b"/".to_vec());
+        let inside = crate::mounts::under(&cwd_ns, &ns).map(|r| crate::mounts::join(b"/", r));
+        let outside = inside.is_none().then(|| cwd_ns.clone());
+        let cwd = inside.unwrap_or_else(|| b"/".to_vec());
         let root_mount = fs.mounts().locate(&ns).0.id;
         let cwd_mount = fs.cwd_mount().unwrap_or(0);
         fs.set_root(ns, cwd);
+        fs.set_cwd_outside(outside);
         fs.set_mounts(root_mount, cwd_mount);
         0
     }

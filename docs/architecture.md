@@ -167,6 +167,12 @@ signals and faults for the guest, and the machinery for threads and
   one fails with the caller intact. A re-exec checks only that it is an
   ELF file before the host `execve`, so a later failure ends the
   process.
+- **Busy programs** (`crates/kernel/src/textbusy.rs`): a page every fwe
+  process maps holds each process's program and a ring of the files
+  opened lately for writing; an open to write a running program's file,
+  and a run of a file some process still holds open to write (which the
+  host confirms), fail with `ETXTBSY`. A writer whose ring entry was
+  overwritten by later opens goes unseen.
 - A program given by a host path inside the rootfs gets its guest path as
   `argv[0]` and `AT_EXECFN` (Python finds its installation so);
   `--argv0` overrides it.
@@ -321,12 +327,20 @@ does for it, then the per-process state fwe keeps. Inside fwe:
   at `fork` against the user's fwe processes.
 - **Core dumps** (`crates/kernel/src/coredump.rs`): a signal whose default
   dumps core leaves an ELF core (the thread's registers, the process, and
-  the mappings Linux's default `coredump_filter` dumps), named by
-  `kernel.core_pattern` and `core_uses_pid` and cut short at
-  `RLIMIT_CORE`. The host's own core limit is 0.
+  the mappings Linux's default `coredump_filter` dumps, which
+  `/proc/<pid>/coredump_filter` shows, less memory given
+  `MADV_DONTDUMP`), named by `kernel.core_pattern` and `core_uses_pid`
+  and cut short at `RLIMIT_CORE`. The host's own core limit is 0.
 - **End status:** a process a signal ends leaves its Linux wait status
   beside its record (`procreg::ending`), so its parent reads the signal
   and core bit Linux would report even for a signal the host lacks.
+- **POSIX timers** (`crates/kernel/src/posixtimer.rs`): a thread of
+  fwe's, started with a process's first timer, sleeps until the next is
+  due and raises its signal (`SI_TIMER`) for the process or a thread; a
+  periodic timer goes again when its signal is taken, the intervals that
+  passed its overrun. A timer of CPU time is looked at again at most
+  every 10 ms. A fork child has none; `execve` deletes them. A signal of
+  a timer deleted or set again while it waits is still delivered.
 - **Interval timers** are the host's; one longer than the host takes
   (100,000,000 s) gets the host's longest and reads back as asked.
   CPU-time clocks are the host thread's or process's CPU time.
@@ -490,13 +504,20 @@ is in keeping fwe's own descriptors apart and Linux's limits exact:
 What the guest reads about files, and the file features macOS lacks or
 shapes differently:
 
-- `stat`/`statx` are translated to the arm64 Linux layout; `getdents64`
-  is built from `getdirentries`, re-reading from the directory position
-  when translated entries outgrow the guest's buffer.
-- **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner
-  is kept in `org.fwe.mode`, the file flagged `UF_NODUMP`; `stat` reports
-  it. A file made by something else that the host refuses root is
-  converted the first time.
+- `stat`/`statx` are translated to the arm64 Linux layout; `statx`
+  reports the immutable, append-only and no-dump attributes from the
+  host's file flags. A file of a tmpfs mount is on the device
+  `/proc/<pid>/mountinfo` gives the mount, in page-sized blocks.
+  `getdents64` is built from `getdirentries`, re-reading from the
+  directory position when translated entries outgrow the guest's buffer.
+- **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner,
+  or a file's set-ID bits (which the host drops from a file of a group
+  its user is not in, and on any write), is kept in `org.fwe.mode`, the
+  file flagged `UF_NODUMP`; `stat` reports it. A write by a caller
+  without `CAP_FSETID` takes a file's set-ID bits away, as Linux's does.
+  Where a file's path is too long for the host, its attributes are read
+  and written through a descriptor of it. A file made by something else
+  that the host refuses root is converted the first time.
 - **Owners** (`crates/kernel/src/owners.rs`): a file whose owner is not
   root (fwe's user) keeps it in `org.fwe.owner`, under the same flag;
   `stat` reports it. A new file is its maker's (its file-system user, and
@@ -510,7 +531,13 @@ shapes differently:
   `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` passing them. The checks
   outside the kernel lock (the path walk, a connect to a Unix socket's
   node) use the credentials published after each system call
-  (`creds::access`). Without a root filesystem the host's own files and
+  (`creds::access`). With `fs.protected_symlinks` on, a link in a sticky
+  directory anyone may write to is followed only by its owner or where the
+  directory's owner owns it (`EACCES`); with `fs.protected_hardlinks` on,
+  a file is linked to only by its owner (or `CAP_FOWNER`) or by one who
+  may read and write it, a regular file not set-ID (`EPERM`). Both are
+  off by default, as in Linux's kernel, and read again only when a sysctl
+  changes. Without a root filesystem the host's own files and
   directories (root's, no owner kept) are left to the host's checks.
   fwe's own umask on the host is 0: the guest's umask is applied by fwe,
   and its files are made with the modes it asked for.
@@ -551,6 +578,31 @@ shapes differently:
   blocking. A full pipe is not writable to `poll`, `select` and `epoll`,
   which look at it each millisecond. A host `SIGIO` for a descriptor with a
   chosen signal arrives as that signal, with `si_fd` and `si_band`.
+- **Whole pipe writes** (`crates/kernel/src/pipelock.rs`): a write of up
+  to Linux's `PIPE_BUF` (4096 bytes) to a pipe arrives whole, never
+  interleaved with another writer's, where the host keeps only 512 whole:
+  writers of one pipe take turns through a lock of that pipe's own in a
+  page every fwe process maps (one whose holder has ended is taken over),
+  so only that pipe's writers wait; one that does not wait is written
+  whole or not at all (`EAGAIN`).
+- **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`): immutable,
+  append-only and no-dump are the host's user flags of the same meaning,
+  which it enforces (no-dump also marks a kept mode, see Modes, so such a
+  file does not show it); setting the first two takes `CAP_LINUX_IMMUTABLE`,
+  and such a file's extended attributes cannot change. An append-only
+  file's times may be set to now (the host refuses it, so the flag is
+  lifted for the change), not to a time. `O_NOATIME` (a descriptor's own,
+  the host has none) leaves the access time as a `noatime` mount does.
+- **`O_TMPFILE`** (`crates/kernel/src/tmpfile.rs`): the file is made
+  under a hidden name in its directory (`getdents` leaves it out, `rmdir`
+  of a directory holding only such names removes them), which goes when
+  the descriptor is closed, or at once with `O_EXCL`; `linkat` gives it a
+  name through `/proc/self/fd`.
+- **File handles** (`crates/kernel/src/handles.rs`): a handle names the
+  host file system and inode, which the host turns back into a path
+  (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes
+  stale (`ESTALE`) with the file or on another file system; a file fwe
+  makes up has an identifier handle (`AT_HANDLE_FID`) only.
 - **Leases** (`crates/kernel/src/leases.rs`): a record every fwe process
   shares. An open or truncation that conflicts with a lease signals its
   holder and waits until the lease is let go or downgraded, or for
@@ -586,7 +638,8 @@ shapes differently:
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
   overflowuid,overflowgid,threads-max,tainted}`,
   `kernel/random/{entropy_avail,poolsize}`, `fs/{nr_open,file-max,
-  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time}`, `fs/inotify/*`, `fs/mqueue/*`,
+  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time,
+  protected_symlinks,protected_hardlinks}`, `fs/inotify/*`, `fs/mqueue/*`,
   `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
   `kernel/keys/*`, the IPC limits and a network namespace's sysctls
   (`crates/kernel/src/sysctl.rs`). `fs.nr_open` bounds `RLIMIT_NOFILE` and
@@ -766,6 +819,8 @@ each is mapped is in
   in this process or (by host path) in another fwe process of the
   namespace; `MNT_DETACH` and `MNT_EXPIRE` act as on Linux. `pivot_root`
   replaces the mount at the caller's root, the namespace's or a chroot's.
+  A `chroot` that leaves the working directory outside the new root has
+  `getcwd` report it `(unreachable)`, as Linux does, until a `chdir`.
 - **New mount API** (`crates/kernel/src/mountapi.rs`): a filesystem
   context gathers source, flags and options through `fsconfig`, checked
   as Linux checks them (an unknown parameter is logged; reading the
@@ -893,7 +948,11 @@ which are to be lifted for 1.0 and which are not planned.
 - VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
   `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
   nothing.
-- `/proc/<pid>/pagemap` and `coredump_filter` are not there.
+- `/proc/self/mem` and `/proc/self/pagemap` are the caller's own memory
+  only (macOS gives no process another's); a `pagemap` entry tells
+  whether a page is in memory, its frame number 0, as Linux shows it to
+  a process without `CAP_SYS_ADMIN`. `coredump_filter` is the default
+  and cannot be changed.
 - Native: write+exec memory takes a fault each time a page goes from being
   written to being run or back, slow for code that does both to one page
   often; a host call writing into such a page while it is executable (a

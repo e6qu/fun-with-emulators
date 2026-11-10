@@ -173,7 +173,9 @@ impl<P: Platform> Kernel<P> {
             | nr::TEE
             | nr::VMSPLICE => {
                 // SAFETY: the backend's guarantee for the guest pointers.
-                unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS))
+                let r = unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS));
+                crate::after_write(n, &a, r);
+                r
             }
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
@@ -202,6 +204,10 @@ impl<P: Platform> Kernel<P> {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
                 crate::mountwatch::closed(fd);
+                crate::atime::closed(fd);
+                crate::memfd::closed(fd);
+                crate::tmpfile::closed(fd);
+                crate::modes::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);
@@ -261,6 +267,11 @@ impl<P: Platform> Kernel<P> {
             },
             // SAFETY: eventfd2 takes no pointers.
             nr::EVENTFD2 => unsafe { crate::specialfd::eventfd2(a[0], a[1]) },
+            nr::TIMER_CREATE => self.sys_timer_create(a[0], a[1], a[2]),
+            nr::TIMER_SETTIME => self.sys_timer_settime(a[0], a[1], a[2], a[3]),
+            nr::TIMER_GETTIME => self.sys_timer_gettime(a[0], a[1]),
+            nr::TIMER_GETOVERRUN => self.sys_timer_getoverrun(a[0]),
+            nr::TIMER_DELETE => self.sys_timer_delete(a[0]),
             // SAFETY: timerfd_create takes no pointers.
             nr::TIMERFD_CREATE => unsafe { crate::specialfd::timerfd_create(a[0], a[1]) },
             // SAFETY: the itimerspec pointers are validated by the host/impl.
@@ -369,8 +380,20 @@ impl<P: Platform> Kernel<P> {
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
             nr::FSYNC | nr::FDATASYNC => match crate::loopdev::fsync(a[0] as i32) {
                 Some(r) => r,
-                // SAFETY: plain host call on a guest fd.
-                None => ret(unsafe { libc::fsync(a[0] as i32) }),
+                None => {
+                    // A pipe, socket or character device has nothing to
+                    // sync: `EINVAL`, as Linux has it.
+                    // SAFETY: an all-zero `stat` is a valid out-parameter.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: as above.
+                    let ok = unsafe { libc::fstat(a[0] as i32, &mut st) } == 0;
+                    let kind = st.st_mode & libc::S_IFMT;
+                    if ok && matches!(kind, libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR) {
+                        return err(errno::EINVAL);
+                    }
+                    // SAFETY: plain host call on a guest fd.
+                    ret(unsafe { libc::fsync(a[0] as i32) })
+                }
             },
 
             // Memory.
@@ -411,6 +434,21 @@ impl<P: Platform> Kernel<P> {
                     (Ok(_), Err(_)) => return err(errno::EPERM),
                     (Err(e), _) => return err(e),
                 };
+                // A child of the caller's session that has run a program of
+                // its own may not be moved (`EACCES`), whatever the group:
+                // Linux tells that before the group's checks, the host after.
+                // SAFETY: plain host calls.
+                let (me, sid) = unsafe { (libc::getpid(), libc::getsid(0)) };
+                if pid != 0
+                    && pid != me
+                    // SAFETY: as above.
+                    && unsafe { libc::getsid(pid) } == sid
+                    && crate::procreg::read(pid).is_some_and(|r| {
+                        r.execed && r.lineage.first().is_some_and(|&(p, _)| p == me)
+                    })
+                {
+                    return err(errno::EACCES);
+                }
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setpgid(pid, pgid) });
                 if r == 0 {
@@ -537,7 +575,7 @@ impl<P: Platform> Kernel<P> {
                 let pid = a[0] as i32;
                 if pid != 0 && pid != thread::tid() {
                     return err(
-                        if crate::pidns::to_host(pid).is_some()
+                        if crate::pidns::to_host(pid).is_some_and(host::process_exists)
                             || thread::host_thread(pid).is_some()
                         {
                             errno::EPERM
@@ -732,6 +770,8 @@ impl<P: Platform> Kernel<P> {
             // here (e.g. through the plain `syscall` helper) is unsupported.
 
             // Randomness.
+            nr::NAME_TO_HANDLE_AT => self.sys_name_to_handle_at(a[0], a[1], a[2], a[3], a[4]),
+            nr::OPEN_BY_HANDLE_AT => self.sys_open_by_handle_at(a[0], a[1], a[2]),
             nr::GETRANDOM => {
                 // GRND_NONBLOCK, GRND_RANDOM and GRND_INSECURE, but not the
                 // last two at once.
@@ -1126,6 +1166,18 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
             return r;
         }
+        // `FICLONE`, `FICLONERANGE` and `FIDEDUPERANGE` between files: no
+        // file system fwe mounts shares extents (`EOPNOTSUPP`, as Linux's
+        // tmpfs and ext4 answer).
+        if matches!(req, 0x4004_9409 | 0x4020_940d | 0xc018_9436) && is_regular_fd(fd) {
+            return err(errno::EOPNOTSUPP);
+        }
+        // `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`: the immutable and
+        // append-only flags, which the host has (and enforces) too.
+        #[cfg(target_os = "macos")]
+        if req == 0x8008_6601 || req == 0x4008_6602 {
+            return self.inode_flags(fd, req == 0x4008_6602, arg);
+        }
         // `RNDGETENTCNT` on `/dev/random` or `/dev/urandom`: the entropy
         // count, full as Linux's is (`kernel.random.entropy_avail`).
         if req == 0x8004_5200 && is_random_device(fd) {
@@ -1151,6 +1203,7 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::TCGETS => crate::term::tcgetattr(fd, arg),
+                ioctl::TCGETA => crate::term::tcgeta(fd, arg),
                 ioctl::PROCMAP_QUERY if let Some(pid) = maps_of_fd(fd) => {
                     self.procmap_query(pid, arg)
                 }
@@ -2173,6 +2226,90 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     }
 }
 
+/// Linux's inode flags fwe keeps: immutable and append-only, as the
+/// host's user flags; `noatime` and `nodump`, which tmpfs takes, are
+/// accepted and not kept.
+#[cfg(target_os = "macos")]
+const FS_IMMUTABLE_FL: u32 = 0x10;
+#[cfg(target_os = "macos")]
+const FS_APPEND_FL: u32 = 0x20;
+#[cfg(target_os = "macos")]
+const FS_NODUMP_FL: u32 = 0x40;
+#[cfg(target_os = "macos")]
+const FS_NOATIME_FL: u32 = 0x80;
+
+#[cfg(target_os = "macos")]
+impl<P: Platform> Kernel<P> {
+    /// `FS_IOC_GETFLAGS` (`set` false) or `FS_IOC_SETFLAGS` of the file
+    /// open as `fd`, the flags at `arg`.
+    fn inode_flags(&mut self, fd: i32, set: bool, arg: u64) -> i64 {
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return last_error();
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+            return err(errno::ENOTTY);
+        }
+        let host = st.st_flags;
+        if !set {
+            let mut f = 0u32;
+            if host & libc::UF_IMMUTABLE != 0 {
+                f |= FS_IMMUTABLE_FL;
+            }
+            if host & libc::UF_APPEND != 0 {
+                f |= FS_APPEND_FL;
+            }
+            if crate::modes::nodump_fd(fd, &st) {
+                f |= FS_NODUMP_FL;
+            }
+            guest!(uaccess::write(arg, f));
+            return 0;
+        }
+        let f: u32 = guest!(uaccess::read(arg));
+        if f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
+            return err(errno::EOPNOTSUPP);
+        }
+        // The file's owner's to change, and the immutable and append-only
+        // flags only with `CAP_LINUX_IMMUTABLE`.
+        let owner = crate::owners::of_fd(fd, &st).0;
+        if owner != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
+            return err(errno::EPERM);
+        }
+        let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
+        let mut want = host & !(fixed | libc::UF_NODUMP);
+        if f & FS_IMMUTABLE_FL != 0 {
+            want |= libc::UF_IMMUTABLE;
+        }
+        if f & FS_APPEND_FL != 0 {
+            want |= libc::UF_APPEND;
+        }
+        // The flag also marks a kept mode, which stays marked.
+        let kept = crate::modes::marked(&st) && !crate::modes::nodump_fd(fd, &st);
+        if f & FS_NODUMP_FL != 0 || kept {
+            want |= libc::UF_NODUMP;
+        }
+        if (want ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
+            return err(errno::EPERM);
+        }
+        if want == host {
+            return 0;
+        }
+        // SAFETY: plain host call on the guest's descriptor.
+        ret(unsafe { libc::fchflags(fd, want) })
+    }
+}
+
+/// Whether `fd` is a regular file.
+fn is_regular_fd(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG }
+}
+
 /// Whether `fd` is `/dev/random` or `/dev/urandom` (Linux's 1:8, 1:9).
 fn is_random_device(fd: i32) -> bool {
     // SAFETY: an all-zero `stat` is a valid out-parameter.
@@ -2479,7 +2616,7 @@ impl<P: Platform> Kernel<P> {
         Ok(match which {
             prio::PROCESS if who == 0 => vec![me],
             prio::PROCESS => crate::pidns::to_host(who)
-                .filter(|&h| h > 0 && (h == me || crate::procreg::start_time(h).is_some()))
+                .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
                 .into_iter()
                 .collect(),
             prio::PGRP => {

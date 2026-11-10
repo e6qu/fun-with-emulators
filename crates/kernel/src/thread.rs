@@ -72,6 +72,8 @@ pub fn init_main(pid: i32) {
     crate::futex::forked_child();
     crate::signote::open_own();
     crate::sysvipc::forked_child();
+    crate::textbusy::forked_child();
+    crate::posixtimer::forked_child();
     register_current();
 }
 
@@ -567,10 +569,18 @@ impl Pending {
             return None;
         }
         let slot = &self.info[(sig - 1) as usize];
+        let code = slot.code.load(Ordering::Relaxed);
+        let pid = slot.pid.load(Ordering::Relaxed);
+        // A POSIX timer's signal: its overrun as it is taken.
+        let uid = if code == fwe_abi::signal::SI_TIMER {
+            crate::posixtimer::delivered(pid)
+        } else {
+            slot.uid.load(Ordering::Relaxed)
+        };
         Some(SigInfo {
-            code: slot.code.load(Ordering::Relaxed),
-            pid: slot.pid.load(Ordering::Relaxed),
-            uid: slot.uid.load(Ordering::Relaxed),
+            code,
+            pid,
+            uid,
             status: slot.status.load(Ordering::Relaxed),
             value: slot.value.load(Ordering::Relaxed),
             poll: match slot.poll_fd.load(Ordering::Relaxed) {

@@ -29,6 +29,7 @@ pub mod fifo;
 pub mod fs;
 mod fsops;
 pub mod futex;
+mod handles;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
@@ -58,7 +59,10 @@ pub mod owners;
 pub mod pdeath;
 pub mod pidfd;
 pub mod pidns;
+pub mod pipelock;
+pub mod posixtimer;
 pub mod procfs;
+pub mod procmem;
 pub mod procpid;
 pub mod procreg;
 pub mod pty;
@@ -83,7 +87,9 @@ mod syscalls;
 pub mod sysctl;
 pub mod sysvipc;
 pub mod term;
+pub mod textbusy;
 pub mod thread;
+pub mod tmpfile;
 pub mod tmpfs;
 pub mod trace;
 pub mod uaccess;
@@ -461,6 +467,7 @@ impl<P: Platform> Kernel<P> {
     /// callers that do not expose a register file.
     pub fn syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         let result = self.dispatch(nr, args);
+        self.note_creds();
         self.tracer.syscall(nr, &args, result);
         result
     }
@@ -469,7 +476,18 @@ impl<P: Platform> Kernel<P> {
     /// tracing it or touching registers: for a backend that records the
     /// result itself with [`Kernel::finish_syscall`].
     pub fn run_call(&mut self, nr: u64, args: [u64; 6]) -> i64 {
-        self.dispatch(nr, args)
+        let result = self.dispatch(nr, args);
+        self.note_creds();
+        result
+    }
+
+    /// What the calls made without the kernel's lock need of the caller's
+    /// credentials: whether it has `CAP_FSETID`, while a set-ID file is
+    /// open to write.
+    fn note_creds(&self) {
+        if modes::setid_open() {
+            modes::note_fsetid(self.creds.has(caps::CAP_FSETID));
+        }
     }
 
     /// Reset the signal and per-thread state across a successful `execve`:
@@ -480,8 +498,9 @@ impl<P: Platform> Kernel<P> {
     pub fn exec_reset(&mut self) {
         // The other threads are gone, and with them their waits; the
         // segments it had attached are detached (its memory is the new
-        // program's).
+        // program's); its POSIX timers are deleted.
         futex::process_started();
+        posixtimer::exec();
         sysvipc::process_leaving(true);
         // The thread and process keyrings go; the session keyring stays.
         keys::exec();
@@ -572,16 +591,26 @@ impl<P: Platform> Kernel<P> {
 
     /// Whether the caller may run the program at guest path `path`: only a
     /// regular file whose bits let it (`EACCES`; root needs one execute
-    /// bit set).
+    /// bit set), and that no process has open for writing (`ETXTBSY`).
     pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
         use fwe_abi::{errno, fcntl};
         let Some(fs) = self.fs.as_ref() else { return Ok(()) };
         if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
-            && (st.st_mode & libc::S_IFMT != libc::S_IFREG || !self.permits(&st, 1))
         {
-            return Err(errno::EACCES);
+            // Not a regular file, not to be run by the caller, or on a
+            // `noexec` mount, before any writer is looked for.
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG
+                || !self.permits(&st, 1)
+                || r.mount_flags & mounts::ms::NOEXEC != 0
+            {
+                return Err(errno::EACCES);
+            }
+            // Not a file open for writing.
+            if host_file_busy(&st) {
+                return Err(errno::ETXTBSY);
+            }
         }
         Ok(())
     }
@@ -925,9 +954,22 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     // SAFETY: the caller's guarantee, passed on.
     let r = unsafe { blocking_call(nr, a) }?;
     atime::after(noted, r);
+    after_write(nr, &a, r);
     // A write the host refused to a sealed memfd, and what a socket that
     // stands in for another kind reports, as Linux reports them.
     Some(linux_result(nr, &a, r))
+}
+
+/// After call `nr` with `a`, which returned `r`: a write to a set-ID
+/// file takes the bits away where Linux's would ([`modes::wrote`]).
+pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
+    use fwe_abi::nr as n;
+    if r > 0
+        && modes::setid_open()
+        && matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2)
+    {
+        modes::wrote(a[0] as i32);
+    }
 }
 
 /// The result of system call `nr` as Linux reports it where the host's
@@ -948,6 +990,14 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     r
 }
 
+/// Whether `fd` is a regular file.
+fn is_regular(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG }
+}
+
 /// `sendfile` (`both_files` false) and `copy_file_range` (true): copy up to
 /// `count` bytes from `input` to `output`, from the offset at `in_off` (a
 /// guest pointer, updated, leaving the file's own offset alone) or the
@@ -955,6 +1005,78 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
 /// The input must be a regular file or a block device (a loop device), as
 /// Linux has it; `copy_file_range` needs both to be regular files. Returns
 /// the bytes copied, or an errno when none were.
+/// Whether the file of host status `st` is open for writing.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+fn host_file_busy(st: &libc::stat) -> bool {
+    textbusy::is_being_written(st.st_dev as u64, st.st_ino as u64)
+}
+
+/// `copy_file_range`'s checks, in Linux's order: the descriptors
+/// (`EBADF`), the offsets (`EFAULT`), the flags (`EINVAL`); directories
+/// (`EISDIR`), anything but regular files (`EINVAL`), a descriptor not open
+/// to read or write as it is used, or appending (`EBADF`); an immutable
+/// output (`EPERM`), offsets that wrap (`EOVERFLOW`); then a range of the
+/// input's that overlaps the output's in the same file (`EINVAL`). The
+/// count to copy, cut at the input's end.
+fn copy_range_checks(
+    input: i32,
+    in_off: u64,
+    output: i32,
+    out_off: u64,
+    count: u64,
+    flags: u64,
+) -> Result<u64, i32> {
+    use fwe_abi::errno;
+    let stat = |fd: i32| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 { Err(errno::EBADF) } else { Ok(st) }
+    };
+    let (si, so) = (stat(input)?, stat(output)?);
+    let offset = |fd: i32, p: u64| -> Result<u64, i32> {
+        if p != 0 {
+            return uaccess::read::<i64>(p).map(|v| v as u64);
+        }
+        // SAFETY: plain host call on the guest's descriptor.
+        Ok(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }.max(0) as u64)
+    };
+    let (ipos, opos) = (offset(input, in_off)?, offset(output, out_off)?);
+    if flags != 0 {
+        return Err(errno::EINVAL);
+    }
+    let kind = |st: &libc::stat| st.st_mode & libc::S_IFMT;
+    if kind(&si) == libc::S_IFDIR || kind(&so) == libc::S_IFDIR {
+        return Err(errno::EISDIR);
+    }
+    let device = |fd: i32| loopdev::device_of(fd).is_some() || loopdev::is_control(fd);
+    if kind(&si) != libc::S_IFREG || kind(&so) != libc::S_IFREG || device(input) || device(output) {
+        return Err(errno::EINVAL);
+    }
+    // SAFETY: F_GETFL only queries the descriptors.
+    let (iacc, oacc) =
+        unsafe { (libc::fcntl(input, libc::F_GETFL), libc::fcntl(output, libc::F_GETFL)) };
+    if iacc & libc::O_ACCMODE == libc::O_WRONLY
+        || oacc & libc::O_ACCMODE == libc::O_RDONLY
+        || oacc & libc::O_APPEND != 0
+    {
+        return Err(errno::EBADF);
+    }
+    #[cfg(target_os = "macos")]
+    if so.st_flags & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0 {
+        return Err(errno::EPERM);
+    }
+    if ipos.checked_add(count).is_none() || opos.checked_add(count).is_none() {
+        return Err(errno::EOVERFLOW);
+    }
+    let count = count.min((si.st_size.max(0) as u64).saturating_sub(ipos));
+    let same = (si.st_dev, si.st_ino) == (so.st_dev, so.st_ino);
+    if same && count > 0 && opos + count > ipos && opos < ipos + count {
+        return Err(errno::EINVAL);
+    }
+    Ok(count)
+}
+
 fn copy_between(
     input: i32,
     in_off: u64,
@@ -977,6 +1099,15 @@ fn copy_between(
     };
     // A loop device reads and writes as a block device: `sendfile` takes
     // one, `copy_file_range` only regular files.
+    // The input open for reading, the output for writing.
+    // SAFETY: F_GETFL only queries the descriptors.
+    let (iacc, oacc) =
+        unsafe { (libc::fcntl(input, libc::F_GETFL), libc::fcntl(output, libc::F_GETFL)) };
+    if (iacc >= 0 && iacc & libc::O_ACCMODE == libc::O_WRONLY)
+        || (oacc >= 0 && oacc & libc::O_ACCMODE == libc::O_RDONLY)
+    {
+        return err(errno::EBADF);
+    }
     let device = |fd: i32| loopdev::device_of(fd).is_some();
     let (in_dev, out_dev) = (device(input), device(output));
     match (regular(input), regular(output)) {
@@ -1280,6 +1411,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Some(r) = loopdev::io(nr, &a) {
         return Some(r);
     }
+    if let Some(r) = procmem::io(nr, &a) {
+        return Some(r);
+    }
     if let Some(r) = mqueue::io(nr, &a) {
         return Some(r);
     }
@@ -1385,6 +1519,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 // SAFETY: the guest buffer spans the length.
                 return Some(unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) });
             }
+            if memfd::grow_refused(fd, None, len) {
+                return Some(fwe_abi::err(fwe_abi::errno::EPERM));
+            }
             // A file of a tmpfs with a size: as much as fits.
             let len = match tmpfs::room(fd, None, len) {
                 Ok(n) => n,
@@ -1397,6 +1534,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 host::ret(unsafe { libc::write(fd, (buf + at) as *const _, n as usize) } as i64)
             };
             if let Some(r) = fdstate::capped_write(fd, len, write) {
+                return Some(r);
+            }
+            // A pipe write Linux makes whole: whole.
+            if let Some(r) = pipelock::whole_write(fd, len, write) {
                 return Some(r);
             }
             // SAFETY: the host validates the guest buffer.
@@ -1454,12 +1595,36 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             let special = specialwrite::Source::Guest(a[1]);
             match specialwrite::write(a[0] as i32, special, a[2]) {
                 Some(r) => r,
+                None if memfd::grow_refused(a[0] as i32, Some(a[3]), a[2]) => {
+                    fwe_abi::err(fwe_abi::errno::EPERM)
+                }
                 // A file of a tmpfs with a size: as much as fits.
                 None => match tmpfs::room(a[0] as i32, Some(a[3]), a[2]) {
-                    // SAFETY: the host validates the guest buffer.
-                    Ok(n) => host::ret(unsafe {
-                        libc::pwrite(a[0] as i32, a[1] as *const _, n as usize, a[3] as libc::off_t)
-                    } as i64),
+                    Ok(n) => {
+                        let fd = a[0] as i32;
+                        // SAFETY: F_GETFL only queries the descriptor.
+                        let append =
+                            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_APPEND != 0;
+                        if append && is_regular(fd) {
+                            // Linux appends whatever the offset, leaving the
+                            // file's own offset where it was.
+                            // SAFETY: plain host calls; the host validates the
+                            // guest buffer.
+                            unsafe {
+                                let at = libc::lseek(fd, 0, libc::SEEK_CUR);
+                                let r = libc::write(fd, a[1] as *const _, n as usize);
+                                if at >= 0 {
+                                    libc::lseek(fd, at, libc::SEEK_SET);
+                                }
+                                host::ret(r as i64)
+                            }
+                        } else {
+                            // SAFETY: the host validates the guest buffer.
+                            host::ret(unsafe {
+                                libc::pwrite(fd, a[1] as *const _, n as usize, a[3] as libc::off_t)
+                            } as i64)
+                        }
+                    }
                     Err(e) => fwe_abi::err(e),
                 },
             }
@@ -1473,8 +1638,13 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::SPLICE => splice::splice(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5]),
         n::TEE => splice::tee(a[0] as i32, a[1] as i32, a[2], a[3]),
         n::VMSPLICE => splice::vmsplice(a[0] as i32, a[1], a[2], a[3]),
-        n::COPY_FILE_RANGE if a[5] != 0 => fwe_abi::err(fwe_abi::errno::EINVAL),
-        n::COPY_FILE_RANGE => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], a[4], true),
+        n::COPY_FILE_RANGE => {
+            match copy_range_checks(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5]) {
+                Ok(0) => 0,
+                Ok(count) => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], count, true),
+                Err(e) => fwe_abi::err(e),
+            }
+        }
         // SAFETY: caller guarantees the pollfd array and timeout pointers.
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // The sixth argument points to `{ const sigset_t *ss; size_t len }`.

@@ -91,6 +91,12 @@ pub enum Mark {
     /// thread `tid`; 0 for the process), `PIDFD_NONBLOCK` if `nonblock`
     /// ([`crate::pidfd`]).
     Pid { host: i32, tid: i32, nonblock: bool },
+    /// `/proc/self/mem`: the process's memory, by address
+    /// ([`crate::procmem`]).
+    Mem,
+    /// `/proc/self/pagemap`: an entry per page of the process's memory
+    /// ([`crate::procmem`]).
+    Pagemap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +119,10 @@ static CGROUP_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// for one only while there are any ([`atime_files`]).
 static ATIME_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many records are of files in a tmpfs, so that `fstat` looks for
+/// one only while there are any ([`tmpfs_mount`]).
+static TMPFS_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn count(rec: Option<&Record>, up: bool) {
     use crate::mounts::ms;
     use std::sync::atomic::Ordering::SeqCst;
@@ -126,6 +136,9 @@ fn count(rec: Option<&Record>, up: bool) {
     };
     if o.fstype == FsType::Cgroup2 {
         bump(&CGROUP_FILES);
+    }
+    if o.fstype == FsType::Tmpfs {
+        bump(&TMPFS_FILES);
     }
     if o.flags & (ms::NOATIME | ms::NODIRATIME | ms::STRICTATIME) != 0 {
         bump(&ATIME_FILES);
@@ -155,6 +168,17 @@ fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
 
 fn take(r: &mut BTreeMap<i32, Record>, fd: i32) {
     count(r.remove(&fd).as_ref(), false);
+}
+
+/// The tmpfs mount `fd` was opened in, if it is the file of host identity
+/// `dev`, `ino` opened in one.
+pub fn tmpfs_mount(fd: i32, dev: u64, ino: u64) -> Option<u32> {
+    if TMPFS_FILES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return None;
+    }
+    let r = records();
+    let rec = r.get(&fd).filter(|rec| (rec.dev, rec.ino) == (dev, ino))?;
+    rec.origin.as_ref().filter(|o| o.fstype == FsType::Tmpfs).map(|o| o.mount)
 }
 
 /// Whether `fd` is a file in a cgroup filesystem (which a write acts on,
@@ -451,6 +475,8 @@ pub fn save(e: &mut Enc) {
             Some(Mark::ProcLink) => 17,
             Some(Mark::TimerSlack { .. }) => 18,
             Some(Mark::Pid { .. }) => 19,
+            Some(Mark::Mem) => 20,
+            Some(Mark::Pagemap) => 21,
         });
         if let Some(Mark::Pid { host, tid, nonblock }) = rec.mark {
             e.i32(host);
@@ -533,6 +559,8 @@ pub fn load(d: &mut Dec) {
             17 => Some(Mark::ProcLink),
             18 => Some(Mark::TimerSlack { host: d.i32() }),
             19 => Some(Mark::Pid { host: d.i32(), tid: d.i32(), nonblock: d.bool() }),
+            20 => Some(Mark::Mem),
+            21 => Some(Mark::Pagemap),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

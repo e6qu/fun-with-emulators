@@ -25,3 +25,19 @@ pathconf02 musl's pathconf answers from a table without asking the kernel about 
 nice05 not planned (ROADMAP.md): it pins its processes to one CPU, which macOS cannot, and measures how the scheduler shares it
 close_range01 not planned (ROADMAP.md): its child shares the parent's descriptor table without its memory (CLONE_FILES without CLONE_VM), which macOS processes cannot
 setgroups03 musl's NGROUPS is 32 (glibc's is NGROUPS_MAX), so its setgroups(NGROUPS + 1) is in range and succeeds
+ioctl04 a tmpfs (LTP_DEV_FS_TYPE) takes no device, so the device's read-only flag does not stop a read-write mount
+open13 musl's fchmod and fchown retry an EBADF through /proc/self/fd/N, which succeeds for an O_PATH descriptor
+sched_setscheduler04 it checks the child with musl's sched_getscheduler and sched_getparam, stubs that fail (ENOSYS) without asking the kernel
+posix_fadvise02_64 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
+posix_fadvise03_64 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
+posix_fadvise04_64 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
+preadv203 it writes about 120 MB to its device's file system, and a tmpfs (LTP_DEV_FS_TYPE) without a device is limited to 32 MB
+preadv203_64 it writes about 120 MB to its device's file system, and a tmpfs (LTP_DEV_FS_TYPE) without a device is limited to 32 MB
+fcntl35 not planned (ROADMAP.md): Linux's default pipe is 16 pages, 256 KiB with 16 KiB pages, and a host pipe holds at most 64 KiB, so fwe's pipes start at 64 KiB
+fcntl35_64 not planned (ROADMAP.md): Linux's default pipe is 16 pages, 256 KiB with 16 KiB pages, and a host pipe holds at most 64 KiB, so fwe's pipes start at 64 KiB
+gethostname02 musl's gethostname copies a truncated name and succeeds without asking the kernel; the test expects ENAMETOOLONG
+sendmsg03 not planned (ROADMAP.md): it needs a raw socket
+sendmsg01 musl's sendmsg copies msg_control into a buffer of its own before the call, so the invalid control pointer faults in the program (SIGSEGV), not in the kernel (EFAULT)
+gethostbyname_r01 musl's gethostbyname_r takes the all-digit name for a numeric address and succeeds without asking the kernel; the test expects glibc's ERANGE
+nftw01 musl's nftw reports a file again when a symbolic link leads back to it; the test expects glibc's, which reports each file once
+nftw6401 musl's nftw reports a file again when a symbolic link leads back to it; the test expects glibc's, which reports each file once

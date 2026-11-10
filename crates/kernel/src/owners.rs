@@ -41,7 +41,13 @@ pub fn of_at(dir: i32, name: &CStr, st: &libc::stat) -> (u32, u32) {
     if !crate::modes::marked(st) {
         return host_owner(st);
     }
-    path_of(dir, name).and_then(|p| read_path(&p)).unwrap_or_else(|| host_owner(st))
+    match path_of(dir, name) {
+        Some(p) => read_path(&p),
+        // A path too long for the host: through a descriptor of the file.
+        None => crate::modes::open_at(dir, name)
+            .and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
+    }
+    .unwrap_or_else(|| host_owner(st))
 }
 
 /// [`of_fd`] for the file at host path `path` (not followed).
@@ -70,8 +76,13 @@ pub fn keep_fd(fd: i32, owner: (u32, u32)) -> Result<(), i32> {
 pub fn keep_at(dir: i32, name: &CStr, owner: (u32, u32)) -> Result<(), i32> {
     let st = fstatat(dir, name)?;
     let record = (owner != host_owner(&st)).then_some(owner);
-    let path = path_of(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
-    mark_path(&path, &st, record)
+    match path_of(dir, name) {
+        Some(path) => mark_path(&path, &st, record),
+        None => {
+            let fd = crate::modes::open_at(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
+            mark_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), &st, record)
+        }
+    }
 }
 
 /// Whether the file open as `fd` has an owner kept.
@@ -103,10 +114,15 @@ fn fstatat(dir: i32, name: &CStr) -> Result<libc::stat, i32> {
     if r != 0 { Err(last()) } else { Ok(st) }
 }
 
+/// The host path of `name` in directory `dir`, if the host takes one so
+/// long (a longer one is reached through a descriptor instead).
 fn path_of(dir: i32, name: &CStr) -> Option<std::ffi::CString> {
     let mut p = crate::fs::fd_path(dir)?;
     p.push(b'/');
     p.extend_from_slice(name.to_bytes());
+    if p.len() >= libc::PATH_MAX as usize {
+        return None;
+    }
     std::ffi::CString::new(p).ok()
 }
 

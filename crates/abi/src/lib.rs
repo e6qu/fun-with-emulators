@@ -219,6 +219,8 @@ pub mod mman {
     pub const MADV_WILLNEED: u64 = 3;
     pub const MADV_DONTNEED: u64 = 4;
     pub const MADV_FREE: u64 = 8;
+    pub const MADV_DONTDUMP: u64 = 16;
+    pub const MADV_DODUMP: u64 = 17;
 }
 
 /// File status flags (`asm-generic/fcntl.h`, arm64 overrides).
@@ -532,6 +534,8 @@ pub mod ioctl {
     /// (`_IOWR('f', 17, struct procmap_query)`).
     pub const PROCMAP_QUERY: u64 = 0xc068_6611;
     pub const TCGETS: u64 = 0x5401;
+    /// The old `struct termio` form of `TCGETS`.
+    pub const TCGETA: u64 = 0x5405;
     pub const TCSETS: u64 = 0x5402;
     pub const TCSETSW: u64 = 0x5403;
     pub const TCSETSF: u64 = 0x5404;
@@ -789,6 +793,9 @@ pub mod mqueue {
     pub const SIGEV_SIGNAL: i32 = 0;
     pub const SIGEV_NONE: i32 = 1;
     pub const SIGEV_THREAD: i32 = 2;
+    /// With `SIGEV_SIGNAL`: the signal goes to the thread `sigev_tid`
+    /// (POSIX timers).
+    pub const SIGEV_THREAD_ID: i32 = 4;
     /// `struct sigevent`: `sigev_value` (8 bytes), `sigev_signo`,
     /// `sigev_notify`, then the union (64 bytes in all).
     pub const SIGEVENT_SIZE: usize = 64;

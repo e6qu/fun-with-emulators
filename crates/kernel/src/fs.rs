@@ -263,6 +263,10 @@ pub struct Fs {
     /// The mount it was entered through (0 when not known), which it stays
     /// in when another is mounted over it, as on Linux.
     cwd_mount: u32,
+    /// Where the working directory is when a `chroot` left it outside the
+    /// root (a path in the namespace's view): `getcwd` reports it
+    /// unreachable, as Linux does, until the next `chdir`.
+    cwd_outside: Option<Vec<u8>>,
     /// The mount the root was set in (0 when not known), which it stays in
     /// when another is mounted over it.
     root_mount: u32,
@@ -320,6 +324,7 @@ impl Fs {
             root,
             cwd,
             cwd_mount,
+            cwd_outside: None,
             root_mount,
             root_host,
             mnt,
@@ -401,6 +406,7 @@ impl Fs {
             root,
             cwd: b"/".to_vec(),
             cwd_mount: 0,
+            cwd_outside: None,
             root_mount: 0,
             root_host,
             mnt,
@@ -429,6 +435,14 @@ impl Fs {
             None => self.file_id(&exe),
         };
         crate::maps::record().set_exe(exe.clone(), id.unwrap_or((0, 0)));
+        // The program's file is busy while it runs (`ETXTBSY`).
+        let host_id = match exe_fd {
+            Some(fd) => crate::fsops::host_identity(fd),
+            None => self.file_id(&exe),
+        };
+        if let Some((dev, ino)) = host_id {
+            crate::textbusy::running(dev, ino);
+        }
         crate::maps::publish();
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
     }
@@ -750,6 +764,13 @@ impl Fs {
             // The kernel's view of the process fills it in (see
             // `Kernel::self_status`); its place is held here.
             b"/proc/self/status" => return Some(crate::procfs::Entry::File(Vec::new())),
+            // Read and written by address (`crate::procmem`).
+            b"/proc/self/mem" | b"/proc/self/pagemap" => {
+                return Some(crate::procfs::Entry::File(Vec::new()));
+            }
+            b"/proc/self/coredump_filter" => {
+                return Some(crate::procfs::Entry::File(crate::coredump::FILTER.to_vec()));
+            }
             b"/proc/self/timerslack_ns" => {
                 // SAFETY: getpid cannot fail.
                 let (slack, _) = crate::procreg::slack(unsafe { libc::getpid() });
@@ -1116,6 +1137,18 @@ impl Fs {
         &self.cwd
     }
 
+    /// The working directory's path in the namespace's view, when a
+    /// `chroot` left it outside the root.
+    pub fn cwd_outside(&self) -> Option<&[u8]> {
+        self.cwd_outside.as_deref()
+    }
+
+    /// A `chroot` left the working directory outside the root, at `path`
+    /// (or inside it, `None`).
+    pub fn set_cwd_outside(&mut self, path: Option<Vec<u8>>) {
+        self.cwd_outside = path;
+    }
+
     pub fn umask(&self) -> u32 {
         self.umask
     }
@@ -1392,6 +1425,7 @@ impl Fs {
         drop(child);
         let guest = resolved.ns_path.as_deref().and_then(|ns| self.from_ns(ns));
         self.cwd_mount = resolved.mount_id;
+        self.cwd_outside = None;
         self.cwd = match guest {
             Some(g) => g,
             None => {
@@ -1423,6 +1457,7 @@ impl Fs {
         match opened.or(fallback) {
             Some(guest) => {
                 self.cwd = guest;
+                self.cwd_outside = None;
                 self.cwd_mount = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
                 self.republish();
                 Ok(())
@@ -1636,9 +1671,29 @@ pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
     })
 }
 
-/// Resolve `path` relative to `dirfd` in the view `v`: the work of
-/// [`Fs::resolve`], also done for the socket calls that run without the
-/// kernel lock ([`resolve_host`]).
+/// Whether a caller of file-system user `fsuid` may follow the symbolic
+/// link `name` in directory `dir`, with `fs.protected_symlinks` on: one in
+/// a sticky directory anyone may write to only if it is the caller's, or
+/// the directory's owner's (`EACCES`).
+fn may_follow(dir: i32, name: &std::ffi::CStr, fsuid: u32) -> Result<(), i32> {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Ok(());
+    }
+    let owner = crate::owners::of_at(dir, name, &st).0;
+    if owner == fsuid {
+        return Ok(());
+    }
+    let Some(parent) = guest_stat(dir) else { return Ok(()) };
+    let open = (libc::S_ISVTX | libc::S_IWOTH) as libc::mode_t;
+    if parent.st_mode & open != open || parent.st_uid == owner {
+        return Ok(());
+    }
+    Err(errno::EACCES)
+}
+
 /// The guest's metadata of the file open as `fd`: its kept mode and
 /// owner ([`crate::modes`], [`crate::owners`]).
 fn guest_stat(fd: i32) -> Option<libc::stat> {
@@ -1671,6 +1726,9 @@ pub(crate) fn guest_stat_at(dir: i32, name: &std::ffi::CStr) -> Option<libc::sta
     st
 }
 
+/// Resolve `path` relative to `dirfd` in the view `v`: the work of
+/// [`Fs::resolve`], also done for the socket calls that run without the
+/// kernel lock ([`resolve_host`]).
 fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
     let table = v.ns.table();
     let absolute = if path.first() == Some(&b'/') {
@@ -2055,6 +2113,9 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 symlinks += 1;
                 if symlinks > MAX_SYMLINKS {
                     return Err(errno::ELOOP);
+                }
+                if here.ovl.is_none() && crate::sysctl::protected_links().0 {
+                    may_follow(here.dir.as_raw_fd(), &comp_c, access.fsuid)?;
                 }
                 // A mount whose links are not followed.
                 let nofollow = here

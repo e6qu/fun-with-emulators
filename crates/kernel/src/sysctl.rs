@@ -68,6 +68,27 @@ fn globals() -> Option<&'static crate::shared::Record<Globals>> {
     G.get_or_init(|| crate::shared::Record::named("sysctl", 0, Globals::default).ok()).as_ref()
 }
 
+/// Whether `fs.protected_symlinks` and `fs.protected_hardlinks` are on,
+/// read again only when a sysctl has changed (the walk asks at each link).
+pub fn protected_links() -> (bool, bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    /// The record's generation the values are of (`u64::MAX`: none yet),
+    /// and the values (bit 0: symlinks, bit 1: hardlinks).
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    static BITS: AtomicU64 = AtomicU64::new(0);
+    let Some(r) = globals() else { return (false, false) };
+    let now = r.generation();
+    if SEEN.load(Ordering::Acquire) != now {
+        let on = |p: &[u8]| number(p).is_some_and(|n| n != 0);
+        let bits =
+            u64::from(on(b"fs/protected_symlinks")) | u64::from(on(b"fs/protected_hardlinks")) << 1;
+        BITS.store(bits, Ordering::Release);
+        SEEN.store(now, Ordering::Release);
+    }
+    let bits = BITS.load(Ordering::Acquire);
+    (bits & 1 != 0, bits & 2 != 0)
+}
+
 /// The value of the sysctl at `path` (under `/proc/sys`, `fs/inotify/...`)
 /// as a number, if it is one fwe keeps.
 pub fn number(path: &[u8]) -> Option<i64> {
@@ -186,6 +207,18 @@ const SYSCTLS: &[Sysctl] = &[
         path: b"fs/lease-break-time",
         default: "45",
         kind: Kind::Int(0, INT_MAX),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"fs/protected_hardlinks",
+        default: "0",
+        kind: Kind::Int(0, 1),
+        space: Space::Global,
+    },
+    Sysctl {
+        path: b"fs/protected_symlinks",
+        default: "0",
+        kind: Kind::Int(0, 1),
         space: Space::Global,
     },
     Sysctl {

@@ -142,8 +142,9 @@ fn of_fd(fd: i32) -> Option<(Vec<u8>, u64)> {
 
 /// How much of a write of `len` bytes at `offset` (the file's end, for
 /// `None`, or its position) to the file open as `fd` fits: all of it unless
-/// the file is in a sized tmpfs, where it may grow the file only by the
-/// room left (`ENOSPC` for none at all).
+/// the file is in a sized tmpfs, where what it writes past the file's end
+/// takes the room left (`ENOSPC` for none at all); a hole it leaves takes
+/// none.
 pub fn room(fd: i32, offset: Option<u64>, len: u64) -> Result<u64, i32> {
     let Some((dir, limit)) = of_fd(fd) else { return Ok(len) };
     // SAFETY: an all-zero `stat` is a valid out-parameter.
@@ -160,7 +161,9 @@ pub fn room(fd: i32, offset: Option<u64>, len: u64) -> Result<u64, i32> {
         let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
         if append || pos < 0 { size } else { pos as u64 }
     });
-    let growth = (at + len).saturating_sub(size);
+    // What it adds past the end: no more than it writes (a hole it leaves
+    // takes no room, as tmpfs's do not).
+    let growth = (at + len).saturating_sub(size).min(len);
     if growth == 0 {
         return Ok(len);
     }
@@ -169,7 +172,8 @@ pub fn room(fd: i32, offset: Option<u64>, len: u64) -> Result<u64, i32> {
         grew(&dir, growth);
         return Ok(len);
     }
-    let fits = (size + left).saturating_sub(at).min(len);
+    // What lies within the file now, and as much past it as there is room.
+    let fits = (len - growth + left).min(len);
     if fits == 0 {
         return Err(errno::ENOSPC);
     }
@@ -187,7 +191,9 @@ pub fn allocate(fd: i32, offset: u64, len: u64) -> Result<(), i32> {
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Ok(());
     }
-    let growth = (offset + len).saturating_sub((st.st_blocks.max(0) as u64) * 512);
+    // What the range adds: no more than its length, less what the file
+    // holds already.
+    let growth = (offset + len).saturating_sub((st.st_blocks.max(0) as u64) * 512).min(len);
     if growth > limit.saturating_sub(held(&dir)) {
         return Err(errno::ENOSPC);
     }

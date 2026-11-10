@@ -75,6 +75,10 @@ pub struct ProcRecord {
     /// Its main thread's timer slack and the default a slack of 0 restores
     /// (`PR_SET_TIMERSLACK`, `/proc/<pid>/timerslack_ns`), in nanoseconds.
     pub slack: (u64, u64),
+    /// Whether it has run a program of its own since its fork (Linux's
+    /// `PF_FORKNOEXEC` cleared): a parent may no longer move it to another
+    /// process group.
+    pub execed: bool,
 }
 
 /// A host process, as its pid and its start time.
@@ -212,6 +216,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     e.bytes(&r.maps);
     e.u64(r.slack.0);
     e.u64(r.slack.1);
+    e.bool(r.execed);
     e.into_bytes()
 }
 
@@ -241,6 +246,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let sched = Sched::decode(&mut d);
     let maps = d.bytes();
     let slack = (d.u64(), d.u64());
+    let execed = d.bool();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -264,6 +270,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         sched,
         maps,
         slack,
+        execed,
     })
 }
 
@@ -498,6 +505,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         sched: Sched::default(),
         maps: Vec::new(),
         slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
+        execed: false,
     });
     f(&mut r);
     write(pid, &r);
@@ -523,6 +531,7 @@ pub fn own_program(exe: &[u8], cmdline: &[u8]) {
         r.exe = exe.to_vec();
         r.cmdline = cmdline.to_vec();
         r.comm = comm;
+        r.execed = true;
     });
 }
 
@@ -601,6 +610,12 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
     (r.oom_score_adj, r.oom_score_adj_min) = i.oom;
     r.nice = i.nice;
     r.sched = i.sched;
+    // `SCHED_RESET_ON_FORK`: the child starts as an ordinary process (a
+    // real-time or deadline policy, and a raised priority, not passed on).
+    if r.sched.reset_on_fork {
+        r.sched = Sched::default();
+        r.nice = r.nice.max(0);
+    }
     if i.slack != 0 {
         r.slack = (i.slack, i.slack);
     }
@@ -1077,6 +1092,8 @@ pub fn exiting(status: i32) {
     // Its files closed, as it ends (inotify's close events), and its
     // instances gone.
     crate::inotify::exiting();
+    // The program it runs no longer.
+    crate::textbusy::exiting();
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
     let me = me();

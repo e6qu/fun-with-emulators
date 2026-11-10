@@ -16,6 +16,7 @@
 //! [`keep_fd`] with its own mode).
 
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(target_os = "macos")]
 const ATTR: &CStr = c"org.fwe.mode";
@@ -24,11 +25,94 @@ const MARK: u32 = libc::UF_NODUMP;
 
 /// What the host's mode must have of guest mode `perm` (its low 12 bits)
 /// for a directory (`dir`) or another file: the owner's read and write,
-/// and search for a directory or execute for a file anyone may run.
+/// and search for a directory or execute for a file anyone may run. A
+/// file's set-ID bits are never the host's (it drops them from a file of a
+/// group its user is not in, and on any write): they are kept.
 pub fn host_perm(perm: u32, dir: bool) -> u32 {
     // Execute for anyone is the owner's too: root may run what anyone may.
     let exec = dir || perm & 0o111 != 0;
-    perm & 0o7777 | 0o600 | if exec { 0o100 } else { 0 }
+    let setid = if dir { 0 } else { 0o6000 };
+    perm & 0o7777 & !setid | 0o600 | if exec { 0o100 } else { 0 }
+}
+
+/// Descriptors open to write a file whose kept mode is set-ID: a write
+/// through one by a caller without `CAP_FSETID` takes the bits away, as
+/// Linux's does ([`wrote`]).
+static SETID_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+static SETID_OPEN: AtomicUsize = AtomicUsize::new(0);
+/// Whether the caller has `CAP_FSETID`, as of its last system call that
+/// took the kernel's lock ([`note_fsetid`]).
+static FSETID: AtomicBool = AtomicBool::new(true);
+
+fn setid_fds() -> std::sync::MutexGuard<'static, Vec<i32>> {
+    SETID_FDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether any descriptor is open to write a set-ID file.
+pub fn setid_open() -> bool {
+    SETID_OPEN.load(Ordering::Acquire) != 0
+}
+
+/// The caller has `CAP_FSETID` (`has`), while set-ID files are open.
+pub fn note_fsetid(has: bool) {
+    FSETID.store(has, Ordering::Relaxed);
+}
+
+/// `fd` was opened, or its file's kept mode set, as `perm`: it is watched
+/// if it writes a set-ID file.
+fn watch_setid(fd: i32, perm: u32) {
+    if perm & 0o6000 == 0 {
+        return;
+    }
+    // SAFETY: F_GETFL only queries the descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
+        return;
+    }
+    let mut fds = setid_fds();
+    if !fds.contains(&fd) {
+        fds.push(fd);
+        SETID_OPEN.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// `fd` was opened to write the file of host metadata `st`.
+pub fn opened_for_writing(fd: i32, st: &libc::stat) {
+    if marked(st)
+        && st.st_mode & libc::S_IFMT == libc::S_IFREG
+        && let Some(perm) = read_fd(fd)
+    {
+        watch_setid(fd, perm);
+    }
+}
+
+/// `fd` was closed.
+pub fn closed(fd: i32) {
+    if !setid_open() {
+        return;
+    }
+    let mut fds = setid_fds();
+    if let Some(i) = fds.iter().position(|&f| f == fd) {
+        fds.swap_remove(i);
+        SETID_OPEN.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `fd` was written to: a set-ID file written by a caller without
+/// `CAP_FSETID` loses its set-user-ID bit, and its set-group-ID bit if
+/// its group may execute it.
+pub fn wrote(fd: i32) {
+    if !setid_open() || FSETID.load(Ordering::Relaxed) || !setid_fds().contains(&fd) {
+        return;
+    }
+    let Some(perm) = read_fd(fd) else { return };
+    let mut kept = perm & !0o4000;
+    if kept & 0o2010 == 0o2010 {
+        kept &= !0o2000;
+    }
+    if kept != perm {
+        let _ = keep_fd(fd, kept);
+    }
 }
 
 /// The permission bits of host metadata `st`.
@@ -46,6 +130,18 @@ pub fn marked(st: &libc::stat) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn marked(_st: &libc::stat) -> bool {
     false
+}
+
+/// Whether the file open as `fd`, with host metadata `st`, has the host's
+/// no-dump flag of its own (`FS_NODUMP_FL`), not as the mark of a kept
+/// mode.
+pub fn nodump_fd(fd: i32, st: &libc::stat) -> bool {
+    marked(st) && read_fd(fd).is_none()
+}
+
+/// [`nodump_fd`] for `name` in directory `dir`.
+pub fn nodump_at(dir: i32, name: &CStr, st: &libc::stat) -> bool {
+    marked(st) && read_at(dir, name).is_none()
 }
 
 /// The guest's permission bits of the file whose host metadata is `st`:
@@ -71,7 +167,7 @@ pub fn guest_perm_at(dir: i32, name: &CStr, st: &libc::stat) -> u32 {
     if !marked(st) {
         return host;
     }
-    path_of(dir, name).and_then(|p| read_path(&p)).unwrap_or(host)
+    read_at(dir, name).unwrap_or(host)
 }
 
 /// Put the guest's permission bits in `st`.
@@ -94,7 +190,11 @@ pub fn keep_fd(fd: i32, perm: u32) -> Result<(), i32> {
     if unsafe { libc::fchmod(fd, host as libc::mode_t) } != 0 {
         return Err(last());
     }
-    mark_fd(fd, &st, (host != perm & 0o7777).then_some(perm & 0o7777))
+    mark_fd(fd, &st, (host != perm & 0o7777).then_some(perm & 0o7777))?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFREG {
+        watch_setid(fd, perm);
+    }
+    Ok(())
 }
 
 /// [`keep_fd`] for `name` in directory `dir` (not a symbolic link, whose
@@ -113,8 +213,38 @@ pub fn keep_at(dir: i32, name: &CStr, perm: u32) -> Result<(), i32> {
     if r != 0 {
         return Err(last());
     }
-    let path = path_of(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
-    mark_path(&path, &st, (host != perm & 0o7777).then_some(perm & 0o7777))
+    let kept = (host != perm & 0o7777).then_some(perm & 0o7777);
+    match path_of(dir, name) {
+        Some(path) => mark_path(&path, &st, kept),
+        // A path too long for the host: through a descriptor of the file.
+        None => {
+            let fd = open_at(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
+            mark_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), &st, kept)
+        }
+    }
+}
+
+/// A descriptor of `name` in directory `dir` (a symbolic link itself)
+/// that reads nothing, for its attributes, where its path is too long
+/// for the host to take.
+pub(crate) fn open_at(dir: i32, name: &CStr) -> Option<std::os::fd::OwnedFd> {
+    #[cfg(target_os = "macos")]
+    const HOW: i32 = 0x8000 | 0x20_0000; // O_EVTONLY | O_SYMLINK
+    #[cfg(not(target_os = "macos"))]
+    const HOW: i32 = libc::O_PATH | libc::O_NOFOLLOW;
+    // SAFETY: `name` NUL-terminated; `dir` live; the result is owned.
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), HOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    // SAFETY: a descriptor just opened, owned here.
+    (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+}
+
+/// The kept mode of `name` in directory `dir`, by its path or, where that
+/// is too long for the host, a descriptor of it.
+fn read_at(dir: i32, name: &CStr) -> Option<u32> {
+    match path_of(dir, name) {
+        Some(p) => read_path(&p),
+        None => open_at(dir, name).and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
+    }
 }
 
 /// Whether a caller without the capabilities may do `want` (`R_OK`,
@@ -143,10 +273,15 @@ fn fstatat(dir: i32, name: &CStr) -> Result<libc::stat, i32> {
     if r != 0 { Err(last()) } else { Ok(st) }
 }
 
+/// The host path of `name` in directory `dir`, if the host takes one so
+/// long (a longer one is reached through a descriptor instead).
 fn path_of(dir: i32, name: &CStr) -> Option<std::ffi::CString> {
     let mut p = crate::fs::fd_path(dir)?;
     p.push(b'/');
     p.extend_from_slice(name.to_bytes());
+    if p.len() >= libc::PATH_MAX as usize {
+        return None;
+    }
     std::ffi::CString::new(p).ok()
 }
 
@@ -295,6 +430,17 @@ fn mark_path(_path: &CStr, _st: &libc::stat, _perm: Option<u32>) -> Result<(), i
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn set_id_bits_of_a_file_are_never_the_hosts() {
+        assert_eq!(host_perm(0o7777, false), 0o1777);
+        assert_eq!(host_perm(0o4755, false), 0o755);
+        assert_eq!(host_perm(0o2750, false), 0o750);
+        // A directory's set-group-ID is the host's (it gives new files
+        // the directory's group).
+        assert_eq!(host_perm(0o2775, true), 0o2775);
+        assert_eq!(host_perm(0o440, false), 0o640);
+    }
 
     #[test]
     fn a_mode_denying_the_owner_is_kept() {

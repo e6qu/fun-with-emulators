@@ -1457,6 +1457,7 @@ how it is bridged:
 | OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
 | leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits for it, up to `fs.lease-break-time` |
 | `F_SETSIG`, thread owners | `SIGIO` to a process or group | kept per descriptor (`crates/kernel/src/fdstate.rs`); see [Network events](#network-events) for how a host `SIGIO` arrives |
+| writes kept whole (`PIPE_BUF`) | 4096 bytes | 512 bytes | up to 4096 bytes whole: the writers of such a write to one pipe take turns (a lock of the pipe's own every fwe process shares) |
 | pipe size (`F_SETPIPE_SZ`) | fixed, 64 KiB at most | kept by fwe and reported as set; a smaller pipe holds no more than Linux's would, its writes cut to the room left in its page buffers and its write end not writable to `poll` or `epoll` while full; one set above 64 KiB holds no more than the host's |
 | extended attributes | own namespace (`com.apple.`) | Linux names stored as host attributes of the same name; Linux's rules per namespace; only Linux's namespaces are listed; `system.` ACLs not kept |
 | mode bits; root passes them | owner's bits enforced on the owner | a mode denying its owner is kept in an attribute (`UF_NODUMP` flags the file), the host file keeps owner read/write (`crates/kernel/src/modes.rs`) |
@@ -1710,6 +1711,7 @@ itself:
 | clocks: `REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`, `*_COARSE`, `*_ALARM`, CPU-time | fewer | mapped onto the host's realtime, monotonic, raw and CPU-time clocks (`host::clock_to_host`) |
 | setting the clock (`CAP_SYS_TIME`) | root | refused with `EPERM` after Linux's argument checks, as in a container |
 | interval timers (`setitimer`, `alarm`) | the same, at most 100,000,000 s | the host's |
+| POSIX timers (`timer_create` and the rest) on any clock, with overruns | none | a thread of fwe's per process that raises each timer's signal when it is due; a periodic timer goes again when its signal is taken, its overrun the intervals that passed (`crates/kernel/src/posixtimer.rs`) |
 | sleeps and timeouts (`nanosleep`, `clock_nanosleep`, `poll`, `select`, the `epoll` waits, futex waits, timerfd), woken within the timer slack (50 µs by default) | coalesced: a millisecond or more late | a kqueue timer per thread with `NOTE_CRITICAL`, in nanoseconds, which wakes within tens of microseconds |
 | nice, scheduling policies | own scheduler | kept in the process record with Linux's checks, inherited; the host schedules every process alike |
 | `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, `CORE`, `STACK`, `CPU`, `NPROC`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`): `CORE` for fwe's core dumps, `STACK` for the guest's stack, `CPU`'s hard limit and `NPROC` enforced by fwe; `NOFILE` is virtual, below fwe's reserved descriptors; `FSIZE`, `DATA`, `AS` are the host's |
