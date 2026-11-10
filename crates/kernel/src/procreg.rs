@@ -1095,6 +1095,7 @@ pub fn exiting(status: i32) {
     // The program it runs no longer; no tracer waits on it.
     crate::textbusy::exiting();
     crate::ptrace::exiting(status);
+    crate::thread::process_ending();
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
     let me = me();

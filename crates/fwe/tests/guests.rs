@@ -2826,6 +2826,7 @@ const PTRACE: &str = "stop: signal 19\n\
     thread: events 1, new thread stopped 1, its end 1, exit 5\n\
     waitid: signal true, trapped true, status 19\n\
     step: exit 21, stepped true\n\
+    attach: listed true, tgkill true, attached true, signal 19, pc true, detached true\n\
     breakpoint: signal 5, at work true, argument 10, exit 21\n";
 
 /// ptrace: a traced child stops for a signal, has its memory read and

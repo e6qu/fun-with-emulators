@@ -375,7 +375,12 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     if sig == host::WAKE_SIGNAL {
         // Signals the host lacks, queued by another process.
         fwe_kernel::signote::drain(|lsig, note| {
-            thread::post_landed(lsig, host::sent_info(note));
+            // One for a thread of this process goes to it, if it is there.
+            if note.tid != 0 {
+                thread::post_directed(note.tid, lsig, host::sent_info(note));
+            } else {
+                thread::post_landed(lsig, host::sent_info(note));
+            }
         });
     } else {
         // The host's own SIGINFO (Ctrl-T), no relay: nothing on Linux.

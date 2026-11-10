@@ -457,8 +457,13 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
                 };
             }
             if let Some(t) = sub.strip_prefix(b"/task/") {
-                // The main thread only: fwe knows another's threads by count.
-                return if t == pid.to_string().as_bytes() { Entry::Dir } else { Entry::Missing };
+                // Its threads, as it published them (the main thread always).
+                let listed = t == pid.to_string().as_bytes()
+                    || std::str::from_utf8(t)
+                        .ok()
+                        .and_then(|t| t.parse::<i32>().ok())
+                        .is_some_and(|t| crate::thread::published_tids(host).contains(&t));
+                return if listed { Entry::Dir } else { Entry::Missing };
             }
             Entry::Missing
         }
@@ -475,7 +480,16 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
                 .iter()
                 .map(|n| (n.to_vec(), DT_LNK)),
         ),
-        b"/task" => out.push((pid.to_string().into_bytes(), DT_DIR)),
+        b"/task" => {
+            out.push((pid.to_string().into_bytes(), DT_DIR));
+            let me = pid.to_string().into_bytes();
+            for t in crate::thread::published_tids(crate::pidns::to_host(pid).unwrap_or(pid)) {
+                let name = t.to_string().into_bytes();
+                if name != me {
+                    out.push((name, DT_DIR));
+                }
+            }
+        }
         _ => return None,
     }
     Some(out)

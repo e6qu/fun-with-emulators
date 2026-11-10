@@ -1425,6 +1425,7 @@ woken with the wake signal:
 | `kill` of itself with a fault signal (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | recorded directly, since macOS's `siginfo` cannot tell a sent one from a fault | none |
 | `kill`/`tgkill`/`rt_sigqueueinfo` with a real-time signal (or `SIGSTKFLT`, `SIGPWR`) | recorded directly within the process; to another fwe process queued in its mailbox with the sender, code and value (`signal::send_unhosted`); to a process that is not fwe's `EINVAL` | `SIGEMT` to wake the target |
 | `tgkill(tgid, tid, sig)`, a signal the guest catches or a fault signal | posted to that thread directly, which a relayed host signal could not target | `SIGEMT` to wake it |
+| `tgkill`/`tkill` of a thread of another process | queued in its process's mailbox with the tid, and posted to that thread | `SIGEMT` to wake the process |
 | `tgkill` of a signal the host acts on | — | `pthread_kill(<host thread>, <host signal>)` |
 | `kill(-1, sig)` | only the caller's pid namespace or its run of fwe, never other host processes | `kill` of each |
 

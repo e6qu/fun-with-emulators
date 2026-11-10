@@ -412,7 +412,14 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   its deadline sleeps the same way, a wake writing to its pipe.
 - **Signals the host lacks, between processes:** queued in the target's
   mailbox (up to 64, with sender, code and value) and the target woken
-  with `SIGEMT`; its wake handler moves them onto its pending sets.
+  with `SIGEMT`; its wake handler moves them onto its pending sets. One
+  for a thread of another process (`tgkill`, ptrace's attach) is queued
+  with the tid and posted to that thread through a table of the threads'
+  pending sets the handler reads without a lock.
+- **Threads of another process:** each tid's process is recorded beside
+  the shared tid counter, and a process with more than its main thread
+  publishes its tids (`tids-<pid>` in fwe's private directory), which
+  `/proc/<pid>/task` lists.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.
@@ -937,9 +944,7 @@ something a Linux program could notice. The [roadmap](../ROADMAP.md) says
 which are to be lifted for 1.0 and which are not planned.
 
 **Execution**
-- ptrace cannot attach to a thread of another process other than its
-  main one (fwe sends no signal to another process's thread). There is no
-  seccomp event, no hardware breakpoint or watchpoint (their register
+- ptrace has no seccomp event, no hardware breakpoint or watchpoint (their register
   sets say there are none), and no `PTRACE_INTERRUPT`/`LISTEN`; a single step over an exclusive load and
   store loops, as a breakpoint between them clears the monitor.
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,

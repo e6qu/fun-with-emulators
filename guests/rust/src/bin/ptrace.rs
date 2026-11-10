@@ -9,7 +9,10 @@
 //! thread stopping first under its own id, its end reported); `waitid`
 //! reports a stop (`CLD_TRAPPED`); it runs to its end one
 //! instruction at a time (`PTRACE_SINGLESTEP`); and a breakpoint planted
-//! in its code stops it there. It prints what it observed.
+//! in its code stops it there; and a thread of a running process that is
+//! not traced is listed in `/proc/<pid>/task`, reached by `tgkill`, and
+//! attached to on its own (`PTRACE_ATTACH` of its tid), stopping while its
+//! process goes on. It prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
@@ -18,6 +21,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const SYS_PTRACE: c_long = 117;
 const SYS_WRITE: c_long = 64;
+const SYS_GETTID: c_long = 178;
+const SYS_TGKILL: c_long = 131;
+const PTRACE_ATTACH: c_long = 16;
+const PTRACE_DETACH: c_long = 17;
 const SIGSTOP: c_int = 19;
 const SIGTRAP: i32 = 5;
 const SIGCHLD: i32 = 17;
@@ -54,6 +61,9 @@ unsafe extern "C" {
     fn waitid(idtype: c_int, id: c_int, info: *mut [i32; 32], options: c_int) -> c_int;
     fn syscall(n: c_long, ...) -> c_long;
     fn _exit(code: c_int) -> !;
+    fn pipe(fds: *mut c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+    fn write(fd: c_int, buf: *const u8, n: usize) -> isize;
 }
 
 static SECRET: AtomicU64 = AtomicU64::new(0x1122_3344_5566_7788);
@@ -257,6 +267,50 @@ fn main() {
         steps += 1;
     };
     println!("step: exit {}, stepped {}", exit_code(st), steps > 10);
+
+    // A thread of a running process attached to on its own.
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: a valid out-array; plain calls; the child ends by SIGKILL.
+    let c = unsafe {
+        pipe(fds.as_mut_ptr());
+        let c = fork();
+        if c == 0 {
+            let w = fds[1];
+            std::thread::spawn(move || {
+                let tid = syscall(SYS_GETTID) as i32;
+                write(w, tid.to_ne_bytes().as_ptr(), 4);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        c
+    };
+    let mut b = [0u8; 4];
+    // SAFETY: a valid buffer.
+    unsafe { read(fds[0], b.as_mut_ptr(), 4) };
+    let tid = i32::from_ne_bytes(b);
+    let listed = std::fs::read_dir(format!("/proc/{c}/task"))
+        .map(|d| d.filter_map(Result::ok).any(|e| e.file_name().to_str() == Some(&tid.to_string())))
+        .unwrap_or(false);
+    // SAFETY: the raw call, signal 0 only checks the thread.
+    let reached = unsafe { syscall(SYS_TGKILL, c as c_long, tid as c_long, 0 as c_long) } == 0;
+    let attached = ptrace(PTRACE_ATTACH, tid, 0, 0) == 0;
+    let sig = stopsig(wait(tid));
+    let (r, _) = regs(tid);
+    let detached = ptrace(PTRACE_DETACH, tid, 0, 0) == 0;
+    // SAFETY: plain calls on the child.
+    unsafe {
+        kill(c, 9);
+        waitpid(c, &mut 0, 0);
+    }
+    println!(
+        "attach: listed {listed}, tgkill {reached}, attached {attached}, signal {sig}, pc {}, detached {detached}",
+        r[32] != 0
+    );
 
     // A breakpoint.
     let c = traced_child(|| work(10));

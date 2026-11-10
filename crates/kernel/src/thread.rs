@@ -67,6 +67,12 @@ pub fn init_main(pid: i32) {
         PROCESS.post(s, i);
     }
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // The parent's threads are none of the child's.
+    for d in &DIRECTED {
+        d.tid.store(0, Ordering::Release);
+        d.readers.store(0, Ordering::Release);
+        d.pending.store(std::ptr::null_mut(), Ordering::Release);
+    }
     forget_wait_pipes();
     crate::pdeath::forked();
     crate::futex::forked_child();
@@ -424,9 +430,79 @@ fn shared_tid() -> Option<i32> {
         let n = if (TID_FIRST..TID_END).contains(&n) { n } else { TID_FIRST };
         let next = if n + 1 >= TID_END { TID_FIRST } else { n + 1 };
         libc::pwrite(fd, next.to_ne_bytes().as_ptr().cast(), 4, 0);
+        // Whose it is, for another process to find it by ([`owner_of_tid`]):
+        // the slot of each tid, after the counter.
+        let me = libc::getpid();
+        libc::pwrite(fd, me.to_ne_bytes().as_ptr().cast(), 4, owner_at(n));
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
         Some(n)
+    }
+}
+
+/// Where in the counter's file thread `tid`'s process is.
+fn owner_at(tid: i32) -> libc::off_t {
+    (4 + 4 * i64::from(tid - TID_FIRST)) as libc::off_t
+}
+
+/// The host process thread `tid` (one of another process's) is in, if a
+/// live one.
+pub fn owner_of_tid(tid: i32) -> Option<i32> {
+    if !(TID_FIRST..TID_END).contains(&tid) {
+        return None;
+    }
+    let dir = crate::procreg::records_dir()?;
+    let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
+    let mut b = [0u8; 4];
+    // SAFETY: a NUL-terminated path; a 4-byte buffer; closed below.
+    let n = unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return None;
+        }
+        let n = libc::pread(fd, b.as_mut_ptr().cast(), 4, owner_at(tid));
+        libc::close(fd);
+        n
+    };
+    let pid = i32::from_ne_bytes(b);
+    (n == 4 && pid > 0 && crate::host::process_exists(pid) && published_tids(pid).contains(&tid))
+        .then_some(pid)
+}
+
+/// The threads (tids, the main thread's the process's pid) another
+/// process published ([`publish_tids`]).
+pub fn published_tids(pid: i32) -> Vec<i32> {
+    let Some(dir) = crate::procreg::records_dir() else { return Vec::new() };
+    let Ok(b) = std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+        &tids_file(&dir, pid),
+    )) else {
+        return Vec::new();
+    };
+    b.chunks_exact(4).map(|c| i32::from_ne_bytes(c.try_into().unwrap())).collect()
+}
+
+fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {
+    [dir, format!("/tids-{pid}").as_bytes()].concat()
+}
+
+/// Publish this process's threads, for another process to list
+/// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): only
+/// while it has more than its main thread.
+fn publish_tids(tids: &[i32]) {
+    let Some(dir) = crate::procreg::records_dir() else { return };
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let path = tids_file(&dir, me);
+    let p = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path);
+    if tids.len() <= 1 {
+        let _ = std::fs::remove_file(p);
+        return;
+    }
+    let b: Vec<u8> = tids.iter().flat_map(|t| t.to_ne_bytes()).collect();
+    let tmp = [&path[..], b".new"].concat();
+    let t = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&tmp);
+    if std::fs::write(t, b).is_ok() {
+        let _ = std::fs::rename(t, p);
     }
 }
 
@@ -679,6 +755,8 @@ pub fn register(tid: i32) -> Arc<Pending> {
     let pending = Arc::new(Pending::new());
     let entry = Registered { tid, pending: pending.clone(), host: 0 };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    directed_add(tid, Arc::as_ptr(&pending));
+    publish_tids(&tids());
     pending
 }
 
@@ -693,12 +771,22 @@ pub fn set_host_thread(pending: &Arc<Pending>, host: libc::pthread_t) {
     let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = threads.iter_mut().find(|r| Arc::ptr_eq(&r.pending, pending)) {
         r.host = host;
+        directed_host(r.tid, host);
     }
 }
 
 /// Drop the registration owning `pending` (a thread that never started).
 pub fn unregister(pending: &Arc<Pending>) {
-    THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| !Arc::ptr_eq(&r.pending, pending));
+    let gone: Vec<i32> = {
+        let mut t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let gone = t.iter().filter(|r| Arc::ptr_eq(&r.pending, pending)).map(|r| r.tid).collect();
+        t.retain(|r| !Arc::ptr_eq(&r.pending, pending));
+        gone
+    };
+    for tid in gone {
+        directed_remove(tid);
+    }
+    publish_tids(&tids());
 }
 
 /// Forget the calling thread's registration as it exits.
@@ -707,7 +795,98 @@ pub fn unregister_current() {
     crate::pidfd::thread_gone(tid());
     drop_wait_pipe();
     let own = OWN.with(|o| o.replace(std::ptr::null()));
+    directed_remove(tid());
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
+    publish_tids(&tids());
+}
+
+/// As the process ends: its published threads go.
+pub fn process_ending() {
+    publish_tids(&[]);
+}
+
+// --- signals for a named thread, from a handler ------------------------------------
+//
+// A signal another process sends one thread of this one comes through the
+// wake signal's handler ([`crate::signote`]), which must not take the
+// registry's lock: each thread's pending set and host thread are also kept
+// in a table it reads without one, an entry counting its readers so it is
+// not taken away while one reads it.
+
+const DIRECTED_SLOTS: usize = 512;
+
+struct Directed {
+    tid: AtomicI32,
+    readers: AtomicU32,
+    pending: std::sync::atomic::AtomicPtr<Pending>,
+    host: std::sync::atomic::AtomicUsize,
+}
+
+static DIRECTED: [Directed; DIRECTED_SLOTS] = [const {
+    Directed {
+        tid: AtomicI32::new(0),
+        readers: AtomicU32::new(0),
+        pending: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        host: std::sync::atomic::AtomicUsize::new(0),
+    }
+}; DIRECTED_SLOTS];
+
+fn directed_add(tid: i32, pending: *const Pending) {
+    for d in &DIRECTED {
+        if d.tid.load(Ordering::Acquire) == 0 && d.readers.load(Ordering::Acquire) == 0 {
+            d.pending.store(pending as *mut Pending, Ordering::Release);
+            d.host.store(0, Ordering::Release);
+            if d.tid.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_cast)] // `pthread_t` is a pointer on macOS
+fn directed_host(tid: i32, host: libc::pthread_t) {
+    if let Some(d) = DIRECTED.iter().find(|d| d.tid.load(Ordering::Acquire) == tid) {
+        d.host.store(host as usize, Ordering::Release);
+    }
+}
+
+fn directed_remove(tid: i32) {
+    if let Some(d) = DIRECTED.iter().find(|d| d.tid.load(Ordering::Acquire) == tid) {
+        d.tid.store(0, Ordering::Release);
+        // Until no handler reads it.
+        while d.readers.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
+        d.pending.store(std::ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// Post `sig` for thread `tid` of this process and wake it: whether it was
+/// there. Async-signal-safe.
+#[allow(clippy::unnecessary_cast)] // `pthread_t` is a pointer on macOS
+pub fn post_directed(tid: i32, sig: u64, info: SigInfo) -> bool {
+    for d in &DIRECTED {
+        if d.tid.load(Ordering::Acquire) != tid {
+            continue;
+        }
+        d.readers.fetch_add(1, Ordering::AcqRel);
+        let p = d.pending.load(Ordering::Acquire);
+        let ok = d.tid.load(Ordering::Acquire) == tid && !p.is_null();
+        if ok {
+            // SAFETY: the set lives while its entry names it, and the entry
+            // is not taken away while a reader is counted.
+            unsafe { (*p).post(sig, info) };
+            let host = d.host.load(Ordering::Acquire);
+            // SAFETY: pthread_self cannot fail.
+            if host != 0 && host != unsafe { libc::pthread_self() } as usize {
+                // SAFETY: a registered thread, live while its entry is.
+                unsafe { libc::pthread_kill(host as libc::pthread_t, crate::host::WAKE_SIGNAL) };
+            }
+        }
+        d.readers.fetch_sub(1, Ordering::AcqRel);
+        return ok;
+    }
+    false
 }
 
 fn with_own<R>(f: impl FnOnce(&Pending) -> R) -> R {
