@@ -592,6 +592,11 @@ impl<P: Platform> Kernel<P> {
             Some(v) => align_down(v, 16),
             None => return false,
         };
+        // `SS_AUTODISARM`: the handler runs with no alternate stack, which
+        // `rt_sigreturn` restores from the frame.
+        if on_altstack && !already_on_alt && altstack.ss_flags & signal::SS_AUTODISARM != 0 {
+            thread::set_altstack(Stack { ss_flags: signal::SS_DISABLE, ..Stack::default() });
+        }
 
         // An `rt_sigsuspend` in progress: the frame restores the mask from
         // before the call, and the handler runs with the call's mask.

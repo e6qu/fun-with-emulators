@@ -16,9 +16,9 @@
 //! interest list is also recorded here ([`save`], [`restore`]): a fork
 //! child rebuilds its epoll descriptors from it.
 //!
-//! Guest addresses are host addresses, so `epoll_event` arrays are read and
-//! written in place. The arm64 layout is `{ u32 events; u64 data; }`, not
-//! packed as on x86-64: `data` sits at offset 8 and the stride is 16 bytes.
+//! `epoll_event` arrays are copied in and out of guest memory. The arm64
+//! layout is `{ u32 events; u64 data; }`, not packed as on x86-64: `data`
+//! sits at offset 8 and the stride is 16 bytes.
 
 /// Each epoll descriptor's interest list: `fd -> (events, data)`.
 #[cfg(not(target_os = "linux"))]

@@ -494,6 +494,8 @@ pub mod signal {
     /// `ss_flags` bits.
     pub const SS_ONSTACK: i32 = 1;
     pub const SS_DISABLE: i32 = 2;
+    /// The alternate stack is disabled while a handler runs on it.
+    pub const SS_AUTODISARM: i32 = i32::MIN;
 
     /// `si_code` values shared across signals.
     pub const SI_USER: i32 = 0;

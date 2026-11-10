@@ -797,7 +797,7 @@ impl<P: Platform> Kernel<P> {
                 self.sys_getrandom(a[0], a[1])
             }
 
-            // Not implemented yet. rseq and membarrier are optional for libc.
+            // Any other call: `ENOSYS`, as Linux gives a call it lacks.
             _ => {
                 self.tracer.note(&format!("unimplemented syscall {n}"));
                 err(errno::ENOSYS)
@@ -2160,12 +2160,20 @@ impl<P: Platform> Kernel<P> {
             guest!(uaccess::write(old, thread::altstack()));
         }
         if ss != 0 {
-            let s: Stack = guest!(uaccess::read(ss));
-            if s.ss_flags & !libc::SS_DISABLE != 0 {
+            let mut s: Stack = guest!(uaccess::read(ss));
+            // Linux's modes: none, `SS_ONSTACK` (the same) or `SS_DISABLE`,
+            // with `SS_AUTODISARM` beside them.
+            let autodisarm = s.ss_flags & signal::SS_AUTODISARM;
+            let mode = s.ss_flags & !signal::SS_AUTODISARM;
+            if ![0, signal::SS_ONSTACK, signal::SS_DISABLE].contains(&mode) {
                 return err(errno::EINVAL);
             }
-            if s.ss_flags & libc::SS_DISABLE == 0 && s.ss_size < signal::MINSIGSTKSZ {
+            if mode == signal::SS_DISABLE {
+                s = Stack { ss_flags: signal::SS_DISABLE | autodisarm, ..Stack::default() };
+            } else if s.ss_size < signal::MINSIGSTKSZ {
                 return err(errno::ENOMEM);
+            } else {
+                s.ss_flags = autodisarm;
             }
             thread::set_altstack(s);
         }
@@ -2194,19 +2202,12 @@ impl<P: Platform> Kernel<P> {
     }
 }
 
-/// `ppoll(fds, nfds, timeout)`; the caller applies the signal mask. Blocks, so
-/// the backend runs it without the kernel lock through
-/// [`crate::blocking_syscall`]; it touches no kernel state.
-///
-/// # Safety
-/// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
-/// a guest `Timespec`.
 /// `pselect6(nfds, readfds, writefds, exceptfds, timeout, _)`, by way of the
 /// host's `poll`: each set bit below `nfds` becomes a `pollfd`, and the sets
 /// are rewritten with what is ready (the signal mask is the caller's, see
 /// [`crate::blocking_syscall`]). Linux's `fd_set` is a bitmap of 64-bit
-/// words, as fwe reads it. The timeout is not updated with the time left,
-/// which POSIX allows and glibc's `select` does not rely on.
+/// words, as fwe reads it. The time left is written back to the timeout,
+/// as Linux does ([`with_remaining`]).
 ///
 /// # Safety
 /// The set and timeout pointers are null or reference guest memory.
@@ -2472,6 +2473,13 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     count
 }
 
+/// `ppoll(fds, nfds, timeout)`; the caller applies the signal mask. Blocks, so
+/// the backend runs it without the kernel lock through
+/// [`crate::blocking_syscall`]; it touches no kernel state.
+///
+/// # Safety
+/// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
+/// a guest `Timespec`, where the time left is written back.
 pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     // SAFETY: the caller's guarantee, passed on.
     with_remaining(timeout, || unsafe { ppoll_wait(fds, nfds, timeout) })

@@ -2385,6 +2385,18 @@ fn ppoll_applies_its_signal_mask() {
     assert_eq!(signals("ppoll-mask"), "ppoll -1 errno 4, handled 1\n");
 }
 
+/// The alternate signal stack's modes as Linux takes them: `SS_ONSTACK`
+/// and `SS_DISABLE` accepted, and `SS_AUTODISARM` disabling the stack
+/// while a handler runs on it.
+#[test]
+fn the_alternate_stack_takes_linuxs_modes() {
+    assert_eq!(
+        signals("altstack"),
+        "onstack 0, disable 0 disabled true, autodisarm 0: \
+         handled true, on it true, disarmed in it true, restored true\n"
+    );
+}
+
 /// With the default disposition, writing to a pipe without a reader kills
 /// the writer with `SIGPIPE`, as on Linux.
 #[test]
