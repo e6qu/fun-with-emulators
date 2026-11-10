@@ -66,6 +66,7 @@ pub mod procfs;
 pub mod procmem;
 pub mod procpid;
 pub mod procreg;
+pub mod ptrace;
 pub mod pty;
 pub mod reaper;
 pub mod rlimits;
@@ -673,6 +674,8 @@ impl<P: Platform> Kernel<P> {
         // has none of, would clear some of it).
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
+        // Traced on, by the same tracer ([`ptrace::restore`]).
+        e.u32(ptrace::exec_state() as u32);
         e.into_bytes()
     }
 
@@ -708,7 +711,9 @@ impl<P: Platform> Kernel<P> {
         let nnp = d.bool();
         let persona = d.u32();
         let thp = d.bool();
+        let tracer = d.u32() as i32;
         d.finish()?;
+        ptrace::restore(tracer);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);

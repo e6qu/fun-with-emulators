@@ -590,6 +590,7 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
+            nr::PTRACE => self.sys_ptrace(a[0], a[1], a[2], a[3]),
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2], a[3], a[4]),

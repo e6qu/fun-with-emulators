@@ -136,8 +136,10 @@ In order of what each item unblocks. The LTP counts are from the latest
 run.
 
 - [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
-  and debug a guest program (attach, system-call stops, registers, memory,
-  breakpoints, signals).
+  and debug a guest program. Tracing a child or an attached process,
+  signal and system-call stops, registers, memory and breakpoints work;
+  left are single-stepping, the fork, clone and exit events (`strace -f`),
+  stops of a tracee's other threads, and `waitid` of a tracee's stops.
 - [ ] **Every other failure LTP points at**, among them:
   - `fs.protected_hardlinks` and `protected_symlinks`, robust futex
     lists of other processes.

@@ -432,6 +432,33 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   trampoline the backend maps at startup. `rt_sigreturn` restores
   registers, mask and alternate stack.
 
+### ptrace
+
+`crates/kernel/src/ptrace.rs`. macOS lets no process read another's
+memory or threads, so a tracee does its tracer's work itself:
+
+- **Mailbox:** a page per tracee in fwe's private directory
+  (`ptrace-<pid>`), mapped by it and its tracer: the stop's wait status,
+  the general and FP registers, the `siginfo`, the options, and one
+  request at a time with its result, handed over through shared host
+  address waits.
+- **Stops:** a signal about to be delivered (every one but `SIGKILL`, the
+  host catching even ignored ones while traced, and `SIGSTOP` sent to a
+  tracee as fwe's), a fault (a breakpoint's `SIGTRAP`), the program after
+  `execve` (or the exec event), and each system call's entry and exit
+  under `PTRACE_SYSCALL`. The tracee writes its state, tells its tracer
+  (its inbox page's generation, `SIGCHLD` and the wake signal) and serves
+  requests until told to go on, with the signal the tracer chose; the
+  registers the tracer changed are the ones it goes on with.
+- **The tracer** reads and writes registers, `siginfo` and options in
+  the mailbox, and asks the tracee for memory: `PEEK`/`POKE`, written as
+  `/proc/self/mem` writes (code too, its instructions fetched afresh).
+  Its `wait4` reports a tracee's stop from its inbox before the host's
+  children, looking again as tracees stop.
+- **Attaching** makes the target's mailbox and sends it `SIGSTOP` as
+  fwe's; the target begins to be traced as it takes it. Only a process of
+  fwe's can be traced.
+
 ## Files
 
 Every file operation starts with a guest path or descriptor and ends with
@@ -894,6 +921,11 @@ something a Linux program could notice. The [roadmap](../ROADMAP.md) says
 which are to be lifted for 1.0 and which are not planned.
 
 **Execution**
+- ptrace stops only the thread that stops (the tracee's other threads go
+  on), and has no single-stepping (`EIO`), no fork, clone, exit or
+  seccomp events, no change of the system call's number at its entry,
+  and no `PTRACE_INTERRUPT`/`LISTEN`; `waitid` does not report a tracee's
+  stops (`wait4` does).
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
   which needs `fwe` signed with the hypervisor entitlement and a
   bare-metal Apple Silicon Mac; that backend is verified on its stand-in,

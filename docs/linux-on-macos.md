@@ -1710,6 +1710,7 @@ itself:
 |---|---|---|
 | clocks: `REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`, `*_COARSE`, `*_ALARM`, CPU-time | fewer | mapped onto the host's realtime, monotonic, raw and CPU-time clocks (`host::clock_to_host`) |
 | setting the clock (`CAP_SYS_TIME`) | root | refused with `EPERM` after Linux's argument checks, as in a container |
+| `ptrace` | `ptrace` for a few requests, no access to another process's memory or threads without the debugger entitlement | the tracee does its tracer's work: at a stop it writes its registers and `siginfo` to a page they share and serves memory requests until told to go on (`crates/kernel/src/ptrace.rs`) |
 | `reboot` (`CAP_SYS_BOOT`) | root | Linux's checks; Ctrl-Alt-Del's setting taken, a restart, halt or power off refused with `EPERM`: a guest never stops the Mac |
 | interval timers (`setitimer`, `alarm`) | the same, at most 100,000,000 s | the host's |
 | POSIX timers (`timer_create` and the rest) on any clock, with overruns | none | a thread of fwe's per process that raises each timer's signal when it is due; a periodic timer goes again when its signal is taken, its overrun the intervals that passed (`crates/kernel/src/posixtimer.rs`) |

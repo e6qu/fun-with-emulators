@@ -860,8 +860,11 @@ impl Fs {
         if let Some(name) = crate::memfd::name(fd) {
             return [&b"/memfd:"[..], &name, b" (deleted)"].concat();
         }
-        if crate::bpf::prog_of(fd).is_some() {
+        if crate::bpf::prog_info(fd).is_some() {
             return b"anon_inode:bpf-prog".to_vec();
+        }
+        if crate::bpfmap::of(fd).is_some() {
+            return b"anon_inode:bpf-map".to_vec();
         }
         if let Some(p) = crate::synthdir::path_of(fd) {
             return p;

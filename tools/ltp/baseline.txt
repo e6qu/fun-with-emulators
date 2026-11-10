@@ -739,6 +739,11 @@ pselect02
 pselect02_64
 pselect03
 pselect03_64
+ptrace01
+ptrace02
+ptrace03
+ptrace05
+ptrace06
 pwrite01
 pwrite01_64
 pwrite02

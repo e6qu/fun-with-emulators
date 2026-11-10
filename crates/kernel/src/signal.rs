@@ -158,6 +158,33 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
     }
 }
 
+/// The `siginfo` of `sig` raised with `info`, as Linux lays it out (128
+/// bytes), for a tracer to read.
+pub(crate) fn siginfo_bytes(sig: u64, info: SigInfo) -> [u8; 128] {
+    let mut b = Buf::zeroed(128);
+    put_siginfo(&mut b, sig, info, 0);
+    b.0.try_into().unwrap()
+}
+
+/// The signal and what it carries of a `siginfo` laid out as Linux's (as a
+/// tracer set it).
+pub(crate) fn siginfo_parse(b: &[u8; 128]) -> (u64, SigInfo) {
+    let w = |at: usize| i32::from_ne_bytes(b[at..at + 4].try_into().unwrap());
+    let sig = w(0) as u32 as u64;
+    let code = w(8);
+    let info = SigInfo {
+        code,
+        pid: w(SI_PID_OFF as usize),
+        uid: w(SI_UID_OFF as usize) as u32,
+        status: w(SI_STATUS_OFF as usize),
+        value: u64::from_ne_bytes(
+            b[SI_STATUS_OFF as usize..SI_STATUS_OFF as usize + 8].try_into().unwrap(),
+        ),
+        poll: None,
+    };
+    (sig, info)
+}
+
 /// A `SIGIO` the host raised for an owned descriptor's readiness (one no
 /// process sent) is, as on Linux, the signal that descriptor's `F_SETSIG`
 /// chose, carrying the descriptor and its events (`POLL_IN` and the like);
@@ -270,10 +297,13 @@ fn me_host() -> i64 {
 }
 
 fn owned(sig: u64) -> bool {
-    matches!(
-        sig,
-        signal::SIGTRAP | signal::SIGSEGV | signal::SIGBUS | signal::SIGILL | signal::SIGFPE
-    )
+    // A traced process stops for each signal it takes ([`crate::ptrace`]):
+    // even SIGSTOP comes to it as fwe's, not the host's.
+    crate::ptrace::traced() && sig != signal::SIGKILL
+        || matches!(
+            sig,
+            signal::SIGTRAP | signal::SIGSEGV | signal::SIGBUS | signal::SIGILL | signal::SIGFPE
+        )
 }
 
 /// Whether Linux restarts system call `nr` after a handler with
@@ -391,8 +421,10 @@ impl<P: Platform> Kernel<P> {
             signal::default_action(sig),
             signal::Default::Terminate | signal::Default::Stop
         );
+        let traced = crate::ptrace::traced();
         let how = match action.handler {
-            _ if watched => HostSignal::Catch { flags: action.flags },
+            // A traced process stops for every signal, ignored ones too.
+            _ if watched || traced => HostSignal::Catch { flags: action.flags },
             signal::SIG_DFL if !fwe_default => HostSignal::Default,
             // An ignored `SIGCHLD` has the host reap the children.
             signal::SIG_IGN if sig == signal::SIGCHLD => HostSignal::Ignore,
@@ -401,7 +433,7 @@ impl<P: Platform> Kernel<P> {
         // Recorded first: from the moment the host catches it, the host
         // mask a thread takes on next leaves it unblocked.
         let ordering = std::sync::atomic::Ordering::SeqCst;
-        if action.handler == signal::SIG_IGN && sig != signal::SIGCHLD {
+        if action.handler == signal::SIG_IGN && sig != signal::SIGCHLD && !traced {
             IGNORED.fetch_or(bit(sig), ordering);
         } else {
             IGNORED.fetch_and(!bit(sig), ordering);
@@ -457,6 +489,18 @@ impl<P: Platform> Kernel<P> {
             }
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(info) = thread::take_pending(sig) else { continue };
+            // Traced: the tracer sees the signal first, and says which to
+            // deliver (none, this one, or another).
+            let (sig, info) = if sig != signal::SIGKILL
+                && (crate::ptrace::traced() || crate::ptrace::attached(sig))
+            {
+                match self.ptrace_signal_stop(regs, sig, info) {
+                    Some(s) => s,
+                    None => continue,
+                }
+            } else {
+                (sig, info)
+            };
             let action = self.sigactions[(sig - 1) as usize];
             match action.handler {
                 signal::SIG_IGN => {}
@@ -618,6 +662,19 @@ impl<P: Platform> Kernel<P> {
     /// takes the default action (terminate).
     pub fn deliver_fault(&mut self, regs: &mut Regs, sig: u64, addr: u64) -> bool {
         let info = SigInfo { code: signal::SI_KERNEL, ..SigInfo::default() };
+        // Traced: the tracer sees the fault first (a breakpoint's SIGTRAP,
+        // say), and the guest goes on as it leaves the registers, or takes
+        // the signal it chooses.
+        if crate::ptrace::traced() {
+            match self.ptrace_signal_stop(regs, sig, info) {
+                None => return true,
+                Some((s, i)) if s != sig => {
+                    thread::post_process(s, i);
+                    return true;
+                }
+                Some(_) => {}
+            }
+        }
         self.deliver_to_handler(regs, sig, info, addr)
     }
 
@@ -708,6 +765,15 @@ impl<P: Platform> Kernel<P> {
             return 0;
         }
         let to_self = pid == me || pid == 0;
+        // A traced process takes SIGSTOP as fwe's: the host's would stop it
+        // where it cannot answer its tracer.
+        if sig == signal::SIGSTOP
+            && target > 0
+            && !to_self
+            && crate::ptrace::is_traced(target as i32)
+        {
+            return send_unhosted(target as i32, sig, signal::SI_USER, 0);
+        }
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
             // A namespace's init takes its namespace with it.
             let led = (sig == signal::SIGKILL && target > 0)
