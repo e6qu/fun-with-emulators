@@ -783,6 +783,8 @@ each is mapped is in
   in this process or (by host path) in another fwe process of the
   namespace; `MNT_DETACH` and `MNT_EXPIRE` act as on Linux. `pivot_root`
   replaces the mount at the caller's root, the namespace's or a chroot's.
+  A `chroot` that leaves the working directory outside the new root has
+  `getcwd` report it `(unreachable)`, as Linux does, until a `chdir`.
 - **New mount API** (`crates/kernel/src/mountapi.rs`): a filesystem
   context gathers source, flags and options through `fsconfig`, checked
   as Linux checks them (an unknown parameter is logged; reading the

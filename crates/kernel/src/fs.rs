@@ -263,6 +263,10 @@ pub struct Fs {
     /// The mount it was entered through (0 when not known), which it stays
     /// in when another is mounted over it, as on Linux.
     cwd_mount: u32,
+    /// Where the working directory is when a `chroot` left it outside the
+    /// root (a path in the namespace's view): `getcwd` reports it
+    /// unreachable, as Linux does, until the next `chdir`.
+    cwd_outside: Option<Vec<u8>>,
     /// The mount the root was set in (0 when not known), which it stays in
     /// when another is mounted over it.
     root_mount: u32,
@@ -320,6 +324,7 @@ impl Fs {
             root,
             cwd,
             cwd_mount,
+            cwd_outside: None,
             root_mount,
             root_host,
             mnt,
@@ -401,6 +406,7 @@ impl Fs {
             root,
             cwd: b"/".to_vec(),
             cwd_mount: 0,
+            cwd_outside: None,
             root_mount: 0,
             root_host,
             mnt,
@@ -1116,6 +1122,18 @@ impl Fs {
         &self.cwd
     }
 
+    /// The working directory's path in the namespace's view, when a
+    /// `chroot` left it outside the root.
+    pub fn cwd_outside(&self) -> Option<&[u8]> {
+        self.cwd_outside.as_deref()
+    }
+
+    /// A `chroot` left the working directory outside the root, at `path`
+    /// (or inside it, `None`).
+    pub fn set_cwd_outside(&mut self, path: Option<Vec<u8>>) {
+        self.cwd_outside = path;
+    }
+
     pub fn umask(&self) -> u32 {
         self.umask
     }
@@ -1392,6 +1410,7 @@ impl Fs {
         drop(child);
         let guest = resolved.ns_path.as_deref().and_then(|ns| self.from_ns(ns));
         self.cwd_mount = resolved.mount_id;
+        self.cwd_outside = None;
         self.cwd = match guest {
             Some(g) => g,
             None => {
@@ -1423,6 +1442,7 @@ impl Fs {
         match opened.or(fallback) {
             Some(guest) => {
                 self.cwd = guest;
+                self.cwd_outside = None;
                 self.cwd_mount = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
                 self.republish();
                 Ok(())

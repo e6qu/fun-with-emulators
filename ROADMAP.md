@@ -13,7 +13,7 @@ describes how each part works and lists the current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done except one item: the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 1110 of 1551 (94% of the 1180 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests at 1111 of 1551 (94% of the 1176 that apply) |
 | M5 Release | Not started |
 
 What runs, unmodified, with its output checked in CI:
@@ -206,6 +206,8 @@ for it fall back:
   memory (`CLONE_FILES` without `CLONE_VM`): two macOS processes cannot
   share one, so the child has a copy (`unshare(CLONE_FILES)` and
   `CLOSE_RANGE_UNSHARE` act as Linux's on it);
+- pipes of more than 64 KiB, which a host pipe cannot hold: a pipe
+  starts with 64 KiB where Linux with 16 KiB pages gives 256 KiB (`fcntl35`);
 - CPU affinity: macOS has none, so `sched_setaffinity` is accepted and
   pins nothing, and a test of how the scheduler shares one CPU (`nice05`)
   cannot hold;

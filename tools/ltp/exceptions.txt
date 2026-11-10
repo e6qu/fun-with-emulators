@@ -33,3 +33,7 @@ posix_fadvise03_64 Zig's libc posix_fadvise returns -1 and sets errno; the test 
 posix_fadvise04_64 Zig's libc posix_fadvise returns -1 and sets errno; the test expects the error returned
 preadv203 it writes about 120 MB to its device's file system, and a tmpfs (LTP_DEV_FS_TYPE) without a device is limited to 32 MB
 preadv203_64 it writes about 120 MB to its device's file system, and a tmpfs (LTP_DEV_FS_TYPE) without a device is limited to 32 MB
+fcntl35 not planned (ROADMAP.md): Linux's default pipe is 16 pages, 256 KiB with 16 KiB pages, and a host pipe holds at most 64 KiB, so fwe's pipes start at 64 KiB
+fcntl35_64 not planned (ROADMAP.md): Linux's default pipe is 16 pages, 256 KiB with 16 KiB pages, and a host pipe holds at most 64 KiB, so fwe's pipes start at 64 KiB
+gethostname02 musl's gethostname copies a truncated name and succeeds without asking the kernel; the test expects ENAMETOOLONG
+sendmsg03 not planned (ROADMAP.md): it needs a raw socket

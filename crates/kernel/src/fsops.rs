@@ -1377,7 +1377,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_getcwd(&mut self, buf: u64, size: u64) -> i64 {
-        let cwd = self.fs().cwd();
+        // Outside the root (a `chroot` left it there): unreachable from it.
+        let outside = self.fs().cwd_outside().map(|p| [&b"(unreachable)"[..], p].concat());
+        let cwd = outside.as_deref().unwrap_or(self.fs().cwd());
         let need = cwd.len() + 1;
         if (size as usize) < need {
             return err(errno::ERANGE);

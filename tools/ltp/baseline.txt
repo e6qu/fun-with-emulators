@@ -748,6 +748,7 @@ readlink01
 readlinkat01
 readv01
 readv02
+realpath01
 recv01
 recvfrom01
 recvmsg01
