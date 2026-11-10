@@ -49,6 +49,7 @@ pub fn closed(fd: i32) {
         });
         EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
         HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
+        BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
         WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
     }
 }
@@ -200,7 +201,10 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         // A mounts file polls (for its namespace's changes); other files
         // and directories are always ready, so cannot be watched.
         let mounts = crate::mountwatch::is(target);
-        if (kind == libc::S_IFREG && !mounts) || kind == libc::S_IFDIR {
+        // A program or map of bpf's (an unlinked file of fwe's) polls, as
+        // an error ([`bpf_watched`]).
+        let bpf = kind == libc::S_IFREG && st.st_nlink == 0 && crate::bpf::is_bpf_fd(target);
+        if (kind == libc::S_IFREG && !mounts && !bpf) || kind == libc::S_IFDIR {
             return err(errno::EPERM);
         }
         if ep == target || !is_epoll(ep) {
@@ -230,8 +234,15 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
             EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD => {}
             _ => return err(errno::EINVAL),
         }
-        // A mounts file is fwe's to watch, not the host's.
-        let r = if mounts {
+        // A mounts file or a bpf object is fwe's to watch, not the host's.
+        if bpf {
+            let mut w = BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+            w.retain(|&(e, f)| (e, f) != (epfd as i32, fd as i32));
+            if entry.is_some() {
+                w.push((epfd as i32, fd as i32));
+            }
+        }
+        let r = if mounts || bpf {
             0
         } else {
             // SAFETY: plain host calls on the guest's descriptors.
@@ -261,6 +272,17 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         }
         r
     }
+}
+
+/// The bpf objects each set watches (set, descriptor): always in error, as
+/// Linux polls a map without events of its own.
+#[cfg(not(target_os = "linux"))]
+static BPF_WATCHED: std::sync::Mutex<Vec<(i32, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether set `ep` watches bpf object `fd`.
+#[cfg(not(target_os = "linux"))]
+fn bpf_watched(ep: i32, fd: i32) -> bool {
+    BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(ep, fd))
 }
 
 /// Whether `fd` is an epoll descriptor.
@@ -491,7 +513,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     let mounts: Vec<(i32, u64, u32)> = interest(|m| {
         m.get(&ep).map_or_else(Vec::new, |l| {
             l.iter()
-                .filter(|&(&fd, _)| crate::mountwatch::is(fd))
+                .filter(|&(&fd, _)| crate::mountwatch::is(fd) || bpf_watched(ep, fd))
                 .map(|(&fd, &(ev, d))| (fd, d, ev))
                 .collect()
         })
@@ -545,7 +567,9 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
                 continue;
             }
             let mut bits = ev & EPOLLIN;
-            if crate::mountwatch::changed(fd) == Some(true) {
+            if bpf_watched(ep, fd) {
+                bits = EPOLLERR;
+            } else if crate::mountwatch::changed(fd) == Some(true) {
                 bits |= EPOLLERR | (ev & EPOLLPRI);
             }
             if bits != 0 && !ready.iter().any(|r| r.0 == fd) {

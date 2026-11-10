@@ -998,6 +998,12 @@ mod tests {
     }
 }
 
+/// Whether `fd` is a descriptor of a program or a map (an anonymous inode
+/// on Linux).
+pub fn is_bpf_fd(fd: i32) -> bool {
+    prog_id_type(fd).is_some() || crate::bpfmap::of(fd).is_some()
+}
+
 /// The identity, type and instructions of the program `fd` is a
 /// descriptor of, if it is one.
 pub fn prog_info(fd: i32) -> Option<(u32, u32, Vec<u8>)> {
