@@ -334,6 +334,13 @@ does for it, then the per-process state fwe keeps. Inside fwe:
 - **End status:** a process a signal ends leaves its Linux wait status
   beside its record (`procreg::ending`), so its parent reads the signal
   and core bit Linux would report even for a signal the host lacks.
+- **POSIX timers** (`crates/kernel/src/posixtimer.rs`): a thread of
+  fwe's, started with a process's first timer, sleeps until the next is
+  due and raises its signal (`SI_TIMER`) for the process or a thread; a
+  periodic timer goes again when its signal is taken, the intervals that
+  passed its overrun. A timer of CPU time is looked at again at most
+  every 10 ms. A fork child has none; `execve` deletes them. A signal of
+  a timer deleted or set again while it waits is still delivered.
 - **Interval timers** are the host's; one longer than the host takes
   (100,000,000 s) gets the host's longest and reads back as asked.
   CPU-time clocks are the host thread's or process's CPU time.

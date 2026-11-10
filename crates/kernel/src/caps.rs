@@ -36,6 +36,7 @@ pub const CAP_LEASE: u32 = 28;
 pub const CAP_SETFCAP: u32 = 31;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
 pub const CAP_SYSLOG: u32 = 34;
+pub const CAP_WAKE_ALARM: u32 = 35;
 /// The highest capability (`CAP_CHECKPOINT_RESTORE`).
 pub const CAP_LAST_CAP: u32 = 40;
 /// Every capability.

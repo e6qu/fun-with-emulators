@@ -60,6 +60,7 @@ pub mod pdeath;
 pub mod pidfd;
 pub mod pidns;
 pub mod pipelock;
+pub mod posixtimer;
 pub mod procfs;
 pub mod procmem;
 pub mod procpid;
@@ -497,8 +498,9 @@ impl<P: Platform> Kernel<P> {
     pub fn exec_reset(&mut self) {
         // The other threads are gone, and with them their waits; the
         // segments it had attached are detached (its memory is the new
-        // program's).
+        // program's); its POSIX timers are deleted.
         futex::process_started();
+        posixtimer::exec();
         sysvipc::process_leaving(true);
         // The thread and process keyrings go; the session keyring stays.
         keys::exec();

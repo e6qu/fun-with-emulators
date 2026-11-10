@@ -1039,6 +1039,16 @@ tgkill01
 tgkill02
 tgkill03
 time01
+timer_create01
+timer_create02
+timer_create03
+timer_delete01
+timer_delete02
+timer_getoverrun01
+timer_gettime01
+timer_settime01
+timer_settime02
+timer_settime03
 timerfd01
 timerfd02
 timerfd_create01

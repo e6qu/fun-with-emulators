@@ -793,6 +793,9 @@ pub mod mqueue {
     pub const SIGEV_SIGNAL: i32 = 0;
     pub const SIGEV_NONE: i32 = 1;
     pub const SIGEV_THREAD: i32 = 2;
+    /// With `SIGEV_SIGNAL`: the signal goes to the thread `sigev_tid`
+    /// (POSIX timers).
+    pub const SIGEV_THREAD_ID: i32 = 4;
     /// `struct sigevent`: `sigev_value` (8 bytes), `sigev_signo`,
     /// `sigev_notify`, then the union (64 bytes in all).
     pub const SIGEVENT_SIZE: usize = 64;

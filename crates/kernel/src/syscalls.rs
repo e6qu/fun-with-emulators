@@ -267,6 +267,11 @@ impl<P: Platform> Kernel<P> {
             },
             // SAFETY: eventfd2 takes no pointers.
             nr::EVENTFD2 => unsafe { crate::specialfd::eventfd2(a[0], a[1]) },
+            nr::TIMER_CREATE => self.sys_timer_create(a[0], a[1], a[2]),
+            nr::TIMER_SETTIME => self.sys_timer_settime(a[0], a[1], a[2], a[3]),
+            nr::TIMER_GETTIME => self.sys_timer_gettime(a[0], a[1]),
+            nr::TIMER_GETOVERRUN => self.sys_timer_getoverrun(a[0]),
+            nr::TIMER_DELETE => self.sys_timer_delete(a[0]),
             // SAFETY: timerfd_create takes no pointers.
             nr::TIMERFD_CREATE => unsafe { crate::specialfd::timerfd_create(a[0], a[1]) },
             // SAFETY: the itimerspec pointers are validated by the host/impl.
