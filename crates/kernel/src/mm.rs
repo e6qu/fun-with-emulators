@@ -113,6 +113,19 @@ pub fn poisoned(addr: u64) -> bool {
     poisoned_ranges().range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
 }
 
+/// Guest ranges given `MADV_DONTDUMP` (until `MADV_DODUMP`): left out of
+/// a core dump ([`dont_dump`]).
+static DONT_DUMP: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn dont_dump_ranges() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    DONT_DUMP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether guest address `addr` is in memory given `MADV_DONTDUMP`.
+pub fn dont_dump(addr: u64) -> bool {
+    dont_dump_ranges().range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
+}
+
 /// Host ranges given `MADV_WIPEONFORK`: a fork child finds them zero
 /// ([`forked_child`]), and so does its own child.
 static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
@@ -146,6 +159,17 @@ pub fn forked_child() {
 }
 
 /// The host protection of the memory at host address `addr`.
+/// The host's page size.
+pub fn host_page_size() -> u64 {
+    // SAFETY: sysconf only reads a system value.
+    (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
+}
+
+/// The host protection of the memory at host address `addr`.
+pub fn host_prot_at(addr: u64) -> libc::c_int {
+    region_prot(addr)
+}
+
 fn region_prot(addr: u64) -> libc::c_int {
     #[cfg(target_os = "macos")]
     {
@@ -201,6 +225,7 @@ pub fn release_guest_memory() {
     wipe_on_fork().clear();
     grows_down().clear();
     poisoned_ranges().clear();
+    dont_dump_ranges().clear();
     crate::maps::clear();
     let ranges = std::mem::take(&mut *guest_maps());
     for (start, end) in ranges {
@@ -1734,6 +1759,7 @@ impl<P: Platform> Kernel<P> {
             remove_range(&mut wipe_on_fork(), host as u64, self.page_up(len));
             remove_range(&mut grows_down(), addr, self.page_up(len));
             remove_range(&mut poisoned_ranges(), addr, self.page_up(len));
+            remove_range(&mut dont_dump_ranges(), addr, self.page_up(len));
         }
         r
     }
@@ -2105,6 +2131,15 @@ impl<P: Platform> Kernel<P> {
                 add_range(&mut poisoned_ranges(), addr, len);
                 0
             }
+            // Left out of a core dump, or back in it.
+            mman::MADV_DONTDUMP => {
+                add_range(&mut dont_dump_ranges(), addr, len);
+                0
+            }
+            mman::MADV_DODUMP => {
+                remove_range(&mut dont_dump_ranges(), addr, len);
+                0
+            }
             // MADV_WIPEONFORK, MADV_KEEPONFORK
             18 => {
                 add_range(&mut wipe_on_fork(), host, len);
@@ -2114,7 +2149,7 @@ impl<P: Platform> Kernel<P> {
                 remove_range(&mut wipe_on_fork(), host, len);
                 0
             }
-            // Other advice (huge pages, dump control, ...) has no host
+            // Other advice (huge pages, merging, ...) has no host
             // equivalent and no effect on program semantics.
             _ => 0,
         }

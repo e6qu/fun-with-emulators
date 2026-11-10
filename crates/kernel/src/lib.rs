@@ -61,6 +61,7 @@ pub mod pidfd;
 pub mod pidns;
 pub mod pipelock;
 pub mod procfs;
+pub mod procmem;
 pub mod procpid;
 pub mod procreg;
 pub mod pty;
@@ -966,6 +967,72 @@ fn is_regular(fd: i32) -> bool {
 /// The input must be a regular file or a block device (a loop device), as
 /// Linux has it; `copy_file_range` needs both to be regular files. Returns
 /// the bytes copied, or an errno when none were.
+/// `copy_file_range`'s checks, in Linux's order: the descriptors
+/// (`EBADF`), the offsets (`EFAULT`), the flags (`EINVAL`); directories
+/// (`EISDIR`), anything but regular files (`EINVAL`), a descriptor not open
+/// to read or write as it is used, or appending (`EBADF`); an immutable
+/// output (`EPERM`), offsets that wrap (`EOVERFLOW`); then a range of the
+/// input's that overlaps the output's in the same file (`EINVAL`). The
+/// count to copy, cut at the input's end.
+fn copy_range_checks(
+    input: i32,
+    in_off: u64,
+    output: i32,
+    out_off: u64,
+    count: u64,
+    flags: u64,
+) -> Result<u64, i32> {
+    use fwe_abi::errno;
+    let stat = |fd: i32| {
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 { Err(errno::EBADF) } else { Ok(st) }
+    };
+    let (si, so) = (stat(input)?, stat(output)?);
+    let offset = |fd: i32, p: u64| -> Result<u64, i32> {
+        if p != 0 {
+            return uaccess::read::<i64>(p).map(|v| v as u64);
+        }
+        // SAFETY: plain host call on the guest's descriptor.
+        Ok(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }.max(0) as u64)
+    };
+    let (ipos, opos) = (offset(input, in_off)?, offset(output, out_off)?);
+    if flags != 0 {
+        return Err(errno::EINVAL);
+    }
+    let kind = |st: &libc::stat| st.st_mode & libc::S_IFMT;
+    if kind(&si) == libc::S_IFDIR || kind(&so) == libc::S_IFDIR {
+        return Err(errno::EISDIR);
+    }
+    let device = |fd: i32| loopdev::device_of(fd).is_some() || loopdev::is_control(fd);
+    if kind(&si) != libc::S_IFREG || kind(&so) != libc::S_IFREG || device(input) || device(output) {
+        return Err(errno::EINVAL);
+    }
+    // SAFETY: F_GETFL only queries the descriptors.
+    let (iacc, oacc) =
+        unsafe { (libc::fcntl(input, libc::F_GETFL), libc::fcntl(output, libc::F_GETFL)) };
+    if iacc & libc::O_ACCMODE == libc::O_WRONLY
+        || oacc & libc::O_ACCMODE == libc::O_RDONLY
+        || oacc & libc::O_APPEND != 0
+    {
+        return Err(errno::EBADF);
+    }
+    #[cfg(target_os = "macos")]
+    if so.st_flags & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0 {
+        return Err(errno::EPERM);
+    }
+    if ipos.checked_add(count).is_none() || opos.checked_add(count).is_none() {
+        return Err(errno::EOVERFLOW);
+    }
+    let count = count.min((si.st_size.max(0) as u64).saturating_sub(ipos));
+    let same = (si.st_dev, si.st_ino) == (so.st_dev, so.st_ino);
+    if same && count > 0 && opos + count > ipos && opos < ipos + count {
+        return Err(errno::EINVAL);
+    }
+    Ok(count)
+}
+
 fn copy_between(
     input: i32,
     in_off: u64,
@@ -1300,6 +1367,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Some(r) = loopdev::io(nr, &a) {
         return Some(r);
     }
+    if let Some(r) = procmem::io(nr, &a) {
+        return Some(r);
+    }
     if let Some(r) = mqueue::io(nr, &a) {
         return Some(r);
     }
@@ -1524,8 +1594,13 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::SPLICE => splice::splice(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5]),
         n::TEE => splice::tee(a[0] as i32, a[1] as i32, a[2], a[3]),
         n::VMSPLICE => splice::vmsplice(a[0] as i32, a[1], a[2], a[3]),
-        n::COPY_FILE_RANGE if a[5] != 0 => fwe_abi::err(fwe_abi::errno::EINVAL),
-        n::COPY_FILE_RANGE => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], a[4], true),
+        n::COPY_FILE_RANGE => {
+            match copy_range_checks(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5]) {
+                Ok(0) => 0,
+                Ok(count) => copy_between(a[0] as i32, a[1], a[2] as i32, a[3], count, true),
+                Err(e) => fwe_abi::err(e),
+            }
+        }
         // SAFETY: caller guarantees the pollfd array and timeout pointers.
         n::PPOLL => unsafe { signal::with_call_mask(a[3], || syscalls::ppoll(a[0], a[1], a[2])) },
         // The sixth argument points to `{ const sigset_t *ss; size_t len }`.

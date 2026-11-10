@@ -2254,6 +2254,9 @@ impl<P: Platform> Kernel<P> {
             if host & libc::UF_APPEND != 0 {
                 f |= FS_APPEND_FL;
             }
+            if host & libc::UF_NODUMP != 0 {
+                f |= FS_NODUMP_FL;
+            }
             guest!(uaccess::write(arg, f));
             return 0;
         }
@@ -2267,14 +2270,18 @@ impl<P: Platform> Kernel<P> {
         if owner != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
             return err(errno::EPERM);
         }
-        let mut want = host & !(libc::UF_IMMUTABLE | libc::UF_APPEND);
+        let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
+        let mut want = host & !(fixed | libc::UF_NODUMP);
         if f & FS_IMMUTABLE_FL != 0 {
             want |= libc::UF_IMMUTABLE;
         }
         if f & FS_APPEND_FL != 0 {
             want |= libc::UF_APPEND;
         }
-        if want != host && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
+        if f & FS_NODUMP_FL != 0 {
+            want |= libc::UF_NODUMP;
+        }
+        if (want ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
             return err(errno::EPERM);
         }
         if want == host {

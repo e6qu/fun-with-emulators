@@ -44,6 +44,36 @@ fn stat_to_linux(s: &libc::stat) -> Stat {
     }
 }
 
+/// Linux's `STATX_ATTR_IMMUTABLE`, `APPEND` and `NODUMP`: the attributes
+/// a file's `statx` reports, from its host flags, which a file's owner can
+/// set (`FS_IOC_SETFLAGS`), as on Linux's tmpfs.
+const STATX_ATTR_IMMUTABLE: u64 = 0x10;
+const STATX_ATTR_APPEND: u64 = 0x20;
+const STATX_ATTR_NODUMP: u64 = 0x40;
+const STATX_ATTRS_KNOWN: u64 = STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP;
+
+/// The `statx` attributes of a file with host status `s`.
+#[cfg(target_os = "macos")]
+fn statx_attributes(s: &libc::stat) -> u64 {
+    let f = s.st_flags;
+    let mut a = 0;
+    for (host, linux) in [
+        (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE, STATX_ATTR_IMMUTABLE),
+        (libc::UF_APPEND | libc::SF_APPEND, STATX_ATTR_APPEND),
+        (libc::UF_NODUMP, STATX_ATTR_NODUMP),
+    ] {
+        if f & host != 0 {
+            a |= linux;
+        }
+    }
+    a
+}
+
+#[cfg(not(target_os = "macos"))]
+fn statx_attributes(_: &libc::stat) -> u64 {
+    0
+}
+
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 fn statx_from(s: &libc::stat) -> Statx {
     let rdev = crate::devnodes::linux_numbers_of_host(s)
@@ -56,7 +86,7 @@ fn statx_from(s: &libc::stat) -> Statx {
     Statx {
         stx_mask: statx_mask::STATX_BASIC_STATS,
         stx_blksize: s.st_blksize as u32,
-        stx_attributes: 0,
+        stx_attributes: statx_attributes(s),
         stx_nlink: s.st_nlink as u32,
         stx_uid: crate::userns::to_ns(s.st_uid, false),
         stx_gid: crate::userns::to_ns(s.st_gid, true),
@@ -65,7 +95,7 @@ fn statx_from(s: &libc::stat) -> Statx {
         stx_ino: s.st_ino as u64,
         stx_size: s.st_size as u64,
         stx_blocks: s.st_blocks as u64,
-        stx_attributes_mask: 0,
+        stx_attributes_mask: STATX_ATTRS_KNOWN,
         stx_atime: ts(s.st_atime as i64, s.st_atime_nsec as i64),
         stx_btime: fwe_abi::StatxTimestamp::default(),
         stx_ctime: ts(s.st_ctime as i64, s.st_ctime_nsec as i64),
@@ -179,7 +209,31 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 /// bits ([`crate::modes`]).
 /// `fstat` of `fd` in Linux's layout (the host's view of the file).
 pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
-    stat_fd(fd).map(|s| stat_to_linux(&s))
+    stat_fd(fd).map(|s| stat_to_linux_fd(fd, &s))
+}
+
+/// The Linux status of the file open as `fd`, whose host status is `s`:
+/// that of a tmpfs's file if it was opened in one.
+fn stat_to_linux_fd(fd: i32, s: &libc::stat) -> Stat {
+    let mut out = stat_to_linux(s);
+    if let Some(m) = tmpfs_of(fd, s) {
+        on_tmpfs(&mut out, m);
+    }
+    out
+}
+
+/// The tmpfs mount the file open as `fd` (host status `s`) was opened in.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+fn tmpfs_of(fd: i32, s: &libc::stat) -> Option<u32> {
+    crate::fdmarks::tmpfs_mount(fd, s.st_dev as u64, s.st_ino as u64)
+}
+
+/// A file of the tmpfs mounted as mount `id`: on a device of its own, the
+/// one `/proc/<pid>/mountinfo` gives the mount (`0:<20 + id>`), in blocks
+/// of a page, as Linux's tmpfs is.
+fn on_tmpfs(st: &mut Stat, id: u32) {
+    st.st_dev = crate::devnodes::makedev(0, 20 + id);
+    st.st_blksize = crate::maps::page_size().max(4096) as i32;
 }
 
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
@@ -364,6 +418,24 @@ impl<P: Platform> Kernel<P> {
                     }) =>
                 {
                     self.synthetic_fd(anon_fd(&self.task_status(tid), flags), dirfd as i32, &path)
+                }
+                crate::procfs::Entry::File(_)
+                    if let Some(pagemap) =
+                        self.fs().proc_path(dirfd as i32, &path).and_then(|p| match &p[..] {
+                            b"/proc/self/mem" => Some(false),
+                            b"/proc/self/pagemap" => Some(true),
+                            _ => None,
+                        }) =>
+                {
+                    // `pagemap` is only read.
+                    if pagemap && flags & fcntl::O_ACCMODE != fcntl::O_RDONLY {
+                        return err(errno::EACCES);
+                    }
+                    let fd = self.synthetic_fd(anon_fd(&[], flags), dirfd as i32, &path);
+                    if fd >= 0 {
+                        crate::procmem::opened(fd as i32, pagemap);
+                    }
+                    fd
                 }
                 crate::procfs::Entry::File(content)
                     if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY =>
@@ -1091,6 +1163,17 @@ impl<P: Platform> Kernel<P> {
     /// node of fwe's as the device, or the host file. `depth` counts the
     /// links followed.
     fn linux_stat(&self, dirfd: i32, path: &[u8], follow: bool, depth: u32) -> Result<Stat, i32> {
+        self.linux_stat_attrs(dirfd, path, follow, depth).map(|(s, _)| s)
+    }
+
+    /// [`Self::linux_stat`], with the file's `statx` attributes.
+    fn linux_stat_attrs(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow: bool,
+        depth: u32,
+    ) -> Result<(Stat, u64), i32> {
         match self.stat_once(dirfd, path, follow, depth) {
             // A link of the host's to a file of fwe's, which the host cannot
             // follow: that file.
@@ -1104,44 +1187,66 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    fn stat_once(&self, dirfd: i32, path: &[u8], follow: bool, depth: u32) -> Result<Stat, i32> {
+    fn stat_once(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow: bool,
+        depth: u32,
+    ) -> Result<(Stat, u64), i32> {
         use crate::procfs::Entry;
         use fwe_abi::stat as st;
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
-            return Ok(match entry {
-                Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
-                Entry::Symlink(t) if follow => {
-                    if let Some(ino) = namespace_inode(&t) {
-                        return Ok(ns_stat(ino));
+            return Ok((
+                match entry {
+                    Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
+                    Entry::Symlink(t) if follow => {
+                        if let Some(ino) = namespace_inode(&t) {
+                            return Ok((ns_stat(ino), 0));
+                        }
+                        if depth >= 40 {
+                            return Err(errno::ELOOP);
+                        }
+                        // /proc/self/exe and the like follow to the real target.
+                        let target = self.fs().link_target(dirfd, path, &t);
+                        return self.linux_stat_attrs(
+                            fcntl::AT_FDCWD as i32,
+                            &target,
+                            true,
+                            depth + 1,
+                        );
                     }
-                    if depth >= 40 {
-                        return Err(errno::ELOOP);
+                    Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
+                    Entry::Fd { fd, .. } if follow => {
+                        if crate::synthdir::fstat_is_dir(fd) {
+                            return Ok((synth_stat(st::S_IFDIR | 0o555, 0), 0));
+                        }
+                        let s = stat_fd(fd)?;
+                        let node = crate::devnodes::marked(&s)
+                            .then(|| crate::devnodes::node_of(fd))
+                            .flatten();
+                        return Ok((as_node(stat_to_linux(&s), node), statx_attributes(&s)));
                     }
-                    // /proc/self/exe and the like follow to the real target.
-                    let target = self.fs().link_target(dirfd, path, &t);
-                    return self.linux_stat(fcntl::AT_FDCWD as i32, &target, true, depth + 1);
-                }
-                Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
-                Entry::Fd { fd, .. } if follow => {
-                    if crate::synthdir::fstat_is_dir(fd) {
-                        return Ok(synth_stat(st::S_IFDIR | 0o555, 0));
+                    Entry::Fd { target, .. } => {
+                        synth_stat(st::S_IFLNK | 0o700, target.len() as u64)
                     }
-                    let s = stat_fd(fd)?;
-                    let node =
-                        crate::devnodes::marked(&s).then(|| crate::devnodes::node_of(fd)).flatten();
-                    return Ok(as_node(stat_to_linux(&s), node));
-                }
-                Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
-                Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
-                Entry::Missing => return Err(errno::ENOENT),
-            });
+                    Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
+                    Entry::Missing => return Err(errno::ENOENT),
+                },
+                0,
+            ));
         }
-        let (dir, name) = self.resolve_c(dirfd as u64, path, follow)?;
-        let s = stat_at(dir.as_raw_fd(), &name)?;
+        let r = self.fs().resolve(dirfd, path, follow)?;
+        let name = r.name_c()?;
+        let s = stat_at(r.dir.as_raw_fd(), &name)?;
         let node = crate::devnodes::marked(&s)
-            .then(|| crate::devnodes::node_at(dir.as_raw_fd(), &name))
+            .then(|| crate::devnodes::node_at(r.dir.as_raw_fd(), &name))
             .flatten();
-        Ok(as_node(stat_to_linux(&s), node))
+        let mut out = as_node(stat_to_linux(&s), node);
+        if r.ns_path.is_some() && r.fstype == crate::mounts::FsType::Tmpfs {
+            on_tmpfs(&mut out, r.mount_id);
+        }
+        Ok((out, statx_attributes(&s)))
     }
 
     /// `open` with `O_NOFOLLOW` of the link of fwe's `/proc` at `path`:
@@ -1202,7 +1307,7 @@ impl<P: Platform> Kernel<P> {
         };
         let node =
             crate::devnodes::marked(&out).then(|| crate::devnodes::node_of(fd as i32)).flatten();
-        let mut st = as_node(stat_to_linux(&out), node);
+        let mut st = as_node(stat_to_linux_fd(fd as i32, &out), node);
         if let Some((mode, uid, gid)) = crate::mqueue::owner_of(fd as i32) {
             // A message queue's descriptor: the queue's owner and mode.
             (st.st_mode, st.st_uid, st.st_gid) = (fwe_abi::stat::S_IFREG | mode, uid, gid);
@@ -1279,15 +1384,25 @@ impl<P: Platform> Kernel<P> {
                 .flatten();
             (out, node)
         } else {
-            return match self.linux_stat(dirfd as i32, &path, follow, 0) {
-                Ok(st) => {
-                    guest!(uaccess::write(buf, with_mount(statx_of(&st))));
+            return match self.linux_stat_attrs(dirfd as i32, &path, follow, 0) {
+                Ok((st, attrs)) => {
+                    let mut x = statx_of(&st);
+                    x.stx_attributes = attrs;
+                    x.stx_attributes_mask = STATX_ATTRS_KNOWN;
+                    guest!(uaccess::write(buf, with_mount(x)));
                     0
                 }
                 Err(e) => err(e),
             };
         };
         let mut x = statx_from(&host);
+        if let Some(m) = tmpfs_of(dirfd as i32, &host) {
+            let mut st = stat_to_linux(&host);
+            on_tmpfs(&mut st, m);
+            x.stx_dev_major = crate::devnodes::major(st.st_dev);
+            x.stx_dev_minor = crate::devnodes::minor(st.st_dev);
+            x.stx_blksize = st.st_blksize as u32;
+        }
         if let Some((mode, uid, gid)) = crate::mqueue::owner_of(dirfd as i32) {
             x.stx_mode = (fwe_abi::stat::S_IFREG | mode) as u16;
             (x.stx_uid, x.stx_gid) = (uid, gid);
@@ -2196,6 +2311,8 @@ impl<P: Platform> Kernel<P> {
         let explicit =
             kinds.is_some_and(|k| k.iter().any(|&n| n != libc::UTIME_NOW && n != libc::UTIME_OMIT));
         let all_omitted = kinds.is_some_and(|k| k.iter().all(|&n| n == libc::UTIME_OMIT));
+        // Both set to now (what an append-only file takes).
+        let touch = kinds.is_none_or(|k| k.iter().all(|&n| n == libc::UTIME_NOW));
         let may = |st: &libc::stat| -> Result<(), i32> {
             let c = &self.creds;
             if all_omitted || c.fsuid == st.st_uid || c.has(crate::caps::CAP_FOWNER) {
@@ -2213,15 +2330,18 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EFAULT);
         }
         if path == 0 {
-            // futimens-style: operate on the fd in dirfd.
+            // futimens-style: operate on the fd in dirfd, which takes no
+            // flags.
+            if flags != 0 {
+                return err(errno::EINVAL);
+            }
             if let Err(e) = self.fd_change(dirfd as i32) {
                 return err(e);
             }
             if let Err(e) = stat_fd(dirfd as i32).and_then(|st| may(&st)) {
                 return err(e);
             }
-            // SAFETY: valid timespec array pointer or null.
-            return ret(unsafe { libc::futimens(dirfd as i32, times_ptr) });
+            return set_times_fd(dirfd as i32, times_ptr, touch);
         }
         if flags & !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH) != 0 {
             return err(errno::EINVAL);
@@ -2248,8 +2368,7 @@ impl<P: Platform> Kernel<P> {
                     )
                 });
             }
-            // SAFETY: valid timespec array pointer or null.
-            return ret(unsafe { libc::futimens(dirfd as i32, times_ptr) });
+            return set_times_fd(dirfd as i32, times_ptr, touch);
         }
         let path =
             if path.is_empty() && flags & fcntl::AT_EMPTY_PATH != 0 { b".".to_vec() } else { path };
@@ -2261,8 +2380,7 @@ impl<P: Platform> Kernel<P> {
             if let Err(e) = stat_fd(fd).and_then(|st| may(&st)) {
                 return err(e);
             }
-            // SAFETY: valid timespec array pointer or null.
-            return ret(unsafe { libc::futimens(fd, times_ptr) });
+            return set_times_fd(fd, times_ptr, touch);
         }
         let r = match self.resolve_p(dirfd, &path, follow, true, Change::Modify) {
             Ok(r) => r,
@@ -2276,7 +2394,24 @@ impl<P: Platform> Kernel<P> {
         // Not followed: a symbolic link's own times.
         let host_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         // SAFETY: `name` NUL-terminated; `dir` live; times valid or null.
-        ret(unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, host_flags) })
+        let r = unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, host_flags) };
+        if r != 0 && host::last_errno() == libc::EPERM && touch {
+            // An append-only file's times set to now (see `set_times_fd`),
+            // through a descriptor that reads nothing.
+            let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+            // SAFETY: as above.
+            let fd = unsafe {
+                libc::openat(dir.as_raw_fd(), name.as_ptr(), O_EVTONLY | libc::O_CLOEXEC | nofollow)
+            };
+            if fd >= 0 {
+                let r = set_times_fd(fd, times_ptr, true);
+                // SAFETY: the descriptor just opened.
+                unsafe { libc::close(fd) };
+                return r;
+            }
+            return err(errno::EPERM);
+        }
+        ret(r)
     }
 
     /// The open file a `/proc/self/fd/N` link (or `/proc/self/exe`) at
@@ -3483,6 +3618,42 @@ fn drop_cached(fd: i32, offset: u64, len: u64, size: u64) {
         // SAFETY: fwe's own descriptor, opened above.
         unsafe { libc::close(own) };
     }
+}
+
+/// macOS's `O_EVTONLY`: a descriptor of a file that reads nothing, which
+/// its permissions do not stand in the way of.
+#[cfg(target_os = "macos")]
+const O_EVTONLY: i32 = 0x8000;
+#[cfg(not(target_os = "macos"))]
+const O_EVTONLY: i32 = libc::O_PATH;
+
+/// Set the times of the file open as `fd` (`times` as `futimens` takes
+/// them). Linux lets an append-only file's times both be set to now
+/// (`touch`), and no other way; the host refuses any (`EPERM`), so for a
+/// touch the flag is taken off the file for the change, by its owner.
+fn set_times_fd(fd: i32, times: *const libc::timespec, touch: bool) -> i64 {
+    // SAFETY: valid timespec array pointer or null.
+    let r = unsafe { libc::futimens(fd, times) };
+    #[cfg(target_os = "macos")]
+    if r != 0 && host::last_errno() == libc::EPERM && touch {
+        let Ok(st) = stat_fd(fd) else { return err(errno::EPERM) };
+        let fixed = libc::UF_IMMUTABLE | libc::SF_IMMUTABLE | libc::SF_APPEND;
+        if st.st_flags & libc::UF_APPEND == 0 || st.st_flags & fixed != 0 {
+            return err(errno::EPERM);
+        }
+        // SAFETY: plain host calls on the descriptor; the flags go back.
+        unsafe {
+            if libc::fchflags(fd, st.st_flags & !libc::UF_APPEND) != 0 {
+                return err(errno::EPERM);
+            }
+            let r = libc::futimens(fd, times);
+            let e = host::last_errno();
+            libc::fchflags(fd, st.st_flags);
+            return if r == 0 { 0 } else { err(host::errno_to_linux(e)) };
+        }
+    }
+    let _ = touch;
+    ret(r)
 }
 
 #[cfg(test)]

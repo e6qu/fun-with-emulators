@@ -236,6 +236,7 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"oom_score_adj", DT_REG),
     (b"oom_adj", DT_REG),
     (b"oom_score", DT_REG),
+    (b"coredump_filter", DT_REG),
     (b"timerslack_ns", DT_REG),
     (b"ns", DT_DIR),
     (b"fd", DT_DIR),
@@ -428,6 +429,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
             Entry::File(oom_file(sub, rec.oom_score_adj))
         }
+        b"/coredump_filter" => Entry::File(crate::coredump::FILTER.to_vec()),
         b"/timerslack_ns" => Entry::File(format!("{}\n", rec.slack.0).into_bytes()),
         b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
             Some(u) => {

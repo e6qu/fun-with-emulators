@@ -18,10 +18,11 @@
 //! `NT_PRPSINFO` (the process), then a `PT_LOAD` per mapping, with what
 //! `coredump_filter`'s default (0x33) dumps: anonymous memory, private
 //! file memory the process wrote (taken to be the writable kind), and the
-//! first page of a file mapping that holds an ELF header. Pages of zeros
-//! are left as holes, which do not count against the limit. Past
-//! `RLIMIT_CORE` the file is cut short, the core still reported dumped,
-//! as on Linux. A pipe (`|program`) in `core_pattern` is not run:
+//! first page of a file mapping that holds an ELF header, less memory
+//! given `MADV_DONTDUMP`. Pages of zeros and those left out are holes,
+//! which do not count against the limit. Past `RLIMIT_CORE` the file is
+//! cut short, the core still reported dumped, as on Linux. That filter is
+//! what `/proc/<pid>/coredump_filter` shows. A pipe (`|program`) in `core_pattern` is not run:
 //! no core is dumped.
 
 use crate::{Kernel, Platform, Regs};
@@ -141,6 +142,10 @@ fn note(out: &mut Vec<u8>, kind: u32, desc: &[u8]) {
         out.push(0);
     }
 }
+
+/// `/proc/<pid>/coredump_filter`: the filter the core follows, Linux's
+/// default (anonymous and ELF header pages, private and shared).
+pub const FILTER: &[u8] = b"00000033\n";
 
 /// A mapping, and how much of it the core holds.
 struct Segment {
@@ -370,8 +375,10 @@ impl<P: Platform> Kernel<P> {
         for s in &segs {
             let mut a = s.start;
             while a < s.start + s.dump {
-                // A page that cannot be read, or holds only zeros, is a hole.
-                let read = crate::uaccess::read_into(a, &mut page).is_ok();
+                // A page that cannot be read, holds only zeros or was
+                // given `MADV_DONTDUMP` is a hole.
+                let read =
+                    !crate::mm::dont_dump(a) && crate::uaccess::read_into(a, &mut page).is_ok();
                 if !read || page.iter().all(|&b| b == 0) {
                     out.skip(PAGE);
                 } else if !out.put(&page) {

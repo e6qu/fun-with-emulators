@@ -756,6 +756,13 @@ impl Fs {
             // The kernel's view of the process fills it in (see
             // `Kernel::self_status`); its place is held here.
             b"/proc/self/status" => return Some(crate::procfs::Entry::File(Vec::new())),
+            // Read and written by address (`crate::procmem`).
+            b"/proc/self/mem" | b"/proc/self/pagemap" => {
+                return Some(crate::procfs::Entry::File(Vec::new()));
+            }
+            b"/proc/self/coredump_filter" => {
+                return Some(crate::procfs::Entry::File(crate::coredump::FILTER.to_vec()));
+            }
             b"/proc/self/timerslack_ns" => {
                 // SAFETY: getpid cannot fail.
                 let (slack, _) = crate::procreg::slack(unsafe { libc::getpid() });

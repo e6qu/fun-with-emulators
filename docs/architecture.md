@@ -321,9 +321,10 @@ does for it, then the per-process state fwe keeps. Inside fwe:
   at `fork` against the user's fwe processes.
 - **Core dumps** (`crates/kernel/src/coredump.rs`): a signal whose default
   dumps core leaves an ELF core (the thread's registers, the process, and
-  the mappings Linux's default `coredump_filter` dumps), named by
-  `kernel.core_pattern` and `core_uses_pid` and cut short at
-  `RLIMIT_CORE`. The host's own core limit is 0.
+  the mappings Linux's default `coredump_filter` dumps, which
+  `/proc/<pid>/coredump_filter` shows, less memory given
+  `MADV_DONTDUMP`), named by `kernel.core_pattern` and `core_uses_pid`
+  and cut short at `RLIMIT_CORE`. The host's own core limit is 0.
 - **End status:** a process a signal ends leaves its Linux wait status
   beside its record (`procreg::ending`), so its parent reads the signal
   and core bit Linux would report even for a signal the host lacks.
@@ -490,9 +491,12 @@ is in keeping fwe's own descriptors apart and Linux's limits exact:
 What the guest reads about files, and the file features macOS lacks or
 shapes differently:
 
-- `stat`/`statx` are translated to the arm64 Linux layout; `getdents64`
-  is built from `getdirentries`, re-reading from the directory position
-  when translated entries outgrow the guest's buffer.
+- `stat`/`statx` are translated to the arm64 Linux layout; `statx`
+  reports the immutable, append-only and no-dump attributes from the
+  host's file flags. A file of a tmpfs mount is on the device
+  `/proc/<pid>/mountinfo` gives the mount, in page-sized blocks.
+  `getdents64` is built from `getdirentries`, re-reading from the
+  directory position when translated entries outgrow the guest's buffer.
 - **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner
   is kept in `org.fwe.mode`, the file flagged `UF_NODUMP`; `stat` reports
   it. A file made by something else that the host refuses root is
@@ -558,10 +562,12 @@ shapes differently:
   page every fwe process maps (one whose holder has ended is taken over),
   so only that pipe's writers wait; one that does not wait is written
   whole or not at all (`EAGAIN`).
-- **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`): immutable and
-  append-only are the host's user flags of the same meaning, which it
-  enforces; setting them takes `CAP_LINUX_IMMUTABLE`, and such a file's
-  extended attributes cannot change. `O_NOATIME` (a descriptor's own,
+- **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`): immutable,
+  append-only and no-dump are the host's user flags of the same meaning,
+  which it enforces; setting the first two takes `CAP_LINUX_IMMUTABLE`,
+  and such a file's extended attributes cannot change. An append-only
+  file's times may be set to now (the host refuses it, so the flag is
+  lifted for the change), not to a time. `O_NOATIME` (a descriptor's own,
   the host has none) leaves the access time as a `noatime` mount does.
 - **`O_TMPFILE`** (`crates/kernel/src/tmpfile.rs`): the file is made
   under a hidden name in its directory (`getdents` leaves it out, `rmdir`
@@ -918,7 +924,11 @@ which are to be lifted for 1.0 and which are not planned.
 - VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
   `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
   nothing.
-- `/proc/<pid>/pagemap` and `coredump_filter` are not there.
+- `/proc/self/mem` and `/proc/self/pagemap` are the caller's own memory
+  only (macOS gives no process another's); a `pagemap` entry tells
+  whether a page is in memory, its frame number 0, as Linux shows it to
+  a process without `CAP_SYS_ADMIN`. `coredump_filter` is the default
+  and cannot be changed.
 - Native: write+exec memory takes a fault each time a page goes from being
   written to being run or back, slow for code that does both to one page
   often; a host call writing into such a page while it is executable (a
