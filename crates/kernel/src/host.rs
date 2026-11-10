@@ -652,10 +652,12 @@ pub unsafe fn signal_info(
         } else {
             None
         };
-        // The host's own SIGIO, for a descriptor's readiness (one another
-        // process sent leaves a note): Linux's is the kernel's, from no
-        // process.
-        if sig == libc::SIGIO && code == 0 && note.is_none() {
+        // The host's own SIGIO, for a descriptor's readiness: Linux's is the
+        // kernel's, from no process. Every fwe process that sends one leaves
+        // a note, so one without is the host's, whatever code and sender it
+        // comes with: macOS may give it those of a SIGCHLD just raised (a
+        // child that wrote to the pipe and ended).
+        if sig == libc::SIGIO && note.is_none() && code != SENT {
             return crate::thread::SigInfo { code: signal::SI_KERNEL, ..Default::default() };
         }
         if let Some(n) = note {
