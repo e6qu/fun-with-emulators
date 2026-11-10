@@ -303,6 +303,9 @@ impl<P: Platform> Kernel<P> {
     /// host cannot open, is opened as that file.
     pub(crate) fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         let r = self.open_path_inner(dirfd, path, flags, mode);
+        if r >= 0 && flags & fwe_abi::fcntl::O_NOATIME != 0 {
+            crate::atime::opened_noatime(r as i32);
+        }
         // `O_CREAT` of a directory that exists (through a link too) is
         // `EISDIR`, which the host lets open.
         if r >= 0 && flags & fcntl::O_CREAT != 0 {
@@ -2499,8 +2502,7 @@ impl<P: Platform> Kernel<P> {
                 f(&crate::xattr::Target::Fd(fd), &self.xattr_who(plain), layers.as_deref())
             }
             None => {
-                let path =
-                    uaccess::read_cstr(path, uaccess::PATH_MAX).map_err(|_| errno::EFAULT)?;
+                let path = uaccess::read_cstr(path, uaccess::PATH_MAX)?;
                 if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
                     return Err(SYNTHETIC);
                 }

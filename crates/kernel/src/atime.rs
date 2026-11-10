@@ -28,14 +28,40 @@ fn read_fd(n: u64, a: &[u64; 6]) -> Option<i32> {
     } as i32)
 }
 
+/// Whether any descriptor was opened with `O_NOATIME` (until then a read
+/// looks no further).
+static NOATIME_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The descriptors opened with `O_NOATIME`: reading through one leaves the
+/// access time, as Linux's does.
+static NOATIME_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+fn noatime_fd(fd: i32) -> bool {
+    NOATIME_FDS.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)
+}
+
+/// `fd` was opened with `O_NOATIME`.
+pub fn opened_noatime(fd: i32) {
+    NOATIME_FDS.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+    NOATIME_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `fd` was closed.
+pub fn closed(fd: i32) {
+    if NOATIME_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        NOATIME_FDS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+    }
+}
+
 /// Before call `n`: what its read of a file of a `noatime`, `nodiratime`
 /// or `strictatime` mount needs afterwards.
 pub fn before(n: u64, a: &[u64; 6]) -> Option<Before> {
     let fd = read_fd(n, a)?;
-    if !crate::fdmarks::atime_files() {
+    // Opened with `O_NOATIME`: as a `noatime` mount's file.
+    let own = NOATIME_ANY.load(std::sync::atomic::Ordering::Relaxed) && noatime_fd(fd);
+    if !own && !crate::fdmarks::atime_files() {
         return None;
     }
-    let flags = crate::fdmarks::origin(fd)?.flags;
+    let flags = if own { ms::NOATIME } else { crate::fdmarks::origin(fd)?.flags };
     if flags & (ms::NOATIME | ms::NODIRATIME | ms::STRICTATIME) == 0 {
         return None;
     }

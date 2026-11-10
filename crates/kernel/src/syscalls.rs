@@ -202,6 +202,7 @@ impl<P: Platform> Kernel<P> {
                 let fd = a[0] as i32;
                 crate::epoll::closed(fd);
                 crate::mountwatch::closed(fd);
+                crate::atime::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);
@@ -1154,6 +1155,18 @@ impl<P: Platform> Kernel<P> {
         }
         if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
             return r;
+        }
+        // `FICLONE`, `FICLONERANGE` and `FIDEDUPERANGE` between files: no
+        // file system fwe mounts shares extents (`EOPNOTSUPP`, as Linux's
+        // tmpfs and ext4 answer).
+        if matches!(req, 0x4004_9409 | 0x4020_940d | 0xc018_9436) && is_regular_fd(fd) {
+            return err(errno::EOPNOTSUPP);
+        }
+        // `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`: the immutable and
+        // append-only flags, which the host has (and enforces) too.
+        #[cfg(target_os = "macos")]
+        if req == 0x8008_6601 || req == 0x4008_6602 {
+            return self.inode_flags(fd, req == 0x4008_6602, arg);
         }
         // `RNDGETENTCNT` on `/dev/random` or `/dev/urandom`: the entropy
         // count, full as Linux's is (`kernel.random.entropy_avail`).
@@ -2201,6 +2214,81 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             return Ok(n);
         }
     }
+}
+
+/// Linux's inode flags fwe keeps: immutable and append-only, as the
+/// host's user flags; `noatime` and `nodump`, which tmpfs takes, are
+/// accepted and not kept.
+#[cfg(target_os = "macos")]
+const FS_IMMUTABLE_FL: u32 = 0x10;
+#[cfg(target_os = "macos")]
+const FS_APPEND_FL: u32 = 0x20;
+#[cfg(target_os = "macos")]
+const FS_NODUMP_FL: u32 = 0x40;
+#[cfg(target_os = "macos")]
+const FS_NOATIME_FL: u32 = 0x80;
+
+#[cfg(target_os = "macos")]
+impl<P: Platform> Kernel<P> {
+    /// `FS_IOC_GETFLAGS` (`set` false) or `FS_IOC_SETFLAGS` of the file
+    /// open as `fd`, the flags at `arg`.
+    fn inode_flags(&mut self, fd: i32, set: bool, arg: u64) -> i64 {
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return last_error();
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+            return err(errno::ENOTTY);
+        }
+        let host = st.st_flags;
+        if !set {
+            let mut f = 0u32;
+            if host & libc::UF_IMMUTABLE != 0 {
+                f |= FS_IMMUTABLE_FL;
+            }
+            if host & libc::UF_APPEND != 0 {
+                f |= FS_APPEND_FL;
+            }
+            guest!(uaccess::write(arg, f));
+            return 0;
+        }
+        let f: u32 = guest!(uaccess::read(arg));
+        if f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
+            return err(errno::EOPNOTSUPP);
+        }
+        // The file's owner's to change, and the immutable and append-only
+        // flags only with `CAP_LINUX_IMMUTABLE`.
+        let owner = crate::owners::of_fd(fd, &st).0;
+        if owner != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
+            return err(errno::EPERM);
+        }
+        let mut want = host & !(libc::UF_IMMUTABLE | libc::UF_APPEND);
+        if f & FS_IMMUTABLE_FL != 0 {
+            want |= libc::UF_IMMUTABLE;
+        }
+        if f & FS_APPEND_FL != 0 {
+            want |= libc::UF_APPEND;
+        }
+        if want != host && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
+            return err(errno::EPERM);
+        }
+        if want == host {
+            return 0;
+        }
+        // SAFETY: plain host call on the guest's descriptor.
+        ret(unsafe { libc::fchflags(fd, want) })
+    }
+}
+
+/// Whether `fd` is a regular file.
+fn is_regular_fd(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG }
 }
 
 /// Whether `fd` is `/dev/random` or `/dev/urandom` (Linux's 1:8, 1:9).

@@ -167,9 +167,33 @@ pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
 }
 
 /// Set attribute `name` of `t` to `value`, with Linux `flags`.
+/// Whether the file `t` names is immutable or append-only, whose
+/// attributes Linux lets no one change (the host does).
+#[cfg(target_os = "macos")]
+fn frozen(t: &Target) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid path or descriptor, and the out-parameter above.
+    let r = unsafe {
+        match t {
+            Target::Path(p) => libc::lstat(p.as_ptr(), &mut st),
+            Target::Fd(fd) => libc::fstat(*fd, &mut st),
+        }
+    };
+    r == 0 && st.st_flags & (libc::UF_IMMUTABLE | libc::UF_APPEND) != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn frozen(_: &Target) -> bool {
+    false
+}
+
 pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32> {
     if flags & !(CREATE | REPLACE) != 0 {
         return Err(errno::EINVAL);
+    }
+    if frozen(t) {
+        return Err(errno::EPERM);
     }
     if value.len() > SIZE_MAX {
         return Err(errno::E2BIG);
@@ -203,6 +227,9 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
 
 /// Remove attribute `name` of `t`.
 pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
+    if frozen(t) {
+        return Err(errno::EPERM);
+    }
     let n = host_name(name)?;
     // SAFETY: a valid name.
     let r = unsafe {

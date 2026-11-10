@@ -558,6 +558,11 @@ shapes differently:
   page every fwe process maps (one whose holder has ended is taken over),
   so only that pipe's writers wait; one that does not wait is written
   whole or not at all (`EAGAIN`).
+- **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`): immutable and
+  append-only are the host's user flags of the same meaning, which it
+  enforces; setting them takes `CAP_LINUX_IMMUTABLE`, and such a file's
+  extended attributes cannot change. `O_NOATIME` (a descriptor's own,
+  the host has none) leaves the access time as a `noatime` mount does.
 - **File handles** (`crates/kernel/src/handles.rs`): a handle names the
   host file system and inode, which the host turns back into a path
   (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes

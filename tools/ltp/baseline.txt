@@ -425,6 +425,7 @@ ioctl05
 ioctl06
 ioctl07
 ioctl10
+ioctl_ficlone02
 ioctl_pidfd01
 ioctl_pidfd02
 ioctl_pidfd03
@@ -486,8 +487,10 @@ listmount02
 listmount03
 listmount04
 listxattr01
+listxattr02
 listxattr03
 llistxattr01
+llistxattr02
 llistxattr03
 llseek01
 llseek02
@@ -644,10 +647,12 @@ open06
 open07
 open09
 open11
+open12
 open15
 open_by_handle_at01
 open_by_handle_at02
 openat01
+openat02
 openat201
 openat202
 openat203
@@ -916,6 +921,7 @@ setuid03
 setuid04
 setxattr01
 setxattr02
+setxattr03
 shmat01
 shmat02
 shmat03
@@ -1040,6 +1046,7 @@ uname04
 unlink05
 unlink07
 unlink08
+unlink09
 unlink10
 unlinkat01
 unshare01
