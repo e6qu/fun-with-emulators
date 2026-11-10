@@ -503,10 +503,14 @@ shapes differently:
   `/proc/<pid>/mountinfo` gives the mount, in page-sized blocks.
   `getdents64` is built from `getdirentries`, re-reading from the
   directory position when translated entries outgrow the guest's buffer.
-- **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner
-  is kept in `org.fwe.mode`, the file flagged `UF_NODUMP`; `stat` reports
-  it. A file made by something else that the host refuses root is
-  converted the first time.
+- **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner,
+  or a file's set-ID bits (which the host drops from a file of a group
+  its user is not in, and on any write), is kept in `org.fwe.mode`, the
+  file flagged `UF_NODUMP`; `stat` reports it. A write by a caller
+  without `CAP_FSETID` takes a file's set-ID bits away, as Linux's does.
+  Where a file's path is too long for the host, its attributes are read
+  and written through a descriptor of it. A file made by something else
+  that the host refuses root is converted the first time.
 - **Owners** (`crates/kernel/src/owners.rs`): a file whose owner is not
   root (fwe's user) keeps it in `org.fwe.owner`, under the same flag;
   `stat` reports it. A new file is its maker's (its file-system user, and
@@ -580,8 +584,7 @@ shapes differently:
   under a hidden name in its directory (`getdents` leaves it out, `rmdir`
   of a directory holding only such names removes them), which goes when
   the descriptor is closed, or at once with `O_EXCL`; `linkat` gives it a
-  name through `/proc/self/fd`. A kept mode the host lacks (one without
-  the owner's read and write) is not carried to the name it is given.
+  name through `/proc/self/fd`.
 - **File handles** (`crates/kernel/src/handles.rs`): a handle names the
   host file system and inode, which the host turns back into a path
   (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes

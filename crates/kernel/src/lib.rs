@@ -466,6 +466,7 @@ impl<P: Platform> Kernel<P> {
     /// callers that do not expose a register file.
     pub fn syscall(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         let result = self.dispatch(nr, args);
+        self.note_creds();
         self.tracer.syscall(nr, &args, result);
         result
     }
@@ -474,7 +475,18 @@ impl<P: Platform> Kernel<P> {
     /// tracing it or touching registers: for a backend that records the
     /// result itself with [`Kernel::finish_syscall`].
     pub fn run_call(&mut self, nr: u64, args: [u64; 6]) -> i64 {
-        self.dispatch(nr, args)
+        let result = self.dispatch(nr, args);
+        self.note_creds();
+        result
+    }
+
+    /// What the calls made without the kernel's lock need of the caller's
+    /// credentials: whether it has `CAP_FSETID`, while a set-ID file is
+    /// open to write.
+    fn note_creds(&self) {
+        if modes::setid_open() {
+            modes::note_fsetid(self.creds.has(caps::CAP_FSETID));
+        }
     }
 
     /// Reset the signal and per-thread state across a successful `execve`:
@@ -935,9 +947,22 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     // SAFETY: the caller's guarantee, passed on.
     let r = unsafe { blocking_call(nr, a) }?;
     atime::after(noted, r);
+    after_write(nr, &a, r);
     // A write the host refused to a sealed memfd, and what a socket that
     // stands in for another kind reports, as Linux reports them.
     Some(linux_result(nr, &a, r))
+}
+
+/// After call `nr` with `a`, which returned `r`: a write to a set-ID
+/// file takes the bits away where Linux's would ([`modes::wrote`]).
+pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
+    use fwe_abi::nr as n;
+    if r > 0
+        && modes::setid_open()
+        && matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2)
+    {
+        modes::wrote(a[0] as i32);
+    }
 }
 
 /// The result of system call `nr` as Linux reports it where the host's

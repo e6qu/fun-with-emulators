@@ -173,7 +173,9 @@ impl<P: Platform> Kernel<P> {
             | nr::TEE
             | nr::VMSPLICE => {
                 // SAFETY: the backend's guarantee for the guest pointers.
-                unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS))
+                let r = unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS));
+                crate::after_write(n, &a, r);
+                r
             }
             nr::LSEEK => {
                 if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
@@ -205,6 +207,7 @@ impl<P: Platform> Kernel<P> {
                 crate::atime::closed(fd);
                 crate::memfd::closed(fd);
                 crate::tmpfile::closed(fd);
+                crate::modes::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);

@@ -139,9 +139,8 @@ run.
   and debug a guest program (attach, system-call stops, registers, memory,
   breakpoints, signals).
 - [ ] **Every other failure LTP points at**, among them:
-  - `ETXTBSY` for a running program's file, `fs.protected_hardlinks`
-    and `protected_symlinks`, an `O_TMPFILE` file's kept mode once
-    linked, robust futex lists of other processes.
+  - POSIX interval timers (`timer_create`), `fs.protected_hardlinks`
+    and `protected_symlinks`, robust futex lists of other processes.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries stripped of section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its

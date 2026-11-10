@@ -658,11 +658,13 @@ open07
 open09
 open11
 open12
+open14
 open15
 open_by_handle_at01
 open_by_handle_at02
 openat01
 openat02
+openat03
 openat04
 openat201
 openat202

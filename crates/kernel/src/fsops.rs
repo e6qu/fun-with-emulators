@@ -206,9 +206,6 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
     Ok(out)
 }
 
-/// Host metadata of open descriptor `fd`, with the guest's permission
-/// bits ([`crate::modes`]).
-/// `fstat` of `fd` in Linux's layout (the host's view of the file).
 /// The host device and inode of the file open as `fd`.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
@@ -217,6 +214,9 @@ pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
 }
 
+/// Host metadata of open descriptor `fd`, with the guest's permission
+/// bits ([`crate::modes`]).
+/// `fstat` of `fd` in Linux's layout (the host's view of the file).
 pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
     stat_fd(fd).map(|s| stat_to_linux_fd(fd, &s))
 }
@@ -832,6 +832,7 @@ impl<P: Platform> Kernel<P> {
             {
                 #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
                 crate::textbusy::opened_for_writing(st.st_dev as u64, st.st_ino);
+                crate::modes::opened_for_writing(fd, &st);
             }
             let node = if crate::devnodes::marked(&st) {
                 crate::devnodes::node_of(fd)
