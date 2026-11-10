@@ -1404,6 +1404,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 // SAFETY: the guest buffer spans the length.
                 return Some(unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) });
             }
+            if memfd::grow_refused(fd, None, len) {
+                return Some(fwe_abi::err(fwe_abi::errno::EPERM));
+            }
             // A file of a tmpfs with a size: as much as fits.
             let len = match tmpfs::room(fd, None, len) {
                 Ok(n) => n,
@@ -1477,6 +1480,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             let special = specialwrite::Source::Guest(a[1]);
             match specialwrite::write(a[0] as i32, special, a[2]) {
                 Some(r) => r,
+                None if memfd::grow_refused(a[0] as i32, Some(a[3]), a[2]) => {
+                    fwe_abi::err(fwe_abi::errno::EPERM)
+                }
                 // A file of a tmpfs with a size: as much as fits.
                 None => match tmpfs::room(a[0] as i32, Some(a[3]), a[2]) {
                     Ok(n) => {

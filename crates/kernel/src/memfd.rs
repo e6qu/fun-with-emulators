@@ -10,12 +10,16 @@
 //! Seals are kept as Linux keeps them:
 //!
 //! - `F_SEAL_SHRINK` and `F_SEAL_GROW` are checked by `ftruncate` and
-//!   `fallocate` here.
+//!   `fallocate` here, and `F_SEAL_GROW` by a write past the end (looked
+//!   at only once some memfd of the process has it).
 //! - `F_SEAL_WRITE` (and `F_SEAL_FUTURE_WRITE`) freezes the contents: the file
 //!   is cloned, and every descriptor this process has of it is replaced by a
 //!   read-only one of the clone, at the same offset and with the same flags
 //!   and sharing. The host then refuses writes and writable shared mappings,
-//!   and the kernel reports those as `EPERM` ([`write_refused`]).
+//!   and the kernel reports those as `EPERM` ([`write_refused`]). Its size
+//!   still changes as the other seals allow, through a writable descriptor
+//!   of the clone fwe keeps; a writable shared mapping of it makes the seal
+//!   `EBUSY`.
 //! - `F_SEAL_EXEC` is checked by `fchmod`.
 
 use fwe_abi::{err, errno, fcntl, memfd as mfd};
@@ -91,6 +95,11 @@ pub fn add_seals(fd: i32, add: u64) -> i64 {
     if add & !(ALL_SEALS as u64) != 0 {
         return err(errno::EINVAL);
     }
+    if ANY_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)
+    {
+        return err(errno::EPERM);
+    }
     match imp::add_seals(fd, add as u32) {
         Ok(()) => 0,
         Err(e) => err(e),
@@ -113,11 +122,76 @@ pub fn check_resize(fd: i32, len: i64) -> Result<(), i32> {
     }
     let size = st.st_size as i64;
     let refused = (len < size && seals & fcntl::F_SEAL_SHRINK != 0)
-        || (len > size && seals & fcntl::F_SEAL_GROW != 0)
-        // The contents are frozen in a read-only clone, which cannot be
-        // resized at all.
-        || (len != size && seals & WRITE_SEALS != 0);
+        || (len > size && seals & fcntl::F_SEAL_GROW != 0);
     if refused { Err(errno::EPERM) } else { Ok(()) }
+}
+
+/// Memfd descriptors opened read-only again (through `/proc/self/fd`),
+/// which the host made sharing a writable description: no seals through
+/// them, as Linux's need one open for writing. With whether any is.
+static READ_ONLY: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+static ANY_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Memfd descriptor `fd` was opened again read-only.
+pub fn reopened_read_only(fd: i32) {
+    READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+    ANY_READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Descriptor `fd` was closed.
+pub fn closed(fd: i32) {
+    if ANY_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+    }
+}
+
+/// Whether a memfd of this process was sealed against growing (until then
+/// a write looks no further).
+static GROW_SEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a write of `len` bytes to `fd` at `offset` (its position, for
+/// `None`) would grow a memfd sealed against it (`F_SEAL_GROW`: `EPERM`).
+pub fn grow_refused(fd: i32, offset: Option<u64>, len: u64) -> bool {
+    if cfg!(target_os = "linux") || !GROW_SEALED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if imp::seals(fd).is_none_or(|s| s & fcntl::F_SEAL_GROW == 0) {
+        return false;
+    }
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    let at = offset.unwrap_or_else(|| {
+        // SAFETY: plain host calls on an open descriptor.
+        let append = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_APPEND != 0;
+        // SAFETY: as above.
+        let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        if append || pos < 0 { st.st_size as u64 } else { pos as u64 }
+    });
+    at + len > st.st_size.max(0) as u64
+}
+
+/// fwe's own writable descriptor of the memfd `fd` is open on, if its
+/// contents are frozen (`F_SEAL_WRITE`): what resizes it.
+pub fn frozen_resizer(fd: i32) -> Option<i32> {
+    if cfg!(target_os = "linux") || imp::seals(fd)? & WRITE_SEALS == 0 {
+        return None;
+    }
+    imp::resizer(fd)
+}
+
+/// `ftruncate` of `fd` to `len`, if it is a memfd whose contents are
+/// frozen (`F_SEAL_WRITE`): its descriptors are read-only, so the clone
+/// is resized through one of fwe's own that may write, as Linux lets a
+/// write-sealed memfd shrink and grow.
+pub fn truncate_frozen(fd: i32, len: i64) -> Option<i64> {
+    let w = frozen_resizer(fd)?;
+    // SAFETY: plain host call on fwe's own descriptor of the clone.
+    let r = unsafe { libc::ftruncate(w, len as libc::off_t) };
+    Some(if r == 0 { 0 } else { crate::host::last_error() })
 }
 
 /// Whether `fchmod` of `fd` is refused by `F_SEAL_EXEC`.
@@ -194,6 +268,11 @@ mod imp {
             return Err(last_errno());
         }
         Ok(())
+    }
+
+    /// The host keeps a sealed memfd's descriptors as they are.
+    pub(super) fn resizer(_: i32) -> Option<i32> {
+        None
     }
 }
 
@@ -289,7 +368,14 @@ mod imp {
             return Ok(());
         }
         if add & WRITE_SEALS != 0 && current & WRITE_SEALS == 0 {
+            // Not while it is mapped shared and writable (`EBUSY`).
+            if file_id(fd).is_some_and(|(_, ino)| crate::maps::record().shared_writable(ino)) {
+                return Err(errno::EBUSY);
+            }
             freeze(fd, new)?;
+        }
+        if new & fcntl::F_SEAL_GROW != 0 {
+            super::GROW_SEALED.store(true, Ordering::Relaxed);
         }
         // Recorded on the file, after the freeze, so that both the original
         // (which other processes may hold) and the clone carry it.
@@ -313,6 +399,7 @@ mod imp {
         let fds: Vec<i32> =
             crate::fdtable::open_fds().into_iter().filter(|&g| file_id(g) == Some(id)).collect();
         let clone = clone_read_only(fd, seals)?;
+        keep_resizer(&clone);
         // Which descriptors share an open file description: give each its
         // own offset in turn, and see which offset each ends up with.
         let offsets: Vec<i64> = fds
@@ -401,6 +488,36 @@ mod imp {
             // SAFETY: unlinking fwe's own file.
             unsafe { libc::unlink(self.path.as_ptr()) };
         }
+    }
+
+    /// A writable descriptor of each frozen clone, by its identity, in
+    /// fwe's reserved range: its size may still change (shrink and grow
+    /// seals allowing), though its contents may not.
+    static RESIZERS: std::sync::Mutex<Vec<((libc::dev_t, u64), i32)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn keep_resizer(clone: &Clone) {
+        // SAFETY: a NUL-terminated path of fwe's own file.
+        let w = unsafe { libc::open(clone.path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        let Ok(w) = crate::fdtable::reserve(w) else { return };
+        match file_id(w) {
+            Some(id) => RESIZERS.lock().unwrap_or_else(|e| e.into_inner()).push((id, w)),
+            // SAFETY: closing the descriptor just opened.
+            None => unsafe {
+                libc::close(w);
+            },
+        }
+    }
+
+    /// The writable descriptor of the frozen clone `fd` is open on.
+    pub(super) fn resizer(fd: i32) -> Option<i32> {
+        let id = file_id(fd)?;
+        RESIZERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, w)| *w)
     }
 
     fn clone_read_only(fd: i32, seals: u32) -> Result<Clone, i32> {

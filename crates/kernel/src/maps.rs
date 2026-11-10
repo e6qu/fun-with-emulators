@@ -444,6 +444,13 @@ impl Record {
         self.areas.get(addr).map(|p| (p.start, p.end))
     }
 
+    /// Whether the file with inode `ino` is mapped shared and writable.
+    pub fn shared_writable(&self, ino: u64) -> bool {
+        self.areas.iter().any(|p| {
+            p.value.shared && p.value.prot & mman::PROT_WRITE != 0 && p.value.object.ino == ino
+        })
+    }
+
     /// How many mappings there are (what `vm.max_map_count` limits).
     pub fn count(&self) -> usize {
         self.areas.len()

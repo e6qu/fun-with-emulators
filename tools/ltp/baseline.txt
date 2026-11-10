@@ -512,6 +512,7 @@ madvise10
 membarrier01
 memcmp01
 memcpy01
+memfd_create01
 memfd_create02
 memset01
 mincore01

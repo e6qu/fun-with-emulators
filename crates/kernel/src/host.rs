@@ -225,12 +225,13 @@ pub fn rlim_to_linux(v: libc::rlim_t) -> u64 {
 }
 
 pub fn rlim_to_host(v: u64) -> libc::rlim_t {
-    // Past the host's largest (its infinity), which Linux takes: no limit.
-    if v == resource::RLIM_INFINITY || v > libc::RLIM_INFINITY as u64 {
-        libc::RLIM_INFINITY
-    } else {
-        v
-    }
+    // Linux's infinity, or past the host's largest (its infinity, 2^63 - 1
+    // on macOS), which Linux takes: no limit.
+    #[cfg(target_os = "macos")]
+    let past = v > i64::MAX as u64;
+    #[cfg(not(target_os = "macos"))]
+    let past = false;
+    if v == resource::RLIM_INFINITY || past { libc::RLIM_INFINITY } else { v }
 }
 
 /// Host signal for a Linux signal number, if the host has an equivalent.

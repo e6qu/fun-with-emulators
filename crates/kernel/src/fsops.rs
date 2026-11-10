@@ -435,6 +435,21 @@ impl<P: Platform> Kernel<P> {
                         }
                         return reopen(fd, flags);
                     }
+                    // A memfd opened to truncate: emptied first, as its
+                    // seals allow (one whose contents are frozen too).
+                    if flags & fcntl::O_TRUNC != 0 && crate::memfd::name(fd).is_some() {
+                        if let Err(e) = crate::memfd::check_resize(fd, 0) {
+                            return err(e);
+                        }
+                        let r = match crate::memfd::truncate_frozen(fd, 0) {
+                            Some(r) => r,
+                            // SAFETY: plain host call on an open guest descriptor.
+                            None => ret(unsafe { libc::ftruncate(fd, 0) }),
+                        };
+                        if r < 0 {
+                            return r;
+                        }
+                    }
                     // A pipe, socket, memfd or the like: a new descriptor
                     // for it.
                     let cmd = if flags & fcntl::O_CLOEXEC != 0 {
@@ -443,7 +458,14 @@ impl<P: Platform> Kernel<P> {
                         libc::F_DUPFD
                     };
                     // SAFETY: plain host call on an open guest descriptor.
-                    ret(unsafe { libc::fcntl(fd, cmd, 0) })
+                    let new = ret(unsafe { libc::fcntl(fd, cmd, 0) });
+                    if new >= 0
+                        && flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
+                        && crate::memfd::name(fd).is_some()
+                    {
+                        crate::memfd::reopened_read_only(new as i32);
+                    }
+                    new
                 }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
                     Some(entries) => {
@@ -1930,6 +1952,9 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::memfd::check_resize(fd as i32, len as i64) {
             return err(e);
         }
+        if let Some(r) = crate::memfd::truncate_frozen(fd as i32, len as i64) {
+            return r;
+        }
         // SAFETY: plain host call on a guest fd.
         ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) })
     }
@@ -2003,7 +2028,10 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EPERM);
         }
-        match crate::host::fallocate(fd as i32, mode, offset as i64, len as i64) {
+        // A memfd whose contents are frozen grows through fwe's own
+        // writable descriptor of it.
+        let target = crate::memfd::frozen_resizer(fd as i32).unwrap_or(fd as i32);
+        match crate::host::fallocate(target, mode, offset as i64, len as i64) {
             Ok(()) => {
                 if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0 {
                     crate::tmpfs::freed(fd as i32);
