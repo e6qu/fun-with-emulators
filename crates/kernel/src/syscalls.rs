@@ -221,6 +221,7 @@ impl<P: Platform> Kernel<P> {
                 crate::mountapi::closed(fd);
                 crate::nsfd::closed(fd);
                 crate::inotify::closed(fd);
+                crate::dnotify::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
@@ -378,6 +379,23 @@ impl<P: Platform> Kernel<P> {
             nr::UMASK => self.sys_umask(a[0]),
             nr::PIPE2 => self.sys_pipe2(a[0], a[1]),
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
+            // Every file system's writes, the host's `sync`: a file
+            // system of a descriptor is the host's too.
+            nr::SYNC => {
+                // SAFETY: plain host call.
+                unsafe { libc::sync() };
+                0
+            }
+            nr::SYNCFS => {
+                // SAFETY: plain host call on a guest fd.
+                if unsafe { libc::fcntl(a[0] as i32, libc::F_GETFD) } < 0 {
+                    return err(errno::EBADF);
+                }
+                let _ = crate::loopdev::fsync(a[0] as i32);
+                // SAFETY: plain host call.
+                unsafe { libc::sync() };
+                0
+            }
             nr::FSYNC | nr::FDATASYNC => match crate::loopdev::fsync(a[0] as i32) {
                 Some(r) => r,
                 None => {
@@ -603,6 +621,9 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
+            nr::ACCT => self.sys_acct(a[0]),
+            #[cfg(target_os = "macos")]
+            nr::FILE_GETATTR | nr::FILE_SETATTR => self.sys_file_attr(n == nr::FILE_SETATTR, a),
             nr::PTRACE => self.sys_ptrace(a[0], a[1], a[2], a[3]),
             nr::UNAME => self.sys_uname(a[0]),
             nr::SYSINFO => self.sys_sysinfo(a[0]),
@@ -675,6 +696,9 @@ impl<P: Platform> Kernel<P> {
             nr::DELETE_MODULE => self.sys_delete_module(a[0]),
             nr::SYSLOG => self.sys_syslog(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0], a[1]),
+            nr::LSM_LIST_MODULES => self.sys_lsm_list_modules(a[0], a[1], a[2]),
+            nr::LSM_GET_SELF_ATTR => self.sys_lsm_get_self_attr(a[0], a[2], a[3]),
+            nr::LSM_SET_SELF_ATTR => self.sys_lsm_set_self_attr(a[1], a[2], a[3]),
             nr::RT_SIGQUEUEINFO => self.sys_rt_sigqueueinfo(a[0], a[1], a[2]),
             nr::RT_TGSIGQUEUEINFO => self.sys_rt_tgsigqueueinfo(a[0], a[1], a[2], a[3]),
             nr::PERSONALITY => personality(a[0]),
@@ -802,6 +826,42 @@ impl<P: Platform> Kernel<P> {
                 self.tracer.note(&format!("unimplemented syscall {n}"));
                 err(errno::ENOSYS)
             }
+        }
+    }
+
+    /// `acct(path)`: process accounting to the regular file at `path`, or
+    /// off for a null one; the file is opened as Linux opens it (for
+    /// appending), so it fails as that open would.
+    fn sys_acct(&mut self, path: u64) -> i64 {
+        if !self.creds.has(crate::caps::CAP_SYS_PACCT) {
+            return err(errno::EPERM);
+        }
+        if path == 0 {
+            return match crate::acct::set(None) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            };
+        }
+        let flags = fwe_abi::fcntl::O_WRONLY | fwe_abi::fcntl::O_APPEND;
+        let fd = self.sys_openat(fwe_abi::fcntl::AT_FDCWD as u64, path, flags, 0);
+        if fd < 0 {
+            return fd;
+        }
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a plain host call on the descriptor just opened, with a
+        // valid out-parameter.
+        let regular = unsafe { libc::fstat(fd as i32, &mut st) } == 0
+            && st.st_mode & libc::S_IFMT == libc::S_IFREG;
+        let named = crate::fs::host_path_of(fd as i32);
+        self.dispatch_call(nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+        if !regular {
+            return err(errno::EACCES);
+        }
+        let Some(host) = named else { return err(errno::EIO) };
+        match crate::acct::set(Some(&host)) {
+            Ok(()) => 0,
+            Err(e) => err(e),
         }
     }
 
@@ -1059,6 +1119,10 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 fcntl::F_GETSIG => crate::fdstate::get(fd).sig as i64,
+                fcntl::F_NOTIFY => match crate::dnotify::set(fd, arg) {
+                    Ok(()) => 0,
+                    Err(e) => err(e),
+                },
                 fcntl::F_SETLEASE => self.set_lease(fd, arg),
                 fcntl::F_GETLEASE => i64::from(crate::leases::get(fd)),
                 fcntl::F_GETPIPE_SZ | fcntl::F_SETPIPE_SZ => self.pipe_size(fd, cmd, arg),
@@ -2286,40 +2350,35 @@ impl<P: Platform> Kernel<P> {
     /// `FS_IOC_GETFLAGS` (`set` false) or `FS_IOC_SETFLAGS` of the file
     /// open as `fd`, the flags at `arg`.
     fn inode_flags(&mut self, fd: i32, set: bool, arg: u64) -> i64 {
-        // SAFETY: an all-zero `stat` is a valid out-parameter.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: as above.
-        if unsafe { libc::fstat(fd, &mut st) } != 0 {
-            return last_error();
-        }
-        let kind = st.st_mode & libc::S_IFMT;
-        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
-            return err(errno::ENOTTY);
-        }
-        let host = st.st_flags;
         if !set {
-            let mut f = 0u32;
-            if host & libc::UF_IMMUTABLE != 0 {
-                f |= FS_IMMUTABLE_FL;
-            }
-            if host & libc::UF_APPEND != 0 {
-                f |= FS_APPEND_FL;
-            }
-            if crate::modes::nodump_fd(fd, &st) {
-                f |= FS_NODUMP_FL;
-            }
-            guest!(uaccess::write(arg, f));
-            return 0;
+            return match get_inode_flags(fd) {
+                Ok(f) => {
+                    guest!(uaccess::write(arg, f));
+                    0
+                }
+                Err(e) => err(e),
+            };
         }
         let f: u32 = guest!(uaccess::read(arg));
+        match self.set_inode_flags(fd, f) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// Set the inode flags `f` of the file open as `fd` (`ENOTTY` for one
+    /// that has none).
+    fn set_inode_flags(&mut self, fd: i32, f: u32) -> Result<(), i32> {
+        let st = file_kind_for_flags(fd)?;
+        let host = st.st_flags;
         if f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
-            return err(errno::EOPNOTSUPP);
+            return Err(errno::EOPNOTSUPP);
         }
         // The file's owner's to change, and the immutable and append-only
         // flags only with `CAP_LINUX_IMMUTABLE`.
         let owner = crate::owners::of_fd(fd, &st).0;
         if owner != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
-            return err(errno::EPERM);
+            return Err(errno::EPERM);
         }
         let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
         let mut want = host & !(fixed | libc::UF_NODUMP);
@@ -2335,14 +2394,172 @@ impl<P: Platform> Kernel<P> {
             want |= libc::UF_NODUMP;
         }
         if (want ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
-            return err(errno::EPERM);
+            return Err(errno::EPERM);
         }
         if want == host {
-            return 0;
+            return Ok(());
         }
         // SAFETY: plain host call on the guest's descriptor.
-        ret(unsafe { libc::fchflags(fd, want) })
+        if unsafe { libc::fchflags(fd, want) } != 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        Ok(())
     }
+
+    /// `file_getattr(dfd, path, attr, size, at_flags)` (`set` false) or
+    /// `file_setattr`: a file's attributes as `struct file_attr` (24
+    /// bytes), the inode flags as `fa_xflags`; what only XFS keeps
+    /// (extent sizes, projects) is `EOPNOTSUPP` to set.
+    fn sys_file_attr(&mut self, set: bool, a: [u64; 6]) -> i64 {
+        const VER0: u64 = 24;
+        let (dfd, path, attr, size, at) = (a[0] as i32, a[1], a[2], a[3], a[4]);
+        if at & !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH) != 0 {
+            return err(errno::EINVAL);
+        }
+        if size > 4096 {
+            return err(errno::E2BIG);
+        }
+        if size < VER0 {
+            return err(errno::EINVAL);
+        }
+        // `file_setattr` takes the attributes first: those past the 24
+        // bytes it knows must be zero.
+        let wanted = if set {
+            let given = guest!(uaccess::read_bytes(attr, size as usize));
+            if given[VER0 as usize..].iter().any(|&b| b != 0) {
+                return err(errno::E2BIG);
+            }
+            let word = |at: usize| u32::from_ne_bytes(given[at..at + 4].try_into().unwrap());
+            let xflags = u64::from_ne_bytes(given[..8].try_into().unwrap());
+            // Linux's `FS_XFLAG_*` bits, `FS_XFLAG_HASATTR` aside.
+            if xflags & !0x1_ffff != 0 {
+                return err(errno::EINVAL);
+            }
+            // Beyond what every file system with flags has (immutable,
+            // append-only, sync, no-atime, no-dump, DAX), XFS's.
+            if xflags & !(0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x8000) != 0
+                || word(8) != 0
+                || word(16) != 0
+                || word(20) != 0
+            {
+                Some(Err(errno::EOPNOTSUPP))
+            } else {
+                Some(Ok(xflags))
+            }
+        } else {
+            None
+        };
+        // The file: `dfd` itself for a null or empty path with
+        // `AT_EMPTY_PATH`, else the path from it.
+        let name = if path == 0 && at & fcntl::AT_EMPTY_PATH != 0 {
+            Vec::new()
+        } else {
+            guest!(uaccess::read_cstr(path, uaccess::PATH_MAX))
+        };
+        let file = if name.is_empty() && at & fcntl::AT_EMPTY_PATH != 0 {
+            // SAFETY: plain host call on a guest descriptor.
+            let fd = unsafe { libc::fcntl(dfd, libc::F_DUPFD_CLOEXEC, 0) };
+            if fd < 0 {
+                return err(errno::EBADF);
+            }
+            fd
+        } else {
+            let follow = at & fcntl::AT_SYMLINK_NOFOLLOW == 0;
+            let r = match self.fs().resolve(dfd, &name, follow) {
+                Ok(r) => r,
+                Err(e) => return err(e),
+            };
+            if set && r.mount_flags & crate::mounts::ms::RDONLY != 0 {
+                return err(errno::EROFS);
+            }
+            let Ok(c) = std::ffi::CString::new(r.name.clone()) else {
+                return err(errno::ENOENT);
+            };
+            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+            // SAFETY: a NUL-terminated name in a directory descriptor.
+            let fd =
+                unsafe { libc::openat(std::os::fd::AsRawFd::as_raw_fd(&r.dir), c.as_ptr(), flags) };
+            if fd < 0 {
+                // A symbolic link has no attributes.
+                return err(match host::last_errno() {
+                    libc::ELOOP => errno::EOPNOTSUPP,
+                    e => host::errno_to_linux(e),
+                });
+            }
+            fd
+        };
+        let r = (|| {
+            if let Some(w) = wanted {
+                let x = w?;
+                let mut f = 0;
+                for (xf, fl) in [
+                    (0x8, FS_IMMUTABLE_FL),
+                    (0x10, FS_APPEND_FL),
+                    (0x20, 0x8),
+                    (0x40, FS_NOATIME_FL),
+                    (0x80, FS_NODUMP_FL),
+                ] {
+                    if x & xf != 0 {
+                        f |= fl;
+                    }
+                }
+                return self.set_inode_flags(file, f).map(|()| 0);
+            }
+            let f = get_inode_flags(file)?;
+            let mut x = 0u64;
+            for (fl, xf) in [(FS_IMMUTABLE_FL, 0x8), (FS_APPEND_FL, 0x10), (FS_NODUMP_FL, 0x80)] {
+                if f & fl != 0 {
+                    x |= xf;
+                }
+            }
+            let mut out = vec![0u8; size as usize];
+            out[..8].copy_from_slice(&x.to_ne_bytes());
+            uaccess::write_from(attr, &out)?;
+            Ok(0)
+        })();
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(file) };
+        match r {
+            Ok(v) => v,
+            Err(errno::ENOTTY) => err(errno::EOPNOTSUPP),
+            Err(e) => err(e),
+        }
+    }
+}
+
+/// The host status of `fd` if its file has inode flags (a regular file or
+/// directory), else `ENOTTY`.
+#[cfg(target_os = "macos")]
+fn file_kind_for_flags(fd: i32) -> Result<libc::stat, i32> {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(host::errno_to_linux(host::last_errno()));
+    }
+    let kind = st.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+        return Err(errno::ENOTTY);
+    }
+    Ok(st)
+}
+
+/// The inode flags (`FS_IOC_GETFLAGS`) of the file open as `fd`.
+#[cfg(target_os = "macos")]
+fn get_inode_flags(fd: i32) -> Result<u32, i32> {
+    let st = file_kind_for_flags(fd)?;
+    let host = st.st_flags;
+    let mut f = 0u32;
+    if host & libc::UF_IMMUTABLE != 0 {
+        f |= FS_IMMUTABLE_FL;
+    }
+    if host & libc::UF_APPEND != 0 {
+        f |= FS_APPEND_FL;
+    }
+    if crate::modes::nodump_fd(fd, &st) {
+        f |= FS_NODUMP_FL;
+    }
+    Ok(f)
 }
 
 /// Whether `fd` is a regular file.

@@ -1105,6 +1105,8 @@ pub fn exiting(status: i32) {
     let me = me();
     // Ending of a Linux signal: its status as recorded ([`ending`]).
     let status = end_status(me).unwrap_or(status);
+    // Its accounting record, if accounting is on.
+    crate::acct::process_ending(status);
     crate::pidns::exiting();
     if crate::host::children_reaped_by_host() {
         forget_children(me);

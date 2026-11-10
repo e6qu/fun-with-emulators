@@ -765,20 +765,43 @@ impl Ipc {
         body: Body,
         limit: usize,
     ) -> Result<i32, i32> {
+        // An id asked for (`kernel.*_next_id`, used once): its slot, or
+        // the first free one past it, with its sequence number.
+        let next_name = match kind {
+            Kind::Shm => "kernel/shm_next_id",
+            Kind::Sem => "kernel/sem_next_id",
+            Kind::Msg => "kernel/msg_next_id",
+        };
+        let asked = self.sysctls.get(next_name).and_then(|v| v.trim().parse::<i32>().ok());
+        let asked = asked.filter(|&v| v >= 0);
         let slot = {
             let mut idx = self.index();
             let k = kind as u8;
             if idx.used[k as usize % 3].0 >= limit {
                 return Err(errno::ENOSPC);
             }
-            let from = idx.used[k as usize % 3].1;
-            let slot =
-                (from..IPCMNI).find(|&s| !idx.slots.contains_key(&(k, s))).ok_or(errno::ENOSPC)?;
-            // The slots below it are all in use.
-            idx.used[k as usize % 3].1 = slot + 1;
-            slot
+            match asked {
+                Some(v) => (v % IPCMNI..IPCMNI)
+                    .find(|&s| !idx.slots.contains_key(&(k, s)))
+                    .ok_or(errno::ENOSPC)?,
+                None => {
+                    let from = idx.used[k as usize % 3].1;
+                    let slot = (from..IPCMNI)
+                        .find(|&s| !idx.slots.contains_key(&(k, s)))
+                        .ok_or(errno::ENOSPC)?;
+                    // The slots below it are all in use.
+                    idx.used[k as usize % 3].1 = slot + 1;
+                    slot
+                }
+            }
         };
-        let seq = self.seqs.get(&(kind as u8, slot)).copied().unwrap_or(0);
+        let seq = match asked {
+            Some(v) => {
+                self.sysctls.remove(next_name);
+                (v / IPCMNI) as u16
+            }
+            None => self.seqs.get(&(kind as u8, slot)).copied().unwrap_or(0),
+        };
         let id = seq as i32 * IPCMNI + slot;
         self.seqs.insert((kind as u8, slot), seq.wrapping_add(1) % (i32::MAX / IPCMNI) as u16);
         self.objs.insert((kind as u8, id), Obj { key, perm, ctime: now(), removed: false, body });

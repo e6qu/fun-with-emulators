@@ -60,8 +60,11 @@ pub fn init_main(pid: i32) {
     crate::procreg::forget_end(unsafe { libc::getpid() });
     // The calling thread's own set goes with the registry: what landed in
     // it is moved to the process's, and a handler meanwhile posts there.
-    let early: Vec<(u64, SigInfo)> =
-        with_own(|p| (1..=signal::NSIG).filter_map(|s| p.take(s).map(|i| (s, i))).collect());
+    let early: Vec<(u64, SigInfo)> = with_own(|p| {
+        (1..=signal::NSIG)
+            .flat_map(|s| std::iter::from_fn(move || p.take(s)).map(move |i| (s, i)))
+            .collect()
+    });
     OWN.with(|o| o.set(std::ptr::null()));
     for (s, i) in early {
         PROCESS.post(s, i);
@@ -357,6 +360,7 @@ fn wait_timer() -> i32 {
 pub fn forked() {
     PROCESS.clear();
     with_own(Pending::clear);
+    crate::acct::forked_child();
     // A new process starts with no robust list, as Linux's does.
     ROBUST_LIST.with(|c| c.set((0, 0)));
 }
@@ -726,16 +730,78 @@ impl SigSlot {
     }
 }
 
-/// A set of pending signals (one per signal number, as for standard
-/// signals) with the `siginfo` each was raised with.
+/// A real-time signal queued behind the one pending of its number.
+struct Queued {
+    /// 0: free; [`CLAIMED`] while it is written or read; else the order it
+    /// was queued in, from 2 up.
+    state: AtomicU64,
+    sig: AtomicU64,
+    info: SigSlot,
+}
+
+const CLAIMED: u64 = 1;
+
+/// How many real-time signals a set queues beyond one of each number.
+const QUEUED: usize = 64;
+
+/// A set of pending signals with the `siginfo` each was raised with: one
+/// of each standard signal, and the real-time signals queued, as Linux
+/// queues them (one of each number in `info`, the rest behind it in
+/// `queue`, oldest first).
 pub struct Pending {
     bits: AtomicU64,
     info: [SigSlot; signal::NSIG as usize],
+    queue: [Queued; QUEUED],
+    /// The order the next queued signal takes.
+    order: AtomicU64,
 }
 
 impl Pending {
     pub const fn new() -> Pending {
-        Pending { bits: AtomicU64::new(0), info: [const { SigSlot::new() }; signal::NSIG as usize] }
+        Pending {
+            bits: AtomicU64::new(0),
+            info: [const { SigSlot::new() }; signal::NSIG as usize],
+            queue: [const {
+                Queued { state: AtomicU64::new(0), sig: AtomicU64::new(0), info: SigSlot::new() }
+            }; QUEUED],
+            order: AtomicU64::new(2),
+        }
+    }
+
+    /// Queue real-time `sig` with `info` behind the one pending (dropped
+    /// when the queue is full). Async-signal-safe.
+    fn enqueue(&self, sig: u64, info: &SigInfo) {
+        for q in &self.queue {
+            if q.state.compare_exchange(0, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                q.sig.store(sig, Ordering::Relaxed);
+                store_slot(&q.info, info);
+                let order = self.order.fetch_add(1, Ordering::Relaxed);
+                q.state.store(order, Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    /// The oldest signal queued of number `sig`, taken off the queue.
+    fn dequeue(&self, sig: u64) -> Option<SigInfo> {
+        loop {
+            let oldest = self
+                .queue
+                .iter()
+                .filter(|q| q.sig.load(Ordering::Relaxed) == sig)
+                .filter_map(|q| {
+                    let s = q.state.load(Ordering::Acquire);
+                    (s > CLAIMED).then_some((s, q))
+                })
+                .min_by_key(|&(s, _)| s);
+            let (s, q) = oldest?;
+            if q.state.compare_exchange(s, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            let info = load_slot(&q.info);
+            q.state.store(0, Ordering::Release);
+            return Some(info);
+        }
     }
 
     /// Mark `sig` pending. A standard signal already pending keeps the
@@ -753,49 +819,52 @@ impl Pending {
         if sig == signal::SIGCHLD && crate::reaper::superseded(info.pid) {
             return;
         }
+        let pending = self.bits.load(Ordering::Acquire) & (1 << (sig - 1)) != 0;
         if sig < signal::SIGRTMIN
-            && self.bits.load(Ordering::Acquire) & (1 << (sig - 1)) != 0
+            && pending
             && !(sig == signal::SIGCHLD
                 && crate::reaper::precedes(info.pid, slot.pid.load(Ordering::Relaxed)))
         {
             return;
         }
-        slot.code.store(info.code, Ordering::Relaxed);
-        slot.pid.store(info.pid, Ordering::Relaxed);
-        slot.uid.store(info.uid, Ordering::Relaxed);
-        slot.status.store(info.status, Ordering::Relaxed);
-        slot.value.store(info.value, Ordering::Relaxed);
-        let (fd, band) = info.poll.unwrap_or((-1, 0));
-        slot.poll_fd.store(fd, Ordering::Relaxed);
-        slot.band.store(band, Ordering::Relaxed);
+        // A real-time signal already pending: this one waits behind it.
+        if sig >= signal::SIGRTMIN && pending {
+            self.enqueue(sig, &info);
+            return;
+        }
+        store_slot(slot, &info);
         self.bits.fetch_or(1 << (sig - 1), Ordering::Release);
     }
 
     fn take(&self, sig: u64) -> Option<SigInfo> {
         let bit = 1 << (sig - 1);
-        if self.bits.fetch_and(!bit, Ordering::Acquire) & bit == 0 {
+        let slot = &self.info[(sig - 1) as usize];
+        if self.bits.load(Ordering::Acquire) & bit == 0 {
             return None;
         }
-        let slot = &self.info[(sig - 1) as usize];
-        let code = slot.code.load(Ordering::Relaxed);
-        let pid = slot.pid.load(Ordering::Relaxed);
-        // A POSIX timer's signal: its overrun as it is taken.
-        let uid = if code == fwe_abi::signal::SI_TIMER {
-            crate::posixtimer::delivered(pid)
+        let mut info = load_slot(slot);
+        // The next of a queued real-time signal takes its place.
+        if sig >= signal::SIGRTMIN
+            && let Some(next) = self.dequeue(sig)
+        {
+            store_slot(slot, &next);
         } else {
-            slot.uid.load(Ordering::Relaxed)
-        };
-        Some(SigInfo {
-            code,
-            pid,
-            uid,
-            status: slot.status.load(Ordering::Relaxed),
-            value: slot.value.load(Ordering::Relaxed),
-            poll: match slot.poll_fd.load(Ordering::Relaxed) {
-                -1 => None,
-                fd => Some((fd, slot.band.load(Ordering::Relaxed))),
-            },
-        })
+            if self.bits.fetch_and(!bit, Ordering::Acquire) & bit == 0 {
+                return None;
+            }
+            // One queued as the bit was cleared.
+            if sig >= signal::SIGRTMIN
+                && let Some(next) = self.dequeue(sig)
+            {
+                store_slot(slot, &next);
+                self.bits.fetch_or(bit, Ordering::Release);
+            }
+        }
+        // A POSIX timer's signal: its overrun as it is taken.
+        if info.code == fwe_abi::signal::SI_TIMER {
+            info.uid = crate::posixtimer::delivered(info.pid);
+        }
+        Some(info)
     }
 
     fn bits(&self) -> u64 {
@@ -804,6 +873,34 @@ impl Pending {
 
     fn clear(&self) {
         self.bits.store(0, Ordering::Release);
+        for q in &self.queue {
+            q.state.store(0, Ordering::Release);
+        }
+    }
+}
+
+fn store_slot(slot: &SigSlot, info: &SigInfo) {
+    slot.code.store(info.code, Ordering::Relaxed);
+    slot.pid.store(info.pid, Ordering::Relaxed);
+    slot.uid.store(info.uid, Ordering::Relaxed);
+    slot.status.store(info.status, Ordering::Relaxed);
+    slot.value.store(info.value, Ordering::Relaxed);
+    let (fd, band) = info.poll.unwrap_or((-1, 0));
+    slot.poll_fd.store(fd, Ordering::Relaxed);
+    slot.band.store(band, Ordering::Relaxed);
+}
+
+fn load_slot(slot: &SigSlot) -> SigInfo {
+    SigInfo {
+        code: slot.code.load(Ordering::Relaxed),
+        pid: slot.pid.load(Ordering::Relaxed),
+        uid: slot.uid.load(Ordering::Relaxed),
+        status: slot.status.load(Ordering::Relaxed),
+        value: slot.value.load(Ordering::Relaxed),
+        poll: match slot.poll_fd.load(Ordering::Relaxed) {
+            -1 => None,
+            fd => Some((fd, slot.band.load(Ordering::Relaxed))),
+        },
     }
 }
 
@@ -1236,5 +1333,31 @@ mod tests {
         set_mask(u64::MAX);
         assert_eq!(mask() & UNBLOCKABLE, 0);
         set_mask(0);
+    }
+
+    fn valued(value: u64) -> SigInfo {
+        SigInfo { code: signal::SI_QUEUE, value, ..SigInfo::default() }
+    }
+
+    /// Real-time signals queue, each with its own `siginfo`, oldest first;
+    /// a standard one pending keeps its first.
+    #[test]
+    fn real_time_signals_queue() {
+        let p = Pending::new();
+        let rt = signal::SIGRTMIN + 1;
+        for v in 1..=3 {
+            p.post(rt, valued(v));
+        }
+        p.post(signal::SIGUSR1, valued(7));
+        p.post(signal::SIGUSR1, valued(8));
+        let taken: Vec<u64> = std::iter::from_fn(|| p.take(rt)).map(|i| i.value).collect();
+        assert_eq!(taken, [1, 2, 3]);
+        assert_eq!(p.bits() & (1 << (rt - 1)), 0);
+        assert_eq!(p.take(signal::SIGUSR1).map(|i| i.value), Some(7));
+        assert!(p.take(signal::SIGUSR1).is_none());
+        p.post(rt, valued(9));
+        p.post(rt, valued(10));
+        p.clear();
+        assert!(p.take(rt).is_none());
     }
 }

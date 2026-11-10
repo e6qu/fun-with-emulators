@@ -203,6 +203,26 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, IPCMNI),
         space: Space::Ipc,
     },
+    // The id the next object of a kind gets (-1: any), for checkpoint and
+    // restore, used once ([`crate::sysvipc::Ipc::create`]).
+    Sysctl {
+        path: b"kernel/msg_next_id",
+        default: "-1",
+        kind: Kind::Int(-1, INT_MAX),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"kernel/sem_next_id",
+        default: "-1",
+        kind: Kind::Int(-1, INT_MAX),
+        space: Space::Ipc,
+    },
+    Sysctl {
+        path: b"kernel/shm_next_id",
+        default: "-1",
+        kind: Kind::Int(-1, INT_MAX),
+        space: Space::Ipc,
+    },
     Sysctl {
         path: b"fs/lease-break-time",
         default: "45",

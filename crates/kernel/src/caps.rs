@@ -26,6 +26,7 @@ pub const CAP_IPC_OWNER: u32 = 15;
 pub const CAP_SYS_MODULE: u32 = 16;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_PTRACE: u32 = 19;
+pub const CAP_SYS_PACCT: u32 = 20;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;

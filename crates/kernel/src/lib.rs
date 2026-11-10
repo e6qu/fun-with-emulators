@@ -10,6 +10,7 @@
 //! directly and are often handed straight to host system calls, which validate
 //! them.
 
+pub mod acct;
 pub mod atime;
 pub mod bpf;
 pub mod bpfmap;
@@ -21,6 +22,7 @@ pub mod cloneargs;
 pub mod coredump;
 pub mod creds;
 pub mod devnodes;
+pub mod dnotify;
 pub mod epoll;
 pub mod exclusive;
 pub mod fdmarks;
@@ -462,6 +464,7 @@ impl<P: Platform> Kernel<P> {
         epoll::restore(d);
         pidfd::restore(d, false);
         ptrace::load_fork(d);
+        acct::forked_child();
         if let Some(fs) = &k.fs {
             fs.publish();
         }
@@ -532,6 +535,7 @@ impl<P: Platform> Kernel<P> {
         thread::set_altstack(Stack { ss_flags: absig::SS_DISABLE, ..Stack::default() });
         thread::set_clear_child_tid(0);
         thread::set_robust_list(0, 0);
+        acct::exec();
         // The saved IDs become the effective ones, as Linux's execve sets
         // them (no set-user-ID programs here).
         let saved = (self.creds.suid, self.creds.sgid);

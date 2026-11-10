@@ -250,6 +250,7 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
             | n::GETDENTS64
             | n::FSYNC
             | n::FDATASYNC
+            | n::SYNCFS
             | n::FTRUNCATE
             | n::FCHMOD
             | n::FCHOWN

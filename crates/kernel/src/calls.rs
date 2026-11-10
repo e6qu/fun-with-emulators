@@ -1,7 +1,8 @@
 //! Small system calls with little state of their own: `getcpu`,
 //! `vhangup`, `readahead`, `sync_file_range`, `delete_module`, `syslog`,
-//! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, each checked
-//! as Linux checks its arguments.
+//! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, and the LSM
+//! calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`),
+//! each checked as Linux checks its arguments.
 
 use crate::{Kernel, Platform, guest, thread, uaccess};
 use fwe_abi::{err, errno, signal as sig};
@@ -11,6 +12,13 @@ use std::sync::atomic::Ordering::SeqCst;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 1;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
 const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 4;
+
+/// The security modules fwe has: Linux's capabilities alone
+/// (`LSM_ID_CAPABILITY`), which keep no attributes of a process.
+const LSM_IDS: [u64; 1] = [100];
+
+/// `struct lsm_ctx`'s header: `id`, `flags`, `len` and `ctx_len`.
+const LSM_CTX_HEADER: u64 = 32;
 
 /// `membarrier`'s commands.
 const MEMBARRIER_CMD_QUERY: u64 = 0;
@@ -209,6 +217,52 @@ impl<P: Platform> Kernel<P> {
     /// `membarrier(cmd, flags, cpu_id)`: a barrier across the process's
     /// threads (or every process: no other runs code of this process's,
     /// so the same), the private ones only once registered for.
+    /// `lsm_list_modules(ids, size, flags)`: the security modules' ids.
+    pub(crate) fn sys_lsm_list_modules(&mut self, ids: u64, size: u64, flags: u64) -> i64 {
+        if flags != 0 {
+            return err(errno::EINVAL);
+        }
+        let given: u32 = guest!(uaccess::read(size));
+        let total = (LSM_IDS.len() * 8) as u32;
+        guest!(uaccess::write(size, total));
+        if given < total {
+            return err(errno::E2BIG);
+        }
+        for (i, id) in LSM_IDS.iter().enumerate() {
+            guest!(uaccess::write(ids + 8 * i as u64, *id));
+        }
+        LSM_IDS.len() as i64
+    }
+
+    /// `lsm_get_self_attr(attr, ctx, size, flags)`: no module keeps
+    /// attributes of a process (`EOPNOTSUPP`).
+    pub(crate) fn sys_lsm_get_self_attr(&mut self, attr: u64, size: u64, flags: u64) -> i64 {
+        const LSM_FLAG_SINGLE: u64 = 1;
+        if attr == 0 || flags & !LSM_FLAG_SINGLE != 0 {
+            return err(errno::EINVAL);
+        }
+        let _: u32 = guest!(uaccess::read(size));
+        err(errno::EOPNOTSUPP)
+    }
+
+    /// `lsm_set_self_attr(attr, ctx, size, flags)`: the context checked
+    /// as Linux checks it, then `EOPNOTSUPP`, as no module takes one.
+    pub(crate) fn sys_lsm_set_self_attr(&mut self, ctx: u64, size: u64, flags: u64) -> i64 {
+        if flags != 0 || size < LSM_CTX_HEADER {
+            return err(errno::EINVAL);
+        }
+        if size > 4096 {
+            return err(errno::E2BIG);
+        }
+        let b = guest!(uaccess::read_bytes(ctx, size as usize));
+        let word = |at: usize| u64::from_ne_bytes(b[at..at + 8].try_into().unwrap());
+        let (len, ctx_len) = (word(16), word(24));
+        if size < len || size < ctx_len + LSM_CTX_HEADER || len < ctx_len + LSM_CTX_HEADER {
+            return err(errno::EINVAL);
+        }
+        err(errno::EOPNOTSUPP)
+    }
+
     pub(crate) fn sys_membarrier(&mut self, cmd: u64, flags: u64) -> i64 {
         if flags != 0 {
             return err(errno::EINVAL);

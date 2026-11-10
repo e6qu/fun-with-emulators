@@ -194,6 +194,12 @@ fn route_io_signal() {
         return;
     }
     let Some(info) = thread::take_pending(signal::SIGIO) else { return };
+    // Another process's dnotify event on a watch of this one's: the
+    // descriptor's signal ([`crate::dnotify`]).
+    if info.code == crate::dnotify::POLL_MSG && info.poll.is_none() {
+        crate::dnotify::post(info.value as u32 as i32);
+        return;
+    }
     // Only the host's own: another process's (a lease break's) names it.
     if info.code != signal::SI_KERNEL || info.pid != 0 {
         thread::post_process(signal::SIGIO, info);

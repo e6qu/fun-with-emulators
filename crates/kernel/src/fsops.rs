@@ -371,6 +371,18 @@ impl<P: Platform> Kernel<P> {
     /// host's to a file of fwe's `/proc` or `/sys` (`/etc/mtab`), which the
     /// host cannot open, is opened as that file.
     pub(crate) fn open_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
+        // A trailing slash names a directory: `O_CREAT` cannot make one
+        // (`EISDIR`), and anything else is `ENOTDIR` (below).
+        let dir_only = path.len() > 1 && path.ends_with(b"/");
+        if dir_only && flags & fcntl::O_CREAT != 0 {
+            return err(errno::EISDIR);
+        }
+        if dir_only
+            && let Ok(st) = self.linux_stat(dirfd as i32, &path, true, 0)
+            && st.st_mode & fwe_abi::stat::S_IFMT != fwe_abi::stat::S_IFDIR
+        {
+            return err(errno::ENOTDIR);
+        }
         let r = self.open_path_inner(dirfd, path, flags, mode);
         if r >= 0 && flags & fwe_abi::fcntl::O_NOATIME != 0 {
             crate::atime::opened_noatime(r as i32);
