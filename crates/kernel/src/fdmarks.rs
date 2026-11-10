@@ -48,8 +48,10 @@ pub enum Mark {
     /// `/dev/full`, whose writes fail with `ENOSPC`.
     DevFull,
     /// A socket bound in a network namespace of fwe's, to its port `port`
-    /// (of the wildcard address if `any`), see [`crate::netns`].
-    NetBound { port: u16, any: bool },
+    /// (of the wildcard address if `any`), or to a low loopback port of the
+    /// host's namespace that fwe mapped; `key` is the protocol its table
+    /// keeps the port under. See [`crate::netns`].
+    NetBound { port: u16, any: bool, key: u8 },
     /// `/proc/<pid>/uid_map` (`which` 0), `gid_map` (1) or `setgroups` (2)
     /// of host process `host`, opened for writing by a process that was
     /// `privileged` there, and whose own id in the map's parent namespace
@@ -508,9 +510,10 @@ pub fn save(e: &mut Enc) {
             e.bool(privileged);
             e.u32(own);
         }
-        if let Some(Mark::NetBound { port, any }) = rec.mark {
+        if let Some(Mark::NetBound { port, any, key }) = rec.mark {
             e.u32(u32::from(port));
             e.bool(any);
+            e.u8(key);
         }
     }
 }
@@ -538,7 +541,7 @@ pub fn load(d: &mut Dec) {
         let mark = match d.u8() {
             1 => Some(Mark::SeqPacket),
             2 => Some(Mark::DevFull),
-            3 => Some(Mark::NetBound { port: d.u32() as u16, any: d.bool() }),
+            3 => Some(Mark::NetBound { port: d.u32() as u16, any: d.bool(), key: d.u8() }),
             4 => Some(Mark::ProcMap {
                 host: d.i32(),
                 which: d.u8(),

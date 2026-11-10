@@ -781,7 +781,8 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
         Err(e) => return e,
     };
     // A port below `net.ipv4.ip_unprivileged_port_start` is the
-    // privileged's (the host lets anyone have one).
+    // privileged's (the host lets anyone have one on the wildcard address;
+    // on a loopback one, `netns` maps it).
     if !may_low
         && matches!(family(&hb), libc::AF_INET | libc::AF_INET6)
         && (1..crate::sysctl::unprivileged_port_start())

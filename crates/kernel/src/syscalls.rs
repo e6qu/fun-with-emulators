@@ -226,7 +226,7 @@ impl<P: Platform> Kernel<P> {
                 if matches!(mark, Some(crate::fdmarks::Mark::NetBound { .. }))
                     && !crate::fdmarks::shared_elsewhere(fd)
                 {
-                    crate::netns::closed(fd, mark);
+                    crate::netns::closed(mark);
                 }
                 crate::netlink::closed(fd);
                 crate::net::closed(fd);

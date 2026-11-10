@@ -1189,6 +1189,9 @@ which are to be lifted for 1.0 and which are not planned.
   its ports nobody bound by number goes to the host loopback port of that
   number; a port is freed when the last descriptor of its socket in the
   binding process closes; the initial namespace's sysctls cannot change.
+- A port below 1024 bound on a loopback address of the initial namespace,
+  when fwe is not root, is reached by its number only from fwe's
+  processes: the host keeps it for root, so it is an ephemeral port there.
 - Capabilities are the process's, not qualified by user namespace; the
   owning user namespace `NS_GET_USERNS` reports for a non-user namespace
   is the caller's.

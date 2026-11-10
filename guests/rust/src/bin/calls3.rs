@@ -6,8 +6,9 @@
 //! listed; `sync` and `syncfs`; a trailing slash on a file; and a message
 //! queue's id chosen by `kernel.msg_next_id`; and a child's memory read
 //! and written by its parent (`process_vm_readv`, `process_vm_writev`);
-//! and a Landlock domain that lets a child read under one directory only.
-//! It prints what it observed.
+//! and a Landlock domain that lets a child read under one directory only;
+//! and a port below 1024 on loopback addresses, bound as root. It prints
+//! what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
@@ -386,5 +387,51 @@ fn main() {
             bits & 4 != 0
         );
     }
+    low_port();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A port below 1024 on loopback addresses, which the host keeps for root:
+/// bound by this (root) process, named by its number, and reached by it
+/// from a child, over IPv4 and IPv6 at once; bound again once closed.
+fn low_port() {
+    use std::net::{TcpListener, TcpStream};
+    // One of its own, beside other runs of this guest.
+    // SAFETY: getpid cannot fail.
+    let port = 200 + (unsafe { getpid() } % 700) as u16;
+    let (v4, v6) = match (TcpListener::bind(("127.0.0.1", port)), TcpListener::bind(("::1", port))) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            println!("low port: bind {:?} {:?}", a.err(), b.err());
+            return;
+        }
+    };
+    let named = v4.local_addr().map(|a| a.port()).ok() == Some(port)
+        && v6.local_addr().map(|a| a.port()).ok() == Some(port);
+    // SAFETY: a plain fork; the child only connects and exits.
+    let child = unsafe { fork() };
+    if child == 0 {
+        let reach = |host: &str| {
+            TcpStream::connect((host, port))
+                .is_ok_and(|s| s.peer_addr().map(|a| a.port()).ok() == Some(port))
+        };
+        let bits = i32::from(reach("127.0.0.1")) | i32::from(reach("::1")) << 1;
+        // SAFETY: ends the child.
+        unsafe { _exit(bits) };
+    }
+    let mut st = 0;
+    // SAFETY: the child just forked.
+    unsafe { waitpid(child, &mut st, 0) };
+    let bits = (st >> 8) & 0xff;
+    // The child's connections, queued.
+    let accepted = [&v4, &v6]
+        .iter()
+        .all(|l| l.set_nonblocking(true).is_ok() && l.accept().is_ok());
+    drop((v4, v6));
+    let again = TcpListener::bind(("127.0.0.1", port)).is_ok();
+    println!(
+        "low port: named {named}, reached {} {}, accepted {accepted}, bound again {again}",
+        bits & 1 != 0,
+        bits & 2 != 0
+    );
 }

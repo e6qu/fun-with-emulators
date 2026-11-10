@@ -1265,7 +1265,7 @@ can block run without the kernel lock (`blocking_call` in
 |---|---|---|
 | `socket`, `socketpair` | family, type and protocol checked; `SOCK_NONBLOCK`/`SOCK_CLOEXEC` applied after; every socket `SO_NOSIGPIPE`; a Unix socket gets Linux's 212,992-byte buffers; `SOCK_SEQPACKET` Unix sockets are framed streams; `socketpair` of a non-Unix family is `EOPNOTSUPP` | `socket`, `socketpair`, `fcntl`, `setsockopt` |
 | `socket(AF_NETLINK)` and calls on it | `NETLINK_ROUTE` only, `SOCK_RAW` or `SOCK_DGRAM`; fwe answers each request; `bind`, `connect`, `getsockname`, `getpeername` and `SOL_NETLINK` options are fwe's | `socketpair(AF_UNIX, SOCK_DGRAM)`, `send`, `recv` |
-| `bind`, `connect` | address checked against the socket's family and translated; a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`); ports mapped in an fwe network namespace; a bound Unix node gets the socket's mode less the umask, and the guest's owner; `connect` to `AF_UNSPEC` disconnects | `bind`, `connect` (from the path's directory with `pthread_fchdir_np` for a long path), `fchmodat` |
+| `bind`, `connect` | address checked against the socket's family and translated; a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`); ports mapped in an fwe network namespace, and in the host's a port below 1024 on a loopback address (macOS keeps one for root, but on the wildcard address) mapped to an ephemeral one that fwe's processes reach and see by its number; a bound Unix node gets the socket's mode less the umask, and the guest's owner; `connect` to `AF_UNSPEC` disconnects | `bind`, `connect` (from the path's directory with `pthread_fchdir_np` for a long path), `fchmodat` |
 | `listen` | the host given one more than the backlog, as Linux queues one connection past it (a negative backlog or one past `somaxconn` taken as 4096) | `listen` |
 | `accept`, `accept4` | peer address translated back; flags applied; a `SOCK_SEQPACKET` listener's connection marked as one; past `RLIMIT_NOFILE` closed, `EMFILE` | `accept`, `fcntl`, `setsockopt` |
 | `getsockname`, `getpeername` | host address translated back; a Unix path is reported as the guest gave it; namespace ports mapped back; `IPV6_ADDRFORM` view applied | `getsockname`, `getpeername` |
@@ -2634,7 +2634,9 @@ itself:
 ### Network events
 
 Guest sockets are host sockets: connections, data and the ports of the
-initial network namespace are the host's. What arrives does so as
+initial network namespace are the host's (but for a port below 1024 on a
+loopback address, which only fwe's processes reach by its number when fwe
+is not root). What arrives does so as
 `kqueue` events, which fwe turns into `epoll` events with Linux's meaning
 for each kind of descriptor:
 

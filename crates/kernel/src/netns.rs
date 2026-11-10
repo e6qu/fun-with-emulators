@@ -11,9 +11,18 @@
 //! or another namespace by its number. A bind to the wildcard address is a
 //! bind to the host's loopback.
 //!
+//! The host's own namespace keeps such a table for one thing the host
+//! refuses there: a port below 1024 on a loopback address, for a caller
+//! that may bind one (`CAP_NET_BIND_SERVICE`) when fwe does not run as
+//! root. macOS lets anyone bind such a port on the wildcard address but
+//! only root on a given one, where Linux lets the capability do both. The
+//! socket is bound to an ephemeral port of the same address instead, and
+//! the pair recorded ([`host_low_ports`]), so fwe's processes reach the
+//! socket, and see it, by its number; a program that is not fwe's finds
+//! nothing there.
+//!
 //! The functions here act on host socket addresses (macOS layout: a length
-//! and a family byte, the port, then the address), and do nothing outside
-//! such a namespace.
+//! and a family byte, the port, then the address).
 
 use crate::ns::Net;
 use crate::shared::Record;
@@ -147,6 +156,65 @@ fn in_use(proto: u8, v6: bool, host: u16) -> bool {
     }
 }
 
+/// Ports below this are root's on the host, on an address of its own.
+const HOST_LOW: u16 = 1024;
+
+/// The host namespace's low loopback ports, each by protocol (with
+/// [`V6`] for IPv6) and number, and the host port behind it.
+fn host_low_ports() -> Option<&'static Record<Net>> {
+    static R: std::sync::OnceLock<Option<Record<Net>>> = std::sync::OnceLock::new();
+    R.get_or_init(|| Record::named("host-low-ports", 0, Net::default).ok()).as_ref()
+}
+
+/// Marks an IPv6 port's protocol in [`host_low_ports`]: `127.0.0.1` and
+/// `::1` are each a port space.
+const V6: u8 = 0x80;
+
+/// Whether host port `port` of address `hb`, for `proto`, is still bound
+/// by someone (a mapping to it is not stale).
+fn in_use_at(proto: u8, hb: &[u8], port: u16) -> bool {
+    let fam = family(hb);
+    let ty = if proto & !V6 == UDP { libc::SOCK_DGRAM } else { libc::SOCK_STREAM };
+    let len = if fam == libc::AF_INET6 { 28 } else { 16 };
+    let mut a = [0u8; 28];
+    a[..len].copy_from_slice(&hb[..len]);
+    set_port(&mut a, port);
+    // SAFETY: plain host calls on a socket of our own, closed after.
+    unsafe {
+        let s = libc::socket(fam, ty, 0);
+        if s < 0 {
+            return true;
+        }
+        let free = libc::bind(s, a.as_ptr().cast(), len as libc::socklen_t) == 0;
+        libc::close(s);
+        !free
+    }
+}
+
+/// The key of a port of `fd` at `a` in [`host_low_ports`].
+fn host_key(fd: i32, a: &Inet) -> u8 {
+    proto(fd) | if a.v6 { V6 } else { 0 }
+}
+
+/// [`bind_prepare`] in the host's namespace.
+fn host_bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan>, i32> {
+    let Some(a) = parse(hb) else { return Ok(None) };
+    // SAFETY: plain host call.
+    let root = unsafe { libc::geteuid() } == 0;
+    if a.port == 0 || a.port >= HOST_LOW || !a.loopback || a.any || !may_low || root {
+        return Ok(None);
+    }
+    let Some(t) = host_low_ports() else { return Ok(None) };
+    let key = host_key(fd, &a);
+    if let Some(h) = host_port(t, key, a.port)
+        && in_use_at(key, hb, h)
+    {
+        return Err(errno::EADDRINUSE);
+    }
+    set_port(hb, 0);
+    Ok(Some(Plan { proto: key, port: a.port, any: false }))
+}
+
 /// What a `bind` in the namespace does once the host's bind is made:
 /// record the namespace's port for the host's.
 pub struct Plan {
@@ -160,7 +228,7 @@ pub struct Plan {
 /// the namespace's port is to be. `may_low` says the caller may bind a
 /// port below 1024.
 pub fn bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan>, i32> {
-    let Some(net) = current() else { return Ok(None) };
+    let Some(net) = current() else { return host_bind_prepare(fd, hb, may_low) };
     let Some(a) = parse(hb) else { return Ok(None) };
     if !(a.loopback || a.any) || a.loopback && !net.get().lo_up {
         return Err(errno::EADDRNOTAVAIL);
@@ -184,7 +252,12 @@ pub fn bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan
 /// After the host's `bind` of `fd` (per `plan`) succeeded: record the
 /// namespace's port for the host's.
 pub fn bind_done(fd: i32, plan: Plan) {
-    let Some(net) = current() else { return };
+    let net = current();
+    let table: &Record<Net> = match (net.as_deref(), host_low_ports()) {
+        (Some(n), _) => n,
+        (None, Some(t)) => t,
+        (None, None) => return,
+    };
     let mut hb = [0u8; 128];
     let mut hl = hb.len() as libc::socklen_t;
     // SAFETY: valid out-parameters.
@@ -194,18 +267,38 @@ pub fn bind_done(fd: i32, plan: Plan) {
     let Some(a) = parse(&hb) else { return };
     // An ephemeral port is the host's own number.
     let port = if plan.port == 0 { a.port } else { plan.port };
-    let _ = net.update(|n| {
+    let _ = table.update(|n| {
+        // (A mapping to the same host port is a stale one.)
+        n.ports.retain(|&(p, _), h| p != plan.proto || *h != a.port);
         n.ports.insert((plan.proto, port), a.port);
         Ok(())
     });
-    crate::fdmarks::mark(fd, crate::fdmarks::Mark::NetBound { port, any: plan.any });
+    crate::fdmarks::mark(
+        fd,
+        crate::fdmarks::Mark::NetBound { port, any: plan.any, key: plan.proto },
+    );
 }
 
 /// Before `connect` of `fd`, or a datagram sent, to the host address `hb`:
 /// only a loopback address, and the namespace's port is the host's it is
 /// bound to (`ECONNREFUSED` for a stream to one nothing is bound to).
 pub fn connect_prepare(fd: i32, hb: &mut [u8]) -> Result<(), i32> {
-    let Some(net) = current() else { return Ok(()) };
+    let Some(net) = current() else {
+        // In the host's namespace, a low loopback port fwe mapped.
+        if let Some(a) = parse(hb)
+            && a.loopback
+            && (1..HOST_LOW).contains(&a.port)
+            && let Some(t) = host_low_ports()
+        {
+            let key = host_key(fd, &a);
+            if let Some(h) = host_port(t, key, a.port)
+                && in_use_at(key, hb, h)
+            {
+                set_port(hb, h);
+            }
+        }
+        return Ok(());
+    };
     let Some(a) = parse(hb) else { return Ok(()) };
     if a.any {
         // Linux takes the wildcard as this host's loopback.
@@ -228,9 +321,33 @@ pub fn connect_prepare(fd: i32, hb: &mut [u8]) -> Result<(), i32> {
 /// A host address `hb` the guest is given back, as the namespace numbers
 /// it: `local` for the socket's own (`getsockname`), else a peer's.
 pub fn to_guest(fd: i32, hb: &mut [u8], local: bool) {
-    let Some(net) = current() else { return };
     let Some(a) = parse(hb) else { return };
-    if local && let Some(crate::fdmarks::Mark::NetBound { port, any }) = crate::fdmarks::marked(fd)
+    let Some(net) = current() else {
+        // In the host's namespace, a low loopback port fwe mapped.
+        if local
+            && let Some(crate::fdmarks::Mark::NetBound { port, .. }) = crate::fdmarks::marked(fd)
+        {
+            set_port(hb, port);
+        } else if !local
+            && a.loopback
+            && a.port >= HOST_LOW
+            && let Some(t) = host_low_ports()
+        {
+            let key = host_key(fd, &a);
+            let found = t
+                .get()
+                .ports
+                .iter()
+                .find(|((p, _), h)| *p == key && **h == a.port)
+                .map(|(k, _)| k.1);
+            if let Some(port) = found {
+                set_port(hb, port);
+            }
+        }
+        return;
+    };
+    if local
+        && let Some(crate::fdmarks::Mark::NetBound { port, any, .. }) = crate::fdmarks::marked(fd)
     {
         set_port(hb, port);
         if any {
@@ -251,14 +368,19 @@ pub fn to_guest(fd: i32, hb: &mut [u8], local: bool) {
     }
 }
 
-/// `fd`, bound in the namespace, is closed: its port is free again unless
-/// another descriptor of this process holds the socket.
-pub fn closed(fd: i32, mark: Option<crate::fdmarks::Mark>) {
-    let Some(net) = current() else { return };
-    let Some(crate::fdmarks::Mark::NetBound { port, .. }) = mark else { return };
-    let proto = proto(fd);
-    let _ = net.update(|n| {
-        n.ports.remove(&(proto, port));
+/// A socket with `mark`, bound in the namespace (or to a low loopback port
+/// of the host's that fwe mapped), is closed: its port is free again
+/// unless another descriptor of this process holds the socket.
+pub fn closed(mark: Option<crate::fdmarks::Mark>) {
+    let Some(crate::fdmarks::Mark::NetBound { port, key, .. }) = mark else { return };
+    let net = current();
+    let table: &Record<Net> = match (net.as_deref(), host_low_ports()) {
+        (Some(n), _) => n,
+        (None, Some(t)) => t,
+        (None, None) => return,
+    };
+    let _ = table.update(|n| {
+        n.ports.remove(&(key, port));
         Ok(())
     });
 }

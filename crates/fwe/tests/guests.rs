@@ -3036,12 +3036,14 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     sync: 0, syncfs 0, file/ ENOTDIR\n\
     msg_next_id: id true, then -1\n\
     process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n\
-    landlock: abi 6, restricted true, inside read true, outside EACCES true\n";
+    landlock: abi 6, restricted true, inside read true, outside EACCES true\n\
+    low port: named true, reached true true, accepted true, bound again true\n";
 
 /// More calls: native AIO (a poll that waits, an eventfd signalled),
 /// process accounting, dnotify, queued real-time signals, file attributes,
-/// the security modules, `sync`, a trailing slash on a file and
-/// `kernel.msg_next_id`.
+/// the security modules, `sync`, a trailing slash on a file,
+/// `kernel.msg_next_id`, `process_vm_readv`/`writev`, Landlock, and a
+/// port below 1024 on loopback addresses, which the host keeps for root.
 #[test]
 fn more_calls() {
     let out = fwe(&rust_guest("calls3"), &[]);
