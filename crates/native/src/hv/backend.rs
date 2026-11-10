@@ -539,6 +539,9 @@ const SIGRETURN: [u32; 2] = [0xd280_1168, 0xd400_0001];
 /// masks follow the guest's.
 pub(super) fn become_vm_process() -> Result<(), String> {
     block_guest_signals();
+    // Code fwe writes (a tracer's breakpoint) is fetched afresh by the VM,
+    // and by the stand-in's translations.
+    fwe_kernel::procmem::on_code_written(mem::code_written);
     // From before the VM exists, no host signal may end the process by the
     // host's default action: every one whose default ends it is caught (for
     // the guest, whose default action tears the VM down first) until the
@@ -1296,6 +1299,23 @@ struct Spawn {
 /// process (`fork`, `vfork`), a fresh fwe process given this one's memory
 /// and state (see [`fork`]).
 fn clone(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
+    if a.check().is_err() {
+        return clone_checked(vcpu, parent, a);
+    }
+    // A traced parent whose tracer follows its children: its event is
+    // raised once the result is in the registers ([`syscall`]).
+    let event = fwe_kernel::ptrace::fork_event(a.flags);
+    let r = clone_checked(vcpu, parent, a);
+    fwe_kernel::ptrace::fork_done();
+    if let Some(e) = event
+        && r > 0
+    {
+        fwe_kernel::ptrace::note_fork(e, a.flags, r as u64);
+    }
+    r
+}
+
+fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     use fwe_abi::clone as cl;
     let fwe_kernel::CloneArgs { flags, stack, parent_tid: ptid, tls, child_tid: ctid, .. } = a;
     if let Err(e) = a.check() {
@@ -1551,6 +1571,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // Guest addresses only from here on (a signal frame, say).
     uaccess::clear_host_args();
     kernel().as_mut().unwrap().finish_syscall(regs, n, &args, result);
+    // A fork's event stops, the child's pid in `x0`.
+    kernel().as_mut().unwrap().ptrace_fork_stops(regs);
     // The exit's stop, its result in `x0`.
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(regs);

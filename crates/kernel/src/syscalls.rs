@@ -416,7 +416,11 @@ impl<P: Platform> Kernel<P> {
             nr::MREMAP => self.sys_mremap(a[0], a[1], a[2], a[3], a[4]),
 
             // Process and thread identity.
-            nr::EXIT_GROUP => self.platform.exit(a[0] as i32),
+            nr::EXIT_GROUP => {
+                // A traced process tells its tracer it is ending first.
+                self.ptrace_exit_stop(((a[0] as i32) & 0xff) << 8);
+                self.platform.exit(a[0] as i32)
+            }
             nr::EXIT => {
                 self.thread_cleanup();
                 self.platform.exit_thread(a[0] as i32)

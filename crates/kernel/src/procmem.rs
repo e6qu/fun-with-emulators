@@ -156,8 +156,11 @@ fn force_write(addr: u64, data: &[u8]) -> bool {
             return false;
         }
     }
-    let r = uaccess::write_from(addr, data).is_ok();
-    if prot & libc::PROT_EXEC != 0 {
+    // To the host's memory itself: the guest's own mapping is read-only.
+    let r = uaccess::write_host(host, data).is_ok();
+    // Code, as the guest maps it (the VM backend's memory is not the
+    // host's code).
+    if area.prot & PROT_EXEC != 0 || prot & libc::PROT_EXEC != 0 {
         flush_icache(host, data.len());
     }
     // SAFETY: as above.
@@ -165,8 +168,22 @@ fn force_write(addr: u64, data: &[u8]) -> bool {
     r
 }
 
+/// What a backend does when fwe writes code it runs (the VM backend's
+/// stand-in drops the code it translated), set as it starts.
+static CODE_WRITTEN: std::sync::OnceLock<fn(u64, u64)> = std::sync::OnceLock::new();
+
+/// Have `f` called for code fwe writes ([`write_forced`]), in place of the
+/// host's instruction cache maintenance.
+pub fn on_code_written(f: fn(u64, u64)) {
+    let _ = CODE_WRITTEN.set(f);
+}
+
 /// Make the processor fetch the `len` bytes of code at host `addr` afresh.
 fn flush_icache(addr: u64, len: usize) {
+    if let Some(f) = CODE_WRITTEN.get() {
+        f(addr, len as u64);
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {

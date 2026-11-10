@@ -2815,6 +2815,28 @@ fn process_descriptors_name_processes() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `ptrace` guest prints.
+const PTRACE: &str = "stop: signal 19\n\
+    peek: true\n\
+    regs: 272 bytes, pc near the code true\n\
+    poke: exit 7\n\
+    syscalls: write stopped at entry true, its result -9\n\
+    fork: events 1, new child stopped 1, exit events 2, exits 2\n\
+    waitid: signal true, trapped true, status 19\n\
+    step: exit 21, stepped true\n\
+    breakpoint: signal 5, at work true, argument 10, exit 21\n";
+
+/// ptrace: a traced child stops for a signal, has its memory read and
+/// written and its registers read, stops at a system call's entry and
+/// exit, has a fork it makes followed, is reported by `waitid`, runs one
+/// instruction at a time to its end and stops at a breakpoint.
+#[test]
+fn ptrace_traces_a_child() {
+    let out = fwe(&rust_guest("ptrace"), &[]);
+    assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// POSIX message queues: messages by priority, the status line, a queue
 /// that outlives its name, and the notifications another process's
 /// message sets off (a signal with the value and sender, and the C
@@ -3516,9 +3538,8 @@ fn hv_message_queues_deliver_and_notify() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// The new mount API in the VM (see
-/// [`the_new_mount_api_makes_and_attaches_mounts`]): its structures are
-/// the guest's memory, translated.
+/// Process descriptors in the VM (see
+/// [`process_descriptors_name_processes`]).
 #[test]
 fn hv_process_descriptors_name_processes() {
     let Some(out) = fwe_hv(&rust_low_guest("pidfd"), &[]) else { return };
@@ -3526,6 +3547,19 @@ fn hv_process_descriptors_name_processes() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// ptrace in the VM (see [`ptrace_traces_a_child`]): a fork child is a
+/// fresh process that learns from its snapshot to be traced, and code a
+/// tracer writes is fetched afresh.
+#[test]
+fn hv_ptrace_traces_a_child() {
+    let Some(out) = fwe_hv(&rust_low_guest("ptrace"), &[]) else { return };
+    assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The new mount API in the VM (see
+/// [`the_new_mount_api_makes_and_attaches_mounts`]): its structures are
+/// the guest's memory, translated.
 #[test]
 fn hv_the_new_mount_api_makes_and_attaches_mounts() {
     let Some(out) = fwe_hv(&rust_low_guest("mountapi"), &[]) else { return };

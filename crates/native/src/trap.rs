@@ -399,11 +399,30 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         } else {
             fwe_kernel::CloneArgs::from_clone3(regs.x[0], regs.x[1])
         };
+        let mut event = None;
         let r = match a.and_then(|a| a.check().map(|()| a)) {
-            Ok(a) => crate::threads::do_clone(&regs, a),
+            Ok(a) => {
+                // A traced parent whose tracer follows its children.
+                event = fwe_kernel::ptrace::fork_event(a.flags).map(|e| (e, a.flags));
+                let r = crate::threads::do_clone(&regs, a);
+                fwe_kernel::ptrace::fork_done();
+                r
+            }
             Err(e) => fwe_abi::err(e),
         };
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        let mut guard = kernel();
+        let k = guard.as_mut().unwrap();
+        k.finish_syscall(&mut regs, nr, &args, r);
+        // The parent's event stop, the child's pid its message.
+        if r > 0
+            && let Some((e, flags)) = event
+        {
+            k.ptrace_event_stop(&mut regs, e, r as u64);
+            if flags & fwe_abi::clone::CLONE_VFORK != 0 {
+                k.ptrace_vfork_done(&mut regs, r as u64);
+            }
+        }
+        drop(guard);
     } else if nr == fwe_abi::nr::WAIT4 {
         // wait4 blocks; run it without the kernel lock.
         let r = crate::process::do_wait4(&regs);

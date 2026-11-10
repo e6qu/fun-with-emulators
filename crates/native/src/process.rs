@@ -619,6 +619,58 @@ fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     }
 }
 
+/// `waitid` of a tracer: a stop of one of its tracees first, reported as
+/// `CLD_TRAPPED` with the stop's signal (and event) as its status, then its
+/// children as the host reports them, looking again as tracees stop.
+fn waitid_tracer(
+    idtype: libc::idtype_t,
+    id: libc::id_t,
+    host_options: i32,
+    infop: u64,
+    options: u64,
+) -> i64 {
+    const CLD_TRAPPED: i32 = 4;
+    // SAFETY: plain host call.
+    let pgid_of = |p: i32| unsafe { libc::getpgid(p) };
+    let wanted = |p: i32| match idtype {
+        libc::P_PID => p == id as i32,
+        libc::P_PGID => pgid_of(p) == id as i32,
+        _ => true,
+    };
+    let peek = options & fwe_abi::wait::WNOWAIT != 0;
+    loop {
+        let seen = fwe_kernel::ptrace::inbox_generation();
+        if let Some((p, status)) = fwe_kernel::ptrace::take_stop(wanted, peek) {
+            if infop != 0 {
+                let mut words = [0i32; 32];
+                words[0] = fwe_abi::signal::SIGCHLD as i32;
+                words[2] = CLD_TRAPPED;
+                words[4] = fwe_kernel::pidns::guest_ret(i64::from(p)) as i32;
+                words[5] = fwe_kernel::procreg::ids(p)[0] as i32;
+                words[6] = (status >> 8) & 0xffff;
+                if fwe_kernel::uaccess::write(infop, words).is_err() {
+                    return err(errno::EFAULT);
+                }
+            }
+            return 0;
+        }
+        let r = waitid_host(idtype, id, host_options | libc::WNOHANG, infop, options);
+        let reported = r == 0
+            && infop != 0
+            && fwe_kernel::uaccess::read::<i32>(infop + 16).is_ok_and(|pid| pid != 0);
+        let traced_other = r == err(errno::ECHILD)
+            && idtype == libc::P_PID
+            && fwe_kernel::ptrace::traces(id as i32);
+        if (r < 0 && !traced_other) || reported || host_options & libc::WNOHANG != 0 {
+            return r.min(0);
+        }
+        if fwe_kernel::thread::deliverable() != 0 {
+            return err(errno::EINTR);
+        }
+        fwe_kernel::ptrace::wait_for_stop(seen, std::time::Duration::from_millis(20));
+    }
+}
+
 fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     if host_options & libc::WNOHANG != 0 && pid > 0 && reaper::init_unreapable(pid) {
         return 0;
@@ -734,6 +786,10 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         }
         0
     };
+    if fwe_kernel::ptrace::tracing() {
+        let r = waitid_tracer(idtype, id, host_options, infop, options);
+        return if r < 0 { r } else { zero_rusage() };
+    }
     if !reaper::active() {
         let r = waitid_host(idtype, id, host_options, infop, options);
         if nonblock && r == 0 {

@@ -452,9 +452,21 @@ memory or threads, so a tracee does its tracer's work itself:
   registers the tracer changed are the ones it goes on with.
 - **The tracer** reads and writes registers, `siginfo` and options in
   the mailbox, and asks the tracee for memory: `PEEK`/`POKE`, written as
-  `/proc/self/mem` writes (code too, its instructions fetched afresh).
-  Its `wait4` reports a tracee's stop from its inbox before the host's
-  children, looking again as tracees stop.
+  `/proc/self/mem` writes (code too, its instructions fetched afresh, by
+  the VM as well). Its `wait4` and `waitid` report a tracee's stop from
+  its inbox before the host's children, looking again as tracees stop,
+  and the end of a tracee that is not its child, which the tracee leaves
+  in its mailbox.
+- **Events:** a fork, vfork or clone a tracer follows
+  (`PTRACE_O_TRACEFORK` and the like) stops the parent with the event and
+  starts the child traced, stopped by `SIGSTOP`, with its parent's options
+  (in the VM backend through the fork's snapshot); the exit event comes
+  before a process ends, and `PTRACE_O_EXITKILL` ends a tracer's tracees
+  with it.
+- **Single-stepping** plants a breakpoint of fwe's (`brk #0x4c59`) where
+  the instruction may go next (a branch's target and the next
+  instruction, a register's address), and stops when one is taken,
+  putting the instructions back.
 - **Attaching** makes the target's mailbox and sends it `SIGSTOP` as
   fwe's; the target begins to be traced as it takes it. Only a process of
   fwe's can be traced.
@@ -921,11 +933,12 @@ something a Linux program could notice. The [roadmap](../ROADMAP.md) says
 which are to be lifted for 1.0 and which are not planned.
 
 **Execution**
-- ptrace stops only the thread that stops (the tracee's other threads go
-  on), and has no single-stepping (`EIO`), no fork, clone, exit or
-  seccomp events, no change of the system call's number at its entry,
-  and no `PTRACE_INTERRUPT`/`LISTEN`; `waitid` does not report a tracee's
-  stops (`wait4` does).
+- ptrace traces processes, not threads: a tracee's other threads go on
+  while it stops, a new thread is not followed, and a thread cannot be
+  attached to on its own. There is no seccomp event, no `NT_ARM_TLS` or
+  hardware breakpoint and watchpoint register set, and no
+  `PTRACE_INTERRUPT`/`LISTEN`; a single step over an exclusive load and
+  store loops, as a breakpoint between them clears the monitor.
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
   which needs `fwe` signed with the hypervisor entitlement and a
   bare-metal Apple Silicon Mac; that backend is verified on its stand-in,
