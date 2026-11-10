@@ -558,6 +558,11 @@ shapes differently:
   page every fwe process maps (one whose holder has ended is taken over),
   so only that pipe's writers wait; one that does not wait is written
   whole or not at all (`EAGAIN`).
+- **File handles** (`crates/kernel/src/handles.rs`): a handle names the
+  host file system and inode, which the host turns back into a path
+  (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes
+  stale (`ESTALE`) with the file or on another file system; a file fwe
+  makes up has an identifier handle (`AT_HANDLE_FID`) only.
 - **Leases** (`crates/kernel/src/leases.rs`): a record every fwe process
   shares. An open or truncation that conflicts with a lease signals its
   holder and waits until the lease is let go or downgraded, or for

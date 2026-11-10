@@ -51,7 +51,7 @@ Executables linked below 4 GiB run in a Hypervisor.framework VM:
 Container engines run standard images: crun, podman and containerd run
 `alpine`.
 
-LTP's system-call tests pass at 1098 of 1551 (93% of those that apply).
+LTP's system-call tests pass at 1103 of 1551 (93% of those that apply).
 
 ## Documentation
 

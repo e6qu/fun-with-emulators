@@ -759,6 +759,8 @@ impl<P: Platform> Kernel<P> {
             // here (e.g. through the plain `syscall` helper) is unsupported.
 
             // Randomness.
+            nr::NAME_TO_HANDLE_AT => self.sys_name_to_handle_at(a[0], a[1], a[2], a[3], a[4]),
+            nr::OPEN_BY_HANDLE_AT => self.sys_open_by_handle_at(a[0], a[1], a[2]),
             nr::GETRANDOM => {
                 // GRND_NONBLOCK, GRND_RANDOM and GRND_INSECURE, but not the
                 // last two at once.

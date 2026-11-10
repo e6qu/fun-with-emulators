@@ -622,6 +622,9 @@ munlockall01
 munmap01
 munmap03
 munmap04
+name_to_handle_at01
+name_to_handle_at02
+name_to_handle_at03
 nanosleep02
 nanosleep04
 newuname01
@@ -642,6 +645,8 @@ open07
 open09
 open11
 open15
+open_by_handle_at01
+open_by_handle_at02
 openat01
 openat201
 openat202

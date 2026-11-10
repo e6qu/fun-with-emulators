@@ -29,6 +29,7 @@ pub mod fifo;
 pub mod fs;
 mod fsops;
 pub mod futex;
+mod handles;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
