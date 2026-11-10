@@ -1,4 +1,4 @@
-//! eBPF programs for the cgroup v2 device controller.
+//! eBPF programs: the cgroup v2 device controller's, and socket filters.
 //!
 //! cgroup v2 has no device files: a runtime restricts a container's
 //! devices by attaching a `BPF_PROG_TYPE_CGROUP_DEVICE` program to its
@@ -10,6 +10,13 @@
 //! interpreter that checks every access against the context and the stack
 //! at run time and stops a program that runs too long, so that a guest's
 //! program can do nothing but answer.
+//!
+//! A socket filter (`BPF_PROG_TYPE_SOCKET_FILTER`) may also load maps
+//! ([`crate::bpfmap`]) and call their helpers (lookup, update, delete),
+//! reading and writing a value through the pointer a lookup returns.
+//! Attached to a socket (`SO_ATTACH_BPF`), it runs as data is sent to it
+//! by this process, found by the socket's connected peer: what it returns
+//! is how much of the data arrives (none: dropped).
 
 use fwe_abi::errno;
 
@@ -22,6 +29,7 @@ pub const BPF_PROG_QUERY: u64 = 16;
 
 /// The one program type fwe runs.
 pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 /// The highest program type Linux 6.x has (`BPF_PROG_TYPE_NETFILTER`).
 const MAX_PROG_TYPE: u32 = 32;
 /// Its attach type.
@@ -87,9 +95,27 @@ pub struct Program {
     pub insns: Vec<Insn>,
 }
 
-/// Check and keep the program `bytes` (instructions as Linux lays them
-/// out), or `EINVAL` as Linux's verifier would refuse it.
+/// Check and keep the device program `bytes` (instructions as Linux lays
+/// them out), or `EINVAL` as Linux's verifier would refuse it.
 pub fn load(bytes: &[u8]) -> Result<Program, i32> {
+    check(bytes, false)
+}
+
+/// [`load`] for a socket filter, which may load a map's descriptor
+/// (`BPF_LD_MAP_FD`) and call the map helpers.
+pub fn load_filter(bytes: &[u8]) -> Result<Program, i32> {
+    check(bytes, true)
+}
+
+/// The map helpers a socket filter may call: `bpf_map_lookup_elem`,
+/// `bpf_map_update_elem`, `bpf_map_delete_elem`.
+const HELPER_LOOKUP: i32 = 1;
+const HELPER_UPDATE: i32 = 2;
+const HELPER_DELETE: i32 = 3;
+/// A 64-bit immediate load of a map's descriptor.
+const PSEUDO_MAP_FD: u8 = 1;
+
+fn check(bytes: &[u8], filter: bool) -> Result<Program, i32> {
     if bytes.is_empty() || bytes.len() % 8 != 0 || bytes.len() / 8 > MAX_INSNS {
         return Err(errno::EINVAL);
     }
@@ -117,8 +143,9 @@ pub fn load(bytes: &[u8]) -> Result<Program, i32> {
             CLASS_LD => {
                 // Only the 64-bit immediate load, which takes two slots.
                 let second = insns.get(i + 1);
+                let pseudo = filter && ins.src == PSEUDO_MAP_FD;
                 if ins.code != LD_IMM64
-                    || ins.src != 0
+                    || (ins.src != 0 && !pseudo)
                     || second.is_none_or(|s| s.code != 0 || s.dst != 0 || s.src != 0 || s.off != 0)
                 {
                     return Err(errno::EINVAL);
@@ -140,8 +167,12 @@ pub fn load(bytes: &[u8]) -> Result<Program, i32> {
             CLASS_JMP | CLASS_JMP32 => {
                 let op = ins.code & 0xf0;
                 match op {
-                    0x80 => return Err(errno::EINVAL), // a helper call
-                    0x90 => {}                         // exit
+                    // A helper call: the map helpers, for a filter.
+                    0x80 if filter
+                        && class == CLASS_JMP
+                        && matches!(ins.imm, HELPER_LOOKUP | HELPER_UPDATE | HELPER_DELETE) => {}
+                    0x80 => return Err(errno::EINVAL),
+                    0x90 => {} // exit
                     _ if op > 0xd0 => return Err(errno::EINVAL),
                     _ => {
                         let target = i as i64 + 1 + ins.off as i64;
@@ -170,6 +201,11 @@ enum Val {
     Scalar(u64),
     Ctx(i64),
     Stack(i64),
+    /// A map (its place in the program's maps).
+    Map(usize),
+    /// A map's value: the map, where the value is in its file, and the
+    /// offset from there.
+    Value(usize, u64, i64),
 }
 
 impl Val {
@@ -186,6 +222,13 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
     ctx[0..4].copy_from_slice(&((access << 16) | dev_type).to_le_bytes());
     ctx[4..8].copy_from_slice(&major.to_le_bytes());
     ctx[8..12].copy_from_slice(&minor.to_le_bytes());
+    exec(prog, &ctx, &[])
+}
+
+/// Run `prog` with context `ctx` (read only) and the maps it loads, by the
+/// index of the instruction that loads each: its return value, or `None`
+/// when it went wrong.
+fn exec(prog: &Program, ctx: &[u8], maps: &[(usize, crate::bpfmap::Map)]) -> Option<u64> {
     let mut stack = [0u8; STACK];
     let mut r = [Val::Scalar(0); 11];
     r[1] = Val::Ctx(0);
@@ -196,6 +239,11 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
         let class = ins.code & 7;
         pc += 1;
         match class {
+            CLASS_LD if ins.src == PSEUDO_MAP_FD => {
+                let i = maps.iter().position(|&(at, _)| at == pc - 1)?;
+                r[ins.dst as usize] = Val::Map(i);
+                pc += 1;
+            }
             CLASS_LD => {
                 let hi = prog.insns.get(pc)?.imm as u32 as u64;
                 r[ins.dst as usize] = Val::Scalar((hi << 32) | ins.imm as u32 as u64);
@@ -203,7 +251,7 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
             }
             CLASS_LDX => {
                 let size = size_of(ins.code);
-                let v = mem(&ctx, &stack, r[ins.src as usize], ins.off, size, false)?;
+                let v = mem(ctx, &stack, maps, r[ins.src as usize], ins.off, size)?;
                 r[ins.dst as usize] = Val::Scalar(v);
             }
             CLASS_ST | CLASS_STX => {
@@ -213,13 +261,33 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
                 } else {
                     r[ins.src as usize].scalar()?
                 };
-                let Val::Stack(base) = r[ins.dst as usize] else { return None };
-                let at = (STACK as i64).checked_add(base)?.checked_add(ins.off as i64)?;
-                if at < 0 || at as usize + size > STACK {
-                    return None;
+                let bytes = &value.to_le_bytes()[..size];
+                match r[ins.dst as usize] {
+                    Val::Stack(base) => {
+                        let at = (STACK as i64).checked_add(base)?.checked_add(ins.off as i64)?;
+                        if at < 0 || at as usize + size > STACK {
+                            return None;
+                        }
+                        let at = at as usize;
+                        stack[at..at + size].copy_from_slice(bytes);
+                    }
+                    Val::Value(m, file, rel) => {
+                        let map = &maps.get(m)?.1;
+                        let rel = rel.checked_add(ins.off as i64)?;
+                        if rel < 0 || rel as u64 + size as u64 > u64::from(map.value_size) {
+                            return None;
+                        }
+                        map_write(map, file + rel as u64, bytes)?;
+                    }
+                    _ => return None,
                 }
-                let at = at as usize;
-                stack[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
+            }
+            CLASS_JMP if ins.code & 0xf0 == 0x80 => {
+                r[0] = helper(ins.imm, &r, &stack, maps)?;
+                // The argument registers are the helper's to spoil.
+                for reg in &mut r[1..=5] {
+                    *reg = Val::Scalar(0);
+                }
             }
             CLASS_ALU | CLASS_ALU64 => {
                 let wide = class == CLASS_ALU64;
@@ -239,6 +307,11 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
                 }
                 let taken = if op == 0x00 {
                     true
+                } else if let (Val::Value(..), 0x10 | 0x50, false, 0) =
+                    (r[ins.dst as usize], op, ins.code & 8 != 0, ins.imm)
+                {
+                    // A value a lookup found is never null.
+                    op == 0x50
                 } else {
                     let a = r[ins.dst as usize].scalar()?;
                     let b = if ins.code & 8 != 0 {
@@ -292,17 +365,30 @@ fn size_of(code: u8) -> usize {
 
 /// A load through pointer `p` at `off`, of `size` bytes.
 fn mem(
-    ctx: &[u8; CTX],
+    ctx: &[u8],
     stack: &[u8; STACK],
+    maps: &[(usize, crate::bpfmap::Map)],
     p: Val,
     off: i16,
     size: usize,
-    _write: bool,
 ) -> Option<u64> {
     let (buf, at): (&[u8], i64) = match p {
         Val::Ctx(base) => (ctx, base.checked_add(off as i64)?),
         Val::Stack(base) => (stack, (STACK as i64).checked_add(base)?.checked_add(off as i64)?),
-        Val::Scalar(_) => return None,
+        Val::Value(m, file, rel) => {
+            let map = &maps.get(m)?.1;
+            let rel = rel.checked_add(off as i64)?;
+            if rel < 0 || rel as u64 + size as u64 > u64::from(map.value_size) {
+                return None;
+            }
+            let mut b = [0u8; 8];
+            // SAFETY: a valid buffer of `size` bytes (at most 8).
+            let n = unsafe {
+                libc::pread(map.fd, b.as_mut_ptr().cast(), size, (file + rel as u64) as libc::off_t)
+            };
+            return (n == size as isize).then(|| u64::from_le_bytes(b));
+        }
+        Val::Scalar(_) | Val::Map(_) => return None,
     };
     if at < 0 || at as usize + size > buf.len() {
         return None;
@@ -326,9 +412,15 @@ fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32, src_is_x: bool) -> Opti
                 _ => return None,
             });
         }
-        (0x00 | 0x10, Val::Ctx(o) | Val::Stack(o), Val::Scalar(v)) if wide => {
+        (0x00 | 0x10, Val::Ctx(o) | Val::Stack(o) | Val::Value(_, _, o), Val::Scalar(v))
+            if wide =>
+        {
             let d = if op == 0x00 { o.wrapping_add(v as i64) } else { o.wrapping_sub(v as i64) };
-            return Some(if matches!(dst, Val::Ctx(_)) { Val::Ctx(d) } else { Val::Stack(d) });
+            return Some(match dst {
+                Val::Ctx(_) => Val::Ctx(d),
+                Val::Value(m, file, _) => Val::Value(m, file, d),
+                _ => Val::Stack(d),
+            });
         }
         _ => {}
     }
@@ -379,6 +471,49 @@ fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32, src_is_x: bool) -> Opti
         _ => return None,
     };
     Some(Val::Scalar(fit(v)))
+}
+
+/// Write `bytes` to map `m`'s file at `at`.
+fn map_write(m: &crate::bpfmap::Map, at: u64, bytes: &[u8]) -> Option<()> {
+    // SAFETY: a valid buffer of its length.
+    let n = unsafe { libc::pwrite(m.fd, bytes.as_ptr().cast(), bytes.len(), at as libc::off_t) };
+    (n == bytes.len() as isize).then_some(())
+}
+
+/// `len` bytes of the stack at pointer `p`.
+fn stack_bytes(stack: &[u8; STACK], p: Val, len: usize) -> Option<Vec<u8>> {
+    let Val::Stack(base) = p else { return None };
+    let at = (STACK as i64).checked_add(base)?;
+    if at < 0 || at as usize + len > STACK {
+        return None;
+    }
+    Some(stack[at as usize..at as usize + len].to_vec())
+}
+
+/// Call map helper `which` with the registers `r`.
+fn helper(
+    which: i32,
+    r: &[Val; 11],
+    stack: &[u8; STACK],
+    maps: &[(usize, crate::bpfmap::Map)],
+) -> Option<Val> {
+    let Val::Map(i) = r[1] else { return None };
+    let m = &maps.get(i)?.1;
+    let key = stack_bytes(stack, r[2], m.key_size as usize)?;
+    let status =
+        |res: Result<(), i32>| Val::Scalar(res.map_or_else(|e| -(e as i64), |()| 0) as u64);
+    Some(match which {
+        HELPER_LOOKUP => match m.find(&key).ok()? {
+            Some(file) => Val::Value(i, file, 0),
+            None => Val::Scalar(0),
+        },
+        HELPER_UPDATE => {
+            let value = stack_bytes(stack, r[3], m.value_size as usize)?;
+            status(m.update(&key, &value, r[4].scalar()?))
+        }
+        HELPER_DELETE => status(m.delete(&key)),
+        _ => return None,
+    })
 }
 
 // --- the bpf system call -------------------------------------------------------
@@ -489,6 +624,97 @@ fn fresh_id() -> u32 {
         .max(1)
 }
 
+/// A new map identity.
+pub fn fresh_map_id() -> u32 {
+    #[cfg(target_os = "macos")]
+    return fresh_id();
+    #[cfg(not(target_os = "macos"))]
+    return 1;
+}
+
+/// The maps of each loaded socket filter, by the program file's host
+/// identity: the instruction that loads each, and the map (through a
+/// descriptor of fwe's, so the program keeps it).
+type FilterMaps = Vec<(usize, crate::bpfmap::Map)>;
+static PROG_MAPS: std::sync::Mutex<Vec<((u64, u64), FilterMaps)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The maps program `bytes` loads by descriptor, as fwe keeps them.
+fn resolve_maps(bytes: &[u8]) -> Result<FilterMaps, i32> {
+    let insns: Vec<Insn> = bytes.chunks(8).map(Insn::decode).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < insns.len() {
+        let ins = insns[i];
+        if ins.code == LD_IMM64 {
+            if ins.src == PSEUDO_MAP_FD {
+                let m = crate::bpfmap::of(ins.imm).ok_or(errno::EBADF)?;
+                let fd = crate::fdtable::dup_reserved(m.fd)?;
+                out.push((i, crate::bpfmap::Map { fd, ..m }));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Socket filters attached (`SO_ATTACH_BPF`), by the host's handle of the
+/// socket they filter what arrives at.
+static FILTERS: std::sync::Mutex<Vec<(u64, Program, FilterMaps)>> =
+    std::sync::Mutex::new(Vec::new());
+static ANY_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `setsockopt(fd, SOL_SOCKET, SO_ATTACH_BPF)` with program `prog`, or
+/// `SO_DETACH_BPF` (`prog` `None`).
+pub fn attach_socket(fd: i32, prog: Option<i32>) -> Result<(), i32> {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let so = crate::procpid::socket_id(me, fd).ok_or(errno::ENOTSOCK)?;
+    let mut f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(prog) = prog else {
+        let before = f.len();
+        f.retain(|e| e.0 != so);
+        return if f.len() < before { Ok(()) } else { Err(errno::ENOENT) };
+    };
+    let (_, ty, bytes) = prog_info(prog).ok_or(errno::EBADF)?;
+    if ty != BPF_PROG_TYPE_SOCKET_FILTER {
+        return Err(errno::EINVAL);
+    }
+    let program = load_filter(&bytes)?;
+    let id = crate::fsops::host_identity(prog).ok_or(errno::EBADF)?;
+    let maps = PROG_MAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|e| e.0 == id)
+        .map(|e| e.1.clone())
+        .unwrap_or_default();
+    f.retain(|e| e.0 != so);
+    f.push((so, program, maps));
+    ANY_FILTER.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// What of `len` bytes sent on socket `fd` the filter of the socket they
+/// reach lets in (`None`: no filter; `Some(0)`: none, the data dropped).
+pub fn filter_send(fd: i32, len: u64) -> Option<u64> {
+    if !ANY_FILTER.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let peer = crate::procpid::socket_peer(me, fd)?;
+    let f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, prog, maps) = f.iter().find(|e| e.0 == peer)?;
+    // The context: `struct __sk_buff`, its length first.
+    let mut ctx = [0u8; 192];
+    ctx[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+    let keep = exec(prog, &ctx, maps).unwrap_or(0);
+    Some(keep.min(len))
+}
+
 /// The cgroup directory `fd` is open on, on the host.
 fn cgroup_dir(fd: i32) -> Result<Vec<u8>, i32> {
     let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
@@ -506,10 +732,12 @@ fn dword(a: &[u8], at: usize) -> u64 {
     a.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
-/// `bpf(cmd, attr, size)` for the device controller's programs: load,
-/// attach, detach, query, and a descriptor by identity. A program of
-/// another type loads (as programs probe for features by loading one) but
-/// cannot be attached; other commands fail as on a kernel without them.
+/// `bpf(cmd, attr, size)`: maps and their elements ([`crate::bpfmap`]);
+/// the device controller's programs: load, attach, detach, query, and a
+/// descriptor by identity; socket filters, loaded with the maps they use
+/// and attached with `SO_ATTACH_BPF`. A program of another type loads (as
+/// programs probe for features by loading one) but cannot be attached;
+/// other commands fail as on a kernel without them.
 pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     use fwe_abi::err;
     let size = size.min(256) as usize;
@@ -528,15 +756,30 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                 return Err(errno::E2BIG);
             }
             let bytes = crate::uaccess::read_bytes(dword(&a, 8), n * 8)?;
-            // A device program is checked as fwe will run it; one of
-            // another type is kept but never attached (see below).
-            if ty == BPF_PROG_TYPE_CGROUP_DEVICE {
-                load(&bytes)?;
-            }
+            // A device program or a socket filter is checked as fwe will
+            // run it; one of another type is kept but never attached.
+            let maps = match ty {
+                BPF_PROG_TYPE_CGROUP_DEVICE => load(&bytes).map(|_| Vec::new())?,
+                BPF_PROG_TYPE_SOCKET_FILTER => {
+                    load_filter(&bytes)?;
+                    resolve_maps(&bytes)?
+                }
+                _ => Vec::new(),
+            };
             #[cfg(target_os = "macos")]
-            return prog_fd(&bytes, fresh_id(), ty).map(|fd| fd as i64);
+            return prog_fd(&bytes, fresh_id(), ty).map(|fd| {
+                if !maps.is_empty()
+                    && let Some(id) = crate::fsops::host_identity(fd)
+                {
+                    PROG_MAPS.lock().unwrap_or_else(|e| e.into_inner()).push((id, maps));
+                }
+                fd as i64
+            });
             #[cfg(not(target_os = "macos"))]
-            return Err(errno::ENOSYS);
+            return {
+                let _ = maps;
+                Err(errno::ENOSYS)
+            };
         })(),
         BPF_PROG_ATTACH | BPF_PROG_DETACH => (|| {
             let (target, prog, ty) = (word(&a, 0) as i32, word(&a, 4) as i32, word(&a, 8));
@@ -601,6 +844,11 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                 Err(errno::ENOSYS)
             };
         })(),
+        crate::bpfmap::BPF_MAP_CREATE => crate::bpfmap::create(&a),
+        crate::bpfmap::BPF_MAP_LOOKUP_ELEM
+        | crate::bpfmap::BPF_MAP_UPDATE_ELEM
+        | crate::bpfmap::BPF_MAP_DELETE_ELEM
+        | crate::bpfmap::BPF_MAP_GET_NEXT_KEY => crate::bpfmap::command(cmd, &a),
         _ => Err(errno::EINVAL),
     };
     match r {
@@ -652,6 +900,66 @@ mod tests {
         assert_eq!(run(&p, BPF_DEVCG_ACC_MKNOD, BPF_DEVCG_DEV_CHAR, 1, 3), Some(0));
         assert_eq!(run(&p, rw, BPF_DEVCG_DEV_CHAR, 1, 5), Some(0));
         assert_eq!(run(&p, rw, BPF_DEVCG_DEV_BLOCK, 1, 3), Some(0));
+    }
+
+    /// A map of `entries` values of 8 bytes, keyed by 4 (an array) or 8
+    /// (a hash table), in a file of the test's own.
+    fn test_map(ty: u32, entries: u32) -> crate::bpfmap::Map {
+        let path = std::env::temp_dir().join(format!(
+            "fwe-bpfmap-{}-{ty}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create_new(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let key_size = if ty == 2 { 4 } else { 8 };
+        f.set_len(u64::from(entries) * (if ty == 2 { 8 } else { 1 + 8 + 8 })).unwrap();
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(f);
+        crate::bpfmap::Map { fd, ty, key_size, value_size: 8, max_entries: entries, id: 1 }
+    }
+
+    #[test]
+    fn maps_keep_their_elements() {
+        let a = test_map(2, 2);
+        assert_eq!(a.lookup(&0u32.to_le_bytes()), Ok(vec![0; 8]));
+        a.update(&1u32.to_le_bytes(), &7u64.to_le_bytes(), 0).unwrap();
+        assert_eq!(a.lookup(&1u32.to_le_bytes()), Ok(7u64.to_le_bytes().to_vec()));
+        assert_eq!(a.update(&2u32.to_le_bytes(), &[0; 8], 0), Err(errno::E2BIG));
+        assert_eq!(a.delete(&0u32.to_le_bytes()), Err(errno::EINVAL));
+        let h = test_map(1, 1);
+        assert_eq!(h.lookup(b"12345678"), Err(errno::ENOENT));
+        h.update(b"12345678", &9u64.to_le_bytes(), 1).unwrap();
+        assert_eq!(h.update(b"12345678", &[0; 8], 1), Err(errno::EEXIST));
+        assert_eq!(h.update(b"87654321", &[0; 8], 0), Err(errno::E2BIG));
+        assert_eq!(h.next_key(None), Ok(b"12345678".to_vec()));
+        h.delete(b"12345678").unwrap();
+        assert_eq!(h.lookup(b"12345678"), Err(errno::ENOENT));
+    }
+
+    /// LTP's bpf_prog01: look element 0 up and set it to 1 through the
+    /// pointer the helper returns.
+    #[test]
+    fn a_filter_writes_through_a_map_value() {
+        let m = test_map(2, 1);
+        let mut ld = ins(0x18, 1, PSEUDO_MAP_FD, 0, m.fd).to_vec();
+        ld.extend_from_slice(&ins(0, 0, 0, 0, 0));
+        let prog = [
+            ld,
+            ins(0xbf, 2, 10, 0, 0).to_vec(), // r2 = fp
+            ins(0x07, 2, 0, 0, -8).to_vec(), // r2 -= 8
+            ins(0x7a, 2, 0, 0, 0).to_vec(),  // *(u64 *)r2 = 0
+            ins(0x85, 0, 0, 0, 1).to_vec(),  // r0 = lookup(r1, r2)
+            ins(0x15, 0, 0, 3, 0).to_vec(),  // if r0 == 0 goto out
+            ins(0xbf, 1, 0, 0, 0).to_vec(),  // r1 = r0
+            ins(0x7a, 1, 0, 0, 1).to_vec(),  // *(u64 *)r1 = 1
+            ins(0xb7, 0, 0, 0, 0).to_vec(),  // r0 = 0
+            ins(0x95, 0, 0, 0, 0).to_vec(),  // out: exit
+        ]
+        .concat();
+        assert_eq!(load(&prog), Err(errno::EINVAL));
+        let p = load_filter(&prog).unwrap();
+        assert_eq!(exec(&p, &[0u8; 192], &[(0, m)]), Some(0));
+        assert_eq!(m.lookup(&0u32.to_le_bytes()), Ok(1u64.to_le_bytes().to_vec()));
     }
 
     /// A program cannot reach past its context or stack, use a number as

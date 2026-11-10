@@ -1064,6 +1064,14 @@ fn msg_flags_from_host(flags: i32) -> i32 {
 /// # Safety
 /// `buf` spans `len` readable bytes; `addr`, if non-null, a `sockaddr`.
 pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> i64 {
+    // What the receiving socket's filter lets in: none, the data dropped as
+    // if sent, or the first part.
+    let sent = len;
+    let len = match crate::bpf::filter_send(fd as i32, len) {
+        Some(0) => return sent as i64,
+        Some(keep) => keep,
+        None => len,
+    };
     if crate::netlink::is(fd as i32) {
         if crate::netlink::too_large(len) {
             return err(errno::EMSGSIZE);
@@ -1615,6 +1623,10 @@ fn opt_to_host(level: u64, optname: u64) -> Result<(i32, i32, Form), i64> {
     }
 }
 
+/// `SO_ATTACH_BPF` and `SO_DETACH_BPF` (also `SO_DETACH_FILTER`).
+const SO_ATTACH_BPF: u64 = 50;
+const SO_DETACH_BPF: u64 = 27;
+
 /// `setsockopt`.
 ///
 /// # Safety
@@ -1636,6 +1648,21 @@ pub unsafe fn setsockopt(
     // IPPROTO_IPV6, IPV6_ADDRFORM
     if level == 41 && optname == 1 {
         return addrform(fd as i32, optval, optlen);
+    }
+    // An eBPF socket filter, attached or taken off ([`crate::bpf`]).
+    if level == SOL_SOCKET && matches!(optname, SO_ATTACH_BPF | SO_DETACH_BPF) {
+        let prog = if optname == SO_ATTACH_BPF {
+            if optlen < 4 {
+                return err(errno::EINVAL);
+            }
+            Some(guest!(uaccess::read::<i32>(optval)))
+        } else {
+            None
+        };
+        return match crate::bpf::attach_socket(fd as i32, prog) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        };
     }
     if level == SOL_SOCKET && KEPT.contains(&optname) {
         if optlen < 4 {

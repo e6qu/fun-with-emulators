@@ -841,9 +841,17 @@ each is mapped is in
   are kept in the cgroup's directory, so they outlive the runtime that
   attached them. The eBPF interpreter checks each access against the
   context and stack and stops a program that runs too long. Other program
-  types load (libraries probe with them) but do not attach (`EINVAL`);
-  `/proc/self/fdinfo` shows a program's type, id and tag (the first 8 bytes
-  of its instructions' SHA-1).
+  types load (libraries probe with them) but do not attach (`EINVAL`),
+  except socket filters; `/proc/self/fdinfo` shows a program's type, id
+  and tag (the first 8 bytes of its instructions' SHA-1).
+- **eBPF maps and socket filters** (`crates/kernel/src/bpfmap.rs`,
+  `bpf.rs`): array and hash maps, each an unlinked file of fwe's that its
+  descriptors share; a socket filter may use maps and their helpers, and
+  attached with `SO_ATTACH_BPF` runs on what this process sends to the
+  socket (by its connected peer, which the host's socket record names),
+  keeping what it returns of the data. A filter attached by another
+  process is not seen, nor one on a socket that is not connected; classic
+  socket filters (`SO_ATTACH_FILTER`) are not taken.
 - **Loop devices** (`crates/kernel/src/loopdev.rs`): eight at first. An
   open device is its node's descriptor, marked, whose position the host
   keeps; reads and writes are in whole sectors from the attached file's
