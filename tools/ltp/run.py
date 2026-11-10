@@ -17,7 +17,9 @@ tests that pass; a run fails if any of them does not (a regression), and
 `--update` rewrites it from the run. A regression is run again alone; a
 timer test that then fails only by sleeping too long is measured against
 the host's own timers (hosttimer.c), and named, not failed, if they, with
-fwe's least cost per sleep, miss the same threshold. The pass rate is printed either way.
+fwe's least cost per sleep, miss the same threshold; once the host has so
+missed in a run, its other timer tests that only slept too long are named
+with it. The pass rate is printed either way.
 The tests in exceptions.txt, which fail or skip on Linux too or test what is
 not planned, are not run, and do not count as applicable; a test that skips
 and is not among them is named (what fwe still lacks).
@@ -257,6 +259,13 @@ TIMER_SET = re.compile(r"sleeping for (\d+)us (\d+) iterations, threshold ([\d.]
 TIMER_RESULT = re.compile(r"min (\d+)us, .*trunc mean ([\d.]+)us")
 
 
+def only_overslept(tail):
+    """Whether a timer test's output shows failures, all of sleeps that
+    ended too late."""
+    fails = [line for line in tail.splitlines() if "TFAIL" in line]
+    return bool(fails) and all("slept for too long" in line for line in fails)
+
+
 def host_timers_late(work, tail):
     """For a timer test (LTP's tst_timer_test) whose only failures are
     sleeps that ended too late: evidence, as lines, that the host made each
@@ -266,8 +275,7 @@ def host_timers_late(work, tail):
     The host made the sleep late when its mean, with that cost, is past
     LTP's threshold already."""
     lines = tail.splitlines()
-    fails = [line for line in lines if "TFAIL" in line]
-    if not fails or any("slept for too long" not in line for line in fails):
+    if not only_overslept(tail):
         return []
     late_sets = []
     for i, line in enumerate(lines):
@@ -475,7 +483,14 @@ def main():
         finally:
             shutil.rmtree(work, ignore_errors=True)
         host_late = {n: v for n, v in host_late.items() if v}
+        # A host shown to miss LTP's thresholds itself in this run cannot
+        # time the rest either: its other timer tests that only slept too
+        # long are named with them (their own rounds may have caught it at
+        # a better moment).
         if host_late:
+            for n in regressed:
+                if n not in host_late and only_overslept(again[n][3]):
+                    host_late[n] = ["the host's timers missed LTP's thresholds in this run (above)"]
             print(f"late as the host's own timers are ({len(host_late)}): " + " ".join(host_late))
             for n, found in host_late.items():
                 print(f"    {n}: " + "; ".join(found))

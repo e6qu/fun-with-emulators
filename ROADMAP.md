@@ -110,7 +110,7 @@ hardware.
   tests that measure time or load the host run one at a time, after the
   rest; one that sleeps too long is measured against the host's own timers,
   and is not failed when they, with fwe's least cost per sleep, are as
-  late.
+  late, or were in that run.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries without section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
