@@ -27,3 +27,4 @@ close_range01 not planned (ROADMAP.md): its child shares the parent's descriptor
 setgroups03 musl's NGROUPS is 32 (glibc's is NGROUPS_MAX), so its setgroups(NGROUPS + 1) is in range and succeeds
 ioctl04 a tmpfs (LTP_DEV_FS_TYPE) takes no device, so the device's read-only flag does not stop a read-write mount
 open13 musl's fchmod and fchown retry an EBADF through /proc/self/fd/N, which succeeds for an O_PATH descriptor
+sched_setscheduler04 it checks the child with musl's sched_getscheduler and sched_getparam, stubs that fail (ENOSYS) without asking the kernel

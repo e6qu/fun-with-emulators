@@ -610,6 +610,12 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
     (r.oom_score_adj, r.oom_score_adj_min) = i.oom;
     r.nice = i.nice;
     r.sched = i.sched;
+    // `SCHED_RESET_ON_FORK`: the child starts as an ordinary process (a
+    // real-time or deadline policy, and a raised priority, not passed on).
+    if r.sched.reset_on_fork {
+        r.sched = Sched::default();
+        r.nice = r.nice.max(0);
+    }
     if i.slack != 0 {
         r.slack = (i.slack, i.slack);
     }

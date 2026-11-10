@@ -2050,6 +2050,29 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = unsafe { crate::synthdir::getdents64(fd as i32, buf, count) } {
             return r;
         }
+        // Not a directory (`ENOTDIR`), or one removed since it was opened
+        // (`ENOENT`), as Linux tells them.
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::fstat(fd as i32, &mut st) } == 0 {
+            if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                return err(errno::ENOTDIR);
+            }
+            // Removed: no links left, or its path names it no more.
+            let gone = st.st_nlink == 0
+                || crate::fs::fd_path(fd as i32).is_some_and(|p| {
+                    let Ok(c) = std::ffi::CString::new(p) else { return false };
+                    // SAFETY: an all-zero `stat` is a valid out-parameter.
+                    let mut at: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: a NUL-terminated path and a valid out-parameter.
+                    let r = unsafe { libc::lstat(c.as_ptr(), &mut at) };
+                    r != 0 || (at.st_dev, at.st_ino) != (st.st_dev, st.st_ino)
+                });
+            if gone {
+                return err(errno::ENOENT);
+            }
+        }
         if let Some(l) = crate::fdmarks::origin(fd as i32).and_then(|o| o.ovl) {
             // The overlay's directory: its layers' entries merged.
             return crate::overlay::getdents64(fd as i32, buf, count, || {

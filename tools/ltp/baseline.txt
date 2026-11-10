@@ -337,6 +337,7 @@ getcwd02
 getcwd03
 getcwd04
 getdents01
+getdents02
 getdomainname01
 getegid01
 getegid01_16
@@ -377,6 +378,7 @@ getrlimit02
 getrlimit03
 getrusage01
 getrusage02
+getrusage03
 getrusage04
 getsid01
 getsid02
