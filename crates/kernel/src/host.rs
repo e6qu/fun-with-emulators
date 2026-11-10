@@ -225,7 +225,12 @@ pub fn rlim_to_linux(v: libc::rlim_t) -> u64 {
 }
 
 pub fn rlim_to_host(v: u64) -> libc::rlim_t {
-    if v == resource::RLIM_INFINITY { libc::RLIM_INFINITY } else { v }
+    // Past the host's largest (its infinity), which Linux takes: no limit.
+    if v == resource::RLIM_INFINITY || v > libc::RLIM_INFINITY as u64 {
+        libc::RLIM_INFINITY
+    } else {
+        v
+    }
 }
 
 /// Host signal for a Linux signal number, if the host has an equivalent.

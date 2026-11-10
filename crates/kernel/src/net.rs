@@ -1354,8 +1354,19 @@ fn ip_stream(fd: i32) -> bool {
 /// host says it is not connected.
 pub fn linux_send_error(nr: u64, fd: i32, r: i64) -> i64 {
     use fwe_abi::nr as n;
-    let sends = matches!(nr, n::WRITE | n::WRITEV | n::SENDTO | n::SENDMSG);
-    if sends && r == err(errno::ENOTCONN) && ip_stream(fd) { err(errno::EPIPE) } else { r }
+    let sends = matches!(nr, n::WRITE | n::WRITEV | n::SENDTO | n::SENDMSG | n::SENDFILE);
+    if sends && r == err(errno::ENOTCONN) && ip_stream(fd) {
+        return err(errno::EPIPE);
+    }
+    // A full socket buffer the host calls out of buffers: Linux's `EAGAIN`
+    // for a socket that does not wait.
+    if sends && r == err(errno::ENOBUFS) {
+        // SAFETY: F_GETFL only queries the descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
+            return err(errno::EAGAIN);
+        }
+    }
+    r
 }
 
 /// The guest `sockaddr` at `addr` for a `bind` (`bind`) or `connect` of

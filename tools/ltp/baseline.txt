@@ -850,6 +850,8 @@ sendfile05
 sendfile05_64
 sendfile06
 sendfile06_64
+sendfile07
+sendfile07_64
 sendfile08
 sendfile08_64
 sendfile09
@@ -1036,6 +1038,7 @@ truncate02
 truncate02_64
 truncate03
 truncate03_64
+ulimit01
 umask01
 umount01
 umount02
