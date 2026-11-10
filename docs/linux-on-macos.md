@@ -402,8 +402,7 @@ from fwe's mechanisms:
   limits, which under fwe are fixed figures and unenforced limits
   ([Memory pressure](#memory-pressure), [cgroups](#cgroups)).
 - **Tools:** attach mechanisms that use `ptrace` work between fwe
-  processes ([ptrace](#ptrace)); `process_vm_readv`/`writev` fail with
-  `ENOSYS` ([Not available](#not-available)).
+  processes ([ptrace](#ptrace)), and so do `process_vm_readv`/`writev`.
 
 ### Wine
 
@@ -443,11 +442,10 @@ fwe's mechanisms, from how Wine is generally built:
   an alternate stack to emulate Windows exceptions; fwe delivers faults to
   guest handlers with Linux frames and honours `sigaltstack`; in the VM a
   misaligned pc or sp is `SIGBUS` and a `brk` is `SIGTRAP`.
-- **Other processes' memory:** `ptrace` works between fwe processes, but
-  `process_vm_readv`/`writev` fail with `ENOSYS` and `/proc/<pid>/mem` is
-  the caller's own memory only, so whatever Wine does with them for
-  another process would fail. Whether that blocks ordinary programs is
-  unknown.
+- **Other processes' memory:** `ptrace` and `process_vm_readv`/`writev`
+  work between fwe processes, but `/proc/<pid>/mem` is the caller's own
+  memory only, so what Wine does through it for another process would
+  fail. Whether that blocks ordinary programs is unknown.
 
 ## Which instructions get translated, and how
 
@@ -929,6 +927,7 @@ and the per-call differences are in [Address-space layout](#address-space-layout
 | `madvise` | Advice and each mapping checked as Linux checks them; `MADV_DONTNEED` zero-fills private anonymous memory; `MADV_HWPOISON`/`SOFT_OFFLINE` need `CAP_SYS_ADMIN`. | native: `mmap` (fresh pages), `madvise`, `mprotect`; VM: slab edit |
 | `msync` | Flags and alignment checked; each mapping in the range synced, a hole `ENOMEM` after the rest; `MS_INVALIDATE` of locked memory `EBUSY`. | `msync` (VM: of shared segments) |
 | `mincore` | One byte per guest page, from the host's residency. | `mincore` |
+| `process_vm_readv`, `process_vm_writev` | Permission as for ptrace; the caller's own memory copied directly; another fwe process's copied by that process in its wake handler, from a request file of fwe's, with the host's copies of its own task (an address with nothing behind it is an error, not a fault); a fault partway returns the bytes copied | `mach_vm_read_overwrite`, `mach_vm_write` (in the target), `pread`/`pwrite` |
 | `pkey_alloc`, `pkey_free`, `pkey_mprotect` | As on a CPU without protection keys (arm64's need `FEAT_S1POE`): none to allocate (`ENOSPC`), none to free; `pkey_mprotect` with key -1 is `mprotect`. | `mprotect` |
 | `mlock`, `mlock2`, `munlock`, `mlockall`, `munlockall` | Range and `RLIMIT_MEMLOCK` checked, pages read in (not with `MLOCK_ONFAULT`), marked locked; nothing wired. | none |
 | `mseal` | The mappings marked sealed in fwe's record; later changes to them fail with `EPERM`. | none |
@@ -2264,7 +2263,7 @@ numbers mean nothing there. fwe keeps its own:
 Any call not dispatched in `crates/kernel/src/syscalls.rs` fails with
 `ENOSYS`, noted under `--strace`. These are:
 
-- `process_vm_readv`/`process_vm_writev`, `kcmp`;
+- `kcmp`;
 - `io_uring_setup` and the rest;
 - `userfaultfd`, `perf_event_open`, `fanotify_init`/`fanotify_mark`;
 - the `landlock_*` calls, `rseq`;

@@ -4,7 +4,9 @@
 //! signal, each carrying its descriptor); real-time signals queued, each
 //! with its value; `file_setattr` and `file_getattr`; the security modules
 //! listed; `sync` and `syncfs`; a trailing slash on a file; and a message
-//! queue's id chosen by `kernel.msg_next_id`. It prints what it observed.
+//! queue's id chosen by `kernel.msg_next_id`; and a child's memory read
+//! and written by its parent (`process_vm_readv`, `process_vm_writev`). It
+//! prints what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
@@ -23,6 +25,8 @@ const SYS_FILE_GETATTR: i64 = 468;
 const SYS_FILE_SETATTR: i64 = 469;
 const SYS_RT_SIGQUEUEINFO: i64 = 138;
 const SYS_EVENTFD2: i64 = 19;
+const SYS_PROCESS_VM_READV: i64 = 270;
+const SYS_PROCESS_VM_WRITEV: i64 = 271;
 
 const O_RDONLY: i32 = 0;
 const O_RDWR: i32 = 2;
@@ -121,6 +125,9 @@ fn errno() -> i32 {
 fn c(s: &str) -> CString {
     CString::new(s).unwrap()
 }
+
+/// A word a child sets, which its parent reads and writes.
+static WORD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The descriptors dnotify's signal was taken with, in order.
 static SEEN: [AtomicI32; 4] = [const { AtomicI32::new(-1) }; 4];
@@ -293,6 +300,36 @@ fn main() {
         let next = std::fs::read_to_string("/proc/sys/kernel/msg_next_id").unwrap_or_default();
         println!("msg_next_id: id {}, then {}", q == 4242, next.trim());
         msgctl(q, IPC_RMID, std::ptr::null_mut());
+
+        // A child's memory, read and written by its parent.
+        let (mut up, mut down) = ([0i32; 2], [0i32; 2]);
+        pipe(up.as_mut_ptr());
+        pipe(down.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            WORD.store(0x1234, Ordering::SeqCst);
+            write(up[1], b"x".as_ptr(), 1);
+            let mut b = 0u8;
+            read(down[0], &mut b, 1);
+            _exit((WORD.load(Ordering::SeqCst) & 0xff) as i32);
+        }
+        let mut b = 0u8;
+        read(up[0], &mut b, 1);
+        let at = WORD.as_ptr() as u64;
+        let mut got = 0u64;
+        let local = [(&mut got as *mut u64 as u64), 8u64];
+        let remote = [at, 8u64];
+        let read_n = syscall(SYS_PROCESS_VM_READV, i64::from(child), local.as_ptr(), 1i64, remote.as_ptr(), 1i64, 0i64);
+        let new = 0x99u64;
+        let local = [(&new as *const u64 as u64), 8u64];
+        let wrote_n = syscall(SYS_PROCESS_VM_WRITEV, i64::from(child), local.as_ptr(), 1i64, remote.as_ptr(), 1i64, 0i64);
+        write(down[1], b"x".as_ptr(), 1);
+        let mut st = 0;
+        waitpid(child, &mut st, 0);
+        println!(
+            "process_vm: read {read_n} bytes {got:#x}, wrote {wrote_n}, child saw {:#x}",
+            (st >> 8) & 0xff
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }

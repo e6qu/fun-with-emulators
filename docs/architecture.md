@@ -965,6 +965,14 @@ Calls that fit none of the areas above:
   is kept in a file of fwe's for the pid namespace, and each ending
   process looks for it and appends its `struct acct_v3`: times, memory and
   faults from its usage, `AFORK` for a fork child that ran no program.
+- `process_vm_readv`/`process_vm_writev` (`crates/kernel/src/procvm.rs`):
+  the caller writes the ranges (and data to write) to a request file and
+  asks the other process through its mailbox; its wake handler copies
+  with `mach_vm_read_overwrite` and `mach_vm_write` on its own task,
+  which return an error for an address with nothing behind it, and
+  wakes the caller on a reply socket. In the VM it translates guest
+  addresses without waiting on the translation table (a request made
+  while the table changes is made again).
 - `cachestat` counts a file's resident pages with `mincore` of a mapping
   of the range; `ioprio_set` checks and keeps the caller's I/O priority,
   which nothing applies.
@@ -1033,6 +1041,10 @@ which are to be lifted for 1.0 and which are not planned.
   held as they were (their next locker waits rather than getting
   `EOWNERDEAD`) and writes no accounting record; a VM process takes a
   `SIGKILL` from fwe as its own ending, with both.
+- `process_vm_readv`/`process_vm_writev` of a process that is stopped
+  waits until it runs again (its handler serves the request), and one of
+  a process fwe did not start fails with `ESRCH`; in the VM, a write to
+  guest memory the guest maps read-only succeeds.
 - An I/O priority set for another process (`ioprio_set`) is checked and
   accepted but not kept: `ioprio_get` reports that process's as (none,
   0).

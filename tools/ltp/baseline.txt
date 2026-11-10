@@ -765,6 +765,11 @@ preadv201
 preadv201_64
 preadv202
 preadv202_64
+process_vm_readv01
+process_vm_readv02
+process_vm_readv03
+process_vm_writev01
+process_vm_writev02
 prot_hsymlinks
 pselect02
 pselect02_64

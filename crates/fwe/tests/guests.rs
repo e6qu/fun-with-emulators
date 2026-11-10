@@ -3034,7 +3034,8 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     file attributes: set 0, get 0, no-dump true\n\
     lsm: 1 module, id 100, size 8\n\
     sync: 0, syncfs 0, file/ ENOTDIR\n\
-    msg_next_id: id true, then -1\n";
+    msg_next_id: id true, then -1\n\
+    process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n";
 
 /// More calls: native AIO (a poll that waits, an eventfd signalled),
 /// process accounting, dnotify, queued real-time signals, file attributes,

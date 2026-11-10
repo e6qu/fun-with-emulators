@@ -70,6 +70,7 @@ pub mod procfs;
 pub mod procmem;
 pub mod procpid;
 pub mod procreg;
+pub mod procvm;
 pub mod ptrace;
 pub mod pty;
 pub mod reaper;

@@ -622,6 +622,8 @@ impl<P: Platform> Kernel<P> {
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
             nr::ACCT => self.sys_acct(a[0]),
+            nr::PROCESS_VM_READV => self.sys_process_vm(false, a),
+            nr::PROCESS_VM_WRITEV => self.sys_process_vm(true, a),
             nr::IO_SETUP => self.sys_io_setup(a[0], a[1]),
             nr::IO_DESTROY => self.sys_io_destroy(a[0]),
             #[cfg(target_os = "macos")]

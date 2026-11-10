@@ -328,6 +328,136 @@ pub fn request_fd(target: i32, fd: i32, token: u64) -> Result<(), i32> {
     put(target, 0, FD_REQUEST, fd, token)
 }
 
+/// What a queue entry holds for a request to copy this process's memory
+/// ([`request_mem`]).
+const MEM_REQUEST: u64 = 0x1_0001;
+
+/// Ask process `target` to copy between its memory and the request file
+/// of reply socket `token` ([`answer_mem`]).
+pub fn request_mem(target: i32, token: u64) -> Result<(), i32> {
+    put(target, 0, MEM_REQUEST, 0, token)
+}
+
+/// A memory request's file: its reply socket's path with `m` after it.
+fn mem_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH + 1]) -> Option<usize> {
+    let mut sock = [0u8; SUN_PATH];
+    let len = reply_path(pid, token, &mut sock)?;
+    buf[..len].copy_from_slice(&sock[..len]);
+    buf[len] = b'm';
+    buf[len + 1] = 0;
+    Some(len + 1)
+}
+
+/// The path of process `pid`'s memory request `token`.
+pub fn mem_request_path(pid: i32, token: u64) -> Option<Vec<u8>> {
+    let mut buf = [0u8; SUN_PATH + 1];
+    let len = mem_path(pid, token, &mut buf)?;
+    Some(buf[..len].to_vec())
+}
+
+/// A memory request's file: a header (the operation, 0 to read this
+/// process's memory and 1 to write it; the count of ranges; the result,
+/// written by the answer), the ranges (address and length), then the
+/// data. The answer's result is the bytes copied, `-EFAULT` if none could
+/// be, or [`MEM_RETRY`] when the translation of guest addresses was being
+/// changed.
+pub const MEM_HEADER: usize = 16;
+pub const MEM_RETRY: i64 = i64::MIN;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_vm_read_overwrite(task: u32, addr: u64, size: u64, data: u64, out: *mut u64) -> i32;
+    fn mach_vm_write(task: u32, addr: u64, data: usize, count: u32) -> i32;
+    /// This task's port (`mach_task_self()` is a macro over it).
+    static mach_task_self_: u32;
+}
+
+/// In the wake handler: carry out process `caller`'s memory request
+/// `token` on this process's memory, through the host's copies of its own
+/// task, which report an address with nothing behind it rather than fault,
+/// and tell the caller on its reply socket. Async-signal-safe.
+fn answer_mem(caller: i32, token: u64) {
+    let mut path = [0u8; SUN_PATH + 1];
+    let Some(_) = mem_path(caller, token, &mut path) else { return };
+    let saved = crate::host::last_errno();
+    // SAFETY: a NUL-terminated path; buffers on the stack of their stated
+    // lengths; the host copies check the addresses they are given.
+    unsafe {
+        let fd = libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC);
+        if fd >= 0 {
+            let mut h = [0u8; MEM_HEADER];
+            let ok = libc::pread(fd, h.as_mut_ptr().cast(), MEM_HEADER, 0) == MEM_HEADER as isize;
+            let write = u32::from_ne_bytes(h[..4].try_into().unwrap()) == 1;
+            let count = u32::from_ne_bytes(h[4..8].try_into().unwrap()) as usize;
+            let data_at = MEM_HEADER + count * 16;
+            let mut done: i64 = 0;
+            let mut failed = !ok;
+            'ranges: for i in 0..count.min(1024) {
+                if failed {
+                    break;
+                }
+                let mut r = [0u8; 16];
+                if libc::pread(fd, r.as_mut_ptr().cast(), 16, (MEM_HEADER + i * 16) as libc::off_t)
+                    != 16
+                {
+                    failed = true;
+                    break;
+                }
+                let base = u64::from_ne_bytes(r[..8].try_into().unwrap());
+                let len = u64::from_ne_bytes(r[8..].try_into().unwrap());
+                let mut off = 0u64;
+                while off < len {
+                    let Some((host, room)) = crate::uaccess::try_run(base + off) else {
+                        done = MEM_RETRY;
+                        break 'ranges;
+                    };
+                    let n = (len - off).min(room).min(4096);
+                    let mut buf = [0u8; 4096];
+                    let at = (data_at as u64 + done as u64) as libc::off_t;
+                    #[cfg(target_os = "macos")]
+                    let copied = if write {
+                        libc::pread(fd, buf.as_mut_ptr().cast(), n as usize, at) == n as isize
+                            && mach_vm_write(mach_task_self_, host, buf.as_ptr() as usize, n as u32)
+                                == 0
+                    } else {
+                        let mut out = 0u64;
+                        mach_vm_read_overwrite(
+                            mach_task_self_,
+                            host,
+                            n,
+                            buf.as_mut_ptr() as u64,
+                            &mut out,
+                        ) == 0
+                            && out == n
+                            && libc::pwrite(fd, buf.as_ptr().cast(), n as usize, at) == n as isize
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let copied = {
+                        let _ = (host, at, write, &mut buf);
+                        false
+                    };
+                    if !copied {
+                        failed = true;
+                        break 'ranges;
+                    }
+                    done += n as i64;
+                    off += n;
+                }
+            }
+            let result = if done == MEM_RETRY || done > 0 || !failed {
+                done
+            } else {
+                -i64::from(fwe_abi::errno::EFAULT)
+            };
+            libc::pwrite(fd, result.to_ne_bytes().as_ptr().cast(), 8, 8);
+            libc::close(fd);
+        }
+    }
+    crate::host::set_errno(saved);
+    // The answer itself is in the file: the caller is only woken.
+    answer_fd(caller, -1, token);
+}
+
 fn put(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
     let mut buf = [0u8; 512];
     let path = mailbox(target, &mut buf).ok_or(fwe_abi::errno::ESRCH)?;
@@ -415,7 +545,12 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
     for e in q[..n.max(0) as usize].chunks_exact(ENTRY) {
         let word = |at: usize| e[at..at + 4].try_into().unwrap();
         let sig = i32::from_ne_bytes(word(0));
-        if sig as u64 == FD_REQUEST {
+        if sig as u64 == MEM_REQUEST {
+            answer_mem(
+                i32::from_ne_bytes(word(4)),
+                u64::from_ne_bytes(e[16..24].try_into().unwrap()),
+            );
+        } else if sig as u64 == FD_REQUEST {
             answer_fd(
                 i32::from_ne_bytes(word(4)),
                 i32::from_ne_bytes(word(12)),
