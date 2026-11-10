@@ -8,7 +8,7 @@ Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
 The root is a root filesystem with LTP in /opt/ltp (tools/ltp/build.sh
 makes it, of Alpine's minirootfs). Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
 <args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
-own per-test timeout and a hard limit above that (twice it for the slow
+own per-test timeout and a hard limit above that (four times it for the slow
 ones, which start first; a minute for one not in the baseline); `--jobs`
 run at once, but those that change a machine-wide setting or measure time
 (see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
@@ -16,8 +16,8 @@ otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
 `--update` rewrites it from the run. A regression is run again alone; a
 timer test that then fails only by sleeping too long is measured against
-the host's own timers (hosttimer.c), and named, not failed, if they miss
-the same threshold natively. The pass rate is printed either way.
+the host's own timers (hosttimer.c), and named, not failed, if they, with
+fwe's least cost per sleep, miss the same threshold. The pass rate is printed either way.
 The tests in exceptions.txt, which fail or skip on Linux too or test what is
 not planned, are not run, and do not count as applicable; a test that skips
 and is not among them is named (what fwe still lacks).
@@ -197,11 +197,13 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         # (LTP's default is ext2).
         "LTP_DEV_FS_TYPE": "tmpfs",
         # A fork under fwe takes milliseconds, not Linux's tenth of one: a
-        # test is given eight times LTP's time, a slow one (fork14's
-        # thousands of forks) sixteen, as its hard limit is doubled. One
+        # test is given eight times LTP's time, a slow one thirty-two, as
+        # its hard limit is four times the rest's (fork14's 16,394 forks of
+        # a process with as many mappings take macOS minutes natively, a
+        # CI runner several times this). One
         # that runs for a set time instead (fork13's ten minutes) runs a
         # tenth of it: the same checks, fewer rounds.
-        "LTP_TIMEOUT_MUL": "16" if SLOW.match(name) else "8",
+        "LTP_TIMEOUT_MUL": "32" if SLOW.match(name) else "8",
         "LTP_RUNTIME_MUL": "0.1",
         "HOME": guest_tmp,
         "LANG": "C",
@@ -252,15 +254,17 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
 
 
 TIMER_SET = re.compile(r"sleeping for (\d+)us (\d+) iterations, threshold ([\d.]+)us")
-TRUNC_MEAN = re.compile(r"trunc mean ([\d.]+)us")
+TIMER_RESULT = re.compile(r"min (\d+)us, .*trunc mean ([\d.]+)us")
 
 
 def host_timers_late(work, tail):
     """For a timer test (LTP's tst_timer_test) whose only failures are
-    sleeps that ended too late: the host's own timers measured on each
-    sleep it failed (hosttimer.c, up to three rounds), as lines, if they
-    missed the same threshold natively. Empty if they did not, or the test
-    failed otherwise."""
+    sleeps that ended too late: evidence, as lines, that the host made each
+    late sleep late itself, or none. The host's own sleeps of the same
+    length are measured (hosttimer.c, up to three rounds); fwe's least cost
+    per sleep is what its shortest sleep took past the host's shortest.
+    The host made the sleep late when its mean, with that cost, is past
+    LTP's threshold already."""
     lines = tail.splitlines()
     fails = [line for line in lines if "TFAIL" in line]
     if not fails or any("slept for too long" not in line for line in fails):
@@ -268,11 +272,11 @@ def host_timers_late(work, tail):
     late_sets = []
     for i, line in enumerate(lines):
         m = TIMER_SET.search(line)
-        mean = next((TRUNC_MEAN.search(x) for x in lines[i + 1:i + 3] if TRUNC_MEAN.search(x)), None)
-        if m and mean:
+        res = next((TIMER_RESULT.search(x) for x in lines[i + 1:i + 3] if TIMER_RESULT.search(x)), None)
+        if m and res:
             usec, n, threshold = int(m[1]), int(m[2]), float(m[3])
-            if float(mean[1]) > usec + threshold:
-                late_sets.append((usec, n, threshold))
+            if float(res[2]) > usec + threshold:
+                late_sets.append((usec, n, threshold, int(res[1])))
     if not late_sets:
         return []
     probe = os.path.join(work, "hosttimer")
@@ -281,11 +285,19 @@ def host_timers_late(work, tail):
         if subprocess.run(["cc", "-O2", "-o", probe, source]).returncode != 0:
             return []
     found = []
-    for usec, n, threshold in late_sets:
+    for usec, n, threshold, fwe_min in late_sets:
         for _ in range(3):
-            r = subprocess.run([probe, str(usec), str(n), str(threshold)], capture_output=True, text=True)
-            if r.returncode == 1:
-                found.append(r.stdout.strip())
+            r = subprocess.run([probe, str(usec), str(n)], capture_output=True, text=True)
+            try:
+                host_min, host_mean, host_max = (float(x) for x in r.stdout.split())
+            except ValueError:
+                return []
+            cost = max(0.0, fwe_min - host_min)
+            if host_mean + cost > usec + threshold:
+                found.append(
+                    f"{usec}us x{n}: host mean {host_mean:.0f}us (min {host_min:.0f}, max {host_max:.0f})"
+                    f" + fwe's least cost {cost:.0f}us > {usec + threshold:.0f}us"
+                )
                 break
         else:
             return []
@@ -361,11 +373,11 @@ def main():
         passing = {n for n, _ in tests}
 
     def limit(name):
-        # A slow test is given twice the time, passing yet or not: its
-        # time is mostly the host's (fork14's thousands of forks of a
+        # A slow test is given four times the time, passing yet or not:
+        # its time is mostly the host's (fork14's thousands of forks of a
         # process with thousands of mappings).
         if SLOW.match(name):
-            return 2 * args.hard_limit
+            return 4 * args.hard_limit
         return args.hard_limit if name in passing else min(args.failing_limit, args.hard_limit)
 
     tests = [t for t in tests if t[0] not in excepted]

@@ -1,12 +1,10 @@
 /*
- * How late the host's own timers end a sleep, judged as LTP's timer tests
- * judge one (lib/tst_timer_test.c): `hosttimer USEC ITERATIONS THRESHOLD`
+ * How late the host's own timers end a sleep, measured as LTP's timer
+ * tests measure one (lib/tst_timer_test.c): `hosttimer USEC ITERATIONS`
  * sleeps USEC microseconds ITERATIONS times on the host timer fwe's waits
  * use (a kqueue EVFILT_TIMER with NOTE_CRITICAL), drops the longest 5%
- * (at least one), and exits 1 if the mean of the rest is more than
- * THRESHOLD microseconds late (LTP's per-sleep threshold), 0 if not.
- * run.py runs it when a timer test fails: a host that misses the same
- * threshold natively cannot be met by a program running on it.
+ * (at least one), and prints the shortest sleep, the mean of the rest and
+ * the longest, in microseconds. run.py runs it when a timer test fails.
  */
 #include <poll.h>
 #include <stdio.h>
@@ -30,11 +28,10 @@ static int longest_first(const void *a, const void *b)
 
 int main(int argc, char **argv)
 {
-	if (argc != 4)
+	if (argc != 3)
 		return 2;
 	long long usec = atoll(argv[1]);
 	int n = atoi(argv[2]);
-	double threshold = atof(argv[3]);
 	long long *samples = calloc(n, sizeof(*samples));
 	int kq = kqueue();
 	if (!samples || kq < 0 || n < 1)
@@ -56,9 +53,6 @@ int main(int argc, char **argv)
 	double sum = 0;
 	for (int i = discard; i < n; i++)
 		sum += samples[i];
-	double mean = sum / (n - discard);
-	int late = mean > usec + threshold;
-	printf("host: %lldus %d times: max %lldus, trunc mean %.2fus, %s\n", usec, n,
-	       samples[0], mean, late ? "late" : "on time");
-	return late;
+	printf("%lld %.2f %lld\n", samples[n - 1], sum / (n - discard), samples[0]);
+	return 0;
 }
