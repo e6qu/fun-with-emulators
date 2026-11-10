@@ -40,6 +40,8 @@ const SLOT: usize = 32;
 pub struct Note {
     pub pid: i32,
     pub uid: u32,
+    /// The thread it is for (0: the process).
+    pub tid: i32,
     /// Linux's `si_code`: `SI_USER` (0) for a plain `kill`.
     pub code: i32,
     pub value: u64,
@@ -282,6 +284,7 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
         let note = Note {
             pid: i32::from_ne_bytes(word(0)),
             uid: u32::from_ne_bytes(word(4)),
+            tid: 0,
             code: i32::from_ne_bytes(word(16)),
             value: u64::from_ne_bytes(slot[24..32].try_into().unwrap()),
         };
@@ -306,7 +309,12 @@ const ENTRY: usize = 32;
 /// a full queue refuses a real-time one (`EAGAIN`). The caller wakes the
 /// target.
 pub fn queue(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
-    put(target, sig, code, value)
+    put(target, 0, sig, code, value)
+}
+
+/// [`queue`] for thread `tid` of host process `target`.
+pub fn queue_thread(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
+    put(target, tid, sig, code, value)
 }
 
 /// What a queue entry holds in place of a signal for a request of a
@@ -317,10 +325,10 @@ const FD_REQUEST: u64 = 0x1_0000;
 /// `fd`, to be sent to this process's reply socket `token`
 /// ([`fd_reply_socket`]).
 pub fn request_fd(target: i32, fd: i32, token: u64) -> Result<(), i32> {
-    put(target, FD_REQUEST, fd, token)
+    put(target, 0, FD_REQUEST, fd, token)
 }
 
-fn put(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
+fn put(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
     let mut buf = [0u8; 512];
     let path = mailbox(target, &mut buf).ok_or(fwe_abi::errno::ESRCH)?;
     // SAFETY: plain host calls.
@@ -340,25 +348,28 @@ fn put(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
             q[n.max(0) as usize..].fill(0);
         }
         let sig_at = |i: usize| i32::from_ne_bytes(q[i * ENTRY..i * ENTRY + 4].try_into().unwrap());
-        let r =
-            if sig < fwe_abi::signal::SIGRTMIN && (0..QUEUE_LEN).any(|i| sig_at(i) == sig as i32) {
+        let r = if sig < fwe_abi::signal::SIGRTMIN
+            && tid == 0
+            && (0..QUEUE_LEN).any(|i| sig_at(i) == sig as i32)
+        {
+            Ok(())
+        } else if let Some(i) = (0..QUEUE_LEN).find(|&i| sig_at(i) == 0) {
+            let mut e = [0u8; ENTRY];
+            e[0..4].copy_from_slice(&(sig as i32).to_ne_bytes());
+            e[4..8].copy_from_slice(&me.to_ne_bytes());
+            e[8..12].copy_from_slice(&uid.to_ne_bytes());
+            e[12..16].copy_from_slice(&code.to_ne_bytes());
+            e[16..24].copy_from_slice(&value.to_ne_bytes());
+            e[24..28].copy_from_slice(&tid.to_ne_bytes());
+            let at = (QUEUE_AT + i * ENTRY) as libc::off_t;
+            if libc::pwrite(fd, e.as_ptr().cast(), ENTRY, at) == ENTRY as isize {
                 Ok(())
-            } else if let Some(i) = (0..QUEUE_LEN).find(|&i| sig_at(i) == 0) {
-                let mut e = [0u8; ENTRY];
-                e[0..4].copy_from_slice(&(sig as i32).to_ne_bytes());
-                e[4..8].copy_from_slice(&me.to_ne_bytes());
-                e[8..12].copy_from_slice(&uid.to_ne_bytes());
-                e[12..16].copy_from_slice(&code.to_ne_bytes());
-                e[16..24].copy_from_slice(&value.to_ne_bytes());
-                let at = (QUEUE_AT + i * ENTRY) as libc::off_t;
-                if libc::pwrite(fd, e.as_ptr().cast(), ENTRY, at) == ENTRY as isize {
-                    Ok(())
-                } else {
-                    Err(fwe_abi::errno::EAGAIN)
-                }
             } else {
                 Err(fwe_abi::errno::EAGAIN)
-            };
+            }
+        } else {
+            Err(fwe_abi::errno::EAGAIN)
+        };
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
         r
@@ -418,6 +429,7 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
                     uid: u32::from_ne_bytes(word(8)),
                     code: i32::from_ne_bytes(word(12)),
                     value: u64::from_ne_bytes(e[16..24].try_into().unwrap()),
+                    tid: i32::from_ne_bytes(word(24)),
                 },
             );
         }

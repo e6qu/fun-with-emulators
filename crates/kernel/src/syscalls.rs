@@ -573,24 +573,33 @@ impl<P: Platform> Kernel<P> {
                 thread::set_robust_list(a[0], a[1]);
                 0
             }
-            // The caller's own list; another thread's or process's needs a
-            // tracer's standing, which nothing has.
+            // Any thread's list, another process's to a caller that may
+            // trace it; the length is always the head's size, as Linux's.
             nr::GET_ROBUST_LIST => {
                 let pid = a[0] as i32;
-                if pid != 0 && pid != thread::tid() {
-                    return err(
-                        if crate::pidns::to_host(pid).is_some_and(host::process_exists)
-                            || thread::host_thread(pid).is_some()
-                        {
-                            errno::EPERM
-                        } else {
-                            errno::ESRCH
-                        },
-                    );
-                }
-                let (head, len) = thread::robust_list();
+                let head = if pid == 0 || pid == thread::tid() {
+                    thread::robust_list().0
+                } else if let Some(head) = thread::robust_list_of(pid) {
+                    head
+                } else {
+                    // Another process's thread: its host process and, for
+                    // one not its main thread, its number.
+                    let target = match thread::owner_of_tid(pid) {
+                        Some(owner) => Some((owner, Some(pid))),
+                        None => crate::pidns::to_host(pid)
+                            .filter(|&h| host::process_exists(h))
+                            .map(|h| (h, None)),
+                    };
+                    let Some((owner, tid)) = target else {
+                        return err(errno::ESRCH);
+                    };
+                    if !self.may_trace(owner) {
+                        return err(errno::EPERM);
+                    }
+                    thread::published_robust(owner, tid).unwrap_or(0)
+                };
                 guest!(uaccess::write(a[1], head));
-                guest!(uaccess::write(a[2], len));
+                guest!(uaccess::write(a[2], 24u64));
                 0
             }
             nr::REBOOT => self.sys_reboot(a[0], a[1], a[2]),
@@ -788,7 +797,7 @@ impl<P: Platform> Kernel<P> {
                 self.sys_getrandom(a[0], a[1])
             }
 
-            // Not implemented yet. rseq and membarrier are optional for libc.
+            // Any other call: `ENOSYS`, as Linux gives a call it lacks.
             _ => {
                 self.tracer.note(&format!("unimplemented syscall {n}"));
                 err(errno::ENOSYS)
@@ -2151,12 +2160,20 @@ impl<P: Platform> Kernel<P> {
             guest!(uaccess::write(old, thread::altstack()));
         }
         if ss != 0 {
-            let s: Stack = guest!(uaccess::read(ss));
-            if s.ss_flags & !libc::SS_DISABLE != 0 {
+            let mut s: Stack = guest!(uaccess::read(ss));
+            // Linux's modes: none, `SS_ONSTACK` (the same) or `SS_DISABLE`,
+            // with `SS_AUTODISARM` beside them.
+            let autodisarm = s.ss_flags & signal::SS_AUTODISARM;
+            let mode = s.ss_flags & !signal::SS_AUTODISARM;
+            if ![0, signal::SS_ONSTACK, signal::SS_DISABLE].contains(&mode) {
                 return err(errno::EINVAL);
             }
-            if s.ss_flags & libc::SS_DISABLE == 0 && s.ss_size < signal::MINSIGSTKSZ {
+            if mode == signal::SS_DISABLE {
+                s = Stack { ss_flags: signal::SS_DISABLE | autodisarm, ..Stack::default() };
+            } else if s.ss_size < signal::MINSIGSTKSZ {
                 return err(errno::ENOMEM);
+            } else {
+                s.ss_flags = autodisarm;
             }
             thread::set_altstack(s);
         }
@@ -2185,19 +2202,12 @@ impl<P: Platform> Kernel<P> {
     }
 }
 
-/// `ppoll(fds, nfds, timeout)`; the caller applies the signal mask. Blocks, so
-/// the backend runs it without the kernel lock through
-/// [`crate::blocking_syscall`]; it touches no kernel state.
-///
-/// # Safety
-/// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
-/// a guest `Timespec`.
 /// `pselect6(nfds, readfds, writefds, exceptfds, timeout, _)`, by way of the
 /// host's `poll`: each set bit below `nfds` becomes a `pollfd`, and the sets
 /// are rewritten with what is ready (the signal mask is the caller's, see
 /// [`crate::blocking_syscall`]). Linux's `fd_set` is a bitmap of 64-bit
-/// words, as fwe reads it. The timeout is not updated with the time left,
-/// which POSIX allows and glibc's `select` does not rely on.
+/// words, as fwe reads it. The time left is written back to the timeout,
+/// as Linux does ([`with_remaining`]).
 ///
 /// # Safety
 /// The set and timeout pointers are null or reference guest memory.
@@ -2463,6 +2473,13 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
     count
 }
 
+/// `ppoll(fds, nfds, timeout)`; the caller applies the signal mask. Blocks, so
+/// the backend runs it without the kernel lock through
+/// [`crate::blocking_syscall`]; it touches no kernel state.
+///
+/// # Safety
+/// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
+/// a guest `Timespec`, where the time left is written back.
 pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     // SAFETY: the caller's guarantee, passed on.
     with_remaining(timeout, || unsafe { ppoll_wait(fds, nfds, timeout) })

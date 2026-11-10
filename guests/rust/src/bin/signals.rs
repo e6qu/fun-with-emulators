@@ -1180,6 +1180,70 @@ fn main() {
             println!("ppoll {r} errno {}, handled {}", errno(), HITS.load(Ordering::SeqCst));
             wait_status(pid);
         }
+        // The alternate stack's modes, made with the raw call (musl's
+        // wrapper refuses `SS_ONSTACK` itself): `SS_ONSTACK` and
+        // `SS_DISABLE` taken, and `SS_AUTODISARM` disabling the stack while
+        // a handler runs on it, restored after.
+        "altstack" => {
+            const SYS_SIGALTSTACK: i64 = 132;
+            const SS_ONSTACK: i32 = 1;
+            const SS_DISABLE: i32 = 2;
+            const SS_AUTODISARM: i32 = i32::MIN;
+            const SA_ONSTACK: i32 = 0x0800_0000;
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct Stack {
+                sp: usize,
+                flags: i32,
+                size: usize,
+            }
+            const SIZE: usize = 65536;
+            static AREA: AtomicUsize = AtomicUsize::new(0);
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            fn altstack(new: Option<Stack>) -> (i64, Stack) {
+                let mut old = Stack { sp: 0, flags: 0, size: 0 };
+                let new_ptr = new.as_ref().map_or(std::ptr::null(), |s| s as *const Stack);
+                // SAFETY: valid stack_t pointers.
+                let r = unsafe { syscall(SYS_SIGALTSTACK, new_ptr, &mut old as *mut Stack) };
+                (r, old)
+            }
+            extern "C" fn on_alt(_: i32) {
+                let here = 0u8;
+                let at = &here as *const u8 as usize;
+                let area = AREA.load(Ordering::SeqCst);
+                let on = (area..area + SIZE).contains(&at);
+                let disarmed = altstack(None).1.flags & SS_DISABLE != 0;
+                SEEN.store(1 | (on as u64) << 1 | (disarmed as u64) << 2, Ordering::SeqCst);
+            }
+            let area = Box::leak(vec![0u8; SIZE].into_boxed_slice()).as_mut_ptr() as usize;
+            AREA.store(area, Ordering::SeqCst);
+            let stack = |flags| Stack { sp: area, flags, size: SIZE };
+            let onstack = altstack(Some(stack(SS_ONSTACK))).0;
+            let disable = altstack(Some(stack(SS_DISABLE))).0;
+            let disabled = altstack(None).1.flags & SS_DISABLE != 0;
+            let armed = altstack(Some(stack(SS_AUTODISARM))).0;
+            let act = SigAction {
+                handler: on_alt as *const () as usize,
+                mask: SigSet([0; 16]),
+                flags: SA_ONSTACK,
+                restorer: 0,
+            };
+            // SAFETY: a valid sigaction; the handler only reads and stores.
+            unsafe {
+                sigaction(SIGUSR1, &act, std::ptr::null_mut());
+                raise(SIGUSR1);
+            }
+            let seen = SEEN.load(Ordering::SeqCst);
+            let after = altstack(None).1.flags;
+            println!(
+                "onstack {onstack}, disable {disable} disabled {disabled}, autodisarm {armed}: \
+                 handled {}, on it {}, disarmed in it {}, restored {}",
+                seen & 1 != 0,
+                seen & 2 != 0,
+                seen & 4 != 0,
+                after == SS_AUTODISARM
+            );
+        }
         other => {
             eprintln!("unknown scenario {other:?}");
             std::process::exit(2);

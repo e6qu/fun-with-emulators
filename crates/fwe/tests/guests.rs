@@ -2385,6 +2385,18 @@ fn ppoll_applies_its_signal_mask() {
     assert_eq!(signals("ppoll-mask"), "ppoll -1 errno 4, handled 1\n");
 }
 
+/// The alternate signal stack's modes as Linux takes them: `SS_ONSTACK`
+/// and `SS_DISABLE` accepted, and `SS_AUTODISARM` disabling the stack
+/// while a handler runs on it.
+#[test]
+fn the_alternate_stack_takes_linuxs_modes() {
+    assert_eq!(
+        signals("altstack"),
+        "onstack 0, disable 0 disabled true, autodisarm 0: \
+         handled true, on it true, disarmed in it true, restored true\n"
+    );
+}
+
 /// With the default disposition, writing to a pipe without a reader kills
 /// the writer with `SIGPIPE`, as on Linux.
 #[test]
@@ -2826,6 +2838,8 @@ const PTRACE: &str = "stop: signal 19\n\
     thread: events 1, new thread stopped 1, its end 1, exit 5\n\
     waitid: signal true, trapped true, status 19\n\
     step: exit 21, stepped true\n\
+    attach: listed true, tgkill true, attached true, signal 19, pc true, detached true\n\
+    robust lists: process true, thread true\n\
     breakpoint: signal 5, at work true, argument 10, exit 21\n";
 
 /// ptrace: a traced child stops for a signal, has its memory read and
@@ -2837,6 +2851,21 @@ const PTRACE: &str = "stop: signal 19\n\
 fn ptrace_traces_a_child() {
     let out = fwe(&rust_guest("ptrace"), &[]);
     assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What the `robust` guest prints.
+const ROBUST: &str = "exited holder: owner dead true, recovered true\n\
+    killed holder: signal 15, owner dead true, recovered true\n\
+    thread holder: started true, owner dead true, recovered true\n";
+
+/// Robust mutexes whose holder ends without unlocking: a process that
+/// exits or is killed, and a thread that ends with the raw `exit` call,
+/// a waiter woken. The next to lock each learns its owner died.
+#[test]
+fn robust_mutexes_report_a_dead_owner() {
+    let out = fwe(&rust_guest("robust"), &[]);
+    assert_eq!(stdout(&out), ROBUST, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -3557,6 +3586,15 @@ fn hv_process_descriptors_name_processes() {
 fn hv_ptrace_traces_a_child() {
     let Some(out) = fwe_hv(&rust_low_guest("ptrace"), &[]) else { return };
     assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Robust mutexes in the VM (see [`robust_mutexes_report_a_dead_owner`]):
+/// the futex words are released through the guest's translated memory.
+#[test]
+fn hv_robust_mutexes_report_a_dead_owner() {
+    let Some(out) = fwe_hv(&rust_low_guest("robust"), &[]) else { return };
+    assert_eq!(stdout(&out), ROBUST, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

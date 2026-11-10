@@ -6,52 +6,32 @@ kernel: like Wine, but for Linux. Written in Rust.
 
 ## How it works
 
-A Mac with Apple Silicon has the same processor architecture as an arm64
-Linux machine, so a Linux program's instructions can run on it directly.
-What differs is the kernel. `fwe` plays the Linux kernel: each guest
-process is one `fwe` process, which catches every system call the program
-makes, carries it out with macOS's own calls, and turns what macOS reports
-(signals, key strokes, children ending, errors) into what Linux would have
-said. Files, sockets and terminals are the host's; what macOS lacks or
-shapes differently (namespaces, cgroups, epoll, inotify, System V IPC,
-keyrings and more) `fwe` provides itself, shared between its processes.
+An Apple Silicon Mac has the same processor architecture as an arm64 Linux
+machine, so a Linux program's instructions run on it directly; what differs
+is the kernel. `fwe` plays the Linux kernel: each guest process is one `fwe`
+process, which carries out the program's system calls with macOS's own and
+provides itself what macOS lacks (namespaces, cgroups, epoll, inotify,
+System V IPC, keyrings and more). A program runs in one of two backends:
 
-Programs run in one of two backends, chosen per program:
+- **Native**, inside the `fwe` process, for every position-independent
+  program, which is most of what a distribution ships. `fwe` first rewrites
+  the few instructions macOS cannot let a Linux program run unchanged.
+- **Hypervisor**, for a program linked at a fixed address below 4 GiB,
+  which macOS reserves: it runs unmodified in a small Hypervisor.framework
+  VM, its system calls served by the same code. `fwe` must be signed with
+  the hypervisor entitlement for this
+  ([docs/hypervisor.md](docs/hypervisor.md)).
 
-- **Native.** The program runs inside the `fwe` process, on the CPU, at
-  native speed. Before its code may execute, `fwe` rewrites the few
-  instructions macOS cannot let a Linux program run unchanged: each
-  system call (`svc #0`) becomes a trap into `fwe`, and accesses to the
-  thread pointer and to the `x18` register, which macOS reserves, go
-  through short stubs. Every position-independent program runs this way,
-  which is most of what a Linux distribution ships.
-- **Hypervisor.** A program linked at a fixed address below 4 GiB cannot
-  be placed in a macOS process, which reserves that range. `fwe` runs it
-  in a small Hypervisor.framework VM instead: the program's code runs
-  unmodified at EL0 with an address space of its own, and each system
-  call leaves the VM and is served by the same code as in the native
-  backend.
-
-[docs/linux-on-macos.md](docs/linux-on-macos.md) explains all of this in
-detail.
+[docs/linux-on-macos.md](docs/linux-on-macos.md) explains this in detail.
 
 ## Status
 
-Unmodified Debian `aarch64` programs run natively, against a genuine glibc
-(musl works too): coreutils, bash, git, SQLite, lighttpd, Node.js, rustc
-with Cargo, and apt.
-
-Executables linked below 4 GiB run in a Hypervisor.framework VM:
-- that covers Debian's Python, GCC, clang and Go;
-- `fwe` must be signed with the hypervisor entitlement for this
-  ([docs/hypervisor.md](docs/hypervisor.md));
-- it is verified on a software stand-in for the framework, not yet on real
-  hardware.
-
-Container engines run standard images: crun, podman and containerd run
-`alpine`.
-
-LTP's system-call tests pass at 1160 of 1551 (99.7% of those that apply).
+Unmodified Debian programs run natively against glibc or musl (coreutils,
+bash, git, SQLite, lighttpd, Node.js, rustc with Cargo, apt) and in the VM
+(Python, GCC, clang, Go; verified on a software stand-in for the framework,
+not yet on real hardware). crun, podman and containerd run the `alpine`
+image. LTP's system-call tests pass at 1161 of the 1164 that apply.
+[ROADMAP.md](ROADMAP.md) has the details and what is left to 1.0.
 
 ## Documentation
 
@@ -59,7 +39,7 @@ LTP's system-call tests pass at 1160 of 1551 (99.7% of those that apply).
 |---|---|
 | [PLAN.md](PLAN.md) | Goal, approach, scope and the 1.0 finish line |
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
-| [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run in which backend, which instructions are rewritten, how the VM is used; how each Linux concept (system calls, memory, processes, signals, namespaces, cgroups…) maps onto macOS, and how host events (signals, key strokes, children ending, errors…) reach the guest |
+| [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run where, which instructions are rewritten, how the VM is used, and how each Linux concept maps onto macOS |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
@@ -98,12 +78,10 @@ Debian rootfs.
 cargo test
 ```
 
-On Apple Silicon macOS this includes the end-to-end tests:
-- They build the programs in `guests/`, which needs `clang` from the Xcode
-  command line tools, and run them under `fwe`.
-- The hypervisor backend's tests run on a software stand-in, which needs
-  `brew install unicorn`. They never use a real VM unless asked to.
-
+On Apple Silicon macOS this includes the end-to-end tests, which build the
+programs in `guests/` (needing `clang` from the Xcode command line tools)
+and run them under `fwe`. The hypervisor backend's tests run on a software
+stand-in (`brew install unicorn`), never on a real VM unless asked to.
 Elsewhere only the unit tests run. [AGENTS.md](AGENTS.md) lists every check
 CI runs.
 

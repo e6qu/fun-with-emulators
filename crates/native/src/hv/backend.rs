@@ -375,7 +375,12 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     if sig == host::WAKE_SIGNAL {
         // Signals the host lacks, queued by another process.
         fwe_kernel::signote::drain(|lsig, note| {
-            thread::post_landed(lsig, host::sent_info(note));
+            // One for a thread of this process goes to it, if it is there.
+            if note.tid != 0 {
+                thread::post_directed(note.tid, lsig, host::sent_info(note));
+            } else {
+                thread::post_landed(lsig, host::sent_info(note));
+            }
         });
     } else {
         // The host's own SIGINFO (Ctrl-T), no relay: nothing on Linux.
@@ -1223,6 +1228,8 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     // runnable, there is no way back.
     let state = k.exec_state();
     let before_exec = || {
+        // The robust futexes its threads hold, while its memory is there.
+        fwe_kernel::release_robust_lists();
         // A vfork child's changes reach its parent before it goes on.
         mem::finish_lazy();
         teardown();

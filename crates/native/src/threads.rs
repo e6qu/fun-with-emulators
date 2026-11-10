@@ -50,9 +50,8 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         let (share, wait) = (flags & cl::CLONE_VM != 0, flags & cl::CLONE_VFORK != 0);
         return crate::process::do_fork(parent, a, share, wait);
     }
-    if flags & cl::CLONE_VM == 0 {
-        return err(errno::ENOSYS);
-    }
+    // A thread shares the memory: `CloneArgs::check` refused `CLONE_THREAD`
+    // without `CLONE_SIGHAND` and `CLONE_VM` (`EINVAL`), as Linux does.
     if flags & !SUPPORTED & !cl::CSIGNAL != 0 {
         return err(errno::ENOSYS);
     }

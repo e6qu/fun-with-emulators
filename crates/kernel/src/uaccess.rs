@@ -204,6 +204,9 @@ mod imp {
     // between `_fwe_uaccess_start` and `_fwe_uaccess_fault`; a fault there
     // resumes at `_fwe_uaccess_fault`, which returns 1 to the caller (the
     // routine is a leaf, so `lr` still holds the return address).
+    // fwe_uaccess_cas32(ptr, expected, new, old) -> 0, or 1 if the access
+    // faulted: an atomic compare-and-swap of a 32-bit word, the value it
+    // held stored at `old`. A leaf in the same range.
     core::arch::global_asm!(
         ".p2align 2",
         ".globl _fwe_uaccess_copy",
@@ -224,6 +227,12 @@ mod imp {
         "    b.ne 3b",
         "4:  mov x0, #0",
         "    ret",
+        ".globl _fwe_uaccess_cas32",
+        "_fwe_uaccess_cas32:",
+        "    casal w1, w2, [x0]",
+        "    str w1, [x3]",
+        "    mov x0, #0",
+        "    ret",
         ".globl _fwe_uaccess_fault",
         "_fwe_uaccess_fault:",
         "    mov x0, #1",
@@ -232,6 +241,7 @@ mod imp {
 
     unsafe extern "C" {
         fn fwe_uaccess_copy(dst: *mut u8, src: *const u8, len: usize) -> u64;
+        fn fwe_uaccess_cas32(ptr: *mut u32, expected: u32, new: u32, old: *mut u32) -> u64;
         static fwe_uaccess_start: u8;
         static fwe_uaccess_fault: u8;
     }
@@ -244,6 +254,19 @@ mod imp {
         // SAFETY: the routine only touches the two ranges; a fault in it is
         // recovered by the backend (see `fixup`).
         unsafe { fwe_uaccess_copy(dst, src, len) == 0 }
+    }
+
+    /// Compare-and-swap the word at `ptr`: the value it held, or `None` if
+    /// the access faulted.
+    ///
+    /// # Safety
+    /// `ptr` must be 4-byte aligned; a fault there is recovered.
+    pub unsafe fn cas32(ptr: *mut u32, expected: u32, new: u32) -> Option<u32> {
+        let mut old = 0u32;
+        // SAFETY: the routine touches only `ptr` and `old`; a fault at
+        // `ptr` is recovered by the backend (see `fixup`).
+        let r = unsafe { fwe_uaccess_cas32(ptr, expected, new, &mut old) };
+        (r == 0).then_some(old)
     }
 
     pub fn fixup(pc: u64) -> Option<u64> {
@@ -263,6 +286,17 @@ mod imp {
         // SAFETY: guaranteed by the caller.
         unsafe { std::ptr::copy(src, dst, len) };
         true
+    }
+
+    /// Compare-and-swap the word at `ptr` (unchecked on this host).
+    ///
+    /// # Safety
+    /// `ptr` must be valid and 4-byte aligned.
+    pub unsafe fn cas32(ptr: *mut u32, expected: u32, new: u32) -> Option<u32> {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // SAFETY: guaranteed by the caller.
+        let word = unsafe { AtomicU32::from_ptr(ptr) };
+        Some(word.compare_exchange(expected, new, SeqCst, SeqCst).unwrap_or_else(|v| v))
     }
 
     pub fn fixup(_pc: u64) -> Option<u64> {
@@ -312,6 +346,20 @@ unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Res
         done += n;
     }
     Ok(())
+}
+
+/// Atomically set the guest's 32-bit word at `addr` to `new` if it holds
+/// `expected`: the value it held, or `EFAULT` (also for a word not
+/// aligned).
+pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32> {
+    let addr = guest_of(addr);
+    if addr % 4 != 0 || addr >= 1 << 48 {
+        return Err(errno::EFAULT);
+    }
+    check(valid(addr, 4, true))?;
+    let host = run(addr).0;
+    // SAFETY: an aligned guest word, validated; a fault is recovered.
+    unsafe { imp::cas32(host as *mut u32, expected, new) }.ok_or(errno::EFAULT)
 }
 
 /// Copy `src` to host address `dst`, a guest buffer already translated

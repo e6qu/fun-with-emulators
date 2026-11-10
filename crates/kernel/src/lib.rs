@@ -868,6 +868,9 @@ pub fn thread_exit_cleanup() {
     }
     // A traced thread's tracer learns of its end.
     ptrace::thread_exiting();
+    // The robust futexes it still holds, then its `set_tid_address` word,
+    // as Linux releases them.
+    futex::release_robust(thread::take_robust_list(), thread::tid());
     thread::unregister_current();
     let addr = thread::clear_child_tid();
     if addr != 0 {
@@ -875,6 +878,16 @@ pub fn thread_exit_cleanup() {
         if uaccess::write(addr, 0u32).is_ok() {
             wake_futex(addr, 1);
         }
+    }
+}
+
+/// Release every thread's robust futexes (`set_robust_list`) as the
+/// process ends or runs another program, its memory still there: Linux
+/// releases each thread's as the thread ends.
+pub fn release_robust_lists() {
+    futex::release_robust(thread::take_robust_list(), thread::tid());
+    for (tid, head) in thread::take_others_robust() {
+        futex::release_robust(head, tid);
     }
 }
 
@@ -959,10 +972,12 @@ pub fn wake_futex(addr: u64, count: u32) {
 
 /// Run a system call that must not hold the kernel lock because it can block:
 /// `futex`, the sleeps, `epoll_pwait`, `ppoll`, `rt_sigsuspend`, the socket
-/// calls that wait, `flock` and `fcntl`'s `F_SETLKW` and `F_OFD_SETLKW` (waiting for another
-/// process's lock), and `read`/`write` and their vectored and positioned forms (a pipe, socket
-/// or terminal blocks until the other side acts, and the other side may be a
-/// guest thread that needs the lock). Returns `None` for any other call,
+/// calls that wait, `flock` and `fcntl`'s `F_SETLKW` and `F_OFD_SETLKW`
+/// (waiting for another process's lock), `read`/`write` and their vectored
+/// and positioned forms, and the copies between descriptors (`sendfile`,
+/// `splice`, `tee`, `vmsplice`, `copy_file_range`): a pipe, socket or
+/// terminal blocks until the other side acts, and the other side may be a
+/// guest thread that needs the lock. Returns `None` for any other call,
 /// which the backend runs under the lock through [`Kernel::enter_syscall`].
 ///
 /// # Safety

@@ -2,26 +2,28 @@
 
 ## Summary
 
-Most Linux programs run in fwe's native backend, inside the fwe process.
-One kind cannot: a non-position-independent executable linked below
-4 GiB, such as Debian's `python3.11`, GCC and clang at `0x400000` or
-static Go programs at `0x10000`. macOS reserves the low 4 GiB of every
-arm64 process (`__PAGEZERO`, which Apple's loader will not let a program
-shrink on Apple Silicon), and such a program has no relocations that would
-let it run anywhere else. fwe runs these programs in a small virtual
-machine made with Hypervisor.framework, where the guest has an address
-space of its own, and picks this backend automatically.
+fwe runs a non-position-independent executable linked below 4 GiB, such
+as Debian's `python3.11`, GCC and clang at `0x400000` or static Go
+programs at `0x10000`, in a small virtual machine made with
+Hypervisor.framework, and picks this backend for it automatically. macOS
+reserves the low 4 GiB of every arm64 process (`__PAGEZERO`, which
+Apple's loader will not let a program shrink on Apple Silicon), and such a
+program has no relocations that would let it run anywhere else; in the VM
+the guest has an address space of its own.
 
 The VM runs only the guest's CPU and memory. It has no Linux kernel in it:
 every system call leaves the VM and goes to the same kernel crate the
-native backend uses. How the VM is used — the vCPUs, fwe's exception
+native backend uses. How the VM is used (the vCPUs, fwe's exception
 vector, the two stages of address translation, system calls, timers and
-signals — is explained for a reader new to it in
+signals) is explained in
 [linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used), and
 how its memory, fork and execve compare with Linux and the native backend
-in the same document's [Memory](linux-on-macos.md#memory) and
-[Processes](linux-on-macos.md#processes) sections. This document holds
-what is particular to the backend:
+in that document's [Memory](linux-on-macos.md#memory) and
+[Processes](linux-on-macos.md#processes) sections. Where the backend
+differs from Linux is in
+[architecture.md](architecture.md#known-limitations), and whether it is
+verified on real hardware in the [roadmap](../ROADMAP.md). This document
+holds:
 
 - the rules its implementation keeps ([How it works](#how-it-works));
 - why misusing the framework is dangerous and the rules that prevent it
@@ -46,7 +48,7 @@ mapped once and then only the guest's own page tables change.
   memory, mapped whole) and fwe's region (the page-table pool and a code
   page). Only shared segments add and remove mappings of their own. The
   framework keeps the host pages it found when a range was mapped, so the
-  host memory behind stage 2 never changes either.
+  host memory behind stage 2 must not change either.
 - **Stage 1** (`pagetables.rs`): 4 KiB pages in a 40-bit space, each with
   its EL0 permissions and BTI guard, written with single 64-bit stores, a
   new table filled before it is linked in. Taking access away bumps a
@@ -60,9 +62,9 @@ mapped once and then only the guest's own page tables change.
   answered with one flush and a retry.
 - **Memory** (`mem.rs`): the kernel's memory calls go to the backend
   (`Platform::memory`), which keeps the guest's mappings
-  (`crates/kernel/src/vmas.rs`) and edits stage 1; host memory is never
-  replaced behind the VM. A `MAP_FIXED` mapping over slab memory at its own
-  address keeps using that memory, zeroed, so translated ranges stay rare.
+  (`crates/kernel/src/vmas.rs`) and edits stage 1. A `MAP_FIXED` mapping
+  over slab memory at its own address keeps using that memory, zeroed, so
+  translated ranges stay rare.
   The framework maps only host memory that may be written, which a shared
   mapping of a file opened read-only is not: such a segment is made of the
   same file opened again for writing (checked to be the same file; an
@@ -70,8 +72,8 @@ mapped once and then only the guest's own page tables change.
   may not write, of a private copy.
 - **Pointer authentication and BTI**, where the vCPUs' ID registers offer
   them (see [linux-on-macos.md](linux-on-macos.md#cache-maintenance-pac-and-bti)).
-- **Signals, threads, `execve` and `fork`** are explained in
-  linux-on-macos.md: a signal stops the vCPU with `hv_vcpus_exit` and the
+- **Signals, threads, `execve` and `fork`** (explained in
+  linux-on-macos.md): a signal stops the vCPU with `hv_vcpus_exit` and the
   run loop delivers it, while the framework's own threads block every
   guest signal ([Signals into a running vCPU](linux-on-macos.md#signals-into-a-running-vcpu));
   each guest thread has a vCPU of its own, created on it
@@ -135,8 +137,8 @@ change stage 2 or the host memory behind it while the VM runs, and give a
 fork child a copy rather than pages mapped into two VMs. fwe does the same,
 and keeps these rules:
 
-- **A plain `cargo test` never starts a VM.** The VM tests run on a
-  software stand-in (below), and on the real framework only with
+- **A plain `cargo test` never starts a VM.** The VM tests run on the
+  [stand-in](#the-stand-in), and on the real framework only with
   `FWE_HV_TESTS=1`, which only a machine whose crash costs nothing should
   set.
 - **Every way out tears the VM down first:** `exit_group`, the last
@@ -179,20 +181,11 @@ and keeps these rules:
 
 Keep to these when changing the backend.
 
-## Status
-
-Programs linked below 4 GiB run in the VM: static and dynamic, with
-threads, signals, `execve` in both directions, `fork` and `vfork`. Debian's
-Python, GCC, clang and Go pass their tests there. All of it is verified on
-the stand-in; the run on real hardware, in the self-hosted `hypervisor`
-job, waits for a runner to be registered. The differences from Linux that
-remain are in [architecture.md](architecture.md#known-limitations).
-
 ## The stand-in
 
-The real framework cannot be used in hosted CI, and should not be used on
-a development Mac. So the backend can run on a software imitation of the
-framework instead: `fwe --hv-standin` sends every framework call
+The real framework is unavailable in hosted CI and must not be used on a
+development Mac, so the backend can also run on a software imitation of
+it: `fwe --hv-standin` sends every framework call
 (`crates/native/src/hv/standin.rs`) to an emulated CPU, Unicorn (QEMU's
 CPU emulator as a library, `brew install unicorn`), loaded only in this
 mode. It creates no VM, so it is safe on any Mac and runs in hosted CI; the
@@ -238,15 +231,13 @@ tests fail:
 A refused `hv_vm_map` is reported and fails as the framework fails it:
 misaligned (16 KiB), overlapping, or over host memory that is unmapped or
 could never be readable and writable. That last rule is inferred from the
-framework's behaviour; `fwe --probe hv-map-rules` compares the two on real
-hardware, in the `hypervisor` job. The stand-in's unit test breaks each
-rule on purpose. `FWE_STANDIN_DEBUG=1` reports each exception and exit it
-models.
+framework's behaviour, and checked against it on real hardware (below).
+The stand-in's unit test breaks each rule on purpose.
+`FWE_STANDIN_DEBUG=1` reports each exception and exit it models.
 
 A stand-in proves nothing about the real framework: its rules are what fwe
 has seen the framework do, and the kernel crashes the backend may cause
-cannot happen in it. So VM changes are also run on real hardware, on a
-machine whose crash costs nothing, instrumented (below).
+cannot happen in it. So VM changes are also run on real hardware (below).
 - **Not modelled:** the virtual timer, the fault address of an alignment
   fault outside the exclusive and atomic instructions, stack-pointer
   alignment checks, and code one vCPU writes for another without a mapping
@@ -259,7 +250,7 @@ machine whose crash costs nothing, instrumented (below).
 ## Real-hardware runs and the flight recorder
 
 Real runs happen on a machine whose crash costs nothing (the self-hosted
-runner of the `hypervisor` job, such as a rented bare-metal Mac) and are
+runner of the `hypervisor` job, such as a rented bare-metal Mac), and are
 instrumented. A crash leaves no stackshot and loses the last seconds of the
 system log, so fwe keeps the evidence itself:
 
@@ -304,11 +295,10 @@ target/release/fwe ./program-linked-low
 
 ## Tests and CI
 
-The backend's end-to-end tests run on the stand-in unless asked for the
-real framework:
+The end-to-end tests named `hv_*` run low-linked programs in the VM
+backend:
 
-- The end-to-end tests named `hv_*` run low-linked programs in the VM
-  backend, by default on the stand-in with the unsigned `fwe`, which could
+- By default they run on the stand-in with the unsigned `fwe`, which could
   not create a real VM even by mistake (the tests check it carries no
   entitlement).
 - With `FWE_HV_TESTS=1` they sign a copy of `fwe` with the entitlement and

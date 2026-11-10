@@ -21,7 +21,7 @@
 
 use crate::shared::{wait_word_for, wake_word};
 use fwe_abi::errno;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 pub const PTRACE_TRACEME: u64 = 0;
@@ -248,9 +248,14 @@ fn tracer() -> i32 {
     TRACER.with(std::cell::Cell::get)
 }
 
+/// The host's signal dispositions are to be set again: a thread began or
+/// ended being traced ([`crate::Kernel::resync_for_tracing`]).
+static RESYNC: AtomicBool = AtomicBool::new(false);
+
 /// This thread traced (or not any more).
 fn set_traced(on: bool) {
     if TRACED.with(|t| t.replace(on)) != on {
+        RESYNC.store(true, Ordering::Release);
         if on {
             ANY.fetch_add(1, Ordering::AcqRel);
         } else {
@@ -1050,6 +1055,12 @@ pub fn traces(pid: i32) -> bool {
 /// with this process as its tracer, ready for the SIGSTOP the caller sends
 /// it, which it stops for ([`attached`]).
 pub fn attach(pid: i32) -> Result<(), i32> {
+    attach_id(pid, pid)
+}
+
+/// [`attach`] of tracee `id` (a thread's tid, or a process's pid) of host
+/// process `proc`.
+fn attach_id(pid: i32, proc: i32) -> Result<(), i32> {
     if is_traced(pid) {
         return Err(errno::EPERM);
     }
@@ -1058,7 +1069,7 @@ pub fn attach(pid: i32) -> Result<(), i32> {
         mb.word(w).store(0, Ordering::Release);
     }
     mb.word(W_TRACER).store(me() as u64, Ordering::Release);
-    mb.word(W_PROC).store(pid as u64, Ordering::Release);
+    mb.word(W_PROC).store(proc as u64, Ordering::Release);
     let inbox = open(&inbox_name(me()), true).ok_or(errno::ENOMEM)?;
     let slots = &inbox.0[1..];
     if !slots.iter().any(|s| s.load(Ordering::Acquire) == pid as u64)
@@ -1071,15 +1082,18 @@ pub fn attach(pid: i32) -> Result<(), i32> {
     Ok(())
 }
 
-/// Whether taking `sig` begins this process's tracing: a SIGSTOP a tracer
+/// Whether taking `sig` begins this thread's tracing: a SIGSTOP a tracer
 /// sent as it attached (its mailbox names a live tracer).
 pub fn attached(sig: u64) -> bool {
-    if sig != fwe_abi::signal::SIGSTOP || traced() || self_id() != me() {
+    if sig != fwe_abi::signal::SIGSTOP || traced() {
         return false;
     }
-    let Some(mb) = open(&mailbox_name(me()), false) else { return false };
+    let Some(mb) = open(&mailbox_name(self_id()), false) else { return false };
     let tracer = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
     if tracer <= 0 || !alive(tracer) {
+        return false;
+    }
+    if mb.word(W_STATE).load(Ordering::Acquire) == EXITED {
         return false;
     }
     mb.word(W_PROC).store(me() as u64, Ordering::Release);
@@ -1098,7 +1112,9 @@ impl<P: crate::Platform> crate::Kernel<P> {
     }
 
     /// [`stop`], with the calling thread's thread pointer, which the tracer
-    /// may read and change.
+    /// may read and change; the host's signal dispositions set again where
+    /// a thread began or ended being traced (the host catches every signal
+    /// while one is).
     fn stop_with_tls(
         &mut self,
         regs: &mut crate::Regs,
@@ -1106,11 +1122,17 @@ impl<P: crate::Platform> crate::Kernel<P> {
         siginfo: &[u8; 128],
         event: u64,
     ) -> Resume {
+        if RESYNC.swap(false, Ordering::AcqRel) {
+            self.resync_for_tracing();
+        }
         let mut tls = self.platform.thread_pointer();
         let before = tls;
         let r = stop(regs, &mut tls, status, siginfo, event);
         if tls != before {
             self.platform.set_thread_pointer(tls);
+        }
+        if RESYNC.swap(false, Ordering::AcqRel) {
+            self.resync_for_tracing();
         }
         r
     }
@@ -1123,15 +1145,8 @@ impl<P: crate::Platform> crate::Kernel<P> {
         sig: u64,
         info: crate::thread::SigInfo,
     ) -> Option<(u64, crate::thread::SigInfo)> {
-        if !traced() {
-            // Just attached: the host catches every signal from now on.
-            self.resync_for_tracing();
-        }
         let si = crate::signal::siginfo_bytes(sig, info);
         let r = self.stop_with_tls(regs, stop_status(sig, 0), &si, 0);
-        if !traced() {
-            self.resync_for_tracing();
-        }
         let to = r.signal();
         if to == 0 || to > fwe_abi::signal::NSIG {
             return None;
@@ -1231,7 +1246,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// `ptrace_may_access` for attaching): `CAP_SYS_PTRACE`, or the same
     /// real, effective and saved ids as the target's, and the target
     /// dumpable.
-    fn may_trace(&self, target: i32) -> bool {
+    pub(crate) fn may_trace(&self, target: i32) -> bool {
         if self.creds.has(crate::caps::CAP_SYS_PTRACE) {
             return true;
         }
@@ -1255,6 +1270,23 @@ impl<P: crate::Platform> crate::Kernel<P> {
                     self.resync_for_tracing();
                     0
                 }
+                Err(e) => err(e),
+            };
+        }
+        // A thread of another process, attached to on its own: fwe's
+        // SIGSTOP for it, through its process's queue.
+        if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE)
+            && let Some(owner) = crate::thread::owner_of_tid(pid as i32)
+        {
+            if owner == me() || !self.may_trace(owner) {
+                return err(errno::EPERM);
+            }
+            if let Err(e) = attach_id(pid as i32, owner) {
+                return err(e);
+            }
+            let stop = fwe_abi::signal::SIGSTOP;
+            return match crate::signote::queue_thread(owner, pid as i32, stop, 0, 0) {
+                Ok(()) => crate::host::kill_process(owner, crate::host::WAKE_SIGNAL),
                 Err(e) => err(e),
             };
         }

@@ -1,9 +1,9 @@
 # Roadmap
 
 A milestone is done when its **Done when** criteria pass as end-to-end tests
-in CI; its checklist is the work that gets there. [PLAN.md](PLAN.md) states
-the goal and the 1.0 finish line; [docs/architecture.md](docs/architecture.md)
-describes how each part works and lists the current limitations in detail.
+in CI. [PLAN.md](PLAN.md) states the goal and the 1.0 finish line;
+[docs/architecture.md](docs/architecture.md) lists the current limitations
+in detail.
 
 ## Status
 
@@ -11,176 +11,128 @@ describes how each part works and lists the current limitations in detail.
 |---|---|
 | M0 Foundation | Done |
 | M1 Core userland | Done |
-| M2 Everyday software | Done except one item: the VM backend's run on real hardware |
+| M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests at 1160 of 1551 (99.7% of the 1164 that apply) |
+| M4 Compatibility | In progress: LTP's system-call tests pass at 1161 of the 1164 that apply (1551 run) |
 | M5 Release | Not started |
 
-What runs, unmodified, with its output checked in CI:
+What runs unmodified, with its output checked in CI:
 - **Natively, in-process:** Debian's coreutils, bash, git, SQLite, lighttpd,
   Node.js (V8's JIT), rustc with Cargo, and apt.
-- **In the VM:** Python, GCC, clang and Go, for executables linked below
-  4 GiB. These pass on the software stand-in for Hypervisor.framework only.
+- **In the VM**, for executables linked below 4 GiB: Debian's Python, GCC,
+  clang and Go, on the software stand-in for Hypervisor.framework only.
 - **Containers:** crun, podman and containerd run the `alpine` image.
 
 ## Done
 
-**M0 — Foundation.** Rust workspace; CI on macOS 15 and 26 plus a Linux
-unit-test job; ELF loading; system calls trapped by rewriting `svc #0`; an
-end-to-end harness of assembly and Rust guests. *A static Linux binary
-prints "hello".*
+**M0 — Foundation.** CI on macOS 15 and 26 plus a Linux unit-test job; ELF
+loading; system calls trapped by rewriting `svc #0`; an end-to-end harness
+of assembly and Rust guests. *A static Linux binary prints "hello".*
 
 **M1 — Core userland.** Processes and threads (`clone`, futexes, `fork`,
-`execve`, `wait4`), memory, files on a Linux root filesystem confined to it,
-signals with Linux's frame layout, pipes, rewriting of what macOS cannot run
-unchanged (`svc`, `TPIDR_EL0`, `x18`), and real glibc and musl dynamic
-linking. *bash and coreutils run from a Debian rootfs.*
+`execve`, `wait4`), memory, files confined to a Linux root filesystem,
+signals with Linux's frame layout, pipes, rewriting of `svc`, `TPIDR_EL0`
+and `x18`, and glibc and musl dynamic linking. *bash and coreutils run from
+a Debian rootfs.*
 
-**M2 — Everyday software** (all but the real-hardware run):
-- networking (TCP, UDP, IPv4 and IPv6, `AF_UNIX` with descriptor passing);
-- terminals, ptys and job control;
-- `epoll`, `eventfd`, `timerfd` and `signalfd`;
-- the `/proc` and `/sys` programs read;
-- virtual credentials;
-- signals between processes and per thread;
-- the process model shells and spawners need (`vfork`, `posix_spawn`,
-  `execveat`, `clone3`);
-- `EFAULT` for bad pointers;
-- fwe's own descriptors out of the guest's reach;
-- the hypervisor backend for executables linked below 4 GiB, with threads,
-  `fork`, `vfork` and `execve` in both directions, pointer authentication
-  and BTI.
-
-*The target programs (git, compilers, Node, Go, Rust, apt, a database, a web
-server) run unmodified.*
+**M2 — Everyday software**, but for the real-hardware run. Networking (TCP,
+UDP, IPv4, IPv6, `AF_UNIX` with descriptor passing); terminals, ptys and
+job control; `epoll`, `eventfd`, `timerfd`, `signalfd`; the `/proc` and
+`/sys` programs read; virtual credentials; signals between processes and
+threads; `vfork`, `posix_spawn`, `execveat`, `clone3`; `EFAULT` for bad
+pointers; fwe's own descriptors out of the guest's reach; the hypervisor
+backend for executables linked below 4 GiB, with threads, `fork`, `vfork`,
+`execve` in both directions, pointer authentication and BTI. *The target
+programs (git, compilers, Node, Go, Rust, apt, a database, a web server) run
+unmodified.*
 
 **M3 — Containers.** Mount, pid, user, UTS, IPC, network and cgroup
 namespaces; cgroups v2 with device programs; overlay mounts; seccomp and
 capabilities. *crun, podman and containerd run standard images.*
 
-**M4, done:**
-- the LTP system-call suite in CI against a baseline, and the bugs it found;
-- `preadv`/`pwritev` and their `2` forms;
-- priorities and CPU-time clocks;
-- the `fcntl` owner, signal, lease and pipe-size commands;
-- futex requeue and bitsets;
-- System V IPC per IPC namespace;
-- `/proc/<pid>/maps` and `smaps` with `PROCMAP_QUERY`;
-- the `mlock` family with locked-memory accounting;
-- `mincore` and `fadvise64`;
-- loop devices (`/dev/loop-control`, `/dev/loopN`, the `LOOP_*` and
-  `BLK*` requests, `/sys/block`), on which LTP's device tests run with
-  tmpfs;
-- `splice`, `tee` and `vmsplice`; `personality`; the scheduling policies
-  (`sched_setattr` and the rest); the clock refused as Linux refuses it
-  without `CAP_SYS_TIME`;
-- POSIX message queues per IPC namespace, with notifications across
-  processes (a signal with its value, or the C library's thread through a
-  netlink socket), or a real-time signal;
-- the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`,
-  `open_tree`, `move_mount`, `mount_setattr`, `statmount`, `listmount`),
-  with peer groups kept and mount ids in `statx`;
-- namespace descriptors: `/proc/<pid>/ns/*` opened, `setns` and the
-  `NS_GET_*` requests;
-- inotify, its events raised by fwe from every process's file calls;
-- keys and keyrings (`add_key`, `request_key`, `keyctl`), shared by every
-  process, with Diffie-Hellman, asymmetric and encrypted keys;
-- mounts as Linux has them: propagation (between peers, to slaves, across
-  namespaces), the `nodev`, `noexec`, `nosymfollow` and access-time flags
-  acted on, busy mounts refused, `MNT_EXPIRE`, and `pivot_root` of a
-  chroot;
-- real-time signals across processes (`rt_sigqueueinfo`,
-  `rt_tgsigqueueinfo`), core dumps with the core-dump bit, the core,
-  stack, CPU and process-count limits, `clone3` into a cgroup and with
-  handlers cleared, `CLONE_VM` processes, and `getcpu`, `syslog`,
-  `membarrier`, `readahead`, `sync_file_range` and `vhangup`;
-- `openat2` with its `resolve` rules, `epoll_pwait2`, `mseal`,
-  `futex_waitv` and `remap_file_pages`;
-- process descriptors: `pidfd_open`, `CLONE_PIDFD`, `pidfd_send_signal`,
-  `pidfd_getfd`, `waitid(P_PIDFD)`, `PIDFD_GET_INFO` and the namespace
-  requests, and `setns` with one;
-- sleeps and timeouts on time (a precise host timer per thread), `poll`
-  and `select` events as Linux reports them, timerfd's checks and flags,
-  and shared futexes requeued;
-- a pipe's capacity held to what `F_SETPIPE_SZ` set, and edge-triggered
-  `epoll` on a pipe as Linux reports it;
-- sockets checked and numbered as Linux has them: arguments in Linux's
-  order, the IP, IPv6, TCP and socket options translated, `MSG_MORE`,
-  `sendmmsg`/`recvmmsg`, `connect` to `AF_UNSPEC`, `IPV6_ADDRFORM`,
-  abstract names freed with their socket, and the interface requests;
-- memory calls as Linux has them: `mremap` grows and moves mappings,
-  `madvise` and `msync` checked per mapping, `MADV_WIPEONFORK`,
-  `MADV_HWPOISON`, stacks that grow down, and shared `/dev/zero`;
-- ownership for a guest that is not root: owners kept and shown by `stat`,
-  `chown` and creation as Linux has them, and Linux's permission checks
-  (opening, directories' entries and search bits, the sticky bit, `chmod`,
-  `utimensat`, extended attributes, `execve`).
+**M4 — Compatibility, delivered so far.** LTP's system-call suite runs in CI
+against a baseline. Beyond M3:
+- **Processes and signals:** process descriptors (`pidfd_*`,
+  `CLONE_PIDFD`, `waitid(P_PIDFD)`); real-time signals across processes;
+  the parent-death signal; core dumps; resource limits; `CLONE_VM`
+  processes; priorities, scheduling policies and CPU-time clocks; POSIX
+  timers; ptrace of processes and threads (see below); robust futexes
+  released as their owner ends, and `get_robust_list` of any thread;
+  zombies in `/proc`.
+- **Memory:** `mremap`, `madvise` and `msync` as Linux has them; the `mlock`
+  family with accounting; `mincore`; `mseal`; `remap_file_pages`;
+  `/proc/<pid>/maps`, `smaps` with `PROCMAP_QUERY`, `/proc/self/mem` and
+  `pagemap`.
+- **Files:** `preadv2`/`pwritev2`; `openat2`; `O_TMPFILE`; file handles;
+  `ETXTBSY`; `fcntl` owners, signals, OFD locks, leases and pipe sizes;
+  `splice`, `tee`, `vmsplice`; inotify; owners and Linux's permission
+  checks for a guest that is not root; loop devices.
+- **Mounts and namespaces:** the new mount API (`fsopen` to `listmount`);
+  propagation and mount flags acted on; `pivot_root` of a chroot; namespace
+  descriptors with `setns` and the `NS_GET_*` requests.
+- **IPC and sockets:** System V IPC and POSIX message queues per IPC
+  namespace; keys and keyrings; socket arguments, options and requests as
+  Linux checks them; `sendmmsg`/`recvmmsg`; eBPF maps and socket filters.
+- **Waiting and time:** sleeps, timeouts, `poll`, `select` and timerfd as
+  Linux reports them; `epoll_pwait2`; `futex_waitv`, requeue, bitsets and
+  shared futexes.
+- **Other calls:** `personality`, `getcpu`, `syslog`, `membarrier`,
+  `readahead`, `sync_file_range`, `vhangup`, `reboot`, strict seccomp, and
+  the clock refused as Linux refuses it without `CAP_SYS_TIME`.
 
 ## Left to 1.0
 
 ### M2 — finish
 
-- [ ] The VM backend verified on real hardware: the `hv_` tests and
-  `fwe --hv-spike` pass in the self-hosted `hypervisor` job. The machine
-  must be one whose crash costs nothing, such as a rented bare-metal Mac
-  ([docs/hypervisor.md](docs/hypervisor.md)), never the development Mac.
-  This needs a runner registered and `FWE_HV_SELF_HOSTED` set: an owner's
-  action, not code.
+- [ ] **The VM backend on real hardware:** the `hv_` tests and
+  `fwe --hv-spike` pass in the self-hosted `hypervisor` CI job, on a
+  machine whose crash costs nothing, never the development Mac
+  ([docs/hypervisor.md](docs/hypervisor.md)). It needs a registered runner
+  and the `FWE_HV_SELF_HOSTED` variable set: an owner's action, not code.
 
-**Done when:** the target programs run unmodified, the VM's on real
+**Done when:** the target programs run unmodified, those in the VM on real
 hardware.
 
 ### M4 — Compatibility
 
-In order of what each item unblocks. The LTP counts are from the latest
-run.
-
-- [ ] **ptrace** for the debuggers: enough for `strace` and `gdb` to trace
-  and debug a guest program. Processes and their threads are traced
-  (stops, registers, memory, breakpoints, single-stepping, fork, clone
-  and exit events, the thread pointer); left is attaching to a running
-  process's other threads (`strace -p`, gdb's `attach` of a threaded
-  program), which needs a signal to another process's thread.
-- [ ] **Every other failure LTP points at**, among them:
-  - `fs.protected_hardlinks` and `protected_symlinks`, robust futex
-    lists of other processes.
+- [ ] **ptrace for the debuggers:** processes and threads are traced and
+  attached to (stops, registers, memory, breakpoints, single-stepping,
+  fork, clone and exit events, the thread pointer); left is `strace` and
+  `gdb` themselves tracing and debugging a guest program.
+- [ ] **The last LTP failures:** `fork14`, `prctl09` and `select02` pass
+  alone but not always under a full run's load.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
-  binaries stripped of section headers, when a program needs them.
+  binaries without section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
-  containerd and runc, and the `docker` CLI) runs unmodified: it loads an
-  image, runs a container of it (`docker run`, with `--network=none` or
-  the host's network, since veth bridges are not planned) and builds one
-  from a Dockerfile (`docker build`, BuildKit). `dockerd` starts with
-  `--bridge=none --iptables=false`.
-- [ ] **Podman, further:** beyond M3's root `podman run`: `podman build`
-  (Buildah) from a Containerfile, rootless podman as an ordinary user (a
-  user namespace with the user's `/etc/subuid` ranges, overlay storage),
-  `podman pull` from a registry, and Debian's podman (non-PIE, so in the
-  VM) as well as Alpine's.
+  containerd and runc, and the `docker` CLI), started with
+  `--bridge=none --iptables=false`, loads an image, runs a container of it
+  (`docker run` with `--network=none` or the host's network) and builds one
+  from a Dockerfile (`docker build`, BuildKit).
+- [ ] **Podman, further:** `podman build` (Buildah) from a Containerfile;
+  rootless podman as an ordinary user (a user namespace from
+  `/etc/subuid`, overlay storage); `podman pull` from a registry; Debian's
+  podman (non-PIE, so in the VM) as well as Alpine's.
 - [ ] **Wine:** a distribution's arm64 Wine runs ARM64 Windows console
-  programs unmodified: `wineboot` sets up a prefix, `wine cmd /c` runs a
-  batch command, and a C program built for ARM64 Windows runs with its
-  files, threads, exceptions and child processes. What
-  [linux-on-macos.md](docs/linux-on-macos.md#wine) expects it to need:
-  its preloader's low, fixed mappings (the VM), Windows' `x18` kept,
-  `wineserver` over Unix sockets with passed descriptors and shared
-  memory, and faults handed to its handlers as Windows exceptions.
+  programs: `wineboot` sets up a prefix, `wine cmd /c` runs a batch
+  command, and a C program built for ARM64 Windows runs with its files,
+  threads, exceptions and child processes. What it is expected to need is
+  in [linux-on-macos.md](docs/linux-on-macos.md#wine).
 
-**Done when:** every one of LTP's system-call tests passes, in CI against
-the baseline, but those for what is not planned for 1.0 and those that fail
-or skip on Linux too with the same build, each listed with the reason in
-`tools/ltp/exceptions.txt`; `strace` and `gdb` work on a guest
-program; Docker and podman build and run images, rootless podman
-included, and Wine runs ARM64 Windows console programs, each tested end
-to end in CI; the target programs and container engines keep passing.
+**Done when:** every LTP system-call test passes in CI against the baseline,
+but those listed with their reason in `tools/ltp/exceptions.txt` (not
+planned for 1.0, or failing or skipping on Linux too with the same build);
+`strace` and `gdb` work on a guest program; Docker and podman build and run
+images, rootless podman included; Wine runs ARM64 Windows console programs;
+each is tested end to end in CI, and the target programs and container
+engines keep passing.
 
 ### M5 — Release
 
 - [ ] **Performance:** benchmarks in CI of startup, system-call cost,
-  `fork`/`exec`, and a C project's build. Compared with native macOS and a
-  Linux VM (Lima or OrbStack). The hot spots fixed: the single kernel lock,
-  trap cost, and record rewrites.
-- [ ] **Packaging:** a signed and notarized `fwe` carrying the hypervisor
+  `fork`/`exec` and a C project's build, against native macOS and a Linux
+  VM (Lima or OrbStack); the hot spots fixed: the single kernel lock, trap
+  cost and record rewrites.
+- [ ] **Packaging:** a signed and notarized `fwe` with the hypervisor
   entitlement, a Homebrew formula, and a command that fetches and unpacks a
   Debian or Alpine root filesystem.
 - [ ] **User documentation:** installing, running programs and containers,
@@ -191,35 +143,32 @@ userland and podman with it, following the documentation.
 
 ## Not planned for 1.0
 
-Each of these fails cleanly (`ENOSYS` or `EINVAL`), so programs that probe
-for it fall back:
-- io_uring;
-- networking beyond loopback in namespaces (veth, firewalling, raw
-  sockets, TUN);
-- kselftests and gVisor's system-call suite as gates;
-- x86_64 Linux binaries;
-- `kcmp`: macOS cannot tell whether two descriptors share an open file
-  description, and programs that use it (CRIU, systemd) fall back;
-- choosing pids, as checkpoint and restore does (`clone3`'s `set_tid`,
-  `/proc/sys/kernel/ns_last_pid`): macOS assigns the host's;
-- `fanotify`: its permission events would hold every process's file
-  calls on another's answer; it is refused (`ENOSYS`), and programs fall
-  back to inotify;
-- a child process that shares its parent's descriptor table but not its
-  memory (`CLONE_FILES` without `CLONE_VM`): two macOS processes cannot
-  share one, so the child has a copy (`unshare(CLONE_FILES)` and
-  `CLOSE_RANGE_UNSHARE` act as Linux's on it);
-- pipes of more than 64 KiB, which a host pipe cannot hold: a pipe
-  starts with 64 KiB where Linux with 16 KiB pages gives 256 KiB (`fcntl35`);
-- setting the clock (`settimeofday`, `clock_settime`, `adjtimex` and
-  `clock_adjtime` that change it): fwe's root lacks `CAP_SYS_TIME`, as in
-  a container, so the Mac's clock is only read;
-- setting the host name or NIS domain name in the initial UTS namespace:
-  it is the Mac's, read and never set (`EPERM`); a new UTS namespace's
-  names are the guest's to set;
-- CPU affinity: macOS has none, so `sched_setaffinity` is accepted and
-  pins nothing, and a test of how the scheduler shares one CPU (`nice05`)
-  cannot hold;
-- graphical programs, Wine's included;
-- x86 and x64 Windows programs under Wine (an x86 emulator such as FEX
-  inside Wine, or box64 under it).
+Calls for these are refused (`ENOSYS`, `EINVAL` or `EPERM`) unless noted, so
+programs that probe for them fall back.
+- **io_uring:** refused; programs fall back to ordinary system calls.
+- **Networking beyond loopback in namespaces** (veth, bridges, firewalling,
+  raw sockets, TUN): a new network namespace has loopback only.
+- **`kcmp`:** macOS cannot tell whether two descriptors share an open file
+  description.
+- **Chosen pids** (`clone3`'s `set_tid`, `/proc/sys/kernel/ns_last_pid`):
+  pids are the host's, which macOS assigns.
+- **`fanotify`:** its permission events would hold every process's file
+  calls on another's answer; programs fall back to inotify.
+- **A shared descriptor table without shared memory** (`CLONE_FILES`
+  without `CLONE_VM`): two macOS processes cannot share one, so the child
+  gets a copy.
+- **Pipes over 64 KiB:** a host pipe holds no more, so a pipe starts at
+  64 KiB, not Linux's 256 KiB with 16 KiB pages.
+- **Setting the clock:** fwe's root lacks `CAP_SYS_TIME`, as in a
+  container; the Mac's clock is only read.
+- **Setting the initial UTS namespace's names:** they are the Mac's; a new
+  UTS namespace's are the guest's to set.
+- **CPU affinity:** macOS has none; `sched_setaffinity` is accepted and pins
+  nothing.
+- **x86_64 Linux binaries:** fwe runs arm64 code natively and emulates no
+  other architecture.
+- **Graphical programs**, Wine's included: out of the plan's scope.
+- **x86 and x64 Windows programs under Wine:** they need an x86 emulator
+  (FEX or box64).
+- **kselftests and gVisor's system-call suite as gates:** LTP is the
+  conformance gate.

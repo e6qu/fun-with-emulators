@@ -289,6 +289,70 @@ pub fn process_started() {
     shared::process_started();
 }
 
+/// Release the futexes on thread `tid`'s robust list at `head` as the
+/// thread ends, as Linux's `exit_robust_list` does: each word the thread
+/// still owns is marked `FUTEX_OWNER_DIED` (its waiters bit kept) and a
+/// waiter woken, so the next to lock it learns its owner died
+/// (`EOWNERDEAD`). The entry being added or removed (`list_op_pending`)
+/// last; the walk stops at a fault, the list's end, or 2048 entries.
+pub fn release_robust(head: u64, tid: i32) {
+    use crate::uaccess::read;
+    if head == 0 {
+        return;
+    }
+    // The head: the first entry, the futex word's offset from an entry,
+    // the pending entry; an entry's low bit marks a PI futex.
+    let (Ok(first), Ok(offset), Ok(pending)) =
+        (read::<u64>(head), read::<i64>(head + 8), read::<u64>(head + 16))
+    else {
+        return;
+    };
+    let (pending, pending_pi) = (pending & !1, pending & 1 != 0);
+    let (mut entry, mut pi) = (first & !1, first & 1 != 0);
+    let mut left = futex::ROBUST_LIST_LIMIT;
+    while entry != head {
+        let next = read::<u64>(entry);
+        if entry != pending {
+            owner_died(entry.wrapping_add_signed(offset), tid, pi, false);
+        }
+        let Ok(next) = next else { return };
+        (entry, pi) = (next & !1, next & 1 != 0);
+        left -= 1;
+        if left == 0 {
+            break;
+        }
+    }
+    if pending != 0 {
+        owner_died(pending.wrapping_add_signed(offset), tid, pending_pi, true);
+    }
+}
+
+/// Linux's `handle_futex_death` for the word at `uaddr`.
+fn owner_died(uaddr: u64, tid: i32, pi: bool, pending: bool) {
+    use crate::uaccess::{cmpxchg_u32, read};
+    let Ok(mut word) = read::<u32>(uaddr) else { return };
+    loop {
+        // A lock being taken when the thread ended, its word still 0: a
+        // waiter may have been about to be woken for it.
+        if pending && !pi && word == 0 {
+            wake_any(uaddr, 1);
+            return;
+        }
+        if word & futex::FUTEX_TID_MASK != tid as u32 {
+            return;
+        }
+        let died = (word & futex::FUTEX_WAITERS) | futex::FUTEX_OWNER_DIED;
+        match cmpxchg_u32(uaddr, word, died) {
+            Ok(held) if held == word => break,
+            Ok(held) => word = held,
+            Err(_) => return,
+        }
+    }
+    if !pi && word & futex::FUTEX_WAITERS != 0 {
+        wake_any(uaddr, 1);
+    }
+}
+
 /// Wake up to `count` waiters on the word at `uaddr`, private or shared
 /// (for what fwe itself wakes, as Linux wakes a thread's
 /// `clear_child_tid` word as it ends, which C libraries wait on either
@@ -620,5 +684,33 @@ mod tests {
         // SAFETY: both pointers are to live locals.
         let r = unsafe { op(addr, FUTEX_WAIT, 0, &ts as *const _ as u64) };
         assert_eq!(r, err(errno::ETIMEDOUT));
+    }
+
+    /// A robust list's words: the ending thread's marked owner-dead (the
+    /// waiters bit kept), another's left, the pending one released too.
+    #[test]
+    fn a_robust_list_is_released() {
+        use fwe_abi::futex::{FUTEX_OWNER_DIED, FUTEX_WAITERS};
+        // An entry: the next entry, then its futex word (offset 8).
+        #[repr(C)]
+        struct Entry {
+            next: u64,
+            word: u32,
+        }
+        let tid = 4242u32;
+        let mut head = [0u64; 3];
+        let mut a = Entry { next: 0, word: tid | FUTEX_WAITERS };
+        let mut b = Entry { next: 0, word: 77 };
+        let mut pending = Entry { next: 0, word: tid };
+        head[0] = &a as *const Entry as u64;
+        head[1] = 8;
+        head[2] = &mut pending as *mut Entry as u64;
+        let head_at = head.as_ptr() as u64;
+        a.next = &b as *const Entry as u64;
+        b.next = head_at;
+        release_robust(head_at, tid as i32);
+        assert_eq!(a.word, FUTEX_WAITERS | FUTEX_OWNER_DIED);
+        assert_eq!(b.word, 77);
+        assert_eq!(pending.word, FUTEX_OWNER_DIED);
     }
 }

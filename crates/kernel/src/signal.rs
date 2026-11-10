@@ -592,6 +592,11 @@ impl<P: Platform> Kernel<P> {
             Some(v) => align_down(v, 16),
             None => return false,
         };
+        // `SS_AUTODISARM`: the handler runs with no alternate stack, which
+        // `rt_sigreturn` restores from the frame.
+        if on_altstack && !already_on_alt && altstack.ss_flags & signal::SS_AUTODISARM != 0 {
+            thread::set_altstack(Stack { ss_flags: signal::SS_DISABLE, ..Stack::default() });
+        }
 
         // An `rt_sigsuspend` in progress: the frame restores the mask from
         // before the call, and the handler runs with the call's mask.
@@ -906,20 +911,49 @@ impl<P: Platform> Kernel<P> {
     /// `sig` to one thread of this process. A relayed signal is sent to that
     /// host thread; any other is recorded pending against the thread, which
     /// is woken to take it.
+    /// `sig` for thread `tid` of host process `owner` (not this one): in the
+    /// process's queue, the process woken to give it to the thread
+    /// ([`crate::signote::queue_thread`]); SIGKILL ends the process.
+    fn signal_other_thread(&mut self, owner: i32, tid: i32, sig: u64) -> i64 {
+        if !self.may_signal(owner, sig) {
+            return err(errno::EPERM);
+        }
+        match sig {
+            0 => 0,
+            signal::SIGKILL => host::kill_process(owner, libc::SIGKILL),
+            _ => match crate::signote::queue_thread(owner, tid, sig, signal::SI_TKILL, 0) {
+                Ok(()) => host::kill_process(owner, host::WAKE_SIGNAL),
+                Err(e) => err(e),
+            },
+        }
+    }
+
     pub(crate) fn sys_tgkill(&mut self, tgid: i64, tid: i64, sig: u64) -> i64 {
         if sig > signal::NSIG || tid <= 0 || tgid == 0 || tgid < -1 {
             return err(errno::EINVAL);
         }
         let me = thread::tgid() as i64;
         if tgid != -1 && tgid != me {
-            // A thread of another process: only its main thread is
-            // reachable, through the process.
-            return if tid == tgid { self.sys_kill(tid, sig) } else { err(errno::ESRCH) };
+            // A thread of another process: its main thread through the
+            // process, another through the process's queue.
+            if tid == tgid {
+                return self.sys_kill(tid, sig);
+            }
+            return match thread::owner_of_tid(tid as i32) {
+                Some(owner) if crate::pidns::to_host(tgid as i32) == Some(owner) => {
+                    self.signal_other_thread(owner, tid as i32, sig)
+                }
+                _ => err(errno::ESRCH),
+            };
         }
         // A tid not registered here is not a thread of this process (an
-        // exited one's number may already be another process's pid).
+        // exited one's number may already be another process's pid); with
+        // no process named (`tkill`), it may be another's.
         let Some(host_thread) = thread::host_thread(tid as i32) else {
-            return err(errno::ESRCH);
+            return match thread::owner_of_tid(tid as i32) {
+                Some(owner) if tgid == -1 => self.signal_other_thread(owner, tid as i32, sig),
+                _ => err(errno::ESRCH),
+            };
         };
         if sig == 0 {
             return 0;
