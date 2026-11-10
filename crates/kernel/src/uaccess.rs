@@ -288,6 +288,11 @@ fn check(ok: bool) -> Result<()> {
 /// `buf` must be valid for `len` bytes.
 unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Result<()> {
     let addr = guest_of(addr);
+    // Past a user address space (48 bits), or wrapping: never the guest's,
+    // and a fault there is not one a copy recovers from.
+    if len != 0 && addr.checked_add(len as u64).is_none_or(|end| end > 1 << 48) {
+        return Err(errno::EFAULT);
+    }
     check(valid(addr, len as u64, to_guest))?;
     let mut done = 0usize;
     while done < len {

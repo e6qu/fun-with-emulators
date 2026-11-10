@@ -37,3 +37,4 @@ fcntl35 not planned (ROADMAP.md): Linux's default pipe is 16 pages, 256 KiB with
 fcntl35_64 not planned (ROADMAP.md): Linux's default pipe is 16 pages, 256 KiB with 16 KiB pages, and a host pipe holds at most 64 KiB, so fwe's pipes start at 64 KiB
 gethostname02 musl's gethostname copies a truncated name and succeeds without asking the kernel; the test expects ENAMETOOLONG
 sendmsg03 not planned (ROADMAP.md): it needs a raw socket
+sendmsg01 musl's sendmsg copies msg_control into a buffer of its own before the call, so the invalid control pointer faults in the program (SIGSEGV), not in the kernel (EFAULT)
