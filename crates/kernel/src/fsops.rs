@@ -530,6 +530,7 @@ impl<P: Platform> Kernel<P> {
             // Opening the directory itself.
             host_flags |= libc::O_DIRECTORY;
         }
+        let asked = mode as u32;
         let mode = if flags & fcntl::O_CREAT != 0 { self.fs().apply_umask(mode as u32) } else { 0 };
         // An existing file's kept mode, for a caller that does not pass
         // permission bits; a new one is made with what its owner must have
@@ -612,7 +613,7 @@ impl<P: Platform> Kernel<P> {
                     let _ = crate::modes::keep_fd(r as i32, mode);
                 }
                 if r >= 0 && made.get() {
-                    self.own_new(dirfd, &name, Some(r as i32), false, mode);
+                    self.own_new(dirfd, &name, Some(r as i32), false, mode, asked);
                 }
                 if r >= 0 {
                     crate::fdstate::update(r as i32, |s| s.created = made.get());
@@ -1456,7 +1457,7 @@ impl<P: Platform> Kernel<P> {
             let _ = crate::modes::keep_at(dir, &name, mode);
         }
         if made == 0 {
-            self.own_new(dir, &name, None, true, mode);
+            self.own_new(dir, &name, None, true, mode, mode);
         }
         if let Err(e) = r.finish(made == 0)
             && made == 0
@@ -1478,7 +1479,8 @@ impl<P: Platform> Kernel<P> {
         use crate::devnodes::{Node, S_IFBLK, S_IFCHR};
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let kind = mode as u32 & 0o170000;
-        let perm = self.fs().apply_umask(mode as u32 & 0o7777);
+        let asked = mode as u32 & 0o7777;
+        let perm = self.fs().apply_umask(asked);
         let mut r = match self.resolve_p(dirfd, &path, false, false, Change::Create) {
             Ok(r) => r,
             Err(errno::EBUSY) => return err(errno::EEXIST),
@@ -1552,7 +1554,7 @@ impl<P: Platform> Kernel<P> {
             let _ = crate::modes::keep_at(d, &name, perm);
         }
         if made == 0 {
-            self.own_new(d, &name, None, false, perm);
+            self.own_new(d, &name, None, false, perm, asked);
         }
         match r.finish(made == 0) {
             Err(e) if made == 0 => err(e),
@@ -1647,7 +1649,7 @@ impl<P: Platform> Kernel<P> {
             ret(unsafe { libc::symlinkat(target.as_ptr(), d, name.as_ptr()) })
         });
         if made == 0 {
-            self.own_new(d, &name, None, false, 0o777);
+            self.own_new(d, &name, None, false, 0o777, 0o777);
         }
         match r.finish(made == 0) {
             Err(e) if made == 0 => err(e),
@@ -2598,7 +2600,8 @@ impl<P: Platform> Kernel<P> {
     /// the caller's file-system user, its group the caller's or, in a
     /// set-group-ID directory, the directory's, whose bit a directory made
     /// there inherits; a file made set-group-ID for a group the caller is
-    /// not in loses the bit (without `CAP_FSETID`), as Linux makes one.
+    /// not in loses the bit (without `CAP_FSETID`), judged by the mode
+    /// `asked` before the umask, as Linux makes one.
     pub(crate) fn own_new(
         &self,
         dir: i32,
@@ -2606,6 +2609,7 @@ impl<P: Platform> Kernel<P> {
         fd: Option<i32>,
         is_dir: bool,
         perm: u32,
+        asked: u32,
     ) {
         let c = &self.creds;
         let parent = stat_fd(dir).ok();
@@ -2618,7 +2622,8 @@ impl<P: Platform> Kernel<P> {
         if setgid_dir && is_dir {
             kept |= 0o2000;
         } else if !is_dir
-            && kept & 0o2010 == 0o2010
+            && kept & 0o2000 != 0
+            && asked & 0o010 != 0
             && gid != c.fsgid
             && !c.groups().contains(&gid)
             && !c.has(crate::caps::CAP_FSETID)
