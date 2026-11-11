@@ -101,10 +101,13 @@ hardware.
 
 ### M4 — Compatibility
 
-- [ ] **ptrace for the debuggers:** processes and threads are traced and
-  attached to (stops, registers, memory, breakpoints, single-stepping,
-  fork, clone and exit events, the thread pointer); left is `strace` and
-  `gdb` themselves tracing and debugging a guest program.
+- [x] **ptrace for the debuggers:** processes and threads are traced,
+  attached to and seized (stops, registers, memory, breakpoints,
+  single-stepping, fork, clone, exec and exit events, interrupts and
+  group-stops, system-call information, the thread pointer); Alpine's
+  `strace` traces a shell and what it runs, and its `gdb` stops a C
+  program at a breakpoint, shows its frames and values and finishes a
+  function (CI's `debuggers` job).
 - [x] **Every LTP test that applies passes:** the rest are exceptions,
   each with its reason; the runner names any skip that is not one. The
   tests that measure time or load the host run one at a time, after the

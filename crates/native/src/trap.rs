@@ -335,7 +335,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     // the tracer may change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
     if syscall_stops {
-        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs);
+        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, true);
     }
     let nr = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
@@ -463,7 +463,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     }
     // The exit's stop, its result in `x0`.
     if syscall_stops {
-        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs);
+        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, false);
     }
     settle(&mut regs);
     regs_to(mc, &regs);

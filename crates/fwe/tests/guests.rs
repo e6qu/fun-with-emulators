@@ -411,16 +411,29 @@ fn build_c_dynamic(name: &str, libc: Libc, crt: bool) -> PathBuf {
 /// low address, as distributions build some programs (Debian's `python3`):
 /// only the hypervisor backend can run it.
 fn build_c(name: &str, libc: Libc, crt: bool, pie: bool) -> PathBuf {
+    build_c_as(name, libc, crt, pie, false)
+}
+
+/// [`build_c`] for a debugger: unoptimized, with debug information
+/// (`-O0 -g`).
+fn build_c_debug(name: &str, libc: Libc) -> PathBuf {
+    build_c_as(name, libc, true, true, true)
+}
+
+fn build_c_as(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> PathBuf {
     let out = out_dir().join("c");
     std::fs::create_dir_all(&out).unwrap();
-    let tag =
+    let mut tag =
         if pie { name_suffix(libc).to_string() } else { format!("{}-nopie", name_suffix(libc)) };
+    if debug {
+        tag.push_str("-g");
+    }
     let obj = out.join(format!("{name}-{tag}.o"));
     run_checked(
         Command::new("clang")
+            .args(if debug { &["-O0", "-g"][..] } else { &["-O2"][..] })
             .args([
                 "--target=aarch64-linux-gnu",
-                "-O2",
                 "-fno-stack-protector",
                 if pie { "-fPIC" } else { "-fno-pic" },
                 "-ffreestanding",
@@ -1101,7 +1114,10 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
     }
     // Tests fetch at once, and manifests share packages: each download goes
     // to a name of its own and is renamed into place once it checks out.
-    let part = cache.join(format!("{name}.{tag}.part"));
+    // (A name of this fetch's own: two tests may fetch the same file.)
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let part = cache.join(format!("{name}.{tag}.{}-{n}.part", std::process::id()));
     let fetched = urls.iter().any(|url| {
         Command::new("curl")
             .args(["-fsSL", "--retry", "3", "-o"])
@@ -1193,6 +1209,9 @@ fn fetched_alpine(manifest_name: &str) -> Vec<PathBuf> {
 /// and cached: the minirootfs, then each package. An `.apk` is gzipped tar
 /// segments, its signature and metadata (dot files) before the files.
 fn alpine_root(manifest_name: &str) -> PathBuf {
+    // One test at a time makes a root: two may want the same one.
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest_in("alpine", manifest_name);
     let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
     let done = root.join(".fwe-complete");
@@ -1223,6 +1242,125 @@ fn alpine_image(manifest_name: &str) -> PathBuf {
         .into_iter()
         .find(|f| f.to_string_lossy().contains("minirootfs"))
         .unwrap()
+}
+
+/// Whether the debugger tests run: they need Alpine's strace and gdb
+/// (fetched: `guests/alpine/fetch/ptrace.txt`), run only where
+/// `FWE_DEBUGGER_TESTS` is set (CI's `debuggers` job).
+fn debugger_tests() -> bool {
+    let on = std::env::var_os("FWE_DEBUGGER_TESTS").is_some();
+    if !on {
+        eprintln!("skipped: set FWE_DEBUGGER_TESTS=1 to run Alpine's strace and gdb");
+    }
+    on
+}
+
+/// Run `args` (a program of the root, then its arguments) in a copy of the
+/// `ptrace` manifest's Alpine root, with `/prog` the given program, if
+/// any: its output, and the root's file `keep` (if any) as it was left.
+fn in_debugger_root(args: &[&str], prog: Option<&Path>, keep: Option<&str>) -> (Output, Vec<u8>) {
+    let root = std::env::temp_dir().join(format!(
+        "fwe-dbg-{}-{}",
+        std::process::id(),
+        args[0].replace('/', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("ptrace")).arg(&root));
+    if let Some(p) = prog {
+        std::fs::copy(p, root.join("prog")).unwrap();
+    }
+    let _workload = workload();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg("--cwd").arg("/tmp");
+    cmd.arg(root.join(args[0].trim_start_matches('/'))).args(&args[1..]);
+    // The environment of a Linux login, not the host's.
+    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("HOME", "/root");
+    cmd.env("TERM", "dumb").env("SHELL", "/bin/sh");
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(180));
+    let kept = keep.and_then(|k| std::fs::read(root.join(k.trim_start_matches('/'))).ok());
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("--- {args:?} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    (out, kept.unwrap_or_default())
+}
+
+/// Alpine's strace (fetched) traces a shell and what it runs (`-f`): the
+/// calls with their arguments as Linux's strace shows them, the child's
+/// `execve`, and both ends.
+#[test]
+fn alpine_strace_traces_a_program() {
+    if !debugger_tests() {
+        return;
+    }
+    let (out, trace) = in_debugger_root(
+        &["/usr/bin/strace", "-f", "-o", "/tmp/trace", "/bin/sh", "-c", "echo hi; /bin/true"],
+        None,
+        Some("/tmp/trace"),
+    );
+    let trace = String::from_utf8_lossy(&trace);
+    eprintln!("--- trace:\n{trace}");
+    assert_eq!(stdout(&out), "hi\n");
+    assert_eq!(out.status.code(), Some(0));
+    for want in [
+        "execve(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"echo hi; /bin/true\"]",
+        "execve(\"/bin/true\", [\"/bin/true\"]",
+        "+++ exited with 0 +++",
+    ] {
+        assert!(trace.contains(want), "no {want:?} in the trace");
+    }
+    // (strace pads the result into a column.)
+    let write = trace.lines().find(|l| l.contains("write(1, \"hi\\n\", 3)"));
+    assert!(write.is_some_and(|l| l.ends_with("= 3")), "no write of \"hi\" in the trace");
+}
+
+/// Alpine's gdb (fetched) debugs a C program built with debug
+/// information: a breakpoint on a function stops it there with its
+/// arguments, the backtrace names its caller, `finish` returns its value,
+/// and the program runs on to its end.
+#[test]
+fn alpine_gdb_debugs_a_program() {
+    if !debugger_tests() {
+        return;
+    }
+    let prog = build_c_debug("debuggee", Libc::Musl);
+    let (out, _) = in_debugger_root(
+        &[
+            "/usr/bin/gdb",
+            "-nx",
+            "-batch",
+            "-ex",
+            "break add",
+            "-ex",
+            "run",
+            "-ex",
+            "bt",
+            "-ex",
+            "print a",
+            "-ex",
+            "print b",
+            "-ex",
+            "finish",
+            "-ex",
+            "delete",
+            "-ex",
+            "continue",
+            "/prog",
+        ],
+        Some(&prog),
+        None,
+    );
+    let text = stdout(&out);
+    for want in [
+        "Breakpoint 1, add (a=0, b=1) at",
+        "in main () at",
+        "$1 = 0",
+        "$2 = 1",
+        "#1  0x",
+        "Value returned is $3 = 1",
+        "total 6",
+        "exited normally]",
+    ] {
+        assert!(text.contains(want), "no {want:?} in gdb's output:\n{text}");
+    }
 }
 
 /// What the container prints in [`alpine_crun_runs_an_image`].
@@ -2861,6 +2999,29 @@ fn ptrace_traces_a_child() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// What the `debugger` guest prints.
+const DEBUGGER: &str = "exec: alternate true, entry then event then exit true\n\
+    seize: 0, running true\n\
+    interrupt: 0, stopped true, event stop true\n\
+    sigmask: get 0, SIGUSR1 blocked true, set 0, now true\n\
+    mem: read true, write true\n\
+    auxv: entry true\n\
+    syscall info: size true, entry true, number 173, exit true\n\
+    group stop: delivery true, event true, listen 0, stays true, continued true\n\
+    killed: true\n";
+
+/// What debuggers ask of ptrace beyond its basics: a seized child runs
+/// on until interrupted, which stops it with an event stop; the system
+/// call it stops at is described; its signal mask is read and set; a
+/// group-stop is an event stop, listened to until `SIGCONT`; and its
+/// memory is read and written through `/proc/<pid>/mem`.
+#[test]
+fn ptrace_serves_debuggers() {
+    let out = fwe(&rust_guest("debugger"), &[]);
+    assert_eq!(stdout(&out), DEBUGGER, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `robust` guest prints.
 const ROBUST: &str = "exited holder: owner dead true, recovered true\n\
     killed holder: signal 15, owner dead true, recovered true\n\
@@ -3631,6 +3792,14 @@ fn hv_process_descriptors_name_processes() {
 fn hv_ptrace_traces_a_child() {
     let Some(out) = fwe_hv(&rust_low_guest("ptrace"), &[]) else { return };
     assert_eq!(stdout(&out), PTRACE, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What debuggers ask of ptrace, in the VM (see [`ptrace_serves_debuggers`]).
+#[test]
+fn hv_ptrace_serves_debuggers() {
+    let Some(out) = fwe_hv(&rust_low_guest("debugger"), &[]) else { return };
+    assert_eq!(stdout(&out), DEBUGGER, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 

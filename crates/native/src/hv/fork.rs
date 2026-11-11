@@ -798,7 +798,8 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     // Its own record too: it may end before the parent writes it.
     // With its mappings, for other processes' `/proc/<pid>/maps`.
     let ns = k.fs.as_ref().map(|fs| fs.ns_dirs()).unwrap_or_default();
-    fwe_kernel::procreg::own_line(&line, &inherit, ns, fwe_kernel::maps::forked());
+    let auxv = k.fs.as_ref().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
+    fwe_kernel::procreg::own_line(&line, &inherit, ns, fwe_kernel::maps::forked(), &auxv);
     fwe_kernel::reaper::start_if_reaper();
     d.finish()?;
     backend::become_vm_process()?;

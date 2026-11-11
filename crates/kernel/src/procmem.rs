@@ -12,8 +12,9 @@
 //! nor is memory not mapped. A `pagemap` entry has bit 63 if the page is
 //! in memory, bit 61 if it is a file's or shared, bit 56 if it is in
 //! memory and private; the frame number, which Linux gives only to
-//! `CAP_SYS_ADMIN`, is 0. Another process's memory is not reached: macOS
-//! gives no process another's.
+//! `CAP_SYS_ADMIN`, is 0. Another process's `mem` (opened by one that may
+//! trace it) reaches its memory as `process_vm_readv` does, or through its
+//! ptrace mailbox when it is the opener's tracee and stopped.
 
 use crate::fdmarks::{self, Mark};
 use crate::uaccess;
@@ -35,9 +36,10 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
     if !matches!(nr, n::READ | n::WRITE | n::PREAD64 | n::PWRITE64) || !fdmarks::any_marks() {
         return None;
     }
-    let pagemap = match fdmarks::marked(a[0] as i32)? {
-        Mark::Mem => false,
-        Mark::Pagemap => true,
+    let (pagemap, remote) = match fdmarks::marked(a[0] as i32)? {
+        Mark::Mem => (false, None),
+        Mark::Pagemap => (true, None),
+        Mark::RemoteMem { id } => (false, Some(id)),
         _ => return None,
     };
     let fd = a[0] as i32;
@@ -64,6 +66,7 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
     };
     let (buf, len) = (a[1], a[2].min(1 << 30));
     let r = match (pagemap, write) {
+        _ if let Some(id) = remote => remote_mem(id, pos, buf, len, write),
         (true, true) => Err(errno::EINVAL),
         (true, false) => read_pagemap(pos, buf, len),
         (false, false) => read_mem(pos, buf, len),
@@ -79,6 +82,33 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
         }
         Err(e) => err(e),
     })
+}
+
+/// Copy `len` bytes between another process's memory at `addr` (tracee
+/// `id`'s, as ptrace names it) and the guest buffer `buf`: through its
+/// ptrace mailbox if this process traces it and it is stopped, else as
+/// `process_vm_readv` reaches it ([`crate::procvm`]); as much as moves in
+/// a row, `EIO` if none.
+fn remote_mem(id: i32, addr: u64, buf: u64, len: u64, write: bool) -> Result<u64, i32> {
+    let mut data = vec![0u8; len.min(1 << 20) as usize];
+    if data.is_empty() {
+        return Ok(0);
+    }
+    if write {
+        uaccess::read_into(buf, &mut data)?;
+    }
+    let n = if crate::ptrace::traces_stopped(id) {
+        crate::ptrace::tracee_memory(id, addr, &mut data, write)?
+    } else {
+        crate::procvm::remote(crate::ptrace::process_of(id), addr, &mut data, write)?
+    };
+    if n == 0 {
+        return Err(errno::EIO);
+    }
+    if !write {
+        uaccess::write_from(buf, &data[..n])?;
+    }
+    Ok(n as u64)
 }
 
 /// The part of `[at, at + len)` within the page `at` is in.

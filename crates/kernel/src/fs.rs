@@ -449,7 +449,14 @@ impl Fs {
 
     /// The running program started with the auxiliary vector `auxv` (its
     /// words, `AT_NULL` included), which `/proc/self/auxv` shows.
+    /// The auxiliary vector the running program started with.
+    pub fn auxv(&self) -> &[u8] {
+        &self.proc.auxv
+    }
+
     pub fn set_auxv(&mut self, auxv: Vec<u8>) {
+        // Other processes' `/proc/<pid>/auxv` too.
+        crate::procreg::own_auxv(&auxv);
         self.proc.auxv = auxv;
     }
 
@@ -509,6 +516,20 @@ impl Fs {
             crate::procfs::Entry::Fd { fd, .. } => Some(fd),
             _ => None,
         }
+    }
+
+    /// The program `path` names, a `/proc` link such as `/proc/self/exe`
+    /// followed to where it leads (the process that runs it next would
+    /// find its own there), as a path a new process can open.
+    pub fn exec_target(&self, path: &[u8]) -> Vec<u8> {
+        let mut p = path.to_vec();
+        for _ in 0..8 {
+            match self.synthetic(fcntl::AT_FDCWD as i32, &p) {
+                Some(crate::procfs::Entry::Symlink(t)) if t.starts_with(b"/") => p = t,
+                _ => break,
+            }
+        }
+        p
     }
 
     /// The host path of the rootfs, or `None` when the root is the host `/`

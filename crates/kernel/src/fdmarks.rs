@@ -96,6 +96,9 @@ pub enum Mark {
     /// `/proc/self/mem`: the process's memory, by address
     /// ([`crate::procmem`]).
     Mem,
+    /// `/proc/<pid>/mem` of another process: tracee `id`'s memory (a
+    /// thread's tid, or a process's host pid, as ptrace names tracees).
+    RemoteMem { id: i32 },
     /// `/proc/self/pagemap`: an entry per page of the process's memory
     /// ([`crate::procmem`]).
     Pagemap,
@@ -479,13 +482,14 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Pid { .. }) => 19,
             Some(Mark::Mem) => 20,
             Some(Mark::Pagemap) => 21,
+            Some(Mark::RemoteMem { .. }) => 22,
         });
         if let Some(Mark::Pid { host, tid, nonblock }) = rec.mark {
             e.i32(host);
             e.i32(tid);
             e.bool(nonblock);
         }
-        if let Some(Mark::TimerSlack { host }) = rec.mark {
+        if let Some(Mark::TimerSlack { host } | Mark::RemoteMem { id: host }) = rec.mark {
             e.i32(host);
         }
         if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
@@ -564,6 +568,7 @@ pub fn load(d: &mut Dec) {
             19 => Some(Mark::Pid { host: d.i32(), tid: d.i32(), nonblock: d.bool() }),
             20 => Some(Mark::Mem),
             21 => Some(Mark::Pagemap),
+            22 => Some(Mark::RemoteMem { id: d.i32() }),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

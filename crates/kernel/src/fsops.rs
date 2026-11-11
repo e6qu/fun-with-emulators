@@ -441,6 +441,24 @@ impl<P: Platform> Kernel<P> {
                     let text = crate::keys::proc_keys(&self.key_caller());
                     self.synthetic_fd(anon_fd(&text, flags), dirfd as i32, &path)
                 }
+                // Another process's memory (`crate::procmem`).
+                crate::procfs::Entry::File(_)
+                    if let Some(id) = self.other_mem(dirfd as i32, &path) =>
+                {
+                    match id {
+                        Ok(id) => {
+                            let fd = self.synthetic_fd(anon_fd(&[], flags), dirfd as i32, &path);
+                            if fd >= 0 {
+                                crate::fdmarks::mark(
+                                    fd as i32,
+                                    crate::fdmarks::Mark::RemoteMem { id },
+                                );
+                            }
+                            fd
+                        }
+                        Err(e) => err(e),
+                    }
+                }
                 crate::procfs::Entry::File(_)
                     if let Some(tid) = self.fs().proc_path(dirfd as i32, &path).and_then(|p| {
                         let t = p.strip_prefix(b"/proc/self/task/")?.strip_suffix(b"/status")?;
@@ -2577,6 +2595,38 @@ impl<P: Platform> Kernel<P> {
         }
         let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
         Some(Ok(crate::fdmarks::Mark::OomScore { host, legacy, privileged }))
+    }
+
+    /// For another process's `/proc/<pid>/mem` (or a thread's,
+    /// `/proc/<pid>/task/<tid>/mem`) at `path`: the tracee it reaches, as
+    /// ptrace names it, if the caller may (it traces it, or may trace
+    /// it); `EACCES` if not.
+    fn other_mem(&self, dirfd: i32, path: &[u8]) -> Option<Result<i32, i32>> {
+        let a = self.fs().absolute_path(dirfd, path)?;
+        let (m, fs_path) = self.fs().mount_of(&a);
+        if m.fstype != crate::mounts::FsType::Proc {
+            return None;
+        }
+        let rest = fs_path.strip_prefix(b"/")?.strip_suffix(b"/mem")?;
+        let num = |b: &[u8]| std::str::from_utf8(b).ok()?.parse::<i32>().ok();
+        let (pid, tid) = match rest.iter().position(|&b| b == b'/') {
+            None => (num(rest)?, None),
+            Some(i) => (num(&rest[..i])?, Some(num(rest[i..].strip_prefix(b"/task/")?)?)),
+        };
+        let host = crate::pidns::to_host(pid)?;
+        // SAFETY: getpid cannot fail.
+        if host == unsafe { libc::getpid() } {
+            return None;
+        }
+        let id = match tid {
+            Some(t) if t != pid => crate::ptrace::target_of(t)?,
+            _ => host,
+        };
+        Some(if crate::ptrace::traces(id) || self.may_trace(host) {
+            Ok(id)
+        } else {
+            Err(errno::EACCES)
+        })
     }
 
     /// For `/proc/<pid>/uid_map`, `gid_map` or `setgroups` at `path`, what

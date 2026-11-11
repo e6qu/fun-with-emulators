@@ -375,7 +375,8 @@ impl<P: Platform> Kernel<P> {
         // Its own record too: it may end before the parent writes it.
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
-        crate::procreg::own_line(&t.line, &t.inherit, t.dirs.clone(), crate::maps::forked());
+        let auxv = self.fs.as_ref().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
+        crate::procreg::own_line(&t.line, &t.inherit, t.dirs.clone(), crate::maps::forked(), &auxv);
         if let Some(cg) = &t.cgroup {
             // Where it starts, should it look before the parent writes it.
             // SAFETY: getpid cannot fail.

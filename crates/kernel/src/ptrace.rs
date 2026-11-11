@@ -44,6 +44,11 @@ pub const PTRACE_SETSIGINFO: u64 = 0x4203;
 pub const PTRACE_GETREGSET: u64 = 0x4204;
 pub const PTRACE_SETREGSET: u64 = 0x4205;
 pub const PTRACE_SEIZE: u64 = 0x4206;
+pub const PTRACE_INTERRUPT: u64 = 0x4207;
+pub const PTRACE_LISTEN: u64 = 0x4208;
+pub const PTRACE_GETSIGMASK: u64 = 0x420a;
+pub const PTRACE_SETSIGMASK: u64 = 0x420b;
+pub const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
 
 pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
 pub const PTRACE_O_TRACEFORK: u64 = 0x2;
@@ -69,6 +74,17 @@ pub const PTRACE_EVENT_CLONE: i32 = 3;
 pub const PTRACE_EVENT_EXEC: i32 = 4;
 pub const PTRACE_EVENT_VFORK_DONE: i32 = 5;
 pub const PTRACE_EVENT_EXIT: i32 = 6;
+/// A seized tracee's stop that no signal or event made: an interrupt, a
+/// group-stop, the end of one.
+pub const PTRACE_EVENT_STOP: i32 = 128;
+
+/// The `si_code` of the SIGSTOP fwe sends a seized tracee, through fwe's
+/// own queue: no signal for the guest, but a nudge to look at its mailbox
+/// (to begin being traced, or for an interrupt), which ends a wait it is
+/// in as a signal would, and the call it was in starts again after.
+pub const POKE_CODE: i32 = 0x4206;
+/// `AUDIT_ARCH_AARCH64`, a system call's architecture.
+const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
@@ -103,11 +119,27 @@ const W_EVENTMSG: usize = 10;
 const W_PROC: usize = 11;
 /// The tracee's thread pointer (`TPIDR_EL0`, `NT_ARM_TLS`).
 const W_TLS: usize = 12;
+/// 1: attached by `PTRACE_SEIZE` (stops it did not ask for are event
+/// stops, and `PTRACE_INTERRUPT` and `PTRACE_LISTEN` work).
+const W_SEIZED: usize = 13;
+/// 1: `PTRACE_INTERRUPT` asked for a stop not yet made.
+const W_INTERRUPT: usize = 14;
+/// The tracee's signal mask at its stop, and 1 in the next word if the
+/// tracer set another (`PTRACE_SETSIGMASK`).
+const W_SIGMASK: usize = 15;
+const W_SIGMASK_SET: usize = 16;
+/// The stop's system call, for `PTRACE_GET_SYSCALL_INFO`: 1 at its entry,
+/// 2 at its exit, 0 for a stop of another kind.
+const W_SYSCALL: usize = 17;
 /// Where the `siginfo`, the general registers and the FP registers are
 /// kept, in bytes.
 const SIGINFO_AT: usize = 256;
 const REGS_AT: usize = 512;
 const FPREGS_AT: usize = 1024;
+/// Memory the tracer reads or writes through the tracee (`OP_READ`,
+/// `OP_WRITE`), a part at a time.
+const MEMBUF_AT: usize = 2048;
+const MEMBUF_LEN: usize = 2048;
 const PAGE: usize = 4096;
 
 /// [`W_STATE`]: running, stopped and not yet reported by `wait`, stopped
@@ -118,6 +150,9 @@ const REPORTED: u64 = 2;
 /// Ended, its wait status for a tracer that is not its parent (whose host
 /// `wait` does not see it).
 const EXITED: u64 = 3;
+/// Stopped in a group-stop the tracer listens to (`PTRACE_LISTEN`): not
+/// stopped as far as ptrace's requests go, until it reports again.
+const LISTENING: u64 = 4;
 
 /// Requests: memory, and going on (the signal in [`W_DATA`]).
 const OP_PEEK: u64 = 1;
@@ -126,6 +161,10 @@ const OP_CONT: u64 = 3;
 const OP_SYSCALL: u64 = 4;
 const OP_DETACH: u64 = 5;
 const OP_STEP: u64 = 6;
+const OP_LISTEN: u64 = 7;
+/// Read or write [`W_DATA`] bytes at [`W_ADDR`] through [`MEMBUF_AT`].
+const OP_READ: u64 = 8;
+const OP_WRITE: u64 = 9;
 
 /// A mapped mailbox or inbox page.
 struct Page(&'static [AtomicU64]);
@@ -284,11 +323,25 @@ fn self_id() -> i32 {
     if tid == 0 || tid == crate::thread::tgid() { me() } else { tid }
 }
 
+/// The words a new tracing starts with at 0.
+const FRESH: [usize; 10] = [
+    W_STATE,
+    W_REQ,
+    W_DONE,
+    W_OPTIONS,
+    W_EVENTMSG,
+    W_SEIZED,
+    W_INTERRUPT,
+    W_SIGMASK,
+    W_SIGMASK_SET,
+    W_SYSCALL,
+];
+
 /// This thread is traced by host process `tracer` from now on.
 fn begin(tracer: i32) -> Result<(), i32> {
     let id = self_id();
     let mb = open(&mailbox_name(id), true).ok_or(errno::ENOMEM)?;
-    for w in [W_STATE, W_REQ, W_DONE, W_OPTIONS, W_EVENTMSG] {
+    for w in FRESH {
         mb.word(w).store(0, Ordering::Release);
     }
     mb.word(W_TRACER).store(tracer as u64, Ordering::Release);
@@ -338,22 +391,42 @@ pub fn forked_child() {
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // Its parent's tracer follows it (`PTRACE_O_TRACEFORK` and the like):
-    // traced from the start, and stopped first by SIGSTOP, as Linux
-    // starts it.
+    // traced from the start, and stopped first, as Linux starts it.
     if follow > 0 && begin(follow).is_ok() {
-        // With its parent's options, as Linux gives them.
-        if let Some(mb) = open(&mailbox_name(self_id()), false) {
-            mb.word(W_OPTIONS).store(FOLLOW_OPTIONS.load(Ordering::Acquire), Ordering::Release);
-        }
-        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-        crate::thread::post_process(fwe_abi::signal::SIGSTOP, info);
+        let seized = FOLLOW_SEIZED.load(Ordering::Acquire);
+        let opts = FOLLOW_OPTIONS.load(Ordering::Acquire);
+        let (sig, info) = first_stop(self_id(), opts, seized);
+        crate::thread::post_process(sig, info);
     }
+}
+
+/// A tracee followed from its start (`id`, with its creator's options
+/// `opts`, seized if its creator was): its mailbox set so, and the signal
+/// it first stops for: SIGSTOP, or for a seized one fwe's nudge, which
+/// stops it with `PTRACE_EVENT_STOP`, as Linux starts each.
+fn first_stop(id: i32, opts: u64, seized: bool) -> (u64, crate::thread::SigInfo) {
+    use crate::thread::SigInfo;
+    if let Some(mb) = open(&mailbox_name(id), false) {
+        mb.word(W_OPTIONS).store(opts, Ordering::Release);
+        mb.word(W_SEIZED).store(u64::from(seized), Ordering::Release);
+        mb.word(W_INTERRUPT).store(u64::from(seized), Ordering::Release);
+    }
+    let code = if seized { POKE_CODE } else { fwe_abi::signal::SI_USER };
+    (fwe_abi::signal::SIGSTOP, SigInfo { code, ..Default::default() })
+}
+
+/// Whether this thread was attached by `PTRACE_SEIZE`.
+pub fn seized() -> bool {
+    traced()
+        && open(&mailbox_name(self_id()), false)
+            .is_some_and(|mb| mb.word(W_SEIZED).load(Ordering::Acquire) == 1)
 }
 
 /// The tracer a fork child is to be traced by (0: none), set by its parent
 /// just before it forks ([`fork_event`]).
 static FOLLOW: AtomicI32 = AtomicI32::new(0);
 static FOLLOW_OPTIONS: AtomicU64 = AtomicU64::new(0);
+static FOLLOW_SEIZED: AtomicBool = AtomicBool::new(false);
 
 /// The event a clone with `flags` raises in a traced thread, if its tracer
 /// asked for it; the new process or thread is then traced too (a thread
@@ -368,7 +441,7 @@ pub fn fork_event(flags: u64) -> Option<i32> {
         if opts & PTRACE_O_TRACECLONE == 0 {
             return None;
         }
-        NEW_THREAD.with(|n| n.set(Some((tracer(), opts))));
+        NEW_THREAD.with(|n| n.set(Some((tracer(), opts, seized()))));
         return Some(PTRACE_EVENT_CLONE);
     }
     let (event, option) = if flags & cl::CLONE_VFORK != 0 {
@@ -383,43 +456,41 @@ pub fn fork_event(flags: u64) -> Option<i32> {
         return None;
     }
     FOLLOW_OPTIONS.store(opts, Ordering::Release);
+    FOLLOW_SEIZED.store(seized(), Ordering::Release);
     FOLLOW.store(tracer(), Ordering::Release);
     Some(event)
 }
 
 std::thread_local! {
     /// The tracer and options a thread this one is making is to be traced
-    /// with ([`fork_event`]).
-    static NEW_THREAD: std::cell::Cell<Option<(i32, u64)>> = const { std::cell::Cell::new(None) };
+    /// with, and whether seized ([`fork_event`]).
+    static NEW_THREAD: std::cell::Cell<Option<(i32, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
-/// New threads to be traced as they start, by tid: their tracer and
-/// options.
-static PENDING: std::sync::Mutex<Vec<(i32, i32, u64)>> = std::sync::Mutex::new(Vec::new());
+/// New threads to be traced as they start, by tid: their tracer, options
+/// and whether seized.
+static PENDING: std::sync::Mutex<Vec<(i32, i32, u64, bool)>> = std::sync::Mutex::new(Vec::new());
 
 /// A backend made thread `tid` for this thread's clone: traced as it
 /// starts, if its tracer follows it.
 pub fn new_thread(tid: i32) {
-    if let Some((tracer, opts)) = NEW_THREAD.with(std::cell::Cell::take) {
-        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push((tid, tracer, opts));
+    if let Some((tracer, opts, seized)) = NEW_THREAD.with(std::cell::Cell::take) {
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push((tid, tracer, opts, seized));
     }
 }
 
 /// Thread `tid` starts: traced from the start if its tracer follows it,
-/// with its creator's options, and stopped first by SIGSTOP.
+/// with its creator's options, and stopped first ([`first_stop`]).
 pub fn thread_started(tid: i32) {
     let found = {
         let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         let i = p.iter().position(|e| e.0 == tid);
         i.map(|i| p.swap_remove(i))
     };
-    let Some((_, tracer, opts)) = found else { return };
+    let Some((_, tracer, opts, seized)) = found else { return };
     if begin(tracer).is_ok() {
-        if let Some(mb) = open(&mailbox_name(self_id()), false) {
-            mb.word(W_OPTIONS).store(opts, Ordering::Release);
-        }
-        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-        crate::thread::post_thread(tid, fwe_abi::signal::SIGSTOP, info);
+        let (sig, info) = first_stop(self_id(), opts, seized);
+        crate::thread::post_thread(tid, sig, info);
     }
 }
 
@@ -451,12 +522,14 @@ fn report_end(id: i32, tracer: i32, status: i32) {
 pub fn save_fork(e: &mut crate::snapshot::Enc) {
     e.i32(FOLLOW.load(Ordering::Acquire));
     e.u64(FOLLOW_OPTIONS.load(Ordering::Acquire));
+    e.bool(FOLLOW_SEIZED.load(Ordering::Acquire));
 }
 
 /// From a fork snapshot, in the child: followed as [`forked_child`] is.
 pub fn load_fork(d: &mut crate::snapshot::Dec) {
     FOLLOW.store(d.i32(), Ordering::Release);
     FOLLOW_OPTIONS.store(d.u64(), Ordering::Release);
+    FOLLOW_SEIZED.store(d.bool(), Ordering::Release);
     forked_child();
 }
 
@@ -533,16 +606,26 @@ pub fn exiting(status: i32) {
     }
 }
 
-/// What a re-executed fwe must know: the tracer (0: none).
-pub fn exec_state() -> i32 {
-    if traced() { tracer() } else { 0 }
+/// What a re-executed fwe must know: the tracer (0: none), and whether
+/// it stops at system calls.
+pub fn exec_state() -> (i32, bool) {
+    if traced() { (tracer(), stops_at_syscalls()) } else { (0, false) }
 }
 
-/// In a re-executed fwe: traced by `tracer` again, as before `execve`.
-pub fn restore(tracer: i32) {
-    if tracer > 0 && alive(tracer) {
-        let _ = begin(tracer);
+/// In a re-executed fwe: traced by `tracer` again, as before `execve`,
+/// with its mailbox as it was (its options, whether it was seized), and
+/// stopping at system calls if it did (`syscalls`).
+pub fn restore(tracer: i32, syscalls: bool) {
+    if tracer <= 0 || !alive(tracer) {
+        return;
     }
+    if open(&mailbox_name(self_id()), false).is_none() {
+        let _ = begin(tracer);
+    } else {
+        TRACER.with(|t| t.set(tracer));
+        set_traced(true);
+    }
+    SYSCALLS.with(|t| t.set(syscalls));
 }
 
 /// How a stop ends.
@@ -571,14 +654,16 @@ pub fn options() -> u64 {
 
 /// Stop for the tracer with wait status `status` and `siginfo` (128
 /// bytes), the registers `regs` its to read and change, until it says to
-/// go on: how. Not traced, or the tracer gone: `Cont(0)`, or the signal
-/// the stop was for.
+/// go on: how. `syscall` is 1 at a system call's entry, 2 at its exit (for
+/// `PTRACE_GET_SYSCALL_INFO`). Not traced, or the tracer gone: `Cont(0)`,
+/// or the signal the stop was for.
 pub fn stop(
     regs: &mut crate::Regs,
     tls: &mut u64,
     status: i32,
     siginfo: &[u8; 128],
     event: u64,
+    syscall: u64,
 ) -> Resume {
     let sig = ((status >> 8) & 0x7f) as u64;
     let passing = if status >> 16 == 0 && sig != libc::SIGTRAP as u64 { sig } else { 0 };
@@ -588,10 +673,55 @@ pub fn stop(
         end();
         return Resume::Cont(passing);
     }
-    put_regs(&mb, regs);
-    mb.word(W_TLS).store(*tls, Ordering::Release);
+    let (mut status, mut siginfo, mut event, mut syscall) = (status, *siginfo, event, syscall);
+    loop {
+        report(&mb, tracer, regs, *tls, status, &siginfo, event, syscall);
+        let r = match serve(&mb, tracer, regs, tls, passing) {
+            Served::Resume(r) => r,
+            // Listened to, then continued or interrupted: it reports so.
+            Served::Listened => {
+                (status, siginfo, event, syscall) = trap_stop();
+                continue;
+            }
+        };
+        // An interrupt asked for while it was stopped: it stops again at
+        // once.
+        if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) == 1 && traced() {
+            (status, siginfo, event, syscall) = trap_stop();
+            continue;
+        }
+        break r;
+    }
+}
+
+/// The stop an interrupt makes, or the end of a group-stop a seized
+/// tracee was listened to in: `PTRACE_EVENT_STOP` with SIGTRAP.
+fn trap_stop() -> (i32, [u8; 128], u64, u64) {
+    let trap = fwe_abi::signal::SIGTRAP;
+    let info =
+        crate::thread::SigInfo { code: trap as i32 | PTRACE_EVENT_STOP << 8, ..Default::default() };
+    (stop_status(trap, PTRACE_EVENT_STOP), crate::signal::siginfo_bytes(trap, info), 0, 0)
+}
+
+/// Publish a stop in mailbox `mb` and tell `tracer`.
+#[allow(clippy::too_many_arguments)]
+fn report(
+    mb: &Page,
+    tracer: i32,
+    regs: &crate::Regs,
+    tls: u64,
+    status: i32,
+    siginfo: &[u8; 128],
+    event: u64,
+    syscall: u64,
+) {
+    put_regs(mb, regs);
+    mb.word(W_TLS).store(tls, Ordering::Release);
     mb.put(SIGINFO_AT, siginfo);
     mb.word(W_EVENTMSG).store(event, Ordering::Release);
+    mb.word(W_SYSCALL).store(syscall, Ordering::Release);
+    mb.word(W_SIGMASK).store(crate::thread::mask(), Ordering::Release);
+    mb.word(W_SIGMASK_SET).store(0, Ordering::Release);
     mb.word(W_STATUS).store(status as u32 as u64, Ordering::Release);
     mb.word(W_STATE).store(STOPPED, Ordering::Release);
     wake_word(mb.word(W_STATE));
@@ -603,12 +733,48 @@ pub fn stop(
     crate::host::kill_process(tracer, libc::SIGCHLD);
     // fwe's wake signal too, which ends a host wait the tracer is in.
     crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+}
+
+/// How serving a stop ended.
+enum Served {
+    Resume(Resume),
+    /// Listened to (`PTRACE_LISTEN`), then continued (`SIGCONT`) or
+    /// interrupted.
+    Listened,
+}
+
+/// Whether host signal `sig` is pending for this thread: a stop is served
+/// with the host's signals blocked (in fwe's trap handler), so what comes
+/// for it waits there.
+fn host_pending(sig: libc::c_int) -> bool {
+    // SAFETY: an empty set is a valid out-parameter; plain host calls.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut set) == 0 && libc::sigismember(&set, sig) == 1
+    }
+}
+
+/// Whether a guest's `SIGKILL` waits for this process: its host form
+/// ([`crate::host::KILL_RELAY`]) pending, or (where a handler took it, in
+/// the VM backend) the guest signal. A stop ends for it, as Linux kills a
+/// stopped tracee.
+fn killed() -> bool {
+    crate::thread::pending() & 1 << (fwe_abi::signal::SIGKILL - 1) != 0
+        || host_pending(crate::host::KILL_RELAY)
+}
+
+/// Carry out the tracer's requests at a stop, until it says to go on.
+fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing: u64) -> Served {
     loop {
         let req = mb.word(W_REQ).load(Ordering::Acquire);
         if req == mb.word(W_DONE).load(Ordering::Acquire) {
             if !alive(tracer) {
                 end();
-                break Resume::Cont(passing);
+                break Served::Resume(Resume::Cont(passing));
+            }
+            if killed() {
+                mb.word(W_STATE).store(RUNNING, Ordering::Release);
+                break Served::Resume(Resume::Cont(0));
             }
             wait_word_for(mb.word(W_REQ), req, Duration::from_millis(100));
             continue;
@@ -631,7 +797,21 @@ pub fn stop(
                 Ok(()) => 0,
                 Err(e) => -(e as i64),
             },
-            OP_CONT => {
+            OP_READ => {
+                let mut b = vec![0u8; (data as usize).min(MEMBUF_LEN)];
+                let n = read_some(addr, &mut b);
+                mb.put(MEMBUF_AT, &b[..n]);
+                if n == 0 && !b.is_empty() { -(errno::EIO as i64) } else { n as i64 }
+            }
+            OP_WRITE => {
+                let n = (data as usize).min(MEMBUF_LEN);
+                let b = mb.bytes(MEMBUF_AT, n.div_ceil(8) * 8);
+                match crate::procmem::write_forced(addr, &b[..n]) {
+                    Ok(()) => n as i64,
+                    Err(e) => -(e as i64),
+                }
+            }
+            OP_CONT | OP_DETACH => {
                 resume = Some(Resume::Cont(data));
                 0
             }
@@ -639,20 +819,35 @@ pub fn stop(
                 resume = Some(Resume::Syscall(data));
                 0
             }
-            OP_DETACH => {
-                resume = Some(Resume::Cont(data));
-                0
-            }
             OP_STEP => {
                 resume = Some(Resume::Step(data));
                 0
+            }
+            OP_LISTEN => {
+                mb.word(W_STATE).store(LISTENING, Ordering::Release);
+                mb.word(W_RESULT).store(0, Ordering::Release);
+                mb.word(W_DONE).store(req, Ordering::Release);
+                wake_word(mb.word(W_DONE));
+                if listen(mb, tracer) {
+                    if killed() {
+                        mb.word(W_STATE).store(RUNNING, Ordering::Release);
+                        return Served::Resume(Resume::Cont(0));
+                    }
+                    return Served::Listened;
+                }
+                end();
+                return Served::Resume(Resume::Cont(0));
             }
             _ => -(errno::EIO as i64),
         };
         mb.word(W_RESULT).store(result as u64, Ordering::Release);
         if let Some(r) = resume {
-            get_regs(&mb, regs);
+            get_regs(mb, regs);
             *tls = mb.word(W_TLS).load(Ordering::Acquire);
+            // A signal mask the tracer set (`PTRACE_SETSIGMASK`).
+            if mb.word(W_SIGMASK_SET).swap(0, Ordering::AcqRel) == 1 {
+                crate::thread::set_mask(mb.word(W_SIGMASK).load(Ordering::Acquire));
+            }
             SYSCALLS.with(|t| t.set(matches!(r, Resume::Syscall(_))));
             mb.word(W_STATE).store(RUNNING, Ordering::Release);
             mb.word(W_DONE).store(req, Ordering::Release);
@@ -665,11 +860,51 @@ pub fn stop(
             if matches!(r, Resume::Step(_)) {
                 arm_step(regs);
             }
-            break r;
+            break Served::Resume(r);
         }
         mb.word(W_DONE).store(req, Ordering::Release);
         wake_word(mb.word(W_DONE));
     }
+}
+
+/// Stay stopped, listened to (`PTRACE_LISTEN`), until `SIGCONT` (or
+/// `SIGKILL`) comes or the tracer interrupts: true then, false if the
+/// tracer is gone. A `SIGCONT` is looked for among the host's pending
+/// signals ([`host_pending`]), and delivered once the stop is over.
+fn listen(mb: &Page, tracer: i32) -> bool {
+    let cont = 1u64 << (fwe_abi::signal::SIGCONT - 1);
+    loop {
+        if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) == 1
+            || crate::thread::pending() & cont != 0
+            || host_pending(libc::SIGCONT)
+            || killed()
+        {
+            return true;
+        }
+        if !alive(tracer) {
+            return false;
+        }
+        wait_word_for(mb.word(W_INTERRUPT), 0, Duration::from_millis(20));
+    }
+}
+
+/// Read as much of `buf.len()` bytes at `addr` as is readable from the
+/// start: how many.
+fn read_some(addr: u64, buf: &mut [u8]) -> usize {
+    if crate::procmem::read_forced(addr, buf).is_ok() {
+        return buf.len();
+    }
+    // Up to the first page that cannot be read.
+    let mut done = 0;
+    while done < buf.len() {
+        let at = addr + done as u64;
+        let n = (4096 - (at % 4096) as usize).min(buf.len() - done);
+        if crate::procmem::read_forced(at, &mut buf[done..done + n]).is_err() {
+            break;
+        }
+        done += n;
+    }
+    done
 }
 
 fn put_regs(mb: &Page, regs: &crate::Regs) {
@@ -854,10 +1089,129 @@ pub fn process_of(id: i32) -> i32 {
 /// it is stopped (`ESRCH` otherwise, as Linux's).
 fn stopped(pid: i32) -> Result<Page, i32> {
     let mb = tracee(pid)?;
-    if mb.word(W_STATE).load(Ordering::Acquire) == RUNNING {
+    if matches!(mb.word(W_STATE).load(Ordering::Acquire), RUNNING | LISTENING) {
         return Err(errno::ESRCH);
     }
     Ok(mb)
+}
+
+/// Whether this process traces `pid` (a tracee's id) and it is stopped.
+pub fn traces_stopped(pid: i32) -> bool {
+    stopped(pid).is_ok()
+}
+
+/// Copy between stopped tracee `pid`'s memory at `addr` and `buf` (into
+/// it if `write`), a part at a time through its mailbox: the bytes moved
+/// up to the first that cannot be (`EIO` if none).
+pub fn tracee_memory(pid: i32, addr: u64, buf: &mut [u8], write: bool) -> Result<usize, i32> {
+    let mb = stopped(pid)?;
+    let mut done = 0;
+    while done < buf.len() {
+        let n = (buf.len() - done).min(MEMBUF_LEN);
+        let at = addr.wrapping_add(done as u64);
+        let r = if write {
+            mb.put(MEMBUF_AT, &buf[done..done + n]);
+            ask(&mb, pid, OP_WRITE, at, n as u64)
+        } else {
+            ask(&mb, pid, OP_READ, at, n as u64).inspect(|&got| {
+                let got = got as usize;
+                let b = mb.bytes(MEMBUF_AT, got.div_ceil(8) * 8);
+                buf[done..done + got].copy_from_slice(&b[..got]);
+            })
+        };
+        match r {
+            Ok(got) if got as usize == n => done += n,
+            Ok(got) => return Ok(done + got as usize),
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}
+
+/// `PTRACE_SEIZE` of tracee `id` (of host process `proc`) with `options`:
+/// traced without stopping it; its nudge sent by the caller.
+fn seize(id: i32, proc: i32, options: u64) -> Result<(), i32> {
+    attach_id(id, proc)?;
+    let mb = open(&mailbox_name(id), false).ok_or(errno::ESRCH)?;
+    mb.word(W_OPTIONS).store(options, Ordering::Release);
+    mb.word(W_SEIZED).store(1, Ordering::Release);
+    Ok(())
+}
+
+/// Whether tracee `pid` (traced by this process) was seized.
+fn is_seized(mb: &Page) -> bool {
+    mb.word(W_SEIZED).load(Ordering::Acquire) == 1
+}
+
+/// `PTRACE_INTERRUPT` of seized tracee `pid`: it stops as soon as it can
+/// (once resumed, if stopped now; at once, if listened to). Whether it is
+/// to be nudged (it runs).
+pub fn interrupt(pid: i32) -> Result<bool, i32> {
+    let mb = tracee(pid)?;
+    if !is_seized(&mb) {
+        return Err(errno::EIO);
+    }
+    mb.word(W_INTERRUPT).store(1, Ordering::Release);
+    wake_word(mb.word(W_INTERRUPT));
+    Ok(mb.word(W_STATE).load(Ordering::Acquire) == RUNNING)
+}
+
+/// `PTRACE_LISTEN` of seized tracee `pid`, in a group-stop: it stays
+/// stopped, reporting again when continued or interrupted.
+pub fn listen_to(pid: i32) -> Result<(), i32> {
+    let mb = stopped(pid)?;
+    let status = mb.word(W_STATUS).load(Ordering::Acquire) as i32;
+    let sig = ((status >> 8) & 0xff) as u64;
+    if !is_seized(&mb) || status >> 16 != PTRACE_EVENT_STOP || sig == fwe_abi::signal::SIGTRAP {
+        return Err(errno::EIO);
+    }
+    ask(&mb, pid, OP_LISTEN, 0, 0).map(|_| ())
+}
+
+/// Stopped tracee `pid`'s signal mask.
+pub fn sigmask(pid: i32) -> Result<u64, i32> {
+    Ok(stopped(pid)?.word(W_SIGMASK).load(Ordering::Acquire))
+}
+
+/// Set stopped tracee `pid`'s signal mask (never SIGKILL or SIGSTOP), as
+/// it goes on.
+pub fn set_sigmask(pid: i32, mask: u64) -> Result<(), i32> {
+    use fwe_abi::signal::{SIGKILL, SIGSTOP};
+    let mb = stopped(pid)?;
+    let mask = mask & !(1 << (SIGKILL - 1) | 1 << (SIGSTOP - 1));
+    mb.word(W_SIGMASK).store(mask, Ordering::Release);
+    mb.word(W_SIGMASK_SET).store(1, Ordering::Release);
+    Ok(())
+}
+
+/// Stopped tracee `pid`'s `struct ptrace_syscall_info`: the call it is
+/// stopped at the entry (its number and arguments) or exit (its result)
+/// of, or the stop's place only.
+pub fn syscall_info(pid: i32) -> Result<Vec<u8>, i32> {
+    let mb = stopped(pid)?;
+    let r = mb.bytes(REGS_AT, PRSTATUS_SIZE);
+    let reg = |i: usize| u64::from_le_bytes(r[i * 8..i * 8 + 8].try_into().unwrap());
+    let op = mb.word(W_SYSCALL).load(Ordering::Acquire);
+    let mut b = vec![op as u8, 0, 0, 0];
+    b.extend_from_slice(&AUDIT_ARCH_AARCH64.to_le_bytes());
+    b.extend_from_slice(&reg(32).to_le_bytes());
+    b.extend_from_slice(&reg(31).to_le_bytes());
+    match op {
+        1 => {
+            b.extend_from_slice(&reg(8).to_le_bytes());
+            for i in 0..6 {
+                b.extend_from_slice(&reg(i).to_le_bytes());
+            }
+        }
+        2 => {
+            let rval = reg(0) as i64;
+            b.extend_from_slice(&rval.to_le_bytes());
+            b.push(u8::from((-4095..0).contains(&rval)));
+        }
+        _ => {}
+    }
+    Ok(b)
 }
 
 /// Ask stopped tracee `mb` (host process `pid`) to do `op`: its result.
@@ -1065,7 +1419,7 @@ fn attach_id(pid: i32, proc: i32) -> Result<(), i32> {
         return Err(errno::EPERM);
     }
     let mb = open(&mailbox_name(pid), true).ok_or(errno::ENOMEM)?;
-    for w in [W_STATE, W_REQ, W_DONE, W_OPTIONS, W_EVENTMSG] {
+    for w in FRESH {
         mb.word(w).store(0, Ordering::Release);
     }
     mb.word(W_TRACER).store(me() as u64, Ordering::Release);
@@ -1083,10 +1437,14 @@ fn attach_id(pid: i32, proc: i32) -> Result<(), i32> {
 }
 
 /// Whether taking `sig` begins this thread's tracing: a SIGSTOP a tracer
-/// sent as it attached (its mailbox names a live tracer).
+/// sent as it attached, or any signal once seized (its mailbox names a
+/// live tracer).
 pub fn attached(sig: u64) -> bool {
-    if sig != fwe_abi::signal::SIGSTOP || traced() {
+    if traced() {
         return false;
+    }
+    if sig != fwe_abi::signal::SIGSTOP {
+        return begin_seized();
     }
     let Some(mb) = open(&mailbox_name(self_id()), false) else { return false };
     let tracer = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
@@ -1094,6 +1452,25 @@ pub fn attached(sig: u64) -> bool {
         return false;
     }
     if mb.word(W_STATE).load(Ordering::Acquire) == EXITED {
+        return false;
+    }
+    mb.word(W_PROC).store(me() as u64, Ordering::Release);
+    TRACER.with(|t| t.set(tracer));
+    SYSCALLS.with(|t| t.set(false));
+    set_traced(true);
+    true
+}
+
+/// A thread seized (`PTRACE_SEIZE`) but not yet traced is traced from now
+/// on: whether it was.
+fn begin_seized() -> bool {
+    let Some(mb) = open(&mailbox_name(self_id()), false) else { return false };
+    let tracer = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
+    if mb.word(W_SEIZED).load(Ordering::Acquire) != 1
+        || tracer <= 0
+        || !alive(tracer)
+        || mb.word(W_STATE).load(Ordering::Acquire) == EXITED
+    {
         return false;
     }
     mb.word(W_PROC).store(me() as u64, Ordering::Release);
@@ -1121,13 +1498,14 @@ impl<P: crate::Platform> crate::Kernel<P> {
         status: i32,
         siginfo: &[u8; 128],
         event: u64,
+        syscall: u64,
     ) -> Resume {
         if RESYNC.swap(false, Ordering::AcqRel) {
             self.resync_for_tracing();
         }
         let mut tls = self.platform.thread_pointer();
         let before = tls;
-        let r = stop(regs, &mut tls, status, siginfo, event);
+        let r = stop(regs, &mut tls, status, siginfo, event, syscall);
         if tls != before {
             self.platform.set_thread_pointer(tls);
         }
@@ -1146,7 +1524,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         info: crate::thread::SigInfo,
     ) -> Option<(u64, crate::thread::SigInfo)> {
         let si = crate::signal::siginfo_bytes(sig, info);
-        let r = self.stop_with_tls(regs, stop_status(sig, 0), &si, 0);
+        let r = self.stop_with_tls(regs, stop_status(sig, 0), &si, 0, 0);
         let to = r.signal();
         if to == 0 || to > fwe_abi::signal::NSIG {
             return None;
@@ -1161,7 +1539,8 @@ impl<P: crate::Platform> crate::Kernel<P> {
     }
 
     /// The stop after a successful `execve` of a traced process: SIGTRAP,
-    /// or the exec event (`PTRACE_O_TRACEEXEC`).
+    /// or the exec event (`PTRACE_O_TRACEEXEC`); a seized one stops only
+    /// for the event.
     pub fn ptrace_exec_stop(&mut self, regs: &mut crate::Regs) {
         if !traced() {
             return;
@@ -1169,12 +1548,27 @@ impl<P: crate::Platform> crate::Kernel<P> {
         self.resync_for_tracing();
         let trap = fwe_abi::signal::SIGTRAP;
         let event = if options() & PTRACE_O_TRACEEXEC != 0 { PTRACE_EVENT_EXEC } else { 0 };
+        let legacy_trap = event == 0 && !seized();
         let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
         let si = crate::signal::siginfo_bytes(trap, info);
         let msg = crate::thread::tgid() as u64;
-        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg);
-        if r.signal() != 0 {
-            crate::thread::post_process(r.signal(), info);
+        // The exec event comes before the call's exit stop; the SIGTRAP of
+        // a tracee without it, a signal, after.
+        if event != 0 {
+            let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg, 0);
+            if r.signal() != 0 {
+                crate::thread::post_process(r.signal(), info);
+            }
+        }
+        if stops_at_syscalls() {
+            regs.x[0] = 0;
+            self.ptrace_syscall_stop(regs, false);
+        }
+        if legacy_trap {
+            let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, msg, 0);
+            if r.signal() != 0 {
+                crate::thread::post_process(r.signal(), info);
+            }
         }
     }
 
@@ -1188,7 +1582,47 @@ impl<P: crate::Platform> crate::Kernel<P> {
         let trap = fwe_abi::signal::SIGTRAP;
         let info = crate::thread::SigInfo { code: trap as i32 | event << 8, ..Default::default() };
         let si = crate::signal::siginfo_bytes(trap, info);
-        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg);
+        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg, 0);
+        if r.signal() != 0 {
+            let info =
+                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+            crate::thread::post_process(r.signal(), info);
+        }
+    }
+
+    /// fwe's nudge ([`POKE_CODE`]) taken: a seized thread is traced from
+    /// now on, and stops if its tracer asked it to (`PTRACE_INTERRUPT`, or
+    /// as it first starts), with `PTRACE_EVENT_STOP` and SIGTRAP.
+    pub fn ptrace_poked(&mut self, regs: &mut crate::Regs) {
+        if !traced() && !begin_seized() {
+            return;
+        }
+        let Some(mb) = open(&mailbox_name(self_id()), false) else { return };
+        if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) != 1 {
+            return;
+        }
+        drop(mb);
+        let (status, si, _, _) = trap_stop();
+        let r = self.stop_with_tls(regs, status, &si, 0, 0);
+        if r.signal() != 0 {
+            let info =
+                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+            crate::thread::post_process(r.signal(), info);
+        }
+    }
+
+    /// A stop signal `sig` (with `info`) whose default action stops a
+    /// seized thread: a group-stop, which its tracer sees as
+    /// `PTRACE_EVENT_STOP` with the signal, and which ends as the tracer
+    /// says (or, listened to, at `SIGCONT`).
+    pub fn ptrace_group_stop(
+        &mut self,
+        regs: &mut crate::Regs,
+        sig: u64,
+        info: crate::thread::SigInfo,
+    ) {
+        let si = crate::signal::siginfo_bytes(sig, info);
+        let r = self.stop_with_tls(regs, stop_status(sig, PTRACE_EVENT_STOP), &si, 0, 0);
         if r.signal() != 0 {
             let info =
                 crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
@@ -1224,8 +1658,8 @@ impl<P: crate::Platform> crate::Kernel<P> {
         }
     }
 
-    /// A system call's entry or exit stop (`PTRACE_SYSCALL`).
-    pub fn ptrace_syscall_stop(&mut self, regs: &mut crate::Regs) {
+    /// A system call's entry stop (`entry`) or exit stop (`PTRACE_SYSCALL`).
+    pub fn ptrace_syscall_stop(&mut self, regs: &mut crate::Regs, entry: bool) {
         if !stops_at_syscalls() {
             return;
         }
@@ -1234,7 +1668,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         let info =
             crate::thread::SigInfo { code: fwe_abi::signal::SIGTRAP as i32, ..Default::default() };
         let si = crate::signal::siginfo_bytes(fwe_abi::signal::SIGTRAP, info);
-        let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, 0);
+        let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, 0, if entry { 1 } else { 2 });
         if r.signal() != 0 {
             let info =
                 crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
@@ -1273,19 +1707,28 @@ impl<P: crate::Platform> crate::Kernel<P> {
                 Err(e) => err(e),
             };
         }
+        // Seizing takes its options, and nothing at `addr`.
+        if request == PTRACE_SEIZE && (addr != 0 || data & !KNOWN_OPTIONS != 0) {
+            return err(errno::EIO);
+        }
         // A thread of another process, attached to on its own: fwe's
-        // SIGSTOP for it, through its process's queue.
+        // SIGSTOP for it, through its process's queue (seized: the nudge).
         if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE)
             && let Some(owner) = crate::thread::owner_of_tid(pid as i32)
         {
             if owner == me() || !self.may_trace(owner) {
                 return err(errno::EPERM);
             }
-            if let Err(e) = attach_id(pid as i32, owner) {
+            let (r, code) = if request == PTRACE_SEIZE {
+                (seize(pid as i32, owner, data), POKE_CODE)
+            } else {
+                (attach_id(pid as i32, owner), 0)
+            };
+            if let Err(e) = r {
                 return err(e);
             }
             let stop = fwe_abi::signal::SIGSTOP;
-            return match crate::signote::queue_thread(owner, pid as i32, stop, 0, 0) {
+            return match crate::signote::queue_thread(owner, pid as i32, stop, code, 0) {
                 Ok(()) => crate::host::kill_process(owner, crate::host::WAKE_SIGNAL),
                 Err(e) => err(e),
             };
@@ -1300,15 +1743,22 @@ impl<P: crate::Platform> crate::Kernel<P> {
             if !self.may_trace(target) || crate::procreg::read(target).is_none() {
                 return err(errno::EPERM);
             }
-            if let Err(e) = attach(target) {
+            let (r, code) = if request == PTRACE_SEIZE {
+                (seize(target, target, data), POKE_CODE)
+            } else {
+                (attach(target), fwe_abi::signal::SI_USER)
+            };
+            if let Err(e) = r {
                 return err(e);
             }
-            return crate::signal::send_unhosted(
-                target,
-                fwe_abi::signal::SIGSTOP,
-                fwe_abi::signal::SI_USER,
-                0,
-            );
+            return crate::signal::send_unhosted(target, fwe_abi::signal::SIGSTOP, code, 0);
+        }
+        if request == PTRACE_INTERRUPT {
+            return match interrupt(target) {
+                Ok(true) => self.nudge(target),
+                Ok(false) => 0,
+                Err(e) => err(e),
+            };
         }
         if request == PTRACE_KILL {
             if !traces(target) {
@@ -1366,6 +1816,19 @@ impl<P: crate::Platform> crate::Kernel<P> {
                 uaccess::write(data, m)?;
                 Ok(0)
             }
+            PTRACE_LISTEN => listen_to(target).map(|()| 0),
+            PTRACE_GETSIGMASK | PTRACE_SETSIGMASK if addr != 8 => Err(errno::EINVAL),
+            PTRACE_GETSIGMASK => {
+                uaccess::write(data, sigmask(target)?)?;
+                Ok(0)
+            }
+            PTRACE_SETSIGMASK => set_sigmask(target, uaccess::read(data)?).map(|()| 0),
+            PTRACE_GET_SYSCALL_INFO => {
+                let info = syscall_info(target)?;
+                let n = info.len().min(addr as usize);
+                uaccess::write_from(data, &info[..n])?;
+                Ok(info.len() as i64)
+            }
             _ => {
                 stopped(target)?;
                 Err(errno::EIO)
@@ -1375,6 +1838,22 @@ impl<P: crate::Platform> crate::Kernel<P> {
             Ok(v) => v,
             Err(e) => err(e),
         }
+    }
+}
+
+impl<P: crate::Platform> crate::Kernel<P> {
+    /// fwe's nudge ([`POKE_CODE`]) to tracee `id`: a thread through its
+    /// process's queue, a process through its own.
+    fn nudge(&self, id: i32) -> i64 {
+        let proc = process_of(id);
+        let stop = fwe_abi::signal::SIGSTOP;
+        if proc != id {
+            return match crate::signote::queue_thread(proc, id, stop, POKE_CODE, 0) {
+                Ok(()) => crate::host::kill_process(proc, crate::host::WAKE_SIGNAL),
+                Err(e) => fwe_abi::err(e),
+            };
+        }
+        crate::signal::send_unhosted(id, stop, POKE_CODE, 0)
     }
 }
 

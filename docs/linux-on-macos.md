@@ -1449,7 +1449,7 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `ptrace` | `TRACEME`, `ATTACH`, `SEIZE`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `mmap` of a shared page, `__ulock_wait2`/`__ulock_wake`, `kill` |
+| `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `mmap` of a shared page, `__ulock_wait2`/`__ulock_wake`, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
 | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path, TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); the domain is the process's, carried by `fork` and `execve` | none |
 | `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
@@ -1461,7 +1461,10 @@ delivered, a system call's entry or exit under `PTRACE_SYSCALL`, an
 wait status and `siginfo` there, tells its tracer through the tracer's
 inbox page, `SIGCHLD` and fwe's wake signal, and serves requests until told
 to go on. The tracer reads and writes registers and `siginfo` in the
-mailbox itself and asks the tracee for each memory word. The tracee is
+mailbox itself and asks the tracee for memory, a word or 2 KiB at a time
+(`/proc/<pid>/mem`, `process_vm_readv`). `PTRACE_SEIZE` and
+`PTRACE_INTERRUPT` nudge the tracee with a `SIGSTOP` of fwe's own queue
+that no guest sees, which ends a wait it is in. The tracee is
 never stopped on the host, so the tracer's `wait4`/`waitid` take a stop
 from the inbox before asking the host. Single-stepping plants
 `brk #0x4c59` where the instruction may go next. Details are in
@@ -2029,8 +2032,11 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   `synthdir.rs`); what of the host shows there is under
   [Host identity and machine state](#host-identity-and-machine-state).
 - `/proc/<pid>`, with its `task` directory, covers the processes of the
-  reader's pid namespace. `/proc/self/mem` and `pagemap` are the caller's
-  own memory only. `/proc/sys` writes reach the namespace sysctls fwe
+  reader's pid namespace. Another process's `mem` (and a thread's,
+  `task/<tid>/mem`) is read and written as `process_vm_readv` reaches it,
+  or through a stopped tracee's mailbox, and its `auxv` is the vector
+  its program started with (a fork child's, its parent's); `pagemap` is
+  the caller's own only. `/proc/sys` writes reach the namespace sysctls fwe
   keeps (network, IPC) and the few it acts on.
 - `/proc/self/fd/N`, `cwd` and `root` behave as magic links.
 - `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's;
