@@ -119,30 +119,6 @@ jobs:
           name: docker-traces
           path: target/tmp/docker-traces
 
-  # TEMPORARY (removed before merging): the crun test, many times, to find
-  # a crash seen once.
-  crun-stress:
-    name: crun stress (macos-26)
-    runs-on: macos-26
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: |
-          cargo test -p fwe --test guests --no-run
-          fails=0
-          for i in $(seq 1 30); do
-            if ! cargo test -q -p fwe --test guests -- alpine_crun --exact alpine_crun_runs_an_image --nocapture > run-$i.log 2>&1; then
-              fails=$((fails+1)); echo "run $i failed"; grep -v "^\[fwe" run-$i.log | tail -40; grep -A20 "last calls" run-$i.log | head -400
-            fi
-          done
-          echo "failed $fails of 30"
-          test $fails = 0
-
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
   ltp:

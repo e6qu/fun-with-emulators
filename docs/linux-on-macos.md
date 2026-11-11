@@ -2343,15 +2343,18 @@ the host takes as Linux would (`Kernel::sync_host_signal`):
 | a handler | caught by fwe | to build Linux's frame |
 | read by a `signalfd` or `rt_sigtimedwait` | caught by fwe, whatever the disposition, while it is read | to queue it there |
 | default, and the default ends or stops the process (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGTSTP`, `SIGTTIN`, …) | caught by fwe, which carries the default out | so a thread whose guest mask blocks it keeps it pending, the parent sees Linux's status, and a VM process tears its VM down first |
-| default, and the default ignores or continues (`SIGCHLD`, `SIGURG`, `SIGWINCH`, `SIGCONT`) | host default | the host does the same |
+| default, and the default ignores (`SIGCHLD`, `SIGURG`, `SIGWINCH`) | caught by fwe, which drops it unless the guest blocks it | macOS discards such a signal even while it is blocked; Linux keeps a blocked one pending |
+| default `SIGCONT` | host default | the host does the same |
 | ignored | host `SIG_IGN` | the host does the same, and keeps it ignored across `execve` |
 | `SIGKILL`, `SIGSTOP` | the host's | they cannot be caught |
 | fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | fwe's fault handlers, always | see [Faults in guest code](#faults-in-guest-code) |
 
 A guest thread runs under a host mask holding only the guest-blocked
 signals whose action the host applies (`host::host_mask_for`); fwe's
-handlers run with every signal blocked. `SIGCHLD`'s `SA_NOCLDSTOP` and
-`SA_NOCLDWAIT` are passed to the host with it.
+handlers run with every signal blocked, and what a handler does for a
+signal that interrupted fwe's own code allocates nothing (it may have
+interrupted the allocator). `SIGCHLD`'s `SA_NOCLDSTOP` and `SA_NOCLDWAIT`
+are passed to the host with it.
 
 #### A host signal reaching a guest thread
 

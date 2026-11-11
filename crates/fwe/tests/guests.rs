@@ -2175,7 +2175,7 @@ fn debian_apt_installs_and_removes_a_package() {
         .stdin(Stdio::null());
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_dir_all(&root);
-    eprintln!("--- apt stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("--- apt ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     // dpkg's progress, which apt relays, is interleaved; the lines asked for
     // come in order.
     let text = stdout(&out);
@@ -3381,6 +3381,7 @@ const PROCSIG: &str = "queued to -1: true\n\
     core of a fault: (11, true), an ELF core true\n\
     core of SIGABRT: (6, true), an ELF core true\n\
     end told with: SIGUSR2, reaped true\n\
+    blocked SIGCHLD kept: true\n\
     memory shared: {shared}\n\
     cpu limit: SIGXCPU true, then true\n\
     timer slack: 70000, shown 70000, the child's true\n\
@@ -3389,7 +3390,8 @@ const PROCSIG: &str = "queued to -1: true\n\
 
 /// Signals between processes and how processes end: a queued real-time
 /// signal, `rt_sigqueueinfo` to -1 refused, signals the moment a child is
-/// forked, core dumps, a clone's own exit signal, a child sharing the
+/// forked, core dumps, a clone's own exit signal, a blocked `SIGCHLD` kept
+/// pending at its default action, a child sharing the
 /// memory, the hard CPU limit and an inherited timer slack.
 #[test]
 fn process_signals_and_ends() {

@@ -101,6 +101,13 @@ pub fn open_own() {
 
 /// `<dir>/<pid>.sig`, NUL-terminated, in `buf`. Async-signal-safe.
 fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
+    record_file(pid, b".sig", buf)
+}
+
+/// The path of process `pid`'s file beside its record with suffix `suffix`
+/// (`.sig`, its mailbox; `.end`, how it ended), NUL-terminated in `buf`.
+/// Async-signal-safe: it allocates nothing.
+pub fn record_file(pid: i32, suffix: &[u8], buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
     let dir = DIR.get()?;
     let mut digits = [0u8; 12];
     let mut n = pid.unsigned_abs();
@@ -113,7 +120,7 @@ fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
             break;
         }
     }
-    let need = dir.len() + 1 + len + 4 + 1;
+    let need = dir.len() + 1 + len + suffix.len() + 1;
     if pid <= 0 || need > buf.len() {
         return None;
     }
@@ -125,8 +132,8 @@ fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
         buf[at] = digits[i];
         at += 1;
     }
-    buf[at..at + 4].copy_from_slice(b".sig");
-    buf[at + 4] = 0;
+    buf[at..at + suffix.len()].copy_from_slice(suffix);
+    buf[at + suffix.len()] = 0;
     Some(buf.as_ptr().cast())
 }
 

@@ -340,9 +340,24 @@ pub fn ending(status: i32) {
 }
 
 /// The Linux wait status host process `pid` left as it ended of a signal.
+/// Async-signal-safe (a `SIGCHLD` handler asks): it allocates nothing.
 pub fn end_status(pid: i32) -> Option<i32> {
-    let b = std::fs::read(OsStr::from_bytes(&end_path(pid)?)).ok()?;
-    Some(i32::from_ne_bytes(b.get(..4)?.try_into().ok()?))
+    let mut buf = [0u8; 512];
+    let path = crate::signote::record_file(pid, b".end", &mut buf)?;
+    let mut b = [0u8; 4];
+    let saved = crate::host::last_errno();
+    // SAFETY: a NUL-terminated path; a buffer of its length; the
+    // descriptor is closed here.
+    let n = unsafe {
+        let fd = libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC);
+        let n = if fd < 0 { -1 } else { libc::read(fd, b.as_mut_ptr().cast(), b.len()) };
+        if fd >= 0 {
+            libc::close(fd);
+        }
+        n
+    };
+    crate::host::set_errno(saved);
+    (n == 4).then(|| i32::from_ne_bytes(b))
 }
 
 /// Host process `pid` was reaped, or this one starts with that number:
