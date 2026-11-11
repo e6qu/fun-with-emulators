@@ -31,8 +31,9 @@ libcap BSD-3-Clause or GPL-2.0-only; libseccomp LGPL-2.1-or-later; yajl MIT;
 podman, conmon, netavark, containers-common, containerd, ctr, runc,
 dockerd, the docker CLI, buildx, Compose and the registry Apache-2.0;
 shadow, libbsd and linux-pam BSD-3-Clause; libmd BSD-3-Clause,
-BSD-2-Clause, ISC, Beerware and public domain; skalibs and utmps ISC; tini MIT; iptables,
-libnftnl and libxtables GPL-2.0-or-later; libmnl LGPL-2.1-or-later; catatonit
+BSD-2-Clause, ISC, Beerware and public domain; skalibs and utmps ISC;
+tini MIT; iptables, libnftnl and libxtables GPL-2.0-or-later; libmnl
+LGPL-2.1-or-later; catatonit
 GPL-2.0-or-later; gpgme LGPL-2.1-or-later and GPL-3.0-or-later; libassuan,
 glib and libintl LGPL-2.1-or-later; libgpg-error and libgcc
 GPL-2.0-or-later and LGPL-2.1-or-later; sqlite the SQLite blessing; pcre2

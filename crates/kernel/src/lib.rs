@@ -987,14 +987,11 @@ fn file_caps(dir: i32, name: &std::ffi::CStr) -> Option<caps::FileCaps> {
         if fd < 0 {
             return None;
         }
-        let n = libc::fgetxattr(
-            fd,
-            c"security.capability".as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-            0,
-        );
+        let name = c"security.capability".as_ptr();
+        #[cfg(target_os = "macos")]
+        let n = libc::fgetxattr(fd, name, buf.as_mut_ptr().cast(), buf.len(), 0, 0);
+        #[cfg(not(target_os = "macos"))]
+        let n = libc::fgetxattr(fd, name, buf.as_mut_ptr().cast(), buf.len());
         libc::close(fd);
         n
     };
