@@ -686,6 +686,7 @@ fn notify() {
     };
     let sig = fwe_abi::signal::SIGCHLD;
     for e in fresh {
+        crate::trace::note_to_file(&format!("reaper: {} ended, adopted", e.pid));
         if crate::host::children_reaped_by_host() && procreg::take_ended(&e) {
             crate::pidns::released(&e.numbers, e.pid);
         }
@@ -729,6 +730,7 @@ pub fn superseded(pid: i32) -> bool {
 /// holds or is delivering would absorb it (standard signals are not queued
 /// twice), and the guest would hear of the orphan from neither.
 fn raise(e: &Ended) {
+    crate::trace::note_to_file(&format!("reaper: SIGCHLD for {} ({:#x})", e.pid, e.status));
     // An end is what Linux reports before the former parent's own.
     if !is_stop(e.status) && e.status != CONTINUED {
         REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);
@@ -807,6 +809,7 @@ mod watch {
                 if !self.watched.insert(p) {
                     continue;
                 }
+                crate::trace::note_to_file(&format!("reaper: follows {p}"));
                 let ev = change(
                     p,
                     libc::EVFILT_PROC,
@@ -966,6 +969,7 @@ mod watch {
                         }
                     }
                     if ev.fflags & libc::NOTE_EXIT != 0 && pid != me {
+                        crate::trace::note_to_file(&format!("reaper: {pid} exits"));
                         w.watched.remove(&pid);
                         ending.insert((pid, procreg::start_time(pid)));
                         signalled.remove(&pid);

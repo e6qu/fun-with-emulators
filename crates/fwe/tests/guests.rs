@@ -5277,6 +5277,13 @@ fn root_of_a_users_namespace_keeps_capabilities_across_exec() {
     );
 }
 
+/// A user namespace a user made is the user's to join (it has every
+/// capability there), not another user's.
+#[test]
+fn a_users_namespace_is_its_makers_to_join() {
+    assert_eq!(containers("userns-join"), "its maker joins: ok\nanother user joins: EPERM\n");
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.

@@ -1388,7 +1388,7 @@ that the processes in them name ([Namespaces](#namespaces)).
 | `setgroups` | `CAP_SETGID`; up to 65536 groups, mapped up; `EPERM` in a user namespace whose `setgroups` is `deny` or whose `gid_map` is unwritten | none |
 | `capget`, `capset` | effective, permitted and inheritable sets, header versions 1 to 3; the caller's process only | none |
 | `unshare` | mount, UTS, IPC, network, cgroup, pid and user namespaces as new records; `CAP_SYS_ADMIN` except for a user namespace; `CLONE_NEWTIME` is `EINVAL` | none |
-| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN` | none |
+| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN`, for a user namespace in that one (a user has it in one it made) | none |
 | `clone`, `clone3` with `CLONE_NEW*` | the same namespaces made before the host `fork`, so the child inherits them | `fork` (by the backend) |
 
 **`setuid` and the rest**: no host privilege is needed, since only fwe's

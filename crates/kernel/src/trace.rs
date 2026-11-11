@@ -30,6 +30,15 @@ pub fn to_file(path: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Note `message` in the trace file, when the run traces to one: what fwe's
+/// own threads (the reaper's watcher) see and do, which no system call
+/// shows. Nothing without a trace file.
+pub fn note_to_file(message: &str) {
+    if FILE.get().is_some() {
+        Tracer { enabled: true, failures_only: false }.write_line(message);
+    }
+}
+
 /// The file traced to, which a process fwe starts is told of.
 pub fn file() -> Option<&'static [u8]> {
     FILE.get().map(|(p, _)| p.as_slice())

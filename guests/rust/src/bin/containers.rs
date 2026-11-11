@@ -99,6 +99,7 @@ unsafe extern "C" {
     fn waitpid(pid: i32, st: *mut i32, o: i32) -> i32;
     fn setuid(u: u32) -> i32;
     fn geteuid() -> u32;
+    fn setns(fd: i32, t: i32) -> i32;
     fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn execv(p: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
     fn umask(m: u32) -> u32;
@@ -282,6 +283,38 @@ fn main() {
                     _exit(9);
                 }
                 waitpid(-1, std::ptr::null_mut(), 0);
+            }
+            // Joining a user namespace a user made, as rootless podman joins
+            // its pause process's: the user may, another user may not.
+            Some("userns-join") => {
+                let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+                pipe2(ready.as_mut_ptr(), 0);
+                pipe2(go.as_mut_ptr(), 0);
+                let holder = fork();
+                if holder == 0 {
+                    setuid(1000);
+                    unshare(0x1000_0000);
+                    write(ready[1], b"r".as_ptr(), 1);
+                    let mut b = 0u8;
+                    read(go[0], &mut b, 1);
+                    _exit(0);
+                }
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
+                for (uid, who) in [(1000, "its maker"), (2000, "another user")] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    if fork() == 0 {
+                        setuid(uid);
+                        let f = std::fs::File::open(format!("/proc/{holder}/ns/user")).unwrap();
+                        use std::os::fd::AsRawFd;
+                        let r = setns(f.as_raw_fd(), 0x1000_0000);
+                        println!("{who} joins: {}", res(r as i64));
+                        _exit(0);
+                    }
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
+                write(go[1], b"g".as_ptr(), 1);
+                waitpid(holder, std::ptr::null_mut(), 0);
             }
             // A program only the VM runs, on a host without one: the exec
             // fails and the caller goes on, as podman's pause process does

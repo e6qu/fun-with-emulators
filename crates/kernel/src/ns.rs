@@ -157,11 +157,13 @@ impl Namespaces {
     /// Make the new namespaces `flags` asks for (other than the mount and
     /// pid ones, which the caller makes), copying what a new one starts
     /// with from this process's.
-    pub fn unshare(&mut self, flags: u64) -> Result<(), i32> {
+    /// `euid` is the maker's effective uid (the initial namespace's), which
+    /// owns a new user namespace.
+    pub fn unshare(&mut self, flags: u64, euid: u32) -> Result<(), i32> {
         // The user namespace first: the others are made in it.
         if flags & CLONE_NEWUSER != 0 {
             let parent = self.user.as_ref().map(|r| (r.dir().to_vec(), r.id()));
-            let owner = crate::userns::from_ns(0, false).unwrap_or(0);
+            let owner = euid;
             let ns = crate::userns::UserNs { parent, owner, ..Default::default() };
             self.user = Some(Arc::new(Record::fresh("user", ns)?));
         }

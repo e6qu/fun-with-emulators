@@ -296,6 +296,35 @@ impl<P: Platform> Kernel<P> {
         })
     }
 
+    /// Whether the caller has `CAP_SYS_ADMIN` in the user namespace whose
+    /// record is `dir` (`None`: the initial one), as Linux's `ns_capable`:
+    /// in its own namespace by its capabilities; in one below it, made by
+    /// its effective user, outright; in one further below, as in the one
+    /// of those it is in.
+    fn admin_in_user_ns(&self, dir: Option<&[u8]>, id: u64) -> bool {
+        let own = self.fs().ns.user.as_ref().map(|r| r.dir().to_vec());
+        let mut at = dir.map(|d| (d.to_vec(), id));
+        for _ in 0..64 {
+            let Some((d, id)) = at else {
+                // Reached the initial namespace: the caller's only if it is in it.
+                return own.is_none() && self.creds.has_admin();
+            };
+            if Some(&d) == own.as_ref() {
+                return self.creds.has_admin();
+            }
+            let Ok(r) = crate::shared::Record::<crate::userns::UserNs>::join(&d, id) else {
+                return false;
+            };
+            let ns = r.get();
+            let parent = ns.parent.clone();
+            if parent.as_ref().map(|p| &p.0) == own.as_ref() && ns.owner == self.creds.euid {
+                return true;
+            }
+            at = parent;
+        }
+        false
+    }
+
     /// Whether, from namespace `start` of `kind` (`None`: the initial one)
     /// and up through its parents, the caller's own is reached.
     fn reaches(&self, kind: u64, start: &Option<(Vec<u8>, u64)>) -> bool {
@@ -331,7 +360,14 @@ impl<P: Platform> Kernel<P> {
         if nstype != 0 && nstype != n.kind {
             return err(errno::EINVAL);
         }
-        if !self.creds.has_admin() {
+        // CAP_SYS_ADMIN where it counts: for a user namespace, in that one
+        // (a user has it in one of its own, made below its namespace).
+        let admin = if n.kind == CLONE_NEWUSER {
+            self.admin_in_user_ns(n.dir.as_deref(), n.id)
+        } else {
+            self.creds.has_admin()
+        };
+        if !admin {
             return err(errno::EPERM);
         }
         if n.kind == CLONE_NEWUSER && crate::thread::live_threads() > 1 {
