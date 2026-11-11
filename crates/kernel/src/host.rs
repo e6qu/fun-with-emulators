@@ -402,6 +402,7 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
                     b"kill relay note written: ",
                     crate::signote::noted_at(t, KILL_RELAY),
                 );
+                crate::signote::trace_dir();
             }
             if r == 0 {
                 result = 0;

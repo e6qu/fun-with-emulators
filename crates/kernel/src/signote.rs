@@ -289,11 +289,19 @@ fn own_mailbox() -> Option<(i32, bool)> {
     (fd >= 0).then_some((fd, true))
 }
 
+/// Diagnostic: the mailboxes' directory, in the trace file.
+pub fn trace_dir() {
+    if let Some(d) = DIR.get() {
+        crate::trace::note_to_file_raw(d, 0);
+    }
+}
+
 /// Diagnostic, in a handler: what this process's mailbox holds for host
 /// signal `sig`, in the trace file. Async-signal-safe.
 pub fn trace_slots(sig: libc::c_int) {
     use crate::trace::note_to_file_raw as n;
     n(b"mailbox dir set: ", DIR.get().is_some() as i64);
+    trace_dir();
     n(b"mailbox own pid: ", i64::from(OWN_PID.load(Ordering::SeqCst)));
     n(b"mailbox own fd: ", i64::from(OWN.load(Ordering::SeqCst)));
     let Some(off) = offset(sig) else { return };
