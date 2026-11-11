@@ -650,9 +650,8 @@ impl<P: Platform> Kernel<P> {
                 && !ptrace::traced();
             if gains {
                 let privs = ExecPrivs {
-                    uid: (st.st_mode as u32 & libc::S_ISUID as u32 != 0).then_some(st.st_uid),
-                    gid: (st.st_mode as u32 & libc::S_ISGID as u32 != 0
-                        && st.st_mode as u32 & libc::S_IXGRP as u32 != 0)
+                    uid: (st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
+                    gid: (st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
                         .then_some(st.st_gid),
                     caps: file_caps(r.dir.as_raw_fd(), &name),
                 };
