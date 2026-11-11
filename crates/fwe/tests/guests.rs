@@ -4439,7 +4439,7 @@ fn hv_delivers_signals() {
 /// the snapshot the cloning thread's registers are in.
 #[test]
 fn userns_clone_from_a_thread() {
-    let want = "child's parent ours: true, ended 0\n";
+    let want = "child's parent ours: true, its namespace seen: true, killed by 9\n";
     assert_eq!(namespaces("userns-thread-clone"), want);
     let Some(out) = fwe_hv(&rust_low_guest("namespaces"), &["userns-thread-clone"]) else { return };
     assert_eq!(stdout(&out), want);

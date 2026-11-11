@@ -815,18 +815,27 @@ fn main() {
                 pipe(p.as_mut_ptr());
                 let child = syscall(SYS_CLONE, CLONE_NEWUSER as i64 | SIGCHLD as i64, 0, 0, 0, 0);
                 if child == 0 {
+                    // As containers/storage's user-namespace holder: tell
+                    // the parent, then wait in ppoll until it kills us.
                     syscall(167, 1i64, 9i64, 0i64, 0i64, 0i64);
                     let ppid = syscall(173);
                     write_i32(p[1], ppid as i32);
-                    _exit(0);
+                    loop {
+                        syscall(73, 0i64, 0i64, 0i64, 0i64, 0i64);
+                    }
+                }
+                for m in ["uid_map", "gid_map"] {
+                    let _ = std::fs::write(format!("/proc/{child}/{m}"), "0 0 1\n");
                 }
                 let ppid = read_i32(p[0]);
+                let ns = std::fs::metadata(format!("/proc/{child}/ns/user")).is_ok();
+                kill(child as i32, SIGKILL);
                 let mut st = 0;
                 waitpid(child as i32, &mut st, 0);
-                (ppid == getpid(), st)
+                (ppid == getpid(), ns, st)
             });
-            let (parent_ok, st) = t.join().unwrap();
-            println!("child's parent ours: {parent_ok}, ended {}", (st >> 8) & 0xff);
+            let (parent_ok, ns, st) = t.join().unwrap();
+            println!("child's parent ours: {parent_ok}, its namespace seen: {ns}, killed by {}", st & 0x7f);
         }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds

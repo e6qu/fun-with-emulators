@@ -719,16 +719,7 @@ fn hand_off(rx: Port, pid: i32, state: &[u8]) -> Result<(), String> {
 
 /// The child's side: `fwe --hv-fork-child`. Takes the parent's memory and
 /// state, builds a VM and resumes the guest. Does not return.
-/// This process is a VM fork child (for its trace notes).
-static IS_CHILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether this process started as a VM fork child.
-pub(super) fn is_child() -> bool {
-    IS_CHILD.load(Ordering::Relaxed)
-}
-
 pub fn child() -> ! {
-    IS_CHILD.store(true, Ordering::Relaxed);
     super::record::event("fork child starts", b"");
     match become_child() {
         Ok(never) => match never {},
