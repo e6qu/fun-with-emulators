@@ -30,8 +30,9 @@ Unmodified Debian programs run natively against glibc or musl (coreutils,
 bash, git, SQLite, lighttpd, Node.js, rustc with Cargo, apt) and in the VM
 (Python, GCC, clang, Go; verified on a software stand-in for the framework,
 not yet on real hardware). crun, podman and containerd run the `alpine`
-image, and Docker Engine loads, runs and builds images (BuildKit) and
-brings up Docker Compose projects, natively, with no VM. All 1213 of LTP's system-call tests that apply pass.
+image; podman builds, pushes, pulls and runs images, rootless too; and
+Docker Engine loads, runs and builds images (BuildKit) and brings up
+Docker Compose projects, natively, with no VM. All 1213 of LTP's system-call tests that apply pass.
 [ROADMAP.md](ROADMAP.md) has the details and what is left to 1.0.
 
 ## Documentation
