@@ -1747,8 +1747,8 @@ const COMPOSE: &str = "services:\n\
 /// runs in a container and whose `COPY` takes a file of the build context;
 /// a container of the built image runs. Docker Compose (the CLI's plugin)
 /// brings up a project of two services sharing a named volume, one built,
-/// the second started once the first completed, with the second's exit
-/// status its own, and takes it down with its volume. Each container's
+/// the second started once the first completed, each with its own exit
+/// status, and takes it down with its volume. Each container's
 /// exit status is `docker`'s, and nothing is left behind.
 #[test]
 fn alpine_docker_runs_and_builds_images() {
@@ -1824,8 +1824,11 @@ fn alpine_docker_runs_and_builds_images() {
     let built = docker(&["build", "--network=none", "-t", "fwe-built:1", "/tmp/context"], 0);
     let ran = docker(&["run", "--rm", "--network=none", "fwe-built:1"], 0);
     let compose = ["compose", "-p", "fwe", "-f", "/tmp/compose/compose.yaml"];
-    let up =
-        docker(&[&compose[..], &["up", "--no-color", "--exit-code-from", "reader"]].concat(), 6);
+    let up = docker(&[&compose[..], &["up", "--no-color"]].concat(), 0);
+    let codes = docker(
+        &[&compose[..], &["ps", "-a", "--format", "{{.Service}} {{.ExitCode}}"]].concat(),
+        0,
+    );
     let down = docker(&[&compose[..], &["down", "--volumes"]].concat(), 0);
     let after = docker(&["ps", "-a", "--format", "{{.ID}}"], 0);
     let volumes = docker(&["volume", "ls", "-q"], 0);
