@@ -2153,6 +2153,8 @@ fn debian_podman_runs_in_the_vm() {
         .map(|(_, n)| n.trim().to_string())
         .unwrap_or_default();
     eprintln!("--- loaded: {}", stdout(&loaded));
+    let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}} {{.ID}}"]);
+    eprintln!("--- images: {}", stdout(&images));
     let run = podman(&[
         "run",
         "--rm",
@@ -5245,6 +5247,9 @@ fn containers(scenario: &str) -> String {
     }
     std::fs::write(root.join("etc/marker"), "marked\n").unwrap();
     std::fs::copy(rust_guest("containers"), root.join("containers")).unwrap();
+    if scenario == "exec-low" {
+        std::fs::copy(rust_low_guest("hello"), root.join("lowprog")).unwrap();
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace=failures")
         .arg("--root")
@@ -5256,6 +5261,14 @@ fn containers(scenario: &str) -> String {
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
     stdout(&out)
+}
+
+/// A program only the VM can run (linked below 4 GiB), where there is no
+/// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
+/// caller is intact, and the caller goes on.
+#[test]
+fn exec_of_a_vm_program_without_a_vm_fails_cleanly() {
+    assert_eq!(containers("exec-low"), "exec: ENOEXEC, and on\n");
 }
 
 /// What a program gives the user who runs it: file capabilities
@@ -5270,6 +5283,7 @@ fn programs_grant_file_capabilities_and_set_ids() {
          set-uid: euid 0 CapEff:\t000001fffdffffff\n\
          capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
          set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         a user's mknod: whiteout ok, device EPERM\n\
          /proc owners: theirs Ok(1000), opened Ok(1000), own Ok(0)\n"
     );
 }

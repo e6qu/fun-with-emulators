@@ -159,7 +159,12 @@ at its own address.
 `needs_vm` (`crates/native/src/lib.rs`) asks one question: is this a
 non-PIE executable whose lowest loaded page lies below 4 GiB? If so it
 runs in the VM, otherwise natively. Static or dynamic, glibc or musl, C,
-Rust or Go make no difference.
+Rust or Go make no difference. A guest's `execve` of such a program where
+there is no VM to run it (no stand-in, and fwe without the hypervisor
+entitlement or the Mac without `kern.hv_support`, both asked of the
+kernel) fails with `ENOEXEC` while the caller is intact, so it can go on:
+podman's pause process, whose `catatonit` is one, then waits in a loop of
+its own.
 
 ```mermaid
 flowchart TD
@@ -805,7 +810,7 @@ host reports differently.
 | `getdents64` | Entries built from the host's; an overlay directory merges its layers; `O_TMPFILE` names and fwe's cgroup files hidden; fwe's directories listed from memory. | `__getdirentries64` |
 | `faccessat`, `faccessat2` | fwe's check against the kept mode; `CAP_DAC_OVERRIDE` passes all but a missing execute bit; `W_OK` on a read-only mount is `EROFS`. | `faccessat`, `access` |
 | `readlinkat` | `/proc` links answered by fwe; an `O_PATH` stand-in reads the link it names. | `readlinkat`, `readlink` |
-| `mkdirat`, `mknodat` | Umask applied by fwe; a mode denying its owner and the maker's ownership kept in attributes. `mknodat` makes a file, FIFO, socket node or one of fwe's device nodes ([Devices](#devices)). | `mkdirat`, `openat(O_CREAT\|O_EXCL)`, `mkfifoat` |
+| `mkdirat`, `mknodat` | Umask applied by fwe; a mode denying its owner and the maker's ownership kept in attributes. `mknodat` makes a file, FIFO, socket node or one of fwe's device nodes ([Devices](#devices)); a device takes `CAP_MKNOD` but for a whiteout (0:0), as on Linux. | `mkdirat`, `openat(O_CREAT\|O_EXCL)`, `mkfifoat` |
 | `unlinkat` | Overlays get whiteouts; a directory holding only `O_TMPFILE` names is removed with them; the host's `EPERM` for a directory becomes `EISDIR`. | `unlinkat` |
 | `renameat`, `renameat2` | `RENAME_NOREPLACE` and `RENAME_EXCHANGE` atomic, `RENAME_WHITEOUT` leaves a 0:0 node; `EXDEV` across mounts; the working directory follows a rename of it. | `renameatx_np` (`RENAME_EXCL`, `RENAME_SWAP`) |
 | `symlinkat`, `linkat` | `linkat` follows links itself; `AT_EMPTY_PATH` or a `/proc/self/fd` path names the descriptor's file (an `O_TMPFILE` one); `EXDEV` across mounts; `fs.protected_hardlinks` checked. | `symlinkat`, `linkat` (flags 0) |

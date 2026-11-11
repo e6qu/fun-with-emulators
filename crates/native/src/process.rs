@@ -77,9 +77,16 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let fs = k.fs.as_ref().expect("filesystem configured");
     k.may_exec(&path).map_err(err)?;
     let file = fs.read(&path).map_err(err)?;
+    let vm = crate::needs_vm(&file);
+    // A program only the VM can run, where there is none: the exec fails
+    // while the caller is intact (podman's pause process then waits in a
+    // loop of its own, say), rather than once it has gone.
+    if vm && !crate::hv::usable() {
+        return Err(err(fwe_abi::errno::ENOEXEC));
+    }
     // A program only the VM can run, or an exec from a process with other
     // threads (which must end): replace this process with a fresh fwe.
-    if crate::needs_vm(&file) || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
+    if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
         fwe_kernel::release_robust_lists();
         let state = k.exec_state();
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));

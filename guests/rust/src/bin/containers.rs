@@ -172,6 +172,7 @@ fn name(e: i32) -> &'static str {
         ESTALE => "ESTALE",
         ENXIO => "ENXIO",
         EAFNOSUPPORT => "EAFNOSUPPORT",
+        8 => "ENOEXEC",
         _ => "?",
     }
 }
@@ -266,6 +267,15 @@ fn main() {
     // SAFETY: the scenarios' calls take valid strings and buffers.
     unsafe {
         match std::env::args().nth(1).as_deref() {
+            // A program only the VM runs, on a host without one: the exec
+            // fails and the caller goes on, as podman's pause process does
+            // when its catatonit cannot run.
+            Some("exec-low") => {
+                let p = c("/lowprog");
+                let argv = [p.as_ptr(), std::ptr::null()];
+                let r = execv(p.as_ptr(), argv.as_ptr());
+                println!("exec: {}, and on", res(r as i64));
+            }
             // What a program it runs gives a user: one with file
             // capabilities (`cap_setuid+ep`, as `newuidmap` has), one
             // set-user-ID root; and neither under `no_new_privs`.
@@ -317,9 +327,16 @@ fn main() {
                 let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
                 pipe2(ready.as_mut_ptr(), 0);
                 pipe2(go.as_mut_ptr(), 0);
+                chmod(c("/tmp").as_ptr(), 0o1777);
                 let child = fork();
                 if child == 0 {
                     setuid(1000);
+                    // A user may make a whiteout (as rootless overlay
+                    // storage does), not a device.
+                    let wh = mknod(c("/tmp/wh").as_ptr(), 0o20000 | 0o644, 0);
+                    let dev = mknod(c("/tmp/null").as_ptr(), 0o20000 | 0o644, (1 << 8) | 3);
+                    println!("a user's mknod: whiteout {}, device {}", res(wh as i64), res(dev as i64));
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
                     write(ready[1], b"r".as_ptr(), 1);
                     let mut b = 0u8;
                     read(go[0], &mut b, 1);
