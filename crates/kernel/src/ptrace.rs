@@ -688,10 +688,8 @@ pub fn stop(
 /// tracee was listened to in: `PTRACE_EVENT_STOP` with SIGTRAP.
 fn trap_stop() -> (i32, [u8; 128], u64, u64) {
     let trap = fwe_abi::signal::SIGTRAP;
-    let info = crate::thread::SigInfo {
-        code: trap as i32 | PTRACE_EVENT_STOP << 8,
-        ..Default::default()
-    };
+    let info =
+        crate::thread::SigInfo { code: trap as i32 | PTRACE_EVENT_STOP << 8, ..Default::default() };
     (stop_status(trap, PTRACE_EVENT_STOP), crate::signal::siginfo_bytes(trap, info), 0, 0)
 }
 
@@ -735,6 +733,26 @@ enum Served {
     Listened,
 }
 
+/// Whether host signal `sig` is pending for this thread: a stop is served
+/// with the host's signals blocked (in fwe's trap handler), so what comes
+/// for it waits there.
+fn host_pending(sig: libc::c_int) -> bool {
+    // SAFETY: an empty set is a valid out-parameter; plain host calls.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut set) == 0 && libc::sigismember(&set, sig) == 1
+    }
+}
+
+/// Whether a guest's `SIGKILL` waits for this process: its host form
+/// ([`crate::host::KILL_RELAY`]) pending, or (where a handler took it, in
+/// the VM backend) the guest signal. A stop ends for it, as Linux kills a
+/// stopped tracee.
+fn killed() -> bool {
+    crate::thread::pending() & 1 << (fwe_abi::signal::SIGKILL - 1) != 0
+        || host_pending(crate::host::KILL_RELAY)
+}
+
 /// Carry out the tracer's requests at a stop, until it says to go on.
 fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing: u64) -> Served {
     loop {
@@ -743,6 +761,10 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
             if !alive(tracer) {
                 end();
                 break Served::Resume(Resume::Cont(passing));
+            }
+            if killed() {
+                mb.word(W_STATE).store(RUNNING, Ordering::Release);
+                break Served::Resume(Resume::Cont(0));
             }
             wait_word_for(mb.word(W_REQ), req, Duration::from_millis(100));
             continue;
@@ -797,6 +819,10 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
                 mb.word(W_DONE).store(req, Ordering::Release);
                 wake_word(mb.word(W_DONE));
                 if listen(mb, tracer) {
+                    if killed() {
+                        mb.word(W_STATE).store(RUNNING, Ordering::Release);
+                        return Served::Resume(Resume::Cont(0));
+                    }
                     return Served::Listened;
                 }
                 end();
@@ -831,23 +857,17 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
     }
 }
 
-/// Stay stopped, listened to (`PTRACE_LISTEN`), until `SIGCONT` comes or
-/// the tracer interrupts: true then, false if the tracer is gone. A stop
-/// is served with the host's signals blocked (in fwe's trap handler), so
-/// a `SIGCONT` is looked for among the host's pending signals, and
-/// delivered once the stop is over.
+/// Stay stopped, listened to (`PTRACE_LISTEN`), until `SIGCONT` (or
+/// `SIGKILL`) comes or the tracer interrupts: true then, false if the
+/// tracer is gone. A `SIGCONT` is looked for among the host's pending
+/// signals ([`host_pending`]), and delivered once the stop is over.
 fn listen(mb: &Page, tracer: i32) -> bool {
     let cont = 1u64 << (fwe_abi::signal::SIGCONT - 1);
-    let host_cont = || {
-        // SAFETY: an empty set is a valid out-parameter.
-        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
-        // SAFETY: as above; plain host calls.
-        unsafe { libc::sigpending(&mut set) == 0 && libc::sigismember(&set, libc::SIGCONT) == 1 }
-    };
     loop {
         if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) == 1
             || crate::thread::pending() & cont != 0
-            || host_cont()
+            || host_pending(libc::SIGCONT)
+            || killed()
         {
             return true;
         }
