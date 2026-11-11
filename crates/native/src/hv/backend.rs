@@ -385,8 +385,12 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     } else {
         // The host's own SIGINFO (Ctrl-T), no relay: nothing on Linux.
         // Before the note is looked at for the siginfo.
-        if sig == host::KILL_RELAY && !host::kill_relayed() {
-            return;
+        if sig == host::KILL_RELAY {
+            let relayed = host::kill_relayed();
+            fwe_kernel::trace::note_to_file_raw(b"kill relay arrived, noted: ", relayed as i64);
+            if !relayed {
+                return;
+            }
         }
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let info = unsafe { host::signal_info(sig, info) };
