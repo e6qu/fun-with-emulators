@@ -1,9 +1,9 @@
 # Alpine Linux test fixtures
 
 The container and debugger tests use Alpine Linux, whose `aarch64` builds
-of the container tools and debuggers are position-independent, so they run in fwe's native
-backend (Debian's podman, containerd and runc are not, and would need the
-VM). Nothing is vendored here.
+of the container tools and debuggers are position-independent, so they
+run in fwe's native backend (Debian's podman, containerd and runc are
+not, and would need the VM). Nothing is vendored here.
 
 ## Fetched, not vendored
 
