@@ -2148,6 +2148,10 @@ fn debian_podman_runs_in_the_vm() {
     let loaded = podman(&["--log-level=debug", "load", "-i", "/tmp/alpine.tar"]);
     if !stdout(&loaded).contains("Loaded image") {
         print_last_calls(&root.join("tmp/podman.trace"));
+        // The whole trace, for CI to keep.
+        let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
+        let _ = std::fs::create_dir_all(&kept);
+        let _ = std::fs::copy(root.join("tmp/podman.trace"), kept.join("debian-load.trace"));
     }
     // The name it was loaded as (`Loaded image(s): <name>`).
     let name = stdout(&loaded)
