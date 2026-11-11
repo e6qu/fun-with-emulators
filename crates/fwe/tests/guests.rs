@@ -1716,7 +1716,8 @@ const DOCKERFILE: &str = "FROM alpine:3.20\n\
 
 /// The Compose project [`alpine_docker_runs_and_builds_images`] brings up:
 /// a service that writes to a named volume, and one built from the
-/// Dockerfile that reads it once the first has completed.
+/// Dockerfile (with no network: the daemon has no bridge) that reads it
+/// once the first has completed.
 const COMPOSE: &str = "services:\n\
     \x20 store:\n\
     \x20   image: alpine:3.20\n\
@@ -1724,7 +1725,9 @@ const COMPOSE: &str = "services:\n\
     \x20   volumes: [\"shared:/data\"]\n\
     \x20   command: [\"sh\", \"-c\", \"echo stored > /data/f\"]\n\
     \x20 reader:\n\
-    \x20   build: /tmp/context\n\
+    \x20   build:\n\
+    \x20     context: /tmp/context\n\
+    \x20     network: none\n\
     \x20   network_mode: none\n\
     \x20   volumes: [\"shared:/data\"]\n\
     \x20   depends_on:\n\
@@ -3049,6 +3052,17 @@ fn namespace_file_bound_to_a_path() {
         "bind: 0, back 0\ninode is the namespace's: true\nmountinfo: true\n\
          joined: 0, bound true\nchild joined: 0, port taken true\nchild exited 0\n\
          umount: 0, a plain file again: -1 errno 22\n"
+    );
+}
+
+/// A directory of a bind mount of an overlay, opened, reaches what is
+/// mounted below the bind: runc makes `dev/pts` this way in the tmpfs it
+/// put on a container's `dev`, the root a bind of an overlay (BuildKit's).
+#[test]
+fn overlay_bind_directory_reaches_mounts_below() {
+    assert_eq!(
+        namespaces("ovlbind"),
+        "mounts: 0 0 0\nmkdir: 0, in the tmpfs true, not the overlay's true\nchild exited 0\n"
     );
 }
 

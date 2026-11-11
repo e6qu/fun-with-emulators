@@ -710,6 +710,31 @@ impl Fs {
         None
     }
 
+    /// The namespace bound to `path` (an nsfs mount) when the path reaches
+    /// it through a symbolic link of its directories (`/var/run` to `/run`):
+    /// looked for only while one is bound somewhere.
+    fn bound_ns_through_links(&self, dirfd: i32, path: &[u8]) -> Option<crate::nsfd::NsRef> {
+        let table = self.mnt.table();
+        if !table.mounts.iter().any(|m| m.fstype == FsType::Nsfs) {
+            return None;
+        }
+        let (parent, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) => (&b"/"[..], &path[1..]),
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => (&b"."[..], path),
+        };
+        if name.is_empty() || name == b"." || name == b".." {
+            return None;
+        }
+        let dir = self.resolve(dirfd, parent, true).ok()?.ns_path?;
+        let at = mounts::join(&dir, name);
+        let (m, rest) = table.locate(&at);
+        match &m.source {
+            Source::Ns(n) if m.fstype == FsType::Nsfs && rest.is_empty() => Some(n.clone()),
+            _ => None,
+        }
+    }
+
     pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
         if path.is_empty() {
             // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).
@@ -717,6 +742,11 @@ impl Fs {
         }
         let absolute = self.absolute(dirfd, path)?;
         let (m, fs_path) = self.mount_of(&absolute);
+        if m.fstype != FsType::Nsfs
+            && let Some(n) = self.bound_ns_through_links(dirfd, path)
+        {
+            return Some(crate::procfs::Entry::Ns(n));
+        }
         let absolute = match m.fstype {
             FsType::Nsfs => {
                 let Source::Ns(n) = &m.source else { return None };
@@ -1594,9 +1624,10 @@ fn host_to_ns(table: &Table, host: &[u8]) -> Option<Vec<u8>> {
 /// the mount of that overlay that shows it inside the process's root (if
 /// one still does).
 fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, i32> {
-    let Some(l) = crate::fdmarks::origin(fd).and_then(|o| o.ovl) else { return Ok(None) };
+    let Some(origin) = crate::fdmarks::origin(fd) else { return Ok(None) };
+    let Some(l) = origin.ovl else { return Ok(None) };
     let path = overlay::path_of(&l, fd).ok_or(errno::ENOENT)?;
-    let at = table.mounts.iter().find_map(|m| {
+    let place = |m: &Mount| {
         let Source::Overlay(ml) = &m.source else { return None };
         if **ml != *l {
             return None;
@@ -1605,7 +1636,12 @@ fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, 
         let ns = mounts::join(&m.point, rest);
         (table.locate(&ns).0.id == m.id && mounts::under(&ns, root_ns).is_some())
             .then_some((m.id, ns))
-    });
+    };
+    // Where it was opened (a bind mount of the overlay, which has mounts
+    // of its own below it), while that mount is there; else any mount of
+    // the overlay.
+    let at =
+        table.get(origin.mount).and_then(place).or_else(|| table.mounts.iter().find_map(place));
     Here::overlay(&l, path, at).map(Some)
 }
 

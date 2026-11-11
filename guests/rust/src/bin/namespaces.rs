@@ -6,6 +6,7 @@
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
 
+const O_DIRECTORY: i32 = 0o40000;
 const CLONE_FS: i32 = 0x0000_0200;
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -44,6 +45,8 @@ struct Utsname {
 
 unsafe extern "C" {
     fn unshare(flags: i32) -> i32;
+    fn openat(dirfd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    fn mkdirat(dirfd: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
     fn setns(fd: i32, nstype: i32) -> i32;
     fn umask(mask: u32) -> u32;
     fn sethostname(name: *const u8, len: usize) -> i32;
@@ -720,7 +723,9 @@ fn main() {
                     .lines()
                     .any(|l| l.contains(" /tmp/netns ") && l.contains(" - nsfs nsfs "))
             );
-            let ns = std::fs::File::open("/tmp/netns").unwrap();
+            // Through a directory's link too, as `/var/run` leads to `/run`.
+            std::os::unix::fs::symlink("/tmp", "/tmp/via").unwrap();
+            let ns = std::fs::File::open("/tmp/via/netns").unwrap();
             // SAFETY: a namespace descriptor.
             let joined = unsafe { setns(ns.as_raw_fd(), CLONE_NEWNET) };
             let held = std::net::TcpListener::bind("127.0.0.1:18091");
@@ -741,6 +746,58 @@ fn main() {
             // SAFETY: a descriptor of a plain file.
             let r = unsafe { setns(plain.as_raw_fd(), CLONE_NEWNET) };
             println!("umount: {u}, a plain file again: {r} errno {}", errno());
+        }
+        // A directory of a bind mount of an overlay, opened, reaches what
+        // is mounted below the bind (runc makes `dev/pts` in the tmpfs it
+        // put on a container's `dev` this way), not the overlay's own.
+        Some("ovlbind") => {
+            use std::os::fd::AsRawFd;
+            for d in ["/tmp/lower/dev", "/tmp/upper", "/tmp/work", "/tmp/o", "/tmp/b"] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let code = in_child(|| {
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    unshare(CLONE_NEWNS);
+                    let o = mount(
+                        c"overlay".as_ptr(),
+                        c"/tmp/o".as_ptr(),
+                        c"overlay".as_ptr(),
+                        0,
+                        c"lowerdir=/tmp/lower,upperdir=/tmp/upper,workdir=/tmp/work".as_ptr().cast(),
+                    );
+                    let b = mount(
+                        c"/tmp/o".as_ptr(),
+                        c"/tmp/b".as_ptr(),
+                        c"bind".as_ptr(),
+                        MS_BIND | MS_REC,
+                        std::ptr::null(),
+                    );
+                    let t = mount(
+                        c"tmpfs".as_ptr(),
+                        c"/tmp/b/dev".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    );
+                    println!("mounts: {o} {b} {t}");
+                }
+                let root = std::fs::File::open("/tmp/b").unwrap();
+                let dev = std::ffi::CString::new("dev").unwrap();
+                let pts = std::ffi::CString::new("pts").unwrap();
+                // SAFETY: a directory descriptor and NUL-terminated names.
+                let made = unsafe {
+                    let d = openat(root.as_raw_fd(), dev.as_ptr(), O_DIRECTORY);
+                    mkdirat(d, pts.as_ptr(), 0o755)
+                };
+                println!(
+                    "mkdir: {made}, in the tmpfs {}, not the overlay's {}",
+                    std::path::Path::new("/tmp/b/dev/pts").is_dir(),
+                    !std::path::Path::new("/tmp/o/dev/pts").exists()
+                );
+                0
+            });
+            println!("child exited {code}");
         }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds

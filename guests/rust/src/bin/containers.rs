@@ -789,8 +789,9 @@ fn main() {
                 let mut sf = [0u64; 15];
                 fstatfs(d, sf.as_mut_ptr());
                 println!("proc fstatfs: {:#x}", sf[0]);
-                // oom_score_adj, kept and inherited.
-                std::fs::write("/proc/self/oom_score_adj", "500").unwrap();
+                // oom_score_adj, kept and inherited; written as runc writes
+                // it, with the NUL that ends the text.
+                std::fs::write("/proc/self/oom_score_adj", "500\0").unwrap();
                 let own = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
                 let (mut pp, mut cp) = ([0i32; 2], [0i32; 2]);
                 pipe2(pp.as_mut_ptr(), 0);
