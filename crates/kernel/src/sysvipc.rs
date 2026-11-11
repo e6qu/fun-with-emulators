@@ -737,8 +737,23 @@ pub fn set_current(r: &Arc<Record<Ipc>>) {
     }
 }
 
-/// The process's IPC namespace's objects.
+thread_local! {
+    /// This thread's own IPC namespace, when it has its own
+    /// ([`crate::threadfs`]): `Some(None)` for the initial one.
+    static THREAD: std::cell::RefCell<Option<Option<Arc<Record<Ipc>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make `ipc` this thread's own (`Some`), or the process's again (`None`).
+pub fn set_thread(ipc: Option<Option<Arc<Record<Ipc>>>>) {
+    THREAD.with(|t| *t.borrow_mut() = ipc);
+}
+
+/// The calling thread's IPC namespace's objects.
 pub fn current() -> Option<Arc<Record<Ipc>>> {
+    if let Some(own) = THREAD.with(|t| t.borrow().clone()) {
+        return own.or_else(initial);
+    }
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(initial)
 }
 

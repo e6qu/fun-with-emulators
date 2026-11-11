@@ -82,6 +82,13 @@ pub struct ProcRecord {
     /// The auxiliary vector its program started with (`/proc/<pid>/auxv`,
     /// where a debugger finds where the program was loaded).
     pub auxv: Vec<u8>,
+    /// The namespaces its threads are in apart from its own (records'
+    /// directories), which they hold as the process does its own.
+    pub held: Vec<Vec<u8>>,
+    /// Its parent (the head of its line) is not its parent on the host:
+    /// it was made with `CLONE_PARENT`, so its parent waits for it as a
+    /// reaper waits for one it adopted ([`crate::reaper`]).
+    pub foster: bool,
 }
 
 /// A host process, as its pid and its start time.
@@ -221,6 +228,11 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     e.u64(r.slack.1);
     e.bool(r.execed);
     e.bytes(&r.auxv);
+    e.u64(r.held.len() as u64);
+    for d in &r.held {
+        e.bytes(d);
+    }
+    e.bool(r.foster);
     e.into_bytes()
 }
 
@@ -252,6 +264,9 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let slack = (d.u64(), d.u64());
     let execed = d.bool();
     let auxv = d.bytes();
+    let n = d.count(8);
+    let held = (0..n).map(|_| d.bytes()).collect();
+    let foster = d.bool();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -277,6 +292,8 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         slack,
         execed,
         auxv,
+        held,
+        foster,
     })
 }
 
@@ -323,9 +340,24 @@ pub fn ending(status: i32) {
 }
 
 /// The Linux wait status host process `pid` left as it ended of a signal.
+/// Async-signal-safe (a `SIGCHLD` handler asks): it allocates nothing.
 pub fn end_status(pid: i32) -> Option<i32> {
-    let b = std::fs::read(OsStr::from_bytes(&end_path(pid)?)).ok()?;
-    Some(i32::from_ne_bytes(b.get(..4)?.try_into().ok()?))
+    let mut buf = [0u8; 512];
+    let path = crate::signote::record_file(pid, b".end", &mut buf)?;
+    let mut b = [0u8; 4];
+    let saved = crate::host::last_errno();
+    // SAFETY: a NUL-terminated path; a buffer of its length; the
+    // descriptor is closed here.
+    let n = unsafe {
+        let fd = libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC);
+        let n = if fd < 0 { -1 } else { libc::read(fd, b.as_mut_ptr().cast(), b.len()) };
+        if fd >= 0 {
+            libc::close(fd);
+        }
+        n
+    };
+    crate::host::set_errno(saved);
+    (n == 4).then(|| i32::from_ne_bytes(b))
 }
 
 /// Host process `pid` was reaped, or this one starts with that number:
@@ -405,7 +437,7 @@ pub fn gone(pid: i32) {
         let told = ended_path(pid, r.start)
             .is_some_and(|p| std::path::Path::new(OsStr::from_bytes(&p)).exists());
         if !told
-            && crate::reaper::might_adopt((pid, r.start), &r.lineage, r.bound)
+            && crate::reaper::takes_end((pid, r.start), &r.lineage, r.bound, r.foster)
             && !parent_autoreaps(&r.lineage)
         {
             write_ended(&Ended {
@@ -416,6 +448,7 @@ pub fn gone(pid: i32) {
                 numbers: numbers_in(&r.ns, pid),
                 lineage: r.lineage,
                 bound: r.bound,
+                foster: r.foster,
             });
         }
         let zombie = host_info(pid).is_some_and(|(start, _, z)| z && start == r.start);
@@ -516,6 +549,8 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
         execed: false,
         auxv: Vec::new(),
+        held: Vec::new(),
+        foster: false,
     });
     f(&mut r);
     write(pid, &r);
@@ -545,12 +580,18 @@ pub fn own_program(exe: &[u8], cmdline: &[u8]) {
     });
 }
 
-/// This process's main thread is named `comm`.
 /// This process's program started with auxiliary vector `auxv`.
 pub fn own_auxv(auxv: &[u8]) {
     let _ = change(me(), |r| r.auxv = auxv.to_vec());
 }
 
+/// This process's threads are in the namespaces whose records are `held`
+/// besides its own.
+pub fn own_held(held: Vec<Vec<u8>>) {
+    let _ = change(me(), |r| r.held = held);
+}
+
+/// This process's main thread is named `comm`.
 pub fn own_comm(comm: &[u8]) {
     let _ = change(me(), |r| r.comm = comm.to_vec());
 }
@@ -570,6 +611,8 @@ pub struct Inherit {
     sched: Sched,
     /// The forking thread's timer slack: the child's, and its default.
     slack: u64,
+    /// The child is made with `CLONE_PARENT` ([`ProcRecord::foster`]).
+    pub foster: bool,
 }
 
 /// What a child forked now inherits ([`Inherit`]): a child of a process
@@ -591,7 +634,14 @@ pub fn inherit() -> Inherit {
         s => (s, r.nice),
     };
     let slack = crate::thread::slack();
-    Inherit { ids: r.ids, oom: (r.oom_score_adj, r.oom_score_adj_min), nice, sched, slack }
+    Inherit {
+        ids: r.ids,
+        oom: (r.oom_score_adj, r.oom_score_adj_min),
+        nice,
+        sched,
+        slack,
+        foster: false,
+    }
 }
 
 /// Write `i` for a child that starts on state handed to it.
@@ -604,6 +654,7 @@ pub fn save_inherit(e: &mut Enc, i: &Inherit) {
     e.i32(i.nice);
     i.sched.encode(e);
     e.u64(i.slack);
+    e.bool(i.foster);
 }
 
 /// What [`save_inherit`] wrote.
@@ -616,7 +667,8 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let nice = d.i32();
     let sched = Sched::decode(d);
     let slack = d.u64();
-    Inherit { ids, oom, nice, sched, slack }
+    let foster = d.bool();
+    Inherit { ids, oom, nice, sched, slack, foster }
 }
 
 /// Set `r`'s inherited part.
@@ -634,6 +686,7 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
     if i.slack != 0 {
         r.slack = (i.slack, i.slack);
     }
+    r.foster = i.foster;
 }
 
 /// A child `child` of this process starts in this process's cgroup (or in
@@ -1026,6 +1079,8 @@ pub struct Ended {
     pub bound: Option<Proc>,
     /// Its pid namespaces' records, and its number in each.
     pub numbers: Vec<(Vec<u8>, i32)>,
+    /// It was a foster child ([`ProcRecord::foster`]).
+    pub foster: bool,
 }
 
 impl Ended {
@@ -1042,6 +1097,7 @@ impl Ended {
             e.bytes(d);
             e.i32(*n);
         }
+        e.bool(self.foster);
         e.into_bytes()
     }
 
@@ -1051,8 +1107,9 @@ impl Ended {
         let (lineage, bound) = (get_procs(&mut d), get_opt(&mut d));
         let n = d.count(12);
         let numbers = (0..n).map(|_| (d.bytes(), d.i32())).collect();
+        let foster = d.bool();
         d.finish().ok()?;
-        Some(Ended { pid, start, status, pgid, lineage, bound, numbers })
+        Some(Ended { pid, start, status, pgid, lineage, bound, numbers, foster })
     }
 
     /// Its number in the pid namespace whose record is `dir`.
@@ -1176,9 +1233,14 @@ pub fn exiting(status: i32) {
                 .collect(),
             lineage: r.lineage,
             bound: r.bound,
+            foster: r.foster,
         };
-        if crate::reaper::might_adopt((ended.pid, ended.start), &ended.lineage, ended.bound)
-            && !parent_autoreaps(&ended.lineage)
+        if crate::reaper::takes_end(
+            (ended.pid, ended.start),
+            &ended.lineage,
+            ended.bound,
+            ended.foster,
+        ) && !parent_autoreaps(&ended.lineage)
         {
             write_ended(&ended);
         }

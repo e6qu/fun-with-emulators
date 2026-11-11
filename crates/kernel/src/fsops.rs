@@ -325,8 +325,34 @@ fn open_wants(flags: u64) -> u32 {
 }
 
 impl<P: Platform> Kernel<P> {
-    pub(crate) fn fs(&self) -> &Fs {
-        self.fs.as_ref().expect("filesystem configured")
+    /// The calling thread's filesystem view and namespaces: its own
+    /// ([`crate::threadfs`]) or the process's.
+    pub fn fs(&self) -> &Fs {
+        self.fs_opt().expect("filesystem configured")
+    }
+
+    /// [`fs`](Self::fs), to change.
+    pub fn fs_mut(&mut self) -> &mut Fs {
+        self.fs_opt_mut().expect("filesystem configured")
+    }
+
+    /// [`fs`](Self::fs), if there is one.
+    pub fn fs_opt(&self) -> Option<&Fs> {
+        match crate::threadfs::current() {
+            // SAFETY: this thread's own view, which only it uses, under
+            // the kernel lock that `&self` stands for.
+            Some(p) => Some(unsafe { &*p }),
+            None => self.fs.as_ref(),
+        }
+    }
+
+    /// [`fs_opt`](Self::fs_opt), to change.
+    pub fn fs_opt_mut(&mut self) -> Option<&mut Fs> {
+        match crate::threadfs::current() {
+            // SAFETY: as in `fs_opt`, with `&mut self` for the lock.
+            Some(p) => Some(unsafe { &mut *p }),
+            None => self.fs.as_mut(),
+        }
     }
 
     pub(crate) fn sys_openat(&mut self, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
@@ -356,18 +382,46 @@ impl<P: Platform> Kernel<P> {
     /// Open the namespace `/proc/<pid>/ns/<kind>` (`path` from `dirfd`)
     /// names, its link reading `link`.
     fn open_ns_path(&mut self, dirfd: i32, path: &[u8], link: &[u8], flags: u64) -> i64 {
-        let Some((who, sub)) = self.fs().proc_target(dirfd, path) else {
-            return err(errno::ENOENT);
+        match self.ns_at(dirfd, path, link) {
+            Ok(n) => crate::nsfd::open(n, flags & fcntl::O_CLOEXEC != 0),
+            Err(e) => err(e),
+        }
+    }
+
+    /// The namespace `/proc/<pid>/ns/<kind>` or
+    /// `/proc/<pid>/task/<tid>/ns/<kind>` (`path` from `dirfd`) names, its
+    /// link reading `link`.
+    pub(crate) fn ns_at(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        link: &[u8],
+    ) -> Result<crate::nsfd::NsRef, i32> {
+        let (who, sub) = self.fs().proc_target(dirfd, path).ok_or(errno::ENOENT)?;
+        // A thread's (`/proc/<pid>/task/<tid>/ns/<kind>`): its own
+        // namespaces, if it has them ([`crate::threadfs`]).
+        let task = sub.strip_prefix(b"/task/").and_then(|rest| {
+            let i = rest.iter().position(|&b| b == b'/')?;
+            let tid = std::str::from_utf8(&rest[..i]).ok()?.parse::<i32>().ok()?;
+            Some((tid, &rest[i..]))
+        });
+        let (tid, sub) = match (who, task) {
+            (None, Some((tid, rest))) => (Some(tid), rest.to_vec()),
+            _ => (None, sub),
         };
-        let Some(name) = sub.strip_prefix(b"/ns/") else { return err(errno::ENOENT) };
+        let name = sub.strip_prefix(b"/ns/").ok_or(errno::ENOENT)?;
         let dirs = match who {
-            None => self.fs().ns_dirs(),
+            None => match tid {
+                Some(t) if t != crate::thread::tid() => crate::threadfs::view_of(t, Fs::ns_dirs)
+                    .unwrap_or_else(|| self.fs.as_ref().map_or_else(Vec::new, Fs::ns_dirs)),
+                _ => self.fs().ns_dirs(),
+            },
             Some(host) => match host.and_then(crate::procreg::read) {
                 Some(rec) => rec.ns,
-                None => return err(errno::ENOENT),
+                None => return Err(errno::ENOENT),
             },
         };
-        self.open_ns(name, &dirs, link, flags)
+        self.ns_ref(name, &dirs, link)
     }
 
     /// `openat` of `path`, read from the guest. A symbolic link of the
@@ -428,6 +482,8 @@ impl<P: Platform> Kernel<P> {
         // Synthetic /proc and /sys files take priority over the host rootfs.
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
+                // A namespace's file bound to a path.
+                crate::procfs::Entry::Ns(n) => crate::nsfd::open(n, flags & fcntl::O_CLOEXEC != 0),
                 crate::procfs::Entry::File(_)
                     if self.fs().proc_path(dirfd as i32, &path).as_deref()
                         == Some(b"/proc/self/status") =>
@@ -1183,7 +1239,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(o) = crate::fdmarks::origin(fd) {
             return statfs_fd(fd, buf, Some((o.fstype, o.flags)));
         }
-        let mount = self.fs.as_ref().and_then(|fs| fs.ns_path_of_fd(fd)).map(|ns| {
+        let mount = self.fs_opt().and_then(|fs| fs.ns_path_of_fd(fd)).map(|ns| {
             let table = self.fs().mounts();
             let (m, _) = table.locate(&ns);
             (m.fstype, m.flags)
@@ -1259,6 +1315,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
             return Ok((
                 match entry {
+                    Entry::Ns(n) => ns_stat(n.id),
                     Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                     Entry::Symlink(t) if follow => {
                         if let Some(ino) = namespace_inode(&t) {
@@ -1531,7 +1588,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(t) => Ok(LinkKind::Symlink(t)),
                 Entry::Fd { .. } => Ok(LinkKind::Magic),
                 Entry::Missing => Err(errno::ENOENT),
-                Entry::File(_) | Entry::Dir => Ok(LinkKind::None),
+                Entry::File(_) | Entry::Dir | Entry::Ns(_) => Ok(LinkKind::None),
             };
         }
         let st = self.linux_stat(cwd, abs, false, 0)?;
@@ -1602,7 +1659,9 @@ impl<P: Platform> Kernel<P> {
                     guest!(uaccess::write_from(buf, &target[..n]));
                     n as i64
                 }
-                crate::procfs::Entry::File(_) | crate::procfs::Entry::Dir => err(errno::EINVAL),
+                crate::procfs::Entry::File(_)
+                | crate::procfs::Entry::Dir
+                | crate::procfs::Entry::Ns(_) => err(errno::EINVAL),
                 crate::procfs::Entry::Missing => err(errno::ENOENT),
             };
         }
@@ -1646,7 +1705,7 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EACCES);
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         match fs.chdir(fcntl::AT_FDCWD as i32, &path) {
             Ok(()) => 0,
             Err(e) => err(e),
@@ -1660,7 +1719,7 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EACCES);
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         match fs.fchdir(fd as i32) {
             Ok(()) => 0,
             Err(e) => err(e),
@@ -2029,7 +2088,7 @@ impl<P: Platform> Kernel<P> {
             let now = moved(&from, &to)
                 .or_else(|| (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten());
             if let Some(now) = now.and_then(|ns| self.fs().from_ns(&ns)) {
-                let fs = self.fs.as_mut().expect("filesystem configured");
+                let fs = self.fs_mut();
                 let root = fs.proc_root().to_vec();
                 fs.set_root(root, now);
             }
@@ -2311,7 +2370,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_umask(&mut self, mask: u64) -> i64 {
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         fs.set_umask(mask as u32) as i64
     }
 
@@ -2942,7 +3001,7 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn permits(&self, st: &libc::stat, want: u32) -> bool {
         // Without a root filesystem, the host's own files (root's, with no
         // owner kept) are the host user's to allow, as they always were.
-        if st.st_uid == 0 && st.st_gid == 0 && self.fs.as_ref().is_some_and(|f| f.root_is_host()) {
+        if st.st_uid == 0 && st.st_gid == 0 && self.fs_opt().is_some_and(|f| f.root_is_host()) {
             return true;
         }
         crate::creds::Access::of(&self.creds).permits(st, want)

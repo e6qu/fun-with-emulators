@@ -1223,7 +1223,7 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     if let Err(e) = k.may_exec(&path) {
         return err(e);
     }
-    let fs = k.fs.as_ref().expect("filesystem configured");
+    let fs = k.fs();
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
     let state = k.exec_state();

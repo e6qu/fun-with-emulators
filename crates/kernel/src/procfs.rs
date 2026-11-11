@@ -38,6 +38,9 @@ pub enum Entry {
     Fd { fd: i32, target: Vec<u8> },
     /// A synthetic directory (its entries come from [`children`]).
     Dir,
+    /// A namespace's file bound to a path (an nsfs mount): opening it
+    /// gives a descriptor of the namespace.
+    Ns(crate::nsfd::NsRef),
     /// A path under `/proc` or `/sys` that is not provided (maps to ENOENT).
     Missing,
 }

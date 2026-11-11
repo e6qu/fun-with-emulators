@@ -72,6 +72,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let strace = k.tracer;
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
+    // The calling thread's view is what the program runs with.
+    k.adopt_thread_view();
     let fs = k.fs.as_ref().expect("filesystem configured");
     k.may_exec(&path).map_err(err)?;
     let file = fs.read(&path).map_err(err)?;
@@ -223,7 +225,13 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                     || unsafe { libc::fork() },
                     // Before the parent takes signals again: a child that
                     // ends at once is told of with its own signal.
-                    |child| reaper::set_exit_signal(child, flags & cl::CSIGNAL),
+                    // A foster child's end is its parent's to hear of
+                    // (see `reaper`), not this process's.
+                    |child| {
+                        let sig =
+                            if flags & cl::CLONE_PARENT != 0 { 0 } else { flags & cl::CSIGNAL };
+                        reaper::set_exit_signal(child, sig)
+                    },
                 )
             });
             set_shared(false);
@@ -473,6 +481,7 @@ pub fn do_wait4(regs: &Regs) -> i64 {
     if fwe_kernel::ptrace::tracing() {
         return wait4_tracer(pid, host_options, wstatus, rusage);
     }
+    start_watcher_if_wanted();
     if !reaper::active() {
         let r = wait4_host(pid, host_options, wstatus, rusage);
         // A child that began to be traced while this waited, and stopped.
@@ -582,6 +591,16 @@ fn reaper_wait(
 /// written in Linux's layout.
 /// `wait4` of a tracer: a stop of one of its tracees first (which the host
 /// does not see: a tracee stops in fwe, [`fwe_kernel::ptrace`]), then its
+/// Start the watcher this process was told it wants (it has a foster
+/// child, see `reaper`), under the kernel lock, before a `wait` that would
+/// otherwise ask only the host.
+fn start_watcher_if_wanted() {
+    if reaper::watcher_wanted() {
+        let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        reaper::start_if_reaper();
+    }
+}
+
 /// children as the host reports them, looking again as tracees stop.
 fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     // SAFETY: plain host calls.
@@ -795,6 +814,7 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         let r = waitid_tracer(idtype, id, host_options, infop, options);
         return if r < 0 { r } else { zero_rusage() };
     }
+    start_watcher_if_wanted();
     if !reaper::active() {
         let r = waitid_host(idtype, id, host_options, infop, options);
         if nonblock && r == 0 {

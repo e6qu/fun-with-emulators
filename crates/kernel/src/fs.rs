@@ -561,6 +561,40 @@ impl Fs {
         self.mnt.table()
     }
 
+    /// A copy of this view, for a thread to have as its own
+    /// ([`crate::threadfs`]), with its own descriptor of the rootfs.
+    pub fn copy(&self) -> Result<Fs, i32> {
+        let root = self
+            .root
+            .try_clone()
+            .map_err(|e| errno_to_linux(e.raw_os_error().unwrap_or(libc::EMFILE)))?;
+        Ok(Fs {
+            root,
+            root_host: self.root_host.clone(),
+            mnt: self.mnt.clone(),
+            proc_root: self.proc_root.clone(),
+            cwd: self.cwd.clone(),
+            cwd_mount: self.cwd_mount,
+            cwd_outside: self.cwd_outside.clone(),
+            root_mount: self.root_mount,
+            umask: self.umask,
+            proc: self.proc.clone(),
+            ns: self.ns.clone(),
+        })
+    }
+
+    /// Take `from`'s root, working directory and umask: a thread that
+    /// shares them changed them ([`crate::threadfs::share_view`]).
+    pub fn set_view(&mut self, from: &Fs) {
+        self.proc_root = from.proc_root.clone();
+        self.cwd = from.cwd.clone();
+        self.cwd_mount = from.cwd_mount;
+        self.cwd_outside = from.cwd_outside.clone();
+        self.root_mount = from.root_mount;
+        self.umask = from.umask;
+        self.republish();
+    }
+
     /// Move to the mount namespace `ns` (`unshare`, `setns`), keeping the
     /// root and working directory at the same paths.
     pub fn set_mount_ns(&mut self, ns: Arc<Ns>) {
@@ -676,6 +710,31 @@ impl Fs {
         None
     }
 
+    /// The namespace bound to `path` (an nsfs mount) when the path reaches
+    /// it through a symbolic link of its directories (`/var/run` to `/run`):
+    /// looked for only while one is bound somewhere.
+    fn bound_ns_through_links(&self, dirfd: i32, path: &[u8]) -> Option<crate::nsfd::NsRef> {
+        let table = self.mnt.table();
+        if !table.mounts.iter().any(|m| m.fstype == FsType::Nsfs) {
+            return None;
+        }
+        let (parent, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) => (&b"/"[..], &path[1..]),
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => (&b"."[..], path),
+        };
+        if name.is_empty() || name == b"." || name == b".." {
+            return None;
+        }
+        let dir = self.resolve(dirfd, parent, true).ok()?.ns_path?;
+        let at = mounts::join(&dir, name);
+        let (m, rest) = table.locate(&at);
+        match &m.source {
+            Source::Ns(n) if m.fstype == FsType::Nsfs && rest.is_empty() => Some(n.clone()),
+            _ => None,
+        }
+    }
+
     pub fn synthetic(&self, dirfd: i32, path: &[u8]) -> Option<crate::procfs::Entry> {
         if path.is_empty() {
             // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).
@@ -683,7 +742,16 @@ impl Fs {
         }
         let absolute = self.absolute(dirfd, path)?;
         let (m, fs_path) = self.mount_of(&absolute);
+        if m.fstype != FsType::Nsfs
+            && let Some(n) = self.bound_ns_through_links(dirfd, path)
+        {
+            return Some(crate::procfs::Entry::Ns(n));
+        }
         let absolute = match m.fstype {
+            FsType::Nsfs => {
+                let Source::Ns(n) = &m.source else { return None };
+                return Some(crate::procfs::Entry::Ns(n.clone()));
+            }
             FsType::Proc => mounts::join(b"/proc", &fs_path),
             FsType::Sysfs => mounts::join(b"/sys", &fs_path),
             FsType::Devpts | FsType::Mqueue => {
@@ -771,6 +839,15 @@ impl Fs {
             ));
         }
         if let Some(rest) = absolute.strip_prefix(b"/proc/self/task/") {
+            if let Some((tid, kind)) = task_ns(rest) {
+                return Some(match kind {
+                    None => crate::procfs::Entry::Dir,
+                    Some(kind) => match self.task_ns_link(tid, kind) {
+                        Some(link) => crate::procfs::Entry::Symlink(link),
+                        None => crate::procfs::Entry::Missing,
+                    },
+                });
+            }
             return Some(task_entry(rest));
         }
         match &absolute[..] {
@@ -1547,9 +1624,10 @@ fn host_to_ns(table: &Table, host: &[u8]) -> Option<Vec<u8>> {
 /// the mount of that overlay that shows it inside the process's root (if
 /// one still does).
 fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, i32> {
-    let Some(l) = crate::fdmarks::origin(fd).and_then(|o| o.ovl) else { return Ok(None) };
+    let Some(origin) = crate::fdmarks::origin(fd) else { return Ok(None) };
+    let Some(l) = origin.ovl else { return Ok(None) };
     let path = overlay::path_of(&l, fd).ok_or(errno::ENOENT)?;
-    let at = table.mounts.iter().find_map(|m| {
+    let place = |m: &Mount| {
         let Source::Overlay(ml) = &m.source else { return None };
         if **ml != *l {
             return None;
@@ -1558,7 +1636,12 @@ fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, 
         let ns = mounts::join(&m.point, rest);
         (table.locate(&ns).0.id == m.id && mounts::under(&ns, root_ns).is_some())
             .then_some((m.id, ns))
-    });
+    };
+    // Where it was opened (a bind mount of the overlay, which has mounts
+    // of its own below it), while that mount is there; else any mount of
+    // the overlay.
+    let at =
+        table.get(origin.mount).and_then(place).or_else(|| table.mounts.iter().find_map(place));
     Here::overlay(&l, path, at).map(Some)
 }
 
@@ -2217,7 +2300,7 @@ fn mount_tops(m: &Mount) -> Vec<Vec<u8>> {
     match &m.source {
         Source::Host(_) => m.host_path(b"").into_iter().collect(),
         Source::Overlay(l) => l.paths().map(|p| mounts::join(p, &m.root)).collect(),
-        Source::Synthetic => Vec::new(),
+        Source::Synthetic | Source::Ns(_) => Vec::new(),
     }
 }
 
@@ -2459,12 +2542,44 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         return Ok(());
     }
     let access = if writes { libc::O_WRONLY } else { libc::O_RDONLY };
-    // SAFETY: as above; waits for the other end.
-    let fd = unsafe {
-        libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    let flags_host = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // A reader holds a non-blocking end too, opened first (a reader
+    // waiting counts as one on Linux and on the host alike): Linux's open
+    // succeeds once a writer has come, even if a signal is pending by then,
+    // where the host's returns `EINTR`; this end shows whether one came.
+    let early = if writes {
+        -1
+    } else {
+        // SAFETY: as above; does not wait.
+        unsafe {
+            libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NONBLOCK | flags_host)
+        }
     };
+    // SAFETY: as above; waits for the other end.
+    let mut fd = unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) };
+    let err = e();
+    if early >= 0 {
+        let came = fd < 0
+            && err == errno::EINTR
+            && matches!(
+                crate::fifo::probe(early),
+                crate::fifo::Probe::HungUp | crate::fifo::Probe::Data
+            );
+        if came {
+            // A writer came (and maybe went): the open succeeded, as Linux's.
+            // SAFETY: fwe's own descriptor, made blocking as the guest asked.
+            unsafe {
+                let fl = libc::fcntl(early, libc::F_GETFL);
+                libc::fcntl(early, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+            }
+            fd = early;
+        } else {
+            // SAFETY: fwe's own descriptor, not handed on.
+            unsafe { libc::close(early) };
+        }
+    }
     if fd < 0 {
-        return Err(e());
+        return Err(err);
     }
     // Out of the guest's range while it waits to be taken.
     let fd = crate::fdtable::reserve(fd)?;
@@ -2518,6 +2633,37 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
     match view.as_ref() {
         Some(v) => from_ns(&v.proc_root, &host_to_ns(&v.ns.table(), host)?),
         None => Some(host.to_vec()),
+    }
+}
+
+/// `<tid>/ns` (`None`) or `<tid>/ns/<kind>` of a live thread of this
+/// process, from `/proc/self/task/`.
+fn task_ns(rest: &[u8]) -> Option<(i32, Option<&[u8]>)> {
+    let mut parts = rest.splitn(3, |&b| b == b'/');
+    let tid = std::str::from_utf8(parts.next()?).ok()?.parse::<i32>().ok()?;
+    if parts.next()? != b"ns" || !crate::thread::tids().contains(&tid) {
+        return None;
+    }
+    Some((tid, parts.next().filter(|k| !k.is_empty())))
+}
+
+impl Fs {
+    /// The link `/proc/self/task/<tid>/ns/<kind>` reads, this view being
+    /// the calling thread's: a thread's own namespaces if it has them
+    /// ([`crate::threadfs`]), else the process's.
+    fn task_ns_link(&self, tid: i32, kind: &[u8]) -> Option<Vec<u8>> {
+        if tid == crate::thread::tid() {
+            return self.ns.link(kind, self.mnt.id());
+        }
+        if let Some(link) = crate::threadfs::view_of(tid, |f| f.ns.link(kind, f.mnt.id())) {
+            return link;
+        }
+        if crate::threadfs::current().is_none() {
+            return self.ns.link(kind, self.mnt.id());
+        }
+        // SAFETY: getpid cannot fail.
+        let rec = crate::procreg::read(unsafe { libc::getpid() })?;
+        Some(crate::procpid::ns_link_of(kind, &rec.ns)).filter(|l| !l.is_empty())
     }
 }
 

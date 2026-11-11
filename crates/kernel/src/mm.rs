@@ -1119,7 +1119,7 @@ impl<P: Platform> Kernel<P> {
         let object = (flags & mman::MAP_ANONYMOUS == 0)
             .then(|| {
                 let st = crate::fsops::linux_fstat(fd as i32).ok()?;
-                let path = self.fs.as_ref().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
+                let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
                 Some(crate::maps::Object::file(path, &st, offset))
             })
             .flatten();

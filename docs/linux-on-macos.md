@@ -291,7 +291,7 @@ for a well-known property that puts it in the category.
 | Category | Software | Why it is there |
 |---|---|---|
 | native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once as mapped; the rewrites are system calls and thread-pointer accesses |
-| native, Go built as PIE | Alpine's podman and containerd (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and would need the VM |
+| native, Go built as PIE | Alpine's podman, containerd and Docker with BuildKit and Compose (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and would need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries scanned once each |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
@@ -358,7 +358,7 @@ its vCPU even in a loop with no system calls.
 Debian's Go 1.19 toolchain and the static executables it builds by default
 are linked low, non-PIE, and run in the VM (tested: `go` builds, runs and
 tests a module with goroutines). Go programs built as PIEs, as Alpine
-builds podman and containerd, run natively (tested). `go` starts its tools
+builds podman, containerd and Docker, run natively (tested). `go` starts its tools
 with `vfork`, supported in both backends.
 
 ### Python and other interpreters
@@ -1301,8 +1301,9 @@ on a file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 datagram pair, so `recv`, `poll` and `epoll` are the host's. A request
 written to it is answered at once on the other end. In an fwe network
 namespace, `RTM_GETLINK`, `RTM_NEWLINK` (with `CAP_NET_ADMIN`) and
-`RTM_GETADDR` describe and change `lo`; in the initial namespace every
-request is answered with `EOPNOTSUPP`. Such a socket also carries a POSIX
+`RTM_GETADDR` describe and change `lo`; in the initial namespace they
+describe the host's loopback as `lo`, always up (taking it down is
+`EPERM`), and no other interface. Such a socket also carries a POSIX
 message queue's `SIGEV_THREAD` notification
 ([POSIX message queues](#posix-message-queues)).
 
@@ -1403,12 +1404,17 @@ privilege, gives the caller every capability in the new namespace, and
 is refused (`EINVAL`) to a process with other threads; the other kinds
 need `CAP_SYS_ADMIN`. `CLONE_NEWPID` applies to children, and a second
 one before a child is made fails with `EINVAL`. `CLONE_FILES`, `CLONE_FS`,
-`CLONE_SYSVSEM`, `CLONE_SIGHAND` and `CLONE_VM` are accepted.
+`CLONE_SYSVSEM`, `CLONE_SIGHAND` and `CLONE_VM` are accepted. In a process
+with other threads, the caller's namespaces change alone, and
+`CLONE_FS` (which `CLONE_NEWNS` implies) gives it a root, working
+directory and umask of its own ([Namespaces](#namespaces)).
 
 **`setns`**: a namespace descriptor names the namespace's record
 (`crates/kernel/src/nsfd.rs`); `nstype` must be 0 or its kind. A pidfd
 joins each kind named in the flags that its process is in, the user
-namespace first.
+namespace first. It changes the calling thread's namespaces only; a
+mount namespace is refused (`EINVAL`) to a thread that shares its root
+with others.
 
 #### System-wide calls
 
@@ -2095,7 +2101,7 @@ names macOS does not support:
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
 | interface requests (`SIOCGIFCONF`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCSIFMTU`, ...) | a 32-byte `ifreq`, other flag bits | in an fwe network namespace, answered for `lo`; elsewhere the host's interfaces, `lo0` as `lo`, which the guest cannot change |
 | `SOCK_SEQPACKET` Unix sockets | none | a stream socket with length-prefixed frames (`crates/kernel/src/seqpacket.rs`) |
-| `AF_NETLINK`/`NETLINK_ROUTE` | none | in an fwe network namespace, answers for `lo`; elsewhere every request is `EOPNOTSUPP` |
+| `AF_NETLINK`/`NETLINK_ROUTE` | none | in an fwe network namespace, answers for `lo`; in the initial one, for the host's loopback as `lo` |
 | `SO_PEERCRED` | `LOCAL_PEERCRED` | peer pid in the caller's pid namespace, ids as the guest sees them |
 
 #### System V IPC
@@ -2161,7 +2167,15 @@ and when a fresh fwe starts.
 macOS has no namespaces. fwe makes each as a shared record the processes
 in it name; a process in an initial namespace sees the host's (host name,
 host pids). `clone` and `unshare` make them (`crates/kernel/src/nsops.rs`),
-`setns` joins one through a `/proc/<pid>/ns/*` descriptor (`nsfd.rs`):
+`setns` joins one through a `/proc/<pid>/ns/*` descriptor (`nsfd.rs`).
+As on Linux, each thread has its own: one that changes them while other
+threads run takes a copy of the process's view (`threadfs.rs`), which its
+sockets and IPC act in, and which goes once it is back in the process's
+namespaces; it shares the root, working directory and umask with the
+others unless it unshared `CLONE_FS`, and a thread it starts has a copy
+of its view. A `fork` child or a program it runs takes the calling
+thread's.
+
 
 | Namespace | What fwe does |
 |---|---|
@@ -2208,7 +2222,14 @@ follows:
   enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
 - an overlay is resolved as Linux's `overlay`: upper then lower layers,
   whiteouts (0:0 device nodes) and opaque directories, copy-up as an APFS
-  clone, each change built in the work directory and renamed into place.
+  clone, each change built in the work directory and renamed into place;
+  a directory opened in a bind mount of one stays in that mount, with what
+  is mounted below it;
+- a namespace's file (`/proc/<pid>/ns/<kind>`, a thread's under
+  `task/<tid>`, or a descriptor of one) bound to a file is an `nsfs` mount
+  that names the namespace: opening the path gives a descriptor of it,
+  `stat` shows its inode, and it keeps the namespace from being collected
+  until unmounted (Docker and `ip netns` keep network namespaces so).
 
 ### Credentials and capabilities
 
@@ -2322,15 +2343,18 @@ the host takes as Linux would (`Kernel::sync_host_signal`):
 | a handler | caught by fwe | to build Linux's frame |
 | read by a `signalfd` or `rt_sigtimedwait` | caught by fwe, whatever the disposition, while it is read | to queue it there |
 | default, and the default ends or stops the process (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGTSTP`, `SIGTTIN`, …) | caught by fwe, which carries the default out | so a thread whose guest mask blocks it keeps it pending, the parent sees Linux's status, and a VM process tears its VM down first |
-| default, and the default ignores or continues (`SIGCHLD`, `SIGURG`, `SIGWINCH`, `SIGCONT`) | host default | the host does the same |
+| default, and the default ignores (`SIGCHLD`, `SIGURG`, `SIGWINCH`) | caught by fwe, which drops it unless the guest blocks it | macOS discards such a signal even while it is blocked; Linux keeps a blocked one pending |
+| default `SIGCONT` | host default | the host does the same |
 | ignored | host `SIG_IGN` | the host does the same, and keeps it ignored across `execve` |
 | `SIGKILL`, `SIGSTOP` | the host's | they cannot be caught |
 | fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | fwe's fault handlers, always | see [Faults in guest code](#faults-in-guest-code) |
 
 A guest thread runs under a host mask holding only the guest-blocked
 signals whose action the host applies (`host::host_mask_for`); fwe's
-handlers run with every signal blocked. `SIGCHLD`'s `SA_NOCLDSTOP` and
-`SA_NOCLDWAIT` are passed to the host with it.
+handlers run with every signal blocked, and what a handler does for a
+signal that interrupted fwe's own code allocates nothing (it may have
+interrupted the allocator). `SIGCHLD`'s `SA_NOCLDSTOP` and `SA_NOCLDWAIT`
+are passed to the host with it.
 
 #### A host signal reaching a guest thread
 
@@ -2599,7 +2623,12 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 - a reaper runs a watcher thread on `kqueue` process events and raises
   `SIGCHLD` in itself for an adopted descendant's end, stop or continue,
   with a child's `siginfo`, and wakes its threads waiting in `wait`;
-- its `wait` looks at its own children, then the adopted ones.
+- its `wait` looks at its own children, then the adopted ones;
+- a child made with `CLONE_PARENT` is its creator's parent's, not its
+  parent's on the host: its record says so, it tells that parent as it
+  starts (a note in the parent's signal mailbox), and the parent then
+  runs the watcher and waits for it as for one it adopted (runc makes
+  each container's init so).
 
 ### A process killed from the host
 
@@ -2659,7 +2688,7 @@ for each kind of descriptor:
 | readiness on an `O_ASYNC` descriptor: host `SIGIO` with no sender | the descriptor and its events found with `poll`; sent as the signal `F_SETSIG` chose, to the owner thread if one is set | that signal with `si_fd`, `si_band` and `POLL_IN`/`POLL_OUT`/`POLL_PRI`/`POLL_HUP` |
 | out-of-band data: `SIGURG` (16) | relayed | `SIGURG` (23) |
 | reading an unconnected Unix stream socket: `ENOTCONN` | Linux's answer | `EINVAL` |
-| an interface or route changes | no netlink outside an fwe network namespace (`EOPNOTSUPP`) | nothing |
+| an interface or route changes | netlink outside an fwe network namespace describes only the host's loopback | nothing |
 | the host's DNS settings | not read: the resolver reads the rootfs's `/etc/resolv.conf` and `/etc/hosts` | the rootfs's |
 
 ### Clocks and timers

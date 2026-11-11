@@ -98,6 +98,7 @@ pub mod sysvipc;
 pub mod term;
 pub mod textbusy;
 pub mod thread;
+pub mod threadfs;
 pub mod tmpfile;
 pub mod tmpfs;
 pub mod trace;
@@ -346,7 +347,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(coredump::UNDUMPABLE.load(std::sync::atomic::Ordering::Relaxed));
         rlimits::save(e);
-        match &self.fs {
+        match self.fs_opt() {
             Some(fs) => {
                 e.bool(true);
                 fs.save(e);
@@ -473,6 +474,8 @@ impl<P: Platform> Kernel<P> {
         landlock::load(d);
         acct::forked_child();
         aio::forget_all();
+        // A thread's own view the forking thread had is in the state.
+        drop(threadfs::take_for_child());
         if let Some(fs) = &k.fs {
             fs.publish();
         }
@@ -568,7 +571,7 @@ impl<P: Platform> Kernel<P> {
         if flags & !(fcntl::AT_EMPTY_PATH | fcntl::AT_SYMLINK_NOFOLLOW) != 0 {
             return Err(errno::EINVAL);
         }
-        let fs = self.fs.as_ref().ok_or(errno::ENOENT)?;
+        let fs = self.fs_opt().ok_or(errno::ENOENT)?;
         let at_cwd = dirfd == fcntl::AT_FDCWD as i32;
         // The guest path of an open descriptor, if it names a file.
         let fd_path = |fd: i32| -> Result<Vec<u8>, i32> {
@@ -624,7 +627,7 @@ impl<P: Platform> Kernel<P> {
         if landlock::active() {
             self.landlock_exec(path)?;
         }
-        let Some(fs) = self.fs.as_ref() else { return Ok(()) };
+        let Some(fs) = self.fs_opt() else { return Ok(()) };
         if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
@@ -655,7 +658,7 @@ impl<P: Platform> Kernel<P> {
     pub fn exec_state(&self) -> Vec<u8> {
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
-        match self.fs.as_ref() {
+        match self.fs_opt() {
             Some(fs) => {
                 e.bool(true);
                 fs.save_view(&mut e);
@@ -674,7 +677,7 @@ impl<P: Platform> Kernel<P> {
         let (soft, hard) = fdtable::limit();
         e.u64(soft);
         e.u64(hard);
-        e.u32(self.fs.as_ref().map_or(0o022, |fs| fs.umask()));
+        e.u32(self.fs_opt().map_or(0o022, |fs| fs.umask()));
         rlimits::save(&mut e);
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
@@ -708,6 +711,8 @@ impl<P: Platform> Kernel<P> {
         e.bool(syscalls);
         // Its Landlock domain, which a program run keeps.
         landlock::save(&mut e);
+        // Its foster children, still its own to follow.
+        e.bool(reaper::fostering());
         e.into_bytes()
     }
 
@@ -745,7 +750,9 @@ impl<P: Platform> Kernel<P> {
         let thp = d.bool();
         let (tracer, syscalls) = (d.u32() as i32, d.bool());
         landlock::load(&mut d);
+        let fostering = d.bool();
         d.finish()?;
+        reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
@@ -770,7 +777,7 @@ impl<P: Platform> Kernel<P> {
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
         let _ = fdtable::set_limit(soft, hard);
-        if let Some(fs) = self.fs.as_mut() {
+        if let Some(fs) = self.fs_opt_mut() {
             fs.set_umask(umask);
         }
         // Limits another process left for this one (runc sets its
@@ -889,6 +896,8 @@ pub fn thread_exit_cleanup() {
     }
     // A traced thread's tracer learns of its end.
     ptrace::thread_exiting();
+    // Its own filesystem view and namespaces, if it had them.
+    threadfs::thread_exit();
     // The robust futexes it still holds, then its `set_tid_address` word,
     // as Linux releases them.
     futex::release_robust(thread::take_robust_list(), thread::tid());
@@ -953,7 +962,11 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
                             fs::hold(|| {
                                 futex::hold(|| {
                                     mm::hold(|| {
-                                        maps::hold(|| thread::hold(|| seqpacket::hold(fork)))
+                                        maps::hold(|| {
+                                            thread::hold(|| {
+                                                threadfs::hold(|| seqpacket::hold(fork))
+                                            })
+                                        })
                                     })
                                 })
                             })

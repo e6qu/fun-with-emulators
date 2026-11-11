@@ -101,6 +101,13 @@ pub fn open_own() {
 
 /// `<dir>/<pid>.sig`, NUL-terminated, in `buf`. Async-signal-safe.
 fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
+    record_file(pid, b".sig", buf)
+}
+
+/// The path of process `pid`'s file beside its record with suffix `suffix`
+/// (`.sig`, its mailbox; `.end`, how it ended), NUL-terminated in `buf`.
+/// Async-signal-safe: it allocates nothing.
+pub fn record_file(pid: i32, suffix: &[u8], buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
     let dir = DIR.get()?;
     let mut digits = [0u8; 12];
     let mut n = pid.unsigned_abs();
@@ -113,7 +120,7 @@ fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
             break;
         }
     }
-    let need = dir.len() + 1 + len + 4 + 1;
+    let need = dir.len() + 1 + len + suffix.len() + 1;
     if pid <= 0 || need > buf.len() {
         return None;
     }
@@ -125,8 +132,8 @@ fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
         buf[at] = digits[i];
         at += 1;
     }
-    buf[at..at + 4].copy_from_slice(b".sig");
-    buf[at + 4] = 0;
+    buf[at..at + suffix.len()].copy_from_slice(suffix);
+    buf[at + suffix.len()] = 0;
     Some(buf.as_ptr().cast())
 }
 
@@ -331,6 +338,16 @@ pub fn request_fd(target: i32, fd: i32, token: u64) -> Result<(), i32> {
 /// What a queue entry holds for a request to copy this process's memory
 /// ([`request_mem`]).
 const MEM_REQUEST: u64 = 0x1_0001;
+
+/// What a queue entry holds for the note that the receiver has a foster
+/// child ([`foster`]).
+const FOSTER_NOTE: u64 = 0x1_0002;
+
+/// Tell host process `target` (woken by the caller) that it has a child
+/// made with `CLONE_PARENT` ([`crate::reaper::foster_started`]).
+pub fn foster(target: i32) -> Result<(), i32> {
+    put(target, 0, FOSTER_NOTE, 0, 0)
+}
 
 /// Ask process `target` to copy between its memory and the request file
 /// of reply socket `token` ([`answer_mem`]).
@@ -545,7 +562,9 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
     for e in q[..n.max(0) as usize].chunks_exact(ENTRY) {
         let word = |at: usize| e[at..at + 4].try_into().unwrap();
         let sig = i32::from_ne_bytes(word(0));
-        if sig as u64 == MEM_REQUEST {
+        if sig as u64 == FOSTER_NOTE {
+            crate::reaper::fostered();
+        } else if sig as u64 == MEM_REQUEST {
             answer_mem(
                 i32::from_ne_bytes(word(4)),
                 u64::from_ne_bytes(e[16..24].try_into().unwrap()),

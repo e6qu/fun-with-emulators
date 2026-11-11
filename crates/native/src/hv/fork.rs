@@ -800,6 +800,9 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let ns = k.fs.as_ref().map(|fs| fs.ns_dirs()).unwrap_or_default();
     let auxv = k.fs.as_ref().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
     fwe_kernel::procreg::own_line(&line, &inherit, ns, fwe_kernel::maps::forked(), &auxv);
+    if inherit.foster {
+        fwe_kernel::reaper::foster_started(&line.0);
+    }
     fwe_kernel::reaper::start_if_reaper();
     d.finish()?;
     backend::become_vm_process()?;

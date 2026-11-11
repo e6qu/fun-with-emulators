@@ -227,6 +227,22 @@ impl<P: Platform> Kernel<P> {
         Ok(crate::overlay::Layers { upper, work, lowers, userxattr: o.userxattr })
     }
 
+    /// The namespace `source` names, if it is a namespace's file: a
+    /// `/proc/<pid>/ns/<kind>` link, a descriptor of a namespace through
+    /// `/proc/self/fd`, or a path a namespace is bound to.
+    fn bound_namespace(&self, source: &[u8]) -> Option<Result<crate::nsfd::NsRef, i32>> {
+        use crate::procfs::Entry;
+        let cwd = fwe_abi::fcntl::AT_FDCWD as i32;
+        match self.fs().synthetic(cwd, source)? {
+            Entry::Ns(n) => Some(Ok(n)),
+            Entry::Fd { fd, .. } => crate::nsfd::of(fd).map(Ok),
+            Entry::Symlink(link) if link.contains(&b'[') && link.ends_with(b"]") => {
+                Some(self.ns_at(cwd, source, &link))
+            }
+            _ => None,
+        }
+    }
+
     /// `mount(source, target, fstype, flags, data)`.
     pub(crate) fn sys_mount(
         &mut self,
@@ -259,6 +275,33 @@ impl<P: Platform> Kernel<P> {
             let named = flags & (ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME);
             let flags = if named == 0 { flags } else { flags | default_atime(flags) };
             ns.update(|t| t.remount(&point, flags, opts))
+        } else if flags & ms::BIND != 0
+            && let Some(found) = self.bound_namespace(&source)
+        {
+            // A namespace's file (`/proc/<pid>/ns/<kind>`, a descriptor of
+            // one, or a path one is bound to) bound to a file: opening it
+            // gives the namespace, which lives as long as the mount.
+            let n = match found {
+                Ok(n) => n,
+                Err(e) => return err(e),
+            };
+            if is_dir {
+                return err(errno::ENOTDIR);
+            }
+            let name = crate::nsfd::name_of(n.kind);
+            let root = [name.as_bytes(), format!(":[{}]", n.id).as_bytes()].concat();
+            ns.update(|t| {
+                t.mount(
+                    &point,
+                    FsType::Nsfs,
+                    Source::Ns(n),
+                    root,
+                    flags & ms::PER_MOUNT,
+                    b"nsfs".to_vec(),
+                    b"rw".to_vec(),
+                );
+                Ok(())
+            })
         } else if flags & ms::BIND != 0 {
             // A file fwe serves from the host outside any mount (the
             // standard device nodes): that host file.
@@ -427,7 +470,7 @@ impl<P: Platform> Kernel<P> {
             let roots: Vec<Vec<u8>> = match &m.source {
                 Source::Host(_) => m.host_path(b"").into_iter().collect(),
                 Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
-                Source::Synthetic => Vec::new(),
+                Source::Synthetic | Source::Ns(_) => Vec::new(),
             };
             roots.iter().map(|r| canonical(r)).collect()
         };
@@ -501,7 +544,7 @@ impl<P: Platform> Kernel<P> {
         } else {
             cwd_ns
         };
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
         let root_mount = fs.mounts().locate(&root).0.id;
         fs.set_root(root, cwd);
@@ -528,7 +571,7 @@ impl<P: Platform> Kernel<P> {
         }
         // The working directory stays where it is; from the new root it
         // has a path only if it is inside.
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         let cwd_ns = fs.to_ns(fs.cwd());
         let inside = crate::mounts::under(&cwd_ns, &ns).map(|r| crate::mounts::join(b"/", r));
         let outside = inside.is_none().then(|| cwd_ns.clone());

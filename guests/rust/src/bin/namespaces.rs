@@ -1,11 +1,14 @@
 //! Namespaces and mounts as container runtimes use them, one scenario per
-//! argument, each printing what it observed. Runs as (virtual) root, in a
+//! argument (a thread's own included), each printing what it observed. Runs as (virtual) root, in a
 //! root filesystem that has `/mnt`, `/newroot` (with `etc/marker` and
 //! `proc`) and `/tmp`.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
 
+const O_DIRECTORY: i32 = 0o40000;
+const CLONE_FS: i32 = 0x0000_0200;
+const CLONE_PARENT: i32 = 0x0000_8000;
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
 const CLONE_NEWPID: i32 = 0x2000_0000;
@@ -43,6 +46,10 @@ struct Utsname {
 
 unsafe extern "C" {
     fn unshare(flags: i32) -> i32;
+    fn openat(dirfd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    fn mkdirat(dirfd: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
+    fn setns(fd: i32, nstype: i32) -> i32;
+    fn umask(mask: u32) -> u32;
     fn sethostname(name: *const u8, len: usize) -> i32;
     fn uname(u: *mut Utsname) -> i32;
     fn fork() -> i32;
@@ -141,8 +148,9 @@ fn sigchld_from(pid: i32) -> bool {
 
 fn read_i32(fd: i32) -> i32 {
     let mut b = [0u8; 4];
+    // Again when a signal (a child's SIGCHLD) interrupts it.
     // SAFETY: a valid buffer.
-    unsafe { read(fd, b.as_mut_ptr(), 4) };
+    while unsafe { read(fd, b.as_mut_ptr(), 4) } < 0 && errno() == 4 {}
     i32::from_ne_bytes(b)
 }
 
@@ -585,6 +593,214 @@ fn main() {
             });
             println!("child exited {code}");
         }
+        // A thread's own root, mounts and network namespace, as Docker
+        // makes them on one of its threads while the others carry on; and
+        // a working directory and umask the threads share.
+        Some("threads") => {
+            use std::os::fd::AsRawFd;
+            let own = std::thread::spawn(|| {
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    let u = unshare(CLONE_FS | CLONE_NEWNS);
+                    let p = mount(
+                        c"none".as_ptr(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        MS_REC | MS_PRIVATE,
+                        std::ptr::null(),
+                    );
+                    let m = mount(
+                        c"tmpfs".as_ptr(),
+                        c"/mnt".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    );
+                    let mnt = mounted("/mnt");
+                    let c = chroot(c"/newroot".as_ptr());
+                    chdir(c"/".as_ptr());
+                    let marker = std::fs::read_to_string("/etc/marker").unwrap_or_default();
+                    format!(
+                        "thread: unshare {u} private {p} tmpfs {m} {mnt} chroot {c} marker {}",
+                        marker.trim()
+                    )
+                }
+            });
+            println!("{}", own.join().unwrap());
+            println!(
+                "others: root kept {}, /mnt not mounted {}",
+                std::path::Path::new("/newroot/etc/marker").exists(),
+                !mounted("/mnt")
+            );
+            // Shared: what a thread sets, the others have.
+            std::thread::spawn(|| {
+                // SAFETY: plain calls.
+                unsafe {
+                    umask(0o077);
+                    chdir(c"/tmp".as_ptr());
+                }
+            })
+            .join()
+            .unwrap();
+            // SAFETY: plain call.
+            let was = unsafe { umask(0o022) };
+            let cwd = std::env::current_dir().unwrap();
+            println!("shared: umask {was:o} cwd {}", cwd.display());
+            // SAFETY: a NUL-terminated path.
+            unsafe { chdir(c"/".as_ptr()) };
+            // A thread's own network namespace, then back in the process's.
+            let (to_main, from_thread) = std::sync::mpsc::channel();
+            let (to_thread, from_main) = std::sync::mpsc::channel::<()>();
+            let net = std::thread::spawn(move || {
+                let orig = std::fs::File::open("/proc/self/ns/net").unwrap();
+                // SAFETY: plain calls.
+                unsafe { unshare(CLONE_NEWNET) };
+                set_lo_up();
+                let inside = std::net::TcpListener::bind("127.0.0.1:18090");
+                to_main.send(inside.is_ok()).unwrap();
+                from_main.recv().unwrap();
+                // SAFETY: a namespace descriptor.
+                let back = unsafe { setns(orig.as_raw_fd(), CLONE_NEWNET) };
+                let again = std::net::TcpListener::bind("127.0.0.1:18090").map(|_| ()).unwrap_err();
+                format!("back: {back}, port taken {}", again.raw_os_error() == Some(98))
+            });
+            let inside = from_thread.recv().unwrap();
+            let outside = std::net::TcpListener::bind("127.0.0.1:18090");
+            println!("net: thread bound {inside}, process too {}", outside.is_ok());
+            to_thread.send(()).unwrap();
+            println!("{}", net.join().unwrap());
+            // A mount namespace is not joined while the root is shared.
+            let mnt = std::fs::File::open("/proc/self/ns/mnt").unwrap();
+            let (hold, wait) = std::sync::mpsc::channel::<()>();
+            let other = std::thread::spawn(move || wait.recv());
+            // SAFETY: a namespace descriptor.
+            let r = unsafe { setns(mnt.as_raw_fd(), CLONE_NEWNS) };
+            println!("setns mnt with threads: {r} errno {}", errno());
+            drop(hold);
+            let _ = other.join();
+        }
+        // A network namespace kept by a bind mount of its file, as Docker
+        // and `ip netns` keep one: made on a thread, bound by its
+        // `/proc/<pid>/task/<tid>/ns/net`, joined through the file by the
+        // process and by a child, and gone from the path once unmounted.
+        Some("nsbind") => {
+            use std::os::fd::AsRawFd;
+            std::fs::write("/tmp/netns", b"").unwrap();
+            let made = std::thread::spawn(|| {
+                let orig = std::fs::File::open("/proc/self/ns/net").unwrap();
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    unshare(CLONE_NEWNET);
+                    set_lo_up();
+                    let tid = syscall(178);
+                    let src = std::ffi::CString::new(format!(
+                        "/proc/{}/task/{tid}/ns/net",
+                        getpid()
+                    ))
+                    .unwrap();
+                    let link = std::fs::read_link(src.to_str().unwrap()).unwrap();
+                    let m = mount(
+                        src.as_ptr(),
+                        c"/tmp/netns".as_ptr(),
+                        std::ptr::null(),
+                        MS_BIND,
+                        std::ptr::null(),
+                    );
+                    let back = setns(orig.as_raw_fd(), CLONE_NEWNET);
+                    (m, back, link)
+                }
+            });
+            let (m, back, link) = made.join().unwrap();
+            println!("bind: {m}, back {back}");
+            let ino = {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata("/tmp/netns").unwrap().ino()
+            };
+            let id = link.to_string_lossy().trim_start_matches("net:[").trim_end_matches(']').to_string();
+            println!("inode is the namespace's: {}", ino.to_string() == id);
+            println!(
+                "mountinfo: {}",
+                std::fs::read_to_string("/proc/self/mountinfo")
+                    .unwrap()
+                    .lines()
+                    .any(|l| l.contains(" /tmp/netns ") && l.contains(" - nsfs nsfs "))
+            );
+            // Through a directory's link too, as `/var/run` leads to `/run`.
+            std::os::unix::fs::symlink("/tmp", "/tmp/via").unwrap();
+            let ns = std::fs::File::open("/tmp/via/netns").unwrap();
+            // SAFETY: a namespace descriptor.
+            let joined = unsafe { setns(ns.as_raw_fd(), CLONE_NEWNET) };
+            let held = std::net::TcpListener::bind("127.0.0.1:18091");
+            println!("joined: {joined}, bound {}", held.is_ok());
+            let code = in_child(|| {
+                let ns = std::fs::File::open("/tmp/netns").unwrap();
+                // SAFETY: a namespace descriptor.
+                let r = unsafe { setns(ns.as_raw_fd(), CLONE_NEWNET) };
+                let taken = std::net::TcpListener::bind("127.0.0.1:18091").map(|_| ()).unwrap_err();
+                println!("child joined: {r}, port taken {}", taken.raw_os_error() == Some(98));
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                0
+            });
+            println!("child exited {code}");
+            // SAFETY: a NUL-terminated path.
+            let u = unsafe { umount2(c"/tmp/netns".as_ptr(), MNT_DETACH) };
+            let plain = std::fs::File::open("/tmp/netns").unwrap();
+            // SAFETY: a descriptor of a plain file.
+            let r = unsafe { setns(plain.as_raw_fd(), CLONE_NEWNET) };
+            println!("umount: {u}, a plain file again: {r} errno {}", errno());
+        }
+        // A directory of a bind mount of an overlay, opened, reaches what
+        // is mounted below the bind (runc makes `dev/pts` in the tmpfs it
+        // put on a container's `dev` this way), not the overlay's own.
+        Some("ovlbind") => {
+            use std::os::fd::AsRawFd;
+            for d in ["/tmp/lower/dev", "/tmp/upper", "/tmp/work", "/tmp/o", "/tmp/b"] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let code = in_child(|| {
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    unshare(CLONE_NEWNS);
+                    let o = mount(
+                        c"overlay".as_ptr(),
+                        c"/tmp/o".as_ptr(),
+                        c"overlay".as_ptr(),
+                        0,
+                        c"lowerdir=/tmp/lower,upperdir=/tmp/upper,workdir=/tmp/work".as_ptr().cast(),
+                    );
+                    let b = mount(
+                        c"/tmp/o".as_ptr(),
+                        c"/tmp/b".as_ptr(),
+                        c"bind".as_ptr(),
+                        MS_BIND | MS_REC,
+                        std::ptr::null(),
+                    );
+                    let t = mount(
+                        c"tmpfs".as_ptr(),
+                        c"/tmp/b/dev".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    );
+                    println!("mounts: {o} {b} {t}");
+                }
+                let root = std::fs::File::open("/tmp/b").unwrap();
+                let dev = std::ffi::CString::new("dev").unwrap();
+                let pts = std::ffi::CString::new("pts").unwrap();
+                // SAFETY: a directory descriptor and NUL-terminated names.
+                let made = unsafe {
+                    let d = openat(root.as_raw_fd(), dev.as_ptr(), O_DIRECTORY);
+                    mkdirat(d, pts.as_ptr(), 0o755)
+                };
+                println!(
+                    "mkdir: {made}, in the tmpfs {}, not the overlay's {}",
+                    std::path::Path::new("/tmp/b/dev/pts").is_dir(),
+                    !std::path::Path::new("/tmp/o/dev/pts").exists()
+                );
+                0
+            });
+            println!("child exited {code}");
+        }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds
             // it while a child in its own namespace has it.
@@ -682,6 +898,58 @@ fn main() {
         }
         // A child subreaper adopts the orphans below it: it is their
         // parent, is sent SIGCHLD when one ends, and reaps it.
+        // Children made with CLONE_PARENT are the creator's parent's: it
+        // is told when each ends and reaps it, though it is no subreaper
+        // and they are not its children on the host; as runc makes a
+        // container's init, in new namespaces, two levels down.
+        Some("fosters") => {
+            catch_sigchld();
+            // SAFETY: plain calls with valid buffers; the children end.
+            unsafe {
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let first = fork();
+                if first == 0 {
+                    let second = syscall(SYS_CLONE, CLONE_PARENT as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                    if second == 0 {
+                        unshare(CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET);
+                        let init =
+                            syscall(SYS_CLONE, CLONE_PARENT as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                        if init == 0 {
+                            usleep(300_000);
+                            _exit(7);
+                        }
+                        // Its pid: in the parent's pid namespace still.
+                        write_i32(report[1], getpid());
+                        write_i32(report[1], init as i32);
+                        _exit(0);
+                    }
+                    usleep(50_000);
+                    _exit(0);
+                }
+                let second = read_i32(report[0]);
+                let init = read_i32(report[0]);
+                let mut reaped = Vec::new();
+                loop {
+                    let mut st = 0;
+                    let w = waitpid(-1, &mut st, 0);
+                    if w < 0 {
+                        println!("then: ECHILD {}", errno() == ECHILD);
+                        break;
+                    }
+                    reaped.push((w, (st >> 8) & 0xff));
+                }
+                let has = |p: i32, code: i32| reaped.contains(&(p, code));
+                println!(
+                    "reaped: {} children, first {}, second {}, init exited {}",
+                    reaped.len(),
+                    has(first, 0),
+                    has(second, 0),
+                    reaped.iter().find(|r| r.0 == init).map_or(-1, |r| r.1)
+                );
+                println!("init's SIGCHLD: {}", sigchld_coded(init, 1));
+            }
+        }
         Some("subreaper") => {
             catch_sigchld();
             // SAFETY: plain calls with valid out-parameters.

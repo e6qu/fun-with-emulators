@@ -182,6 +182,21 @@ fn main() {
         println!("end told with: {}, reaped {reaped}", if sig == SIGUSR2 { "SIGUSR2" } else { "other" });
         sigprocmask(1, &usr2, std::ptr::null_mut());
 
+        // A blocked SIGCHLD left at its default action stays pending: a
+        // child that ended before the wait began is told of in it.
+        let chld = set(&[SIGCHLD]);
+        sigprocmask(0, &chld, std::ptr::null_mut());
+        let pid = fork();
+        if pid == 0 {
+            _exit(0);
+        }
+        usleep(200_000);
+        let t = Timespec { sec: 2, nsec: 0 };
+        let kept = sigtimedwait(&chld, &mut got, &t) == SIGCHLD;
+        waitpid(pid, &mut status, 0);
+        sigprocmask(1, &chld, std::ptr::null_mut());
+        println!("blocked SIGCHLD kept: {kept}");
+
         // A child that shares the memory.
         let stack = vec![0u8; 64 << 10];
         let top = stack.as_ptr().add(stack.len()) as *mut c_void;

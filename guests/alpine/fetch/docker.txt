@@ -1,0 +1,19 @@
+# Alpine Linux 3.20 aarch64 files the Docker test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs (the root filesystem
+# of the standard `alpine` image), Docker Engine (dockerd), the docker CLI
+# with its buildx and compose plugins, containerd, runc, tini and iptables
+# with their libraries. Each line is a path under that URL and the file's
+# SHA-256. 3.20 is past its end of life, so these files no longer change.
+v3.20/releases/aarch64/alpine-minirootfs-3.20.10-aarch64.tar.gz 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+v3.20/community/aarch64/docker-engine-26.1.5-r0.apk c98573353b267f96c5932b95145744fbea9fae0e3419ffd9503bc2325df861fc
+v3.20/community/aarch64/docker-cli-26.1.5-r0.apk ca1df8dc4aa2780aab6b4efe3b78b2e73189e8d62bf7b4d96fc1b137569b44f7
+v3.20/community/aarch64/docker-cli-buildx-0.14.0-r3.apk cbd178e0c3fda0c302e12103fc6895066244c693246fa7bfec8a3f71648823af
+v3.20/community/aarch64/docker-cli-compose-2.27.0-r3.apk 731463721450903a65f6bd6e2eeb490d34c5ae0151b0aa7aa4b6103d7cd450d6
+v3.20/community/aarch64/containerd-1.7.17-r2.apk d7d5f399dc2e2d7af7206c51b788ed06991aa2dfe022a014c125bafbe49fdbe6
+v3.20/community/aarch64/runc-1.1.14-r0.apk 25551850e3490e8722c462b49483e31a113a8c1ab4d93fb626e3725fcddb0a6f
+v3.20/community/aarch64/tini-static-0.19.0-r3.apk ec7468e5aa5c8d580929464c26c7e9d1df1f2944b25e1a5a91a23fe7bf8b679c
+v3.20/main/aarch64/iptables-1.8.10-r3.apk 8847bfc716cdeef79c2829dc1e850447e0289137d3472e26a6f7fa5ce69e51be
+v3.20/main/aarch64/libmnl-1.0.5-r2.apk 0136c982ed2e1b1daa3f0c8f5857584796eb627e7feec67bf0df48cfc0d22e80
+v3.20/main/aarch64/libnftnl-1.2.6-r0.apk a2df3702ab7809899486be6d1d2366d1c50ba2862523fd092bf4088aa3a47672
+v3.20/main/aarch64/libxtables-1.8.10-r3.apk 49999935f1f5175068823fea77d15e06ea1924cb9836f97f04567811c403eaba
+v3.20/main/aarch64/libseccomp-2.5.5-r1.apk 8ccd1bd0dbe018a5b4f07ee9c2ffb4fe2805ecfe22e004dd301870d47e14618b

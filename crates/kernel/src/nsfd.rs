@@ -61,7 +61,7 @@ pub fn kind_of(name: &[u8]) -> Option<u64> {
 }
 
 /// The name a namespace of `CLONE_NEW*` type `kind` goes by.
-fn name_of(kind: u64) -> &'static str {
+pub fn name_of(kind: u64) -> &'static str {
     match kind {
         CLONE_NEWUTS => "uts",
         CLONE_NEWIPC => "ipc",
@@ -205,16 +205,24 @@ impl<P: Platform> Kernel<P> {
     /// the namespaces whose record directories are `dirs` (the caller's,
     /// for `self`); `link` is its link's text, `kind:[id]`.
     pub(crate) fn open_ns(&self, name: &[u8], dirs: &[Vec<u8>], link: &[u8], flags: u64) -> i64 {
-        let Some(kind) = kind_of(name) else { return err(errno::ENOENT) };
+        match self.ns_ref(name, dirs, link) {
+            Ok(n) => open(n, flags & fwe_abi::fcntl::O_CLOEXEC != 0),
+            Err(e) => err(e),
+        }
+    }
+
+    /// The namespace [`open_ns`](Self::open_ns) opens.
+    pub(crate) fn ns_ref(&self, name: &[u8], dirs: &[Vec<u8>], link: &[u8]) -> Result<NsRef, i32> {
+        let kind = kind_of(name).ok_or(errno::ENOENT)?;
         let id = link.iter().position(|&b| b == b'[').and_then(|o| {
             std::str::from_utf8(link[o + 1..].strip_suffix(b"]")?).ok()?.parse().ok()
         });
-        let Some(id) = id else { return err(errno::ENOENT) };
+        let id = id.ok_or(errno::ENOENT)?;
         let dir = dir_among(name, dirs).or_else(|| {
             // The initial mount namespace's table is a record too.
             (kind == CLONE_NEWNS).then(|| self.fs().mount_ns().dir().to_vec())
         });
-        open(NsRef { kind, id, dir }, flags & fwe_abi::fcntl::O_CLOEXEC != 0)
+        Ok(NsRef { kind, id, dir })
     }
 
     /// An `ioctl` on namespace descriptor `fd`: `None` for another one.
@@ -329,13 +337,22 @@ impl<P: Platform> Kernel<P> {
         if n.kind == CLONE_NEWUSER && crate::thread::live_threads() > 1 {
             return err(errno::EINVAL);
         }
+        // A mount namespace is joined by a thread that shares its root and
+        // working directory with no other.
+        if n.kind == CLONE_NEWNS
+            && crate::thread::live_threads() > 1
+            && (crate::threadfs::current().is_none() || crate::threadfs::shares())
+        {
+            return err(errno::EINVAL);
+        }
+        if let Err(e) = self.own_view(false) {
+            return err(e);
+        }
         let r = self.join_ns(&n);
         if let Err(e) = r {
             return err(e);
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
-        crate::procreg::own_namespaces(fs.ns_dirs());
-        fs.ns.activate();
+        self.namespaces_changed();
         0
     }
 
@@ -347,7 +364,7 @@ impl<P: Platform> Kernel<P> {
         fn join<T: crate::shared::Data>(n: &NsRef) -> Result<Option<Arc<Record<T>>>, i32> {
             n.dir.as_ref().map(|d| Record::join(d, n.id).map(Arc::new)).transpose()
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         match n.kind {
             CLONE_NEWUTS => fs.ns.uts = join(n)?,
             CLONE_NEWIPC => fs.ns.ipc = join(n)?,

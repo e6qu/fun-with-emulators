@@ -542,6 +542,11 @@ fn legacy_adj(adj: i32) -> i32 {
 
 /// What a write of `data` to `/proc/<pid>/oom_score_adj` (or `oom_adj`)
 /// opened as `mark` does.
+/// `data` up to its first NUL, if it has one.
+fn c_text(data: &[u8]) -> &[u8] {
+    data.split(|&b| b == 0).next().unwrap_or_default()
+}
+
 pub fn oom_write(mark: crate::fdmarks::Mark, data: &[u8], len: u64) -> i64 {
     use fwe_abi::{err, errno};
     let crate::fdmarks::Mark::OomScore { host, legacy, privileged } = mark else {
@@ -577,6 +582,9 @@ pub fn oom_write(mark: crate::fdmarks::Mark, data: &[u8], len: u64) -> i64 {
 /// `oom_score_adj` file opened for writing, what the write does (see
 /// [`crate::specialwrite`]).
 pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
+    // The text ends at a NUL, as Linux reads it: runc writes its value with
+    // the NUL that ends it.
+    let data = c_text(data);
     match crate::fdmarks::marked(fd)? {
         mark @ crate::fdmarks::Mark::OomScore { .. } => {
             Some(oom_write(mark, &data[..data.len().min(64)], len))

@@ -147,7 +147,7 @@ fn tree_fd(root: &Mount) -> Result<i32, i32> {
         Source::Overlay(l) => {
             l.upper.clone().or_else(|| l.lowers.first().cloned()).map(|d| join(&d, &root.root))
         }
-        Source::Synthetic => None,
+        Source::Synthetic | Source::Ns(_) => None,
     };
     let path = match host {
         Some(p) => p,

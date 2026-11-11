@@ -983,6 +983,10 @@ pub fn register(tid: i32) -> Arc<Pending> {
         let s = slack();
         SLACK_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).push((tid, s));
     }
+    if tid != tgid() {
+        // Its filesystem view and namespaces are its creator's.
+        crate::threadfs::started(tid);
+    }
     let pending = Arc::new(Pending::new());
     let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0 };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
@@ -994,6 +998,7 @@ pub fn register(tid: i32) -> Arc<Pending> {
 /// Make `pending` (from [`register`]) the calling thread's own set.
 pub fn adopt(pending: &Arc<Pending>) {
     OWN.with(|o| o.set(Arc::as_ptr(pending)));
+    crate::threadfs::enter(tid());
 }
 
 /// Record the host thread of the registration owning `pending`. Does
@@ -1016,6 +1021,7 @@ pub fn unregister(pending: &Arc<Pending>) {
     };
     for tid in gone {
         directed_remove(tid);
+        crate::threadfs::forget(tid);
     }
     publish_tids(&tids());
 }

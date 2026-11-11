@@ -1244,15 +1244,22 @@ fn alpine_image(manifest_name: &str) -> PathBuf {
         .unwrap()
 }
 
+/// Whether the tests of fetched programs that `var` gates run: they run
+/// only where it is set (CI's own job for them), not on a development
+/// machine.
+fn fetched_program_tests(var: &str) -> bool {
+    let on = std::env::var_os(var).is_some();
+    if !on {
+        eprintln!("skipped: set {var}=1 to run them");
+    }
+    on
+}
+
 /// Whether the debugger tests run: they need Alpine's strace and gdb
 /// (fetched: `guests/alpine/fetch/ptrace.txt`), run only where
 /// `FWE_DEBUGGER_TESTS` is set (CI's `debuggers` job).
 fn debugger_tests() -> bool {
-    let on = std::env::var_os("FWE_DEBUGGER_TESTS").is_some();
-    if !on {
-        eprintln!("skipped: set FWE_DEBUGGER_TESTS=1 to run Alpine's strace and gdb");
-    }
-    on
+    fetched_program_tests("FWE_DEBUGGER_TESTS")
 }
 
 /// Run `args` (a program of the root, then its arguments) in a copy of the
@@ -1390,12 +1397,15 @@ fn alpine_crun_runs_an_image() {
             .arg(bundle.join("rootfs")),
     );
     let _workload = workload();
-    // Traced, except for the container's run: its program writes its own
-    // standard error into what the test reads.
+    // Traced: the container's run to a file (its program writes its own
+    // standard error into what the test reads), for a run that goes wrong.
+    let run_trace = root.join("tmp/crun-run.trace");
     let crun = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root).arg("--cwd").arg("/bundle");
-        if args[0] != "run" {
+        if args[0] == "run" {
+            cmd.arg("--strace").arg(format!("--strace-file={}", run_trace.display()));
+        } else {
             cmd.arg("--strace=failures");
         }
         cmd.arg(root.join("usr/bin/crun")).args(args);
@@ -1424,21 +1434,23 @@ fn alpine_crun_runs_an_image() {
     std::fs::write(&config, spec).unwrap();
     let id = format!("fwe-test-{}", std::process::id());
     let out = crun(&["run", &id]);
-    let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(
-        stdout(&out),
-        "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
+    let want = "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
          Read-only file system\nOperation not permitted\n\
          core fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero\n\
-         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n"
-    );
+         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n";
+    if stdout(&out) != want {
+        print_last_calls(&run_trace);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), want);
     assert_eq!(out.status.code(), Some(0));
 }
 
 /// The standard `alpine` image as an OCI archive at `out`, made from its
 /// one layer, the minirootfs, as the official image is: named
-/// `docker.io/library/alpine:3.20`.
-fn alpine_oci_archive(manifest_name: &str, out: &Path) {
+/// `docker.io/library/alpine:3.20`. With `docker`, it also has the
+/// `manifest.json` that `docker save` writes beside the OCI layout.
+fn alpine_oci_archive(manifest_name: &str, out: &Path, docker: bool) {
     let dir = out.with_extension("layout");
     let _ = std::fs::remove_dir_all(&dir);
     let blobs = dir.join("blobs/sha256");
@@ -1473,13 +1485,24 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    let mut entries = vec!["oci-layout", "index.json", "blobs"];
+    if docker {
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"[{{"Config":"blobs/sha256/{config_digest}","RepoTags":["alpine:3.20"],"Layers":["blobs/sha256/{layer_digest}"]}}]"#
+            ),
+        )
+        .unwrap();
+        entries.push("manifest.json");
+    }
     // Without the host's own attributes, which an archive made on Linux
     // would not have.
     run_checked(
         Command::new("tar")
             .args(["--no-xattrs", "--no-mac-metadata", "-cf"])
             .arg(out)
-            .args(["oci-layout", "index.json", "blobs"])
+            .args(&entries)
             .current_dir(&dir),
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -1536,7 +1559,7 @@ fn alpine_podman_runs_an_image() {
     )
     .unwrap();
     std::fs::create_dir_all(root.join("root")).unwrap();
-    alpine_oci_archive("podman", &root.join("tmp/alpine.tar"));
+    alpine_oci_archive("podman", &root.join("tmp/alpine.tar"), false);
     let _workload = workload();
     let podman = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
@@ -1601,7 +1624,7 @@ fn alpine_containerd_runs_an_image() {
          [grpc]\n  address = \"/run/containerd/containerd.sock\"\n",
     )
     .unwrap();
-    alpine_oci_archive("containerd", &root.join("tmp/alpine.tar"));
+    alpine_oci_archive("containerd", &root.join("tmp/alpine.tar"), false);
     let _workload = workload();
     // Each process's calls, for a step that fails: the daemon's (its
     // shims' and runc's with them), and each ctr's.
@@ -1681,6 +1704,189 @@ fn alpine_containerd_runs_an_image() {
     assert!(stdout(&filtered).starts_with("Seccomp:\t2\n"), "{}", stdout(&filtered));
     assert_eq!(filtered.status.code(), Some(0));
     assert_eq!(stdout(&after), "");
+}
+
+/// What the container prints in [`alpine_docker_runs_and_builds_images`].
+const IN_DOCKER: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
+    grep -E 'NoNewPrivs|Seccomp:' /proc/self/status; hostname | grep -cE '^[0-9a-f]{12}$'; \
+    touch /made-here && echo writable; \
+    awk '$5 == \"/\" && / - overlay / {print \"root on overlay\"}' /proc/self/mountinfo; exit 5";
+
+/// The Dockerfile [`alpine_docker_runs_and_builds_images`] builds.
+const DOCKERFILE: &str = "FROM alpine:3.20\n\
+    RUN echo built > /built && mkdir /data\n\
+    COPY greeting.txt /data/\n\
+    CMD [\"sh\", \"-c\", \"cat /built /data/greeting.txt\"]\n";
+
+/// The Compose project [`alpine_docker_runs_and_builds_images`] brings up:
+/// a service that writes to a named volume, and one built from the
+/// Dockerfile (with no network: the daemon has no bridge) that reads it
+/// once the first has completed.
+const COMPOSE: &str = "services:\n\
+    \x20 store:\n\
+    \x20   image: alpine:3.20\n\
+    \x20   network_mode: none\n\
+    \x20   volumes: [\"shared:/data\"]\n\
+    \x20   command: [\"sh\", \"-c\", \"echo stored > /data/f\"]\n\
+    \x20 reader:\n\
+    \x20   build:\n\
+    \x20     context: /tmp/context\n\
+    \x20     network: none\n\
+    \x20   network_mode: none\n\
+    \x20   volumes: [\"shared:/data\"]\n\
+    \x20   depends_on:\n\
+    \x20     store:\n\
+    \x20       condition: service_completed_successfully\n\
+    \x20   command: [\"sh\", \"-c\", \"cat /data/f /built; exit 6\"]\n\
+    volumes:\n\
+    \x20 shared: {}\n";
+
+/// Alpine's Docker Engine (fetched: `guests/alpine/fetch/docker.txt`), as
+/// root, only where `FWE_DOCKER_TESTS` is set (CI's `docker` job): `dockerd`
+/// starts its own containerd, with its `overlay2` storage, no bridge and no
+/// iptables; the `docker` CLI loads the standard `alpine` image from an
+/// archive, runs containers of it through containerd's runc shim and runc,
+/// with no network and with the host's, and builds an image from a
+/// Dockerfile with BuildKit (through the buildx plugin), whose `RUN` step
+/// runs in a container and whose `COPY` takes a file of the build context;
+/// a container of the built image runs. Docker Compose (the CLI's plugin)
+/// brings up a project of two services sharing a named volume, one built,
+/// the second started once the first completed, each with its own exit
+/// status, and takes it down with its volume. Each container's
+/// exit status is `docker`'s, and nothing is left behind.
+#[test]
+fn alpine_docker_runs_and_builds_images() {
+    if !fetched_program_tests("FWE_DOCKER_TESTS") {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("fwe-docker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("docker")).arg(&root));
+    alpine_oci_archive("docker", &root.join("tmp/alpine.tar"), true);
+    let context = root.join("tmp/context");
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::write(context.join("Dockerfile"), DOCKERFILE).unwrap();
+    std::fs::write(context.join("greeting.txt"), "from the context\n").unwrap();
+    std::fs::create_dir_all(root.join("tmp/compose")).unwrap();
+    std::fs::write(root.join("tmp/compose/compose.yaml"), COMPOSE).unwrap();
+    std::fs::create_dir_all(root.join("root")).unwrap();
+    let _workload = workload();
+    // Each process's calls, for a step that fails: the daemon's (containerd's,
+    // the shims' and runc's with them), and each docker's.
+    let fwe = |prog: &str, trace: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        let trace = root.join("tmp").join(trace);
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join(prog));
+        cmd
+    };
+    let log = std::fs::File::create(root.join("tmp/dockerd.log")).unwrap();
+    let mut daemon = fwe("usr/bin/dockerd", "dockerd.trace")
+        .args(["--debug", "--bridge=none", "--iptables=false", "--ip6tables=false"])
+        .args(["--storage-driver=overlay2"])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let socket = root.join("run/docker.sock");
+    for _ in 0..1200 {
+        if socket.exists() || daemon.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let dockerd_log = || std::fs::read_to_string(root.join("tmp/dockerd.log")).unwrap_or_default();
+    // `docker` with `args`, which is to end with status `expect`; otherwise
+    // the last calls of it and of the daemon's processes are printed.
+    let step = std::cell::Cell::new(0);
+    let docker = |args: &[&str], expect: i32| {
+        step.set(step.get() + 1);
+        let trace = format!("docker-{}-{}.trace", step.get(), args[0]);
+        let mut cmd = fwe("usr/bin/docker", &trace);
+        cmd.args(args);
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
+        eprintln!(
+            "--- docker {args:?} ({}) stderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.code() != Some(expect) {
+            print_last_calls(&root.join("tmp").join(&trace));
+            print_last_calls(&root.join("tmp/dockerd.trace"));
+            eprintln!("--- dockerd log:\n{}", dockerd_log());
+        }
+        out
+    };
+    let info = docker(&["info", "--format", "{{.Driver}} {{.CgroupVersion}} {{.Name}}"], 0);
+    let loaded = docker(&["load", "-i", "/tmp/alpine.tar"], 0);
+    let images = docker(&["images", "--format", "{{.Repository}}:{{.Tag}}"], 0);
+    let run = docker(&["run", "--rm", "--network=none", "alpine:3.20", "sh", "-c", IN_DOCKER], 5);
+    let host = docker(&["run", "--rm", "--network=host", "alpine:3.20", "hostname"], 0);
+    let built = docker(&["build", "--network=none", "-t", "fwe-built:1", "/tmp/context"], 0);
+    let ran = docker(&["run", "--rm", "--network=none", "fwe-built:1"], 0);
+    let compose = ["compose", "-p", "fwe", "-f", "/tmp/compose/compose.yaml"];
+    let up = docker(&[&compose[..], &["up", "--no-color"]].concat(), 0);
+    let codes = docker(
+        &[&compose[..], &["ps", "-a", "--format", "{{.Service}} {{.ExitCode}}"]].concat(),
+        0,
+    );
+    let down = docker(&[&compose[..], &["down", "--volumes"]].concat(), 0);
+    let after = docker(&["ps", "-a", "--format", "{{.ID}}"], 0);
+    let volumes = docker(&["volume", "ls", "-q"], 0);
+    // SAFETY: plain call, to the daemon this test started.
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let mut ended = None;
+    for _ in 0..600 {
+        ended = daemon.try_wait().unwrap();
+        if ended.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if ended.is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    eprintln!("--- dockerd log:\n{}", dockerd_log());
+    // The traces and the daemon's log, for CI to keep should a step fail.
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("docker-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    for e in std::fs::read_dir(root.join("tmp")).unwrap().flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".trace") || name.ends_with(".log") {
+            let _ = std::fs::copy(e.path(), kept.join(&*name));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let info = stdout(&info);
+    let name = info.split_whitespace().nth(2).unwrap_or_default().to_string();
+    assert!(info.starts_with("overlay2 2 "), "{info}");
+    assert!(stdout(&loaded).contains("Loaded image: alpine:3.20"), "{}", stdout(&loaded));
+    assert_eq!(stdout(&images), "alpine:3.20\n");
+    // Docker's default seccomp profile, and no `no_new_privs`.
+    assert_eq!(
+        stdout(&run),
+        "3.20.10\npid 1\n0\nNoNewPrivs:\t0\nSeccomp:\t2\n1\nwritable\nroot on overlay\n"
+    );
+    assert_eq!(run.status.code(), Some(5));
+    // The host's network, and with it its name.
+    assert_eq!(stdout(&host), format!("{name}\n"));
+    assert_eq!(built.status.code(), Some(0));
+    assert_eq!(stdout(&ran), "built\nfrom the context\n");
+    let up = stdout(&up);
+    assert!(up.contains("reader-1  | stored\n") && up.contains("reader-1  | built\n"), "{up}");
+    let mut codes: Vec<String> = stdout(&codes).lines().map(str::to_string).collect();
+    codes.sort();
+    assert_eq!(codes, ["reader 6", "store 0"]);
+    assert_eq!(down.status.code(), Some(0));
+    assert_eq!(stdout(&after), "");
+    assert_eq!(stdout(&volumes), "");
+    assert!(ended.is_some_and(|s| s.success()), "dockerd did not end cleanly: {ended:?}");
 }
 
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
@@ -1969,7 +2175,7 @@ fn debian_apt_installs_and_removes_a_package() {
         .stdin(Stdio::null());
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_dir_all(&root);
-    eprintln!("--- apt stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("--- apt ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     // dpkg's progress, which apt relays, is interleaved; the lines asked for
     // come in order.
     let text = stdout(&out);
@@ -2827,6 +3033,49 @@ fn network_namespace_has_its_own_loopback() {
     assert_eq!(namespaces("net-outside"), "inside: 127.0.0.1:18082\noutside too: true\n");
 }
 
+/// A thread's own root, mounts and network namespace: a thread that
+/// unshares `CLONE_FS` and the mount namespace mounts and changes its root
+/// alone; one that unshares the network namespace binds a port there that
+/// the process binds too, until it joins the process's again; what a
+/// thread that shares them sets (working directory, umask), the others
+/// have; and the mount namespace is not joined while the root is shared.
+#[test]
+fn threads_have_their_own_root_and_namespaces() {
+    assert_eq!(
+        namespaces("threads"),
+        "thread: unshare 0 private 0 tmpfs 0 true chroot 0 marker new\n\
+         others: root kept true, /mnt not mounted true\nshared: umask 77 cwd /tmp\n\
+         net: thread bound true, process too true\nback: 0, port taken true\n\
+         setns mnt with threads: -1 errno 22\n"
+    );
+}
+
+/// A network namespace kept by a bind mount of its file, as Docker keeps
+/// a container's: made on a thread, bound by the thread's
+/// `/proc/<pid>/task/<tid>/ns/net`, shown as nsfs, its inode the
+/// namespace's; the process and a child join it through the file and share
+/// its ports; unmounted, the path is the plain file again.
+#[test]
+fn namespace_file_bound_to_a_path() {
+    assert_eq!(
+        namespaces("nsbind"),
+        "bind: 0, back 0\ninode is the namespace's: true\nmountinfo: true\n\
+         joined: 0, bound true\nchild joined: 0, port taken true\nchild exited 0\n\
+         umount: 0, a plain file again: -1 errno 22\n"
+    );
+}
+
+/// A directory of a bind mount of an overlay, opened, reaches what is
+/// mounted below the bind: runc makes `dev/pts` this way in the tmpfs it
+/// put on a container's `dev`, the root a bind of an overlay (BuildKit's).
+#[test]
+fn overlay_bind_directory_reaches_mounts_below() {
+    assert_eq!(
+        namespaces("ovlbind"),
+        "mounts: 0 0 0\nmkdir: 0, in the tmpfs true, not the overlay's true\nchild exited 0\n"
+    );
+}
+
 /// A user namespace: unmapped until its maps are written, once, under
 /// Linux's rules (the process itself its own id only, setgroups denied
 /// first; its parent, privileged outside, anything), with every capability
@@ -3132,6 +3381,7 @@ const PROCSIG: &str = "queued to -1: true\n\
     core of a fault: (11, true), an ELF core true\n\
     core of SIGABRT: (6, true), an ELF core true\n\
     end told with: SIGUSR2, reaped true\n\
+    blocked SIGCHLD kept: true\n\
     memory shared: {shared}\n\
     cpu limit: SIGXCPU true, then true\n\
     timer slack: 70000, shown 70000, the child's true\n\
@@ -3140,7 +3390,8 @@ const PROCSIG: &str = "queued to -1: true\n\
 
 /// Signals between processes and how processes end: a queued real-time
 /// signal, `rt_sigqueueinfo` to -1 refused, signals the moment a child is
-/// forked, core dumps, a clone's own exit signal, a child sharing the
+/// forked, core dumps, a clone's own exit signal, a blocked `SIGCHLD` kept
+/// pending at its default action, a child sharing the
 /// memory, the hard CPU limit and an inherited timer slack.
 #[test]
 fn process_signals_and_ends() {
@@ -4582,6 +4833,19 @@ fn hv_fork_and_vfork() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Children made with `CLONE_PARENT` are the creator's parent's: it is
+/// told when each ends and reaps each, though it is no subreaper and they
+/// are not its children on the host (runc makes a container's init so, in
+/// new namespaces, two levels down).
+#[test]
+fn clone_parent_children_are_their_parents() {
+    assert_eq!(
+        namespaces("fosters"),
+        "then: ECHILD true\nreaped: 3 children, first true, second true, init exited 7\n\
+         init's SIGCHLD: true\n"
+    );
+}
+
 /// A child subreaper adopts the orphans below it: it is their parent, it
 /// is sent `SIGCHLD` when one ends, and it reaps it, also one killed
 /// outright; a child of its own is not a subreaper.
@@ -4753,8 +5017,8 @@ fn overlay_mounts() {
 /// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
 /// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
 /// is not attached; limits set with `prlimit` from outside; netlink of a
-/// network namespace's `lo`, and in the host's, a socket whose requests
-/// are refused.
+/// network namespace's `lo`, and in the host's, the host's loopback, up
+/// and kept so.
 #[test]
 fn container_runtime_calls() {
     assert_eq!(
@@ -4766,7 +5030,7 @@ fn container_runtime_calls() {
          prlimit of the child: ok\nchild: oom 500 nofile 100 200\npeer: self true uid 0\n\
          shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
          linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
-         attached as a device program: EINVAL\nnetlink outside: true answers -95\n\
+         attached as a device program: EINVAL\nnetlink outside: true lo flags 0x10049, set down -1\n\
          netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
     );
 }

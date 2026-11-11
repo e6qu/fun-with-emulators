@@ -891,7 +891,19 @@ each is mapped is in
 - **Namespace descriptors** (`crates/kernel/src/nsfd.rs`): a descriptor
   names a namespace's record; it stats as nsfs shows it (the identity is
   the inode), refuses reads and writes, answers `NS_GET_*` (type, parent,
-  owner, a mount namespace's id), and is what `setns` joins.
+  owner, a mount namespace's id), and is what `setns` joins. Bound to a
+  file it is an `nsfs` mount whose source is the namespace (the mount
+  table keeps its kind, identity and record), which the collector counts
+  as live.
+- **A thread's own view** (`crates/kernel/src/threadfs.rs`): a thread that
+  unshares `CLONE_FS` or changes a namespace while others run gets a copy
+  of the process's filesystem view (root, working directory, umask, mount
+  table and namespaces), which every path and namespace lookup of its
+  calls uses; its sockets and IPC act in its namespaces through
+  thread-local overrides. A copy made for a namespace alone follows the
+  process's root, working directory and umask both ways, and is dropped
+  once the thread is back in the process's namespaces. The process's
+  record lists the namespaces such copies hold, which keeps them live.
 - **Mount propagation** (`crates/kernel/src/mounts.rs`): a bind of a
   shared mount joins its peer group; a mount under a shared one is
   copied to the same place in the parent's peers and in the slaves of its
@@ -924,7 +936,8 @@ each is mapped is in
 - **Overlays** (`crates/kernel/src/overlay.rs`): a descriptor of a lower
   file changed through it (`fchmod`) moves onto the copy; a descriptor
   opened through an overlay keeps its layers after the mount moves or
-  goes. An opaque directory is marked `trusted.overlay.opaque` (or
+  goes, and resolves from the mount it was opened through while that is
+  there (a bind of the overlay, with what is mounted below it). An opaque directory is marked `trusted.overlay.opaque` (or
   `user.overlay.opaque` with `userxattr`). The overlay's own attributes
   are hidden; `metacopy=on`, `redirect_dir=on` and `index=on` are
   refused.
@@ -1055,10 +1068,8 @@ which are to be lifted for 1.0 and which are not planned.
   `core_pattern` piping to a program dumps none; a process ended by a
   signal the host lacks exits on the host with status 128 + the signal,
   which only a parent that is not fwe's sees.
-- A `CLONE_PARENT` child's parent is the caller's for `getppid`, `/proc`
-  and adoption, but on the host it is the caller's child, which the
-  caller's parent cannot `wait` for (nor gets `SIGCHLD` of) while the
-  caller lives.
+- A `CLONE_PARENT` child is still its creator's child on the host, which
+  the creator could `wait` for while it lives (Linux's could not).
 - A process descriptor cannot be passed over a Unix socket (`EINVAL`:
   the host passes no kqueue); `PIDFD_GET_INFO` gives a wait status only
   to the process that reaped it, and no cgroup id; a `PIDFD_THREAD`

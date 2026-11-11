@@ -52,6 +52,9 @@ unsafe extern "C" {
     fn pwrite(fd: c_int, buf: *const u8, n: usize, off: i64) -> isize;
     fn close(fd: c_int) -> c_int;
     fn execv(path: *const u8, argv: *const *const u8) -> c_int;
+    fn pipe(fds: *mut c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+    fn write(fd: c_int, buf: *const u8, n: usize) -> isize;
 }
 
 /// A word the parent reads and writes in the child through its `mem`.
@@ -155,14 +158,24 @@ fn main() {
         return;
     }
     exec_stops();
+    // The child tells, by a byte, that it is in its loop: a fork child
+    // makes calls of its own first (the C library's `set_tid_address`),
+    // which a tracer that came sooner would stop at.
+    let mut ready = [0 as c_int; 2];
+    // SAFETY: a valid array for the two descriptors.
+    unsafe { pipe(ready.as_mut_ptr()) };
     // SAFETY: plain calls; the child ends by SIGKILL.
     let child = unsafe { fork() };
     if child == 0 {
         // SIGUSR1 blocked, for the tracer to see; then system calls,
         // over and over.
         let set = 1u64 << (SIGUSR1 - 1);
-        // SAFETY: a valid set, no old one asked for.
-        unsafe { syscall(SYS_RT_SIGPROCMASK, 0 as c_long, &set as *const u64, 0usize, 8usize) };
+        // SAFETY: a valid set, no old one asked for; a byte from a valid
+        // buffer.
+        unsafe {
+            syscall(SYS_RT_SIGPROCMASK, 0 as c_long, &set as *const u64, 0usize, 8usize);
+            write(ready[1], b"r".as_ptr(), 1);
+        }
         loop {
             // SAFETY: a plain call.
             unsafe { syscall(SYS_GETPPID) };
@@ -170,6 +183,9 @@ fn main() {
         }
     }
 
+    let mut b = 0u8;
+    // SAFETY: a byte's buffer.
+    unsafe { read(ready[0], &mut b, 1) };
     // Seized, it goes on: nothing to report.
     let seized = ptrace(PTRACE_SEIZE, child, 0, PTRACE_O_TRACESYSGOOD);
     // SAFETY: a plain call.

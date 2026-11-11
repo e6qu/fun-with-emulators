@@ -31,9 +31,24 @@ use std::sync::{Arc, Mutex};
 
 static CURRENT: Mutex<Option<Arc<Record<Net>>>> = Mutex::new(None);
 
-/// The process's network namespace, if it is one of fwe's.
+thread_local! {
+    /// This thread's own network namespace, when it has its own
+    /// ([`crate::threadfs`]): `Some(None)` for the initial one.
+    static THREAD: std::cell::RefCell<Option<Option<Arc<Record<Net>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The calling thread's network namespace, if it is one of fwe's.
 pub fn current() -> Option<Arc<Record<Net>>> {
+    if let Some(own) = THREAD.with(|t| t.borrow().clone()) {
+        return own;
+    }
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Make `net` this thread's own (`Some`), or the process's again (`None`).
+pub fn set_thread(net: Option<Option<Arc<Record<Net>>>>) {
+    THREAD.with(|t| *t.borrow_mut() = net);
 }
 
 /// Make `net` the process's ([`crate::ns::Namespaces::net`]).

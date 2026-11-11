@@ -423,9 +423,14 @@ impl<P: Platform> Kernel<P> {
         // blocks a caught signal for the guest (see [`caught`]), so a
         // default action left to the host could strike a thread whose guest
         // mask blocks the signal, which Linux keeps pending instead.
+        //
+        // A default action that ignores the signal is fwe's too: macOS
+        // discards such a signal (`SIGCHLD`, `SIGURG`, `SIGWINCH`) even
+        // while it is blocked, where Linux keeps a blocked one pending
+        // (a child's end, for a `sigtimedwait` about to start).
         let fwe_default = matches!(
             signal::default_action(sig),
-            signal::Default::Terminate | signal::Default::Stop
+            signal::Default::Terminate | signal::Default::Stop | signal::Default::Ignore
         );
         let traced = crate::ptrace::any_traced();
         let how = match action.handler {

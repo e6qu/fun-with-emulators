@@ -1086,7 +1086,7 @@ impl<P: Platform> Kernel<P> {
             groups: c.groups.iter().filter_map(|g| crate::userns::from_ns(*g, true)).collect(),
             admin: c.has(crate::caps::CAP_SYS_ADMIN),
             setuid: c.has(crate::caps::CAP_SETUID),
-            userns: self.fs.as_ref().map_or_else(Vec::new, |f| f.ns.user_dir()),
+            userns: self.fs_opt().map_or_else(Vec::new, |f| f.ns.user_dir()),
         }
     }
 
