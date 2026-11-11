@@ -224,10 +224,14 @@ pub fn reapable(e: &Ended) -> bool {
 }
 
 /// Whether ended process `e` is this process's to reap as an adopter, or
-/// as a foster child's parent.
+/// as a foster child's parent: once it is gone. A process records how it
+/// ends just before it does; reaped while still there, its record would
+/// stay, and whoever found it gone afterwards would take it for one killed
+/// outright and record a second end.
 fn adopted_ended(e: &Ended) -> bool {
-    fostered_here(&e.lineage, e.foster)
-        || orphaned(&e.lineage) && adopter((e.pid, e.start), &e.lineage, e.bound) == Some(me())
+    (fostered_here(&e.lineage, e.foster)
+        || orphaned(&e.lineage) && adopter((e.pid, e.start), &e.lineage, e.bound) == Some(me()))
+        && !procreg::alive((e.pid, e.start))
 }
 
 /// Whether living process `pid`, whose record is `r`, is one this process

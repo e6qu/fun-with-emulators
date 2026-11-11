@@ -2629,7 +2629,8 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 - a process that ends where a reaper might adopt it records how it ended
   (one killed by `SIGKILL` is recorded by whoever finds it gone);
 - a reaper runs a watcher thread on `kqueue` process events and raises
-  `SIGCHLD` in itself for an adopted descendant's end, stop or continue,
+  `SIGCHLD` in itself for an adopted descendant's end (once it is gone:
+  its record of how it ended comes just before), stop or continue,
   with a child's `siginfo`, and wakes every one of its threads, so the
   one that does not block it takes it (a wake the host gives one thread
   could land on one that blocks it);
