@@ -2,7 +2,6 @@
 # https://dl-cdn.alpinelinux.org/alpine/: the minirootfs, strace, gdb and
 # their libraries (gdb's include Python, which it embeds), and musl's debug
 # information. Each line is a path under that URL and the file's SHA-256.
-# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs (the root filesystem
 v3.20/releases/aarch64/alpine-minirootfs-3.20.10-aarch64.tar.gz 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
 v3.20/main/aarch64/gdb-14.2-r1.apk cf63ded809b0c46370fc3a4f26eac944dc79907a3bb3ec947fb573fa70a65e94
 v3.20/main/aarch64/gdbm-1.23-r1.apk 6d217fbdbbd49a2fe5287c2ec0e18b41a79c670b8a52054ca503e35959d4bf1a

@@ -96,6 +96,23 @@ jobs:
         env:
           FWE_DEBUGGER_TESTS: "1"
 
+  # Alpine's Docker Engine (fetched) loading, running and building images.
+  # It runs here only (FWE_DOCKER_TESTS), not on a development machine.
+  docker:
+    name: Docker (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: cargo test -p fwe --test guests -- alpine_docker --nocapture
+        env:
+          FWE_DOCKER_TESTS: "1"
+
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
   ltp:
