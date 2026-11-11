@@ -1403,12 +1403,17 @@ privilege, gives the caller every capability in the new namespace, and
 is refused (`EINVAL`) to a process with other threads; the other kinds
 need `CAP_SYS_ADMIN`. `CLONE_NEWPID` applies to children, and a second
 one before a child is made fails with `EINVAL`. `CLONE_FILES`, `CLONE_FS`,
-`CLONE_SYSVSEM`, `CLONE_SIGHAND` and `CLONE_VM` are accepted.
+`CLONE_SYSVSEM`, `CLONE_SIGHAND` and `CLONE_VM` are accepted. In a process
+with other threads, the caller's namespaces change alone, and
+`CLONE_FS` (which `CLONE_NEWNS` implies) gives it a root, working
+directory and umask of its own ([Namespaces](#namespaces)).
 
 **`setns`**: a namespace descriptor names the namespace's record
 (`crates/kernel/src/nsfd.rs`); `nstype` must be 0 or its kind. A pidfd
 joins each kind named in the flags that its process is in, the user
-namespace first.
+namespace first. It changes the calling thread's namespaces only; a
+mount namespace is refused (`EINVAL`) to a thread that shares its root
+with others.
 
 #### System-wide calls
 
@@ -2161,7 +2166,15 @@ and when a fresh fwe starts.
 macOS has no namespaces. fwe makes each as a shared record the processes
 in it name; a process in an initial namespace sees the host's (host name,
 host pids). `clone` and `unshare` make them (`crates/kernel/src/nsops.rs`),
-`setns` joins one through a `/proc/<pid>/ns/*` descriptor (`nsfd.rs`):
+`setns` joins one through a `/proc/<pid>/ns/*` descriptor (`nsfd.rs`).
+As on Linux, each thread has its own: one that changes them while other
+threads run takes a copy of the process's view (`threadfs.rs`), which its
+sockets and IPC act in, and which goes once it is back in the process's
+namespaces; it shares the root, working directory and umask with the
+others unless it unshared `CLONE_FS`, and a thread it starts has a copy
+of its view. A `fork` child or a program it runs takes the calling
+thread's.
+
 
 | Namespace | What fwe does |
 |---|---|

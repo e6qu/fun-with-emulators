@@ -119,25 +119,28 @@ hardware.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
   containerd and runc, and the `docker` CLI), started with
   `--bridge=none --iptables=false`, loads an image, runs a container of it
-  (`docker run` with `--network=none` or the host's network) and builds one
-  from a Dockerfile (`docker build`, BuildKit).
+  (`docker run` with `--network=none` or the host's network), builds one
+  from a Dockerfile (`docker build`, BuildKit), and Docker Compose brings
+  up a project of services that build, share a volume and depend on each
+  other; natively, with no VM.
 - [ ] **Podman, further:** `podman build` (Buildah) from a Containerfile;
   rootless podman as an ordinary user (a user namespace from
   `/etc/subuid`, overlay storage); `podman pull` from a registry; Debian's
   podman (non-PIE, so in the VM) as well as Alpine's.
-- [ ] **Wine:** a distribution's arm64 Wine runs ARM64 Windows console
-  programs: `wineboot` sets up a prefix, `wine cmd /c` runs a batch
-  command, and a C program built for ARM64 Windows runs with its files,
-  threads, exceptions and child processes. What it is expected to need is
-  in [linux-on-macos.md](docs/linux-on-macos.md#wine).
+- [ ] **Wine, a showcase:** Windows programs run on the Mac through a
+  distribution's arm64 Wine under fwe, with no VM: `wineboot` sets up a
+  prefix, `wine cmd /c` runs a batch command, and a C program built for
+  ARM64 Windows runs with its files, threads, exceptions and child
+  processes; the README shows it. What it is expected to need is in
+  [linux-on-macos.md](docs/linux-on-macos.md#wine).
 
 **Done when:** every LTP system-call test passes in CI against the baseline,
 but those listed with their reason in `tools/ltp/exceptions.txt` (not
 planned for 1.0, or failing or skipping on Linux too with the same build);
-`strace` and `gdb` work on a guest program; Docker and podman build and run
-images, rootless podman included; Wine runs ARM64 Windows console programs;
-each is tested end to end in CI, and the target programs and container
-engines keep passing.
+`strace` and `gdb` work on a guest program; Docker (with Compose) and
+podman build and run images, rootless podman included; Wine runs ARM64
+Windows console programs; each is tested end to end in CI, and the target
+programs and container engines keep passing.
 
 ### M5 — Release
 
