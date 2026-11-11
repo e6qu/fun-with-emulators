@@ -48,6 +48,13 @@ fn owners<R>(f: impl FnOnce(&mut HashMap<i32, Own>) -> R) -> R {
     r
 }
 
+/// Show in the process's record the namespaces the threads' own views are
+/// in, which they hold as the process holds its own.
+fn publish_held() {
+    let held: Vec<Vec<u8>> = owners(|o| o.values().flat_map(|w| w.fs.ns_dirs()).collect());
+    crate::procreg::own_held(held);
+}
+
 /// This thread's own view, if it has one. The kernel lock guards it, as it
 /// does the process's.
 pub fn current() -> Option<*mut Fs> {
@@ -68,6 +75,7 @@ pub fn take(fs: Fs, shares: bool) {
     owners(|o| o.insert(crate::thread::tid(), Own { fs, shares }));
     CURRENT.with(|c| c.set(p));
     crate::ns::Namespaces::activate_thread(current_ns());
+    publish_held();
 }
 
 /// This thread's own namespaces, if it has its own view.
@@ -85,6 +93,7 @@ pub fn release() {
     crate::ns::Namespaces::activate_thread(None);
     let own = owners(|o| o.remove(&crate::thread::tid()));
     drop(own);
+    publish_held();
 }
 
 /// After this thread's namespaces changed: its own view, if it shares the
@@ -98,6 +107,7 @@ pub fn namespaces_changed(process: &Fs) {
         release();
     } else {
         crate::ns::Namespaces::activate_thread(current_ns());
+        publish_held();
     }
 }
 
@@ -120,6 +130,12 @@ pub fn share_view(from: &Fs, process: Option<&mut Fs>) {
             }
         }
     });
+}
+
+/// `f` of thread `tid`'s own view, if it has one (under the kernel lock,
+/// which guards it).
+pub fn view_of<R>(tid: i32, f: impl FnOnce(&Fs) -> R) -> Option<R> {
+    owners(|o| o.get(&tid).map(|w| f(&w.fs)))
 }
 
 /// Whether any thread has its own view.
@@ -159,7 +175,9 @@ pub fn unshare_fs() {
 
 /// Thread `tid`, which never started, has no view.
 pub fn forget(tid: i32) {
-    drop(owners(|o| o.remove(&tid)));
+    if owners(|o| o.remove(&tid)).is_some() {
+        publish_held();
+    }
 }
 
 /// This thread ends: its own view goes.
@@ -174,5 +192,8 @@ pub fn take_for_child() -> Option<Fs> {
     CURRENT.with(|c| c.set(std::ptr::null_mut()));
     crate::ns::Namespaces::activate_thread(None);
     let mut all = owners(std::mem::take);
+    if !all.is_empty() {
+        publish_held();
+    }
     all.remove(&me).map(|w| *w.fs)
 }

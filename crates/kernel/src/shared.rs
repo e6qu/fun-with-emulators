@@ -136,7 +136,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 17;
+pub const FORMAT: u32 = 18;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -614,6 +614,7 @@ pub fn collect() {
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
         live.extend(r.ns);
+        live.extend(r.held);
     }
     // An ended process not yet reaped keeps its numbers, while someone
     // may still reap it.
@@ -658,10 +659,13 @@ pub fn collect() {
                 .is_some_and(|n| n.starts_with(format!("v{FORMAT}-mnt-init-").as_bytes()))
         })
         .collect();
+    // A namespace bound to a path in a live table (an nsfs mount) is live.
+    let mut bound: Vec<Vec<u8>> = Vec::new();
     for d in live.iter().filter(|d| kind_of(d) == b"mnt").chain(init_tables.iter()) {
         if let Ok(ns) = crate::mounts::store::Ns::join(d, 0) {
             for m in &ns.table().mounts {
                 match &m.source {
+                    crate::mounts::Source::Ns(n) => bound.extend(n.dir.clone()),
                     crate::mounts::Source::Host(h) => {
                         shown.insert(h.clone());
                     }
@@ -681,6 +685,7 @@ pub fn collect() {
             }
         }
     }
+    live.extend(bound);
     let Ok(entries) = std::fs::read_dir(os(&base)) else { return };
     let mine = format!("v{FORMAT}-");
     for e in entries.flatten() {

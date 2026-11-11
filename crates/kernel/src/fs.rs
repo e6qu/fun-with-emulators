@@ -718,6 +718,10 @@ impl Fs {
         let absolute = self.absolute(dirfd, path)?;
         let (m, fs_path) = self.mount_of(&absolute);
         let absolute = match m.fstype {
+            FsType::Nsfs => {
+                let Source::Ns(n) = &m.source else { return None };
+                return Some(crate::procfs::Entry::Ns(n.clone()));
+            }
             FsType::Proc => mounts::join(b"/proc", &fs_path),
             FsType::Sysfs => mounts::join(b"/sys", &fs_path),
             FsType::Devpts | FsType::Mqueue => {
@@ -805,6 +809,15 @@ impl Fs {
             ));
         }
         if let Some(rest) = absolute.strip_prefix(b"/proc/self/task/") {
+            if let Some((tid, kind)) = task_ns(rest) {
+                return Some(match kind {
+                    None => crate::procfs::Entry::Dir,
+                    Some(kind) => match self.task_ns_link(tid, kind) {
+                        Some(link) => crate::procfs::Entry::Symlink(link),
+                        None => crate::procfs::Entry::Missing,
+                    },
+                });
+            }
             return Some(task_entry(rest));
         }
         match &absolute[..] {
@@ -2251,7 +2264,7 @@ fn mount_tops(m: &Mount) -> Vec<Vec<u8>> {
     match &m.source {
         Source::Host(_) => m.host_path(b"").into_iter().collect(),
         Source::Overlay(l) => l.paths().map(|p| mounts::join(p, &m.root)).collect(),
-        Source::Synthetic => Vec::new(),
+        Source::Synthetic | Source::Ns(_) => Vec::new(),
     }
 }
 
@@ -2552,6 +2565,37 @@ pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
     match view.as_ref() {
         Some(v) => from_ns(&v.proc_root, &host_to_ns(&v.ns.table(), host)?),
         None => Some(host.to_vec()),
+    }
+}
+
+/// `<tid>/ns` (`None`) or `<tid>/ns/<kind>` of a live thread of this
+/// process, from `/proc/self/task/`.
+fn task_ns(rest: &[u8]) -> Option<(i32, Option<&[u8]>)> {
+    let mut parts = rest.splitn(3, |&b| b == b'/');
+    let tid = std::str::from_utf8(parts.next()?).ok()?.parse::<i32>().ok()?;
+    if parts.next()? != b"ns" || !crate::thread::tids().contains(&tid) {
+        return None;
+    }
+    Some((tid, parts.next().filter(|k| !k.is_empty())))
+}
+
+impl Fs {
+    /// The link `/proc/self/task/<tid>/ns/<kind>` reads, this view being
+    /// the calling thread's: a thread's own namespaces if it has them
+    /// ([`crate::threadfs`]), else the process's.
+    fn task_ns_link(&self, tid: i32, kind: &[u8]) -> Option<Vec<u8>> {
+        if tid == crate::thread::tid() {
+            return self.ns.link(kind, self.mnt.id());
+        }
+        if let Some(link) = crate::threadfs::view_of(tid, |f| f.ns.link(kind, f.mnt.id())) {
+            return link;
+        }
+        if crate::threadfs::current().is_none() {
+            return self.ns.link(kind, self.mnt.id());
+        }
+        // SAFETY: getpid cannot fail.
+        let rec = crate::procreg::read(unsafe { libc::getpid() })?;
+        Some(crate::procpid::ns_link_of(kind, &rec.ns)).filter(|l| !l.is_empty())
     }
 }
 

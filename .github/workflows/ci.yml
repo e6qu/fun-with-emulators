@@ -112,6 +112,12 @@ jobs:
       - run: cargo test -p fwe --test guests -- alpine_docker --nocapture
         env:
           FWE_DOCKER_TESTS: "1"
+      # Each process's calls and the daemon's log, for a step that failed.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-traces
+          path: target/tmp/docker-traces
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.

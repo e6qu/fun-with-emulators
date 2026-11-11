@@ -1841,6 +1841,17 @@ fn alpine_docker_runs_and_builds_images() {
         let _ = daemon.wait();
     }
     eprintln!("--- dockerd log:\n{}", dockerd_log());
+    // The traces and the daemon's log, for CI to keep should a step fail.
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("docker-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    for e in std::fs::read_dir(root.join("tmp")).unwrap().flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".trace") || name.ends_with(".log") {
+            let _ = std::fs::copy(e.path(), kept.join(&*name));
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
     let info = stdout(&info);
     let name = info.split_whitespace().nth(2).unwrap_or_default().to_string();
@@ -3023,6 +3034,21 @@ fn threads_have_their_own_root_and_namespaces() {
          others: root kept true, /mnt not mounted true\nshared: umask 77 cwd /tmp\n\
          net: thread bound true, process too true\nback: 0, port taken true\n\
          setns mnt with threads: -1 errno 22\n"
+    );
+}
+
+/// A network namespace kept by a bind mount of its file, as Docker keeps
+/// a container's: made on a thread, bound by the thread's
+/// `/proc/<pid>/task/<tid>/ns/net`, shown as nsfs, its inode the
+/// namespace's; the process and a child join it through the file and share
+/// its ports; unmounted, the path is the plain file again.
+#[test]
+fn namespace_file_bound_to_a_path() {
+    assert_eq!(
+        namespaces("nsbind"),
+        "bind: 0, back 0\ninode is the namespace's: true\nmountinfo: true\n\
+         joined: 0, bound true\nchild joined: 0, port taken true\nchild exited 0\n\
+         umount: 0, a plain file again: -1 errno 22\n"
     );
 }
 

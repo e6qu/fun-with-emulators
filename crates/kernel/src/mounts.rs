@@ -75,6 +75,8 @@ pub enum FsType {
     Devpts,
     Mqueue,
     Overlay,
+    /// A namespace's file bound to a path ([`Source::Ns`]).
+    Nsfs,
 }
 
 impl FsType {
@@ -88,6 +90,7 @@ impl FsType {
             FsType::Devpts => "devpts",
             FsType::Mqueue => "mqueue",
             FsType::Overlay => "overlay",
+            FsType::Nsfs => "nsfs",
         }
     }
 
@@ -102,6 +105,7 @@ impl FsType {
             FsType::Devpts => 0x1cd1,
             FsType::Mqueue => 0x1980_2002,
             FsType::Overlay => crate::overlay::MAGIC,
+            FsType::Nsfs => 0x6e73_6673,
         }
     }
 
@@ -132,6 +136,7 @@ impl FsType {
             5 => FsType::Devpts,
             6 => FsType::Mqueue,
             7 => FsType::Overlay,
+            8 => FsType::Nsfs,
             _ => FsType::Ext4,
         }
     }
@@ -147,6 +152,9 @@ pub enum Source {
     Overlay(std::sync::Arc<crate::overlay::Layers>),
     /// A filesystem fwe generates.
     Synthetic,
+    /// A namespace, its file bound to the mount point: what opening it
+    /// gives, and what it keeps from being freed.
+    Ns(crate::nsfd::NsRef),
 }
 
 /// One mount.
@@ -1300,6 +1308,13 @@ impl Table {
                     l.encode(e);
                 }
                 Source::Synthetic => e.u8(0),
+                Source::Ns(n) => {
+                    e.u8(3);
+                    e.u64(n.kind);
+                    e.u64(n.id);
+                    e.bool(n.dir.is_some());
+                    e.bytes(n.dir.as_deref().unwrap_or_default());
+                }
             }
             e.bytes(&m.root);
             e.u64(m.flags);
@@ -1329,6 +1344,11 @@ impl Table {
                 source: match d.u8() {
                     1 => Source::Host(d.bytes()),
                     2 => Source::Overlay(std::sync::Arc::new(crate::overlay::Layers::decode(d))),
+                    3 => {
+                        let (kind, id, has) = (d.u64(), d.u64(), d.bool());
+                        let dir = d.bytes();
+                        Source::Ns(crate::nsfd::NsRef { kind, id, dir: has.then_some(dir) })
+                    }
                     _ => Source::Synthetic,
                 },
                 root: d.bytes(),

@@ -382,18 +382,46 @@ impl<P: Platform> Kernel<P> {
     /// Open the namespace `/proc/<pid>/ns/<kind>` (`path` from `dirfd`)
     /// names, its link reading `link`.
     fn open_ns_path(&mut self, dirfd: i32, path: &[u8], link: &[u8], flags: u64) -> i64 {
-        let Some((who, sub)) = self.fs().proc_target(dirfd, path) else {
-            return err(errno::ENOENT);
+        match self.ns_at(dirfd, path, link) {
+            Ok(n) => crate::nsfd::open(n, flags & fcntl::O_CLOEXEC != 0),
+            Err(e) => err(e),
+        }
+    }
+
+    /// The namespace `/proc/<pid>/ns/<kind>` or
+    /// `/proc/<pid>/task/<tid>/ns/<kind>` (`path` from `dirfd`) names, its
+    /// link reading `link`.
+    pub(crate) fn ns_at(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        link: &[u8],
+    ) -> Result<crate::nsfd::NsRef, i32> {
+        let (who, sub) = self.fs().proc_target(dirfd, path).ok_or(errno::ENOENT)?;
+        // A thread's (`/proc/<pid>/task/<tid>/ns/<kind>`): its own
+        // namespaces, if it has them ([`crate::threadfs`]).
+        let task = sub.strip_prefix(b"/task/").and_then(|rest| {
+            let i = rest.iter().position(|&b| b == b'/')?;
+            let tid = std::str::from_utf8(&rest[..i]).ok()?.parse::<i32>().ok()?;
+            Some((tid, &rest[i..]))
+        });
+        let (tid, sub) = match (who, task) {
+            (None, Some((tid, rest))) => (Some(tid), rest.to_vec()),
+            _ => (None, sub),
         };
-        let Some(name) = sub.strip_prefix(b"/ns/") else { return err(errno::ENOENT) };
+        let name = sub.strip_prefix(b"/ns/").ok_or(errno::ENOENT)?;
         let dirs = match who {
-            None => self.fs().ns_dirs(),
+            None => match tid {
+                Some(t) if t != crate::thread::tid() => crate::threadfs::view_of(t, Fs::ns_dirs)
+                    .unwrap_or_else(|| self.fs.as_ref().map_or_else(Vec::new, Fs::ns_dirs)),
+                _ => self.fs().ns_dirs(),
+            },
             Some(host) => match host.and_then(crate::procreg::read) {
                 Some(rec) => rec.ns,
-                None => return err(errno::ENOENT),
+                None => return Err(errno::ENOENT),
             },
         };
-        self.open_ns(name, &dirs, link, flags)
+        self.ns_ref(name, &dirs, link)
     }
 
     /// `openat` of `path`, read from the guest. A symbolic link of the
@@ -454,6 +482,8 @@ impl<P: Platform> Kernel<P> {
         // Synthetic /proc and /sys files take priority over the host rootfs.
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
+                // A namespace's file bound to a path.
+                crate::procfs::Entry::Ns(n) => crate::nsfd::open(n, flags & fcntl::O_CLOEXEC != 0),
                 crate::procfs::Entry::File(_)
                     if self.fs().proc_path(dirfd as i32, &path).as_deref()
                         == Some(b"/proc/self/status") =>
@@ -1285,6 +1315,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
             return Ok((
                 match entry {
+                    Entry::Ns(n) => ns_stat(n.id),
                     Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                     Entry::Symlink(t) if follow => {
                         if let Some(ino) = namespace_inode(&t) {
@@ -1557,7 +1588,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(t) => Ok(LinkKind::Symlink(t)),
                 Entry::Fd { .. } => Ok(LinkKind::Magic),
                 Entry::Missing => Err(errno::ENOENT),
-                Entry::File(_) | Entry::Dir => Ok(LinkKind::None),
+                Entry::File(_) | Entry::Dir | Entry::Ns(_) => Ok(LinkKind::None),
             };
         }
         let st = self.linux_stat(cwd, abs, false, 0)?;
@@ -1628,7 +1659,9 @@ impl<P: Platform> Kernel<P> {
                     guest!(uaccess::write_from(buf, &target[..n]));
                     n as i64
                 }
-                crate::procfs::Entry::File(_) | crate::procfs::Entry::Dir => err(errno::EINVAL),
+                crate::procfs::Entry::File(_)
+                | crate::procfs::Entry::Dir
+                | crate::procfs::Entry::Ns(_) => err(errno::EINVAL),
                 crate::procfs::Entry::Missing => err(errno::ENOENT),
             };
         }

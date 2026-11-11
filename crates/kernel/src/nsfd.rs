@@ -61,7 +61,7 @@ pub fn kind_of(name: &[u8]) -> Option<u64> {
 }
 
 /// The name a namespace of `CLONE_NEW*` type `kind` goes by.
-fn name_of(kind: u64) -> &'static str {
+pub fn name_of(kind: u64) -> &'static str {
     match kind {
         CLONE_NEWUTS => "uts",
         CLONE_NEWIPC => "ipc",
@@ -205,16 +205,24 @@ impl<P: Platform> Kernel<P> {
     /// the namespaces whose record directories are `dirs` (the caller's,
     /// for `self`); `link` is its link's text, `kind:[id]`.
     pub(crate) fn open_ns(&self, name: &[u8], dirs: &[Vec<u8>], link: &[u8], flags: u64) -> i64 {
-        let Some(kind) = kind_of(name) else { return err(errno::ENOENT) };
+        match self.ns_ref(name, dirs, link) {
+            Ok(n) => open(n, flags & fwe_abi::fcntl::O_CLOEXEC != 0),
+            Err(e) => err(e),
+        }
+    }
+
+    /// The namespace [`open_ns`](Self::open_ns) opens.
+    pub(crate) fn ns_ref(&self, name: &[u8], dirs: &[Vec<u8>], link: &[u8]) -> Result<NsRef, i32> {
+        let kind = kind_of(name).ok_or(errno::ENOENT)?;
         let id = link.iter().position(|&b| b == b'[').and_then(|o| {
             std::str::from_utf8(link[o + 1..].strip_suffix(b"]")?).ok()?.parse().ok()
         });
-        let Some(id) = id else { return err(errno::ENOENT) };
+        let id = id.ok_or(errno::ENOENT)?;
         let dir = dir_among(name, dirs).or_else(|| {
             // The initial mount namespace's table is a record too.
             (kind == CLONE_NEWNS).then(|| self.fs().mount_ns().dir().to_vec())
         });
-        open(NsRef { kind, id, dir }, flags & fwe_abi::fcntl::O_CLOEXEC != 0)
+        Ok(NsRef { kind, id, dir })
     }
 
     /// An `ioctl` on namespace descriptor `fd`: `None` for another one.

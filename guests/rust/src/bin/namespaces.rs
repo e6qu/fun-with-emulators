@@ -674,6 +674,74 @@ fn main() {
             drop(hold);
             let _ = other.join();
         }
+        // A network namespace kept by a bind mount of its file, as Docker
+        // and `ip netns` keep one: made on a thread, bound by its
+        // `/proc/<pid>/task/<tid>/ns/net`, joined through the file by the
+        // process and by a child, and gone from the path once unmounted.
+        Some("nsbind") => {
+            use std::os::fd::AsRawFd;
+            std::fs::write("/tmp/netns", b"").unwrap();
+            let made = std::thread::spawn(|| {
+                let orig = std::fs::File::open("/proc/self/ns/net").unwrap();
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    unshare(CLONE_NEWNET);
+                    set_lo_up();
+                    let tid = syscall(178);
+                    let src = std::ffi::CString::new(format!(
+                        "/proc/{}/task/{tid}/ns/net",
+                        getpid()
+                    ))
+                    .unwrap();
+                    let link = std::fs::read_link(src.to_str().unwrap()).unwrap();
+                    let m = mount(
+                        src.as_ptr(),
+                        c"/tmp/netns".as_ptr(),
+                        std::ptr::null(),
+                        MS_BIND,
+                        std::ptr::null(),
+                    );
+                    let back = setns(orig.as_raw_fd(), CLONE_NEWNET);
+                    (m, back, link)
+                }
+            });
+            let (m, back, link) = made.join().unwrap();
+            println!("bind: {m}, back {back}");
+            let ino = {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata("/tmp/netns").unwrap().ino()
+            };
+            let id = link.to_string_lossy().trim_start_matches("net:[").trim_end_matches(']').to_string();
+            println!("inode is the namespace's: {}", ino.to_string() == id);
+            println!(
+                "mountinfo: {}",
+                std::fs::read_to_string("/proc/self/mountinfo")
+                    .unwrap()
+                    .lines()
+                    .any(|l| l.contains(" /tmp/netns ") && l.contains(" - nsfs nsfs "))
+            );
+            let ns = std::fs::File::open("/tmp/netns").unwrap();
+            // SAFETY: a namespace descriptor.
+            let joined = unsafe { setns(ns.as_raw_fd(), CLONE_NEWNET) };
+            let held = std::net::TcpListener::bind("127.0.0.1:18091");
+            println!("joined: {joined}, bound {}", held.is_ok());
+            let code = in_child(|| {
+                let ns = std::fs::File::open("/tmp/netns").unwrap();
+                // SAFETY: a namespace descriptor.
+                let r = unsafe { setns(ns.as_raw_fd(), CLONE_NEWNET) };
+                let taken = std::net::TcpListener::bind("127.0.0.1:18091").map(|_| ()).unwrap_err();
+                println!("child joined: {r}, port taken {}", taken.raw_os_error() == Some(98));
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                0
+            });
+            println!("child exited {code}");
+            // SAFETY: a NUL-terminated path.
+            let u = unsafe { umount2(c"/tmp/netns".as_ptr(), MNT_DETACH) };
+            let plain = std::fs::File::open("/tmp/netns").unwrap();
+            // SAFETY: a descriptor of a plain file.
+            let r = unsafe { setns(plain.as_raw_fd(), CLONE_NEWNET) };
+            println!("umount: {u}, a plain file again: {r} errno {}", errno());
+        }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds
             // it while a child in its own namespace has it.

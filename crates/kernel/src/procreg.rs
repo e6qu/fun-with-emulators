@@ -82,6 +82,9 @@ pub struct ProcRecord {
     /// The auxiliary vector its program started with (`/proc/<pid>/auxv`,
     /// where a debugger finds where the program was loaded).
     pub auxv: Vec<u8>,
+    /// The namespaces its threads are in apart from its own (records'
+    /// directories), which they hold as the process does its own.
+    pub held: Vec<Vec<u8>>,
 }
 
 /// A host process, as its pid and its start time.
@@ -221,6 +224,10 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     e.u64(r.slack.1);
     e.bool(r.execed);
     e.bytes(&r.auxv);
+    e.u64(r.held.len() as u64);
+    for d in &r.held {
+        e.bytes(d);
+    }
     e.into_bytes()
 }
 
@@ -252,6 +259,8 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let slack = (d.u64(), d.u64());
     let execed = d.bool();
     let auxv = d.bytes();
+    let n = d.count(8);
+    let held = (0..n).map(|_| d.bytes()).collect();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -277,6 +286,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         slack,
         execed,
         auxv,
+        held,
     })
 }
 
@@ -516,6 +526,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
         execed: false,
         auxv: Vec::new(),
+        held: Vec::new(),
     });
     f(&mut r);
     write(pid, &r);
@@ -545,12 +556,18 @@ pub fn own_program(exe: &[u8], cmdline: &[u8]) {
     });
 }
 
-/// This process's main thread is named `comm`.
 /// This process's program started with auxiliary vector `auxv`.
 pub fn own_auxv(auxv: &[u8]) {
     let _ = change(me(), |r| r.auxv = auxv.to_vec());
 }
 
+/// This process's threads are in the namespaces whose records are `held`
+/// besides its own.
+pub fn own_held(held: Vec<Vec<u8>>) {
+    let _ = change(me(), |r| r.held = held);
+}
+
+/// This process's main thread is named `comm`.
 pub fn own_comm(comm: &[u8]) {
     let _ = change(me(), |r| r.comm = comm.to_vec());
 }
