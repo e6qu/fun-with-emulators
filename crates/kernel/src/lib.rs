@@ -1014,7 +1014,10 @@ fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
     c.suid = c.euid;
     c.sgid = c.egid;
     let setid = p.uid.is_some() || p.gid.is_some();
-    c.caps.on_exec_file(c.uid, c.euid, p.caps, setid);
+    // Root is uid 0 of the process's user namespace (the ids are kept as the
+    // initial namespace's).
+    let ns = |id| userns::to_ns(id, false);
+    c.caps.on_exec_file(ns(c.uid), ns(c.euid), p.caps, setid);
 }
 
 /// Host `fork` is refused (see [`forbid_fork`]).

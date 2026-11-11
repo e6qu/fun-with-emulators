@@ -267,6 +267,22 @@ fn main() {
     // SAFETY: the scenarios' calls take valid strings and buffers.
     unsafe {
         match std::env::args().nth(1).as_deref() {
+            // A user's own user namespace, its root the user: a program it
+            // runs there is root's, with every capability, as on Linux.
+            Some("userns-exec") => {
+                if fork() == 0 {
+                    setuid(1000);
+                    unshare(0x1000_0000);
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", "0 1000 1").unwrap();
+                    std::fs::write("/proc/self/gid_map", "0 0 1").unwrap();
+                    let (p, r, l) = (c("/containers"), c("report"), c("root of its namespace"));
+                    let argv = [p.as_ptr(), r.as_ptr(), l.as_ptr(), std::ptr::null()];
+                    execv(p.as_ptr(), argv.as_ptr());
+                    _exit(9);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+            }
             // A program only the VM runs, on a host without one: the exec
             // fails and the caller goes on, as podman's pause process does
             // when its catatonit cannot run.

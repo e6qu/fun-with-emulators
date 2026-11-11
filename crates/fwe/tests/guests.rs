@@ -1586,6 +1586,9 @@ fn alpine_podman_runs_an_image() {
         out
     };
     let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
+    if !stdout(&loaded).contains("Loaded image") {
+        print_last_calls(&root.join("tmp/podman.trace"));
+    }
     let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
     let driver = podman(&["info", "--format", "{{.Store.GraphDriverName}}"]);
     let run = podman(&["run", "--rm", "--network=none", "alpine:3.20", "sh", "-c", IN_PODMAN]);
@@ -5261,6 +5264,17 @@ fn containers(scenario: &str) -> String {
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
     stdout(&out)
+}
+
+/// A user's own user namespace, whose root is the user: a program run
+/// there is root's, with every capability (root is uid 0 of the process's
+/// namespace, not of the initial one).
+#[test]
+fn root_of_a_users_namespace_keeps_capabilities_across_exec() {
+    assert_eq!(
+        containers("userns-exec"),
+        "root of its namespace: euid 0 CapEff:\t000001ffffffffff\n"
+    );
 }
 
 /// A program only the VM can run (linked below 4 GiB), where there is no
