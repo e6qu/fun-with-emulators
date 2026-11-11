@@ -5171,6 +5171,13 @@ fn subreaper_adopts_orphans() {
         "child exited 0\nchild is not a subreaper: true\nproc shows the subreaper: true\n\
          not ended yet: true\nreaped the orphan: true, killed by 9\n"
     );
+    // Its SIGCHLD reaches the thread that takes it, while the main thread,
+    // also waiting, blocks it.
+    assert_eq!(
+        namespaces("subreaper-thread"),
+        "child exited 0\nchild is not a subreaper: true\norphan adopted: true\n\
+         the worker took its SIGCHLD: true\nreaped: true\n"
+    );
 }
 
 /// A process that becomes a subreaper does not adopt an orphan below it

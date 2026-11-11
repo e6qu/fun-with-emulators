@@ -2627,7 +2627,9 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
   (one killed by `SIGKILL` is recorded by whoever finds it gone);
 - a reaper runs a watcher thread on `kqueue` process events and raises
   `SIGCHLD` in itself for an adopted descendant's end, stop or continue,
-  with a child's `siginfo`, and wakes its threads waiting in `wait`;
+  with a child's `siginfo`, and wakes every one of its threads, so the
+  one that does not block it takes it (a wake the host gives one thread
+  could land on one that blocks it);
 - its `wait` looks at its own children, then the adopted ones;
 - a child made with `CLONE_PARENT` is its creator's parent's, not its
   parent's on the host: its record says so, it tells that parent as it

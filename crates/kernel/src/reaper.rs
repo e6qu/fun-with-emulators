@@ -725,8 +725,8 @@ pub fn superseded(pid: i32) -> bool {
 }
 
 /// Raise the `SIGCHLD` for adopted process `e`'s end: pending for the
-/// guest with the `siginfo` Linux gives a child's end, and a guest thread
-/// woken to take it. It is not sent through the host: a `SIGCHLD` the host
+/// guest with the `siginfo` Linux gives a child's end, and the guest's
+/// threads woken, so the one that takes it does. It is not sent through the host: a `SIGCHLD` the host
 /// holds or is delivering would absorb it (standard signals are not queued
 /// twice), and the guest would hear of the orphan from neither.
 fn raise(e: &Ended) {
@@ -740,12 +740,7 @@ fn raise(e: &Ended) {
     // SAFETY: getuid cannot fail.
     let uid = crate::host::uid_to_initial(unsafe { libc::getuid() });
     let info = crate::thread::SigInfo { code, pid: e.pid, uid, status, value: 0, poll: None };
-    crate::thread::post_process(fwe_abi::signal::SIGCHLD, info);
-    // One thread is woken to take it, as the host picks one for a signal
-    // sent to the process: the wake carries nothing, so a wake the host
-    // holds or merges loses nothing.
-    // SAFETY: plain host call, to this process.
-    unsafe { libc::kill(me(), crate::host::WAKE_SIGNAL) };
+    crate::thread::post_process_waking(fwe_abi::signal::SIGCHLD, info);
 }
 
 /// Host process `pid`'s children.

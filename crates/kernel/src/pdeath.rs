@@ -144,8 +144,7 @@ fn deliver(sig: u64) {
                 uid,
                 ..Default::default()
             };
-            crate::thread::post_process(sig, info);
-            crate::host::kill_process(me, crate::host::WAKE_SIGNAL);
+            crate::thread::post_process_waking(sig, info);
         }
     }
 }

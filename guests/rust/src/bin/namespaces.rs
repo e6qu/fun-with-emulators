@@ -101,6 +101,8 @@ const SA_SIGINFO: i32 = 4;
 const ECHILD: i32 = 10;
 
 /// The `si_pid` and `si_code` of the last `SIGCHLD`.
+/// The pipe an orphan waits on before it ends (`subreaper-thread`).
+static GO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static CHLD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CHLD_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -1031,6 +1033,67 @@ fn main() {
                 println!("reaped the orphan: {}, {}", w == g, ended(status));
                 println!("SIGCHLD from the orphan: {}", sigchld_from(g));
                 println!("then: {} errno {}", waitpid(-1, &mut status, 0), errno() == ECHILD);
+            }
+        }
+        // An adopted orphan's SIGCHLD reaches the thread that takes it
+        // while the main thread, waiting too, blocks it.
+        Some("subreaper-thread") => {
+            catch_sigchld();
+            // SAFETY: plain calls with valid arguments; the children exit.
+            unsafe {
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                let mut res = [0i32; 2];
+                pipe(res.as_mut_ptr());
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let mut go = [0i32; 2];
+                pipe(go.as_mut_ptr());
+                GO.store(go[0], std::sync::atomic::Ordering::SeqCst);
+                let blocked = 1u64 << (SIGCHLD - 1);
+                syscall(135, 0i64, &blocked as *const u64, 0i64, 8i64);
+                // It ends once told, when every thread waits.
+                let (_, g) = orphan(report, || {
+                    read_i32(GO.load(std::sync::atomic::Ordering::SeqCst));
+                    7
+                });
+                // Others that block it too, waiting without end.
+                for _ in 0..6 {
+                    std::thread::spawn(|| {
+                        let mut idle = [0i32; 2];
+                        pipe(idle.as_mut_ptr());
+                        let mut p = [idle[0], 1];
+                        poll(&mut p, 1, -1);
+                    });
+                }
+                let worker = std::thread::spawn(move || {
+                    syscall(135, 1i64, &blocked as *const u64, 0i64, 8i64);
+                    let mut idle = [0i32; 2];
+                    pipe(idle.as_mut_ptr());
+                    write_i32(res[1], 0);
+                    // Without end, until the orphan's SIGCHLD interrupts it.
+                    while CHLD_PID.load(std::sync::atomic::Ordering::SeqCst) != g {
+                        let mut p = [idle[0], 1];
+                        poll(&mut p, 1, -1);
+                    }
+                    write_i32(res[1], 1);
+                });
+                read_i32(res[0]);
+                let parent = read_i32(report[0]);
+                // The orphan ends once the threads wait; this one too, with
+                // SIGCHLD blocked.
+                usleep(200_000);
+                write_i32(go[1], 0);
+                let mut p = [res[0], 1];
+                let took = poll(&mut p, 1, 5000) == 1;
+                println!("orphan adopted: {}", parent == getpid());
+                println!("the worker took its SIGCHLD: {took}");
+                if took {
+                    worker.join().unwrap();
+                }
+                let mut status = 0;
+                println!("reaped: {}", waitpid(g, &mut status, 0) == g);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                _exit(0);
             }
         }
         // A process that becomes a subreaper does not adopt the orphans
