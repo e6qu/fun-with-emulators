@@ -1993,10 +1993,12 @@ fn alpine_podman_builds_pulls_and_runs_rootless() {
     let sh = |script: &str, user: bool, expect: i32| {
         step.set(step.get() + 1);
         let trace = format!("step-{}.trace", step.get());
+        // BusyBox's applets, by name: `/bin/sh` and `/bin/su` are links to
+        // it, which name it by its path in the root.
         let cmd = if user {
-            fwe(&["/bin/su", "-s", "/bin/sh", "user", "-c", script], &trace)
+            fwe(&["/bin/busybox", "su", "-s", "/bin/sh", "user", "-c", script], &trace)
         } else {
-            fwe(&["/bin/sh", "-c", script], &trace)
+            fwe(&["/bin/busybox", "sh", "-c", script], &trace)
         };
         let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
         eprintln!(
@@ -2091,7 +2093,7 @@ fn shell_quote(s: &str) -> String {
 /// a program podman's VM process starts with `execve`; the container's
 /// exit status is podman's.
 #[test]
-fn hv_debian_podman_runs_an_image() {
+fn debian_podman_runs_in_the_vm() {
     if !fetched_program_tests("FWE_PODMAN_TESTS") {
         return;
     }
@@ -2144,11 +2146,13 @@ fn hv_debian_podman_runs_an_image() {
         out
     };
     let loaded = podman(&["load", "-q", "-i", "/tmp/alpine.tar"]);
+    // The name it was loaded as (`Loaded image(s): <name>`).
+    let name = stdout(&loaded).trim().rsplit(' ').next().unwrap_or_default().to_string();
     let run = podman(&[
         "run",
         "--rm",
         "--network=none",
-        "docker.io/library/alpine:3.20",
+        &name,
         "sh",
         "-c",
         "cat /etc/alpine-release; echo pid $$; id -u; exit 3",

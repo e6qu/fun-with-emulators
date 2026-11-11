@@ -134,7 +134,7 @@ jobs:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
-      - run: cargo test -p fwe --test guests -- alpine_podman_builds hv_debian_podman --nocapture
+      - run: cargo test -p fwe --test guests -- alpine_podman_builds debian_podman_runs_in_the_vm --nocapture
         env:
           FWE_PODMAN_TESTS: "1"
       # Each process's calls and the registry's log, for a step that failed.
