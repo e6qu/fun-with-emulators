@@ -4,8 +4,8 @@
 //! What a privileged operation needs is a capability in the effective set,
 //! as on Linux, not an effective uid of 0: a container runtime that drops
 //! capabilities leaves a root that cannot, say, mount or change its uid.
-//! fwe has no file capabilities and no set-user-ID programs, so `execve`
-//! follows Linux's rules for a file without either.
+//! `execve` follows Linux's rules, a program's file capabilities
+//! (`security.capability`, [`FileCaps`]) and set-ID bits included.
 
 use fwe_abi::errno;
 
@@ -54,6 +54,47 @@ const FS_MASK: u64 = 1 << CAP_CHOWN
     | 1 << CAP_LINUX_IMMUTABLE
     | 1 << CAP_MKNOD
     | 1 << CAP_MAC_OVERRIDE;
+
+/// A program's file capabilities, its `security.capability` attribute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileCaps {
+    pub permitted: u64,
+    pub inheritable: u64,
+    /// Its effective bit: the permitted set is made effective at once.
+    pub effective: bool,
+}
+
+/// `VFS_CAP_FLAGS_EFFECTIVE` and the revisions of `vfs_cap_data`.
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x1;
+const VFS_CAP_REVISION_1: u32 = 0x0100_0000;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+
+/// The file capabilities attribute value `v` holds, and the root id a
+/// revision-3 value is for (`None` for an earlier revision): `None` for a
+/// malformed value, which Linux ignores.
+pub fn parse_file_caps(v: &[u8]) -> Option<(FileCaps, Option<u32>)> {
+    let word = |i: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(v.get(i * 4..i * 4 + 4)?.try_into().ok()?))
+    };
+    let magic = word(0)?;
+    let effective = magic & VFS_CAP_FLAGS_EFFECTIVE != 0;
+    let (words, rootid) = match magic & 0xff00_0000 {
+        VFS_CAP_REVISION_1 if v.len() == 12 => (1, None),
+        VFS_CAP_REVISION_2 if v.len() == 20 => (2, None),
+        VFS_CAP_REVISION_3 if v.len() == 24 => (2, Some(word(5)?)),
+        _ => return None,
+    };
+    let (mut permitted, mut inheritable) = (0u64, 0u64);
+    for i in 0..words {
+        permitted |= u64::from(word(1 + 2 * i)?) << (32 * i);
+        inheritable |= u64::from(word(2 + 2 * i)?) << (32 * i);
+    }
+    Some((
+        FileCaps { permitted: permitted & ALL, inheritable: inheritable & ALL, effective },
+        rootid,
+    ))
+}
 
 /// Securebits (`linux/securebits.h`).
 pub const SECBIT_NOROOT: u32 = 1 << 0;
@@ -255,10 +296,23 @@ impl Caps {
     /// `execve` of a program with no file capabilities and no set-ID bits,
     /// by a process with uids `ruid` and `euid` (already the new ones).
     pub fn on_exec(&mut self, ruid: u32, euid: u32) {
+        self.on_exec_file(ruid, euid, None, false);
+    }
+
+    /// [`on_exec`](Self::on_exec) of a program with file capabilities
+    /// `file`, or one that is set-ID (`setid`): such a program clears the
+    /// ambient set, and a non-root caller gains what its file
+    /// capabilities grant, as Linux computes it.
+    pub fn on_exec_file(&mut self, ruid: u32, euid: u32, file: Option<FileCaps>, setid: bool) {
+        if file.is_some() || setid {
+            self.ambient = 0;
+        }
         let root = self.securebits & SECBIT_NOROOT == 0 && (euid == 0 || ruid == 0);
         let (permitted, raise) = if root {
             // Root runs every program as if it had every capability.
             (self.inheritable | self.bounding, euid == 0)
+        } else if let Some(f) = file {
+            ((self.inheritable & f.inheritable) | (f.permitted & self.bounding), f.effective)
         } else {
             (0, false)
         };
@@ -338,5 +392,38 @@ mod tests {
         c.on_exec(1000, 1000);
         assert_eq!((c.permitted, c.effective, c.ambient), (b, b, b));
         assert_eq!(c.ambient_op(1, CAP_NET_BIND_SERVICE as u64), Ok(1));
+    }
+
+    /// A program with file capabilities, as `newuidmap` has
+    /// `cap_setuid+ep`: run by a user, it has them, within the bounding set,
+    /// and the ambient set goes.
+    #[test]
+    fn file_capabilities_raise_a_users_program() {
+        // Revision 2, effective, CAP_SETUID permitted.
+        let mut v = (VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE).to_le_bytes().to_vec();
+        for w in [1u32 << CAP_SETUID, 0, 0, 0] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        let (f, root) = parse_file_caps(&v).unwrap();
+        assert_eq!(
+            (f.permitted, f.inheritable, f.effective, root),
+            (bit(CAP_SETUID), 0, true, None)
+        );
+        assert!(parse_file_caps(&v[..16]).is_none());
+        let mut c = Caps::default();
+        c.after_setuid((0, 0, 0), (1000, 1000, 1000));
+        c.on_exec_file(1000, 1000, Some(f), false);
+        assert_eq!((c.permitted, c.effective), (bit(CAP_SETUID), bit(CAP_SETUID)));
+        // Without the effective bit, permitted only.
+        let mut c = Caps::default();
+        c.after_setuid((0, 0, 0), (1000, 1000, 1000));
+        c.on_exec_file(1000, 1000, Some(FileCaps { effective: false, ..f }), false);
+        assert_eq!((c.permitted, c.effective), (bit(CAP_SETUID), 0));
+        // Outside the bounding set, nothing.
+        let mut c = Caps::default();
+        c.drop_bounding(CAP_SETUID as u64).unwrap();
+        c.after_setuid((0, 0, 0), (1000, 1000, 1000));
+        c.on_exec_file(1000, 1000, Some(f), false);
+        assert_eq!(c.permitted, 0);
     }
 }

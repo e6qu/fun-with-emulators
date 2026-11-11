@@ -548,14 +548,11 @@ impl<P: Platform> Kernel<P> {
         thread::set_robust_list(0, 0);
         acct::exec();
         aio::forget_all();
-        // The saved IDs become the effective ones, as Linux's execve sets
-        // them (no set-user-ID programs here).
-        let saved = (self.creds.suid, self.creds.sgid);
-        self.creds.suid = self.creds.euid;
-        self.creds.sgid = self.creds.egid;
-        let (uid, euid) = (self.creds.uid, self.creds.euid);
-        self.creds.caps.on_exec(uid, euid);
-        if saved != (self.creds.suid, self.creds.sgid) {
+        // A set-ID program's owner and group, then the saved IDs the
+        // effective ones, and the capabilities, as Linux's execve sets them.
+        let saved = (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid);
+        apply_exec_privs(&mut self.creds, take_exec_privs());
+        if saved != (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid) {
             self.ids_changed(0);
         }
     }
@@ -622,7 +619,9 @@ impl<P: Platform> Kernel<P> {
     /// Whether the caller may run the program at guest path `path`: only a
     /// regular file whose bits let it (`EACCES`; root needs one execute
     /// bit set), and that no process has open for writing (`ETXTBSY`).
+    /// What running it grants ([`ExecPrivs`]) is noted for the exec.
     pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
+        EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
         use fwe_abi::{errno, fcntl};
         if landlock::active() {
             self.landlock_exec(path)?;
@@ -643,6 +642,21 @@ impl<P: Platform> Kernel<P> {
             // Not a file open for writing.
             if host_file_busy(&st) {
                 return Err(errno::ETXTBSY);
+            }
+            // What it grants, unless a `nosuid` mount, `no_new_privs` or a
+            // tracer says it grants nothing, as on Linux.
+            let gains = r.mount_flags & mounts::ms::NOSUID == 0
+                && !syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
+                && !ptrace::traced();
+            if gains {
+                let privs = ExecPrivs {
+                    uid: (st.st_mode as u32 & libc::S_ISUID as u32 != 0).then_some(st.st_uid),
+                    gid: (st.st_mode as u32 & libc::S_ISGID as u32 != 0
+                        && st.st_mode as u32 & libc::S_IXGRP as u32 != 0)
+                        .then_some(st.st_gid),
+                    caps: file_caps(r.dir.as_raw_fd(), &name),
+                };
+                EXEC_PRIVS.with(|p| p.set(privs));
             }
         }
         Ok(())
@@ -713,6 +727,8 @@ impl<P: Platform> Kernel<P> {
         landlock::save(&mut e);
         // Its foster children, still its own to follow.
         e.bool(reaper::fostering());
+        // What the program it runs grants.
+        take_exec_privs().save(&mut e);
         e.into_bytes()
     }
 
@@ -733,7 +749,7 @@ impl<P: Platform> Kernel<P> {
         }
         let n = d.count(4);
         let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
-        let mut caps = caps::Caps::decode(&mut d);
+        let caps = caps::Caps::decode(&mut d);
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
         rlimits::load(&mut d);
@@ -751,6 +767,7 @@ impl<P: Platform> Kernel<P> {
         let (tracer, syscalls) = (d.u32() as i32, d.bool());
         landlock::load(&mut d);
         let fostering = d.bool();
+        let privs = ExecPrivs::load(&mut d);
         d.finish()?;
         reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
@@ -759,20 +776,11 @@ impl<P: Platform> Kernel<P> {
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
-        let [uid, euid, _, fsuid, gid, egid, _, fsgid] = ids;
-        caps.on_exec(uid, euid);
-        self.creds = creds::Creds {
-            uid,
-            euid,
-            suid: euid,
-            fsuid,
-            gid,
-            egid,
-            sgid: egid,
-            fsgid,
-            groups,
-            caps,
-        };
+        let [uid, euid, suid, fsuid, gid, egid, sgid, fsgid] = ids;
+        let mut creds =
+            creds::Creds { uid, euid, suid, fsuid, gid, egid, sgid, fsgid, groups, caps };
+        apply_exec_privs(&mut creds, privs);
+        self.creds = creds;
         creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
@@ -919,6 +927,98 @@ pub fn release_robust_lists() {
     for (tid, head) in thread::take_others_robust() {
         futex::release_robust(head, tid);
     }
+}
+
+/// What running a program grants ([`Kernel::may_exec`] notes it): the
+/// owner and group of a set-ID program, and its file capabilities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExecPrivs {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    caps: Option<caps::FileCaps>,
+}
+
+impl ExecPrivs {
+    fn save(&self, e: &mut snapshot::Enc) {
+        for id in [self.uid, self.gid] {
+            e.bool(id.is_some());
+            e.u32(id.unwrap_or(0));
+        }
+        e.bool(self.caps.is_some());
+        let c = self.caps.unwrap_or_default();
+        e.u64(c.permitted);
+        e.u64(c.inheritable);
+        e.bool(c.effective);
+    }
+
+    fn load(d: &mut snapshot::Dec) -> ExecPrivs {
+        let mut id = || {
+            let (has, v) = (d.bool(), d.u32());
+            has.then_some(v)
+        };
+        let (uid, gid) = (id(), id());
+        let has = d.bool();
+        let c = caps::FileCaps { permitted: d.u64(), inheritable: d.u64(), effective: d.bool() };
+        ExecPrivs { uid, gid, caps: has.then_some(c) }
+    }
+}
+
+thread_local! {
+    /// What the program this thread is about to run grants.
+    static EXEC_PRIVS: std::cell::Cell<ExecPrivs> = const {
+        std::cell::Cell::new(ExecPrivs { uid: None, gid: None, caps: None })
+    };
+}
+
+fn take_exec_privs() -> ExecPrivs {
+    EXEC_PRIVS.with(|p| p.take())
+}
+
+/// The file capabilities of `name` in directory `dir`
+/// (`security.capability`), if it has any that apply: a revision-3 value
+/// only for the user namespace whose root it names.
+fn file_caps(dir: i32, name: &std::ffi::CStr) -> Option<caps::FileCaps> {
+    let mut buf = [0u8; 24];
+    // SAFETY: a NUL-terminated name in a live directory; the descriptor is
+    // closed below; a buffer of its length.
+    let n = unsafe {
+        let fd =
+            libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        if fd < 0 {
+            return None;
+        }
+        let n = libc::fgetxattr(
+            fd,
+            c"security.capability".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            0,
+        );
+        libc::close(fd);
+        n
+    };
+    let (f, rootid) = caps::parse_file_caps(&buf[..usize::try_from(n).ok()?])?;
+    match rootid {
+        Some(r) if r != 0 && userns::to_ns(r, false) != 0 => None,
+        _ => Some(f),
+    }
+}
+
+/// An exec's change to `c`: a set-ID program's owner and group as the
+/// effective (and filesystem) ids, the saved ids then the effective ones,
+/// and the capabilities as Linux computes them.
+fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
+    if let Some(u) = p.uid {
+        (c.euid, c.fsuid) = (u, u);
+    }
+    if let Some(g) = p.gid {
+        (c.egid, c.fsgid) = (g, g);
+    }
+    c.suid = c.euid;
+    c.sgid = c.egid;
+    let setid = p.uid.is_some() || p.gid.is_some();
+    c.caps.on_exec_file(c.uid, c.euid, p.caps, setid);
 }
 
 /// Host `fork` is refused (see [`forbid_fork`]).

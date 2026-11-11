@@ -20,6 +20,7 @@ of life, so the files no longer change.
 | `fetch/podman.txt` | The minirootfs (the test's root, and the one layer of the `alpine` image the test builds an OCI archive of), podman 5.2.5, conmon, crun, netavark, containers-common, catatonit and their libraries (gpgme, libassuan, libgpg-error, sqlite, glib, pcre2, libintl, libgcc, libcap, libseccomp, yajl) | 22 MB |
 | `fetch/containerd.txt` | The minirootfs (the test's root, and the `alpine` image's layer), containerd 1.7.17 with its runc shim, ctr, runc 1.1.14 and libseccomp | 33 MB |
 | `fetch/docker.txt` | The minirootfs (the test's root, and the `alpine` image's layer), Docker Engine 26.1.5 (`dockerd`), the docker CLI with its buildx 0.14 and Compose 2.27 plugins, containerd 1.7.17, runc 1.1.14, tini, iptables and their libraries (libmnl, libnftnl, libxtables, libseccomp) | 88 MB |
+| `fetch/podman-further.txt` | What `podman.txt` lists, distribution's registry 2.8.3 (`docker-registry`), and shadow's `newuidmap`/`newgidmap` with their libraries (shadow-libs, libbsd, libmd, linux-pam, skalibs, utmps) | 31 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
 
 ## License
@@ -28,7 +29,9 @@ What the tests fetch keeps the licenses Alpine ships it under, recorded in
 each package's metadata: crun GPL-2.0-or-later and LGPL-2.1-or-later;
 libcap BSD-3-Clause or GPL-2.0-only; libseccomp LGPL-2.1-or-later; yajl MIT;
 podman, conmon, netavark, containers-common, containerd, ctr, runc,
-dockerd, the docker CLI, buildx and Compose Apache-2.0; tini MIT; iptables,
+dockerd, the docker CLI, buildx, Compose and the registry Apache-2.0;
+shadow, libbsd and linux-pam BSD-3-Clause; libmd BSD-3-Clause,
+BSD-2-Clause, ISC, Beerware and public domain; skalibs and utmps ISC; tini MIT; iptables,
 libnftnl and libxtables GPL-2.0-or-later; libmnl LGPL-2.1-or-later; catatonit
 GPL-2.0-or-later; gpgme LGPL-2.1-or-later and GPL-3.0-or-later; libassuan,
 glib and libintl LGPL-2.1-or-later; libgpg-error and libgcc

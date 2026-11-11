@@ -98,6 +98,9 @@ unsafe extern "C" {
     fn fork() -> i32;
     fn waitpid(pid: i32, st: *mut i32, o: i32) -> i32;
     fn setuid(u: u32) -> i32;
+    fn geteuid() -> u32;
+    fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
+    fn execv(p: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
     fn umask(m: u32) -> u32;
     fn chdir(p: *const std::ffi::c_char) -> i32;
     fn readlink(p: *const std::ffi::c_char, b: *mut u8, n: usize) -> isize;
@@ -263,6 +266,53 @@ fn main() {
     // SAFETY: the scenarios' calls take valid strings and buffers.
     unsafe {
         match std::env::args().nth(1).as_deref() {
+            // What a program it runs gives a user: one with file
+            // capabilities (`cap_setuid+ep`, as `newuidmap` has), one
+            // set-user-ID root; and neither under `no_new_privs`.
+            Some("report") => {
+                let status = std::fs::read_to_string("/proc/self/status").unwrap();
+                let eff = status.lines().find(|l| l.starts_with("CapEff:")).unwrap_or("");
+                let label = std::env::args().nth(2).unwrap_or_default();
+                println!("{label}: euid {} {eff}", geteuid());
+            }
+            Some("execprivs") => {
+                std::fs::copy("/containers", "/tmp/capped").unwrap();
+                std::fs::copy("/containers", "/tmp/setuid").unwrap();
+                chmod(c("/tmp/capped").as_ptr(), 0o755);
+                chmod(c("/tmp/setuid").as_ptr(), 0o4755);
+                // Revision 2, effective, CAP_SETUID (7) permitted.
+                let mut v = 0x0200_0001u32.to_le_bytes().to_vec();
+                for w in [1u32 << 7, 0, 0, 0] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                let set = setxattr(
+                    c("/tmp/capped").as_ptr(),
+                    c("security.capability").as_ptr(),
+                    v.as_ptr(),
+                    v.len(),
+                    0,
+                );
+                println!("setcap: {}", res(set as i64));
+                for (prog, label, nnp) in [
+                    ("/tmp/capped", "capped", false),
+                    ("/tmp/setuid", "set-uid", false),
+                    ("/tmp/capped", "capped, no_new_privs", true),
+                    ("/tmp/setuid", "set-uid, no_new_privs", true),
+                ] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    if fork() == 0 {
+                        setuid(1000);
+                        if nnp {
+                            prctl(38, 1, 0, 0, 0);
+                        }
+                        let (p, r, l) = (c(prog), c("report"), c(label));
+                        let argv = [p.as_ptr(), r.as_ptr(), l.as_ptr(), std::ptr::null()];
+                        execv(p.as_ptr(), argv.as_ptr());
+                        _exit(9);
+                    }
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
+            }
             // Extended attributes by namespace, as container images carry
             // them (file capabilities, overlay markers).
             Some("xattr") => {
