@@ -1369,7 +1369,7 @@ fn alpine_gdb_debugs_a_program() {
         "total 6",
         "exited normally]",
     ] {
-        assert!(text.contains(want), "no {want:?} in gdb's output:\n{text}");
+        assert!(text.contains(want), "no {want:?} in gdb's output ({}):\n{text}", out.status);
     }
 }
 
@@ -4443,6 +4443,9 @@ fn userns_clone_from_a_thread() {
     assert_eq!(namespaces("userns-thread-clone"), want);
     let Some(out) = fwe_hv(&rust_low_guest("namespaces"), &["userns-thread-clone"]) else { return };
     assert_eq!(stdout(&out), want);
+    // Killed as soon as it is made, before it has run.
+    let out = fwe_hv(&rust_low_guest("namespaces"), &["kill-at-once"]).unwrap();
+    assert_eq!(stdout(&out), "killed at once: 20 of 20\n");
 }
 
 /// Namespaces in the VM, whose fork child starts from a snapshot of the

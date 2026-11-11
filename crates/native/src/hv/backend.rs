@@ -389,6 +389,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
             let relayed = host::kill_relayed();
             fwe_kernel::trace::note_to_file_raw(b"kill relay arrived, noted: ", relayed as i64);
             if !relayed {
+                fwe_kernel::signote::trace_slots(sig);
                 return;
             }
         }

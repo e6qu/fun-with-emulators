@@ -837,6 +837,26 @@ fn main() {
             let (parent_ok, ns, st) = t.join().unwrap();
             println!("child's parent ours: {parent_ok}, its namespace seen: {ns}, killed by {}", st & 0x7f);
         }
+        // A child killed as soon as it is made, before it has run.
+        Some("kill-at-once") => {
+            let mut killed = 0;
+            for _ in 0..20 {
+                // SAFETY: plain calls; the child only waits.
+                unsafe {
+                    let child = syscall(SYS_CLONE, CLONE_NEWUSER as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                    if child == 0 {
+                        loop {
+                            syscall(73, 0i64, 0i64, 0i64, 0i64, 0i64);
+                        }
+                    }
+                    kill(child as i32, SIGKILL);
+                    let mut st = 0;
+                    waitpid(child as i32, &mut st, 0);
+                    killed += i32::from(st & 0x7f == SIGKILL);
+                }
+            }
+            println!("killed at once: {killed} of 20");
+        }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds
             // it while a child in its own namespace has it.

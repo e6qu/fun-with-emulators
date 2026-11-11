@@ -396,10 +396,13 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
             }
             // SAFETY: plain host call.
             let r = unsafe { libc::kill(t, s) };
-            crate::trace::note_to_file(&format!(
-                "kill of {t}: {}, {r}",
-                if s == KILL_RELAY { "relayed" } else { "host SIGKILL" }
-            ));
+            if s == KILL_RELAY {
+                crate::trace::note_to_file_raw(b"kill relayed to ", i64::from(t));
+                crate::trace::note_to_file_raw(
+                    b"kill relay note written: ",
+                    crate::signote::noted_at(t, KILL_RELAY),
+                );
+            }
             if r == 0 {
                 result = 0;
             } else if result != 0 {
