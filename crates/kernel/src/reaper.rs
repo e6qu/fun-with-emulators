@@ -204,7 +204,7 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
         // it (a second would arrive with no report, from no one). The mark
         // goes with the watcher's next look, the record taken.
         let mut told = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
-        if procreg::take_ended(&e) {
+        if procreg::take_adopted_end(&e) {
             let first = told.get_or_insert_with(HashSet::new).insert((e.pid, e.start));
             drop(told);
             crate::pidns::released(&e.numbers, e.pid);

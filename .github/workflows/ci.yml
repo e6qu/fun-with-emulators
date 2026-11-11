@@ -108,6 +108,13 @@ jobs:
         if: steps.ltp-cache.outputs.cache-hit != 'true'
         run: tools/ltp/build.sh target/ltp
       - run: cargo build
+      # A process may open as many files as a Linux distribution allows
+      # (pipe15 opens 8195), not the runner's 10240, of which fwe keeps a
+      # quarter for itself.
+      - name: Raise the host's open-file limits
+        run: |
+          sudo sysctl -w kern.maxfiles=184320 kern.maxfilesperproc=92160
+          echo "hard limit: $(ulimit -Hn)"
       - name: Run LTP's system-call tests under fwe
         run: |
           # Four at once: most of a test's time is spent waiting.

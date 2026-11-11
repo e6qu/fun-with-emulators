@@ -2,7 +2,7 @@
 //! from `/dev/loop-control`, a file attached, its contents read and
 //! written through the device, from an offset and within a size limit,
 //! mapped, at a position a fork child shares, shown in `/sys/block`, then
-//! detached; and a device added and removed. It prints what it observed,
+//! detached (and run down until closed); and a device added and removed. It prints what it observed,
 //! in terms that do not depend on which device it was given.
 //!
 //! The C library calls go straight to the statically linked musl, declared
@@ -244,7 +244,27 @@ fn main() {
             status(dev).err() == Some(ENXIO),
             size64(dev)
         );
+        // Run down while this process holds it: another process neither
+        // attaches it nor is given it as free; once closed, it does.
+        let other = |expect_busy: bool| {
+            let pid = fork();
+            if pid == 0 {
+                let d = open(c(&dev_path).as_ptr(), O_RDWR);
+                let r = res(ioctl(d, LOOP_SET_FD, file) as i64);
+                let ok = if expect_busy {
+                    r == -(EBUSY as i64) && ioctl(ctl, LOOP_CTL_GET_FREE) != n
+                } else {
+                    r == 0 && ioctl(d, LOOP_CLR_FD, 0) == 0
+                };
+                _exit(if ok { 0 } else { 1 });
+            }
+            let mut wstatus = 0;
+            waitpid(pid, &mut wstatus, 0);
+            wstatus == 0
+        };
+        let held = other(true);
         close(dev);
+        println!("run down: held {held}, closed {}", other(false));
 
         // A device added, then removed.
         let m = ioctl(ctl, LOOP_CTL_ADD, -1);

@@ -8,13 +8,18 @@ Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
 The root is a root filesystem with LTP in /opt/ltp (tools/ltp/build.sh
 makes it, of Alpine's minirootfs). Each entry of LTP's runtest/syscalls runs as `fwe --root ROOT <test>
 <args>`, in a directory of its own under `/tmp` (its TMPDIR), with LTP's
-own per-test timeout and a hard limit above that (twice it for the slow
+own per-test timeout and a hard limit above that (four times it for the slow
 ones, which start first; a minute for one not in the baseline); `--jobs`
-run at once, but those that change a machine-wide setting (see SERIAL) run
-one at a time, after the rest. A test passes when it exits 0; LTP's exit status
+run at once, but those that change a machine-wide setting or measure time
+(see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
-`--update` rewrites it from the run. The pass rate is printed either way.
+`--update` rewrites it from the run. A regression is run again alone; a
+timer test that then fails only by sleeping too long is measured against
+the host's own timers (hosttimer.c), and named, not failed, if they, with
+fwe's least cost per sleep, miss the same threshold; once the host has so
+missed in a run, its other timer tests that only slept too long are named
+with it. The pass rate is printed either way.
 The tests in exceptions.txt, which fail or skip on Linux too or test what is
 not planned, are not run, and do not count as applicable; a test that skips
 and is not among them is named (what fwe still lacks).
@@ -194,10 +199,13 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         # (LTP's default is ext2).
         "LTP_DEV_FS_TYPE": "tmpfs",
         # A fork under fwe takes milliseconds, not Linux's tenth of one: a
-        # test that forks thousands of times (fork14) is given eight times
-        # LTP's time. One that runs for a set time instead (fork13's ten
-        # minutes) runs a tenth of it: the same checks, fewer rounds.
-        "LTP_TIMEOUT_MUL": "8",
+        # test is given eight times LTP's time, a slow one thirty-two, as
+        # its hard limit is four times the rest's (fork14's 16,394 forks of
+        # a process with as many mappings take macOS minutes natively, a
+        # CI runner several times this). One
+        # that runs for a set time instead (fork13's ten minutes) runs a
+        # tenth of it: the same checks, fewer rounds.
+        "LTP_TIMEOUT_MUL": "32" if SLOW.match(name) else "8",
         "LTP_RUNTIME_MUL": "0.1",
         "HOME": guest_tmp,
         "LANG": "C",
@@ -241,9 +249,67 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         log.seek(0)
         out = log.read()
     shutil.rmtree(tmp, ignore_errors=True)
-    keep = 400 if outcome == "timeout" else 40
+    # (A timer test's every measurement, for `host_timers_late`.)
+    keep = 400 if outcome == "timeout" or b"slept for too long" in out else 40
     tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
     return name, outcome, time.monotonic() - start, tail
+
+
+TIMER_SET = re.compile(r"sleeping for (\d+)us (\d+) iterations, threshold ([\d.]+)us")
+TIMER_RESULT = re.compile(r"min (\d+)us, .*trunc mean ([\d.]+)us")
+
+
+def only_overslept(tail):
+    """Whether a timer test's output shows failures, all of sleeps that
+    ended too late."""
+    fails = [line for line in tail.splitlines() if "TFAIL" in line]
+    return bool(fails) and all("slept for too long" in line for line in fails)
+
+
+def host_timers_late(work, tail):
+    """For a timer test (LTP's tst_timer_test) whose only failures are
+    sleeps that ended too late: evidence, as lines, that the host made each
+    late sleep late itself, or none. The host's own sleeps of the same
+    length are measured (hosttimer.c, up to three rounds); fwe's least cost
+    per sleep is what its shortest sleep took past the host's shortest.
+    The host made the sleep late when its mean, with that cost, is past
+    LTP's threshold already."""
+    lines = tail.splitlines()
+    if not only_overslept(tail):
+        return []
+    late_sets = []
+    for i, line in enumerate(lines):
+        m = TIMER_SET.search(line)
+        res = next((TIMER_RESULT.search(x) for x in lines[i + 1:i + 3] if TIMER_RESULT.search(x)), None)
+        if m and res:
+            usec, n, threshold = int(m[1]), int(m[2]), float(m[3])
+            if float(res[2]) > usec + threshold:
+                late_sets.append((usec, n, threshold, int(res[1])))
+    if not late_sets:
+        return []
+    probe = os.path.join(work, "hosttimer")
+    if not os.path.exists(probe):
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosttimer.c")
+        if subprocess.run(["cc", "-O2", "-o", probe, source]).returncode != 0:
+            return []
+    found = []
+    for usec, n, threshold, fwe_min in late_sets:
+        for _ in range(3):
+            r = subprocess.run([probe, str(usec), str(n)], capture_output=True, text=True)
+            try:
+                host_min, host_mean, host_max = (float(x) for x in r.stdout.split())
+            except ValueError:
+                return []
+            cost = max(0.0, fwe_min - host_min)
+            if host_mean + cost > usec + threshold:
+                found.append(
+                    f"{usec}us x{n}: host mean {host_mean:.0f}us (min {host_min:.0f}, max {host_max:.0f})"
+                    f" + fwe's least cost {cost:.0f}us > {usec + threshold:.0f}us"
+                )
+                break
+        else:
+            return []
+    return found
 
 
 def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
@@ -259,12 +325,19 @@ def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             time.sleep(1)
 
 
-# Tests that change a machine-wide setting (a sysctl: fork13 lowers
-# kernel.pid_max, which getpid01 checks pids against) and put it back as
-# they end: run one at a time, after the rest, so that none of them takes
-# another's change for the setting to restore, nor runs while another's is
-# in force.
-SERIAL = re.compile(r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13)(_64)?$")
+# Tests run one at a time, after the rest: those that change a
+# machine-wide setting (a sysctl: fork13 lowers kernel.pid_max, which
+# getpid01 checks pids against) and put it back as they end, so that none
+# takes another's change for the setting to restore, nor runs while
+# another's is in force; and those that measure time (how late a sleep or a
+# timeout ends, timer slack) or need the host's processors (fork14's 16384
+# forks of a process with as many mappings, quadratic on the host), which a
+# loaded machine makes miss.
+SERIAL = re.compile(
+    r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13"
+    r"|fork14|prctl09|select02|poll02|pselect01|epoll_pwait03|epoll_wait02"
+    r"|clock_gettime04|clock_nanosleep02|nanosleep01|futex_wait05|pipe15)(_64)?$"
+)
 
 
 def main():
@@ -308,11 +381,11 @@ def main():
         passing = {n for n, _ in tests}
 
     def limit(name):
-        # A slow test is given twice the time, passing yet or not: its
-        # time is mostly the host's (fork14's thousands of forks of a
+        # A slow test is given four times the time, passing yet or not:
+        # its time is mostly the host's (fork14's thousands of forks of a
         # process with thousands of mappings).
         if SLOW.match(name):
-            return 2 * args.hard_limit
+            return 4 * args.hard_limit
         return args.hard_limit if name in passing else min(args.failing_limit, args.hard_limit)
 
     tests = [t for t in tests if t[0] not in excepted]
@@ -334,6 +407,10 @@ def main():
         # them rather than leaving them to run on alone at the end.
         parallel.sort(key=lambda t: not SLOW.match(t[0]))
         serial = [(n, a) for n, a in tests if SERIAL.match(n)]
+        # The slow ones last: what they leave the host to do as they end
+        # (fork14's thousands of large address spaces torn down) would
+        # disturb the timing of the next.
+        serial.sort(key=lambda t: bool(SLOW.match(t[0])))
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, limit(n)) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
@@ -396,6 +473,28 @@ def main():
             if again[n][1] != "pass" and args.show:
                 print(f"--- {n} ({again[n][1]}), run again:\n" + again[n][3])
         regressed = [n for n in regressed if again[n][1] != "pass"]
+        # A timer test the host's own timers fail too: the host cannot
+        # time as LTP asks (a CI runner, a virtual machine, is late now and
+        # then by milliseconds), so it is named with the evidence, not
+        # failed. One the host meets is fwe's to fix.
+        work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+        try:
+            host_late = {n: host_timers_late(work, again[n][3]) for n in regressed}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        host_late = {n: v for n, v in host_late.items() if v}
+        # A host shown to miss LTP's thresholds itself in this run cannot
+        # time the rest either: its other timer tests that only slept too
+        # long are named with them (their own rounds may have caught it at
+        # a better moment).
+        if host_late:
+            for n in regressed:
+                if n not in host_late and only_overslept(again[n][3]):
+                    host_late[n] = ["the host's timers missed LTP's thresholds in this run (above)"]
+            print(f"late as the host's own timers are ({len(host_late)}): " + " ".join(host_late))
+            for n, found in host_late.items():
+                print(f"    {n}: " + "; ".join(found))
+        regressed = [n for n in regressed if n not in host_late]
     if regressed:
         print(f"REGRESSED ({len(regressed)}): " + " ".join(f"{n}={results[n]}" for n in regressed))
         return 1

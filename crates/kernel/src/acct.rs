@@ -4,8 +4,10 @@
 //!
 //! The file's host path is kept in a small file of fwe's, one per pid
 //! namespace (beside the process records in the initial one, in the
-//! namespace's record directory otherwise), which every ending process
-//! looks for: one failed `open` when accounting is off.
+//! namespace's record directory otherwise). An ending process's record
+//! goes to the nearest namespace, its own or one above it, with
+//! accounting on, as Linux's does: a failed `open` a namespace when none
+//! is.
 
 use fwe_abi::errno;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +31,24 @@ fn setting() -> Option<std::ffi::CString> {
         Some(ns) => ns.dir().to_vec(),
         None => crate::procreg::records_dir()?,
     };
-    std::ffi::CString::new([&dir[..], b"/acct"].concat()).ok()
+    setting_in(&dir)
+}
+
+fn setting_in(dir: &[u8]) -> Option<std::ffi::CString> {
+    std::ffi::CString::new([dir, b"/acct"].concat()).ok()
+}
+
+/// The accounting file a record of this process goes to: the nearest pid
+/// namespace's, from its own up to the initial one, that has one.
+fn target() -> Option<Vec<u8>> {
+    let mut dirs: Vec<Vec<u8>> =
+        crate::pidns::current().iter().map(|ns| ns.dir().to_vec()).collect();
+    dirs.extend(crate::procreg::records_dir());
+    dirs.iter().find_map(|d| {
+        let p = setting_in(d)?;
+        std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(p.as_bytes()))
+            .ok()
+    })
 }
 
 /// Turn accounting on, to the file at host path `host`, or off (`None`).
@@ -86,12 +105,7 @@ fn ticks(tv: libc::timeval) -> u64 {
 /// This process ends with Linux wait status `status`: its record, if
 /// accounting is on.
 pub fn process_ending(status: i32) {
-    let Some(path) = setting() else { return };
-    let Ok(file) = std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
-        path.as_bytes(),
-    )) else {
-        return;
-    };
+    let Some(file) = target() else { return };
     let Ok(target) = std::ffi::CString::new(file) else { return };
     let rec = record(status);
     // SAFETY: a NUL-terminated path; a 64-byte buffer; closed below.

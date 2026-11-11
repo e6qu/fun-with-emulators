@@ -362,6 +362,8 @@ pub fn forked() {
     with_own(Pending::clear);
     crate::acct::forked_child();
     crate::aio::forget_all();
+    // A restricted process's child is in its domain: it says so.
+    crate::landlock::publish();
     // A new process starts with no robust list, as Linux's does.
     ROBUST_LIST.with(|c| c.set((0, 0)));
 }
@@ -428,7 +430,7 @@ fn shared_tid() -> Option<i32> {
         if fd < 0 {
             return None;
         }
-        libc::flock(fd, libc::LOCK_EX);
+        crate::shared::lock_exclusive(fd);
         let mut b = [0u8; 4];
         let n = match libc::pread(fd, b.as_mut_ptr().cast(), 4, 0) {
             4 => i32::from_ne_bytes(b),

@@ -686,7 +686,9 @@ shapes differently:
   `maps`, `smaps`, `auxv` (the vector the program started with),
   `personality`, `oom_score`, `oom_adj`, `oom_score_adj`, `fd`, `fdinfo`,
   `ns`, `task/<tid>/{stat,status,comm}`. A process's state in `stat` is its
-  main thread's: `S` while it waits in a system call.
+  main thread's: `S` while it waits in a system call, never while it waits
+  for one of fwe's own locks (it stays runnable, as a Linux task waiting
+  on a kernel lock is not asleep).
 - `/proc` globals: `cpuinfo`, `meminfo`, `stat` (host CPU times and boot
   time), `uptime`, `loadavg`, `cmdline`, `filesystems`, `partitions`,
   `config.gz` (the options of what fwe implements), `keys`, `key-users`,
@@ -963,8 +965,17 @@ Calls that fit none of the areas above:
   `siginfo`.
 - `acct` (`crates/kernel/src/acct.rs`): the accounting file's host path
   is kept in a file of fwe's for the pid namespace, and each ending
-  process looks for it and appends its `struct acct_v3`: times, memory and
-  faults from its usage, `AFORK` for a fork child that ran no program.
+  process appends its `struct acct_v3` to the nearest namespace's, its
+  own or one above, with accounting on: times, memory and faults from its
+  usage, `AFORK` for a fork child that ran no program.
+- `process_vm_readv`/`process_vm_writev` (`crates/kernel/src/procvm.rs`):
+  the caller writes the ranges (and data to write) to a request file and
+  asks the other process through its mailbox; its wake handler copies
+  with `mach_vm_read_overwrite` and `mach_vm_write` on its own task,
+  which return an error for an address with nothing behind it, and
+  wakes the caller on a reply socket. In the VM it translates guest
+  addresses without waiting on the translation table (a request made
+  while the table changes is made again).
 - `cachestat` counts a file's resident pages with `mincore` of a mapping
   of the range; `ioprio_set` checks and keeps the caller's I/O priority,
   which nothing applies.
@@ -972,8 +983,21 @@ Calls that fit none of the areas above:
   followed with what is known of each register, and a map access at a
   known offset outside the value is refused, as Linux's verifier refuses
   it; one at an offset only the run knows is checked by the interpreter.
-- The LSM calls report Linux's capabilities as the one security module
-  (`/sys/kernel/security/lsm`), which keeps no attributes of a process.
+- The LSM calls report Linux's capabilities and Landlock as the security
+  modules (`/sys/kernel/security/lsm`), neither keeping attributes of a
+  process.
+- Landlock (`crates/kernel/src/landlock.rs`, checked by
+  `landlockops.rs`): a ruleset is the process's, kept against its
+  descriptor; `landlock_restrict_self` adds it to the process's domain as
+  a layer, which `fork` and `execve` carry. While a domain is in force
+  each call it restricts is checked before it runs: a file access is
+  granted by a rule on the file or on a directory above it, matched by
+  host identity up the file's host path (`EACCES`); a move between
+  directories needs `REFER` in both (`EXDEV`); `ftruncate` is decided as
+  the file is opened; TCP `bind` and `connect` need a rule for the port;
+  a signal or a connection to an abstract socket leaving a scoping
+  layer's domain is `EPERM`, each layer having an id and a restricted
+  process publishing its chain of them beside the process records.
 - `sysinfo` reports the host's uptime and load with the fixed memory
   figures of `/proc/meminfo`; `vm.drop_caches` accepts Linux's values and
   drops nothing.
@@ -1033,6 +1057,14 @@ which are to be lifted for 1.0 and which are not planned.
   held as they were (their next locker waits rather than getting
   `EOWNERDEAD`) and writes no accounting record; a VM process takes a
   `SIGKILL` from fwe as its own ending, with both.
+- `process_vm_readv`/`process_vm_writev` of a process that is stopped
+  waits until it runs again (its handler serves the request), and one of
+  a process fwe did not start fails with `ESRCH`; in the VM, a write to
+  guest memory the guest maps read-only succeeds.
+- A Landlock domain is the process's, not the thread's that made it (the
+  process's other threads are restricted with it), and its file rules
+  follow a file's host path, so a bind mount's files are under the rules
+  of the directory they are bound from.
 - An I/O priority set for another process (`ioprio_set`) is checked and
   accepted but not kept: `ioprio_get` reports that process's as (none,
   0).
@@ -1159,6 +1191,9 @@ which are to be lifted for 1.0 and which are not planned.
   its ports nobody bound by number goes to the host loopback port of that
   number; a port is freed when the last descriptor of its socket in the
   binding process closes; the initial namespace's sysctls cannot change.
+- A port below 1024 bound on a loopback address of the initial namespace,
+  when fwe is not root, is reached by its number only from fwe's
+  processes: the host keeps it for root, so it is an ephemeral port there.
 - Capabilities are the process's, not qualified by user namespace; the
   owning user namespace `NS_GET_USERNS` reports for a non-user namespace
   is the caller's.

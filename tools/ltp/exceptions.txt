@@ -333,3 +333,12 @@ sysinfo03 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_
 timerfd04 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
 ustat01 arm64 has no ustat system call
 ustat02 arm64 has no ustat system call
+userfaultfd01 not planned (ROADMAP.md): userfaultfd
+userfaultfd02 not planned (ROADMAP.md): userfaultfd
+userfaultfd03 not planned (ROADMAP.md): userfaultfd
+userfaultfd04 not planned (ROADMAP.md): userfaultfd
+userfaultfd05 not planned (ROADMAP.md): userfaultfd
+userfaultfd06 not planned (ROADMAP.md): userfaultfd
+userfaultfd07 not planned (ROADMAP.md): userfaultfd
+mremap07 not planned (ROADMAP.md): userfaultfd, which its MREMAP_DONTUNMAP case uses
+dirtyc0w_shmem not planned (ROADMAP.md): userfaultfd, which it races a write with

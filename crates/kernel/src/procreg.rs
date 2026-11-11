@@ -298,7 +298,7 @@ fn lock(pid: i32) -> Option<std::fs::File> {
         .ok()?;
     use std::os::fd::AsRawFd;
     // SAFETY: plain host call on the file just opened; the lock goes with it.
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    crate::shared::lock_exclusive(f.as_raw_fd());
     Some(f)
 }
 
@@ -641,10 +641,16 @@ pub fn forked(
     let mine = read(me());
     let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
     let cgroup = cgroup.map_or_else(own_cgroup, <[u8]>::to_vec);
-    // Kept what the child has already written of itself (its program).
+    // Kept what the child has already written of itself (its program,
+    // and its namespaces and cgroup, which it may have changed since).
     let _ = change(child, |r| {
-        r.cgroup = cgroup;
-        r.ns = ns;
+        let child_wrote = !r.lineage.is_empty();
+        if !child_wrote || r.cgroup.is_empty() {
+            r.cgroup = cgroup;
+        }
+        if !child_wrote {
+            r.ns = ns;
+        }
         if r.exe.is_empty() {
             (r.comm, r.cmdline, r.exe) = (comm, cmdline, exe);
         }
@@ -801,13 +807,21 @@ pub fn load_line(d: &mut Dec) -> (Vec<Proc>, Option<Proc>) {
 }
 
 /// This process (just forked) has the line of ancestors and bound `line`,
-/// what it inherited of its parent's record (`inherit`), and the mappings
-/// `maps` it inherited (see [`crate::maps::forked`]): written by the child
-/// first, so it reads its own from the start.
-pub fn own_line(line: &(Vec<Proc>, Option<Proc>), inherit: &Inherit, maps: Vec<u8>) {
+/// what it inherited of its parent's record (`inherit`), the namespaces
+/// `ns` it starts in, and the mappings `maps` it inherited (see
+/// [`crate::maps::forked`]): written by the child first, so it reads its
+/// own from the start, and the parent's later write ([`forked`]) keeps
+/// what it changed since (a namespace it unshared, say).
+pub fn own_line(
+    line: &(Vec<Proc>, Option<Proc>),
+    inherit: &Inherit,
+    ns: Vec<Vec<u8>>,
+    maps: Vec<u8>,
+) {
     let _ = change(me(), |r| {
         if r.lineage.is_empty() {
             apply(r, inherit);
+            r.ns = ns;
         }
         (r.lineage, r.bound) = line.clone();
         r.maps = maps;
@@ -1066,6 +1080,21 @@ pub fn all_ended() -> Vec<Ended> {
 /// Take the record of how `e` ended: whoever removes it reaps the process.
 pub fn take_ended(e: &Ended) -> bool {
     ended_path(e.pid, e.start).is_some_and(|p| std::fs::remove_file(OsStr::from_bytes(&p)).is_ok())
+}
+
+/// Reap ended process `e`, adopted: take the account of how it ended, and
+/// its record with it, under the record's lock, so that no one finding it
+/// gone ([`gone`]) takes it for one killed outright and records a second
+/// end. Whoever takes the account reaps the process.
+pub fn take_adopted_end(e: &Ended) -> bool {
+    let _lock = lock(e.pid);
+    if !take_ended(e) {
+        return false;
+    }
+    if read_any(e.pid).is_some_and(|r| r.start == e.start) && !alive((e.pid, e.start)) {
+        remove(e.pid);
+    }
+    true
 }
 
 /// Child `pid` was reaped by its parent: forget it, and how it ended.

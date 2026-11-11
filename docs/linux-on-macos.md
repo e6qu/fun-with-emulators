@@ -402,8 +402,7 @@ from fwe's mechanisms:
   limits, which under fwe are fixed figures and unenforced limits
   ([Memory pressure](#memory-pressure), [cgroups](#cgroups)).
 - **Tools:** attach mechanisms that use `ptrace` work between fwe
-  processes ([ptrace](#ptrace)); `process_vm_readv`/`writev` fail with
-  `ENOSYS` ([Not available](#not-available)).
+  processes ([ptrace](#ptrace)), and so do `process_vm_readv`/`writev`.
 
 ### Wine
 
@@ -443,11 +442,10 @@ fwe's mechanisms, from how Wine is generally built:
   an alternate stack to emulate Windows exceptions; fwe delivers faults to
   guest handlers with Linux frames and honours `sigaltstack`; in the VM a
   misaligned pc or sp is `SIGBUS` and a `brk` is `SIGTRAP`.
-- **Other processes' memory:** `ptrace` works between fwe processes, but
-  `process_vm_readv`/`writev` fail with `ENOSYS` and `/proc/<pid>/mem` is
-  the caller's own memory only, so whatever Wine does with them for
-  another process would fail. Whether that blocks ordinary programs is
-  unknown.
+- **Other processes' memory:** `ptrace` and `process_vm_readv`/`writev`
+  work between fwe processes, but `/proc/<pid>/mem` is the caller's own
+  memory only, so what Wine does through it for another process would
+  fail. Whether that blocks ordinary programs is unknown.
 
 ## Which instructions get translated, and how
 
@@ -929,6 +927,7 @@ and the per-call differences are in [Address-space layout](#address-space-layout
 | `madvise` | Advice and each mapping checked as Linux checks them; `MADV_DONTNEED` zero-fills private anonymous memory; `MADV_HWPOISON`/`SOFT_OFFLINE` need `CAP_SYS_ADMIN`. | native: `mmap` (fresh pages), `madvise`, `mprotect`; VM: slab edit |
 | `msync` | Flags and alignment checked; each mapping in the range synced, a hole `ENOMEM` after the rest; `MS_INVALIDATE` of locked memory `EBUSY`. | `msync` (VM: of shared segments) |
 | `mincore` | One byte per guest page, from the host's residency. | `mincore` |
+| `process_vm_readv`, `process_vm_writev` | Permission as for ptrace; the caller's own memory copied directly; another fwe process's copied by that process in its wake handler, from a request file of fwe's, with the host's copies of its own task (an address with nothing behind it is an error, not a fault); a fault partway returns the bytes copied | `mach_vm_read_overwrite`, `mach_vm_write` (in the target), `pread`/`pwrite` |
 | `pkey_alloc`, `pkey_free`, `pkey_mprotect` | As on a CPU without protection keys (arm64's need `FEAT_S1POE`): none to allocate (`ENOSPC`), none to free; `pkey_mprotect` with key -1 is `mprotect`. | `mprotect` |
 | `mlock`, `mlock2`, `munlock`, `mlockall`, `munlockall` | Range and `RLIMIT_MEMLOCK` checked, pages read in (not with `MLOCK_ONFAULT`), marked locked; nothing wired. | none |
 | `mseal` | The mappings marked sealed in fwe's record; later changes to them fail with `EPERM`. | none |
@@ -991,7 +990,7 @@ and `futex_waitv` run without the kernel lock.
 | `getrusage`, `times` | The host's usage; `RUSAGE_THREAD` reports the process's; `times` in 100 Hz ticks since boot. | `getrusage` |
 | `pidfd_open`, `pidfd_getfd` | A process descriptor is a kqueue watching the process's exit; `pidfd_getfd` asks the target for the descriptor through its signal mailbox. | `kqueue`/`kevent`, `sendmsg`/`recvmsg` |
 | `personality` | Kept per process; `PER_LINUX32` fails with `EINVAL`. | none |
-| `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); each process of the pid namespace appends its `struct acct_v3` as it ends | `open`, `write` |
+| `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); an ending process appends its `struct acct_v3` to the nearest pid namespace's, its own or one above, with accounting on | `open`, `write` |
 
 **`clone` of a thread**: the new thread starts with its creator's
 registers, `x0` = 0, the given stack, the creator's signal mask, and
@@ -1266,8 +1265,8 @@ can block run without the kernel lock (`blocking_call` in
 |---|---|---|
 | `socket`, `socketpair` | family, type and protocol checked; `SOCK_NONBLOCK`/`SOCK_CLOEXEC` applied after; every socket `SO_NOSIGPIPE`; a Unix socket gets Linux's 212,992-byte buffers; `SOCK_SEQPACKET` Unix sockets are framed streams; `socketpair` of a non-Unix family is `EOPNOTSUPP` | `socket`, `socketpair`, `fcntl`, `setsockopt` |
 | `socket(AF_NETLINK)` and calls on it | `NETLINK_ROUTE` only, `SOCK_RAW` or `SOCK_DGRAM`; fwe answers each request; `bind`, `connect`, `getsockname`, `getpeername` and `SOL_NETLINK` options are fwe's | `socketpair(AF_UNIX, SOCK_DGRAM)`, `send`, `recv` |
-| `bind`, `connect` | address checked against the socket's family and translated; a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`); ports mapped in an fwe network namespace; a bound Unix node gets the socket's mode less the umask, and the guest's owner; `connect` to `AF_UNSPEC` disconnects | `bind`, `connect` (from the path's directory with `pthread_fchdir_np` for a long path), `fchmodat` |
-| `listen` | passed through | `listen` |
+| `bind`, `connect` | address checked against the socket's family and translated; a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`); ports mapped in an fwe network namespace, and in the host's a port below 1024 on a loopback address (macOS keeps one for root, but on the wildcard address) mapped to an ephemeral one that fwe's processes reach and see by its number; a bound Unix node gets the socket's mode less the umask, and the guest's owner; `connect` to `AF_UNSPEC` disconnects | `bind`, `connect` (from the path's directory with `pthread_fchdir_np` for a long path), `fchmodat` |
+| `listen` | the host given one more than the backlog, as Linux queues one connection past it (a negative backlog or one past `somaxconn` taken as 4096) | `listen` |
 | `accept`, `accept4` | peer address translated back; flags applied; a `SOCK_SEQPACKET` listener's connection marked as one; past `RLIMIT_NOFILE` closed, `EMFILE` | `accept`, `fcntl`, `setsockopt` |
 | `getsockname`, `getpeername` | host address translated back; a Unix path is reported as the guest gave it; namespace ports mapped back; `IPV6_ADDRFORM` view applied | `getsockname`, `getpeername` |
 | `sendto`, `sendmsg`, `recvfrom`, `recvmsg` | flags mapped; addresses translated; `SCM_RIGHTS` re-encoded; `MSG_MORE` held back on TCP and UDP; `MSG_ERRQUEUE` on an IP socket `EAGAIN`; a peer's eBPF socket filter applied on send; `SIGPIPE` raised by fwe unless `MSG_NOSIGNAL` | `sendmsg`, `recv`, `recvfrom`, `recvmsg` |
@@ -1428,7 +1427,7 @@ otherwise.
 | `reboot` | `CAP_SYS_BOOT` and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
 | `vhangup` | `CAP_SYS_TTY_CONFIG`, then nothing | none |
 | `delete_module` | `CAP_SYS_MODULE`, the name read, then `ENOENT`: no module is loaded | none |
-| `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities are the one module (`LSM_ID_CAPABILITY`, `/sys/kernel/security/lsm` reads `capability`); it keeps no attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
+| `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities and Landlock are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`; `/sys/kernel/security/lsm` reads `capability,landlock`); neither keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
 
 **`uname`**: the release is fixed (`RELEASE` in
 `crates/kernel/src/syscalls.rs`), with `UNAME26` replacing its version
@@ -1452,6 +1451,7 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 |---|---|---|
 | `ptrace` | `TRACEME`, `ATTACH`, `SEIZE`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `mmap` of a shared page, `__ulock_wait2`/`__ulock_wake`, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
+| `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path, TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); the domain is the process's, carried by `fork` and `execve` | none |
 | `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
 
 **`ptrace`**: each traced thread has a mailbox, a page in fwe's private
@@ -2264,10 +2264,10 @@ numbers mean nothing there. fwe keeps its own:
 Any call not dispatched in `crates/kernel/src/syscalls.rs` fails with
 `ENOSYS`, noted under `--strace`. These are:
 
-- `process_vm_readv`/`process_vm_writev`, `kcmp`;
+- `kcmp`;
 - `io_uring_setup` and the rest;
 - `userfaultfd`, `perf_event_open`, `fanotify_init`/`fanotify_mark`;
-- the `landlock_*` calls, `rseq`;
+- `rseq`;
 - the `futex_wait`, `futex_wake` and `futex_requeue` calls (`futex` and
   `futex_waitv` work);
 - the `*xattrat` calls, `open_tree_attr`, `listns`;
@@ -2634,7 +2634,9 @@ itself:
 ### Network events
 
 Guest sockets are host sockets: connections, data and the ports of the
-initial network namespace are the host's. What arrives does so as
+initial network namespace are the host's (but for a port below 1024 on a
+loopback address, which only fwe's processes reach by its number when fwe
+is not root). What arrives does so as
 `kqueue` events, which fwe turns into `epoll` events with Linux's meaning
 for each kind of descriptor:
 

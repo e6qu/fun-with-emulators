@@ -123,6 +123,19 @@ fn run(addr: u64) -> (u64, u64) {
     }
 }
 
+/// [`run`] without waiting for the table: `None` while it is being
+/// changed. For a signal handler, which must not wait on a lock its own
+/// thread may hold.
+pub fn try_run(addr: u64) -> Option<(u64, u64)> {
+    let t = TABLE.try_read().ok()?;
+    let i = t.partition_point(|x| x.hi <= addr);
+    Some(match t.get(i) {
+        Some(x) if x.lo <= addr => (x.host + (addr - x.lo), x.hi - addr),
+        Some(x) => (addr, x.lo - addr),
+        None => (addr, u64::MAX),
+    })
+}
+
 /// The host address of guest address `addr` (itself, outside every
 /// translated range).
 pub fn g2h(addr: u64) -> u64 {
@@ -229,6 +242,8 @@ mod imp {
         "    ret",
         ".globl _fwe_uaccess_cas32",
         "_fwe_uaccess_cas32:",
+        // (Every Apple Silicon core has the atomics of ARMv8.1, LSE.)
+        "    .arch_extension lse",
         "    casal w1, w2, [x0]",
         "    str w1, [x3]",
         "    mov x0, #0",

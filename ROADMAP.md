@@ -13,7 +13,7 @@ in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests pass at 1190 of the 1198 that apply (1551 run) |
+| M4 Compatibility | In progress: LTP's system-call tests: all 1213 that apply pass (1551 run) |
 | M5 Release | Not started |
 
 What runs unmodified, with its output checked in CI:
@@ -59,7 +59,8 @@ against a baseline. Beyond M3:
   timers; ptrace of processes and threads (see below); robust futexes
   released as their owner ends, and `get_robust_list` of any thread;
   zombies in `/proc`; real-time signals queued; process accounting
-  (`acct`); I/O priorities.
+  (`acct`); I/O priorities; `process_vm_readv` and `process_vm_writev`;
+  Landlock.
 - **Memory:** `mremap`, `madvise` and `msync` as Linux has them; the `mlock`
   family with accounting; `mincore`; `mseal`; `remap_file_pages`;
   `/proc/<pid>/maps`, `smaps` with `PROCMAP_QUERY`, `/proc/self/mem` and
@@ -104,12 +105,12 @@ hardware.
   attached to (stops, registers, memory, breakpoints, single-stepping,
   fork, clone and exit events, the thread pointer); left is `strace` and
   `gdb` themselves tracing and debugging a guest program.
-- [ ] **The last LTP failures and skips:** `fork14`, `prctl09` and
-  `select02` pass alone but not always under a full run's load; and the
-  calls the remaining skips need: landlock, `process_vm_readv` and
-  `process_vm_writev`, and userfaultfd (with `mremap`'s
-  `MREMAP_DONTUNMAP` of one). The runner names every skip that is not an
-  exception.
+- [x] **Every LTP test that applies passes:** the rest are exceptions,
+  each with its reason; the runner names any skip that is not one. The
+  tests that measure time or load the host run one at a time, after the
+  rest; one that sleeps too long is measured against the host's own timers,
+  and is not failed when they, with fwe's least cost per sleep, are as
+  late, or were in that run.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries without section headers, when a program needs them.
 - [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
@@ -185,6 +186,10 @@ programs that probe for them fall back.
 - **The page cache's figures** (`/proc/meminfo`'s `Cached`,
   `/proc/<pid>/io`): the host's cache does not report them per process.
 - **perf events:** `perf_event_open` fails with `ENOSYS`.
+- **userfaultfd:** a page fault handed to another thread to resolve would
+  have fwe block the faulting thread in its signal handler, natively and
+  in the VM; few programs use it (CRIU, QEMU's post-copy migration).
+  `userfaultfd` fails with `ENOSYS`, and there is no `/dev/userfaultfd`.
 - **Setting the initial UTS namespace's names:** they are the Mac's; a new
   UTS namespace's are the guest's to set.
 - **CPU affinity:** macOS has none; `sched_setaffinity` is accepted and pins

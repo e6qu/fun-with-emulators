@@ -177,8 +177,10 @@ fn main() {
     wait(c);
     ptrace(PTRACE_SETOPTIONS, c, 0, (PTRACE_O_TRACEFORK | PTRACE_O_TRACEEXIT) as u64);
     ptrace(PTRACE_CONT, c, 0, 0);
-    let (mut forks, mut new_stopped, mut exit_events, mut exits, mut live) = (0, 0, 0, 0, 1);
-    while live > 0 {
+    // (The new child's first stop may come before its parent's event, as
+    // on Linux; the child ends last, having waited for it.)
+    let (mut forks, mut new_stopped, mut exit_events, mut exits) = (0, 0, 0, 0);
+    loop {
         let mut st = 0;
         // SAFETY: a valid out-parameter.
         let w = unsafe { waitpid(-1, &mut st, WALL) };
@@ -187,7 +189,9 @@ fn main() {
         }
         if st & 0x7f == 0 {
             exits += 1;
-            live -= 1;
+            if w == c {
+                break;
+            }
             continue;
         }
         match st >> 16 {
@@ -195,7 +199,6 @@ fn main() {
                 let mut msg = 0u64;
                 ptrace(PTRACE_GETEVENTMSG, w, 0, &mut msg as *mut u64 as u64);
                 forks += i32::from(msg > 0);
-                live += 1;
             }
             PTRACE_EVENT_EXIT => exit_events += 1,
             _ if w != c && stopsig(st) == SIGSTOP => new_stopped += 1,
@@ -212,8 +215,9 @@ fn main() {
     wait(c);
     ptrace(PTRACE_SETOPTIONS, c, 0, PTRACE_O_TRACECLONE as u64);
     ptrace(PTRACE_CONT, c, 0, 0);
+    // (The new thread's first stop may come before its creator's event,
+    // as on Linux: any stop or end but the process's is the thread's.)
     let (mut clones, mut thread_stopped, mut thread_ends, mut code) = (0, 0, 0, -1);
-    let mut new = 0;
     loop {
         let mut st = 0;
         // SAFETY: a valid out-parameter.
@@ -226,16 +230,15 @@ fn main() {
                 code = exit_code(st);
                 break;
             }
-            thread_ends += i32::from(w == new);
+            thread_ends += 1;
             continue;
         }
         if st >> 16 == PTRACE_EVENT_CLONE {
             let mut msg = 0u64;
             ptrace(PTRACE_GETEVENTMSG, w, 0, &mut msg as *mut u64 as u64);
-            new = msg as c_int;
-            clones += 1;
+            clones += i32::from(msg > 0);
         } else if w != c && stopsig(st) == SIGSTOP {
-            thread_stopped += i32::from(w == new);
+            thread_stopped += 1;
         }
         ptrace(PTRACE_CONT, w, 0, 0);
     }

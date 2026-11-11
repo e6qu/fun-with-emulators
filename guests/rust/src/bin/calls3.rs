@@ -4,7 +4,11 @@
 //! signal, each carrying its descriptor); real-time signals queued, each
 //! with its value; `file_setattr` and `file_getattr`; the security modules
 //! listed; `sync` and `syncfs`; a trailing slash on a file; and a message
-//! queue's id chosen by `kernel.msg_next_id`. It prints what it observed.
+//! queue's id chosen by `kernel.msg_next_id`; and a child's memory read
+//! and written by its parent (`process_vm_readv`, `process_vm_writev`);
+//! and a Landlock domain that lets a child read under one directory only;
+//! and a port below 1024 on loopback addresses, bound as root. It prints
+//! what it observed.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
@@ -17,12 +21,21 @@ const SYS_IO_SUBMIT: i64 = 2;
 const SYS_IO_GETEVENTS: i64 = 4;
 const SYS_SYNC: i64 = 81;
 const SYS_ACCT: i64 = 89;
+const SYS_UNSHARE: i64 = 97;
+const CLONE_NEWPID: i64 = 0x2000_0000;
 const SYS_SYNCFS: i64 = 267;
 const SYS_LSM_LIST_MODULES: i64 = 461;
 const SYS_FILE_GETATTR: i64 = 468;
 const SYS_FILE_SETATTR: i64 = 469;
 const SYS_RT_SIGQUEUEINFO: i64 = 138;
 const SYS_EVENTFD2: i64 = 19;
+const SYS_PROCESS_VM_READV: i64 = 270;
+const SYS_PROCESS_VM_WRITEV: i64 = 271;
+const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+const SYS_LANDLOCK_ADD_RULE: i64 = 445;
+const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+const SYS_PRCTL: i64 = 167;
+const O_PATH: i32 = 0o10000000;
 
 const O_RDONLY: i32 = 0;
 const O_RDWR: i32 = 2;
@@ -122,6 +135,9 @@ fn c(s: &str) -> CString {
     CString::new(s).unwrap()
 }
 
+/// A word a child sets, which its parent reads and writes.
+static WORD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The descriptors dnotify's signal was taken with, in order.
 static SEEN: [AtomicI32; 4] = [const { AtomicI32::new(-1) }; 4];
 static SEEN_N: AtomicUsize = AtomicUsize::new(0);
@@ -189,27 +205,39 @@ fn main() {
             close(fd);
         }
 
-        // Process accounting: a child's record, its name and exit code.
-        let file = format!("{dir}/acct");
-        close(open(c(&file).as_ptr(), O_RDWR | O_CREAT, 0o600));
-        let on = syscall(SYS_ACCT, c(&file).as_ptr());
-        let child = fork();
-        if child == 0 {
-            _exit(3);
+        // Process accounting: a child's record, its name and exit code, in
+        // a pid namespace of its own (accounting is a namespace's).
+        let helper = fork();
+        if helper == 0 {
+            syscall(SYS_UNSHARE, CLONE_NEWPID);
+            let init = fork();
+            if init == 0 {
+                let file = format!("{dir}/acct");
+                close(open(c(&file).as_ptr(), O_RDWR | O_CREAT, 0o600));
+                let on = syscall(SYS_ACCT, c(&file).as_ptr());
+                let child = fork();
+                if child == 0 {
+                    _exit(3);
+                }
+                waitpid(child, &mut 0, 0);
+                let off = syscall(SYS_ACCT, 0i64);
+                let rec = std::fs::read(&file).unwrap_or_default();
+                let found = rec.chunks_exact(64).find(|r| {
+                    u32::from_le_bytes(r[16..20].try_into().unwrap()) == child as u32
+                });
+                let (version, exit, forked) = found.map_or((0, 0, false), |r| {
+                    (r[1], u32::from_le_bytes(r[4..8].try_into().unwrap()), r[0] & 1 != 0)
+                });
+                println!(
+                    "acct: on {on}, off {off}, record {}, version {version}, exit status {exit:#x}, forked {forked}",
+                    found.is_some()
+                );
+                _exit(0);
+            }
+            waitpid(init, &mut 0, 0);
+            _exit(0);
         }
-        waitpid(child, &mut 0, 0);
-        let off = syscall(SYS_ACCT, 0i64);
-        let rec = std::fs::read(&file).unwrap_or_default();
-        let found = rec.chunks_exact(64).find(|r| {
-            u32::from_le_bytes(r[16..20].try_into().unwrap()) == child as u32
-        });
-        let (version, exit, forked) = found.map_or((0, 0, false), |r| {
-            (r[1], u32::from_le_bytes(r[4..8].try_into().unwrap()), r[0] & 1 != 0)
-        });
-        println!(
-            "acct: on {on}, off {off}, record {}, version {version}, exit status {exit:#x}, forked {forked}",
-            found.is_some()
-        );
+        waitpid(helper, &mut 0, 0);
 
         // dnotify: a directory and one in it both watched, one signal.
         let sig = 35;
@@ -271,7 +299,7 @@ fn main() {
         let mut ids = [0u64; 4];
         let mut size = 32u32;
         let n = syscall(SYS_LSM_LIST_MODULES, ids.as_mut_ptr(), &mut size as *mut u32, 0i64);
-        println!("lsm: {n} module, id {}, size {size}", ids[0]);
+        println!("lsm: {n} modules, ids {} {}, size {size}", ids[0], ids[1]);
 
         // sync and syncfs; a file named with a trailing slash.
         let d = open(c(&dir).as_ptr(), O_RDONLY);
@@ -293,6 +321,117 @@ fn main() {
         let next = std::fs::read_to_string("/proc/sys/kernel/msg_next_id").unwrap_or_default();
         println!("msg_next_id: id {}, then {}", q == 4242, next.trim());
         msgctl(q, IPC_RMID, std::ptr::null_mut());
+
+        // A child's memory, read and written by its parent.
+        let (mut up, mut down) = ([0i32; 2], [0i32; 2]);
+        pipe(up.as_mut_ptr());
+        pipe(down.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            WORD.store(0x1234, Ordering::SeqCst);
+            write(up[1], b"x".as_ptr(), 1);
+            let mut b = 0u8;
+            read(down[0], &mut b, 1);
+            _exit((WORD.load(Ordering::SeqCst) & 0xff) as i32);
+        }
+        let mut b = 0u8;
+        read(up[0], &mut b, 1);
+        let at = WORD.as_ptr() as u64;
+        let mut got = 0u64;
+        let local = [(&mut got as *mut u64 as u64), 8u64];
+        let remote = [at, 8u64];
+        let read_n = syscall(SYS_PROCESS_VM_READV, i64::from(child), local.as_ptr(), 1i64, remote.as_ptr(), 1i64, 0i64);
+        let new = 0x99u64;
+        let local = [(&new as *const u64 as u64), 8u64];
+        let wrote_n = syscall(SYS_PROCESS_VM_WRITEV, i64::from(child), local.as_ptr(), 1i64, remote.as_ptr(), 1i64, 0i64);
+        write(down[1], b"x".as_ptr(), 1);
+        let mut st = 0;
+        waitpid(child, &mut st, 0);
+        println!(
+            "process_vm: read {read_n} bytes {got:#x}, wrote {wrote_n}, child saw {:#x}",
+            (st >> 8) & 0xff
+        );
+
+        // Landlock: reading allowed under one directory only, in a child.
+        let inside = format!("{dir}/inside");
+        mkdir(c(&inside).as_ptr(), 0o700);
+        std::fs::write(format!("{inside}/file"), b"in").unwrap();
+        std::fs::write(format!("{dir}/outside"), b"out").unwrap();
+        let abi = syscall(SYS_LANDLOCK_CREATE_RULESET, 0i64, 0i64, 1i64);
+        let child = fork();
+        if child == 0 {
+            const READ_FILE: u64 = 1 << 2;
+            let attr = [READ_FILE];
+            let rs = syscall(SYS_LANDLOCK_CREATE_RULESET, attr.as_ptr(), 8i64, 0i64);
+            let parent = open(c(&inside).as_ptr(), O_PATH);
+            let rule: [u8; 12] = {
+                let mut r = [0u8; 12];
+                r[..8].copy_from_slice(&READ_FILE.to_ne_bytes());
+                r[8..].copy_from_slice(&parent.to_ne_bytes());
+                r
+            };
+            syscall(SYS_LANDLOCK_ADD_RULE, rs, 1i64, rule.as_ptr(), 0i64);
+            syscall(SYS_PRCTL, 38i64, 1i64, 0i64, 0i64, 0i64);
+            let restricted = syscall(SYS_LANDLOCK_RESTRICT_SELF, rs, 0i64) == 0;
+            let ok = open(c(&format!("{inside}/file")).as_ptr(), O_RDONLY) >= 0;
+            let denied = open(c(&format!("{dir}/outside")).as_ptr(), O_RDONLY) < 0 && errno() == 13;
+            _exit(i32::from(restricted) | i32::from(ok) << 1 | i32::from(denied) << 2);
+        }
+        let mut st = 0;
+        waitpid(child, &mut st, 0);
+        let bits = (st >> 8) & 0xff;
+        println!(
+            "landlock: abi {abi}, restricted {}, inside read {}, outside EACCES {}",
+            bits & 1 != 0,
+            bits & 2 != 0,
+            bits & 4 != 0
+        );
     }
+    low_port();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A port below 1024 on loopback addresses, which the host keeps for root:
+/// bound by this (root) process, named by its number, and reached by it
+/// from a child, over IPv4 and IPv6 at once; bound again once closed.
+fn low_port() {
+    use std::net::{TcpListener, TcpStream};
+    // One of its own, beside other runs of this guest.
+    // SAFETY: getpid cannot fail.
+    let port = 200 + (unsafe { getpid() } % 700) as u16;
+    let (v4, v6) = match (TcpListener::bind(("127.0.0.1", port)), TcpListener::bind(("::1", port))) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            println!("low port: bind {:?} {:?}", a.err(), b.err());
+            return;
+        }
+    };
+    let named = v4.local_addr().map(|a| a.port()).ok() == Some(port)
+        && v6.local_addr().map(|a| a.port()).ok() == Some(port);
+    // SAFETY: a plain fork; the child only connects and exits.
+    let child = unsafe { fork() };
+    if child == 0 {
+        let reach = |host: &str| {
+            TcpStream::connect((host, port))
+                .is_ok_and(|s| s.peer_addr().map(|a| a.port()).ok() == Some(port))
+        };
+        let bits = i32::from(reach("127.0.0.1")) | i32::from(reach("::1")) << 1;
+        // SAFETY: ends the child.
+        unsafe { _exit(bits) };
+    }
+    let mut st = 0;
+    // SAFETY: the child just forked.
+    unsafe { waitpid(child, &mut st, 0) };
+    let bits = (st >> 8) & 0xff;
+    // The child's connections, queued.
+    let accepted = [&v4, &v6]
+        .iter()
+        .all(|l| l.set_nonblocking(true).is_ok() && l.accept().is_ok());
+    drop((v4, v6));
+    let again = TcpListener::bind(("127.0.0.1", port)).is_ok();
+    println!(
+        "low port: named {named}, reached {} {}, accepted {accepted}, bound again {again}",
+        bits & 1 != 0,
+        bits & 2 != 0
+    );
 }

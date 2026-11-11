@@ -3032,14 +3032,18 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     dnotify: 2 signals, parent's true, inner's true\n\
     real-time queue: [1, 2, 3]\n\
     file attributes: set 0, get 0, no-dump true\n\
-    lsm: 1 module, id 100, size 8\n\
+    lsm: 2 modules, ids 100 110, size 16\n\
     sync: 0, syncfs 0, file/ ENOTDIR\n\
-    msg_next_id: id true, then -1\n";
+    msg_next_id: id true, then -1\n\
+    process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n\
+    landlock: abi 6, restricted true, inside read true, outside EACCES true\n\
+    low port: named true, reached true true, accepted true, bound again true\n";
 
 /// More calls: native AIO (a poll that waits, an eventfd signalled),
 /// process accounting, dnotify, queued real-time signals, file attributes,
-/// the security modules, `sync`, a trailing slash on a file and
-/// `kernel.msg_next_id`.
+/// the security modules, `sync`, a trailing slash on a file,
+/// `kernel.msg_next_id`, `process_vm_readv`/`writev`, Landlock, and a
+/// port below 1024 on loopback addresses, which the host keeps for root.
 #[test]
 fn more_calls() {
     let out = fwe(&rust_guest("calls3"), &[]);
@@ -3108,6 +3112,7 @@ const LOOPDEV: &str = "free: true\n\
     remove attached: true\n\
     detach: 0\n\
     detached: again true, status true, size 0\n\
+    run down: held true, closed true\n\
     added: true, shown true\n\
     removed: 0, gone true\n\
     control read: true\n";
@@ -3115,8 +3120,9 @@ const LOOPDEV: &str = "free: true\n\
 /// A loop device set up and used as a program does: a free one from
 /// `/dev/loop-control`, a file attached and read, written and mapped
 /// through it from an offset within a size limit, its position shared
-/// with a fork child, `/sys/block` showing it, then detached; and a device
-/// added and removed.
+/// with a fork child, `/sys/block` showing it, then detached (run down,
+/// so another process cannot attach it, until closed); and a device added
+/// and removed.
 #[test]
 fn loop_devices_show_a_file() {
     let out = fwe(&rust_guest("loopdev"), &[]);
