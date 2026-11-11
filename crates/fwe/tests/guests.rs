@@ -126,6 +126,17 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
         }
         if start.elapsed() > limit {
             timed_out = true;
+            // What is left of the guest's processes, and what each waits in.
+            if let Ok(ps) = Command::new("ps")
+                .args(["-o", "pid,ppid,stat,wchan,command", "-g"])
+                .arg(child.id().to_string())
+                .output()
+            {
+                eprintln!(
+                    "--- the guest's processes at the timeout:\n{}",
+                    String::from_utf8_lossy(&ps.stdout)
+                );
+            }
             if vm {
                 let pgid = child.id() as i32;
                 // SAFETY: SIGTERM to the guest's own process group; VM
@@ -1582,6 +1593,10 @@ fn alpine_podman_runs_an_image() {
         // A `run` ends with its container's status; one killed hung.
         if !out.status.success() && (args[0] != "run" || out.status.code().is_none()) {
             print_last_calls(&trace);
+            // The whole trace, for CI to keep.
+            let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("test-traces");
+            let _ = std::fs::create_dir_all(&kept);
+            let _ = std::fs::copy(&trace, kept.join(format!("podman-{}.trace", args[0])));
         }
         out
     };
