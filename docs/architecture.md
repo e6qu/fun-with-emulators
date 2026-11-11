@@ -435,7 +435,10 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   code and value) with `pwrite`, a free one or else the oldest; the
   target's handler reads the note of the sender the host names, or the
   oldest, with `pread`, both async-signal-safe, the mailbox held in fwe's
-  reserved descriptor range.
+  reserved descriptor range while it is the file at its path (else read by
+  the path: a process with the pid of one whose records were left behind
+  opened that one's, which goes when they are cleared; clearing them keeps
+  a live process's mailbox, lock and mappings).
 - **Before a re-exec,** the whole guest mask goes on the host, and signals
   fwe holds pending that the guest blocks are re-raised on the thread,
   which the host `execve` keeps.
