@@ -554,8 +554,9 @@ is in keeping fwe's own descriptors apart and Linux's limits exact:
   quarter of the host's descriptors, at least 64).
 - The guest never reaches the range: `close_range(3, ~0)`, closing up to
   the limit and listing `/proc/self/fd` stop below it; a call naming one
-  fails with `EBADF`, as does `dup2` onto one; the limit cannot be raised
-  into it. When the range is full, what needed one fails as Linux would
+  fails with `EBADF`, as does `dup2` onto one. Root may raise the limit
+  past it, up to `fs.nr_open`, as Linux allows; the descriptors the guest
+  gets stay below it. When the range is full, what needed one fails as Linux would
   (`EMFILE` for an `eventfd`, `ENOMEM` for an `mmap`, `EAGAIN` for a
   `fork`).
 - The soft limit holds as on Linux: a new descriptor at or above it is
@@ -696,7 +697,9 @@ shapes differently:
   `crates/kernel/src/procfs.rs` (`procpid.rs` for another process's
   `/proc/<pid>`), from an anonymous seekable descriptor;
   `crates/kernel/src/synthdir.rs` serves `getdents64`, `lseek`, `fstat`
-  and `close` of the directories from an in-memory list. An unknown path
+  and `close` of the directories from an in-memory list. A process's
+  `/proc/<pid>` and what is in it are owned by its effective user and
+  group (root's while it is not dumpable), as on Linux. An unknown path
   is `ENOENT`.
 - `/proc/self`: `exe`, `cwd`, `root`, `cmdline`, `stat`, `status`,
   `cgroup`, `mountinfo`, `mounts`, `uid_map`, `gid_map`, `setgroups`,

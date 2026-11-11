@@ -1427,7 +1427,12 @@ impl<P: Platform> Kernel<P> {
         }
         if crate::synthdir::fstat_is_dir(fd as i32) {
             use fwe_abi::stat as st;
-            guest!(uaccess::write(buf, synth_stat(st::S_IFDIR | 0o555, 0)));
+            let mut stat = synth_stat(st::S_IFDIR | 0o555, 0);
+            // A process's directory is its user's (newuidmap checks so).
+            if let Some(path) = crate::synthdir::path_of(fd as i32) {
+                stat = self.proc_owned(fcntl::AT_FDCWD as i32, &path, stat);
+            }
+            guest!(uaccess::write(buf, stat));
             return 0;
         }
         let out = match stat_fd(fd as i32) {

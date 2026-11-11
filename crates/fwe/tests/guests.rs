@@ -2152,6 +2152,7 @@ fn debian_podman_runs_in_the_vm() {
         .find_map(|l| l.strip_prefix("Loaded image").and_then(|l| l.split_once(": ")))
         .map(|(_, n)| n.trim().to_string())
         .unwrap_or_default();
+    eprintln!("--- loaded: {}", stdout(&loaded));
     let run = podman(&[
         "run",
         "--rm",
@@ -3920,8 +3921,9 @@ fn proc_self_fd_lists_and_links_descriptors() {
     );
 }
 
-/// `RLIMIT_NOFILE` is virtual: its hard limit is where fwe's own range
-/// begins, so `dup2` there fails with `EBADF` and raising it is refused.
+/// `RLIMIT_NOFILE` is virtual: its hard limit starts where fwe's own range
+/// begins, so `dup2` there fails with `EBADF`; root may raise it as far as
+/// `fs.nr_open`, not past it.
 #[test]
 fn descriptor_limit_bounds_the_guest() {
     assert_eq!(fds("limits"), FDS_LIMITS);
@@ -3934,7 +3936,8 @@ hard limit above soft: true
 dup2 at the soft limit: -1 EBADF
 dup2 just below it: true
 F_DUPFD from it: -1 EINVAL
-raising past it: -1 EPERM
+raising past fs.nr_open: -1 EPERM
+raising to it: 0, hard limit now fs.nr_open true
 soft limit now 32
 dup stopped at 32: EMFILE
 eventfd: -1 EMFILE
@@ -4747,7 +4750,8 @@ func TestSums(t *testing.T) {
         .env("GOPROXY", "off")
         .env("CGO_ENABLED", "0")
         .stdin(Stdio::null());
-    let out = run_hv_for(cmd, "go", Duration::from_secs(900));
+    // The stand-in on a loaded CI runner takes up to twice as long.
+    let out = run_hv_for(cmd, "go", Duration::from_secs(1800));
     let text = stdout(&out);
     assert_eq!(
         text.lines().next(),
@@ -5266,7 +5270,7 @@ fn programs_grant_file_capabilities_and_set_ids() {
          set-uid: euid 0 CapEff:\t000001fffdffffff\n\
          capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
          set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
-         /proc owners: theirs Ok(1000), own Ok(0)\n"
+         /proc owners: theirs Ok(1000), opened Ok(1000), own Ok(0)\n"
     );
 }
 

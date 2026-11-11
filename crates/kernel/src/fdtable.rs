@@ -5,12 +5,14 @@
 //! the pipe a `vfork` parent waits on, and in the VM backend the file of
 //! each file mapping. Those live in a reserved range at the top of the
 //! host's descriptor space, above the highest number the guest may use: the
-//! guest's `RLIMIT_NOFILE` is virtual, its hard limit below the range.
+//! guest's `RLIMIT_NOFILE` is virtual.
 //! Loops that close everything up to the limit, `close_range`, and
 //! `/proc/self/fd` never reach the reserved range, and a system call naming
 //! a descriptor there fails with `EBADF`, as for a descriptor that is not
 //! open. A descriptor of fwe's never goes below the range: when it is full,
-//! what needed one fails.
+//! what needed one fails. The limit may be raised past the range, up to
+//! `fs.nr_open`, as Linux allows; the descriptors the guest gets stay below
+//! it.
 
 use fwe_abi::resource::RLIM_INFINITY;
 use std::sync::Mutex;
@@ -174,7 +176,11 @@ pub fn set_limit(soft: u64, hard: u64) -> Result<(), i32> {
     if soft > hard {
         return Err(fwe_abi::errno::EINVAL);
     }
-    if hard > max {
+    // Up to `fs.nr_open`, as on Linux (container runtimes set 1048576):
+    // the limit is a ceiling, and descriptors are given below fwe's range
+    // whatever it is.
+    let nr_open = (crate::sysctl::number(b"fs/nr_open").unwrap_or(1 << 20) as u64).max(max);
+    if hard > nr_open {
         return Err(fwe_abi::errno::EPERM);
     }
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = (soft, hard);
@@ -407,11 +413,13 @@ mod tests {
     }
 
     #[test]
-    fn limit_is_virtual_and_bounded() {
+    fn limit_is_virtual_and_bounded_by_nr_open() {
         init();
         let (_, hard) = limit();
         assert_eq!(hard, guest_max() as u64);
-        assert_eq!(set_limit(hard + 1, hard + 1), Err(fwe_abi::errno::EPERM));
+        // Past the range, up to `fs.nr_open`, as Linux allows.
+        set_limit(hard + 1, hard + 1).unwrap();
+        assert_eq!(set_limit(1 << 20, (1 << 20) + 1), Err(fwe_abi::errno::EPERM));
         assert_eq!(set_limit(200, 100), Err(fwe_abi::errno::EINVAL));
         set_limit(512, hard).unwrap();
         assert_eq!(limit(), (512, hard));
