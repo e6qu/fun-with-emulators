@@ -2148,11 +2148,6 @@ fn debian_podman_runs_in_the_vm() {
     let loaded = podman(&["--log-level=debug", "load", "-i", "/tmp/alpine.tar"]);
     if !stdout(&loaded).contains("Loaded image") {
         print_last_calls(&root.join("tmp/podman.trace"));
-        // fwe's notes of kill relays and mailboxes, from every process.
-        let whole = std::fs::read_to_string(root.join("tmp/podman.trace")).unwrap_or_default();
-        for l in whole.lines().filter(|l| l.contains("kill rel") || l.contains("mailbox")) {
-            eprintln!("{l}");
-        }
         // The whole trace, for CI to keep.
         let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
         let _ = std::fs::create_dir_all(&kept);

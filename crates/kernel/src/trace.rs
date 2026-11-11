@@ -39,52 +39,6 @@ pub fn note_to_file(message: &str) {
     }
 }
 
-/// [`note_to_file`] for a signal handler: `message` and then `n` in
-/// decimal. Async-signal-safe: it allocates nothing.
-pub fn note_to_file_raw(message: &[u8], n: i64) {
-    let Some(&(_, fd)) = FILE.get() else { return };
-    let mut buf = [0u8; 256];
-    let mut at = 0;
-    let mut put = |b: &[u8]| {
-        let k = b.len().min(buf.len() - at);
-        buf[at..at + k].copy_from_slice(&b[..k]);
-        at += k;
-    };
-    let dec = |mut v: u64, out: &mut [u8; 20]| -> usize {
-        let mut d = [0u8; 20];
-        let mut len = 0;
-        loop {
-            d[len] = b'0' + (v % 10) as u8;
-            len += 1;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        for i in 0..len {
-            out[i] = d[len - 1 - i];
-        }
-        len
-    };
-    let mut digits = [0u8; 20];
-    put(b"[fwe ");
-    // SAFETY: getpid cannot fail.
-    let len = dec(unsafe { libc::getpid() } as u64, &mut digits);
-    put(&digits[..len]);
-    put(b"] ");
-    put(message);
-    if n < 0 {
-        put(b"-");
-    }
-    let len = dec(n.unsigned_abs(), &mut digits);
-    put(&digits[..len]);
-    put(b"\n");
-    let saved = crate::host::last_errno();
-    // SAFETY: a buffer of `at` bytes to fwe's own trace descriptor.
-    unsafe { libc::write(fd, buf.as_ptr().cast(), at) };
-    crate::host::set_errno(saved);
-}
-
 /// The file traced to, which a process fwe starts is told of.
 pub fn file() -> Option<&'static [u8]> {
     FILE.get().map(|(p, _)| p.as_slice())

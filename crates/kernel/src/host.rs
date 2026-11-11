@@ -395,16 +395,7 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
                 crate::signote::note(t, KILL_RELAY);
             }
             // SAFETY: plain host call.
-            let r = unsafe { libc::kill(t, s) };
-            if s == KILL_RELAY {
-                crate::trace::note_to_file_raw(b"kill relayed to ", i64::from(t));
-                crate::trace::note_to_file_raw(
-                    b"kill relay note written: ",
-                    crate::signote::noted_at(t, KILL_RELAY),
-                );
-                crate::signote::trace_dir();
-            }
-            if r == 0 {
+            if unsafe { libc::kill(t, s) } == 0 {
                 result = 0;
             } else if result != 0 {
                 result = last_error();

@@ -453,6 +453,7 @@ pub(super) fn fork(
         let mut e2 = Enc::new();
         e2.u64(STATE_MAGIC);
         e2.u64(build_id());
+        e2.bytes(&fwe_kernel::fs::host_dir().unwrap_or_default());
         e2.u64(fds.len() as u64);
         for &(fd, cloexec) in &fds {
             e2.i32(fd);
@@ -753,6 +754,13 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let mut d = Dec::new(&state);
     if d.u64() != STATE_MAGIC || d.u64() != build_id() {
         return Err("the parent is a different build of fwe".into());
+    }
+    // The parent's private directory, where the records and mailboxes of
+    // the run are: the host's lookup of the user's temporary directory
+    // gives another one here.
+    let dir = d.bytes();
+    if !dir.is_empty() {
+        fwe_kernel::fs::adopt_host_dir(dir);
     }
     let n = d.count(5);
     let fds: Vec<(i32, bool)> = (0..n).map(|_| (d.i32(), d.bool())).collect();

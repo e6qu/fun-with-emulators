@@ -1013,8 +1013,10 @@ held and the other guest threads suspended; `CLONE_VM` makes the private
 memory inherit by sharing for that fork and `CLONE_VFORK` makes the parent
 wait on a pipe until the child execs or exits. In the VM no host fork
 happens: a fresh `fwe --hv-fork-child` gets the kernel state over a Mach
-port and every slab page over a socket (a `vfork` child fetches pages as it
-touches them); `CLONE_VM` without `CLONE_VFORK` fails with `ENOSYS`. See
+port (with fwe's private directory, where the run's records and signal
+mailboxes are: the host's lookup of the user's temporary directory gives
+another one there) and every slab page over a socket (a `vfork` child
+fetches pages as it touches them); `CLONE_VM` without `CLONE_VFORK` fails with `ENOSYS`. See
 [fork](#fork).
 
 **`execve`**: a native process with no other threads, running a program

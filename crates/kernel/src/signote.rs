@@ -194,34 +194,6 @@ pub fn note(target: i32, sig: libc::c_int) {
     note_with(target, sig, 0, 0);
 }
 
-/// Diagnostic: how many fresh notes of this process's for host signal
-/// `sig` process `target`'s mailbox holds (-1: it cannot be read).
-pub fn noted_at(target: i32, sig: libc::c_int) -> i64 {
-    let Some(off) = offset(sig) else { return -1 };
-    let mut buf = [0u8; 512];
-    let Some(path) = mailbox(target, &mut buf) else { return -1 };
-    let mut slots = [0u8; PER_SIGNAL * SLOT];
-    // SAFETY: a NUL-terminated path; buffers of their lengths.
-    let n = unsafe {
-        let fd = libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return -1;
-        }
-        let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off);
-        libc::close(fd);
-        n.max(0) as usize
-    };
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    let now = now_ns();
-    (0..n / SLOT)
-        .filter(|&i| {
-            let (pid, when) = slot_of(&slots, i);
-            pid == me && now.saturating_sub(when) < FRESH_NS
-        })
-        .count() as i64
-}
-
 /// As [`note`], for a signal the target is to take with Linux `si_code`
 /// `code` and value `value` (a message queue's notification).
 pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
@@ -287,45 +259,6 @@ fn own_mailbox() -> Option<(i32, bool)> {
     // SAFETY: a NUL-terminated path; async-signal-safe.
     let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
     (fd >= 0).then_some((fd, true))
-}
-
-/// Diagnostic: the mailboxes' directory, in the trace file.
-pub fn trace_dir() {
-    if let Some(d) = DIR.get() {
-        crate::trace::note_to_file_raw(d, 0);
-    }
-}
-
-/// Diagnostic, in a handler: what this process's mailbox holds for host
-/// signal `sig`, in the trace file. Async-signal-safe.
-pub fn trace_slots(sig: libc::c_int) {
-    use crate::trace::note_to_file_raw as n;
-    n(b"mailbox dir set: ", DIR.get().is_some() as i64);
-    trace_dir();
-    n(b"mailbox own pid: ", i64::from(OWN_PID.load(Ordering::SeqCst)));
-    n(b"mailbox own fd: ", i64::from(OWN.load(Ordering::SeqCst)));
-    let Some(off) = offset(sig) else { return };
-    let Some((fd, opened)) = own_mailbox() else {
-        n(b"mailbox not opened, errno ", i64::from(crate::host::last_errno()));
-        return;
-    };
-    n(b"mailbox opened by path: ", opened as i64);
-    let mut slots = [0u8; PER_SIGNAL * SLOT];
-    // SAFETY: a descriptor of the mailbox; a buffer of its length.
-    let got = unsafe { libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off) };
-    n(b"mailbox read bytes: ", got as i64);
-    let now = now_ns();
-    for i in 0..(got.max(0) as usize) / SLOT {
-        let (pid, when) = slot_of(&slots, i);
-        if pid != 0 {
-            n(b"mailbox slot pid: ", i64::from(pid));
-            n(b"mailbox slot age ms: ", (now as i64 - when as i64) / 1_000_000);
-        }
-    }
-    if opened {
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(fd) };
-    }
 }
 
 /// Read, and with `clear_if` (clearing only a note of that sender, or with
