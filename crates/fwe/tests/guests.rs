@@ -1714,6 +1714,26 @@ const DOCKERFILE: &str = "FROM alpine:3.20\n\
     COPY greeting.txt /data/\n\
     CMD [\"sh\", \"-c\", \"cat /built /data/greeting.txt\"]\n";
 
+/// The Compose project [`alpine_docker_runs_and_builds_images`] brings up:
+/// a service that writes to a named volume, and one built from the
+/// Dockerfile that reads it once the first has completed.
+const COMPOSE: &str = "services:\n\
+    \x20 store:\n\
+    \x20   image: alpine:3.20\n\
+    \x20   network_mode: none\n\
+    \x20   volumes: [\"shared:/data\"]\n\
+    \x20   command: [\"sh\", \"-c\", \"echo stored > /data/f\"]\n\
+    \x20 reader:\n\
+    \x20   build: /tmp/context\n\
+    \x20   network_mode: none\n\
+    \x20   volumes: [\"shared:/data\"]\n\
+    \x20   depends_on:\n\
+    \x20     store:\n\
+    \x20       condition: service_completed_successfully\n\
+    \x20   command: [\"sh\", \"-c\", \"cat /data/f /built; exit 6\"]\n\
+    volumes:\n\
+    \x20 shared: {}\n";
+
 /// Alpine's Docker Engine (fetched: `guests/alpine/fetch/docker.txt`), as
 /// root, only where `FWE_DOCKER_TESTS` is set (CI's `docker` job): `dockerd`
 /// starts its own containerd, with its `overlay2` storage, no bridge and no
@@ -1722,8 +1742,11 @@ const DOCKERFILE: &str = "FROM alpine:3.20\n\
 /// with no network and with the host's, and builds an image from a
 /// Dockerfile with BuildKit (through the buildx plugin), whose `RUN` step
 /// runs in a container and whose `COPY` takes a file of the build context;
-/// a container of the built image runs. Each container's exit status is
-/// `docker`'s, and `--rm` leaves no container behind.
+/// a container of the built image runs. Docker Compose (the CLI's plugin)
+/// brings up a project of two services sharing a named volume, one built,
+/// the second started once the first completed, with the second's exit
+/// status its own, and takes it down with its volume. Each container's
+/// exit status is `docker`'s, and nothing is left behind.
 #[test]
 fn alpine_docker_runs_and_builds_images() {
     if !fetched_program_tests("FWE_DOCKER_TESTS") {
@@ -1737,6 +1760,8 @@ fn alpine_docker_runs_and_builds_images() {
     std::fs::create_dir_all(&context).unwrap();
     std::fs::write(context.join("Dockerfile"), DOCKERFILE).unwrap();
     std::fs::write(context.join("greeting.txt"), "from the context\n").unwrap();
+    std::fs::create_dir_all(root.join("tmp/compose")).unwrap();
+    std::fs::write(root.join("tmp/compose/compose.yaml"), COMPOSE).unwrap();
     std::fs::create_dir_all(root.join("root")).unwrap();
     let _workload = workload();
     // Each process's calls, for a step that fails: the daemon's (containerd's,
@@ -1795,7 +1820,12 @@ fn alpine_docker_runs_and_builds_images() {
     let host = docker(&["run", "--rm", "--network=host", "alpine:3.20", "hostname"], 0);
     let built = docker(&["build", "--network=none", "-t", "fwe-built:1", "/tmp/context"], 0);
     let ran = docker(&["run", "--rm", "--network=none", "fwe-built:1"], 0);
+    let compose = ["compose", "-p", "fwe", "-f", "/tmp/compose/compose.yaml"];
+    let up =
+        docker(&[&compose[..], &["up", "--no-color", "--exit-code-from", "reader"]].concat(), 6);
+    let down = docker(&[&compose[..], &["down", "--volumes"]].concat(), 0);
     let after = docker(&["ps", "-a", "--format", "{{.ID}}"], 0);
+    let volumes = docker(&["volume", "ls", "-q"], 0);
     // SAFETY: plain call, to the daemon this test started.
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let mut ended = None;
@@ -1827,7 +1857,11 @@ fn alpine_docker_runs_and_builds_images() {
     assert_eq!(stdout(&host), format!("{name}\n"));
     assert_eq!(built.status.code(), Some(0));
     assert_eq!(stdout(&ran), "built\nfrom the context\n");
+    let up = stdout(&up);
+    assert!(up.contains("reader-1  | stored\n") && up.contains("reader-1  | built\n"), "{up}");
+    assert_eq!(down.status.code(), Some(0));
     assert_eq!(stdout(&after), "");
+    assert_eq!(stdout(&volumes), "");
     assert!(ended.is_some_and(|s| s.success()), "dockerd did not end cleanly: {ended:?}");
 }
 
@@ -2973,6 +3007,23 @@ fn network_namespace_has_its_own_loopback() {
          served: ping\ntaken: true\nelsewhere: true\nnobody there: true\nchild exited 0\n"
     );
     assert_eq!(namespaces("net-outside"), "inside: 127.0.0.1:18082\noutside too: true\n");
+}
+
+/// A thread's own root, mounts and network namespace: a thread that
+/// unshares `CLONE_FS` and the mount namespace mounts and changes its root
+/// alone; one that unshares the network namespace binds a port there that
+/// the process binds too, until it joins the process's again; what a
+/// thread that shares them sets (working directory, umask), the others
+/// have; and the mount namespace is not joined while the root is shared.
+#[test]
+fn threads_have_their_own_root_and_namespaces() {
+    assert_eq!(
+        namespaces("threads"),
+        "thread: unshare 0 private 0 tmpfs 0 true chroot 0 marker new\n\
+         others: root kept true, /mnt not mounted true\nshared: umask 77 cwd /tmp\n\
+         net: thread bound true, process too true\nback: 0, port taken true\n\
+         setns mnt with threads: -1 errno 22\n"
+    );
 }
 
 /// A user namespace: unmapped until its maps are written, once, under

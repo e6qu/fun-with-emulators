@@ -99,7 +99,7 @@ impl<P: Platform> Kernel<P> {
     /// directory it is in.
     fn ll_target(&self, dirfd: u64, path: u64, follow: bool) -> Option<(Vec<u8>, Vec<u8>)> {
         let p = uaccess::read_cstr(path, uaccess::PATH_MAX).ok()?;
-        let r = self.fs.as_ref()?.resolve(dirfd as i32, &p, follow).ok()?;
+        let r = self.fs_opt()?.resolve(dirfd as i32, &p, follow).ok()?;
         let dir = crate::fs::host_path_of(r.dir.as_raw_fd())?;
         let obj = if r.name == b"." { dir.clone() } else { [&dir[..], b"/", &r.name[..]].concat() };
         Some((dir, obj))
@@ -211,7 +211,7 @@ impl<P: Platform> Kernel<P> {
                         AF_UNIX if rest.first().is_some_and(|&c| c != 0) => {
                             let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
                             let path = &rest[..end];
-                            let p = self.fs.as_ref().and_then(|fs| {
+                            let p = self.fs_opt().and_then(|fs| {
                                 let r = fs.resolve(fcntl::AT_FDCWD as i32, path, false).ok()?;
                                 crate::fs::host_path_of(r.dir.as_raw_fd())
                             });
@@ -254,7 +254,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `EXECUTE` of the program at guest path `path`.
     pub(crate) fn landlock_exec(&self, path: &[u8]) -> Result<(), i32> {
-        let Some(fs) = self.fs.as_ref() else { return Ok(()) };
+        let Some(fs) = self.fs_opt() else { return Ok(()) };
         let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true) else { return Ok(()) };
         let Some(dir) = crate::fs::host_path_of(r.dir.as_raw_fd()) else { return Ok(()) };
         ll::check_path(&[&dir[..], b"/", &r.name[..]].concat(), ll::EXECUTE, true)

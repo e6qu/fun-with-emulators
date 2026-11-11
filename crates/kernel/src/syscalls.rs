@@ -358,8 +358,8 @@ impl<P: Platform> Kernel<P> {
             nr::STATX => self.sys_statx(a[0], a[1], a[2], a[3], a[4]),
             nr::GETDENTS64 => self.sys_getdents64(a[0], a[1], a[2]),
             nr::GETCWD => self.sys_getcwd(a[0], a[1]),
-            nr::CHDIR => self.sys_chdir(a[0]),
-            nr::FCHDIR => self.sys_fchdir(a[0]),
+            nr::CHDIR => self.view_call(|k| k.sys_chdir(a[0])),
+            nr::FCHDIR => self.view_call(|k| k.sys_fchdir(a[0])),
             nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
             nr::MKDIRAT => self.sys_mkdirat(a[0], a[1], a[2]),
             nr::MKNODAT => self.sys_mknodat(a[0], a[1], a[2], a[3]),
@@ -390,7 +390,7 @@ impl<P: Platform> Kernel<P> {
             nr::FTRUNCATE => self.sys_ftruncate(a[0], a[1]),
             nr::FALLOCATE => self.sys_fallocate(a[0], a[1], a[2], a[3]),
             nr::FADVISE64 => self.sys_fadvise(a[0], a[1], a[2], a[3]),
-            nr::UMASK => self.sys_umask(a[0]),
+            nr::UMASK => self.view_call(|k| k.sys_umask(a[0])),
             nr::PIPE2 => self.sys_pipe2(a[0], a[1]),
             nr::UTIMENSAT => self.sys_utimensat(a[0], a[1], a[2], a[3]),
             // Every file system's writes, the host's `sync`: a file
@@ -435,8 +435,8 @@ impl<P: Platform> Kernel<P> {
             nr::SETDOMAINNAME => self.sys_setname(a[0], a[1], false),
             nr::MOUNT => self.sys_mount(a[0], a[1], a[2], a[3], a[4]),
             nr::UMOUNT2 => self.sys_umount2(a[0], a[1]),
-            nr::PIVOT_ROOT => self.sys_pivot_root(a[0], a[1]),
-            nr::CHROOT => self.sys_chroot(a[0]),
+            nr::PIVOT_ROOT => self.view_call(|k| k.sys_pivot_root(a[0], a[1])),
+            nr::CHROOT => self.view_call(|k| k.sys_chroot(a[0])),
             nr::MMAP => self.sys_mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
             nr::MUNMAP => self.sys_munmap(a[0], a[1]),
             nr::MSEAL => self.sys_mseal(a[0], a[1], a[2]),
@@ -1420,7 +1420,7 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: zeroed bytes are a valid `Utsname`.
         let mut u: Utsname = unsafe { std::mem::zeroed() };
         fill(&mut u.sysname, b"Linux");
-        let (host, domain) = match self.fs.as_ref() {
+        let (host, domain) = match self.fs_opt() {
             Some(fs) => (fs.ns.hostname(), fs.ns.domainname()),
             None => (crate::ns::host_name(), b"(none)".to_vec()),
         };

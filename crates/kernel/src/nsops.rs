@@ -95,6 +95,13 @@ impl<P: Platform> Kernel<P> {
             }
             FILES_SHARED.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        // `CLONE_NEWNS` unshares `CLONE_FS` too: with other threads, the
+        // caller's root, working directory and umask become its own.
+        if flags & (CLONE_FS | CLONE_NEWNS) != 0
+            && let Err(e) = self.own_view(true)
+        {
+            return err(e);
+        }
         if flags & SUPPORTED == 0 {
             return 0;
         }
@@ -107,7 +114,11 @@ impl<P: Platform> Kernel<P> {
         if !new_user && !self.creds.has_admin() {
             return err(errno::EPERM);
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        // With other threads, the namespaces become the caller's own.
+        if let Err(e) = self.own_view(false) {
+            return err(e);
+        }
+        let fs = self.fs_mut();
         if let Err(e) = fs.ns.unshare(flags) {
             return err(e);
         }
@@ -121,7 +132,7 @@ impl<P: Platform> Kernel<P> {
         if new_user {
             self.creds.caps = caps_in_new_userns();
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         if flags & CLONE_NEWPID != 0 {
             // A second one before a child was made in the first fails.
             let unshared = match (&fs.ns.pid, &fs.ns.pid_children) {
@@ -139,9 +150,74 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => return err(e),
             }
         }
-        crate::procreg::own_namespaces(fs.ns_dirs());
-        fs.ns.activate();
+        self.namespaces_changed();
         0
+    }
+
+    /// Before the calling thread changes its namespaces, or with `fs` its
+    /// root, working directory and umask apart from the other threads'
+    /// (`CLONE_FS`): with other threads it takes a view of its own
+    /// ([`crate::threadfs`]).
+    pub(crate) fn own_view(&mut self, fs: bool) -> Result<(), i32> {
+        if crate::threadfs::current().is_some() {
+            if fs {
+                crate::threadfs::unshare_fs();
+            }
+            return Ok(());
+        }
+        if crate::thread::live_threads() <= 1 {
+            return Ok(());
+        }
+        let copy = self.fs().copy()?;
+        crate::threadfs::take(copy, !fs);
+        Ok(())
+    }
+
+    /// After the calling thread's namespaces changed: the process's, which
+    /// its record shows and its sockets act in, or the thread's own.
+    pub(crate) fn namespaces_changed(&mut self) {
+        match (crate::threadfs::current(), self.fs.as_ref()) {
+            (Some(_), Some(process)) => crate::threadfs::namespaces_changed(process),
+            _ => {
+                let fs = self.fs();
+                crate::procreg::own_namespaces(fs.ns_dirs());
+                fs.ns.activate();
+            }
+        }
+    }
+
+    /// The calling thread's own view, if it has one, becomes the
+    /// process's: it is the only thread left (a `fork` child), or the one
+    /// that goes on to run another program.
+    pub fn adopt_thread_view(&mut self) {
+        if let Some(fs) = crate::threadfs::take_for_child() {
+            fs.publish();
+            self.fs = Some(fs);
+            if let Some(fs) = self.fs.as_ref() {
+                crate::procreg::own_namespaces(fs.ns_dirs());
+                fs.ns.activate();
+            }
+        }
+    }
+
+    /// A call that may change the calling thread's root, working directory
+    /// or umask: the threads that share them have them too.
+    pub(crate) fn view_call(&mut self, call: impl FnOnce(&mut Self) -> i64) -> i64 {
+        let r = call(self);
+        if r >= 0 {
+            self.share_view();
+        }
+        r
+    }
+
+    /// After the calling thread changed its root, working directory or
+    /// umask: the threads that share them have them too.
+    fn share_view(&mut self) {
+        if !crate::threadfs::any() {
+            return;
+        }
+        let Ok(from) = self.fs().copy() else { return };
+        crate::threadfs::share_view(&from, self.fs.as_mut());
     }
 
     /// `sethostname(name, len)`, or `setdomainname` when `!host`.
@@ -257,7 +333,7 @@ impl<P: Platform> Kernel<P> {
             flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
             std::sync::atomic::Ordering::SeqCst,
         );
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         let mut ns = fs.ns.clone();
         ns.unshare(new)?;
         let base = fs.ns.pid_children.clone();
@@ -317,7 +393,7 @@ impl<P: Platform> Kernel<P> {
             self.creds.caps = caps;
         }
         if let Some((mnt, ns)) = t.saved {
-            let fs = self.fs.as_mut().expect("filesystem configured");
+            let fs = self.fs_mut();
             fs.set_mount_ns(mnt);
             fs.ns = ns;
         }
@@ -364,18 +440,20 @@ impl<P: Platform> Kernel<P> {
     /// In the child after the host `fork`: its pid namespaces are the ones
     /// made for it. Returns its pid, for `thread::init_main`.
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
+        // Its view is the forking thread's.
+        self.adopt_thread_view();
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
         // SAFETY: getpid cannot fail.
         pidns::set_host(&t.chain, &t.nums, unsafe { libc::getpid() });
         pidns::set_current(t.chain);
-        if let Some(fs) = self.fs.as_ref() {
+        if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
         }
         // Its own record too: it may end before the parent writes it.
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
-        let auxv = self.fs.as_ref().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
+        let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
         crate::procreg::own_line(&t.line, &t.inherit, t.dirs.clone(), crate::maps::forked(), &auxv);
         if let Some(cg) = &t.cgroup {
             // Where it starts, should it look before the parent writes it.

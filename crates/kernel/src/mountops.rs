@@ -501,7 +501,7 @@ impl<P: Platform> Kernel<P> {
         } else {
             cwd_ns
         };
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
         let root_mount = fs.mounts().locate(&root).0.id;
         fs.set_root(root, cwd);
@@ -528,7 +528,7 @@ impl<P: Platform> Kernel<P> {
         }
         // The working directory stays where it is; from the new root it
         // has a path only if it is inside.
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         let cwd_ns = fs.to_ns(fs.cwd());
         let inside = crate::mounts::under(&cwd_ns, &ns).map(|r| crate::mounts::join(b"/", r));
         let outside = inside.is_none().then(|| cwd_ns.clone());

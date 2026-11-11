@@ -243,6 +243,15 @@ impl Namespaces {
         crate::sysvipc::activate(self.ipc.clone());
     }
 
+    /// Make `own` the calling thread's own namespaces for its sockets and
+    /// IPC ([`crate::threadfs`]), or the process's again (`None`). (A user
+    /// namespace is never a thread's own: one with other threads cannot
+    /// change it.)
+    pub fn activate_thread(own: Option<Namespaces>) {
+        crate::netns::set_thread(own.as_ref().map(|n| n.net.clone()));
+        crate::sysvipc::set_thread(own.map(|n| n.ipc));
+    }
+
     /// Write the namespaces into a fork snapshot or exec state.
     pub fn save(&self, e: &mut Enc) {
         shared::save_opt(e, &self.uts);

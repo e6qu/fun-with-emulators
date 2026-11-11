@@ -19,7 +19,7 @@ of life, so the files no longer change.
 | `fetch/crun.txt` | The 3.20.10 minirootfs (the root filesystem of the standard `alpine` image, used both as the test's root and as the container's image), crun 1.17, libcap, libseccomp and yajl | 4 MB |
 | `fetch/podman.txt` | The minirootfs (the test's root, and the one layer of the `alpine` image the test builds an OCI archive of), podman 5.2.5, conmon, crun, netavark, containers-common, catatonit and their libraries (gpgme, libassuan, libgpg-error, sqlite, glib, pcre2, libintl, libgcc, libcap, libseccomp, yajl) | 22 MB |
 | `fetch/containerd.txt` | The minirootfs (the test's root, and the `alpine` image's layer), containerd 1.7.17 with its runc shim, ctr, runc 1.1.14 and libseccomp | 33 MB |
-| `fetch/docker.txt` | The minirootfs (the test's root, and the `alpine` image's layer), Docker Engine 26.1.5 (`dockerd`), the docker CLI with its buildx 0.14 plugin, containerd 1.7.17, runc 1.1.14, tini, iptables and their libraries (libmnl, libnftnl, libxtables, libseccomp) | 71 MB |
+| `fetch/docker.txt` | The minirootfs (the test's root, and the `alpine` image's layer), Docker Engine 26.1.5 (`dockerd`), the docker CLI with its buildx 0.14 and Compose 2.27 plugins, containerd 1.7.17, runc 1.1.14, tini, iptables and their libraries (libmnl, libnftnl, libxtables, libseccomp) | 88 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
 
 ## License
@@ -28,7 +28,7 @@ What the tests fetch keeps the licenses Alpine ships it under, recorded in
 each package's metadata: crun GPL-2.0-or-later and LGPL-2.1-or-later;
 libcap BSD-3-Clause or GPL-2.0-only; libseccomp LGPL-2.1-or-later; yajl MIT;
 podman, conmon, netavark, containers-common, containerd, ctr, runc,
-dockerd, the docker CLI and buildx Apache-2.0; tini MIT; iptables,
+dockerd, the docker CLI, buildx and Compose Apache-2.0; tini MIT; iptables,
 libnftnl and libxtables GPL-2.0-or-later; libmnl LGPL-2.1-or-later; catatonit
 GPL-2.0-or-later; gpgme LGPL-2.1-or-later and GPL-3.0-or-later; libassuan,
 glib and libintl LGPL-2.1-or-later; libgpg-error and libgcc

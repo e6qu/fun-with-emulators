@@ -329,13 +329,22 @@ impl<P: Platform> Kernel<P> {
         if n.kind == CLONE_NEWUSER && crate::thread::live_threads() > 1 {
             return err(errno::EINVAL);
         }
+        // A mount namespace is joined by a thread that shares its root and
+        // working directory with no other.
+        if n.kind == CLONE_NEWNS
+            && crate::thread::live_threads() > 1
+            && (crate::threadfs::current().is_none() || crate::threadfs::shares())
+        {
+            return err(errno::EINVAL);
+        }
+        if let Err(e) = self.own_view(false) {
+            return err(e);
+        }
         let r = self.join_ns(&n);
         if let Err(e) = r {
             return err(e);
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
-        crate::procreg::own_namespaces(fs.ns_dirs());
-        fs.ns.activate();
+        self.namespaces_changed();
         0
     }
 
@@ -347,7 +356,7 @@ impl<P: Platform> Kernel<P> {
         fn join<T: crate::shared::Data>(n: &NsRef) -> Result<Option<Arc<Record<T>>>, i32> {
             n.dir.as_ref().map(|d| Record::join(d, n.id).map(Arc::new)).transpose()
         }
-        let fs = self.fs.as_mut().expect("filesystem configured");
+        let fs = self.fs_mut();
         match n.kind {
             CLONE_NEWUTS => fs.ns.uts = join(n)?,
             CLONE_NEWIPC => fs.ns.ipc = join(n)?,

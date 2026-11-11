@@ -1,11 +1,12 @@
 //! Namespaces and mounts as container runtimes use them, one scenario per
-//! argument, each printing what it observed. Runs as (virtual) root, in a
+//! argument (a thread's own included), each printing what it observed. Runs as (virtual) root, in a
 //! root filesystem that has `/mnt`, `/newroot` (with `etc/marker` and
 //! `proc`) and `/tmp`.
 //!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates.
 
+const CLONE_FS: i32 = 0x0000_0200;
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
 const CLONE_NEWPID: i32 = 0x2000_0000;
@@ -43,6 +44,8 @@ struct Utsname {
 
 unsafe extern "C" {
     fn unshare(flags: i32) -> i32;
+    fn setns(fd: i32, nstype: i32) -> i32;
+    fn umask(mask: u32) -> u32;
     fn sethostname(name: *const u8, len: usize) -> i32;
     fn uname(u: *mut Utsname) -> i32;
     fn fork() -> i32;
@@ -584,6 +587,92 @@ fn main() {
                 0
             });
             println!("child exited {code}");
+        }
+        // A thread's own root, mounts and network namespace, as Docker
+        // makes them on one of its threads while the others carry on; and
+        // a working directory and umask the threads share.
+        Some("threads") => {
+            use std::os::fd::AsRawFd;
+            let own = std::thread::spawn(|| {
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    let u = unshare(CLONE_FS | CLONE_NEWNS);
+                    let p = mount(
+                        c"none".as_ptr(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        MS_REC | MS_PRIVATE,
+                        std::ptr::null(),
+                    );
+                    let m = mount(
+                        c"tmpfs".as_ptr(),
+                        c"/mnt".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    );
+                    let mnt = mounted("/mnt");
+                    let c = chroot(c"/newroot".as_ptr());
+                    chdir(c"/".as_ptr());
+                    let marker = std::fs::read_to_string("/etc/marker").unwrap_or_default();
+                    format!(
+                        "thread: unshare {u} private {p} tmpfs {m} {mnt} chroot {c} marker {}",
+                        marker.trim()
+                    )
+                }
+            });
+            println!("{}", own.join().unwrap());
+            println!(
+                "others: root kept {}, /mnt not mounted {}",
+                std::path::Path::new("/newroot/etc/marker").exists(),
+                !mounted("/mnt")
+            );
+            // Shared: what a thread sets, the others have.
+            std::thread::spawn(|| {
+                // SAFETY: plain calls.
+                unsafe {
+                    umask(0o077);
+                    chdir(c"/tmp".as_ptr());
+                }
+            })
+            .join()
+            .unwrap();
+            // SAFETY: plain call.
+            let was = unsafe { umask(0o022) };
+            let cwd = std::env::current_dir().unwrap();
+            println!("shared: umask {was:o} cwd {}", cwd.display());
+            // SAFETY: a NUL-terminated path.
+            unsafe { chdir(c"/".as_ptr()) };
+            // A thread's own network namespace, then back in the process's.
+            let (to_main, from_thread) = std::sync::mpsc::channel();
+            let (to_thread, from_main) = std::sync::mpsc::channel::<()>();
+            let net = std::thread::spawn(move || {
+                let orig = std::fs::File::open("/proc/self/ns/net").unwrap();
+                // SAFETY: plain calls.
+                unsafe { unshare(CLONE_NEWNET) };
+                set_lo_up();
+                let inside = std::net::TcpListener::bind("127.0.0.1:18090");
+                to_main.send(inside.is_ok()).unwrap();
+                from_main.recv().unwrap();
+                // SAFETY: a namespace descriptor.
+                let back = unsafe { setns(orig.as_raw_fd(), CLONE_NEWNET) };
+                let again = std::net::TcpListener::bind("127.0.0.1:18090").map(|_| ()).unwrap_err();
+                format!("back: {back}, port taken {}", again.raw_os_error() == Some(98))
+            });
+            let inside = from_thread.recv().unwrap();
+            let outside = std::net::TcpListener::bind("127.0.0.1:18090");
+            println!("net: thread bound {inside}, process too {}", outside.is_ok());
+            to_thread.send(()).unwrap();
+            println!("{}", net.join().unwrap());
+            // A mount namespace is not joined while the root is shared.
+            let mnt = std::fs::File::open("/proc/self/ns/mnt").unwrap();
+            let (hold, wait) = std::sync::mpsc::channel::<()>();
+            let other = std::thread::spawn(move || wait.recv());
+            // SAFETY: a namespace descriptor.
+            let r = unsafe { setns(mnt.as_raw_fd(), CLONE_NEWNS) };
+            println!("setns mnt with threads: {r} errno {}", errno());
+            drop(hold);
+            let _ = other.join();
         }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds

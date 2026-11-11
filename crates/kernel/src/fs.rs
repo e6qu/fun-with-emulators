@@ -561,6 +561,40 @@ impl Fs {
         self.mnt.table()
     }
 
+    /// A copy of this view, for a thread to have as its own
+    /// ([`crate::threadfs`]), with its own descriptor of the rootfs.
+    pub fn copy(&self) -> Result<Fs, i32> {
+        let root = self
+            .root
+            .try_clone()
+            .map_err(|e| errno_to_linux(e.raw_os_error().unwrap_or(libc::EMFILE)))?;
+        Ok(Fs {
+            root,
+            root_host: self.root_host.clone(),
+            mnt: self.mnt.clone(),
+            proc_root: self.proc_root.clone(),
+            cwd: self.cwd.clone(),
+            cwd_mount: self.cwd_mount,
+            cwd_outside: self.cwd_outside.clone(),
+            root_mount: self.root_mount,
+            umask: self.umask,
+            proc: self.proc.clone(),
+            ns: self.ns.clone(),
+        })
+    }
+
+    /// Take `from`'s root, working directory and umask: a thread that
+    /// shares them changed them ([`crate::threadfs::share_view`]).
+    pub fn set_view(&mut self, from: &Fs) {
+        self.proc_root = from.proc_root.clone();
+        self.cwd = from.cwd.clone();
+        self.cwd_mount = from.cwd_mount;
+        self.cwd_outside = from.cwd_outside.clone();
+        self.root_mount = from.root_mount;
+        self.umask = from.umask;
+        self.republish();
+    }
+
     /// Move to the mount namespace `ns` (`unshare`, `setns`), keeping the
     /// root and working directory at the same paths.
     pub fn set_mount_ns(&mut self, ns: Arc<Ns>) {

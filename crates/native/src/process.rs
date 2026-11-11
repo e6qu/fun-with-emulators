@@ -72,6 +72,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let strace = k.tracer;
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
+    // The calling thread's view is what the program runs with.
+    k.adopt_thread_view();
     let fs = k.fs.as_ref().expect("filesystem configured");
     k.may_exec(&path).map_err(err)?;
     let file = fs.read(&path).map_err(err)?;
