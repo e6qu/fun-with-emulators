@@ -1585,7 +1585,7 @@ fn alpine_podman_runs_an_image() {
         }
         out
     };
-    let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
+    let loaded = podman(&["--log-level=debug", "load", "-i", "/tmp/alpine.tar"]);
     if !stdout(&loaded).contains("Loaded image") {
         print_last_calls(&root.join("tmp/podman.trace"));
     }
