@@ -1301,8 +1301,9 @@ on a file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 datagram pair, so `recv`, `poll` and `epoll` are the host's. A request
 written to it is answered at once on the other end. In an fwe network
 namespace, `RTM_GETLINK`, `RTM_NEWLINK` (with `CAP_NET_ADMIN`) and
-`RTM_GETADDR` describe and change `lo`; in the initial namespace every
-request is answered with `EOPNOTSUPP`. Such a socket also carries a POSIX
+`RTM_GETADDR` describe and change `lo`; in the initial namespace they
+describe the host's loopback as `lo`, always up (taking it down is
+`EPERM`), and no other interface. Such a socket also carries a POSIX
 message queue's `SIGEV_THREAD` notification
 ([POSIX message queues](#posix-message-queues)).
 
@@ -2100,7 +2101,7 @@ names macOS does not support:
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
 | interface requests (`SIOCGIFCONF`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCSIFMTU`, ...) | a 32-byte `ifreq`, other flag bits | in an fwe network namespace, answered for `lo`; elsewhere the host's interfaces, `lo0` as `lo`, which the guest cannot change |
 | `SOCK_SEQPACKET` Unix sockets | none | a stream socket with length-prefixed frames (`crates/kernel/src/seqpacket.rs`) |
-| `AF_NETLINK`/`NETLINK_ROUTE` | none | in an fwe network namespace, answers for `lo`; elsewhere every request is `EOPNOTSUPP` |
+| `AF_NETLINK`/`NETLINK_ROUTE` | none | in an fwe network namespace, answers for `lo`; in the initial one, for the host's loopback as `lo` |
 | `SO_PEERCRED` | `LOCAL_PEERCRED` | peer pid in the caller's pid namespace, ids as the guest sees them |
 
 #### System V IPC
@@ -2619,7 +2620,12 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 - a reaper runs a watcher thread on `kqueue` process events and raises
   `SIGCHLD` in itself for an adopted descendant's end, stop or continue,
   with a child's `siginfo`, and wakes its threads waiting in `wait`;
-- its `wait` looks at its own children, then the adopted ones.
+- its `wait` looks at its own children, then the adopted ones;
+- a child made with `CLONE_PARENT` is its creator's parent's, not its
+  parent's on the host: its record says so, it tells that parent as it
+  starts (a note in the parent's signal mailbox), and the parent then
+  runs the watcher and waits for it as for one it adopted (runc makes
+  each container's init so).
 
 ### A process killed from the host
 
@@ -2679,7 +2685,7 @@ for each kind of descriptor:
 | readiness on an `O_ASYNC` descriptor: host `SIGIO` with no sender | the descriptor and its events found with `poll`; sent as the signal `F_SETSIG` chose, to the owner thread if one is set | that signal with `si_fd`, `si_band` and `POLL_IN`/`POLL_OUT`/`POLL_PRI`/`POLL_HUP` |
 | out-of-band data: `SIGURG` (16) | relayed | `SIGURG` (23) |
 | reading an unconnected Unix stream socket: `ENOTCONN` | Linux's answer | `EINVAL` |
-| an interface or route changes | no netlink outside an fwe network namespace (`EOPNOTSUPP`) | nothing |
+| an interface or route changes | netlink outside an fwe network namespace describes only the host's loopback | nothing |
 | the host's DNS settings | not read: the resolver reads the rootfs's `/etc/resolv.conf` and `/etc/hosts` | the rootfs's |
 
 ### Clocks and timers

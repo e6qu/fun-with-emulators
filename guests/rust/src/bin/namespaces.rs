@@ -8,6 +8,7 @@
 
 const O_DIRECTORY: i32 = 0o40000;
 const CLONE_FS: i32 = 0x0000_0200;
+const CLONE_PARENT: i32 = 0x0000_8000;
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
 const CLONE_NEWPID: i32 = 0x2000_0000;
@@ -147,8 +148,9 @@ fn sigchld_from(pid: i32) -> bool {
 
 fn read_i32(fd: i32) -> i32 {
     let mut b = [0u8; 4];
+    // Again when a signal (a child's SIGCHLD) interrupts it.
     // SAFETY: a valid buffer.
-    unsafe { read(fd, b.as_mut_ptr(), 4) };
+    while unsafe { read(fd, b.as_mut_ptr(), 4) } < 0 && errno() == 4 {}
     i32::from_ne_bytes(b)
 }
 
@@ -896,6 +898,58 @@ fn main() {
         }
         // A child subreaper adopts the orphans below it: it is their
         // parent, is sent SIGCHLD when one ends, and reaps it.
+        // Children made with CLONE_PARENT are the creator's parent's: it
+        // is told when each ends and reaps it, though it is no subreaper
+        // and they are not its children on the host; as runc makes a
+        // container's init, in new namespaces, two levels down.
+        Some("fosters") => {
+            catch_sigchld();
+            // SAFETY: plain calls with valid buffers; the children end.
+            unsafe {
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let first = fork();
+                if first == 0 {
+                    let second = syscall(SYS_CLONE, CLONE_PARENT as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                    if second == 0 {
+                        unshare(CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET);
+                        let init =
+                            syscall(SYS_CLONE, CLONE_PARENT as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                        if init == 0 {
+                            usleep(300_000);
+                            _exit(7);
+                        }
+                        // Its pid: in the parent's pid namespace still.
+                        write_i32(report[1], getpid());
+                        write_i32(report[1], init as i32);
+                        _exit(0);
+                    }
+                    usleep(50_000);
+                    _exit(0);
+                }
+                let second = read_i32(report[0]);
+                let init = read_i32(report[0]);
+                let mut reaped = Vec::new();
+                loop {
+                    let mut st = 0;
+                    let w = waitpid(-1, &mut st, 0);
+                    if w < 0 {
+                        println!("then: ECHILD {}", errno() == ECHILD);
+                        break;
+                    }
+                    reaped.push((w, (st >> 8) & 0xff));
+                }
+                let has = |p: i32, code: i32| reaped.contains(&(p, code));
+                println!(
+                    "reaped: {} children, first {}, second {}, init exited {}",
+                    reaped.len(),
+                    has(first, 0),
+                    has(second, 0),
+                    reaped.iter().find(|r| r.0 == init).map_or(-1, |r| r.1)
+                );
+                println!("init's SIGCHLD: {}", sigchld_coded(init, 1));
+            }
+        }
         Some("subreaper") => {
             catch_sigchld();
             // SAFETY: plain calls with valid out-parameters.

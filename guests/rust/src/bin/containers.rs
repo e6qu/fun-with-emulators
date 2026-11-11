@@ -885,7 +885,12 @@ fn main() {
                     }
                 };
                 let outside = socket(16, 3, 0);
-                println!("netlink outside: {} answers {}", outside >= 0, link(outside, None) as i32);
+                println!(
+                    "netlink outside: {} lo flags {:#x}, set down {}",
+                    outside >= 0,
+                    link(outside, None),
+                    link(outside, Some(false)) as i32
+                );
                 close(outside);
                 unshare(CLONE_NEWNET);
                 let nl = socket(16, 3, 0);

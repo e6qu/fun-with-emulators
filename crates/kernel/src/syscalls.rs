@@ -125,6 +125,11 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
 
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        // Told of a foster child: the watcher that follows it starts here,
+        // under the kernel lock.
+        if crate::reaper::watcher_wanted() {
+            crate::reaper::start_if_reaper();
+        }
         // Mappings changed by memory calls are published before any other
         // call ([`crate::maps::publish`]).
         crate::maps::flush_before(n);

@@ -1068,10 +1068,8 @@ which are to be lifted for 1.0 and which are not planned.
   `core_pattern` piping to a program dumps none; a process ended by a
   signal the host lacks exits on the host with status 128 + the signal,
   which only a parent that is not fwe's sees.
-- A `CLONE_PARENT` child's parent is the caller's for `getppid`, `/proc`
-  and adoption, but on the host it is the caller's child, which the
-  caller's parent cannot `wait` for (nor gets `SIGCHLD` of) while the
-  caller lives.
+- A `CLONE_PARENT` child is still its creator's child on the host, which
+  the creator could `wait` for while it lives (Linux's could not).
 - A process descriptor cannot be passed over a Unix socket (`EINVAL`:
   the host passes no kqueue); `PIDFD_GET_INFO` gives a wait status only
   to the process that reaped it, and no cgroup id; a `PIDFD_THREAD`

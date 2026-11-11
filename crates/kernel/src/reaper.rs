@@ -24,6 +24,12 @@
 //!   `wait`, which report the stop or continue as Linux reports a
 //!   child's ([`take_change`]).
 //!
+//! A child made with `CLONE_PARENT` is its creator's parent's, which is not
+//! its parent on the host: its record says so (a *foster* child,
+//! [`procreg::ProcRecord::foster`]), and it tells that parent as it starts
+//! ([`foster_started`]). The parent then runs the watcher too, and its
+//! `wait` takes the child as a reaper takes one it adopted.
+//!
 //! An adopter is found from the line of ancestors when it is asked for,
 //! and a process that becomes a subreaper, or stops being one, notes the
 //! orphans below it then ([`set_subreaper`]): those that had an adopter
@@ -79,6 +85,69 @@ pub fn adopter(who: Proc, lineage: &[Proc], bound: Option<Proc>) -> Option<i32> 
 /// ends is worth recording.
 pub fn might_adopt(who: Proc, lineage: &[Proc], bound: Option<Proc>) -> bool {
     adopter(who, lineage, bound).is_some()
+}
+
+/// Whether how process `who` ends is to be recorded for someone other
+/// than its host parent to take: a reaper might adopt it, or it is a
+/// foster child (`foster`) of a living parent.
+pub fn takes_end(who: Proc, lineage: &[Proc], bound: Option<Proc>, foster: bool) -> bool {
+    foster && lineage.first().is_some_and(|&p| procreg::alive(p))
+        || might_adopt(who, lineage, bound)
+}
+
+/// Whether a process with line `lineage`, foster or not (`foster`), is a
+/// foster child of this process (by pid and start time: not of an earlier
+/// process that had this pid).
+fn fostered_here(lineage: &[Proc], foster: bool) -> bool {
+    foster && lineage.first().is_some_and(|&p| Some(p) == own_proc())
+}
+
+/// This process as its pid and start time, kept once known.
+fn own_proc() -> Option<Proc> {
+    static PID: AtomicI32 = AtomicI32::new(0);
+    static START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let me = me();
+    if PID.load(SeqCst) != me {
+        let start = procreg::start_time(me)?;
+        START.store(start, SeqCst);
+        PID.store(me, SeqCst);
+    }
+    Some((me, START.load(SeqCst)))
+}
+
+/// This process has a foster child: its watcher is to run.
+static FOSTERING: AtomicBool = AtomicBool::new(false);
+
+/// This process was told it has a foster child (from the signal handler
+/// that takes the note). Async-signal-safe.
+pub fn fostered() {
+    FOSTERING.store(true, SeqCst);
+}
+
+/// Whether this process has foster children, so its watcher is to run
+/// (kept across `execve`, see [`set_fostering`]).
+pub fn fostering() -> bool {
+    FOSTERING.load(SeqCst)
+}
+
+/// [`fostering`], as a process that ran another program had it.
+pub fn set_fostering(on: bool) {
+    FOSTERING.store(on, SeqCst);
+}
+
+/// Whether the watcher is to be started: this process was told of a
+/// foster child and its watcher does not run yet. A cheap check.
+pub fn watcher_wanted() -> bool {
+    FOSTERING.load(SeqCst) && !active()
+}
+
+/// This process, just made with `CLONE_PARENT` (a foster child, its line
+/// `lineage`), tells its parent, whose watcher is to follow it.
+pub fn foster_started(lineage: &[Proc]) {
+    let Some(&(parent, _)) = lineage.first() else { return };
+    if crate::signote::foster(parent).is_ok() {
+        let _ = crate::host::kill_process(parent, crate::host::WAKE_SIGNAL);
+    }
 }
 
 /// `PR_SET_CHILD_SUBREAPER`: make this process a subreaper (`on`), or
@@ -154,18 +223,21 @@ pub fn reapable(e: &Ended) -> bool {
         || might_adopt((e.pid, e.start), &e.lineage, e.bound)
 }
 
-/// Whether ended process `e` is this process's to reap as an adopter.
+/// Whether ended process `e` is this process's to reap as an adopter, or
+/// as a foster child's parent.
 fn adopted_ended(e: &Ended) -> bool {
-    orphaned(&e.lineage) && adopter((e.pid, e.start), &e.lineage, e.bound) == Some(me())
+    fostered_here(&e.lineage, e.foster)
+        || orphaned(&e.lineage) && adopter((e.pid, e.start), &e.lineage, e.bound) == Some(me())
 }
 
 /// Whether living process `pid`, whose record is `r`, is one this process
-/// adopted.
+/// adopted, or a foster child of its.
 fn adopted_live(pid: i32, r: &procreg::ProcRecord) -> bool {
     let me = me();
-    r.lineage.first().is_some_and(|&(p, _)| p != me)
-        && orphaned(&r.lineage)
-        && adopter((pid, r.start), &r.lineage, r.bound) == Some(me)
+    fostered_here(&r.lineage, r.foster)
+        || r.lineage.first().is_some_and(|&(p, _)| p != me)
+            && orphaned(&r.lineage)
+            && adopter((pid, r.start), &r.lineage, r.bound) == Some(me)
 }
 
 /// Which children a `wait` is for, by host pid or process group.
@@ -302,6 +374,7 @@ fn changed(pid: i32, r: &procreg::ProcRecord, sig: Option<i32>) {
         lineage: r.lineage.clone(),
         bound: r.bound,
         numbers: procreg::numbers_in(&r.ns, pid),
+        foster: r.foster,
     };
     {
         let mut c = CHANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -504,7 +577,7 @@ pub fn reaped_child(child: i32) {
 fn is_reaper() -> bool {
     let init =
         crate::pidns::current().first().is_some_and(|ns| ns.get().number_of(me()) == Some(1));
-    init || procreg::own_subreaper()
+    init || fostering() || procreg::own_subreaper()
 }
 
 /// Start the watcher if this process is a reaper and it has none yet.

@@ -365,7 +365,9 @@ impl<P: Platform> Kernel<P> {
         };
         let dirs = fs.ns_dirs();
         let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
-        let inherit = crate::procreg::inherit();
+        let mut inherit = crate::procreg::inherit();
+        // Its parent is this process's, not this one (a foster child).
+        inherit.foster = flags & fwe_abi::clone::CLONE_PARENT != 0;
         let clear_sighand = flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0;
         let exit_signal = flags & fwe_abi::clone::CSIGNAL;
         Ok(ForkNs {
@@ -455,6 +457,9 @@ impl<P: Platform> Kernel<P> {
         // `/proc/<pid>/maps`.
         let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
         crate::procreg::own_line(&t.line, &t.inherit, t.dirs.clone(), crate::maps::forked(), &auxv);
+        if t.inherit.foster {
+            crate::reaper::foster_started(&t.line.0);
+        }
         if let Some(cg) = &t.cgroup {
             // Where it starts, should it look before the parent writes it.
             // SAFETY: getpid cannot fail.

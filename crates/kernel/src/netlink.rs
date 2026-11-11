@@ -12,10 +12,11 @@
 //! is up; any other request is answered with `EOPNOTSUPP`, as the kernel
 //! answers one it has no handler for.
 //!
-//! In the initial network namespace, whose interfaces are the host's, a
-//! socket can be made, and every request on it is answered with
-//! `EOPNOTSUPP`: fwe does not describe the host's interfaces. Such a socket
-//! still carries what the kernel itself sends it: a message queue's
+//! In the initial network namespace, whose interfaces are the host's, fwe
+//! describes the host's loopback as `lo`, always up, with its addresses:
+//! bringing it up changes nothing, taking it down is refused (`EPERM`).
+//! The host's other interfaces are not described. Such a socket also
+//! carries what the kernel itself sends it: a message queue's
 //! notification ([`crate::mqueue`]), for which [`bind_for_notify`] gives
 //! the socket a host address another process can send to.
 
@@ -569,14 +570,8 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             message(NLMSG_ERROR, flags, seq, port, &b)
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-        // The initial namespace's interfaces are the host's, which fwe does
-        // not describe.
-        let Some(net) = &net else {
-            replies.push(ack(errno::EOPNOTSUPP));
-            at += (len + 3) & !3;
-            continue;
-        };
-        let up = net.get().lo_up;
+        // The initial namespace's loopback is the host's, always up.
+        let up = net.as_ref().is_none_or(|n| n.get().lo_up);
         let result: Result<Vec<Vec<u8>>, i32> = match ty {
             RTM_GETLINK if flags & NLM_F_DUMP == NLM_F_DUMP => Ok(vec![
                 message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &link_body(up)),
@@ -597,11 +592,17 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
                 } else if !admin {
                     Err(errno::EPERM)
                 } else if change & IFF_UP != 0 || change == 0 {
-                    net.update(|n| {
-                        n.lo_up = want & IFF_UP != 0;
-                        Ok(())
-                    })
-                    .map(|()| Vec::new())
+                    match &net {
+                        Some(net) => net
+                            .update(|n| {
+                                n.lo_up = want & IFF_UP != 0;
+                                Ok(())
+                            })
+                            .map(|()| Vec::new()),
+                        // The host's stays up.
+                        None if want & IFF_UP != 0 => Ok(Vec::new()),
+                        None => Err(errno::EPERM),
+                    }
                 } else {
                     Ok(Vec::new())
                 }

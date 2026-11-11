@@ -4821,6 +4821,19 @@ fn hv_fork_and_vfork() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Children made with `CLONE_PARENT` are the creator's parent's: it is
+/// told when each ends and reaps each, though it is no subreaper and they
+/// are not its children on the host (runc makes a container's init so, in
+/// new namespaces, two levels down).
+#[test]
+fn clone_parent_children_are_their_parents() {
+    assert_eq!(
+        namespaces("fosters"),
+        "then: ECHILD true\nreaped: 3 children, first true, second true, init exited 7\n\
+         init's SIGCHLD: true\n"
+    );
+}
+
 /// A child subreaper adopts the orphans below it: it is their parent, it
 /// is sent `SIGCHLD` when one ends, and it reaps it, also one killed
 /// outright; a child of its own is not a subreaper.
@@ -4992,8 +5005,8 @@ fn overlay_mounts() {
 /// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
 /// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
 /// is not attached; limits set with `prlimit` from outside; netlink of a
-/// network namespace's `lo`, and in the host's, a socket whose requests
-/// are refused.
+/// network namespace's `lo`, and in the host's, the host's loopback, up
+/// and kept so.
 #[test]
 fn container_runtime_calls() {
     assert_eq!(
@@ -5005,7 +5018,7 @@ fn container_runtime_calls() {
          prlimit of the child: ok\nchild: oom 500 nofile 100 200\npeer: self true uid 0\n\
          shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
          linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
-         attached as a device program: EINVAL\nnetlink outside: true answers -95\n\
+         attached as a device program: EINVAL\nnetlink outside: true lo flags 0x10049, set down -1\n\
          netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
     );
 }

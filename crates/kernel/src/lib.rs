@@ -711,6 +711,8 @@ impl<P: Platform> Kernel<P> {
         e.bool(syscalls);
         // Its Landlock domain, which a program run keeps.
         landlock::save(&mut e);
+        // Its foster children, still its own to follow.
+        e.bool(reaper::fostering());
         e.into_bytes()
     }
 
@@ -748,7 +750,9 @@ impl<P: Platform> Kernel<P> {
         let thp = d.bool();
         let (tracer, syscalls) = (d.u32() as i32, d.bool());
         landlock::load(&mut d);
+        let fostering = d.bool();
         d.finish()?;
+        reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);

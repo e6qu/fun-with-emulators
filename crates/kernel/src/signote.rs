@@ -332,6 +332,16 @@ pub fn request_fd(target: i32, fd: i32, token: u64) -> Result<(), i32> {
 /// ([`request_mem`]).
 const MEM_REQUEST: u64 = 0x1_0001;
 
+/// What a queue entry holds for the note that the receiver has a foster
+/// child ([`foster`]).
+const FOSTER_NOTE: u64 = 0x1_0002;
+
+/// Tell host process `target` (woken by the caller) that it has a child
+/// made with `CLONE_PARENT` ([`crate::reaper::foster_started`]).
+pub fn foster(target: i32) -> Result<(), i32> {
+    put(target, 0, FOSTER_NOTE, 0, 0)
+}
+
 /// Ask process `target` to copy between its memory and the request file
 /// of reply socket `token` ([`answer_mem`]).
 pub fn request_mem(target: i32, token: u64) -> Result<(), i32> {
@@ -545,7 +555,9 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
     for e in q[..n.max(0) as usize].chunks_exact(ENTRY) {
         let word = |at: usize| e[at..at + 4].try_into().unwrap();
         let sig = i32::from_ne_bytes(word(0));
-        if sig as u64 == MEM_REQUEST {
+        if sig as u64 == FOSTER_NOTE {
+            crate::reaper::fostered();
+        } else if sig as u64 == MEM_REQUEST {
             answer_mem(
                 i32::from_ne_bytes(word(4)),
                 u64::from_ne_bytes(e[16..24].try_into().unwrap()),
