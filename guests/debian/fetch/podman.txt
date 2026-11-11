@@ -1,0 +1,37 @@
+# Debian 12 (bookworm) arm64 packages the podman test fetches from
+# https://deb.debian.org/debian/ and unpacks into its root filesystem: podman
+# (non-PIE, so the VM runs it), conmon and crun (PIEs, run natively),
+# catatonit, the containers configuration, and the libraries they load;
+# each line is a pool path and the package's SHA-256 from the bookworm index.
+pool/main/libp/libpod/podman_4.3.1+ds1-8+deb12u1+b3_arm64.deb ef75a5e3f39c9705ec7ad1d0a4e11ca81be3cb864fad631e89493538112126cb
+pool/main/c/conmon/conmon_2.1.6+ds1-1_arm64.deb 9d15cab56dc01b228c6d889b8159c1a45eb995c5938cbc9467bc19e01f36e3e7
+pool/main/c/crun/crun_1.8.1-1+deb12u1_arm64.deb e4a27bf7e75746e9d9500985402e83eb9c9d7742135ff038f0bd729a3cde2c20
+pool/main/c/catatonit/catatonit_0.1.7-1+b2_arm64.deb f50d9cbdec0b6cf471e82926579755ef77619b8f917d5e5d60f388196cde43e9
+pool/main/g/golang-github-containers-common/golang-github-containers-common_0.50.1+ds1-4_all.deb 39d5c31902c4ce55bd419286946d0b291383169585f1b3509000f6bf57454181
+pool/main/g/golang-github-containers-image/golang-github-containers-image_5.23.1-4_all.deb 2dc5697a30ae8de43221eeb7aa553d5187dbf97392d299ecb27ef51e46d159ca
+pool/main/liba/libassuan/libassuan0_2.5.5-5_arm64.deb f74048f54d824401b9aa4bb26fcabe1e4a29cd36f1331ceab8b474d5af59f24f
+pool/main/a/audit/libaudit1_3.0.9-1_arm64.deb 619606427a334cba955e0afb18bf4a636df4141d32ea474a79cc512b5ca358e7
+pool/main/a/audit/libaudit-common_3.0.9-1_all.deb 17d0341ca6ce604ce59c296780ac2c2a24141a769823c50669af942c025e6591
+pool/main/b/bzip2/libbz2-1.0_1.0.8-5+b1_arm64.deb d3a96ece03326498b39ff093a76800dfcbcb1d4049d6ae6e9f6fa1aa7a590ad6
+pool/main/libc/libcap-ng/libcap-ng0_0.8.3-1+b3_arm64.deb 24e74ad29a37d2a3940b8977d11298a7afc77379ef414b561d79c64147d740e0
+pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_arm64.deb b3a21ae1cef9c2f3fa340007100fb0aa934ab6a4d8aed131660de9713db2bb6e
+pool/main/libx/libxcrypt/libcrypt1_4.4.33-2_arm64.deb eea0ad76ea5eb507127fea0c291622ea4ecdbb71c4b9a8ed9c76ae33fc1a0127
+pool/main/l/lvm2/libdevmapper1.02.1_1.02.185-2_arm64.deb 0b4ffad17467a043dd1cb9cdbbcf8cbaf2ab88e902ae4c110a0b08d74753589b
+pool/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_arm64.deb 140af58350c9b15bfa611000d9e0205528bbed2cba39271bf12bd36de2678f2e
+pool/main/g/glib2.0/libglib2.0-0_2.74.6-2+deb12u9_arm64.deb 61d92fffada7e27fc0ed9d23e047b45bca3b2e3bfe1a918f4ec16559282859f4
+pool/main/libg/libgpg-error/libgpg-error0_1.46-1_arm64.deb aff6ce011ae9abf7090e906f0cf6bc2b447bbc4cc7e03ff117f9d73528857352
+pool/main/g/gpgme1.0/libgpgme11_1.18.0-3+b1_arm64.deb adf21a9ee8c3005804afcbaccdb3fe73023fd18e91babd55100b0c2a2813a578
+pool/main/l/lz4/liblz4-1_1.9.4-1_arm64.deb f061216ce11aabba8f032dfd6c75c181e782fef7493033b9621a8c3b2953b87e
+pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_arm64.deb 647ce9d81e41c30071ce6ac0d3324579216a33aaa1d28971d6952315f6a95a75
+pool/main/p/pam/libpam0g_1.5.2-6+deb12u2_arm64.deb f04916b56a3225cb109e1c283ebfb163524797a406148875a6871816dc8939cd
+pool/main/p/pcre2/libpcre2-8-0_10.42-1_arm64.deb b2448d0a8a3db7fbeac231e7ef93811346c1fb5f96ccf6f631701d8a4eb39206
+pool/main/libs/libseccomp/libseccomp2_2.5.4-1+deb12u1_arm64.deb be675cf3b7778d88e8f6156c501d32fcbe77636b3dcf18bf2bc7e5daf3dde256
+pool/main/libs/libselinux/libselinux1_3.4-1+b6_arm64.deb 29201edf23ebae40844d6c289afdb9bba52f927d55096ed1b1cd37e040135edc
+pool/main/libs/libsemanage/libsemanage2_3.4-1+b5_arm64.deb 6d1958b29ac622d352e00f9de55d9de8aea12bd0c27dee8b522e052ace3c67bd
+pool/main/libs/libsemanage/libsemanage-common_3.4-1_all.deb 835f806c21ae25e39053bd3057051640341b0cf08e1db9746fd82e370d82fa30
+pool/main/libs/libsepol/libsepol2_3.4-2.1_arm64.deb 22b0041a04af364f643ff2e7ff88eaaecdf0714dcfd253e8c99a6a952ae1fec6
+pool/main/s/shadow/libsubid4_4.13+dfsg1-1+deb12u2_arm64.deb 6db405e98139458f12ebd8e3598cdb1ddcf1314e0268ebe5572fce4c20c0469c
+pool/main/s/systemd/libsystemd0_252.39-1~deb12u2_arm64.deb 293ab474b90276dae9ebc03ed01e622e0c1f2578e83ed3aa926ae1eaf84dda9c
+pool/main/s/systemd/libudev1_252.39-1~deb12u2_arm64.deb b76444b0259abfa416f8c1d9a652d208a24770667a1181aa52317b74d12a7a72
+pool/main/y/yajl/libyajl2_2.1.0-3+deb12u2_arm64.deb 97f1216dffee32d3d4d71194f466432dd5bc9c9d9a2eb435fd12cb58dff8582c
+pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_arm64.deb 95e173c9538f96ede4fc275ec7863f395a97dd0ea62454be9bc914efa1b9be93

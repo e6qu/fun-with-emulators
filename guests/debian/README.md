@@ -98,6 +98,7 @@ it). Nothing fetched is redistributed in this repository.
 | `fetch/gcc.txt` | GCC 12 (the driver, `cc1`, `collect2`) with GMP, MPFR, MPC and ISL, GNU binutils (`as`, `ld`, `ar`), and the glibc and GCC files a program links with (`libc6`, `libc6-dev`, `linux-libc-dev`, `libgcc-12-dev`) | 40 MB |
 | `fetch/clang.txt` | clang 14 with LLVM 14 and its libraries, GNU binutils, and the glibc, GCC and libstdc++ files a program builds and links with | 63 MB |
 | `fetch/go.txt` | Go 1.19: the `go` command, its tools and the standard library's sources | 74 MB |
+| `fetch/podman.txt` | podman 4.3, conmon, crun, catatonit, the containers configuration, and the libraries they load (gpgme, libseccomp, libsubid, devmapper, glib, libsystemd, yajl and theirs) | 14 MB |
 
 ## License
 

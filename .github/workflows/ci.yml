@@ -125,7 +125,7 @@ jobs:
   podman:
     name: Podman (macos-26)
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -133,7 +133,8 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: cargo test -p fwe --test guests -- alpine_podman_builds --nocapture
+      - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
+      - run: cargo test -p fwe --test guests -- alpine_podman_builds hv_debian_podman --nocapture
         env:
           FWE_PODMAN_TESTS: "1"
       # Each process's calls and the registry's log, for a step that failed.

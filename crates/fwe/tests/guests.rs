@@ -2084,6 +2084,84 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Debian's podman 4.3 (fetched: `guests/debian/fetch/podman.txt`), a
+/// non-PIE executable the VM runs, only where `FWE_PODMAN_TESTS` is set
+/// (CI's `podman` job), as root: it loads the standard `alpine` image and
+/// runs a container of it through conmon and crun, which run natively, each
+/// a program podman's VM process starts with `execve`; the container's
+/// exit status is podman's.
+#[test]
+fn hv_debian_podman_runs_an_image() {
+    if !fetched_program_tests("FWE_PODMAN_TESTS") {
+        return;
+    }
+    let Some(_) = hv_mode() else {
+        eprintln!("skipped: no hypervisor on this host");
+        return;
+    };
+    let cached = fetched_root("podman");
+    let root = std::env::temp_dir().join(format!("fwe-debpodman-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    let etc = root.join("etc/containers");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::write(
+        etc.join("storage.conf"),
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\n\
+         graphroot = \"/var/lib/containers/storage\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        etc.join("containers.conf"),
+        "[engine]\ncgroup_manager = \"cgroupfs\"\nevents_logger = \"file\"\n\
+         runtime = \"crun\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\n").unwrap();
+    std::fs::write(root.join("etc/group"), "root:x:0:\n").unwrap();
+    for d in ["root", "tmp", "run", "var/tmp"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    alpine_oci_archive("podman", &root.join("tmp/alpine.tar"), false);
+    let _workload = workload();
+    let podman = |args: &[&str]| {
+        let mut cmd = hv_command().unwrap();
+        let trace = root.join("tmp/podman.trace");
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        cmd.stdin(Stdio::null());
+        let out = run_hv_for(cmd, "podman", Duration::from_secs(1200));
+        eprintln!(
+            "--- podman {args:?} ({}) stderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !out.status.success() && args[0] != "run" {
+            print_last_calls(&trace);
+        }
+        out
+    };
+    let loaded = podman(&["load", "-q", "-i", "/tmp/alpine.tar"]);
+    let run = podman(&[
+        "run",
+        "--rm",
+        "--network=none",
+        "docker.io/library/alpine:3.20",
+        "sh",
+        "-c",
+        "cat /etc/alpine-release; echo pid $$; id -u; exit 3",
+    ]);
+    if run.status.code() != Some(3) {
+        print_last_calls(&root.join("tmp/podman.trace"));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(stdout(&loaded).contains("alpine:3.20"), "{}", stdout(&loaded));
+    assert_eq!(stdout(&run), "3.20.10\npid 1\n0\n");
+    assert_eq!(run.status.code(), Some(3));
+}
+
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
 /// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
 /// constant tables among its code, which must not be rewritten), zlib, the
