@@ -454,6 +454,8 @@ pub fn busy<R>(f: impl FnOnce() -> R) -> R {
 /// is not here), and so are its waiters.
 pub fn forked_child() {
     RUNNING.store(false, SeqCst);
+    // The parent's foster children are not this process's.
+    FOSTERING.store(false, SeqCst);
     // The parent's children are not this process's.
     for (pid, _) in &EXIT_SIGNALS {
         pid.store(0, SeqCst);

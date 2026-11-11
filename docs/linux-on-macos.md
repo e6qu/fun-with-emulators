@@ -291,7 +291,7 @@ for a well-known property that puts it in the category.
 | Category | Software | Why it is there |
 |---|---|---|
 | native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once as mapped; the rewrites are system calls and thread-pointer accesses |
-| native, Go built as PIE | Alpine's podman and containerd (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and would need the VM |
+| native, Go built as PIE | Alpine's podman, containerd and Docker with BuildKit and Compose (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and would need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries scanned once each |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
@@ -358,7 +358,7 @@ its vCPU even in a loop with no system calls.
 Debian's Go 1.19 toolchain and the static executables it builds by default
 are linked low, non-PIE, and run in the VM (tested: `go` builds, runs and
 tests a module with goroutines). Go programs built as PIEs, as Alpine
-builds podman and containerd, run natively (tested). `go` starts its tools
+builds podman, containerd and Docker, run natively (tested). `go` starts its tools
 with `vfork`, supported in both backends.
 
 ### Python and other interpreters

@@ -55,6 +55,13 @@ fn publish_held() {
     crate::procreg::own_held(held);
 }
 
+/// Run `f` (a host `fork`) with the registry's lock held, released in both
+/// processes (see [`crate::fork_locked`]).
+pub fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _g = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// This thread's own view, if it has one. The kernel lock guards it, as it
 /// does the process's.
 pub fn current() -> Option<*mut Fs> {

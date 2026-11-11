@@ -962,7 +962,11 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
                             fs::hold(|| {
                                 futex::hold(|| {
                                     mm::hold(|| {
-                                        maps::hold(|| thread::hold(|| seqpacket::hold(fork)))
+                                        maps::hold(|| {
+                                            thread::hold(|| {
+                                                threadfs::hold(|| seqpacket::hold(fork))
+                                            })
+                                        })
                                     })
                                 })
                             })

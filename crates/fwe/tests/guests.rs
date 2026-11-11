@@ -1397,12 +1397,15 @@ fn alpine_crun_runs_an_image() {
             .arg(bundle.join("rootfs")),
     );
     let _workload = workload();
-    // Traced, except for the container's run: its program writes its own
-    // standard error into what the test reads.
+    // Traced: the container's run to a file (its program writes its own
+    // standard error into what the test reads), for a run that goes wrong.
+    let run_trace = root.join("tmp/crun-run.trace");
     let crun = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root).arg("--cwd").arg("/bundle");
-        if args[0] != "run" {
+        if args[0] == "run" {
+            cmd.arg("--strace").arg(format!("--strace-file={}", run_trace.display()));
+        } else {
             cmd.arg("--strace=failures");
         }
         cmd.arg(root.join("usr/bin/crun")).args(args);
@@ -1431,14 +1434,15 @@ fn alpine_crun_runs_an_image() {
     std::fs::write(&config, spec).unwrap();
     let id = format!("fwe-test-{}", std::process::id());
     let out = crun(&["run", &id]);
-    let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(
-        stdout(&out),
-        "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
+    let want = "pid 1 host crun\n0::/\n1\nCapEff:\t0000000020000420\nNoNewPrivs:\t1\nSeccomp:\t2\n\
          Read-only file system\nOperation not permitted\n\
          core fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero\n\
-         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n"
-    );
+         / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n";
+    if stdout(&out) != want {
+        print_last_calls(&run_trace);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), want);
     assert_eq!(out.status.code(), Some(0));
 }
 

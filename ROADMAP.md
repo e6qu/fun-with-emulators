@@ -21,7 +21,9 @@ What runs unmodified, with its output checked in CI:
   Node.js (V8's JIT), rustc with Cargo, and apt.
 - **In the VM**, for executables linked below 4 GiB: Debian's Python, GCC,
   clang and Go, on the software stand-in for Hypervisor.framework only.
-- **Containers:** crun, podman and containerd run the `alpine` image.
+- **Containers:** crun, podman and containerd run the `alpine` image;
+  Docker loads, runs and builds images, and Docker Compose brings up a
+  project.
 
 ## Done
 
@@ -81,6 +83,10 @@ against a baseline. Beyond M3:
 - **Waiting and time:** sleeps, timeouts, `poll`, `select` and timerfd as
   Linux reports them; `epoll_pwait2`; `futex_waitv`, requeue, bitsets and
   shared futexes.
+- **Containers, further:** a thread's own root, working directory, mounts
+  and namespaces (`unshare` and `setns` on one thread); namespace files
+  bound to paths (`nsfs`); `CLONE_PARENT` children waited for by their
+  parent; the host's loopback described over netlink.
 - **Other calls:** `personality`, `getcpu`, `syslog`, `membarrier`,
   `readahead`, `sync_file_range`, `vhangup`, `reboot`, strict seccomp, the
   LSM calls, protection keys as on a CPU without them, and the clock
@@ -116,7 +122,7 @@ hardware.
   late, or were in that run.
 - [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
   binaries without section headers, when a program needs them.
-- [ ] **Docker:** a distribution's Docker Engine (`dockerd` with its
+- [x] **Docker:** a distribution's Docker Engine (`dockerd` with its
   containerd and runc, and the `docker` CLI), started with
   `--bridge=none --iptables=false`, loads an image, runs a container of it
   (`docker run` with `--network=none` or the host's network), builds one
