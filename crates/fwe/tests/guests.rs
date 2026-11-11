@@ -1585,10 +1585,7 @@ fn alpine_podman_runs_an_image() {
         }
         out
     };
-    let loaded = podman(&["--log-level=debug", "load", "-i", "/tmp/alpine.tar"]);
-    if !stdout(&loaded).contains("Loaded image") {
-        print_last_calls(&root.join("tmp/podman.trace"));
-    }
+    let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
     let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
     let driver = podman(&["info", "--format", "{{.Store.GraphDriverName}}"]);
     let run = podman(&["run", "--rm", "--network=none", "alpine:3.20", "sh", "-c", IN_PODMAN]);
@@ -2148,7 +2145,10 @@ fn debian_podman_runs_in_the_vm() {
         }
         out
     };
-    let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
+    let loaded = podman(&["--log-level=debug", "load", "-i", "/tmp/alpine.tar"]);
+    if !stdout(&loaded).contains("Loaded image") {
+        print_last_calls(&root.join("tmp/podman.trace"));
+    }
     // The name it was loaded as (`Loaded image(s): <name>`).
     let name = stdout(&loaded)
         .lines()
