@@ -2221,7 +2221,14 @@ follows:
   enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
 - an overlay is resolved as Linux's `overlay`: upper then lower layers,
   whiteouts (0:0 device nodes) and opaque directories, copy-up as an APFS
-  clone, each change built in the work directory and renamed into place.
+  clone, each change built in the work directory and renamed into place;
+  a directory opened in a bind mount of one stays in that mount, with what
+  is mounted below it;
+- a namespace's file (`/proc/<pid>/ns/<kind>`, a thread's under
+  `task/<tid>`, or a descriptor of one) bound to a file is an `nsfs` mount
+  that names the namespace: opening the path gives a descriptor of it,
+  `stat` shows its inode, and it keeps the namespace from being collected
+  until unmounted (Docker and `ip netns` keep network namespaces so).
 
 ### Credentials and capabilities
 
