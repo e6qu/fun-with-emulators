@@ -465,8 +465,12 @@ memory or threads, so a tracee does its tracer's work itself:
   (its inbox page's generation, `SIGCHLD` and the wake signal) and serves
   requests until told to go on, with the signal the tracer chose; the
   registers the tracer changed are the ones it goes on with.
-- **The tracer** reads and writes registers, `siginfo` and options in
-  the mailbox, and asks the tracee for memory: `PEEK`/`POKE`, written as
+- **The tracer** reads and writes registers, `siginfo`, options and the
+  signal mask in the mailbox (`PTRACE_GET_SYSCALL_INFO` too, from the
+  registers and whether the stop is a call's entry or exit), and asks the
+  tracee for memory: `PEEK`/`POKE`, and up to 2 KiB at a time through the
+  page for another process's `/proc/<pid>/mem` and for
+  `process_vm_readv`/`writev` of a stopped tracee, written as
   `/proc/self/mem` writes (code too, its instructions fetched afresh, by
   the VM as well). Its `wait4` and `waitid` report a tracee's stop from
   its inbox before the host's children, looking again as tracees stop,
@@ -480,6 +484,19 @@ memory or threads, so a tracee does its tracer's work itself:
   while the process's other threads go on, and its end is reported to the
   tracer by its tid; the exit event comes before a process ends, and
   `PTRACE_O_EXITKILL` ends a tracer's tracees with it.
+- **Seizing** (`PTRACE_SEIZE`) marks the mailbox seized and nudges the
+  tracee: a `SIGSTOP` of fwe's own queue with a code of its own, which no
+  guest sees, ending a wait it is in (the call starts again after) so it
+  begins being traced without stopping. `PTRACE_INTERRUPT` sets a word
+  and nudges it the same way: it stops with `PTRACE_EVENT_STOP` and
+  `SIGTRAP`, at once, or as soon as a stop it is in ends. A seized
+  tracee's group-stop is an event stop with the stop signal; listened to
+  (`PTRACE_LISTEN`) it stays in its stop until `SIGCONT` comes (looked
+  for among the host's pending signals, as a stop is served with them
+  blocked) or the tracer interrupts it, then reports `PTRACE_EVENT_STOP`
+  with `SIGTRAP`. A process or thread a seized tracee starts begins with
+  that stop instead of `SIGSTOP`, and an `execve` stops it only for the
+  exec event. A guest's `SIGKILL` pending ends any stop.
 - **Single-stepping** plants a breakpoint of fwe's (`brk #0x4c59`) where
   the instruction may go next (a branch's target and the next
   instruction, a register's address), and stops when one is taken,
@@ -1011,10 +1028,8 @@ which are to be lifted for 1.0 and which are not planned.
 **Execution**
 - ptrace has no seccomp event (`PTRACE_O_TRACESECCOMP`), no hardware
   breakpoint or watchpoint (their register sets say there are none), and
-  no `PTRACE_INTERRUPT`, `LISTEN`, `PEEKSIGINFO` or signal-mask requests
-  (`EIO`); `PTRACE_SEIZE` stops the tracee with `SIGSTOP` as
-  `PTRACE_ATTACH` does. A single step over an exclusive load and store
-  loops, as a breakpoint between them clears the monitor.
+  no `PTRACE_PEEKSIGINFO` (`EIO`). A single step over an exclusive load
+  and store loops, as a breakpoint between them clears the monitor.
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
   which needs `fwe` signed with the hypervisor entitlement and a
   bare-metal Apple Silicon Mac.
@@ -1058,7 +1073,8 @@ which are to be lifted for 1.0 and which are not planned.
   `EOWNERDEAD`) and writes no accounting record; a VM process takes a
   `SIGKILL` from fwe as its own ending, with both.
 - `process_vm_readv`/`process_vm_writev` of a process that is stopped
-  waits until it runs again (its handler serves the request), and one of
+  (but in a ptrace stop of the caller's) waits until it runs again (its
+  handler serves the request), and one of
   a process fwe did not start fails with `ESRCH`; in the VM, a write to
   guest memory the guest maps read-only succeeds.
 - A Landlock domain is the process's, not the thread's that made it (the
@@ -1092,8 +1108,10 @@ which are to be lifted for 1.0 and which are not planned.
 - VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
   `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
   nothing.
-- `/proc/self/mem` and `/proc/self/pagemap` are the caller's own memory
-  only (macOS gives no process another's); a `pagemap` entry tells
+- Another process's `/proc/<pid>/mem` reaches its memory as
+  `process_vm_readv` does (or, for a stopped tracee of the reader's,
+  through its ptrace mailbox), and `pagemap` is the caller's own only; a
+  `pagemap` entry tells
   whether a page is in memory, its frame number 0, as Linux shows it to
   a process without `CAP_SYS_ADMIN`. `coredump_filter` is the default
   and cannot be changed.
