@@ -25,6 +25,9 @@ const PTRACE_GETSIGMASK: c_long = 0x420a;
 const PTRACE_SETSIGMASK: c_long = 0x420b;
 const PTRACE_GET_SYSCALL_INFO: c_long = 0x420e;
 const PTRACE_O_TRACESYSGOOD: u64 = 1;
+const PTRACE_O_TRACEEXEC: u64 = 0x10;
+const PTRACE_EVENT_EXEC: i32 = 4;
+const SYS_EXECVE: u64 = 221;
 const PTRACE_EVENT_STOP: i32 = 128;
 const SIGKILL: c_int = 9;
 const SIGUSR1: c_int = 10;
@@ -48,6 +51,7 @@ unsafe extern "C" {
     fn pread(fd: c_int, buf: *mut u8, n: usize, off: i64) -> isize;
     fn pwrite(fd: c_int, buf: *const u8, n: usize, off: i64) -> isize;
     fn close(fd: c_int) -> c_int;
+    fn execv(path: *const u8, argv: *const *const u8) -> c_int;
 }
 
 /// A word the parent reads and writes in the child through its `mem`.
@@ -99,7 +103,58 @@ fn syscall_info(pid: c_int) -> (i64, SyscallInfo) {
     (n as i64, i)
 }
 
+/// A seized child's `execve`, stopped at at system calls: the call's
+/// entry, the exec event, then its exit (0), as Linux stops at them.
+fn exec_stops() {
+    // SAFETY: plain calls; the child execs itself, which exits at once.
+    let child = unsafe { fork() };
+    if child == 0 {
+        // Waits for its tracer, then runs this program again.
+        // SAFETY: plain calls.
+        unsafe {
+            usleep(100_000);
+            let argv = [c"debugger".as_ptr() as *const u8, c"exec-child".as_ptr() as *const u8, std::ptr::null()];
+            execv(c"/proc/self/exe".as_ptr() as *const u8, argv.as_ptr());
+            syscall(93, 1 as c_long);
+        }
+    }
+    ptrace(PTRACE_SEIZE, child, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC);
+    ptrace(PTRACE_INTERRUPT, child, 0, 0);
+    wait(child, 0);
+    // Its stops until it ends: entry and exit of each call (by the
+    // info's op), and the exec event.
+    let mut seen = Vec::new();
+    loop {
+        ptrace(PTRACE_SYSCALL, child, 0, 0);
+        let Some(st) = wait(child, 0) else { break };
+        if st & 0x7f != 0x7f {
+            break;
+        }
+        if event(st) == PTRACE_EVENT_EXEC {
+            seen.push((3u8, 0u64));
+        } else if stopsig(st) == SIGTRAP | 0x80 {
+            let (_, i) = syscall_info(child);
+            seen.push((i.op, i.words[0]));
+        }
+    }
+    // Entries and exits alternate, the execve's exit after its event.
+    let alternate = seen
+        .iter()
+        .filter(|s| s.0 != 3)
+        .enumerate()
+        .all(|(n, s)| s.0 == if n % 2 == 0 { 1 } else { 2 });
+    let at = seen.iter().position(|&s| s == (1, SYS_EXECVE));
+    let exec_order = at.is_some_and(|i| seen.get(i + 1) == Some(&(3, 0)) && seen.get(i + 2).is_some_and(|s| s.0 == 2 && s.1 == 0));
+    println!("exec: alternate {alternate}, entry then event then exit {exec_order}");
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("exec-child") {
+        // SAFETY: a plain call.
+        unsafe { syscall(SYS_GETPPID) };
+        return;
+    }
+    exec_stops();
     // SAFETY: plain calls; the child ends by SIGKILL.
     let child = unsafe { fork() };
     if child == 0 {

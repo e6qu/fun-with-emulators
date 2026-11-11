@@ -511,6 +511,20 @@ impl Fs {
         }
     }
 
+    /// The program `path` names, a `/proc` link such as `/proc/self/exe`
+    /// followed to where it leads (the process that runs it next would
+    /// find its own there), as a path a new process can open.
+    pub fn exec_target(&self, path: &[u8]) -> Vec<u8> {
+        let mut p = path.to_vec();
+        for _ in 0..8 {
+            match self.synthetic(fcntl::AT_FDCWD as i32, &p) {
+                Some(crate::procfs::Entry::Symlink(t)) if t.starts_with(b"/") => p = t,
+                _ => break,
+            }
+        }
+        p
+    }
+
     /// The host path of the rootfs, or `None` when the root is the host `/`
     /// (pass-through). Used to root `AF_UNIX` socket paths.
     pub fn root_host_path(&self) -> Option<std::path::PathBuf> {

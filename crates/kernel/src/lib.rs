@@ -703,7 +703,9 @@ impl<P: Platform> Kernel<P> {
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
         // Traced on, by the same tracer ([`ptrace::restore`]).
-        e.u32(ptrace::exec_state() as u32);
+        let (tracer, syscalls) = ptrace::exec_state();
+        e.u32(tracer as u32);
+        e.bool(syscalls);
         // Its Landlock domain, which a program run keeps.
         landlock::save(&mut e);
         e.into_bytes()
@@ -741,10 +743,10 @@ impl<P: Platform> Kernel<P> {
         let nnp = d.bool();
         let persona = d.u32();
         let thp = d.bool();
-        let tracer = d.u32() as i32;
+        let (tracer, syscalls) = (d.u32() as i32, d.bool());
         landlock::load(&mut d);
         d.finish()?;
-        ptrace::restore(tracer);
+        ptrace::restore(tracer, syscalls);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);

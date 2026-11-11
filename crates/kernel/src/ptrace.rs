@@ -606,16 +606,26 @@ pub fn exiting(status: i32) {
     }
 }
 
-/// What a re-executed fwe must know: the tracer (0: none).
-pub fn exec_state() -> i32 {
-    if traced() { tracer() } else { 0 }
+/// What a re-executed fwe must know: the tracer (0: none), and whether
+/// it stops at system calls.
+pub fn exec_state() -> (i32, bool) {
+    if traced() { (tracer(), stops_at_syscalls()) } else { (0, false) }
 }
 
-/// In a re-executed fwe: traced by `tracer` again, as before `execve`.
-pub fn restore(tracer: i32) {
-    if tracer > 0 && alive(tracer) {
-        let _ = begin(tracer);
+/// In a re-executed fwe: traced by `tracer` again, as before `execve`,
+/// with its mailbox as it was (its options, whether it was seized), and
+/// stopping at system calls if it did (`syscalls`).
+pub fn restore(tracer: i32, syscalls: bool) {
+    if tracer <= 0 || !alive(tracer) {
+        return;
     }
+    if open(&mailbox_name(self_id()), false).is_none() {
+        let _ = begin(tracer);
+    } else {
+        TRACER.with(|t| t.set(tracer));
+        set_traced(true);
+    }
+    SYSCALLS.with(|t| t.set(syscalls));
 }
 
 /// How a stop ends.
@@ -1538,15 +1548,27 @@ impl<P: crate::Platform> crate::Kernel<P> {
         self.resync_for_tracing();
         let trap = fwe_abi::signal::SIGTRAP;
         let event = if options() & PTRACE_O_TRACEEXEC != 0 { PTRACE_EVENT_EXEC } else { 0 };
-        if event == 0 && seized() {
-            return;
-        }
+        let legacy_trap = event == 0 && !seized();
         let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
         let si = crate::signal::siginfo_bytes(trap, info);
         let msg = crate::thread::tgid() as u64;
-        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg, 0);
-        if r.signal() != 0 {
-            crate::thread::post_process(r.signal(), info);
+        // The exec event comes before the call's exit stop; the SIGTRAP of
+        // a tracee without it, a signal, after.
+        if event != 0 {
+            let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg, 0);
+            if r.signal() != 0 {
+                crate::thread::post_process(r.signal(), info);
+            }
+        }
+        if stops_at_syscalls() {
+            regs.x[0] = 0;
+            self.ptrace_syscall_stop(regs, false);
+        }
+        if legacy_trap {
+            let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, msg, 0);
+            if r.signal() != 0 {
+                crate::thread::post_process(r.signal(), info);
+            }
         }
     }
 

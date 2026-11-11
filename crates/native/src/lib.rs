@@ -314,6 +314,9 @@ pub(crate) fn reexec(
 ) -> i64 {
     use fwe_abi::{err, errno};
     use std::ffi::CString;
+    // A `/proc` link names a program the new fwe would look for in itself.
+    let target = fs.exec_target(path);
+    let path = &target[..];
     let file = match fs.read(path) {
         Ok(f) => f,
         Err(e) => return err(e),

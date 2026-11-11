@@ -1114,7 +1114,10 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
     }
     // Tests fetch at once, and manifests share packages: each download goes
     // to a name of its own and is renamed into place once it checks out.
-    let part = cache.join(format!("{name}.{tag}.part"));
+    // (A name of this fetch's own: two tests may fetch the same file.)
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let part = cache.join(format!("{name}.{tag}.{}-{n}.part", std::process::id()));
     let fetched = urls.iter().any(|url| {
         Command::new("curl")
             .args(["-fsSL", "--retry", "3", "-o"])
@@ -1206,6 +1209,9 @@ fn fetched_alpine(manifest_name: &str) -> Vec<PathBuf> {
 /// and cached: the minirootfs, then each package. An `.apk` is gzipped tar
 /// segments, its signature and metadata (dot files) before the files.
 fn alpine_root(manifest_name: &str) -> PathBuf {
+    // One test at a time makes a root: two may want the same one.
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest_in("alpine", manifest_name);
     let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
     let done = root.join(".fwe-complete");
@@ -2990,7 +2996,8 @@ fn ptrace_traces_a_child() {
 }
 
 /// What the `debugger` guest prints.
-const DEBUGGER: &str = "seize: 0, running true\n\
+const DEBUGGER: &str = "exec: alternate true, entry then event then exit true\n\
+    seize: 0, running true\n\
     interrupt: 0, stopped true, event stop true\n\
     sigmask: get 0, SIGUSR1 blocked true, set 0, now true\n\
     mem: read true, write true\n\
