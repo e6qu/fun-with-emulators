@@ -312,6 +312,26 @@ fn main() {
                     }
                     waitpid(-1, std::ptr::null_mut(), 0);
                 }
+                // A process's /proc directory is its effective user's, as
+                // newuidmap checks of the process it maps.
+                let mut ready = [0i32; 2];
+                pipe2(ready.as_mut_ptr(), 0);
+                let child = fork();
+                if child == 0 {
+                    setuid(1000);
+                    write(ready[1], b"r".as_ptr(), 1);
+                    let mut b = 0u8;
+                    read(ready[0], &mut b, 1);
+                    _exit(0);
+                }
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
+                use std::os::unix::fs::MetadataExt;
+                let theirs = std::fs::metadata(format!("/proc/{child}")).map(|m| m.uid());
+                let own = std::fs::metadata("/proc/self/status").map(|m| m.uid());
+                println!("/proc owners: theirs {theirs:?}, own {own:?}");
+                write(ready[1], b"g".as_ptr(), 1);
+                waitpid(child, std::ptr::null_mut(), 0);
             }
             // Extended attributes by namespace, as container images carry
             // them (file capabilities, overlay markers).

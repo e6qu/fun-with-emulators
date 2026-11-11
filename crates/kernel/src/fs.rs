@@ -564,10 +564,11 @@ impl Fs {
     /// A copy of this view, for a thread to have as its own
     /// ([`crate::threadfs`]), with its own descriptor of the rootfs.
     pub fn copy(&self) -> Result<Fs, i32> {
-        let root = self
-            .root
-            .try_clone()
-            .map_err(|e| errno_to_linux(e.raw_os_error().unwrap_or(libc::EMFILE)))?;
+        // In fwe's own range, out of the guest's reach (a program that
+        // closes or replaces its descriptors must not take the root).
+        let root = crate::fdtable::dup_reserved(self.root.as_raw_fd())?;
+        // SAFETY: a fresh descriptor of fwe's, owned by nothing else.
+        let root = unsafe { OwnedFd::from_raw_fd(root) };
         Ok(Fs {
             root,
             root_host: self.root_host.clone(),

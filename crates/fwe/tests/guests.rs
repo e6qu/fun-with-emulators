@@ -2145,9 +2145,13 @@ fn debian_podman_runs_in_the_vm() {
         }
         out
     };
-    let loaded = podman(&["load", "-q", "-i", "/tmp/alpine.tar"]);
+    let loaded = podman(&["load", "-i", "/tmp/alpine.tar"]);
     // The name it was loaded as (`Loaded image(s): <name>`).
-    let name = stdout(&loaded).trim().rsplit(' ').next().unwrap_or_default().to_string();
+    let name = stdout(&loaded)
+        .lines()
+        .find_map(|l| l.strip_prefix("Loaded image").and_then(|l| l.split_once(": ")))
+        .map(|(_, n)| n.trim().to_string())
+        .unwrap_or_default();
     let run = podman(&[
         "run",
         "--rm",
@@ -3320,7 +3324,7 @@ fn network_namespace_has_its_own_loopback() {
 fn threads_have_their_own_root_and_namespaces() {
     assert_eq!(
         namespaces("threads"),
-        "thread: unshare 0 private 0 tmpfs 0 true chroot 0 marker new\n\
+        "thread: unshare 0 private 0 tmpfs 0 true chroot 0 marker new new\n\
          others: root kept true, /mnt not mounted true\nshared: umask 77 cwd /tmp\n\
          net: thread bound true, process too true\nback: 0, port taken true\n\
          setns mnt with threads: -1 errno 22\n"
@@ -5261,7 +5265,8 @@ fn programs_grant_file_capabilities_and_set_ids() {
         "setcap: ok\ncapped: euid 1000 CapEff:\t0000000000000080\n\
          set-uid: euid 0 CapEff:\t000001fffdffffff\n\
          capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
-         set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n"
+         set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         /proc owners: theirs Ok(1000), own Ok(0)\n"
     );
 }
 

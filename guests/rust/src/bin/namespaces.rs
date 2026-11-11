@@ -620,9 +620,14 @@ fn main() {
                     let c = chroot(c"/newroot".as_ptr());
                     chdir(c"/".as_ptr());
                     let marker = std::fs::read_to_string("/etc/marker").unwrap_or_default();
+                    // Its every descriptor closed, as a program about to
+                    // run another closes them: its root is still there.
+                    syscall(436, 3i64, u32::MAX as i64, 0i64);
+                    let again = std::fs::read_to_string("/etc/marker").unwrap_or_default();
                     format!(
-                        "thread: unshare {u} private {p} tmpfs {m} {mnt} chroot {c} marker {}",
-                        marker.trim()
+                        "thread: unshare {u} private {p} tmpfs {m} {mnt} chroot {c} marker {} {}",
+                        marker.trim(),
+                        again.trim()
                     )
                 }
             });

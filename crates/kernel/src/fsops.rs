@@ -1303,6 +1303,26 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
+    /// `st`, a synthetic file's, owned as Linux owns the files of
+    /// `/proc/<pid>`: by the process's effective user and group (root's,
+    /// for a process that is not dumpable).
+    fn proc_owned(&self, dirfd: i32, path: &[u8], mut st: Stat) -> Stat {
+        let owner = match self.fs().proc_target(dirfd, path) {
+            Some((None, _))
+                if !crate::coredump::UNDUMPABLE.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                Some((self.creds.euid, self.creds.egid))
+            }
+            Some((Some(Some(host)), _)) => crate::procreg::read(host).map(|r| (r.ids[1], r.ids[5])),
+            _ => None,
+        };
+        if let Some((uid, gid)) = owner {
+            st.st_uid = crate::userns::to_ns(uid, false);
+            st.st_gid = crate::userns::to_ns(gid, true);
+        }
+        st
+    }
+
     fn stat_once(
         &self,
         dirfd: i32,
@@ -1313,46 +1333,36 @@ impl<P: Platform> Kernel<P> {
         use crate::procfs::Entry;
         use fwe_abi::stat as st;
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
-            return Ok((
-                match entry {
-                    Entry::Ns(n) => ns_stat(n.id),
-                    Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
-                    Entry::Symlink(t) if follow => {
-                        if let Some(ino) = namespace_inode(&t) {
-                            return Ok((ns_stat(ino), 0));
-                        }
-                        if depth >= 40 {
-                            return Err(errno::ELOOP);
-                        }
-                        // /proc/self/exe and the like follow to the real target.
-                        let target = self.fs().link_target(dirfd, path, &t);
-                        return self.linux_stat_attrs(
-                            fcntl::AT_FDCWD as i32,
-                            &target,
-                            true,
-                            depth + 1,
-                        );
+            let st = match entry {
+                Entry::Ns(n) => ns_stat(n.id),
+                Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
+                Entry::Symlink(t) if follow => {
+                    if let Some(ino) = namespace_inode(&t) {
+                        return Ok((ns_stat(ino), 0));
                     }
-                    Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
-                    Entry::Fd { fd, .. } if follow => {
-                        if crate::synthdir::fstat_is_dir(fd) {
-                            return Ok((synth_stat(st::S_IFDIR | 0o555, 0), 0));
-                        }
-                        let s = stat_fd(fd)?;
-                        let node = crate::devnodes::marked(&s)
-                            .then(|| crate::devnodes::node_of(fd))
-                            .flatten();
-                        let attrs = statx_attributes(&s, crate::modes::nodump_fd(fd, &s));
-                        return Ok((as_node(stat_to_linux(&s), node), attrs));
+                    if depth >= 40 {
+                        return Err(errno::ELOOP);
                     }
-                    Entry::Fd { target, .. } => {
-                        synth_stat(st::S_IFLNK | 0o700, target.len() as u64)
+                    // /proc/self/exe and the like follow to the real target.
+                    let target = self.fs().link_target(dirfd, path, &t);
+                    return self.linux_stat_attrs(fcntl::AT_FDCWD as i32, &target, true, depth + 1);
+                }
+                Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
+                Entry::Fd { fd, .. } if follow => {
+                    if crate::synthdir::fstat_is_dir(fd) {
+                        return Ok((synth_stat(st::S_IFDIR | 0o555, 0), 0));
                     }
-                    Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
-                    Entry::Missing => return Err(errno::ENOENT),
-                },
-                0,
-            ));
+                    let s = stat_fd(fd)?;
+                    let node =
+                        crate::devnodes::marked(&s).then(|| crate::devnodes::node_of(fd)).flatten();
+                    let attrs = statx_attributes(&s, crate::modes::nodump_fd(fd, &s));
+                    return Ok((as_node(stat_to_linux(&s), node), attrs));
+                }
+                Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
+                Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
+                Entry::Missing => return Err(errno::ENOENT),
+            };
+            return Ok((self.proc_owned(dirfd, path, st), 0));
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
         let name = r.name_c()?;
