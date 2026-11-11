@@ -3005,6 +3005,7 @@ const DEBUGGER: &str = "exec: alternate true, entry then event then exit true\n\
     interrupt: 0, stopped true, event stop true\n\
     sigmask: get 0, SIGUSR1 blocked true, set 0, now true\n\
     mem: read true, write true\n\
+    auxv: entry true\n\
     syscall info: size true, entry true, number 173, exit true\n\
     group stop: delivery true, event true, listen 0, stays true, continued true\n\
     killed: true\n";

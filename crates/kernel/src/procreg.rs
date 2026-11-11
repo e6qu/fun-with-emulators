@@ -79,6 +79,9 @@ pub struct ProcRecord {
     /// `PF_FORKNOEXEC` cleared): a parent may no longer move it to another
     /// process group.
     pub execed: bool,
+    /// The auxiliary vector its program started with (`/proc/<pid>/auxv`,
+    /// where a debugger finds where the program was loaded).
+    pub auxv: Vec<u8>,
 }
 
 /// A host process, as its pid and its start time.
@@ -217,6 +220,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     e.u64(r.slack.0);
     e.u64(r.slack.1);
     e.bool(r.execed);
+    e.bytes(&r.auxv);
     e.into_bytes()
 }
 
@@ -247,6 +251,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let maps = d.bytes();
     let slack = (d.u64(), d.u64());
     let execed = d.bool();
+    let auxv = d.bytes();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -271,6 +276,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
         maps,
         slack,
         execed,
+        auxv,
     })
 }
 
@@ -509,6 +515,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         maps: Vec::new(),
         slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
         execed: false,
+        auxv: Vec::new(),
     });
     f(&mut r);
     write(pid, &r);
@@ -539,6 +546,11 @@ pub fn own_program(exe: &[u8], cmdline: &[u8]) {
 }
 
 /// This process's main thread is named `comm`.
+/// This process's program started with auxiliary vector `auxv`.
+pub fn own_auxv(auxv: &[u8]) {
+    let _ = change(me(), |r| r.auxv = auxv.to_vec());
+}
+
 pub fn own_comm(comm: &[u8]) {
     let _ = change(me(), |r| r.comm = comm.to_vec());
 }
@@ -808,7 +820,8 @@ pub fn load_line(d: &mut Dec) -> (Vec<Proc>, Option<Proc>) {
 
 /// This process (just forked) has the line of ancestors and bound `line`,
 /// what it inherited of its parent's record (`inherit`), the namespaces
-/// `ns` it starts in, and the mappings `maps` it inherited (see
+/// `ns` it starts in, the auxiliary vector `auxv` of the program it runs,
+/// and the mappings `maps` it inherited (see
 /// [`crate::maps::forked`]): written by the child first, so it reads its
 /// own from the start, and the parent's later write ([`forked`]) keeps
 /// what it changed since (a namespace it unshared, say).
@@ -817,6 +830,7 @@ pub fn own_line(
     inherit: &Inherit,
     ns: Vec<Vec<u8>>,
     maps: Vec<u8>,
+    auxv: &[u8],
 ) {
     let _ = change(me(), |r| {
         if r.lineage.is_empty() {
@@ -825,6 +839,8 @@ pub fn own_line(
         }
         (r.lineage, r.bound) = line.clone();
         r.maps = maps;
+        // The program its parent runs, which it runs too until it execs.
+        r.auxv = auxv.to_vec();
     });
 }
 

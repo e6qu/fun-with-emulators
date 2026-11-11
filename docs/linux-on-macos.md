@@ -2034,8 +2034,9 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
 - `/proc/<pid>`, with its `task` directory, covers the processes of the
   reader's pid namespace. Another process's `mem` (and a thread's,
   `task/<tid>/mem`) is read and written as `process_vm_readv` reaches it,
-  or through a stopped tracee's mailbox; `pagemap` is the caller's own
-  only. `/proc/sys` writes reach the namespace sysctls fwe
+  or through a stopped tracee's mailbox, and its `auxv` is the vector
+  its program started with (a fork child's, its parent's); `pagemap` is
+  the caller's own only. `/proc/sys` writes reach the namespace sysctls fwe
   keeps (network, IPC) and the few it acts on.
 - `/proc/self/fd/N`, `cwd` and `root` behave as magic links.
 - `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's;

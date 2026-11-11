@@ -214,6 +214,18 @@ fn main() {
     unsafe { close(fd) };
     println!("mem: read {read_ok}, write {}", w == 8 && back == new);
 
+    // Where its program was loaded, from its auxiliary vector, as a
+    // debugger finds it: AT_ENTRY, this program's entry (the same program).
+    let auxv = std::fs::read(format!("/proc/{child}/auxv")).unwrap_or_default();
+    let words: Vec<u64> =
+        auxv.chunks_exact(8).map(|c| u64::from_ne_bytes(c.try_into().unwrap())).collect();
+    let entry = words.chunks_exact(2).find(|p| p[0] == 9).map(|p| p[1]);
+    let own = std::fs::read("/proc/self/auxv").unwrap_or_default();
+    let own: Vec<u64> =
+        own.chunks_exact(8).map(|c| u64::from_ne_bytes(c.try_into().unwrap())).collect();
+    let own_entry = own.chunks_exact(2).find(|p| p[0] == 9).map(|p| p[1]);
+    println!("auxv: entry {}", entry.is_some() && entry == own_entry);
+
     // Its system calls: a stop at getppid's entry, then at its exit.
     ptrace(PTRACE_SYSCALL, child, 0, 0);
     let st = wait(child, 0).unwrap_or(0);

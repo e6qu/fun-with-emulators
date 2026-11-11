@@ -239,6 +239,7 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"coredump_filter", DT_REG),
     (b"timerslack_ns", DT_REG),
     (b"mem", DT_REG),
+    (b"auxv", DT_REG),
     (b"ns", DT_DIR),
     (b"fd", DT_DIR),
     (b"task", DT_DIR),
@@ -434,6 +435,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/timerslack_ns" => Entry::File(format!("{}\n", rec.slack.0).into_bytes()),
         // Read and written by address (`crate::procmem`).
         b"/mem" => Entry::File(Vec::new()),
+        b"/auxv" => Entry::File(rec.auxv.clone()),
         b"/uid_map" | b"/gid_map" | b"/setgroups" => match user_record(&rec.ns) {
             Some(u) => {
                 let n = u.get();
