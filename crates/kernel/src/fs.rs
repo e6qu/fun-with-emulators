@@ -2542,12 +2542,44 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         return Ok(());
     }
     let access = if writes { libc::O_WRONLY } else { libc::O_RDONLY };
-    // SAFETY: as above; waits for the other end.
-    let fd = unsafe {
-        libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    let flags_host = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // A reader holds a non-blocking end too, opened first (a reader
+    // waiting counts as one on Linux and on the host alike): Linux's open
+    // succeeds once a writer has come, even if a signal is pending by then,
+    // where the host's returns `EINTR`; this end shows whether one came.
+    let early = if writes {
+        -1
+    } else {
+        // SAFETY: as above; does not wait.
+        unsafe {
+            libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NONBLOCK | flags_host)
+        }
     };
+    // SAFETY: as above; waits for the other end.
+    let mut fd = unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) };
+    let err = e();
+    if early >= 0 {
+        let came = fd < 0
+            && err == errno::EINTR
+            && matches!(
+                crate::fifo::probe(early),
+                crate::fifo::Probe::HungUp | crate::fifo::Probe::Data
+            );
+        if came {
+            // A writer came (and maybe went): the open succeeded, as Linux's.
+            // SAFETY: fwe's own descriptor, made blocking as the guest asked.
+            unsafe {
+                let fl = libc::fcntl(early, libc::F_GETFL);
+                libc::fcntl(early, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+            }
+            fd = early;
+        } else {
+            // SAFETY: fwe's own descriptor, not handed on.
+            unsafe { libc::close(early) };
+        }
+    }
     if fd < 0 {
-        return Err(e());
+        return Err(err);
     }
     // Out of the guest's range while it waits to be taken.
     let fd = crate::fdtable::reserve(fd)?;
