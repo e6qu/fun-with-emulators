@@ -2218,8 +2218,8 @@ follows:
   `fsconfig`, `fsmount`, `fspick`, `open_tree`, `move_mount`,
   `mount_setattr`, `statmount`, `listmount`) act on the table;
 - propagation as Linux's: peer groups, slaves, across namespaces;
-- `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time flags are
-  enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
+- `nosuid`, `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time
+  flags are enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
 - an overlay is resolved as Linux's `overlay`: upper then lower layers,
   whiteouts (0:0 device nodes) and opaque directories, copy-up as an APFS
   clone, each change built in the work directory and renamed into place;
@@ -2244,7 +2244,7 @@ guest's identity virtual:
 | capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start |
 | `chown` | changes the owner | kept in an attribute (`org.fwe.owner`, `crates/kernel/src/owners.rs`) under Linux's rules and shown by `stat`; the host file stays fwe's user's |
 | permission bits for a caller that is not root | the host's, for the host user | fwe's check by the guest's owner, mode and file-system ids, and each directory's search bit along a path (in a root filesystem) |
-| file capabilities, set-ID programs | set-ID bits | none: `execve` follows Linux's rules for a file with neither |
+| file capabilities, set-ID programs | set-ID bits, honoured only for root's files | `execve` acts on a program's `security.capability` attribute and its set-ID bits (the owner and group fwe keeps) with Linux's rules: the new ids and capability sets, the ambient set cleared, and nothing gained under `no_new_privs`, on a `nosuid` mount or while traced |
 
 How host users and file owners look to the guest is under
 [Host identity](#host-identity-and-machine-state).

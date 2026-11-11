@@ -912,7 +912,8 @@ each is mapped is in
   cannot be moved (`EINVAL`). Peer groups span namespaces, numbered across
   them. A namespace copied into a user namespace other than the original's
   owner (`unshare -Urm`) gets slaves of the original's shared mounts.
-- **Mount flags:** `nodev` refuses device opens (`EACCES`); `noexec`
+- **Mount flags:** `nosuid` has a program's set-ID bits and file
+  capabilities grant nothing; `nodev` refuses device opens (`EACCES`); `noexec`
   refuses running a program or mapping a file executable (`EACCES`,
   `EPERM`, and later `mprotect`); `nosymfollow` refuses links (`ELOOP`);
   `noatime`, `nodiratime` and `strictatime` set a read file's access time
