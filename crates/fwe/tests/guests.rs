@@ -1273,7 +1273,9 @@ fn in_debugger_root(args: &[&str], prog: Option<&Path>, keep: Option<&str>) -> (
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg("--cwd").arg("/tmp");
     cmd.arg(root.join(args[0].trim_start_matches('/'))).args(&args[1..]);
-    cmd.env("HOME", "/root").env("TERM", "dumb");
+    // The environment of a Linux login, not the host's.
+    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("HOME", "/root");
+    cmd.env("TERM", "dumb").env("SHELL", "/bin/sh");
     let out = run_bounded_for(cmd, &[], Duration::from_secs(180));
     let kept = keep.and_then(|k| std::fs::read(root.join(k.trim_start_matches('/'))).ok());
     let _ = std::fs::remove_dir_all(&root);
@@ -1300,12 +1302,14 @@ fn alpine_strace_traces_a_program() {
     assert_eq!(out.status.code(), Some(0));
     for want in [
         "execve(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"echo hi; /bin/true\"]",
-        "write(1, \"hi\\n\", 3) = 3",
         "execve(\"/bin/true\", [\"/bin/true\"]",
         "+++ exited with 0 +++",
     ] {
         assert!(trace.contains(want), "no {want:?} in the trace");
     }
+    // (strace pads the result into a column.)
+    let write = trace.lines().find(|l| l.contains("write(1, \"hi\\n\", 3)"));
+    assert!(write.is_some_and(|l| l.ends_with("= 3")), "no write of \"hi\" in the trace");
 }
 
 /// Alpine's gdb (fetched) debugs a C program built with debug
