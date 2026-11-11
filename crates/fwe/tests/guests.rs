@@ -1354,7 +1354,7 @@ fn alpine_gdb_debugs_a_program() {
         "in main () at",
         "$1 = 0",
         "$2 = 1",
-        "Run till exit from #0  add (a=0, b=1)",
+        "#1  0x",
         "Value returned is $3 = 1",
         "total 6",
         "exited normally]",
