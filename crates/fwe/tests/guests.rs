@@ -4433,6 +4433,18 @@ fn hv_delivers_signals() {
     assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
 }
 
+/// A child in a new user namespace, made by a raw `clone` from a second
+/// thread (as Go makes one), sets its parent-death signal, asks for its
+/// parent and ends: natively and in the VM, whose fork child starts from
+/// the snapshot the cloning thread's registers are in.
+#[test]
+fn userns_clone_from_a_thread() {
+    let want = "child's parent ours: true, ended 0\n";
+    assert_eq!(namespaces("userns-thread-clone"), want);
+    let Some(out) = fwe_hv(&rust_low_guest("namespaces"), &["userns-thread-clone"]) else { return };
+    assert_eq!(stdout(&out), want);
+}
+
 /// Namespaces in the VM, whose fork child starts from a snapshot of the
 /// namespaces made for it: a pid namespace numbering from 1, a UTS
 /// namespace's own name, a user namespace's maps.

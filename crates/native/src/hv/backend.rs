@@ -1479,6 +1479,34 @@ fn host_buffer(n: u64, i: usize, a: &[u64; 6]) -> Option<(u64, bool)> {
 
 /// Run the system call in `regs` (number in `x8`), leaving its result and
 /// any signal delivery in `regs`.
+/// How many of a fork child's first calls [`note_fork_child_call`] notes.
+static CHILD_CALLS_NOTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// In a VM fork child traced to a file: note its first calls' number,
+/// program counter, stack pointer and the stack's first words.
+fn note_fork_child_call(n: u64, regs: &Regs) {
+    if !fork::is_child() || fwe_kernel::trace::file().is_none() {
+        return;
+    }
+    let seen = CHILD_CALLS_NOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seen >= 8 {
+        return;
+    }
+    let words: Vec<String> = (0..4)
+        .map(|i| match uaccess::read::<u64>(regs.sp + 8 * i) {
+            Ok(w) => format!("{w:#x}"),
+            Err(_) => "?".into(),
+        })
+        .collect();
+    fwe_kernel::trace::note_to_file(&format!(
+        "hv fork child: call {n} at pc {:#x} sp {:#x} lr {:#x} stack [{}]",
+        regs.pc,
+        regs.sp,
+        regs.x[30],
+        words.join(" ")
+    ));
+}
+
 fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // A traced process stopping at system calls: the entry's stop.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
@@ -1487,6 +1515,9 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     }
     let n = regs.x[8];
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    // A fork child's first calls, where it is and on what stack, in the
+    // trace file: what a child that goes astray ran.
+    note_fork_child_call(n, regs);
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
         let action = fwe_kernel::seccomp::check(n, &args, regs.pc);

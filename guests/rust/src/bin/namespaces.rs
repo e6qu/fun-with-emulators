@@ -806,6 +806,28 @@ fn main() {
             });
             println!("child exited {code}");
         }
+        // A child in a new user namespace made from a second thread with a
+        // raw clone (as Go's os/exec makes one, podman's storage among
+        // them): it sets its parent-death signal, asks its parent, and ends.
+        Some("userns-thread-clone") => {
+            let t = std::thread::spawn(|| unsafe {
+                let mut p = [0i32; 2];
+                pipe(p.as_mut_ptr());
+                let child = syscall(SYS_CLONE, CLONE_NEWUSER as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                if child == 0 {
+                    syscall(167, 1i64, 9i64, 0i64, 0i64, 0i64);
+                    let ppid = syscall(173);
+                    write_i32(p[1], ppid as i32);
+                    _exit(0);
+                }
+                let ppid = read_i32(p[0]);
+                let mut st = 0;
+                waitpid(child as i32, &mut st, 0);
+                (ppid == getpid(), st)
+            });
+            let (parent_ok, st) = t.join().unwrap();
+            println!("child's parent ours: {parent_ok}, ended {}", (st >> 8) & 0xff);
+        }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds
             // it while a child in its own namespace has it.
