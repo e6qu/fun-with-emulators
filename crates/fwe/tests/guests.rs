@@ -1873,6 +1873,9 @@ fn alpine_docker_runs_and_builds_images() {
     assert_eq!(stdout(&ran), "built\nfrom the context\n");
     let up = stdout(&up);
     assert!(up.contains("reader-1  | stored\n") && up.contains("reader-1  | built\n"), "{up}");
+    let mut codes: Vec<String> = stdout(&codes).lines().map(str::to_string).collect();
+    codes.sort();
+    assert_eq!(codes, ["reader 6", "store 0"]);
     assert_eq!(down.status.code(), Some(0));
     assert_eq!(stdout(&after), "");
     assert_eq!(stdout(&volumes), "");
