@@ -239,6 +239,12 @@ jobs:
         with:
           name: bench-results
           path: macos.json
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-trace
+          path: bench-trace.txt
+          if-no-files-found: ignore
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.

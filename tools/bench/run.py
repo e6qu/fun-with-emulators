@@ -136,14 +136,28 @@ def unpack_lua(tarball, into):
     return os.path.join(into, "lua-5.4.7")
 
 
-def lua_build_s(cmd_for, src):
+def checked(cmd, retrace=None):
+    """Run `cmd`; on failure, show the end of its output and, with
+    `retrace` (fwe's trace options), run it once more traced, then stop."""
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0:
+        return
+    print(f"failed ({r.returncode}): {' '.join(cmd)}", file=sys.stderr)
+    print((r.stdout + r.stderr)[-4000:], file=sys.stderr)
+    if retrace:
+        subprocess.run(cmd[:1] + retrace + cmd[1:], capture_output=True)
+        print(f"traced to {retrace[-1]}", file=sys.stderr)
+    sys.exit(1)
+
+
+def lua_build_s(cmd_for, src, retrace=None):
     """Seconds to build Lua from clean with `cmd_for(make_args)`, best of
     three."""
 
     def once():
-        subprocess.run(cmd_for(["clean"]), check=True, capture_output=True)
+        checked(cmd_for(["clean"]))
         start = time.perf_counter()
-        subprocess.run(cmd_for(["-j4", "posix"]), check=True, capture_output=True)
+        checked(cmd_for(["-j4", "posix"]), retrace)
         return time.perf_counter() - start
 
     return best(once, 3)
@@ -206,7 +220,10 @@ def build(a, fwe, results):
     shutil.rmtree(os.path.join(tmp, "lua-5.4.7"), ignore_errors=True)
     src = unpack_lua(lua, tmp)
     make = fwe + ["--root", root, os.path.join(root, "usr/bin/make"), "-C", "/tmp/lua-5.4.7"]
-    results["fwe"]["build Lua (s)"] = lua_build_s(lambda args: make + args, src)
+    trace = os.path.abspath("bench-trace.txt")
+    results["fwe"]["build Lua (s)"] = lua_build_s(
+        lambda args: make + args, src, ["--strace", f"--strace-file={trace}"]
+    )
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
