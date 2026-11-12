@@ -1225,7 +1225,11 @@ gets a read filter with a low-water mark no read reaches. A wait polls the
 kqueue descriptor itself, together with the wake pipe
 (`thread::wait_ready`), then takes the events with a zero-timeout `kevent`
 and turns `EV_EOF` into `EPOLLHUP`/`EPOLLRDHUP` as Linux reports them.
-Several cases the host does not report are looked at in slices:
+Events it has taken reach the guest even if a further take to fill the
+guest's buffer is interrupted: an edge-triggered one is not reported again
+(Go's runtime, interrupted by its own preemption signals, would wait for
+ever on a pipe's end). Several cases the host does not report are looked
+at in slices:
 
 - the read end of a named FIFO whose writers have gone;
 - a mounts file;

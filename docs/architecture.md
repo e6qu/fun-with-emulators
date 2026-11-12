@@ -276,8 +276,11 @@ keeps:
 - **Native fork** (the sequence is drawn in
   [linux-on-macos.md](linux-on-macos.md#fork)):
   `fwe_kernel::fork_locked` holds the kernel lock and every registry lock
-  across the host `fork`, so the child (which has only the forking
-  thread) inherits none held by a thread it lacks; it refuses (`ENOSYS`)
+  across the host `fork`, and the locks threads take outside the kernel
+  lock (epoll's interest lists, pipe states, the user namespace...;
+  `forklock.rs`, taken all at once or not at all, so their order never
+  matters), so the child (which has only the forking thread) inherits
+  none held by a thread it lacks; it refuses (`ENOSYS`)
   once the process has a VM. Threads running guest code are suspended
   (`crates/native/src/quiesce.rs`); one in fwe's code (which may hold
   `malloc`'s lock) runs on and waits before re-entering guest code until
