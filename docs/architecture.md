@@ -280,7 +280,9 @@ keeps:
   lock (epoll's interest lists, pipe states, the user namespace...;
   `forklock.rs`, taken all at once or not at all, so their order never
   matters), so the child (which has only the forking thread) inherits
-  none held by a thread it lacks; it refuses (`ENOSYS`)
+  none held by a thread it lacks. A `RwLock` among them is replaced in the
+  child rather than unlocked, since on macOS unlocking one walks a queue
+  of waiting threads that the child lacks. The fork refuses (`ENOSYS`)
   once the process has a VM. Threads running guest code are suspended
   (`crates/native/src/quiesce.rs`); one in fwe's code (which may hold
   `malloc`'s lock) runs on and waits before re-entering guest code until

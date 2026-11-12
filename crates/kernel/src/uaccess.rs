@@ -30,7 +30,6 @@
 //! asks first.
 
 use fwe_abi::errno;
-use std::sync::RwLock;
 
 /// A translated guest range `[lo, hi)`, backed at `host`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +40,8 @@ pub(crate) struct Translation {
 }
 
 /// The translated ranges, sorted and disjoint.
-pub(crate) static TABLE: RwLock<Vec<Translation>> = RwLock::new(Vec::new());
+pub(crate) static TABLE: crate::forklock::ForkRwLock<Vec<Translation>> =
+    crate::forklock::ForkRwLock::new(Vec::new());
 
 fn table() -> std::sync::RwLockReadGuard<'static, Vec<Translation>> {
     TABLE.read().unwrap_or_else(|e| e.into_inner())
