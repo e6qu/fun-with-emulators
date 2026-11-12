@@ -229,14 +229,14 @@ stops running its own code.
   program and its libraries map, as it is mapped executable. Under
   `--strace` fwe notes for the program and its dynamic linker
   `prepared exe <addr>+<len>: N system calls, M stubs, K x18 uses left
-  unrewritten` (`interp` for the dynamic linker). An image without
-  section headers or unwind tables is scanned whole, which is slower and
-  less precise ([What is scanned](#what-is-scanned)).
+  unrewritten` (`interp` for the dynamic linker). An image without an
+  unwind table has every executable byte taken as code, which is slower
+  and less precise ([What is scanned](#what-is-scanned)).
 - **`svc #0`** is replaced in place by one `brk` word, no stub; it costs a
   trap each time it runs.
 - **`TPIDR_EL0` and `x18` instructions** branch to a short stub and back:
   a few extra instructions per execution, no trap. Linux toolchains seldom
-  allocate `x18`, and a few `x18` forms cannot be rewritten
+  allocate `x18`, and a handful of absurd `x18` forms are left alone
   ([What is not translated](#what-is-not-translated)).
 - **`CTR_EL0`** is emulated in fwe's `SIGILL` handler: C libraries read it
   once at startup; code that reads it often pays a trap each time.
@@ -273,7 +273,7 @@ program is built:
 | dynamic | the dynamic linker and each library prepared as mapped | loaded as is; private file mappings copied |
 | system call | a `brk` trap, a host signal handler | a vCPU exit and register transfers |
 | thread-local variables (`TPIDR_EL0`) | a stub branch per access | the hardware register |
-| code using `x18` | a stub branch per use; a few forms unrewritten | the hardware register |
+| code using `x18` | a stub branch per use | the hardware register |
 | reading `CTR_EL0` | a trap per read | read by the guest |
 | reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
 | JIT, write+exec pages | a fault per switch between writing and running | no faults |
@@ -555,11 +555,26 @@ ldr  x0, [x18, #8]            b    stub
 An instruction that writes `x18` stores the scratch register back into the
 slot; macOS preserves every register but `x18`, so the scratch register
 survives preemption. The rewrite covers every data-processing, load/store,
-exclusive, acquire/release and LSE atomic form, PC-relative forms
-(materialised from the original pc), compare- and test-branches, indirect
-branches through `x18`, and code using `sp` (offsets adjusted for the
-stub's push). A system call or signal frame sees the guest's real `x18`,
-`rt_sigreturn` restores it, and a new thread starts with its creator's.
+exclusive, acquire/release and LSE atomic form, system-register moves and
+`sys` (`dc civac, x18`), the thread pointer moved through `x18`, the
+pointer-authentication forms, PC-relative forms (materialised from the
+original pc), compare- and test-branches, indirect branches through `x18`
+(authenticated ones too), and code using `sp` (offsets adjusted for the
+stub's push, or `sp` in a scratch register). Some forms have stubs of
+their own:
+
+- `casp` with `x18` in a pair: a free even-numbered pair stands in for it;
+- a load or store of `x18` written back onto `sp` (`str x18, [sp, #-16]!`):
+  the access is made without the writeback, below the stub's saved
+  registers, and `sp` is moved by the immediate after;
+- `sp` written from `x18` (`mov sp, x18`): the new `sp` is computed in a
+  scratch register and set last, and the two scratch registers are read
+  back after it from where they were saved, below the old `sp`. A signal
+  delivered on those two loads finishes them first, since its frame goes
+  below the new `sp` and could cover them.
+
+A system call or signal frame sees the guest's real `x18`, `rt_sigreturn`
+restores it, and a new thread starts with its creator's.
 
 ### CTR_EL0: emulated when it traps
 
@@ -603,8 +618,10 @@ one of these instructions, so:
   `x18` instructions); a literal load marks its target as a literal pool;
 - system calls and thread-pointer accesses are rewritten throughout the
   executable sections;
-- without a usable unwind table, each executable section is all code;
-  without section headers, the whole executable segment is;
+- without section headers, the whole executable segment is scanned, and
+  the unwind table is found through `PT_GNU_EH_FRAME`, whose
+  `.eh_frame_hdr` points at it; without a usable unwind table, every
+  scanned word is taken as code;
 - code made executable after mapping (a JIT's) has only system calls and
   thread-pointer accesses rewritten: Linux arm64 JITs leave `x18` alone
   (V8 reserves it) and their pages hold data.
@@ -619,9 +636,11 @@ can be found the preparation fails: the guest's `mmap` or `mprotect` gets
 
 ### What is not translated
 
-- Load/store writeback onto `sp`, writes to `sp`, `casp` and the
-  pointer-authenticated loads that name `x18`, counted per image under
-  `--strace` ("x18 uses left unrewritten").
+- The memory-tagging instructions with an `sp` operand and `x18` (no
+  Apple CPU runs them), `casp` on `sp` with `x18`, an authenticated load
+  of `x18` written back onto `sp`, and `blraa x18, x30` (whose stub would
+  set the link register before the branch reads it as the modifier),
+  counted per image under `--strace` ("x18 uses left unrewritten").
 - `x18` uses in JIT code.
 - Pointer authentication is not offered natively (`AT_HWCAP` has no
   `PACA`/`PACG`), since the host owns the keys; programs use the
