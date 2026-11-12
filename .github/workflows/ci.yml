@@ -240,10 +240,17 @@ jobs:
           name: bench-results
           path: macos.json
       - if: failure()
+        run: |
+          mkdir -p crash-reports
+          cp ~/Library/Logs/DiagnosticReports/fwe* crash-reports/ 2>/dev/null || true
+          /usr/bin/log show --last 30m --style compact --predicate 'eventMessage CONTAINS[c] "fwe" AND NOT eventMessage CONTAINS "CT signature"' | grep -i -E 'kill|crash|exception|unrecoverable' | tail -40 || true
+      - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: bench-trace
-          path: bench-trace.txt
+          path: |
+            bench-trace.txt
+            crash-reports
           if-no-files-found: ignore
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the

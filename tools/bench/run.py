@@ -225,7 +225,14 @@ def build(a, fwe, results):
     make += ["-C", "/tmp/lua-5.4.7"]
     trace = os.path.abspath("bench-trace.txt")
     i = len(guest_env) + 1  # after fwe itself
-    traced = lambda cmd: cmd[:i] + ["--strace", f"--strace-file={trace}"] + cmd[i:]  # noqa: E731
+
+    def traced(cmd):
+        # The compiler alone, its messages and fwe's shown, then the build.
+        alone = guest_env + fwe + ["--strace", "--root", root, os.path.join(root, "usr/bin/clang")]
+        r = subprocess.run(alone + ["--version"], capture_output=True, text=True, errors="replace")
+        print(f"clang --version: {r.returncode}\n{(r.stdout + r.stderr)[-6000:]}", file=sys.stderr)
+        return cmd[:i] + ["--strace", f"--strace-file={trace}"] + cmd[i:]
+
     results["fwe"]["build Lua (s)"] = lua_build_s(lambda args: make + args, src, traced)
     # The Lua it built runs.
     out = subprocess.run(
