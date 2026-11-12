@@ -139,7 +139,7 @@ def unpack_lua(tarball, into):
 def checked(cmd, retrace=None):
     """Run `cmd`; on failure, show the end of its output and, with
     `retrace` (fwe's trace options), run it once more traced, then stop."""
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode == 0:
         return
     print(f"failed ({r.returncode}): {' '.join(cmd)}", file=sys.stderr)
