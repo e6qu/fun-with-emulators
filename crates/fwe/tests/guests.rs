@@ -3071,6 +3071,28 @@ fn rust_args_env_and_exit_status() {
     assert_eq!(out.status.code(), Some(7));
 }
 
+/// A program starts in the directory fwe was started in (in the root's
+/// terms under `--root`), so a relative path, the program's own among
+/// them, means what it does on the host.
+#[test]
+fn a_program_starts_in_the_directory_fwe_was_started_in() {
+    let dir = rust_guest("args").parent().unwrap().to_path_buf();
+    let run = |root: Option<&Path>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        if let Some(r) = root {
+            cmd.arg("--root").arg(r);
+        }
+        cmd.arg("./args").arg("cwd").current_dir(&dir);
+        stdout(&run_bounded(cmd))
+    };
+    let host = std::fs::canonicalize(&dir).unwrap();
+    assert!(run(None).contains(&format!("cwd={}\n./args found: true\n", host.display())));
+    // Under a root holding it: the same directory, from the root.
+    let root = host.ancestors().nth(2).unwrap();
+    let inside = Path::new("/").join(host.strip_prefix(root).unwrap());
+    assert!(run(Some(root)).contains(&format!("cwd={}\n./args found: true\n", inside.display())));
+}
+
 /// A compiled Rust/musl binary exercising heap, sleep, clock and a large
 /// allocation. Compiled code uses x18 as a scratch register throughout; the
 /// x18 rewrite (every x18-naming instruction in this binary is covered) keeps

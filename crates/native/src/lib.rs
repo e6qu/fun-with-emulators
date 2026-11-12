@@ -228,6 +228,18 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
         fs.chdir(fwe_abi::fcntl::AT_FDCWD as i32, cwd).map_err(|e| {
             Error::Unsupported(format!("entering {}: errno {e}", String::from_utf8_lossy(cwd)))
         })?;
+    } else if options.exec_state.is_none() {
+        // A fresh start: the directory fwe was started in, in the guest's
+        // terms (the root's `/` where it lies outside the root, as `chroot`
+        // leaves a program).
+        let host = std::env::current_dir().ok();
+        let guest = match &options.root {
+            None => host.map(|h| h.as_os_str().as_bytes().to_vec()),
+            Some(_) => host.and_then(|h| guest_path_in_root(&h, options)),
+        };
+        if let Some(cwd) = guest {
+            let _ = fs.chdir(fwe_abi::fcntl::AT_FDCWD as i32, &cwd);
+        }
     }
     Ok(fs)
 }
