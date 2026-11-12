@@ -4565,7 +4565,8 @@ fn hv_debian_python_runs_a_workload() {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
-    let out = run_hv(cmd, "python3.11");
+    // The stand-in on a loaded CI runner takes several times as long.
+    let out = run_hv_for(cmd, "python3.11", Duration::from_secs(600));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     assert_eq!(
         stdout(&out),

@@ -82,7 +82,7 @@ jobs:
       - if: failure()
         run: |
           /usr/bin/log show --last 60m --style compact --predicate \
-            'eventMessage CONTAINS[c] "unrecoverable" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
+            '(eventMessage CONTAINS[c] "unrecoverable" AND NOT eventMessage CONTAINS "CT signature") OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
             | tail -200 || true
       # The whole trace of a container engine's step that failed.
       - if: failure()
