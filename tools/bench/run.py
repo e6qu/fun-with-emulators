@@ -230,6 +230,8 @@ def build(a, fwe, results):
         # The compiler alone, its messages and fwe's shown, then the build.
         alone = guest_env + fwe + ["--strace", "--root", root, os.path.join(root, "usr/bin/clang")]
         r = subprocess.run(alone + ["--version"], capture_output=True, text=True, errors="replace")
+        with open("bench-clang.txt", "w") as f:
+            f.write(r.stdout + r.stderr)
         print(f"clang --version: {r.returncode}\n{(r.stdout + r.stderr)[-6000:]}", file=sys.stderr)
         return cmd[:i] + ["--strace", f"--strace-file={trace}"] + cmd[i:]
 

@@ -1883,14 +1883,16 @@ impl<P: Platform> Kernel<P> {
     /// for the stubs its code needs ([`Platform::prepare_exec`]): reserved
     /// (inaccessible), the room left free. Code longer than a branch reaches
     /// (128 MiB) needs both: its first sites reach only room before it.
-    /// None if the host has no such place.
+    /// Asked for at [`MMAP_HINT`], as other mappings left to fwe are, away
+    /// from the program's image and the break it grows. None if the host has
+    /// no such place.
     fn roomy_place(len: u64) -> Option<u64> {
         const ROOM: u64 = 64 << 20;
         // SAFETY: a fresh inaccessible mapping of fwe's; its head and tail
         // are let go.
         unsafe {
             let p = libc::mmap(
-                std::ptr::null_mut(),
+                MMAP_HINT as *mut libc::c_void,
                 (len + 2 * ROOM) as usize,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,

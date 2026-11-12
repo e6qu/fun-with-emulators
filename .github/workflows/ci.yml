@@ -250,6 +250,7 @@ jobs:
           name: bench-trace
           path: |
             bench-trace.txt
+            bench-clang.txt
             crash-reports
           if-no-files-found: ignore
 
