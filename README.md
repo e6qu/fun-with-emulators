@@ -32,7 +32,8 @@ bash, git, SQLite, lighttpd, Node.js, rustc with Cargo, apt) and in the VM
 not yet on real hardware). crun, podman and containerd run the `alpine`
 image; podman builds, pushes, pulls and runs images, rootless too; and
 Docker Engine loads, runs and builds images (BuildKit) and brings up
-Docker Compose projects, natively, with no VM. All 1213 of LTP's system-call tests that apply pass.
+Docker Compose projects, natively, with no VM. Wine runs Windows programs
+built for ARM64 in the VM (`fwe --vm`, on the stand-in). All 1213 of LTP's system-call tests that apply pass.
 [ROADMAP.md](ROADMAP.md) has the details and what is left to 1.0.
 
 ## Documentation
@@ -53,11 +54,32 @@ target/release/fwe ./hello                 # run a Linux arm64 executable
 target/release/fwe --root ./rootfs ./hello # with ./rootfs as /
 target/release/fwe --strace ./hello        # trace its system calls
 target/release/fwe --strace --strace-file=trace.log ./hello  # every process, to a file
+target/release/fwe --vm ./hello            # in the VM, with 4 KiB pages
 ```
 
 A dynamically linked program needs its dynamic linker and libraries under
 the root, at the paths the program names. For Debian binaries, that means a
 Debian rootfs.
+
+Windows programs built for ARM64 run through Wine, here Alpine's
+(`apk add wine` in an aarch64 Alpine root), in the VM:
+
+```sh
+cp winprog.exe alpine/tmp/
+fwe --vm --root ./alpine ./alpine/bin/busybox sh -c 'wine wineboot --init && wine /tmp/winprog.exe'
+```
+
+```text
+arm64: 1
+file: written by Windows, deleted 1
+threads: 4000, exit codes 10
+exception: handled
+child: hello
+child exited 7
+```
+
+That is `guests/windows/winprog.c`, built with
+`zig cc -target aarch64-windows-gnu`; CI's `wine` job runs it.
 
 ## Layout
 

@@ -2272,7 +2272,7 @@ fn alpine_wine_runs_windows_programs() {
             .env("HOME", "/root")
             .env("PATH", "/usr/bin:/bin")
             .env("WINEPREFIX", "/root/.wine")
-            .env("WINEDEBUG", "err+all,warn+winstation,warn+virtual,warn+section")
+            .env("WINEDEBUG", "err+all")
             .env("WINEDLLOVERRIDES", "mscoree,mshtml=");
         cmd.stdin(Stdio::null());
         // SAFETY: only setrlimit, async-signal-safe, between fork and exec.

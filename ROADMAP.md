@@ -25,6 +25,8 @@ What runs unmodified, with its output checked in CI:
   podman builds images, pushes and pulls them through a registry and runs
   rootless, and Debian's podman runs in the VM; Docker loads, runs and
   builds images, and Docker Compose brings up a project.
+- **Wine:** Alpine's arm64 Wine runs ARM64 Windows console programs in the
+  VM (`fwe --vm`), on the stand-in.
 
 ## Done
 
@@ -134,11 +136,12 @@ hardware.
   rootless podman as an ordinary user (a user namespace from
   `/etc/subuid`, overlay storage); `podman push` to and `podman pull` from
   a registry; Debian's podman (non-PIE, so in the VM) as well as Alpine's.
-- [ ] **Wine, a showcase:** Windows programs run on the Mac through a
-  distribution's arm64 Wine under fwe, with no VM: `wineboot` sets up a
-  prefix, `wine cmd /c` runs a batch command, and a C program built for
-  ARM64 Windows runs with its files, threads, exceptions and child
-  processes; the README shows it. What it is expected to need is in
+- [x] **Wine, a showcase:** Windows programs run on the Mac through
+  Alpine's arm64 Wine 11 under `fwe --vm` (Windows images want 4 KiB
+  pages): `wineboot` sets up a prefix, `wine cmd /c` runs a batch command,
+  and a C program built for ARM64 Windows runs with its files, threads,
+  exceptions and child processes; the README shows it. Tested in CI on the
+  software stand-in for Hypervisor.framework; how Wine meets fwe is in
   [linux-on-macos.md](docs/linux-on-macos.md#wine).
 
 **Done when:** every LTP system-call test passes in CI against the baseline,

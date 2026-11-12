@@ -310,7 +310,7 @@ for a well-known property that puts it in the category.
 | VM, container engine | Debian's podman 4.3 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
 | fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a trap natively or a VM exit |
-| uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (not tested by fwe) | natively each use goes through a stub, and JIT code's uses are not rewritten; in the VM `x18` is the guest's own |
+| uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub, and JIT code's uses are not rewritten; in the VM `x18` is the guest's own |
 
 ## Languages and runtimes
 
@@ -415,48 +415,54 @@ from fwe's mechanisms:
 
 ### Wine
 
-Not tested by fwe; it is on the
-[roadmap](../ROADMAP.md#m4--compatibility). How Wine for Linux would meet
-fwe's mechanisms, from how Wine is generally built:
+Tested: Alpine's arm64 Wine 11 runs under `fwe --vm` (in CI on the
+software stand-in for Hypervisor.framework). `wineboot` makes a prefix,
+`wine cmd /c` runs a batch command, and a C program built for ARM64
+Windows writes, reads and deletes a file, runs threads, has an exception
+taken by a vectored handler, and starts itself as a child process. How
+Wine meets fwe's mechanisms:
 
 - **Which Wine:** fwe runs only arm64 Linux code, so an arm64 build of
   Wine, which runs Windows programs built for ARM64. x86 or x64 Windows
   programs would need an x86 emulator inside the arm64 process (Wine on
   arm64 can load one, such as FEX, through WoW64 and ARM64EC), or an x64
   Wine under an emulator such as box64; fwe has no x86 emulation.
-- **Pages:** Wine assumes Windows' 4 KiB pages (Asahi Linux, with 16 KiB
-  pages, runs Wine in a 4 KiB-page VM). Natively the guest's pages are
-  16 KiB; in the VM they are 4 KiB.
-- **Backend:** Wine 10 and later are position-independent throughout
-  (the loader, `wineserver`, and `wine-preloader`, a static PIE that
-  reserves the low ranges Windows programs expect, with `MAP_FIXED`, before
-  loading the dynamic linker and Wine), so fwe would run them natively,
-  with 16 KiB pages. They run under `fwe --vm`, which puts every program
-  of the run in the VM. There a fixed mapping ending below fwe's code page
-  near 1 TiB is accepted, backed by slab memory (translated outside the
-  slab), and one beyond it fails with `ENOMEM`. Each reservation, even
+- **Backend:** Wine is position-independent throughout (the loader,
+  `wineserver`, and `wine-preloader`, a static PIE that reserves the low
+  ranges Windows programs expect, with `MAP_FIXED`, before loading the
+  dynamic linker and Wine), so by default fwe would run it natively, with
+  16 KiB pages. Windows images assume 4 KiB pages, so Wine runs under
+  `fwe --vm`, which puts every program of the run in the VM, where pages
+  are 4 KiB. There a fixed mapping ending below fwe's code page near
+  1 TiB is accepted, backed by slab memory (translated outside the slab),
+  and one beyond it fails with `ENOMEM`. Each reservation, even
   `PROT_NONE`, takes its size out of the slab, 7/16 of the guest-physical
   space the host offers (28 GiB on an M1 or M2), but host memory only for
-  the pages touched.
+  the pages touched; a reservation mapped over is zeroed only where its
+  pages held data.
 - **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`. In the
   VM `x18` is the guest's own. Natively, ELF code using it goes through
   stubs, and Windows code Wine loads and makes executable is treated as
   JIT code, its `x18` uses unrewritten: another reason it belongs in the
   VM.
 - **wineserver** talks to Wine processes over Unix sockets, passing
-  descriptors with `SCM_RIGHTS` (supported; received descriptors are not
-  held to `RLIMIT_NOFILE`), sharing memory through `MAP_SHARED` file
-  mappings and memfds (supported; in the VM, shared mappings are
-  segments), and suspending threads with ordinary signals, which fwe
-  relays.
+  descriptors with `SCM_RIGHTS` (received descriptors are not held to
+  `RLIMIT_NOFILE`), and suspends threads with ordinary signals, which fwe
+  relays. It stays a while after its last client leaves; `wineserver -w`
+  waits for it.
+- **Shared memory:** wineserver shares session and object memory through
+  files it creates and unlinks, which Wine processes map private and
+  writable. On Linux such a mapping shows the file's later writes on each
+  page until the process writes that page itself; fwe gives a private
+  mapping of a file with no name the same behaviour
+  ([The mmap family](#the-mmap-family)).
 - **Signals:** Wine handles `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGTRAP` on
   an alternate stack to emulate Windows exceptions; fwe delivers faults to
   guest handlers with Linux frames and honours `sigaltstack`; in the VM a
   misaligned pc or sp is `SIGBUS` and a `brk` is `SIGTRAP`.
-- **Other processes' memory:** `ptrace` and `process_vm_readv`/`writev`
-  work between fwe processes, but `/proc/<pid>/mem` is the caller's own
-  memory only, so what Wine does through it for another process would
-  fail. Whether that blocks ordinary programs is unknown.
+- **Fonts and display:** Alpine's Wine package does not depend on
+  FreeType or X11, and Wine says so on each run; console programs need
+  neither. Graphical programs are not planned.
 
 ## Which instructions get translated, and how
 
