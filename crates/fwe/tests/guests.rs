@@ -800,6 +800,77 @@ fn dynamic_min_resolves_libc_symbols() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A library whose code is longer than a branch reaches (128 MiB) gets
+/// room for its stubs on both sides: its first sites reach only room below
+/// it, here taken by a library loaded before it (guests/asm/bigcode.S,
+/// bigfill.S, guests/c/bigcode.c; LLVM's library in clang is such).
+#[test]
+fn a_library_longer_than_a_branch_gets_its_stubs() {
+    let out = out_dir().join("c");
+    std::fs::create_dir_all(&out).unwrap();
+    let obj = out.join("bigcode-lib.o");
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-c", "-o"])
+            .arg(&obj)
+            .arg(repo().join("guests/asm/bigcode.S")),
+    );
+    let root = libc_rootfs(Libc::Musl, "bigcode");
+    // Loaded first, below it: 140 MiB taken.
+    let fill_obj = out.join("bigfill.o");
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-c", "-o"])
+            .arg(&fill_obj)
+            .arg(repo().join("guests/asm/bigfill.S")),
+    );
+    let fill = root.join("lib/libbigfill.so");
+    run_checked(
+        Command::new(rust_lld())
+            .args(["-flavor", "gnu", "-shared", "-soname", "libbigfill.so", "-o"])
+            .arg(&fill)
+            .arg(&fill_obj),
+    );
+    let lib = root.join("lib/libbigcode.so");
+    run_checked(
+        Command::new(rust_lld())
+            .args(["-flavor", "gnu", "-shared", "-soname", "libbigcode.so", "-o"])
+            .arg(&lib)
+            .arg(&obj),
+    );
+    let main = out.join("bigcode-main.o");
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-O2", "-fPIC", "-ffreestanding", "-c", "-o"])
+            .arg(&main)
+            .arg(repo().join("guests/c/bigcode.c")),
+    );
+    let musl = Libc::Musl.lib_dir();
+    let prog = out.join("bigcode");
+    run_checked(
+        Command::new(rust_lld())
+            .args(["-flavor", "gnu", "-pie", "-rpath=/lib"])
+            .arg(format!("--dynamic-linker={}", Libc::Musl.interp()))
+            .arg("-o")
+            .arg(&prog)
+            .arg(musl.join("Scrt1.o"))
+            .arg(musl.join("crti.o"))
+            .arg(&main)
+            .arg(&fill)
+            .arg(&lib)
+            .arg(Libc::Musl.libc_so())
+            .arg(musl.join("crtn.o")),
+    );
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
+    let run = run_bounded(cmd);
+    eprintln!("--- bigcode stderr:\n{}", String::from_utf8_lossy(&run.stderr));
+    if std::env::var_os("KEEP_BIGCODE").is_none() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    assert_eq!(run.status.code(), Some(0));
+}
+
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
 /// crt objects, using the heap and buffered stdio from the shared libc. Covers
 /// the complete path — `ld-musl` self-relocation, `crt` `_start`,
