@@ -89,8 +89,9 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
 /// (see [`run_vm_bounded`]).
 /// At a timeout: the processes running under the guest's root that left
 /// its process group (a daemon's double fork, as podman's conmon), each
-/// sampled (its host threads' stacks, kept in `target/tmp/samples` for CI
-/// to keep, the innermost fwe frame of each printed) and then stopped.
+/// sampled: its host threads' stacks, kept in `target/tmp/samples` for CI
+/// to keep, the innermost fwe frame of each printed. They are left running
+/// (a daemon the test goes on using among them).
 fn sample_strays(cmd: &Command) {
     let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
@@ -138,11 +139,6 @@ fn sample_strays(cmd: &Command) {
             }
         }
         flush(&mut inner);
-        if pid > 0 {
-            // SAFETY: SIGTERM to a process of the guest's, a positive host
-            // pid (VM processes catch it and tear their VM down).
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
     }
 }
 
@@ -1758,6 +1754,13 @@ fn alpine_containerd_runs_an_image() {
         if out.status.code() != Some(expect) {
             print_last_calls(&root.join("tmp").join(&trace));
             print_last_calls(&root.join("tmp/containerd.trace"));
+            // The whole traces, for CI to keep.
+            let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("test-traces");
+            let _ = std::fs::create_dir_all(&kept);
+            for t in [trace.as_str(), "containerd.trace"] {
+                let _ =
+                    std::fs::copy(root.join("tmp").join(t), kept.join(format!("{}-{t}", args[1])));
+            }
         }
         out
     };
@@ -5387,6 +5390,15 @@ fn subreaper_adopts_orphans() {
         namespaces("subreaper-thread"),
         "child exited 0\nchild is not a subreaper: true\norphan adopted: true\n\
          the worker took its SIGCHLD: true\nreaped: true\n"
+    );
+    // Blocked and read from a signalfd, it ends a `ppoll` that watches a
+    // named FIFO too (conmon's wait), which reports its other descriptors
+    // as any other wait does.
+    assert_eq!(
+        namespaces("subreaper-signalfd-fifo"),
+        "child exited 0\nchild is not a subreaper: true\norphan adopted: true\n\
+         ppoll woke for its SIGCHLD: true\nreaped: true\n\
+         with the FIFO, an eventfd writable: true\n"
     );
 }
 

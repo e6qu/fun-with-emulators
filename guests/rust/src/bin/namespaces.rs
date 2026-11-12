@@ -1096,6 +1096,73 @@ fn main() {
                 _exit(0);
             }
         }
+        // An adopted orphan's SIGCHLD, blocked and read from a signalfd,
+        // ends a `ppoll` of that signalfd and a named FIFO (conmon's wait).
+        Some("subreaper-signalfd-fifo") => {
+            // SAFETY: plain calls with valid arguments; the children exit.
+            unsafe {
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                let blocked = 1u64 << (SIGCHLD - 1);
+                syscall(135, 0i64, &blocked as *const u64, 0i64, 8i64);
+                // signalfd4(-1, mask, 8, SFD_NONBLOCK)
+                let sfd = syscall(74, -1i64, &blocked as *const u64, 8i64, 0o4000i64) as i32;
+                let path = format!("/tmp/fwe-sfd-fifo-{}\0", getpid());
+                // mknodat(AT_FDCWD, path, S_IFIFO | 0600, 0)
+                syscall(33, -100i64, path.as_ptr(), 0o010600i64, 0i64);
+                let reader = openat(-100, path.as_ptr().cast(), 0o4000);
+                let writer = openat(-100, path.as_ptr().cast(), 1 | 0o4000);
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let mut go = [0i32; 2];
+                pipe(go.as_mut_ptr());
+                GO.store(go[0], std::sync::atomic::Ordering::SeqCst);
+                // It ends a while after told, once the wait has begun.
+                let (_, g) = orphan(report, || {
+                    read_i32(GO.load(std::sync::atomic::Ordering::SeqCst));
+                    usleep(100_000);
+                    7
+                });
+                let parent = read_i32(report[0]);
+                write_i32(go[1], 0);
+                // Each wake told of a child; the orphan's must wake one
+                // (the first child's may come first).
+                let (mut woke, mut told) = (true, false);
+                let mut info = [0u8; 128];
+                for _ in 0..5 {
+                    // fd, then events (POLLIN) and revents.
+                    let mut fds = [[sfd, 1], [reader, 1]];
+                    let ts = [5i64, 0];
+                    let n = syscall(73, fds.as_mut_ptr(), 2i64, ts.as_ptr(), 0i64, 8i64);
+                    if n <= 0 || (fds[0][1] >> 16) & 1 == 0 {
+                        woke = false;
+                        break;
+                    }
+                    while read(sfd, info.as_mut_ptr(), info.len()) == 128 {
+                        // `ssi_pid` at offset 12.
+                        told |= i32::from_le_bytes(info[12..16].try_into().unwrap()) == g;
+                    }
+                    if told {
+                        break;
+                    }
+                }
+                println!("orphan adopted: {}", parent == getpid());
+                println!("ppoll woke for its SIGCHLD: {}", woke && told);
+                let mut status = 0;
+                println!("reaped: {}", waitpid(g, &mut status, 0) == g);
+                // The same wait sees what Linux reports of its other
+                // descriptors: an eventfd with room is writable at once.
+                let efd = syscall(19, 0i64, 0i64) as i32;
+                let mut fds = [[reader, 1], [efd, 4]]; // POLLIN, POLLOUT
+                let ts = [2i64, 0];
+                let n = syscall(73, fds.as_mut_ptr(), 2i64, ts.as_ptr(), 0i64, 8i64);
+                println!("with the FIFO, an eventfd writable: {}", n == 1 && (fds[1][1] >> 16) & 4 != 0);
+                close(efd);
+                close(reader);
+                close(writer);
+                // unlinkat(AT_FDCWD, path, 0)
+                syscall(35, -100i64, path.as_ptr(), 0i64);
+            }
+        }
         // A process that becomes a subreaper does not adopt the orphans
         // that had their adopter already, as on Linux an orphan is adopted
         // when its parent ends.

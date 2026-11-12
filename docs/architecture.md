@@ -695,6 +695,8 @@ shapes differently:
   FIFO's read end wait in short slices and probe with `select` between
   them, reporting `POLLHUP` once the data still buffered is read (once to
   an edge-triggered or one-shot `epoll` entry). The probe reads nothing.
+  Each slice is a wait as any other, which a signal ends and which moves a
+  signal blocked for a `signalfd` onto it.
   An open that waits for the other end runs without the kernel lock.
 
 ### /proc and /sys
