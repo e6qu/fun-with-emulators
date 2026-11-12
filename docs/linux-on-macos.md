@@ -615,7 +615,10 @@ one of these instructions, so:
 - `x18` is rewritten only within the ranges the unwind table (`.eh_frame`)
   covers, since hand-written assembly keeps constant tables in `.text`
   (OpenSSL's `libcrypto` has over a thousand data words that decode as
-  `x18` instructions); a literal load marks its target as a literal pool;
+  `x18` instructions); a literal load marks its target as a literal pool.
+  That holds where the table describes most of the section: one that
+  describes less than half of it (musl, built without unwind tables, has
+  entries only for its assembly) leaves all of it code;
 - system calls and thread-pointer accesses are rewritten throughout the
   executable sections;
 - without section headers, the whole executable segment is scanned, and

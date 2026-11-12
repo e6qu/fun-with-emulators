@@ -259,6 +259,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18sig",
     "x18rare",
     "x18spsig",
+    "x18partial",
     "fpsig",
     "efault",
     "sigmap",
@@ -3096,6 +3097,16 @@ fn x18_lookalike_data_is_kept_without_section_headers() {
         .unwrap();
     for program in [&bin, &stripped] {
         assert_eq!(fwe(program, &[]).status.code(), Some(0), "{}", program.display());
+    }
+}
+
+/// x18 in code the unwind table does not describe, in a program whose
+/// table describes little (as musl's describes only its assembly): code all
+/// the same, rewritten, across preemption (guests/asm/x18partial.S).
+#[test]
+fn x18_in_code_a_sparse_unwind_table_leaves_out_is_rewritten() {
+    for name in ["x18partial", "x18partial-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
     }
 }
 
