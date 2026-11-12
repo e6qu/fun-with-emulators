@@ -95,6 +95,37 @@ impl Reader<'_> {
     }
 }
 
+/// From `.eh_frame_hdr` (its bytes, at link address `vaddr`): the address
+/// of `.eh_frame`, and that of the last frame description entry its search
+/// table names, if it has a table. `None` for a header this cannot read.
+pub fn eh_frame_from_header(hdr: &[u8], vaddr: u64) -> Option<(u64, Option<u64>)> {
+    let mut r = Reader { data: hdr, pos: 0 };
+    if r.u8()? != 1 {
+        return None;
+    }
+    let (ptr_enc, count_enc, table_enc) = (r.u8()?, r.u8()?, r.u8()?);
+    // `DW_EH_PE_datarel` here is relative to the header's start.
+    let value = |r: &mut Reader<'_>, enc: u8| -> Option<u64> {
+        if enc & 0x70 == 0x30 {
+            Some(vaddr.wrapping_add(r.pointer(enc & 0x0f, vaddr, false)?))
+        } else {
+            r.pointer(enc, vaddr, true)
+        }
+    };
+    let eh_frame = value(&mut r, ptr_enc)?;
+    if count_enc == PE_OMIT || table_enc == PE_OMIT {
+        return Some((eh_frame, None));
+    }
+    let count = r.pointer(count_enc & 0x0f, vaddr, false)?;
+    let mut last = None;
+    for _ in 0..count {
+        let _start = value(&mut r, table_enc)?;
+        let fde = value(&mut r, table_enc)?;
+        last = Some(last.map_or(fde, |l: u64| l.max(fde)));
+    }
+    Some((eh_frame, last))
+}
+
 /// The FDE address encoding a CIE at `pos` declares (its `R` augmentation),
 /// or absolute 8-byte pointers when it declares none.
 fn cie_encoding(data: &[u8], pos: usize, end: usize, vaddr: u64) -> Option<u8> {

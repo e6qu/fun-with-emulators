@@ -23,6 +23,7 @@ pub const PT_INTERP: u32 = 3;
 pub const PT_NOTE: u32 = 4;
 pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
+pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 pub const PT_GNU_STACK: u32 = 0x6474_e551;
 pub const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 /// `GNU_PROPERTY_AARCH64_FEATURE_1_AND` bits: the binary is built for BTI
@@ -357,26 +358,56 @@ impl<'a> Elf<'a> {
 
     /// File-offset ranges `(offset, size)` of the executable sections, for a
     /// mapping made straight from the file (`mmap` with `PROT_EXEC`), where
-    /// positions are file offsets rather than virtual addresses. `None` when
-    /// there are no section headers, so the caller falls back to translating
-    /// the whole mapped region. The dynamic linker maps a shared library's
-    /// code segment this way, and for a library whose code segment also holds
-    /// its symbol and string tables (as glibc's `libc.so.6` does) this keeps
-    /// the rewrite off those tables.
-    pub fn exec_file_ranges(&self) -> Option<Vec<(u64, u64)>> {
-        self.exec_sections().map(|s| s.into_iter().map(|s| (s.offset, s.size)).collect())
+    /// positions are file offsets rather than virtual addresses. The dynamic
+    /// linker maps a shared library's code segment this way, and for a
+    /// library whose code segment also holds its symbol and string tables (as
+    /// glibc's `libc.so.6` does) this keeps the rewrite off those tables.
+    /// With no section headers, the executable load segments.
+    pub fn exec_file_ranges(&self) -> Vec<(u64, u64)> {
+        if let Some(sections) = self.exec_sections()
+            && !sections.is_empty()
+        {
+            return sections.into_iter().map(|s| (s.offset, s.size)).collect();
+        }
+        self.loads().filter(|ph| ph.executable()).map(|ph| (ph.offset, ph.filesz)).collect()
     }
 
     /// The `(start, length)` link-address ranges of code that the unwind
     /// table (`.eh_frame`) describes, or `None` without a usable table. Bytes
     /// of an executable section outside them are data in practice (see
-    /// `unwind.rs`).
+    /// `unwind.rs`). Without section headers the table is found through
+    /// `PT_GNU_EH_FRAME`, whose `.eh_frame_hdr` points at it and at its
+    /// last entry.
     pub fn unwind_code_ranges(&self) -> Option<Vec<(u64, u64)>> {
-        let s = self.section_named(b".eh_frame")?;
-        let end = s.offset.checked_add(s.size)?;
-        let data = self.data.get(s.offset as usize..end as usize)?;
-        let ranges = unwind::code_ranges(data, s.addr)?;
+        let (data, addr) = match self.section_named(b".eh_frame") {
+            Some(s) => {
+                let end = s.offset.checked_add(s.size)?;
+                (self.data.get(s.offset as usize..end as usize)?, s.addr)
+            }
+            None => self.eh_frame_through_header()?,
+        };
+        let ranges = unwind::code_ranges(data, addr)?;
         (!ranges.is_empty()).then_some(ranges)
+    }
+
+    /// `.eh_frame`'s bytes up to the end of its last entry, and its
+    /// address, as `PT_GNU_EH_FRAME` locates them.
+    fn eh_frame_through_header(&self) -> Option<(&'a [u8], u64)> {
+        let ph = self.phdrs.iter().find(|ph| ph.kind == PT_GNU_EH_FRAME)?;
+        let hdr = self.data.get(ph.offset as usize..ph.offset.checked_add(ph.filesz)? as usize)?;
+        let (addr, last) = unwind::eh_frame_from_header(hdr, ph.vaddr)?;
+        // The bytes from `addr` to the end of the load segment holding it.
+        let load = self.loads().find(|l| l.vaddr <= addr && addr < l.vaddr + l.filesz)?;
+        let start = (addr - load.vaddr + load.offset) as usize;
+        let mut end = (load.offset + load.filesz) as usize;
+        let data = self.data.get(start..end)?;
+        // Up to the end of the last entry the header's table names.
+        if let Some(last) = last.and_then(|l| l.checked_sub(addr)) {
+            let at = last as usize;
+            let len = u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?) as usize;
+            end = start + (at + 4 + len).min(data.len());
+        }
+        Some((self.data.get(start..end)?, addr))
     }
 
     /// [`Elf::unwind_code_ranges`] as `(file offset, length)`, through the
@@ -775,11 +806,11 @@ mod tests {
     fn exec_file_ranges_reports_file_offsets() {
         let d = packed_code_image();
         let elf = Elf::parse(&d).unwrap();
-        assert_eq!(elf.exec_file_ranges(), Some(vec![(0x200, 0x100)]));
+        assert_eq!(elf.exec_file_ranges(), vec![(0x200, 0x100)]);
     }
 
     /// With no section headers (fully stripped), the whole executable load
-    /// segments are translated, and the file-offset query signals a fallback.
+    /// segments are translated, by address and by file offset.
     #[test]
     fn exec_ranges_falls_back_without_sections() {
         let d = image(
@@ -792,6 +823,6 @@ mod tests {
         );
         let elf = Elf::parse(&d).unwrap();
         assert_eq!(elf.exec_ranges(), vec![(0, 0x200)]);
-        assert_eq!(elf.exec_file_ranges(), None);
+        assert_eq!(elf.exec_file_ranges(), vec![(0, 0x200)]);
     }
 }
