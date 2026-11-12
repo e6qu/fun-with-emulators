@@ -87,6 +87,65 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
 /// The guest's output and its pid, killing it after `limit`. With `vm`, the
 /// command leads its own process group, and a timeout ends the group gently
 /// (see [`run_vm_bounded`]).
+/// At a timeout: the processes running under the guest's root that left
+/// its process group (a daemon's double fork, as podman's conmon), each
+/// sampled (its host threads' stacks, kept in `target/tmp/samples` for CI
+/// to keep, the innermost fwe frame of each printed) and then stopped.
+fn sample_strays(cmd: &Command) {
+    let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
+        return;
+    };
+    let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output() else {
+        return;
+    };
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("samples");
+    let _ = std::fs::create_dir_all(&dir);
+    for line in String::from_utf8_lossy(&ps.stdout).lines() {
+        let mut f = line.split_whitespace();
+        let (Some(pid), Some(_), command) = (f.next(), f.next(), f.collect::<Vec<_>>().join(" "))
+        else {
+            continue;
+        };
+        if !command.contains(root.as_str()) || !command.contains("fwe") {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<i32>() else { continue };
+        let file = dir.join(format!("sample-{pid}.txt"));
+        let _ = Command::new("sample")
+            .arg(pid.to_string())
+            .arg("1")
+            .arg("-file")
+            .arg(&file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        eprintln!("--- {pid} {command}");
+        // Each thread, and the innermost fwe frame of its heaviest stack.
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut inner: Option<&str> = None;
+        let flush = |inner: &mut Option<&str>| {
+            if let Some(l) = inner.take() {
+                eprintln!("      {}", l.trim_start_matches([' ', '+', '!', ':', '|']).trim());
+            }
+        };
+        for l in text.lines().take_while(|l| !l.starts_with("Total number in stack")) {
+            if l.contains("Thread_") {
+                flush(&mut inner);
+                eprintln!("    {}", l.trim());
+            } else if l.contains("fwe_") {
+                inner = Some(l);
+            }
+        }
+        flush(&mut inner);
+        if pid > 0 {
+            // SAFETY: SIGTERM to a process of the guest's, a positive host
+            // pid (VM processes catch it and tear their VM down).
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+}
+
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -137,6 +196,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                     String::from_utf8_lossy(&ps.stdout)
                 );
             }
+            sample_strays(&cmd);
             if vm {
                 let pgid = child.id() as i32;
                 // SAFETY: SIGTERM to the guest's own process group; VM
@@ -2205,6 +2265,10 @@ fn debian_podman_runs_in_the_vm() {
     ]);
     if run.status.code() != Some(3) {
         print_last_calls(&root.join("tmp/podman.trace"));
+        // The whole trace, for CI to keep.
+        let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
+        let _ = std::fs::create_dir_all(&kept);
+        let _ = std::fs::copy(root.join("tmp/podman.trace"), kept.join("debian-run.trace"));
     }
     let _ = std::fs::remove_dir_all(&root);
     assert!(stdout(&loaded).contains("alpine:3.20"), "{}", stdout(&loaded));
