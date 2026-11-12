@@ -2220,6 +2220,7 @@ fn debian_podman_runs_in_the_vm() {
 /// exception and a child process.
 #[test]
 fn alpine_wine_runs_windows_programs() {
+    use std::os::unix::process::CommandExt;
     if !fetched_program_tests("FWE_WINE_TESTS") {
         return;
     }
@@ -2241,12 +2242,23 @@ fn alpine_wine_runs_windows_programs() {
     let _ = std::fs::remove_dir_all(&kept);
     std::fs::create_dir_all(&kept).unwrap();
     let mut step = 0;
-    let mut wine = |args: &[&str]| {
+    // Processes beyond what a step needs fail to start, rather than a run
+    // that goes wrong taking the machine's: the user's processes now, and
+    // room for Wine's (each VM process has a stand-in watcher too).
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mine = Command::new("ps").args(["-U", &uid.to_string(), "-o", "pid="]).output().unwrap();
+    let cap = (stdout(&mine).lines().count() + 300) as libc::rlim_t;
+    let mut wine = |command: &str| {
         step += 1;
         let mut cmd = hv_command().unwrap();
         let trace = root.join(format!("tmp/step-{step}.trace"));
+        let err = format!("/tmp/step-{step}.err");
         cmd.arg("--vm").arg("--strace").arg(format!("--strace-file={}", trace.display()));
-        cmd.arg("--root").arg(&root).arg(root.join("usr/bin/wine")).args(args);
+        // Wine's messages to a file: wineserver, which stays a while after a
+        // step, holds the standard error it was given.
+        cmd.arg("--root").arg(&root).arg(root.join("bin/sh"));
+        cmd.args(["-c", &format!("exec {command} 2>{err}")]);
         // No display: Wine runs its console programs without one. No Mono or
         // Gecko to offer to install.
         cmd.env_clear()
@@ -2256,19 +2268,30 @@ fn alpine_wine_runs_windows_programs() {
             .env("WINEDEBUG", "err+all")
             .env("WINEDLLOVERRIDES", "mscoree,mshtml=");
         cmd.stdin(Stdio::null());
+        // SAFETY: only setrlimit, async-signal-safe, between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit { rlim_cur: cap, rlim_max: cap };
+                libc::setrlimit(libc::RLIMIT_NPROC, &lim);
+                Ok(())
+            });
+        }
         let out = run_hv_for(cmd, "wine", Duration::from_secs(1800));
-        eprintln!("--- wine {args:?} ({}) stdout:\n{}", out.status, stdout(&out));
+        let messages =
+            std::fs::read_to_string(root.join(err.trim_start_matches('/'))).unwrap_or_default();
+        eprintln!("--- {command} ({}) stdout:\n{}", out.status, stdout(&out));
+        eprintln!("--- its messages:\n{messages}");
         if !out.status.success() {
             print_last_calls(&trace);
             let _ = std::fs::copy(&trace, kept.join(format!("step-{step}.trace")));
         }
         out
     };
-    let version = wine(&["--version"]);
-    let boot = wine(&["wineboot", "--init"]);
+    let version = wine("wine --version");
+    let boot = wine("wine wineboot --init");
     let prefix = root.join("root/.wine/system.reg").exists();
-    let batch = wine(&["cmd", "/c", "echo hello from cmd"]);
-    let program = wine(&["/tmp/winprog.exe"]);
+    let batch = wine("wine cmd /c echo hello from cmd");
+    let program = wine("wine /tmp/winprog.exe");
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(stdout(&version), "wine-11.0\n");
     assert!(boot.status.success() && prefix, "wineboot: {} prefix {prefix}", boot.status);
