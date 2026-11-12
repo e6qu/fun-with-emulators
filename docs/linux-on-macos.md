@@ -1012,7 +1012,9 @@ checks (`crates/kernel/src/cloneargs.rs`). See
 **`clone` of a process**: natively a host `fork` with every registry lock
 held and the other guest threads suspended; `CLONE_VM` makes the private
 memory inherit by sharing for that fork and `CLONE_VFORK` makes the parent
-wait on a pipe until the child execs or exits. In the VM no host fork
+wait on a pipe until the child execs or exits (made, and the parent's write
+end closed, under the kernel lock, so no child another thread forks
+meanwhile holds it). In the VM no host fork
 happens: a fresh `fwe --hv-fork-child` gets the kernel state over a Mach
 port (with fwe's private directory, where the run's records and signal
 mailboxes are: the host's lookup of the user's temporary directory gives

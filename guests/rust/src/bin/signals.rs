@@ -766,6 +766,50 @@ fn main() {
             }
             println!("{}", describe(wait_status(pid)));
         }
+        // Threads that vfork and exec at once, each child staying a while:
+        // a vfork returns once its own child has exec'd, not when another
+        // thread's child ends (Go's runtime starts processes so).
+        "vfork-concurrent" => {
+            unsafe extern "C" {
+                fn vfork() -> i32;
+                fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;
+            }
+            let exe = std::env::current_exe().unwrap();
+            let mut path = exe.into_os_string().into_encoded_bytes();
+            path.push(0);
+            let path: &'static [u8] = Box::leak(path.into_boxed_slice());
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    std::thread::spawn(move || {
+                        let mut slowest = std::time::Duration::ZERO;
+                        let mut pids = Vec::new();
+                        for _ in 0..6 {
+                            let argv = [path.as_ptr(), b"linger\0".as_ptr(), std::ptr::null()];
+                            let envp = [std::ptr::null()];
+                            let start = std::time::Instant::now();
+                            // SAFETY: the child only execs or exits.
+                            let pid = unsafe { vfork() };
+                            if pid == 0 {
+                                // SAFETY: valid NUL-terminated arrays.
+                                unsafe {
+                                    execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                                    _exit(127)
+                                }
+                            }
+                            slowest = slowest.max(start.elapsed());
+                            pids.push(pid);
+                        }
+                        for pid in pids {
+                            wait_status(pid);
+                        }
+                        slowest
+                    })
+                })
+                .collect();
+            let slowest = threads.into_iter().map(|t| t.join().unwrap()).max().unwrap();
+            println!("each vfork returned once its child exec'd: {}", slowest.as_millis() < 1500);
+        }
+        "linger" => std::thread::sleep(std::time::Duration::from_millis(2000)),
         "spawned" => println!("hello from the spawned child"),
         // Code written into writable and executable memory, as a JIT
         // compiler does: run, rewritten in place and run again, one piece

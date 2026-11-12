@@ -3108,6 +3108,8 @@ fn command_spawns_a_child_program() {
 #[test]
 fn exec_replaces_the_address_space() {
     assert_eq!(signals("vfork-exec"), "hello from the spawned child\nexited 0\n");
+    // Threads that vfork at once: none waits for another's child.
+    assert_eq!(signals("vfork-concurrent"), "each vfork returned once its child exec'd: true\n");
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
 

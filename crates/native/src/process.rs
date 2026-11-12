@@ -183,22 +183,25 @@ pub(crate) fn reserve_pair(fds: [i32; 2]) -> Result<[i32; 2], i32> {
 pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
-    // A pipe whose write end only the child holds: it closes when the child
-    // execs (it is close-on-exec) or exits, which ends the parent's wait.
     let mut done = [-1i32; 2];
-    if wait {
-        // SAFETY: plain host call with a 2-element array.
-        if unsafe { libc::pipe(done.as_mut_ptr()) } != 0 {
-            return fwe_kernel::host::last_error();
-        }
-        done = match reserve_pair(done) {
-            Ok(d) => d,
-            Err(e) => return fwe_abi::err(e),
-        };
-    }
-
     let (pid, shown) = {
         let mut kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        // A pipe whose write end only the child holds: it closes when the
+        // child execs or exits, which ends the parent's wait. It is made,
+        // and the parent's write end closed, under the kernel lock, where
+        // every fork is: no other thread's child inherits the write end (the
+        // parent would wait for that child too, which may never end: Go's
+        // runtime starts processes from two threads at once).
+        if wait {
+            // SAFETY: plain host call with a 2-element array.
+            if unsafe { libc::pipe(done.as_mut_ptr()) } != 0 {
+                return fwe_kernel::host::last_error();
+            }
+            done = match reserve_pair(done) {
+                Ok(d) => d,
+                Err(e) => return fwe_abi::err(e),
+            };
+        }
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
         let token = match k.fork_begin(&a) {
@@ -259,6 +262,11 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         if pid == 0 && share.is_empty() {
             fwe_kernel::mm::forked_child();
         }
+        if pid > 0 && done[1] >= 0 {
+            // SAFETY: the child holds its own copy of the write end.
+            unsafe { libc::close(done[1]) };
+            done[1] = -1;
+        }
         (if pid < 0 { e } else { pid as i64 }, shown)
     };
     if pid < 0 {
@@ -313,7 +321,6 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
     if wait {
         // SAFETY: plain host calls on the pipe opened above.
         unsafe {
-            libc::close(done[1]);
             let mut b = 0u8;
             while libc::read(done[0], (&mut b as *mut u8).cast(), 1) < 0
                 && host::last_errno() == libc::EINTR
