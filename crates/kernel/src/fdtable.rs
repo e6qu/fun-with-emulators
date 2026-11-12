@@ -26,7 +26,7 @@ pub const RESERVED: i32 = 64;
 /// The first descriptor the guest may not use (the guest's hard limit).
 static GUEST_MAX: AtomicI32 = AtomicI32::new(1024);
 /// The guest's virtual `RLIMIT_NOFILE`.
-static LIMIT: Mutex<(u64, u64)> = Mutex::new((1024, 1024));
+pub(crate) static LIMIT: Mutex<(u64, u64)> = Mutex::new((1024, 1024));
 /// Where the next reserved descriptor is looked for.
 static NEXT: AtomicI32 = AtomicI32::new(0);
 

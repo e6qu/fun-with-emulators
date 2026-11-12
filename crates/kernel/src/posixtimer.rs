@@ -105,7 +105,7 @@ static SLOTS: [Slot; MAX] = [const { Slot::new() }; MAX];
 
 /// How a timer tells of its expiry.
 #[derive(Clone, Copy, Debug)]
-struct Notify {
+pub(crate) struct Notify {
     /// `SIGEV_SIGNAL`, `SIGEV_NONE` or `SIGEV_THREAD_ID` (`SIGEV_THREAD`
     /// is a signal to the process, which the C library acts on).
     how: i32,
@@ -115,7 +115,7 @@ struct Notify {
 }
 
 /// Each timer's notification, by id.
-static NOTIFY: Mutex<Vec<Option<Notify>>> = Mutex::new(Vec::new());
+pub(crate) static NOTIFY: Mutex<Vec<Option<Notify>>> = Mutex::new(Vec::new());
 
 /// The timer thread's wake pipe (read, write; -1: no thread yet).
 static WAKE_R: AtomicI32 = AtomicI32::new(-1);

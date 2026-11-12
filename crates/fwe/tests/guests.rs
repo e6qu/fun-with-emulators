@@ -87,6 +87,61 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
 /// The guest's output and its pid, killing it after `limit`. With `vm`, the
 /// command leads its own process group, and a timeout ends the group gently
 /// (see [`run_vm_bounded`]).
+/// At a timeout: the processes running under the guest's root that left
+/// its process group (a daemon's double fork, as podman's conmon), each
+/// sampled: its host threads' stacks, kept in `target/tmp/samples` for CI
+/// to keep, the innermost fwe frame of each printed. They are left running
+/// (a daemon the test goes on using among them).
+fn sample_strays(cmd: &Command) {
+    let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
+        return;
+    };
+    let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output() else {
+        return;
+    };
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("samples");
+    let _ = std::fs::create_dir_all(&dir);
+    for line in String::from_utf8_lossy(&ps.stdout).lines() {
+        let mut f = line.split_whitespace();
+        let (Some(pid), Some(_), command) = (f.next(), f.next(), f.collect::<Vec<_>>().join(" "))
+        else {
+            continue;
+        };
+        if !command.contains(root.as_str()) || !command.contains("fwe") {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<i32>() else { continue };
+        let file = dir.join(format!("sample-{pid}.txt"));
+        let _ = Command::new("sample")
+            .arg(pid.to_string())
+            .arg("1")
+            .arg("-file")
+            .arg(&file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        eprintln!("--- {pid} {command}");
+        // Each thread, and the innermost fwe frame of its heaviest stack.
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut inner: Option<&str> = None;
+        let flush = |inner: &mut Option<&str>| {
+            if let Some(l) = inner.take() {
+                eprintln!("      {}", l.trim_start_matches([' ', '+', '!', ':', '|']).trim());
+            }
+        };
+        for l in text.lines().take_while(|l| !l.starts_with("Total number in stack")) {
+            if l.contains("Thread_") {
+                flush(&mut inner);
+                eprintln!("    {}", l.trim());
+            } else if l.contains("fwe_") {
+                inner = Some(l);
+            }
+        }
+        flush(&mut inner);
+    }
+}
+
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -137,6 +192,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                     String::from_utf8_lossy(&ps.stdout)
                 );
             }
+            sample_strays(&cmd);
             if vm {
                 let pgid = child.id() as i32;
                 // SAFETY: SIGTERM to the guest's own process group; VM
@@ -796,6 +852,23 @@ fn dynamic_glibc_hello_runs_through_libc_startup() {
     assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--vm`: a program that would run natively (a dynamic PIE against glibc
+/// or musl) runs in the VM, with its 4 KiB pages.
+#[test]
+fn hv_vm_option_runs_a_pie_in_the_vm() {
+    for libc in [Libc::Glibc, Libc::Musl] {
+        let prog = build_c_dynamic("dynhello", libc, true);
+        let root = libc_rootfs(libc, "vm-hello");
+        let Some(mut cmd) = hv_command() else { return };
+        cmd.arg("--vm").arg("--strace").arg("--root").arg(&root).arg(&prog).arg("in the VM");
+        let out = run_hv(cmd, "dynhello --vm");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stdout(&out), "dynamic hello, in the VM\n");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("hypervisor backend: exe entry"), "not in the VM: {err}");
+    }
 }
 
 /// Real Debian coreutils: unmodified glibc programs from a Debian rootfs run
@@ -1681,6 +1754,13 @@ fn alpine_containerd_runs_an_image() {
         if out.status.code() != Some(expect) {
             print_last_calls(&root.join("tmp").join(&trace));
             print_last_calls(&root.join("tmp/containerd.trace"));
+            // The whole traces, for CI to keep.
+            let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("test-traces");
+            let _ = std::fs::create_dir_all(&kept);
+            for t in [trace.as_str(), "containerd.trace"] {
+                let _ =
+                    std::fs::copy(root.join("tmp").join(t), kept.join(format!("{}-{t}", args[1])));
+            }
         }
         out
     };
@@ -2188,11 +2268,113 @@ fn debian_podman_runs_in_the_vm() {
     ]);
     if run.status.code() != Some(3) {
         print_last_calls(&root.join("tmp/podman.trace"));
+        // The whole trace, for CI to keep.
+        let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
+        let _ = std::fs::create_dir_all(&kept);
+        let _ = std::fs::copy(root.join("tmp/podman.trace"), kept.join("debian-run.trace"));
     }
     let _ = std::fs::remove_dir_all(&root);
     assert!(stdout(&loaded).contains("alpine:3.20"), "{}", stdout(&loaded));
     assert_eq!(stdout(&run), "3.20.10\npid 1\n0\n");
     assert_eq!(run.status.code(), Some(3));
+}
+
+/// Alpine's Wine 11 (fetched: `guests/alpine/fetch/wine.txt`) running
+/// Windows programs built for ARM64, in the VM (`--vm`: Windows images want
+/// 4 KiB pages), only where `FWE_WINE_TESTS` is set (CI's `wine` job):
+/// `wineboot` makes a prefix, `cmd` runs a batch command, and a C program
+/// (`guests/windows/winprog.c`, built with zig) uses files, threads, an
+/// exception and a child process.
+#[test]
+fn alpine_wine_runs_windows_programs() {
+    use std::os::unix::process::CommandExt;
+    if !fetched_program_tests("FWE_WINE_TESTS") {
+        return;
+    }
+    let cached = alpine_root("wine");
+    let root = std::env::temp_dir().join(format!("fwe-wine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    for d in ["root", "tmp"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    run_checked(
+        Command::new("zig")
+            .args(["cc", "-target", "aarch64-windows-gnu", "-O1", "-o"])
+            .arg(root.join("tmp/winprog.exe"))
+            .arg(repo().join("guests/windows/winprog.c")),
+    );
+    let _workload = workload();
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("wine-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    let mut step = 0;
+    // Processes beyond what a step needs fail to start, rather than a run
+    // that goes wrong taking the machine's: the user's processes now, and
+    // room for Wine's (each VM process has a stand-in watcher too).
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mine = Command::new("ps").args(["-U", &uid.to_string(), "-o", "pid="]).output().unwrap();
+    let cap = (stdout(&mine).lines().count() + 300) as libc::rlim_t;
+    let mut wine = |command: &str| {
+        step += 1;
+        let mut cmd = hv_command().unwrap();
+        let trace = root.join(format!("tmp/step-{step}.trace"));
+        let err = format!("/tmp/step-{step}.err");
+        cmd.arg("--vm").arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        // Wine's messages to a file: wineserver holds the standard error it
+        // was given.
+        // busybox by name: `/bin/sh` is an absolute link the host would
+        // follow out of the root. The step waits for wineserver, which
+        // stays a while after its last client, to end with it.
+        cmd.arg("--root").arg(&root).arg(root.join("bin/busybox"));
+        cmd.args([
+            "sh",
+            "-c",
+            &format!("{command} 2>{err}; s=$?; wineserver -w 2>>{err}; exit $s"),
+        ]);
+        // No display: Wine runs its console programs without one. No Mono or
+        // Gecko to offer to install.
+        cmd.env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("WINEPREFIX", "/root/.wine")
+            .env("WINEDEBUG", "err+all")
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=");
+        cmd.stdin(Stdio::null());
+        // SAFETY: only setrlimit, async-signal-safe, between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit { rlim_cur: cap, rlim_max: cap };
+                libc::setrlimit(libc::RLIMIT_NPROC, &lim);
+                Ok(())
+            });
+        }
+        let out = run_hv_for(cmd, "wine", Duration::from_secs(1800));
+        let messages =
+            std::fs::read_to_string(root.join(err.trim_start_matches('/'))).unwrap_or_default();
+        eprintln!("--- {command} ({}) stdout:\n{}", out.status, stdout(&out));
+        eprintln!("--- its messages:\n{messages}");
+        if !out.status.success() {
+            print_last_calls(&trace);
+            let _ = std::fs::copy(&trace, kept.join(format!("step-{step}.trace")));
+        }
+        out
+    };
+    let version = wine("wine --version");
+    let boot = wine("wine wineboot --init");
+    let prefix = root.join("root/.wine/system.reg").exists();
+    let batch = wine("wine cmd /c echo hello from cmd");
+    let program = wine("wine /tmp/winprog.exe");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&version), "wine-11.0\n");
+    assert!(boot.status.success() && prefix, "wineboot: {} prefix {prefix}", boot.status);
+    assert_eq!(stdout(&batch).replace("\r\n", "\n"), "hello from cmd\n");
+    assert_eq!(
+        stdout(&program).replace("\r\n", "\n"),
+        "arm64: 1\nfile: written by Windows, deleted 1\nthreads: 4000, exit codes 10\n\
+         exception: handled\nchild: hello\nchild exited 7\n"
+    );
 }
 
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
@@ -4921,6 +5103,19 @@ fn hv_map_fixed_replaces_mapped_memory() {
     let out = fwe_hv(&asm_guest("mapfixedmt-low"), &[]).unwrap();
     assert_eq!(stdout(&out), "ok\n");
     assert_eq!(out.status.code(), Some(0));
+    // A private mapping of a memfd follows the file in each page until that
+    // page is written (by the program, or by a system call for it).
+    let want = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
+                writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
+    assert_eq!(stdout(&fwe(&rust_guest("maps"), &["view"])), want);
+    let out = fwe_hv(&rust_low_guest("maps"), &["view"]).unwrap();
+    assert_eq!(stdout(&out), want);
+    // Gigabytes reserved and mapped over take memory only where touched.
+    let out = fwe_hv(&rust_low_guest("maps"), &["reserve"]).unwrap();
+    assert_eq!(
+        stdout(&out),
+        "reserved 4 GiB, mapped over twice: zero true, under 256 MiB resident true\n"
+    );
 }
 
 /// The stand-in's watcher reports a process that ended with its VM alive,
@@ -5195,6 +5390,15 @@ fn subreaper_adopts_orphans() {
         namespaces("subreaper-thread"),
         "child exited 0\nchild is not a subreaper: true\norphan adopted: true\n\
          the worker took its SIGCHLD: true\nreaped: true\n"
+    );
+    // Blocked and read from a signalfd, it ends a `ppoll` that watches a
+    // named FIFO too (conmon's wait), which reports its other descriptors
+    // as any other wait does.
+    assert_eq!(
+        namespaces("subreaper-signalfd-fifo"),
+        "child exited 0\nchild is not a subreaper: true\norphan adopted: true\n\
+         ppoll woke for its SIGCHLD: true\nreaped: true\n\
+         with the FIFO, an eventfd writable: true\n"
     );
 }
 

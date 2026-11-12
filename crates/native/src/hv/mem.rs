@@ -73,6 +73,13 @@ impl PartialEq for Area {
     }
 }
 
+impl Source {
+    /// The same file from `offset` bytes further on.
+    fn at(&self, offset: u64) -> Source {
+        Source { file: self.file.clone(), offset: self.offset + offset }
+    }
+}
+
 impl Mapping for Area {
     fn at(&self, offset: u64) -> Area {
         Area {
@@ -81,10 +88,7 @@ impl Mapping for Area {
                 Back::Slab { host } => Back::Slab { host: host + offset },
                 Back::Segment { id, off } => Back::Segment { id, off: off + offset },
             },
-            source: self
-                .source
-                .as_ref()
-                .map(|s| Source { file: s.file.clone(), offset: s.offset + offset }),
+            source: self.source.as_ref().map(|s| s.at(offset)),
         }
     }
 }
@@ -171,6 +175,14 @@ pub fn valid(addr: u64, len: u64, write: bool) -> bool {
     let Some(end) = addr.checked_add(len) else { return false };
     // A vfork child has its parent's memory fetched first.
     prepare_access(addr, len);
+    // Pages of a private file view fwe writes for the guest become copies
+    // first, as the guest's own write would make them.
+    if write
+        && let Some(m) = mem().as_mut()
+        && m.own_view_pages(addr, end).is_err()
+    {
+        return false;
+    }
     let g = mem();
     let Some(m) = g.as_ref() else { return true };
     let (lo, hi) = (addr & !(PAGE - 1), page_up(end));
@@ -258,14 +270,36 @@ impl Mem {
         self.install_pages(start, end, area)
     }
 
-    /// Put `[start, end)` of `area` into the tables now.
+    /// Put `[start, end)` of `area` into the tables now. A private view of a
+    /// file is never writable there: its pages are written as copies
+    /// ([`view_fault`]).
     fn install_pages(&self, start: u64, end: u64, area: &Area) -> Result<(), i32> {
         if area.prot == mman::PROT_NONE {
             vm::unmap_pages(start, end - start);
             return Ok(());
         }
         let ipa = self.ipa(area).ok_or(errno::ENOMEM)?;
-        vm::map_pages(start, end - start, ipa, vm::perms(area.prot))
+        let prot = if is_view(area) { area.prot & !mman::PROT_WRITE } else { area.prot };
+        vm::map_pages(start, end - start, ipa, vm::perms(prot))
+    }
+
+    /// The pages of private file views in `[start, end)` the guest may
+    /// write become copies of themselves: what a write makes them.
+    fn own_view_pages(&mut self, start: u64, end: u64) -> Result<(), i32> {
+        let (lo, hi) = (start & !(PAGE - 1), page_up(end));
+        let views: Vec<Piece<Area>> = self
+            .vmas
+            .pieces(lo, hi)
+            .into_iter()
+            .filter(|p| is_view(&p.value) && p.value.prot & mman::PROT_WRITE != 0)
+            .collect();
+        for p in views {
+            let (a, b) = (p.start.max(lo), p.end.min(hi));
+            let source = p.value.source.as_ref().map(|s| s.at(a - p.start));
+            let kept = self.remove_keeping(a, b);
+            self.map_private(a, b - a, p.value.prot, source, kept)?;
+        }
+        Ok(())
     }
 
     /// Unmap `[start, end)`: out of the tables, its memory released after
@@ -377,7 +411,7 @@ impl Mem {
                 forget_remote(a, b);
                 // SAFETY: slab memory of the mapping being replaced, kept
                 // for this one at the same address.
-                unsafe { std::ptr::write_bytes(a as *mut u8, 0, (b - a) as usize) };
+                unsafe { window::zero(a, b) };
             }
             return Ok(addr);
         }
@@ -439,9 +473,13 @@ impl Mem {
                 return Err(e);
             }
         }
-        // Kept memory was zeroed, filled memory written: either may have
-        // held code.
-        code_written(host, len);
+        // Filled memory was written over what may have been code (the
+        // zeroing of what held data saw to its own pages: `window::zero`).
+        // Not the whole of an anonymous mapping: invalidating the cache
+        // over memory never touched would make the host commit all of it.
+        if source.is_some() {
+            code_written(host, len);
+        }
         let area = Area { prot, back: Back::Slab { host }, source };
         if let Err(e) = self.install(addr, addr + len, &area) {
             // What was mapped of it goes again; its memory after a flush.
@@ -609,9 +647,39 @@ impl Mem {
                 Err(e) => return err(e),
             }
         };
+        // A private mapping of a file with no name (a memfd, or Wine's
+        // section of shared memory) is mapped from the file itself, as a
+        // segment, never writable in the tables: its pages show what others
+        // write to the file, as Linux's do until each is written, when it
+        // becomes a copy ([`view_fault`]). An ordinary file's private
+        // mapping is a copy from the start.
+        let view = !shared
+            && prot & mman::PROT_EXEC == 0
+            && file.as_ref().is_some_and(|f| fwe_kernel::host::unlinked(f.as_raw_fd()));
         // A fixed mapping replaces what is there.
         let kept = self.remove_keeping(at, at + len);
-        let r = if shared {
+        let r = if view {
+            let generation = vm::generation();
+            for &(h, e) in &kept {
+                self.pending.push((generation, h, e - h));
+            }
+            let file = file.expect("a file view");
+            let source = Source { file: file.clone(), offset };
+            // Mapped as a read-only segment (the guest may write a private
+            // mapping of a file it may only read), then given its
+            // protections, which the tables give without the write.
+            self.map_shared(at, len, prot & !mman::PROT_WRITE, file, offset).and_then(|()| {
+                self.vmas.update(at, at + len, |a| Area {
+                    prot,
+                    source: Some(source.at(0)),
+                    ..a.clone()
+                });
+                match self.vmas.pieces(at, at + len).first() {
+                    Some(p) => self.install(at, at + len, &p.value.clone()),
+                    None => Ok(()),
+                }
+            })
+        } else if shared {
             let generation = vm::generation();
             for &(h, e) in &kept {
                 self.pending.push((generation, h, e - h));
@@ -659,6 +727,20 @@ impl Mem {
         if prot & mman::PROT_WRITE != 0 && self.vmas.pieces(addr, end).iter().any(read_only) {
             return err(errno::EACCES);
         }
+        // A private view of a file made executable becomes a copy of the
+        // file as it is now (code is not run from segments).
+        if prot & mman::PROT_EXEC != 0 {
+            let views: Vec<Piece<Area>> =
+                self.vmas.pieces(addr, end).into_iter().filter(|p| is_view(&p.value)).collect();
+            for p in views {
+                let kept = self.remove_keeping(p.start, p.end);
+                if let Err(e) =
+                    self.map_private(p.start, p.end - p.start, prot, p.value.source, kept)
+                {
+                    return err(e);
+                }
+            }
+        }
         self.vmas.update(addr, end, |a| Area { prot, ..a.clone() });
         for p in self.vmas.pieces(addr, end) {
             if let Err(e) = self.install(p.start, p.end, &p.value) {
@@ -682,9 +764,7 @@ impl Mem {
                 // SAFETY: the break's own slab range, unmapped from the
                 // guest since it shrank (and flushed since: a vCPU only
                 // shrinks or grows it from a system call).
-                unsafe {
-                    std::ptr::write_bytes(old_end as *mut u8, 0, (dirty_end - old_end) as usize)
-                };
+                unsafe { window::zero(old_end, dirty_end) };
             }
             let area = Area {
                 prot: mman::PROT_READ | mman::PROT_WRITE,
@@ -723,7 +803,7 @@ impl Mem {
                 if let Back::Slab { host } = p.value.back {
                     let len = p.end - p.start;
                     // SAFETY: slab memory backing this guest mapping.
-                    unsafe { std::ptr::write_bytes(host as *mut u8, 0, len as usize) };
+                    unsafe { window::zero(host, host + len) };
                     if let Some(s) = &p.value.source {
                         if let Err(e) = fill(host, len, s) {
                             return err(e);
@@ -831,14 +911,39 @@ impl Mem {
 /// the same when it loads code into a page. The stand-in drops its
 /// translated code likewise.
 pub fn code_written(host: u64, len: u64) {
+    invalidate_icache(host, len);
+    if super::standin::active() {
+        super::standin::code_written();
+    }
+}
+
+/// The host's instruction cache invalidated for `[host, host + len)`, memory
+/// of ours just written (see [`code_written`], which also has the
+/// stand-in's translations dropped).
+pub fn invalidate_icache(host: u64, len: u64) {
     unsafe extern "C" {
         fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
     }
     // SAFETY: invalidating the instruction cache for memory of ours.
     unsafe { sys_icache_invalidate(host as *mut libc::c_void, len as usize) };
-    if super::standin::active() {
-        super::standin::code_written();
-    }
+}
+
+/// Whether `area` is a private view of a file with no name: a segment of
+/// the file with the file as its source.
+fn is_view(area: &Area) -> bool {
+    matches!(area.back, Back::Segment { .. }) && area.source.is_some()
+}
+
+/// A write the guest made at `va` faulted for want of permission: if it is
+/// a page of a private file view it may write, that page becomes a copy of
+/// itself, and the write is tried again (true).
+pub fn view_fault(va: u64) -> bool {
+    let mut g = mem();
+    let Some(m) = g.as_mut() else { return false };
+    let page = va & !(PAGE - 1);
+    let ok =
+        m.vmas.get(page).is_some_and(|p| is_view(p.value) && p.value.prot & mman::PROT_WRITE != 0);
+    ok && m.own_view_pages(page, page + PAGE).is_ok()
 }
 
 /// Copy `len` bytes of `source`'s file into slab memory at `host` (short

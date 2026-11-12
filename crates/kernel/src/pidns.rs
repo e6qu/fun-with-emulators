@@ -121,7 +121,8 @@ impl PidNs {
 /// namespace.
 pub type Chain = Vec<std::sync::Arc<crate::shared::Record<PidNs>>>;
 
-static CURRENT: std::sync::Mutex<Option<std::sync::Arc<Chain>>> = std::sync::Mutex::new(None);
+pub(crate) static CURRENT: std::sync::Mutex<Option<std::sync::Arc<Chain>>> =
+    std::sync::Mutex::new(None);
 
 /// The chain the process is in now.
 pub fn current() -> std::sync::Arc<Chain> {
@@ -195,7 +196,7 @@ pub fn to_guest(host: i32) -> i32 {
 
 /// Numbers just released by a reap, by host pid and namespace record: a
 /// `SIGCHLD` delivered after its `wait` still names the child by its pid.
-static RECENT: std::sync::Mutex<std::collections::VecDeque<(i32, Vec<u8>, i32)>> =
+pub(crate) static RECENT: std::sync::Mutex<std::collections::VecDeque<(i32, Vec<u8>, i32)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn remember_released(host: i32, dir: &[u8], n: i32) {
@@ -378,7 +379,7 @@ pub fn adopt(ns: &crate::ns::Namespaces, known: i32) -> i32 {
 
 /// Each thread's numbers in the namespaces of the chain, by its number in
 /// the first.
-static THREAD_NUMS: std::sync::Mutex<BTreeMap<i32, Vec<i32>>> =
+pub(crate) static THREAD_NUMS: std::sync::Mutex<BTreeMap<i32, Vec<i32>>> =
     std::sync::Mutex::new(BTreeMap::new());
 
 /// Remember the numbers [`alloc`] gave thread `tid`.

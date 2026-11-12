@@ -29,7 +29,7 @@ use crate::shared::Record;
 use fwe_abi::errno;
 use std::sync::{Arc, Mutex};
 
-static CURRENT: Mutex<Option<Arc<Record<Net>>>> = Mutex::new(None);
+pub(crate) static CURRENT: Mutex<Option<Arc<Record<Net>>>> = Mutex::new(None);
 
 thread_local! {
     /// This thread's own network namespace, when it has its own

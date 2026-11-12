@@ -298,7 +298,7 @@ pub fn remember_exe() {
 /// a program of the other kind. What Linux keeps across `execve` the host
 /// keeps across its own: the pid, descriptors not marked close-on-exec (the
 /// guest's flag is the host's), the signal mask, pending signals and ignored
-/// dispositions; the root filesystem, working directory, `--strace`,
+/// dispositions; the root filesystem, working directory, `--strace`, `--vm`,
 /// `--hv-standin` and `--hv-record` are passed on, and a program with no
 /// path (a memfd) by descriptor (`--exe-fd`). Other threads end, as on Linux. Returns a Linux errno only if
 /// the program cannot be run; on success it does not return.
@@ -781,12 +781,14 @@ pub struct Loadout {
     pub auxv: Vec<u8>,
 }
 
-/// Whether `file` is a program only the hypervisor backend can run: a non-PIE
-/// executable linked into the low 4 GiB.
+/// Whether `file` is a program the hypervisor backend runs: a non-PIE
+/// executable linked into the low 4 GiB, which only it can run, or under
+/// `--vm` any program.
 pub fn needs_vm(file: &[u8]) -> bool {
     Elf::parse(file).is_ok_and(|elf| {
-        !elf.is_pie()
-            && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
+        hv::vm_always()
+            || !elf.is_pie()
+                && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
     })
 }
 

@@ -129,7 +129,7 @@ pub fn check_resize(fd: i32, len: i64) -> Result<(), i32> {
 /// Memfd descriptors opened read-only again (through `/proc/self/fd`),
 /// which the host made sharing a writable description: no seals through
 /// them, as Linux's need one open for writing. With whether any is.
-static READ_ONLY: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static READ_ONLY: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 static ANY_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Memfd descriptor `fd` was opened again read-only.

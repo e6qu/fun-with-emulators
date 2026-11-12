@@ -21,7 +21,7 @@ static SIZED: AtomicBool = AtomicBool::new(false);
 static LOOKED: AtomicBool = AtomicBool::new(false);
 
 /// What each sized tmpfs holds, by its directory: bytes, and when counted.
-static HELD: Mutex<Option<Held>> = Mutex::new(None);
+pub(crate) static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// Bytes held, and when counted, by tmpfs directory.
 type Held = HashMap<Vec<u8>, (u64, Instant)>;

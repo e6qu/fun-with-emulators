@@ -52,7 +52,7 @@ struct Poll {
     resfd: Option<i32>,
 }
 
-struct Ctx {
+pub(crate) struct Ctx {
     id: u64,
     /// Events reserved against `fs.aio-max-nr`.
     reserved: u64,
@@ -61,7 +61,7 @@ struct Ctx {
     polls: Vec<Poll>,
 }
 
-static CTXS: Mutex<Vec<Ctx>> = Mutex::new(Vec::new());
+pub(crate) static CTXS: Mutex<Vec<Ctx>> = Mutex::new(Vec::new());
 
 /// Events reserved by this process's contexts.
 static RESERVED: AtomicU64 = AtomicU64::new(0);

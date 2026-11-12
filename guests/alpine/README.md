@@ -12,7 +12,8 @@ Each file in `fetch/` lists what one test downloads from
 file's SHA-256. The test checks each checksum, unpacks the files in order
 into its root filesystem and caches them under `target/fetched-packages`
 (`FWE_FETCH_CACHE` overrides it; CI caches it). Alpine 3.20 is past its end
-of life, so the files no longer change.
+of life, so its files no longer change; 3.24 (Wine's) is supported, and a
+rebuilt package fails its checksum.
 
 | Manifest | Contents | Size |
 | --- | --- | --- |
@@ -21,6 +22,7 @@ of life, so the files no longer change.
 | `fetch/containerd.txt` | The minirootfs (the test's root, and the `alpine` image's layer), containerd 1.7.17 with its runc shim, ctr, runc 1.1.14 and libseccomp | 33 MB |
 | `fetch/docker.txt` | The minirootfs (the test's root, and the `alpine` image's layer), Docker Engine 26.1.5 (`dockerd`), the docker CLI with its buildx 0.14 and Compose 2.27 plugins, containerd 1.7.17, runc 1.1.14, tini, iptables and their libraries (libmnl, libnftnl, libxtables, libseccomp) | 88 MB |
 | `fetch/podman-further.txt` | What `podman.txt` lists, distribution's registry 2.8.3 (`docker-registry`), and shadow's `newuidmap`/`newgidmap` with their libraries (shadow-libs, libbsd, libmd, linux-pam, skalibs, utmps) | 31 MB |
+| `fetch/wine.txt` | The 3.24.4 minirootfs (the test's root) and Wine 11.0, its Windows modules ARM64 PE (and its x86 and ARM64EC parts, unused) | 76 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
 
 ## License
@@ -32,7 +34,7 @@ podman, conmon, netavark, containers-common, containerd, ctr, runc,
 dockerd, the docker CLI, buildx, Compose and the registry Apache-2.0;
 shadow, libbsd and linux-pam BSD-3-Clause; libmd BSD-3-Clause,
 BSD-2-Clause, ISC, Beerware and public domain; skalibs and utmps ISC;
-tini MIT; iptables, libnftnl and libxtables GPL-2.0-or-later; libmnl
+tini MIT; Wine LGPL-2.1-or-later; iptables, libnftnl and libxtables GPL-2.0-or-later; libmnl
 LGPL-2.1-or-later; catatonit
 GPL-2.0-or-later; gpgme LGPL-2.1-or-later and GPL-3.0-or-later; libassuan,
 glib and libintl LGPL-2.1-or-later; libgpg-error and libgcc

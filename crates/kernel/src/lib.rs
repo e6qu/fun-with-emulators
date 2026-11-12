@@ -31,6 +31,7 @@ pub mod fdmarks;
 pub mod fdstate;
 pub mod fdtable;
 pub mod fifo;
+mod forklock;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -1063,7 +1064,9 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
                                     mm::hold(|| {
                                         maps::hold(|| {
                                             thread::hold(|| {
-                                                threadfs::hold(|| seqpacket::hold(fork))
+                                                threadfs::hold(|| {
+                                                    seqpacket::hold(|| forklock::hold(fork))
+                                                })
                                             })
                                         })
                                     })
@@ -1575,6 +1578,24 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
+    }
+    // The host writes these buffers itself: pages of a private file view
+    // in them become the guest's own first (see `mm::views_written`).
+    if mm::any_views() {
+        match nr {
+            n::READ | n::PREAD64 => mm::views_written(a[1], a[2]),
+            n::READV | n::PREADV | n::PREADV2 => {
+                for v in uaccess::read_bytes(a[1], (a[2].min(uaccess::UIO_MAXIOV) * 16) as usize)
+                    .unwrap_or_default()
+                    .chunks_exact(16)
+                {
+                    let base = u64::from_ne_bytes(v[0..8].try_into().unwrap());
+                    let len = u64::from_ne_bytes(v[8..16].try_into().unwrap());
+                    mm::views_written(base, len);
+                }
+            }
+            _ => {}
+        }
     }
     if let Some(r) = loopdev::io(nr, &a) {
         return Some(r);

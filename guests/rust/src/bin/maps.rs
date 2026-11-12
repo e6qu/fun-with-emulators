@@ -55,6 +55,9 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
     fn _exit(code: i32) -> !;
+    fn pwrite(fd: i32, buf: *const u8, len: usize, off: i64) -> isize;
+    fn pread(fd: i32, buf: *mut u8, len: usize, off: i64) -> isize;
+    fn ftruncate(fd: i32, len: i64) -> i32;
 }
 
 /// The lines of `/proc/self/maps` as (start, end, perms, offset, name).
@@ -108,7 +111,96 @@ fn smaps_field_of(who: &str, start: u64, field: &str) -> u64 {
     u64::MAX
 }
 
+/// A large reservation mapped over, as Wine reserves the address space a
+/// Windows program expects and maps into it: only what is touched takes
+/// memory, and what is read back is zero.
+fn reserve_and_map_over() {
+    const PROT_NONE: i32 = 0;
+    const PROT_RW: i32 = 3;
+    const PRIVATE_ANON: i32 = 0x22;
+    const FIXED: i32 = 0x10;
+    const NORESERVE: i32 = 0x4000;
+    let len = 4usize << 30;
+    // SAFETY: fresh mappings of this program's, written within their length.
+    let (zero, rss) = unsafe {
+        let a = mmap(std::ptr::null_mut(), len, PROT_NONE, PRIVATE_ANON | NORESERVE, -1, 0);
+        let b = mmap(a, len, PROT_RW, PRIVATE_ANON | FIXED, -1, 0);
+        assert_eq!(a, b);
+        *b.add(len / 2) = 1;
+        let again = mmap(a, len, PROT_RW, PRIVATE_ANON | FIXED, -1, 0);
+        (*again.add(len / 2) == 0 && *again.add(len - 1) == 0, rss_kb())
+    };
+    println!("reserved 4 GiB, mapped over twice: zero {zero}, under 256 MiB resident {}", rss < 256 << 10);
+}
+
+/// A private view of a file with no name (a memfd), as Wine maps the shared
+/// memory its server writes: it shows what is written to the file until it
+/// is itself written, then holds its own copy.
+fn private_view() {
+    let name = CString::new("view").unwrap();
+    // SAFETY: a memfd of this program's, and mappings of it read and written
+    // within their length.
+    unsafe {
+        let fd = memfd_create(name.as_ptr(), 0);
+        ftruncate(fd, 65536);
+        pwrite(fd, b"A".as_ptr(), 1, 4096);
+        let v = mmap(std::ptr::null_mut(), 65536, 1, 2, fd, 0);
+        pwrite(fd, b"B".as_ptr(), 1, 4096);
+        let follows = *v.add(4096) as char;
+        mprotect(v, 65536, 3);
+        *v.add(4096) = b'C';
+        let mut f = [0u8];
+        pread(fd, f.as_mut_ptr(), 1, 4096);
+        pwrite(fd, b"D".as_ptr(), 1, 4096);
+        println!(
+            "view: follows the file {follows}, its own write {}, the file kept {}, later file write {}",
+            *v.add(4096) as char,
+            f[0] as char,
+            if *v.add(4096) == b'C' { "unseen" } else { "seen" }
+        );
+        // Writable from the start, as Wine maps its sections: each page
+        // follows the file until it is itself written; a write through a
+        // system call (`read` into it) makes it a copy as well.
+        let page = getpagesize() as usize;
+        let w = mmap(std::ptr::null_mut(), 4 * page, 3, 2, fd, 0);
+        pwrite(fd, b"E".as_ptr(), 1, 0);
+        pwrite(fd, b"F".as_ptr(), 1, page as i64);
+        let before = (*w as char, *w.add(page) as char);
+        *w = b'G';
+        let mut p = [0i32; 2];
+        pipe(p.as_mut_ptr());
+        write(p[1], b"H".as_ptr(), 1);
+        read(p[0], w.add(2 * page), 1);
+        pwrite(fd, b"I".as_ptr(), 1, 0);
+        pwrite(fd, b"J".as_ptr(), 1, page as i64);
+        pwrite(fd, b"K".as_ptr(), 1, 2 * page as i64);
+        let mut f0 = [0u8];
+        pread(fd, f0.as_mut_ptr(), 1, 0);
+        println!(
+            "writable view: follows {}{}, written page {}, its neighbour {}, read into {}, file {}",
+            before.0,
+            before.1,
+            *w as char,
+            *w.add(page) as char,
+            *w.add(2 * page) as char,
+            f0[0] as char
+        );
+    }
+}
+
+/// This process's resident memory (`/proc/self/status`'s `VmRSS`), in KiB.
+fn rss_kb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("reserve") => return reserve_and_map_over(),
+        Some("view") => return private_view(),
+        _ => {}
+    }
     // SAFETY: plain C library calls with valid arguments, on memory this
     // program maps for them.
     unsafe {

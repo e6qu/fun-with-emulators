@@ -63,7 +63,7 @@ const HEADER: usize = 16;
 
 /// One netlink socket: the host end fwe answers through, the port it is
 /// bound to, and the type the guest made it with.
-struct Sock {
+pub(crate) struct Sock {
     peer: i32,
     port: u32,
     ty: i32,
@@ -88,7 +88,7 @@ const NLM_F_CAPPED: u16 = 0x100;
 
 /// The sockets, by the inode of the guest's end (which its duplicates
 /// share).
-static SOCKS: Mutex<Option<HashMap<u64, Sock>>> = Mutex::new(None);
+pub(crate) static SOCKS: Mutex<Option<HashMap<u64, Sock>>> = Mutex::new(None);
 
 fn socks<R>(f: impl FnOnce(&mut HashMap<u64, Sock>) -> R) -> R {
     let mut g = SOCKS.lock().unwrap_or_else(|e| e.into_inner());

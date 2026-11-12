@@ -271,7 +271,7 @@ std::thread_local! {
 /// How many of this process's threads are traced (the host catches every
 /// signal while any is), and which besides the main thread.
 static ANY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static THREADS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static THREADS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether this thread is traced.
 pub fn traced() -> bool {
@@ -469,7 +469,8 @@ std::thread_local! {
 
 /// New threads to be traced as they start, by tid: their tracer, options
 /// and whether seized.
-static PENDING: std::sync::Mutex<Vec<(i32, i32, u64, bool)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static PENDING: std::sync::Mutex<Vec<(i32, i32, u64, bool)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// A backend made thread `tid` for this thread's clone: traced as it
 /// starts, if its tracer follows it.

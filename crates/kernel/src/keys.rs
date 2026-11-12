@@ -987,7 +987,7 @@ fn with<R>(f: impl FnOnce(&mut Store) -> (R, bool)) -> Result<R, i32> {
 /// What a fork child inherits of this process's keyrings, noted before the
 /// fork (so the child has it, copied): (this process's pid, its session
 /// keyring, its request default).
-static INHERIT: std::sync::Mutex<Option<(i32, i32, i32)>> = std::sync::Mutex::new(None);
+pub(crate) static INHERIT: std::sync::Mutex<Option<(i32, i32, i32)>> = std::sync::Mutex::new(None);
 
 /// Before a fork: what the child is to hold ([`INHERIT`]).
 pub fn before_fork() {

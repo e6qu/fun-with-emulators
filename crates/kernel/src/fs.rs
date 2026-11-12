@@ -2486,7 +2486,7 @@ thread_local! {
 /// FIFOs [`open_fifo_unlocked`] holds open for a thread's `openat`, by
 /// fwe's descriptor: a fork child closes them, as no `openat` of its takes
 /// them.
-static PREOPENED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static PREOPENED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 /// In a fork child: close the FIFOs other threads of the parent opened
 /// ahead of their `openat` ([`open_fifo_unlocked`]).

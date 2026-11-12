@@ -43,7 +43,7 @@ enum Phase {
 
 /// A filesystem context.
 #[derive(Clone, Debug)]
-struct Context {
+pub(crate) struct Context {
     kind: FsType,
     phase: Phase,
     source: Option<Vec<u8>>,
@@ -62,9 +62,9 @@ struct Context {
     log: VecDeque<Vec<u8>>,
 }
 
-static CONTEXTS: Mutex<Option<HashMap<u32, Context>>> = Mutex::new(None);
+pub(crate) static CONTEXTS: Mutex<Option<HashMap<u32, Context>>> = Mutex::new(None);
 /// The detached trees, root first ([`crate::mounts::Table::copy_tree`]).
-static TREES: Mutex<Option<HashMap<u32, Vec<Mount>>>> = Mutex::new(None);
+pub(crate) static TREES: Mutex<Option<HashMap<u32, Vec<Mount>>>> = Mutex::new(None);
 static NEXT: AtomicU32 = AtomicU32::new(1);
 
 fn with<K, R>(

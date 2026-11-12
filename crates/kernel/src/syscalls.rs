@@ -2771,7 +2771,6 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         Ok(ns) => ns,
         Err(e) => return e,
     };
-    let ms = if ns < 0 { -1 } else { (ns as u64).div_ceil(1_000_000).min(i32::MAX as u64) as i32 };
     // The read ends of named FIFOs it watches, whose writers' end the
     // host does not report ([`crate::fifo`]): waited for in slices,
     // looked at between them.
@@ -2785,71 +2784,57 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     } else {
         Vec::new()
     };
-    if fifos.is_empty() {
-        // `struct pollfd` and the POLL* bits match the host's.
-        let mut set = vec![libc::pollfd { fd: 0, events: 0, revents: 0 }; nfds as usize];
-        // SAFETY: a `pollfd` is plain data, as many bytes as the guest's.
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                set.as_mut_ptr().cast::<u8>(),
-                set.len() * size_of::<libc::pollfd>(),
-            )
-        };
-        guest!(uaccess::read_into(fds, bytes));
-        return match poll_linux(&mut set, ns) {
-            Ok(n) => {
-                for (i, p) in set.iter().enumerate() {
-                    let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
-                    guest!(uaccess::write(at, p.revents));
-                }
-                i64::from(n)
-            }
-            Err(e) => err(e),
-        };
-    }
+    // `struct pollfd` and the POLL* bits match the host's.
+    let mut set = vec![libc::pollfd { fd: 0, events: 0, revents: 0 }; nfds as usize];
+    // SAFETY: a `pollfd` is plain data, as many bytes as the guest's.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            set.as_mut_ptr().cast::<u8>(),
+            set.len() * size_of::<libc::pollfd>(),
+        )
+    };
+    guest!(uaccess::read_into(fds, bytes));
     let deadline =
-        (ms >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+        (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
+    let mut first = true;
     loop {
-        let slice = match deadline {
-            None => crate::fifo::SLICE_MS,
-            Some(d) => {
-                let left =
-                    d.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
-                left.min(crate::fifo::SLICE_MS)
-            }
+        // Each slice is a wait as any other (a signal ends it, one for a
+        // signalfd is moved onto it), only shorter; the first looks at the
+        // FIFOs before waiting at all.
+        let wait = if fifos.is_empty() {
+            ns
+        } else if first {
+            0
+        } else {
+            let slice = i64::from(crate::fifo::SLICE_MS) * 1_000_000;
+            deadline.map_or(slice, |d| {
+                (d.saturating_duration_since(std::time::Instant::now()).as_nanos() as i64)
+                    .min(slice)
+            })
         };
-        // SAFETY: as above.
-        let n = unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, 0) };
-        if n < 0 {
-            return last_error();
-        }
-        let mut ready = n as i64;
+        first = false;
+        let mut ready = match poll_linux(&mut set, wait) {
+            Ok(n) => i64::from(n),
+            Err(e) => return err(e),
+        };
         for &i in &fifos {
-            let at = fds + (i * size_of::<Pollfd>()) as u64;
-            let mut p: Pollfd = guest!(uaccess::read(at));
-            let extra = match crate::fifo::probe(p.fd) {
-                crate::fifo::Probe::HungUp => libc::POLLHUP,
-                _ => 0,
-            };
-            if extra != 0 {
+            let p = &mut set[i];
+            if p.revents & libc::POLLHUP == 0
+                && matches!(crate::fifo::probe(p.fd), crate::fifo::Probe::HungUp)
+            {
                 if p.revents == 0 {
                     ready += 1;
                 }
-                p.revents |= extra;
-                guest!(uaccess::write(at, p));
+                p.revents |= libc::POLLHUP;
             }
         }
-        if ready > 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if ready > 0 || fifos.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            for (i, p) in set.iter().enumerate() {
+                let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
+                guest!(uaccess::write(at, p.revents));
+            }
             return ready;
-        }
-        // A signal that came between slices interrupts the wait.
-        if crate::thread::deliverable() != 0 {
-            return err(errno::EINTR);
-        }
-        // SAFETY: as above.
-        let n = unsafe { libc::poll(fds as *mut libc::pollfd, nfds as libc::nfds_t, slice) };
-        if n != 0 {
-            return if n < 0 { last_error() } else { n as i64 };
         }
     }
 }
@@ -3319,7 +3304,7 @@ fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
 }
 
 /// The affinity `sched_setaffinity` set for this process, if it did.
-static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
+pub(crate) static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
 
 /// The CPU the caller is taken to run on: the first of its affinity (the
 /// host's scheduler places it where it will).

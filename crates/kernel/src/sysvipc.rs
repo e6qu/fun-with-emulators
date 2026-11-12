@@ -717,7 +717,7 @@ pub fn initial() -> Option<Arc<Record<Ipc>>> {
 }
 
 /// The process's IPC namespace (`None` until it is set: the initial one).
-static CURRENT: Mutex<Option<Arc<Record<Ipc>>>> = Mutex::new(None);
+pub(crate) static CURRENT: Mutex<Option<Arc<Record<Ipc>>>> = Mutex::new(None);
 
 /// The process's namespaces are now these: its IPC namespace's record
 /// (the initial namespace's for `None`).
@@ -1044,7 +1044,7 @@ pub fn guest_pid(host: i32) -> i32 {
 }
 
 /// This process's shared memory attachments: address, segment id, size.
-static ATTACHED: Mutex<BTreeMap<u64, (i32, u64)>> = Mutex::new(BTreeMap::new());
+pub(crate) static ATTACHED: Mutex<BTreeMap<u64, (i32, u64)>> = Mutex::new(BTreeMap::new());
 
 pub fn attached(addr: u64) -> Option<(i32, u64)> {
     ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).get(&addr).copied()

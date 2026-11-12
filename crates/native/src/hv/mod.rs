@@ -107,12 +107,29 @@ pub fn start_recording(spec: &str) -> Result<(), String> {
     }
 }
 
+/// Every program of the run is run in the VM (`--vm`), PIE or not: for
+/// programs that need 4 KiB pages, which only the VM has (Wine).
+static ALWAYS_VM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run every program in the VM from now on (`--vm`).
+pub fn use_vm_always() {
+    ALWAYS_VM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether every program runs in the VM (`--vm`).
+pub fn vm_always() -> bool {
+    ALWAYS_VM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The leading options every fwe that fwe starts for the guest is given:
-/// the stand-in and the flight recorder, when in use.
+/// `--vm`, the stand-in and the flight recorder, when in use.
 pub fn passed_on() -> Vec<Vec<u8>> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let mut words = Vec::new();
+        if vm_always() {
+            words.push(b"--vm".to_vec());
+        }
         if standin::active() {
             words.push(b"--hv-standin".to_vec());
         }

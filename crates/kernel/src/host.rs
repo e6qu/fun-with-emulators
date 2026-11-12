@@ -359,6 +359,15 @@ pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
     all.into_iter().filter(|&p| crate::procreg::read(p).is_some()).collect()
 }
 
+/// Whether host descriptor `fd` is of a file with no name left (a memfd's,
+/// or one unlinked after it was opened): one kept to share memory.
+pub fn unlinked(fd: i32) -> bool {
+    // SAFETY: a zeroed stat is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: plain host call into `st`.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_nlink == 0 }
+}
+
 /// `kill(pid, sig)` for a host signal and a `kill`-style `pid` (a process,
 /// 0 for the caller's group, or `-pgid`). A `SIGKILL` reaches fwe processes
 /// as [`KILL_RELAY`], with a note of its sender ([`kill_relayed`]). Returns

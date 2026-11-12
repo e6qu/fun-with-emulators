@@ -94,7 +94,7 @@ pub fn tracked() -> Vec<(u64, u64)> {
 /// `MAP_GROWSDOWN` mappings, guest start to end: a fault in the space
 /// just below one grows it down ([`Kernel::stack_fault`]; the native
 /// backend's, whose guest addresses are host addresses).
-static GROWS_DOWN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static GROWS_DOWN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn grows_down() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     GROWS_DOWN.lock().unwrap_or_else(|e| e.into_inner())
@@ -102,7 +102,7 @@ fn grows_down() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
 
 /// Guest ranges `MADV_HWPOISON` poisoned: inaccessible, and an access to
 /// them is a `SIGBUS` ([`poisoned`]), as Linux reports a memory failure.
-static POISONED: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static POISONED: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn poisoned_ranges() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     POISONED.lock().unwrap_or_else(|e| e.into_inner())
@@ -115,7 +115,7 @@ pub fn poisoned(addr: u64) -> bool {
 
 /// Guest ranges given `MADV_DONTDUMP` (until `MADV_DODUMP`): left out of
 /// a core dump ([`dont_dump`]).
-static DONT_DUMP: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static DONT_DUMP: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn dont_dump_ranges() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     DONT_DUMP.lock().unwrap_or_else(|e| e.into_inner())
@@ -128,7 +128,7 @@ pub fn dont_dump(addr: u64) -> bool {
 
 /// Host ranges given `MADV_WIPEONFORK`: a fork child finds them zero
 /// ([`forked_child`]), and so does its own child.
-static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn wipe_on_fork() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     WIPE_ON_FORK.lock().unwrap_or_else(|e| e.into_inner())
@@ -192,6 +192,19 @@ static WRITE_EXEC: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn write_exec() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     WRITE_EXEC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Pages of private mappings of files with no name (a memfd, or a file
+/// unlinked once opened: memory shared through it) not yet written, host
+/// `start -> end`. Linux shows such a page what is written to the file
+/// until the page is itself written; the host's private mapping is a copy
+/// from the start. So the host maps them shared and never writable, and a
+/// page becomes a copy of itself when first written: by the guest
+/// ([`Kernel::view_fault`]) or by fwe for it ([`views_written`]).
+static FILE_VIEWS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn file_views() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    FILE_VIEWS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether host address `addr` is in writable and executable guest memory.
@@ -433,6 +446,8 @@ pub(crate) fn resident(start: u64, end: u64) -> u64 {
 /// Run `f` holding the tracking lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = guest_maps();
+    let _wx = write_exec();
+    let _views = file_views();
     f()
 }
 
@@ -987,6 +1002,69 @@ fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
     // SAFETY: unmapping the mapping made above; `data` is not used again.
     unsafe { libc::munmap(map, size) };
     ranges
+}
+
+/// Whether any page of a private file view waits to be written (see
+/// [`FILE_VIEWS`]).
+pub fn any_views() -> bool {
+    !file_views().is_empty()
+}
+
+/// fwe is about to write guest range `[addr, addr + len)` for the guest:
+/// pages of a file view in it become copies of themselves first (see
+/// [`FILE_VIEWS`]), as the guest's own write would make them. Cheap where
+/// there are none.
+pub fn views_written(addr: u64, len: u64) {
+    if len == 0 || !any_views() {
+        return;
+    }
+    let (start, end) = (crate::uaccess::g2h(addr), crate::uaccess::g2h(addr).saturating_add(len));
+    let page = crate::maps::page_size();
+    let pages: Vec<(u64, u64)> = file_views()
+        .range(..end)
+        .rev()
+        .take_while(|&(_, &e)| e > start)
+        .map(|(&s, &e)| (s.max(start & !(page - 1)), e.min(end.div_ceil(page) * page)))
+        .collect();
+    for (s, e) in pages {
+        let guest = crate::uaccess::guest_of(s);
+        let prot = crate::maps::record()
+            .areas_in(guest, guest + 1)
+            .into_iter()
+            .next()
+            .map_or(0, |p| p.value.prot);
+        if prot & mman::PROT_WRITE == 0 || own_copy(s, e - s).is_err() {
+            continue;
+        }
+        // SAFETY: the pages just copied, guest memory; their protections as
+        // the guest set them.
+        unsafe { libc::mprotect(s as *mut libc::c_void, (e - s) as usize, final_prot(prot)) };
+        remove_range(&mut file_views(), s, e - s);
+    }
+}
+
+/// Make host memory `[addr, addr + len)`, a shared view of a file, a
+/// private copy of what it shows now, readable (the caller then sets its
+/// protections).
+fn own_copy(addr: u64, len: u64) -> Result<(), i64> {
+    // SAFETY: guest memory of a readable mapping, copied out, then replaced
+    // at the same place by fresh memory the copy is written back into.
+    unsafe {
+        let data = std::slice::from_raw_parts(addr as *const u8, len as usize).to_vec();
+        let p = libc::mmap(
+            addr as *mut libc::c_void,
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return Err(last_error());
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+    }
+    Ok(())
 }
 
 fn host_prot(prot: u64) -> libc::c_int {
@@ -1614,11 +1692,22 @@ impl<P: Platform> Kernel<P> {
         // the code, then switched to the requested protections. Shared file
         // mappings are made private for this, since the code is modified.
         let exec = prot & mman::PROT_EXEC != 0;
+        // A private mapping of a file with no name: shared on the host,
+        // never writable there (see [`FILE_VIEWS`]).
+        let view = !anonymous
+            && !exec
+            && hflags & libc::MAP_PRIVATE != 0
+            && crate::host::unlinked(fd as i32);
+        if view {
+            hflags = (hflags & !libc::MAP_PRIVATE) | libc::MAP_SHARED;
+        }
         let initial_prot = if exec {
             if hflags & libc::MAP_SHARED != 0 && !anonymous {
                 hflags = (hflags & !libc::MAP_SHARED) | libc::MAP_PRIVATE;
             }
             libc::PROT_READ | libc::PROT_WRITE
+        } else if view {
+            host_prot(prot) & !libc::PROT_WRITE
         } else {
             host_prot(prot)
         };
@@ -1662,6 +1751,11 @@ impl<P: Platform> Kernel<P> {
             }
             let guest = if p == haddr && fixed { addr } else { p };
             track(p, self.page_up(len));
+            if view {
+                add_range(&mut file_views(), p, self.page_up(len));
+            } else {
+                remove_range(&mut file_views(), p, self.page_up(len));
+            }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
                 // SAFETY: unmapping the mapping just created.
                 self.unmap_host(p, len);
@@ -1756,6 +1850,7 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             untrack(host as u64, self.page_up(len));
             remove_range(&mut write_exec(), host as u64, self.page_up(len));
+            remove_range(&mut file_views(), host as u64, self.page_up(len));
             remove_range(&mut wipe_on_fork(), host as u64, self.page_up(len));
             remove_range(&mut grows_down(), addr, self.page_up(len));
             remove_range(&mut poisoned_ranges(), addr, self.page_up(len));
@@ -1803,6 +1898,26 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let a = crate::uaccess::g2h(addr) as *mut libc::c_void;
+        // Not yet written pages of a file view stay unwritable on the host
+        // (see [`FILE_VIEWS`]); made executable, a copy (code is prepared in
+        // place).
+        let views: Vec<(u64, u64)> = {
+            let len = self.page_up(len);
+            file_views()
+                .range(..a as u64 + len)
+                .rev()
+                .take_while(|&(_, &e)| e > a as u64)
+                .map(|(&s, &e)| (s.max(a as u64), e.min(a as u64 + len)))
+                .collect()
+        };
+        if prot & mman::PROT_EXEC != 0 {
+            for &(s, e) in &views {
+                if let Err(e) = own_copy(s, e - s) {
+                    return e;
+                }
+                remove_range(&mut file_views(), s, e - s);
+            }
+        }
         if prot & mman::PROT_EXEC != 0 {
             // SAFETY: guest-requested protection change of guest memory.
             if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
@@ -1824,6 +1939,18 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: guest-requested protection change of guest memory.
         let r = ret(unsafe { libc::mprotect(a, len as usize, final_prot(prot)) });
+        if r == 0 && prot & mman::PROT_EXEC == 0 {
+            for &(s, e) in &views {
+                // SAFETY: as above, for the file view's pages in the range.
+                unsafe {
+                    libc::mprotect(
+                        s as *mut libc::c_void,
+                        (e - s) as usize,
+                        final_prot(prot) & !libc::PROT_WRITE,
+                    )
+                };
+            }
+        }
         if r == 0 {
             let mut wx = write_exec();
             if wants_write_exec(prot) {
@@ -1893,6 +2020,38 @@ impl<P: Platform> Kernel<P> {
     /// mapped writable and executable, switch its page to what the access
     /// needs — executable, with its code prepared as any guest code is, or
     /// writable — and report it handled, so the access is retried.
+    /// A write the guest made at host address `addr` faulted: if it is a
+    /// page of a file view not yet written that the guest may write, the
+    /// page becomes a copy of itself (see [`FILE_VIEWS`]), and the write is
+    /// tried again.
+    pub fn view_fault(&mut self, addr: u64) -> bool {
+        let page = addr & !(self.page_size - 1);
+        if !file_views().range(..=page).next_back().is_some_and(|(_, &e)| e > page) {
+            return false;
+        }
+        let guest = crate::uaccess::guest_of(page);
+        let Some(p) = crate::maps::record().areas_in(guest, guest + 1).into_iter().next() else {
+            return false;
+        };
+        if p.value.prot & mman::PROT_WRITE == 0 {
+            return false;
+        }
+        if own_copy(page, self.page_size).is_err() {
+            return false;
+        }
+        // SAFETY: the page just copied, guest memory; its protections as the
+        // guest set them.
+        unsafe {
+            libc::mprotect(
+                page as *mut libc::c_void,
+                self.page_size as usize,
+                final_prot(p.value.prot),
+            )
+        };
+        remove_range(&mut file_views(), page, self.page_size);
+        true
+    }
+
     pub fn write_exec_fault(&mut self, addr: u64, exec: bool) -> bool {
         if !write_exec_writable(addr, self.page_size) {
             return false;

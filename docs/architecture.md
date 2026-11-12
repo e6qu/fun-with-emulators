@@ -276,8 +276,13 @@ keeps:
 - **Native fork** (the sequence is drawn in
   [linux-on-macos.md](linux-on-macos.md#fork)):
   `fwe_kernel::fork_locked` holds the kernel lock and every registry lock
-  across the host `fork`, so the child (which has only the forking
-  thread) inherits none held by a thread it lacks; it refuses (`ENOSYS`)
+  across the host `fork`, and the locks threads take outside the kernel
+  lock (epoll's interest lists, pipe states, the user namespace...;
+  `forklock.rs`, taken all at once or not at all, so their order never
+  matters), so the child (which has only the forking thread) inherits
+  none held by a thread it lacks. A `RwLock` among them is replaced in the
+  child rather than unlocked, since on macOS unlocking one walks a queue
+  of waiting threads that the child lacks. The fork refuses (`ENOSYS`)
   once the process has a VM. Threads running guest code are suspended
   (`crates/native/src/quiesce.rs`); one in fwe's code (which may hold
   `malloc`'s lock) runs on and waits before re-entering guest code until
@@ -690,6 +695,8 @@ shapes differently:
   FIFO's read end wait in short slices and probe with `select` between
   them, reporting `POLLHUP` once the data still buffered is read (once to
   an edge-triggered or one-shot `epoll` entry). The probe reads nothing.
+  Each slice is a wait as any other, which a signal ends and which moves a
+  signal blocked for a `signalfd` onto it.
   An open that waits for the other end runs without the kernel lock.
 
 ### /proc and /sys
@@ -1118,6 +1125,10 @@ which are to be lifted for 1.0 and which are not planned.
   change how the host schedules.
 
 **Memory**
+- Native: a page of a private mapping of a file with no name (a memfd)
+  not yet written, written by a system call other than the `read` family
+  (`recv` into it, say), fails with `EFAULT`; the program's own write, or
+  fwe's copies into it, make it a copy first.
 - Native: `mremap` does not grow or move code (an executable mapping,
   prepared where it is: `ENOMEM`); a grown shared anonymous mapping's new
   part is new memory, not shared with processes that share the rest;

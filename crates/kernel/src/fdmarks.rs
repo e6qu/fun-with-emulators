@@ -105,7 +105,7 @@ pub enum Mark {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Record {
+pub(crate) struct Record {
     /// The file, to tell a record from a reused descriptor number.
     dev: u64,
     ino: u64,
@@ -113,7 +113,7 @@ struct Record {
     mark: Option<Mark>,
 }
 
-static RECORDS: Mutex<BTreeMap<i32, Record>> = Mutex::new(BTreeMap::new());
+pub(crate) static RECORDS: Mutex<BTreeMap<i32, Record>> = Mutex::new(BTreeMap::new());
 
 /// How many records are of files in a cgroup filesystem, so that a write
 /// checks for one only while there are any ([`cgroup_file`]).

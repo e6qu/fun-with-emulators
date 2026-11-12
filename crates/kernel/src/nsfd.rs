@@ -38,7 +38,7 @@ const NS_GET_MNTNS_ID: u64 = 0x8008_b705;
 /// The device nsfs's files are on.
 pub const NSFS_DEV: (u32, u32) = (0, 4);
 
-static FDS: Mutex<Option<HashMap<u32, NsRef>>> = Mutex::new(None);
+pub(crate) static FDS: Mutex<Option<HashMap<u32, NsRef>>> = Mutex::new(None);
 static NEXT: AtomicU32 = AtomicU32::new(1);
 
 fn with<R>(f: impl FnOnce(&mut HashMap<u32, NsRef>) -> R) -> R {

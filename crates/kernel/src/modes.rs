@@ -38,7 +38,7 @@ pub fn host_perm(perm: u32, dir: bool) -> u32 {
 /// Descriptors open to write a file whose kept mode is set-ID: a write
 /// through one by a caller without `CAP_FSETID` takes the bits away, as
 /// Linux's does ([`wrote`]).
-static SETID_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static SETID_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 static SETID_OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Whether the caller has `CAP_FSETID`, as of its last system call that
 /// took the kernel's lock ([`note_fsetid`]).

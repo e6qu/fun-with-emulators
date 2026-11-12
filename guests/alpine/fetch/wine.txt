@@ -1,0 +1,9 @@
+# Alpine Linux 3.24 aarch64 files the Wine test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs (the test's root)
+# and Wine 11.0, whose loader, wineserver and core Unix modules need only
+# musl (its other modules, for devices and displays, load their libraries
+# when used). Each line is a path under that URL and the file's SHA-256.
+# 3.24 is supported: a rebuild of a package replaces its file, and the
+# checksum then fails rather than the test changing.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/community/aarch64/wine-11.0-r0.apk b9a2ae117dad294bae9d0e33bf0c58c526ff8e5a9d7d8afb7e388fdd09a65fb7

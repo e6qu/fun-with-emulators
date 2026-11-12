@@ -33,7 +33,7 @@ fn read_fd(n: u64, a: &[u64; 6]) -> Option<i32> {
 static NOATIME_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The descriptors opened with `O_NOATIME`: reading through one leaves the
 /// access time, as Linux's does.
-static NOATIME_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static NOATIME_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 fn noatime_fd(fd: i32) -> bool {
     NOATIME_FDS.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)

@@ -863,7 +863,8 @@ fn family(hb: &[u8]) -> i32 {
 
 /// Modes given unbound sockets with `fchmod`, by descriptor and the
 /// socket's inode: what a node bound for one is made with.
-static SOCKET_MODES: std::sync::Mutex<Vec<(i32, u64, u32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static SOCKET_MODES: std::sync::Mutex<Vec<(i32, u64, u32)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn inode(fd: i32) -> Option<u64> {
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -946,7 +947,8 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
 /// relative to its directory: by descriptor and inode, the guest's path,
 /// which `getsockname` and `getpeername` report.
 #[allow(clippy::type_complexity)]
-static NAMES: std::sync::Mutex<Vec<(i32, u64, bool, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static NAMES: std::sync::Mutex<Vec<(i32, u64, bool, Vec<u8>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn remember_name(fd: i32, local: bool, guest: &[u8]) {
     let Some(ino) = inode(fd) else { return };
@@ -1158,7 +1160,7 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
 }
 
 /// Bytes `MSG_MORE` held back, by IP socket.
-static CORKED: std::sync::Mutex<Option<std::collections::HashMap<i32, Vec<u8>>>> =
+pub(crate) static CORKED: std::sync::Mutex<Option<std::collections::HashMap<i32, Vec<u8>>>> =
     std::sync::Mutex::new(None);
 
 /// Whether any socket has bytes held back.
@@ -1184,7 +1186,8 @@ fn take_corked(fd: i32) -> Option<Vec<u8>> {
 
 /// The multicast groups TCP sockets joined: (socket, group and
 /// interface as the host lays them out).
-static MEMBERSHIPS: std::sync::Mutex<Vec<(i32, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static MEMBERSHIPS: std::sync::Mutex<Vec<(i32, Vec<u8>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// A multicast group joined or left on a TCP socket, which Linux allows
 /// (no multicast reaches one) and the host refuses: kept by fwe. Joining
@@ -1518,7 +1521,8 @@ fn disconnect(fd: i32) -> Option<i64> {
 const KEPT: [u64; 3] = [11, 12, 16];
 
 /// The values of [`KEPT`] options set: (socket, option, value).
-static KEPT_VALUES: std::sync::Mutex<Vec<(i32, u64, i32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static KEPT_VALUES: std::sync::Mutex<Vec<(i32, u64, i32)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// IPv6 sockets `IPV6_ADDRFORM` made IPv4: the host's socket stays IPv6,
 /// its names are reported as the IPv4 ones they map.
