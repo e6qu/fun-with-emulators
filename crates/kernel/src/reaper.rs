@@ -768,6 +768,44 @@ pub fn children(pid: i32) -> Vec<i32> {
     }
 }
 
+/// Processes this one sent a signal that may stop or continue them, for the
+/// watcher to look at ([`stop_signal_sent`]).
+static SENT: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// The watcher's kqueue, where a user event wakes it (-1: none).
+#[cfg(target_os = "macos")]
+static WATCH_KQ: AtomicI32 = AtomicI32::new(-1);
+
+/// This process is sending host process `pid` a signal that may stop or
+/// continue it: when a watcher runs, it looks for the stop or continue, and
+/// takes a stop it finds for this signal's. The host
+/// tells the watcher of a signal only to a process it follows already, and
+/// an orphan this process just adopted it may not follow yet: the stop
+/// would then be taken for one from before the adoption, never reported.
+pub fn stop_signal_sent(pid: i32) {
+    if !active() {
+        return;
+    }
+    SENT.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+    #[cfg(target_os = "macos")]
+    {
+        let kq = WATCH_KQ.load(SeqCst);
+        if kq >= 0 {
+            let ev = libc::kevent {
+                ident: 0,
+                filter: libc::EVFILT_USER,
+                flags: 0,
+                fflags: libc::NOTE_TRIGGER,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: triggering the user event registered on the watcher's
+            // kqueue.
+            unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod watch {
     use super::*;
@@ -826,7 +864,10 @@ mod watch {
                     gone = true;
                     continue;
                 }
-                self.stopped.insert(p, procreg::stopped_by(p).is_some());
+                // Stopped already: from before it was followed, unless by a
+                // signal this process is sending ([`stop_signal_sent`]).
+                let sent = SENT.lock().unwrap_or_else(|e| e.into_inner()).contains(&p);
+                self.stopped.insert(p, !sent && procreg::stopped_by(p).is_some());
                 // Registered first, so a child it makes from now on is
                 // reported by its fork.
                 todo.extend(children(p));
@@ -904,12 +945,16 @@ mod watch {
         let mut w = Watcher { kq, watched: HashSet::new(), stopped: Default::default() };
         // This process's forks, and the host's SIGCHLD (a child of its own
         // that ended, stopped or continued).
+        // And the signals it sends that may stop or continue a process
+        // ([`stop_signal_sent`]).
         let own = [
             change(me, libc::EVFILT_PROC, libc::EV_ADD | libc::EV_CLEAR, libc::NOTE_FORK),
             change(libc::SIGCHLD, libc::EVFILT_SIGNAL, libc::EV_ADD | libc::EV_CLEAR, 0),
+            change(0, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0),
         ];
         // SAFETY: registering changes on our kqueue.
-        unsafe { libc::kevent(kq, own.as_ptr(), 2, std::ptr::null_mut(), 0, std::ptr::null()) };
+        unsafe { libc::kevent(kq, own.as_ptr(), 3, std::ptr::null_mut(), 0, std::ptr::null()) };
+        WATCH_KQ.store(kq, SeqCst);
         w.watched.insert(me);
         busy(|| {
             for c in children(me) {
@@ -976,6 +1021,31 @@ mod watch {
                         CHANGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.pid != pid);
                     } else if ev.fflags & libc::NOTE_SIGNAL != 0 && pid != me {
                         signalled.insert(pid, std::time::Instant::now());
+                    }
+                }
+                // Those this process signalled itself: followed now if they
+                // are below it and were not, from before the signal (which
+                // the host told nothing of).
+                let sent: Vec<i32> = SENT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                for &pid in &sent {
+                    if !w.watched.contains(&pid) {
+                        let below = procreg::read(pid)
+                            .is_some_and(|r| r.lineage.iter().any(|&(p, _)| p == me));
+                        if !below {
+                            continue;
+                        }
+                        w.follow(pid);
+                        w.stopped.insert(pid, false);
+                    }
+                    signalled.insert(pid, std::time::Instant::now());
+                }
+                // Handled: gone from the list (one sent meanwhile stays).
+                {
+                    let mut l = SENT.lock().unwrap_or_else(|e| e.into_inner());
+                    for pid in &sent {
+                        if let Some(i) = l.iter().position(|p| p == pid) {
+                            l.remove(i);
+                        }
                     }
                 }
                 // Those of them that stopped or continued.

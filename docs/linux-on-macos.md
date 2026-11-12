@@ -1713,7 +1713,7 @@ them out on the slab and the guest's page tables:
 
 | Call | Linux | fwe, native | fwe, VM |
 |---|---|---|---|
-| `mmap` anonymous / private file | kernel VMA | host `mmap` at the guest's address or where macOS places it; offset a multiple of 16 KiB | slab range; a private file mapping is a copy of the file's data when mapped |
+| `mmap` anonymous / private file | kernel VMA | host `mmap` at the guest's address or where macOS places it; offset a multiple of 16 KiB; a read-only one of a file with no name (a memfd, an unlinked file: memory shared through it) is a shared host mapping, so it shows what others write to the file until made writable, when it becomes a copy (the host's private mapping is a copy from the start) | slab range; a private file mapping is a copy of the file's data when mapped, but a read-only one of a file with no name is a segment of the file, a copy once made writable |
 | `MAP_SHARED` | shared pages | host `MAP_SHARED`; an executable shared file mapping is made private, since its code is rewritten | a *segment*: a host shared mapping outside the slab (anonymous shared memory is an unlinked file), mapped into the VM once |
 | `MAP_FIXED`, `MAP_FIXED_NOREPLACE` | replace / refuse to replace | host `MAP_FIXED`; `NOREPLACE` checks where macOS put it (`EEXIST`) | page-table edit; slab memory at its own address is reused, zeroed |
 | `munmap` | | host `munmap` | pages removed from stage 1, TLBs flushed; the slab range zeroed before reuse |
@@ -2640,7 +2640,10 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
   its record of how it ended comes just before), stop or continue,
   with a child's `siginfo`, and wakes every one of its threads, so the
   one that does not block it takes it (a wake the host gives one thread
-  could land on one that blocks it);
+  could land on one that blocks it); a stop or continue signal the reaper
+  sends itself is told to its watcher first, which looks for the stop it
+  makes even in a process it did not follow yet (the host tells it only of
+  signals to the processes it follows);
 - its `wait` looks at its own children, then the adopted ones;
 - a child made with `CLONE_PARENT` is its creator's parent's, not its
   parent's on the host: its record says so, it tells that parent as it

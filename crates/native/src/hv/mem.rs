@@ -73,6 +73,13 @@ impl PartialEq for Area {
     }
 }
 
+impl Source {
+    /// The same file from `offset` bytes further on.
+    fn at(&self, offset: u64) -> Source {
+        Source { file: self.file.clone(), offset: self.offset + offset }
+    }
+}
+
 impl Mapping for Area {
     fn at(&self, offset: u64) -> Area {
         Area {
@@ -81,10 +88,7 @@ impl Mapping for Area {
                 Back::Slab { host } => Back::Slab { host: host + offset },
                 Back::Segment { id, off } => Back::Segment { id, off: off + offset },
             },
-            source: self
-                .source
-                .as_ref()
-                .map(|s| Source { file: s.file.clone(), offset: s.offset + offset }),
+            source: self.source.as_ref().map(|s| s.at(offset)),
         }
     }
 }
@@ -613,9 +617,29 @@ impl Mem {
                 Err(e) => return err(e),
             }
         };
+        // A private read-only view of an unlinked file (a memfd, or Wine's
+        // section of shared memory) is mapped from the file itself, as a
+        // shared mapping, so that it shows what others write to the file,
+        // as Linux's does until it is written: a copy made now would not.
+        // It becomes a copy when made writable (`mprotect`). An ordinary
+        // file's view is a copy, as before.
+        let view = !shared
+            && prot & mman::PROT_WRITE == 0
+            && file.as_ref().is_some_and(|f| fwe_kernel::host::unlinked(f.as_raw_fd()));
         // A fixed mapping replaces what is there.
         let kept = self.remove_keeping(at, at + len);
-        let r = if shared {
+        let r = if view {
+            let generation = vm::generation();
+            for &(h, e) in &kept {
+                self.pending.push((generation, h, e - h));
+            }
+            let file = file.expect("a file view");
+            let source = Source { file: file.clone(), offset };
+            self.map_shared(at, len, prot, file, offset).map(|()| {
+                self.vmas
+                    .update(at, at + len, |a| Area { source: Some(source.at(0)), ..a.clone() });
+            })
+        } else if shared {
             let generation = vm::generation();
             for &(h, e) in &kept {
                 self.pending.push((generation, h, e - h));
@@ -662,6 +686,27 @@ impl Mem {
         };
         if prot & mman::PROT_WRITE != 0 && self.vmas.pieces(addr, end).iter().any(read_only) {
             return err(errno::EACCES);
+        }
+        // A private view of a file made writable becomes a copy of the file
+        // as it is now (its pages were the file's until then), as Linux's
+        // pages are copied when first written.
+        if prot & mman::PROT_WRITE != 0 {
+            let views: Vec<Piece<Area>> = self
+                .vmas
+                .pieces(addr, end)
+                .into_iter()
+                .filter(|p| {
+                    matches!(p.value.back, Back::Segment { .. }) && p.value.source.is_some()
+                })
+                .collect();
+            for p in views {
+                let kept = self.remove_keeping(p.start, p.end);
+                if let Err(e) =
+                    self.map_private(p.start, p.end - p.start, prot, p.value.source, kept)
+                {
+                    return err(e);
+                }
+            }
         }
         self.vmas.update(addr, end, |a| Area { prot, ..a.clone() });
         for p in self.vmas.pieces(addr, end) {

@@ -55,6 +55,9 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
     fn _exit(code: i32) -> !;
+    fn pwrite(fd: i32, buf: *const u8, len: usize, off: i64) -> isize;
+    fn pread(fd: i32, buf: *mut u8, len: usize, off: i64) -> isize;
+    fn ftruncate(fd: i32, len: i64) -> i32;
 }
 
 /// The lines of `/proc/self/maps` as (start, end, perms, offset, name).
@@ -130,6 +133,34 @@ fn reserve_and_map_over() {
     println!("reserved 4 GiB, mapped over twice: zero {zero}, under 256 MiB resident {}", rss < 256 << 10);
 }
 
+/// A private view of a file with no name (a memfd), as Wine maps the shared
+/// memory its server writes: it shows what is written to the file until it
+/// is itself written, then holds its own copy.
+fn private_view() {
+    let name = CString::new("view").unwrap();
+    // SAFETY: a memfd of this program's, and mappings of it read and written
+    // within their length.
+    unsafe {
+        let fd = memfd_create(name.as_ptr(), 0);
+        ftruncate(fd, 65536);
+        pwrite(fd, b"A".as_ptr(), 1, 4096);
+        let v = mmap(std::ptr::null_mut(), 65536, 1, 2, fd, 0);
+        pwrite(fd, b"B".as_ptr(), 1, 4096);
+        let follows = *v.add(4096) as char;
+        mprotect(v, 65536, 3);
+        *v.add(4096) = b'C';
+        let mut f = [0u8];
+        pread(fd, f.as_mut_ptr(), 1, 4096);
+        pwrite(fd, b"D".as_ptr(), 1, 4096);
+        println!(
+            "view: follows the file {follows}, its own write {}, the file kept {}, later file write {}",
+            *v.add(4096) as char,
+            f[0] as char,
+            if *v.add(4096) == b'C' { "unseen" } else { "seen" }
+        );
+    }
+}
+
 /// This process's resident memory (`/proc/self/status`'s `VmRSS`), in KiB.
 fn rss_kb() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -138,9 +169,10 @@ fn rss_kb() -> u64 {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("reserve") {
-        reserve_and_map_over();
-        return;
+    match std::env::args().nth(1).as_deref() {
+        Some("reserve") => return reserve_and_map_over(),
+        Some("view") => return private_view(),
+        _ => {}
     }
     // SAFETY: plain C library calls with valid arguments, on memory this
     // program maps for them.

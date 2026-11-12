@@ -194,6 +194,18 @@ fn write_exec() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     WRITE_EXEC.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Private read-only mappings of files with no name (a memfd, or a file
+/// unlinked once opened: memory shared through it), host `start -> end`.
+/// Linux shows such a mapping what is written to the file until the mapping
+/// is itself written; the host's private mapping is a copy from the start.
+/// So the host maps them shared (and read-only), and they become a copy of
+/// the file as it then is when made writable ([`Kernel::mprotect_call`]).
+static FILE_VIEWS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+fn file_views() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
+    FILE_VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Whether host address `addr` is in writable and executable guest memory.
 fn is_write_exec(addr: u64) -> bool {
     write_exec().range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
@@ -989,6 +1001,30 @@ fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
     ranges
 }
 
+/// Make host memory `[addr, addr + len)`, a shared view of a file, a
+/// private copy of what it shows now, readable (the caller then sets its
+/// protections).
+fn own_copy(addr: u64, len: u64) -> Result<(), i64> {
+    // SAFETY: guest memory of a readable mapping, copied out, then replaced
+    // at the same place by fresh memory the copy is written back into.
+    unsafe {
+        let data = std::slice::from_raw_parts(addr as *const u8, len as usize).to_vec();
+        let p = libc::mmap(
+            addr as *mut libc::c_void,
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return Err(last_error());
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+    }
+    Ok(())
+}
+
 fn host_prot(prot: u64) -> libc::c_int {
     let mut p = libc::PROT_NONE;
     if prot & mman::PROT_READ != 0 {
@@ -1614,6 +1650,16 @@ impl<P: Platform> Kernel<P> {
         // the code, then switched to the requested protections. Shared file
         // mappings are made private for this, since the code is modified.
         let exec = prot & mman::PROT_EXEC != 0;
+        // A private read-only view of a file with no name: shared on the
+        // host (see [`FILE_VIEWS`]).
+        let view = !anonymous
+            && !exec
+            && hflags & libc::MAP_PRIVATE != 0
+            && prot & mman::PROT_WRITE == 0
+            && crate::host::unlinked(fd as i32);
+        if view {
+            hflags = (hflags & !libc::MAP_PRIVATE) | libc::MAP_SHARED;
+        }
         let initial_prot = if exec {
             if hflags & libc::MAP_SHARED != 0 && !anonymous {
                 hflags = (hflags & !libc::MAP_SHARED) | libc::MAP_PRIVATE;
@@ -1662,6 +1708,11 @@ impl<P: Platform> Kernel<P> {
             }
             let guest = if p == haddr && fixed { addr } else { p };
             track(p, self.page_up(len));
+            if view {
+                add_range(&mut file_views(), p, self.page_up(len));
+            } else {
+                remove_range(&mut file_views(), p, self.page_up(len));
+            }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
                 // SAFETY: unmapping the mapping just created.
                 self.unmap_host(p, len);
@@ -1756,6 +1807,7 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             untrack(host as u64, self.page_up(len));
             remove_range(&mut write_exec(), host as u64, self.page_up(len));
+            remove_range(&mut file_views(), host as u64, self.page_up(len));
             remove_range(&mut wipe_on_fork(), host as u64, self.page_up(len));
             remove_range(&mut grows_down(), addr, self.page_up(len));
             remove_range(&mut poisoned_ranges(), addr, self.page_up(len));
@@ -1803,6 +1855,21 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let a = crate::uaccess::g2h(addr) as *mut libc::c_void;
+        if prot & mman::PROT_WRITE != 0 {
+            let len = self.page_up(len);
+            let views: Vec<(u64, u64)> = file_views()
+                .range(..a as u64 + len)
+                .rev()
+                .take_while(|&(_, &e)| e > a as u64)
+                .map(|(&s, &e)| (s.max(a as u64), e.min(a as u64 + len)))
+                .collect();
+            for (s, e) in views {
+                if let Err(e) = own_copy(s, e - s) {
+                    return e;
+                }
+                remove_range(&mut file_views(), s, e - s);
+            }
+        }
         if prot & mman::PROT_EXEC != 0 {
             // SAFETY: guest-requested protection change of guest memory.
             if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {

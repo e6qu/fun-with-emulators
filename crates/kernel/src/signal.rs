@@ -834,6 +834,20 @@ impl<P: Platform> Kernel<P> {
             if noted {
                 crate::signote::note(target as i32, h);
             }
+            // Before the signal: the watcher of a reaper takes the target's
+            // stop for one it was sent from now on.
+            if target > 0
+                && matches!(
+                    sig,
+                    signal::SIGSTOP
+                        | signal::SIGTSTP
+                        | signal::SIGTTIN
+                        | signal::SIGTTOU
+                        | signal::SIGCONT
+                )
+            {
+                crate::reaper::stop_signal_sent(target as i32);
+            }
             let r = host::kill(target as libc::pid_t, h);
             if r != 0 && noted {
                 crate::signote::unnote(target as i32, h);

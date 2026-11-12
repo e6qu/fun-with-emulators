@@ -5031,6 +5031,12 @@ fn hv_map_fixed_replaces_mapped_memory() {
     let out = fwe_hv(&asm_guest("mapfixedmt-low"), &[]).unwrap();
     assert_eq!(stdout(&out), "ok\n");
     assert_eq!(out.status.code(), Some(0));
+    // A private view of a memfd follows the file until written.
+    let want =
+        "view: follows the file B, its own write C, the file kept B, later file write unseen\n";
+    assert_eq!(stdout(&fwe(&rust_guest("maps"), &["view"])), want);
+    let out = fwe_hv(&rust_low_guest("maps"), &["view"]).unwrap();
+    assert_eq!(stdout(&out), want);
     // Gigabytes reserved and mapped over take memory only where touched.
     let out = fwe_hv(&rust_low_guest("maps"), &["reserve"]).unwrap();
     assert_eq!(
