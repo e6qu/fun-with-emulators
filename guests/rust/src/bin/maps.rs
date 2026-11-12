@@ -158,6 +158,33 @@ fn private_view() {
             f[0] as char,
             if *v.add(4096) == b'C' { "unseen" } else { "seen" }
         );
+        // Writable from the start, as Wine maps its sections: each page
+        // follows the file until it is itself written; a write through a
+        // system call (`read` into it) makes it a copy as well.
+        let page = getpagesize() as usize;
+        let w = mmap(std::ptr::null_mut(), 4 * page, 3, 2, fd, 0);
+        pwrite(fd, b"E".as_ptr(), 1, 0);
+        pwrite(fd, b"F".as_ptr(), 1, page as i64);
+        let before = (*w as char, *w.add(page) as char);
+        *w = b'G';
+        let mut p = [0i32; 2];
+        pipe(p.as_mut_ptr());
+        write(p[1], b"H".as_ptr(), 1);
+        read(p[0], w.add(2 * page), 1);
+        pwrite(fd, b"I".as_ptr(), 1, 0);
+        pwrite(fd, b"J".as_ptr(), 1, page as i64);
+        pwrite(fd, b"K".as_ptr(), 1, 2 * page as i64);
+        let mut f0 = [0u8];
+        pread(fd, f0.as_mut_ptr(), 1, 0);
+        println!(
+            "writable view: follows {}{}, written page {}, its neighbour {}, read into {}, file {}",
+            before.0,
+            before.1,
+            *w as char,
+            *w.add(page) as char,
+            *w.add(2 * page) as char,
+            f0[0] as char
+        );
     }
 }
 

@@ -1099,6 +1099,10 @@ impl Vcpu {
                 // access is tried again.
                 if esr & 0x3c == 0x04 && mem::demand(far) {
                     regs.pc = elr;
+                } else if esr & 0x3c == 0x0c && esr & (1 << 6) != 0 && mem::view_fault(far) {
+                    // A write to a page of a private view of a file: it is
+                    // a copy now, and the write is tried again.
+                    regs.pc = elr;
                 } else if esr & 0x3c == 0x0c && stale_permissions(esr, far) {
                     // A permission fault (0b0011xx) the tables no longer
                     // give: the TLBs are invalidated, the access tried

@@ -681,6 +681,12 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if kernel().as_mut().is_some_and(|k| k.write_exec_fault(addr, exec)) {
         return;
     }
+    // A page of a private mapping of a file with no name, first written:
+    // it becomes a copy, and the write is tried again.
+    let write = !exec && mc.es.esr & (1 << 6) != 0;
+    if write && kernel().as_mut().is_some_and(|k| k.view_fault(addr)) {
+        return;
+    }
     // Below a stack that grows down (`MAP_GROWSDOWN`): it grows, and the
     // access is retried.
     if sig == libc::SIGSEGV && !exec && kernel().as_mut().is_some_and(|k| k.stack_fault(addr)) {

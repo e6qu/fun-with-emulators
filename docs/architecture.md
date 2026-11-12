@@ -1118,6 +1118,10 @@ which are to be lifted for 1.0 and which are not planned.
   change how the host schedules.
 
 **Memory**
+- Native: a page of a private mapping of a file with no name (a memfd)
+  not yet written, written by a system call other than the `read` family
+  (`recv` into it, say), fails with `EFAULT`; the program's own write, or
+  fwe's copies into it, make it a copy first.
 - Native: `mremap` does not grow or move code (an executable mapping,
   prepared where it is: `ENOMEM`); a grown shared anonymous mapping's new
   part is new memory, not shared with processes that share the rest;

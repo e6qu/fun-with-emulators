@@ -200,6 +200,11 @@ pub fn set_validator(f: Validator) {
 /// Whether the guest may access `[addr, addr + len)` (writing, with
 /// `write`): always, without a validator (the host faults instead).
 pub fn valid(addr: u64, len: u64, write: bool) -> bool {
+    if write {
+        // Pages of a file view become the guest's own first (as its own
+        // write makes them).
+        crate::mm::views_written(addr, len);
+    }
     len == 0 || VALIDATOR.get().is_none_or(|f| f(addr, len, write))
 }
 
