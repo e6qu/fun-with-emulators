@@ -984,10 +984,7 @@ fn start(
 
     let page = page_size();
     let tracer = options.strace;
-    let host = host_support();
-    if tracer.enabled {
-        tracer.note(&format!("host: {host}"));
-    }
+    trap::set_tracing(tracer.enabled);
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
 
