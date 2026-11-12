@@ -49,19 +49,37 @@ const PUSH: u32 = 0xf81f_0fe0;
 const POP: u32 = 0xf841_07e0;
 /// `add xD, sp, #48`: the `sp` a three-register stub was entered with.
 const ADD_SP_48: u32 = 0x9100_c3e0;
+/// `sub sp, sp, #imm12`; `| (imm << 10)`.
+const SUB_SP: u32 = 0xd100_03ff;
+/// `add sp, sp, #imm12`; `| (imm << 10)`.
+const ADD_SP: u32 = 0x9100_03ff;
+/// `add xD, sp, #imm12`; `| (imm << 10) | d`.
+const ADD_FROM_SP: u32 = 0x9100_03e0;
+/// `mov sp, xN` (`add sp, xN, #0`); `| (n << 5)`.
+const MOV_TO_SP: u32 = 0x9100_001f;
+/// `stp xA, xB, [sp]`; `| (b << 10) | a`.
+const STP_SP: u32 = 0xa900_03e0;
+/// `ldp xA, xB, [sp]`; `| (b << 10) | a`.
+const LDP_SP: u32 = 0xa940_03e0;
+/// `stp xA, xB, [sp, #-16]!`; `| (b << 10) | a`.
+const PUSH_PAIR: u32 = 0xa9bf_03e0;
+/// `ldp xA, xB, [sp], #16`; `| (b << 10) | a`.
+const POP_PAIR: u32 = 0xa8c1_03e0;
+/// `ldur xT, [xN, #imm9]`; `| ((imm & 0x1ff) << 12) | (n << 5) | t`.
+pub const LDUR: u32 = 0xf840_0000;
+/// `mov xD, xM` (`orr xD, xzr, xM`); `| (m << 16) | d`.
+const MOV: u32 = 0xaa00_03e0;
+/// `add xD, xN, xM`; `| (m << 16) | (n << 5) | d`.
+const ADD_REG: u32 = 0x8b00_0000;
 /// `b <label>`
 const B: u32 = 0x1400_0000;
-/// `br xN` (indirect branch); `| (n << 5)`.
-const BR: u32 = 0xd61f_0000;
 /// `movz xN, #imm16` base; `| (hw << 21) | (imm16 << 5) | n`.
 const MOVZ: u32 = 0xd280_0000;
 /// `movk xN, #imm16` base.
 const MOVK: u32 = 0xf280_0000;
 
-/// Largest stub, in instructions. The `x18` branch stub is the biggest: save
-/// two scratch registers, load the TSD base and `x18`, test it, and restore the
-/// scratch registers down each of the taken and not-taken paths before a
-/// full-range branch.
+/// Largest stub, in instructions. The `x18` branch stub and the stub for a
+/// load or store written back onto `sp` are the biggest.
 pub const STUB_WORDS: usize = 14;
 
 /// Reach of a `b` instruction.
@@ -94,6 +112,9 @@ fn x18_site(insn: u32) -> bool {
         || x18_adr(insn).is_some()
         || x18_ldr_literal(insn)
         || x18_indirect(insn).is_some()
+        || x18_casp(insn)
+        || x18_sp_writeback(insn)
+        || x18_writes_sp(insn)
 }
 
 /// Result of rewriting a block of code in place.
@@ -229,6 +250,24 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
         (slot / 8) << 10
     };
     let mut words = match site {
+        // Through `x18`: from one slot to the other.
+        Site::ReadThreadPointer { rt: 18 } | Site::WriteThreadPointer { rt: 18 } => {
+            let (from, to) = match site {
+                Site::ReadThreadPointer { .. } => (imm(tp_slot), imm(x18_slot)),
+                _ => (imm(x18_slot), imm(tp_slot)),
+            };
+            let (s1, s2) = (0, 1);
+            vec![
+                PUSH | s1,
+                PUSH | s2,
+                MRS_TPIDRRO | s2,
+                AND_NOT7 | (s2 << 5) | s2,
+                LDR_UIMM | from | (s2 << 5) | s1,
+                STR_UIMM | to | (s2 << 5) | s1,
+                POP | s2,
+                POP | s1,
+            ]
+        }
         Site::ReadThreadPointer { rt } => {
             let imm = imm(tp_slot);
             vec![MRS_TPIDRRO | rt, AND_NOT7 | (rt << 5) | rt, LDR_UIMM | imm | (rt << 5) | rt]
@@ -263,10 +302,18 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
         Site::X18 { insn } if crate::decode::x18_ldr_literal(insn) => {
             x18_ldr_literal_stub(insn, imm(x18_slot), ret)
         }
+        Site::X18 { insn } if crate::decode::x18_casp(insn) => x18_casp_stub(insn, imm(x18_slot)),
+        Site::X18 { insn } if crate::decode::x18_sp_writeback(insn) => {
+            x18_sp_writeback_stub(insn, imm(x18_slot))
+        }
+        Site::X18 { insn } if crate::decode::x18_writes_sp(insn) => {
+            x18_writes_sp_stub(insn, imm(x18_slot))
+        }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
     };
     let at = stub + 4 * words.len() as u64;
     words.push(branch(at, ret).expect("stub placed within branch range of its site"));
+    assert!(words.len() <= STUB_WORDS, "a stub longer than its slot");
     words
 }
 
@@ -383,23 +430,199 @@ fn x18_ldr_literal_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
     ]
 }
 
-/// Stub for an indirect branch (`br`/`blr`/`ret`) through `x18`. Loads the
-/// target from the slot into `x16` and jumps; `x16`/`x17` are the
-/// intra-procedure-call scratch registers, dead at any branch, so no save is
-/// needed. For `blr` the link register is set to the instruction after the
-/// original branch. Self-terminating (ends in `br`).
+/// Stub for an indirect branch through `x18` (`br`/`blr`/`ret`, and the
+/// authenticated forms). Loads the target from the slot into `x16` (`x17`
+/// when the modifier is `x16`) and branches with the original's kind:
+/// `x16`/`x17` are the intra-procedure-call scratch registers, dead at any
+/// branch, so no save is needed, and a branch through them may land on a
+/// `bti c`. For the `blr` forms the link register is set to the instruction
+/// after the original branch, and the branch made without link.
+/// Self-terminating (ends in the branch).
 fn x18_indirect_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
     let sets_link = crate::decode::x18_indirect(insn) == Some(true);
-    let mut v = vec![
-        MRS_TPIDRRO | 17,
-        AND_NOT7 | (17 << 5) | 17,
-        LDR_UIMM | imm | (17 << 5) | 16, // x16 = x18 (the target)
-    ];
+    let modifier = ((insn >> 24) & 1 == 1).then_some(insn & 0x1f);
+    let t = if modifier == Some(16) { 17 } else { 16 };
+    let mut v = vec![MRS_TPIDRRO | t, AND_NOT7 | (t << 5) | t, LDR_UIMM | imm | (t << 5) | t];
     if sets_link {
         v.extend(materialize(30, ret)); // lr = site + 4
     }
-    v.push(BR | (16 << 5)); // br x16
+    // The same branch, without link, through `t`.
+    v.push((insn & !(1 << 21) & !(0x1f << 5)) | (t << 5));
     v
+}
+
+/// The registers 0..=30 not in `used`, lowest first.
+fn free(used: u32) -> impl Iterator<Item = u32> {
+    (0u32..=30).filter(move |&r| used & (1 << r) == 0)
+}
+
+/// Stub for a `casp` naming `x18` in a pair or as its base. A pair must be
+/// an even-numbered register and the next, so one holding `x18` is replaced
+/// by a free even pair: its first holds `x18`, its second a copy of `x19`,
+/// and both go back after (`x18` to the slot) if the pair is the one
+/// written (`Rs`). A base of `x18` goes through one more scratch register.
+fn x18_casp_stub(insn: u32, imm: u32) -> Vec<u32> {
+    let (rs, rt, rn) = ((insn >> 16) & 0x1f, insn & 0x1f, (insn >> 5) & 0x1f);
+    let used = [rs, rs + 1, rt, rt + 1, rn, 18, 19].iter().fold(0u32, |u, &r| u | 1 << r);
+    let pair = rs == 18 || rt == 18;
+    let p = (0u32..=28).step_by(2).find(|&r| used & (3 << r) == 0).expect("a free even pair");
+    let mut taken = used | 3 << p;
+    let mut next = || {
+        let r = free(taken).next().expect("a free register");
+        taken |= 1 << r;
+        r
+    };
+    let b = next(); // the TSD base
+    let q = next(); // a base of x18
+    let mut casp = insn;
+    let sub = |i: u32, shift: u32, r: u32| (i & !(0x1f << shift)) | (r << shift);
+    if rs == 18 {
+        casp = sub(casp, 16, p);
+    }
+    if rt == 18 {
+        casp = sub(casp, 0, p);
+    }
+    if rn == 18 {
+        casp = sub(casp, 5, q);
+    }
+    let mut w = Vec::new();
+    if pair {
+        w.push(PUSH_PAIR | (p + 1) << 10 | p);
+    }
+    w.extend([PUSH_PAIR | q << 10 | b, MRS_TPIDRRO | b, AND_NOT7 | (b << 5) | b]);
+    if pair {
+        w.extend([LDR_UIMM | imm | (b << 5) | p, MOV | 19 << 16 | (p + 1)]);
+    }
+    if rn == 18 {
+        w.push(LDR_UIMM | imm | (b << 5) | q);
+    }
+    w.push(casp);
+    if rs == 18 {
+        w.extend([STR_UIMM | imm | (b << 5) | p, MOV | (p + 1) << 16 | 19]);
+    }
+    w.push(POP_PAIR | q << 10 | b);
+    if pair {
+        w.push(POP_PAIR | (p + 1) << 10 | p);
+    }
+    w
+}
+
+/// Stub for a load or store of `x18` written back onto `sp`. It runs the
+/// access without the writeback, at the address the original uses, through
+/// a scratch register, then moves `sp` by the immediate. Its scratch
+/// registers are saved below the access, and `sp` covers both all along, so
+/// a signal at any point finds nothing live below `sp`.
+fn x18_sp_writeback_stub(insn: u32, imm: u32) -> Vec<u32> {
+    let pair = insn & 0x3a00_0000 == 0x2800_0000;
+    let rt = insn & 0x1f;
+    let rt2 = (insn >> 10) & 0x1f;
+    let (pre, delta, load) = if pair {
+        // opc 00: 32-bit, 01: `ldpsw` (32-bit loads), 10: 64-bit.
+        let scale = if insn >> 31 == 1 { 8 } else { 4 };
+        let imm7 = (((insn >> 15) & 0x7f) as i32) << 25 >> 25;
+        ((insn >> 23) & 3 == 0b11, imm7 * scale, (insn >> 22) & 1 == 1)
+    } else {
+        let imm9 = (((insn >> 12) & 0x1ff) as i32) << 23 >> 23;
+        ((insn >> 11) & 1 == 1, imm9, (insn >> 22) & 3 != 0)
+    };
+    // The access, from `sp` on entry; the scratch registers saved below it.
+    let at = if pre { delta } else { 0 };
+    let k = 32 + ((-at).max(0) as u32).div_ceil(16) * 16;
+    let mut used = 1u32 << 18 | 1 << rt;
+    if pair && rt2 != 31 {
+        used |= 1 << rt2;
+    }
+    let mut regs = free(used);
+    let (s1, s2, s3) = (regs.next().unwrap(), regs.next().unwrap(), regs.next().unwrap());
+    let x = |r: u32| if r == 18 { s1 } else { r };
+    let access = if pair {
+        let keep = insn & !(3 << 23) & !(0x7f << 15) & !(0x1f << 10) & !(0x1f << 5) & !0x1f;
+        keep | 0b10 << 23 | x(rt2) << 10 | s3 << 5 | x(rt)
+    } else {
+        (insn & 0xc4c0_0000) | 0x3900_0000 | s3 << 5 | x(rt)
+    };
+    let mut w = vec![
+        SUB_SP | k << 10,
+        STP_SP | s2 << 10 | s1,
+        STR_UIMM | (2 << 10) | (31 << 5) | s3,
+        MRS_TPIDRRO | s2,
+        AND_NOT7 | (s2 << 5) | s2,
+    ];
+    if !load {
+        w.push(LDR_UIMM | imm | (s2 << 5) | s1);
+    }
+    w.extend([ADD_FROM_SP | ((k as i32 + at) as u32) << 10 | s3, access]);
+    if load {
+        w.push(STR_UIMM | imm | (s2 << 5) | s1);
+    }
+    w.extend([LDR_UIMM | (2 << 10) | (31 << 5) | s3, LDP_SP | s2 << 10 | s1, ADD_SP | k << 10]);
+    match delta {
+        0 => {}
+        d if d > 0 => w.push(ADD_SP | (d as u32) << 10),
+        d => w.push(SUB_SP | ((-d) as u32) << 10),
+    }
+    w
+}
+
+/// Stub for an instruction that writes `sp` from `x18`. The new `sp` is
+/// computed in a scratch register, with `x18` from its slot and the
+/// original `sp` in a second scratch register, then moved into `sp`; the
+/// two scratch registers come back from where they were saved, through the
+/// second. Those last two loads read below a new `sp` higher than the
+/// old: a signal delivered between the move and them finishes them first
+/// (`trap::finish_sp_stub` in the native backend), so its frame cannot
+/// overwrite what they read.
+fn x18_writes_sp_stub(insn: u32, imm: u32) -> Vec<u32> {
+    let (rn, rm) = ((insn >> 5) & 0x1f, (insn >> 16) & 0x1f);
+    let simd = insn & 0x1f != 31;
+    // Rm is a register in the extended-register and SIMD forms only.
+    let has_rm = simd || (insn >> 24) & 0x1f == 0b01011;
+    let mut used = 1u32 << 18;
+    for (r, is_reg) in [(rn, true), (rm, has_rm)] {
+        if is_reg && r != 31 {
+            used |= 1 << r;
+        }
+    }
+    let mut regs = free(used);
+    let (s1, s2) = (regs.next().unwrap(), regs.next().unwrap());
+    let mut w = vec![
+        PUSH | s1,
+        PUSH | s2,
+        MRS_TPIDRRO | s2,
+        AND_NOT7 | (s2 << 5) | s2,
+        LDR_UIMM | imm | (s2 << 5) | s1,
+        ADD_FROM_SP | (32 << 10) | s2,
+    ];
+    if simd {
+        // The access at `sp` without the writeback, then `sp` + `x18`.
+        w.push((insn & !(1 << 23) & !(0x1f << 16) & !(0x1f << 5)) | s2 << 5);
+        w.push(ADD_REG | s1 << 16 | s2 << 5 | s1);
+    } else {
+        let sub = |i: u32, shift: u32, r: u32| (i & !(0x1f << shift)) | (r << shift);
+        let mut c = sub(insn, 0, s1);
+        c = sub(
+            c,
+            5,
+            if rn == 31 {
+                s2
+            } else if rn == 18 {
+                s1
+            } else {
+                rn
+            },
+        );
+        // The extended-register form's Rm.
+        if (insn >> 24) & 0x1f == 0b01011 && rm == 18 {
+            c = sub(c, 16, s1);
+        }
+        w.push(c);
+    }
+    w.extend([
+        MOV_TO_SP | s1 << 5,
+        LDUR | (((-16i32) as u32) & 0x1ff) << 12 | s2 << 5 | s1,
+        LDUR | (((-32i32) as u32) & 0x1ff) << 12 | s2 << 5 | s2,
+    ]);
+    w
 }
 
 /// Body of the stub for an `x18`-naming instruction (without the final branch
@@ -424,8 +647,9 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let s2 = pick(used | (1 << s1));
     // An `sp` operand the push cannot be folded into is replaced by a third
     // scratch register holding `sp` as it was on entry (see
-    // [`crate::decode::sp_base_scratch`]).
-    let sp_base = crate::decode::sp_base_scratch(insn);
+    // [`crate::decode::sp_scratch_field`]).
+    let sp_field = crate::decode::sp_scratch_field(insn);
+    let sp_base = sp_field.is_some();
     let s3 = pick(used | (1 << s1) | (1 << s2));
 
     let reads = ops.iter().any(|f| field_reg(f) == 18 && f.read);
@@ -438,7 +662,10 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     // independent.
     let mut rewritten = match crate::decode::sp_fixup(insn) {
         crate::decode::SpFixup::Adjusted(a) => a,
-        _ if sp_base => (insn & !(0x1f << 5)) | (s3 << 5),
+        _ if sp_base => {
+            let f = sp_field.unwrap_or(5);
+            (insn & !(0x1f << f)) | (s3 << f)
+        }
         _ => insn,
     };
     for f in &ops {
@@ -656,9 +883,9 @@ mod tests {
         assert_eq!(
             s,
             vec![
-                0xd53b_d071, // mrs x17, tpidrro_el0
-                0x927d_f231, // and x17, x17, #~7
-                0xf940_0e30, // ldr x16, [x17, #24]
+                0xd53b_d070, // mrs x16, tpidrro_el0
+                0x927d_f210, // and x16, x16, #~7
+                0xf940_0e10, // ldr x16, [x16, #24]
                 0xd282_009e, // movz x30, #0x1004
                 0xf2a0_001e, // movk x30, #0, lsl #16
                 0xf2c0_001e, // movk x30, #0, lsl #32
@@ -757,6 +984,53 @@ mod tests {
         );
     }
 
+    /// The `x18` stubs of their own, as `llvm-mc` assembles their listings
+    /// (stub at 0x1000, returning to 0x2004; thread pointer in slot 0x10,
+    /// `x18` in 0x18).
+    #[test]
+    fn x18_stubs_for_sp_pairs_and_authenticated_branches() {
+        let stub_of = |site: Site| {
+            let mut w = stub(site, 0x10, 0x18, 0x1000, 0x2004);
+            w.pop(); // the branch back
+            w
+        };
+        // str x18, [sp, #-16]!: the access below the saves, sp moved after.
+        assert_eq!(
+            stub_of(Site::X18 { insn: 0xf81f0ff2 }),
+            [
+                0xd100c3ff, 0xa90007e0, 0xf9000be2, 0xd53bd061, 0x927df021, 0xf9400c20, 0x910083e2,
+                0xf9000040, 0xf9400be2, 0xa94007e0, 0x9100c3ff, 0xd10043ff
+            ]
+        );
+        // mov sp, x18: sp set last, the scratch registers read back after.
+        assert_eq!(
+            stub_of(Site::X18 { insn: 0x9100025f }),
+            [
+                0xf81f0fe0, 0xf81f0fe1, 0xd53bd061, 0x927df021, 0xf9400c20, 0x910083e1, 0x91000000,
+                0x9100001f, 0xf85f0020, 0xf85e0021
+            ]
+        );
+        // casp x18, x19, x2, x3, [x0]: an even pair of scratch registers.
+        assert_eq!(
+            stub_of(Site::X18 { insn: 0x48327c02 }),
+            [
+                0xa9bf17e4, 0xa9bf1be1, 0xd53bd061, 0x927df021, 0xf9400c24, 0xaa1303e5, 0x48247c02,
+                0xf9000c24, 0xaa0503f3, 0xa8c11be1, 0xa8c117e4
+            ]
+        );
+        // braa x18, x1 through x16; braa x18, x16 through x17.
+        assert_eq!(
+            stub(Site::X18 { insn: 0xd71f0a41 }, 0x10, 0x18, 0x1000, 0x2004),
+            [0xd53bd070, 0x927df210, 0xf9400e10, 0xd71f0a01]
+        );
+        assert_eq!(stub(Site::X18 { insn: 0xd71f0a50 }, 0x10, 0x18, 0x1000, 0x2004)[3], 0xd71f0a30);
+        // mrs x18, tpidr_el0: from the thread pointer's slot to x18's.
+        let tp = stub_of(Site::ReadThreadPointer { rt: 18 });
+        assert_eq!(&tp[4..6], [0xf9400820, 0xf9000c20]);
+        let tp = stub_of(Site::WriteThreadPointer { rt: 18 });
+        assert_eq!(&tp[4..6], [0xf9400c20, 0xf9000820]);
+    }
+
     #[test]
     fn literal_pool_words_are_not_rewritten() {
         // ldr x0, <+8> makes the two words at offset 8 a literal pool. The
@@ -814,11 +1088,12 @@ mod tests {
             0xaa1203ea, // mov x10, x18        -> rewritable site
             0xf9400012, // ldr x18, [x0]       -> rewritable site (load/store)
             0x90000012, // adrp x18, .         -> site (PC-relative)
-            0xf8010ff2, // str x18, [sp, #16]! -> deferred (sp writeback)
+            0xf8010ff2, // str x18, [sp, #16]! -> site (sp writeback)
+            0x9adf13f2, // irg x18, sp         -> deferred (memory tagging)
             0xd2800000, // movz x0, #0         -> untouched
         ]);
         let p = patch(&mut code, None);
-        assert_eq!(p.sites.len(), 4);
+        assert_eq!(p.sites.len(), 5);
         assert_eq!(p.x18_deferred, 1);
         assert!(matches!(p.sites[0].1, Site::X18 { insn: 0xd2830312 }));
     }
