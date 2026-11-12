@@ -158,6 +158,32 @@ jobs:
           name: podman-traces
           path: target/tmp/podman-traces
 
+  # Alpine's Wine (fetched) running Windows programs built for ARM64, in the
+  # VM (on the stand-in here; zig builds the Windows test program). It runs
+  # here only (FWE_WINE_TESTS), not on a development machine.
+  wine:
+    name: Wine (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
+      - run: brew list zig >/dev/null 2>&1 || brew install zig
+      - run: cargo test -p fwe --test guests -- alpine_wine --nocapture
+        env:
+          FWE_WINE_TESTS: "1"
+      # The calls of each step that failed.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-traces
+          path: target/tmp/wine-traces
+
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
   ltp:

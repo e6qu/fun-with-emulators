@@ -2212,6 +2212,74 @@ fn debian_podman_runs_in_the_vm() {
     assert_eq!(run.status.code(), Some(3));
 }
 
+/// Alpine's Wine 11 (fetched: `guests/alpine/fetch/wine.txt`) running
+/// Windows programs built for ARM64, in the VM (`--vm`: Windows images want
+/// 4 KiB pages), only where `FWE_WINE_TESTS` is set (CI's `wine` job):
+/// `wineboot` makes a prefix, `cmd` runs a batch command, and a C program
+/// (`guests/windows/winprog.c`, built with zig) uses files, threads, an
+/// exception and a child process.
+#[test]
+fn alpine_wine_runs_windows_programs() {
+    if !fetched_program_tests("FWE_WINE_TESTS") {
+        return;
+    }
+    let cached = alpine_root("wine");
+    let root = std::env::temp_dir().join(format!("fwe-wine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    for d in ["root", "tmp"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    run_checked(
+        Command::new("zig")
+            .args(["cc", "-target", "aarch64-windows-gnu", "-O1", "-o"])
+            .arg(root.join("tmp/winprog.exe"))
+            .arg(repo().join("guests/windows/winprog.c")),
+    );
+    let _workload = workload();
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("wine-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    let mut step = 0;
+    let mut wine = |args: &[&str]| {
+        step += 1;
+        let mut cmd = hv_command().unwrap();
+        let trace = root.join(format!("tmp/step-{step}.trace"));
+        cmd.arg("--vm").arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join("usr/bin/wine")).args(args);
+        // No display: Wine runs its console programs without one. No Mono or
+        // Gecko to offer to install.
+        cmd.env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("WINEPREFIX", "/root/.wine")
+            .env("WINEDEBUG", "err+all")
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=");
+        cmd.stdin(Stdio::null());
+        let out = run_hv_for(cmd, "wine", Duration::from_secs(1800));
+        eprintln!("--- wine {args:?} ({}) stdout:\n{}", out.status, stdout(&out));
+        if !out.status.success() {
+            print_last_calls(&trace);
+            let _ = std::fs::copy(&trace, kept.join(format!("step-{step}.trace")));
+        }
+        out
+    };
+    let version = wine(&["--version"]);
+    let boot = wine(&["wineboot", "--init"]);
+    let prefix = root.join("root/.wine/system.reg").exists();
+    let batch = wine(&["cmd", "/c", "echo hello from cmd"]);
+    let program = wine(&["/tmp/winprog.exe"]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&version), "wine-11.0\n");
+    assert!(boot.status.success() && prefix, "wineboot: {} prefix {prefix}", boot.status);
+    assert_eq!(stdout(&batch).replace("\r\n", "\n"), "hello from cmd\n");
+    assert_eq!(
+        stdout(&program).replace("\r\n", "\n"),
+        "arm64: 1\nfile: written by Windows, deleted 1\nthreads: 4000, exit codes 10\n\
+         exception: handled\nchild: hello\nchild exited 7\n"
+    );
+}
+
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
 /// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
 /// constant tables among its code, which must not be rewritten), zlib, the
