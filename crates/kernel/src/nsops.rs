@@ -118,8 +118,9 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = self.own_view(false) {
             return err(e);
         }
+        let euid = self.creds.euid;
         let fs = self.fs_mut();
-        if let Err(e) = fs.ns.unshare(flags) {
+        if let Err(e) = fs.ns.unshare(flags, euid) {
             return err(e);
         }
         // Owned by the user namespace it is made in, a new one included.
@@ -333,9 +334,10 @@ impl<P: Platform> Kernel<P> {
             flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
             std::sync::atomic::Ordering::SeqCst,
         );
+        let euid = self.creds.euid;
         let fs = self.fs_mut();
         let mut ns = fs.ns.clone();
-        ns.unshare(new)?;
+        ns.unshare(new, euid)?;
         let base = fs.ns.pid_children.clone();
         let child_pid_ns = if new & CLONE_NEWPID != 0 {
             let parent = base.as_ref().map(|r| (r.dir().to_vec(), r.id()));

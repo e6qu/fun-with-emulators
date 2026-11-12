@@ -77,6 +77,20 @@ jobs:
           exit "$status"
       # The rest: the VM's tests ran in the step above.
       - run: cargo test -- --skip hv_
+      # Why the host killed a process outright (a lock misused in a signal
+      # handler, a guard violation), for a guest that died of SIGKILL.
+      - if: failure()
+        run: |
+          /usr/bin/log show --last 60m --style compact --predicate \
+            '(eventMessage CONTAINS[c] "unrecoverable" AND NOT eventMessage CONTAINS "CT signature") OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
+            | tail -200 || true
+      # The whole trace of a container engine's step that failed.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-traces-${{ matrix.os }}
+          path: target/tmp/test-traces
+          if-no-files-found: ignore
 
   # Alpine's strace and gdb (fetched: guests/alpine/fetch/ptrace.txt)
   # tracing and debugging guest programs. They run here only
@@ -118,6 +132,31 @@ jobs:
         with:
           name: docker-traces
           path: target/tmp/docker-traces
+
+  # Alpine's podman (fetched) building, pushing and pulling images and
+  # running rootless. It runs here only (FWE_PODMAN_TESTS), not on a
+  # development machine.
+  podman:
+    name: Podman (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
+      - run: cargo test -p fwe --test guests -- alpine_podman_builds debian_podman_runs_in_the_vm --nocapture
+        env:
+          FWE_PODMAN_TESTS: "1"
+      # Each process's calls and the registry's log, for a step that failed.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-traces
+          path: target/tmp/podman-traces
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.

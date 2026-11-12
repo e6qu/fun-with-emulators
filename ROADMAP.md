@@ -22,8 +22,9 @@ What runs unmodified, with its output checked in CI:
 - **In the VM**, for executables linked below 4 GiB: Debian's Python, GCC,
   clang and Go, on the software stand-in for Hypervisor.framework only.
 - **Containers:** crun, podman and containerd run the `alpine` image;
-  Docker loads, runs and builds images, and Docker Compose brings up a
-  project.
+  podman builds images, pushes and pulls them through a registry and runs
+  rootless, and Debian's podman runs in the VM; Docker loads, runs and
+  builds images, and Docker Compose brings up a project.
 
 ## Done
 
@@ -129,10 +130,10 @@ hardware.
   from a Dockerfile (`docker build`, BuildKit), and Docker Compose brings
   up a project of services that build, share a volume and depend on each
   other; natively, with no VM.
-- [ ] **Podman, further:** `podman build` (Buildah) from a Containerfile;
+- [x] **Podman, further:** `podman build` (Buildah) from a Containerfile;
   rootless podman as an ordinary user (a user namespace from
-  `/etc/subuid`, overlay storage); `podman pull` from a registry; Debian's
-  podman (non-PIE, so in the VM) as well as Alpine's.
+  `/etc/subuid`, overlay storage); `podman push` to and `podman pull` from
+  a registry; Debian's podman (non-PIE, so in the VM) as well as Alpine's.
 - [ ] **Wine, a showcase:** Windows programs run on the Mac through a
   distribution's arm64 Wine under fwe, with no VM: `wineboot` sets up a
   prefix, `wine cmd /c` runs a batch command, and a C program built for

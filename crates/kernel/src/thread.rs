@@ -1198,6 +1198,15 @@ pub fn post_process(sig: u64, info: SigInfo) {
     PROCESS.post(sig, info);
 }
 
+/// From a thread of fwe's own (the reaper's watcher, the parent-death
+/// watcher): [`post_process`], and every guest thread woken. A wake sent
+/// to the process would reach one thread the host picks, which may block
+/// `sig` and wait on, leaving the one that takes it asleep.
+pub fn post_process_waking(sig: u64, info: SigInfo) {
+    post_process(sig, info);
+    wake_others(crate::host::WAKE_SIGNAL);
+}
+
 /// Record `sig` as pending against thread `tid` of this process. Returns
 /// the host thread to wake, or `None` if there is no such thread.
 pub fn post_thread(tid: i32, sig: u64, info: SigInfo) -> Option<libc::pthread_t> {

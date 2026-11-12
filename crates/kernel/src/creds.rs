@@ -167,9 +167,14 @@ impl Creds {
         self.caps.has(cap)
     }
 
-    /// The capability changes a change of user ids from `old` makes.
+    /// The capability changes a change of user ids from `old` makes, root
+    /// being uid 0 of the process's user namespace (the ids are kept as the
+    /// initial namespace's).
     fn fix_caps(&mut self, old: (u32, u32, u32)) {
-        self.caps.after_setuid(old, (self.uid, self.euid, self.suid));
+        let ns = |id| crate::userns::to_ns(id, false);
+        let (old, new) =
+            ((ns(old.0), ns(old.1), ns(old.2)), (ns(self.uid), ns(self.euid), ns(self.suid)));
+        self.caps.after_setuid(old, new);
     }
 
     pub fn getuid(&self) -> i64 {
@@ -287,7 +292,8 @@ impl Creds {
                 || f == self.suid
                 || f == self.fsuid)
         {
-            self.caps.after_setfsuid(self.fsuid, f);
+            let ns = |id| crate::userns::to_ns(id, false);
+            self.caps.after_setfsuid(ns(self.fsuid), ns(f));
             self.fsuid = f;
         }
         old as i64

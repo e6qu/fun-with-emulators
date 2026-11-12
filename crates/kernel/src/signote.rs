@@ -230,29 +230,48 @@ pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
     }
 }
 
+/// This process's mailbox for a handler to read: the descriptor kept open
+/// for it while it is still the file at the mailbox's path, and whether it
+/// was opened here instead (to be closed by the caller). A fork child
+/// before it opened its own (it may be sent a signal at once) reads it by
+/// its path; so does a process whose file was replaced: one that started
+/// with the pid of a process whose records were left behind opens that
+/// one's mailbox, which goes when those records are cleared, and senders
+/// then write a new one. Async-signal-safe; the caller keeps errno.
+fn own_mailbox() -> Option<(i32, bool)> {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let mut buf = [0u8; 512];
+    let path = mailbox(me, &mut buf)?;
+    let own = OWN.load(Ordering::SeqCst);
+    if OWN_PID.load(Ordering::SeqCst) == me && own >= 0 {
+        // SAFETY: stat buffers of their size; a NUL-terminated path.
+        let same = unsafe {
+            let (mut a, mut b): (libc::stat, libc::stat) = (std::mem::zeroed(), std::mem::zeroed());
+            libc::fstat(own, &mut a) == 0
+                && libc::stat(path, &mut b) == 0
+                && (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+        };
+        if same {
+            return Some((own, false));
+        }
+    }
+    // SAFETY: a NUL-terminated path; async-signal-safe.
+    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
+    (fd >= 0).then_some((fd, true))
+}
+
 /// Read, and with `clear_if` (clearing only a note of that sender, or with
 /// 0 any), clear this process's note for host signal `sig`.
 /// Async-signal-safe.
 fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
     let off = offset(sig)?;
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    // Not open for this process yet (a fork child before it starts, which
-    // may be sent a signal at once): opened by its path for the read.
-    let opened = if OWN_PID.load(Ordering::SeqCst) == me {
-        None
-    } else {
-        let mut buf = [0u8; 512];
-        let path = mailbox(me, &mut buf)?;
-        // SAFETY: a NUL-terminated path; async-signal-safe.
-        let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return None;
-        }
-        Some(fd)
-    };
-    let fd = opened.unwrap_or_else(|| OWN.load(Ordering::SeqCst));
     let saved = crate::host::last_errno();
+    let Some((fd, opened)) = own_mailbox() else {
+        crate::host::set_errno(saved);
+        return None;
+    };
+    let opened = opened.then_some(fd);
     let mut slots = [0u8; PER_SIGNAL * SLOT];
     let mut slot = [0u8; SLOT];
     // SAFETY: fwe's own descriptor of the mailbox; buffers of their
@@ -527,22 +546,11 @@ fn put(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32
 /// process, each with its sender's note, in the order queued.
 /// Async-signal-safe.
 pub fn drain(mut post: impl FnMut(u64, Note)) {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    let own = OWN_PID.load(Ordering::SeqCst) == me;
-    let fd = if own {
-        OWN.load(Ordering::SeqCst)
-    } else {
-        // A fork child before it opened its own: by its path.
-        let mut buf = [0u8; 512];
-        let Some(path) = mailbox(me, &mut buf) else { return };
-        // SAFETY: a NUL-terminated path.
-        unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) }
-    };
-    if fd < 0 {
-        return;
-    }
     let saved = crate::host::last_errno();
+    let Some((fd, opened)) = own_mailbox() else {
+        crate::host::set_errno(saved);
+        return;
+    };
     let mut q = [0u8; QUEUE_LEN * ENTRY];
     // SAFETY: fwe's descriptor of the mailbox; a buffer of its length.
     let n = unsafe {
@@ -553,7 +561,7 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
             libc::pwrite(fd, zero.as_ptr().cast(), n as usize, QUEUE_AT as libc::off_t);
         }
         libc::flock(fd, libc::LOCK_UN);
-        if !own {
+        if opened {
             libc::close(fd);
         }
         n
@@ -824,10 +832,14 @@ pub fn remove(pid: i32) {
 mod tests {
     use super::*;
 
+    /// The tests that use this process's own mailbox, one at a time.
+    static OWN_BOX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Signals the host lacks queue in a process's mailbox and are taken
     /// in order, a standard one once, each with its sender and value.
     #[test]
     fn queued_signals_are_taken_in_order() {
+        let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
         init();
         // SAFETY: getpid cannot fail.
         let me = unsafe { libc::getpid() };
@@ -847,16 +859,38 @@ mod tests {
         assert_eq!(again, 0);
     }
 
+    /// A mailbox replaced under a process that has it open (the records
+    /// of an earlier process with its pid cleared after it started) still
+    /// brings it its senders' notes.
+    #[test]
+    fn a_replaced_mailbox_is_read_by_its_path() {
+        let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        if DIR.get().is_none() {
+            return;
+        }
+        // A signal no other test notes.
+        let sig = libc::SIGXFSZ;
+        let mut buf = [0u8; 512];
+        let path = mailbox(me, &mut buf).unwrap();
+        // SAFETY: a NUL-terminated path.
+        unsafe { libc::unlink(path) };
+        note(me, sig);
+        assert_eq!(take(sig).map(|n| n.pid), Some(me));
+        assert!(take(sig).is_none());
+    }
+
     #[test]
     fn mailbox_path_is_made_without_allocating() {
-        let _ = DIR.set(b"/x/v5-procs".to_vec());
+        init();
+        let Some(dir) = DIR.get() else { return };
         let mut buf = [0u8; 512];
         let p = mailbox(4021, &mut buf).unwrap();
         // SAFETY: NUL-terminated by `mailbox`.
         let s = unsafe { std::ffi::CStr::from_ptr(p) };
-        if DIR.get().unwrap() == b"/x/v5-procs" {
-            assert_eq!(s.to_bytes(), b"/x/v5-procs/4021.sig");
-        }
+        assert_eq!(s.to_bytes(), [&dir[..], b"/4021.sig"].concat());
         assert!(mailbox(0, &mut buf).is_none());
     }
 }

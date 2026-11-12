@@ -98,6 +98,10 @@ unsafe extern "C" {
     fn fork() -> i32;
     fn waitpid(pid: i32, st: *mut i32, o: i32) -> i32;
     fn setuid(u: u32) -> i32;
+    fn geteuid() -> u32;
+    fn setns(fd: i32, t: i32) -> i32;
+    fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
+    fn execv(p: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
     fn umask(m: u32) -> u32;
     fn chdir(p: *const std::ffi::c_char) -> i32;
     fn readlink(p: *const std::ffi::c_char, b: *mut u8, n: usize) -> isize;
@@ -169,6 +173,7 @@ fn name(e: i32) -> &'static str {
         ESTALE => "ESTALE",
         ENXIO => "ENXIO",
         EAFNOSUPPORT => "EAFNOSUPPORT",
+        8 => "ENOEXEC",
         _ => "?",
     }
 }
@@ -263,6 +268,141 @@ fn main() {
     // SAFETY: the scenarios' calls take valid strings and buffers.
     unsafe {
         match std::env::args().nth(1).as_deref() {
+            // A user's own user namespace, its root the user: a program it
+            // runs there is root's, with every capability, as on Linux.
+            Some("userns-exec") => {
+                if fork() == 0 {
+                    setuid(1000);
+                    unshare(0x1000_0000);
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", "0 1000 1").unwrap();
+                    std::fs::write("/proc/self/gid_map", "0 0 1").unwrap();
+                    let (p, r, l) = (c("/containers"), c("report"), c("root of its namespace"));
+                    let argv = [p.as_ptr(), r.as_ptr(), l.as_ptr(), std::ptr::null()];
+                    execv(p.as_ptr(), argv.as_ptr());
+                    _exit(9);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+            }
+            // Joining a user namespace a user made, as rootless podman joins
+            // its pause process's: the user may, another user may not.
+            Some("userns-join") => {
+                let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+                pipe2(ready.as_mut_ptr(), 0);
+                pipe2(go.as_mut_ptr(), 0);
+                let holder = fork();
+                if holder == 0 {
+                    setuid(1000);
+                    unshare(0x1000_0000);
+                    write(ready[1], b"r".as_ptr(), 1);
+                    let mut b = 0u8;
+                    read(go[0], &mut b, 1);
+                    _exit(0);
+                }
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
+                for (uid, who) in [(1000, "its maker"), (2000, "another user")] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    if fork() == 0 {
+                        setuid(uid);
+                        let f = std::fs::File::open(format!("/proc/{holder}/ns/user")).unwrap();
+                        use std::os::fd::AsRawFd;
+                        let r = setns(f.as_raw_fd(), 0x1000_0000);
+                        println!("{who} joins: {}", res(r as i64));
+                        _exit(0);
+                    }
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
+                write(go[1], b"g".as_ptr(), 1);
+                waitpid(holder, std::ptr::null_mut(), 0);
+            }
+            // A program only the VM runs, on a host without one: the exec
+            // fails and the caller goes on, as podman's pause process does
+            // when its catatonit cannot run.
+            Some("exec-low") => {
+                let p = c("/lowprog");
+                let argv = [p.as_ptr(), std::ptr::null()];
+                let r = execv(p.as_ptr(), argv.as_ptr());
+                println!("exec: {}, and on", res(r as i64));
+            }
+            // What a program it runs gives a user: one with file
+            // capabilities (`cap_setuid+ep`, as `newuidmap` has), one
+            // set-user-ID root; and neither under `no_new_privs`.
+            Some("report") => {
+                let status = std::fs::read_to_string("/proc/self/status").unwrap();
+                let eff = status.lines().find(|l| l.starts_with("CapEff:")).unwrap_or("");
+                let label = std::env::args().nth(2).unwrap_or_default();
+                println!("{label}: euid {} {eff}", geteuid());
+            }
+            Some("execprivs") => {
+                std::fs::copy("/containers", "/tmp/capped").unwrap();
+                std::fs::copy("/containers", "/tmp/setuid").unwrap();
+                chmod(c("/tmp/capped").as_ptr(), 0o755);
+                chmod(c("/tmp/setuid").as_ptr(), 0o4755);
+                // Revision 2, effective, CAP_SETUID (7) permitted.
+                let mut v = 0x0200_0001u32.to_le_bytes().to_vec();
+                for w in [1u32 << 7, 0, 0, 0] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                let set = setxattr(
+                    c("/tmp/capped").as_ptr(),
+                    c("security.capability").as_ptr(),
+                    v.as_ptr(),
+                    v.len(),
+                    0,
+                );
+                println!("setcap: {}", res(set as i64));
+                for (prog, label, nnp) in [
+                    ("/tmp/capped", "capped", false),
+                    ("/tmp/setuid", "set-uid", false),
+                    ("/tmp/capped", "capped, no_new_privs", true),
+                    ("/tmp/setuid", "set-uid, no_new_privs", true),
+                ] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    if fork() == 0 {
+                        setuid(1000);
+                        if nnp {
+                            prctl(38, 1, 0, 0, 0);
+                        }
+                        let (p, r, l) = (c(prog), c("report"), c(label));
+                        let argv = [p.as_ptr(), r.as_ptr(), l.as_ptr(), std::ptr::null()];
+                        execv(p.as_ptr(), argv.as_ptr());
+                        _exit(9);
+                    }
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
+                // A process's /proc directory is its effective user's, as
+                // newuidmap checks of the process it maps.
+                let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+                pipe2(ready.as_mut_ptr(), 0);
+                pipe2(go.as_mut_ptr(), 0);
+                chmod(c("/tmp").as_ptr(), 0o1777);
+                let child = fork();
+                if child == 0 {
+                    setuid(1000);
+                    // A user may make a whiteout (as rootless overlay
+                    // storage does), not a device.
+                    let wh = mknod(c("/tmp/wh").as_ptr(), 0o20000 | 0o644, 0);
+                    let dev = mknod(c("/tmp/null").as_ptr(), 0o20000 | 0o644, (1 << 8) | 3);
+                    println!("a user's mknod: whiteout {}, device {}", res(wh as i64), res(dev as i64));
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    write(ready[1], b"r".as_ptr(), 1);
+                    let mut b = 0u8;
+                    read(go[0], &mut b, 1);
+                    _exit(0);
+                }
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
+                use std::os::unix::fs::MetadataExt;
+                let theirs = std::fs::metadata(format!("/proc/{child}")).map(|m| m.uid());
+                let own = std::fs::metadata("/proc/self/status").map(|m| m.uid());
+                // As newuidmap looks: the directory opened, then fstat.
+                let dir = std::fs::File::open(format!("/proc/{child}/")).unwrap();
+                let opened = dir.metadata().map(|m| m.uid());
+                println!("/proc owners: theirs {theirs:?}, opened {opened:?}, own {own:?}");
+                write(go[1], b"g".as_ptr(), 1);
+                waitpid(child, std::ptr::null_mut(), 0);
+            }
             // Extended attributes by namespace, as container images carry
             // them (file capabilities, overlay markers).
             Some("xattr") => {

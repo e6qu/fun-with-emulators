@@ -224,10 +224,14 @@ pub fn reapable(e: &Ended) -> bool {
 }
 
 /// Whether ended process `e` is this process's to reap as an adopter, or
-/// as a foster child's parent.
+/// as a foster child's parent: once it is gone. A process records how it
+/// ends just before it does; reaped while still there, its record would
+/// stay, and whoever found it gone afterwards would take it for one killed
+/// outright and record a second end.
 fn adopted_ended(e: &Ended) -> bool {
-    fostered_here(&e.lineage, e.foster)
-        || orphaned(&e.lineage) && adopter((e.pid, e.start), &e.lineage, e.bound) == Some(me())
+    (fostered_here(&e.lineage, e.foster)
+        || orphaned(&e.lineage) && adopter((e.pid, e.start), &e.lineage, e.bound) == Some(me()))
+        && !procreg::alive((e.pid, e.start))
 }
 
 /// Whether living process `pid`, whose record is `r`, is one this process
@@ -686,6 +690,7 @@ fn notify() {
     };
     let sig = fwe_abi::signal::SIGCHLD;
     for e in fresh {
+        crate::trace::note_to_file(&format!("reaper: {} ended, adopted", e.pid));
         if crate::host::children_reaped_by_host() && procreg::take_ended(&e) {
             crate::pidns::released(&e.numbers, e.pid);
         }
@@ -724,11 +729,12 @@ pub fn superseded(pid: i32) -> bool {
 }
 
 /// Raise the `SIGCHLD` for adopted process `e`'s end: pending for the
-/// guest with the `siginfo` Linux gives a child's end, and a guest thread
-/// woken to take it. It is not sent through the host: a `SIGCHLD` the host
+/// guest with the `siginfo` Linux gives a child's end, and the guest's
+/// threads woken, so the one that takes it does. It is not sent through the host: a `SIGCHLD` the host
 /// holds or is delivering would absorb it (standard signals are not queued
 /// twice), and the guest would hear of the orphan from neither.
 fn raise(e: &Ended) {
+    crate::trace::note_to_file(&format!("reaper: SIGCHLD for {} ({:#x})", e.pid, e.status));
     // An end is what Linux reports before the former parent's own.
     if !is_stop(e.status) && e.status != CONTINUED {
         REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);
@@ -738,12 +744,7 @@ fn raise(e: &Ended) {
     // SAFETY: getuid cannot fail.
     let uid = crate::host::uid_to_initial(unsafe { libc::getuid() });
     let info = crate::thread::SigInfo { code, pid: e.pid, uid, status, value: 0, poll: None };
-    crate::thread::post_process(fwe_abi::signal::SIGCHLD, info);
-    // One thread is woken to take it, as the host picks one for a signal
-    // sent to the process: the wake carries nothing, so a wake the host
-    // holds or merges loses nothing.
-    // SAFETY: plain host call, to this process.
-    unsafe { libc::kill(me(), crate::host::WAKE_SIGNAL) };
+    crate::thread::post_process_waking(fwe_abi::signal::SIGCHLD, info);
 }
 
 /// Host process `pid`'s children.
@@ -807,6 +808,7 @@ mod watch {
                 if !self.watched.insert(p) {
                     continue;
                 }
+                crate::trace::note_to_file(&format!("reaper: follows {p}"));
                 let ev = change(
                     p,
                     libc::EVFILT_PROC,
@@ -966,6 +968,7 @@ mod watch {
                         }
                     }
                     if ev.fflags & libc::NOTE_EXIT != 0 && pid != me {
+                        crate::trace::note_to_file(&format!("reaper: {pid} exits"));
                         w.watched.remove(&pid);
                         ending.insert((pid, procreg::start_time(pid)));
                         signalled.remove(&pid);

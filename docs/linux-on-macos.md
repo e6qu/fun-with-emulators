@@ -159,7 +159,12 @@ at its own address.
 `needs_vm` (`crates/native/src/lib.rs`) asks one question: is this a
 non-PIE executable whose lowest loaded page lies below 4 GiB? If so it
 runs in the VM, otherwise natively. Static or dynamic, glibc or musl, C,
-Rust or Go make no difference.
+Rust or Go make no difference. A guest's `execve` of such a program where
+there is no VM to run it (no stand-in, and fwe without the hypervisor
+entitlement or the Mac without `kern.hv_support`, both asked of the
+kernel) fails with `ENOEXEC` while the caller is intact, so it can go on:
+podman's pause process, whose `catatonit` is one, then waits in a loop of
+its own.
 
 ```mermaid
 flowchart TD
@@ -291,7 +296,7 @@ for a well-known property that puts it in the category.
 | Category | Software | Why it is there |
 |---|---|---|
 | native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once as mapped; the rewrites are system calls and thread-pointer accesses |
-| native, Go built as PIE | Alpine's podman, containerd and Docker with BuildKit and Compose (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and would need the VM |
+| native, Go built as PIE | Alpine's podman (building, pushing, pulling, rootless), containerd and Docker with BuildKit and Compose (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries scanned once each |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
@@ -299,6 +304,7 @@ for a well-known property that puts it in the category.
 | VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
 | VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
 | VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
+| VM, container engine | Debian's podman 4.3 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
 | fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a trap natively or a VM exit |
 | uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (not tested by fwe) | natively each use goes through a stub, and JIT code's uses are not rewritten; in the VM `x18` is the guest's own |
@@ -805,7 +811,7 @@ host reports differently.
 | `getdents64` | Entries built from the host's; an overlay directory merges its layers; `O_TMPFILE` names and fwe's cgroup files hidden; fwe's directories listed from memory. | `__getdirentries64` |
 | `faccessat`, `faccessat2` | fwe's check against the kept mode; `CAP_DAC_OVERRIDE` passes all but a missing execute bit; `W_OK` on a read-only mount is `EROFS`. | `faccessat`, `access` |
 | `readlinkat` | `/proc` links answered by fwe; an `O_PATH` stand-in reads the link it names. | `readlinkat`, `readlink` |
-| `mkdirat`, `mknodat` | Umask applied by fwe; a mode denying its owner and the maker's ownership kept in attributes. `mknodat` makes a file, FIFO, socket node or one of fwe's device nodes ([Devices](#devices)). | `mkdirat`, `openat(O_CREAT\|O_EXCL)`, `mkfifoat` |
+| `mkdirat`, `mknodat` | Umask applied by fwe; a mode denying its owner and the maker's ownership kept in attributes. `mknodat` makes a file, FIFO, socket node or one of fwe's device nodes ([Devices](#devices)); a device takes `CAP_MKNOD` but for a whiteout (0:0), as on Linux. | `mkdirat`, `openat(O_CREAT\|O_EXCL)`, `mkfifoat` |
 | `unlinkat` | Overlays get whiteouts; a directory holding only `O_TMPFILE` names is removed with them; the host's `EPERM` for a directory becomes `EISDIR`. | `unlinkat` |
 | `renameat`, `renameat2` | `RENAME_NOREPLACE` and `RENAME_EXCHANGE` atomic, `RENAME_WHITEOUT` leaves a 0:0 node; `EXDEV` across mounts; the working directory follows a rename of it. | `renameatx_np` (`RENAME_EXCL`, `RENAME_SWAP`) |
 | `symlinkat`, `linkat` | `linkat` follows links itself; `AT_EMPTY_PATH` or a `/proc/self/fd` path names the descriptor's file (an `O_TMPFILE` one); `EXDEV` across mounts; `fs.protected_hardlinks` checked. | `symlinkat`, `linkat` (flags 0) |
@@ -1006,10 +1012,14 @@ checks (`crates/kernel/src/cloneargs.rs`). See
 **`clone` of a process**: natively a host `fork` with every registry lock
 held and the other guest threads suspended; `CLONE_VM` makes the private
 memory inherit by sharing for that fork and `CLONE_VFORK` makes the parent
-wait on a pipe until the child execs or exits. In the VM no host fork
+wait on a pipe until the child execs or exits (made, and the parent's write
+end closed, under the kernel lock, so no child another thread forks
+meanwhile holds it). In the VM no host fork
 happens: a fresh `fwe --hv-fork-child` gets the kernel state over a Mach
-port and every slab page over a socket (a `vfork` child fetches pages as it
-touches them); `CLONE_VM` without `CLONE_VFORK` fails with `ENOSYS`. See
+port (with fwe's private directory, where the run's records and signal
+mailboxes are: the host's lookup of the user's temporary directory gives
+another one there) and every slab page over a socket (a `vfork` child
+fetches pages as it touches them); `CLONE_VM` without `CLONE_VFORK` fails with `ENOSYS`. See
 [fork](#fork).
 
 **`execve`**: a native process with no other threads, running a program
@@ -1383,7 +1393,7 @@ that the processes in them name ([Namespaces](#namespaces)).
 | `setgroups` | `CAP_SETGID`; up to 65536 groups, mapped up; `EPERM` in a user namespace whose `setgroups` is `deny` or whose `gid_map` is unwritten | none |
 | `capget`, `capset` | effective, permitted and inheritable sets, header versions 1 to 3; the caller's process only | none |
 | `unshare` | mount, UTS, IPC, network, cgroup, pid and user namespaces as new records; `CAP_SYS_ADMIN` except for a user namespace; `CLONE_NEWTIME` is `EINVAL` | none |
-| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN` | none |
+| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN`, for a user namespace in that one (a user has it in one it made) | none |
 | `clone`, `clone3` with `CLONE_NEW*` | the same namespaces made before the host `fork`, so the child inherits them | `fork` (by the backend) |
 
 **`setuid` and the rest**: no host privilege is needed, since only fwe's
@@ -2013,7 +2023,7 @@ to the host.
 |---|---|---|
 | a process's root (`chroot`) and mount table | one host filesystem | guest paths resolved component by component (`crates/kernel/src/fs.rs`): symlinks followed by fwe, mounts entered, `..` clamped at the process's root, as `openat2(RESOLVE_IN_ROOT)` would; the final host `openat` has `O_NOFOLLOW` added |
 | `open` flags | other values | translated (`host::open_flags_to_host`) |
-| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range at the top, out of the guest's reach (`EBADF`), with a virtual `RLIMIT_NOFILE` below it |
+| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range at the top, out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
 | `struct stat`, `statx` | different layout | translated |
 | `statfs` | different layout, APFS | translated; type ext4, sizes and counts the host's |
 | `getdents64` | `getdirentries` | built from it |
@@ -2218,8 +2228,8 @@ follows:
   `fsconfig`, `fsmount`, `fspick`, `open_tree`, `move_mount`,
   `mount_setattr`, `statmount`, `listmount`) act on the table;
 - propagation as Linux's: peer groups, slaves, across namespaces;
-- `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time flags are
-  enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
+- `nosuid`, `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time
+  flags are enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
 - an overlay is resolved as Linux's `overlay`: upper then lower layers,
   whiteouts (0:0 device nodes) and opaque directories, copy-up as an APFS
   clone, each change built in the work directory and renamed into place;
@@ -2244,7 +2254,7 @@ guest's identity virtual:
 | capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start |
 | `chown` | changes the owner | kept in an attribute (`org.fwe.owner`, `crates/kernel/src/owners.rs`) under Linux's rules and shown by `stat`; the host file stays fwe's user's |
 | permission bits for a caller that is not root | the host's, for the host user | fwe's check by the guest's owner, mode and file-system ids, and each directory's search bit along a path (in a root filesystem) |
-| file capabilities, set-ID programs | set-ID bits | none: `execve` follows Linux's rules for a file with neither |
+| file capabilities, set-ID programs | set-ID bits, honoured only for root's files | `execve` acts on a program's `security.capability` attribute and its set-ID bits (the owner and group fwe keeps) with Linux's rules: the new ids and capability sets, the ambient set cleared, and nothing gained under `no_new_privs`, on a `nosuid` mount or while traced |
 
 How host users and file owners look to the guest is under
 [Host identity](#host-identity-and-machine-state).
@@ -2621,8 +2631,11 @@ the adoption itself (`crates/kernel/src/reaper.rs`):
 - a process that ends where a reaper might adopt it records how it ended
   (one killed by `SIGKILL` is recorded by whoever finds it gone);
 - a reaper runs a watcher thread on `kqueue` process events and raises
-  `SIGCHLD` in itself for an adopted descendant's end, stop or continue,
-  with a child's `siginfo`, and wakes its threads waiting in `wait`;
+  `SIGCHLD` in itself for an adopted descendant's end (once it is gone:
+  its record of how it ended comes just before), stop or continue,
+  with a child's `siginfo`, and wakes every one of its threads, so the
+  one that does not block it takes it (a wake the host gives one thread
+  could land on one that blocks it);
 - its `wait` looks at its own children, then the adopted ones;
 - a child made with `CLONE_PARENT` is its creator's parent's, not its
   parent's on the host: its record says so, it tells that parent as it

@@ -126,6 +126,61 @@ pub fn passed_on() -> Vec<Vec<u8>> {
     Vec::new()
 }
 
+/// Whether this host can run a program in the VM: the stand-in is on, or
+/// fwe carries the hypervisor entitlement on a Mac with hypervisor support
+/// (`kern.hv_support`). Asked once, of the kernel, never of the framework.
+pub fn usable() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *USABLE.get_or_init(|| standin_active() || (hv_support() && entitled()))
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    false
+}
+
+/// `sysctl kern.hv_support`: the Mac supports the hypervisor.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hv_support() -> bool {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: reading an int sysctl into a buffer of its size.
+    let r = unsafe {
+        libc::sysctlbyname(
+            c"kern.hv_support".as_ptr(),
+            (&mut v as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    r == 0 && v == 1
+}
+
+/// Whether this process carries the `com.apple.security.hypervisor`
+/// entitlement, by its code signature's entitlements (`csops`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn entitled() -> bool {
+    unsafe extern "C" {
+        fn csops(pid: libc::pid_t, ops: u32, buf: *mut libc::c_void, size: usize) -> libc::c_int;
+    }
+    /// `CS_OPS_ENTITLEMENTS_BLOB`: a blob header, then the XML plist.
+    const CS_OPS_ENTITLEMENTS_BLOB: u32 = 7;
+    let mut buf = vec![0u8; 64 * 1024];
+    // SAFETY: a buffer of its length, for this process's own signature.
+    let r = unsafe {
+        csops(libc::getpid(), CS_OPS_ENTITLEMENTS_BLOB, buf.as_mut_ptr().cast(), buf.len())
+    };
+    if r != 0 || buf.len() < 8 {
+        return false;
+    }
+    let len =
+        (u32::from_be_bytes(buf[4..8].try_into().unwrap_or_default()) as usize).min(buf.len());
+    let text = String::from_utf8_lossy(&buf[8.min(len)..len]);
+    let key = "<key>com.apple.security.hypervisor</key>";
+    text.find(key).is_some_and(|at| text[at + key.len()..].trim_start().starts_with("<true/>"))
+}
+
 /// Whether the VM backend uses the software stand-in (`--hv-standin`).
 pub fn standin_active() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

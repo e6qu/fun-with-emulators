@@ -1,0 +1,32 @@
+# Alpine Linux 3.20 aarch64 files the podman build, pull and rootless test
+# fetches from https://dl-cdn.alpinelinux.org/alpine/: what podman.txt lists
+# (the minirootfs, podman and what it runs), the registry (distribution's
+# `docker-registry`), and `newuidmap`/`newgidmap` with their libraries. Each
+# line is a path under that URL and the file's SHA-256. 3.20 is past its end
+# of life, so these files no longer change.
+v3.20/releases/aarch64/alpine-minirootfs-3.20.10-aarch64.tar.gz 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+v3.20/community/aarch64/podman-5.2.5-r0.apk 4c3c21547cdccf3dd2aa04e68f6eafbacdb962d79ddf54010b039490038ab930
+v3.20/community/aarch64/conmon-2.1.12-r0.apk c2072be66e323967b196756be4bb9956200be24dac2e3355fd09c38ca51d6e05
+v3.20/community/aarch64/crun-1.17-r0.apk f18a1b72e250fab6f390aba8946efb3722aa46064c9f43bb6b4ed2ec272059bf
+v3.20/community/aarch64/netavark-1.12.2-r0.apk 4ca538b1ae84637e2dca38516fa44b9b3fbd898324070bd09d075badbefd1043
+v3.20/community/aarch64/containers-common-0.60.4-r0.apk 3b4ed4456ec922eb5a583d7439fa48d72e8f680ce6fb4a18755cbc3a68c39010
+v3.20/community/aarch64/catatonit-0.2.0-r0.apk a5fc7dd9e7fb40e85f1f708671000367dd864b4ebb715787719e7aa94f97d773
+v3.20/community/aarch64/gpgme-1.23.2-r1.apk 2f62da5ae0b3a91c7d79fa07749b04b6f333d70effb732f6818b4c0c1e8ae377
+v3.20/main/aarch64/libassuan-2.5.7-r0.apk 2f052bd96427b6a45c3b549c9be3509bfb5e8910adb0702c0a3534bf409aaa87
+v3.20/main/aarch64/libgpg-error-1.49-r0.apk 50dd7ede7ad9e5565193fde28492271cfe91d31b801f48a8a713ee46a292055d
+v3.20/main/aarch64/sqlite-libs-3.45.3-r3.apk 917e36789a41dcafec178eeb4a789abd25bc845f6d081e9ace93de87df359ae6
+v3.20/main/aarch64/glib-2.80.5-r0.apk c73624c9decab3b38cec73626c2a1d6331342642330c21c4119d7311bedf5e89
+v3.20/main/aarch64/pcre2-10.43-r0.apk eb3924e37469c5b679e35cc3c44180abf5a45503b86e9d21961319feffc0e356
+v3.20/main/aarch64/libintl-0.22.5-r0.apk 404a9c3aa7a56d73f7560917fe0bad50a9c795ec7207538646fc17308125059a
+v3.20/main/aarch64/libgcc-13.2.1_git20240309-r1.apk 0d6aabf922c91c8bfc62cf625366a6669d67048c3a4fef2318a1246f152de2c0
+v3.20/main/aarch64/libcap2-2.78-r0.apk 80cfbaffa9b278a4a4cbb0ebe0290232925dcaa9d6b45673b2b1cd6c6d92b200
+v3.20/main/aarch64/libseccomp-2.5.5-r1.apk 8ccd1bd0dbe018a5b4f07ee9c2ffb4fe2805ecfe22e004dd301870d47e14618b
+v3.20/main/aarch64/yajl-2.1.0-r9.apk 1a6ec6ae73d7f5452eb3d779795c90d65b1f5de0aa6ab83ad1d4d8cc849fe2ed
+v3.20/community/aarch64/docker-registry-2.8.3-r7.apk 1aed3084553bd741022281610a2ee9267252261b790339aad42b1e3eba469166
+v3.20/community/aarch64/shadow-subids-4.15.1-r0.apk a542ad23da42e686df8fa2a4b19ef58e5b99698b2a1571e54ca49750fa25e2e9
+v3.20/community/aarch64/shadow-libs-4.15.1-r0.apk 4561f52233fa1c6e00d1bec912eab9ab312b06a2626e1ea8d9bf68b1b3d2c1c4
+v3.20/main/aarch64/libbsd-0.12.2-r0.apk 5685d7302b4bbb5665e6ad3e59c61e4cfa69bd2c78911f4fae5d2439b0088eba
+v3.20/main/aarch64/libmd-1.1.0-r0.apk 48ef621c994f1ed7a56b6ecac6534a0dff889e067384e5863a742adf73b3b2c2
+v3.20/main/aarch64/linux-pam-1.6.0-r0.apk 81bc03286b21c1e4c6d25daf7c97074e6d8e4a414a46923cac1604b833ef79eb
+v3.20/main/aarch64/skalibs-2.14.1.1-r0.apk 589979c5251411ea880ffcb9e854426afacf820b6b37d8647ed449b6c220d3e0
+v3.20/main/aarch64/utmps-libs-0.1.2.2-r1.apk 18860f30d392b1cf9120693dd7a0d85ad050169f5ff0175283de40e6863925fa

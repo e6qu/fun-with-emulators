@@ -126,6 +126,17 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
         }
         if start.elapsed() > limit {
             timed_out = true;
+            // What is left of the guest's processes, and what each waits in.
+            if let Ok(ps) = Command::new("ps")
+                .args(["-o", "pid,ppid,stat,wchan,command", "-g"])
+                .arg(child.id().to_string())
+                .output()
+            {
+                eprintln!(
+                    "--- the guest's processes at the timeout:\n{}",
+                    String::from_utf8_lossy(&ps.stdout)
+                );
+            }
             if vm {
                 let pgid = child.id() as i32;
                 // SAFETY: SIGTERM to the guest's own process group; VM
@@ -1223,8 +1234,11 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     std::fs::create_dir_all(&root).unwrap();
     for f in &files {
         run_checked(
+            // With the files' extended attributes: a program's file
+            // capabilities (`security.capability`) among them.
             Command::new("tar")
-                .arg("xzf")
+                .arg("--xattrs")
+                .arg("-xzf")
                 .arg(f)
                 .args(["--exclude", ".PKGINFO", "--exclude", ".SIGN.*", "--exclude", ".pre-*"])
                 .args(["--exclude", ".post-*", "--exclude", ".trigger", "-C"])
@@ -1366,7 +1380,7 @@ fn alpine_gdb_debugs_a_program() {
         "total 6",
         "exited normally]",
     ] {
-        assert!(text.contains(want), "no {want:?} in gdb's output:\n{text}");
+        assert!(text.contains(want), "no {want:?} in gdb's output ({}):\n{text}", out.status);
     }
 }
 
@@ -1579,6 +1593,10 @@ fn alpine_podman_runs_an_image() {
         // A `run` ends with its container's status; one killed hung.
         if !out.status.success() && (args[0] != "run" || out.status.code().is_none()) {
             print_last_calls(&trace);
+            // The whole trace, for CI to keep.
+            let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("test-traces");
+            let _ = std::fs::create_dir_all(&kept);
+            let _ = std::fs::copy(&trace, kept.join(format!("podman-{}.trace", args[0])));
         }
         out
     };
@@ -1887,6 +1905,294 @@ fn alpine_docker_runs_and_builds_images() {
     assert_eq!(stdout(&after), "");
     assert_eq!(stdout(&volumes), "");
     assert!(ended.is_some_and(|s| s.success()), "dockerd did not end cleanly: {ended:?}");
+}
+
+/// The Containerfile [`alpine_podman_builds_pulls_and_runs_rootless`]
+/// builds.
+const CONTAINERFILE: &str = "FROM docker.io/library/alpine:3.20\n\
+    RUN echo built > /built && mkdir /data\n\
+    COPY greeting.txt /data/\n\
+    CMD [\"sh\", \"-c\", \"cat /built /data/greeting.txt\"]\n";
+
+/// What a rootless container prints: its uid, its user namespace's map (its
+/// root the user, the rest the user's subordinate ids), and a file a
+/// subordinate id owns.
+const IN_ROOTLESS: &str = "id -u; awk '{print $1, $2, $3}' /proc/self/uid_map; \
+    touch /f && chown 1234 /f && stat -c %u /f";
+
+/// Alpine's podman (fetched: `guests/alpine/fetch/podman-further.txt`),
+/// only where `FWE_PODMAN_TESTS` is set (CI's `podman` job): as root, it
+/// builds an image from a Containerfile (Buildah's `RUN` in a container
+/// and `COPY` from the context) and runs it, pushes it to a registry
+/// (distribution's, running alongside) and pulls it back; then as an
+/// ordinary user, rootless, in a user namespace `newuidmap` maps from
+/// `/etc/subuid` (which it may, by its file capability `cap_setuid`), with
+/// overlay storage in the user's home, it pulls the image from the registry
+/// and runs it, and runs a container whose root is the user.
+#[test]
+fn alpine_podman_builds_pulls_and_runs_rootless() {
+    if !fetched_program_tests("FWE_PODMAN_TESTS") {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("fwe-podman2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("podman-further")).arg(&root));
+    let etc = root.join("etc/containers");
+    std::fs::write(
+        etc.join("storage.conf"),
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\n\
+         graphroot = \"/var/lib/containers/storage\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        etc.join("containers.conf"),
+        "[engine]\ncgroup_manager = \"cgroupfs\"\nevents_logger = \"file\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        etc.join("registries.conf"),
+        "unqualified-search-registries = []\n\
+         [[registry]]\nlocation = \"127.0.0.1:15000\"\ninsecure = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("etc/docker-registry/config.yml"),
+        "version: 0.1\nstorage:\n  filesystem:\n    rootdirectory: /var/lib/registry\n\
+         http:\n  addr: 127.0.0.1:15000\n",
+    )
+    .unwrap();
+    // The user, its subordinate ids, its home and its runtime directory
+    // (made its own below, as root).
+    let mut passwd = std::fs::read_to_string(root.join("etc/passwd")).unwrap();
+    passwd.push_str("user:x:1000:1000:user:/home/user:/bin/sh\n");
+    std::fs::write(root.join("etc/passwd"), passwd).unwrap();
+    let mut group = std::fs::read_to_string(root.join("etc/group")).unwrap();
+    group.push_str("user:x:1000:\n");
+    std::fs::write(root.join("etc/group"), group).unwrap();
+    std::fs::write(root.join("etc/subuid"), "user:100000:65536\n").unwrap();
+    std::fs::write(root.join("etc/subgid"), "user:100000:65536\n").unwrap();
+    for d in ["root", "home/user", "run/user/1000", "tmp/context"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(root.join("tmp/context/Containerfile"), CONTAINERFILE).unwrap();
+    std::fs::write(root.join("tmp/context/greeting.txt"), "from the context\n").unwrap();
+    alpine_oci_archive("podman-further", &root.join("tmp/alpine.tar"), false);
+    let _workload = workload();
+    // Each process's calls, for a step that fails.
+    let fwe = |args: &[&str], trace: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        let trace = root.join("tmp").join(trace);
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join(args[0].trim_start_matches('/')));
+        cmd.args(&args[1..]);
+        cmd
+    };
+    let log = std::fs::File::create(root.join("tmp/registry.log")).unwrap();
+    let mut registry = fwe(
+        &["/usr/bin/docker-registry", "serve", "/etc/docker-registry/config.yml"],
+        "registry.trace",
+    )
+    .stdin(Stdio::null())
+    .stdout(log.try_clone().unwrap())
+    .stderr(log)
+    .spawn()
+    .unwrap();
+    let registry_log =
+        || std::fs::read_to_string(root.join("tmp/registry.log")).unwrap_or_default();
+    // A shell command, as root or (`user`) as the user, which is to end
+    // with status `expect`; otherwise its processes' last calls and the
+    // registry's log are printed.
+    let step = std::cell::Cell::new(0);
+    let sh = |script: &str, user: bool, expect: i32| {
+        step.set(step.get() + 1);
+        let trace = format!("step-{}.trace", step.get());
+        // BusyBox's applets, by name: `/bin/sh` and `/bin/su` are links to
+        // it, which name it by its path in the root.
+        let cmd = if user {
+            fwe(&["/bin/busybox", "su", "-s", "/bin/sh", "user", "-c", script], &trace)
+        } else {
+            fwe(&["/bin/busybox", "sh", "-c", script], &trace)
+        };
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
+        eprintln!(
+            "--- {script:?} ({}) stderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.code() != Some(expect) {
+            print_last_calls(&root.join("tmp").join(&trace));
+            eprintln!("--- registry log:\n{}", registry_log());
+        }
+        out
+    };
+    let image = "127.0.0.1:15000/fwe/built:1";
+    sh("chown -R user:user /home/user /run/user/1000 && chmod 700 /run/user/1000", false, 0);
+    let loaded = sh("podman load -q -i /tmp/alpine.tar", false, 0);
+    let built = sh(
+        &format!("podman build -q --network=none -t {image} /tmp/context >/dev/null && echo built"),
+        false,
+        0,
+    );
+    let ran = sh(&format!("podman run --rm --network=none {image}"), false, 0);
+    let pushed = sh(
+        &format!("podman push -q {image} && podman rmi -f {image} >/dev/null && echo pushed"),
+        false,
+        0,
+    );
+    let pulled = sh(
+        &format!("podman pull -q {image} >/dev/null && podman run --rm --network=none {image}"),
+        false,
+        0,
+    );
+    // Rootless, as the user.
+    let rootless_env = "export XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/user;";
+    let info = sh(
+        &format!(
+            "{rootless_env} podman info --format '{{{{.Host.Security.Rootless}}}} {{{{.Store.GraphDriverName}}}}'"
+        ),
+        true,
+        0,
+    );
+    let user_pulled = sh(
+        &format!(
+            "{rootless_env} podman pull -q {image} >/dev/null && podman run --rm --network=none {image}"
+        ),
+        true,
+        0,
+    );
+    let mapped = sh(
+        &format!(
+            "{rootless_env} podman load -q -i /tmp/alpine.tar >/dev/null && \
+             podman run --rm --network=none docker.io/library/alpine:3.20 sh -c {}",
+            shell_quote(IN_ROOTLESS)
+        ),
+        true,
+        0,
+    );
+    // SAFETY: plain call, to the registry this test started.
+    unsafe { libc::kill(registry.id() as i32, libc::SIGTERM) };
+    let _ = registry.wait();
+    // The traces and logs, for CI to keep should a step fail.
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    for e in std::fs::read_dir(root.join("tmp")).unwrap().flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".trace") || name.ends_with(".log") {
+            let _ = std::fs::copy(e.path(), kept.join(&*name));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(stdout(&loaded).contains("alpine:3.20"), "{}", stdout(&loaded));
+    assert_eq!(stdout(&built), "built\n");
+    assert_eq!(stdout(&ran), "built\nfrom the context\n");
+    assert_eq!(stdout(&pushed), "pushed\n");
+    assert_eq!(stdout(&pulled), "built\nfrom the context\n");
+    assert_eq!(stdout(&info), "true overlay\n");
+    assert_eq!(stdout(&user_pulled), "built\nfrom the context\n");
+    assert_eq!(stdout(&mapped), "0\n0 1000 1\n1 100000 65536\n1234\n");
+}
+
+/// `s` quoted for a POSIX shell, as one word.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Debian's podman 4.3 (fetched: `guests/debian/fetch/podman.txt`), a
+/// non-PIE executable the VM runs, only where `FWE_PODMAN_TESTS` is set
+/// (CI's `podman` job), as root: it loads the standard `alpine` image and
+/// runs a container of it through conmon and crun, which run natively, each
+/// a program podman's VM process starts with `execve`; the container's
+/// exit status is podman's.
+#[test]
+fn debian_podman_runs_in_the_vm() {
+    if !fetched_program_tests("FWE_PODMAN_TESTS") {
+        return;
+    }
+    let Some(_) = hv_mode() else {
+        eprintln!("skipped: no hypervisor on this host");
+        return;
+    };
+    let cached = fetched_root("podman");
+    let root = std::env::temp_dir().join(format!("fwe-debpodman-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    let etc = root.join("etc/containers");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::write(
+        etc.join("storage.conf"),
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\n\
+         graphroot = \"/var/lib/containers/storage\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        etc.join("containers.conf"),
+        "[engine]\ncgroup_manager = \"cgroupfs\"\nevents_logger = \"file\"\n\
+         runtime = \"crun\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\n").unwrap();
+    std::fs::write(root.join("etc/group"), "root:x:0:\n").unwrap();
+    for d in ["root", "tmp", "run", "var/tmp"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    alpine_oci_archive("podman", &root.join("tmp/alpine.tar"), false);
+    let _workload = workload();
+    let podman = |args: &[&str]| {
+        let mut cmd = hv_command().unwrap();
+        let trace = root.join("tmp/podman.trace");
+        let _ = std::fs::remove_file(&trace);
+        cmd.arg("--strace").arg(format!("--strace-file={}", trace.display()));
+        cmd.arg("--root").arg(&root).arg(root.join("usr/bin/podman")).args(args);
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        cmd.stdin(Stdio::null());
+        let out = run_hv_for(cmd, "podman", Duration::from_secs(1200));
+        eprintln!(
+            "--- podman {args:?} ({}) stderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !out.status.success() && args[0] != "run" {
+            print_last_calls(&trace);
+        }
+        out
+    };
+    let loaded = podman(&["--log-level=debug", "load", "-i", "/tmp/alpine.tar"]);
+    if !stdout(&loaded).contains("Loaded image") {
+        print_last_calls(&root.join("tmp/podman.trace"));
+        // The whole trace, for CI to keep.
+        let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
+        let _ = std::fs::create_dir_all(&kept);
+        let _ = std::fs::copy(root.join("tmp/podman.trace"), kept.join("debian-load.trace"));
+    }
+    // The name it was loaded as (`Loaded image(s): <name>`).
+    let name = stdout(&loaded)
+        .lines()
+        .find_map(|l| l.strip_prefix("Loaded image").and_then(|l| l.split_once(": ")))
+        .map(|(_, n)| n.trim().to_string())
+        .unwrap_or_default();
+    eprintln!("--- loaded: {}", stdout(&loaded));
+    let images = podman(&["images", "--format", "{{.Repository}}:{{.Tag}} {{.ID}}"]);
+    eprintln!("--- images: {}", stdout(&images));
+    let run = podman(&[
+        "run",
+        "--rm",
+        "--network=none",
+        &name,
+        "sh",
+        "-c",
+        "cat /etc/alpine-release; echo pid $$; id -u; exit 3",
+    ]);
+    if run.status.code() != Some(3) {
+        print_last_calls(&root.join("tmp/podman.trace"));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(stdout(&loaded).contains("alpine:3.20"), "{}", stdout(&loaded));
+    assert_eq!(stdout(&run), "3.20.10\npid 1\n0\n");
+    assert_eq!(run.status.code(), Some(3));
 }
 
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
@@ -2802,6 +3108,8 @@ fn command_spawns_a_child_program() {
 #[test]
 fn exec_replaces_the_address_space() {
     assert_eq!(signals("vfork-exec"), "hello from the spawned child\nexited 0\n");
+    // Threads that vfork at once: none waits for another's child.
+    assert_eq!(signals("vfork-concurrent"), "each vfork returned once its child exec'd: true\n");
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
 
@@ -3043,7 +3351,7 @@ fn network_namespace_has_its_own_loopback() {
 fn threads_have_their_own_root_and_namespaces() {
     assert_eq!(
         namespaces("threads"),
-        "thread: unshare 0 private 0 tmpfs 0 true chroot 0 marker new\n\
+        "thread: unshare 0 private 0 tmpfs 0 true chroot 0 marker new new\n\
          others: root kept true, /mnt not mounted true\nshared: umask 77 cwd /tmp\n\
          net: thread bound true, process too true\nback: 0, port taken true\n\
          setns mnt with threads: -1 errno 22\n"
@@ -3639,8 +3947,9 @@ fn proc_self_fd_lists_and_links_descriptors() {
     );
 }
 
-/// `RLIMIT_NOFILE` is virtual: its hard limit is where fwe's own range
-/// begins, so `dup2` there fails with `EBADF` and raising it is refused.
+/// `RLIMIT_NOFILE` is virtual: its hard limit starts where fwe's own range
+/// begins, so `dup2` there fails with `EBADF`; root may raise it as far as
+/// `fs.nr_open`, not past it.
 #[test]
 fn descriptor_limit_bounds_the_guest() {
     assert_eq!(fds("limits"), FDS_LIMITS);
@@ -3653,7 +3962,8 @@ hard limit above soft: true
 dup2 at the soft limit: -1 EBADF
 dup2 just below it: true
 F_DUPFD from it: -1 EINVAL
-raising past it: -1 EPERM
+raising past fs.nr_open: -1 EPERM
+raising to it: 0, hard limit now fs.nr_open true
 soft limit now 32
 dup stopped at 32: EMFILE
 eventfd: -1 EMFILE
@@ -4140,6 +4450,21 @@ fn hv_delivers_signals() {
     assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
 }
 
+/// A child in a new user namespace, made by a raw `clone` from a second
+/// thread (as Go makes one), sets its parent-death signal, asks for its
+/// parent and ends: natively and in the VM, whose fork child starts from
+/// the snapshot the cloning thread's registers are in.
+#[test]
+fn userns_clone_from_a_thread() {
+    let want = "child's parent ours: true, its namespace seen: true, killed by 9\n";
+    assert_eq!(namespaces("userns-thread-clone"), want);
+    let Some(out) = fwe_hv(&rust_low_guest("namespaces"), &["userns-thread-clone"]) else { return };
+    assert_eq!(stdout(&out), want);
+    // Killed as soon as it is made, before it has run.
+    let out = fwe_hv(&rust_low_guest("namespaces"), &["kill-at-once"]).unwrap();
+    assert_eq!(stdout(&out), "killed at once: 20 of 20\n");
+}
+
 /// Namespaces in the VM, whose fork child starts from a snapshot of the
 /// namespaces made for it: a pid namespace numbering from 1, a UTS
 /// namespace's own name, a user namespace's maps.
@@ -4242,7 +4567,8 @@ fn hv_debian_python_runs_a_workload() {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
-    let out = run_hv(cmd, "python3.11");
+    // The stand-in on a loaded CI runner takes several times as long.
+    let out = run_hv_for(cmd, "python3.11", Duration::from_secs(600));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     assert_eq!(
         stdout(&out),
@@ -4466,7 +4792,8 @@ func TestSums(t *testing.T) {
         .env("GOPROXY", "off")
         .env("CGO_ENABLED", "0")
         .stdin(Stdio::null());
-    let out = run_hv_for(cmd, "go", Duration::from_secs(900));
+    // The stand-in on a loaded CI runner takes up to twice as long.
+    let out = run_hv_for(cmd, "go", Duration::from_secs(1800));
     let text = stdout(&out);
     assert_eq!(
         text.lines().next(),
@@ -4862,6 +5189,13 @@ fn subreaper_adopts_orphans() {
         "child exited 0\nchild is not a subreaper: true\nproc shows the subreaper: true\n\
          not ended yet: true\nreaped the orphan: true, killed by 9\n"
     );
+    // Its SIGCHLD reaches the thread that takes it, while the main thread,
+    // also waiting, blocks it.
+    assert_eq!(
+        namespaces("subreaper-thread"),
+        "child exited 0\nchild is not a subreaper: true\norphan adopted: true\n\
+         the worker took its SIGCHLD: true\nreaped: true\n"
+    );
 }
 
 /// A process that becomes a subreaper does not adopt an orphan below it
@@ -4960,6 +5294,9 @@ fn containers(scenario: &str) -> String {
     }
     std::fs::write(root.join("etc/marker"), "marked\n").unwrap();
     std::fs::copy(rust_guest("containers"), root.join("containers")).unwrap();
+    if scenario == "exec-low" {
+        std::fs::copy(rust_low_guest("hello"), root.join("lowprog")).unwrap();
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace=failures")
         .arg("--root")
@@ -4971,6 +5308,49 @@ fn containers(scenario: &str) -> String {
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
     stdout(&out)
+}
+
+/// A user's own user namespace, whose root is the user: a program run
+/// there is root's, with every capability (root is uid 0 of the process's
+/// namespace, not of the initial one).
+#[test]
+fn root_of_a_users_namespace_keeps_capabilities_across_exec() {
+    assert_eq!(
+        containers("userns-exec"),
+        "root of its namespace: euid 0 CapEff:\t000001ffffffffff\n"
+    );
+}
+
+/// A user namespace a user made is the user's to join (it has every
+/// capability there), not another user's.
+#[test]
+fn a_users_namespace_is_its_makers_to_join() {
+    assert_eq!(containers("userns-join"), "its maker joins: ok\nanother user joins: EPERM\n");
+}
+
+/// A program only the VM can run (linked below 4 GiB), where there is no
+/// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
+/// caller is intact, and the caller goes on.
+#[test]
+fn exec_of_a_vm_program_without_a_vm_fails_cleanly() {
+    assert_eq!(containers("exec-low"), "exec: ENOEXEC, and on\n");
+}
+
+/// What a program gives the user who runs it: file capabilities
+/// (`security.capability`, as `newuidmap` has `cap_setuid+ep`) raise its
+/// capabilities, a set-user-ID root program its effective uid and with it
+/// every capability; under `no_new_privs`, neither.
+#[test]
+fn programs_grant_file_capabilities_and_set_ids() {
+    assert_eq!(
+        containers("execprivs"),
+        "setcap: ok\ncapped: euid 1000 CapEff:\t0000000000000080\n\
+         set-uid: euid 0 CapEff:\t000001fffdffffff\n\
+         capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         a user's mknod: whiteout ok, device EPERM\n\
+         /proc owners: theirs Ok(1000), opened Ok(1000), own Ok(0)\n"
+    );
 }
 
 /// Extended attributes by Linux's namespaces: set, created once, read

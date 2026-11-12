@@ -101,6 +101,8 @@ const SA_SIGINFO: i32 = 4;
 const ECHILD: i32 = 10;
 
 /// The `si_pid` and `si_code` of the last `SIGCHLD`.
+/// The pipe an orphan waits on before it ends (`subreaper-thread`).
+static GO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static CHLD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CHLD_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -620,9 +622,14 @@ fn main() {
                     let c = chroot(c"/newroot".as_ptr());
                     chdir(c"/".as_ptr());
                     let marker = std::fs::read_to_string("/etc/marker").unwrap_or_default();
+                    // Its every descriptor closed, as a program about to
+                    // run another closes them: its root is still there.
+                    syscall(436, 3i64, u32::MAX as i64, 0i64);
+                    let again = std::fs::read_to_string("/etc/marker").unwrap_or_default();
                     format!(
-                        "thread: unshare {u} private {p} tmpfs {m} {mnt} chroot {c} marker {}",
-                        marker.trim()
+                        "thread: unshare {u} private {p} tmpfs {m} {mnt} chroot {c} marker {} {}",
+                        marker.trim(),
+                        again.trim()
                     )
                 }
             });
@@ -801,6 +808,57 @@ fn main() {
             });
             println!("child exited {code}");
         }
+        // A child in a new user namespace made from a second thread with a
+        // raw clone (as Go's os/exec makes one, podman's storage among
+        // them): it sets its parent-death signal, asks its parent, and ends.
+        Some("userns-thread-clone") => {
+            let t = std::thread::spawn(|| unsafe {
+                let mut p = [0i32; 2];
+                pipe(p.as_mut_ptr());
+                let child = syscall(SYS_CLONE, CLONE_NEWUSER as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                if child == 0 {
+                    // As containers/storage's user-namespace holder: tell
+                    // the parent, then wait in ppoll until it kills us.
+                    syscall(167, 1i64, 9i64, 0i64, 0i64, 0i64);
+                    let ppid = syscall(173);
+                    write_i32(p[1], ppid as i32);
+                    loop {
+                        syscall(73, 0i64, 0i64, 0i64, 0i64, 0i64);
+                    }
+                }
+                for m in ["uid_map", "gid_map"] {
+                    let _ = std::fs::write(format!("/proc/{child}/{m}"), "0 0 1\n");
+                }
+                let ppid = read_i32(p[0]);
+                let ns = std::fs::metadata(format!("/proc/{child}/ns/user")).is_ok();
+                kill(child as i32, SIGKILL);
+                let mut st = 0;
+                waitpid(child as i32, &mut st, 0);
+                (ppid == getpid(), ns, st)
+            });
+            let (parent_ok, ns, st) = t.join().unwrap();
+            println!("child's parent ours: {parent_ok}, its namespace seen: {ns}, killed by {}", st & 0x7f);
+        }
+        // A child killed as soon as it is made, before it has run.
+        Some("kill-at-once") => {
+            let mut killed = 0;
+            for _ in 0..20 {
+                // SAFETY: plain calls; the child only waits.
+                unsafe {
+                    let child = syscall(SYS_CLONE, CLONE_NEWUSER as i64 | SIGCHLD as i64, 0, 0, 0, 0);
+                    if child == 0 {
+                        loop {
+                            syscall(73, 0i64, 0i64, 0i64, 0i64, 0i64);
+                        }
+                    }
+                    kill(child as i32, SIGKILL);
+                    let mut st = 0;
+                    waitpid(child as i32, &mut st, 0);
+                    killed += i32::from(st & 0x7f == SIGKILL);
+                }
+            }
+            println!("killed at once: {killed} of 20");
+        }
         Some("net-outside") => {
             // The port a namespace holds is not the host's: the parent binds
             // it while a child in its own namespace has it.
@@ -975,6 +1033,67 @@ fn main() {
                 println!("reaped the orphan: {}, {}", w == g, ended(status));
                 println!("SIGCHLD from the orphan: {}", sigchld_from(g));
                 println!("then: {} errno {}", waitpid(-1, &mut status, 0), errno() == ECHILD);
+            }
+        }
+        // An adopted orphan's SIGCHLD reaches the thread that takes it
+        // while the main thread, waiting too, blocks it.
+        Some("subreaper-thread") => {
+            catch_sigchld();
+            // SAFETY: plain calls with valid arguments; the children exit.
+            unsafe {
+                prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+                let mut res = [0i32; 2];
+                pipe(res.as_mut_ptr());
+                let mut report = [0i32; 2];
+                pipe(report.as_mut_ptr());
+                let mut go = [0i32; 2];
+                pipe(go.as_mut_ptr());
+                GO.store(go[0], std::sync::atomic::Ordering::SeqCst);
+                let blocked = 1u64 << (SIGCHLD - 1);
+                syscall(135, 0i64, &blocked as *const u64, 0i64, 8i64);
+                // It ends once told, when every thread waits.
+                let (_, g) = orphan(report, || {
+                    read_i32(GO.load(std::sync::atomic::Ordering::SeqCst));
+                    7
+                });
+                // Others that block it too, waiting without end.
+                for _ in 0..6 {
+                    std::thread::spawn(|| {
+                        let mut idle = [0i32; 2];
+                        pipe(idle.as_mut_ptr());
+                        let mut p = [idle[0], 1];
+                        poll(&mut p, 1, -1);
+                    });
+                }
+                let worker = std::thread::spawn(move || {
+                    syscall(135, 1i64, &blocked as *const u64, 0i64, 8i64);
+                    let mut idle = [0i32; 2];
+                    pipe(idle.as_mut_ptr());
+                    write_i32(res[1], 0);
+                    // Without end, until the orphan's SIGCHLD interrupts it.
+                    while CHLD_PID.load(std::sync::atomic::Ordering::SeqCst) != g {
+                        let mut p = [idle[0], 1];
+                        poll(&mut p, 1, -1);
+                    }
+                    write_i32(res[1], 1);
+                });
+                read_i32(res[0]);
+                let parent = read_i32(report[0]);
+                // The orphan ends once the threads wait; this one too, with
+                // SIGCHLD blocked.
+                usleep(200_000);
+                write_i32(go[1], 0);
+                let mut p = [res[0], 1];
+                let took = poll(&mut p, 1, 5000) == 1;
+                println!("orphan adopted: {}", parent == getpid());
+                println!("the worker took its SIGCHLD: {took}");
+                if took {
+                    worker.join().unwrap();
+                }
+                let mut status = 0;
+                println!("reaped: {}", waitpid(g, &mut status, 0) == g);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                _exit(0);
             }
         }
         // A process that becomes a subreaper does not adopt the orphans

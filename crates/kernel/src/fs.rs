@@ -564,10 +564,11 @@ impl Fs {
     /// A copy of this view, for a thread to have as its own
     /// ([`crate::threadfs`]), with its own descriptor of the rootfs.
     pub fn copy(&self) -> Result<Fs, i32> {
-        let root = self
-            .root
-            .try_clone()
-            .map_err(|e| errno_to_linux(e.raw_os_error().unwrap_or(libc::EMFILE)))?;
+        // In fwe's own range, out of the guest's reach (a program that
+        // closes or replaces its descriptors must not take the root).
+        let root = crate::fdtable::dup_reserved(self.root.as_raw_fd())?;
+        // SAFETY: a fresh descriptor of fwe's, owned by nothing else.
+        let root = unsafe { OwnedFd::from_raw_fd(root) };
         Ok(Fs {
             root,
             root_host: self.root_host.clone(),
@@ -2780,6 +2781,22 @@ fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
 /// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
 /// user's temporary directory. Unlike a tmpfs it outlives the processes,
 /// until the host clears its temporary files.
+/// fwe's private directory on the host (`fwe-<uid>` in the user's
+/// temporary directory), which a process fwe starts in a way that leaves
+/// the host's answer for the temporary directory unreliable (a VM fork
+/// child, see [`adopt_host_dir`]) is handed.
+pub fn host_dir() -> Option<Vec<u8>> {
+    shm::user_dir().ok()
+}
+
+/// Take `dir` as fwe's private directory ([`host_dir`]): the one the
+/// parent has, so that every process of a run shares it (in a VM fork
+/// child the host's lookup of the user's temporary directory gives
+/// another one). Before anything here uses it.
+pub fn adopt_host_dir(dir: Vec<u8>) {
+    let _ = shm::USER_DIR.set(dir);
+}
+
 pub(crate) mod shm {
     use super::{OwnedFd, e, fd_path};
     use fwe_abi::errno;
@@ -2834,8 +2851,7 @@ pub(crate) mod shm {
     /// fwe's private directory for this user (`fwe-<uid>` in the user's
     /// temporary directory), created on first use.
     pub(crate) fn user_dir() -> Result<Vec<u8>, i32> {
-        static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        if let Some(d) = DIR.get() {
+        if let Some(d) = USER_DIR.get() {
             return Ok(d.clone());
         }
         // SAFETY: getuid cannot fail.
@@ -2852,8 +2868,11 @@ pub(crate) mod shm {
         let canonical = std::fs::canonicalize(std::ffi::OsStr::from_bytes(&base))
             .map(|p| p.into_os_string().into_vec())
             .unwrap_or(base);
-        Ok(DIR.get_or_init(|| canonical).clone())
+        Ok(USER_DIR.get_or_init(|| canonical).clone())
     }
+
+    /// [`user_dir`], once known.
+    pub(crate) static USER_DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
     /// The host path of the directory for the root at `root_host`, created
     /// on first use: what the initial namespace mounts at `/dev/shm`.

@@ -368,13 +368,18 @@ pub fn forget_end(pid: i32) {
     }
 }
 
-/// Forget host process `pid` (it ended).
+/// Forget host process `pid` (it ended). Where a new process has the pid
+/// already, only the old one's record goes: the files beside it (its
+/// mailbox, lock and mappings) are the new one's now, which may have
+/// opened them before it wrote its own record.
 pub fn remove(pid: i32) {
-    if let Some(p) = path(pid) {
-        let _ = std::fs::remove_file(OsStr::from_bytes(&p));
-        let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
-        let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
+    let Some(p) = path(pid) else { return };
+    let _ = std::fs::remove_file(OsStr::from_bytes(&p));
+    if start_time(pid).is_some() {
+        return;
     }
+    let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
+    let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     crate::signote::remove(pid);
 }
 

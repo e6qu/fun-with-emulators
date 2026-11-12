@@ -435,7 +435,10 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   code and value) with `pwrite`, a free one or else the oldest; the
   target's handler reads the note of the sender the host names, or the
   oldest, with `pread`, both async-signal-safe, the mailbox held in fwe's
-  reserved descriptor range.
+  reserved descriptor range while it is the file at its path (else read by
+  the path: a process with the pid of one whose records were left behind
+  opened that one's, which goes when they are cleared; clearing them keeps
+  a live process's mailbox, lock and mappings).
 - **Before a re-exec,** the whole guest mask goes on the host, and signals
   fwe holds pending that the guest blocks are re-raised on the thread,
   which the host `execve` keeps.
@@ -554,8 +557,9 @@ is in keeping fwe's own descriptors apart and Linux's limits exact:
   quarter of the host's descriptors, at least 64).
 - The guest never reaches the range: `close_range(3, ~0)`, closing up to
   the limit and listing `/proc/self/fd` stop below it; a call naming one
-  fails with `EBADF`, as does `dup2` onto one; the limit cannot be raised
-  into it. When the range is full, what needed one fails as Linux would
+  fails with `EBADF`, as does `dup2` onto one. Root may raise the limit
+  past it, up to `fs.nr_open`, as Linux allows; the descriptors the guest
+  gets stay below it. When the range is full, what needed one fails as Linux would
   (`EMFILE` for an `eventfd`, `ENOMEM` for an `mmap`, `EAGAIN` for a
   `fork`).
 - The soft limit holds as on Linux: a new descriptor at or above it is
@@ -696,7 +700,9 @@ shapes differently:
   `crates/kernel/src/procfs.rs` (`procpid.rs` for another process's
   `/proc/<pid>`), from an anonymous seekable descriptor;
   `crates/kernel/src/synthdir.rs` serves `getdents64`, `lseek`, `fstat`
-  and `close` of the directories from an in-memory list. An unknown path
+  and `close` of the directories from an in-memory list. A process's
+  `/proc/<pid>` and what is in it are owned by its effective user and
+  group (root's while it is not dumpable), as on Linux. An unknown path
   is `ENOENT`.
 - `/proc/self`: `exe`, `cwd`, `root`, `cmdline`, `stat`, `status`,
   `cgroup`, `mountinfo`, `mounts`, `uid_map`, `gid_map`, `setgroups`,
@@ -912,7 +918,8 @@ each is mapped is in
   cannot be moved (`EINVAL`). Peer groups span namespaces, numbered across
   them. A namespace copied into a user namespace other than the original's
   owner (`unshare -Urm`) gets slaves of the original's shared mounts.
-- **Mount flags:** `nodev` refuses device opens (`EACCES`); `noexec`
+- **Mount flags:** `nosuid` has a program's set-ID bits and file
+  capabilities grant nothing; `nodev` refuses device opens (`EACCES`); `noexec`
   refuses running a program or mapping a file executable (`EACCES`,
   `EPERM`, and later `mprotect`); `nosymfollow` refuses links (`ELOOP`);
   `noatime`, `nodiratime` and `strictatime` set a read file's access time

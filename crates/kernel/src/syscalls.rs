@@ -2041,6 +2041,12 @@ impl<P: Platform> Kernel<P> {
         if res == resource::RLIMIT_NOFILE {
             if new != 0 {
                 let n: Rlimit = guest!(uaccess::read(new));
+                // Raising the hard limit takes CAP_SYS_RESOURCE.
+                if n.rlim_max > crate::fdtable::limit().1
+                    && !self.creds.has(crate::caps::CAP_SYS_RESOURCE)
+                {
+                    return err(errno::EPERM);
+                }
                 if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
                     return err(e);
                 }

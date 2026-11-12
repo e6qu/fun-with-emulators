@@ -171,10 +171,19 @@ fn main() {
             // SAFETY: plain calls.
             let (r, e) = unsafe { (fcntl(1, F_DUPFD, lim.cur as i32), errno()) };
             println!("F_DUPFD from it: {r} {}", name(e));
-            let above = Rlimit { cur: lim.max + 1, max: lim.max + 1 };
+            // Root may raise it as far as `fs.nr_open`, not past it.
+            let nr_open: u64 = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(1 << 20);
+            let above = Rlimit { cur: nr_open + 1, max: nr_open + 1 };
             // SAFETY: a valid in-parameter.
             let (r, e) = unsafe { (setrlimit(RLIMIT_NOFILE, &above), errno()) };
-            println!("raising past it: {r} {}", name(e));
+            println!("raising past fs.nr_open: {r} {}", name(e));
+            let most = Rlimit { cur: lim.max, max: nr_open };
+            // SAFETY: a valid in-parameter.
+            let r = unsafe { setrlimit(RLIMIT_NOFILE, &most) };
+            println!("raising to it: {r}, hard limit now fs.nr_open {}", nofile().max == nr_open);
 
             // With the soft limit lowered and every descriptor below it
             // taken, a new one fails with EMFILE, whatever makes it.
