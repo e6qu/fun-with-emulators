@@ -896,8 +896,8 @@ impl Vcpu {
     /// The guest's registers, with `pc` and `pstate` as given.
     fn regs(&self, pc: u64, pstate: u64) -> Regs {
         let mut r = Regs { pc, pstate, sp: self.get_sys(HV_SYS_REG_SP_EL0), ..Regs::default() };
-        for i in 0..31 {
-            r.x[i] = self.get(HV_REG_X0 + i as u32);
+        for (i, x) in r.x.iter_mut().enumerate() {
+            *x = self.get(HV_REG_X0 + i as u32);
         }
         let mut fp = FpRegs {
             fpsr: self.get(HV_REG_FPSR) as u32,
@@ -914,8 +914,8 @@ impl Vcpu {
 
     /// Resume the guest at EL0 with `r`.
     fn set_regs(&self, r: &Regs) {
-        for i in 0..31 {
-            self.set(HV_REG_X0 + i as u32, r.x[i]);
+        for (i, &x) in r.x.iter().enumerate() {
+            self.set(HV_REG_X0 + i as u32, x);
         }
         self.set_sys(HV_SYS_REG_SP_EL0, r.sp);
         self.set(HV_REG_PC, r.pc);

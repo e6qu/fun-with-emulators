@@ -259,6 +259,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18sig",
     "x18rare",
     "x18spsig",
+    "x18partial",
     "fpsig",
     "efault",
     "sigmap",
@@ -798,6 +799,77 @@ fn dynamic_min_resolves_libc_symbols() {
     assert_eq!(stdout(&out), "dynamic-min: hello from musl\n");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A library whose code is longer than a branch reaches (128 MiB) gets
+/// room for its stubs on both sides: its first sites reach only room below
+/// it, here taken by a library loaded before it (guests/asm/bigcode.S,
+/// bigfill.S, guests/c/bigcode.c; LLVM's library in clang is such).
+#[test]
+fn a_library_longer_than_a_branch_gets_its_stubs() {
+    let out = out_dir().join("c");
+    std::fs::create_dir_all(&out).unwrap();
+    let obj = out.join("bigcode-lib.o");
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-c", "-o"])
+            .arg(&obj)
+            .arg(repo().join("guests/asm/bigcode.S")),
+    );
+    let root = libc_rootfs(Libc::Musl, "bigcode");
+    // Loaded first, below it: 140 MiB taken.
+    let fill_obj = out.join("bigfill.o");
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-c", "-o"])
+            .arg(&fill_obj)
+            .arg(repo().join("guests/asm/bigfill.S")),
+    );
+    let fill = root.join("lib/libbigfill.so");
+    run_checked(
+        Command::new(rust_lld())
+            .args(["-flavor", "gnu", "-shared", "-soname", "libbigfill.so", "-o"])
+            .arg(&fill)
+            .arg(&fill_obj),
+    );
+    let lib = root.join("lib/libbigcode.so");
+    run_checked(
+        Command::new(rust_lld())
+            .args(["-flavor", "gnu", "-shared", "-soname", "libbigcode.so", "-o"])
+            .arg(&lib)
+            .arg(&obj),
+    );
+    let main = out.join("bigcode-main.o");
+    run_checked(
+        Command::new("clang")
+            .args(["--target=aarch64-linux-gnu", "-O2", "-fPIC", "-ffreestanding", "-c", "-o"])
+            .arg(&main)
+            .arg(repo().join("guests/c/bigcode.c")),
+    );
+    let musl = Libc::Musl.lib_dir();
+    let prog = out.join("bigcode");
+    run_checked(
+        Command::new(rust_lld())
+            .args(["-flavor", "gnu", "-pie", "-rpath=/lib"])
+            .arg(format!("--dynamic-linker={}", Libc::Musl.interp()))
+            .arg("-o")
+            .arg(&prog)
+            .arg(musl.join("Scrt1.o"))
+            .arg(musl.join("crti.o"))
+            .arg(&main)
+            .arg(&fill)
+            .arg(&lib)
+            .arg(Libc::Musl.libc_so())
+            .arg(musl.join("crtn.o")),
+    );
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
+    let run = run_bounded(cmd);
+    eprintln!("--- bigcode stderr:\n{}", String::from_utf8_lossy(&run.stderr));
+    if std::env::var_os("KEEP_BIGCODE").is_none() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    assert_eq!(run.status.code(), Some(0));
 }
 
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
@@ -3028,6 +3100,16 @@ fn x18_lookalike_data_is_kept_without_section_headers() {
     }
 }
 
+/// x18 in code the unwind table does not describe, in a program whose
+/// table describes little (as musl's describes only its assembly): code all
+/// the same, rewritten, across preemption (guests/asm/x18partial.S).
+#[test]
+fn x18_in_code_a_sparse_unwind_table_leaves_out_is_rewritten() {
+    for name in ["x18partial", "x18partial-pie"] {
+        assert_eq!(fwe(&asm_guest(name), &[]).status.code(), Some(0), "{name}");
+    }
+}
+
 /// sp written from x18 while a fast timer's signals arrive: a signal in the
 /// last instructions of its stub finishes them before its frame is written
 /// (guests/asm/x18spsig.S).
@@ -3069,6 +3151,28 @@ fn rust_args_env_and_exit_status() {
     );
     assert_eq!(stdout(&out), expected);
     assert_eq!(out.status.code(), Some(7));
+}
+
+/// A program starts in the directory fwe was started in (in the root's
+/// terms under `--root`), so a relative path, the program's own among
+/// them, means what it does on the host.
+#[test]
+fn a_program_starts_in_the_directory_fwe_was_started_in() {
+    let dir = rust_guest("args").parent().unwrap().to_path_buf();
+    let run = |root: Option<&Path>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        if let Some(r) = root {
+            cmd.arg("--root").arg(r);
+        }
+        cmd.arg("./args").arg("cwd").current_dir(&dir);
+        stdout(&run_bounded(cmd))
+    };
+    let host = std::fs::canonicalize(&dir).unwrap();
+    assert!(run(None).contains(&format!("cwd={}\n./args found: true\n", host.display())));
+    // Under a root holding it: the same directory, from the root.
+    let root = host.ancestors().nth(2).unwrap();
+    let inside = Path::new("/").join(host.strip_prefix(root).unwrap());
+    assert!(run(Some(root)).contains(&format!("cwd={}\n./args found: true\n", inside.display())));
 }
 
 /// A compiled Rust/musl binary exercising heap, sleep, clock and a large

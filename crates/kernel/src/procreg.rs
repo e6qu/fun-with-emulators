@@ -383,6 +383,39 @@ pub fn remove(pid: i32) {
     crate::signote::remove(pid);
 }
 
+/// Remove the files kept beside the records for processes that are gone
+/// (their mailbox, lock, mappings and thread ids), older than `young`: a
+/// process whose record was taken away ([`remove`]) without them, as when
+/// its pid had been given to another process by then.
+pub fn collect_leftovers(young: std::time::Duration) {
+    let Some(d) = dir() else { return };
+    let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let pid = match name.split_once('.') {
+            Some((p, "sig" | "lock" | "maps")) => p,
+            _ => match name.strip_prefix("tids-").or_else(|| name.strip_prefix("threads-")) {
+                Some(p) => p.strip_suffix(".new").unwrap_or(p),
+                None => continue,
+            },
+        };
+        let Ok(pid) = pid.parse::<i32>() else { continue };
+        if pid <= 0 || start_time(pid).is_some() || read(pid).is_some() {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= young);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Every live process fwe has a record of, forgetting those that ended
 /// (zombies too).
 pub fn all() -> Vec<(i32, ProcRecord)> {

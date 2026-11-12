@@ -119,16 +119,22 @@ pub unsafe fn prepare(
     let len = (len + (addr - start)) & !3;
     // SAFETY: guaranteed by the caller.
     let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len as usize) };
-    let known: Option<Vec<(u64, u64)>> = known.map(|ranges| {
-        ranges
-            .iter()
-            .filter_map(|&(a, l)| {
-                let lo = a.max(start);
-                let hi = a.saturating_add(l).min(start + len);
-                (lo < hi).then(|| (lo - start, hi - lo))
-            })
-            .collect()
-    });
+    let known: Option<Vec<(u64, u64)>> = known
+        .map(|ranges| {
+            ranges
+                .iter()
+                .filter_map(|&(a, l)| {
+                    let lo = a.max(start);
+                    let hi = a.saturating_add(l).min(start + len);
+                    (lo < hi).then(|| (lo - start, hi - lo))
+                })
+                .collect::<Vec<_>>()
+        })
+        // The unwind table tells code from data only where it describes
+        // most of the range: a program built without unwind tables has
+        // entries for a few functions only (musl's assembly), and the rest
+        // of its code is code all the same.
+        .filter(|r| r.iter().map(|&(_, l)| l).sum::<u64>() * 2 >= len);
     let patched = rewrite::patch(code, known.as_deref());
     let stats = Prepared {
         syscalls: patched.syscalls,

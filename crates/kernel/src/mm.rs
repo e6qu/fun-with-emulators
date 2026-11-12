@@ -1597,6 +1597,11 @@ fn populate(start: u64, len: u64, page: u64) {
 /// the address space a guest may use.
 const MMAP_HINT: u64 = 0x200_0000_0000;
 
+/// The size from which a mapping left to fwe is placed with room on both
+/// sides ([`Kernel::roomy_place`]): code within it may be longer than a
+/// branch reaches, once its stubs' reach is counted.
+const ROOMY_FROM: u64 = 64 << 20;
+
 impl<P: Platform> Kernel<P> {
     /// `a` rounded up to a page; past the last page, the last page's start
     /// (what no range fits in, so a call given it fails as too long).
@@ -1672,11 +1677,26 @@ impl<P: Platform> Kernel<P> {
         }
         let mut haddr = if fixed { crate::uaccess::g2h(addr) } else { addr };
         let mut placed = false;
+        let mut placed_roomy = false;
         if !fixed {
             if let Some(at) = self.platform.place_mapping(self.page_up(len)) {
                 haddr = at;
                 hflags |= libc::MAP_FIXED;
                 placed = true;
+            } else if addr == 0 && self.page_up(len) >= ROOMY_FROM {
+                // A large mapping may be a library's whole span, reserved
+                // before its code is mapped over it at a fixed address, as
+                // dynamic loaders do: code longer than a branch reaches
+                // needs room for stubs below it as well as above, which a
+                // fixed mapping cannot move to find. So it goes where there
+                // is room on both sides.
+                if let Some(at) = Self::roomy_place(self.page_up(len)) {
+                    haddr = at;
+                    hflags |= libc::MAP_FIXED;
+                    placed_roomy = true;
+                } else {
+                    haddr = MMAP_HINT;
+                }
             } else if addr == 0 {
                 // Left to the host, a mapping goes in the first gap it fits,
                 // among the program's image, its break and fwe's own memory,
@@ -1737,7 +1757,7 @@ impl<P: Platform> Kernel<P> {
                 if placed {
                     // The range chosen for it goes back to the backend.
                     self.platform.release_host(haddr, self.page_up(len));
-                } else if retried {
+                } else if retried || placed_roomy {
                     // SAFETY: the place reserved for it, not otherwise used.
                     unsafe { libc::munmap(haddr as *mut libc::c_void, len as usize) };
                 }
@@ -1859,16 +1879,21 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// A place for a mapping of `len` bytes with room after it for the stubs
-    /// its code needs ([`Platform::prepare_exec`]): reserved (inaccessible),
-    /// the room left free. None if the host has no such place.
+    /// A place for a mapping of `len` bytes with room before and after it
+    /// for the stubs its code needs ([`Platform::prepare_exec`]): reserved
+    /// (inaccessible), the room left free. Code longer than a branch reaches
+    /// (128 MiB) needs both: its first sites reach only room before it.
+    /// Asked for at [`MMAP_HINT`], as other mappings left to fwe are, away
+    /// from the program's image and the break it grows. None if the host has
+    /// no such place.
     fn roomy_place(len: u64) -> Option<u64> {
         const ROOM: u64 = 64 << 20;
-        // SAFETY: a fresh inaccessible mapping of fwe's; its tail is let go.
+        // SAFETY: a fresh inaccessible mapping of fwe's; its head and tail
+        // are let go.
         unsafe {
             let p = libc::mmap(
-                std::ptr::null_mut(),
-                (len + ROOM) as usize,
+                MMAP_HINT as *mut libc::c_void,
+                (len + 2 * ROOM) as usize,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
@@ -1877,8 +1902,10 @@ impl<P: Platform> Kernel<P> {
             if p == libc::MAP_FAILED {
                 return None;
             }
-            libc::munmap((p as u64 + len) as *mut libc::c_void, ROOM as usize);
-            Some(p as u64)
+            let p = p as u64;
+            libc::munmap(p as *mut libc::c_void, ROOM as usize);
+            libc::munmap((p + ROOM + len) as *mut libc::c_void, ROOM as usize);
+            Some(p + ROOM)
         }
     }
 

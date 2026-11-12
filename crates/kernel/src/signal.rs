@@ -724,8 +724,8 @@ impl<P: Platform> Kernel<P> {
             return false;
         };
         let f = Buf(bytes);
-        for i in 0..31 {
-            regs.x[i] = f.get(MC_REGS_OFF + i as u64 * 8);
+        for (i, x) in regs.x.iter_mut().enumerate() {
+            *x = f.get(MC_REGS_OFF + i as u64 * 8);
         }
         regs.sp = f.get(MC_SP_OFF);
         regs.pc = f.get(MC_PC_OFF);

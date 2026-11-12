@@ -39,7 +39,7 @@
 use crate::procreg::{self, Ended, Proc};
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::SeqCst};
 
 /// The host pid of this process.
 fn me() -> i32 {
@@ -208,12 +208,37 @@ fn orphaned(lineage: &[Proc]) -> bool {
 /// while that lives, else the reaper that adopted it. `host_ppid` is the
 /// host's answer, used for a process fwe has no line of ancestors for.
 pub fn parent_of(pid: i32, host_ppid: i32) -> i32 {
+    // This process's own parent, still its parent on the host: alive, and
+    // the answer, without reading the record again.
+    if pid == me() {
+        match own_parent() {
+            // The first of its run: the host's answer.
+            Some(None) => return host_ppid,
+            Some(Some(p)) if p == host_ppid => return p,
+            _ => {}
+        }
+    }
     let Some(r) = procreg::read(pid) else { return host_ppid };
     match r.lineage.first() {
         Some(&p) if procreg::alive(p) => p.0,
         Some(_) => adopter((pid, r.start), &r.lineage, r.bound).unwrap_or(host_ppid),
         None => host_ppid,
     }
+}
+
+/// This process's parent as its record names it (fixed as it was made; `None`
+/// for the first process of a run), or `None` without a record yet. Kept
+/// for its pid: a fork child, with a pid of its own, reads its own.
+fn own_parent() -> Option<Option<i32>> {
+    static OWN: AtomicU64 = AtomicU64::new(0);
+    let me = me();
+    let v = OWN.load(SeqCst);
+    if (v >> 32) as i32 == me {
+        return Some((v as i32 != 0).then_some(v as i32));
+    }
+    let parent = procreg::read(me)?.lineage.first().map_or(0, |p| p.0);
+    OWN.store((me as u64) << 32 | parent as u32 as u64, SeqCst);
+    Some((parent != 0).then_some(parent))
 }
 
 /// Whether someone may still reap ended process `e`: its parent, or a

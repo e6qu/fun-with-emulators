@@ -606,11 +606,26 @@ const YOUNG: std::time::Duration = std::time::Duration::from_secs(60);
 /// when its last process leaves: namespaces nobody is in, tmpfs directories
 /// no live mount table shows, records another fwe build wrote, and the
 /// initial mount table of a rootfs that is gone.
+///
+/// It runs at most once a minute ([`YOUNG`], within which nothing would be
+/// removed anyway), as a fresh fwe starts: a marker's time says when.
 pub fn collect() {
     use std::collections::HashSet;
     use std::os::unix::ffi::OsStrExt;
     let Ok(base) = crate::fs::shm::user_dir() else { return };
     let os = |p: &[u8]| std::ffi::OsStr::from_bytes(p).to_owned();
+    let marker = os(&[&base[..], format!("/v{FORMAT}-collected").as_bytes()].concat());
+    let recent = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < YOUNG);
+    if recent {
+        return;
+    }
+    // Marked first: another fwe starting meanwhile need not collect too.
+    let _ = std::fs::File::create(&marker);
+    crate::procreg::collect_leftovers(YOUNG);
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
         live.extend(r.ns);
@@ -691,12 +706,13 @@ pub fn collect() {
     for e in entries.flatten() {
         let name = e.file_name().as_bytes().to_vec();
         let path = [&base[..], b"/", &name].concat();
-        let young = e
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_none_or(|age| age < YOUNG);
+        let young = || {
+            e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < YOUNG)
+        };
         let gone = if let Some(rest) = name.strip_prefix(mine.as_bytes()) {
             let kind = rest.split(|&b| b == b'-').next().unwrap_or(&[]);
             match kind {
@@ -719,6 +735,11 @@ pub fn collect() {
                 }
                 _ => false,
             }
+        } else if let Some(dir) =
+            name.strip_prefix(b"tmpfs-").and_then(|n| n.strip_suffix(b".limit"))
+        {
+            // A tmpfs's size limit goes with it.
+            !shown.contains(&[&base[..], b"/tmpfs-", dir].concat())
         } else if name.starts_with(b"tmpfs-") {
             !shown.contains(&path)
         } else {
@@ -727,8 +748,12 @@ pub fn collect() {
                 && name[1..].iter().take_while(|b| b.is_ascii_digit()).count() > 0
                 && !name.starts_with(mine.as_bytes())
         };
-        if gone && !young {
-            let _ = std::fs::remove_dir_all(os(&path));
+        if gone && !young() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = std::fs::remove_dir_all(os(&path));
+            } else {
+                let _ = std::fs::remove_file(os(&path));
+            }
         }
     }
 }

@@ -1,0 +1,34 @@
+# Alpine Linux 3.24 aarch64 files the benchmarks fetch from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and clang 22 with
+# binutils, musl's headers and make, which build a C project under fwe
+# natively (all position-independent). GCC is there for the start files and
+# libgcc clang links with; its own compilers are not position-independent
+# and are not run. Each line is a path under that URL and the file's SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/main/aarch64/binutils-2.45.1-r1.apk bac4a00e73296dfebf5f587c2b304b7d110e7de658cd2b05491f87c2b228420c
+v3.24/main/aarch64/clang22-22.1.3-r2.apk 1f147208ddca79ef7ff8ce1ac241b43fcc5d8ce7bda25f660d8761ad3615e0c0
+v3.24/main/aarch64/clang22-headers-22.1.3-r2.apk 9740b2bbb74a62270f4014cbbb7fdf50d62914239ec1b5483c86156693dbfac0
+v3.24/main/aarch64/clang22-libs-22.1.3-r2.apk ad2c5f44f52daa3a8dd0fcd02ed83c1f6270059306b615040d9747847caaabcf
+v3.24/main/aarch64/fortify-headers-3.0.1-r2.apk 72bf2a77475f2550a7345683c77b39487ee94ecbc2ca11ed5314161f3b927d76
+v3.24/main/aarch64/gcc-15.2.0-r5.apk ff3fecfc32c9a1bed4a47a32ccfee6f6f575708258f912c218dce8ed0d892221
+v3.24/main/aarch64/gmp-6.3.0-r4.apk 4dab6e86b850fe1b5bc0cf2fac17efa4d7f648bea44f3d9019694cc1e1cb12b7
+v3.24/main/aarch64/isl25-0.25-r2.apk 5209569eb853a98e72f3d78ae575c66708e1d628b8cb2131eb870b3ba1ef0950
+v3.24/main/aarch64/jansson-2.15.0-r0.apk a13822f5ca1772cced4bb7d3d178ec5dee770d8accba5b4816b2ddc413e6f055
+v3.24/main/aarch64/libatomic-15.2.0-r5.apk 31a45fec053c43a006370f83238f16f959838a9a703fbf26bfd1a36da4f538b2
+v3.24/main/aarch64/libffi-3.5.2-r1.apk 9a67280b0c7c62db658c2d4d32ed1199903bef859c32dd4245e1a7e35c89ab4b
+v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+v3.24/main/aarch64/libgcc-static-15.2.0-r5.apk 2ec3dc4be953d842cc51193248367d86829ed699a1ed094fb5149b1b3fc62919
+v3.24/main/aarch64/libgomp-15.2.0-r5.apk 90576a8899c560d3983b8ac8442b5b75957a917bc1c4e950e005945080f8682f
+v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+v3.24/main/aarch64/libstdc++-dev-15.2.0-r5.apk 8385c811d93b64ee1877005a5473cde8ebabe82d346301f2b153ff8cb6a71510
+v3.24/main/aarch64/libxml2-2.13.9-r2.apk 0a860a26ebdfea491498386fe682130f4c5565e46ee8e0a2281256db2ef1be27
+v3.24/main/aarch64/llvm22-libs-22.1.3-r1.apk 6b1b25fdc82cd6d0e2fb57594d08d405569d4776e4b9c56012bd81f8dd90805a
+v3.24/main/aarch64/llvm22-linker-tools-22.1.3-r1.apk c2188d54124bc56289c0a64fa81f1a3309f9ca0d7b1007b3d0aab4d5a3d5303f
+v3.24/main/aarch64/make-4.4.1-r4.apk 0a2c6c3fa0d90b652bbaeac362d1bfe54b75aae57631a6b448826f8b51c85170
+v3.24/main/aarch64/mpc1-1.3.1-r1.apk c4e03923cf1b958ba0d3665196f521a00fb091132e79c39493298019fb59ae60
+v3.24/main/aarch64/mpfr4-4.2.2-r0.apk 81cb276c1e050138fed90c8f1ef584cf5bfce26739733753fce138fc0a092b35
+v3.24/main/aarch64/musl-1.2.6-r3.apk 2e17864102278d9049c3a56f1bceed9e8cf287065617e579325123443daed8a5
+v3.24/main/aarch64/musl-dev-1.2.6-r3.apk 45afe0a9f78de3402b6b5d11f5153ed955bf59d59b45344d9c3fed9f4bbf2f66
+v3.24/main/aarch64/xz-libs-5.8.4-r0.apk 9be375832e747afe14f98e400e8b55d8f6fde25e41663090c81600628daab093
+v3.24/main/aarch64/zlib-1.4-r0.apk d3e30d012a3445222b0b4a28f1d4d97ce67387f8b48561921111696da174f0de
+v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818

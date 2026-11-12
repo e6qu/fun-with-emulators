@@ -482,7 +482,7 @@ impl Aes {
     fn encrypt_block(&self, s: &mut [u8; 16]) {
         let nr = self.round_keys.len() - 1;
         xor16(s, &self.round_keys[0]);
-        for round in 1..=nr {
+        for (round, key) in self.round_keys.iter().enumerate().skip(1) {
             for b in s.iter_mut() {
                 *b = SBOX[*b as usize];
             }
@@ -503,7 +503,7 @@ impl Aes {
                     }
                 }
             }
-            xor16(s, &self.round_keys[round]);
+            xor16(s, key);
         }
     }
 

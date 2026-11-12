@@ -200,7 +200,10 @@ The pieces that do it:
   upwards with free space past the latest (in the gaps below, a library's
   code could find no stub region within reach); code mapped without a
   fixed address that still finds none is mapped again where there is
-  room;
+  room. A large mapping left to fwe (64 MiB or more: a library's span,
+  reserved before its code is mapped over it at a fixed address) is placed
+  with room on both sides from the start, since code longer than a branch
+  reaches has sites that reach only room below it;
 - the kernel crate asks for preparation through
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
@@ -229,6 +232,14 @@ call, an emulated instruction, a write+exec page switch, a recovered
 checked copy, a signal another process sent, a signal for the guest, or a
 fatal fault in fwe's own code; what each becomes for the guest is in
 [linux-on-macos.md](linux-on-macos.md#faults-in-guest-code).
+
+A handler is entered with every signal blocked. For a system call it
+unblocks the guest's signals while it runs, so a wait can be interrupted,
+and blocks them again before returning, the guest's mask restored by the
+return itself. A call that neither waits nor touches guest memory
+(`getpid`, `brk`, `mmap` and the like, outside `--strace`) runs with them
+still blocked, two host calls fewer; a signal that arrives meanwhile is
+delivered as the handler returns, before the guest's next instruction.
 
 ## Memory bookkeeping
 
@@ -436,9 +447,10 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   with the tid and posted to that thread through a table of the threads'
   pending sets the handler reads without a lock.
 - **Threads of another process:** each tid's process is recorded beside
-  the shared tid counter, and a process with more than its main thread
-  publishes its tids (`tids-<pid>` in fwe's private directory), which
-  `/proc/<pid>/task` lists.
+  the shared tid counter (taken sixteen at a time), and a process with
+  more than its main thread publishes its tids (`threads-<pid>` in fwe's
+  private directory, a count and the tids written at once on a descriptor
+  it keeps), which `/proc/<pid>/task` lists.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.

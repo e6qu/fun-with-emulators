@@ -615,7 +615,10 @@ one of these instructions, so:
 - `x18` is rewritten only within the ranges the unwind table (`.eh_frame`)
   covers, since hand-written assembly keeps constant tables in `.text`
   (OpenSSL's `libcrypto` has over a thousand data words that decode as
-  `x18` instructions); a literal load marks its target as a literal pool;
+  `x18` instructions); a literal load marks its target as a literal pool.
+  That holds where the table describes most of the section: one that
+  describes less than half of it (musl, built without unwind tables, has
+  entries only for its assembly) leaves all of it code;
 - system calls and thread-pointer accesses are rewritten throughout the
   executable sections;
 - without section headers, the whole executable segment is scanned, and
@@ -863,7 +866,7 @@ host reports differently.
 | `file_getattr`, `file_setattr` | The inode flags (immutable, append-only, no-dump) as `fa_xflags`, Linux's checks of the size and flags; what only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set. | `fstat`, `fchflags` |
 | `name_to_handle_at`, `open_by_handle_at` | A handle is the host file system id and inode; opening needs `CAP_DAC_READ_SEARCH`. | `fstatfs`, `fsgetpath`, `open` |
 | `memfd_create` | See [Shared memory and memfd](#shared-memory-and-memfd). | `open(O_CREAT\|O_EXCL)`, `unlink` |
-| `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. Search permission checked. | `openat` (to check), `fcntl(F_GETPATH)` |
+| `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. A run starts in the directory fwe was started in (under `--root`, its path in the root, or `/` where it lies outside). Search permission checked. | `openat` (to check), `fcntl(F_GETPATH)` |
 | `umask` | Kept and applied by fwe; fwe's host umask is 0. | none |
 
 **`openat`**: after resolution, an existing file is checked against
@@ -2204,7 +2207,9 @@ flowchart LR
 
 A record's name carries a format number, so another fwe build never reads
 it. A record no live process holds is collected when a namespace is made
-and when a fresh fwe starts.
+and when a fresh fwe starts, at most once a minute (records younger than
+that are spared anyway), with the files a gone process left beside its
+record.
 
 ### Namespaces
 

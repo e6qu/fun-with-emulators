@@ -419,12 +419,22 @@ const TID_END: i32 = 4_194_304;
 
 /// A thread id outside a pid namespace of fwe's: the next of a counter
 /// every fwe process shares (a file beside the process records, taken in
-/// turn with `flock`), so no two live threads have the same one.
+/// turn with `flock`), so no two live threads have the same one. They are
+/// taken [`TID_BLOCK`] at a time, each marked this process's, with no
+/// robust list, and given out from the block.
 fn shared_tid() -> Option<i32> {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    // A fork child's block is its parent's.
+    if block.0 == me && block.1 < block.2 {
+        block.1 += 1;
+        return Some(block.1 - 1);
+    }
     let dir = crate::procreg::records_dir()?;
     let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
-    // SAFETY: a NUL-terminated path in fwe's private directory; a 4-byte
-    // buffer; the descriptor is closed below.
+    // SAFETY: a NUL-terminated path in fwe's private directory; buffers of
+    // the sizes given; the descriptor is closed below.
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
         if fd < 0 {
@@ -436,20 +446,30 @@ fn shared_tid() -> Option<i32> {
             4 => i32::from_ne_bytes(b),
             _ => TID_FIRST,
         };
-        let n = if (TID_FIRST..TID_END).contains(&n) { n } else { TID_FIRST };
-        let next = if n + 1 >= TID_END { TID_FIRST } else { n + 1 };
+        // A block that fits before the end of the numbers.
+        let n = if (TID_FIRST..=TID_END - TID_BLOCK).contains(&n) { n } else { TID_FIRST };
+        let next = n + TID_BLOCK;
+        let next = if next >= TID_END { TID_FIRST } else { next };
         libc::pwrite(fd, next.to_ne_bytes().as_ptr().cast(), 4, 0);
-        // Whose it is, for another process to find it by ([`owner_of_tid`]):
-        // the slot of each tid, after the counter.
-        let me = libc::getpid();
-        libc::pwrite(fd, me.to_ne_bytes().as_ptr().cast(), 4, owner_at(n));
-        // The number's robust list is the new thread's, none yet.
-        publish_robust(n, me, 0);
+        // Whose each is, for another process to find it by
+        // ([`owner_of_tid`]): the slot of each tid, after the counter.
+        let owners: Vec<u8> = (0..TID_BLOCK).flat_map(|_| me.to_ne_bytes()).collect();
+        libc::pwrite(fd, owners.as_ptr().cast(), owners.len(), owner_at(n));
+        // The numbers' robust lists are the new threads', none yet.
+        publish_robust_block(n, TID_BLOCK, me);
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
+        *block = (me, n + 1, n + TID_BLOCK);
         Some(n)
     }
 }
+
+/// How many thread ids [`shared_tid`] takes at once.
+const TID_BLOCK: i32 = 16;
+
+/// The block of thread ids being given out: its process, the next, and
+/// the end.
+pub(crate) static TID_BLOCK_LEFT: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0));
 
 /// Where in the counter's file thread `tid`'s process is.
 fn owner_at(tid: i32) -> libc::off_t {
@@ -489,32 +509,61 @@ pub fn published_tids(pid: i32) -> Vec<i32> {
     )) else {
         return Vec::new();
     };
-    b.chunks_exact(4).map(|c| i32::from_ne_bytes(c.try_into().unwrap())).collect()
+    let Some(count) = b.get(..4).map(|c| u32::from_ne_bytes(c.try_into().unwrap()) as usize) else {
+        return Vec::new();
+    };
+    b[4..].chunks_exact(4).take(count).map(|c| i32::from_ne_bytes(c.try_into().unwrap())).collect()
 }
 
 fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {
-    [dir, format!("/tids-{pid}").as_bytes()].concat()
+    [dir, format!("/threads-{pid}").as_bytes()].concat()
 }
+
+/// This process's thread list file, open: its pid and descriptor.
+pub(crate) static TIDS_FD: Mutex<(i32, i32)> = Mutex::new((0, -1));
 
 /// Publish this process's threads, for another process to list
 /// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): only
-/// while it has more than its main thread.
+/// while it has more than its main thread. The list is a count and the
+/// tids, written whole at once on a descriptor kept open, so a reader sees
+/// one list or the other.
 fn publish_tids(tids: &[i32]) {
     let Some(dir) = crate::procreg::records_dir() else { return };
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };
     let path = tids_file(&dir, me);
-    let p = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path);
+    let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.0 != me && kept.1 >= 0 {
+        // A fork child's copy of its parent's descriptor.
+        // SAFETY: closing the descriptor this process inherited.
+        unsafe { libc::close(kept.1) };
+        *kept = (me, -1);
+    }
     if tids.len() <= 1 {
-        let _ = std::fs::remove_file(p);
+        if kept.1 >= 0 {
+            // SAFETY: closing the descriptor kept for the list.
+            unsafe { libc::close(kept.1) };
+            *kept = (me, -1);
+        }
+        let _ = std::fs::remove_file(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path),
+        );
         return;
     }
-    let b: Vec<u8> = tids.iter().flat_map(|t| t.to_ne_bytes()).collect();
-    let tmp = [&path[..], b".new"].concat();
-    let t = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&tmp);
-    if std::fs::write(t, b).is_ok() {
-        let _ = std::fs::rename(t, p);
+    if kept.1 < 0 {
+        let Ok(c) = std::ffi::CString::new(path) else { return };
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        let fd = unsafe {
+            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
+        };
+        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
+        *kept = (me, fd);
     }
+    let mut b = Vec::with_capacity(4 + 4 * tids.len());
+    b.extend((tids.len() as u32).to_ne_bytes());
+    b.extend(tids.iter().flat_map(|t| t.to_ne_bytes()));
+    // SAFETY: a buffer of `b.len()` bytes, on the descriptor kept for it.
+    unsafe { libc::pwrite(kept.1, b.as_ptr().cast(), b.len(), 0) };
 }
 
 /// Allocate a fresh thread id for a new thread: in a pid namespace of
@@ -646,6 +695,33 @@ fn publish_robust(id: i32, owner: i32, head: u64) {
                 b.as_ptr().cast(),
                 b.len(),
                 (i64::from(id) * ROBUST_SLOT) as libc::off_t,
+            );
+            libc::close(fd);
+        }
+    }
+}
+
+/// Mark slots `first..first + count` (thread numbers) `owner`'s, with no
+/// robust list, in one write.
+fn publish_robust_block(first: i32, count: i32, owner: i32) {
+    if first < 1 || first + count > TID_END {
+        return;
+    }
+    let Some(path) = robust_path() else { return };
+    let mut slot = [0u8; ROBUST_SLOT as usize];
+    slot[..4].copy_from_slice(&owner.to_ne_bytes());
+    slot[8..16].copy_from_slice(&now_micros().to_ne_bytes());
+    let b: Vec<u8> = (0..count).flat_map(|_| slot).collect();
+    // SAFETY: a NUL-terminated path; a buffer of `b.len()` bytes; closed
+    // below.
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+        if fd >= 0 {
+            libc::pwrite(
+                fd,
+                b.as_ptr().cast(),
+                b.len(),
+                (i64::from(first) * ROBUST_SLOT) as libc::off_t,
             );
             libc::close(fd);
         }

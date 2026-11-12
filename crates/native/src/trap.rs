@@ -162,6 +162,15 @@ fn block_async_signals() {
         libc::sigaddset(&mut all, host::WAKE_SIGNAL);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }
+    UNBLOCKED.with(|u| u.set(false));
+}
+
+/// [`block_async_signals`], in a handler's host code: only if
+/// [`HostCode`] unblocked them (the handler was entered with them blocked).
+fn reblock() {
+    if UNBLOCKED.with(Cell::get) {
+        block_async_signals();
+    }
 }
 
 /// Run under the host mask this thread's guest mask calls for.
@@ -169,6 +178,54 @@ fn apply_guest_mask() {
     let mask = host::host_mask_for(thread::mask());
     // SAFETY: `mask` is an initialized signal set.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) };
+    UNBLOCKED.with(|u| u.set(true));
+}
+
+thread_local! {
+    /// Whether a handler's host code runs with the guest's signals
+    /// unblocked ([`HostCode`]).
+    static UNBLOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether system call `nr` neither waits nor touches guest memory,
+/// whatever its arguments: it runs with signals still blocked as the
+/// handler was entered, saving two host calls. A signal that arrives
+/// meanwhile is delivered as the handler returns, before the guest's next
+/// instruction, as Linux delivers it on the way back from the call. (A
+/// fault in guest memory needs `SIGSEGV` unblocked, to be recovered; so
+/// does the tracer, which reads arguments.)
+fn never_waits(nr: u64) -> bool {
+    use fwe_abi::nr::*;
+    !TRACING.load(std::sync::atomic::Ordering::Relaxed)
+        && matches!(
+            nr,
+            GETPID
+                | GETPPID
+                | GETTID
+                | GETUID
+                | GETEUID
+                | GETGID
+                | GETEGID
+                | GETPGID
+                | GETSID
+                | BRK
+                | MMAP
+                | MUNMAP
+                | MPROTECT
+                | MADVISE
+                | SET_TID_ADDRESS
+                | UMASK
+                | LSEEK
+                | SCHED_YIELD
+        )
+}
+
+/// Whether the run traces its system calls (`--strace`).
+static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Note whether the run traces its system calls.
+pub fn set_tracing(on: bool) {
+    TRACING.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Make the guest's current mask the one the host restores when the handler
@@ -193,16 +250,25 @@ struct HostCode {
 
 impl HostCode {
     fn enter() -> HostCode {
+        let h = HostCode::enter_blocked();
+        apply_guest_mask();
+        h
+    }
+
+    /// [`HostCode::enter`] leaving signals blocked, for host code that does
+    /// not wait ([`never_waits`]).
+    fn enter_blocked() -> HostCode {
         let was_in_guest = IN_GUEST.with(|g| g.replace(false));
         crate::quiesce::leave();
-        apply_guest_mask();
+        // Handlers are entered with every signal blocked.
+        UNBLOCKED.with(|u| u.set(false));
         HostCode { was_in_guest }
     }
 }
 
 impl Drop for HostCode {
     fn drop(&mut self) {
-        block_async_signals();
+        reblock();
         IN_GUEST.with(|g| g.set(self.was_in_guest));
         if self.was_in_guest {
             // Back to guest code, unless a fork is copying memory.
@@ -278,7 +344,7 @@ fn is_brk(word: u32) -> bool {
 /// before it blocks signals to return; recorded but not delivered, it would
 /// otherwise wait for the thread's next system call.
 fn settle(regs: &mut Regs) {
-    block_async_signals();
+    reblock();
     if thread::deliverable() != 0 {
         if let Some(k) = kernel().as_mut() {
             k.deliver_pending(regs);
@@ -299,9 +365,14 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         take_async(sig, || unsafe { host::signal_info(sig, info) }, ctx, in_guest);
         return;
     }
-    let _host = HostCode::enter();
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+    // A system call that cannot wait runs with signals still blocked,
+    // unless a tracer or a seccomp filter may make it wait.
+    let quick = never_waits(mc.ss.x[8])
+        && fwe_kernel::seccomp::mode() == 0
+        && !fwe_kernel::ptrace::stops_at_syscalls();
+    let _host = if quick { HostCode::enter_blocked() } else { HostCode::enter() };
     // The saved pc is the trapping instruction for `brk`.
     // SAFETY: the guest was executing at `pc`, so it is mapped.
     if unsafe { insn(mc.ss.pc) } != Some(TRAP) {
