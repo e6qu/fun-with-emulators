@@ -161,7 +161,9 @@ and keeps these rules:
 - **Host memory behind the VM is never replaced.** Private memory stays
   in the slab: `munmap`, `mremap`, a `MAP_FIXED` mapping over existing
   memory and `MADV_DONTNEED` edit stage 1 and zero slab memory, which is
-  reused only after a TLB flush. A shared segment leaves the VM before its
+  reused only after a TLB flush. Zeros are written only over the host
+  pages that ever held data (the host's page dispositions tell), so a
+  range reserved and mapped over (gigabytes, by Wine) takes no memory. A shared segment leaves the VM before its
   host mapping goes.
 - **A vCPU is never destroyed under a call on it.** At the end each thread
   destroys its own vCPU, from the wake signal's handler if it is blocked
@@ -290,6 +292,8 @@ target/release/fwe ./program-linked-low
 - Without the entitlement, or on a host without hypervisor support
   (`sysctl kern.hv_support` must be `1`), fwe explains that the program
   needs the hypervisor backend and exits with status 126.
+- `fwe --vm program` runs any program in the VM, position-independent or
+  not, and every program it starts; Wine needs it for its 4 KiB pages.
 - `fwe --hv-spike` runs a tiny guest in a VM as a check that the hypervisor
   works: it prints `hv: hello from the guest` and reports exit status 42.
 

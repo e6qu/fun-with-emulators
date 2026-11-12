@@ -108,7 +108,40 @@ fn smaps_field_of(who: &str, start: u64, field: &str) -> u64 {
     u64::MAX
 }
 
+/// A large reservation mapped over, as Wine reserves the address space a
+/// Windows program expects and maps into it: only what is touched takes
+/// memory, and what is read back is zero.
+fn reserve_and_map_over() {
+    const PROT_NONE: i32 = 0;
+    const PROT_RW: i32 = 3;
+    const PRIVATE_ANON: i32 = 0x22;
+    const FIXED: i32 = 0x10;
+    const NORESERVE: i32 = 0x4000;
+    let len = 4usize << 30;
+    // SAFETY: fresh mappings of this program's, written within their length.
+    let (zero, rss) = unsafe {
+        let a = mmap(std::ptr::null_mut(), len, PROT_NONE, PRIVATE_ANON | NORESERVE, -1, 0);
+        let b = mmap(a, len, PROT_RW, PRIVATE_ANON | FIXED, -1, 0);
+        assert_eq!(a, b);
+        *b.add(len / 2) = 1;
+        let again = mmap(a, len, PROT_RW, PRIVATE_ANON | FIXED, -1, 0);
+        (*again.add(len / 2) == 0 && *again.add(len - 1) == 0, rss_kb())
+    };
+    println!("reserved 4 GiB, mapped over twice: zero {zero}, under 256 MiB resident {}", rss < 256 << 10);
+}
+
+/// This process's resident memory (`/proc/self/status`'s `VmRSS`), in KiB.
+fn rss_kb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("reserve") {
+        reserve_and_map_over();
+        return;
+    }
     // SAFETY: plain C library calls with valid arguments, on memory this
     // program maps for them.
     unsafe {

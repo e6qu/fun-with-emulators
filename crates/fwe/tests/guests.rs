@@ -5006,6 +5006,12 @@ fn hv_map_fixed_replaces_mapped_memory() {
     let out = fwe_hv(&asm_guest("mapfixedmt-low"), &[]).unwrap();
     assert_eq!(stdout(&out), "ok\n");
     assert_eq!(out.status.code(), Some(0));
+    // Gigabytes reserved and mapped over take memory only where touched.
+    let out = fwe_hv(&rust_low_guest("maps"), &["reserve"]).unwrap();
+    assert_eq!(
+        stdout(&out),
+        "reserved 4 GiB, mapped over twice: zero true, under 256 MiB resident true\n"
+    );
 }
 
 /// The stand-in's watcher reports a process that ended with its VM alive,

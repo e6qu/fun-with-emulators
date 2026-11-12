@@ -155,26 +155,11 @@ const HANDOFF_TIMEOUT_MS: u32 = 10_000;
 /// Bytes per write of the memory a `fork` child is sent.
 const STREAM_CHUNK: u64 = 1 << 20;
 
-fn task_page_query(addr: u64, size: u64, out: &mut [i32]) -> bool {
-    unsafe extern "C" {
-        fn mach_vm_page_range_query(
-            task: Port,
-            addr: u64,
-            size: u64,
-            dispositions: u64,
-            count: *mut u64,
-        ) -> i32;
-    }
-    let mut n = out.len() as u64;
-    // SAFETY: room for `n` dispositions, one per host page of the range.
-    unsafe { mach_vm_page_range_query(task(), addr, size, out.as_mut_ptr() as u64, &mut n) == 0 }
-}
-
 /// Send a `fork` child every page of the slab that exists (untouched
 /// pages are zero in the child too), as `(address, length, bytes)` runs,
 /// then `(0, 0)`.
 fn stream_memory(sock: i32) -> Result<(), String> {
-    const HOST_PAGE: u64 = 16 << 10;
+    use window::HOST_PAGE;
     let send = |addr: u64, len: u64| -> Result<(), String> {
         let mut hdr = [0u8; 16];
         hdr[..8].copy_from_slice(&addr.to_le_bytes());
@@ -193,9 +178,7 @@ fn stream_memory(sock: i32) -> Result<(), String> {
             let span = (end - at).min(STREAM_CHUNK.max(HOST_PAGE));
             let pages = span.div_ceil(HOST_PAGE) as usize;
             let mut disp = vec![0i32; pages];
-            if !task_page_query(at, pages as u64 * HOST_PAGE, &mut disp) {
-                disp.iter_mut().for_each(|d| *d = 1);
-            }
+            window::page_dispositions(at, &mut disp);
             let mut i = 0;
             while i < pages {
                 if disp[i] == 0 {

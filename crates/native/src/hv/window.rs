@@ -105,9 +105,84 @@ fn claim(st: &mut State, start: u64, end: u64) {
         // SAFETY: slab memory, now in use by the caller, which no one else
         // reaches (it was free; any translation of it was flushed before it
         // was given back).
-        unsafe { std::ptr::write_bytes(a as *mut u8, 0, (b - a) as usize) };
+        unsafe { zero(a, b) };
     }
     add(&mut st.used, start, end);
+}
+
+/// The host's page size, which the host tells of pages in.
+pub const HOST_PAGE: u64 = 16 << 10;
+
+/// For each host page from `addr` on (one per entry of `out`), whether it
+/// exists: 0 for one never touched, which reads as zero, else the host's
+/// disposition of it (resident, paged out, ...). Where the host does not
+/// answer, every page is taken to exist.
+pub fn page_dispositions(addr: u64, out: &mut [i32]) {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_page_range_query(
+            task: u32,
+            addr: u64,
+            size: u64,
+            dispositions: u64,
+            count: *mut u64,
+        ) -> i32;
+    }
+    let mut n = out.len() as u64;
+    // SAFETY: the task port the runtime set up at startup; room for `n`
+    // dispositions, one per host page of the range.
+    let ok = unsafe {
+        mach_vm_page_range_query(
+            mach_task_self_,
+            addr,
+            n * HOST_PAGE,
+            out.as_mut_ptr() as u64,
+            &mut n,
+        ) == 0
+    };
+    if !ok {
+        out.iter_mut().for_each(|d| *d = 1);
+    }
+}
+
+/// Make slab memory `[start, end)` read as zero, writing zeros only over
+/// the host pages that ever held data ([`page_dispositions`]): a page never touched reads as zero already, and writing to it
+/// would make the host commit it. A program that reserves gigabytes and
+/// maps over them (Wine) would otherwise have all of it committed. What is
+/// written may have held code: the caches are told.
+///
+/// # Safety
+///
+/// `[start, end)` is slab memory the caller may write: no vCPU reaches it
+/// through a translation the caller has not accounted for.
+pub unsafe fn zero(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    let host = HOST_PAGE;
+    let mut disp = vec![0i32; 4096];
+    let mut at = start / host * host;
+    let mut wrote = false;
+    while at < end {
+        let pages = ((end - at).div_ceil(host)).min(disp.len() as u64);
+        page_dispositions(at, &mut disp[..pages as usize]);
+        for i in 0..pages {
+            let page = at + i * host;
+            if disp[i as usize] == 0 {
+                continue;
+            }
+            let (a, b) = (page.max(start), (page + host).min(end));
+            // SAFETY: the caller's memory, as the function's contract says.
+            unsafe { std::ptr::write_bytes(a as *mut u8, 0, (b - a) as usize) };
+            // It may have held code.
+            super::mem::invalidate_icache(a, b - a);
+            wrote = true;
+        }
+        at += pages * host;
+    }
+    if wrote && super::standin::active() {
+        super::standin::code_written();
+    }
 }
 
 /// A free range of `len` bytes (page-rounded), now in use and zeroed.

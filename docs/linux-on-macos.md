@@ -127,7 +127,7 @@ and share the rest:
 
 | | Native backend | VM backend |
 |---|---|---|
-| Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB |
+| Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB, and under `--vm` every program of the run |
 | Guest code | in the `fwe` process, after rewriting | at EL0 in a Hypervisor.framework VM, unmodified |
 | Page size the guest sees | 16 KiB (the host's) | 4 KiB |
 | Guest addresses | host addresses | host addresses, except fixed-address ranges outside the memory set aside for the VM (the *slab*), such as a low-linked image, which are translated |
@@ -158,7 +158,10 @@ at its own address.
 
 `needs_vm` (`crates/native/src/lib.rs`) asks one question: is this a
 non-PIE executable whose lowest loaded page lies below 4 GiB? If so it
-runs in the VM, otherwise natively. Static or dynamic, glibc or musl, C,
+runs in the VM, otherwise natively. `fwe --vm` runs every program of the
+run in the VM instead (each fwe it starts is given `--vm` too), for
+programs that need 4 KiB pages, such as Wine; a position-independent one
+is placed in the slab. Static or dynamic, glibc or musl, C,
 Rust or Go make no difference. A guest's `execve` of such a program where
 there is no VM to run it (no stand-in, and fwe without the hypervisor
 entitlement or the Mac without `kern.hv_support`, both asked of the
@@ -424,15 +427,17 @@ fwe's mechanisms, from how Wine is generally built:
 - **Pages:** Wine assumes Windows' 4 KiB pages (Asahi Linux, with 16 KiB
   pages, runs Wine in a 4 KiB-page VM). Natively the guest's pages are
   16 KiB; in the VM they are 4 KiB.
-- **Backend:** Wine's Linux builds start Windows programs through
-  `wine-preloader`, a static non-PIE executable linked low, which reserves
-  the low ranges Windows programs expect (with `MAP_FIXED`) before loading
-  the dynamic linker and Wine. It would run in the VM, the only backend
-  that gives a program memory below 4 GiB. There a fixed mapping ending
-  below fwe's code page near 1 TiB is accepted, backed by slab memory
-  (translated outside the slab), and one beyond it fails with `ENOMEM`.
-  Each reservation, even `PROT_NONE`, takes its size out of the slab, 7/16
-  of the guest-physical space the host offers (28 GiB on an M1 or M2).
+- **Backend:** Wine 10 and later are position-independent throughout
+  (the loader, `wineserver`, and `wine-preloader`, a static PIE that
+  reserves the low ranges Windows programs expect, with `MAP_FIXED`, before
+  loading the dynamic linker and Wine), so fwe would run them natively,
+  with 16 KiB pages. They run under `fwe --vm`, which puts every program
+  of the run in the VM. There a fixed mapping ending below fwe's code page
+  near 1 TiB is accepted, backed by slab memory (translated outside the
+  slab), and one beyond it fails with `ENOMEM`. Each reservation, even
+  `PROT_NONE`, takes its size out of the slab, 7/16 of the guest-physical
+  space the host offers (28 GiB on an M1 or M2), but host memory only for
+  the pages touched.
 - **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`. In the
   VM `x18` is the guest's own. Natively, ELF code using it goes through
   stubs, and Windows code Wine loads and makes executable is treated as
