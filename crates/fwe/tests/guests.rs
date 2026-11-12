@@ -2257,8 +2257,10 @@ fn alpine_wine_runs_windows_programs() {
         cmd.arg("--vm").arg("--strace").arg(format!("--strace-file={}", trace.display()));
         // Wine's messages to a file: wineserver, which stays a while after a
         // step, holds the standard error it was given.
-        cmd.arg("--root").arg(&root).arg(root.join("bin/sh"));
-        cmd.args(["-c", &format!("exec {command} 2>{err}")]);
+        // busybox by name: `/bin/sh` is an absolute link the host would
+        // follow out of the root.
+        cmd.arg("--root").arg(&root).arg(root.join("bin/busybox"));
+        cmd.args(["sh", "-c", &format!("exec {command} 2>{err}")]);
         // No display: Wine runs its console programs without one. No Mono or
         // Gecko to offer to install.
         cmd.env_clear()
