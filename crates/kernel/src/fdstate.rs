@@ -31,10 +31,10 @@ pub struct State {
     pub created: bool,
 }
 
-static STATES: Mutex<BTreeMap<i32, State>> = Mutex::new(BTreeMap::new());
+pub(crate) static STATES: Mutex<BTreeMap<i32, State>> = Mutex::new(BTreeMap::new());
 
 /// Pipes' capacities, by the host pipe's identity (device and inode).
-static PIPES: Mutex<Option<HashMap<(u64, u64), u64>>> = Mutex::new(None);
+pub(crate) static PIPES: Mutex<Option<HashMap<(u64, u64), u64>>> = Mutex::new(None);
 
 /// A pipe's capacity until one is set: what the host's pipe holds (Linux's
 /// 16 pages are more, with 16 KiB pages, than a host pipe can take).
@@ -113,7 +113,7 @@ pub fn duplicated(old: i32, new: i32) {
 /// The write ends of pipes this process made, by their host identity: the
 /// read end's identity, which the pipe's capacity is kept under (the host
 /// gives a pipe's two ends two identities; a FIFO's share the file's).
-static WRITE_ENDS: Mutex<Option<HashMap<PipeId, PipeId>>> = Mutex::new(None);
+pub(crate) static WRITE_ENDS: Mutex<Option<HashMap<PipeId, PipeId>>> = Mutex::new(None);
 
 /// A pipe end's host identity: device and inode.
 type PipeId = (u64, u64);
@@ -155,11 +155,11 @@ static CAPPED: AtomicBool = AtomicBool::new(false);
 /// The page buffers of pipes with less than the host's capacity that this
 /// process wrote, by the pipe's identity: each buffer's end in its page
 /// (where a write may add to it) and the bytes in it not yet read.
-static BUFFERS: Mutex<Option<HashMap<PipeId, Buffers>>> = Mutex::new(None);
+pub(crate) static BUFFERS: Mutex<Option<HashMap<PipeId, Buffers>>> = Mutex::new(None);
 
 /// One pipe's buffers, oldest first: (end in its page, unread bytes).
 #[derive(Debug, Default)]
-struct Buffers(VecDeque<(u64, u64)>);
+pub(crate) struct Buffers(VecDeque<(u64, u64)>);
 
 impl Buffers {
     /// Brought up to date with the host pipe holding `held` bytes: what

@@ -76,14 +76,14 @@ pub struct Ruleset {
 }
 
 /// The process's rulesets, by their descriptors' host identity.
-static RULESETS: Mutex<Vec<((u64, u64), Ruleset)>> = Mutex::new(Vec::new());
+pub(crate) static RULESETS: Mutex<Vec<((u64, u64), Ruleset)>> = Mutex::new(Vec::new());
 
 /// The process's domain: each layer's id and ruleset.
-static DOMAIN: Mutex<Vec<(u64, Ruleset)>> = Mutex::new(Vec::new());
+pub(crate) static DOMAIN: Mutex<Vec<(u64, Ruleset)>> = Mutex::new(Vec::new());
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Descriptors opened without the right to truncate their file.
-static NO_TRUNCATE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+pub(crate) static NO_TRUNCATE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 /// Whether the process is restricted at all.
 pub fn active() -> bool {

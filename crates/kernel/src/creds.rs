@@ -72,7 +72,7 @@ impl Access {
 /// The process's [`Access`], as of its last system call ([`publish`]): for
 /// what fwe checks outside the kernel (the path walk, a connect to a Unix
 /// socket's file). Credentials change only in system calls.
-static ACCESS: std::sync::RwLock<Option<Access>> = std::sync::RwLock::new(None);
+pub(crate) static ACCESS: std::sync::RwLock<Option<Access>> = std::sync::RwLock::new(None);
 
 /// The process's [`Access`] (root's before any is published).
 pub fn access() -> Access {

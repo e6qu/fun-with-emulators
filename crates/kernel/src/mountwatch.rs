@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 /// Each watched descriptor's namespace, and the generation last seen.
 type Watches = HashMap<i32, (Arc<Ns>, u64)>;
 
-static WATCHES: Mutex<Option<Watches>> = Mutex::new(None);
+pub(crate) static WATCHES: Mutex<Option<Watches>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut Watches) -> R) -> R {
     f(WATCHES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))

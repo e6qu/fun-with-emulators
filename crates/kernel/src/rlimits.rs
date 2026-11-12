@@ -29,7 +29,7 @@ use std::sync::Mutex;
 /// Linux's resources, by number.
 const COUNT: usize = r::RLIM_NLIMITS as usize;
 
-static LIMITS: Mutex<Option<[(u64, u64); COUNT]>> = Mutex::new(None);
+pub(crate) static LIMITS: Mutex<Option<[(u64, u64); COUNT]>> = Mutex::new(None);
 
 /// A process's limit of `res` as Linux starts one out (for those kept
 /// here).

@@ -77,7 +77,7 @@ impl Data for UserNs {
 /// including) the initial one.
 pub type Chain = Vec<Arc<Record<UserNs>>>;
 
-static CURRENT: Mutex<Option<Arc<Chain>>> = Mutex::new(None);
+pub(crate) static CURRENT: Mutex<Option<Arc<Chain>>> = Mutex::new(None);
 
 /// The chain from `ns` up.
 pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {

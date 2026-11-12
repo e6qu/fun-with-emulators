@@ -94,7 +94,7 @@ pub fn tracked() -> Vec<(u64, u64)> {
 /// `MAP_GROWSDOWN` mappings, guest start to end: a fault in the space
 /// just below one grows it down ([`Kernel::stack_fault`]; the native
 /// backend's, whose guest addresses are host addresses).
-static GROWS_DOWN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static GROWS_DOWN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn grows_down() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     GROWS_DOWN.lock().unwrap_or_else(|e| e.into_inner())
@@ -102,7 +102,7 @@ fn grows_down() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
 
 /// Guest ranges `MADV_HWPOISON` poisoned: inaccessible, and an access to
 /// them is a `SIGBUS` ([`poisoned`]), as Linux reports a memory failure.
-static POISONED: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static POISONED: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn poisoned_ranges() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     POISONED.lock().unwrap_or_else(|e| e.into_inner())
@@ -115,7 +115,7 @@ pub fn poisoned(addr: u64) -> bool {
 
 /// Guest ranges given `MADV_DONTDUMP` (until `MADV_DODUMP`): left out of
 /// a core dump ([`dont_dump`]).
-static DONT_DUMP: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static DONT_DUMP: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn dont_dump_ranges() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     DONT_DUMP.lock().unwrap_or_else(|e| e.into_inner())
@@ -128,7 +128,7 @@ pub fn dont_dump(addr: u64) -> bool {
 
 /// Host ranges given `MADV_WIPEONFORK`: a fork child finds them zero
 /// ([`forked_child`]), and so does its own child.
-static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static WIPE_ON_FORK: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 fn wipe_on_fork() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     WIPE_ON_FORK.lock().unwrap_or_else(|e| e.into_inner())
@@ -446,6 +446,8 @@ pub(crate) fn resident(start: u64, end: u64) -> u64 {
 /// Run `f` holding the tracking lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = guest_maps();
+    let _wx = write_exec();
+    let _views = file_views();
     f()
 }
 

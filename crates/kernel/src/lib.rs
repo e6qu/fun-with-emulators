@@ -31,6 +31,7 @@ pub mod fdmarks;
 pub mod fdstate;
 pub mod fdtable;
 pub mod fifo;
+mod forklock;
 pub mod fs;
 mod fsops;
 pub mod futex;
@@ -1063,7 +1064,9 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
                                     mm::hold(|| {
                                         maps::hold(|| {
                                             thread::hold(|| {
-                                                threadfs::hold(|| seqpacket::hold(fork))
+                                                threadfs::hold(|| {
+                                                    seqpacket::hold(|| forklock::hold(fork))
+                                                })
                                             })
                                         })
                                     })

@@ -47,7 +47,7 @@ pub struct Target {
 
 /// The wait statuses of the processes this process reaped and holds a
 /// descriptor of, by host pid.
-static EXITS: Mutex<Option<HashMap<i32, i32>>> = Mutex::new(None);
+pub(crate) static EXITS: Mutex<Option<HashMap<i32, i32>>> = Mutex::new(None);
 
 /// How many thread descriptors were made, so that a thread's exit looks
 /// for one only once there are any.

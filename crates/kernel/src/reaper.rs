@@ -444,6 +444,7 @@ pub fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _notified = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
     let _changes = CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     let _inits = INITS.lock().unwrap_or_else(|e| e.into_inner());
+    let _sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
     f()
 }
 

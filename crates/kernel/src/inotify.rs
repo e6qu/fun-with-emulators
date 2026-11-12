@@ -208,7 +208,7 @@ pub fn watching() -> bool {
 }
 
 /// This process's instances, by mark number: the socket path.
-static INSTANCES: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+pub(crate) static INSTANCES: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
 static NEXT: AtomicU32 = AtomicU32::new(1);
 
 fn instances<R>(f: impl FnOnce(&mut HashMap<u32, Vec<u8>>) -> R) -> R {

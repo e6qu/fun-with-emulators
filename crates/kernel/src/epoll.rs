@@ -25,7 +25,7 @@
 type Interest = std::collections::BTreeMap<i32, (u32, u64)>;
 
 #[cfg(not(target_os = "linux"))]
-static INTEREST: std::sync::Mutex<Option<std::collections::HashMap<i32, Interest>>> =
+pub(crate) static INTEREST: std::sync::Mutex<Option<std::collections::HashMap<i32, Interest>>> =
     std::sync::Mutex::new(None);
 
 #[cfg(not(target_os = "linux"))]
@@ -277,7 +277,8 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
 /// The bpf objects each set watches (set, descriptor): always in error, as
 /// Linux polls a map without events of its own.
 #[cfg(not(target_os = "linux"))]
-static BPF_WATCHED: std::sync::Mutex<Vec<(i32, i32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static BPF_WATCHED: std::sync::Mutex<Vec<(i32, i32)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Whether set `ep` watches bpf object `fd`.
 #[cfg(not(target_os = "linux"))]
@@ -710,7 +711,7 @@ fn write_events(events: u64, ready: &[(i32, u32, u64)]) -> i64 {
 /// report on (its writers' end, bytes a probe kept), by epoll descriptor and
 /// descriptor.
 #[cfg(not(target_os = "linux"))]
-static EDGES: std::sync::Mutex<Vec<(i32, i32, u32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static EDGES: std::sync::Mutex<Vec<(i32, i32, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether `bits` of `fd` are news to epoll set `epfd` (and note them).
 #[cfg(not(target_os = "linux"))]
@@ -739,12 +740,13 @@ fn edge_clear(epfd: i32, fd: i32) {
 /// What edge-triggered pipe read ends in epoll sets held when last
 /// reported: (set, descriptor, bytes).
 #[cfg(not(target_os = "linux"))]
-static HELD: std::sync::Mutex<Vec<(i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static HELD: std::sync::Mutex<Vec<(i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
 
 /// The writes each set saw counted of each pipe watched exclusively it
 /// watches: `(epfd, fd, writes)`.
 #[cfg(not(target_os = "linux"))]
-static WRITES: std::sync::Mutex<Vec<(i32, i32, u64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static WRITES: std::sync::Mutex<Vec<(i32, i32, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Whether a pipe read end `fd` holding `bytes` has had data written since
 /// set `epfd` last saw it, which is an edge to Linux (the host's
@@ -890,7 +892,10 @@ fn kevent_once(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
         if ready.len() >= room || last <= ready.len() {
             break;
         }
-        let (more, n) = kevent_take(epfd, room - ready.len(), 0)?;
+        // Taken events are the guest's now (an edge-triggered one is not
+        // reported again): a failure here (a signal ending the call) ends
+        // the taking, not the call.
+        let Ok((more, n)) = kevent_take(epfd, room - ready.len(), 0) else { break };
         if n == 0 {
             break;
         }

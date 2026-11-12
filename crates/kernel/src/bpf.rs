@@ -636,7 +636,7 @@ pub fn fresh_map_id() -> u32 {
 /// identity: the instruction that loads each, and the map (through a
 /// descriptor of fwe's, so the program keeps it).
 type FilterMaps = Vec<(usize, crate::bpfmap::Map)>;
-static PROG_MAPS: std::sync::Mutex<Vec<((u64, u64), FilterMaps)>> =
+pub(crate) static PROG_MAPS: std::sync::Mutex<Vec<((u64, u64), FilterMaps)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// The maps program `bytes` loads by descriptor, as fwe keeps them.
@@ -662,7 +662,7 @@ fn resolve_maps(bytes: &[u8]) -> Result<FilterMaps, i32> {
 
 /// Socket filters attached (`SO_ATTACH_BPF`), by the host's handle of the
 /// socket they filter what arrives at.
-static FILTERS: std::sync::Mutex<Vec<(u64, Program, FilterMaps)>> =
+pub(crate) static FILTERS: std::sync::Mutex<Vec<(u64, Program, FilterMaps)>> =
     std::sync::Mutex::new(Vec::new());
 static ANY_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

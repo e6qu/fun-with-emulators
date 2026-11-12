@@ -235,12 +235,12 @@ fn run(f: &Filter, d: &[u8; DATA_LEN as usize]) -> u32 {
 
 /// The process's seccomp state.
 #[derive(Clone, Debug, Default)]
-struct State {
+pub(crate) struct State {
     strict: bool,
     filters: Vec<Arc<Filter>>,
 }
 
-static STATE: RwLock<State> = RwLock::new(State { strict: false, filters: Vec::new() });
+pub(crate) static STATE: RwLock<State> = RwLock::new(State { strict: false, filters: Vec::new() });
 /// 0 with no seccomp, 1 strict, 2 filtering: what `/proc/self/status`
 /// shows, and what [`check`] looks at first.
 static MODE: AtomicU8 = AtomicU8::new(0);

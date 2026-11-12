@@ -34,14 +34,14 @@ use std::sync::RwLock;
 
 /// A translated guest range `[lo, hi)`, backed at `host`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Translation {
+pub(crate) struct Translation {
     lo: u64,
     hi: u64,
     host: u64,
 }
 
 /// The translated ranges, sorted and disjoint.
-static TABLE: RwLock<Vec<Translation>> = RwLock::new(Vec::new());
+pub(crate) static TABLE: RwLock<Vec<Translation>> = RwLock::new(Vec::new());
 
 fn table() -> std::sync::RwLockReadGuard<'static, Vec<Translation>> {
     TABLE.read().unwrap_or_else(|e| e.into_inner())

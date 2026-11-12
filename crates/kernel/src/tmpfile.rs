@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub const PREFIX: &[u8] = b".fwe-tmpfile-";
 
 /// Each descriptor's hidden file: its host path.
-static NAMES: Mutex<Vec<(i32, std::ffi::CString)>> = Mutex::new(Vec::new());
+pub(crate) static NAMES: Mutex<Vec<(i32, std::ffi::CString)>> = Mutex::new(Vec::new());
 /// Whether any is held (until then a close looks no further).
 static ANY: AtomicBool = AtomicBool::new(false);
 

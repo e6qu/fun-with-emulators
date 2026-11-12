@@ -570,7 +570,7 @@ impl Published {
 /// processes read it for `/proc/<pid>/maps`. It holds a sequence word
 /// (odd while a change is written), the length of what follows, and the
 /// encoded [`Published`].
-struct Outbox {
+pub(crate) struct Outbox {
     pid: i32,
     fd: i32,
     map: *mut u8,
@@ -580,7 +580,7 @@ struct Outbox {
 // SAFETY: the mapping is this process's own, used under `OUTBOX`'s lock.
 unsafe impl Send for Outbox {}
 
-static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
+pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
 
 /// The header before the encoded record: the sequence word and the length.
 const HEADER: usize = 16;

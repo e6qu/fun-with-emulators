@@ -3319,7 +3319,7 @@ fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
 }
 
 /// The affinity `sched_setaffinity` set for this process, if it did.
-static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
+pub(crate) static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
 
 /// The CPU the caller is taken to run on: the first of its affinity (the
 /// host's scheduler places it where it will).

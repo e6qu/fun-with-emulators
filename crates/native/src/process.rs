@@ -251,6 +251,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // The child's pid: in the child, its own namespace's; in the
         // parent, as the parent sees it.
         let shown = if pid == 0 {
+            // The parent's pending signals are not the child's: forgotten
+            // before any is taken (they stay blocked until the child enters
+            // guest code), once the locks held across the fork are free.
+            thread::forked();
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);
@@ -372,11 +376,6 @@ fn fork_with_signals_held(
         let pid = fork();
         // What a failed fork left, kept for the caller across the calls below.
         let saved = host::last_errno();
-        if pid == 0 {
-            // Before any signal sent to the child can be taken: the
-            // parent's pending ones are not the child's.
-            thread::forked();
-        }
         if pid > 0 {
             in_parent(pid);
         }
