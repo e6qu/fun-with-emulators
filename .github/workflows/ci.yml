@@ -228,7 +228,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/bench-cache
-          key: bench-cache-${{ hashFiles('guests/alpine/fetch/gcc.txt', 'tools/bench/run.py') }}
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'tools/bench/run.py') }}
       - uses: actions/download-artifact@v4
         with:
           name: bench-linux

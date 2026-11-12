@@ -9,9 +9,9 @@ project's build, under fwe, natively on macOS and natively on Linux.
     run.py macos --fwe FWE --bench BENCH --native NATIVE --cache DIR
                  [--linux linux.json] [--no-build] --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
-        source built for macOS) runs natively; Lua is built under FWE in an
-        Alpine root with GCC and make (guests/alpine/fetch/gcc.txt, fetched
-        into DIR), and natively with the host's compiler. With the Linux
+        source built for macOS) runs natively; Lua is built with clang
+        under FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched
+        into DIR), and natively with the host's clang. With the Linux
         results, a table of all three is printed (and appended to
         $GITHUB_STEP_SUMMARY). `--no-build` leaves the build out (Alpine's
         programs run only in CI).
@@ -138,15 +138,16 @@ def unpack_lua(tarball, into):
 
 def checked(cmd, retrace=None):
     """Run `cmd`; on failure, show the end of its output and, with
-    `retrace` (fwe's trace options), run it once more traced, then stop."""
+    `retrace` (the command made to trace itself), run it once more that
+    way, then stop."""
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode == 0:
         return
     print(f"failed ({r.returncode}): {' '.join(cmd)}", file=sys.stderr)
     print((r.stdout + r.stderr)[-4000:], file=sys.stderr)
     if retrace:
-        subprocess.run(cmd[:1] + retrace + cmd[1:], capture_output=True)
-        print(f"traced to {retrace[-1]}", file=sys.stderr)
+        subprocess.run(retrace(cmd), capture_output=True)
+        print("traced", file=sys.stderr)
     sys.exit(1)
 
 
@@ -157,7 +158,7 @@ def lua_build_s(cmd_for, src, retrace=None):
     def once():
         checked(cmd_for(["clean"]))
         start = time.perf_counter()
-        checked(cmd_for(["-j4", "posix"]), retrace)
+        checked(cmd_for(["-j4", "posix", "CC=clang"]), retrace)
         return time.perf_counter() - start
 
     return best(once, 3)
@@ -179,7 +180,7 @@ def linux(a):
         )
         try:
             subprocess.run(
-                ["docker", "exec", name, "apk", "add", "-q", "gcc", "make", "musl-dev", "binutils"],
+                ["docker", "exec", name, "apk", "add", "-q", "clang22", "gcc", "make", "musl-dev"],
                 check=True,
             )
             r["build Lua (s)"] = lua_build_s(
@@ -211,19 +212,21 @@ def macos(a):
 
 
 def build(a, fwe, results):
-    """Lua built under fwe with Alpine's GCC, in the root's /tmp, and
-    natively with the host's compiler."""
+    """Lua built with clang under fwe, in an Alpine root's /tmp (the guest
+    given only its own environment), and natively with the host's clang."""
     lua = fetch(*LUA, a.cache)
-    root = alpine_root("gcc", a.cache)
+    root = alpine_root("clang", a.cache)
     tmp = os.path.join(root, "tmp")
     os.makedirs(tmp, exist_ok=True)
     shutil.rmtree(os.path.join(tmp, "lua-5.4.7"), ignore_errors=True)
     src = unpack_lua(lua, tmp)
-    make = fwe + ["--root", root, os.path.join(root, "usr/bin/make"), "-C", "/tmp/lua-5.4.7"]
+    guest_env = ["env", "-i", "PATH=/usr/bin:/bin", "HOME=/root"]
+    make = guest_env + fwe + ["--root", root, os.path.join(root, "usr/bin/make")]
+    make += ["-C", "/tmp/lua-5.4.7"]
     trace = os.path.abspath("bench-trace.txt")
-    results["fwe"]["build Lua (s)"] = lua_build_s(
-        lambda args: make + args, src, ["--strace", f"--strace-file={trace}"]
-    )
+    i = len(guest_env) + 1  # after fwe itself
+    traced = lambda cmd: cmd[:i] + ["--strace", f"--strace-file={trace}"] + cmd[i:]  # noqa: E731
+    results["fwe"]["build Lua (s)"] = lua_build_s(lambda args: make + args, src, traced)
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
