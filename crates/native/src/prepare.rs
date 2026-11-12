@@ -60,6 +60,39 @@ pub fn stub_space(code: &[u8], page: u64) -> u64 {
     (sites * (STUB_WORDS as u64) * 4).div_ceil(page) * page + groups * page
 }
 
+/// The stub regions holding a stub for an instruction that writes `sp`
+/// from `x18`, as `(start, end)` pairs, for a signal to finish such a stub
+/// first ([`in_sp_stub_region`]). Few programs have one; past the table's
+/// room every pc is looked at.
+static SP_STUB_REGIONS: [std::sync::atomic::AtomicU64; 2 * 256] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2 * 256];
+static SP_STUB_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn note_sp_stub_region(start: u64, end: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let i = SP_STUB_COUNT.load(SeqCst);
+    if i < SP_STUB_REGIONS.len() / 2 {
+        SP_STUB_REGIONS[2 * i].store(start, SeqCst);
+        SP_STUB_REGIONS[2 * i + 1].store(end, SeqCst);
+    }
+    SP_STUB_COUNT.store(i + 1, SeqCst);
+}
+
+/// Whether `pc` may be in a stub for an instruction that writes `sp` from
+/// `x18`. Async-signal-safe.
+pub fn in_sp_stub_region(pc: u64) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let n = SP_STUB_COUNT.load(SeqCst);
+    if n > SP_STUB_REGIONS.len() / 2 {
+        return true;
+    }
+    (0..n).any(|i| {
+        let (start, end) =
+            (SP_STUB_REGIONS[2 * i].load(SeqCst), SP_STUB_REGIONS[2 * i + 1].load(SeqCst));
+        start <= pc && pc < end
+    })
+}
+
 /// Distance between candidate stub region placements.
 const PLACEMENT_STEP: u64 = 1 << 20;
 
@@ -167,6 +200,12 @@ unsafe fn redirect(
         // SAFETY: the site is writable guest code (caller's guarantee).
         unsafe { (at as *mut u32).write(jump) };
         cursor += (STUB_WORDS * 4) as u64;
+    }
+    if group
+        .iter()
+        .any(|&(_, site)| matches!(site, Site::X18 { insn } if crate::decode::x18_writes_sp(insn)))
+    {
+        note_sp_stub_region(region, region + size);
     }
     // SAFETY: making our stub region executable and visible to fetch.
     unsafe {

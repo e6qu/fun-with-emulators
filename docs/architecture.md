@@ -188,7 +188,9 @@ The pieces that do it:
   site;
 - `crates/native/src/decode.rs` decodes the operands of an instruction
   naming `x18`, so the stub can substitute a scratch register, adjust an
-  `sp` offset or rebuild a PC-relative or branch form;
+  `sp` offset or rebuild a PC-relative or branch form, and finds the forms
+  with stubs of their own (`casp`, writeback onto `sp`, `sp` written from
+  `x18`);
 - `crates/native/src/prepare.rs` groups sites so that one stub region
   reaches each group (a quarter of the branch range apart at most), takes
   the region from the loader's arena or reserves one near the code, writes
@@ -204,6 +206,11 @@ The pieces that do it:
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
   passing the code ranges it knows from the file's sections and unwind
   table; a failure is traced (see [Tracing](#tracing)).
+
+The stub for an instruction writing `sp` from `x18` sets `sp` before it
+reads its two scratch registers back from below the old `sp`; a signal
+delivered on those loads has them made first (`finish_sp_stub` in
+`crates/native/src/trap.rs`), so its frame cannot overwrite them.
 
 The trap handler keeps the `x18` slot and the kernel's register view in
 step: it reads the guest's `x18` into `Regs` and writes it back on return,
@@ -1060,10 +1067,12 @@ which are to be lifted for 1.0 and which are not planned.
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
   which needs `fwe` signed with the hypervisor entitlement and a
   bare-metal Apple Silicon Mac.
-- A few rare `x18` forms are left unrewritten (`--strace` counts them), as
-  is any `x18` use in JIT code. A binary without section headers has its
-  whole executable segment scanned, and an inline jump table in code the
-  unwind table covers could be patched.
+- The memory-tagging instructions with an `sp` operand, `casp` on `sp`,
+  an authenticated load written back onto `sp` and `blraa x18, x30` are
+  left unrewritten when they name `x18` (`--strace` counts them), as is
+  any `x18` use in JIT code. A binary with neither section headers nor an
+  unwind table has its whole executable segment taken as code, and an
+  inline jump table in code the unwind table covers could be patched.
 
 **Processes**
 - A `vfork` child shares the guest's memory but not its mappings (an

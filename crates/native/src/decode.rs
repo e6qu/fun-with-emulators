@@ -13,11 +13,13 @@
 //! else — the conservative answer, since an undecoded instruction is simply
 //! left alone rather than risk a wrong rewrite. The PC-relative forms,
 //! compare/test branches and indirect branches through `x18` have their own
-//! decoders here, since their stubs differ. What is still left alone — a
-//! load/store with writeback onto `sp`, a result written to `sp`, `casp`
-//! and the pointer-authenticated loads — is found by [`names_x18`], which
-//! knows the register fields of every non-SIMD group, so it can be counted
-//! exactly.
+//! decoders here, since their stubs differ, as do `casp` (register pairs), a
+//! load/store with writeback onto `sp` and a result written to `sp`. What is
+//! still left alone — the memory-tagging instructions with an `sp` operand
+//! (which no Apple CPU runs), `casp` on `sp`, a pointer-authenticated load
+//! written back onto `sp` and `blraa x18, x30` — is found by [`names_x18`],
+//! which knows the register fields of every non-SIMD group, so it can be
+//! counted exactly.
 
 /// A register operand: its field position (low bit) and access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +41,21 @@ fn reg(insn: u32, shift: u32) -> u32 {
 /// relocate and rewrite. `None` means "leave it alone" (unknown class,
 /// PC-relative, a branch, a load/store, or anything that uses `sp`).
 pub fn operands(insn: u32) -> Option<Vec<Field>> {
+    // System instructions with a general register: `mrs`/`msr` of a system
+    // register, `sys`/`sysl` (`dc civac, x18` and the like) and `wfet`/
+    // `wfit`. L (bit 21) set: the register is written. `TPIDR_EL0` never
+    // gets here (the thread-pointer stubs take it); `ctr_el0`, which macOS
+    // traps, is emulated as it traps, in the stub as anywhere.
+    if insn >> 22 == 0b11_0101_0100 {
+        let write = (insn >> 21) & 1 == 1;
+        let op0 = (insn >> 19) & 3;
+        let wfet = op0 == 0 && (insn >> 12) & 0xf == 0b0001 && !write;
+        if op0 == 0 && !wfet {
+            return None; // hints, barriers, `msr` of PSTATE fields
+        }
+        return Some(vec![Field { shift: RD, read: !write, write }]);
+    }
+
     // Move wide immediate: op[28:23] = 100101. opc[30:29]: 00=MOVN, 10=MOVZ,
     // 11=MOVK (01 is unallocated). MOVK preserves the other bits, so it reads
     // its destination as well as writing it.
@@ -170,14 +187,34 @@ pub fn operands(insn: u32) -> Option<Vec<Field>> {
     // one-source op (RBIT/CLZ/REV, Rd/Rn); bit 30 = 0 is two-source
     // (UDIV/LSLV/..., Rd/Rn/Rm).
     if (insn >> 21) & 0xff == 0b1101_0110 {
-        let mut f = vec![
-            Field { shift: RD, read: false, write: true },
-            Field { shift: RN, read: true, write: false },
-        ];
-        if (insn >> 30) & 1 == 0 {
-            f.push(Field { shift: RM, read: true, write: false });
+        let opcode = (insn >> 10) & 0x3f;
+        let rn = Field { shift: RN, read: true, write: false };
+        let rm = Field { shift: RM, read: true, write: false };
+        if (insn >> 30) & 1 == 1 {
+            // Pointer authentication (opcode2 00001): `pacia`/`autia` and
+            // the rest sign or check Rd in place, with the modifier in Rn
+            // (`sp` for 31); the zero-modifier forms and `xpaci`/`xpacd`
+            // have no Rn.
+            if (insn >> 16) & 0x1f == 0b00001 {
+                let rd = Field { shift: RD, read: true, write: true };
+                return match opcode {
+                    0..=7 => Some(vec![rd, rn]),
+                    8..=17 => Some(vec![rd]),
+                    _ => None,
+                };
+            }
+            return Some(vec![Field { shift: RD, read: false, write: true }, rn]);
         }
-        return Some(f);
+        let rd = Field { shift: RD, read: false, write: true };
+        let sp = |shift| reg(insn, shift) == 31;
+        return match opcode {
+            // `pacga`: Rm 31 is `sp`, through a scratch register.
+            0b001100 => Some(vec![rd, rn, rm]),
+            // The memory-tagging `subp`, `irg` and `gmi`, whose 31s are
+            // `sp`: left alone with one (no Apple CPU runs them).
+            0b000000 | 0b000100 | 0b000101 if sp(RD) || sp(RN) || sp(RM) => None,
+            _ => Some(vec![rd, rn, rm]),
+        };
     }
 
     // Data-processing (3-source): op[28:24] = 11011 (MADD/MSUB/SMULH/...).
@@ -272,7 +309,16 @@ fn load_store(insn: u32) -> Option<Vec<Field>> {
                 0b10 => {} // register offset
                 // The atomic memory operations.
                 0b00 if !v => return atomic(insn),
-                // Pointer-authenticated loads (x1), SIMD with bits 00: left alone.
+                // The pointer-authenticated loads (`ldraa`/`ldrab`, bits x1):
+                // Rt written, the base written back with W (bit 11). One on
+                // `sp` written back is left alone.
+                0b01 | 0b11 if !v && size == 0b11 => {
+                    let w = (insn >> 11) & 1 == 1;
+                    if sp_base && (w || sp_defer) {
+                        return None;
+                    }
+                    return Some(vec![Field { shift: RD, read: false, write: true }, base(w)]);
+                }
                 _ => return None,
             }
         }
@@ -315,12 +361,9 @@ fn load_store(insn: u32) -> Option<Vec<Field>> {
 
 /// The atomic memory operations (LSE: `ldadd`/`ldclr`/`ldeor`/`ldset`/
 /// `ldsmax`/…, their `st*` aliases, `swp`) and `ldapr`: Rs at the Rm position
-/// is read, Rt written, Rn the base. There is no immediate, so an `sp` base
-/// cannot absorb the stub's push and is left alone.
+/// is read, Rt written, Rn the base (`sp` through a scratch register: there
+/// is no immediate to absorb the stub's push).
 fn atomic(insn: u32) -> Option<Vec<Field>> {
-    if reg(insn, RN) == 31 {
-        return None;
-    }
     let o3 = (insn >> 15) & 1;
     let opc = (insn >> 12) & 7;
     let rs = Field { shift: RM, read: true, write: false };
@@ -336,12 +379,10 @@ fn atomic(insn: u32) -> Option<Vec<Field>> {
 /// Load/store exclusive (`ldxr`/`stxr`, `ldaxr`/`stlxr`, the pairs), the
 /// ordered loads and stores (`ldar`/`stlr`, `ldlar`/`stllr`) and
 /// compare-and-swap (`cas*`). A store-exclusive writes its status to Rs (at
-/// the Rm position); `cas` reads and writes Rs. `casp` names register pairs
-/// and is left alone, as is an `sp` base (no immediate to adjust).
+/// the Rm position); `cas` reads and writes Rs. An `sp` base goes through a
+/// scratch register (no immediate to adjust). `casp` names register pairs,
+/// which a stub of its own takes ([`x18_casp`]).
 fn exclusive(insn: u32) -> Option<Vec<Field>> {
-    if reg(insn, RN) == 31 {
-        return None;
-    }
     let o2 = (insn >> 23) & 1;
     let load = (insn >> 22) & 1 == 1;
     let o1 = (insn >> 21) & 1;
@@ -420,6 +461,20 @@ pub fn sp_fixup(insn: u32) -> SpFixup {
             SpFixup::Defer
         };
     }
+    // Pointer-authenticated loads: S:imm9 (bits 22, 20:12), scaled by 8.
+    if insn & 0xff20_0400 == 0xf820_0400 {
+        if (insn >> 11) & 1 == 1 {
+            return SpFixup::Defer; // writeback onto sp
+        }
+        let imm10 = ((((insn >> 22) & 1) << 9 | (insn >> 12) & 0x1ff) as i32) << 22 >> 22;
+        let n = imm10 + 4;
+        if !(-512..=511).contains(&n) {
+            return SpFixup::Defer;
+        }
+        let n = n as u32 & 0x3ff;
+        let base = insn & !((1 << 22) | (0x1ff << 12));
+        return SpFixup::Adjusted(base | ((n >> 9) << 22) | ((n & 0x1ff) << 12));
+    }
     // Unscaled / index / register-offset family.
     if insn & 0x3b00_0000 == 0x3800_0000 {
         if (insn >> 21) & 1 == 1 {
@@ -455,38 +510,110 @@ pub fn sp_fixup(insn: u32) -> SpFixup {
     SpFixup::NotSp
 }
 
-/// Whether `insn` takes `sp` as its base or first source (`Rn` = 31) in a
-/// form where a general register may stand in for it, and the stub must do
+/// The field of `insn` holding `sp` (`Rn`, or `Rm` for `pacga`) in a form
+/// where a general register may stand in for it, when the stub must do
 /// that: [`sp_fixup`] cannot fold the stub's push into an offset. The stub
 /// then holds `sp`'s value on entry in a scratch register and runs the
-/// instruction with that register as `Rn`. These are `add`/`sub` immediate
-/// and extended-register (flag-setting too, but not one that writes `sp`),
-/// and loads and stores without writeback (a register offset, or an offset
-/// the bump would push out of range).
-pub fn sp_base_scratch(insn: u32) -> bool {
-    if reg(insn, RN) != 31 || matches!(sp_fixup(insn), SpFixup::Adjusted(_)) {
-        return false;
+/// instruction with that register in the field. These are `add`/`sub`
+/// immediate and extended-register (flag-setting too, but not one that
+/// writes `sp`), loads and stores without writeback (a register offset, or
+/// an offset the bump would push out of range), the exclusive, ordered and
+/// atomic accesses, and the pointer-authentication modifiers.
+pub fn sp_scratch_field(insn: u32) -> Option<u32> {
+    // `pacga`: Rm 31 is `sp`.
+    if insn & 0xffe0_fc00 == 0x9ac0_3000 && reg(insn, RM) == 31 {
+        return Some(RM);
     }
+    if reg(insn, RN) != 31 || matches!(sp_fixup(insn), SpFixup::Adjusted(_)) {
+        return None;
+    }
+    let rn = |yes: bool| yes.then_some(RN);
     let flag_setting = (insn >> 29) & 1 == 1;
     let writes_sp = !flag_setting && reg(insn, RD) == 31;
     // Add/subtract (immediate), and (extended register).
     if (insn >> 24) & 0x1f == 0b10001 || (insn >> 24) & 0x1f == 0b01011 && (insn >> 21) & 1 == 1 {
-        return !writes_sp;
+        return rn(!writes_sp);
+    }
+    // `pacia`..`autdb`, whose modifier Rn 31 is `sp`.
+    if insn & 0xffff_e000 == 0xdac1_0000 {
+        return Some(RN);
+    }
+    // Exclusive, ordered and compare-and-swap (but `casp`, with pairs).
+    if (insn >> 24) & 0x3f == 0b001000 {
+        let casp = (insn >> 23) & 1 == 0 && (insn >> 21) & 1 == 1 && insn >> 31 == 0;
+        return rn(!casp);
     }
     // Single register (unsigned offset; unscaled, register offset), but
-    // not pre/post-index writeback or the atomics.
+    // not pre/post-index writeback; the atomics; the authenticated loads
+    // without writeback.
     if insn & 0x3b00_0000 == 0x3900_0000 {
-        return true;
+        return Some(RN);
     }
     if insn & 0x3b00_0000 == 0x3800_0000 {
         let bit21 = (insn >> 21) & 1 == 1;
         let idx = (insn >> 10) & 3;
-        return if bit21 { idx == 0b10 } else { idx == 0b00 || idx == 0b10 };
+        let v = (insn >> 26) & 1 == 1;
+        return rn(if bit21 {
+            idx == 0b10 || idx == 0b00 && !v || insn & 0xff20_0c00 == 0xf820_0400
+        } else {
+            idx == 0b00 || idx == 0b10
+        });
     }
     // Pair, signed offset or no-allocate (not pre/post-index).
     if insn & 0x3a00_0000 == 0x2800_0000 {
         let mode = (insn >> 23) & 3;
-        return mode == 0b10 || mode == 0b00;
+        return rn(mode == 0b10 || mode == 0b00);
+    }
+    None
+}
+
+/// Whether [`sp_scratch_field`] finds `sp` in `insn`'s `Rn`.
+pub fn sp_base_scratch(insn: u32) -> bool {
+    sp_scratch_field(insn) == Some(RN)
+}
+
+/// Whether `insn` is a `casp` (compare and swap a pair) that names `x18`
+/// in one of its pairs or as its base, which [`operands`] leaves to a stub
+/// of its own: the pairs must stay even-numbered pairs of registers. One
+/// on `sp` is left alone.
+pub fn x18_casp(insn: u32) -> bool {
+    insn & 0xbfa0_7c00 == 0x0820_7c00
+        && reg(insn, RN) != 31
+        && [RM, RD, RN].iter().any(|&f| reg(insn, f) == 18)
+}
+
+/// Whether `insn` is a general-purpose load or store, single or pair,
+/// written back onto `sp` (pre- or post-index) whose transfer register is
+/// `x18`: `str x18, [sp, #-16]!` and the like. Its stub runs it without the
+/// writeback and moves `sp` by the immediate after.
+pub fn x18_sp_writeback(insn: u32) -> bool {
+    if reg(insn, RN) != 31 || (insn >> 26) & 1 == 1 {
+        return false;
+    }
+    let single =
+        insn & 0x3b20_0400 == 0x3800_0400 && !(insn >> 30 == 0b11 && (insn >> 22) & 3 == 0b10);
+    let pair = insn & 0x3a00_0000 == 0x2800_0000 && (insn >> 23) & 1 == 1;
+    (single && reg(insn, RD) == 18) || (pair && (reg(insn, RD) == 18 || reg(insn, 10) == 18))
+}
+
+/// Whether `insn` writes `sp` from a value computed with `x18`: `mov sp,
+/// x18`, `add`/`sub` (immediate or extended register) or a logical
+/// immediate into `sp`, or a SIMD structure load or store on `sp` written
+/// back by `x18`. Its stub computes the new `sp` in a scratch register and
+/// moves it into `sp` last.
+pub fn x18_writes_sp(insn: u32) -> bool {
+    if reg(insn, RD) != 31 {
+        return insn & 0xbe80_0000 == 0x0c80_0000 && reg(insn, RN) == 31 && reg(insn, RM) == 18;
+    }
+    let flag_setting = (insn >> 29) & 1 == 1;
+    if (insn >> 24) & 0x1f == 0b10001 {
+        return !flag_setting && reg(insn, RN) == 18;
+    }
+    if (insn >> 24) & 0x1f == 0b01011 && (insn >> 21) & 1 == 1 {
+        return !flag_setting && (reg(insn, RN) == 18 || reg(insn, RM) == 18);
+    }
+    if (insn >> 23) & 0x3f == 0b100100 {
+        return (insn >> 29) & 3 != 0b11 && reg(insn, RN) == 18;
     }
     false
 }
@@ -527,16 +654,37 @@ pub fn x18_ldr_literal(insn: u32) -> bool {
     insn & 0x3b00_0000 == 0x1800_0000 && (insn >> 26) & 1 == 0 && insn & 0x1f == 18
 }
 
-/// If `insn` is an indirect branch (`br`/`blr`/`ret`) through `x18`, returns
-/// `Some(sets_link)` — true for `blr`. The target register is `Rn` (bits 9:5).
+/// If `insn` is an indirect branch through `x18` (`br`/`blr`/`ret`, and the
+/// authenticated `braa`/`blraa` and their `b` and zero-modifier forms),
+/// returns `Some(sets_link)` — true for the `blr` forms. The target register
+/// is `Rn` (bits 9:5); an authenticated one's modifier is `Rm` (bits 4:0,
+/// `sp` for 31). `blraa x18, x30` is left alone: its stub sets the link
+/// register before the branch reads the modifier.
 pub fn x18_indirect(insn: u32) -> Option<bool> {
-    if (insn >> 25) & 0x7f != 0b1101011 || (insn >> 5) & 0x1f != 18 {
+    if (insn >> 25) & 0x7f != 0b1101011 || reg(insn, RN) != 18 || (insn >> 16) & 0x1f != 0x1f {
         return None;
     }
-    match (insn >> 21) & 0xf {
-        0b0000 | 0b0010 => Some(false), // br, ret
-        0b0001 => Some(true),           // blr
-        _ => None,                      // authenticated variants: not handled
+    let z = (insn >> 24) & 1; // 1: a modifier register
+    let opc = (insn >> 21) & 0x3;
+    let auth = (insn >> 11) & 1 == 1;
+    if (insn >> 12) & 0xf != 0 || (insn >> 23) & 1 != 0 || (insn >> 22) & 1 == 1 && (z == 1 || auth)
+    {
+        return None;
+    }
+    if !auth && (z == 1 || (insn >> 10) & 1 != 0 || insn & 0x1f != 0) {
+        return None;
+    }
+    if auth && z == 0 && insn & 0x1f != 0x1f {
+        return None;
+    }
+    let link = opc == 0b01;
+    if link && auth && z == 1 && insn & 0x1f == 30 {
+        return None;
+    }
+    match opc {
+        0b00 | 0b10 => Some(false), // br, ret (and braa, brab)
+        0b01 => Some(true),         // blr (and blraa, blrab)
+        _ => None,
     }
 }
 
@@ -867,10 +1015,9 @@ mod tests {
         assert_eq!(operands(0xf8328020), Some(vec![rr(RM), rd(RD), rr(RN)]));
         // ldapr x18, [x1]
         assert_eq!(operands(0xf8bfc032), Some(vec![rd(RD), rr(RN)]));
-        // ldaddal x18, x0, [sp]: sp base, deferred
-        assert_eq!(operands(0xf8f203e0), None);
-        // ldraa x18, [x1]: pointer-authenticated load, deferred
-        assert_eq!(operands(0xf8200432), None);
+        // ldaddal x18, x0, [sp]: sp base, through a scratch register
+        assert_eq!(operands(0xf8f203e0), Some(vec![rr(RM), rd(RD), rr(RN)]));
+        assert!(sp_base_scratch(0xf8f203e0));
     }
 
     #[test]
@@ -896,8 +1043,10 @@ mod tests {
         assert_eq!(operands(0xc8e0fc32), Some(vec![rw(RM), rr(RD), rr(RN)]));
         // casp x0, x1, x2, x3, [x18]: register pairs, deferred
         assert_eq!(operands(0x48207e42), None);
-        // ldar x18, [sp]: sp base, deferred
-        assert_eq!(operands(0xc8dffff2), None);
+        // ldar x18, [sp]; stxr w18, x1, [sp]: sp base, through a scratch
+        assert_eq!(operands(0xc8dffff2), Some(vec![rd(RD), rr(RN)]));
+        assert_eq!(operands(0xc8127fe1), Some(vec![rd(RM), rr(RD), rr(RN)]));
+        assert!(sp_base_scratch(0xc8dffff2) && sp_base_scratch(0xc8127fe1));
     }
 
     #[test]
@@ -1021,6 +1170,82 @@ mod tests {
         assert!(!x18_branch(0x14000000)); // b
         // these are branches, so the register decoder leaves them alone
         assert_eq!(operands(0xb5000012), None);
+    }
+
+    /// System registers, `sys` and the pointer-authentication instructions
+    /// naming `x18`. Encodings from `llvm-mc`.
+    #[test]
+    fn system_and_pointer_authentication() {
+        let rw = Field { shift: RD, read: true, write: true };
+        assert_eq!(operands(0xd53be052), Some(vec![rd(RD)])); // mrs x18, cntvct_el0
+        assert_eq!(operands(0xd53b4212), Some(vec![rd(RD)])); // mrs x18, nzcv
+        assert_eq!(operands(0xd51b4412), Some(vec![rr(RD)])); // msr fpcr, x18
+        assert_eq!(operands(0xd50b7e32), Some(vec![rr(RD)])); // dc civac, x18
+        assert_eq!(operands(0xd503201f), None); // nop
+        assert_eq!(operands(0xdac103f2), Some(vec![rw, rr(RN)])); // pacia x18, sp
+        assert_eq!(sp_scratch_field(0xdac103f2), Some(RN));
+        assert_eq!(operands(0xdac10032), Some(vec![rw, rr(RN)])); // pacia x18, x1
+        assert_eq!(sp_scratch_field(0xdac10032), None);
+        assert_eq!(operands(0xdac10832), Some(vec![rw, rr(RN)])); // pacda x18, x1
+        assert_eq!(
+            operands(0xdac11241), // autia x1, x18
+            Some(vec![rw, rr(RN)])
+        );
+        assert_eq!(operands(0xdac123f2), Some(vec![rw])); // paciza x18
+        assert_eq!(operands(0xdac143f2), Some(vec![rw])); // xpaci x18
+        assert_eq!(operands(0x9adf3032), Some(vec![rd(RD), rr(RN), rr(RM)])); // pacga x18, x1, sp
+        assert_eq!(sp_scratch_field(0x9adf3032), Some(RM));
+        assert_eq!(operands(0x9ac23241), Some(vec![rd(RD), rr(RN), rr(RM)])); // pacga x1, x18, x2
+        assert_eq!(sp_scratch_field(0x9ac23241), None);
+        // The memory-tagging forms with an sp operand: left alone.
+        assert_eq!(operands(0x9adf13f2), None); // irg x18, sp
+        assert_eq!(operands(0x9ac103f2), None); // subp x18, sp, x1
+        assert!(names_x18(0x9adf13f2));
+        // ldraa x18, [x1, #8]; ldraa x1, [x18, #-16]! (base written back)
+        assert_eq!(operands(0xf8201432), Some(vec![rd(RD), rr(RN)]));
+        assert_eq!(
+            operands(0xf87fee41),
+            Some(vec![rd(RD), Field { shift: RN, read: true, write: true }])
+        );
+        // ldrab x18, [sp, #16] -> ldrab x18, [sp, #48]
+        assert_eq!(sp_fixup(0xf8a027f2), SpFixup::Adjusted(0xf8a067f2));
+        assert_eq!(operands(0xf8a027f2), Some(vec![rd(RD), rr(RN)]));
+        // ldraa x18, [sp, #-8]!: written back onto sp, left alone
+        assert_eq!(operands(0xf87ffff2), None);
+    }
+
+    /// Authenticated branches through `x18`. Encodings from `llvm-mc`.
+    #[test]
+    fn authenticated_indirect_branches() {
+        assert_eq!(x18_indirect(0xd71f0a41), Some(false)); // braa x18, x1
+        assert_eq!(x18_indirect(0xd61f0a5f), Some(false)); // braaz x18
+        assert_eq!(x18_indirect(0xd73f0a5f), Some(true)); // blraa x18, sp
+        assert_eq!(x18_indirect(0xd63f0e5f), Some(true)); // blrabz x18
+        assert_eq!(x18_indirect(0xd73f0a5e), None); // blraa x18, x30
+        assert_eq!(x18_indirect(0xd65f0bff), None); // retaa
+    }
+
+    /// The forms with stubs of their own: `casp`, writeback onto `sp`, and
+    /// a result in `sp`. Encodings from `llvm-mc`.
+    #[test]
+    fn casp_and_sp_writing_forms() {
+        for insn in [0x48327c02, 0x4862fc32, 0x08327c02, 0x48227e44] {
+            assert!(x18_casp(insn), "{insn:#x}");
+            assert_eq!(operands(insn), None, "{insn:#x}");
+        }
+        assert!(!x18_casp(0x48207c82)); // casp x0, x1, x2, x3, [x4]
+        assert!(!x18_casp(0x48327fe2)); // casp x18, x19, x2, x3, [sp]
+        for insn in [0xf81f0ff2, 0xf84107f2, 0xa9be4bfd, 0xa8c14ff2, 0xb8408ff2, 0xf8100ff2] {
+            assert!(x18_sp_writeback(insn), "{insn:#x}");
+        }
+        assert!(!x18_sp_writeback(0xf81f0c32)); // str x18, [x1, #-16]!
+        assert!(!x18_sp_writeback(0xf81f0fe0)); // str x0, [sp, #-16]!
+        for insn in [0x9100025f, 0x9100425f, 0xcb3263ff, 0x8b326bff, 0x927cee5f, 0x4cd273e0] {
+            assert!(x18_writes_sp(insn), "{insn:#x}");
+        }
+        assert!(!x18_writes_sp(0x910043ff)); // add sp, sp, #16
+        assert!(!x18_writes_sp(0x91000640)); // add x0, x18, #1
+        assert!(!x18_writes_sp(0xf2401e5f)); // tst x18, #0xff
     }
 
     #[test]

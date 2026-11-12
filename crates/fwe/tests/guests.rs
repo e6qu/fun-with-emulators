@@ -257,6 +257,8 @@ const ASM_GUESTS: &[&str] = &[
     "x18fp",
     "x18pc",
     "x18sig",
+    "x18rare",
+    "x18spsig",
     "fpsig",
     "efault",
     "sigmap",
@@ -2989,6 +2991,51 @@ fn asm_x18_across_signal_handler() {
     assert_eq!(fwe(&asm_guest("x18sig-pie"), &[]).status.code(), Some(0));
 }
 
+/// x18 through the rarer forms (guests/asm/x18rare.S): the thread pointer
+/// and system registers, pointer authentication, `casp`, exclusive and
+/// atomic accesses on sp, writeback onto sp, and sp written from x18. The
+/// exit status names the first check that failed.
+#[test]
+fn asm_x18_survives_the_rarer_forms() {
+    for name in ["x18rare", "x18rare-pie"] {
+        let out = fwe(&asm_guest(name), &[]);
+        assert_eq!(out.status.code(), Some(0), "{name}");
+        // Every x18 use rewritten.
+        let err = String::from_utf8_lossy(&out.stderr);
+        let prepared: Vec<&str> = err.lines().filter(|l| l.contains("x18 uses left")).collect();
+        assert!(!prepared.is_empty(), "{err}");
+        assert!(prepared.iter().all(|l| l.contains(" 0 x18 uses left")), "{prepared:?}");
+    }
+}
+
+/// A word among the code that reads as an `x18` instruction but that no
+/// unwind entry covers is data, left alone, in a binary with section
+/// headers and in one without (whose unwind table is found through
+/// `PT_GNU_EH_FRAME`).
+#[test]
+fn x18_lookalike_data_is_kept_without_section_headers() {
+    let bin = build_asm("x18data", &["-static", "--eh-frame-hdr", IMAGE_BASE]);
+    let mut data = std::fs::read(&bin).unwrap();
+    // e_shoff, e_shnum and e_shstrndx: no section headers.
+    data[0x28..0x30].fill(0);
+    data[0x3c..0x40].fill(0);
+    let stripped = bin.with_file_name("x18data-noshdr");
+    std::fs::write(&stripped, &data).unwrap();
+    std::fs::set_permissions(&stripped, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .unwrap();
+    for program in [&bin, &stripped] {
+        assert_eq!(fwe(program, &[]).status.code(), Some(0), "{}", program.display());
+    }
+}
+
+/// sp written from x18 while a fast timer's signals arrive: a signal in the
+/// last instructions of its stub finishes them before its frame is written
+/// (guests/asm/x18spsig.S).
+#[test]
+fn asm_x18_sp_stub_survives_signals() {
+    assert_eq!(fwe(&asm_guest("x18spsig-pie"), &[]).status.code(), Some(0));
+}
+
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
 /// thread that writes to the pipe could never make its own system call.
 #[test]
@@ -4448,6 +4495,7 @@ fn hv_runs_low_assembly_guests() {
         ("x18fp", 0),
         ("x18pc", 0),
         ("x18sig", 0),
+        ("x18rare", 0),
         ("sigtest", 0),
         ("fpsig", 0),
         ("signalfdtest", 0),

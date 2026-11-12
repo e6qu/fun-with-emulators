@@ -539,12 +539,94 @@ fn take_async(
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     let mut regs = regs_from(mc);
+    finish_sp_stub(&mut regs);
     k.deliver_pending(&mut regs);
     drop(guard);
     settle(&mut regs);
     regs_to(mc, &regs);
     // SAFETY: `ctx` is this handler's ucontext.
     unsafe { return_with_guest_mask(ctx) };
+}
+
+/// The `T` at host address `addr`, or `None` where nothing readable is,
+/// read through the host's copy of this task's memory, which reports a hole
+/// rather than fault. Async-signal-safe.
+fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn mach_vm_read_overwrite(
+                task: u32,
+                a: u64,
+                size: u64,
+                data: u64,
+                out: *mut u64,
+            ) -> i32;
+            static mach_task_self_: u32;
+        }
+        let mut v = T::default();
+        let size = std::mem::size_of::<T>() as u64;
+        let mut out = 0u64;
+        // SAFETY: copying `size` bytes into `v`, which has room for them.
+        let r = unsafe {
+            mach_vm_read_overwrite(mach_task_self_, addr, size, &mut v as *mut T as u64, &mut out)
+        };
+        (r == 0 && out == size).then_some(v)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = addr;
+        None
+    }
+}
+
+/// A thread stopped on one of the last two instructions of the stub for an
+/// instruction that writes `sp` from `x18` (`rewrite::x18_writes_sp_stub`):
+/// `mov sp, s1; ldur s1, [s2, #-16]; ldur s2, [s2, #-32]`. Those loads read
+/// the scratch registers back from below the old `sp`, which may be below
+/// the new one too, where a signal frame is about to be written: so they
+/// are made here first, and the thread goes on after them.
+fn finish_sp_stub(regs: &mut Regs) {
+    use crate::rewrite::LDUR;
+    let pc = regs.pc;
+    if !crate::prepare::in_sp_stub_region(pc) {
+        return;
+    }
+    let ldur = |imm: i32, n: u32, t: u32| LDUR | ((imm as u32) & 0x1ff) << 12 | n << 5 | t;
+    let mov_to_sp = |n: u32| 0x9100_001f | n << 5;
+    // Read as the host copies, which reports a hole rather than fault: a
+    // fault here, in a signal handler, would end the process.
+    let word = |a: u64| read_host::<u32>(a);
+    let Some(here) = word(pc) else { return };
+    let (n, t) = ((here >> 5) & 0x1f, here & 0x1f);
+    // On the first load: both are left.
+    let first = here == ldur(-16, n, t)
+        && word(pc.wrapping_sub(4)) == Some(mov_to_sp(t))
+        && word(pc + 4) == Some(ldur(-32, n, n));
+    // On the second: the first was made.
+    let second = t == n
+        && here == ldur(-32, n, n)
+        && word(pc.wrapping_sub(4)).is_some_and(|w| {
+            let s1 = w & 0x1f;
+            w == ldur(-16, n, s1) && word(pc.wrapping_sub(8)) == Some(mov_to_sp(s1))
+        });
+    if !first && !second {
+        return;
+    }
+    let base = regs.x[n as usize];
+    let read = read_host::<u64>;
+    if first {
+        let (Some(a), Some(b)) = (read(base.wrapping_sub(16)), read(base.wrapping_sub(32))) else {
+            return;
+        };
+        regs.x[t as usize] = a;
+        regs.x[n as usize] = b;
+        regs.pc = pc + 8;
+    } else {
+        let Some(b) = read(base.wrapping_sub(32)) else { return };
+        regs.x[n as usize] = b;
+        regs.pc = pc + 4;
+    }
 }
 
 /// Set the host disposition of relayed Linux signal `sig`.

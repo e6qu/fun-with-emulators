@@ -962,10 +962,10 @@ mod tests {
 const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
 
 /// The executable sections of the ELF file open at `fd`, as file-offset
-/// ranges, or `None` if it is not a readable regular ELF with section headers
-/// (then the caller translates the whole mapped region instead), with the
-/// file-offset ranges its unwind table says are code, if it has a usable
-/// one. Maps the file to read it, so the guest's file position is untouched.
+/// ranges (its executable segments' without section headers), or `None` if
+/// it is not a readable regular ELF (then the caller translates the whole
+/// mapped region instead), with the file-offset ranges its unwind table says
+/// are code, if it has a usable one. Maps the file to read it, so the guest's file position is untouched.
 type ExecFile = (Vec<(u64, u64)>, Option<Vec<(u64, u64)>>);
 fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
     if fd < 0 {
@@ -998,7 +998,7 @@ fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
     let data = unsafe { std::slice::from_raw_parts(map as *const u8, size) };
     let ranges = fwe_elf::Elf::parse(data)
         .ok()
-        .and_then(|elf| Some((elf.exec_file_ranges()?, elf.unwind_code_file_ranges())));
+        .map(|elf| (elf.exec_file_ranges(), elf.unwind_code_file_ranges()));
     // SAFETY: unmapping the mapping made above; `data` is not used again.
     unsafe { libc::munmap(map, size) };
     ranges

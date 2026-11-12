@@ -13,7 +13,7 @@ in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | In progress: LTP's system-call tests: all 1213 that apply pass (1551 run) |
+| M4 Compatibility | Done: all 1213 of LTP's system-call tests that apply pass (1551 run) |
 | M5 Release | Not started |
 
 What runs unmodified, with its output checked in CI:
@@ -55,8 +55,14 @@ unmodified.*
 namespaces; cgroups v2 with device programs; overlay mounts; seccomp and
 capabilities. *crun, podman and containerd run standard images.*
 
-**M4 — Compatibility, delivered so far.** LTP's system-call suite runs in CI
-against a baseline. Beyond M3:
+**M4 — Compatibility.** Every LTP system-call test that applies passes in
+CI, the rest listed with their reasons in `tools/ltp/exceptions.txt`;
+ptrace serves Alpine's `strace` and `gdb`; Docker Engine with BuildKit and
+Compose, and podman building, pushing, pulling and running rootless (and
+Debian's in the VM); Wine runs ARM64 Windows console programs under
+`fwe --vm`; the rare `x18` forms are rewritten, and a binary without section
+headers has its unwind table found through `PT_GNU_EH_FRAME`. *Each is
+tested end to end in CI.* Beyond M3:
 - **Processes and signals:** process descriptors (`pidfd_*`,
   `CLONE_PIDFD`, `waitid(P_PIDFD)`); real-time signals across processes;
   the parent-death signal; core dumps; resource limits; `CLONE_VM`
@@ -107,50 +113,6 @@ against a baseline. Beyond M3:
 
 **Done when:** the target programs run unmodified, those in the VM on real
 hardware.
-
-### M4 — Compatibility
-
-- [x] **ptrace for the debuggers:** processes and threads are traced,
-  attached to and seized (stops, registers, memory, breakpoints,
-  single-stepping, fork, clone, exec and exit events, interrupts and
-  group-stops, system-call information, the thread pointer); Alpine's
-  `strace` traces a shell and what it runs, and its `gdb` stops a C
-  program at a breakpoint, shows its frames and values and finishes a
-  function (CI's `debuggers` job).
-- [x] **Every LTP test that applies passes:** the rest are exceptions,
-  each with its reason; the runner names any skip that is not one. The
-  tests that measure time or load the host run one at a time, after the
-  rest; one that sleeps too long is measured against the host's own timers,
-  and is not failed when they, with fwe's least cost per sleep, are as
-  late, or were in that run.
-- [ ] **The `x18` and code-discovery gaps:** the rare `x18` forms and
-  binaries without section headers, when a program needs them.
-- [x] **Docker:** a distribution's Docker Engine (`dockerd` with its
-  containerd and runc, and the `docker` CLI), started with
-  `--bridge=none --iptables=false`, loads an image, runs a container of it
-  (`docker run` with `--network=none` or the host's network), builds one
-  from a Dockerfile (`docker build`, BuildKit), and Docker Compose brings
-  up a project of services that build, share a volume and depend on each
-  other; natively, with no VM.
-- [x] **Podman, further:** `podman build` (Buildah) from a Containerfile;
-  rootless podman as an ordinary user (a user namespace from
-  `/etc/subuid`, overlay storage); `podman push` to and `podman pull` from
-  a registry; Debian's podman (non-PIE, so in the VM) as well as Alpine's.
-- [x] **Wine, a showcase:** Windows programs run on the Mac through
-  Alpine's arm64 Wine 11 under `fwe --vm` (Windows images want 4 KiB
-  pages): `wineboot` sets up a prefix, `wine cmd /c` runs a batch command,
-  and a C program built for ARM64 Windows runs with its files, threads,
-  exceptions and child processes; the README shows it. Tested in CI on the
-  software stand-in for Hypervisor.framework; how Wine meets fwe is in
-  [linux-on-macos.md](docs/linux-on-macos.md#wine).
-
-**Done when:** every LTP system-call test passes in CI against the baseline,
-but those listed with their reason in `tools/ltp/exceptions.txt` (not
-planned for 1.0, or failing or skipping on Linux too with the same build);
-`strace` and `gdb` work on a guest program; Docker (with Compose) and
-podman build and run images, rootless podman included; Wine runs ARM64
-Windows console programs; each is tested end to end in CI, and the target
-programs and container engines keep passing.
 
 ### M5 — Release
 
