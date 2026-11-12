@@ -77,6 +77,13 @@ jobs:
           exit "$status"
       # The rest: the VM's tests ran in the step above.
       - run: cargo test -- --skip hv_
+      # Why the host killed a process outright (a lock misused in a signal
+      # handler, a guard violation), for a guest that died of SIGKILL.
+      - if: failure()
+        run: |
+          /usr/bin/log show --last 60m --style compact --predicate \
+            'eventMessage CONTAINS[c] "unrecoverable" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
+            | tail -200 || true
       # The whole trace of a container engine's step that failed.
       - if: failure()
         uses: actions/upload-artifact@v4
