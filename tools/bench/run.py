@@ -36,17 +36,31 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # The C project built: Lua 5.4.7's source.
 LUA = (
-    "https://www.lua.org/ftp/lua-5.4.7.tar.gz",
+    [
+        "https://www.lua.org/ftp/lua-5.4.7.tar.gz",
+        "https://www.tecgraf.puc-rio.br/lua/ftp/lua-5.4.7.tar.gz",
+    ],
     "9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30",
 )
 
 
-def fetch(url, sha256, cache):
-    """`url` into `cache`, checked against `sha256`."""
+def fetch(urls, sha256, cache):
+    """The file at the first of `urls` (one URL, or a list of mirrors) that
+    serves it, into `cache`, checked against `sha256`."""
+    urls = [urls] if isinstance(urls, str) else urls
+    url = urls[0]
     path = os.path.join(cache, os.path.basename(url))
     if not os.path.exists(path):
         os.makedirs(cache, exist_ok=True)
-        subprocess.run(["curl", "-sfL", "--retry", "3", "-o", path + ".part", url], check=True)
+        for u in urls:
+            r = subprocess.run(
+                ["curl", "-sfL", "--retry", "5", "--retry-all-errors", "-o", path + ".part", u]
+            )
+            if r.returncode == 0:
+                url = u
+                break
+        else:
+            sys.exit(f"could not fetch {urls}")
         os.replace(path + ".part", path)
     with open(path, "rb") as f:
         got = hashlib.sha256(f.read()).hexdigest()
