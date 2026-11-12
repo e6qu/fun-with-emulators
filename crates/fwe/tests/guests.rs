@@ -798,6 +798,23 @@ fn dynamic_glibc_hello_runs_through_libc_startup() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `--vm`: a program that would run natively (a dynamic PIE against glibc
+/// or musl) runs in the VM, with its 4 KiB pages.
+#[test]
+fn hv_vm_option_runs_a_pie_in_the_vm() {
+    for libc in [Libc::Glibc, Libc::Musl] {
+        let prog = build_c_dynamic("dynhello", libc, true);
+        let root = libc_rootfs(libc, "vm-hello");
+        let Some(mut cmd) = hv_command() else { return };
+        cmd.arg("--vm").arg("--strace").arg("--root").arg(&root).arg(&prog).arg("in the VM");
+        let out = run_hv(cmd, "dynhello --vm");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stdout(&out), "dynamic hello, in the VM\n");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("hypervisor backend: exe entry"), "not in the VM: {err}");
+    }
+}
+
 /// Real Debian coreutils: unmodified glibc programs from a Debian rootfs run
 /// and produce correct output. These are genuine distribution binaries, not
 /// built here — the whole chain (glibc dynamic linking, process startup, file

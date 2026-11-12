@@ -23,6 +23,9 @@ options:
   --hv-spike   check that the hypervisor backend can run here: a tiny guest
                in a VM (see docs/hypervisor.md; Apple Silicon, needs the
                entitlement)
+  --vm         run every program in the VM (the hypervisor backend), not
+               only those linked below 4 GiB: for programs that need 4 KiB
+               pages, such as Wine (must come first)
   --hv-standin run the hypervisor backend on a software stand-in for
                Hypervisor.framework instead of a real VM (for development
                and tests; needs Unicorn; must come first)
@@ -41,6 +44,7 @@ fn main() -> ExitCode {
     // These come first, as fwe passes them on to every process it starts
     // for the guest.
     let mut record = std::env::var("FWE_HV_RECORD").ok().filter(|s| !s.is_empty());
+    let mut vm = false;
     loop {
         match args.first().map(|a| a.as_bytes()) {
             Some(b"--hv-standin") => {
@@ -50,12 +54,27 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            Some(b"--vm") => {
+                args.remove(0);
+                vm = true;
+            }
             Some(b"--hv-record") if args.len() > 1 => {
                 args.remove(0);
                 record = Some(args.remove(0).to_string_lossy().into_owned());
             }
             _ => break,
         }
+    }
+    // Once the stand-in, which may follow it, is known.
+    if vm {
+        if !fwe_native::hv::usable() {
+            eprintln!(
+                "fwe: --vm needs the hypervisor backend: fwe with the hypervisor \
+                 entitlement on a Mac with hypervisor support, or --hv-standin"
+            );
+            return ExitCode::from(2);
+        }
+        fwe_native::hv::use_vm_always();
     }
     if let Some(spec) = record {
         if let Err(e) = fwe_native::hv::start_recording(&spec) {
@@ -211,13 +230,15 @@ fn main() -> ExitCode {
     ExitCode::from(126)
 }
 
-/// `--hv-standin` or `--hv-record` among fwe's own options after the first
+/// `--vm`, `--hv-standin` or `--hv-record` among fwe's own options after the first
 /// position (the guest's arguments, after its program, are not looked at).
 fn late_leading_option(args: &[OsString]) -> Option<String> {
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_bytes() {
-            b"--hv-standin" | b"--hv-record" => return Some(a.to_string_lossy().into_owned()),
+            b"--vm" | b"--hv-standin" | b"--hv-record" => {
+                return Some(a.to_string_lossy().into_owned());
+            }
             b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--probe" => {
                 i += 2
             }
