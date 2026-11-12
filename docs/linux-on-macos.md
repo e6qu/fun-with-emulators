@@ -2204,7 +2204,9 @@ flowchart LR
 
 A record's name carries a format number, so another fwe build never reads
 it. A record no live process holds is collected when a namespace is made
-and when a fresh fwe starts.
+and when a fresh fwe starts, at most once a minute (records younger than
+that are spared anyway), with the files a gone process left beside its
+record.
 
 ### Namespaces
 

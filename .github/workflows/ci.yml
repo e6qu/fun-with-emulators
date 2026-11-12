@@ -192,6 +192,50 @@ jobs:
             target/tmp/wine-traces
             target/tmp/samples
 
+  # The benchmarks (tools/bench/run.py): startup, system calls, threads,
+  # fork and exec, and Lua's build, natively on arm64 Linux here (Lua in an
+  # Alpine container, the GCC fwe's run uses) ...
+  bench-linux:
+    name: Benchmarks (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: gcc -O2 -static-pie -o bench guests/c/bench.c
+      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --out linux.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux
+          path: |
+            bench
+            linux.json
+
+  # ... then the same program under fwe and its source natively on macOS,
+  # and Lua built under fwe with Alpine's GCC: a table of the three in the
+  # run's summary.
+  bench:
+    name: Benchmarks (macos-26)
+    needs: bench-linux
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/bench-cache
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/gcc.txt', 'tools/bench/run.py') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-linux
+      - run: cargo build --release -p fwe
+      - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
+      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --cache target/bench-cache --linux linux.json --out macos.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: macos.json
+
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
   ltp:

@@ -23,6 +23,7 @@ rebuilt package fails its checksum.
 | `fetch/docker.txt` | The minirootfs (the test's root, and the `alpine` image's layer), Docker Engine 26.1.5 (`dockerd`), the docker CLI with its buildx 0.14 and Compose 2.27 plugins, containerd 1.7.17, runc 1.1.14, tini, iptables and their libraries (libmnl, libnftnl, libxtables, libseccomp) | 88 MB |
 | `fetch/podman-further.txt` | What `podman.txt` lists, distribution's registry 2.8.3 (`docker-registry`), and shadow's `newuidmap`/`newgidmap` with their libraries (shadow-libs, libbsd, libmd, linux-pam, skalibs, utmps) | 31 MB |
 | `fetch/wine.txt` | The 3.24.4 minirootfs (the test's root) and Wine 11.0, its Windows modules ARM64 PE (and its x86 and ARM64EC parts, unused) | 76 MB |
+| `fetch/gcc.txt` | The 3.24.4 minirootfs and GCC 15.2 with binutils 2.45, musl's headers, make 4.4 and their libraries (gmp, mpfr, mpc, isl, jansson, libstdc++, libgcc, libatomic, libgomp, zlib, zstd), for the benchmarks' C build (`tools/bench/run.py`, which also fetches Lua 5.4.7's source from lua.org, MIT) | 80 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
 
 ## License
@@ -34,7 +35,9 @@ podman, conmon, netavark, containers-common, containerd, ctr, runc,
 dockerd, the docker CLI, buildx, Compose and the registry Apache-2.0;
 shadow, libbsd and linux-pam BSD-3-Clause; libmd BSD-3-Clause,
 BSD-2-Clause, ISC, Beerware and public domain; skalibs and utmps ISC;
-tini MIT; Wine LGPL-2.1-or-later; iptables, libnftnl and libxtables GPL-2.0-or-later; libmnl
+tini MIT; Wine LGPL-2.1-or-later; GCC, libgcc, libstdc++, libatomic and
+libgomp GPL-3.0-or-later with the GCC Runtime Library Exception; binutils and
+make GPL-3.0-or-later; mpc LGPL-3.0-or-later; isl and jansson MIT; iptables, libnftnl and libxtables GPL-2.0-or-later; libmnl
 LGPL-2.1-or-later; catatonit
 GPL-2.0-or-later; gpgme LGPL-2.1-or-later and GPL-3.0-or-later; libassuan,
 glib and libintl LGPL-2.1-or-later; libgpg-error and libgcc
