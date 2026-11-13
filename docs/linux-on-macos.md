@@ -66,7 +66,9 @@ backend, its safety rules and its tests in [hypervisor.md](hypervisor.md).
   - [Kernel-wide state](#kernel-wide-state),
     [namespaces](#namespaces), [cgroups](#cgroups), [mounts](#mounts),
     [credentials and capabilities](#credentials-and-capabilities),
-    [seccomp](#seccomp), [devices](#devices)
+    [seccomp](#seccomp), [security modules](#security-modules-selinux-apparmor-landlock),
+    [seccomp profiles](#seccomp-profiles), [eBPF](#ebpf),
+    [isolation and security](#isolation-and-security), [devices](#devices)
   - [Time, scheduling and limits](#time-scheduling-and-limits)
   - [Not available](#not-available)
 - [macOS to Linux](#macos-to-linux)
@@ -2343,6 +2345,101 @@ Filters apply to every thread of the process and are kept across `fork`
 and `execve`. `SECCOMP_RET_TRAP` raises `SIGSYS` with Linux's `_sigsys`
 fields; `SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF` fail with
 `ENOSYS`, as with no tracer or listener.
+
+### Security modules: SELinux, AppArmor, Landlock
+
+Linux's security modules (LSMs) add checks to the kernel's own: SELinux
+labels every process and file and checks each access against a policy;
+AppArmor confines a program to what its profile lists; Landlock lets a
+process restrict itself. macOS has its own (the sandbox, SIP), which
+apply to the `fwe` process as to any other and know nothing of the
+guest.
+
+| Module | What fwe does | What a program sees |
+|---|---|---|
+| capabilities | Linux's five sets and securebits, enforced by fwe ([Credentials and capabilities](#credentials-and-capabilities)) | as on Linux |
+| Landlock | ABI 6: file rights by path, TCP ports, abstract sockets and signals, enforced by fwe (`landlock.rs`, `landlockops.rs`) | as on Linux, with the limits in [architecture.md](architecture.md#known-limitations) |
+| SELinux | none | no `/sys/fs/selinux`: SELinux is off, as on a distribution that does not use it |
+| AppArmor | none | no `/sys/kernel/security/apparmor`: AppArmor is absent |
+| the list | `/sys/kernel/security/lsm` and `lsm_list_modules` name `capability,landlock` | only the modules that act |
+
+Container tools look before they use a module: podman, crun, runc and
+Docker apply an AppArmor profile or an SELinux label only where the host
+has the module, so here they run without one (`--security-opt
+label=...` and `apparmor=...` have nothing to act on), as on a Linux host
+without them. Their seccomp profiles do apply: see the next section.
+
+### Seccomp profiles
+
+A container runtime turns a seccomp profile (Docker's default, podman's,
+or a pod's) into a classic BPF filter and installs it in the container's
+first process with `seccomp(SECCOMP_SET_MODE_FILTER)`. fwe runs the
+filter on every system call before either backend routes it
+([seccomp](#seccomp)), so the profile holds as it would on Linux: a call
+it refuses fails with the profile's errno, kills, or raises `SIGSYS`.
+CI's crun test runs a container with a profile and checks `Seccomp: 2` in
+its `/proc/self/status`. Two actions have no counterpart: a filter that
+answers `SECCOMP_RET_TRACE` or `SECCOMP_RET_USER_NOTIF` fails the call
+with `ENOSYS`, as Linux does with no tracer or listener.
+
+### eBPF
+
+On Linux, eBPF programs are loaded into the kernel, checked by its
+verifier, compiled to machine code and attached to hooks: sockets,
+cgroups, tracepoints, kprobes, network devices (XDP), the scheduler.
+macOS has none of it. fwe implements the part container runtimes and
+socket programs use (`crates/kernel/src/bpf.rs`, `bpfmap.rs`,
+`bpfcheck.rs`):
+
+- **Programs** are interpreted, not compiled. The interpreter checks
+  every memory access against the context and stack at run time and
+  stops a program after 2^20 steps, so a program can do nothing but
+  answer.
+- **Cgroup device programs** (`BPF_PROG_TYPE_CGROUP_DEVICE`), which runc,
+  crun and Docker attach to a container's cgroup to say which devices it
+  may use, run on every device open and `mknod` of the cgroup's members
+  ([cgroups](#cgroups)).
+- **Socket filters** (`BPF_PROG_TYPE_SOCKET_FILTER`, `SO_ATTACH_BPF`),
+  checked when loaded by a verifier for the subset fwe runs
+  (`bpfcheck.rs`, with a verifier log as Linux gives), run on what this
+  process sends to the socket.
+- **Maps**: array and hash maps, with the lookup, update and delete
+  helpers, kept in files of fwe's that every process holding a
+  descriptor shares.
+- A program of any other type loads and has an id, but is never
+  attached. Tracing (kprobes, tracepoints, `perf_event_open`), XDP and
+  traffic control, LSM programs, and the BPF filesystem are not there, so
+  `bpftrace`, Cilium and the like do not work.
+
+### Isolation and security
+
+Namespaces, cgroups, credentials, seccomp and Landlock are enforced by
+fwe, between the guest's system calls and the host. That is enough to
+run container runtimes and their containers as they expect, and to keep
+well-behaved programs apart (their own pids, mounts, network, ids). It
+is not a boundary against a program that sets out to cross it:
+
+- **The native backend** runs the program inside the `fwe` process. Its
+  code shares the address space with fwe's own code and data and with
+  macOS's libraries, so code that writes fwe's memory, jumps into
+  `libSystem`, or makes macOS's own system calls (`svc #0x80`, which fwe
+  does not rewrite) acts as the user who started `fwe`, with nothing of
+  fwe's in the way.
+- **The VM backend** keeps the guest's memory apart from fwe's: the guest
+  reaches the host only through its system calls and faults, which fwe
+  answers. That is a much smaller surface, but fwe's userspace kernel is
+  not hardened as a sandbox's is.
+- **Every guest process is the host user's.** What the guest thinks of
+  as root, a container's own user, or another user is the same macOS user
+  to the Mac: a file the guest may not write because of its virtual
+  owner is one the user's other programs can.
+- **macOS's own protections** (the sandbox, SIP, privacy consent, the
+  firewall) apply to `fwe` as to any program the user runs.
+
+So fwe isolates as a convenience, as `chroot` does, not as a security
+boundary, as a VM does. A program that must not be trusted is better run
+in a Linux VM (Lima, Colima, Apple's `container`; see
+[comparisons.md](comparisons.md)).
 
 ### Devices
 

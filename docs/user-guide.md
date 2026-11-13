@@ -214,6 +214,11 @@ that lacks it, and `--strace` names it.
   (ext4, btrfs) and block devices are not there.
 - **Resource limits of cgroups** but the process count: accepted, not
   enforced.
+- **A sandbox**: namespaces, seccomp and the rest keep well-behaved
+  programs apart, as containers expect, but a program run natively
+  shares the `fwe` process and acts as your user; run untrusted code in a
+  Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
+  [comparisons](comparisons.md)).
 - **Programs for other processors** (x86-64): `fwe` runs arm64 code only.
 - **Chosen process ids**: pids are the Mac's.
 - The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10),
