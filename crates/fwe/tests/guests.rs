@@ -4262,6 +4262,19 @@ fn a_binary_run_through_a_read_only_clone_sees_it() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// `/proc` reached through a descriptor of a procfs instance, as crun
+/// reaches it: one made with `fsmount`, and a clone of `/proc`.
+#[test]
+fn proc_is_read_through_a_detached_mount() {
+    let out = fwe(&rust_guest("mountapi"), &["procfd"]);
+    assert_eq!(
+        stdout(&out),
+        "fsmount proc: cap_last_cap 40\nopen_tree /proc: cap_last_cap 40\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// What the `nsfd` guest prints.
 const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
     nstype 0x4000000, parent of a UTS namespace refused true\n\

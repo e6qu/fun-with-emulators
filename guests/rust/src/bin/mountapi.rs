@@ -6,6 +6,9 @@
 //! under a shared one reaching a child's copy of the namespace; and the
 //! mount flags and a busy mount enforced. It prints what it observed.
 //!
+//! `mountapi procfd` reads `/proc` through a descriptor of a procfs
+//! instance, made with `fsmount` and cloned with `open_tree`.
+//!
 //! `mountapi selfclone` does what crun and runc do to run a copy of
 //! themselves no container can write: unless `/proc/self/exe` is on a
 //! read-only mount, it clones its own binary's mount (`open_tree`), makes
@@ -140,8 +143,41 @@ fn self_clone(again: bool) {
     }
 }
 
+/// `/proc` reached through a descriptor of a procfs instance, as crun
+/// reaches it: one made with `fsopen`/`fsmount`, and a clone of `/proc`
+/// (`open_tree`); a file read relative to each.
+fn proc_fd() {
+    const OPEN_TREE_CLONE: u32 = 1;
+    let read_at = |dfd: i32| {
+        let mut buf = [0u8; 16];
+        // SAFETY: a NUL-terminated path; a live buffer of its length.
+        unsafe {
+            let fd = syscall(56, dfd, c"sys/kernel/cap_last_cap".as_ptr(), 0i64, 0i64) as i32;
+            if fd < 0 {
+                return format!("open failed ({})", *__errno_location());
+            }
+            let n = read(fd, buf.as_mut_ptr(), buf.len());
+            close(fd);
+            String::from_utf8_lossy(&buf[..n.max(0) as usize]).trim().to_string()
+        }
+    };
+    // SAFETY: plain calls with NUL-terminated strings.
+    unsafe {
+        let fs = syscall(SYS_FSOPEN, c"proc".as_ptr(), 0u32) as i32;
+        syscall(SYS_FSCONFIG, fs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
+        let mnt = syscall(SYS_FSMOUNT, fs, 0u32, 0u64) as i32;
+        println!("fsmount proc: cap_last_cap {}", read_at(mnt));
+        let tree = syscall(SYS_OPEN_TREE, AT_FDCWD, c"/proc".as_ptr(), OPEN_TREE_CLONE) as i32;
+        println!("open_tree /proc: cap_last_cap {}", read_at(tree));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("procfd") {
+        proc_fd();
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("selfclone") {
         self_clone(args.get(2).map(String::as_str) == Some("again"));
         return;

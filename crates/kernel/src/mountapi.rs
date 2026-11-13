@@ -104,6 +104,18 @@ pub(crate) fn detached_root(fd: i32) -> Option<(u32, u64, crate::mounts::FsType)
     with(&TREES, |m| m.get(&k).and_then(|t| t.first()).map(|r| (r.id, r.flags, r.fstype)))
 }
 
+/// For a descriptor of a detached tree of one of fwe's synthetic
+/// filesystems (`proc`, `sysfs`), its type and the path inside it the tree
+/// shows: what a path relative to the descriptor reads.
+pub(crate) fn detached_synthetic(fd: i32) -> Option<(crate::mounts::FsType, Vec<u8>)> {
+    use crate::mounts::FsType;
+    let k = tree_key(fd)?;
+    with(&TREES, |m| {
+        let r = m.get(&k)?.first()?;
+        matches!(r.fstype, FsType::Proc | FsType::Sysfs).then(|| (r.fstype, r.root.clone()))
+    })
+}
+
 /// `fd` is closed: a context or tree it was the last descriptor of goes.
 pub fn closed(fd: i32) {
     if fdmarks::shared_elsewhere(fd) {

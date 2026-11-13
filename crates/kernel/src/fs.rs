@@ -744,6 +744,15 @@ impl Fs {
             // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).
             return None;
         }
+        // Relative to a detached tree of `proc` or `sysfs` (crun reaches
+        // `/proc` through one it makes with `fsmount`): that filesystem's
+        // file, whatever is mounted where.
+        if path.first() != Some(&b'/')
+            && let Some((fstype, root)) = crate::mountapi::detached_synthetic(dirfd)
+        {
+            let base = if fstype == FsType::Proc { &b"/proc"[..] } else { &b"/sys"[..] };
+            return self.synthetic_entry(mounts::join(base, &normalize(&root, path)));
+        }
         let absolute = self.absolute(dirfd, path)?;
         let (m, fs_path) = self.mount_of(&absolute);
         if m.fstype != FsType::Nsfs
@@ -778,6 +787,13 @@ impl Fs {
             }
             _ => return None,
         };
+        self.synthetic_entry(absolute)
+    }
+
+    /// What fwe's `/proc` or `/sys` holds at `absolute` (a path starting
+    /// `/proc` or `/sys`, as that filesystem shows it), whatever is
+    /// mounted where.
+    fn synthetic_entry(&self, absolute: Vec<u8>) -> Option<crate::procfs::Entry> {
         // /proc/<pid>: the reader's own is /proc/self; another, what fwe
         // knows of it.
         let absolute = match own_or_other(&absolute) {
