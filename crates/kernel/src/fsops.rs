@@ -198,6 +198,19 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
     stat_at_with(dir, name, libc::AT_SYMLINK_NOFOLLOW)
 }
 
+/// [`stat_at`] of what `r` resolved to, the host's view taken from the
+/// lookup where it looked.
+fn resolved_stat(r: &crate::fs::Resolved) -> Option<libc::stat> {
+    let mut out = r.lstat()?;
+    let name = r.name_c().ok()?;
+    let dir = r.dir.as_raw_fd();
+    let perm = crate::modes::guest_perm_at(dir, &name, &out);
+    let owner = crate::owners::of_at(dir, &name, &out);
+    crate::modes::apply(&mut out, perm);
+    crate::owners::apply(&mut out, owner);
+    Some(out)
+}
+
 /// [`stat_at`] with `fstatat` flags `flags`.
 fn stat_at_with(dir: i32, name: &CString, flags: i32) -> Result<libc::stat, i32> {
     // SAFETY: `out` is a valid out-parameter; `name` is NUL-terminated.
@@ -738,8 +751,7 @@ impl<P: Platform> Kernel<P> {
             // to read with O_CREAT; a device, FIFO or socket to write as
             // well (Linux refuses only regular files, directories and
             // links), and one in an overlay is not copied up to be.
-            let found =
-                resolved.name_c().ok().and_then(|n| stat_at(resolved.dir.as_raw_fd(), &n).ok());
+            let found = resolved_stat(&resolved);
             let exists = found.is_some();
             let special = found.is_some_and(|st| {
                 crate::devnodes::marked(&st)
@@ -788,7 +800,7 @@ impl<P: Platform> Kernel<P> {
         // An existing file's kept mode, for a caller that does not pass
         // permission bits; a new one is made with what its owner must have
         // on the host ([`crate::modes`]).
-        let existing = stat_at(resolved.dir.as_raw_fd(), &name).ok();
+        let existing = resolved_stat(&resolved);
         // A lease on the file this open conflicts with is broken first.
         if let Some(st) = &existing
             && st.st_mode & libc::S_IFMT == libc::S_IFREG

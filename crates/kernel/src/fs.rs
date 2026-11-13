@@ -130,6 +130,10 @@ pub struct Resolved {
     /// What [`Resolved::prepare`] set up for a file being made in an
     /// overlay, which [`Resolved::finish`] puts in place.
     created: Option<overlay::Created>,
+    /// The host's `lstat` of the name as the lookup saw it (`Err` with the
+    /// host's error), when the lookup looked at it: callers that would
+    /// look again take this.
+    pub(crate) seen: Option<Result<libc::stat, i32>>,
 }
 
 /// Where a resolved name is in an overlay mount ([`crate::overlay`]).
@@ -178,8 +182,27 @@ impl Resolved {
     /// after which [`dir`](Self::dir) and [`name`](Self::name) are where the
     /// call acts. A call that makes a file calls [`finish`](Self::finish)
     /// once it has.
+    /// The host's `lstat` of the name: as the lookup saw it, or looked at
+    /// now.
+    pub(crate) fn lstat(&self) -> Option<libc::stat> {
+        if let Some(seen) = self.seen {
+            return seen.ok();
+        }
+        let name = self.name_c().ok()?;
+        // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a live directory, a NUL-terminated name, a valid
+        // out-parameter.
+        let r = unsafe {
+            libc::fstatat(self.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+        };
+        (r == 0).then_some(st)
+    }
+
     pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
         self.writable()?;
+        // What it sets up is looked at afresh.
+        self.seen = None;
         let Some(o) = &self.ovl else { return Ok(()) };
         let upper = o.layers.upper.is_some();
         let dir = match (&o.found, how) {
@@ -251,6 +274,7 @@ impl Resolved {
             mount_id: 0,
             ovl: None,
             created: None,
+            seen: None,
         }
     }
 }
@@ -2195,6 +2219,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             mount_root,
             ovl,
             created: None,
+            seen: None,
         })
     };
 
@@ -2207,6 +2232,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     // Whether to try a run of plain names in one host lookup (see
     // `plain_run`); off once one failed, until a link is followed.
     let mut whole_runs = !check_search;
+    let mut seen = None;
     while let Some(comp) = pending.pop() {
         if whole_runs && let Some((dir, at, n)) = plain_run(&table, &here, &comp, &pending) {
             pending.truncate(pending.len() + 1 - n);
@@ -2427,6 +2453,35 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 }
                 overlay::Found::Other { .. } => Step::Other,
             }
+        } else if is_last {
+            // The last name is looked at, not read as a link: what it is
+            // serves the caller too ([`Resolved::seen`]).
+            // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: a live directory, a NUL-terminated name, a valid
+            // out-parameter.
+            let r = unsafe {
+                libc::fstatat(
+                    here.dir.as_raw_fd(),
+                    comp_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            match (r, e()) {
+                (0, _) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+                    Step::Link(readlink_at(here.dir.as_raw_fd(), &comp_c)?)
+                }
+                (0, _) => {
+                    seen = Some(Ok(st));
+                    Step::Other
+                }
+                (_, errno::ENOENT) => {
+                    seen = Some(Err(libc::ENOENT));
+                    Step::Missing
+                }
+                (_, other) => return Err(other),
+            }
         } else {
             match readlink_at(here.dir.as_raw_fd(), &comp_c) {
                 Ok(target) => Step::Link(target),
@@ -2467,7 +2522,11 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 parts.reverse();
                 pending.extend(parts);
             }
-            Step::Other | Step::OvlDir(_) if is_last => return done(here, comp, false),
+            Step::Other | Step::OvlDir(_) if is_last => {
+                let mut r = done(here, comp, false)?;
+                r.seen = seen;
+                return Ok(r);
+            }
             Step::Other => {
                 let child = open_dir(here.dir.as_raw_fd(), &comp_c)?;
                 let at = here.at.as_ref().map(|(id, ns)| (*id, mounts::join(ns, &comp)));
@@ -2496,7 +2555,9 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     continue;
                 }
                 if is_last {
-                    return done(here, comp, false);
+                    let mut r = done(here, comp, false)?;
+                    r.seen = seen;
+                    return Ok(r);
                 }
                 return Err(errno::ENOENT);
             }
@@ -2718,14 +2779,8 @@ fn fifo_to_wait_for(r: &Resolved, flags: u64) -> bool {
     if r.ovl.is_some() || writes && r.writable().is_err() || r.name == b"." {
         return false;
     }
-    let Ok(name) = r.name_c() else { return false };
-    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
-    let found = unsafe {
-        libc::fstatat(r.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
-    } == 0;
-    found && st.st_mode & libc::S_IFMT == libc::S_IFIFO && !crate::modes::marked(&st)
+    let Some(st) = r.lstat() else { return false };
+    st.st_mode & libc::S_IFMT == libc::S_IFIFO && !crate::modes::marked(&st)
 }
 
 /// A resolution [`open_fifo_unlocked`] made for an `openat` that waits for
