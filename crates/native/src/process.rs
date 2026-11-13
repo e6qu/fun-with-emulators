@@ -66,6 +66,7 @@ pub fn do_execveat(regs: &Regs) -> Result<Regs, i64> {
 /// environment. Returns the new program's registers, or a negated errno
 /// while the old program is still intact.
 fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<Regs, i64> {
+    fwe_kernel::tmark("exec");
     let mut guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     let k = guard.as_mut().unwrap();
     let page = page_size();
@@ -77,6 +78,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let fs = k.fs.as_ref().expect("filesystem configured");
     k.may_exec(&path).map_err(err)?;
     let file = fs.read(&path).map_err(err)?;
+    fwe_kernel::tmark("x read");
     let vm = crate::needs_vm(&file);
     // A program only the VM can run, where there is none: the exec fails
     // while the caller is intact (podman's pause process then waits in a
@@ -108,8 +110,10 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // The point of no return: the old program's memory goes, and a vfork
     // parent may resume. The robust futexes its threads hold are released
     // first.
+    fwe_kernel::tmark("x checked");
     fwe_kernel::release_robust_lists();
     fwe_kernel::mm::release_guest_memory();
+    fwe_kernel::tmark("x released");
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
         // SAFETY: closing the pipe end this child holds for its parent.
@@ -125,8 +129,10 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         }
     };
 
+    fwe_kernel::tmark("x loaded");
     k.close_on_exec();
     k.exec_reset();
+    fwe_kernel::tmark("x reset");
     k.brk = out.brk;
     if let Some(fs) = k.fs.as_mut() {
         fs.set_exe_fd(exe_fd);
@@ -135,6 +141,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         fs.set_auxv(out.auxv);
         fs.publish();
     }
+    fwe_kernel::tmark("x done");
     // The new program starts with every register zero, as Linux leaves it;
     // the trap handler returns into it.
     Ok(Regs { sp: out.sp, pc: out.entry, ..Regs::default() })
@@ -254,6 +261,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // The parent's pending signals are not the child's: forgotten
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
+            fwe_kernel::tmark("forked child");
             thread::forked();
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.

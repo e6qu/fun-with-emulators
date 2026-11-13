@@ -399,9 +399,13 @@ impl Fs {
         let fd = crate::fdtable::reserve(fd)?;
         // SAFETY: `fd` is a fresh owned directory descriptor.
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        crate::tmark("  fs open");
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
+        crate::tmark("  fs fdpath");
         let shm = shm::dir_path(&root_host).ok();
+        crate::tmark("  fs shm");
         let mnt = Arc::new(Ns::initial(&root_host, shm.as_deref())?);
+        crate::tmark("  fs ns");
         Ok(Fs {
             root,
             cwd: b"/".to_vec(),
@@ -427,7 +431,9 @@ impl Fs {
         let exe = if self.proc.exe_fd.is_some() { exe } else { self.program_path(&exe) };
         let exe_fd = self.proc.exe_fd;
         let auxv = std::mem::take(&mut self.proc.auxv);
+        crate::tmark("  pi path");
         crate::procreg::own_program(&exe, &cmdline);
+        crate::tmark("  pi own");
         // The program's file, for `/proc/self/maps`: through the descriptor
         // it was run by, if it has no path.
         let id = match exe_fd {
@@ -443,7 +449,9 @@ impl Fs {
         if let Some((dev, ino)) = host_id {
             crate::textbusy::running(dev, ino);
         }
+        crate::tmark("  pi ids");
         crate::maps::publish();
+        crate::tmark("  pi maps");
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
     }
 

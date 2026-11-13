@@ -613,6 +613,7 @@ pub fn collect() {
     use std::collections::HashSet;
     use std::os::unix::ffi::OsStrExt;
     let Ok(base) = crate::fs::shm::user_dir() else { return };
+    crate::tmark("  userdir");
     let os = |p: &[u8]| std::ffi::OsStr::from_bytes(p).to_owned();
     let marker = os(&[&base[..], format!("/v{FORMAT}-collected").as_bytes()].concat());
     let recent = std::fs::metadata(&marker)

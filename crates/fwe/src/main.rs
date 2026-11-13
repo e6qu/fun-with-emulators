@@ -38,6 +38,7 @@ options:
 ";
 
 fn main() -> ExitCode {
+    fwe_native::tmark("main");
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -98,6 +99,7 @@ fn main() -> ExitCode {
         eprintln!("fwe: {late} must come first\n{USAGE}");
         return ExitCode::from(2);
     }
+    fwe_native::tmark("args");
     let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {
@@ -126,13 +128,15 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" => {
+            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--user-dir" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
                     return ExitCode::from(2);
                 };
-                if flag == "--cwd" {
+                if flag == "--user-dir" {
+                    fwe_native::adopt_user_dir(value.as_bytes());
+                } else if flag == "--cwd" {
                     options.cwd = Some(value.as_bytes().to_vec());
                 } else if flag == "--exec-state" {
                     options.exec_state = Some(value.as_bytes().to_vec());

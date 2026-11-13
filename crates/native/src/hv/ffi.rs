@@ -58,60 +58,133 @@ pub const HV_MEMORY_READ: u64 = 1;
 pub const HV_MEMORY_WRITE: u64 = 2;
 pub const HV_MEMORY_EXEC: u64 = 4;
 
-/// The framework itself.
-mod framework {
+/// The framework itself, loaded on first use: linking it would cost every
+/// process its loading at startup, and most never run a VM.
+pub(super) mod framework {
     use super::*;
+    use std::sync::OnceLock;
 
-    #[link(name = "Hypervisor", kind = "framework")]
-    unsafe extern "C" {
-        pub fn hv_vm_config_create() -> hv_vm_config_t;
-        pub fn hv_vm_config_set_ipa_size(
-            config: hv_vm_config_t,
-            ipa_bit_length: u32,
-        ) -> hv_return_t;
-        pub fn hv_vm_config_get_max_ipa_size(ipa_bit_length: *mut u32) -> hv_return_t;
-        pub fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t;
-        pub fn hv_vm_destroy() -> hv_return_t;
-        pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t;
-        pub fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t;
-        pub fn hv_vcpu_create(
-            vcpu: *mut hv_vcpu_t,
-            exit: *mut *mut hv_vcpu_exit_t,
-            config: *mut c_void,
-        ) -> hv_return_t;
-        pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
-        pub fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
-        pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t;
-        pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t;
-        pub fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t;
-        pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;
-        pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t;
-        pub fn hv_vcpu_get_sys_reg(
-            vcpu: hv_vcpu_t,
-            reg: hv_sys_reg_t,
-            value: *mut u64,
-        ) -> hv_return_t;
-        pub fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) -> hv_return_t;
-        pub fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u128) -> hv_return_t;
-        // Takes the value by value in `q0`, which Rust cannot pass; called
-        // only through [`set_simd_fp_reg`], so its real signature does not
-        // matter.
-        fn hv_vcpu_set_simd_fp_reg();
+    /// `HV_ERROR`: what a call returns when the framework cannot be loaded.
+    const HV_ERROR: hv_return_t = 0xfae9_4001_u32 as i32;
+
+    macro_rules! table {
+        ($(fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty = $fail:expr;)*) => {
+            /// The framework's entry points, all resolved at once (a call
+            /// made in a signal handler then never resolves one).
+            #[allow(non_snake_case)]
+            struct Table {
+                $($name: Option<unsafe extern "C" fn($($ty),*) -> $ret>,)*
+                hv_vcpu_set_simd_fp_reg: Option<unsafe extern "C" fn()>,
+            }
+
+            fn load() -> Table {
+                // SAFETY: loading a system framework by its absolute path.
+                let h = unsafe {
+                    libc::dlopen(
+                        c"/System/Library/Frameworks/Hypervisor.framework/Hypervisor".as_ptr(),
+                        libc::RTLD_NOW | libc::RTLD_LOCAL,
+                    )
+                };
+                let sym = |name: &std::ffi::CStr| -> *mut c_void {
+                    if h.is_null() {
+                        return std::ptr::null_mut();
+                    }
+                    // SAFETY: looking up a symbol in the handle just opened.
+                    unsafe { libc::dlsym(h, name.as_ptr()) }
+                };
+                Table {
+                    $(
+                        // SAFETY: the symbol of this name has this signature
+                        // (Hypervisor.framework's headers); null is None.
+                        $name: unsafe {
+                            std::mem::transmute::<*mut c_void, Option<unsafe extern "C" fn($($ty),*) -> $ret>>(
+                                sym(&std::ffi::CString::new(stringify!($name)).unwrap()),
+                            )
+                        },
+                    )*
+                    // SAFETY: as above; called only through `set_simd_fp_reg`.
+                    hv_vcpu_set_simd_fp_reg: unsafe {
+                        std::mem::transmute::<*mut c_void, Option<unsafe extern "C" fn()>>(
+                            sym(c"hv_vcpu_set_simd_fp_reg"),
+                        )
+                    },
+                }
+            }
+
+            $(
+                /// # Safety
+                /// As for the framework call of this name.
+                pub unsafe fn $name($($arg: $ty),*) -> $ret {
+                    match table().$name {
+                        // SAFETY: the caller keeps the framework's contract.
+                        Some(f) => unsafe { f($($arg),*) },
+                        None => $fail,
+                    }
+                }
+            )*
+        };
     }
 
-    /// `hv_vcpu_set_simd_fp_reg(vcpu, reg, *value)`: load the 16 bytes into
-    /// `q0`, where the framework expects them, and tail-call it.
+    fn table() -> &'static Table {
+        static TABLE: OnceLock<Table> = OnceLock::new();
+        TABLE.get_or_init(load)
+    }
+
+    table! {
+        fn hv_vm_config_create() -> hv_vm_config_t = std::ptr::null_mut();
+        fn hv_vm_config_set_ipa_size(config: hv_vm_config_t, ipa_bit_length: u32) -> hv_return_t
+            = HV_ERROR;
+        fn hv_vm_config_get_max_ipa_size(ipa_bit_length: *mut u32) -> hv_return_t = HV_ERROR;
+        fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t = HV_ERROR;
+        fn hv_vm_destroy() -> hv_return_t = HV_ERROR;
+        fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t
+            = HV_ERROR;
+        fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t = HV_ERROR;
+        fn hv_vcpu_create(
+            vcpu: *mut hv_vcpu_t,
+            exit: *mut *mut hv_vcpu_exit_t,
+            config: *mut c_void
+        ) -> hv_return_t = HV_ERROR;
+        fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t = HV_ERROR;
+        fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t = HV_ERROR;
+        fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t
+            = HV_ERROR;
+        fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t = HV_ERROR;
+        fn hv_vcpus_exit(vcpus: *mut hv_vcpu_t, count: u32) -> hv_return_t = HV_ERROR;
+        fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t
+            = HV_ERROR;
+        fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t
+            = HV_ERROR;
+        fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: *mut u64)
+            -> hv_return_t = HV_ERROR;
+        fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) -> hv_return_t
+            = HV_ERROR;
+        fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u128) -> hv_return_t
+            = HV_ERROR;
+    }
+
+    /// `hv_vcpu_set_simd_fp_reg(vcpu, reg, *value)`, which takes the value
+    /// by value in `q0`, which Rust cannot pass.
     ///
     /// # Safety
     /// `value` must point to 16 readable bytes; `vcpu` must be the calling
     /// thread's vCPU.
+    pub unsafe fn set_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *const u128) -> hv_return_t {
+        let Some(f) = table().hv_vcpu_set_simd_fp_reg else { return HV_ERROR };
+        // SAFETY: the caller's guarantees; `f` is the framework's entry.
+        unsafe { with_q0(vcpu, reg, value, f) }
+    }
+
+    /// Load the 16 bytes at `value` into `q0`, where the framework expects
+    /// them, and tail-call `f`.
     #[unsafe(naked)]
-    pub unsafe extern "C" fn set_simd_fp_reg(
+    unsafe extern "C" fn with_q0(
         vcpu: hv_vcpu_t,
         reg: u32,
         value: *const u128,
+        f: unsafe extern "C" fn(),
     ) -> hv_return_t {
-        core::arch::naked_asm!("ldr q0, [x2]", "b {f}", f = sym hv_vcpu_set_simd_fp_reg)
+        core::arch::naked_asm!("ldr q0, [x2]", "br x3")
     }
 }
 
