@@ -841,6 +841,12 @@ pub fn probe(name: &str) -> Result<String, String> {
         "first-close-write" | "first-close-mmap" | "first-close-truncate" | "first-close-empty" => {
             Ok(first_close_probe(&name["first-close-".len()..]))
         }
+        // The same after raising this thread's scheduling class, as a run
+        // does (`interactive`).
+        "first-close-write-qos" => {
+            interactive();
+            Ok(first_close_probe("write"))
+        }
         _ => Err(format!("unknown probe {name}")),
     }
 }
