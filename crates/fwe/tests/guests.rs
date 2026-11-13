@@ -260,6 +260,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18rare",
     "x18spsig",
     "x18partial",
+    "svcimm",
     "fpsig",
     "efault",
     "sigmap",
@@ -3180,6 +3181,17 @@ fn asm_hello() {
     for name in ["hello", "hello-pie"] {
         let out = fwe(&asm_guest(name), &[]);
         assert_eq!(stdout(&out), "hello from linux\n", "{name}");
+        assert_eq!(out.status.code(), Some(0), "{name}");
+    }
+}
+
+/// `svc` with an immediate other than 0 is a system call, as Linux takes
+/// any (guests/asm/svcimm.S: `svc #0x80`, `svc #1`).
+#[test]
+fn svc_with_any_immediate_is_a_system_call() {
+    for name in ["svcimm", "svcimm-pie"] {
+        let out = fwe(&asm_guest(name), &[]);
+        assert_eq!(stdout(&out), "svc imm\n", "{name}");
         assert_eq!(out.status.code(), Some(0), "{name}");
     }
 }

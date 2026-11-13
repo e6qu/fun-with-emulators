@@ -25,6 +25,12 @@
 /// `svc #0`.
 pub const SVC0: u32 = 0xd400_0001;
 
+/// Whether `insn` is an `svc`, whatever its immediate: Linux takes any as
+/// a system call (macOS's own calls use `svc #0x80`).
+pub fn is_svc(insn: u32) -> bool {
+    insn & 0xffe0_001f == SVC0
+}
+
 /// Immediate of the trap instruction that replaces `svc #0` ("LX").
 pub const TRAP_IMM: u32 = 0x4c58;
 
@@ -165,6 +171,9 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
         }
     };
     let data = literal_pool_words(code, &is_code);
+    // An `svc` with an immediate other than 0 only where the image's tables
+    // say there is code: as data it is likelier than `svc #0`'s one word.
+    let known_code = |i: usize| known.is_some() && is_code[i];
     for (i, word) in code.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         // Words that belong to a literal pool are data, not instructions, and a
         // constant can encode anything — never rewrite them.
@@ -172,7 +181,7 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
             continue;
         }
         let insn = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-        let replacement = if insn == SVC0 {
+        let replacement = if insn == SVC0 || (is_svc(insn) && known_code(i)) {
             out.syscalls += 1;
             out.sites.push((i as u64 * 4, Site::Syscall { gate: 0 }));
             Some(TRAP)
@@ -239,7 +248,7 @@ pub fn count_sites(code: &[u8]) -> usize {
         .iter()
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .filter(|&i| {
-            i == SVC0
+            is_svc(i)
                 || (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31)
                 || i & !RT_MASK == MSR_TPIDR
                 || x18_site(i)
@@ -807,7 +816,21 @@ mod tests {
         // Each is the trap in place, and a site for a stub to the gate.
         let gate = Site::Syscall { gate: 0 };
         assert_eq!(p.sites, vec![(4, gate), (12, gate)]);
+        // With no table saying where code is, only `svc #0` is taken.
         assert_eq!(code, words(&[mov_x8, TRAP, svc1, TRAP]));
+    }
+
+    /// Linux takes any `svc` as a system call: one with another immediate
+    /// (`svc #0x80`, macOS's own) is rewritten too where the image's tables
+    /// say there is code, and left alone outside it.
+    #[test]
+    fn any_svc_in_known_code_is_a_system_call() {
+        let svc80 = 0xd400_1001; // svc #0x80
+        assert!(is_svc(svc80) && is_svc(SVC0) && !is_svc(TRAP));
+        let mut code = words(&[svc80, SVC0, svc80]);
+        let p = patch(&mut code, Some(&[(0, 8)]));
+        assert_eq!(p.syscalls, 2);
+        assert_eq!(code, words(&[TRAP, TRAP, svc80]));
     }
 
     /// A system call's stub saves `x30` and `x0` in one store (its only

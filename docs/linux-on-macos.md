@@ -483,7 +483,7 @@ Only instructions whose meaning depends on the kernel need help:
 
 | Instruction | What Linux expects | Why it cannot run unchanged on macOS | What fwe does |
 |---|---|---|---|
-| `svc #0` | a Linux system call, number in `x8` | it would enter the macOS kernel, which reads `x16` and other numbers | rewritten to a branch to a stub that calls fwe's gate (`brk #0x4c58` where no stub fits) |
+| `svc #0` (any `svc`: Linux ignores the immediate) | a Linux system call, number in `x8` | it would enter the macOS kernel, which reads `x16` and other numbers | rewritten to a branch to a stub that calls fwe's gate (`brk #0x4c58` where no stub fits); an `svc` with another immediate only where the image's unwind table says there is code |
 | `mrs`/`msr` of `TPIDR_EL0` | the thread pointer, which the program owns | macOS does not preserve `TPIDR_EL0` for user code | rewritten to a branch to a stub |
 | any instruction naming `x18` | an ordinary register | macOS clears `x18` on every exception return, preemption included | rewritten to a branch to a stub |
 | `mrs <Xt>, ctr_el0` | readable at EL0 | macOS traps it | left alone; emulated when it traps |
@@ -493,7 +493,11 @@ Only instructions whose meaning depends on the kernel need help:
 macOS's own system calls use `svc #0x80` with the number in `x16`, so a
 Linux `svc #0` would make a wrong call. Before guest code may execute,
 every `svc #0` is overwritten with a branch to a stub of its own, which
-calls fwe's system-call gate (`crates/native/src/gate.rs`):
+calls fwe's system-call gate (`crates/native/src/gate.rs`). Linux takes an
+`svc` with any immediate as a system call, which compilers never emit
+but hand-written code may: such an `svc` is rewritten the same way in
+code the image's unwind table covers, where it cannot be a constant
+(elsewhere a data word could match it far more often than `svc #0`):
 
 ```
 site:  b     stub                  ; was svc #0
@@ -2422,8 +2426,8 @@ is not a boundary against a program that sets out to cross it:
 - **The native backend** runs the program inside the `fwe` process. Its
   code shares the address space with fwe's own code and data and with
   macOS's libraries, so code that writes fwe's memory, jumps into
-  `libSystem`, or makes macOS's own system calls (`svc #0x80`, which fwe
-  does not rewrite) acts as the user who started `fwe`, with nothing of
+  `libSystem`, or makes macOS's own system calls (an `svc` fwe did not
+  take for code) acts as the user who started `fwe`, with nothing of
   fwe's in the way.
 - **The VM backend** keeps the guest's memory apart from fwe's: the guest
   reaches the host only through its system calls and faults, which fwe
