@@ -596,7 +596,7 @@ fn main() {
         // system calls until the signal is handled, or long enough to say
         // it was left pending.
         "busy-calls" => {
-            static ARMED: AtomicBool = AtomicBool::new(false);
+            static SENT: AtomicUsize = AtomicUsize::new(0);
             static STOP: AtomicBool = AtomicBool::new(false);
             static STUCK: AtomicUsize = AtomicUsize::new(0);
             catch(SIGUSR1, SA_RESTART);
@@ -604,37 +604,32 @@ fn main() {
             let worker = std::thread::spawn(move || {
                 tid_tx.send(gettid()).unwrap();
                 while !STOP.load(Ordering::SeqCst) {
-                    let before = HITS.load(Ordering::SeqCst);
                     // SAFETY: plain call.
                     unsafe { getppid() };
-                    if ARMED.load(Ordering::SeqCst) {
-                        let mut spins = 0u64;
-                        while HITS.load(Ordering::SeqCst) == before && spins < 200_000_000 {
-                            spins += 1;
-                            std::hint::spin_loop();
-                        }
-                        if HITS.load(Ordering::SeqCst) == before {
-                            STUCK.fetch_add(1, Ordering::SeqCst);
-                        }
+                    // Every signal sent so far is taken, or on its way.
+                    let mut spins = 0u64;
+                    while HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst)
+                        && spins < 200_000_000
+                    {
+                        spins += 1;
+                        std::hint::spin_loop();
+                    }
+                    if HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst) {
+                        STUCK.fetch_add(1, Ordering::SeqCst);
                     }
                 }
             });
             let tid = tid_rx.recv().unwrap();
             let start = std::time::Instant::now();
-            let mut sent = 0;
             while start.elapsed() < Duration::from_secs(1) {
-                let before = HITS.load(Ordering::SeqCst);
-                ARMED.store(true, Ordering::SeqCst);
+                SENT.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(tgkill(tid, SIGUSR1), 0);
-                while HITS.load(Ordering::SeqCst) == before {
+                while HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
-                ARMED.store(false, Ordering::SeqCst);
-                sent += 1;
             }
             STOP.store(true, Ordering::SeqCst);
             worker.join().unwrap();
-            let _ = sent;
             println!("left pending: {}", STUCK.load(Ordering::SeqCst));
         }
         // tgkill interrupts one thread's blocking call: a relayed signal and
