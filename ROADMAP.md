@@ -14,7 +14,7 @@ in detail.
 | M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
 | M4 Compatibility | Done: all 1213 of LTP's system-call tests that apply pass (1551 run) |
-| M5 Release | Not started |
+| M5 Release | In progress |
 
 What runs unmodified, with its output checked in CI:
 - **Natively, in-process:** Debian's coreutils, bash, git, SQLite, lighttpd,
@@ -116,9 +116,11 @@ hardware.
 
 ### M5 — Release
 
-- [ ] **Performance:** benchmarks in CI of startup, system-call cost,
-  `fork`/`exec` and a C project's build, against native macOS and a Linux
-  VM (Lima or OrbStack); the single kernel lock split.
+- [x] **Performance:** benchmarks in CI of startup, system-call cost
+  (one thread and several at once), `fork`/`exec` and a C project's
+  build, against native macOS and Linux on arm64; system calls through a
+  direct gate rather than a trap; a kernel lock whose reading calls run
+  side by side.
 - [ ] **Packaging:** a signed and notarized `fwe` with the hypervisor
   entitlement, a Homebrew formula, and a command that fetches and unpacks a
   Debian or Alpine root filesystem.

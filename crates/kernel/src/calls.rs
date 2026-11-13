@@ -71,7 +71,7 @@ impl<P: Platform> Kernel<P> {
     /// `getcpu(cpu, node, cache)`: the CPU the caller runs on, as far as
     /// fwe can tell (the first of its affinity, which it is held to), on
     /// node 0.
-    pub(crate) fn sys_getcpu(&mut self, cpu: u64, node: u64) -> i64 {
+    pub(crate) fn sys_getcpu(&self, cpu: u64, node: u64) -> i64 {
         let n = crate::syscalls::own_cpu() as u32;
         if cpu != 0 {
             guest!(uaccess::write(cpu, n));

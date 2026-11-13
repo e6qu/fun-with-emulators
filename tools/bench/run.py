@@ -96,6 +96,11 @@ def alpine_root(manifest, cache):
 MICRO = [
     ("getpid", ["getpid", "200000"], "ns"),
     ("getppid", ["syscall", "200000"], "ns"),
+    # Calls made by 3 threads at once (the macOS runners have 3 cores): the
+    # time per call of each, the same as one thread's when they run side
+    # by side.
+    ("getppid, 3 threads", ["par", "getppid", "3", "100000"], "ns"),
+    ("fstat, 3 threads", ["par", "fstat", "3", "100000"], "ns"),
     ("thread create+join", ["thread", "2000"], "us"),
     ("fork+exit+wait", ["fork", "200"], "us"),
 ]

@@ -129,9 +129,15 @@ pub fn current() -> std::sync::Arc<Chain> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
+/// Whether [`CURRENT`] is a chain of any namespace: what [`nested`] asks
+/// on every call that takes or returns a pid, without the lock.
+static NESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Make `chain` the process's ([`crate::ns::Namespaces::pid`]).
 pub fn set_current(chain: Chain) {
-    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(chain));
+    let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+    NESTED.store(!chain.is_empty(), std::sync::atomic::Ordering::Release);
+    *current = Some(std::sync::Arc::new(chain));
 }
 
 /// The chain of namespaces from `ns` up: its record's parents, joined.
@@ -239,7 +245,7 @@ pub fn to_host(pid: i32) -> Option<i32> {
 
 /// Whether the process is in a pid namespace of fwe's.
 pub fn nested() -> bool {
-    !current().is_empty()
+    NESTED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The init of the namespace whose record is `ns` has ended: end every

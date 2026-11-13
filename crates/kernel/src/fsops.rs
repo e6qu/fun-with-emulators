@@ -339,8 +339,9 @@ impl<P: Platform> Kernel<P> {
     /// [`fs`](Self::fs), if there is one.
     pub fn fs_opt(&self) -> Option<&Fs> {
         match crate::threadfs::current() {
-            // SAFETY: this thread's own view, which only it uses, under
-            // the kernel lock that `&self` stands for.
+            // SAFETY: this thread's own view, which only it uses; a call
+            // of another thread that changes it holds the kernel lock
+            // alone, which `&self` excludes.
             Some(p) => Some(unsafe { &*p }),
             None => self.fs.as_ref(),
         }
@@ -993,7 +994,7 @@ impl<P: Platform> Kernel<P> {
         fd as i64
     }
 
-    pub(crate) fn sys_faccessat(&mut self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
+    pub(crate) fn sys_faccessat(&self, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
         if flags & !(fcntl::AT_EACCESS | fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH) != 0
             || mode & !7 != 0
         {
@@ -1247,7 +1248,7 @@ impl<P: Platform> Kernel<P> {
         statfs_fd(fd, buf, mount)
     }
 
-    pub(crate) fn sys_newfstatat(&mut self, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
+    pub(crate) fn sys_newfstatat(&self, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
         // The flags Linux's `vfs_statx` takes; any other is refused.
         const AT_STATX_SYNC_TYPE: u64 = 0x6000;
         if flags
@@ -1407,7 +1408,7 @@ impl<P: Platform> Kernel<P> {
         crate::fdmarks::proc_link(fd).and_then(|ns| self.fs().from_ns(&ns))
     }
 
-    pub(crate) fn sys_fstat(&mut self, fd: u64, buf: u64) -> i64 {
+    pub(crate) fn sys_fstat(&self, fd: u64, buf: u64) -> i64 {
         if let Some(link) = self.proc_link_path(fd as i32) {
             return match self.linux_stat(fcntl::AT_FDCWD as i32, &link, false, 0) {
                 Ok(st) => {
@@ -1450,14 +1451,7 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    pub(crate) fn sys_statx(
-        &mut self,
-        dirfd: u64,
-        path: u64,
-        flags: u64,
-        mask: u64,
-        buf: u64,
-    ) -> i64 {
+    pub(crate) fn sys_statx(&self, dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         // Linux's checks of the request: the reserved mask bit, both sync
         // types at once, an unknown flag.
@@ -1629,7 +1623,7 @@ impl<P: Platform> Kernel<P> {
         Ok(LinkKind::Symlink(target))
     }
 
-    pub(crate) fn sys_readlinkat(&mut self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
+    pub(crate) fn sys_readlinkat(&self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
         // A buffer of no size, first (an `int` to Linux).
         if size as i32 <= 0 {
             return err(errno::EINVAL);
@@ -1695,7 +1689,7 @@ impl<P: Platform> Kernel<P> {
         } as i64)
     }
 
-    pub(crate) fn sys_getcwd(&mut self, buf: u64, size: u64) -> i64 {
+    pub(crate) fn sys_getcwd(&self, buf: u64, size: u64) -> i64 {
         // Outside the root (a `chroot` left it there): unreachable from it.
         let outside = self.fs().cwd_outside().map(|p| [&b"(unreachable)"[..], p].concat());
         let cwd = outside.as_deref().unwrap_or(self.fs().cwd());

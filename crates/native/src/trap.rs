@@ -25,9 +25,8 @@
 
 use crate::rewrite::TRAP;
 use crate::{KERNEL, NativePlatform, X18Abi};
-use fwe_kernel::{FpRegs, Kernel, Regs, host, thread};
+use fwe_kernel::{FpRegs, Regs, host, thread};
 use std::cell::Cell;
-use std::sync::MutexGuard;
 
 /// `__darwin_arm_thread_state64`.
 #[repr(C)]
@@ -78,8 +77,8 @@ pub struct Ucontext {
 
 const SIGNAL_STACK_SIZE: usize = 1 << 20;
 
-fn kernel() -> MutexGuard<'static, Option<Kernel<NativePlatform>>> {
-    KERNEL.lock().unwrap_or_else(|e| e.into_inner())
+fn kernel() -> fwe_kernel::klock::Exclusive<'static, Option<fwe_kernel::Kernel<NativePlatform>>> {
+    KERNEL.lock()
 }
 
 /// Write a diagnostic directly to the host's standard error.
@@ -344,9 +343,9 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // SAFETY: guest pointers in `args` reference guest memory.
     if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
-        kernel().as_mut().unwrap().finish_syscall(regs, nr, &args, r);
+        KERNEL.finish(regs, nr, &args, r);
     } else {
-        kernel().as_mut().unwrap().enter_syscall(regs);
+        KERNEL.syscall(regs);
     }
     b.ran = 1;
     // A signal from here on is seen by the gate's way out.
@@ -607,21 +606,21 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     } else if nr == fwe_abi::nr::WAIT4 {
         // wait4 blocks; run it without the kernel lock.
         let r = crate::process::do_wait4(&regs);
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        KERNEL.finish(&mut regs, nr, &args, r);
     } else if nr == fwe_abi::nr::WAITID {
         let r = crate::process::do_waitid(&regs);
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        KERNEL.finish(&mut regs, nr, &args, r);
     } else if nr == fwe_abi::nr::PIDFD_GETFD {
         // The target is asked for its descriptor without the kernel lock.
         let req = kernel().as_ref().unwrap().getfd_request(args[0], args[1], args[2]);
         let r = fwe_kernel::pidfd::getfd(req);
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        KERNEL.finish(&mut regs, nr, &args, r);
     } else if fwe_kernel::ipcops::waits(nr) {
         // A semaphore or message queue wait: what it needs of the kernel is
         // taken under the lock, and it waits without it.
         let ctx = kernel().as_ref().unwrap().ipc_context();
         let r = fwe_kernel::ipcops::blocking(ctx, nr, args);
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        KERNEL.finish(&mut regs, nr, &args, r);
     } else if nr == fwe_abi::nr::RT_SIGTIMEDWAIT {
         // The awaited signals are caught on the host while the call waits,
         // without the kernel lock.
@@ -638,9 +637,9 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // SAFETY: guest pointers in `args` reference guest memory.
         unsafe { fwe_kernel::blocking_syscall(nr, args) }
     } {
-        kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r);
+        KERNEL.finish(&mut regs, nr, &args, r);
     } else {
-        kernel().as_mut().unwrap().enter_syscall(&mut regs);
+        KERNEL.syscall(&mut regs);
     }
     // The exit's stop, its result in `x0`.
     if syscall_stops {

@@ -42,6 +42,7 @@ pub mod ipcops;
 pub mod keycrypto;
 pub mod keys;
 mod keytypes;
+pub mod klock;
 pub mod landlock;
 mod landlockops;
 pub mod leases;
@@ -110,6 +111,7 @@ pub mod xattr;
 
 pub use cloneargs::CloneArgs;
 pub use fs::Fs;
+pub use klock::KernelLock;
 pub use mm::Brk;
 pub use trace::Tracer;
 
@@ -1119,6 +1121,10 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
+    // None of the calls run on the shared side waits.
+    if syscalls::shares(nr) {
+        return None;
+    }
     // What other processes may look at, current before this one waits.
     maps::flush_before(nr);
     let noted = atime::before(nr, &a);

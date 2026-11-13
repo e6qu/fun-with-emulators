@@ -123,6 +123,47 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
     crate::pidns::to_host(pid)
 }
 
+/// Whether call `n` with `a` runs on the kernel lock's shared side
+/// ([`Kernel::dispatch_shared`]).
+pub(crate) fn shares(n: u64) -> bool {
+    matches!(
+        n,
+        nr::LSEEK
+            | nr::FACCESSAT
+            | nr::FACCESSAT2
+            | nr::NEWFSTATAT
+            | nr::FSTAT
+            | nr::STATX
+            | nr::GETCWD
+            | nr::READLINKAT
+            | nr::GETPGID
+            | nr::GETSID
+            | nr::GETPID
+            | nr::GETTID
+            | nr::GETPPID
+            | nr::GETUID
+            | nr::GETEUID
+            | nr::GETGID
+            | nr::GETEGID
+            | nr::GETRESUID
+            | nr::GETRESGID
+            | nr::GETGROUPS
+            | nr::UNAME
+            | nr::SYSINFO
+            | nr::SCHED_YIELD
+            | nr::SCHED_GETAFFINITY
+            | nr::GETCPU
+            | nr::GETRUSAGE
+            | nr::TIMES
+            | nr::CLOCK_GETTIME
+            | nr::CLOCK_GETRES
+            | nr::GETTIMEOFDAY
+            | nr::RT_SIGPROCMASK
+            | nr::SIGALTSTACK
+            | nr::GETRANDOM
+    )
+}
+
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
         // Told of a foster child: the watcher that follows it starts here,
@@ -171,6 +212,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        if shares(n) {
+            return self.shared_call(n, a);
+        }
         match n {
             // Files and I/O.
             // The backends run these without the lock
@@ -193,29 +237,6 @@ impl<P: Platform> Kernel<P> {
                 let r = unsafe { crate::blocking_call(n, a) }.unwrap_or(err(errno::ENOSYS));
                 crate::after_write(n, &a, r);
                 r
-            }
-            nr::LSEEK => {
-                if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
-                    r
-                } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
-                {
-                    r
-                } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
-                    && is_dir_fd(a[0] as i32)
-                {
-                    crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
-                } else {
-                    // SEEK_SET, CUR and END match; Linux's SEEK_DATA and
-                    // SEEK_HOLE are 3 and 4, the host's the other way round.
-                    let whence = match a[2] {
-                        0..=2 => a[2] as i32,
-                        3 => libc::SEEK_DATA,
-                        4 => libc::SEEK_HOLE,
-                        _ => return err(errno::EINVAL),
-                    };
-                    // SAFETY: plain host call.
-                    ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, whence) })
-                }
             }
             nr::CLOSE => {
                 let fd = a[0] as i32;
@@ -354,18 +375,11 @@ impl<P: Platform> Kernel<P> {
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),
             nr::OPENAT2 => self.sys_openat2(a[0], a[1], a[2], a[3]),
-            nr::FACCESSAT => self.sys_faccessat(a[0], a[1], a[2], 0),
-            nr::FACCESSAT2 => self.sys_faccessat(a[0], a[1], a[2], a[3]),
-            nr::NEWFSTATAT => self.sys_newfstatat(a[0], a[1], a[2], a[3]),
             nr::STATFS => self.sys_statfs(a[0], a[1]),
             nr::FSTATFS => self.sys_fstatfs(a[0], a[1]),
-            nr::FSTAT => self.sys_fstat(a[0], a[1]),
-            nr::STATX => self.sys_statx(a[0], a[1], a[2], a[3], a[4]),
             nr::GETDENTS64 => self.sys_getdents64(a[0], a[1], a[2]),
-            nr::GETCWD => self.sys_getcwd(a[0], a[1]),
             nr::CHDIR => self.view_call(|k| k.sys_chdir(a[0])),
             nr::FCHDIR => self.view_call(|k| k.sys_fchdir(a[0])),
-            nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
             nr::MKDIRAT => self.sys_mkdirat(a[0], a[1], a[2]),
             nr::MKNODAT => self.sys_mknodat(a[0], a[1], a[2], a[3]),
             nr::UNLINKAT => self.sys_unlinkat(a[0], a[1], a[2]),
@@ -499,16 +513,6 @@ impl<P: Platform> Kernel<P> {
                 }
                 r
             }
-            nr::GETPGID => match crate::pidns::host_arg(a[0] as i32) {
-                // SAFETY: plain host call.
-                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getpgid(p) } as i64)),
-                Err(e) => err(e),
-            },
-            nr::GETSID => match crate::pidns::host_arg(a[0] as i32) {
-                // SAFETY: plain host call.
-                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getsid(p) } as i64)),
-                Err(e) => err(e),
-            },
             nr::SETSID => {
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setsid() } as i64);
@@ -518,22 +522,9 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::pidns::guest_ret(r)
             }
-            nr::GETPID => thread::tgid() as i64,
-            nr::GETTID => thread::tid() as i64,
-            // A parent outside the namespace is 0, as Linux reports it.
-            nr::GETPPID => {
-                // SAFETY: getpid cannot fail.
-                let me = unsafe { libc::getpid() };
-                let parent = crate::reaper::parent_of(me, host::getppid() as i32);
-                crate::pidns::guest_ret(i64::from(parent))
-            }
             // Virtual credentials (see crates/kernel/src/creds.rs).
             // Kept as the initial namespace's ids, seen through the user
             // namespace's maps (see `userns`).
-            nr::GETUID => uid_out(self.creds.uid, false),
-            nr::GETEUID => uid_out(self.creds.euid, false),
-            nr::GETGID => uid_out(self.creds.gid, true),
-            nr::GETEGID => uid_out(self.creds.egid, true),
             nr::SETUID => match uid_in(a[0], false) {
                 Ok(u) => {
                     let r = self.creds.setuid(u);
@@ -566,7 +557,6 @@ impl<P: Platform> Kernel<P> {
                 // Unmapped: no change, and the old one back.
                 Err(_) => uid_out(self.creds.fsuid, false),
             },
-            nr::GETRESUID => self.sys_getresuid(a[0], a[1], a[2]),
             nr::SETGID => match uid_in(a[0], true) {
                 Ok(g) => {
                     let r = self.creds.setgid(g);
@@ -596,8 +586,6 @@ impl<P: Platform> Kernel<P> {
                 }
                 Err(_) => uid_out(self.creds.fsgid, true),
             },
-            nr::GETRESGID => self.sys_getresgid(a[0], a[1], a[2]),
-            nr::GETGROUPS => self.sys_getgroups(a[0], a[1]),
             nr::SETGROUPS => self.sys_setgroups(a[0], a[1]),
             nr::SET_TID_ADDRESS => {
                 thread::set_clear_child_tid(a[0]);
@@ -659,8 +647,6 @@ impl<P: Platform> Kernel<P> {
             #[cfg(target_os = "macos")]
             nr::FILE_GETATTR | nr::FILE_SETATTR => self.sys_file_attr(n == nr::FILE_SETATTR, a),
             nr::PTRACE => self.sys_ptrace(a[0], a[1], a[2], a[3]),
-            nr::UNAME => self.sys_uname(a[0]),
-            nr::SYSINFO => self.sys_sysinfo(a[0]),
             nr::PRCTL => self.sys_prctl(a[0], a[1], a[2], a[3], a[4]),
             nr::SHMGET => self.sys_shmget(a[0], a[1], a[2]),
             nr::SHMAT => self.sys_shmat(a[0], a[1], a[2]),
@@ -721,12 +707,6 @@ impl<P: Platform> Kernel<P> {
             }
             nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
             nr::CAPSET => self.sys_capset(a[0], a[1]),
-            nr::SCHED_YIELD => {
-                std::thread::yield_now();
-                0
-            }
-            nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
-            nr::GETCPU => self.sys_getcpu(a[0], a[1]),
             nr::VHANGUP => self.sys_vhangup(),
             nr::READAHEAD => self.sys_readahead(a[0]),
             nr::SYNC_FILE_RANGE => self.sys_sync_file_range(a[0], a[1], a[2], a[3]),
@@ -761,6 +741,146 @@ impl<P: Platform> Kernel<P> {
             nr::SCHED_GET_PRIORITY_MIN => crate::sched::priority_bound(a[0], false),
             nr::SCHED_RR_GET_INTERVAL => self.sys_sched_rr_get_interval(a[0], a[1]),
             nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
+            nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
+            nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
+            nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),
+
+            // Time.
+            nr::CLOCK_SETTIME => self.sys_clock_settime(a[0], a[1]),
+            nr::CLOCK_ADJTIME => self.sys_clock_adjtime(a[0], a[1]),
+            nr::SETTIMEOFDAY => self.sys_settimeofday(a[0], a[1]),
+            nr::ADJTIMEX => self.sys_adjtimex(a[0]),
+            nr::NANOSLEEP => {
+                // SAFETY: the arguments are checked guest pointers.
+                unsafe { clock_nanosleep(clock::CLOCK_MONOTONIC, 0, a[0], a[1]) }
+            }
+            nr::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a[0], a[1], a[2], a[3]),
+
+            // Signals.
+            nr::RT_SIGACTION => self.sys_rt_sigaction(a[0], a[1], a[2], a[3]),
+            nr::KILL => self.sys_kill(a[0] as i32 as i64, a[1]),
+            nr::TKILL => self.sys_tgkill(-1, a[0] as i32 as i64, a[1]),
+            // A tgid must name a process (`tkill` passes -1 for any).
+            nr::TGKILL if (a[0] as i32) <= 0 => err(errno::EINVAL),
+            nr::TGKILL => self.sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2]),
+            nr::RT_SIGPENDING => self.sys_rt_sigpending(a[0], a[1]),
+            nr::SETITIMER => self.sys_setitimer(a[0], a[1], a[2]),
+            nr::GETITIMER => match itimer::get(a[0]) {
+                Ok(v) => {
+                    guest!(uaccess::write(a[1], v));
+                    0
+                }
+                Err(e) => err(e),
+            },
+
+            // futex and the sleeps can block, so the backend runs them
+            // outside the kernel lock via `blocking_syscall`; reaching them
+            // here (e.g. through the plain `syscall` helper) is unsupported.
+
+            // Randomness.
+            nr::NAME_TO_HANDLE_AT => self.sys_name_to_handle_at(a[0], a[1], a[2], a[3], a[4]),
+            nr::OPEN_BY_HANDLE_AT => self.sys_open_by_handle_at(a[0], a[1], a[2]),
+
+            // Any other call: `ENOSYS`, as Linux gives a call it lacks.
+            _ => {
+                self.tracer.note(&format!("unimplemented syscall {n}"));
+                err(errno::ENOSYS)
+            }
+        }
+    }
+
+    /// Run call `n` on the kernel lock's shared side, alongside other
+    /// threads' ([`crate::klock`]), if it is one that may: `None` for any
+    /// other, which [`Kernel::dispatch`] runs holding the lock for itself.
+    /// What [`Kernel::dispatch`] does around a call is done here as far as
+    /// these calls need it; a call that must start the reaper's watcher, or
+    /// that Landlock must check, is left to it.
+    pub(crate) fn dispatch_shared(&self, n: u64, a: [u64; 6]) -> Option<i64> {
+        if !shares(n) || crate::reaper::watcher_wanted() || crate::landlock::active() {
+            return None;
+        }
+        crate::maps::flush_before(n);
+        if let Err(e) = crate::fdtable::check_args(n, &a) {
+            return Some(e);
+        }
+        let plan = self.inotify_before(n, &a);
+        let noted = crate::atime::before(n, &a);
+        let r = crate::linux_result(n, &a, self.shared_call(n, a));
+        crate::atime::after(noted, r);
+        self.inotify_after(n, &a, r, plan);
+        Some(r)
+    }
+
+    /// The calls [`shares`] names: each reads what the kernel keeps for the
+    /// process, changes only the calling thread's own state, or makes a
+    /// host call that stands alone.
+    fn shared_call(&self, n: u64, a: [u64; 6]) -> i64 {
+        match n {
+            nr::LSEEK => {
+                if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
+                    r
+                } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    r
+                } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
+                    && is_dir_fd(a[0] as i32)
+                {
+                    crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                } else {
+                    // SEEK_SET, CUR and END match; Linux's SEEK_DATA and
+                    // SEEK_HOLE are 3 and 4, the host's the other way round.
+                    let whence = match a[2] {
+                        0..=2 => a[2] as i32,
+                        3 => libc::SEEK_DATA,
+                        4 => libc::SEEK_HOLE,
+                        _ => return err(errno::EINVAL),
+                    };
+                    // SAFETY: plain host call.
+                    ret(unsafe { libc::lseek(a[0] as i32, a[1] as libc::off_t, whence) })
+                }
+            }
+            nr::FACCESSAT => self.sys_faccessat(a[0], a[1], a[2], 0),
+            nr::FACCESSAT2 => self.sys_faccessat(a[0], a[1], a[2], a[3]),
+            nr::NEWFSTATAT => self.sys_newfstatat(a[0], a[1], a[2], a[3]),
+            nr::FSTAT => self.sys_fstat(a[0], a[1]),
+            nr::STATX => self.sys_statx(a[0], a[1], a[2], a[3], a[4]),
+            nr::GETCWD => self.sys_getcwd(a[0], a[1]),
+            nr::READLINKAT => self.sys_readlinkat(a[0], a[1], a[2], a[3]),
+            nr::GETPGID => match crate::pidns::host_arg(a[0] as i32) {
+                // SAFETY: plain host call.
+                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getpgid(p) } as i64)),
+                Err(e) => err(e),
+            },
+            nr::GETSID => match crate::pidns::host_arg(a[0] as i32) {
+                // SAFETY: plain host call.
+                Ok(p) => crate::pidns::guest_ret(ret(unsafe { libc::getsid(p) } as i64)),
+                Err(e) => err(e),
+            },
+            nr::GETPID => thread::tgid() as i64,
+            nr::GETTID => thread::tid() as i64,
+            // A parent outside the namespace is 0, as Linux reports it.
+            nr::GETPPID => {
+                // SAFETY: getpid cannot fail.
+                let me = unsafe { libc::getpid() };
+                let parent = crate::reaper::parent_of(me, host::getppid() as i32);
+                crate::pidns::guest_ret(i64::from(parent))
+            }
+            // Credentials, seen through the user namespace's maps.
+            nr::GETUID => uid_out(self.creds.uid, false),
+            nr::GETEUID => uid_out(self.creds.euid, false),
+            nr::GETGID => uid_out(self.creds.gid, true),
+            nr::GETEGID => uid_out(self.creds.egid, true),
+            nr::GETRESUID => self.sys_getresuid(a[0], a[1], a[2]),
+            nr::GETRESGID => self.sys_getresgid(a[0], a[1], a[2]),
+            nr::GETGROUPS => self.sys_getgroups(a[0], a[1]),
+            nr::UNAME => self.sys_uname(a[0]),
+            nr::SYSINFO => self.sys_sysinfo(a[0]),
+            nr::SCHED_YIELD => {
+                std::thread::yield_now();
+                0
+            }
+            nr::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a[0], a[1], a[2]),
+            nr::GETCPU => self.sys_getcpu(a[0], a[1]),
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
                 let who = match a[0] as i32 as i64 {
@@ -803,17 +923,8 @@ impl<P: Platform> Kernel<P> {
                 }
                 (host::uptime() * 100.0) as i64
             }
-            nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
-            nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
-            nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),
-
-            // Time.
             nr::CLOCK_GETTIME => self.sys_clock_gettime(a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(a[0], a[1]),
-            nr::CLOCK_SETTIME => self.sys_clock_settime(a[0], a[1]),
-            nr::CLOCK_ADJTIME => self.sys_clock_adjtime(a[0], a[1]),
-            nr::SETTIMEOFDAY => self.sys_settimeofday(a[0], a[1]),
-            nr::ADJTIMEX => self.sys_adjtimex(a[0]),
             nr::GETTIMEOFDAY => {
                 // The C library fills these in itself, unchecked: copy out.
                 let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
@@ -828,38 +939,8 @@ impl<P: Platform> Kernel<P> {
                 }
                 0
             }
-            nr::NANOSLEEP => {
-                // SAFETY: the arguments are checked guest pointers.
-                unsafe { clock_nanosleep(clock::CLOCK_MONOTONIC, 0, a[0], a[1]) }
-            }
-            nr::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a[0], a[1], a[2], a[3]),
-
-            // Signals.
-            nr::RT_SIGACTION => self.sys_rt_sigaction(a[0], a[1], a[2], a[3]),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(a[0], a[1], a[2], a[3]),
             nr::SIGALTSTACK => self.sys_sigaltstack(a[0], a[1]),
-            nr::KILL => self.sys_kill(a[0] as i32 as i64, a[1]),
-            nr::TKILL => self.sys_tgkill(-1, a[0] as i32 as i64, a[1]),
-            // A tgid must name a process (`tkill` passes -1 for any).
-            nr::TGKILL if (a[0] as i32) <= 0 => err(errno::EINVAL),
-            nr::TGKILL => self.sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2]),
-            nr::RT_SIGPENDING => self.sys_rt_sigpending(a[0], a[1]),
-            nr::SETITIMER => self.sys_setitimer(a[0], a[1], a[2]),
-            nr::GETITIMER => match itimer::get(a[0]) {
-                Ok(v) => {
-                    guest!(uaccess::write(a[1], v));
-                    0
-                }
-                Err(e) => err(e),
-            },
-
-            // futex and the sleeps can block, so the backend runs them
-            // outside the kernel lock via `blocking_syscall`; reaching them
-            // here (e.g. through the plain `syscall` helper) is unsupported.
-
-            // Randomness.
-            nr::NAME_TO_HANDLE_AT => self.sys_name_to_handle_at(a[0], a[1], a[2], a[3], a[4]),
-            nr::OPEN_BY_HANDLE_AT => self.sys_open_by_handle_at(a[0], a[1], a[2]),
             nr::GETRANDOM => {
                 // GRND_NONBLOCK, GRND_RANDOM and GRND_INSECURE, but not the
                 // last two at once.
@@ -869,12 +950,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 self.sys_getrandom(a[0], a[1])
             }
-
-            // Any other call: `ENOSYS`, as Linux gives a call it lacks.
-            _ => {
-                self.tracer.note(&format!("unimplemented syscall {n}"));
-                err(errno::ENOSYS)
-            }
+            _ => unreachable!("not a shared call: {n}"),
         }
     }
 
@@ -1421,7 +1497,7 @@ impl<P: Platform> Kernel<P> {
         unsafe { ppoll(fds, nfds, timeout) }
     }
 
-    fn sys_uname(&mut self, buf: u64) -> i64 {
+    fn sys_uname(&self, buf: u64) -> i64 {
         // SAFETY: zeroed bytes are a valid `Utsname`.
         let mut u: Utsname = unsafe { std::mem::zeroed() };
         fill(&mut u.sysname, b"Linux");
@@ -1943,7 +2019,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `sysinfo`: the host's uptime and load, and the memory `/proc/meminfo`
     /// reports.
-    fn sys_sysinfo(&mut self, buf: u64) -> i64 {
+    fn sys_sysinfo(&self, buf: u64) -> i64 {
         let scale = (1u64 << fwe_abi::SI_LOAD_SHIFT) as f64;
         let info = fwe_abi::Sysinfo {
             uptime: host::uptime() as i64,
@@ -1958,7 +2034,7 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    fn sys_sched_getaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
+    fn sys_sched_getaffinity(&self, pid: u64, len: u64, mask: u64) -> i64 {
         // The caller, the process, or one of its threads: glibc's
         // `pthread_getattr_np` asks with the thread's own id.
         let id = pid as i32;
@@ -2175,7 +2251,7 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    fn sys_clock_gettime(&mut self, id: u64, tp: u64) -> i64 {
+    fn sys_clock_gettime(&self, id: u64, tp: u64) -> i64 {
         if let Some(ns) = cpu_clock_ns(id) {
             let ns = match ns {
                 Ok(n) => n,
@@ -2207,7 +2283,7 @@ impl<P: Platform> Kernel<P> {
         unsafe { clock_nanosleep(id, flags, req, rem) }
     }
 
-    fn sys_clock_getres(&mut self, id: u64, tp: u64) -> i64 {
+    fn sys_clock_getres(&self, id: u64, tp: u64) -> i64 {
         if let Some(ns) = cpu_clock_ns(id) {
             if let Err(e) = ns {
                 return err(e);
@@ -2254,7 +2330,7 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    fn sys_rt_sigprocmask(&mut self, how: u64, set: u64, old: u64, size: u64) -> i64 {
+    fn sys_rt_sigprocmask(&self, how: u64, set: u64, old: u64, size: u64) -> i64 {
         if size != signal::SIGSET_SIZE {
             return err(errno::EINVAL);
         }
@@ -2274,7 +2350,7 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    fn sys_sigaltstack(&mut self, ss: u64, old: u64) -> i64 {
+    fn sys_sigaltstack(&self, ss: u64, old: u64) -> i64 {
         if old != 0 {
             guest!(uaccess::write(old, thread::altstack()));
         }
@@ -2311,7 +2387,7 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    fn sys_getrandom(&mut self, buf: u64, len: u64) -> i64 {
+    fn sys_getrandom(&self, buf: u64, len: u64) -> i64 {
         // Linux returns at most 32 MiB per call.
         let len = len.min(32 << 20) as usize;
         let mut out = vec![0u8; len];
