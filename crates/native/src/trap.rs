@@ -319,8 +319,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     b.ran = 0;
     let nr = b.regs.x[8];
     // What the trap runs its own way, or stops at, it runs.
-    let plain = !TRACING.load(SeqCst)
-        && fwe_kernel::seccomp::mode() == 0
+    let plain = fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls()
         && !matches!(
             nr,

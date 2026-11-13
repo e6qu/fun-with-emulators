@@ -2536,7 +2536,7 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     )
     .unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--strace=failures").arg("--root")
+    cmd.arg("--strace").arg("--root")
         .arg(&root)
         .arg(root.join("usr/bin/node"))
         .arg(&script)

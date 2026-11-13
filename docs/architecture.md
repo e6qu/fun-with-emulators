@@ -263,7 +263,7 @@ finish itself (see
   handler's system call does once it unblocks the guest's signals.
 - **Plain calls only:** the Rust half (`trap::fwe_gate_call`) runs a call
   through `Kernel::enter_syscall` or `fwe_kernel::blocking_syscall`, as
-  the trap does, unless the run is traced (`--strace`, `PTRACE_SYSCALL`),
+  the trap does, unless a tracer stops at system calls (`PTRACE_SYSCALL`),
   a seccomp filter is set, or the call is one the trap runs its own way
   (`exit`, `execve`, `clone`, `wait4`, `waitid`, `pidfd_getfd`, the IPC
   waits, `rt_sigtimedwait`). It returns straight to the guest only when
