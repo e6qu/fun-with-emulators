@@ -1,0 +1,30 @@
+name: Probe (temporary)
+on:
+  push:
+    branches: [m5-exec]
+jobs:
+  ltp-bisect:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 10 }
+      - uses: Swatinem/rust-cache@v2
+      - id: ltp-cache
+        uses: actions/cache@v4
+        with:
+          path: target/ltp/root
+          key: ltp-root-${{ hashFiles('tools/ltp/build.sh') }}
+      - run: test -d target/ltp/root/opt/ltp
+      - run: |
+          for c in aae9a0f 8786aa9 HEAD; do
+            git worktree add -q wt-$c $c
+            (cd wt-$c && CARGO_TARGET_DIR=$PWD/../tgt cargo build -q && cp ../tgt/debug/fwe ../fwe-$c)
+          done
+      - run: sudo sysctl -w kern.maxfiles=184320 kern.maxfilesperproc=92160
+      - run: |
+          for round in 1 2; do for c in aae9a0f 8786aa9 HEAD; do
+            echo "== $c round $round"
+            python3 tools/ltp/run.py --fwe $PWD/fwe-$c --root target/ltp/root --jobs 4 \
+              --only '^(shmget03|fcntl14|inotify11|fork06|fork07|fork11|semctl06)$' --results r.txt > log.txt 2>&1 || true
+            grep -E "^\[[0-9]+/" log.txt
+          done; done
