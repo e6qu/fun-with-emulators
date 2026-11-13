@@ -18,6 +18,15 @@ jobs:
         run: |
           F=target/release/fwe
           time (for i in $(seq 20); do ./bench-mac exit; done)
+          time (for i in $(seq 20); do $F --version >/dev/null; done)
+          python3 -c "
+          import subprocess,time
+          for c in [['./bench-mac','exit'],['$F','--version'],['$F','./bench-linux','exit']]:
+              ts=[]
+              for i in range(20):
+                  s=time.perf_counter(); subprocess.run(c,stdout=subprocess.DEVNULL); ts.append((time.perf_counter()-s)*1e3)
+              ts.sort(); print(c[-1], 'median %.2f ms min %.2f ms' % (ts[10], ts[0]))
+          "
           time (for i in $(seq 20); do $F ./bench-linux exit; done)
           for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit; done
           echo "== fork"

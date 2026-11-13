@@ -27,7 +27,9 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// since `pthread_exit` does not return and would never release it.
 pub(crate) fn exit_current_thread(code: i32) -> ! {
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        fwe_kernel::timing::mark("exit");
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
+        fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
@@ -105,7 +107,9 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        fwe_kernel::timing::mark("exit");
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
+        fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
