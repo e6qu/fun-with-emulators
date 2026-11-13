@@ -1300,6 +1300,12 @@ impl Fs {
         if dirfd as i64 == fcntl::AT_FDCWD {
             return Some(normalize(&self.cwd, path));
         }
+        // A detached tree of `proc` or `sysfs`: that filesystem's path, as
+        // fwe's own mount of it shows it.
+        if let Some((fstype, root)) = crate::mountapi::detached_synthetic(dirfd) {
+            let base = if fstype == FsType::Proc { &b"/proc"[..] } else { &b"/sys"[..] };
+            return Some(mounts::join(base, &normalize(&root, path)));
+        }
         let dir = self.fd_ns_path(dirfd).and_then(|ns| self.from_ns(&ns))?;
         Some(normalize(&dir, path))
     }

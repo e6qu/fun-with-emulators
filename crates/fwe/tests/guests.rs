@@ -4263,13 +4263,15 @@ fn a_binary_run_through_a_read_only_clone_sees_it() {
 }
 
 /// `/proc` reached through a descriptor of a procfs instance, as crun
-/// reaches it: one made with `fsmount`, and a clone of `/proc`.
+/// reaches it: one made with `fsmount`, and a clone of `/proc`; files fwe
+/// makes from the process's state (`self/status`, `mounts`) too.
 #[test]
 fn proc_is_read_through_a_detached_mount() {
     let out = fwe(&rust_guest("mountapi"), &["procfd"]);
     assert_eq!(
         stdout(&out),
-        "fsmount proc: cap_last_cap 40\nopen_tree /proc: cap_last_cap 40\n",
+        "fsmount proc: cap_last_cap 40\nmounts: read\nself/mountinfo: read\nself/status: read\n\
+         self/cgroup: read\nopen_tree /proc: cap_last_cap 40\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

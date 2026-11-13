@@ -167,6 +167,13 @@ fn proc_fd() {
         syscall(SYS_FSCONFIG, fs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
         let mnt = syscall(SYS_FSMOUNT, fs, 0u32, 0u64) as i32;
         println!("fsmount proc: cap_last_cap {}", read_at(mnt));
+        for f in [c"mounts", c"self/mountinfo", c"self/status", c"self/cgroup"] {
+            let fd = syscall(56, mnt, f.as_ptr(), 0i64, 0i64) as i32;
+            let mut buf = [0u8; 4096];
+            let n = if fd >= 0 { read(fd, buf.as_mut_ptr(), buf.len()) } else { -1 };
+            println!("{}: {}", f.to_str().unwrap(), if n > 0 { "read" } else { "missing" });
+            close(fd);
+        }
         let tree = syscall(SYS_OPEN_TREE, AT_FDCWD, c"/proc".as_ptr(), OPEN_TREE_CLONE) as i32;
         println!("open_tree /proc: cap_last_cap {}", read_at(tree));
     }
