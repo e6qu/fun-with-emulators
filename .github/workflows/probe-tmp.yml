@@ -1,0 +1,31 @@
+name: probe-tmp
+on:
+  push:
+    branches: [m5-docs]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build -p fwe
+      - name: podman run, traced
+        run: |
+          F=$PWD/target/debug/fwe
+          $F --pull alpine:3.24 $RUNNER_TEMP/alpine 2>&1 | tail -1
+          R=$RUNNER_TEMP/alpine
+          P() { env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin perl -e 'alarm shift; exec @ARGV' 300 "$F" "$@"; echo "exit $?"; }
+          P --root $R $R/bin/sh -c 'apk add -q --no-progress podman' >/dev/null 2>&1
+          mkdir -p $R/etc/containers
+          printf '[storage]\ndriver = "overlay"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' > $R/etc/containers/storage.conf
+          printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > $R/etc/containers/containers.conf
+          P --root $R $R/usr/bin/podman pull -q docker.io/library/alpine:3.24
+          P --strace --strace-file=$RUNNER_TEMP/trace-run.log --root $R $R/usr/bin/podman run --rm --network=none docker.io/library/alpine:3.24 echo hi
+          P='(mount|mount_setattr|open_tree|move_mount|fsmount|fsopen|fsconfig)\(.*= -1'
+          grep -nE "$P" $RUNNER_TEMP/trace-run.log | head -20
+          for n in $(grep -nE "$P" $RUNNER_TEMP/trace-run.log | tail -3 | cut -d: -f1); do echo "== $n"; sed -n "$((n-30)),$((n+3))p" $RUNNER_TEMP/trace-run.log; done
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-traces
+          path: ${{ runner.temp }}/trace-*.log
