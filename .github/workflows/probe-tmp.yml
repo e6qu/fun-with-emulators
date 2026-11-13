@@ -1,0 +1,27 @@
+name: probe-tmp
+on:
+  push:
+    branches: [m6-native]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p fwe
+      - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
+      - name: Build the Linux bench with zig
+        run: |
+          brew install zig >/dev/null 2>&1 || true
+          zig cc -target aarch64-linux-musl -O2 -fPIE -pie -o bench-linux guests/c/bench.c
+      - name: Timings
+        run: |
+          F=target/release/fwe
+          time (for i in $(seq 20); do $F --version >/dev/null; done)
+          time (for i in $(seq 20); do ./bench-mac exit; done)
+          time (for i in $(seq 20); do $F ./bench-linux exit; done)
+          for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit; done
+          FWE_TIMING=1 $F ./bench-linux forkexec 3 ./bench-linux
+          $F ./bench-linux forkexec 20 ./bench-linux
+          ./bench-mac forkexec 20 ./bench-mac
+          echo "TMPDIR=$TMPDIR"; df -h $TMPDIR /tmp | head -5
