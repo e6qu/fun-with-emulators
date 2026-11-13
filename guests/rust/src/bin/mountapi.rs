@@ -237,6 +237,25 @@ fn proc_fd() {
         let b = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize);
         let eb = if b < 0 { *__errno_location() } else { 0 };
         println!("in an overlay: mounted {ov}, proc attached {pmoved}; keys: openat {}, openat2 {} ({eb})", a >= 0, b >= 0);
+        // Masked, as crun masks it: /dev/null bound over it, through
+        // descriptors of both, then opened again and read.
+        let null = open(c"/dev/null".as_ptr(), 0o2000000);
+        let tree = syscall(SYS_OPEN_TREE, null, c"".as_ptr(), 1u32 | 0x1000 | 0o2000000) as i32;
+        let et = if tree < 0 { *__errno_location() } else { 0 };
+        let keys = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize) as i32;
+        let bound = mount(
+            c(&format!("/proc/self/fd/{null}")).as_ptr(),
+            c(&format!("/proc/self/fd/{keys}")).as_ptr(),
+            std::ptr::null(),
+            4096,
+            std::ptr::null(),
+        );
+        let again = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize);
+        let ea = if again < 0 { *__errno_location() } else { 0 };
+        let opened = syscall(56, root, c"proc/keys".as_ptr(), 0i64, 0i64) as i32;
+        let mut buf = [0u8; 16];
+        let n = if opened >= 0 { read(opened, buf.as_mut_ptr(), buf.len()) } else { -1 };
+        println!("masked: open_tree of /dev/null {} ({et}), bound {bound}; again {} ({ea}), reads {n}", tree >= 0, again >= 0);
         umount2(c(&dir).as_ptr(), 2);
     }
 }

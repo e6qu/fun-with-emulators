@@ -4264,20 +4264,36 @@ fn a_binary_run_through_a_read_only_clone_sees_it() {
 
 /// `/proc` reached through a descriptor of a procfs instance, as crun
 /// reaches it: one made with `fsmount`, and a clone of `/proc`; files fwe
-/// makes from the process's state (`self/status`, `mounts`) too. Attached,
-/// the mount is remounted through a descriptor of its mount point and by
-/// path, and its flags set through the descriptor it was attached with.
+/// makes from the process's state (`self/status`, `mounts`) too. Attached
+/// (in a directory, and in an overlay bound onto itself, as a container's
+/// root), the mount is remounted through a descriptor of its mount point
+/// and by path, its flags set through the descriptor it was attached
+/// with, its files opened with `openat2`, and one masked with `/dev/null`
+/// as crun masks it (a clone of `/dev/null`, and a bind through
+/// descriptors).
 #[test]
 fn proc_is_read_through_a_detached_mount() {
-    let out = fwe(&rust_guest("mountapi"), &["procfd"]);
-    assert_eq!(
-        stdout(&out),
-        "fsmount proc: cap_last_cap 40\nmounts: read\nself/mountinfo: read\nself/status: read\n\
+    let want = "fsmount proc: cap_last_cap 40\nmounts: read\nself/mountinfo: read\nself/status: read\n\
          self/cgroup: read\nopen_tree /proc: cap_last_cap 40\n\
-         proc attached 0; remount through fd 0 (0), by path 0 (0); setattr through its descriptor 0\n",
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+         proc attached 0; remount through fd 0 (0), by path 0 (0); setattr through its descriptor 0\n\
+         keys under it: openat true, openat2 true (0)\n\
+         in an overlay: mounted 0, proc attached 0; keys: openat true, openat2 true (0)\n\
+         masked: open_tree of /dev/null true (0), bound 0; again true (0), reads 0\n";
+    // On the host's files, and in a root filesystem, whose `/dev/null` is
+    // the host's device served from outside it, as a container engine's.
+    let out = fwe(&rust_guest("mountapi"), &["procfd"]);
+    assert_eq!(stdout(&out), want, "{}", String::from_utf8_lossy(&out.stderr));
+    let root = std::env::temp_dir().join(format!("fwe-procfd-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["tmp", "proc", "dev", "sys"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::copy(rust_guest("mountapi"), root.join("mountapi")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("mountapi")).arg("procfd");
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), want, "in a root: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// What the `nsfd` guest prints.

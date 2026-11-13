@@ -759,6 +759,33 @@ impl<P: Platform> Kernel<P> {
         if tree_key(dfd as i32).is_some() && name.is_empty() && empty {
             return err(errno::EINVAL);
         }
+        // A standard device node fwe serves from the host (`/dev/null`,
+        // which crun clones to mask files): a tree of that one file, the
+        // mount a bind of it makes.
+        let device = if name.is_empty() && empty {
+            crate::fs::device_of_fd(dfd as i32)
+        } else if dfd as i64 == fcntl::AT_FDCWD || name.starts_with(b"/") {
+            self.fs().device_host(&name)
+        } else {
+            None
+        };
+        if let Some(host) = device {
+            let m = Mount {
+                id: 0,
+                parent: 0,
+                point: Vec::new(),
+                fstype: crate::mounts::FsType::Tmpfs,
+                source: crate::mounts::Source::Host(host),
+                root: b"/".to_vec(),
+                flags: 0,
+                propagation: ms::PRIVATE,
+                peer: 0,
+                master: 0,
+                device: b"devtmpfs".to_vec(),
+                options: Vec::new(),
+            };
+            return self.tree_descriptor(vec![m], cloexec);
+        }
         let ns = guest!(self.ns_path_at(dfd as i32, &name, empty, follow));
         let tree = guest!(self.fs().mount_ns().table().copy_tree(&ns, flags & AT_RECURSIVE != 0));
         self.tree_descriptor(tree, cloexec)

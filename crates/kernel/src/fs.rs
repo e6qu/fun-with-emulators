@@ -1531,6 +1531,13 @@ impl Fs {
     /// device nodes fwe serves in the rootfs's own `/dev` (see
     /// [`resolve_in`]): what a bind mount of it shows.
     pub fn device_host(&self, path: &[u8]) -> Option<Vec<u8>> {
+        // Through a descriptor of one (`/proc/self/fd/N`, `/dev/fd/N`), as
+        // crun binds `/dev/null` over the files it masks.
+        if let Some(crate::procfs::Entry::Fd { fd, .. }) =
+            self.synthetic(fcntl::AT_FDCWD as i32, path)
+        {
+            return device_of_fd(fd);
+        }
         let absolute = self.absolute_path(fcntl::AT_FDCWD as i32, path)?;
         let name = absolute.strip_prefix(b"/dev/")?;
         if !DEVICES.contains(&name) && crate::loopdev::node_named(name).is_none() {
@@ -2802,6 +2809,14 @@ fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
     }
     out.truncate(at);
     Ok(out)
+}
+
+/// The host file of the standard device node `fd` is open on, if it is
+/// one of them ([`DEVICES`]): what a bind mount or a clone of it shows.
+pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
+    let p = fd_path(fd)?;
+    let name = p.strip_prefix(b"/dev/")?;
+    DEVICES.contains(&name).then_some(p)
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever
