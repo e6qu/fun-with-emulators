@@ -702,44 +702,59 @@ fn x18_survives_kernel_entry() -> bool {
 }
 
 /// Diagnostic probes of host behaviour, run one per process with
-/// Microseconds per create-write-close, rewrite of an existing file, and
-/// create of an empty one, in fwe's records directory and in a new
-/// temporary directory (see `probe`).
+/// How long one write of a new file in fwe's records directory takes, and
+/// its close, as this process takes on what a program's start does (see
+/// `probe`).
 fn file_writes_probe() -> String {
     use std::io::Write;
-    let time = |f: &mut dyn FnMut(usize)| {
+    let dir = fwe_kernel::procreg::records_dir()
+        .map(|d| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&d)))
+        .unwrap_or_else(std::env::temp_dir);
+    let mut n = 0;
+    // One create-write-close, then a close alone of a file just written.
+    let mut once = |what: &str| -> String {
+        n += 1;
+        let f = dir.join(format!("probe-{}-{n}", std::process::id()));
         let start = std::time::Instant::now();
-        for i in 0..30 {
-            f(i);
-        }
-        start.elapsed().as_micros() / 30
+        let mut h = std::fs::File::create(&f).unwrap();
+        h.write_all(&[7u8; 200]).unwrap();
+        let written = start.elapsed().as_micros();
+        drop(h);
+        let closed = start.elapsed().as_micros() - written;
+        let _ = std::fs::remove_file(&f);
+        format!("{what}: write {written} us, close {closed} us\n")
     };
     let mut out = String::new();
-    let tmp = std::env::temp_dir().join(format!("fwe-writes-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-    let records = fwe_kernel::procreg::records_dir()
-        .map(|d| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&d)));
-    for (name, dir) in [("records", records), ("tmp", Some(tmp.clone()))] {
-        let Some(dir) = dir else { continue };
-        let f = |i: usize| dir.join(format!("probe-{}-{i}", std::process::id()));
-        let empty = time(&mut |i| drop(std::fs::File::create(f(i))));
-        let written = time(&mut |i| {
-            let _ = std::fs::File::create(f(i)).and_then(|mut h| h.write_all(&[7u8; 200]));
-        });
-        let rewritten = time(&mut |i| {
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .open(f(i))
-                .and_then(|mut h| h.write_all(&[8u8; 200]));
-        });
-        for i in 0..30 {
-            let _ = std::fs::remove_file(f(i));
-        }
-        out.push_str(&format!(
-            "{name}: create {empty} us, create+write {written} us, rewrite {rewritten} us\n"
-        ));
+    out.push_str(&once("at start"));
+    out.push_str(&once("again"));
+    // SAFETY: plain host calls making mappings this probe keeps.
+    unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            1 << 30,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
     }
-    let _ = std::fs::remove_dir_all(&tmp);
+    out.push_str(&once("after a 1 GiB reservation"));
+    // SAFETY: as above.
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            1 << 20,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        libc::mprotect(p, 1 << 20, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    out.push_str(&once("after executable memory"));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    trap::install_handlers();
+    out.push_str(&once("after fwe's signal handlers"));
     out
 }
 
