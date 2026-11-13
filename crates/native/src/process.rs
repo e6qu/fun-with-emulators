@@ -74,8 +74,9 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
     // The calling thread's view is what the program runs with.
     k.adopt_thread_view();
+    // A script runs its interpreter.
+    let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
-    k.may_exec(&path).map_err(err)?;
     let file = fs.read(&path).map_err(err)?;
     let vm = crate::needs_vm(&file);
     // A program only the VM can run, where there is none: the exec fails

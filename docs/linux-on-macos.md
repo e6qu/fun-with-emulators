@@ -1967,7 +1967,11 @@ flowchart TD
 | a program run from a descriptor (`execveat(fd, "", AT_EMPTY_PATH)`) | the descriptor kept and passed on with `--exe-fd` |
 
 `execveat` turns its directory descriptor, path and flags into a guest
-path and is then `execve`.
+path and is then `execve`. A script (`#!interpreter [argument]`) runs
+its interpreter as Linux's `binfmt_script` does, with the line's argument,
+the script's path (`/dev/fd/N` for a descriptor) and the rest of the
+arguments, nested up to five deep (`Kernel::exec_target`); the
+interpreter, not the script, decides what set-ID bits grant.
 
 #### The ELF loader and dynamic linker
 

@@ -432,6 +432,33 @@ fn root_programs_behind_absolute_links_run() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A script run by `execve` with no shell between (as `apk` runs its
+/// packages' scripts, from a memfd through `fexecve`): its `#!` line's
+/// interpreter runs with the line's argument, the script's path
+/// (`/dev/fd/N` for a descriptor), then the rest of the arguments.
+#[test]
+fn scripts_run_their_interpreter() {
+    let dir = std::env::temp_dir().join(format!("fwe-script-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let me = rust_guest("args");
+    let out = fwe(&me, &["script", dir.to_str().unwrap()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = stdout(&out);
+    let want = format!(
+        "arg[0]={}\narg[1]=-a\narg[2]={}/script.sh\narg[3]=one\n",
+        me.display(),
+        dir.display()
+    );
+    assert!(text.starts_with(&want), "{text}");
+    let out = fwe(&me, &["memfd-script"]);
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().take(4).collect();
+    assert_eq!(lines[..2], [format!("arg[0]={}", me.display()), "arg[1]=-a".to_string()], "{text}");
+    assert!(lines[2].starts_with("arg[2]=/dev/fd/"), "{text}");
+    assert_eq!(lines[3], "arg[3]=one", "{text}");
+}
+
 /// Build one assembly guest object and link it with the given extra flags.
 fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     let out = out_dir().join("asm");

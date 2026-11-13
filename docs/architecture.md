@@ -187,6 +187,8 @@ guest, and the machinery for threads and `fork`.
 - The break is reserved after the image and its stub space (up to 1 GiB,
   halved while something is in the way) before the dynamic linker is
   placed. The stack is 8 MiB with a guard page.
+- `execve` of a script runs its `#!` interpreter (`Kernel::exec_target`),
+  in either backend, so a program needs no shell to run one.
 - An in-place `execve` checks the new program first (an arm64 ELF that
   fits the address space, with a dynamic linker that exists), so a bad
   one fails with the caller intact. A re-exec checks only that it is an

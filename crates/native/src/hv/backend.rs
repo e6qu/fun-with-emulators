@@ -1224,9 +1224,11 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     let argv = if argv.is_empty() { vec![Vec::new()] } else { argv };
     let guard = kernel();
     let k = guard.as_ref().unwrap();
-    if let Err(e) = k.may_exec(&path) {
-        return err(e);
-    }
+    // A script runs its interpreter.
+    let (path, argv) = match k.exec_target(path, argv) {
+        Ok(t) => t,
+        Err(e) => return err(e),
+    };
     let fs = k.fs();
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.

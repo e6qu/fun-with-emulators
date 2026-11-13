@@ -1414,8 +1414,32 @@ impl Fs {
     }
 
     /// The first `len` bytes (or fewer, at its end) of the regular file
-    /// `path` names.
+    /// `path` names, as [`Fs::read`] finds it (a descriptor's file for
+    /// `/dev/fd/N`).
     pub fn read_head(&self, path: &[u8], len: usize) -> Result<Vec<u8>, i32> {
+        if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
+            use crate::procfs::Entry;
+            return match entry {
+                Entry::File(mut data) => {
+                    data.truncate(len);
+                    Ok(data)
+                }
+                Entry::Fd { fd, .. } => {
+                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid out-parameter.
+                    if unsafe { libc::fstat(fd, &mut st) } != 0
+                        || st.st_mode & libc::S_IFMT != libc::S_IFREG
+                    {
+                        return Err(errno::EACCES);
+                    }
+                    pread_head(fd, len)
+                }
+                Entry::Symlink(t) if t.starts_with(b"/") => self.read_head(&t, len),
+                Entry::Dir => Err(errno::EISDIR),
+                _ => Err(errno::ENOENT),
+            };
+        }
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
@@ -1427,28 +1451,7 @@ impl Fs {
         }
         // SAFETY: `fd` is a fresh owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut out = vec![0u8; len];
-        let mut at = 0;
-        while at < len {
-            // SAFETY: reading into the rest of `out`.
-            let n = unsafe {
-                libc::pread(
-                    fd.as_raw_fd(),
-                    out[at..].as_mut_ptr().cast(),
-                    len - at,
-                    at as libc::off_t,
-                )
-            };
-            if n < 0 {
-                return Err(e());
-            }
-            if n == 0 {
-                break;
-            }
-            at += n as usize;
-        }
-        out.truncate(at);
-        Ok(out)
+        pread_head(fd.as_raw_fd(), len)
     }
 
     /// The device and inode numbers of the file `path` names, following
@@ -2753,6 +2756,27 @@ pub(crate) fn host_path_in(dir: i32, name: &[u8]) -> Option<Vec<u8>> {
 /// descriptor (a pipe, a socket, a memfd).
 pub(crate) fn has_path(fd: i32, target: &[u8]) -> bool {
     target.starts_with(b"/") && crate::memfd::name(fd).is_none()
+}
+
+/// The first `len` bytes of the file open as `fd` (fewer at its end), read
+/// from its start without moving its offset.
+fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
+    let mut out = vec![0u8; len];
+    let mut at = 0;
+    while at < len {
+        // SAFETY: reading into the rest of `out`.
+        let n =
+            unsafe { libc::pread(fd, out[at..].as_mut_ptr().cast(), len - at, at as libc::off_t) };
+        if n < 0 {
+            return Err(e());
+        }
+        if n == 0 {
+            break;
+        }
+        at += n as usize;
+    }
+    out.truncate(at);
+    Ok(out)
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever

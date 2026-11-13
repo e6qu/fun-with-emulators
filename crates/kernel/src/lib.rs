@@ -664,6 +664,35 @@ impl<P: Platform> Kernel<P> {
         Ok(())
     }
 
+    /// The program an `execve` of `path` with `args` loads, and its
+    /// arguments, as Linux's `binfmt_script` makes them: a file that starts
+    /// `#!` runs its interpreter (the line's first word, up to 255 bytes in)
+    /// with the rest of the line as one argument if there is any, then
+    /// `path` as given (`/dev/fd/N` for a descriptor), then `args` but the
+    /// first; an interpreter may be a script too, five deep. Each must be
+    /// one the caller may run ([`Kernel::may_exec`], which notes what the
+    /// last grants: a script's own set-ID bits grant nothing).
+    pub fn exec_target(
+        &self,
+        path: Vec<u8>,
+        args: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, Vec<Vec<u8>>), i32> {
+        let (mut path, mut args) = (path, args);
+        for _ in 0..5 {
+            self.may_exec(&path)?;
+            let Some(fs) = self.fs_opt() else { return Ok((path, args)) };
+            let Some((interp, arg)) = script_interpreter(&fs.read_head(&path, 256)?)? else {
+                return Ok((path, args));
+            };
+            let mut new = vec![interp.clone()];
+            new.extend(arg);
+            new.push(path);
+            new.extend(args.into_iter().skip(1));
+            (path, args) = (interp, new);
+        }
+        Err(fwe_abi::errno::ELOOP)
+    }
+
     /// What an `execve` that re-executes fwe carries into the new process
     /// beyond what the host keeps: the mount namespace and root (first, so
     /// that the new process finds its program in them, see
@@ -889,6 +918,28 @@ impl<P: Platform> Kernel<P> {
     pub fn thread_cleanup(&mut self) {
         thread_exit_cleanup();
     }
+}
+
+/// A script's interpreter and its optional argument.
+type Interpreter = (Vec<u8>, Option<Vec<u8>>);
+
+/// The interpreter and its optional argument a script's first bytes
+/// `head` name (`#!interpreter [argument]`), or `None` for a file that is
+/// no script. `ENOEXEC` for a `#!` line with no interpreter.
+fn script_interpreter(head: &[u8]) -> Result<Option<Interpreter>, i32> {
+    let Some(rest) = head.strip_prefix(b"#!") else { return Ok(None) };
+    let line = &rest[..rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len())];
+    let blank = |c: &u8| *c == b' ' || *c == b'\t';
+    let start = line.iter().position(|c| !blank(c)).unwrap_or(line.len());
+    let end = line.iter().rposition(|c| !blank(c)).map_or(start, |e| e + 1);
+    let line = &line[start..end.max(start)];
+    if line.is_empty() {
+        return Err(fwe_abi::errno::ENOEXEC);
+    }
+    let split = line.iter().position(blank).unwrap_or(line.len());
+    let arg = &line[split..];
+    let arg = &arg[arg.iter().position(|c| !blank(c)).unwrap_or(arg.len())..];
+    Ok(Some((line[..split].to_vec(), (!arg.is_empty()).then(|| arg.to_vec()))))
 }
 
 /// Clear and wake this thread's `set_tid_address` futex word, so a joiner
@@ -1917,4 +1968,26 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::RECVMMSG => unsafe { net::recvmmsg(a[0], a[1], a[2], a[3], a[4]) },
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::script_interpreter;
+
+    #[test]
+    fn script_lines_are_read_as_linux_reads_them() {
+        let v = |s: &str| s.as_bytes().to_vec();
+        assert_eq!(script_interpreter(b"\x7fELF..."), Ok(None));
+        assert_eq!(script_interpreter(b"#!/bin/sh\necho"), Ok(Some((v("/bin/sh"), None))));
+        assert_eq!(
+            script_interpreter(b"#! /usr/bin/env  python3 -u \nx"),
+            Ok(Some((v("/usr/bin/env"), Some(v("python3 -u")))))
+        );
+        assert_eq!(script_interpreter(b"#!/bin/sh"), Ok(Some((v("/bin/sh"), None))));
+        assert_eq!(
+            script_interpreter(b"#!\t/bin/sh\t-e\n"),
+            Ok(Some((v("/bin/sh"), Some(v("-e")))))
+        );
+        assert_eq!(script_interpreter(b"#!  \n"), Err(fwe_abi::errno::ENOEXEC));
+    }
 }
