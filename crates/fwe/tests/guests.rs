@@ -1596,6 +1596,8 @@ fn user_guide_recipes() {
     let bin = Path::new(env!("CARGO_BIN_EXE_fwe")).parent().unwrap().to_path_buf();
     let mut at = 0;
     let mut ran = Vec::new();
+    // Every recipe runs, so one run of CI shows each that fails.
+    let mut failed = Vec::new();
     while let Some(i) = guide[at..].find("<!-- tested: ") {
         let i = i + at;
         let name = guide[i + 13..].split(' ').next().unwrap().to_string();
@@ -1608,12 +1610,15 @@ fn user_guide_recipes() {
         cmd.env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()));
         let out = run_bounded_for(cmd, &[], Duration::from_secs(900));
         eprintln!("--- guide {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(stdout(&out), format!("{want}\n"), "guide recipe {name}");
-        assert_eq!(out.status.code(), Some(0), "guide recipe {name}");
+        if stdout(&out) != format!("{want}\n") || out.status.code() != Some(0) {
+            eprintln!("--- guide {name} printed ({}):\n{}", out.status, stdout(&out));
+            failed.push(name.clone());
+        }
         ran.push(name);
     }
     let _ = std::fs::remove_dir_all(&home);
     assert_eq!(ran, ["debian", "alpine", "podman"]);
+    assert!(failed.is_empty(), "guide recipes that failed: {failed:?}");
 }
 
 /// Run `args` (a program of the root, then its arguments) in a copy of the
