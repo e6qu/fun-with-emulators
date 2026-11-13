@@ -255,14 +255,16 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
 fn read_any(pid: i32) -> Option<ProcRecord> {
     let p = path(pid)?;
     // A record is rewritten in place ([`write`]): one read while it is
-    // being written fails its check, and is made again.
-    for i in 0..1000 {
+    // being written fails its check, and is made again. An empty file is
+    // one not yet written (or whose writer died first): no record.
+    for _ in 0..100 {
         let bytes = std::fs::read(OsStr::from_bytes(&p)).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
         if let Some(body) = unframe(&bytes) {
-            if i > 0 { crate::tmark(&format!("read_any {pid} retried {i}")); }
             return decode(body);
         }
-        if i == 0 { crate::tmark(&format!("read_any {pid} bad frame len {}", bytes.len())); }
         std::thread::yield_now();
     }
     None
@@ -346,10 +348,10 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
 }
 
 /// Write the record of host process `pid`, under its lock ([`change`]): in
-/// place, framed with its length and checksum, for readers (who take no
-/// lock) to tell a record being written from a whole one, and what follows
-/// it from the record. A new file costs the host far more than rewriting
-/// one.
+/// place (a new file costs the host far more than rewriting one), framed
+/// with its length and checksum, for readers (who take no lock) to tell a
+/// whole record from one being written, and from an older one's longer
+/// tail.
 fn write(pid: i32, r: &ProcRecord) {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
@@ -376,7 +378,6 @@ fn lock(pid: i32) -> Option<std::fs::File> {
         .write(true)
         .open(OsStr::from_bytes(&p))
         .ok()?;
-    crate::tmark("   l opened");
     use std::os::fd::AsRawFd;
     // SAFETY: plain host call on the file just opened; the lock goes with it.
     crate::shared::lock_exclusive(f.as_raw_fd());
@@ -650,17 +651,12 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 /// Change the record of host process `pid` with `f` (making one if it has
 /// none).
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
-    crate::tmark("   c0");
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
-    crate::tmark("   c start");
     // Under the record's lock: a parent and its child may change one.
     let _lock = lock(pid);
-    crate::tmark("   c locked");
     let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
-    crate::tmark("   c read");
     f(&mut r);
     write(pid, &r);
-    crate::tmark("   c written");
     Ok(())
 }
 
@@ -681,12 +677,21 @@ type Pending = Box<dyn Fn(&mut ProcRecord) + Send>;
 /// The changes [`batch`] holds back, with the process they are for.
 static BATCH: std::sync::Mutex<Option<(i32, Vec<Pending>)>> = std::sync::Mutex::new(None);
 
+/// Whether a [`batch`] runs: only then is [`BATCH`] looked at, so a
+/// process forked while another thread reads a record never inherits it
+/// locked.
+static BATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Run `f`, making the changes it makes to this process's own record
 /// ([`own_program`], [`own_auxv`], [`own_namespaces`]) in one write at its
-/// end: a program's start makes several.
+/// end: a program's start makes several. Only while the process has one
+/// thread (its start, an `execve`).
 pub fn batch<R>(f: impl FnOnce() -> R) -> R {
+    use std::sync::atomic::Ordering::SeqCst;
     *BATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((me(), Vec::new()));
+    BATCHING.store(true, SeqCst);
     let out = f();
+    BATCHING.store(false, SeqCst);
     let held = BATCH.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some((pid, changes)) = held.filter(|(_, c)| !c.is_empty()) {
         let _ = change(pid, |r| changes.iter().for_each(|c| c(r)));
@@ -698,7 +703,7 @@ pub fn batch<R>(f: impl FnOnce() -> R) -> R {
 /// for [`batch`].
 fn change_own(f: impl Fn(&mut ProcRecord) + Send + 'static) {
     let me = me();
-    {
+    if BATCHING.load(std::sync::atomic::Ordering::SeqCst) {
         let mut b = BATCH.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((pid, changes)) = b.as_mut()
             && *pid == me
@@ -712,6 +717,9 @@ fn change_own(f: impl Fn(&mut ProcRecord) + Send + 'static) {
 
 /// This process's record with the changes [`batch`] holds back.
 fn with_held(pid: i32, r: Option<ProcRecord>) -> Option<ProcRecord> {
+    if !BATCHING.load(std::sync::atomic::Ordering::SeqCst) {
+        return r;
+    }
     let b = BATCH.lock().unwrap_or_else(|e| e.into_inner());
     match b.as_ref() {
         Some((p, changes)) if *p == pid && !changes.is_empty() => {

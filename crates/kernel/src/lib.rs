@@ -1910,12 +1910,3 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         _ => return None,
     })
 }
-
-// TEMP timing
-pub static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-pub fn tmark(label: &str) {
-    if std::env::var_os("FWE_T").is_some() {
-        let t = T0.get_or_init(std::time::Instant::now);
-        eprintln!("[t] {:>8.3} ms {label}", t.elapsed().as_secs_f64() * 1e3);
-    }
-}

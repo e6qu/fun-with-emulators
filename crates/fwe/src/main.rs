@@ -38,7 +38,6 @@ options:
 ";
 
 fn main() -> ExitCode {
-    fwe_native::tmark("main");
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -99,7 +98,6 @@ fn main() -> ExitCode {
         eprintln!("fwe: {late} must come first\n{USAGE}");
         return ExitCode::from(2);
     }
-    fwe_native::tmark("args");
     let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
     while let Some(arg) = args.peek() {

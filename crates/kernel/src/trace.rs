@@ -101,7 +101,6 @@ impl Tracer {
     }
 
     fn write_line(&self, line: &str) {
-        crate::tmark("strace");
         let mut out = String::with_capacity(line.len() + 16);
         let fd = match FILE.get() {
             Some((_, fd)) => {

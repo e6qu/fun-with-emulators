@@ -1886,6 +1886,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_gone_process_leaves_its_mailboxes_to_be_collected() {
+        use std::os::unix::ffi::OsStrExt;
+        // A process that has ended (and been reaped).
+        let child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone = child.id() as i32;
+        let mut child = child;
+        child.wait().unwrap();
+        assert!(leftover(format!("ptrace-inbox-{gone}").as_bytes()));
+        assert!(!leftover(format!("ptrace-inbox-{}", me()).as_bytes()));
+        // A thread's mailbox, by the process it says it is in.
+        let id = 0x7ff0_0000 + (me() & 0xffff);
+        let mb = open(&mailbox_name(id), true).unwrap();
+        mb.word(W_PROC).store(me() as u64, Ordering::Release);
+        assert!(!leftover(&mailbox_name(id).as_bytes()[1..]));
+        mb.word(W_PROC).store(gone as u64, Ordering::Release);
+        assert!(leftover(&mailbox_name(id).as_bytes()[1..]));
+        let _ = std::fs::remove_file(std::ffi::OsStr::from_bytes(
+            path(&mailbox_name(id)).unwrap().to_bytes(),
+        ));
+        assert!(!leftover(b"ptrace-x"));
+    }
+
+    #[test]
     fn a_step_follows_every_kind_of_branch() {
         let mut x = [0u64; 31];
         x[3] = 0x9000;

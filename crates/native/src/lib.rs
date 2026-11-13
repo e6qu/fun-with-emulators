@@ -103,9 +103,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
-        fwe_kernel::tmark("exit");
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
-        fwe_kernel::tmark("exited");
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
@@ -1000,21 +998,16 @@ fn start(
             "the native backend runs only on macOS on Apple Silicon".into(),
         ));
     }
-    fwe_kernel::tmark("start");
     // fwe's own descriptors go above the guest's range from here on.
     fwe_kernel::fdtable::init();
-    fwe_kernel::tmark("fdinit");
     if options.exec_state.is_none() {
         // A fresh start: what earlier runs left behind and no process holds
         // goes (see `fwe_kernel::shared::collect`).
-        fwe_kernel::tmark("collect0");
         fwe_kernel::shared::collect();
     }
-    fwe_kernel::tmark("collected");
     let args = &guest_args(args, options);
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
-    fwe_kernel::tmark("openfs");
     let data = read_program(path, options, &fs)?;
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
@@ -1024,12 +1017,10 @@ fn start(
         return Err(hv::run(path, &data, args, env, options));
     }
 
-    fwe_kernel::tmark("read");
     let page = page_size();
     let tracer = options.strace;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     trap::set_tracing(tracer.enabled);
-    fwe_kernel::tmark("collect-start");
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
 
@@ -1045,35 +1036,26 @@ fn start(
         page,
         options.strace,
     )?;
-    fwe_kernel::tmark("loaded");
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
-    fwe_kernel::tmark("tramp");
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
         fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
-        fwe_kernel::tmark("procinfo");
         fs.set_auxv(out.auxv.clone());
-        fwe_kernel::tmark("auxv");
         fs.publish();
-        fwe_kernel::tmark("published");
         // The main thread's id equals the process id, as on Linux: in its
         // pid namespace, for a process exec'd in one.
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
-        fwe_kernel::tmark("initmain");
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
     });
-    fwe_kernel::tmark("ownns");
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();
 
-    fwe_kernel::tmark("threads");
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
     apply_exec_state(&mut kernel, options, path)?;
-    fwe_kernel::tmark("kernel");
     *KERNEL.lock().unwrap() = Some(kernel);
     enter(out.sp, out.entry)
 }
@@ -1109,7 +1091,6 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     });
     // From here on this thread runs guest code, which may use x18 freely;
     // the trap handlers leave the mode while they run host code.
-    fwe_kernel::tmark("entering");
     trap::prepare_guest_entry();
     match traced {
         // SAFETY: the registers of the program's entry, as the tracer left them.
@@ -1122,4 +1103,3 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
 fn enter(_sp: u64, _entry: u64) -> Result<std::convert::Infallible, Error> {
     unreachable!("checked in start")
 }
-pub use fwe_kernel::tmark;
