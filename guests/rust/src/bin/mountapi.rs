@@ -256,6 +256,23 @@ fn proc_fd() {
         let mut buf = [0u8; 16];
         let n = if opened >= 0 { read(opened, buf.as_mut_ptr(), buf.len()) } else { -1 };
         println!("masked: open_tree of /dev/null {} ({et}), bound {bound}; again {} ({ea}), reads {n}", tree >= 0, again >= 0);
+        // sysfs the same way, read-only and recursive, as crun makes a
+        // container's /sys: a new instance, and a clone of the host's.
+        mkdir(c(&format!("{o}/lower/sys")).as_ptr(), 0o755);
+        let sdir = syscall(56, root, c"sys".as_ptr(), 0o40000i64 | 0o100000 | 0o2000000, 0i64) as i32;
+        let sfs = syscall(SYS_FSOPEN, c"sysfs".as_ptr(), 0u32) as i32;
+        syscall(SYS_FSCONFIG, sfs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
+        let sm = syscall(SYS_FSMOUNT, sfs, 0u32, 0u64) as i32;
+        let smoved = syscall(SYS_MOVE_MOUNT, sm, c"".as_ptr(), sdir, c"".as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | 0x40);
+        const MOUNT_ATTR_RDONLY: u64 = 1;
+        let attr = [MOUNT_ATTR_RDONLY | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC | 2, 0, 0, 0];
+        let sr = syscall(SYS_MOUNT_SETATTR, sm, c"".as_ptr(), 0x1000u32 | 0x8000, attr.as_ptr(), 32usize);
+        let es = if sr < 0 { *__errno_location() } else { 0 };
+        let st = syscall(SYS_OPEN_TREE, AT_FDCWD, c"/sys".as_ptr(), 1u32 | 0x8000 | 0o2000000) as i32;
+        let et2 = if st < 0 { *__errno_location() } else { 0 };
+        let sr2 = syscall(SYS_MOUNT_SETATTR, st, c"".as_ptr(), 0x1000u32 | 0x8000, attr.as_ptr(), 32usize);
+        let es2 = if sr2 < 0 { *__errno_location() } else { 0 };
+        println!("sysfs attached {smoved}, setattr {sr} ({es}); clone of /sys {} ({et2}), setattr {sr2} ({es2})", st >= 0);
         umount2(c(&dir).as_ptr(), 2);
     }
 }
