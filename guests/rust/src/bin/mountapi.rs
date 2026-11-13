@@ -183,7 +183,10 @@ fn proc_fd() {
         let dir = format!("/tmp/fwe-procfd-{}", getpid());
         mkdir(c(&dir).as_ptr(), 0o755);
         let dir = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
-        let moved = syscall(SYS_MOVE_MOUNT, mnt, c"".as_ptr(), AT_FDCWD, c(&dir).as_ptr(), MOVE_MOUNT_F_EMPTY_PATH);
+        // Attached through a descriptor of the directory, as crun does.
+        let at = open(c(&dir).as_ptr(), 0o40000 | 0o100000 | 0o2000000);
+        let moved = syscall(SYS_MOVE_MOUNT, mnt, c"".as_ptr(), at, c"".as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | 0x40);
+        close(at);
         let target = open(c(&dir).as_ptr(), O_PATH | 0o2000000);
         let through = format!("/proc/self/fd/{target}");
         const MS_REMOUNT: u64 = 32;
@@ -200,6 +203,40 @@ fn proc_fd() {
         let attr = [MOUNT_ATTR_NODEV, 0, 0, 0];
         let r3 = syscall(SYS_MOUNT_SETATTR, mnt, c"".as_ptr(), 0x1000u32, attr.as_ptr(), 32usize);
         println!("proc attached {moved}; remount through fd {r} ({e}), by path {r2} ({e2}); setattr through its descriptor {r3}");
+        // Its files opened relative to the directory it is in, as crun
+        // opens a container's (`openat`, and `openat2` kept in that root).
+        let parent = open(c(&dir).as_ptr().cast::<c_char>(), O_PATH | 0o2000000);
+        let up = open(c(&format!("{dir}/..")).as_ptr(), O_PATH | 0o2000000);
+        let name = dir.rsplit('/').next().unwrap();
+        let rel = c(&format!("{name}/keys"));
+        let a = syscall(56, up, rel.as_ptr(), O_PATH | 0o2000000, 0i64);
+        let how = [(O_PATH | 0o2000000) as u64, 0u64, 0x08 /* RESOLVE_IN_ROOT */];
+        let b = syscall(437, up, rel.as_ptr(), how.as_ptr(), 24usize);
+        let eb = if b < 0 { *__errno_location() } else { 0 };
+        println!("keys under it: openat {}, openat2 {} ({eb})", a >= 0, b >= 0);
+        close(parent);
+        // The same in an overlay's directory, as a container's root is.
+        let o = format!("{dir}-ovl");
+        for d in ["", "/lower", "/upper", "/work", "/merged"] {
+            mkdir(c(&format!("{o}{d}")).as_ptr(), 0o755);
+        }
+        mkdir(c(&format!("{o}/lower/proc")).as_ptr(), 0o755);
+        let opts = format!("lowerdir={o}/lower,upperdir={o}/upper,workdir={o}/work");
+        let merged = format!("{o}/merged");
+        let ov = mount(c"overlay".as_ptr(), c(&merged).as_ptr(), c"overlay".as_ptr(), 0, c(&opts).as_ptr().cast());
+        // Bound onto itself and made private, as crun prepares a root.
+        mount(c(&merged).as_ptr(), c(&merged).as_ptr(), std::ptr::null(), 0x5000, std::ptr::null());
+        mount(std::ptr::null(), c(&merged).as_ptr(), std::ptr::null(), MS_REC | MS_PRIVATE, std::ptr::null());
+        let root = open(c(&merged).as_ptr(), O_PATH | 0o40000 | 0o2000000);
+        let pfs = syscall(SYS_FSOPEN, c"proc".as_ptr(), 0u32) as i32;
+        syscall(SYS_FSCONFIG, pfs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
+        let pm = syscall(SYS_FSMOUNT, pfs, 0u32, 0u64) as i32;
+        let pdir = syscall(56, root, c"proc".as_ptr(), 0o40000i64 | 0o100000 | 0o2000000, 0i64) as i32;
+        let pmoved = syscall(SYS_MOVE_MOUNT, pm, c"".as_ptr(), pdir, c"".as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | 0x40);
+        let a = syscall(56, root, c"proc/keys".as_ptr(), O_PATH | 0o2000000, 0i64);
+        let b = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize);
+        let eb = if b < 0 { *__errno_location() } else { 0 };
+        println!("in an overlay: mounted {ov}, proc attached {pmoved}; keys: openat {}, openat2 {} ({eb})", a >= 0, b >= 0);
         umount2(c(&dir).as_ptr(), 2);
     }
 }
