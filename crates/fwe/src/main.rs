@@ -47,6 +47,7 @@ options:
 ";
 
 fn main() -> ExitCode {
+    fwe_kernel::timing::init();
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();

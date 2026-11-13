@@ -101,6 +101,7 @@ pub mod term;
 pub mod textbusy;
 pub mod thread;
 pub mod threadfs;
+pub mod timing;
 pub mod tmpfile;
 pub mod tmpfs;
 pub mod trace;

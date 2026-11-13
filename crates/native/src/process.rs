@@ -78,6 +78,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
     let file = fs.read(&path).map_err(err)?;
+    fwe_kernel::timing::mark("exec: read");
     let vm = crate::needs_vm(&file);
     // A program only the VM can run, where there is none: the exec fails
     // while the caller is intact (podman's pause process then waits in a
@@ -93,6 +94,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
     // The old image is untouched on failure, so the guest can handle it.
+    fwe_kernel::timing::mark("exec: checked for re-exec");
     crate::check_image(&file, fs).map_err(err)?;
     // A program with no path (a memfd) is held, for `/proc/self/exe`: the
     // descriptor it was run through may close on exec.
@@ -110,6 +112,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // parent may resume. The robust futexes its threads hold are released
     // first.
     fwe_kernel::release_robust_lists();
+    fwe_kernel::timing::mark("exec: checked");
     fwe_kernel::mm::release_guest_memory();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
@@ -126,6 +129,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         }
     };
 
+    fwe_kernel::timing::mark("exec: loaded");
     k.close_on_exec();
     k.exec_reset();
     k.brk = out.brk;
@@ -139,6 +143,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
             fs.publish();
         });
     }
+    fwe_kernel::timing::mark("exec: published");
     // The new program starts with every register zero, as Linux leaves it;
     // the trap handler returns into it.
     Ok(Regs { sp: out.sp, pc: out.entry, ..Regs::default() })
@@ -230,6 +235,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 region::set_shared_on_fork(start, len, on);
             }
         };
+        fwe_kernel::timing::mark("fork: prepared");
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
@@ -251,6 +257,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             set_shared(false);
             pid
         });
+        fwe_kernel::timing::mark(if pid == 0 { "fork: child" } else { "fork: parent" });
         let e = fwe_kernel::host::last_error();
         // The child's pid: in the child, its own namespace's; in the
         // parent, as the parent sees it.

@@ -1027,15 +1027,20 @@ fn start(
     }
     // fwe's own descriptors go above the guest's range from here on.
     fwe_kernel::fdtable::init();
+    fwe_kernel::timing::mark("main");
     if options.exec_state.is_none() {
         // A fresh start: what earlier runs left behind and no process holds
         // goes (see `fwe_kernel::shared::collect`).
         fwe_kernel::shared::collect();
     }
     let args = &guest_args(args, options);
+    fwe_kernel::timing::mark("collect");
+
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
+    fwe_kernel::timing::mark("open_fs");
     let data = read_program(path, options, &fs)?;
+    fwe_kernel::timing::mark("read_program");
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1063,9 +1068,11 @@ fn start(
         page,
         options.strace,
     )?;
+    fwe_kernel::timing::mark("load_image");
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(page)?;
+    fwe_kernel::timing::mark("trampoline");
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
@@ -1077,6 +1084,7 @@ fn start(
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
     });
+    fwe_kernel::timing::mark("published");
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();
 
@@ -1084,6 +1092,7 @@ fn start(
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
     apply_exec_state(&mut kernel, options, path)?;
     *KERNEL.lock() = Some(kernel);
+    fwe_kernel::timing::mark("kernel");
     enter(out.sp, out.entry)
 }
 
