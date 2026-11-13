@@ -2927,18 +2927,7 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
     // On a failure, lighttpd's own account of it.
     let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
     if let Err(e) = result {
-        let errpipe = {
-            let mut server = server;
-            let e = server.0.stderr.take();
-            drop(server);
-            e
-        };
-        let mut err = String::new();
-        if let Some(mut p) = errpipe {
-            let _ = std::io::Read::read_to_string(&mut p, &mut err);
-        }
-        let lines: Vec<&str> = err.lines().collect();
-        eprintln!("--- fwe stderr tail:\n{}", lines[lines.len().saturating_sub(200)..].join("\n"));
+        drop(server);
         eprintln!(
             "--- lighttpd's error log:\n{}",
             std::fs::read_to_string(&log_path).unwrap_or_default()

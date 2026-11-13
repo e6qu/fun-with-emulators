@@ -1,0 +1,32 @@
+name: Probe (temporary)
+on:
+  push:
+    branches: [m5-gate]
+jobs:
+  hang:
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        t: [debian_node_runs_a_workload, debian_cargo_builds_and_tests_a_project]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: cargo build && cargo test -p fwe --test guests --no-run
+      - run: |
+          cargo test -p fwe --test guests -- --exact ${{ matrix.t }} --nocapture > t.log 2>&1 &
+          T=$!
+          for i in $(seq 1 150); do sleep 1; kill -0 $T 2>/dev/null || break; done
+          if kill -0 $T 2>/dev/null; then
+            echo "=== still running after 150 s"
+            ps -axo pid,ppid,stat,etime,command | grep -E "fwe|node|cargo|rustc" | grep -v grep | head -40
+            for p in $(pgrep -f target/debug/fwe); do
+              echo "=== sample $p: $(ps -o command= -p $p | cut -c1-200)"
+              sample $p 1 2>/dev/null | awk '/Call graph/,/Total number/' | sed -E 's/\(in [^)]*\)//; s/\[0x[0-9a-f,]+\]//' | cut -c1-170 | head -60
+            done
+          fi
+          tail -60 t.log
