@@ -4049,6 +4049,9 @@ mod tests {
         let a = k.syscall(nr::MMAP, [0, len, rw, anon | MAP_NORESERVE, u64::MAX, 0]) as u64;
         let b = k.syscall(nr::MMAP, [0, len, rw, anon | MAP_NORESERVE, u64::MAX, 0]) as u64;
         assert!(a as i64 > 0 && b as i64 > 0);
+        // macOS fills upwards from the place asked for (Linux, the unit
+        // tests' other host, goes elsewhere when it is taken).
+        #[cfg(target_os = "macos")]
         assert!(b == a + len || a == b + len, "apart: {a:#x}, {b:#x}");
         let r = k.syscall(nr::MMAP, [0, len, PROT_NONE, anon | MAP_NORESERVE, u64::MAX, 0]) as u64;
         assert!(r as i64 > 0);
