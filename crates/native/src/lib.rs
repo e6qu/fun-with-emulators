@@ -704,6 +704,51 @@ fn x18_survives_kernel_entry() -> bool {
 /// Diagnostic probes of host behaviour, run one per process with
 /// How long one write of a new file in fwe's records directory takes, and
 /// its close, as this process takes on what a program's start does (see
+/// How long a fresh process's first close of a file in fwe's records
+/// directory takes, the file changed as `how` says (see `probe`).
+fn first_close_probe(how: &str) -> String {
+    let dir = fwe_kernel::procreg::records_dir()
+        .map(|d| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&d)))
+        .unwrap_or_else(std::env::temp_dir);
+    let p = std::ffi::CString::new(
+        dir.join(format!("first-{}", std::process::id())).as_os_str().as_bytes(),
+    )
+    .unwrap();
+    // SAFETY: plain host calls on a file of this probe's.
+    let (changed, closed) = unsafe {
+        let start = std::time::Instant::now();
+        let fd = libc::open(p.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
+        match how {
+            "write" => {
+                libc::pwrite(fd, [1u8; 200].as_ptr().cast(), 200, 0);
+            }
+            "mmap" => {
+                libc::ftruncate(fd, 16384);
+                let m = libc::mmap(
+                    std::ptr::null_mut(),
+                    16384,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                (m as *mut u8).write_bytes(1, 200);
+                libc::munmap(m, 16384);
+            }
+            "truncate" => {
+                libc::ftruncate(fd, 200);
+            }
+            _ => {}
+        }
+        let changed = start.elapsed().as_micros();
+        libc::close(fd);
+        let closed = start.elapsed().as_micros() - changed;
+        libc::unlink(p.as_ptr());
+        (changed, closed)
+    };
+    format!("first close after {how}: change {changed} us, close {closed} us")
+}
+
 /// `probe`).
 fn file_writes_probe() -> String {
     use std::io::Write;
@@ -791,6 +836,11 @@ pub fn probe(name: &str) -> Result<String, String> {
         // What writing files costs this process here: in fwe's records
         // directory and in a plain temporary one.
         "file-writes" => Ok(file_writes_probe()),
+        // A fresh process's first close of a file it changed, by `write`,
+        // by a shared mapping, or by `ftruncate`; or of an empty one.
+        "first-close-write" | "first-close-mmap" | "first-close-truncate" | "first-close-empty" => {
+            Ok(first_close_probe(&name["first-close-".len()..]))
+        }
         _ => Err(format!("unknown probe {name}")),
     }
 }

@@ -26,6 +26,9 @@ jobs:
           $F ./bench-linux forkexec 20 ./bench-linux
           ./bench-mac forkexec 20 ./bench-mac
           echo "TMPDIR=$TMPDIR"; df -h $TMPDIR /tmp | head -5
+      - name: First closes
+        run: |
+          for k in 1 2 3; do for h in write mmap truncate empty; do target/release/fwe --probe first-close-$h; done; done
       - name: File writes from fwe
         run: |
           target/release/fwe --probe file-writes
