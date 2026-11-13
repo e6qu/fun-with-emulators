@@ -91,9 +91,9 @@ What `--pull` does beyond unpacking:
   `passwd`), keep their owners and modes as Linux programs see them, in
   extended attributes `fwe` reads. The guest sees your own files as
   root's, and runs as root unless it changes user.
-- `/etc/resolv.conf` and `/etc/hosts` are written where the image has
-  none, with your Mac's name servers at the time, as a container runtime
-  does at a container's start.
+- `/etc/resolv.conf` is written with your Mac's name servers at the
+  time, in place of the image's, and `/etc/hosts` where the image has
+  none, as a container runtime does at a container's start.
 - On a case-insensitive volume (macOS's default), a file whose name
   differs from another's only in case cannot be kept: `--pull` leaves the
   later one out and lists it. Debian's image has one such file, a manual

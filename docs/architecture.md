@@ -75,9 +75,9 @@ flowchart TD
   (`crates/fwe/src/tarlist.rs`); every file gets the user's group, which
   the guest sees as root's. On a case-insensitive volume, a file whose
   name differs from an earlier one's only in case is left out and listed.
-  As a container runtime does, it adds `/etc/resolv.conf` (the host's
-  name servers, as they are then) and `/etc/hosts` where the image has
-  none.
+  As a container runtime does, it writes `/etc/resolv.conf` with the
+  host's name servers as they are then, in place of the image's, and
+  `/etc/hosts` where the image has none.
 - **Hosts:** the kernel, ELF and ABI crates build on any Unix (`libc`
   supplies host values; on Linux most translations are the identity), and
   CI runs their unit tests on Linux too. The backends, and so `fwe`, run
@@ -972,8 +972,8 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   end of a host datagram pair; fwe writes each reply to the other.
   `RTM_NEWLINK` needs `CAP_NET_ADMIN`.
 - DNS needs nothing special: the resolver reads `/etc/resolv.conf` and
-  `/etc/hosts` from the rootfs (`fwe --pull` writes them where an image
-  has none).
+  `/etc/hosts` from the rootfs (`fwe --pull` writes the host's name
+  servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
   terminal requests in `Kernel::sys_ioctl`, ptys in
   `crates/kernel/src/pty.rs` (what each maps to is in
