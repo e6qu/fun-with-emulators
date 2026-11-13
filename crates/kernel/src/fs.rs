@@ -494,6 +494,9 @@ impl Fs {
         if let Some(old) = self.proc.exe_fd
             && Some(old) != fd
         {
+            // What fwe keeps of it goes with it (a detached tree it held).
+            crate::mountapi::closed(old);
+            crate::fdmarks::closed(old);
             // SAFETY: closing fwe's own descriptor of the old program.
             unsafe { libc::close(old) };
         }

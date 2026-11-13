@@ -346,6 +346,17 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
     }
 }
 
+/// Record `fd` as a file opened in mount `mount` of a detached tree, with
+/// `flags` and `fstype` (a file reopened through the tree's descriptor, as
+/// `/proc/self/exe` of a program run through one): an ordinary open file
+/// there, not the tree's own descriptor.
+pub fn opened_in_tree(fd: i32, mount: u32, flags: u64, fstype: FsType) {
+    let Some((dev, ino)) = identity(fd) else { return };
+    let origin =
+        Some(Origin { mount, flags, fstype, ns_path: Vec::new(), ovl: None, stand_in: None });
+    insert(&mut records(), fd, Record { dev, ino, origin, mark: None });
+}
+
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
     let Some((dev, ino)) = identity(fd) else { return };

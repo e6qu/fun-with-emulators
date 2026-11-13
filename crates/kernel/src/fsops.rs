@@ -1237,6 +1237,9 @@ impl<P: Platform> Kernel<P> {
                 return 0;
             }
         }
+        if let Some((_, flags, fstype)) = crate::mountapi::detached_root(fd) {
+            return statfs_fd(fd, buf, Some((fstype, flags)));
+        }
         if let Some(o) = crate::fdmarks::origin(fd) {
             return statfs_fd(fd, buf, Some((o.fstype, o.flags)));
         }
@@ -3486,7 +3489,12 @@ fn reopen(fd: i32, flags: u64) -> i64 {
     if new < 0 {
         return last_error();
     }
-    crate::fdmarks::duplicated(fd, new);
+    match crate::mountapi::detached_root(fd) {
+        // Through a detached tree's descriptor: a file open in that tree's
+        // mount, with its flags (a read-only clone stays read-only).
+        Some((id, mflags, fstype)) => crate::fdmarks::opened_in_tree(new, id, mflags, fstype),
+        None => crate::fdmarks::duplicated(fd, new),
+    }
     new as i64
 }
 

@@ -4237,6 +4237,22 @@ fn the_new_mount_api_makes_and_attaches_mounts() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A binary run again through a read-only clone of its own mount
+/// (`open_tree`, `mount_setattr`, `execveat`), as crun and runc protect
+/// themselves, finds itself on a read-only mount (`fstatfs` of
+/// `/proc/self/exe`), so it does not clone itself again.
+#[test]
+fn a_binary_run_through_a_read_only_clone_sees_it() {
+    let out = fwe(&rust_guest("mountapi"), &["selfclone"]);
+    assert_eq!(
+        stdout(&out),
+        "cloned: read-only true, re-ran true\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `nsfd` guest prints.
 const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
     nstype 0x4000000, parent of a UTS namespace refused true\n\

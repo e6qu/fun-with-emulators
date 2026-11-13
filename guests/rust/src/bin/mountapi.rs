@@ -6,6 +6,13 @@
 //! under a shared one reaching a child's copy of the namespace; and the
 //! mount flags and a busy mount enforced. It prints what it observed.
 //!
+//! `mountapi selfclone` does what crun and runc do to run a copy of
+//! themselves no container can write: unless `/proc/self/exe` is on a
+//! read-only mount, it clones its own binary's mount (`open_tree`), makes
+//! the clone read-only (`mount_setattr`) and runs itself again through
+//! it (`execveat`), once; then it prints what `fstatfs` of its binary
+//! says.
+//!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates; the calls musl lacks are made with
 //! `syscall`.
@@ -91,7 +98,54 @@ fn options_of(point: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether this program's binary is on a read-only mount, as runc's
+/// `IsSelfExeCloned` asks.
+fn self_read_only() -> bool {
+    const ST_RDONLY: u64 = 1;
+    let mut st = [0u64; 15];
+    // SAFETY: a NUL-terminated path; a `struct statfs` sized buffer.
+    unsafe {
+        let fd = open(c"/proc/self/exe".as_ptr(), 0o2000000);
+        let r = syscall(44, fd, st.as_mut_ptr());
+        close(fd);
+        // f_flags is the last but four words of Linux's `struct statfs`.
+        r == 0 && st[10] & ST_RDONLY != 0
+    }
+}
+
+fn self_clone(again: bool) {
+    const OPEN_TREE_CLONE: u32 = 1;
+    const AT_RECURSIVE: u32 = 0x8000;
+    const O_CLOEXEC: u32 = 0o2000000;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const MOUNT_ATTR_RDONLY: u64 = 0x1;
+    if self_read_only() || again {
+        println!("cloned: read-only {}, re-ran {again}", self_read_only());
+        return;
+    }
+    // SAFETY: plain calls with NUL-terminated paths and live buffers.
+    unsafe {
+        let fd = syscall(
+            SYS_OPEN_TREE,
+            AT_FDCWD,
+            c"/proc/self/exe".as_ptr(),
+            OPEN_TREE_CLONE | AT_RECURSIVE | O_CLOEXEC,
+        ) as i32;
+        let attr = [MOUNT_ATTR_RDONLY, 0, 0, 0];
+        let r = syscall(SYS_MOUNT_SETATTR, fd, c"".as_ptr(), AT_EMPTY_PATH, attr.as_ptr(), 32usize);
+        let argv = [c"mountapi".as_ptr(), c"selfclone".as_ptr(), c"again".as_ptr(), std::ptr::null()];
+        let env: [*const c_char; 1] = [std::ptr::null()];
+        syscall(281, fd, c"".as_ptr(), argv.as_ptr(), env.as_ptr(), AT_EMPTY_PATH);
+        println!("clone failed: open_tree {fd}, mount_setattr {r}");
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("selfclone") {
+        self_clone(args.get(2).map(String::as_str) == Some("again"));
+        return;
+    }
     // SAFETY: plain calls into the C library and the kernel throughout;
     // every buffer is a live local of the length passed.
     unsafe {

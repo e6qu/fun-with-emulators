@@ -97,6 +97,13 @@ fn tree_key(fd: i32) -> Option<u32> {
     }
 }
 
+/// The root mount of the detached tree `fd` is a descriptor of: its id,
+/// flags and filesystem type.
+pub(crate) fn detached_root(fd: i32) -> Option<(u32, u64, crate::mounts::FsType)> {
+    let k = tree_key(fd)?;
+    with(&TREES, |m| m.get(&k).and_then(|t| t.first()).map(|r| (r.id, r.flags, r.fstype)))
+}
+
 /// `fd` is closed: a context or tree it was the last descriptor of goes.
 pub fn closed(fd: i32) {
     if fdmarks::shared_elsewhere(fd) {
@@ -106,7 +113,17 @@ pub fn closed(fd: i32) {
         with(&CONTEXTS, |m| m.remove(&k));
     }
     if let Some(k) = tree_key(fd) {
-        with(&TREES, |m| m.remove(&k));
+        // Not while another descriptor of the tree is open: fwe's own of a
+        // program run through it (`/proc/self/exe`) is one.
+        let open = |o: i32| {
+            // SAFETY: F_GETFD only queries the descriptor.
+            unsafe { libc::fcntl(o, libc::F_GETFD) >= 0 }
+        };
+        let held =
+            fdmarks::marks().into_iter().any(|(o, m)| o != fd && m == Mark::Detached(k) && open(o));
+        if !held {
+            with(&TREES, |m| m.remove(&k));
+        }
     }
 }
 
