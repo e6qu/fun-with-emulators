@@ -25,6 +25,10 @@ jobs:
           $F ./bench-linux forkexec 20 ./bench-linux
           ./bench-mac forkexec 20 ./bench-mac
           echo "TMPDIR=$TMPDIR"; df -h $TMPDIR /tmp | head -5
+      - name: File writes from fwe
+        run: |
+          target/release/fwe --probe file-writes
+          target/release/fwe --probe file-writes
       - name: File writes on this runner
         run: |
           python3 - <<'PY'

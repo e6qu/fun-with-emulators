@@ -702,6 +702,47 @@ fn x18_survives_kernel_entry() -> bool {
 }
 
 /// Diagnostic probes of host behaviour, run one per process with
+/// Microseconds per create-write-close, rewrite of an existing file, and
+/// create of an empty one, in fwe's records directory and in a new
+/// temporary directory (see `probe`).
+fn file_writes_probe() -> String {
+    use std::io::Write;
+    let time = |f: &mut dyn FnMut(usize)| {
+        let start = std::time::Instant::now();
+        for i in 0..30 {
+            f(i);
+        }
+        start.elapsed().as_micros() / 30
+    };
+    let mut out = String::new();
+    let tmp = std::env::temp_dir().join(format!("fwe-writes-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let records = fwe_kernel::procreg::records_dir()
+        .map(|d| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&d)));
+    for (name, dir) in [("records", records), ("tmp", Some(tmp.clone()))] {
+        let Some(dir) = dir else { continue };
+        let f = |i: usize| dir.join(format!("probe-{}-{i}", std::process::id()));
+        let empty = time(&mut |i| drop(std::fs::File::create(f(i))));
+        let written = time(&mut |i| {
+            let _ = std::fs::File::create(f(i)).and_then(|mut h| h.write_all(&[7u8; 200]));
+        });
+        let rewritten = time(&mut |i| {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(f(i))
+                .and_then(|mut h| h.write_all(&[8u8; 200]));
+        });
+        for i in 0..30 {
+            let _ = std::fs::remove_file(f(i));
+        }
+        out.push_str(&format!(
+            "{name}: create {empty} us, create+write {written} us, rewrite {rewritten} us\n"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    out
+}
+
 /// `fwe --probe <name>`. Prints the result; a crash identifies the step.
 pub fn probe(name: &str) -> Result<String, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -732,6 +773,9 @@ pub fn probe(name: &str) -> Result<String, String> {
         .map(|_| "waited in mode".into()),
         // Creates a VM unless under --hv-standin (see hv::probe).
         "hv-map-rules" => hv::map_rules_probe(),
+        // What writing files costs this process here: in fwe's records
+        // directory and in a plain temporary one.
+        "file-writes" => Ok(file_writes_probe()),
         _ => Err(format!("unknown probe {name}")),
     }
 }
