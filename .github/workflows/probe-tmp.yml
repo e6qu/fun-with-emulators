@@ -21,6 +21,7 @@ jobs:
           time (for i in $(seq 20); do ./bench-mac exit; done)
           time (for i in $(seq 20); do $F ./bench-linux exit; done)
           for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit; done
+          for i in 1 2; do FWE_TIMING=1 FWE_CLOSETEST=1 $F ./bench-linux exit; done
           FWE_TIMING=1 $F ./bench-linux forkexec 3 ./bench-linux
           $F ./bench-linux forkexec 20 ./bench-linux
           ./bench-mac forkexec 20 ./bench-mac
