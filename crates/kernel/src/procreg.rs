@@ -674,11 +674,15 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 /// none).
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    crate::timing::mark("record: start time");
     // Under the record's lock: a parent and its child may change one.
     let _lock = lock(pid);
+    crate::timing::mark("record: locked");
     let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
+    crate::timing::mark("record: read");
     f(&mut r);
     write(pid, &r);
+    crate::timing::mark("record: written");
     Ok(())
 }
 
