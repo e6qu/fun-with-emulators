@@ -64,6 +64,20 @@ flowchart TD
 - The **hypervisor backend** runs the guest at EL0 in a
   Hypervisor.framework VM. fwe picks it automatically for a non-PIE
   executable linked below 4 GiB, which the native backend cannot map.
+- **Root filesystems:** `fwe --pull IMAGE DIR` (`crates/fwe/src/pull.rs`)
+  fetches a container image's linux/arm64 variant from its registry
+  (`curl`, an anonymous token where the registry asks for one), checks
+  each layer against its SHA-256 digest and unpacks the layers in order
+  with the host's `tar`, applying their whiteouts. What an unprivileged
+  unpacking loses is then kept as fwe keeps it for the guest: owners other
+  than root (`org.fwe.owner`), set-ID bits and modes that deny the owner
+  (`org.fwe.mode`), read from the layers' own headers
+  (`crates/fwe/src/tarlist.rs`); every file gets the user's group, which
+  the guest sees as root's. On a case-insensitive volume, a file whose
+  name differs from an earlier one's only in case is left out and listed.
+  As a container runtime does, it adds `/etc/resolv.conf` (the host's
+  name servers, as they are then) and `/etc/hosts` where the image has
+  none.
 - **Hosts:** the kernel, ELF and ABI crates build on any Unix (`libc`
   supplies host values; on Linux most translations are the identity), and
   CI runs their unit tests on Linux too. The backends, and so `fwe`, run
@@ -173,6 +187,8 @@ guest, and the machinery for threads and `fork`.
 - The break is reserved after the image and its stub space (up to 1 GiB,
   halved while something is in the way) before the dynamic linker is
   placed. The stack is 8 MiB with a guard page.
+- `execve` of a script runs its `#!` interpreter (`Kernel::exec_target`),
+  in either backend, so a program needs no shell to run one.
 - An in-place `execve` checks the new program first (an arm64 ELF that
   fits the address space, with a dynamic linker that exists), so a bad
   one fails with the caller intact. A re-exec checks only that it is an
@@ -953,7 +969,8 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   end of a host datagram pair; fwe writes each reply to the other.
   `RTM_NEWLINK` needs `CAP_NET_ADMIN`.
 - DNS needs nothing special: the resolver reads `/etc/resolv.conf` and
-  `/etc/hosts` from the rootfs.
+  `/etc/hosts` from the rootfs (`fwe --pull` writes them where an image
+  has none).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
   terminal requests in `Kernel::sys_ioctl`, ptys in
   `crates/kernel/src/pty.rs` (what each maps to is in
@@ -1238,6 +1255,9 @@ which are to be lifted for 1.0 and which are not planned.
   is as much of the region as is resident, which can overstate it.
 
 **Files and descriptors**
+- A root on a case-insensitive volume (macOS's default) holds one file
+  for names that differ only in case; `fwe --pull` keeps the first and
+  lists the others.
 - What fwe keeps of an open file for `fcntl` (owner thread, `F_SETSIG`'s
   signal) is per descriptor, so a duplicate's changes do not show in the
   original.

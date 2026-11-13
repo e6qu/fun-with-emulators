@@ -155,18 +155,15 @@ fn start_thread() {
     }
     WAKE_R.store(r, Ordering::Release);
     WAKE_W.store(w, Ordering::Release);
-    let _ = std::thread::Builder::new().name("fwe-timers".into()).spawn(move || run(r));
+    let _ = crate::host::with_signals_blocked(|| {
+        std::thread::Builder::new().name("fwe-timers".into()).spawn(move || run(r))
+    });
 }
 
 /// The timer thread: raise what is due, then sleep until the next one.
+/// Host signals are the guest threads' to take: it starts with them all
+/// blocked ([`crate::host::with_signals_blocked`]).
 fn run(r: i32) {
-    // Host signals are the guest threads' to take.
-    // SAFETY: a full set, applied to this thread only.
-    unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-    }
     loop {
         if WAKE_R.load(Ordering::Acquire) != r {
             return;

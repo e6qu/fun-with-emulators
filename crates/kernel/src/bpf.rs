@@ -116,7 +116,7 @@ const HELPER_DELETE: i32 = 3;
 const PSEUDO_MAP_FD: u8 = 1;
 
 fn check(bytes: &[u8], filter: bool) -> Result<Program, i32> {
-    if bytes.is_empty() || bytes.len() % 8 != 0 || bytes.len() / 8 > MAX_INSNS {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(8) || bytes.len() / 8 > MAX_INSNS {
         return Err(errno::EINVAL);
     }
     let insns: Vec<Insn> = bytes.chunks(8).map(Insn::decode).collect();

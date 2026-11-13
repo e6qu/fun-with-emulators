@@ -99,17 +99,10 @@ pub fn start(spec: &str) -> Result<(), String> {
         fds.push((kept, fd.1));
     }
     let _ = SINKS.set(Sinks { spec: resolved.join(","), fds });
-    std::thread::Builder::new()
-        .name("fwe-hv-record".into())
-        .spawn(|| {
-            // No signal for the guest may land here: the backend relies on
-            // the host delivering them only to vCPU threads.
-            // SAFETY: blocking every signal on this thread only.
-            unsafe {
-                let mut all: libc::sigset_t = std::mem::zeroed();
-                libc::sigfillset(&mut all);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-            }
+    // No signal for the guest may land on it: the backend relies on the
+    // host delivering them only to vCPU threads.
+    fwe_kernel::host::with_signals_blocked(|| {
+        std::thread::Builder::new().name("fwe-hv-record".into()).spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let mut l = Line::new();
@@ -117,7 +110,8 @@ pub fn start(spec: &str) -> Result<(), String> {
                 l.emit();
             }
         })
-        .map_err(|e| e.to_string())?;
+    })
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

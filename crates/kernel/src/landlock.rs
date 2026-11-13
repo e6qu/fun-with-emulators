@@ -292,8 +292,7 @@ pub fn publish() {
 /// is a former process's).
 fn chain_of(pid: i32) -> Vec<u64> {
     let Some(b) = chain_file(pid).and_then(|p| std::fs::read(p).ok()) else { return Vec::new() };
-    let words: Vec<u64> =
-        b.chunks_exact(8).map(|c| u64::from_ne_bytes(c.try_into().unwrap())).collect();
+    let words: Vec<u64> = b.as_chunks::<8>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
     match (words.split_first(), crate::procreg::start_time(pid)) {
         (Some((&start, rest)), Some(now)) if start == now => rest.to_vec(),
         _ => Vec::new(),

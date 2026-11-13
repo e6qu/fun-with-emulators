@@ -229,7 +229,7 @@ fn flush_icache(addr: u64, len: usize) {
 /// Read `len` bytes of `pagemap` at `pos` into the guest buffer `buf`:
 /// whole entries only (`EINVAL` otherwise, as Linux's).
 fn read_pagemap(pos: u64, buf: u64, len: u64) -> Result<u64, i32> {
-    if pos % 8 != 0 || len % 8 != 0 {
+    if !pos.is_multiple_of(8) || !len.is_multiple_of(8) {
         return Err(errno::EINVAL);
     }
     // An entry per guest page, at most those of the address space.

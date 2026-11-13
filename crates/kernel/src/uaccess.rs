@@ -373,7 +373,7 @@ unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Res
 /// aligned).
 pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32> {
     let addr = guest_of(addr);
-    if addr % 4 != 0 || addr >= 1 << 48 {
+    if !addr.is_multiple_of(4) || addr >= 1 << 48 {
         return Err(errno::EFAULT);
     }
     check(valid(addr, 4, true))?;
@@ -538,7 +538,7 @@ pub fn host_iovecs(addr: u64, count: u64, write: bool) -> Result<Vec<libc::iovec
     }
     let raw = read_bytes(addr, count as usize * 16)?;
     let mut out = Vec::with_capacity(count as usize);
-    for c in raw.chunks_exact(16) {
+    for c in raw.as_chunks::<16>().0.iter() {
         let base = u64::from_ne_bytes(c[0..8].try_into().unwrap());
         let len = u64::from_ne_bytes(c[8..16].try_into().unwrap());
         // A length that is negative as a `ssize_t` is refused before any

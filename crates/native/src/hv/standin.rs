@@ -586,7 +586,11 @@ pub fn vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return
         violation("hv_vm_map without a VM");
         return HV_ERROR;
     }
-    if host % PAGE != 0 || ipa % PAGE != 0 || len % PAGE != 0 || len == 0 {
+    if !host.is_multiple_of(PAGE)
+        || !ipa.is_multiple_of(PAGE)
+        || !len.is_multiple_of(PAGE)
+        || len == 0
+    {
         note(&format!("hv_vm_map refused: {host:#x} -> {ipa:#x}+{len:#x} is not 16 KiB aligned"));
         return HV_BAD_ARGUMENT;
     }
@@ -621,7 +625,7 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
         violation("hv_vm_unmap without a VM");
         return HV_ERROR;
     }
-    if ipa % PAGE != 0 || size as u64 % PAGE != 0 {
+    if !ipa.is_multiple_of(PAGE) || !(size as u64).is_multiple_of(PAGE) {
         return HV_BAD_ARGUMENT;
     }
     let mut g = vm();
@@ -654,13 +658,13 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
         let (h, hl) = (m.host + (lo - s), hi - lo);
         v.objects.retain(|&(a, b, _)| b <= h || a >= h + hl);
     }
-    if let Some(first) = &v.first_run {
-        if first.iter().any(|&(a, b)| ipa < b && end > a) {
-            violation(&format!(
-                "hv_vm_unmap of {ipa:#x}+{size:#x}, part of the stage 2 the VM ran with: \
+    if let Some(first) = &v.first_run
+        && first.iter().any(|&(a, b)| ipa < b && end > a)
+    {
+        violation(&format!(
+            "hv_vm_unmap of {ipa:#x}+{size:#x}, part of the stage 2 the VM ran with: \
                  stage 2 may not change while the VM runs"
-            ));
-        }
+        ));
     }
     let mut ops: Vec<Op> = gone.iter().map(|&(lo, hi)| Op::Unmap(lo, hi)).collect();
     ops.push(Op::Flush);
@@ -1218,11 +1222,11 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
             debug_exit(v, id, "cancelled");
             return HV_SUCCESS;
         }
-        if !engine(v).synced {
-            if let Err(e) = sync(v) {
-                violation(&e);
-                return HV_ERROR;
-            }
+        if !engine(v).synced
+            && let Err(e) = sync(v)
+        {
+            violation(&e);
+            return HV_ERROR;
         }
         {
             let mut g = vm();
@@ -1488,24 +1492,24 @@ extern "C" fn on_block(uc: Uc, addr: u64, _size: u32, d: *mut c_void) {
     let maybe_guarded = v.any_guarded.load(SeqCst)
         && v.guarded.lock().unwrap_or_else(|e| e.into_inner()).contains(&(addr >> 12));
     let btype = if maybe_guarded { (read(uc, R_PSTATE) >> 10) & 3 } else { 0 };
-    if btype != 0 {
-        if let Walked::Page { guarded: true, .. } = walk(v.ttbr0.load(SeqCst), addr) {
-            let insn = fetch_va(v.ttbr0.load(SeqCst), addr).unwrap_or(0);
-            // bti c, bti j, bti jc; paciasp, pacibsp (with SCTLR.BT0 set,
-            // as fwe sets it: not for BTYPE 0b11).
-            let ok = match insn {
-                0xd503_245f => btype != 0b11,
-                0xd503_249f => btype != 0b10,
-                0xd503_24df => true,
-                0xd503_233f | 0xd503_237f => btype != 0b11,
-                _ => false,
-            };
-            if !ok {
-                record(d, Event::El1 { esr: (0x0d << 26) | (1 << 25) | btype, elr: addr, far: 0 });
-                // SAFETY: stopping the engine whose hook this is.
-                unsafe { (api().emu_stop)(uc) };
-                return;
-            }
+    if btype != 0
+        && let Walked::Page { guarded: true, .. } = walk(v.ttbr0.load(SeqCst), addr)
+    {
+        let insn = fetch_va(v.ttbr0.load(SeqCst), addr).unwrap_or(0);
+        // bti c, bti j, bti jc; paciasp, pacibsp (with SCTLR.BT0 set,
+        // as fwe sets it: not for BTYPE 0b11).
+        let ok = match insn {
+            0xd503_245f => btype != 0b11,
+            0xd503_249f => btype != 0b10,
+            0xd503_24df => true,
+            0xd503_233f | 0xd503_237f => btype != 0b11,
+            _ => false,
+        };
+        if !ok {
+            record(d, Event::El1 { esr: (0x0d << 26) | (1 << 25) | btype, elr: addr, far: 0 });
+            // SAFETY: stopping the engine whose hook this is.
+            unsafe { (api().emu_stop)(uc) };
+            return;
         }
     }
     if v.cancel.load(SeqCst) || v.yield_now.swap(false, SeqCst) {

@@ -27,7 +27,9 @@ pub fn set(sig: u64) {
         // The parent is watched from now on, before the call returns: a
         // parent that ends right after (as the child tells it to) is seen.
         let Some(kq) = watch_parent() else { return };
-        let started = std::thread::Builder::new().name("fwe-pdeath".into()).spawn(move || wait(kq));
+        let started = crate::host::with_signals_blocked(|| {
+            std::thread::Builder::new().name("fwe-pdeath".into()).spawn(move || wait(kq))
+        });
         if started.is_err() {
             // SAFETY: the kqueue made above, of no one else's.
             unsafe { libc::close(kq) };
@@ -98,13 +100,11 @@ fn watch_parent() -> Option<i32> {
 /// parent's end, then send the signal.
 #[cfg(target_os = "macos")]
 fn wait(kq: i32) {
-    // Signals are for the guest's threads, never this one.
-    // SAFETY: plain host calls on a valid signal set and the kqueue the
-    // thread was given, which it closes.
+    // Signals are for the guest's threads, never this one: it starts with
+    // them all blocked ([`crate::host::with_signals_blocked`]).
+    // SAFETY: plain host calls on the kqueue the thread was given, which it
+    // closes.
     unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
         let mut out: libc::kevent = std::mem::zeroed();
         let n = loop {
             let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null());

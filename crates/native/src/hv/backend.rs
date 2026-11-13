@@ -777,7 +777,7 @@ fn start(
         ));
     }
 
-    let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options));
+    let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options, &fs));
     fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
     fs.set_auxv(image.auxv.clone());
     fs.publish();
@@ -1038,10 +1038,10 @@ impl Vcpu {
             // Whatever the exit, a signal that became deliverable meanwhile
             // (one a sigreturn just unblocked, or one the kernel queued
             // itself) is delivered now, not at the next system call.
-            if thread::deliverable() != 0 {
-                if let Some(k) = kernel().as_mut() {
-                    k.deliver_pending(&mut regs);
-                }
+            if thread::deliverable() != 0
+                && let Some(k) = kernel().as_mut()
+            {
+                k.deliver_pending(&mut regs);
             }
             self.set_regs(&regs);
         }
@@ -1224,9 +1224,11 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     let argv = if argv.is_empty() { vec![Vec::new()] } else { argv };
     let guard = kernel();
     let k = guard.as_ref().unwrap();
-    if let Err(e) = k.may_exec(&path) {
-        return err(e);
-    }
+    // A script runs its interpreter.
+    let (path, argv) = match k.exec_target(path, argv) {
+        Ok(t) => t,
+        Err(e) => return err(e),
+    };
     let fs = k.fs();
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
@@ -1394,7 +1396,11 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         let mut attr: libc::pthread_attr_t = std::mem::zeroed();
         libc::pthread_attr_init(&mut attr);
         libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
-        let r = libc::pthread_create(&mut handle, &attr, thread_main, arg);
+        // Every signal blocked until the vCPU loop sets the guest's mask
+        // (see `host::with_signals_blocked`).
+        let r = fwe_kernel::host::with_signals_blocked(|| {
+            libc::pthread_create(&mut handle, &attr, thread_main, arg)
+        });
         libc::pthread_attr_destroy(&mut attr);
         r
     };

@@ -93,7 +93,7 @@ fn report(message: &str) {
 /// `addr` must be mapped if it is 4-byte aligned.
 unsafe fn insn(addr: u64) -> Option<u32> {
     // SAFETY: guaranteed by the caller.
-    (addr % 4 == 0).then(|| unsafe { (addr as *const u32).read() })
+    addr.is_multiple_of(4).then(|| unsafe { (addr as *const u32).read() })
 }
 
 thread_local! {
@@ -422,10 +422,10 @@ fn is_brk(word: u32) -> bool {
 /// otherwise wait for the thread's next system call.
 fn settle(regs: &mut Regs) {
     reblock();
-    if thread::deliverable() != 0 {
-        if let Some(k) = kernel().as_mut() {
-            k.deliver_pending(regs);
-        }
+    if thread::deliverable() != 0
+        && let Some(k) = kernel().as_mut()
+    {
+        k.deliver_pending(regs);
     }
 }
 

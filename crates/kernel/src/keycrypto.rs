@@ -251,7 +251,7 @@ impl Hasher {
 
 fn sha1_compress(h: &mut [u32; 5], block: &[u8]) {
     let mut w = [0u32; 80];
-    for (i, c) in block.chunks_exact(4).enumerate() {
+    for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
         w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
     }
     for i in 16..80 {
@@ -279,7 +279,7 @@ fn sha1_compress(h: &mut [u32; 5], block: &[u8]) {
 
 fn sha256_compress(h: &mut [u32; 8], block: &[u8]) {
     let mut w = [0u32; 64];
-    for (i, c) in block.chunks_exact(4).enumerate() {
+    for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
         w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
     }
     for i in 16..64 {
@@ -311,7 +311,7 @@ fn sha256_compress(h: &mut [u32; 8], block: &[u8]) {
 
 fn sha512_compress(h: &mut [u64; 8], block: &[u8]) {
     let mut w = [0u64; 80];
-    for (i, c) in block.chunks_exact(8).enumerate() {
+    for (i, c) in block.as_chunks::<8>().0.iter().enumerate() {
         w[i] = u64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
     }
     for i in 16..80 {
@@ -448,7 +448,8 @@ impl Aes {
         };
         let nr = nk + 6;
         let total = 4 * (nr + 1);
-        let mut w: Vec<[u8; 4]> = key.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        let mut w: Vec<[u8; 4]> =
+            key.as_chunks::<4>().0.iter().map(|c| [c[0], c[1], c[2], c[3]]).collect();
         let mut rcon = 1u8;
         for i in nk..total {
             let mut t = w[i - 1];
@@ -467,7 +468,9 @@ impl Aes {
             w.push([p[0] ^ t[0], p[1] ^ t[1], p[2] ^ t[2], p[3] ^ t[3]]);
         }
         let round_keys = w
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let mut k = [0u8; 16];
                 for (j, word) in c.iter().enumerate() {
@@ -545,13 +548,13 @@ fn xor16(a: &mut [u8; 16], b: &[u8; 16]) {
 /// AES-CBC encryption with a 16, 24 or 32 byte key. `None` for another key
 /// size or data that is not a whole number of 16-byte blocks.
 pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() % 16 != 0 {
+    if !data.len().is_multiple_of(16) {
         return None;
     }
     let aes = Aes::new(key)?;
     let mut prev = *iv;
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(16) {
+    for chunk in data.as_chunks::<16>().0.iter() {
         let mut b = [0u8; 16];
         b.copy_from_slice(chunk);
         xor16(&mut b, &prev);
@@ -564,13 +567,13 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>
 
 /// AES-CBC decryption, the inverse of [`aes_cbc_encrypt`].
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() % 16 != 0 {
+    if !data.len().is_multiple_of(16) {
         return None;
     }
     let aes = Aes::new(key)?;
     let mut prev = *iv;
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(16) {
+    for chunk in data.as_chunks::<16>().0.iter() {
         let mut b = [0u8; 16];
         b.copy_from_slice(chunk);
         let c = b;
@@ -1481,11 +1484,11 @@ fn parse_akid(a: &mut Asym, data: &[u8]) -> Result<(), i32> {
             }
         }
     }
-    if let Some(serial) = d.optional(0x82)? {
-        if let Some(issuer) = issuer {
-            a.akid_serial = Some(serial.value.to_vec());
-            a.akid_issuer = Some(issuer.to_vec());
-        }
+    if let Some(serial) = d.optional(0x82)?
+        && let Some(issuer) = issuer
+    {
+        a.akid_serial = Some(serial.value.to_vec());
+        a.akid_issuer = Some(issuer.to_vec());
     }
     d.end()
 }
@@ -2270,10 +2273,10 @@ fn valid_master_desc(new: &[u8], orig: Option<&[u8]>) -> Result<(), i32> {
     if new.len() == prefix_len {
         return Err(EINVAL);
     }
-    if let Some(orig) = orig {
-        if orig.get(..prefix_len) != Some(&new[..prefix_len]) {
-            return Err(EINVAL);
-        }
+    if let Some(orig) = orig
+        && orig.get(..prefix_len) != Some(&new[..prefix_len])
+    {
+        return Err(EINVAL);
     }
     Ok(())
 }
@@ -2338,10 +2341,10 @@ fn enc_datalen(
     if !(ENC_MIN_DATA_SIZE..=ENC_MAX_DATA_SIZE).contains(&dlen) {
         return Err(EINVAL);
     }
-    if let Some(d) = decrypted {
-        if d.len() as i64 != dlen * 2 || !d.iter().all(u8::is_ascii_hexdigit) {
-            return Err(EINVAL);
-        }
+    if let Some(d) = decrypted
+        && (d.len() as i64 != dlen * 2 || !d.iter().all(u8::is_ascii_hexdigit))
+    {
+        return Err(EINVAL);
     }
     match format {
         Some(b"ecryptfs") if dlen != ECRYPTFS_MAX_KEY_BYTES => return Err(EINVAL),
@@ -2352,10 +2355,12 @@ fn enc_datalen(
 }
 
 fn unhex(s: &[u8]) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
-    s.chunks_exact(2)
+    s.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let h = (c[0] as char).to_digit(16)?;
             let l = (c[1] as char).to_digit(16)?;

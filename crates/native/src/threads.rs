@@ -99,7 +99,10 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     }
 }
 
-/// Create a detached host thread that becomes the guest thread.
+/// Create a detached host thread that becomes the guest thread. It starts
+/// with every signal blocked, whatever the caller's mask (a system call
+/// runs with the guest's unblocked; see `host::with_signals_blocked`), and
+/// `child_main` takes the guest's mask once it is set up.
 fn spawn_host_thread(spawn: Box<Spawn>) -> Option<libc::pthread_t> {
     let arg = Box::into_raw(spawn).cast::<libc::c_void>();
     // SAFETY: a detached pthread with the default stack; `child_main` takes
@@ -109,7 +112,9 @@ fn spawn_host_thread(spawn: Box<Spawn>) -> Option<libc::pthread_t> {
         libc::pthread_attr_init(&mut attr);
         libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
         let mut handle: libc::pthread_t = 0;
-        let r = libc::pthread_create(&mut handle, &attr, child_main, arg);
+        let r = fwe_kernel::host::with_signals_blocked(|| {
+            libc::pthread_create(&mut handle, &attr, child_main, arg)
+        });
         libc::pthread_attr_destroy(&mut attr);
         if r != 0 {
             // Reclaim the box the thread never received.
@@ -139,9 +144,8 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
 
     let regs = spawn.regs;
     drop(spawn);
-    // The child is spawned from inside the clone SIGTRAP handler, where
-    // SIGTRAP is blocked, and pthread_create inherits that mask: switch to
-    // the guest mask (and the x18 ABI) for guest code.
+    // The thread started with every signal blocked (`spawn_host_thread`):
+    // switch to the guest mask (and the x18 ABI) for guest code.
     trap::prepare_guest_entry();
     // SAFETY: `regs` describes a runnable guest context on the child stack.
     unsafe { trap::enter_guest_full(&regs) }

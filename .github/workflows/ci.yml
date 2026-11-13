@@ -75,8 +75,12 @@ jobs:
           status=${PIPESTATUS[0]}
           if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
           exit "$status"
-      # The rest: the VM's tests ran in the step above.
+      # The rest: the VM's tests ran in the step above. Images pulled from
+      # Docker Hub run here only (FWE_PULL_TESTS), not on a development
+      # machine.
       - run: cargo test -- --skip hv_
+        env:
+          FWE_PULL_TESTS: "1"
       # Why the host killed a process outright (a lock misused in a signal
       # handler, a guard violation), for a guest that died of SIGKILL.
       - if: failure()
@@ -215,6 +219,30 @@ jobs:
   # The benchmarks (tools/bench/run.py): startup, system calls, threads,
   # fork and exec, and Lua's build, natively on arm64 Linux here (Lua in an
   # Alpine container, the GCC fwe's run uses) ...
+  # The Homebrew formula (Formula/fwe.rb), built from this commit's source
+  # in place of a release's, installed and tested as a user would.
+  homebrew:
+    name: Homebrew formula (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the formula from this commit
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          src="$RUNNER_TEMP/fwe-0.1.0.tar.gz"
+          git archive --format=tar.gz --prefix=fwe-0.1.0/ -o "$src" HEAD
+          sha=$(shasum -a 256 "$src" | cut -d' ' -f1)
+          brew tap-new --no-git local/fwe
+          tap=$(brew --repository local/fwe)
+          sed -e "s|^  url .*|  url \"file://$src\"|" -e "s|^  sha256 .*|  sha256 \"$sha\"|" \
+            Formula/fwe.rb > "$tap/Formula/fwe.rb"
+          brew install --build-from-source local/fwe/fwe
+          brew test local/fwe/fwe
+          codesign -d --entitlements - "$(brew --prefix)/bin/fwe"
+
   bench-linux:
     name: Benchmarks (Linux arm64)
     runs-on: ubuntu-24.04-arm

@@ -414,6 +414,51 @@ fn root_filesystem_confines_writes() {
     }
 }
 
+/// A program named by a host path inside the root that is a symbolic link
+/// to an absolute path (Alpine's `/bin/sh` to `/bin/busybox`): the link
+/// resolves in the root, not on the host.
+#[test]
+fn root_programs_behind_absolute_links_run() {
+    let root = std::env::temp_dir().join(format!("fwe-root-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::copy(asm_guest("hello"), root.join("bin/hello")).unwrap();
+    std::os::unix::fs::symlink("/bin/hello", root.join("bin/sh")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("bin/sh"));
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), "hello from linux\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A script run by `execve` with no shell between (as `apk` runs its
+/// packages' scripts, from a memfd through `fexecve`): its `#!` line's
+/// interpreter runs with the line's argument, the script's path
+/// (`/dev/fd/N` for a descriptor), then the rest of the arguments.
+#[test]
+fn scripts_run_their_interpreter() {
+    let dir = std::env::temp_dir().join(format!("fwe-script-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let me = rust_guest("args");
+    let out = fwe(&me, &["script", dir.to_str().unwrap()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = stdout(&out);
+    let want = format!(
+        "arg[0]={}\narg[1]=-a\narg[2]={}/script.sh\narg[3]=one\n",
+        me.display(),
+        dir.display()
+    );
+    assert!(text.starts_with(&want), "{text}");
+    let out = fwe(&me, &["memfd-script"]);
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().take(4).collect();
+    assert_eq!(lines[..2], [format!("arg[0]={}", me.display()), "arg[1]=-a".to_string()], "{text}");
+    assert!(lines[2].starts_with("arg[2]=/dev/fd/"), "{text}");
+    assert_eq!(lines[3], "arg[3]=one", "{text}");
+}
+
 /// Build one assembly guest object and link it with the given extra flags.
 fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     let out = out_dir().join("asm");
@@ -1450,6 +1495,78 @@ fn fetched_program_tests(var: &str) -> bool {
 /// `FWE_DEBUGGER_TESTS` is set (CI's `debuggers` job).
 fn debugger_tests() -> bool {
     fetched_program_tests("FWE_DEBUGGER_TESTS")
+}
+
+/// `fwe --pull IMAGE DIR` into a fresh directory, then `script` run by the
+/// root's shell `sh` (a path in the root): its output.
+fn pulled_and_run(image: &str, sh: &str, script: &str) -> Output {
+    let root = std::env::temp_dir().join(format!(
+        "fwe-pulled-{}-{}",
+        std::process::id(),
+        image.replace([':', '/'], "-")
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pull = run_bounded_for(
+        {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_fwe"));
+            c.arg("--pull").arg(image).arg(&root);
+            c
+        },
+        &[],
+        Duration::from_secs(300),
+    );
+    eprintln!("--- pull {image}:\n{}", String::from_utf8_lossy(&pull.stderr));
+    assert_eq!(pull.status.code(), Some(0), "pull {image}");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg("--cwd").arg("/");
+    cmd.arg(root.join(sh.trim_start_matches('/'))).args(["-c", script]);
+    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("HOME", "/root");
+    cmd.env("TERM", "dumb");
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(180));
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("--- {image} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    out
+}
+
+/// Alpine's and Debian's images, pulled from Docker Hub (`fwe --pull`) and
+/// run with `--root`: their shells and package tools (`apk add` fetching
+/// and installing a package), the owners and
+/// set-ID modes an unprivileged unpacking loses kept, and `su` (set-ID)
+/// running a command as another user. Only where `FWE_PULL_TESTS` is set
+/// (CI): the images' programs are downloaded.
+#[test]
+fn pulled_images_run() {
+    if !fetched_program_tests("FWE_PULL_TESTS") {
+        return;
+    }
+    let out = pulled_and_run(
+        "alpine:3.24",
+        "/bin/sh",
+        "cat /etc/alpine-release; apk --version; stat -c '%a %U:%G' /etc/shadow; id -un; \
+         apk add -q --no-progress tree && tree --version | cut -d' ' -f1",
+    );
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() == 5 && lines[0].starts_with("3.24."), "{text}");
+    assert!(lines[1].starts_with("apk-tools "), "{text}");
+    assert_eq!(lines[2..], ["640 root:shadow", "root", "tree"], "{text}");
+    assert_eq!(out.status.code(), Some(0));
+
+    let out = pulled_and_run(
+        "debian:trixie",
+        "/bin/bash",
+        "cat /etc/debian_version; dpkg-query -W -f '${Status}\\n' base-files; \
+         stat -c '%a %U:%G' /usr/bin/su /etc/shadow; su -s /bin/sh nobody -c 'id -un'",
+    );
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() == 5 && lines[0].starts_with("13."), "{text}");
+    assert_eq!(
+        lines[1..],
+        ["install ok installed", "4755 root:root", "640 root:shadow", "nobody"],
+        "{text}"
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// Run `args` (a program of the root, then its arguments) in a copy of the
@@ -3166,7 +3283,12 @@ fn x18_in_code_a_sparse_unwind_table_leaves_out_is_rewritten() {
 /// (guests/asm/x18spsig.S).
 #[test]
 fn asm_x18_sp_stub_survives_signals() {
-    assert_eq!(fwe(&asm_guest("x18spsig-pie"), &[]).status.code(), Some(0));
+    // Untraced: two trace lines a signal, every 50 us, can take a slow
+    // runner longer than the timer's interval, and the loop never ends.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg(asm_guest("x18spsig-pie"));
+    let out = run_vm_bounded(cmd);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the

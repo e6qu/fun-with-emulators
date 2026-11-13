@@ -179,7 +179,7 @@ fn hex(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode [`hex`]'s output.
 fn unhex(text: &[u8]) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
@@ -246,13 +246,19 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
     Ok(fs)
 }
 
-/// The program's bytes: a host path, or a guest path in the rootfs.
+/// The program's bytes: a host path, or a guest path in the rootfs. A
+/// host path inside the rootfs is read as the guest's path, so that a
+/// symbolic link there resolves in the rootfs (Alpine's `/bin/sh` links to
+/// `/bin/busybox`, which on the host is no file).
 fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<Vec<u8>, Error> {
+    let in_guest =
+        |p: &[u8]| fs.read(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)));
     if options.exe_fd.is_some() {
-        fs.read(b"/proc/self/exe").map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+        in_guest(b"/proc/self/exe")
     } else if options.guest_path {
-        fs.read(path.as_os_str().as_bytes())
-            .map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+        in_guest(path.as_os_str().as_bytes())
+    } else if let Some(guest) = guest_path_in_root(path, options) {
+        in_guest(&guest)
     } else {
         std::fs::read(path).map_err(Error::Read)
     }
@@ -283,7 +289,14 @@ fn guest_path_in_root(path: &Path, options: &Options) -> Option<Vec<u8>> {
     if options.guest_path {
         return None;
     }
-    let host = std::fs::canonicalize(path).ok()?;
+    // The directory resolved on the host, the name itself not: a symbolic
+    // link there is the guest's to resolve.
+    let name = path.file_name()?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let host = std::fs::canonicalize(parent).ok()?.join(name);
     let root = std::fs::canonicalize(options.root.as_ref()?).ok()?;
     let inside = host.strip_prefix(&root).ok()?;
     Some(Path::new("/").join(inside).as_os_str().as_bytes().to_vec())
@@ -1055,7 +1068,7 @@ fn start(
     let sigreturn_tramp = make_sigreturn_trampoline(page)?;
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
-        let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
+        let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
         fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
         fs.set_auxv(out.auxv.clone());
         fs.publish();
@@ -1076,13 +1089,14 @@ fn start(
 
 /// The guest's absolute path of the program fwe was asked to run, for
 /// `/proc/self/exe`: the host path, made relative to the root filesystem when
-/// the program lies inside it.
-fn guest_exe_path(path: &Path, options: &Options) -> Vec<u8> {
+/// the program lies inside it, its symbolic links followed there.
+fn guest_exe_path(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Vec<u8> {
     if options.guest_path {
         return path.as_os_str().as_bytes().to_vec();
     }
     if let Some(guest) = guest_path_in_root(path, options) {
-        return guest;
+        let cwd = fwe_abi::fcntl::AT_FDCWD as i32;
+        return fs.resolve(cwd, &guest, true).ok().and_then(|r| r.ns_path).unwrap_or(guest);
     }
     match std::fs::canonicalize(path) {
         Ok(host) => host.as_os_str().as_bytes().to_vec(),

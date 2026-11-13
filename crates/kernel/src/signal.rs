@@ -1090,10 +1090,10 @@ pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64
     let r = if thread::deliverable() != 0 { err(errno::EINTR) } else { call() };
     // SAFETY: restoring the mask saved above.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
-    if r != err(errno::EINTR) {
-        if let Some(mask) = thread::take_saved_mask() {
-            thread::set_mask(mask);
-        }
+    if r != err(errno::EINTR)
+        && let Some(mask) = thread::take_saved_mask()
+    {
+        thread::set_mask(mask);
     }
     r
 }

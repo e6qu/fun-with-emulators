@@ -1,0 +1,114 @@
+name: Release
+
+# A release: fwe built for Apple Silicon, signed with the entitlements in
+# hypervisor.entitlements under the hardened runtime, checked by running an
+# Alpine image, and published with its SHA-256 on the tag's release page.
+#
+# Signed with a Developer ID and notarized when the repository has these
+# secrets (the owner's Apple Developer account), and ad hoc otherwise:
+#   MACOS_CERTIFICATE           the Developer ID Application certificate
+#                               and key, a .p12 file in base64
+#   MACOS_CERTIFICATE_PASSWORD  its password
+#   MACOS_SIGNING_IDENTITY      "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD
+#                               the account notarytool submits with (an
+#                               app-specific password)
+#
+# Run by hand (workflow_dispatch), or for a pull request that changes how
+# a release is made, it builds, signs and checks, and keeps the archive as
+# the run's artifact without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - hypervisor.entitlements
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked -p fwe
+      - name: Sign
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          identity=-
+          if [ -n "$MACOS_CERTIFICATE" ]; then
+            keychain="$RUNNER_TEMP/signing.keychain-db"
+            password=$(uuidgen)
+            security create-keychain -p "$password" "$keychain"
+            security set-keychain-settings -lut 3600 "$keychain"
+            security unlock-keychain -p "$password" "$keychain"
+            echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+              -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            rm "$RUNNER_TEMP/cert.p12"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+            security list-keychains -d user -s "$keychain"
+            identity="$MACOS_SIGNING_IDENTITY"
+          else
+            echo "::warning::no Developer ID secrets: signed ad hoc, not notarized"
+          fi
+          # A secure timestamp, which notarization needs, for a real identity.
+          timestamp=--timestamp=none
+          [ "$identity" = - ] || timestamp=--timestamp
+          codesign --sign "$identity" --force --options runtime "$timestamp" \
+            --entitlements hypervisor.entitlements target/release/fwe
+          codesign --verify --strict --verbose=2 target/release/fwe
+          codesign -d --entitlements - target/release/fwe
+      - name: Check it runs an image
+        run: |
+          target/release/fwe --pull alpine:3.24 "$RUNNER_TEMP/alpine"
+          root="$RUNNER_TEMP/alpine"
+          out=$(env -i PATH=/usr/bin:/bin target/release/fwe --root "$root" "$root/bin/sh" -c 'echo ok')
+          test "$out" = ok
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="0.0.0-${GITHUB_SHA::7}"
+          name="fwe-$version-macos-arm64"
+          mkdir -p "dist/$name"
+          cp target/release/fwe LICENSE README.md "dist/$name/"
+          # ditto keeps the signature; zip, as notarytool takes.
+          (cd dist && ditto -c -k --keepParent "$name" "$name.zip")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+        if: env.MACOS_CERTIFICATE != '' && env.APPLE_ID != ''
+        run: |
+          xcrun notarytool submit "dist/${{ steps.package.outputs.name }}.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+      - name: Checksum
+        run: |
+          cd dist
+          shasum -a 256 "${{ steps.package.outputs.name }}.zip" > "${{ steps.package.outputs.name }}.zip.sha256"
+          cat "${{ steps.package.outputs.name }}.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.zip*
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "fwe ${GITHUB_REF_NAME#v}" \
+            --notes "See README.md for installing and running." \
+            dist/*.zip dist/*.zip.sha256

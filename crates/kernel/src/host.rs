@@ -446,11 +446,12 @@ pub fn empty_sigset() -> libc::sigset_t {
 pub fn host_sigset(mask: u64) -> libc::sigset_t {
     let mut set = empty_sigset();
     for sig in 1..=signal::NSIG {
-        if mask & (1 << (sig - 1)) != 0 && crate::signal::relayed(sig) {
-            if let Some(h) = signal_to_host(sig) {
-                // SAFETY: `set` is an initialized signal set.
-                unsafe { libc::sigaddset(&mut set, h) };
-            }
+        if mask & (1 << (sig - 1)) != 0
+            && crate::signal::relayed(sig)
+            && let Some(h) = signal_to_host(sig)
+        {
+            // SAFETY: `set` is an initialized signal set.
+            unsafe { libc::sigaddset(&mut set, h) };
         }
     }
     set
@@ -1073,7 +1074,9 @@ pub fn cpu_times() -> Vec<[u64; 4]> {
         // SAFETY: `info` holds `words` integers, four per CPU.
         let ticks = unsafe { std::slice::from_raw_parts(info, words as usize) };
         let out = ticks
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(cpus as usize)
             .map(|t| {
                 let v = |i: usize| u64::from(t[i] as u32);
@@ -1574,4 +1577,27 @@ pub fn clone_at(src: i32, dst_dir: i32, dst: &std::ffi::CStr) -> Result<(), i32>
         let _ = (src, dst_dir, dst);
         Err(le::EOPNOTSUPP)
     }
+}
+
+/// Run `f` with every signal blocked on the calling thread, its mask put
+/// back after. A thread `f` creates starts with them all blocked: one of
+/// fwe's own keeps them so (a guest's signal is a guest thread's to take),
+/// and a guest thread takes the guest's mask once its thread-local storage
+/// is made. A signal handled before then would have the host make that
+/// storage in the handler, in `malloc`, which the thread may be in
+/// already, making it for the thread's own first access.
+pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: zeroed sets, filled or written by the calls; this thread's
+    // mask only, restored below.
+    let old = unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut old);
+        old
+    };
+    let r = f();
+    // SAFETY: the mask saved above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    r
 }

@@ -567,7 +567,7 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
         n
     };
     crate::host::set_errno(saved);
-    for e in q[..n.max(0) as usize].chunks_exact(ENTRY) {
+    for e in q[..n.max(0) as usize].as_chunks::<ENTRY>().0.iter() {
         let word = |at: usize| e[at..at + 4].try_into().unwrap();
         let sig = i32::from_ne_bytes(word(0));
         if sig as u64 == FOSTER_NOTE {
