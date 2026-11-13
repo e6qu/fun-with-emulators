@@ -433,6 +433,15 @@ fn root_programs_behind_absolute_links_run() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A program run through an `O_PATH` descriptor of it
+/// (`execveat(fd, "", AT_EMPTY_PATH)`), as crun runs a container's.
+#[test]
+fn programs_run_through_an_o_path_descriptor() {
+    let out = fwe(&rust_guest("args"), &["opath-exec"]);
+    assert!(stdout(&out).starts_with("arg[0]=args\narg[1]=after-opath\n"), "{}", stdout(&out));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// A script run by `execve` with no shell between (as `apk` runs its
 /// packages' scripts, from a memfd through `fexecve`): its `#!` line's
 /// interpreter runs with the line's argument, the script's path

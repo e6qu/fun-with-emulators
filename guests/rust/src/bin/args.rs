@@ -5,7 +5,8 @@
 //! `args script DIR` (or `args memfd-script`) runs itself again through a
 //! script, `#!` naming it with one argument, made in DIR (or in a memfd,
 //! run through its descriptor, as `fexecve` does): with no shell between,
-//! the kernel runs the interpreter.
+//! the kernel runs the interpreter. `args opath-exec` runs itself again
+//! through an `O_PATH` descriptor of itself.
 
 unsafe extern "C" {
     fn execv(path: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
@@ -41,8 +42,27 @@ fn run_script(text: &str, path: Option<&str>) -> ! {
     std::process::exit(1);
 }
 
+/// Run this program again through an `O_PATH` descriptor of it, as crun
+/// runs a container's program: `execveat(fd, "", AT_EMPTY_PATH)`.
+fn run_opath() -> ! {
+    use std::ffi::CString;
+    let me = CString::new(std::fs::read_link("/proc/self/exe").unwrap().into_os_string().into_encoded_bytes()).unwrap();
+    let argv = [c"args".as_ptr(), c"after-opath".as_ptr(), std::ptr::null()];
+    let env: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+    // SAFETY: openat and execveat with NUL-terminated paths and arrays.
+    unsafe {
+        let fd = syscall(56, -100i64, me.as_ptr(), 0o10000000i64 | 0o2000000, 0i64);
+        syscall(281, fd, c"".as_ptr(), argv.as_ptr(), env.as_ptr(), 0x1000i64);
+    }
+    println!("exec failed: {}", std::io::Error::last_os_error());
+    std::process::exit(1);
+}
+
 fn main() {
     let all: Vec<String> = std::env::args().collect();
+    if all.get(1).map(String::as_str) == Some("opath-exec") {
+        run_opath();
+    }
     if all.len() >= 2 && (all[1] == "script" || all[1] == "memfd-script") {
         let me = std::fs::read_link("/proc/self/exe").unwrap();
         let text = format!("#!{} -a\nnot read\n", me.display());
