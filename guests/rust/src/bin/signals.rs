@@ -775,6 +775,55 @@ fn main() {
             let status = std::process::Command::new(exe).arg("spawned").status().unwrap();
             println!("child {status}");
         }
+        // A handler runs and returns in a program that replaced another in
+        // the same process, as a shell's command substitution does after
+        // its `exec`: the way back from the handler (fwe's `rt_sigreturn`
+        // trampoline) outlives the first program's memory.
+        "exec-then-handler" => {
+            unsafe extern "C" {
+                fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;
+            }
+            catch(SIGUSR1, 0);
+            // SAFETY: plain call.
+            unsafe { raise(SIGUSR1) };
+            let exe = std::env::current_exe().unwrap();
+            let mut path = exe.into_os_string().into_encoded_bytes();
+            path.push(0);
+            let argv = [path.as_ptr(), b"handler-after-exec\0".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: valid NUL-terminated arrays.
+            unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            println!("execve failed: {}", errno());
+        }
+        "handler-after-exec" => {
+            // Installed with no restorer of its own, as glibc installs
+            // handlers on arm64: the handler returns through the kernel's
+            // way back (fwe's trampoline), not the C library's.
+            #[repr(C)]
+            struct KernelSigaction {
+                handler: usize,
+                flags: u64,
+                restorer: usize,
+                mask: u64,
+            }
+            let act = KernelSigaction {
+                handler: record as *const () as usize,
+                flags: SA_SIGINFO as u64,
+                restorer: 0,
+                mask: 0,
+            };
+            const SYS_RT_SIGACTION: i64 = 134;
+            // SAFETY: a valid kernel sigaction, no old one asked for.
+            let r = unsafe {
+                syscall(SYS_RT_SIGACTION, SIGUSR1 as i64, &act as *const KernelSigaction, 0i64, 8i64)
+            };
+            assert_eq!(r, 0);
+            for _ in 0..3 {
+                // SAFETY: plain call.
+                unsafe { raise(SIGUSR1) };
+            }
+            println!("handled after exec: {}", HITS.load(Ordering::SeqCst));
+        }
         "exec-self" => {
             unsafe extern "C" {
                 fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;

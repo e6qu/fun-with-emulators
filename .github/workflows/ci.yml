@@ -84,6 +84,8 @@ jobs:
           /usr/bin/log show --last 60m --style compact --predicate \
             '(eventMessage CONTAINS[c] "unrecoverable" AND NOT eventMessage CONTAINS "CT signature") OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
             | tail -200 || true
+      # Where fwe itself crashed: the newest crash reports, their faulting
+      # thread's registers and frames.
       - if: failure()
         run: |
           for f in $(ls -t ~/Library/Logs/DiagnosticReports/fwe*.ips 2>/dev/null | head -3); do

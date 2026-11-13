@@ -3389,6 +3389,13 @@ fn signals_landing_as_calls_end_are_taken() {
     assert_eq!(signals("busy-calls"), "left pending: 0\n");
 }
 
+/// A signal handler returns in a program that replaced another in the same
+/// process: the way back from it is still there.
+#[test]
+fn handlers_return_after_exec() {
+    assert_eq!(signals("exec-then-handler"), "handled after exec: 3\n");
+}
+
 /// A real-time signal (no host equivalent) sent to the process itself.
 #[test]
 fn realtime_signal_to_self() {

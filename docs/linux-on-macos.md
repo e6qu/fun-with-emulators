@@ -625,8 +625,10 @@ while it is still writable and before any thread can run it
   ([Write+exec memory](#writeexec-memory)).
 
 Preparing code twice is harmless: a rewritten site no longer matches.
-fwe's own `rt_sigreturn` trampoline (`movz x8, #139; svc #0`) is prepared
-like guest code.
+fwe's own `rt_sigreturn` trampoline is written already rewritten, as
+`movz x8, #139; brk #0x4c58`: the trap, not a branch to a stub, since the
+trampoline is fwe's and outlives the program's memory (its stub regions
+included) across `execve`, and `rt_sigreturn` always takes the trap.
 
 ### What is scanned
 
