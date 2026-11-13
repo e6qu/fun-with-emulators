@@ -666,7 +666,9 @@ mod tests {
 
     /// Two layers unpacked in order: the second's whiteouts remove a file
     /// and empty an opaque directory of the first, and are not unpacked
-    /// themselves; a path asked to be left out is.
+    /// themselves; a path asked to be left out is. (With the host's `tar`,
+    /// macOS's: `fwe` runs only there.)
+    #[cfg(target_os = "macos")]
     #[test]
     fn layers_apply_in_order_with_whiteouts() {
         let base = std::env::temp_dir().join(format!("fwe-pull-test-{}", std::process::id()));
