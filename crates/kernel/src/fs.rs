@@ -2870,6 +2870,11 @@ pub(crate) mod shm {
     fn user_temp() -> Vec<u8> {
         #[cfg(target_os = "macos")]
         {
+            // `TMPDIR` as the system sets it, when it is that directory:
+            // asking the system costs milliseconds (a daemon is asked).
+            if let Some(dir) = system_tmpdir() {
+                return dir;
+            }
             let mut buf = vec![0u8; 1024];
             // SAFETY: `buf` is valid for its length; confstr NUL-terminates.
             let n = unsafe {
@@ -2881,6 +2886,38 @@ pub(crate) mod shm {
             }
         }
         b"/tmp".to_vec()
+    }
+
+    /// `TMPDIR`, if it names a user's temporary directory as the system
+    /// makes them (`/var/folders/<xx>/<id>/T`) and that one is this user's,
+    /// which makes it this user's only one.
+    #[cfg(target_os = "macos")]
+    fn system_tmpdir() -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut dir = std::env::var_os("TMPDIR")?.into_vec();
+        while dir.len() > 1 && dir.last() == Some(&b'/') {
+            dir.pop();
+        }
+        let rest = dir
+            .strip_prefix(b"/var/folders/")
+            .or_else(|| dir.strip_prefix(b"/private/var/folders/"))?;
+        let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').collect();
+        let plain =
+            |p: &&[u8]| !p.is_empty() && p.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_');
+        if parts.len() != 3 || parts[2] != b"T" || !parts[..2].iter().all(plain) {
+            return None;
+        }
+        let p = c(&dir).ok()?;
+        // SAFETY: zeroed bytes are a valid `stat`; `lstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `p` is NUL-terminated; `st` is a valid out-parameter.
+        if unsafe { libc::lstat(p.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        // SAFETY: getuid cannot fail.
+        let mine = st.st_uid == unsafe { libc::getuid() };
+        (mine && st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_mode & 0o077 == 0)
+            .then_some(dir)
     }
 
     fn c(path: &[u8]) -> Result<std::ffi::CString, i32> {
