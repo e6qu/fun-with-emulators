@@ -260,6 +260,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18rare",
     "x18spsig",
     "x18partial",
+    "svcimm",
     "fpsig",
     "efault",
     "sigmap",
@@ -429,6 +430,15 @@ fn root_programs_behind_absolute_links_run() {
     let out = run_bounded(cmd);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(stdout(&out), "hello from linux\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A program run through an `O_PATH` descriptor of it
+/// (`execveat(fd, "", AT_EMPTY_PATH)`), as crun runs a container's.
+#[test]
+fn programs_run_through_an_o_path_descriptor() {
+    let out = fwe(&rust_guest("args"), &["opath-exec"]);
+    assert!(stdout(&out).starts_with("arg[0]=args\narg[1]=after-opath\n"), "{}", stdout(&out));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -1567,6 +1577,57 @@ fn pulled_images_run() {
         "{text}"
     );
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// The user guide's tested recipes (`docs/user-guide.md`), run as written:
+/// each block marked `<!-- tested: NAME -->` runs in `bash` on the host
+/// (after the guide's `linux` function), in order, sharing a home
+/// directory, with `fwe` on the `PATH`, and must print what the `text`
+/// block after it shows. Only where `FWE_PULL_TESTS` is set (CI): they
+/// pull images and run their programs.
+#[test]
+fn user_guide_recipes() {
+    if !fetched_program_tests("FWE_PULL_TESTS") {
+        return;
+    }
+    let guide = std::fs::read_to_string(repo().join("docs/user-guide.md")).unwrap();
+    let block = |from: usize, fence: &str| -> Option<(String, usize)> {
+        let start = guide[from..].find(fence)? + from + fence.len();
+        let end = guide[start..].find("\n```")? + start;
+        Some((guide[start..end].trim_start_matches('\n').to_string(), end + 4))
+    };
+    let helper_at = guide.find("linux() {").expect("the guide's linux function");
+    let helper_start = guide[..helper_at].rfind("```sh").unwrap();
+    let (helper, _) = block(helper_start, "```sh").unwrap();
+    let home = std::env::temp_dir().join(format!("fwe-guide-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_fwe")).parent().unwrap().to_path_buf();
+    let mut at = 0;
+    let mut ran = Vec::new();
+    // Every recipe runs, so one run of CI shows each that fails.
+    let mut failed = Vec::new();
+    while let Some(i) = guide[at..].find("<!-- tested: ") {
+        let i = i + at;
+        let name = guide[i + 13..].split(' ').next().unwrap().to_string();
+        let (script, after) = block(i, "```sh").unwrap();
+        let (want, after) = block(after, "```text").unwrap();
+        at = after;
+        let mut cmd = Command::new("bash");
+        cmd.args(["-euo", "pipefail", "-c", &format!("{helper}\n{script}")]);
+        cmd.env_clear().env("HOME", &home);
+        cmd.env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()));
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(900));
+        eprintln!("--- guide {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        if stdout(&out) != format!("{want}\n") || out.status.code() != Some(0) {
+            eprintln!("--- guide {name} printed ({}):\n{}", out.status, stdout(&out));
+            failed.push(name.clone());
+        }
+        ran.push(name);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(ran, ["debian", "alpine", "podman"]);
+    assert!(failed.is_empty(), "guide recipes that failed: {failed:?}");
 }
 
 /// Run `args` (a program of the root, then its arguments) in a copy of the
@@ -3138,6 +3199,17 @@ fn asm_hello() {
     }
 }
 
+/// `svc` with an immediate other than 0 is a system call, as Linux takes
+/// any (guests/asm/svcimm.S: `svc #0x80`, `svc #1`).
+#[test]
+fn svc_with_any_immediate_is_a_system_call() {
+    for name in ["svcimm", "svcimm-pie"] {
+        let out = fwe(&asm_guest(name), &[]);
+        assert_eq!(stdout(&out), "svc imm\n", "{name}");
+        assert_eq!(out.status.code(), Some(0), "{name}");
+    }
+}
+
 #[test]
 fn asm_exit_status() {
     for name in ["exit42", "exit42-pie"] {
@@ -4172,6 +4244,59 @@ fn the_new_mount_api_makes_and_attaches_mounts() {
     let out = fwe(&rust_guest("mountapi"), &[]);
     assert_eq!(stdout(&out), MOUNTAPI, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// A binary run again through a read-only clone of its own mount
+/// (`open_tree`, `mount_setattr`, `execveat`), as crun and runc protect
+/// themselves, finds itself on a read-only mount (`fstatfs` of
+/// `/proc/self/exe`), so it does not clone itself again.
+#[test]
+fn a_binary_run_through_a_read_only_clone_sees_it() {
+    let out = fwe(&rust_guest("mountapi"), &["selfclone"]);
+    assert_eq!(
+        stdout(&out),
+        "cloned: read-only true, re-ran true\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// `/proc` reached through a descriptor of a procfs instance, as crun
+/// reaches it: one made with `fsmount`, and a clone of `/proc`; files fwe
+/// makes from the process's state (`self/status`, `mounts`) too. Attached
+/// (in a directory, and in an overlay bound onto itself, as a container's
+/// root), the mount is remounted through a descriptor of its mount point
+/// and by path, its flags set through the descriptor it was attached
+/// with, its files opened with `openat2`, and one masked with `/dev/null`
+/// as crun masks it (a clone of `/dev/null`, and a bind through
+/// descriptors); a sysfs the same way, its flags set through its
+/// descriptor again after `pivot_root` into that root.
+#[test]
+fn proc_is_read_through_a_detached_mount() {
+    let want = "fsmount proc: cap_last_cap 40\nmounts: read\nself/mountinfo: read\nself/status: read\n\
+         self/cgroup: read\nopen_tree /proc: cap_last_cap 40\n\
+         proc attached 0; remount through fd 0 (0), by path 0 (0); setattr through its descriptor 0\n\
+         keys under it: openat true, openat2 true (0)\n\
+         in an overlay: mounted 0, proc attached 0; keys: openat true, openat2 true (0)\n\
+         masked: open_tree of /dev/null true (0), bound 0; again true (0), reads 0\n\
+         sysfs attached 0, setattr 0 (0); clone of /sys true (0), setattr 0 (0)\n\
+         pivoted 0 (0); setattr through the sysfs's descriptor after 0 (0)\n";
+    // On the host's files, and in a root filesystem, whose `/dev/null` is
+    // the host's device served from outside it, as a container engine's.
+    let out = fwe(&rust_guest("mountapi"), &["procfd"]);
+    assert_eq!(stdout(&out), want, "{}", String::from_utf8_lossy(&out.stderr));
+    let root = std::env::temp_dir().join(format!("fwe-procfd-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["tmp", "proc", "dev", "sys"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::copy(rust_guest("mountapi"), root.join("mountapi")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("mountapi")).arg("procfd");
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), want, "in a root: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// What the `nsfd` guest prints.

@@ -535,15 +535,22 @@ impl<P: Platform> Kernel<P> {
         // one in the new root's tree, or in the old one's, moves with it,
         // as Linux has it.
         use crate::mounts::{join, under};
-        let cwd_ns = if cwd_ns == root {
-            cwd_ns
-        } else if let Some(rest) = under(&cwd_ns, &new_ns) {
-            join(&root, rest)
-        } else if let Some(rest) = under(&cwd_ns, &root) {
-            join(&new_put, rest)
-        } else {
-            cwd_ns
+        let moved = |p: &[u8]| -> Vec<u8> {
+            if p == root {
+                p.to_vec()
+            } else if let Some(rest) = under(p, &new_ns) {
+                join(&root, rest)
+            } else if let Some(rest) = under(p, &root) {
+                join(&new_put, rest)
+            } else {
+                p.to_vec()
+            }
         };
+        let cwd_ns = moved(&cwd_ns);
+        // What open descriptors were opened at moves the same way: a mount
+        // attached through a descriptor is still that descriptor's after
+        // the pivot (crun sets its container's `/sys` flags so).
+        crate::fdmarks::rebase(moved);
         let fs = self.fs_mut();
         let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
         let root_mount = fs.mounts().locate(&root).0.id;

@@ -1520,7 +1520,26 @@ fn disconnect(fd: i32) -> Option<i64> {
 /// `SO_PASSCRED`).
 const KEPT: [u64; 3] = [11, 12, 16];
 
-/// The values of [`KEPT`] options set: (socket, option, value).
+/// Options of the IP levels Linux has and the host has not, kept as
+/// [`KEPT`] is: `IP_RECVERR` and `IPV6_RECVERR`, which glibc's resolver
+/// sets on its socket and gives up without. Linux's error queue holds the
+/// ICMP errors a socket's datagrams met; the host keeps none, so it stays
+/// empty, as on a network that returns no such errors.
+const KEPT_IP: [(u64, u64); 2] = [(0, 11), (41, 25)];
+
+/// The key [`KEPT_VALUES`] holds option `optname` of `level` under, if it
+/// is one fwe keeps.
+fn kept_key(level: u64, optname: u64) -> Option<u64> {
+    if level == SOL_SOCKET && KEPT.contains(&optname) {
+        Some(optname)
+    } else if KEPT_IP.contains(&(level, optname)) {
+        Some(level << 32 | optname)
+    } else {
+        None
+    }
+}
+
+/// The values of kept options set: (socket, [`kept_key`], value).
 pub(crate) static KEPT_VALUES: std::sync::Mutex<Vec<(i32, u64, i32)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -1692,7 +1711,7 @@ pub unsafe fn setsockopt(
             Err(e) => err(e),
         };
     }
-    if level == SOL_SOCKET && KEPT.contains(&optname) {
+    let keep = |key: u64| {
         if optlen < 4 {
             return err(errno::EINVAL);
         }
@@ -1701,12 +1720,20 @@ pub unsafe fn setsockopt(
             return e;
         }
         let mut k = KEPT_VALUES.lock().unwrap_or_else(|e| e.into_inner());
-        k.retain(|&(f, o, _)| (f, o) != (fd as i32, optname));
-        k.push((fd as i32, optname, v));
-        return 0;
+        k.retain(|&(f, o, _)| (f, o) != (fd as i32, key));
+        k.push((fd as i32, key, v));
+        0
+    };
+    if level == SOL_SOCKET
+        && let Some(key) = kept_key(level, optname)
+    {
+        return keep(key);
     }
     if let Some(e) = level_refused(fd as i32, level, false) {
         return e;
+    }
+    if let Some(key) = kept_key(level, optname) {
+        return keep(key);
     }
     let (hl, ho, form) = match opt_to_host(level, optname) {
         Ok(v) => v,
@@ -1760,7 +1787,8 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
     if optval == 0 && len > 0 {
         return err(errno::EFAULT);
     }
-    if level == SOL_SOCKET && (KEPT.contains(&optname) || matches!(optname, 38 | 39)) {
+    let kept = kept_key(level, optname);
+    if kept.is_some() || level == SOL_SOCKET && matches!(optname, 38 | 39) {
         let Some((fam, ty)) = kind(fd as i32) else {
             return socket_fd(fd as i32).err().unwrap_or(err(errno::ENOTSOCK));
         };
@@ -1780,7 +1808,7 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .find(|&&(f, o, _)| (f, o) == (fd as i32, optname))
+                .find(|&&(f, o, _)| Some((f, o)) == kept.map(|k| (fd as i32, k)))
                 .map_or(0, |k| k.2),
         };
         let n = (len as usize).min(4);
@@ -2637,6 +2665,34 @@ mod tests {
         assert_eq!(r, 0, "getsockopt: {r}");
         assert_eq!(ty as u64, SOCK_STREAM);
         close(fd);
+    }
+
+    /// `IP_RECVERR` and `IPV6_RECVERR`, which glibc's resolver sets on its
+    /// UDP socket and gives up without, are accepted and read back as set.
+    #[test]
+    fn error_queue_options_are_kept() {
+        for (family, level, opt) in [(AF_INET, 0u64, 11u64), (AF_INET6, 41, 25)] {
+            // SAFETY: no pointers.
+            let fd = unsafe { socket(family, SOCK_DGRAM, 0) };
+            assert!(fd >= 0);
+            let on: i32 = 1;
+            // SAFETY: a readable option of its length.
+            let r = unsafe { setsockopt(fd as u64, level, opt, &on as *const _ as u64, 4, false) };
+            assert_eq!(r, 0, "setsockopt {level}/{opt}");
+            let (mut v, mut len): (i32, u32) = (0, 4);
+            // SAFETY: writable option and length buffers.
+            let r = unsafe {
+                getsockopt(
+                    fd as u64,
+                    level,
+                    opt,
+                    &mut v as *mut _ as u64,
+                    &mut len as *mut _ as u64,
+                )
+            };
+            assert_eq!((r, v, len), (0, 1, 4), "getsockopt {level}/{opt}");
+            close(fd);
+        }
     }
 
     /// A guest `AF_UNIX` address for `path`, and its length.

@@ -40,75 +40,28 @@ built for ARM64 in the VM (`fwe --vm`, on the stand-in). All 1213 of LTP's syste
 
 | Document | Contents |
 |---|---|
+| [docs/user-guide.md](docs/user-guide.md) | Installing fwe, a Linux userland, running programs and containers, and what does not work |
 | [PLAN.md](PLAN.md) | Goal, approach, scope and the 1.0 finish line |
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
 | [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run where, which instructions are rewritten, how the VM is used, and how each Linux concept maps onto macOS |
+| [docs/comparisons.md](docs/comparisons.md) | fwe beside Wine, Lima, WSL, gVisor, QEMU, Rosetta, FreeBSD's Linuxulator and others |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
-## Installing
-
-With Homebrew, from this repository as a tap (built from source, and
-signed for your Mac with the entitlements in `hypervisor.entitlements`):
+## Usage
 
 ```sh
 brew tap e6qu/fwe https://github.com/e6qu/fun-with-emulators
-brew install fwe          # the latest release; --HEAD for main
-```
-
-Or from a release's archive (signed and notarized), or from source with
-`cargo build --release`, then signing as [docs/hypervisor.md](docs/hypervisor.md)
-shows for the VM backend.
-
-## Usage
-
-A Linux userland comes from a container image: `fwe --pull` fetches its
-linux/arm64 variant from the registry (Docker Hub unless named otherwise)
-and unpacks it into a directory, which `--root` then makes the guest's `/`:
-
-```sh
-fwe --pull debian:trixie ~/debian
+brew install fwe
+fwe --pull debian:trixie ~/debian          # a Debian userland, from its image
 fwe --root ~/debian ~/debian/bin/bash      # a shell in it
-fwe --pull alpine:3.24 ~/alpine
-fwe --root ~/alpine ~/alpine/bin/sh -c 'apk add git && git --version'
+fwe ./hello                                # a Linux arm64 executable
+fwe --strace ./hello                       # with its system calls traced
 ```
 
-On a case-insensitive volume (macOS's default) a file whose name differs
-from another's only in case cannot be kept; `--pull` leaves such files out
-and lists them (Debian has one, a manual page). A case-sensitive APFS
-volume keeps them all.
-
-```sh
-fwe ./hello                 # run a Linux arm64 executable
-fwe --root ./rootfs ./hello # with ./rootfs as /
-fwe --strace ./hello        # trace its system calls
-fwe --strace --strace-file=trace.log ./hello  # every process, to a file
-fwe --vm ./hello            # in the VM, with 4 KiB pages
-```
-
-A dynamically linked program needs its dynamic linker and libraries under
-the root, at the paths the program names: run it in a root of the
-distribution it was built for.
-
-Windows programs built for ARM64 run through Wine, here Alpine's
-(`apk add wine` in an aarch64 Alpine root), in the VM:
-
-```sh
-cp winprog.exe alpine/tmp/
-fwe --vm --root ./alpine ./alpine/bin/busybox sh -c 'wine wineboot --init && wine /tmp/winprog.exe'
-```
-
-```text
-arm64: 1
-file: written by Windows, deleted 1
-threads: 4000, exit codes 10
-exception: handled
-child: hello
-child exited 7
-```
-
-That is `guests/windows/winprog.c`, built with
-`zig cc -target aarch64-windows-gnu`; CI's `wine` job runs it.
+[docs/user-guide.md](docs/user-guide.md) covers installing, userlands,
+running programs, podman, Windows programs through Wine, and what does
+not work.
 
 ## Layout
 

@@ -9,8 +9,8 @@
 //! modes that deny the owner, is kept as fwe keeps it for the guest
 //! ([`fwe_kernel::owners`], [`fwe_kernel::modes`]), and every file is
 //! given the user's own group, so that the guest sees root's. As a
-//! container runtime does, it adds `/etc/resolv.conf` (the host's name
-//! servers) and `/etc/hosts` where the image has none. The result is a
+//! container runtime does, it writes `/etc/resolv.conf` with the host's
+//! name servers, and `/etc/hosts` where the image has none. The result is a
 //! directory `fwe --root DIR` runs programs in.
 //!
 //! On a case-insensitive volume (macOS's default) two names that differ
@@ -192,9 +192,12 @@ fn glob_escape(path: &str) -> String {
     out
 }
 
-/// What a container runtime gives a container at its start, where the
-/// image has none: `/etc/resolv.conf`, with the host's name servers (from
-/// `host_resolv`, the host's own file), and `/etc/hosts` for `localhost`.
+/// What a container runtime gives a container at its start:
+/// `/etc/resolv.conf` with the host's name servers (from `host_resolv`,
+/// the host's own file), in place of whatever the image has (a runtime
+/// never uses the image's: it names servers of wherever the image was
+/// built, or a link to a resolver that is not running), and `/etc/hosts`
+/// for `localhost` where the image has none.
 fn runtime_files(dir: &Path, host_resolv: &str) -> Result<(), String> {
     let etc = dir.join("etc");
     std::fs::create_dir_all(&etc).map_err(|e| format!("{}: {e}", etc.display()))?;
@@ -209,10 +212,15 @@ fn runtime_files(dir: &Path, host_resolv: &str) -> Result<(), String> {
     ];
     for (name, text) in files {
         let path = etc.join(name);
-        // Not where the image has one, even a link (Debian's may be one).
-        if std::fs::symlink_metadata(&path).is_err() {
-            std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let present = std::fs::symlink_metadata(&path).is_ok();
+        if name == "hosts" && present {
+            continue;
         }
+        if present {
+            // A link is replaced, not followed out of the root.
+            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -750,14 +758,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A root without the files a runtime gives a container gets them; an
-    /// image's own are kept.
+    /// The host's name servers replace an image's, even a link; an
+    /// image's `/etc/hosts` is kept.
     #[test]
-    fn runtime_files_are_added_where_missing() {
+    fn runtime_files_are_the_hosts() {
         let base = std::env::temp_dir().join(format!("fwe-pull-etc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("etc")).unwrap();
         std::fs::write(base.join("etc/hosts"), "mine\n").unwrap();
+        std::os::unix::fs::symlink("../run/resolver.conf", base.join("etc/resolv.conf")).unwrap();
         let host = "# a comment\nnameserver 10.0.0.1\nsearch example.org\nsortlist x\n";
         runtime_files(&base, host).unwrap();
         let read = |f: &str| std::fs::read_to_string(base.join(f)).unwrap();

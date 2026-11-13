@@ -97,6 +97,25 @@ fn tree_key(fd: i32) -> Option<u32> {
     }
 }
 
+/// The root mount of the detached tree `fd` is a descriptor of: its id,
+/// flags and filesystem type.
+pub(crate) fn detached_root(fd: i32) -> Option<(u32, u64, crate::mounts::FsType)> {
+    let k = tree_key(fd)?;
+    with(&TREES, |m| m.get(&k).and_then(|t| t.first()).map(|r| (r.id, r.flags, r.fstype)))
+}
+
+/// For a descriptor of a detached tree of one of fwe's synthetic
+/// filesystems (`proc`, `sysfs`), its type and the path inside it the tree
+/// shows: what a path relative to the descriptor reads.
+pub(crate) fn detached_synthetic(fd: i32) -> Option<(crate::mounts::FsType, Vec<u8>)> {
+    use crate::mounts::FsType;
+    let k = tree_key(fd)?;
+    with(&TREES, |m| {
+        let r = m.get(&k)?.first()?;
+        matches!(r.fstype, FsType::Proc | FsType::Sysfs).then(|| (r.fstype, r.root.clone()))
+    })
+}
+
 /// `fd` is closed: a context or tree it was the last descriptor of goes.
 pub fn closed(fd: i32) {
     if fdmarks::shared_elsewhere(fd) {
@@ -106,7 +125,17 @@ pub fn closed(fd: i32) {
         with(&CONTEXTS, |m| m.remove(&k));
     }
     if let Some(k) = tree_key(fd) {
-        with(&TREES, |m| m.remove(&k));
+        // Not while another descriptor of the tree is open: fwe's own of a
+        // program run through it (`/proc/self/exe`) is one.
+        let open = |o: i32| {
+            // SAFETY: F_GETFD only queries the descriptor.
+            unsafe { libc::fcntl(o, libc::F_GETFD) >= 0 }
+        };
+        let held =
+            fdmarks::marks().into_iter().any(|(o, m)| o != fd && m == Mark::Detached(k) && open(o));
+        if !held {
+            with(&TREES, |m| m.remove(&k));
+        }
     }
 }
 
@@ -730,6 +759,33 @@ impl<P: Platform> Kernel<P> {
         if tree_key(dfd as i32).is_some() && name.is_empty() && empty {
             return err(errno::EINVAL);
         }
+        // A standard device node fwe serves from the host (`/dev/null`,
+        // which crun clones to mask files): a tree of that one file, the
+        // mount a bind of it makes.
+        let device = if name.is_empty() && empty {
+            crate::fs::device_of_fd(dfd as i32)
+        } else if dfd as i64 == fcntl::AT_FDCWD || name.starts_with(b"/") {
+            self.fs().device_host(&name)
+        } else {
+            None
+        };
+        if let Some(host) = device {
+            let m = Mount {
+                id: 0,
+                parent: 0,
+                point: Vec::new(),
+                fstype: crate::mounts::FsType::Tmpfs,
+                source: crate::mounts::Source::Host(host),
+                root: b"/".to_vec(),
+                flags: 0,
+                propagation: ms::PRIVATE,
+                peer: 0,
+                master: 0,
+                device: b"devtmpfs".to_vec(),
+                options: Vec::new(),
+            };
+            return self.tree_descriptor(vec![m], cloexec);
+        }
         let ns = guest!(self.ns_path_at(dfd as i32, &name, empty, follow));
         let tree = guest!(self.fs().mount_ns().table().copy_tree(&ns, flags & AT_RECURSIVE != 0));
         self.tree_descriptor(tree, cloexec)
@@ -796,13 +852,18 @@ impl<P: Platform> Kernel<P> {
                 let Some(tree) = with(&TREES, |m| m.get(&k).cloned()) else {
                     return err(errno::EINVAL);
                 };
-                let r = ns.update(|t| t.attach_tree(&tree, &to, beneath).map(|_| ()));
-                if r.is_ok() {
-                    // Attached: the descriptor is an `O_PATH` one of it now.
+                let r = ns.update(|t| t.attach_tree(&tree, &to, beneath));
+                if let Ok(id) = r {
+                    // Attached: the descriptor is an `O_PATH` one of the
+                    // mount, where it now is (`mount_setattr` and the like
+                    // act on it through the descriptor, as crun does).
                     with(&TREES, |m| m.remove(&k));
-                    fdmarks::mark(from_dfd as i32, Mark::Path);
+                    let fd = from_dfd as i32;
+                    fdmarks::mark(fd, Mark::Path);
+                    let root = &tree[0];
+                    fdmarks::opened(fd, to.clone(), id, root.flags, root.fstype, None);
                 }
-                r
+                r.map(|_| ())
             }
             Err(from) if flags & MOVE_MOUNT_SET_GROUP != 0 => ns.update(|t| {
                 let (f, rest) = t.locate(&from);

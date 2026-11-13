@@ -276,10 +276,12 @@ impl Data for Store {
     }
 }
 
+/// The shared record, once this process has opened it.
+static STORE: std::sync::OnceLock<Option<Record<Store>>> = std::sync::OnceLock::new();
+
 /// The shared record.
 fn store() -> Option<&'static Record<Store>> {
-    static S: std::sync::OnceLock<Option<Record<Store>>> = std::sync::OnceLock::new();
-    S.get_or_init(|| Record::named("keys", 0, Store::default).ok()).as_ref()
+    STORE.get_or_init(|| Record::named("keys", 0, Store::default).ok()).as_ref()
 }
 
 /// The shared record, if any process has made it: so a fork or exec of a
@@ -1047,7 +1049,9 @@ pub fn exec() {
 
 /// Thread `tid` of this process ended: its thread keyring goes.
 pub fn thread_exit(tid: i32) {
-    let Some(st) = existing() else { return };
+    // A thread holds a keyring only once its process has used the keys,
+    // which opened the record: otherwise there is nothing to look at.
+    let Some(st) = STORE.get().and_then(Option::as_ref) else { return };
     let (pid, start) = me();
     let holds =
         |h: &Holder| h.pid == pid && h.start == start && h.threads.iter().any(|(t, _)| *t == tid);

@@ -494,6 +494,9 @@ impl Fs {
         if let Some(old) = self.proc.exe_fd
             && Some(old) != fd
         {
+            // What fwe keeps of it goes with it (a detached tree it held).
+            crate::mountapi::closed(old);
+            crate::fdmarks::closed(old);
             // SAFETY: closing fwe's own descriptor of the old program.
             unsafe { libc::close(old) };
         }
@@ -741,6 +744,15 @@ impl Fs {
             // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).
             return None;
         }
+        // Relative to a detached tree of `proc` or `sysfs` (crun reaches
+        // `/proc` through one it makes with `fsmount`): that filesystem's
+        // file, whatever is mounted where.
+        if path.first() != Some(&b'/')
+            && let Some((fstype, root)) = crate::mountapi::detached_synthetic(dirfd)
+        {
+            let base = if fstype == FsType::Proc { &b"/proc"[..] } else { &b"/sys"[..] };
+            return self.synthetic_entry(mounts::join(base, &normalize(&root, path)));
+        }
         let absolute = self.absolute(dirfd, path)?;
         let (m, fs_path) = self.mount_of(&absolute);
         if m.fstype != FsType::Nsfs
@@ -775,6 +787,13 @@ impl Fs {
             }
             _ => return None,
         };
+        self.synthetic_entry(absolute)
+    }
+
+    /// What fwe's `/proc` or `/sys` holds at `absolute` (a path starting
+    /// `/proc` or `/sys`, as that filesystem shows it), whatever is
+    /// mounted where.
+    fn synthetic_entry(&self, absolute: Vec<u8>) -> Option<crate::procfs::Entry> {
         // /proc/<pid>: the reader's own is /proc/self; another, what fwe
         // knows of it.
         let absolute = match own_or_other(&absolute) {
@@ -1281,6 +1300,12 @@ impl Fs {
         if dirfd as i64 == fcntl::AT_FDCWD {
             return Some(normalize(&self.cwd, path));
         }
+        // A detached tree of `proc` or `sysfs`: that filesystem's path, as
+        // fwe's own mount of it shows it.
+        if let Some((fstype, root)) = crate::mountapi::detached_synthetic(dirfd) {
+            let base = if fstype == FsType::Proc { &b"/proc"[..] } else { &b"/sys"[..] };
+            return Some(mounts::join(base, &normalize(&root, path)));
+        }
         let dir = self.fd_ns_path(dirfd).and_then(|ns| self.from_ns(&ns))?;
         Some(normalize(&dir, path))
     }
@@ -1506,6 +1531,13 @@ impl Fs {
     /// device nodes fwe serves in the rootfs's own `/dev` (see
     /// [`resolve_in`]): what a bind mount of it shows.
     pub fn device_host(&self, path: &[u8]) -> Option<Vec<u8>> {
+        // Through a descriptor of one (`/proc/self/fd/N`, `/dev/fd/N`), as
+        // crun binds `/dev/null` over the files it masks.
+        if let Some(crate::procfs::Entry::Fd { fd, .. }) =
+            self.synthetic(fcntl::AT_FDCWD as i32, path)
+        {
+            return device_of_fd(fd);
+        }
         let absolute = self.absolute_path(fcntl::AT_FDCWD as i32, path)?;
         let name = absolute.strip_prefix(b"/dev/")?;
         if !DEVICES.contains(&name) && crate::loopdev::node_named(name).is_none() {
@@ -2777,6 +2809,14 @@ fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
     }
     out.truncate(at);
     Ok(out)
+}
+
+/// The host file of the standard device node `fd` is open on, if it is
+/// one of them ([`DEVICES`]): what a bind mount or a clone of it shows.
+pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
+    let p = fd_path(fd)?;
+    let name = p.strip_prefix(b"/dev/")?;
+    DEVICES.contains(&name).then_some(p)
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever

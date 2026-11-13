@@ -68,10 +68,12 @@ Each document has one job; do not duplicate content across them.
 | Document | Holds |
 |---|---|
 | [README.md](README.md) | What the project is, a short status, how to run and test it |
+| [docs/user-guide.md](docs/user-guide.md) | For users: installing, a Linux userland, running programs and containers, what does not work; its tested recipes run in CI |
 | [PLAN.md](PLAN.md) | Goal, approach, scope, the 1.0 finish line, principles, how progress is measured |
 | [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 with "Done when" criteria, and what is not planned |
 | [docs/linux-on-macos.md](docs/linux-on-macos.md) | How Linux programs run on macOS: which binaries run where and what costs least, how languages and runtimes fare, which instructions are rewritten, how the VM is used; Linux to macOS (what Linux does, what macOS has, what fwe does) and macOS to Linux (what happens on the host, what the guest sees) |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
+| [docs/comparisons.md](docs/comparisons.md) | fwe beside other ways to run Linux programs (Wine, VMs, WSL, gVisor, translators, the Linuxulator, rebuilding) and what it takes from each |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
 

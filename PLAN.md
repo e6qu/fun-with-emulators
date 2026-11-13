@@ -7,8 +7,9 @@ kernel, in the spirit of Wine. fwe is written in Rust.
 
 ## Approach
 
-fwe implements the Linux userspace ABI on top of macOS. A Linux program runs
-directly on the CPU inside an `fwe` process; its system calls go to fwe's
+fwe implements the Linux userspace ABI on top of macOS. Like Wine, it is
+not an emulator: a Linux program's instructions run directly on the CPU
+inside an `fwe` process, and only its system calls go elsewhere, to fwe's
 kernel layer, which provides Linux's processes, threads, memory, files,
 signals, networking, namespaces and cgroups on macOS, with fwe's own
 `/proc`, `/sys` and `/dev`.
@@ -42,7 +43,7 @@ Out of scope:
 ## The finish line: 1.0
 
 1.0 is reached when all of these hold, as [ROADMAP.md](ROADMAP.md) defines
-them in M2, M4 and M5:
+them in M2, M4, M5 and M6:
 - the target programs (git, compilers, Node, Go, Rust, apt, a database, a
   web server) run unmodified, those in the VM on real hardware;
 - container engines (Docker, podman, containerd) build and run images,
@@ -52,15 +53,34 @@ them in M2, M4 and M5:
   listed with its reason;
 - `strace` and `gdb` work on a guest program;
 - Wine runs ARM64 Windows console programs;
-- a signed release installs and runs them, with user documentation.
+- a signed release installs and runs them, with user documentation;
+- Linux code runs at native speed and what fwe adds stays within the
+  benchmark budgets, and as much runs natively as the host allows:
+  executables linked below 4 GiB and programs that need 4 KiB pages,
+  Wine among them, without the VM where fwe can make them fit.
 
 The roadmap lists what 1.0 leaves out under "Not planned for 1.0".
+
+## After 1.0
+
+Virtual networking (M7), so that multi-process and multi-container Linux
+applications talk over their own networks: addresses per network
+namespace, bridges, container networks with names, ports published on the
+Mac. The design keeps the host's own TCP/IP stack carrying the traffic,
+and adds a server process only for what must outlive every process of a
+network.
 
 ## Principles
 
 - **Compatibility first:** success is unmodified Linux binaries working.
-- **Native performance:** in-process, with no virtual machine where one is
-  not needed.
+- **Native speed:** Linux code runs at or near native speed. Its
+  instructions run unmodified on the CPU, in-process, with no virtual
+  machine where one is not needed; no abstraction fwe adds may put a cost
+  in the program's own code, and what fwe adds at system calls, process
+  creation and start-up is held to budgets measured in CI against native
+  macOS. A design that would slow guest code (a packet-level network
+  stack, instrumenting every block) is chosen only where nothing cheaper
+  gives the behaviour.
 - **No blockers:** an implementation problem is something to solve.
 - **Measured progress:** real workloads and LTP define what "working"
   means.
@@ -71,6 +91,7 @@ The roadmap lists what 1.0 leaves out under "Not planned for 1.0".
   with their output checked.
 - **Conformance:** LTP's system-call tests run in CI against a baseline of
   those that pass (`tools/ltp`); a test that stops passing fails CI.
-- **Performance:** benchmarks against native macOS and a Linux VM (M5).
+- **Performance:** benchmarks against native macOS and Linux on arm64,
+  with budgets CI holds fwe to (M6).
 
 [AGENTS.md](AGENTS.md) describes how work is delivered.

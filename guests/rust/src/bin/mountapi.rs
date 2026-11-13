@@ -6,6 +6,16 @@
 //! under a shared one reaching a child's copy of the namespace; and the
 //! mount flags and a busy mount enforced. It prints what it observed.
 //!
+//! `mountapi procfd` reads `/proc` through a descriptor of a procfs
+//! instance, made with `fsmount` and cloned with `open_tree`.
+//!
+//! `mountapi selfclone` does what crun and runc do to run a copy of
+//! themselves no container can write: unless `/proc/self/exe` is on a
+//! read-only mount, it clones its own binary's mount (`open_tree`), makes
+//! the clone read-only (`mount_setattr`) and runs itself again through
+//! it (`execveat`), once; then it prints what `fstatfs` of its binary
+//! says.
+//!
 //! The C library calls go straight to the statically linked musl, declared
 //! here, so the guest needs no crates; the calls musl lacks are made with
 //! `syscall`.
@@ -91,7 +101,205 @@ fn options_of(point: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether this program's binary is on a read-only mount, as runc's
+/// `IsSelfExeCloned` asks.
+fn self_read_only() -> bool {
+    const ST_RDONLY: u64 = 1;
+    let mut st = [0u64; 15];
+    // SAFETY: a NUL-terminated path; a `struct statfs` sized buffer.
+    unsafe {
+        let fd = open(c"/proc/self/exe".as_ptr(), 0o2000000);
+        let r = syscall(44, fd, st.as_mut_ptr());
+        close(fd);
+        // f_flags is the last but four words of Linux's `struct statfs`.
+        r == 0 && st[10] & ST_RDONLY != 0
+    }
+}
+
+fn self_clone(again: bool) {
+    const OPEN_TREE_CLONE: u32 = 1;
+    const AT_RECURSIVE: u32 = 0x8000;
+    const O_CLOEXEC: u32 = 0o2000000;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const MOUNT_ATTR_RDONLY: u64 = 0x1;
+    if self_read_only() || again {
+        println!("cloned: read-only {}, re-ran {again}", self_read_only());
+        return;
+    }
+    // SAFETY: plain calls with NUL-terminated paths and live buffers.
+    unsafe {
+        let fd = syscall(
+            SYS_OPEN_TREE,
+            AT_FDCWD,
+            c"/proc/self/exe".as_ptr(),
+            OPEN_TREE_CLONE | AT_RECURSIVE | O_CLOEXEC,
+        ) as i32;
+        let attr = [MOUNT_ATTR_RDONLY, 0, 0, 0];
+        let r = syscall(SYS_MOUNT_SETATTR, fd, c"".as_ptr(), AT_EMPTY_PATH, attr.as_ptr(), 32usize);
+        let argv = [c"mountapi".as_ptr(), c"selfclone".as_ptr(), c"again".as_ptr(), std::ptr::null()];
+        let env: [*const c_char; 1] = [std::ptr::null()];
+        syscall(281, fd, c"".as_ptr(), argv.as_ptr(), env.as_ptr(), AT_EMPTY_PATH);
+        println!("clone failed: open_tree {fd}, mount_setattr {r}");
+    }
+}
+
+/// `/proc` reached through a descriptor of a procfs instance, as crun
+/// reaches it: one made with `fsopen`/`fsmount`, and a clone of `/proc`
+/// (`open_tree`); a file read relative to each.
+fn proc_fd() {
+    const OPEN_TREE_CLONE: u32 = 1;
+    let read_at = |dfd: i32| {
+        let mut buf = [0u8; 16];
+        // SAFETY: a NUL-terminated path; a live buffer of its length.
+        unsafe {
+            let fd = syscall(56, dfd, c"sys/kernel/cap_last_cap".as_ptr(), 0i64, 0i64) as i32;
+            if fd < 0 {
+                return format!("open failed ({})", *__errno_location());
+            }
+            let n = read(fd, buf.as_mut_ptr(), buf.len());
+            close(fd);
+            String::from_utf8_lossy(&buf[..n.max(0) as usize]).trim().to_string()
+        }
+    };
+    // SAFETY: plain calls with NUL-terminated strings.
+    unsafe {
+        let fs = syscall(SYS_FSOPEN, c"proc".as_ptr(), 0u32) as i32;
+        syscall(SYS_FSCONFIG, fs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
+        let mnt = syscall(SYS_FSMOUNT, fs, 0u32, 0u64) as i32;
+        println!("fsmount proc: cap_last_cap {}", read_at(mnt));
+        for f in [c"mounts", c"self/mountinfo", c"self/status", c"self/cgroup"] {
+            let fd = syscall(56, mnt, f.as_ptr(), 0i64, 0i64) as i32;
+            let mut buf = [0u8; 4096];
+            let n = if fd >= 0 { read(fd, buf.as_mut_ptr(), buf.len()) } else { -1 };
+            println!("{}: {}", f.to_str().unwrap(), if n > 0 { "read" } else { "missing" });
+            close(fd);
+        }
+        let tree = syscall(SYS_OPEN_TREE, AT_FDCWD, c"/proc".as_ptr(), OPEN_TREE_CLONE) as i32;
+        println!("open_tree /proc: cap_last_cap {}", read_at(tree));
+        // Attached in a mount namespace of its own, then remounted with
+        // flags through a descriptor of its mount point, as crun does.
+        unshare(CLONE_NEWNS);
+        mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), MS_REC | MS_PRIVATE, std::ptr::null());
+        let dir = format!("/tmp/fwe-procfd-{}", getpid());
+        mkdir(c(&dir).as_ptr(), 0o755);
+        let dir = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
+        // Attached through a descriptor of the directory, as crun does.
+        let at = open(c(&dir).as_ptr(), 0o40000 | 0o100000 | 0o2000000);
+        let moved = syscall(SYS_MOVE_MOUNT, mnt, c"".as_ptr(), at, c"".as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | 0x40);
+        close(at);
+        let target = open(c(&dir).as_ptr(), O_PATH | 0o2000000);
+        let through = format!("/proc/self/fd/{target}");
+        const MS_REMOUNT: u64 = 32;
+        const MS_BIND: u64 = 4096;
+        const MS_NOSUID: u64 = 2;
+        const MS_NODEV: u64 = 4;
+        const MS_NOEXEC: u64 = 8;
+        let flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+        let r = mount(std::ptr::null(), c(&through).as_ptr(), std::ptr::null(), flags, std::ptr::null());
+        let e = if r < 0 { *__errno_location() } else { 0 };
+        let r2 = mount(std::ptr::null(), c(&dir).as_ptr(), std::ptr::null(), flags, std::ptr::null());
+        let e2 = if r2 < 0 { *__errno_location() } else { 0 };
+        // Through the descriptor it was attached with: it names the mount.
+        let attr = [MOUNT_ATTR_NODEV, 0, 0, 0];
+        let r3 = syscall(SYS_MOUNT_SETATTR, mnt, c"".as_ptr(), 0x1000u32, attr.as_ptr(), 32usize);
+        println!("proc attached {moved}; remount through fd {r} ({e}), by path {r2} ({e2}); setattr through its descriptor {r3}");
+        // Its files opened relative to the directory it is in, as crun
+        // opens a container's (`openat`, and `openat2` kept in that root).
+        let parent = open(c(&dir).as_ptr().cast::<c_char>(), O_PATH | 0o2000000);
+        let up = open(c(&format!("{dir}/..")).as_ptr(), O_PATH | 0o2000000);
+        let name = dir.rsplit('/').next().unwrap();
+        let rel = c(&format!("{name}/keys"));
+        let a = syscall(56, up, rel.as_ptr(), O_PATH | 0o2000000, 0i64);
+        let how = [(O_PATH | 0o2000000) as u64, 0u64, 0x08 /* RESOLVE_IN_ROOT */];
+        let b = syscall(437, up, rel.as_ptr(), how.as_ptr(), 24usize);
+        let eb = if b < 0 { *__errno_location() } else { 0 };
+        println!("keys under it: openat {}, openat2 {} ({eb})", a >= 0, b >= 0);
+        close(parent);
+        // The same in an overlay's directory, as a container's root is.
+        let o = format!("{dir}-ovl");
+        for d in ["", "/lower", "/upper", "/work", "/merged"] {
+            mkdir(c(&format!("{o}{d}")).as_ptr(), 0o755);
+        }
+        mkdir(c(&format!("{o}/lower/proc")).as_ptr(), 0o755);
+        let opts = format!("lowerdir={o}/lower,upperdir={o}/upper,workdir={o}/work");
+        let merged = format!("{o}/merged");
+        let ov = mount(c"overlay".as_ptr(), c(&merged).as_ptr(), c"overlay".as_ptr(), 0, c(&opts).as_ptr().cast());
+        // Bound onto itself and made private, as crun prepares a root.
+        mount(c(&merged).as_ptr(), c(&merged).as_ptr(), std::ptr::null(), 0x5000, std::ptr::null());
+        mount(std::ptr::null(), c(&merged).as_ptr(), std::ptr::null(), MS_REC | MS_PRIVATE, std::ptr::null());
+        let root = open(c(&merged).as_ptr(), O_PATH | 0o40000 | 0o2000000);
+        let pfs = syscall(SYS_FSOPEN, c"proc".as_ptr(), 0u32) as i32;
+        syscall(SYS_FSCONFIG, pfs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
+        let pm = syscall(SYS_FSMOUNT, pfs, 0u32, 0u64) as i32;
+        let pdir = syscall(56, root, c"proc".as_ptr(), 0o40000i64 | 0o100000 | 0o2000000, 0i64) as i32;
+        let pmoved = syscall(SYS_MOVE_MOUNT, pm, c"".as_ptr(), pdir, c"".as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | 0x40);
+        let a = syscall(56, root, c"proc/keys".as_ptr(), O_PATH | 0o2000000, 0i64);
+        let b = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize);
+        let eb = if b < 0 { *__errno_location() } else { 0 };
+        println!("in an overlay: mounted {ov}, proc attached {pmoved}; keys: openat {}, openat2 {} ({eb})", a >= 0, b >= 0);
+        // Masked, as crun masks it: /dev/null bound over it, through
+        // descriptors of both, then opened again and read.
+        let null = open(c"/dev/null".as_ptr(), 0o2000000);
+        let tree = syscall(SYS_OPEN_TREE, null, c"".as_ptr(), 1u32 | 0x1000 | 0o2000000) as i32;
+        let et = if tree < 0 { *__errno_location() } else { 0 };
+        let keys = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize) as i32;
+        let bound = mount(
+            c(&format!("/proc/self/fd/{null}")).as_ptr(),
+            c(&format!("/proc/self/fd/{keys}")).as_ptr(),
+            std::ptr::null(),
+            4096,
+            std::ptr::null(),
+        );
+        let again = syscall(437, root, c"proc/keys".as_ptr(), how.as_ptr(), 24usize);
+        let ea = if again < 0 { *__errno_location() } else { 0 };
+        let opened = syscall(56, root, c"proc/keys".as_ptr(), 0i64, 0i64) as i32;
+        let mut buf = [0u8; 16];
+        let n = if opened >= 0 { read(opened, buf.as_mut_ptr(), buf.len()) } else { -1 };
+        println!("masked: open_tree of /dev/null {} ({et}), bound {bound}; again {} ({ea}), reads {n}", tree >= 0, again >= 0);
+        // sysfs the same way, read-only and recursive, as crun makes a
+        // container's /sys: a new instance, and a clone of the host's.
+        mkdir(c(&format!("{o}/lower/sys")).as_ptr(), 0o755);
+        let sdir = syscall(56, root, c"sys".as_ptr(), 0o40000i64 | 0o100000 | 0o2000000, 0i64) as i32;
+        let sfs = syscall(SYS_FSOPEN, c"sysfs".as_ptr(), 0u32) as i32;
+        syscall(SYS_FSCONFIG, sfs, FSCONFIG_CMD_CREATE, 0usize, 0usize, 0);
+        let sm = syscall(SYS_FSMOUNT, sfs, 0u32, 0u64) as i32;
+        let smoved = syscall(SYS_MOVE_MOUNT, sm, c"".as_ptr(), sdir, c"".as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | 0x40);
+        const MOUNT_ATTR_RDONLY: u64 = 1;
+        let attr = [MOUNT_ATTR_RDONLY | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC | 2, 0, 0, 0];
+        let sr = syscall(SYS_MOUNT_SETATTR, sm, c"".as_ptr(), 0x1000u32 | 0x8000, attr.as_ptr(), 32usize);
+        let es = if sr < 0 { *__errno_location() } else { 0 };
+        let st = syscall(SYS_OPEN_TREE, AT_FDCWD, c"/sys".as_ptr(), 1u32 | 0x8000 | 0o2000000) as i32;
+        let et2 = if st < 0 { *__errno_location() } else { 0 };
+        let sr2 = syscall(SYS_MOUNT_SETATTR, st, c"".as_ptr(), 0x1000u32 | 0x8000, attr.as_ptr(), 32usize);
+        let es2 = if sr2 < 0 { *__errno_location() } else { 0 };
+        println!("sysfs attached {smoved}, setattr {sr} ({es}); clone of /sys {} ({et2}), setattr {sr2} ({es2})", st >= 0);
+        // Into the root with `pivot_root(".", ".")`, as crun goes into a
+        // container's, then flags set again through the descriptor the
+        // sysfs was attached with: the same mount, at its new path.
+        let into = open(c(&merged).as_ptr(), 0o40000 | 0o2000000);
+        syscall(50, into); // fchdir
+        let pr = syscall(41, c".".as_ptr(), c".".as_ptr()); // pivot_root
+        let ep = if pr < 0 { *__errno_location() } else { 0 };
+        umount2(c".".as_ptr(), 2);
+        syscall(49, c"/".as_ptr()); // chdir
+        let attr = [MOUNT_ATTR_NOEXEC, 0, 0, 0];
+        let after = syscall(SYS_MOUNT_SETATTR, sm, c"".as_ptr(), 0x1000u32, attr.as_ptr(), 32usize);
+        let ea = if after < 0 { *__errno_location() } else { 0 };
+        println!("pivoted {pr} ({ep}); setattr through the sysfs's descriptor after {after} ({ea})");
+        umount2(c(&dir).as_ptr(), 2);
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("procfd") {
+        proc_fd();
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("selfclone") {
+        self_clone(args.get(2).map(String::as_str) == Some("again"));
+        return;
+    }
     // SAFETY: plain calls into the C library and the kernel throughout;
     // every buffer is a live local of the length passed.
     unsafe {

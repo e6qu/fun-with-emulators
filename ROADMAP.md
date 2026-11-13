@@ -14,7 +14,9 @@ in detail.
 | M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
 | M4 Compatibility | Done: all 1213 of LTP's system-call tests that apply pass (1551 run) |
-| M5 Release | In progress |
+| M5 Release | Done but for the first release (the owner's) |
+| M6 Native speed and coverage | Not started |
+| M7 Virtual networking | Planned after 1.0 |
 
 What runs unmodified, with its output checked in CI:
 - **Natively, in-process:** Debian's coreutils, bash, git, SQLite, lighttpd,
@@ -129,11 +131,101 @@ hardware.
   signs under the hardened runtime and notarizes with a Developer ID.
   Left: the Developer ID secrets (an owner's action, not code) and the
   first release, whose tag the formula names.
-- [ ] **User documentation:** installing, running programs and containers,
-  and what is not supported.
+- [x] **User documentation:** installing, running programs and containers,
+  and what is not supported ([docs/user-guide.md](docs/user-guide.md),
+  whose recipes CI runs as written).
 
 **Done when:** a user installs a release and runs a Debian or Alpine
 userland and podman with it, following the documentation.
+
+### M6 — Native speed and native coverage
+
+Linux code runs at native speed, and what fwe adds is held to budgets
+([PLAN.md](PLAN.md#principles)); programs that now need the VM run
+natively wherever fwe can make them fit the Mac.
+
+- [ ] **Benchmark budgets in CI:** the benchmark job fails when fwe exceeds
+  a budget against native macOS on the same runner. The budgets and the
+  figures on the last run before this plan:
+
+  | Benchmark | Budget | Last run |
+  |---|---|---|
+  | a system call (`getpid`, `getppid`, several threads at once) | 1.5× | 1.3×, 2.6×, 2.0× |
+  | thread create and join | 3× | 15.8× |
+  | `fork` + exit + wait | 3× | 4.7× |
+  | `fork` + `exec` + wait | 3× | 11.6× |
+  | start-up | 3× | 10× |
+  | building a C project (Lua) | 1.5× | 3.9× |
+
+  The work this calls for: start and end threads without per-thread files
+  or scans; the per-process files written at start; `fork`'s cost per
+  host region and per record; the memory calls on the kernel lock's
+  shared side; and prepared images kept (below).
+- [ ] **Prepared images kept:** the code fwe prepares in a program (its
+  system calls, thread-pointer accesses and `x18` uses rewritten, and
+  relocated where the next item needs it) is kept on disk by the file's
+  identity and reused, as Rosetta 2 keeps its translations, so a program
+  is prepared once rather than at every start, and a large one
+  (libLLVM, a JIT runtime) starts as fast as a small one.
+- [ ] **Executables linked below 4 GiB, natively:** static Go programs and
+  Debian's non-PIE executables (`python3`, GCC, clang) moved above 4 GiB.
+  arm64 code reaches its own code and data PC-relative (`adrp`, `adr`,
+  branches), so moving the whole image by a multiple of the page keeps
+  its code right; the absolute addresses are in its data (the GOT,
+  init and fini arrays, pointer tables, Go's module data). They are found
+  from relocations a binary keeps, and from the structures that hold them
+  (the GOT and arrays the dynamic section names, Go's `moduledata` and
+  `pclntab`), checked before the move; a binary whose pointers cannot all
+  be accounted for runs in the VM as now, and why is recorded.
+- [ ] **4 KiB pages natively:** `mmap`, `mprotect` and `munmap` at 4 KiB
+  granularity on the Mac's 16 KiB pages: file contents at 4 KiB offsets
+  copied in, each host page given the union of its parts' protections and
+  the stricter parts enforced by fwe (a write to a read-only part caught
+  and delivered as Linux would), and 4096 in `AT_PAGESZ` for a program
+  that needs it. A layout that cannot be kept so (an execute-only part
+  beside a writable one in one host page, say) sends the program to the
+  VM.
+- [ ] **Wine natively:** Windows' ARM64 code keeps the thread's TEB in
+  `x18`, which macOS clears, so code Wine maps executable is prepared as
+  a program's own is, with its `x18` uses rewritten; its images' 4 KiB
+  sections are mapped as above. Wine then runs without `fwe --vm`.
+
+**Done when:** the budgets hold in CI; static Go programs, Debian's
+low-linked toolchain and Wine's test program run natively, in CI; and
+what still needs the VM is listed with the reason.
+
+## After 1.0
+
+### M7 — Virtual networking
+
+Multi-process and multi-container Linux applications on networks of their
+own, as on a Linux host, with the host's TCP/IP stack carrying the
+traffic, so that it moves at native speed.
+
+- [ ] **Addresses per network namespace:** veth pairs and bridges as fwe's
+  records, with the interfaces, addresses and routes netlink shows and
+  sets; a socket bound or connected to a namespace's address is mapped to
+  a host endpoint (a loopback port or a Unix socket) through a table all
+  fwe processes share, with `connect`, `accept`, `getsockname` and
+  `getpeername` translated, so no packet passes through fwe.
+- [ ] **Container networks:** podman's netavark and Docker's bridge driver
+  set them up through those calls; containers reach each other by address
+  and by name (aardvark-dns, Docker's embedded resolver, which run as
+  Linux programs); published ports listen on the Mac; outgoing
+  connections leave as the Mac's, which is network address translation by
+  construction.
+- [ ] **A server process, only if needed:** for what must outlive every
+  process of a network (a published port whose creator has ended), a
+  per-user fwe process started on demand, as Wine's `wineserver` is.
+
+Packet-level features (iptables and nftables rules, raw and packet
+sockets, ICMP from containers, TUN) would need a TCP/IP stack inside fwe,
+as gVisor has, which every packet would pass through; they stay out
+unless one proves cheap enough for the principle above.
+
+**Done when:** Docker Compose with a bridge network (a web application, a
+database and a cache) and a podman pod run, their containers reaching
+each other by name, with a published port reachable from the Mac.
 
 ## Not planned for 1.0
 
@@ -143,7 +235,8 @@ programs that probe for them fall back.
 - **Networking beyond loopback and the host's sockets** (veth, bridges,
   firewalling, raw and packet sockets, SCTP, RDS, TUN, kernel TLS): a new
   network namespace has loopback only, and other protocols fail with
-  `EAFNOSUPPORT` or `ENOPROTOOPT`.
+  `EAFNOSUPPORT` or `ENOPROTOOPT`. Addresses per namespace, bridges and
+  container networks are planned after 1.0 (M7).
 - **`kcmp`:** macOS cannot tell whether two descriptors share an open file
   description.
 - **Chosen pids** (`clone3`'s `set_tid`, `/proc/sys/kernel/ns_last_pid`):
