@@ -825,13 +825,18 @@ impl<P: Platform> Kernel<P> {
                 let Some(tree) = with(&TREES, |m| m.get(&k).cloned()) else {
                     return err(errno::EINVAL);
                 };
-                let r = ns.update(|t| t.attach_tree(&tree, &to, beneath).map(|_| ()));
-                if r.is_ok() {
-                    // Attached: the descriptor is an `O_PATH` one of it now.
+                let r = ns.update(|t| t.attach_tree(&tree, &to, beneath));
+                if let Ok(id) = r {
+                    // Attached: the descriptor is an `O_PATH` one of the
+                    // mount, where it now is (`mount_setattr` and the like
+                    // act on it through the descriptor, as crun does).
                     with(&TREES, |m| m.remove(&k));
-                    fdmarks::mark(from_dfd as i32, Mark::Path);
+                    let fd = from_dfd as i32;
+                    fdmarks::mark(fd, Mark::Path);
+                    let root = &tree[0];
+                    fdmarks::opened(fd, to.clone(), id, root.flags, root.fstype, None);
                 }
-                r
+                r.map(|_| ())
             }
             Err(from) if flags & MOVE_MOUNT_SET_GROUP != 0 => ns.update(|t| {
                 let (f, rest) = t.locate(&from);

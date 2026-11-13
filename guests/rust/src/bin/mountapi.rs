@@ -196,7 +196,10 @@ fn proc_fd() {
         let e = if r < 0 { *__errno_location() } else { 0 };
         let r2 = mount(std::ptr::null(), c(&dir).as_ptr(), std::ptr::null(), flags, std::ptr::null());
         let e2 = if r2 < 0 { *__errno_location() } else { 0 };
-        println!("proc attached {moved}; remount through fd {r} ({e}), by path {r2} ({e2})");
+        // Through the descriptor it was attached with: it names the mount.
+        let attr = [MOUNT_ATTR_NODEV, 0, 0, 0];
+        let r3 = syscall(SYS_MOUNT_SETATTR, mnt, c"".as_ptr(), 0x1000u32, attr.as_ptr(), 32usize);
+        println!("proc attached {moved}; remount through fd {r} ({e}), by path {r2} ({e2}); setattr through its descriptor {r3}");
         umount2(c(&dir).as_ptr(), 2);
     }
 }
