@@ -4037,6 +4037,28 @@ mod tests {
         let _ = k.syscall(nr::MUNMAP, [at, len, 0, 0, 0, 0]);
     }
 
+    /// Large data mappings left to fwe lie side by side, one host region
+    /// (each a host fork copies); a large reservation, which a loader may
+    /// map code into, gets room for stubs on both sides.
+    #[test]
+    fn large_data_lies_side_by_side_and_reservations_get_room() {
+        let _mapping = mapping_lock();
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let (anon, rw, len) = (MAP_PRIVATE | MAP_ANONYMOUS, PROT_READ | PROT_WRITE, 64u64 << 20);
+        let a = k.syscall(nr::MMAP, [0, len, rw, anon | MAP_NORESERVE, u64::MAX, 0]) as u64;
+        let b = k.syscall(nr::MMAP, [0, len, rw, anon | MAP_NORESERVE, u64::MAX, 0]) as u64;
+        assert!(a as i64 > 0 && b as i64 > 0);
+        assert!(b == a + len || a == b + len, "apart: {a:#x}, {b:#x}");
+        let r = k.syscall(nr::MMAP, [0, len, PROT_NONE, anon | MAP_NORESERVE, u64::MAX, 0]) as u64;
+        assert!(r as i64 > 0);
+        let near = |x: u64| x.abs_diff(r) < len + (64 << 20);
+        assert!(!near(a) && !near(b), "no room: {r:#x} by {a:#x}, {b:#x}");
+        for p in [a, b, r] {
+            assert_eq!(k.syscall(nr::MUNMAP, [p, len, 0, 0, 0, 0]), 0);
+        }
+    }
+
     /// `mremap`: checked as Linux checks it; a range grows in place with
     /// its contents, or moves with them (`MREMAP_MAYMOVE`, or to a place
     /// asked for with `MREMAP_FIXED`), the grown part zero.

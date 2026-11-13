@@ -201,10 +201,13 @@ The pieces that do it:
   upwards with free space past the latest (in the gaps below, a library's
   code could find no stub region within reach); code mapped without a
   fixed address that still finds none is mapped again where there is
-  room. A large mapping left to fwe (64 MiB or more: a library's span,
-  reserved before its code is mapped over it at a fixed address) is placed
-  with room on both sides from the start, since code longer than a branch
-  reaches has sites that reach only room below it;
+  room. A large mapping left to fwe (64 MiB or more) that may hold code (a
+  file's, an inaccessible one, as a library's span is reserved before its
+  code is mapped over it at a fixed address, or an executable one) is
+  placed with room on both sides from the start, since code longer than a
+  branch reaches has sites that reach only room below it. Large data (a
+  heap, an arena) fills upwards with the rest: mappings side by side are
+  one host region, and a host fork's cost grows with the regions;
 - the kernel crate asks for preparation through
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
