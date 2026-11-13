@@ -339,8 +339,9 @@ pub const SYSCALL_STUB_ENTRY: u32 = 0xa9be_03fe;
 pub const LDR_X30_LIT: u32 = 0x5800_0000 | (5 << 5) | 30;
 /// `blr x30`
 pub const BLR_X30: u32 = 0xd63f_03c0;
-/// `ldr x30, [sp], #32`
-const POP32_X30: u32 = 0xf842_07fe;
+/// `ldr x30, [sp], #32`: a system-call stub's load of `x30` back, after
+/// the call, which faults where the call unmapped the stack.
+pub const POP32_X30: u32 = 0xf842_07fe;
 
 /// Stub for `svc #0`: `x30` and `x0` saved below `sp` (the gate saves the
 /// rest), the gate called through `x30` (its address a literal in the

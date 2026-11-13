@@ -915,6 +915,19 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             syscall_trap(ctx, true, true);
             return;
         }
+        // A call through the gate unmapped the stack the stub saved `x30`
+        // on (musl's thread exit unmaps its own before `exit`): the gate's
+        // block holds the guest's `x30` and `sp` as the call left them.
+        let after_call =
+            ss.pc.checked_sub(12).filter(|_| word(ss.pc) == Some(crate::rewrite::POP32_X30));
+        if let Some(site) = after_call.and_then(|s| crate::rewrite::syscall_stub_site(word, s))
+            && let Some(b) = crate::gate::block()
+        {
+            ss.lr = b.regs.x[30];
+            ss.sp = b.regs.sp;
+            ss.pc = site + 4;
+            return;
+        }
     }
     if !in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.

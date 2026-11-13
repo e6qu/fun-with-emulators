@@ -2536,7 +2536,8 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     )
     .unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--strace").arg("--root")
+    cmd.arg("--strace")
+        .arg("--root")
         .arg(&root)
         .arg(root.join("usr/bin/node"))
         .arg(&script)
@@ -2548,7 +2549,11 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     let err = String::from_utf8_lossy(&out.stderr);
     let lines: Vec<&str> = err.lines().collect();
-    eprintln!("--- node status {:?}, stderr tail:\n{}", out.status, lines[lines.len().saturating_sub(150)..].join("\n"));
+    eprintln!(
+        "--- node status {:?}, stderr tail:\n{}",
+        out.status,
+        lines[lines.len().saturating_sub(150)..].join("\n")
+    );
     // The digests are the host's (`shasum`, `md5`, Python's hashlib).
     assert_eq!(
         stdout(&out),
