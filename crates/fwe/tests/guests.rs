@@ -414,6 +414,24 @@ fn root_filesystem_confines_writes() {
     }
 }
 
+/// A program named by a host path inside the root that is a symbolic link
+/// to an absolute path (Alpine's `/bin/sh` to `/bin/busybox`): the link
+/// resolves in the root, not on the host.
+#[test]
+fn root_programs_behind_absolute_links_run() {
+    let root = std::env::temp_dir().join(format!("fwe-root-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::copy(asm_guest("hello"), root.join("bin/hello")).unwrap();
+    std::os::unix::fs::symlink("/bin/hello", root.join("bin/sh")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("bin/sh"));
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), "hello from linux\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Build one assembly guest object and link it with the given extra flags.
 fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
     let out = out_dir().join("asm");
@@ -3238,7 +3256,12 @@ fn x18_in_code_a_sparse_unwind_table_leaves_out_is_rewritten() {
 /// (guests/asm/x18spsig.S).
 #[test]
 fn asm_x18_sp_stub_survives_signals() {
-    assert_eq!(fwe(&asm_guest("x18spsig-pie"), &[]).status.code(), Some(0));
+    // Untraced: two trace lines a signal, every 50 us, can take a slow
+    // runner longer than the timer's interval, and the loop never ends.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg(asm_guest("x18spsig-pie"));
+    let out = run_vm_bounded(cmd);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the

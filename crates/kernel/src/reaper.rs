@@ -523,10 +523,12 @@ pub fn init_child(child: i32, ns: Vec<u8>) {
             None => {
                 // SAFETY: plain host call.
                 let Ok(kq) = crate::fdtable::reserve(unsafe { libc::kqueue() }) else { return };
-                let spawned = std::thread::Builder::new()
-                    .name("fwe-pidns".into())
-                    .spawn(move || watch::inits(kq))
-                    .is_ok();
+                let spawned = crate::host::with_signals_blocked(|| {
+                    std::thread::Builder::new()
+                        .name("fwe-pidns".into())
+                        .spawn(move || watch::inits(kq))
+                        .is_ok()
+                });
                 if !spawned {
                     // SAFETY: closing the kqueue just made.
                     unsafe { libc::close(kq) };
@@ -624,10 +626,12 @@ pub fn start_if_reaper() {
         // SAFETY: plain host call.
         let kq = unsafe { libc::kqueue() };
         let started = crate::fdtable::reserve(kq).ok().is_some_and(|kq| {
-            std::thread::Builder::new()
-                .name("fwe-reaper".into())
-                .spawn(move || watch::run(kq))
-                .is_ok()
+            crate::host::with_signals_blocked(|| {
+                std::thread::Builder::new()
+                    .name("fwe-reaper".into())
+                    .spawn(move || watch::run(kq))
+                    .is_ok()
+            })
         });
         if !started {
             RUNNING.store(false, SeqCst);
@@ -917,13 +921,9 @@ mod watch {
 
     /// The thread that waits for this process's children that are pid
     /// namespaces' inits to end ([`init_child`]).
+    /// Its signals are blocked from its start
+    /// ([`crate::host::with_signals_blocked`]).
     pub(super) fn inits(kq: i32) {
-        // SAFETY: plain host calls on a valid signal set.
-        unsafe {
-            let mut all: libc::sigset_t = std::mem::zeroed();
-            libc::sigfillset(&mut all);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-        }
         // SAFETY: a zeroed kevent is a valid out-parameter.
         let mut evs: [libc::kevent; 8] = unsafe { std::mem::zeroed() };
         loop {
@@ -960,13 +960,8 @@ mod watch {
     }
 
     pub(super) fn run(kq: i32) {
-        // Signals are for the guest's threads, never this one.
-        // SAFETY: plain host calls on a valid signal set.
-        unsafe {
-            let mut all: libc::sigset_t = std::mem::zeroed();
-            libc::sigfillset(&mut all);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-        }
+        // Signals are for the guest's threads, never this one: it starts
+        // with them all blocked ([`crate::host::with_signals_blocked`]).
         let me = me();
         let mut w = Watcher { kq, watched: HashSet::new(), stopped: Default::default() };
         // This process's forks, and the host's SIGCHLD (a child of its own

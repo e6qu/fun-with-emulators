@@ -777,7 +777,7 @@ fn start(
         ));
     }
 
-    let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options));
+    let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options, &fs));
     fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
     fs.set_auxv(image.auxv.clone());
     fs.publish();
@@ -1394,7 +1394,11 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         let mut attr: libc::pthread_attr_t = std::mem::zeroed();
         libc::pthread_attr_init(&mut attr);
         libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
-        let r = libc::pthread_create(&mut handle, &attr, thread_main, arg);
+        // Every signal blocked until the vCPU loop sets the guest's mask
+        // (see `host::with_signals_blocked`).
+        let r = fwe_kernel::host::with_signals_blocked(|| {
+            libc::pthread_create(&mut handle, &attr, thread_main, arg)
+        });
         libc::pthread_attr_destroy(&mut attr);
         r
     };
