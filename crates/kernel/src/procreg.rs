@@ -378,6 +378,7 @@ fn write(pid: i32, r: &ProcRecord) {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
     let bytes = frame(&encode(r));
+    crate::timing::mark("record: encoded");
     let Ok(f) = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -387,8 +388,12 @@ fn write(pid: i32, r: &ProcRecord) {
     else {
         return;
     };
+    crate::timing::mark("record: opened");
     // An older record's longer tail stays, past the frame.
     let _ = f.write_all_at(&bytes, 0);
+    crate::timing::mark("record: wrote");
+    drop(f);
+    crate::timing::mark("record: closed");
 }
 
 /// Hold host process `pid`'s record's lock while the result lives.
