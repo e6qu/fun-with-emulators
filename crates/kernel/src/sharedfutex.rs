@@ -68,10 +68,19 @@ const WAITING: u32 = 2;
 const WOKEN: u32 = 3;
 const MOVING: u32 = 4;
 
-/// The first slot's room: the counter tickets are drawn from.
+/// The first slot's room: the counter tickets are drawn from, and how far
+/// into the table a slot has ever been taken (a waiter takes the first
+/// free one), so a wake looks no further.
 #[repr(C)]
 struct Header {
     tickets: AtomicU32,
+    high: AtomicU32,
+}
+
+/// The slots that may be in use: those up to the highest ever taken.
+fn in_use(t: &[Slot]) -> &[Slot] {
+    let high = header().map_or(t.len(), |h| h.high.load(SeqCst) as usize);
+    &t[..high.min(t.len())]
 }
 
 /// Slots in the table (more threads than this waiting on shared futexes
@@ -185,7 +194,7 @@ fn free(s: &Slot, seen: u32) -> bool {
 pub fn process_started() {
     let Some(t) = table() else { return };
     let pid = me();
-    for s in t {
+    for s in in_use(t) {
         let cur = s.state.load(SeqCst);
         if st(cur) != FREE && s.owner.load(SeqCst) == pid {
             free(s, cur);
@@ -214,7 +223,10 @@ fn take_slot(t: &[Slot], key: [u64; 2], bits: u32) -> Option<(usize, u32)> {
             s.bits.store(bits, SeqCst);
             s.owner.store(pid, SeqCst);
             s.owner_start.store(start, SeqCst);
-            s.ticket.store(header()?.tickets.fetch_add(1, SeqCst), SeqCst);
+            let h = header()?;
+            s.ticket.store(h.tickets.fetch_add(1, SeqCst), SeqCst);
+            // Before it is seen waiting, so a wake's scan reaches it.
+            h.high.fetch_max(i as u32 + 1, SeqCst);
             let waiting = with_state(cur, WAITING);
             s.state.store(waiting, SeqCst);
             return Some((i, waiting));
@@ -406,7 +418,7 @@ fn claim(
         return 0;
     }
     let mut waiting: Vec<(u32, usize, u32)> = Vec::new();
-    for (i, s) in t.iter().enumerate() {
+    for (i, s) in in_use(t).iter().enumerate() {
         let state = s.state.load(SeqCst);
         if st(state) != WAITING
             || s.key[0].load(SeqCst) != key[0]

@@ -464,7 +464,9 @@ scheduling; fwe adds Linux's thread identity and futexes:
   (`crates/kernel/src/sharedfutex.rs`), keyed by Mach memory object and
   offset for shared memory and by process and address for private memory.
   A slot carries a generation, so a wake never claims one freed and
-  reused; a dead owner's slot is freed by the next process that looks.
+  reused; a dead owner's slot is freed by the next process that looks. A
+  waiter takes the first free slot, and the table's header keeps how far
+  slots have ever been taken, which is as far as a wake looks.
 - Waiters check every 20 ms for a signal they should take, and return
   `EINTR` for it.
 - Robust futex lists (`set_robust_list`): as a thread ends, and for
@@ -517,10 +519,11 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   with the tid and posted to that thread through a table of the threads'
   pending sets the handler reads without a lock.
 - **Threads of another process:** each tid's process is recorded beside
-  the shared tid counter (taken sixteen at a time), and a process with
-  more than its main thread publishes its tids (`threads-<pid>` in fwe's
-  private directory, a count and the tids written at once on a descriptor
-  it keeps), which `/proc/<pid>/task` lists.
+  the shared tid counter (taken sixteen at a time), and a process that
+  has had more than its main thread publishes its tids (`threads-<pid>`
+  in fwe's private directory, a count and the tids written at once on a
+  descriptor it keeps, the file kept while the process lives), which
+  `/proc/<pid>/task` lists.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.
