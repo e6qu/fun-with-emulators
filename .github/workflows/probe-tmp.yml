@@ -17,8 +17,15 @@ jobs:
           for c in main head rename; do
             (cd wt-$c && CARGO_TARGET_DIR=$PWD/../tgt cargo build -q -p fwe && cp ../tgt/debug/fwe ../fwe-$c)
           done
+      - uses: actions/cache@v4
+        with:
+          path: target/ltp/root
+          key: ltp-root-${{ hashFiles('tools/ltp/build.sh') }}
+      - run: test -d target/ltp/root/opt/ltp
+      - run: sudo sysctl -w kern.maxfiles=184320 kern.maxfilesperproc=92160
       - run: |
-          chmod +x tools/probe-tmp/f14b
-          for round in 1 2; do for c in main head rename; do
-            echo "== $c round $round: $(./fwe-$c tools/probe-tmp/f14b 3000)"
-          done; done
+          for c in head main rename; do
+            python3 tools/ltp/run.py --fwe $PWD/fwe-$c --root target/ltp/root --jobs 1 \
+              --only '^fork14$' --results r.txt > log.txt 2>&1 || true
+            echo "== $c: $(grep -E '^\[[0-9]+/' log.txt)"
+          done
