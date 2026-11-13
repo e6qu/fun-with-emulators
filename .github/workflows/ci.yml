@@ -84,6 +84,24 @@ jobs:
           /usr/bin/log show --last 60m --style compact --predicate \
             '(eventMessage CONTAINS[c] "unrecoverable" AND NOT eventMessage CONTAINS "CT signature") OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
             | tail -200 || true
+      - if: failure()
+        run: |
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/fwe*.ips 2>/dev/null | head -3); do
+            echo "=== $f"
+            python3 -c "
+          import json,sys
+          t=open(sys.argv[1]).read().split('\\n',1)[1]
+          r=json.loads(t)
+          print(r.get('exception'),r.get('termination',{}).get('indicator'))
+          imgs=r['usedImages']
+          ft=r['faultingThread']
+          th=r['threads'][ft]
+          print('state', {k:v for k,v in th.get('threadState',{}).items() if k in ('pc','lr','sp','far','esr','x')})
+          for fr in th['frames'][:25]:
+            im=imgs[fr['imageIndex']]
+            print(im.get('name'), fr.get('symbol'), hex(fr.get('imageOffset',0)))
+          " "$f" || head -c 3000 "$f"
+          done
       # The whole trace of a container engine's step that failed.
       - if: failure()
         uses: actions/upload-artifact@v4
