@@ -36,22 +36,19 @@ jobs:
           for i in 1 2 3 4 5; do FWE_T=1 target/release/fwe ./bench exit 2>&1 | awk '{printf "%s %.2f | ", $NF, $2-p; p=$2} END{print ""}'; done
           FWE_T=1 target/release/fwe ./bench forkexec 4 $PWD/bench 2>&1 | grep -E "f |exec|x |exit" | sed -E 's/\[t\] +//' | awk '{printf "%.2f %s %s\n", $1-p, $3, $4; p=$1}'
           FWE_T=1 target/release/fwe ./bench fork 4 2>&1 | grep -E "f |exit" | sed -E 's/\[t\] +//' | awk '{printf "%.2f %s %s\n", $1-p, $3, $4; p=$1}'
-          sudo fs_usage -w -e -f filesys fwe > fsu.txt 2>&1 &
+          sudo fs_usage -w -e -f filesys,diskio > fsu.txt 2>&1 &
           FSU=$!
-          sleep 3
-          for i in 1 2 3; do FWE_T=1 target/release/fwe ./bench exit 2>&1 | grep -E "c read|c written|entering|exit$"; done
-          sleep 2
+          sleep 4
+          for i in 1 2 3 4; do FWE_T=1 target/release/fwe ./bench exit 2>&1 | grep -E "c read|c written|entering|exit$"; sleep 0.3; done
+          sleep 1
           sudo kill -INT $FSU || true
           sleep 2
-          grep -v "^\s*$" fsu.txt | head -400
-          sudo fs_usage -w -e -f diskio,filesys,pathname fwe > fsu2.txt 2>&1 &
-          FSU=$!
-          sleep 3
-          FWE_T=1 target/release/fwe ./bench exit 2>&1 | grep -E "c read|c written|entering|exit$"
-          sleep 2
-          sudo kill -INT $FSU || true
-          sleep 2
-          grep -v "^\s*$" fsu2.txt | head -300
+          wc -l fsu.txt
+          grep -E " fwe\.[0-9]+" fsu.txt | sed -E 's/ {2,}/ /g' > fwe-fsu.txt
+          wc -l fwe-fsu.txt
+          awk '{print $(NF-1), $0}' fwe-fsu.txt | sort -rn | head -40 | cut -c1-220
+          echo ----
+          cat fwe-fsu.txt | cut -c1-200 | head -300
           for i in 1 2 3; do DYLD_INSERT_LIBRARIES=$PWD/interp.dylib FWE_T=1 target/release/fwe ./bench exit 2>&1 | grep -v mkdir | sed -n '/initmain/,$p'; echo; done
           for i in 1 2 3; do FWE_T=1 target/release/fwe --strace ./bench exit 2>&1 | grep -v "^\[t\].* ms  " | tail -22; done
           for i in 1 2 3; do target/release/fwe ./bench forkexec 50 $PWD/bench; target/release/fwe ./bench getpid 100000; target/release/fwe ./bench fork 100; done
