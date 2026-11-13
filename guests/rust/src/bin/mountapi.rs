@@ -176,6 +176,28 @@ fn proc_fd() {
         }
         let tree = syscall(SYS_OPEN_TREE, AT_FDCWD, c"/proc".as_ptr(), OPEN_TREE_CLONE) as i32;
         println!("open_tree /proc: cap_last_cap {}", read_at(tree));
+        // Attached in a mount namespace of its own, then remounted with
+        // flags through a descriptor of its mount point, as crun does.
+        unshare(CLONE_NEWNS);
+        mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), MS_REC | MS_PRIVATE, std::ptr::null());
+        let dir = format!("/tmp/fwe-procfd-{}", getpid());
+        mkdir(c(&dir).as_ptr(), 0o755);
+        let dir = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
+        let moved = syscall(SYS_MOVE_MOUNT, mnt, c"".as_ptr(), AT_FDCWD, c(&dir).as_ptr(), MOVE_MOUNT_F_EMPTY_PATH);
+        let target = open(c(&dir).as_ptr(), O_PATH | 0o2000000);
+        let through = format!("/proc/self/fd/{target}");
+        const MS_REMOUNT: u64 = 32;
+        const MS_BIND: u64 = 4096;
+        const MS_NOSUID: u64 = 2;
+        const MS_NODEV: u64 = 4;
+        const MS_NOEXEC: u64 = 8;
+        let flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+        let r = mount(std::ptr::null(), c(&through).as_ptr(), std::ptr::null(), flags, std::ptr::null());
+        let e = if r < 0 { *__errno_location() } else { 0 };
+        let r2 = mount(std::ptr::null(), c(&dir).as_ptr(), std::ptr::null(), flags, std::ptr::null());
+        let e2 = if r2 < 0 { *__errno_location() } else { 0 };
+        println!("proc attached {moved}; remount through fd {r} ({e}), by path {r2} ({e2})");
+        umount2(c(&dir).as_ptr(), 2);
     }
 }
 
