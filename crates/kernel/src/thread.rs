@@ -512,7 +512,7 @@ pub fn published_tids(pid: i32) -> Vec<i32> {
     let Some(count) = b.get(..4).map(|c| u32::from_ne_bytes(c.try_into().unwrap()) as usize) else {
         return Vec::new();
     };
-    b[4..].chunks_exact(4).take(count).map(|c| i32::from_ne_bytes(c.try_into().unwrap())).collect()
+    b[4..].as_chunks::<4>().0.iter().take(count).map(|c| i32::from_ne_bytes(*c)).collect()
 }
 
 fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {

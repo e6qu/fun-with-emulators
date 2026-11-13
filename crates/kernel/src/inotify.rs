@@ -760,7 +760,7 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
                 Err(e) => return Some(err(e)),
             };
             let mut total = 0i64;
-            for (i, c) in iov.chunks_exact(16).enumerate() {
+            for (i, c) in iov.as_chunks::<16>().0.iter().enumerate() {
                 let base = u64::from_ne_bytes(c[0..8].try_into().unwrap());
                 let len = u64::from_ne_bytes(c[8..16].try_into().unwrap());
                 if len == 0 {

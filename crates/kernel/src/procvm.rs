@@ -25,7 +25,9 @@ fn ranges(at: u64, count: u64) -> Result<Vec<(u64, u64)>, i32> {
     }
     let b = uaccess::read_bytes(at, count as usize * 16)?;
     let v: Vec<(u64, u64)> = b
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|c| {
             (
                 u64::from_ne_bytes(c[..8].try_into().unwrap()),

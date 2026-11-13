@@ -179,7 +179,7 @@ fn hex(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode [`hex`]'s output.
 fn unhex(text: &[u8]) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()

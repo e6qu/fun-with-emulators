@@ -138,7 +138,7 @@ fn note(out: &mut Vec<u8>, kind: u32, desc: &[u8]) {
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(b"CORE\0\0\0\0");
     out.extend_from_slice(desc);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }

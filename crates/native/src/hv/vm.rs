@@ -155,10 +155,10 @@ impl Flush {
     /// The vCPU ran the stub: every translation the tables lost up to this
     /// generation is gone from every TLB, and emptied tables can be reused.
     pub fn done(self) {
-        if FLUSHED.fetch_max(self.generation, SeqCst) < self.generation {
-            if let Some(t) = tables().as_mut() {
-                t.flushed(self.generation);
-            }
+        if FLUSHED.fetch_max(self.generation, SeqCst) < self.generation
+            && let Some(t) = tables().as_mut()
+        {
+            t.flushed(self.generation);
         }
         flushed_hook(self.generation);
     }

@@ -1819,14 +1819,16 @@ impl<P: Platform> Kernel<P> {
                         // Where the guest left the place to fwe, and the host
                         // put the code with no room for its stubs within
                         // reach: once more, where there is.
-                        if !fixed && !placed && !retried {
-                            if let Some(at) = Self::roomy_place(self.page_up(len)) {
-                                self.tracer.note(&format!("code moved for room: {}", e.why));
-                                haddr = at;
-                                hflags |= libc::MAP_FIXED;
-                                retried = true;
-                                continue 'map;
-                            }
+                        if !fixed
+                            && !placed
+                            && !retried
+                            && let Some(at) = Self::roomy_place(self.page_up(len))
+                        {
+                            self.tracer.note(&format!("code moved for room: {}", e.why));
+                            haddr = at;
+                            hflags |= libc::MAP_FIXED;
+                            retried = true;
+                            continue 'map;
                         }
                         return self.prepare_failed(e);
                     }

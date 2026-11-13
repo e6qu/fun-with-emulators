@@ -463,15 +463,15 @@ impl Mem {
         kept: Vec<(u64, u64)>,
     ) -> Result<(), i32> {
         let host = self.back(addr, len, kept)?;
-        if let Some(s) = &source {
-            if let Err(e) = fill(host, len, s) {
-                // Nothing maps it yet: given back after the next flush.
-                self.pending.push((vm::generation(), host, len));
-                if host != addr {
-                    uaccess::remove_translation(addr, len);
-                }
-                return Err(e);
+        if let Some(s) = &source
+            && let Err(e) = fill(host, len, s)
+        {
+            // Nothing maps it yet: given back after the next flush.
+            self.pending.push((vm::generation(), host, len));
+            if host != addr {
+                uaccess::remove_translation(addr, len);
             }
+            return Err(e);
         }
         // Filled memory was written over what may have been code (the
         // zeroing of what held data saw to its own pages: `window::zero`).
@@ -827,20 +827,18 @@ impl Mem {
             return err(errno::ENOMEM);
         }
         for p in self.vmas.pieces(addr, end) {
-            if let Back::Segment { id, off } = p.value.back {
-                if let Some(s) = self.segments.get(&id) {
-                    let h = s.host + off;
-                    let lo = h & !((16 << 10) - 1);
-                    let how = if flags & fwe_abi::statfs::MS_ASYNC != 0 {
-                        libc::MS_ASYNC
-                    } else {
-                        libc::MS_SYNC
-                    };
-                    // SAFETY: part of the segment's own host mapping.
-                    unsafe {
-                        libc::msync(lo as *mut _, (h + (p.end - p.start) - lo) as usize, how)
-                    };
-                }
+            if let Back::Segment { id, off } = p.value.back
+                && let Some(s) = self.segments.get(&id)
+            {
+                let h = s.host + off;
+                let lo = h & !((16 << 10) - 1);
+                let how = if flags & fwe_abi::statfs::MS_ASYNC != 0 {
+                    libc::MS_ASYNC
+                } else {
+                    libc::MS_SYNC
+                };
+                // SAFETY: part of the segment's own host mapping.
+                unsafe { libc::msync(lo as *mut _, (h + (p.end - p.start) - lo) as usize, how) };
             }
         }
         0
@@ -1224,10 +1222,10 @@ impl Mem {
             .map(|p| Piece { start: p.start, end: p.end, value: p.value.clone() })
             .collect();
         for p in &pieces {
-            if let Back::Segment { id, off } = p.value.back {
-                if let Some(s) = self.segments.get(&id) {
-                    uaccess::add_translation(p.start, p.end - p.start, s.host + off);
-                }
+            if let Back::Segment { id, off } = p.value.back
+                && let Some(s) = self.segments.get(&id)
+            {
+                uaccess::add_translation(p.start, p.end - p.start, s.host + off);
             }
             if lazy && matches!(p.value.back, Back::Slab { .. }) {
                 continue;

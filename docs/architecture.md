@@ -64,6 +64,17 @@ flowchart TD
 - The **hypervisor backend** runs the guest at EL0 in a
   Hypervisor.framework VM. fwe picks it automatically for a non-PIE
   executable linked below 4 GiB, which the native backend cannot map.
+- **Root filesystems:** `fwe --pull IMAGE DIR` (`crates/fwe/src/pull.rs`)
+  fetches a container image's linux/arm64 variant from its registry
+  (`curl`, an anonymous token where the registry asks for one), checks
+  each layer against its SHA-256 digest and unpacks the layers in order
+  with the host's `tar`, applying their whiteouts. What an unprivileged
+  unpacking loses is then kept as fwe keeps it for the guest: owners other
+  than root (`org.fwe.owner`), set-ID bits and modes that deny the owner
+  (`org.fwe.mode`), read from the layers' own headers
+  (`crates/fwe/src/tarlist.rs`); every file gets the user's group, which
+  the guest sees as root's. On a case-insensitive volume, a file whose
+  name differs from an earlier one's only in case is left out and listed.
 - **Hosts:** the kernel, ELF and ABI crates build on any Unix (`libc`
   supplies host values; on Linux most translations are the identity), and
   CI runs their unit tests on Linux too. The backends, and so `fwe`, run
@@ -1238,6 +1249,9 @@ which are to be lifted for 1.0 and which are not planned.
   is as much of the region as is resident, which can overstate it.
 
 **Files and descriptors**
+- A root on a case-insensitive volume (macOS's default) holds one file
+  for names that differ only in case; `fwe --pull` keeps the first and
+  lists the others.
 - What fwe keeps of an open file for `fcntl` (owner thread, `F_SETSIG`'s
   signal) is per descriptor, so a duplicate's changes do not show in the
   original.

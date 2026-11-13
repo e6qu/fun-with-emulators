@@ -2043,7 +2043,7 @@ impl<P: Platform> Kernel<P> {
         }
         let online = online_cpus();
         let size = online.len() as u64 * 8;
-        if len < size || len % 8 != 0 {
+        if len < size || !len.is_multiple_of(8) {
             return err(errno::EINVAL);
         }
         let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(online);

@@ -2350,10 +2350,10 @@ impl<P: Platform> Kernel<P> {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: `st` is a valid out-parameter.
             let size = if unsafe { libc::fstat(fd as i32, &mut st) } == 0 { st.st_size } else { 0 };
-            if end > size {
-                if let Err(e) = crate::memfd::check_resize(fd as i32, end) {
-                    return err(e);
-                }
+            if end > size
+                && let Err(e) = crate::memfd::check_resize(fd as i32, end)
+            {
+                return err(e);
             }
         }
         // What a tmpfs with a size has no room for (punching a hole frees).

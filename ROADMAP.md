@@ -123,7 +123,12 @@ hardware.
   side by side.
 - [ ] **Packaging:** a signed and notarized `fwe` with the hypervisor
   entitlement, a Homebrew formula, and a command that fetches and unpacks a
-  Debian or Alpine root filesystem.
+  Debian or Alpine root filesystem. In place: `fwe --pull` (CI pulls and
+  runs Alpine's and Debian's images), the formula (`Formula/fwe.rb`, which
+  CI installs and tests from source), and the release workflow, which
+  signs under the hardened runtime and notarizes with a Developer ID.
+  Left: the Developer ID secrets (an owner's action, not code) and the
+  first release, whose tag the formula names.
 - [ ] **User documentation:** installing, running programs and containers,
   and what is not supported.
 

@@ -1,5 +1,9 @@
 //! `fwe`: run a Linux arm64 executable on macOS.
 
+mod json;
+mod pull;
+mod tarlist;
+
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -7,8 +11,9 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage: fwe [options] <program> [args...]
+       fwe --pull IMAGE DIR
 
-Run a Linux arm64 executable.
+Run a Linux arm64 executable, or make a root filesystem to run them in.
 
 options:
   --strace     trace system calls to standard error
@@ -18,6 +23,10 @@ options:
                trace to PATH (appended to) instead, every process of the
                run, each line naming its process
   --root DIR   use DIR as the guest root filesystem
+  --pull IMAGE DIR
+               fetch a container image's linux/arm64 variant (alpine,
+               debian:trixie, ghcr.io/owner/name:tag...) and unpack it into
+               DIR, a new or empty directory, for --root
   --host-info  show host features that affect compatibility
   --probe NAME run one host-behaviour probe (diagnostic; used by CI)
   --hv-spike   check that the hypervisor backend can run here: a tiny guest
@@ -76,11 +85,11 @@ fn main() -> ExitCode {
         }
         fwe_native::hv::use_vm_always();
     }
-    if let Some(spec) = record {
-        if let Err(e) = fwe_native::hv::start_recording(&spec) {
-            eprintln!("fwe: --hv-record: {e}");
-            return ExitCode::from(2);
-        }
+    if let Some(spec) = record
+        && let Err(e) = fwe_native::hv::start_recording(&spec)
+    {
+        eprintln!("fwe: --hv-record: {e}");
+        return ExitCode::from(2);
     }
     if args.first().is_some_and(|a| a == "--hv-standin-watch") {
         // The stand-in's watcher of one VM process; not for direct use.
@@ -164,6 +173,20 @@ fn main() -> ExitCode {
                     Err(e) => {
                         eprintln!("fwe: {e}");
                         ExitCode::from(2)
+                    }
+                };
+            }
+            b"--pull" => {
+                args.next();
+                let (Some(image), Some(dir)) = (args.next(), args.next()) else {
+                    eprintln!("fwe: --pull needs an image and a directory\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                return match pull::pull(&image.to_string_lossy(), &PathBuf::from(dir)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("fwe: --pull: {e}");
+                        ExitCode::FAILURE
                     }
                 };
             }

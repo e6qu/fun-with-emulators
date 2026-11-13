@@ -1038,10 +1038,10 @@ impl Vcpu {
             // Whatever the exit, a signal that became deliverable meanwhile
             // (one a sigreturn just unblocked, or one the kernel queued
             // itself) is delivered now, not at the next system call.
-            if thread::deliverable() != 0 {
-                if let Some(k) = kernel().as_mut() {
-                    k.deliver_pending(&mut regs);
-                }
+            if thread::deliverable() != 0
+                && let Some(k) = kernel().as_mut()
+            {
+                k.deliver_pending(&mut regs);
             }
             self.set_regs(&regs);
         }

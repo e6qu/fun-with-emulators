@@ -46,20 +46,49 @@ built for ARM64 in the VM (`fwe --vm`, on the stand-in). All 1213 of LTP's syste
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
-## Usage
+## Installing
+
+With Homebrew, from this repository as a tap (built from source, and
+signed for your Mac with the entitlements in `hypervisor.entitlements`):
 
 ```sh
-cargo build --release
-target/release/fwe ./hello                 # run a Linux arm64 executable
-target/release/fwe --root ./rootfs ./hello # with ./rootfs as /
-target/release/fwe --strace ./hello        # trace its system calls
-target/release/fwe --strace --strace-file=trace.log ./hello  # every process, to a file
-target/release/fwe --vm ./hello            # in the VM, with 4 KiB pages
+brew tap e6qu/fwe https://github.com/e6qu/fun-with-emulators
+brew install fwe          # the latest release; --HEAD for main
+```
+
+Or from a release's archive (signed and notarized), or from source with
+`cargo build --release`, then signing as [docs/hypervisor.md](docs/hypervisor.md)
+shows for the VM backend.
+
+## Usage
+
+A Linux userland comes from a container image: `fwe --pull` fetches its
+linux/arm64 variant from the registry (Docker Hub unless named otherwise)
+and unpacks it into a directory, which `--root` then makes the guest's `/`:
+
+```sh
+fwe --pull debian:trixie ~/debian
+fwe --root ~/debian ~/debian/bin/bash      # a shell in it
+fwe --pull alpine:3.24 ~/alpine
+fwe --root ~/alpine ~/alpine/bin/sh -c 'apk add git && git --version'
+```
+
+On a case-insensitive volume (macOS's default) a file whose name differs
+from another's only in case cannot be kept; `--pull` leaves such files out
+and lists them (Debian has one, a manual page). A case-sensitive APFS
+volume keeps them all.
+
+```sh
+fwe ./hello                 # run a Linux arm64 executable
+fwe --root ./rootfs ./hello # with ./rootfs as /
+fwe --strace ./hello        # trace its system calls
+fwe --strace --strace-file=trace.log ./hello  # every process, to a file
+fwe --vm ./hello            # in the VM, with 4 KiB pages
 ```
 
 A dynamically linked program needs its dynamic linker and libraries under
-the root, at the paths the program names. For Debian binaries, that means a
-Debian rootfs.
+the root, at the paths the program names: run it in a root of the
+distribution it was built for.
 
 Windows programs built for ARM64 run through Wine, here Alpine's
 (`apk add wine` in an aarch64 Alpine root), in the VM:

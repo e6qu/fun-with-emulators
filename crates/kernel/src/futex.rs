@@ -53,7 +53,7 @@ pub(crate) fn load(uaddr: u64) -> crate::uaccess::Result<u32> {
 /// # Safety
 /// `uaddr` (and `timeout`, when non-null) must point to valid guest memory.
 pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
-    if uaddr % 4 != 0 {
+    if !uaddr.is_multiple_of(4) {
         return err(errno::EINVAL);
     }
     // SAFETY: the caller's guarantee, passed on; no second address.
@@ -68,7 +68,7 @@ pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
 /// # Safety
 /// As for [`op`].
 pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
-    if uaddr % 4 != 0 {
+    if !uaddr.is_multiple_of(4) {
         return err(errno::EINVAL);
     }
     let private = op & futex::FUTEX_PRIVATE_FLAG != 0;
@@ -114,7 +114,7 @@ pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, 
         futex::FUTEX_WAKE_BITSET if private => wake_private_bits(uaddr, val, val3),
         futex::FUTEX_WAKE_BITSET => shared::wake(uaddr, val, val3),
         futex::FUTEX_REQUEUE | futex::FUTEX_CMP_REQUEUE => {
-            if uaddr2 % 4 != 0 || (val as i32) < 0 || (timeout as i32) < 0 {
+            if !uaddr2.is_multiple_of(4) || (val as i32) < 0 || (timeout as i32) < 0 {
                 return err(errno::EINVAL);
             }
             let expect = (op & futex::FUTEX_CMD_MASK == futex::FUTEX_CMP_REQUEUE).then_some(val3);
@@ -191,7 +191,7 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
     };
     let raw = crate::guest!(crate::uaccess::read_bytes(waiters, nr as usize * 24));
     let mut list: Vec<(u64, u32, bool)> = Vec::new();
-    for w in raw.chunks_exact(24) {
+    for w in raw.as_chunks::<24>().0.iter() {
         let val = u64::from_ne_bytes(w[0..8].try_into().unwrap());
         let uaddr = u64::from_ne_bytes(w[8..16].try_into().unwrap());
         let f = u32::from_ne_bytes(w[16..20].try_into().unwrap());

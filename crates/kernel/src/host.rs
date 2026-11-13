@@ -446,11 +446,12 @@ pub fn empty_sigset() -> libc::sigset_t {
 pub fn host_sigset(mask: u64) -> libc::sigset_t {
     let mut set = empty_sigset();
     for sig in 1..=signal::NSIG {
-        if mask & (1 << (sig - 1)) != 0 && crate::signal::relayed(sig) {
-            if let Some(h) = signal_to_host(sig) {
-                // SAFETY: `set` is an initialized signal set.
-                unsafe { libc::sigaddset(&mut set, h) };
-            }
+        if mask & (1 << (sig - 1)) != 0
+            && crate::signal::relayed(sig)
+            && let Some(h) = signal_to_host(sig)
+        {
+            // SAFETY: `set` is an initialized signal set.
+            unsafe { libc::sigaddset(&mut set, h) };
         }
     }
     set
@@ -1073,7 +1074,9 @@ pub fn cpu_times() -> Vec<[u64; 4]> {
         // SAFETY: `info` holds `words` integers, four per CPU.
         let ticks = unsafe { std::slice::from_raw_parts(info, words as usize) };
         let out = ticks
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(cpus as usize)
             .map(|t| {
                 let v = |i: usize| u64::from(t[i] as u32);

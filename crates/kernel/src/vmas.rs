@@ -77,10 +77,10 @@ impl<V: Mapping> Vmas<V> {
     pub fn pieces(&self, start: u64, end: u64) -> Vec<Piece<V>> {
         let mut out = Vec::new();
         // The mapping that may begin before `start`.
-        if let Some((&s, (e, v))) = self.map.range(..start).next_back() {
-            if *e > start {
-                out.push(Piece { start, end: (*e).min(end), value: v.at(start - s) });
-            }
+        if let Some((&s, (e, v))) = self.map.range(..start).next_back()
+            && *e > start
+        {
+            out.push(Piece { start, end: (*e).min(end), value: v.at(start - s) });
         }
         for (&s, (e, v)) in self.map.range(start..end) {
             out.push(Piece { start: s, end: (*e).min(end), value: v.clone() });

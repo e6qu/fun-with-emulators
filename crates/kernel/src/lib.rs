@@ -1593,7 +1593,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             n::READV | n::PREADV | n::PREADV2 => {
                 for v in uaccess::read_bytes(a[1], (a[2].min(uaccess::UIO_MAXIOV) * 16) as usize)
                     .unwrap_or_default()
-                    .chunks_exact(16)
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
                 {
                     let base = u64::from_ne_bytes(v[0..8].try_into().unwrap());
                     let len = u64::from_ne_bytes(v[8..16].try_into().unwrap());

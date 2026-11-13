@@ -1452,6 +1452,78 @@ fn debugger_tests() -> bool {
     fetched_program_tests("FWE_DEBUGGER_TESTS")
 }
 
+/// `fwe --pull IMAGE DIR` into a fresh directory, then `script` run by the
+/// root's shell `sh` (a path in the root): its output.
+fn pulled_and_run(image: &str, sh: &str, script: &str) -> Output {
+    let root = std::env::temp_dir().join(format!(
+        "fwe-pulled-{}-{}",
+        std::process::id(),
+        image.replace([':', '/'], "-")
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pull = run_bounded_for(
+        {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_fwe"));
+            c.arg("--pull").arg(image).arg(&root);
+            c
+        },
+        &[],
+        Duration::from_secs(300),
+    );
+    eprintln!("--- pull {image}:\n{}", String::from_utf8_lossy(&pull.stderr));
+    assert_eq!(pull.status.code(), Some(0), "pull {image}");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg("--cwd").arg("/");
+    cmd.arg(root.join(sh.trim_start_matches('/'))).args(["-c", script]);
+    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("HOME", "/root");
+    cmd.env("TERM", "dumb");
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(180));
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("--- {image} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    out
+}
+
+/// Alpine's and Debian's images, pulled from Docker Hub (`fwe --pull`) and
+/// run with `--root`: their shells and package tools (`apk add` fetching
+/// and installing a package), the owners and
+/// set-ID modes an unprivileged unpacking loses kept, and `su` (set-ID)
+/// running a command as another user. Only where `FWE_PULL_TESTS` is set
+/// (CI): the images' programs are downloaded.
+#[test]
+fn pulled_images_run() {
+    if !fetched_program_tests("FWE_PULL_TESTS") {
+        return;
+    }
+    let out = pulled_and_run(
+        "alpine:3.24",
+        "/bin/sh",
+        "cat /etc/alpine-release; apk --version; stat -c '%a %U:%G' /etc/shadow; id -un; \
+         apk add -q --no-progress tree && tree --version | cut -d' ' -f1",
+    );
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() == 5 && lines[0].starts_with("3.24."), "{text}");
+    assert!(lines[1].starts_with("apk-tools "), "{text}");
+    assert_eq!(lines[2..], ["640 root:shadow", "root", "tree"], "{text}");
+    assert_eq!(out.status.code(), Some(0));
+
+    let out = pulled_and_run(
+        "debian:trixie",
+        "/bin/bash",
+        "cat /etc/debian_version; dpkg-query -W -f '${Status}\\n' base-files; \
+         stat -c '%a %U:%G' /usr/bin/su /etc/shadow; su -s /bin/sh nobody -c 'id -un'",
+    );
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() == 5 && lines[0].starts_with("13."), "{text}");
+    assert_eq!(
+        lines[1..],
+        ["install ok installed", "4755 root:root", "640 root:shadow", "nobody"],
+        "{text}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Run `args` (a program of the root, then its arguments) in a copy of the
 /// `ptrace` manifest's Alpine root, with `/prog` the given program, if
 /// any: its output, and the root's file `keep` (if any) as it was left.

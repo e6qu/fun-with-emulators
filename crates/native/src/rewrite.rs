@@ -165,7 +165,7 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
         }
     };
     let data = literal_pool_words(code, &is_code);
-    for (i, word) in code.chunks_exact_mut(4).enumerate() {
+    for (i, word) in code.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         // Words that belong to a literal pool are data, not instructions, and a
         // constant can encode anything — never rewrite them.
         if data[i] {
@@ -211,7 +211,7 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
 fn literal_pool_words(code: &[u8], is_code: &[bool]) -> Vec<bool> {
     let n = code.len() / 4;
     let mut data = vec![false; n];
-    for (i, w) in code.chunks_exact(4).enumerate() {
+    for (i, w) in code.as_chunks::<4>().0.iter().enumerate() {
         // Only a load that is code names a literal: a data word that happens
         // to decode as one could otherwise hide a real instruction.
         if !is_code[i] {
@@ -234,7 +234,9 @@ fn literal_pool_words(code: &[u8], is_code: &[bool]) -> Vec<bool> {
 
 /// Number of instructions in `code` that [`patch`] would redirect to stubs.
 pub fn count_sites(code: &[u8]) -> usize {
-    code.chunks_exact(4)
+    code.as_chunks::<4>()
+        .0
+        .iter()
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .filter(|&i| {
             i == SVC0
@@ -259,7 +261,10 @@ pub fn branch(from: u64, to: u64) -> Option<u32> {
 /// `x18` in the host TSD.
 pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec<u32> {
     let imm = |slot: u32| {
-        assert!(slot % 8 == 0 && slot / 8 < 4096, "slot offset must fit an ldr/str immediate");
+        assert!(
+            slot.is_multiple_of(8) && slot / 8 < 4096,
+            "slot offset must fit an ldr/str immediate"
+        );
         (slot / 8) << 10
     };
     let mut words = match site {
@@ -349,7 +354,7 @@ pub const POP32_X30: u32 = 0xf842_07fe;
 /// only when the call changed nothing but `x0`; any other outcome it
 /// installs itself. `stub` is 8-byte aligned.
 fn syscall_stub(gate: u64, stub: u64, ret: u64) -> Vec<u32> {
-    debug_assert!(stub % 8 == 0, "a system-call stub's literal must be aligned");
+    debug_assert!(stub.is_multiple_of(8), "a system-call stub's literal must be aligned");
     vec![
         SYSCALL_STUB_ENTRY,
         LDR_X30_LIT,
