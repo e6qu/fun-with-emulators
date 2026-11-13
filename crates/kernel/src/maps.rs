@@ -675,6 +675,9 @@ pub fn flush() {
 
 /// Publish this process's mappings for other processes to read now.
 pub fn publish_now() {
+    if std::env::var_os("FWE_NO_MAPS").is_some() {
+        return;
+    }
     let body = snapshot();
     let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: getpid cannot fail.

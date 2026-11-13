@@ -26,6 +26,8 @@ jobs:
           for i in 1 2 3; do sleep 1; FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|kernel'; done
           echo "== back to back"
           for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|kernel'; done
+          for v in FWE_NO_MAPS FWE_NO_TEXTBUSY; do echo "== without $v"; for i in 1 2 3; do env $v=1 FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed'; done; done
+          echo "== without both"; for i in 1 2 3; do FWE_NO_MAPS=1 FWE_NO_TEXTBUSY=1 FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed'; done
           echo "== after a probe process"
           for i in 1 2 3; do $F --probe first-close-empty >/dev/null; FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|kernel'; done
           FWE_TIMING=1 $F ./bench-linux forkexec 3 ./bench-linux
