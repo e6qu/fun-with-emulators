@@ -256,11 +256,13 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     let p = path(pid)?;
     // A record is rewritten in place ([`write`]): one read while it is
     // being written fails its check, and is made again.
-    for _ in 0..1000 {
+    for i in 0..1000 {
         let bytes = std::fs::read(OsStr::from_bytes(&p)).ok()?;
         if let Some(body) = unframe(&bytes) {
+            if i > 0 { crate::tmark(&format!("read_any {pid} retried {i}")); }
             return decode(body);
         }
+        if i == 0 { crate::tmark(&format!("read_any {pid} bad frame len {}", bytes.len())); }
         std::thread::yield_now();
     }
     None
@@ -286,7 +288,7 @@ fn unframe(bytes: &[u8]) -> Option<&[u8]> {
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes
         .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x1_0000_0001_b3))
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
 fn decode(bytes: &[u8]) -> Option<ProcRecord> {
@@ -376,6 +378,7 @@ fn lock(pid: i32) -> Option<std::fs::File> {
         .write(true)
         .open(OsStr::from_bytes(&p))
         .ok()?;
+    crate::tmark("   l opened");
     use std::os::fd::AsRawFd;
     // SAFETY: plain host call on the file just opened; the lock goes with it.
     crate::shared::lock_exclusive(f.as_raw_fd());
@@ -649,12 +652,17 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 /// Change the record of host process `pid` with `f` (making one if it has
 /// none).
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
+    crate::tmark("   c0");
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    crate::tmark("   c start");
     // Under the record's lock: a parent and its child may change one.
     let _lock = lock(pid);
+    crate::tmark("   c locked");
     let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
+    crate::tmark("   c read");
     f(&mut r);
     write(pid, &r);
+    crate::tmark("   c written");
     Ok(())
 }
 
@@ -1418,5 +1426,46 @@ fn forget_children(parent: i32) {
         {
             remove(pid);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_record_caught_mid_write_is_not_taken_for_whole() {
+        let r = fresh(me(), 1);
+        let body = encode(&r);
+        let whole = frame(&body);
+        assert_eq!(decode(unframe(&whole).unwrap()), Some(r));
+        // The longer tail of the record written before, not yet cut off.
+        let mut longer = whole.clone();
+        longer.extend_from_slice(&[7; 40]);
+        assert_eq!(unframe(&longer), Some(&body[..]));
+        // Cut short, empty, or a byte of another write.
+        assert_eq!(unframe(&whole[..whole.len() - 1]), None);
+        assert_eq!(unframe(&[]), None);
+        let mut mixed = whole.clone();
+        let last = mixed.len() - 1;
+        mixed[last] ^= 1;
+        assert_eq!(unframe(&mixed), None);
+    }
+
+    #[test]
+    fn a_batch_writes_once_and_its_changes_are_read_meanwhile() {
+        let exe = format!("/batch-test-{}", std::process::id()).into_bytes();
+        batch(|| {
+            own_program(&exe, b"batch\0");
+            own_auxv(&[1, 2, 3]);
+            // Held back, but this process reads them.
+            let held = read(me()).unwrap();
+            assert_eq!((held.exe.as_slice(), held.auxv.as_slice()), (&exe[..], &[1, 2, 3][..]));
+            assert!(read_any(me()).is_none_or(|r| r.exe != exe), "written before the batch ends");
+        });
+        let r = read_any(me()).unwrap();
+        // Its name is the program's, cut to 15 bytes as Linux's is.
+        assert_eq!((r.exe, r.auxv, r.comm), (exe.clone(), vec![1, 2, 3], exe[1..16].to_vec()));
+        remove(me());
     }
 }
