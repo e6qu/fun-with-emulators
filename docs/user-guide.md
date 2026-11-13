@@ -174,7 +174,7 @@ cgroup_manager = "cgroupfs"
 events_logger = "file"
 EOF
 linux ~/alpine /usr/bin/podman run --rm --network=none docker.io/library/alpine:3.24 \
-  sh -c 'echo hello from a container; cat /etc/alpine-release | cut -d. -f1-2' 2>/dev/null
+  sh -c 'echo hello from a container; cat /etc/alpine-release | cut -d. -f1-2'
 ```
 
 ```text
