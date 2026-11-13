@@ -589,6 +589,49 @@ fn main() {
                 LAST_TID.load(Ordering::SeqCst) == worker
             );
         }
+        // A thread making system calls back to back takes each signal sent
+        // to it as the call it lands in ends: one that lands as a call
+        // returns is not left pending until the next. After each call that
+        // a signal was sent before or during, the thread spins without
+        // system calls until the signal is handled, or long enough to say
+        // it was left pending.
+        "busy-calls" => {
+            static SENT: AtomicUsize = AtomicUsize::new(0);
+            static STOP: AtomicBool = AtomicBool::new(false);
+            static STUCK: AtomicUsize = AtomicUsize::new(0);
+            catch(SIGUSR1, SA_RESTART);
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                tid_tx.send(gettid()).unwrap();
+                while !STOP.load(Ordering::SeqCst) {
+                    // SAFETY: plain call.
+                    unsafe { getppid() };
+                    // Every signal sent so far is taken, or on its way.
+                    let mut spins = 0u64;
+                    while HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst)
+                        && spins < 200_000_000
+                    {
+                        spins += 1;
+                        std::hint::spin_loop();
+                    }
+                    if HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst) {
+                        STUCK.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+            let tid = tid_rx.recv().unwrap();
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(1) {
+                SENT.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(tgkill(tid, SIGUSR1), 0);
+                while HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            STOP.store(true, Ordering::SeqCst);
+            worker.join().unwrap();
+            println!("left pending: {}", STUCK.load(Ordering::SeqCst));
+        }
         // tgkill interrupts one thread's blocking call: a relayed signal and
         // a real-time one (which the host does not have).
         "tgkill" => {
@@ -731,6 +774,55 @@ fn main() {
             let exe = std::env::current_exe().unwrap();
             let status = std::process::Command::new(exe).arg("spawned").status().unwrap();
             println!("child {status}");
+        }
+        // A handler runs and returns in a program that replaced another in
+        // the same process, as a shell's command substitution does after
+        // its `exec`: the way back from the handler (fwe's `rt_sigreturn`
+        // trampoline) outlives the first program's memory.
+        "exec-then-handler" => {
+            unsafe extern "C" {
+                fn execve(p: *const u8, a: *const *const u8, e: *const *const u8) -> i32;
+            }
+            catch(SIGUSR1, 0);
+            // SAFETY: plain call.
+            unsafe { raise(SIGUSR1) };
+            let exe = std::env::current_exe().unwrap();
+            let mut path = exe.into_os_string().into_encoded_bytes();
+            path.push(0);
+            let argv = [path.as_ptr(), b"handler-after-exec\0".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: valid NUL-terminated arrays.
+            unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            println!("execve failed: {}", errno());
+        }
+        "handler-after-exec" => {
+            // Installed with no restorer of its own, as glibc installs
+            // handlers on arm64: the handler returns through the kernel's
+            // way back (fwe's trampoline), not the C library's.
+            #[repr(C)]
+            struct KernelSigaction {
+                handler: usize,
+                flags: u64,
+                restorer: usize,
+                mask: u64,
+            }
+            let act = KernelSigaction {
+                handler: record as *const () as usize,
+                flags: SA_SIGINFO as u64,
+                restorer: 0,
+                mask: 0,
+            };
+            const SYS_RT_SIGACTION: i64 = 134;
+            // SAFETY: a valid kernel sigaction, no old one asked for.
+            let r = unsafe {
+                syscall(SYS_RT_SIGACTION, SIGUSR1 as i64, &act as *const KernelSigaction, 0i64, 8i64)
+            };
+            assert_eq!(r, 0);
+            for _ in 0..3 {
+                // SAFETY: plain call.
+                unsafe { raise(SIGUSR1) };
+            }
+            println!("handled after exec: {}", HITS.load(Ordering::SeqCst));
         }
         "exec-self" => {
             unsafe extern "C" {

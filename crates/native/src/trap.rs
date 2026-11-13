@@ -1,9 +1,11 @@
 //! Guest entry and trap handling on macOS arm64.
 //!
 //! Guest code runs on the host thread that entered it. Rewritten system calls
-//! raise `SIGTRAP`; the handler runs on its own signal stack, executes the
-//! Linux system call against the guest's saved registers and returns, which
-//! resumes the guest after the trap with `x0` holding the result.
+//! call the gate ([`crate::gate`]), whose Rust half ([`fwe_gate_call`]) runs
+//! the plain ones; the rest, and those rewritten as a `brk` where no stub
+//! fits, raise `SIGTRAP`: the handler runs on its own signal stack, executes
+//! the Linux system call against the guest's saved registers and returns,
+//! which resumes the guest after the call with `x0` holding the result.
 //!
 //! Signals for the guest arrive as host signals too (see
 //! `fwe_kernel::signal`): [`on_async`] records each one pending for the
@@ -16,7 +18,8 @@
 //! ([`fwe_kernel::thread::post_landed`]).
 //!
 //! Every handler here runs with all signals blocked on entry and exit, so
-//! [`IN_GUEST`] reliably tells whether an interrupted context is guest code;
+//! [`IN_GUEST`], with the gate's own state ([`guest_interrupted`]), reliably
+//! tells whether an interrupted context is guest code;
 //! in between it unblocks the guest's mask, so a blocking host call made for
 //! the guest is interrupted (`EINTR`) by a signal the guest takes.
 
@@ -281,11 +284,86 @@ impl Drop for HostCode {
 /// child, a new thread): it runs guest code from here, under its guest
 /// mask.
 pub fn prepare_guest_entry() {
+    crate::gate::ensure_block();
     block_async_signals();
     IN_GUEST.with(|g| g.set(true));
     crate::quiesce::register();
     crate::quiesce::enter();
     apply_guest_mask();
+}
+
+/// Whether the signal whose context is `ctx` interrupted guest code: not
+/// fwe's, which the gate is too, from its first instruction to its last
+/// ([`crate::gate`]).
+fn guest_interrupted(ctx: *mut libc::c_void) -> bool {
+    // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+    let pc = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).ss.pc };
+    IN_GUEST.with(Cell::get) && !crate::gate::in_gate(pc) && !crate::gate::active()
+}
+
+/// The Rust half of the system-call gate ([`crate::gate`]): run the call
+/// in `b`, if it is a plain one. 0: it ran and changed nothing but `x0`,
+/// and nothing is to be delivered (the gate returns to the guest); 1: the
+/// trap is to finish it (`b.ran` says whether it ran).
+#[unsafe(no_mangle)]
+extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
+    use fwe_abi::nr::*;
+    use std::sync::atomic::Ordering::SeqCst;
+    // SAFETY: the gate passes this thread's block, which only it uses now.
+    let b = unsafe { &mut *b };
+    IN_GUEST.with(|g| g.set(false));
+    crate::quiesce::leave();
+    let site = crate::gate::site_of(b.ret);
+    b.regs.pc = site;
+    b.regs.x[18] = guest_x18();
+    b.ran = 0;
+    let nr = b.regs.x[8];
+    // What the trap runs its own way, or stops at, it runs.
+    let plain = fwe_kernel::seccomp::mode() == 0
+        && !fwe_kernel::ptrace::stops_at_syscalls()
+        && !matches!(
+            nr,
+            EXIT | EXECVE
+                | EXECVEAT
+                | CLONE
+                | CLONE3
+                | WAIT4
+                | WAITID
+                | PIDFD_GETFD
+                | RT_SIGTIMEDWAIT
+        )
+        && !fwe_kernel::ipcops::waits(nr);
+    if !plain {
+        IN_GUEST.with(|g| g.set(true));
+        return 1;
+    }
+    reroute_parked();
+    let mask = thread::mask();
+    let before = b.regs;
+    let regs = &mut b.regs;
+    let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    // SAFETY: guest pointers in `args` reference guest memory.
+    if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
+        kernel().as_mut().unwrap().finish_syscall(regs, nr, &args, r);
+    } else {
+        kernel().as_mut().unwrap().enter_syscall(regs);
+    }
+    b.ran = 1;
+    // A signal from here on is seen by the gate's way out.
+    b.seen = b.signals.load(SeqCst);
+    let regs = &b.regs;
+    let plain_return = regs.pc == site + 4
+        && regs.sp == before.sp
+        && regs.x[1..] == before.x[1..]
+        && regs.pstate == before.pstate
+        && regs.fp == before.fp
+        && thread::mask() == mask
+        && thread::deliverable() == 0;
+    if plain_return {
+        crate::quiesce::enter();
+    }
+    IN_GUEST.with(|g| g.set(true));
+    u64::from(!plain_return)
 }
 
 /// The TSD key of the guest `x18` slot (see [`crate::x18_slot`]).
@@ -362,9 +440,41 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     // SAFETY: the thread was executing at `pc`, so it is mapped.
     if !unsafe { insn(pc) }.is_some_and(is_brk) {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        take_async(sig, || unsafe { host::signal_info(sig, info) }, ctx, in_guest);
+        take_async(sig, || unsafe { host::signal_info(sig, info) }, ctx, guest_interrupted(ctx));
         return;
     }
+    // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+    let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+    // The gate's trap: the guest's state is in this thread's block.
+    // SAFETY: the thread was executing at `pc`, so it is mapped.
+    let from_gate = crate::gate::in_gate(pc) && unsafe { insn(pc) } == Some(crate::gate::GATE_TRAP);
+    if from_gate {
+        let b = crate::gate::block().expect("the gate's thread has a block");
+        let mut regs = b.regs;
+        let ran = b.ran != 0;
+        b.active.store(0, std::sync::atomic::Ordering::SeqCst);
+        if ran {
+            // The call ran: what is pending is delivered, and the guest
+            // goes on where the call left it.
+            let _host = HostCode::enter_blocked();
+            settle(&mut regs);
+            regs_to(mc, &regs);
+            // SAFETY: `ctx` is this handler's ucontext.
+            unsafe { return_with_guest_mask(ctx) };
+            return;
+        }
+        // As if the guest had trapped at its system call.
+        regs_to(mc, &regs);
+    }
+    syscall_trap(ctx, in_guest, from_gate);
+}
+
+/// The guest at a system call, its state in `ctx` with `pc` on the call's
+/// site: run it, as `on_sigtrap` does for its trap. `known`: the site is a
+/// system call's whatever its instruction (the gate's, or its stub's);
+/// otherwise a `brk` that is not fwe's trap is the guest's own, and
+/// `in_guest` says whether guest code ran it.
+fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // A system call that cannot wait runs with signals still blocked,
@@ -375,7 +485,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     let _host = if quick { HostCode::enter_blocked() } else { HostCode::enter() };
     // The saved pc is the trapping instruction for `brk`.
     // SAFETY: the guest was executing at `pc`, so it is mapped.
-    if unsafe { insn(mc.ss.pc) } != Some(TRAP) {
+    if !known && unsafe { insn(mc.ss.pc) } != Some(TRAP) {
         // Not one of our system call traps: a guest `brk` is a SIGTRAP for
         // the guest; one in fwe's own code is fatal.
         if in_guest {
@@ -551,7 +661,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
 extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let sent = || unsafe { host::signal_info(sig, info) };
-    take_async(sig, sent, ctx, IN_GUEST.with(Cell::get));
+    take_async(sig, sent, ctx, guest_interrupted(ctx));
 }
 
 /// The body of [`on_async`], also used for a fault signal that was sent
@@ -599,6 +709,14 @@ fn take_async(
         // down the thread's signal stack until the host cannot deliver one
         // and ends the process.
         record();
+        // A system call made through the gate delivers it as it ends; one
+        // on its way out starts that again, to look for it.
+        crate::gate::note_signal();
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        if let Some(to) = crate::gate::rewind(ss.pc) {
+            ss.pc = to;
+        }
         return;
     }
     let _host = HostCode::enter();
@@ -779,10 +897,39 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // signal for the guest, whatever this thread was running. (A genuine
     // fault that coincides with a note faults again, without one.)
     if let Some(note) = fwe_kernel::signote::take(sig) {
-        take_async(sig, || host::sent_info(note), ctx, IN_GUEST.with(Cell::get));
+        take_async(sig, || host::sent_info(note), ctx, guest_interrupted(ctx));
         return;
     }
-    if !IN_GUEST.with(Cell::get) {
+    let in_guest = guest_interrupted(ctx);
+    if in_guest {
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        // Read as the host copies, which reports a hole rather than fault:
+        // the pc of an instruction-fetch fault is not mapped.
+        let word = |a: u64| read_host::<u32>(a);
+        if let Some(site) = crate::rewrite::syscall_stub_site(word, ss.pc) {
+            // A system call's stub could not save registers below the
+            // guest's sp (none is needed for a system call: musl's thread
+            // exit unmaps its own stack first): it runs as the trap runs it.
+            ss.pc = site;
+            syscall_trap(ctx, true, true);
+            return;
+        }
+        // A call through the gate unmapped the stack the stub saved `x30`
+        // on (musl's thread exit unmaps its own before `exit`): the gate's
+        // block holds the guest's `x30` and `sp` as the call left them.
+        let after_call =
+            ss.pc.checked_sub(12).filter(|_| word(ss.pc) == Some(crate::rewrite::POP32_X30));
+        if let Some(site) = after_call.and_then(|s| crate::rewrite::syscall_stub_site(word, s))
+            && let Some(b) = crate::gate::block()
+        {
+            ss.lr = b.regs.x[30];
+            ss.sp = b.regs.sp;
+            ss.pc = site + 4;
+            return;
+        }
+    }
+    if !in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
         // SAFETY: `info` is valid for SA_SIGINFO handlers.

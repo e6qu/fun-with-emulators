@@ -232,8 +232,10 @@ stops running its own code.
   unrewritten` (`interp` for the dynamic linker). An image without an
   unwind table has every executable byte taken as code, which is slower
   and less precise ([What is scanned](#what-is-scanned)).
-- **`svc #0`** is replaced in place by one `brk` word, no stub; it costs a
-  trap each time it runs.
+- **`svc #0`** branches to a stub that calls fwe's system-call gate: a
+  plain call costs a function call into fwe and back, no trap and no host
+  signal (`getpid` about 150 ns). Where no stub can be placed it is a
+  `brk` instead, which costs a trap each time it runs.
 - **`TPIDR_EL0` and `x18` instructions** branch to a short stub and back:
   a few extra instructions per execution, no trap. Linux toolchains seldom
   allocate `x18`, and a handful of absurd `x18` forms are left alone
@@ -271,7 +273,7 @@ program is built:
 |---|---|---|
 | static | one image prepared | loaded as is |
 | dynamic | the dynamic linker and each library prepared as mapped | loaded as is; private file mappings copied |
-| system call | a `brk` trap, a host signal handler | a vCPU exit and register transfers |
+| system call | a call into fwe's gate (a `brk` trap for what changes more than `x0`) | a vCPU exit and register transfers |
 | thread-local variables (`TPIDR_EL0`) | a stub branch per access | the hardware register |
 | code using `x18` | a stub branch per use | the hardware register |
 | reading `CTR_EL0` | a trap per read | read by the guest |
@@ -479,28 +481,51 @@ Only instructions whose meaning depends on the kernel need help:
 
 | Instruction | What Linux expects | Why it cannot run unchanged on macOS | What fwe does |
 |---|---|---|---|
-| `svc #0` | a Linux system call, number in `x8` | it would enter the macOS kernel, which reads `x16` and other numbers | rewritten in place to `brk #0x4c58` |
+| `svc #0` | a Linux system call, number in `x8` | it would enter the macOS kernel, which reads `x16` and other numbers | rewritten to a branch to a stub that calls fwe's gate (`brk #0x4c58` where no stub fits) |
 | `mrs`/`msr` of `TPIDR_EL0` | the thread pointer, which the program owns | macOS does not preserve `TPIDR_EL0` for user code | rewritten to a branch to a stub |
 | any instruction naming `x18` | an ordinary register | macOS clears `x18` on every exception return, preemption included | rewritten to a branch to a stub |
 | `mrs <Xt>, ctr_el0` | readable at EL0 | macOS traps it | left alone; emulated when it traps |
 
-### System calls: svc becomes brk
+### System calls: svc calls fwe's gate
 
 macOS's own system calls use `svc #0x80` with the number in `x16`, so a
 Linux `svc #0` would make a wrong call. Before guest code may execute,
-every `svc #0` is overwritten with a breakpoint carrying fwe's mark
-(`0x4c58`, "LX"):
+every `svc #0` is overwritten with a branch to a stub of its own, which
+calls fwe's system-call gate (`crates/native/src/gate.rs`):
+
+```
+site:  b     stub                  ; was svc #0
+stub:  stp   x30, x0, [sp, #-32]!  ; below the guest's sp
+       ldr   x30, =gate
+       blr   x30
+       ldr   x30, [sp], #32
+       b     site + 4
+```
+
+The gate saves the guest's registers in a per-thread block, switches to a
+stack of fwe's, and runs the call with the number from `x8` and arguments
+from `x0`–`x5`. A call that changes nothing but `x0`, with no signal to
+deliver, returns straight back: no exception, no host signal, no change
+of the host's signal mask. Every other outcome (a call that changes the
+pc, `sp` or the signal mask, a signal to deliver, a traced or filtered
+call, `clone`, `execve`, the waits fwe runs outside its lock) takes a
+trap from the gate (`brk #0x4c5a`): fwe's `SIGTRAP` handler (`on_sigtrap`,
+`crates/native/src/trap.rs`) takes the guest's state from the block and
+installs whatever the call left.
+
+A system call needs no usable stack on Linux (musl's thread exit unmaps
+its own stack before its `exit`): there the stub's first store faults,
+and fwe's fault handler runs the call as the trap does. Where no stub can
+be placed within branch range, the `svc #0` is overwritten with a
+breakpoint carrying fwe's mark (`0x4c58`, "LX") instead:
 
 | | Assembly | Word | Bytes in memory |
 |---|---|---|---|
 | In the Linux binary | `svc #0` | `0xd4000001` | `01 00 00 d4` |
 | In memory under fwe | `brk #0x4c58` | `0xd4298b00` | `00 8b 29 d4` |
 
-The `brk` raises `SIGTRAP`. fwe's handler (`on_sigtrap`,
-`crates/native/src/trap.rs`) checks that the instruction at the saved pc
-is its own `brk`, runs the call with the number from `x8` and arguments
-from `x0`–`x5`, writes the result to `x0`, advances the pc and resumes the
-guest. A `brk` with any other immediate is the guest's own breakpoint and
+That `brk` raises `SIGTRAP`, and `on_sigtrap` runs the call the same way.
+A `brk` with any other immediate is the guest's own breakpoint and
 becomes a `SIGTRAP` for the guest.
 
 ### The thread pointer: a stub per access
@@ -600,8 +625,10 @@ while it is still writable and before any thread can run it
   ([Write+exec memory](#writeexec-memory)).
 
 Preparing code twice is harmless: a rewritten site no longer matches.
-fwe's own `rt_sigreturn` trampoline (`movz x8, #139; svc #0`) is prepared
-like guest code.
+fwe's own `rt_sigreturn` trampoline is written already rewritten, as
+`movz x8, #139; brk #0x4c58`: the trap, not a branch to a stub, since the
+trampoline is fwe's and outlives the program's memory (its stub regions
+included) across `execve`, and `rt_sigreturn` always takes the trap.
 
 ### What is scanned
 
@@ -1554,8 +1581,8 @@ the CPU at startup.
 | Error report | `x0` = −errno (−1 to −4095) | carry flag set, `x0` = errno (macOS numbering) |
 
 fwe intercepts every guest system call before it reaches macOS: natively
-each `svc #0` is a `brk` that traps into fwe
-([System calls: svc becomes brk](#system-calls-svc-becomes-brk)); in the
+each `svc #0` calls fwe's gate
+([System calls: svc calls fwe's gate](#system-calls-svc-calls-fwes-gate)); in the
 VM the `svc` takes an exception to fwe's vector, which leaves the VM
 ([A system call in the VM](#a-system-call-in-the-vm)). Then:
 
@@ -1565,7 +1592,7 @@ sequenceDiagram
     participant B as Backend (trap handler / vCPU loop)
     participant K as Kernel crate
     participant M as macOS
-    G->>B: svc 0 (native: rewritten to brk, SIGTRAP. VM: vector, hvc 2, vCPU exit)
+    G->>B: svc 0 (native: rewritten to a call of the gate. VM: vector, hvc 2, vCPU exit)
     B->>K: Kernel::enter_syscall(regs), number in x8
     K->>M: libc call(s) with translated arguments
     M-->>K: result, or -1 and host errno
@@ -2525,7 +2552,9 @@ fwe's own traps rather than faults the guest should see:
 
 | On macOS (native) | What fwe does | What the guest sees |
 |---|---|---|
-| `SIGTRAP` at `brk #0x4c58` | the rewritten `svc #0`: a system call | the call's result |
+| `SIGTRAP` at `brk #0x4c58` | the rewritten `svc #0` (where no stub fits): a system call | the call's result |
+| `SIGTRAP` at the gate's `brk #0x4c5a` | a system call the gate does not finish itself | the call's result, a signal delivered |
+| `SIGSEGV`/`SIGBUS` at a system-call stub's first store | the guest's `sp` takes no store: the system call, run as the trap runs it | the call's result |
 | `SIGTRAP` at any other `brk` | the guest's own breakpoint | `SIGTRAP`, `si_addr` the `brk` |
 | `SIGTRAP` where the pc holds no `brk` | sent by another process | a relayed `SIGTRAP` |
 | `SIGILL` at `mrs <Xt>, ctr_el0` | emulated | the value, as Linux lets EL0 read it |

@@ -2927,7 +2927,29 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
     // On a failure, lighttpd's own account of it.
     let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
     if let Err(e) = result {
+        let mut server = server;
+        let pipe = server.0.stderr.take();
         drop(server);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut err = String::new();
+            if let Some(mut p) = pipe {
+                let mut buf = [0u8; 65536];
+                while let Ok(n) = std::io::Read::read(&mut p, &mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    err.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let _ = tx.send(err.clone());
+                }
+            }
+        });
+        let mut err = String::new();
+        while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
+            err = e;
+        }
+        let lines: Vec<&str> = err.lines().collect();
+        eprintln!("--- fwe stderr tail:\n{}", lines[lines.len().saturating_sub(120)..].join("\n"));
         eprintln!(
             "--- lighttpd's error log:\n{}",
             std::fs::read_to_string(&log_path).unwrap_or_default()
@@ -3357,6 +3379,21 @@ fn tgkill_interrupts_one_thread() {
         signals("tgkill"),
         "signal 12: reader EINTR, handled on it: true\nsignal 40: reader EINTR, handled on it: true\n"
     );
+}
+
+/// A signal sent to a thread making system calls back to back is taken as
+/// the call it lands in ends, also when it lands as the call returns
+/// through the gate: none is left pending until the thread's next call.
+#[test]
+fn signals_landing_as_calls_end_are_taken() {
+    assert_eq!(signals("busy-calls"), "left pending: 0\n");
+}
+
+/// A signal handler returns in a program that replaced another in the same
+/// process: the way back from it is still there.
+#[test]
+fn handlers_return_after_exec() {
+    assert_eq!(signals("exec-then-handler"), "handled after exec: 3\n");
 }
 
 /// A real-time signal (no host equivalent) sent to the process itself.

@@ -2,6 +2,8 @@
 //! this macOS process, with system calls redirected to the kernel layer.
 
 pub mod decode;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod gate;
 pub mod hv;
 pub mod hwcap;
 pub mod loader;
@@ -468,6 +470,15 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The address of the system-call gate rewritten system calls call
+/// ([`gate`]), or 0 where there is none (they trap instead).
+pub fn syscall_gate() -> u64 {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return gate::address();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    0
+}
+
 /// The host TSD slot holding the guest thread pointer, as a byte offset
 /// from the TSD base that `TPIDRRO_EL0` points to.
 pub fn thread_pointer_slot() -> u32 {
@@ -722,7 +733,7 @@ const MOVZ_X8_139: u32 = 0xd280_1168;
 
 /// Map a one-page `rt_sigreturn` trampoline (`movz x8, #139; svc #0`), with
 /// the `svc` rewritten to a trap like any other guest code.
-fn make_sigreturn_trampoline(platform: &NativePlatform, page: u64) -> Result<u64, Error> {
+fn make_sigreturn_trampoline(page: u64) -> Result<u64, Error> {
     // SAFETY: a fresh writable mapping.
     let p = unsafe {
         libc::mmap(
@@ -738,16 +749,19 @@ fn make_sigreturn_trampoline(platform: &NativePlatform, page: u64) -> Result<u64
         return Err(Error::Load(loader::LoadError::Map(std::io::Error::last_os_error())));
     }
     let addr = p as u64;
+    // The call is the trap itself, not a branch to a stub: the trampoline
+    // is fwe's and outlives the program's memory (stub regions included)
+    // across `execve`, and `rt_sigreturn` always takes the trap.
     // SAFETY: writing two instruction words into the fresh page.
     unsafe {
         (addr as *mut u32).write(MOVZ_X8_139);
-        ((addr + 4) as *mut u32).write(rewrite::SVC0);
+        ((addr + 4) as *mut u32).write(rewrite::TRAP);
     }
-    platform
-        .prepare(addr, 8, None, None)
-        .map_err(|e| Error::Unsupported(format!("preparing the sigreturn trampoline: {e}")))?;
-    // SAFETY: making the trampoline executable.
-    unsafe { libc::mprotect(p, page as usize, libc::PROT_READ | libc::PROT_EXEC) };
+    // SAFETY: making the trampoline executable and visible to fetch.
+    unsafe {
+        libc::mprotect(p, page as usize, libc::PROT_READ | libc::PROT_EXEC);
+        prepare::flush_icache(addr, 8);
+    }
     Ok(addr)
 }
 
@@ -1038,7 +1052,7 @@ fn start(
     )?;
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
-    let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
+    let sigreturn_tramp = make_sigreturn_trampoline(page)?;
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));

@@ -4,8 +4,10 @@
 //! macOS differs from Linux are replaced:
 //!
 //! - `svc #0` (a Linux system call) would enter the macOS kernel. It becomes
-//!   a `brk` with a distinctive immediate; the resulting trap is serviced by
-//!   our handler, which runs the Linux system call and resumes the guest.
+//!   a branch to a stub that calls fwe's system-call gate directly (see
+//!   `trap`'s gate), which runs the Linux system call and returns past the
+//!   site. Where no stub can be placed it becomes a `brk` with a distinctive
+//!   immediate instead, whose trap fwe's handler services the same way.
 //! - `mrs`/`msr` of `TPIDR_EL0` (the Linux thread pointer): macOS does not
 //!   preserve `TPIDR_EL0` for user code. Each access becomes a branch to a
 //!   short stub that reads or writes the guest thread pointer in a per-thread
@@ -94,6 +96,9 @@ pub enum Site {
     WriteThreadPointer { rt: u32 },
     /// An instruction that names `x18`; the stub keeps `x18` in a slot.
     X18 { insn: u32 },
+    /// `svc #0`, already a `brk` ([`TRAP`]) in place: the stub calls the
+    /// system-call gate at `gate` (0 until the caller knows it).
+    Syscall { gate: u64 },
 }
 
 /// Whether `insn` names `x18` in an operand position this pass can rewrite by
@@ -169,6 +174,7 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
         let insn = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         let replacement = if insn == SVC0 {
             out.syscalls += 1;
+            out.sites.push((i as u64 * 4, Site::Syscall { gate: 0 }));
             Some(TRAP)
         } else if insn & !RT_MASK == MRS_TPIDR {
             let rt = insn & RT_MASK;
@@ -231,7 +237,8 @@ pub fn count_sites(code: &[u8]) -> usize {
     code.chunks_exact(4)
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .filter(|&i| {
-            (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31)
+            i == SVC0
+                || (i & !RT_MASK == MRS_TPIDR && i & RT_MASK != 31)
                 || i & !RT_MASK == MSR_TPIDR
                 || x18_site(i)
         })
@@ -316,11 +323,57 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
             x18_writes_sp_stub(insn, imm(x18_slot))
         }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
+        Site::Syscall { gate } => return syscall_stub(gate, stub, ret),
     };
     let at = stub + 4 * words.len() as u64;
     words.push(branch(at, ret).expect("stub placed within branch range of its site"));
     assert!(words.len() <= STUB_WORDS, "a stub longer than its slot");
     words
+}
+
+/// `stp x30, x0, [sp, #-32]!`: a system-call stub's first word, its only
+/// one that can fault (the guest's `sp` need not be usable at a system
+/// call: musl's thread exit unmaps its own stack before `exit`).
+pub const SYSCALL_STUB_ENTRY: u32 = 0xa9be_03fe;
+/// `ldr x30, <pc + 20>`: the gate's address, the literal at word 6.
+pub const LDR_X30_LIT: u32 = 0x5800_0000 | (5 << 5) | 30;
+/// `blr x30`
+pub const BLR_X30: u32 = 0xd63f_03c0;
+/// `ldr x30, [sp], #32`: a system-call stub's load of `x30` back, after
+/// the call, which faults where the call unmapped the stack.
+pub const POP32_X30: u32 = 0xf842_07fe;
+
+/// Stub for `svc #0`: `x30` and `x0` saved below `sp` (the gate saves the
+/// rest), the gate called through `x30` (its address a literal in the
+/// stub), `x30` restored, and back past the site. The gate returns here
+/// only when the call changed nothing but `x0`; any other outcome it
+/// installs itself. `stub` is 8-byte aligned.
+fn syscall_stub(gate: u64, stub: u64, ret: u64) -> Vec<u32> {
+    debug_assert!(stub % 8 == 0, "a system-call stub's literal must be aligned");
+    vec![
+        SYSCALL_STUB_ENTRY,
+        LDR_X30_LIT,
+        BLR_X30,
+        POP32_X30,
+        branch(stub + 16, ret).expect("stub placed within branch range of its site"),
+        NOP,
+        gate as u32,
+        (gate >> 32) as u32,
+    ]
+}
+
+/// The system-call site of the stub whose first word is at `pc`, if it is
+/// one: the stub's branch back goes past it.
+pub fn syscall_stub_site(word: impl Fn(u64) -> Option<u32>, pc: u64) -> Option<u64> {
+    if word(pc)? != SYSCALL_STUB_ENTRY || word(pc + 4)? != LDR_X30_LIT || word(pc + 8)? != BLR_X30 {
+        return None;
+    }
+    let b = word(pc + 16)?;
+    if b & 0xfc00_0000 != B {
+        return None;
+    }
+    let offset = (((b & 0x03ff_ffff) << 6) as i32 >> 4) as i64;
+    Some((pc as i64 + 16 + offset) as u64 - 4)
 }
 
 /// Stub for a `cbz`/`cbnz`/`tbz`/`tbnz` that tests `x18`. It loads `x18` into a
@@ -746,8 +799,29 @@ mod tests {
         let mut code = words(&[mov_x8, SVC0, svc1, SVC0]);
         let p = patch(&mut code, None);
         assert_eq!(p.syscalls, 2);
-        assert!(p.sites.is_empty());
+        // Each is the trap in place, and a site for a stub to the gate.
+        let gate = Site::Syscall { gate: 0 };
+        assert_eq!(p.sites, vec![(4, gate), (12, gate)]);
         assert_eq!(code, words(&[mov_x8, TRAP, svc1, TRAP]));
+    }
+
+    /// A system call's stub saves `x30` and `x0` in one store (its only
+    /// one that can fault), calls the gate from its literal and goes back
+    /// past the site; its site is found from its first word.
+    #[test]
+    fn syscall_stub_calls_the_gate_and_names_its_site() {
+        let gate = 0x0001_0203_0405_0608;
+        let s = stub(Site::Syscall { gate }, 0, 0, 0x2000, 0x1004);
+        assert_eq!(s.len(), 8);
+        assert!(s.len() <= STUB_WORDS);
+        assert_eq!(&s[..4], &[SYSCALL_STUB_ENTRY, LDR_X30_LIT, BLR_X30, POP32_X30]);
+        assert_eq!(s[4], branch(0x2010, 0x1004).unwrap());
+        // The literal `ldr` (at word 1) reads 20 bytes on: words 6 and 7.
+        assert_eq!(s[6] as u64 | (s[7] as u64) << 32, gate);
+        let word = |a: u64| s.get(((a - 0x2000) / 4) as usize).copied();
+        assert_eq!(syscall_stub_site(word, 0x2000), Some(0x1000));
+        // Any other word is not a stub's first.
+        assert_eq!(syscall_stub_site(word, 0x2004), None);
     }
 
     #[test]
@@ -1067,7 +1141,7 @@ mod tests {
             0x3956_c25b, // a SHA-256 constant that decodes as `ldrb w27, [x18, ...]`
         ]);
         let p = patch(&mut code, Some(&[(0, 8)]));
-        assert_eq!(p.sites.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(p.sites.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 4]);
         assert_eq!(p.syscalls, 1);
         assert_eq!(p.x18_deferred, 0);
         assert_eq!(&code[8..16], &words(&[0xd283_0312, 0x3956_c25b])[..]);

@@ -118,8 +118,7 @@ hardware.
 
 - [ ] **Performance:** benchmarks in CI of startup, system-call cost,
   `fork`/`exec` and a C project's build, against native macOS and a Linux
-  VM (Lima or OrbStack); the hot spots fixed: the single kernel lock, trap
-  cost and record rewrites.
+  VM (Lima or OrbStack); the single kernel lock split.
 - [ ] **Packaging:** a signed and notarized `fwe` with the hypervisor
   entitlement, a Homebrew formula, and a command that fetches and unpacks a
   Debian or Alpine root filesystem.
