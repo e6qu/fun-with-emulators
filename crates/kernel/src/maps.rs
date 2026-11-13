@@ -681,7 +681,7 @@ pub fn publish_now() {
         let fd = unsafe {
             libc::open(
                 c.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | if std::env::var_os("FWE_MAPS_CLOSE").is_some() { 0 } else { libc::O_TRUNC } | libc::O_CLOEXEC,
                 0o600,
             )
         };
@@ -711,6 +711,13 @@ pub fn publish_now() {
     put(&rest, 8);
     o.seq = odd + 1;
     put(&o.seq.to_ne_bytes(), 0);
+    crate::timing::mark("maps published");
+    if std::env::var_os("FWE_MAPS_CLOSE").is_some() {
+        // SAFETY: fwe's own descriptor, forgotten with the outbox.
+        unsafe { libc::close(o.fd) };
+        *out = None;
+        crate::timing::mark("maps closed");
+    }
 }
 
 /// What [`snapshot`] encoded.
