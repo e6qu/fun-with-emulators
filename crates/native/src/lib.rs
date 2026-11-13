@@ -1076,13 +1076,18 @@ fn start(
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
+        fwe_kernel::timing::mark("exe path");
         fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+        fwe_kernel::timing::mark("proc info");
         fs.set_auxv(out.auxv.clone());
         fs.publish();
+        fwe_kernel::timing::mark("fs published");
         // The main thread's id equals the process id, as on Linux: in its
         // pid namespace, for a process exec'd in one.
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
+        fwe_kernel::timing::mark("main thread");
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+        fwe_kernel::timing::mark("namespaces");
     });
     fwe_kernel::timing::mark("published");
     // A subreaper stays one across execve; a namespace's init is one.
