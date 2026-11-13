@@ -274,7 +274,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
 fn frame(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 16);
     out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    out.extend_from_slice(&fnv1a(body).to_le_bytes());
+    out.extend_from_slice(&checksum(body).to_le_bytes());
     out.extend_from_slice(body);
     out
 }
@@ -284,13 +284,35 @@ fn unframe(bytes: &[u8]) -> Option<&[u8]> {
     let len = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
     let sum = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
     let body = bytes.get(16..16usize.checked_add(len)?)?;
-    (fnv1a(body) == sum).then_some(body)
+    (checksum(body) == sum).then_some(body)
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+/// A record's checksum over its little-endian words, the last one padded
+/// with zeros. Records carry a process's mappings, thousands of them for
+/// some, and are read at every reap: a word at a time, and straight from
+/// the buffer when it is aligned.
+fn checksum(bytes: &[u8]) -> u64 {
+    let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    // SAFETY: every bit pattern is a valid u64.
+    let (head, words, _) = unsafe { bytes.align_to::<u64>() };
+    let rest = if head.is_empty() && cfg!(target_endian = "little") {
+        let mut i = 0;
+        while i < words.len() {
+            h = mix(h, words[i]);
+            i += 1;
+        }
+        &bytes[words.len() * 8..]
+    } else {
+        bytes
+    };
+    let mut chunks = rest.chunks(8);
+    for c in &mut chunks {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = mix(h, u64::from_le_bytes(w));
+    }
+    h
 }
 
 fn decode(bytes: &[u8]) -> Option<ProcRecord> {
@@ -1456,6 +1478,28 @@ mod tests {
         let last = mixed.len() - 1;
         mixed[last] ^= 1;
         assert_eq!(unframe(&mixed), None);
+    }
+
+    #[test]
+    fn a_checksum_is_the_same_wherever_the_bytes_lie() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let mut buf = [0u8; 120];
+        for at in 0..8 {
+            for len in [0, 1, 7, 8, 9, 64, 99] {
+                buf[at..at + len].copy_from_slice(&bytes[..len]);
+                assert_eq!(
+                    checksum(&buf[at..at + len]),
+                    checksum(&bytes[..len]),
+                    "at {at}, {len} bytes"
+                );
+            }
+        }
+        // Any one byte changed changes it.
+        for i in 0..bytes.len() {
+            let mut other = bytes.clone();
+            other[i] ^= 0x40;
+            assert_ne!(checksum(&other), checksum(&bytes), "byte {i}");
+        }
     }
 
     #[test]
