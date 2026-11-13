@@ -273,6 +273,19 @@ fn proc_fd() {
         let sr2 = syscall(SYS_MOUNT_SETATTR, st, c"".as_ptr(), 0x1000u32 | 0x8000, attr.as_ptr(), 32usize);
         let es2 = if sr2 < 0 { *__errno_location() } else { 0 };
         println!("sysfs attached {smoved}, setattr {sr} ({es}); clone of /sys {} ({et2}), setattr {sr2} ({es2})", st >= 0);
+        // Into the root with `pivot_root(".", ".")`, as crun goes into a
+        // container's, then flags set again through the descriptor the
+        // sysfs was attached with: the same mount, at its new path.
+        let into = open(c(&merged).as_ptr(), 0o40000 | 0o2000000);
+        syscall(50, into); // fchdir
+        let pr = syscall(41, c".".as_ptr(), c".".as_ptr()); // pivot_root
+        let ep = if pr < 0 { *__errno_location() } else { 0 };
+        umount2(c".".as_ptr(), 2);
+        syscall(49, c"/".as_ptr()); // chdir
+        let attr = [MOUNT_ATTR_NOEXEC, 0, 0, 0];
+        let after = syscall(SYS_MOUNT_SETATTR, sm, c"".as_ptr(), 0x1000u32, attr.as_ptr(), 32usize);
+        let ea = if after < 0 { *__errno_location() } else { 0 };
+        println!("pivoted {pr} ({ep}); setattr through the sysfs's descriptor after {after} ({ea})");
         umount2(c(&dir).as_ptr(), 2);
     }
 }

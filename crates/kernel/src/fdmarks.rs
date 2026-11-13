@@ -357,6 +357,18 @@ pub fn opened_in_tree(fd: i32, mount: u32, flags: u64, fstype: FsType) {
     insert(&mut records(), fd, Record { dev, ino, origin, mark: None });
 }
 
+/// The namespace paths descriptors were opened at, each made `moved(path)`
+/// (the namespace's mounts moved by `pivot_root`).
+pub fn rebase(moved: impl Fn(&[u8]) -> Vec<u8>) {
+    for rec in records().values_mut() {
+        if let Some(o) = rec.origin.as_mut()
+            && !o.ns_path.is_empty()
+        {
+            o.ns_path = moved(&o.ns_path);
+        }
+    }
+}
+
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
     let Some((dev, ino)) = identity(fd) else { return };

@@ -4270,7 +4270,8 @@ fn a_binary_run_through_a_read_only_clone_sees_it() {
 /// and by path, its flags set through the descriptor it was attached
 /// with, its files opened with `openat2`, and one masked with `/dev/null`
 /// as crun masks it (a clone of `/dev/null`, and a bind through
-/// descriptors).
+/// descriptors); a sysfs the same way, its flags set through its
+/// descriptor again after `pivot_root` into that root.
 #[test]
 fn proc_is_read_through_a_detached_mount() {
     let want = "fsmount proc: cap_last_cap 40\nmounts: read\nself/mountinfo: read\nself/status: read\n\
@@ -4278,7 +4279,9 @@ fn proc_is_read_through_a_detached_mount() {
          proc attached 0; remount through fd 0 (0), by path 0 (0); setattr through its descriptor 0\n\
          keys under it: openat true, openat2 true (0)\n\
          in an overlay: mounted 0, proc attached 0; keys: openat true, openat2 true (0)\n\
-         masked: open_tree of /dev/null true (0), bound 0; again true (0), reads 0\n";
+         masked: open_tree of /dev/null true (0), bound 0; again true (0), reads 0\n\
+         sysfs attached 0, setattr 0 (0); clone of /sys true (0), setattr 0 (0)\n\
+         pivoted 0 (0); setattr through the sysfs's descriptor after 0 (0)\n";
     // On the host's files, and in a root filesystem, whose `/dev/null` is
     // the host's device served from outside it, as a container engine's.
     let out = fwe(&rust_guest("mountapi"), &["procfd"]);
