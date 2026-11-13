@@ -159,12 +159,22 @@ fn get_opt(d: &mut Dec) -> Option<Proc> {
     get_procs(d).first().copied()
 }
 
-fn dir() -> Option<Vec<u8>> {
+/// The directory `name` in fwe's private directory, made the first time
+/// this process asks for it.
+fn made_dir(cell: &'static std::sync::OnceLock<Vec<u8>>, name: &str) -> Option<Vec<u8>> {
+    if let Some(d) = cell.get() {
+        return Some(d.clone());
+    }
     let mut d = crate::fs::shm::user_dir().ok()?;
-    d.extend_from_slice(format!("/v{}-procs", crate::shared::FORMAT).as_bytes());
+    d.extend_from_slice(format!("/v{}-{name}", crate::shared::FORMAT).as_bytes());
     // SAFETY: a NUL-terminated path in fwe's private directory.
     unsafe { libc::mkdir(std::ffi::CString::new(d.clone()).ok()?.as_ptr(), 0o700) };
-    Some(d)
+    Some(cell.get_or_init(|| d).clone())
+}
+
+fn dir() -> Option<Vec<u8>> {
+    static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    made_dir(&DIR, "procs")
 }
 
 /// The directory the process records are kept in.
@@ -238,13 +248,49 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
 
 /// The record of live host process `pid`.
 pub fn read(pid: i32) -> Option<ProcRecord> {
-    read_any(pid).filter(|r| start_time(pid) == Some(r.start))
+    with_held(pid, read_any(pid).filter(|r| start_time(pid) == Some(r.start)))
 }
 
 /// The record kept for host pid `pid`, whether or not its process lives.
 fn read_any(pid: i32) -> Option<ProcRecord> {
-    let bytes = std::fs::read(OsStr::from_bytes(&path(pid)?)).ok()?;
-    let mut d = Dec::new(&bytes);
+    let p = path(pid)?;
+    // A record is rewritten in place ([`write`]): one read while it is
+    // being written fails its check, and is made again.
+    for _ in 0..1000 {
+        let bytes = std::fs::read(OsStr::from_bytes(&p)).ok()?;
+        if let Some(body) = unframe(&bytes) {
+            return decode(body);
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
+/// A record's bytes as written: its length and checksum, then itself.
+fn frame(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 16);
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&fnv1a(body).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// The record in `bytes` ([`frame`]), if it is whole.
+fn unframe(bytes: &[u8]) -> Option<&[u8]> {
+    let len = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
+    let sum = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
+    let body = bytes.get(16..16usize.checked_add(len)?)?;
+    (fnv1a(body) == sum).then_some(body)
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x1_0000_0001_b3))
+}
+
+fn decode(bytes: &[u8]) -> Option<ProcRecord> {
+    let mut d = Dec::new(bytes);
     let (start, cgroup) = (d.u64(), d.bytes());
     let n = d.count(8);
     let ns = (0..n).map(|_| d.bytes()).collect();
@@ -297,16 +343,27 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     })
 }
 
-/// Write the record of host process `pid`.
-pub fn write(pid: i32, r: &ProcRecord) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
+/// Write the record of host process `pid`, under its lock ([`change`]): in
+/// place, framed with its length and checksum, for readers (who take no
+/// lock) to tell a record being written from a whole one. A new file costs
+/// the host far more than rewriting one.
+fn write(pid: i32, r: &ProcRecord) {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
-    // A name of this writer's own: two processes may write one record.
-    let tmp = [&p[..], format!(".{}.{}.tmp", me(), N.fetch_add(1, Ordering::Relaxed)).as_bytes()]
-        .concat();
-    if std::fs::write(OsStr::from_bytes(&tmp), encode(r)).is_ok() {
-        let _ = std::fs::rename(OsStr::from_bytes(&tmp), OsStr::from_bytes(&p));
+    let bytes = frame(&encode(r));
+    let Ok(f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(OsStr::from_bytes(&p))
+    else {
+        return;
+    };
+    // The new record first, then the old one's longer tail cut off (which
+    // the frame leaves out meanwhile).
+    if f.write_all_at(&bytes, 0).is_ok() {
+        let _ = f.set_len(bytes.len() as u64);
     }
 }
 
@@ -384,9 +441,10 @@ pub fn remove(pid: i32) {
 }
 
 /// Remove the files kept beside the records for processes that are gone
-/// (their mailbox, lock, mappings and thread ids), older than `young`: a
-/// process whose record was taken away ([`remove`]) without them, as when
-/// its pid had been given to another process by then.
+/// (their mailbox, lock, mappings, thread ids and how they ended), older
+/// than `young`: a process whose record was taken away ([`remove`])
+/// without them, as when its pid had been given to another process by
+/// then, or whose parent was not fwe's to reap it.
 pub fn collect_leftovers(young: std::time::Duration) {
     let Some(d) = dir() else { return };
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return };
@@ -394,7 +452,7 @@ pub fn collect_leftovers(young: std::time::Duration) {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         let pid = match name.split_once('.') {
-            Some((p, "sig" | "lock" | "maps")) => p,
+            Some((p, "sig" | "lock" | "maps" | "end")) => p,
             _ => match name.strip_prefix("tids-").or_else(|| name.strip_prefix("threads-")) {
                 Some(p) => p.strip_suffix(".new").unwrap_or(p),
                 None => continue,
@@ -556,13 +614,9 @@ pub fn cgroup_of(pid: i32) -> Vec<u8> {
     read(pid).map_or_else(|| b"/".to_vec(), |r| r.cgroup)
 }
 
-/// Change the record of host process `pid` with `f` (making one if it has
-/// none).
-fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
-    let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
-    // Under the record's lock: a parent and its child may change one.
-    let _lock = lock(pid);
-    let mut r = read(pid).unwrap_or(ProcRecord {
+/// The record of a process fwe has none of yet.
+fn fresh(pid: i32, start: u64) -> ProcRecord {
+    ProcRecord {
         start,
         cgroup: b"/".to_vec(),
         ns: Vec::new(),
@@ -589,7 +643,16 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         auxv: Vec::new(),
         held: Vec::new(),
         foster: false,
-    });
+    }
+}
+
+/// Change the record of host process `pid` with `f` (making one if it has
+/// none).
+fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
+    let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    // Under the record's lock: a parent and its child may change one.
+    let _lock = lock(pid);
+    let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
     f(&mut r);
     write(pid, &r);
     Ok(())
@@ -606,21 +669,71 @@ pub fn set_namespaces(pid: i32, ns: Vec<Vec<u8>>) {
     let _ = change(pid, |r| r.ns = ns);
 }
 
+/// A change to this process's record held back by [`batch`].
+type Pending = Box<dyn Fn(&mut ProcRecord) + Send>;
+
+/// The changes [`batch`] holds back, with the process they are for.
+static BATCH: std::sync::Mutex<Option<(i32, Vec<Pending>)>> = std::sync::Mutex::new(None);
+
+/// Run `f`, making the changes it makes to this process's own record
+/// ([`own_program`], [`own_auxv`], [`own_namespaces`]) in one write at its
+/// end: a program's start makes several.
+pub fn batch<R>(f: impl FnOnce() -> R) -> R {
+    *BATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((me(), Vec::new()));
+    let out = f();
+    let held = BATCH.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some((pid, changes)) = held.filter(|(_, c)| !c.is_empty()) {
+        let _ = change(pid, |r| changes.iter().for_each(|c| c(r)));
+    }
+    out
+}
+
+/// Change this process's own record with `f`, or hold the change back
+/// for [`batch`].
+fn change_own(f: impl Fn(&mut ProcRecord) + Send + 'static) {
+    let me = me();
+    {
+        let mut b = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((pid, changes)) = b.as_mut()
+            && *pid == me
+        {
+            changes.push(Box::new(f));
+            return;
+        }
+    }
+    let _ = change(me, f);
+}
+
+/// This process's record with the changes [`batch`] holds back.
+fn with_held(pid: i32, r: Option<ProcRecord>) -> Option<ProcRecord> {
+    let b = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+    match b.as_ref() {
+        Some((p, changes)) if *p == pid && !changes.is_empty() => {
+            let mut r = r.or_else(|| start_time(pid).map(|start| fresh(pid, start)))?;
+            changes.iter().for_each(|c| c(&mut r));
+            Some(r)
+        }
+        _ => r,
+    }
+}
+
 /// This process runs program `exe` with command line `cmdline`.
 pub fn own_program(exe: &[u8], cmdline: &[u8]) {
     let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
     let comm = base[..base.len().min(15)].to_vec();
-    let _ = change(me(), |r| {
-        r.exe = exe.to_vec();
-        r.cmdline = cmdline.to_vec();
-        r.comm = comm;
+    let (exe, cmdline) = (exe.to_vec(), cmdline.to_vec());
+    change_own(move |r| {
+        r.exe = exe.clone();
+        r.cmdline = cmdline.clone();
+        r.comm = comm.clone();
         r.execed = true;
     });
 }
 
 /// This process's program started with auxiliary vector `auxv`.
 pub fn own_auxv(auxv: &[u8]) {
-    let _ = change(me(), |r| r.auxv = auxv.to_vec());
+    let auxv = auxv.to_vec();
+    change_own(move |r| r.auxv = auxv.clone());
 }
 
 /// This process's threads are in the namespaces whose records are `held`
@@ -636,7 +749,7 @@ pub fn own_comm(comm: &[u8]) {
 
 /// This process is in the namespaces `ns`.
 pub fn own_namespaces(ns: Vec<Vec<u8>>) {
-    set_namespaces(me(), ns);
+    change_own(move |r| r.ns = ns.clone());
 }
 
 /// What a fork child takes of this process's record, as it is when it
@@ -1157,11 +1270,8 @@ impl Ended {
 }
 
 fn ended_dir() -> Option<Vec<u8>> {
-    let mut d = crate::fs::shm::user_dir().ok()?;
-    d.extend_from_slice(format!("/v{}-ended", crate::shared::FORMAT).as_bytes());
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    unsafe { libc::mkdir(std::ffi::CString::new(d.clone()).ok()?.as_ptr(), 0o700) };
-    Some(d)
+    static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    made_dir(&DIR, "ended")
 }
 
 fn ended_path(pid: i32, start: u64) -> Option<Vec<u8>> {

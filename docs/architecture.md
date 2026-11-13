@@ -185,7 +185,8 @@ The pieces that do it:
 
 - `crates/native/src/rewrite.rs` scans a range word by word, rewrites
   `svc #0` in place, and builds a stub for each thread-pointer or `x18`
-  site;
+  site; a word with no 18 in any register field (bits 0, 5, 10 and 16),
+  nearly every one, is passed over without decoding;
 - `crates/native/src/decode.rs` decodes the operands of an instruction
   naming `x18`, so the stub can substitute a scratch register, adjust an
   `sp` offset or rebuild a PC-relative or branch form, and finds the forms
@@ -320,7 +321,10 @@ keeps:
   pid in fwe's private directory with the process's start time (so a
   record never outlives its process into another with the same pid),
   cgroup, namespaces, name, command line, program, ancestors, subreaper
-  flag, nice value, scheduling policy and `oom_score_adj`.
+  flag, nice value, scheduling policy and `oom_score_adj`. A record is
+  rewritten in place under its lock, framed with its length and a
+  checksum, so a reader (which takes no lock) rereads one caught
+  mid-write; a program's start writes its record once.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events));

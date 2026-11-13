@@ -2209,7 +2209,12 @@ A record's name carries a format number, so another fwe build never reads
 it. A record no live process holds is collected when a namespace is made
 and when a fresh fwe starts, at most once a minute (records younger than
 that are spared anyway), with the files a gone process left beside its
-record.
+record, the `/dev/shm` directory of a rootfs no mount table shows, and
+the tracing mailboxes of processes that are gone. A fresh start leaves
+that work to a process of its own, which nothing waits for. A process
+fwe starts for a guest's `execve` is handed the private directory
+rather than asking macOS for the user's temporary directory again (the
+host takes about a millisecond to answer).
 
 ### Namespaces
 

@@ -34,7 +34,9 @@ holds:
   [CI](#tests-and-ci) is arranged.
 
 The framework needs the `com.apple.security.hypervisor` entitlement (an
-ad-hoc signature carrying it is enough) but no root.
+ad-hoc signature carrying it is enough) but no root. fwe loads it
+(`dlopen`) when a process first asks it anything, every entry point at
+once: a process that runs no VM never pays for loading it.
 
 ## How it works
 

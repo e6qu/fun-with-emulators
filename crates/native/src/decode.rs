@@ -778,12 +778,46 @@ fn gpr_fields(insn: u32) -> Option<Vec<u32>> {
 /// Whether `insn` names `x18` in a general-purpose register field. Used to
 /// count the `x18` uses the rewrite leaves alone, a diagnostic only.
 pub fn names_x18(insn: u32) -> bool {
+    may_name_x18(insn) && fields_name_x18(insn)
+}
+
+/// [`names_x18`] by decoding alone.
+fn fields_name_x18(insn: u32) -> bool {
     gpr_fields(insn).is_some_and(|f| f.iter().any(|&s| reg(insn, s) == 18))
+}
+
+/// Whether `insn` has 18 in one of the places an instruction names a
+/// general register (bits 0, 5, 10 and 16): one that has not names no
+/// `x18`, which is told at once, where decoding it costs far more.
+#[inline]
+pub fn may_name_x18(insn: u32) -> bool {
+    const ALL: u32 = 0x1f | 0x1f << 5 | 0x1f << 10 | 0x1f << 16;
+    const X18: u32 = 18 | 18 << 5 | 18 << 10 | 18 << 16;
+    // Each field equal to 18 is all zeros once XORed with it.
+    let x = (insn ^ X18) & ALL;
+    [0, 5, 10, 16].iter().any(|&s| (x >> s) & 0x1f == 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_quick_check_passes_every_x18_word() {
+        // A spread of words (every one of the 2^32 was checked once):
+        // whatever decoding finds naming x18, the quick check lets through.
+        let mut w: u32 = 1;
+        for _ in 0..1 << 22 {
+            w = w.wrapping_mul(0x9e37_79b1).wrapping_add(0x7f4a_7c15);
+            for insn in
+                [w, w & !(0x1f << 5) | 18 << 5, w & !0x1f | 18, w & !(0x1f << 16) | 18 << 16]
+            {
+                assert!(may_name_x18(insn) || !fields_name_x18(insn), "{insn:#010x}");
+            }
+        }
+        assert!(!may_name_x18(0xaa0103e0)); // mov x0, x1
+        assert!(may_name_x18(0xaa1203ea)); // mov x10, x18
+    }
 
     fn rd(shift: u32) -> Field {
         Field { shift, read: false, write: true }

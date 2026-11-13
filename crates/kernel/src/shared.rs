@@ -136,7 +136,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 18;
+pub const FORMAT: u32 = 19;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -604,19 +604,20 @@ const YOUNG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Remove the records no live process holds, as a kernel frees a namespace
 /// when its last process leaves: namespaces nobody is in, tmpfs directories
-/// no live mount table shows, records another fwe build wrote, and the
-/// initial mount table of a rootfs that is gone.
+/// and rootfs `/dev/shm` directories no live mount table shows, records
+/// another fwe build wrote, the initial mount table of a rootfs that is
+/// gone, and the tracing mailboxes of processes that are gone.
 ///
 /// It runs at most once a minute ([`YOUNG`], within which nothing would be
-/// removed anyway), as a fresh fwe starts: a marker's time says when.
+/// removed anyway), as a fresh fwe starts, in a process of its own: a
+/// marker's time says when.
 pub fn collect() {
-    use std::collections::HashSet;
     use std::os::unix::ffi::OsStrExt;
     let Ok(base) = crate::fs::shm::user_dir() else { return };
     crate::tmark("  userdir");
-    let os = |p: &[u8]| std::ffi::OsStr::from_bytes(p).to_owned();
-    let marker = os(&[&base[..], format!("/v{FORMAT}-collected").as_bytes()].concat());
-    let recent = std::fs::metadata(&marker)
+    let marker = [&base[..], format!("/v{FORMAT}-collected").as_bytes()].concat();
+    let marker = std::ffi::OsStr::from_bytes(&marker);
+    let recent = std::fs::metadata(marker)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
@@ -625,7 +626,65 @@ pub fn collect() {
         return;
     }
     // Marked first: another fwe starting meanwhile need not collect too.
-    let _ = std::fs::File::create(&marker);
+    let _ = std::fs::File::create(marker);
+    // In a process of its own, which no one waits for: a program's start
+    // does not wait for it, and its program never sees it as a child (its
+    // parent, gone at once, leaves it to the host).
+    // SAFETY: plain host calls; the process is single-threaded here (a
+    // fresh start, before the guest runs), and each child only collects
+    // and ends.
+    unsafe {
+        match libc::fork() {
+            0 => {
+                if libc::fork() == 0 {
+                    detach_descriptors();
+                    collect_in(&base);
+                }
+                libc::_exit(0)
+            }
+            -1 => collect_in(&base),
+            child => {
+                let mut status = 0;
+                while libc::waitpid(child, &mut status, 0) < 0
+                    && crate::host::last_errno() == libc::EINTR
+                {}
+            }
+        }
+    }
+}
+
+/// Close every descriptor inherited, and put `/dev/null` in place of the
+/// standard ones: whoever reads the output of the process that started
+/// [`collect`] must not wait for it too.
+fn detach_descriptors() {
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .collect();
+    for fd in fds {
+        // SAFETY: closing a descriptor this process inherited (the one the
+        // listing used is closed already, harmlessly closed again).
+        unsafe { libc::close(fd) };
+    }
+    // SAFETY: opening `/dev/null`, which takes the lowest number (0), and
+    // making 1 and 2 copies of it.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null == 0 {
+            libc::dup2(0, 1);
+            libc::dup2(0, 2);
+        }
+    }
+}
+
+/// [`collect`]'s work, in fwe's private directory `base`.
+fn collect_in(base: &[u8]) {
+    use std::collections::HashSet;
+    use std::os::unix::ffi::OsStrExt;
+    let base = base.to_vec();
+    let os = |p: &[u8]| std::ffi::OsStr::from_bytes(p).to_owned();
     crate::procreg::collect_leftovers(YOUNG);
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
@@ -741,8 +800,11 @@ pub fn collect() {
         {
             // A tmpfs's size limit goes with it.
             !shown.contains(&[&base[..], b"/tmpfs-", dir].concat())
-        } else if name.starts_with(b"tmpfs-") {
+        } else if name.starts_with(b"tmpfs-") || name.starts_with(b"shm-") {
+            // A tmpfs, or a rootfs's `/dev/shm`, that no table shows.
             !shown.contains(&path)
+        } else if name.starts_with(b"ptrace-") {
+            crate::ptrace::leftover(&name)
         } else {
             // Another fwe build's: `v<n>-` with another format.
             name.first() == Some(&b'v')

@@ -1012,13 +1012,15 @@ fn start(
     }
     fwe_kernel::tmark("collected");
     let args = &guest_args(args, options);
-    let fs0 = open_fs(options)?;
+    // The root filesystem; also used to find the dynamic linker.
+    let mut fs = open_fs(options)?;
     fwe_kernel::tmark("openfs");
-    let data = read_program(path, options, &fs0)?;
+    let data = read_program(path, options, &fs)?;
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if needs_vm(&data) {
+        drop(fs);
         return Err(hv::run(path, &data, args, env, options));
     }
 
@@ -1031,10 +1033,6 @@ fn start(
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
 
-    // The root filesystem; also used to find the dynamic linker.
-    let mut fs = open_fs(options)?;
-
-    fwe_kernel::tmark("fs");
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
     let out = load_image(
@@ -1048,24 +1046,25 @@ fn start(
         options.strace,
     )?;
     fwe_kernel::tmark("loaded");
-    let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
-    fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
-    fwe_kernel::tmark("procinfo");
-    fs.set_auxv(out.auxv.clone());
-    fwe_kernel::tmark("auxv");
-    fs.publish();
-
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
-    fwe_kernel::tmark("published");
     let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
-
-    // The main thread's id equals the process id, as on Linux: in its pid
-    // namespace, for a process exec'd in one.
     fwe_kernel::tmark("tramp");
-    fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
-    fwe_kernel::tmark("initmain");
-    fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    // What the process's record tells of it, written once.
+    fwe_kernel::procreg::batch(|| {
+        let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
+        fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+        fwe_kernel::tmark("procinfo");
+        fs.set_auxv(out.auxv.clone());
+        fwe_kernel::tmark("auxv");
+        fs.publish();
+        fwe_kernel::tmark("published");
+        // The main thread's id equals the process id, as on Linux: in its
+        // pid namespace, for a process exec'd in one.
+        fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
+        fwe_kernel::tmark("initmain");
+        fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    });
     fwe_kernel::tmark("ownns");
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();

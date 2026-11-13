@@ -137,9 +137,12 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if let Some(fs) = k.fs.as_mut() {
         fs.set_exe_fd(exe_fd);
         let exe = fs.exe_fd_target().unwrap_or_else(|| path.clone());
-        fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
-        fs.set_auxv(out.auxv);
-        fs.publish();
+        // What the process's record tells of it, written once.
+        fwe_kernel::procreg::batch(|| {
+            fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+            fs.set_auxv(out.auxv);
+            fs.publish();
+        });
     }
     fwe_kernel::tmark("x done");
     // The new program starts with every register zero, as Linux leaves it;
@@ -209,6 +212,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 Err(e) => return fwe_abi::err(e),
             };
         }
+        fwe_kernel::tmark("f begin");
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
         let token = match k.fork_begin(&a) {
@@ -221,6 +225,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 return fwe_abi::err(e);
             }
         };
+        fwe_kernel::tmark("f token");
         let kqueues = fwe_kernel::kqueue_state();
         // A child of CLONE_VM shares the guest's memory: its private parts
         // are shared for the fork, then copied again by any later one (in
@@ -266,9 +271,14 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);
-            k.fork_child(token)
+            let r = k.fork_child(token);
+            fwe_kernel::tmark("f child done");
+            r
         } else {
-            k.fork_parent(token, pid)
+            fwe_kernel::tmark("f parent forked");
+            let r = k.fork_parent(token, pid);
+            fwe_kernel::tmark("f parent done");
+            r
         };
         // A child with memory of its own has none of what was to be wiped.
         if pid == 0 && share.is_empty() {
@@ -322,6 +332,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         if child_stack != 0 {
             regs.sp = child_stack;
         }
+        fwe_kernel::tmark("f child enter");
         trap::prepare_guest_entry();
         // SAFETY: `regs` is the parent's runnable context with x0 cleared.
         unsafe { trap::enter_guest_full(&regs) }
