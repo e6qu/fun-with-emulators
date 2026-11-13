@@ -378,7 +378,6 @@ fn write(pid: i32, r: &ProcRecord) {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
     let bytes = frame(&encode(r));
-    crate::timing::mark("record: encoded");
     let Ok(f) = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -388,12 +387,8 @@ fn write(pid: i32, r: &ProcRecord) {
     else {
         return;
     };
-    crate::timing::mark("record: opened");
     // An older record's longer tail stays, past the frame.
     let _ = f.write_all_at(&bytes, 0);
-    crate::timing::mark("record: wrote");
-    drop(f);
-    crate::timing::mark("record: closed");
 }
 
 /// Hold host process `pid`'s record's lock while the result lives.
@@ -679,15 +674,11 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 /// none).
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
-    crate::timing::mark("record: start time");
     // Under the record's lock: a parent and its child may change one.
     let _lock = lock(pid);
-    crate::timing::mark("record: locked");
     let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
-    crate::timing::mark("record: read");
     f(&mut r);
     write(pid, &r);
-    crate::timing::mark("record: written");
     Ok(())
 }
 

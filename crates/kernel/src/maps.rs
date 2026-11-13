@@ -566,17 +566,17 @@ impl Published {
     }
 }
 
-/// The shared file this process publishes its mappings in: other
-/// processes read it for `/proc/<pid>/maps`. It holds a sequence word
-/// (odd while a change is written), the length of what follows, and the
-/// encoded [`Published`].
+/// The file this process publishes its mappings in: other processes read
+/// it for `/proc/<pid>/maps`. It holds a sequence word (odd while a change
+/// is written), the length of what follows, and the encoded [`Published`].
+/// The file is opened for each publication and closed after it: a process
+/// that ends holding a file it wrote makes the next process's first close
+/// of a file it wrote wait (milliseconds, on a virtual machine's disk).
 pub(crate) struct Outbox {
     pid: i32,
-    fd: i32,
     /// The sequence word as last written.
     seq: u64,
 }
-
 pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
 
 /// The header before the encoded record: the sequence word and the length.
@@ -604,15 +604,11 @@ pub fn snapshot() -> Vec<u8> {
     e.into_bytes()
 }
 
-/// Let go of the parent's file a fork child inherited.
+/// Forget the parent's publication state a fork child inherited.
 fn drop_inherited(out: &mut Option<Outbox>) {
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };
-    if let Some(o) = out.as_ref()
-        && o.pid != me
-    {
-        // SAFETY: the descriptor is this process's copy.
-        unsafe { libc::close(o.fd) };
+    if out.as_ref().is_some_and(|o| o.pid != me) {
         *out = None;
     }
 }
@@ -674,35 +670,26 @@ pub fn publish_now() {
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };
     drop_inherited(&mut out);
-    if out.is_none() {
-        let Some(path) = crate::procreg::maps_path(me) else { return };
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | if std::env::var_os("FWE_MAPS_CLOSE").is_some() { 0 } else { libc::O_TRUNC } | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return;
-        }
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *out = Some(Outbox { pid: me, fd, seq: 0 });
+    let Some(path) = crate::procreg::maps_path(me) else { return };
+    let Ok(c) = std::ffi::CString::new(path) else { return };
+    // SAFETY: a NUL-terminated path in fwe's private directory.
+    let fd =
+        unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
+    if fd < 0 {
+        return;
     }
-    let Some(o) = out.as_mut() else { return };
-    // Written with `pwrite`, not through a shared mapping: a mapping's
-    // dirty pages are written back once the process has gone, and until
-    // they are the next process's first close of a file it wrote waits
-    // (milliseconds, on a virtual machine's disk).
-    let fd = o.fd;
+    let o = out.get_or_insert(Outbox { pid: me, seq: 0 });
+    // Written with `pwrite`, not through a shared mapping, whose dirty
+    // pages would be written back after the process has gone, with the
+    // same wait as a file left open.
     let put = |bytes: &[u8], at: usize| {
         // SAFETY: a buffer of its length, on fwe's own descriptor.
         unsafe { libc::pwrite(fd, bytes.as_ptr().cast(), bytes.len(), at as libc::off_t) };
     };
     // The sequence word odd while the rest changes; the length and the
-    // body, which follow it, in one write; then even again.
+    // body, which follow it, in one write; then even again. A file left
+    // by an earlier process of the same pid is overwritten in place: the
+    // length says where this record ends.
     let odd = o.seq | 1;
     put(&odd.to_ne_bytes(), 0);
     let mut rest = Vec::with_capacity(8 + body.len());
@@ -711,13 +698,8 @@ pub fn publish_now() {
     put(&rest, 8);
     o.seq = odd + 1;
     put(&o.seq.to_ne_bytes(), 0);
-    crate::timing::mark("maps published");
-    if std::env::var_os("FWE_MAPS_CLOSE").is_some() {
-        // SAFETY: fwe's own descriptor, forgotten with the outbox.
-        unsafe { libc::close(o.fd) };
-        *out = None;
-        crate::timing::mark("maps closed");
-    }
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
 }
 
 /// What [`snapshot`] encoded.

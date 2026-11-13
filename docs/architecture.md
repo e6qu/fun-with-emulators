@@ -164,6 +164,8 @@ fwe can show what a guest asks of it, much as `strace` does on Linux:
   enough to keep a run's timing.
 - `--strace-file=PATH` appends the trace of every process of the run to
   `PATH`, each line naming its process.
+- `FWE_TIMING=1` in fwe's environment prints how long each phase of a
+  start, an `execve` and a `fork` took, to standard error.
 - All are passed on across `execve` and `fork`. A failed code preparation
   is noted with its reason (no room for stubs, say) while the guest gets
   `ENOMEM`.
@@ -325,10 +327,14 @@ records Linux would keep about them:
   the guest did not ask for (code stubs, a guard page) is listed as
   anonymous with the host's protections, so a program looking for free
   space does not pick it.
-- **Other processes:** each process publishes its record in a shared
-  file beside its process record (a sequence word odd while it is
-  written) before its next system call that is not a memory call, and
-  before a `fork`, so a run of mapping calls publishes once. Another
+- **Other processes:** each process publishes its record in a file
+  beside its process record (a sequence word odd while it is written)
+  before its next system call that is not a memory call, and before a
+  `fork`, so a run of mapping calls publishes once. The file is written
+  with `pwrite` and closed after each publication: a process that ends
+  holding a file it wrote, or with dirty pages of one mapped, makes the
+  next process's first close of a file it wrote wait for the write-back
+  (milliseconds on a virtual machine's disk). Another
   process's `/proc/<pid>/maps` and `smaps` read it, with resident pages
   from the host (`proc_pidinfo`).
   `PROCMAP_QUERY` answers for any of them, with the mapped file's GNU

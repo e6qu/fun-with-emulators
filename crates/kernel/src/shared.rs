@@ -614,7 +614,6 @@ const YOUNG: std::time::Duration = std::time::Duration::from_secs(60);
 pub fn collect() {
     use std::os::unix::ffi::OsStrExt;
     let Ok(base) = crate::fs::shm::user_dir() else { return };
-    crate::timing::mark("user_dir");
     let marker = [&base[..], format!("/v{FORMAT}-collected").as_bytes()].concat();
     let marker = std::ffi::OsStr::from_bytes(&marker);
     let recent = std::fs::metadata(marker)

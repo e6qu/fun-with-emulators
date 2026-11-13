@@ -701,108 +701,6 @@ fn x18_survives_kernel_entry() -> bool {
     x18_survives(true)
 }
 
-/// Diagnostic probes of host behaviour, run one per process with
-/// How long one write of a new file in fwe's records directory takes, and
-/// its close, as this process takes on what a program's start does (see
-/// How long a fresh process's first close of a file in fwe's records
-/// directory takes, the file changed as `how` says (see `probe`).
-fn first_close_probe(how: &str) -> String {
-    let dir = fwe_kernel::procreg::records_dir()
-        .map(|d| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&d)))
-        .unwrap_or_else(std::env::temp_dir);
-    let p = std::ffi::CString::new(
-        dir.join(format!("first-{}", std::process::id())).as_os_str().as_bytes(),
-    )
-    .unwrap();
-    // SAFETY: plain host calls on a file of this probe's.
-    let (changed, closed) = unsafe {
-        let start = std::time::Instant::now();
-        let fd = libc::open(p.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
-        match how {
-            "write" => {
-                libc::pwrite(fd, [1u8; 200].as_ptr().cast(), 200, 0);
-            }
-            "mmap" => {
-                libc::ftruncate(fd, 16384);
-                let m = libc::mmap(
-                    std::ptr::null_mut(),
-                    16384,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                );
-                (m as *mut u8).write_bytes(1, 200);
-                libc::munmap(m, 16384);
-            }
-            "truncate" => {
-                libc::ftruncate(fd, 200);
-            }
-            _ => {}
-        }
-        let changed = start.elapsed().as_micros();
-        libc::close(fd);
-        let closed = start.elapsed().as_micros() - changed;
-        libc::unlink(p.as_ptr());
-        (changed, closed)
-    };
-    format!("first close after {how}: change {changed} us, close {closed} us")
-}
-
-/// `probe`).
-fn file_writes_probe() -> String {
-    use std::io::Write;
-    let dir = fwe_kernel::procreg::records_dir()
-        .map(|d| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&d)))
-        .unwrap_or_else(std::env::temp_dir);
-    let mut n = 0;
-    // One create-write-close, then a close alone of a file just written.
-    let mut once = |what: &str| -> String {
-        n += 1;
-        let f = dir.join(format!("probe-{}-{n}", std::process::id()));
-        let start = std::time::Instant::now();
-        let mut h = std::fs::File::create(&f).unwrap();
-        h.write_all(&[7u8; 200]).unwrap();
-        let written = start.elapsed().as_micros();
-        drop(h);
-        let closed = start.elapsed().as_micros() - written;
-        let _ = std::fs::remove_file(&f);
-        format!("{what}: write {written} us, close {closed} us\n")
-    };
-    let mut out = String::new();
-    out.push_str(&once("at start"));
-    out.push_str(&once("again"));
-    // SAFETY: plain host calls making mappings this probe keeps.
-    unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            1 << 30,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-    }
-    out.push_str(&once("after a 1 GiB reservation"));
-    // SAFETY: as above.
-    unsafe {
-        let p = libc::mmap(
-            std::ptr::null_mut(),
-            1 << 20,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        libc::mprotect(p, 1 << 20, libc::PROT_READ | libc::PROT_EXEC);
-    }
-    out.push_str(&once("after executable memory"));
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    trap::install_handlers();
-    out.push_str(&once("after fwe's signal handlers"));
-    out
-}
-
 /// `fwe --probe <name>`. Prints the result; a crash identifies the step.
 pub fn probe(name: &str) -> Result<String, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -833,20 +731,6 @@ pub fn probe(name: &str) -> Result<String, String> {
         .map(|_| "waited in mode".into()),
         // Creates a VM unless under --hv-standin (see hv::probe).
         "hv-map-rules" => hv::map_rules_probe(),
-        // What writing files costs this process here: in fwe's records
-        // directory and in a plain temporary one.
-        "file-writes" => Ok(file_writes_probe()),
-        // A fresh process's first close of a file it changed, by `write`,
-        // by a shared mapping, or by `ftruncate`; or of an empty one.
-        "first-close-write" | "first-close-mmap" | "first-close-truncate" | "first-close-empty" => {
-            Ok(first_close_probe(&name["first-close-".len()..]))
-        }
-        // The same after raising this thread's scheduling class, as a run
-        // does (`interactive`).
-        "first-close-write-qos" => {
-            interactive();
-            Ok(first_close_probe("write"))
-        }
         _ => Err(format!("unknown probe {name}")),
     }
 }
@@ -1150,7 +1034,6 @@ fn start(
     }
     let args = &guest_args(args, options);
     fwe_kernel::timing::mark("collect");
-
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
     fwe_kernel::timing::mark("open_fs");
@@ -1191,18 +1074,13 @@ fn start(
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
-        fwe_kernel::timing::mark("exe path");
         fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
-        fwe_kernel::timing::mark("proc info");
         fs.set_auxv(out.auxv.clone());
         fs.publish();
-        fwe_kernel::timing::mark("fs published");
         // The main thread's id equals the process id, as on Linux: in its
         // pid namespace, for a process exec'd in one.
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
-        fwe_kernel::timing::mark("main thread");
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
-        fwe_kernel::timing::mark("namespaces");
     });
     fwe_kernel::timing::mark("published");
     // A subreaper stays one across execve; a namespace's init is one.

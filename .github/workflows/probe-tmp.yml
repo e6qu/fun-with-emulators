@@ -17,44 +17,10 @@ jobs:
       - name: Timings
         run: |
           F=target/release/fwe
-          time (for i in $(seq 20); do $F --version >/dev/null; done)
           time (for i in $(seq 20); do ./bench-mac exit; done)
           time (for i in $(seq 20); do $F ./bench-linux exit; done)
           for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit; done
-          for i in 1 2; do FWE_TIMING=1 FWE_CLOSETEST=1 $F ./bench-linux exit; done
-          echo "== back to back"
-          for i in 1 2 3 4; do FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|maps'; done
-          echo "== maps closed after each publication"
-          for i in 1 2 3 4; do FWE_MAPS_CLOSE=1 FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|maps'; done
-          time (for i in $(seq 20); do $F ./bench-linux exit; done)
-          time (for i in $(seq 20); do FWE_MAPS_CLOSE=1 $F ./bench-linux exit; done)
-      - name: First closes
-        run: |
-          for k in 1 2 3; do for h in write write-qos mmap empty; do target/release/fwe --probe first-close-$h; done; done
-      - name: File writes from fwe
-        run: |
-          target/release/fwe --probe file-writes
-          target/release/fwe --probe file-writes
-      - name: File writes on this runner
-        run: |
-          python3 - <<'PY'
-          import os, time, tempfile
-          d = tempfile.mkdtemp()
-          def t(name, f, n=30):
-              s = time.perf_counter()
-              for i in range(n): f(i)
-              print(f"{name}: {(time.perf_counter()-s)/n*1e6:.0f} us")
-          t("create empty", lambda i: os.close(os.open(f"{d}/e{i}", os.O_CREAT|os.O_WRONLY, 0o600)))
-          def cw(i):
-              fd = os.open(f"{d}/w{i}", os.O_CREAT|os.O_WRONLY, 0o600); os.pwrite(fd, b"x"*200, 0); os.close(fd)
-          t("create+write+close", cw)
-          def rw(i):
-              fd = os.open(f"{d}/w{i}", os.O_WRONLY); os.pwrite(fd, b"y"*200, 0); os.close(fd)
-          t("rewrite existing", rw)
-          fd = os.open(f"{d}/keep", os.O_CREAT|os.O_RDWR, 0o600)
-          t("pwrite kept open", lambda i: os.pwrite(fd, b"z"*200, 0))
-          import mmap
-          os.ftruncate(fd, 4096); m = mmap.mmap(fd, 4096)
-          def mm(i): m[0:200] = b"q"*200
-          t("mmap store", mm)
-          PY
+          echo "== fork"
+          FWE_TIMING=1 $F ./bench-linux fork 3 2>&1 | tail -20
+          echo "== fork+exec"
+          FWE_TIMING=1 $F ./bench-linux forkexec 3 ./bench-linux 2>&1 | tail -40
