@@ -50,14 +50,15 @@ then makes that directory the program's `/`.
 
 A program inside the root is named by its path on the Mac. The
 environment is passed on as it is, so give the program a Linux one with
-`env -i`, as a login would. This guide uses a shell function for it:
+`env -i`, as a login would (`fwe` found first, on your `PATH`). This
+guide uses a shell function for it:
 
 ```sh
 # linux ROOT PROGRAM [ARGS...]: run PROGRAM (a path in ROOT) with ROOT as /.
 linux() {
-  root=$1 prog=$2; shift 2
+  root=$1 prog=$2 fwe=$(command -v fwe); shift 2
   env -i HOME=/root TERM="${TERM:-dumb}" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    fwe --root "$root" "$root$prog" "$@"
+    "$fwe" --root "$root" "$root$prog" "$@"
 }
 ```
 
@@ -145,7 +146,7 @@ Windows programs built for ARM64 run through Alpine's Wine, in the VM:
 ```sh
 linux ~/alpine /bin/sh -c 'apk add -q wine'
 cp winprog.exe ~/alpine/tmp/
-env -i HOME=/root PATH=/usr/bin:/bin fwe --vm --root ~/alpine ~/alpine/bin/sh \
+env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/alpine/bin/sh \
   -c 'wine wineboot --init && wine /tmp/winprog.exe'
 ```
 
