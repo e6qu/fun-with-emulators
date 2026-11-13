@@ -22,6 +22,12 @@ jobs:
           time (for i in $(seq 20); do $F ./bench-linux exit; done)
           for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit; done
           for i in 1 2; do FWE_TIMING=1 FWE_CLOSETEST=1 $F ./bench-linux exit; done
+          echo "== paused"
+          for i in 1 2 3; do sleep 1; FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|kernel'; done
+          echo "== back to back"
+          for i in 1 2 3; do FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|kernel'; done
+          echo "== after a probe process"
+          for i in 1 2 3; do $F --probe first-close-empty >/dev/null; FWE_TIMING=1 $F ./bench-linux exit 2>&1 | grep -E 'record: closed|kernel'; done
           FWE_TIMING=1 $F ./bench-linux forkexec 3 ./bench-linux
           $F ./bench-linux forkexec 20 ./bench-linux
           ./bench-mac forkexec 20 ./bench-mac
