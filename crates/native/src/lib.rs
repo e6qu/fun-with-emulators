@@ -293,6 +293,19 @@ pub(crate) fn guest_execfn(path: &Path, options: &Options) -> Vec<u8> {
     guest_path_in_root(path, options).unwrap_or_else(|| path.as_os_str().as_bytes().to_vec())
 }
 
+/// Take `dir`, which the fwe that re-executed this one passed on
+/// (`--user-dir`), as fwe's private directory, if it still is one: a
+/// directory of this user's that no one else can enter.
+pub fn adopt_user_dir(dir: &[u8]) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(dir)) else { return };
+    // SAFETY: getuid cannot fail.
+    let mine = m.uid() == unsafe { libc::getuid() };
+    if mine && m.is_dir() && m.mode() & 0o077 == 0 {
+        fwe_kernel::fs::adopt_host_dir(dir.to_vec());
+    }
+}
+
 /// This `fwe` executable, for re-executing it (see [`reexec`]).
 static FWE_EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
 
@@ -311,9 +324,10 @@ pub fn remember_exe() {
 /// keeps across its own: the pid, descriptors not marked close-on-exec (the
 /// guest's flag is the host's), the signal mask, pending signals and ignored
 /// dispositions; the root filesystem, working directory, `--strace`, `--vm`,
-/// `--hv-standin` and `--hv-record` are passed on, and a program with no
-/// path (a memfd) by descriptor (`--exe-fd`). Other threads end, as on Linux. Returns a Linux errno only if
-/// the program cannot be run; on success it does not return.
+/// `--hv-standin`, `--hv-record` and fwe's private directory are passed
+/// on, and a program with no path (a memfd) by descriptor (`--exe-fd`).
+/// Other threads end, as on Linux. Returns a Linux errno only if the
+/// program cannot be run; on success it does not return.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reexec(
     path: &[u8],
@@ -354,6 +368,12 @@ pub(crate) fn reexec(
     }
     argv.push(b"--cwd".to_vec());
     argv.push(fs.cwd().to_vec());
+    // fwe's private directory, which the new fwe would otherwise look up
+    // again (slowly).
+    if let Some(dir) = fwe_kernel::fs::host_dir() {
+        argv.push(b"--user-dir".to_vec());
+        argv.push(dir);
+    }
     argv.push(b"--exec-state".to_vec());
     argv.push(hex(state));
     if let Some(a0) = args.first() {
@@ -986,11 +1006,14 @@ fn start(
         fwe_kernel::shared::collect();
     }
     let args = &guest_args(args, options);
-    let data = read_program(path, options, &open_fs(options)?)?;
+    // The root filesystem; also used to find the dynamic linker.
+    let mut fs = open_fs(options)?;
+    let data = read_program(path, options, &fs)?;
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if needs_vm(&data) {
+        drop(fs);
         return Err(hv::run(path, &data, args, env, options));
     }
 
@@ -1000,9 +1023,6 @@ fn start(
     trap::set_tracing(tracer.enabled);
     let platform =
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
-
-    // The root filesystem; also used to find the dynamic linker.
-    let mut fs = open_fs(options)?;
 
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
@@ -1016,19 +1036,20 @@ fn start(
         page,
         options.strace,
     )?;
-    let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
-    fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
-    fs.set_auxv(out.auxv.clone());
-    fs.publish();
-
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(&platform, page)?;
-
-    // The main thread's id equals the process id, as on Linux: in its pid
-    // namespace, for a process exec'd in one.
-    fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
-    fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    // What the process's record tells of it, written once.
+    fwe_kernel::procreg::batch(|| {
+        let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options));
+        fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+        fs.set_auxv(out.auxv.clone());
+        fs.publish();
+        // The main thread's id equals the process id, as on Linux: in its
+        // pid namespace, for a process exec'd in one.
+        fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
+        fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    });
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();
 

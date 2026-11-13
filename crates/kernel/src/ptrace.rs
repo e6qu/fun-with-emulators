@@ -1052,6 +1052,23 @@ pub fn stop_status(sig: u64, event: i32) -> i32 {
     0x7f | ((sig as i32) << 8) | (event << 16)
 }
 
+/// Whether `name`, a file in fwe's private directory, is a mailbox or
+/// inbox of a process that is gone (left when it was killed).
+pub(crate) fn leftover(name: &[u8]) -> bool {
+    let Some(name) = std::str::from_utf8(name).ok() else { return false };
+    if let Some(tracer) = name.strip_prefix("ptrace-inbox-") {
+        return tracer.parse().is_ok_and(|pid: i32| pid > 0 && !alive(pid));
+    }
+    let Some(id) = name.strip_prefix("ptrace-").and_then(|n| n.parse::<i32>().ok()) else {
+        return false;
+    };
+    // A thread's mailbox is named by its tid: the process it says it is in.
+    open(&mailbox_name(id), false).is_some_and(|mb| {
+        let pid = proc_of(&mb);
+        pid <= 0 || !alive(pid)
+    })
+}
+
 // --- the tracer ----------------------------------------------------------------
 
 /// The host process a tracee's mailbox says it is in.
@@ -1867,6 +1884,29 @@ fn get_own_siginfo() -> Option<[u8; 128]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gone_process_leaves_its_mailboxes_to_be_collected() {
+        use std::os::unix::ffi::OsStrExt;
+        // A process that has ended (and been reaped).
+        let child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone = child.id() as i32;
+        let mut child = child;
+        child.wait().unwrap();
+        assert!(leftover(format!("ptrace-inbox-{gone}").as_bytes()));
+        assert!(!leftover(format!("ptrace-inbox-{}", me()).as_bytes()));
+        // A thread's mailbox, by the process it says it is in.
+        let id = 0x7ff0_0000 + (me() & 0xffff);
+        let mb = open(&mailbox_name(id), true).unwrap();
+        mb.word(W_PROC).store(me() as u64, Ordering::Release);
+        assert!(!leftover(&mailbox_name(id).as_bytes()[1..]));
+        mb.word(W_PROC).store(gone as u64, Ordering::Release);
+        assert!(leftover(&mailbox_name(id).as_bytes()[1..]));
+        let _ = std::fs::remove_file(std::ffi::OsStr::from_bytes(
+            path(&mailbox_name(id)).unwrap().to_bytes(),
+        ));
+        assert!(!leftover(b"ptrace-x"));
+    }
 
     #[test]
     fn a_step_follows_every_kind_of_branch() {

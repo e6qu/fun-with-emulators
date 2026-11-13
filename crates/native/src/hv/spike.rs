@@ -27,36 +27,15 @@ mod imp {
     use super::Spike;
     use std::os::raw::c_void;
 
-    // Hypervisor.framework, arm64. Only the handful of calls the spike needs.
-    #[allow(non_camel_case_types)]
-    type hv_return_t = i32;
-    #[allow(non_camel_case_types)]
-    type hv_vcpu_t = u64;
-    #[allow(non_camel_case_types)]
-    type hv_reg_t = u32;
-
-    #[repr(C)]
-    struct hv_vcpu_exit_exception_t {
-        syndrome: u64,
-        virtual_address: u64,
-        physical_address: u64,
-    }
-    #[repr(C)]
-    struct hv_vcpu_exit_t {
-        reason: u32,
-        exception: hv_vcpu_exit_exception_t,
-    }
-
-    const HV_EXIT_REASON_EXCEPTION: u32 = 1;
-
-    // hv_reg_t: X0..X30 = 0..30, then PC = 31, FPCR, FPSR, CPSR = 34.
-    const HV_REG_X0: hv_reg_t = 0;
-    const HV_REG_PC: hv_reg_t = 31;
-    const HV_REG_CPSR: hv_reg_t = 34;
-
-    const HV_MEMORY_READ: u64 = 1;
-    const HV_MEMORY_WRITE: u64 = 2;
-    const HV_MEMORY_EXEC: u64 = 4;
+    // Hypervisor.framework, arm64: the calls themselves, never the stand-in.
+    use crate::hv::ffi::framework::{
+        hv_vcpu_create, hv_vcpu_destroy, hv_vcpu_get_reg, hv_vcpu_run, hv_vcpu_set_reg,
+        hv_vm_create, hv_vm_destroy, hv_vm_map,
+    };
+    use crate::hv::ffi::{
+        HV_EXIT_REASON_EXCEPTION, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE, HV_REG_CPSR,
+        HV_REG_PC, HV_REG_X0, hv_reg_t, hv_return_t, hv_vcpu_exit_t, hv_vcpu_t,
+    };
 
     // ESR exception class for an `HVC` taken from AArch64.
     const EC_HVC: u64 = 0x16;
@@ -64,24 +43,6 @@ mod imp {
     const PSTATE_EL1H: u64 = 0x3c5;
     // The `HVC #0` instruction, used to tell whether PC still sits on it.
     const HVC_0: u32 = 0xd400_0002;
-
-    // SAFETY: these are the Hypervisor.framework entry points; each call below
-    // documents the arguments it passes.
-    #[link(name = "Hypervisor", kind = "framework")]
-    unsafe extern "C" {
-        fn hv_vm_create(config: *mut c_void) -> hv_return_t;
-        fn hv_vm_destroy() -> hv_return_t;
-        fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t;
-        fn hv_vcpu_create(
-            vcpu: *mut hv_vcpu_t,
-            exit: *mut *mut hv_vcpu_exit_t,
-            config: *mut c_void,
-        ) -> hv_return_t;
-        fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
-        fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
-        fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t;
-        fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;
-    }
 
     /// Guest-physical base the RAM is mapped at: deliberately low, in the
     /// region macOS's `__PAGEZERO` would deny to the native backend.

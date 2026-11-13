@@ -185,7 +185,8 @@ The pieces that do it:
 
 - `crates/native/src/rewrite.rs` scans a range word by word, rewrites
   `svc #0` in place, and builds a stub for each thread-pointer or `x18`
-  site;
+  site; a word with no 18 in any register field (bits 0, 5, 10 and 16),
+  nearly every one, is passed over without decoding;
 - `crates/native/src/decode.rs` decodes the operands of an instruction
   naming `x18`, so the stub can substitute a scratch register, adjust an
   `sp` offset or rebuild a PC-relative or branch form, and finds the forms
@@ -200,10 +201,13 @@ The pieces that do it:
   upwards with free space past the latest (in the gaps below, a library's
   code could find no stub region within reach); code mapped without a
   fixed address that still finds none is mapped again where there is
-  room. A large mapping left to fwe (64 MiB or more: a library's span,
-  reserved before its code is mapped over it at a fixed address) is placed
-  with room on both sides from the start, since code longer than a branch
-  reaches has sites that reach only room below it;
+  room. A large mapping left to fwe (64 MiB or more) that may hold code (a
+  file's, an inaccessible one, as a library's span is reserved before its
+  code is mapped over it at a fixed address, or an executable one) is
+  placed with room on both sides from the start, since code longer than a
+  branch reaches has sites that reach only room below it. Large data (a
+  heap, an arena) fills upwards with the rest: mappings side by side are
+  one host region, and a host fork's cost grows with the regions;
 - the kernel crate asks for preparation through
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
@@ -320,7 +324,10 @@ keeps:
   pid in fwe's private directory with the process's start time (so a
   record never outlives its process into another with the same pid),
   cgroup, namespaces, name, command line, program, ancestors, subreaper
-  flag, nice value, scheduling policy and `oom_score_adj`.
+  flag, nice value, scheduling policy and `oom_score_adj`. A record is
+  rewritten in place under its lock, framed with its length and a
+  checksum, so a reader (which takes no lock) rereads one caught
+  mid-write; a program's start writes its record once.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events));

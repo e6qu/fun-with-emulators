@@ -106,6 +106,12 @@ fn rewritable_x18(insn: u32) -> bool {
 /// Whether `insn` is any instruction naming `x18` that this pass rewrites —
 /// operand substitution, a PC-relative form, a branch, or an indirect branch.
 fn x18_site(insn: u32) -> bool {
+    // Most words name no x18, which the quick check tells.
+    crate::decode::may_name_x18(insn) && x18_form(insn)
+}
+
+/// [`x18_site`] by decoding alone.
+fn x18_form(insn: u32) -> bool {
     use crate::decode::*;
     rewritable_x18(insn)
         || x18_branch(insn)
@@ -1079,6 +1085,20 @@ mod tests {
         ]);
         let p = patch(&mut code, Some(&[(0, 8)]));
         assert_eq!(p.sites.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn the_quick_check_passes_every_x18_site() {
+        // A spread of words (every one of the 2^32 was checked once).
+        let mut w: u32 = 1;
+        for _ in 0..1 << 22 {
+            w = w.wrapping_mul(0x9e37_79b1).wrapping_add(0x7f4a_7c15);
+            for insn in
+                [w, w & !(0x1f << 5) | 18 << 5, w & !0x1f | 18, w & !(0x1f << 10) | 18 << 10]
+            {
+                assert!(crate::decode::may_name_x18(insn) || !x18_form(insn), "{insn:#010x}");
+            }
+        }
     }
 
     #[test]

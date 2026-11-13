@@ -1683,13 +1683,20 @@ impl<P: Platform> Kernel<P> {
                 haddr = at;
                 hflags |= libc::MAP_FIXED;
                 placed = true;
-            } else if addr == 0 && self.page_up(len) >= ROOMY_FROM {
-                // A large mapping may be a library's whole span, reserved
-                // before its code is mapped over it at a fixed address, as
-                // dynamic loaders do: code longer than a branch reaches
-                // needs room for stubs below it as well as above, which a
-                // fixed mapping cannot move to find. So it goes where there
-                // is room on both sides.
+            } else if addr == 0
+                && self.page_up(len) >= ROOMY_FROM
+                && (!anonymous || prot == mman::PROT_NONE || prot & mman::PROT_EXEC != 0)
+            {
+                // A large mapping of a file, or an inaccessible one, may be
+                // a library's whole span, reserved before its code is
+                // mapped over it at a fixed address, as dynamic loaders do;
+                // large executable memory is code itself. Code longer than
+                // a branch reaches needs room for stubs below it as well as
+                // above, which a fixed mapping cannot move to find. So it
+                // goes where there is room on both sides. Large data (a
+                // heap, an arena) fills upwards with the rest: mappings
+                // side by side are one host region, which each fork copies
+                // whole, not one each.
                 if let Some(at) = Self::roomy_place(self.page_up(len)) {
                     haddr = at;
                     hflags |= libc::MAP_FIXED;
