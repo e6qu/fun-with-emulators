@@ -573,12 +573,9 @@ impl Published {
 pub(crate) struct Outbox {
     pid: i32,
     fd: i32,
-    map: *mut u8,
-    cap: usize,
+    /// The sequence word as last written.
+    seq: u64,
 }
-
-// SAFETY: the mapping is this process's own, used under `OUTBOX`'s lock.
-unsafe impl Send for Outbox {}
 
 pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
 
@@ -614,11 +611,8 @@ fn drop_inherited(out: &mut Option<Outbox>) {
     if let Some(o) = out.as_ref()
         && o.pid != me
     {
-        // SAFETY: the mapping and descriptor are this process's copies.
-        unsafe {
-            libc::munmap(o.map.cast(), o.cap);
-            libc::close(o.fd);
-        }
+        // SAFETY: the descriptor is this process's copy.
+        unsafe { libc::close(o.fd) };
         *out = None;
     }
 }
@@ -675,9 +669,6 @@ pub fn flush() {
 
 /// Publish this process's mappings for other processes to read now.
 pub fn publish_now() {
-    if std::env::var_os("FWE_NO_MAPS").is_some() {
-        return;
-    }
     let body = snapshot();
     let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: getpid cannot fail.
@@ -698,51 +689,28 @@ pub fn publish_now() {
             return;
         }
         let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *out = Some(Outbox { pid: me, fd, map: std::ptr::null_mut(), cap: 0 });
+        *out = Some(Outbox { pid: me, fd, seq: 0 });
     }
     let Some(o) = out.as_mut() else { return };
-    let need = HEADER + body.len();
-    if need > o.cap {
-        let cap = need.next_power_of_two().max(1 << 16);
-        // SAFETY: fwe's own file; growing it keeps what it holds.
-        if unsafe { libc::ftruncate(o.fd, cap as libc::off_t) } != 0 {
-            return;
-        }
-        // SAFETY: a fresh shared mapping of the whole file.
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                cap,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                o.fd,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            return;
-        }
-        if !o.map.is_null() {
-            // SAFETY: the old mapping, replaced by the new one.
-            unsafe { libc::munmap(o.map.cast(), o.cap) };
-        }
-        o.map = map.cast();
-        o.cap = cap;
-    }
-    use std::sync::atomic::{AtomicU64, Ordering, fence};
-    // SAFETY: the mapping is `cap` bytes, at least `need`, page-aligned
-    // (so the words are aligned), and only this process writes it.
-    unsafe {
-        let seq = &*(o.map as *const AtomicU64);
-        let len = &*(o.map.add(8) as *const AtomicU64);
-        let s = seq.load(Ordering::Relaxed);
-        seq.store(s | 1, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        std::ptr::copy_nonoverlapping(body.as_ptr(), o.map.add(HEADER), body.len());
-        len.store(body.len() as u64, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        seq.store((s | 1) + 1, Ordering::Release);
-    }
+    // Written with `pwrite`, not through a shared mapping: a mapping's
+    // dirty pages are written back once the process has gone, and until
+    // they are the next process's first close of a file it wrote waits
+    // (milliseconds, on a virtual machine's disk).
+    let fd = o.fd;
+    let put = |bytes: &[u8], at: usize| {
+        // SAFETY: a buffer of its length, on fwe's own descriptor.
+        unsafe { libc::pwrite(fd, bytes.as_ptr().cast(), bytes.len(), at as libc::off_t) };
+    };
+    // The sequence word odd while the rest changes; the length and the
+    // body, which follow it, in one write; then even again.
+    let odd = o.seq | 1;
+    put(&odd.to_ne_bytes(), 0);
+    let mut rest = Vec::with_capacity(8 + body.len());
+    rest.extend_from_slice(&(body.len() as u64).to_ne_bytes());
+    rest.extend_from_slice(&body);
+    put(&rest, 8);
+    o.seq = odd + 1;
+    put(&o.seq.to_ne_bytes(), 0);
 }
 
 /// What [`snapshot`] encoded.

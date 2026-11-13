@@ -93,9 +93,6 @@ fn alive(pid: u64) -> bool {
 
 /// This process runs the program whose file is host `dev`, `ino`.
 pub fn running(dev: u64, ino: u64) {
-    if std::env::var_os("FWE_NO_TEXTBUSY").is_some() {
-        return;
-    }
     MY_DEV.store(dev, Ordering::Relaxed);
     MY_INO.store(ino, Ordering::Relaxed);
     let Some(t) = table() else { return };

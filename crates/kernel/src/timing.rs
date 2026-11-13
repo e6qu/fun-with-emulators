@@ -30,23 +30,6 @@ pub fn mark(name: &str) {
 
 #[cold]
 fn write_mark(name: &str) {
-    if std::env::var_os("FWE_CLOSETEST").is_some() && !name.starts_with("record") {
-        if let Some(dir) = crate::procreg::records_dir() {
-            use std::io::Write;
-            let p = std::path::PathBuf::from(
-                <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&dir),
-            )
-            .join(format!("closetest-{}", unsafe { libc::getpid() }));
-            let t = std::time::Instant::now();
-            if let Ok(mut f) = std::fs::File::create(&p) {
-                let _ = f.write_all(&[1u8; 200]);
-                drop(f);
-            }
-            let _ = std::fs::remove_file(&p);
-            let line = format!("  closetest after {name}: {}us\n", t.elapsed().as_micros());
-            unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-        }
-    }
     let Some(start) = START.get() else { return };
     let now = start.elapsed().as_nanos() as u64;
     let last = LAST.swap(now, Relaxed);
