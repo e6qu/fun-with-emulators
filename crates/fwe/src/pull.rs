@@ -8,12 +8,14 @@
 //! unprivileged unpacking loses, owners other than root and set-ID bits or
 //! modes that deny the owner, is kept as fwe keeps it for the guest
 //! ([`fwe_kernel::owners`], [`fwe_kernel::modes`]), and every file is
-//! given the user's own group, so that the guest sees root's. The result is
-//! a directory `fwe --root DIR` runs programs in.
+//! given the user's own group, so that the guest sees root's. As a
+//! container runtime does, it adds `/etc/resolv.conf` (the host's name
+//! servers) and `/etc/hosts` where the image has none. The result is a
+//! directory `fwe --root DIR` runs programs in.
 //!
 //! On a case-insensitive volume (macOS's default) two names that differ
-//! only in case would become one file: an image that has such names is
-//! refused there, before anything is unpacked.
+//! only in case would become one file: the later of such files is left
+//! out, and listed.
 
 use crate::json::Json;
 use crate::tarlist::{Entry, Kind};
@@ -158,6 +160,7 @@ fn pull_into(r: &Reference, dir: &Path, work: &Path) -> Result<(), String> {
         unpack(path, dir, &exclude)?;
         keep_metadata(dir, entries, &skipped)?;
     }
+    runtime_files(dir, &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())?;
     if !left_out.is_empty() {
         eprintln!(
             "fwe: {} is on a case-insensitive volume, where these files of the image would \
@@ -187,6 +190,31 @@ fn glob_escape(path: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// What a container runtime gives a container at its start, where the
+/// image has none: `/etc/resolv.conf`, with the host's name servers (from
+/// `host_resolv`, the host's own file), and `/etc/hosts` for `localhost`.
+fn runtime_files(dir: &Path, host_resolv: &str) -> Result<(), String> {
+    let etc = dir.join("etc");
+    std::fs::create_dir_all(&etc).map_err(|e| format!("{}: {e}", etc.display()))?;
+    let resolv: String = host_resolv
+        .lines()
+        .filter(|l| ["nameserver", "search", "domain", "options"].iter().any(|k| l.starts_with(k)))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let files = [
+        ("resolv.conf", resolv),
+        ("hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n".to_string()),
+    ];
+    for (name, text) in files {
+        let path = etc.join(name);
+        // Not where the image has one, even a link (Debian's may be one).
+        if std::fs::symlink_metadata(&path).is_err() {
+            std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The digest of the linux/arm64 image an index lists.
@@ -719,6 +747,22 @@ mod tests {
         assert_eq!(names("etc"), ["keep"]);
         assert_eq!(names("var/cache"), ["c"]);
         assert_eq!(names("usr"), ["x"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A root without the files a runtime gives a container gets them; an
+    /// image's own are kept.
+    #[test]
+    fn runtime_files_are_added_where_missing() {
+        let base = std::env::temp_dir().join(format!("fwe-pull-etc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::write(base.join("etc/hosts"), "mine\n").unwrap();
+        let host = "# a comment\nnameserver 10.0.0.1\nsearch example.org\nsortlist x\n";
+        runtime_files(&base, host).unwrap();
+        let read = |f: &str| std::fs::read_to_string(base.join(f)).unwrap();
+        assert_eq!(read("etc/resolv.conf"), "nameserver 10.0.0.1\nsearch example.org\n");
+        assert_eq!(read("etc/hosts"), "mine\n");
         let _ = std::fs::remove_dir_all(&base);
     }
 
