@@ -129,8 +129,9 @@ hardware.
   signs under the hardened runtime and notarizes with a Developer ID.
   Left: the Developer ID secrets (an owner's action, not code) and the
   first release, whose tag the formula names.
-- [ ] **User documentation:** installing, running programs and containers,
-  and what is not supported.
+- [x] **User documentation:** installing, running programs and containers,
+  and what is not supported ([docs/user-guide.md](docs/user-guide.md),
+  whose recipes CI runs as written).
 
 **Done when:** a user installs a release and runs a Debian or Alpine
 userland and podman with it, following the documentation.

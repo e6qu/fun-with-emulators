@@ -1569,6 +1569,52 @@ fn pulled_images_run() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// The user guide's tested recipes (`docs/user-guide.md`), run as written:
+/// each block marked `<!-- tested: NAME -->` runs in `bash` on the host
+/// (after the guide's `linux` function), in order, sharing a home
+/// directory, with `fwe` on the `PATH`, and must print what the `text`
+/// block after it shows. Only where `FWE_PULL_TESTS` is set (CI): they
+/// pull images and run their programs.
+#[test]
+fn user_guide_recipes() {
+    if !fetched_program_tests("FWE_PULL_TESTS") {
+        return;
+    }
+    let guide = std::fs::read_to_string(repo().join("docs/user-guide.md")).unwrap();
+    let block = |from: usize, fence: &str| -> Option<(String, usize)> {
+        let start = guide[from..].find(fence)? + from + fence.len();
+        let end = guide[start..].find("\n```")? + start;
+        Some((guide[start..end].trim_start_matches('\n').to_string(), end + 4))
+    };
+    let helper_at = guide.find("linux() {").expect("the guide's linux function");
+    let helper_start = guide[..helper_at].rfind("```sh").unwrap();
+    let (helper, _) = block(helper_start, "```sh").unwrap();
+    let home = std::env::temp_dir().join(format!("fwe-guide-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_fwe")).parent().unwrap().to_path_buf();
+    let mut at = 0;
+    let mut ran = Vec::new();
+    while let Some(i) = guide[at..].find("<!-- tested: ") {
+        let i = i + at;
+        let name = guide[i + 13..].split(' ').next().unwrap().to_string();
+        let (script, after) = block(i, "```sh").unwrap();
+        let (want, after) = block(after, "```text").unwrap();
+        at = after;
+        let mut cmd = Command::new("bash");
+        cmd.args(["-euo", "pipefail", "-c", &format!("{helper}\n{script}")]);
+        cmd.env_clear().env("HOME", &home);
+        cmd.env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()));
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(900));
+        eprintln!("--- guide {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(stdout(&out), format!("{want}\n"), "guide recipe {name}");
+        assert_eq!(out.status.code(), Some(0), "guide recipe {name}");
+        ran.push(name);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(ran, ["debian", "alpine", "podman"]);
+}
+
 /// Run `args` (a program of the root, then its arguments) in a copy of the
 /// `ptrace` manifest's Alpine root, with `/prog` the given program, if
 /// any: its output, and the root's file `keep` (if any) as it was left.
