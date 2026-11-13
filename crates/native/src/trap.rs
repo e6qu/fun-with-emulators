@@ -904,9 +904,9 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
-        // SAFETY: the guest was executing at the pc, and the words after it
-        // are read only if it is a stub's first.
-        let word = |a: u64| unsafe { insn(a) };
+        // Read as the host copies, which reports a hole rather than fault:
+        // the pc of an instruction-fetch fault is not mapped.
+        let word = |a: u64| read_host::<u32>(a);
         if let Some(site) = crate::rewrite::syscall_stub_site(word, ss.pc) {
             // A system call's stub could not save registers below the
             // guest's sp (none is needed for a system call: musl's thread

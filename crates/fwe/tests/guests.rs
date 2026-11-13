@@ -2927,7 +2927,29 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
     // On a failure, lighttpd's own account of it.
     let result = std::panic::catch_unwind(|| lighttpd_requests(port, &big));
     if let Err(e) = result {
+        let mut server = server;
+        let pipe = server.0.stderr.take();
         drop(server);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut err = String::new();
+            if let Some(mut p) = pipe {
+                let mut buf = [0u8; 65536];
+                while let Ok(n) = std::io::Read::read(&mut p, &mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    err.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let _ = tx.send(err.clone());
+                }
+            }
+        });
+        let mut err = String::new();
+        while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
+            err = e;
+        }
+        let lines: Vec<&str> = err.lines().collect();
+        eprintln!("--- fwe stderr tail:\n{}", lines[lines.len().saturating_sub(120)..].join("\n"));
         eprintln!(
             "--- lighttpd's error log:\n{}",
             std::fs::read_to_string(&log_path).unwrap_or_default()
