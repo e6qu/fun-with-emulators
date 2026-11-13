@@ -1,0 +1,40 @@
+name: probe-tmp
+on:
+  push:
+    branches: [m5-docs]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build -p fwe
+      - name: Debian name lookups
+        run: |
+          set -x
+          F=$PWD/target/debug/fwe
+          $F --pull debian:trixie $RUNNER_TEMP/debian 2>&1 | tail -3
+          cat $RUNNER_TEMP/debian/etc/resolv.conf
+          cat /etc/resolv.conf; scutil --dns | head -20
+          L() { env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$F" --strace-file=$RUNNER_TEMP/trace-$1.log --root $RUNNER_TEMP/debian $RUNNER_TEMP/debian/bin/bash -c "$2"; echo "exit $?"; }
+          L getent 'getent ahosts deb.debian.org' || true
+          L apt 'getent ahostsv4 deb.debian.org; su -s /bin/sh _apt -c "getent ahostsv4 deb.debian.org"' || true
+          L update 'apt-get update 2>&1 | tail -5' || true
+          ls -la $RUNNER_TEMP/*.log
+      - name: podman run
+        run: |
+          set -x
+          F=$PWD/target/debug/fwe
+          $F --pull alpine:3.24 $RUNNER_TEMP/alpine 2>&1 | tail -2
+          R=$RUNNER_TEMP/alpine
+          P() { env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin timeout ${T:-300} "$F" --strace-file=$RUNNER_TEMP/trace-podman-$1.log --root $R $R$2 "${@:3}"; echo "exit $?"; }
+          P apk /bin/sh -c 'apk add -q --no-progress podman' || true
+          printf '[storage]\ndriver = "overlay"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' > $R/etc/containers/storage.conf
+          printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > $R/etc/containers/containers.conf
+          T=400 P pull /usr/bin/podman pull docker.io/library/alpine:3.24 || true
+          T=300 P run /usr/bin/podman run --rm --network=none docker.io/library/alpine:3.24 echo hi || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-traces
+          path: ${{ runner.temp }}/trace-*.log
