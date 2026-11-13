@@ -523,8 +523,8 @@ fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {
 pub(crate) static TIDS_FD: Mutex<(i32, i32)> = Mutex::new((0, -1));
 
 /// Publish this process's threads, for another process to list
-/// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): only
-/// while it has more than its main thread. The list is a count and the
+/// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): from
+/// when it first has more than its main thread. The list is a count and the
 /// tids, written whole at once on a descriptor kept open, so a reader sees
 /// one list or the other.
 fn publish_tids(tids: &[i32]) {
@@ -539,15 +539,11 @@ fn publish_tids(tids: &[i32]) {
         unsafe { libc::close(kept.1) };
         *kept = (me, -1);
     }
-    if tids.len() <= 1 {
-        if kept.1 >= 0 {
-            // SAFETY: closing the descriptor kept for the list.
-            unsafe { libc::close(kept.1) };
-            *kept = (me, -1);
-        }
-        let _ = std::fs::remove_file(
-            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path),
-        );
+    // A process that never had another thread has no list; one that had
+    // keeps its file, with the main thread alone in it again (making and
+    // removing it for each thread a program starts and joins cost more
+    // than the thread). The collector removes it once the process is gone.
+    if tids.len() <= 1 && kept.1 < 0 {
         return;
     }
     if kept.1 < 0 {
