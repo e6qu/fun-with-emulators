@@ -2,6 +2,8 @@
 //! this macOS process, with system calls redirected to the kernel layer.
 
 pub mod decode;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod gate;
 pub mod hv;
 pub mod hwcap;
 pub mod loader;
@@ -467,6 +469,15 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// The address of the system-call gate rewritten system calls call
+/// ([`gate`]), or 0 where there is none (they trap instead).
+pub fn syscall_gate() -> u64 {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return gate::address();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    0
+}
 
 /// The host TSD slot holding the guest thread pointer, as a byte offset
 /// from the TSD base that `TPIDRRO_EL0` points to.

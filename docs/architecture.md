@@ -76,8 +76,9 @@ flowchart TD
 
 ## System calls
 
-A system call starts in a backend: the native backend's trap handler or
-the VM's run loop catches the guest's `svc`, reads the number and
+A system call starts in a backend: the native backend's system-call gate
+(or its trap handler) or the VM's run loop catches the guest's `svc`,
+reads the number and
 arguments from the guest's registers, and hands them to the kernel crate
 (the path from `svc` to the host is drawn in
 [linux-on-macos.md](linux-on-macos.md#system-call-entry)). Seccomp
@@ -146,9 +147,9 @@ fwe can show what a guest asks of it, much as `strace` does on Linux:
 
 The native backend (`crates/native`) runs guest code in the fwe process.
 Its parts are the loader, the code preparation that rewrites guest
-instructions, the trap handlers that turn host signals into system calls,
-signals and faults for the guest, and the machinery for threads and
-`fork`.
+instructions, the system-call gate guest code calls, the trap handlers
+that turn host signals into system calls, signals and faults for the
+guest, and the machinery for threads and `fork`.
 
 ### Loading
 
@@ -244,6 +245,39 @@ return itself. A call that neither waits nor touches guest memory
 (`getpid`, `brk`, `mmap` and the like, outside `--strace`) runs with them
 still blocked, two host calls fewer; a signal that arrives meanwhile is
 delivered as the handler returns, before the guest's next instruction.
+
+### The system-call gate
+
+A rewritten `svc #0` calls the gate (`crates/native/src/gate.rs`) through
+a stub of its own; the trap is the way only for what the gate does not
+finish itself (see
+[linux-on-macos.md](linux-on-macos.md#system-calls-svc-calls-fwes-gate)):
+
+- **State:** each guest thread has a block (the guest's `Regs`, where the
+  stub returns to, an `active` flag and a count of signals recorded for
+  it) and a gate stack of 1 MiB, mapped as it first enters guest code
+  (`trap::prepare_guest_entry`); a TSD slot points to the block. A forked
+  child keeps its copy.
+- **The mask:** the gate changes no signal mask. Guest code runs under the
+  host mask its guest mask calls for, and so does the call, as a
+  handler's system call does once it unblocks the guest's signals.
+- **Plain calls only:** the Rust half (`trap::fwe_gate_call`) runs a call
+  through `Kernel::enter_syscall` or `fwe_kernel::blocking_syscall`, as
+  the trap does, unless the run is traced (`--strace`, `PTRACE_SYSCALL`),
+  a seccomp filter is set, or the call is one the trap runs its own way
+  (`exit`, `execve`, `clone`, `wait4`, `waitid`, `pidfd_getfd`, the IPC
+  waits, `rt_sigtimedwait`). It returns straight to the guest only when
+  the call changed nothing but `x0` (the pc past the site, the same `sp`,
+  registers, flags and mask) and nothing is to be delivered; otherwise
+  the gate takes the trap (`brk #0x4c5a`), whose handler installs the
+  state in the block, delivering what is pending.
+- **Signals:** a host signal is the guest's to take at once only where
+  the thread is in guest code: not in the gate's instructions, nor while
+  the block is active. Elsewhere it is recorded and counted; the call
+  looks for one to deliver as it ends, and the gate's way out compares
+  the count with the one the call saw. A signal landing on the way out
+  restarts it (`gate::rewind`), so it is seen there, not left pending
+  until the thread's next call.
 
 ## Memory bookkeeping
 

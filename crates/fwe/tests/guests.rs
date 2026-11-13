@@ -3359,6 +3359,14 @@ fn tgkill_interrupts_one_thread() {
     );
 }
 
+/// A signal sent to a thread making system calls back to back is taken as
+/// the call it lands in ends, also when it lands as the call returns
+/// through the gate: none is left pending until the thread's next call.
+#[test]
+fn signals_landing_as_calls_end_are_taken() {
+    assert_eq!(signals("busy-calls"), "left pending: 0\n");
+}
+
 /// A real-time signal (no host equivalent) sent to the process itself.
 #[test]
 fn realtime_signal_to_self() {

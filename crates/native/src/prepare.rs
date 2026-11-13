@@ -136,20 +136,60 @@ pub unsafe fn prepare(
         // of its code is code all the same.
         .filter(|r| r.iter().map(|&(_, l)| l).sum::<u64>() * 2 >= len);
     let patched = rewrite::patch(code, known.as_deref());
-    let stats = Prepared {
-        syscalls: patched.syscalls,
-        stubs: patched.sites.len(),
-        x18_deferred: patched.x18_deferred,
-    };
+    // A system call's site calls the gate through a stub, where there is
+    // one; it is already the trap otherwise.
+    let gate = crate::syscall_gate();
+    let all: Vec<(u64, Site)> = patched
+        .sites
+        .iter()
+        .filter_map(|&(off, site)| match site {
+            Site::Syscall { .. } if gate == 0 => None,
+            Site::Syscall { .. } => Some((off, Site::Syscall { gate })),
+            _ => Some((off, site)),
+        })
+        .collect();
+    let mut stats =
+        Prepared { syscalls: patched.syscalls, stubs: 0, x18_deferred: patched.x18_deferred };
 
-    let mut sites = patched.sites.as_slice();
+    let mut sites = all.as_slice();
     while let Some(&(first, _)) = sites.first() {
         let n = sites.iter().take_while(|(off, _)| off - first < GROUP_SPAN).count();
         let (group, rest) = sites.split_at(n);
         // SAFETY: the sites lie inside the caller's range.
-        unsafe {
+        let placed = unsafe {
             redirect(start, group, slot, x18_slot, page, start, start + len, arena.as_deref_mut())
-        }?;
+        };
+        match placed {
+            Ok(()) => stats.stubs += group.len(),
+            Err(e) => {
+                // With no room for stubs, system calls keep the trap; the
+                // other sites need theirs.
+                let needed: Vec<(u64, Site)> = group
+                    .iter()
+                    .copied()
+                    .filter(|(_, site)| !matches!(site, Site::Syscall { .. }))
+                    .collect();
+                if needed.len() == group.len() {
+                    return Err(e);
+                }
+                if !needed.is_empty() {
+                    // SAFETY: as above.
+                    unsafe {
+                        redirect(
+                            start,
+                            &needed,
+                            slot,
+                            x18_slot,
+                            page,
+                            start,
+                            start + len,
+                            arena.as_deref_mut(),
+                        )
+                    }?;
+                    stats.stubs += needed.len();
+                }
+            }
+        }
         sites = rest;
     }
     if stats.syscalls + stats.stubs > 0 {
@@ -347,19 +387,32 @@ mod tests {
         }
         // SAFETY: the mapping is ours, writable and not executing.
         let stats = unsafe { prepare(code, 12, 8, 16, page, None, None) }.unwrap();
-        assert_eq!(stats, Prepared { syscalls: 1, stubs: 2, x18_deferred: 0 });
+        // The system call has a stub where there is a gate to call.
+        let gate = crate::syscall_gate();
+        let stubs = if gate == 0 { 2 } else { 3 };
+        assert_eq!(stats, Prepared { syscalls: 1, stubs, x18_deferred: 0 });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };
-        assert_eq!(read(code + 4), rewrite::TRAP);
-        for site in [code, code + 8] {
+        let stub_of = |site: u64| {
             let b = read(site);
             assert_eq!(b & 0xfc00_0000, 0x1400_0000, "site is a branch");
             let offset = (((b & 0x03ff_ffff) << 6) as i32 >> 4) as i64;
-            let stub = (site as i64 + offset) as u64;
+            (site as i64 + offset) as u64
+        };
+        for site in [code, code + 8] {
+            let stub = stub_of(site);
             // The stub ends with a branch back to the instruction after the site.
             let words = if site == code { 4 } else { 6 };
             let back = read(stub + 4 * (words - 1));
             assert_eq!(rewrite::branch(stub + 4 * (words - 1), site + 4), Some(back));
+        }
+        if gate == 0 {
+            assert_eq!(read(code + 4), rewrite::TRAP);
+        } else {
+            // Its stub calls the gate, then branches back past it.
+            let stub = stub_of(code + 4);
+            assert_eq!(read(stub + 24) as u64 | (read(stub + 28) as u64) << 32, gate);
+            assert_eq!(rewrite::branch(stub + 16, code + 8), Some(read(stub + 16)));
         }
     }
 }
