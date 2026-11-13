@@ -1,0 +1,30 @@
+diff --git a/crates/kernel/src/procreg.rs b/crates/kernel/src/procreg.rs
+index 8d709e4..020fb95 100644
+--- a/crates/kernel/src/procreg.rs
++++ b/crates/kernel/src/procreg.rs
+@@ -375,20 +375,12 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
+ /// whole record from one being written, and from an older one's longer
+ /// tail.
+ fn write(pid: i32, r: &ProcRecord) {
+-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
++    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let Some(p) = path(pid) else { return };
+-    let bytes = frame(&encode(r));
+-    let Ok(f) = std::fs::OpenOptions::new()
+-        .write(true)
+-        .create(true)
+-        .truncate(false)
+-        .mode(0o600)
+-        .open(OsStr::from_bytes(&p))
+-    else {
+-        return;
+-    };
+-    // An older record's longer tail stays, past the frame.
+-    let _ = f.write_all_at(&bytes, 0);
++    let tmp = [&p[..], format!(".{}.{}.tmp", me(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).as_bytes()].concat();
++    if std::fs::write(OsStr::from_bytes(&tmp), frame(&encode(r))).is_ok() {
++        let _ = std::fs::rename(OsStr::from_bytes(&tmp), OsStr::from_bytes(&p));
++    }
+ }
+ 
+ /// Hold host process `pid`'s record's lock while the result lives.

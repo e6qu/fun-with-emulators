@@ -1,0 +1,24 @@
+name: Probe (temporary)
+on:
+  push:
+    branches: [m5-exec]
+jobs:
+  fork-maps:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          git worktree add -q wt-main origin/main
+          git worktree add -q wt-head HEAD
+          git worktree add -q wt-rename HEAD
+          (cd wt-rename && git apply ../tools/probe-tmp/rename.patch)
+          for c in main head rename; do
+            (cd wt-$c && CARGO_TARGET_DIR=$PWD/../tgt cargo build -q -p fwe && cp ../tgt/debug/fwe ../fwe-$c)
+          done
+      - run: |
+          chmod +x tools/probe-tmp/f14b
+          for round in 1 2; do for c in main head rename; do
+            echo "== $c round $round: $(./fwe-$c tools/probe-tmp/f14b 3000)"
+          done; done
