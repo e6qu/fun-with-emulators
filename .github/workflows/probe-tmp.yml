@@ -19,10 +19,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: probe-bench }
       - run: cargo build --release -p fwe
-      - run: clang -O2 -dynamiclib -o interp.dylib tools/probe-tmp/interp.c
+      - run: clang -O2 -dynamiclib -o interp.dylib tools/probe-tmp/interp.c && clang -O2 -o ct4 tools/probe-tmp/ct4.c
       - run: |
           chmod +x bench
           sysctl -n machdep.cpu.brand_string hw.ncpu; uptime
+          for i in 1 2 3; do ./ct4 $(getconf DARWIN_USER_TEMP_DIR); done
+          ps -Ao pcpu,comm -r | head -8
           python3 - <<'PY'
           import subprocess,time
           for cmd in (["target/release/fwe","--version"],["/usr/bin/true"],["target/release/fwe","./bench","exit"]):
@@ -35,5 +37,5 @@ jobs:
           FWE_T=1 target/release/fwe ./bench forkexec 4 $PWD/bench 2>&1 | grep -E "f |exec|x |exit" | sed -E 's/\[t\] +//' | awk '{printf "%.2f %s %s\n", $1-p, $3, $4; p=$1}'
           FWE_T=1 target/release/fwe ./bench fork 4 2>&1 | grep -E "f |exit" | sed -E 's/\[t\] +//' | awk '{printf "%.2f %s %s\n", $1-p, $3, $4; p=$1}'
           for i in 1 2 3; do DYLD_INSERT_LIBRARIES=$PWD/interp.dylib FWE_T=1 target/release/fwe ./bench exit 2>&1 | grep -v mkdir | sed -n '/initmain/,$p'; echo; done
-          target/release/fwe --strace ./bench exit 2>&1 | head -40
+          for i in 1 2 3; do FWE_T=1 target/release/fwe --strace ./bench exit 2>&1 | grep -v "^\[t\].* ms  " | tail -22; done
           for i in 1 2 3; do target/release/fwe ./bench forkexec 50 $PWD/bench; target/release/fwe ./bench getpid 100000; target/release/fwe ./bench fork 100; done

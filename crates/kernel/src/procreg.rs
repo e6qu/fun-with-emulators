@@ -347,8 +347,9 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
 
 /// Write the record of host process `pid`, under its lock ([`change`]): in
 /// place, framed with its length and checksum, for readers (who take no
-/// lock) to tell a record being written from a whole one. A new file costs
-/// the host far more than rewriting one.
+/// lock) to tell a record being written from a whole one, and what follows
+/// it from the record. A new file costs the host far more than rewriting
+/// one.
 fn write(pid: i32, r: &ProcRecord) {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
@@ -362,11 +363,8 @@ fn write(pid: i32, r: &ProcRecord) {
     else {
         return;
     };
-    // The new record first, then the old one's longer tail cut off (which
-    // the frame leaves out meanwhile).
-    if f.write_all_at(&bytes, 0).is_ok() {
-        let _ = f.set_len(bytes.len() as u64);
-    }
+    // An older record's longer tail stays, past the frame.
+    let _ = f.write_all_at(&bytes, 0);
 }
 
 /// Hold host process `pid`'s record's lock while the result lives.
