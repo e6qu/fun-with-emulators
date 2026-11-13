@@ -118,13 +118,16 @@ pub(crate) fn detached_synthetic(fd: i32) -> Option<(crate::mounts::FsType, Vec<
 
 /// `fd` is closed: a context or tree it was the last descriptor of goes.
 pub fn closed(fd: i32) {
-    if fdmarks::shared_elsewhere(fd) {
+    // The mark first: most descriptors are neither, and finding another
+    // descriptor of the same file lists them all.
+    let (context, tree) = (context_key(fd), tree_key(fd));
+    if (context.is_none() && tree.is_none()) || fdmarks::shared_elsewhere(fd) {
         return;
     }
-    if let Some(k) = context_key(fd) {
+    if let Some(k) = context {
         with(&CONTEXTS, |m| m.remove(&k));
     }
-    if let Some(k) = tree_key(fd) {
+    if let Some(k) = tree {
         // Not while another descriptor of the tree is open: fwe's own of a
         // program run through it (`/proc/self/exe`) is one.
         let open = |o: i32| {

@@ -858,7 +858,8 @@ mechanisms. A call not listed here is not dispatched and fails with
 #### File calls
 
 fwe resolves every guest path itself and hands the host one component to
-open from a directory it holds ([Files and descriptors](#files-and-descriptors));
+open from a directory it holds, or a run of components the host must
+follow no link in ([Files and descriptors](#files-and-descriptors));
 the descriptor the host returns is the guest's, so I/O goes to the host on
 it directly. fwe steps in for descriptors it stands in for (`/proc` and
 `/sys` files, loop devices, eventfd and the like), for metadata the host

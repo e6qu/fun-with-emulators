@@ -226,7 +226,21 @@ pub fn opened(
     fstype: FsType,
     ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 ) {
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some(id) = identity(fd) else { return };
+    opened_as(fd, id, ns_path, mount, flags, fstype, ovl);
+}
+
+/// [`opened`], for a descriptor whose file (`dev`, `ino`) the caller has
+/// looked at already.
+pub fn opened_as(
+    fd: i32,
+    (dev, ino): (u64, u64),
+    ns_path: Vec<u8>,
+    mount: u32,
+    flags: u64,
+    fstype: FsType,
+    ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
+) {
     let origin = Some(Origin { mount, flags, fstype, ns_path, ovl, stand_in: None });
     let mut r = records();
     let mark = kept(&r, fd, dev, ino).and_then(|rec| rec.mark);
@@ -398,7 +412,17 @@ pub fn proc_link(fd: i32) -> Option<Vec<u8>> {
 
 /// What `fd` stands in for, if anything.
 pub fn marked(fd: i32) -> Option<Mark> {
-    record(fd)?.mark
+    if !any_marks() {
+        return None;
+    }
+    // The mark first: most records have none, and the check that `fd`
+    // still names the file asks the host.
+    let (mark, dev, ino) = {
+        let r = records();
+        let rec = r.get(&fd)?;
+        (rec.mark?, rec.dev, rec.ino)
+    };
+    (identity(fd) == Some((dev, ino))).then_some(mark)
 }
 
 /// Every marked descriptor, with its mark (whether or not it is still

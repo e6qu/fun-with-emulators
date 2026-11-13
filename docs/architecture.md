@@ -628,6 +628,13 @@ the guest's reach, and translates what comes back.
   symlinks followed by fwe (absolute targets re-rooted), mounts entered,
   `..` clamped at the process's root. `*at` calls start from where their
   descriptor was opened.
+- A run of plain names that crosses no mount is looked up in one host
+  `openat` (`O_NOFOLLOW_ANY`, opened to search, not to read), and a
+  `stat` of an absolute path under no mount but the root's in one
+  `fstatat` from the root (`AT_SYMLINK_NOFOLLOW_ANY`). The host refuses
+  either where a link is on the way, and fwe then walks name by name. An
+  `openat` resolves its path once: the look for a FIFO to wait for,
+  without the kernel lock, hands its resolution to the open.
 - Every open file remembers the mount it came through
   (`crates/kernel/src/fdmarks.rs`), followed through `dup`, `close`,
   `fork` and `execve` and dropped once the descriptor names another file:

@@ -94,6 +94,21 @@ pub fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A path the host looks up in one call ([`Fs::direct`]).
+pub struct Direct {
+    /// The rootfs's descriptor, which the [`Fs`] owns.
+    pub dir: i32,
+    /// The path below it.
+    pub name: CString,
+    pub mount_id: u32,
+    pub fstype: FsType,
+}
+
+/// `fstatat`'s flag that refuses to follow a link anywhere in the path (a
+/// last one is looked at itself). `libc` does not have it.
+#[cfg(target_os = "macos")]
+pub const AT_SYMLINK_NOFOLLOW_ANY: i32 = 0x0800;
+
 /// A resolved path: the directory holding the final component, and its name.
 pub struct Resolved {
     pub dir: OwnedFd,
@@ -1335,7 +1350,11 @@ impl Fs {
             // `AT_EMPTY_PATH` acts on its descriptor before resolving.
             return Err(errno::ENOENT);
         }
-        let r = resolve_in(&self.view(), dirfd, path, follow_final)?;
+        let view = self.view();
+        let r = match ahead::take(&view, dirfd, path, follow_final) {
+            Some(r) => r,
+            None => resolve_in(&view, dirfd, path, follow_final)?,
+        };
         // A mount marked to expire (`MNT_EXPIRE`) is in use again (but by
         // the lookup of an unmount's own target).
         let t = self.mnt.table();
@@ -1357,6 +1376,49 @@ impl Fs {
             }
         }
         Ok(r)
+    }
+
+    /// `path` (absolute) as the host can look it up in one call from the
+    /// rootfs's descriptor, finding what a walk name by name would: the
+    /// descriptor, the path below it, and the mount it is in (its id and
+    /// type). Only for a path of plain names under none of the process's
+    /// mounts but the root one, with no `..` and no trailing `/`, outside
+    /// `/dev` (whose standard nodes are the host's), in a rootfs whose
+    /// directories need no search permission checked. The caller asks the
+    /// host not to follow any link on the way (`AT_SYMLINK_NOFOLLOW_ANY`),
+    /// and walks after all when the host meets one.
+    pub fn direct(&self, path: &[u8]) -> Option<Direct> {
+        if path.first() != Some(&b'/') || path.last() == Some(&b'/') {
+            return None;
+        }
+        let names = components(path);
+        let first = names.first()?;
+        if first == b"dev" || names.iter().any(|c| c == b"..") {
+            return None;
+        }
+        let v = self.view();
+        if access_checked(&v) {
+            return None;
+        }
+        let table = self.mnt.table();
+        if !table.expiring.is_empty() {
+            return None;
+        }
+        let (m, rest) = table.locate(v.proc_root);
+        let rootfs = matches!(&m.source, Source::Host(base) if base == v.root_host);
+        if !rest.is_empty() || !components(&m.root).is_empty() || !rootfs {
+            return None;
+        }
+        let top = mounts::join(v.proc_root, first);
+        if table.mounts.iter().any(|o| o.id != m.id && mounts::under(&o.point, &top).is_some()) {
+            return None;
+        }
+        Some(Direct {
+            dir: v.root,
+            name: cstr(&names.join(&b'/')).ok()?,
+            mount_id: m.id,
+            fstype: m.fstype,
+        })
     }
 
     /// Whether the guest's root is the host's own (no root filesystem).
@@ -1869,6 +1931,84 @@ pub(crate) fn guest_stat_at(dir: i32, name: &std::ffi::CStr) -> Option<libc::sta
     st
 }
 
+/// The directory reached from `here` by the plain names `comp` and those
+/// on top of `pending` (a stack: the next name last), in one host lookup:
+/// with its mount and namespace path, and how many names it took. The run
+/// stops before a `..` and before the last name, which the caller looks up
+/// itself; it takes in no mount, and the host follows no link in it
+/// (`O_NOFOLLOW_ANY`), so the lookup is the one the walk would make name by
+/// name. `None` when it cannot be taken (the caller then walks).
+fn plain_run(
+    table: &mounts::Table,
+    here: &Here,
+    comp: &[u8],
+    pending: &[Vec<u8>],
+) -> Option<(OwnedFd, (u32, Vec<u8>), usize)> {
+    if here.phantom || here.ovl.is_some() {
+        return None;
+    }
+    plain_run_from(table, here.dir.as_raw_fd(), here.at.as_ref()?, comp, pending)
+}
+
+/// [`plain_run`] from directory `dir`, which is `at` (its mount and
+/// namespace path).
+fn plain_run_from(
+    table: &mounts::Table,
+    dir: i32,
+    at: &(u32, Vec<u8>),
+    comp: &[u8],
+    pending: &[Vec<u8>],
+) -> Option<(OwnedFd, (u32, Vec<u8>), usize)> {
+    #[cfg(target_os = "macos")]
+    {
+        if comp == b".." || pending.is_empty() {
+            return None;
+        }
+        let (id, ns) = at;
+        // The names before the last one, up to a `..`.
+        let names: Vec<&[u8]> = std::iter::once(comp)
+            .chain(pending[1..].iter().rev().map(Vec::as_slice))
+            .take_while(|c| *c != b"..")
+            .collect();
+        let mut end = ns.clone();
+        for c in &names {
+            end = mounts::join(&end, c);
+        }
+        // No mount on the way, nor at its end.
+        if table.mounts.iter().any(|m| {
+            mounts::under(&m.point, ns).is_some_and(|r| !r.is_empty())
+                && mounts::under(&end, &m.point).is_some()
+        }) {
+            return None;
+        }
+        let rel = cstr(&names.join(&b'/')).ok()?;
+        // SAFETY: opening a directory relative to a live one; the result
+        // is checked and owned.
+        let fd = unsafe {
+            libc::openat(dir, rel.as_ptr(), DIR_OPEN | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` is a fresh owned descriptor.
+        let dir = unsafe { OwnedFd::from_raw_fd(fd) };
+        Some((dir, (*id, end), names.len()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (table, dir, at, comp, pending);
+        None
+    }
+}
+
+/// Whether each step of a lookup in view `v` checks search permission:
+/// for a caller that does not pass permission bits, in a root filesystem
+/// (the host's own directories, without one, are searched as the host user
+/// searches them: they are all its own).
+fn access_checked(v: &View) -> bool {
+    !crate::creds::access().searches_any() && v.root_host != b"/"
+}
+
 /// Resolve `path` relative to `dirfd` in the view `v`: the work of
 /// [`Fs::resolve`], also done for the socket calls that run without the
 /// kernel lock ([`resolve_host`]).
@@ -1949,14 +2089,39 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             Err(e) => Err(e),
         }
     };
-    let (mut here, path) = match (path.first() == Some(&b'/'), dirfd as i64 == fcntl::AT_FDCWD) {
-        (true, _) => (enter(&root_ns)?, path.to_vec()),
-        (false, true) => (enter(&to_ns(v.proc_root, v.cwd))?, path.to_vec()),
+    // An absolute path whose first names are plain is looked up from the
+    // rootfs's own descriptor, with no copy of it made.
+    let mut pending = components(path);
+    pending.reverse();
+    let from_root = || {
+        let (m, rest) = table.locate(&root_ns);
+        let at_top = rest.is_empty() && components(&m.root).is_empty();
+        let rootfs = matches!(&m.source, Source::Host(base) if base == v.root_host);
+        if !at_top || !rootfs || access_checked(v) {
+            return None;
+        }
+        let comp = pending.last()?;
+        plain_run_from(
+            &table,
+            v.root,
+            &(m.id, root_ns.clone()),
+            comp,
+            &pending[..pending.len() - 1],
+        )
+    };
+    let start = if path.first() == Some(&b'/') { from_root() } else { None };
+    let mut here = match (path.first() == Some(&b'/'), dirfd as i64 == fcntl::AT_FDCWD) {
+        (true, _) if let Some((dir, at, n)) = start => {
+            pending.truncate(pending.len() - n);
+            Here { dir, at: Some(at), phantom: false, ovl: None }
+        }
+        (true, _) => enter(&root_ns)?,
+        (false, true) => enter(&to_ns(v.proc_root, v.cwd))?,
         _ => {
             // From a directory descriptor: where it is, when fwe can tell
             // and it is inside the process's root; a directory of an
             // overlay is the overlay's, wherever the mount has gone.
-            let here = match overlay_here(&table, &root_ns, dirfd)? {
+            match overlay_here(&table, &root_ns, dirfd)? {
                 Some(here) => here,
                 None => {
                     // A path relative to something that is not a directory
@@ -1977,13 +2142,10 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
                     Here { dir, at, phantom: false, ovl: None }
                 }
-            };
-            (here, path.to_vec())
+            }
         }
     };
     let mut ancestors: Vec<Here> = Vec::new();
-    let mut pending = components(&path);
-    pending.reverse();
     let mut symlinks = 0;
     // The resolution of the name `name` in `here`.
     let done = |here: Here, name: Vec<u8>, mount_root: bool| -> Result<Resolved, i32> {
@@ -2041,8 +2203,20 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     // (the host's own directories, without one, are searched as the host
     // user searches them: they are all its own).
     let access = crate::creds::access();
-    let check_search = !access.searches_any() && v.root_host != b"/";
+    let check_search = access_checked(v);
+    // Whether to try a run of plain names in one host lookup (see
+    // `plain_run`); off once one failed, until a link is followed.
+    let mut whole_runs = !check_search;
     while let Some(comp) = pending.pop() {
+        if whole_runs && let Some((dir, at, n)) = plain_run(&table, &here, &comp, &pending) {
+            pending.truncate(pending.len() + 1 - n);
+            // `..` from here enters its parent by its path: no link led
+            // here.
+            ancestors.clear();
+            here = Here { dir, at: Some(at), phantom: false, ovl: None };
+            continue;
+        }
+        whole_runs = false;
         if check_search
             && !here.phantom
             && let Some(st) = guest_stat(here.dir.as_raw_fd())
@@ -2284,6 +2458,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     here = enter(&root_ns)?;
                     ancestors.clear();
                 }
+                whole_runs = !check_search;
                 // Push the target's components so they are resolved next,
                 // ahead of the remaining path. `pending` is a stack popped
                 // from the end, so pushing them reversed yields the first
@@ -2534,6 +2709,92 @@ pub(crate) fn forked_child_fifos() {
     FIFO.with(|f| f.set(None));
 }
 
+/// Whether `r` is a FIFO whose open by `flags` [`open_fifo_unlocked`]
+/// waits for: not in an overlay, not on a read-only mount to write, and
+/// not one whose mode fwe keeps aside.
+fn fifo_to_wait_for(r: &Resolved, flags: u64) -> bool {
+    use fwe_abi::fcntl as f;
+    let writes = flags & f::O_ACCMODE == f::O_WRONLY;
+    if r.ovl.is_some() || writes && r.writable().is_err() || r.name == b"." {
+        return false;
+    }
+    let Ok(name) = r.name_c() else { return false };
+    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
+    let found = unsafe {
+        libc::fstatat(r.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+    } == 0;
+    found && st.st_mode & libc::S_IFMT == libc::S_IFIFO && !crate::modes::marked(&st)
+}
+
+/// A resolution [`open_fifo_unlocked`] made for an `openat` that waits for
+/// nothing, which the locked open of the same call takes instead of
+/// resolving the path again: only for the same path, followed alike, in
+/// the same view (root, working directory and mount table).
+pub(crate) mod ahead {
+    use super::{Resolved, View};
+    use std::cell::RefCell;
+
+    pub(crate) struct Key {
+        root: i32,
+        root_host: Vec<u8>,
+        ns: usize,
+        table: std::sync::Arc<crate::mounts::Table>,
+        proc_root: Vec<u8>,
+        cwd: Vec<u8>,
+        path: Vec<u8>,
+        follow: bool,
+    }
+
+    impl Key {
+        pub(super) fn of(v: &View, path: &[u8], follow: bool) -> Key {
+            Key {
+                root: v.root,
+                root_host: v.root_host.to_vec(),
+                ns: std::ptr::from_ref(v.ns) as usize,
+                table: v.ns.table(),
+                proc_root: v.proc_root.to_vec(),
+                cwd: v.cwd.to_vec(),
+                path: path.to_vec(),
+                follow,
+            }
+        }
+
+        fn matches(&self, v: &View, path: &[u8], follow: bool) -> bool {
+            self.path == path
+                && self.follow == follow
+                && self.root == v.root
+                && self.root_host == v.root_host
+                && self.ns == std::ptr::from_ref(v.ns) as usize
+                && self.proc_root == v.proc_root
+                && self.cwd == v.cwd
+                && std::sync::Arc::ptr_eq(&self.table, &v.ns.table())
+        }
+    }
+
+    thread_local! {
+        static AHEAD: RefCell<Option<(Key, Resolved)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn put(key: Key, r: Resolved) {
+        AHEAD.with(|a| *a.borrow_mut() = Some((key, r)));
+    }
+
+    /// The resolution made ahead, if it is of this lookup (`path` absolute
+    /// or relative to the working directory, as the one ahead was).
+    pub(super) fn take(v: &View, dirfd: i32, path: &[u8], follow: bool) -> Option<Resolved> {
+        let (key, r) = AHEAD.with(|a| a.borrow_mut().take())?;
+        let placed = path.first() == Some(&b'/') || dirfd as i64 == fwe_abi::fcntl::AT_FDCWD;
+        (placed && key.matches(v, path, follow)).then_some(r)
+    }
+
+    /// Forget any resolution made ahead: a new call starts.
+    pub fn clear() {
+        let _ = AHEAD.try_with(|a| a.borrow_mut().take());
+    }
+}
+
 /// Before an `openat(dirfd, path, flags)` that runs under the kernel lock:
 /// if `path` names a FIFO and the open is one that waits for the other end
 /// (to read or to write, without `O_NONBLOCK`), open it here, where the
@@ -2557,26 +2818,21 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
     if path.is_empty() || path.first() != Some(&b'/') && dirfd as i64 != fcntl::AT_FDCWD {
         return Ok(());
     }
-    let resolved = {
+    let follow = flags & f::O_NOFOLLOW == 0;
+    let (resolved, key) = {
         let view = published();
         let Some(v) = view.as_ref() else { return Ok(()) };
-        resolve_in(&v.view(), fcntl::AT_FDCWD as i32, &path, flags & f::O_NOFOLLOW == 0)
+        let v = v.view();
+        (resolve_in(&v, fcntl::AT_FDCWD as i32, &path, follow), ahead::Key::of(&v, &path, follow))
     };
     let Ok(r) = resolved else { return Ok(()) };
+    // Not a FIFO to wait for: the locked open takes this resolution.
+    if !fifo_to_wait_for(&r, flags) {
+        ahead::put(key, r);
+        return Ok(());
+    }
     let writes = flags & f::O_ACCMODE == f::O_WRONLY;
-    if r.ovl.is_some() || writes && r.writable().is_err() || r.name == b"." {
-        return Ok(());
-    }
     let Ok(name) = r.name_c() else { return Ok(()) };
-    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
-    let found = unsafe {
-        libc::fstatat(r.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
-    } == 0;
-    if !found || st.st_mode & libc::S_IFMT != libc::S_IFIFO || crate::modes::marked(&st) {
-        return Ok(());
-    }
     let access = if writes { libc::O_WRONLY } else { libc::O_RDONLY };
     let flags_host = libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // A reader holds a non-blocking end too, opened first (a reader
@@ -3058,15 +3314,17 @@ fn out_of_reach(dir: OwnedFd) -> OwnedFd {
     }
 }
 
+/// How fwe opens the directories it looks names up in: to search them,
+/// which is cheaper than to read them (a listing opens `.` in one).
+#[cfg(target_os = "macos")]
+const DIR_OPEN: i32 = libc::O_SEARCH;
+#[cfg(not(target_os = "macos"))]
+const DIR_OPEN: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+
 fn open_dir(dir: i32, name: &std::ffi::CStr) -> Result<OwnedFd, i32> {
     // SAFETY: opening a directory relative to `dir`.
-    let fd = unsafe {
-        libc::openat(
-            dir,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
+    let fd =
+        unsafe { libc::openat(dir, name.as_ptr(), DIR_OPEN | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(e());
     }

@@ -195,10 +195,15 @@ pub(crate) fn minor(dev: u64) -> u32 {
 /// with the guest's permission bits ([`crate::modes`]) and owner, in the
 /// initial user namespace's ids ([`crate::owners`]).
 fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
+    stat_at_with(dir, name, libc::AT_SYMLINK_NOFOLLOW)
+}
+
+/// [`stat_at`] with `fstatat` flags `flags`.
+fn stat_at_with(dir: i32, name: &CString, flags: i32) -> Result<libc::stat, i32> {
     // SAFETY: `out` is a valid out-parameter; `name` is NUL-terminated.
     let mut out = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd; `out` valid.
-    let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut out, libc::AT_SYMLINK_NOFOLLOW) };
+    let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut out, flags) };
     if r < 0 {
         return Err(host::errno_to_linux(host::last_errno()));
     }
@@ -207,6 +212,25 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
     crate::modes::apply(&mut out, perm);
     crate::owners::apply(&mut out, owner);
     Ok(out)
+}
+
+/// The Linux status of `name` in directory `dir`, whose host status is
+/// `s`, in a mount of type `fstype` and id `mount_id`; with its `statx`
+/// attributes.
+fn stat_result(
+    dir: i32,
+    name: &CString,
+    s: &libc::stat,
+    fstype: crate::mounts::FsType,
+    mount_id: u32,
+) -> (Stat, u64) {
+    let node = crate::devnodes::marked(s).then(|| crate::devnodes::node_at(dir, name)).flatten();
+    let mut out = as_node(stat_to_linux(s), node);
+    if fstype == crate::mounts::FsType::Tmpfs {
+        on_tmpfs(&mut out, mount_id);
+    }
+    let nodump = crate::modes::nodump_at(dir, name, s);
+    (out, statx_attributes(s, nodump))
 }
 
 /// The host device and inode of the file open as `fd`.
@@ -921,7 +945,8 @@ impl<P: Platform> Kernel<P> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // An O_PATH descriptor is of the node itself, the device untouched.
         // SAFETY: a valid out-parameter.
-        if flags & fcntl::O_PATH == 0 && unsafe { libc::fstat(fd, &mut st) } == 0 {
+        let looked = flags & fcntl::O_PATH == 0 && unsafe { libc::fstat(fd, &mut st) } == 0;
+        if looked {
             // A file open to write, which is not to be run meanwhile.
             if st.st_mode & libc::S_IFMT == libc::S_IFREG
                 && flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
@@ -974,14 +999,14 @@ impl<P: Platform> Kernel<P> {
         let layers = resolved.ovl.as_ref().map(|o| o.layers.clone());
         if resolved.ns_path.is_some() || layers.is_some() || stand_in {
             let ns = resolved.ns_path.clone().unwrap_or_default();
-            crate::fdmarks::opened(
-                fd,
-                ns,
-                resolved.mount_id,
-                resolved.mount_flags,
-                resolved.fstype,
-                layers,
-            );
+            let (id, flags, fstype) = (resolved.mount_id, resolved.mount_flags, resolved.fstype);
+            if looked {
+                #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+                let file = (st.st_dev as u64, st.st_ino as u64);
+                crate::fdmarks::opened_as(fd, file, ns, id, flags, fstype, layers);
+            } else {
+                crate::fdmarks::opened(fd, ns, id, flags, fstype, layers);
+            }
         }
         if stand_in && let Some(host) = crate::fs::host_path_in(dirfd, &resolved.name) {
             crate::fdmarks::set_stand_in(fd, host);
@@ -1368,18 +1393,24 @@ impl<P: Platform> Kernel<P> {
             };
             return Ok((self.proc_owned(dirfd, path, st), 0));
         }
+        // In one host call where it finds what the walk would.
+        #[cfg(target_os = "macos")]
+        if let Some(d) = self.fs().direct(path) {
+            match stat_at_with(d.dir, &d.name, crate::fs::AT_SYMLINK_NOFOLLOW_ANY) {
+                Ok(s) if !(follow && s.st_mode & libc::S_IFMT == libc::S_IFLNK) => {
+                    return Ok(stat_result(d.dir, &d.name, &s, d.fstype, d.mount_id));
+                }
+                // A missing name on a way with no link, as the walk finds.
+                Err(e @ (errno::ENOENT | errno::ENOTDIR)) => return Err(e),
+                // A link: followed by the walk.
+                _ => {}
+            }
+        }
         let r = self.fs().resolve(dirfd, path, follow)?;
         let name = r.name_c()?;
         let s = stat_at(r.dir.as_raw_fd(), &name)?;
-        let node = crate::devnodes::marked(&s)
-            .then(|| crate::devnodes::node_at(r.dir.as_raw_fd(), &name))
-            .flatten();
-        let mut out = as_node(stat_to_linux(&s), node);
-        if r.ns_path.is_some() && r.fstype == crate::mounts::FsType::Tmpfs {
-            on_tmpfs(&mut out, r.mount_id);
-        }
-        let nodump = crate::modes::nodump_at(r.dir.as_raw_fd(), &name, &s);
-        Ok((out, statx_attributes(&s, nodump)))
+        let fstype = if r.ns_path.is_some() { r.fstype } else { crate::mounts::FsType::Ext4 };
+        Ok(stat_result(r.dir.as_raw_fd(), &name, &s, fstype, r.mount_id))
     }
 
     /// `open` with `O_NOFOLLOW` of the link of fwe's `/proc` at `path`:
