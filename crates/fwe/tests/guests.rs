@@ -3993,6 +3993,27 @@ fn robust_mutexes_report_a_dead_owner() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// Threads making system calls at once while others change what those
+/// calls read (the working directory), fork and take signals: each call
+/// of the kernel lock's shared side gets an answer the process could give,
+/// and every thread finishes. Run untraced, so the calls overlap.
+#[test]
+fn threads_make_calls_side_by_side() {
+    let dir = std::env::temp_dir().join(format!("fwe-parallel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg(rust_guest("parallel")).arg(&dir);
+    let out = run_vm_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        stdout(&out),
+        "forks: 40 of 40 saw their parent\nreaders: 0 wrong answers\nsignals handled: true\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// POSIX message queues: messages by priority, the status line, a queue
 /// that outlives its name, and the notifications another process's
 /// message sets off (a signal with the value and sender, and the C

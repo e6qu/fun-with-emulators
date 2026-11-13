@@ -44,14 +44,14 @@ use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// Size of the guest's main thread stack.
 pub const STACK_SIZE: u64 = 8 << 20;
 
 /// The kernel of the guest running in this process.
 #[allow(dead_code)]
-static KERNEL: Mutex<Option<Kernel<NativePlatform>>> = Mutex::new(None);
+static KERNEL: fwe_kernel::KernelLock<NativePlatform> = fwe_kernel::KernelLock::new(None);
 
 /// [`Platform`] for guests running natively in this process.
 pub struct NativePlatform {
@@ -1070,7 +1070,7 @@ fn start(
     let mut kernel = Kernel::new(platform, page, out.brk, Some(fs), tracer);
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
     apply_exec_state(&mut kernel, options, path)?;
-    *KERNEL.lock().unwrap() = Some(kernel);
+    *KERNEL.lock() = Some(kernel);
     enter(out.sp, out.entry)
 }
 
@@ -1095,12 +1095,12 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     trap::install_handlers();
     // Signals the guest inherits as ignored stay ignored; the rest go to
     // their default action until the guest says otherwise.
-    KERNEL.lock().unwrap().as_mut().unwrap().adopt_host_signals();
+    KERNEL.lock().as_mut().unwrap().adopt_host_signals();
     // A traced program, re-executed by fwe, stops for its tracer before its
     // first instruction, as after any `execve`.
     let traced = fwe_kernel::ptrace::traced().then(|| {
         let mut regs = fwe_kernel::Regs { sp, pc: entry, ..fwe_kernel::Regs::default() };
-        KERNEL.lock().unwrap().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+        KERNEL.lock().as_mut().unwrap().ptrace_exec_stop(&mut regs);
         regs
     });
     // From here on this thread runs guest code, which may use x18 freely;

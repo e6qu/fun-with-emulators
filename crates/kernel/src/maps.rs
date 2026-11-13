@@ -665,7 +665,10 @@ pub fn flush_before(nr: u64) {
 
 /// Publish the mappings if they changed since last published.
 pub fn flush() {
-    if STALE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Read first: a swap would write the flag's line on every call, which
+    // every thread's calls then contend for.
+    if STALE.load(Relaxed) && STALE.swap(false, Relaxed) {
         publish_now();
     }
 }

@@ -56,7 +56,7 @@ pub fn do_execveat(regs: &Regs) -> Result<Regs, i64> {
     let rel = uaccess::read_cstr(regs.x[1], uaccess::PATH_MAX).map_err(err)?;
     let (args, env) = read_exec_args(regs.x[2], regs.x[3])?;
     let path = {
-        let guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = KERNEL.lock();
         guard.as_ref().unwrap().execveat_path(regs.x[0] as i32, &rel, regs.x[4]).map_err(err)?
     };
     exec_program(path, args, env)
@@ -66,7 +66,7 @@ pub fn do_execveat(regs: &Regs) -> Result<Regs, i64> {
 /// environment. Returns the new program's registers, or a negated errno
 /// while the old program is still intact.
 fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<Regs, i64> {
-    let mut guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = KERNEL.lock();
     let k = guard.as_mut().unwrap();
     let page = page_size();
     let strace = k.tracer;
@@ -188,7 +188,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
 
     let mut done = [-1i32; 2];
     let (pid, shown) = {
-        let mut kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kernel = KERNEL.lock();
         // A pipe whose write end only the child holds: it closes when the
         // child execs or exits, which ends the parent's wait. It is made,
         // and the parent's write end closed, under the kernel lock, where
@@ -273,6 +273,11 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // SAFETY: the child holds its own copy of the write end.
             unsafe { libc::close(done[1]) };
             done[1] = -1;
+        }
+        if pid == 0 {
+            // SAFETY: this is the child, its only thread the caller, which
+            // holds the lock.
+            unsafe { KERNEL.forked_child(&kernel) };
         }
         (if pid < 0 { e } else { pid as i64 }, shown)
     };
@@ -612,7 +617,7 @@ fn reaper_wait(
 /// otherwise ask only the host.
 fn start_watcher_if_wanted() {
     if reaper::watcher_wanted() {
-        let _kernel = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+        let _kernel = KERNEL.lock();
         reaper::start_if_reaper();
     }
 }

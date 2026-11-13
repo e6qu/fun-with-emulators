@@ -85,8 +85,19 @@ arguments from the guest's registers, and hands them to the kernel crate
 filters see the call first. Then the kernel crate either runs it under its
 lock or, for a call that may block, without it. Inside fwe:
 
-- **One kernel lock.** Most calls run under a single lock through
-  `Kernel::enter_syscall`.
+- **The kernel lock** (`crates/kernel/src/klock.rs`) is a read-write
+  lock over the process's kernel state. Calls that only read it (the ids,
+  `uname`, the time, `getrandom`, `fstat`, `newfstatat`, `statx`,
+  `faccessat`, `readlinkat`, `getcwd`, `lseek`) or change only the calling
+  thread's state (`rt_sigprocmask`, `sigaltstack`) run on its shared
+  side, several threads at once (`Kernel::dispatch_shared`); every other
+  call holds it alone, through `Kernel::enter_syscall`, so a descriptor
+  or mapping and what fwe keeps for it change together. The shared side
+  writes no memory another thread's shared calls use: a reader counts
+  itself in one of 32 counters, each on its own cache line, and checks a
+  flag only writers set. A writer sets the flag and waits for the
+  counters to drain; readers that find it set come in when it is done,
+  ahead of the next writer.
 - **Blocking calls run without it**, so a waiting thread never stalls the
   thread meant to wake it: `futex`, the sleeps, `epoll_pwait`, `ppoll`,
   `pselect6`, `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the
@@ -331,8 +342,10 @@ keeps:
 
 - **Native fork** (the sequence is drawn in
   [linux-on-macos.md](linux-on-macos.md#fork)):
-  `fwe_kernel::fork_locked` holds the kernel lock and every registry lock
-  across the host `fork`, and the locks threads take outside the kernel
+  `fwe_kernel::fork_locked` holds the kernel lock for writing and every
+  registry lock across the host `fork` (the child clears the kernel
+  lock's reader counters, which may hold another thread's reader stepping
+  back), and the locks threads take outside the kernel
   lock (epoll's interest lists, pipe states, the user namespace...;
   `forklock.rs`, taken all at once or not at all, so their order never
   matters), so the child (which has only the forking thread) inherits

@@ -11,13 +11,13 @@ use std::cell::Cell;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 /// The kernel of the guest running in this VM.
-static KERNEL: Mutex<Option<Kernel<HvPlatform>>> = Mutex::new(None);
+static KERNEL: fwe_kernel::KernelLock<HvPlatform> = fwe_kernel::KernelLock::new(None);
 
-pub(super) fn kernel() -> MutexGuard<'static, Option<Kernel<HvPlatform>>> {
-    KERNEL.lock().unwrap_or_else(|e| e.into_inner())
+pub(super) fn kernel() -> fwe_kernel::klock::Exclusive<'static, Option<Kernel<HvPlatform>>> {
+    KERNEL.lock()
 }
 
 thread_local! {
@@ -1593,15 +1593,17 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             // SAFETY: guest pointers, translated, reference guest memory.
             match unsafe { fwe_kernel::blocking_syscall(n, host_args) } {
                 Some(r) => r,
-                None => kernel().as_mut().unwrap().run_call(n, host_args),
+                None => KERNEL.run_call(n, host_args),
             }
         }
     };
     // Guest addresses only from here on (a signal frame, say).
     uaccess::clear_host_args();
-    kernel().as_mut().unwrap().finish_syscall(regs, n, &args, result);
+    KERNEL.finish(regs, n, &args, result);
     // A fork's event stops, the child's pid in `x0`.
-    kernel().as_mut().unwrap().ptrace_fork_stops(regs);
+    if matches!(n, nr::CLONE | nr::CLONE3) {
+        kernel().as_mut().unwrap().ptrace_fork_stops(regs);
+    }
     // The exit's stop, its result in `x0`.
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(regs, false);
