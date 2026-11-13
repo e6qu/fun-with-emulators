@@ -322,9 +322,12 @@ keeps:
   record never outlives its process into another with the same pid),
   cgroup, namespaces, name, command line, program, ancestors, subreaper
   flag, nice value, scheduling policy and `oom_score_adj`. A record is
-  rewritten in place under its lock, framed with its length and a
-  checksum, so a reader (which takes no lock) rereads one caught
-  mid-write; a program's start writes its record once.
+  rewritten in place under its lock (an exclusive `flock` of the record's
+  file itself, retaken if the record was removed meanwhile), framed with
+  its length and a checksum, so a reader (which takes no lock) rereads
+  one caught mid-write. A process keeps its own record open while it
+  lives, so changing or reading it opens and closes no file; a program's
+  start writes it once.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events));

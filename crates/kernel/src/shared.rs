@@ -627,8 +627,9 @@ pub fn collect() {
     // Marked first: another fwe starting meanwhile need not collect too.
     let _ = std::fs::File::create(marker);
     // In a process of its own, which no one waits for: a program's start
-    // does not wait for it, and its program never sees it as a child (its
-    // parent, gone at once, leaves it to the host).
+    // does not wait for it, its program never sees it as a child (its
+    // parent, gone at once, leaves it to the host), and it is in no group
+    // of the program's.
     // SAFETY: plain host calls; the process is single-threaded here (a
     // fresh start, before the guest runs), and each child only collects
     // and ends.
@@ -636,6 +637,9 @@ pub fn collect() {
         match libc::fork() {
             0 => {
                 if libc::fork() == 0 {
+                    // Out of the program's session and process group: no
+                    // signal to them, and no wait for them, reaches it.
+                    libc::setsid();
                     detach_descriptors();
                     collect_in(&base);
                 }

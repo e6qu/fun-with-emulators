@@ -1372,8 +1372,10 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest_in("alpine", manifest_name);
     let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
-    let done = root.join(".fwe-complete");
-    if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
+    // The mark that it is whole is an extended attribute of its own: a
+    // copy that lost them (CI's cache keeps none) is unpacked again, as
+    // its files' are gone too.
+    if completed(&root).as_deref() == Some(list.as_str()) {
         return root;
     }
     let files = fetched_alpine(manifest_name);
@@ -1392,8 +1394,35 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
                 .arg(&root),
         );
     }
-    std::fs::write(&done, &list).unwrap();
+    mark_completed(&root, &list);
     root
+}
+
+/// The attribute that marks an unpacked root whole ([`alpine_root`]).
+const COMPLETE: &std::ffi::CStr = c"user.fwe-complete";
+
+/// The manifest an unpacked root was marked whole with, if any.
+fn completed(root: &Path) -> Option<String> {
+    let path =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(root.as_os_str())).ok()?;
+    let mut buf = vec![0u8; 1 << 16];
+    // SAFETY: a NUL-terminated path and name; a buffer of its length.
+    let n = unsafe {
+        libc::getxattr(path.as_ptr(), COMPLETE.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0)
+    };
+    buf.truncate(usize::try_from(n).ok()?);
+    String::from_utf8(buf).ok()
+}
+
+/// Mark the unpacked root whole, with the manifest it holds.
+fn mark_completed(root: &Path, list: &str) {
+    let path =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(root.as_os_str())).unwrap();
+    // SAFETY: a NUL-terminated path and name; the value's bytes.
+    let rc = unsafe {
+        libc::setxattr(path.as_ptr(), COMPLETE.as_ptr(), list.as_ptr().cast(), list.len(), 0, 0)
+    };
+    assert_eq!(rc, 0, "marking {} whole: {}", root.display(), std::io::Error::last_os_error());
 }
 
 /// The minirootfs of an Alpine manifest: the standard `alpine` image's

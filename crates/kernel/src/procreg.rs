@@ -253,21 +253,109 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
 
 /// The record kept for host pid `pid`, whether or not its process lives.
 fn read_any(pid: i32) -> Option<ProcRecord> {
-    let p = path(pid)?;
-    // A record is rewritten in place ([`write`]): one read while it is
-    // being written fails its check, and is made again. An empty file is
-    // one not yet written (or whose writer died first): no record.
+    if pid == me() {
+        return read_from(own_fd()?);
+    }
+    let p = std::ffi::CString::new(path(pid)?).ok()?;
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let r = read_from(fd);
+    // SAFETY: closing the descriptor opened above.
+    unsafe { libc::close(fd) };
+    r
+}
+
+/// The record in the file open on `fd`. A record is rewritten in place
+/// ([`write`]): one read while it is being written fails its check, and
+/// is made again. An empty file is one not yet written (or whose writer
+/// died first): no record.
+fn read_from(fd: i32) -> Option<ProcRecord> {
+    let mut buf = vec![0u8; 4096];
     for _ in 0..100 {
-        let bytes = std::fs::read(OsStr::from_bytes(&p)).ok()?;
-        if bytes.is_empty() {
+        let n = loop {
+            // SAFETY: a buffer of its length, read at the file's start.
+            let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+            if n < 0 {
+                return None;
+            }
+            let n = n as usize;
+            if n < buf.len() {
+                break n;
+            }
+            // A longer record: all of it.
+            buf.resize(buf.len() * 2, 0);
+        };
+        if n == 0 {
             return None;
         }
-        if let Some(body) = unframe(&bytes) {
+        if let Some(body) = unframe(&buf[..n]) {
             return decode(body);
         }
         std::thread::yield_now();
     }
     None
+}
+
+/// This process's own record, kept open (in fwe's own range) while it
+/// lives: its changes and reads then open and close no file, and it is
+/// its lock ([`lock`]). Made at first use; a fork child opens its own.
+fn own_fd() -> Option<i32> {
+    use std::sync::atomic::{AtomicI32, Ordering::SeqCst};
+    static FD: AtomicI32 = AtomicI32::new(-1);
+    static PID: AtomicI32 = AtomicI32::new(0);
+    let me = me();
+    if PID.load(SeqCst) == me {
+        let fd = FD.load(SeqCst);
+        if linked(fd) {
+            return Some(fd);
+        }
+    } else {
+        // A fork child: the thread that held the parent's lock is not in it.
+        OWN_BUSY.store(false, SeqCst);
+    }
+    let p = std::ffi::CString::new(path(me)?).ok()?;
+    // SAFETY: a NUL-terminated path in fwe's private directory.
+    let fd = unsafe {
+        libc::open(
+            p.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    let fd = crate::fdtable::reserve(fd).ok()?;
+    let old = FD.swap(fd, SeqCst);
+    let mine = PID.swap(me, SeqCst) == me;
+    if old >= 0 {
+        // This process's record, removed meanwhile (taken for another's
+        // with its pid): kept, in the file now named.
+        if mine && let Some(r) = read_from(old) {
+            let bytes = frame(&encode(&r));
+            // SAFETY: zeroed bytes are a valid `stat`; a buffer of its
+            // length written to the new, empty file.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstat(fd, &mut st) == 0 && st.st_size == 0 {
+                    libc::pwrite(fd, bytes.as_ptr().cast(), bytes.len(), 0);
+                }
+            }
+        }
+        // SAFETY: the descriptor this process (or its parent, before the
+        // fork) kept; a parent's lock stays with its own.
+        unsafe { libc::close(old) };
+    }
+    Some(fd)
+}
+
+/// Whether the file open on `fd` still has a name (a record removed is
+/// unlinked: a lock on it is no lock on the record).
+fn linked(fd: i32) -> bool {
+    // SAFETY: zeroed bytes are a valid `stat`, which the call fills.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    fd >= 0 && unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_nlink > 0
 }
 
 /// A record's bytes as written: its length and checksum, then itself.
@@ -352,36 +440,92 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
 /// with its length and checksum, for readers (who take no lock) to tell a
 /// whole record from one being written, and from an older one's longer
 /// tail.
-fn write(pid: i32, r: &ProcRecord) {
-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
-    let Some(p) = path(pid) else { return };
+fn write(lock: &Locked, r: &ProcRecord) {
     let bytes = frame(&encode(r));
-    let Ok(f) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(OsStr::from_bytes(&p))
-    else {
-        return;
-    };
+    let mut at = 0;
+    while at < bytes.len() {
+        // SAFETY: the rest of the buffer, written at its offset in the
+        // file the lock holds.
+        let n = unsafe {
+            libc::pwrite(lock.fd, bytes[at..].as_ptr().cast(), bytes.len() - at, at as libc::off_t)
+        };
+        if n <= 0 {
+            return;
+        }
+        at += n as usize;
+    }
     // An older record's longer tail stays, past the frame.
-    let _ = f.write_all_at(&bytes, 0);
 }
 
-/// Hold host process `pid`'s record's lock while the result lives.
-fn lock(pid: i32) -> Option<std::fs::File> {
-    let p = [path(pid)?, b".lock".to_vec()].concat();
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(OsStr::from_bytes(&p))
-        .ok()?;
-    use std::os::fd::AsRawFd;
-    // SAFETY: plain host call on the file just opened; the lock goes with it.
-    crate::shared::lock_exclusive(f.as_raw_fd());
-    Some(f)
+/// Whether a thread of this process holds its own record's lock: the
+/// threads share the one descriptor ([`own_fd`]), which `flock` does not
+/// tell apart.
+static OWN_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A record's lock, held while this lives: an exclusive `flock` of the
+/// record's file, which a removed record (its file unlinked) no longer
+/// has.
+struct Locked {
+    fd: i32,
+    /// The descriptor is this process's own record's ([`own_fd`]), kept.
+    own: bool,
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        // SAFETY: plain host calls on the descriptor the lock holds.
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            if !self.own {
+                libc::close(self.fd);
+            }
+        }
+        if self.own {
+            OWN_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Hold host process `pid`'s record's lock, its file made if `create`
+/// (else `None` if it has none).
+fn lock_record(pid: i32, create: bool) -> Option<Locked> {
+    loop {
+        let (fd, own) = if pid == me() {
+            let fd = own_fd()?;
+            while OWN_BUSY
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                std::thread::yield_now();
+            }
+            (fd, true)
+        } else {
+            let p = std::ffi::CString::new(path(pid)?).ok()?;
+            let flags = libc::O_RDWR | libc::O_CLOEXEC | if create { libc::O_CREAT } else { 0 };
+            // SAFETY: a NUL-terminated path; the descriptor goes with the lock.
+            let fd = unsafe { libc::open(p.as_ptr(), flags, 0o600 as libc::c_uint) };
+            if fd < 0 {
+                return None;
+            }
+            (fd, false)
+        };
+        crate::shared::lock_exclusive(fd);
+        if linked(fd) {
+            return Some(Locked { fd, own });
+        }
+        // Removed meanwhile: the record's file is another now, if any.
+        drop(Locked { fd, own });
+    }
+}
+
+/// Hold host process `pid`'s record's lock, if it has a record.
+fn lock(pid: i32) -> Option<Locked> {
+    lock_record(pid, false)
 }
 
 fn end_path(pid: i32) -> Option<Vec<u8>> {
@@ -429,8 +573,8 @@ pub fn forget_end(pid: i32) {
 
 /// Forget host process `pid` (it ended). Where a new process has the pid
 /// already, only the old one's record goes: the files beside it (its
-/// mailbox, lock and mappings) are the new one's now, which may have
-/// opened them before it wrote its own record.
+/// mailbox and mappings) are the new one's now, which may have opened
+/// them before it wrote its own record.
 pub fn remove(pid: i32) {
     let Some(p) = path(pid) else { return };
     let _ = std::fs::remove_file(OsStr::from_bytes(&p));
@@ -438,12 +582,11 @@ pub fn remove(pid: i32) {
         return;
     }
     let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
-    let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     crate::signote::remove(pid);
 }
 
 /// Remove the files kept beside the records for processes that are gone
-/// (their mailbox, lock, mappings, thread ids and how they ended), older
+/// (their mailbox, mappings, thread ids and how they ended), older
 /// than `young`: a process whose record was taken away ([`remove`])
 /// without them, as when its pid had been given to another process by
 /// then, or whose parent was not fwe's to reap it.
@@ -454,7 +597,7 @@ pub fn collect_leftovers(young: std::time::Duration) {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         let pid = match name.split_once('.') {
-            Some((p, "sig" | "lock" | "maps" | "end")) => p,
+            Some((p, "sig" | "maps" | "end")) => p,
             _ => match name.strip_prefix("tids-").or_else(|| name.strip_prefix("threads-")) {
                 Some(p) => p.strip_suffix(".new").unwrap_or(p),
                 None => continue,
@@ -485,8 +628,8 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
-            // A lock or a write in progress; a leftover of a writer that died
-            // goes with its process's record.
+            // A file beside a record (a mailbox, mappings, how a process
+            // ended), which goes with it.
             continue;
         };
         // A zombie has ended (Linux lists it in no cgroup either): its
@@ -653,10 +796,10 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
     // Under the record's lock: a parent and its child may change one.
-    let _lock = lock(pid);
+    let lock = lock_record(pid, true).ok_or(fwe_abi::errno::EIO)?;
     let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
     f(&mut r);
-    write(pid, &r);
+    write(&lock, &r);
     Ok(())
 }
 
