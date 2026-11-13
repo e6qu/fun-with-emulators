@@ -77,7 +77,10 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // A script runs its interpreter.
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
-    let file = fs.read(&path).map_err(err)?;
+    let file = match k.take_exec_file(&path) {
+        Some(file) => file,
+        None => fs.read(&path).map_err(err)?,
+    };
     fwe_kernel::timing::mark("exec: read");
     let vm = crate::needs_vm(&file);
     // A program only the VM can run, where there is none: the exec fails

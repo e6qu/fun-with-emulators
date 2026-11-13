@@ -1925,7 +1925,7 @@ fn may_follow(dir: i32, name: &std::ffi::CStr, fsuid: u32) -> Result<(), i32> {
 
 /// The guest's metadata of the file open as `fd`: its kept mode and
 /// owner ([`crate::modes`], [`crate::owners`]).
-fn guest_stat(fd: i32) -> Option<libc::stat> {
+pub(crate) fn guest_stat(fd: i32) -> Option<libc::stat> {
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
@@ -3132,6 +3132,11 @@ pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
 
 /// The whole contents of the file `fd` is open on, from its start whatever
 /// its offset.
+/// All of the file open as `fd`, from where it is.
+pub(crate) fn read_all_fd(fd: i32) -> Result<Vec<u8>, i32> {
+    read_all(fd)
+}
+
 fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
     let mut data = Vec::new();
     let mut chunk = [0u8; 65536];
