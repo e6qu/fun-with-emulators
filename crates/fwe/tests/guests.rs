@@ -2742,7 +2742,7 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         .stdin(Stdio::null());
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
-    eprintln!("--- node stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     // The digests are the host's (`shasum`, `md5`, Python's hashlib).
     assert_eq!(
         stdout(&out),
