@@ -31,19 +31,19 @@ In scope:
 - the Linux userspace ABI on arm64: system calls, ELF loading, signals,
   `/proc`, `/sys`, `/dev`, ioctls, namespaces and cgroups;
 - distributions' userland (Debian, Alpine);
-- container engines and standard images;
-- Wine, for ARM64 Windows console programs.
+- container engines and standard images, and gVisor's sandbox;
+- Wine, for ARM64 Windows programs;
+- graphical programs, drawn by an X server on the Mac.
 
 Out of scope:
 - kernel modules and private kernel interfaces;
 - hardware drivers;
-- x86 binaries;
-- graphical programs.
+- x86 binaries.
 
 ## The finish line: 1.0
 
 1.0 is reached when all of these hold, as [ROADMAP.md](ROADMAP.md) defines
-them in M2, M4, M5 and M6:
+them in M2, M4, M5, M6 and M7:
 - the target programs (git, compilers, Node, Go, Rust, apt, a database, a
   web server) run unmodified, those in the VM on real hardware;
 - container engines (Docker, podman, containerd) build and run images,
@@ -57,13 +57,15 @@ them in M2, M4, M5 and M6:
 - Linux code runs at native speed and what fwe adds stays within the
   benchmark budgets, and as much runs natively as the host allows:
   executables linked below 4 GiB and programs that need 4 KiB pages,
-  Wine among them, without the VM where fwe can make them fit.
+  Wine among them, without the VM where fwe can make them fit;
+- graphical Linux programs and a Windows program with a window draw on
+  the Mac's screen, and a Linux program runs inside gVisor (`runsc`).
 
 The roadmap lists what 1.0 leaves out under "Not planned for 1.0".
 
 ## After 1.0
 
-Virtual networking (M7), so that multi-process and multi-container Linux
+Virtual networking (M8), so that multi-process and multi-container Linux
 applications talk over their own networks: addresses per network
 namespace, bridges, container networks with names, ports published on the
 Mac. The design keeps the host's own TCP/IP stack carrying the traffic,

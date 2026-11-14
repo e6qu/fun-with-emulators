@@ -15,8 +15,9 @@ in detail.
 | M3 Containers | Done |
 | M4 Compatibility | Done: all 1213 of LTP's system-call tests that apply pass (1551 run) |
 | M5 Release | Done but for the first release (the owner's) |
-| M6 Native speed and coverage | Not started |
-| M7 Virtual networking | Planned after 1.0 |
+| M6 Native speed and coverage | Under way |
+| M7 Graphical programs and sandboxes | Not started |
+| M8 Virtual networking | Planned after 1.0 |
 
 What runs unmodified, with its output checked in CI:
 - **Natively, in-process:** Debian's coreutils, bash, git, SQLite, lighttpd,
@@ -179,6 +180,13 @@ natively wherever fwe can make them fit the Mac.
   (the GOT and arrays the dynamic section names, Go's `moduledata` and
   `pclntab`), checked before the move; a binary whose pointers cannot all
   be accounted for runs in the VM as now, and why is recorded.
+- [ ] **Programs GCC builds, natively:** what GCC links below 4 GiB
+  (`-static`, `-no-pie`, and toolchains whose default is not PIE) runs
+  natively, not in the VM: moved above 4 GiB as the item above moves a
+  binary, or, where its pointers cannot all be found, loaded at its own
+  addresses in the low 4 GiB natively, which fwe keeps free of its own
+  mappings for it. CI builds such programs with GCC and runs them without
+  `fwe --vm`.
 - [ ] **4 KiB pages natively:** `mmap`, `mprotect` and `munmap` at 4 KiB
   granularity on the Mac's 16 KiB pages: file contents at 4 KiB offsets
   copied in, each host page given the union of its parts' protections and
@@ -193,12 +201,36 @@ natively wherever fwe can make them fit the Mac.
   sections are mapped as above. Wine then runs without `fwe --vm`.
 
 **Done when:** the budgets hold in CI; static Go programs, Debian's
-low-linked toolchain and Wine's test program run natively, in CI; and
-what still needs the VM is listed with the reason.
+low-linked toolchain, programs GCC links non-PIE or static, and Wine's
+test program run natively, in CI; and what still needs the VM is listed
+with the reason.
+
+### M7 — Graphical programs and sandboxes
+
+Linux programs with windows on the Mac's screen, Windows programs through
+Wine with theirs, and a Linux program run inside gVisor, all on fwe.
+
+- [ ] **Graphical Linux programs:** X11 clients (`xterm`, `xeyes`, a GTK
+  and a Qt program) drawn by an X server on the Mac (XQuartz), reached
+  through the socket `DISPLAY` names, with shared memory (`MIT-SHM`)
+  where the server offers it; Wayland clients through a compositor that
+  speaks to the Mac, if one proves practical.
+- [ ] **Graphical Wine:** a Windows program with a window (Notepad, a
+  Direct3D-free game or demo) through Wine's X11 driver, natively (M6's
+  Wine item).
+- [ ] **gVisor on fwe:** `runsc` running a Linux program on its `systrap`
+  platform (`seccomp`'s `SECCOMP_RET_TRAP`, `SIGSYS` and memory shared
+  between its sentry and stub processes) or its `ptrace` platform, as
+  Podman or Docker would start it.
+
+**Done when:** CI starts an X server and runs an X11 program, a GTK
+program and a Windows program with a window under fwe, checking what they
+draw (a screenshot of the server compared), and runs a Linux program
+through `runsc` on fwe.
 
 ## After 1.0
 
-### M7 — Virtual networking
+### M8 — Virtual networking
 
 Multi-process and multi-container Linux applications on networks of their
 own, as on a Linux host, with the host's TCP/IP stack carrying the
@@ -238,7 +270,7 @@ programs that probe for them fall back.
   firewalling, raw and packet sockets, SCTP, RDS, TUN, kernel TLS): a new
   network namespace has loopback only, and other protocols fail with
   `EAFNOSUPPORT` or `ENOPROTOOPT`. Addresses per namespace, bridges and
-  container networks are planned after 1.0 (M7).
+  container networks are planned after 1.0 (M8).
 - **`kcmp`:** macOS cannot tell whether two descriptors share an open file
   description.
 - **Chosen pids** (`clone3`'s `set_tid`, `/proc/sys/kernel/ns_last_pid`):
