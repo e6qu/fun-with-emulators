@@ -259,7 +259,9 @@ The pieces that do it:
   turned into traps) are kept aside, and those pages are made readable but
   not executable. The guest's first instruction fetch there faults, and
   the fault handler writes the page (each word only if it is still what
-  it was) and gives it the protections the guest asked for. A page made
+  it was) and gives it the protections the guest asked for, under a lock:
+  another thread that faulted on the page meanwhile finds it written and
+  runs on. A page made
   writable has its words written first; one moved by `mremap` too. A
   large library is mostly never run: clang's `libLLVM` has sites on 2,081
   of its 5,927 code pages, most never reached by a compile.

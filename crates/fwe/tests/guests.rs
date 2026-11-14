@@ -927,6 +927,24 @@ fn a_library_longer_than_a_branch_gets_its_stubs() {
     assert_eq!(run.status.code(), Some(0));
 }
 
+/// Threads that first run the same pages of the shared libc at once, with
+/// the libc's preparation kept from the run before: each page's code is
+/// written as it first runs, and a thread that runs it meanwhile runs on.
+#[test]
+fn threads_first_run_shared_code_together() {
+    let prog = build_c_dynamic("lazyrace", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "lazyrace");
+    // The first run keeps the libc's preparation; the next ones use it.
+    for run in 0..3 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        assert_eq!(stdout(&out), "ok\n", "run {run}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "run {run}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
 /// crt objects, using the heap and buffered stdio from the shared libc. Covers
 /// the complete path — `ld-musl` self-relocation, `crt` `_start`,

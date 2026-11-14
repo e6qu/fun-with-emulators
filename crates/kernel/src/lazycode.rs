@@ -25,11 +25,19 @@ struct Owed {
     prot: i32,
 }
 
-/// Pages by their host address.
-static OWED: Mutex<BTreeMap<u64, Owed>> = Mutex::new(BTreeMap::new());
+/// Pages by their host address: those owed writes, and those whose writes
+/// were made (a thread that faulted there while another made them runs on).
+#[derive(Default)]
+struct Pages {
+    owed: BTreeMap<u64, Owed>,
+    done: std::collections::BTreeSet<u64>,
+}
 
-fn owed() -> std::sync::MutexGuard<'static, BTreeMap<u64, Owed>> {
-    OWED.lock().unwrap_or_else(|e| e.into_inner())
+static PAGES: Mutex<Pages> =
+    Mutex::new(Pages { owed: BTreeMap::new(), done: std::collections::BTreeSet::new() });
+
+fn pages() -> std::sync::MutexGuard<'static, Pages> {
+    PAGES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The host's page size, which protections are set by.
@@ -44,15 +52,24 @@ fn page() -> u64 {
 /// ([`protected`]).
 pub fn owe(writes: Vec<Write>) {
     let page = page();
-    let mut o = owed();
+    let mut pg = pages();
     for w in writes {
-        o.entry(w.0 & !(page - 1)).or_insert(Owed { writes: Vec::new(), prot: 0 }).writes.push(w);
+        let p = w.0 & !(page - 1);
+        pg.done.remove(&p);
+        pg.owed.entry(p).or_insert(Owed { writes: Vec::new(), prot: 0 }).writes.push(w);
     }
 }
 
 /// Whether any page is owed writes.
 fn any() -> bool {
-    !owed().is_empty()
+    let pg = pages();
+    !pg.owed.is_empty() || !pg.done.is_empty()
+}
+
+/// The owed pages in `[addr, addr + len)`.
+fn owed_in(pg: &Pages, addr: u64, len: u64) -> Vec<u64> {
+    let page = page();
+    pg.owed.range(addr & !(page - 1)..addr.saturating_add(len)).map(|(&p, _)| p).collect()
 }
 
 /// Host memory `[addr, addr + len)` was given host protections `prot`: the
@@ -63,16 +80,15 @@ pub fn protected(addr: u64, len: u64, prot: i32) {
         return;
     }
     let page = page();
-    let mut o = owed();
-    let pages: Vec<u64> =
-        o.range(addr & !(page - 1)..addr.saturating_add(len)).map(|(&p, _)| p).collect();
-    for p in pages {
+    let mut pg = pages();
+    for p in owed_in(&pg, addr, len) {
         if prot & libc::PROT_WRITE != 0 {
-            let owed = o.remove(&p).expect("listed");
+            let owed = pg.owed.remove(&p).expect("listed");
             write(p, &owed.writes, prot);
+            pg.done.insert(p);
             continue;
         }
-        let e = o.get_mut(&p).expect("listed");
+        let e = pg.owed.get_mut(&p).expect("listed");
         e.prot = prot;
         // SAFETY: a page of guest code fwe prepared, made not to run until
         // its writes are made.
@@ -86,11 +102,14 @@ pub fn unmapped(addr: u64, len: u64) {
         return;
     }
     let page = page();
-    let mut o = owed();
-    let pages: Vec<u64> =
-        o.range(addr & !(page - 1)..addr.saturating_add(len)).map(|(&p, _)| p).collect();
-    for p in pages {
-        o.remove(&p);
+    let mut pg = pages();
+    for p in owed_in(&pg, addr, len) {
+        pg.owed.remove(&p);
+    }
+    let end = addr.saturating_add(len);
+    let done: Vec<u64> = pg.done.range(addr & !(page - 1)..end).copied().collect();
+    for p in done {
+        pg.done.remove(&p);
     }
 }
 
@@ -100,13 +119,11 @@ pub fn settle(addr: u64, len: u64) {
     if !any() {
         return;
     }
-    let page = page();
-    let mut o = owed();
-    let pages: Vec<u64> =
-        o.range(addr & !(page - 1)..addr.saturating_add(len)).map(|(&p, _)| p).collect();
-    for p in pages {
-        let owed = o.remove(&p).expect("listed");
+    let mut pg = pages();
+    for p in owed_in(&pg, addr, len) {
+        let owed = pg.owed.remove(&p).expect("listed");
         write(p, &owed.writes, owed.prot);
+        pg.done.insert(p);
     }
 }
 
@@ -118,8 +135,15 @@ pub fn fault(pc: u64) -> bool {
         return false;
     }
     let p = pc & !(page() - 1);
-    let Some(owed) = owed().remove(&p) else { return false };
+    // Under the lock throughout: another thread that faults on the page
+    // meanwhile waits, then finds it done and runs on.
+    let mut pg = pages();
+    if pg.done.contains(&p) {
+        return true;
+    }
+    let Some(owed) = pg.owed.remove(&p) else { return false };
     write(p, &owed.writes, owed.prot);
+    pg.done.insert(p);
     true
 }
 
@@ -183,11 +207,13 @@ mod tests {
         // Not what it was: left alone.
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + 12) as *const u32).read() }, 0);
-        assert!(!fault(p + 100));
+        // Done: a thread that faulted there meanwhile runs on.
+        assert!(fault(p + 100));
         protected(p + page, page, libc::PROT_READ | libc::PROT_WRITE);
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + page + 4) as *const u32).read() }, 0x2222_2222);
-        assert!(!any() || owed().range(p..p + 2 * page).next().is_none());
+        assert!(pages().owed.range(p..p + 2 * page).next().is_none());
+        unmapped(p, 2 * page);
         // SAFETY: the test's own mapping.
         unsafe { libc::munmap(p as *mut libc::c_void, 2 * page as usize) };
     }
