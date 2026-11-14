@@ -199,6 +199,9 @@ pub unsafe fn prepare(
     // Code mapped from a file whose preparation is known: its writes are
     // made as each page is first run ([`fwe_kernel::lazycode`]), not now.
     // The loader's images (`arena`) are copies, written already.
+    // Code the host maps from its file, not written as a whole: only the
+    // pages written need the instruction cache invalidated.
+    let from_file = cache.is_some() && arena.is_none();
     let kept = cache.and_then(kept);
     let mut defer: Option<std::collections::BTreeMap<u64, (u32, u32)>> = None;
     let mut hot: Vec<u64> = Vec::new();
@@ -319,11 +322,16 @@ pub unsafe fn prepare(
         if let Some(key) = cache {
             fwe_kernel::lazycode::owe(owed, key, start, &kept_hot);
         }
-    } else if stats.syscalls + stats.stubs > 0 {
-        // The words changed in place, and the sites' branches to their
-        // stubs: every one is noted.
+    } else if from_file {
+        // Mapped from its file by the host: the words changed in place,
+        // and the sites' branches to their stubs, every one noted.
         // SAFETY: the pages are of the range, mapped.
         unsafe { flush_pages(patched.noted.iter().map(|&(off, ..)| start + off)) };
+    } else {
+        // Written as a whole (the loader's copies, memory the guest wrote):
+        // all of it.
+        // SAFETY: the range is mapped.
+        unsafe { flush_icache(start, len) };
     }
     Ok(stats)
 }
