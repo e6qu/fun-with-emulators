@@ -15,7 +15,8 @@ project's build, under fwe, natively on macOS and natively on Linux.
         results, a table of all three is printed (and appended to
         $GITHUB_STEP_SUMMARY). `--no-build` leaves the build out (Alpine's
         programs run only in CI). It fails when a figure of fwe's exceeds
-        its budget against macOS's (BUDGETS).
+        its budget (BUDGETS) against macOS's, or for the build against
+        Linux's, which runs the same toolchain (AGAINST).
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -121,6 +122,11 @@ BUDGETS = {
     "fork+exec+wait (us)": 3.0,
     "build Lua (s)": 1.5,
 }
+
+# The figures held to a budget against another than macOS's: the build,
+# against Linux's, which runs the same Alpine clang as fwe does (macOS's
+# is Apple's clang, another compiler, which says nothing of fwe).
+AGAINST = {"build Lua (s)": "Linux"}
 
 
 def best(f, rounds=ROUNDS):
@@ -275,12 +281,19 @@ def macos(a):
 
 
 def over_budget(results):
-    """The benchmarks whose fwe / macOS ratio exceeds its budget."""
+    """The benchmarks whose ratio to their reference (macOS, or AGAINST's)
+    exceeds its budget. A reference missing is a failure: the budget is
+    not shown to hold."""
     over = []
     for row, budget in BUDGETS.items():
-        fwe, mac = results["fwe"].get(row), results["macOS"].get(row)
-        if fwe is not None and mac and fwe / mac > budget:
-            over.append(f"{row} {fwe / mac:.1f}x > {budget}x")
+        against = AGAINST.get(row, "macOS")
+        fwe, ref = results["fwe"].get(row), results.get(against, {}).get(row)
+        if fwe is None:
+            continue
+        if not ref:
+            over.append(f"{row}: no {against} figure")
+        elif fwe / ref > budget:
+            over.append(f"{row} {fwe / ref:.1f}x > {budget}x against {against}")
     return over
 
 
@@ -346,6 +359,9 @@ def render(results):
         )
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
         budget = f"{BUDGETS[row]}x" if row in BUDGETS else ""
+        if row in AGAINST and results.get(AGAINST[row], {}).get(row):
+            r = results["fwe"][row] / results[AGAINST[row]][row]
+            budget += f" ({r:.1f}x against {AGAINST[row]})"
         lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} | {budget} |")
     return "\n".join(lines)
 

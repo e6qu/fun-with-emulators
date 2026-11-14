@@ -78,7 +78,7 @@ network.
   machine where one is not needed; no abstraction fwe adds may put a cost
   in the program's own code, and what fwe adds at system calls, process
   creation and start-up is held to budgets measured in CI against native
-  macOS. A design that would slow guest code (a packet-level network
+  macOS (a build, against native Linux running the same toolchain). A design that would slow guest code (a packet-level network
   stack, instrumenting every block) is chosen only where nothing cheaper
   gives the behaviour.
 - **No blockers:** an implementation problem is something to solve.
