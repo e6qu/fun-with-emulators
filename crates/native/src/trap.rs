@@ -937,6 +937,11 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        // The first run of a page of code whose preparation was left until
+        // it runs: finished, and the guest runs on.
+        if fwe_kernel::lazycode::fault(ss.pc) {
+            return;
+        }
         // Read as the host copies, which reports a hole rather than fault:
         // the pc of an instruction-fetch fault is not mapped.
         let word = |a: u64| read_host::<u32>(a);

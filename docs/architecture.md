@@ -253,6 +253,16 @@ The pieces that do it:
   loader keeps the same for the program and its dynamic linker, with the
   size of their stub space and their unwind tables' code ranges. The
   collector removes entries made more than 30 days ago.
+- `crates/kernel/src/lazycode.rs`: a mapped file's code whose preparation
+  is kept is written as each page first runs. Its stubs are written as it
+  is mapped; the words its pages owe (branches to the stubs, system calls
+  turned into traps) are kept aside, and those pages are made readable but
+  not executable. The guest's first instruction fetch there faults, and
+  the fault handler writes the page (each word only if it is still what
+  it was) and gives it the protections the guest asked for. A page made
+  writable has its words written first; one moved by `mremap` too. A
+  large library is mostly never run: clang's `libLLVM` has sites on 2,081
+  of its 5,927 code pages, most never reached by a compile.
 
 The stub for an instruction writing `sp` from `x18` sets `sp` before it
 reads its two scratch registers back from below the old `sp`; a signal

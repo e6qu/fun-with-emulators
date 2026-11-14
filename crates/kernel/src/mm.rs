@@ -1789,6 +1789,8 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EEXIST);
             }
             let guest = if p == haddr && fixed { addr } else { p };
+            // What was owed to the pages replaced goes with them.
+            crate::lazycode::unmapped(p, self.page_up(len));
             track(p, self.page_up(len));
             if view {
                 add_range(&mut file_views(), p, self.page_up(len));
@@ -1873,6 +1875,8 @@ impl<P: Platform> Kernel<P> {
                     untrack(p, self.page_up(len));
                     return e;
                 }
+                // Pages whose writes are owed are not to run yet.
+                crate::lazycode::protected(p, self.page_up(len), final_prot(prot));
             }
             break (p, guest);
         };
@@ -1887,6 +1891,7 @@ impl<P: Platform> Kernel<P> {
     /// Unmap guest host memory, or have the backend take it back
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
+        crate::lazycode::unmapped(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
         }
@@ -2005,6 +2010,10 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: guest-requested protection change of guest memory.
         let r = ret(unsafe { libc::mprotect(a, len as usize, final_prot(prot)) });
+        if r == 0 {
+            // Code with writes owed: made writable, they are made first.
+            crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
+        }
         if r == 0 && prot & mman::PROT_EXEC == 0 {
             for &(s, e) in &views {
                 // SAFETY: as above, for the file view's pages in the range.
@@ -2541,6 +2550,8 @@ impl<P: Platform> Kernel<P> {
                 (p as u64, p as u64)
             };
             let keep = old_len.min(new_len);
+            // Code with writes owed has them made before it moves.
+            crate::lazycode::settle(host, old_len);
             if !region::move_pages(host, dest, keep)
                 || extra > 0 && !self.grow_at(dest + old_len, extra, &area, host + (end - old))
             {

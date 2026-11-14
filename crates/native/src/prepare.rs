@@ -164,7 +164,22 @@ pub unsafe fn prepare(
         // entries for a few functions only (musl's assembly), and the rest
         // of its code is code all the same.
         .filter(|r| r.iter().map(|&(_, l)| l).sum::<u64>() * 2 >= len);
-    let patched = match cache.and_then(kept).and_then(|(n, d)| rewrite::replay(code, &n, d)) {
+    // Code mapped from a file whose preparation is known: its writes are
+    // made as each page is first run ([`fwe_kernel::lazycode`]), not now.
+    // The loader's images (`arena`) are copies, written already.
+    let kept = cache.and_then(kept);
+    let mut defer: Option<std::collections::BTreeMap<u64, (u32, u32)>> = None;
+    let replayed = match kept {
+        Some((n, d)) if arena.is_none() => {
+            let (p, words) = rewrite::plan(&n, d);
+            defer =
+                Some(words.into_iter().map(|(off, was, now)| (start + off, (was, now))).collect());
+            Some(p)
+        }
+        Some((n, d)) => rewrite::replay(code, &n, d),
+        None => None,
+    };
+    let patched = match replayed {
         Some(p) => p,
         None => {
             let p = rewrite::patch(code, known.as_deref());
@@ -197,7 +212,15 @@ pub unsafe fn prepare(
         let (group, rest) = sites.split_at(n);
         // SAFETY: the sites lie inside the caller's range.
         let placed = unsafe {
-            redirect(start, group, slot, x18_slot, page, start, start + len, arena.as_deref_mut())
+            redirect(
+                start,
+                group,
+                (slot, x18_slot),
+                page,
+                (start, start + len),
+                arena.as_deref_mut(),
+                defer.as_mut(),
+            )
         };
         match placed {
             Ok(()) => stats.stubs += group.len(),
@@ -218,12 +241,11 @@ pub unsafe fn prepare(
                         redirect(
                             start,
                             &needed,
-                            slot,
-                            x18_slot,
+                            (slot, x18_slot),
                             page,
-                            start,
-                            start + len,
+                            (start, start + len),
                             arena.as_deref_mut(),
+                            defer.as_mut(),
                         )
                     }?;
                     stats.stubs += needed.len();
@@ -232,7 +254,10 @@ pub unsafe fn prepare(
         }
         sites = rest;
     }
-    if stats.syscalls + stats.stubs > 0 {
+    if let Some(d) = defer {
+        let owed = d.into_iter().filter(|(_, (was, now))| was != now);
+        fwe_kernel::lazycode::owe(owed.map(|(at, (was, now))| (at, was, now)).collect());
+    } else if stats.syscalls + stats.stubs > 0 {
         // SAFETY: the range is mapped.
         unsafe { flush_icache(start, len) };
     }
@@ -248,12 +273,11 @@ pub unsafe fn prepare(
 unsafe fn redirect(
     base: u64,
     group: &[(u64, Site)],
-    slot: u32,
-    x18_slot: u32,
+    (slot, x18_slot): (u32, u32),
     page: u64,
-    lo: u64,
-    hi: u64,
+    (lo, hi): (u64, u64),
     arena: Option<&mut StubArena>,
+    mut defer: Option<&mut std::collections::BTreeMap<u64, (u32, u32)>>,
 ) -> Result<(), NoStubSpace> {
     let first = base + group[0].0;
     let last = base + group[group.len() - 1].0;
@@ -283,8 +307,12 @@ unsafe fn redirect(
             unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
         }
         let jump = rewrite::branch(at, cursor).expect("stub region within range");
-        // SAFETY: the site is writable guest code (caller's guarantee).
-        unsafe { (at as *mut u32).write(jump) };
+        match defer.as_deref_mut().and_then(|d| d.get_mut(&at)) {
+            // Owed until the page first runs.
+            Some(word) => word.1 = jump,
+            // SAFETY: the site is writable guest code (caller's guarantee).
+            None => unsafe { (at as *mut u32).write(jump) },
+        }
         cursor += (STUB_WORDS * 4) as u64;
     }
     if group

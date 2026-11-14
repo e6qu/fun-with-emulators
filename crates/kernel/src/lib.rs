@@ -45,6 +45,7 @@ mod keytypes;
 pub mod klock;
 pub mod landlock;
 mod landlockops;
+pub mod lazycode;
 pub mod leases;
 pub mod loopdev;
 pub mod maps;

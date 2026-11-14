@@ -192,6 +192,26 @@ fn classify(insn: u32, is_code: bool, known_code: bool) -> Word {
     w
 }
 
+/// What [`replay`] would do, without touching the code: the sites, and
+/// for every word noted its offset, what it was and what it is to be (the
+/// same for a site, which its stub's branch replaces later).
+pub fn plan(noted: &[Noted], x18_deferred: usize) -> (Patched, Vec<(u64, u32, u32)>) {
+    let mut out = Patched { x18_deferred, ..Patched::default() };
+    let mut words = Vec::with_capacity(noted.len());
+    for &(off, orig, flags) in noted {
+        let w = classify(orig, flags & IS_CODE != 0, flags & KNOWN_CODE != 0);
+        if w.syscall {
+            out.syscalls += 1;
+        }
+        if let Some(site) = w.site {
+            out.sites.push((off, site));
+        }
+        words.push((off, orig, w.replacement.unwrap_or(orig)));
+    }
+    out.noted = noted.to_vec();
+    (out, words)
+}
+
 /// Do again in `code` what [`patch`] did to the same code, from its
 /// [`Patched::noted`] and `x18_deferred`, touching only the words noted.
 /// `None`, with `code` untouched, if a noted word is not what it was.
