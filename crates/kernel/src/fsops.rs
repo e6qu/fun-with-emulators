@@ -398,10 +398,14 @@ impl<P: Platform> Kernel<P> {
             Ok(p) => p,
             Err(e) => {
                 crate::fs::drop_fifo();
+                crate::fs::ahead::clear();
                 return err(e);
             }
         };
-        self.open_with(dirfd, path, flags, mode)
+        let r = self.open_with(dirfd, path, flags, mode);
+        // A resolution made ahead serves only the call it was made for.
+        crate::fs::ahead::clear();
+        r
     }
 
     /// `openat` of guest path `path` (`openat2`'s too, once walked).

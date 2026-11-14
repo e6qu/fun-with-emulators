@@ -376,7 +376,8 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     b.ran = 1;
     // A changed mask is the host thread's now (the guest's is in force in
     // its code): a signal it unblocks that is pending is seen below.
-    if thread::mask() != mask {
+    let (_, now_mask) = thread::state();
+    if now_mask != mask {
         apply_guest_mask();
         UNBLOCKED.with(|u| u.set(false));
     }
@@ -387,7 +388,10 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         && regs.sp == before_sp
         && regs.x[1..].iter().zip(&before_x[1..]).fold(0, |d, (a, b)| d | (a ^ b)) == 0
         && regs.pstate == before_pstate
-        && thread::deliverable() == 0;
+        && {
+            let (pending, mask) = thread::state();
+            pending & !mask == 0
+        };
     if plain_return {
         crate::quiesce::enter();
     }

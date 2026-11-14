@@ -1251,8 +1251,6 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
-    // A resolution made ahead serves only the call it was made for.
-    fs::ahead::clear();
     // None of the calls run on the shared side waits.
     if syscalls::shares(nr) {
         return None;

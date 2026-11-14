@@ -312,7 +312,8 @@ fn set_traced(on: bool) {
 
 /// Whether this thread stops at each system call's entry and exit.
 pub fn stops_at_syscalls() -> bool {
-    traced() && SYSCALLS.with(std::cell::Cell::get)
+    // Nothing traced in the process: no look at this thread's state.
+    any_traced() && traced() && SYSCALLS.with(std::cell::Cell::get)
 }
 
 /// What names this thread's mailbox: the process's host pid for its main

@@ -373,7 +373,11 @@ impl<P: Platform> Kernel<P> {
 
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),
-            nr::OPENAT2 => self.sys_openat2(a[0], a[1], a[2], a[3]),
+            nr::OPENAT2 => {
+                let r = self.sys_openat2(a[0], a[1], a[2], a[3]);
+                crate::fs::ahead::clear();
+                r
+            }
             nr::STATFS => self.sys_statfs(a[0], a[1]),
             nr::FSTATFS => self.sys_fstatfs(a[0], a[1]),
             nr::GETDENTS64 => self.sys_getdents64(a[0], a[1], a[2]),

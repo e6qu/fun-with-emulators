@@ -257,12 +257,18 @@ impl<P: Platform> Kernel<P> {
     /// does short of delivering one. `false` when a signal is ready, for
     /// [`Kernel::deliver_pending`] under the exclusive lock.
     pub(crate) fn settle_shared(&self) -> bool {
-        thread::wake_others_if_asked(crate::host::WAKE_SIGNAL);
-        crate::signal::drain_to_signalfd();
-        if thread::deliverable() != 0 {
-            return false;
+        let (pending, _, saved) = thread::after_call(crate::host::WAKE_SIGNAL);
+        // With nothing pending there is nothing for a signalfd and nothing
+        // to deliver.
+        if pending != 0 {
+            crate::signal::drain_to_signalfd();
+            if thread::deliverable() != 0 {
+                return false;
+            }
         }
-        if let Some(mask) = thread::take_saved_mask() {
+        if saved.is_some()
+            && let Some(mask) = thread::take_saved_mask()
+        {
             thread::set_mask(mask);
         }
         true

@@ -64,7 +64,7 @@ pub fn init_main(pid: i32) {
             .flat_map(|s| std::iter::from_fn(move || p.take(s)).map(move |i| (s, i)))
             .collect()
     });
-    OWN.with(|o| o.set(std::ptr::null()));
+    HOT.with(|h| h.own.set(std::ptr::null()));
     for (s, i) in early {
         PROCESS.post(s, i);
     }
@@ -1002,18 +1002,60 @@ pub fn live_threads() -> usize {
 
 const UNBLOCKABLE: u64 = (1 << (signal::SIGKILL - 1)) | (1 << (signal::SIGSTOP - 1));
 
-thread_local! {
-    static MASK: Cell<u64> = const { Cell::new(0) };
+/// The signal state every system call looks at, in one thread-local so
+/// that a call looks it up once (each lookup is a call into the host's
+/// dynamic linker).
+struct Hot {
+    mask: Cell<u64>,
     /// The mask `rt_sigsuspend` replaced, restored once the call ends.
-    static SAVED_MASK: Cell<Option<u64>> = const { Cell::new(None) };
+    saved_mask: Cell<Option<u64>>,
+    /// This thread's registered pending set (owned by [`THREADS`]).
+    own: Cell<*const Pending>,
+    /// A process signal landed here while this thread blocked it: the
+    /// other threads are to be woken to take it ([`post_landed`]).
+    wake_others: Cell<bool>,
+}
+
+thread_local! {
+    static HOT: Hot = const {
+        Hot {
+            mask: Cell::new(0),
+            saved_mask: Cell::new(None),
+            own: Cell::new(std::ptr::null()),
+            wake_others: Cell::new(false),
+        }
+    };
     static ALTSTACK: Cell<Stack> = const {
         Cell::new(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 })
     };
-    /// This thread's registered pending set (owned by [`THREADS`]).
-    static OWN: Cell<*const Pending> = const { Cell::new(std::ptr::null()) };
-    /// A process signal landed here while this thread blocked it: the
-    /// other threads are to be woken to take it ([`post_landed`]).
-    static WAKE_OTHERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// After a system call: wake the other threads if a signal for them landed
+/// here, and the calling thread's pending signals, mask and saved mask
+/// (see [`save_mask`]), in one look.
+pub fn after_call(sig: libc::c_int) -> (u64, u64, Option<u64>) {
+    let (wake, own, mask, saved) =
+        HOT.with(|h| (h.wake_others.replace(false), h.own.get(), h.mask.get(), h.saved_mask.get()));
+    if wake {
+        wake_others(sig);
+    }
+    (own_bits(own) | PROCESS.bits(), mask, saved)
+}
+
+/// The calling thread's pending signals and mask, in one look.
+pub fn state() -> (u64, u64) {
+    let (own, mask) = HOT.with(|h| (h.own.get(), h.mask.get()));
+    (own_bits(own) | PROCESS.bits(), mask)
+}
+
+/// The bits pending in `own` (the process's set when it is null).
+fn own_bits(own: *const Pending) -> u64 {
+    if own.is_null() {
+        PROCESS.bits()
+    } else {
+        // SAFETY: the pointer is cleared before the registry drops its Arc.
+        unsafe { &*own }.bits()
+    }
 }
 
 /// Run `f` holding the thread registry lock (see [`crate::fork_locked`]).
@@ -1054,7 +1096,7 @@ pub fn register(tid: i32) -> Arc<Pending> {
 
 /// Make `pending` (from [`register`]) the calling thread's own set.
 pub fn adopt(pending: &Arc<Pending>) {
-    OWN.with(|o| o.set(Arc::as_ptr(pending)));
+    HOT.with(|h| h.own.set(Arc::as_ptr(pending)));
     crate::threadfs::enter(tid());
 }
 
@@ -1088,7 +1130,7 @@ pub fn unregister_current() {
     // Its process descriptors (`PIDFD_THREAD`) say it has ended.
     crate::pidfd::thread_gone(tid());
     drop_wait_pipe();
-    let own = OWN.with(|o| o.replace(std::ptr::null()));
+    let own = HOT.with(|h| h.own.replace(std::ptr::null()));
     directed_remove(tid());
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
     publish_tids(&tids());
@@ -1184,7 +1226,7 @@ pub fn post_directed(tid: i32, sig: u64, info: SigInfo) -> bool {
 }
 
 fn with_own<R>(f: impl FnOnce(&Pending) -> R) -> R {
-    let p = OWN.with(Cell::get);
+    let p = HOT.with(|h| h.own.get());
     if p.is_null() {
         f(&PROCESS)
     } else {
@@ -1236,7 +1278,7 @@ pub fn post_landed(sig: u64, info: SigInfo) {
         post_self(sig, info);
     } else {
         PROCESS.post(sig, info);
-        WAKE_OTHERS.with(|w| w.set(true));
+        HOT.with(|h| h.wake_others.set(true));
     }
 }
 
@@ -1244,7 +1286,7 @@ pub fn post_landed(sig: u64, info: SigInfo) {
 /// blocked it ([`post_landed`]). Takes the thread registry lock: called
 /// where this thread holds none of fwe's locks.
 pub fn wake_others_if_asked(sig: libc::c_int) {
-    if WAKE_OTHERS.with(|w| w.replace(false)) {
+    if HOT.with(|h| h.wake_others.replace(false)) {
         wake_others(sig);
     }
 }
@@ -1340,23 +1382,23 @@ pub fn deliverable() -> u64 {
 
 /// The calling thread's blocked-signal mask.
 pub fn mask() -> u64 {
-    MASK.with(Cell::get)
+    HOT.with(|h| h.mask.get())
 }
 
 /// Replace the calling thread's mask; `SIGKILL` and `SIGSTOP` cannot be
 /// blocked.
 pub fn set_mask(mask: u64) {
-    MASK.with(|m| m.set(mask & !UNBLOCKABLE));
+    HOT.with(|h| h.mask.set(mask & !UNBLOCKABLE));
 }
 
 /// Remember the mask to restore when `rt_sigsuspend` ends.
 pub fn save_mask(mask: u64) {
-    SAVED_MASK.with(|m| m.set(Some(mask)));
+    HOT.with(|h| h.saved_mask.set(Some(mask)));
 }
 
 /// The mask saved by `rt_sigsuspend`, if the call is still in progress.
 pub fn take_saved_mask() -> Option<u64> {
-    SAVED_MASK.with(Cell::take)
+    HOT.with(|h| h.saved_mask.take())
 }
 
 /// The calling thread's alternate signal stack.

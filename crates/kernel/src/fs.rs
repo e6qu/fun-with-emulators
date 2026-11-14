@@ -2847,7 +2847,7 @@ pub(crate) mod ahead {
         (placed && key.matches(v, path, follow)).then_some(r)
     }
 
-    /// Forget any resolution made ahead: a new call starts.
+    /// Forget any resolution made ahead: the open it was made for is done.
     pub fn clear() {
         let _ = AHEAD.try_with(|a| a.borrow_mut().take());
     }
