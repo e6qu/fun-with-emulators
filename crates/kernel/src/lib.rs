@@ -1041,6 +1041,22 @@ pub fn thread_exit_cleanup() {
     }
 }
 
+/// The calling host thread, whose guest thread ended, is to run another
+/// one (the backend keeps host threads for reuse): every per-thread state
+/// of the kernel's is as a new host thread's.
+pub fn thread_reused() {
+    thread::thread_reused();
+    fs::thread_reused();
+    netns::thread_reused();
+    sysvipc::thread_reused();
+    threadfs::thread_reused();
+    ptrace::thread_reused();
+    uaccess::thread_reused();
+    mounts::store::thread_reused();
+    EXEC_FILE.with(|f| f.borrow_mut().take());
+    EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
+}
+
 /// Release every thread's robust futexes (`set_robust_list`) as the
 /// process ends or runs another program, its memory still there: Linux
 /// releases each thread's as the thread ends.

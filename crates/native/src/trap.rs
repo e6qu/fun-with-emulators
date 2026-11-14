@@ -105,6 +105,14 @@ thread_local! {
     static REROUTING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// This host thread starts another guest thread
+/// ([`crate::threads::wait_for_next`]): its flags are a new thread's.
+pub fn thread_reused() {
+    IN_GUEST.with(|g| g.set(false));
+    REROUTING.with(|r| r.set(false));
+    UNBLOCKED.with(|u| u.set(false));
+}
+
 /// Whether the host delivers `sig` to [`on_async`] (the guest catches it).
 fn caught(sig: libc::c_int) -> bool {
     // SAFETY: zeroed bytes are a valid `sigaction`; this only reads it.
@@ -349,7 +357,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
             libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
         }
         fwe_kernel::thread_exit_cleanup();
-        crate::exit_current_thread(b.regs.x[0] as i32);
+        crate::exit_current_thread(b.regs.x[0] as i32, true);
     }
     if !plain {
         return 1;
@@ -562,7 +570,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         {
             // The thread ends without the kernel lock, as `exit` does.
             fwe_kernel::thread_exit_cleanup();
-            crate::exit_current_thread(128 + fwe_abi::signal::SIGSYS as i32);
+            crate::exit_current_thread(128 + fwe_abi::signal::SIGSYS as i32, false);
         }
         if action != fwe_kernel::seccomp::Action::Allow {
             kernel().as_mut().unwrap().seccomp_refuse(&mut regs, nr, &args, action);
@@ -582,7 +590,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // A thread exits without the kernel lock: pthread_exit never returns,
         // so a held lock would never be released.
         fwe_kernel::thread_exit_cleanup();
-        crate::exit_current_thread(regs.x[0] as i32);
+        crate::exit_current_thread(regs.x[0] as i32, false);
     }
     if nr == fwe_abi::nr::EXECVE || nr == fwe_abi::nr::EXECVEAT {
         // On success this enters the new program and never returns; on

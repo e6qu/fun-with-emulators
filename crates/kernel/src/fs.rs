@@ -2757,6 +2757,13 @@ thread_local! {
     static FIFO: std::cell::Cell<Option<(i32, u64)>> = const { std::cell::Cell::new(None) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    UNMOUNTING.with(|u| u.set(false));
+    FIFO.with(|f| f.set(None));
+    ahead::clear();
+}
+
 /// FIFOs [`open_fifo_unlocked`] holds open for a thread's `openat`, by
 /// fwe's descriptor: a fork child closes them, as no `openat` of its takes
 /// them.

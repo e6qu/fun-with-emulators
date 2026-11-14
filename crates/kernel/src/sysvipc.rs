@@ -743,6 +743,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    THREAD.with(|t| t.borrow_mut().take());
+}
+
 /// Make `ipc` this thread's own (`Some`), or the process's again (`None`).
 pub fn set_thread(ipc: Option<Option<Arc<Record<Ipc>>>>) {
     THREAD.with(|t| *t.borrow_mut() = ipc);

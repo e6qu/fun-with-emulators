@@ -158,7 +158,6 @@ pub fn forked_child() {
     }
 }
 
-/// The host protection of the memory at host address `addr`.
 /// The host's page size.
 pub fn host_page_size() -> u64 {
     // SAFETY: sysconf only reads a system value.

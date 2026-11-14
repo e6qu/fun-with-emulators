@@ -186,6 +186,11 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    HOST_ARGS.with(|h| h.borrow_mut().clear());
+}
+
 /// The host address for pointer argument `addr` of the system call this
 /// thread is starting ([`g2h`]), remembered so the kernel's own copies
 /// through it are taken as copies of `addr` ([`guest_of`]).

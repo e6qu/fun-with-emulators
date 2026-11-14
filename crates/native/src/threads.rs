@@ -14,12 +14,17 @@ use std::sync::atomic::Ordering;
 struct Spawn {
     regs: Regs,
     tid: i32,
-    /// Guest thread pointer (`CLONE_SETTLS`), or `None` to inherit.
-    tls: Option<u64>,
+    /// Guest thread pointer: `CLONE_SETTLS`'s, else the creator's.
+    tls: u64,
     /// `set_tid_address` word (`CLONE_CHILD_CLEARTID`), or 0.
     clear_child_tid: u64,
     /// The creating thread's blocked mask, which the new thread inherits.
     sigmask: u64,
+    /// The creating thread's name (`PR_SET_NAME`), which it inherits.
+    name: Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]>,
+    /// The creating thread's floating-point control and status registers,
+    /// as Linux copies them.
+    fp: (u64, u64),
     /// The thread's pending signals, registered before it starts.
     pending: std::sync::Arc<thread::Pending>,
 }
@@ -78,9 +83,11 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     let spawn = Box::new(Spawn {
         regs,
         tid,
-        tls: (flags & cl::CLONE_SETTLS != 0).then_some(tls),
+        tls: if flags & cl::CLONE_SETTLS != 0 { tls } else { thread_pointer() },
         clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
         sigmask: thread::mask(),
+        name: thread::name(),
+        fp: fp_controls(),
         pending: thread::register(tid),
     });
     let pending = spawn.pending.clone();
@@ -99,11 +106,16 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     }
 }
 
-/// Create a detached host thread that becomes the guest thread. It starts
-/// with every signal blocked, whatever the caller's mask (a system call
-/// runs with the guest's unblocked; see `host::with_signals_blocked`), and
-/// `child_main` takes the guest's mask once it is set up.
+/// A host thread that becomes the guest thread: one an ended thread left
+/// waiting ([`crate::pool`]), or a new detached one. Either starts with
+/// every signal blocked, whatever the caller's mask (a system call runs
+/// with the guest's unblocked; see `host::with_signals_blocked`), and takes
+/// the guest's mask once it is set up ([`run`]).
 fn spawn_host_thread(spawn: Box<Spawn>) -> Option<libc::pthread_t> {
+    let spawn = match crate::pool::give(spawn) {
+        Ok(host) => return Some(host),
+        Err(spawn) => spawn,
+    };
     let arg = Box::into_raw(spawn).cast::<libc::c_void>();
     // SAFETY: a detached pthread with the default stack; `child_main` takes
     // ownership of the boxed `Spawn` passed as its argument.
@@ -138,13 +150,37 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
         None => trap::install_thread_altstack(),
     }
     crate::interactive();
+    run(spawn)
+}
+
+/// The calling thread's guest thread ended (not the process's last), from
+/// the system-call gate, with every host signal blocked and no lock held:
+/// its host thread waits for the next thread a `clone` makes and runs it.
+/// Returns if the pool has no room, for the caller to end the host thread.
+pub(crate) fn wait_for_next() {
+    let Some(spawn) = crate::pool::wait::<Spawn>() else { return };
+    // A new thread's state: the kernel's, the trap's and the gate's, and
+    // the floating-point controls a new host thread starts with.
+    fwe_kernel::thread_reused();
+    trap::thread_reused();
+    crate::gate::reset_block();
+    run(spawn)
+}
+
+/// Become the guest thread `spawn` describes.
+fn run(spawn: Box<Spawn>) -> ! {
     thread::set_tid(spawn.tid);
+    if let Some(name) = spawn.name {
+        thread::set_name(name);
+    }
+    let (fpcr, fpsr) = spawn.fp;
+    // SAFETY: the guest's floating-point controls, which fwe's own code
+    // runs under too (the system-call gate leaves them as they are).
+    unsafe { core::arch::asm!("msr fpcr, {}", "msr fpsr, {}", in(reg) fpcr, in(reg) fpsr) };
     thread::adopt(&spawn.pending);
     thread::set_mask(spawn.sigmask);
     thread::set_clear_child_tid(spawn.clear_child_tid);
-    if let Some(tls) = spawn.tls {
-        set_thread_pointer(tls);
-    }
+    set_thread_pointer(spawn.tls);
     // The guest's x18 lives in a per-thread slot; the child inherits the
     // parent's value as it would any other register.
     trap::set_guest_x18(spawn.regs.x[18]);
@@ -156,6 +192,22 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     trap::prepare_guest_entry();
     // SAFETY: `regs` describes a runnable guest context on the child stack.
     unsafe { trap::enter_guest_full(&regs) }
+}
+
+/// The calling thread's floating-point control and status registers: the
+/// guest's, in a system call.
+fn fp_controls() -> (u64, u64) {
+    let (fpcr, fpsr): (u64, u64);
+    // SAFETY: reads two registers.
+    unsafe { core::arch::asm!("mrs {}, fpcr", "mrs {}, fpsr", out(reg) fpcr, out(reg) fpsr) };
+    (fpcr, fpsr)
+}
+
+/// The calling thread's guest thread pointer.
+fn thread_pointer() -> u64 {
+    let key = (thread_pointer_slot() / 8) as libc::pthread_key_t;
+    // SAFETY: `key` is the process-wide key fwe allocated for the slot.
+    unsafe { libc::pthread_getspecific(key) as u64 }
 }
 
 /// Set this thread's guest thread pointer into its TSD slot, where the

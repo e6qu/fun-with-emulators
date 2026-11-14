@@ -954,6 +954,22 @@ fn threads_first_run_shared_code_together() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A thread made after another ended starts as a new one, whatever host
+/// thread runs it: no signal stack, and its creator's name, signal mask
+/// and floating-point rounding mode, round after round.
+#[test]
+fn a_thread_after_another_ended_starts_afresh() {
+    let prog = build_c_dynamic("threadreuse", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "threadreuse");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    let line = "signal stack disabled: 1, name: maker, SIGUSR1 blocked: 0, rounding: 3\n";
+    assert_eq!(stdout(&out), line.repeat(4), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
 /// crt objects, using the heap and buffered stdio from the shared libc. Covers
 /// the complete path — `ld-musl` self-relocation, `crt` `_start`,

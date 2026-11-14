@@ -958,6 +958,16 @@ std::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    TRACED.with(|t| t.set(false));
+    TRACER.with(|t| t.set(0));
+    SYSCALLS.with(|t| t.set(false));
+    NEW_THREAD.with(|t| t.set(None));
+    NOTED.with(|t| t.set(None));
+    STEPS.with(|s| s.borrow_mut().clear());
+}
+
 /// Where the instruction `insn` at `pc` may go next, with registers `x`.
 pub fn next_pcs(insn: u32, pc: u64, x: &[u64; 31]) -> Vec<u64> {
     let sext = |v: u32, bits: u32| ((v as i64) << (64 - bits)) >> (64 - bits);

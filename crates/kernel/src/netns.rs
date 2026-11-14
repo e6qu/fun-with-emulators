@@ -38,6 +38,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    THREAD.with(|t| t.borrow_mut().take());
+}
+
 /// The calling thread's network namespace, if it is one of fwe's.
 pub fn current() -> Option<Arc<Record<Net>>> {
     if let Some(own) = THREAD.with(|t| t.borrow().clone()) {

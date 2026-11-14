@@ -282,6 +282,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             thread::forked();
             // The parent's threads' stacks are none of the child's to reuse.
             crate::stacks::forked();
+            // Nor are its waiting threads.
+            crate::pool::forked();
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);

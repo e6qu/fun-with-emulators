@@ -7,6 +7,8 @@ mod gate;
 pub mod hv;
 pub mod hwcap;
 pub mod loader;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod pool;
 pub mod prepare;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod process;
@@ -35,9 +37,13 @@ fn mark_exit() {
 }
 
 /// End the calling guest thread: the last thread ends the process, any other
-/// ends just its host thread. Must be called without the kernel lock held,
-/// since `pthread_exit` does not return and would never release it.
-pub(crate) fn exit_current_thread(code: i32) -> ! {
+/// ends just its host thread, or, from the system-call gate (`from_gate`),
+/// leaves it to run the next thread ([`threads::wait_for_next`]). Must be
+/// called without the kernel lock held, since neither returns and the lock
+/// would never be released.
+pub(crate) fn exit_current_thread(code: i32, from_gate: bool) -> ! {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = from_gate;
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
         mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
@@ -48,6 +54,9 @@ pub(crate) fn exit_current_thread(code: i32) -> ! {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         quiesce::forget_current();
+        if from_gate {
+            threads::wait_for_next();
+        }
         // Its stacks, for a thread that starts once this one has gone.
         if let (Some(gate), Some(alt)) = (gate::block_mapping(), trap::altstack_mapping()) {
             stacks::give(gate, alt);
@@ -134,7 +143,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit_thread(&mut self, code: i32) -> ! {
-        exit_current_thread(code)
+        exit_current_thread(code, false)
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {

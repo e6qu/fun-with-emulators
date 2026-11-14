@@ -128,6 +128,14 @@ pub fn adopt_block(p: u64) {
     }
 }
 
+/// Start this thread's block afresh, as [`adopt_block`] does a pooled one:
+/// its thread runs another guest thread.
+pub fn reset_block() {
+    if let Some(p) = block_mapping() {
+        adopt_block(p);
+    }
+}
+
 /// This thread's block's mapping, if it has one.
 pub fn block_mapping() -> Option<u64> {
     block().map(|b| std::ptr::from_ref(b) as u64)
