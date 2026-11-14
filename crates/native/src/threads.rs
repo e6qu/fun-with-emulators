@@ -129,7 +129,14 @@ extern "C" fn child_main(arg: *mut libc::c_void) -> *mut libc::c_void {
     // SAFETY: `arg` is the `Spawn` box handed to `pthread_create`.
     let spawn = unsafe { Box::from_raw(arg.cast::<Spawn>()) };
 
-    trap::install_thread_altstack();
+    // Stacks an ended thread gave back, or fresh ones.
+    match crate::stacks::take() {
+        Some((gate, alt)) => {
+            crate::gate::adopt_block(gate);
+            trap::use_altstack(alt);
+        }
+        None => trap::install_thread_altstack(),
+    }
     crate::interactive();
     thread::set_tid(spawn.tid);
     thread::adopt(&spawn.pending);

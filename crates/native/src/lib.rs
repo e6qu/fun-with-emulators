@@ -15,6 +15,8 @@ mod quiesce;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod stacks;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod threads;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod trap;
@@ -44,7 +46,13 @@ pub(crate) fn exit_current_thread(code: i32) -> ! {
         unsafe { libc::_exit(code) }
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    quiesce::forget_current();
+    {
+        quiesce::forget_current();
+        // Its stacks, for a thread that starts once this one has gone.
+        if let (Some(gate), Some(alt)) = (gate::block_mapping(), trap::altstack_mapping()) {
+            stacks::give(gate, alt);
+        }
+    }
     // SAFETY: ends the calling host thread; the process keeps running.
     unsafe { libc::pthread_exit(std::ptr::null_mut()) }
 }

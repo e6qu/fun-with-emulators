@@ -311,7 +311,10 @@ finish itself (see
   stub returns to, an `active` flag and a count of signals recorded for
   it) and a gate stack of 1 MiB, mapped as it first enters guest code
   (`trap::prepare_guest_entry`); a TSD slot points to the block. A forked
-  child keeps its copy.
+  child keeps its copy. A thread that ends gives its gate stack and signal
+  stack back (`crates/native/src/stacks.rs`), and a thread that starts
+  takes a pair whose thread has gone (its Mach thread port is dead by
+  then) before mapping new ones.
 - **The mask:** guest code runs under the host mask its guest mask calls
   for, and so does the call, as a handler's system call does once it
   unblocks the guest's signals. A call that changes the guest's mask

@@ -1187,6 +1187,28 @@ pub fn ensure_thread_altstack() {
     }
 }
 
+/// Make the mapping at `stack` (an ended thread's, [`crate::stacks`]) this
+/// thread's signal stack.
+pub fn use_altstack(stack: u64) {
+    let ss = libc::stack_t {
+        ss_sp: stack as *mut libc::c_void,
+        ss_size: SIGNAL_STACK_SIZE,
+        ss_flags: 0,
+    };
+    // SAFETY: a mapping of the signal stack's size, this thread's alone.
+    assert_eq!(unsafe { libc::sigaltstack(&ss, std::ptr::null_mut()) }, 0, "sigaltstack failed");
+}
+
+/// This thread's signal stack, if it has one.
+pub fn altstack_mapping() -> Option<u64> {
+    // SAFETY: querying this thread's signal stack into a zeroed stack_t.
+    unsafe {
+        let mut old: libc::stack_t = std::mem::zeroed();
+        (libc::sigaltstack(std::ptr::null(), &mut old) == 0 && old.ss_flags & libc::SS_DISABLE == 0)
+            .then_some(old.ss_sp as u64)
+    }
+}
+
 pub fn install_thread_altstack() {
     // SAFETY: a fresh mapping for the signal stack, leaked for the life of
     // the thread (which runs until the process or the thread exits).

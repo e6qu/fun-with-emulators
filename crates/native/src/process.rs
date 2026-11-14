@@ -278,6 +278,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
             thread::forked();
+            // The parent's threads' stacks are none of the child's to reuse.
+            crate::stacks::forked();
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);

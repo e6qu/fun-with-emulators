@@ -112,6 +112,24 @@ pub fn ensure_block() {
     }
 }
 
+/// Give this thread the block and gate stack at `p` (a mapping an ended
+/// thread gave back, [`crate::stacks`]), fresh.
+pub fn adopt_block(p: u64) {
+    let size = crate::page_size() as usize + STACK_SIZE;
+    // SAFETY: the mapping is this thread's alone now; the block starts it.
+    unsafe {
+        std::ptr::write_bytes(p as *mut Block, 0, 1);
+        let b = p as *mut Block;
+        (*b).stack = p + size as u64;
+        libc::pthread_setspecific(key(), p as *const libc::c_void);
+    }
+}
+
+/// This thread's block's mapping, if it has one.
+pub fn block_mapping() -> Option<u64> {
+    block().map(|b| std::ptr::from_ref(b) as u64)
+}
+
 /// Whether `pc` is in the gate's own instructions. Async-signal-safe.
 pub fn in_gate(pc: u64) -> bool {
     (fwe_gate as *const () as u64..fwe_gate_end as *const () as u64).contains(&pc)
