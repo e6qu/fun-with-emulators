@@ -331,7 +331,7 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
 }
 
 /// A record's bytes as written: its length and checksum, then itself.
-fn frame(body: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 16);
     out.extend_from_slice(&(body.len() as u64).to_le_bytes());
     out.extend_from_slice(&checksum(body).to_le_bytes());
@@ -340,7 +340,7 @@ fn frame(body: &[u8]) -> Vec<u8> {
 }
 
 /// The record in `bytes` ([`frame`]), if it is whole.
-fn unframe(bytes: &[u8]) -> Option<&[u8]> {
+pub(crate) fn unframe(bytes: &[u8]) -> Option<&[u8]> {
     let len = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
     let sum = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
     let body = bytes.get(16..16usize.checked_add(len)?)?;

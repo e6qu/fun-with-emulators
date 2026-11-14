@@ -567,8 +567,10 @@ impl Published {
 }
 
 /// The file this process publishes its mappings in: other processes read
-/// it for `/proc/<pid>/maps`. It holds a sequence word (odd while a change
-/// is written), the length of what follows, and the encoded [`Published`].
+/// it for `/proc/<pid>/maps`. It holds the encoded [`Published`] framed as
+/// a process record is ([`crate::procreg::frame`]): its length and
+/// checksum, written with it in one `pwrite`, so a reader that finds the
+/// checksum wrong has caught a write half done and reads again.
 /// It stays open while the process runs and is closed as it ends
 /// ([`close_for_exit`]): a process that ends holding a file it wrote makes
 /// the next process's first close of a file it wrote wait (milliseconds,
@@ -576,8 +578,6 @@ impl Published {
 pub(crate) struct Outbox {
     pid: i32,
     fd: i32,
-    /// The sequence word as last written.
-    seq: u64,
 }
 
 /// The process is ending: its mappings are published no more.
@@ -595,9 +595,6 @@ pub fn close_for_exit() {
 }
 
 pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
-
-/// The header before the encoded record: the sequence word and the length.
-const HEADER: usize = 16;
 
 /// This process's mappings encoded as [`publish`] publishes them.
 pub fn snapshot() -> Vec<u8> {
@@ -700,29 +697,17 @@ pub fn publish_now() {
             libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
         };
         let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *out = Some(Outbox { pid: me, fd, seq: 0 });
+        *out = Some(Outbox { pid: me, fd });
     }
     let Some(o) = out.as_mut() else { return };
     // Written with `pwrite`, not through a shared mapping, whose dirty
     // pages would be written back after the process has gone, with the
-    // same wait as a file left open.
-    let fd = o.fd;
-    let put = |bytes: &[u8], at: usize| {
-        // SAFETY: a buffer of its length, on fwe's own descriptor.
-        unsafe { libc::pwrite(fd, bytes.as_ptr().cast(), bytes.len(), at as libc::off_t) };
-    };
-    // The sequence word odd while the rest changes; the length and the
-    // body, which follow it, in one write; then even again. A file left
-    // by an earlier process of the same pid is overwritten in place: the
-    // length says where this record ends.
-    let odd = o.seq | 1;
-    put(&odd.to_ne_bytes(), 0);
-    let mut rest = Vec::with_capacity(8 + body.len());
-    rest.extend_from_slice(&(body.len() as u64).to_ne_bytes());
-    rest.extend_from_slice(&body);
-    put(&rest, 8);
-    o.seq = odd + 1;
-    put(&o.seq.to_ne_bytes(), 0);
+    // same wait as a file left open. One write: the frame says whether a
+    // reader saw all of it. A longer record left by an earlier one stays
+    // past the frame's end.
+    let framed = crate::procreg::frame(&body);
+    // SAFETY: a buffer of its length, on fwe's own descriptor.
+    unsafe { libc::pwrite(o.fd, framed.as_ptr().cast(), framed.len(), 0) };
 }
 
 /// What [`snapshot`] encoded.
@@ -741,27 +726,23 @@ fn decode_published(body: &[u8]) -> Option<Published> {
 /// The mappings host process `pid` published, if it is a process of
 /// fwe's that has.
 pub fn of_process(pid: i32) -> Option<Published> {
-    use std::os::unix::fs::FileExt;
     let path = crate::procreg::maps_path(pid)?;
     let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)) else {
         // None published yet: what it was forked with.
         let r = crate::procreg::read(pid)?;
         return (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten();
     };
-    let word = |at: u64| -> Option<u64> {
-        let mut b = [0u8; 8];
-        file.read_exact_at(&mut b, at).ok()?;
-        Some(u64::from_ne_bytes(b))
-    };
-    // A consistent copy: the same even sequence word before and after.
+    // A whole record: one whose frame checks, read again if a write was
+    // half done.
+    use std::io::{Read, Seek};
+    let mut buf = Vec::new();
+    let mut f = &file;
     for _ in 0..1000 {
-        let before = word(0)?;
-        if before & 1 == 0 {
-            let len = word(8)? as usize;
-            let mut body = vec![0u8; len];
-            if file.read_exact_at(&mut body, HEADER as u64).is_ok() && word(0)? == before {
-                return decode_published(&body);
-            }
+        buf.clear();
+        f.seek(std::io::SeekFrom::Start(0)).ok()?;
+        f.read_to_end(&mut buf).ok()?;
+        if let Some(body) = crate::procreg::unframe(&buf) {
+            return decode_published(body);
         }
         std::thread::yield_now();
     }

@@ -256,10 +256,20 @@ core::arch::global_asm!(
     "ldp q26, q27, [x2, #416]",
     "ldp q28, q29, [x2, #448]",
     "ldp q30, q31, [x2, #480]",
+    // The floating-point status and control as they were, written only
+    // where fwe's code changed them: writing `fpcr` stalls the core.
     "ldr w3, [x0, #784]",
-    "ldr w4, [x0, #788]",
+    "mrs x5, fpsr",
+    "cmp x3, x5",
+    "b.eq 2f",
     "msr fpsr, x3",
+    "2:",
+    "ldr w4, [x0, #788]",
+    "mrs x5, fpcr",
+    "cmp x4, x5",
+    "b.eq 3f",
     "msr fpcr, x4",
+    "3:",
     "ldr x3, [x0, #264]",
     "msr nzcv, x3",
     // Back on the guest's stack, its x30 still saved there for the stub.

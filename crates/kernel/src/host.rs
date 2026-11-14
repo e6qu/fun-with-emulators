@@ -1654,3 +1654,23 @@ fn kept_id(slot: &std::sync::atomic::AtomicU64, ask: impl FnOnce() -> u32) -> u3
     slot.store(u64::from(id), Relaxed);
     id
 }
+
+/// Milliseconds on a monotonic clock that is cheap to read and coarse:
+/// for checks made at most so often on every call, where reading the
+/// precise clock costs more than the check (it does in a virtual machine).
+pub fn coarse_ms() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn clock_gettime_nsec_np(clock: libc::clockid_t) -> u64;
+        }
+        // SAFETY: plain host call; the approximate clock is read from
+        // memory the kernel keeps current.
+        unsafe { clock_gettime_nsec_np(libc::CLOCK_MONOTONIC_RAW_APPROX) / 1_000_000 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+}

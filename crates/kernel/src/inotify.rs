@@ -144,8 +144,7 @@ static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
 static MISSED: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+    crate::host::coarse_ms() + 1
 }
 
 fn registry_dir() -> Option<Vec<u8>> {

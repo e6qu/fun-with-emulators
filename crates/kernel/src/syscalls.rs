@@ -797,6 +797,25 @@ impl<P: Platform> Kernel<P> {
             return None;
         }
         crate::maps::flush_before(n);
+        // A call that names no descriptor, path or buffer of data: none of
+        // the checks or notes around file calls applies to it.
+        if matches!(
+            n,
+            nr::GETPID
+                | nr::GETTID
+                | nr::GETPPID
+                | nr::GETUID
+                | nr::GETEUID
+                | nr::GETGID
+                | nr::GETEGID
+                | nr::GETPGID
+                | nr::GETSID
+                | nr::SCHED_YIELD
+                | nr::CLOCK_GETTIME
+                | nr::GETTIMEOFDAY
+        ) {
+            return Some(self.shared_call(n, a));
+        }
         if let Err(e) = crate::fdtable::check_args(n, &a) {
             return Some(e);
         }

@@ -342,8 +342,9 @@ records Linux would keep about them:
   anonymous with the host's protections, so a program looking for free
   space does not pick it.
 - **Other processes:** each process publishes its record in a file
-  beside its process record (a sequence word odd while it is written)
-  before its next system call that is not a memory call, and before a
+  beside its process record (framed with its length and checksum, in one
+  write, so a reader that catches a write half done reads again) before
+  its next system call that is not a memory call, and before a
   `fork`, so a run of mapping calls publishes once. The file is written
   with `pwrite` and closed as the process ends, as its thread list's is:
   a process that ends holding a file it wrote, or with dirty pages of one

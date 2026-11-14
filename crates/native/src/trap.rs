@@ -354,7 +354,10 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     }
     reroute_parked();
     let mask = thread::mask();
-    let before = b.regs;
+    // What a plain return keeps: the general registers but `x0`, `sp` and
+    // the flags (the vector registers change only with the pc, as a
+    // signal's delivery or return changes them).
+    let (before_x, before_sp, before_pstate) = (b.regs.x, b.regs.sp, b.regs.pstate);
     let regs = &mut b.regs;
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     if thread_clone {
@@ -381,10 +384,9 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     b.seen = b.signals.load(SeqCst);
     let regs = &b.regs;
     let plain_return = regs.pc == site + 4
-        && regs.sp == before.sp
-        && regs.x[1..] == before.x[1..]
-        && regs.pstate == before.pstate
-        && regs.fp == before.fp
+        && regs.sp == before_sp
+        && regs.x[1..].iter().zip(&before_x[1..]).fold(0, |d, (a, b)| d | (a ^ b)) == 0
+        && regs.pstate == before_pstate
         && thread::deliverable() == 0;
     if plain_return {
         crate::quiesce::enter();
