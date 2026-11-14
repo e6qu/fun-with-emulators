@@ -44,29 +44,42 @@ impl Access {
     /// permission check has it: `CAP_DAC_OVERRIDE` passes all but running
     /// a file nobody may run, `CAP_DAC_READ_SEARCH` reading and searching;
     /// else the owner's, the group's or the others' bits.
-    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
     pub fn permits(&self, st: &libc::stat, want: u32) -> bool {
-        let dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-        if self.dac_override {
-            return want & 1 == 0 || dir || st.st_mode & 0o111 != 0;
-        }
-        if self.dac_read_search && want & 2 == 0 && (want & 1 == 0 || dir) {
-            return true;
-        }
-        let shift = if self.fsuid == st.st_uid {
-            6
-        } else if self.fsgid == st.st_gid || self.groups.contains(&st.st_gid) {
-            3
-        } else {
-            0
-        };
-        (st.st_mode as u32 >> shift) & want == want
+        permitted(
+            (self.fsuid, self.fsgid, &self.groups),
+            (self.dac_override, self.dac_read_search),
+            st,
+            want,
+        )
     }
 
     /// Whether it passes every directory's search bits.
     pub fn searches_any(&self) -> bool {
         self.dac_override || self.dac_read_search
     }
+}
+
+/// [`Access::permits`] for ids `(fsuid, fsgid, groups)` and capabilities
+/// `(CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH)`.
+#[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+fn permitted(ids: (u32, u32, &[u32]), caps: (bool, bool), st: &libc::stat, want: u32) -> bool {
+    let (fsuid, fsgid, groups) = ids;
+    let (dac_override, dac_read_search) = caps;
+    let dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    if dac_override {
+        return want & 1 == 0 || dir || st.st_mode & 0o111 != 0;
+    }
+    if dac_read_search && want & 2 == 0 && (want & 1 == 0 || dir) {
+        return true;
+    }
+    let shift = if fsuid == st.st_uid {
+        6
+    } else if fsgid == st.st_gid || groups.contains(&st.st_gid) {
+        3
+    } else {
+        0
+    };
+    (st.st_mode as u32 >> shift) & want == want
 }
 
 /// The process's [`Access`], as of its last system call ([`publish`]): for
@@ -409,6 +422,16 @@ impl Creds {
     /// Current supplementary groups.
     pub fn groups(&self) -> &[u32] {
         &self.groups
+    }
+
+    /// [`Access::permits`] for these credentials, as they are now.
+    pub fn permits(&self, st: &libc::stat, want: u32) -> bool {
+        permitted(
+            (self.fsuid, self.fsgid, &self.groups),
+            (self.has(crate::caps::CAP_DAC_OVERRIDE), self.has(crate::caps::CAP_DAC_READ_SEARCH)),
+            st,
+            want,
+        )
     }
 
     /// `setgroups`: privileged only.
