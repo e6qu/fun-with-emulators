@@ -1461,7 +1461,6 @@ pub fn exiting(status: i32) {
     crate::sysvipc::process_leaving(false);
     // The files it keeps open and writes, closed before it ends.
     crate::maps::close_for_exit();
-    crate::thread::close_tids_for_exit();
     let me = me();
     // Ending of a Linux signal: its status as recorded ([`ending`]).
     let status = end_status(me).unwrap_or(status);

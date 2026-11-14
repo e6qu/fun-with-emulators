@@ -369,8 +369,7 @@ records Linux would keep about them:
   write, so a reader that catches a write half done reads again) before
   its next system call that is not a memory call, and before a
   `fork`, so a run of mapping calls publishes once. The file is written
-  with `pwrite` and closed as the process ends, as its thread list's
-  mapping is let go:
+  with `pwrite` and closed as the process ends:
   a process that ends holding a file it wrote, or with dirty pages of one
   mapped, makes the next process's first close of a file it wrote wait
   for the write-back (milliseconds on a virtual machine's disk). Another
@@ -433,8 +432,10 @@ keeps:
   process into another with the same pid), cgroup, namespaces, name,
   command line, program, ancestors, subreaper flag, nice value,
   scheduling policy and `oom_score_adj`. They are kept in memory every
-  fwe process of the user maps (`crates/kernel/src/procstore.rs`, a file
-  in fwe's private directory): an entry for each pid (a lock naming its
+  fwe process of the user maps (`crates/kernel/src/procstore.rs`, a POSIX
+  shared memory object of the user's, not a file: a file's dirty pages
+  are written back to its disk as each process holding them ends): an
+  entry for each pid (a lock naming its
   holder's pid, taken over from one that died holding it; a sequence
   number, odd while the record changes; where its bytes are; the end
   status), the bytes in chained 4 KiB blocks, a bitmap of the pids with
@@ -578,12 +579,9 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   pending sets the handler reads without a lock.
 - **Threads of another process:** each tid's process is recorded beside
   the shared tid counter (taken sixty-four at a time), and a process that
-  has had more than its main thread publishes its tids (`threads-<pid>`
-  in fwe's private directory, kept while the process lives): the process
-  maps the file and writes the list in memory, a sequence number odd
-  while it changes, then the count and the tids; a reader reads the file
-  and reads again if the number was odd or changed meanwhile.
-  `/proc/<pid>/task` lists them.
+  has had more than its main thread publishes its tids, in an entry of
+  its own in the process records' memory, which `/proc/<pid>/task`
+  lists.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.

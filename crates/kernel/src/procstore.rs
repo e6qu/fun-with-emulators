@@ -25,6 +25,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 
 /// Host pids with an entry: those below this (macOS's end at 99999).
 const PIDS: usize = 1 << 17;
+/// What an entry holds: a process record, or a process's thread list
+/// ([`crate::thread`]).
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Record = 0,
+    Threads = 1,
+}
+const KINDS: usize = 2;
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).
@@ -74,7 +82,7 @@ fn next(state: u32, st: u32) -> u32 {
 
 /// The store's layout: where each part starts in the file.
 const ENTRIES_AT: usize = 64;
-const USED_AT: usize = ENTRIES_AT + PIDS * size_of::<Entry>();
+const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 const ENDED_AT: usize = USED_AT + PIDS / 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
 const TAKEN_AT: usize = FREE_HINT_AT + 64;
@@ -88,20 +96,32 @@ struct Store {
 
 static STORE: OnceLock<Option<Store>> = OnceLock::new();
 
+/// The store's name: a POSIX shared memory object of the user's (memory
+/// only: a file's dirty pages would be written back to its disk as each
+/// process holding them ends, milliseconds on a virtual machine's).
+fn name() -> String {
+    // (macOS allows names of 31 bytes.)
+    format!("/fwe{}v{}procs", crate::host::euid(), crate::shared::FORMAT)
+}
+
 fn map() -> Option<Store> {
-    let mut path = crate::fs::shm::user_dir().ok()?;
-    path.extend_from_slice(format!("/v{}-processes", crate::shared::FORMAT).as_bytes());
-    let path = std::ffi::CString::new(path).ok()?;
-    // SAFETY: plain host calls; the file is fwe's own, and the mapping is
-    // kept for the process's life.
+    let name = std::ffi::CString::new(name()).ok()?;
+    // SAFETY: plain host calls; the object is the user's own (checked), and
+    // the mapping is kept for the process's life.
     unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+        let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600 as libc::c_uint);
         if fd < 0 {
             return None;
         }
-        // Zeroes (nothing recorded, every block free) the first time, the
-        // same size after; the host keeps only the pages written.
-        let sized = libc::ftruncate(fd, SIZE as libc::off_t) == 0;
+        // Zeroes (nothing recorded, every block free) the first time; the
+        // host gives memory only to the pages written. Its size is set once
+        // (macOS refuses to change it after).
+        libc::ftruncate(fd, SIZE as libc::off_t);
+        let mut st: libc::stat = std::mem::zeroed();
+        let sized = libc::fstat(fd, &mut st) == 0
+            && st.st_uid == crate::host::euid()
+            && st.st_mode & 0o077 == 0
+            && st.st_size as usize >= SIZE;
         let p = libc::mmap(
             std::ptr::null_mut(),
             SIZE,
@@ -111,7 +131,14 @@ fn map() -> Option<Store> {
             0,
         );
         libc::close(fd);
-        (sized && p != libc::MAP_FAILED).then_some(Store { base: p as usize })
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        if !sized {
+            libc::munmap(p, SIZE);
+            return None;
+        }
+        Some(Store { base: p as usize })
     }
 }
 
@@ -133,8 +160,12 @@ impl Store {
     }
 
     fn entry(&self, pid: i32) -> Option<&Entry> {
+        self.entry_of(Kind::Record, pid)
+    }
+
+    fn entry_of(&self, kind: Kind, pid: i32) -> Option<&Entry> {
         let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
-        Some(self.at(ENTRIES_AT + i * size_of::<Entry>()))
+        Some(self.at(ENTRIES_AT + (kind as usize * PIDS + i) * size_of::<Entry>()))
     }
 
     fn used(&self, word: usize) -> &AtomicU64 {
@@ -258,8 +289,13 @@ impl Store {
 
 /// The record bytes of host pid `pid`, if it has a record.
 pub fn get(pid: i32) -> Option<Vec<u8>> {
+    get_of(Kind::Record, pid)
+}
+
+/// What host pid `pid`'s entry of `kind` holds, if anything.
+pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
     let s = store()?;
-    let e = s.entry(pid)?;
+    let e = s.entry_of(kind, pid)?;
     for round in 0..10_000 {
         let seq = e.seq.load(SeqCst);
         if seq % 2 == 0 {
@@ -334,6 +370,22 @@ pub fn remove(_held: &Held, pid: i32) {
     let Some(e) = s.entry(pid) else { return };
     let (old, old_len) = replace(e, 0, 0);
     s.used(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
+    s.free_chain(old, old_len as usize);
+}
+
+/// Write `bytes` as this process's entry of `kind` (one it alone writes,
+/// its threads taking turns): `None` for none.
+pub fn put_own(kind: Kind, bytes: Option<&[u8]>) {
+    let Some(s) = store() else { return };
+    let Some(e) = s.entry_of(kind, crate::host::pid()) else { return };
+    let (head, len) = match bytes {
+        Some(b) => match s.write_chain(b) {
+            Some(head) => (head, b.len() as u32),
+            None => return,
+        },
+        None => (0, 0),
+    };
+    let (old, old_len) = replace(e, head, len);
     s.free_chain(old, old_len as usize);
 }
 

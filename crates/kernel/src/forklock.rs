@@ -162,7 +162,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &mm::GROWS_DOWN,
         &mm::POISONED,
         &mm::WIPE_ON_FORK,
-        &thread::TIDS_MAP,
+        &thread::PUBLISHED,
         &thread::TID_BLOCK_LEFT,
     ]);
     v
