@@ -330,18 +330,21 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let nr = b.regs.x[8];
     // A new thread of an untraced one is made here too: the trap would
     // make it from the same registers.
-    let thread_clone = nr == CLONE
-        && b.regs.x[0] & fwe_abi::clone::CLONE_THREAD != 0
+    // A thread's `clone`, or `clone3` (glibc's): its flags in its
+    // arguments' structure.
+    let clone_flags = match nr {
+        CLONE => Some(b.regs.x[0]),
+        CLONE3 => fwe_kernel::uaccess::read::<u64>(b.regs.x[0]).ok(),
+        _ => None,
+    };
+    let thread_clone = clone_flags.is_some_and(|f| f & fwe_abi::clone::CLONE_THREAD != 0)
         && !fwe_kernel::ptrace::traced();
     // What the trap runs its own way, or stops at, it runs.
     let plain = fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls()
-        && !matches!(
-            nr,
-            EXIT | EXECVE | EXECVEAT | CLONE3 | WAIT4 | WAITID | PIDFD_GETFD | RT_SIGTIMEDWAIT
-        )
+        && !matches!(nr, EXIT | EXECVE | EXECVEAT | WAIT4 | WAITID | PIDFD_GETFD | RT_SIGTIMEDWAIT)
         && !fwe_kernel::ipcops::waits(nr)
-        && (nr != CLONE || thread_clone);
+        && (!matches!(nr, CLONE | CLONE3) || thread_clone);
     // A thread that is not the last ends here, as the trap would end it,
     // with every host signal blocked first: one for the process is then
     // taken by another thread, as when the trap's handler runs.
@@ -371,9 +374,13 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let regs = &mut b.regs;
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     if thread_clone {
-        let a = fwe_kernel::CloneArgs::from_clone(&regs.x);
-        let r = match a.check() {
-            Ok(()) => crate::threads::do_clone(regs, a),
+        let a = if nr == CLONE {
+            Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
+        } else {
+            fwe_kernel::CloneArgs::from_clone3(regs.x[0], regs.x[1])
+        };
+        let r = match a.and_then(|a| a.check().map(|()| a)) {
+            Ok(a) => crate::threads::do_clone(regs, a),
             Err(e) => fwe_abi::err(e),
         };
         KERNEL.finish(regs, nr, &args, r);
