@@ -2631,7 +2631,7 @@ the host:
 | `SIGINFO` from anywhere else (`kill -INFO`) | no note came with it, so it is no relay: dropped | nothing |
 | a child killed by a host signal with no Linux number | `host::signal_to_linux` gives `SIGABRT` | a child killed by `SIGABRT` |
 | Linux's `SIGSTKFLT`, `SIGPWR` and real-time signals | never from the host; recorded within the process, or queued in another fwe process's mailbox and that process woken with `SIGEMT` | delivered with fwe's own `siginfo` |
-| a guest killed by one of those (default action) | no host signal to die of: leaves its Linux status beside its record, then exits with 128 + the signal | an fwe parent sees it killed by that signal; a host shell sees 128 + the signal |
+| a guest killed by one of those (default action) | no host signal to die of: leaves its Linux status in its record's entry, then exits with 128 + the signal | an fwe parent sees it killed by that signal; a host shell sees 128 + the signal |
 
 #### Where each signal comes from
 
@@ -2789,10 +2789,10 @@ sequenceDiagram
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | a child exited with code *n* | status word kept | `n << 8` |
-| a child killed by a host signal | the Linux status the child left beside its record (`procreg::ending`), with the core bit if fwe wrote a core; else the signal mapped (`host::signal_to_linux`) | Linux's signal number, `0x80` if a core was dumped |
+| a child killed by a host signal | the Linux status the child left in its record's entry (`procreg::ending`), with the core bit if fwe wrote a core; else the signal mapped (`host::signal_to_linux`) | Linux's signal number, `0x80` if a core was dumped |
 | a child stopped | the stop signal mapped | `sig << 8 \| 0x7f` |
 | a child continued | — | `0xffff` |
-| a guest child ended by a Linux-only signal | it exited with 128 + the signal, leaving its Linux status beside its record | killed by that signal |
+| a guest child ended by a Linux-only signal | it exited with 128 + the signal, leaving its Linux status in its record's entry | killed by that signal |
 | `SIGCHLD` `siginfo`: `CLD_KILLED`/`CLD_DUMPED`/`CLD_STOPPED` | `si_status` mapped to Linux's signal | Linux's signal number |
 | `SIGCHLD` `siginfo`: `CLD_CONTINUED` | `si_status` is what stopped it on macOS; set to what continued it | `SIGCONT`, as Linux reports |
 | `rusage` from `wait4` | `ru_maxrss` from bytes to KiB | Linux's `rusage` |

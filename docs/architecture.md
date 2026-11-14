@@ -364,8 +364,8 @@ records Linux would keep about them:
   the guest did not ask for (code stubs, a guard page) is listed as
   anonymous with the host's protections, so a program looking for free
   space does not pick it.
-- **Other processes:** each process publishes its record in a file
-  beside its process record (framed with its length and checksum, in one
+- **Other processes:** each process publishes its record in a file of
+  its own in the process records' directory (framed with its length and checksum, in one
   write, so a reader that catches a write half done reads again) before
   its next system call that is not a memory call, and before a
   `fork`, so a run of mapping calls publishes once. The file is written
@@ -428,18 +428,24 @@ keeps:
   private to one fwe binary.
 - **Re-exec state** (`Kernel::exec_state`): see
   [linux-on-macos.md](linux-on-macos.md#execve).
-- **Process records** (`crates/kernel/src/procreg.rs`): a file per host
-  pid in fwe's private directory with the process's start time (so a
-  record never outlives its process into another with the same pid),
-  cgroup, namespaces, name, command line, program, ancestors, subreaper
-  flag, nice value, scheduling policy and `oom_score_adj`. A record is
-  rewritten in place under its lock, framed with its length and a
-  checksum, so a reader (which takes no lock) rereads one caught
-  mid-write; a program's start writes its record once. A record is locked
-  on its own file. A native fork's child writes its whole record as it
-  starts, with what its parent knows of it (its program, cgroup and
-  whether the host reaps); a look at one's own child's record that it has
-  not written yet waits for it.
+- **Process records** (`crates/kernel/src/procreg.rs`): one for each host
+  pid, with the process's start time (so a record never outlives its
+  process into another with the same pid), cgroup, namespaces, name,
+  command line, program, ancestors, subreaper flag, nice value,
+  scheduling policy and `oom_score_adj`. They are kept in memory every
+  fwe process of the user maps (`crates/kernel/src/procstore.rs`, a file
+  in fwe's private directory): an entry for each pid (a lock naming its
+  holder's pid, taken over from one that died holding it; a sequence
+  number, odd while the record changes; where its bytes are; the end
+  status), the bytes in chained 4 KiB blocks, a bitmap of the pids with
+  a record, and a table of the accounts of how processes ended. A writer
+  holds the lock, writes new blocks, makes them the record's and then
+  frees the old ones; a reader takes no lock and reads again if the
+  sequence number changed meanwhile. A program's start writes its record
+  once. A native fork's child writes its whole record as it starts, with
+  what its parent knows of it (its program, cgroup and whether the host
+  reaps); a look at one's own child's record that it has not written yet
+  waits for it, and so does a listing of every process.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events));
@@ -470,8 +476,9 @@ keeps:
   `MADV_DONTDUMP`), named by `kernel.core_pattern` and `core_uses_pid`
   and cut short at `RLIMIT_CORE`. The host's own core limit is 0.
 - **End status:** a process a signal ends leaves its Linux wait status
-  beside its record (`procreg::ending`), so its parent reads the signal
-  and core bit Linux would report even for a signal the host lacks.
+  in its record's entry (`procreg::ending`), so its parent reads the
+  signal and core bit Linux would report even for a signal the host
+  lacks.
 - **POSIX timers** (`crates/kernel/src/posixtimer.rs`): a thread of
   fwe's, started with a process's first timer, sleeps until the next is
   due and raises its signal (`SI_TIMER`) for the process or a thread; a

@@ -76,6 +76,7 @@ pub mod procfs;
 pub mod procmem;
 pub mod procpid;
 pub mod procreg;
+pub mod procstore;
 pub mod procvm;
 pub mod ptrace;
 pub mod pty;
@@ -312,6 +313,8 @@ impl<P: Platform> Kernel<P> {
         // one process making many kernels while others wait.)
         #[cfg(not(test))]
         futex::process_started();
+        // The process records, mapped before a signal handler reads them.
+        procstore::init();
         // The guest's umask is fwe's to apply: the host's would take more
         // bits off what the guest asked for.
         #[cfg(not(test))]
