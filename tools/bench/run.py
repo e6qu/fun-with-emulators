@@ -28,9 +28,11 @@ best is the least disturbed.
 """
 
 import argparse
+import collections
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -398,15 +400,19 @@ def build(a, fwe, results):
         "Lua script (s)",
         guest_env + fwe + ["--root", root, os.path.join(src, "src/lua"), "/tmp/wl/bench.lua"],
         [os.path.join(native_src, "src/lua"), os.path.join(WORKLOADS, "bench.lua")],
+        (),
+        len(guest_env) + 1,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     shutil.rmtree(native, ignore_errors=True)
 
 
-def workload(results, name, ours, theirs, fresh=()):
+def workload(results, name, ours, theirs, fresh, at):
     """Time workload `name`: command `ours` under fwe and `theirs` natively,
     in turns, three rounds, the best of each kept. Each round starts with
-    the directories `fresh` empty. Both must succeed and print the same."""
+    the directories `fresh` empty. Both must succeed and print the same.
+    Then `ours` once more, traced (fwe's options go in at `at`, after fwe
+    itself), its system calls counted in the log: where fwe's time goes."""
     times = {"fwe": [], "macOS": []}
     outs = {}
     for _ in range(3):
@@ -424,6 +430,21 @@ def workload(results, name, ours, theirs, fresh=()):
         sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
     for side in times:
         results[side][name] = min(times[side])
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    trace = os.path.abspath(f"bench-{name.split()[0].lower()}.trace")
+    subprocess.run(
+        ours[:at] + ["--strace", f"--strace-file={trace}"] + ours[at:], capture_output=True
+    )
+    calls = collections.Counter()
+    with open(trace, errors="replace") as f:
+        for line in f:
+            m = re.search(r"\] ([a-z_0-9]+)\(", line)
+            if m:
+                calls[m.group(1)] += 1
+    top = ", ".join(f"{c} {n}" for c, n in ((n, c) for c, n in calls.most_common(14)))
+    print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
 
 
 def workloads(a, fwe, guest_env, lua_src, results):
@@ -453,11 +474,14 @@ def workloads(a, fwe, guest_env, lua_src, results):
         )
 
     fresh = (ours_w, theirs_w)
+    at = len(guest_env) + 1  # after fwe itself
     workload(
         results,
         "Python script (s)",
         under("/usr/bin/python3", "/tmp/wl/bench.py"),
         [brew["python"], os.path.join(WORKLOADS, "bench.py")],
+        (),
+        at,
     )
     workload(
         results,
@@ -465,9 +489,10 @@ def workloads(a, fwe, guest_env, lua_src, results):
         under("/usr/bin/sqlite3", "/tmp/w/db", ".read /tmp/wl/bench.sql"),
         [brew["sqlite"], os.path.join(theirs_w, "db"), f".read {WORKLOADS}/bench.sql"],
         fresh,
+        at,
     )
-    workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh)
-    workload(results, "xz (s)", *script("xz.sh", "/usr/bin/xz", brew["xz"]), fresh)
+    workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh, at)
+    workload(results, "xz (s)", *script("xz.sh", "/usr/bin/xz", brew["xz"]), fresh, at)
     shutil.rmtree(native, ignore_errors=True)
 
 
