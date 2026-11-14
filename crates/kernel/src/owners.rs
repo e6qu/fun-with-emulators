@@ -66,15 +66,48 @@ pub fn apply(st: &mut libc::stat, owner: (u32, u32)) {
 
 /// Give the file open as `fd` the owner `owner`.
 pub fn keep_fd(fd: i32, owner: (u32, u32)) -> Result<(), i32> {
-    let st = fstat(fd)?;
+    let mut st = fstat(fd)?;
+    if root_group_by_host(owner, &st) {
+        // SAFETY: plain host call on the caller's descriptor.
+        if unsafe { libc::fchown(fd, u32::MAX, crate::host::egid()) } != 0 {
+            return Err(last());
+        }
+        st = fstat(fd)?;
+    }
     let record = (owner != host_owner(&st)).then_some(owner);
     mark_fd(fd, &st, record)
+}
+
+/// Whether the host gives the file whose metadata is `st` another group
+/// than fwe's own while `owner`'s group is root's (fwe's own): a new file
+/// takes its directory's group on the host (`/tmp`'s is `wheel`), where
+/// Linux gives it its creator's. Given fwe's group, it needs no attribute
+/// to keep its owner, and a `stat` of it reads none.
+fn root_group_by_host(owner: (u32, u32), st: &libc::stat) -> bool {
+    owner.1 == 0 && st.st_gid != crate::host::egid()
 }
 
 /// [`keep_fd`] for `name` in directory `dir`, a symbolic link itself if it
 /// is one.
 pub fn keep_at(dir: i32, name: &CStr, owner: (u32, u32)) -> Result<(), i32> {
-    let st = fstatat(dir, name)?;
+    let mut st = fstatat(dir, name)?;
+    if root_group_by_host(owner, &st) {
+        // SAFETY: a NUL-terminated name in the caller's directory, a link
+        // itself if it is one.
+        let r = unsafe {
+            libc::fchownat(
+                dir,
+                name.as_ptr(),
+                u32::MAX,
+                crate::host::egid(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r != 0 {
+            return Err(last());
+        }
+        st = fstatat(dir, name)?;
+    }
     let record = (owner != host_owner(&st)).then_some(owner);
     match path_of(dir, name) {
         Some(path) => mark_path(&path, &st, record),
