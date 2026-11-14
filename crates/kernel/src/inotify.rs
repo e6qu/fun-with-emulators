@@ -182,7 +182,7 @@ pub fn registry() -> Option<&'static Record<Registry>> {
 }
 
 /// The registry, made if no process has made it yet.
-fn make_registry() -> Option<&'static Record<Registry>> {
+pub(crate) fn make_registry() -> Option<&'static Record<Registry>> {
     if let Some(r) = registry() {
         return Some(r);
     }

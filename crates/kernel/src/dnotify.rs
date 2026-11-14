@@ -76,7 +76,8 @@ pub fn set(fd: i32, arg: u64) -> Result<(), i32> {
         return Err(errno::ENOTDIR);
     }
     let name = name_of(fd);
-    let r = inotify::registry().ok_or(errno::ENOMEM)?;
+    // The first watch of all makes the registry.
+    let r = inotify::make_registry().ok_or(errno::ENOMEM)?;
     let mask = events(arg);
     let watching = arg & !DN_MULTISHOT != 0;
     r.update_maybe(|t| {
