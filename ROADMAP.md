@@ -186,6 +186,11 @@ natively wherever fwe can make them fit the Mac.
   (the GOT and arrays the dynamic section names, Go's `moduledata` and
   `pclntab`), checked before the move; a binary whose pointers cannot all
   be accounted for runs in the VM as now, and why is recorded.
+- [ ] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes
+  and runs, many threads, a garbage collector) runs natively under fwe,
+  and the benchmarks run a realistic workload on it (compiling and running
+  a multi-threaded application) against Homebrew's OpenJDK of the same
+  release on the same runner, their output compared, within 1.5×.
 - [ ] **Programs GCC builds, natively:** what GCC links below 4 GiB
   (`-static`, `-no-pie`, and toolchains whose default is not PIE) runs
   natively, not in the VM: moved above 4 GiB as the item above moves a
@@ -212,7 +217,8 @@ natively wherever fwe can make them fit the Mac.
 
 **Done when:** the budgets hold in CI; static Go programs, Debian's
 low-linked toolchain, programs GCC links non-PIE or static, and Wine's
-test program run natively, in CI; Wine's benchmarks hold their budget;
+test program run natively, in CI; the JDK's and Wine's benchmarks hold
+their budgets;
 and what still needs the VM is listed with the reason.
 
 ### M7 — Graphical programs and sandboxes
@@ -231,12 +237,15 @@ Wine with theirs, and a Linux program run inside gVisor, all on fwe.
 - [ ] **gVisor on fwe:** `runsc` running a Linux program on its `systrap`
   platform (`seccomp`'s `SECCOMP_RET_TRAP`, `SIGSYS` and memory shared
   between its sentry and stub processes) or its `ptrace` platform, as
-  Podman or Docker would start it.
+  Podman or Docker would start it. The program is a realistic JDK workload
+  (OpenJDK compiling and running a multi-threaded application: collections,
+  streams, JSON, garbage collection), benchmarked: under `runsc` on fwe,
+  against the same workload under `runsc` on Linux, its output compared.
 
 **Done when:** CI starts an X server and runs an X11 program, a GTK
 program and a Windows program with a window under fwe, checking what they
-draw (a screenshot of the server compared), and runs a Linux program
-through `runsc` on fwe.
+draw (a screenshot of the server compared), and runs the JDK workload
+through `runsc` on fwe, its benchmark beside `runsc` on Linux.
 
 ## After 1.0
 

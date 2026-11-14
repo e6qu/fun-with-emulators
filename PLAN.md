@@ -59,7 +59,7 @@ them in M2, M4, M5, M6 and M7:
   executables linked below 4 GiB and programs that need 4 KiB pages,
   Wine among them, without the VM where fwe can make them fit;
 - graphical Linux programs and a Windows program with a window draw on
-  the Mac's screen, and a Linux program runs inside gVisor (`runsc`).
+  the Mac's screen, and a JDK workload runs inside gVisor (`runsc`).
 
 The roadmap lists what 1.0 leaves out under "Not planned for 1.0".
 
