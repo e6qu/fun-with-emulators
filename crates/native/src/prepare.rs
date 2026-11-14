@@ -299,7 +299,7 @@ pub unsafe fn prepare(
         let kept_hot = hot.clone();
         let hot: std::collections::BTreeSet<u64> = hot.into_iter().collect();
         let mut owed = Vec::new();
-        let mut written = false;
+        let mut written = Vec::new();
         for (at, (was, now)) in d.into_iter().filter(|(_, (was, now))| was != now) {
             if hot.contains(&((at - first) / host_page)) {
                 // SAFETY: a word of the range, writable now (the caller's
@@ -309,23 +309,52 @@ pub unsafe fn prepare(
                         (at as *mut u32).write(now);
                     }
                 }
-                written = true;
+                written.push(at);
             } else {
                 owed.push((at, was, now));
             }
         }
-        if written {
-            // SAFETY: the range is mapped.
-            unsafe { flush_icache(start, len) };
-        }
+        // SAFETY: the pages are of the range, mapped.
+        unsafe { flush_pages(written) };
         if let Some(key) = cache {
             fwe_kernel::lazycode::owe(owed, key, start, &kept_hot);
         }
     } else if stats.syscalls + stats.stubs > 0 {
-        // SAFETY: the range is mapped.
-        unsafe { flush_icache(start, len) };
+        // The words changed in place, and the sites' branches to their
+        // stubs: every one is noted.
+        // SAFETY: the pages are of the range, mapped.
+        unsafe { flush_pages(patched.noted.iter().map(|&(off, ..)| start + off)) };
     }
     Ok(stats)
+}
+
+/// Invalidate the instruction cache for the pages holding the words at
+/// `addrs` (in any order), neighbouring pages in one run: the cache is
+/// walked a line at a time, and a page walked is a page brought in, so the
+/// rest of a large library is left alone.
+///
+/// # Safety
+/// The pages must be mapped.
+unsafe fn flush_pages(addrs: impl IntoIterator<Item = u64>) {
+    let page = fwe_kernel::mm::host_page_size();
+    let pages: std::collections::BTreeSet<u64> =
+        addrs.into_iter().map(|a| a & !(page - 1)).collect();
+    let mut run: Option<(u64, u64)> = None;
+    for p in pages {
+        run = match run {
+            Some((s, e)) if e == p => Some((s, p + page)),
+            Some((s, e)) => {
+                // SAFETY: the caller's guarantee.
+                unsafe { flush_icache(s, e - s) };
+                Some((p, p + page))
+            }
+            None => Some((p, p + page)),
+        };
+    }
+    if let Some((s, e)) = run {
+        // SAFETY: as above.
+        unsafe { flush_icache(s, e - s) };
+    }
 }
 
 /// Write stubs for `group` (offsets from `base`) into a new region near
