@@ -3943,14 +3943,24 @@ fn namespaces(scenario: &str) -> String {
     }
     std::fs::write(root.join("newroot/etc/marker"), "new\n").unwrap();
     std::fs::copy(rust_guest("namespaces"), root.join("namespaces")).unwrap();
+    // The reaper's notes (whom it follows, who ended, what it reported)
+    // go to a file, shown with the output.
+    let trace =
+        std::env::temp_dir().join(format!("fwe-ns-{}-{scenario}.trace", std::process::id()));
+    let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace=failures")
+        .arg(format!("--strace-file={}", trace.display()))
         .arg("--root")
         .arg(&root)
         .arg(root.join("namespaces"))
         .arg(scenario);
     let out = run_bounded(cmd);
     eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let notes = std::fs::read_to_string(&trace).unwrap_or_default();
+    let reaper: Vec<&str> = notes.lines().filter(|l| l.contains("reaper")).collect();
+    eprintln!("--- its reaper's notes:\n{}", reaper.join("\n"));
+    let _ = std::fs::remove_file(&trace);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
     stdout(&out)
