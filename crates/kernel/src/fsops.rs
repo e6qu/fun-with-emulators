@@ -3938,8 +3938,30 @@ mod tests {
         }
     }
 
-    /// A kernel rooted at a fresh temporary directory, returned with its path.
-    fn rooted() -> (Kernel<NoPlatform>, std::path::PathBuf) {
+    /// A test's temporary root directory, removed when the test is done.
+    struct TempRoot(std::path::PathBuf);
+
+    impl std::ops::Deref for TempRoot {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempRoot {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A kernel rooted at a fresh temporary directory, returned with it.
+    fn rooted() -> (Kernel<NoPlatform>, TempRoot) {
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "fwe-fs-{}-{}",
@@ -3957,7 +3979,7 @@ mod tests {
             Some(root),
             Tracer::default(),
         );
-        (k, dir)
+        (k, TempRoot(dir))
     }
 
     fn cstr(s: &str) -> CString {
