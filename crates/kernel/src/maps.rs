@@ -22,7 +22,6 @@
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a mapping is named by in the listing.
@@ -566,35 +565,21 @@ impl Published {
     }
 }
 
-/// The file this process publishes its mappings in: other processes read
-/// it for `/proc/<pid>/maps`. It holds the encoded [`Published`] framed as
-/// a process record is ([`crate::procreg::frame`]): its length and
-/// checksum, written with it in one `pwrite`, so a reader that finds the
-/// checksum wrong has caught a write half done and reads again.
-/// It stays open while the process runs and is closed as it ends
-/// ([`close_for_exit`]): a process that ends holding a file it wrote makes
-/// the next process's first close of a file it wrote wait (milliseconds,
-/// on a virtual machine's disk).
-pub(crate) struct Outbox {
-    pid: i32,
-    fd: i32,
-}
-
 /// The process is ending: its mappings are published no more.
 static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Close the mappings file as the process ends (see [`Outbox`]).
+/// The process is ending: its published mappings go, and are published no
+/// more.
 pub fn close_for_exit() {
     ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
-    drop_inherited(&mut out);
-    if let Some(o) = out.take() {
-        // SAFETY: fwe's own descriptor, forgotten with the outbox.
-        unsafe { libc::close(o.fd) };
-    }
+    let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    crate::procstore::put_own(crate::procstore::Kind::Maps, None);
 }
 
-pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
+/// Taken while this process publishes its mappings (its threads take
+/// turns): other processes read them from its entry in the process store
+/// ([`crate::procstore`]) for `/proc/<pid>/maps`.
+pub(crate) static OUTBOX: Mutex<()> = Mutex::new(());
 
 /// This process's mappings encoded as [`publish`] publishes them.
 pub fn snapshot() -> Vec<u8> {
@@ -618,23 +603,10 @@ pub fn snapshot() -> Vec<u8> {
     e.into_bytes()
 }
 
-/// Let go of the parent's file a fork child inherited.
-fn drop_inherited(out: &mut Option<Outbox>) {
-    let me = crate::host::pid();
-    if let Some(o) = out.as_ref()
-        && o.pid != me
-    {
-        // SAFETY: the descriptor is this process's copy.
-        unsafe { libc::close(o.fd) };
-        *out = None;
-    }
-}
-
 /// In a fork child: its mappings, which are its parent's, for the record
-/// it writes as it starts (see [`crate::procreg::own_line`]). It makes a
-/// file of its own only once they change, so a fork costs no file.
+/// it writes as it starts (see [`crate::procreg::own_line`]). It publishes
+/// its own only once they change.
 pub fn forked() -> Vec<u8> {
-    drop_inherited(&mut OUTBOX.lock().unwrap_or_else(|e| e.into_inner()));
     snapshot()
 }
 
@@ -682,32 +654,17 @@ pub fn flush() {
 
 /// Publish this process's mappings for other processes to read now.
 pub fn publish_now() {
-    let body = snapshot();
-    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    // After when the process started: a reader tells them from an earlier
+    // process's of the same pid that was killed before it could take its
+    // own away.
     let me = crate::host::pid();
-    drop_inherited(&mut out);
+    let mut body = crate::procreg::start_time(me).unwrap_or(0).to_le_bytes().to_vec();
+    body.extend(snapshot());
+    let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
     if ENDED.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    if out.is_none() {
-        let Some(path) = crate::procreg::maps_path(me) else { return };
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *out = Some(Outbox { pid: me, fd });
-    }
-    let Some(o) = out.as_mut() else { return };
-    // Written with `pwrite`, not through a shared mapping, whose dirty
-    // pages would be written back after the process has gone, with the
-    // same wait as a file left open. One write: the frame says whether a
-    // reader saw all of it. A longer record left by an earlier one stays
-    // past the frame's end.
-    let framed = crate::procreg::frame(&body);
-    // SAFETY: a buffer of its length, on fwe's own descriptor.
-    unsafe { libc::pwrite(o.fd, framed.as_ptr().cast(), framed.len(), 0) };
+    crate::procstore::put_own(crate::procstore::Kind::Maps, Some(&body));
 }
 
 /// What [`snapshot`] encoded.
@@ -726,27 +683,18 @@ fn decode_published(body: &[u8]) -> Option<Published> {
 /// The mappings host process `pid` published, if it is a process of
 /// fwe's that has.
 pub fn of_process(pid: i32) -> Option<Published> {
-    let path = crate::procreg::maps_path(pid)?;
-    let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)) else {
-        // None published yet: what it was forked with.
-        let r = crate::procreg::read(pid)?;
-        return (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten();
-    };
-    // A whole record: one whose frame checks, read again if a write was
-    // half done.
-    use std::io::{Read, Seek};
-    let mut buf = Vec::new();
-    let mut f = &file;
-    for _ in 0..1000 {
-        buf.clear();
-        f.seek(std::io::SeekFrom::Start(0)).ok()?;
-        f.read_to_end(&mut buf).ok()?;
-        if let Some(body) = crate::procreg::unframe(&buf) {
-            return decode_published(body);
+    let published = crate::procstore::get_of(crate::procstore::Kind::Maps, pid).filter(|b| {
+        b.get(..8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+            == crate::procreg::start_time(pid)
+    });
+    match published {
+        Some(body) => decode_published(&body[8..]),
+        None => {
+            // None published yet: what it was forked with.
+            let r = crate::procreg::read(pid)?;
+            (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten()
         }
-        std::thread::yield_now();
     }
-    None
 }
 
 /// What the listing shows of each mapping beyond its line (`smaps`).

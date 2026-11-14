@@ -182,16 +182,6 @@ pub fn records_dir() -> Option<Vec<u8>> {
     dir()
 }
 
-fn path(pid: i32) -> Option<Vec<u8>> {
-    Some([dir()?, format!("/{pid}").into_bytes()].concat())
-}
-
-/// The file host process `pid` publishes its mappings in (see
-/// [`crate::maps::publish`]).
-pub fn maps_path(pid: i32) -> Option<Vec<u8>> {
-    Some([path(pid)?, b".maps".to_vec()].concat())
-}
-
 /// Host process `pid`'s parent as the host has it, if it exists.
 pub fn host_parent(pid: i32) -> Option<i32> {
     host_info(pid).map(|(_, ppid, _)| ppid)
@@ -339,51 +329,6 @@ fn read_any(pid: i32) -> Option<ProcRecord> {
     decode(&crate::procstore::get(pid)?)
 }
 
-/// A record's bytes as written: its length and checksum, then itself.
-pub(crate) fn frame(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 16);
-    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    out.extend_from_slice(&checksum(body).to_le_bytes());
-    out.extend_from_slice(body);
-    out
-}
-
-/// The record in `bytes` ([`frame`]), if it is whole.
-pub(crate) fn unframe(bytes: &[u8]) -> Option<&[u8]> {
-    let len = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
-    let sum = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
-    let body = bytes.get(16..16usize.checked_add(len)?)?;
-    (checksum(body) == sum).then_some(body)
-}
-
-/// A record's checksum over its little-endian words, the last one padded
-/// with zeros. Records carry a process's mappings, thousands of them for
-/// some, and are read at every reap: a word at a time, and straight from
-/// the buffer when it is aligned.
-fn checksum(bytes: &[u8]) -> u64 {
-    let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    // SAFETY: every bit pattern is a valid u64.
-    let (head, words, _) = unsafe { bytes.align_to::<u64>() };
-    let rest = if head.is_empty() && cfg!(target_endian = "little") {
-        let mut i = 0;
-        while i < words.len() {
-            h = mix(h, words[i]);
-            i += 1;
-        }
-        &bytes[words.len() * 8..]
-    } else {
-        bytes
-    };
-    let mut chunks = rest.chunks(8);
-    for c in &mut chunks {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h = mix(h, u64::from_le_bytes(w));
-    }
-    h
-}
-
 fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     let mut d = Dec::new(bytes);
     let (start, cgroup) = (d.u64(), d.bytes());
@@ -483,9 +428,6 @@ pub fn remove(held: &crate::procstore::Held, pid: i32) {
     crate::procstore::remove(held, pid);
     if start_time(pid).is_some() {
         return;
-    }
-    if let Some(p) = maps_path(pid) {
-        let _ = std::fs::remove_file(OsStr::from_bytes(&p));
     }
     crate::signote::remove(pid);
 }
@@ -1525,47 +1467,6 @@ fn forget_children(parent: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_record_caught_mid_write_is_not_taken_for_whole() {
-        let r = fresh(me(), 1);
-        let body = encode(&r);
-        let whole = frame(&body);
-        assert_eq!(decode(unframe(&whole).unwrap()), Some(r));
-        // The longer tail of the record written before, not yet cut off.
-        let mut longer = whole.clone();
-        longer.extend_from_slice(&[7; 40]);
-        assert_eq!(unframe(&longer), Some(&body[..]));
-        // Cut short, empty, or a byte of another write.
-        assert_eq!(unframe(&whole[..whole.len() - 1]), None);
-        assert_eq!(unframe(&[]), None);
-        let mut mixed = whole.clone();
-        let last = mixed.len() - 1;
-        mixed[last] ^= 1;
-        assert_eq!(unframe(&mixed), None);
-    }
-
-    #[test]
-    fn a_checksum_is_the_same_wherever_the_bytes_lie() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let mut buf = [0u8; 120];
-        for at in 0..8 {
-            for len in [0, 1, 7, 8, 9, 64, 99] {
-                buf[at..at + len].copy_from_slice(&bytes[..len]);
-                assert_eq!(
-                    checksum(&buf[at..at + len]),
-                    checksum(&bytes[..len]),
-                    "at {at}, {len} bytes"
-                );
-            }
-        }
-        // Any one byte changed changes it.
-        for i in 0..bytes.len() {
-            let mut other = bytes.clone();
-            other[i] ^= 0x40;
-            assert_ne!(checksum(&other), checksum(&bytes), "byte {i}");
-        }
-    }
 
     #[test]
     fn a_batch_writes_once_and_its_changes_are_read_meanwhile() {

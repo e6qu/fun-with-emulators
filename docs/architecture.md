@@ -364,17 +364,13 @@ records Linux would keep about them:
   the guest did not ask for (code stubs, a guard page) is listed as
   anonymous with the host's protections, so a program looking for free
   space does not pick it.
-- **Other processes:** each process publishes its record in a file of
-  its own in the process records' directory (framed with its length and checksum, in one
-  write, so a reader that catches a write half done reads again) before
-  its next system call that is not a memory call, and before a
-  `fork`, so a run of mapping calls publishes once. The file is written
-  with `pwrite` and closed as the process ends:
-  a process that ends holding a file it wrote, or with dirty pages of one
-  mapped, makes the next process's first close of a file it wrote wait
-  for the write-back (milliseconds on a virtual machine's disk). Another
-  process's `/proc/<pid>/maps` and `smaps` read it, with resident pages
-  from the host (`proc_pidinfo`).
+- **Other processes:** each process publishes its record, with when it
+  started, in an entry of its own in the process records' memory before
+  its next system call that is not a memory call, and before a `fork`,
+  so a run of mapping calls publishes once; it takes it away as it ends.
+  Another process's `/proc/<pid>/maps` and `smaps` read it (one left by
+  an earlier process of the pid is not taken for it), with resident
+  pages from the host (`proc_pidinfo`).
   `PROCMAP_QUERY` answers for any of them, with the mapped file's GNU
   build ID.
 - **`vm.max_map_count`** (65530 by default) limits the mappings: an
@@ -946,7 +942,8 @@ each behaves inside fwe:
     and for a file in a watched directory: open, access, modify, truncate,
     close (write or not), attribute changes, create, delete (for the last
     link `IN_ATTRIB`, `IN_DELETE_SELF`, `IN_IGNORED`), moves with one
-    cookie, `IN_MOVE_SELF`, `IN_UNMOUNT`;
+    cookie, `IN_MOVE_SELF`, `IN_UNMOUNT` (for the watches made in the
+    mount namespace the unmount is in);
   - the watches are a shared record naming each file by host device and
     inode; an overlay's file is named by the overlay and its lower file
     (a copy-up records that), so watches survive a copy-up;

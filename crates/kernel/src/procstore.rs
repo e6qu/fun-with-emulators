@@ -33,8 +33,10 @@ pub enum Kind {
     Threads = 1,
     /// Its threads' robust-futex list heads ([`crate::thread`]).
     Robust = 2,
+    /// Its mappings, for `/proc/<pid>/maps` ([`crate::maps`]).
+    Maps = 3,
 }
-const KINDS: usize = 3;
+const KINDS: usize = 4;
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).
