@@ -215,6 +215,11 @@ def linux(a):
 
 def macos(a):
     fwe = [a.fwe]
+    # Where a start's time goes (FWE_TIMING), for the log.
+    for args in (["exit"], ["forkexec", "2", a.bench]):
+        env = dict(os.environ, FWE_TIMING="1")
+        r = subprocess.run(fwe + [a.bench] + args, env=env, capture_output=True, text=True)
+        print(r.stderr, file=sys.stderr)
     results = {
         "fwe": micro(fwe, a.bench),
         "macOS": micro([], a.native),
