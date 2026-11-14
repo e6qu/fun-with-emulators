@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 
-ROUNDS = 5
+ROUNDS = 9
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
 
