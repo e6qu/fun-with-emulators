@@ -47,8 +47,6 @@ options:
 ";
 
 fn main() -> ExitCode {
-    #[cfg(target_os = "macos")]
-    fwe_native::nano_malloc_off();
     fwe_kernel::timing::init();
     fwe_native::install_kill_relay();
     fwe_native::remember_exe();
@@ -250,7 +248,6 @@ fn main() -> ExitCode {
             kv.push(v);
             kv
         })
-        .filter(|e| !fwe_native::is_nano_malloc(e.as_bytes()))
         .collect();
 
     let error = fwe_native::run(&path, &guest_args, &env, &options);

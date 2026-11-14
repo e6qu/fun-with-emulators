@@ -49,10 +49,9 @@ unless named otherwise) and unpacking it into a new directory; `--root`
 then makes that directory the program's `/`.
 
 A program inside the root is named by its path on the Mac. The
-environment is passed on as it is (but `MallocNanoZone`, a setting of
-macOS's allocator that fwe keeps for itself), so give the program a
-Linux one with `env -i`, as a login would (`fwe` found first, on your
-`PATH`). This guide uses a shell function for it:
+environment is passed on as it is, so give the program a Linux one with
+`env -i`, as a login would (`fwe` found first, on your `PATH`). This
+guide uses a shell function for it:
 
 ```sh
 # linux ROOT PROGRAM [ARGS...]: run PROGRAM (a path in ROOT) with ROOT as /.

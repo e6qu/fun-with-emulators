@@ -365,60 +365,6 @@ pub fn adopt_user_dir(dir: &[u8]) {
     }
 }
 
-/// macOS's nano allocator, as fwe runs: off. It hands small blocks out of
-/// a large region by CPU, and a host `fork` of a process that has it costs
-/// tens of microseconds more, in the call and in the child, whatever fwe
-/// allocates where. macOS reads the setting as a process starts, from its
-/// environment: every fwe that fwe starts has it there ([`reexec`]), and
-/// the one started otherwise runs itself again with it
-/// ([`nano_malloc_off`]). The variable is fwe's: the guest's environment
-/// is without it.
-pub const NANO_MALLOC_OFF: &str = "MallocNanoZone=0";
-
-/// Whether environment entry `e` is the nano allocator's setting.
-pub fn is_nano_malloc(e: &[u8]) -> bool {
-    e.starts_with(b"MallocNanoZone=")
-}
-
-/// Run this fwe again with the nano allocator off, unless it is
-/// ([`NANO_MALLOC_OFF`]). Called first thing.
-#[cfg(target_os = "macos")]
-pub fn nano_malloc_off() {
-    let off = NANO_MALLOC_OFF.split_once('=').unwrap();
-    if std::env::var_os(off.0).is_some_and(|v| v == off.1) {
-        return;
-    }
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => fatal_start(&format!("cannot find its own executable: {e}")),
-    };
-    let args: Vec<std::ffi::CString> = std::env::args_os()
-        .map(|a| std::ffi::CString::new(a.into_vec()).expect("an argument holds no NUL"))
-        .collect();
-    let env: Vec<std::ffi::CString> = std::env::vars_os()
-        .map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat())
-        .filter(|e| !is_nano_malloc(e))
-        .chain([NANO_MALLOC_OFF.as_bytes().to_vec()])
-        .map(|e| std::ffi::CString::new(e).expect("an environment entry holds no NUL"))
-        .collect();
-    let path =
-        std::ffi::CString::new(exe.into_os_string().into_vec()).expect("a path holds no NUL");
-    let mut pargs: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
-    pargs.push(std::ptr::null());
-    let mut penv: Vec<*const libc::c_char> = env.iter().map(|c| c.as_ptr()).collect();
-    penv.push(std::ptr::null());
-    // SAFETY: NUL-terminated argument and environment arrays of C strings
-    // that live across the call.
-    unsafe { libc::execve(path.as_ptr(), pargs.as_ptr(), penv.as_ptr()) };
-    fatal_start(&format!("cannot run itself again: {}", std::io::Error::last_os_error()))
-}
-
-#[cfg(target_os = "macos")]
-fn fatal_start(why: &str) -> ! {
-    eprintln!("fwe: {why}");
-    std::process::exit(126)
-}
-
 /// This `fwe` executable, for re-executing it (see [`reexec`]).
 static FWE_EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
 
@@ -513,14 +459,7 @@ pub(crate) fn reexec(
     argv.push(path.to_vec());
     argv.extend(args.iter().skip(1).cloned());
     let cargs: Result<Vec<CString>, _> = argv.into_iter().map(CString::new).collect();
-    // The guest's environment, with fwe's own allocator setting.
-    let cenv: Result<Vec<CString>, _> = env
-        .iter()
-        .filter(|e| !is_nano_malloc(e))
-        .cloned()
-        .chain([NANO_MALLOC_OFF.as_bytes().to_vec()])
-        .map(CString::new)
-        .collect();
+    let cenv: Result<Vec<CString>, _> = env.iter().cloned().map(CString::new).collect();
     let (Ok(cargs), Ok(cenv)) = (cargs, cenv) else {
         release();
         return err(errno::EINVAL);
