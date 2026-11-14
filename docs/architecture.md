@@ -267,7 +267,10 @@ The pieces that do it:
   that runs is mostly together. A page made
   writable has its words written first; one moved by `mremap` too. A
   large library is mostly never run: clang's `libLLVM` has sites on 2,081
-  of its 5,927 code pages, most never reached by a compile.
+  of its 5,927 code pages, most never reached by a compile. The pages a
+  run wrote are kept with the range's preparation as the process ends
+  (`prepare::keep_hot`), added to those of earlier runs; the next start
+  writes those as it prepares the range, and owes only the rest.
 
 The stub for an instruction writing `sp` from `x18` sets `sp` before it
 reads its two scratch registers back from below the old `sp`; a signal

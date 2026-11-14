@@ -11,6 +11,10 @@
 //! guest gave it. A read of the page sees the file's own bytes, as it
 //! would on Linux. The guest making the page writable has the writes made
 //! first ([`protected`]), so that none lands on what the guest wrote.
+//!
+//! Which pages a run wrote is kept with the code's preparation
+//! ([`keep_hot`]): the next start of the same file writes those at once,
+//! as it prepares the code, and owes only the rest.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -18,11 +22,21 @@ use std::sync::Mutex;
 /// A write owed: where, the word there now, and the word to put there.
 pub type Write = (u64, u32, u32);
 
-/// A page with writes owed: the writes, and the protections the guest
-/// gave the page (host bits).
+/// A page with writes owed: the writes, the protections the guest gave
+/// the page (host bits), and the code's preparation it is of (an index
+/// into [`Pages::origins`]).
 struct Owed {
     writes: Vec<Write>,
     prot: i32,
+    origin: usize,
+}
+
+/// A range of code whose writes are owed: its preparation's key, where it
+/// starts, and its pages (offsets from the start) written so far.
+struct Origin {
+    key: Vec<u8>,
+    start: u64,
+    written: std::collections::BTreeSet<u64>,
 }
 
 /// Pages by their host address: those owed writes, and those whose writes
@@ -31,10 +45,14 @@ struct Owed {
 struct Pages {
     owed: BTreeMap<u64, Owed>,
     done: std::collections::BTreeSet<u64>,
+    origins: Vec<Origin>,
 }
 
-static PAGES: Mutex<Pages> =
-    Mutex::new(Pages { owed: BTreeMap::new(), done: std::collections::BTreeSet::new() });
+static PAGES: Mutex<Pages> = Mutex::new(Pages {
+    owed: BTreeMap::new(),
+    done: std::collections::BTreeSet::new(),
+    origins: Vec::new(),
+});
 
 fn pages() -> std::sync::MutexGuard<'static, Pages> {
     PAGES.lock().unwrap_or_else(|e| e.into_inner())
@@ -49,15 +67,37 @@ fn page() -> u64 {
 
 /// Owe `writes` to the pages they fall in, which the caller has prepared
 /// otherwise; their protections are set once the mapping's are
-/// ([`protected`]).
-pub fn owe(writes: Vec<Write>) {
+/// ([`protected`]). They are of the code from `start` whose preparation
+/// is kept under `key`.
+pub fn owe(writes: Vec<Write>, key: &[u8], start: u64) {
     let page = page();
     let mut pg = pages();
+    let origin = pg.origins.len();
+    pg.origins.push(Origin { key: key.to_vec(), start, written: Default::default() });
     for w in writes {
         let p = w.0 & !(page - 1);
         pg.done.remove(&p);
-        pg.owed.entry(p).or_insert(Owed { writes: Vec::new(), prot: 0 }).writes.push(w);
+        pg.owed.entry(p).or_insert(Owed { writes: Vec::new(), prot: 0, origin }).writes.push(w);
     }
+}
+
+/// The page of `p` was written: noted for its origin's preparation.
+fn note_written(pg: &mut Pages, p: u64, origin: usize) {
+    if let Some(o) = pg.origins.get_mut(origin) {
+        o.written.insert(p.wrapping_sub(o.start & !(page() - 1)) / page());
+    }
+}
+
+/// The pages each owing range of code had written in this run, by its
+/// preparation's key: page numbers from the range's first page (host
+/// pages). For [`crate::prepcache`], as the process ends.
+pub fn written_pages() -> Vec<(Vec<u8>, Vec<u64>)> {
+    let pg = pages();
+    pg.origins
+        .iter()
+        .filter(|o| !o.written.is_empty())
+        .map(|o| (o.key.clone(), o.written.iter().copied().collect()))
+        .collect()
 }
 
 /// Whether any page is owed writes.
@@ -86,6 +126,7 @@ pub fn protected(addr: u64, len: u64, prot: i32) {
             let owed = pg.owed.remove(&p).expect("listed");
             write(p, &owed.writes, prot);
             pg.done.insert(p);
+            note_written(&mut pg, p, owed.origin);
             continue;
         }
         let e = pg.owed.get_mut(&p).expect("listed");
@@ -124,6 +165,7 @@ pub fn settle(addr: u64, len: u64) {
         let owed = pg.owed.remove(&p).expect("listed");
         write(p, &owed.writes, owed.prot);
         pg.done.insert(p);
+        note_written(&mut pg, p, owed.origin);
     }
 }
 
@@ -160,10 +202,12 @@ pub fn fault(pc: u64, addr: u64) -> bool {
     while end - p < (NEIGHBOURS + 1) * page && same(&pg, end) {
         end += page;
     }
-    let writes: Vec<Write> = (first..end)
-        .step_by(page as usize)
-        .flat_map(|q| pg.owed.remove(&q).expect("owed").writes)
-        .collect();
+    let mut writes: Vec<Write> = Vec::new();
+    for q in (first..end).step_by(page as usize) {
+        let owed = pg.owed.remove(&q).expect("owed");
+        note_written(&mut pg, q, owed.origin);
+        writes.extend(owed.writes);
+    }
     write_run(first, end - first, &writes, prot);
     for q in (first..end).step_by(page as usize) {
         pg.done.insert(q);
@@ -238,11 +282,11 @@ mod tests {
                 0,
             )
         } as u64;
-        owe(vec![
-            (p + 8, 0, 0x1111_1111),
-            (p + page + 4, 0, 0x2222_2222),
-            (p + 12, 7, 0x3333_3333),
-        ]);
+        owe(
+            vec![(p + 8, 0, 0x1111_1111), (p + page + 4, 0, 0x2222_2222), (p + 12, 7, 0x3333_3333)],
+            b"test",
+            p,
+        );
         protected(p, 2 * page, libc::PROT_READ);
         // SAFETY: the mapping above, readable.
         assert_eq!(unsafe { ((p + 8) as *const u32).read() }, 0);

@@ -30,6 +30,8 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// written as they first ran.
 fn mark_exit() {
     fwe_kernel::timing::mark("exit");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    prepare::keep_hot();
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();
         fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));

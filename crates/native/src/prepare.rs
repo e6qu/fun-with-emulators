@@ -104,28 +104,60 @@ const GROUP_SPAN: u64 = BRANCH_RANGE / 4;
 /// costs less than reading the record.
 const KEEP_FROM: u64 = 64 << 10;
 
-/// What [`rewrite::patch`] found, kept under `key`.
-fn keep(key: &[u8], p: &rewrite::Patched) {
+/// What was kept of a range of code: the words [`rewrite::patch`] noted,
+/// the `x18` uses it left, and the pages runs wrote as they first ran
+/// them (host pages, from the range's first; see
+/// [`fwe_kernel::lazycode`]).
+struct Kept {
+    noted: Vec<rewrite::Noted>,
+    deferred: usize,
+    hot: Vec<u64>,
+}
+
+/// Keep `k` under `key`.
+fn keep(key: &[u8], k: &Kept) {
     let mut e = fwe_kernel::snapshot::Enc::new();
-    e.u64(p.x18_deferred as u64);
-    e.u64(p.noted.len() as u64);
-    for &(off, orig, flags) in &p.noted {
+    e.u64(k.deferred as u64);
+    e.u64(k.noted.len() as u64);
+    for &(off, orig, flags) in &k.noted {
         e.u64(off);
         e.u32(orig);
         e.u32(u32::from(flags));
     }
+    e.u64(k.hot.len() as u64);
+    for &p in &k.hot {
+        e.u64(p);
+    }
     fwe_kernel::prepcache::store(key, &e.into_bytes());
 }
 
-/// What was kept under `key`: the words noted and the `x18` uses left.
-fn kept(key: &[u8]) -> Option<(Vec<rewrite::Noted>, usize)> {
+/// What was kept under `key`.
+fn kept(key: &[u8]) -> Option<Kept> {
     let v = fwe_kernel::prepcache::load(key)?;
     let mut d = fwe_kernel::snapshot::Dec::new(&v);
     let deferred = d.u64() as usize;
     let n = d.count(16);
     let noted = (0..n).map(|_| (d.u64(), d.u32(), d.u32() as u8)).collect();
+    let n = d.count(8);
+    let hot = (0..n).map(|_| d.u64()).collect();
     d.finish().ok()?;
-    Some((noted, deferred))
+    Some(Kept { noted, deferred, hot })
+}
+
+/// As the process ends: the pages of each range of code it wrote as they
+/// first ran, kept with the range's preparation for the next start (which
+/// writes them at once, sparing a fault each), with those kept before.
+pub fn keep_hot() {
+    for (key, pages) in fwe_kernel::lazycode::written_pages() {
+        let Some(mut k) = kept(&key) else { continue };
+        let before = k.hot.len();
+        k.hot.extend(pages);
+        k.hot.sort_unstable();
+        k.hot.dedup();
+        if k.hot.len() != before {
+            keep(&key, &k);
+        }
+    }
 }
 
 /// Prepare guest code in `[addr, addr + len)` for execution. `known`, when
@@ -169,14 +201,16 @@ pub unsafe fn prepare(
     // The loader's images (`arena`) are copies, written already.
     let kept = cache.and_then(kept);
     let mut defer: Option<std::collections::BTreeMap<u64, (u32, u32)>> = None;
+    let mut hot: Vec<u64> = Vec::new();
     let replayed = match kept {
-        Some((n, d)) if arena.is_none() => {
-            let (p, words) = rewrite::plan(&n, d);
+        Some(k) if arena.is_none() => {
+            let (p, words) = rewrite::plan(&k.noted, k.deferred);
             defer =
                 Some(words.into_iter().map(|(off, was, now)| (start + off, (was, now))).collect());
+            hot = k.hot;
             Some(p)
         }
-        Some((n, d)) => rewrite::replay(code, &n, d),
+        Some(k) => rewrite::replay(code, &k.noted, k.deferred),
         None => None,
     };
     let patched = match replayed {
@@ -186,7 +220,10 @@ pub unsafe fn prepare(
             if let Some(key) = cache
                 && len >= KEEP_FROM
             {
-                keep(key, &p);
+                keep(
+                    key,
+                    &Kept { noted: p.noted.clone(), deferred: p.x18_deferred, hot: Vec::new() },
+                );
             }
             p
         }
@@ -255,8 +292,34 @@ pub unsafe fn prepare(
         sites = rest;
     }
     if let Some(d) = defer {
-        let owed = d.into_iter().filter(|(_, (was, now))| was != now);
-        fwe_kernel::lazycode::owe(owed.map(|(at, (was, now))| (at, was, now)).collect());
+        // The pages earlier runs wrote as they first ran are written now,
+        // while the range is still writable; the rest are owed.
+        let host_page = fwe_kernel::mm::host_page_size();
+        let first = start & !(host_page - 1);
+        let hot: std::collections::BTreeSet<u64> = hot.into_iter().collect();
+        let mut owed = Vec::new();
+        let mut written = false;
+        for (at, (was, now)) in d.into_iter().filter(|(_, (was, now))| was != now) {
+            if hot.contains(&((at - first) / host_page)) {
+                // SAFETY: a word of the range, writable now (the caller's
+                // guarantee); one not as the preparation found it is left.
+                unsafe {
+                    if (at as *const u32).read() == was {
+                        (at as *mut u32).write(now);
+                    }
+                }
+                written = true;
+            } else {
+                owed.push((at, was, now));
+            }
+        }
+        if written {
+            // SAFETY: the range is mapped.
+            unsafe { flush_icache(start, len) };
+        }
+        if let Some(key) = cache {
+            fwe_kernel::lazycode::owe(owed, key, start);
+        }
     } else if stats.syscalls + stats.stubs > 0 {
         // SAFETY: the range is mapped.
         unsafe { flush_icache(start, len) };
@@ -482,5 +545,15 @@ mod tests {
             assert_eq!(read(stub + 24) as u64 | (read(stub + 28) as u64) << 32, gate);
             assert_eq!(rewrite::branch(stub + 16, code + 8), Some(read(stub + 16)));
         }
+    }
+
+    /// A range's preparation is kept with the pages runs wrote, which a
+    /// later run adds to.
+    #[test]
+    fn kept_preparation_carries_the_pages_written() {
+        let key = format!("prepare-test-{}", std::process::id()).into_bytes();
+        keep(&key, &Kept { noted: vec![(8, 0xd400_0001, 1)], deferred: 2, hot: vec![3, 1] });
+        let k = kept(&key).unwrap();
+        assert_eq!((k.noted, k.deferred, k.hot), (vec![(8, 0xd400_0001, 1)], 2, vec![3, 1]));
     }
 }
