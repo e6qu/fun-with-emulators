@@ -18,10 +18,10 @@
 //! signal from elsewhere (the terminal, the host) is not taken for it. Both
 //! are
 //! async-signal-safe: `pread` and `pwrite` on the process's own mailbox,
-//! which it opened as it started (and a fork child as it starts), in fwe's
-//! reserved descriptor range, so a handler takes no number the guest's
-//! next descriptor would. A note whose signal could not be sent is taken
-//! back.
+//! which the first sender makes, kept open in fwe's reserved descriptor
+//! range once a handler first reads it (opening it by its path takes a
+//! number below the range for that moment only). A note whose signal could
+//! not be sent is taken back.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -85,10 +85,13 @@ pub fn open_own() {
     }
     let mut buf = [0u8; 512];
     let Some(path) = mailbox(me, &mut buf) else { return };
+    // Not made here: the first sender makes it, and the first note read
+    // keeps it open ([`own_mailbox`]). Most processes are sent nothing,
+    // and making a file costs more than the rest of a fork child's start.
     // SAFETY: a NUL-terminated path; the descriptor is moved out of the
     // guest's range and kept for the process's life.
-    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
-    let Ok(fd) = crate::fdtable::reserve(fd) else { return };
+    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
+    let fd = if fd >= 0 { crate::fdtable::reserve(fd).unwrap_or(-1) } else { -1 };
     let old = OWN.swap(fd, Ordering::SeqCst);
     OWN_PID.store(me, Ordering::SeqCst);
     if old >= 0 {
@@ -256,7 +259,25 @@ fn own_mailbox() -> Option<(i32, bool)> {
     }
     // SAFETY: a NUL-terminated path; async-signal-safe.
     let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
-    (fd >= 0).then_some((fd, true))
+    if fd < 0 {
+        return None;
+    }
+    // Kept for the next note, out of the guest's range, if none is kept:
+    // the mailbox a sender made after this process started.
+    if OWN_PID.load(Ordering::SeqCst) == me && own < 0 {
+        // SAFETY: plain host calls on the descriptor just opened;
+        // async-signal-safe.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, crate::fdtable::guest_max()) };
+        if high >= 0 {
+            // SAFETY: the descriptor opened above, now copied.
+            unsafe { libc::close(fd) };
+            if OWN.compare_exchange(-1, high, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Some((high, false));
+            }
+            return Some((high, true));
+        }
+    }
+    Some((fd, true))
 }
 
 /// Read, and with `clear_if` (clearing only a note of that sender, or with
