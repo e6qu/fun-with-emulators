@@ -634,6 +634,9 @@ while it is still writable and before any thread can run it
 - **the first instruction fetch from write+exec memory**
   ([Write+exec memory](#writeexec-memory)).
 
+The instruction cache is invalidated for the pages written only: it is
+walked a line at a time, and a page walked is a page read in, so a large
+library mostly not run (LLVM's, under a compiler) stays mostly unread.
 Preparing code twice is harmless: a rewritten site no longer matches.
 fwe's own `rt_sigreturn` trampoline is written already rewritten, as
 `movz x8, #139; brk #0x4c58`: the trap, not a branch to a stub, since the
