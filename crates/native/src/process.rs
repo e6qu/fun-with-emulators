@@ -225,7 +225,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
-        let token = match k.fork_begin(&a) {
+        let mut token = match k.fork_begin(&a) {
             Ok(t) => t,
             Err(e) => {
                 for fd in done.into_iter().filter(|&fd| fd >= 0) {
@@ -235,6 +235,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 return fwe_abi::err(e);
             }
         };
+        // The child writes its whole record as it starts.
+        fwe_kernel::Kernel::<NativePlatform>::fork_child_writes(&mut token);
         let kqueues = fwe_kernel::kqueue_state();
         // A child of CLONE_VM shares the guest's memory: its private parts
         // are shared for the fork, then copied again by any later one (in

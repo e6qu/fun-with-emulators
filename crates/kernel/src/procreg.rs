@@ -251,7 +251,26 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
     if pid == crate::host::pid() {
         return with_held(pid, read_own(pid));
     }
-    with_held(pid, read_any(pid).filter(|r| start_time(pid) == Some(r.start)))
+    let r = read_any(pid).filter(|r| start_time(pid) == Some(r.start));
+    if r.is_none() && new_child(pid) {
+        // A child this process just forked writes its own record as it
+        // starts ([`own_whole`]): wait for it, as it is there on Linux.
+        for _ in 0..2000 {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            if let Some(r) = read_any(pid).filter(|r| start_time(pid) == Some(r.start)) {
+                return with_held(pid, Some(r));
+            }
+            if !new_child(pid) {
+                break;
+            }
+        }
+    }
+    with_held(pid, r)
+}
+
+/// Whether host process `pid` is a live child of this process.
+fn new_child(pid: i32) -> bool {
+    host_info(pid).is_some_and(|(_, ppid, zombie)| ppid == me() && !zombie)
 }
 
 /// What a record's file looks like on the host: its identity, when it was
@@ -483,9 +502,9 @@ fn lock(pid: i32) -> Option<std::fs::File> {
             .ok()?;
         // SAFETY: plain host call on the file just opened; the lock goes with it.
         crate::shared::lock_exclusive(f.as_raw_fd());
-        let held = f.metadata().ok().map(|m| (m.dev(), m.ino()));
-        let there = std::fs::metadata(OsStr::from_bytes(&p)).ok().map(|m| (m.dev(), m.ino()));
-        if held.is_some() && held == there {
+        // Still the record's file: removed, it has no link left (a record
+        // is only ever removed, never replaced by another file).
+        if f.metadata().is_ok_and(|m| m.nlink() > 0) {
             return Some(f);
         }
     }
@@ -495,11 +514,20 @@ fn lock(pid: i32) -> Option<std::fs::File> {
 /// The record in `f`, the locked file of host process `pid`'s record (see
 /// [`lock`]), if it is of the process that started at `start`.
 fn read_locked(f: &std::fs::File, pid: i32, start: u64) -> Option<ProcRecord> {
-    use std::io::{Read, Seek};
-    let mut bytes = Vec::new();
-    let mut f = f;
-    f.seek(std::io::SeekFrom::Start(0)).ok()?;
-    f.read_to_end(&mut bytes).ok()?;
+    use std::os::unix::fs::FileExt;
+    // As long as the file is, in one read.
+    let len = f.metadata().ok()?.len() as usize;
+    let mut bytes = vec![0u8; len];
+    let mut n = 0;
+    while n < len {
+        match f.read_at(&mut bytes[n..], n as u64) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    bytes.truncate(n);
     let r = (!bytes.is_empty()).then(|| unframe(&bytes).and_then(decode)).flatten();
     with_held(pid, r.filter(|r| r.start == start))
 }
@@ -1188,6 +1216,63 @@ pub fn own_line(
         (r.lineage, r.bound) = line.clone();
         r.maps = maps;
         // The program its parent runs, which it runs too until it execs.
+        r.auxv = auxv.to_vec();
+    });
+}
+
+/// What a parent alone knows of its child's record as it forks: its own
+/// program (the child runs it until it execs), the cgroup the child starts
+/// in, and whether the host reaps the parent's children.
+#[derive(Clone, Debug)]
+pub struct FromParent {
+    comm: Vec<u8>,
+    cmdline: Vec<u8>,
+    exe: Vec<u8>,
+    cgroup: Vec<u8>,
+    autoreap: bool,
+}
+
+impl FromParent {
+    /// This process's, for a child that starts in `cgroup` (else in this
+    /// process's).
+    pub fn of(cgroup: Option<&[u8]>) -> FromParent {
+        let mine = read(me());
+        let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
+        FromParent {
+            comm,
+            cmdline,
+            exe,
+            cgroup: cgroup.map_or_else(own_cgroup, <[u8]>::to_vec),
+            autoreap: crate::host::children_reaped_by_host(),
+        }
+    }
+}
+
+/// [`own_line`] for a child whose parent writes none of its record: all of
+/// what [`forked`] would have written too, from `from`.
+pub fn own_whole(
+    line: &(Vec<Proc>, Option<Proc>),
+    inherit: &Inherit,
+    ns: Vec<Vec<u8>>,
+    maps: Vec<u8>,
+    auxv: &[u8],
+    from: &FromParent,
+) {
+    let _ = change(me(), |r| {
+        if r.lineage.is_empty() {
+            apply(r, inherit);
+            r.ns = ns;
+        }
+        if r.cgroup.is_empty() {
+            r.cgroup = from.cgroup.clone();
+        }
+        if r.exe.is_empty() {
+            (r.comm, r.cmdline, r.exe) =
+                (from.comm.clone(), from.cmdline.clone(), from.exe.clone());
+        }
+        (r.lineage, r.bound) = line.clone();
+        r.autoreap = from.autoreap;
+        r.maps = maps;
         r.auxv = auxv.to_vec();
     });
 }
