@@ -417,12 +417,13 @@ def build(a, fwe, results):
     shutil.rmtree(native, ignore_errors=True)
 
 
-def workload(results, name, ours, theirs, fresh, at):
+def workload(results, name, ours, theirs, fresh, at, profiled=False):
     """Time workload `name`: command `ours` under fwe and `theirs` natively,
     in turns, three rounds, the best of each kept. Each round starts with
     the directories `fresh` empty. Both must succeed and print the same.
     Then `ours` once more, traced (fwe's options go in at `at`, after fwe
-    itself), its system calls counted in the log: where fwe's time goes."""
+    itself), its system calls counted in the log: where fwe's time goes;
+    and, `profiled` (a program in one process), once more sampled."""
     times = {"fwe": [], "macOS": []}
     outs = {}
     for _ in range(3):
@@ -455,6 +456,41 @@ def workload(results, name, ours, theirs, fresh, at):
                 calls[m.group(1)] += 1
     top = ", ".join(f"{c} {n}" for c, n in ((n, c) for c, n in calls.most_common(14)))
     print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
+    if profiled:
+        for d in fresh:
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+        profile(name, ours)
+
+
+def profile(name, cmd):
+    """Run `cmd` (one fwe process) once more under macOS's `sample`, and
+    log where its time went by the top of the stack: the guest's own code
+    (no symbols), or fwe's and the host libraries' functions."""
+    out = os.path.abspath(f"bench-{name.split()[0].lower()}.sample")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["sample", str(proc.pid), "5", "1", "-file", out], capture_output=True)
+    proc.wait()
+    tops = collections.Counter()
+    with open(out, errors="replace") as f:
+        lines = iter(f)
+        for line in lines:
+            if line.startswith("Sort by top of stack"):
+                break
+        for line in lines:
+            m = re.match(r"\s+(.+?)\s+\(in ([^)]*)\)\s+(\d+)\s*$", line)
+            if not m:
+                if line.strip() == "" and tops:
+                    break
+                continue
+            sym, where, n = m.group(1), m.group(2), int(m.group(3))
+            if where.startswith("<unknown") or sym.startswith("???"):
+                sym, where = "guest code", "guest"
+            tops[(sym[:60], where)] += n
+    total = sum(tops.values()) or 1
+    guest = sum(n for (_, w), n in tops.items() if w == "guest")
+    top = ", ".join(f"{s} ({w}) {n * 100 // total}%" for (s, w), n in tops.most_common(12))
+    print(f"{name}: {guest * 100 // total}% in guest code; top of stack: {top}", file=sys.stderr)
 
 
 def workloads(a, fwe, guest_env, lua_src, results):
@@ -492,6 +528,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
         [brew["python"], os.path.join(WORKLOADS, "bench.py")],
         (),
         at,
+        profiled=True,
     )
     workload(
         results,
@@ -500,6 +537,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
         [brew["sqlite"], os.path.join(theirs_w, "db"), f".read {WORKLOADS}/bench.sql"],
         fresh,
         at,
+        profiled=True,
     )
     workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh, at)
     workload(results, "xz (s)", *script("xz.sh", "/usr/bin/xz", brew["xz"]), fresh, at)
