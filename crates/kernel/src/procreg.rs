@@ -434,13 +434,18 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
 /// with its length and checksum, for readers (who take no lock) to tell a
 /// whole record from one being written, and from an older one's longer
 /// tail.
-fn write(pid: i32, r: &ProcRecord) {
-    // What this process kept of its own record is read again.
+/// What this process kept of its own record ([`read_own`]) is read again
+/// after a write of host process `pid`'s.
+fn forget_own(pid: i32) {
     if let Some(own) = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         && own.0 == pid
     {
         own.0 = 0;
     }
+}
+
+fn write(pid: i32, r: &ProcRecord) {
+    forget_own(pid);
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
     let bytes = frame(&encode(r));
@@ -457,19 +462,54 @@ fn write(pid: i32, r: &ProcRecord) {
     let _ = f.write_all_at(&bytes, 0);
 }
 
-/// Hold host process `pid`'s record's lock while the result lives.
+/// Hold host process `pid`'s record's lock while the result lives: a lock
+/// on the record's own file (made, empty, if there is none: an empty file
+/// is no record), which the holder reads and writes through
+/// ([`read_locked`], [`write_locked`]).
 fn lock(pid: i32) -> Option<std::fs::File> {
-    let p = [path(pid)?, b".lock".to_vec()].concat();
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(OsStr::from_bytes(&p))
-        .ok()?;
     use std::os::fd::AsRawFd;
-    // SAFETY: plain host call on the file just opened; the lock goes with it.
-    crate::shared::lock_exclusive(f.as_raw_fd());
-    Some(f)
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let p = path(pid)?;
+    // A file removed while this waited for its lock is no longer the
+    // record's: the lock is taken again on the one there now.
+    for _ in 0..100 {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(OsStr::from_bytes(&p))
+            .ok()?;
+        // SAFETY: plain host call on the file just opened; the lock goes with it.
+        crate::shared::lock_exclusive(f.as_raw_fd());
+        let held = f.metadata().ok().map(|m| (m.dev(), m.ino()));
+        let there = std::fs::metadata(OsStr::from_bytes(&p)).ok().map(|m| (m.dev(), m.ino()));
+        if held.is_some() && held == there {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// The record in `f`, the locked file of host process `pid`'s record (see
+/// [`lock`]), if it is of the process that started at `start`.
+fn read_locked(f: &std::fs::File, pid: i32, start: u64) -> Option<ProcRecord> {
+    use std::io::{Read, Seek};
+    let mut bytes = Vec::new();
+    let mut f = f;
+    f.seek(std::io::SeekFrom::Start(0)).ok()?;
+    f.read_to_end(&mut bytes).ok()?;
+    let r = (!bytes.is_empty()).then(|| unframe(&bytes).and_then(decode)).flatten();
+    with_held(pid, r.filter(|r| r.start == start))
+}
+
+/// Write record `r` of host process `pid` into `f`, its locked file.
+fn write_locked(f: &std::fs::File, pid: i32, r: &ProcRecord) {
+    use std::os::unix::fs::FileExt;
+    forget_own(pid);
+    // An older record's longer tail stays, past the frame.
+    let _ = f.write_all_at(&frame(&encode(r)), 0);
 }
 
 fn end_path(pid: i32) -> Option<Vec<u8>> {
@@ -516,7 +556,7 @@ pub fn forget_end(pid: i32) {
 
 /// Forget host process `pid` (it ended). Where a new process has the pid
 /// already, only the old one's record goes: the files beside it (its
-/// mailbox, lock and mappings) are the new one's now, which may have
+/// mailbox and mappings) are the new one's now, which may have
 /// opened them before it wrote its own record.
 pub fn remove(pid: i32) {
     let Some(p) = path(pid) else { return };
@@ -525,7 +565,6 @@ pub fn remove(pid: i32) {
         return;
     }
     let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
-    let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     crate::signote::remove(pid);
 }
 
@@ -739,10 +778,15 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
     // Under the record's lock: a parent and its child may change one.
-    let _lock = lock(pid);
-    let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
+    let Some(file) = lock(pid) else {
+        let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
+        f(&mut r);
+        write(pid, &r);
+        return Ok(());
+    };
+    let mut r = read_locked(&file, pid, start).unwrap_or_else(|| fresh(pid, start));
     f(&mut r);
-    write(pid, &r);
+    write_locked(&file, pid, &r);
     Ok(())
 }
 
