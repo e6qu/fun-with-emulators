@@ -429,7 +429,11 @@ keeps:
   flag, nice value, scheduling policy and `oom_score_adj`. A record is
   rewritten in place under its lock, framed with its length and a
   checksum, so a reader (which takes no lock) rereads one caught
-  mid-write; a program's start writes its record once.
+  mid-write; a program's start writes its record once. A record is locked
+  on its own file. A native fork's child writes its whole record as it
+  starts, with what its parent knows of it (its program, cgroup and
+  whether the host reaps); a look at one's own child's record that it has
+  not written yet waits for it.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events));
