@@ -398,6 +398,19 @@ def build(a, fwe, results):
         )
     results["fwe"]["build Lua (s)"] = min(ours)
     results["macOS"]["build Lua (s)"] = min(theirs)
+    # Where one compile's time goes: fwe's marks (start-up, the code pages
+    # written as they first ran), and what it and the native one cost the
+    # host.
+    one = ["-O2", "-c", "-o", "/tmp/one.o", "/tmp/lua-5.4.7/src/lvm.c"]
+    clang = guest_env + fwe + ["--root", root, os.path.join(root, "usr/bin/clang")] + one
+    timed = clang[:2] + ["FWE_TIMING=1"] + clang[2:]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
+    marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines() if "timing: " in l]
+    print("clang -c lvm.c: fwe's marks: " + "; ".join(marks), file=sys.stderr)
+    native_one = [os.path.join(a.brew, BREW["clang"]), "-O2", "-c", "-o",
+                  os.path.join(native, "one.o"), os.path.join(native_src, "src/lvm.c")]
+    rusage("clang -c lvm.c", "fwe", clang, ())
+    rusage("clang -c lvm.c", "macOS", native_one, ())
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
