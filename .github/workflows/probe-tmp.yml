@@ -52,6 +52,10 @@ jobs:
           lines = open("/tmp/t.txt", errors="replace").read().splitlines()
           print("\n".join(l[:200] for l in lines if "mmap" in l and "PROT_EXEC" in l.upper()[:400])[:4000])
           print("\n".join(l[:200] for l in lines if "prepared" in l)[:3000])
+          r = subprocess.run(["/usr/bin/time", "-l"] + cmd, capture_output=True, text=True)
+          print("fwe:", "\n".join(l for l in r.stderr.splitlines() if "fault" in l or "reclaims" in l or "real" in l or "instructions" in l or "cycles" in l))
+          r = subprocess.run(["/usr/bin/time", "-l", "clang", "--version"], capture_output=True, text=True)
+          print("mac:", "\n".join(l for l in r.stderr.splitlines() if "fault" in l or "reclaims" in l or "real" in l or "instructions" in l or "cycles" in l))
           PY
       - name: A compile under fwe
         run: |
@@ -84,3 +88,9 @@ jobs:
           p.wait()
           PY
           awk '/Sort by top of stack/,/Binary Images/' c.txt | head -40 || true
+  linux:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - run: |
+          docker run --rm alpine:3.24 sh -c 'apk add -q clang22 >/dev/null; for i in 1 2 3 4; do s=$(date +%s%N); clang --version >/dev/null; e=$(date +%s%N); echo "linux clang --version $(( (e-s)/1000000 )) ms"; done'
