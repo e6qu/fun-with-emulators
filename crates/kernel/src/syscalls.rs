@@ -1174,7 +1174,9 @@ impl<P: Platform> Kernel<P> {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
-                    } else if crate::memfd::write_refused(fd) {
+                    } else if r & libc::O_ACCMODE == libc::O_RDONLY
+                        && crate::memfd::write_refused(fd)
+                    {
                         // Read-only on the host since it was sealed (see
                         // `memfd`), but open for writing as far as Linux goes.
                         let r = (r & !libc::O_ACCMODE) | libc::O_RDWR;
