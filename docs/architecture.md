@@ -421,7 +421,12 @@ keeps:
   `SIGSEGV`, `SIGBUS` and `SIGSYS` is held across the host `fork`; one of
   those sent to the child before it is set up (it may not know its own
   pid yet, and it forgets its parent's pending signals as it starts) is
-  kept and posted once it is (`trap::post_early`).
+  kept and posted once it is (`trap::post_early`). fwe runs with macOS's
+  nano allocator off (`MallocNanoZone=0`, which macOS reads as a process
+  starts: the fwe a user starts runs itself again with it, every fwe
+  that fwe starts has it, and the guest's environment is without it): a
+  host `fork` of a process that has it costs tens of microseconds more,
+  in the call and in the child.
 - **VM fork state** (`Kernel::save_for_fork`, `crates/kernel/src/snapshot.rs`):
   signal dispositions, the forking thread's mask and alternate stack, the
   break, filesystem view, credentials, descriptor limits, every descriptor
@@ -615,9 +620,10 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
 `crates/kernel/src/ptrace.rs`. macOS lets no process read another's
 memory or threads, so a tracee does its tracer's work itself:
 
-- **Mailbox:** a page per traced thread in fwe's private directory
-  (`ptrace-<id>`, a process's pid for its main thread, a tid for
-  another), mapped by it and its tracer, naming the process it is in and
+- **Mailbox:** a page per traced thread in the process store
+  (`crates/kernel/src/procstore.rs`, named by a process's pid for its
+  main thread, a tid for another), kept while its tracer lives, as a
+  tracer's inbox is; it names the process the thread is in and
   holding the stop's wait status, the general and FP registers, the
   `siginfo`, the options, and one request at a time with its result,
   handed over through shared host address waits.
@@ -1179,7 +1185,9 @@ Calls that fit none of the areas above:
   is kept in a file of fwe's for the pid namespace, and each ending
   process appends its `struct acct_v3` to the nearest namespace's, its
   own or one above, with accounting on: times, memory and faults from its
-  usage, `AFORK` for a fork child that ran no program.
+  usage, `AFORK` for a fork child that ran no program. The process store
+  counts the namespaces with accounting on; while none has, an ending
+  process looks for no file.
 - `process_vm_readv`/`process_vm_writev` (`crates/kernel/src/procvm.rs`):
   the caller writes the ranges (and data to write) to a request file and
   asks the other process through its mailbox; its wake handler copies

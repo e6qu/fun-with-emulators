@@ -136,7 +136,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 21;
+pub const FORMAT: u32 = 22;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -807,7 +807,8 @@ fn collect_in(base: &[u8]) {
             // A tmpfs, or a rootfs's `/dev/shm`, that no table shows.
             !shown.contains(&path)
         } else if name.starts_with(b"ptrace-") {
-            crate::ptrace::leftover(&name)
+            // ptrace's pages are the process store's.
+            true
         } else {
             // Another fwe build's: `v<n>-` with another format.
             name.first() == Some(&b'v')

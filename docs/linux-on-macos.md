@@ -1538,13 +1538,13 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `mmap` of a shared page, `__ulock_wait2`/`__ulock_wake`, `kill` |
+| `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `__ulock_wait2`/`__ulock_wake` on pages of the process store, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
 | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path, TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); the domain is the process's, carried by `fork` and `execve` | none |
 | `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
 
-**`ptrace`**: each traced thread has a mailbox, a page in fwe's private
-directory that it and its tracer map. At a stop (a signal about to be
+**`ptrace`**: each traced thread has a mailbox, a page of fwe's shared
+process store that it and its tracer use. At a stop (a signal about to be
 delivered, a system call's entry or exit under `PTRACE_SYSCALL`, an
 `execve`, a fork, clone or exit event) the tracee writes its registers,
 wait status and `siginfo` there, tells its tracer through the tracer's
@@ -1836,8 +1836,10 @@ place.
 
 macOS's `fork` copies memory while the parent's other threads keep
 running, gives the child none of the parent's kqueues, and does not
-restore a signal mask from a handler frame the child did not take. A VM
-cannot be forked at all.
+restore a signal mask from a handler frame the child did not take. It
+also costs tens of microseconds more in a process with macOS's nano
+allocator, so fwe runs with it off (`MallocNanoZone=0`, a variable the
+guest does not see). A VM cannot be forked at all.
 
 **Native backend** (`crates/native/src/process.rs`, `quiesce.rs`): fwe
 holds every lock a child could need and pauses the parent's other threads
@@ -2249,8 +2251,8 @@ A record's name carries a format number, so another fwe build never reads
 it. A record no live process holds is collected when a namespace is made
 and when a fresh fwe starts, at most once a minute (records younger than
 that are spared anyway), with the files a gone process left beside its
-record, the `/dev/shm` directory of a rootfs no mount table shows, and
-the tracing mailboxes of processes that are gone. A fresh start leaves
+record, and the `/dev/shm` directory of a rootfs no mount table shows.
+A fresh start leaves
 that work to a process of its own, which nothing waits for. A process
 fwe starts for a guest's `execve` is handed the private directory
 rather than asking macOS for the user's temporary directory again (the

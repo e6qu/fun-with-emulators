@@ -109,7 +109,15 @@ const MAILBOXES_AT: usize = MAILBOX_TAKEN_AT + MAILBOXES / 8;
 /// Cells of three shared words, each named by a tag ([`cell`]).
 const CELLS: usize = 1024;
 const CELLS_AT: usize = MAILBOXES_AT + MAILBOXES * MAILBOX_WORDS * 8;
-const TAKEN_AT: usize = CELLS_AT + CELLS * 32;
+/// Pages of shared words, each named by a tag and kept for a process
+/// ([`page`]): the lock under which one is made, then each's tag and
+/// process, then the pages.
+const PAGES: usize = 1024;
+pub const PAGE_WORDS: usize = 512;
+const PAGES_LOCK_AT: usize = CELLS_AT + CELLS * 32;
+const PAGE_TAGS_AT: usize = PAGES_LOCK_AT + 64;
+const PAGES_AT: usize = (PAGE_TAGS_AT + PAGES * 16).div_ceil(PAGE_WORDS * 8) * PAGE_WORDS * 8;
+const TAKEN_AT: usize = PAGES_AT + PAGES * PAGE_WORDS * 8;
 const BLOCKS_AT: usize = (TAKEN_AT + BLOCKS / 8).div_ceil(BLOCK) * BLOCK;
 const SIZE: usize = BLOCKS_AT + BLOCKS * BLOCK;
 
@@ -190,7 +198,7 @@ fn mapped() -> Option<&'static Store> {
 }
 
 /// End the process: the store cannot do what it must.
-fn fatal(why: &str) -> ! {
+pub fn fatal(why: &str) -> ! {
     eprintln!("fwe: {why}");
     std::process::exit(1)
 }
@@ -445,6 +453,50 @@ pub fn free_cell(tag: u64) {
     }
 }
 
+/// The page tagged `tag` (not 0), or with `make` (`Some(owner)`) a new
+/// one, zeroed, kept until [`free_page`], or until host process `owner`
+/// is gone and the pages run short (`None`: none so tagged).
+pub fn page(tag: u64, make: Option<i32>) -> Option<&'static [Word; PAGE_WORDS]> {
+    let s = store();
+    let tags = |i: usize| -> &'static [Word; 2] { s.at(PAGE_TAGS_AT + i * 16) };
+    let words = |i: usize| -> &'static [Word; PAGE_WORDS] { s.at(PAGES_AT + i * PAGE_WORDS * 8) };
+    let find = || (0..PAGES).find(|&i| tags(i)[0].load(SeqCst) == tag);
+    if let Some(i) = find() {
+        return Some(words(i));
+    }
+    let owner = make?;
+    let _held = hold(s.at(PAGES_LOCK_AT));
+    // Made meanwhile by another process.
+    if let Some(i) = find() {
+        return Some(words(i));
+    }
+    // Free first, then those of processes gone.
+    for gone in [false, true] {
+        let free = (0..PAGES).find(|&i| {
+            let [t, o] = tags(i);
+            t.load(SeqCst) == 0 || gone && !crate::host::process_exists(o.load(SeqCst) as i32)
+        });
+        if let Some(i) = free {
+            for w in words(i) {
+                w.store(0, SeqCst);
+            }
+            tags(i)[1].store(owner as u64, SeqCst);
+            tags(i)[0].store(tag, SeqCst);
+            return Some(words(i));
+        }
+    }
+    fatal(&format!("the shared pages are full ({PAGES} are kept)"))
+}
+
+/// The page tagged `tag` is free again.
+pub fn free_page(tag: u64) {
+    let s = store();
+    for i in 0..PAGES {
+        let t: &Word = s.at(PAGE_TAGS_AT + i * 16);
+        let _ = t.compare_exchange(tag, 0, SeqCst, SeqCst);
+    }
+}
+
 /// Host pid `pid`'s mailbox goes (its record went, or its process).
 pub fn forget_mailbox(pid: i32) {
     let s = store();
@@ -521,33 +573,37 @@ pub fn version(pid: i32) -> Option<u32> {
 
 /// A held record lock ([`lock`]), let go when dropped.
 pub struct Held {
-    entry: &'static Entry,
+    word: &'static AtomicU32,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.entry.lock.store(0, SeqCst);
-        wake(&self.entry.lock);
+        self.word.store(0, SeqCst);
+        wake(self.word);
     }
 }
 
-/// Hold host pid `pid`'s record lock while the result lives. A lock its
-/// holder left as it died is taken over.
+/// Hold host pid `pid`'s record lock while the result lives.
 pub fn lock(pid: i32) -> Option<Held> {
-    let entry = store().entry(pid)?;
+    Some(hold(&store().entry(pid)?.lock))
+}
+
+/// Hold the lock `word` (its holder's host pid, 0: free) while the result
+/// lives. A lock its holder left as it died is taken over.
+fn hold(word: &'static AtomicU32) -> Held {
     let me = crate::host::pid() as u32;
     loop {
-        match entry.lock.compare_exchange(0, me, SeqCst, SeqCst) {
-            Ok(_) => return Some(Held { entry }),
+        match word.compare_exchange(0, me, SeqCst, SeqCst) {
+            Ok(_) => return Held { word },
             Err(holder) => {
                 // Gone, or a zombie (it died holding the lock): taken over.
                 let live = crate::procreg::host_info(holder as i32).is_some_and(|(_, _, z)| !z);
-                if !live && entry.lock.compare_exchange(holder, me, SeqCst, SeqCst).is_ok() {
-                    return Some(Held { entry });
+                if !live && word.compare_exchange(holder, me, SeqCst, SeqCst).is_ok() {
+                    return Held { word };
                 }
                 // Woken as it is let go; a while at most, to look at the
                 // holder again.
-                wait(&entry.lock, holder, 10_000_000);
+                wait(word, holder, 10_000_000);
             }
         }
     }
@@ -763,6 +819,23 @@ fn wake(word: &AtomicU32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page made is found by its tag, zeroed, until it is freed.
+    #[test]
+    fn pages_are_found_by_tag_until_freed() {
+        let tag = 7 << 32 | u64::from(std::process::id());
+        let me = crate::host::pid();
+        assert!(page(tag, None).is_none());
+        let p = page(tag, Some(me)).unwrap();
+        assert!(p.iter().all(|w| w.load(SeqCst) == 0));
+        p[3].store(42, SeqCst);
+        assert_eq!(page(tag, None).unwrap()[3].load(SeqCst), 42);
+        assert_eq!(page(tag, Some(me)).unwrap()[3].load(SeqCst), 42);
+        free_page(tag);
+        assert!(page(tag, None).is_none());
+        assert_eq!(page(tag, Some(me)).unwrap()[3].load(SeqCst), 0);
+        free_page(tag);
+    }
 
     /// A record written is read back whole, across blocks, replaced and
     /// removed, its blocks given back; an ended account is taken once.
