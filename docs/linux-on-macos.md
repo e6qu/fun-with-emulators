@@ -1050,7 +1050,7 @@ and `futex_waitv` run without the kernel lock.
 | `exit_group` | A traced process's exit stop, then the process ends (in the VM after every vCPU and the VM are destroyed). | `_exit` |
 | `wait4`, `waitid` | Run without the lock; pids, options and status translated; a tracer sees its tracees' stops first. | `wait4`, `waitid` |
 | `getpid`, `gettid` | The process's and thread's ids as fwe numbers them (pid namespace; thread ids from a shared counter). | none |
-| `getppid` | The parent, or the reaper that adopted the process; 0 for one outside the pid namespace. | `getppid` |
+| `getppid` | The parent, or the reaper that adopted the process; 0 for one outside the pid namespace. A process that asks often has a thread of fwe's watch the parent's end (`kqueue`, as for the parent-death signal) and the answer kept while the parent lives. | `getppid`, then `kqueue` |
 | `getpgid`, `getsid`, `setpgid`, `setsid` | The host's, ids mapped through the pid namespace; `setpgid` of a child that has exec'd fails with `EACCES` first, as on Linux. | `getpgid`, `getsid`, `setpgid`, `setsid` |
 | `set_tid_address`, `set_robust_list`, `get_robust_list` | Kept per thread; another process's robust list is read from the record its threads publish, for a caller that may trace it. | none |
 | `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`; other operations (PI, `WAKE_OP`) fail with `ENOSYS`. | `__ulock_wait2`/`__ulock_wake` for shared futexes |

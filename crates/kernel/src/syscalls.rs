@@ -881,7 +881,11 @@ impl<P: Platform> Kernel<P> {
             // A parent outside the namespace is 0, as Linux reports it.
             nr::GETPPID => {
                 let me = crate::host::pid();
-                let parent = crate::reaper::parent_of(me, host::getppid() as i32);
+                let host_ppid = crate::pdeath::parent().unwrap_or_else(|| {
+                    crate::pdeath::asked();
+                    host::getppid() as i32
+                });
+                let parent = crate::reaper::parent_of(me, host_ppid);
                 crate::pidns::guest_ret(i64::from(parent))
             }
             // Credentials, seen through the user namespace's maps.

@@ -954,6 +954,24 @@ fn threads_first_run_shared_code_together() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A child that asks for its parent often (fwe keeps the answer while the
+/// parent lives) sees it change once the parent ends.
+#[test]
+fn getppid_follows_the_parents_end() {
+    let prog = build_c_dynamic("ppidwatch", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "ppidwatch");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "same while it lived: 1, changed once it ended: 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A thread made after another ended starts as a new one, whatever host
 /// thread runs it: no signal stack, and its creator's name, signal mask
 /// and floating-point rounding mode, round after round.

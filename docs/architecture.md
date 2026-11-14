@@ -1274,8 +1274,7 @@ which are to be lifted for 1.0 and which are not planned.
   accepted but not kept: `ioprio_get` reports that process's as (none,
   0).
 - A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
-  process ends (Linux sends it when the parent thread does); a new thread
-  does not inherit its creator's name.
+  process ends (Linux sends it when the parent thread does).
 
 **Resources**
 - The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),
