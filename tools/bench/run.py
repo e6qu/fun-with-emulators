@@ -112,6 +112,12 @@ MICRO = [
     ("fstat, 3 threads", ["par", "fstat", "3", "100000"], "ns"),
     ("thread create+join", ["thread", "2000"], "us"),
     ("fork+exit+wait", ["fork", "200"], "us"),
+    # The calls programs at work make most (a database's reads, a
+    # repository's lookups, an allocator's mappings).
+    ("pread 4 KiB", ["file", "pread", "100000"], "ns"),
+    ("stat", ["file", "stat", "100000"], "ns"),
+    ("open+close", ["file", "open", "50000"], "ns"),
+    ("mmap+munmap", ["file", "mmap", "50000"], "ns"),
 ]
 
 
@@ -124,6 +130,10 @@ BUDGETS = {
     "getppid (ns)": 1.5,
     "getppid, 3 threads (ns)": 1.5,
     "fstat, 3 threads (ns)": 1.5,
+    "pread 4 KiB (ns)": 1.5,
+    "stat (ns)": 1.5,
+    "open+close (ns)": 1.5,
+    "mmap+munmap (ns)": 1.5,
     "thread create+join (us)": 3.0,
     "fork+exit+wait (us)": 3.0,
     "fork+exec+wait (us)": 3.0,

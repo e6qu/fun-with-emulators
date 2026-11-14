@@ -12,12 +12,18 @@
  *                        uname, or fstat of its own pipe); nanoseconds per
  *                        call per thread (the same for any T when calls
  *                        run in parallel)
+ *   bench file OP N      N calls of OP on a file of 64 KiB in /tmp: pread
+ *                        (4 KiB at offset 0), stat (of its path), open
+ *                        (open + close), mmap (64 KiB anonymous, mapped and
+ *                        unmapped); nanoseconds per call
  *   bench exit           returns at once (for startup time)
  */
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -133,6 +139,36 @@ int main(int argc, char **argv) {
             pthread_join(t[i], NULL);
         }
         printf("%.1f\n", (now_ns() - start) / par_calls);
+    } else if (strcmp(argv[1], "file") == 0) {
+        const char *op = argv[2];
+        n = argc > 3 ? atol(argv[3]) : 1000;
+        char path[] = "/tmp/fwe-bench-XXXXXX";
+        int fd = mkstemp(path);
+        static char buf[65536];
+        if (fd < 0 || write(fd, buf, sizeof buf) != (long)sizeof buf) {
+            return 1;
+        }
+        struct stat st;
+        volatile long sink = 0;
+        start = now_ns();
+        for (long i = 0; i < n; i++) {
+            if (strcmp(op, "pread") == 0) {
+                sink += pread(fd, buf, 4096, 0);
+            } else if (strcmp(op, "stat") == 0) {
+                sink += stat(path, &st);
+            } else if (strcmp(op, "open") == 0) {
+                int f = open(path, O_RDONLY);
+                sink += close(f);
+            } else if (strcmp(op, "mmap") == 0) {
+                void *m = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                sink += munmap(m, 65536);
+            } else {
+                return 2;
+            }
+        }
+        printf("%.1f\n", (now_ns() - start) / n);
+        close(fd);
+        unlink(path);
     } else {
         fprintf(stderr, "unknown benchmark %s\n", argv[1]);
         return 2;
