@@ -286,10 +286,13 @@ jobs:
       # the workloads' programs (tools/bench/run.py, BREW).
       - run: brew install llvm@22 python@3.14 sqlite git xz
       - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --linux linux.json --out macos.json
-      - uses: actions/upload-artifact@v4
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: bench-results
-          path: macos.json
+          path: |
+            macos.json
+            bench-*.sample
       - if: failure()
         run: |
           mkdir -p crash-reports
