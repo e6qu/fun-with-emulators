@@ -418,8 +418,24 @@ def build(a, fwe, results):
     v = subprocess.run(["vmmap", "-summary", str(proc.pid)], capture_output=True, text=True,
                        errors="replace").stdout
     proc.wait()
-    table = v[v.find("REGION TYPE"):v.find("MALLOC ZONE")]
+    table = v[v.find("REGION TYPE"):v.find("TOTAL, minus")]
     print("clang -c lvm.c under fwe, its memory:\n" + table, file=sys.stderr)
+    # Its system calls, and how much memory it maps and unmaps.
+    trace = os.path.abspath("bench-clang-one.trace")
+    subprocess.run(clang[:i] + ["--strace", f"--strace-file={trace}"] + clang[i:],
+                   capture_output=True)
+    calls = collections.Counter()
+    sizes = collections.Counter()
+    with open(trace, errors="replace") as f:
+        for line in f:
+            m = re.search(r"\] ([a-z_0-9]+)\(([^,)]*)(?:, ([^,)]*))?", line)
+            if m:
+                calls[m.group(1)] += 1
+                if m.group(1) in ("mmap", "munmap") and m.group(3):
+                    sizes[m.group(1)] += int(m.group(3), 16)
+    top = ", ".join(f"{c} {n}" for n, c in calls.most_common(12))
+    mib = {k: v >> 20 for k, v in sizes.items()}
+    print(f"clang -c lvm.c: {sum(calls.values())} system calls: {top}; MiB {mib}", file=sys.stderr)
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
