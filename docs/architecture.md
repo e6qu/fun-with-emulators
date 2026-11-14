@@ -311,10 +311,15 @@ finish itself (see
   stub returns to, an `active` flag and a count of signals recorded for
   it) and a gate stack of 1 MiB, mapped as it first enters guest code
   (`trap::prepare_guest_entry`); a TSD slot points to the block. A forked
-  child keeps its copy. A thread that ends gives its gate stack and signal
-  stack back (`crates/native/src/stacks.rs`), and a thread that starts
-  takes a pair whose thread has gone (its Mach thread port is dead by
-  then) before mapping new ones.
+  child keeps its copy. A thread that ends through the gate leaves its
+  host thread waiting, every host signal blocked, for the next `clone`
+  (`crates/native/src/pool.rs`, up to sixteen waiting): that thread then
+  runs on it, its block, its stacks and every per-thread state of the
+  kernel's and the backend's reset as a new host thread's
+  (`fwe_kernel::thread_reused`). A host thread that ends gives its gate
+  stack and signal stack back (`crates/native/src/stacks.rs`), and a new
+  host thread takes a pair whose thread has gone (its Mach thread port is
+  dead by then) before mapping new ones.
 - **The mask:** guest code runs under the host mask its guest mask calls
   for, and so does the call, as a handler's system call does once it
   unblocks the guest's signals. A call that changes the guest's mask
@@ -364,7 +369,8 @@ records Linux would keep about them:
   write, so a reader that catches a write half done reads again) before
   its next system call that is not a memory call, and before a
   `fork`, so a run of mapping calls publishes once. The file is written
-  with `pwrite` and closed as the process ends, as its thread list's is:
+  with `pwrite` and closed as the process ends, as its thread list's
+  mapping is let go:
   a process that ends holding a file it wrote, or with dirty pages of one
   mapped, makes the next process's first close of a file it wrote wait
   for the write-back (milliseconds on a virtual machine's disk). Another
@@ -492,7 +498,9 @@ scheduling; fwe adds Linux's thread identity and futexes:
   so the host wakes them on time when it is busy, as Linux wakes a
   sleeping task.
 - `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and
-  `CLONE_CHILD_CLEARTID` act as on Linux.
+  `CLONE_CHILD_CLEARTID` act as on Linux. A new thread starts with its
+  creator's thread pointer (without `CLONE_SETTLS`), name, signal mask
+  and floating-point control and status registers.
 - Thread ids: the main thread's is the pid; another's comes from its pid
   namespace, or outside one from a counter every fwe process shares,
   numbered from 100000 (past every macOS pid, so a thread's number never
@@ -562,11 +570,13 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   with the tid and posted to that thread through a table of the threads'
   pending sets the handler reads without a lock.
 - **Threads of another process:** each tid's process is recorded beside
-  the shared tid counter (taken sixteen at a time), and a process that
+  the shared tid counter (taken sixty-four at a time), and a process that
   has had more than its main thread publishes its tids (`threads-<pid>`
-  in fwe's private directory, a count and the tids written at once on a
-  descriptor it keeps, the file kept while the process lives), which
-  `/proc/<pid>/task` lists.
+  in fwe's private directory, kept while the process lives): the process
+  maps the file and writes the list in memory, a sequence number odd
+  while it changes, then the count and the tids; a reader reads the file
+  and reads again if the number was odd or changed meanwhile.
+  `/proc/<pid>/task` lists them.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` takes the place of
   its former parent's while that is pending, and absorbs one after it, as
   Linux sends them.

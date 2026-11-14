@@ -1046,7 +1046,7 @@ and `futex_waitv` run without the kernel lock.
 |---|---|---|
 | `clone`, `clone3` (and so `fork`, `vfork`, `pthread_create`, `posix_spawn`) | A thread is a new host thread; a process is a host `fork` natively, a new fwe process in the VM. `clone3`'s structure is read into the same arguments; `set_tid` fails with `ENOSYS`. | native: `pthread_create`, `fork`; VM: `pthread_create`, `posix_spawn` |
 | `execve`, `execveat` | Natively in place when it can; otherwise fwe re-executes itself on the new program. | `execve` of fwe |
-| `exit` | Robust list released, `clear_child_tid` cleared and woken, the host thread ended; the last thread ends the process. | `pthread_exit` / `_exit` |
+| `exit` | Robust list released, `clear_child_tid` cleared and woken, the host thread ended or (natively) kept for the next thread; the last thread ends the process. | `pthread_exit` / `_exit` |
 | `exit_group` | A traced process's exit stop, then the process ends (in the VM after every vCPU and the VM are destroyed). | `_exit` |
 | `wait4`, `waitid` | Run without the lock; pids, options and status translated; a tracer sees its tracees' stops first. | `wait4`, `waitid` |
 | `getpid`, `gettid` | The process's and thread's ids as fwe numbers them (pid namespace; thread ids from a shared counter). | none |
@@ -1931,7 +1931,7 @@ macOS counterpart:
 
 | | Linux | macOS | fwe |
 |---|---|---|---|
-| Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native) or a host thread with its own vCPU (VM) |
+| Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native; one an ended thread left runs the next) or a host thread with its own vCPU (VM) |
 | `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either in the VM; natively `EINVAL` without a stack, `ENOSYS` without `CLONE_VM`); natively `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID` and `DETACHED` are accepted and others fail with `ENOSYS` |
 | `clone3` | `struct clone_args` | — | treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers, `CLONE_PIDFD` returns a process descriptor; `set_tid` fails with `ENOSYS` |
 | Per-thread state | in the task | — | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
