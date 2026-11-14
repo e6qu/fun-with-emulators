@@ -128,8 +128,7 @@ fn caught(sig: libc::c_int) -> bool {
 /// other threads are woken to take it. A signal with the default action
 /// or ignored stays where it is: unblocking it would apply that action to
 /// a signal Linux keeps pending.
-fn reroute_parked() {
-    let blocked = thread::mask();
+fn reroute_parked(blocked: u64) {
     if blocked == 0 {
         return;
     }
@@ -310,8 +309,12 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     use std::sync::atomic::Ordering::SeqCst;
     // SAFETY: the gate passes this thread's block, which only it uses now.
     let b = unsafe { &mut *b };
-    IN_GUEST.with(|g| g.set(false));
-    crate::quiesce::leave();
+    // `IN_GUEST` stays as it is: while the block is active, a signal's
+    // handler takes the thread for out of guest code ([`guest_interrupted`]).
+    if b.slot == 0 {
+        b.slot = crate::quiesce::mine_addr();
+    }
+    crate::quiesce::leave_at(b.slot);
     let site = crate::gate::site_of(b.ret);
     b.regs.pc = site;
     b.regs.x[18] = guest_x18();
@@ -349,11 +352,10 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         crate::exit_current_thread(b.regs.x[0] as i32);
     }
     if !plain {
-        IN_GUEST.with(|g| g.set(true));
         return 1;
     }
-    reroute_parked();
     let mask = thread::mask();
+    reroute_parked(mask);
     // What a plain return keeps: the general registers but `x0`, `sp` and
     // the flags (the vector registers change only with the pc, as a
     // signal's delivery or return changes them).
@@ -393,9 +395,8 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
             pending & !mask == 0
         };
     if plain_return {
-        crate::quiesce::enter();
+        crate::quiesce::enter_at(b.slot);
     }
-    IN_GUEST.with(|g| g.set(true));
     u64::from(!plain_return)
 }
 
@@ -544,7 +545,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // SAFETY: terminating the process.
         unsafe { libc::_exit(127) }
     }
-    reroute_parked();
+    reroute_parked(thread::mask());
     // A traced process stopping at system calls: the entry's stop, where
     // the tracer may change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();

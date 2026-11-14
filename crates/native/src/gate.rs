@@ -52,6 +52,9 @@ pub struct Block {
     pub stack: u64,
     /// The call has run (the trap only delivers what is pending).
     pub ran: u64,
+    /// This thread's slot in [`crate::quiesce`], once looked up: the gate
+    /// marks itself in and out of guest code there without a thread-local.
+    pub slot: u64,
 }
 
 const _: () = assert!(std::mem::size_of::<Regs>() == 800);
