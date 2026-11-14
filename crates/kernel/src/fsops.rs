@@ -1374,6 +1374,21 @@ impl<P: Platform> Kernel<P> {
         follow: bool,
         depth: u32,
     ) -> Result<(Stat, u64), i32> {
+        // In one host call where it finds what the walk would: on a way
+        // with no mount but the root's, none of fwe's own files, and no
+        // link.
+        #[cfg(target_os = "macos")]
+        if let Some(d) = self.fs().direct(path) {
+            match stat_at_with(d.dir, &d.name, crate::fs::AT_SYMLINK_NOFOLLOW_ANY) {
+                Ok(s) if !(follow && s.st_mode & libc::S_IFMT == libc::S_IFLNK) => {
+                    return Ok(stat_result(d.dir, &d.name, &s, d.fstype, d.mount_id));
+                }
+                // A missing name on a way with no link, as the walk finds.
+                Err(e @ (errno::ENOENT | errno::ENOTDIR)) => return Err(e),
+                // A link: followed by the walk.
+                _ => {}
+            }
+        }
         use crate::procfs::Entry;
         use fwe_abi::stat as st;
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
@@ -1407,19 +1422,6 @@ impl<P: Platform> Kernel<P> {
                 Entry::Missing => return Err(errno::ENOENT),
             };
             return Ok((self.proc_owned(dirfd, path, st), 0));
-        }
-        // In one host call where it finds what the walk would.
-        #[cfg(target_os = "macos")]
-        if let Some(d) = self.fs().direct(path) {
-            match stat_at_with(d.dir, &d.name, crate::fs::AT_SYMLINK_NOFOLLOW_ANY) {
-                Ok(s) if !(follow && s.st_mode & libc::S_IFMT == libc::S_IFLNK) => {
-                    return Ok(stat_result(d.dir, &d.name, &s, d.fstype, d.mount_id));
-                }
-                // A missing name on a way with no link, as the walk finds.
-                Err(e @ (errno::ENOENT | errno::ENOTDIR)) => return Err(e),
-                // A link: followed by the walk.
-                _ => {}
-            }
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
         let name = r.name_c()?;

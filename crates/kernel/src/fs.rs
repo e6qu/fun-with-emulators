@@ -67,6 +67,20 @@ fn dup_cloexec(fd: i32) -> Result<OwnedFd, i32> {
 }
 
 /// Split a path into components, dropping empty ones and ".".
+/// The links at the top of macOS's sealed system volume, each to the
+/// directory of its name in `/private`.
+const SEALED_LINKS: [&[u8]; 3] = [b"tmp", b"var", b"etc"];
+
+/// On the host's own root, absolute `path` with a link of [`SEALED_LINKS`]
+/// followed, if it goes through one (a name follows it): the same way,
+/// without the link to read.
+fn through_sealed_link(path: &[u8]) -> Option<Vec<u8>> {
+    let rest = path.strip_prefix(b"/")?;
+    let rest = &rest[rest.iter().position(|&b| b != b'/')?..];
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    SEALED_LINKS.contains(&&rest[..slash]).then(|| [b"/private/".as_slice(), rest].concat())
+}
+
 fn components(path: &[u8]) -> Vec<Vec<u8>> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty() && c != b".").map(<[u8]>::to_vec).collect()
 }
@@ -1410,9 +1424,10 @@ impl Fs {
         if path.first() != Some(&b'/') || path.last() == Some(&b'/') {
             return None;
         }
-        let names = components(path);
-        let first = names.first()?;
-        if first == b"dev" || names.iter().any(|c| c == b"..") {
+        let mut names = path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".");
+        let first = names.next()?;
+        let more = names.clone().next().is_some();
+        if first == b"dev" || names.clone().any(|c| c == b"..") || first == b".." {
             return None;
         }
         let v = self.view();
@@ -1428,16 +1443,30 @@ impl Fs {
         if !rest.is_empty() || !components(&m.root).is_empty() || !rootfs {
             return None;
         }
-        let top = mounts::join(v.proc_root, first);
-        if table.mounts.iter().any(|o| o.id != m.id && mounts::under(&o.point, &top).is_some()) {
+        // No mount under the way's top directory but the root.
+        let clear = |top: &[u8]| {
+            let top = mounts::join(v.proc_root, top);
+            !table.mounts.iter().any(|o| o.id != m.id && mounts::under(&o.point, &top).is_some())
+        };
+        if !clear(first) {
             return None;
         }
-        Some(Direct {
-            dir: v.root,
-            name: cstr(&names.join(&b'/')).ok()?,
-            mount_id: m.id,
-            fstype: m.fstype,
-        })
+        let mut name = Vec::with_capacity(path.len() + 9);
+        // On the host's own root, the links of its sealed system volume
+        // into `/private`, which never change, followed here: the host
+        // follows no link in the call.
+        if self.root_is_host() && more && SEALED_LINKS.contains(&first) {
+            if !clear(b"private") {
+                return None;
+            }
+            name.extend_from_slice(b"private/");
+        }
+        name.extend_from_slice(first);
+        for c in names {
+            name.push(b'/');
+            name.extend_from_slice(c);
+        }
+        Some(Direct { dir: v.root, name: cstr(&name).ok()?, mount_id: m.id, fstype: m.fstype })
     }
 
     /// Whether the guest's root is the host's own (no root filesystem).
@@ -2041,6 +2070,8 @@ fn access_checked(v: &View) -> bool {
 /// [`Fs::resolve`], also done for the socket calls that run without the
 /// kernel lock ([`resolve_host`]).
 fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
+    let sealed = (v.root_host == b"/").then(|| through_sealed_link(path)).flatten();
+    let path = sealed.as_deref().unwrap_or(path);
     let table = v.ns.table();
     let absolute = if path.first() == Some(&b'/') {
         Some(normalize(b"/", path))
@@ -3546,6 +3577,16 @@ mod tests {
         // SAFETY: removing the file made above.
         unsafe { libc::unlinkat(f.dir.as_raw_fd(), c"f".as_ptr(), 0) };
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sealed_links_are_followed_where_a_name_follows() {
+        assert_eq!(through_sealed_link(b"/tmp/x").as_deref(), Some(&b"/private/tmp/x"[..]));
+        assert_eq!(through_sealed_link(b"//etc/").as_deref(), Some(&b"/private/etc/"[..]));
+        assert_eq!(through_sealed_link(b"/var/a/b").as_deref(), Some(&b"/private/var/a/b"[..]));
+        assert_eq!(through_sealed_link(b"/tmp"), None);
+        assert_eq!(through_sealed_link(b"/tmpx/y"), None);
+        assert_eq!(through_sealed_link(b"tmp/x"), None);
     }
 
     #[test]

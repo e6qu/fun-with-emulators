@@ -1881,10 +1881,8 @@ place.
 
 macOS's `fork` copies memory while the parent's other threads keep
 running, gives the child none of the parent's kqueues, and does not
-restore a signal mask from a handler frame the child did not take. It
-also costs tens of microseconds more in a process with macOS's nano
-allocator, so fwe runs with it off (`MallocNanoZone=0`, a variable the
-guest does not see). A VM cannot be forked at all.
+restore a signal mask from a handler frame the child did not take. A VM
+cannot be forked at all.
 
 **Native backend** (`crates/native/src/process.rs`, `quiesce.rs`): fwe
 holds every lock a child could need and pauses the parent's other threads

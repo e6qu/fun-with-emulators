@@ -421,12 +421,7 @@ keeps:
   `SIGSEGV`, `SIGBUS` and `SIGSYS` is held across the host `fork`; one of
   those sent to the child before it is set up (it may not know its own
   pid yet, and it forgets its parent's pending signals as it starts) is
-  kept and posted once it is (`trap::post_early`). fwe runs with macOS's
-  nano allocator off (`MallocNanoZone=0`, which macOS reads as a process
-  starts: the fwe a user starts runs itself again with it, every fwe
-  that fwe starts has it, and the guest's environment is without it): a
-  host `fork` of a process that has it costs tens of microseconds more,
-  in the call and in the child.
+  kept and posted once it is (`trap::post_early`).
 - **VM fork state** (`Kernel::save_for_fork`, `crates/kernel/src/snapshot.rs`):
   signal dispositions, the forking thread's mask and alternate stack, the
   break, filesystem view, credentials, descriptor limits, every descriptor
@@ -696,9 +691,14 @@ the guest's reach, and translates what comes back.
   `openat` (`O_NOFOLLOW_ANY`, opened to search, not to read), and a
   `stat` of an absolute path under no mount but the root's in one
   `fstatat` from the root (`AT_SYMLINK_NOFOLLOW_ANY`). The host refuses
-  either where a link is on the way, and fwe then walks name by name. An
-  `openat` resolves its path once: the look for a FIFO to wait for,
-  without the kernel lock, hands its resolution to the open.
+  either where a link is on the way, and fwe then walks name by name.
+  With no root filesystem, the links at the top of macOS's sealed system
+  volume (`/tmp`, `/var` and `/etc`, into `/private`), which never
+  change, are followed by fwe without reading them. That `stat` comes
+  before the look for fwe's own files, which it never reaches (it takes
+  no way through a mount or a link). An `openat` resolves its path once:
+  the look for a FIFO to wait for, without the kernel lock, hands its
+  resolution to the open.
 - Every open file remembers the mount it came through
   (`crates/kernel/src/fdmarks.rs`), followed through `dup`, `close`,
   `fork` and `execve` and dropped once the descriptor names another file:
