@@ -204,12 +204,16 @@ natively wherever fwe can make them fit the Mac.
 - [ ] **Wine natively:** Windows' ARM64 code keeps the thread's TEB in
   `x18`, which macOS clears, so code Wine maps executable is prepared as
   a program's own is, with its `x18` uses rewritten; its images' 4 KiB
-  sections are mapped as above. Wine then runs without `fwe --vm`.
+  sections are mapped as above. Wine then runs without `fwe --vm`, and the
+  benchmarks run it at work: Windows programs built for ARM64 (a script
+  interpreter, a database, compression) under Alpine's Wine on fwe,
+  against the same sources built natively for macOS on the same runner,
+  their output compared, within 1.5×.
 
 **Done when:** the budgets hold in CI; static Go programs, Debian's
 low-linked toolchain, programs GCC links non-PIE or static, and Wine's
-test program run natively, in CI; and what still needs the VM is listed
-with the reason.
+test program run natively, in CI; Wine's benchmarks hold their budget;
+and what still needs the VM is listed with the reason.
 
 ### M7 — Graphical programs and sandboxes
 
