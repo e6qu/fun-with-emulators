@@ -510,12 +510,14 @@ stub:  stp   x30, x0, [sp, #-32]!  ; below the guest's sp
 
 The gate saves the guest's registers in a per-thread block, switches to a
 stack of fwe's, and runs the call with the number from `x8` and arguments
-from `x0`–`x5`. A call that changes nothing but `x0`, with no signal to
-deliver, returns straight back: no exception, no host signal, no change
-of the host's signal mask. Every other outcome (a call that changes the
-pc, `sp` or the signal mask, a signal to deliver, a traced or filtered
-call, `clone`, `execve`, the waits fwe runs outside its lock) takes a
-trap from the gate (`brk #0x4c5a`): fwe's `SIGTRAP` handler (`on_sigtrap`,
+from `x0`–`x5`. A call that changes nothing but `x0` and the signal
+mask, with no signal to deliver, returns straight back: no exception, no
+host signal (a changed mask is set on the host thread with
+`pthread_sigmask`). A new thread is made, and a thread that is not the
+last ends, from the gate too. Every other outcome (a call that changes
+the pc or `sp`, a signal to deliver, a traced or filtered call, a new
+process, `execve`, the waits fwe runs outside its lock) takes a trap from
+the gate (`brk #0x4c5a`): fwe's `SIGTRAP` handler (`on_sigtrap`,
 `crates/native/src/trap.rs`) takes the guest's state from the block and
 installs whatever the call left.
 
@@ -858,7 +860,8 @@ mechanisms. A call not listed here is not dispatched and fails with
 #### File calls
 
 fwe resolves every guest path itself and hands the host one component to
-open from a directory it holds ([Files and descriptors](#files-and-descriptors));
+open from a directory it holds, or a run of components the host must
+follow no link in ([Files and descriptors](#files-and-descriptors));
 the descriptor the host returns is the guest's, so I/O goes to the host on
 it directly. fwe steps in for descriptors it stands in for (`/proc` and
 `/sys` files, loop devices, eventfd and the like), for metadata the host
@@ -1043,11 +1046,11 @@ and `futex_waitv` run without the kernel lock.
 |---|---|---|
 | `clone`, `clone3` (and so `fork`, `vfork`, `pthread_create`, `posix_spawn`) | A thread is a new host thread; a process is a host `fork` natively, a new fwe process in the VM. `clone3`'s structure is read into the same arguments; `set_tid` fails with `ENOSYS`. | native: `pthread_create`, `fork`; VM: `pthread_create`, `posix_spawn` |
 | `execve`, `execveat` | Natively in place when it can; otherwise fwe re-executes itself on the new program. | `execve` of fwe |
-| `exit` | Robust list released, `clear_child_tid` cleared and woken, the host thread ended; the last thread ends the process. | `pthread_exit` / `_exit` |
+| `exit` | Robust list released, `clear_child_tid` cleared and woken, the host thread ended or (natively) kept for the next thread; the last thread ends the process. | `pthread_exit` / `_exit` |
 | `exit_group` | A traced process's exit stop, then the process ends (in the VM after every vCPU and the VM are destroyed). | `_exit` |
 | `wait4`, `waitid` | Run without the lock; pids, options and status translated; a tracer sees its tracees' stops first. | `wait4`, `waitid` |
 | `getpid`, `gettid` | The process's and thread's ids as fwe numbers them (pid namespace; thread ids from a shared counter). | none |
-| `getppid` | The parent, or the reaper that adopted the process; 0 for one outside the pid namespace. | `getppid` |
+| `getppid` | The parent, or the reaper that adopted the process; 0 for one outside the pid namespace. A process that asks often has a thread of fwe's watch the parent's end (`kqueue`, as for the parent-death signal) and the answer kept while the parent lives. | `getppid`, then `kqueue` |
 | `getpgid`, `getsid`, `setpgid`, `setsid` | The host's, ids mapped through the pid namespace; `setpgid` of a child that has exec'd fails with `EACCES` first, as on Linux. | `getpgid`, `getsid`, `setpgid`, `setsid` |
 | `set_tid_address`, `set_robust_list`, `get_robust_list` | Kept per thread; another process's robust list is read from the record its threads publish, for a caller that may trace it. | none |
 | `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`; other operations (PI, `WAKE_OP`) fail with `ENOSYS`. | `__ulock_wait2`/`__ulock_wake` for shared futexes |
@@ -1928,12 +1931,12 @@ macOS counterpart:
 
 | | Linux | macOS | fwe |
 |---|---|---|---|
-| Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native) or a host thread with its own vCPU (VM) |
+| Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native; one an ended thread left runs the next) or a host thread with its own vCPU (VM) |
 | `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either in the VM; natively `EINVAL` without a stack, `ENOSYS` without `CLONE_VM`); natively `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID` and `DETACHED` are accepted and others fail with `ENOSYS` |
 | `clone3` | `struct clone_args` | — | treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers, `CLONE_PIDFD` returns a process descriptor; `set_tid` fails with `ENOSYS` |
 | Per-thread state | in the task | — | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
 | Robust futex list | walked as a thread ends: words it owns marked `FUTEX_OWNER_DIED`, a waiter woken | — | the same, as a thread ends and for every thread as the process ends or calls `execve`; not for a native process ended by `SIGKILL`, nor one ended by a signal from outside fwe |
-| `get_robust_list` of another thread | the target's head, to a caller that may trace it | — | the process's other threads' heads from its registry, another process's from a shared record each thread writes |
+| `get_robust_list` of another thread | the target's head, to a caller that may trace it | — | the process's other threads' heads from its registry, another process's from its entry of them in the process records' memory, which the process writes |
 | futex, private | a wait queue per address | `__ulock_wait`/`__ulock_wake` (private) | per-process wait queues, outside the kernel lock |
 | futex, shared | keyed by the page's backing object | `__ulock_wait2` with `UL_COMPARE_AND_WAIT_SHARED` | a slot table every fwe process maps, keyed as Linux keys a shared futex (Mach memory object + offset); each waiter sleeps on its slot's word, so a wake knows whom it woke |
 
@@ -2097,7 +2100,7 @@ to the host.
 |---|---|---|
 | a process's root (`chroot`) and mount table | one host filesystem | guest paths resolved component by component (`crates/kernel/src/fs.rs`): symlinks followed by fwe, mounts entered, `..` clamped at the process's root, as `openat2(RESOLVE_IN_ROOT)` would; the final host `openat` has `O_NOFOLLOW` added |
 | `open` flags | other values | translated (`host::open_flags_to_host`) |
-| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range at the top, out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
+| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 16384 at most), out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
 | `struct stat`, `statx` | different layout | translated |
 | `statfs` | different layout, APFS | translated; type ext4, sizes and counts the host's |
 | `getdents64` | `getdirentries` | built from it |
@@ -2628,7 +2631,7 @@ the host:
 | `SIGINFO` from anywhere else (`kill -INFO`) | no note came with it, so it is no relay: dropped | nothing |
 | a child killed by a host signal with no Linux number | `host::signal_to_linux` gives `SIGABRT` | a child killed by `SIGABRT` |
 | Linux's `SIGSTKFLT`, `SIGPWR` and real-time signals | never from the host; recorded within the process, or queued in another fwe process's mailbox and that process woken with `SIGEMT` | delivered with fwe's own `siginfo` |
-| a guest killed by one of those (default action) | no host signal to die of: leaves its Linux status beside its record, then exits with 128 + the signal | an fwe parent sees it killed by that signal; a host shell sees 128 + the signal |
+| a guest killed by one of those (default action) | no host signal to die of: leaves its Linux status in its record's entry, then exits with 128 + the signal | an fwe parent sees it killed by that signal; a host shell sees 128 + the signal |
 
 #### Where each signal comes from
 
@@ -2786,10 +2789,10 @@ sequenceDiagram
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
 | a child exited with code *n* | status word kept | `n << 8` |
-| a child killed by a host signal | the Linux status the child left beside its record (`procreg::ending`), with the core bit if fwe wrote a core; else the signal mapped (`host::signal_to_linux`) | Linux's signal number, `0x80` if a core was dumped |
+| a child killed by a host signal | the Linux status the child left in its record's entry (`procreg::ending`), with the core bit if fwe wrote a core; else the signal mapped (`host::signal_to_linux`) | Linux's signal number, `0x80` if a core was dumped |
 | a child stopped | the stop signal mapped | `sig << 8 \| 0x7f` |
 | a child continued | — | `0xffff` |
-| a guest child ended by a Linux-only signal | it exited with 128 + the signal, leaving its Linux status beside its record | killed by that signal |
+| a guest child ended by a Linux-only signal | it exited with 128 + the signal, leaving its Linux status in its record's entry | killed by that signal |
 | `SIGCHLD` `siginfo`: `CLD_KILLED`/`CLD_DUMPED`/`CLD_STOPPED` | `si_status` mapped to Linux's signal | Linux's signal number |
 | `SIGCHLD` `siginfo`: `CLD_CONTINUED` | `si_status` is what stopped it on macOS; set to what continued it | `SIGCONT`, as Linux reports |
 | `rusage` from `wait4` | `ru_maxrss` from bytes to KiB | Linux's `rusage` |

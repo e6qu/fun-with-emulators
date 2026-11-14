@@ -1561,6 +1561,12 @@ pub mod store {
         static OWN: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
     }
 
+    /// This host thread starts another guest thread
+    /// ([`crate::thread_reused`]).
+    pub(crate) fn thread_reused() {
+        OWN.with(|o| o.borrow_mut().take());
+    }
+
     /// The tables of the mount namespaces other than the one being changed
     /// (none outside a change): read, never locked, so a change reads them
     /// with its own namespace locked and no other.

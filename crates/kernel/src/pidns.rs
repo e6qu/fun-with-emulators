@@ -309,8 +309,7 @@ pub fn init_gone(dirs: &[Vec<u8>], host: i32) {
 /// This process is ending: if it is its pid namespace's init, the
 /// namespace ends with it.
 pub fn exiting() {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if let Some(ns) = current().first()
         && ns.get().number_of(me) == Some(1)
     {
@@ -362,8 +361,7 @@ pub fn guest_ret(r: i64) -> i64 {
 /// what the namespace's record holds for this host process.
 pub fn adopt(ns: &crate::ns::Namespaces, known: i32) -> i32 {
     set_current(chain_from(ns.pid.clone()));
-    // SAFETY: getpid cannot fail.
-    let host = unsafe { libc::getpid() };
+    let host = crate::host::pid();
     if known > 0 {
         // Its number stands for it from now on, not only once the parent
         // gets to it.

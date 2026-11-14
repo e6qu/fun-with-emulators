@@ -134,8 +134,7 @@ fn ticks_since_boot(started: f64) -> u64 {
 fn threads_state(pid: i32) -> u8 {
     /// `PROC_PIDLISTTHREADS`: the process's thread handles.
     const PROC_PIDLISTTHREADS: i32 = 6;
-    // SAFETY: getpid cannot fail.
-    if pid == unsafe { libc::getpid() } {
+    if pid == crate::host::pid() {
         return match crate::thread::host_state(crate::thread::tgid()) {
             Some((_, _, true)) | None => b'R',
             Some((_, _, false)) => b'S',
@@ -740,8 +739,7 @@ fn peer_offset() -> Option<usize> {
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) } != 0 {
             return None;
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let found = (|| {
             let a = socket_info(me, sv[0])?;
             let other = socket_id(me, sv[1])?;

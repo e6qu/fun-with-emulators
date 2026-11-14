@@ -348,12 +348,7 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
         b"cgroup.procs" => {
             for word in text.split_whitespace() {
                 let pid: i32 = word.parse().map_err(|_| errno::EINVAL)?;
-                let host = if pid == 0 {
-                    // SAFETY: getpid cannot fail.
-                    unsafe { libc::getpid() }
-                } else {
-                    crate::pidns::host_arg(pid)?
-                };
+                let host = if pid == 0 { crate::host::pid() } else { crate::pidns::host_arg(pid)? };
                 may_join(cg)?;
                 procreg::set_cgroup(host, cg)?;
             }

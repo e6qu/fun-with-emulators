@@ -90,8 +90,7 @@ impl<P: Platform> Kernel<P> {
         else {
             return err(errno::ESRCH);
         };
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if host != me && !self.may_trace(host) {
             return err(errno::EPERM);
         }
@@ -178,8 +177,7 @@ pub fn remote(host: i32, addr: u64, data: &mut [u8], write: bool) -> Result<usiz
 fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -> Result<i64, i32> {
     use crate::signote::{MEM_HEADER, MEM_RETRY};
     let reply = crate::signote::fd_reply_socket().ok_or(errno::EMFILE)?;
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let path = crate::signote::mem_request_path(me, reply.token).ok_or(errno::ENOMEM)?;
     let p = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path);
     // The ranges, cut to the data that moves.

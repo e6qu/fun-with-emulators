@@ -77,7 +77,11 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // A script runs its interpreter.
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
-    let file = fs.read(&path).map_err(err)?;
+    let (file, file_id) = match k.take_exec_file(&path) {
+        Some(file) => file,
+        None => fs.read_identified(&path).map_err(err)?,
+    };
+    fwe_kernel::timing::mark("exec: read");
     let vm = crate::needs_vm(&file);
     // A program only the VM can run, where there is none: the exec fails
     // while the caller is intact (podman's pause process then waits in a
@@ -93,6 +97,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
     // The old image is untouched on failure, so the guest can handle it.
+    fwe_kernel::timing::mark("exec: checked for re-exec");
     crate::check_image(&file, fs).map_err(err)?;
     // A program with no path (a memfd) is held, for `/proc/self/exe`: the
     // descriptor it was run through may close on exec.
@@ -110,13 +115,23 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // parent may resume. The robust futexes its threads hold are released
     // first.
     fwe_kernel::release_robust_lists();
+    fwe_kernel::timing::mark("exec: checked");
     fwe_kernel::mm::release_guest_memory();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
         // SAFETY: closing the pipe end this child holds for its parent.
         unsafe { libc::close(done) };
     }
-    let out = match load_image(&file, &path, &arg_refs, &env_refs, fs, &platform, page, strace) {
+    let out = match load_image(
+        (&file, file_id),
+        &path,
+        &arg_refs,
+        &env_refs,
+        fs,
+        &platform,
+        page,
+        strace,
+    ) {
         Ok(out) => out,
         Err(e) => {
             let msg = format!("fwe: execve {}: {e}\n", String::from_utf8_lossy(&path));
@@ -126,6 +141,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         }
     };
 
+    fwe_kernel::timing::mark("exec: loaded");
     k.close_on_exec();
     k.exec_reset();
     k.brk = out.brk;
@@ -139,6 +155,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
             fs.publish();
         });
     }
+    fwe_kernel::timing::mark("exec: published");
     // The new program starts with every register zero, as Linux leaves it;
     // the trap handler returns into it.
     Ok(Regs { sp: out.sp, pc: out.entry, ..Regs::default() })
@@ -208,7 +225,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
-        let token = match k.fork_begin(&a) {
+        let mut token = match k.fork_begin(&a) {
             Ok(t) => t,
             Err(e) => {
                 for fd in done.into_iter().filter(|&fd| fd >= 0) {
@@ -218,6 +235,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 return fwe_abi::err(e);
             }
         };
+        // The child writes its whole record as it starts.
+        fwe_kernel::Kernel::<NativePlatform>::fork_child_writes(&mut token);
         let kqueues = fwe_kernel::kqueue_state();
         // A child of CLONE_VM shares the guest's memory: its private parts
         // are shared for the fork, then copied again by any later one (in
@@ -230,6 +249,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 region::set_shared_on_fork(start, len, on);
             }
         };
+        fwe_kernel::timing::mark("fork: prepared");
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
@@ -251,6 +271,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             set_shared(false);
             pid
         });
+        fwe_kernel::timing::mark(if pid == 0 { "fork: child" } else { "fork: parent" });
         let e = fwe_kernel::host::last_error();
         // The child's pid: in the child, its own namespace's; in the
         // parent, as the parent sees it.
@@ -259,6 +280,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
             thread::forked();
+            // The parent's threads' stacks are none of the child's to reuse.
+            crate::stacks::forked();
+            // Nor are its waiting threads.
+            crate::pool::forked();
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);

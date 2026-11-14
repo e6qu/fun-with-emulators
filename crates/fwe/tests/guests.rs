@@ -228,6 +228,15 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
         while !reader.is_finished() {
             if start.elapsed() > Duration::from_secs(10) {
                 eprintln!("--- a process outlived the guest holding its {which}");
+                // Which: every fwe process still running, with its group.
+                if let Ok(ps) = Command::new("ps")
+                    .args(["-A", "-o", "pid,ppid,pgid,stat,etime,command"])
+                    .output()
+                {
+                    let all = String::from_utf8_lossy(&ps.stdout);
+                    let fwe: Vec<&str> = all.lines().filter(|l| l.contains("fwe")).collect();
+                    eprintln!("--- fwe processes now:\n{}", fwe.join("\n"));
+                }
                 return Vec::new();
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -925,6 +934,58 @@ fn a_library_longer_than_a_branch_gets_its_stubs() {
         let _ = std::fs::remove_dir_all(&root);
     }
     assert_eq!(run.status.code(), Some(0));
+}
+
+/// Threads that first run the same pages of the shared libc at once, with
+/// the libc's preparation kept from the run before: each page's code is
+/// written as it first runs, and a thread that runs it meanwhile runs on.
+#[test]
+fn threads_first_run_shared_code_together() {
+    let prog = build_c_dynamic("lazyrace", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "lazyrace");
+    // The first run keeps the libc's preparation; the next ones use it.
+    for run in 0..3 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        assert_eq!(stdout(&out), "ok\n", "run {run}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "run {run}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A child that asks for its parent often (fwe keeps the answer while the
+/// parent lives) sees it change once the parent ends.
+#[test]
+fn getppid_follows_the_parents_end() {
+    let prog = build_c_dynamic("ppidwatch", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "ppidwatch");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "same while it lived: 1, changed once it ended: 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A thread made after another ended starts as a new one, whatever host
+/// thread runs it: no signal stack, and its creator's name, signal mask
+/// and floating-point rounding mode, round after round.
+#[test]
+fn a_thread_after_another_ended_starts_afresh() {
+    let prog = build_c_dynamic("threadreuse", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "threadreuse");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    let line = "signal stack disabled: 1, name: maker, SIGUSR1 blocked: 0, rounding: 3\n";
+    assert_eq!(stdout(&out), line.repeat(4), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
@@ -2724,7 +2785,7 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         .stdin(Stdio::null());
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
-    eprintln!("--- node stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     // The digests are the host's (`shasum`, `md5`, Python's hashlib).
     assert_eq!(
         stdout(&out),

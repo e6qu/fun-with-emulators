@@ -298,8 +298,7 @@ fn post_own(sig: u64) -> i64 {
 }
 
 fn me_host() -> i64 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() as i64 }
+    crate::host::pid() as i64
 }
 
 fn owned(sig: u64) -> bool {
@@ -397,7 +396,7 @@ pub(crate) fn raise_self(sig: u64) {
 
 fn own_info(code: i32) -> SigInfo {
     // SAFETY: plain host calls.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     SigInfo { code, pid, ..SigInfo::default() }
 }
 
@@ -1247,6 +1246,7 @@ mod tests {
             _a: u64,
             _l: u64,
             _k: Option<&[(u64, u64)]>,
+            _c: Option<&[u8]>,
         ) -> Result<(), crate::PrepareFailed> {
             Ok(())
         }

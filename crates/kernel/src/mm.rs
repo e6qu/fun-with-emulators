@@ -158,7 +158,6 @@ pub fn forked_child() {
     }
 }
 
-/// The host protection of the memory at host address `addr`.
 /// The host's page size.
 pub fn host_page_size() -> u64 {
     // SAFETY: sysconf only reads a system value.
@@ -202,6 +201,10 @@ fn write_exec() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
 /// page becomes a copy of itself when first written: by the guest
 /// ([`Kernel::view_fault`]) or by fwe for it ([`views_written`]).
 static FILE_VIEWS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Whether a file view was ever made: until one is, a write for the guest
+/// takes no lock to look for one.
+static ANY_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn file_views() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     FILE_VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -382,8 +385,7 @@ pub(crate) struct MapsView {
 
 impl MapsView {
     pub(crate) fn of(pid: i32) -> Option<MapsView> {
-        // SAFETY: getpid cannot fail.
-        if pid == unsafe { libc::getpid() } {
+        if pid == crate::host::pid() {
             // The host's view first: its lock comes before the record's.
             let extra = host_guest_memory();
             let record = crate::maps::record().clone();
@@ -967,10 +969,23 @@ const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
 /// mapped region instead), with the file-offset ranges its unwind table says
 /// are code, if it has a usable one. Maps the file to read it, so the guest's file position is untouched.
 type ExecFile = (Vec<(u64, u64)>, Option<Vec<(u64, u64)>>);
-fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
+fn exec_file_ranges(fd: i32, file: Option<crate::prepcache::FileId>) -> Option<ExecFile> {
     if fd < 0 {
         return None;
     }
+    // Parsed once per file ([`crate::prepcache`]).
+    if let Some(kept) = file.and_then(crate::prepcache::exec_ranges) {
+        return kept;
+    }
+    let ranges = parse_exec_ranges(fd);
+    if let Some(id) = file {
+        crate::prepcache::keep_exec_ranges(id, ranges.as_ref());
+    }
+    ranges
+}
+
+/// [`exec_file_ranges`], read from the file.
+fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
     // SAFETY: zeroing a stat value, which is plain data.
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     // SAFETY: fstat on a borrowed fd, writing into the stat just created.
@@ -1007,7 +1022,7 @@ fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
 /// Whether any page of a private file view waits to be written (see
 /// [`FILE_VIEWS`]).
 pub fn any_views() -> bool {
-    !file_views().is_empty()
+    ANY_VIEWS.load(std::sync::atomic::Ordering::SeqCst) && !file_views().is_empty()
 }
 
 /// fwe is about to write guest range `[addr, addr + len)` for the guest:
@@ -1777,8 +1792,11 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EEXIST);
             }
             let guest = if p == haddr && fixed { addr } else { p };
+            // What was owed to the pages replaced goes with them.
+            crate::lazycode::unmapped(p, self.page_up(len));
             track(p, self.page_up(len));
             if view {
+                ANY_VIEWS.store(true, std::sync::atomic::Ordering::SeqCst);
                 add_range(&mut file_views(), p, self.page_up(len));
             } else {
                 remove_range(&mut file_views(), p, self.page_up(len));
@@ -1807,12 +1825,30 @@ impl<P: Platform> Kernel<P> {
                         })
                         .collect()
                 };
-                let (prep, known) = match if anonymous { None } else { exec_file_ranges(host_fd) } {
-                    Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
-                    None => (vec![(p, self.page_up(len))], None),
-                };
+                let file = if anonymous { None } else { crate::prepcache::FileId::of_fd(host_fd) };
+                let (prep, known) =
+                    match if anonymous { None } else { exec_file_ranges(host_fd, file) } {
+                        Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
+                        None => (vec![(p, self.page_up(len))], None),
+                    };
                 for (a, l) in prep {
-                    if let Err(e) = self.platform.prepare_exec(a, l, known.as_deref()) {
+                    // Kept by the file's identity and where the code is in
+                    // it, with the known code as offsets from there.
+                    let cache = file.map(|id| {
+                        let k = known.as_ref().map(|k| {
+                            k.iter()
+                                .filter_map(|&(ka, kl)| {
+                                    let lo = ka.max(a);
+                                    let hi = (ka + kl).min(a + l);
+                                    (lo < hi).then(|| (lo - a, hi - lo))
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        crate::prepcache::code_key(id, offset + (a - p), l, k.as_deref())
+                    });
+                    if let Err(e) =
+                        self.platform.prepare_exec(a, l, known.as_deref(), cache.as_deref())
+                    {
                         // SAFETY: unmapping the mapping just created.
                         self.unmap_host(p, len);
                         untrack(p, self.page_up(len));
@@ -1843,6 +1879,8 @@ impl<P: Platform> Kernel<P> {
                     untrack(p, self.page_up(len));
                     return e;
                 }
+                // Pages whose writes are owed are not to run yet.
+                crate::lazycode::protected(p, self.page_up(len), final_prot(prot));
             }
             break (p, guest);
         };
@@ -1857,6 +1895,7 @@ impl<P: Platform> Kernel<P> {
     /// Unmap guest host memory, or have the backend take it back
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
+        crate::lazycode::unmapped(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
         }
@@ -1968,13 +2007,17 @@ impl<P: Platform> Kernel<P> {
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
             if backed > 0
-                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE)
+                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE, None)
             {
                 return self.prepare_failed(e);
             }
         }
         // SAFETY: guest-requested protection change of guest memory.
         let r = ret(unsafe { libc::mprotect(a, len as usize, final_prot(prot)) });
+        if r == 0 {
+            // Code with writes owed: made writable, they are made first.
+            crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
+        }
         if r == 0 && prot & mman::PROT_EXEC == 0 {
             for &(s, e) in &views {
                 // SAFETY: as above, for the file view's pages in the range.
@@ -2094,7 +2137,7 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
-            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE) {
+            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
                 self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
                 return false;
             }
@@ -2511,6 +2554,8 @@ impl<P: Platform> Kernel<P> {
                 (p as u64, p as u64)
             };
             let keep = old_len.min(new_len);
+            // Code with writes owed has them made before it moves.
+            crate::lazycode::settle(host, old_len);
             if !region::move_pages(host, dest, keep)
                 || extra > 0 && !self.grow_at(dest + old_len, extra, &area, host + (end - old))
             {

@@ -22,6 +22,10 @@ struct Dir {
 
 static REG: Mutex<Option<HashMap<i32, Dir>>> = Mutex::new(None);
 
+/// Whether a synthetic directory was ever opened: until one is, a call
+/// asking about a descriptor takes no lock.
+static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn with<R>(f: impl FnOnce(&mut HashMap<i32, Dir>) -> R) -> R {
     let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(HashMap::new))
@@ -68,6 +72,7 @@ pub fn open(path: Vec<u8>, entries: Vec<(Vec<u8>, u8)>) -> i64 {
     if fd < 0 {
         return last_error();
     }
+    ANY.store(true, std::sync::atomic::Ordering::SeqCst);
     with(|m| m.insert(fd, Dir { path, entries, offset: 0 }));
     fd as i64
 }
@@ -83,11 +88,17 @@ pub fn add(fd: i32, name: Vec<u8>, dtype: u8) {
 
 /// The guest path of synthetic directory `fd`.
 pub fn path_of(fd: i32) -> Option<Vec<u8>> {
+    if !ANY.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
     with(|m| m.get(&fd).map(|d| d.path.clone()))
 }
 
 /// Whether `fd` is a synthetic directory.
 pub fn is_synth(fd: i32) -> bool {
+    if !ANY.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
     with(|m| m.contains_key(&fd))
 }
 

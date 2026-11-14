@@ -88,10 +88,17 @@ fn record() -> Option<&'static Record<Leases>> {
 /// ever taken on costs a look only).
 fn existing() -> Option<&'static Record<Leases>> {
     use std::os::unix::ffi::OsStrExt;
+    // Once made, the record stays: no more looks.
+    static FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FOUND.load(std::sync::atomic::Ordering::Relaxed) {
+        return record();
+    }
     let mut dir = crate::fs::shm::user_dir().ok()?;
     dir.extend_from_slice(format!("/v{}-leases", crate::shared::FORMAT).as_bytes());
     std::fs::metadata(std::ffi::OsStr::from_bytes(&dir)).ok()?;
-    record()
+    let r = record();
+    FOUND.store(r.is_some(), std::sync::atomic::Ordering::Relaxed);
+    r
 }
 
 fn now() -> u64 {
@@ -100,8 +107,7 @@ fn now() -> u64 {
 
 /// This process: host pid and start time.
 fn me() -> (i32, u64) {
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     (pid, crate::procreg::host_info(pid).map_or(0, |i| i.0))
 }
 

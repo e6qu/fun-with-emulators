@@ -105,6 +105,14 @@ thread_local! {
     static REROUTING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// This host thread starts another guest thread
+/// ([`crate::threads::wait_for_next`]): its flags are a new thread's.
+pub fn thread_reused() {
+    IN_GUEST.with(|g| g.set(false));
+    REROUTING.with(|r| r.set(false));
+    UNBLOCKED.with(|u| u.set(false));
+}
+
 /// Whether the host delivers `sig` to [`on_async`] (the guest catches it).
 fn caught(sig: libc::c_int) -> bool {
     // SAFETY: zeroed bytes are a valid `sigaction`; this only reads it.
@@ -128,8 +136,7 @@ fn caught(sig: libc::c_int) -> bool {
 /// other threads are woken to take it. A signal with the default action
 /// or ignored stays where it is: unblocking it would apply that action to
 /// a signal Linux keeps pending.
-fn reroute_parked() {
-    let blocked = thread::mask();
+fn reroute_parked(blocked: u64) {
     if blocked == 0 {
         return;
     }
@@ -310,58 +317,101 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     use std::sync::atomic::Ordering::SeqCst;
     // SAFETY: the gate passes this thread's block, which only it uses now.
     let b = unsafe { &mut *b };
-    IN_GUEST.with(|g| g.set(false));
-    crate::quiesce::leave();
+    // `IN_GUEST` stays as it is: while the block is active, a signal's
+    // handler takes the thread for out of guest code ([`guest_interrupted`]).
+    if b.slot == 0 {
+        b.slot = crate::quiesce::mine_addr();
+    }
+    crate::quiesce::leave_at(b.slot);
     let site = crate::gate::site_of(b.ret);
     b.regs.pc = site;
     b.regs.x[18] = guest_x18();
     b.ran = 0;
     let nr = b.regs.x[8];
+    // A new thread of an untraced one is made here too: the trap would
+    // make it from the same registers.
+    // A thread's `clone`, or `clone3` (glibc's): its flags in its
+    // arguments' structure.
+    let clone_flags = match nr {
+        CLONE => Some(b.regs.x[0]),
+        CLONE3 => fwe_kernel::uaccess::read::<u64>(b.regs.x[0]).ok(),
+        _ => None,
+    };
+    let thread_clone = clone_flags.is_some_and(|f| f & fwe_abi::clone::CLONE_THREAD != 0)
+        && !fwe_kernel::ptrace::traced();
     // What the trap runs its own way, or stops at, it runs.
     let plain = fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls()
-        && !matches!(
-            nr,
-            EXIT | EXECVE
-                | EXECVEAT
-                | CLONE
-                | CLONE3
-                | WAIT4
-                | WAITID
-                | PIDFD_GETFD
-                | RT_SIGTIMEDWAIT
-        )
-        && !fwe_kernel::ipcops::waits(nr);
+        && !matches!(nr, EXIT | EXECVE | EXECVEAT | WAIT4 | WAITID | PIDFD_GETFD | RT_SIGTIMEDWAIT)
+        && !fwe_kernel::ipcops::waits(nr)
+        && (!matches!(nr, CLONE | CLONE3) || thread_clone);
+    // A thread that is not the last ends here, as the trap would end it,
+    // with every host signal blocked first: one for the process is then
+    // taken by another thread, as when the trap's handler runs.
+    if nr == EXIT
+        && fwe_kernel::seccomp::mode() == 0
+        && !fwe_kernel::ptrace::stops_at_syscalls()
+        && !fwe_kernel::ptrace::traced()
+    {
+        // SAFETY: a full set, and blocking it on this thread only.
+        unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+        }
+        fwe_kernel::thread_exit_cleanup();
+        crate::exit_current_thread(b.regs.x[0] as i32, true);
+    }
     if !plain {
-        IN_GUEST.with(|g| g.set(true));
         return 1;
     }
-    reroute_parked();
     let mask = thread::mask();
-    let before = b.regs;
+    reroute_parked(mask);
+    // What a plain return keeps: the general registers but `x0`, `sp` and
+    // the flags (the vector registers change only with the pc, as a
+    // signal's delivery or return changes them).
+    let (before_x, before_sp, before_pstate) = (b.regs.x, b.regs.sp, b.regs.pstate);
     let regs = &mut b.regs;
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    if thread_clone {
+        let a = if nr == CLONE {
+            Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
+        } else {
+            fwe_kernel::CloneArgs::from_clone3(regs.x[0], regs.x[1])
+        };
+        let r = match a.and_then(|a| a.check().map(|()| a)) {
+            Ok(a) => crate::threads::do_clone(regs, a),
+            Err(e) => fwe_abi::err(e),
+        };
+        KERNEL.finish(regs, nr, &args, r);
     // SAFETY: guest pointers in `args` reference guest memory.
-    if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
+    } else if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
         KERNEL.finish(regs, nr, &args, r);
     } else {
         KERNEL.syscall(regs);
     }
     b.ran = 1;
+    // A changed mask is the host thread's now (the guest's is in force in
+    // its code): a signal it unblocks that is pending is seen below.
+    let (_, now_mask) = thread::state();
+    if now_mask != mask {
+        apply_guest_mask();
+        UNBLOCKED.with(|u| u.set(false));
+    }
     // A signal from here on is seen by the gate's way out.
     b.seen = b.signals.load(SeqCst);
     let regs = &b.regs;
     let plain_return = regs.pc == site + 4
-        && regs.sp == before.sp
-        && regs.x[1..] == before.x[1..]
-        && regs.pstate == before.pstate
-        && regs.fp == before.fp
-        && thread::mask() == mask
-        && thread::deliverable() == 0;
+        && regs.sp == before_sp
+        && regs.x[1..].iter().zip(&before_x[1..]).fold(0, |d, (a, b)| d | (a ^ b)) == 0
+        && regs.pstate == before_pstate
+        && {
+            let (pending, mask) = thread::state();
+            pending & !mask == 0
+        };
     if plain_return {
-        crate::quiesce::enter();
+        crate::quiesce::enter_at(b.slot);
     }
-    IN_GUEST.with(|g| g.set(true));
     u64::from(!plain_return)
 }
 
@@ -510,7 +560,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // SAFETY: terminating the process.
         unsafe { libc::_exit(127) }
     }
-    reroute_parked();
+    reroute_parked(thread::mask());
     // A traced process stopping at system calls: the entry's stop, where
     // the tracer may change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
@@ -527,7 +577,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         {
             // The thread ends without the kernel lock, as `exit` does.
             fwe_kernel::thread_exit_cleanup();
-            crate::exit_current_thread(128 + fwe_abi::signal::SIGSYS as i32);
+            crate::exit_current_thread(128 + fwe_abi::signal::SIGSYS as i32, false);
         }
         if action != fwe_kernel::seccomp::Action::Allow {
             kernel().as_mut().unwrap().seccomp_refuse(&mut regs, nr, &args, action);
@@ -547,7 +597,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // A thread exits without the kernel lock: pthread_exit never returns,
         // so a held lock would never be released.
         fwe_kernel::thread_exit_cleanup();
-        crate::exit_current_thread(regs.x[0] as i32);
+        crate::exit_current_thread(regs.x[0] as i32, false);
     }
     if nr == fwe_abi::nr::EXECVE || nr == fwe_abi::nr::EXECVEAT {
         // On success this enters the new program and never returns; on
@@ -903,6 +953,13 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
+        // The first run of a page of code whose preparation was left until
+        // it runs: finished, and the guest runs on.
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        let addr = unsafe { (*info).si_addr() } as u64;
+        if fwe_kernel::lazycode::fault(ss.pc, addr) {
+            return;
+        }
         // Read as the host copies, which reports a hole rather than fault:
         // the pc of an instruction-fetch fault is not mapped.
         let word = |a: u64| read_host::<u32>(a);
@@ -1143,6 +1200,28 @@ pub fn ensure_thread_altstack() {
     };
     if disabled {
         install_thread_altstack();
+    }
+}
+
+/// Make the mapping at `stack` (an ended thread's, [`crate::stacks`]) this
+/// thread's signal stack.
+pub fn use_altstack(stack: u64) {
+    let ss = libc::stack_t {
+        ss_sp: stack as *mut libc::c_void,
+        ss_size: SIGNAL_STACK_SIZE,
+        ss_flags: 0,
+    };
+    // SAFETY: a mapping of the signal stack's size, this thread's alone.
+    assert_eq!(unsafe { libc::sigaltstack(&ss, std::ptr::null_mut()) }, 0, "sigaltstack failed");
+}
+
+/// This thread's signal stack, if it has one.
+pub fn altstack_mapping() -> Option<u64> {
+    // SAFETY: querying this thread's signal stack into a zeroed stack_t.
+    unsafe {
+        let mut old: libc::stack_t = std::mem::zeroed();
+        (libc::sigaltstack(std::ptr::null(), &mut old) == 0 && old.ss_flags & libc::SS_DISABLE == 0)
+            .then_some(old.ss_sp as u64)
     }
 }
 

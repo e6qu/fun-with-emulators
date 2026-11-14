@@ -34,6 +34,11 @@ thread_local! {
     static CURRENT: Cell<*mut Fs> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    CURRENT.with(|c| c.set(std::ptr::null_mut()));
+}
+
 /// Each thread's own view, by thread id.
 static OWNERS: Mutex<Option<HashMap<i32, Own>>> = Mutex::new(None);
 

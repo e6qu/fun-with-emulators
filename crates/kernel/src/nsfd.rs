@@ -125,10 +125,12 @@ pub fn target(fd: i32) -> Option<Vec<u8>> {
 
 /// `fd` is closed: what it named goes with its last descriptor.
 pub fn closed(fd: i32) {
-    if fdmarks::shared_elsewhere(fd) {
+    // The mark first: finding another descriptor of the same file lists
+    // them all.
+    let Some(Mark::Ns(k)) = fdmarks::any_marks().then(|| fdmarks::marked(fd)).flatten() else {
         return;
-    }
-    if let Some(Mark::Ns(k)) = fdmarks::any_marks().then(|| fdmarks::marked(fd)).flatten() {
+    };
+    if !fdmarks::shared_elsewhere(fd) {
         with(|m| m.remove(&k));
     }
 }

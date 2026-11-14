@@ -18,10 +18,10 @@
 //! signal from elsewhere (the terminal, the host) is not taken for it. Both
 //! are
 //! async-signal-safe: `pread` and `pwrite` on the process's own mailbox,
-//! which it opened as it started (and a fork child as it starts), in fwe's
-//! reserved descriptor range, so a handler takes no number the guest's
-//! next descriptor would. A note whose signal could not be sent is taken
-//! back.
+//! which the first sender makes, kept open in fwe's reserved descriptor
+//! range once a handler first reads it (opening it by its path takes a
+//! number below the range for that moment only). A note whose signal could
+//! not be sent is taken back.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -79,17 +79,19 @@ pub fn init() {
 /// Open this process's own mailbox, if it is not open yet for this pid (a
 /// fork child has its parent's open): where its handlers read notes.
 pub fn open_own() {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if OWN_PID.load(Ordering::SeqCst) == me {
         return;
     }
     let mut buf = [0u8; 512];
     let Some(path) = mailbox(me, &mut buf) else { return };
+    // Not made here: the first sender makes it, and the first note read
+    // keeps it open ([`own_mailbox`]). Most processes are sent nothing,
+    // and making a file costs more than the rest of a fork child's start.
     // SAFETY: a NUL-terminated path; the descriptor is moved out of the
     // guest's range and kept for the process's life.
-    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
-    let Ok(fd) = crate::fdtable::reserve(fd) else { return };
+    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
+    let fd = if fd >= 0 { crate::fdtable::reserve(fd).unwrap_or(-1) } else { -1 };
     let old = OWN.swap(fd, Ordering::SeqCst);
     OWN_PID.store(me, Ordering::SeqCst);
     if old >= 0 {
@@ -239,8 +241,7 @@ pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
 /// one's mailbox, which goes when those records are cleared, and senders
 /// then write a new one. Async-signal-safe; the caller keeps errno.
 fn own_mailbox() -> Option<(i32, bool)> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut buf = [0u8; 512];
     let path = mailbox(me, &mut buf)?;
     let own = OWN.load(Ordering::SeqCst);
@@ -258,7 +259,25 @@ fn own_mailbox() -> Option<(i32, bool)> {
     }
     // SAFETY: a NUL-terminated path; async-signal-safe.
     let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
-    (fd >= 0).then_some((fd, true))
+    if fd < 0 {
+        return None;
+    }
+    // Kept for the next note, out of the guest's range, if none is kept:
+    // the mailbox a sender made after this process started.
+    if OWN_PID.load(Ordering::SeqCst) == me && own < 0 {
+        // SAFETY: plain host calls on the descriptor just opened;
+        // async-signal-safe.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, crate::fdtable::guest_max()) };
+        if high >= 0 {
+            // SAFETY: the descriptor opened above, now copied.
+            unsafe { libc::close(fd) };
+            if OWN.compare_exchange(-1, high, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Some((high, false));
+            }
+            return Some((high, true));
+        }
+    }
+    Some((fd, true))
 }
 
 /// Read, and with `clear_if` (clearing only a note of that sender, or with
@@ -698,8 +717,7 @@ fn reply_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH]) -> Option<usize> {
 pub fn fd_reply_socket() -> Option<Reply> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut buf = [0u8; SUN_PATH];
     let len = reply_path(me, token, &mut buf)?;
     let path = buf[..len].to_vec();
@@ -841,8 +859,7 @@ mod tests {
     fn queued_signals_are_taken_in_order() {
         let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
         init();
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if DIR.get().is_none() {
             return;
         }
@@ -866,8 +883,7 @@ mod tests {
     fn a_replaced_mailbox_is_read_by_its_path() {
         let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
         init();
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if DIR.get().is_none() {
             return;
         }

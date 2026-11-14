@@ -1,0 +1,133 @@
+name: probe-tmp
+on:
+  push:
+    branches: [m6-native]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p fwe
+      - name: Build the Linux bench with zig
+        run: |
+          brew install zig >/dev/null 2>&1 || true
+          zig cc -target aarch64-linux-musl -O2 -fPIE -pie -o bench-linux guests/c/bench.c
+          clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
+      - name: Profiles
+        run: |
+          F=target/release/fwe
+          echo "host getppid in fwe: $($F --probe host-getppid)"
+          for op in getpid syscall; do echo "$op fwe $($F ./bench-linux $op 2000000) mac $(./bench-mac $op 2000000)"; done
+          echo "thread fwe $($F ./bench-linux thread 3000) mac $(./bench-mac thread 3000)"
+          prof() {
+            "$@" & P=$!; sleep 1; sample $P 3 -file s.txt >/dev/null 2>&1 || true; kill $P 2>/dev/null || true; wait $P 2>/dev/null || true
+            awk '/Sort by top of stack/,/Binary Images/' s.txt | head -40
+            awk '/Call graph/,/Total number/' s.txt | sed 's/  (in [a-zA-Z_.]*) .*//' | awk '{ match($0,/[0-9]+ /); n=substr($0,RSTART,RLENGTH)+0; if (n>=40) print }' | cut -c1-170 | head -80
+          }
+          echo "== getpid"; prof $F ./bench-linux getpid 400000000
+          echo "== thread"; prof $F ./bench-linux thread 2000000
+      - name: What clang --version does under fwe
+        run: |
+          python3 -I - <<'PY'
+          import sys, os, subprocess, time, collections, re
+          sys.path.insert(0, os.path.abspath("tools/bench"))
+          import run
+          cache = os.path.abspath("target/bench-cache")
+          root = run.alpine_root("clang", cache)
+          fwe = os.path.abspath("target/release/fwe")
+          env = ["env", "-i", "PATH=/usr/bin:/bin", "HOME=/root", "TMPDIR=" + os.environ.get("TMPDIR", "/tmp")]
+          cmd = env + [fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "--version"]
+          for i in range(3):
+              s = time.perf_counter(); subprocess.run(cmd, capture_output=True); print("fwe clang --version %.0f ms" % ((time.perf_counter() - s) * 1e3))
+          s = time.perf_counter(); subprocess.run(["clang", "--version"], capture_output=True); print("mac clang --version %.0f ms" % ((time.perf_counter() - s) * 1e3))
+          subprocess.run(env + [fwe, "--strace", "--strace-file=/tmp/t.txt", "--root", root, os.path.join(root, "usr/bin/clang"), "--version"], capture_output=True)
+          calls = collections.Counter()
+          notes = 0
+          for line in open("/tmp/t.txt", errors="replace"):
+              m = re.search(r"\] ([a-z_0-9]+)\(", line)
+              if m: calls[m.group(1)] += 1
+              elif "prepared" in line or "loaded" in line: notes += 1
+          print("calls", sum(calls.values()), calls.most_common(25), "notes", notes)
+          lines = open("/tmp/t.txt", errors="replace").read().splitlines()
+          print("\n".join(l[:200] for l in lines if "mmap" in l and "PROT_EXEC" in l.upper()[:400])[:4000])
+          print("\n".join(l[:200] for l in lines if "prepared" in l)[:3000])
+          r = subprocess.run(["/usr/bin/time", "-l"] + cmd, capture_output=True, text=True)
+          print("fwe:", "\n".join(l for l in r.stderr.splitlines() if "fault" in l or "reclaims" in l or "real" in l or "instructions" in l or "cycles" in l))
+          r = subprocess.run(["/usr/bin/time", "-l", "clang", "--version"], capture_output=True, text=True)
+          print("mac:", "\n".join(l for l in r.stderr.splitlines() if "fault" in l or "reclaims" in l or "real" in l or "instructions" in l or "cycles" in l))
+          PY
+      - name: A compile under fwe
+        run: |
+          python3 -I - <<'PY'
+          import sys, os, subprocess, time, shutil
+          sys.path.insert(0, os.path.abspath("tools/bench"))
+          import run
+          cache = os.path.abspath("target/bench-cache")
+          lua = run.fetch(*run.LUA, cache)
+          root = run.alpine_root("clang", cache)
+          tmp = os.path.join(root, "tmp"); os.makedirs(tmp, exist_ok=True)
+          shutil.rmtree(os.path.join(tmp, "lua-5.4.7"), ignore_errors=True)
+          src = run.unpack_lua(lua, tmp)
+          fwe = os.path.abspath("target/release/fwe")
+          env = ["env", "-i", "PATH=/usr/bin:/bin", "HOME=/root"]
+          g = env + [fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "-O2", "-c", "/tmp/lua-5.4.7/src/lparser.c", "-o", "/tmp/x.o"]
+          n = ["clang", "-O2", "-c", os.path.join(src, "src/lparser.c"), "-o", "/tmp/x.o"]
+          for name, cmd in (("fwe", g), ("mac", n)):
+              ts = []
+              for i in range(5):
+                  s = time.perf_counter(); subprocess.run(cmd, check=True); ts.append(time.perf_counter() - s)
+              print(name, "compile", " ".join("%.0f" % (t * 1e3) for t in ts), "ms")
+          s = time.perf_counter(); subprocess.run(env + [fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "--version"], capture_output=True); print("fwe clang --version %.0f ms" % ((time.perf_counter() - s) * 1e3))
+          r = subprocess.run(env + ["FWE_TIMING=1", fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "--version"], capture_output=True, text=True)
+          print(r.stderr[-3000:])
+          # Profile one compile (cc1 runs in the same process).
+          p = subprocess.Popen(g[:-4] + ["-O2", "-c", "/tmp/lua-5.4.7/src/lparser.c", "-o", "/tmp/y.o"])
+          time.sleep(0.05)
+          subprocess.run(["sample", str(p.pid), "1", "-file", "c.txt"], capture_output=True)
+          p.wait()
+          PY
+          awk '/Sort by top of stack/,/Binary Images/' c.txt | head -40 || true
+  linux:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - run: |
+          docker run --rm alpine:3.24 sh -c '
+            apk add -q clang22 musl-dev >/dev/null
+            (wget -q https://www.lua.org/ftp/lua-5.4.7.tar.gz || wget -q https://www.tecgraf.puc-rio.br/lua/ftp/lua-5.4.7.tar.gz) && tar xzf lua-5.4.7.tar.gz
+            echo "20 x clang --version:"; time sh -c "for i in \$(seq 20); do clang --version >/dev/null; done"
+            clang -O2 -c lua-5.4.7/src/lparser.c -o /tmp/x.o; echo "compile exit $?"
+            echo "5 x compile lparser.c:"; time sh -c "for i in \$(seq 5); do clang -O2 -c lua-5.4.7/src/lparser.c -o /tmp/x.o; done"
+          ' 2>&1
+  node:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Node, several times
+        run: |
+          cargo test -p fwe --test guests --no-run
+          for i in 1 2 3 4 5 6 7 8; do
+            cargo test -q -p fwe --test guests debian_node_runs_a_workload 2>&1 | grep -E "test result|node \(" || true
+          done
+      - if: always()
+        run: |
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/fwe*.ips 2>/dev/null | head -8); do
+            echo "=== $f"
+            python3 -c "
+          import json,sys
+          t=open(sys.argv[1]).read().split('\\n',1)[1]
+          r=json.loads(t)
+          print(r.get('exception'))
+          imgs=r['usedImages']
+          ft=r['faultingThread']
+          th=r['threads'][ft]
+          ts=th.get('threadState',{})
+          print('pc', ts.get('pc'), 'lr', ts.get('lr'), 'far', ts.get('far'), 'esr', ts.get('esr'))
+          for fr in th['frames'][:12]:
+              i=fr.get('imageIndex'); im=imgs[i] if i is not None and i < len(imgs) else {}
+              print(im.get('name'), fr.get('symbol'), hex(fr.get('imageOffset',0)))
+          " "$f" || true
+          done

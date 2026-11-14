@@ -182,16 +182,6 @@ pub fn records_dir() -> Option<Vec<u8>> {
     dir()
 }
 
-fn path(pid: i32) -> Option<Vec<u8>> {
-    Some([dir()?, format!("/{pid}").into_bytes()].concat())
-}
-
-/// The file host process `pid` publishes its mappings in (see
-/// [`crate::maps::publish`]).
-pub fn maps_path(pid: i32) -> Option<Vec<u8>> {
-    Some([path(pid)?, b".maps".to_vec()].concat())
-}
-
 /// Host process `pid`'s parent as the host has it, if it exists.
 pub fn host_parent(pid: i32) -> Option<i32> {
     host_info(pid).map(|(_, ppid, _)| ppid)
@@ -248,71 +238,95 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
 
 /// The record of live host process `pid`.
 pub fn read(pid: i32) -> Option<ProcRecord> {
-    with_held(pid, read_any(pid).filter(|r| start_time(pid) == Some(r.start)))
+    if pid == crate::host::pid() {
+        return with_held(pid, read_own(pid));
+    }
+    let r = read_any(pid).filter(|r| start_time(pid) == Some(r.start));
+    if r.is_none() && new_child(pid) {
+        // A child this process just forked writes its own record as it
+        // starts ([`own_whole`]): wait for it, as it is there on Linux.
+        for _ in 0..2000 {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            if let Some(r) = read_any(pid).filter(|r| start_time(pid) == Some(r.start)) {
+                return with_held(pid, Some(r));
+            }
+            if !new_child(pid) {
+                break;
+            }
+        }
+    }
+    with_held(pid, r)
+}
+
+/// Children this process forked that write their own records
+/// ([`own_whole`]) and may not have yet.
+static UNWRITTEN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// This process forked `child`, which writes its own record as it starts:
+/// a listing of every process waits for it ([`all`]), as on Linux the
+/// child is there once the fork returns.
+pub fn child_writes_own(child: i32) {
+    let mut u = UNWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if u.len() >= 64 {
+        // A parent that forks many and lists none: those written are done.
+        u.retain(|&pid| read_any(pid).is_none() && new_child(pid));
+    }
+    u.push(child);
+}
+
+/// Wait for the records of the children this process forked that were to
+/// write their own ([`child_writes_own`]).
+fn await_unwritten() {
+    let pids = std::mem::take(&mut *UNWRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in pids {
+        // Waits while it is a live child with no record yet.
+        let _ = read(pid);
+    }
+}
+
+/// Whether host process `pid` is a live child of this process.
+fn new_child(pid: i32) -> bool {
+    host_info(pid).is_some_and(|(_, ppid, zombie)| ppid == me() && !zombie)
+}
+
+/// This process's record as last read, by its version then
+/// ([`crate::procstore::version`]).
+static OWN: std::sync::Mutex<Option<(i32, u32, ProcRecord)>> = std::sync::Mutex::new(None);
+
+/// This process's start time, by pid.
+static OWN_START: std::sync::Mutex<(i32, u64)> = std::sync::Mutex::new((0, 0));
+
+/// [`read`] of this process's own record (host pid `me`): read again only
+/// once it changed, which its version tells (a thread started reads it,
+/// for its creator's timer slack).
+fn read_own(me: i32) -> Option<ProcRecord> {
+    let version = crate::procstore::version(me)?;
+    {
+        let own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((pid, v, r)) = own.as_ref()
+            && (*pid, *v) == (me, version)
+        {
+            return Some(r.clone());
+        }
+    }
+    let start = {
+        let mut s = OWN_START.lock().unwrap_or_else(|e| e.into_inner());
+        if s.0 != me {
+            *s = (me, start_time(me)?);
+        }
+        s.1
+    };
+    let r = read_any(me).filter(|r| r.start == start)?;
+    // Kept only if it did not change while it was read.
+    if version % 2 == 0 && crate::procstore::version(me) == Some(version) {
+        *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some((me, version, r.clone()));
+    }
+    Some(r)
 }
 
 /// The record kept for host pid `pid`, whether or not its process lives.
 fn read_any(pid: i32) -> Option<ProcRecord> {
-    let p = path(pid)?;
-    // A record is rewritten in place ([`write`]): one read while it is
-    // being written fails its check, and is made again. An empty file is
-    // one not yet written (or whose writer died first): no record.
-    for _ in 0..100 {
-        let bytes = std::fs::read(OsStr::from_bytes(&p)).ok()?;
-        if bytes.is_empty() {
-            return None;
-        }
-        if let Some(body) = unframe(&bytes) {
-            return decode(body);
-        }
-        std::thread::yield_now();
-    }
-    None
-}
-
-/// A record's bytes as written: its length and checksum, then itself.
-fn frame(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 16);
-    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    out.extend_from_slice(&checksum(body).to_le_bytes());
-    out.extend_from_slice(body);
-    out
-}
-
-/// The record in `bytes` ([`frame`]), if it is whole.
-fn unframe(bytes: &[u8]) -> Option<&[u8]> {
-    let len = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
-    let sum = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
-    let body = bytes.get(16..16usize.checked_add(len)?)?;
-    (checksum(body) == sum).then_some(body)
-}
-
-/// A record's checksum over its little-endian words, the last one padded
-/// with zeros. Records carry a process's mappings, thousands of them for
-/// some, and are read at every reap: a word at a time, and straight from
-/// the buffer when it is aligned.
-fn checksum(bytes: &[u8]) -> u64 {
-    let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    // SAFETY: every bit pattern is a valid u64.
-    let (head, words, _) = unsafe { bytes.align_to::<u64>() };
-    let rest = if head.is_empty() && cfg!(target_endian = "little") {
-        let mut i = 0;
-        while i < words.len() {
-            h = mix(h, words[i]);
-            i += 1;
-        }
-        &bytes[words.len() * 8..]
-    } else {
-        bytes
-    };
-    let mut chunks = rest.chunks(8);
-    for c in &mut chunks {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h = mix(h, u64::from_le_bytes(w));
-    }
-    h
+    decode(&crate::procstore::get(pid)?)
 }
 
 fn decode(bytes: &[u8]) -> Option<ProcRecord> {
@@ -369,45 +383,21 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     })
 }
 
-/// Write the record of host process `pid`, under its lock ([`change`]): in
-/// place (a new file costs the host far more than rewriting one), framed
-/// with its length and checksum, for readers (who take no lock) to tell a
-/// whole record from one being written, and from an older one's longer
-/// tail.
-fn write(pid: i32, r: &ProcRecord) {
-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
-    let Some(p) = path(pid) else { return };
-    let bytes = frame(&encode(r));
-    let Ok(f) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(OsStr::from_bytes(&p))
-    else {
-        return;
-    };
-    // An older record's longer tail stays, past the frame.
-    let _ = f.write_all_at(&bytes, 0);
+/// Hold host process `pid`'s record's lock while the result lives: the
+/// holder reads and writes it ([`read_locked`], [`write_locked`]).
+fn lock(pid: i32) -> Option<crate::procstore::Held> {
+    crate::procstore::lock(pid)
 }
 
-/// Hold host process `pid`'s record's lock while the result lives.
-fn lock(pid: i32) -> Option<std::fs::File> {
-    let p = [path(pid)?, b".lock".to_vec()].concat();
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(OsStr::from_bytes(&p))
-        .ok()?;
-    use std::os::fd::AsRawFd;
-    // SAFETY: plain host call on the file just opened; the lock goes with it.
-    crate::shared::lock_exclusive(f.as_raw_fd());
-    Some(f)
+/// The record of host process `pid`, whose lock the caller holds, if it is
+/// of the process that started at `start`.
+fn read_locked(pid: i32, start: u64) -> Option<ProcRecord> {
+    with_held(pid, read_any(pid).filter(|r| r.start == start))
 }
 
-fn end_path(pid: i32) -> Option<Vec<u8>> {
-    Some([dir()?, format!("/{pid}.end").into_bytes()].concat())
+/// Write record `r` of host process `pid`, whose lock is `held`.
+fn write_locked(held: &crate::procstore::Held, pid: i32, r: &ProcRecord) {
+    crate::procstore::put(held, pid, &encode(r));
 }
 
 /// This process ends of a Linux signal, with Linux wait status `status`
@@ -415,52 +405,30 @@ fn end_path(pid: i32) -> Option<Vec<u8>> {
 /// to report, which the host cannot say when the host has no such signal,
 /// ignores it by default (`SIGIO`), or wrote no core.
 pub fn ending(status: i32) {
-    // SAFETY: getpid cannot fail.
-    let Some(p) = end_path(unsafe { libc::getpid() }) else { return };
-    let _ = std::fs::write(OsStr::from_bytes(&p), status.to_ne_bytes());
+    crate::procstore::set_end(crate::host::pid(), status);
 }
 
 /// The Linux wait status host process `pid` left as it ended of a signal.
 /// Async-signal-safe (a `SIGCHLD` handler asks): it allocates nothing.
 pub fn end_status(pid: i32) -> Option<i32> {
-    let mut buf = [0u8; 512];
-    let path = crate::signote::record_file(pid, b".end", &mut buf)?;
-    let mut b = [0u8; 4];
-    let saved = crate::host::last_errno();
-    // SAFETY: a NUL-terminated path; a buffer of its length; the
-    // descriptor is closed here.
-    let n = unsafe {
-        let fd = libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC);
-        let n = if fd < 0 { -1 } else { libc::read(fd, b.as_mut_ptr().cast(), b.len()) };
-        if fd >= 0 {
-            libc::close(fd);
-        }
-        n
-    };
-    crate::host::set_errno(saved);
-    (n == 4).then(|| i32::from_ne_bytes(b))
+    crate::procstore::end_status(pid)
 }
 
 /// Host process `pid` was reaped, or this one starts with that number:
 /// its end status goes.
 pub fn forget_end(pid: i32) {
-    if let Some(p) = end_path(pid) {
-        let _ = std::fs::remove_file(OsStr::from_bytes(&p));
-    }
+    crate::procstore::forget_end(pid);
 }
 
-/// Forget host process `pid` (it ended). Where a new process has the pid
-/// already, only the old one's record goes: the files beside it (its
-/// mailbox, lock and mappings) are the new one's now, which may have
-/// opened them before it wrote its own record.
-pub fn remove(pid: i32) {
-    let Some(p) = path(pid) else { return };
-    let _ = std::fs::remove_file(OsStr::from_bytes(&p));
+/// Forget host process `pid` (it ended), whose record's lock is `held`.
+/// Where a new process has the pid already, only the old one's record
+/// goes: the files beside it (its mailbox and mappings) are the new one's
+/// now, which may have opened them before it wrote its own record.
+pub fn remove(held: &crate::procstore::Held, pid: i32) {
+    crate::procstore::remove(held, pid);
     if start_time(pid).is_some() {
         return;
     }
-    let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".maps"].concat()));
-    let _ = std::fs::remove_file(OsStr::from_bytes(&[&p[..], b".lock"].concat()));
     crate::signote::remove(pid);
 }
 
@@ -476,7 +444,7 @@ pub fn collect_leftovers(young: std::time::Duration) {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         let pid = match name.split_once('.') {
-            Some((p, "sig" | "lock" | "maps" | "end")) => p,
+            Some((p, "sig" | "lock" | "maps")) => p,
             _ => match name.strip_prefix("tids-").or_else(|| name.strip_prefix("threads-")) {
                 Some(p) => p.strip_suffix(".new").unwrap_or(p),
                 None => continue,
@@ -501,16 +469,9 @@ pub fn collect_leftovers(young: std::time::Duration) {
 /// Every live process fwe has a record of, forgetting those that ended
 /// (zombies too).
 pub fn all() -> Vec<(i32, ProcRecord)> {
-    let Some(d) = dir() else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return Vec::new() };
+    await_unwritten();
     let mut out = Vec::new();
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
-            // A lock or a write in progress; a leftover of a writer that died
-            // goes with its process's record.
-            continue;
-        };
+    for pid in crate::procstore::pids() {
         // A zombie has ended (Linux lists it in no cgroup either): its
         // record goes, and how it ended is kept for whoever reaps it.
         // Read again once before it is taken for gone: another process may
@@ -547,15 +508,14 @@ pub fn run() -> Vec<i32> {
 /// take it. A zombie has ended too, but its record stays until it is
 /// reaped: `/proc/<pid>` shows it, as Linux shows a zombie.
 pub fn gone(pid: i32) {
-    let _lock = lock(pid);
+    let Some(held) = lock(pid) else { return };
     if let Some(r) = read_any(pid)
         && !alive((pid, r.start))
     {
         // A namespace's init takes its namespace with it.
         crate::pidns::init_gone(&r.ns, pid);
         // An account the process left itself stands.
-        let told = ended_path(pid, r.start)
-            .is_some_and(|p| std::path::Path::new(OsStr::from_bytes(&p)).exists());
+        let told = crate::procstore::has_ended(pid, r.start);
         if !told
             && crate::reaper::takes_end((pid, r.start), &r.lineage, r.bound, r.foster)
             && !parent_autoreaps(&r.lineage)
@@ -573,7 +533,7 @@ pub fn gone(pid: i32) {
         }
         let zombie = host_info(pid).is_some_and(|(start, _, z)| z && start == r.start);
         if !zombie {
-            remove(pid);
+            remove(&held, pid);
         }
     }
 }
@@ -624,8 +584,7 @@ pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
 
 /// The host pid of this process.
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 /// This process's cgroup: its record's, made in the root if it has none.
@@ -675,10 +634,10 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
     // Under the record's lock: a parent and its child may change one.
-    let _lock = lock(pid);
-    let mut r = read(pid).unwrap_or_else(|| fresh(pid, start));
+    let held = lock(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    let mut r = read_locked(pid, start).unwrap_or_else(|| fresh(pid, start));
     f(&mut r);
-    write(pid, &r);
+    write_locked(&held, pid, &r);
     Ok(())
 }
 
@@ -1084,6 +1043,63 @@ pub fn own_line(
     });
 }
 
+/// What a parent alone knows of its child's record as it forks: its own
+/// program (the child runs it until it execs), the cgroup the child starts
+/// in, and whether the host reaps the parent's children.
+#[derive(Clone, Debug)]
+pub struct FromParent {
+    comm: Vec<u8>,
+    cmdline: Vec<u8>,
+    exe: Vec<u8>,
+    cgroup: Vec<u8>,
+    autoreap: bool,
+}
+
+impl FromParent {
+    /// This process's, for a child that starts in `cgroup` (else in this
+    /// process's).
+    pub fn of(cgroup: Option<&[u8]>) -> FromParent {
+        let mine = read(me());
+        let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
+        FromParent {
+            comm,
+            cmdline,
+            exe,
+            cgroup: cgroup.map_or_else(own_cgroup, <[u8]>::to_vec),
+            autoreap: crate::host::children_reaped_by_host(),
+        }
+    }
+}
+
+/// [`own_line`] for a child whose parent writes none of its record: all of
+/// what [`forked`] would have written too, from `from`.
+pub fn own_whole(
+    line: &(Vec<Proc>, Option<Proc>),
+    inherit: &Inherit,
+    ns: Vec<Vec<u8>>,
+    maps: Vec<u8>,
+    auxv: &[u8],
+    from: &FromParent,
+) {
+    let _ = change(me(), |r| {
+        if r.lineage.is_empty() {
+            apply(r, inherit);
+            r.ns = ns;
+        }
+        if r.cgroup.is_empty() {
+            r.cgroup = from.cgroup.clone();
+        }
+        if r.exe.is_empty() {
+            (r.comm, r.cmdline, r.exe) =
+                (from.comm.clone(), from.cmdline.clone(), from.exe.clone());
+        }
+        (r.lineage, r.bound) = line.clone();
+        r.autoreap = from.autoreap;
+        r.maps = maps;
+        r.auxv = auxv.to_vec();
+    });
+}
+
 /// Make this process a child subreaper, or not, with the orphans below it
 /// it is not to adopt (`declined`) and those it keeps (`kept`), see
 /// [`crate::reaper::set_subreaper`].
@@ -1305,38 +1321,30 @@ impl Ended {
     }
 }
 
-fn ended_dir() -> Option<Vec<u8>> {
-    static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    made_dir(&DIR, "ended")
-}
-
-fn ended_path(pid: i32, start: u64) -> Option<Vec<u8>> {
-    Some([ended_dir()?, format!("/{pid}.{start}").into_bytes()].concat())
-}
-
 /// Record how a process ended.
 pub fn write_ended(e: &Ended) {
-    let Some(p) = ended_path(e.pid, e.start) else { return };
-    let tmp = [&p[..], format!(".{}.tmp", me()).as_bytes()].concat();
-    if std::fs::write(OsStr::from_bytes(&tmp), e.encode()).is_ok() {
-        let _ = std::fs::rename(OsStr::from_bytes(&tmp), OsStr::from_bytes(&p));
-    }
+    crate::procstore::put_ended(e.pid, e.start, &e.encode());
 }
 
 /// Every record of a process that ended and is not yet reaped.
 pub fn all_ended() -> Vec<Ended> {
-    let Some(d) = ended_dir() else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return Vec::new() };
-    entries
-        .flatten()
-        .filter(|e| !e.file_name().as_bytes().ends_with(b".tmp"))
-        .filter_map(|e| Ended::decode(&std::fs::read(e.path()).ok()?))
-        .collect()
+    ended_where(|_| true)
 }
 
-/// Take the record of how `e` ended: whoever removes it reaps the process.
+/// The records of processes with host pid `pid` that ended and are not yet
+/// reaped (an older one may have had its number).
+fn ended_of(pid: i32) -> Vec<Ended> {
+    ended_where(|p| p == pid)
+}
+
+/// The ended records of the host pids `wanted` picks.
+fn ended_where(wanted: impl Fn(i32) -> bool) -> Vec<Ended> {
+    crate::procstore::ended(wanted).iter().filter_map(|b| Ended::decode(b)).collect()
+}
+
+/// Take the record of how `e` ended: whoever takes it reaps the process.
 pub fn take_ended(e: &Ended) -> bool {
-    ended_path(e.pid, e.start).is_some_and(|p| std::fs::remove_file(OsStr::from_bytes(&p)).is_ok())
+    crate::procstore::take_ended(e.pid, e.start)
 }
 
 /// Reap ended process `e`, adopted: take the account of how it ended, and
@@ -1344,12 +1352,15 @@ pub fn take_ended(e: &Ended) -> bool {
 /// gone ([`gone`]) takes it for one killed outright and records a second
 /// end. Whoever takes the account reaps the process.
 pub fn take_adopted_end(e: &Ended) -> bool {
-    let _lock = lock(e.pid);
+    let held = lock(e.pid);
     if !take_ended(e) {
         return false;
     }
-    if read_any(e.pid).is_some_and(|r| r.start == e.start) && !alive((e.pid, e.start)) {
-        remove(e.pid);
+    if let Some(held) = &held
+        && read_any(e.pid).is_some_and(|r| r.start == e.start)
+        && !alive((e.pid, e.start))
+    {
+        remove(held, e.pid);
     }
     true
 }
@@ -1358,17 +1369,16 @@ pub fn take_adopted_end(e: &Ended) -> bool {
 pub fn reaped(pid: i32) {
     forget_end(pid);
     crate::reaper::forget_exit_signal(pid);
-    if read(pid).is_none() {
-        let _lock = lock(pid);
-        if let Some(r) = read_any(pid)
-            && r.lineage.first().is_some_and(|&(p, _)| p == me())
-        {
-            // An init killed outright: its namespace goes with it.
-            crate::pidns::init_gone(&r.ns, pid);
-            remove(pid);
-        }
+    if read(pid).is_none()
+        && let Some(held) = lock(pid)
+        && let Some(r) = read_any(pid)
+        && r.lineage.first().is_some_and(|&(p, _)| p == me())
+    {
+        // An init killed outright: its namespace goes with it.
+        crate::pidns::init_gone(&r.ns, pid);
+        remove(&held, pid);
     }
-    for e in all_ended().into_iter().filter(|e| e.pid == pid) {
+    for e in ended_of(pid) {
         // Only the one the parent reaped: an older process with its pid
         // had another parent, now gone.
         if e.lineage.first().is_some_and(|&(p, _)| p == me()) {
@@ -1391,6 +1401,8 @@ pub fn exiting(status: i32) {
     crate::thread::process_ending();
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
+    // The files it keeps open and writes, closed before it ends.
+    crate::maps::close_for_exit();
     let me = me();
     // Ending of a Linux signal: its status as recorded ([`ending`]).
     let status = end_status(me).unwrap_or(status);
@@ -1441,18 +1453,13 @@ fn forget_children(parent: i32) {
     for e in all_ended().into_iter().filter(|e| e.lineage.first().is_some_and(|p| p.0 == parent)) {
         take_ended(&e);
     }
-    let Some(d) = dir() else { return };
-    let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return };
-    for e in entries.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
-            continue;
-        };
-        let _lock = lock(pid);
+    for pid in crate::procstore::pids() {
+        let Some(held) = lock(pid) else { continue };
         if let Some(r) = read_any(pid)
             && r.lineage.first().is_some_and(|p| p.0 == parent)
             && start_time(pid) != Some(r.start)
         {
-            remove(pid);
+            remove(&held, pid);
         }
     }
 }
@@ -1460,47 +1467,6 @@ fn forget_children(parent: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_record_caught_mid_write_is_not_taken_for_whole() {
-        let r = fresh(me(), 1);
-        let body = encode(&r);
-        let whole = frame(&body);
-        assert_eq!(decode(unframe(&whole).unwrap()), Some(r));
-        // The longer tail of the record written before, not yet cut off.
-        let mut longer = whole.clone();
-        longer.extend_from_slice(&[7; 40]);
-        assert_eq!(unframe(&longer), Some(&body[..]));
-        // Cut short, empty, or a byte of another write.
-        assert_eq!(unframe(&whole[..whole.len() - 1]), None);
-        assert_eq!(unframe(&[]), None);
-        let mut mixed = whole.clone();
-        let last = mixed.len() - 1;
-        mixed[last] ^= 1;
-        assert_eq!(unframe(&mixed), None);
-    }
-
-    #[test]
-    fn a_checksum_is_the_same_wherever_the_bytes_lie() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let mut buf = [0u8; 120];
-        for at in 0..8 {
-            for len in [0, 1, 7, 8, 9, 64, 99] {
-                buf[at..at + len].copy_from_slice(&bytes[..len]);
-                assert_eq!(
-                    checksum(&buf[at..at + len]),
-                    checksum(&bytes[..len]),
-                    "at {at}, {len} bytes"
-                );
-            }
-        }
-        // Any one byte changed changes it.
-        for i in 0..bytes.len() {
-            let mut other = bytes.clone();
-            other[i] ^= 0x40;
-            assert_ne!(checksum(&other), checksum(&bytes), "byte {i}");
-        }
-    }
 
     #[test]
     fn a_batch_writes_once_and_its_changes_are_read_meanwhile() {
@@ -1516,6 +1482,6 @@ mod tests {
         let r = read_any(me()).unwrap();
         // Its name is the program's, cut to 15 bytes as Linux's is.
         assert_eq!((r.exe, r.auxv, r.comm), (exe.clone(), vec![1, 2, 3], exe[1..16].to_vec()));
-        remove(me());
+        remove(&lock(me()).unwrap(), me());
     }
 }

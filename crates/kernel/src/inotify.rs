@@ -41,9 +41,10 @@ pub struct Watch {
     pub ino: u64,
     /// The events asked for, with `IN_ONESHOT` and `IN_EXCL_UNLINK`.
     pub mask: u32,
-    /// Where the file was in the mount namespace's view (for
-    /// `IN_UNMOUNT`).
+    /// Where the file was in the mount namespace's view, and that
+    /// namespace's record (for `IN_UNMOUNT`).
     pub ns_path: Vec<u8>,
+    pub mnt: Vec<u8>,
 }
 
 /// An instance.
@@ -82,6 +83,7 @@ impl Data for Registry {
             e.u64(w.ino);
             e.u32(w.mask);
             e.bytes(&w.ns_path);
+            e.bytes(&w.mnt);
         }
     }
 
@@ -95,7 +97,7 @@ impl Data for Registry {
                 next_wd: d.i32(),
             })
             .collect();
-        let n = d.count(40);
+        let n = d.count(48);
         let watches = (0..n)
             .map(|_| Watch {
                 inst: d.bytes(),
@@ -104,6 +106,7 @@ impl Data for Registry {
                 ino: d.u64(),
                 mask: d.u32(),
                 ns_path: d.bytes(),
+                mnt: d.bytes(),
             })
             .collect();
         Registry { instances, watches }
@@ -144,8 +147,7 @@ static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
 static MISSED: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+    crate::host::coarse_ms() + 1
 }
 
 fn registry_dir() -> Option<Vec<u8>> {
@@ -370,8 +372,7 @@ fn forget(inst: &[u8]) {
 fn sender(f: impl FnOnce(i32) -> Result<i32, i32>) -> Result<i32, i32> {
     static S: Mutex<(i32, i32)> = Mutex::new((-1, 0));
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if g.0 < 0 || g.1 != me {
         // SAFETY: plain host call; the socket is fwe's own.
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -655,20 +656,20 @@ pub fn deleted(s: &Subject) {
     drop_watches(|w| w.dev == s.dev && w.ino == s.ino, 0);
 }
 
-/// The mount at namespace path `point` is gone: the watches of what was
-/// in it hear `IN_UNMOUNT` and go.
-pub fn unmounted(point: &[u8]) {
+/// The mount at path `point` of the mount namespace whose record is `mnt`
+/// is gone: the watches of what was in it there hear `IN_UNMOUNT` and go
+/// (another namespace's mounts there are its own).
+pub fn unmounted(mnt: &[u8], point: &[u8]) {
     if !watching() {
         return;
     }
-    drop_watches(|w| crate::mounts::under(&w.ns_path, point).is_some(), IN_UNMOUNT);
+    drop_watches(|w| w.mnt == mnt && crate::mounts::under(&w.ns_path, point).is_some(), IN_UNMOUNT);
 }
 
 /// A cookie tying a move's two events together.
 pub fn cookie() -> u32 {
     static N: AtomicU32 = AtomicU32::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = crate::host::pid() as u32;
     (pid << 12) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 
@@ -1306,6 +1307,7 @@ impl<P: Platform> Kernel<P> {
             return r;
         }
         let ns_path = resolved.ns_path.clone().unwrap_or_default();
+        let mnt = self.fs().mount_ns().dir().to_vec();
         let kept = mask & (IN_ALL_EVENTS | IN_ONESHOT | IN_EXCL_UNLINK);
         let uid = self.creds.uid;
         let Some(r) = registry() else { return err(errno::ENOMEM) };
@@ -1335,6 +1337,7 @@ impl<P: Platform> Kernel<P> {
                 ino: s.ino,
                 mask: kept,
                 ns_path,
+                mnt,
             });
             Ok(wd)
         });
@@ -1451,6 +1454,7 @@ mod tests {
             ino: 5,
             mask: IN_OPEN,
             ns_path: b"/x".to_vec(),
+            mnt: b"/ns".to_vec(),
         });
         let mut e = Enc::new();
         r.encode(&mut e);

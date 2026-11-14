@@ -14,7 +14,9 @@ project's build, under fwe, natively on macOS and natively on Linux.
         into DIR), and natively with the host's clang. With the Linux
         results, a table of all three is printed (and appended to
         $GITHUB_STEP_SUMMARY). `--no-build` leaves the build out (Alpine's
-        programs run only in CI).
+        programs run only in CI). It fails when a figure of fwe's exceeds
+        its budget (BUDGETS) against macOS's, or for the build against
+        Linux's, which runs the same toolchain (AGAINST).
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -30,7 +32,7 @@ import sys
 import tempfile
 import time
 
-ROUNDS = 5
+ROUNDS = 9
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
 
@@ -106,6 +108,27 @@ MICRO = [
 ]
 
 
+# How many times native macOS's figure fwe's may be, on the same runner
+# (PLAN.md, "Native speed"): system calls 1.5x, the process and thread
+# calls and start-up 3x, a C build 1.5x.
+BUDGETS = {
+    "startup (ms)": 3.0,
+    "getpid (ns)": 1.5,
+    "getppid (ns)": 1.5,
+    "getppid, 3 threads (ns)": 1.5,
+    "fstat, 3 threads (ns)": 1.5,
+    "thread create+join (us)": 3.0,
+    "fork+exit+wait (us)": 3.0,
+    "fork+exec+wait (us)": 3.0,
+    "build Lua (s)": 1.5,
+}
+
+# The figures held to a budget against another than macOS's: the build,
+# against Linux's, which runs the same Alpine clang as fwe does (macOS's
+# is Apple's clang, another compiler, which says nothing of fwe).
+AGAINST = {"build Lua (s)": "Linux"}
+
+
 def best(f, rounds=ROUNDS):
     return min(f() for _ in range(rounds))
 
@@ -136,6 +159,38 @@ def micro(prefix, bench):
     return r
 
 
+def micro_pair(fwe, guest, native):
+    """The micro-benchmarks under fwe (`fwe` its command, `guest` the Linux
+    build) and natively (`native`), their rounds taken in turn: a runner's
+    load comes and goes, and so it falls on both alike."""
+    def pair(f, g, rounds=ROUNDS):
+        a, b = [], []
+        for _ in range(rounds):
+            a.append(f())
+            b.append(g())
+        return min(a), min(b)
+
+    runs = [("startup (ms)", lambda p, b: startup_ms_once(p + [b, "exit"]))]
+    for name, args, unit in MICRO:
+        runs.append((f"{name} ({unit})", lambda p, b, args=args: run_bench(p, b, args)))
+    # fork + exec of the benchmark itself (under fwe without a root, the
+    # guest sees host paths).
+    runs.append(
+        ("fork+exec+wait (us)", lambda p, b: run_bench(p, b, ["forkexec", "100", b]))
+    )
+    ours, theirs = {}, {}
+    for name, f in runs:
+        ours[name], theirs[name] = pair(lambda: f(fwe, guest), lambda: f([], native))
+    return ours, theirs
+
+
+def startup_ms_once(cmd, n=30):
+    start = time.perf_counter()
+    for _ in range(n):
+        subprocess.run(cmd, check=True)
+    return (time.perf_counter() - start) / n * 1e3
+
+
 def unpack_lua(tarball, into):
     subprocess.run(["tar", "-xzf", tarball, "-C", into], check=True)
     return os.path.join(into, "lua-5.4.7")
@@ -159,14 +214,15 @@ def checked(cmd, retrace=None):
 def lua_build_s(cmd_for, src, retrace=None):
     """Seconds to build Lua from clean with `cmd_for(make_args)`, best of
     three."""
+    return best(lambda: lua_build_once(cmd_for, retrace), 3)
 
-    def once():
-        checked(cmd_for(["clean"]))
-        start = time.perf_counter()
-        checked(cmd_for(["-j4", "posix", "CC=clang"]), retrace)
-        return time.perf_counter() - start
 
-    return best(once, 3)
+def lua_build_once(cmd_for, retrace=None):
+    """Seconds to build Lua from clean once with `cmd_for(make_args)`."""
+    checked(cmd_for(["clean"]))
+    start = time.perf_counter()
+    checked(cmd_for(["-j4", "posix", "CC=clang"]), retrace)
+    return time.perf_counter() - start
 
 
 def linux(a):
@@ -198,10 +254,13 @@ def linux(a):
 
 def macos(a):
     fwe = [a.fwe]
-    results = {
-        "fwe": micro(fwe, a.bench),
-        "macOS": micro([], a.native),
-    }
+    # Where a start's time goes (FWE_TIMING), for the log.
+    for args in (["exit"], ["forkexec", "2", a.bench]):
+        env = dict(os.environ, FWE_TIMING="1")
+        r = subprocess.run(fwe + [a.bench] + args, env=env, capture_output=True, text=True)
+        print(r.stderr, file=sys.stderr)
+    ours, theirs = micro_pair(fwe, a.bench, a.native)
+    results = {"fwe": ours, "macOS": theirs}
     if not a.no_build:
         build(a, fwe, results)
     if a.linux:
@@ -209,11 +268,33 @@ def macos(a):
             results["Linux"] = json.load(f)
     write(a.out, results)
     table = render(results)
+    over = over_budget(results)
+    if over:
+        table += "\n\nOver budget: " + ", ".join(over)
     print(table)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:
             f.write(table + "\n")
+    if over:
+        sys.exit("over budget: " + ", ".join(over))
+
+
+def over_budget(results):
+    """The benchmarks whose ratio to their reference (macOS, or AGAINST's)
+    exceeds its budget. A reference missing is a failure: the budget is
+    not shown to hold."""
+    over = []
+    for row, budget in BUDGETS.items():
+        against = AGAINST.get(row, "macOS")
+        fwe, ref = results["fwe"].get(row), results.get(against, {}).get(row)
+        if fwe is None:
+            continue
+        if not ref:
+            over.append(f"{row}: no {against} figure")
+        elif fwe / ref > budget:
+            over.append(f"{row} {fwe / ref:.1f}x > {budget}x against {against}")
+    return over
 
 
 def build(a, fwe, results):
@@ -240,7 +321,17 @@ def build(a, fwe, results):
         print(f"clang --version: {r.returncode}\n{(r.stdout + r.stderr)[-6000:]}", file=sys.stderr)
         return cmd[:i] + ["--strace", f"--strace-file={trace}"] + cmd[i:]
 
-    results["fwe"]["build Lua (s)"] = lua_build_s(lambda args: make + args, src, traced)
+    native = tempfile.mkdtemp()
+    native_src = unpack_lua(lua, native)
+    # Each round under fwe, then natively, three times: the runner's load
+    # falls on both alike.
+    ours, theirs = [], []
+    for _ in range(3):
+        ours.append(lua_build_once(lambda args: make + args, traced))
+        theirs.append(lua_build_once(lambda args: ["make", "-C", native_src] + args))
+    shutil.rmtree(native, ignore_errors=True)
+    results["fwe"]["build Lua (s)"] = min(ours)
+    results["macOS"]["build Lua (s)"] = min(theirs)
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
@@ -250,18 +341,15 @@ def build(a, fwe, results):
     )
     if out.stdout.strip() != "42":
         sys.exit(f"the Lua fwe built printed {out.stdout!r}")
-    native = tempfile.mkdtemp()
-    native_src = unpack_lua(lua, native)
-    results["macOS"]["build Lua (s)"] = lua_build_s(
-        lambda args: ["make", "-C", native_src] + args, native_src
-    )
-    shutil.rmtree(native, ignore_errors=True)
 
 
 def render(results):
     cols = [c for c in ("fwe", "macOS", "Linux") if c in results]
     rows = list(results["fwe"].keys())
-    lines = ["| benchmark | " + " | ".join(cols) + " | fwe / macOS |", "|---" * (len(cols) + 2) + "|"]
+    lines = [
+        "| benchmark | " + " | ".join(cols) + " | fwe / macOS | budget |",
+        "|---" * (len(cols) + 3) + "|",
+    ]
     for row in rows:
         vals = [results[c].get(row) for c in cols]
         ratio = (
@@ -270,7 +358,11 @@ def render(results):
             else ""
         )
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
-        lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} |")
+        budget = f"{BUDGETS[row]}x" if row in BUDGETS else ""
+        if row in AGAINST and results.get(AGAINST[row], {}).get(row):
+            r = results["fwe"][row] / results[AGAINST[row]][row]
+            budget += f" ({r:.1f}x against {AGAINST[row]})"
+        lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} | {budget} |")
     return "\n".join(lines)
 
 

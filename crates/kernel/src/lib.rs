@@ -45,6 +45,7 @@ mod keytypes;
 pub mod klock;
 pub mod landlock;
 mod landlockops;
+pub mod lazycode;
 pub mod leases;
 pub mod loopdev;
 pub mod maps;
@@ -70,10 +71,12 @@ pub mod pidfd;
 pub mod pidns;
 pub mod pipelock;
 pub mod posixtimer;
+pub mod prepcache;
 pub mod procfs;
 pub mod procmem;
 pub mod procpid;
 pub mod procreg;
+pub mod procstore;
 pub mod procvm;
 pub mod ptrace;
 pub mod pty;
@@ -101,6 +104,7 @@ pub mod term;
 pub mod textbusy;
 pub mod thread;
 pub mod threadfs;
+pub mod timing;
 pub mod tmpfile;
 pub mod tmpfs;
 pub mod trace;
@@ -183,11 +187,14 @@ pub trait Platform {
     /// The memory is readable and writable when this is called; the kernel
     /// applies the final protections afterwards. A failure carries the
     /// Linux errno for the guest and why, for the trace.
+    /// `cache`, when given, is the key ([`prepcache::code_key`]) under
+    /// which what the preparation finds is kept and found again.
     fn prepare_exec(
         &mut self,
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<(), PrepareFailed>;
 
     /// Terminate the whole process with `code` as its exit status
@@ -306,6 +313,8 @@ impl<P: Platform> Kernel<P> {
         // one process making many kernels while others wait.)
         #[cfg(not(test))]
         futex::process_started();
+        // The process records, mapped before a signal handler reads them.
+        procstore::init();
         // The guest's umask is fwe's to apply: the host's would take more
         // bits off what the guest asked for.
         #[cfg(not(test))]
@@ -623,9 +632,56 @@ impl<P: Platform> Kernel<P> {
     /// regular file whose bits let it (`EACCES`; root needs one execute
     /// bit set), and that no process has open for writing (`ETXTBSY`).
     /// What running it grants ([`ExecPrivs`]) is noted for the exec.
+    /// The program file at `path`, which the caller may run
+    /// ([`Kernel::may_exec`]): its contents, read through the one
+    /// descriptor its checks were made on (`None` with no filesystem).
+    fn exec_file(&self, path: &[u8]) -> Result<Option<ExecFile>, i32> {
+        use fwe_abi::{errno, fcntl};
+        use std::os::fd::FromRawFd;
+        let Some(fs) = self.fs_opt() else {
+            self.may_exec(path)?;
+            return Ok(None);
+        };
+        // fwe's own files (`/proc/self/exe`, `/dev/fd/N`): through them.
+        if fs.synthetic(fcntl::AT_FDCWD as i32, path).is_some() {
+            self.may_exec(path)?;
+            return fs.read_identified(path).map(Some);
+        }
+        EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
+        if landlock::active() {
+            self.landlock_exec(path)?;
+        }
+        let r = fs.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        let name = r.name_c()?;
+        // Not waiting for a writer, should it be a FIFO (refused below).
+        // SAFETY: a NUL-terminated name in a live directory; the result is
+        // checked and owned.
+        let fd = unsafe {
+            libc::openat(
+                r.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        // SAFETY: a fresh descriptor this owns.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let st = fs::guest_stat(fd.as_raw_fd()).ok_or(errno::EACCES)?;
+        self.exec_checks(&st, &r, &name)?;
+        let id = prepcache::FileId::of_fd(fd.as_raw_fd());
+        fs::read_all_fd(fd.as_raw_fd()).map(|d| Some((d, id)))
+    }
+
+    /// The program the last [`Kernel::exec_target`] found at `path`, read.
+    pub fn take_exec_file(&self, path: &[u8]) -> Option<ExecFile> {
+        EXEC_FILE.with(|f| f.borrow_mut().take()).filter(|(p, _)| p == path).map(|(_, d)| d)
+    }
+
     pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
         EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
-        use fwe_abi::{errno, fcntl};
+        use fwe_abi::fcntl;
         if landlock::active() {
             self.landlock_exec(path)?;
         }
@@ -634,32 +690,45 @@ impl<P: Platform> Kernel<P> {
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
         {
-            // Not a regular file, not to be run by the caller, or on a
-            // `noexec` mount, before any writer is looked for.
-            if st.st_mode & libc::S_IFMT != libc::S_IFREG
-                || !self.permits(&st, 1)
-                || r.mount_flags & mounts::ms::NOEXEC != 0
-            {
-                return Err(errno::EACCES);
-            }
-            // Not a file open for writing.
-            if host_file_busy(&st) {
-                return Err(errno::ETXTBSY);
-            }
-            // What it grants, unless a `nosuid` mount, `no_new_privs` or a
-            // tracer says it grants nothing, as on Linux.
-            let gains = r.mount_flags & mounts::ms::NOSUID == 0
-                && !syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-                && !ptrace::traced();
-            if gains {
-                let privs = ExecPrivs {
-                    uid: (st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
-                    gid: (st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
-                        .then_some(st.st_gid),
-                    caps: file_caps(r.dir.as_raw_fd(), &name),
-                };
-                EXEC_PRIVS.with(|p| p.set(privs));
-            }
+            self.exec_checks(&st, &r, &name)?;
+        }
+        Ok(())
+    }
+
+    /// [`Kernel::may_exec`]'s checks of the file `name` in `r`'s directory,
+    /// whose guest status is `st`, noting what it grants.
+    fn exec_checks(
+        &self,
+        st: &libc::stat,
+        r: &fs::Resolved,
+        name: &std::ffi::CStr,
+    ) -> Result<(), i32> {
+        use fwe_abi::errno;
+        // Not a regular file, not to be run by the caller, or on a
+        // `noexec` mount, before any writer is looked for.
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG
+            || !self.permits(st, 1)
+            || r.mount_flags & mounts::ms::NOEXEC != 0
+        {
+            return Err(errno::EACCES);
+        }
+        // Not a file open for writing.
+        if host_file_busy(st) {
+            return Err(errno::ETXTBSY);
+        }
+        // What it grants, unless a `nosuid` mount, `no_new_privs` or a
+        // tracer says it grants nothing, as on Linux.
+        let gains = r.mount_flags & mounts::ms::NOSUID == 0
+            && !syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
+            && !ptrace::traced();
+        if gains {
+            let privs = ExecPrivs {
+                uid: (st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
+                gid: (st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
+                    .then_some(st.st_gid),
+                caps: file_caps(r.dir.as_raw_fd(), name),
+            };
+            EXEC_PRIVS.with(|p| p.set(privs));
         }
         Ok(())
     }
@@ -678,10 +747,13 @@ impl<P: Platform> Kernel<P> {
         args: Vec<Vec<u8>>,
     ) -> Result<(Vec<u8>, Vec<Vec<u8>>), i32> {
         let (mut path, mut args) = (path, args);
+        EXEC_FILE.with(|f| f.borrow_mut().take());
         for _ in 0..5 {
-            self.may_exec(&path)?;
-            let Some(fs) = self.fs_opt() else { return Ok((path, args)) };
-            let Some((interp, arg)) = script_interpreter(&fs.read_head(&path, 256)?)? else {
+            let Some(data) = self.exec_file(&path)? else { return Ok((path, args)) };
+            let head = &data.0[..data.0.len().min(256)];
+            let Some((interp, arg)) = script_interpreter(head)? else {
+                // Kept for the loader ([`Kernel::take_exec_file`]).
+                EXEC_FILE.with(|f| *f.borrow_mut() = Some((path.clone(), data)));
                 return Ok((path, args));
             };
             let mut new = vec![interp.clone()];
@@ -972,6 +1044,22 @@ pub fn thread_exit_cleanup() {
     }
 }
 
+/// The calling host thread, whose guest thread ended, is to run another
+/// one (the backend keeps host threads for reuse): every per-thread state
+/// of the kernel's is as a new host thread's.
+pub fn thread_reused() {
+    thread::thread_reused();
+    fs::thread_reused();
+    netns::thread_reused();
+    sysvipc::thread_reused();
+    threadfs::thread_reused();
+    ptrace::thread_reused();
+    uaccess::thread_reused();
+    mounts::store::thread_reused();
+    EXEC_FILE.with(|f| f.borrow_mut().take());
+    EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
+}
+
 /// Release every thread's robust futexes (`set_robust_list`) as the
 /// process ends or runs another program, its memory still there: Linux
 /// releases each thread's as the thread ends.
@@ -1014,6 +1102,17 @@ impl ExecPrivs {
         let c = caps::FileCaps { permitted: d.u64(), inheritable: d.u64(), effective: d.bool() };
         ExecPrivs { uid, gid, caps: has.then_some(c) }
     }
+}
+
+/// A program file read to be run, and its identity
+/// ([`prepcache::FileId`]).
+pub type ExecFile = (Vec<u8>, Option<prepcache::FileId>);
+
+thread_local! {
+    /// The program file [`Kernel::exec_target`] read, by its path, for the
+    /// loader to take.
+    static EXEC_FILE: std::cell::RefCell<Option<(Vec<u8>, ExecFile)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 thread_local! {

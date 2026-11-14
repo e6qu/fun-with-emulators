@@ -78,8 +78,7 @@ fn table() -> Option<&'static [AtomicU64]> {
 }
 
 fn me() -> u64 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() as u64 }
+    crate::host::pid() as u64
 }
 
 /// Whether host process `pid` is there.

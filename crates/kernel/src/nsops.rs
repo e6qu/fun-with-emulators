@@ -72,6 +72,9 @@ pub struct ForkNs {
     /// `CLONE_PIDFD`: the descriptor made ready for the child, and where it
     /// goes.
     pidfd: Option<(i32, u64)>,
+    /// What the parent alone would know of the child's record, for a child
+    /// that writes its whole record itself ([`Kernel::fork_child_writes`]).
+    child_writes: Option<crate::procreg::FromParent>,
 }
 
 impl<P: Platform> Kernel<P> {
@@ -299,10 +302,9 @@ impl<P: Platform> Kernel<P> {
         // Taken while this process's own pid namespaces are current.
         let mut line = crate::procreg::child_line();
         if flags & fwe_abi::clone::CLONE_PARENT != 0
-            && crate::pidns::current().first().is_some_and(|ns| {
-                // SAFETY: getpid cannot fail.
-                ns.get().number_of(unsafe { libc::getpid() }) == Some(1)
-            })
+            && crate::pidns::current()
+                .first()
+                .is_some_and(|ns| ns.get().number_of(crate::host::pid()) == Some(1))
         {
             // A pid namespace's init has no parent in its namespace to give.
             return Err(errno::EINVAL);
@@ -385,12 +387,21 @@ impl<P: Platform> Kernel<P> {
             files: flags & fwe_abi::clone::CLONE_FILES != 0,
             exit_signal,
             pidfd: None,
+            child_writes: None,
         })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
     /// pid, or negative if it failed): back to its own namespaces. Returns
     /// the child's pid as the parent sees it.
+    /// For a fork whose child runs [`Kernel::fork_child`]: the child writes
+    /// its whole record as it starts, with what this process knows of it,
+    /// and this process writes none (a look at the child's record waits
+    /// for it, [`crate::procreg::read`]).
+    pub fn fork_child_writes(t: &mut ForkNs) {
+        t.child_writes = Some(crate::procreg::FromParent::of(t.cgroup.as_deref()));
+    }
+
     pub fn fork_parent(&mut self, t: ForkNs, child: i32) -> i32 {
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(caps) = t.caps {
@@ -401,7 +412,7 @@ impl<P: Platform> Kernel<P> {
             fs.set_mount_ns(mnt);
             fs.ns = ns;
         }
-        if child > 0 {
+        if child > 0 && t.child_writes.is_none() {
             // It starts in this process's cgroup, in its namespaces.
             crate::procreg::forked(
                 child,
@@ -412,6 +423,11 @@ impl<P: Platform> Kernel<P> {
                 t.cgroup.as_deref(),
             );
             // It holds this process's session keyring.
+        }
+        if child > 0 && t.child_writes.is_some() {
+            crate::procreg::child_writes_own(child);
+        }
+        if child > 0 {
             crate::keys::forked(child);
             crate::reaper::set_exit_signal(child, t.exit_signal);
             if let Some((fd, at)) = t.pidfd {
@@ -448,8 +464,7 @@ impl<P: Platform> Kernel<P> {
         self.adopt_thread_view();
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
-        // SAFETY: getpid cannot fail.
-        pidns::set_host(&t.chain, &t.nums, unsafe { libc::getpid() });
+        pidns::set_host(&t.chain, &t.nums, crate::host::pid());
         pidns::set_current(t.chain);
         if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
@@ -458,14 +473,29 @@ impl<P: Platform> Kernel<P> {
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
         let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
-        crate::procreg::own_line(&t.line, &t.inherit, t.dirs.clone(), crate::maps::forked(), &auxv);
+        match &t.child_writes {
+            Some(from) => crate::procreg::own_whole(
+                &t.line,
+                &t.inherit,
+                t.dirs.clone(),
+                crate::maps::forked(),
+                &auxv,
+                from,
+            ),
+            None => crate::procreg::own_line(
+                &t.line,
+                &t.inherit,
+                t.dirs.clone(),
+                crate::maps::forked(),
+                &auxv,
+            ),
+        }
         if t.inherit.foster {
             crate::reaper::foster_started(&t.line.0);
         }
         if let Some(cg) = &t.cgroup {
             // Where it starts, should it look before the parent writes it.
-            // SAFETY: getpid cannot fail.
-            let _ = crate::procreg::set_cgroup(unsafe { libc::getpid() }, cg);
+            let _ = crate::procreg::set_cgroup(crate::host::pid(), cg);
         }
         if t.clear_sighand {
             self.clear_handlers();
@@ -475,8 +505,7 @@ impl<P: Platform> Kernel<P> {
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
-        // SAFETY: getpid cannot fail.
-        t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
+        t.nums.first().copied().unwrap_or_else(crate::host::pid)
     }
 
     /// `CLONE_CLEAR_SIGHAND`: every handler back to the default action (an

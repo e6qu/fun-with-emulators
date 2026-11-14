@@ -22,7 +22,6 @@
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a mapping is named by in the listing.
@@ -566,24 +565,21 @@ impl Published {
     }
 }
 
-/// The shared file this process publishes its mappings in: other
-/// processes read it for `/proc/<pid>/maps`. It holds a sequence word
-/// (odd while a change is written), the length of what follows, and the
-/// encoded [`Published`].
-pub(crate) struct Outbox {
-    pid: i32,
-    fd: i32,
-    map: *mut u8,
-    cap: usize,
+/// The process is ending: its mappings are published no more.
+static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The process is ending: its published mappings go, and are published no
+/// more.
+pub fn close_for_exit() {
+    ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    crate::procstore::put_own(crate::procstore::Kind::Maps, None);
 }
 
-// SAFETY: the mapping is this process's own, used under `OUTBOX`'s lock.
-unsafe impl Send for Outbox {}
-
-pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
-
-/// The header before the encoded record: the sequence word and the length.
-const HEADER: usize = 16;
+/// Taken while this process publishes its mappings (its threads take
+/// turns): other processes read them from its entry in the process store
+/// ([`crate::procstore`]) for `/proc/<pid>/maps`.
+pub(crate) static OUTBOX: Mutex<()> = Mutex::new(());
 
 /// This process's mappings encoded as [`publish`] publishes them.
 pub fn snapshot() -> Vec<u8> {
@@ -607,27 +603,10 @@ pub fn snapshot() -> Vec<u8> {
     e.into_bytes()
 }
 
-/// Let go of the parent's file a fork child inherited.
-fn drop_inherited(out: &mut Option<Outbox>) {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    if let Some(o) = out.as_ref()
-        && o.pid != me
-    {
-        // SAFETY: the mapping and descriptor are this process's copies.
-        unsafe {
-            libc::munmap(o.map.cast(), o.cap);
-            libc::close(o.fd);
-        }
-        *out = None;
-    }
-}
-
 /// In a fork child: its mappings, which are its parent's, for the record
-/// it writes as it starts (see [`crate::procreg::own_line`]). It makes a
-/// file of its own only once they change, so a fork costs no file.
+/// it writes as it starts (see [`crate::procreg::own_line`]). It publishes
+/// its own only once they change.
 pub fn forked() -> Vec<u8> {
-    drop_inherited(&mut OUTBOX.lock().unwrap_or_else(|e| e.into_inner()));
     snapshot()
 }
 
@@ -675,71 +654,17 @@ pub fn flush() {
 
 /// Publish this process's mappings for other processes to read now.
 pub fn publish_now() {
-    let body = snapshot();
-    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    drop_inherited(&mut out);
-    if out.is_none() {
-        let Some(path) = crate::procreg::maps_path(me) else { return };
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return;
-        }
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *out = Some(Outbox { pid: me, fd, map: std::ptr::null_mut(), cap: 0 });
+    // After when the process started: a reader tells them from an earlier
+    // process's of the same pid that was killed before it could take its
+    // own away.
+    let me = crate::host::pid();
+    let mut body = crate::procreg::start_time(me).unwrap_or(0).to_le_bytes().to_vec();
+    body.extend(snapshot());
+    let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    if ENDED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
-    let Some(o) = out.as_mut() else { return };
-    let need = HEADER + body.len();
-    if need > o.cap {
-        let cap = need.next_power_of_two().max(1 << 16);
-        // SAFETY: fwe's own file; growing it keeps what it holds.
-        if unsafe { libc::ftruncate(o.fd, cap as libc::off_t) } != 0 {
-            return;
-        }
-        // SAFETY: a fresh shared mapping of the whole file.
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                cap,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                o.fd,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            return;
-        }
-        if !o.map.is_null() {
-            // SAFETY: the old mapping, replaced by the new one.
-            unsafe { libc::munmap(o.map.cast(), o.cap) };
-        }
-        o.map = map.cast();
-        o.cap = cap;
-    }
-    use std::sync::atomic::{AtomicU64, Ordering, fence};
-    // SAFETY: the mapping is `cap` bytes, at least `need`, page-aligned
-    // (so the words are aligned), and only this process writes it.
-    unsafe {
-        let seq = &*(o.map as *const AtomicU64);
-        let len = &*(o.map.add(8) as *const AtomicU64);
-        let s = seq.load(Ordering::Relaxed);
-        seq.store(s | 1, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        std::ptr::copy_nonoverlapping(body.as_ptr(), o.map.add(HEADER), body.len());
-        len.store(body.len() as u64, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        seq.store((s | 1) + 1, Ordering::Release);
-    }
+    crate::procstore::put_own(crate::procstore::Kind::Maps, Some(&body));
 }
 
 /// What [`snapshot`] encoded.
@@ -758,31 +683,18 @@ fn decode_published(body: &[u8]) -> Option<Published> {
 /// The mappings host process `pid` published, if it is a process of
 /// fwe's that has.
 pub fn of_process(pid: i32) -> Option<Published> {
-    use std::os::unix::fs::FileExt;
-    let path = crate::procreg::maps_path(pid)?;
-    let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)) else {
-        // None published yet: what it was forked with.
-        let r = crate::procreg::read(pid)?;
-        return (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten();
-    };
-    let word = |at: u64| -> Option<u64> {
-        let mut b = [0u8; 8];
-        file.read_exact_at(&mut b, at).ok()?;
-        Some(u64::from_ne_bytes(b))
-    };
-    // A consistent copy: the same even sequence word before and after.
-    for _ in 0..1000 {
-        let before = word(0)?;
-        if before & 1 == 0 {
-            let len = word(8)? as usize;
-            let mut body = vec![0u8; len];
-            if file.read_exact_at(&mut body, HEADER as u64).is_ok() && word(0)? == before {
-                return decode_published(&body);
-            }
+    let published = crate::procstore::get_of(crate::procstore::Kind::Maps, pid).filter(|b| {
+        b.get(..8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+            == crate::procreg::start_time(pid)
+    });
+    match published {
+        Some(body) => decode_published(&body[8..]),
+        None => {
+            // None published yet: what it was forked with.
+            let r = crate::procreg::read(pid)?;
+            (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten()
         }
-        std::thread::yield_now();
     }
-    None
 }
 
 /// What the listing shows of each mapping beyond its line (`smaps`).

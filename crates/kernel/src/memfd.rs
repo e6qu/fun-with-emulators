@@ -286,8 +286,7 @@ mod imp {
     fn fresh_path(what: &str) -> Result<std::ffi::CString, i32> {
         static N: AtomicU64 = AtomicU64::new(0);
         let mut path = crate::fs::shm::user_dir()?;
-        // SAFETY: getpid cannot fail.
-        let pid = unsafe { libc::getpid() };
+        let pid = crate::host::pid();
         let n = N.fetch_add(1, Ordering::Relaxed);
         path.extend_from_slice(format!("/{what}-{pid}-{n}").as_bytes());
         std::ffi::CString::new(path).map_err(|_| errno::EINVAL)

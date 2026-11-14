@@ -43,8 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::SeqCst};
 
 /// The host pid of this process.
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 /// The processes that would adopt one with line of ancestors `lineage`

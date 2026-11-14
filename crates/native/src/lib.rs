@@ -7,6 +7,8 @@ mod gate;
 pub mod hv;
 pub mod hwcap;
 pub mod loader;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod pool;
 pub mod prepare;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod process;
@@ -15,6 +17,8 @@ mod quiesce;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod stacks;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod threads;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod trap;
@@ -22,17 +26,44 @@ mod trap;
 /// Live guest threads, so the last one to exit ends the process.
 static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// `FWE_TIMING`'s mark as the process ends, with how many code pages were
+/// written as they first ran.
+fn mark_exit() {
+    fwe_kernel::timing::mark("exit");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    prepare::keep_hot();
+    if fwe_kernel::timing::on() {
+        let pages = fwe_kernel::lazycode::written();
+        fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
+    }
+}
+
 /// End the calling guest thread: the last thread ends the process, any other
-/// ends just its host thread. Must be called without the kernel lock held,
-/// since `pthread_exit` does not return and would never release it.
-pub(crate) fn exit_current_thread(code: i32) -> ! {
+/// ends just its host thread, or, from the system-call gate (`from_gate`),
+/// leaves it to run the next thread ([`threads::wait_for_next`]). Must be
+/// called without the kernel lock held, since neither returns and the lock
+/// would never be released.
+pub(crate) fn exit_current_thread(code: i32, from_gate: bool) -> ! {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = from_gate;
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
+        fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    quiesce::forget_current();
+    {
+        quiesce::forget_current();
+        if from_gate {
+            threads::wait_for_next();
+        }
+        // Its stacks, for a thread that starts once this one has gone.
+        if let (Some(gate), Some(alt)) = (gate::block_mapping(), trap::altstack_mapping()) {
+            stacks::give(gate, alt);
+        }
+    }
     // SAFETY: ends the calling host thread; the process keeps running.
     unsafe { libc::pthread_exit(std::ptr::null_mut()) }
 }
@@ -69,12 +100,13 @@ impl NativePlatform {
         len: u64,
         arena: Option<&mut prepare::StubArena>,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
         unsafe {
             let (tp, x18, page) = (self.tp_slot, self.x18_slot, self.page_size);
-            prepare::prepare(addr, len, tp, x18, page, arena, known)
+            prepare::prepare(addr, len, (tp, x18), page, arena, known, cache)
         }
     }
 }
@@ -97,21 +129,23 @@ impl Platform for NativePlatform {
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<(), fwe_kernel::PrepareFailed> {
-        self.prepare(addr, len, None, known).map(|_| ()).map_err(|e| fwe_kernel::PrepareFailed {
-            errno: fwe_abi::errno::ENOMEM,
-            why: e.to_string(),
+        self.prepare(addr, len, None, known, cache).map(|_| ()).map_err(|e| {
+            fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
         })
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
+        fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
 
     fn exit_thread(&mut self, code: i32) -> ! {
-        exit_current_thread(code)
+        exit_current_thread(code, false)
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
@@ -250,9 +284,14 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
 /// host path inside the rootfs is read as the guest's path, so that a
 /// symbolic link there resolves in the rootfs (Alpine's `/bin/sh` links to
 /// `/bin/busybox`, which on the host is no file).
-fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<Vec<u8>, Error> {
-    let in_guest =
-        |p: &[u8]| fs.read(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)));
+fn read_program(
+    path: &Path,
+    options: &Options,
+    fs: &fwe_kernel::Fs,
+) -> Result<fwe_kernel::ExecFile, Error> {
+    let in_guest = |p: &[u8]| {
+        fs.read_identified(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+    };
     if options.exe_fd.is_some() {
         in_guest(b"/proc/self/exe")
     } else if options.guest_path {
@@ -260,7 +299,12 @@ fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<V
     } else if let Some(guest) = guest_path_in_root(path, options) {
         in_guest(&guest)
     } else {
-        std::fs::read(path).map_err(Error::Read)
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::File::open(path).map_err(Error::Read)?;
+        let mut data = Vec::new();
+        f.read_to_end(&mut data).map_err(Error::Read)?;
+        Ok((data, fwe_kernel::prepcache::FileId::of_fd(f.as_raw_fd())))
     }
 }
 
@@ -701,7 +745,6 @@ fn x18_survives_kernel_entry() -> bool {
     x18_survives(true)
 }
 
-/// Diagnostic probes of host behaviour, run one per process with
 /// `fwe --probe <name>`. Prints the result; a crash identifies the step.
 pub fn probe(name: &str) -> Result<String, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -732,6 +775,16 @@ pub fn probe(name: &str) -> Result<String, String> {
         .map(|_| "waited in mode".into()),
         // Creates a VM unless under --hv-standin (see hv::probe).
         "hv-map-rules" => hv::map_rules_probe(),
+        // What a host `getppid` costs in this process: nanoseconds per call.
+        "host-getppid" => {
+            let n = 1_000_000;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                // SAFETY: plain host call.
+                std::hint::black_box(unsafe { libc::getppid() });
+            }
+            Ok(format!("{:.1} ns", t.elapsed().as_nanos() as f64 / n as f64))
+        }
         _ => Err(format!("unknown probe {name}")),
     }
 }
@@ -877,7 +930,7 @@ pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
 /// `execve`. Does not touch the kernel; the caller installs or updates it.
 #[allow(clippy::too_many_arguments)]
 pub fn load_image(
-    file: &[u8],
+    (file, file_id): (&[u8], Option<fwe_kernel::prepcache::FileId>),
     execfn: &[u8],
     args: &[&[u8]],
     env: &[&[u8]],
@@ -890,9 +943,10 @@ pub fn load_image(
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
-    let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
-        loader::load(elf, page, |a, l, known, arena| {
-            let stats = platform.prepare(a, l, Some(arena), known).map_err(|e| e.to_string())?;
+    let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
+        loader::load(elf, page, id, |a, l, known, arena, cache| {
+            let stats =
+                platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
                 tracer.note(&format!(
                     "prepared {what} {a:#x}+{l:#x}: {} system calls, {} stubs, \
@@ -905,7 +959,7 @@ pub fn load_image(
         .map_err(Error::Load)
     };
 
-    let loaded = load_object(&elf, "exe")?;
+    let loaded = load_object(&elf, file_id, "exe")?;
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
@@ -921,7 +975,7 @@ pub fn load_image(
     // libraries itself through our mmap and openat.
     let interp = match &interp_path {
         Some(ip) => {
-            let idata = fs.read(ip).map_err(|e| {
+            let (idata, iid) = fs.read_identified(ip).map_err(|e| {
                 Error::Unsupported(format!(
                     "loading the dynamic linker {}: errno {e}",
                     String::from_utf8_lossy(ip)
@@ -933,7 +987,7 @@ pub fn load_image(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            let placed = load_object(&ielf, "interp")?;
+            let placed = load_object(&ielf, iid, "interp")?;
             let name = fwe_kernel::maps::Name::Path(ip.as_slice().into());
             fwe_kernel::maps::record().loaded(
                 &ielf,
@@ -1027,15 +1081,19 @@ fn start(
     }
     // fwe's own descriptors go above the guest's range from here on.
     fwe_kernel::fdtable::init();
+    fwe_kernel::timing::mark("main");
     if options.exec_state.is_none() {
         // A fresh start: what earlier runs left behind and no process holds
         // goes (see `fwe_kernel::shared::collect`).
         fwe_kernel::shared::collect();
     }
     let args = &guest_args(args, options);
+    fwe_kernel::timing::mark("collect");
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
-    let data = read_program(path, options, &fs)?;
+    fwe_kernel::timing::mark("open_fs");
+    let (data, data_id) = read_program(path, options, &fs)?;
+    fwe_kernel::timing::mark("read_program");
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1054,7 +1112,7 @@ fn start(
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
     let out = load_image(
-        &data,
+        (&data, data_id),
         &guest_execfn(path, options),
         &arg_bytes,
         &env_bytes,
@@ -1063,9 +1121,11 @@ fn start(
         page,
         options.strace,
     )?;
+    fwe_kernel::timing::mark("load_image");
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(page)?;
+    fwe_kernel::timing::mark("trampoline");
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
@@ -1077,6 +1137,7 @@ fn start(
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
     });
+    fwe_kernel::timing::mark("published");
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();
 
@@ -1084,6 +1145,7 @@ fn start(
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
     apply_exec_state(&mut kernel, options, path)?;
     *KERNEL.lock() = Some(kernel);
+    fwe_kernel::timing::mark("kernel");
     enter(out.sp, out.entry)
 }
 

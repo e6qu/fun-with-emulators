@@ -536,8 +536,7 @@ fn prog_fd(bytes: &[u8], id: u32, ty: u32) -> Result<i32, i32> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let mut path = crate::fs::shm::user_dir()?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     path.extend_from_slice(format!("/bpf-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes());
     let p = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
     // SAFETY: a NUL-terminated path in fwe's private directory.
@@ -617,8 +616,7 @@ fn fresh_id() -> u32 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = crate::host::pid() as u32;
     ((now ^ pid.rotate_left(16) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_mul(2654435761))
         & 0x7fff_ffff)
         .max(1)
@@ -669,8 +667,7 @@ static ANY_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// `setsockopt(fd, SOL_SOCKET, SO_ATTACH_BPF)` with program `prog`, or
 /// `SO_DETACH_BPF` (`prog` `None`).
 pub fn attach_socket(fd: i32, prog: Option<i32>) -> Result<(), i32> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let so = crate::procpid::socket_id(me, fd).ok_or(errno::ENOTSOCK)?;
     let mut f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(prog) = prog else {
@@ -703,8 +700,7 @@ pub fn filter_send(fd: i32, len: u64) -> Option<u64> {
     if !ANY_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let peer = crate::procpid::socket_peer(me, fd)?;
     let f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
     let (_, prog, maps) = f.iter().find(|e| e.0 == peer)?;

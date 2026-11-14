@@ -247,8 +247,7 @@ fn inbox_name(pid: i32) -> String {
 }
 
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 fn alive(pid: i32) -> bool {
@@ -313,7 +312,8 @@ fn set_traced(on: bool) {
 
 /// Whether this thread stops at each system call's entry and exit.
 pub fn stops_at_syscalls() -> bool {
-    traced() && SYSCALLS.with(std::cell::Cell::get)
+    // Nothing traced in the process: no look at this thread's state.
+    any_traced() && traced() && SYSCALLS.with(std::cell::Cell::get)
 }
 
 /// What names this thread's mailbox: the process's host pid for its main
@@ -956,6 +956,16 @@ std::thread_local! {
     /// they replaced.
     static STEPS: std::cell::RefCell<Vec<(u64, [u8; 4])>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    TRACED.with(|t| t.set(false));
+    TRACER.with(|t| t.set(0));
+    SYSCALLS.with(|t| t.set(false));
+    NEW_THREAD.with(|t| t.set(None));
+    NOTED.with(|t| t.set(None));
+    STEPS.with(|s| s.borrow_mut().clear());
 }
 
 /// Where the instruction `insn` at `pc` may go next, with registers `x`.

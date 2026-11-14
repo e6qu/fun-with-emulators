@@ -322,8 +322,7 @@ pub struct Caller {
 
 /// This process's identity: host pid and start time.
 fn me() -> (i32, u64) {
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     (pid, crate::procreg::host_info(pid).map_or(0, |i| i.0))
 }
 
@@ -352,8 +351,7 @@ impl Store {
         if let Some(h) = self.holders.iter().find(|h| h.pid == c.pid && h.start == c.start) {
             return Some(std::borrow::Cow::Borrowed(h));
         }
-        // SAFETY: getpid cannot fail.
-        if c.pid != unsafe { libc::getpid() } {
+        if c.pid != crate::host::pid() {
             return None;
         }
         match *INHERIT.lock().unwrap_or_else(|e| e.into_inner()) {

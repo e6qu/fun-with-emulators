@@ -55,9 +55,10 @@ pub fn init_main(pid: i32) {
     // process's own.
     NEXT_TID.store(TID_FIRST + (pid % 40) * 100_000, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
-    // An end status left by an earlier process of this number.
-    // SAFETY: getpid cannot fail.
-    crate::procreg::forget_end(unsafe { libc::getpid() });
+    // An end status and a thread list left by an earlier process of this
+    // number.
+    crate::procreg::forget_end(crate::host::pid());
+    forget_published();
     // The calling thread's own set goes with the registry: what landed in
     // it is moved to the process's, and a handler meanwhile posts there.
     let early: Vec<(u64, SigInfo)> = with_own(|p| {
@@ -65,7 +66,7 @@ pub fn init_main(pid: i32) {
             .flat_map(|s| std::iter::from_fn(move || p.take(s)).map(move |i| (s, i)))
             .collect()
     });
-    OWN.with(|o| o.set(std::ptr::null()));
+    HOT.with(|h| h.own.set(std::ptr::null()));
     for (s, i) in early {
         PROCESS.post(s, i);
     }
@@ -384,8 +385,7 @@ static SLACK_HANDOFF: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 /// This thread's timer slack (`PR_GET_TIMERSLACK`).
 pub fn slack() -> u64 {
     if tid() == tgid() {
-        // SAFETY: getpid cannot fail.
-        crate::procreg::slack(unsafe { libc::getpid() }).0
+        crate::procreg::slack(crate::host::pid()).0
     } else {
         SLACK.with(Cell::get).0
     }
@@ -395,8 +395,7 @@ pub fn slack() -> u64 {
 /// default).
 pub fn set_slack(value: u64) {
     if tid() == tgid() {
-        // SAFETY: getpid cannot fail.
-        let _ = crate::procreg::set_slack(unsafe { libc::getpid() }, value);
+        let _ = crate::procreg::set_slack(crate::host::pid(), value);
     } else {
         SLACK.with(|s| {
             let (_, default) = s.get();
@@ -420,11 +419,11 @@ const TID_END: i32 = 4_194_304;
 /// A thread id outside a pid namespace of fwe's: the next of a counter
 /// every fwe process shares (a file beside the process records, taken in
 /// turn with `flock`), so no two live threads have the same one. They are
-/// taken [`TID_BLOCK`] at a time, each marked this process's, with no
-/// robust list, and given out from the block.
+/// taken [`TID_BLOCK`] at a time, the block marked this process's, and
+/// given out from the block (a slot of the robust lists' file is a thread's
+/// only once it is written after the process started).
 fn shared_tid() -> Option<i32> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
     // A fork child's block is its parent's.
     if block.0 == me && block.1 < block.2 {
@@ -432,7 +431,7 @@ fn shared_tid() -> Option<i32> {
         return Some(block.1 - 1);
     }
     let dir = crate::procreg::records_dir()?;
-    let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
+    let path = std::ffi::CString::new([&dir[..], b"/tid-blocks"].concat()).ok()?;
     // SAFETY: a NUL-terminated path in fwe's private directory; buffers of
     // the sizes given; the descriptor is closed below.
     unsafe {
@@ -452,11 +451,8 @@ fn shared_tid() -> Option<i32> {
         let next = if next >= TID_END { TID_FIRST } else { next };
         libc::pwrite(fd, next.to_ne_bytes().as_ptr().cast(), 4, 0);
         // Whose each is, for another process to find it by
-        // ([`owner_of_tid`]): the slot of each tid, after the counter.
-        let owners: Vec<u8> = (0..TID_BLOCK).flat_map(|_| me.to_ne_bytes()).collect();
-        libc::pwrite(fd, owners.as_ptr().cast(), owners.len(), owner_at(n));
-        // The numbers' robust lists are the new threads', none yet.
-        publish_robust_block(n, TID_BLOCK, me);
+        // ([`owner_of_tid`]): the block's slot, after the counter.
+        libc::pwrite(fd, me.to_ne_bytes().as_ptr().cast(), 4, owner_at(n));
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
         *block = (me, n + 1, n + TID_BLOCK);
@@ -464,16 +460,19 @@ fn shared_tid() -> Option<i32> {
     }
 }
 
-/// How many thread ids [`shared_tid`] takes at once.
-const TID_BLOCK: i32 = 16;
+/// How many thread ids [`shared_tid`] takes at once: a write to the shared
+/// file for each block, not each thread.
+const TID_BLOCK: i32 = 64;
 
 /// The block of thread ids being given out: its process, the next, and
 /// the end.
 pub(crate) static TID_BLOCK_LEFT: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0));
 
-/// Where in the counter's file thread `tid`'s process is.
+/// Where in the counter's file thread `tid`'s process is: its block's
+/// slot (one for each block, so the file stays small and is written once
+/// a block).
 fn owner_at(tid: i32) -> libc::off_t {
-    (4 + 4 * i64::from(tid - TID_FIRST)) as libc::off_t
+    (4 + 4 * i64::from((tid - TID_FIRST) / TID_BLOCK)) as libc::off_t
 }
 
 /// The host process thread `tid` (one of another process's) is in, if a
@@ -483,7 +482,7 @@ pub fn owner_of_tid(tid: i32) -> Option<i32> {
         return None;
     }
     let dir = crate::procreg::records_dir()?;
-    let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
+    let path = std::ffi::CString::new([&dir[..], b"/tid-blocks"].concat()).ok()?;
     let mut b = [0u8; 4];
     // SAFETY: a NUL-terminated path; a 4-byte buffer; closed below.
     let n = unsafe {
@@ -503,63 +502,44 @@ pub fn owner_of_tid(tid: i32) -> Option<i32> {
 /// The threads (tids, the main thread's the process's pid) another
 /// process published ([`publish_tids`]).
 pub fn published_tids(pid: i32) -> Vec<i32> {
-    let Some(dir) = crate::procreg::records_dir() else { return Vec::new() };
-    let Ok(b) = std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
-        &tids_file(&dir, pid),
-    )) else {
-        return Vec::new();
-    };
-    let Some(count) = b.get(..4).map(|c| u32::from_ne_bytes(c.try_into().unwrap()) as usize) else {
-        return Vec::new();
-    };
-    b[4..].as_chunks::<4>().0.iter().take(count).map(|c| i32::from_ne_bytes(*c)).collect()
+    let b = crate::procstore::get_of(crate::procstore::Kind::Threads, pid).unwrap_or_default();
+    b.as_chunks::<4>().0.iter().map(|c| i32::from_ne_bytes(*c)).collect()
 }
 
-fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {
-    [dir, format!("/threads-{pid}").as_bytes()].concat()
-}
+/// Whether this process published its threads ([`publish_tids`]), and
+/// which process that was (a fork child's is its parent's).
+pub(crate) static PUBLISHED: Mutex<i32> = Mutex::new(0);
 
-/// This process's thread list file, open: its pid and descriptor.
-pub(crate) static TIDS_FD: Mutex<(i32, i32)> = Mutex::new((0, -1));
+/// The process is ending: its thread list is written no more.
+static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Publish this process's threads, for another process to list
 /// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): from
-/// when it first has more than its main thread. The list is a count and the
-/// tids, written whole at once on a descriptor kept open, so a reader sees
-/// one list or the other.
+/// when it first has more than its main thread, in its entry of the
+/// process store ([`crate::procstore`]), which only it writes.
 fn publish_tids(tids: &[i32]) {
-    let Some(dir) = crate::procreg::records_dir() else { return };
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    let path = tids_file(&dir, me);
-    let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
-    if kept.0 != me && kept.1 >= 0 {
-        // A fork child's copy of its parent's descriptor.
-        // SAFETY: closing the descriptor this process inherited.
-        unsafe { libc::close(kept.1) };
-        *kept = (me, -1);
-    }
-    // A process that never had another thread has no list; one that had
-    // keeps its file, with the main thread alone in it again (making and
-    // removing it for each thread a program starts and joins cost more
-    // than the thread). The collector removes it once the process is gone.
-    if tids.len() <= 1 && kept.1 < 0 {
+    if TIDS_ENDED.load(Ordering::SeqCst) {
         return;
     }
-    if kept.1 < 0 {
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *kept = (me, fd);
+    let me = crate::host::pid();
+    // Its threads take turns.
+    let mut published = PUBLISHED.lock().unwrap_or_else(|e| e.into_inner());
+    // A process that never had another thread has no list; one that had
+    // keeps it, with the main thread alone in it again.
+    if tids.len() <= 1 && *published != me {
+        return;
     }
-    let mut b = Vec::with_capacity(4 + 4 * tids.len());
-    b.extend((tids.len() as u32).to_ne_bytes());
-    b.extend(tids.iter().flat_map(|t| t.to_ne_bytes()));
-    // SAFETY: a buffer of `b.len()` bytes, on the descriptor kept for it.
-    unsafe { libc::pwrite(kept.1, b.as_ptr().cast(), b.len(), 0) };
+    *published = me;
+    let b: Vec<u8> = tids.iter().flat_map(|t| t.to_ne_bytes()).collect();
+    crate::procstore::put_own(crate::procstore::Kind::Threads, Some(&b));
+}
+
+/// This process starts (or is a fork's child): a list its pid's earlier
+/// process left is not its own.
+pub(crate) fn forget_published() {
+    crate::procstore::put_own(crate::procstore::Kind::Threads, None);
+    crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Allocate a fresh thread id for a new thread: in a pid namespace of
@@ -567,8 +547,7 @@ fn publish_tids(tids: &[i32]) {
 /// outside one, a number no host process has ([`shared_tid`]).
 pub fn alloc_tid() -> i32 {
     if crate::pidns::nested() {
-        // SAFETY: getpid cannot fail.
-        let host = unsafe { libc::getpid() };
+        let host = crate::host::pid();
         if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
             crate::pidns::remember_thread(nums[0], nums.clone());
             return nums[0];
@@ -614,12 +593,11 @@ pub fn set_robust_list(head: u64, len: u64) {
         r.robust = head;
     }
     drop(threads);
-    // SAFETY: getpid cannot fail.
-    let host = unsafe { libc::getpid() };
+    let host = crate::host::pid();
     if me == tgid() {
-        publish_robust(host, host, head);
+        publish_robust(host, head);
     } else if !crate::pidns::nested() {
-        publish_robust(me, host, head);
+        publish_robust(me, head);
     }
 }
 
@@ -651,116 +629,44 @@ pub fn robust_list_of(tid: i32) -> Option<u64> {
     threads.iter().find(|r| r.tid == tid).map(|r| r.robust)
 }
 
-// Robust-list heads for other processes to read (`get_robust_list`), in a
-// file beside the process records: a slot per main thread (by host pid)
-// and per thread number of fwe's ([`shared_tid`]), holding the owner's
-// host pid, when it was written (microseconds since the epoch) and the
-// head. A main thread's slot written before its process started is a
-// former process's; a thread number's is cleared when it is given out.
+// Robust-list heads for other processes to read (`get_robust_list`): the
+// process's entry of them in the process store ([`crate::procstore`]),
+// which only it writes, as (id, head) pairs: the main thread's id its host
+// pid, another's its thread number of fwe's ([`shared_tid`]).
 
-const ROBUST_SLOT: i64 = 24;
+/// The heads this process published, by id.
+pub(crate) static ROBUST: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
-fn robust_path() -> Option<std::ffi::CString> {
-    let dir = crate::procreg::records_dir()?;
-    std::ffi::CString::new([&dir[..], b"/robust"].concat()).ok()
-}
-
-fn now_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as u64)
-}
-
-/// Record slot `id`'s (a host pid or a thread number) robust-list head.
-fn publish_robust(id: i32, owner: i32, head: u64) {
-    if !(1..TID_END).contains(&id) {
-        return;
-    }
-    let Some(path) = robust_path() else { return };
-    let mut b = [0u8; ROBUST_SLOT as usize];
-    b[..4].copy_from_slice(&owner.to_ne_bytes());
-    b[8..16].copy_from_slice(&now_micros().to_ne_bytes());
-    b[16..].copy_from_slice(&head.to_ne_bytes());
-    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
-    // below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            libc::pwrite(
-                fd,
-                b.as_ptr().cast(),
-                b.len(),
-                (i64::from(id) * ROBUST_SLOT) as libc::off_t,
-            );
-            libc::close(fd);
+/// Record thread `id`'s (a host pid or a thread number) robust-list head
+/// (0: none).
+fn publish_robust(id: i32, head: u64) {
+    let mut heads = ROBUST.lock().unwrap_or_else(|e| e.into_inner());
+    let had = heads.iter().position(|&(i, _)| i == id);
+    match (had, head) {
+        (Some(i), 0) => {
+            heads.swap_remove(i);
         }
+        (Some(i), h) => heads[i].1 = h,
+        (None, 0) => return,
+        (None, h) => heads.push((id, h)),
     }
-}
-
-/// Mark slots `first..first + count` (thread numbers) `owner`'s, with no
-/// robust list, in one write.
-fn publish_robust_block(first: i32, count: i32, owner: i32) {
-    if first < 1 || first + count > TID_END {
-        return;
-    }
-    let Some(path) = robust_path() else { return };
-    let mut slot = [0u8; ROBUST_SLOT as usize];
-    slot[..4].copy_from_slice(&owner.to_ne_bytes());
-    slot[8..16].copy_from_slice(&now_micros().to_ne_bytes());
-    let b: Vec<u8> = (0..count).flat_map(|_| slot).collect();
-    // SAFETY: a NUL-terminated path; a buffer of `b.len()` bytes; closed
-    // below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            libc::pwrite(
-                fd,
-                b.as_ptr().cast(),
-                b.len(),
-                (i64::from(first) * ROBUST_SLOT) as libc::off_t,
-            );
-            libc::close(fd);
-        }
-    }
+    let b: Vec<u8> = heads
+        .iter()
+        .flat_map(|&(i, h)| (i as u64).to_ne_bytes().into_iter().chain(h.to_ne_bytes()))
+        .collect();
+    crate::procstore::put_own(crate::procstore::Kind::Robust, Some(&b));
 }
 
 /// Another process's thread's robust-list head: `host` the main thread of
 /// that host process, or `tid` one of its other threads (a number of
-/// fwe's, of process `host`). `None` if the slot is not that thread's,
-/// which then has no list.
+/// fwe's, of process `host`). `None` if it published none.
 pub fn published_robust(host: i32, tid: Option<i32>) -> Option<u64> {
     let id = tid.unwrap_or(host);
-    if !(1..TID_END).contains(&id) {
-        return None;
-    }
-    let path = robust_path()?;
-    let mut b = [0u8; ROBUST_SLOT as usize];
-    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
-    // below.
-    let n = unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let n = libc::pread(
-            fd,
-            b.as_mut_ptr().cast(),
-            b.len(),
-            (i64::from(id) * ROBUST_SLOT) as libc::off_t,
-        );
-        libc::close(fd);
-        n
-    };
-    let owner = i32::from_ne_bytes(b[..4].try_into().unwrap());
-    let written = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-    let head = u64::from_ne_bytes(b[16..].try_into().unwrap());
-    if n != ROBUST_SLOT as isize || owner != host {
-        return None;
-    }
-    if tid.is_none() && crate::procreg::start_time(host).is_none_or(|start| written < start) {
-        return None;
-    }
-    Some(head)
+    let b = crate::procstore::get_of(crate::procstore::Kind::Robust, host)?;
+    b.as_chunks::<16>().0.iter().find_map(|c| {
+        let i = u64::from_ne_bytes(c[..8].try_into().unwrap()) as i32;
+        (i == id).then(|| u64::from_ne_bytes(c[8..].try_into().unwrap()))
+    })
 }
 
 /// What a pending signal carries into the handler's `siginfo`.
@@ -1017,18 +923,77 @@ pub fn live_threads() -> usize {
 
 const UNBLOCKABLE: u64 = (1 << (signal::SIGKILL - 1)) | (1 << (signal::SIGSTOP - 1));
 
-thread_local! {
-    static MASK: Cell<u64> = const { Cell::new(0) };
+/// The signal state every system call looks at, in one thread-local so
+/// that a call looks it up once (each lookup is a call into the host's
+/// dynamic linker).
+struct Hot {
+    mask: Cell<u64>,
     /// The mask `rt_sigsuspend` replaced, restored once the call ends.
-    static SAVED_MASK: Cell<Option<u64>> = const { Cell::new(None) };
+    saved_mask: Cell<Option<u64>>,
+    /// This thread's registered pending set (owned by [`THREADS`]).
+    own: Cell<*const Pending>,
+    /// A process signal landed here while this thread blocked it: the
+    /// other threads are to be woken to take it ([`post_landed`]).
+    wake_others: Cell<bool>,
+}
+
+thread_local! {
+    static HOT: Hot = const {
+        Hot {
+            mask: Cell::new(0),
+            saved_mask: Cell::new(None),
+            own: Cell::new(std::ptr::null()),
+            wake_others: Cell::new(false),
+        }
+    };
     static ALTSTACK: Cell<Stack> = const {
         Cell::new(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 })
     };
-    /// This thread's registered pending set (owned by [`THREADS`]).
-    static OWN: Cell<*const Pending> = const { Cell::new(std::ptr::null()) };
-    /// A process signal landed here while this thread blocked it: the
-    /// other threads are to be woken to take it ([`post_landed`]).
-    static WAKE_OTHERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This host thread starts another guest thread ([`crate::thread_reused`]):
+/// its state is a new thread's.
+pub(crate) fn thread_reused() {
+    TID.with(|t| t.set(0));
+    CLEAR_CHILD_TID.with(|c| c.set(0));
+    ROBUST_LIST.with(|r| r.set((0, 0)));
+    NAME.with(|n| n.set(None));
+    SLACK.with(|s| s.set((DEFAULT_SLACK, DEFAULT_SLACK)));
+    HOT.with(|h| {
+        h.mask.set(0);
+        h.saved_mask.set(None);
+        h.own.set(std::ptr::null());
+        h.wake_others.set(false);
+    });
+    ALTSTACK.with(|a| a.set(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 }));
+}
+
+/// After a system call: wake the other threads if a signal for them landed
+/// here, and the calling thread's pending signals, mask and saved mask
+/// (see [`save_mask`]), in one look.
+pub fn after_call(sig: libc::c_int) -> (u64, u64, Option<u64>) {
+    let (wake, own, mask, saved) =
+        HOT.with(|h| (h.wake_others.replace(false), h.own.get(), h.mask.get(), h.saved_mask.get()));
+    if wake {
+        wake_others(sig);
+    }
+    (own_bits(own) | PROCESS.bits(), mask, saved)
+}
+
+/// The calling thread's pending signals and mask, in one look.
+pub fn state() -> (u64, u64) {
+    let (own, mask) = HOT.with(|h| (h.own.get(), h.mask.get()));
+    (own_bits(own) | PROCESS.bits(), mask)
+}
+
+/// The bits pending in `own` (the process's set when it is null).
+fn own_bits(own: *const Pending) -> u64 {
+    if own.is_null() {
+        PROCESS.bits()
+    } else {
+        // SAFETY: the pointer is cleared before the registry drops its Arc.
+        unsafe { &*own }.bits()
+    }
 }
 
 /// Run `f` holding the thread registry lock (see [`crate::fork_locked`]).
@@ -1069,7 +1034,7 @@ pub fn register(tid: i32) -> Arc<Pending> {
 
 /// Make `pending` (from [`register`]) the calling thread's own set.
 pub fn adopt(pending: &Arc<Pending>) {
-    OWN.with(|o| o.set(Arc::as_ptr(pending)));
+    HOT.with(|h| h.own.set(Arc::as_ptr(pending)));
     crate::threadfs::enter(tid());
 }
 
@@ -1103,15 +1068,21 @@ pub fn unregister_current() {
     // Its process descriptors (`PIDFD_THREAD`) say it has ended.
     crate::pidfd::thread_gone(tid());
     drop_wait_pipe();
-    let own = OWN.with(|o| o.replace(std::ptr::null()));
+    let own = HOT.with(|h| h.own.replace(std::ptr::null()));
     directed_remove(tid());
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
     publish_tids(&tids());
+    if tid() != tgid() {
+        publish_robust(tid(), 0);
+    }
 }
 
-/// As the process ends: its published threads go.
+/// As the process ends: its published threads go, and are written no
+/// more.
 pub fn process_ending() {
-    publish_tids(&[]);
+    TIDS_ENDED.store(true, Ordering::SeqCst);
+    crate::procstore::put_own(crate::procstore::Kind::Threads, None);
+    crate::procstore::put_own(crate::procstore::Kind::Robust, None);
 }
 
 // --- signals for a named thread, from a handler ------------------------------------
@@ -1199,7 +1170,7 @@ pub fn post_directed(tid: i32, sig: u64, info: SigInfo) -> bool {
 }
 
 fn with_own<R>(f: impl FnOnce(&Pending) -> R) -> R {
-    let p = OWN.with(Cell::get);
+    let p = HOT.with(|h| h.own.get());
     if p.is_null() {
         f(&PROCESS)
     } else {
@@ -1251,7 +1222,7 @@ pub fn post_landed(sig: u64, info: SigInfo) {
         post_self(sig, info);
     } else {
         PROCESS.post(sig, info);
-        WAKE_OTHERS.with(|w| w.set(true));
+        HOT.with(|h| h.wake_others.set(true));
     }
 }
 
@@ -1259,7 +1230,7 @@ pub fn post_landed(sig: u64, info: SigInfo) {
 /// blocked it ([`post_landed`]). Takes the thread registry lock: called
 /// where this thread holds none of fwe's locks.
 pub fn wake_others_if_asked(sig: libc::c_int) {
-    if WAKE_OTHERS.with(|w| w.replace(false)) {
+    if HOT.with(|h| h.wake_others.replace(false)) {
         wake_others(sig);
     }
 }
@@ -1355,23 +1326,23 @@ pub fn deliverable() -> u64 {
 
 /// The calling thread's blocked-signal mask.
 pub fn mask() -> u64 {
-    MASK.with(Cell::get)
+    HOT.with(|h| h.mask.get())
 }
 
 /// Replace the calling thread's mask; `SIGKILL` and `SIGSTOP` cannot be
 /// blocked.
 pub fn set_mask(mask: u64) {
-    MASK.with(|m| m.set(mask & !UNBLOCKABLE));
+    HOT.with(|h| h.mask.set(mask & !UNBLOCKABLE));
 }
 
 /// Remember the mask to restore when `rt_sigsuspend` ends.
 pub fn save_mask(mask: u64) {
-    SAVED_MASK.with(|m| m.set(Some(mask)));
+    HOT.with(|h| h.saved_mask.set(Some(mask)));
 }
 
 /// The mask saved by `rt_sigsuspend`, if the call is still in progress.
 pub fn take_saved_mask() -> Option<u64> {
-    SAVED_MASK.with(Cell::take)
+    HOT.with(|h| h.saved_mask.take())
 }
 
 /// The calling thread's alternate signal stack.
