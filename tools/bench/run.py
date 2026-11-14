@@ -7,16 +7,17 @@ project's build, under fwe, natively on macOS and natively on Linux.
         natively; Lua is built in an Alpine 3.24 container (docker).
 
     run.py macos --fwe FWE --bench BENCH --native NATIVE --cache DIR
-                 [--linux linux.json] [--no-build] --out macos.json
+                 [--linux linux.json] [--no-build] [--native-cc CC] --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
         source built for macOS) runs natively; Lua is built with clang
         under FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched
-        into DIR), and natively with the host's clang. With the Linux
+        into DIR), and natively with the same clang release (`--native-cc`).
+        With the Linux
         results, a table of all three is printed (and appended to
         $GITHUB_STEP_SUMMARY). `--no-build` leaves the build out (Alpine's
-        programs run only in CI). It fails when a figure of fwe's exceeds
-        its budget (BUDGETS) against macOS's, or for the build against
-        Linux's, which runs the same toolchain (AGAINST).
+        programs run only in CI). `--native-cc` is the native build's
+        compiler (CI: Homebrew's clang of Alpine's release). It fails when a
+        figure of fwe's exceeds its budget (BUDGETS) against macOS's.
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -123,10 +124,10 @@ BUDGETS = {
     "build Lua (s)": 1.5,
 }
 
-# The figures held to a budget against another than macOS's: the build,
-# against Linux's, which runs the same Alpine clang as fwe does (macOS's
-# is Apple's clang, another compiler, which says nothing of fwe).
-AGAINST = {"build Lua (s)": "Linux"}
+# The figures held to a budget against another than macOS's (none: the
+# build's native side uses the same clang release as fwe's, on the same
+# runner, so the runner's speed falls on both alike).
+AGAINST: dict = {}
 
 
 def best(f, rounds=ROUNDS):
@@ -217,11 +218,12 @@ def lua_build_s(cmd_for, src, retrace=None):
     return best(lambda: lua_build_once(cmd_for, retrace), 3)
 
 
-def lua_build_once(cmd_for, retrace=None):
-    """Seconds to build Lua from clean once with `cmd_for(make_args)`."""
+def lua_build_once(cmd_for, retrace=None, cc="clang"):
+    """Seconds to build Lua from clean once with `cmd_for(make_args)`, with
+    compiler `cc`."""
     checked(cmd_for(["clean"]))
     start = time.perf_counter()
-    checked(cmd_for(["-j4", "posix", "CC=clang"]), retrace)
+    checked(cmd_for(["-j4", "posix", f"CC={cc}"]), retrace)
     return time.perf_counter() - start
 
 
@@ -299,7 +301,10 @@ def over_budget(results):
 
 def build(a, fwe, results):
     """Lua built with clang under fwe, in an Alpine root's /tmp (the guest
-    given only its own environment), and natively with the host's clang."""
+    given only its own environment), and natively with `--native-cc`: the
+    same clang release as Alpine's (Homebrew's `llvm@22`), so the two
+    differ by fwe, not by the compiler (Apple's clang is another, faster
+    build of it)."""
     lua = fetch(*LUA, a.cache)
     root = alpine_root("clang", a.cache)
     tmp = os.path.join(root, "tmp")
@@ -328,7 +333,9 @@ def build(a, fwe, results):
     ours, theirs = [], []
     for _ in range(3):
         ours.append(lua_build_once(lambda args: make + args, traced))
-        theirs.append(lua_build_once(lambda args: ["make", "-C", native_src] + args))
+        theirs.append(
+            lua_build_once(lambda args: ["make", "-C", native_src] + args, cc=a.native_cc)
+        )
     shutil.rmtree(native, ignore_errors=True)
     results["fwe"]["build Lua (s)"] = min(ours)
     results["macOS"]["build Lua (s)"] = min(theirs)
@@ -386,6 +393,7 @@ def main():
     mc.add_argument("--cache", required=True)
     mc.add_argument("--linux")
     mc.add_argument("--no-build", action="store_true")
+    mc.add_argument("--native-cc", default="clang", help="the compiler of the native build")
     mc.add_argument("--out", required=True)
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)

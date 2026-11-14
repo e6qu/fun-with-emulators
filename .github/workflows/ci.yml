@@ -282,7 +282,9 @@ jobs:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
-      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --cache target/bench-cache --linux linux.json --out macos.json
+      # The native build's compiler: the clang release Alpine's root has.
+      - run: brew install llvm@22
+      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --native-cc "$(brew --prefix llvm@22)/bin/clang" --cache target/bench-cache --linux linux.json --out macos.json
       - uses: actions/upload-artifact@v4
         with:
           name: bench-results

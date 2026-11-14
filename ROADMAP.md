@@ -146,10 +146,10 @@ Linux code runs at native speed, and what fwe adds is held to budgets
 natively wherever fwe can make them fit the Mac.
 
 - [ ] **Benchmark budgets in CI:** the benchmark job fails when fwe exceeds
-  a budget against native macOS on the same runner (the C build, against
-  native Linux running the same Alpine clang: macOS's is Apple's clang,
-  another compiler). The budgets and the figures on the last run before
-  this plan:
+  a budget against native macOS on the same runner (the C build natively
+  with Homebrew's clang of the release Alpine's root has, not Apple's
+  clang, a faster build of it). The budgets and the figures on the last
+  run before this plan:
 
   | Benchmark | Budget | Last run |
   |---|---|---|
