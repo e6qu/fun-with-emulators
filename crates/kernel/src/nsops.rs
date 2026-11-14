@@ -424,6 +424,9 @@ impl<P: Platform> Kernel<P> {
             );
             // It holds this process's session keyring.
         }
+        if child > 0 && t.child_writes.is_some() {
+            crate::procreg::child_writes_own(child);
+        }
         if child > 0 {
             crate::keys::forked(child);
             crate::reaper::set_exit_signal(child, t.exit_signal);

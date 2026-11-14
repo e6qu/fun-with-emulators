@@ -228,6 +228,15 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
         while !reader.is_finished() {
             if start.elapsed() > Duration::from_secs(10) {
                 eprintln!("--- a process outlived the guest holding its {which}");
+                // Which: every fwe process still running, with its group.
+                if let Ok(ps) = Command::new("ps")
+                    .args(["-A", "-o", "pid,ppid,pgid,stat,etime,command"])
+                    .output()
+                {
+                    let all = String::from_utf8_lossy(&ps.stdout);
+                    let fwe: Vec<&str> = all.lines().filter(|l| l.contains("fwe")).collect();
+                    eprintln!("--- fwe processes now:\n{}", fwe.join("\n"));
+                }
                 return Vec::new();
             }
             std::thread::sleep(Duration::from_millis(20));

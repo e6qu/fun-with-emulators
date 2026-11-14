@@ -268,6 +268,32 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
     with_held(pid, r)
 }
 
+/// Children this process forked that write their own records
+/// ([`own_whole`]) and may not have yet.
+static UNWRITTEN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// This process forked `child`, which writes its own record as it starts:
+/// a listing of every process waits for it ([`all`]), as on Linux the
+/// child is there once the fork returns.
+pub fn child_writes_own(child: i32) {
+    let mut u = UNWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if u.len() >= 64 {
+        // A parent that forks many and lists none: those written are done.
+        u.retain(|&pid| read_any(pid).is_none() && new_child(pid));
+    }
+    u.push(child);
+}
+
+/// Wait for the records of the children this process forked that were to
+/// write their own ([`child_writes_own`]).
+fn await_unwritten() {
+    let pids = std::mem::take(&mut *UNWRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in pids {
+        // Waits while it is a live child with no record yet.
+        let _ = read(pid);
+    }
+}
+
 /// Whether host process `pid` is a live child of this process.
 fn new_child(pid: i32) -> bool {
     host_info(pid).is_some_and(|(_, ppid, zombie)| ppid == me() && !zombie)
@@ -634,6 +660,7 @@ pub fn collect_leftovers(young: std::time::Duration) {
 /// (zombies too).
 pub fn all() -> Vec<(i32, ProcRecord)> {
     let Some(d) = dir() else { return Vec::new() };
+    await_unwritten();
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return Vec::new() };
     let mut out = Vec::new();
     for e in entries.flatten() {
