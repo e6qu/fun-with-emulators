@@ -499,7 +499,7 @@ impl<P: Platform> Kernel<P> {
             }
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(info) = thread::take_pending(sig) else { continue };
-            if sig == signal::SIGCHLD {
+            if sig == signal::SIGCHLD && crate::trace::file().is_some() {
                 crate::trace::note_to_file(&format!(
                     "signal: SIGCHLD from {} delivered to {}",
                     info.pid,
