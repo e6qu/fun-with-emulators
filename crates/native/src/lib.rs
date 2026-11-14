@@ -22,12 +22,22 @@ mod trap;
 /// Live guest threads, so the last one to exit ends the process.
 static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// `FWE_TIMING`'s mark as the process ends, with how many code pages were
+/// written as they first ran.
+fn mark_exit() {
+    fwe_kernel::timing::mark("exit");
+    if fwe_kernel::timing::on() {
+        let pages = fwe_kernel::lazycode::written();
+        fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
+    }
+}
+
 /// End the calling guest thread: the last thread ends the process, any other
 /// ends just its host thread. Must be called without the kernel lock held,
 /// since `pthread_exit` does not return and would never release it.
 pub(crate) fn exit_current_thread(code: i32) -> ! {
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-        fwe_kernel::timing::mark("exit");
+        mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
         fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process.
@@ -108,7 +118,7 @@ impl Platform for NativePlatform {
     }
 
     fn exit(&mut self, code: i32) -> ! {
-        fwe_kernel::timing::mark("exit");
+        mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
         fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process; the guest owns all its state.

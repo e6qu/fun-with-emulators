@@ -149,7 +149,16 @@ pub fn fault(pc: u64, addr: u64) -> bool {
     let Some(owed) = pg.owed.remove(&p) else { return false };
     write(p, &owed.writes, owed.prot);
     pg.done.insert(p);
+    WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// How many pages were written as they first ran ([`fault`]).
+static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many pages were written as they first ran, for `FWE_TIMING`.
+pub fn written() -> u64 {
+    WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Make `writes` in page `p` and give it host protections `prot`. A word

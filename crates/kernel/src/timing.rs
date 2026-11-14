@@ -42,3 +42,8 @@ fn write_mark(name: &str) {
     // SAFETY: a buffer of its length.
     unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
 }
+
+/// Whether `FWE_TIMING` is set: for a mark whose name costs work to make.
+pub fn on() -> bool {
+    ON.load(Relaxed)
+}
