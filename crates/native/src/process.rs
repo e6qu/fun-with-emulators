@@ -77,9 +77,9 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // A script runs its interpreter.
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
-    let file = match k.take_exec_file(&path) {
+    let (file, file_id) = match k.take_exec_file(&path) {
         Some(file) => file,
-        None => fs.read(&path).map_err(err)?,
+        None => fs.read_identified(&path).map_err(err)?,
     };
     fwe_kernel::timing::mark("exec: read");
     let vm = crate::needs_vm(&file);
@@ -122,7 +122,16 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         // SAFETY: closing the pipe end this child holds for its parent.
         unsafe { libc::close(done) };
     }
-    let out = match load_image(&file, &path, &arg_refs, &env_refs, fs, &platform, page, strace) {
+    let out = match load_image(
+        (&file, file_id),
+        &path,
+        &arg_refs,
+        &env_refs,
+        fs,
+        &platform,
+        page,
+        strace,
+    ) {
         Ok(out) => out,
         Err(e) => {
             let msg = format!("fwe: execve {}: {e}\n", String::from_utf8_lossy(&path));

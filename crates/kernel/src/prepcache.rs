@@ -192,3 +192,39 @@ pub fn keep_exec_ranges(id: FileId, ranges: Option<&ExecRanges>) {
     }
     store(&key.into_bytes(), &e.into_bytes());
 }
+
+/// The key of what is kept of file `id` under `tag` (the loader's figures,
+/// see the backend).
+pub fn about(id: FileId, tag: &[u8]) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.bytes(tag);
+    id.encode(&mut e);
+    e.into_bytes()
+}
+
+/// Encode ranges `r` (or none) for [`store`].
+pub fn encode_ranges(r: Option<&[(u64, u64)]>) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.bool(r.is_some());
+    if let Some(r) = r {
+        e.u64(r.len() as u64);
+        for &(a, l) in r {
+            e.u64(a);
+            e.u64(l);
+        }
+    }
+    e.into_bytes()
+}
+
+/// The ranges [`encode_ranges`] encoded.
+pub fn decode_ranges(v: &[u8]) -> Option<Option<Vec<(u64, u64)>>> {
+    let mut d = Dec::new(v);
+    let out = if d.bool() {
+        let n = d.count(16);
+        Some((0..n).map(|_| (d.u64(), d.u64())).collect())
+    } else {
+        None
+    };
+    d.finish().ok()?;
+    Some(out)
+}

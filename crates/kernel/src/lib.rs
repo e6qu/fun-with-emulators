@@ -631,7 +631,7 @@ impl<P: Platform> Kernel<P> {
     /// The program file at `path`, which the caller may run
     /// ([`Kernel::may_exec`]): its contents, read through the one
     /// descriptor its checks were made on (`None` with no filesystem).
-    fn exec_file(&self, path: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+    fn exec_file(&self, path: &[u8]) -> Result<Option<ExecFile>, i32> {
         use fwe_abi::{errno, fcntl};
         use std::os::fd::FromRawFd;
         let Some(fs) = self.fs_opt() else {
@@ -641,7 +641,7 @@ impl<P: Platform> Kernel<P> {
         // fwe's own files (`/proc/self/exe`, `/dev/fd/N`): through them.
         if fs.synthetic(fcntl::AT_FDCWD as i32, path).is_some() {
             self.may_exec(path)?;
-            return fs.read(path).map(Some);
+            return fs.read_identified(path).map(Some);
         }
         EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
         if landlock::active() {
@@ -666,11 +666,12 @@ impl<P: Platform> Kernel<P> {
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         let st = fs::guest_stat(fd.as_raw_fd()).ok_or(errno::EACCES)?;
         self.exec_checks(&st, &r, &name)?;
-        fs::read_all_fd(fd.as_raw_fd()).map(Some)
+        let id = prepcache::FileId::of_fd(fd.as_raw_fd());
+        fs::read_all_fd(fd.as_raw_fd()).map(|d| Some((d, id)))
     }
 
     /// The program the last [`Kernel::exec_target`] found at `path`, read.
-    pub fn take_exec_file(&self, path: &[u8]) -> Option<Vec<u8>> {
+    pub fn take_exec_file(&self, path: &[u8]) -> Option<ExecFile> {
         EXEC_FILE.with(|f| f.borrow_mut().take()).filter(|(p, _)| p == path).map(|(_, d)| d)
     }
 
@@ -745,7 +746,7 @@ impl<P: Platform> Kernel<P> {
         EXEC_FILE.with(|f| f.borrow_mut().take());
         for _ in 0..5 {
             let Some(data) = self.exec_file(&path)? else { return Ok((path, args)) };
-            let head = &data[..data.len().min(256)];
+            let head = &data.0[..data.0.len().min(256)];
             let Some((interp, arg)) = script_interpreter(head)? else {
                 // Kept for the loader ([`Kernel::take_exec_file`]).
                 EXEC_FILE.with(|f| *f.borrow_mut() = Some((path.clone(), data)));
@@ -1083,10 +1084,14 @@ impl ExecPrivs {
     }
 }
 
+/// A program file read to be run, and its identity
+/// ([`prepcache::FileId`]).
+pub type ExecFile = (Vec<u8>, Option<prepcache::FileId>);
+
 thread_local! {
     /// The program file [`Kernel::exec_target`] read, by its path, for the
     /// loader to take.
-    static EXEC_FILE: std::cell::RefCell<Option<(Vec<u8>, Vec<u8>)>> =
+    static EXEC_FILE: std::cell::RefCell<Option<(Vec<u8>, ExecFile)>> =
         const { std::cell::RefCell::new(None) };
 }
 

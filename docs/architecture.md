@@ -250,6 +250,8 @@ The pieces that do it:
   at, with what they were. A later mapping of that range replays them
   (`rewrite::replay`), touching only the pages that hold them, after
   checking each word is still what it was (scanning again if not). The
+  loader keeps the same for the program and its dynamic linker, with the
+  size of their stub space and their unwind tables' code ranges. The
   collector removes entries made more than 30 days ago.
 
 The stub for an instruction writing `sp` from `x18` sets `sp` before it

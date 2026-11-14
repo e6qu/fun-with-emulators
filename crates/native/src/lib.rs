@@ -255,9 +255,14 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
 /// host path inside the rootfs is read as the guest's path, so that a
 /// symbolic link there resolves in the rootfs (Alpine's `/bin/sh` links to
 /// `/bin/busybox`, which on the host is no file).
-fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<Vec<u8>, Error> {
-    let in_guest =
-        |p: &[u8]| fs.read(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)));
+fn read_program(
+    path: &Path,
+    options: &Options,
+    fs: &fwe_kernel::Fs,
+) -> Result<fwe_kernel::ExecFile, Error> {
+    let in_guest = |p: &[u8]| {
+        fs.read_identified(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+    };
     if options.exe_fd.is_some() {
         in_guest(b"/proc/self/exe")
     } else if options.guest_path {
@@ -265,7 +270,12 @@ fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<V
     } else if let Some(guest) = guest_path_in_root(path, options) {
         in_guest(&guest)
     } else {
-        std::fs::read(path).map_err(Error::Read)
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::File::open(path).map_err(Error::Read)?;
+        let mut data = Vec::new();
+        f.read_to_end(&mut data).map_err(Error::Read)?;
+        Ok((data, fwe_kernel::prepcache::FileId::of_fd(f.as_raw_fd())))
     }
 }
 
@@ -881,7 +891,7 @@ pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
 /// `execve`. Does not touch the kernel; the caller installs or updates it.
 #[allow(clippy::too_many_arguments)]
 pub fn load_image(
-    file: &[u8],
+    (file, file_id): (&[u8], Option<fwe_kernel::prepcache::FileId>),
     execfn: &[u8],
     args: &[&[u8]],
     env: &[&[u8]],
@@ -894,10 +904,10 @@ pub fn load_image(
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
-    let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
-        loader::load(elf, page, |a, l, known, arena| {
+    let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
+        loader::load(elf, page, id, |a, l, known, arena, cache| {
             let stats =
-                platform.prepare(a, l, Some(arena), known, None).map_err(|e| e.to_string())?;
+                platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
                 tracer.note(&format!(
                     "prepared {what} {a:#x}+{l:#x}: {} system calls, {} stubs, \
@@ -910,7 +920,7 @@ pub fn load_image(
         .map_err(Error::Load)
     };
 
-    let loaded = load_object(&elf, "exe")?;
+    let loaded = load_object(&elf, file_id, "exe")?;
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
@@ -926,7 +936,7 @@ pub fn load_image(
     // libraries itself through our mmap and openat.
     let interp = match &interp_path {
         Some(ip) => {
-            let idata = fs.read(ip).map_err(|e| {
+            let (idata, iid) = fs.read_identified(ip).map_err(|e| {
                 Error::Unsupported(format!(
                     "loading the dynamic linker {}: errno {e}",
                     String::from_utf8_lossy(ip)
@@ -938,7 +948,7 @@ pub fn load_image(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            let placed = load_object(&ielf, "interp")?;
+            let placed = load_object(&ielf, iid, "interp")?;
             let name = fwe_kernel::maps::Name::Path(ip.as_slice().into());
             fwe_kernel::maps::record().loaded(
                 &ielf,
@@ -1043,7 +1053,7 @@ fn start(
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
     fwe_kernel::timing::mark("open_fs");
-    let data = read_program(path, options, &fs)?;
+    let (data, data_id) = read_program(path, options, &fs)?;
     fwe_kernel::timing::mark("read_program");
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
@@ -1063,7 +1073,7 @@ fn start(
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
     let out = load_image(
-        &data,
+        (&data, data_id),
         &guest_execfn(path, options),
         &arg_bytes,
         &env_bytes,

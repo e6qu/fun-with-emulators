@@ -1459,10 +1459,19 @@ impl Fs {
     /// to run it: a program, or the dynamic linker it names (`EACCES` from
     /// a `noexec` mount).
     pub fn read(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        self.read_identified(path).map(|(data, _)| data)
+    }
+
+    /// [`Fs::read`], with the identity of the file read, for what is kept
+    /// of it ([`crate::prepcache`]): `None` for one of fwe's own.
+    pub fn read_identified(
+        &self,
+        path: &[u8],
+    ) -> Result<(Vec<u8>, Option<crate::prepcache::FileId>), i32> {
         if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
             use crate::procfs::Entry;
             return match entry {
-                Entry::File(data) => Ok(data),
+                Entry::File(data) => Ok((data, None)),
                 Entry::Fd { fd, .. } => {
                     // Through the descriptor: only a regular file is run.
                     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -1473,9 +1482,9 @@ impl Fs {
                     {
                         return Err(errno::EACCES);
                     }
-                    read_all(fd)
+                    read_all(fd).map(|d| (d, crate::prepcache::FileId::of_fd(fd)))
                 }
-                Entry::Symlink(t) if t.starts_with(b"/") => self.read(&t),
+                Entry::Symlink(t) if t.starts_with(b"/") => self.read_identified(&t),
                 Entry::Dir => Err(errno::EISDIR),
                 _ => Err(errno::ENOENT),
             };
@@ -1495,6 +1504,7 @@ impl Fs {
         }
         // SAFETY: `fd` is a fresh owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let id = crate::prepcache::FileId::of_fd(fd.as_raw_fd());
         let mut data = Vec::new();
         let mut chunk = [0u8; 65536];
         loop {
@@ -1508,7 +1518,7 @@ impl Fs {
             }
             data.extend_from_slice(&chunk[..n as usize]);
         }
-        Ok(data)
+        Ok((data, id))
     }
 
     /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
