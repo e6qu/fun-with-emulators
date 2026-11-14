@@ -1577,7 +1577,12 @@ fn vectored_at(
     if offset != -1 && (kind == libc::S_IFIFO || kind == libc::S_IFSOCK) {
         return err(errno::ESPIPE);
     }
-    if no_buffers(fd, write) != 0 {
+    // SAFETY: F_GETFL only queries the descriptor.
+    let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status < 0 {
+        return host::last_error();
+    }
+    if !open_for(status, write) {
         return err(errno::EBADF);
     }
     let iov = match uaccess::host_iovecs(iov, count, !write) {
@@ -1608,7 +1613,10 @@ fn vectored_at(
         }
     }
     let n = iov.len() as i32;
-    let r = if flags & rwf::APPEND != 0 {
+    // Linux appends to a file opened to append whatever the offset, as
+    // its `pwrite` does.
+    let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
+    let r = if flags & rwf::APPEND != 0 || appends {
         append_vectored(fd, &iov, offset)
     } else if offset == -1 {
         // SAFETY: the iovecs are checked host buffers.
@@ -1666,12 +1674,17 @@ fn no_buffers(fd: i32, write: bool) -> i64 {
     if fl < 0 {
         return host::last_error();
     }
-    let open_for = match fl & libc::O_ACCMODE {
+    if open_for(fl, write) { 0 } else { fwe_abi::err(fwe_abi::errno::EBADF) }
+}
+
+/// Whether a descriptor of host status flags `fl` is open to write
+/// (`write`) or to read.
+fn open_for(fl: i32, write: bool) -> bool {
+    match fl & libc::O_ACCMODE {
         libc::O_RDONLY => !write,
         libc::O_WRONLY => write,
         _ => true,
-    };
-    if open_for { 0 } else { fwe_abi::err(fwe_abi::errno::EBADF) }
+    }
 }
 
 /// `pwritev2` with `RWF_APPEND`: the data goes at the end of the file, as
@@ -2088,5 +2101,36 @@ mod script_tests {
             Ok(Some((v("/bin/sh"), Some(v("-e")))))
         );
         assert_eq!(script_interpreter(b"#!  \n"), Err(fwe_abi::errno::ENOEXEC));
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use fwe_abi::nr as n;
+
+    /// `pwritev` to a file opened to append appends, whatever the offset,
+    /// as Linux's does, and leaves the file's position alone.
+    #[test]
+    fn a_vectored_write_at_an_offset_appends_to_a_file_opened_to_append() {
+        let dir = std::env::temp_dir().join(format!("fwe-pwritev-{}", std::process::id()));
+        std::fs::write(&dir, b"abc").unwrap();
+        let path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        // SAFETY: plain host calls on a file of the test's own.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_APPEND) };
+        assert!(fd >= 0);
+        let data = *b"XY";
+        let iov = libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: 2 };
+        // SAFETY: the iovec and its buffer live across the call.
+        let r = unsafe {
+            super::blocking_call(n::PWRITEV, [fd as u64, &iov as *const _ as u64, 1, 0, 0, 0])
+        };
+        assert_eq!(r, Some(2));
+        // SAFETY: plain host calls.
+        unsafe {
+            assert_eq!(libc::lseek(fd, 0, libc::SEEK_CUR), 0);
+            libc::close(fd);
+        }
+        assert_eq!(std::fs::read(&dir).unwrap(), b"abcXY");
+        let _ = std::fs::remove_file(&dir);
     }
 }
