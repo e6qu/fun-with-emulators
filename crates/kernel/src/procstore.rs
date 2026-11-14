@@ -104,7 +104,11 @@ pub enum Count {
 
 /// The store's layout: where each part starts in the file.
 const COUNTS_AT: usize = 0;
-const ENTRIES_AT: usize = 64;
+/// The user's temporary directory as the host named it ([`user_temp`]):
+/// its length, then its bytes.
+const USER_TEMP_AT: usize = 64;
+const USER_TEMP_MAX: usize = 1024;
+const ENTRIES_AT: usize = USER_TEMP_AT + 8 + USER_TEMP_MAX;
 const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 /// The pids whose record their process writes itself as it starts, and
 /// has not yet ([`mark_unwritten`]).
@@ -227,6 +231,38 @@ pub fn init() {
 /// The count `c`.
 pub fn count(c: Count) -> &'static AtomicU64 {
     store().at(COUNTS_AT + c as usize * 8)
+}
+
+/// The user's temporary directory, as a process asked the host for it
+/// ([`set_user_temp`]): asking costs milliseconds (a daemon answers).
+pub fn user_temp() -> Option<Vec<u8>> {
+    let s = store();
+    let len: &AtomicU64 = s.at(USER_TEMP_AT);
+    let n = len.load(SeqCst) as usize;
+    if n == 0 || n > USER_TEMP_MAX {
+        return None;
+    }
+    let words = n.div_ceil(8);
+    let bytes: Vec<u8> = (0..words)
+        .flat_map(|i| s.at::<AtomicU64>(USER_TEMP_AT + 8 + i * 8).load(SeqCst).to_le_bytes())
+        .take(n)
+        .collect();
+    Some(bytes)
+}
+
+/// Keep `dir` as the user's temporary directory ([`user_temp`]); its
+/// length is written last, so a reader finds all of it or none.
+pub fn set_user_temp(dir: &[u8]) {
+    if dir.is_empty() || dir.len() > USER_TEMP_MAX {
+        return;
+    }
+    let s = store();
+    for (i, chunk) in dir.chunks(8).enumerate() {
+        let mut w = [0u8; 8];
+        w[..chunk.len()].copy_from_slice(chunk);
+        s.at::<AtomicU64>(USER_TEMP_AT + 8 + i * 8).store(u64::from_le_bytes(w), SeqCst);
+    }
+    s.at::<AtomicU64>(USER_TEMP_AT).store(dir.len() as u64, SeqCst);
 }
 
 impl Store {

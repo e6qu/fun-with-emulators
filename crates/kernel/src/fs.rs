@@ -3278,9 +3278,15 @@ pub(crate) mod shm {
     fn user_temp() -> Vec<u8> {
         #[cfg(target_os = "macos")]
         {
-            // `TMPDIR` as the system sets it, when it is that directory:
-            // asking the system costs milliseconds (a daemon is asked).
-            if let Some(dir) = system_tmpdir() {
+            // `TMPDIR` as the system sets it, when it is that directory, or
+            // the one an fwe process asked the system for, kept in the
+            // process store: asking costs milliseconds (a daemon answers).
+            use std::os::unix::ffi::OsStringExt;
+            let env = std::env::var_os("TMPDIR").map(OsStringExt::into_vec);
+            if let Some(dir) = env.and_then(system_tmpdir) {
+                return dir;
+            }
+            if let Some(dir) = crate::procstore::user_temp().and_then(system_tmpdir) {
                 return dir;
             }
             let mut buf = vec![0u8; 1024];
@@ -3290,19 +3296,18 @@ pub(crate) mod shm {
             };
             if n > 0 && n <= buf.len() {
                 buf.truncate(n - 1);
+                crate::procstore::set_user_temp(&buf);
                 return buf;
             }
         }
         b"/tmp".to_vec()
     }
 
-    /// `TMPDIR`, if it names a user's temporary directory as the system
-    /// makes them (`/var/folders/<xx>/<id>/T`) and that one is this user's,
-    /// which makes it this user's only one.
+    /// `dir`, if it names a user's temporary directory as the system makes
+    /// them (`/var/folders/<xx>/<id>/T`) and that one is this user's, which
+    /// makes it this user's only one.
     #[cfg(target_os = "macos")]
-    fn system_tmpdir() -> Option<Vec<u8>> {
-        use std::os::unix::ffi::OsStringExt;
-        let mut dir = std::env::var_os("TMPDIR")?.into_vec();
+    fn system_tmpdir(mut dir: Vec<u8>) -> Option<Vec<u8>> {
         while dir.len() > 1 && dir.last() == Some(&b'/') {
             dir.pop();
         }

@@ -2295,11 +2295,12 @@ it. A record no live process holds is collected when a namespace is made
 and when a fresh fwe starts, at most once a minute (records younger than
 that are spared anyway), with the files a gone process left beside its
 record, and the `/dev/shm` directory of a rootfs no mount table shows.
-A fresh start leaves
-that work to a process of its own, which nothing waits for. A process
-fwe starts for a guest's `execve` is handed the private directory
-rather than asking macOS for the user's temporary directory again (the
-host takes about a millisecond to answer).
+A fresh start leaves that work to a process of its own, which nothing
+waits for. The private directory is in the user's temporary directory,
+which macOS takes about a millisecond to name: fwe takes `TMPDIR` when
+it names it, and otherwise what the first fwe process to ask was told,
+kept in the process store. A process fwe starts for a guest's `execve`
+is handed the private directory itself.
 
 ### Namespaces
 
