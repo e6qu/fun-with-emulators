@@ -1174,6 +1174,14 @@ pub fn post_landed(sig: u64, info: SigInfo) {
         // Ignored, and not held: gone, as Linux drops it.
         return;
     }
+    if sig == signal::SIGCHLD {
+        crate::trace::note_to_file(&format!(
+            "signal: SIGCHLD from {} landed on {} (blocked {})",
+            info.pid,
+            tid(),
+            !unblocked
+        ));
+    }
     let own = matches!(sig, signal::SIGPIPE | signal::SIGXFSZ);
     if own || (1..=signal::NSIG).contains(&sig) && mask() & (1 << (sig - 1)) == 0 {
         post_self(sig, info);
@@ -1203,6 +1211,13 @@ pub fn post_process(sig: u64, info: SigInfo) {
 /// to the process would reach one thread the host picks, which may block
 /// `sig` and wait on, leaving the one that takes it asleep.
 pub fn post_process_waking(sig: u64, info: SigInfo) {
+    if sig == signal::SIGCHLD {
+        crate::trace::note_to_file(&format!(
+            "signal: SIGCHLD from {} posted (pending {:#x})",
+            info.pid,
+            PROCESS.bits()
+        ));
+    }
     post_process(sig, info);
     wake_others(crate::host::WAKE_SIGNAL);
 }

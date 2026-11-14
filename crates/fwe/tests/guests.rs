@@ -3958,7 +3958,8 @@ fn namespaces(scenario: &str) -> String {
     let out = run_bounded(cmd);
     eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let notes = std::fs::read_to_string(&trace).unwrap_or_default();
-    let reaper: Vec<&str> = notes.lines().filter(|l| l.contains("reaper")).collect();
+    let reaper: Vec<&str> =
+        notes.lines().filter(|l| l.contains("reaper") || l.contains("SIGCHLD")).collect();
     eprintln!("--- its reaper's notes:\n{}", reaper.join("\n"));
     let _ = std::fs::remove_file(&trace);
     let _ = std::fs::remove_dir_all(&root);

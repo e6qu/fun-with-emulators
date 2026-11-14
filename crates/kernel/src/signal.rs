@@ -499,6 +499,13 @@ impl<P: Platform> Kernel<P> {
             }
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(info) = thread::take_pending(sig) else { continue };
+            if sig == signal::SIGCHLD {
+                crate::trace::note_to_file(&format!(
+                    "signal: SIGCHLD from {} delivered to {}",
+                    info.pid,
+                    thread::tid()
+                ));
+            }
             // fwe's nudge of a seized thread: no signal for the guest.
             if sig == signal::SIGSTOP && info.code == crate::ptrace::POKE_CODE {
                 self.ptrace_poked(regs);
