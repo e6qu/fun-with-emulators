@@ -417,7 +417,11 @@ keeps:
   the fork is done. The child goes on only once the parent has unblocked
   signals, so a signal it sends its parent keeps its sender, and enters
   the guest directly with `x0` = 0 rather than through the trap frame it
-  inherited, whose signal mask macOS would not restore.
+  inherited, whose signal mask macOS would not restore. Every signal but
+  `SIGSEGV`, `SIGBUS` and `SIGSYS` is held across the host `fork`; one of
+  those sent to the child before it is set up (it may not know its own
+  pid yet, and it forgets its parent's pending signals as it starts) is
+  kept and posted once it is (`trap::post_early`).
 - **VM fork state** (`Kernel::save_for_fork`, `crates/kernel/src/snapshot.rs`):
   signal dispositions, the forking thread's mask and alternate stack, the
   break, filesystem view, credentials, descriptor limits, every descriptor
@@ -577,7 +581,8 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   with the tid and posted to that thread through a table of the threads'
   pending sets the handler reads without a lock.
 - **Threads of another process:** each tid's process is recorded beside
-  the shared tid counter (taken sixty-four at a time), and a process that
+  the shared tid counter in the process records' memory (taken
+  sixty-four at a time), and a process that
   has had more than its main thread publishes its tids, in an entry of
   its own in the process records' memory, which `/proc/<pid>/task`
   lists.
@@ -586,15 +591,15 @@ them lives in the kernel crate (`crates/kernel/src/signal.rs`,
   Linux sends them.
 - **Notes:** a sender writes a note in one of eight slots per host
   signal in the target's mailbox (pid, uid, time, and for `SI_MESGQ` the
-  code and value) with `pwrite`, a free one or else the oldest; the
-  target's handler reads the note of the sender the host names, or the
-  oldest, with `pread`, both async-signal-safe. The first sender makes
-  the mailbox (a process makes none of its own: most are sent nothing);
-  the first note read keeps it open in fwe's reserved descriptor range
-  while it is the file at its path (else it is read by the path: a process
-  with the pid of one whose records were left behind opened that one's,
-  which goes when they are cleared; clearing them keeps a live process's
-  mailbox and mappings).
+  code and value), a free one or else the oldest; the target's handler
+  takes the note of the sender the host names, or the oldest. Mailboxes
+  are a pool in the process records' memory (4096 of them), one given to
+  a pid by its first sender (a process makes none of its own: most are
+  sent nothing) and taken back with its record, or when the pool is full
+  and its process is gone. Each slot and queue entry is claimed and taken
+  with a compare-and-swap of a word holding a generation (for the queue,
+  the ticket that orders it) and the sender, so the handler takes notes
+  without a lock, whatever its thread was doing.
 - **Before a re-exec,** the whole guest mask goes on the host, and signals
   fwe holds pending that the guest blocks are re-raised on the thread,
   which the host `execve` keeps.
@@ -950,7 +955,8 @@ each behaves inside fwe:
   - the watches are a shared record naming each file by host device and
     inode; an overlay's file is named by the overlay and its lower file
     (a copy-up records that), so watches survive a copy-up;
-  - shared words beside each instance's socket count what is queued (to
+  - shared words of each instance (a cell of the process records'
+    memory) count what is queued (to
     `fs.inotify.max_queued_events`, then `IN_Q_OVERFLOW` once the rest is
     read) and keep the last event, so an identical one is merged;
   - `IN_ONESHOT`, `IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`,

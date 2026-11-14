@@ -250,6 +250,9 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             }
         };
         fwe_kernel::timing::mark("fork: prepared");
+        // A fault signal sent to the child before it is set up is kept
+        // for it (`trap::post_early`).
+        trap::FORKING.store(host::pid(), Ordering::SeqCst);
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
@@ -271,6 +274,9 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             set_shared(false);
             pid
         });
+        if pid != 0 {
+            trap::FORKING.store(0, Ordering::SeqCst);
+        }
         fwe_kernel::timing::mark(if pid == 0 { "fork: child" } else { "fork: parent" });
         let e = fwe_kernel::host::last_error();
         // The child's pid: in the child, its own namespace's; in the
@@ -280,6 +286,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
             thread::forked();
+            // A signal sent to it as it was being made is its own.
+            trap::post_early();
             // The parent's threads' stacks are none of the child's to reuse.
             crate::stacks::forked();
             // Nor are its waiting threads.

@@ -954,6 +954,26 @@ fn threads_first_run_shared_code_together() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A signal sent to a child the instant it exists ends it, even one fwe
+/// leaves deliverable across the host's `fork` (which reaches the child
+/// before it is set up).
+#[test]
+fn a_signal_sent_as_a_child_starts_ends_it() {
+    let prog = build_c_dynamic("forkkill", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "forkkill");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "signal 7: killed\nsignal 11: killed\nsignal 31: killed\nsignal 15: killed\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A child that asks for its parent often (fwe keeps the answer while the
 /// parent lives) sees it change once the parent ends.
 #[test]

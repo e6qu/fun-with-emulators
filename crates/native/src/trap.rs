@@ -742,7 +742,10 @@ fn take_async(
         } else {
             let info = sent();
             let lsig = host::signal_to_linux(sig);
-            if REROUTING.with(Cell::get) {
+            if in_fork_child() {
+                // Kept until the child forgets its parent's signals.
+                keep_early(lsig, info);
+            } else if REROUTING.with(Cell::get) {
                 thread::post_process(lsig, info);
             } else {
                 thread::post_landed(lsig, info);
@@ -936,6 +939,57 @@ fn linux_fault_signal(host: libc::c_int, addr: u64, esr: u32) -> u64 {
 
 /// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
 const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
+
+/// The pid of a process forking, from before its host `fork` until its
+/// child is set up (in the child) or the fork has returned (in the
+/// parent); 0 otherwise.
+pub static FORKING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// A signal another process sent a fork child before it was set up (one
+/// of those not held across the host `fork`, [`FORKING`]): the Linux
+/// signal (0: none), then what it carries.
+static EARLY_SIG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EARLY_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EARLY_CODE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EARLY_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether this is a fork child not yet set up, whose pending signals are
+/// still to be forgotten as its parent's. Async-signal-safe.
+fn in_fork_child() -> bool {
+    let forking = FORKING.load(std::sync::atomic::Ordering::SeqCst);
+    forking != 0 && forking != host::pid_now()
+}
+
+/// Keep Linux signal `sig`, carrying `info`, for [`post_early`].
+/// Async-signal-safe.
+fn keep_early(sig: u64, info: thread::SigInfo) {
+    use std::sync::atomic::Ordering::SeqCst;
+    EARLY_FROM.store(u64::from(info.pid as u32) | u64::from(info.uid) << 32, SeqCst);
+    EARLY_CODE.store(u64::from(info.code as u32) | u64::from(info.status as u32) << 32, SeqCst);
+    EARLY_VALUE.store(info.value, SeqCst);
+    EARLY_SIG.store(sig, SeqCst);
+}
+
+/// In a fork child, set up: post the signal it was sent before it was
+/// ([`keep_early`]), as the process's.
+pub fn post_early() {
+    use std::sync::atomic::Ordering::SeqCst;
+    FORKING.store(0, SeqCst);
+    let sig = EARLY_SIG.swap(0, SeqCst);
+    if sig == 0 {
+        return;
+    }
+    let (from, code) = (EARLY_FROM.load(SeqCst), EARLY_CODE.load(SeqCst));
+    let info = thread::SigInfo {
+        code: code as u32 as i32,
+        pid: from as u32 as i32,
+        uid: (from >> 32) as u32,
+        status: (code >> 32) as u32 as i32,
+        value: EARLY_VALUE.load(SeqCst),
+        poll: None,
+    };
+    thread::post_process(sig, info);
+}
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // A process that sends itself one of these signals has it emulated (see
