@@ -316,6 +316,10 @@ def macos(a):
         r = subprocess.run(fwe + [a.bench] + args, env=env, capture_output=True, text=True)
         print(r.stderr, file=sys.stderr)
     ours, theirs = micro_pair(fwe, a.bench, a.native)
+    # Where the file calls' time goes under fwe, for the log.
+    for name, args, _ in MICRO:
+        if args[0] == "file":
+            sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
     results = {"fwe": ours, "macOS": theirs}
     if not a.no_build:
         build(a, fwe, results)
@@ -457,19 +461,15 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False):
     top = ", ".join(f"{c} {n}" for c, n in ((n, c) for c, n in calls.most_common(14)))
     print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
     if profiled:
-        for d in fresh:
-            shutil.rmtree(d, ignore_errors=True)
-            os.makedirs(d)
         profile(name, ours, fresh)
 
 
-def profile(name, cmd, fresh):
-    """Run `cmd` (one fwe process, after `env -i`) once more under macOS's
-    `sample`, and log where its time went by the top of the stack: the
-    guest's own code (no symbols), or fwe's and the host libraries'
-    functions; then once more with fwe's timing marks (`fresh` emptied
-    before each run)."""
-    out = os.path.abspath(f"bench-{name.split()[0].lower()}.sample")
+def sampled(name, cmd):
+    """Run `cmd` (one fwe process) under macOS's `sample`, and log where
+    its time went by the top of the stack: the guest's own code (no
+    symbols), or fwe's and the host libraries' functions. The sample is
+    kept beside the results."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.sample")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["sample", str(proc.pid), "5", "1", "-file", out], capture_output=True)
     proc.wait()
@@ -493,8 +493,16 @@ def profile(name, cmd, fresh):
     guest = sum(n for (_, w), n in tops.items() if w == "guest")
     top = ", ".join(f"{s} ({w}) {n * 100 // total}%" for (s, w), n in tops.most_common(12))
     print(f"{name}: {guest * 100 // total}% in guest code; top of stack: {top}", file=sys.stderr)
-    # fwe's own marks of the run (FWE_TIMING): start-up, and the code pages
-    # it wrote as they first ran.
+
+
+def profile(name, cmd, fresh):
+    """[`sampled`] of `cmd` (one fwe process, after `env -i`), then a run
+    with fwe's timing marks: start-up, and the code pages it wrote as they
+    first ran (`fresh` emptied before each run)."""
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    sampled(name, cmd)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
