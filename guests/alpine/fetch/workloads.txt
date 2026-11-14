@@ -1,0 +1,37 @@
+# Alpine Linux 3.24 aarch64 files the benchmarks fetch from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs with SQLite, git, xz
+# and Python 3 and what they need, whose realistic workloads the benchmarks
+# run under fwe (all position-independent: natively). Each line is a path
+# under that URL and the file's SHA-256.
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and clang 22 with
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/main/aarch64/ncurses-terminfo-base-6.6_p20260516-r0.apk e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d
+v3.24/main/aarch64/libncursesw-6.6_p20260516-r0.apk 51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6
+v3.24/main/aarch64/readline-8.3.3-r1.apk 9f0ae0923c02b0d6aba62e9173542b65396ba3f0efefcbf087ea32f1120e7b34
+v3.24/main/aarch64/sqlite-3.53.4-r0.apk 753f39e446fa0208a58323147e568326c8426454dc4f7ccc4b375d7e6dd19b3b
+v3.24/main/aarch64/ca-certificates-bundle-20261020-r0.apk d0a573c27d337c369ad3abe3f39f09ffe67b95af23861577a8d134738375176a
+v3.24/main/aarch64/brotli-libs-1.2.1-r0.apk f802b9d5a329c216f02e73607cb8f662c434767e41686367ac0afcf6d0d45d64
+v3.24/main/aarch64/c-ares-1.34.9-r0.apk 1bda7f36597a3f6d616b0c8bd25cd611299bf353ec5ee2ae102e97694885c2f1
+v3.24/main/aarch64/libcrypto3-3.5.9-r0.apk 2676a2b0b6e23ea2edccf3ee982b9842a665d52603d047de3d0a185dc316d983
+v3.24/main/aarch64/libunistring-1.4.2-r0.apk 58abfcbce2459071c505771a572a79953d6043d72b643ed0d5285ca39cdaf85c
+v3.24/main/aarch64/libidn2-2.3.8-r0.apk d02ffda4510652f89c5fb89cd2e7ff721afb0c74e7d75476ad60bebe7ac0ae20
+v3.24/main/aarch64/nghttp2-libs-1.70.0-r0.apk 7ef451f4dcdc065aa872c2f3c78b9d9bb4348caa5bcc70dee0c9e1fcf8e4c1fd
+v3.24/main/aarch64/libpsl-0.21.5-r3.apk b31e91371425d5f80c1db5cba2a849956b65c802add0b49de844b2ca961aa8da
+v3.24/main/aarch64/libssl3-3.5.9-r0.apk 20ac252b276d73f2c69c1d25f84537c7fba81caefc026c6be1094b394af2082e
+v3.24/main/aarch64/zlib-1.4-r0.apk d3e30d012a3445222b0b4a28f1d4d97ce67387f8b48561921111696da174f0de
+v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818
+v3.24/main/aarch64/libcurl-8.23.0-r0.apk 64ae89f6e5d318ed5209778232191806ce49644ce9e09540b7d7830a5330d127
+v3.24/main/aarch64/libexpat-2.10.0-r0.apk 99144fe0b1bb9316a3bc30c38707996767806661f4a0456fcf4565ac92e79b0f
+v3.24/main/aarch64/pcre2-10.49-r0.apk 03efd0b29f7f38deb10a9ccb54f56e19683eb7ac27eb1f347e6dbd2e59ea000d
+v3.24/main/aarch64/git-2.54.1-r0.apk 6a9dc5e00013a8daecedd1c2951ec16fc69f0e5ade6847db81e86a9e658323b7
+v3.24/main/aarch64/xz-libs-5.8.4-r0.apk 9be375832e747afe14f98e400e8b55d8f6fde25e41663090c81600628daab093
+v3.24/main/aarch64/xz-5.8.4-r0.apk 05e4e19bc47caf6d2dcf22c493ae5a44a6d7c395b4cedead2328698e52dc6bad
+v3.24/main/aarch64/libbz2-1.0.8-r6.apk 28cb76bb6d11d2a55c3061b5fcb2ab84996412a248b2c9fe52bb710d0a2a84e7
+v3.24/main/aarch64/libffi-3.5.2-r1.apk 9a67280b0c7c62db658c2d4d32ed1199903bef859c32dd4245e1a7e35c89ab4b
+v3.24/main/aarch64/gdbm-1.26-r0.apk bad50eb26533e2f58e014fbcd3c1744f2fdb79954af6e3c188ccd059251c7790
+v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+v3.24/main/aarch64/mpdecimal-4.0.1-r0.apk 358959600f99f58deee30ca9089c7f6f0f1bd73cc0021e321a7dbf6f735935c6
+v3.24/main/aarch64/libpanelw-6.6_p20260516-r0.apk a6912c654c821db4f8a801321709205bd482b0e515b862f2d02045e21b73d97d
+v3.24/main/aarch64/sqlite-libs-3.53.4-r0.apk b39d8d73c1208838a436f2d481ba605b52a095f8d6ff781556eafc81cd1a13e9
+v3.24/main/aarch64/python3-3.14.10-r1.apk 980b5108e756f1aae298c041ef6bb229b655b7a5393b8c001f6bac8a03825429

@@ -79,8 +79,10 @@ network.
   instructions run unmodified on the CPU, in-process, with no virtual
   machine where one is not needed; no abstraction fwe adds may put a cost
   in the program's own code, and what fwe adds at system calls, process
-  creation and start-up is held to budgets measured in CI against native
-  macOS (a build, natively with the same clang release as fwe runs). A design that would slow guest code (a packet-level network
+  creation and start-up, and programs at work (a build, a script, a
+  database, a repository, compression), is held to budgets measured in CI
+  against native macOS running the same programs' native builds. A design
+  that would slow guest code (a packet-level network
   stack, instrumenting every block) is chosen only where nothing cheaper
   gives the behaviour.
 - **No blockers:** an implementation problem is something to solve.

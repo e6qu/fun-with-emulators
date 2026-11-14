@@ -146,10 +146,14 @@ Linux code runs at native speed, and what fwe adds is held to budgets
 natively wherever fwe can make them fit the Mac.
 
 - [ ] **Benchmark budgets in CI:** the benchmark job fails when fwe exceeds
-  a budget against native macOS on the same runner (the C build natively
-  with Homebrew's clang of the release Alpine's root has, not Apple's
-  clang, a faster build of it). The budgets and the figures on the last
-  run before this plan:
+  a budget against native macOS on the same runner. Programs run under fwe
+  as Alpine builds them and natively as Homebrew builds the same projects
+  (the C build with Homebrew's clang of the release Alpine's root has, not
+  Apple's clang, a faster build of it), on realistic workloads: a Lua
+  script, a Python script, an SQLite database on disk, a git repository's
+  commits, history and status, and xz compressing and decompressing; both
+  sides' output must match. The budgets and the figures on the last run
+  before this plan:
 
   | Benchmark | Budget | Last run |
   |---|---|---|
@@ -159,6 +163,8 @@ natively wherever fwe can make them fit the Mac.
   | `fork` + `exec` + wait | 3× | 11.6× |
   | start-up | 3× | 10× |
   | building a C project (Lua) | 1.5× | 3.9× |
+  | a Lua script, a Python script, xz | 1.2× | — |
+  | SQLite on disk, git | 1.5× | — |
 
   The work this calls for: start and end threads without per-thread files
   or scans; the per-process files written at start; `fork`'s cost per

@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""fwe's benchmarks: startup, system calls, fork/exec, threads and a C
-project's build, under fwe, natively on macOS and natively on Linux.
+"""fwe's benchmarks: startup, system calls, fork/exec, threads, a C
+project's build and programs' realistic workloads, under fwe, natively on
+macOS and natively on Linux.
 
     run.py linux --bench BENCH --cache DIR --out linux.json
         On arm64 Linux: BENCH (guests/c/bench.c, built static-pie) runs
-        natively; Lua is built in an Alpine 3.24 container (docker).
+        natively; Lua is built, and the workloads run, in an Alpine 3.24
+        container (docker).
 
-    run.py macos --fwe FWE --bench BENCH --native NATIVE --cache DIR
-                 --native-cc CC [--linux linux.json] [--no-build] --out macos.json
+    run.py macos --fwe FWE --bench BENCH --native NATIVE --brew PREFIX
+                 --cache DIR [--linux linux.json] [--no-build] --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
-        source built for macOS) runs natively; Lua is built with clang
-        under FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched
-        into DIR), and natively with the same clang release (`--native-cc`).
-        With the Linux
-        results, a table of all three is printed (and appended to
-        $GITHUB_STEP_SUMMARY). `--no-build` leaves the build out (Alpine's
-        programs run only in CI). `--native-cc` is the native build's
-        compiler (CI: Homebrew's clang of Alpine's release). It fails when a
-        figure of fwe's exceeds its budget (BUDGETS) against macOS's.
+        source built for macOS) runs natively. Lua is built with clang under
+        FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched into
+        DIR), and natively with Homebrew's clang of the same release (under
+        PREFIX); the workloads (tools/bench/workloads: Lua, Python, SQLite,
+        git and xz) run under FWE in an Alpine root of those programs
+        (guests/alpine/fetch/workloads.txt) and natively with Homebrew's
+        builds of them, each side's output checked against the other's.
+        With the Linux results, a table of all three is printed (and
+        appended to $GITHUB_STEP_SUMMARY). `--no-build` leaves the build and
+        the workloads out (Alpine's programs run only in CI). It fails when
+        a figure of fwe's exceeds its budget (BUDGETS) against macOS's.
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -122,6 +126,26 @@ BUDGETS = {
     "fork+exit+wait (us)": 3.0,
     "fork+exec+wait (us)": 3.0,
     "build Lua (s)": 1.5,
+    # Programs at work: those that compute 1.2x, those that are mostly
+    # system calls (a database on disk, a repository) as a call is, 1.5x.
+    "Lua script (s)": 1.2,
+    "Python script (s)": 1.2,
+    "xz (s)": 1.2,
+    "SQLite (s)": 1.5,
+    "git (s)": 1.5,
+}
+
+# The workloads (tools/bench/workloads).
+WORKLOADS = os.path.join(REPO, "tools/bench/workloads")
+
+# Homebrew's builds the native side runs, under `--brew`: the clang release
+# Alpine's root has, and the programs of the workloads.
+BREW = {
+    "clang": "opt/llvm@22/bin/clang",
+    "python": "opt/python@3.14/bin/python3.14",
+    "sqlite": "opt/sqlite/bin/sqlite3",
+    "git": "opt/git/bin/git",
+    "xz": "opt/xz/bin/xz",
 }
 
 
@@ -246,6 +270,27 @@ def linux(a):
             r["build Lua (s)"] = lua_build_s(
                 lambda args: ["docker", "exec", "-w", "/src", name, "make"] + args, src
             )
+            # The workloads, with the Lua just built and Alpine's programs.
+            shutil.copytree(WORKLOADS, os.path.join(src, "wl"))
+            subprocess.run(
+                ["docker", "exec", name, "apk", "add", "-q", "sqlite", "git", "xz", "python3"],
+                check=True,
+            )
+
+            def timed(cmd):
+                full = ["docker", "exec", name, "sh", "-c", f"rm -rf /tmp/w && mkdir /tmp/w && cd /tmp/w && {cmd}"]
+                start = time.perf_counter()
+                subprocess.run(full, check=True, capture_output=True)
+                return time.perf_counter() - start
+
+            for row, cmd in (
+                ("Lua script (s)", "/src/src/lua /src/wl/bench.lua"),
+                ("Python script (s)", "python3 /src/wl/bench.py"),
+                ("SQLite (s)", "sqlite3 /tmp/w/db '.read /src/wl/bench.sql'"),
+                ("git (s)", "sh /src/wl/git.sh /src/src /usr/bin/git"),
+                ("xz (s)", "sh /src/wl/xz.sh /src/src /usr/bin/xz"),
+            ):
+                r[row] = best(lambda cmd=cmd: timed(cmd), 3)
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     write(a.out, r)
@@ -296,10 +341,10 @@ def over_budget(results):
 
 def build(a, fwe, results):
     """Lua built with clang under fwe, in an Alpine root's /tmp (the guest
-    given only its own environment), and natively with `--native-cc`: the
-    same clang release as Alpine's (Homebrew's `llvm@22`), so the two
-    differ by fwe, not by the compiler (Apple's clang is another, faster
-    build of it)."""
+    given only its own environment), and natively with Homebrew's clang of
+    the same release, so the two differ by fwe, not by the compiler
+    (Apple's clang is another, faster build of it). Then the workloads,
+    the Lua script with the Lua each side built."""
     lua = fetch(*LUA, a.cache)
     root = alpine_root("clang", a.cache)
     tmp = os.path.join(root, "tmp")
@@ -330,9 +375,11 @@ def build(a, fwe, results):
         # Alpine's clang, in its root under fwe.
         ours.append(lua_build_once(lambda args: make + args, "clang", traced))
         theirs.append(
-            lua_build_once(lambda args: ["make", "-C", native_src] + args, a.native_cc)
+            lua_build_once(
+                lambda args: ["make", "-C", native_src] + args,
+                os.path.join(a.brew, BREW["clang"]),
+            )
         )
-    shutil.rmtree(native, ignore_errors=True)
     results["fwe"]["build Lua (s)"] = min(ours)
     results["macOS"]["build Lua (s)"] = min(theirs)
     # The Lua it built runs.
@@ -344,6 +391,84 @@ def build(a, fwe, results):
     )
     if out.stdout.strip() != "42":
         sys.exit(f"the Lua fwe built printed {out.stdout!r}")
+    # The Lua script, in the build's root.
+    shutil.copytree(WORKLOADS, os.path.join(tmp, "wl"), dirs_exist_ok=True)
+    workload(
+        results,
+        "Lua script (s)",
+        guest_env + fwe + ["--root", root, os.path.join(src, "src/lua"), "/tmp/wl/bench.lua"],
+        [os.path.join(native_src, "src/lua"), os.path.join(WORKLOADS, "bench.lua")],
+    )
+    workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    shutil.rmtree(native, ignore_errors=True)
+
+
+def workload(results, name, ours, theirs, fresh=()):
+    """Time workload `name`: command `ours` under fwe and `theirs` natively,
+    in turns, three rounds, the best of each kept. Each round starts with
+    the directories `fresh` empty. Both must succeed and print the same."""
+    times = {"fwe": [], "macOS": []}
+    outs = {}
+    for _ in range(3):
+        for side, cmd in (("fwe", ours), ("macOS", theirs)):
+            for d in fresh:
+                shutil.rmtree(d, ignore_errors=True)
+                os.makedirs(d)
+            start = time.perf_counter()
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            times[side].append(time.perf_counter() - start)
+            if r.returncode != 0:
+                sys.exit(f"{name} {side} failed ({r.returncode}): {r.stderr[-3000:]}")
+            outs[side] = r.stdout
+    if outs["fwe"] != outs["macOS"]:
+        sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
+    for side in times:
+        results[side][name] = min(times[side])
+
+
+def workloads(a, fwe, guest_env, lua_src, results):
+    """The workloads of Python, SQLite, git and xz: under fwe in their
+    Alpine root, natively with Homebrew's builds of them. git and xz work on
+    the Lua sources in `lua_src` (copied into the root)."""
+    root = alpine_root("workloads", a.cache)
+    tmp = os.path.join(root, "tmp")
+    shutil.copytree(WORKLOADS, os.path.join(tmp, "wl"), dirs_exist_ok=True)
+    src = os.path.join(tmp, "luasrc")
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src)
+    for f in os.listdir(lua_src):
+        if f.endswith((".c", ".h")):
+            shutil.copy(os.path.join(lua_src, f), src)
+    native = tempfile.mkdtemp()
+    ours_w, theirs_w = os.path.join(tmp, "w"), os.path.join(native, "w")
+    brew = {k: os.path.join(a.brew, v) for k, v in BREW.items()}
+
+    def under(prog, *args):
+        return guest_env + fwe + ["--root", root, os.path.join(root, prog.lstrip("/"))] + list(args)
+
+    def script(name, prog_ours, prog_theirs):
+        return (
+            under("/bin/sh", "-c", f"cd /tmp/w && sh /tmp/wl/{name} /tmp/luasrc {prog_ours}"),
+            ["/bin/sh", "-c", f"cd {theirs_w} && sh {WORKLOADS}/{name} {lua_src} {prog_theirs}"],
+        )
+
+    fresh = (ours_w, theirs_w)
+    workload(
+        results,
+        "Python script (s)",
+        under("/usr/bin/python3", "/tmp/wl/bench.py"),
+        [brew["python"], os.path.join(WORKLOADS, "bench.py")],
+    )
+    workload(
+        results,
+        "SQLite (s)",
+        under("/usr/bin/sqlite3", "/tmp/w/db", ".read /tmp/wl/bench.sql"),
+        [brew["sqlite"], os.path.join(theirs_w, "db"), f".read {WORKLOADS}/bench.sql"],
+        fresh,
+    )
+    workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh)
+    workload(results, "xz (s)", *script("xz.sh", "/usr/bin/xz", brew["xz"]), fresh)
+    shutil.rmtree(native, ignore_errors=True)
 
 
 def render(results):
@@ -386,7 +511,7 @@ def main():
     mc.add_argument("--cache", required=True)
     mc.add_argument("--linux")
     mc.add_argument("--no-build", action="store_true")
-    mc.add_argument("--native-cc", required=True, help="the native build's compiler")
+    mc.add_argument("--brew", required=True, help="Homebrew's prefix: the native programs")
     mc.add_argument("--out", required=True)
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)
