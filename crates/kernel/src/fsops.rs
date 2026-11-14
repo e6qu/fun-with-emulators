@@ -755,7 +755,10 @@ impl<P: Platform> Kernel<P> {
         }
         #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
         let file = (st.st_dev as u64, st.st_ino as u64);
-        crate::fdmarks::opened_as(fd, file, d.ns_path, d.mount_id, d.mount_flags, d.fstype, None);
+        // Where it is in the mount namespace: the root's place, and the
+        // way below it.
+        let ns = crate::mounts::join(self.fs().proc_root(), d.name.to_bytes());
+        crate::fdmarks::opened_as(fd, file, ns, d.mount_id, d.mount_flags, d.fstype, None);
         // A number reused keeps no earlier open's word.
         crate::fdstate::update(fd, |s| s.created = false);
         Some(fd as i64)

@@ -142,11 +142,9 @@ fn direct_in(v: &View, dirfd: i32, path: &[u8]) -> Option<Direct> {
         name.push(b'/');
         name.extend_from_slice(c);
     }
-    let ns_path = mounts::join(v.proc_root, &name);
     Some(Direct {
         dir: v.root,
         name: cstr(&name).ok()?,
-        ns_path,
         mount_id: m.id,
         mount_flags: m.flags,
         fstype: m.fstype,
@@ -186,8 +184,6 @@ pub struct Direct {
     pub dir: i32,
     /// The path below it.
     pub name: CString,
-    /// Where it is in the mount namespace.
-    pub ns_path: Vec<u8>,
     pub mount_id: u32,
     pub mount_flags: u64,
     pub fstype: FsType,
