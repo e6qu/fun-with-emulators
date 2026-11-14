@@ -422,7 +422,7 @@ impl<P: Platform> Kernel<P> {
             t.umount(&point)
         }) {
             Ok(()) => {
-                crate::inotify::unmounted(&point);
+                crate::inotify::unmounted(ns.dir(), &point);
                 0
             }
             Err(e) => err(e),

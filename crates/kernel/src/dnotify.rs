@@ -90,6 +90,7 @@ pub fn set(fd: i32, arg: u64) -> Result<(), i32> {
                 ino: s.ino,
                 mask,
                 ns_path: Vec::new(),
+                mnt: Vec::new(),
             });
         }
         Ok(((), watching || t.watches.len() != before))
