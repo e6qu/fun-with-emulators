@@ -100,6 +100,9 @@ pub enum Count {
     Leases = 1,
     /// Memfds ever sealed against writing ([`crate::memfd`]).
     WriteSeals = 2,
+    /// Whether the registry of watched files is made
+    /// ([`crate::inotify::registry`]): 1 once it is.
+    Watches = 3,
 }
 
 /// The store's layout: where each part starts in the file.

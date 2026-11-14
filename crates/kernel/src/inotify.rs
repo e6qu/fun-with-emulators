@@ -144,13 +144,6 @@ fn alive(p: Proc) -> bool {
 }
 
 static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
-/// When this process last found no registry (monotonic milliseconds).
-static MISSED: AtomicU64 = AtomicU64::new(0);
-
-fn now_ms() -> u64 {
-    crate::host::coarse_ms() + 1
-}
-
 fn registry_dir() -> Option<Vec<u8>> {
     let mut d = crate::fs::shm::user_dir().ok()?;
     d.extend_from_slice(format!("/v{}-inotify", crate::shared::FORMAT).as_bytes());
@@ -158,36 +151,31 @@ fn registry_dir() -> Option<Vec<u8>> {
 }
 
 /// The registry, every process's, if any process has made it (it lasts,
-/// once made). A process that finds none looks again a second later at
-/// the soonest, so a file call costs nothing while nothing is watched.
+/// once made): a count in the process store says so, so a file call costs
+/// a word read while none is.
 pub fn registry() -> Option<&'static Record<Registry>> {
+    use crate::procstore::{Count, count};
     if let Some(r) = REGISTRY.get() {
         return Some(r);
     }
-    let missed = MISSED.load(Ordering::Relaxed);
-    let now = now_ms();
-    if missed != 0 && now.saturating_sub(missed) < 1000 {
+    if count(Count::Watches).load(Ordering::SeqCst) == 0 {
         return None;
     }
-    match registry_dir().and_then(|d| Record::join(&d, 0).ok()) {
-        Some(r) => {
-            let _ = REGISTRY.set(r);
-            REGISTRY.get()
-        }
-        None => {
-            MISSED.store(now, Ordering::Relaxed);
-            None
-        }
-    }
+    let r = registry_dir().and_then(|d| Record::join(&d, 0).ok())?;
+    let _ = REGISTRY.set(r);
+    REGISTRY.get()
 }
 
 /// The registry, made if no process has made it yet.
 pub(crate) fn make_registry() -> Option<&'static Record<Registry>> {
+    use crate::procstore::{Count, count};
     if let Some(r) = registry() {
         return Some(r);
     }
     let r = Record::named("inotify", 0, Registry::default).ok()?;
     let _ = REGISTRY.set(r);
+    // Every process looks for it from now on.
+    count(Count::Watches).store(1, Ordering::SeqCst);
     REGISTRY.get()
 }
 
