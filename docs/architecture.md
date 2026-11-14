@@ -262,7 +262,9 @@ The pieces that do it:
   the fault handler writes the page (each word only if it is still what
   it was) and gives it the protections the guest asked for, under a lock:
   another thread that faulted on the page meanwhile finds it written and
-  runs on. A page made
+  runs on. The owed pages beside it (up to eight each way, with the same
+  protections) are written with it, in one change of protections: code
+  that runs is mostly together. A page made
   writable has its words written first; one moved by `mremap` too. A
   large library is mostly never run: clang's `libLLVM` has sites on 2,081
   of its 5,927 code pages, most never reached by a compile.

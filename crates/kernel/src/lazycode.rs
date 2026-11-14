@@ -146,12 +146,34 @@ pub fn fault(pc: u64, addr: u64) -> bool {
     if pg.done.contains(&p) {
         return true;
     }
-    let Some(owed) = pg.owed.remove(&p) else { return false };
-    write(p, &owed.writes, owed.prot);
-    pg.done.insert(p);
-    WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(prot) = pg.owed.get(&p).map(|o| o.prot) else { return false };
+    // The owed pages beside it too, as one run (code that runs is mostly
+    // together): one fault, and one change of protections each way, for
+    // them all.
+    let page = page();
+    let same = |pg: &Pages, q: u64| pg.owed.get(&q).is_some_and(|o| o.prot == prot);
+    let mut first = p;
+    while p - first < NEIGHBOURS * page && first >= page && same(&pg, first - page) {
+        first -= page;
+    }
+    let mut end = p + page;
+    while end - p < (NEIGHBOURS + 1) * page && same(&pg, end) {
+        end += page;
+    }
+    let writes: Vec<Write> = (first..end)
+        .step_by(page as usize)
+        .flat_map(|q| pg.owed.remove(&q).expect("owed").writes)
+        .collect();
+    write_run(first, end - first, &writes, prot);
+    for q in (first..end).step_by(page as usize) {
+        pg.done.insert(q);
+    }
+    WRITTEN.fetch_add((end - first) / page, std::sync::atomic::Ordering::Relaxed);
     true
 }
+
+/// How many owed pages on each side of a faulting one are written with it.
+const NEIGHBOURS: u64 = 8;
 
 /// How many pages were written as they first ran ([`fault`]).
 static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -161,28 +183,37 @@ pub fn written() -> u64 {
     WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Make `writes` in page `p` and give it host protections `prot`. A word
-/// that is not what it was when the write was owed (the file changed in
-/// place, keeping its size and time) is left as it is.
+/// Make `writes` in page `p` and give it host protections `prot`.
 fn write(p: u64, writes: &[Write], prot: i32) {
-    let page = page();
+    write_run(p, page(), writes, prot);
+}
+
+/// Make `writes` in `[start, start + len)` (whole pages) and give the run
+/// host protections `prot`. A word that is not what it was when the write
+/// was owed (the file changed in place, keeping its size and time) is left
+/// as it is.
+fn write_run(start: u64, len: u64, writes: &[Write], prot: i32) {
     // SAFETY: a page of guest code fwe prepared, writable while the words
     // are written, then as the guest protected it, with the instruction
     // cache made to see the change.
     unsafe {
-        libc::mprotect(p as *mut libc::c_void, page as usize, libc::PROT_READ | libc::PROT_WRITE);
+        libc::mprotect(
+            start as *mut libc::c_void,
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
         for &(at, was, word) in writes {
             if (at as *const u32).read() == was {
                 (at as *mut u32).write(word);
             }
         }
-        libc::mprotect(p as *mut libc::c_void, page as usize, prot);
+        libc::mprotect(start as *mut libc::c_void, len as usize, prot);
         #[cfg(target_os = "macos")]
         {
             unsafe extern "C" {
                 fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
             }
-            sys_icache_invalidate(p as *mut libc::c_void, page as usize);
+            sys_icache_invalidate(start as *mut libc::c_void, len as usize);
         }
     }
 }
