@@ -1442,7 +1442,8 @@ mod tests {
         });
         let r = read_any(me()).unwrap();
         // Its name is the program's, cut to 15 bytes as Linux's is.
-        assert_eq!((r.exe, r.auxv, r.comm), (exe.clone(), vec![1, 2, 3], exe[1..16].to_vec()));
+        let comm: Vec<u8> = exe[1..].iter().copied().take(15).collect();
+        assert_eq!((r.exe, r.auxv, r.comm), (exe.clone(), vec![1, 2, 3], comm));
         remove(&crate::procstore::lock(me()).unwrap(), me());
     }
 }
