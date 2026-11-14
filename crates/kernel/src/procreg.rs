@@ -1433,11 +1433,26 @@ pub fn write_ended(e: &Ended) {
 
 /// Every record of a process that ended and is not yet reaped.
 pub fn all_ended() -> Vec<Ended> {
+    ended_named(|_| true)
+}
+
+/// The records of processes with host pid `pid` that ended and are not yet
+/// reaped (an older one may have had its number): only theirs are read.
+fn ended_of(pid: i32) -> Vec<Ended> {
+    let prefix = format!("{pid}.");
+    ended_named(|name| name.starts_with(prefix.as_bytes()))
+}
+
+/// The ended records whose file names `wanted` picks.
+fn ended_named(wanted: impl Fn(&[u8]) -> bool) -> Vec<Ended> {
     let Some(d) = ended_dir() else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return Vec::new() };
     entries
         .flatten()
-        .filter(|e| !e.file_name().as_bytes().ends_with(b".tmp"))
+        .filter(|e| {
+            let name = e.file_name();
+            !name.as_bytes().ends_with(b".tmp") && wanted(name.as_bytes())
+        })
         .filter_map(|e| Ended::decode(&std::fs::read(e.path()).ok()?))
         .collect()
 }
@@ -1476,7 +1491,7 @@ pub fn reaped(pid: i32) {
             remove(pid);
         }
     }
-    for e in all_ended().into_iter().filter(|e| e.pid == pid) {
+    for e in ended_of(pid) {
         // Only the one the parent reaped: an older process with its pid
         // had another parent, now gone.
         if e.lineage.first().is_some_and(|&(p, _)| p == me()) {
