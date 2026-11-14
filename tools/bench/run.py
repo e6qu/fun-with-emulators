@@ -460,13 +460,15 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False):
         for d in fresh:
             shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d)
-        profile(name, ours)
+        profile(name, ours, fresh)
 
 
-def profile(name, cmd):
-    """Run `cmd` (one fwe process) once more under macOS's `sample`, and
-    log where its time went by the top of the stack: the guest's own code
-    (no symbols), or fwe's and the host libraries' functions."""
+def profile(name, cmd, fresh):
+    """Run `cmd` (one fwe process, after `env -i`) once more under macOS's
+    `sample`, and log where its time went by the top of the stack: the
+    guest's own code (no symbols), or fwe's and the host libraries'
+    functions; then once more with fwe's timing marks (`fresh` emptied
+    before each run)."""
     out = os.path.abspath(f"bench-{name.split()[0].lower()}.sample")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["sample", str(proc.pid), "5", "1", "-file", out], capture_output=True)
@@ -478,7 +480,7 @@ def profile(name, cmd):
             if line.startswith("Sort by top of stack"):
                 break
         for line in lines:
-            m = re.match(r"\s+(.+?)\s+\(in ([^)]*)\)\s+(\d+)\s*$", line)
+            m = re.match(r"\s+(.+?)\s+\(in ([^)]*)\)\s+(?:\[[^]]*\]\s+)?(\d+)\s*$", line)
             if not m:
                 if line.strip() == "" and tops:
                     break
@@ -491,6 +493,16 @@ def profile(name, cmd):
     guest = sum(n for (_, w), n in tops.items() if w == "guest")
     top = ", ".join(f"{s} ({w}) {n * 100 // total}%" for (s, w), n in tops.most_common(12))
     print(f"{name}: {guest * 100 // total}% in guest code; top of stack: {top}", file=sys.stderr)
+    # fwe's own marks of the run (FWE_TIMING): start-up, and the code pages
+    # it wrote as they first ran.
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    # (After `env -i`, which the guest's environment starts with.)
+    timed = cmd[:2] + ["FWE_TIMING=1"] + cmd[2:]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
+    marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines() if "timing: " in l]
+    print(f"{name}: fwe's marks: " + "; ".join(marks), file=sys.stderr)
 
 
 def workloads(a, fwe, guest_env, lua_src, results):
