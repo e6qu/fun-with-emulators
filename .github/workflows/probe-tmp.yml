@@ -100,3 +100,34 @@ jobs:
             clang -O2 -c lua-5.4.7/src/lparser.c -o /tmp/x.o; echo "compile exit $?"
             echo "5 x compile lparser.c:"; time sh -c "for i in \$(seq 5); do clang -O2 -c lua-5.4.7/src/lparser.c -o /tmp/x.o; done"
           ' 2>&1
+  node:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Node, several times
+        run: |
+          cargo test -p fwe --test guests --no-run
+          for i in 1 2 3 4 5 6 7 8; do
+            cargo test -q -p fwe --test guests debian_node_runs_a_workload 2>&1 | grep -E "test result|node \(" || true
+          done
+      - if: always()
+        run: |
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/fwe*.ips 2>/dev/null | head -8); do
+            echo "=== $f"
+            python3 -c "
+          import json,sys
+          t=open(sys.argv[1]).read().split('\\n',1)[1]
+          r=json.loads(t)
+          print(r.get('exception'))
+          imgs=r['usedImages']
+          ft=r['faultingThread']
+          th=r['threads'][ft]
+          ts=th.get('threadState',{})
+          print('pc', ts.get('pc'), 'lr', ts.get('lr'), 'far', ts.get('far'), 'esr', ts.get('esr'))
+          for fr in th['frames'][:12]:
+              i=fr.get('imageIndex'); im=imgs[i] if i is not None and i < len(imgs) else {}
+              print(im.get('name'), fr.get('symbol'), hex(fr.get('imageOffset',0)))
+          " "$f" || true
+          done
