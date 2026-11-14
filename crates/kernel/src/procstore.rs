@@ -337,12 +337,15 @@ pub fn remove(_held: &Held, pid: i32) {
     s.free_chain(old, old_len as usize);
 }
 
-/// Make the chain from `head` of `len` bytes entry `e`'s record: the old
-/// chain and its length.
+/// Make the chain from `head` of `len` bytes entry `e`'s record, under its
+/// lock: the old chain and its length. The sequence number is set, not
+/// counted on, so one left odd by a writer that died between its two
+/// changes is put right.
 fn replace(e: &Entry, head: u32, len: u32) -> (u32, u32) {
-    e.seq.fetch_add(1, SeqCst);
+    let odd = e.seq.load(SeqCst) | 1;
+    e.seq.store(odd, SeqCst);
     let old = (e.head.swap(head, SeqCst), e.len.swap(len, SeqCst));
-    e.seq.fetch_add(1, SeqCst);
+    e.seq.store(odd.wrapping_add(1), SeqCst);
     old
 }
 
