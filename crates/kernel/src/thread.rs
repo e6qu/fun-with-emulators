@@ -430,50 +430,20 @@ fn shared_tid() -> Option<i32> {
         block.1 += 1;
         return Some(block.1 - 1);
     }
-    let dir = crate::procreg::records_dir()?;
-    let path = std::ffi::CString::new([&dir[..], b"/tid-blocks"].concat()).ok()?;
-    // SAFETY: a NUL-terminated path in fwe's private directory; buffers of
-    // the sizes given; the descriptor is closed below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd < 0 {
-            return None;
-        }
-        crate::shared::lock_exclusive(fd);
-        let mut b = [0u8; 4];
-        let n = match libc::pread(fd, b.as_mut_ptr().cast(), 4, 0) {
-            4 => i32::from_ne_bytes(b),
-            _ => TID_FIRST,
-        };
-        // A block that fits before the end of the numbers.
-        let n = if (TID_FIRST..=TID_END - TID_BLOCK).contains(&n) { n } else { TID_FIRST };
-        let next = n + TID_BLOCK;
-        let next = if next >= TID_END { TID_FIRST } else { next };
-        libc::pwrite(fd, next.to_ne_bytes().as_ptr().cast(), 4, 0);
-        // Whose each is, for another process to find it by
-        // ([`owner_of_tid`]): the block's slot, after the counter.
-        libc::pwrite(fd, me.to_ne_bytes().as_ptr().cast(), 4, owner_at(n));
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
-        *block = (me, n + 1, n + TID_BLOCK);
-        Some(n)
-    }
+    // Whose each block is, for another process to find it by
+    // ([`owner_of_tid`]), beside the counter in the process store.
+    let n = crate::procstore::take_tid_block(TID_FIRST, TID_END, TID_BLOCK)?;
+    *block = (me, n + 1, n + TID_BLOCK);
+    Some(n)
 }
 
-/// How many thread ids [`shared_tid`] takes at once: a write to the shared
-/// file for each block, not each thread.
+/// How many thread ids [`shared_tid`] takes at once: a change of the shared
+/// counter for each block, not each thread.
 const TID_BLOCK: i32 = 64;
 
 /// The block of thread ids being given out: its process, the next, and
 /// the end.
 pub(crate) static TID_BLOCK_LEFT: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0));
-
-/// Where in the counter's file thread `tid`'s process is: its block's
-/// slot (one for each block, so the file stays small and is written once
-/// a block).
-fn owner_at(tid: i32) -> libc::off_t {
-    (4 + 4 * i64::from((tid - TID_FIRST) / TID_BLOCK)) as libc::off_t
-}
 
 /// The host process thread `tid` (one of another process's) is in, if a
 /// live one.
@@ -481,21 +451,8 @@ pub fn owner_of_tid(tid: i32) -> Option<i32> {
     if !(TID_FIRST..TID_END).contains(&tid) {
         return None;
     }
-    let dir = crate::procreg::records_dir()?;
-    let path = std::ffi::CString::new([&dir[..], b"/tid-blocks"].concat()).ok()?;
-    let mut b = [0u8; 4];
-    // SAFETY: a NUL-terminated path; a 4-byte buffer; closed below.
-    let n = unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let n = libc::pread(fd, b.as_mut_ptr().cast(), 4, owner_at(tid));
-        libc::close(fd);
-        n
-    };
-    let pid = i32::from_ne_bytes(b);
-    (n == 4 && pid > 0 && crate::host::process_exists(pid) && published_tids(pid).contains(&tid))
+    let pid = crate::procstore::tid_block_owner(((tid - TID_FIRST) / TID_BLOCK) as usize);
+    (pid > 0 && crate::host::process_exists(pid) && published_tids(pid).contains(&tid))
         .then_some(pid)
 }
 

@@ -1600,6 +1600,26 @@ pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// This process's host pid as the kernel has it now, asked each time: in
+/// a signal handler, which may run in a fork child before its
+/// `pthread_atfork` handlers have forgotten the parent's [`pid`] (or
+/// libc its own copy). Async-signal-safe.
+pub fn pid_now() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the `getpid` system call (20), which cannot fail.
+        #[allow(deprecated)]
+        unsafe {
+            libc::syscall(20)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: plain host call.
+        unsafe { libc::getpid() }
+    }
+}
+
 /// This process's host pid, kept: asked of the host once, and again in a
 /// fork child (a `pthread_atfork` handler forgets it).
 pub fn pid() -> i32 {

@@ -12,7 +12,8 @@
 //! and inode), and its mask. An instance's descriptor is a host datagram
 //! socket bound to a path in fwe's private directory, so a process that
 //! raises an event sends it there, one datagram an event, and reading,
-//! `poll` and `epoll` are the host's own. Beside it, three shared words
+//! `poll` and `epoll` are the host's own. Beside it, three shared words (a
+//! cell of the process store, [`crate::procstore::cell`])
 //! count the events queued (up to `fs.inotify.max_queued_events`, past
 //! which events are dropped and the reader is given `IN_Q_OVERFLOW` once
 //! it has read the rest), note an overflow, and keep the last event sent,
@@ -226,55 +227,25 @@ pub fn instance_of(fd: i32) -> Option<Vec<u8>> {
     }
 }
 
-/// The three shared words beside instance `path`: events queued, an
-/// overflow, the last event sent (a hash).
+/// The three shared words of instance `path`: events queued, an
+/// overflow, the last event sent (a hash). They are a cell of the process
+/// store's ([`crate::procstore::cell`]), tagged with a hash of the path:
+/// memory, where a file's mapped words would be written back to its disk.
 fn queue_words(path: &[u8]) -> Option<&'static [AtomicU64; 3]> {
-    static MAPS: Mutex<Option<HashMap<Vec<u8>, usize>>> = Mutex::new(None);
-    let mut g = MAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(HashMap::new);
-    if let Some(&p) = m.get(path) {
-        // SAFETY: a mapping made below, never unmapped.
-        return Some(unsafe { &*(p as *const [AtomicU64; 3]) });
-    }
-    let c = std::ffi::CString::new([path, b".q"].concat()).ok()?;
-    // SAFETY: a NUL-terminated path in fwe's private directory; the
-    // mapping holds the file, the descriptor is closed again.
-    let p = unsafe {
-        let fd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let p = libc::mmap(
-            std::ptr::null_mut(),
-            24,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        libc::close(fd);
-        if p == libc::MAP_FAILED {
-            return None;
-        }
-        p
-    };
-    m.insert(path.to_vec(), p as usize);
-    // SAFETY: a shared mapping of 24 bytes, aligned, kept for good.
-    Some(unsafe { &*(p as *const [AtomicU64; 3]) })
+    crate::procstore::cell(crate::shared::hash(path), false)
 }
 
-/// Remove instance `path`'s files.
+/// Remove instance `path`'s socket and words.
 fn remove_files(path: &[u8]) {
-    // A dnotify watch has no files.
+    // A dnotify watch has none.
     if crate::dnotify::is_dnotify(path) {
         return;
     }
-    for p in [path.to_vec(), [path, b".q"].concat()] {
-        if let Ok(c) = std::ffi::CString::new(p) {
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            unsafe { libc::unlink(c.as_ptr()) };
-        }
+    if let Ok(c) = std::ffi::CString::new(path) {
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        unsafe { libc::unlink(c.as_ptr()) };
     }
+    crate::procstore::free_cell(crate::shared::hash(path));
 }
 
 /// `struct inotify_event` for `wd`, `mask`, `cookie` and `name`, its name
@@ -1216,23 +1187,9 @@ impl<P: Platform> Kernel<P> {
             err(e)
         };
         // The queue's words, then the socket.
-        let Ok(q) = std::ffi::CString::new([&path[..], b".q"].concat()) else {
-            return fail(errno::EINVAL);
-        };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let qfd = unsafe {
-            libc::open(
-                q.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        // SAFETY: the descriptor just opened.
-        if qfd < 0 || unsafe { libc::ftruncate(qfd, 24) } != 0 {
+        if crate::procstore::cell(crate::shared::hash(&path), true).is_none() {
             return fail(errno::ENOMEM);
         }
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(qfd) };
         // SAFETY: plain host call; the socket is the guest's descriptor.
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
         if s < 0 {

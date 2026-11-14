@@ -7,33 +7,38 @@
 //! taken after it with no sender. Linux keeps the sender.
 //!
 //! So an fwe process that sends another a signal first leaves a note of
-//! itself in the target's mailbox, a small file beside its process record
-//! ([`crate::procreg`]): a few slots per host signal (several processes
-//! may send one at once, which the host merges), each with the sender's pid
-//! and user, when it was written, and for a signal that carries more than
-//! its sender (one a message queue raises, `SI_MESGQ`) its Linux `si_code`
-//! and value. A handler given a signal with no
-//! sender takes the note for it, if a recent one is there ([`take`]); one
-//! given a sender takes that sender's note ([`take_from`]), so a later
-//! signal from elsewhere (the terminal, the host) is not taken for it. Both
-//! are
-//! async-signal-safe: `pread` and `pwrite` on the process's own mailbox,
-//! which the first sender makes, kept open in fwe's reserved descriptor
-//! range once a handler first reads it (opening it by its path takes a
-//! number below the range for that moment only). A note whose signal could
-//! not be sent is taken back.
+//! itself in the target's mailbox, in the memory every fwe process maps
+//! ([`crate::procstore::mailbox`], given to the target by its first
+//! sender): a few slots per host signal (several processes may send one at
+//! once, which the host merges), each with the sender's pid and user, when
+//! it was written, and for a signal that carries more than its sender (one
+//! a message queue raises, `SI_MESGQ`) its Linux `si_code` and value. A
+//! handler given a signal with no sender takes the note for it, if a
+//! recent one is there ([`take`]); one given a sender takes that sender's
+//! note ([`take_from`]), so a later signal from elsewhere (the terminal,
+//! the host) is not taken for it. A note whose signal could not be sent is
+//! taken back.
+//!
+//! Every slot is claimed and taken with a compare-and-swap of its first
+//! word, which holds a generation (bumped by each change, so a slot taken
+//! and filled again meanwhile is never taken for the one seen) and the
+//! sender, or a mark while a sender fills it: no lock, so a handler reads
+//! and takes notes whatever its thread was doing.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::Ordering::{self, SeqCst};
 
 /// The directory of the process records, made once as the process starts
 /// (the handlers read it without allocating).
 static DIR: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// A slot: sender pid (`i32`), sender uid (`u32`), monotonic nanoseconds
-/// when written (`u64`), Linux `si_code` (`i32`, 0 for `SI_USER`), four
-/// bytes unused, and the value (`u64`).
-const SLOT: usize = 32;
+/// A slot's words: its state (generation above, sender or [`BUSY`] or 0
+/// below), the sender's uid and Linux `si_code`, when it was written
+/// (monotonic nanoseconds), and the value.
+const SLOT: usize = 4;
+
+/// A slot's sender while one fills it in.
+const BUSY: u64 = 0xffff_ffff;
 
 /// A sender's note, as a handler takes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,83 +66,19 @@ const FRESH_NS: u64 = 10_000_000_000;
 /// the VM's stand-in) separates them.
 const SENDER_FRESH_NS: u64 = 60_000_000_000;
 
-/// This process's own mailbox, open (-1: not yet), and the pid it is of.
-static OWN: AtomicI32 = AtomicI32::new(-1);
-static OWN_PID: AtomicI32 = AtomicI32::new(0);
-
-/// Learn where the mailboxes are. Called as the process starts, before any
-/// handler may need it.
+/// Learn where the process records are (reply sockets are made beside
+/// them). Called as the process starts, before any handler may need it.
 pub fn init() {
     if DIR.get().is_none()
         && let Some(d) = crate::procreg::records_dir()
     {
         let _ = DIR.set(d);
     }
-    open_own();
 }
 
-/// Open this process's own mailbox, if it is not open yet for this pid (a
-/// fork child has its parent's open): where its handlers read notes.
-pub fn open_own() {
-    let me = crate::host::pid();
-    if OWN_PID.load(Ordering::SeqCst) == me {
-        return;
-    }
-    let mut buf = [0u8; 512];
-    let Some(path) = mailbox(me, &mut buf) else { return };
-    // Not made here: the first sender makes it, and the first note read
-    // keeps it open ([`own_mailbox`]). Most processes are sent nothing,
-    // and making a file costs more than the rest of a fork child's start.
-    // SAFETY: a NUL-terminated path; the descriptor is moved out of the
-    // guest's range and kept for the process's life.
-    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
-    let fd = if fd >= 0 { crate::fdtable::reserve(fd).unwrap_or(-1) } else { -1 };
-    let old = OWN.swap(fd, Ordering::SeqCst);
-    OWN_PID.store(me, Ordering::SeqCst);
-    if old >= 0 {
-        // The parent's, inherited.
-        // SAFETY: fwe's own descriptor, no longer used.
-        unsafe { libc::close(old) };
-    }
-}
-
-/// `<dir>/<pid>.sig`, NUL-terminated, in `buf`. Async-signal-safe.
-fn mailbox(pid: i32, buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
-    record_file(pid, b".sig", buf)
-}
-
-/// The path of process `pid`'s file beside its record with suffix `suffix`
-/// (`.sig`, its mailbox; `.end`, how it ended), NUL-terminated in `buf`.
-/// Async-signal-safe: it allocates nothing.
-pub fn record_file(pid: i32, suffix: &[u8], buf: &mut [u8; 512]) -> Option<*const libc::c_char> {
-    let dir = DIR.get()?;
-    let mut digits = [0u8; 12];
-    let mut n = pid.unsigned_abs();
-    let mut len = 0;
-    loop {
-        digits[len] = b'0' + (n % 10) as u8;
-        len += 1;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    let need = dir.len() + 1 + len + suffix.len() + 1;
-    if pid <= 0 || need > buf.len() {
-        return None;
-    }
-    buf[..dir.len()].copy_from_slice(dir);
-    let mut at = dir.len();
-    buf[at] = b'/';
-    at += 1;
-    for i in (0..len).rev() {
-        buf[at] = digits[i];
-        at += 1;
-    }
-    buf[at..at + suffix.len()].copy_from_slice(suffix);
-    buf[at + suffix.len()] = 0;
-    Some(buf.as_ptr().cast())
-}
+/// A fork child, or a process that runs another program: nothing to do
+/// (its mailbox is found by its pid).
+pub fn open_own() {}
 
 fn now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -146,47 +87,37 @@ fn now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// Where the slots of host signal `sig` start.
-fn offset(sig: libc::c_int) -> Option<libc::off_t> {
-    (1..SIGNALS as libc::c_int)
-        .contains(&sig)
-        .then(|| (sig as usize * PER_SIGNAL * SLOT) as libc::off_t)
+/// The words of host signal `sig`'s slots in mailbox `mb`.
+fn slots(mb: &[crate::procstore::Word], sig: libc::c_int) -> Option<&[crate::procstore::Word]> {
+    let s = usize::try_from(sig).ok().filter(|s| (1..SIGNALS).contains(s))?;
+    let at = NOTES_AT + s * PER_SIGNAL * SLOT;
+    mb.get(at..at + PER_SIGNAL * SLOT)
 }
 
-/// The pid and time of slot `i` of `slots`.
-fn slot_of(slots: &[u8], i: usize) -> (i32, u64) {
-    let s = &slots[i * SLOT..(i + 1) * SLOT];
-    (
-        i32::from_ne_bytes(s[0..4].try_into().unwrap()),
-        u64::from_ne_bytes(s[8..16].try_into().unwrap()),
-    )
+/// The mailbox's words: a ticket counter, the notes, then the queue.
+const NOTES_AT: usize = 1;
+
+/// Claim the slot whose state word is `w`, seen as `seen`: its next
+/// generation, marked [`BUSY`] until filled in.
+fn claim(w: &crate::procstore::Word, seen: u64) -> Option<u64> {
+    let generation = (seen >> 32).wrapping_add(1) & 0xffff_ffff;
+    w.compare_exchange(seen, generation << 32 | BUSY, SeqCst, SeqCst).ok().map(|_| generation)
 }
 
 /// The signal [`note`] was for could not be sent: take the note back, if
 /// it is still this process's.
 pub fn unnote(target: i32, sig: libc::c_int) {
-    let Some(off) = offset(sig) else { return };
-    let mut buf = [0u8; 512];
-    let Some(path) = mailbox(target, &mut buf) else { return };
-    let mut slots = [0u8; PER_SIGNAL * SLOT];
-    // SAFETY: a NUL-terminated path; buffers of their lengths.
-    unsafe {
-        let fd = libc::open(path, libc::O_RDWR | libc::O_CLOEXEC);
-        if fd < 0 {
-            return;
-        }
-        crate::shared::lock_exclusive(fd);
-        let me = libc::getpid();
-        let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
-        // This process's latest note there.
-        let mine = (0..n / SLOT)
-            .filter(|&i| slot_of(&slots, i).0 == me)
-            .max_by_key(|&i| slot_of(&slots, i).1);
-        if let Some(i) = mine {
-            libc::pwrite(fd, [0u8; SLOT].as_ptr().cast(), SLOT, off + (i * SLOT) as libc::off_t);
-        }
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
+    let Some(mb) = crate::procstore::mailbox(target, false) else { return };
+    let Some(slots) = slots(mb, sig) else { return };
+    let me = crate::host::pid() as u64;
+    // This process's latest note there.
+    let mine = slots
+        .chunks(SLOT)
+        .map(|s| (s, s[0].load(SeqCst), s[2].load(SeqCst)))
+        .filter(|&(_, state, _)| state & 0xffff_ffff == me)
+        .max_by_key(|&(_, _, when)| when);
+    if let Some((s, state, _)) = mine {
+        let _ = s[0].compare_exchange(state, state & !0xffff_ffff, SeqCst, SeqCst);
     }
 }
 
@@ -199,154 +130,91 @@ pub fn note(target: i32, sig: libc::c_int) {
 /// As [`note`], for a signal the target is to take with Linux `si_code`
 /// `code` and value `value` (a message queue's notification).
 pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
-    let Some(off) = offset(sig) else { return };
-    let mut buf = [0u8; 512];
-    let Some(path) = mailbox(target, &mut buf) else { return };
-    let mut slot = [0u8; SLOT];
-    // SAFETY: plain host calls.
-    let (me, uid) = unsafe { (libc::getpid(), libc::getuid()) };
-    slot[0..4].copy_from_slice(&me.to_ne_bytes());
-    slot[4..8].copy_from_slice(&uid.to_ne_bytes());
-    slot[8..16].copy_from_slice(&now_ns().to_ne_bytes());
-    slot[16..20].copy_from_slice(&code.to_ne_bytes());
-    slot[24..32].copy_from_slice(&value.to_ne_bytes());
-    // A free slot of the signal's, or the oldest note's, under the
-    // mailbox's lock (other senders write there too).
-    let mut slots = [0u8; PER_SIGNAL * SLOT];
-    // SAFETY: a NUL-terminated path; buffers of their lengths.
-    unsafe {
-        let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            crate::shared::lock_exclusive(fd);
-            let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
-            let len = slots.len();
-            slots[n.min(len)..].fill(0);
-            let at = (0..PER_SIGNAL)
-                .find(|&i| slot_of(&slots, i).0 == 0)
-                .or_else(|| (0..PER_SIGNAL).min_by_key(|&i| slot_of(&slots, i).1))
-                .unwrap_or(0);
-            libc::pwrite(fd, slot.as_ptr().cast(), SLOT, off + (at * SLOT) as libc::off_t);
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-        }
-    }
-}
-
-/// This process's mailbox for a handler to read: the descriptor kept open
-/// for it while it is still the file at the mailbox's path, and whether it
-/// was opened here instead (to be closed by the caller). A fork child
-/// before it opened its own (it may be sent a signal at once) reads it by
-/// its path; so does a process whose file was replaced: one that started
-/// with the pid of a process whose records were left behind opens that
-/// one's mailbox, which goes when those records are cleared, and senders
-/// then write a new one. Async-signal-safe; the caller keeps errno.
-fn own_mailbox() -> Option<(i32, bool)> {
-    let me = crate::host::pid();
-    let mut buf = [0u8; 512];
-    let path = mailbox(me, &mut buf)?;
-    let own = OWN.load(Ordering::SeqCst);
-    if OWN_PID.load(Ordering::SeqCst) == me && own >= 0 {
-        // SAFETY: stat buffers of their size; a NUL-terminated path.
-        let same = unsafe {
-            let (mut a, mut b): (libc::stat, libc::stat) = (std::mem::zeroed(), std::mem::zeroed());
-            libc::fstat(own, &mut a) == 0
-                && libc::stat(path, &mut b) == 0
-                && (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    let Some(mb) = crate::procstore::mailbox(target, true) else { return };
+    let Some(slots) = slots(mb, sig) else { return };
+    // SAFETY: plain host call.
+    let uid = unsafe { libc::getuid() };
+    let me = crate::host::pid() as u64;
+    // A free slot of the signal's, or the oldest note's.
+    for _ in 0..64 {
+        let state = |s: &[crate::procstore::Word]| s[0].load(SeqCst);
+        let pick = slots.chunks(SLOT).find(|s| state(s) & 0xffff_ffff == 0).or_else(|| {
+            slots
+                .chunks(SLOT)
+                .filter(|s| state(s) & 0xffff_ffff != BUSY)
+                .min_by_key(|s| s[2].load(SeqCst))
+        });
+        let Some(s) = pick else {
+            std::thread::yield_now();
+            continue;
         };
-        if same {
-            return Some((own, false));
-        }
+        let seen = state(s);
+        let Some(generation) = claim(&s[0], seen) else { continue };
+        s[1].store(u64::from(uid) | (code as u32 as u64) << 32, SeqCst);
+        s[2].store(now_ns(), SeqCst);
+        s[3].store(value, SeqCst);
+        s[0].store(generation << 32 | me, SeqCst);
+        return;
     }
-    // SAFETY: a NUL-terminated path; async-signal-safe.
-    let fd = unsafe { libc::open(path, libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    // Kept for the next note, out of the guest's range, if none is kept:
-    // the mailbox a sender made after this process started.
-    if OWN_PID.load(Ordering::SeqCst) == me && own < 0 {
-        // SAFETY: plain host calls on the descriptor just opened;
-        // async-signal-safe.
-        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, crate::fdtable::guest_max()) };
-        if high >= 0 {
-            // SAFETY: the descriptor opened above, now copied.
-            unsafe { libc::close(fd) };
-            if OWN.compare_exchange(-1, high, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                return Some((high, false));
-            }
-            return Some((high, true));
-        }
-    }
-    Some((fd, true))
 }
 
 /// Read, and with `clear_if` (clearing only a note of that sender, or with
 /// 0 any), clear this process's note for host signal `sig`.
 /// Async-signal-safe.
 fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
-    let off = offset(sig)?;
-    let saved = crate::host::last_errno();
-    let Some((fd, opened)) = own_mailbox() else {
-        crate::host::set_errno(saved);
-        return None;
-    };
-    let opened = opened.then_some(fd);
-    let mut slots = [0u8; PER_SIGNAL * SLOT];
-    let mut slot = [0u8; SLOT];
-    // SAFETY: fwe's own descriptor of the mailbox; buffers of their
-    // lengths.
-    let got = unsafe {
-        let n = libc::pread(fd, slots.as_mut_ptr().cast(), slots.len(), off).max(0) as usize;
-        let now = now_ns();
+    // (A fork child's handler may run before it knows its own pid.)
+    let mb = crate::procstore::mailbox(crate::host::pid_now(), false)?;
+    let slots = slots(mb, sig)?;
+    let now = now_ns();
+    for _ in 0..64 {
         // The note of the sender named, or (none named) the oldest recent
         // one: the signal the host merged others into came first.
-        let pick = (0..n / SLOT)
-            .filter(|&i| {
-                let (pid, when) = slot_of(&slots, i);
+        let pick = slots
+            .chunks(SLOT)
+            .map(|s| (s, s[0].load(SeqCst)))
+            .filter(|&(s, state)| {
+                let pid = state & 0xffff_ffff;
                 pid != 0
+                    && pid != BUSY
                     && match clear_if {
-                        Some(c) if c != 0 => pid == c,
-                        _ => now.saturating_sub(when) < FRESH_NS,
+                        Some(c) if c != 0 => pid == c as u64,
+                        _ => now.saturating_sub(s[2].load(SeqCst)) < FRESH_NS,
                     }
             })
-            .min_by_key(|&i| slot_of(&slots, i).1);
-        if let Some(i) = pick {
-            slot.copy_from_slice(&slots[i * SLOT..(i + 1) * SLOT]);
-            if clear_if.is_some() {
-                let zero = [0u8; SLOT];
-                libc::pwrite(fd, zero.as_ptr().cast(), SLOT, off + (i * SLOT) as libc::off_t);
-            }
-        }
-        pick.is_some()
-    };
-    if let Some(fd) = opened {
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(fd) };
-    }
-    crate::host::set_errno(saved);
-    let word = |at: usize| slot[at..at + 4].try_into().unwrap();
-    got.then(|| {
-        let note = Note {
-            pid: i32::from_ne_bytes(word(0)),
-            uid: u32::from_ne_bytes(word(4)),
-            tid: 0,
-            code: i32::from_ne_bytes(word(16)),
-            value: u64::from_ne_bytes(slot[24..32].try_into().unwrap()),
+            .min_by_key(|&(s, _)| s[2].load(SeqCst));
+        let (s, state) = pick?;
+        let (ids, when, value) = (s[1].load(SeqCst), s[2].load(SeqCst), s[3].load(SeqCst));
+        // Taken (or, not to be taken, still as read): else read again.
+        let kept = if clear_if.is_some() {
+            s[0].compare_exchange(state, state & !0xffff_ffff, SeqCst, SeqCst).is_ok()
+        } else {
+            s[0].load(SeqCst) == state
         };
-        (note, u64::from_ne_bytes(slot[8..16].try_into().unwrap()))
-    })
+        if kept {
+            let note = Note {
+                pid: (state & 0xffff_ffff) as i32,
+                uid: ids as u32,
+                tid: 0,
+                code: (ids >> 32) as i32,
+                value,
+            };
+            return Some((note, when));
+        }
+    }
+    None
 }
 
 /// The queue of signals the host has no equivalent of (Linux's real-time
 /// signals, `SIGSTKFLT`, `SIGPWR`), after the host signals' slots: each
-/// entry is the Linux signal (0: free), the sender's pid and uid, the
-/// `si_code` and the value. A sender queues one under the mailbox's lock
-/// ([`queue`]), then wakes the target with [`crate::host::WAKE_SIGNAL`],
-/// whose handler takes them all ([`drain`]).
-const QUEUE_AT: usize = SIGNALS * PER_SIGNAL * SLOT;
+/// entry's words are its state (the ticket it was queued with above, the
+/// Linux signal or 0 or [`BUSY`] below), the sender's pid and uid, the
+/// `si_code` and thread, and the value. A sender queues one ([`queue`]),
+/// then wakes the target with [`crate::host::WAKE_SIGNAL`], whose handler
+/// takes them all, in the order of their tickets ([`drain`]).
+const QUEUE_AT: usize = NOTES_AT + SIGNALS * PER_SIGNAL * SLOT;
 /// Entries in the queue: as many signals as may wait for a process.
 const QUEUE_LEN: usize = 64;
-const ENTRY: usize = 32;
+const ENTRY: usize = 4;
 
 /// Queue Linux signal `sig`, which the host lacks, for host process
 /// `target`, sent with `code` and `value` (and this process as sender):
@@ -514,103 +382,80 @@ fn answer_mem(caller: i32, token: u64) {
 }
 
 fn put(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
-    let mut buf = [0u8; 512];
-    let path = mailbox(target, &mut buf).ok_or(fwe_abi::errno::ESRCH)?;
-    // SAFETY: plain host calls.
-    let (me, uid) = unsafe { (libc::getpid(), libc::getuid()) };
-    // SAFETY: a NUL-terminated path; buffers of their stated lengths; the
-    // descriptor is closed below.
-    unsafe {
-        let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd < 0 {
-            return Err(fwe_abi::errno::ESRCH);
-        }
-        crate::shared::lock_exclusive(fd);
-        let mut q = [0u8; QUEUE_LEN * ENTRY];
-        let n = libc::pread(fd, q.as_mut_ptr().cast(), q.len(), QUEUE_AT as libc::off_t);
-        if n < q.len() as isize {
-            // Short of the queue: what is missing is free.
-            q[n.max(0) as usize..].fill(0);
-        }
-        let sig_at = |i: usize| i32::from_ne_bytes(q[i * ENTRY..i * ENTRY + 4].try_into().unwrap());
-        let r = if sig < fwe_abi::signal::SIGRTMIN
-            && tid == 0
-            && (0..QUEUE_LEN).any(|i| sig_at(i) == sig as i32)
-        {
-            Ok(())
-        } else if let Some(i) = (0..QUEUE_LEN).find(|&i| sig_at(i) == 0) {
-            let mut e = [0u8; ENTRY];
-            e[0..4].copy_from_slice(&(sig as i32).to_ne_bytes());
-            e[4..8].copy_from_slice(&me.to_ne_bytes());
-            e[8..12].copy_from_slice(&uid.to_ne_bytes());
-            e[12..16].copy_from_slice(&code.to_ne_bytes());
-            e[16..24].copy_from_slice(&value.to_ne_bytes());
-            e[24..28].copy_from_slice(&tid.to_ne_bytes());
-            let at = (QUEUE_AT + i * ENTRY) as libc::off_t;
-            if libc::pwrite(fd, e.as_ptr().cast(), ENTRY, at) == ENTRY as isize {
-                Ok(())
-            } else {
-                Err(fwe_abi::errno::EAGAIN)
-            }
-        } else {
-            Err(fwe_abi::errno::EAGAIN)
-        };
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
-        r
+    let mb = crate::procstore::mailbox(target, true).ok_or(fwe_abi::errno::ESRCH)?;
+    let q = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY).ok_or(fwe_abi::errno::ESRCH)?;
+    // SAFETY: plain host call.
+    let uid = unsafe { libc::getuid() };
+    let me = crate::host::pid() as u32;
+    let sig_of = |e: &[crate::procstore::Word]| e[0].load(SeqCst) & 0xffff_ffff;
+    // A standard signal already queued for the process is not queued
+    // again, as Linux keeps one.
+    if sig < fwe_abi::signal::SIGRTMIN
+        && tid == 0
+        && q.chunks(ENTRY).any(|e| sig_of(e) == sig && (e[2].load(SeqCst) >> 32) as i32 == 0)
+    {
+        return Ok(());
     }
+    for _ in 0..4 {
+        for e in q.chunks(ENTRY) {
+            let seen = e[0].load(SeqCst);
+            if seen & 0xffff_ffff != 0 {
+                continue;
+            }
+            let ticket = mb[0].fetch_add(1, SeqCst) & 0xffff_ffff;
+            if e[0].compare_exchange(seen, ticket << 32 | BUSY, SeqCst, SeqCst).is_err() {
+                continue;
+            }
+            e[1].store(u64::from(me) | u64::from(uid) << 32, SeqCst);
+            e[2].store(code as u32 as u64 | (tid as u32 as u64) << 32, SeqCst);
+            e[3].store(value, SeqCst);
+            e[0].store(ticket << 32 | sig, SeqCst);
+            return Ok(());
+        }
+    }
+    Err(fwe_abi::errno::EAGAIN)
 }
 
 /// In the wake signal's handler: take every queued signal for this
 /// process, each with its sender's note, in the order queued.
-/// Async-signal-safe.
+/// Async-signal-safe (it allocates nothing).
 pub fn drain(mut post: impl FnMut(u64, Note)) {
-    let saved = crate::host::last_errno();
-    let Some((fd, opened)) = own_mailbox() else {
-        crate::host::set_errno(saved);
-        return;
-    };
-    let mut q = [0u8; QUEUE_LEN * ENTRY];
-    // SAFETY: fwe's descriptor of the mailbox; a buffer of its length.
-    let n = unsafe {
-        crate::shared::lock_exclusive(fd);
-        let n = libc::pread(fd, q.as_mut_ptr().cast(), q.len(), QUEUE_AT as libc::off_t);
-        if n > 0 {
-            let zero = [0u8; QUEUE_LEN * ENTRY];
-            libc::pwrite(fd, zero.as_ptr().cast(), n as usize, QUEUE_AT as libc::off_t);
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    let Some(q) = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY) else { return };
+    // Taken in ticket order: the lowest left, each round.
+    let mut taken = [(0u64, 0u64, 0u64, 0u64, 0u64); QUEUE_LEN];
+    let mut n = 0;
+    for e in q.chunks(ENTRY) {
+        let state = e[0].load(SeqCst);
+        let sig = state & 0xffff_ffff;
+        if sig == 0 || sig == BUSY {
+            continue;
         }
-        libc::flock(fd, libc::LOCK_UN);
-        if opened {
-            libc::close(fd);
+        let (a, b, c) = (e[1].load(SeqCst), e[2].load(SeqCst), e[3].load(SeqCst));
+        if e[0].compare_exchange(state, state & !0xffff_ffff, SeqCst, SeqCst).is_ok() {
+            taken[n] = (state >> 32, sig, a, b, c);
+            n += 1;
         }
-        n
-    };
-    crate::host::set_errno(saved);
-    for e in q[..n.max(0) as usize].as_chunks::<ENTRY>().0.iter() {
-        let word = |at: usize| e[at..at + 4].try_into().unwrap();
-        let sig = i32::from_ne_bytes(word(0));
-        if sig as u64 == FOSTER_NOTE {
+    }
+    let taken = &mut taken[..n];
+    taken.sort_unstable_by_key(|t| t.0);
+    for &(_, sig, ids, code_tid, value) in taken.iter() {
+        let pid = ids as u32 as i32;
+        if sig == FOSTER_NOTE {
             crate::reaper::fostered();
-        } else if sig as u64 == MEM_REQUEST {
-            answer_mem(
-                i32::from_ne_bytes(word(4)),
-                u64::from_ne_bytes(e[16..24].try_into().unwrap()),
-            );
-        } else if sig as u64 == FD_REQUEST {
-            answer_fd(
-                i32::from_ne_bytes(word(4)),
-                i32::from_ne_bytes(word(12)),
-                u64::from_ne_bytes(e[16..24].try_into().unwrap()),
-            );
-        } else if sig > 0 {
+        } else if sig == MEM_REQUEST {
+            answer_mem(pid, value);
+        } else if sig == FD_REQUEST {
+            answer_fd(pid, code_tid as u32 as i32, value);
+        } else {
             post(
-                sig as u64,
+                sig,
                 Note {
-                    pid: i32::from_ne_bytes(word(4)),
-                    uid: u32::from_ne_bytes(word(8)),
-                    code: i32::from_ne_bytes(word(12)),
-                    value: u64::from_ne_bytes(e[16..24].try_into().unwrap()),
-                    tid: i32::from_ne_bytes(word(24)),
+                    pid,
+                    uid: (ids >> 32) as u32,
+                    code: code_tid as u32 as i32,
+                    value,
+                    tid: (code_tid >> 32) as i32,
                 },
             );
         }
@@ -839,11 +684,7 @@ pub fn receive_fd(sock: i32) -> (i32, i32) {
 
 /// Host process `pid`'s mailbox goes with its record.
 pub fn remove(pid: i32) {
-    let mut buf = [0u8; 512];
-    if let Some(path) = mailbox(pid, &mut buf) {
-        // SAFETY: a NUL-terminated path.
-        unsafe { libc::unlink(path) };
-    }
+    crate::procstore::forget_mailbox(pid);
 }
 
 #[cfg(test)]
@@ -876,37 +717,20 @@ mod tests {
         assert_eq!(again, 0);
     }
 
-    /// A mailbox replaced under a process that has it open (the records
-    /// of an earlier process with its pid cleared after it started) still
-    /// brings it its senders' notes.
+    /// A note left for this process is taken once, by a handler that
+    /// names no sender, and one for another sender is left.
     #[test]
-    fn a_replaced_mailbox_is_read_by_its_path() {
+    fn notes_are_taken_once() {
         let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
         init();
         let me = crate::host::pid();
-        if DIR.get().is_none() {
-            return;
-        }
         // A signal no other test notes.
         let sig = libc::SIGXFSZ;
-        let mut buf = [0u8; 512];
-        let path = mailbox(me, &mut buf).unwrap();
-        // SAFETY: a NUL-terminated path.
-        unsafe { libc::unlink(path) };
         note(me, sig);
         assert_eq!(take(sig).map(|n| n.pid), Some(me));
         assert!(take(sig).is_none());
-    }
-
-    #[test]
-    fn mailbox_path_is_made_without_allocating() {
-        init();
-        let Some(dir) = DIR.get() else { return };
-        let mut buf = [0u8; 512];
-        let p = mailbox(4021, &mut buf).unwrap();
-        // SAFETY: NUL-terminated by `mailbox`.
-        let s = unsafe { std::ffi::CStr::from_ptr(p) };
-        assert_eq!(s.to_bytes(), [&dir[..], b"/4021.sig"].concat());
-        assert!(mailbox(0, &mut buf).is_none());
+        note_with(me, sig, -3, 9);
+        assert!(take_from(sig, me + 1).is_none());
+        assert_eq!(take_from(sig, me).map(|n| (n.code, n.value)), Some((-3, 9)));
     }
 }

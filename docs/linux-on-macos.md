@@ -1085,9 +1085,9 @@ wait on a pipe until the child execs or exits (made, and the parent's write
 end closed, under the kernel lock, so no child another thread forks
 meanwhile holds it). In the VM no host fork
 happens: a fresh `fwe --hv-fork-child` gets the kernel state over a Mach
-port (with fwe's private directory, where the run's records and signal
-mailboxes are: the host's lookup of the user's temporary directory gives
-another one there) and every slab page over a socket (a `vfork` child
+port (with fwe's private directory, where the run's records are kept
+beside the shared memory of process records and signal mailboxes: the
+host's lookup of the user's temporary directory gives another one there) and every slab page over a socket (a `vfork` child
 fetches pages as it touches them); `CLONE_VM` without `CLONE_VFORK` fails with `ENOSYS`. See
 [fork](#fork).
 

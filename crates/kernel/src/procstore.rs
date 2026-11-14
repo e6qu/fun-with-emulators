@@ -12,6 +12,11 @@
 //!   to a bitmap of free ones.
 //! - **Ended accounts** (how a process ended, for its reaper): a table of
 //!   their own, each taken whole by one reaper.
+//! - **Thread numbers** outside a pid namespace ([`crate::thread`]): a
+//!   counter blocks of them are taken from, and each block's process.
+//! - **Signal mailboxes** ([`crate::signote`]): a pool of them, each given
+//!   to a pid as it is first sent a signal through one, and taken back
+//!   with its record, or once its process is gone.
 //!
 //! A reader takes no lock: it reads the sequence number, the bytes and the
 //! number again, and reads again if a change came between. A writer holds
@@ -55,7 +60,8 @@ struct Entry {
     len: AtomicU32,
     /// How the process ended of a signal ([`set_end`]), with [`END_SET`].
     end: AtomicU32,
-    _pad: AtomicU32,
+    /// Its signal mailbox ([`mailbox`]), from 1 (0: none).
+    mailbox: AtomicU32,
 }
 
 const END_SET: u32 = 1 << 31;
@@ -89,7 +95,21 @@ const ENTRIES_AT: usize = 64;
 const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 const ENDED_AT: usize = USED_AT + PIDS / 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
-const TAKEN_AT: usize = FREE_HINT_AT + 64;
+/// Thread-number blocks: the next block's first number, then each
+/// block's process.
+pub const TID_BLOCKS: usize = 1 << 16;
+const TID_NEXT_AT: usize = FREE_HINT_AT + 64;
+const TID_OWNERS_AT: usize = TID_NEXT_AT + 64;
+/// Signal mailboxes: how many, each's words (its process, then what
+/// [`crate::signote`] lays out), and which are given out.
+const MAILBOXES: usize = 4096;
+pub const MAILBOX_WORDS: usize = 1290;
+const MAILBOX_TAKEN_AT: usize = TID_OWNERS_AT + TID_BLOCKS * 4;
+const MAILBOXES_AT: usize = MAILBOX_TAKEN_AT + MAILBOXES / 8;
+/// Cells of three shared words, each named by a tag ([`cell`]).
+const CELLS: usize = 1024;
+const CELLS_AT: usize = MAILBOXES_AT + MAILBOXES * MAILBOX_WORDS * 8;
+const TAKEN_AT: usize = CELLS_AT + CELLS * 32;
 const BLOCKS_AT: usize = (TAKEN_AT + BLOCKS / 8).div_ceil(BLOCK) * BLOCK;
 const SIZE: usize = BLOCKS_AT + BLOCKS * BLOCK;
 
@@ -104,9 +124,9 @@ static STORE: OnceLock<Option<Store>> = OnceLock::new();
 /// only: a file's dirty pages would be written back to its disk as each
 /// process holding them ends, milliseconds on a virtual machine's).
 fn name() -> String {
-    // Its size in MiB too: an object's size is set once, so a layout of
-    // another size is another object. (macOS allows names of 31 bytes.)
-    format!("/fwe{}v{}p{}", crate::host::euid(), crate::shared::FORMAT, SIZE >> 20)
+    // Its size too: an object's size is set once, so a layout of another
+    // size is another object. (macOS allows names of 31 bytes.)
+    format!("/fwe{}v{}p{:x}", crate::host::euid(), crate::shared::FORMAT, SIZE)
 }
 
 fn map() -> Option<Store> {
@@ -148,7 +168,16 @@ fn map() -> Option<Store> {
 }
 
 fn store() -> Option<&'static Store> {
-    STORE.get_or_init(map).as_ref()
+    STORE
+        .get_or_init(|| {
+            let s = map();
+            if s.is_none() {
+                // Without it no process is known to another: said once.
+                eprintln!("fwe: the process records ({}) could not be mapped", name());
+            }
+            s
+        })
+        .as_ref()
 }
 
 /// Map the store now, so that [`end_status`] (from a signal handler) finds
@@ -289,6 +318,162 @@ impl Store {
             b = link.load(SeqCst);
         }
         Some(out)
+    }
+}
+
+/// Take the next block of `size` thread numbers from `first` (up to
+/// `end`, then from `first` again) for this process: its first number.
+pub fn take_tid_block(first: i32, end: i32, size: i32) -> Option<i32> {
+    let s = store()?;
+    let next: &AtomicU32 = s.at(TID_NEXT_AT);
+    let mut cur = next.load(SeqCst);
+    let n = loop {
+        let n = cur as i32;
+        let n = if (first..=end - size).contains(&n) { n } else { first };
+        let after = if n + size >= end { first } else { n + size };
+        match next.compare_exchange(cur, after as u32, SeqCst, SeqCst) {
+            Ok(_) => break n,
+            Err(now) => cur = now,
+        }
+    };
+    let block = ((n - first) / size) as usize;
+    if block < TID_BLOCKS {
+        let owner: &AtomicU32 = s.at(TID_OWNERS_AT + block * 4);
+        owner.store(crate::host::pid() as u32, SeqCst);
+    }
+    Some(n)
+}
+
+/// The process that took thread-number block `block` last (0: none).
+pub fn tid_block_owner(block: usize) -> i32 {
+    let Some(s) = store() else { return 0 };
+    if block >= TID_BLOCKS {
+        return 0;
+    }
+    let owner: &AtomicU32 = s.at(TID_OWNERS_AT + block * 4);
+    owner.load(SeqCst) as i32
+}
+
+/// A word of shared memory.
+pub type Word = AtomicU64;
+
+/// Host pid `pid`'s signal mailbox (its words after its owner's), given
+/// one now if it has none and `make`. Without `make`, async-signal-safe
+/// once the store is mapped ([`init`]).
+pub fn mailbox(pid: i32, make: bool) -> Option<&'static [AtomicU64]> {
+    let s = if make { store()? } else { STORE.get()?.as_ref()? };
+    let e = s.entry(pid)?;
+    let words = |i: u32| -> &'static [AtomicU64] {
+        let at = MAILBOXES_AT + (i as usize - 1) * MAILBOX_WORDS * 8;
+        // SAFETY: mailbox `i`'s words, inside the mapping, kept for the
+        // process's life; atomics only.
+        unsafe { std::slice::from_raw_parts((s.base + at) as *const AtomicU64, MAILBOX_WORDS) }
+    };
+    let i = e.mailbox.load(SeqCst);
+    if i != 0 {
+        return Some(&words(i)[1..]);
+    }
+    if !make {
+        return None;
+    }
+    for round in 0..2 {
+        if let Some(i) = s.take_mailbox() {
+            words(i)[0].store(pid as u64, SeqCst);
+            return match e.mailbox.compare_exchange(0, i, SeqCst, SeqCst) {
+                Ok(_) => Some(&words(i)[1..]),
+                Err(theirs) => {
+                    // Another sender gave it one first.
+                    s.give_back_mailbox(i, words(i));
+                    Some(&words(theirs)[1..])
+                }
+            };
+        }
+        if round == 0 {
+            // None free: those of processes gone are.
+            for i in 1..=MAILBOXES as u32 {
+                let owner = words(i)[0].load(SeqCst) as i32;
+                if owner > 0 && !crate::host::process_exists(owner) {
+                    forget_mailbox(owner);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The three shared words of the cell tagged `tag` (not 0): the one
+/// tagged so, or with `make` a free one, zeroed, tagged now (`None` if
+/// none is free).
+pub fn cell(tag: u64, make: bool) -> Option<&'static [Word; 3]> {
+    let s = store()?;
+    let tag = tag | 1;
+    let at = |i: usize| -> &'static [Word; 4] { s.at(CELLS_AT + i * 32) };
+    if let Some(i) = (0..CELLS).find(|&i| at(i)[0].load(SeqCst) == tag) {
+        return Some(at(i)[1..].try_into().unwrap());
+    }
+    if !make {
+        return None;
+    }
+    for i in 0..CELLS {
+        let c = at(i);
+        if c[0].load(SeqCst) == 0 && c[0].compare_exchange(0, u64::MAX, SeqCst, SeqCst).is_ok() {
+            for w in &c[1..] {
+                w.store(0, SeqCst);
+            }
+            c[0].store(tag, SeqCst);
+            return Some(c[1..].try_into().unwrap());
+        }
+    }
+    None
+}
+
+/// The cell tagged `tag` is free again.
+pub fn free_cell(tag: u64) {
+    let Some(s) = store() else { return };
+    for i in 0..CELLS {
+        let c: &[Word; 4] = s.at(CELLS_AT + i * 32);
+        let _ = c[0].compare_exchange(tag | 1, 0, SeqCst, SeqCst);
+    }
+}
+
+/// Host pid `pid`'s mailbox goes (its record went, or its process).
+pub fn forget_mailbox(pid: i32) {
+    let Some(s) = store() else { return };
+    let Some(e) = s.entry(pid) else { return };
+    let i = e.mailbox.swap(0, SeqCst);
+    if i != 0 {
+        let at = MAILBOXES_AT + (i as usize - 1) * MAILBOX_WORDS * 8;
+        // SAFETY: as in [`mailbox`].
+        let w =
+            unsafe { std::slice::from_raw_parts((s.base + at) as *const AtomicU64, MAILBOX_WORDS) };
+        s.give_back_mailbox(i, w);
+    }
+}
+
+impl Store {
+    fn take_mailbox(&self) -> Option<u32> {
+        for w in 0..MAILBOXES / 64 {
+            let word: &AtomicU64 = self.at(MAILBOX_TAKEN_AT + w * 8);
+            let mut cur = word.load(SeqCst);
+            while cur != u64::MAX {
+                let bit = (!cur).trailing_zeros();
+                match word.compare_exchange(cur, cur | 1 << bit, SeqCst, SeqCst) {
+                    Ok(_) => return Some((w * 64) as u32 + bit + 1),
+                    Err(now) => cur = now,
+                }
+            }
+        }
+        None
+    }
+
+    /// Mailbox `i` (its words `w`), emptied, is free again.
+    fn give_back_mailbox(&self, i: u32, w: &[AtomicU64]) {
+        for x in w {
+            x.store(0, SeqCst);
+        }
+        let b = i as usize - 1;
+        let word: &AtomicU64 = self.at(MAILBOX_TAKEN_AT + b / 64 * 8);
+        word.fetch_and(!(1 << (b % 64)), SeqCst);
     }
 }
 
