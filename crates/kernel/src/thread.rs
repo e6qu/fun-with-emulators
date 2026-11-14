@@ -501,80 +501,140 @@ pub fn owner_of_tid(tid: i32) -> Option<i32> {
 /// process published ([`publish_tids`]).
 pub fn published_tids(pid: i32) -> Vec<i32> {
     let Some(dir) = crate::procreg::records_dir() else { return Vec::new() };
-    let Ok(b) = std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+    let Ok(f) = std::fs::File::open(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
         &tids_file(&dir, pid),
     )) else {
         return Vec::new();
     };
-    let Some(count) = b.get(..4).map(|c| u32::from_ne_bytes(c.try_into().unwrap()) as usize) else {
-        return Vec::new();
+    use std::os::unix::fs::FileExt;
+    let head = |f: &std::fs::File| {
+        let mut h = [0u8; 8];
+        f.read_exact_at(&mut h, 0).ok()?;
+        let seq = u32::from_ne_bytes(h[..4].try_into().unwrap());
+        let count = u32::from_ne_bytes(h[4..].try_into().unwrap()) as usize;
+        Some((seq, count.min(TIDS_CAP)))
     };
-    b[4..].as_chunks::<4>().0.iter().take(count).map(|c| i32::from_ne_bytes(*c)).collect()
+    // The list as it stood between two of its writer's changes: read
+    // again while one was under way, or one came between.
+    for _ in 0..1000 {
+        let Some((seq, count)) = head(&f) else { return Vec::new() };
+        if seq % 2 == 1 {
+            std::thread::yield_now();
+            continue;
+        }
+        let mut b = vec![0u8; 4 * count];
+        if f.read_exact_at(&mut b, 8).is_err() {
+            return Vec::new();
+        }
+        if head(&f).map(|h| h.0) == Some(seq) {
+            return b.as_chunks::<4>().0.iter().map(|c| i32::from_ne_bytes(*c)).collect();
+        }
+    }
+    Vec::new()
 }
 
 fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {
     [dir, format!("/threads-{pid}").as_bytes()].concat()
 }
 
-/// This process's thread list file, open: its pid and descriptor.
-pub(crate) static TIDS_FD: Mutex<(i32, i32)> = Mutex::new((0, -1));
+/// How many threads the list holds: more than a process has.
+const TIDS_CAP: usize = (1 << 20) / 4 - 2;
 
-/// Publish this process's threads, for another process to list
-/// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): from
-/// when it first has more than its main thread. The list is a count and the
-/// tids, written whole at once on a descriptor kept open, so a reader sees
-/// one list or the other.
+/// This process's thread list, mapped: its pid and the mapping's address
+/// (0 for none).
+pub(crate) static TIDS_MAP: Mutex<(i32, usize)> = Mutex::new((0, 0));
+
 /// The process is ending: its thread list is written no more.
 static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Close the thread list's file as the process ends, as
-/// [`crate::maps::close_for_exit`] does the mappings'.
+/// Let go of the thread list's mapping as the process ends, as
+/// [`crate::maps::close_for_exit`] does the mappings' file.
 pub fn close_tids_for_exit() {
     TIDS_ENDED.store(true, Ordering::SeqCst);
     let me = crate::host::pid();
-    let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
-    if kept.0 == me && kept.1 >= 0 {
-        // SAFETY: the descriptor kept for the list, forgotten here.
-        unsafe { libc::close(kept.1) };
-        *kept = (me, -1);
+    let mut kept = TIDS_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.0 == me && kept.1 != 0 {
+        // SAFETY: the list's mapping, forgotten here.
+        unsafe { libc::munmap(kept.1 as *mut libc::c_void, TIDS_SIZE) };
+        *kept = (me, 0);
     }
 }
 
+/// The size of the list's file and mapping: a sequence number, the count
+/// and [`TIDS_CAP`] tids (a sparse file, of which the pages written are
+/// used).
+const TIDS_SIZE: usize = 8 + 4 * TIDS_CAP;
+
+/// Publish this process's threads, for another process to list
+/// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): from
+/// when it first has more than its main thread. The list is a file this
+/// process maps and writes in memory (the host's file cache is the
+/// mapping's pages, so a reader of the file sees the writes): a sequence
+/// number, odd while it changes, the count and the tids.
 fn publish_tids(tids: &[i32]) {
     if TIDS_ENDED.load(Ordering::SeqCst) {
         return;
     }
-    let Some(dir) = crate::procreg::records_dir() else { return };
     let me = crate::host::pid();
-    let path = tids_file(&dir, me);
-    let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
-    if kept.0 != me && kept.1 >= 0 {
-        // A fork child's copy of its parent's descriptor.
-        // SAFETY: closing the descriptor this process inherited.
-        unsafe { libc::close(kept.1) };
-        *kept = (me, -1);
+    let mut kept = TIDS_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.0 != me && kept.1 != 0 {
+        // A fork child's copy of its parent's mapping, which writes the
+        // parent's file.
+        // SAFETY: unmapping this process's copy of it.
+        unsafe { libc::munmap(kept.1 as *mut libc::c_void, TIDS_SIZE) };
+        *kept = (me, 0);
     }
     // A process that never had another thread has no list; one that had
-    // keeps its file, with the main thread alone in it again (making and
-    // removing it for each thread a program starts and joins cost more
-    // than the thread). The collector removes it once the process is gone.
-    if tids.len() <= 1 && kept.1 < 0 {
+    // keeps its file, with the main thread alone in it again. The
+    // collector removes it once the process is gone.
+    if tids.len() <= 1 && kept.1 == 0 {
         return;
     }
-    if kept.1 < 0 {
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
+    if kept.1 == 0 {
+        let Some(dir) = crate::procreg::records_dir() else { return };
+        let Ok(c) = std::ffi::CString::new(tids_file(&dir, me)) else { return };
+        // SAFETY: a NUL-terminated path in fwe's private directory; the
+        // descriptor is closed once the file is mapped.
+        let map = unsafe {
+            let fd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
+            if fd < 0 {
+                return;
+            }
+            let map = if libc::ftruncate(fd, TIDS_SIZE as libc::off_t) == 0 {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    TIDS_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            } else {
+                libc::MAP_FAILED
+            };
+            libc::close(fd);
+            map
         };
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *kept = (me, fd);
+        if map == libc::MAP_FAILED {
+            return;
+        }
+        *kept = (me, map as usize);
     }
-    let mut b = Vec::with_capacity(4 + 4 * tids.len());
-    b.extend((tids.len() as u32).to_ne_bytes());
-    b.extend(tids.iter().flat_map(|t| t.to_ne_bytes()));
-    // SAFETY: a buffer of `b.len()` bytes, on the descriptor kept for it.
-    unsafe { libc::pwrite(kept.1, b.as_ptr().cast(), b.len(), 0) };
+    let base = kept.1 as *const std::sync::atomic::AtomicU32;
+    let word = |i: usize| {
+        // SAFETY: word `i` of the mapping of `TIDS_SIZE` bytes; this
+        // process writes it only under `TIDS_MAP`.
+        unsafe { &*base.add(i) }
+    };
+    let n = tids.len().min(TIDS_CAP);
+    let seq = word(0).load(Ordering::Relaxed);
+    word(0).store(seq | 1, Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    for (i, &t) in tids[..n].iter().enumerate() {
+        word(2 + i).store(t as u32, Ordering::Relaxed);
+    }
+    word(1).store(n as u32, Ordering::Relaxed);
+    word(0).store((seq | 1).wrapping_add(1), Ordering::Release);
 }
 
 /// Allocate a fresh thread id for a new thread: in a pid namespace of
@@ -1031,6 +1091,23 @@ thread_local! {
     static ALTSTACK: Cell<Stack> = const {
         Cell::new(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 })
     };
+}
+
+/// This host thread starts another guest thread ([`crate::thread_reused`]):
+/// its state is a new thread's.
+pub(crate) fn thread_reused() {
+    TID.with(|t| t.set(0));
+    CLEAR_CHILD_TID.with(|c| c.set(0));
+    ROBUST_LIST.with(|r| r.set((0, 0)));
+    NAME.with(|n| n.set(None));
+    SLACK.with(|s| s.set((DEFAULT_SLACK, DEFAULT_SLACK)));
+    HOT.with(|h| {
+        h.mask.set(0);
+        h.saved_mask.set(None);
+        h.own.set(std::ptr::null());
+        h.wake_others.set(false);
+    });
+    ALTSTACK.with(|a| a.set(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 }));
 }
 
 /// After a system call: wake the other threads if a signal for them landed
