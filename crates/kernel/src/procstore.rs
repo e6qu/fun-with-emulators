@@ -173,11 +173,10 @@ fn map() -> Result<Store, String> {
         // (macOS refuses to change it after, so a failure here is one made
         // already, which the size below checks).
         libc::ftruncate(fd, SIZE as libc::off_t);
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) != 0 {
+        let Some(st) = sized(fd) else {
             libc::close(fd);
             return Err(err("looking at"));
-        }
+        };
         if st.st_uid != crate::host::euid() || st.st_mode & 0o077 != 0 {
             libc::close(fd);
             return Err(format!(
@@ -203,6 +202,26 @@ fn map() -> Result<Store, String> {
         }
         Ok(Store { base: p as usize })
     }
+}
+
+/// The metadata of the shared memory object open as `fd`, once it has a
+/// size: another process making it at once sizes it, and its size is 0
+/// until that process's `ftruncate` is done (this one's is refused
+/// meanwhile). `None` if it cannot be looked at.
+fn sized(fd: i32) -> Option<libc::stat> {
+    // SAFETY: zeroed bytes are a valid `stat`.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    for _ in 0..1000 {
+        // SAFETY: a valid out-parameter.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return None;
+        }
+        if st.st_size != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Some(st)
 }
 
 /// The store, mapped on first use. fwe cannot run without it (no process
@@ -904,6 +923,27 @@ fn wake(word: &AtomicU32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store another process is making is waited for until it has its
+    /// size.
+    #[test]
+    fn a_store_being_sized_elsewhere_is_waited_for() {
+        let name = std::ffi::CString::new(format!("/fwe-t{}", std::process::id())).unwrap();
+        // SAFETY: plain host calls on an object of the test's own.
+        unsafe {
+            let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
+            assert!(fd >= 0);
+            let other = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                libc::ftruncate(fd, 1 << 20);
+            });
+            let st = sized(fd).unwrap();
+            other.join().unwrap();
+            assert_eq!(st.st_size, 1 << 20);
+            libc::close(fd);
+            libc::shm_unlink(name.as_ptr());
+        }
+    }
 
     /// A page made is found by its tag, zeroed, until it is freed.
     #[test]
