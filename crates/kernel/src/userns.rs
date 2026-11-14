@@ -79,6 +79,10 @@ pub type Chain = Vec<Arc<Record<UserNs>>>;
 
 pub(crate) static CURRENT: Mutex<Option<Arc<Chain>>> = Mutex::new(None);
 
+/// Whether [`CURRENT`] holds any namespace: most processes are in none,
+/// and a mapping of an id (every `stat` maps two) looks no further.
+static NESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The chain from `ns` up.
 pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {
     let mut out = Vec::new();
@@ -94,7 +98,9 @@ pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {
 /// Make `ns` (and those above it) the process's.
 pub fn set_current(ns: Option<Arc<Record<UserNs>>>) {
     let chain = Arc::new(chain_from(ns));
-    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(chain);
+    let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+    NESTED.store(!chain.is_empty(), std::sync::atomic::Ordering::SeqCst);
+    *current = Some(chain);
 }
 
 fn current() -> Arc<Chain> {
@@ -103,7 +109,7 @@ fn current() -> Arc<Chain> {
 
 /// Whether the process is in a user namespace of fwe's.
 pub fn nested() -> bool {
-    !current().is_empty()
+    NESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn down(map: &[Extent], outside: u32) -> Option<u32> {
@@ -119,6 +125,9 @@ fn up(map: &[Extent], inside: u32) -> Option<u32> {
 /// What the initial namespace's id `id` is in the process's namespace
 /// (`gid` for a group id).
 pub fn to_ns(id: u32, gid: bool) -> u32 {
+    if !nested() {
+        return id;
+    }
     let chain = current();
     let mut v = id;
     for ns in chain.iter().rev() {
@@ -135,6 +144,9 @@ pub fn to_ns(id: u32, gid: bool) -> u32 {
 /// The initial namespace's id for the process's namespace's id `id`, if it
 /// has one.
 pub fn from_ns(id: u32, gid: bool) -> Option<u32> {
+    if !nested() {
+        return Some(id);
+    }
     let chain = current();
     let mut v = id;
     for ns in chain.iter() {

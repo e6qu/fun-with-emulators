@@ -203,6 +203,10 @@ fn write_exec() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
 /// ([`Kernel::view_fault`]) or by fwe for it ([`views_written`]).
 static FILE_VIEWS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
+/// Whether a file view was ever made: until one is, a write for the guest
+/// takes no lock to look for one.
+static ANY_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn file_views() -> std::sync::MutexGuard<'static, BTreeMap<u64, u64>> {
     FILE_VIEWS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1019,7 +1023,7 @@ fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
 /// Whether any page of a private file view waits to be written (see
 /// [`FILE_VIEWS`]).
 pub fn any_views() -> bool {
-    !file_views().is_empty()
+    ANY_VIEWS.load(std::sync::atomic::Ordering::SeqCst) && !file_views().is_empty()
 }
 
 /// fwe is about to write guest range `[addr, addr + len)` for the guest:
@@ -1793,6 +1797,7 @@ impl<P: Platform> Kernel<P> {
             crate::lazycode::unmapped(p, self.page_up(len));
             track(p, self.page_up(len));
             if view {
+                ANY_VIEWS.store(true, std::sync::atomic::Ordering::SeqCst);
                 add_range(&mut file_views(), p, self.page_up(len));
             } else {
                 remove_range(&mut file_views(), p, self.page_up(len));
