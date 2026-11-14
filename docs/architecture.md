@@ -448,8 +448,10 @@ keeps:
   sequence number changed meanwhile. A program's start writes its record
   once. A native fork's child writes its whole record as it starts, with
   what its parent knows of it (its program, cgroup and whether the host
-  reaps); a look at one's own child's record that it has not written yet
-  waits for it, and so does a listing of every process.
+  reaps). The parent marks it in the store as one still to write its
+  record before its `fork` returns: until the child has, every process's
+  listing has it, and a look at its record waits for it (a reaper's
+  watcher finds so the orphan of a parent that ended at once).
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events));

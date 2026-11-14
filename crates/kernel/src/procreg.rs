@@ -239,51 +239,32 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
         return with_held(pid, read_own(pid));
     }
     let r = read_any(pid).filter(|r| start_time(pid) == Some(r.start));
-    if r.is_none() && new_child(pid) {
-        // A child this process just forked writes its own record as it
-        // starts ([`own_whole`]): wait for it, as it is there on Linux.
+    if r.is_none() && crate::procstore::unwritten(pid) {
+        // A process just forked writes its own record as it starts
+        // ([`own_whole`]): wait for it, as it is there on Linux.
+        let live = || host_info(pid).is_some_and(|(_, _, zombie)| !zombie);
         for _ in 0..2000 {
-            std::thread::sleep(std::time::Duration::from_micros(50));
             if let Some(r) = read_any(pid).filter(|r| start_time(pid) == Some(r.start)) {
                 return with_held(pid, Some(r));
             }
-            if !new_child(pid) {
+            if !live() {
                 break;
             }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Gone before it wrote one.
+        if !live() {
+            crate::procstore::forget_unwritten(pid);
         }
     }
     with_held(pid, r)
 }
 
-/// Children this process forked that write their own records
-/// ([`own_whole`]) and may not have yet.
-static UNWRITTEN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
-
 /// This process forked `child`, which writes its own record as it starts:
-/// a listing of every process waits for it ([`all`]), as on Linux the
-/// child is there once the fork returns.
+/// every process waits for it to, as on Linux the child is there once the
+/// fork returns ([`crate::procstore::mark_unwritten`]).
 pub fn child_writes_own(child: i32) {
-    let mut u = UNWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if u.len() >= 64 {
-        // A parent that forks many and lists none: those written are done.
-        u.retain(|&pid| read_any(pid).is_none() && new_child(pid));
-    }
-    u.push(child);
-}
-
-/// Wait for the records of the children this process forked that were to
-/// write their own ([`child_writes_own`]).
-fn await_unwritten() {
-    let pids = std::mem::take(&mut *UNWRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
-    for pid in pids {
-        // Waits while it is a live child with no record yet.
-        let _ = read(pid);
-    }
-}
-
-/// Whether host process `pid` is a live child of this process.
-fn new_child(pid: i32) -> bool {
-    host_info(pid).is_some_and(|(_, ppid, zombie)| ppid == me() && !zombie)
+    crate::procstore::mark_unwritten(child);
 }
 
 /// This process's record as last read, by its version then
@@ -449,7 +430,6 @@ pub fn collect_leftovers(young: std::time::Duration) {
 /// Every live process fwe has a record of, forgetting those that ended
 /// (zombies too).
 pub fn all() -> Vec<(i32, ProcRecord)> {
-    await_unwritten();
     let mut out = Vec::new();
     for pid in crate::procstore::pids() {
         // A zombie has ended (Linux lists it in no cgroup either): its

@@ -98,13 +98,18 @@ pub enum Count {
     Accounting = 0,
     /// Leases ever taken ([`crate::leases`]).
     Leases = 1,
+    /// Memfds ever sealed against writing ([`crate::memfd`]).
+    WriteSeals = 2,
 }
 
 /// The store's layout: where each part starts in the file.
 const COUNTS_AT: usize = 0;
 const ENTRIES_AT: usize = 64;
 const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
-const ENDED_AT: usize = USED_AT + PIDS / 8;
+/// The pids whose record their process writes itself as it starts, and
+/// has not yet ([`mark_unwritten`]).
+const UNWRITTEN_AT: usize = USED_AT + PIDS / 8;
+const ENDED_AT: usize = UNWRITTEN_AT + PIDS / 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
 /// Thread-number blocks: the next block's first number, then each
 /// block's process.
@@ -238,6 +243,10 @@ impl Store {
     fn entry_of(&self, kind: Kind, pid: i32) -> Option<&Entry> {
         let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
         Some(self.at(ENTRIES_AT + (kind as usize * PIDS + i) * size_of::<Entry>()))
+    }
+
+    fn unwritten(&self, word: usize) -> &AtomicU64 {
+        self.at(UNWRITTEN_AT + word * 8)
     }
 
     fn used(&self, word: usize) -> &AtomicU64 {
@@ -632,7 +641,31 @@ pub fn put(_held: &Held, pid: i32, bytes: &[u8]) {
     let head = s.write_chain(bytes);
     let (old, old_len) = replace(e, head, bytes.len() as u32);
     s.used(pid as usize / 64).fetch_or(1 << (pid as usize % 64), SeqCst);
+    s.unwritten(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
     s.free_chain(old, old_len as usize);
+}
+
+/// Host pid `pid`, just forked, writes its record itself as it starts:
+/// until it has, every process's listing ([`pids`]) has it, and a read of
+/// it waits ([`crate::procreg::read`]), as on Linux a child is there once
+/// `fork` returns.
+pub fn mark_unwritten(pid: i32) {
+    if (1..PIDS as i32).contains(&pid) {
+        store().unwritten(pid as usize / 64).fetch_or(1 << (pid as usize % 64), SeqCst);
+    }
+}
+
+/// Whether host pid `pid` is to write its record and has not yet.
+pub fn unwritten(pid: i32) -> bool {
+    (1..PIDS as i32).contains(&pid)
+        && store().unwritten(pid as usize / 64).load(SeqCst) & (1 << (pid as usize % 64)) != 0
+}
+
+/// Host pid `pid` will write no record (it is gone).
+pub fn forget_unwritten(pid: i32) {
+    if (1..PIDS as i32).contains(&pid) {
+        store().unwritten(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
+    }
 }
 
 /// Forget host pid `pid`'s record, under its lock (`_held`).
@@ -669,12 +702,12 @@ fn replace(e: &Entry, head: u32, len: u32) -> (u32, u32) {
     old
 }
 
-/// Every host pid with a record.
+/// Every host pid with a record, or to write one ([`mark_unwritten`]).
 pub fn pids() -> Vec<i32> {
     let s = store();
     let mut out = Vec::new();
     for w in 0..PIDS / 64 {
-        let mut bits = s.used(w).load(SeqCst);
+        let mut bits = s.used(w).load(SeqCst) | s.unwritten(w).load(SeqCst);
         while bits != 0 {
             let b = bits.trailing_zeros();
             out.push((w * 64) as i32 + b as i32);

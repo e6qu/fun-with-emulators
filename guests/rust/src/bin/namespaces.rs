@@ -1084,7 +1084,11 @@ fn main() {
                 usleep(200_000);
                 write_i32(go[1], 0);
                 let mut p = [res[0], 1];
-                let took = poll(&mut p, 1, 5000) == 1;
+                let polled = poll(&mut p, 1, 5000);
+                let took = polled == 1;
+                if !took {
+                    eprintln!("poll: {polled} errno {}", *__errno_location());
+                }
                 println!("orphan adopted: {}", parent == getpid());
                 println!("the worker took its SIGCHLD: {took}");
                 if took {
