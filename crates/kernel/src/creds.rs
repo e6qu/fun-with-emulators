@@ -94,9 +94,17 @@ pub fn dac_override() -> bool {
 /// Publish the access `c` gives, after a system call that may have
 /// changed it (written only when it did).
 pub fn publish(c: &Creds) {
-    let now = Access::of(c);
-    if ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref() != Some(&now) {
-        *ACCESS.write().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    // Compared where it is, as most calls change nothing: made anew only
+    // when it changed.
+    let same = ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| {
+        a.fsuid == c.fsuid
+            && a.fsgid == c.fsgid
+            && a.groups == c.groups()
+            && a.dac_override == c.has(crate::caps::CAP_DAC_OVERRIDE)
+            && a.dac_read_search == c.has(crate::caps::CAP_DAC_READ_SEARCH)
+    });
+    if !same {
+        *ACCESS.write().unwrap_or_else(|e| e.into_inner()) = Some(Access::of(c));
     }
 }
 

@@ -386,6 +386,9 @@ pub fn made(nr: u64, a: &[u64; 6], result: i64) -> Vec<i32> {
 /// lowest free number, as Linux does, so only a guest holding as many
 /// descriptors as its limit gets one.)
 pub fn over_limit(fds: &[i32]) -> bool {
+    if fds.is_empty() {
+        return false;
+    }
     let soft = limit().0;
     fds.iter().any(|&fd| fd as u64 >= soft)
 }
