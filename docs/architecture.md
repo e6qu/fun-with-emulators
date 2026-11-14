@@ -257,7 +257,8 @@ The pieces that do it:
   is kept is written as each page first runs. Its stubs are written as it
   is mapped; the words its pages owe (branches to the stubs, system calls
   turned into traps) are kept aside, and those pages are made readable but
-  not executable. The guest's first instruction fetch there faults, and
+  not executable. The guest's first instruction fetch there faults (a
+  fault on the instruction's own page; any other is handled as before), and
   the fault handler writes the page (each word only if it is still what
   it was) and gives it the protections the guest asked for, under a lock:
   another thread that faulted on the page meanwhile finds it written and

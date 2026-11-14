@@ -939,7 +939,9 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
         // The first run of a page of code whose preparation was left until
         // it runs: finished, and the guest runs on.
-        if fwe_kernel::lazycode::fault(ss.pc) {
+        // SAFETY: `info` is valid for SA_SIGINFO handlers.
+        let addr = unsafe { (*info).si_addr() } as u64;
+        if fwe_kernel::lazycode::fault(ss.pc, addr) {
             return;
         }
         // Read as the host copies, which reports a hole rather than fault:

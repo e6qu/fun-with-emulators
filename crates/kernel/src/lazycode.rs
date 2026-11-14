@@ -127,14 +127,19 @@ pub fn settle(addr: u64, len: u64) {
     }
 }
 
-/// The guest faulted at host address `pc`: if the fault is the first run
-/// of a page owed writes, make them and give the page its protections, and
-/// the guest runs on. Called from the fault handler.
-pub fn fault(pc: u64) -> bool {
+/// The guest faulted at host address `pc` on `addr`: if the fault is the
+/// first run of a page owed writes (an instruction fetch there, `addr` in
+/// the page of `pc`), make them and give the page its protections, and the
+/// guest runs on. Any other fault (a data access) is not one of these.
+/// Called from the fault handler.
+pub fn fault(pc: u64, addr: u64) -> bool {
     if !any() {
         return false;
     }
     let p = pc & !(page() - 1);
+    if addr & !(page() - 1) != p {
+        return false;
+    }
     // Under the lock throughout: another thread that faults on the page
     // meanwhile waits, then finds it done and runs on.
     let mut pg = pages();
@@ -201,14 +206,16 @@ mod tests {
         protected(p, 2 * page, libc::PROT_READ);
         // SAFETY: the mapping above, readable.
         assert_eq!(unsafe { ((p + 8) as *const u32).read() }, 0);
-        assert!(fault(p + 100));
+        assert!(fault(p + 100, p + 100));
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + 8) as *const u32).read() }, 0x1111_1111);
         // Not what it was: left alone.
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + 12) as *const u32).read() }, 0);
-        // Done: a thread that faulted there meanwhile runs on.
-        assert!(fault(p + 100));
+        // Done: a thread that faulted there meanwhile runs on; a data
+        // fault there is not one of these.
+        assert!(fault(p + 100, p + 100));
+        assert!(!fault(p + 100, p + 3 * page));
         protected(p + page, page, libc::PROT_READ | libc::PROT_WRITE);
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + page + 4) as *const u32).read() }, 0x2222_2222);

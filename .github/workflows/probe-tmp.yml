@@ -97,5 +97,6 @@ jobs:
             apk add -q clang22 musl-dev >/dev/null
             wget -q https://www.lua.org/ftp/lua-5.4.7.tar.gz && tar xzf lua-5.4.7.tar.gz
             echo "20 x clang --version:"; time sh -c "for i in \$(seq 20); do clang --version >/dev/null; done"
+            clang -O2 -c lua-5.4.7/src/lparser.c -o /tmp/x.o; echo "compile exit $?"
             echo "5 x compile lparser.c:"; time sh -c "for i in \$(seq 5); do clang -O2 -c lua-5.4.7/src/lparser.c -o /tmp/x.o; done"
           ' 2>&1
