@@ -31,8 +31,10 @@ const PIDS: usize = 1 << 17;
 pub enum Kind {
     Record = 0,
     Threads = 1,
+    /// Its threads' robust-futex list heads ([`crate::thread`]).
+    Robust = 2,
 }
-const KINDS: usize = 2;
+const KINDS: usize = 3;
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).
@@ -100,8 +102,9 @@ static STORE: OnceLock<Option<Store>> = OnceLock::new();
 /// only: a file's dirty pages would be written back to its disk as each
 /// process holding them ends, milliseconds on a virtual machine's).
 fn name() -> String {
-    // (macOS allows names of 31 bytes.)
-    format!("/fwe{}v{}procs", crate::host::euid(), crate::shared::FORMAT)
+    // Its size in MiB too: an object's size is set once, so a layout of
+    // another size is another object. (macOS allows names of 31 bytes.)
+    format!("/fwe{}v{}p{}", crate::host::euid(), crate::shared::FORMAT, SIZE >> 20)
 }
 
 fn map() -> Option<Store> {

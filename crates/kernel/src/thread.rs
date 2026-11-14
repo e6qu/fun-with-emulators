@@ -538,6 +538,8 @@ fn publish_tids(tids: &[i32]) {
 /// process left is not its own.
 pub(crate) fn forget_published() {
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
+    crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Allocate a fresh thread id for a new thread: in a pid namespace of
@@ -593,9 +595,9 @@ pub fn set_robust_list(head: u64, len: u64) {
     drop(threads);
     let host = crate::host::pid();
     if me == tgid() {
-        publish_robust(host, host, head);
+        publish_robust(host, head);
     } else if !crate::pidns::nested() {
-        publish_robust(me, host, head);
+        publish_robust(me, head);
     }
 }
 
@@ -627,91 +629,44 @@ pub fn robust_list_of(tid: i32) -> Option<u64> {
     threads.iter().find(|r| r.tid == tid).map(|r| r.robust)
 }
 
-// Robust-list heads for other processes to read (`get_robust_list`), in a
-// file beside the process records: a slot per main thread (by host pid)
-// and per thread number of fwe's ([`shared_tid`]), holding the owner's
-// host pid, when it was written (microseconds since the epoch) and the
-// head. A main thread's slot written before its process started is a
-// former process's; a thread number's is cleared when it is given out.
+// Robust-list heads for other processes to read (`get_robust_list`): the
+// process's entry of them in the process store ([`crate::procstore`]),
+// which only it writes, as (id, head) pairs: the main thread's id its host
+// pid, another's its thread number of fwe's ([`shared_tid`]).
 
-const ROBUST_SLOT: i64 = 24;
+/// The heads this process published, by id.
+pub(crate) static ROBUST: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
-fn robust_path() -> Option<std::ffi::CString> {
-    let dir = crate::procreg::records_dir()?;
-    std::ffi::CString::new([&dir[..], b"/robust"].concat()).ok()
-}
-
-fn now_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as u64)
-}
-
-/// Record slot `id`'s (a host pid or a thread number) robust-list head.
-fn publish_robust(id: i32, owner: i32, head: u64) {
-    if !(1..TID_END).contains(&id) {
-        return;
-    }
-    let Some(path) = robust_path() else { return };
-    let mut b = [0u8; ROBUST_SLOT as usize];
-    b[..4].copy_from_slice(&owner.to_ne_bytes());
-    b[8..16].copy_from_slice(&now_micros().to_ne_bytes());
-    b[16..].copy_from_slice(&head.to_ne_bytes());
-    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
-    // below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            libc::pwrite(
-                fd,
-                b.as_ptr().cast(),
-                b.len(),
-                (i64::from(id) * ROBUST_SLOT) as libc::off_t,
-            );
-            libc::close(fd);
+/// Record thread `id`'s (a host pid or a thread number) robust-list head
+/// (0: none).
+fn publish_robust(id: i32, head: u64) {
+    let mut heads = ROBUST.lock().unwrap_or_else(|e| e.into_inner());
+    let had = heads.iter().position(|&(i, _)| i == id);
+    match (had, head) {
+        (Some(i), 0) => {
+            heads.swap_remove(i);
         }
+        (Some(i), h) => heads[i].1 = h,
+        (None, 0) => return,
+        (None, h) => heads.push((id, h)),
     }
+    let b: Vec<u8> = heads
+        .iter()
+        .flat_map(|&(i, h)| (i as u64).to_ne_bytes().into_iter().chain(h.to_ne_bytes()))
+        .collect();
+    crate::procstore::put_own(crate::procstore::Kind::Robust, Some(&b));
 }
 
 /// Another process's thread's robust-list head: `host` the main thread of
 /// that host process, or `tid` one of its other threads (a number of
-/// fwe's, of process `host`). `None` if the slot is not that thread's,
-/// which then has no list.
+/// fwe's, of process `host`). `None` if it published none.
 pub fn published_robust(host: i32, tid: Option<i32>) -> Option<u64> {
     let id = tid.unwrap_or(host);
-    if !(1..TID_END).contains(&id) {
-        return None;
-    }
-    let path = robust_path()?;
-    let mut b = [0u8; ROBUST_SLOT as usize];
-    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
-    // below.
-    let n = unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let n = libc::pread(
-            fd,
-            b.as_mut_ptr().cast(),
-            b.len(),
-            (i64::from(id) * ROBUST_SLOT) as libc::off_t,
-        );
-        libc::close(fd);
-        n
-    };
-    let owner = i32::from_ne_bytes(b[..4].try_into().unwrap());
-    let written = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-    let head = u64::from_ne_bytes(b[16..].try_into().unwrap());
-    if n != ROBUST_SLOT as isize || owner != host {
-        return None;
-    }
-    // A slot written before the process started is an earlier one's (its
-    // pid, or the thread number, given again): the thread has no list.
-    if crate::procreg::start_time(host).is_none_or(|start| written < start) {
-        return None;
-    }
-    Some(head)
+    let b = crate::procstore::get_of(crate::procstore::Kind::Robust, host)?;
+    b.as_chunks::<16>().0.iter().find_map(|c| {
+        let i = u64::from_ne_bytes(c[..8].try_into().unwrap()) as i32;
+        (i == id).then(|| u64::from_ne_bytes(c[8..].try_into().unwrap()))
+    })
 }
 
 /// What a pending signal carries into the handler's `siginfo`.
@@ -1117,6 +1072,9 @@ pub fn unregister_current() {
     directed_remove(tid());
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
     publish_tids(&tids());
+    if tid() != tgid() {
+        publish_robust(tid(), 0);
+    }
 }
 
 /// As the process ends: its published threads go, and are written no
@@ -1124,6 +1082,7 @@ pub fn unregister_current() {
 pub fn process_ending() {
     TIDS_ENDED.store(true, Ordering::SeqCst);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
+    crate::procstore::put_own(crate::procstore::Kind::Robust, None);
 }
 
 // --- signals for a named thread, from a handler ------------------------------------

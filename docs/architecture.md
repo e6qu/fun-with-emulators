@@ -328,9 +328,9 @@ finish itself (see
   through `Kernel::enter_syscall` or `fwe_kernel::blocking_syscall`, as
   the trap does, unless a tracer stops at system calls (`PTRACE_SYSCALL`),
   a seccomp filter is set, or the call is one the trap runs its own way
-  (`execve`, a `clone` of a process or of a traced thread, `clone3`,
+  (`execve`, a `clone` or `clone3` of a process or of a traced thread,
   `wait4`, `waitid`, `pidfd_getfd`, the IPC waits, `rt_sigtimedwait`).
-  An untraced thread's `clone` makes the thread from the block's
+  An untraced thread's `clone` or `clone3` makes the thread from the block's
   registers, and its `exit` ends it with every host signal blocked, as
   the trap's handler would. It returns straight to the guest only when
   the call changed nothing but `x0` and the mask (the pc past the site,
@@ -533,10 +533,10 @@ scheduling; fwe adds Linux's thread identity and futexes:
   its list it still owns is marked `FUTEX_OWNER_DIED` (by a
   compare-and-swap that survives a fault in the guest's memory) and a
   waiter woken, as Linux's `exit_robust_list` does. Each thread's list is
-  in its registry entry for the process's other threads, and in a file
-  beside the process records for other processes' `get_robust_list`
-  (by host pid for a main thread, by number for another; a main thread's
-  written before its process started is a former process's).
+  in its registry entry for the process's other threads, and in the
+  process's entry of them in the process records' memory for other
+  processes' `get_robust_list` (by host pid for a main thread, by number
+  for another), which the process clears as it starts and ends.
 
 ## Signals
 
