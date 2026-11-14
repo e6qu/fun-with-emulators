@@ -81,6 +81,78 @@ fn through_sealed_link(path: &[u8]) -> Option<Vec<u8>> {
     SEALED_LINKS.contains(&&rest[..slash]).then(|| [b"/private/".as_slice(), rest].concat())
 }
 
+/// [`Fs::direct`] in view `v`: a path (from `dirfd`) the host can look up
+/// in one call from the root, refusing any link (`*_NOFOLLOW_ANY`), where
+/// it finds what the walk would: absolute or from the working directory,
+/// no `..`, no mount on the way but the root's, no `/dev`, and no search
+/// permission to check.
+fn direct_in(v: &View, dirfd: i32, path: &[u8]) -> Option<Direct> {
+    if path.is_empty() || path.last() == Some(&b'/') {
+        return None;
+    }
+    // A relative path from the working directory: its path in front, as
+    // the walk enters it.
+    let joined;
+    let path = if path.first() == Some(&b'/') {
+        path
+    } else if dirfd as i64 == fcntl::AT_FDCWD {
+        joined = [v.cwd, b"/", path].concat();
+        &joined[..]
+    } else {
+        return None;
+    };
+    let mut names = path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".");
+    let first = names.next()?;
+    let more = names.clone().next().is_some();
+    if first == b"dev" || names.clone().any(|c| c == b"..") || first == b".." {
+        return None;
+    }
+    if access_checked(v) {
+        return None;
+    }
+    let table = v.ns.table();
+    if !table.expiring.is_empty() {
+        return None;
+    }
+    let (m, rest) = table.locate(v.proc_root);
+    let rootfs = matches!(&m.source, Source::Host(base) if base == v.root_host);
+    if !rest.is_empty() || !components(&m.root).is_empty() || !rootfs {
+        return None;
+    }
+    // No mount under the way's top directory but the root.
+    let clear = |top: &[u8]| {
+        let top = mounts::join(v.proc_root, top);
+        !table.mounts.iter().any(|o| o.id != m.id && mounts::under(&o.point, &top).is_some())
+    };
+    if !clear(first) {
+        return None;
+    }
+    let mut name = Vec::with_capacity(path.len() + 9);
+    // On the host's own root, the links of its sealed system volume
+    // into `/private`, which never change, followed here: the host
+    // follows no link in the call.
+    if v.root_host == b"/" && more && SEALED_LINKS.contains(&first) {
+        if !clear(b"private") {
+            return None;
+        }
+        name.extend_from_slice(b"private/");
+    }
+    name.extend_from_slice(first);
+    for c in names {
+        name.push(b'/');
+        name.extend_from_slice(c);
+    }
+    let ns_path = mounts::join(v.proc_root, &name);
+    Some(Direct {
+        dir: v.root,
+        name: cstr(&name).ok()?,
+        ns_path,
+        mount_id: m.id,
+        mount_flags: m.flags,
+        fstype: m.fstype,
+    })
+}
+
 fn components(path: &[u8]) -> Vec<Vec<u8>> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty() && c != b".").map(<[u8]>::to_vec).collect()
 }
@@ -114,7 +186,10 @@ pub struct Direct {
     pub dir: i32,
     /// The path below it.
     pub name: CString,
+    /// Where it is in the mount namespace.
+    pub ns_path: Vec<u8>,
     pub mount_id: u32,
+    pub mount_flags: u64,
     pub fstype: FsType,
 }
 
@@ -1420,53 +1495,8 @@ impl Fs {
     /// directories need no search permission checked. The caller asks the
     /// host not to follow any link on the way (`AT_SYMLINK_NOFOLLOW_ANY`),
     /// and walks after all when the host meets one.
-    pub fn direct(&self, path: &[u8]) -> Option<Direct> {
-        if path.first() != Some(&b'/') || path.last() == Some(&b'/') {
-            return None;
-        }
-        let mut names = path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".");
-        let first = names.next()?;
-        let more = names.clone().next().is_some();
-        if first == b"dev" || names.clone().any(|c| c == b"..") || first == b".." {
-            return None;
-        }
-        let v = self.view();
-        if access_checked(&v) {
-            return None;
-        }
-        let table = self.mnt.table();
-        if !table.expiring.is_empty() {
-            return None;
-        }
-        let (m, rest) = table.locate(v.proc_root);
-        let rootfs = matches!(&m.source, Source::Host(base) if base == v.root_host);
-        if !rest.is_empty() || !components(&m.root).is_empty() || !rootfs {
-            return None;
-        }
-        // No mount under the way's top directory but the root.
-        let clear = |top: &[u8]| {
-            let top = mounts::join(v.proc_root, top);
-            !table.mounts.iter().any(|o| o.id != m.id && mounts::under(&o.point, &top).is_some())
-        };
-        if !clear(first) {
-            return None;
-        }
-        let mut name = Vec::with_capacity(path.len() + 9);
-        // On the host's own root, the links of its sealed system volume
-        // into `/private`, which never change, followed here: the host
-        // follows no link in the call.
-        if self.root_is_host() && more && SEALED_LINKS.contains(&first) {
-            if !clear(b"private") {
-                return None;
-            }
-            name.extend_from_slice(b"private/");
-        }
-        name.extend_from_slice(first);
-        for c in names {
-            name.push(b'/');
-            name.extend_from_slice(c);
-        }
-        Some(Direct { dir: v.root, name: cstr(&name).ok()?, mount_id: m.id, fstype: m.fstype })
+    pub fn direct(&self, dirfd: i32, path: &[u8]) -> Option<Direct> {
+        direct_in(&self.view(), dirfd, path)
     }
 
     /// Whether the guest's root is the host's own (no root filesystem).
@@ -2788,6 +2818,13 @@ thread_local! {
     static FIFO: std::cell::Cell<Option<(i32, u64)>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether [`open_fifo_unlocked`] holds a FIFO open for this thread's
+/// `openat`, which takes it.
+#[cfg(target_os = "macos")]
+pub(crate) fn fifo_preopened() -> bool {
+    FIFO.with(|f| f.get().is_some())
+}
+
 /// This host thread starts another guest thread ([`crate::thread_reused`]).
 pub(crate) fn thread_reused() {
     UNMOUNTING.with(|u| u.set(false));
@@ -2919,6 +2956,22 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         let view = published();
         let Some(v) = view.as_ref() else { return Ok(()) };
         let v = v.view();
+        // In one host call where it finds what the walk would: no FIFO is
+        // there to wait for.
+        #[cfg(target_os = "macos")]
+        if let Some(d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path) {
+            // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: the root's descriptor and a NUL-terminated name.
+            let r =
+                unsafe { libc::fstatat(d.dir, d.name.as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW_ANY) };
+            if r == 0 && !matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFLNK) {
+                return Ok(());
+            }
+            if r != 0 && matches!(e(), errno::ENOENT | errno::ENOTDIR) {
+                return Ok(());
+            }
+        }
         (resolve_in(&v, fcntl::AT_FDCWD as i32, &path, follow), ahead::Key::of(&v, &path, follow))
     };
     let Ok(r) = resolved else { return Ok(()) };

@@ -690,9 +690,12 @@ the guest's reach, and translates what comes back.
   `..` clamped at the process's root. `*at` calls start from where their
   descriptor was opened.
 - A run of plain names that crosses no mount is looked up in one host
-  `openat` (`O_NOFOLLOW_ANY`, opened to search, not to read), and a
-  `stat` of an absolute path under no mount but the root's in one
-  `fstatat` from the root (`AT_SYMLINK_NOFOLLOW_ANY`). The host refuses
+  `openat` (`O_NOFOLLOW_ANY`, opened to search, not to read). A path,
+  absolute or from the working directory, under no mount but the root's
+  and needing no search permission checked is found in one host call
+  from the root: by a `stat` (`AT_SYMLINK_NOFOLLOW_ANY`), and by an open
+  only to read of a regular file or a directory whose mode and owner are
+  the host's, while no lease is held (`O_NOFOLLOW_ANY`). The host refuses
   either where a link is on the way, and fwe then walks name by name.
   With no root filesystem, the links at the top of macOS's sealed system
   volume (`/tmp`, `/var` and `/etc`, into `/private`), which never

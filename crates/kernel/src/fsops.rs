@@ -521,6 +521,10 @@ impl<P: Platform> Kernel<P> {
         if let Some(n) = pts_number(&path) {
             return crate::pty::open_slave(n, host::open_flags_to_host(flags));
         }
+        #[cfg(target_os = "macos")]
+        if let Some(r) = self.open_direct(dirfd as i32, &path, flags) {
+            return r;
+        }
         // Synthetic /proc and /sys files take priority over the host rootfs.
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
@@ -703,6 +707,58 @@ impl<P: Platform> Kernel<P> {
             };
         }
         self.sys_openat_bytes(dirfd, &path, flags, mode)
+    }
+
+    /// An open only to read, of a file the host finds in one call from the
+    /// root where the walk would find it ([`crate::fs::Fs::direct`]): a
+    /// regular file or a directory with no mode or owner kept apart from
+    /// the host's, while no lease is taken anywhere. `None` for any other,
+    /// which takes the whole way ([`Self::sys_openat_bytes`]).
+    #[cfg(target_os = "macos")]
+    fn open_direct(&mut self, dirfd: i32, path: &[u8], flags: u64) -> Option<i64> {
+        use crate::procstore::{Count, count};
+        let only_read = flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
+            && flags & (fcntl::O_CREAT | fcntl::O_TRUNC | fcntl::O_PATH | fcntl::O_TMPFILE) == 0
+            // O_NOATIME, the owner's to ask for.
+            && flags & 0o1000000 == 0;
+        // (A FIFO opened already, waiting for its other end, is its.)
+        if !only_read
+            || crate::fs::fifo_preopened()
+            || count(Count::Leases).load(std::sync::atomic::Ordering::SeqCst) != 0
+        {
+            return None;
+        }
+        let d = self.fs().direct(dirfd, path)?;
+        // No link anywhere on the way (the host refuses `O_NOFOLLOW` beside
+        // it, which it covers).
+        let host_flags = host::open_flags_to_host(flags) & !libc::O_NOFOLLOW | libc::O_NOFOLLOW_ANY;
+        // SAFETY: the root's descriptor and a NUL-terminated name.
+        let fd = unsafe { host::openat(d.dir, &d.name, host_flags, 0) };
+        if fd < 0 {
+            // A missing name on a way with no link, as the walk finds; a
+            // link, or a refusal root may pass, takes the whole way.
+            let e = host::last_errno();
+            return matches!(e, libc::ENOENT | libc::ENOTDIR).then(last_error);
+        }
+        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the descriptor just opened.
+        let plain = unsafe { libc::fstat(fd, &mut st) } == 0
+            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+            && !crate::modes::marked(&st);
+        let mut guest = st;
+        crate::owners::apply(&mut guest, crate::owners::host_owner(&st));
+        if !plain || !self.permits(&guest, open_wants(flags)) {
+            // SAFETY: closing the descriptor just opened.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+        let file = (st.st_dev as u64, st.st_ino as u64);
+        crate::fdmarks::opened_as(fd, file, d.ns_path, d.mount_id, d.mount_flags, d.fstype, None);
+        // A number reused keeps no earlier open's word.
+        crate::fdstate::update(fd, |s| s.created = false);
+        Some(fd as i64)
     }
 
     fn sys_openat_bytes(&mut self, dirfd: u64, path: &[u8], flags: u64, mode: u64) -> i64 {
@@ -1378,7 +1434,7 @@ impl<P: Platform> Kernel<P> {
         // with no mount but the root's, none of fwe's own files, and no
         // link.
         #[cfg(target_os = "macos")]
-        if let Some(d) = self.fs().direct(path) {
+        if let Some(d) = self.fs().direct(dirfd, path) {
             match stat_at_with(d.dir, &d.name, crate::fs::AT_SYMLINK_NOFOLLOW_ANY) {
                 Ok(s) if !(follow && s.st_mode & libc::S_IFMT == libc::S_IFLNK) => {
                     return Ok(stat_result(d.dir, &d.name, &s, d.fstype, d.mount_id));
@@ -3061,7 +3117,7 @@ impl<P: Platform> Kernel<P> {
         if st.st_uid == 0 && st.st_gid == 0 && self.fs_opt().is_some_and(|f| f.root_is_host()) {
             return true;
         }
-        crate::creds::Access::of(&self.creds).permits(st, want)
+        self.creds.permits(st, want)
     }
 
     /// A file `name` made in directory `dir` (open as `fd`, if it is),
