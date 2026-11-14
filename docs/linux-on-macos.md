@@ -49,6 +49,8 @@ backend, its safety rules and its tests in [hypervisor.md](hypervisor.md).
 - [Which instructions get translated, and how](#which-instructions-get-translated-and-how)
 - [How the VM is actually used](#how-the-vm-is-actually-used)
 - [Linux to macOS](#linux-to-macos)
+  - [Where a system call runs](#where-a-system-call-runs): how a call
+    reaches fwe under each backend, and how fwe carries it out
   - [System calls by category](#system-calls-by-category)
   - [The CPU](#the-cpu): system call entry and return, registers and
     errno, TLS, `x18`, cache maintenance, PAC and BTI, auxv and hwcaps,
@@ -843,6 +845,49 @@ coming out:
 | `clock_gettime(CLOCK_BOOTTIME, &ts)` (no vDSO, so it traps) | maps the clock id | `clock_gettime(CLOCK_MONOTONIC, &ts)` |
 | `kill(pid, SIGUSR1)` | maps the pid out of the guest's pid namespace and the signal number (10 to 30); leaves a sender note for an fwe target | `kill(<host pid>, 30)` |
 | `write(fd, buf, n)` to a socket whose peer has gone | sockets are all `SO_NOSIGPIPE`, so fwe raises `SIGPIPE` itself | `write` fails with `EPIPE`; the guest gets `x0 = -32` and a pending `SIGPIPE` |
+
+### Where a system call runs
+
+No guest system call runs on a Linux kernel, for fwe has none, and none
+runs inside the VM, which holds only the guest's CPU state and memory.
+Under either backend every call is carried out by fwe's kernel crate, as
+ordinary macOS code in the guest's own fwe process. A backend decides
+how a call gets there, and carries out the few that change the process
+itself.
+
+**How a call reaches fwe:**
+
+| Backend | Path | What the path costs |
+|---|---|---|
+| native, most calls | each `svc #0` is rewritten into a branch to a stub that calls fwe's gate; the call runs on the guest thread's own host thread and returns straight to the guest when it changed only `x0` and the signal mask ([svc calls fwe's gate](#system-calls-svc-calls-fwes-gate)) | a function call: no exception, no host signal |
+| native, the rest | the gate takes a trap (`brk #0x4c5a`, fwe's `SIGTRAP` handler) for a call that changes the pc or `sp`, a signal to deliver, a traced or seccomp-filtered call, a new process, `execve` and the waits fwe runs outside its lock; where no stub fits within branch range, the `svc` itself is a `brk #0x4c58` | a host signal and its return |
+| VM, every call | the `svc` takes an exception to fwe's vector at EL1, which leaves the VM (`hvc #2`); the vCPU's host thread runs the call and resumes the vCPU after the `svc` ([A system call in the VM](#a-system-call-in-the-vm)) | a VM exit and re-entry |
+
+**How fwe carries a call out.** Each call's row in the tables of
+[System calls by category](#system-calls-by-category) names the host
+calls it makes; by mechanism:
+
+| Mechanism | What happens | For example |
+|---|---|---|
+| The same macOS call | arguments, flags, structures and errors translated, with Linux's checks first where macOS's differ | the `read` and `write` family, `lseek`, `fsync`, `flock`, `utimensat`, `unlinkat`, `listen`, `shutdown`, `getsockopt`, `sched_yield`, `getitimer`, `gettimeofday` |
+| Other macOS calls | a Linux primitive macOS lacks, built from others | `epoll` (a kqueue), `eventfd` and `signalfd` (a pipe), `timerfd` and `nanosleep` (kqueue timers), `renameat2` (`renameatx_np`), `getdents64` (`__getdirentries64`), `splice` and `sendfile` (copied through a buffer of fwe's), shared futexes and System V semaphores (`__ulock_wait2`, `__ulock_wake`), System V shared memory (a file, mapped), `getrandom` (`arc4random_buf`), `chown` (an extended attribute) |
+| fwe's own state, no macOS call | what Linux's kernel keeps and macOS has no counterpart for, or keeps once for the whole Mac | `getpid`, `gettid`, `umask`, the mount calls, `pivot_root`, credentials and capabilities, `unshare`, `setns`, `prctl`, scheduling policies, `personality`, `sigaltstack`, robust-futex lists, the `mlock` family, `sethostname`, `seccomp`, Landlock |
+| Another fwe process | macOS lets no process reach another's memory or threads, so the target does the work, asked through its mailbox and woken by a signal | a signal that carries its sender or that macOS lacks, `tgkill` of another process's thread, `pidfd_getfd`, `process_vm_readv` and `process_vm_writev`, `ptrace`, `/proc/<pid>/mem` |
+| A thread of fwe's | something must happen when no guest thread is in a call | POSIX timers (a timer thread per process), the reaper's watch of the processes it adopted, the watch of the parent's end that `getppid` keeps |
+| The backend | the call makes, replaces or ends a process or thread, or changes its memory | `clone` and `clone3`, `execve` and `execveat`, `exit`, `exit_group`, `wait4`, `waitid`, `rt_sigreturn`, `rt_sigtimedwait`, `pidfd_getfd`, and the `mmap` family |
+| Not dispatched | `ENOSYS` | [Not available](#not-available) |
+
+**What differs in the VM.** The kernel crate is the same; what the
+backend does for it is not:
+
+| | Native | VM |
+|---|---|---|
+| Pointer arguments | guest addresses are fwe's own, read and written through copies that fail with `EFAULT` rather than crash | each is checked against the guest's mappings and turned into the host address of its slab page ([Pages and translation](#pages-and-translation)) |
+| The `mmap` family | host `mmap`, `mprotect` and `munmap` at the guest's addresses | the guest's slab pages and stage-1 page tables, the TLB flushed; a `MAP_SHARED` segment is a host `mmap` |
+| A new thread | a host thread, taken from fwe's waiting ones when there is one | a host thread with a vCPU of its own |
+| `fork`, `vfork` | host `fork` ([fork](#fork)) | a fresh fwe process, sent the parent's memory and kernel state |
+| `execve` | the new program loaded in place, or a host `execve` of fwe ([execve](#execve)) | a host `execve` of fwe |
+| A signal to a running thread | fwe's host handler builds the frame | the vCPU is made to exit and the run loop builds the frame ([Signals into a running vCPU](#signals-into-a-running-vcpu)) |
 
 ### System calls by category
 
