@@ -4026,8 +4026,15 @@ mod tests {
                 p as u64
             };
             k.brk = Brk::reserve(probe, size);
-            if k.brk.limit != k.brk.start {
+            // All of it: a range taken in part meanwhile is let go and
+            // tried again.
+            if k.brk.limit == probe + size {
                 break;
+            }
+            if k.brk.limit > probe {
+                crate::mm::untrack(probe, k.brk.limit - probe);
+                // SAFETY: the test's own reservation, released.
+                unsafe { libc::munmap(probe as *mut libc::c_void, (k.brk.limit - probe) as usize) };
             }
         }
         assert_eq!(k.brk.limit, probe + size);
