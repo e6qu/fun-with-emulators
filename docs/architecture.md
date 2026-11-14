@@ -287,17 +287,21 @@ finish itself (see
   it) and a gate stack of 1 MiB, mapped as it first enters guest code
   (`trap::prepare_guest_entry`); a TSD slot points to the block. A forked
   child keeps its copy.
-- **The mask:** the gate changes no signal mask. Guest code runs under the
-  host mask its guest mask calls for, and so does the call, as a
-  handler's system call does once it unblocks the guest's signals.
+- **The mask:** guest code runs under the host mask its guest mask calls
+  for, and so does the call, as a handler's system call does once it
+  unblocks the guest's signals. A call that changes the guest's mask
+  sets the host thread's to match before the gate returns.
 - **Plain calls only:** the Rust half (`trap::fwe_gate_call`) runs a call
   through `Kernel::enter_syscall` or `fwe_kernel::blocking_syscall`, as
   the trap does, unless a tracer stops at system calls (`PTRACE_SYSCALL`),
   a seccomp filter is set, or the call is one the trap runs its own way
-  (`exit`, `execve`, `clone`, `wait4`, `waitid`, `pidfd_getfd`, the IPC
-  waits, `rt_sigtimedwait`). It returns straight to the guest only when
-  the call changed nothing but `x0` (the pc past the site, the same `sp`,
-  registers, flags and mask) and nothing is to be delivered; otherwise
+  (`execve`, a `clone` of a process or of a traced thread, `clone3`,
+  `wait4`, `waitid`, `pidfd_getfd`, the IPC waits, `rt_sigtimedwait`).
+  An untraced thread's `clone` makes the thread from the block's
+  registers, and its `exit` ends it with every host signal blocked, as
+  the trap's handler would. It returns straight to the guest only when
+  the call changed nothing but `x0` and the mask (the pc past the site,
+  the same `sp`, registers and flags) and nothing is to be delivered; otherwise
   the gate takes the trap (`brk #0x4c5a`), whose handler installs the
   state in the block, delivering what is pending.
 - **Signals:** a host signal is the guest's to take at once only where

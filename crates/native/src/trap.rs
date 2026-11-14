@@ -317,6 +317,11 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     b.regs.x[18] = guest_x18();
     b.ran = 0;
     let nr = b.regs.x[8];
+    // A new thread of an untraced one is made here too: the trap would
+    // make it from the same registers.
+    let thread_clone = nr == CLONE
+        && b.regs.x[0] & fwe_abi::clone::CLONE_THREAD != 0
+        && !fwe_kernel::ptrace::traced();
     // What the trap runs its own way, or stops at, it runs.
     let plain = fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls()
@@ -324,14 +329,31 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
             nr,
             EXIT | EXECVE
                 | EXECVEAT
-                | CLONE
                 | CLONE3
                 | WAIT4
                 | WAITID
                 | PIDFD_GETFD
                 | RT_SIGTIMEDWAIT
         )
-        && !fwe_kernel::ipcops::waits(nr);
+        && !fwe_kernel::ipcops::waits(nr)
+        && (nr != CLONE || thread_clone);
+    // A thread that is not the last ends here, as the trap would end it,
+    // with every host signal blocked first: one for the process is then
+    // taken by another thread, as when the trap's handler runs.
+    if nr == EXIT
+        && fwe_kernel::seccomp::mode() == 0
+        && !fwe_kernel::ptrace::stops_at_syscalls()
+        && !fwe_kernel::ptrace::traced()
+    {
+        // SAFETY: a full set, and blocking it on this thread only.
+        unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+        }
+        fwe_kernel::thread_exit_cleanup();
+        crate::exit_current_thread(b.regs.x[0] as i32);
+    }
     if !plain {
         IN_GUEST.with(|g| g.set(true));
         return 1;
@@ -341,13 +363,26 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let before = b.regs;
     let regs = &mut b.regs;
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    if thread_clone {
+        let a = fwe_kernel::CloneArgs::from_clone(&regs.x);
+        let r = match a.check() {
+            Ok(()) => crate::threads::do_clone(regs, a),
+            Err(e) => fwe_abi::err(e),
+        };
+        KERNEL.finish(regs, nr, &args, r);
     // SAFETY: guest pointers in `args` reference guest memory.
-    if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
+    } else if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
         KERNEL.finish(regs, nr, &args, r);
     } else {
         KERNEL.syscall(regs);
     }
     b.ran = 1;
+    // A changed mask is the host thread's now (the guest's is in force in
+    // its code): a signal it unblocks that is pending is seen below.
+    if thread::mask() != mask {
+        apply_guest_mask();
+        UNBLOCKED.with(|u| u.set(false));
+    }
     // A signal from here on is seen by the gate's way out.
     b.seen = b.signals.load(SeqCst);
     let regs = &b.regs;
@@ -356,7 +391,6 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         && regs.x[1..] == before.x[1..]
         && regs.pstate == before.pstate
         && regs.fp == before.fp
-        && thread::mask() == mask
         && thread::deliverable() == 0;
     if plain_return {
         crate::quiesce::enter();

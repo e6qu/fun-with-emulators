@@ -510,12 +510,14 @@ stub:  stp   x30, x0, [sp, #-32]!  ; below the guest's sp
 
 The gate saves the guest's registers in a per-thread block, switches to a
 stack of fwe's, and runs the call with the number from `x8` and arguments
-from `x0`–`x5`. A call that changes nothing but `x0`, with no signal to
-deliver, returns straight back: no exception, no host signal, no change
-of the host's signal mask. Every other outcome (a call that changes the
-pc, `sp` or the signal mask, a signal to deliver, a traced or filtered
-call, `clone`, `execve`, the waits fwe runs outside its lock) takes a
-trap from the gate (`brk #0x4c5a`): fwe's `SIGTRAP` handler (`on_sigtrap`,
+from `x0`–`x5`. A call that changes nothing but `x0` and the signal
+mask, with no signal to deliver, returns straight back: no exception, no
+host signal (a changed mask is set on the host thread with
+`pthread_sigmask`). A new thread is made, and a thread that is not the
+last ends, from the gate too. Every other outcome (a call that changes
+the pc or `sp`, a signal to deliver, a traced or filtered call, a new
+process, `execve`, the waits fwe runs outside its lock) takes a trap from
+the gate (`brk #0x4c5a`): fwe's `SIGTRAP` handler (`on_sigtrap`,
 `crates/native/src/trap.rs`) takes the guest's state from the block and
 installs whatever the call left.
 

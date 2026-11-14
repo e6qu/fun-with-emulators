@@ -451,8 +451,6 @@ fn shared_tid() -> Option<i32> {
         // ([`owner_of_tid`]): the slot of each tid, after the counter.
         let owners: Vec<u8> = (0..TID_BLOCK).flat_map(|_| me.to_ne_bytes()).collect();
         libc::pwrite(fd, owners.as_ptr().cast(), owners.len(), owner_at(n));
-        // The numbers' robust lists are the new threads', none yet.
-        publish_robust_block(n, TID_BLOCK, me);
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
         *block = (me, n + 1, n + TID_BLOCK);
@@ -709,33 +707,6 @@ fn publish_robust(id: i32, owner: i32, head: u64) {
     }
 }
 
-/// Mark slots `first..first + count` (thread numbers) `owner`'s, with no
-/// robust list, in one write.
-fn publish_robust_block(first: i32, count: i32, owner: i32) {
-    if first < 1 || first + count > TID_END {
-        return;
-    }
-    let Some(path) = robust_path() else { return };
-    let mut slot = [0u8; ROBUST_SLOT as usize];
-    slot[..4].copy_from_slice(&owner.to_ne_bytes());
-    slot[8..16].copy_from_slice(&now_micros().to_ne_bytes());
-    let b: Vec<u8> = (0..count).flat_map(|_| slot).collect();
-    // SAFETY: a NUL-terminated path; a buffer of `b.len()` bytes; closed
-    // below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            libc::pwrite(
-                fd,
-                b.as_ptr().cast(),
-                b.len(),
-                (i64::from(first) * ROBUST_SLOT) as libc::off_t,
-            );
-            libc::close(fd);
-        }
-    }
-}
-
 /// Another process's thread's robust-list head: `host` the main thread of
 /// that host process, or `tid` one of its other threads (a number of
 /// fwe's, of process `host`). `None` if the slot is not that thread's,
@@ -769,7 +740,9 @@ pub fn published_robust(host: i32, tid: Option<i32>) -> Option<u64> {
     if n != ROBUST_SLOT as isize || owner != host {
         return None;
     }
-    if tid.is_none() && crate::procreg::start_time(host).is_none_or(|start| written < start) {
+    // A slot written before the process started is an earlier one's (its
+    // pid, or the thread number, given again): the thread has no list.
+    if crate::procreg::start_time(host).is_none_or(|start| written < start) {
         return None;
     }
     Some(head)
