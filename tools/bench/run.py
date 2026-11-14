@@ -461,7 +461,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False):
     top = ", ".join(f"{c} {n}" for c, n in ((n, c) for c, n in calls.most_common(14)))
     print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
     if profiled:
-        profile(name, ours, fresh)
+        profile(name, ours, theirs, fresh)
 
 
 def sampled(name, cmd):
@@ -495,10 +495,27 @@ def sampled(name, cmd):
     print(f"{name}: {guest * 100 // total}% in guest code; top of stack: {top}", file=sys.stderr)
 
 
-def profile(name, cmd, fresh):
+def rusage(name, side, cmd, fresh):
+    """Log what `cmd` costs the host as `/usr/bin/time -l` reports it: user
+    and system time, page faults and the largest resident size."""
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    r = subprocess.run(["/usr/bin/time", "-l"] + cmd, capture_output=True, text=True,
+                       errors="replace")
+    keep = ("real", "maximum resident", "page reclaims", "page faults", "voluntary",
+            "involuntary", "instructions retired", "cycles elapsed")
+    lines = [l.strip() for l in r.stderr.splitlines() if any(k in l for k in keep)]
+    print(f"{name} {side}: " + "; ".join(lines), file=sys.stderr)
+
+
+def profile(name, cmd, theirs, fresh):
     """[`sampled`] of `cmd` (one fwe process, after `env -i`), then a run
     with fwe's timing marks: start-up, and the code pages it wrote as they
-    first ran (`fresh` emptied before each run)."""
+    first ran; and what it and `theirs` cost the host ([`rusage`]).
+    `fresh` is emptied before each run."""
+    rusage(name, "fwe", cmd, fresh)
+    rusage(name, "macOS", theirs, fresh)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
