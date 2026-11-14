@@ -273,7 +273,7 @@ impl Record {
 
     /// The guest unmapped `[start, start + len)`.
     pub fn unmapped(&mut self, start: u64, len: u64) {
-        self.areas.remove(start, start + len);
+        self.areas.clear(start, start + len);
     }
 
     /// The guest changed the protections of `[start, start + len)` to
@@ -291,13 +291,13 @@ impl Record {
 
     /// Whether any of `[start, start + len)` may not be made writable.
     pub fn any_nowrite(&self, start: u64, len: u64) -> bool {
-        self.areas.pieces(start, start + len).iter().any(|p| p.value.nowrite)
+        self.areas.overlapping(start, start + len).any(|p| p.value.nowrite)
     }
 
     /// Whether any of `[start, start + len)` maps a file of a `noexec`
     /// mount.
     pub fn any_noexec(&self, start: u64, len: u64) -> bool {
-        self.areas.pieces(start, start + len).iter().any(|p| p.value.noexec)
+        self.areas.overlapping(start, start + len).any(|p| p.value.noexec)
     }
 
     pub fn protected(&mut self, start: u64, len: u64, prot: u64) {
@@ -339,7 +339,7 @@ impl Record {
             .map(|p| (p.start, p.end))
             .collect();
         for (a, b) in heap {
-            self.areas.remove(a, b);
+            self.areas.clear(a, b);
         }
         if end > start {
             let mut heap = Area::anonymous(mman::PROT_READ | mman::PROT_WRITE, Name::Heap);

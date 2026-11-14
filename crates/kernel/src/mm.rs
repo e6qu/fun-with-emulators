@@ -69,13 +69,13 @@ fn add_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 /// Remove `[addr, addr + len)` from a set of ranges, splitting any range it
 /// covers part of.
 fn remove_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
-    if len == 0 {
+    if len == 0 || maps.is_empty() {
         return;
     }
     let end = addr.saturating_add(len);
-    let overlapping: Vec<(u64, u64)> =
-        maps.range(..end).rev().take_while(|&(_, &e)| e > addr).map(|(&s, &e)| (s, e)).collect();
-    for (s, e) in overlapping {
+    // From the last range that overlaps down to the first: what is put
+    // back of one is outside the range, and not taken again.
+    while let Some((&s, &e)) = maps.range(..end).next_back().filter(|&(_, &e)| e > addr) {
         maps.remove(&s);
         if s < addr {
             maps.insert(s, addr);

@@ -91,8 +91,8 @@ impl<V: Mapping> Vmas<V> {
     /// Whether every page of `[start, end)` is mapped.
     pub fn covered(&self, start: u64, end: u64) -> bool {
         let mut at = start;
-        for p in self.pieces(start, end) {
-            if p.start != at {
+        for p in self.overlapping(start, end) {
+            if p.start > at {
                 return false;
             }
             at = p.end;
@@ -102,7 +102,7 @@ impl<V: Mapping> Vmas<V> {
 
     /// Whether any page of `[start, end)` is mapped.
     pub fn any(&self, start: u64, end: u64) -> bool {
-        !self.pieces(start, end).is_empty()
+        self.overlapping(start, end).next().is_some()
     }
 
     /// Unmap `[start, end)`, returning what was mapped there.
@@ -111,24 +111,30 @@ impl<V: Mapping> Vmas<V> {
             return Vec::new();
         }
         let removed = self.pieces(start, end);
-        self.cut(start);
-        self.cut(end);
-        let keys: Vec<u64> = self.map.range(start..end).map(|(&s, _)| s).collect();
-        for k in keys {
-            self.map.remove(&k);
-        }
+        self.clear(start, end);
         removed
     }
 
+    /// Unmap `[start, end)`.
+    pub fn clear(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.cut(start);
+        self.cut(end);
+        while let Some((&k, _)) = self.map.range(start..end).next() {
+            self.map.remove(&k);
+        }
+    }
+
     /// Map `[start, end)` to `value`, replacing what was there (as
-    /// `MAP_FIXED` does); returns what it replaced.
-    pub fn insert(&mut self, start: u64, end: u64, value: V) -> Vec<Piece<V>> {
-        let replaced = self.remove(start, end);
+    /// `MAP_FIXED` does).
+    pub fn insert(&mut self, start: u64, end: u64, value: V) {
         if start < end {
+            self.clear(start, end);
             self.map.insert(start, (end, value));
             self.merge_around(start, end);
         }
-        replaced
     }
 
     /// Give every mapped part of `[start, end)` the value `f` makes of its
@@ -182,30 +188,27 @@ impl<V: Mapping> Vmas<V> {
 
     /// Split the mapping containing `addr` there, if it starts before it.
     fn cut(&mut self, addr: u64) {
-        let Some((&s, &(e, _))) = self.map.range(..addr).next_back() else { return };
-        if e <= addr {
+        let Some((&s, (e, v))) = self.map.range_mut(..addr).next_back() else { return };
+        if *e <= addr {
             return;
         }
-        let (_, v) = self.map.get(&s).unwrap().clone();
-        self.map.insert(s, (addr, v.clone()));
-        self.map.insert(addr, (e, v.at(addr - s)));
+        let rest = (*e, v.at(addr - s));
+        *e = addr;
+        self.map.insert(addr, rest);
     }
 
     /// Merge the mappings in and next to `[start, end)` that continue each
     /// other.
     fn merge_around(&mut self, start: u64, end: u64) {
+        use std::ops::Bound::{Excluded, Included};
         let from = self.map.range(..start).next_back().map_or(start, |(&s, _)| s);
-        let keys: Vec<u64> = self.map.range(from..=end).map(|(&s, _)| s).collect();
-        let Some(&first) = keys.first() else { return };
+        let Some((&first, _)) = self.map.range(from..=end).next() else { return };
         let mut cur = first;
-        for &next in &keys[1..] {
-            let continues = {
-                let (ce, cv) = &self.map[&cur];
-                let (_, nv) = &self.map[&next];
-                *ce == next && cv.at(next - cur) == *nv
-            };
-            if continues {
-                let (ne, _) = self.map.remove(&next).unwrap();
+        while let Some((&next, (ne, nv))) = self.map.range((Excluded(cur), Included(end))).next() {
+            let (ce, cv) = &self.map[&cur];
+            if *ce == next && cv.at(next - cur) == *nv {
+                let ne = *ne;
+                self.map.remove(&next);
                 self.map.get_mut(&cur).unwrap().0 = ne;
             } else {
                 cur = next;
@@ -243,8 +246,11 @@ mod tests {
     fn fixed_mappings_replace_and_split() {
         let mut v = Vmas::new();
         v.insert(0x1000, 0x9000, m(3, 0));
-        let replaced = v.insert(0x3000, 0x5000, m(1, 100));
-        assert_eq!(replaced, vec![Piece { start: 0x3000, end: 0x5000, value: m(3, 0x2000) }]);
+        assert_eq!(
+            v.pieces(0x3000, 0x5000),
+            vec![Piece { start: 0x3000, end: 0x5000, value: m(3, 0x2000) }]
+        );
+        v.insert(0x3000, 0x5000, m(1, 100));
         assert_eq!(
             list(&v),
             vec![(0x1000, 0x3000, 3, 0), (0x3000, 0x5000, 1, 100), (0x5000, 0x9000, 3, 0x4000)]
