@@ -10,8 +10,8 @@
 //! open waits until the holder lets the lease go or downgrades it, or until
 //! `fs.lease-break-time` seconds pass and it is taken away; a non-blocking
 //! open fails with `EWOULDBLOCK` instead, the break begun. Opens look at
-//! the record only once some process has taken a lease (a count in the
-//! process store).
+//! the record only while it holds a lease (their count, kept in the process
+//! store with every change of it).
 
 use crate::shared::{Data, Record};
 use crate::snapshot::{Dec, Enc};
@@ -135,11 +135,6 @@ pub fn set(fd: i32, dev: u64, ino: u64, kind: i16) -> Result<(), i32> {
     let (pid, start) = me();
     let sig = crate::fdstate::get(fd).sig;
     HELD.store(true, std::sync::atomic::Ordering::SeqCst);
-    if kind != fcntl::F_UNLCK {
-        // Opens look for leases from now on.
-        crate::procstore::count(crate::procstore::Count::Leases)
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
     r.update(|l| {
         tidy(l, now());
         let i = l.0.iter().position(|e| e.pid == pid && e.start == start && e.fd == fd);
@@ -147,6 +142,7 @@ pub fn set(fd: i32, dev: u64, ino: u64, kind: i16) -> Result<(), i32> {
             if let Some(i) = i {
                 l.0.remove(i);
             }
+            counted(l);
             return Ok(());
         }
         match i {
@@ -163,8 +159,17 @@ pub fn set(fd: i32, dev: u64, ino: u64, kind: i16) -> Result<(), i32> {
             }
             None => l.0.push(Lease { dev, ino, pid, start, fd, kind, sig, breaking: None }),
         }
+        counted(l);
         Ok(())
     })
+}
+
+/// The leases there are now, in the process store, for opens to look at
+/// the record only while there are any ([`existing`]). Kept under the
+/// record's lock, with every change.
+fn counted(l: &Leases) {
+    crate::procstore::count(crate::procstore::Count::Leases)
+        .store(l.0.len() as u64, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Descriptor `fd`'s signal is `sig` now (`F_SETSIG`): its lease's too.
@@ -194,6 +199,7 @@ pub fn closed(fd: i32) {
     let _ = r.update_maybe(|l| {
         let before = l.0.len();
         l.0.retain(|e| !(e.pid == pid && e.start == start && e.fd == fd));
+        counted(l);
         Ok(((), l.0.len() != before))
     });
 }
@@ -212,6 +218,7 @@ pub fn break_for(dev: u64, ino: u64, write: bool, nonblock: bool) -> Result<(), 
         let mut signals: Vec<(i32, u32, i32)> = Vec::new();
         let pending = r.update(|l| {
             tidy(l, now);
+            counted(l);
             let mut pending = false;
             for e in l.0.iter_mut().filter(|e| e.dev == dev && e.ino == ino) {
                 let target = if write { fcntl::F_UNLCK } else { fcntl::F_RDLCK };

@@ -96,7 +96,7 @@ pub enum Count {
     /// Pid namespaces with accounting on ([`crate::acct`]); never fewer
     /// than have it.
     Accounting = 0,
-    /// Leases ever taken ([`crate::leases`]).
+    /// Leases held ([`crate::leases`]).
     Leases = 1,
     /// Memfds ever sealed against writing ([`crate::memfd`]).
     WriteSeals = 2,
