@@ -18,8 +18,6 @@ use std::sync::{Arc, Mutex};
 
 /// The process (thread-group) id, shared by all threads. Set once at startup.
 static TGID: AtomicI32 = AtomicI32::new(0);
-/// Next thread id to hand out. Thread ids are unique within the process.
-static NEXT_TID: AtomicI32 = AtomicI32::new(TID_FIRST);
 
 thread_local! {
     static TID: Cell<i32> = const { Cell::new(0) };
@@ -51,9 +49,6 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
 /// ([`forked`]).
 pub fn init_main(pid: i32) {
     TGID.store(pid, Ordering::SeqCst);
-    // Without the shared counter: numbers past every host pid, this
-    // process's own.
-    NEXT_TID.store(TID_FIRST + (pid % 40) * 100_000, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
     // An end status and a thread list left by an earlier process of this
     // number.
@@ -80,7 +75,6 @@ pub fn init_main(pid: i32) {
     forget_wait_pipes();
     crate::pdeath::forked();
     crate::futex::forked_child();
-    crate::signote::open_own();
     crate::sysvipc::forked_child();
     crate::textbusy::forked_child();
     crate::posixtimer::forked_child();
@@ -422,19 +416,19 @@ const TID_END: i32 = 4_194_304;
 /// taken [`TID_BLOCK`] at a time, the block marked this process's, and
 /// given out from the block (a slot of the robust lists' file is a thread's
 /// only once it is written after the process started).
-fn shared_tid() -> Option<i32> {
+fn shared_tid() -> i32 {
     let me = crate::host::pid();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
     // A fork child's block is its parent's.
     if block.0 == me && block.1 < block.2 {
         block.1 += 1;
-        return Some(block.1 - 1);
+        return block.1 - 1;
     }
     // Whose each block is, for another process to find it by
     // ([`owner_of_tid`]), beside the counter in the process store.
-    let n = crate::procstore::take_tid_block(TID_FIRST, TID_END, TID_BLOCK)?;
+    let n = crate::procstore::take_tid_block(TID_FIRST, TID_END, TID_BLOCK);
     *block = (me, n + 1, n + TID_BLOCK);
-    Some(n)
+    n
 }
 
 /// How many thread ids [`shared_tid`] takes at once: a change of the shared
@@ -510,7 +504,7 @@ pub fn alloc_tid() -> i32 {
             return nums[0];
         }
     }
-    shared_tid().unwrap_or_else(|| NEXT_TID.fetch_add(1, Ordering::SeqCst))
+    shared_tid()
 }
 
 /// Record this host thread's guest thread id (called when a thread starts).

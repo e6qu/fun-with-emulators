@@ -118,7 +118,7 @@ struct Store {
     base: usize,
 }
 
-static STORE: OnceLock<Option<Store>> = OnceLock::new();
+static STORE: OnceLock<Store> = OnceLock::new();
 
 /// The store's name: a POSIX shared memory object of the user's (memory
 /// only: a file's dirty pages would be written back to its disk as each
@@ -129,24 +129,38 @@ fn name() -> String {
     format!("/fwe{}v{}p{:x}", crate::host::euid(), crate::shared::FORMAT, SIZE)
 }
 
-fn map() -> Option<Store> {
-    let name = std::ffi::CString::new(name()).ok()?;
+fn map() -> Result<Store, String> {
+    let name = name();
+    let c = std::ffi::CString::new(name.clone()).map_err(|e| e.to_string())?;
+    let err = |what: &str| format!("{what} {name}: {}", std::io::Error::last_os_error());
     // SAFETY: plain host calls; the object is the user's own (checked), and
     // the mapping is kept for the process's life.
     unsafe {
-        let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600 as libc::c_uint);
+        let fd = libc::shm_open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600 as libc::c_uint);
         if fd < 0 {
-            return None;
+            return Err(err("opening"));
         }
         // Zeroes (nothing recorded, every block free) the first time; the
         // host gives memory only to the pages written. Its size is set once
-        // (macOS refuses to change it after).
+        // (macOS refuses to change it after, so a failure here is one made
+        // already, which the size below checks).
         libc::ftruncate(fd, SIZE as libc::off_t);
         let mut st: libc::stat = std::mem::zeroed();
-        let sized = libc::fstat(fd, &mut st) == 0
-            && st.st_uid == crate::host::euid()
-            && st.st_mode & 0o077 == 0
-            && st.st_size as usize >= SIZE;
+        if libc::fstat(fd, &mut st) != 0 {
+            libc::close(fd);
+            return Err(err("looking at"));
+        }
+        if st.st_uid != crate::host::euid() || st.st_mode & 0o077 != 0 {
+            libc::close(fd);
+            return Err(format!(
+                "{name} is not the user's own (owner {}, mode {:o})",
+                st.st_uid, st.st_mode
+            ));
+        }
+        if (st.st_size as usize) < SIZE {
+            libc::close(fd);
+            return Err(format!("{name} is {} bytes, not {SIZE}", st.st_size));
+        }
         let p = libc::mmap(
             std::ptr::null_mut(),
             SIZE,
@@ -157,31 +171,31 @@ fn map() -> Option<Store> {
         );
         libc::close(fd);
         if p == libc::MAP_FAILED {
-            return None;
+            return Err(err("mapping"));
         }
-        if !sized {
-            libc::munmap(p, SIZE);
-            return None;
-        }
-        Some(Store { base: p as usize })
+        Ok(Store { base: p as usize })
     }
 }
 
-fn store() -> Option<&'static Store> {
-    STORE
-        .get_or_init(|| {
-            let s = map();
-            if s.is_none() {
-                // Without it no process is known to another: said once.
-                eprintln!("fwe: the process records ({}) could not be mapped", name());
-            }
-            s
-        })
-        .as_ref()
+/// The store, mapped on first use. fwe cannot run without it (no process
+/// would know another): a failure to map it ends the process, saying why.
+fn store() -> &'static Store {
+    STORE.get_or_init(|| map().unwrap_or_else(|e| fatal(&format!("the process records: {e}"))))
 }
 
-/// Map the store now, so that [`end_status`] (from a signal handler) finds
-/// it mapped.
+/// The store from a signal handler, which cannot map it: mapped by then
+/// ([`init`], as every process starts), else `None`.
+fn mapped() -> Option<&'static Store> {
+    STORE.get()
+}
+
+/// End the process: the store cannot do what it must.
+fn fatal(why: &str) -> ! {
+    eprintln!("fwe: {why}");
+    std::process::exit(1)
+}
+
+/// Map the store now, before a signal handler may need it.
 pub fn init() {
     store();
 }
@@ -266,9 +280,9 @@ impl Store {
         }
     }
 
-    /// Write `bytes` into new blocks: the first, or `None` if there is no
-    /// room (what was taken given back).
-    fn write_chain(&self, bytes: &[u8]) -> Option<u32> {
+    /// Write `bytes` into new blocks: the first. With no room (256 MiB of
+    /// records), the process ends saying so.
+    fn write_chain(&self, bytes: &[u8]) -> u32 {
         let mut chunks: Vec<&[u8]> = bytes.chunks(ROOM).collect();
         if chunks.is_empty() {
             chunks.push(&[]);
@@ -277,12 +291,7 @@ impl Store {
         for _ in &chunks {
             match self.take_block() {
                 Some(b) => blocks.push(b),
-                None => {
-                    for &b in &blocks {
-                        self.free_chain(b, 0);
-                    }
-                    return None;
-                }
+                None => fatal("the process records' memory is full"),
             }
         }
         for (i, chunk) in chunks.iter().enumerate() {
@@ -291,7 +300,7 @@ impl Store {
             // SAFETY: a block this writer took, `ROOM` bytes from `room`.
             unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), room, chunk.len()) };
         }
-        Some(blocks[0])
+        blocks[0]
     }
 
     /// The `len` bytes of the chain from block `b`, as they read now (the
@@ -323,8 +332,8 @@ impl Store {
 
 /// Take the next block of `size` thread numbers from `first` (up to
 /// `end`, then from `first` again) for this process: its first number.
-pub fn take_tid_block(first: i32, end: i32, size: i32) -> Option<i32> {
-    let s = store()?;
+pub fn take_tid_block(first: i32, end: i32, size: i32) -> i32 {
+    let s = store();
     let next: &AtomicU32 = s.at(TID_NEXT_AT);
     let mut cur = next.load(SeqCst);
     let n = loop {
@@ -341,12 +350,12 @@ pub fn take_tid_block(first: i32, end: i32, size: i32) -> Option<i32> {
         let owner: &AtomicU32 = s.at(TID_OWNERS_AT + block * 4);
         owner.store(crate::host::pid() as u32, SeqCst);
     }
-    Some(n)
+    n
 }
 
 /// The process that took thread-number block `block` last (0: none).
 pub fn tid_block_owner(block: usize) -> i32 {
-    let Some(s) = store() else { return 0 };
+    let s = store();
     if block >= TID_BLOCKS {
         return 0;
     }
@@ -361,7 +370,7 @@ pub type Word = AtomicU64;
 /// one now if it has none and `make`. Without `make`, async-signal-safe
 /// once the store is mapped ([`init`]).
 pub fn mailbox(pid: i32, make: bool) -> Option<&'static [AtomicU64]> {
-    let s = if make { store()? } else { STORE.get()?.as_ref()? };
+    let s = if make { store() } else { mapped()? };
     let e = s.entry(pid)?;
     let words = |i: u32| -> &'static [AtomicU64] {
         let at = MAILBOXES_AT + (i as usize - 1) * MAILBOX_WORDS * 8;
@@ -389,7 +398,7 @@ pub fn mailbox(pid: i32, make: bool) -> Option<&'static [AtomicU64]> {
             };
         }
         if round == 0 {
-            // None free: those of processes gone are.
+            // None free: those of processes gone are taken back.
             for i in 1..=MAILBOXES as u32 {
                 let owner = words(i)[0].load(SeqCst) as i32;
                 if owner > 0 && !crate::host::process_exists(owner) {
@@ -398,14 +407,14 @@ pub fn mailbox(pid: i32, make: bool) -> Option<&'static [AtomicU64]> {
             }
         }
     }
-    None
+    fatal(&format!("the signal mailboxes are full ({MAILBOXES} processes have one)"))
 }
 
 /// The three shared words of the cell tagged `tag` (not 0): the one
 /// tagged so, or with `make` a free one, zeroed, tagged now (`None` if
 /// none is free).
 pub fn cell(tag: u64, make: bool) -> Option<&'static [Word; 3]> {
-    let s = store()?;
+    let s = store();
     let tag = tag | 1;
     let at = |i: usize| -> &'static [Word; 4] { s.at(CELLS_AT + i * 32) };
     if let Some(i) = (0..CELLS).find(|&i| at(i)[0].load(SeqCst) == tag) {
@@ -429,7 +438,7 @@ pub fn cell(tag: u64, make: bool) -> Option<&'static [Word; 3]> {
 
 /// The cell tagged `tag` is free again.
 pub fn free_cell(tag: u64) {
-    let Some(s) = store() else { return };
+    let s = store();
     for i in 0..CELLS {
         let c: &[Word; 4] = s.at(CELLS_AT + i * 32);
         let _ = c[0].compare_exchange(tag | 1, 0, SeqCst, SeqCst);
@@ -438,7 +447,7 @@ pub fn free_cell(tag: u64) {
 
 /// Host pid `pid`'s mailbox goes (its record went, or its process).
 pub fn forget_mailbox(pid: i32) {
-    let Some(s) = store() else { return };
+    let s = store();
     let Some(e) = s.entry(pid) else { return };
     let i = e.mailbox.swap(0, SeqCst);
     if i != 0 {
@@ -484,7 +493,7 @@ pub fn get(pid: i32) -> Option<Vec<u8>> {
 
 /// What host pid `pid`'s entry of `kind` holds, if anything.
 pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
-    let s = store()?;
+    let s = store();
     let e = s.entry_of(kind, pid)?;
     for round in 0..10_000 {
         let seq = e.seq.load(SeqCst);
@@ -507,7 +516,7 @@ pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
 /// Which version of host pid `pid`'s record there is: it changes with
 /// every write ([`put`], [`remove`]).
 pub fn version(pid: i32) -> Option<u32> {
-    Some(store()?.entry(pid)?.seq.load(SeqCst))
+    Some(store().entry(pid)?.seq.load(SeqCst))
 }
 
 /// A held record lock ([`lock`]), let go when dropped.
@@ -525,7 +534,7 @@ impl Drop for Held {
 /// Hold host pid `pid`'s record lock while the result lives. A lock its
 /// holder left as it died is taken over.
 pub fn lock(pid: i32) -> Option<Held> {
-    let entry = store()?.entry(pid)?;
+    let entry = store().entry(pid)?;
     let me = crate::host::pid() as u32;
     loop {
         match entry.lock.compare_exchange(0, me, SeqCst, SeqCst) {
@@ -546,9 +555,9 @@ pub fn lock(pid: i32) -> Option<Held> {
 
 /// Write `bytes` as host pid `pid`'s record, under its lock (`_held`).
 pub fn put(_held: &Held, pid: i32, bytes: &[u8]) {
-    let Some(s) = store() else { return };
+    let s = store();
     let Some(e) = s.entry(pid) else { return };
-    let Some(head) = s.write_chain(bytes) else { return };
+    let head = s.write_chain(bytes);
     let (old, old_len) = replace(e, head, bytes.len() as u32);
     s.used(pid as usize / 64).fetch_or(1 << (pid as usize % 64), SeqCst);
     s.free_chain(old, old_len as usize);
@@ -556,7 +565,7 @@ pub fn put(_held: &Held, pid: i32, bytes: &[u8]) {
 
 /// Forget host pid `pid`'s record, under its lock (`_held`).
 pub fn remove(_held: &Held, pid: i32) {
-    let Some(s) = store() else { return };
+    let s = store();
     let Some(e) = s.entry(pid) else { return };
     let (old, old_len) = replace(e, 0, 0);
     s.used(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
@@ -566,13 +575,10 @@ pub fn remove(_held: &Held, pid: i32) {
 /// Write `bytes` as this process's entry of `kind` (one it alone writes,
 /// its threads taking turns): `None` for none.
 pub fn put_own(kind: Kind, bytes: Option<&[u8]>) {
-    let Some(s) = store() else { return };
+    let s = store();
     let Some(e) = s.entry_of(kind, crate::host::pid()) else { return };
     let (head, len) = match bytes {
-        Some(b) => match s.write_chain(b) {
-            Some(head) => (head, b.len() as u32),
-            None => return,
-        },
+        Some(b) => (s.write_chain(b), b.len() as u32),
         None => (0, 0),
     };
     let (old, old_len) = replace(e, head, len);
@@ -593,7 +599,7 @@ fn replace(e: &Entry, head: u32, len: u32) -> (u32, u32) {
 
 /// Every host pid with a record.
 pub fn pids() -> Vec<i32> {
-    let Some(s) = store() else { return Vec::new() };
+    let s = store();
     let mut out = Vec::new();
     for w in 0..PIDS / 64 {
         let mut bits = s.used(w).load(SeqCst);
@@ -609,7 +615,7 @@ pub fn pids() -> Vec<i32> {
 /// Record that host process `pid` ends of a signal, with Linux wait status
 /// `status`.
 pub fn set_end(pid: i32, status: i32) {
-    if let Some(e) = store().and_then(|s| s.entry(pid)) {
+    if let Some(e) = store().entry(pid) {
         e.end.store((status as u32 & !END_SET) | END_SET, SeqCst);
     }
 }
@@ -617,14 +623,14 @@ pub fn set_end(pid: i32, status: i32) {
 /// The status [`set_end`] recorded for host pid `pid`. Async-signal-safe
 /// once the store is mapped ([`init`]).
 pub fn end_status(pid: i32) -> Option<i32> {
-    let s = STORE.get()?.as_ref()?;
+    let s = mapped()?;
     let v = s.entry(pid)?.end.load(SeqCst);
     (v & END_SET != 0).then_some((v & !END_SET) as i32)
 }
 
 /// Forget the status [`set_end`] recorded for host pid `pid`.
 pub fn forget_end(pid: i32) {
-    if let Some(e) = store().and_then(|s| s.entry(pid)) {
+    if let Some(e) = store().entry(pid) {
         e.end.store(0, SeqCst);
     }
 }
@@ -632,9 +638,9 @@ pub fn forget_end(pid: i32) {
 /// Keep an ended account of host process `pid` that started at `start`,
 /// in place of one kept of it already.
 pub fn put_ended(pid: i32, start: u64, bytes: &[u8]) {
-    let Some(s) = store() else { return };
+    let s = store();
     take_ended(pid, start);
-    let Some(head) = s.write_chain(bytes) else { return };
+    let head = s.write_chain(bytes);
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
@@ -650,12 +656,12 @@ pub fn put_ended(pid: i32, start: u64, bytes: &[u8]) {
         slot.state.store(next(cur, FULL), SeqCst);
         return;
     }
-    s.free_chain(head, bytes.len());
+    fatal(&format!("the table of ended processes is full ({ENDED} not reaped)"));
 }
 
 /// The ended accounts kept of processes whose host pid `wanted` picks.
 pub fn ended(wanted: impl Fn(i32) -> bool) -> Vec<Vec<u8>> {
-    let Some(s) = store() else { return Vec::new() };
+    let s = store();
     let mut out = Vec::new();
     for i in 0..ENDED {
         let slot = s.ended(i);
@@ -678,7 +684,7 @@ pub fn ended(wanted: impl Fn(i32) -> bool) -> Vec<Vec<u8>> {
 /// Take the ended account of host process `pid` that started at `start`:
 /// whether this caller took it (one caller does).
 pub fn take_ended(pid: i32, start: u64) -> bool {
-    let Some(s) = store() else { return false };
+    let s = store();
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
@@ -700,7 +706,7 @@ pub fn take_ended(pid: i32, start: u64) -> bool {
 /// Whether an ended account of host process `pid` that started at `start`
 /// is kept.
 pub fn has_ended(pid: i32, start: u64) -> bool {
-    let Some(s) = store() else { return false };
+    let s = store();
     (0..ENDED).any(|i| {
         let slot = s.ended(i);
         st(slot.state.load(SeqCst)) == FULL

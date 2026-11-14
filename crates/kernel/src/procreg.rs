@@ -172,14 +172,11 @@ fn made_dir(cell: &'static std::sync::OnceLock<Vec<u8>>, name: &str) -> Option<V
     Some(cell.get_or_init(|| d).clone())
 }
 
-fn dir() -> Option<Vec<u8>> {
+/// The directory of the files kept beside the process records (signal
+/// reply sockets, memory requests, Landlock domains).
+pub fn records_dir() -> Option<Vec<u8>> {
     static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     made_dir(&DIR, "procs")
-}
-
-/// The directory the process records are kept in.
-pub fn records_dir() -> Option<Vec<u8>> {
-    dir()
 }
 
 /// Host process `pid`'s parent as the host has it, if it exists.
@@ -383,23 +380,6 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     })
 }
 
-/// Hold host process `pid`'s record's lock while the result lives: the
-/// holder reads and writes it ([`read_locked`], [`write_locked`]).
-fn lock(pid: i32) -> Option<crate::procstore::Held> {
-    crate::procstore::lock(pid)
-}
-
-/// The record of host process `pid`, whose lock the caller holds, if it is
-/// of the process that started at `start`.
-fn read_locked(pid: i32, start: u64) -> Option<ProcRecord> {
-    with_held(pid, read_any(pid).filter(|r| r.start == start))
-}
-
-/// Write record `r` of host process `pid`, whose lock is `held`.
-fn write_locked(held: &crate::procstore::Held, pid: i32, r: &ProcRecord) {
-    crate::procstore::put(held, pid, &encode(r));
-}
-
 /// This process ends of a Linux signal, with Linux wait status `status`
 /// (the signal, and `0x80` if it dumped core): what its parent's `wait` is
 /// to report, which the host cannot say when the host has no such signal,
@@ -438,7 +418,7 @@ pub fn remove(held: &crate::procstore::Held, pid: i32) {
 /// without them, as when its pid had been given to another process by
 /// then, or whose parent was not fwe's to reap it.
 pub fn collect_leftovers(young: std::time::Duration) {
-    let Some(d) = dir() else { return };
+    let Some(d) = records_dir() else { return };
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
@@ -508,7 +488,7 @@ pub fn run() -> Vec<i32> {
 /// take it. A zombie has ended too, but its record stays until it is
 /// reaped: `/proc/<pid>` shows it, as Linux shows a zombie.
 pub fn gone(pid: i32) {
-    let Some(held) = lock(pid) else { return };
+    let Some(held) = crate::procstore::lock(pid) else { return };
     if let Some(r) = read_any(pid)
         && !alive((pid, r.start))
     {
@@ -634,10 +614,11 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
     // Under the record's lock: a parent and its child may change one.
-    let held = lock(pid).ok_or(fwe_abi::errno::ESRCH)?;
-    let mut r = read_locked(pid, start).unwrap_or_else(|| fresh(pid, start));
+    let held = crate::procstore::lock(pid).ok_or(fwe_abi::errno::ESRCH)?;
+    let mut r = with_held(pid, read_any(pid).filter(|r| r.start == start))
+        .unwrap_or_else(|| fresh(pid, start));
     f(&mut r);
-    write_locked(&held, pid, &r);
+    crate::procstore::put(&held, pid, &encode(&r));
     Ok(())
 }
 
@@ -1352,7 +1333,7 @@ pub fn take_ended(e: &Ended) -> bool {
 /// gone ([`gone`]) takes it for one killed outright and records a second
 /// end. Whoever takes the account reaps the process.
 pub fn take_adopted_end(e: &Ended) -> bool {
-    let held = lock(e.pid);
+    let held = crate::procstore::lock(e.pid);
     if !take_ended(e) {
         return false;
     }
@@ -1370,7 +1351,7 @@ pub fn reaped(pid: i32) {
     forget_end(pid);
     crate::reaper::forget_exit_signal(pid);
     if read(pid).is_none()
-        && let Some(held) = lock(pid)
+        && let Some(held) = crate::procstore::lock(pid)
         && let Some(r) = read_any(pid)
         && r.lineage.first().is_some_and(|&(p, _)| p == me())
     {
@@ -1415,7 +1396,7 @@ pub fn exiting(status: i32) {
     // Under the record's lock: whoever finds the process gone (`gone`)
     // checks its record and records how it ended under the same lock, so
     // it sees the record with this account written, or no record at all.
-    let _lock = lock(me);
+    let _lock = crate::procstore::lock(me);
     if let Some(r) = read(me) {
         let ended = Ended {
             pid: me,
@@ -1454,7 +1435,7 @@ fn forget_children(parent: i32) {
         take_ended(&e);
     }
     for pid in crate::procstore::pids() {
-        let Some(held) = lock(pid) else { continue };
+        let Some(held) = crate::procstore::lock(pid) else { continue };
         if let Some(r) = read_any(pid)
             && r.lineage.first().is_some_and(|p| p.0 == parent)
             && start_time(pid) != Some(r.start)
@@ -1482,6 +1463,6 @@ mod tests {
         let r = read_any(me()).unwrap();
         // Its name is the program's, cut to 15 bytes as Linux's is.
         assert_eq!((r.exe, r.auxv, r.comm), (exe.clone(), vec![1, 2, 3], exe[1..16].to_vec()));
-        remove(&lock(me()).unwrap(), me());
+        remove(&crate::procstore::lock(me()).unwrap(), me());
     }
 }

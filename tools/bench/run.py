@@ -7,7 +7,7 @@ project's build, under fwe, natively on macOS and natively on Linux.
         natively; Lua is built in an Alpine 3.24 container (docker).
 
     run.py macos --fwe FWE --bench BENCH --native NATIVE --cache DIR
-                 [--linux linux.json] [--no-build] [--native-cc CC] --out macos.json
+                 --native-cc CC [--linux linux.json] [--no-build] --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
         source built for macOS) runs natively; Lua is built with clang
         under FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched
@@ -124,10 +124,6 @@ BUDGETS = {
     "build Lua (s)": 1.5,
 }
 
-# The figures held to a budget against another than macOS's (none: the
-# build's native side uses the same clang release as fwe's, on the same
-# runner, so the runner's speed falls on both alike).
-AGAINST: dict = {}
 
 
 def best(f, rounds=ROUNDS):
@@ -215,10 +211,11 @@ def checked(cmd, retrace=None):
 def lua_build_s(cmd_for, src, retrace=None):
     """Seconds to build Lua from clean with `cmd_for(make_args)`, best of
     three."""
-    return best(lambda: lua_build_once(cmd_for, retrace), 3)
+    # Alpine's clang, in the container.
+    return best(lambda: lua_build_once(cmd_for, "clang", retrace), 3)
 
 
-def lua_build_once(cmd_for, retrace=None, cc="clang"):
+def lua_build_once(cmd_for, cc, retrace=None):
     """Seconds to build Lua from clean once with `cmd_for(make_args)`, with
     compiler `cc`."""
     checked(cmd_for(["clean"]))
@@ -283,19 +280,17 @@ def macos(a):
 
 
 def over_budget(results):
-    """The benchmarks whose ratio to their reference (macOS, or AGAINST's)
-    exceeds its budget. A reference missing is a failure: the budget is
-    not shown to hold."""
+    """The benchmarks whose fwe / macOS ratio exceeds its budget. A missing
+    macOS figure is one: the budget is not shown to hold."""
     over = []
     for row, budget in BUDGETS.items():
-        against = AGAINST.get(row, "macOS")
-        fwe, ref = results["fwe"].get(row), results.get(against, {}).get(row)
+        fwe, mac = results["fwe"].get(row), results["macOS"].get(row)
         if fwe is None:
             continue
-        if not ref:
-            over.append(f"{row}: no {against} figure")
-        elif fwe / ref > budget:
-            over.append(f"{row} {fwe / ref:.1f}x > {budget}x against {against}")
+        if not mac:
+            over.append(f"{row}: no macOS figure")
+        elif fwe / mac > budget:
+            over.append(f"{row} {fwe / mac:.1f}x > {budget}x")
     return over
 
 
@@ -332,9 +327,10 @@ def build(a, fwe, results):
     # falls on both alike.
     ours, theirs = [], []
     for _ in range(3):
-        ours.append(lua_build_once(lambda args: make + args, traced))
+        # Alpine's clang, in its root under fwe.
+        ours.append(lua_build_once(lambda args: make + args, "clang", traced))
         theirs.append(
-            lua_build_once(lambda args: ["make", "-C", native_src] + args, cc=a.native_cc)
+            lua_build_once(lambda args: ["make", "-C", native_src] + args, a.native_cc)
         )
     shutil.rmtree(native, ignore_errors=True)
     results["fwe"]["build Lua (s)"] = min(ours)
@@ -366,9 +362,6 @@ def render(results):
         )
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
         budget = f"{BUDGETS[row]}x" if row in BUDGETS else ""
-        if row in AGAINST and results.get(AGAINST[row], {}).get(row):
-            r = results["fwe"][row] / results[AGAINST[row]][row]
-            budget += f" ({r:.1f}x against {AGAINST[row]})"
         lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} | {budget} |")
     return "\n".join(lines)
 
@@ -393,7 +386,7 @@ def main():
     mc.add_argument("--cache", required=True)
     mc.add_argument("--linux")
     mc.add_argument("--no-build", action="store_true")
-    mc.add_argument("--native-cc", default="clang", help="the compiler of the native build")
+    mc.add_argument("--native-cc", required=True, help="the native build's compiler")
     mc.add_argument("--out", required=True)
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)

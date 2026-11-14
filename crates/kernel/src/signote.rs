@@ -76,10 +76,6 @@ pub fn init() {
     }
 }
 
-/// A fork child, or a process that runs another program: nothing to do
-/// (its mailbox is found by its pid).
-pub fn open_own() {}
-
 fn now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: a valid out-parameter; async-signal-safe.
