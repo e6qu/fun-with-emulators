@@ -27,6 +27,32 @@ jobs:
           }
           echo "== getpid"; prof $F ./bench-linux getpid 400000000
           echo "== thread"; prof $F ./bench-linux thread 2000000
+      - name: What clang --version does under fwe
+        run: |
+          python3 -I - <<'PY'
+          import sys, os, subprocess, time, collections, re
+          sys.path.insert(0, os.path.abspath("tools/bench"))
+          import run
+          cache = os.path.abspath("target/bench-cache")
+          root = run.alpine_root("clang", cache)
+          fwe = os.path.abspath("target/release/fwe")
+          env = ["env", "-i", "PATH=/usr/bin:/bin", "HOME=/root", "TMPDIR=" + os.environ.get("TMPDIR", "/tmp")]
+          cmd = env + [fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "--version"]
+          for i in range(3):
+              s = time.perf_counter(); subprocess.run(cmd, capture_output=True); print("fwe clang --version %.0f ms" % ((time.perf_counter() - s) * 1e3))
+          s = time.perf_counter(); subprocess.run(["clang", "--version"], capture_output=True); print("mac clang --version %.0f ms" % ((time.perf_counter() - s) * 1e3))
+          subprocess.run(env + [fwe, "--strace", "--strace-file=/tmp/t.txt", "--root", root, os.path.join(root, "usr/bin/clang"), "--version"], capture_output=True)
+          calls = collections.Counter()
+          notes = 0
+          for line in open("/tmp/t.txt", errors="replace"):
+              m = re.search(r"\] ([a-z_0-9]+)\(", line)
+              if m: calls[m.group(1)] += 1
+              elif "prepared" in line or "loaded" in line: notes += 1
+          print("calls", sum(calls.values()), calls.most_common(25), "notes", notes)
+          lines = open("/tmp/t.txt", errors="replace").read().splitlines()
+          print("\n".join(l[:200] for l in lines if "mmap" in l and "PROT_EXEC" in l.upper()[:400])[:4000])
+          print("\n".join(l[:200] for l in lines if "prepared" in l)[:3000])
+          PY
       - name: A compile under fwe
         run: |
           python3 -I - <<'PY'
