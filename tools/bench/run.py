@@ -153,6 +153,38 @@ def micro(prefix, bench):
     return r
 
 
+def micro_pair(fwe, guest, native):
+    """The micro-benchmarks under fwe (`fwe` its command, `guest` the Linux
+    build) and natively (`native`), their rounds taken in turn: a runner's
+    load comes and goes, and so it falls on both alike."""
+    def pair(f, g, rounds=ROUNDS):
+        a, b = [], []
+        for _ in range(rounds):
+            a.append(f())
+            b.append(g())
+        return min(a), min(b)
+
+    runs = [("startup (ms)", lambda p, b: startup_ms_once(p + [b, "exit"]))]
+    for name, args, unit in MICRO:
+        runs.append((f"{name} ({unit})", lambda p, b, args=args: run_bench(p, b, args)))
+    # fork + exec of the benchmark itself (under fwe without a root, the
+    # guest sees host paths).
+    runs.append(
+        ("fork+exec+wait (us)", lambda p, b: run_bench(p, b, ["forkexec", "100", b]))
+    )
+    ours, theirs = {}, {}
+    for name, f in runs:
+        ours[name], theirs[name] = pair(lambda: f(fwe, guest), lambda: f([], native))
+    return ours, theirs
+
+
+def startup_ms_once(cmd, n=30):
+    start = time.perf_counter()
+    for _ in range(n):
+        subprocess.run(cmd, check=True)
+    return (time.perf_counter() - start) / n * 1e3
+
+
 def unpack_lua(tarball, into):
     subprocess.run(["tar", "-xzf", tarball, "-C", into], check=True)
     return os.path.join(into, "lua-5.4.7")
@@ -176,14 +208,15 @@ def checked(cmd, retrace=None):
 def lua_build_s(cmd_for, src, retrace=None):
     """Seconds to build Lua from clean with `cmd_for(make_args)`, best of
     three."""
+    return best(lambda: lua_build_once(cmd_for, retrace), 3)
 
-    def once():
-        checked(cmd_for(["clean"]))
-        start = time.perf_counter()
-        checked(cmd_for(["-j4", "posix", "CC=clang"]), retrace)
-        return time.perf_counter() - start
 
-    return best(once, 3)
+def lua_build_once(cmd_for, retrace=None):
+    """Seconds to build Lua from clean once with `cmd_for(make_args)`."""
+    checked(cmd_for(["clean"]))
+    start = time.perf_counter()
+    checked(cmd_for(["-j4", "posix", "CC=clang"]), retrace)
+    return time.perf_counter() - start
 
 
 def linux(a):
@@ -220,10 +253,8 @@ def macos(a):
         env = dict(os.environ, FWE_TIMING="1")
         r = subprocess.run(fwe + [a.bench] + args, env=env, capture_output=True, text=True)
         print(r.stderr, file=sys.stderr)
-    results = {
-        "fwe": micro(fwe, a.bench),
-        "macOS": micro([], a.native),
-    }
+    ours, theirs = micro_pair(fwe, a.bench, a.native)
+    results = {"fwe": ours, "macOS": theirs}
     if not a.no_build:
         build(a, fwe, results)
     if a.linux:
@@ -277,7 +308,17 @@ def build(a, fwe, results):
         print(f"clang --version: {r.returncode}\n{(r.stdout + r.stderr)[-6000:]}", file=sys.stderr)
         return cmd[:i] + ["--strace", f"--strace-file={trace}"] + cmd[i:]
 
-    results["fwe"]["build Lua (s)"] = lua_build_s(lambda args: make + args, src, traced)
+    native = tempfile.mkdtemp()
+    native_src = unpack_lua(lua, native)
+    # Each round under fwe, then natively, three times: the runner's load
+    # falls on both alike.
+    ours, theirs = [], []
+    for _ in range(3):
+        ours.append(lua_build_once(lambda args: make + args, traced))
+        theirs.append(lua_build_once(lambda args: ["make", "-C", native_src] + args))
+    shutil.rmtree(native, ignore_errors=True)
+    results["fwe"]["build Lua (s)"] = min(ours)
+    results["macOS"]["build Lua (s)"] = min(theirs)
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
@@ -287,12 +328,6 @@ def build(a, fwe, results):
     )
     if out.stdout.strip() != "42":
         sys.exit(f"the Lua fwe built printed {out.stdout!r}")
-    native = tempfile.mkdtemp()
-    native_src = unpack_lua(lua, native)
-    results["macOS"]["build Lua (s)"] = lua_build_s(
-        lambda args: ["make", "-C", native_src] + args, native_src
-    )
-    shutil.rmtree(native, ignore_errors=True)
 
 
 def render(results):

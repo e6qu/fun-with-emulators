@@ -17,6 +17,7 @@ jobs:
       - name: Profiles
         run: |
           F=target/release/fwe
+          echo "host getppid in fwe: $($F --probe host-getppid)"
           for op in getpid syscall; do echo "$op fwe $($F ./bench-linux $op 2000000) mac $(./bench-mac $op 2000000)"; done
           echo "thread fwe $($F ./bench-linux thread 3000) mac $(./bench-mac thread 3000)"
           prof() {
@@ -26,3 +27,34 @@ jobs:
           }
           echo "== getpid"; prof $F ./bench-linux getpid 400000000
           echo "== thread"; prof $F ./bench-linux thread 2000000
+      - name: A compile under fwe
+        run: |
+          python3 -I - <<'PY'
+          import sys, os, subprocess, time, shutil
+          sys.path.insert(0, os.path.abspath("tools/bench"))
+          import run
+          cache = os.path.abspath("target/bench-cache")
+          lua = run.fetch(*run.LUA, cache)
+          root = run.alpine_root("clang", cache)
+          tmp = os.path.join(root, "tmp"); os.makedirs(tmp, exist_ok=True)
+          shutil.rmtree(os.path.join(tmp, "lua-5.4.7"), ignore_errors=True)
+          src = run.unpack_lua(lua, tmp)
+          fwe = os.path.abspath("target/release/fwe")
+          env = ["env", "-i", "PATH=/usr/bin:/bin", "HOME=/root"]
+          g = env + [fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "-O2", "-c", "/tmp/lua-5.4.7/src/lparser.c", "-o", "/tmp/x.o"]
+          n = ["clang", "-O2", "-c", os.path.join(src, "src/lparser.c"), "-o", "/tmp/x.o"]
+          for name, cmd in (("fwe", g), ("mac", n)):
+              ts = []
+              for i in range(5):
+                  s = time.perf_counter(); subprocess.run(cmd, check=True); ts.append(time.perf_counter() - s)
+              print(name, "compile", " ".join("%.0f" % (t * 1e3) for t in ts), "ms")
+          s = time.perf_counter(); subprocess.run(env + [fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "--version"], capture_output=True); print("fwe clang --version %.0f ms" % ((time.perf_counter() - s) * 1e3))
+          r = subprocess.run(env + ["FWE_TIMING=1", fwe, "--root", root, os.path.join(root, "usr/bin/clang"), "--version"], capture_output=True, text=True)
+          print(r.stderr[-3000:])
+          # Profile one compile (cc1 runs in the same process).
+          p = subprocess.Popen(g[:-4] + ["-O2", "-c", "/tmp/lua-5.4.7/src/lparser.c", "-o", "/tmp/y.o"])
+          time.sleep(0.05)
+          subprocess.run(["sample", str(p.pid), "1", "-file", "c.txt"], capture_output=True)
+          p.wait()
+          PY
+          awk '/Sort by top of stack/,/Binary Images/' c.txt | head -40 || true

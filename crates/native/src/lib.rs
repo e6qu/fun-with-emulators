@@ -746,6 +746,16 @@ pub fn probe(name: &str) -> Result<String, String> {
         .map(|_| "waited in mode".into()),
         // Creates a VM unless under --hv-standin (see hv::probe).
         "hv-map-rules" => hv::map_rules_probe(),
+        // What a host `getppid` costs in this process: nanoseconds per call.
+        "host-getppid" => {
+            let n = 1_000_000;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                // SAFETY: plain host call.
+                std::hint::black_box(unsafe { libc::getppid() });
+            }
+            Ok(format!("{:.1} ns", t.elapsed().as_nanos() as f64 / n as f64))
+        }
         _ => Err(format!("unknown probe {name}")),
     }
 }
