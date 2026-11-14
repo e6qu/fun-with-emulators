@@ -411,6 +411,15 @@ def build(a, fwe, results):
                   os.path.join(native, "one.o"), os.path.join(native_src, "src/lvm.c")]
     rusage("clang -c lvm.c", "fwe", clang, ())
     rusage("clang -c lvm.c", "macOS", native_one, ())
+    sampled("clang -c lvm.c", clang)
+    # Its memory as it compiles, by kind of region.
+    proc = subprocess.Popen(clang, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.25)
+    v = subprocess.run(["vmmap", "-summary", str(proc.pid)], capture_output=True, text=True,
+                       errors="replace").stdout
+    proc.wait()
+    table = v[v.find("REGION TYPE"):v.find("MALLOC ZONE")]
+    print("clang -c lvm.c under fwe, its memory:\n" + table, file=sys.stderr)
     # The Lua it built runs.
     out = subprocess.run(
         fwe + ["--root", root, os.path.join(src, "src/lua"), "-e", "print(6*7)"],
