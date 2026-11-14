@@ -622,8 +622,10 @@ fn main() {
             let tid = tid_rx.recv().unwrap();
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(1) {
-                SENT.fetch_add(1, Ordering::SeqCst);
+                // Counted once sent: a sender held up before the call
+                // (on a loaded machine) leaves nothing on its way.
                 assert_eq!(tgkill(tid, SIGUSR1), 0);
+                SENT.fetch_add(1, Ordering::SeqCst);
                 while HITS.load(Ordering::SeqCst) < SENT.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
