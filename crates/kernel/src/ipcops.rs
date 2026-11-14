@@ -113,8 +113,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_shmget(&mut self, key: u64, size: u64, flags: u64) -> i64 {
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         self.ipc_get(
             Kind::Shm,
             key as i32,

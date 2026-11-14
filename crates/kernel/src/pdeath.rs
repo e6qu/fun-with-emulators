@@ -130,8 +130,7 @@ fn deliver(sig: u64) {
     if sig == 0 {
         return;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     match crate::host::signal_to_host(sig) {
         Some(h) => {
             crate::host::kill_process(me, h);

@@ -75,8 +75,7 @@ impl<P: Platform> Kernel<P> {
         if pid < 0 {
             return Err(errno::EINVAL);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if pid == 0 || pid == crate::thread::tgid() || crate::thread::tids().contains(&pid) {
             return Ok(me);
         }
@@ -131,8 +130,7 @@ impl<P: Platform> Kernel<P> {
         if cur.policy == SCHED_IDLE && policy != SCHED_IDLE && !nice_ok(nice_now) {
             return false;
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let owner = if host == me {
             [self.creds.uid, self.creds.euid]
         } else {

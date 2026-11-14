@@ -141,8 +141,7 @@ fn make_node(
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        // SAFETY: getpid cannot fail.
-        let pid = unsafe { libc::getpid() };
+        let pid = crate::host::pid();
         let tmp = std::ffi::CString::new(format!(
             ".fwe-node-{pid}-{}",
             N.fetch_add(1, Ordering::Relaxed)

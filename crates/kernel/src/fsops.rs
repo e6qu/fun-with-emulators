@@ -1195,8 +1195,7 @@ impl<P: Platform> Kernel<P> {
             return ret(unsafe { libc::access(c.as_ptr(), mode as i32) });
         }
         // A file with no path (a pipe, a socket): its bits for the caller.
-        // SAFETY: plain host calls.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (uid, gid) = (host::euid(), host::egid());
         let shift = if st.st_uid == uid {
             6
         } else if st.st_gid == gid {
@@ -2680,14 +2679,12 @@ impl<P: Platform> Kernel<P> {
             b"/oom_adj" => true,
             b"/timerslack_ns" => {
                 let host = if who == b"self" {
-                    // SAFETY: getpid cannot fail.
-                    unsafe { libc::getpid() }
+                    crate::host::pid()
                 } else {
                     crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
                 };
                 // Another process's takes CAP_SYS_NICE, as on Linux.
-                // SAFETY: getpid cannot fail.
-                let own = host == unsafe { libc::getpid() };
+                let own = host == crate::host::pid();
                 if !own && !self.creds.has(crate::caps::CAP_SYS_NICE) {
                     return Some(Err(errno::EPERM));
                 }
@@ -2696,13 +2693,11 @@ impl<P: Platform> Kernel<P> {
             _ => return None,
         };
         let host = if who == b"self" {
-            // SAFETY: getpid cannot fail.
-            unsafe { libc::getpid() }
+            crate::host::pid()
         } else {
             crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
         };
-        // SAFETY: getpid cannot fail.
-        let own = host == unsafe { libc::getpid() };
+        let own = host == crate::host::pid();
         // The file is its process's effective user's, mode 0644.
         if !own
             && !self.creds.has(crate::caps::CAP_DAC_OVERRIDE)
@@ -2731,8 +2726,7 @@ impl<P: Platform> Kernel<P> {
             Some(i) => (num(&rest[..i])?, Some(num(rest[i..].strip_prefix(b"/task/")?)?)),
         };
         let host = crate::pidns::to_host(pid)?;
-        // SAFETY: getpid cannot fail.
-        if host == unsafe { libc::getpid() } {
+        if host == crate::host::pid() {
             return None;
         }
         let id = match tid {
@@ -2764,8 +2758,7 @@ impl<P: Platform> Kernel<P> {
             b"/setgroups" => 2,
             _ => return None,
         };
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let host = if who == b"self" {
             me
         } else {

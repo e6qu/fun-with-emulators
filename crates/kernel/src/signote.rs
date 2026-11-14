@@ -79,8 +79,7 @@ pub fn init() {
 /// Open this process's own mailbox, if it is not open yet for this pid (a
 /// fork child has its parent's open): where its handlers read notes.
 pub fn open_own() {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if OWN_PID.load(Ordering::SeqCst) == me {
         return;
     }
@@ -239,8 +238,7 @@ pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
 /// one's mailbox, which goes when those records are cleared, and senders
 /// then write a new one. Async-signal-safe; the caller keeps errno.
 fn own_mailbox() -> Option<(i32, bool)> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut buf = [0u8; 512];
     let path = mailbox(me, &mut buf)?;
     let own = OWN.load(Ordering::SeqCst);
@@ -698,8 +696,7 @@ fn reply_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH]) -> Option<usize> {
 pub fn fd_reply_socket() -> Option<Reply> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut buf = [0u8; SUN_PATH];
     let len = reply_path(me, token, &mut buf)?;
     let path = buf[..len].to_vec();
@@ -841,8 +838,7 @@ mod tests {
     fn queued_signals_are_taken_in_order() {
         let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
         init();
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if DIR.get().is_none() {
             return;
         }
@@ -866,8 +862,7 @@ mod tests {
     fn a_replaced_mailbox_is_read_by_its_path() {
         let _one = OWN_BOX.lock().unwrap_or_else(|e| e.into_inner());
         init();
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if DIR.get().is_none() {
             return;
         }

@@ -14,7 +14,8 @@ project's build, under fwe, natively on macOS and natively on Linux.
         into DIR), and natively with the host's clang. With the Linux
         results, a table of all three is printed (and appended to
         $GITHUB_STEP_SUMMARY). `--no-build` leaves the build out (Alpine's
-        programs run only in CI).
+        programs run only in CI). It fails when a figure of fwe's exceeds
+        its budget against macOS's (BUDGETS).
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -104,6 +105,22 @@ MICRO = [
     ("thread create+join", ["thread", "2000"], "us"),
     ("fork+exit+wait", ["fork", "200"], "us"),
 ]
+
+
+# How many times native macOS's figure fwe's may be, on the same runner
+# (PLAN.md, "Native speed"): system calls 1.5x, the process and thread
+# calls and start-up 3x, a C build 1.5x.
+BUDGETS = {
+    "startup (ms)": 3.0,
+    "getpid (ns)": 1.5,
+    "getppid (ns)": 1.5,
+    "getppid, 3 threads (ns)": 1.5,
+    "fstat, 3 threads (ns)": 1.5,
+    "thread create+join (us)": 3.0,
+    "fork+exit+wait (us)": 3.0,
+    "fork+exec+wait (us)": 3.0,
+    "build Lua (s)": 1.5,
+}
 
 
 def best(f, rounds=ROUNDS):
@@ -209,11 +226,26 @@ def macos(a):
             results["Linux"] = json.load(f)
     write(a.out, results)
     table = render(results)
+    over = over_budget(results)
+    if over:
+        table += "\n\nOver budget: " + ", ".join(over)
     print(table)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:
             f.write(table + "\n")
+    if over:
+        sys.exit("over budget: " + ", ".join(over))
+
+
+def over_budget(results):
+    """The benchmarks whose fwe / macOS ratio exceeds its budget."""
+    over = []
+    for row, budget in BUDGETS.items():
+        fwe, mac = results["fwe"].get(row), results["macOS"].get(row)
+        if fwe is not None and mac and fwe / mac > budget:
+            over.append(f"{row} {fwe / mac:.1f}x > {budget}x")
+    return over
 
 
 def build(a, fwe, results):
@@ -261,7 +293,10 @@ def build(a, fwe, results):
 def render(results):
     cols = [c for c in ("fwe", "macOS", "Linux") if c in results]
     rows = list(results["fwe"].keys())
-    lines = ["| benchmark | " + " | ".join(cols) + " | fwe / macOS |", "|---" * (len(cols) + 2) + "|"]
+    lines = [
+        "| benchmark | " + " | ".join(cols) + " | fwe / macOS | budget |",
+        "|---" * (len(cols) + 3) + "|",
+    ]
     for row in rows:
         vals = [results[c].get(row) for c in cols]
         ratio = (
@@ -270,7 +305,8 @@ def render(results):
             else ""
         )
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
-        lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} |")
+        budget = f"{BUDGETS[row]}x" if row in BUDGETS else ""
+        lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} | {budget} |")
     return "\n".join(lines)
 
 

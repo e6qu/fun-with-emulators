@@ -141,8 +141,7 @@ pub fn thread_gone(tid: i32) {
     if THREAD_FDS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     for (fd, m) in fdmarks::marks() {
         if m == (Mark::Pid { host: me, tid, nonblock: false })
             || m == (Mark::Pid { host: me, tid, nonblock: true })
@@ -158,8 +157,7 @@ pub fn thread_gone(tid: i32) {
 /// `NSpid`.
 pub fn fdinfo(fd: i32) -> Option<String> {
     let t = of(fd)?;
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let pid = if t.host == me {
         thread::tgid()
     } else if ended(fd) && !crate::host::process_exists(t.host) {
@@ -220,8 +218,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
     let exits: HashMap<i32, i32> = (0..n).map(|_| (d.i32(), d.i32())).collect();
     *EXITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(exits);
     let n = d.count(14);
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     for _ in 0..n {
         let (fd, host, tid, nonblock, cloexec) = (d.i32(), d.i32(), d.i32(), d.bool(), d.bool());
         if exec && cloexec {
@@ -267,13 +264,11 @@ fn proc_dir_target(fd: i32) -> Option<i32> {
     let path = crate::synthdir::path_of(fd)?;
     let rest = path.strip_prefix(b"/proc/")?;
     if rest == b"self" || rest == b"thread-self" {
-        // SAFETY: getpid cannot fail.
-        return Some(unsafe { libc::getpid() });
+        return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(rest).ok()?.parse().ok()?;
     if pid == thread::tgid() {
-        // SAFETY: getpid cannot fail.
-        return Some(unsafe { libc::getpid() });
+        return Some(crate::host::pid());
     }
     crate::pidns::to_host(pid)
 }
@@ -286,8 +281,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let nonblock = flags & PIDFD_NONBLOCK != 0;
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let t = if thread::host_thread(pid).is_some() || pid == thread::tid() {
             // One of this process's threads: the main one names the
             // process; another only as a thread.
@@ -351,8 +345,7 @@ impl<P: Platform> Kernel<P> {
         if gone {
             return err(errno::ESRCH);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host) };
         if pid == 0 {
             // Not in the caller's pid namespace or one below it.
@@ -395,8 +388,7 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return Err(err(errno::ESRCH));
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if t.host == me {
             if !crate::fdtable::guest_visible(target_fd) {
                 return Err(err(errno::EBADF));
@@ -457,8 +449,7 @@ impl<P: Platform> Kernel<P> {
     fn pidfd_info(&self, fd: i32, t: Target, arg: u64, size: u64) -> i64 {
         let asked: u64 = guest!(uaccess::read(arg));
         // As the caller's pid namespace numbers it: none outside it.
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host) };
         if pid == 0 {
             return err(errno::ESRCH);
@@ -516,8 +507,7 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return err(errno::ESRCH);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if t.host != me && !self.may_attach(t.host) {
             return err(errno::EPERM);
         }
@@ -553,8 +543,7 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return err(errno::ESRCH);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let dirs = if t.host == me {
             self.fs().ns_dirs()
         } else {

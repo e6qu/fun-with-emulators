@@ -623,8 +623,7 @@ pub fn snapshot() -> Vec<u8> {
 
 /// Let go of the parent's file a fork child inherited.
 fn drop_inherited(out: &mut Option<Outbox>) {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if let Some(o) = out.as_ref()
         && o.pid != me
     {
@@ -688,8 +687,7 @@ pub fn flush() {
 pub fn publish_now() {
     let body = snapshot();
     let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     drop_inherited(&mut out);
     if ENDED.load(std::sync::atomic::Ordering::SeqCst) {
         return;

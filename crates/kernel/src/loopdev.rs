@@ -270,8 +270,7 @@ fn now_secs() -> u64 {
 }
 
 fn host_pid() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 fn alive(pid: i32) -> bool {

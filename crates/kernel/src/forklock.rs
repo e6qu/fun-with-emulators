@@ -180,11 +180,10 @@ pub(crate) fn hold<R>(fork: impl FnOnce() -> R) -> R {
             }
         }
         if held.len() == all.len() {
-            // SAFETY: getpid cannot fail.
-            let parent = unsafe { libc::getpid() };
+            let parent = crate::host::pid();
             let r = fork();
             // SAFETY: as above.
-            if unsafe { libc::getpid() } != parent {
+            if crate::host::pid() != parent {
                 for (&l, g) in all.iter().zip(held) {
                     l.release_in_child(g);
                 }

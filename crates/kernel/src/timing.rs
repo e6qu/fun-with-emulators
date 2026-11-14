@@ -33,8 +33,7 @@ fn write_mark(name: &str) {
     let Some(start) = START.get() else { return };
     let now = start.elapsed().as_nanos() as u64;
     let last = LAST.swap(now, Relaxed);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let line = format!(
         "[fwe {pid}] timing: {name} +{}us ({}us)\n",
         now.saturating_sub(last) / 1000,

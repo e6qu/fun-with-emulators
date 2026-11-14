@@ -382,8 +382,7 @@ pub(crate) struct MapsView {
 
 impl MapsView {
     pub(crate) fn of(pid: i32) -> Option<MapsView> {
-        // SAFETY: getpid cannot fail.
-        if pid == unsafe { libc::getpid() } {
+        if pid == crate::host::pid() {
             // The host's view first: its lock comes before the record's.
             let extra = host_guest_memory();
             let record = crate::maps::record().clone();

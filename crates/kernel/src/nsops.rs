@@ -299,10 +299,9 @@ impl<P: Platform> Kernel<P> {
         // Taken while this process's own pid namespaces are current.
         let mut line = crate::procreg::child_line();
         if flags & fwe_abi::clone::CLONE_PARENT != 0
-            && crate::pidns::current().first().is_some_and(|ns| {
-                // SAFETY: getpid cannot fail.
-                ns.get().number_of(unsafe { libc::getpid() }) == Some(1)
-            })
+            && crate::pidns::current()
+                .first()
+                .is_some_and(|ns| ns.get().number_of(crate::host::pid()) == Some(1))
         {
             // A pid namespace's init has no parent in its namespace to give.
             return Err(errno::EINVAL);
@@ -448,8 +447,7 @@ impl<P: Platform> Kernel<P> {
         self.adopt_thread_view();
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
-        // SAFETY: getpid cannot fail.
-        pidns::set_host(&t.chain, &t.nums, unsafe { libc::getpid() });
+        pidns::set_host(&t.chain, &t.nums, crate::host::pid());
         pidns::set_current(t.chain);
         if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
@@ -464,8 +462,7 @@ impl<P: Platform> Kernel<P> {
         }
         if let Some(cg) = &t.cgroup {
             // Where it starts, should it look before the parent writes it.
-            // SAFETY: getpid cannot fail.
-            let _ = crate::procreg::set_cgroup(unsafe { libc::getpid() }, cg);
+            let _ = crate::procreg::set_cgroup(crate::host::pid(), cg);
         }
         if t.clear_sighand {
             self.clear_handlers();
@@ -475,8 +472,7 @@ impl<P: Platform> Kernel<P> {
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
-        // SAFETY: getpid cannot fail.
-        t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
+        t.nums.first().copied().unwrap_or_else(crate::host::pid)
     }
 
     /// `CLONE_CLEAR_SIGHAND`: every handler back to the default action (an

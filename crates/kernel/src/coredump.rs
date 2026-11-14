@@ -75,7 +75,7 @@ pub fn status_bit() -> i32 {
 /// `core_pattern` with its `%` specifiers filled in.
 fn core_name(pattern: &str, sig: u64, uid: u32, gid: u32, comm: &[u8], exe: &[u8]) -> Vec<u8> {
     // SAFETY: plain host calls.
-    let host_pid = unsafe { libc::getpid() };
+    let host_pid = crate::host::pid();
     let pid = crate::thread::tgid();
     let mut out = Vec::new();
     let mut has_pid = false;
@@ -158,8 +158,7 @@ struct Segment {
 /// What the core holds of each mapping, by `coredump_filter`'s default.
 fn segments() -> Vec<Segment> {
     use crate::maps::Name;
-    // SAFETY: getpid cannot fail.
-    let Some(view) = crate::mm::MapsView::of(unsafe { libc::getpid() }) else { return Vec::new() };
+    let Some(view) = crate::mm::MapsView::of(crate::host::pid()) else { return Vec::new() };
     view.areas
         .iter()
         .map(|p| {
@@ -245,8 +244,7 @@ impl<P: Platform> Kernel<P> {
         if pattern.is_empty() || pattern.starts_with('|') {
             return false;
         }
-        // SAFETY: getpid cannot fail.
-        let record = crate::procreg::read(unsafe { libc::getpid() });
+        let record = crate::procreg::read(crate::host::pid());
         let comm = crate::thread::name()
             .map(|n| n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())].to_vec())
             .or_else(|| record.as_ref().map(|r| r.comm.clone()))

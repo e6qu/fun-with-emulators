@@ -440,8 +440,7 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
 /// What a send or receive needs of the caller, taken under the kernel
 /// lock: who it is.
 fn sender(creds: &Creds) -> Sender {
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let uid = crate::userns::from_ns(creds.uid, false).unwrap_or(crate::userns::OVERFLOW);
     Sender { pid, uid }
 }
@@ -993,8 +992,7 @@ impl<P: Platform> Kernel<P> {
 /// `SIGEV_THREAD` registration's socket is bound.
 fn notify_path(ns_dir: &[u8]) -> Vec<u8> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     [ns_dir, format!("/{NOTIFY_PREFIX}{pid}-{n}").as_bytes()].concat()
 }

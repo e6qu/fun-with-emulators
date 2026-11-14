@@ -248,8 +248,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
 
 /// The record of live host process `pid`.
 pub fn read(pid: i32) -> Option<ProcRecord> {
-    // SAFETY: getpid cannot fail.
-    if pid == unsafe { libc::getpid() } {
+    if pid == crate::host::pid() {
         return with_held(pid, read_own(pid));
     }
     with_held(pid, read_any(pid).filter(|r| start_time(pid) == Some(r.start)))
@@ -482,8 +481,7 @@ fn end_path(pid: i32) -> Option<Vec<u8>> {
 /// to report, which the host cannot say when the host has no such signal,
 /// ignores it by default (`SIGIO`), or wrote no core.
 pub fn ending(status: i32) {
-    // SAFETY: getpid cannot fail.
-    let Some(p) = end_path(unsafe { libc::getpid() }) else { return };
+    let Some(p) = end_path(crate::host::pid()) else { return };
     let _ = std::fs::write(OsStr::from_bytes(&p), status.to_ne_bytes());
 }
 
@@ -691,8 +689,7 @@ pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
 
 /// The host pid of this process.
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 /// This process's cgroup: its record's, made in the root if it has none.

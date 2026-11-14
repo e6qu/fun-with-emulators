@@ -24,8 +24,7 @@ fn tmpfs_dir(mode: u32) -> Result<Vec<u8>, i32> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let mut dir = crate::fs::shm::user_dir()?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -487,8 +486,7 @@ impl<P: Platform> Kernel<P> {
             Some(d) => deepest(path, &others).is_none_or(|o| o < d),
             None => false,
         };
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let ns = fs.mount_ns().dir().to_vec();
         crate::procreg::all()
             .into_iter()

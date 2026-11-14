@@ -89,8 +89,7 @@ pub type Proc = (i32, u64);
 /// This process.
 pub fn me() -> Proc {
     static ME: Mutex<Proc> = Mutex::new((0, 0));
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let mut m = ME.lock().unwrap_or_else(|e| e.into_inner());
     if m.0 != pid {
         *m = (pid, crate::procreg::start_time(pid).unwrap_or(0));

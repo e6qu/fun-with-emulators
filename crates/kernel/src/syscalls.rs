@@ -116,8 +116,7 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
     }
     let who = o.ns_path.strip_suffix(b"/maps")?.rsplit(|&b| b == b'/').next()?;
     if who == b"self" {
-        // SAFETY: getpid cannot fail.
-        return Some(unsafe { libc::getpid() });
+        return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(who).ok()?.parse().ok()?;
     crate::pidns::to_host(pid)
@@ -507,8 +506,7 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setpgid(pid, pgid) });
                 if r == 0 {
-                    // SAFETY: getpid cannot fail.
-                    let me = unsafe { libc::getpid() };
+                    let me = crate::host::pid();
                     crate::procreg::record_pgid(if pid == 0 { me } else { pid });
                 }
                 r
@@ -517,8 +515,7 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setsid() } as i64);
                 if r > 0 {
-                    // SAFETY: getpid cannot fail.
-                    crate::procreg::record_pgid(unsafe { libc::getpid() });
+                    crate::procreg::record_pgid(crate::host::pid());
                 }
                 crate::pidns::guest_ret(r)
             }
@@ -860,8 +857,7 @@ impl<P: Platform> Kernel<P> {
             nr::GETTID => thread::tid() as i64,
             // A parent outside the namespace is 0, as Linux reports it.
             nr::GETPPID => {
-                // SAFETY: getpid cannot fail.
-                let me = unsafe { libc::getpid() };
+                let me = crate::host::pid();
                 let parent = crate::reaper::parent_of(me, host::getppid() as i32);
                 crate::pidns::guest_ret(i64::from(parent))
             }
@@ -1992,8 +1988,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn self_status(&self) -> Vec<u8> {
-        // SAFETY: getpid cannot fail.
-        let host = unsafe { libc::getpid() };
+        let host = crate::host::pid();
         let comm = thread::name()
             .map(|n| n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())].to_vec())
             .unwrap_or_else(|| {
@@ -3053,8 +3048,7 @@ impl<P: Platform> Kernel<P> {
         // `RLIMIT_NICE` bounds the least nice value as 20 less it.
         let floor =
             20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let mut result = err(errno::ESRCH);
         for h in targets {
             let ids = if h == me {
@@ -3107,8 +3101,7 @@ pub(crate) fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
         let tid = if who == 0 { thread::tid() } else { who };
         thread::host_state(tid).map(|(user, system, _)| (user, system))
     } else if who == 0 || who == me {
-        // SAFETY: getpid cannot fail.
-        crate::procpid::cpu_ns(unsafe { libc::getpid() })
+        crate::procpid::cpu_ns(crate::host::pid())
     } else {
         crate::pidns::to_host(who).and_then(crate::procpid::cpu_ns)
     };

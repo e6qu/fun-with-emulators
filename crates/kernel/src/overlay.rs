@@ -461,8 +461,7 @@ fn split(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
 fn temp_name() -> CString {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     CString::new(format!("#fwe.{pid}.{}", N.fetch_add(1, Ordering::Relaxed))).expect("no NUL")
 }
 

@@ -370,8 +370,7 @@ fn forget(inst: &[u8]) {
 fn sender(f: impl FnOnce(i32) -> Result<i32, i32>) -> Result<i32, i32> {
     static S: Mutex<(i32, i32)> = Mutex::new((-1, 0));
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if g.0 < 0 || g.1 != me {
         // SAFETY: plain host call; the socket is fwe's own.
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -667,8 +666,7 @@ pub fn unmounted(point: &[u8]) {
 /// A cookie tying a move's two events together.
 pub fn cookie() -> u32 {
     static N: AtomicU32 = AtomicU32::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = crate::host::pid() as u32;
     (pid << 12) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 

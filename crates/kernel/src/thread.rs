@@ -56,8 +56,7 @@ pub fn init_main(pid: i32) {
     NEXT_TID.store(TID_FIRST + (pid % 40) * 100_000, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
     // An end status left by an earlier process of this number.
-    // SAFETY: getpid cannot fail.
-    crate::procreg::forget_end(unsafe { libc::getpid() });
+    crate::procreg::forget_end(crate::host::pid());
     // The calling thread's own set goes with the registry: what landed in
     // it is moved to the process's, and a handler meanwhile posts there.
     let early: Vec<(u64, SigInfo)> = with_own(|p| {
@@ -384,8 +383,7 @@ static SLACK_HANDOFF: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 /// This thread's timer slack (`PR_GET_TIMERSLACK`).
 pub fn slack() -> u64 {
     if tid() == tgid() {
-        // SAFETY: getpid cannot fail.
-        crate::procreg::slack(unsafe { libc::getpid() }).0
+        crate::procreg::slack(crate::host::pid()).0
     } else {
         SLACK.with(Cell::get).0
     }
@@ -395,8 +393,7 @@ pub fn slack() -> u64 {
 /// default).
 pub fn set_slack(value: u64) {
     if tid() == tgid() {
-        // SAFETY: getpid cannot fail.
-        let _ = crate::procreg::set_slack(unsafe { libc::getpid() }, value);
+        let _ = crate::procreg::set_slack(crate::host::pid(), value);
     } else {
         SLACK.with(|s| {
             let (_, default) = s.get();
@@ -423,8 +420,7 @@ const TID_END: i32 = 4_194_304;
 /// taken [`TID_BLOCK`] at a time, each marked this process's, with no
 /// robust list, and given out from the block.
 fn shared_tid() -> Option<i32> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
     // A fork child's block is its parent's.
     if block.0 == me && block.1 < block.2 {
@@ -534,8 +530,7 @@ static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// [`crate::maps::close_for_exit`] does the mappings'.
 pub fn close_tids_for_exit() {
     TIDS_ENDED.store(true, Ordering::SeqCst);
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
     if kept.0 == me && kept.1 >= 0 {
         // SAFETY: the descriptor kept for the list, forgotten here.
@@ -549,8 +544,7 @@ fn publish_tids(tids: &[i32]) {
         return;
     }
     let Some(dir) = crate::procreg::records_dir() else { return };
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let path = tids_file(&dir, me);
     let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
     if kept.0 != me && kept.1 >= 0 {
@@ -587,8 +581,7 @@ fn publish_tids(tids: &[i32]) {
 /// outside one, a number no host process has ([`shared_tid`]).
 pub fn alloc_tid() -> i32 {
     if crate::pidns::nested() {
-        // SAFETY: getpid cannot fail.
-        let host = unsafe { libc::getpid() };
+        let host = crate::host::pid();
         if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
             crate::pidns::remember_thread(nums[0], nums.clone());
             return nums[0];
@@ -634,8 +627,7 @@ pub fn set_robust_list(head: u64, len: u64) {
         r.robust = head;
     }
     drop(threads);
-    // SAFETY: getpid cannot fail.
-    let host = unsafe { libc::getpid() };
+    let host = crate::host::pid();
     if me == tgid() {
         publish_robust(host, host, head);
     } else if !crate::pidns::nested() {

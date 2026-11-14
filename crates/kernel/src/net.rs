@@ -809,8 +809,7 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     }
     // Who bound an abstract name, beside its file.
     if r == 0 && src[..2] == 1u16.to_ne_bytes() && src.get(2) == Some(&0) {
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let _ = std::fs::write(abstract_file(&src[3..]).with_extension("owner"), me.to_ne_bytes());
     }
     if r == 0

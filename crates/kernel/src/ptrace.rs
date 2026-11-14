@@ -247,8 +247,7 @@ fn inbox_name(pid: i32) -> String {
 }
 
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 fn alive(pid: i32) -> bool {

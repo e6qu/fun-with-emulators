@@ -137,8 +137,7 @@ pub fn uid_to_linux(uid: u32) -> u32 {
 /// handler may compute (it takes no lock), translated when the guest is
 /// given it.
 pub fn uid_to_initial(uid: u32) -> u32 {
-    // SAFETY: plain host call.
-    if uid == unsafe { libc::geteuid() } { 0 } else { OVERFLOW_ID }
+    if uid == euid() { 0 } else { OVERFLOW_ID }
 }
 
 /// [`uid_to_linux`] for group ids: fwe's own group is the guest's root
@@ -149,8 +148,7 @@ pub fn gid_to_linux(gid: u32) -> u32 {
 
 /// [`gid_to_linux`] in the initial user namespace's terms.
 pub fn gid_to_initial(gid: u32) -> u32 {
-    // SAFETY: plain host call.
-    if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID }
+    if gid == egid() { 0 } else { OVERFLOW_ID }
 }
 
 /// Host clock for a Linux clock id.
@@ -1600,4 +1598,59 @@ pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
     // SAFETY: the mask saved above.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
     r
+}
+
+/// This process's host pid, kept: asked of the host once, and again in a
+/// fork child (a `pthread_atfork` handler forgets it).
+pub fn pid() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = PID.load(Relaxed);
+    if p != 0 {
+        return p;
+    }
+    static FORGET: std::sync::Once = std::sync::Once::new();
+    FORGET.call_once(|| {
+        extern "C" fn forget() {
+            PID.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: registering a handler that only stores to an atomic.
+        unsafe { libc::pthread_atfork(None, None, Some(forget)) };
+    });
+    // SAFETY: getpid cannot fail.
+    let p = unsafe { libc::getpid() };
+    PID.store(p, Relaxed);
+    p
+}
+
+static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// fwe's effective user id on the host, kept: fwe never changes it. Safe in
+/// a signal handler.
+pub fn euid() -> u32 {
+    kept_id(&EUID, || {
+        // SAFETY: geteuid cannot fail.
+        unsafe { libc::geteuid() }
+    })
+}
+
+/// fwe's effective group id on the host, as [`euid`].
+pub fn egid() -> u32 {
+    kept_id(&EGID, || {
+        // SAFETY: getegid cannot fail.
+        unsafe { libc::getegid() }
+    })
+}
+
+static EUID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static EGID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn kept_id(slot: &std::sync::atomic::AtomicU64, ask: impl FnOnce() -> u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = slot.load(Relaxed);
+    if v != u64::MAX {
+        return v as u32;
+    }
+    let id = ask();
+    slot.store(u64::from(id), Relaxed);
+    id
 }

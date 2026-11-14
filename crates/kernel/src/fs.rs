@@ -912,8 +912,7 @@ impl Fs {
         match &absolute[..] {
             b"/proc/self/stat" => {
                 let me = crate::thread::tgid();
-                // SAFETY: getpid cannot fail.
-                let host = unsafe { libc::getpid() };
+                let host = crate::host::pid();
                 let comm = crate::procreg::read(host).map(|r| r.comm).unwrap_or_default();
                 let h = crate::procpid::host_info(host).unwrap_or_default();
                 return Some(crate::procfs::Entry::File(crate::procpid::stat_line(me, &comm, &h)));
@@ -929,14 +928,12 @@ impl Fs {
                 return Some(crate::procfs::Entry::File(crate::coredump::FILTER.to_vec()));
             }
             b"/proc/self/timerslack_ns" => {
-                // SAFETY: getpid cannot fail.
-                let (slack, _) = crate::procreg::slack(unsafe { libc::getpid() });
+                let (slack, _) = crate::procreg::slack(crate::host::pid());
                 return Some(crate::procfs::Entry::File(format!("{slack}\n").into_bytes()));
             }
             // The main thread's name, as the process's.
             b"/proc/self/comm" => {
-                // SAFETY: getpid cannot fail.
-                let host = unsafe { libc::getpid() };
+                let host = crate::host::pid();
                 let comm = crate::procreg::read(host).map(|r| r.comm).unwrap_or_default();
                 return Some(crate::procfs::Entry::File([&comm[..], b"\n"].concat()));
             }
@@ -958,8 +955,7 @@ impl Fs {
             }
             b"/proc/self/oom_score_adj" | b"/proc/self/oom_adj" | b"/proc/self/oom_score" => {
                 let sub = &absolute[b"/proc/self".len()..];
-                // SAFETY: getpid cannot fail.
-                let adj = crate::procreg::oom_score_adj(unsafe { libc::getpid() });
+                let adj = crate::procreg::oom_score_adj(crate::host::pid());
                 return Some(crate::procfs::Entry::File(crate::procpid::oom_file(sub, adj)));
             }
             b"/proc/self/cgroup" => {
@@ -1061,8 +1057,7 @@ impl Fs {
             }
             libc::S_IFSOCK => {
                 // Named as other processes see it ([`crate::procpid::socket_id`]).
-                // SAFETY: getpid cannot fail.
-                let id = crate::procpid::socket_id(unsafe { libc::getpid() }, fd);
+                let id = crate::procpid::socket_id(crate::host::pid(), fd);
                 return format!("socket:[{}]", id.unwrap_or(st.st_ino as u64)).into_bytes();
             }
             _ => {}
@@ -1519,8 +1514,7 @@ impl Fs {
     /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
     /// mappings (see [`crate::maps`]).
     fn maps(&self, smaps: bool) -> Vec<u8> {
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         crate::mm::MapsView::of(me).map_or_else(Vec::new, |v| v.render(smaps))
     }
 
@@ -2594,8 +2588,7 @@ fn proc_magic_link(rel: &[u8]) -> Option<MagicLink> {
         p == b"self"
             || p == b"thread-self"
             || std::str::from_utf8(p).ok().and_then(|n| n.parse::<i32>().ok())
-                // SAFETY: getpid cannot fail.
-                == Some(crate::pidns::to_guest(unsafe { libc::getpid() }))
+                == Some(crate::pidns::to_guest(crate::host::pid()))
     };
     match parts[..] {
         [who, b"fd", n] if own(who) => {
@@ -3008,8 +3001,7 @@ impl Fs {
         if crate::threadfs::current().is_none() {
             return self.ns.link(kind, self.mnt.id());
         }
-        // SAFETY: getpid cannot fail.
-        let rec = crate::procreg::read(unsafe { libc::getpid() })?;
+        let rec = crate::procreg::read(crate::host::pid())?;
         Some(crate::procpid::ns_link_of(kind, &rec.ns)).filter(|l| !l.is_empty())
     }
 }
@@ -3032,8 +3024,7 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
     if !crate::thread::tids().contains(&tid) {
         return Entry::Missing;
     }
-    // SAFETY: getpid cannot fail.
-    let host = unsafe { libc::getpid() };
+    let host = crate::host::pid();
     let comm = || {
         if tid == crate::thread::tid()
             && let Some(name) = crate::thread::name()

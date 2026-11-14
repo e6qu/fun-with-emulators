@@ -18,8 +18,7 @@ static ANY: AtomicBool = AtomicBool::new(false);
 /// A hidden name for a new file.
 pub fn fresh_name() -> Vec<u8> {
     static N: AtomicU64 = AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let mut name = PREFIX.to_vec();
     name.extend_from_slice(format!("{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes());
     name

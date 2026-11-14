@@ -141,8 +141,7 @@ pub const FORMAT: u32 = 20;
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -399,8 +398,7 @@ impl<T: Data> Record<T> {
         let mut enc = Enc::new();
         enc.u64(at);
         t.encode(&mut enc);
-        // SAFETY: getpid cannot fail.
-        let pid = unsafe { libc::getpid() };
+        let pid = crate::host::pid();
         let tmp = [&self.data_path()[..], format!(".{pid}").as_bytes()].concat();
         std::fs::write(std::ffi::OsStr::from_bytes(&tmp), enc.into_bytes())
             .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;

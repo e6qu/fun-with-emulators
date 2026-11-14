@@ -145,8 +145,7 @@ pub fn create_ruleset(attr: u64, size: u64, flags: u64) -> Result<i64, i32> {
 fn anon_file() -> Result<i32, i32> {
     static N: AtomicU64 = AtomicU64::new(0);
     let mut path = crate::procreg::records_dir().ok_or(errno::ENOMEM)?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     path.extend_from_slice(
         format!("/landlock-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
     );
@@ -272,8 +271,7 @@ pub fn publish() {
     if !active() {
         return;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let Some(p) = chain_file(me) else { return };
     let mut b = Vec::new();
     if let Some(start) = crate::procreg::start_time(me) {
@@ -308,8 +306,7 @@ fn within(target: i32, scope: u64) -> bool {
     }
     let mine: Vec<(u64, u64)> = d.iter().map(|l| (l.0, l.1.scoped)).collect();
     drop(d);
-    // SAFETY: getpid cannot fail.
-    if target == unsafe { libc::getpid() } {
+    if target == crate::host::pid() {
         return true;
     }
     let theirs = chain_of(target);

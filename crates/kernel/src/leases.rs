@@ -107,8 +107,7 @@ fn now() -> u64 {
 
 /// This process: host pid and start time.
 fn me() -> (i32, u64) {
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     (pid, crate::procreg::host_info(pid).map_or(0, |i| i.0))
 }
 
