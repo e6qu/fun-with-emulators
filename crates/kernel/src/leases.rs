@@ -9,7 +9,9 @@
 //! default, or the chosen one with the descriptor, as `POLL_MSG`), and the
 //! open waits until the holder lets the lease go or downgrades it, or until
 //! `fs.lease-break-time` seconds pass and it is taken away; a non-blocking
-//! open fails with `EWOULDBLOCK` instead, the break begun.
+//! open fails with `EWOULDBLOCK` instead, the break begun. Opens look at
+//! the record only once some process has taken a lease (a count in the
+//! process store).
 
 use crate::shared::{Data, Record};
 use crate::snapshot::{Dec, Enc};
@@ -87,18 +89,11 @@ fn record() -> Option<&'static Record<Leases>> {
 /// The record, if a process has made it (an open of a file no lease was
 /// ever taken on costs a look only).
 fn existing() -> Option<&'static Record<Leases>> {
-    use std::os::unix::ffi::OsStrExt;
-    // Once made, the record stays: no more looks.
-    static FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if FOUND.load(std::sync::atomic::Ordering::Relaxed) {
-        return record();
+    let taken = crate::procstore::count(crate::procstore::Count::Leases);
+    if taken.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return None;
     }
-    let mut dir = crate::fs::shm::user_dir().ok()?;
-    dir.extend_from_slice(format!("/v{}-leases", crate::shared::FORMAT).as_bytes());
-    std::fs::metadata(std::ffi::OsStr::from_bytes(&dir)).ok()?;
-    let r = record();
-    FOUND.store(r.is_some(), std::sync::atomic::Ordering::Relaxed);
-    r
+    record()
 }
 
 fn now() -> u64 {
@@ -140,6 +135,11 @@ pub fn set(fd: i32, dev: u64, ino: u64, kind: i16) -> Result<(), i32> {
     let (pid, start) = me();
     let sig = crate::fdstate::get(fd).sig;
     HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+    if kind != fcntl::F_UNLCK {
+        // Opens look for leases from now on.
+        crate::procstore::count(crate::procstore::Count::Leases)
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     r.update(|l| {
         tidy(l, now());
         let i = l.0.iter().position(|e| e.pid == pid && e.start == start && e.fd == fd);

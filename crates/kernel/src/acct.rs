@@ -52,16 +52,8 @@ fn target() -> Option<Vec<u8>> {
     })
 }
 
-/// The tag of the store's cell whose first word counts the namespaces
-/// with accounting on: never fewer than have it (a race may count one
-/// twice, which only costs a look).
-const ON_TAG: u64 = u64::from_le_bytes(*b"acct-on\0");
-
 fn namespaces_on() -> &'static std::sync::atomic::AtomicU64 {
-    match crate::procstore::cell(ON_TAG, true) {
-        Some(c) => &c[0],
-        None => crate::procstore::fatal("the store's cells are full"),
-    }
+    crate::procstore::count(crate::procstore::Count::Accounting)
 }
 
 /// Turn accounting on, to the file at host path `host`, or off (`None`).

@@ -90,7 +90,18 @@ fn next(state: u32, st: u32) -> u32 {
     (state.wrapping_add(0x100) & !0xff) | st
 }
 
+/// Counts every fwe process shares ([`count`]), first in the store.
+#[derive(Clone, Copy)]
+pub enum Count {
+    /// Pid namespaces with accounting on ([`crate::acct`]); never fewer
+    /// than have it.
+    Accounting = 0,
+    /// Leases ever taken ([`crate::leases`]).
+    Leases = 1,
+}
+
 /// The store's layout: where each part starts in the file.
+const COUNTS_AT: usize = 0;
 const ENTRIES_AT: usize = 64;
 const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 const ENDED_AT: usize = USED_AT + PIDS / 8;
@@ -198,7 +209,7 @@ fn mapped() -> Option<&'static Store> {
 }
 
 /// End the process: the store cannot do what it must.
-pub fn fatal(why: &str) -> ! {
+fn fatal(why: &str) -> ! {
     eprintln!("fwe: {why}");
     std::process::exit(1)
 }
@@ -206,6 +217,11 @@ pub fn fatal(why: &str) -> ! {
 /// Map the store now, before a signal handler may need it.
 pub fn init() {
     store();
+}
+
+/// The count `c`.
+pub fn count(c: Count) -> &'static AtomicU64 {
+    store().at(COUNTS_AT + c as usize * 8)
 }
 
 impl Store {
