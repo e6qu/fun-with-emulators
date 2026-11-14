@@ -248,7 +248,68 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
 
 /// The record of live host process `pid`.
 pub fn read(pid: i32) -> Option<ProcRecord> {
+    // SAFETY: getpid cannot fail.
+    if pid == unsafe { libc::getpid() } {
+        return with_held(pid, read_own(pid));
+    }
     with_held(pid, read_any(pid).filter(|r| start_time(pid) == Some(r.start)))
+}
+
+/// What a record's file looks like on the host: its identity, when it was
+/// last written, and its size.
+type FileKey = (u64, u64, i64, i64, i64);
+
+fn file_key(path: &[u8]) -> Option<FileKey> {
+    let c = std::ffi::CString::new(path).ok()?;
+    // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid out-parameter.
+    if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)] // field types differ by host
+    Some((
+        st.st_dev as u64,
+        st.st_ino as u64,
+        st.st_mtime as i64,
+        st.st_mtime_nsec as i64,
+        st.st_size as i64,
+    ))
+}
+
+/// This process's record as last read, by what its file looked like then.
+static OWN: std::sync::Mutex<Option<(i32, FileKey, ProcRecord)>> = std::sync::Mutex::new(None);
+
+/// This process's start time, by pid.
+static OWN_START: std::sync::Mutex<(i32, u64)> = std::sync::Mutex::new((0, 0));
+
+/// [`read`] of this process's own record (host pid `me`): read again only
+/// once its file changed, which a look at the file tells (a thread
+/// started reads it, for its creator's timer slack).
+fn read_own(me: i32) -> Option<ProcRecord> {
+    let p = path(me)?;
+    let key = file_key(&p)?;
+    {
+        let own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((pid, k, r)) = own.as_ref()
+            && (*pid, *k) == (me, key)
+        {
+            return Some(r.clone());
+        }
+    }
+    let start = {
+        let mut s = OWN_START.lock().unwrap_or_else(|e| e.into_inner());
+        if s.0 != me {
+            *s = (me, start_time(me)?);
+        }
+        s.1
+    };
+    let r = read_any(me).filter(|r| r.start == start)?;
+    // Kept only if the file did not change while it was read.
+    if file_key(&p) == Some(key) {
+        *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some((me, key, r.clone()));
+    }
+    Some(r)
 }
 
 /// The record kept for host pid `pid`, whether or not its process lives.
@@ -375,6 +436,12 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
 /// whole record from one being written, and from an older one's longer
 /// tail.
 fn write(pid: i32, r: &ProcRecord) {
+    // What this process kept of its own record is read again.
+    if let Some(own) = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        && own.0 == pid
+    {
+        own.0 = 0;
+    }
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let Some(p) = path(pid) else { return };
     let bytes = frame(&encode(r));
@@ -1391,6 +1458,9 @@ pub fn exiting(status: i32) {
     crate::thread::process_ending();
     // Its System V IPC attachments and undo adjustments, as it ends.
     crate::sysvipc::process_leaving(false);
+    // The files it keeps open and writes, closed before it ends.
+    crate::maps::close_for_exit();
+    crate::thread::close_tids_for_exit();
     let me = me();
     // Ending of a Linux signal: its status as recorded ([`ending`]).
     let status = end_status(me).unwrap_or(status);

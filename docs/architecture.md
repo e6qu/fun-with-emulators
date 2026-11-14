@@ -331,10 +331,10 @@ records Linux would keep about them:
   beside its process record (a sequence word odd while it is written)
   before its next system call that is not a memory call, and before a
   `fork`, so a run of mapping calls publishes once. The file is written
-  with `pwrite` and closed after each publication: a process that ends
-  holding a file it wrote, or with dirty pages of one mapped, makes the
-  next process's first close of a file it wrote wait for the write-back
-  (milliseconds on a virtual machine's disk). Another
+  with `pwrite` and closed as the process ends, as its thread list's is:
+  a process that ends holding a file it wrote, or with dirty pages of one
+  mapped, makes the next process's first close of a file it wrote wait
+  for the write-back (milliseconds on a virtual machine's disk). Another
   process's `/proc/<pid>/maps` and `smaps` read it, with resident pages
   from the host (`proc_pidinfo`).
   `PROCMAP_QUERY` answers for any of them, with the mapped file's GNU

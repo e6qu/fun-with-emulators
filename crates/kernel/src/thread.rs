@@ -527,7 +527,27 @@ pub(crate) static TIDS_FD: Mutex<(i32, i32)> = Mutex::new((0, -1));
 /// when it first has more than its main thread. The list is a count and the
 /// tids, written whole at once on a descriptor kept open, so a reader sees
 /// one list or the other.
+/// The process is ending: its thread list is written no more.
+static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Close the thread list's file as the process ends, as
+/// [`crate::maps::close_for_exit`] does the mappings'.
+pub fn close_tids_for_exit() {
+    TIDS_ENDED.store(true, Ordering::SeqCst);
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.0 == me && kept.1 >= 0 {
+        // SAFETY: the descriptor kept for the list, forgotten here.
+        unsafe { libc::close(kept.1) };
+        *kept = (me, -1);
+    }
+}
+
 fn publish_tids(tids: &[i32]) {
+    if TIDS_ENDED.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(dir) = crate::procreg::records_dir() else { return };
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };

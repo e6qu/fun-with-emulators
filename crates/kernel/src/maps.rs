@@ -569,14 +569,31 @@ impl Published {
 /// The file this process publishes its mappings in: other processes read
 /// it for `/proc/<pid>/maps`. It holds a sequence word (odd while a change
 /// is written), the length of what follows, and the encoded [`Published`].
-/// The file is opened for each publication and closed after it: a process
-/// that ends holding a file it wrote makes the next process's first close
-/// of a file it wrote wait (milliseconds, on a virtual machine's disk).
+/// It stays open while the process runs and is closed as it ends
+/// ([`close_for_exit`]): a process that ends holding a file it wrote makes
+/// the next process's first close of a file it wrote wait (milliseconds,
+/// on a virtual machine's disk).
 pub(crate) struct Outbox {
     pid: i32,
+    fd: i32,
     /// The sequence word as last written.
     seq: u64,
 }
+
+/// The process is ending: its mappings are published no more.
+static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Close the mappings file as the process ends (see [`Outbox`]).
+pub fn close_for_exit() {
+    ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    drop_inherited(&mut out);
+    if let Some(o) = out.take() {
+        // SAFETY: fwe's own descriptor, forgotten with the outbox.
+        unsafe { libc::close(o.fd) };
+    }
+}
+
 pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
 
 /// The header before the encoded record: the sequence word and the length.
@@ -604,11 +621,15 @@ pub fn snapshot() -> Vec<u8> {
     e.into_bytes()
 }
 
-/// Forget the parent's publication state a fork child inherited.
+/// Let go of the parent's file a fork child inherited.
 fn drop_inherited(out: &mut Option<Outbox>) {
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };
-    if out.as_ref().is_some_and(|o| o.pid != me) {
+    if let Some(o) = out.as_ref()
+        && o.pid != me
+    {
+        // SAFETY: the descriptor is this process's copy.
+        unsafe { libc::close(o.fd) };
         *out = None;
     }
 }
@@ -670,18 +691,24 @@ pub fn publish_now() {
     // SAFETY: getpid cannot fail.
     let me = unsafe { libc::getpid() };
     drop_inherited(&mut out);
-    let Some(path) = crate::procreg::maps_path(me) else { return };
-    let Ok(c) = std::ffi::CString::new(path) else { return };
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    let fd =
-        unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600) };
-    if fd < 0 {
+    if ENDED.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    let o = out.get_or_insert(Outbox { pid: me, seq: 0 });
+    if out.is_none() {
+        let Some(path) = crate::procreg::maps_path(me) else { return };
+        let Ok(c) = std::ffi::CString::new(path) else { return };
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        let fd = unsafe {
+            libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
+        };
+        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
+        *out = Some(Outbox { pid: me, fd, seq: 0 });
+    }
+    let Some(o) = out.as_mut() else { return };
     // Written with `pwrite`, not through a shared mapping, whose dirty
     // pages would be written back after the process has gone, with the
     // same wait as a file left open.
+    let fd = o.fd;
     let put = |bytes: &[u8], at: usize| {
         // SAFETY: a buffer of its length, on fwe's own descriptor.
         unsafe { libc::pwrite(fd, bytes.as_ptr().cast(), bytes.len(), at as libc::off_t) };
@@ -698,8 +725,6 @@ pub fn publish_now() {
     put(&rest, 8);
     o.seq = odd + 1;
     put(&o.seq.to_ne_bytes(), 0);
-    // SAFETY: the descriptor opened above.
-    unsafe { libc::close(fd) };
 }
 
 /// What [`snapshot`] encoded.
