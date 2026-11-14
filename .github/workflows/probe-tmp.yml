@@ -1,0 +1,27 @@
+name: probe-tmp
+on:
+  push:
+    branches: [m6-native]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p fwe
+      - name: Build the Linux bench with zig
+        run: |
+          brew install zig >/dev/null 2>&1 || true
+          zig cc -target aarch64-linux-musl -O2 -fPIE -pie -o bench-linux guests/c/bench.c
+          clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
+      - name: Profiles
+        run: |
+          F=target/release/fwe
+          for op in getpid syscall; do echo "$op fwe $($F ./bench-linux $op 2000000) mac $(./bench-mac $op 2000000)"; done
+          echo "thread fwe $($F ./bench-linux thread 3000) mac $(./bench-mac thread 3000)"
+          prof() {
+            "$@" & P=$!; sleep 1; sample $P 3 -file s.txt >/dev/null 2>&1; kill $P 2>/dev/null; wait $P 2>/dev/null
+            awk '/Sort by top of stack/,/Binary Images/' s.txt | head -30
+          }
+          echo "== getppid"; prof $F ./bench-linux syscall 400000000
+          echo "== thread"; prof $F ./bench-linux thread 2000000
