@@ -966,10 +966,23 @@ const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
 /// mapped region instead), with the file-offset ranges its unwind table says
 /// are code, if it has a usable one. Maps the file to read it, so the guest's file position is untouched.
 type ExecFile = (Vec<(u64, u64)>, Option<Vec<(u64, u64)>>);
-fn exec_file_ranges(fd: i32) -> Option<ExecFile> {
+fn exec_file_ranges(fd: i32, file: Option<crate::prepcache::FileId>) -> Option<ExecFile> {
     if fd < 0 {
         return None;
     }
+    // Parsed once per file ([`crate::prepcache`]).
+    if let Some(kept) = file.and_then(crate::prepcache::exec_ranges) {
+        return kept;
+    }
+    let ranges = parse_exec_ranges(fd);
+    if let Some(id) = file {
+        crate::prepcache::keep_exec_ranges(id, ranges.as_ref());
+    }
+    ranges
+}
+
+/// [`exec_file_ranges`], read from the file.
+fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
     // SAFETY: zeroing a stat value, which is plain data.
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     // SAFETY: fstat on a borrowed fd, writing into the stat just created.
@@ -1806,12 +1819,30 @@ impl<P: Platform> Kernel<P> {
                         })
                         .collect()
                 };
-                let (prep, known) = match if anonymous { None } else { exec_file_ranges(host_fd) } {
-                    Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
-                    None => (vec![(p, self.page_up(len))], None),
-                };
+                let file = if anonymous { None } else { crate::prepcache::FileId::of_fd(host_fd) };
+                let (prep, known) =
+                    match if anonymous { None } else { exec_file_ranges(host_fd, file) } {
+                        Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
+                        None => (vec![(p, self.page_up(len))], None),
+                    };
                 for (a, l) in prep {
-                    if let Err(e) = self.platform.prepare_exec(a, l, known.as_deref()) {
+                    // Kept by the file's identity and where the code is in
+                    // it, with the known code as offsets from there.
+                    let cache = file.map(|id| {
+                        let k = known.as_ref().map(|k| {
+                            k.iter()
+                                .filter_map(|&(ka, kl)| {
+                                    let lo = ka.max(a);
+                                    let hi = (ka + kl).min(a + l);
+                                    (lo < hi).then(|| (lo - a, hi - lo))
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        crate::prepcache::code_key(id, offset + (a - p), l, k.as_deref())
+                    });
+                    if let Err(e) =
+                        self.platform.prepare_exec(a, l, known.as_deref(), cache.as_deref())
+                    {
                         // SAFETY: unmapping the mapping just created.
                         self.unmap_host(p, len);
                         untrack(p, self.page_up(len));
@@ -1967,7 +1998,7 @@ impl<P: Platform> Kernel<P> {
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
             if backed > 0
-                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE)
+                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE, None)
             {
                 return self.prepare_failed(e);
             }
@@ -2093,7 +2124,7 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
-            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE) {
+            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
                 self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
                 return false;
             }

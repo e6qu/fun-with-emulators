@@ -327,13 +327,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         && !fwe_kernel::ptrace::stops_at_syscalls()
         && !matches!(
             nr,
-            EXIT | EXECVE
-                | EXECVEAT
-                | CLONE3
-                | WAIT4
-                | WAITID
-                | PIDFD_GETFD
-                | RT_SIGTIMEDWAIT
+            EXIT | EXECVE | EXECVEAT | CLONE3 | WAIT4 | WAITID | PIDFD_GETFD | RT_SIGTIMEDWAIT
         )
         && !fwe_kernel::ipcops::waits(nr)
         && (nr != CLONE || thread_clone);

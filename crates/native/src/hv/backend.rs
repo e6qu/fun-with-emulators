@@ -50,6 +50,7 @@ impl Platform for HvPlatform {
         _addr: u64,
         _len: u64,
         _known: Option<&[(u64, u64)]>,
+        _cache: Option<&[u8]>,
     ) -> Result<(), fwe_kernel::PrepareFailed> {
         // The guest's code runs as it is.
         Ok(())

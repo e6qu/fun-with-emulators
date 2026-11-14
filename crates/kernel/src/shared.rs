@@ -687,6 +687,8 @@ fn collect_in(base: &[u8]) {
     let base = base.to_vec();
     let os = |p: &[u8]| std::ffi::OsStr::from_bytes(p).to_owned();
     crate::procreg::collect_leftovers(YOUNG);
+    // Prepared code no start has made for a month.
+    crate::prepcache::collect(std::time::Duration::from_secs(30 * 24 * 3600));
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
         live.extend(r.ns);

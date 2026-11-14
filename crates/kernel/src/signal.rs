@@ -1246,6 +1246,7 @@ mod tests {
             _a: u64,
             _l: u64,
             _k: Option<&[(u64, u64)]>,
+            _c: Option<&[u8]>,
         ) -> Result<(), crate::PrepareFailed> {
             Ok(())
         }

@@ -145,6 +145,80 @@ pub struct Patched {
     /// writeback and `sp` register-offset load/store forms, and data-processing
     /// forms with an `sp` operand). Diagnostic only.
     pub x18_deferred: usize,
+    /// Each word that was changed in place or is a site: its offset, what
+    /// it was, and whether it was taken for code and known to be code,
+    /// which is all [`replay`] needs to do the same again.
+    pub noted: Vec<Noted>,
+}
+
+/// A word [`patch`] noted: its offset, what it was, and its flags.
+pub type Noted = (u64, u32, u8);
+
+/// [`Patched::noted`]'s flags.
+const IS_CODE: u8 = 1;
+const KNOWN_CODE: u8 = 2;
+
+/// What [`patch`] does with word `insn`: its replacement in place, the
+/// site it is, and whether it counts as a system call or as an `x18` use
+/// left alone.
+struct Word {
+    replacement: Option<u32>,
+    site: Option<Site>,
+    syscall: bool,
+    deferred: bool,
+}
+
+fn classify(insn: u32, is_code: bool, known_code: bool) -> Word {
+    let mut w = Word { replacement: None, site: None, syscall: false, deferred: false };
+    if insn == SVC0 || (is_svc(insn) && known_code) {
+        w.syscall = true;
+        w.site = Some(Site::Syscall { gate: 0 });
+        w.replacement = Some(TRAP);
+    } else if insn & !RT_MASK == MRS_TPIDR {
+        let rt = insn & RT_MASK;
+        if rt == 31 {
+            // Reading into xzr has no effect.
+            w.replacement = Some(NOP);
+        } else {
+            w.site = Some(Site::ReadThreadPointer { rt });
+        }
+    } else if insn & !RT_MASK == MSR_TPIDR {
+        w.site = Some(Site::WriteThreadPointer { rt: insn & RT_MASK });
+    } else if is_code && x18_site(insn) {
+        w.site = Some(Site::X18 { insn });
+    } else if is_code && crate::decode::names_x18(insn) {
+        w.deferred = true;
+    }
+    w
+}
+
+/// Do again in `code` what [`patch`] did to the same code, from its
+/// [`Patched::noted`] and `x18_deferred`, touching only the words noted.
+/// `None`, with `code` untouched, if a noted word is not what it was.
+pub fn replay(code: &mut [u8], noted: &[Noted], x18_deferred: usize) -> Option<Patched> {
+    let word = |code: &[u8], off: u64| -> Option<u32> {
+        let at = usize::try_from(off).ok()?;
+        Some(u32::from_le_bytes(code.get(at..at.checked_add(4)?)?.try_into().ok()?))
+    };
+    if noted.iter().any(|&(off, orig, _)| word(code, off) != Some(orig)) {
+        return None;
+    }
+    let mut out = Patched { x18_deferred, ..Patched::default() };
+    for &(off, orig, flags) in noted {
+        let w = classify(orig, flags & IS_CODE != 0, flags & KNOWN_CODE != 0);
+        if w.syscall {
+            out.syscalls += 1;
+        }
+        if let Some(site) = w.site {
+            out.sites.push((off, site));
+        }
+        if let Some(r) = w.replacement {
+            let at = off as usize;
+            code[at..at + 4].copy_from_slice(&r.to_le_bytes());
+        }
+    }
+    out.noted = noted.to_vec();
+    Some(out)
 }
 
 /// Rewrite what can be rewritten in place and collect the rest. `code`
@@ -181,33 +255,21 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
             continue;
         }
         let insn = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-        let replacement = if insn == SVC0 || (is_svc(insn) && known_code(i)) {
+        let w = classify(insn, is_code[i], known_code(i));
+        if w.syscall {
             out.syscalls += 1;
-            out.sites.push((i as u64 * 4, Site::Syscall { gate: 0 }));
-            Some(TRAP)
-        } else if insn & !RT_MASK == MRS_TPIDR {
-            let rt = insn & RT_MASK;
-            if rt == 31 {
-                // Reading into xzr has no effect.
-                Some(NOP)
-            } else {
-                out.sites.push((i as u64 * 4, Site::ReadThreadPointer { rt }));
-                None
-            }
-        } else if insn & !RT_MASK == MSR_TPIDR {
-            out.sites.push((i as u64 * 4, Site::WriteThreadPointer { rt: insn & RT_MASK }));
-            None
-        } else if !is_code[i] {
-            None
-        } else if x18_site(insn) {
-            out.sites.push((i as u64 * 4, Site::X18 { insn }));
-            None
-        } else {
-            if crate::decode::names_x18(insn) {
-                out.x18_deferred += 1;
-            }
-            None
-        };
+        }
+        if w.deferred {
+            out.x18_deferred += 1;
+        }
+        if let Some(site) = w.site {
+            out.sites.push((i as u64 * 4, site));
+        }
+        let replacement = w.replacement;
+        if replacement.is_some() || w.site.is_some() {
+            let flags = (u8::from(is_code[i]) * IS_CODE) | (u8::from(known_code(i)) * KNOWN_CODE);
+            out.noted.push((i as u64 * 4, insn, flags));
+        }
         if let Some(r) = replacement {
             word.copy_from_slice(&r.to_le_bytes());
         }
@@ -769,6 +831,28 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// A replay of what `patch` noted does the same to the same code.
+    #[test]
+    fn replay_matches_patch() {
+        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut code = exe[..(exe.len() & !3).min(8 << 20)].to_vec();
+        let mut again = code.clone();
+        let known = [(4096u64, 1 << 20)];
+        let p = patch(&mut code, Some(&known));
+        let r = replay(&mut again, &p.noted, p.x18_deferred).expect("the same words");
+        assert_eq!(code, again);
+        assert_eq!((p.syscalls, p.sites, p.x18_deferred), (r.syscalls, r.sites, r.x18_deferred));
+        // A word that changed since: nothing done.
+        let mut changed = exe[..code.len()].to_vec();
+        if let Some(&(off, orig, _)) = p.noted.first() {
+            let at = off as usize;
+            changed[at..at + 4].copy_from_slice(&(orig ^ 1).to_le_bytes());
+            let before = changed.clone();
+            assert!(replay(&mut changed, &p.noted, 0).is_none());
+            assert_eq!(changed, before);
+        }
+    }
+
     use super::*;
 
     fn words(ws: &[u32]) -> Vec<u8> {

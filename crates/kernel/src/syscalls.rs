@@ -3442,6 +3442,7 @@ mod tests {
             addr: u64,
             len: u64,
             _known: Option<&[(u64, u64)]>,
+            _cache: Option<&[u8]>,
         ) -> Result<(), crate::PrepareFailed> {
             if self.refuse > 0 {
                 self.refuse -= 1;

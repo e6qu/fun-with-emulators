@@ -99,6 +99,35 @@ const PLACEMENT_STEP: u64 = 1 << 20;
 /// Sites grouped so that one stub region can reach all of them.
 const GROUP_SPAN: u64 = BRANCH_RANGE / 4;
 
+/// The least code whose preparation is kept on disk
+/// ([`fwe_kernel::prepcache`]): below it, looking through the code again
+/// costs less than reading the record.
+const KEEP_FROM: u64 = 64 << 10;
+
+/// What [`rewrite::patch`] found, kept under `key`.
+fn keep(key: &[u8], p: &rewrite::Patched) {
+    let mut e = fwe_kernel::snapshot::Enc::new();
+    e.u64(p.x18_deferred as u64);
+    e.u64(p.noted.len() as u64);
+    for &(off, orig, flags) in &p.noted {
+        e.u64(off);
+        e.u32(orig);
+        e.u32(u32::from(flags));
+    }
+    fwe_kernel::prepcache::store(key, &e.into_bytes());
+}
+
+/// What was kept under `key`: the words noted and the `x18` uses left.
+fn kept(key: &[u8]) -> Option<(Vec<rewrite::Noted>, usize)> {
+    let v = fwe_kernel::prepcache::load(key)?;
+    let mut d = fwe_kernel::snapshot::Dec::new(&v);
+    let deferred = d.u64() as usize;
+    let n = d.count(16);
+    let noted = (0..n).map(|_| (d.u64(), d.u32(), d.u32() as u8)).collect();
+    d.finish().ok()?;
+    Some((noted, deferred))
+}
+
 /// Prepare guest code in `[addr, addr + len)` for execution. `known`, when
 /// given, is the host address ranges known to be code (see
 /// [`rewrite::patch`]).
@@ -109,11 +138,11 @@ const GROUP_SPAN: u64 = BRANCH_RANGE / 4;
 pub unsafe fn prepare(
     addr: u64,
     len: u64,
-    slot: u32,
-    x18_slot: u32,
+    (slot, x18_slot): (u32, u32),
     page: u64,
     mut arena: Option<&mut StubArena>,
     known: Option<&[(u64, u64)]>,
+    cache: Option<&[u8]>,
 ) -> Result<Prepared, NoStubSpace> {
     let start = addr & !3;
     let len = (len + (addr - start)) & !3;
@@ -135,7 +164,18 @@ pub unsafe fn prepare(
         // entries for a few functions only (musl's assembly), and the rest
         // of its code is code all the same.
         .filter(|r| r.iter().map(|&(_, l)| l).sum::<u64>() * 2 >= len);
-    let patched = rewrite::patch(code, known.as_deref());
+    let patched = match cache.and_then(kept).and_then(|(n, d)| rewrite::replay(code, &n, d)) {
+        Some(p) => p,
+        None => {
+            let p = rewrite::patch(code, known.as_deref());
+            if let Some(key) = cache
+                && len >= KEEP_FROM
+            {
+                keep(key, &p);
+            }
+            p
+        }
+    };
     // A system call's site calls the gate through a stub, where there is
     // one; it is already the trap otherwise.
     let gate = crate::syscall_gate();
@@ -386,7 +426,7 @@ mod tests {
             unsafe { ((code + 4 * i as u64) as *mut u32).write(*w) };
         }
         // SAFETY: the mapping is ours, writable and not executing.
-        let stats = unsafe { prepare(code, 12, 8, 16, page, None, None) }.unwrap();
+        let stats = unsafe { prepare(code, 12, (8, 16), page, None, None, None) }.unwrap();
         // The system call has a stub where there is a gate to call.
         let gate = crate::syscall_gate();
         let stubs = if gate == 0 { 2 } else { 3 };

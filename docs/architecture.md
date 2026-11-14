@@ -242,7 +242,15 @@ The pieces that do it:
   `Platform::prepare_exec` whenever guest memory is to become executable
   (`mmap`, `mprotect`, a write+exec fault, in `crates/kernel/src/mm.rs`),
   passing the code ranges it knows from the file's sections and unwind
-  table; a failure is traced (see [Tracing](#tracing)).
+  table; a failure is traced (see [Tracing](#tracing));
+- `crates/kernel/src/prepcache.rs` keeps, in fwe's private directory and
+  by a file's identity (device, inode, size, modification time), its
+  sections' and unwind table's code ranges, and for each mapped range of
+  its code of 64 KiB or more, the words the scan rewrote or found sites
+  at, with what they were. A later mapping of that range replays them
+  (`rewrite::replay`), touching only the pages that hold them, after
+  checking each word is still what it was (scanning again if not). The
+  collector removes entries made more than 30 days ago.
 
 The stub for an instruction writing `sp` from `x18` sets `sp` before it
 reads its two scratch registers back from below the old `sp`; a signal

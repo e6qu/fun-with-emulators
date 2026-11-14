@@ -71,12 +71,13 @@ impl NativePlatform {
         len: u64,
         arena: Option<&mut prepare::StubArena>,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
         unsafe {
             let (tp, x18, page) = (self.tp_slot, self.x18_slot, self.page_size);
-            prepare::prepare(addr, len, tp, x18, page, arena, known)
+            prepare::prepare(addr, len, (tp, x18), page, arena, known, cache)
         }
     }
 }
@@ -99,10 +100,10 @@ impl Platform for NativePlatform {
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<(), fwe_kernel::PrepareFailed> {
-        self.prepare(addr, len, None, known).map(|_| ()).map_err(|e| fwe_kernel::PrepareFailed {
-            errno: fwe_abi::errno::ENOMEM,
-            why: e.to_string(),
+        self.prepare(addr, len, None, known, cache).map(|_| ()).map_err(|e| {
+            fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
         })
     }
 
@@ -895,7 +896,8 @@ pub fn load_image(
     let strace = tracer.enabled;
     let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
         loader::load(elf, page, |a, l, known, arena| {
-            let stats = platform.prepare(a, l, Some(arena), known).map_err(|e| e.to_string())?;
+            let stats =
+                platform.prepare(a, l, Some(arena), known, None).map_err(|e| e.to_string())?;
             if strace {
                 tracer.note(&format!(
                     "prepared {what} {a:#x}+{l:#x}: {} system calls, {} stubs, \

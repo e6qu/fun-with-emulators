@@ -70,6 +70,7 @@ pub mod pidfd;
 pub mod pidns;
 pub mod pipelock;
 pub mod posixtimer;
+pub mod prepcache;
 pub mod procfs;
 pub mod procmem;
 pub mod procpid;
@@ -184,11 +185,14 @@ pub trait Platform {
     /// The memory is readable and writable when this is called; the kernel
     /// applies the final protections afterwards. A failure carries the
     /// Linux errno for the guest and why, for the trace.
+    /// `cache`, when given, is the key ([`prepcache::code_key`]) under
+    /// which what the preparation finds is kept and found again.
     fn prepare_exec(
         &mut self,
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<(), PrepareFailed>;
 
     /// Terminate the whole process with `code` as its exit status
