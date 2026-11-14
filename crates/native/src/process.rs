@@ -288,6 +288,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             thread::forked();
             // A signal sent to it as it was being made is its own.
             trap::post_early();
+            // The code pages its parent wrote are the parent's to keep.
+            fwe_kernel::lazycode::forked();
             // The parent's threads' stacks are none of the child's to reuse.
             crate::stacks::forked();
             // Nor are its waiting threads.

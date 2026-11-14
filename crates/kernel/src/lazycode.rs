@@ -32,11 +32,13 @@ struct Owed {
 }
 
 /// A range of code whose writes are owed: its preparation's key, where it
-/// starts, and its pages (offsets from the start) written so far.
+/// starts, its pages (offsets from the start) written so far, and those
+/// its kept preparation lists already (or a parent process will keep).
 struct Origin {
     key: Vec<u8>,
     start: u64,
     written: std::collections::BTreeSet<u64>,
+    kept: std::collections::BTreeSet<u64>,
 }
 
 /// Pages by their host address: those owed writes, and those whose writes
@@ -69,11 +71,17 @@ fn page() -> u64 {
 /// otherwise; their protections are set once the mapping's are
 /// ([`protected`]). They are of the code from `start` whose preparation
 /// is kept under `key`.
-pub fn owe(writes: Vec<Write>, key: &[u8], start: u64) {
+/// `kept` are the pages its kept preparation lists already.
+pub fn owe(writes: Vec<Write>, key: &[u8], start: u64, kept: &[u64]) {
     let page = page();
     let mut pg = pages();
     let origin = pg.origins.len();
-    pg.origins.push(Origin { key: key.to_vec(), start, written: Default::default() });
+    pg.origins.push(Origin {
+        key: key.to_vec(),
+        start,
+        written: Default::default(),
+        kept: kept.iter().copied().collect(),
+    });
     for w in writes {
         let p = w.0 & !(page - 1);
         pg.done.remove(&p);
@@ -88,16 +96,30 @@ fn note_written(pg: &mut Pages, p: u64, origin: usize) {
     }
 }
 
-/// The pages each owing range of code had written in this run, by its
-/// preparation's key: page numbers from the range's first page (host
-/// pages). For [`crate::prepcache`], as the process ends.
-pub fn written_pages() -> Vec<(Vec<u8>, Vec<u64>)> {
-    let pg = pages();
-    pg.origins
-        .iter()
-        .filter(|o| !o.written.is_empty())
-        .map(|o| (o.key.clone(), o.written.iter().copied().collect()))
-        .collect()
+/// The pages each owing range of code had written that its kept
+/// preparation does not list yet, by its preparation's key: page numbers
+/// from the range's first page (host pages). For [`crate::prepcache`], as
+/// the process ends; they count as kept from then on.
+pub fn new_written_pages() -> Vec<(Vec<u8>, Vec<u64>)> {
+    let mut pg = pages();
+    let mut out = Vec::new();
+    for o in &mut pg.origins {
+        let new: Vec<u64> = o.written.difference(&o.kept).copied().collect();
+        if !new.is_empty() {
+            o.kept.extend(new.iter().copied());
+            out.push((o.key.clone(), new));
+        }
+    }
+    out
+}
+
+/// In a fork child: the pages written so far are its parent's to keep.
+pub fn forked() {
+    let mut pg = pages();
+    for o in &mut pg.origins {
+        let w = std::mem::take(&mut o.written);
+        o.kept.extend(w);
+    }
 }
 
 /// Whether any page is owed writes.
@@ -286,6 +308,7 @@ mod tests {
             vec![(p + 8, 0, 0x1111_1111), (p + page + 4, 0, 0x2222_2222), (p + 12, 7, 0x3333_3333)],
             b"test",
             p,
+            &[],
         );
         protected(p, 2 * page, libc::PROT_READ);
         // SAFETY: the mapping above, readable.

@@ -148,7 +148,7 @@ fn kept(key: &[u8]) -> Option<Kept> {
 /// first ran, kept with the range's preparation for the next start (which
 /// writes them at once, sparing a fault each), with those kept before.
 pub fn keep_hot() {
-    for (key, pages) in fwe_kernel::lazycode::written_pages() {
+    for (key, pages) in fwe_kernel::lazycode::new_written_pages() {
         let Some(mut k) = kept(&key) else { continue };
         let before = k.hot.len();
         k.hot.extend(pages);
@@ -296,6 +296,7 @@ pub unsafe fn prepare(
         // while the range is still writable; the rest are owed.
         let host_page = fwe_kernel::mm::host_page_size();
         let first = start & !(host_page - 1);
+        let kept_hot = hot.clone();
         let hot: std::collections::BTreeSet<u64> = hot.into_iter().collect();
         let mut owed = Vec::new();
         let mut written = false;
@@ -318,7 +319,7 @@ pub unsafe fn prepare(
             unsafe { flush_icache(start, len) };
         }
         if let Some(key) = cache {
-            fwe_kernel::lazycode::owe(owed, key, start);
+            fwe_kernel::lazycode::owe(owed, key, start, &kept_hot);
         }
     } else if stats.syscalls + stats.stubs > 0 {
         // SAFETY: the range is mapped.
