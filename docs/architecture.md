@@ -672,11 +672,13 @@ is in keeping fwe's own descriptors apart and Linux's limits exact:
 
 - fwe's own descriptors (the rootfs handle, pipe ends behind eventfd and
   signalfd, a vfork parent's pipe, the signal mailbox, in the VM every
-  file mapping's file) live in a reserved range at the top of the host's
-  space (`crates/kernel/src/fdtable.rs`).
+  file mapping's file) live in a reserved range from just above the
+  guest's up to the host's limit (`crates/kernel/src/fdtable.rs`).
 - At startup fwe raises its host soft limit as far as macOS allows and
   gives the guest a virtual `RLIMIT_NOFILE` (soft 1024, hard leaving fwe a
-  quarter of the host's descriptors, at least 64).
+  quarter of the host's descriptors, at least 64, and at most 16384: the
+  host's table grows as far as the highest descriptor, and a host `fork`
+  copies it all).
 - The guest never reaches the range: `close_range(3, ~0)`, closing up to
   the limit and listing `/proc/self/fd` stop below it; a call naming one
   fails with `EBADF`, as does `dup2` onto one. Root may raise the limit

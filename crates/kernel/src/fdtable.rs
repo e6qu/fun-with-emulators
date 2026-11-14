@@ -3,9 +3,11 @@
 //! Guest descriptors are host descriptors, but fwe holds some for itself —
 //! the root filesystem directory, the pipe ends behind eventfd and signalfd,
 //! the pipe a `vfork` parent waits on, and in the VM backend the file of
-//! each file mapping. Those live in a reserved range at the top of the
-//! host's descriptor space, above the highest number the guest may use: the
-//! guest's `RLIMIT_NOFILE` is virtual.
+//! each file mapping. Those live in a reserved range above the highest
+//! number the guest may use, up to the host's limit: the guest's
+//! `RLIMIT_NOFILE` is virtual. The guest's range ends at [`GUEST_CAP`] at
+//! most, so the range starts low: the host's table grows only as far as
+//! the descriptors in use, and a host `fork` copies all of it.
 //! Loops that close everything up to the limit, `close_range`, and
 //! `/proc/self/fd` never reach the reserved range, and a system call naming
 //! a descriptor there fails with `EBADF`, as for a descriptor that is not
@@ -32,6 +34,11 @@ static NEXT: AtomicI32 = AtomicI32::new(0);
 
 /// The guest's default soft limit, Linux's.
 const DEFAULT_SOFT: u64 = 1024;
+
+/// The most descriptors the guest may have open at once: a range ending
+/// at 69120 (a quarter of the host's left to fwe) makes each host `fork`
+/// copy that much table, 70% more than a fork of a small one.
+pub const GUEST_CAP: i32 = 16384;
 
 #[cfg(target_os = "macos")]
 fn max_files_per_proc() -> u64 {
@@ -80,7 +87,7 @@ pub fn init() {
     let host = lim.rlim_cur.min(cap).max(2 * RESERVED as u64) as i32;
     // The guest keeps at least Linux's default soft limit.
     let reserved = (host / 4).max(RESERVED).min(host - DEFAULT_SOFT as i32).max(RESERVED);
-    let guest_max = host - reserved;
+    let guest_max = (host - reserved).min(GUEST_CAP);
     GUEST_MAX.store(guest_max, Ordering::SeqCst);
     NEXT.store(guest_max, Ordering::SeqCst);
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) =
