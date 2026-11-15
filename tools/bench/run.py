@@ -509,15 +509,22 @@ def sampled(name, cmd):
     kept beside the results."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.sample")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Once it has run its exec (`env -i`; Homebrew's python3 runs the
+    # Python.app inside its framework): an exec ends the sampler's hold.
+    time.sleep(0.05)
     sampler = subprocess.Popen(["sample", str(proc.pid), "5", "1", "-file", out],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               errors="replace")
     # What is mapped where (the guest's libraries are files the host
     # maps), to name the guest's code in the sample: taken as it runs.
     time.sleep(0.2)
     with open(out[: -len(".sample")] + ".vmmap", "w") as f:
         subprocess.run(["vmmap", "-wide", str(proc.pid)], stdout=f, stderr=subprocess.DEVNULL)
-    sampler.wait()
+    said = sampler.communicate()[0]
     proc.wait()
+    if not os.path.exists(out):
+        print(f"{name}: not sampled: {said.strip()}", file=sys.stderr)
+        return
     tops = collections.Counter()
     with open(out, errors="replace") as f:
         lines = iter(f)
