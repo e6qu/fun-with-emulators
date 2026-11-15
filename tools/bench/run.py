@@ -626,6 +626,30 @@ def workloads(a, fwe, guest_env, lua_src, results):
         profiled=True,
     )
     workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh, at)
+    # One git process's start, where the workload's seventy go.
+    one = under("/usr/bin/git", "--version")
+    timed = one[:2] + ["FWE_TIMING=1"] + one[2:]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
+    marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines() if "timing: " in l]
+    print("git --version: fwe's marks: " + "; ".join(marks), file=sys.stderr)
+    starts = {"fwe": one, "macOS": [brew["git"], "--version"]}
+    for side, cmd in starts.items():
+        rusage("git --version", side, cmd, ())
+        t = time.perf_counter()
+        for _ in range(20):
+            subprocess.run(cmd, capture_output=True)
+        print(f"git --version {side}: {(time.perf_counter() - t) / 20 * 1e3:.2f} ms each",
+              file=sys.stderr)
+    # And started from a shell inside, as the workload's are: forked, then
+    # the program loaded in place.
+    loop = "i=0; while [ $i -lt 50 ]; do {} --version >/dev/null; i=$((i+1)); done"
+    inside = {"fwe": under("/bin/sh", "-c", loop.format("/usr/bin/git")),
+              "macOS": ["/bin/sh", "-c", loop.format(brew["git"])]}
+    for side, cmd in inside.items():
+        t = time.perf_counter()
+        subprocess.run(cmd, capture_output=True)
+        print(f"git --version from a shell, {side}: {(time.perf_counter() - t) / 50 * 1e3:.2f} ms each",
+              file=sys.stderr)
     workload(results, "xz (s)", *script("xz.sh", "/usr/bin/xz", brew["xz"]), fresh, at)
     shutil.rmtree(native, ignore_errors=True)
 
