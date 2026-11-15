@@ -812,6 +812,10 @@ def workloads(a, fwe, guest_env, lua_src, results):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     pcs("xz (s)", script("xz.sh", "/usr/bin/xz", brew["xz"])[0])
+    # And xz alone, on the data that left (its code named by its library's
+    # offsets, not its shell's).
+    pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"))
+    pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", "/tmp/w/data.xz"))
     shutil.rmtree(native, ignore_errors=True)
 
 
