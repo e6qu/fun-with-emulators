@@ -2755,14 +2755,7 @@ impl<P: Platform> Kernel<P> {
                 crate::overlay::list(&crate::overlay::open(&l, &path)?)
             });
         }
-        // What fwe keeps in a cgroup's directory is its own.
-        let cgroup = crate::fdmarks::origin(fd as i32)
-            .is_some_and(|o| o.fstype == crate::mounts::FsType::Cgroup2);
-        let hide = |name: &[u8]| {
-            (cgroup && (name == crate::cgroupfs::PRIVATE || name.ends_with(b".fwe-new")))
-                || name.starts_with(crate::tmpfile::PREFIX)
-        };
-        getdents64(fd as i32, buf, count as usize, &hide)
+        getdents64(fd as i32, buf, count as usize, &listing_hides(fd as i32))
     }
 
     pub(crate) fn sys_utimensat(&mut self, dirfd: u64, path: u64, times: u64, flags: u64) -> i64 {
@@ -4098,6 +4091,8 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
     if start < 0 {
         return last_error();
     }
+    // The entries listed so far; each one's `d_off` is the count through it.
+    let base = listed_of(fd).unwrap_or(0);
     // A translated record can be up to 4 bytes longer than the host's (they
     // round to 8 and 4 bytes), so a host buffer of `count` bytes may yield a
     // little more than fits. When it does, the stream is rewound and re-read
@@ -4124,10 +4119,10 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
         let mut src = 0usize;
         let mut out: Vec<u8> = Vec::with_capacity(count);
         let mut overflow = false;
+        let mut listed = 0u64;
         while src + BSD_HEADER <= n {
             let rec = &bsd[src..];
             let d_ino = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
-            let d_seekoff = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
             let d_reclen = u16::from_ne_bytes(rec[16..18].try_into().unwrap()) as usize;
             let d_namlen = u16::from_ne_bytes(rec[18..20].try_into().unwrap()) as usize;
             let d_type = rec[20];
@@ -4152,7 +4147,9 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
             out.resize(at + out_len, 0);
             let rec = &mut out[at..];
             rec[0..8].copy_from_slice(&d_ino.to_ne_bytes());
-            rec[8..16].copy_from_slice(&(d_seekoff as i64).to_ne_bytes());
+            // Its position: entries listed through it ([`dir_lseek`]).
+            listed += 1;
+            rec[8..16].copy_from_slice(&((base + listed) as i64).to_ne_bytes());
             rec[16..18].copy_from_slice(&(out_len as u16).to_ne_bytes());
             rec[18] = d_type;
             rec[DIRENT64_HEADER..DIRENT64_HEADER + d_namlen].copy_from_slice(name);
@@ -4165,6 +4162,7 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
                 unsafe { libc::lseek(fd, start, libc::SEEK_SET) };
                 return err(errno::EFAULT);
             }
+            set_listed(fd, base + listed);
             return out.len() as i64;
         }
         if src == 0 {
@@ -4177,6 +4175,136 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
         }
         size = src;
     }
+}
+
+/// What a listing of the host directory open as `fd` leaves out: the
+/// hidden names of `O_TMPFILE` files, and what fwe keeps in a cgroup's
+/// directory.
+fn listing_hides(fd: i32) -> impl Fn(&[u8]) -> bool {
+    let cgroup =
+        crate::fdmarks::origin(fd).is_some_and(|o| o.fstype == crate::mounts::FsType::Cgroup2);
+    move |name: &[u8]| {
+        (cgroup && (name == crate::cgroupfs::PRIVATE || name.ends_with(b".fwe-new")))
+            || name.starts_with(crate::tmpfile::PREFIX)
+    }
+}
+
+/// `lseek` of a host directory `getdents64` listed (`None` for any other
+/// descriptor): its entries' `d_off` are positions in the listing (APFS
+/// gives none), so a position is reached by listing that many entries
+/// from the start again; `SEEK_CUR` counts from the position reached.
+#[cfg(target_os = "macos")]
+pub(crate) fn dir_lseek(fd: i32, off: i64, whence: i32) -> Option<i64> {
+    if !crate::fdstate::DIRS_LISTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let at = listed_of(fd)?;
+    let to = match whence {
+        libc::SEEK_SET => off,
+        libc::SEEK_CUR => (at as i64).saturating_add(off),
+        _ => return Some(err(errno::EINVAL)),
+    };
+    if to < 0 {
+        return Some(err(errno::EINVAL));
+    }
+    if whence == libc::SEEK_CUR && off == 0 {
+        return Some(to);
+    }
+    // SAFETY: plain host call on the guest's directory.
+    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+        return Some(last_error());
+    }
+    if let Err(e) = skip_entries(fd, to as u64, &listing_hides(fd)) {
+        return Some(err(e));
+    }
+    set_listed(fd, to as u64);
+    Some(to)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn dir_lseek(_fd: i32, _off: i64, _whence: i32) -> Option<i64> {
+    None
+}
+
+/// How many entries of the directory open as `fd` `getdents64` listed from
+/// its start, if it listed this directory through `fd`.
+#[cfg(target_os = "macos")]
+fn listed_of(fd: i32) -> Option<u64> {
+    let (dev, ino, n) = crate::fdstate::get(fd).dir_pos?;
+    (host_identity(fd)? == (dev, ino)).then_some(n)
+}
+
+/// `n` entries of the directory open as `fd` are listed from its start.
+#[cfg(target_os = "macos")]
+fn set_listed(fd: i32, n: u64) {
+    let Some((dev, ino)) = host_identity(fd) else { return };
+    crate::fdstate::update(fd, |s| s.dir_pos = Some((dev, ino, n)));
+    crate::fdstate::DIRS_LISTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read past the next `n` entries of the directory open as `fd` (those
+/// `hide` leaves out not counted), the host's position left right after
+/// the last of them.
+#[cfg(target_os = "macos")]
+fn skip_entries(fd: i32, mut n: u64, hide: &dyn Fn(&[u8]) -> bool) -> Result<(), i32> {
+    const SYS___GETDIRENTRIES64: libc::c_int = 344;
+    const BSD_HEADER: usize = 21;
+    let mut bsd = vec![0u8; 1 << 16];
+    while n > 0 {
+        // SAFETY: plain host call on the guest's directory.
+        let start = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        let mut position: libc::off_t = 0;
+        // SAFETY: a valid buffer; the call writes the new position.
+        let got = unsafe {
+            libc::syscall(SYS___GETDIRENTRIES64, fd, bsd.as_mut_ptr(), bsd.len(), &mut position)
+        };
+        if got <= 0 {
+            // The end, or an error: as far as the directory goes.
+            return if got < 0 {
+                Err(crate::host::errno_to_linux(crate::host::last_errno()))
+            } else {
+                Ok(())
+            };
+        }
+        // The bytes of the entries up to the `n`th shown, and how many
+        // shown entries the first `upto` bytes hold.
+        let walk = |bsd: &[u8], got: usize, upto: Option<u64>| {
+            let (mut src, mut seen) = (0usize, 0u64);
+            while src + BSD_HEADER <= got && upto.is_none_or(|u| seen < u) {
+                let rec = &bsd[src..];
+                let reclen = u16::from_ne_bytes(rec[16..18].try_into().unwrap()) as usize;
+                let namlen = u16::from_ne_bytes(rec[18..20].try_into().unwrap()) as usize;
+                if reclen == 0 || src + BSD_HEADER + namlen > got {
+                    break;
+                }
+                if !hide(&rec[BSD_HEADER..BSD_HEADER + namlen]) {
+                    seen += 1;
+                }
+                src += reclen;
+            }
+            (src, seen)
+        };
+        let got = got as usize;
+        let (src, seen) = walk(&bsd, got, Some(n));
+        if src >= got {
+            n -= seen;
+            continue;
+        }
+        // Past the last one in this batch: read again just up to it (the
+        // host may give fewer records than the bytes hold; the loop takes
+        // the rest).
+        // SAFETY: plain host calls on the guest's directory, a buffer of
+        // at least `src` bytes.
+        let again = unsafe {
+            libc::lseek(fd, start, libc::SEEK_SET);
+            libc::syscall(SYS___GETDIRENTRIES64, fd, bsd.as_mut_ptr(), src, &mut position)
+        };
+        if again <= 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        n -= walk(&bsd, again as usize, None).1;
+    }
+    Ok(())
 }
 
 /// Build a synthetic `struct stat` for a `/proc` or `/sys` entry.
@@ -4841,6 +4969,54 @@ mod tests {
         );
         assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
         assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
+    }
+
+    /// A directory entry's `d_off` is a position `lseek` returns to (as
+    /// `telldir` and `seekdir` use it): listing from there goes on with
+    /// the next entry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn getdents_offsets_seek_back() {
+        use fwe_abi::fcntl::{O_DIRECTORY, O_RDONLY};
+        let (mut k, _d) = rooted();
+        for i in 0..30 {
+            let path = cstr(&format!("/entry-{i:02}"));
+            assert_eq!(k.syscall(nr::MKDIRAT, [AT_FDCWD, path.as_ptr() as u64, 0o755, 0, 0, 0]), 0);
+        }
+        let fd = open(&mut k, &cstr("/"), O_RDONLY | O_DIRECTORY, 0) as u64;
+        let list = |k: &mut Kernel<NoPlatform>, size: usize| {
+            let mut buf = vec![0u8; size];
+            let n = k.syscall(nr::GETDENTS64, [fd, buf.as_mut_ptr() as u64, size as u64, 0, 0, 0]);
+            assert!(n >= 0);
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            while at < n as usize {
+                let off = i64::from_ne_bytes(buf[at + 8..at + 16].try_into().unwrap());
+                let len = u16::from_ne_bytes(buf[at + 16..at + 18].try_into().unwrap()) as usize;
+                let name = &buf[at + 19..at + len];
+                let name = name[..name.iter().position(|&b| b == 0).unwrap()].to_vec();
+                out.push((name, off));
+                at += len;
+            }
+            out
+        };
+        let mut all = Vec::new();
+        loop {
+            let got = list(&mut k, 120);
+            if got.is_empty() {
+                break;
+            }
+            all.extend(got);
+        }
+        assert!(all.len() >= 32, "{}", all.len());
+        let (_, tenth) = &all[9];
+        assert_eq!(k.syscall(nr::LSEEK, [fd, *tenth as u64, 0, 0, 0, 0]), *tenth);
+        assert_eq!(k.syscall(nr::LSEEK, [fd, 0, 1, 0, 0, 0]), *tenth);
+        assert_eq!(list(&mut k, 120)[0], all[10]);
+        assert_eq!(k.syscall(nr::LSEEK, [fd, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(list(&mut k, 120)[0], all[0]);
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
     }
 
     /// A trailing slash names a directory in every call, as on Linux: a

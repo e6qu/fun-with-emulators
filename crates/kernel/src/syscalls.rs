@@ -883,6 +883,11 @@ impl<P: Platform> Kernel<P> {
                     && is_dir_fd(a[0] as i32)
                 {
                     crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                } else if let Some(r) =
+                    crate::fsops::dir_lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    // A host directory listed: by its positions in the listing.
+                    r
                 } else {
                     // SEEK_SET, CUR and END match; Linux's SEEK_DATA and
                     // SEEK_HOLE are 3 and 4, the host's the other way round.

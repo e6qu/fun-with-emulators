@@ -1411,6 +1411,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   own: the program `execve` runs, a file mapping grown by `mremap` or
   `remap_file_pages`, and a loop device's backing file at each of its
   reads and writes.
+- A directory listing's positions (its entries' `d_off`, which `lseek`
+  returns to) are counted per descriptor: a duplicate, or a fork child,
+  listing the same open directory moves the host's place under the
+  other's count.
 - What fwe keeps of an open file for `fcntl` (owner thread, `F_SETSIG`'s
   signal) is per descriptor, so a duplicate's changes do not show in the
   original.

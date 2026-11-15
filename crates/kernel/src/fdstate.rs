@@ -29,7 +29,16 @@ pub struct State {
     pub sig: u32,
     /// The open that made it made the file (`O_CREAT` of one not there).
     pub created: bool,
+    /// For a host directory `getdents64` listed: its host identity (device
+    /// and inode, which a number reused for another misses) and how many
+    /// entries it listed from its start, the position its entries' `d_off`
+    /// count ([`crate::fsops::dir_lseek`]).
+    pub dir_pos: Option<(u64, u64, u64)>,
 }
+
+/// Whether any descriptor's [`State::dir_pos`] was set: `lseek` looks no
+/// further for a descriptor when none was.
+pub static DIRS_LISTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static STATES: Mutex<BTreeMap<i32, State>> = Mutex::new(BTreeMap::new());
 

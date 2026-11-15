@@ -7125,6 +7125,13 @@ fn trailing_slashes_name_directories() {
     );
 }
 
+/// `telldir` and `seekdir`, which the C library builds on `d_off` and
+/// `lseek`, return to the same place in a directory's listing.
+#[test]
+fn seekdir_returns_to_a_telldir_position() {
+    assert_eq!(fsrules("telldir"), "back to the same entry: true\n");
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

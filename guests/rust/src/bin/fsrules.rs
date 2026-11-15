@@ -61,6 +61,10 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn opendir(p: *const c_char) -> *mut u8;
+    fn readdir(d: *mut u8) -> *const u8;
+    fn telldir(d: *mut u8) -> i64;
+    fn seekdir(d: *mut u8, pos: i64);
     fn unlink(p: *const c_char) -> i32;
     fn rename(a: *const c_char, b: *const c_char) -> i32;
     fn symlink(t: *const c_char, p: *const c_char) -> i32;
@@ -799,9 +803,39 @@ fn trailing_slash_scenario() {
     println!("link/ is a directory: {}", word(4) & 0o170000 == 0o40000);
 }
 
+/// `telldir` and `seekdir` (the C library's, from `d_off`) return to the
+/// same place in a directory's listing.
+fn telldir_scenario() {
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/dd").as_ptr(), 0o755) };
+    for i in 0..40 {
+        make(&format!("/tmp/dd/file-with-a-longer-name-{i:02}"), 0o644);
+    }
+    // SAFETY: a NUL-terminated path; the stream is the C library's.
+    let d = unsafe { opendir(c("/tmp/dd").as_ptr()) };
+    let next = || {
+        // SAFETY: the stream above; an entry's name at its offset 19.
+        unsafe {
+            let e = readdir(d);
+            std::ffi::CStr::from_ptr(e.add(19).cast()).to_string_lossy().into_owned()
+        }
+    };
+    for _ in 0..25 {
+        next();
+    }
+    // SAFETY: the stream above.
+    let pos = unsafe { telldir(d) };
+    let after = next();
+    next();
+    // SAFETY: the stream above, a position it gave.
+    unsafe { seekdir(d, pos) };
+    println!("back to the same entry: {}", next() == after);
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "telldir" => telldir_scenario(),
         "slash" => trailing_slash_scenario(),
         "ovlsticky" => overlay_sticky_scenario(),
         "unixperm" => unix_permissions_scenario(),
