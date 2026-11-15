@@ -12,7 +12,8 @@ else; in the VM the guest has an address space of its own.
 
 The VM holds only the guest's CPU and memory, no Linux kernel: every
 system call leaves the VM for the same kernel crate the native backend
-uses. How the VM is used (vCPUs, fwe's exception vector, the two stages
+uses, so a program in the VM has the same processes, namespaces, cgroups,
+mounts and files as a native one. How the VM is used (vCPUs, fwe's exception vector, the two stages
 of translation, system calls, timers, signals, memory, fork and execve)
 is in [linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used);
 where the backend differs from Linux, in

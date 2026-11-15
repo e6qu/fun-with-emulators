@@ -428,9 +428,8 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 "0" => false,
                 _ => return Err(errno::EINVAL),
             };
-            for pid in members(cg, true).into_iter().filter(|&p| p > 0) {
-                // SAFETY: plain host call.
-                unsafe { libc::kill(pid, if on { libc::SIGSTOP } else { libc::SIGCONT }) };
+            for pid in members(cg, true) {
+                crate::host::kill_process(pid, if on { libc::SIGSTOP } else { libc::SIGCONT });
             }
             store(format!("{}\n", u8::from(on)))
         }

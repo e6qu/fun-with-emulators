@@ -1392,7 +1392,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `mem`; `/proc` in the initial pid namespace lists only fwe's processes
   (another host process is reached by its number, with only its `stat`).
 - cgroups: memory, CPU, I/O and other limits are kept and read back but
-  not enforced (only `pids.max` and device programs are); a threaded
+  not enforced (only `pids.max`, for `fork` and not for a new thread, and
+  device programs are); a threaded
   cgroup cannot be made (`cgroup.threads` refuses writes); the tree is the
   user's, not the machine's.
 - seccomp filters apply to every thread (as with

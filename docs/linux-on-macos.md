@@ -1963,22 +1963,31 @@ thread's.
 | network (`netns.rs`) | a loopback interface, down until brought up; sockets reach only loopback; its ports are host loopback ports mapped through its table, so each namespace has its own port 80; its abstract `AF_UNIX` names and sysctls are its own |
 | IPC | its System V objects and POSIX queues |
 | cgroup | `/proc/self/cgroup` and `cgroup2` mounts show the tree from its root |
+| time | not made: `CLONE_NEWTIME` is `EINVAL` ([roadmap](../ROADMAP.md), not planned for 1.0) |
+
+Namespaces are fwe's kernel layer's, which both backends share: a program
+in the VM is in them, and is numbered, mapped and confined by them,
+exactly as a native one; its host process is what their records name.
 
 ### cgroups
 
 macOS has no cgroups and no unprivileged way to hold a process to a
-memory or CPU budget. fwe keeps one cgroup v2 tree for the user's fwe
-processes, as real directories with interface files
-(`crates/kernel/src/cgroupfs.rs`):
+memory or CPU budget. fwe keeps one cgroup v2 tree for all the user's fwe
+processes, as a machine has one: its cgroups are directories in fwe's
+private directory, their interface files files there, which a `cgroup2`
+mount shows; a process's cgroup is in its process record, and a `fork`
+child starts in its parent's (`crates/kernel/src/cgroupfs.rs`). A member
+is a host process, native or running the VM alike.
 
-- `mkdir`/`rmdir`, `cgroup.procs`, `cgroup.subtree_control` with Linux's
-  rules; `cgroup.events`, `pids.current`, `memory.current` and `cpu.stat`
-  read what is so when opened;
-- `cgroup.freeze` stops and continues members, `cgroup.kill` kills them,
-  `pids.max` limits `fork`;
-- device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) decide every device open
-  and `mknod` of members, run on fwe's eBPF interpreter (`bpf.rs`);
-- the other limits are kept and read back, not enforced.
+| File | What fwe does | On the host |
+|---|---|---|
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat` | Linux's rules; `cgroup.threads` refuses writes (no threaded cgroups) (no controllers for children of a cgroup with processes, `EBUSY` removing one in use); lists read as they are when opened | the directories, the process records |
+| `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
+| `pids.max` | enforced on `fork` (`EAGAIN` past it, counting threads, up the tree); a new thread is not refused | none |
+| `cgroup.freeze` | stops and continues the members | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
+| `cgroup.kill` | kills the members | `SIGKILL`, relayed so a process running the VM takes it down first |
+| device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`) | none |
+| `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back, not enforced | none: macOS has no such limit for a process |
 
 ### Mounts
 
