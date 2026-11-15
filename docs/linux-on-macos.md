@@ -826,7 +826,7 @@ the host reports differently.
 | `pipe2` | Flags set after; the pipe's capacity recorded ([Files and descriptors](#files-and-descriptors)). | `pipe`, `fcntl` |
 | `splice`, `tee`, `vmsplice` | Copied through a buffer of fwe's, without the kernel lock: from a pipe what it holds, into one what room it has. | `read`, `write`, `poll` |
 | `sendfile`, `copy_file_range` | Copied through a buffer of fwe's, without the kernel lock, after Linux's checks. | `read`/`pread`, `write`/`pwrite`, `lseek` |
-| `setxattr`, `getxattr`, `listxattr`, `removexattr` and their `l` and `f` forms | Linux's namespaces and rules ([Files and descriptors](#files-and-descriptors)); fwe's `/proc` files have none. | the host's attribute calls on the file's host path or descriptor |
+| `setxattr`, `getxattr`, `listxattr`, `removexattr`, their `l` and `f` forms, and their `at` forms (`setxattrat` and the rest, with `struct xattr_args`) | Linux's namespaces and rules ([Files and descriptors](#files-and-descriptors)); fwe's `/proc` files have none. | the host's attribute calls on the file's host path or descriptor |
 | `file_getattr`, `file_setattr` | The inode flags (immutable, append-only, no-dump) as `fa_xflags`, Linux's checks of the size and flags; what only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set. | `fstat`, `fchflags` |
 | `name_to_handle_at`, `open_by_handle_at` | A handle is the host file system id and inode; opening needs `CAP_DAC_READ_SEARCH`. | `fstatfs`, `fsgetpath`, `open` |
 | `memfd_create` | See [Shared memory and memfd](#shared-memory-and-memfd). | `open(O_CREAT\|O_EXCL)`, `unlink` |
@@ -942,7 +942,7 @@ and `futex_waitv` run without the kernel lock.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `clone`, `clone3` (and so `fork`, `vfork`, `pthread_create`, `posix_spawn`) | A thread is a new host thread; a process is a host `fork` natively, a new fwe process in the VM. `clone3`'s structure is read into the same arguments; `set_tid` fails with `ENOSYS`. | native: `pthread_create`, `fork`; VM: `pthread_create`, `posix_spawn` |
+| `clone`, `clone3` (and so `fork`, `vfork`, `pthread_create`, `posix_spawn`) | A thread is a new host thread; a process is a host `fork` natively, a new fwe process in the VM. `clone3`'s structure is read into the same arguments; `set_tid` chooses the child's pids in fwe's pid namespaces (with `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`; `EEXIST` for one taken; `EPERM` for one in the initial namespace, whose numbers are the host's; `EINVAL` for a thread's). | native: `pthread_create`, `fork`; VM: `pthread_create`, `posix_spawn` |
 | `execve`, `execveat` | Natively in place when it can; otherwise fwe re-executes itself on the new program. | `execve` of fwe |
 | `exit` | Robust list released, `clear_child_tid` cleared and woken, the host thread ended or (natively) kept for the next thread; the last thread ends the process. | `pthread_exit` / `_exit` |
 | `exit_group` | A traced process's exit stop, then the process ends (in the VM after every vCPU and the VM are destroyed). | `_exit` |
@@ -953,7 +953,10 @@ and `futex_waitv` run without the kernel lock.
 | `set_tid_address`, `set_robust_list`, `get_robust_list` | Kept per thread; another process's robust list is read from the record its threads publish, for a caller that may trace it. | none |
 | `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`; other operations (PI, `WAKE_OP`) fail with `ENOSYS`. | `__ulock_wait2`/`__ulock_wake` for shared futexes |
 | `futex_waitv` | Up to 128 32-bit futexes, private and shared, on `CLOCK_MONOTONIC` or `CLOCK_REALTIME`. | as `futex` |
-| `prctl` | Name, capabilities, keepcaps, securebits, child subreaper, `no_new_privs`, THP choice, speculation (reported unaffected), seccomp, timer slack, dumpable, parent-death signal; `PR_PAC_RESET_KEYS` in the VM only; others `EINVAL`. | none |
+| `futex_wake`, `futex_wait`, `futex_requeue` | As `FUTEX_WAKE_BITSET`, `FUTEX_WAIT_BITSET` (an absolute timeout on the clock given) and `FUTEX_CMP_REQUEUE`, on 32-bit futexes (another size or NUMA `EINVAL`); a requeue's two futexes are both private or both shared (`EINVAL` otherwise). | as `futex` |
+| `kcmp` | Memory, descriptor table, filesystem view, handlers, I/O context and undo list are shared only by a process's threads; two descriptors are one open file if they name the same socket or pipe, or the same file and (in the caller) share their status flags; `KCMP_EPOLL_TFD` for the caller's own epoll descriptors (`ENOENT` for another's); a caller that may not trace either process `EPERM`. | `proc_pidinfo`, `proc_pidfdinfo`, `fcntl` |
+| `prctl` | Name, capabilities, keepcaps, securebits, child subreaper, `no_new_privs`, THP choice, speculation (reported unaffected), seccomp, timer slack, dumpable, parent-death signal, anonymous memory's names (`PR_SET_VMA_ANON_NAME`, shown in `maps`); `PR_PAC_RESET_KEYS` in the VM only; others `EINVAL`. | none |
+| `process_madvise` | The caller's own ranges as `madvise` takes them; another process's (with `CAP_SYS_NICE`, for a caller that may trace it) checked to be mapped, the hint given nothing to act on; only `MADV_WILLNEED`, `MADV_COLD`, `MADV_PAGEOUT` and `MADV_COLLAPSE` (`EINVAL` otherwise). | `madvise` for the caller's own |
 | `sched_setscheduler`, `sched_setparam`, `sched_getscheduler`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`/`min`, `sched_rr_get_interval` | Kept per process in its record with Linux's checks, inherited; the host schedules as before. | none |
 | `sched_setaffinity`, `sched_getaffinity`, `getcpu` | The mask is checked and remembered; `getcpu` reports its first CPU, node 0. | `sysconf` (online CPUs) |
 | `sched_yield` | The host's. | `sched_yield` |
@@ -1304,7 +1307,6 @@ otherwise.
 | `getrandom` | flags checked (`GRND_RANDOM` with `GRND_INSECURE` is `EINVAL`); never waits; at most 32 MiB a call | `arc4random_buf` |
 | `reboot` | `CAP_SYS_BOOT` and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
 | `vhangup` | `CAP_SYS_TTY_CONFIG`, then nothing | none |
-| `delete_module` | `CAP_SYS_MODULE`, the name read, then `ENOENT`: no module is loaded | none |
 | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities and Landlock are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`; `/sys/kernel/security/lsm` reads `capability,landlock`); neither keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
 
 **`uname`**: the release is fixed (`RELEASE` in
@@ -2173,17 +2175,16 @@ numbers mean nothing there. fwe keeps its own:
 Any call not dispatched in `crates/kernel/src/syscalls.rs` fails with
 `ENOSYS`, noted under `--strace`. These are:
 
-- `kcmp`;
-- `io_uring_setup` and the rest;
-- `userfaultfd`, `perf_event_open`, `fanotify_init`/`fanotify_mark`;
+- `io_uring_setup` and the rest, `userfaultfd`, `perf_event_open`,
+  `fanotify_init`/`fanotify_mark`: as on a kernel built without them, which
+  `/proc/config.gz` says fwe's is;
 - `rseq`;
-- the `futex_wait`, `futex_wake` and `futex_requeue` calls (`futex` and
-  `futex_waitv` work);
-- the `*xattrat` calls, `open_tree_attr`, `listns`;
-- `process_madvise`, `process_mrelease`, `memfd_secret`,
+- `open_tree_attr`, `listns`;
+- `process_mrelease`, `memfd_secret`,
   `map_shadow_stack`;
-- loading kernel modules (`init_module`, `finit_module`; `delete_module`
-  finds none), `kexec_load`/`kexec_file_load`, `swapon`/`swapoff`,
+- the module calls (`init_module`, `finit_module`, `delete_module`), as
+  on a kernel built without modules (`CONFIG_MODULES` not set),
+  `kexec_load`/`kexec_file_load`, `swapon`/`swapoff`,
   `quotactl`/`quotactl_fd`, the NUMA policy calls.
 
 ## macOS to Linux

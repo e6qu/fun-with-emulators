@@ -1809,6 +1809,12 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::FUTEX => unsafe { futex::op_full(a[0], a[1], a[2] as u32, a[3], a[4], a[5] as u32) },
         // SAFETY: the guest pointers are checked as they are read.
         n::FUTEX_WAITV => unsafe { futex::waitv(a[0], a[1], a[2], a[3], a[4]) },
+        // SAFETY: as for `futex`.
+        n::FUTEX_WAKE => unsafe { futex::wake2(a[0], a[1], a[2], a[3]) },
+        // SAFETY: as for `futex`.
+        n::FUTEX_WAIT => unsafe { futex::wait2(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        // SAFETY: the guest pointers are checked as they are read.
+        n::FUTEX_REQUEUE => unsafe { futex::requeue2(a[0], a[1], a[2], a[3]) },
         // On macOS `nanosleep` reads and writes its arguments in the C
         // library, unchecked, so it goes through `clock_nanosleep`'s copies.
         // SAFETY: the arguments are checked guest pointers.

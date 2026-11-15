@@ -74,6 +74,9 @@ pub struct Area {
     pub sealed: bool,
     /// What it maps; anonymous memory has offset 0 throughout.
     pub object: Object,
+    /// Anonymous memory's name (`PR_SET_VMA_ANON_NAME`), as the listing
+    /// shows it (`[anon:name]`).
+    pub label: Option<Arc<[u8]>>,
 }
 
 impl Mapping for Area {
@@ -98,6 +101,7 @@ impl Mapping for Area {
             && a.ino == b.ino
             && a.offset.wrapping_add(moved) == b.offset
             && a.name == b.name
+            && self.label == next.label
     }
 }
 
@@ -127,6 +131,7 @@ impl Area {
             nowrite: false,
             sealed: false,
             object: Object { name, dev: 0, ino: 0, offset: 0 },
+            label: None,
         }
     }
 }
@@ -207,6 +212,7 @@ impl Record {
                     e.bytes(p);
                 }
             }
+            e.bytes(a.label.as_deref().unwrap_or_default());
         }
     }
 
@@ -231,7 +237,8 @@ impl Record {
                 _ => Name::Anonymous,
             };
             let object = Object { name, dev, ino, offset };
-            let area = Area { prot, shared, locked, noexec, nowrite, sealed, object };
+            let label = Some(d.bytes()).filter(|l| !l.is_empty()).map(Into::into);
+            let area = Area { prot, shared, locked, noexec, nowrite, sealed, object, label };
             r.any_sealed |= sealed;
             r.areas.insert(start, end, area);
         }
@@ -252,10 +259,41 @@ impl Record {
     ) -> bool {
         let locked = self.lock_future;
         let object = object.unwrap_or(Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 });
-        let area =
-            Area { prot, shared, locked, noexec: false, nowrite: false, sealed: false, object };
+        let area = Area {
+            prot,
+            shared,
+            locked,
+            noexec: false,
+            nowrite: false,
+            sealed: false,
+            object,
+            label: None,
+        };
         self.areas.insert(start, start + len, area);
         locked
+    }
+
+    /// Name the anonymous memory in `[start, end)` `name` (`None`: no
+    /// name), as `PR_SET_VMA_ANON_NAME` does: `EBADF` if a file is mapped
+    /// in it (nothing named then), `ENOMEM` past a hole (the rest named).
+    pub fn set_anon_name(&mut self, start: u64, end: u64, name: Option<&[u8]>) -> Result<(), i32> {
+        let pieces: Vec<_> = self.areas.overlapping(start, end).collect();
+        if pieces.iter().any(|p| matches!(p.value.object.name, Name::Exe | Name::Path(_))) {
+            return Err(fwe_abi::errno::EBADF);
+        }
+        let mut at = start;
+        let mut hole = false;
+        for p in &pieces {
+            hole |= p.start > at;
+            at = p.end;
+        }
+        hole |= at < end;
+        let label = |shared: bool| -> Option<Arc<[u8]>> {
+            let kind: &[u8] = if shared { b"[anon_shmem:" } else { b"[anon:" };
+            name.map(|n| [kind, n, b"]"].concat().into())
+        };
+        self.areas.update(start, end, |a| Area { label: label(a.shared), ..a.clone() });
+        if hole { Err(fwe_abi::errno::ENOMEM) } else { Ok(()) }
     }
 
     /// Name the mapping `[start, start + len)` as what it maps (a System V
@@ -425,6 +463,7 @@ impl Record {
                     nowrite: false,
                     sealed: false,
                     object,
+                    label: None,
                 };
                 self.areas.insert(start, file_end, area);
             }
@@ -898,7 +937,7 @@ pub fn query(areas: &[Piece<Area>], addr: u64, flags: u64) -> Option<&Piece<Area
 /// and its file's device and inode.
 pub fn name_of<'a>(a: &'a Area, exe: &Exe<'a>) -> (&'a [u8], (u64, u64)) {
     match &a.object.name {
-        Name::Anonymous => (b"", (0, 0)),
+        Name::Anonymous => (a.label.as_deref().unwrap_or_default(), (0, 0)),
         Name::Heap => (b"[heap]", (0, 0)),
         Name::Stack => (b"[stack]", (0, 0)),
         Name::Exe => (exe.path, exe.id),
@@ -927,6 +966,7 @@ mod tests {
             nowrite: false,
             sealed: false,
             object: file("/lib/x.so", 0x1000).unwrap(),
+            label: None,
         };
         let anon = Area {
             object: Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 },
@@ -944,6 +984,7 @@ mod tests {
             |a: &mut Area| a.object.ino += 1,
             |a: &mut Area| a.object.name = Name::Path(b"/lib/y.so"[..].into()),
             |a: &mut Area| a.object.name = Name::Heap,
+            |a: &mut Area| a.label = Some(b"[anon:x]"[..].into()),
         ] {
             let mut a = base.at(0x4000);
             change(&mut a);
@@ -960,6 +1001,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Anonymous memory takes a name, which the listing shows and which
+    /// splits it from the rest; a file's mapping takes none (`EBADF`); a
+    /// hole is `ENOMEM` once the rest is named.
+    #[test]
+    fn anonymous_memory_is_named() {
+        let mut r = Record::new();
+        let rw = mman::PROT_READ | mman::PROT_WRITE;
+        r.mapped(0x10000, 0xc000, rw, false, None);
+        r.mapped(0x20000, 0x4000, rw, true, None);
+        r.mapped(0x30000, 0x4000, rw, false, file("/lib/a.so", 0));
+        assert_eq!(r.set_anon_name(0x14000, 0x18000, Some(b"buf")), Ok(()));
+        assert_eq!(r.set_anon_name(0x20000, 0x24000, Some(b"shm")), Ok(()));
+        assert_eq!(r.set_anon_name(0x2c000, 0x34000, Some(b"x")), Err(fwe_abi::errno::EBADF));
+        assert_eq!(r.set_anon_name(0x18000, 0x20000, Some(b"y")), Err(fwe_abi::errno::ENOMEM));
+        let text = String::from_utf8(render(
+            &r.areas(),
+            &Exe { path: b"/bin/x", id: (0, 0) },
+            0x4000,
+            None,
+        ))
+        .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("00010000-00014000 rw-p") && lines[0].ends_with(" 0 "));
+        assert!(lines[1].starts_with("00014000-00018000 ") && lines[1].ends_with("[anon:buf]"));
+        assert!(lines[2].starts_with("00018000-0001c000 ") && lines[2].ends_with("[anon:y]"));
+        assert!(lines[3].ends_with("[anon_shmem:shm]"), "{text}");
+        assert_eq!(r.set_anon_name(0x14000, 0x18000, None), Ok(()));
+        assert!(r.areas()[0].value.label.is_none());
     }
 
     #[test]

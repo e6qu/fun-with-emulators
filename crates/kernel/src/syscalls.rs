@@ -404,18 +404,23 @@ impl<P: Platform> Kernel<P> {
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
             nr::FCHMODAT2 => self.sys_fchmodat2(a[0], a[1], a[2], a[3]),
-            nr::SETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], true),
-            nr::LSETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], false),
+            nr::SETXATTR => self.sys_setxattr(CWD, a[0], a[1], a[2], a[3], a[4], true),
+            nr::LSETXATTR => self.sys_setxattr(CWD, a[0], a[1], a[2], a[3], a[4], false),
             nr::FSETXATTR => self.sys_fsetxattr(a[0], a[1], a[2], a[3], a[4]),
-            nr::GETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], true),
-            nr::LGETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], false),
-            nr::FGETXATTR => self.sys_getxattr(Some(a[0] as i32), 0, a[1], a[2], a[3], true),
-            nr::LISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], true),
-            nr::LLISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], false),
-            nr::FLISTXATTR => self.sys_listxattr(Some(a[0] as i32), 0, a[1], a[2], true),
-            nr::REMOVEXATTR => self.sys_removexattr(None, a[0], a[1], true),
-            nr::LREMOVEXATTR => self.sys_removexattr(None, a[0], a[1], false),
-            nr::FREMOVEXATTR => self.sys_removexattr(Some(a[0] as i32), 0, a[1], true),
+            nr::GETXATTR => self.sys_getxattr(CWD, None, a[0], a[1], a[2], a[3], true),
+            nr::LGETXATTR => self.sys_getxattr(CWD, None, a[0], a[1], a[2], a[3], false),
+            nr::FGETXATTR => self.sys_getxattr(CWD, Some(a[0] as i32), 0, a[1], a[2], a[3], true),
+            nr::LISTXATTR => self.sys_listxattr(CWD, None, a[0], a[1], a[2], true),
+            nr::LLISTXATTR => self.sys_listxattr(CWD, None, a[0], a[1], a[2], false),
+            nr::FLISTXATTR => self.sys_listxattr(CWD, Some(a[0] as i32), 0, a[1], a[2], true),
+            nr::REMOVEXATTR => self.sys_removexattr(CWD, None, a[0], a[1], true),
+            nr::LREMOVEXATTR => self.sys_removexattr(CWD, None, a[0], a[1], false),
+            nr::FREMOVEXATTR => self.sys_removexattr(CWD, Some(a[0] as i32), 0, a[1], true),
+            nr::KCMP => self.sys_kcmp(a[0], a[1], a[2], a[3], a[4]),
+            nr::PROCESS_MADVISE => self.sys_process_madvise(a[0], a[1], a[2], a[3], a[4]),
+            nr::SETXATTRAT | nr::GETXATTRAT | nr::LISTXATTRAT | nr::REMOVEXATTRAT => {
+                self.sys_xattrat(n, a)
+            }
             nr::FCHMOD => self.sys_fchmod(a[0], a[1]),
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHOWN => self.sys_fchown(a[0], a[1], a[2]),
@@ -722,7 +727,6 @@ impl<P: Platform> Kernel<P> {
             nr::VHANGUP => self.sys_vhangup(),
             nr::READAHEAD => self.sys_readahead(a[0]),
             nr::SYNC_FILE_RANGE => self.sys_sync_file_range(a[0], a[1], a[2], a[3]),
-            nr::DELETE_MODULE => self.sys_delete_module(a[0]),
             nr::SYSLOG => self.sys_syslog(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0], a[1]),
             nr::IOPRIO_GET => self.sys_ioprio_get(a[0], a[1]),
@@ -1564,6 +1568,8 @@ impl<P: Platform> Kernel<P> {
         use fwe_abi::prctl::*;
         use std::sync::atomic::Ordering::Relaxed;
         match option {
+            PR_SET_VMA if arg2 == PR_SET_VMA_ANON_NAME => self.set_vma_name(arg3, arg4, arg5),
+            PR_SET_VMA => err(errno::EINVAL),
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
                 let s = guest!(uaccess::read_cstr(arg2, 4096));
@@ -3360,6 +3366,9 @@ pub(crate) static THP_DISABLE: std::sync::atomic::AtomicBool =
 /// per process, which a program setting it before an `execve` (`setarch`)
 /// cannot tell apart.
 pub(crate) static PERSONALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The working directory, as a directory descriptor.
+const CWD: i32 = fwe_abi::fcntl::AT_FDCWD as i32;
 
 /// Personality flags fwe acts on: `select`'s timeout left as given, and
 /// `uname` reporting a 2.6 release. The others (address-space layout,

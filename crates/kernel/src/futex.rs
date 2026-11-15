@@ -227,6 +227,112 @@ const FUTEX2_NUMA: u32 = 4;
 const FUTEX2_MPOL: u32 = 8;
 const FUTEX2_PRIVATE: u32 = 128;
 
+/// A futex2 call's `flags` for one futex, checked as Linux checks them (a
+/// 32-bit word only; no NUMA or memory-policy key: `EINVAL`): whether it
+/// is private.
+fn futex2_private(flags: u64) -> Result<bool, i32> {
+    let known = u64::from(FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FUTEX2_PRIVATE);
+    if flags & !known != 0
+        || flags & u64::from(FUTEX2_SIZE_MASK) != u64::from(FUTEX2_SIZE_U32)
+        || flags & u64::from(FUTEX2_NUMA | FUTEX2_MPOL) != 0
+    {
+        return Err(errno::EINVAL);
+    }
+    Ok(flags & u64::from(FUTEX2_PRIVATE) != 0)
+}
+
+/// The `futex` operation `cmd` for a futex2 call on a private futex or not.
+fn futex2_op(cmd: u64, private: bool) -> u64 {
+    if private { cmd | futex::FUTEX_PRIVATE_FLAG } else { cmd }
+}
+
+/// `futex_wake(uaddr, mask, nr, flags)`: wake up to `nr` waiters on the
+/// futex whose bitset shares a bit with `mask`, as `FUTEX_WAKE_BITSET`.
+///
+/// # Safety
+/// As for [`op`].
+pub unsafe fn wake2(uaddr: u64, mask: u64, nr: u64, flags: u64) -> i64 {
+    let private = match futex2_private(flags) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    if mask == 0 || mask > u64::from(u32::MAX) {
+        return err(errno::EINVAL);
+    }
+    let nr = (nr as i32).max(0) as u32;
+    // SAFETY: the caller's guarantee, passed on.
+    unsafe { op_full(uaddr, futex2_op(futex::FUTEX_WAKE_BITSET, private), nr, 0, 0, mask as u32) }
+}
+
+/// `futex_wait(uaddr, val, mask, flags, timeout, clockid)`: wait while the
+/// futex holds `val`, until woken through `mask` or the absolute
+/// `timeout` on `clockid`, as `FUTEX_WAIT_BITSET`.
+///
+/// # Safety
+/// As for [`op`].
+pub unsafe fn wait2(
+    uaddr: u64,
+    val: u64,
+    mask: u64,
+    flags: u64,
+    timeout: u64,
+    clockid: u64,
+) -> i64 {
+    let private = match futex2_private(flags) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    if mask == 0 || mask > u64::from(u32::MAX) || val > u64::from(u32::MAX) {
+        return err(errno::EINVAL);
+    }
+    let realtime = match clockid {
+        fwe_abi::clock::CLOCK_MONOTONIC => false,
+        fwe_abi::clock::CLOCK_REALTIME => true,
+        _ => return err(errno::EINVAL),
+    };
+    let mut op = futex2_op(futex::FUTEX_WAIT_BITSET, private);
+    if realtime {
+        op |= futex::FUTEX_CLOCK_REALTIME;
+    }
+    // SAFETY: the caller's guarantee, passed on.
+    unsafe { op_full(uaddr, op, val as u32, timeout, 0, mask as u32) }
+}
+
+/// `futex_requeue(waiters, flags, nr_wake, nr_requeue)`: on the first of
+/// the two futexes `waiters` names (as `futex_waitv` does), still holding
+/// its value, wake `nr_wake` waiters and move up to `nr_requeue` more to
+/// the second, as `FUTEX_CMP_REQUEUE`. Both futexes are private or both
+/// shared (fwe keeps the two kinds' waiters apart): `EINVAL` otherwise.
+///
+/// # Safety
+/// The guest pointers are checked as they are read.
+pub unsafe fn requeue2(waiters: u64, flags: u64, nr_wake: u64, nr_requeue: u64) -> i64 {
+    if flags != 0 {
+        return err(errno::EINVAL);
+    }
+    let raw = crate::guest!(crate::uaccess::read_bytes(waiters, 48));
+    let mut futexes = [(0u64, 0u64, false); 2];
+    for (i, w) in raw.as_chunks::<24>().0.iter().enumerate() {
+        let val = u64::from_ne_bytes(w[0..8].try_into().unwrap());
+        let uaddr = u64::from_ne_bytes(w[8..16].try_into().unwrap());
+        let f = u32::from_ne_bytes(w[16..20].try_into().unwrap());
+        let reserved = u32::from_ne_bytes(w[20..24].try_into().unwrap());
+        let private = match futex2_private(u64::from(f)) {
+            Ok(p) if reserved == 0 => p,
+            _ => return err(errno::EINVAL),
+        };
+        futexes[i] = (uaddr, val, private);
+    }
+    let [(from, val, private), (to, _, to_private)] = futexes;
+    if private != to_private || val > u64::from(u32::MAX) {
+        return err(errno::EINVAL);
+    }
+    let op = futex2_op(futex::FUTEX_CMP_REQUEUE, private);
+    let (wake, moved) = ((nr_wake as i32) as u32, (nr_requeue as i32) as u32);
+    // SAFETY: the words are checked as they are read.
+    unsafe { op_full(from, op, wake, u64::from(moved), to, val as u32) }
+}
+
 /// One futex `futex_waitv` waits on: in this process's queues, or in a
 /// slot of the shared table ([`shared`]).
 enum Held {

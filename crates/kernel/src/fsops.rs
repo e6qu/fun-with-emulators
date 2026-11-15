@@ -2910,9 +2910,11 @@ impl<P: Platform> Kernel<P> {
 
     /// `EROFS` for a file opened through a read-only mount.
     /// `setxattr`, `lsetxattr` (`!follow`): set attribute `name` of the
-    /// file at `path` to the `size` bytes at `value`.
+    /// file at `path` (from `dirfd`) to the `size` bytes at `value`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sys_setxattr(
         &mut self,
+        dirfd: i32,
         path: u64,
         name: u64,
         value: u64,
@@ -2925,19 +2927,17 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
+        if self.fs().synthetic(dirfd, &path).is_some() {
             return err(errno::EPERM);
         }
-        let r = self
-            .resolve_p(fcntl::AT_FDCWD as u64, &path, follow, true, Change::Modify)
-            .and_then(|r| {
-                Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
-                let n = r.name_c()?;
-                let (host, plain) = Self::xattr_file(&r.dir, &n)?;
-                let space = crate::xattr::space(&name)?;
-                self.xattr_who(plain).may_write(&name, space)?;
-                crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
-            });
+        let r = self.resolve_p(dirfd as u64, &path, follow, true, Change::Modify).and_then(|r| {
+            Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
+            let n = r.name_c()?;
+            let (host, plain) = Self::xattr_file(&r.dir, &n)?;
+            let space = crate::xattr::space(&name)?;
+            self.xattr_who(plain).may_write(&name, space)?;
+            crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
+        });
         match r {
             Ok(()) => 0,
             Err(e) => err(e),
@@ -2974,8 +2974,10 @@ impl<P: Platform> Kernel<P> {
     /// `getxattr`, `lgetxattr` (`!follow`), and `fgetxattr` (`path` 0,
     /// `fd` set): attribute `name` into the `size` bytes at `value` (its
     /// length, if `size` is 0).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sys_getxattr(
         &mut self,
+        dirfd: i32,
         fd: Option<i32>,
         path: u64,
         name: u64,
@@ -2984,7 +2986,7 @@ impl<P: Platform> Kernel<P> {
         follow: bool,
     ) -> i64 {
         let name = guest!(uaccess::read_cstr(name, 256));
-        let got = self.xattr_target(fd, path, follow, |t, who, layers| {
+        let got = self.xattr_target(dirfd, fd, path, follow, |t, who, layers| {
             Self::overlay_own(layers, &name)?;
             who.may_read(crate::xattr::space(&name)?)?;
             crate::xattr::get(t, &name)
@@ -2996,13 +2998,14 @@ impl<P: Platform> Kernel<P> {
     /// of the attributes the caller sees, into the `size` bytes at `list`.
     pub(crate) fn sys_listxattr(
         &mut self,
+        dirfd: i32,
         fd: Option<i32>,
         path: u64,
         list: u64,
         size: u64,
         follow: bool,
     ) -> i64 {
-        let got = self.xattr_target(fd, path, follow, |t, who, layers| {
+        let got = self.xattr_target(dirfd, fd, path, follow, |t, who, layers| {
             let all = crate::xattr::list(t, who)?;
             // An overlay's file does not show the overlay's own.
             let Some(l) = layers else { return Ok(all) };
@@ -3023,6 +3026,7 @@ impl<P: Platform> Kernel<P> {
     /// `removexattr`, `lremovexattr` (`!follow`), and `fremovexattr`.
     pub(crate) fn sys_removexattr(
         &mut self,
+        dirfd: i32,
         fd: Option<i32>,
         path: u64,
         name: u64,
@@ -3039,18 +3043,17 @@ impl<P: Platform> Kernel<P> {
             }),
             None => {
                 let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-                if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
+                if self.fs().synthetic(dirfd, &path).is_some() {
                     return err(errno::EPERM);
                 }
-                self.resolve_p(fcntl::AT_FDCWD as u64, &path, follow, true, Change::Modify)
-                    .and_then(|r| {
-                        Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
-                        let n = r.name_c()?;
-                        let (host, plain) = Self::xattr_file(&r.dir, &n)?;
-                        let space = crate::xattr::space(&name)?;
-                        self.xattr_who(plain).may_write(&name, space)?;
-                        crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
-                    })
+                self.resolve_p(dirfd as u64, &path, follow, true, Change::Modify).and_then(|r| {
+                    Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
+                    let n = r.name_c()?;
+                    let (host, plain) = Self::xattr_file(&r.dir, &n)?;
+                    let space = crate::xattr::space(&name)?;
+                    self.xattr_who(plain).may_write(&name, space)?;
+                    crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
+                })
             }
         };
         match r {
@@ -3078,6 +3081,7 @@ impl<P: Platform> Kernel<P> {
     /// ([`SYNTHETIC`]).
     fn xattr_target<T>(
         &self,
+        dirfd: i32,
         fd: Option<i32>,
         path: u64,
         follow: bool,
@@ -3095,15 +3099,74 @@ impl<P: Platform> Kernel<P> {
             }
             None => {
                 let path = uaccess::read_cstr(path, uaccess::PATH_MAX)?;
-                if self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some() {
+                if self.fs().synthetic(dirfd, &path).is_some() {
                     return Err(SYNTHETIC);
                 }
-                let r = self.fs().resolve(fcntl::AT_FDCWD as i32, &path, follow)?;
+                let r = self.fs().resolve(dirfd, &path, follow)?;
                 let n = r.name_c()?;
                 let (host, plain) = Self::xattr_file(&r.dir, &n)?;
                 let t = crate::xattr::Target::Path(&host);
                 f(&t, &self.xattr_who(plain), r.ovl.as_ref().map(|o| &*o.layers))
             }
+        }
+    }
+
+    /// `setxattrat`, `getxattrat`, `listxattrat` and `removexattrat`
+    /// (`nr`, arguments `a`): the attribute calls on the file at a path
+    /// from a directory descriptor (`AT_SYMLINK_NOFOLLOW`; with
+    /// `AT_EMPTY_PATH` and no path, the descriptor's file), the value of a
+    /// set or get in a `struct xattr_args`.
+    pub(crate) fn sys_xattrat(&mut self, nr: u64, a: [u64; 6]) -> i64 {
+        use fwe_abi::fcntl::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+        let (dirfd, path, at) = (a[0] as i32, a[1], a[2]);
+        if at & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+            return err(errno::EINVAL);
+        }
+        let follow = at & AT_SYMLINK_NOFOLLOW == 0;
+        // The descriptor's own file: an empty path, as `AT_EMPTY_PATH` allows.
+        let own = at & AT_EMPTY_PATH != 0
+            && dirfd != fcntl::AT_FDCWD as i32
+            && uaccess::read_cstr(path, uaccess::PATH_MAX).is_ok_and(|p| p.is_empty());
+        let fd = own.then_some(dirfd);
+        // `struct xattr_args`: the value's address and size, and flags.
+        let args = |at: u64, size: u64| -> Result<(u64, u64, u64), i32> {
+            if size < 16 {
+                return Err(errno::EINVAL);
+            }
+            if size > 4096 {
+                return Err(errno::E2BIG);
+            }
+            let mut b = vec![0u8; size as usize];
+            uaccess::read_into(at, &mut b)?;
+            if b[16..].iter().any(|&c| c != 0) {
+                return Err(errno::E2BIG);
+            }
+            let word = |o: usize| u64::from_ne_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
+            Ok((word(0), word(8) & 0xffff_ffff, word(8) >> 32))
+        };
+        match nr {
+            fwe_abi::nr::SETXATTRAT => {
+                let (value, size, flags) = match args(a[4], a[5]) {
+                    Ok(v) => v,
+                    Err(e) => return err(e),
+                };
+                match fd {
+                    Some(fd) => self.sys_fsetxattr(fd as u64, a[3], value, size, flags),
+                    None => self.sys_setxattr(dirfd, path, a[3], value, size, flags, follow),
+                }
+            }
+            fwe_abi::nr::GETXATTRAT => {
+                let (value, size, flags) = match args(a[4], a[5]) {
+                    Ok(v) => v,
+                    Err(e) => return err(e),
+                };
+                if flags != 0 {
+                    return err(errno::EINVAL);
+                }
+                self.sys_getxattr(dirfd, fd, path, a[3], value, size, follow)
+            }
+            fwe_abi::nr::LISTXATTRAT => self.sys_listxattr(dirfd, fd, path, a[3], a[4], follow),
+            _ => self.sys_removexattr(dirfd, fd, path, a[3], follow),
         }
     }
 

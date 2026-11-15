@@ -1181,11 +1181,13 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   unsynchronised (`crates/kernel/src/clockset.rs`).
 - `statfs`/`fstatfs` report the host filesystem's sizes and counts with
   ext4's type (or the mount's type and flags); `msync` is the host's.
-- `prctl`: thread name, capability bounding and ambient sets, keepcaps,
+- `prctl`: thread name, anonymous memory's names (kept with each mapping
+  in fwe's record, `[anon:name]` in `maps`), capability bounding and
+  ambient sets, keepcaps,
   securebits, child subreaper, `no_new_privs`, seccomp, dumpability,
   parent-death signal, timer slack, transparent huge pages and speculation
   control (reported as not affected); others fail with `EINVAL`.
-- `getcpu`, `vhangup`, `readahead`, `sync_file_range`, `delete_module`,
+- `getcpu`, `vhangup`, `readahead`, `sync_file_range`,
   `syslog` (an empty kernel log) and `membarrier` check their arguments
   and permissions as Linux does (`crates/kernel/src/calls.rs`);
   `rt_sigqueueinfo` and `rt_tgsigqueueinfo` send with the caller's

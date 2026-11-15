@@ -34,6 +34,18 @@ fn interest<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Interest>) -> 
     f(g.get_or_insert_with(Default::default))
 }
 
+/// Whether descriptor `tfd` is in the interest list of epoll descriptor
+/// `efd` (`None`: `efd` is no epoll descriptor of this process's).
+pub fn watches(efd: i32, tfd: i32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (efd, tfd);
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    interest(|m| m.get(&efd).map(|list| list.contains_key(&tfd)))
+}
+
 /// Descriptor `fd` is being closed: it leaves every interest list (as the
 /// kqueue drops its filters), and if it is an epoll descriptor, its list goes.
 pub fn closed(fd: i32) {

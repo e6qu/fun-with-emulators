@@ -630,6 +630,9 @@ pub fn pointer_args(nr: u64) -> u8 {
         // backend translates it then (see `futex_pointer_args`).
         n::FUTEX => 0b1_0001,
         n::FUTEX_WAITV => 0b1001,
+        n::FUTEX_WAKE => 0b1,
+        n::FUTEX_WAIT => 0b1_0001,
+        n::FUTEX_REQUEUE => 0b1,
         n::PRLIMIT64 => 0b1100,
         n::GETRLIMIT | n::SETRLIMIT => 0b10,
         n::GETRUSAGE => 0b10,

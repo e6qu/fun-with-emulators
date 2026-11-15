@@ -56,8 +56,10 @@ type Child = (&'static [u8], u8);
 type DirDef = (&'static [u8], &'static [Child]);
 
 /// The kernel configuration fwe presents: what it implements, in the
-/// options' terms (an option not listed is not set), for the programs and
-/// test suites that read `/proc/config.gz` to tell what the kernel has.
+/// options' terms (an option not listed is not set; the ones programs ask
+/// about by name are said to be not set), for the programs and test suites
+/// that read `/proc/config.gz` to tell what the kernel has. The calls of
+/// an option not set fail as on a kernel built without it (`ENOSYS`).
 const CONFIG: &str = "\
 # Linux/arm64 Kernel Configuration, as fwe implements it
 CONFIG_ARM64=y
@@ -140,6 +142,11 @@ CONFIG_CRYPTO_SHA512=y
 CONFIG_CRYPTO_AES=y
 CONFIG_CRYPTO_CBC=y
 CONFIG_CRYPTO_HMAC=y
+# CONFIG_MODULES is not set
+# CONFIG_IO_URING is not set
+# CONFIG_PERF_EVENTS is not set
+# CONFIG_FANOTIFY is not set
+# CONFIG_USERFAULTFD is not set
 ";
 
 /// [`CONFIG`], gzipped as `/proc/config.gz` is (in stored blocks: the
@@ -677,6 +684,7 @@ mod tests {
         assert_eq!(body[0], 1);
         let len = u16::from_le_bytes([body[1], body[2]]) as usize;
         assert_eq!(&body[5..5 + len], CONFIG.as_bytes());
+        assert!(CONFIG.contains("\n# CONFIG_MODULES is not set\n"));
         let tail = &gz[gz.len() - 8..];
         assert_eq!(u32::from_le_bytes(tail[..4].try_into().unwrap()), crc32(CONFIG.as_bytes()));
         assert_eq!(u32::from_le_bytes(tail[4..].try_into().unwrap()), CONFIG.len() as u32);

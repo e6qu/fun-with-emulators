@@ -358,6 +358,8 @@ impl<P: Platform> Kernel<P> {
             std::sync::atomic::Ordering::SeqCst,
         );
         let euid = self.creds.euid;
+        // `CAP_CHECKPOINT_RESTORE` (the last) or `CAP_SYS_ADMIN`, for `set_tid`.
+        let restorer = self.creds.has(crate::caps::CAP_LAST_CAP) || self.creds.has_admin();
         let fs = self.fs_mut();
         let mut ns = fs.ns.clone();
         ns.unshare(new, euid)?;
@@ -382,7 +384,23 @@ impl<P: Platform> Kernel<P> {
         // Numbered last, so that nothing after it can fail and leave the
         // numbers taken.
         let chain = pidns::chain_from(child_pid_ns);
-        let nums = if chain.is_empty() { Vec::new() } else { pidns::alloc(&chain, 0, false)? };
+        // `set_tid`: the child's numbers chosen, in fwe's namespaces (the
+        // host's own numbers are not fwe's to choose: `EPERM`), with
+        // `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`.
+        let chosen = &a.set_tid[..a.set_tid_size];
+        if !chosen.is_empty() {
+            if chosen.len() > chain.len() + 1 {
+                return Err(errno::EINVAL);
+            }
+            if chosen.len() > chain.len() || !restorer {
+                return Err(errno::EPERM);
+            }
+        }
+        let nums = if chain.is_empty() {
+            Vec::new()
+        } else {
+            pidns::alloc_chosen(&chain, 0, false, chosen)?
+        };
         let saved = if new != 0 || !nums.is_empty() {
             let old = (fs.mount_ns().clone(), std::mem::replace(&mut fs.ns, ns));
             if let Some(m) = mnt {

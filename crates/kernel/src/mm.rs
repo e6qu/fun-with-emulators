@@ -1311,6 +1311,40 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
+    /// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, len, name)`: name the
+    /// anonymous memory of the range (`name` 0: unname it), as `/proc`'s
+    /// `maps` shows it. The name, up to 79 bytes, takes no control
+    /// character or any of `\`, `` ` ``, `$`, `[` and `]` (`EINVAL`).
+    pub(crate) fn set_vma_name(&mut self, addr: u64, len: u64, name: u64) -> i64 {
+        let name = if name == 0 {
+            None
+        } else {
+            let n = match crate::uaccess::read_cstr(name, 80) {
+                Ok(n) if n.len() < 80 => n,
+                Ok(_) => return err(errno::EINVAL),
+                Err(e) => return err(e),
+            };
+            if n.iter().any(|&c| !(0x20..0x7f).contains(&c) || b"\\`$[]".contains(&c)) {
+                return err(errno::EINVAL);
+            }
+            Some(n)
+        };
+        if addr & (self.page_size - 1) != 0 || len.checked_add(self.page_size - 1).is_none() {
+            return err(errno::EINVAL);
+        }
+        let len = self.page_up(len);
+        let Some(end) = addr.checked_add(len) else { return err(errno::EINVAL) };
+        if len == 0 {
+            return 0;
+        }
+        let r = crate::maps::record().set_anon_name(addr, end, name.as_deref());
+        crate::maps::publish();
+        match r {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
     /// `remap_file_pages(start, size, prot, pgoff, flags)`, as Linux does it
     /// since it stopped keeping non-linear mappings: the range of a shared
     /// file mapping mapped afresh at page `pgoff` of its file.

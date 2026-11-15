@@ -226,6 +226,9 @@ pub mod mman {
 /// File status flags (`asm-generic/fcntl.h`, arm64 overrides).
 /// `prctl` options.
 pub mod prctl {
+    /// `PR_SET_VMA` ("SVMA") and its one option.
+    pub const PR_SET_VMA: u64 = 0x5356_4d41;
+    pub const PR_SET_VMA_ANON_NAME: u64 = 0;
     pub const PR_SET_PDEATHSIG: u64 = 1;
     pub const PR_GET_PDEATHSIG: u64 = 2;
     pub const PR_GET_DUMPABLE: u64 = 3;

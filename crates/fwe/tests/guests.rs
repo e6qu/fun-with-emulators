@@ -6532,3 +6532,46 @@ fn proc_files_programs_read() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// Linux 6.x calls: the `*xattrat` calls, the futex2 calls, `kcmp`,
+/// `process_madvise`, `clone3`'s `set_tid` in fwe's pid namespaces and
+/// `PR_SET_VMA` names; and `ENOSYS` for the features fwe's kernel is built
+/// without (modules, io_uring, perf events, fanotify, userfaultfd).
+#[test]
+fn newer_system_calls() {
+    let out = run_c_guest("newcalls", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "setxattrat: 0\n\
+         getxattrat: 5 value\n\
+         getxattrat with flags: -22\n\
+         small args: -22\n\
+         listxattrat has it: 1\n\
+         getxattrat of the descriptor: 5 value\n\
+         removexattrat: 0, again: -61\n\
+         unknown at flags: -22\n\
+         futex_wait woken: 0, word 1\n\
+         futex_wait on a changed word: -11\n\
+         64-bit futex: -22\n\
+         futex_wake with none waiting: 0\n\
+         futex_requeue: 0\n\
+         futex_requeue on a changed word: -11\n\
+         kcmp dup: 0, pipe dup: 0, two pipe ends differ: 1\n\
+         same file opened twice: 1, duplicated: 0\n\
+         bad descriptor: -9, bad type: -22\n\
+         own memory: 0, a child's: 1, inherited pipe: 0\n\
+         process_madvise: 98304\n\
+         destructive advice: -22, flags: -22, not a pidfd: -9\n\
+         PR_SET_VMA: 0\n\
+         bad name: 22\n\
+         maps names it: 1\n\
+         set_tid in the host's namespace: -1\n\
+         set_tid other than 1 with no init: -22\n\
+         chosen pid: 42\n\
+         taken: -17, too many: -22\n\
+         init made: 1\n\
+         modules: -38 -38 -38\n\
+         io_uring -38, perf -38, fanotify -38, userfaultfd -38\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
