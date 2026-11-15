@@ -2151,6 +2151,13 @@ fn alpine_crun_runs_an_image() {
          / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n";
     if stdout(&out) != want {
         print_last_calls(&run_trace);
+        // And every call that moved a process or made its namespaces.
+        let trace = std::fs::read_to_string(&run_trace).unwrap_or_default();
+        for line in trace.lines().filter(|l| {
+            ["cgroup", "unshare", "clone", "setns", "execve"].iter().any(|w| l.contains(w))
+        }) {
+            eprintln!("{line}");
+        }
     }
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(stdout(&out), want);
@@ -4610,12 +4617,18 @@ fn nice_values_reach_the_host_and_name_threads() {
     std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
     text.push_str(&rest);
     let status = child.wait().unwrap();
+    // A process starts with its parent's nice value, as on Linux: this
+    // test's (CI's runner starts it at -10).
+    // SAFETY: reading this process's own priority.
+    let start = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
     assert_eq!(
         text,
-        "process: start 0, set 5 0 reads 5, lowered to 2 0 reads 2\n\
-         thread: starts 2, set 9 0, reads 9, main thread's 2\n\
-         main thread: 2\n\
-         user namespace: user 500 (43211 outside) 2, user 43211 ESRCH\n"
+        format!(
+            "process: start {start}, set 5 0 reads 5, lowered to 2 0 reads 2\n\
+             thread: starts 2, set 9 0, reads 9, main thread's 2\n\
+             main thread: 2\n\
+             user namespace: user 500 (43211 outside) 2, user 43211 ESRCH\n"
+        )
     );
     assert_eq!(host_nice, Some(5), "the host process keeps the highest nice value it was given");
     assert!(status.success());
