@@ -61,6 +61,7 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn usleep(us: u32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn dup(fd: i32) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
@@ -1069,9 +1070,65 @@ fn mountinfo_scenario() {
     println!("root's numbers match stat: {}", numbers == format!("{major}:{minor}"));
 }
 
+/// Open FIFO `name` from `dir` (`AT_FDCWD` for a path) to read on a thread
+/// of its own, while this thread opens `path` to write: neither open holds
+/// the other up.
+fn meet_at_fifo(dir: i32, name: &'static str, path: &str) -> String {
+    let reader = std::thread::spawn(move || {
+        // SAFETY: a NUL-terminated path; waits for a writer.
+        let fd = unsafe { openat(dir, c(name).as_ptr(), O_RDONLY) };
+        let mut b = [0u8; 2];
+        // SAFETY: a buffer of two bytes.
+        let n = unsafe { read(fd, b.as_mut_ptr(), 2) };
+        String::from_utf8_lossy(&b[..n.max(0) as usize]).into_owned()
+    });
+    // The reader waiting, a call of this thread's that takes fwe's lock
+    // goes on (were the lock held, it would wait for a writer that never
+    // came).
+    // SAFETY: plain calls; a NUL-terminated path.
+    unsafe {
+        usleep(200_000);
+        mkdir(c(&format!("{path}.made")).as_ptr(), 0o755);
+    }
+    // SAFETY: a NUL-terminated path; waits for the reader.
+    let w = unsafe { open(c(path).as_ptr(), O_WRONLY) };
+    // SAFETY: two bytes.
+    unsafe {
+        write(w, b"ok".as_ptr(), 2);
+        close(w);
+    }
+    reader.join().unwrap()
+}
+
+/// FIFO opens that wait for the other end hold up no other thread of the
+/// process: a FIFO another user owns, one opened from a directory
+/// descriptor, one in an overlay.
+fn fifo_scenario() {
+    const CLONE_NEWNS: i32 = 0x20000;
+    // SAFETY: plain calls; NUL-terminated strings.
+    unsafe {
+        unshare(CLONE_NEWNS);
+        for d in ["/tmp/lower", "/tmp/upper", "/tmp/work", "/tmp/m"] {
+            mkdir(c(d).as_ptr(), 0o755);
+        }
+        mkfifo(c("/tmp/owned").as_ptr(), 0o666);
+        chown(c("/tmp/owned").as_ptr(), 1000, 1000);
+        mkfifo(c("/tmp/plain").as_ptr(), 0o666);
+        mkfifo(c("/tmp/lower/f").as_ptr(), 0o666);
+        let data = c("lowerdir=/tmp/lower,upperdir=/tmp/upper,workdir=/tmp/work");
+        mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, data.as_ptr());
+    }
+    println!("another's: {}", meet_at_fifo(AT_FDCWD, "/tmp/owned", "/tmp/owned"));
+    // SAFETY: a NUL-terminated path.
+    let tmp = unsafe { open(c("/tmp").as_ptr(), O_RDONLY | O_DIRECTORY) };
+    println!("from a directory: {}", meet_at_fifo(tmp, "plain", "/tmp/plain"));
+    println!("in an overlay: {}", meet_at_fifo(AT_FDCWD, "/tmp/m/f", "/tmp/m/f"));
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "fifo" => fifo_scenario(),
         "mountinfo" => mountinfo_scenario(),
         "tmpfs" => tmpfs_size_scenario(),
         "tmpfile" => tmpfile_scenario(),

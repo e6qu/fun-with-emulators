@@ -103,7 +103,8 @@ or, for a call that may block, without it:
   `pselect6`, `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the
   blocking socket calls, `flock`, `F_SETLKW`/`F_OFD_SETLKW`, `read`/`write`
   and their vectored and positioned forms, `sendfile`, `splice`, `tee`,
-  `vmsplice`, `copy_file_range`, FIFO opens and IPC waits. `clone`,
+  `vmsplice`, `copy_file_range`, FIFO opens (by any path: another user's
+  FIFO, from a directory descriptor, in an overlay) and IPC waits. `clone`,
   `execve` and `exit` are the backend's.
 - **Signals during a call:** the thread's guest mask is in force on the
   host while a call runs, so a signal the guest takes interrupts a blocking

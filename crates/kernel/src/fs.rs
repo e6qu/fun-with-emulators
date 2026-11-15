@@ -3019,16 +3019,25 @@ pub(crate) fn forked_child_fifos() {
 }
 
 /// Whether `r` is a FIFO whose open by `flags` [`open_fifo_unlocked`]
-/// waits for: not in an overlay, not on a read-only mount to write, and
-/// not one whose mode fwe keeps aside.
-fn fifo_to_wait_for(r: &Resolved, flags: u64) -> bool {
+/// waits for: one the caller may open so, by its guest owner and mode
+/// (one it may not is the locked open's to refuse, before it counts as a
+/// reader or writer). A FIFO is opened to write through a read-only mount
+/// too, and in an overlay's layer as it is.
+fn fifo_to_wait_for(r: &Resolved, flags: u64, host_root: bool) -> bool {
     use fwe_abi::fcntl as f;
-    let writes = flags & f::O_ACCMODE == f::O_WRONLY;
-    if r.ovl.is_some() || writes && r.writable().is_err() || r.name == b"." {
+    if r.name == b"." {
         return false;
     }
     let Some(st) = r.lstat() else { return false };
-    st.st_mode & libc::S_IFMT == libc::S_IFIFO && !crate::modes::marked(&st)
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return false;
+    }
+    let Ok(name) = r.name_c() else { return false };
+    let Some(guest) = guest_stat_at(r.dir.as_raw_fd(), &name) else { return false };
+    let want = if flags & f::O_ACCMODE == f::O_WRONLY { 2 } else { 4 };
+    // Without a root filesystem, the host's own (root's) are left to it.
+    let host_own = host_root && guest.st_uid == 0 && guest.st_gid == 0;
+    host_own || crate::creds::access().permits(&guest, want)
 }
 
 /// A resolution [`open_fifo_unlocked`] made for an `openat` that waits for
@@ -3157,13 +3166,12 @@ pub(crate) fn reads_only(flags: u64) -> bool {
 /// if `path` names a FIFO and the open is one that waits for the other end
 /// (to read or to write, without `O_NONBLOCK`), open it here, where the
 /// wait holds no lock and a signal interrupts it (`EINTR`). The locked
-/// open takes the descriptor ([`take_fifo`]). Only paths from the working
-/// directory or absolute are looked at (the view that runs without the
-/// lock has no descriptors to start from), and only opens that the locked
-/// open would not refuse first: not one that must make the file
-/// (`O_CREAT|O_EXCL`), of a directory, of a link not to be followed, on a
-/// read-only mount to write, of an overlay's file, or of one whose mode fwe
-/// keeps aside (whose checks are the locked open's).
+/// open takes the descriptor ([`take_fifo`]). Any path is looked at (from
+/// a descriptor too, which the walk starts from as the locked open's
+/// does), and only opens that the locked open would not refuse first: not
+/// one that must make the file (`O_CREAT|O_EXCL`), of a directory, of a
+/// link not to be followed, or of a FIFO the caller may not open so
+/// ([`fifo_to_wait_for`]).
 pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<(), i32> {
     use fwe_abi::fcntl as f;
     if flags & (f::O_NONBLOCK | f::O_PATH | f::O_DIRECTORY) != 0
@@ -3173,15 +3181,19 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         return Ok(());
     }
     let Ok(path) = crate::uaccess::read_cstr(path, crate::uaccess::PATH_MAX) else { return Ok(()) };
-    if path.is_empty() || path.first() != Some(&b'/') && dirfd as i64 != fcntl::AT_FDCWD {
+    if path.is_empty() {
         return Ok(());
     }
+    // A path the one-call lookups and the resolution handed on take:
+    // absolute or from the working directory (a descriptor's path is
+    // resolved here only to wait for a FIFO).
+    let placed = path.first() == Some(&b'/') || dirfd as i64 == fcntl::AT_FDCWD;
     let follow = flags & f::O_NOFOLLOW == 0;
     // A FIFO opened here to see what the path names stays open until the
     // FIFO's own ends are: a writer it let through never finds no reader.
     #[cfg(target_os = "macos")]
     let mut seen: Option<OwnedFd> = None;
-    let (resolved, key) = {
+    let (resolved, key, host_root) = {
         let view = published();
         let Some(v) = view.as_ref() else { return Ok(()) };
         let v = v.view();
@@ -3191,7 +3203,8 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         // handed to the locked open, which neither looks it up again nor
         // asks whether it is a FIFO first.
         #[cfg(target_os = "macos")]
-        if reads_only(flags)
+        if placed
+            && reads_only(flags)
             && !crate::reclocks::held()
             && let Some(mut d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path)
         {
@@ -3227,7 +3240,8 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         // In one host call where it finds what the walk would: no FIFO is
         // there to wait for.
         #[cfg(target_os = "macos")]
-        if !reads_only(flags)
+        if placed
+            && !reads_only(flags)
             && let Some(d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path)
         {
             // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
@@ -3244,12 +3258,16 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
                 return Ok(());
             }
         }
-        (resolve_in(&v, fcntl::AT_FDCWD as i32, &path, follow), ahead::Key::of(&v, &path, follow))
+        let key = placed.then(|| ahead::Key::of(&v, &path, follow));
+        (resolve_in(&v, dirfd, &path, follow), key, v.root_host == b"/")
     };
     let Ok(r) = resolved else { return Ok(()) };
-    // Not a FIFO to wait for: the locked open takes this resolution.
-    if !fifo_to_wait_for(&r, flags) {
-        ahead::put(key, r);
+    // Not a FIFO to wait for: the locked open takes this resolution (of a
+    // path it can tell again: absolute or from the working directory).
+    if !fifo_to_wait_for(&r, flags, host_root) {
+        if let Some(key) = key {
+            ahead::put(key, r);
+        }
         return Ok(());
     }
     let writes = flags & f::O_ACCMODE == f::O_WRONLY;

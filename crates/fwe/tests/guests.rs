@@ -7191,6 +7191,14 @@ fn mountinfo_device_numbers_match_stat() {
     assert_eq!(fsrules("mountinfo"), "root's numbers match stat: true\n");
 }
 
+/// A FIFO open that waits for the other end holds up no other thread of
+/// the process (it waits without fwe's lock): for a FIFO another user
+/// owns, one opened from a directory descriptor, one in an overlay.
+#[test]
+fn fifo_opens_wait_without_the_lock() {
+    assert_eq!(fsrules("fifo"), "another's: ok\nfrom a directory: ok\nin an overlay: ok\n");
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).
