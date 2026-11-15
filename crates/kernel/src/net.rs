@@ -895,9 +895,9 @@ fn take_socket_mode(fd: i32) -> Option<u32> {
 /// # Safety
 /// No pointer arguments.
 pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
-    const SOMAXCONN: i32 = 4096;
+    let max = crate::sysctl::somaxconn();
     let b = backlog as i32;
-    let b = if (0..=SOMAXCONN).contains(&b) { b } else { SOMAXCONN };
+    let b = if (0..=max).contains(&b) { b } else { max };
     // SAFETY: plain host call.
     ret(unsafe { libc::listen(fd as i32, b + 1) } as i64)
 }

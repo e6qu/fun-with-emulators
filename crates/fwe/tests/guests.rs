@@ -6383,3 +6383,44 @@ fn strace_file_follows_children() {
     assert_eq!(pids.len(), 2, "{pids:?}");
     assert!(trace.contains("setuid("), "the child's calls are there");
 }
+
+/// Run C guest `name` (built against glibc) as root in a glibc root
+/// filesystem with `/tmp`, with `args`: its output and status.
+fn run_c_guest(name: &str, args: &[&str]) -> Output {
+    let prog = build_c_dynamic(name, Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, name);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).args(args);
+    let out = run_bounded(cmd);
+    eprintln!("--- {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    out
+}
+
+/// Sysctls: the socket buffer limits are there, each user namespace has
+/// its own namespace limits (none until set), which creation is held to
+/// (`ENOSPC`), as it is to Linux's nesting depth, and `listen` holds its
+/// backlog to `net.core.somaxconn`.
+#[test]
+fn sysctls_limit_namespaces_and_listen() {
+    let out = run_c_guest("sysctls", &[]);
+    assert_eq!(
+        stdout(&out),
+        "/proc/sys/net/core/rmem_max: 212992\n\
+         /proc/sys/net/core/wmem_max: 212992\n\
+         /proc/sys/user/max_user_namespaces: 127414\n\
+         /proc/sys/kernel/random/poolsize: 256\n\
+         random is a directory: 1\n\
+         nested user namespaces: 33, then errno 28\n\
+         /proc/sys/user/max_user_namespaces: 2147483647\n\
+         set max_net_namespaces 0: 0\n\
+         new net namespace: 28\n\
+         set max_user_namespaces 1: 0\n\
+         first new user namespace: 0\n\
+         second new user namespace: 28\n\
+         /proc/sys/net/core/somaxconn: 1\n\
+         queued with somaxconn 1: few\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

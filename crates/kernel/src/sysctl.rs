@@ -28,6 +28,9 @@ struct Sysctl {
 enum Space {
     Net,
     Ipc,
+    /// A user namespace's limits (`user.max_*`): the initial one's with
+    /// the rest, another's in a record inside its own ([`user_limit`]).
+    User,
     /// The rest: fwe's own, every process's ([`Globals`]).
     Global,
 }
@@ -155,9 +158,23 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, u32::MAX as i64),
         space: Space::Net,
     },
+    // The most connections `listen` queues.
     Sysctl {
         path: b"net/core/somaxconn",
         default: "4096",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Net,
+    },
+    // The largest socket buffers `SO_RCVBUF` and `SO_SNDBUF` give.
+    Sysctl {
+        path: b"net/core/rmem_max",
+        default: "212992",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Net,
+    },
+    Sysctl {
+        path: b"net/core/wmem_max",
+        default: "212992",
         kind: Kind::Int(0, INT_MAX),
         space: Space::Net,
     },
@@ -334,10 +351,12 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, 1),
         space: Space::Global,
     },
+    // Kept, with no effect: the page cache is the host's, which only the
+    // host's root may drop.
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
     // Pipe buffer pages a user may hold before new pipes get the least
-    // (soft) or none (hard, 0: no limit): Linux's defaults. A privileged
-    // process (every root one) is not held to them.
+    // (soft) or none (hard, 0: no limit), at Linux's defaults. Kept, not
+    // enforced: a pipe is a host pipe, whose buffer the host sizes.
     Sysctl {
         path: b"fs/pipe-user-pages-soft",
         default: "16384",
@@ -363,6 +382,58 @@ const SYSCTLS: &[Sysctl] = &[
         default: "65530",
         kind: Kind::Int(0, INT_MAX),
         space: Space::Global,
+    },
+    // The most namespaces of each kind the user namespace and those below
+    // it may hold, which [`crate::ns::may_make`] holds new ones to: half
+    // of `kernel.threads-max` in the initial one, as on Linux, and no
+    // limit of its own in another until set.
+    Sysctl {
+        path: b"user/max_cgroup_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_ipc_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_mnt_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_net_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_pid_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_time_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_user_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_uts_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
     },
     Sysctl {
         path: b"fs/mqueue/queues_max",
@@ -412,8 +483,52 @@ fn value(i: usize) -> String {
         },
         Space::Ipc => crate::sysvipc::current().and_then(|r| r.get().sysctls.get(&name).cloned()),
         Space::Global => globals().and_then(|r| r.get().0.get(&name).cloned()),
+        Space::User => match crate::userns::chain().first() {
+            Some(u) => {
+                return limits_of(u.dir()).map_or_else(
+                    || INT_MAX.to_string(),
+                    |r| r.get().0.get(&name).cloned().unwrap_or_else(|| INT_MAX.to_string()),
+                );
+            }
+            None => globals().and_then(|r| r.get().0.get(&name).cloned()),
+        },
     };
     set.unwrap_or_else(|| SYSCTLS[i].default.to_string())
+}
+
+/// The limits set in the user namespace whose record is at `dir`: a
+/// record inside it, which lives as long as it does (kept open, one per
+/// namespace, for the process's life).
+fn limits_of(dir: &[u8]) -> Option<std::sync::Arc<crate::shared::Record<Globals>>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    type Open = Mutex<Option<HashMap<Vec<u8>, Arc<crate::shared::Record<Globals>>>>>;
+    static OPEN: Open = Mutex::new(None);
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let open = open.get_or_insert_with(HashMap::new);
+    if let Some(r) = open.get(dir) {
+        return Some(r.clone());
+    }
+    let r = Arc::new(crate::shared::Record::at([dir, b"/limits"].concat(), Globals::default).ok()?);
+    open.insert(dir.to_vec(), r.clone());
+    Some(r)
+}
+
+/// The limit `name` (`user/max_net_namespaces`) of the user namespace
+/// whose record is at `dir` (`None`: the initial one).
+pub fn user_limit(dir: Option<&[u8]>, name: &str) -> i64 {
+    let set = match dir {
+        Some(d) => {
+            limits_of(d).and_then(|r| r.get().0.get(name).cloned()).unwrap_or(INT_MAX.to_string())
+        }
+        None => globals()
+            .and_then(|r| r.get().0.get(name).cloned())
+            .or_else(|| {
+                SYSCTLS.iter().find(|s| s.path == name.as_bytes()).map(|s| s.default.into())
+            })
+            .unwrap_or_default(),
+    };
+    set.trim().parse().unwrap_or(INT_MAX)
 }
 
 /// Set the sysctl of no namespace at `path` (under `/proc/sys`) to
@@ -473,6 +588,8 @@ pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result
     let allowed = match SYSCTLS[i].space {
         Space::Net => creds.has(crate::caps::CAP_NET_ADMIN),
         Space::Ipc | Space::Global => creds.has(crate::caps::CAP_DAC_OVERRIDE),
+        // `CAP_SYS_RESOURCE` (in the namespace, as Linux checks it).
+        Space::User => creds.has(crate::caps::CAP_SYS_RESOURCE),
     };
     Some(if allowed { Ok(Mark::Sysctl(i as u8)) } else { Err(errno::EACCES) })
 }
@@ -547,8 +664,18 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
                 Ok(())
             })
         }
+        Space::User if !crate::userns::chain().is_empty() => {
+            let dir = crate::userns::chain()[0].dir().to_vec();
+            let Some(r) = limits_of(&dir) else {
+                return Some(fwe_abi::err(errno::ENOMEM));
+            };
+            r.update(|t| {
+                t.0.insert(name.clone(), kept.clone());
+                Ok(())
+            })
+        }
         // The initial network namespace's, with those of no namespace.
-        Space::Global | Space::Net => {
+        Space::Global | Space::Net | Space::User => {
             let Some(r) = globals() else {
                 return Some(fwe_abi::err(errno::ENOMEM));
             };
@@ -572,6 +699,12 @@ pub fn unprivileged_port_start() -> u16 {
         .unwrap_or(1024)
 }
 
+/// The most connections a `listen` in the process's network namespace
+/// queues (`net.core.somaxconn`).
+pub fn somaxconn() -> i32 {
+    number(b"net/core/somaxconn").map_or(4096, |n| n.clamp(0, INT_MAX) as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +719,11 @@ mod tests {
         assert_eq!(net, [b"ipv4".to_vec(), b"core".to_vec()]);
         assert!(children(b"/proc/sys").contains(&(b"net".to_vec(), true)));
         assert_eq!(unprivileged_port_start(), 1024);
+        assert_eq!(read(b"/proc/sys/net/core/rmem_max").unwrap(), b"212992\n");
+        assert_eq!(read(b"/proc/sys/user/max_user_namespaces").unwrap(), b"127414\n");
+        assert!(is_dir(b"/proc/sys/user"));
+        let user: Vec<_> = children(b"/proc/sys/user").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(user.len(), 8);
+        assert_eq!(somaxconn(), 4096);
     }
 }

@@ -107,6 +107,11 @@ fn current() -> Arc<Chain> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
+/// The process's user namespaces: its own first (none: the initial one).
+pub fn chain() -> Arc<Chain> {
+    current()
+}
+
 /// Whether the process is in a user namespace of fwe's.
 pub fn nested() -> bool {
     NESTED.load(std::sync::atomic::Ordering::SeqCst)

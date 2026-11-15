@@ -129,7 +129,10 @@ impl<P: Platform> Kernel<P> {
         // Owned by the user namespace it is made in, a new one included.
         if flags & CLONE_NEWNS != 0 {
             match fs.mount_ns().copy(&fs.ns.user_dir()) {
-                Ok(copy) => fs.set_mount_ns(Arc::new(copy)),
+                Ok(copy) => {
+                    crate::ns::set_owner(copy.dir(), fs.ns.user.as_deref());
+                    fs.set_mount_ns(Arc::new(copy))
+                }
                 Err(e) => return err(e),
             }
         }
@@ -150,7 +153,10 @@ impl<P: Platform> Kernel<P> {
             // For the children: the process itself stays where it is.
             let parent = fs.ns.pid_children.as_ref().map(|r| (r.dir().to_vec(), r.id()));
             match Record::fresh("pid", PidNs::new(parent)) {
-                Ok(r) => fs.ns.pid_children = Some(Arc::new(r)),
+                Ok(r) => {
+                    crate::ns::set_owner(r.dir(), fs.ns.user.as_deref());
+                    fs.ns.pid_children = Some(Arc::new(r))
+                }
                 Err(e) => return err(e),
             }
         }
@@ -343,14 +349,18 @@ impl<P: Platform> Kernel<P> {
         let base = fs.ns.pid_children.clone();
         let child_pid_ns = if new & CLONE_NEWPID != 0 {
             let parent = base.as_ref().map(|r| (r.dir().to_vec(), r.id()));
-            Some(Arc::new(Record::fresh("pid", PidNs::new(parent))?))
+            let r = Record::fresh("pid", PidNs::new(parent))?;
+            crate::ns::set_owner(r.dir(), ns.user.as_deref());
+            Some(Arc::new(r))
         } else {
             base
         };
         ns.pid = child_pid_ns.clone();
         ns.pid_children = child_pid_ns.clone();
         let mnt = if new & CLONE_NEWNS != 0 {
-            Some(Arc::new(fs.mount_ns().copy(&ns.user_dir())?))
+            let copy = fs.mount_ns().copy(&ns.user_dir())?;
+            crate::ns::set_owner(copy.dir(), ns.user.as_deref());
+            Some(Arc::new(copy))
         } else {
             None
         };

@@ -253,15 +253,8 @@ const DIRS: &[DirDef] = &[
     (b"/proc/self/fd", &[]),
     (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR), (b"fs", DT_DIR)]),
     (b"/proc/sysvipc", &[(b"shm", DT_REG), (b"sem", DT_REG), (b"msg", DT_REG)]),
-    (
-        b"/proc/sys/fs",
-        &[
-            (b"nr_open", DT_REG),
-            (b"file-max", DT_REG),
-            (b"pipe-max-size", DT_REG),
-            (b"lease-break-time", DT_REG),
-        ],
-    ),
+    // With the sysctls fwe keeps there ([`crate::sysctl::children`]).
+    (b"/proc/sys/fs", &[(b"file-max", DT_REG)]),
     (
         b"/proc/sys/kernel",
         &[
@@ -276,6 +269,16 @@ const DIRS: &[DirDef] = &[
             (b"threads-max", DT_REG),
             (b"domainname", DT_REG),
             (b"tainted", DT_REG),
+            (b"random", DT_DIR),
+        ],
+    ),
+    (
+        b"/proc/sys/kernel/random",
+        &[
+            (b"entropy_avail", DT_REG),
+            (b"poolsize", DT_REG),
+            (b"uuid", DT_REG),
+            (b"boot_id", DT_REG),
         ],
     ),
     (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
@@ -391,15 +394,16 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/sys/kernel/threads-max" => Entry::File(b"254828\n".to_vec()),
         // Nothing has tainted fwe's kernel.
         b"/proc/sys/kernel/tainted" => Entry::File(b"0\n".to_vec()),
-        b"/proc/sys/fs/lease-break-time" => Entry::File(b"45\n".to_vec()),
         // Linux's pool is full from boot.
         b"/proc/sys/kernel/random/entropy_avail" => Entry::File(b"256\n".to_vec()),
         b"/proc/sys/kernel/random/poolsize" => Entry::File(b"256\n".to_vec()),
+        // A new random UUID each read; one for as long as the host runs.
+        b"/proc/sys/kernel/random/uuid" => Entry::File(uuid_line(random_128())),
+        b"/proc/sys/kernel/random/boot_id" => Entry::File(uuid_line(boot_id())),
         // The kernel was given no command line.
         b"/proc/cmdline" => Entry::File(b"\n".to_vec()),
         b"/proc/config.gz" => Entry::File(config_gz()),
         b"/proc/sys/fs/file-max" => Entry::File(b"9223372036854775807\n".to_vec()),
-        b"/proc/sys/fs/pipe-max-size" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),
         b"/proc/sys/vm/mmap_min_addr" => Entry::File(b"65536\n".to_vec()),
         // No newline, as Linux writes it.
@@ -412,6 +416,36 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         p if is_dir(p) => Entry::Dir,
         _ => Entry::Missing,
     })
+}
+
+/// 128 random bits.
+fn random_128() -> u128 {
+    let mut b = [0u8; 16];
+    // SAFETY: `b` is a valid buffer of its length (at most 256 bytes).
+    unsafe { libc::getentropy(b.as_mut_ptr().cast(), b.len()) };
+    u128::from_ne_bytes(b)
+}
+
+/// The host's boot, as 128 bits: the same for every read until it
+/// restarts.
+fn boot_id() -> u128 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    // To the second: the uptime moves on as it is read.
+    let boot = ((now - crate::host::uptime()).max(0.0) as u64).to_le_bytes();
+    let a = crate::shared::hash(&[&boot[..], b"boot"].concat());
+    let b = crate::shared::hash(&[&boot[..], b"id"].concat());
+    u128::from(a) << 64 | u128::from(b)
+}
+
+/// `bits` as a version 4 UUID's text, with a newline.
+fn uuid_line(bits: u128) -> Vec<u8> {
+    let mut b = bits.to_be_bytes();
+    b[6] = b[6] & 0x0f | 0x40;
+    b[8] = b[8] & 0x3f | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}\n", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]).into_bytes()
 }
 
 fn line(bytes: &[u8]) -> Vec<u8> {
@@ -539,6 +573,31 @@ mod tests {
         assert!(
             matches!(lookup(b"/sys/devices/system/cpu/online", &info), Some(Entry::File(c)) if c == b"0-3\n")
         );
+    }
+
+    /// `/proc/sys/kernel/random` is a directory; `uuid` differs at each
+    /// read, `boot_id` does not.
+    #[test]
+    fn random_directory() {
+        let info = info();
+        assert!(matches!(lookup(b"/proc/sys/kernel/random", &info), Some(Entry::Dir)));
+        let names: Vec<_> =
+            children(b"/proc/sys/kernel/random").unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&b"boot_id".to_vec()) && names.contains(&b"uuid".to_vec()));
+        let read = |p: &[u8]| match lookup(p, &info) {
+            Some(Entry::File(c)) => c,
+            _ => panic!(),
+        };
+        let u = read(b"/proc/sys/kernel/random/uuid");
+        assert_eq!(u.len(), 37);
+        assert_eq!(u[14], b'4');
+        assert_ne!(u, read(b"/proc/sys/kernel/random/uuid"));
+        assert_eq!(
+            read(b"/proc/sys/kernel/random/boot_id"),
+            read(b"/proc/sys/kernel/random/boot_id")
+        );
+        let fs: Vec<_> = children(b"/proc/sys/fs").unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(fs.contains(&b"pipe-max-size".to_vec()) && fs.contains(&b"file-max".to_vec()));
     }
 
     #[test]

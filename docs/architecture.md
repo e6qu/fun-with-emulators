@@ -865,13 +865,23 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `sysvipc/{shm,sem,msg}`, and under `/proc/sys`: `kernel/{ostype,
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
   overflowuid,overflowgid,threads-max,tainted}`,
-  `kernel/random/{entropy_avail,poolsize}`, `fs/{nr_open,file-max,
-  pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,lease-break-time,
-  protected_symlinks,protected_hardlinks}`, `fs/inotify/*`, `fs/mqueue/*`,
+  `kernel/random/{entropy_avail,poolsize,uuid,boot_id}`, `fs/{nr_open,
+  file-max,pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,
+  lease-break-time,protected_symlinks,protected_hardlinks}`,
+  `fs/inotify/*`, `fs/mqueue/*`,
   `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
-  `kernel/keys/*`, the IPC limits and a network namespace's sysctls
+  `kernel/keys/*`, `user/max_*_namespaces`, the IPC limits and a network
+  namespace's sysctls, `net/core/{somaxconn,rmem_max,wmem_max}` among them
   (`crates/kernel/src/sysctl.rs`). `fs.nr_open` bounds `RLIMIT_NOFILE`
-  and the copy of a shared descriptor table `unshare(CLONE_FILES)` makes.
+  and the copy of a shared descriptor table `unshare(CLONE_FILES)` makes;
+  `somaxconn` caps `listen`'s backlog, `rmem_max`/`wmem_max` the socket
+  buffers. The `user/max_*_namespaces` limits are each user namespace's
+  own (no limit in a new one until set, Linux's in the initial one): a
+  new namespace counts against its maker's user namespace and each above
+  it, and one past a limit, or a user namespace nested more than 32 deep,
+  fails with `ENOSPC` (`crates/kernel/src/ns.rs`). `vm.drop_caches` and
+  `fs.pipe-user-pages-*` are kept and read back: the page cache and the
+  pipe buffers are the host's.
 - `/sys`: `fs/cgroup` (a mount point), `devices/system/cpu/{online,possible}`
   and the loop devices' `block`, `dev/block` and `devices/virtual/block`
   entries.
@@ -1179,8 +1189,7 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   of the range; `ioprio_set` checks and keeps the caller's I/O priority,
   which nothing applies.
 - `sysinfo` reports the host's uptime and load with the fixed memory
-  figures of `/proc/meminfo`; `vm.drop_caches` accepts Linux's values and
-  drops nothing.
+  figures of `/proc/meminfo`.
 
 ## Known limitations
 
