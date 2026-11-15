@@ -1253,6 +1253,10 @@ impl<P: Platform> Kernel<P> {
             if unsafe { libc::fcntl(fd as i32, libc::F_GETFD) } < 0 {
                 return err(errno::EBADF);
             }
+            // Huge pages are a hugetlbfs file's, which no file here is.
+            if flags & mman::MAP_HUGETLB != 0 {
+                return err(errno::EINVAL);
+            }
             // `MAP_SHARED_VALIDATE`: a flag past Linux's legacy ones (and
             // its huge-page size bits) is one no file here supports, not
             // even `MAP_SYNC`, which needs DAX.
@@ -1272,6 +1276,25 @@ impl<P: Platform> Kernel<P> {
                 | 0x3f << 26;
             if flags & mman::MAP_TYPE == mman::MAP_SHARED_VALIDATE && flags & !LEGACY != 0 {
                 return err(errno::EOPNOTSUPP);
+            }
+        }
+        // Anonymous huge pages: of a size the hardware has (`EINVAL`), and
+        // reserved from the pool, which is empty (`vm.nr_hugepages` is 0:
+        // fwe has no huge pages to give), so `ENOMEM` unless the mapping
+        // reserves none (`MAP_NORESERVE`), when it is made of ordinary
+        // pages.
+        if flags & mman::MAP_HUGETLB != 0 && flags & mman::MAP_ANONYMOUS != 0 {
+            if !huge_page_size_known(flags >> mman::MAP_HUGE_SHIFT) {
+                return err(errno::EINVAL);
+            }
+            // (After the checks of the rest, which an empty length or an
+            // unknown type fails first.)
+            let typed = matches!(
+                flags & mman::MAP_TYPE,
+                mman::MAP_PRIVATE | mman::MAP_SHARED | mman::MAP_SHARED_VALIDATE
+            );
+            if flags & mman::MAP_NORESERVE == 0 && len != 0 && typed {
+                return err(errno::ENOMEM);
             }
         }
         // No more mappings than `vm.max_map_count` allows.
@@ -1825,6 +1848,29 @@ fn wire(start: u64, len: u64, on: bool) -> bool {
         all &= r == 0;
     }
     all
+}
+
+/// Whether `log` (the bits of a `MAP_HUGE_*` or `SHM_HUGE_*` size, the
+/// size's log2; 0 for the default) names a huge page size arm64 with 4K
+/// pages has: 64K, 2M (the default), 32M or 1G (Linux's
+/// `hstate_sizelog`).
+pub fn huge_page_size_known(log: u64) -> bool {
+    matches!(log & 0x3f, 0 | 16 | 21 | 25 | 30)
+}
+
+/// Wire (`on`) or unwire this process's attachments of System V segment
+/// `id`, as `SHM_LOCK` keeps a segment's pages in memory ([`wire`]).
+pub(crate) fn wire_segment(id: i32, on: bool) {
+    let ranges: Vec<(u64, u64)> = crate::sysvipc::ATTACHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, v)| v.0 == id)
+        .map(|(&a, &(_, n))| (a, n))
+        .collect();
+    for (addr, len) in ranges {
+        wire(addr, len, on);
+    }
 }
 
 /// Bring the accessible pages of guest memory `[start, start + len)` in,
@@ -2508,7 +2554,8 @@ impl<P: Platform> Kernel<P> {
     /// `madvise`'s arguments, checked as Linux checks them: advice it
     /// knows (no `MADV_MERGEABLE` without KSM), an aligned start, a range
     /// that does not wrap (`EINVAL`); then each mapping in the range for the
-    /// advice: discarding locked memory, freeing or wiping on fork memory
+    /// advice: discarding, deactivating or paging out locked memory,
+    /// freeing or wiping on fork memory
     /// that is not private and anonymous, removing pages of what is not a
     /// shared file (`EINVAL`). `None` for an empty range (nothing to do),
     /// else whether the range has a hole, which fails the call (`ENOMEM`)
@@ -2539,6 +2586,9 @@ impl<P: Platform> Kernel<P> {
                 // not locked memory.
                 4 | 8 | 9 if a.locked => true,
                 mman::MADV_GUARD_INSTALL if a.locked => true,
+                // MADV_COLD, MADV_PAGEOUT: not locked memory, which stays
+                // resident (Linux's `can_madv_lru_vma`).
+                20 | 21 if a.locked => true,
                 8 | 18 => !anonymous,
                 // MADV_REMOVE: a file's pages (shared anonymous memory is
                 // one too, as Linux's shmem).

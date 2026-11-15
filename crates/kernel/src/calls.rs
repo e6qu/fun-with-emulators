@@ -330,14 +330,18 @@ impl<P: Platform> Kernel<P> {
             let Some(end) = end.filter(|_| addr % page == 0) else {
                 return if done > 0 { done as i64 } else { err(errno::EINVAL) };
             };
-            // Every page of the range mapped, else `ENOMEM` for it.
+            // Every page of the range mapped, else `ENOMEM` for it; none
+            // locked for `MADV_COLD` or `MADV_PAGEOUT` (`EINVAL`).
             let mut at = addr;
+            let mut hole = false;
             for p in view.areas.iter().filter(|p| p.end > addr && p.start < end) {
-                if p.start > at {
-                    break;
+                if p.value.locked && matches!(advice, 20 | 21) {
+                    return if done > 0 { done as i64 } else { err(errno::EINVAL) };
                 }
+                hole |= p.start > at;
                 at = at.max(p.end);
             }
+            let at = if hole { addr } else { at };
             if at < end {
                 return if done > 0 { done as i64 } else { err(errno::ENOMEM) };
             }

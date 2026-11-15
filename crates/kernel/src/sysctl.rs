@@ -118,6 +118,10 @@ enum Kind {
     Range,
     /// One unsigned 64-bit integer (`kernel.shmmax`).
     U64,
+    /// The huge page pool's size (`vm.nr_hugepages`): a count asked for,
+    /// of which the pool gets what can be allocated, which with fwe is
+    /// none, so it stays 0.
+    Pool,
     /// Integers, as many as given, each in a range (`kernel.sem`: four).
     Ints(usize, i64, i64),
     /// A line of text, up to the length given (with its NUL), the rest of
@@ -385,6 +389,17 @@ const SYSCTLS: &[Sysctl] = &[
     // Kept, with no effect: the page cache is the host's, which only the
     // host's root may drop.
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
+    // The huge page pool, empty: fwe has no huge pages to give, so a size
+    // asked for gets none, as on a Linux that cannot allocate them; and
+    // the group (beside `CAP_IPC_LOCK`) whose members may make
+    // `SHM_HUGETLB` segments.
+    Sysctl { path: b"vm/nr_hugepages", default: "0", kind: Kind::Pool, space: Space::Global },
+    Sysctl {
+        path: b"vm/hugetlb_shm_group",
+        default: "0",
+        kind: Kind::Int(i32::MIN as i64, INT_MAX),
+        space: Space::Global,
+    },
     // Pipe buffer pages a user may hold before new pipes get the least
     // (soft) or none (hard, 0: no limit), at Linux's defaults. Kept, not
     // enforced: a pipe is a host pipe, whose buffer the host sizes.
@@ -660,12 +675,9 @@ pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     write_value(fd, &data[..data.len().min(256)], len)
 }
 
-/// Keep `data`, written to sysctl descriptor `fd` (`len` bytes in all).
-fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
-    let Some(Mark::Sysctl(i)) = fdmarks::marked(fd) else { return None };
-    let s = SYSCTLS.get(i as usize)?;
-    let text = String::from_utf8_lossy(data);
-    let kept = if let Kind::Text(max) = s.kind {
+/// What sysctl `s` keeps of `text` written to it, or why it refuses it.
+fn parse(s: &Sysctl, text: &str) -> Result<String, i32> {
+    Ok(if let Kind::Text(max) = s.kind {
         // The first line, as much of it as fits.
         let line = text.split('\n').next().unwrap_or("");
         let mut end = line.len().min(max - 1);
@@ -673,28 +685,33 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
             end -= 1;
         }
         line[..end].to_string()
+    } else if let Kind::Pool = s.kind {
+        match text.trim().parse::<u64>() {
+            Ok(_) => "0".to_string(),
+            Err(_) => return Err(errno::EINVAL),
+        }
     } else if let Kind::U64 = s.kind {
         match text.trim().parse::<u64>() {
             Ok(v) => v.to_string(),
-            Err(_) => return Some(fwe_abi::err(errno::EINVAL)),
+            Err(_) => return Err(errno::EINVAL),
         }
     } else {
         let words: Vec<i64> = match text.split_whitespace().map(str::parse::<i64>).collect() {
             Ok(w) => w,
-            Err(_) => return Some(fwe_abi::err(errno::EINVAL)),
+            Err(_) => return Err(errno::EINVAL),
         };
         match (s.kind, &words[..]) {
             // Yama's scope 3 is for good.
             (Kind::Int(..), [v])
                 if s.path == YAMA_SCOPE && *v != 3 && number(YAMA_SCOPE) == Some(3) =>
             {
-                return Some(fwe_abi::err(errno::EINVAL));
+                return Err(errno::EINVAL);
             }
             // So is BPF's 1.
             (Kind::Int(..), [v])
                 if s.path == BPF_DISABLED && *v != 1 && number(BPF_DISABLED) == Some(1) =>
             {
-                return Some(fwe_abi::err(errno::EPERM));
+                return Err(errno::EPERM);
             }
             (Kind::Int(lo, hi), [v]) if (lo..=hi).contains(v) => v.to_string(),
             // A range of valid ids; a backwards one is taken as none
@@ -713,8 +730,19 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
             {
                 w.iter().map(i64::to_string).collect::<Vec<_>>().join("\t")
             }
-            _ => return Some(fwe_abi::err(errno::EINVAL)),
+            _ => return Err(errno::EINVAL),
         }
+    })
+}
+
+/// Keep `data`, written to sysctl descriptor `fd` (`len` bytes in all).
+fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
+    let Some(Mark::Sysctl(i)) = fdmarks::marked(fd) else { return None };
+    let s = SYSCTLS.get(i as usize)?;
+    let text = String::from_utf8_lossy(data);
+    let kept = match parse(s, &text) {
+        Ok(k) => k,
+        Err(e) => return Some(fwe_abi::err(e)),
     };
     let name = String::from_utf8_lossy(s.path).into_owned();
     if s.space == Space::Pid {
@@ -820,6 +848,17 @@ mod tests {
         assert!(last >= crate::host::pid());
         assert_eq!(set_last_pid(100), Err(errno::EPERM));
         assert!(children(b"/proc/sys/kernel").iter().any(|(n, _)| n == b"ns_last_pid"));
+    }
+
+    /// The huge page pool takes any count and gets none: it stays 0.
+    #[test]
+    fn the_huge_page_pool_stays_empty() {
+        let pool = &SYSCTLS[index(b"/proc/sys/vm/nr_hugepages").unwrap()];
+        assert_eq!(read(b"/proc/sys/vm/nr_hugepages").unwrap(), b"0\n");
+        assert_eq!(parse(pool, "16\n"), Ok("0".to_string()));
+        assert_eq!(parse(pool, "-1"), Err(errno::EINVAL));
+        assert_eq!(parse(pool, "x"), Err(errno::EINVAL));
+        assert_eq!(read(b"/proc/sys/vm/hugetlb_shm_group").unwrap(), b"0\n");
     }
 
     #[test]

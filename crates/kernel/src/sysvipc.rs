@@ -41,6 +41,10 @@ pub const SHM_INFO: u64 = 14;
 pub const SHM_STAT_ANY: u64 = 15;
 pub const SHM_RDONLY: u64 = 0o10000;
 pub const SHM_HUGETLB: u64 = 0o4000;
+/// Reserve no huge pages (with `SHM_HUGETLB`).
+pub const SHM_NORESERVE: u64 = 0o10000;
+/// Where a `SHM_HUGETLB` segment's page size (its log2) starts.
+pub const SHM_HUGE_SHIFT: u64 = 26;
 pub const SHM_RND: u64 = 0o20000;
 pub const SHM_REMAP: u64 = 0o40000;
 pub const SHM_EXEC: u64 = 0o100000;
@@ -134,7 +138,10 @@ pub struct Shm {
     pub dtime: i64,
     /// Attachments, by process.
     pub attached: Vec<(Proc, u32)>,
-    pub locked: bool,
+    /// Locked (`SHM_LOCK`): the user (effective id) its pages are charged
+    /// to, against that user's `RLIMIT_MEMLOCK`, as Linux's
+    /// `user_shm_lock` charges them.
+    pub locked: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -369,7 +376,8 @@ fn put_obj(e: &mut Enc, id: i32, o: &Obj) {
             e.i32(s.lpid);
             e.u64(s.atime as u64);
             e.u64(s.dtime as u64);
-            e.bool(s.locked);
+            e.bool(s.locked.is_some());
+            e.u32(s.locked.unwrap_or(0));
             e.u64(s.attached.len() as u64);
             for &(p, n) in &s.attached {
                 put_proc(e, p);
@@ -420,8 +428,10 @@ fn get_obj(d: &mut Dec) -> (i32, Obj) {
     let (id, key, perm, ctime, removed) = (d.i32(), d.i32(), get_perm(d), d.u64() as i64, d.bool());
     let body = match d.u8() {
         0 => {
-            let (size, cpid, lpid, atime, dtime, locked) =
-                (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64, d.bool());
+            let (size, cpid, lpid, atime, dtime) =
+                (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64);
+            let locked = (d.bool(), d.u32());
+            let locked = locked.0.then_some(locked.1);
             let n = d.count(16);
             let attached = (0..n).map(|_| (get_proc(d), d.u32())).collect();
             Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked })
@@ -1012,7 +1022,7 @@ pub fn shmid_ds(o: &Obj, id: i32) -> Vec<u8> {
     if o.removed {
         perm.mode |= SHM_DEST;
     }
-    if s.locked {
+    if s.locked.is_some() {
         perm.mode |= SHM_LOCKED;
     }
     write_perm(&mut b, o.key, &perm, id);

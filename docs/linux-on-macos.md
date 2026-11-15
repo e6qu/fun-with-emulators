@@ -1300,7 +1300,7 @@ namespace's records last until the host reboots
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `shmget`, `shmat`, `shmdt`, `shmctl` | a segment's state in the namespace's record, its memory a file beside it; `shmat` maps the file shared, listed in `/proc/<pid>/maps` as `/SYSV<key> (deleted)`; `SHM_HUGETLB` refused (`EINVAL`) | `open`, `ftruncate`, `mmap`, `unlink` |
+| `shmget`, `shmat`, `shmdt`, `shmctl` | a segment's state in the namespace's record, its memory a file beside it; `shmat` maps the file shared, listed in `/proc/<pid>/maps` as `/SYSV<key> (deleted)`; `SHM_LOCK` charges the segment to the locker's `RLIMIT_MEMLOCK` and wires each attachment; `SHM_HUGETLB` finds no huge pages (`ENOMEM`; `SHM_NORESERVE` gets ordinary pages) | `open`, `ftruncate`, `mmap`, `unlink` |
 | `semget`, `semctl`, `semop`, `semtimedop` | values and `SEM_UNDO` adjustments in the record; a `semop` applies all its operations or none; waits run without the kernel lock | `flock`, `__ulock_wait2`, `__ulock_wake` |
 | `msgget`, `msgctl`, `msgsnd`, `msgrcv` | messages in the record; waits as for semaphores | as above |
 | `kernel.msg_next_id`, `sem_next_id`, `shm_next_id` | the id the next object of the kind gets in the IPC namespace, used once | none |
@@ -2428,11 +2428,12 @@ where fwe falls short of Linux in detail is in
 | `mseal` | **enforced** | `EPERM` for changes to sealed memory |
 | `memfd_secret` | **refused** | `ENOSYS`, as without `CONFIG_SECRETMEM` |
 | `mlock`, `mlock2`, `mlockall` | **enforced** | pages read in and wired on the host as far as it lets a user; `MLOCK_ONFAULT` wires nothing |
+| Huge pages (`MAP_HUGETLB`, `SHM_HUGETLB`, `vm.nr_hugepages`) | **refused** | the pool is empty and stays so (`vm.nr_hugepages` takes a count and keeps 0; `/proc/meminfo` shows none): a mapping or segment that reserves them `ENOMEM`, an unknown size `EINVAL`, `MAP_HUGETLB` of a file `EINVAL`; one that reserves none (`MAP_NORESERVE`, `SHM_NORESERVE`) gets ordinary pages, where Linux would fault on first touch |
 | `MADV_NORMAL`, `RANDOM`, `SEQUENTIAL`, `WILLNEED`, `FREE` | **host** natively; VM **ignored** | hints given to the host ([The mmap family](#the-mmap-family)) |
 | `MADV_DONTNEED`, `DONTNEED_LOCKED` | **emulated** | private memory reads as zero or the file again; natively a private file mapping keeps modified pages |
 | `MADV_REMOVE` | **emulated** natively; VM **ignored** | pages zeroed in place, the file's blocks not freed |
 | `MADV_DONTFORK`, `WIPEONFORK`, `DONTDUMP`, `GUARD_INSTALL`, `HWPOISON` (and their inverses) | **emulated** natively; VM **ignored** | as Linux; `HWPOISON` needs `CAP_SYS_ADMIN` |
-| `MADV_HUGEPAGE`, `NOHUGEPAGE`, `COLD`, `PAGEOUT`, `POPULATE_READ`, `POPULATE_WRITE`, `COLLAPSE`, `SOFT_OFFLINE` | **ignored** | checked, nothing done |
+| `MADV_HUGEPAGE`, `NOHUGEPAGE`, `COLD`, `PAGEOUT`, `POPULATE_READ`, `POPULATE_WRITE`, `COLLAPSE`, `SOFT_OFFLINE` | **ignored** | checked, nothing done; `COLD` and `PAGEOUT` of locked memory `EINVAL` |
 | Clocks | **host** | the host's realtime and monotonic clocks; `MONOTONIC` counts time asleep, as `BOOTTIME` does; CPU-time clocks of any process ([Time calls](#time-calls)) |
 | Setting the clock (`clock_settime`, `settimeofday`, `adjtimex`) | **refused** | `EPERM` after Linux's checks: no process holds `CAP_SYS_TIME` |
 | Time namespaces | **refused** | `CLONE_NEWTIME` `EINVAL`, as without `CONFIG_TIME_NS` |
@@ -2536,7 +2537,7 @@ where fwe falls short of Linux in detail is in
 | Addresses, routes, veth, bridges, macvlan, `/dev/net/tun` | **refused** | `EOPNOTSUPP`, `ENODEV`, `ENOENT`/`ENXIO` ([roadmap](../ROADMAP.md#m8--virtual-networking)) |
 | iptables, nftables | **refused** | `ENOPROTOOPT`, `EPROTONOSUPPORT`, as without netfilter |
 | Network sysctls | **enforced** | `ip_unprivileged_port_start`, `ping_group_range`, `somaxconn`, `rmem_max`, `wmem_max` per namespace, the initial one's fwe's own copy; `ip_forward` **kept**; others `ENOENT` |
-| System V shared memory, semaphores, messages | **emulated** | fwe's per IPC namespace, not macOS's; permissions and limits **enforced**; `SHM_LOCK` **kept**; `SHM_HUGETLB` `EINVAL` ([Other IPC calls](#other-ipc-calls)) |
+| System V shared memory, semaphores, messages | **emulated** | fwe's per IPC namespace, not macOS's; permissions and limits **enforced**; `SHM_LOCK` **enforced** (charged to the locker's `RLIMIT_MEMLOCK` within the IPC namespace, attachments wired on the host as far as it lets a user); `SHM_HUGETLB` as huge pages below ([Other IPC calls](#other-ipc-calls)) |
 | POSIX message queues | **emulated** | per IPC namespace; permissions and limits **enforced**; `poll` always ready |
 
 ### Namespaces and cgroups

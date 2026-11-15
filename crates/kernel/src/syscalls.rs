@@ -4792,6 +4792,58 @@ mod tests {
         }
     }
 
+    /// Anonymous huge pages come from the pool, which is empty
+    /// (`ENOMEM`), unless the mapping reserves none; a size the hardware
+    /// lacks is `EINVAL`, and so is a file that is not hugetlbfs's.
+    #[test]
+    fn huge_pages_are_none_to_reserve() {
+        let _mapping = mapping_lock();
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let (anon, rw, len) = (MAP_PRIVATE | MAP_ANONYMOUS, PROT_READ | PROT_WRITE, 2u64 << 20);
+        let huge = anon | MAP_HUGETLB;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, huge, u64::MAX, 0]), err(errno::ENOMEM));
+        let shared = MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, shared, u64::MAX, 0]), err(errno::ENOMEM));
+        let sized = huge | 30 << MAP_HUGE_SHIFT;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, sized, u64::MAX, 0]), err(errno::ENOMEM));
+        let odd = huge | 20 << MAP_HUGE_SHIFT;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, odd, u64::MAX, 0]), err(errno::EINVAL));
+        assert_eq!(k.syscall(nr::MMAP, [0, 0, rw, huge, u64::MAX, 0]), err(errno::EINVAL));
+        let p = k.syscall(nr::MMAP, [0, len, rw, huge | MAP_NORESERVE, u64::MAX, 0]);
+        assert!(p > 0, "{p}");
+        assert_eq!(k.syscall(nr::MUNMAP, [p as u64, len, 0, 0, 0, 0]), 0);
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f) as u64;
+        let file = MAP_PRIVATE | MAP_HUGETLB;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, PROT_READ, file, fd, 0]), err(errno::EINVAL));
+    }
+
+    /// `MADV_COLD` and `MADV_PAGEOUT` refuse locked memory (`EINVAL`),
+    /// which stays resident, and take any other.
+    #[test]
+    fn locked_memory_is_not_paged_out() {
+        let _mapping = mapping_lock();
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let page = k.page_size;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let p = k.syscall(nr::MMAP, [0, 2 * page, PROT_READ | PROT_WRITE, anon, u64::MAX, 0]);
+        let p = p as u64;
+        for advice in [20, 21] {
+            assert_eq!(k.syscall(nr::MADVISE, [p, 2 * page, advice, 0, 0, 0]), 0);
+        }
+        assert_eq!(k.syscall(nr::MLOCK, [p + page, page, 0, 0, 0, 0]), 0);
+        for advice in [20, 21] {
+            assert_eq!(k.syscall(nr::MADVISE, [p, page, advice, 0, 0, 0]), 0);
+            let r = k.syscall(nr::MADVISE, [p, 2 * page, advice, 0, 0, 0]);
+            assert_eq!(r, err(errno::EINVAL));
+        }
+        assert_eq!(k.syscall(nr::MUNLOCK, [p + page, page, 0, 0, 0, 0]), 0);
+        assert_eq!(k.syscall(nr::MADVISE, [p, 2 * page, 21, 0, 0, 0]), 0);
+        assert_eq!(k.syscall(nr::MUNMAP, [p, 2 * page, 0, 0, 0, 0]), 0);
+    }
+
     /// `mremap`: checked as Linux checks it; a range grows in place with
     /// its contents, or moves with them (`MREMAP_MAYMOVE`, or to a place
     /// asked for with `MREMAP_FIXED`), the grown part zero.

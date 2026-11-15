@@ -338,7 +338,8 @@ so programs that probe for them fall back.
   its loop devices hold no filesystem.
 - **Swap, huge pages and memory error injection** (but `MADV_HWPOISON`,
   which natively makes the pages fault): the host manages memory;
-  `swapon` fails with `ENOSYS`, as on a kernel without swap.
+  `swapon` fails with `ENOSYS`, as on a kernel without swap, and the huge
+  page pool is empty (`ENOMEM` for what reserves from it).
 - **cgroup resource limits but `pids.max`** (memory, CPU, I/O): accepted,
   not enforced; the host shares its resources alike.
 - **Per-process I/O counts** (`/proc/<pid>/io`'s `rchar`, `syscr` and

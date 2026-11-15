@@ -1662,8 +1662,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 
 **IPC and keys**
 - System V: `SHM_INFO` reports no resident pages; a segment stays
-  attached in a VM fork child without being counted for it; `SHM_HUGETLB`
-  is refused.
+  attached in a VM fork child without being counted for it; `SHM_LOCK`
+  charges a user's locked segments within the IPC namespace, not across
+  namespaces as Linux's per-user count does, and wires an attachment
+  made later only in the process attaching.
+- Huge pages: there are none (`vm.nr_hugepages` stays 0), so what
+  reserves them fails; a `MAP_HUGETLB` or `SHM_HUGETLB` request that
+  reserves none gets ordinary pages, where Linux would fault on first
+  touch.
 - POSIX message queues: `poll`, `select` and `epoll` see a queue's
   descriptor as always ready; a queue's file in `/dev/mqueue` is read, not
   opened as the queue or removed; a guest `flock` of a queue descriptor is

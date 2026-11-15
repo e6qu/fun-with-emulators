@@ -202,6 +202,8 @@ pub mod mman {
     pub const MAP_EXECUTABLE: u64 = 0x1000;
     pub const MAP_LOCKED: u64 = 0x2000;
     pub const MAP_NORESERVE: u64 = 0x4000;
+    /// Where a `MAP_HUGETLB` mapping's page size (its log2) starts.
+    pub const MAP_HUGE_SHIFT: u64 = 26;
     pub const MAP_POPULATE: u64 = 0x8000;
     pub const MAP_NONBLOCK: u64 = 0x10000;
     pub const MAP_STACK: u64 = 0x20000;

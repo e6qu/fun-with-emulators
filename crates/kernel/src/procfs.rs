@@ -649,13 +649,16 @@ fn meminfo() -> Vec<u8> {
         ("Shmem", 0),
         ("HugePages_Total", 0),
         ("HugePages_Free", 0),
+        ("HugePages_Rsvd", 0),
+        ("HugePages_Surp", 0),
     ];
     let mut out = String::new();
     for (name, v) in lines {
         let unit = if name.starts_with("HugePages") { "" } else { " kB" };
         out.push_str(&format!("{:<16}{v:>8}{unit}\n", format!("{name}:")));
     }
-    out.push_str("Hugepagesize:       2048 kB\n");
+    // The huge page pool: empty (`vm.nr_hugepages`).
+    out.push_str("Hugepagesize:       2048 kB\nHugetlb:               0 kB\n");
     out.into_bytes()
 }
 

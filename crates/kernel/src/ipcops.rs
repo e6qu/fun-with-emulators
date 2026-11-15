@@ -114,6 +114,7 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_shmget(&mut self, key: u64, size: u64, flags: u64) -> i64 {
         let me = crate::host::pid();
+        let creds = self.creds.clone();
         self.ipc_get(
             Kind::Shm,
             key as i32,
@@ -124,9 +125,7 @@ impl<P: Platform> Kernel<P> {
                 _ => Ok(()),
             },
             |t| {
-                // Huge pages: fwe has no hugetlbfs (nor says so in its
-                // config), which Linux without one refuses so.
-                if flags & ipc::SHM_HUGETLB != 0 || !(ipc::SHMMIN..=t.shmmax()).contains(&size) {
+                if !(ipc::SHMMIN..=t.shmmax()).contains(&size) {
                     return Err(errno::EINVAL);
                 }
                 // `kernel.shmall`: the pages of every segment together.
@@ -140,6 +139,9 @@ impl<P: Platform> Kernel<P> {
                     .sum();
                 if pages.saturating_add(size.div_ceil(4096)) > t.shmall() {
                     return Err(errno::ENOSPC);
+                }
+                if flags & ipc::SHM_HUGETLB != 0 {
+                    huge_segment(flags, &creds)?;
                 }
                 Ok(Body::Shm(ipc::Shm { size, cpid: me, ..ipc::Shm::default() }))
             },
@@ -225,6 +227,7 @@ impl<P: Platform> Kernel<P> {
         }
         let size = (s.size + self.page_size - 1) & !(self.page_size - 1);
         let key = o.key;
+        let locked = s.locked.is_some();
         drop(t);
         let mut at = addr;
         if at & (ipc::SHMLBA - 1) != 0 {
@@ -279,6 +282,10 @@ impl<P: Platform> Kernel<P> {
         crate::maps::publish();
         let me = ipc::me();
         ipc::note_attached(mapped as u64, id, size);
+        // A locked segment's pages are kept in memory.
+        if locked {
+            crate::mm::wire_segment(id, true);
+        }
         let _ = r.update(|t| {
             ipc::attach_count(t, id, me, 1);
             if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {
@@ -455,20 +462,16 @@ impl<P: Platform> Kernel<P> {
                     Ok(r) => r,
                     Err(e) => return err(e),
                 };
+                let lock = cmd == ipc::SHM_LOCK;
                 let creds = self.creds.clone();
-                match r.update(|t| {
-                    let o = t.get(Kind::Shm, id)?;
-                    if !creds.has_in(&ipc::owner(), crate::caps::CAP_IPC_LOCK)
-                        && !ipc::owns(&creds, &o.perm)
-                    {
-                        return Err(errno::EPERM);
+                let limit = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
+                match r.update(|t| shm_lock(t, id, lock, &creds, limit)) {
+                    Ok(()) => {
+                        // This process's attachments wired, or unwired; the
+                        // others' are as they attach.
+                        crate::mm::wire_segment(id, lock);
+                        0
                     }
-                    if let Body::Shm(s) = &mut o.body {
-                        s.locked = cmd == ipc::SHM_LOCK;
-                    }
-                    Ok(())
-                }) {
-                    Ok(()) => 0,
                     Err(e) => err(e),
                 }
             }
@@ -989,6 +992,82 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// A `SHM_HUGETLB` segment asked with `flags` by a caller with `creds`,
+/// as Linux's `newseg` and `hugetlb_file_setup` take it: a huge page size
+/// the hardware has (`EINVAL`), a caller with `CAP_IPC_LOCK` or in group
+/// `vm.hugetlb_shm_group` (`EPERM`), and the segment's huge pages
+/// reserved from the pool, which is empty (`vm.nr_hugepages` is 0), so
+/// `ENOMEM` unless it reserves none (`SHM_NORESERVE`), when it is made of
+/// ordinary pages.
+fn huge_segment(flags: u64, creds: &crate::creds::Creds) -> Result<(), i32> {
+    if !crate::mm::huge_page_size_known(flags >> ipc::SHM_HUGE_SHIFT) {
+        return Err(errno::EINVAL);
+    }
+    let group = crate::sysctl::number(b"vm/hugetlb_shm_group").unwrap_or(0) as u32;
+    let in_group = creds.fsgid == group || creds.groups().contains(&group);
+    if !creds.has(crate::caps::CAP_IPC_LOCK) && !in_group {
+        return Err(errno::EPERM);
+    }
+    if flags & ipc::SHM_NORESERVE == 0 {
+        return Err(errno::ENOMEM);
+    }
+    Ok(())
+}
+
+/// `SHM_LOCK` (`lock`) or `SHM_UNLOCK` of segment `id` in table `t` by a
+/// caller with `creds` and a `RLIMIT_MEMLOCK` of `limit`, as Linux's
+/// `shmctl_do_lock`: without `CAP_IPC_LOCK` in the user namespace owning
+/// the IPC namespace, only by the segment's owner or creator, and locking
+/// only with a limit above 0 (`EPERM`). A segment newly locked charges its
+/// pages to the caller's user, whose locked segments must fit the limit
+/// unless it has `CAP_IPC_LOCK` (`ENOMEM`, `user_shm_lock`); unlocking (or
+/// removing the segment) gives them back. Locking a locked segment, or
+/// unlocking an unlocked one, changes nothing.
+fn shm_lock(
+    t: &mut Ipc,
+    id: i32,
+    lock: bool,
+    creds: &crate::creds::Creds,
+    limit: u64,
+) -> Result<(), i32> {
+    let capable = creds.has_in(&ipc::owner(), crate::caps::CAP_IPC_LOCK);
+    let o = t.get(Kind::Shm, id)?;
+    if !capable {
+        if creds.euid != o.perm.uid && creds.euid != o.perm.cuid {
+            return Err(errno::EPERM);
+        }
+        if lock && limit == 0 {
+            return Err(errno::EPERM);
+        }
+    }
+    let Body::Shm(s) = &mut o.body else { return Err(errno::EINVAL) };
+    if !lock {
+        s.locked = None;
+        return Ok(());
+    }
+    if s.locked.is_some() {
+        return Ok(());
+    }
+    let pages = s.size.div_ceil(4096);
+    let user = creds.euid;
+    let charged: u64 = t
+        .objs
+        .values()
+        .filter_map(|o| match &o.body {
+            Body::Shm(s) if s.locked == Some(user) => Some(s.size.div_ceil(4096)),
+            _ => None,
+        })
+        .sum();
+    let allowed = if limit == fwe_abi::resource::RLIM_INFINITY { u64::MAX } else { limit / 4096 };
+    if charged.saturating_add(pages) > allowed && !creds.has(crate::caps::CAP_IPC_LOCK) {
+        return Err(errno::ENOMEM);
+    }
+    if let Ok(Obj { body: Body::Shm(s), .. }) = t.get(Kind::Shm, id) {
+        s.locked = Some(user);
+    }
+    Ok(())
+}
+
 /// The file of a new segment `id` of `size` bytes (zeroes).
 fn make_segment(r: &Record<Ipc>, id: i32, size: u64) -> Result<(), i32> {
     let path = std::ffi::CString::new(ipc::segment_path(r, id)).map_err(|_| errno::EINVAL)?;
@@ -1013,5 +1092,69 @@ fn remove_segment(r: &Record<Ipc>, id: i32) {
     if let Ok(p) = std::ffi::CString::new(ipc::segment_path(r, id)) {
         // SAFETY: a NUL-terminated path in fwe's private directory.
         unsafe { libc::unlink(p.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::creds::Creds;
+
+    /// A caller of user and group `id`, in no other group, with no
+    /// capabilities.
+    fn user(id: u32) -> Creds {
+        let mut c = Creds::default();
+        assert_eq!(c.setgroups(vec![]), 0);
+        assert_eq!(c.setresgid(id, id, id), 0);
+        assert_eq!(c.setresuid(id, id, id), 0);
+        c
+    }
+
+    /// `SHM_LOCK` by the owner charges the segment's pages to the caller's
+    /// user against `RLIMIT_MEMLOCK` (`ENOMEM` past it, `EPERM` with a
+    /// limit of 0 or by another user), once however often it is locked,
+    /// until `SHM_UNLOCK`; the lock survives the table's encoding.
+    #[test]
+    fn shm_lock_charges_the_locking_user() {
+        let mut t = Ipc::default();
+        let perm = Perm { uid: 1000, gid: 1000, cuid: 1000, cgid: 1000, mode: 0o600 };
+        let seg = |size| Body::Shm(ipc::Shm { size, ..ipc::Shm::default() });
+        let a = t.create(Kind::Shm, 1, perm, seg(3 * 4096), 10).unwrap();
+        let b = t.create(Kind::Shm, 2, perm, seg(2 * 4096), 10).unwrap();
+        let owner = user(1000);
+        let limit = 4 * 4096;
+        assert_eq!(shm_lock(&mut t, a, true, &user(1001), limit), Err(errno::EPERM));
+        assert_eq!(shm_lock(&mut t, a, true, &owner, 0), Err(errno::EPERM));
+        assert_eq!(shm_lock(&mut t, a, true, &owner, limit), Ok(()));
+        assert_eq!(shm_lock(&mut t, a, true, &owner, limit), Ok(()));
+        assert_eq!(shm_lock(&mut t, b, true, &owner, limit), Err(errno::ENOMEM));
+        let mut e = crate::snapshot::Enc::new();
+        crate::shared::Data::encode(&t, &mut e);
+        let bytes = e.into_bytes();
+        let back: Ipc = crate::shared::Data::decode(&mut crate::snapshot::Dec::new(&bytes));
+        let Body::Shm(s) = &back.objs[&(Kind::Shm as u8, a)].body else { panic!() };
+        assert_eq!(s.locked, Some(1000));
+        // Unlocking needs no limit, and gives the pages back.
+        assert_eq!(shm_lock(&mut t, a, false, &owner, 0), Ok(()));
+        assert_eq!(shm_lock(&mut t, b, true, &owner, limit), Ok(()));
+        // With `CAP_IPC_LOCK`, any segment, past the limit.
+        assert_eq!(shm_lock(&mut t, a, true, &Creds::default(), 4096), Ok(()));
+    }
+
+    /// A `SHM_HUGETLB` segment: of a size the hardware has, by a caller
+    /// with `CAP_IPC_LOCK` or in `vm.hugetlb_shm_group`, and none to
+    /// reserve from the empty pool unless it reserves none.
+    #[test]
+    fn huge_segments_find_no_huge_pages() {
+        let root = Creds::default();
+        let huge = ipc::SHM_HUGETLB;
+        let size = |log: u64| huge | log << ipc::SHM_HUGE_SHIFT;
+        assert_eq!(huge_segment(huge, &root), Err(errno::ENOMEM));
+        assert_eq!(huge_segment(size(21), &root), Err(errno::ENOMEM));
+        assert_eq!(huge_segment(size(30), &root), Err(errno::ENOMEM));
+        assert_eq!(huge_segment(size(22), &root), Err(errno::EINVAL));
+        assert_eq!(huge_segment(huge | ipc::SHM_NORESERVE, &root), Ok(()));
+        assert_eq!(huge_segment(huge, &user(1000)), Err(errno::EPERM));
+        assert_eq!(huge_segment(huge | ipc::SHM_NORESERVE, &user(1000)), Err(errno::EPERM));
     }
 }
