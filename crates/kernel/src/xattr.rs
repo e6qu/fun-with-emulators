@@ -7,7 +7,10 @@
 //! or fwe's (`org.fwe.`), and a list shows only those in Linux's
 //! namespaces. Linux's rules decide who may do what:
 //!
-//! - `user.` attributes are for regular files and directories only;
+//! - `user.` attributes are for regular files and directories only, and a
+//!   sticky directory's are changed only by its owner (or with
+//!   `CAP_FOWNER`);
+
 //! - `trusted.` ones need `CAP_SYS_ADMIN`, and are hidden from others;
 //! - writing a `security.` one needs `CAP_SYS_ADMIN`, or `CAP_SETFCAP` for
 //!   `security.capability`;
@@ -166,6 +169,11 @@ impl Kind {
         let mode = (st.st_mode as u32 & libc::S_IFMT as u32) | perm;
         Kind { plain, meta: (mode, owner.0, owner.1) }
     }
+
+    /// Whether it is a directory with the sticky bit.
+    fn sticky_dir(&self) -> bool {
+        self.meta.0 & 0o171000 == 0o41000
+    }
 }
 
 /// What a caller is and what it acts on, for the permission checks.
@@ -177,6 +185,8 @@ pub struct Who {
     /// bits, or passing them.
     pub read_any: bool,
     pub write_any: bool,
+    /// Whether it owns the file, or has `CAP_FOWNER` over it.
+    pub owner: bool,
     pub kind: Kind,
 }
 
@@ -206,6 +216,9 @@ impl Who {
             Space::Security if name == b"security.capability" && !self.setfcap => Err(errno::EPERM),
             Space::Security if name != b"security.capability" && !self.admin => Err(errno::EPERM),
             Space::User if !self.kind.plain => Err(errno::EPERM),
+            // A sticky directory's are its owner's to change, as its
+            // entries are.
+            Space::User if self.kind.sticky_dir() && !self.owner => Err(errno::EPERM),
             Space::User if !self.bits_allow(2) => Err(errno::EACCES),
             _ => Ok(()),
         }
@@ -471,8 +484,14 @@ mod tests {
     #[test]
     fn rules_by_namespace() {
         let file = Kind { plain: true, meta: (0o100644, 0, 0) };
-        let user =
-            Who { admin: false, setfcap: false, read_any: true, write_any: true, kind: file };
+        let user = Who {
+            admin: false,
+            setfcap: false,
+            read_any: true,
+            write_any: true,
+            owner: false,
+            kind: file,
+        };
         assert_eq!(user.may_read(Space::Trusted), Err(errno::ENODATA));
         assert_eq!(user.may_write(b"trusted.x", Space::Trusted), Err(errno::EPERM));
         assert_eq!(user.may_write(b"user.x", Space::User), Ok(()));
@@ -483,10 +502,35 @@ mod tests {
         assert_eq!(user.may_write(b"user.x", Space::User), Err(errno::EACCES));
         assert_eq!(user.may_read(Space::User), Ok(()));
         let node = Kind { plain: false, meta: (0o20644, 0, 0) };
-        let node = Who { admin: true, setfcap: true, read_any: true, write_any: true, kind: node };
+        let node = Who { kind: node, admin: true, setfcap: true, owner: true, ..user };
         assert_eq!(node.may_write(b"user.x", Space::User), Err(errno::EPERM));
         assert_eq!(node.may_read(Space::User), Err(errno::ENODATA));
         assert_eq!(node.may_write(b"trusted.x", Space::Trusted), Ok(()));
+    }
+
+    /// A sticky directory's `user.` attributes are changed by its owner
+    /// (or with `CAP_FOWNER`) only, whatever its bits allow; read by any
+    /// who may read it (Linux's `xattr_permission`).
+    #[test]
+    fn sticky_directory_attributes_are_the_owners() {
+        let tmp = Kind { plain: true, meta: (0o41777, 0, 0) };
+        let other = Who {
+            admin: false,
+            setfcap: false,
+            read_any: true,
+            write_any: true,
+            owner: false,
+            kind: tmp,
+        };
+        assert_eq!(other.may_write(b"user.x", Space::User), Err(errno::EPERM));
+        assert_eq!(other.may_read(Space::User), Ok(()));
+        let owner = Who { owner: true, ..other };
+        assert_eq!(owner.may_write(b"user.x", Space::User), Ok(()));
+        let plain = Who { kind: Kind { plain: true, meta: (0o40777, 0, 0) }, ..other };
+        assert_eq!(plain.may_write(b"user.x", Space::User), Ok(()));
+        // A sticky regular file is no directory.
+        let file = Who { kind: Kind { plain: true, meta: (0o101666, 0, 0) }, ..other };
+        assert_eq!(file.may_write(b"user.x", Space::User), Ok(()));
     }
 
     /// On the host fwe runs on: a Linux host keeps `trusted.` attributes
@@ -503,6 +547,7 @@ mod tests {
             setfcap: true,
             read_any: true,
             write_any: true,
+            owner: true,
             kind: Kind { plain: true, meta: (0o100644, 0, 0) },
         };
         set(&t, b"user.a", b"1", 0).unwrap();

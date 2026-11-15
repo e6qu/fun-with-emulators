@@ -3484,6 +3484,8 @@ impl<P: Platform> Kernel<P> {
             setfcap: self.creds.has_over(crate::caps::CAP_SETFCAP, st.st_uid, st.st_gid),
             read_any: self.permits(&st, 4),
             write_any: self.permits(&st, 2),
+            owner: self.creds.fsuid == st.st_uid
+                || self.creds.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid),
             kind,
         }
     }
