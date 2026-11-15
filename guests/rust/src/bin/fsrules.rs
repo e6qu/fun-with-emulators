@@ -28,6 +28,7 @@ const SYS_NAME_TO_HANDLE_AT: i64 = 264;
 const SYS_OPEN_BY_HANDLE_AT: i64 = 265;
 const SYS_CAPSET: i64 = 91;
 const SYS_FILE_GETATTR: i64 = 468;
+const SYS_FILE_SETATTR: i64 = 469;
 
 unsafe extern "C" {
     fn open(p: *const c_char, f: i32, ...) -> i32;
@@ -525,9 +526,76 @@ fn locks_scenario() {
     }
 }
 
+/// Set the inode flags of `p` (`FS_IOC_SETFLAGS` through a descriptor
+/// opened to read): "ok" or the error.
+fn try_set_flags(p: &str, flags: u32) -> String {
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c(p).as_ptr(), O_RDONLY) };
+    let mut v = flags;
+    // SAFETY: the flags word for the request.
+    let r = unsafe { ioctl(fd, 0x4008_6602, &mut v) };
+    let out = res(r.into());
+    // SAFETY: the descriptor just opened.
+    unsafe { close(fd) };
+    out
+}
+
+/// `file_setattr` of `p` with the no-dump flag: "ok" or the error.
+fn try_file_setattr(dir: i32, p: &str, flags: i32) -> String {
+    let mut attr = [0u8; 24];
+    attr[..8].copy_from_slice(&0x80u64.to_ne_bytes());
+    // SAFETY: a NUL-terminated path and a `struct file_attr`.
+    res(unsafe { syscall(SYS_FILE_SETATTR, dir, c(p).as_ptr(), attr.as_ptr(), 24, flags) })
+}
+
+/// Inode flags change through a writable mount only (`EROFS` otherwise),
+/// and an overlay's lower file is copied up to take them, the lower layer
+/// left alone.
+fn chattr_scenario() {
+    const FS_NODUMP_FL: u32 = 0x40;
+    const MS_RDONLY: u64 = 1;
+    const CLONE_NEWNS: i32 = 0x20000;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS) };
+    for d in ["/tmp/lower", "/tmp/upper", "/tmp/work", "/tmp/merged", "/tmp/ro"] {
+        // SAFETY: a NUL-terminated path.
+        unsafe { mkdir(c(d).as_ptr(), 0o755) };
+    }
+    make("/tmp/lower/f", 0o644);
+    make("/tmp/lower/g", 0o644);
+    make("/tmp/ro/f", 0o644);
+    let data = c("lowerdir=/tmp/lower,upperdir=/tmp/upper,workdir=/tmp/work");
+    // SAFETY: NUL-terminated strings.
+    let r = unsafe {
+        mount(
+            c("overlay").as_ptr(),
+            c("/tmp/merged").as_ptr(),
+            c("overlay").as_ptr(),
+            0,
+            data.as_ptr(),
+        )
+    };
+    println!("overlay: {}", res(r.into()));
+    println!("ioctl: {}", try_set_flags("/tmp/merged/f", FS_NODUMP_FL));
+    println!("file_setattr: {}", try_file_setattr(AT_FDCWD, "/tmp/merged/g", 0));
+    println!(
+        "merged: {} {} lower: {} {}",
+        inode_flags("/tmp/merged/f", None),
+        inode_flags("/tmp/merged/g", None),
+        inode_flags("/tmp/lower/f", None),
+        inode_flags("/tmp/lower/g", None)
+    );
+    println!("ro: {}", bind("/tmp/ro", "/tmp/ro", Some(MS_RDONLY)));
+    println!("ioctl on ro: {}", try_set_flags("/tmp/ro/f", FS_NODUMP_FL));
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/ro/f").as_ptr(), O_RDONLY) };
+    println!("file_setattr on ro: {}", try_file_setattr(fd, "", AT_EMPTY_PATH));
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "chattr" => chattr_scenario(),
         "locks" => locks_scenario(),
         "romounts" => read_only_mounts_scenario(),
         "handles" => handles_scenario(std::env::args().nth(2).unwrap().parse().unwrap()),

@@ -7060,6 +7060,18 @@ fn record_locks_survive_fwes_own_work_on_the_file() {
     assert_eq!(fsrules("locks"), format!("lock: ok\n{line}lock: ok\n{line}"));
 }
 
+/// `FS_IOC_SETFLAGS` and `file_setattr` change a file only through a
+/// writable mount (`EROFS` otherwise), and copy an overlay's lower file up
+/// first, leaving the lower layer alone.
+#[test]
+fn inode_flags_change_as_files_do() {
+    assert_eq!(
+        fsrules("chattr"),
+        "overlay: ok\nioctl: ok\nfile_setattr: ok\nmerged: 64 64 lower: 0 0\nro: ok\n\
+         ioctl on ro: EROFS\nfile_setattr on ro: EROFS\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

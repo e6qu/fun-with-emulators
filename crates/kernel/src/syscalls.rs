@@ -2619,6 +2619,11 @@ impl<P: Platform> Kernel<P> {
             };
         }
         let f: u32 = guest!(uaccess::read(arg));
+        // A change of the file: not through a read-only mount (`EROFS`), an
+        // overlay's lower file copied up first.
+        if let Err(e) = self.fd_change(fd) {
+            return err(e);
+        }
         match self.set_inode_flags(fd, f) {
             Ok(()) => 0,
             Err(e) => err(e),
@@ -2740,17 +2745,24 @@ impl<P: Platform> Kernel<P> {
         };
         let resolved;
         let cname;
+        // A change of the file: not through a read-only mount (`EROFS`), an
+        // overlay's lower file copied up first.
         let file = if name.is_empty() && at & fcntl::AT_EMPTY_PATH != 0 {
+            if set && let Err(e) = self.fd_change(dfd) {
+                return err(e);
+            }
             FlagFile::Fd(dfd)
         } else {
             let follow = at & fcntl::AT_SYMLINK_NOFOLLOW == 0;
             resolved = match self.fs().resolve(dfd, &name, follow) {
-                Ok(r) => r,
+                Ok(mut r) => {
+                    match if set { r.prepare(crate::fs::Change::Modify) } else { Ok(()) } {
+                        Ok(()) => r,
+                        Err(e) => return err(e),
+                    }
+                }
                 Err(e) => return err(e),
             };
-            if set && resolved.mount_flags & crate::mounts::ms::RDONLY != 0 {
-                return err(errno::EROFS);
-            }
             cname = match resolved.name_c() {
                 Ok(c) => c,
                 Err(e) => return err(e),
