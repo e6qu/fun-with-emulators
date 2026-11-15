@@ -45,6 +45,15 @@ int kill(int pid, int sig);
 long syscall(long nr, ...);
 int poll(void *fds, unsigned long n, int timeout);
 int fflush(void *stream);
+int bind(int fd, const void *addr, unsigned len);
+int listen(int fd, int backlog);
+int accept(int fd, void *addr, unsigned *len);
+int connect(int fd, const void *addr, unsigned len);
+int getsockopt(int fd, int level, int name, void *val, unsigned *len);
+int setsockopt(int fd, int level, int name, const void *val, unsigned len);
+int setgid(unsigned gid);
+int setuid(unsigned uid);
+int *__errno_location(void);
 long sendmsg(int fd, const struct msghdr *msg, int flags);
 long recvmsg(int fd, struct msghdr *msg, int flags);
 int fcntl(int fd, int cmd, ...);
@@ -245,9 +254,106 @@ static int emulated(void) {
     return 0;
 }
 
+#define SCM_CREDENTIALS 2
+#define errno (*__errno_location())
+#define SO_PASSCRED 16
+#define SO_PEERCRED 17
+
+/* Send a byte on `s` with credentials `creds` (pid, uid, gid). */
+static long send_creds(int s, const unsigned *creds) {
+    char byte = 'c';
+    struct iovec iov = {&byte, 1};
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    memset(control, 0, sizeof control);
+    struct cmsghdr *c = (struct cmsghdr *)control;
+    c->cmsg_len = CMSG_LEN(12);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_CREDENTIALS;
+    memcpy(CMSG_DATA(c), creds, 12);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = CMSG_SPACE(12);
+    return sendmsg(s, &m, 0);
+}
+
+/* The credentials a received message carries: 1 if it had them. */
+static int recv_creds(int s, unsigned *creds) {
+    char byte;
+    struct iovec iov = {&byte, 1};
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    memset(control, 0, sizeof control);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = 64;
+    if (recvmsg(s, &m, 0) != 1)
+        return 0;
+    struct cmsghdr *c = (struct cmsghdr *)control;
+    if (m.msg_controllen < CMSG_LEN(12) || c->cmsg_type != SCM_CREDENTIALS)
+        return 0;
+    memcpy(creds, CMSG_DATA(c), 12);
+    return 1;
+}
+
+/* SO_PEERCRED names the peer as the guest knows it (its ids after it
+ * changed them), SO_PASSCRED brings the sender's credentials, and a
+ * sender without privilege may not claim another's. */
+static int creds(void) {
+    struct {
+        unsigned short family;
+        char path[108];
+    } a;
+    memset(&a, 0, sizeof a);
+    a.family = AF_UNIX;
+    memcpy(a.path + 1, "fwe-creds-test", 14);
+    unsigned alen = 2 + 1 + 14;
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    bind(srv, &a, alen);
+    listen(srv, 1);
+    int child = fork();
+    if (child == 0) {
+        setgid(1000);
+        setuid(1000);
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        connect(c, &a, alen);
+        unsigned own[3] = {(unsigned)getpid(), 1000, 1000}, root[3] = {(unsigned)getpid(), 0, 0};
+        long spoof = send_creds(c, root);
+        int e = errno;
+        printf("child: claiming root %ld errno %d\n", spoof, e);
+        fflush(0);
+        char b = 'x';
+        write(c, &b, 1);
+        send_creds(c, own);
+        read(c, &b, 1);
+        _exit(0);
+    }
+    int s = accept(srv, 0, 0);
+    unsigned peer[3];
+    unsigned len = sizeof peer;
+    getsockopt(s, SOL_SOCKET, SO_PEERCRED, peer, &len);
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_PASSCRED, &one, sizeof one);
+    unsigned got[3] = {0}, given[3] = {0};
+    int had = recv_creds(s, got);
+    int had2 = recv_creds(s, given);
+    write(s, "x", 1);
+    int status;
+    waitpid(child, &status, 0);
+    printf("peer is child %d uid %u gid %u\n", peer[0] == (unsigned)child, peer[1], peer[2]);
+    printf("passed %d: child %d uid %u gid %u\n", had, got[0] == (unsigned)child, got[1], got[2]);
+    printf("given %d: child %d uid %u gid %u\n", had2, given[0] == (unsigned)child, given[1],
+           given[2]);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "creds"))
+        return creds();
     if (!strcmp(argv[1], "cloexec"))
         return cloexec();
     if (!strcmp(argv[1], "many"))

@@ -825,6 +825,10 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     {
         crate::netns::bind_done(fd as i32, plan);
     }
+    #[cfg(not(target_os = "linux"))]
+    if r == 0 && kept_value(fd as i32, SO_PASSCRED) != 0 {
+        passcred_bound(fd as i32, true);
+    }
     if r == 0 && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
         // The node takes the socket's mode (its `fchmod`, or every bit),
         // less the umask, as on Linux.
@@ -1156,13 +1160,26 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         return crate::seqpacket::send(fd as i32, &[v], (std::ptr::null_mut(), 0), hflags);
     }
     let mut iov = [guest!(uaccess::host_buffer(buf, len, false))];
+    // A datagram to a socket that asked for credentials carries them.
+    #[cfg(not(target_os = "linux"))]
+    let prepared = match send_control(fd as i32, 0, 0, named.then(|| &hb[..alen as usize])) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (ctl_ptr, ctl_len) = match &prepared {
+        Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len() as _),
+        None => (std::ptr::null_mut(), 0),
+    };
+    #[cfg(target_os = "linux")]
+    let (ctl_ptr, ctl_len) = (std::ptr::null_mut(), 0);
     let mut hmsg = libc::msghdr {
         msg_name: aptr as *mut libc::c_void,
         msg_namelen: alen,
         msg_iov: iov.as_mut_ptr(),
         msg_iovlen: 1,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
+        msg_control: ctl_ptr,
+        msg_controllen: ctl_len,
         msg_flags: 0,
     };
     // ENAMETOOLONG where the host cannot send from a directory.
@@ -1172,6 +1189,12 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         r = unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) };
         0
     });
+    #[cfg(not(target_os = "linux"))]
+    if r < 0
+        && let Some(p) = prepared
+    {
+        p.unsent();
+    }
     if r >= 0 {
         crate::netns::used(fd as i32);
     }
@@ -1280,6 +1303,10 @@ fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) ->
 /// Socket `fd` was closed: what it held back goes out, as Linux sends it,
 /// and the groups it joined are left.
 pub fn closed(fd: i32) {
+    #[cfg(not(target_os = "linux"))]
+    if kept_value(fd, SO_PASSCRED) != 0 {
+        passcred_bound(fd, false);
+    }
     if let Some(mut m) = MEMBERSHIPS.if_used() {
         m.retain(|(f, _)| *f != fd);
     }
@@ -1313,9 +1340,68 @@ fn udp(fd: i32) -> bool {
 
 /// The value of option `optname` of the UDP level fwe keeps for `fd`.
 fn udp_option(fd: i32, optname: u64) -> i32 {
-    let key = SOL_UDP << 32 | optname;
+    kept_value(fd, SOL_UDP << 32 | optname)
+}
+
+/// The value fwe keeps for `fd` under `key` ([`kept_key`]), 0 if none.
+fn kept_value(fd: i32, key: u64) -> i32 {
     let kept = KEPT_VALUES.if_used();
     kept.and_then(|k| k.iter().find(|v| (v.0, v.1) == (fd, key)).map(|v| v.2)).unwrap_or(0)
+}
+
+/// The host path of Unix datagram socket `fd`'s own address (`peer`: its
+/// peer's), if it has one.
+#[cfg(not(target_os = "linux"))]
+fn dgram_path(fd: i32, peer: bool) -> Option<Vec<u8>> {
+    if kind(fd) != Some((libc::AF_UNIX, libc::SOCK_DGRAM)) {
+        return None;
+    }
+    let mut hb = empty_sockaddr();
+    let mut hl = SOCKADDR_MAX as libc::socklen_t;
+    let a = hb.as_mut_ptr().cast();
+    // SAFETY: valid out-parameters of their lengths.
+    let r = unsafe {
+        if peer { libc::getpeername(fd, a, &mut hl) } else { libc::getsockname(fd, a, &mut hl) }
+    };
+    if r != 0 {
+        return None;
+    }
+    host_unix_path(&hb[..hl as usize])
+}
+
+/// The path of host Unix address `hb` (macOS layout), if it has one.
+#[cfg(not(target_os = "linux"))]
+fn host_unix_path(hb: &[u8]) -> Option<Vec<u8>> {
+    if hb.len() <= 2 || i32::from(hb[1]) != libc::AF_UNIX {
+        return None;
+    }
+    let path = &hb[2..];
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    (end > 0).then(|| path[..end].to_vec())
+}
+
+/// Datagram socket `fd`, bound, asks for credentials (`on`) or no longer
+/// does: senders that are fwe's are told by its address ([`crate::scm`]).
+#[cfg(not(target_os = "linux"))]
+fn passcred_bound(fd: i32, on: bool) {
+    if let Some(path) = dgram_path(fd, false) {
+        crate::scm::wants_creds(&path, on);
+    }
+}
+
+/// The credentials a datagram from Unix socket `fd` to host address `to`
+/// (its peer's when `None`) carries unasked: the sender's, when the
+/// receiving socket asked for them ([`crate::scm::wants_creds`]).
+#[cfg(not(target_os = "linux"))]
+fn creds_for(fd: i32, to: Option<&[u8]>) -> Option<crate::scm::Creds> {
+    if !crate::scm::any_wanted() {
+        return None;
+    }
+    let path = match to {
+        Some(hb) => host_unix_path(hb)?,
+        None => dgram_path(fd, true)?,
+    };
+    crate::scm::creds_wanted(&path).then(crate::scm::own_creds)
 }
 
 /// Send `msg` on `fd` with the guest's `flags` (the host's `hflags`), as
@@ -1653,9 +1739,9 @@ fn disconnect(fd: i32) -> Option<i64> {
     Some(0)
 }
 
-/// Socket options Linux has and the host has not, which change nothing
-/// fwe does: kept, and read back as set (`SO_NO_CHECK`, `SO_PRIORITY`,
-/// `SO_PASSCRED`).
+/// Socket options Linux has and the host has not: kept, and read back as
+/// set (`SO_NO_CHECK`, `SO_PRIORITY`, which change nothing fwe does;
+/// `SO_PASSCRED`, which a receive acts on, see [`crate::scm`]).
 const KEPT: [u64; 3] = [11, 12, 16];
 
 /// Options of the IP levels Linux has and the host has not, kept as
@@ -1880,7 +1966,12 @@ pub unsafe fn setsockopt(
     if level == SOL_SOCKET
         && let Some(key) = kept_key(level, optname)
     {
-        return keep(key);
+        let r = keep(key);
+        #[cfg(not(target_os = "linux"))]
+        if r == 0 && optname == SO_PASSCRED {
+            passcred_bound(fd as i32, kept_value(fd as i32, SO_PASSCRED) != 0);
+        }
+        return r;
     }
     if let Some(e) = level_refused(fd as i32, level, false) {
         return e;
@@ -2033,15 +2124,41 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
 /// The pid is the peer's in the caller's pid namespace; its ids are the
 /// host's, as the guest sees them.
 fn peercred(fd: i32, optval: u64, optlen: u64) -> i64 {
-    let Ok(len) = uaccess::read::<u32>(optlen) else { return err(errno::EFAULT) };
-    let (pid, uid, gid) = match host_peercred(fd) {
-        Ok(v) => v,
-        Err(e) => return err(e),
-    };
-    let pid = crate::pidns::to_guest(pid);
-    let cred = [pid as u32, crate::host::uid_to_linux(uid), crate::host::gid_to_linux(gid)];
-    let _ = len;
-    write_ucred(optval, optlen, cred)
+    match peer_ucred(fd) {
+        Ok(cred) => write_ucred(optval, optlen, cred),
+        Err(e) => err(e),
+    }
+}
+
+/// The `ucred` of the process at the other end of Unix socket `fd`, as the
+/// caller sees it: its pid in the caller's pid namespace, its effective
+/// user and group ids (fwe's for it, as `SO_PEERCRED` gives them) in the
+/// caller's user namespace. A process fwe did not start has its host ids
+/// as the guest sees them.
+fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
+    let (pid, uid, gid) = host_peercred(fd)?;
+    Ok(ucred_of(pid).unwrap_or([
+        crate::pidns::to_guest(pid) as u32,
+        crate::host::uid_to_linux(uid),
+        crate::host::gid_to_linux(gid),
+    ]))
+}
+
+/// The `ucred` of fwe's process `pid` (a host pid) as the caller sees it:
+/// its effective ids, if fwe has a record of it.
+fn ucred_of(pid: i32) -> Option<[u32; 3]> {
+    let ids = crate::procreg::read(pid)?.ids;
+    Some(guest_ucred(pid, ids[1], ids[5]))
+}
+
+/// Credentials as the caller sees them: the pid in its pid namespace, the
+/// ids in its user namespace.
+fn guest_ucred(host_pid: i32, uid: u32, gid: u32) -> [u32; 3] {
+    [
+        crate::pidns::to_guest(host_pid) as u32,
+        crate::userns::to_ns(uid, false),
+        crate::userns::to_ns(gid, true),
+    ]
 }
 
 /// Write `struct ucred` `cred` to `optval`, its room at `optlen`.
@@ -2248,7 +2365,9 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     #[cfg(target_os = "linux")]
     let (ctl_ptr, ctl_len) = (control as *mut libc::c_void, controllen as _);
     #[cfg(not(target_os = "linux"))]
-    let prepared = match send_control(fd as i32, control, controllen) {
+    let to = (!name_ptr.is_null()).then(|| &hb[..name_len as usize]);
+    #[cfg(not(target_os = "linux"))]
+    let prepared = match send_control(fd as i32, control, controllen, to) {
         Ok(p) => p,
         Err(e) => return err(e),
     };
@@ -2512,13 +2631,24 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     {
         let cap = controllen as usize;
         let got = (hmsg.msg_controllen as usize).min(macbuf.len());
+        // Credentials, asked for with `SO_PASSCRED`, come first: those the
+        // sender gave, else the peer's (the kernel's, 0, for netlink).
+        let passcred = kept_value(fd as i32, SO_PASSCRED) != 0;
+        let room = cap.saturating_sub(if passcred { 32 } else { 0 });
         let inc = crate::scm::receive(
             &macbuf[..got],
-            cap.saturating_sub(CMSG_HDR) / 4,
+            room.saturating_sub(CMSG_HDR) / 4,
             flags & MSG_PEEK != 0,
         );
+        let creds = passcred.then(|| match inc.creds {
+            Some(c) => guest_ucred(c.host_pid, c.uid, c.gid),
+            None if crate::netlink::is(fd as i32) => [0, 0, 0],
+            // No process to name (a datagram from a program fwe did not
+            // start): the overflow ids, as Linux gives an id it cannot map.
+            None => peer_ucred(fd as i32).unwrap_or([0, 65534, 65534]),
+        });
         let (bytes, ctrunc) =
-            crate::scm::linux_control(cap, None, &inc.fds, flags & MSG_CMSG_CLOEXEC != 0);
+            crate::scm::linux_control(cap, creds, &inc.fds, flags & MSG_CMSG_CLOEXEC != 0);
         let mut lflags = msg_flags_from_host(hmsg.msg_flags);
         if ctrunc || inc.dropped {
             lflags |= MSG_CTRUNC as i32;
@@ -2544,10 +2674,19 @@ const HOST_CONTROL: usize = 12 + 4 * 256 + 64;
 /// The host control data for the guest's control buffer of a send on
 /// `fd` ([`crate::scm`]). A socket that is not a Unix one takes neither
 /// descriptors nor credentials (`EINVAL`), and passes the rest over.
+///
+/// Credentials it gives are checked ([`crate::scm::check_creds`]); a
+/// datagram to a socket that asked for them carries the sender's anyway,
+/// as Linux attaches them (`to`: the host address it is sent to, if any).
 #[cfg(not(target_os = "linux"))]
-fn send_control(fd: i32, control: u64, len: u64) -> Result<Option<crate::scm::Prepared>, i32> {
+fn send_control(
+    fd: i32,
+    control: u64,
+    len: u64,
+    to: Option<&[u8]>,
+) -> Result<Option<crate::scm::Prepared>, i32> {
     if len == 0 {
-        return Ok(None);
+        return creds_for(fd, to).map_or(Ok(None), |c| crate::scm::prepare(&[], Some(c)).map(Some));
     }
     let ctl = uaccess::read_bytes(control, (len as usize).min(64 * 1024))?;
     if !is_unix(fd) {
@@ -2557,7 +2696,14 @@ fn send_control(fd: i32, control: u64, len: u64) -> Result<Option<crate::scm::Pr
         };
     }
     let out = crate::scm::parse(&ctl)?;
-    crate::scm::prepare(&out.fds, None).map(Some)
+    let creds = match out.creds {
+        Some(c) => Some(crate::scm::check_creds(c)?),
+        None => creds_for(fd, to),
+    };
+    if out.fds.is_empty() && creds.is_none() {
+        return Ok(None);
+    }
+    crate::scm::prepare(&out.fds, creds).map(Some)
 }
 
 #[cfg(test)]
@@ -3408,5 +3554,99 @@ mod protocol_tests {
         assert_eq!(r, err(errno::EAGAIN));
         // SAFETY: the sockets made above.
         unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod creds_tests {
+    use super::scm_tests::{close_all, pair, recv_control, send_control};
+    use super::*;
+
+    fn set_passcred(fd: i32) {
+        let one = 1i32;
+        // SAFETY: a 4-byte option value.
+        let r = unsafe {
+            setsockopt(fd as u64, SOL_SOCKET, SO_PASSCRED, &one as *const i32 as u64, 4, false)
+        };
+        assert_eq!(r, 0);
+    }
+
+    /// The `SCM_CREDENTIALS` message (Linux layout) of `creds`.
+    fn credentials(creds: [u32; 3]) -> Vec<u8> {
+        let mut c = vec![0u8; 32];
+        c[0..8].copy_from_slice(&28u64.to_ne_bytes());
+        c[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        c[12..16].copy_from_slice(&crate::scm::SCM_CREDENTIALS.to_ne_bytes());
+        for (i, w) in creds.iter().enumerate() {
+            c[16 + 4 * i..20 + 4 * i].copy_from_slice(&w.to_ne_bytes());
+        }
+        c
+    }
+
+    /// The credentials the control data `c` starts with.
+    fn creds_in(c: &[u8]) -> Option<[u32; 3]> {
+        let ty = i32::from_ne_bytes(c.get(12..16)?.try_into().ok()?);
+        if ty != crate::scm::SCM_CREDENTIALS {
+            return None;
+        }
+        let w = |i: usize| u32::from_ne_bytes(c[16 + 4 * i..20 + 4 * i].try_into().unwrap());
+        Some([w(0), w(1), w(2)])
+    }
+
+    /// A socket that asked for credentials receives its peer's, or those
+    /// the sender gave when it may give them.
+    #[test]
+    fn credentials_come_when_asked() {
+        let sv = pair(SOCK_STREAM);
+        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        assert_eq!(send_control(sv[0], &[]), 1);
+        let (_, c, _) = recv_control(sv[1], 64, 0);
+        assert_eq!(creds_in(&c), None);
+        set_passcred(sv[1]);
+        assert_eq!(send_control(sv[0], &[]), 1);
+        let (_, c, _) = recv_control(sv[1], 64, 0);
+        assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
+        // Given: as given (the caller is root, as before any is published).
+        let tgid = crate::thread::tgid() as u32;
+        assert_eq!(send_control(sv[0], &credentials([tgid, 5, 6])), 1);
+        let (_, c, _) = recv_control(sv[1], 64, 0);
+        assert_eq!(creds_in(&c).map(|c| c[1..].to_vec()), Some(vec![5, 6]));
+        // A pid no process has, or an id nothing maps.
+        let bad = send_control(sv[0], &credentials([0x7fff_fff0, 0, 0]));
+        assert_eq!(bad, err(errno::ESRCH));
+        let bad = send_control(sv[0], &credentials([tgid, u32::MAX, 0]));
+        assert_eq!(bad, err(errno::EINVAL));
+        close_all(&sv);
+    }
+
+    /// A datagram to a bound socket that asked for credentials carries the
+    /// sender's.
+    #[test]
+    fn a_datagram_carries_credentials_when_asked() {
+        let dir = std::env::temp_dir().join(format!("fwe-passcred-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s");
+        let _ = std::fs::remove_file(&path);
+        let mut a = [0u8; 110];
+        a[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        let p = path.to_str().unwrap().as_bytes();
+        a[2..2 + p.len()].copy_from_slice(p);
+        // SAFETY: no pointers.
+        let (rx, tx) = unsafe {
+            (socket(AF_UNIX, SOCK_DGRAM, 0) as i32, socket(AF_UNIX, SOCK_DGRAM, 0) as i32)
+        };
+        // SAFETY: a valid address.
+        assert_eq!(unsafe { bind(rx as u64, a.as_ptr() as u64, 110, true, 0o022) }, 0);
+        set_passcred(rx);
+        let byte = *b"x";
+        // SAFETY: valid buffers.
+        let r = unsafe { sendto(tx as u64, byte.as_ptr() as u64, 1, 0, a.as_ptr() as u64, 110) };
+        assert_eq!(r, 1);
+        let (_, c, _) = recv_control(rx, 64, 0);
+        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
+        closed(rx);
+        close_all(&[rx, tx]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

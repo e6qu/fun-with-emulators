@@ -406,7 +406,7 @@ pub fn connect_prepare(fd: i32, hb: &mut [u8]) -> Result<(), i32> {
 /// The namespace port each socket last sent to, or connected to, where
 /// nobody was bound (its datagrams went to [`sink`]): what its peer's
 /// name reads as.
-static SUNK: Mutex<std::collections::BTreeMap<i32, u16>> =
+pub(crate) static SUNK: Mutex<std::collections::BTreeMap<i32, u16>> =
     Mutex::new(std::collections::BTreeMap::new());
 
 /// This process's host loopback port (of IPv6 if `v6`) that nobody reads:

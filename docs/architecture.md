@@ -1543,6 +1543,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   descriptor arrives as the host object behind it; a receiver that is
   not an fwe process sees one more descriptor (the bundle) with any of
   the descriptors fwe stands in for.
+- Credentials: `SO_PEERCRED` and the credentials a stream's reader gets
+  with `SO_PASSCRED` are the peer process's as they are when read (Linux
+  takes them at `connect`, and per message on a stream), the process that
+  made a socket pair for both its ends; an unconnected datagram carries
+  the sender's only to a bound socket that asked for them.
 - Sockets: what fwe keeps of a socket (see
   [Sockets and terminals](#sockets-and-terminals)) is per descriptor, so
   a duplicate or another process sharing the socket does not see it; a

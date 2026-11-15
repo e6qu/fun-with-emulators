@@ -114,10 +114,55 @@ pub fn real_uid() -> u32 {
     REAL_UID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What sending credentials (`SCM_CREDENTIALS`) checks of a caller: its
+/// real, effective and saved user and group ids (initial-namespace ids),
+/// and whether it may claim another's (`CAP_SETUID`, `CAP_SETGID`) or
+/// another process's pid (`CAP_SYS_ADMIN`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub uids: [u32; 3],
+    pub gids: [u32; 3],
+    pub setuid: bool,
+    pub setgid: bool,
+    pub admin: bool,
+}
+
+impl Identity {
+    fn of(c: &Creds) -> Identity {
+        use crate::caps::{CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN};
+        Identity {
+            uids: [c.uid, c.euid, c.suid],
+            gids: [c.gid, c.egid, c.sgid],
+            setuid: c.has(CAP_SETUID),
+            setgid: c.has(CAP_SETGID),
+            admin: c.has(CAP_SYS_ADMIN),
+        }
+    }
+}
+
+/// The process's [`Identity`], as of its last system call ([`publish`]).
+pub(crate) static IDENTITY: crate::forklock::ForkRwLock<Option<Identity>> =
+    crate::forklock::ForkRwLock::new(None);
+
+/// The process's [`Identity`] (root's before any is published).
+pub fn identity() -> Identity {
+    IDENTITY.read().unwrap_or_else(|e| e.into_inner()).unwrap_or(Identity {
+        uids: [0; 3],
+        gids: [0; 3],
+        setuid: true,
+        setgid: true,
+        admin: true,
+    })
+}
+
 /// Publish the access `c` gives, after a system call that may have
 /// changed it (written only when it did), and its real user id.
 pub fn publish(c: &Creds) {
     REAL_UID.store(c.uid, std::sync::atomic::Ordering::Relaxed);
+    let id = Identity::of(c);
+    if *IDENTITY.read().unwrap_or_else(|e| e.into_inner()) != Some(id) {
+        *IDENTITY.write().unwrap_or_else(|e| e.into_inner()) = Some(id);
+    }
     // Compared where it is, as most calls change nothing: made anew only
     // when it changed.
     let same = ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| {

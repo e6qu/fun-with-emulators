@@ -1174,10 +1174,19 @@ fn socket_protocol_and_error_queue_are_linuxs() {
 /// `POLLMSG` never, `EPOLLRDNORM` for a read.
 #[test]
 fn poll_events_are_linuxs() {
+    c_guest_prints("sockopts", &["events"], "poll 3: 0x100 0x200 0x2001\nepoll 1: 0x40\n");
+}
+
+/// `SO_PEERCRED` names the peer by the ids it has in the guest,
+/// `SO_PASSCRED` brings the sender's credentials, and a sender may not
+/// claim credentials it lacks (`EPERM`).
+#[test]
+fn unix_socket_credentials_are_the_guests() {
     c_guest_prints(
-        "sockopts",
-        &["events"],
-        "poll 3: 0x100 0x200 0x2001\nepoll 1: 0x40\n",
+        "scmrights",
+        &["creds"],
+        "child: claiming root -1 errno 1\npeer is child 1 uid 1000 gid 1000\n\
+         passed 1: child 1 uid 1000 gid 1000\ngiven 1: child 1 uid 1000 gid 1000\n",
     );
 }
 

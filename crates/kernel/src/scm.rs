@@ -163,7 +163,7 @@ impl Drop for Prepared {
 /// that runs while a message is on its way can take a bundle held only
 /// in flight for unreachable and empty it, so the sender holds each until
 /// its receiver has read it (or the sender ends).
-static PENDING: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static PENDING: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 /// Close the pending bundles their receivers have emptied.
 fn sweep(p: &mut Vec<i32>) {
@@ -587,6 +587,96 @@ fn put_cmsg(out: &mut Vec<u8>, cap: usize, ty: i32, data: &[u8]) -> bool {
     m.truncate(room);
     out.extend_from_slice(&m);
     len > room
+}
+
+/// Check credentials `[pid, uid, gid]` a sender gives (in its pid and user
+/// namespaces) as Linux's `scm_check_creds` does: ids its namespace does
+/// not map are `EINVAL`; the pid must be its own unless it has
+/// `CAP_SYS_ADMIN`, the user id its real, effective or saved one unless it
+/// has `CAP_SETUID`, the group id likewise with `CAP_SETGID` (`EPERM`); a
+/// pid no process has is `ESRCH`. Returns them as they travel.
+pub fn check_creds([pid, uid, gid]: [u32; 3]) -> Result<Creds, i32> {
+    let kuid = crate::userns::from_ns(uid, false).filter(|&u| u != u32::MAX);
+    let kgid = crate::userns::from_ns(gid, true).filter(|&g| g != u32::MAX);
+    let (Some(uid), Some(gid)) = (kuid, kgid) else { return Err(errno::EINVAL) };
+    let id = crate::creds::identity();
+    let own = pid as i32 == crate::thread::tgid();
+    if !((own || id.admin)
+        && (id.uids.contains(&uid) || id.setuid)
+        && (id.gids.contains(&gid) || id.setgid))
+    {
+        return Err(errno::EPERM);
+    }
+    let host_pid = if own {
+        crate::host::pid()
+    } else {
+        crate::pidns::to_host(pid as i32)
+            .filter(|&h| crate::host::process_exists(h))
+            .ok_or(errno::ESRCH)?
+    };
+    Ok(Creds { host_pid, uid, gid })
+}
+
+/// This process's credentials as Linux attaches them to what it sends
+/// when asked: its pid, real user and group ids.
+pub fn own_creds() -> Creds {
+    let id = crate::creds::identity();
+    Creds { host_pid: crate::host::pid(), uid: id.uids[0], gid: id.gids[0] }
+}
+
+/// The host addresses (socket paths) of datagram sockets that asked for
+/// credentials (`SO_PASSCRED`), which every fwe process sees: a datagram
+/// sent to one carries the sender's in a bundle, since the host attaches
+/// none (a connected socket's peer is the host's to name).
+#[derive(Clone, Default)]
+pub struct Passcred {
+    paths: std::collections::BTreeSet<Vec<u8>>,
+}
+
+impl crate::shared::Data for Passcred {
+    fn encode(&self, e: &mut Enc) {
+        e.u64(self.paths.len() as u64);
+        for p in &self.paths {
+            e.bytes(p);
+        }
+    }
+    fn decode(d: &mut Dec) -> Self {
+        let n = d.count(8);
+        Passcred { paths: (0..n).map(|_| d.bytes()).collect() }
+    }
+}
+
+fn passcred() -> Option<&'static crate::shared::Record<Passcred>> {
+    static R: std::sync::OnceLock<Option<crate::shared::Record<Passcred>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| crate::shared::Record::named("passcred", 0, Passcred::default).ok()).as_ref()
+}
+
+/// The datagram socket at host path `path` asks for credentials (`on`),
+/// or no longer does.
+pub fn wants_creds(path: &[u8], on: bool) {
+    let Some(r) = passcred() else { return };
+    if r.get().paths.contains(path) == on {
+        return;
+    }
+    let _ = r.update(|p| {
+        if on {
+            p.paths.insert(path.to_vec());
+        } else {
+            p.paths.remove(path);
+        }
+        Ok(())
+    });
+}
+
+/// Whether any datagram socket asks for credentials.
+pub fn any_wanted() -> bool {
+    passcred().is_some_and(|r| !r.get().paths.is_empty())
+}
+
+/// Whether the datagram socket at host path `path` asks for credentials.
+pub fn creds_wanted(path: &[u8]) -> bool {
+    passcred().is_some_and(|r| r.get().paths.contains(path))
 }
 
 #[cfg(test)]

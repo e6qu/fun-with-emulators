@@ -109,6 +109,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &epoll::EDGES,
         &epoll::HELD,
         &epoll::WRITES,
+        &scm::PENDING,
     ]);
     v.extend([
         &fdstate::STATES as &'static dyn ForkLock,
@@ -129,6 +130,8 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &rlimits::LIMITS,
         &seccomp::STATE,
         &creds::ACCESS,
+        &creds::IDENTITY,
+        &netns::SUNK,
         &net::CORKED,
         &net::KEPT_VALUES,
         &net::MEMBERSHIPS,

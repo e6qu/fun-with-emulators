@@ -1186,7 +1186,7 @@ control messages ([Sockets](#sockets)). `AF_UNIX`, `AF_INET` and
 | `getsockname`, `getpeername` | host address translated back; a Unix path is reported as the guest gave it; namespace ports mapped back; `IPV6_ADDRFORM` view applied | `getsockname`, `getpeername` |
 | `sendto`, `sendmsg`, `recvfrom`, `recvmsg` | flags mapped; addresses translated; `SCM_RIGHTS` re-encoded; `MSG_MORE` held back on TCP and UDP; `MSG_FASTOPEN` on an unconnected TCP socket connects to the address, then sends (the host has no client fast open, so the data follows the handshake; `EISCONN` once connected); `MSG_ERRQUEUE` on an IP or Unix socket `EAGAIN` (the queue is never filled); a peer's eBPF socket filter applied on send; `SIGPIPE` raised by fwe unless `MSG_NOSIGNAL` | `sendmsg`, `recv`, `recvfrom`, `recvmsg` |
 | `sendmmsg`, `recvmmsg` | one `sendmsg` or `recvmsg` per message | as above |
-| `setsockopt`, `getsockopt` | numbers and layouts translated (`sockopt.rs`); fwe answers `SO_SNDBUF`/`SO_RCVBUF` arithmetic, `SO_DOMAIN`, `SO_PROTOCOL`, kept `SO_NO_CHECK`/`SO_PRIORITY`/`SO_PASSCRED`, `SO_PEERCRED`, `SO_ATTACH_BPF`/`SO_DETACH_BPF`, `IPV6_ADDRFORM`, and `SO_TYPE` of a `SOCK_SEQPACKET` or netlink socket | `setsockopt`, `getsockopt` |
+| `setsockopt`, `getsockopt` | numbers and layouts translated (`sockopt.rs`); fwe answers `SO_SNDBUF`/`SO_RCVBUF` arithmetic, `SO_DOMAIN`, `SO_PROTOCOL`, kept `SO_NO_CHECK`/`SO_PRIORITY`, `SO_PASSCRED`, `SO_PEERCRED`, `SO_ATTACH_BPF`/`SO_DETACH_BPF`, `IPV6_ADDRFORM`, and `SO_TYPE` of a `SOCK_SEQPACKET` or netlink socket | `setsockopt`, `getsockopt` |
 | `shutdown` | passed through; a Unix socket whose peer has gone shuts down (`0`, where the host says `ENOTCONN`) | `shutdown` |
 
 **`sendmsg`, `recvmsg`** (`crates/kernel/src/scm.rs`): Linux's `cmsghdr`
@@ -1196,8 +1196,8 @@ has a 64-bit `cmsg_len` and 8-byte alignment, macOS's a 32-bit one and
 type or a short `ucred` is `EINVAL`, a descriptor not open `EBADF`;
 other levels are passed over) and sends every `SCM_RIGHTS` message's
 descriptors, up to Linux's 253 (`EINVAL` past them; the host takes 254),
-as one host message. On a socket that is not a Unix one, descriptors and
-credentials are `EINVAL`. A receive writes as many descriptors as the
+as one host message, with `SCM_CREDENTIALS` (see below). On a socket that
+is not a Unix one, descriptors and credentials are `EINVAL`. A receive writes as many descriptors as the
 guest's buffer holds and closes the others, setting `MSG_CTRUNC`, as
 Linux does (the host installs them all whatever the buffer);
 `MSG_CMSG_CLOEXEC` makes them close-on-exec. A received
@@ -1254,11 +1254,31 @@ stops at the first failure (returning the count so far, or the error if
 none went). `recvmmsg` honours `MSG_WAITFORONE`, checks its timeout after
 each message as Linux does, and stops after urgent data.
 
-**`getsockopt(SO_PEERCRED)`**: from the host's `LOCAL_PEERPID` and
-`LOCAL_PEERCRED`: the peer's pid in the caller's pid namespace and its
-host ids as the guest sees them
-([Host identity](#host-identity-and-machine-state)). A socket with no peer
-process (not Unix, or netlink) gives pid 0 and ids -1.
+**`getsockopt(SO_PEERCRED)`**: the peer process from the host's
+`LOCAL_PEERPID`, its pid in the caller's pid namespace and its effective
+user and group ids as fwe keeps them for it (what it set inside fwe), in
+the caller's user namespace; a peer fwe did not start has its host ids
+as the guest sees them
+([Host identity](#host-identity-and-machine-state)). They are the peer's
+as they are when asked (Linux's are as they were at `connect` or
+`socketpair`). A socket with no peer process (not Unix, or netlink) gives
+pid 0 and ids -1.
+
+**`SO_PASSCRED`, `SCM_CREDENTIALS`**: the host attaches no credentials to
+what is sent, so fwe does. Credentials a sender gives are checked as
+Linux checks them (ids the sender's user namespace does not map
+`EINVAL`; another pid without `CAP_SYS_ADMIN`, or ids other than its
+real, effective or saved ones without `CAP_SETUID`/`CAP_SETGID`,
+`EPERM`; a pid nobody has `ESRCH`) and travel in a bundle. A receiver
+that set `SO_PASSCRED` gets an `SCM_CREDENTIALS` message first: those
+given, else, on a connected socket, its peer process's (pid, real ids as
+fwe keeps them), else for a datagram to a bound socket that asked for
+them the sender's, which an fwe sender attaches when the address it sends
+to is in a record of such sockets every fwe process sees; a netlink
+socket's come from the kernel (all 0), and a datagram from a program fwe
+did not start has pid 0 and the overflow ids. On a stream, the
+credentials are the peer process's, whichever process holding the peer
+socket wrote.
 
 #### Other IPC calls
 
@@ -1996,7 +2016,7 @@ names macOS does not support:
 | `MSG_NOSIGNAL` | `SO_NOSIGPIPE` | every socket gets `SO_NOSIGPIPE`; fwe raises `SIGPIPE` itself for a write or send without `MSG_NOSIGNAL` |
 | `AF_UNIX` paths | 104-byte limit | resolved in the guest's root; a long one bound, connected or sent to from its directory with `pthread_fchdir_np`; connecting or sending needs write permission on the node, as fwe keeps its mode |
 | abstract `AF_UNIX` names | none | files in a per-host temporary directory, or in an fwe network namespace's own directory, each with its name beside it; a name whose socket is gone is free to bind again |
-| socket option numbers and layouts at `SOL_SOCKET`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP` and `IPPROTO_ICMPV6` | numbered apart (`IP_TOS` 1 and 3, `TCP_KEEPIDLE` 4 and `TCP_KEEPALIVE` 0x10, `ICMP6_FILTER` 1 and 18); `group_req` packed to 4 bytes; `ip_mreq_source` ordered apart; multicast TTL and loop a byte; an `icmp6_filter` bit blocks a type on Linux and passes it on macOS | each translated (`crates/kernel/src/sockopt.rs`); one the host lacks is `ENOPROTOOPT`, but `SO_NO_CHECK`, `SO_PRIORITY`, `SO_PASSCRED`, `IP_RECVERR`, `IPV6_RECVERR` and `SOL_RAW`'s `ICMP_FILTER` are kept and read back, and `SO_DOMAIN`/`SO_PROTOCOL` answered by fwe (the protocol from the host's `proc_pidfdinfo`, so a ping or raw socket's is its own); any other level is `ENOPROTOOPT`, so no Linux option reaches the host as another |
+| socket option numbers and layouts at `SOL_SOCKET`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP` and `IPPROTO_ICMPV6` | numbered apart (`IP_TOS` 1 and 3, `TCP_KEEPIDLE` 4 and `TCP_KEEPALIVE` 0x10, `ICMP6_FILTER` 1 and 18); `group_req` packed to 4 bytes; `ip_mreq_source` ordered apart; multicast TTL and loop a byte; an `icmp6_filter` bit blocks a type on Linux and passes it on macOS | each translated (`crates/kernel/src/sockopt.rs`); one the host lacks is `ENOPROTOOPT`, but `SO_NO_CHECK`, `SO_PRIORITY`, `SO_PASSCRED` (acted on, see [Sockets](#sockets)), `IP_RECVERR`, `IPV6_RECVERR` and `SOL_RAW`'s `ICMP_FILTER` are kept and read back, and `SO_DOMAIN`/`SO_PROTOCOL` answered by fwe (the protocol from the host's `proc_pidfdinfo`, so a ping or raw socket's is its own); any other level is `ENOPROTOOPT`, so no Linux option reaches the host as another |
 | `SOL_UDP` options | none (macOS's one, `UDP_NOCKSUM`, has `UDP_CORK`'s number) | fwe's: `UDP_CORK` holds sends back until cleared, then sends them as one datagram; `UDP_SEGMENT` cuts a send into datagrams of its size (64 at most, `EINVAL` past them); `UDP_GRO` joins nothing, as Linux need not; `UDP_NO_CHECK6_TX`/`RX` leave checksums to the host; `UDP_ENCAP` (IPsec) and the rest `ENOPROTOOPT` |
 | `SO_SNDBUF`/`SO_RCVBUF` doubled, capped by `wmem_max`/`rmem_max`; the `FORCE` forms with `CAP_NET_ADMIN` | the size as given | Linux's arithmetic, the host's buffer given the result |
 | a level a socket has no layer for | taken or `EINVAL` | `EOPNOTSUPP` to get, `ENOPROTOOPT` to set (`EOPNOTSUPP` on a Unix socket) |
