@@ -153,6 +153,7 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     fdmarks::mark(fd, Mark::Netlink);
+    crate::net::fresh(fd);
     socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin, net, bound: None }));
     fd as i64
 }

@@ -499,6 +499,7 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         let dropped = kept < fds.len();
         close_all(fds.drain(kept..));
         for &fd in &fds {
+            crate::net::fresh(fd);
             // A SOCK_SEQPACKET socket of fwe's is one here too.
             crate::seqpacket::adopt(fd);
         }
@@ -518,6 +519,7 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
     }
     close_all(fds.drain(kept..));
     for (i, &fd) in fds.iter().enumerate() {
+        crate::net::fresh(fd);
         // A socket of a namespace may be a SOCK_SEQPACKET one too.
         if !taken[i] || crate::netns::of(fd).is_some() {
             crate::seqpacket::adopt(fd);

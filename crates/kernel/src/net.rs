@@ -722,6 +722,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
         crate::seqpacket::make(fd);
     }
     crate::netns::made(fd);
+    fresh(fd);
     fd as i64
 }
 
@@ -761,6 +762,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     }
     crate::netns::made(fds[0]);
     crate::netns::made(fds[1]);
+    fresh(fds[0]);
+    fresh(fds[1]);
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -1003,6 +1006,7 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     }
     // A connection is in its listener's namespace.
     crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
+    fresh(r);
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.
@@ -1320,6 +1324,22 @@ pub fn closed(fd: i32) {
         v.retain(|&f| f != fd);
     }
     flush_corked(fd);
+}
+
+/// A new socket is descriptor `fd` (made, accepted or received): what fwe
+/// keeps per descriptor starts empty, whatever a socket that had the
+/// number left (one closed out of fwe's sight).
+pub(crate) fn fresh(fd: i32) {
+    if let Some(mut m) = MEMBERSHIPS.if_used() {
+        m.retain(|(f, _)| *f != fd);
+    }
+    if let Some(mut k) = KEPT_VALUES.if_used() {
+        k.retain(|k| k.0 != fd);
+    }
+    if let Some(mut v) = V4_VIEW.if_used() {
+        v.retain(|&f| f != fd);
+    }
+    take_corked(fd);
 }
 
 /// Send what socket `fd` held back, without waiting.
@@ -3273,7 +3293,7 @@ pub(crate) mod scm_tests {
 
     /// The descriptor-passing tests, one at a time: they take descriptor
     /// numbers the host hands out and registries keyed by them.
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ONE.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -3648,6 +3668,7 @@ mod creds_tests {
     /// the sender gave when it may give them.
     #[test]
     fn credentials_come_when_asked() {
+        let _g = super::scm_tests::serial();
         let sv = pair(SOCK_STREAM);
         let me = crate::pidns::to_guest(crate::host::pid()) as u32;
         assert_eq!(send_control(sv[0], &[]), 1);
@@ -3667,6 +3688,7 @@ mod creds_tests {
         assert_eq!(bad, err(errno::ESRCH));
         let bad = send_control(sv[0], &credentials([tgid, u32::MAX, 0]));
         assert_eq!(bad, err(errno::EINVAL));
+        closed(sv[1]);
         close_all(&sv);
     }
 
@@ -3674,31 +3696,30 @@ mod creds_tests {
     /// sender's.
     #[test]
     fn a_datagram_carries_credentials_when_asked() {
-        let dir = std::env::temp_dir().join(format!("fwe-passcred-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("s");
-        let _ = std::fs::remove_file(&path);
+        let _g = super::scm_tests::serial();
+        // An abstract name: a path would be rooted in whatever filesystem
+        // view another test publishes meanwhile.
+        let name = format!("fwe-passcred-{}", std::process::id());
         let mut a = [0u8; 110];
         a[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
-        let p = path.to_str().unwrap().as_bytes();
-        a[2..2 + p.len()].copy_from_slice(p);
+        a[3..3 + name.len()].copy_from_slice(name.as_bytes());
+        let alen = (3 + name.len()) as u64;
         // SAFETY: no pointers.
         let (rx, tx) = unsafe {
             (socket(AF_UNIX, SOCK_DGRAM, 0) as i32, socket(AF_UNIX, SOCK_DGRAM, 0) as i32)
         };
         // SAFETY: a valid address.
-        assert_eq!(unsafe { bind(rx as u64, a.as_ptr() as u64, 110, true, 0o022) }, 0);
+        assert_eq!(unsafe { bind(rx as u64, a.as_ptr() as u64, alen, true, 0o022) }, 0);
         set_passcred(rx);
         let byte = *b"x";
         // SAFETY: valid buffers.
-        let r = unsafe { sendto(tx as u64, byte.as_ptr() as u64, 1, 0, a.as_ptr() as u64, 110) };
+        let r = unsafe { sendto(tx as u64, byte.as_ptr() as u64, 1, 0, a.as_ptr() as u64, alen) };
         assert_eq!(r, 1);
         let (_, c, _) = recv_control(rx, 64, 0);
         let me = crate::pidns::to_guest(crate::host::pid()) as u32;
         assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
         closed(rx);
         close_all(&[rx, tx]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -3739,6 +3760,7 @@ mod kept_option_tests {
             )
         };
         assert_eq!((r, v[1] != 0, v[1]), (0, true, 7));
+        closed(s as i32);
         // SAFETY: the socket made above.
         unsafe { libc::close(s as i32) };
     }
@@ -3754,6 +3776,7 @@ mod kept_option_tests {
         assert_eq!(set(s, SO_PRIORITY, &[3], false), 0);
         // SAFETY: no out pointers.
         assert_eq!(unsafe { accept4(s as u64, 0, 0, 1) }, err(errno::EINVAL));
+        closed(s as i32);
         // SAFETY: the socket made above.
         unsafe { libc::close(s as i32) };
     }
