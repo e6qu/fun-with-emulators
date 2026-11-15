@@ -2363,7 +2363,7 @@ where fwe falls short of Linux in detail is in
 | `bpf()` privilege | **enforced** | `CAP_BPF` or `CAP_SYS_ADMIN` in the initial namespace (`EPERM`), maps and socket filters for anyone while `kernel.unprivileged_bpf_disabled` is 0 (2 by default) ([eBPF](#ebpf)) |
 | BPF cgroup device programs | **enforced** | interpreted on every device open and `mknod` of the cgroup's members ([cgroups](#cgroups)) |
 | BPF socket filters (`SO_ATTACH_BPF`) | **emulated** | run on what this process sends to the filtered socket, by any call |
-| Other BPF program types (kprobe, tracepoint, XDP, tc, LSM, ...) | **refused** | `EINVAL` at load, as a kernel without them |
+| Other BPF program types (kprobe, tracepoint, XDP, tc, cgroup socket, LSM, ...) | **kept** | load (libraries such as runc's cilium/ebpf probe for support by loading one), never attached or run: `EINVAL` to attach |
 | BPF maps, helpers, verifier | **emulated** | hash and array maps (others `EINVAL`); map helpers and `bpf_skb_load_bytes` (others `EINVAL`); structural checks, a bounds check for socket filters (`EACCES` with a log), loops stopped after 2^20 steps |
 | Other BPF commands, pinning, the BPF filesystem | **refused** | `EINVAL` (`BPF_OBJ_PIN` too); mounting `bpf` `ENODEV` |
 | Classic `SO_ATTACH_FILTER`, `SO_LOCK_FILTER` | **refused** | `ENOPROTOOPT` |
