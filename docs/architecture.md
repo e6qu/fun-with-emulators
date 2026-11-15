@@ -169,7 +169,8 @@ and `fork`.
   shared by several segments gets the union of their protections.
 - The break is reserved after the image and its stub space (up to 1 GiB,
   halved while something is in the way) before the dynamic linker is
-  placed. The stack is 8 MiB with a guard page.
+  placed. The main stack is as large as the soft `RLIMIT_STACK` (128 KiB
+  to 4 GiB), with a guard page.
 - `execve` of a script runs its `#!` interpreter (`Kernel::exec_target`)
   in either backend, so no shell is needed.
 - The auxiliary vector's ids and `AT_SECURE` are the guest's, as the
@@ -974,7 +975,8 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   fails with `ENOSPC` (`crates/kernel/src/ns.rs`). `vm.drop_caches` and
   `fs.pipe-user-pages-*` are kept and read back: the page cache and the
   pipe buffers are the host's.
-- `/sys`: `fs/cgroup` (a mount point), `devices/system/cpu/{online,possible}`
+- `/sys`: `fs/cgroup` (a mount point), `kernel/security/lsm`,
+  `devices/system/cpu/{online,possible}`
   and the loop devices' `block`, `dev/block` and `devices/virtual/block`
   entries.
 - `/proc/self/fd` links name the file's guest path, or `pipe:[ino]`,
@@ -1337,8 +1339,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 [roadmap](../ROADMAP.md) says which are to be lifted for 1.0.
 
 **Execution**
-- ptrace has no seccomp event (`PTRACE_O_TRACESECCOMP`), no hardware
-  breakpoint or watchpoint (their register sets say there are none), and
+- ptrace has no hardware breakpoint or watchpoint (their register sets say there are none), and
   no `PTRACE_PEEKSIGINFO` (`EIO`). A single step over an exclusive load
   and store loops, as a breakpoint between them clears the monitor.
 - A non-PIE executable linked below 4 GiB runs only in the VM backend,
@@ -1396,8 +1397,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   of the directory they are bound from. A device fwe makes of a host
   socket or pipe, opened without `IOCTL_DEV`, keeps no mark: its `ioctl`
   is not refused.
-- An I/O priority set for another process (`ioprio_set`) is checked and
-  accepted but not kept: `ioprio_get` reports that process's as (none,
+- An I/O priority set for another process (`ioprio_set`) is accepted
+  without a permission check, and not kept: `ioprio_get` reports that process's as (none,
   0).
 - A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
   process ends (Linux sends it when the parent thread does).
@@ -1509,8 +1510,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   and punches holes, but does not fill a hole inside a sparse file; other
   modes are `EOPNOTSUPP`.
 - `/dev/shm` outlives its processes until the host clears its temporary
-  files, and a `rename` between it and the rootfs succeeds where Linux
-  returns `EXDEV`.
+  files.
 - memfd: `F_SEAL_GROW` does not stop a `writev` or `pwritev` past the end
   (`write` and `pwrite64` are checked); `F_SEAL_WRITE` does not reach
   another process's descriptors and changes the inode number; a memfd
@@ -1567,7 +1567,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   the last descriptor of its socket in the binding process closes; a
   datagram socket connected to a port nobody had bound stays connected to
   nobody when the port is bound later (Linux's reaches the new socket);
-  the initial namespace's sysctls cannot change.
+  the initial namespace's network sysctls are fwe's own copy, which root
+  changes for fwe's processes and never for the host.
 - A port below 1024 bound on a loopback address of the initial namespace,
   when fwe is not root, is reached by its number only from fwe's
   processes: the host keeps it for root, so it is an ephemeral port there.
@@ -1592,7 +1593,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   not enforced (only `pids.max` and device programs are); a threaded
   cgroup cannot be made (`cgroup.type` refuses `threaded`); there is no
   cgroup v1; the tree is the user's, not the machine's. A new thread in
-  the VM backend is not held to `pids.max` or `RLIMIT_NPROC`.
+  the VM backend is not held to `pids.max` or `RLIMIT_NPROC`. A frozen
+  cgroup's members are stopped processes: a `SIGCONT` thaws one, and its
+  parent sees the stop.
 - seccomp filters apply to every thread (as with
   `SECCOMP_FILTER_FLAG_TSYNC`). There is no user-notification listener:
   `SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL` (so libseccomp
@@ -1603,8 +1606,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   answers through that descriptor, and `SECCOMP_IOCTL_NOTIF_ADDFD`'s
   placing of the supervisor's descriptor in the caller's table, which on
   macOS only the caller itself can do; none of that is built.
-  `kernel.seccomp.actions_logged` is fixed at Linux's default, and a
-  destructive `syslog` read takes what is there without waiting for more.
+  `SECCOMP_GET_ACTION_AVAIL` reports it unavailable (`EOPNOTSUPP`).
+  `/proc/sys/kernel/seccomp` is absent, the actions logged being Linux's
+  defaults, and a destructive `syslog` read takes what is there without waiting for more.
 
 **Signals**
 - `RLIMIT_SIGPENDING` counts the signals pending in each process, not in
@@ -1685,7 +1689,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   socket closed with bytes held back sends them without waiting. An
   abstract name whose socket is bound but not listening counts as free.
   Options whose data comes in control messages (`IP_PKTINFO`,
-  `IP_RECVTTL`, `SO_TIMESTAMP`) are refused, and so is `TCP_INFO`.
+  `IP_RECVTTL`, `SO_TIMESTAMP`) are refused, and so are `TCP_INFO`,
+  `TCP_CONGESTION`, `SO_BINDTODEVICE` and `SO_MARK`
+  ([the full list](linux-on-macos.md#ipc-and-networking)).
 - Keys: no `/sbin/request-key` helper runs, so a constructed key is
   negative and `KEYCTL_INSTANTIATE`, `NEGATE`, `REJECT` and
   `ASSUME_AUTHORITY` have no authorisation key; asymmetric keys are RSA

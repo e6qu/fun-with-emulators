@@ -99,7 +99,7 @@ section headers has its unwind table found through `PT_GNU_EH_FRAME`.
 - **Containers, further:** a thread's own root, working directory, mounts
   and namespaces (`unshare` and `setns` on one thread); namespace files
   bound to paths (`nsfs`); `CLONE_PARENT` children waited for by their
-  parent; the host's loopback described over netlink.
+  parent; the host's interfaces described over netlink.
 - **Other calls:** `personality`, `getcpu`, `syslog`, `membarrier`,
   `readahead`, `sync_file_range`, `vhangup`, `reboot`, strict seccomp, the
   LSM calls, protection keys as on a CPU without them, and the clock
@@ -296,10 +296,10 @@ traffic at native speed.
   process of a network (a published port whose creator has ended), a
   per-user fwe process started on demand, as Wine's `wineserver` is.
 
-Packet-level features (iptables and nftables rules, raw and packet
-sockets, ICMP from containers, TUN) would need a TCP/IP stack inside fwe,
-as gVisor has, which every packet would pass through; they stay out
-unless one proves cheap enough for the native-speed principle.
+Packet-level features (iptables and nftables rules, packet sockets,
+TUN) would need a TCP/IP stack inside fwe, as gVisor has, which every
+packet would pass through; they stay out unless one proves cheap enough
+for the native-speed principle.
 
 **Done when:** Docker Compose with a bridge network (a web application, a
 database and a cache) and a Podman pod run, their containers reaching
@@ -311,13 +311,17 @@ Calls for these are refused (`ENOSYS`, `EINVAL` or `EPERM`) unless noted,
 so programs that probe for them fall back.
 - **io_uring:** programs fall back to ordinary system calls.
 - **Networking beyond loopback and the host's sockets** (veth, bridges,
-  firewalling, raw and packet sockets, SCTP, RDS, TUN, kernel TLS): a new
-  network namespace has loopback only, and other protocols fail with
-  `EAFNOSUPPORT` or `ENOPROTOOPT`. Addresses per namespace, bridges and
-  container networks come after 1.0 (M8).
+  firewalling, packet sockets, SCTP, RDS, TUN, kernel TLS): a new
+  network namespace has loopback only; other families fail with
+  `EAFNOSUPPORT`, other protocols with `EPROTONOSUPPORT`, kernel TLS
+  with `ENOPROTOOPT`. Raw IP sockets take `CAP_NET_RAW` and, on the host,
+  fwe running as root; ping sockets follow `net.ipv4.ping_group_range`.
+  Addresses per namespace, bridges and container networks come after 1.0
+  (M8).
 - **Chosen pids in the initial pid namespace** (`clone3`'s `set_tid`
-  there, `/proc/sys/kernel/ns_last_pid`): pids are the host's, which
-  macOS assigns; `set_tid` chooses them in fwe's own pid namespaces.
+  there): pids are the host's, which macOS assigns; `set_tid` chooses
+  them in fwe's own pid namespaces. `/proc/sys/kernel/ns_last_pid` is
+  absent in every pid namespace.
 - **`fanotify`:** its permission events would hold every process's file
   calls on another's answer; programs fall back to inotify.
 - **A shared descriptor table without shared memory** (`CLONE_FILES`
@@ -332,8 +336,9 @@ so programs that probe for them fall back.
   fs-verity, RAM disks, SCSI): files are the host's, on its filesystem;
   fwe mounts tmpfs, proc, sysfs, cgroup2, devpts, mqueue and overlay, and
   its loop devices hold no filesystem.
-- **Swap, huge pages and memory error injection:** the host manages
-  memory; `swapon` fails with `ENOSYS`, as on a kernel without swap.
+- **Swap, huge pages and memory error injection** (but `MADV_HWPOISON`,
+  which natively makes the pages fault): the host manages memory;
+  `swapon` fails with `ENOSYS`, as on a kernel without swap.
 - **cgroup resource limits but `pids.max`** (memory, CPU, I/O): accepted,
   not enforced; the host shares its resources alike.
 - **Per-process I/O counts** (`/proc/<pid>/io`'s `rchar`, `syscr` and

@@ -223,7 +223,8 @@ that lacks it, and `--strace` names it.
   display yet ([roadmap](../ROADMAP.md#m7--graphical-programs-and-sandboxes)).
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
-- **Chosen process ids**: pids are the Mac's.
+- **Chosen process ids** outside a pid namespace of fwe's: there pids are
+  the Mac's.
 - The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10);
   where `fwe` differs from Linux in detail is in the
   [architecture's known limitations](architecture.md#known-limitations).

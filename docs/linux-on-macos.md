@@ -22,10 +22,13 @@ fwe runs a program one of two ways, chosen per program:
 
 This document covers which backend runs what and at what cost, how
 languages fare, which instructions are rewritten and how the VM is used,
-then both directions of the mapping: [Linux to macOS](#linux-to-macos)
+then the mapping itself: [Linux to macOS](#linux-to-macos)
 (for each Linux primitive, what Linux does, what macOS has, what fwe
-does) and [macOS to Linux](#macos-to-linux) (what happens on the host and
-what the guest sees). How fwe's parts are built, and where fwe still
+does), [What fwe enforces](#what-fwe-enforces) (for each Linux mechanism,
+from capabilities to `io_uring`, whether fwe enforces, emulates, keeps,
+ignores or refuses it, or leaves it to macOS) and
+[macOS to Linux](#macos-to-linux) (what happens on the host and what the
+guest sees). How fwe's parts are built, and where fwe still
 differs from Linux, is in [architecture.md](architecture.md); running the
 VM backend safely is in [hypervisor.md](hypervisor.md).
 
@@ -1547,7 +1550,7 @@ flowchart TB
         stubs["stub arena right after the image (code stubs, within 128 MiB branch range)"]
         brk["break: up to 1 GiB reserved after the image and stubs"]
         ld["dynamic linker, shared libraries, guest mmap regions (where macOS places them)"]
-        stack["guest stack: 8 MiB + guard page"]
+        stack["guest stack: RLIMIT_STACK (128 KiB to 4 GiB) + guard page"]
         fwe["fwe's own: binary, dyld, libSystem, heap, signal stacks, rt_sigreturn trampoline"]
     end
     pz --- img --- stubs --- brk --- ld --- stack --- fwe
@@ -1636,7 +1639,7 @@ them out on the slab and the guest's page tables:
 | `mprotect` | | host `mprotect`; adding `PROT_EXEC` prepares the code first | stage-1 permission edit |
 | `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part); move with `mach_vm_remap`, which takes the pages, contents and sharing along, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
 | `madvise(MADV_DONTNEED)` | private anonymous pages read as zero again | each private anonymous piece replaced by a fresh mapping (macOS's own keeps the data) | private pages read as zero again, or as the file for a private file mapping; shared memory keeps its contents |
-| `madvise` other advice | hints; `MADV_FREE`, `MADV_WIPEONFORK` | hints passed to the host, never failing for mapped memory; advice and mappings checked as Linux checks them; `MADV_WIPEONFORK` ranges zeroed in a fork child | the same, but a fork child keeps `MADV_WIPEONFORK` memory |
+| `madvise` other advice | hints; `MADV_FREE`, `MADV_WIPEONFORK` | hints passed to the host, never failing for mapped memory; advice and mappings checked as Linux checks them; `MADV_WIPEONFORK` ranges zeroed in a fork child | advice and mappings checked as natively, nothing more: no hint reaches the host, `MADV_FREE` frees nothing, a fork child keeps `MADV_WIPEONFORK` memory, `MADV_DONTDUMP` changes no core |
 | `MADV_DONTFORK`, `MADV_DOFORK` | a fork child has nothing mapped in the range | the ranges kept; a fork child unmaps them as it starts (the host's `VM_INHERIT_NONE` would too, but fwe reads a region's inheritance to tell private memory from shared) | ignored |
 | `MADV_GUARD_INSTALL`, `MADV_GUARD_REMOVE` | guard markers: an access is `SIGSEGV`, whatever the mapping's protection | private anonymous pages discarded, the range made inaccessible on the host and kept so across `mprotect`; removed, the mapping's protection back (private pages reading zero) | ignored |
 | `MADV_REMOVE` | frees a shared file's (or shared memory's) pages: they read as zero | the pages zeroed in place, so every mapping and the file read zero (the file's blocks are not freed); `EINVAL` for private anonymous memory, `EACCES` for a mapping that may not write the file | ignored |
@@ -1784,8 +1787,8 @@ macOS counterpart:
 | | Linux | macOS | fwe |
 |---|---|---|---|
 | Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native; one an ended thread left runs the next) or a host thread with its own vCPU (VM) |
-| `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either in the VM; natively `EINVAL` without a stack, `ENOSYS` without `CLONE_VM`); natively `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID` and `DETACHED` are accepted and others fail with `ENOSYS` |
-| `clone3` | `struct clone_args` | — | treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers, `CLONE_PIDFD` returns a process descriptor; `set_tid` fails with `ENOSYS` |
+| `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either); natively `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID` and `DETACHED` are accepted and others fail with `ENOSYS` |
+| `clone3` | `struct clone_args` | — | treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers, `CLONE_PIDFD` returns a process descriptor; `set_tid` chooses the child's pids in fwe's pid namespaces (`EPERM` in the initial one) |
 | Per-thread state | in the task | — | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
 | Robust futex list | walked as a thread ends: words it owns marked `FUTEX_OWNER_DIED`, a waiter woken | — | the same, as a thread ends and for every thread as the process ends or calls `execve`; not for a native process ended by `SIGKILL`, nor one ended by a signal from outside fwe |
 | `get_robust_list` of another thread | the target's head, to a caller that may trace it | — | the process's other threads' heads from its registry, another process's from its entry of them in the process records' memory, which the process writes |
@@ -1955,7 +1958,7 @@ to the host.
 |---|---|---|
 | a process's root (`chroot`) and mount table | one host filesystem | guest paths resolved component by component (`crates/kernel/src/fs.rs`): symlinks followed by fwe, mounts entered, `..` clamped at the process's root, as `openat2(RESOLVE_IN_ROOT)` would; the final host `openat` has `O_NOFOLLOW` added |
 | descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 16384 at most), out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
-| record locks (`F_SETLK`) | POSIX locks, different `struct flock`; any close of a file by the process drops its locks on it | translated; the host's, so they hold against host processes too; fwe reaches a guest's file by path for its own ends, so no close of fwe's drops them |
+| record locks (`F_SETLK`) | POSIX locks, different `struct flock`; any close of a file by the process drops its locks on it | translated; the host's, so they hold against host processes too; fwe reaches a guest's file by path for its own ends, but for the few it reads through a descriptor of its own, whose close drops them ([known limitations](architecture.md#known-limitations)) |
 | OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
 | leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits, up to `fs.lease-break-time` |
 | `F_SETSIG`, thread owners | `SIGIO` to a process or group | kept per descriptor; how a host `SIGIO` arrives is under [Network events](#network-events) |
@@ -1985,8 +1988,10 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   it shares in fwe's process store as they change, and its `maps`,
   `smaps`, `environ`, `io`, `cwd` and `root` are refused (`EACCES`) to a
   reader that may not trace it, as Linux refuses them. `/proc/sys` writes
-  reach the namespace sysctls fwe keeps (network, IPC), the UTS
-  namespace's names, and the few it acts on.
+  reach the network and IPC namespaces' sysctls (the initial ones' too,
+  fwe's own copy that never reaches the host), each user namespace's
+  `user.max_*` limits, the UTS namespace's names, and the global ones fwe
+  acts on.
 - `/proc/net` is the reader's network namespace: a namespace of fwe's
   has `lo` alone; the initial one shows the host's interfaces
   (`getifaddrs`, `lo0` as `lo`) and the routes of their own networks.
@@ -2113,8 +2118,8 @@ is a host process, native or running the VM alike.
 | moving a process (`cgroup.procs`, `CLONE_INTO_CGROUP`) | Linux's delegation: write access to `cgroup.procs` of the cgroup the source and destination are both in (`EACCES`), both inside the writer's cgroup namespace (`ENOENT`; the hierarchy is mounted `nsdelegate`) | none |
 | `cgroup.type`, `cgroup.threads` | only domain cgroups: `threaded` is `EOPNOTSUPP`, and a thread moves only to the cgroup it is in | none |
 | `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
-| `pids.max` | enforced on `fork` and on a new thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
-| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
+| `pids.max` | enforced on `fork` and on a new thread natively, not on a VM thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
+| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too; a frozen member is a stopped process, so a `SIGCONT` thaws it and its parent sees the stop | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
 | `cgroup.kill` | kills the members | `SIGKILL`, relayed so a process running the VM takes it down first |
 | device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`) | none |
 | `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back, not enforced | none: macOS has no such limit for a process |
@@ -2314,22 +2319,306 @@ numbers mean nothing there. fwe keeps its own:
 | `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, `CORE`, `STACK`, `CPU`, `NPROC`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`): `CORE` for fwe's core dumps, `STACK` for the guest's stack, `CPU`'s hard limit and `NPROC` enforced by fwe; `NOFILE` is virtual, below fwe's reserved descriptors; `FSIZE`, `DATA`, `AS` are the host's |
 | `personality` | none | kept per process; `UNAME26` and `STICKY_TIMEOUTS` act |
 
+## What fwe enforces
+
+A reference, area by area, of what becomes of each Linux mechanism under
+fwe. The status words mean:
+
+- **enforced**: fwe applies Linux's rule, refusing what Linux refuses.
+- **emulated**: fwe implements the behaviour itself, on its own records
+  or interpreters.
+- **host**: macOS does it; the notes say where that differs from Linux.
+- **kept**: accepted, stored and reported back, with no effect.
+- **ignored**: accepted, with no effect, and not reported back.
+- **refused**: fails with the errno given; the notes say whether Linux
+  fails so when the feature is configured out.
+
+The rules live in the kernel crate, so a row holds for both backends
+unless it names one. How each piece works is in the sections linked;
+where fwe falls short of Linux in detail is in
+[architecture.md](architecture.md#known-limitations).
+
+### Security
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| Capability sets (effective, permitted, inheritable, bounding, ambient) | **enforced** | Linux's `capset`, `PR_CAPBSET_*`, `PR_CAP_AMBIENT`, `setuid` and `execve` rules; root starts with all but `CAP_SYS_TIME`; per process, not per thread ([Credentials and capabilities](#credentials-and-capabilities)) |
+| Securebits, keepcaps | **enforced** | `NOROOT`, `NO_SETUID_FIXUP`, `KEEP_CAPS`, `NO_CAP_AMBIENT_RAISE` and their locks; `SECBIT_EXEC_*` `EINVAL`, as on 6.12 |
+| Capabilities in user namespaces | **enforced** | each check asks the namespace owning the object; whole-system ones the initial namespace ([Credentials and capabilities](#credentials-and-capabilities)) |
+| seccomp strict mode | **enforced** | `read`, `write`, `exit`, `rt_sigreturn`; anything else `SIGKILL` ([seccomp](#seccomp)) |
+| seccomp filters | **emulated** | classic BPF checked as Linux checks it and run by fwe before either backend routes the call; `no_new_privs` or `CAP_SYS_ADMIN` (`EACCES`); every thread of the process; kept across `fork` and `execve` |
+| `SECCOMP_RET_ALLOW`, `ERRNO`, `TRAP`, `KILL_THREAD`, `KILL_PROCESS` | **enforced** | `TRAP` raises `SIGSYS` with Linux's `_sigsys` fields; the kills are logged |
+| `SECCOMP_RET_LOG`, `SECCOMP_FILTER_FLAG_LOG` | **emulated** | an audit record (`type=1326`) in fwe's kernel log, which `dmesg` reads |
+| `SECCOMP_RET_TRACE` | **emulated** | a tracer with `PTRACE_O_TRACESECCOMP` gets `PTRACE_EVENT_SECCOMP`; without one the call fails with `ENOSYS`, as on Linux |
+| `SECCOMP_RET_USER_NOTIF`, `FLAG_NEW_LISTENER`, `FLAG_WAIT_KILLABLE_RECV` | **refused** | no listener: the filter flags `EINVAL`, the action `ENOSYS` (Linux's answer with no listener), `GET_ACTION_AVAIL` of it `EOPNOTSUPP`; Linux has listeners whenever it has filters |
+| `FLAG_TSYNC`, `FLAG_TSYNC_ESRCH`, `FLAG_SPEC_ALLOW` | **ignored** | filters are always the whole process's; speculation is the host's |
+| `/proc/sys/kernel/seccomp` | **refused** | `ENOENT`; the actions logged are Linux's defaults |
+| `PTRACE_SECCOMP_GET_FILTER`, `PTRACE_O_SUSPEND_SECCOMP` | **refused** | `EIO`, `EINVAL`, as without `CONFIG_CHECKPOINT_RESTORE` |
+| Container seccomp profiles | **enforced** | Docker's, Podman's, a pod's: as filters above; a profile with `SCMP_ACT_NOTIFY` does not load |
+| Landlock | **enforced** | ABI 6: file rights by path (`EACCES`, `REFER` `EXDEV`), `TRUNCATE` and `IOCTL_DEV` at open for every descriptor of the file, TCP bind and connect, signal and abstract-socket scopes (`EPERM`), mounts refused, tracing only within the domain; the domain is the process's, not the thread's ([Debugging and sandboxing calls](#debugging-and-sandboxing-calls)) |
+| AppArmor | **refused** | no `/sys/kernel/security/apparmor` (`ENOENT`), as a kernel without it; runtimes apply no profile ([Security modules](#security-modules-selinux-apparmor-landlock)) |
+| SELinux | **refused** | no `/sys/fs/selinux` (`ENOENT`), as a kernel without it; `security.selinux` attributes **kept** |
+| `lsm_list_modules`, `/sys/kernel/security/lsm` | **emulated** | `capability,landlock,yama` |
+| `lsm_get_self_attr`, `lsm_set_self_attr`, `/proc/<pid>/attr` | **refused** | `EOPNOTSUPP` after Linux's argument checks; `attr` `ENOENT`: no module keeps process attributes |
+| `bpf()` privilege | **enforced** | `CAP_BPF` or `CAP_SYS_ADMIN` in the initial namespace (`EPERM`), maps and socket filters for anyone while `kernel.unprivileged_bpf_disabled` is 0 (2 by default) ([eBPF](#ebpf)) |
+| BPF cgroup device programs | **enforced** | interpreted on every device open and `mknod` of the cgroup's members ([cgroups](#cgroups)) |
+| BPF socket filters (`SO_ATTACH_BPF`) | **emulated** | run on what this process sends to the filtered socket, by any call |
+| Other BPF program types (kprobe, tracepoint, XDP, tc, LSM, ...) | **refused** | `EINVAL` at load, as a kernel without them |
+| BPF maps, helpers, verifier | **emulated** | hash and array maps (others `EINVAL`); map helpers and `bpf_skb_load_bytes` (others `EINVAL`); structural checks, a bounds check for socket filters (`EACCES` with a log), loops stopped after 2^20 steps |
+| Other BPF commands, pinning, the BPF filesystem | **refused** | `EINVAL` (`BPF_OBJ_PIN` too); mounting `bpf` `ENODEV` |
+| Classic `SO_ATTACH_FILTER`, `SO_LOCK_FILTER` | **refused** | `ENOPROTOOPT` |
+| ptrace access | **enforced** | Linux's `ptrace_may_access` (ids, dumpable, capabilities, `CAP_SYS_PTRACE` in the target's namespace) for `ptrace`, `/proc/<pid>/mem`, `process_vm_*`, `pidfd_getfd`; only fwe's processes can be traced ([ptrace](#ptrace)) |
+| Yama (`kernel.yama.ptrace_scope`, `PR_SET_PTRACER`) | **enforced** | 1 by default |
+| Dumpable (`PR_SET_DUMPABLE`, `fs.suid_dumpable`) | **enforced** | set by `execve` and id changes as on Linux; decides tracing, `/proc/<pid>` ownership and core dumps |
+| `no_new_privs` | **enforced** | inherited and kept across `execve`; blocks set-ID and file-capability gains |
+| File capabilities (`security.capability`) | **enforced** | applied at `execve`; `CAP_SETFCAP` to write, checked (revisions 2, 3), kept per user namespace, removed by `chown`, a write or a truncation |
+| Set-ID programs | **emulated** | on the owner and group fwe keeps; nothing gained on `nosuid`, under `no_new_privs`, or while traced by any tracer ([execve](#execve)) |
+| `AT_SECURE` | **emulated** | 1 after a privilege-raising `execve`; the auxv ids are the guest's ([auxv](#auxv-hwcaps-and-the-vdso)) |
+| Keyrings | **emulated** | key types, permissions and quotas (`EDQUOT`) in one record of every fwe process ([Other IPC calls](#other-ipc-calls)); no `request-key` upcall: a key to construct is negative (`ENOKEY`) |
+| Audit (`NETLINK_AUDIT`, `loginuid`, `sessionid`) | **refused** | `EPROTONOSUPPORT`, `ENOENT`, as without `CONFIG_AUDIT` |
+| `syslog`, `dmesg` | **emulated** | fwe's kernel log, holding the seccomp audit records; reading needs `CAP_SYSLOG` or `CAP_SYS_ADMIN`; no `/dev/kmsg` |
+| `kernel.dmesg_restrict`, `kptr_restrict`, `perf_event_paranoid`, `/proc/kallsyms` | **refused** | `ENOENT` |
+| Kernel modules, `kexec` | **refused** | `ENOSYS`, as without `CONFIG_MODULES`, `CONFIG_KEXEC` ([Not available](#not-available)) |
+| Lockdown | **refused** | no `/sys/kernel/security/lockdown` (`ENOENT`), as without the lockdown module |
+| Address-space randomisation | **host** | natively where macOS's `mmap` places things; in the VM none: first fit, the same every run; `kernel.randomize_va_space` `ENOENT`, `ADDR_NO_RANDOMIZE` **kept** |
+| `vm.mmap_min_addr` | **kept** | reads 65536; natively macOS refuses everything below 4 GiB, the VM does not check it |
+
+### Identity and processes
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| Pids in the initial pid namespace | **host** | the host's pids; thread ids from a counter fwe's processes share, from 100000, never a host pid |
+| Pid namespaces | **emulated** | records numbering processes and threads from 1, nested, every pid translated; init takes only the signals it handles and its end kills the rest ([Namespaces](#namespaces)) |
+| `clone3` `set_tid` | **emulated**; initial namespace **refused** | chooses pids in fwe's namespaces (`CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`); `EPERM` in the initial one, whose pids are macOS's |
+| `kernel.ns_last_pid` | **refused** | `ENOENT` in every pid namespace |
+| `kernel.pid_max` | **enforced** | for fwe's pid namespaces; host pids are macOS's |
+| uids, gids (real, effective, saved, fs), groups | **emulated** | virtual, root by default, Linux's `set*id` and `setgroups` rules and capability changes; per process, not per thread; the host process never changes ([Credential and namespace calls](#credential-and-namespace-calls)) |
+| The host user underneath | **host** | every guest user is the macOS user running fwe, with that user's rights ([Isolation and security](#isolation-and-security)) |
+| User namespaces, `uid_map`, `gid_map`, `setgroups` | **enforced** | no privilege needed; maps written once, 340 lines, an unprivileged writer its own id only, `gid_map` after `setgroups` `deny`; the initial namespace's maps read as identity (writes `EPERM`) |
+| Overflow ids | **emulated** | an unmapped id, and a host user other than fwe's, read as 65534 ([Host identity](#host-identity-and-machine-state)) |
+| Signal permission | **enforced** | `CAP_KILL` in the target's user namespace or Linux's uid match, `SIGCONT` within the session, each member of a group; `kill(-1)` reaches the caller's pid namespace, or the processes of its run of fwe, never other host processes |
+| Signals the host lacks (`SIGSTKFLT`, `SIGPWR`, 32–64) | **emulated** | fwe's pending sets, another fwe process's mailbox; to a process fwe did not start `EINVAL` ([Sending a signal](#sending-a-signal)) |
+| siginfo sender | **emulated** | the sender's pid and guest uid in the receiver's namespaces |
+| `SIGKILL`, `SIGSTOP` | **host** | `SIGKILL` to an fwe process relayed so a VM goes down first |
+| `RLIMIT_CPU` | **enforced** | `SIGXCPU` at the soft limit (the host's), `SIGKILL` at the hard limit (fwe's) |
+| `RLIMIT_FSIZE` | **host** | `SIGXFSZ`, `EFBIG`; never above the host's hard limit |
+| `RLIMIT_DATA` | **host** | set on the fwe process; the guest's `brk` is not held to it |
+| `RLIMIT_STACK` | **emulated** natively; VM **kept** | natively the main stack's size (128 KiB to 4 GiB); in the VM 8 MiB whatever it says |
+| `RLIMIT_CORE` | **emulated** | fwe writes core files and cuts them at it |
+| `RLIMIT_RSS`, `RLIMIT_LOCKS`, `RLIMIT_RTTIME` | **kept** | Linux ignores the first two too; there is no real-time scheduling to time |
+| `RLIMIT_NPROC` | **enforced** | the user's threads across fwe's processes, at `fork` (`EAGAIN`) and at a native thread's creation, not a VM thread's; not checked at `execve` after `setuid` |
+| `RLIMIT_NOFILE` | **enforced** | virtual, below fwe's reserved descriptors, capped by `fs.nr_open` |
+| `RLIMIT_MEMLOCK` | **enforced** | `mlock*`, `MAP_LOCKED`, `MCL_FUTURE`; `CAP_IPC_LOCK` exempt |
+| `RLIMIT_AS` | **host** | set on the fwe process, so fwe's own reservations count |
+| `RLIMIT_SIGPENDING` | **enforced** | per process, not per user; at most 4096 queued |
+| `RLIMIT_MSGQUEUE` | **enforced** | at `mq_open`, per user within the IPC namespace |
+| `RLIMIT_NICE`, `RLIMIT_RTPRIO` | **enforced** | bound lowering nice and real-time priorities on the kept values |
+| `prlimit` of another process | **enforced** | fwe's processes only (`ESRCH`); takes effect at its next system call |
+| Nice (`setpriority`) | **emulated** | per thread; the process's given to the host, which lets it rise only ([Process and thread calls](#process-and-thread-calls)) |
+| Scheduling policies, `sched_setattr`, `SCHED_DEADLINE`, uclamp | **kept** | Linux's checks, inherited; the host schedules every thread alike |
+| CPU affinity | **kept** | checked and kept per process; threads run on any CPU; `getcpu` names its first |
+| `ioprio_set`, `ioprio_get` | **kept** for the caller; others **ignored** | class and level checked; another process's accepted without a permission check |
+| Autogroup | **refused** | `ENOENT`, as without `CONFIG_SCHED_AUTOGROUP` |
+| Overcommit (`vm.overcommit_memory`) | **kept** | 0, read-only; the host decides |
+| OOM score (`oom_score_adj`, `oom_adj`) | **kept** | Linux's write rules; no OOM killer ([Memory pressure](#memory-pressure)) |
+| `PR_SET_THP_DISABLE` | **kept** | |
+| KSM (`MADV_MERGEABLE`, `PR_SET_MEMORY_MERGE`) | **refused** | `EINVAL`, as without `CONFIG_KSM` |
+| NUMA policy calls | **refused** | `ENOSYS`, as without `CONFIG_NUMA` |
+| Protection keys | **refused** | `pkey_alloc` `ENOSPC`, as on a CPU without them |
+| `mseal` | **enforced** | `EPERM` for changes to sealed memory |
+| `memfd_secret` | **refused** | `ENOSYS`, as without `CONFIG_SECRETMEM` |
+| `mlock`, `mlock2`, `mlockall` | **enforced** | pages read in and wired on the host as far as it lets a user; `MLOCK_ONFAULT` wires nothing |
+| `MADV_NORMAL`, `RANDOM`, `SEQUENTIAL`, `WILLNEED`, `FREE` | **host** natively; VM **ignored** | hints given to the host ([The mmap family](#the-mmap-family)) |
+| `MADV_DONTNEED`, `DONTNEED_LOCKED` | **emulated** | private memory reads as zero or the file again; natively a private file mapping keeps modified pages |
+| `MADV_REMOVE` | **emulated** natively; VM **ignored** | pages zeroed in place, the file's blocks not freed |
+| `MADV_DONTFORK`, `WIPEONFORK`, `DONTDUMP`, `GUARD_INSTALL`, `HWPOISON` (and their inverses) | **emulated** natively; VM **ignored** | as Linux; `HWPOISON` needs `CAP_SYS_ADMIN` |
+| `MADV_HUGEPAGE`, `NOHUGEPAGE`, `COLD`, `PAGEOUT`, `POPULATE_READ`, `POPULATE_WRITE`, `COLLAPSE`, `SOFT_OFFLINE` | **ignored** | checked, nothing done |
+| Clocks | **host** | the host's realtime and monotonic clocks; `MONOTONIC` counts time asleep, as `BOOTTIME` does; CPU-time clocks of any process ([Time calls](#time-calls)) |
+| Setting the clock (`clock_settime`, `settimeofday`, `adjtimex`) | **refused** | `EPERM` after Linux's checks: no process holds `CAP_SYS_TIME` |
+| Time namespaces | **refused** | `CLONE_NEWTIME` `EINVAL`, as without `CONFIG_TIME_NS` |
+| Timer slack | **kept** | sleeps wake within tens of microseconds whatever it is |
+| `sysinfo` | **host** | uptime, load and memory; `procs` the caller's pid namespace's tasks |
+| `personality` | **kept**; `UNAME26`, `STICKY_TIMEOUTS` **emulated** | `PER_LINUX32` `EINVAL` |
+| `prctl` | **enforced** | the options it knows act or are kept as above; `PR_PAC_RESET_KEYS` only in the VM (natively `EINVAL`); speculation reads not affected (setting `ENXIO`); others `EINVAL` |
+| Parent-death signal, child subreaper | **emulated** | the signal when the parent process ends (not thread); orphans adopted by fwe ([Orphans and reapers](#orphans-and-reapers)) |
+| Process accounting (`acct`) | **emulated** | `acct_v3` records, per pid namespace |
+| Core dumps | **emulated** | fwe writes the ELF core (the dying thread's registers only), named by `kernel.core_pattern`; a pipe pattern dumps nothing; `coredump_filter` fixed |
+
+### Filesystems
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| Permission bits, in a root filesystem | **enforced** | the kept owner and mode against the guest's fs ids and groups, on every call and each directory searched; `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` as Linux ([Files and descriptors](#files-and-descriptors)) |
+| Permission bits, without a root filesystem | **host** | the host user's own files pass fwe's check for any guest user |
+| Modes the host would enforce on fwe | **emulated** | a mode denying its owner kept in an attribute; the host file keeps owner read and write |
+| Ownership (`chown`) | **emulated** | Linux's rules; the owner in an attribute, the host file the user's |
+| Set-ID bits | **emulated** | kept by fwe; cleared by a write, truncation or `chown`, as Linux clears them |
+| Sticky directories | **enforced** | `EPERM`, overlays too |
+| `fs.protected_symlinks`, `fs.protected_hardlinks` | **enforced** | off by default, Linux's built-in default |
+| `fs.protected_fifos`, `fs.protected_regular` | **refused** | `ENOENT`; not applied, as Linux's built-in default |
+| umask | **emulated** | fwe's; the host umask is 0 |
+| POSIX ACLs (`system.posix_acl_*`) | **refused** | `EOPNOTSUPP`, as a filesystem without ACLs |
+| `user.` attributes | **enforced** | regular files and directories, by the permission bits; stored as host attributes |
+| `trusted.` attributes | **enforced** | `CAP_SYS_ADMIN`; hidden without it |
+| `security.` attributes | **enforced** | `CAP_SYS_ADMIN` to write (`CAP_SETFCAP` for capabilities); kept, read by no module but file capabilities |
+| Immutable, append-only | **host** | the host's `UF_IMMUTABLE`, `UF_APPEND`; `CAP_LINUX_IMMUTABLE`; `EROFS` on read-only mounts |
+| No-dump | **kept** | |
+| `FS_NOATIME_FL` | **ignored** | |
+| Other inode flags (sync, compressed, project, extent sizes) | **refused** | `EOPNOTSUPP`, as tmpfs; `FS_IOC_FSGETXATTR` `ENOTTY` (`file_getattr` answers) |
+| Symlinks | **emulated** | fwe follows them (40, then `ELOOP`), `..` held at the root; a link's mode 0777 |
+| `O_NOFOLLOW`, `openat2` `RESOLVE_*` | **enforced** | `ELOOP`, `EXDEV`, `EAGAIN` as Linux |
+| Hard links | **enforced** | `EXDEV` across mounts; a directory `EPERM` |
+| FIFOs, named pipes | **host** | opens wait without fwe's lock; hang-up in `poll` **emulated** |
+| Device nodes | **emulated** | a marked file with Linux's numbers; `CAP_MKNOD` in the initial namespace, cgroup device programs; opens the host device for 1:3, 1:5, 1:7, 1:8, 1:9 and 5:0, else `ENXIO` ([Devices](#devices)) |
+| Unix socket nodes | **enforced** | connecting or sending needs write permission (`EACCES`) |
+| `O_TMPFILE` | **emulated** | a hidden name, counted as no link, gone with its last descriptor |
+| Case sensitivity | **host** | the volume's: APFS by default folds case ([known limitations](architecture.md#known-limitations)) |
+| tmpfs | **emulated** | a host directory; `size=` enforced (`ENOSPC`), `mode=` applied, `uid=`, `gid=`, `nr_inodes=` **ignored** ([Mounts](#mounts)) |
+| proc, sysfs, cgroup2, devpts, mqueue | **emulated** | fwe's; `hidepid=`, `subset=` **ignored** |
+| overlay, bind, move | **emulated** | Linux's layering and copy-up; binds keep their flags |
+| cgroup v1, ext4, btrfs, XFS, FUSE, NFS and other types | **refused** | `ENODEV`, as without them |
+| `ro`, `nosuid`, `nodev`, `noexec`, `nosymfollow` | **enforced** | `EROFS`, no gain, `EACCES`, `EACCES`/`EPERM`, `ELOOP` |
+| Access-time modes | **emulated** | `noatime`, `nodiratime`, `strictatime` by fwe; `relatime` the host's |
+| `sync`, `dirsync`, `lazytime`, `mand` | **ignored** | `mand` as Linux since 5.15 |
+| Idmapped mounts | **refused** | `MOUNT_ATTR_IDMAP` `EINVAL` |
+| Propagation | **emulated** | shared, slave, private, unbindable, across namespaces |
+| `flock`, record locks, OFD locks | **host** | translated; they hold against host programs ([Files and descriptors](#files-and-descriptors)) |
+| Leases | **emulated** | among fwe's processes |
+| Mandatory locking | **ignored** | as Linux since 5.15 |
+| inotify, dnotify | **emulated** | raised by fwe's processes' calls, not by host programs ([Files changing on the host](#files-changing-on-the-host)) |
+| fanotify | **refused** | `ENOSYS`, as without `CONFIG_FANOTIFY` |
+| Quotas | **refused** | `ENOSYS`, as without `CONFIG_QUOTACTL` |
+| Timestamps | **host** | APFS's, in nanoseconds, its birth time as `STATX_BTIME`; `utimensat`'s permission rules **enforced** |
+| `O_NOATIME` | **enforced** | owner or `CAP_FOWNER` |
+| `O_DIRECT` | **ignored** | |
+| `fallocate` | **host** | modes 0, `KEEP_SIZE`, `PUNCH_HOLE`; others `EOPNOTSUPP` |
+| `FICLONE`, `FICLONERANGE`, `FIDEDUPERANGE`, fs-verity, fscrypt | **refused** | `EOPNOTSUPP`, `ENOTTY`, as tmpfs |
+| `statfs` | **emulated** | the mount's type (the root as ext4), the host's sizes |
+| memfd seals, `ETXTBSY` | **enforced** | |
+| `fsync`, `sync` | **host** | macOS flushes no drive cache without `F_FULLFSYNC` |
+| `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT` | **host**; `WHITEOUT` **emulated** | |
+| `name_to_handle_at`, `open_by_handle_at` | **emulated** | the host's file id; `CAP_DAC_READ_SEARCH`, within the caller's root and mounts |
+
+### IPC and networking
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| Pipes | **host** | 64 KiB at most; smaller sizes (`F_SETPIPE_SZ`) **emulated**, larger **kept**; writes of up to 4096 bytes kept whole by fwe ([Files and descriptors](#files-and-descriptors)) |
+| `fs.pipe-max-size` | **enforced** | `fs.pipe-user-pages-*` **kept** |
+| `pipe2(O_DIRECT)` | **ignored** | the pipe stays a byte stream |
+| `O_NOTIFICATION_PIPE` | **refused** | `ENOPKG`, as without `CONFIG_WATCH_QUEUE` |
+| eventfd, signalfd, timerfd, epoll, pidfd | **emulated** | on kqueues and pipes ([Waiting and events](#waiting-and-events)); `TFD_TIMER_CANCEL_ON_SET`, `EPOLLWAKEUP` **ignored**; `EPOLLEXCLUSIVE` wakes one waiter for a pipe only |
+| io_uring | **refused** | `ENOSYS`, as without `CONFIG_IO_URING` |
+| Linux AIO (`io_setup` and the rest) | **emulated** | requests carried out as submitted; `fs.aio-max-nr` enforced ([Waiting and event calls](#waiting-and-event-calls)); POSIX AIO is the C library's, on threads |
+| Unix stream and datagram sockets | **host** | Linux's buffer sizes ([Socket calls](#socket-calls)) |
+| Unix `SOCK_SEQPACKET` | **emulated** | a framed host stream |
+| Unix abstract names | **emulated** | files per network namespace |
+| Unix autobind, `SOCK_RAW` | **refused** | the host's `EINVAL`, `EPROTONOSUPPORT` |
+| `SCM_RIGHTS` | **emulated** | up to 253 descriptors; fwe's own kinds travel with their state |
+| `SCM_CREDENTIALS`, `SO_PASSCRED` | **enforced** | checked as Linux checks them, attached by fwe |
+| `SO_PEERCRED` | **emulated** | the peer's ids as fwe keeps them, as they are when asked |
+| `SO_PEERSEC`, `SO_PASSSEC`, `SO_PEERPIDFD`, `SO_PASSPIDFD`, `SO_PEERGROUPS` | **refused** | `ENOPROTOOPT` |
+| TCP and UDP, IPv4 and IPv6 | **host** | real connections; addresses, flags and options translated; `MSG_MORE`, `MSG_FASTOPEN` **emulated** |
+| Privileged ports | **enforced** | `ip_unprivileged_port_start` and `CAP_NET_BIND_SERVICE` (`EACCES`) |
+| Raw IP sockets | **enforced**, then **host** | `CAP_NET_RAW` (`EPERM`); macOS then needs fwe to run as root |
+| ICMP ping sockets | **enforced**, then **host** | `net.ipv4.ping_group_range` (`EACCES`; Linux's default closes it) |
+| `AF_PACKET`, `AF_VSOCK`, `AF_ALG`, `AF_XDP`, `AF_KEY` and other families | **refused** | `EAFNOSUPPORT`, as without them |
+| SCTP, MPTCP and other protocols | **refused** | `EPROTONOSUPPORT`, as without them |
+| Options `SOL_SOCKET`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP` | **host** | translated ([Sockets](#sockets)); `SO_SNDBUF`, `SO_RCVBUF` by Linux's arithmetic |
+| `SO_PRIORITY`, `SO_NO_CHECK`, `IP_RECVERR`, `IPV6_RECVERR`, `ICMP_FILTER`, `UDP_GRO` | **kept** | |
+| `SOL_UDP` (`UDP_CORK`, `UDP_SEGMENT`) | **emulated** | |
+| `SO_REUSEPORT` | **host** | no load balancing, no same-user check |
+| `SO_BINDTODEVICE`, `SO_MARK`, timestamping, busy poll, `SO_ZEROCOPY`, `IP_PKTINFO`, `IP_RECVTTL`, `IP_FREEBIND`, `IP_TRANSPARENT`, `IPV6_RECVPKTINFO`, `TCP_INFO`, `TCP_CONGESTION`, `TCP_USER_TIMEOUT`, `TCP_ULP`, `TCP_MD5SIG`, `TCP_REPAIR` | **refused** | `ENOPROTOOPT`; Linux has most of them in every configuration |
+| `NETLINK_ROUTE` | **emulated** | links and addresses listed (`lo` in a namespace, the host's interfaces in the initial one), `lo` brought up or down; other requests `EOPNOTSUPP`, multicast groups **ignored** |
+| Other netlink families (audit, netfilter, generic, uevent, sock_diag, xfrm) | **refused** | `EPROTONOSUPPORT`, as without them |
+| Network namespaces | **emulated** | loopback only, down until brought up; own ports (mapped onto host loopback ports, which host programs can reach), abstract names, sysctls, `/proc/net`; a socket stays in the one it was made in ([Namespaces](#namespaces)) |
+| Interfaces (`SIOCGIF*`, `SIOCSIFFLAGS`, `SIOCSIFMTU`) | **emulated** | `lo` in a namespace; the host's interfaces, unchangeable (`EPERM`), in the initial one; other requests `ENOTTY` |
+| Addresses, routes, veth, bridges, macvlan, `/dev/net/tun` | **refused** | `EOPNOTSUPP`, `ENODEV`, `ENOENT`/`ENXIO` ([roadmap](../ROADMAP.md#m8--virtual-networking)) |
+| iptables, nftables | **refused** | `ENOPROTOOPT`, `EPROTONOSUPPORT`, as without netfilter |
+| Network sysctls | **enforced** | `ip_unprivileged_port_start`, `ping_group_range`, `somaxconn`, `rmem_max`, `wmem_max` per namespace, the initial one's fwe's own copy; `ip_forward` **kept**; others `ENOENT` |
+| System V shared memory, semaphores, messages | **emulated** | fwe's per IPC namespace, not macOS's; permissions and limits **enforced**; `SHM_LOCK` **kept**; `SHM_HUGETLB` `EINVAL` ([Other IPC calls](#other-ipc-calls)) |
+| POSIX message queues | **emulated** | per IPC namespace; permissions and limits **enforced**; `poll` always ready |
+
+### Namespaces and cgroups
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| Mount namespace | **emulated** | a mount table each ([Mounts](#mounts)) |
+| UTS namespace | **emulated** | the initial one's names are the Mac's, refused (`EPERM`) even to root |
+| IPC namespace | **emulated** | System V objects, queues and IPC sysctls each; the initial one is fwe's, not the host's |
+| Network namespace | **emulated** | as above; the initial one is the host's network |
+| Pid namespace | **emulated** | as above; the initial one has the host's pids |
+| User namespace | **emulated** | ids mapped, capabilities scoped to it ([Credentials and capabilities](#credentials-and-capabilities)) |
+| Cgroup namespace | **emulated** | `/proc/<pid>/cgroup` and `cgroup2` mounts from its root |
+| Time namespace | **refused** | `EINVAL`, as without `CONFIG_TIME_NS` |
+| `user.max_*_namespaces` | **enforced** | `ENOSPC`; counted over all of fwe's namespaces of the kind, not per user |
+| `clone`, `unshare`, `setns` | **enforced** | Linux's flag rules and capabilities ([Credential and namespace calls](#credential-and-namespace-calls)) |
+| `NS_GET_*` requests, `/proc/<pid>/ns`, nsfs binds | **emulated** | `NSTYPE`, `OWNER_UID`, `PARENT`, `USERNS`, `MNTNS_ID`; others `ENOTTY` |
+| cgroup v2 tree | **emulated** | one per host user, all of their fwe processes, `nsdelegate` ([cgroups](#cgroups)) |
+| cgroup v1 | **refused** | `ENODEV` |
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.controllers`, `cgroup.max.*` | **enforced** | Linux's delegation and no-internal-process rules |
+| `cgroup.type`, `cgroup.threads` | **refused** | `threaded` `EOPNOTSUPP`; a thread moves only where it is |
+| `cgroup.events`, `cgroup.stat` | **emulated** | |
+| `cgroup.freeze`, `cgroup.kill` | **emulated** | host `SIGSTOP`, `SIGCONT`, `SIGKILL` to the members |
+| `pids.max` | **enforced** | at `fork` and a native thread's creation, up the tree (`EAGAIN`), not for a VM thread |
+| `pids.current`, `memory.current`, `cpu.stat` | **host** | the members' threads, resident memory and times |
+| `memory.max`, `high`, `low`, `min`, `swap.max`, `oom.group`, `cpu.max`, `cpu.weight`, `cpuset.*`, `io.*`, `hugetlb.*`, `rdma.*`, `misc.*` | **kept** | macOS bounds no process's memory or CPU; `memory.stat`, `memory.events`, `io.stat` read zeros |
+| Pressure (`*.pressure`, `/proc/pressure`) | **refused** | `ENOENT`, as without `CONFIG_PSI` |
+| `perf_event` controller | **refused** | not offered |
+| Device programs | **enforced** | see Security |
+
+### /proc, /sys and /dev
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| `/proc/<pid>` | **emulated** | the reader's pid namespace's processes; in the initial one only fwe's (another host process: its `stat` only) ([/proc, /sys and /dev](#proc-sys-and-dev)) |
+| `stat`, `status`, `statm`, `io` | **host** with **emulated** | state, times and memory from the host; ids, capabilities, tracer and seccomp from fwe; `io` storage bytes only |
+| `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `mem`, `fd`, `fdinfo`, `ns`, `cgroup`, `limits`, `mountinfo`, `cwd`, `root`, `task` | **emulated** | from fwe's records; another process's private ones by ptrace access (`EACCES`) |
+| `uid_map`, `gid_map`, `setgroups` | **enforced** | |
+| `oom_score_adj`, `timerslack_ns` | **kept** | |
+| `coredump_filter` | **emulated** | constant; writes `EACCES` |
+| `wchan`, `stack`, `syscall`, `sched`, `attr`, `loginuid`, `numa_maps`, `smaps_rollup`, `clear_refs`, `autogroup` | **refused** | `ENOENT` |
+| `meminfo`, `cpuinfo`, `stat`, `uptime`, `loadavg` | **host** | the host's figures; counters the host lacks read 0 |
+| `version`, `filesystems`, `config.gz`, `cmdline` | **emulated** | constant |
+| `mounts`, `partitions`, `keys`, `sysvipc`, `net` | **emulated** | from fwe's records, per namespace |
+| `modules`, `kallsyms`, `swaps`, `kmsg`, `vmstat`, `zoneinfo`, `interrupts`, `diskstats`, `locks`, `pressure` | **refused** | `ENOENT` |
+| `/proc/sys` | **enforced** | network, IPC, `user.max_*`, UTS names and the global sysctls fwe acts on (`fs`, `kernel.keys`, `core_pattern`, `printk`, `yama`, `unprivileged_bpf_disabled`, `pid_max`, `vm.max_map_count`); `vm.drop_caches` **kept**; others constant (writes `EACCES`) or absent (`ENOENT`) |
+| `/sys` | **emulated** | `fs/cgroup`, `kernel/security/lsm`, `devices/system/cpu` (host counts), the loop devices; `class`, `bus`, `module`, `fs/bpf`, `kernel/mm` `ENOENT`; `debugfs`, `securityfs` mounts `ENODEV` |
+| `/dev/null`, `zero`, `random`, `urandom`, `tty` | **host** | |
+| `/dev/full`, `ptmx`, `pts`, `loop-control`, `loopN`, `shm`, `mqueue`, `fd` | **emulated** | ([Devices](#devices)) |
+| `/dev/kvm`, `fuse`, `net/tun`, `dri`, `mem`, `kmsg`, `console`, `userfaultfd` | **refused** | `ENOENT` (`ENXIO` for a node made for them) |
+
 ### Not available
 
-Any call not dispatched in `crates/kernel/src/syscalls.rs` fails with
-`ENOSYS`, noted under `--strace`. These are:
+These system calls are not dispatched in `crates/kernel/src/syscalls.rs`
+and fail with `ENOSYS`, noted under `--strace`, in both backends:
 
-- `io_uring_setup` and the rest, `userfaultfd`, `perf_event_open`,
-  `fanotify_init`/`fanotify_mark`: as on a kernel built without them, which
-  `/proc/config.gz` says fwe's is;
-- `rseq`;
-- `open_tree_attr`, `listns`;
-- `process_mrelease`, `memfd_secret`,
-  `map_shadow_stack`;
-- the module calls (`init_module`, `finit_module`, `delete_module`), as
-  on a kernel built without modules (`CONFIG_MODULES` not set),
-  `kexec_load`/`kexec_file_load`, `swapon`/`swapoff`,
-  `quotactl`/`quotactl_fd`, the NUMA policy calls.
+- io_uring (`io_uring_setup`, `io_uring_enter`, `io_uring_register`),
+  `perf_event_open`, `fanotify_init`, `fanotify_mark`, `userfaultfd`, the
+  module calls (`init_module`, `finit_module`, `delete_module`),
+  `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `quotactl`,
+  `quotactl_fd`, the NUMA calls (`mbind`, `get_mempolicy`,
+  `set_mempolicy`, `set_mempolicy_home_node`, `migrate_pages`,
+  `move_pages`), `rseq`, `rseq_slice_yield`, `memfd_secret`,
+  `map_shadow_stack`: as on a kernel built without them, which
+  `/proc/config.gz` says fwe's is for io_uring, perf events, fanotify,
+  userfaultfd and modules;
+- `lookup_dcookie`, `nfsservctl`: `ENOSYS` on every Linux;
+- `process_mrelease`, `open_tree_attr`, `listns`, `restart_syscall`:
+  Linux has them in every configuration (`restart_syscall` called
+  directly gives `EINTR`).
+
+These are refused whatever their arguments, once checked:
+
+- `clock_settime`, `settimeofday`, and `adjtimex`, `clock_adjtime` with
+  a change: `EPERM`, as for a process without `CAP_SYS_TIME`;
+- `reboot` but Ctrl-Alt-Del on or off: `EPERM`;
+- `pkey_alloc`: `ENOSPC`, as on a CPU without protection keys;
+- `lsm_get_self_attr`, `lsm_set_self_attr`: `EOPNOTSUPP`;
+- `futex`'s PI operations and `FUTEX_FD`: `ENOSYS`, as without
+  `CONFIG_FUTEX_PI`; `FUTEX_WAKE_OP` too, which Linux always has;
+- `CLONE_NEWTIME`: `EINVAL`, as without `CONFIG_TIME_NS`;
+  `personality(PER_LINUX32)`: `EINVAL`, as without 32-bit support.
 
 ## macOS to Linux
 
@@ -2733,7 +3022,8 @@ for each kind of descriptor:
 The guest's time is the Mac's. `CLOCK_REALTIME`, `TAI`, the `*_COARSE` and
 `*_ALARM` clocks read the host's realtime clock, which the guest cannot
 set (`EPERM`); `MONOTONIC`, `BOOTTIME` and their variants read the host's
-`CLOCK_MONOTONIC`, `MONOTONIC_RAW` its raw clock, and the CPU-time clocks
+`CLOCK_MONOTONIC`, which counts time the Mac sleeps (Linux's `MONOTONIC`
+does not), `MONOTONIC_RAW` its raw clock, and the CPU-time clocks
 the host thread's or process's CPU time. Interval timers are the host's
 and their signals relayed; POSIX timers and timerfds are fwe's
 ([Time calls](#time-calls)). In the VM, `CNTVCT_EL0` is the vCPU's virtual
