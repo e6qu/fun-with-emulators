@@ -1,6 +1,8 @@
 //! Phase timings of a start, an `execve` and a `fork`, for finding where
 //! their time goes: with `FWE_TIMING` set, each mark writes to standard
-//! error how long since the previous one and since the process began.
+//! error how long since the previous one and since the process began. A
+//! `backend:` mark names the backend each program starts in, native or the
+//! VM (the benchmarks count them).
 //! Off (the default), a mark costs one relaxed load.
 
 use std::sync::OnceLock;

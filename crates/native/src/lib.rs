@@ -1088,9 +1088,11 @@ fn start(
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if needs_vm(&data) {
+        fwe_kernel::timing::mark("backend: vm");
         drop(fs);
         return Err(hv::run(path, &data, args, env, options));
     }
+    fwe_kernel::timing::mark("backend: native");
 
     let page = page_size();
     let tracer = options.strace;

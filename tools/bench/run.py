@@ -153,6 +153,8 @@ BUDGETS = {
 # that also measures the builds' differences (Alpine's compiler and C
 # library against Homebrew's), not only fwe.
 SHARE = "fwe's share"
+# Which of fwe's backends ran each benchmark's programs ([`backends`]).
+BACKEND = "fwe's backend"
 # The results of the same benchmarks in a Linux VM on the same Mac
 # (tools/bench/vm.sh): what fwe competes with.
 VM = "Linux VM"
@@ -175,6 +177,27 @@ BREW = {
     "xz": "opt/xz/bin/xz",
 }
 
+
+
+def backends(cmd, fresh=()):
+    """Which of fwe's backends ran the programs of `cmd` (fwe, or `env -i`
+    and fwe), by the `backend:` marks of `FWE_TIMING` (every program a run
+    starts, in every process): "native", "VM", or both with how many of
+    each. `fresh` is emptied first."""
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    if cmd[0] == "env":
+        cmd, env = cmd[:2] + ["FWE_TIMING=1"] + cmd[2:], None
+    else:
+        env = dict(os.environ, FWE_TIMING="1")
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace")
+    n = collections.Counter(re.findall(r"timing: backend: (native|vm) ", r.stderr))
+    if not n:
+        return "unknown"
+    if len(n) == 1:
+        return "native" if "native" in n else "VM"
+    return f"native {n['native']}, VM {n['vm']}"
 
 
 def best(f, rounds=ROUNDS):
@@ -337,6 +360,9 @@ def macos(a):
             sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
             pcs(f"{name} (micro)", fwe + [a.bench, "file", args[1], "300000"])
     results = {"fwe": ours, "macOS": theirs}
+    # The benchmark program alone, and forking and running itself.
+    ran = backends(fwe + [a.bench, "forkexec", "2", a.bench])
+    results[BACKEND] = {row: ran for row in ours}
     if not a.no_build:
         build(a, fwe, results)
     if a.linux:
@@ -426,6 +452,9 @@ def build(a, fwe, results):
             )
         )
     results["fwe"]["build Lua (s)"] = min(ours)
+    checked(make + ["clean"])
+    results.setdefault(BACKEND, {})["build Lua (s)"] = backends(
+        make + ["-j4", "posix", "CC=clang"])
     results["macOS"]["build Lua (s)"] = min(theirs)
     # Where one compile's time goes: fwe's marks (start-up, the code pages
     # written as they first ran), and what it and the native one cost the
@@ -530,6 +559,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, own=None):
                 calls[m.group(1)] += 1
     top = ", ".join(f"{c} {n}" for c, n in ((n, c) for c, n in calls.most_common(14)))
     print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
+    results.setdefault(BACKEND, {})[name] = backends(ours, fresh)
     if profiled:
         mine = profile(name, ours, theirs, fresh, own)
         if mine:
@@ -891,10 +921,11 @@ def render(results):
     against = [c for c in ("macOS", VM) if c in results]
     rows = list(results["fwe"].keys())
     shares = results.get(SHARE, {})
+    ran = results.get(BACKEND, {})
     lines = [
-        "| benchmark | " + " | ".join(cols) + "".join(f" | fwe / {c}" for c in against)
+        "| benchmark | fwe's backend | " + " | ".join(cols) + "".join(f" | fwe / {c}" for c in against)
         + " | fwe's share | budget |",
-        "|---" * (len(cols) + len(against) + 3) + "|",
+        "|---" * (len(cols) + len(against) + 4) + "|",
     ]
     for row in rows:
         vals = [results[c].get(row) for c in cols]
@@ -904,7 +935,7 @@ def render(results):
         share = f"{shares[row]:.2f}x" if row in shares else ""
         budget = (f"{BUDGETS[row]}x" if row in BUDGETS
                   else f"{SHARE_BUDGETS[row]}x of share" if row in SHARE_BUDGETS else "")
-        lines.append(f"| {row} | " + " | ".join(cells + ratios) + f" | {share} | {budget} |")
+        lines.append(f"| {row} | {ran.get(row, '')} | " + " | ".join(cells + ratios) + f" | {share} | {budget} |")
     return "\n".join(lines)
 
 

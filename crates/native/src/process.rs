@@ -98,6 +98,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     }
     // The old image is untouched on failure, so the guest can handle it.
     fwe_kernel::timing::mark("exec: checked for re-exec");
+    fwe_kernel::timing::mark("backend: native");
     crate::check_image(&file, fs).map_err(err)?;
     // A program with no path (a memfd) is held, for `/proc/self/exe`: the
     // descriptor it was run through may close on exec.
