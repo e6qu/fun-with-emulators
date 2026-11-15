@@ -1101,6 +1101,18 @@ fn a_datagram_to_an_unbound_namespace_port_goes_nowhere() {
     );
 }
 
+/// The UDP level's options are fwe's: `UDP_CORK` holds sends until
+/// cleared, `UDP_SEGMENT` cuts a send into datagrams, and one fwe cannot
+/// honour is refused rather than reaching the host as another option.
+#[test]
+fn udp_options_are_linuxs() {
+    c_guest_prints(
+        "sockopts",
+        &["udp"],
+        "corked:\nuncorked: 5\nsegmented: 4 4 2\nencap: -1 errno 92\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]

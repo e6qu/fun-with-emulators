@@ -10,8 +10,11 @@
 //!   length byte then a family byte. The payload that follows is identical.
 //! - **socket type flags:** `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are stripped from the
 //!   `type` argument and applied with `fcntl`.
-//! - **`setsockopt` names and `send`/`recv` flags:** mapped individually;
-//!   `MSG_NOSIGNAL` becomes `SO_NOSIGPIPE` on the socket.
+//! - **`setsockopt` names and `send`/`recv` flags:** mapped individually
+//!   ([`crate::sockopt`]); an option the host lacks is kept by fwe (the
+//!   UDP level's, `UDP_CORK` and `UDP_SEGMENT` acted on) or refused, never
+//!   passed on under its Linux number; `MSG_NOSIGNAL` becomes
+//!   `SO_NOSIGPIPE` on the socket.
 //! - **control messages:** the layout differs (`cmsg_len` is 64-bit on
 //!   Linux, 32-bit on macOS), so descriptors and credentials are
 //!   re-encoded, and what fwe keeps of a descriptor goes with it
@@ -1171,9 +1174,17 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     r
 }
 
-/// Bytes `MSG_MORE` held back, by IP socket.
-pub(crate) static CORKED: std::sync::Mutex<Option<std::collections::HashMap<i32, Vec<u8>>>> =
+/// Bytes `MSG_MORE` (or `UDP_CORK`) held back, by IP socket.
+pub(crate) static CORKED: std::sync::Mutex<Option<std::collections::HashMap<i32, Held>>> =
     std::sync::Mutex::new(None);
+
+/// What a socket holds back: the bytes, and for a datagram the host
+/// address the first of them was sent to (empty for none), where they go.
+#[derive(Default)]
+pub(crate) struct Held {
+    data: Vec<u8>,
+    name: Vec<u8>,
+}
 
 /// Whether any socket has bytes held back.
 static ANY_CORKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1189,7 +1200,7 @@ pub fn corked(fd: i32) -> bool {
 }
 
 /// The bytes held back for `fd`, taken.
-fn take_corked(fd: i32) -> Option<Vec<u8>> {
+fn take_corked(fd: i32) -> Option<Held> {
     if !ANY_CORKED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -1249,10 +1260,33 @@ pub fn closed(fd: i32) {
     if let Some(mut v) = V4_VIEW.if_used() {
         v.retain(|&f| f != fd);
     }
-    if let Some(held) = take_corked(fd) {
-        // SAFETY: a local buffer of its length; the send does not wait.
-        unsafe { libc::send(fd, held.as_ptr().cast(), held.len(), libc::MSG_DONTWAIT) };
-    }
+    flush_corked(fd);
+}
+
+/// Send what socket `fd` held back, without waiting.
+fn flush_corked(fd: i32) {
+    let Some(held) = take_corked(fd) else { return };
+    let (name, len) = if held.name.is_empty() {
+        (std::ptr::null(), 0)
+    } else {
+        (held.name.as_ptr().cast(), held.name.len() as libc::socklen_t)
+    };
+    // SAFETY: local buffers of their lengths; the send does not wait.
+    unsafe {
+        libc::sendto(fd, held.data.as_ptr().cast(), held.data.len(), libc::MSG_DONTWAIT, name, len)
+    };
+}
+
+/// Whether `fd` is a UDP socket (an IP datagram one).
+fn udp(fd: i32) -> bool {
+    matches!(kind(fd), Some((libc::AF_INET | libc::AF_INET6, libc::SOCK_DGRAM)))
+}
+
+/// The value of option `optname` of the UDP level fwe keeps for `fd`.
+fn udp_option(fd: i32, optname: u64) -> i32 {
+    let key = SOL_UDP << 32 | optname;
+    let kept = KEPT_VALUES.if_used();
+    kept.and_then(|k| k.iter().find(|v| (v.0, v.1) == (fd, key)).map(|v| v.2)).unwrap_or(0)
 }
 
 /// Send `msg` on `fd` with the guest's `flags` (the host's `hflags`), as
@@ -1266,12 +1300,12 @@ unsafe fn send_corked(fd: i32, msg: &mut libc::msghdr, flags: u64, hflags: i32) 
     #[allow(clippy::unnecessary_cast)] // `msg_iovlen` is an `int` on macOS
     // SAFETY: the caller's guarantee.
     let iov = unsafe { std::slice::from_raw_parts(msg.msg_iov, msg.msg_iovlen as usize) };
-    if flags & MSG_MORE != 0
-        && matches!(
-            kind(fd),
-            Some((libc::AF_INET | libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_DGRAM))
-        )
-    {
+    let ip = matches!(
+        kind(fd),
+        Some((libc::AF_INET | libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_DGRAM))
+    );
+    let udp = ip && udp(fd);
+    if ip && (flags & MSG_MORE != 0 || udp && udp_option(fd, UDP_CORK) != 0) {
         let mut more = Vec::new();
         for v in iov {
             // SAFETY: the iovecs are checked host buffers.
@@ -1281,29 +1315,90 @@ unsafe fn send_corked(fd: i32, msg: &mut libc::msghdr, flags: u64, hflags: i32) 
         }
         let n = more.len() as i64;
         let mut m = CORKED.lock().unwrap_or_else(|e| e.into_inner());
-        m.get_or_insert_with(Default::default).entry(fd).or_default().extend(more);
+        let held = m.get_or_insert_with(Default::default).entry(fd).or_default();
+        if held.name.is_empty() && !msg.msg_name.is_null() {
+            // SAFETY: the caller's name buffer of its length.
+            let name = unsafe {
+                std::slice::from_raw_parts(msg.msg_name.cast::<u8>(), msg.msg_namelen as usize)
+            };
+            held.name = name.to_vec();
+        }
+        held.data.extend(more);
         ANY_CORKED.store(true, std::sync::atomic::Ordering::Relaxed);
         return n;
     }
-    let Some(held) = take_corked(fd) else {
+    let held = take_corked(fd).unwrap_or_default();
+    // A datagram held back goes where its first part was sent.
+    if msg.msg_name.is_null() && !held.name.is_empty() {
+        msg.msg_name = held.name.as_ptr() as *mut _;
+        msg.msg_namelen = held.name.len() as _;
+    }
+    let segment = if udp { udp_option(fd, UDP_SEGMENT) as usize } else { 0 };
+    let total = held.data.len() + iov.iter().map(|v| v.iov_len).sum::<usize>();
+    if segment > 0 && total > segment {
+        // SAFETY: the caller's buffers.
+        return unsafe { send_segments(fd, msg, &held.data, iov, segment, hflags) };
+    }
+    if held.data.is_empty() {
         // SAFETY: the caller's guarantee.
         return ret(unsafe { libc::sendmsg(fd, msg, hflags) } as i64);
-    };
-    let mut all = vec![libc::iovec { iov_base: held.as_ptr() as *mut _, iov_len: held.len() }];
+    }
+    let mut all =
+        vec![libc::iovec { iov_base: held.data.as_ptr() as *mut _, iov_len: held.data.len() }];
     all.extend_from_slice(iov);
     msg.msg_iov = all.as_mut_ptr();
     msg.msg_iovlen = all.len() as _;
     // SAFETY: the caller's buffers, and the held bytes.
     let r = ret(unsafe { libc::sendmsg(fd, msg, hflags) } as i64);
-    let h = held.len() as i64;
+    let h = held.data.len() as i64;
     if r < h {
         // What did not go is held still.
         let sent = r.max(0) as usize;
         let mut m = CORKED.lock().unwrap_or_else(|e| e.into_inner());
-        m.get_or_insert_with(Default::default).insert(fd, held[sent..].to_vec());
+        let rest = Held { data: held.data[sent..].to_vec(), name: held.name.clone() };
+        m.get_or_insert_with(Default::default).insert(fd, rest);
         return if r < 0 { r } else { 0 };
     }
     r - h
+}
+
+/// A UDP send of `held` then `iov` with `UDP_SEGMENT` of `segment` bytes,
+/// as Linux's segmentation offload sends it: a datagram of each `segment`
+/// bytes and one of the rest, at most [`UDP_MAX_SEGMENTS`] (`EINVAL` past
+/// them). Returns the guest's bytes sent, or the first datagram's error.
+///
+/// # Safety
+/// `msg` names valid buffers, `iov` the guest's.
+unsafe fn send_segments(
+    fd: i32,
+    msg: &mut libc::msghdr,
+    held: &[u8],
+    iov: &[libc::iovec],
+    segment: usize,
+    hflags: i32,
+) -> i64 {
+    let mut all = held.to_vec();
+    for v in iov {
+        // SAFETY: the iovecs are checked host buffers.
+        all.extend_from_slice(unsafe { std::slice::from_raw_parts(v.iov_base.cast(), v.iov_len) });
+    }
+    if all.len().div_ceil(segment) > UDP_MAX_SEGMENTS {
+        return err(errno::EINVAL);
+    }
+    for (i, part) in all.chunks(segment).enumerate() {
+        let mut one = libc::iovec { iov_base: part.as_ptr() as *mut _, iov_len: part.len() };
+        msg.msg_iov = &mut one;
+        msg.msg_iovlen = 1;
+        // SAFETY: a local buffer and the caller's name and control.
+        let r = ret(unsafe { libc::sendmsg(fd, msg, hflags) } as i64);
+        if r < 0 && i == 0 {
+            return r;
+        }
+        // Control data (descriptors) goes with the first only.
+        msg.msg_control = std::ptr::null_mut();
+        msg.msg_controllen = 0;
+    }
+    (all.len() - held.len()) as i64
 }
 
 /// `recvfrom(fd, buf, len, flags, addr, addrlen)`.
@@ -1539,13 +1634,30 @@ const KEPT: [u64; 3] = [11, 12, 16];
 /// sets on its socket and gives up without. Linux's error queue holds the
 /// ICMP errors a socket's datagrams met; the host keeps none, so it stays
 /// empty, as on a network that returns no such errors.
-const KEPT_IP: [(u64, u64); 2] = [(0, 11), (41, 25)];
+const KEPT_IP: [(u64, u64); 3] = [(0, 11), (41, 25), (SOL_RAW, ICMP_FILTER)];
+
+/// `SOL_RAW` and its `ICMP_FILTER`, which filters a raw ICMP socket's
+/// types on Linux. The host has none, so it is kept as [`KEPT`] is, and
+/// every type arrives (which `ping` copes with).
+const SOL_RAW: u64 = 255;
+const ICMP_FILTER: u64 = 1;
+
+/// The UDP level's options (`SOL_UDP`, which `SOL_UDPLITE` shares). The
+/// host has none of them (its `UDP_NOCKSUM` has `UDP_CORK`'s number), so
+/// fwe keeps them: `UDP_CORK` holds sends back as `MSG_MORE` does until it
+/// is cleared, which sends them as one datagram; `UDP_SEGMENT` cuts each
+/// send into datagrams of its size, as segmentation offload does;
+/// `UDP_GRO` joins nothing (Linux too delivers datagrams it did not join
+/// one by one); the IPv6 checksum options leave checksums to the host.
+const KEPT_UDP: [u64; 5] = [UDP_CORK, UDP_NO_CHECK6_TX, UDP_NO_CHECK6_RX, UDP_SEGMENT, UDP_GRO];
 
 /// The key [`KEPT_VALUES`] holds option `optname` of `level` under, if it
 /// is one fwe keeps.
 fn kept_key(level: u64, optname: u64) -> Option<u64> {
     if level == SOL_SOCKET && KEPT.contains(&optname) {
         Some(optname)
+    } else if matches!(level, SOL_UDP | SOL_UDPLITE) && KEPT_UDP.contains(&optname) {
+        Some(SOL_UDP << 32 | optname)
     } else if KEPT_IP.contains(&(level, optname)) {
         Some(level << 32 | optname)
     } else {
@@ -1743,6 +1855,21 @@ pub unsafe fn setsockopt(
     }
     if let Some(e) = level_refused(fd as i32, level, false) {
         return e;
+    }
+    if matches!(level, SOL_UDP | SOL_UDPLITE) && kept_key(level, optname).is_some() {
+        if optlen < 4 {
+            return err(errno::EINVAL);
+        }
+        let v: i32 = guest!(uaccess::read(optval));
+        if optname == UDP_SEGMENT && !(0..=0xffff).contains(&v) {
+            return err(errno::EINVAL);
+        }
+        let r = keep(SOL_UDP << 32 | optname);
+        if r == 0 && optname == UDP_CORK && v == 0 {
+            // Uncorked: what was held goes, as one datagram.
+            flush_corked(fd as i32);
+        }
+        return r;
     }
     if let Some(key) = kept_key(level, optname) {
         return keep(key);
@@ -3038,5 +3165,110 @@ pub(crate) mod scm_tests {
         crate::netlink::closed(fd);
         crate::fdmarks::closed(fd);
         close_all(&[got[0], fd]);
+    }
+}
+
+#[cfg(test)]
+mod udp_option_tests {
+    use super::*;
+
+    /// A bound UDP receiver and a sender: their descriptors and the
+    /// receiver's address (Linux layout).
+    fn udp_pair() -> (i32, i32, [u8; 16]) {
+        let mut a = [0u8; 16];
+        a[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // SAFETY: no pointers.
+        let (rx, tx) = unsafe { (socket(AF_INET, SOCK_DGRAM, 0), socket(AF_INET, SOCK_DGRAM, 0)) };
+        // SAFETY: a valid sockaddr.
+        assert_eq!(unsafe { bind(rx as u64, a.as_ptr() as u64, 16, true, 0o022) }, 0);
+        let mut len: u32 = 16;
+        // SAFETY: a writable sockaddr and length.
+        let r =
+            unsafe { getname(rx as u64, a.as_mut_ptr() as u64, &mut len as *mut _ as u64, false) };
+        assert_eq!(r, 0);
+        (rx as i32, tx as i32, a)
+    }
+
+    fn set(fd: i32, level: u64, name: u64, v: i32) -> i64 {
+        // SAFETY: a 4-byte option value.
+        unsafe { setsockopt(fd as u64, level, name, &v as *const i32 as u64, 4, false) }
+    }
+
+    fn get(fd: i32, level: u64, name: u64) -> Result<i32, i64> {
+        let mut v = 0i32;
+        let mut len = 4u32;
+        // SAFETY: a 4-byte option buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                fd as u64,
+                level,
+                name,
+                &mut v as *mut i32 as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        if r < 0 { Err(r) } else { Ok(v) }
+    }
+
+    fn send(tx: i32, data: &[u8], to: &[u8; 16]) -> i64 {
+        // SAFETY: valid buffers.
+        unsafe {
+            sendto(tx as u64, data.as_ptr() as u64, data.len() as u64, 0, to.as_ptr() as u64, 16)
+        }
+    }
+
+    /// The next datagram waiting on `rx`, if one is.
+    fn next(rx: i32) -> Option<Vec<u8>> {
+        let mut b = [0u8; 64];
+        // SAFETY: a valid buffer.
+        let n = unsafe { recvfrom(rx as u64, b.as_mut_ptr() as u64, 64, MSG_DONTWAIT, 0, 0) };
+        (n >= 0).then(|| b[..n as usize].to_vec())
+    }
+
+    #[test]
+    fn udp_cork_sends_one_datagram_when_cleared() {
+        let (rx, tx, to) = udp_pair();
+        assert_eq!(set(tx, SOL_UDP, UDP_CORK, 1), 0);
+        assert_eq!(get(tx, SOL_UDP, UDP_CORK), Ok(1));
+        assert_eq!(send(tx, b"ab", &to), 2);
+        assert_eq!(send(tx, b"cd", &to), 2);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(next(rx), None);
+        assert_eq!(set(tx, SOL_UDP, UDP_CORK, 0), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(next(rx).as_deref(), Some(&b"abcd"[..]));
+        closed(tx);
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
+    }
+
+    #[test]
+    fn udp_segment_cuts_a_send_into_datagrams() {
+        let (rx, tx, to) = udp_pair();
+        assert_eq!(set(tx, SOL_UDP, UDP_SEGMENT, 4), 0);
+        assert_eq!(send(tx, b"0123456789", &to), 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let got: Vec<Vec<u8>> = std::iter::from_fn(|| next(rx)).collect();
+        assert_eq!(got, [b"0123".to_vec(), b"4567".to_vec(), b"89".to_vec()]);
+        assert_eq!(set(tx, SOL_UDP, UDP_SEGMENT, 70_000), err(errno::EINVAL));
+        closed(tx);
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
+    }
+
+    #[test]
+    fn other_options_never_reach_the_host() {
+        let (rx, tx, _) = udp_pair();
+        // An option of the UDP level Linux has but fwe does not
+        // (UDP_ENCAP), one it has not, and a level the socket has not.
+        assert_eq!(set(tx, SOL_UDP, UDP_ENCAP, 1), err(errno::ENOPROTOOPT));
+        assert_eq!(set(tx, SOL_UDP, 999, 1), err(errno::ENOPROTOOPT));
+        assert_eq!(get(tx, SOL_UDP, 999), Err(err(errno::ENOPROTOOPT)));
+        assert_eq!(set(tx, 6, 1, 1), err(errno::ENOPROTOOPT));
+        assert_eq!(set(tx, SOL_UDP, UDP_GRO, 1), 0);
+        assert_eq!(get(tx, SOL_UDPLITE, UDP_GRO), Ok(1));
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
     }
 }

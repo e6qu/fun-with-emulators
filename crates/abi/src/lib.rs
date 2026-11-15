@@ -1262,6 +1262,18 @@ pub mod socket {
     /// The most descriptors one message carries (`SCM_MAX_FD`).
     pub const SCM_MAX_FD: usize = 253;
     pub const CMSG_HDR: usize = 16;
+
+    // `SOL_UDP` (`IPPROTO_UDP`) options, which `SOL_UDPLITE` shares.
+    pub const SOL_UDP: u64 = 17;
+    pub const SOL_UDPLITE: u64 = 136;
+    pub const UDP_CORK: u64 = 1;
+    pub const UDP_ENCAP: u64 = 100;
+    pub const UDP_NO_CHECK6_TX: u64 = 101;
+    pub const UDP_NO_CHECK6_RX: u64 = 102;
+    pub const UDP_SEGMENT: u64 = 103;
+    pub const UDP_GRO: u64 = 104;
+    /// The most datagrams one `UDP_SEGMENT` send is cut into.
+    pub const UDP_MAX_SEGMENTS: usize = 64;
 }
 
 /// `eventfd2` flags (`sys/eventfd.h`).
