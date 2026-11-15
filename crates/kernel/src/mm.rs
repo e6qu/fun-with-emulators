@@ -8,6 +8,7 @@ use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The program break: a reserved region after the executable image that
 /// `brk` commits and releases.
@@ -86,6 +87,11 @@ impl Ranges {
         }
     }
 }
+
+/// Whether a `MAP_GROWSDOWN` mapping was ever made: until one is, a
+/// mapping looks for none to replace. (Set under the kernel lock, which
+/// every mapping call holds.)
+static ANY_GROWS_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// The address space's ranges; a fork takes the lock with the others
 /// ([`hold`]).
@@ -1253,10 +1259,11 @@ impl<P: Platform> Kernel<P> {
         if nowrite {
             crate::maps::record().no_write(r as u64, len);
         }
-        {
+        if flags & mman::MAP_GROWSDOWN != 0 || ANY_GROWS_DOWN.load(Ordering::Relaxed) {
             let mut g = lock_ranges();
             remove_range(&mut g.grows_down, r as u64, len);
             if flags & mman::MAP_GROWSDOWN != 0 {
+                ANY_GROWS_DOWN.store(true, Ordering::Relaxed);
                 g.grows_down.insert(r as u64, r as u64 + len);
             }
         }
