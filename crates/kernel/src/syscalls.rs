@@ -4158,6 +4158,34 @@ mod tests {
         assert_eq!(k.syscall(nr::TGKILL, [-1i64 as u64, 1, 0, 0, 0, 0]), err(errno::EINVAL));
     }
 
+    /// fwe's internal wake signal, whose host default action ends a
+    /// process, never reaches a process that is not fwe's (one this test
+    /// started), whatever asks: a signal the host lacks, a descriptor
+    /// (`pidfd_getfd`), its memory (`process_vm_readv`).
+    #[test]
+    fn internal_signals_never_reach_other_processes() {
+        let mut k = kernel();
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        assert!(!host::is_fwe(pid));
+        assert_eq!(host::kill_process(pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        assert_eq!(host::kill(-pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        // A real-time signal, which only fwe's mailbox carries.
+        assert_eq!(k.syscall(nr::KILL, [pid as u64, 40, 0, 0, 0, 0]), err(errno::EINVAL));
+        let fd = k.syscall(nr::PIDFD_OPEN, [pid as u64, 0, 0, 0, 0, 0]);
+        assert!(fd >= 0, "pidfd_open of a host process: {fd}");
+        assert_eq!(k.syscall(nr::PIDFD_GETFD, [fd as u64, 0, 0, 0, 0, 0]), err(errno::EPERM));
+        let mut buf = [0u8; 8];
+        let iov = [buf.as_mut_ptr() as u64, 8];
+        let remote = [0x1000u64, 8];
+        let a = [pid as u64, iov.as_ptr() as u64, 1, remote.as_ptr() as u64, 1, 0];
+        assert_eq!(k.syscall(nr::PROCESS_VM_READV, a), err(errno::EPERM));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "the host process lives");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     /// Code the host placed with no room for its stubs near it is mapped
     /// again where there is, when the guest left the place to fwe; a fixed
     /// mapping cannot move, and fails.

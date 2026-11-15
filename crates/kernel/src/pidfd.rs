@@ -401,7 +401,9 @@ impl<P: Platform> Kernel<P> {
             fdmarks::duplicated(target_fd, r);
             return Err(i64::from(r));
         }
-        if !self.may_attach(t.host) {
+        // Only an fwe process can be asked for its descriptors; any other is
+        // one the caller may not attach to, as `ptrace` has it.
+        if !crate::host::is_fwe(t.host) || !self.may_attach(t.host) {
             return Err(err(errno::EPERM));
         }
         Ok(GetFd { host: t.host, fd: target_fd, pidfd: fd })

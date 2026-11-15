@@ -275,7 +275,7 @@ pub fn relayed(sig: u64) -> bool {
 /// mailbox, and the process woken to take it ([`crate::signote::queue`]).
 /// A process that is not fwe's cannot take it (`EINVAL`).
 pub(crate) fn send_unhosted(host: i32, sig: u64, code: i32, value: u64) -> i64 {
-    if host <= 0 || crate::procreg::read(host).is_none() {
+    if !host::is_fwe(host) {
         return err(errno::EINVAL);
     }
     if let Err(e) = crate::signote::queue(host, sig, code, value) {
@@ -965,6 +965,11 @@ impl<P: Platform> Kernel<P> {
     /// process's queue, the process woken to give it to the thread
     /// ([`crate::signote::queue_thread`]); SIGKILL ends the process.
     fn signal_other_thread(&mut self, owner: i32, tid: i32, sig: u64) -> i64 {
+        // The table of threads may name a process that has gone, its pid
+        // since taken by one that is not fwe's.
+        if !host::is_fwe(owner) {
+            return err(errno::ESRCH);
+        }
         if !self.may_signal(owner, sig) {
             return err(errno::EPERM);
         }

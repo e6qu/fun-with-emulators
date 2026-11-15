@@ -91,7 +91,9 @@ impl<P: Platform> Kernel<P> {
             return err(errno::ESRCH);
         };
         let me = crate::host::pid();
-        if host != me && !self.may_trace(host) {
+        // Only an fwe process can copy its own memory for the caller; any
+        // other is one the caller may not attach to, as `ptrace` has it.
+        if host != me && (!crate::host::is_fwe(host) || !self.may_trace(host)) {
             return err(errno::EPERM);
         }
         let total = local.iter().map(|r| r.1).sum::<u64>().min(remote.iter().map(|r| r.1).sum());

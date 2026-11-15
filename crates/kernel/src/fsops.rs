@@ -2864,6 +2864,11 @@ impl<P: Platform> Kernel<P> {
             Some(t) if t != pid => crate::ptrace::target_of(t)?,
             _ => host,
         };
+        // Only an fwe process's memory can be reached (through its mailbox):
+        // any other is one the caller may not attach to.
+        if !crate::host::is_fwe(host) {
+            return Some(Err(errno::EACCES));
+        }
         Some(if crate::ptrace::traces(id) || self.may_trace(host) {
             Ok(id)
         } else {

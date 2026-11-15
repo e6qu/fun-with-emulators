@@ -536,7 +536,9 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   host and records it against the process, and the others are woken.
 - **Wake signal:** a signal recorded without a host signal (real-time,
   emulated faults, caught `tgkill`) wakes its target thread, or every
-  thread, with `SIGEMT`.
+  thread, with `SIGEMT`. Another process is sent it only if it is a live
+  fwe process, one with a record (`host::kill` checks every send): the
+  host's default action for `SIGEMT` would end any other.
 - **Wake pipes:** every host signal a thread takes writes a byte to that
   thread's pipe (`thread::poke_wait`), and the sleeps, `poll`, `select`
   and the `epoll` waits watch it beside the guest's descriptors
@@ -1270,7 +1272,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - `process_vm_readv`/`process_vm_writev` of a stopped process (other than
   in a ptrace stop of the caller's) waits until it runs again (its handler
   serves the request), and one of a process fwe did not start fails with
-  `ESRCH`; in the VM, a write to guest memory the guest maps read-only
+  `EPERM`, as `pidfd_getfd` of one does; in the VM, a write to guest memory the guest maps read-only
   succeeds.
 - A Landlock domain is the process's, not the thread's that made it (the
   process's other threads are restricted with it), and its file rules

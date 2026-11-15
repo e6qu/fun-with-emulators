@@ -374,8 +374,15 @@ pub fn unlinked(fd: i32) -> bool {
 /// -1 is refused (`ESRCH`): on the host it is every process of the user, so
 /// a guest's -1 is resolved to fwe's own processes before it gets here
 /// ([`kill_process`] sends to each).
+///
+/// [`WAKE_SIGNAL`] goes only to one live fwe process (`ESRCH` otherwise):
+/// any other process takes the host's default action for it, which ends
+/// it.
 pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     if pid == -1 {
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
+    if sig == WAKE_SIGNAL && (pid <= 0 || !is_fwe(pid)) {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     #[cfg(target_os = "macos")]
@@ -422,6 +429,13 @@ pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     kill(pid, sig)
+}
+
+/// Whether host process `pid` is a live fwe process (one with a record):
+/// the only kind that takes fwe's internal signals ([`WAKE_SIGNAL`]) and
+/// serves requests left in its mailbox.
+pub fn is_fwe(pid: libc::pid_t) -> bool {
+    pid > 0 && crate::procreg::read(pid).is_some()
 }
 
 /// Whether host process `pid` exists (a zombie does), whether or not this

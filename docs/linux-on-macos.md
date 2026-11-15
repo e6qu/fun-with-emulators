@@ -964,7 +964,7 @@ and `futex_waitv` run without the kernel lock.
 | `ioprio_get`, `ioprio_set` | Linux's checks of class and level (`CAP_SYS_NICE` for the real-time class); the caller's priority kept and reported, another process's accepted, not kept: the host takes no I/O priority from fwe. | none |
 | `prlimit64`, `getrlimit`, `setrlimit` | `NOFILE` virtual, fwe's own limits in `rlimits.rs`, the rest the host's; another process's is left for it to take up. | `getrlimit`, `setrlimit` |
 | `getrusage`, `times` | The host's usage; `RUSAGE_THREAD` reports the process's; `times` in 100 Hz ticks since boot. | `getrusage` |
-| `pidfd_open`, `pidfd_getfd` | A process descriptor is a kqueue watching the process's exit; `pidfd_getfd` asks the target for the descriptor through its signal mailbox. | `kqueue`/`kevent`, `sendmsg`/`recvmsg` |
+| `pidfd_open`, `pidfd_getfd` | A process descriptor is a kqueue watching the process's exit, of any host process the caller's pid namespace shows; `pidfd_getfd` asks the target for the descriptor through its signal mailbox, so a process fwe did not start gives `EPERM`. | `kqueue`/`kevent`, `sendmsg`/`recvmsg` |
 | `personality` | Kept per process; `PER_LINUX32` fails with `EINVAL`. | none |
 | `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); an ending process appends its `struct acct_v3` to the nearest pid namespace's, its own or one above, with accounting on | `open`, `write` |
 
@@ -2321,6 +2321,7 @@ the host:
 |---|---|---|
 | `SIGEMT` (7), from fwe itself | the wake signal: interrupts a thread blocked in a host call so it notices a signal recorded for it | the signal it was woken for |
 | `SIGEMT` from any other process | the same: it only interrupts | nothing; an interrupted call runs again |
+| `SIGEMT` to a process that is not fwe's | never sent: its default action would end that process. fwe sends it only to a live process with an fwe record (`host::kill` refuses any other, `ESRCH`); what needs the target to answer refuses a process fwe did not start: `pidfd_getfd` and `process_vm_readv`/`writev` with `EPERM`, as for a process the caller may not trace; a signal the host lacks with `EINVAL` | an error |
 | `SIGINFO` (29), from another fwe process | the kill relay, sent instead of an uncatchable `SIGKILL`: a native process kills itself with `SIGKILL`, a VM process tears its VM down first ([hypervisor.md](hypervisor.md#never-end-a-vm-process-abnormally)) | death by `SIGKILL` |
 | `SIGINFO` from anywhere else (`kill -INFO`) | no note came with it, so it is no relay: dropped | nothing |
 | a child killed by a host signal with no Linux number | `host::signal_to_linux` gives `SIGABRT` | a child killed by `SIGABRT` |

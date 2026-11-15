@@ -4246,6 +4246,35 @@ fn process_descriptors_name_processes() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// The `identity` guest's output for check `check` with `args`, which
+/// must exit 0.
+fn identity(args: &[&str]) -> String {
+    let out = fwe(&rust_guest("identity"), args);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    stdout(&out)
+}
+
+/// A host process fwe did not start (one this test starts) can be named
+/// by a guest, but nothing that needs an fwe process to answer reaches
+/// it: fwe's internal wake signal, whose host default action would end
+/// it, is never sent to it. (`/proc/<pid>` of such a process holds only
+/// `stat`.)
+#[test]
+fn host_processes_never_get_fwes_internal_signals() {
+    let mut sleeper = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let pid = sleeper.id().to_string();
+    let text = identity(&["host-process", &pid]);
+    let alive = sleeper.try_wait().unwrap().is_none();
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    assert_eq!(
+        text,
+        "pidfd_open: ok\npidfd_getfd: EPERM\nprocess_vm_readv: EPERM\n/proc/<pid>/mem: ENOENT\n\
+         kill real-time: EINVAL\npidfd_send_signal real-time: EINVAL\n"
+    );
+    assert!(alive, "the host process was ended");
+}
+
 /// What the `ptrace` guest prints.
 const PTRACE: &str = "stop: signal 19\n\
     peek: true\n\
