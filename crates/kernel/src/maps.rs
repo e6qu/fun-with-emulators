@@ -11,7 +11,10 @@
 //! the guest's. Memory fwe maps for the guest that the guest did not ask
 //! for (the native backend's code stubs, a stack's guard page) is listed
 //! as anonymous memory with the host's protections, so a program looking
-//! for free address space in the list does not pick it.
+//! for free address space in the list does not pick it. The latest plain
+//! anonymous mapping waits beside the list until anything reads it
+//! ([`record`]): one unmapped whole before then, as a program's buffer
+//! often is, never costs the list a change.
 //!
 //! Each process publishes its record once it changed, before its next
 //! system call that is not a memory call and before a fork, in a shared
@@ -151,6 +154,11 @@ pub struct Record {
     exe_id: (u64, u64),
     /// Some memory was sealed: until then no call looks for a seal.
     any_sealed: bool,
+    /// The latest plain mapping (anonymous, unlocked: start, length,
+    /// protection, shared), not yet among the areas: one unmapped whole
+    /// before anything looks is never put there ([`mapped_plain`],
+    /// [`unmapped`]). [`record`] puts it there first.
+    pending: Option<(u64, u64, u64, bool)>,
 }
 
 impl Default for Record {
@@ -168,6 +176,14 @@ impl Record {
             exe: Vec::new(),
             exe_id: (0, 0),
             any_sealed: false,
+            pending: None,
+        }
+    }
+
+    /// Put the pending mapping among the areas.
+    fn settle(&mut self) {
+        if let Some((start, len, prot, shared)) = self.pending.take() {
+            self.mapped(start, len, prot, shared, None);
         }
     }
 
@@ -525,7 +541,7 @@ impl Record {
 
     /// How many mappings there are (what `vm.max_map_count` limits).
     pub fn count(&self) -> usize {
-        self.areas.len()
+        self.areas.len() + usize::from(self.pending.is_some())
     }
 
     pub fn areas_in(&self, start: u64, end: u64) -> Vec<Piece<Area>> {
@@ -629,7 +645,34 @@ impl Drop for Held {
 
 /// This process's record, to read or change.
 pub fn record() -> Held {
-    Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()))
+    let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
+    h.0.settle();
+    h
+}
+
+/// The guest mapped `[start, start + len)` with `prot` (`shared` or
+/// private), nothing named: as [`Record::mapped`], but kept apart until
+/// something looks, so that one unmapped at once ([`unmapped`]) costs the
+/// areas nothing. Returns whether it is locked (`mlockall(MCL_FUTURE)`).
+pub fn mapped_plain(start: u64, len: u64, prot: u64, shared: bool) -> bool {
+    let mut h = record();
+    if h.lock_future {
+        return h.mapped(start, len, prot, shared, None);
+    }
+    h.0.pending = Some((start, len, prot, shared));
+    false
+}
+
+/// The guest unmapped `[start, start + len)`: the pending mapping if it is
+/// that one, else as [`Record::unmapped`].
+pub fn unmapped(start: u64, len: u64) {
+    let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
+    if h.0.pending.is_some_and(|(s, l, _, _)| (s, l) == (start, len)) {
+        h.0.pending = None;
+        return;
+    }
+    h.0.settle();
+    h.unmapped(start, len);
 }
 
 /// How many mappings the record holds, without its lock: as of the last
@@ -979,6 +1022,23 @@ pub fn name_of<'a>(a: &'a Area, exe: &Exe<'a>) -> (&'a [u8], (u64, u64)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain mapping kept apart is in the record for anyone who looks,
+    /// counted meanwhile, and one unmapped whole at once leaves nothing.
+    #[test]
+    fn a_pending_mapping_is_seen_by_readers_and_dropped_by_its_unmap() {
+        let (a, b, len) = (0x7a00_0000_0000u64, 0x7b00_0000_0000u64, 0x4000u64);
+        let before = record().count();
+        mapped_plain(a, len, 3, false);
+        assert_eq!(count(), before + 1);
+        unmapped(a, len);
+        assert_eq!(record().span_at(a), None);
+        assert_eq!(record().count(), before);
+        mapped_plain(b, len, 3, false);
+        assert_eq!(record().span_at(b), Some((b, b + len)));
+        unmapped(b, len);
+        assert_eq!(record().span_at(b), None);
+    }
 
     fn file(path: &str, offset: u64) -> Option<Object> {
         Some(Object { name: Name::Path(path.as_bytes().into()), dev: 0x803, ino: 42, offset })

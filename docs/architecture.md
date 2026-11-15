@@ -346,7 +346,9 @@ records Linux would:
   far as the file has contents, zeroed beyond) and the stack, and the
   break is the heap. Memory fwe maps that the guest did not ask for (code
   stubs, a guard page) is listed as anonymous with the host's protections,
-  so a program looking for free space does not pick it.
+  so a program looking for free space does not pick it. The latest plain
+  anonymous mapping waits beside the list until anything reads it, so a
+  buffer mapped and unmapped at once never changes the list.
 - **Other processes:** each process publishes its record, with its start
   time, in an entry of its own in the process store before its next
   system call that is not a memory call, and before a `fork`, so a run of

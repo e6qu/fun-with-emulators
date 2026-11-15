@@ -1390,7 +1390,10 @@ impl<P: Platform> Kernel<P> {
         let shared = flags & mman::MAP_TYPE != mman::MAP_PRIVATE;
         let len = self.page_up(len);
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
-        let locked = crate::maps::record().mapped(r as u64, len, prot, shared, object);
+        let locked = match object {
+            None => crate::maps::mapped_plain(r as u64, len, prot, shared),
+            object => crate::maps::record().mapped(r as u64, len, prot, shared, object),
+        };
         if noexec {
             crate::maps::record().no_exec(r as u64, len);
         }
@@ -1567,7 +1570,7 @@ impl<P: Platform> Kernel<P> {
         }
         let r = self.munmap_call(addr, len);
         if r == 0 {
-            crate::maps::record().unmapped(addr, self.page_up(len));
+            crate::maps::unmapped(addr, self.page_up(len));
         }
         if r >= 0 {
             crate::maps::publish();
