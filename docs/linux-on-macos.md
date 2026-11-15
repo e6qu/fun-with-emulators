@@ -1829,9 +1829,12 @@ recorded by fwe and the target woken with the wake signal:
 - **Permission** follows Linux: `CAP_KILL`, or the caller's real or
   effective uid matching the target's real or saved one, or `SIGCONT`
   within the session; a process fwe has no record of counts as root's.
-- A `SIGKILL` or `SIGSTOP` sent to a pid namespace's init from inside the
-  namespace is dropped; a `SIGKILL` that ends an init takes its namespace
-  with it.
+- A pid namespace's init takes only the signals it has a handler for, as
+  Linux's `SIGNAL_UNKILLABLE`: one with its default action is dropped as
+  it is delivered, from inside the namespace or above it, except a fault
+  of its own. A `SIGKILL` or `SIGSTOP` sent to it from inside the
+  namespace is dropped at the sender; from an ancestor namespace it acts,
+  and a `SIGKILL` that ends an init takes its namespace with it.
 
 ### Files and descriptors
 
@@ -1974,7 +1977,7 @@ thread's.
 
 | Namespace | What fwe does |
 |---|---|
-| pid (`pidns.rs`) | numbers processes and threads from 1 in a record mapping each to its host pid; `getpid`, `kill`, `wait`, process groups and `siginfo` senders are translated; when its init ends, the rest are killed; init ignores `SIGKILL`/`SIGSTOP` from inside |
+| pid (`pidns.rs`) | numbers processes and threads from 1 in a record mapping each to its host pid; `getpid`, `kill`, `wait`, process groups and `siginfo` senders are translated; when its init ends, the rest are killed; init takes only the signals it handles (and `SIGKILL`/`SIGSTOP` from above) |
 | mount (`mounts.rs`) | a mount table per namespace; see [Mounts](#mounts) |
 | user (`userns.rs`) | ids kept as the initial namespace's and seen through `uid_map`/`gid_map`, written once with Linux's rules; the creator has every capability in it |
 | UTS | `uname`, `sethostname`, `setdomainname` use its names; in the initial one the host's name is read and never set (`EPERM`) |

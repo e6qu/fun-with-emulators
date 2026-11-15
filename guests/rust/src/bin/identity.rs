@@ -12,6 +12,10 @@ const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
 const SYS_PIDFD_OPEN: i64 = 434;
 const SYS_PIDFD_GETFD: i64 = 438;
 const SIGUSR1: i32 = 10;
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+const SIGTSTP: i32 = 20;
+const CLONE_NEWPID: i32 = 0x2000_0000;
 const SIGRT1: i32 = 35;
 const O_RDONLY: i32 = 0;
 const SIG_BLOCK: i32 = 0;
@@ -37,6 +41,10 @@ unsafe extern "C" {
     fn sigprocmask(how: i32, set: *const u64, old: *mut u64) -> i32;
     fn sigtimedwait(set: *const u64, info: *mut [u8; 128], timeout: *const Timespec) -> i32;
     fn _exit(code: i32) -> !;
+    fn unshare(flags: i32) -> i32;
+    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    fn write(fd: i32, buf: *const c_void, len: usize) -> isize;
+    fn usleep(us: u32) -> i32;
     fn __errno_location() -> *mut i32;
 }
 
@@ -128,6 +136,68 @@ fn host_process(pid: i32) {
     }
 }
 
+static HANDLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn count(_: i32) {
+    HANDLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A pid namespace's init takes only the signals it has a handler for:
+/// `SIGTERM` and `SIGTSTP` with their default actions are dropped, from
+/// itself, a child in its namespace and its parent outside it; `SIGUSR1`,
+/// which it handles, arrives; `SIGKILL` from outside ends it.
+fn init_signals() {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        if unshare(CLONE_NEWPID) != 0 {
+            println!("unshare: errno {}", errno());
+            return;
+        }
+        let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+        pipe(ready.as_mut_ptr());
+        pipe(go.as_mut_ptr());
+        let init = fork();
+        if init == 0 {
+            close(ready[0]);
+            close(go[1]);
+            signal(SIGUSR1, count);
+            let own = kill(1, SIGTERM);
+            let stop = kill(1, SIGTSTP);
+            let c = fork();
+            if c == 0 {
+                _exit(i32::from(kill(1, SIGTERM) == 0 && kill(1, SIGUSR1) == 0));
+            }
+            let ok = reap(c);
+            usleep(200_000);
+            println!(
+                "init {}: own SIGTERM {own}, SIGTSTP {stop}, child's sent {}",
+                getpid(),
+                ok == 1
+            );
+            write(ready[1], b"r".as_ptr().cast(), 1);
+            let mut b = 0u8;
+            read(go[0], (&mut b as *mut u8).cast(), 1);
+            usleep(200_000);
+            println!("init lives, handled SIGUSR1 {}", HANDLED.load(std::sync::atomic::Ordering::SeqCst));
+            write(ready[1], b"r".as_ptr().cast(), 1);
+            loop {
+                usleep(1_000_000);
+            }
+        }
+        close(ready[1]);
+        close(go[0]);
+        let mut b = 0u8;
+        read(ready[0], (&mut b as *mut u8).cast(), 1);
+        println!("parent's SIGTERM: {}", kill(init, SIGTERM));
+        close(go[1]);
+        read(ready[0], (&mut b as *mut u8).cast(), 1);
+        kill(init, SIGKILL);
+        let mut status = 0;
+        waitpid(init, &mut status, 0);
+        println!("init killed by {}", status & 0x7f);
+    }
+}
+
 /// `kill(0)` and `kill(-pgid)` from a process of uid 1000, in a group
 /// with root's processes and one of uid 1000: each member it may signal
 /// takes the signal, the others do not, and a group of root's only gives
@@ -175,6 +245,7 @@ fn main() {
     match arg(1) {
         "host-process" => host_process(arg(2).parse().unwrap()),
         "group-kill" => group_kill(),
+        "init-signals" => init_signals(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

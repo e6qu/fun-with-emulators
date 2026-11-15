@@ -4275,6 +4275,17 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// A pid namespace's init takes only the signals it handles, from
+/// inside its namespace or its parent's; `SIGKILL` from outside ends it.
+#[test]
+fn pid_namespace_init_takes_only_handled_signals() {
+    assert_eq!(
+        identity(&["init-signals"]),
+        "init 1: own SIGTERM 0, SIGTSTP 0, child's sent true\nparent's SIGTERM: 0\n\
+         init lives, handled SIGUSR1 1\ninit killed by 9\n"
+    );
+}
+
 /// A signal to a process group reaches each member the sender may
 /// signal and no other, as Linux's `kill_pgrp` sends it.
 #[test]

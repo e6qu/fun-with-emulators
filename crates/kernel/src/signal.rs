@@ -301,6 +301,31 @@ fn post_own(sig: u64) -> i64 {
     0
 }
 
+/// Whether this process is the init of a pid namespace of fwe's: as
+/// Linux's `SIGNAL_UNKILLABLE`, it takes no signal it has no handler for,
+/// from inside its namespace or above it. `SIGKILL` and `SIGSTOP`, which
+/// have no handler, are kept from it at their sender when sent from inside
+/// ([`Kernel::send_one`]); from an ancestor namespace they act.
+fn unkillable_init() -> bool {
+    crate::pidns::nested() && thread::tgid() == 1
+}
+
+/// Whether `sig` with `info` is a fault of the thread taking it (a code
+/// the kernel gave it, not a sender's), which Linux forces on even a
+/// namespace's init.
+fn forced_fault(sig: u64, info: &SigInfo) -> bool {
+    info.code > 0
+        && matches!(
+            sig,
+            signal::SIGSEGV
+                | signal::SIGBUS
+                | signal::SIGILL
+                | signal::SIGFPE
+                | signal::SIGTRAP
+                | signal::SIGSYS
+        )
+}
+
 fn me_host() -> i64 {
     crate::host::pid() as i64
 }
@@ -530,6 +555,8 @@ impl<P: Platform> Kernel<P> {
             let action = self.sigactions[(sig - 1) as usize];
             match action.handler {
                 signal::SIG_IGN => {}
+                // A pid namespace's init takes only the signals it handles.
+                signal::SIG_DFL if unkillable_init() && !forced_fault(sig, &info) => {}
                 signal::SIG_DFL => match signal::default_action(sig) {
                     signal::Default::Terminate => self.terminate_with(sig, Some(regs)),
                     // A seized thread's group-stop is its tracer's to end.
@@ -1227,6 +1254,20 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
 mod tests {
     use super::*;
     use crate::{Brk, Tracer};
+
+    /// A namespace's init still dies of its own faults, which carry the
+    /// kernel's code, but not of a fault signal a process sent it.
+    #[test]
+    fn only_own_faults_are_forced_on_an_init() {
+        let fault = SigInfo { code: 1, ..SigInfo::default() };
+        let sent = SigInfo { code: signal::SI_USER, ..SigInfo::default() };
+        assert!(forced_fault(signal::SIGSEGV, &fault));
+        assert!(forced_fault(signal::SIGSYS, &fault));
+        assert!(!forced_fault(signal::SIGSEGV, &sent));
+        assert!(!forced_fault(signal::SIGTERM, &fault));
+        let queued = SigInfo { code: signal::SI_QUEUE, ..SigInfo::default() };
+        assert!(!forced_fault(signal::SIGBUS, &queued));
+    }
 
     /// The computed frame offsets match the arm64 kernel layout.
     #[test]
