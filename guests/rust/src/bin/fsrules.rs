@@ -61,6 +61,7 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn sleep(s: u32) -> u32;
     fn opendir(p: *const c_char) -> *mut u8;
     fn readdir(d: *mut u8) -> *const u8;
     fn telldir(d: *mut u8) -> i64;
@@ -832,9 +833,46 @@ fn telldir_scenario() {
     println!("back to the same entry: {}", next() == after);
 }
 
+/// The access and change times of `p`, in seconds.
+fn times_of(p: &str) -> (i64, i64) {
+    let mut st = [0i64; 16];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+    unsafe { stat(c(p).as_ptr(), st.as_mut_ptr().cast()) };
+    // arm64's `struct stat`: st_atime at byte 72, st_ctime at 104.
+    (st[9], st[13])
+}
+
+/// A read through a `strictatime` mount sets the access time and leaves
+/// the change time, as a read does on Linux.
+fn atime_scenario() {
+    const MS_STRICTATIME: u64 = 1 << 24;
+    const CLONE_NEWNS: i32 = 0x20000;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS) };
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/s").as_ptr(), 0o755) };
+    make("/tmp/s/f", 0o644);
+    let old = [1_000_000i64, 0, 1_000_000, 0];
+    // SAFETY: a NUL-terminated path and two timespecs.
+    unsafe { utimensat(AT_FDCWD, c("/tmp/s/f").as_ptr(), &old, 0) };
+    println!("strictatime: {}", bind("/tmp/s", "/tmp/s", Some(MS_STRICTATIME)));
+    let (_, ctime) = times_of("/tmp/s/f");
+    // SAFETY: plain calls; a buffer of one byte.
+    unsafe {
+        sleep(2);
+        let fd = open(c("/tmp/s/f").as_ptr(), O_RDONLY);
+        let mut b = [0u8; 1];
+        read(fd, b.as_mut_ptr(), 1);
+        close(fd);
+    }
+    let (atime, after) = times_of("/tmp/s/f");
+    println!("access time set: {} change time kept: {}", atime > 1_000_000, after == ctime);
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "atime" => atime_scenario(),
         "telldir" => telldir_scenario(),
         "slash" => trailing_slash_scenario(),
         "ovlsticky" => overlay_sticky_scenario(),

@@ -7132,6 +7132,13 @@ fn seekdir_returns_to_a_telldir_position() {
     assert_eq!(fsrules("telldir"), "back to the same entry: true\n");
 }
 
+/// A read through a `strictatime` mount sets the file's access time, as
+/// fwe sets it where the host did not, and leaves its change time.
+#[test]
+fn access_times_set_by_reads_leave_change_times() {
+    assert_eq!(fsrules("atime"), "strictatime: ok\naccess time set: true change time kept: true\n");
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

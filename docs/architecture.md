@@ -1147,7 +1147,8 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   `noexec` refuses running a program or mapping a file executable
   (`EACCES`, `EPERM`, and later `mprotect`); `nosymfollow` refuses links
   (`ELOOP`); `noatime`, `nodiratime` and `strictatime` set a read file's
-  access time as Linux would (`crates/kernel/src/atime.rs`), `relatime`
+  access time as Linux would, its change time left alone
+  (`crates/kernel/src/atime.rs`), `relatime`
   is left to the host.
 - **Busy mounts and roots:** a mount is busy while something is mounted
   under it, the caller's working directory or root is in it, or a file
@@ -1475,7 +1476,6 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A mount is not busy for a process fwe did not start, for another
   process's working directory, or for a file another process opened at a
   host path two mounts share (a bind, a lower layer two overlays have).
-  Setting an access time also changes the file's change time.
 - Overlays: layers must be host directories (not in another overlay); a
   directory a lower layer has cannot be renamed (`EXDEV`, as with
   `redirect_dir=off`); a rename leaving a whiteout, and a `bind` over one,
