@@ -1940,7 +1940,10 @@ impl<P: Platform> Kernel<P> {
             return err(e);
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
-        let mode = self.fs().apply_umask(mode as u32);
+        // The permission and sticky bits, as Linux's `mkdir` takes: a
+        // directory is set-group-ID only as one in a set-group-ID directory
+        // ([`Self::own_new`]), and never set-user-ID.
+        let mode = self.fs().apply_umask(mode as u32) & 0o1777;
         let host_mode = crate::modes::host_perm(mode, true);
         let dir = r.dir.as_raw_fd();
         // A new cgroup, within the limits of those above it.
@@ -4711,6 +4714,37 @@ mod tests {
         );
         assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
         assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
+    }
+
+    /// `mkdir` keeps the permission and sticky bits of its mode: a set-ID
+    /// bit asked for is dropped, and a directory is set-group-ID only in a
+    /// set-group-ID directory.
+    #[test]
+    fn mkdir_takes_no_set_id_bits_of_its_mode() {
+        let (mut k, _d) = rooted();
+        let mode_of = |k: &mut Kernel<NoPlatform>, p: &CString| {
+            let mut st = Stat::default();
+            let r = k.syscall(
+                nr::NEWFSTATAT,
+                [AT_FDCWD, p.as_ptr() as u64, &mut st as *mut _ as u64, 0, 0, 0],
+            );
+            assert_eq!(r, 0);
+            st.st_mode & 0o7777
+        };
+        k.fs.as_mut().unwrap().set_umask(0);
+        let mut mkdir = |p: &CString, mode: u64| {
+            assert_eq!(k.syscall(nr::MKDIRAT, [AT_FDCWD, p.as_ptr() as u64, mode, 0, 0, 0]), 0);
+        };
+        let (a, b) = (cstr("/a"), cstr("/a/b"));
+        mkdir(&a, 0o7777);
+        mkdir(&b, 0o755);
+        assert_eq!(mode_of(&mut k, &a), 0o1777);
+        assert_eq!(mode_of(&mut k, &b), 0o755);
+        let r = k.syscall(nr::FCHMODAT, [AT_FDCWD, a.as_ptr() as u64, 0o2777, 0, 0, 0]);
+        assert_eq!(r, 0);
+        let c = cstr("/a/c");
+        assert_eq!(k.syscall(nr::MKDIRAT, [AT_FDCWD, c.as_ptr() as u64, 0o4755, 0, 0, 0]), 0);
+        assert_eq!(mode_of(&mut k, &c), 0o2755, "set-group-ID from its directory");
     }
 
     /// `statx` reports the host's birth time (`STATX_BTIME`), by path and
