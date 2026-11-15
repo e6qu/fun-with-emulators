@@ -166,7 +166,6 @@ pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
     }
 }
 
-/// Set attribute `name` of `t` to `value`, with Linux `flags`.
 /// Whether the file `t` names is immutable or append-only, whose
 /// attributes Linux lets no one change (the host does).
 #[cfg(target_os = "macos")]
@@ -188,6 +187,7 @@ fn frozen(_: &Target) -> bool {
     false
 }
 
+/// Set attribute `name` of `t` to `value`, with Linux `flags`.
 pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32> {
     if flags & !(CREATE | REPLACE) != 0 {
         return Err(errno::EINVAL);

@@ -295,9 +295,7 @@ pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
 }
 
-/// Host metadata of open descriptor `fd`, with the guest's permission
-/// bits ([`crate::modes`]).
-/// `fstat` of `fd` in Linux's layout (the host's view of the file).
+/// `fstat` of `fd` in Linux's layout, with the guest's mode and owner.
 pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
     stat_fd(fd).map(|s| stat_to_linux_fd(fd, &s))
 }
@@ -326,6 +324,9 @@ fn on_tmpfs(st: &mut Stat, id: u32) {
     st.st_blksize = crate::maps::page_size().max(4096) as i32;
 }
 
+/// Host metadata of open descriptor `fd` (of the file an `O_PATH`
+/// stand-in names), with the guest's permission bits ([`crate::modes`])
+/// and owner ([`crate::owners`]).
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if let Some(host) = crate::fdmarks::stand_in(fd) {
         // A stand-in `O_PATH` descriptor: the file it names.
@@ -1733,8 +1734,6 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    /// The mount `path` from `dirfd` (or with `empty`, the file `dirfd` is
-    /// open on) is in, if fwe can place it.
     /// Whether what `path` from `dirfd` names (`dirfd` itself, `empty`)
     /// is the root of a mount, by where it is in the namespace.
     fn mount_root(&self, dirfd: i32, path: &[u8], empty: bool) -> bool {
@@ -1747,6 +1746,8 @@ impl<P: Platform> Kernel<P> {
         ns.is_some_and(|ns| fs.mount_ns().table().locate(&ns).0.point == ns)
     }
 
+    /// The mount `path` from `dirfd` (or with `empty`, the file `dirfd` is
+    /// open on) is in, if fwe can place it.
     fn statx_mount(
         &self,
         dirfd: i32,
@@ -3091,7 +3092,6 @@ impl<P: Platform> Kernel<P> {
         Some(crate::fdmarks::Mark::ProcMap { host, which, privileged, own })
     }
 
-    /// `EROFS` for a file opened through a read-only mount.
     /// `setxattr`, `lsetxattr` (`!follow`): set attribute `name` of the
     /// file at `path` (from `dirfd`) to the `size` bytes at `value`.
     #[allow(clippy::too_many_arguments)]

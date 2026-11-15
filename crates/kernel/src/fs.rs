@@ -611,13 +611,13 @@ impl Fs {
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
     }
 
-    /// The running program started with the auxiliary vector `auxv` (its
-    /// words, `AT_NULL` included), which `/proc/self/auxv` shows.
     /// The auxiliary vector the running program started with.
     pub fn auxv(&self) -> &[u8] {
         &self.proc.auxv
     }
 
+    /// The running program started with the auxiliary vector `auxv` (its
+    /// words, `AT_NULL` included), which `/proc/self/auxv` shows.
     pub fn set_auxv(&mut self, auxv: Vec<u8>) {
         // Other processes' `/proc/<pid>/auxv` too.
         crate::procreg::own_auxv(&auxv);

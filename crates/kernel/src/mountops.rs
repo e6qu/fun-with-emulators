@@ -381,7 +381,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `umount2(target, flags)`: a mount in use is refused (`EBUSY`, see
-    /// [`Self::mount_busy`]) unless detached (`MNT_DETACH`) or forced; with
+    /// [`Self::mount_busy`]) unless detached (`MNT_DETACH`), forced
+    /// (`MNT_FORCE`) or not, as Linux's own file systems refuse it; with
     /// `MNT_EXPIRE` an unused one is first marked (`EAGAIN`), and unmounted
     /// by the next such call if nothing used it in between.
     pub(crate) fn sys_umount2(&mut self, target: u64, flags: u64) -> i64 {

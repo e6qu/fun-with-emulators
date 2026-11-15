@@ -7,10 +7,12 @@
 //! on it with Linux semantics. The default is root (uid 0), the usual identity
 //! inside a container image, so a program that drops privileges can do so.
 //!
-//! Because the identity is virtual, it does not change how the host enforces
-//! access to the backing files; `chown` as root is accepted but does not alter
-//! host ownership, and `access`/open checks under a virtual root bypass the
-//! permission bits as Linux root would.
+//! Because the identity is virtual, the host does not enforce it on the
+//! backing files, which are all the host user's: fwe checks permissions
+//! itself ([`Access::permits`]) against the owner it keeps for each file
+//! (`chown` records it, [`crate::owners`]) and its kept mode
+//! ([`crate::modes`]), and a virtual root's capabilities pass the
+//! permission bits as Linux root's do.
 
 use fwe_abi::{err, errno};
 
