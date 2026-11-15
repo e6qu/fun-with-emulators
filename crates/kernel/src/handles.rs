@@ -4,9 +4,18 @@
 //! of the file, as a Linux handle does, and goes stale once the file is
 //! gone. A file fwe makes up (under `/proc`) has an identifier handle
 //! (`AT_HANDLE_FID`) only, which opens nothing.
+//!
+//! `open_by_handle_at` opens the file at a path the caller sees it at:
+//! where its host path falls under the host directory of `mount_fd`'s
+//! mount (or one of an overlay's layers), at that mount's place, under the
+//! caller's root, and found there as that same file. Then it is opened as
+//! `openat` opens it, with Linux's permission checks, read-only mounts and
+//! `O_PATH`. Any other file is stale (`ESTALE`): a handle never reaches
+//! past the guest's root or mounts.
 
 use crate::{Kernel, Platform};
 use fwe_abi::{err, errno};
+use std::os::unix::ffi::OsStrExt;
 
 /// Linux's `MAX_HANDLE_SZ`.
 const MAX_HANDLE_SZ: u32 = 128;
@@ -61,12 +70,6 @@ fn path_of(fsid: [i32; 2], ino: u64) -> Option<Vec<u8>> {
 }
 
 impl<P: Platform> Kernel<P> {
-    /// The host file system of the working directory.
-    fn cwd_fsid(&self) -> Option<[i32; 2]> {
-        let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, b".", true).ok()?;
-        fsid_of(std::os::fd::AsRawFd::as_raw_fd(&r.dir))
-    }
-
     /// `name_to_handle_at(dirfd, path, handle, mount_id, flags)`.
     pub(crate) fn sys_name_to_handle_at(
         &mut self,
@@ -106,14 +109,21 @@ impl<P: Platform> Kernel<P> {
             } else {
                 dirfd as i32
             };
-            // SAFETY: an all-zero `stat` is a valid out-parameter.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: as above.
-            if unsafe { libc::fstat(fd, &mut st) } != 0 {
-                return err(errno::EBADF);
+            let mount = crate::fdmarks::origin(fd).map_or(0, |o| u64::from(o.mount));
+            match crate::fdmarks::stand_in(fd) {
+                // A stand-in `O_PATH` descriptor: the file it names.
+                Some(host) => match identity_at(&host) {
+                    Some((fsid, ino)) => Ok((fsid, ino, mount)),
+                    None => return err(errno::ESTALE),
+                },
+                None => {
+                    let Some((_, ino)) = crate::fsops::host_identity(fd) else {
+                        return err(errno::EBADF);
+                    };
+                    let Some(fsid) = fsid_of(fd) else { return err(errno::EBADF) };
+                    Ok((fsid, ino, mount))
+                }
             }
-            let Some(fsid) = fsid_of(fd) else { return err(errno::EBADF) };
-            Ok((fsid, st.st_ino, 0))
         } else if self.fs().synthetic(dirfd as i32, &path).is_some() {
             Err(path.clone())
         } else {
@@ -183,13 +193,23 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    /// `open_by_handle_at(mount_fd, handle, flags)`.
+    /// `open_by_handle_at(mount_fd, handle, flags)`: the file the handle
+    /// names, opened as `openat` opens it (permission checks, read-only
+    /// mounts, `O_PATH`) at a path the caller sees it at in the mount of
+    /// `mount_fd` ([`Self::handle_path`]); `ESTALE` where it has none.
     pub(crate) fn sys_open_by_handle_at(&mut self, mount_fd: u64, handle: u64, flags: u64) -> i64 {
-        // The file system the handle is to be of: the descriptor's.
+        use fwe_abi::fcntl;
+        // The mount the handle is to be of: the descriptor's.
         let mfd = mount_fd as i32;
-        let fsid =
-            if i64::from(mfd) == fwe_abi::fcntl::AT_FDCWD { self.cwd_fsid() } else { fsid_of(mfd) };
-        let Some(fsid) = fsid else { return err(errno::EBADF) };
+        let anchor = if i64::from(mfd) == fcntl::AT_FDCWD {
+            self.fs().resolve(mfd, b".", true).ok().map(|r| {
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&r.dir);
+                (fsid_of(fd), r.ns_path.unwrap_or_default())
+            })
+        } else {
+            self.fs().fd_ns_path(mfd).map(|ns| (fsid_of(mfd), ns))
+        };
+        let Some((Some(fsid), anchor)) = anchor else { return err(errno::EBADF) };
         if !self.creds.has(crate::caps::CAP_DAC_READ_SEARCH) {
             return err(errno::EPERM);
         }
@@ -207,15 +227,84 @@ impl<P: Platform> Kernel<P> {
         if of != fsid {
             return err(errno::ESTALE);
         }
-        let Some(path) = path_of(of, ino) else { return err(errno::ESTALE) };
-        let Ok(c) = std::ffi::CString::new(path) else { return err(errno::ESTALE) };
-        // A handle of a symbolic link opens nothing (`ELOOP`), as Linux's.
-        let host = crate::host::open_flags_to_host(flags) | libc::O_NOFOLLOW;
-        // SAFETY: a NUL-terminated host path.
-        let fd = unsafe { libc::open(c.as_ptr(), host, 0) };
-        if fd < 0 {
-            return crate::host::last_error();
+        let Some(path) = self.handle_path(&anchor, of, ino) else { return err(errno::ESTALE) };
+        // The file itself: a link opens as `O_NOFOLLOW` opens one (`ELOOP`,
+        // or with `O_PATH` the link); nothing is made.
+        let flags =
+            flags & !(fcntl::O_CREAT | fcntl::O_EXCL | fcntl::O_TMPFILE) | fcntl::O_NOFOLLOW;
+        let fd = self.open_with(fcntl::AT_FDCWD as u64, path, flags, 0);
+        // Replaced at the path between the look and the open: stale.
+        if fd >= 0 && !same_file(fd as i32, of, ino) {
+            let _ = self.syscall(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+            return err(errno::ESTALE);
         }
-        fd as i64
+        fd
     }
+
+    /// The path, from the caller's root, of inode `ino` of host file system
+    /// `fsid` in the mount at namespace path `anchor` (a `mount_fd`'s): the
+    /// host's path of the file, under the mount's host directory (or one of
+    /// an overlay's layers), at the mount's place, where the caller finds
+    /// that same file (no mount over it, under its root). `None` for a file
+    /// the caller cannot reach so.
+    fn handle_path(&self, anchor: &[u8], fsid: [i32; 2], ino: u64) -> Option<Vec<u8>> {
+        let host = std::fs::canonicalize(std::ffi::OsStr::from_bytes(&path_of(fsid, ino)?)).ok()?;
+        let host = host.as_os_str().as_bytes();
+        let table = self.fs().mounts();
+        let (m, _) = table.locate(anchor);
+        let dirs: Vec<Vec<u8>> = match &m.source {
+            crate::mounts::Source::Host(_) => vec![m.host_path(b"")?],
+            crate::mounts::Source::Overlay(layers) => {
+                layers.paths().map(|p| crate::mounts::join(p, &m.root)).collect()
+            }
+            _ => return None,
+        };
+        let rest = dirs.iter().find_map(|d| {
+            let d = std::fs::canonicalize(std::ffi::OsStr::from_bytes(d)).ok()?;
+            crate::mounts::under(host, d.as_os_str().as_bytes()).map(<[u8]>::to_vec)
+        })?;
+        let ns = crate::mounts::join(&m.point, &rest);
+        let path = self.fs().from_ns(&ns)?;
+        // The same file there, not one a mount or another layer shows.
+        let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, &path, false).ok()?;
+        let st = r.lstat()?;
+        let dir = std::os::fd::AsRawFd::as_raw_fd(&r.dir);
+        (st.st_ino == ino && fsid_of(dir) == Some(fsid)).then_some(path)
+    }
+}
+
+/// Whether the file open as `fd` is inode `ino` of host file system
+/// `fsid`.
+fn same_file(fd: i32, fsid: [i32; 2], ino: u64) -> bool {
+    match crate::fdmarks::stand_in(fd) {
+        // A stand-in `O_PATH` descriptor: the file it names.
+        Some(host) => identity_at(&host) == Some((fsid, ino)),
+        None => {
+            crate::fsops::host_identity(fd).is_some_and(|(_, i)| i == ino)
+                && fsid_of(fd) == Some(fsid)
+        }
+    }
+}
+
+/// The host file system and inode of the file at host path `path` (a link
+/// itself): the file system of the directory it is in.
+fn identity_at(path: &[u8]) -> Option<([i32; 2], u64)> {
+    let c = std::ffi::CString::new(path).ok()?;
+    let dir = match path.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => &b"/"[..],
+        Some(i) => &path[..i],
+    };
+    let dir = std::ffi::CString::new(dir).ok()?;
+    // SAFETY: all-zero `stat` and `statfs` are valid out-parameters.
+    let (mut st, mut sf): (libc::stat, libc::statfs) = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated paths and valid out-parameters.
+    if unsafe { libc::lstat(c.as_ptr(), &mut st) != 0 || libc::statfs(dir.as_ptr(), &mut sf) != 0 }
+    {
+        return None;
+    }
+    // SAFETY: `fsid_t` is two `i32`s, whose fields the libc crate keeps
+    // private.
+    let fsid = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(sf.f_fsid) };
+    #[allow(clippy::unnecessary_cast)] // `st_ino`'s width differs by host
+    Some((fsid, st.st_ino as u64))
 }

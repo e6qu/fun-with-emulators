@@ -842,7 +842,11 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   host file system and inode, which the host turns back into a path
   (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes
   stale (`ESTALE`) with the file or on another file system; a file fwe
-  makes up has an identifier handle (`AT_HANDLE_FID`) only.
+  makes up has an identifier handle (`AT_HANDLE_FID`) only. The file is
+  opened as `openat` opens it, at the path the caller sees it at: under
+  the host directory of `mount_fd`'s mount (or an overlay's layer), at
+  that mount's place, under the caller's root, and the same file there;
+  anything else is stale, so a handle never reaches past the guest's view.
 - **Leases** (`crates/kernel/src/leases.rs`): a record all fwe processes
   share. An open or truncation that conflicts with a lease signals its
   holder and waits until the lease is released or downgraded, or for

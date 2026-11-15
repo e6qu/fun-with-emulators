@@ -6972,12 +6972,18 @@ fn newer_system_calls() {
 /// Run one scenario of the `fsrules` guest in a root filesystem of its own
 /// (`/tmp`) and return its output.
 fn fsrules(scenario: &str) -> String {
+    fsrules_with(scenario, &[])
+}
+
+/// [`fsrules`] with more arguments.
+fn fsrules_with(scenario: &str, args: &[&str]) -> String {
     let root = std::env::temp_dir().join(format!("fwe-fsr-{}-{scenario}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("tmp")).unwrap();
     std::fs::copy(rust_guest("fsrules"), root.join("fsrules")).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace=failures").arg("--root").arg(&root).arg(root.join("fsrules")).arg(scenario);
+    cmd.args(args);
     let out = run_bounded(cmd);
     eprintln!("--- fsrules {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&root);
@@ -7007,6 +7013,27 @@ fn nodump_is_apart_from_kept_owners() {
         fsrules("nodump"),
         "owned no-dump: (false, false)\nafter clearing: 1000:100\n\
          set: (true, true) owner 1000:100\n"
+    );
+}
+
+/// `open_by_handle_at` opens as `openat` does, in the guest's own view:
+/// read through a handle, `O_PATH` for naming only, `EROFS` to write
+/// through a read-only mount, the file's mode for a caller without
+/// `CAP_DAC_OVERRIDE`, `EPERM` without `CAP_DAC_READ_SEARCH`; a handle
+/// forged for a host file outside the root is stale.
+#[test]
+fn file_handles_open_within_the_guests_view() {
+    use std::os::unix::fs::MetadataExt;
+    let outside = std::env::temp_dir().join(format!("fwe-fsr-outside-{}", std::process::id()));
+    std::fs::write(&outside, "host secret").unwrap();
+    let ino = std::fs::metadata(&outside).unwrap().ino().to_string();
+    let out = fsrules_with("handles", &[&ino]);
+    let _ = std::fs::remove_file(&outside);
+    assert_eq!(
+        out,
+        "read: hello\nO_PATH read: EBADF\nread-only mount: write EROFS read ok\n\
+         outside the root: ESTALE\nwithout CAP_DAC_OVERRIDE: write EACCES read ok\n\
+         without CAP_DAC_READ_SEARCH: EPERM\n"
     );
 }
 
