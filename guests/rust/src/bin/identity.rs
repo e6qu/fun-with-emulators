@@ -129,10 +129,18 @@ fn wait_for(sig: i32, ms: i64) -> Option<[u8; 128]> {
 /// Fork a child that waits for pipe `go` to close, runs `f`, and exits
 /// with what it returns.
 fn child(go: [i32; 2], f: impl FnOnce() -> i32) -> i32 {
+    child_as(go, None, f)
+}
+
+/// [`child`], first taking user id `uid` (before the go, so others see it).
+fn child_as(go: [i32; 2], uid: Option<u32>, f: impl FnOnce() -> i32) -> i32 {
     // SAFETY: plain calls into the C library.
     unsafe {
         let pid = fork();
         if pid == 0 {
+            if let Some(u) = uid {
+                setuid(u);
+            }
             close(go[1]);
             let mut b = 0u8;
             read(go[0], (&mut b as *mut u8).cast(), 1);
@@ -745,17 +753,17 @@ fn priorities() {
         pipe(report.as_mut_ptr());
         let child = fork();
         if child == 0 {
-            setuid(1000);
+            setuid(43211);
             unshare(CLONE_NEWUSER);
             let map = CString::new("/proc/self/uid_map").unwrap();
             let fd = open(map.as_ptr(), O_WRONLY);
-            write(fd, b"500 1000 1".as_ptr().cast(), 10);
+            write(fd, b"500 43211 1".as_ptr().cast(), 11);
             close(fd);
             let mapped = getpriority(PRIO_USER, 500);
             let mapped = if mapped == -1 { format!("errno {}", errno()) } else { mapped.to_string() };
-            let unmapped = getpriority(PRIO_USER, 1000);
+            let unmapped = getpriority(PRIO_USER, 43211);
             let unmapped = if unmapped == -1 && errno() == 3 { "ESRCH".to_string() } else { unmapped.to_string() };
-            let line = format!("user namespace: user 500 (1000 outside) {mapped}, user 1000 {unmapped}\n");
+            let line = format!("user namespace: user 500 (43211 outside) {mapped}, user 43211 {unmapped}\n");
             write(report[1], line.as_ptr().cast(), line.len());
             _exit(0);
         }
@@ -868,14 +876,10 @@ fn group_kill() {
         pipe(go.as_mut_ptr());
         let got = || i32::from(wait_for(SIGUSR1, 1500).is_some());
         let root = child(go, got);
-        let user = child(go, || {
-            setuid(1000);
-            got()
-        });
+        let user = child_as(go, Some(1000), got);
         let other = child(go, got);
         setpgid(other, other);
-        let sender = child(go, || {
-            setuid(1000);
+        let sender = child_as(go, Some(1000), || {
             let own = kill(0, SIGUSR1) == 0;
             let r = kill(-other, SIGUSR1);
             let refused = r == -1 && errno() == 1;

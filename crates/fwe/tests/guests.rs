@@ -4382,7 +4382,7 @@ fn nice_values_reach_the_host_and_name_threads() {
         "process: start 0, set 5 0 reads 5, lowered to 2 0 reads 2\n\
          thread: starts 2, set 9 0, reads 9, main thread's 2\n\
          main thread: 2\n\
-         user namespace: user 500 (1000 outside) 2, user 1000 ESRCH\n"
+         user namespace: user 500 (43211 outside) 2, user 43211 ESRCH\n"
     );
     assert_eq!(host_nice, Some(5), "the host process keeps the highest nice value it was given");
     assert!(status.success());
