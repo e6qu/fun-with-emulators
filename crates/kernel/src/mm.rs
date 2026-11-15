@@ -2718,7 +2718,7 @@ fn is_dev_zero(fd: i32) -> bool {
 /// refuses a new one once there are more than it). Read only where a
 /// process has many: below a thousand, none passes.
 fn too_many_maps(extra: usize) -> bool {
-    let n = crate::maps::record().count() + extra;
+    let n = crate::maps::count() + extra;
     n >= 1024 && crate::sysctl::number(b"vm/max_map_count").is_some_and(|max| n as i64 > max.max(0))
 }
 

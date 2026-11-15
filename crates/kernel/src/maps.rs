@@ -22,6 +22,7 @@
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a mapping is named by in the listing.
@@ -532,20 +533,54 @@ static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(40
 
 /// The guest's pages are `page` bytes.
 pub fn set_page_size(page: u64) {
-    PAGE.store(page, std::sync::atomic::Ordering::Relaxed);
+    PAGE.store(page, Relaxed);
 }
 
 /// The guest's page size.
 pub fn page_size() -> u64 {
-    PAGE.load(std::sync::atomic::Ordering::Relaxed)
+    PAGE.load(Relaxed)
 }
 
 /// This process's record.
 static RECORD: Mutex<Record> = Mutex::new(Record::new());
 
+/// How many mappings the record holds, as its lock was last let go: read
+/// without the lock by every `mmap` ([`count`]).
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The record, locked; its count is published as the lock is let go.
+pub struct Held(MutexGuard<'static, Record>);
+
+impl std::ops::Deref for Held {
+    type Target = Record;
+
+    fn deref(&self) -> &Record {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Record {
+        &mut self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        COUNT.store(self.0.count(), Relaxed);
+    }
+}
+
 /// This process's record, to read or change.
-pub fn record() -> MutexGuard<'static, Record> {
-    RECORD.lock().unwrap_or_else(|e| e.into_inner())
+pub fn record() -> Held {
+    Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// How many mappings the record holds, without its lock: as of the last
+/// change, which a call racing with another thread's map may miss as it
+/// would with the lock.
+pub fn count() -> usize {
+    COUNT.load(Relaxed)
 }
 
 /// Forget every mapping (the old program's, at `execve`).
@@ -646,7 +681,7 @@ static STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// of a mapping before then, and a run of mapping calls (a program making
 /// thousands) publishes them once, not once each.
 pub fn publish() {
-    STALE.store(true, std::sync::atomic::Ordering::Relaxed);
+    STALE.store(true, Relaxed);
 }
 
 /// Before system call `nr`: publish the mappings if they changed, unless
@@ -672,7 +707,7 @@ pub fn flush_before(nr: u64) {
 
 /// Publish the mappings if they changed since last published.
 pub fn flush() {
-    use std::sync::atomic::Ordering::Relaxed;
+    use Relaxed;
     // Read first: a swap would write the flag's line on every call, which
     // every thread's calls then contend for.
     if STALE.load(Relaxed) && STALE.swap(false, Relaxed) {

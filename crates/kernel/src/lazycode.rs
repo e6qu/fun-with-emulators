@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::*};
 
 /// A write owed: where, the word there now, and the word to put there.
 pub type Write = (u64, u32, u32);
@@ -84,6 +85,8 @@ pub fn owe(writes: Vec<Write>, key: &[u8], start: u64, kept: &[u64]) {
     });
     for w in writes {
         let p = w.0 & !(page - 1);
+        LOW.fetch_min(p, Release);
+        HIGH.fetch_max(p + page, Release);
         pg.done.remove(&p);
         pg.owed.entry(p).or_insert(Owed { writes: Vec::new(), prot: 0, origin }).writes.push(w);
     }
@@ -122,10 +125,15 @@ pub fn forked() {
     }
 }
 
-/// Whether any page is owed writes.
-fn any() -> bool {
-    let pg = pages();
-    !pg.owed.is_empty() || !pg.done.is_empty()
+/// The lowest and the end of the highest page ever owed writes: every
+/// page [`Pages`] holds is between them, so a call about memory outside
+/// them takes no lock (a memory call on the guest's own data, say).
+static LOW: AtomicU64 = AtomicU64::new(u64::MAX);
+static HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `[addr, addr + len)` may hold a page owed writes or written.
+fn near(addr: u64, len: u64) -> bool {
+    addr.saturating_add(len) > LOW.load(Acquire) && addr < HIGH.load(Acquire)
 }
 
 /// The owed pages in `[addr, addr + len)`.
@@ -138,7 +146,7 @@ fn owed_in(pg: &Pages, addr: u64, len: u64) -> Vec<u64> {
 /// pages in it that are owed writes keep them, but not to run, so the
 /// first run faults; made writable, they are written now.
 pub fn protected(addr: u64, len: u64, prot: i32) {
-    if !any() {
+    if !near(addr, len) {
         return;
     }
     let page = page();
@@ -161,7 +169,7 @@ pub fn protected(addr: u64, len: u64, prot: i32) {
 
 /// Host memory `[addr, addr + len)` is gone: nothing is owed there.
 pub fn unmapped(addr: u64, len: u64) {
-    if !any() {
+    if !near(addr, len) {
         return;
     }
     let page = page();
@@ -179,7 +187,7 @@ pub fn unmapped(addr: u64, len: u64) {
 /// Make what is owed in `[addr, addr + len)` now, the pages keeping their
 /// protections: before their contents move ([`crate::mm`]'s `mremap`).
 pub fn settle(addr: u64, len: u64) {
-    if !any() {
+    if !near(addr, len) {
         return;
     }
     let mut pg = pages();
@@ -197,10 +205,10 @@ pub fn settle(addr: u64, len: u64) {
 /// guest runs on. Any other fault (a data access) is not one of these.
 /// Called from the fault handler.
 pub fn fault(pc: u64, addr: u64) -> bool {
-    if !any() {
+    let p = pc & !(page() - 1);
+    if !near(p, page()) {
         return false;
     }
-    let p = pc & !(page() - 1);
     if addr & !(page() - 1) != p {
         return false;
     }
@@ -234,7 +242,7 @@ pub fn fault(pc: u64, addr: u64) -> bool {
     for q in (first..end).step_by(page as usize) {
         pg.done.insert(q);
     }
-    WRITTEN.fetch_add((end - first) / page, std::sync::atomic::Ordering::Relaxed);
+    WRITTEN.fetch_add((end - first) / page, Relaxed);
     true
 }
 
@@ -242,11 +250,11 @@ pub fn fault(pc: u64, addr: u64) -> bool {
 const NEIGHBOURS: u64 = 8;
 
 /// How many pages were written as they first ran ([`fault`]).
-static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITTEN: AtomicU64 = AtomicU64::new(0);
 
 /// How many pages were written as they first ran, for `FWE_TIMING`.
 pub fn written() -> u64 {
-    WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
+    WRITTEN.load(Relaxed)
 }
 
 /// Make `writes` in page `p` and give it host protections `prot`.
