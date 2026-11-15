@@ -377,6 +377,7 @@ mod tests {
 
     #[test]
     fn queued_signal_reads_back() {
+        let _held = crate::thread::signals_held();
         // Watch SIGUSR1 (10) and SIGTERM (15), non-blocking.
         let mask = (1u64 << (10 - 1)) | (1u64 << (15 - 1));
         let fd = signalfd4(-1, mask, fwe_abi::fcntl::O_NONBLOCK) as i32;
@@ -405,6 +406,7 @@ mod tests {
     /// once, a real-time one twice.
     #[test]
     fn a_signal_is_taken_once() {
+        let _held = crate::thread::signals_held();
         // SIGUSR2 (12) and SIGRTMIN+5 (37).
         let mask = (1u64 << 11) | (1u64 << 36);
         let a = signalfd4(-1, mask, fwe_abi::fcntl::O_NONBLOCK) as i32;
@@ -425,6 +427,7 @@ mod tests {
 
     #[test]
     fn short_buffer_is_einval() {
+        let _held = crate::thread::signals_held();
         let fd = signalfd4(-1, 1, fwe_abi::fcntl::O_NONBLOCK) as i32;
         let mut b = [0u8; 8];
         // SAFETY: buffer too small for a siginfo.

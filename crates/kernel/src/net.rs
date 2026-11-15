@@ -3392,6 +3392,7 @@ pub(crate) mod scm_tests {
         close_all(&[p[0]]);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_passed_eventfd_shares_its_count() {
         let _g = serial();
@@ -3416,6 +3417,7 @@ pub(crate) mod scm_tests {
         assert_eq!(crate::specialfd::try_close(fd), Some(0));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_passed_timerfd_keeps_its_schedule() {
         let _g = serial();
@@ -3443,8 +3445,10 @@ pub(crate) mod scm_tests {
         crate::specialfd::try_close(fd);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_passed_signalfd_is_one() {
+        let _held = crate::thread::signals_held();
         let _g = serial();
         let fd = crate::signalfd::signalfd4(-1, 1 << 9, fwe_abi::fcntl::O_NONBLOCK);
         let got = pass(&[fd as i32]);
@@ -3453,6 +3457,7 @@ pub(crate) mod scm_tests {
         crate::signalfd::try_close(fd as i32);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_passed_netlink_socket_answers() {
         let _g = serial();
@@ -3573,6 +3578,7 @@ mod udp_option_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[cfg(test)]
 mod fastopen_tests {
     use super::*;

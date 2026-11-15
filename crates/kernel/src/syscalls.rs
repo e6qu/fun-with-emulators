@@ -4611,6 +4611,7 @@ mod tests {
     /// signal.
     #[test]
     fn no_guest_pid_signals_the_hosts_processes() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let info = [0u8; 128];
         for pid in [-1i64, 0, -5] {
@@ -4629,8 +4630,10 @@ mod tests {
     /// process, never reaches a process that is not fwe's (one this test
     /// started), whatever asks: a signal the host lacks, a descriptor
     /// (`pidfd_getfd`), its memory (`process_vm_readv`).
+    #[cfg(target_os = "macos")]
     #[test]
     fn internal_signals_never_reach_other_processes() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id() as i32;
@@ -4687,6 +4690,7 @@ mod tests {
     /// Linux's `kill_pgrp`.
     #[test]
     fn group_kill_checks_each_member() {
+        let _held = crate::thread::signals_held();
         use std::os::unix::process::CommandExt;
         let mut k = kernel();
         let mut child =

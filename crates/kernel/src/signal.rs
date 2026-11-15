@@ -1295,6 +1295,7 @@ mod tests {
     /// kernel's code, but not of a fault signal a process sent it.
     #[test]
     fn only_own_faults_are_forced_on_an_init() {
+        let _held = crate::thread::signals_held();
         let fault = SigInfo { code: 1, ..SigInfo::default() };
         let sent = SigInfo { code: signal::SI_USER, ..SigInfo::default() };
         assert!(forced_fault(signal::SIGSEGV, &fault));
@@ -1308,6 +1309,7 @@ mod tests {
     /// The computed frame offsets match the arm64 kernel layout.
     #[test]
     fn frame_offsets() {
+        let _held = crate::thread::signals_held();
         // `offsetof(struct rt_sigframe, uc.uc_mcontext)` and friends on arm64
         // Linux; glibc's `getcontext` stores `x18`/`x19` at
         // `uc_mcontext + 8 + 18 * 8` = 328 from `ucontext`, which is 456 here.
@@ -1363,6 +1365,7 @@ mod tests {
 
     #[test]
     fn delivers_handler_and_restores_on_sigreturn() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let act = Sigaction { handler: HANDLER, flags: signal::SA_SIGINFO, restorer: 0, mask: 0 };
         k.sigactions[(signal::SIGUSR1 - 1) as usize] = act;
@@ -1405,6 +1408,7 @@ mod tests {
     /// builds its frame below the running handler's sp, not over it.
     #[test]
     fn nested_delivery_stays_below_live_altstack_frame() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let act = Sigaction { handler: HANDLER, flags: signal::SA_ONSTACK, restorer: 0, mask: 0 };
         k.sigactions[(signal::SIGUSR1 - 1) as usize] = act;
@@ -1436,6 +1440,7 @@ mod tests {
 
     #[test]
     fn ignored_signal_is_dropped() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = signal::SIG_IGN;
         let mut regs = Regs { sp: 0x9000, pc: 0x1000, ..Regs::default() };
@@ -1447,6 +1452,7 @@ mod tests {
 
     #[test]
     fn blocked_signal_stays_pending() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = HANDLER;
         thread::set_mask(1 << (signal::SIGUSR1 - 1));
@@ -1463,6 +1469,7 @@ mod tests {
     /// pending when `kill` returns, as on Linux.
     #[test]
     fn a_blocked_signal_sent_to_oneself_is_pending_at_once() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let urg = 1u64 << (signal::SIGURG - 1);
         thread::set_mask(urg);
@@ -1482,6 +1489,7 @@ mod tests {
     /// restored on `rt_sigreturn`, whatever the handler did to them.
     #[test]
     fn fp_state_survives_a_handler() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR2 - 1) as usize].handler = HANDLER;
         let (_stack, top) = stack();
@@ -1514,6 +1522,7 @@ mod tests {
     /// returns to the mask from before the call.
     #[test]
     fn sigsuspend_mask_is_restored_by_sigreturn() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = HANDLER;
         let (_stack, top) = stack();
@@ -1538,6 +1547,7 @@ mod tests {
     /// when no handler is waiting (the interruption was not the guest's).
     #[test]
     fn interrupted_calls_restart_as_on_linux() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let (_stack, top) = stack();
         let args = [7, 0, 0, 0, 0, 0];

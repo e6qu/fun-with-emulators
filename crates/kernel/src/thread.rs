@@ -1450,6 +1450,14 @@ pub fn set_altstack(stack: Stack) {
     ALTSTACK.with(|a| a.set(stack));
 }
 
+/// Held by every unit test that touches the process's pending signals or
+/// signal queues, which all of a test process's threads share.
+#[cfg(test)]
+pub(crate) fn signals_held() -> std::sync::MutexGuard<'static, ()> {
+    static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,6 +1474,7 @@ mod tests {
 
     #[test]
     fn pending_is_per_thread_and_carries_info() {
+        let _held = crate::thread::signals_held();
         register_current();
         let info = SigInfo { code: -6, pid: 7, uid: 8, status: 0, value: 9, poll: None };
         post_self(signal::SIGUSR1, info);
