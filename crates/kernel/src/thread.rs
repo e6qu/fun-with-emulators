@@ -241,6 +241,10 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         let mut b = [0u8; 64];
         // SAFETY: the thread's own non-blocking pipe and a buffer of its length.
         while unsafe { libc::read(wake, b.as_mut_ptr().cast(), b.len()) } > 0 {}
+        // One that landed here for the process while this thread blocks
+        // it: another thread that does not is woken to take it, as this
+        // one waits on ([`post_landed`]).
+        wake_others_if_asked(crate::host::WAKE_SIGNAL);
         crate::signal::drain_to_signalfd();
         if deliverable() != 0 {
             return Err(fwe_abi::errno::EINTR);
@@ -313,6 +317,8 @@ pub fn nap_ns(ns: i64) {
     let mut b = [0u8; 64];
     // SAFETY: the thread's own non-blocking pipe and a buffer of its length.
     while unsafe { libc::read(wake, b.as_mut_ptr().cast(), b.len()) } > 0 {}
+    // As [`wait_ready_ns`]: one this thread blocks goes to another.
+    wake_others_if_asked(crate::host::WAKE_SIGNAL);
 }
 
 /// Set the thread's timer kqueue `kq` to fire once, `after` from now, on

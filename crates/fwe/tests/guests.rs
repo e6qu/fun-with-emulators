@@ -1068,6 +1068,14 @@ fn c_guest_prints(name: &str, args: &[&str], want: &str) {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A signal for a process whose main thread blocks it is taken by another
+/// thread that does not, whether that one waits in `pause` or sleeps.
+#[test]
+fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
+    c_guest_prints("blockedwake", &[], "taken by the other thread\n");
+    c_guest_prints("blockedwake", &["sleeping"], "taken by the other thread\n");
+}
+
 /// A process keeps its pid in its pid namespace across an `execve` made
 /// while other threads run, which runs a fresh fwe from the exec state.
 #[test]
