@@ -40,6 +40,7 @@ const SYS_GETCPU: i64 = 168;
 const SYS_PRLIMIT64: i64 = 261;
 const RLIMIT_NOFILE: i32 = 7;
 const RLIMIT_NPROC: i32 = 6;
+const RLIMIT_MSGQUEUE: i32 = 12;
 const MAP_SHARED: i32 = 0x01;
 const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
 const MAP_PRIVATE: i32 = 0x02;
@@ -99,6 +100,8 @@ unsafe extern "C" {
     fn mlockall(flags: i32) -> i32;
     fn munlockall() -> i32;
     fn dup(fd: i32) -> i32;
+    fn execv(path: *const c_char, argv: *const *const c_char) -> i32;
+    fn pause() -> i32;
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn memfd_create(name: *const c_char, flags: u32) -> i32;
@@ -451,6 +454,26 @@ fn prlimit_other() {
         );
         close(go[1]);
         println!("its highest descriptor {}", reap(child));
+        // One that set its own limit, then ran a program: what it carried.
+        let child = fork();
+        if child == 0 {
+            setrlimit(RLIMIT_MSGQUEUE, &Rlimit { cur: 4321, max: 4321 });
+            let me = CString::new("/proc/self/exe").unwrap();
+            let args = [me.as_ptr(), c"identity".as_ptr(), c"pause".as_ptr(), std::ptr::null()];
+            execv(me.as_ptr(), args.as_ptr());
+            _exit(1);
+        }
+        let mut seen = (0, 0);
+        for _ in 0..100 {
+            usleep(20_000);
+            seen = limit_of(child, RLIMIT_MSGQUEUE);
+            if seen == (4321, 4321) {
+                break;
+            }
+        }
+        kill(child, SIGKILL);
+        reap(child);
+        println!("after its execve: {seen:?}");
     }
 }
 
@@ -834,6 +857,10 @@ fn main() {
         "affinity" => affinity(),
         "prlimit-other" => prlimit_other(),
         "nproc-threads" => nproc_threads(),
+        // SAFETY: waiting for a signal.
+        "pause" => loop {
+            unsafe { pause() };
+        },
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

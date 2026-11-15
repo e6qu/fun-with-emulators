@@ -896,6 +896,8 @@ impl<P: Platform> Kernel<P> {
         // Limits another process left for this one (runc sets its
         // container's this way before it runs the program).
         self.take_pending_limits();
+        // The limits carried across, for other processes to read.
+        syscalls::publish_limits();
         self.ids_changed(0);
         Ok(())
     }

@@ -4291,7 +4291,8 @@ fn fork_counts_threads_against_rlimit_nproc() {
 fn prlimit_reaches_another_process_at_once() {
     assert_eq!(
         identity(&["prlimit-other"]),
-        "set 0: it reads (64, 64), the caller's own 128\nits highest descriptor 63\n"
+        "set 0: it reads (64, 64), the caller's own 128\nits highest descriptor 63\n\
+         after its execve: (4321, 4321)\n"
     );
 }
 
