@@ -1055,7 +1055,32 @@ mod imp {
         if add == u64::MAX {
             return Some(err(errno::EINVAL));
         }
-        Some(add_to(fd, add))
+        // One that would take the count past its maximum waits, as Linux's
+        // does, until a read makes room (or fails with `EAGAIN` when the
+        // descriptor does not block); a signal the guest handles ends the
+        // wait (`EINTR`). Reads are looked for every millisecond: a count
+        // this near its maximum is rare, and the wait keeps no hold on the
+        // counter, which a close may unmap.
+        loop {
+            let r = add_to(fd, add);
+            if r != err(errno::EAGAIN) {
+                return Some(r);
+            }
+            let Some(rfd) = with_reg(|m| match m.get(&fd) {
+                Some(Special::Event(e)) => Some(e.rfd),
+                _ => None,
+            }) else {
+                return Some(err(errno::EBADF));
+            };
+            // SAFETY: F_GETFL only queries the descriptor.
+            if unsafe { libc::fcntl(rfd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
+                return Some(r);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if crate::thread::deliverable() != 0 {
+                return Some(err(errno::EINTR));
+            }
+        }
     }
 
     /// Add `add` to eventfd `fd`'s count: 8, or `EAGAIN` past its maximum.
@@ -1066,8 +1091,7 @@ mod imp {
             };
             let wfd = e.wfd;
             locked(e.shared, |count| {
-                // eventfd caps at u64::MAX - 1; overflow would block, which we
-                // report as EAGAIN (the counter reaching this is not expected).
+                // The count stops at u64::MAX - 1.
                 if add > u64::MAX - 1 - *count {
                     return err(errno::EAGAIN);
                 }
@@ -1175,6 +1199,32 @@ mod tests {
         assert_eq!(v, 5);
         // Drained: EAGAIN again.
         assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        assert_eq!(close_fd(fd), 0);
+    }
+
+    /// A write that would take the count past its maximum waits for a
+    /// read, or is `EAGAIN` when the descriptor does not block.
+    #[test]
+    fn eventfd_overflowing_write_waits_for_a_read() {
+        // SAFETY: no pointers.
+        let fd = unsafe { eventfd2(0, 0) } as i32;
+        assert_eq!(write_u64(fd, u64::MAX - 2), 8);
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            read_u64(fd)
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(write_u64(fd, 5), 8);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(40));
+        assert_eq!(reader.join().unwrap(), 8);
+        let mut v = 0u64;
+        assert_eq!(read_into(fd, &mut v), 8);
+        assert_eq!(v, 5);
+        assert_eq!(close_fd(fd), 0);
+        // SAFETY: no pointers.
+        let fd = unsafe { eventfd2(0, EFD_NONBLOCK) } as i32;
+        assert_eq!(write_u64(fd, u64::MAX - 2), 8);
+        assert_eq!(write_u64(fd, 5), fwe_abi::err(fwe_abi::errno::EAGAIN));
         assert_eq!(close_fd(fd), 0);
     }
 

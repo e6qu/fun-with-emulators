@@ -1144,6 +1144,17 @@ fn pipe_and_eventfd_flags_are_checked() {
     );
 }
 
+/// A blocking eventfd write that would overflow its count waits for a
+/// read, as Linux's does, and a signal ends the wait with `EINTR`.
+#[test]
+fn an_overflowing_eventfd_write_waits() {
+    c_guest_prints(
+        "specialfds",
+        &["overflow"],
+        "interrupted -1 errno 4, after a read 8, count 5\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
