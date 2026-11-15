@@ -800,10 +800,10 @@ pub(crate) static WRITES: crate::kept::Kept<Vec<(i32, i32, u64)>> =
 /// edge-triggered read filter fires on reads too).
 #[cfg(not(target_os = "linux"))]
 fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
-    // A pipe whose writes are counted (one watched exclusively, or an
-    // eventfd's, each of whose writes is an edge to Linux even when the
-    // count was not 0): written to since, whatever it holds now.
-    if let Some(w) = crate::exclusive::writes(fd).or_else(|| crate::specialfd::eventfd_writes(fd)) {
+    // A pipe whose writes are counted (an eventfd's, each of whose writes
+    // is an edge to Linux even when the count was not 0, or one watched
+    // exclusively): written to since, whatever it holds now.
+    if let Some(w) = crate::specialfd::eventfd_writes(fd).or_else(|| crate::exclusive::writes(fd)) {
         let mut seen = WRITES.lock();
         return match seen.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
             Some(k) => {

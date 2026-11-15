@@ -194,6 +194,7 @@ fn make(mask: u64, cloexec: bool, nonblock: bool) -> Result<i32, i32> {
         }
     };
     let rfd = fds[0];
+    crate::exclusive::made(rfd);
     if cloexec {
         // SAFETY: plain host call on a fresh descriptor.
         unsafe { libc::fcntl(rfd, libc::F_SETFD, libc::FD_CLOEXEC) };

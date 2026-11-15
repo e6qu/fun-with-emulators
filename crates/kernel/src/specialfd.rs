@@ -792,6 +792,7 @@ mod imp {
             }
         };
         let rfd = fds[0];
+        crate::exclusive::made(rfd);
         if flags & EFD_CLOEXEC != 0 {
             set_cloexec(rfd);
         }
