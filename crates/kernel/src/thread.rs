@@ -368,8 +368,7 @@ pub fn forked() {
     // The parent's other threads' sets are not the child's. Only entries
     // ever taken are looked at, and only those in use written: a write to
     // each of the pool's pages would copy every one into the child.
-    let high = (POOL_HIGH.load(Ordering::Relaxed) as usize).min(QUEUE_MAX);
-    for q in &POOL[..high] {
+    for q in used_pool() {
         if q.state.load(Ordering::Relaxed) != 0 {
             q.state.store(0, Ordering::Release);
         }
@@ -725,6 +724,12 @@ static POOL_USED: AtomicU64 = AtomicU64::new(0);
 /// it was.
 static POOL_HIGH: AtomicU64 = AtomicU64::new(0);
 
+/// The entries of [`POOL`] ever taken: those past them hold nothing, and
+/// are never read (a fork child would map in their pages to read them).
+fn used_pool() -> &'static [Queued] {
+    &POOL[..(POOL_HIGH.load(Ordering::Acquire) as usize).min(QUEUE_MAX)]
+}
+
 /// How many signals are pending in the process, in all its sets: each
 /// number pending, and each queued behind it. What `RLIMIT_SIGPENDING`
 /// bounds ([`may_queue`]).
@@ -760,7 +765,7 @@ impl Pending {
     fn enqueue(&self, sig: u64, info: &SigInfo) -> bool {
         for (i, q) in POOL.iter().enumerate() {
             if q.state.compare_exchange(0, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                POOL_HIGH.fetch_max(i as u64 + 1, Ordering::Relaxed);
+                POOL_HIGH.fetch_max(i as u64 + 1, Ordering::AcqRel);
                 q.owner.store(self.id(), Ordering::Relaxed);
                 q.sig.store(sig, Ordering::Relaxed);
                 store_slot(&q.info, info);
@@ -778,7 +783,7 @@ impl Pending {
     fn dequeue(&self, sig: u64) -> Option<SigInfo> {
         let me = self.id();
         loop {
-            let oldest = POOL
+            let oldest = used_pool()
                 .iter()
                 .filter_map(|q| {
                     let s = q.state.load(Ordering::Acquire);
@@ -883,7 +888,7 @@ impl Pending {
     fn clear(&self) {
         uncount(u64::from(self.bits.swap(0, Ordering::AcqRel).count_ones()));
         let me = self.id();
-        for q in &POOL {
+        for q in used_pool() {
             let s = q.state.load(Ordering::Acquire);
             if s > CLAIMED
                 && q.owner.load(Ordering::Relaxed) == me
