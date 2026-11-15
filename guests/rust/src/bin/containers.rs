@@ -938,6 +938,39 @@ fn main() {
                     }
                     waitpid(-1, std::ptr::null_mut(), 0);
                 }
+                // Traced (`PTRACE_TRACEME`, the tracer detaching at the
+                // exec's stop): a tracer with `CAP_SYS_PTRACE` lets the
+                // program grant what it grants, one without withholds it.
+                let (hdr, mut full) = ([0x2008_0522u32, 0], [0u32; 6]);
+                syscall(90, hdr.as_ptr(), full.as_mut_ptr());
+                for (prog, label, privileged) in [
+                    ("/tmp/setuid", "set-uid, traced by a privileged tracer", true),
+                    ("/tmp/setuid", "set-uid, traced by an unprivileged tracer", false),
+                    ("/tmp/capped", "capped, traced by an unprivileged tracer", false),
+                ] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    let mut less = full;
+                    if !privileged {
+                        // CAP_SYS_PTRACE (19) out of the effective set.
+                        less[0] &= !(1 << 19);
+                    }
+                    syscall(91, hdr.as_ptr(), less.as_ptr());
+                    let child = fork();
+                    if child == 0 {
+                        setuid(1000);
+                        syscall(117, 0, 0, 0, 0);
+                        let (p, r, l) = (c(prog), c("report"), c(label));
+                        let argv = [p.as_ptr(), r.as_ptr(), l.as_ptr(), std::ptr::null()];
+                        execv(p.as_ptr(), argv.as_ptr());
+                        _exit(9);
+                    }
+                    let mut st = 0;
+                    waitpid(child, &mut st, 0);
+                    // PTRACE_DETACH, at the exec's SIGTRAP stop.
+                    syscall(117, 17, child, 0, 0);
+                    waitpid(child, std::ptr::null_mut(), 0);
+                    syscall(91, hdr.as_ptr(), full.as_ptr());
+                }
                 // A process's /proc directory is its effective user's, as
                 // newuidmap checks of the process it maps.
                 let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);

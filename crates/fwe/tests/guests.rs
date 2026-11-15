@@ -6677,7 +6677,8 @@ fn exec_of_a_vm_program_without_a_vm_fails_cleanly() {
 /// What a program gives the user who runs it: file capabilities
 /// (`security.capability`, as `newuidmap` has `cap_setuid+ep`) raise its
 /// capabilities, a set-user-ID root program its effective uid and with it
-/// every capability; under `no_new_privs`, neither.
+/// every capability; under `no_new_privs`, or traced by a tracer without
+/// `CAP_SYS_PTRACE`, neither.
 #[test]
 fn programs_grant_file_capabilities_and_set_ids() {
     assert_eq!(
@@ -6686,6 +6687,9 @@ fn programs_grant_file_capabilities_and_set_ids() {
          set-uid: euid 0 CapEff:\t000001fffdffffff\n\
          capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
          set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         set-uid, traced by a privileged tracer: euid 0 CapEff:\t000001fffdffffff\n\
+         set-uid, traced by an unprivileged tracer: euid 1000 CapEff:\t0000000000000000\n\
+         capped, traced by an unprivileged tracer: euid 1000 CapEff:\t0000000000000000\n\
          dumpable after setuid: 0\n\
          a user's mknod: whiteout ok, device EPERM\n\
          /proc owners: theirs Ok(1000), opened Ok(1000), own Ok(0)\n"

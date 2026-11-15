@@ -249,6 +249,26 @@ fn tracer() -> i32 {
     TRACER.with(std::cell::Cell::get)
 }
 
+/// Whether this thread's tracer (if it has one) has `CAP_SYS_PTRACE` in
+/// its user namespace, Linux's `ptracer_capable`: an exec it watches may
+/// then grant what the program grants. The tracer's capabilities are the
+/// ones its process record holds now.
+pub fn tracer_capable() -> bool {
+    let t = tracer();
+    if !traced() || t <= 0 {
+        return true;
+    }
+    let sec = crate::procreg::security(t).unwrap_or_default();
+    let euid = crate::procreg::ids(t)[1];
+    let effective = sec.caps[0] & 1 << crate::caps::CAP_SYS_PTRACE != 0;
+    crate::userns::capable_of(
+        &crate::procreg::user_ns(t),
+        &crate::userns::own_dir(),
+        euid,
+        effective,
+    )
+}
+
 /// The host's signal dispositions are to be set again: a thread began or
 /// ended being traced ([`crate::Kernel::resync_for_tracing`]).
 static RESYNC: AtomicBool = AtomicBool::new(false);

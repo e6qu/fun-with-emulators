@@ -760,24 +760,30 @@ impl<P: Platform> Kernel<P> {
         if host_file_busy(st) {
             return Err(errno::ETXTBSY);
         }
-        // What it grants, unless a `nosuid` mount, `no_new_privs` or a
-        // tracer says it grants nothing, as on Linux.
-        let gains = r.mount_flags & mounts::ms::NOSUID == 0
-            && !syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-            && !ptrace::traced();
         // A program its caller may not read leaves it undumpable (its
         // memory would show the program).
         let unreadable = !self.permits(st, 4);
-        let privs = if gains {
-            ExecPrivs {
-                uid: (st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
-                gid: (st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
-                    .then_some(st.st_gid),
-                caps: file_caps(r.dir.as_raw_fd(), name),
-                unreadable,
-            }
-        } else {
-            ExecPrivs { unreadable, ..ExecPrivs::default() }
+        // A `nosuid` mount grants nothing, as Linux's `mnt_may_suid`.
+        if r.mount_flags & mounts::ms::NOSUID != 0 {
+            EXEC_PRIVS.with(|p| p.set(ExecPrivs { unreadable, ..ExecPrivs::default() }));
+            return Ok(());
+        }
+        // Under `no_new_privs`, or traced by a tracer without
+        // `CAP_SYS_PTRACE` over the caller, an exec is unsafe and Linux's
+        // `cap_bprm_creds_from_file` downgrades what it grants: the set-ID
+        // ids are kept only by a caller with `CAP_SETUID` not under
+        // `no_new_privs`, and the capabilities are no more than the
+        // caller's permitted ones.
+        let nnp = syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed);
+        let unsafe_exec = nnp || (ptrace::traced() && !ptrace::tracer_capable());
+        let ids = !unsafe_exec || (!nnp && self.creds.has_own(caps::CAP_SETUID));
+        let privs = ExecPrivs {
+            uid: (ids && st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
+            gid: (ids && st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
+                .then_some(st.st_gid),
+            caps: file_caps(r.dir.as_raw_fd(), name),
+            cap_limit: unsafe_exec.then_some(self.creds.caps.permitted),
+            unreadable,
         };
         EXEC_PRIVS.with(|p| p.set(privs));
         Ok(())
@@ -1129,6 +1135,9 @@ pub(crate) struct ExecPrivs {
     uid: Option<u32>,
     gid: Option<u32>,
     caps: Option<caps::FileCaps>,
+    /// For an unsafe exec, the most capabilities it may leave: the
+    /// caller's permitted set.
+    cap_limit: Option<u64>,
     unreadable: bool,
 }
 
@@ -1143,6 +1152,8 @@ impl ExecPrivs {
         e.u64(c.permitted);
         e.u64(c.inheritable);
         e.bool(c.effective);
+        e.bool(self.cap_limit.is_some());
+        e.u64(self.cap_limit.unwrap_or(0));
         e.bool(self.unreadable);
     }
 
@@ -1154,7 +1165,14 @@ impl ExecPrivs {
         let (uid, gid) = (id(), id());
         let has = d.bool();
         let c = caps::FileCaps { permitted: d.u64(), inheritable: d.u64(), effective: d.bool() };
-        ExecPrivs { uid, gid, caps: has.then_some(c), unreadable: d.bool() }
+        let (limited, limit) = (d.bool(), d.u64());
+        ExecPrivs {
+            uid,
+            gid,
+            caps: has.then_some(c),
+            cap_limit: limited.then_some(limit),
+            unreadable: d.bool(),
+        }
     }
 }
 
@@ -1172,7 +1190,13 @@ thread_local! {
 thread_local! {
     /// What the program this thread is about to run grants.
     static EXEC_PRIVS: std::cell::Cell<ExecPrivs> = const {
-        std::cell::Cell::new(ExecPrivs { uid: None, gid: None, caps: None, unreadable: false })
+        std::cell::Cell::new(ExecPrivs {
+            uid: None,
+            gid: None,
+            caps: None,
+            cap_limit: None,
+            unreadable: false,
+        })
     };
 }
 
@@ -1227,6 +1251,10 @@ fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) -> bool {
     // initial namespace's).
     let ns = |id| userns::to_ns(id, false);
     c.caps.on_exec_file(ns(c.uid), ns(c.euid), p.caps, setid);
+    if let Some(limit) = p.cap_limit {
+        c.caps.permitted &= limit;
+        c.caps.effective &= limit;
+    }
     let real_root = ns(c.uid) == 0;
     let file_effective = p.caps.is_some_and(|f| f.effective);
     c.euid != ruid
@@ -2358,6 +2386,26 @@ mod exec_tests {
         assert!(secure(user(), setgid).0);
         assert!(secure(user(), capped).0);
         assert!(secure(user(), permitted_only).0);
+    }
+
+    /// An unsafe exec (under `no_new_privs`, or watched by a tracer
+    /// without `CAP_SYS_PTRACE`) leaves no capability the caller did not
+    /// hold; a set-user-ID root program run that way by root still makes
+    /// it root with root's capabilities.
+    #[test]
+    fn an_unsafe_exec_gains_no_capability() {
+        let file = caps::FileCaps { permitted: 1 << 7, inheritable: 0, effective: true };
+        let limited = ExecPrivs { caps: Some(file), cap_limit: Some(0), ..ExecPrivs::default() };
+        let mut c = user();
+        apply_exec_privs(&mut c, limited);
+        assert_eq!((c.caps.permitted, c.caps.effective), (0, 0));
+        let mut root = creds::Creds::default();
+        let held = root.caps.permitted;
+        let setuid = ExecPrivs { uid: Some(0), cap_limit: Some(held), ..ExecPrivs::default() };
+        apply_exec_privs(&mut root, setuid);
+        assert_eq!((root.euid, root.caps.permitted), (0, held));
+        // Untraced, the tracer's capability is not asked for.
+        assert!(ptrace::tracer_capable());
     }
 
     /// A re-executed fwe's program starts with the auxiliary vector its

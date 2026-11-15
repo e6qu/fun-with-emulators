@@ -2162,7 +2162,7 @@ guest's identity virtual:
 | capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start; held in the process's user namespace and checked against the namespace that owns the object, as below |
 | `chown` | changes the owner | kept in an attribute (`org.fwe.owner`, `crates/kernel/src/owners.rs`) under Linux's rules and shown by `stat`; the host file stays fwe's user's |
 | permission bits for a caller that is not root | the host's, for the host user | fwe's check by the guest's owner, mode and file-system ids, and each directory's search bit along a path (in a root filesystem) |
-| file capabilities, set-ID programs | set-ID bits, honoured only for root's files | `execve` acts on a program's `security.capability` attribute and its set-ID bits (the owner and group fwe keeps) with Linux's rules: the new ids and capability sets, the ambient set cleared, and nothing gained under `no_new_privs`, on a `nosuid` mount or while traced; the attribute is checked as it is written (revisions 2 and 3), kept for the root of the writer's user namespace, and removed by `chown`, a write or a truncation, as Linux removes it |
+| file capabilities, set-ID programs | set-ID bits, honoured only for root's files | `execve` acts on a program's `security.capability` attribute and its set-ID bits (the owner and group fwe keeps) with Linux's rules: the new ids and capability sets, the ambient set cleared, nothing gained on a `nosuid` mount, and under `no_new_privs` or while traced by a tracer without `CAP_SYS_PTRACE` over the caller no capability beyond the caller's permitted ones and the set-ID ids only for a caller with `CAP_SETUID` not under `no_new_privs`; the attribute is checked as it is written (revisions 2 and 3), kept for the root of the writer's user namespace, and removed by `chown`, a write or a truncation, as Linux removes it |
 
 A capability counts in the user namespace it is held in, as Linux's
 `ns_capable` has it (`userns::capable_in`): in the process's own
@@ -2372,7 +2372,7 @@ where fwe falls short of Linux in detail is in
 | Dumpable (`PR_SET_DUMPABLE`, `fs.suid_dumpable`) | **enforced** | set by `execve` and id changes as on Linux; decides tracing, `/proc/<pid>` ownership and core dumps |
 | `no_new_privs` | **enforced** | inherited and kept across `execve`; blocks set-ID and file-capability gains |
 | File capabilities (`security.capability`) | **enforced** | applied at `execve`; `CAP_SETFCAP` to write, checked (revisions 2, 3), kept per user namespace, removed by `chown`, a write or a truncation |
-| Set-ID programs | **emulated** | on the owner and group fwe keeps; nothing gained on `nosuid`, under `no_new_privs`, or while traced by any tracer ([execve](#execve)) |
+| Set-ID programs | **emulated** | on the owner and group fwe keeps; nothing gained on `nosuid`; under `no_new_privs`, or traced by a tracer without `CAP_SYS_PTRACE`, Linux's downgrade ([execve](#execve)) |
 | `AT_SECURE` | **emulated** | 1 after a privilege-raising `execve`; the auxv ids are the guest's ([auxv](#auxv-hwcaps-and-the-vdso)) |
 | Keyrings | **emulated** | key types, permissions and quotas (`EDQUOT`) in one record of every fwe process ([Other IPC calls](#other-ipc-calls)); no `request-key` upcall: a key to construct is negative (`ENOKEY`) |
 | Audit (`NETLINK_AUDIT`, `loginuid`, `sessionid`) | **refused** | `EPROTONOSUPPORT`, `ENOENT`, as without `CONFIG_AUDIT` |
