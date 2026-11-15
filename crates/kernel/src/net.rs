@@ -984,6 +984,9 @@ fn remembered_name(fd: i32, local: bool) -> Option<Vec<u8>> {
 /// # Safety
 /// `addr`/`addrlen`, if non-null, must be writable.
 pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return err(errno::EINVAL);
+    }
     let mut hb = empty_sockaddr();
     let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
     let want = addr != 0;
@@ -1552,6 +1555,38 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
         return crate::seqpacket::recv(fd as i32, &[v], (std::ptr::null_mut(), 0), flags, hflags)
             .result;
     }
+    let whole = match datagram_whole(fd as i32, flags) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    let r = recvfrom_host(fd, buf, len, hflags, addr, addrlen);
+    match whole {
+        Some(w) if r >= 0 => w as i64,
+        _ => r,
+    }
+}
+
+/// The length of the datagram a receive with `MSG_TRUNC` on datagram
+/// socket `fd` takes, which Linux returns (the host takes the flag as an
+/// output only): waited for as the receive would wait, then measured
+/// (`SO_NREAD`). `None` for another socket or without the flag.
+fn datagram_whole(fd: i32, flags: u64) -> Result<Option<usize>, i64> {
+    if flags & MSG_TRUNC == 0 || kind(fd).map(|k| k.1) != Some(libc::SOCK_DGRAM) {
+        return Ok(None);
+    }
+    let wait = msg_flags_to_host(flags & (MSG_DONTWAIT | MSG_OOB)) | libc::MSG_PEEK;
+    let mut b = 0u8;
+    // A peek of a byte, which waits (one of none returns at once).
+    // SAFETY: a one-byte local buffer.
+    if unsafe { libc::recv(fd, (&mut b as *mut u8).cast(), 1, wait) } < 0 {
+        return Err(last_error());
+    }
+    Ok(crate::netlink::next_len(fd))
+}
+
+/// [`recvfrom`] of a host socket: the bytes, the sender's address
+/// translated back.
+fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u64) -> i64 {
     if addr != 0 {
         let mut hb = empty_sockaddr();
         let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
@@ -1893,7 +1928,9 @@ fn opt_to_host(level: u64, optname: u64) -> Result<(i32, i32, Form), i64> {
                 SO_RCVBUF => libc::SO_RCVBUF,
                 SO_KEEPALIVE => libc::SO_KEEPALIVE,
                 SO_OOBINLINE => libc::SO_OOBINLINE,
-                SO_LINGER => libc::SO_LINGER,
+                // Seconds, as Linux's: the host's SO_LINGER is in clock
+                // ticks.
+                SO_LINGER => libc::SO_LINGER_SEC,
                 SO_REUSEPORT => libc::SO_REUSEPORT,
                 SO_RCVTIMEO => libc::SO_RCVTIMEO,
                 SO_SNDTIMEO => libc::SO_SNDTIMEO,
@@ -1966,6 +2003,13 @@ pub unsafe fn setsockopt(
     if level == SOL_SOCKET
         && let Some(key) = kept_key(level, optname)
     {
+        // SO_PRIORITY past 6 is CAP_NET_ADMIN's to set.
+        if optname == SO_PRIORITY && optlen >= 4 {
+            let v: i32 = guest!(uaccess::read(optval));
+            if !(0..=6).contains(&v) && !admin {
+                return err(errno::EPERM);
+            }
+        }
         let r = keep(key);
         #[cfg(not(target_os = "linux"))]
         if r == 0 && optname == SO_PASSCRED {
@@ -2579,9 +2623,16 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_flags: 0,
     };
     // A netlink message's whole length, asked for with MSG_TRUNC.
-    let nl_whole = (crate::netlink::is(fd as i32) && flags & MSG_TRUNC != 0)
-        .then(|| crate::netlink::next_len(fd as i32))
-        .flatten();
+    let nl_whole = if crate::netlink::is(fd as i32) {
+        (flags & MSG_TRUNC != 0).then(|| crate::netlink::next_len(fd as i32)).flatten()
+    } else if crate::seqpacket::is(fd as i32) {
+        None
+    } else {
+        match datagram_whole(fd as i32, flags) {
+            Ok(w) => w,
+            Err(e) => return e,
+        }
+    };
     let r = if crate::seqpacket::is(fd as i32) {
         let got = crate::seqpacket::recv(
             fd as i32,
@@ -3648,5 +3699,83 @@ mod creds_tests {
         closed(rx);
         close_all(&[rx, tx]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod kept_option_tests {
+    use super::*;
+
+    fn set(fd: i64, name: u64, val: &[i32], admin: bool) -> i64 {
+        // SAFETY: an option value of its length.
+        unsafe {
+            setsockopt(
+                fd as u64,
+                SOL_SOCKET,
+                name,
+                val.as_ptr() as u64,
+                4 * val.len() as u64,
+                admin,
+            )
+        }
+    }
+
+    /// `SO_LINGER` is in seconds, as Linux's (the host's own is in ticks).
+    #[test]
+    fn linger_is_in_seconds() {
+        // SAFETY: no pointers.
+        let s = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
+        assert_eq!(set(s, SO_LINGER, &[1, 7], false), 0);
+        let mut v = [0i32; 2];
+        let mut len = 8u32;
+        // SAFETY: an 8-byte buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                s as u64,
+                SOL_SOCKET,
+                SO_LINGER,
+                v.as_mut_ptr() as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        assert_eq!((r, v[1] != 0, v[1]), (0, true, 7));
+        // SAFETY: the socket made above.
+        unsafe { libc::close(s as i32) };
+    }
+
+    /// A priority past 6 needs `CAP_NET_ADMIN`; `accept4` takes Linux's
+    /// flags only.
+    #[test]
+    fn priority_and_accept_flags_are_checked() {
+        // SAFETY: no pointers.
+        let s = unsafe { socket(AF_INET, SOCK_DGRAM, 0) };
+        assert_eq!(set(s, SO_PRIORITY, &[7], false), err(errno::EPERM));
+        assert_eq!(set(s, SO_PRIORITY, &[7], true), 0);
+        assert_eq!(set(s, SO_PRIORITY, &[3], false), 0);
+        // SAFETY: no out pointers.
+        assert_eq!(unsafe { accept4(s as u64, 0, 0, 1) }, err(errno::EINVAL));
+        // SAFETY: the socket made above.
+        unsafe { libc::close(s as i32) };
+    }
+
+    /// `MSG_TRUNC` on a datagram socket returns the datagram's whole
+    /// length, as Linux does.
+    #[test]
+    fn msg_trunc_gives_the_whole_datagram() {
+        let mut sv = [0i32; 2];
+        // SAFETY: a valid array.
+        assert_eq!(unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, sv.as_mut_ptr() as u64) }, 0);
+        // SAFETY: a valid buffer.
+        assert_eq!(unsafe { libc::send(sv[0], b"0123456789".as_ptr().cast(), 10, 0) }, 10);
+        let mut b = [0u8; 4];
+        // SAFETY: a valid 4-byte buffer.
+        let peek =
+            unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 4, MSG_PEEK | MSG_TRUNC, 0, 0) };
+        assert_eq!(peek, 10);
+        // SAFETY: as above.
+        let r = unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 4, MSG_TRUNC, 0, 0) };
+        assert_eq!((r, &b), (10, b"0123"));
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
     }
 }

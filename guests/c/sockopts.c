@@ -192,9 +192,29 @@ static int urgent(void) {
     return 0;
 }
 
+/* MSG_TRUNC gives a datagram's whole length; SO_LINGER is in seconds. */
+static int trunc_linger(void) {
+    struct sockaddr_in a;
+    int rx = receiver(&a);
+    int tx = socket(AF_INET, SOCK_DGRAM, 0);
+    sendto(tx, "0123456789", 10, 0, &a, sizeof a);
+    char b[4];
+    long peek = recv(rx, b, 0, 0x2 | 0x20);
+    long got = recv(rx, b, sizeof b, 0x20);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int linger[2] = {1, 7}, back[2] = {0, 0};
+    setsockopt(s, 1, 13, linger, sizeof linger);
+    socklen_t len = sizeof back;
+    getsockopt(s, 1, 13, back, &len);
+    printf("whole datagram: peeked %ld, read %ld; linger %d %d\n", peek, got, back[0] != 0, back[1]);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "trunc"))
+        return trunc_linger();
     if (!strcmp(argv[1], "urgent"))
         return urgent();
     if (!strcmp(argv[1], "events"))

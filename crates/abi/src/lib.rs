@@ -1238,6 +1238,7 @@ pub mod socket {
     pub const SO_RCVBUF: u64 = 8;
     pub const SO_KEEPALIVE: u64 = 9;
     pub const SO_OOBINLINE: u64 = 10;
+    pub const SO_PRIORITY: u64 = 12;
     pub const SO_LINGER: u64 = 13;
     pub const SO_PASSCRED: u64 = 16;
     pub const SO_PEERCRED: u64 = 17;

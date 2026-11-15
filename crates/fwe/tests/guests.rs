@@ -1196,6 +1196,13 @@ fn urgent_data_is_epollpri() {
     c_guest_prints("sockopts", &["urgent"], "urgent: before 0, after 1 events 0x2\n");
 }
 
+/// `MSG_TRUNC` returns a datagram's whole length, and `SO_LINGER` is in
+/// seconds, as on Linux.
+#[test]
+fn whole_datagrams_and_linger_seconds() {
+    c_guest_prints("sockopts", &["trunc"], "whole datagram: peeked 10, read 10; linger 1 7\n");
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
