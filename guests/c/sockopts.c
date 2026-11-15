@@ -165,9 +165,38 @@ static int events(void) {
     return 0;
 }
 
+int connect(int fd, const void *addr, socklen_t len);
+long send(int fd, const void *buf, size_t n, int flags);
+
+/* A TCP socket's urgent data is EPOLLPRI. */
+static int urgent(void) {
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr = 0x0100007f;
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    bind(srv, &a, sizeof a);
+    socklen_t len = sizeof a;
+    getsockname(srv, &a, &len);
+    listen(srv, 1);
+    int cli = socket(AF_INET, SOCK_STREAM, 0);
+    connect(cli, &a, sizeof a);
+    int conn = accept(srv, 0, 0);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {0x2, 0, 9}, out;
+    epoll_ctl(ep, 1, conn, &ev);
+    int before = epoll_wait(ep, &out, 1, 0);
+    send(cli, "!", 1, 1);
+    int after = epoll_wait(ep, &out, 1, 1000);
+    printf("urgent: before %d, after %d events %#x\n", before, after, out.events);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "urgent"))
+        return urgent();
     if (!strcmp(argv[1], "events"))
         return events();
     if (!strcmp(argv[1], "protocol"))

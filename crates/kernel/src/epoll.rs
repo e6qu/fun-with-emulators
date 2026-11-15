@@ -486,6 +486,23 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
     };
     push(libc::EVFILT_READ, want_read || hangup_only, hangup_only.then_some(i32::MAX as isize));
     push(libc::EVFILT_WRITE, want_write, None);
+    // A TCP socket's urgent data (`EPOLLPRI`): the host's exception filter
+    // for out-of-band data.
+    if tcp_socket(fd as i32) {
+        let flags = if op != EPOLL_CTL_DEL && events & EPOLLPRI != 0 {
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT | extra
+        } else {
+            libc::EV_DELETE | libc::EV_RECEIPT
+        };
+        changes.push(libc::kevent {
+            ident: fd as libc::uintptr_t,
+            filter: libc::EVFILT_EXCEPT,
+            flags,
+            fflags: libc::NOTE_OOB,
+            data: 0,
+            udata: data as *mut libc::c_void,
+        });
+    }
 
     let mut out = changes.clone();
     // SAFETY: both lists are valid for `changes.len()` entries; no timeout.
@@ -858,6 +875,26 @@ fn is_socket(fd: i32) -> bool {
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK }
 }
 
+/// Whether `fd` is a TCP socket (an IP stream one), whose urgent data the
+/// host reports.
+#[cfg(not(target_os = "linux"))]
+fn tcp_socket(fd: i32) -> bool {
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    let stream = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut ty as *mut i32).cast(),
+            &mut len,
+        )
+    } == 0
+        && ty == libc::SOCK_STREAM;
+    stream && !is_unix(fd)
+}
+
 /// Whether socket `fd` is a Unix-domain one.
 #[cfg(not(target_os = "linux"))]
 fn is_unix(fd: i32) -> bool {
@@ -1019,6 +1056,8 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             libc::EVFILT_WRITE if crate::fdstate::pipe_full(fd) => {}
             // A socket's priority band is writable as its normal data is.
             libc::EVFILT_WRITE => bits |= WRITE | if is_socket(fd) { EPOLLWRBAND } else { 0 },
+            // Urgent data waits.
+            libc::EVFILT_EXCEPT => bits |= EPOLLPRI,
             _ => {}
         }
         if ev.flags & libc::EV_ERROR != 0 {
@@ -1096,6 +1135,50 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn data(e: &Event) -> u64 {
         e.data
+    }
+
+    /// A TCP socket's urgent data is `EPOLLPRI`.
+    #[test]
+    fn urgent_data_is_epollpri() {
+        let _turn = turn();
+        // SAFETY: plain host calls on sockets made here, with valid
+        // addresses and lengths.
+        let (srv, cli, conn) = unsafe {
+            let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            let mut a: libc::sockaddr_in = std::mem::zeroed();
+            #[cfg(not(target_os = "linux"))]
+            {
+                a.sin_len = 16;
+            }
+            a.sin_family = libc::AF_INET as libc::sa_family_t;
+            a.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            let mut len = 16 as libc::socklen_t;
+            libc::bind(srv, (&a as *const libc::sockaddr_in).cast(), len);
+            libc::getsockname(srv, (&mut a as *mut libc::sockaddr_in).cast(), &mut len);
+            libc::listen(srv, 1);
+            let cli = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            libc::connect(cli, (&a as *const libc::sockaddr_in).cast(), len);
+            (srv, cli, libc::accept(srv, std::ptr::null_mut(), std::ptr::null_mut()))
+        };
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) };
+        let reg = event(EPOLLPRI, 5);
+        // SAFETY: a valid epoll_event.
+        let r = unsafe { ctl(ep as u64, EPOLL_CTL_ADD, conn as u64, &reg as *const _ as u64) };
+        assert_eq!(r, 0);
+        let mut got = [event(0, 0); 2];
+        // SAFETY: room for 2 events.
+        assert_eq!(unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, 0, 0, 0) }, 0);
+        // SAFETY: a one-byte local buffer.
+        assert_eq!(unsafe { libc::send(cli, b"!".as_ptr().cast(), 1, libc::MSG_OOB) }, 1);
+        // SAFETY: room for 2 events.
+        assert_eq!(unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, 1000, 0, 0) }, 1);
+        assert_eq!({ got[0].events } & EPOLLPRI, EPOLLPRI);
+        closed(ep as i32);
+        for fd in [srv, cli, conn, ep as i32] {
+            // SAFETY: the descriptors made here.
+            unsafe { libc::close(fd) };
+        }
     }
 
     /// A pipe whose read end becomes readable once data is written, observed

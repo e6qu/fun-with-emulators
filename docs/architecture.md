@@ -1506,8 +1506,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 
 **Event descriptors and inotify**
 - `EPOLLEXCLUSIVE` wakes one waiter only for a pipe, and counts only the
-  writes fwe's processes make with `write` and `writev`: a socket or a
-  pipe another program writes to wakes every waiter.
+  writes fwe's processes make with `write` and `writev`: a socket (a
+  shared listening socket among them) or a pipe another program writes to
+  wakes every waiter, which then race for what is there (a non-blocking
+  `accept` the others lose fails with `EAGAIN`); the host tells no waiter
+  that another took it.
+- `EPOLLPRI` reports a TCP socket's urgent data (and a mounts file's
+  change); on another socket it reports nothing.
 - A `CLOCK_REALTIME` timerfd set for an absolute time does not follow a
   later change of the host's clock, and `TFD_TIMER_CANCEL_ON_SET` never
   cancels.

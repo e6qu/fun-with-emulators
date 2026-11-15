@@ -1190,6 +1190,12 @@ fn unix_socket_credentials_are_the_guests() {
     );
 }
 
+/// A TCP socket's urgent data reaches `epoll` as `EPOLLPRI`.
+#[test]
+fn urgent_data_is_epollpri() {
+    c_guest_prints("sockopts", &["urgent"], "urgent: before 0, after 1 events 0x2\n");
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
