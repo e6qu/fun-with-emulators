@@ -24,7 +24,8 @@
 //! A notification goes to the process that registered it, whoever sends
 //! the message that makes the queue non-empty: a signal (`SI_MESGQ`, with
 //! the sender and the registered value), which reaches another process as
-//! a host signal with a note of what it carries ([`crate::signote`]); or,
+//! a host signal with a note of what it carries ([`crate::signote`]), or,
+//! for a real-time signal the host lacks, queued in its mailbox; or,
 //! for `SIGEV_THREAD` (which the C library turns into a netlink socket and
 //! a cookie), the cookie, sent to the socket at the host address fwe gave
 //! it ([`crate::netlink::bind_for_notify`]).
@@ -32,8 +33,7 @@
 //! Not kept: `poll`, `select` and `epoll` see a queue's descriptor as
 //! always ready (its readiness is the queue's, not the host file's), a
 //! queue's file in the mqueue filesystem is read, not opened as the queue
-//! or removed, and a real-time signal is not sent to another process (see
-//! `docs/architecture.md`).
+//! or removed (see `docs/architecture.md`).
 
 use crate::creds::Creds;
 use crate::fdmarks::{self, Mark};

@@ -346,8 +346,8 @@ impl<P: Platform> Kernel<P> {
         done as i64
     }
 
-    /// `syslog(type, buf, len)` (`klogctl`): the kernel log, which is
-    /// empty. Reading it, clearing it and setting the console level need
+    /// `syslog(type, buf, len)` (`klogctl`): the kernel log
+    /// ([`crate::klog`]). Reading it, clearing it and setting the console level need
     /// `CAP_SYSLOG` (or `CAP_SYS_ADMIN`); the sizes need nothing.
     pub(crate) fn sys_syslog(&mut self, ty: u64, buf: u64, len: u64) -> i64 {
         let len = len as i32;

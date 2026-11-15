@@ -13,7 +13,8 @@
 //!
 //! A socket filter (`BPF_PROG_TYPE_SOCKET_FILTER`) may also load maps
 //! ([`crate::bpfmap`]) and call their helpers (lookup, update, delete),
-//! reading and writing a value through the pointer a lookup returns.
+//! reading and writing a value through the pointer a lookup returns, and
+//! read the packet with `bpf_skb_load_bytes`.
 //! Attached to a socket (`SO_ATTACH_BPF`), it runs as data is sent to it
 //! by this process, found by the socket's connected peer: what it returns
 //! is how much of the data arrives (none: dropped).
@@ -27,7 +28,7 @@ pub const BPF_PROG_DETACH: u64 = 9;
 pub const BPF_PROG_GET_FD_BY_ID: u64 = 13;
 pub const BPF_PROG_QUERY: u64 = 16;
 
-/// The one program type fwe runs.
+/// The program types fwe runs: the device controller's and socket filters.
 pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
 pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 /// The highest program type Linux 6.x has (`BPF_PROG_TYPE_NETFILTER`).

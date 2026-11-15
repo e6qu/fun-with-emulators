@@ -6,9 +6,11 @@
 //! ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
 //! `/proc/sys` shows and a write there changes, with Linux's checks. The
 //! initial network namespace's start at Linux's defaults and are kept with
-//! the sysctls of no namespace: fwe consults them only for its own
-//! namespaces, so changing them changes nothing on the host. The initial
-//! IPC namespace is fwe's own, so root may change its limits.
+//! the sysctls of no namespace; fwe acts on them for the guest's sockets in
+//! that namespace as it does in its own (the privileged ports, the buffer
+//! sizes, the listen backlog, who may make a ping socket), and changing
+//! them changes nothing on the host. The initial IPC namespace is fwe's
+//! own, so root may change its limits.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::errno;
