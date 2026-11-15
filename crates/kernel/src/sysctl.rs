@@ -601,11 +601,13 @@ pub fn is_dir(path: &[u8]) -> bool {
 }
 
 /// Opening sysctl `path` to write, by a caller with `creds`: the mark the
-/// descriptor carries, or the error. A network one takes `CAP_NET_ADMIN`
-/// in the user namespace owning the network namespace; an IPC one, root's
-/// access to the file (`CAP_DAC_OVERRIDE`) in the user namespace owning
-/// the IPC namespace; any other, root's access in the initial user
-/// namespace: a user namespace has no say over the whole system's.
+/// descriptor carries, or the error. The file is root's of the user
+/// namespace owning the namespace it is of (the initial root's where that
+/// maps none), mode 0644, as Linux sets it, so its owner writes it; and a
+/// network one also `CAP_NET_ADMIN` in the user namespace owning the
+/// network namespace, an IPC one `CAP_DAC_OVERRIDE` in the one owning the
+/// IPC namespace, any other `CAP_DAC_OVERRIDE` in the initial one: a user
+/// namespace has no say over the whole system's.
 pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result<Mark, i32>> {
     use crate::caps::{CAP_DAC_OVERRIDE, CAP_NET_ADMIN};
     let i = index(path)?;
@@ -615,9 +617,15 @@ pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result
         return Some(Err(errno::EPERM));
     }
     let allowed = match SYSCTLS[i].space {
-        Space::Net => creds.has_in(&crate::netns::owner(), CAP_NET_ADMIN),
-        Space::Ipc => creds.has_in(&crate::sysvipc::owner(), CAP_DAC_OVERRIDE),
-        Space::Global => creds.has(CAP_DAC_OVERRIDE),
+        Space::Net => {
+            let owner = crate::netns::owner();
+            creds.has_in(&owner, CAP_NET_ADMIN) || creds.euid == crate::userns::root_of(&owner).0
+        }
+        Space::Ipc => {
+            let owner = crate::sysvipc::owner();
+            creds.has_in(&owner, CAP_DAC_OVERRIDE) || creds.euid == crate::userns::root_of(&owner).0
+        }
+        Space::Global => creds.has(CAP_DAC_OVERRIDE) || creds.euid == 0,
         // `CAP_SYS_RESOURCE` in the caller's own user namespace, whose
         // limits these are, as Linux checks it.
         Space::User => creds.has_own(crate::caps::CAP_SYS_RESOURCE),
