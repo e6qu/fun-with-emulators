@@ -1159,10 +1159,17 @@ fn an_overflowing_eventfd_write_waits() {
 /// and a standard signal sent twice before it is read is pending once.
 #[test]
 fn a_signal_is_read_once_across_signalfds() {
+    c_guest_prints("specialfds", &["once"], "first 128, other signalfd -1 errno 11, again -1\n");
+}
+
+/// `SO_PROTOCOL` reports the protocol a socket was made with (ICMP for a
+/// ping socket), and a Unix socket's error queue reads as empty.
+#[test]
+fn socket_protocol_and_error_queue_are_linuxs() {
     c_guest_prints(
-        "specialfds",
-        &["once"],
-        "first 128, other signalfd -1 errno 11, again -1\n",
+        "sockopts",
+        &["protocol"],
+        "ping protocol 1, unix error queue -1 errno 11\n",
     );
 }
 

@@ -1957,16 +1957,14 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
     }
     let kept = kept_key(level, optname);
     if kept.is_some() || level == SOL_SOCKET && matches!(optname, 38 | 39) {
-        let Some((fam, ty)) = kind(fd as i32) else {
+        let Some((fam, _)) = kind(fd as i32) else {
             return socket_fd(fd as i32).err().unwrap_or(err(errno::ENOTSOCK));
         };
         let v = match optname {
-            // SO_PROTOCOL: what the socket was made with, as Linux names it.
-            38 => match (fam, ty) {
-                (libc::AF_INET | libc::AF_INET6, libc::SOCK_STREAM) => 6,
-                (libc::AF_INET | libc::AF_INET6, libc::SOCK_DGRAM) => 17,
-                _ => 0,
-            },
+            // SO_PROTOCOL: what the socket was made with (TCP or UDP for
+            // 0), as the host knows it; a netlink one's is NETLINK_ROUTE.
+            38 if crate::netlink::is(fd as i32) => 0,
+            38 => crate::host::socket_protocol(fd as i32).unwrap_or(0),
             // SO_DOMAIN
             39 => match fam {
                 libc::AF_INET6 => AF_INET6 as i32,
@@ -2160,8 +2158,9 @@ fn msg_iovecs(iov: u64, count: u64, write: bool) -> uaccess::Result<Vec<libc::io
     uaccess::host_iovecs(iov, count, write)
 }
 
-/// A read of an IP socket's error queue (`MSG_ERRQUEUE`), which fwe never
-/// fills (the host has none): empty, `EAGAIN`, as Linux reports one.
+/// A read of a socket's error queue (`MSG_ERRQUEUE`), which fwe never
+/// fills (the host has none): empty, `EAGAIN`, as Linux reports one, for
+/// an IP or a Unix socket.
 fn errqueue_empty(fd: i32, flags: u64) -> Option<i64> {
     if flags & MSG_ERRQUEUE == 0 {
         return None;
@@ -2170,7 +2169,9 @@ fn errqueue_empty(fd: i32, flags: u64) -> Option<i64> {
     let mut hl = SOCKADDR_MAX as libc::socklen_t;
     // SAFETY: valid out-parameters of their lengths.
     let named = unsafe { libc::getsockname(fd, hb.as_mut_ptr().cast(), &mut hl) } == 0;
-    (named && matches!(family(&hb), libc::AF_INET | libc::AF_INET6)).then(|| err(errno::EAGAIN))
+    let fam = family(&hb);
+    (named && matches!(fam, libc::AF_INET | libc::AF_INET6 | libc::AF_UNIX))
+        .then(|| err(errno::EAGAIN))
 }
 
 /// Guest `msghdr` fields (64-bit Linux layout): name, namelen, iov,
@@ -3349,5 +3350,63 @@ mod fastopen_tests {
             // SAFETY: the sockets made above.
             unsafe { libc::close(fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn protocol(fd: i64) -> i32 {
+        let mut v = -1i32;
+        let mut len = 4u32;
+        // SAFETY: a 4-byte option buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                fd as u64,
+                SOL_SOCKET,
+                38,
+                &mut v as *mut i32 as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        assert_eq!(r, 0);
+        v
+    }
+
+    /// `SO_PROTOCOL` is the protocol the socket was made with: ICMP for a
+    /// ping socket, not 0.
+    #[test]
+    fn so_protocol_is_the_sockets() {
+        // SAFETY: no pointers.
+        let (tcp, udp, ping) = unsafe {
+            (
+                socket(AF_INET, SOCK_STREAM, 0),
+                socket(AF_INET, SOCK_DGRAM, 0),
+                socket(AF_INET, SOCK_DGRAM, 1),
+            )
+        };
+        assert_eq!((protocol(tcp), protocol(udp)), (6, 17));
+        if ping >= 0 {
+            assert_eq!(protocol(ping), 1);
+        }
+        for fd in [tcp, udp, ping] {
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd as i32) };
+        }
+    }
+
+    /// A Unix socket's error queue is empty, as an IP socket's is.
+    #[test]
+    fn unix_error_queue_is_empty() {
+        let mut sv = [0i32; 2];
+        // SAFETY: a valid array.
+        assert_eq!(unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, sv.as_mut_ptr() as u64) }, 0);
+        let mut b = [0u8; 4];
+        // SAFETY: a valid buffer; the socket's queue holds nothing.
+        let r = unsafe { recvfrom(sv[0] as u64, b.as_mut_ptr() as u64, 4, MSG_ERRQUEUE, 0, 0) };
+        assert_eq!(r, err(errno::EAGAIN));
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
     }
 }

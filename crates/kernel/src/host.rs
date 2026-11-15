@@ -1793,6 +1793,48 @@ pub fn interfaces() -> Vec<Interface> {
     out
 }
 
+/// The protocol socket `fd` was made with, as the host knows it (the one
+/// it chose for 0: TCP or UDP), if it is a socket.
+pub fn socket_protocol(fd: i32) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        // `PROC_PIDFDSOCKETINFO`'s `struct socket_fdinfo` (792 bytes): the
+        // socket's protocol at 180, as `<sys/proc_info.h>` lays it out.
+        const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+        const SIZE: usize = 792;
+        const PROTOCOL: usize = 180;
+        let mut info = [0u8; SIZE];
+        // SAFETY: a buffer of the size the call fills, for this process.
+        let n = unsafe {
+            libc::proc_pidfdinfo(
+                libc::getpid(),
+                fd,
+                PROC_PIDFDSOCKETINFO,
+                info.as_mut_ptr().cast(),
+                SIZE as libc::c_int,
+            )
+        };
+        (n as usize == SIZE)
+            .then(|| i32::from_ne_bytes(info[PROTOCOL..PROTOCOL + 4].try_into().unwrap()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut v: libc::c_int = 0;
+        let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-parameters.
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PROTOCOL,
+                (&mut v as *mut i32).cast(),
+                &mut l,
+            )
+        };
+        (r == 0).then_some(v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

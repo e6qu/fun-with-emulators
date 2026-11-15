@@ -26,6 +26,7 @@ int listen(int fd, int backlog);
 int accept(int fd, void *addr, socklen_t *len);
 long read(int fd, void *buf, size_t n);
 int close(int fd);
+int socketpair(int domain, int type, int protocol, int sv[2]);
 int *__errno_location(void);
 int strcmp(const char *a, const char *b);
 int printf(const char *format, ...);
@@ -110,9 +111,26 @@ static int fastopen(void) {
     return 0;
 }
 
+/* SO_PROTOCOL is the protocol a socket was made with (ICMP for a ping
+ * socket); a Unix socket's error queue is empty (EAGAIN). */
+static int protocol(void) {
+    int ping = socket(AF_INET, SOCK_DGRAM, 1);
+    int p = -1;
+    socklen_t len = sizeof p;
+    getsockopt(ping, 1, 38, &p, &len);
+    int sv[2];
+    socketpair(1, SOCK_DGRAM, 0, sv);
+    char b[4];
+    long r = recv(sv[0], b, sizeof b, 0x2000);
+    printf("ping protocol %d, unix error queue %ld errno %d\n", p, r, errno);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "protocol"))
+        return protocol();
     if (!strcmp(argv[1], "fastopen"))
         return fastopen();
     if (!strcmp(argv[1], "udp"))
