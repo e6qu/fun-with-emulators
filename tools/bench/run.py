@@ -546,22 +546,25 @@ def pcs(name, cmd):
     records leaves it short of. And the time the processes spend in each
     host system call."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
-    # Started first, on every fwe process (one runs at a time here): DTrace
-    # grabbing a running process by its pid fails while it starts.
-    # It ends itself once the process started here exits, and writes what
-    # it gathered.
+    # The process is made first, held until DTrace has started (DTrace
+    # grabbing a running process by its pid fails while it starts), and
+    # then runs `cmd` in its place: DTrace ends itself once it exits, and
+    # writes what it gathered.
+    proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
     script = ('profile-997 /execname == "fwe"/ { @pc[arg1] = count(); } '
               'syscall:::entry /execname == "fwe"/ { self->t = timestamp; } '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
-              f'proc:::exit /execname == "fwe" && ppid == {os.getpid()}/ {{ exit(0); }} '
+              f'proc:::exit /pid == {proc.pid}/ {{ exit(0); }} '
               'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               errors="replace")
     time.sleep(2)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.close()
     time.sleep(0.25)
     regions = []
     vm = subprocess.run(["vmmap", "-wide", str(proc.pid)], capture_output=True, text=True,
