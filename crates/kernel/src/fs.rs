@@ -150,6 +150,7 @@ fn direct_in(v: &View, dirfd: i32, path: &[u8]) -> Option<Direct> {
         mount_id: m.id,
         mount_flags: m.flags,
         fstype: m.fstype,
+        opened: None,
     })
 }
 
@@ -200,6 +201,10 @@ pub struct Direct {
     pub mount_id: u32,
     pub mount_flags: u64,
     pub fstype: FsType,
+    /// The file opened already to read, and its host metadata: a regular
+    /// file or a directory [`open_fifo_unlocked`] opened for the locked
+    /// open to take.
+    pub opened: Option<(OwnedFd, libc::stat)>,
 }
 
 /// `fstatat`'s flag that refuses to follow a link anywhere in the path (a
@@ -2995,6 +3000,16 @@ pub(crate) mod ahead {
 /// (`O_CREAT|O_EXCL`), of a directory, of a link not to be followed, on a
 /// read-only mount to write, of an overlay's file, or of one whose mode fwe
 /// keeps aside (whose checks are the locked open's).
+/// Whether an open by `flags` only reads: no making, truncating or
+/// writing, nor `O_PATH` or `O_NOATIME` (the owner's to ask for), as
+/// [`Direct`]'s one-call open takes.
+#[cfg(target_os = "macos")]
+pub(crate) fn reads_only(flags: u64) -> bool {
+    flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
+        && flags & (fcntl::O_CREAT | fcntl::O_TRUNC | fcntl::O_PATH | fcntl::O_TMPFILE) == 0
+        && flags & 0o1000000 == 0
+}
+
 pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<(), i32> {
     use fwe_abi::fcntl as f;
     if flags & (f::O_NONBLOCK | f::O_PATH | f::O_DIRECTORY) != 0
@@ -3008,14 +3023,58 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         return Ok(());
     }
     let follow = flags & f::O_NOFOLLOW == 0;
+    // A FIFO opened here to see what the path names stays open until the
+    // FIFO's own ends are: a writer it let through never finds no reader.
+    #[cfg(target_os = "macos")]
+    let mut seen: Option<OwnedFd> = None;
     let (resolved, key) = {
         let view = published();
         let Some(v) = view.as_ref() else { return Ok(()) };
         let v = v.view();
+        // An open only to read, in one host call where it finds what the
+        // walk would: opened here, without waiting (a FIFO's open would),
+        // and, a regular file or a directory, made to wait again and
+        // handed to the locked open, which neither looks it up again nor
+        // asks whether it is a FIFO first.
+        #[cfg(target_os = "macos")]
+        if reads_only(flags)
+            && let Some(mut d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path)
+        {
+            let host = crate::host::open_flags_to_host(flags) & !libc::O_NOFOLLOW
+                | libc::O_NOFOLLOW_ANY
+                | libc::O_NONBLOCK
+                | libc::O_NOCTTY;
+            // SAFETY: the root's descriptor and a NUL-terminated name.
+            let fd = unsafe { libc::openat(d.dir, d.name.as_ptr(), host) };
+            if fd < 0 {
+                if matches!(e(), errno::ENOENT | errno::ENOTDIR) {
+                    return Ok(());
+                }
+            } else {
+                // SAFETY: a descriptor just opened, ours alone.
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let off: libc::c_int = 0;
+                // SAFETY: the descriptor above; a valid out-parameter, and
+                // `FIONBIO`'s `int`.
+                let plain = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0
+                    && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+                    && unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &off) } == 0;
+                if plain {
+                    d.opened = Some((fd, st));
+                    ahead::put_direct(&v, path, d);
+                    return Ok(());
+                }
+                seen = Some(fd);
+            }
+        }
         // In one host call where it finds what the walk would: no FIFO is
         // there to wait for.
         #[cfg(target_os = "macos")]
-        if let Some(d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path) {
+        if !reads_only(flags)
+            && let Some(d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path)
+        {
             // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: the root's descriptor and a NUL-terminated name.
@@ -3054,6 +3113,9 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
             libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NONBLOCK | flags_host)
         }
     };
+    // The reader end above stands in for the one opened to look.
+    #[cfg(target_os = "macos")]
+    drop(seen);
     // SAFETY: as above; waits for the other end.
     let mut fd = unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) };
     let err = e();

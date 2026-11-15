@@ -717,34 +717,44 @@ impl<P: Platform> Kernel<P> {
     #[cfg(target_os = "macos")]
     fn open_direct(&mut self, dirfd: i32, path: &[u8], flags: u64) -> Option<i64> {
         use crate::procstore::{Count, count};
-        let only_read = flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
-            && flags & (fcntl::O_CREAT | fcntl::O_TRUNC | fcntl::O_PATH | fcntl::O_TMPFILE) == 0
-            // O_NOATIME, the owner's to ask for.
-            && flags & 0o1000000 == 0;
         // (A FIFO opened already, waiting for its other end, is its.)
-        if !only_read
+        if !crate::fs::reads_only(flags)
             || crate::fs::fifo_preopened()
             || count(Count::Leases).load(std::sync::atomic::Ordering::SeqCst) != 0
         {
             return None;
         }
-        let d = self.fs().direct(dirfd, path)?;
-        // No link anywhere on the way (the host refuses `O_NOFOLLOW` beside
-        // it, which it covers).
-        let host_flags = host::open_flags_to_host(flags) & !libc::O_NOFOLLOW | libc::O_NOFOLLOW_ANY;
-        // SAFETY: the root's descriptor and a NUL-terminated name.
-        let fd = unsafe { host::openat(d.dir, &d.name, host_flags, 0) };
-        if fd < 0 {
-            // A missing name on a way with no link, as the walk finds; a
-            // link, or a refusal root may pass, takes the whole way.
-            let e = host::last_errno();
-            return matches!(e, libc::ENOENT | libc::ENOTDIR).then(last_error);
-        }
-        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: the descriptor just opened.
-        let plain = unsafe { libc::fstat(fd, &mut st) } == 0
-            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+        let mut d = self.fs().direct(dirfd, path)?;
+        // Opened already, without the lock ([`crate::fs::open_fifo_unlocked`]),
+        // or here.
+        let (fd, st) = match d.opened.take() {
+            Some((fd, st)) => (std::os::fd::IntoRawFd::into_raw_fd(fd), st),
+            None => {
+                // No link anywhere on the way (the host refuses
+                // `O_NOFOLLOW` beside it, which it covers).
+                let host_flags =
+                    host::open_flags_to_host(flags) & !libc::O_NOFOLLOW | libc::O_NOFOLLOW_ANY;
+                // SAFETY: the root's descriptor and a NUL-terminated name.
+                let fd = unsafe { host::openat(d.dir, &d.name, host_flags, 0) };
+                if fd < 0 {
+                    // A missing name on a way with no link, as the walk
+                    // finds; a link, or a refusal root may pass, takes the
+                    // whole way.
+                    let e = host::last_errno();
+                    return matches!(e, libc::ENOENT | libc::ENOTDIR).then(last_error);
+                }
+                // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: the descriptor just opened.
+                if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                    // SAFETY: closing the descriptor just opened.
+                    unsafe { libc::close(fd) };
+                    return None;
+                }
+                (fd, st)
+            }
+        };
+        let plain = matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
             && !crate::modes::marked(&st);
         let mut guest = st;
         crate::owners::apply(&mut guest, crate::owners::host_owner(&st));
