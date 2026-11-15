@@ -1068,6 +1068,13 @@ fn c_guest_prints(name: &str, args: &[&str], want: &str) {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A forked child is in its parent's cgroup however the child's start and
+/// the parent's record of it interleave.
+#[test]
+fn a_forked_child_starts_in_its_parents_cgroup() {
+    c_guest_prints("cgroupfork", &[], "children elsewhere: 0\n");
+}
+
 /// A signal for a process whose main thread blocks it is taken by another
 /// thread that does not, whether that one waits in `pause` or sleeps.
 #[test]

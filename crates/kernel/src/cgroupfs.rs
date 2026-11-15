@@ -238,7 +238,9 @@ pub fn made(dir: &[u8]) {
 pub fn members(cg: &[u8], subtree: bool) -> Vec<i32> {
     procreg::all()
         .into_iter()
-        .filter(|(_, r)| r.cgroup == cg || subtree && crate::mounts::under(&r.cgroup, cg).is_some())
+        .filter(|(_, r)| {
+            r.cgroup() == cg || subtree && crate::mounts::under(r.cgroup(), cg).is_some()
+        })
         .map(|(pid, _)| pid)
         .collect()
 }
@@ -503,10 +505,10 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
             // in a cgroup a cgroup above it freezes stays frozen.
             let mut known: std::collections::HashMap<Vec<u8>, bool> = Default::default();
             for (pid, r) in procreg::all() {
-                if r.cgroup != cg && crate::mounts::under(&r.cgroup, cg).is_none() {
+                if r.cgroup() != cg && crate::mounts::under(r.cgroup(), cg).is_none() {
                     continue;
                 }
-                let f = *known.entry(r.cgroup.clone()).or_insert_with(|| frozen(&r.cgroup));
+                let f = *known.entry(r.cgroup().to_vec()).or_insert_with(|| frozen(r.cgroup()));
                 crate::host::kill_process(pid, if f { libc::SIGSTOP } else { libc::SIGCONT });
             }
             Ok(())

@@ -20,7 +20,9 @@ use std::os::unix::ffi::OsStrExt;
 pub struct ProcRecord {
     /// When the host process started, in microseconds since the epoch.
     pub start: u64,
-    /// Its cgroup, a path from the hierarchy's root.
+    /// Its cgroup, a path from the hierarchy's root: empty until known
+    /// (a record a just-forked child or its parent writes first, which the
+    /// other then fills), and the root's then ([`ProcRecord::cgroup`]).
     pub cgroup: Vec<u8>,
     /// The directories of the shared records of its namespaces.
     pub ns: Vec<Vec<u8>>,
@@ -653,14 +655,21 @@ pub fn own_cgroup() -> Vec<u8> {
 
 /// Host process `pid`'s cgroup (the root's for one fwe has no record of).
 pub fn cgroup_of(pid: i32) -> Vec<u8> {
-    read(pid).map_or_else(|| b"/".to_vec(), |r| r.cgroup)
+    read(pid).map_or_else(|| b"/".to_vec(), |r| r.cgroup().to_vec())
 }
 
 /// The record of a process fwe has none of yet.
+impl ProcRecord {
+    /// Its cgroup: the root's while none is known.
+    pub fn cgroup(&self) -> &[u8] {
+        if self.cgroup.is_empty() { b"/" } else { &self.cgroup }
+    }
+}
+
 fn fresh(pid: i32, start: u64) -> ProcRecord {
     ProcRecord {
         start,
-        cgroup: b"/".to_vec(),
+        cgroup: Vec::new(),
         ns: Vec::new(),
         comm: Vec::new(),
         cmdline: Vec::new(),
