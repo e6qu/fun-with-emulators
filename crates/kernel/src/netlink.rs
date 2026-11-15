@@ -425,6 +425,61 @@ pub(crate) fn load(d: &mut crate::snapshot::Dec) {
     });
 }
 
+/// What netlink socket `fd` takes to another process it is passed to
+/// ([`crate::scm`]): its port, type, namespace and address, and fwe's end,
+/// through which the receiver answers it too.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    if !is(fd) {
+        return None;
+    }
+    let ino = inode(fd)?;
+    socks(|m| {
+        let s = m.get(&ino)?;
+        let mut e = crate::snapshot::Enc::new();
+        e.u32(s.port);
+        e.i32(s.ty);
+        e.bool(s.admin);
+        crate::shared::save_opt(&mut e, &s.net);
+        let (path, by) = s.bound.clone().unwrap_or_default();
+        e.bool(s.bound.is_some());
+        e.bytes(&path);
+        e.i32(by);
+        Some(crate::scm::Export {
+            kind: crate::scm::kind::NETLINK,
+            state: e.into_bytes(),
+            companions: vec![s.peer],
+            placeholder: false,
+        })
+    })
+}
+
+/// Make received descriptor `fd` the netlink socket an [`export`]
+/// described: whether it was.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec, companions: Vec<i32>) -> bool {
+    let [peer] = companions[..] else {
+        for c in companions {
+            // SAFETY: descriptors received for this socket.
+            unsafe { libc::close(c) };
+        }
+        return false;
+    };
+    let Ok(peer) = crate::fdtable::reserve(peer) else { return false };
+    let (port, ty, admin) = (d.u32(), d.i32(), d.bool());
+    let net = crate::shared::load_opt(d).ok().flatten();
+    let (some, path, by) = (d.bool(), d.bytes(), d.i32());
+    let Some(ino) = inode(fd) else {
+        // SAFETY: fwe's end, received above.
+        unsafe { libc::close(peer) };
+        return false;
+    };
+    fdmarks::mark(fd, Mark::Netlink);
+    let bound = some.then_some((path, by));
+    socks(|m| m.insert(ino, Sock { peer, port, ty, admin, net, bound }));
+    true
+}
+
 /// `fd` is closed: its host end goes with the last of its descriptors.
 pub fn closed(fd: i32) {
     if !is(fd) || fdmarks::shared_elsewhere(fd) {

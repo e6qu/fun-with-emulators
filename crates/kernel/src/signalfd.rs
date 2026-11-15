@@ -114,10 +114,19 @@ pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
             None => err(errno::EBADF),
         });
     }
+    match make(mask, flags & fcntl::O_CLOEXEC != 0, flags & fcntl::O_NONBLOCK != 0) {
+        Ok(rfd) => rfd as i64,
+        Err(e) => err(e),
+    }
+}
+
+/// A new signalfd watching `mask`: its readiness pipe's read end, which
+/// the guest holds (its write end is fwe's).
+fn make(mask: u64, cloexec: bool, nonblock: bool) -> Result<i32, i32> {
     let mut fds = [0i32; 2];
     // SAFETY: plain host call with a 2-element array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return crate::host::last_error();
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
     }
     // The write end is fwe's: out of the guest's reach.
     let wfd = match crate::fdtable::reserve(fds[1]) {
@@ -125,22 +134,61 @@ pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
         Err(e) => {
             // SAFETY: closing the read end made above.
             unsafe { libc::close(fds[0]) };
-            return fwe_abi::err(e);
+            return Err(e);
         }
     };
     let rfd = fds[0];
-    if flags & fcntl::O_CLOEXEC != 0 {
+    if cloexec {
         // SAFETY: plain host call on a fresh descriptor.
         unsafe { libc::fcntl(rfd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
-    if flags & fcntl::O_NONBLOCK != 0 {
+    if nonblock {
         // As `F_GETFL` shows it, and `F_SETFL` changes it.
         // SAFETY: plain host call on a fresh descriptor.
         unsafe { libc::fcntl(rfd, libc::F_SETFL, libc::O_NONBLOCK) };
     }
     let s = SignalFd { rfd, wfd, mask, queue: VecDeque::new() };
     with(|m| m.insert(rfd, s));
-    rfd as i64
+    Ok(rfd)
+}
+
+/// What signalfd `fd` takes to another process it is passed to
+/// ([`crate::scm`]): its mask and whether it blocks. A signalfd reads its
+/// reader's signals, so the receiver makes its own.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    let mask = with(|m| m.get(&fd).map(|s| s.mask))?;
+    let mut e = crate::snapshot::Enc::new();
+    e.u64(mask);
+    // SAFETY: F_GETFL only queries the descriptor.
+    e.bool(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0);
+    Some(crate::scm::Export {
+        kind: crate::scm::kind::SIGNALFD,
+        state: e.into_bytes(),
+        companions: Vec::new(),
+        placeholder: true,
+    })
+}
+
+/// Make received descriptor `fd` a signalfd as an [`export`] described:
+/// whether it was.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
+    let (mask, nonblock) = (d.u64(), d.bool());
+    let Ok(rfd) = make(mask, false, nonblock) else { return false };
+    let s = with(|m| m.remove(&rfd));
+    if !crate::scm::replace(fd, rfd) {
+        if let Some(s) = s {
+            // SAFETY: the write end made above.
+            unsafe { libc::close(s.wfd) };
+        }
+        return false;
+    }
+    if let Some(mut s) = s {
+        s.rfd = fd;
+        with(|m| m.insert(fd, s));
+    }
+    true
 }
 
 /// Queue `info` on every signalfd that watches signal `sig` (bit `sig-1`).

@@ -14,8 +14,9 @@
 //! kqueue, so it stays readable.
 //!
 //! The host passes no kqueue on to a fork child, nor over a Unix socket: a
-//! fork child gets a new one at each marked number ([`restore`]), and
-//! one sent with `SCM_RIGHTS` fails (`EINVAL`).
+//! fork child gets a new one at each marked number ([`restore`]), and a
+//! process a descriptor is sent to with `SCM_RIGHTS` makes its own
+//! ([`export`], [`import`], [`crate::scm`]).
 //!
 //! An ended process's wait status, which `PIDFD_GET_INFO` gives once it
 //! has been reaped, is what this process's `wait` reaped ([`reaped`]).
@@ -166,6 +167,37 @@ pub fn fdinfo(fd: i32) -> Option<String> {
         crate::pidns::to_guest(t.host)
     };
     Some(format!("Pid:\t{pid}\nNSpid:\t{pid}\n"))
+}
+
+/// What process descriptor `fd` takes to another process it is passed to
+/// ([`crate::scm`]): the process it names (a kqueue, which the host does
+/// not pass, so the receiver watches the process with one of its own).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    let t = of(fd)?;
+    let mut e = crate::snapshot::Enc::new();
+    e.i32(t.host);
+    e.bool(t.nonblock);
+    Some(crate::scm::Export {
+        kind: crate::scm::kind::PIDFD,
+        state: e.into_bytes(),
+        companions: Vec::new(),
+        placeholder: true,
+    })
+}
+
+/// Make received descriptor `fd` the process descriptor an [`export`]
+/// described (of the process, for a thread's of another process):
+/// whether it was.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
+    let t = Target { host: d.i32(), tid: 0, nonblock: d.bool() };
+    let Ok(kq) = watch(t) else { return false };
+    if !crate::scm::replace(fd, kq) {
+        return false;
+    }
+    fdmarks::mark(fd, Mark::Pid { host: t.host, tid: 0, nonblock: t.nonblock });
+    true
 }
 
 /// `PIDFD_NONBLOCK` set or cleared on `fd` (`F_SETFL`).

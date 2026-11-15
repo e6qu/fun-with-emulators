@@ -85,6 +85,8 @@ pub mod pty;
 pub mod reaper;
 pub mod rlimits;
 mod sched;
+#[cfg(not(target_os = "linux"))]
+pub mod scm;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;

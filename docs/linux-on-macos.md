@@ -1175,15 +1175,46 @@ control messages ([Sockets](#sockets)). `AF_UNIX`, `AF_INET` and
 | `setsockopt`, `getsockopt` | numbers and layouts translated (`sockopt.rs`); fwe answers `SO_SNDBUF`/`SO_RCVBUF` arithmetic, `SO_DOMAIN`, `SO_PROTOCOL`, kept `SO_NO_CHECK`/`SO_PRIORITY`/`SO_PASSCRED`, `SO_PEERCRED`, `SO_ATTACH_BPF`/`SO_DETACH_BPF`, `IPV6_ADDRFORM`, and `SO_TYPE` of a `SOCK_SEQPACKET` or netlink socket | `setsockopt`, `getsockopt` |
 | `shutdown` | passed through; a Unix socket whose peer has gone shuts down (`0`, where the host says `ENOTCONN`) | `shutdown` |
 
-**`sendmsg`, `recvmsg`**: only `SCM_RIGHTS` crosses. Linux's `cmsghdr` has
-a 64-bit `cmsg_len` and 8-byte alignment, macOS's a 32-bit one and 4-byte
-alignment, so fwe re-encodes the first `SCM_RIGHTS` message into a
-256-byte host buffer (up to 61 descriptors) and back. Other control
-messages, `SCM_CREDENTIALS` among them, are not sent. A receive whose
-control buffer is too small for the descriptors sets `MSG_CTRUNC`;
-`MSG_CMSG_CLOEXEC` makes the received descriptors close-on-exec. A
-received `SOCK_SEQPACKET` socket is recognised by its buffer size and
-stays one.
+**`sendmsg`, `recvmsg`** (`crates/kernel/src/scm.rs`): Linux's `cmsghdr`
+has a 64-bit `cmsg_len` and 8-byte alignment, macOS's a 32-bit one and
+4-byte alignment, so fwe reads the guest's control messages as Linux's
+`__scm_send` does (a length past the buffer, an unknown `SOL_SOCKET`
+type or a short `ucred` is `EINVAL`, a descriptor not open `EBADF`;
+other levels are passed over) and sends every `SCM_RIGHTS` message's
+descriptors, up to Linux's 253 (`EINVAL` past them; the host takes 254),
+as one host message. On a socket that is not a Unix one, descriptors and
+credentials are `EINVAL`. A receive writes as many descriptors as the
+guest's buffer holds and closes the others, setting `MSG_CTRUNC`, as
+Linux does (the host installs them all whatever the buffer);
+`MSG_CMSG_CLOEXEC` makes them close-on-exec. A received
+`SOCK_SEQPACKET` socket is recognised by its buffer size and stays one.
+
+A descriptor fwe stands in for keeps what it is in the process it is
+passed to: the sender adds a *bundle*, a host datagram socket sent as the
+last descriptor and holding a manifest and the host objects behind each
+such descriptor, which the receiver takes and closes before the guest
+sees the message:
+
+| Passed descriptor | What the receiver gets |
+|---|---|
+| eventfd | the same counter (its file is mapped) and readiness pipe, shared with the sender |
+| timerfd | a kqueue of its own (the host passes none) armed on the sender's schedule; expiries are counted apart |
+| signalfd | a signalfd of its own with the same mask, reading the receiver's signals, as Linux's does |
+| netlink socket | the same socket, answered through the same host end, for the namespace it was made in |
+| process descriptor | a kqueue of its own watching the same process (a `PIDFD_THREAD` one of another process's thread watches that process) |
+| `SOCK_SEQPACKET` socket, memfd | itself: its buffer size or extended attributes say what it is |
+
+The sender holds the bundle's end until the receiver has emptied it: the
+host collects descriptors in flight that no process holds, and a
+collection running while a message is on its way can take one held only
+in flight for unreachable. An epoll descriptor (a kqueue) cannot be passed
+(`EINVAL`), nor can a receiver that is not an fwe process use a bundle
+(it sees one more descriptor). What fwe keeps per process of other
+descriptors stays with their maker: a passed inotify instance receives
+its events but takes no watches (`EINVAL`), and a message queue,
+namespace, mount API, Landlock ruleset, loop device, pseudo-terminal
+master or synthesized `/proc` directory descriptor arrives as the host
+object behind it.
 
 **`socket(AF_UNIX, SOCK_SEQPACKET)`**: macOS has none. fwe makes a stream
 socket and frames each message with a 4-byte length; a send writes a whole
@@ -1921,7 +1952,7 @@ pipe, or both, so the guest can mix them in one `epoll`:
 | Linux | macOS | fwe |
 |---|---|---|
 | `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR` (a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen), `EPOLLONESHOT` → `EV_ONESHOT`, `EPOLLEXCLUSIVE` → a count of a pipe's writes every fwe process shares, of which each woken set must take one to report it, data in `udata`; `epoll_event` is 16 bytes on arm64; returned events under [Network events](#network-events) |
-| `eventfd` | none | a pipe plus a 64-bit counter in a shared page, so a fork child shares it; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
+| `eventfd` | none | a pipe plus a 64-bit counter in a file of fwe's every holder maps, so a fork child or a process it is passed to shares it; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
 | `timerfd` | none | a kqueue with one one-shot `EVFILT_TIMER` for the next expiry, in nanoseconds and on time (`NOTE_CRITICAL`); the schedule is fwe's |
 | `signalfd` | none | a readiness pipe plus a queue of `signalfd_siginfo`; a pending signal the thread blocks and a signalfd watches moves onto it |
 | inotify | `kqueue` vnode events (no names), FSEvents (paths, after the fact); neither reports open, read or close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |

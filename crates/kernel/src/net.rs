@@ -12,8 +12,10 @@
 //!   `type` argument and applied with `fcntl`.
 //! - **`setsockopt` names and `send`/`recv` flags:** mapped individually;
 //!   `MSG_NOSIGNAL` becomes `SO_NOSIGPIPE` on the socket.
-//! - **`SCM_RIGHTS`:** the control-message layout differs (`cmsg_len` is 64-bit
-//!   on Linux, 32-bit on macOS), so file-descriptor passing is re-encoded.
+//! - **control messages:** the layout differs (`cmsg_len` is 64-bit on
+//!   Linux, 32-bit on macOS), so descriptors and credentials are
+//!   re-encoded, and what fwe keeps of a descriptor goes with it
+//!   ([`crate::scm`]).
 //!
 //! `AF_UNIX` paths are rooted under the rootfs; abstract-namespace names (a
 //! leading NUL) are mapped to files under a per-host temporary directory, since
@@ -2068,20 +2070,18 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     };
 
     // Ancillary data: on Linux the guest layout is the host's, so it passes
-    // through; on macOS re-encode SCM_RIGHTS.
+    // through; on macOS it is re-encoded ([`crate::scm`]).
     #[cfg(target_os = "linux")]
     let (ctl_ptr, ctl_len) = (control as *mut libc::c_void, controllen as _);
     #[cfg(not(target_os = "linux"))]
-    let mut macbuf = [0u8; 256];
+    let prepared = match send_control(fd as i32, control, controllen) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
     #[cfg(not(target_os = "linux"))]
-    let (ctl_ptr, ctl_len) = if controllen != 0 {
-        match scm_linux_to_host(control, controllen as usize, &mut macbuf) {
-            Ok(0) => (std::ptr::null_mut(), 0),
-            Ok(n) => (macbuf.as_mut_ptr() as *mut libc::c_void, n as libc::socklen_t),
-            Err(e) => return e,
-        }
-    } else {
-        (std::ptr::null_mut(), 0)
+    let (ctl_ptr, ctl_len) = match &prepared {
+        Some(p) if !p.buf.is_empty() => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len() as _),
+        _ => (std::ptr::null_mut(), 0),
     };
 
     let hmsg = libc::msghdr {
@@ -2093,22 +2093,30 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_len,
         msg_flags: 0,
     };
-    if crate::seqpacket::is(fd as i32) {
-        return crate::seqpacket::send(
+    let r = if crate::seqpacket::is(fd as i32) {
+        crate::seqpacket::send(
             fd as i32,
             &hiov,
             (hmsg.msg_control, hmsg.msg_controllen as usize),
             msg_flags_to_host(flags),
-        );
+        )
+    } else {
+        let mut hmsg = hmsg;
+        // ENAMETOOLONG where the host cannot send from a directory.
+        let mut r = err(errno::ENAMETOOLONG);
+        in_dir(dir.as_ref(), || {
+            // SAFETY: `hmsg` references guest iov and local name/control buffers.
+            r = unsafe { send_corked(fd as i32, &mut hmsg, flags, msg_flags_to_host(flags)) };
+            0
+        });
+        r
+    };
+    #[cfg(not(target_os = "linux"))]
+    if r < 0
+        && let Some(p) = prepared
+    {
+        p.unsent();
     }
-    let mut hmsg = hmsg;
-    // ENAMETOOLONG where the host cannot send from a directory.
-    let mut r = err(errno::ENAMETOOLONG);
-    in_dir(dir.as_ref(), || {
-        // SAFETY: `hmsg` references guest iov and local name/control buffers.
-        r = unsafe { send_corked(fd as i32, &mut hmsg, flags, msg_flags_to_host(flags)) };
-        0
-    });
     r
 }
 
@@ -2251,8 +2259,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
 
     #[cfg(target_os = "linux")]
     let (ctl_ptr, ctl_cap) = (control as *mut libc::c_void, controllen as _);
+    // Room for the most descriptors the host passes in one message.
     #[cfg(not(target_os = "linux"))]
-    let mut macbuf = [0u8; 256];
+    let mut macbuf = vec![0u8; if controllen != 0 { HOST_CONTROL } else { 0 }];
     #[cfg(not(target_os = "linux"))]
     let (ctl_ptr, ctl_cap) = if controllen != 0 {
         (macbuf.as_mut_ptr() as *mut libc::c_void, macbuf.len() as libc::socklen_t)
@@ -2324,117 +2333,54 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let (clen, ctrunc) = if controllen != 0 && hmsg.msg_controllen != 0 {
-            guest!(scm_host_to_linux(
-                &macbuf,
-                hmsg.msg_controllen as usize,
-                control,
-                controllen as usize,
-                flags & MSG_CMSG_CLOEXEC != 0,
-            ))
-        } else {
-            (0u64, false)
-        };
+        let cap = controllen as usize;
+        let got = (hmsg.msg_controllen as usize).min(macbuf.len());
+        let inc = crate::scm::receive(
+            &macbuf[..got],
+            cap.saturating_sub(CMSG_HDR) / 4,
+            flags & MSG_PEEK != 0,
+        );
+        let (bytes, ctrunc) =
+            crate::scm::linux_control(cap, None, &inc.fds, flags & MSG_CMSG_CLOEXEC != 0);
         let mut lflags = msg_flags_from_host(hmsg.msg_flags);
-        if ctrunc {
+        if ctrunc || inc.dropped {
             lflags |= MSG_CTRUNC as i32;
         }
-        guest!(uaccess::write(msg + 40, clen));
+        if uaccess::write_from(control, &bytes).is_err() {
+            for &fd in &inc.fds {
+                // SAFETY: descriptors received for this call, not delivered.
+                unsafe { libc::close(fd) };
+            }
+            return err(errno::EFAULT);
+        }
+        guest!(uaccess::write(msg + 40, bytes.len() as u64));
         guest!(uaccess::write(msg + 48, lflags));
     }
     r as i64
 }
 
-/// Re-encode a guest Linux `SCM_RIGHTS` control buffer into macOS layout in
-/// `out`; returns the macOS control length (0 if no SCM_RIGHTS present).
+/// The host control buffer a receive gives: the host's most descriptors
+/// in one message (254), with room to spare.
 #[cfg(not(target_os = "linux"))]
-fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Result<usize, i64> {
-    // Linux cmsghdr: { u64 cmsg_len; i32 level; i32 type; } then data @16, 8-aligned.
-    let ctl = uaccess::read_bytes(control, len.min(64 * 1024)).map_err(err)?;
-    let len = ctl.len();
-    let u64_at = |o: usize| u64::from_ne_bytes(ctl[o..o + 8].try_into().unwrap());
-    let i32_at = |o: usize| i32::from_ne_bytes(ctl[o..o + 4].try_into().unwrap());
-    let mut off = 0usize;
-    while off + 16 <= len {
-        let (clen, level, ctype) = (u64_at(off) as usize, i32_at(off + 8), i32_at(off + 12));
-        if clen < 16 || off + clen > len {
-            break;
-        }
-        if level == SOL_SOCKET as i32 && ctype == 1
-        /* SCM_RIGHTS */
-        {
-            let nfds = (clen - 16) / 4;
-            // macOS cmsghdr: { u32 cmsg_len; i32 level; i32 type; } data @12, 4-aligned.
-            let maclen = 12 + nfds * 4;
-            if maclen > out.len() {
-                return Err(err(errno::EINVAL));
-            }
-            out[0..4].copy_from_slice(&(maclen as u32).to_ne_bytes());
-            out[4..8].copy_from_slice(&(libc::SOL_SOCKET).to_ne_bytes());
-            out[8..12].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
-            for i in 0..nfds {
-                let fd = i32_at(off + 16 + i * 4);
-                out[12 + i * 4..16 + i * 4].copy_from_slice(&fd.to_ne_bytes());
-            }
-            return Ok(maclen);
-        }
-        off += (clen + 7) & !7; // CMSG_ALIGN to 8
-    }
-    Ok(0)
-}
+const HOST_CONTROL: usize = 12 + 4 * 256 + 64;
 
-/// Re-encode macOS `SCM_RIGHTS` control data from `host` into the guest Linux
-/// control buffer; returns `(linux_controllen, truncated)`.
-///
-/// `host` holds `host_len` bytes; `dst` is the guest's buffer of `dst_cap`
-/// bytes. The descriptors are close-on-exec if `cloexec`
-/// (`MSG_CMSG_CLOEXEC`).
+/// The host control data for the guest's control buffer of a send on
+/// `fd` ([`crate::scm`]). A socket that is not a Unix one takes neither
+/// descriptors nor credentials (`EINVAL`), and passes the rest over.
 #[cfg(not(target_os = "linux"))]
-fn scm_host_to_linux(
-    host: &[u8; 256],
-    host_len: usize,
-    dst: u64,
-    dst_cap: usize,
-    cloexec: bool,
-) -> uaccess::Result<(u64, bool)> {
-    let mut off = 0usize;
-    while off + 12 <= host_len {
-        let clen =
-            u32::from_ne_bytes([host[off], host[off + 1], host[off + 2], host[off + 3]]) as usize;
-        let level =
-            i32::from_ne_bytes([host[off + 4], host[off + 5], host[off + 6], host[off + 7]]);
-        let ctype =
-            i32::from_ne_bytes([host[off + 8], host[off + 9], host[off + 10], host[off + 11]]);
-        if clen < 12 || off + clen > host_len {
-            break;
-        }
-        if level == libc::SOL_SOCKET && ctype == libc::SCM_RIGHTS {
-            let nfds = (clen - 12) / 4;
-            let linux_len = 16 + nfds * 4;
-            if linux_len > dst_cap {
-                return Ok((0, true));
-            }
-            let mut out = vec![0u8; linux_len];
-            out[0..8].copy_from_slice(&(linux_len as u64).to_ne_bytes());
-            out[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
-            out[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
-            for i in 0..nfds {
-                let fd = &host[off + 12 + i * 4..off + 16 + i * 4];
-                out[16 + i * 4..20 + i * 4].copy_from_slice(fd);
-                let fd = i32::from_ne_bytes(fd.try_into().unwrap());
-                if cloexec {
-                    // SAFETY: plain host call on a descriptor just received.
-                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-                }
-                // A SOCK_SEQPACKET socket of fwe's is one here too.
-                crate::seqpacket::adopt(fd);
-            }
-            uaccess::write_from(dst, &out)?;
-            return Ok((linux_len as u64, false));
-        }
-        off += (clen + 3) & !3; // CMSG_ALIGN to 4 on macOS
+fn send_control(fd: i32, control: u64, len: u64) -> Result<Option<crate::scm::Prepared>, i32> {
+    if len == 0 {
+        return Ok(None);
     }
-    Ok((0, false))
+    let ctl = uaccess::read_bytes(control, (len as usize).min(64 * 1024))?;
+    if !is_unix(fd) {
+        return match crate::scm::parse(&ctl) {
+            Ok(o) if !o.fds.is_empty() || o.creds.is_some() => Err(errno::EINVAL),
+            _ => Ok(None),
+        };
+    }
+    let out = crate::scm::parse(&ctl)?;
+    crate::scm::prepare(&out.fds, None).map(Some)
 }
 
 #[cfg(test)]
@@ -2937,6 +2883,7 @@ pub(crate) mod scm_tests {
 
     #[test]
     fn cmsg_cloexec_marks_received_descriptors() {
+        let _g = serial();
         let sv = pair(SOCK_STREAM);
         for (flags, want) in [(0, false), (MSG_CMSG_CLOEXEC, true)] {
             assert_eq!(send_control(sv[0], &rights(&[0, 1])), 1);
@@ -2948,5 +2895,134 @@ pub(crate) mod scm_tests {
             close_all(&fds);
         }
         close_all(&sv);
+    }
+
+    /// The descriptor-passing tests, one at a time: they take descriptor
+    /// numbers the host hands out and registries keyed by them.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Pass `fds` from one end of a socket pair to the other: what came.
+    fn pass(fds: &[i32]) -> Vec<i32> {
+        let sv = pair(SOCK_STREAM);
+        assert_eq!(send_control(sv[0], &rights(fds)), 1);
+        let (r, control, flags) = recv_control(sv[1], 4096, 0);
+        assert_eq!((r, flags & MSG_CTRUNC as i32), (1, 0));
+        close_all(&sv);
+        fds_in(&control)
+    }
+
+    #[test]
+    fn the_most_descriptors_linux_passes_go_in_one_message() {
+        let _g = serial();
+        let fds = vec![0; SCM_MAX_FD];
+        let got = pass(&fds);
+        assert_eq!(got.len(), SCM_MAX_FD);
+        close_all(&got);
+        let sv = pair(SOCK_STREAM);
+        assert_eq!(send_control(sv[0], &rights(&[0; SCM_MAX_FD + 1])), err(errno::EINVAL));
+        close_all(&sv);
+    }
+
+    #[test]
+    fn descriptors_that_do_not_fit_are_closed() {
+        let _g = serial();
+        let mut p = [0i32; 2];
+        // SAFETY: a valid out-array.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        let sv = pair(SOCK_STREAM);
+        // Four of the pipe's write end; room for two.
+        assert_eq!(send_control(sv[0], &rights(&[p[1]; 4])), 1);
+        let (r, control, flags) = recv_control(sv[1], CMSG_HDR + 8, 0);
+        assert_eq!(r, 1);
+        assert_ne!(flags & MSG_CTRUNC as i32, 0);
+        let got = fds_in(&control);
+        assert_eq!(got.len(), 2);
+        // Once those and the original are closed, no write end is left.
+        close_all(&got);
+        close_all(&[p[1]]);
+        close_all(&sv);
+        let mut b = 0u8;
+        // SAFETY: a valid one-byte buffer; the read end does not block
+        // once no writer is left.
+        assert_eq!(unsafe { libc::read(p[0], (&mut b as *mut u8).cast(), 1) }, 0);
+        close_all(&[p[0]]);
+    }
+
+    #[test]
+    fn a_passed_eventfd_shares_its_count() {
+        let _g = serial();
+        // SAFETY: no pointers.
+        let fd = unsafe { crate::specialfd::eventfd2(0, fwe_abi::eventfd::EFD_NONBLOCK) } as i32;
+        let got = pass(&[fd]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(crate::specialfd::anon_name(got[0]), Some("[eventfd]"));
+        let seven = 7u64;
+        // SAFETY: 8 readable bytes.
+        let wrote = unsafe { crate::specialfd::try_write(fd, &seven as *const u64 as u64, 8) };
+        assert_eq!(wrote, Some(8));
+        let mut v = 0u64;
+        // SAFETY: 8 writable bytes.
+        let read = unsafe { crate::specialfd::try_read(got[0], &mut v as *mut u64 as u64, 8) };
+        assert_eq!(read, Some(8));
+        assert_eq!(v, 7);
+        // SAFETY: as above: the original sees it read.
+        let r = unsafe { crate::specialfd::try_read(fd, &mut v as *mut u64 as u64, 8) };
+        assert_eq!(r, Some(err(errno::EAGAIN)));
+        assert_eq!(crate::specialfd::try_close(got[0]), Some(0));
+        assert_eq!(crate::specialfd::try_close(fd), Some(0));
+    }
+
+    #[test]
+    fn a_passed_timerfd_keeps_its_schedule() {
+        let _g = serial();
+        use fwe_abi::timerfd::TFD_NONBLOCK;
+        // SAFETY: no pointers.
+        let fd = unsafe { crate::specialfd::timerfd_create(1, TFD_NONBLOCK) } as i32;
+        let spec: [i64; 4] = [0, 0, 0, 40_000_000];
+        // SAFETY: a valid itimerspec.
+        let r = unsafe { crate::specialfd::timerfd_settime(fd as u64, 0, spec.as_ptr() as u64, 0) };
+        assert_eq!(r, 0);
+        let got = pass(&[fd]);
+        assert_eq!(crate::specialfd::anon_name(got[0]), Some("[timerfd]"));
+        let mut cur = [0i64; 4];
+        // SAFETY: a writable itimerspec.
+        let r =
+            unsafe { crate::specialfd::timerfd_gettime(got[0] as u64, cur.as_mut_ptr() as u64) };
+        assert_eq!(r, 0);
+        assert!(cur[3] > 0 && cur[3] <= 40_000_000, "{cur:?}");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let mut v = 0u64;
+        // SAFETY: 8 writable bytes.
+        let r = unsafe { crate::specialfd::try_read(got[0], &mut v as *mut u64 as u64, 8) };
+        assert_eq!((r, v), (Some(8), 1));
+        crate::specialfd::try_close(got[0]);
+        crate::specialfd::try_close(fd);
+    }
+
+    #[test]
+    fn a_passed_signalfd_is_one() {
+        let _g = serial();
+        let fd = crate::signalfd::signalfd4(-1, 1 << 9, fwe_abi::fcntl::O_NONBLOCK);
+        let got = pass(&[fd as i32]);
+        assert!(crate::signalfd::is_signalfd(got[0]));
+        crate::signalfd::try_close(got[0]);
+        crate::signalfd::try_close(fd as i32);
+    }
+
+    #[test]
+    fn a_passed_netlink_socket_answers() {
+        let _g = serial();
+        let fd = crate::netlink::socket(3, 0, false) as i32;
+        let got = pass(&[fd]);
+        assert!(crate::netlink::is(got[0]));
+        assert_eq!(crate::netlink::sock_type(got[0]), Some(3));
+        crate::netlink::closed(got[0]);
+        crate::fdmarks::closed(got[0]);
+        crate::netlink::closed(fd);
+        crate::fdmarks::closed(fd);
+        close_all(&[got[0], fd]);
     }
 }

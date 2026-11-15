@@ -26,6 +26,25 @@ struct cmsghdr {
 };
 
 int socketpair(int domain, int type, int protocol, int sv[2]);
+int socket(int domain, int type, int protocol);
+int pipe(int fds[2]);
+int fork(void);
+int waitpid(int pid, int *status, int options);
+void _exit(int status);
+long read(int fd, void *buf, size_t n);
+long write(int fd, const void *buf, size_t n);
+long send(int fd, const void *buf, size_t n, int flags);
+long recv(int fd, void *buf, size_t n, int flags);
+int eventfd(unsigned initval, int flags);
+int timerfd_create(int clockid, int flags);
+int timerfd_settime(int fd, int flags, const void *new_value, void *old_value);
+int signalfd(int fd, const void *mask, int flags);
+int sigprocmask(int how, const void *set, void *old);
+int getpid(void);
+int kill(int pid, int sig);
+long syscall(long nr, ...);
+int poll(void *fds, unsigned long n, int timeout);
+int fflush(void *stream);
 long sendmsg(int fd, const struct msghdr *msg, int flags);
 long recvmsg(int fd, struct msghdr *msg, int flags);
 int fcntl(int fd, int cmd, ...);
@@ -114,10 +133,128 @@ static int cloexec(void) {
     return 0;
 }
 
+/* All of Linux's 253 descriptors go in one message; one more is EINVAL. */
+static int many(void) {
+    int sv[2], fds[254], got[254], mflags;
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    for (int i = 0; i < 254; i++)
+        fds[i] = 0;
+    if (send_fds(sv[0], fds, 254) != -1)
+        return printf("254 went\n"), 1;
+    if (send_fds(sv[0], fds, 253) != 1)
+        return printf("253 did not go\n"), 1;
+    int n = recv_fds(sv[1], sizeof control, 0, got, &mflags);
+    for (int i = 0; i < n; i++)
+        close(got[i]);
+    printf("received %d\n", n);
+    return n != 253;
+}
+
+/* Descriptors that do not fit the receiver's buffer are closed: once
+ * those that did and the original are closed, the pipe has no writer. */
+static int truncated(void) {
+    int sv[2], p[2], got[4], mflags;
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    pipe(p);
+    int fds[4] = {p[1], p[1], p[1], p[1]};
+    send_fds(sv[0], fds, 4);
+    int n = recv_fds(sv[1], CMSG_SPACE(2 * sizeof(int)), 0, got, &mflags);
+    for (int i = 0; i < n; i++)
+        close(got[i]);
+    close(p[1]);
+    char b;
+    long r = read(p[0], &b, 1);
+    printf("kept %d, truncated %d, end of pipe %ld\n", n, !!(mflags & MSG_CTRUNC), r);
+    return n != 2 || r != 0;
+}
+
+#define EFD_NONBLOCK 04000
+#define SIGUSR1 10
+#define SIG_BLOCK 0
+#define AF_NETLINK 16
+#define SOCK_RAW 3
+
+struct pollfd {
+    int fd;
+    short events, revents;
+};
+
+/* Descriptors fwe stands in for, made after a fork and passed to the
+ * child, work there as they do in their maker. */
+static int emulated(void) {
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    int child = fork();
+    if (child == 0) {
+        int got[8], mflags;
+        int n = recv_fds(sv[1], sizeof control, 0, got, &mflags);
+        if (n != 5) {
+            printf("child received %d\n", n);
+            fflush(0);
+            _exit(1);
+        }
+        /* The eventfd's count is the maker's. */
+        unsigned long long v = 5;
+        write(got[0], &v, 8);
+        /* The timerfd fires when the maker set it to. */
+        v = 0;
+        long r = read(got[1], &v, 8);
+        printf("timerfd: %ld %llu\n", r, v);
+        /* The signalfd reads this process's signals. */
+        unsigned long long set = 1ULL << (SIGUSR1 - 1);
+        sigprocmask(SIG_BLOCK, &set, 0);
+        kill(getpid(), SIGUSR1);
+        unsigned char info[128];
+        r = read(got[2], info, sizeof info);
+        printf("signalfd: %ld signal %d\n", r, *(int *)info);
+        /* The netlink socket answers. */
+        struct {
+            unsigned len;
+            unsigned short type, flags;
+            unsigned seq, pid;
+            unsigned char family, pad[15];
+        } req = {32, 18, 0x301, 1, 0, 0, {0}};
+        send(got[3], &req, sizeof req, 0);
+        unsigned char reply[4096];
+        r = recv(got[3], reply, sizeof reply, 0);
+        printf("netlink: answered %d\n", r > 16 && *(unsigned short *)(reply + 4) == 16);
+        /* The process descriptor is readable once its process ended. */
+        struct pollfd pfd = {got[4], 1, 0};
+        printf("pidfd: %d\n", poll(&pfd, 1, 5000));
+        fflush(0);
+        _exit(0);
+    }
+    int efd = eventfd(0, 0);
+    int tfd = timerfd_create(1, 0);
+    long spec[4] = {0, 0, 0, 100000000L};
+    timerfd_settime(tfd, 0, spec, 0);
+    int sfd = signalfd(-1, &(unsigned long long){1ULL << (SIGUSR1 - 1)}, 0);
+    int nfd = socket(AF_NETLINK, SOCK_RAW, 0);
+    int gone = fork();
+    if (gone == 0)
+        _exit(0);
+    int pfd = syscall(434, gone, 0);
+    int fds[5] = {efd, tfd, sfd, nfd, pfd};
+    send_fds(sv[0], fds, 5);
+    unsigned long long v = 0;
+    read(efd, &v, 8);
+    int status;
+    waitpid(child, &status, 0);
+    waitpid(gone, &status, 0);
+    printf("eventfd: %llu\n", v);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
     if (!strcmp(argv[1], "cloexec"))
         return cloexec();
+    if (!strcmp(argv[1], "many"))
+        return many();
+    if (!strcmp(argv[1], "truncated"))
+        return truncated();
+    if (!strcmp(argv[1], "emulated"))
+        return emulated();
     return 2;
 }

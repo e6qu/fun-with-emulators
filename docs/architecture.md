@@ -948,8 +948,9 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   namespace record's generation, checked in slices).
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
-  An eventfd's counter is a shared page with a lock word, so a fork child
-  and its parent share one counter, as on Linux.
+  An eventfd's counter is a file of fwe's, mapped, with a lock word, so a
+  fork child and its parent, or a process it is passed to, share one
+  counter, as on Linux.
 - **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
   fwe process maps counts, for each pipe a set watches exclusively, its
   writes and the writes a waiter took. A set a write woke reports it only
@@ -1058,6 +1059,14 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   message is sent or taken under the socket's lock for that direction (a
   mutex within a process, a byte-range lock on a file of fwe's between
   processes).
+- Control messages (`crates/kernel/src/scm.rs`): a descriptor fwe stands
+  in for travels with a bundle, a host datagram socket sent last that
+  holds a manifest and the host objects behind it; the receiver takes it
+  before the guest sees the message (see
+  [linux-on-macos.md](linux-on-macos.md#sockets)). The sender keeps the
+  bundle's end until the receiver has emptied it, as the host's
+  collection of descriptors in flight can otherwise take it for
+  unreachable while the message is on its way.
 - Netlink (`crates/kernel/src/netlink.rs`): the guest's descriptor is one
   end of a host datagram pair; fwe writes each reply to the other.
   `RTM_NEWLINK` needs `CAP_NET_ADMIN`.
@@ -1268,14 +1277,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   parent that is not fwe's sees.
 - A `CLONE_PARENT` child is still its creator's child on the host, which
   the creator could `wait` for while it lives (Linux's could not).
-- A process descriptor cannot be passed over a Unix socket (`EINVAL`: the
-  host passes no kqueue); `PIDFD_GET_INFO` gives a wait status only to the
-  process that reaped it, and no cgroup id; a `PIDFD_THREAD` descriptor
-  names only a thread of the caller's own process, and in a fork child it
-  stands for the parent's process; `pidfd_getfd` of a descriptor fwe
+- `PIDFD_GET_INFO` gives a wait status only to the process that reaped
+  it, and no cgroup id; a `PIDFD_THREAD` descriptor names only a thread
+  of the caller's own process, and in a fork child, or passed to another
+  process, it stands for the process; `pidfd_getfd` of a descriptor fwe
   stands in for (an eventfd, a timerfd, a signalfd) gives the host object
-  behind it, as one passed over a socket does, and waits while the target
-  is stopped.
+  behind it (the target answers from a signal handler, which cannot
+  describe it), and waits while the target is stopped.
 - A native process ended by `SIGKILL`, or any process ended by a signal
   from outside fwe that the host applies, leaves the robust futexes it
   held as they were (their next locker waits rather than getting
@@ -1525,6 +1533,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   not held; `RLIMIT_MSGQUEUE` counts the user's queues in the namespace
   only; a registration goes with `close` or `execve` of a descriptor, not
   `dup2` or `close_range`.
+- Descriptors passed with `SCM_RIGHTS`: an epoll descriptor cannot be
+  (`EINVAL`); a timerfd's expiries are counted apart in sender and
+  receiver; an inotify instance takes no watches in the receiver
+  (`EINVAL`); a message queue, namespace, mount API, Landlock ruleset,
+  loop device, pseudo-terminal master or synthesized `/proc` directory
+  descriptor arrives as the host object behind it; a receiver that is
+  not an fwe process sees one more descriptor (the bundle) with any of
+  the descriptors fwe stands in for.
 - Sockets: what fwe keeps of a socket (see
   [Sockets and terminals](#sockets-and-terminals)) is per descriptor, so
   a duplicate or another process sharing the socket does not see it; a

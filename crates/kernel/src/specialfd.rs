@@ -7,9 +7,11 @@
 //! - **eventfd** is backed by a pipe plus a 64-bit counter. The pipe holds one
 //!   byte exactly while the counter is non-zero, so the read end (the fd handed
 //!   to the guest) is readable — and pollable by `kqueue`, hence by our
-//!   `epoll` — precisely when a read would succeed. The counter is in a page
-//!   of shared memory, with a lock word, so that a fork child, which shares
-//!   the pipe, shares the counter too.
+//!   `epoll` — precisely when a read would succeed. The counter is in a
+//!   file with no name, with a lock word, which each process holding the
+//!   eventfd maps, so that a fork child, which shares the pipe, shares the
+//!   counter too, and one it is passed to gets the file with the pipe's
+//!   write end ([`crate::scm`]).
 //! - **timerfd** is a `kqueue` holding one one-shot `EVFILT_TIMER`, armed
 //!   for the timer's next expiry: the kqueue fd, pollable by our `epoll`,
 //!   is readable once an expiry is due. The schedule (the first expiry on
@@ -225,6 +227,27 @@ pub fn anon_name(fd: i32) -> Option<&'static str> {
     imp::anon_name(fd)
 }
 
+/// What eventfd or timerfd `fd` takes to another process it is passed
+/// to ([`crate::scm`]): an eventfd its pipe's write end and counter file,
+/// shared with the sender; a timerfd (a kqueue, which the host does not
+/// pass) its clock and schedule, for the receiver's own.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    imp::export(fd)
+}
+
+/// Make received descriptor `fd` the eventfd or timerfd an
+/// [`export`] described: whether it was.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(
+    kind: u8,
+    fd: i32,
+    d: &mut crate::snapshot::Dec,
+    companions: Vec<i32>,
+) -> bool {
+    imp::import(kind, fd, d, companions)
+}
+
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_os = "linux")]
@@ -268,16 +291,18 @@ mod imp {
         /// Read end (the fd the guest holds) and write end of the readiness pipe.
         rfd: i32,
         wfd: i32,
-        /// The address of its [`Shared`] counter.
+        /// The file holding its [`Shared`] counter (fwe's descriptor, which
+        /// passing the eventfd to another process passes too), and where
+        /// this process maps it.
+        mfd: i32,
         shared: usize,
-        /// Whether that is a mapping of its own (not this process's heap).
-        mapped: bool,
         semaphore: bool,
         nonblock: bool,
     }
 
-    /// An eventfd's counter, in shared memory (a fork child's is its
-    /// parent's), and the lock its changes, with the pipe's, are made under.
+    /// An eventfd's counter, in a file every process holding the eventfd
+    /// maps (a fork child's mapping is its parent's), and the lock its
+    /// changes, with the pipe's, are made under.
     #[repr(C)]
     struct Shared {
         magic: std::sync::atomic::AtomicU64,
@@ -287,34 +312,64 @@ mod imp {
 
     const MAGIC: u64 = 0x6677_655f_6576_6664;
 
-    /// A new shared counter holding `count`: its address, and whether it
-    /// is a mapping of its own. Should the host give no shared page, the
-    /// counter is this process's own memory.
-    fn new_shared(count: u64) -> (usize, bool) {
-        // SAFETY: a fresh shared anonymous page of this module's.
+    /// A new counter holding `count`: its file (a descriptor out of the
+    /// guest's reach, of a file with no name) and where it is mapped.
+    fn new_shared(count: u64) -> Result<(i32, usize), i32> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut path = crate::fs::shm::user_dir()?;
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        path.extend_from_slice(format!("/eventfd-{}-{n}", crate::host::pid()).as_bytes());
+        let path = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
+        let flags =
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        let fd = unsafe { libc::open(path.as_ptr(), flags, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        // SAFETY: fwe's own file, open above.
+        unsafe { libc::unlink(path.as_ptr()) };
+        let fail = |fd: i32, e: i32| {
+            // SAFETY: closing the descriptor opened above.
+            unsafe { libc::close(fd) };
+            Err(e)
+        };
+        // SAFETY: plain host call on the file just made.
+        if unsafe { libc::ftruncate(fd, std::mem::size_of::<Shared>() as libc::off_t) } != 0 {
+            return fail(fd, crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        let fd = match crate::fdtable::reserve(fd) {
+            Ok(fd) => fd,
+            Err(e) => return fail(fd, e),
+        };
+        let at = match map_shared(fd) {
+            Ok(at) => at,
+            Err(e) => return fail(fd, e),
+        };
+        // SAFETY: the file just mapped, zeroed, large enough for a `Shared`.
+        let sh = unsafe { &*(at as *const Shared) };
+        sh.count.store(count, std::sync::atomic::Ordering::SeqCst);
+        sh.magic.store(MAGIC, std::sync::atomic::Ordering::SeqCst);
+        Ok((fd, at))
+    }
+
+    /// Map counter file `mfd`: where.
+    fn map_shared(mfd: i32) -> Result<usize, i32> {
+        // SAFETY: a shared mapping of fwe's own counter file.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 std::mem::size_of::<Shared>(),
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
+                libc::MAP_SHARED,
+                mfd,
                 0,
             )
         };
         if p == libc::MAP_FAILED {
-            let own = Box::leak(Box::new(Shared {
-                magic: MAGIC.into(),
-                lock: 0.into(),
-                count: count.into(),
-            }));
-            return (own as *const Shared as usize, false);
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
-        // SAFETY: the page just mapped, zeroed, large enough for a `Shared`.
-        let sh = unsafe { &*(p as *const Shared) };
-        sh.count.store(count, std::sync::atomic::Ordering::SeqCst);
-        sh.magic.store(MAGIC, std::sync::atomic::Ordering::SeqCst);
-        (p as usize, true)
+        Ok(p as usize)
     }
 
     /// Run `f` on the counter at `shared` under its lock (shared with every
@@ -410,9 +465,8 @@ mod imp {
                     e.u8(0);
                     e.i32(ev.rfd);
                     e.i32(ev.wfd);
-                    // Only a mapped counter is shared with a fork child.
-                    e.u64(if ev.mapped { ev.shared as u64 } else { 0 });
-                    e.u64(locked(ev.shared, |c| *c));
+                    e.i32(ev.mfd);
+                    e.u64(ev.shared as u64);
                     e.bool(ev.semaphore);
                     e.bool(ev.nonblock);
                 }
@@ -438,22 +492,21 @@ mod imp {
         let mut cloexec = std::collections::HashMap::new();
         let reg = crate::snapshot::read_fd_map(d, |d| {
             if d.u8() == 0 {
-                let (rfd, wfd, at, count) = (d.i32(), d.i32(), d.u64() as usize, d.u64());
+                let (rfd, wfd, mfd, at) = (d.i32(), d.i32(), d.i32(), d.u64() as usize);
                 // A fork child has its parent's counter mapped at the same
-                // place; anything else gets a new one, holding the count.
+                // place; anything else maps its file.
                 // SAFETY: read only where the region is mapped.
-                let inherited = at != 0
-                    && crate::mm::host_mapped(at as u64, 1)
+                let inherited = crate::mm::host_mapped(at as u64, 1)
                     && unsafe { &*(at as *const Shared) }
                         .magic
                         .load(std::sync::atomic::Ordering::SeqCst)
                         == MAGIC;
-                let (shared, mapped) = if inherited { (at, true) } else { new_shared(count) };
+                let shared = if inherited { at } else { map_shared(mfd).unwrap_or(at) };
                 Special::Event(EventFd {
                     rfd,
                     wfd,
+                    mfd,
                     shared,
-                    mapped,
                     semaphore: d.bool(),
                     nonblock: d.bool(),
                 })
@@ -494,6 +547,105 @@ mod imp {
     fn with_reg<R>(f: impl FnOnce(&mut HashMap<i32, Special>) -> R) -> R {
         let mut g = REG.lock();
         f(g.get_or_insert_with(HashMap::new))
+    }
+
+    pub(super) fn export(fd: i32) -> Option<crate::scm::Export> {
+        use crate::scm::{Export, kind};
+        with_reg(|m| {
+            let mut e = crate::snapshot::Enc::new();
+            Some(match m.get(&fd)? {
+                Special::Event(ev) => {
+                    e.bool(ev.semaphore);
+                    e.bool(ev.nonblock);
+                    Export {
+                        kind: kind::EVENTFD,
+                        state: e.into_bytes(),
+                        companions: vec![ev.wfd, ev.mfd],
+                        placeholder: false,
+                    }
+                }
+                Special::Timer(t) => {
+                    e.u64(t.clock as u64);
+                    e.bool(t.nonblock);
+                    for v in [t.interval.0, t.interval.1, t.value.0, t.value.1] {
+                        e.i64(v);
+                    }
+                    e.bool(t.first_at_ns.is_some());
+                    e.i64(t.first_at_ns.unwrap_or(0));
+                    e.i64(t.period_ns);
+                    e.u64(t.taken);
+                    Export {
+                        kind: kind::TIMERFD,
+                        state: e.into_bytes(),
+                        companions: Vec::new(),
+                        placeholder: true,
+                    }
+                }
+            })
+        })
+    }
+
+    pub(super) fn import(
+        kind: u8,
+        fd: i32,
+        d: &mut crate::snapshot::Dec,
+        companions: Vec<i32>,
+    ) -> bool {
+        if kind == crate::scm::kind::EVENTFD {
+            let [wfd, mfd] = companions[..] else {
+                for c in companions {
+                    // SAFETY: descriptors received for this eventfd.
+                    unsafe { libc::close(c) };
+                }
+                return false;
+            };
+            let close = |fd: i32| {
+                // SAFETY: a descriptor received for this eventfd.
+                unsafe { libc::close(fd) };
+            };
+            let Ok(wfd) = crate::fdtable::reserve(wfd) else {
+                close(mfd);
+                return false;
+            };
+            let Ok(mfd) = crate::fdtable::reserve(mfd) else {
+                close(wfd);
+                return false;
+            };
+            let Ok(shared) = map_shared(mfd) else {
+                // SAFETY: fwe's own descriptors, received above.
+                unsafe {
+                    libc::close(wfd);
+                    libc::close(mfd);
+                }
+                return false;
+            };
+            let ev = EventFd { rfd: fd, wfd, mfd, shared, semaphore: d.bool(), nonblock: d.bool() };
+            with_reg(|m| m.insert(fd, Special::Event(ev)));
+            return true;
+        }
+        // A timerfd: a kqueue of the receiver's in the placeholder's place,
+        // on the sender's schedule.
+        // SAFETY: plain host call.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 || !crate::scm::replace(fd, kq) {
+            return false;
+        }
+        let t = TimerFd {
+            kq: fd,
+            clock: d.u64() as libc::clockid_t,
+            nonblock: d.bool(),
+            interval: (d.i64(), d.i64()),
+            value: (d.i64(), d.i64()),
+            first_at_ns: {
+                let (on, at) = (d.bool(), d.i64());
+                on.then_some(at)
+            },
+            period_ns: d.i64(),
+            taken: d.u64(),
+        };
+        t.arm(now_ns());
+        with_reg(|m| m.insert(fd, Special::Timer(t)));
+        true
     }
 
     pub(super) fn writable(fd: i32) -> bool {
@@ -559,12 +711,22 @@ mod imp {
                 libc::fcntl(rfd, libc::F_SETFL, libc::fcntl(rfd, libc::F_GETFL) | libc::O_NONBLOCK)
             };
         }
-        let (shared, mapped) = new_shared(initval);
+        let (mfd, shared) = match new_shared(initval) {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY: closing the pipe made above.
+                unsafe {
+                    libc::close(rfd);
+                    libc::close(wfd);
+                }
+                return err(e);
+            }
+        };
         let ev = EventFd {
             rfd,
             wfd,
+            mfd,
             shared,
-            mapped,
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: flags & EFD_NONBLOCK != 0,
         };
@@ -925,11 +1087,10 @@ mod imp {
                 Special::Event(e) => {
                     libc::close(e.rfd);
                     libc::close(e.wfd);
+                    libc::close(e.mfd);
                     // This process's mapping of the counter (another that
                     // shares it keeps its own).
-                    if e.mapped {
-                        libc::munmap(e.shared as *mut libc::c_void, std::mem::size_of::<Shared>());
-                    }
+                    libc::munmap(e.shared as *mut libc::c_void, std::mem::size_of::<Shared>());
                 }
                 Special::Timer(t) => {
                     libc::close(t.kq);

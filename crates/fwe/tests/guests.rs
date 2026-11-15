@@ -1057,6 +1057,25 @@ fn received_descriptors_close_on_exec_when_asked() {
     c_guest_prints("scmrights", &["cloexec"], "close-on-exec as asked\n");
 }
 
+/// Linux's 253 descriptors go in one message, one more is refused, and
+/// descriptors the receiver has no room for are closed.
+#[test]
+fn descriptors_pass_as_many_as_linux_passes() {
+    c_guest_prints("scmrights", &["many"], "received 253\n");
+    c_guest_prints("scmrights", &["truncated"], "kept 2, truncated 1, end of pipe 0\n");
+}
+
+/// An eventfd, timerfd, signalfd, netlink socket and process descriptor
+/// passed to another process work there as they do in their maker.
+#[test]
+fn emulated_descriptors_work_where_they_are_passed() {
+    c_guest_prints(
+        "scmrights",
+        &["emulated"],
+        "timerfd: 8 1\nsignalfd: 128 signal 10\nnetlink: answered 1\npidfd: 1\neventfd: 5\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
