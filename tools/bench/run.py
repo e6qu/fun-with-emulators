@@ -548,8 +548,8 @@ def pcs(name, cmd):
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
-    # then runs `cmd` in its place: DTrace ends itself once it exits, and
-    # writes what it gathered.
+    # then runs `cmd` in its place. Once it exits, DTrace is interrupted
+    # and writes what it gathered.
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -557,7 +557,6 @@ def pcs(name, cmd):
               'syscall:::entry /execname == "fwe"/ { self->t = timestamp; } '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
-              f'proc:::exit /pid == {proc.pid}/ {{ exit(0); }} '
               'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
@@ -575,11 +574,17 @@ def pcs(name, cmd):
             regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip(),
                             " ".join(line.split())))
     proc.wait(timeout=300)
+    # DTrace itself, sudo's child: sudo passes on no signal from a process
+    # of its own process group, as this one is.
+    dtrace = subprocess.run(["pgrep", "-P", str(tracer.pid)], capture_output=True,
+                            text=True).stdout.split()
+    subprocess.run(["sudo", "-n", "kill", "-INT"] + dtrace, capture_output=True)
     try:
         said = tracer.communicate(timeout=60)[0]
     except subprocess.TimeoutExpired:
-        subprocess.run(["sudo", "-n", "kill", "-KILL", str(tracer.pid)], capture_output=True)
-        sys.exit(f"{name}: DTrace did not end when the program did")
+        subprocess.run(["sudo", "-n", "kill", "-KILL"] + dtrace, capture_output=True)
+        said = tracer.communicate()[0]
+        sys.exit(f"{name}: DTrace did not end when interrupted: {said.strip()[-2000:]}")
     counts, calls = [], []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
@@ -803,6 +808,10 @@ def workloads(a, fwe, guest_env, lua_src, results):
         print(f"git --version from a shell, {side}: {(time.perf_counter() - t) / 50 * 1e3:.2f} ms each",
               file=sys.stderr)
     workload(results, "xz (s)", *script("xz.sh", "/usr/bin/xz", brew["xz"]), fresh, at)
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    pcs("xz (s)", script("xz.sh", "/usr/bin/xz", brew["xz"])[0])
     shutil.rmtree(native, ignore_errors=True)
 
 
