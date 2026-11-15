@@ -1,9 +1,9 @@
 # Alpine Linux test fixtures
 
-The container and debugger tests use Alpine Linux, whose `aarch64` builds
-of the container tools and debuggers are position-independent, so they
-run in fwe's native backend (Debian's podman, containerd and runc are
-not, and would need the VM). Nothing is vendored here.
+The container, debugger, Wine and benchmark tests use Alpine Linux, whose
+`aarch64` builds are position-independent and so run in fwe's native
+backend (Debian's podman, containerd and runc are not, and need the VM).
+Nothing is vendored here.
 
 ## Fetched, not vendored
 
@@ -11,9 +11,9 @@ Each file in `fetch/` lists what one test downloads from
 `https://dl-cdn.alpinelinux.org/alpine/`: a path under that URL and the
 file's SHA-256. The test checks each checksum, unpacks the files in order
 into its root filesystem and caches them under `target/fetched-packages`
-(`FWE_FETCH_CACHE` overrides it; CI caches it). Alpine 3.20 is past its end
-of life, so its files no longer change; 3.24 (Wine's) is supported, and a
-rebuilt package fails its checksum.
+(`FWE_FETCH_CACHE` overrides it; CI caches it). Alpine 3.20 is past its
+end of life, so its files do not change; 3.24 is supported, and a rebuilt
+package there fails its checksum.
 
 | Manifest | Contents | Size |
 | --- | --- | --- |
@@ -24,6 +24,7 @@ rebuilt package fails its checksum.
 | `fetch/podman-further.txt` | What `podman.txt` lists, distribution's registry 2.8.3 (`docker-registry`), and shadow's `newuidmap`/`newgidmap` with their libraries (shadow-libs, libbsd, libmd, linux-pam, skalibs, utmps) | 31 MB |
 | `fetch/wine.txt` | The 3.24.4 minirootfs (the test's root) and Wine 11.0, its Windows modules ARM64 PE (and its x86 and ARM64EC parts, unused) | 76 MB |
 | `fetch/clang.txt` | The 3.24.4 minirootfs and clang 22 with LLVM's libraries, binutils 2.45, musl's headers, make 4.4 and GCC 15.2 (whose start files and libgcc clang links with; GCC's own compilers are not position-independent and are not run), and their libraries (gmp, mpfr, mpc, isl, jansson, libstdc++, libgcc, libatomic, libgomp, libffi, libxml2, xz, zlib, zstd), for the benchmarks' C build (`tools/bench/run.py`, which also fetches Lua 5.4.7's source from lua.org, MIT) | 170 MB |
+| `fetch/workloads.txt` | The 3.24.4 minirootfs with SQLite 3.53, git 2.54, xz 5.8 and Python 3.14, and their libraries (libcurl, OpenSSL, nghttp2, c-ares, brotli, libidn2, libunistring, libpsl, pcre2, zlib, zstd, expat, bzip2, libffi, gdbm, mpdecimal, readline, ncurses, libgcc, libstdc++, ca-certificates), for the benchmarks' workloads (`tools/bench/run.py`) | 25 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
 
 ## License
@@ -52,6 +53,8 @@ readline and gdbm GPL-3.0-or-later; ncurses X11; expat, libffi and musl MIT;
 libstdc++ GPL-2.0-or-later and LGPL-2.1-or-later; OpenSSL Apache-2.0;
 mpdecimal BSD-2-Clause; musl-fts BSD-3-Clause; zlib Zlib; zstd BSD-3-Clause
 or GPL-2.0-or-later; xz-libs GPL-2.0-or-later, 0BSD, public domain and
-LGPL-2.1-or-later; bzip2 bzip2-1.0.6;
+LGPL-2.1-or-later; bzip2 bzip2-1.0.6; git GPL-2.0-only; libcurl curl;
+nghttp2, c-ares, brotli and libpsl MIT; libidn2 and libunistring
+GPL-2.0-or-later or LGPL-3.0-or-later; ca-certificates MPL-2.0 and MIT;
 the minirootfs's packages (BusyBox GPL-2.0-only, musl MIT, and others) their
 own.

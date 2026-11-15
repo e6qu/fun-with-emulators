@@ -1,94 +1,33 @@
 # Linux on macOS
 
-## Summary
-
-fwe runs Linux programs built for arm64 on a Mac with Apple Silicon. Both
-sides use the same processor, so a Linux program's instructions run on the
-Mac's CPU as they are. What differs is the kernel: a Linux program asks for
-files, memory, processes and signals in Linux's terms and expects to hear
-back in Linux's terms about key strokes, children ending, data arriving and
-errors. fwe stands in for that kernel: it catches each request, carries it
-out with what macOS offers, and turns what macOS reports into what Linux
-would have said.
+fwe runs arm64 Linux programs on Apple Silicon Macs. Both systems use the
+same processor, so a Linux program's instructions run on the Mac's CPU
+as they are; what differs is the kernel. fwe stands in for Linux's: it
+catches each system call, carries it out with what macOS offers, and
+turns what macOS reports (key strokes, children ending, data arriving,
+errors) into what Linux would have said.
 
 fwe runs a program one of two ways, chosen per program:
 
-- **The native backend** runs it inside the fwe process. Before any of its
-  code runs, fwe rewrites the few instructions macOS cannot let a Linux
-  program execute: the system-call instruction, accesses to the thread
-  pointer, and uses of `x18`. Everything else runs unmodified.
-- **The VM backend** runs it in a small virtual machine made with
-  Hypervisor.framework, with an address space of its own and nothing
-  rewritten; each system call leaves the VM and is served by the same code
-  as natively. It is used only for programs the native backend cannot
-  place in memory: non-position-independent executables linked below
-  4 GiB.
+- **The native backend** runs it inside the fwe process. Before its code
+  runs, fwe rewrites the few instructions macOS cannot let a Linux
+  program execute (the system-call instruction, thread-pointer accesses,
+  uses of `x18`), one instruction to a branch to a stub. Everything else
+  runs unmodified.
+- **The VM backend** runs it unmodified in a small Hypervisor.framework
+  VM with an address space of its own. Each system call leaves the VM and
+  is served by the same code as natively. It is used for programs the
+  native backend cannot place in memory: non-position-independent
+  executables linked below 4 GiB.
 
-This document covers how a program gets to run (which backend, what it
-costs, how languages fare, which instructions are rewritten, how the VM is
-used), then both directions of the mapping:
-
-- **[Linux to macOS](#linux-to-macos)**: for each Linux primitive, what
-  Linux does, what macOS has, and what fwe does.
-- **[macOS to Linux](#macos-to-linux)**: what happens on the host (a
-  signal, a key stroke, a child ending, a file changing, a clock, an
-  error) and what the guest sees of it.
-
-How fwe's parts are built is in [architecture.md](architecture.md), where
-fwe still differs from Linux in its
-[known limitations](architecture.md#known-limitations), and running the VM
-backend, its safety rules and its tests in [hypervisor.md](hypervisor.md).
-
-## Contents
-
-- [Two kernels, one CPU](#two-kernels-one-cpu)
-- [Which binaries run where, and why](#which-binaries-run-where-and-why)
-- [Which binaries need the least translation](#which-binaries-need-the-least-translation)
-- [Languages and runtimes](#languages-and-runtimes): C and C++, musl,
-  Rust, Go, Python, Node.js, Java, Wine
-- [Which instructions get translated, and how](#which-instructions-get-translated-and-how)
-- [How the VM is actually used](#how-the-vm-is-actually-used)
-- [Linux to macOS](#linux-to-macos)
-  - [Where a system call runs](#where-a-system-call-runs): how a call
-    reaches fwe under each backend, and how fwe carries it out
-  - [System calls by category](#system-calls-by-category)
-  - [The CPU](#the-cpu): system call entry and return, registers and
-    errno, TLS, `x18`, cache maintenance, PAC and BTI, auxv and hwcaps,
-    the vDSO
-  - [Memory](#memory): layouts, pages and translation, the `mmap` family,
-    write+exec memory, shared memory
-  - [Processes](#processes): `fork`, `vfork`, threads and futexes,
-    `execve`, the ELF loader, `wait`, `ptrace`
-  - [Signals](#signals): numbers, dispositions, masks and frames, sending
-  - [Files and descriptors](#files-and-descriptors), [/proc, /sys and
-    /dev](#proc-sys-and-dev)
-  - [Waiting and events](#waiting-and-events): `epoll`, `eventfd`,
-    `timerfd`, `signalfd`, inotify, pidfds
-  - [IPC](#ipc): sockets, System V IPC, POSIX message queues, keyrings
-  - [Kernel-wide state](#kernel-wide-state),
-    [namespaces](#namespaces), [cgroups](#cgroups), [mounts](#mounts),
-    [credentials and capabilities](#credentials-and-capabilities),
-    [seccomp](#seccomp), [security modules](#security-modules-selinux-apparmor-landlock),
-    [seccomp profiles](#seccomp-profiles), [eBPF](#ebpf),
-    [isolation and security](#isolation-and-security), [devices](#devices)
-  - [Time, scheduling and limits](#time-scheduling-and-limits)
-  - [Not available](#not-available)
-- [macOS to Linux](#macos-to-linux)
-  - [Host signals](#host-signals): how one reaches a guest handler,
-    `siginfo` and senders, signals with no counterpart, each signal's
-    source
-  - [Faults in guest code](#faults-in-guest-code)
-  - [Terminals and key strokes](#terminals-and-key-strokes): Ctrl-C,
-    Ctrl-Z, Ctrl-\\, Ctrl-T, window size, `termios`, job control, ptys
-  - [Children ending](#children-ending): `SIGCHLD`, wait statuses,
-    [orphans and reapers](#orphans-and-reapers)
-  - [A process killed from the host](#a-process-killed-from-the-host)
-  - [Files changing on the host](#files-changing-on-the-host)
-  - [Network events](#network-events)
-  - [Clocks and timers](#clocks-and-timers)
-  - [Memory pressure](#memory-pressure)
-  - [Errors](#errors)
-  - [Host identity and machine state](#host-identity-and-machine-state)
+This document covers which backend runs what and at what cost, how
+languages fare, which instructions are rewritten and how the VM is used,
+then both directions of the mapping: [Linux to macOS](#linux-to-macos)
+(for each Linux primitive, what Linux does, what macOS has, what fwe
+does) and [macOS to Linux](#macos-to-linux) (what happens on the host and
+what the guest sees). How fwe's parts are built, and where fwe still
+differs from Linux, is in [architecture.md](architecture.md); running the
+VM backend safely is in [hypervisor.md](hypervisor.md).
 
 ## Two kernels, one CPU
 
@@ -141,37 +80,33 @@ and share the rest:
 ## Which binaries run where, and why
 
 fwe picks a backend for each program from its ELF headers alone, because
-of how the two kernels lay out a process's memory.
+the two kernels lay out a process's memory differently.
 
 ### The low 4 GiB
 
-On Linux an arm64 process owns its whole lower address space. A program
-that is not position-independent (an `ET_EXEC` file) runs only at the
-address it was linked for: the usual toolchains use `0x400000` (4 MiB), Go
-uses `0x10000` (64 KiB) for static programs.
-
-macOS gives every arm64 process a mandatory 4 GiB `__PAGEZERO` at address
-0, so nothing can be mapped below 4 GiB, and Apple's loader refuses a
-smaller one. The native backend runs the guest at the guest's own
-addresses inside the fwe process, so a program linked below 4 GiB has
-nowhere to go there. A position-independent program (`ET_DYN`, a PIE) goes
-wherever macOS has room, and an `ET_EXEC` program linked at or above 4 GiB
-at its own address.
+On Linux an arm64 process owns its whole lower address space. A
+non-position-independent program (`ET_EXEC`) runs only at its link
+address: the usual toolchains use `0x400000` (4 MiB), Go uses `0x10000`
+(64 KiB) for static programs. macOS gives every arm64 process a
+mandatory 4 GiB `__PAGEZERO` at address 0, which Apple's loader will not
+shrink. The native backend runs the guest at the guest's own addresses
+inside the fwe process, so a program linked below 4 GiB has nowhere to
+go there. A position-independent program (`ET_DYN`, a PIE) goes wherever
+macOS has room, and an `ET_EXEC` program linked at or above 4 GiB at its
+own address.
 
 ### How fwe decides
 
 `needs_vm` (`crates/native/src/lib.rs`) asks one question: is this a
 non-PIE executable whose lowest loaded page lies below 4 GiB? If so it
-runs in the VM, otherwise natively. `fwe --vm` runs every program of the
-run in the VM instead (each fwe it starts is given `--vm` too), for
-programs that need 4 KiB pages, such as Wine; a position-independent one
-is placed in the slab. Static or dynamic, glibc or musl, C,
-Rust or Go make no difference. A guest's `execve` of such a program where
-there is no VM to run it (no stand-in, and fwe without the hypervisor
-entitlement or the Mac without `kern.hv_support`, both asked of the
-kernel) fails with `ENOEXEC` while the caller is intact, so it can go on:
-podman's pause process, whose `catatonit` is one, then waits in a loop of
-its own.
+runs in the VM, otherwise natively. Static or dynamic, glibc or musl, C,
+Rust or Go make no difference. `fwe --vm` runs every program of the run
+in the VM (each fwe it starts gets `--vm` too), for programs that need
+4 KiB pages, such as Wine; a PIE is then placed in the slab. Where there
+is no VM to run such a program (fwe without the hypervisor entitlement,
+or a Mac without `kern.hv_support`, and no stand-in), a guest's `execve`
+of one fails with `ENOEXEC` and the caller goes on: podman's pause
+process, whose `catatonit` is one, then waits in a loop of its own.
 
 ```mermaid
 flowchart TD
@@ -190,14 +125,12 @@ flowchart TD
 | non-PIE linked below 4 GiB, dynamic | Debian's `python3.11`, GCC and clang, at `0x400000` | VM |
 | non-PIE linked below 4 GiB, static | static Go programs at `0x10000`; fwe's `rust-low` test guests | VM |
 
-"Low-linked" in this documentation and the tests means the last two rows.
-The test suite builds its Rust guests twice: at 1 TiB to run natively, and
-at the toolchain's default address (`target/guests/rust-low`) to run the
-same programs in the VM.
-
-The VM backend needs `fwe` signed with the hypervisor entitlement and a
-bare-metal Mac; without them a low-linked program fails to start with a
-message saying so and status 126
+"Low-linked" in this documentation and the tests means the last two
+rows. The test suite builds its Rust guests twice: at 1 TiB to run
+natively, and at the toolchain's default address
+(`target/guests/rust-low`) to run in the VM. A low-linked program started
+without the hypervisor entitlement or on a Mac without hardware
+virtualization fails with a message saying so and status 126
 ([hypervisor.md](hypervisor.md#running-it-apple-silicon-no-root)).
 
 ### The dynamic linker
@@ -225,89 +158,46 @@ replaces it in place. What crosses is under [execve](#execve).
 Every system call leaves guest code and enters fwe. Beyond that, the two
 backends charge for different things; none of it changes what a program
 computes, only how much fwe does at load time and how often the guest
-stops running its own code.
-
-### What the native backend charges for
-
-- **Preparing code is a one-time scan** of each executable section the
-  program and its libraries map, as it is mapped executable. Under
-  `--strace` fwe notes for the program and its dynamic linker
-  `prepared exe <addr>+<len>: N system calls, M stubs, K x18 uses left
-  unrewritten` (`interp` for the dynamic linker). An image without an
-  unwind table has every executable byte taken as code, which is slower
-  and less precise ([What is scanned](#what-is-scanned)).
-- **`svc #0`** branches to a stub that calls fwe's system-call gate: a
-  plain call costs a function call into fwe and back, no trap and no host
-  signal (`getpid` about 150 ns). Where no stub can be placed it is a
-  `brk` instead, which costs a trap each time it runs.
-- **`TPIDR_EL0` and `x18` instructions** branch to a short stub and back:
-  a few extra instructions per execution, no trap. Linux toolchains seldom
-  allocate `x18`, and a handful of absurd `x18` forms are left alone
-  ([What is not translated](#what-is-not-translated)).
-- **`CTR_EL0`** is emulated in fwe's `SIGILL` handler: C libraries read it
-  once at startup; code that reads it often pays a trap each time.
-- **Write+exec memory** costs two faults per round trip between writing
-  and running a page ([Write+exec memory](#writeexec-memory)).
-- **`fork`** is a host `fork` with copy-on-write memory, after fwe has
-  paused the parent's other guest threads ([fork](#fork)).
-
-### What the VM backend charges for
-
-Nothing is rewritten or scanned; the costs move elsewhere:
-
-- **Every system call and exception is a VM exit** (faults, `brk`, a
-  trapped `CNTPCT_EL0` read, `wfi`/`wfe`), with the vCPU's registers read
-  and written through the framework.
-- **Memory calls edit page tables**, and one that takes access away
-  (`munmap`, a narrowing `mprotect`) has every vCPU invalidate its TLBs
-  before it resumes.
-- **A private file mapping is a copy** of the file's data taken when
-  mapped.
-- **`fork` sends a new fwe process every page of guest memory that
-  exists**, with the parent's vCPUs stopped; `vfork` fetches pages on
-  first touch instead ([fork](#fork)). **`execve`** always re-executes fwe
-  with a new VM.
-
-### Choosing, and what runs best
-
-fwe picks the backend from the binary, so the practical choice is how a
-program is built:
+stops running its own code:
 
 | Program trait | Native | VM |
 |---|---|---|
 | static | one image prepared | loaded as is |
-| dynamic | the dynamic linker and each library prepared as mapped | loaded as is; private file mappings copied |
-| system call | a call into fwe's gate (a `brk` trap for what changes more than `x0`) | a vCPU exit and register transfers |
+| dynamic | the dynamic linker and each library prepared as mapped; what a file's preparation found is kept on disk, so later starts only replay it ([When code is prepared](#when-code-is-prepared)) | loaded as is; private file mappings copied |
+| system call | a function call into fwe's gate; a trap for a call that changes more than `x0`, and for an `svc` with no stub in reach | a VM exit and register transfers |
 | thread-local variables (`TPIDR_EL0`) | a stub branch per access | the hardware register |
-| code using `x18` | a stub branch per use | the hardware register |
-| reading `CTR_EL0` | a trap per read | read by the guest |
+| code using `x18` | a stub branch per use (a few Linux toolchains allocate it) | the hardware register |
+| reading `CTR_EL0` | a trap per read (C libraries read it once) | read by the guest |
 | reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
-| JIT, write+exec pages | a fault per switch between writing and running | no faults |
-| `mmap`/`munmap` heavy | host calls | page-table edits, TLB invalidation on unmap |
-| `fork` heavy | host `fork`, copy-on-write | new process, all memory copied |
-| `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | new process fetching pages, then a re-exec |
+| JIT, write+exec pages | a fault per switch between writing and running ([Write+exec memory](#writeexec-memory)) | no faults |
+| `mmap`/`munmap` heavy | host calls | page-table edits; a TLB invalidation on every vCPU when access is taken away |
+| `fork` heavy | host `fork`, copy-on-write, after pausing the other guest threads ([fork](#fork)) | a new fwe process sent every page of guest memory that exists |
+| `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | a new process fetching pages as touched, then a re-exec |
 
 A program runs with the least translation when it is position-independent
-(so a system call does not leave a VM), keeps its code apart from its data
-in sections the unwind table describes (as compiler output does), leaves
-`x18` alone, and does not switch pages between writing and executing. A
-program that runs in the VM pays nothing for its code; its costs grow with
-its system calls, memory mapping and forks.
+(so its system calls do not leave a VM), keeps its code apart from its
+data in sections the unwind table describes (as compiler output does;
+without an unwind table every executable byte is taken as code, see
+[What is scanned](#what-is-scanned)), leaves `x18` alone, and does not
+switch pages between writing and executing. A program in the VM pays
+nothing for its code; its costs grow with its system calls, memory
+mapping and forks. Under `--strace` fwe notes for the program and its
+dynamic linker `prepared exe <addr>+<len>: N system calls, M stubs, K x18
+uses left unrewritten` (`interp` for the dynamic linker).
 
 ### Examples
 
-Most of these are what fwe's end-to-end tests run
-(`crates/fwe/tests/guests.rs`, binaries described in
-`guests/debian/README.md`, `guests/alpine/README.md` and the fetch
-manifests beside them); rows marked "not tested by fwe" name software only
-for a well-known property that puts it in the category.
+Most rows are what fwe's end-to-end tests run (`crates/fwe/tests/guests.rs`;
+binaries described in `guests/debian/README.md` and
+`guests/alpine/README.md`); rows marked "not tested by fwe" name software
+for a well-known property only.
 
 | Category | Software | Why it is there |
 |---|---|---|
-| native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once as mapped; the rewrites are system calls and thread-pointer accesses |
+| native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once, then prepared from fwe's record; the rewrites are system calls and thread-pointer accesses |
 | native, Go built as PIE | Alpine's podman (building, pushing, pulling, rootless), containerd and Docker with BuildKit and Compose (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
-| native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries scanned once each |
+| native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries, each page's rewrites written only when it first runs |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
 | native, JIT | the JVM (not tested by fwe) | a large code cache and many threads; see [Java](#java-and-the-jvm) |
 | VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
@@ -315,38 +205,34 @@ for a well-known property that puts it in the category.
 | VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
 | VM, container engine | Debian's podman 4.3 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
 | fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
-| system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a trap natively or a VM exit |
+| system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a call into fwe's gate natively, a VM exit in the VM |
 | uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub, and JIT code's uses are not rewritten; in the VM `x18` is the guest's own |
 
 ## Languages and runtimes
 
 fwe runs machine code and does not distinguish languages. What differs is
 how their programs are linked, which decides the backend, and how their
-runtimes use threads, signals, memory and code generation. Where something
-is not tested by fwe, the text says so and infers only from mechanisms the
-code has.
+runtimes use threads, signals, memory and code generation.
 
 ### C and C++ on glibc
 
-The common case is a dynamic PIE naming `/lib/ld-linux-aarch64.so.1`. From
-the [dynamic linker](#the-dynamic-linker) on, glibc runs as on Linux:
-`ld.so` reads `/etc/ld.so.cache` and the libraries from the guest's root,
-maps them with fwe's `mmap`, applies relocations and RELRO, and sets the
-thread pointer with `msr tpidr_el0` (rewritten natively). `AT_SECURE` is
-0, so `LD_LIBRARY_PATH`, `LD_PRELOAD` and the rest act as on Linux. With
-no vDSO, `clock_gettime` and `gettimeofday` are real system calls. A
-low-linked glibc program runs the same way in the VM (tested with a small
-program and with Debian's Python, GCC and clang). C++ adds nothing fwe
-sees: `libstdc++` is one more library, and exceptions unwind in user
-space.
+The common case is a dynamic PIE naming `/lib/ld-linux-aarch64.so.1`.
+From the [dynamic linker](#the-dynamic-linker) on, glibc runs as on
+Linux: `ld.so` reads `/etc/ld.so.cache` and the libraries from the
+guest's root, maps them with fwe's `mmap`, applies relocations and RELRO,
+and sets the thread pointer with `msr tpidr_el0` (rewritten natively).
+`AT_SECURE` is 0, so `LD_LIBRARY_PATH`, `LD_PRELOAD` and the rest act as
+on Linux. With no vDSO, `clock_gettime` and `gettimeofday` are real system
+calls. A low-linked glibc program runs the same way in the VM (tested
+with Debian's Python, GCC and clang). C++ adds nothing fwe sees:
+`libstdc++` is one more library, and exceptions unwind in user space.
 
 ### musl and Alpine
 
-`/lib/ld-musl-aarch64.so.1` is musl's C library and dynamic linker in one;
-static musl programs have no interpreter. Both run natively when
+`/lib/ld-musl-aarch64.so.1` is musl's C library and dynamic linker in
+one; static musl programs have no interpreter. Both run natively when
 position-independent, as all of Alpine's are (tested: Alpine's root
-filesystem, busybox and the container engines). musl enters the kernel
-through the same `svc #0` as glibc.
+filesystem, busybox and the container engines).
 
 ### Rust
 
@@ -354,27 +240,26 @@ Rust programs are C-like to fwe. The default target
 (`aarch64-unknown-linux-gnu`) builds dynamic PIEs against glibc, which run
 natively; Debian's `rustc` and `cargo` build and test a project under fwe
 (tested). A static `aarch64-unknown-linux-musl` build is a PIE or not
-depending on how it is linked: fwe's test guests are non-PIE, linked with
-`ld.lld` at 1 TiB to run natively, and at the default address (the
-`rust-low` guests) to run in the VM (both tested). The standard library's
-threads and futexes go through libc.
+depending on how it is linked: fwe's test guests are non-PIE, linked at
+1 TiB to run natively and at the default address (`rust-low`) to run in
+the VM (both tested).
 
 ### Go
 
 Go's runtime makes system calls itself with `svc #0`, starts threads with
 `clone`, parks them on futexes, handles nearly every signal on an
 alternate stack, and preempts goroutines by sending `SIGURG` to a thread
-with `tgkill`. fwe meets these as for C: the `svc`s are rewritten (native)
-or trapped (VM), `clone` makes a host thread (with its own vCPU in the
-VM), and a `tgkill` of a caught signal is posted to that thread and the
-thread woken ([Sending a signal](#sending-a-signal)), which in the VM stops
-its vCPU even in a loop with no system calls.
+with `tgkill`. fwe meets these as for C: the `svc`s are rewritten
+(native) or trapped (VM), `clone` makes a host thread (with its own vCPU
+in the VM), and a `tgkill` is posted to that thread and the thread woken
+([Sending a signal](#sending-a-signal)), which in the VM stops its vCPU
+even in a loop with no system calls.
 
-Debian's Go 1.19 toolchain and the static executables it builds by default
-are linked low, non-PIE, and run in the VM (tested: `go` builds, runs and
-tests a module with goroutines). Go programs built as PIEs, as Alpine
-builds podman, containerd and Docker, run natively (tested). `go` starts its tools
-with `vfork`, supported in both backends.
+Debian's Go 1.19 toolchain and the static executables it builds by
+default are linked low and run in the VM (tested: `go` builds, runs and
+tests a module with goroutines; it starts its tools with `vfork`). Go
+programs built as PIEs, as Alpine builds podman, containerd and Docker,
+run natively (tested).
 
 ### Python and other interpreters
 
@@ -382,42 +267,40 @@ An interpreter is an ordinary program to fwe; its scripts are data.
 Debian's Python 3.11 is linked non-PIE at `0x400000` and runs in the VM;
 its test covers C extension modules, threads, sockets, asyncio, `ctypes`
 and libffi closures, signals, `fork`, `subprocess` and a process pool
-sharing POSIX semaphores through `/dev/shm`. A Python built as a PIE would
-run natively, as bash does (tested).
+sharing POSIX semaphores through `/dev/shm`. A Python built as a PIE runs
+natively, as bash does.
 
 ### Node.js and V8
 
 Debian's Node.js 18 is a dynamic PIE and runs natively (tested: V8's JIT
 on a hot function, ICU, OpenSSL digests, zlib, timers and promises, a
-child process, an HTTP server and client, and a worker thread). Each time
-a page of V8's generated code becomes executable, fwe prepares it as JIT
-code: system calls and thread-pointer accesses are rewritten, `x18` is
-not, which suits V8 since it reserves `x18`
-([What is scanned](#what-is-scanned)).
+child process, an HTTP server and client, and a worker thread). Each
+time a page of V8's generated code becomes executable, fwe prepares it as
+JIT code: system calls and thread-pointer accesses are rewritten, `x18`
+is not, which suits V8, since it reserves `x18`.
 
 ### Java and the JVM
 
-Not tested by fwe. Inferred from how a HotSpot JVM is generally built and
-from fwe's mechanisms:
+Not tested by fwe; inferred from how HotSpot is built and from fwe's
+mechanisms:
 
-- **Backend:** a `java` launcher built as a PIE, as Debian builds its
-  programs, runs natively; the JVM itself is a shared library
-  (`libjvm.so`).
-- **JIT code:** each page of HotSpot's code cache becomes executable
-  through an `mprotect` or a write+exec fault and is prepared as JIT code.
-  If the generated code uses `x18` (HotSpot reserves it only on platforms
-  that do, which Linux does not), those uses are not rewritten and lose
-  their value whenever macOS clears `x18`: the largest risk.
-- **Safepoints and null checks** rely on `SIGSEGV` from protected pages.
-  fwe delivers guest faults to the guest's handler with Linux's frame, and
-  turns the `SIGBUS` macOS reports for some protection faults into Linux's
-  `SIGSEGV` ([Faults in guest code](#faults-in-guest-code)).
-- **Threads and memory sizing:** many threads with futexes are supported.
-  The JVM sizes its heap from `sysinfo`, `/proc/meminfo` and cgroup
-  limits, which under fwe are fixed figures and unenforced limits
-  ([Memory pressure](#memory-pressure), [cgroups](#cgroups)).
-- **Tools:** attach mechanisms that use `ptrace` work between fwe
-  processes ([ptrace](#ptrace)), and so do `process_vm_readv`/`writev`.
+- **Backend:** a `java` launcher built as a PIE, as Debian builds it,
+  runs natively; the JVM itself is a shared library (`libjvm.so`).
+- **JIT code:** each page of the code cache is prepared as JIT code when
+  it becomes executable. HotSpot reserves `x18` only where the platform
+  does, which Linux does not; if generated code uses it, those uses are
+  not rewritten and lose their value whenever macOS clears `x18`: the
+  largest risk.
+- **Safepoints and null checks** rely on `SIGSEGV` from protected pages,
+  which fwe delivers with Linux's frame, turning the `SIGBUS` macOS
+  reports for some protection faults into `SIGSEGV`
+  ([Faults in guest code](#faults-in-guest-code)).
+- **Memory sizing:** the JVM sizes its heap from `sysinfo`,
+  `/proc/meminfo` and cgroup limits, which under fwe are fixed figures
+  and unenforced limits ([Memory pressure](#memory-pressure),
+  [cgroups](#cgroups)).
+- **Tools:** attach mechanisms that use `ptrace` or
+  `process_vm_readv`/`writev` work between fwe processes ([ptrace](#ptrace)).
 
 ### Wine
 
@@ -425,56 +308,50 @@ Tested: Alpine's arm64 Wine 11 runs under `fwe --vm` (in CI on the
 software stand-in for Hypervisor.framework). `wineboot` makes a prefix,
 `wine cmd /c` runs a batch command, and a C program built for ARM64
 Windows writes, reads and deletes a file, runs threads, has an exception
-taken by a vectored handler, and starts itself as a child process. How
-Wine meets fwe's mechanisms:
+taken by a vectored handler, and starts itself as a child process.
 
-- **Which Wine:** fwe runs only arm64 Linux code, so an arm64 build of
-  Wine, which runs Windows programs built for ARM64. x86 or x64 Windows
-  programs would need an x86 emulator inside the arm64 process (Wine on
-  arm64 can load one, such as FEX, through WoW64 and ARM64EC), or an x64
-  Wine under an emulator such as box64; fwe has no x86 emulation.
+- **Which Wine:** fwe runs only arm64 Linux code, so an arm64 Wine, which
+  runs Windows programs built for ARM64. x86 or x64 Windows programs need
+  an x86 emulator inside the arm64 process (Wine on arm64 can load one,
+  such as FEX, through WoW64 and ARM64EC), or an x64 Wine under an
+  emulator such as box64; fwe has no x86 emulation of its own.
 - **Backend:** Wine is position-independent throughout (the loader,
   `wineserver`, and `wine-preloader`, a static PIE that reserves the low
-  ranges Windows programs expect, with `MAP_FIXED`, before loading the
-  dynamic linker and Wine), so by default fwe would run it natively, with
+  ranges Windows programs expect with `MAP_FIXED` before loading the
+  dynamic linker and Wine), so by default it would run natively with
   16 KiB pages. Windows images assume 4 KiB pages, so Wine runs under
-  `fwe --vm`, which puts every program of the run in the VM, where pages
-  are 4 KiB. There a fixed mapping ending below fwe's code page near
-  1 TiB is accepted, backed by slab memory (translated outside the slab),
-  and one beyond it fails with `ENOMEM`. Each reservation, even
-  `PROT_NONE`, takes its size out of the slab, 7/16 of the guest-physical
-  space the host offers (28 GiB on an M1 or M2), but host memory only for
-  the pages touched; a reservation mapped over is zeroed only where its
-  pages held data.
-- **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`. In the
-  VM `x18` is the guest's own. Natively, ELF code using it goes through
-  stubs, and Windows code Wine loads and makes executable is treated as
-  JIT code, its `x18` uses unrewritten: another reason it belongs in the
-  VM.
+  `fwe --vm`. There a fixed mapping ending below fwe's code page near
+  1 TiB is backed by slab memory (translated outside the slab), and one
+  beyond it fails with `ENOMEM`. Each reservation, even `PROT_NONE`,
+  takes its size out of the slab (7/16 of the guest-physical space the
+  host offers: 28 GiB on an M1 or M2), but host memory only for the pages
+  touched; a reservation mapped over is zeroed only where its pages held
+  data.
+- **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`. In
+  the VM `x18` is the guest's own. Natively, Windows code Wine makes
+  executable would be treated as JIT code, its `x18` uses unrewritten:
+  another reason Wine belongs in the VM.
 - **wineserver** talks to Wine processes over Unix sockets, passing
   descriptors with `SCM_RIGHTS` (received descriptors are not held to
-  `RLIMIT_NOFILE`), and suspends threads with ordinary signals, which fwe
-  relays. It stays a while after its last client leaves; `wineserver -w`
-  waits for it.
+  `RLIMIT_NOFILE`), and suspends threads with ordinary signals. It stays
+  a while after its last client leaves; `wineserver -w` waits for it.
 - **Shared memory:** wineserver shares session and object memory through
   files it creates and unlinks, which Wine processes map private and
-  writable. On Linux such a mapping shows the file's later writes on each
-  page until the process writes that page itself; fwe gives a private
-  mapping of a file with no name the same behaviour
+  writable. fwe gives such a mapping Linux's behaviour: each page shows
+  the file's later writes until the process writes that page itself
   ([The mmap family](#the-mmap-family)).
-- **Signals:** Wine handles `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGTRAP` on
-  an alternate stack to emulate Windows exceptions; fwe delivers faults to
-  guest handlers with Linux frames and honours `sigaltstack`; in the VM a
-  misaligned pc or sp is `SIGBUS` and a `brk` is `SIGTRAP`.
-- **Fonts and display:** Alpine's Wine package does not depend on
-  FreeType or X11, and Wine says so on each run; console programs need
-  neither. Graphical programs are not planned.
+- **Signals:** Wine handles `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGTRAP`
+  on an alternate stack to emulate Windows exceptions; fwe delivers them
+  with Linux frames and honours `sigaltstack`.
+- **Display:** Alpine's Wine package does not depend on FreeType or X11,
+  and Wine says so on each run; console programs need neither. Graphical
+  programs, Linux's and Wine's, are not supported yet
+  ([roadmap](../ROADMAP.md)).
 
 ## Which instructions get translated, and how
 
 This section is about the native backend; the VM backend translates no
-instructions ([How the VM is actually used](#how-the-vm-is-actually-used)).
-The code that does it is described in
+instructions. The code that does it is described in
 [architecture.md](architecture.md#rewriting-guest-code).
 
 ### What runs unchanged
@@ -622,7 +499,7 @@ in `Xt` without the bits that let code skip cache maintenance
 
 ### When code is prepared
 
-Code is rewritten whenever guest memory is about to become executable,
+Code is prepared whenever guest memory is about to become executable,
 while it is still writable and before any thread can run it
 (`crates/native/src/prepare.rs`):
 
@@ -634,17 +511,30 @@ while it is still writable and before any thread can run it
 - **the first instruction fetch from write+exec memory**
   ([Write+exec memory](#writeexec-memory)).
 
-For code the host maps from its file, the instruction cache is
-invalidated for the pages fwe wrote only: it is walked a line at a time,
-and a page walked is a page read in, so a large library mostly not run
-(LLVM's, under a compiler) stays mostly unread. Code written as a whole
-(the loader's copies of a program, memory the guest wrote) is
-invalidated whole.
+Preparing is done once per file, not once per start, as Rosetta 2 keeps
+its translations. What a file's scan found (its code ranges from the
+section headers and unwind table, and the words rewritten or given
+stubs, with what they were) is kept in fwe's private directory by the
+file's device, inode, size and modification time
+(`crates/kernel/src/prepcache.rs`). A later mapping replays it, checking
+each word is still what it was and scanning again if not.
+
+A mapped file's rewrites are written to each page as it first runs, not
+when it is mapped (`crates/kernel/src/lazycode.rs`): a written page is a
+copied page, and a large library is mostly never run (a compile runs
+little of LLVM's). The stubs are written at once; the pages that owe
+rewrites are readable but not executable, so a read sees the file's own
+bytes, and the first instruction fetch there faults, has the page (and
+owed pages beside it) written, and gets the protections the guest asked
+for. The pages a run wrote are kept with the file's record, and the next
+start writes those as it prepares the code. The instruction cache is
+invalidated for what fwe wrote.
+
 Preparing code twice is harmless: a rewritten site no longer matches.
 fwe's own `rt_sigreturn` trampoline is written already rewritten, as
-`movz x8, #139; brk #0x4c58`: the trap, not a branch to a stub, since the
+`movz x8, #139; brk #0x4c58`: a trap, not a branch to a stub, since the
 trampoline is fwe's and outlives the program's memory (its stub regions
-included) across `execve`, and `rt_sigreturn` always takes the trap.
+included) across `execve`.
 
 ### What is scanned
 
@@ -772,14 +662,14 @@ could not use it) and turned into a host address
 
 ### Faults, breakpoints and other exits
 
-Every other exception the guest takes at EL0 goes through the same vector
-and `hvc`: an abort, a `brk`, a misaligned pc or sp, an unknown
-instruction. Each becomes the signal Linux would send, except an abort
-that is only a page not fetched yet (a `vfork` child's) or a stale TLB
-entry, which is fixed and retried. A stage-2 abort, `wfi`/`wfe` and a
-trapped system-register read exit the vCPU directly. The full list is
-under [Faults in guest code](#faults-in-guest-code), the run loop in
-[hypervisor.md](hypervisor.md#the-run-loop).
+Every other exception the guest takes at EL0 (an abort, a `brk`, a
+misaligned pc or sp, an unknown instruction) goes through the same vector
+and `hvc` and becomes the signal Linux would send, except an abort that
+is only a page not fetched yet (a `vfork` child's) or a stale TLB entry,
+which is fixed and retried. A stage-2 abort, `wfi`/`wfe` and a trapped
+system-register read exit the vCPU directly
+([Faults in guest code](#faults-in-guest-code),
+[hypervisor.md](hypervisor.md#the-run-loop)).
 
 ### Counters and timers
 
@@ -841,7 +731,7 @@ outside fwe cannot be intercepted
 ## Linux to macOS
 
 This part goes through Linux's primitives one by one, mostly in tables
-that read **Linux | macOS | fwe**. A few calls going in and the host calls
+that read **Linux | macOS | fwe**. Some calls going in and the host calls
 coming out:
 
 | Guest call (Linux) | What fwe does | Host call(s) (macOS) |
@@ -854,41 +744,31 @@ coming out:
 
 ### Where a system call runs
 
-No guest system call runs on a Linux kernel, for fwe has none, and none
-runs inside the VM, which holds only the guest's CPU state and memory.
-Under either backend every call is carried out by fwe's kernel crate, as
-ordinary macOS code in the guest's own fwe process. A backend decides
-how a call gets there, and carries out the few that change the process
-itself.
-
-**How a call reaches fwe:**
-
-| Backend | Path | What the path costs |
-|---|---|---|
-| native, most calls | each `svc #0` is rewritten into a branch to a stub that calls fwe's gate; the call runs on the guest thread's own host thread and returns straight to the guest when it changed only `x0` and the signal mask ([svc calls fwe's gate](#system-calls-svc-calls-fwes-gate)) | a function call: no exception, no host signal |
-| native, the rest | the gate takes a trap (`brk #0x4c5a`, fwe's `SIGTRAP` handler) for a call that changes the pc or `sp`, a signal to deliver, a traced or seccomp-filtered call, a new process, `execve` and the waits fwe runs outside its lock; where no stub fits within branch range, the `svc` itself is a `brk #0x4c58` | a host signal and its return |
-| VM, every call | the `svc` takes an exception to fwe's vector at EL1, which leaves the VM (`hvc #2`); the vCPU's host thread runs the call and resumes the vCPU after the `svc` ([A system call in the VM](#a-system-call-in-the-vm)) | a VM exit and re-entry |
-
-**How fwe carries a call out.** Each call's row in the tables of
-[System calls by category](#system-calls-by-category) names the host
-calls it makes; by mechanism:
+No guest system call runs on a Linux kernel, and none runs inside the
+VM, which holds only the guest's CPU state and memory. Under either
+backend every call is carried out by fwe's kernel crate, as ordinary
+macOS code in the guest's own fwe process, on the calling guest thread's
+host thread. Natively a call reaches it through fwe's gate
+([System calls: svc calls fwe's gate](#system-calls-svc-calls-fwes-gate)),
+in the VM through a VM exit ([A system call in the VM](#a-system-call-in-the-vm)).
+By mechanism:
 
 | Mechanism | What happens | For example |
 |---|---|---|
 | The same macOS call | arguments, flags, structures and errors translated, with Linux's checks first where macOS's differ | the `read` and `write` family, `lseek`, `fsync`, `flock`, `utimensat`, `unlinkat`, `listen`, `shutdown`, `getsockopt`, `sched_yield`, `getitimer`, `gettimeofday` |
 | Other macOS calls | a Linux primitive macOS lacks, built from others | `epoll` (a kqueue), `eventfd` and `signalfd` (a pipe), `timerfd` and `nanosleep` (kqueue timers), `renameat2` (`renameatx_np`), `getdents64` (`__getdirentries64`), `splice` and `sendfile` (copied through a buffer of fwe's), shared futexes and System V semaphores (`__ulock_wait2`, `__ulock_wake`), System V shared memory (a file, mapped), `getrandom` (`arc4random_buf`), `chown` (an extended attribute) |
-| fwe's own state, no macOS call | what Linux's kernel keeps and macOS has no counterpart for, or keeps once for the whole Mac | `getpid`, `gettid`, `umask`, the mount calls, `pivot_root`, credentials and capabilities, `unshare`, `setns`, `prctl`, scheduling policies, `personality`, `sigaltstack`, robust-futex lists, the `mlock` family, `sethostname`, `seccomp`, Landlock |
+| fwe's own state, no macOS call | what Linux's kernel keeps and macOS lacks, or keeps once for the whole Mac | `getpid`, `gettid`, `umask`, the mount calls, `pivot_root`, credentials and capabilities, `unshare`, `setns`, `prctl`, scheduling policies, `personality`, `sigaltstack`, robust-futex lists, the `mlock` family, `sethostname`, `seccomp`, Landlock |
 | Another fwe process | macOS lets no process reach another's memory or threads, so the target does the work, asked through its mailbox and woken by a signal | a signal that carries its sender or that macOS lacks, `tgkill` of another process's thread, `pidfd_getfd`, `process_vm_readv` and `process_vm_writev`, `ptrace`, `/proc/<pid>/mem` |
 | A thread of fwe's | something must happen when no guest thread is in a call | POSIX timers (a timer thread per process), the reaper's watch of the processes it adopted, the watch of the parent's end that `getppid` keeps |
 | The backend | the call makes, replaces or ends a process or thread, or changes its memory | `clone` and `clone3`, `execve` and `execveat`, `exit`, `exit_group`, `wait4`, `waitid`, `rt_sigreturn`, `rt_sigtimedwait`, `pidfd_getfd`, and the `mmap` family |
 | Not dispatched | `ENOSYS` | [Not available](#not-available) |
 
-**What differs in the VM.** The kernel crate is the same; what the
-backend does for it is not:
+The kernel crate is the same in both backends; what the backend does for
+it is not:
 
 | | Native | VM |
 |---|---|---|
-| Pointer arguments | guest addresses are fwe's own, read and written through copies that fail with `EFAULT` rather than crash | each is checked against the guest's mappings and turned into the host address of its slab page ([Pages and translation](#pages-and-translation)) |
+| Pointer arguments | guest addresses are fwe's own, read and written through copies that fail with `EFAULT` rather than crash | each checked against the guest's mappings and turned into the host address of its slab page ([Pages and translation](#pages-and-translation)) |
 | The `mmap` family | host `mmap`, `mprotect` and `munmap` at the guest's addresses | the guest's slab pages and stage-1 page tables, the TLB flushed; a `MAP_SHARED` segment is a host `mmap` |
 | A new thread | a host thread, taken from fwe's waiting ones when there is one | a host thread with a vCPU of its own |
 | `fork`, `vfork` | host `fork` ([fork](#fork)) | a fresh fwe process, sent the parent's memory and kernel state |
@@ -897,27 +777,24 @@ backend does for it is not:
 
 ### System calls by category
 
-Every guest system call reaches fwe's kernel
-([System call entry](#system-call-entry)), which handles it in one of
-three ways: it passes the call to the host with its flags, structures
-and errors translated; it serves the call itself from state it keeps
-(mounts, namespaces, credentials, System V objects, `/proc`); or it does
-both, building Linux's behaviour out of several host calls. The tables
-below name, category by category, what fwe does with each call and which
-host calls it makes; the sections after them explain the larger
-mechanisms. A call not listed here is not dispatched and fails with
-`ENOSYS` ([Not available](#not-available)).
+The tables below name, category by category, what fwe does with each
+call and which host calls it makes; the sections after them explain the
+larger mechanisms. The calls that can block run without fwe's kernel
+lock (`blocking_call` in `crates/kernel/src/lib.rs`). In the VM, pointer
+arguments are translated to host addresses first; otherwise a call
+behaves the same in both backends unless its row says so. A call not
+listed fails with `ENOSYS` ([Not available](#not-available)).
 
 #### File calls
 
 fwe resolves every guest path itself and hands the host one component to
-open from a directory it holds, or a run of components the host must
-follow no link in ([Files and descriptors](#files-and-descriptors));
-the descriptor the host returns is the guest's, so I/O goes to the host on
-it directly. fwe steps in for descriptors it stands in for (`/proc` and
-`/sys` files, loop devices, eventfd and the like), for metadata the host
-keeps differently (modes, owners, device numbers), and for Linux results the
-host reports differently.
+open from a directory it holds, or a run of components in which the host
+must follow no link ([Files and descriptors](#files-and-descriptors)).
+The descriptor the host returns is the guest's, so I/O goes to the host
+on it directly. fwe steps in for descriptors it stands in for (`/proc`
+and `/sys` files, loop devices, eventfd and the like), for metadata the
+host keeps differently (modes, owners, device numbers), and for results
+the host reports differently.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
@@ -956,30 +833,26 @@ host reports differently.
 | `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. A run starts in the directory fwe was started in (under `--root`, its path in the root, or `/` where it lies outside). Search permission checked. | `openat` (to check), `fcntl(F_GETPATH)` |
 | `umask` | Kept and applied by fwe; fwe's host umask is 0. | none |
 
-**`openat`**: after resolution, an existing file is checked against
-the caller's credentials, a lease on it is broken, and a file a running
-program uses fails a write open with `ETXTBSY`. `O_CREAT` is first tried
-with `O_EXCL`, so fwe knows whether it made the file and records its owner
-and mode. `O_PATH`, which the host lacks, is a read-only non-blocking
-open; a FIFO, symlink, device or socket the host cannot open that way gets
-a stand-in (`/dev/null`) that names it. `O_TMPFILE` makes a file under a
-hidden name in the directory. A FIFO open that waits for the other end
-runs without the kernel lock (`crates/kernel/src/lib.rs`,
-`blocking_call`). Linux flags the host lacks (`O_DIRECT`, `O_NOATIME`,
-`O_LARGEFILE`, `O_ASYNC`) are not passed (`host::open_flags_to_host`);
-`O_NOATIME` is kept by fwe.
+**`openat`**: an existing file is checked against the caller's
+credentials, a lease on it is broken, and a write open of a file a
+running program uses fails with `ETXTBSY`. `O_CREAT` is first tried with
+`O_EXCL`, so fwe knows whether it made the file and records its owner and
+mode. `O_PATH`, which the host lacks, is a read-only non-blocking open; a
+FIFO, symlink, device or socket the host cannot open that way gets a
+stand-in (`/dev/null`) that names it. `O_TMPFILE` makes a file under a
+hidden name in the directory. Linux flags the host lacks (`O_DIRECT`,
+`O_NOATIME`, `O_LARGEFILE`, `O_ASYNC`) are not passed
+(`host::open_flags_to_host`); `O_NOATIME` is kept by fwe.
 
 **`fcntl`**: `F_GETFL`/`F_SETFL` and `F_GETFD`/`F_SETFD` are translated;
 `F_DUPFD` below the guest's limit only. Record locks and `F_OFD_*` locks
-are translated to the host's (macOS's private `F_OFD_*` numbers); the
-waiting forms run without the kernel lock. Owners (`F_SETOWN_EX`), the
-`F_SETSIG` signal, leases, pipe sizes, `F_CREATED_QUERY` and seals
-(`F_ADD_SEALS`, `F_GET_SEALS`) are fwe's own. Any other command is
-`EINVAL`.
+are translated to the host's (macOS's private `F_OFD_*` numbers). Owners
+(`F_SETOWN_EX`), the `F_SETSIG` signal, leases, pipe sizes,
+`F_CREATED_QUERY` and seals (`F_ADD_SEALS`, `F_GET_SEALS`) are fwe's own.
+Any other command is `EINVAL`.
 
 **`ioctl`**: fwe's loop devices, namespace descriptors and process
-descriptors answer their requests first. Terminal requests (`TCGETS`,
-`TCSETS*`, `TIOCGWINSZ`, `TIOCSPGRP` and the rest, see
+descriptors answer their requests first. Terminal requests (see
 [termios and terminal requests](#termios-and-terminal-requests)), network
 interface requests (`SIOCGIF*`) and `FIONREAD`, `FIONBIO`, `FIOCLEX`,
 `FIONCLEX`, `FIOASYNC` are translated; `FS_IOC_GETFLAGS`/`SETFLAGS` map
@@ -987,11 +860,6 @@ immutable, append-only and no-dump to the host's flags; `FICLONE`,
 `FICLONERANGE` and `FIDEDUPERANGE` are `EOPNOTSUPP`; `RNDGETENTCNT`
 reports 256; `PROCMAP_QUERY` on a `maps` file is fwe's. Any other request
 is `ENOTTY`.
-
-**`statx`**: built from the host's `stat` or fwe's record of a `/proc`,
-namespace or process descriptor, with the owner and mode fwe keeps;
-`STATX_MNT_ID` or `STATX_MNT_ID_UNIQUE` reports the mount the path is in
-from fwe's table.
 
 **`sendfile`**, **`copy_file_range`**: no host call copies between two
 descriptors of different kinds, so fwe reads into a buffer and writes it
@@ -1060,30 +928,6 @@ and the per-call differences are in [Address-space layout](#address-space-layout
 | `remap_file_pages` | The range of one shared file mapping mapped again at page `pgoff` of its file. | `open`, then `mmap` as above |
 | `membarrier` | Every command but the RSEQ ones; a barrier is an `mprotect` of a page of fwe's, which makes the host interrupt the process's other CPUs. | `mprotect` |
 
-**`mmap`**: a file offset must be a multiple of the backend's page size
-(16 KiB natively, 4 KiB in the VM). Natively, `MAP_SHARED` of an executable
-file is mapped private, since its code is rewritten, and
-`MAP_FIXED_NOREPLACE` is checked against where the host put the mapping
-(`EEXIST`). In the VM a private file mapping is a copy of the file's
-contents when mapped; a shared one is a segment, mapped into the VM once
-([The mmap family](#the-mmap-family)).
-
-**`mremap`**: natively a move takes the pages, contents and sharing with
-`mach_vm_remap`, including `MREMAP_FIXED` and `MREMAP_DONTUNMAP`, and
-growing a file mapping continues the same file; code (an executable
-mapping) is not grown or moved (`ENOMEM`). The VM grows and moves private
-memory only, and refuses `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`).
-
-**`madvise(MADV_DONTNEED)`**: macOS's own keeps the contents, so natively
-each private anonymous piece of the range is replaced by a fresh mapping of
-the same protection, which gives the memory back as Linux does; shared and
-file memory is left alone. Which pieces those are, and their protection,
-comes from fwe's record of the mappings; only code and poisoned memory,
-whose host protection differs from the guest's, ask the host for it. In the VM the
-slab pages are zeroed, or refilled from the file for a private file mapping.
-`MADV_WIPEONFORK`, `MAP_GROWSDOWN` growth and `MADV_HWPOISON` act natively
-only.
-
 #### Process and thread calls
 
 Each guest process is a host process and each guest thread a host thread,
@@ -1121,53 +965,23 @@ and `futex_waitv` run without the kernel lock.
 | `personality` | Kept per process; `PER_LINUX32` fails with `EINVAL`. | none |
 | `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); an ending process appends its `struct acct_v3` to the nearest pid namespace's, its own or one above, with accounting on | `open`, `write` |
 
-**`clone` of a thread**: the new thread starts with its creator's
-registers, `x0` = 0, the given stack, the creator's signal mask, and
-`TPIDR_EL0` from `CLONE_SETTLS`. Natively it is a host pthread entering
-guest code directly; the thread pointer goes into a TSD slot the rewritten
-`TPIDR_EL0` accesses read, and only the pthread set of flags is accepted
-(`ENOSYS` for others). In the VM it is a host thread with a vCPU of its own,
-made on that thread; there are no flag restrictions beyond Linux's own
-checks (`crates/kernel/src/cloneargs.rs`). See
-[Threads, clone and futexes](#threads-clone-and-futexes) and
-[Threads](#threads).
-
-**`clone` of a process**: natively a host `fork` with every registry lock
-held and the other guest threads suspended; `CLONE_VM` makes the private
-memory inherit by sharing for that fork and `CLONE_VFORK` makes the parent
-wait on a pipe until the child execs or exits (made, and the parent's write
-end closed, under the kernel lock, so no child another thread forks
-meanwhile holds it). In the VM no host fork
-happens: a fresh `fwe --hv-fork-child` gets the kernel state over a Mach
-port (with fwe's private directory, where the run's records are kept
-beside the shared memory of process records and signal mailboxes: the
-host's lookup of the user's temporary directory gives another one there) and every slab page over a socket (a `vfork` child
-fetches pages as it touches them); `CLONE_VM` without `CLONE_VFORK` fails with `ENOSYS`. See
-[fork](#fork).
-
-**`execve`**: a native process with no other threads, running a program
-that runs natively, unmaps the old program and loads the new one in place.
-Otherwise, and always in the VM, fwe runs the host's `execve` on itself
-with the state to keep on its command line, and the new fwe picks the
-backend. See [execve](#execve).
-
-**`wait4`, `waitid`**: the children are host processes, so the host's
-calls do the waiting; `WCONTINUED` and the status word are translated,
-`__WALL` and the like accepted, `waitid(P_PIDFD)` becomes `P_PID` of the
-descriptor's process, and a reaper also reaps the orphans fwe recorded for
-it. `waitid` reports no resource usage. See [wait](#wait) and
-[Children ending](#children-ending).
+**`clone`**: a thread is described under
+[Threads, clone and futexes](#threads-clone-and-futexes), a process under
+[fork](#fork). Natively a `CLONE_VFORK` parent waits on a pipe until the
+child execs or exits; the pipe is made, and the parent's write end
+closed, under the kernel lock, so no child another thread forks meanwhile
+holds it. A VM fork child is given fwe's private directory with the
+kernel state, since the host's lookup of the user's temporary directory
+would give it another one.
 
 **`futex`**: a private futex waits in a per-process queue keyed by
-address, which a wake marks woken, so it reports exactly how many it woke;
-each waiting thread sleeps on a word of its own
+address, which a wake marks woken, so it reports exactly how many it
+woke; each waiting thread sleeps on a word of its own
 (`__ulock_wait2(UL_COMPARE_AND_WAIT)`), which a wake sets and wakes that
-thread alone on.
-A shared futex takes a slot in a table every fwe process maps, keyed by
-the Mach memory object and offset of the word, and sleeps on the slot's
-word with `__ulock_wait2(UL_COMPARE_AND_WAIT_SHARED)`
-(`crates/kernel/src/sharedfutex.rs`). See
-[Threads, clone and futexes](#threads-clone-and-futexes).
+thread alone on. A shared futex takes a slot in a table every fwe process
+maps, keyed by the Mach memory object and offset of the word, and sleeps
+on the slot's word with `__ulock_wait2(UL_COMPARE_AND_WAIT_SHARED)`
+(`crates/kernel/src/sharedfutex.rs`).
 
 #### Signal calls
 
@@ -1194,59 +1008,41 @@ and the frame are under [Numbers](#numbers) and
 | `pidfd_send_signal` | `kill`, `tgkill`, `rt_sigqueueinfo` or a group `kill` of what the descriptor names (also a `/proc/<pid>` directory) | as those calls |
 | `signalfd4` | a readiness pipe plus a queue of `signalfd_siginfo`; watched signals are always caught | `pipe`, `sigaction` |
 
-**`rt_sigaction`**: the action goes into the kernel's table and
-`Kernel::sync_host_signal` picks the host disposition
-(`crates/kernel/src/signal.rs`). The backend then installs it with
-`sigaction`, the same way in both backends: fwe's handler with
-`SA_SIGINFO | SA_ONSTACK` and every signal blocked, or `SIG_DFL`/`SIG_IGN`
-(`set_host_signal` in `crates/native/src/trap.rs`, which
-`crates/native/src/hv/backend.rs` calls too). Which disposition the host
-gets for which guest disposition is under
-[Who acts on a signal](#who-acts-on-a-signal). `SIGKILL` and `SIGSTOP` are
-refused (`EINVAL`). The fault signals and the signals the host lacks never
-reach the host's table.
+**`rt_sigaction`**: `Kernel::sync_host_signal` (`crates/kernel/src/signal.rs`)
+picks the host disposition ([Who acts on a signal](#who-acts-on-a-signal)),
+which the backend installs with `sigaction`: fwe's handler with
+`SA_SIGINFO | SA_ONSTACK` and every signal blocked, or `SIG_DFL`/`SIG_IGN`.
+`SIGKILL` and `SIGSTOP` are refused (`EINVAL`). The fault signals and the
+signals the host lacks never reach the host's table.
 
 **`kill`, `tgkill`, `rt_sigqueueinfo`**: [Sending a signal](#sending-a-signal)
-lists what each sends where. `tgkill` posts a signal fwe catches straight
-to the target thread and wakes it with `SIGEMT`. As a host signal, the
-signal could land on a thread that blocks it and be counted as the
-process's. `tkill` is `tgkill` with no process named. `kill(-1, …)` signals
-only the caller's pid namespace or run of fwe. `rt_sigqueueinfo` to another
-process may not claim a kernel code (`si_code >= 0`) or `SI_TKILL`
-(`EPERM`), and reaches only that process's main thread. A signal the host
-lacks goes to another fwe process's mailbox (`signal::send_unhosted`), or
-fails with `EINVAL` for a process that is not fwe's
-([Signals with no counterpart](#signals-with-no-counterpart)).
+lists what each sends where. `rt_sigqueueinfo` to another process may not
+claim a kernel code (`si_code >= 0`) or `SI_TKILL` (`EPERM`), and reaches
+only that process's main thread.
 
-**`rt_sigsuspend`, `rt_sigtimedwait`**: both run without the kernel lock.
-`rt_sigsuspend` blocks every relayed host signal while it checks for a
-deliverable one, then calls the host's `sigsuspend` with the host mask the
-new guest mask calls for, so a signal arriving between the check and the
-wait is not lost. Delivering the signal restores the old mask.
-`rt_sigtimedwait` is handled by each backend
-(`crates/native/src/trap.rs`, `crates/native/src/hv/backend.rs`): first
-`Kernel::catch_for_wait` has the host catch every awaited signal whatever
-its disposition, so the signal arrives with its sender. The wait is the
-host's `pselect` with no descriptors, under a mask that leaves the awaited
-signals open. A signal the guest handles that arrives instead gives
-`EINTR`.
+**`rt_sigsuspend`, `rt_sigtimedwait`**: `rt_sigsuspend` blocks every
+relayed host signal while it checks for a deliverable one, then calls the
+host's `sigsuspend` with the host mask the new guest mask calls for, so a
+signal arriving between the check and the wait is not lost; delivering the
+signal restores the old mask. `rt_sigtimedwait` first has the host catch
+every awaited signal whatever its disposition (`Kernel::catch_for_wait`),
+so the signal arrives with its sender, then waits in the host's `pselect`
+with no descriptors under a mask that leaves the awaited signals open; a
+signal the guest handles that arrives instead gives `EINTR`.
 
-**`signalfd4`**: a signalfd is a pipe for readiness and a queue of 128-byte
+**`signalfd4`**: a pipe for readiness and a queue of 128-byte
 `signalfd_siginfo` records (`crates/kernel/src/signalfd.rs`). Creating or
 changing one re-syncs every host disposition, so the host catches a
-watched signal even when its disposition would let the host drop it. A
-pending signal that the thread blocks and a signalfd watches moves onto
-that signalfd (`signal::drain_to_signalfd`) when the thread next waits or
-returns from a call. A `read` of it runs without the kernel lock.
+watched signal even where its disposition would let the host drop it. A
+pending signal the thread blocks and a signalfd watches moves onto the
+signalfd when the thread next waits or returns from a call.
 
-**Delivery, native and VM**: a frame is built on the guest stack, or on
-the alternate stack, as Linux builds it, and returns through `sa_restorer`
-or fwe's `rt_sigreturn` trampoline. Natively, the host handler rewrites the
-interrupted context. In the VM it stops the vCPU (`hv_vcpus_exit`) and the
-run loop delivers ([Signals into a running vCPU](#signals-into-a-running-vcpu)).
-With BTI on in the VM, the handler is entered as if by `blr`
-(`signal::set_bti`). In the VM, pointer arguments are translated to host
-addresses before the call (`uaccess::host_arg`).
+**Delivery**: a frame is built as Linux builds it, on the guest stack or
+the alternate stack, returning through `sa_restorer` or fwe's
+`rt_sigreturn` trampoline. Natively the host handler rewrites the
+interrupted context; in the VM the run loop delivers
+([Signals into a running vCPU](#signals-into-a-running-vcpu)), and with
+BTI on the handler is entered as if by `blr`.
 
 #### Time calls
 
@@ -1254,8 +1050,8 @@ Clocks are read from the host clock with the same meaning
 (`host::clock_to_host`), and results are copied out through fwe's memory,
 because macOS's C library writes them unchecked. Sleeps are waits on the
 thread's wake pipe, timed by a kqueue timer with `NOTE_CRITICAL`. Interval
-timers are the host's; POSIX timers and timerfds are fwe's own. There is no
-vDSO, so every clock read traps
+timers are the host's; POSIX timers and timerfds are fwe's own. There is
+no vDSO, so every clock read is a system call
 ([auxv, hwcaps and the vDSO](#auxv-hwcaps-and-the-vdso)).
 
 | Calls | What fwe does | Host call(s) |
@@ -1271,46 +1067,33 @@ vDSO, so every clock read traps
 | `timerfd_create`, `timerfd_settime`, `timerfd_gettime` | a kqueue holding one timer; reads return the expiry count | `kqueue`, `kevent` (`EVFILT_TIMER`, `NOTE_NSECONDS \| NOTE_CRITICAL`) |
 
 **`clock_nanosleep`** (and `nanosleep`, which is `clock_nanosleep` on
-`CLOCK_MONOTONIC`): a `TIMER_ABSTIME` request is turned into a relative
-wait against the host clock the Linux clock maps to; a time already past
-returns 0. The wait is `thread::wait_ready_ns` with no descriptors. The
-thread's kqueue timer is armed with `NOTE_NSECONDS | NOTE_CRITICAL`, so the
-wait ends on time and not coalesced, and the thread's wake pipe ends it for
-a signal however soon the signal lands. An interrupted relative sleep
-writes the time left. `CLOCK_THREAD_CPUTIME_ID` cannot be slept on
-(`EOPNOTSUPP`). Both calls run without the kernel lock, and neither is
-restarted after a handler.
+`CLOCK_MONOTONIC`): a `TIMER_ABSTIME` time already past returns 0. The
+thread's kqueue timer is armed with `NOTE_NSECONDS | NOTE_CRITICAL`, so
+the wait ends on time rather than coalesced, and the thread's wake pipe
+ends it for a signal however soon the signal lands. An interrupted
+relative sleep writes the time left. `CLOCK_THREAD_CPUTIME_ID` cannot be
+slept on (`EOPNOTSUPP`). Neither call is restarted after a handler.
 
 **`timer_create`** (`crates/kernel/src/posixtimer.rs`): macOS has no POSIX
-timers. Each process gets one fwe thread, started with its first timer that
-signals, which blocks every host signal and sleeps until the next timer is
-due. It sleeps with `nanosleep` when that is under 2 ms, otherwise with
-`poll` on a wake pipe. When a timer is due the thread posts its signal for
-the process, or for one thread with `SIGEV_THREAD_ID`, and wakes the
-target with `SIGEMT`. `SIGEV_THREAD` is sent as a signal to the process,
-which the C library acts on. A periodic timer starts again only once its
-signal is taken; the intervals that passed meanwhile are its overrun. The
-clocks map onto the host's realtime, monotonic and CPU-time clocks. The
-`*_ALARM` clocks need `CAP_WAKE_ALARM`. `MONOTONIC_RAW` and the coarse
-clocks are refused (`EOPNOTSUPP`). A CPU-time timer is checked again at
-least every 10 ms.
+timers. Each process gets one fwe thread, started with its first timer
+that signals, which blocks every host signal and sleeps until the next
+timer is due (`nanosleep` under 2 ms, otherwise `poll` on a wake pipe).
+A due timer's signal is posted for the process, or for one thread with
+`SIGEV_THREAD_ID`, and the target woken with `SIGEMT`. `SIGEV_THREAD` is
+sent as a signal to the process, which the C library acts on. A periodic
+timer starts again only once its signal is taken; the intervals that
+passed meanwhile are its overrun. The `*_ALARM` clocks need
+`CAP_WAKE_ALARM`; `MONOTONIC_RAW` and the coarse clocks are refused
+(`EOPNOTSUPP`). A CPU-time timer is checked at least every 10 ms.
 
-**`timerfd_settime`** (`crates/kernel/src/specialfd.rs`): the timer is a
-one-shot or periodic `EVFILT_TIMER` in nanoseconds. kqueue timers are
+**`timerfd_settime`** (`crates/kernel/src/specialfd.rs`): kqueue timers are
 relative, so `TFD_TIMER_ABSTIME` is converted against `CLOCK_REALTIME`
 whatever the timerfd's clock. A periodic timer fires first after its
-interval, not after `it_value`. `TFD_TIMER_CANCEL_ON_SET` is accepted. A
-host fork child gets no kqueues, so the setting is recorded and the timer
-rebuilt in the child ([Waiting and events](#waiting-and-events)).
+interval, not after `it_value`. `TFD_TIMER_CANCEL_ON_SET` is accepted.
 
-**`setitimer`**: the host's interval timer sends the host's `SIGALRM`,
-`SIGVTALRM` or `SIGPROF` (same numbers on both), relayed like any host
-signal ([Clocks and timers](#clocks-and-timers)). The host refuses values
-over 100,000,000 s, so fwe gives it that maximum and keeps what was asked,
-so that `getitimer` and the old value read as on Linux.
-
-Native and VM: the same in both. The VM's counters are covered under
-[Counters and timers](#counters-and-timers).
+**`setitimer`**: the host refuses values over 100,000,000 s, so fwe gives
+it that maximum and keeps what was asked, for `getitimer` and the old
+value to read as on Linux.
 
 #### Waiting and event calls
 
@@ -1325,70 +1108,36 @@ however soon it lands. The mapping of each descriptor is under
 |---|---|---|
 | `ppoll` | the guest's `pollfd` array polled as is; revents corrected to Linux's; time left written back | `poll` |
 | `pselect6` | the `fd_set` bitmaps turned into a `pollfd` array, results written back as bitmaps; time left written back | `poll` |
-| `epoll_create1` | a kqueue, with an interest list recorded beside it | `kqueue` |
 | `epoll_ctl` | Linux's checks, in its order; each direction one kqueue filter, `data` in `udata` | `kevent` (`EVFILT_READ`, `EVFILT_WRITE`, `EV_RECEIPT`) |
 | `epoll_pwait`, `epoll_pwait2` | a wait for the kqueue to be readable, then the events taken without waiting and translated | `poll`, then `kevent` with a zero timeout |
-| `eventfd2` | a pipe holding one byte while a counter in a shared page is non-zero | `pipe`, `mmap` |
 | `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` | an instance is a datagram socket in fwe's private directory; watches in a record every fwe process shares; fwe's file calls send the events | `socket(AF_UNIX, SOCK_DGRAM)`, `bind` |
 | `fcntl(F_NOTIFY)` (dnotify) | a watch in inotify's record naming its owner and descriptor; an event is the descriptor's `F_SETSIG` signal with `si_fd` (or `SIGIO`), posted as the call that raises it runs, or sent to another process as a `SIGIO` note | `kill` (`SIGEMT`) for another process |
 | `io_setup`, `io_submit`, `io_getevents`, `io_pgetevents`, `io_cancel`, `io_destroy` | a context is the process's, named by a read-only page of zeros it maps (libaio, finding no ring, makes the call); a request is carried out as it is submitted and its completion queued, a poll of a descriptor not yet ready held until `io_getevents` finds it ready; `IOCB_FLAG_RESFD` signals an eventfd | `pread`/`pwrite` and their vectored forms, `fsync`, `poll` |
 
 The masked waits (`ppoll`, `pselect6`, `epoll_pwait`, `epoll_pwait2`) run
-under the mask they are given (`signal::with_call_mask`). The mask stays
-replaced until a signal that ended the wait is delivered, as
-`rt_sigsuspend` does.
+under the mask they are given, which stays replaced until a signal that
+ended the wait is delivered, as with `rt_sigsuspend`.
 
-**`epoll_ctl` and the waits**: an epoll descriptor is a kqueue
-(`crates/kernel/src/epoll.rs`). `EPOLLIN` and `EPOLLOUT` become
-`EVFILT_READ` and `EVFILT_WRITE`, `EPOLLET` becomes `EV_CLEAR` and
-`EPOLLONESHOT` becomes `EV_ONESHOT`. A socket watched only for `EPOLLRDHUP`
-gets a read filter with a low-water mark no read reaches. A wait polls the
-kqueue descriptor itself, together with the wake pipe
-(`thread::wait_ready`), then takes the events with a zero-timeout `kevent`
-and turns `EV_EOF` into `EPOLLHUP`/`EPOLLRDHUP` as Linux reports them.
-Events it has taken reach the guest even if a further take to fill the
-guest's buffer is interrupted: an edge-triggered one is not reported again
-(Go's runtime, interrupted by its own preemption signals, would wait for
-ever on a pipe's end). Several cases the host does not report are looked
-at in slices:
+**`epoll_ctl` and the waits** (`crates/kernel/src/epoll.rs`; the mapping of
+flags is under [Waiting and events](#waiting-and-events)): a socket
+watched only for `EPOLLRDHUP` gets a read filter with a low-water mark no
+read reaches. A wait polls the kqueue descriptor together with the wake
+pipe, then takes the events with a zero-timeout `kevent`. Events it has
+taken reach the guest even if a further take to fill the guest's buffer
+is interrupted, so an edge-triggered event is never lost (Go's runtime,
+interrupted by its own preemption signals, would otherwise wait for ever
+on a pipe's end). Cases the host does not report are looked at in slices:
+the read end of a named FIFO whose writers have gone, a mounts file, and
+a pipe smaller than the host's while it is full. The timeout is rounded
+up to whole milliseconds, `epoll_pwait2`'s too.
 
-- the read end of a named FIFO whose writers have gone;
-- a mounts file;
-- a pipe smaller than the host's, while it is full.
-
-`EPOLLEXCLUSIVE` is a count shared between processes
-(`crates/kernel/src/exclusive.rs`). The wait's timeout is rounded up to
-whole milliseconds, `epoll_pwait2`'s too. `epoll_event` is 16 bytes on
-arm64.
-
-**`ppoll`, `pselect6`**: `struct pollfd` and the `POLL*` bits are the same on
-both kernels, so the array goes to the host `poll`. Then `linux_revents`
-turns what the host reported into Linux's answer:
-
-- a regular file loses `POLLPRI`;
-- a hung-up FIFO with nothing left to read is not readable.
-
-An eventfd that can be written to is reported writable, which its pipe's
-read end never is to the host. `pselect6` reads at most 1024 descriptors, and
-fails with `EBADF` for one of fwe's own. Both write back the time left
-unless the personality has `STICKY_TIMEOUTS`.
-
-**`eventfd2`**: macOS has no eventfd. The guest's descriptor is the read
-end of a pipe, and the write end is fwe's, in its reserved range. The
-counter is in a shared page with a lock word, so a fork child shares it.
-The pipe holds one byte exactly while the counter is non-zero, so the host
-sees the descriptor readable when a read would succeed. `read` and `write`
-on it run without the kernel lock (`specialfd::try_read`, `try_write`).
-
-**`inotify_*`**: the host's file events never report open, read or close.
-So fwe raises Linux's events itself from every fwe process's file calls
-on a watched file or directory (`crates/kernel/src/inotify.rs`), one
-datagram per event to the instance's socket. Reading, `poll` and `epoll`
-on the instance are the host's socket operations. Changes made by programs
-fwe does not run raise no event.
-
-Native and VM: the same in both; in the VM the call's pointers are
-translated to host addresses first.
+**`ppoll`, `pselect6`**: `struct pollfd` and the `POLL*` bits are the same
+on both kernels, so the array goes to the host `poll`, and `linux_revents`
+corrects the answer: a regular file loses `POLLPRI`, a hung-up FIFO with
+nothing left to read is not readable, and an eventfd that can be written
+is writable (its pipe's read end never is to the host). `pselect6` reads
+at most 1024 descriptors and fails with `EBADF` for one of fwe's own. Both
+write back the time left unless the personality has `STICKY_TIMEOUTS`.
 
 #### Socket calls
 
@@ -1397,9 +1146,7 @@ fwe checks each call's arguments in Linux's order, then translates what
 crosses the boundary: addresses, flags, option numbers and layouts, and
 control messages ([Sockets](#sockets)). `AF_UNIX`, `AF_INET` and
 `AF_INET6` reach the host; `AF_NETLINK` is fwe's; any other family
-(`AF_PACKET`, `AF_VSOCK`, ...) fails with `EAFNOSUPPORT`. The calls that
-can block run without the kernel lock (`blocking_call` in
-`crates/kernel/src/lib.rs`).
+(`AF_PACKET`, `AF_VSOCK`, ...) fails with `EAFNOSUPPORT`.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
@@ -1414,50 +1161,41 @@ can block run without the kernel lock (`blocking_call` in
 | `setsockopt`, `getsockopt` | numbers and layouts translated (`sockopt.rs`); fwe answers `SO_SNDBUF`/`SO_RCVBUF` arithmetic, `SO_DOMAIN`, `SO_PROTOCOL`, kept `SO_NO_CHECK`/`SO_PRIORITY`/`SO_PASSCRED`, `SO_PEERCRED`, `SO_ATTACH_BPF`/`SO_DETACH_BPF`, `IPV6_ADDRFORM`, and `SO_TYPE` of a `SOCK_SEQPACKET` or netlink socket | `setsockopt`, `getsockopt` |
 | `shutdown` | passed through; a Unix socket whose peer has gone shuts down (`0`, where the host says `ENOTCONN`) | `shutdown` |
 
-**`bind`, `connect`, `sendto`**: a Linux `sockaddr` (2-byte family) is
-rewritten to the host's (length byte, family byte), and `AF_INET6` 10
-becomes 30. An `AF_UNIX` path resolves in the guest's root as a file path
-does; an abstract name (a leading NUL) becomes a file in a per-host
-temporary directory, with the name kept beside it for `getsockname`. An
-IPv4 address given to an IPv6 datagram socket becomes its IPv4-mapped
-address. The table of what is translated is under [Sockets](#sockets).
-
-**`sendmsg`, `recvmsg`**: only `SCM_RIGHTS` crosses. Linux's `cmsghdr`
-has a 64-bit `cmsg_len` and 8-byte alignment, macOS's a 32-bit one and
-4-byte alignment, so fwe re-encodes the first `SCM_RIGHTS` message into a
+**`sendmsg`, `recvmsg`**: only `SCM_RIGHTS` crosses. Linux's `cmsghdr` has
+a 64-bit `cmsg_len` and 8-byte alignment, macOS's a 32-bit one and 4-byte
+alignment, so fwe re-encodes the first `SCM_RIGHTS` message into a
 256-byte host buffer (up to 61 descriptors) and back. Other control
 messages, `SCM_CREDENTIALS` among them, are not sent. A receive whose
 control buffer is too small for the descriptors sets `MSG_CTRUNC`. A
-`SOCK_SEQPACKET` socket received this way is recognised by its buffer
-size and stays one (`seqpacket::adopt`).
+received `SOCK_SEQPACKET` socket is recognised by its buffer size and
+stays one.
 
-**`socket(AF_UNIX, SOCK_SEQPACKET)`**: macOS has none. fwe makes a
-stream socket and frames each message with a 4-byte length; a send writes
-a whole frame or nothing, a receive takes one frame, cut to the buffer
-with `MSG_TRUNC`. Between processes sharing the socket, a byte-range lock
-on a file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
+**`socket(AF_UNIX, SOCK_SEQPACKET)`**: macOS has none. fwe makes a stream
+socket and frames each message with a 4-byte length; a send writes a whole
+frame or nothing, a receive takes one frame, cut to the buffer with
+`MSG_TRUNC`. Between processes sharing the socket, a byte-range lock on a
+file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 
 **`socket(AF_NETLINK)`**: the guest's descriptor is one end of a host
-datagram pair, so `recv`, `poll` and `epoll` are the host's. A request
+datagram pair, so `recv`, `poll` and `epoll` are the host's; a request
 written to it is answered at once on the other end. In an fwe network
 namespace, `RTM_GETLINK`, `RTM_NEWLINK` (with `CAP_NET_ADMIN`) and
 `RTM_GETADDR` describe and change `lo`; in the initial namespace they
 describe the host's loopback as `lo`, always up (taking it down is
 `EPERM`), and no other interface. Such a socket also carries a POSIX
-message queue's `SIGEV_THREAD` notification
-([POSIX message queues](#posix-message-queues)).
+message queue's `SIGEV_THREAD` notification.
 
-**`sendmmsg`, `recvmmsg`**: the host has neither. fwe runs `sendmsg` or
-`recvmsg` for each message, at most 1024, writing each one's length into
-its `msg_len`, and stops at the first failure (the count so far, or the
-error if none went). `recvmmsg` honours `MSG_WAITFORONE`, checks its
-timeout after each message as Linux does, and stops after urgent data.
+**`sendmmsg`, `recvmmsg`**: fwe runs `sendmsg` or `recvmsg` for each
+message, at most 1024, writing each one's length into its `msg_len`, and
+stops at the first failure (returning the count so far, or the error if
+none went). `recvmmsg` honours `MSG_WAITFORONE`, checks its timeout after
+each message as Linux does, and stops after urgent data.
 
 **`getsockopt(SO_PEERCRED)`**: from the host's `LOCAL_PEERPID` and
 `LOCAL_PEERCRED`: the peer's pid in the caller's pid namespace and its
 host ids as the guest sees them
-([Host identity](#host-identity-and-machine-state)). A socket with no
-peer process (not Unix, or netlink) gives pid 0 and ids -1.
+([Host identity](#host-identity-and-machine-state)). A socket with no peer
+process (not Unix, or netlink) gives pid 0 and ids -1.
 
 #### Other IPC calls
 
@@ -1467,7 +1205,10 @@ all three on shared records ([Kernel-wide state](#kernel-wide-state)):
 one set per IPC namespace for System V objects and queues, one record for
 every key. A change is made under the record's `flock`; a call that must
 wait sleeps on the record's mapped generation word until another process
-changes it.
+changes it. What a process that has gone leaves (attachments, `SEM_UNDO`
+adjustments) is cleaned up by the next process that looks. The initial
+namespace's records last until the host reboots
+(`crates/kernel/src/sysvipc.rs`, `ipcops.rs`, `mqueue.rs`, `keys.rs`).
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
@@ -1475,17 +1216,13 @@ changes it.
 | `semget`, `semctl`, `semop`, `semtimedop` | values and `SEM_UNDO` adjustments in the record; a `semop` applies all its operations or none; waits run without the kernel lock | `flock`, `__ulock_wait2`, `__ulock_wake` |
 | `msgget`, `msgctl`, `msgsnd`, `msgrcv` | messages in the record; waits as for semaphores | as above |
 | `kernel.msg_next_id`, `sem_next_id`, `shm_next_id` | the id the next object of the kind gets in the IPC namespace, used once | none |
-| `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` | a record per queue in the namespace's directory; the descriptor is a host descriptor of the queue's file | `open`, `flock`, `close`; waits as above |
-| `add_key`, `request_key`, `keyctl` | every key, keyring and quota in one record shared by all fwe processes; the key types and their cryptography are fwe's | the record's files only |
+| `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr` | a record per queue in the namespace's directory; the descriptor is a host descriptor of the queue's file holding a shared `flock`, so an unlinked queue is freed with its last descriptor; a notification is a signal carrying `SI_MESGQ` and the value, or for `SIGEV_THREAD` the cookie sent to the C library's netlink socket | `open`, `flock`, `close`; waits as above |
+| `add_key`, `request_key`, `keyctl` | every key, keyring (thread, process, session, user, persistent), permission and quota in one record shared by all fwe processes; the key types (`keyring`, `user`, `logon`, `big_key`, `dns_resolver`, `asymmetric`, `encrypted`) and their cryptography are fwe's, as Linux 6.12 computes it; with no `/sbin/request-key` upcall, a key `request_key` would construct is negative for a minute; `KEYCTL_WATCH_KEY` and unknown operations `EOPNOTSUPP` | the record's files only |
 
-**`shmat`**: the segment's memory is a file in fwe's private directory,
-made with `ftruncate` at `shmget`. `shmat` opens it with the access the
-flags ask for and maps it through fwe's own `mmap` with `MAP_SHARED`, so
-every process attaching the segment shares its pages. `SHMLBA` alignment
-holds with `SHM_RND`, and an address over existing memory needs
-`SHM_REMAP`. A segment marked for removal goes with its last attachment,
-and what a process that has gone leaves attached is detached by the next
-process that looks ([System V IPC](#system-v-ipc)).
+**`shmat`** maps the segment's file through fwe's own `mmap` with
+`MAP_SHARED`, so every process attaching it shares its pages. `SHMLBA`
+alignment holds with `SHM_RND`, and an address over existing memory needs
+`SHM_REMAP`. A segment marked for removal goes with its last attachment.
 
 **`semop`, `msgsnd`, `msgrcv`, `mq_timedsend`, `mq_timedreceive`**: each
 try is one change of the record under its lock, so an operation is all or
@@ -1494,16 +1231,6 @@ generation word with `__ulock_wait2` (`UL_COMPARE_AND_WAIT_SHARED`), which
 any process's change wakes, in slices so that a signal ends the wait with
 `EINTR`; the object going ends it with `EIDRM`, a timeout with `EAGAIN`
 (System V) or `ETIMEDOUT` (POSIX queues).
-
-**`mq_open`**: the descriptor is a host descriptor of a file in the
-queue's directory, holding a shared `flock` that lasts as long as any
-descriptor of that open, so an unlinked queue is freed with its last
-descriptor ([POSIX message queues](#posix-message-queues)).
-
-**`keyctl`**: every operation is fwe's, on the shared record. With no
-`/sbin/request-key` helper, a key `request_key` would construct is
-negative for a minute. `KEYCTL_WATCH_KEY` and unknown operations fail
-with `EOPNOTSUPP` ([Keys and keyrings](#keys-and-keyrings)).
 
 #### Credential and namespace calls
 
@@ -1576,15 +1303,9 @@ otherwise.
 | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities and Landlock are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`; `/sys/kernel/security/lsm` reads `capability,landlock`); neither keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
 
 **`uname`**: the release is fixed (`RELEASE` in
-`crates/kernel/src/syscalls.rs`), with `UNAME26` replacing its version
-numbers as Linux's `override_release` does. In the initial UTS namespace
-the node name is the host's, cut to 64 bytes, and the domain name
-`(none)` ([Host identity](#host-identity-and-machine-state)).
-
-**`reboot`**: a guest never stops the Mac. After Linux's checks, the
-Ctrl-Alt-Del setting is accepted and changes nothing; every command that
-would stop or replace the kernel fails with `EPERM`
-([Time, scheduling and limits](#time-scheduling-and-limits)).
+`crates/kernel/src/syscalls.rs`); `UNAME26` replaces its version numbers
+as Linux's `override_release` does. In the initial UTS namespace the node
+name is the host's, cut to 64 bytes, and the domain name `(none)`.
 
 #### Debugging and sandboxing calls
 
@@ -1605,31 +1326,14 @@ process store that it and its tracer use. At a stop (a signal about to be
 delivered, a system call's entry or exit under `PTRACE_SYSCALL`, an
 `execve`, a fork, clone or exit event) the tracee writes its registers,
 wait status and `siginfo` there, tells its tracer through the tracer's
-inbox page, `SIGCHLD` and fwe's wake signal, and serves requests until told
-to go on. The tracer reads and writes registers and `siginfo` in the
-mailbox itself and asks the tracee for memory, a word or 2 KiB at a time
-(`/proc/<pid>/mem`, `process_vm_readv`). `PTRACE_SEIZE` and
-`PTRACE_INTERRUPT` nudge the tracee with a `SIGSTOP` of fwe's own queue
-that no guest sees, which ends a wait it is in. The tracee is
-never stopped on the host, so the tracer's `wait4`/`waitid` take a stop
-from the inbox before asking the host. Single-stepping plants
-`brk #0x4c59` where the instruction may go next. Details are in
-[architecture.md](architecture.md#ptrace).
-
-**`seccomp`**: both backends run the filters before routing any call, so
-none escapes them. Filters are classic BPF over Linux's `seccomp_data`
-(`AUDIT_ARCH_AARCH64`); the action of highest precedence wins;
-`SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF` fail the call with
-`ENOSYS`. Strict mode allows `read`, `write`, `exit` and `rt_sigreturn`
-and ends the process with `SIGKILL` on any other call. `PR_SET_SECCOMP`
-and `PR_GET_SECCOMP` reach the same code. See [seccomp](#seccomp).
-
-**`bpf`**: a loaded program or map is an unlinked file of fwe's that the
-descriptor is open on, so a fork child shares it. Device programs attached
-to a cgroup are kept in the cgroup's directory and run on each device
-access; a socket filter attached with `SO_ATTACH_BPF` runs on what the
-process sends to the socket's peer. The interpreter checks every access
-and stops a program after 2^20 steps (`crates/kernel/src/bpf.rs`).
+inbox page, `SIGCHLD` and fwe's wake signal, and serves requests until
+told to go on. The tracer reads and writes registers and `siginfo` in the
+mailbox itself and asks the tracee for memory, a word or 2 KiB at a time.
+`PTRACE_SEIZE` and `PTRACE_INTERRUPT` nudge the tracee with a `SIGSTOP`
+of fwe's own queue that no guest sees. The tracee is never stopped on the
+host, so the tracer's `wait4`/`waitid` take a stop from the inbox before
+asking the host. Single-stepping plants `brk #0x4c59` where the
+instruction may go next ([architecture.md](architecture.md#ptrace)).
 
 ### The CPU
 
@@ -1646,26 +1350,9 @@ the CPU at startup.
 | Arguments | `x0`–`x5` | `x0` and up |
 | Error report | `x0` = −errno (−1 to −4095) | carry flag set, `x0` = errno (macOS numbering) |
 
-fwe intercepts every guest system call before it reaches macOS: natively
-each `svc #0` calls fwe's gate
-([System calls: svc calls fwe's gate](#system-calls-svc-calls-fwes-gate)); in the
-VM the `svc` takes an exception to fwe's vector, which leaves the VM
-([A system call in the VM](#a-system-call-in-the-vm)). Then:
-
-```mermaid
-sequenceDiagram
-    participant G as Guest code
-    participant B as Backend (trap handler / vCPU loop)
-    participant K as Kernel crate
-    participant M as macOS
-    G->>B: svc 0 (native: rewritten to a call of the gate. VM: vector, hvc 2, vCPU exit)
-    B->>K: Kernel::enter_syscall(regs), number in x8
-    K->>M: libc call(s) with translated arguments
-    M-->>K: result, or -1 and host errno
-    K-->>B: x0 = result or −(Linux errno)
-    B-->>G: resume after the trapping instruction
-```
-
+fwe intercepts every guest system call before it reaches macOS
+([Where a system call runs](#where-a-system-call-runs)), runs it with the
+number from `x8`, and returns the result or minus a Linux errno in `x0`.
 The kernel crate calls macOS through `libc`, so it sees `-1`/`errno`,
 never the carry flag ([Errors](#errors)). Flag, structure and constant
 translations live in `crates/kernel/src/host.rs`, the Linux values in
@@ -1820,13 +1507,6 @@ hardware translation:
   mappings (the host can reach slab memory the guest cannot) and go
   through `uaccess::g2h`, which looks up the translated ranges.
 
-```mermaid
-flowchart LR
-    gp["guest pointer"] --> who{"who uses it?"}
-    who -- "guest instruction" --> s1["stage 1: fwe's tables"] --> s2["stage 2: hv_vm_map'd host pages"] --> ram["host memory"]
-    who -- "kernel crate / host call" --> v["validate against guest mappings (EFAULT)"] --> g2h["uaccess::g2h: translated range? host address : same address"] --> ram
-```
-
 The low 4 GiB can never be identity-mapped (it is `__PAGEZERO` on the
 host), so the low image is always translated. A host call given one
 buffer that runs over the edge of a translated range has no single host
@@ -1877,7 +1557,7 @@ such memory writable on the host and records it
 |---|---|---|
 | `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone |
 | `/dev/shm` tmpfs (`shm_open`, `sem_open`) | no tmpfs at `/dev/shm` | a directory per rootfs in the user's temporary directory, shared by every fwe process on that root, a mount point to the resolver |
-| System V shared memory | own `shmget` | see [System V IPC](#system-v-ipc) |
+| System V shared memory | own `shmget` | see [Other IPC calls](#other-ipc-calls) |
 
 ### Processes
 
@@ -2070,14 +1750,13 @@ What comes back (the status word, `rusage`, `SIGCHLD`) is under
 
 #### ptrace
 
-| Linux | macOS | fwe |
-|---|---|---|
-| a tracer reads and writes a stopped tracee's registers and memory, and resumes it | `ptrace` for a few requests; no access to another process's memory or threads without the debugger entitlement | the tracee does its tracer's work: at a stop it writes its registers and `siginfo` to a page they share and serves memory requests until told to go on (`crates/kernel/src/ptrace.rs`); only fwe processes can be traced |
-
-Stops (signals, system-call entry and exit, `execve`, fork, clone and exit
-events), single-stepping and attaching to processes and threads work in
-both backends; [architecture.md](architecture.md#ptrace) has the
-mechanism and its limits.
+macOS gives no process another's memory or threads without the debugger
+entitlement, so a tracee does its tracer's work: at a stop it writes its
+registers and `siginfo` to a page they share and serves memory requests
+until told to go on (`crates/kernel/src/ptrace.rs`; the calls under
+[Debugging and sandboxing calls](#debugging-and-sandboxing-calls)). Only
+fwe processes can be traced. Stops, single-stepping and attaching to
+processes and threads work in both backends.
 
 ### Signals
 
@@ -2158,11 +1837,7 @@ to the host.
 | Linux | macOS | fwe |
 |---|---|---|
 | a process's root (`chroot`) and mount table | one host filesystem | guest paths resolved component by component (`crates/kernel/src/fs.rs`): symlinks followed by fwe, mounts entered, `..` clamped at the process's root, as `openat2(RESOLVE_IN_ROOT)` would; the final host `openat` has `O_NOFOLLOW` added |
-| `open` flags | other values | translated (`host::open_flags_to_host`) |
 | descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 16384 at most), out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
-| `struct stat`, `statx` | different layout | translated |
-| `statfs` | different layout, APFS | translated; type ext4, sizes and counts the host's |
-| `getdents64` | `getdirentries` | built from it |
 | record locks (`F_SETLK`) | POSIX locks, different `struct flock` | translated; the host's, so they hold against host processes too |
 | OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
 | leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits, up to `fs.lease-break-time` |
@@ -2230,9 +1905,7 @@ names macOS does not support:
 |---|---|---|
 | `AF_INET6` = 10 | 30 | translated |
 | `sockaddr` starts with a 2-byte family | a length byte, then a family byte | header rewritten in place |
-| `SOCK_NONBLOCK`/`SOCK_CLOEXEC` in the type | none | applied with `fcntl` |
 | `MSG_NOSIGNAL` | `SO_NOSIGPIPE` | every socket gets `SO_NOSIGPIPE`; fwe raises `SIGPIPE` itself for a write or send without `MSG_NOSIGNAL` |
-| `SCM_RIGHTS`: 64-bit `cmsg_len` | 32-bit | re-encoded |
 | `AF_UNIX` paths | 104-byte limit | resolved in the guest's root; a long one bound, connected or sent to from its directory with `pthread_fchdir_np`; connecting or sending needs write permission on the node, as fwe keeps its mode |
 | abstract `AF_UNIX` names | none | files in a per-host temporary directory, or in an fwe network namespace's own directory, each with its name beside it; a name whose socket is gone is free to bind again |
 | socket option numbers and layouts at `SOL_SOCKET`, `IPPROTO_IP`, `IPPROTO_IPV6` and `IPPROTO_TCP` | numbered apart (`IP_TOS` 1 and 3, `TCP_KEEPIDLE` 4 and `TCP_KEEPALIVE` 0x10); `group_req` packed to 4 bytes; `ip_mreq_source` ordered apart; multicast TTL and loop a byte | each translated (`crates/kernel/src/sockopt.rs`); one the host lacks is `ENOPROTOOPT`, but `SO_NO_CHECK`, `SO_PRIORITY` and `SO_PASSCRED` are kept and read back, and `SO_DOMAIN`/`SO_PROTOCOL` answered by fwe |
@@ -2240,46 +1913,10 @@ names macOS does not support:
 | a level a socket has no layer for | taken or `EINVAL` | `EOPNOTSUPP` to get, `ENOPROTOOPT` to set (`EOPNOTSUPP` on a Unix socket) |
 | multicast membership on a TCP socket | refused | kept by fwe (no multicast reaches one) |
 | `MSG_MORE` | none | a TCP or UDP send's data held back and sent with the next send without it, as one segment or datagram |
-| `MSG_ERRQUEUE` | none | an IP socket's error queue is empty (`EAGAIN`) |
-| `sendmmsg`, `recvmmsg` | none | one `sendmsg` or `recvmsg` per message |
 | `connect` to `AF_UNSPEC` | dissolves a datagram socket's peer, reporting an error | a datagram socket's peer forgotten; a TCP socket's connection reset and a fresh host socket put in its place |
 | `IPV6_ADDRFORM` | none | an IPv6 socket with an IPv4-mapped peer reports its names as IPv4, and a reset makes it an IPv4 socket |
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
 | interface requests (`SIOCGIFCONF`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCSIFMTU`, ...) | a 32-byte `ifreq`, other flag bits | in an fwe network namespace, answered for `lo`; elsewhere the host's interfaces, `lo0` as `lo`, which the guest cannot change |
-| `SOCK_SEQPACKET` Unix sockets | none | a stream socket with length-prefixed frames (`crates/kernel/src/seqpacket.rs`) |
-| `AF_NETLINK`/`NETLINK_ROUTE` | none | in an fwe network namespace, answers for `lo`; in the initial one, for the host's loopback as `lo` |
-| `SO_PEERCRED` | `LOCAL_PEERCRED` | peer pid in the caller's pid namespace, ids as the guest sees them |
-
-#### System V IPC
-
-macOS has System V IPC, but one set for the machine, with small limits.
-fwe keeps its own per IPC namespace (`crates/kernel/src/sysvipc.rs`,
-`ipcops.rs`): a shared record holding every object, and a segment's
-memory in a file beside it that `shmat` maps shared. Each operation is one
-change of the record under its lock, so `semop` is atomic across
-processes. What a dead process leaves (attachments, `SEM_UNDO`) is cleaned
-up by the next process that looks. The initial namespace's record lasts
-until the host reboots.
-
-#### POSIX message queues
-
-macOS has no `mq_*`. Each queue is a record in its IPC namespace's
-directory (`crates/kernel/src/mqueue.rs`); the guest's descriptor is a
-host descriptor of the queue's file holding a shared `flock`, so an
-unlinked queue is freed with its last descriptor. Notifications go to the
-registering process: a signal carrying `SI_MESGQ` and the value, or, for
-`SIGEV_THREAD`, the cookie sent to the C library's netlink socket.
-
-#### Keys and keyrings
-
-macOS has no key retention service. fwe keeps every key in one record
-shared by all fwe processes (`crates/kernel/src/keys.rs`): keys, keyrings,
-permissions, quotas, and the thread, process, session, user and persistent
-keyrings. The key types (`keyring`, `user`, `logon`, `big_key`,
-`dns_resolver`, `asymmetric`, `encrypted`) and their cryptography
-(`keycrypto.rs`, as Linux 6.12 computes it) are fwe's. `request_key` has
-no `/sbin/request-key` upcall: a key it would construct is negative for a
-minute.
 
 ### Kernel-wide state
 
@@ -2290,31 +1927,17 @@ watches, shared futexes) lives in fwe's private directory on the host
 under a lock, and a mapped generation count so a process rereads only
 after another changed it.
 
-```mermaid
-flowchart LR
-    subgraph priv["fwe private directory (per user)"]
-        proc["process records (procreg): start time, cgroup, namespaces, ancestors, maps, mailbox"]
-        ns["namespace records: pid map, UTS names, net ports + sysctls, IPC objects + mqueues"]
-        mnt["mount tables per mount namespace"]
-        cg["cgroup tree (real directories)"]
-        other["keys, inotify watches, loop devices, shared-futex table"]
-    end
-    A["fwe process A"] <--> priv
-    B["fwe process B"] <--> priv
-    C["fwe process C"] <--> priv
-```
-
 A record's name carries a format number, so another fwe build never reads
 it. A record no live process holds is collected when a namespace is made
 and when a fresh fwe starts, at most once a minute (records younger than
-that are spared anyway), with the files a gone process left beside its
-record, and the `/dev/shm` directory of a rootfs no mount table shows.
-A fresh start leaves that work to a process of its own, which nothing
-waits for. The private directory is in the user's temporary directory,
-which macOS takes about a millisecond to name: fwe takes `TMPDIR` when
-it names it, and otherwise what the first fwe process to ask was told,
-kept in the process store. A process fwe starts for a guest's `execve`
-is handed the private directory itself.
+that are spared), with the files a gone process left beside its record
+and the `/dev/shm` directory of a rootfs no mount table shows; a fresh
+start leaves that work to a process of its own, which nothing waits for.
+The private directory is in the user's temporary directory, which macOS
+takes milliseconds to name: fwe takes it from `TMPDIR` when that names it,
+and otherwise from the process store, where the first fwe process to ask
+kept it. A process fwe starts for a guest's `execve` is handed the
+private directory itself.
 
 ### Namespaces
 
@@ -2368,9 +1991,6 @@ follows:
 - a mount shows a host directory (rootfs, bind source, a tmpfs's backing
   directory), an overlay of several, or one of fwe's filesystems (`proc`,
   `sysfs`, `cgroup2`, `devpts`, `mqueue`);
-- `mount`, `umount2`, `pivot_root`, `chroot` and the mount API (`fsopen`,
-  `fsconfig`, `fsmount`, `fspick`, `open_tree`, `move_mount`,
-  `mount_setattr`, `statmount`, `listmount`) act on the table;
 - propagation as Linux's: peer groups, slaves, across namespaces;
 - `nosuid`, `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time
   flags are enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
@@ -2407,20 +2027,29 @@ How host users and file owners look to the guest is under
 
 macOS has no seccomp. fwe runs each filter, classic BPF over Linux's
 `seccomp_data` (`AUDIT_ARCH_AARCH64`), before either backend routes a call
-(`crates/kernel/src/seccomp.rs`); the action of highest precedence wins.
-Filters apply to every thread of the process and are kept across `fork`
-and `execve`. `SECCOMP_RET_TRAP` raises `SIGSYS` with Linux's `_sigsys`
-fields; `SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF` fail with
-`ENOSYS`, as with no tracer or listener.
+(`crates/kernel/src/seccomp.rs`), so none escapes it; the action of
+highest precedence wins. Filters apply to every thread of the process and
+are kept across `fork` and `execve`. `SECCOMP_RET_TRAP` raises `SIGSYS`
+with Linux's `_sigsys` fields; `SECCOMP_RET_TRACE` and
+`SECCOMP_RET_USER_NOTIF` fail the call with `ENOSYS`, as Linux does with
+no tracer or listener. Strict mode allows `read`, `write`, `exit` and
+`rt_sigreturn` and ends the process with `SIGKILL` on any other call.
+`PR_SET_SECCOMP` and `PR_GET_SECCOMP` reach the same code.
+
+A container runtime turns its seccomp profile (Docker's default, podman's,
+a pod's) into such a filter and installs it in the container's first
+process, so the profile holds as on Linux: a call it refuses fails with
+the profile's errno, kills, or raises `SIGSYS`. CI's crun test runs a
+container with a profile and checks `Seccomp: 2` in its
+`/proc/self/status`.
 
 ### Security modules: SELinux, AppArmor, Landlock
 
 Linux's security modules (LSMs) add checks to the kernel's own: SELinux
 labels every process and file and checks each access against a policy;
 AppArmor confines a program to what its profile lists; Landlock lets a
-process restrict itself. macOS has its own (the sandbox, SIP), which
-apply to the `fwe` process as to any other and know nothing of the
-guest.
+process restrict itself. macOS's own (the sandbox, SIP) apply to the
+`fwe` process as to any other and know nothing of the guest.
 
 | Module | What fwe does | What a program sees |
 |---|---|---|
@@ -2430,24 +2059,10 @@ guest.
 | AppArmor | none | no `/sys/kernel/security/apparmor`: AppArmor is absent |
 | the list | `/sys/kernel/security/lsm` and `lsm_list_modules` name `capability,landlock` | only the modules that act |
 
-Container tools look before they use a module: podman, crun, runc and
-Docker apply an AppArmor profile or an SELinux label only where the host
-has the module, so here they run without one (`--security-opt
-label=...` and `apparmor=...` have nothing to act on), as on a Linux host
-without them. Their seccomp profiles do apply: see the next section.
-
-### Seccomp profiles
-
-A container runtime turns a seccomp profile (Docker's default, podman's,
-or a pod's) into a classic BPF filter and installs it in the container's
-first process with `seccomp(SECCOMP_SET_MODE_FILTER)`. fwe runs the
-filter on every system call before either backend routes it
-([seccomp](#seccomp)), so the profile holds as it would on Linux: a call
-it refuses fails with the profile's errno, kills, or raises `SIGSYS`.
-CI's crun test runs a container with a profile and checks `Seccomp: 2` in
-its `/proc/self/status`. Two actions have no counterpart: a filter that
-answers `SECCOMP_RET_TRACE` or `SECCOMP_RET_USER_NOTIF` fails the call
-with `ENOSYS`, as Linux does with no tracer or listener.
+podman, crun, runc and Docker apply an AppArmor profile or an SELinux
+label only where the host has the module, so here they run without one
+(`--security-opt label=...` and `apparmor=...` have nothing to act on),
+as on a Linux host without them. Their seccomp profiles do apply.
 
 ### eBPF
 
@@ -2471,8 +2086,9 @@ socket programs use (`crates/kernel/src/bpf.rs`, `bpfmap.rs`,
   (`bpfcheck.rs`, with a verifier log as Linux gives), run on what this
   process sends to the socket.
 - **Maps**: array and hash maps, with the lookup, update and delete
-  helpers, kept in files of fwe's that every process holding a
-  descriptor shares.
+  helpers. A loaded program or map is an unlinked file of fwe's that its
+  descriptor is open on, so every process holding a descriptor, a fork
+  child too, shares it.
 - A program of any other type loads and has an id, but is never
   attached. Tracing (kprobes, tracepoints, `perf_event_open`), XDP and
   traffic control, LSM programs, and the BPF filesystem are not there, so
@@ -2481,32 +2097,28 @@ socket programs use (`crates/kernel/src/bpf.rs`, `bpfmap.rs`,
 ### Isolation and security
 
 Namespaces, cgroups, credentials, seccomp and Landlock are enforced by
-fwe, between the guest's system calls and the host. That is enough to
-run container runtimes and their containers as they expect, and to keep
-well-behaved programs apart (their own pids, mounts, network, ids). It
-is not a boundary against a program that sets out to cross it:
+fwe, between the guest's system calls and the host. That is enough to run
+container runtimes and their containers as they expect, and to keep
+well-behaved programs apart. It is not a boundary against a program that
+sets out to cross it:
 
-- **The native backend** runs the program inside the `fwe` process. Its
-  code shares the address space with fwe's own code and data and with
-  macOS's libraries, so code that writes fwe's memory, jumps into
-  `libSystem`, or makes macOS's own system calls (an `svc` fwe did not
-  take for code) acts as the user who started `fwe`, with nothing of
-  fwe's in the way.
+- **The native backend** runs the program inside the `fwe` process, with
+  fwe's own code and data and macOS's libraries. Code that writes fwe's
+  memory, jumps into `libSystem`, or makes macOS's own system calls (an
+  `svc` fwe did not take for code) acts as the user who started `fwe`.
 - **The VM backend** keeps the guest's memory apart from fwe's: the guest
-  reaches the host only through its system calls and faults, which fwe
-  answers. That is a much smaller surface, but fwe's userspace kernel is
-  not hardened as a sandbox's is.
-- **Every guest process is the host user's.** What the guest thinks of
-  as root, a container's own user, or another user is the same macOS user
-  to the Mac: a file the guest may not write because of its virtual
-  owner is one the user's other programs can.
+  reaches the host only through its system calls and faults. That is a
+  much smaller surface, but fwe's userspace kernel is not hardened as a
+  sandbox's is.
+- **Every guest process is the host user's.** Root in the guest, a
+  container's user and any other guest user are the same macOS user: a
+  file the guest may not write because of its virtual owner is one the
+  user's other programs can.
 - **macOS's own protections** (the sandbox, SIP, privacy consent, the
   firewall) apply to `fwe` as to any program the user runs.
 
-So fwe isolates as a convenience, as `chroot` does, not as a security
-boundary, as a VM does. A program that must not be trusted is better run
-in a Linux VM (Lima, Colima, Apple's `container`; see
-[comparisons.md](comparisons.md)).
+So fwe isolates as `chroot` does, not as a VM does. A program that must
+not be trusted is better run in a Linux VM ([comparisons.md](comparisons.md)).
 
 ### Devices
 
@@ -2525,11 +2137,6 @@ numbers mean nothing there. fwe keeps its own:
 
 | Linux | macOS | fwe |
 |---|---|---|
-| clocks: `REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`, `*_COARSE`, `*_ALARM`, CPU-time | fewer | mapped onto the host's realtime, monotonic, raw and CPU-time clocks (`host::clock_to_host`) |
-| setting the clock (`CAP_SYS_TIME`) | root | refused with `EPERM` after Linux's argument checks, as in a container |
-| `reboot` (`CAP_SYS_BOOT`) | root | Linux's checks; Ctrl-Alt-Del's setting taken, a restart, halt or power off refused with `EPERM`: a guest never stops the Mac |
-| interval timers (`setitimer`, `alarm`) | the same, at most 100,000,000 s | the host's |
-| POSIX timers (`timer_create` and the rest) on any clock, with overruns | none | a thread of fwe's per process raises each timer's signal when due; a periodic timer goes again when its signal is taken, its overrun the intervals that passed (`crates/kernel/src/posixtimer.rs`) |
 | sleeps and timeouts (`nanosleep`, `clock_nanosleep`, `poll`, `select`, the `epoll` waits, futex waits, timerfd), woken within the timer slack (50 µs by default) | coalesced: a millisecond or more late | a kqueue timer per thread with `NOTE_CRITICAL`, in nanoseconds, which wakes within tens of microseconds |
 | nice, scheduling policies | own scheduler | kept in the process record with Linux's checks, inherited; the host schedules every process alike |
 | `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, `CORE`, `STACK`, `CPU`, `NPROC`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`): `CORE` for fwe's core dumps, `STACK` for the guest's stack, `CPU`'s hard limit and `NPROC` enforced by fwe; `NOFILE` is virtual, below fwe's reserved descriptors; `FSIZE`, `DATA`, `AS` are the host's |
@@ -2950,19 +2557,15 @@ for each kind of descriptor:
 
 ### Clocks and timers
 
-The guest's time is the Mac's. Linux has more clocks than macOS; fwe reads
-each from the host clock that means the same:
-
-| On macOS | What fwe does | What the guest sees |
-|---|---|---|
-| the host's realtime clock, set by the user or NTP | `CLOCK_REALTIME`, `TAI`, `*_COARSE`, `*_ALARM` read it | the host's time; the guest cannot set it (`EPERM`) |
-| the host's monotonic clocks | `MONOTONIC`, `BOOTTIME` and their variants read `CLOCK_MONOTONIC`; `MONOTONIC_RAW` reads `CLOCK_MONOTONIC_RAW` | the host's |
-| a host thread's or process's CPU time | the CPU-time clocks | its CPU time |
-| an interval timer expiring | relayed signal | `SIGALRM`, `SIGVTALRM`, `SIGPROF` |
-| a POSIX timer falling due | fwe's timer thread raises its signal | the timer's signal, with its overrun count |
-| a timerfd's `EVFILT_TIMER` firing | counted | a readable timerfd and its expiration count |
-| a sleep interrupted by a signal the guest handles | `nanosleep`, `clock_nanosleep` are not restarted | `EINTR` |
-| VM: the guest reads the counter | `CNTVCT_EL0` is the vCPU's virtual counter; a `CNTPCT_EL0` read is emulated from it | one counter, as on Linux |
+The guest's time is the Mac's. `CLOCK_REALTIME`, `TAI`, the `*_COARSE` and
+`*_ALARM` clocks read the host's realtime clock, which the guest cannot
+set (`EPERM`); `MONOTONIC`, `BOOTTIME` and their variants read the host's
+`CLOCK_MONOTONIC`, `MONOTONIC_RAW` its raw clock, and the CPU-time clocks
+the host thread's or process's CPU time. Interval timers are the host's
+and their signals relayed; POSIX timers and timerfds are fwe's
+([Time calls](#time-calls)). In the VM, `CNTVCT_EL0` is the vCPU's virtual
+counter and a `CNTPCT_EL0` read is emulated from it, so the guest sees
+one counter, as on Linux.
 
 ### Memory pressure
 

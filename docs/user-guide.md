@@ -3,12 +3,12 @@
 `fwe` runs Linux programs built for arm64 on a Mac with Apple Silicon,
 without a Linux VM: the program's own code runs on the Mac's processor,
 and `fwe` plays the Linux kernel for it. This guide covers installing
-`fwe`, getting a Linux userland to run programs in, running containers
-with podman, and what does not work.
+`fwe`, a Linux userland, running programs, Windows programs and
+containers, and what does not work.
 
-The blocks marked as tested below are run by CI as they are written
-(`user_guide_recipes` in `crates/fwe/tests/guests.rs`), each followed by
-the output it gives.
+CI runs the blocks marked as tested as they are written
+(`user_guide_recipes` in `crates/fwe/tests/guests.rs`); each is followed
+by its output.
 
 ## Installing
 
@@ -43,15 +43,14 @@ codesign --sign - --force --options runtime \
 ## A Linux userland
 
 Linux programs expect a Linux filesystem around them: their libraries,
-`/etc`, `/usr/bin`. `fwe --pull` makes one from a container image,
-fetching its linux/arm64 variant from the image's registry (Docker Hub
-unless named otherwise) and unpacking it into a new directory; `--root`
-then makes that directory the program's `/`.
+`/etc`, `/usr/bin`. `fwe --pull` makes one from a container image: it
+fetches the linux/arm64 variant from the image's registry (Docker Hub
+unless named otherwise) and unpacks it into a new directory. `--root`
+makes that directory the program's `/`.
 
 A program inside the root is named by its path on the Mac. The
 environment is passed on as it is, so give the program a Linux one with
-`env -i`, as a login would (`fwe` found first, on your `PATH`). This
-guide uses a shell function for it:
+`env -i`, as a login would. This guide uses a shell function for it:
 
 ```sh
 # linux ROOT PROGRAM [ARGS...]: run PROGRAM (a path in ROOT) with ROOT as /.
@@ -91,9 +90,9 @@ What `--pull` does beyond unpacking:
   `passwd`), keep their owners and modes as Linux programs see them, in
   extended attributes `fwe` reads. The guest sees your own files as
   root's, and runs as root unless it changes user.
-- `/etc/resolv.conf` is written with your Mac's name servers at the
-  time, in place of the image's, and `/etc/hosts` where the image has
-  none, as a container runtime does at a container's start.
+- `/etc/resolv.conf` is written with your Mac's current name servers,
+  and `/etc/hosts` where the image has none, as a container runtime does
+  at a container's start.
 - On a case-insensitive volume (macOS's default), a file whose name
   differs from another's only in case cannot be kept: `--pull` leaves the
   later one out and lists it. Debian's image has one such file, a manual
@@ -112,8 +111,8 @@ unpacked into a directory serves.
 
 - **A program built for Linux on arm64** (an ELF file) runs directly:
   `fwe ./program`. A statically linked one needs nothing more; a
-  dynamically linked one needs its dynamic linker and libraries, so run it
-  in a root of the distribution it was built for, copied into the root.
+  dynamically linked one needs its dynamic linker and libraries, so copy
+  it into a root of the distribution it was built for and run it there.
 - **Threads, processes, signals, pipes, sockets, terminals and job
   control** behave as on Linux; `fork`, `exec` and `wait` make real Mac
   processes, one `fwe` for each Linux process.
@@ -126,18 +125,18 @@ unpacked into a directory serves.
 ### Programs linked below 4 GiB
 
 macOS keeps the lowest 4 GiB of a process's address space for itself, so
-a program linked to load there (a non-PIE executable: Debian's Python,
-GCC, clang and Go are) runs in a small VM instead, through
-Hypervisor.framework. `fwe` picks the VM for it by itself. This needs
+a program linked to load there (a non-PIE executable, such as Debian's
+Python, GCC, clang and Go) runs in a small VM instead, through
+Hypervisor.framework; `fwe` chooses the VM by itself. This needs
 `fwe` signed with the hypervisor entitlement (Homebrew's and the
 releases' are) on a Mac that offers the hypervisor
 (`sysctl kern.hv_support` prints `1`); otherwise `fwe` says the program
 needs the VM and exits with status 126. `fwe --vm` runs every program in
 the VM, for programs that need 4 KiB pages, such as Wine.
 
-The VM backend is tested on a software stand-in for Hypervisor.framework
-(CI's machines offer no hypervisor); its run on real hardware is still
-to come ([roadmap](../ROADMAP.md)).
+The VM backend is tested only on a software stand-in for
+Hypervisor.framework, since CI's machines offer no hypervisor
+([roadmap](../ROADMAP.md)).
 
 ### Windows programs
 
@@ -151,8 +150,9 @@ env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/
 ```
 
 CI's `wine` job runs `guests/windows/winprog.c` (built with
-`zig cc -target aarch64-windows-gnu`) this way: files, threads,
-exceptions and a child process.
+`zig cc -target aarch64-windows-gnu`) this way, exercising files,
+threads, exceptions and a child process. Programs with windows do not run
+yet (see below).
 
 ## Containers
 
@@ -219,10 +219,13 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **Programs for other processors** (x86-64): `fwe` runs arm64 code only.
+- **Graphical programs**, Linux's or Windows' through Wine: there is no
+  display yet ([roadmap](../ROADMAP.md#m7--graphical-programs-and-sandboxes)).
+- **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
+  runs arm64 code only.
 - **Chosen process ids**: pids are the Mac's.
-- The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10),
-  and where `fwe` differs from Linux in detail in the
+- The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10);
+  where `fwe` differs from Linux in detail is in the
   [architecture's known limitations](architecture.md#known-limitations).
 
 ## Troubleshooting
@@ -235,4 +238,4 @@ that lacks it, and `--strace` names it.
   `--strace=failures` and look for `ENOSYS`; please report it with the
   trace.
 - **Name lookups fail in a root**: check its `/etc/resolv.conf`; `--pull`
-  writes the name servers your Mac had at the time.
+  wrote the name servers your Mac had when it ran.

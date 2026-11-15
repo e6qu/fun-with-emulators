@@ -1,9 +1,9 @@
 # Vendored Debian programs (test fixture)
 
 Unmodified GNU coreutils, bash, git, SQLite and lighttpd from Debian 12
-(bookworm) for `aarch64`, vendored so the end-to-end tests can run **real
-distribution binaries** from a Debian rootfs. They are dynamically linked
-against glibc and run against the glibc runtime vendored under `guests/glibc`
+(bookworm) for `aarch64`, vendored so the end-to-end tests run real
+distribution binaries from a Debian rootfs. They are dynamically linked
+against the glibc runtime vendored under `guests/glibc`
 (`/lib/ld-linux-aarch64.so.1` and `/lib/libc.so.6`).
 
 | File | |
@@ -55,7 +55,6 @@ most `GLIBC_2.36`, which lighttpd needs), from `https://deb.debian.org/debian/po
 - `lib/libz.so.1` from `zlib1g_1.2.13.dfsg-1_arm64.deb` (`z/zlib/`, SHA-256
   `52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913`),
   renamed from `libz.so.1.2.13` to its soname
-
 - `bin/sqlite3` from `sqlite3_3.40.1-2+deb12u2_arm64.deb` (`s/sqlite3/`,
   SHA-256 `1f14747c3e019164bc6ed4c1aba47d9705fd7ec990594669b073cd8e3ddc737d`)
 - `lib/libsqlite3.so.0` from `libsqlite3-0_3.40.1-2+deb12u2_arm64.deb`
@@ -80,7 +79,7 @@ Each `.deb` is an `ar` archive whose `data.tar.xz` holds the files.
 
 ## Fetched, not vendored
 
-Programs too large to keep here are listed in `fetch/` instead, one file per
+Programs too large to keep here are listed in `fetch/`, one file per
 test: each line is a Debian 12 `arm64` package's pool path and its SHA-256
 from the bookworm index. The test downloads them from `deb.debian.org` (or,
 once a newer version has replaced one there, from `snapshot.debian.org`),

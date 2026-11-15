@@ -1,14 +1,13 @@
 # Vendored glibc runtime (test fixture)
 
-An unmodified prebuilt [GNU C Library](https://www.gnu.org/software/libc/) for
-`aarch64`, vendored so the end-to-end tests can exercise **real glibc dynamic
-linking** — the case a Debian rootfs needs. macOS has no glibc, so the runtime
-is checked in rather than built from source here.
+An unmodified prebuilt [GNU C Library](https://www.gnu.org/software/libc/)
+for `aarch64`, vendored so the end-to-end tests exercise glibc's dynamic
+linking, which a Debian rootfs needs. macOS has no glibc to build it with.
 
-Unlike musl, glibc's dynamic linker and shared libc are separate files, so the
-linker maps `libc.so.6` itself at run time through our `mmap`; that library's
-code segment also holds its symbol, string and hash tables, which the rewrite
-must leave alone (`Elf::exec_file_ranges`).
+glibc's dynamic linker and shared libc are separate files, so the linker
+maps `libc.so.6` itself through fwe's `mmap`; that library's code segment
+also holds its symbol, string and hash tables, which the rewrite must
+leave alone (`Elf::exec_file_ranges`).
 
 | File | Purpose |
 | --- | --- |
