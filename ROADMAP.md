@@ -67,43 +67,15 @@ Compose, and Podman building, pushing, pulling and running rootless (and
 Debian's in the VM); Wine runs ARM64 Windows console programs under
 `fwe --vm`; the rare `x18` forms are rewritten, and a binary without
 section headers has its unwind table found through `PT_GNU_EH_FRAME`.
-*Each is tested end to end in CI.* Beyond M3:
-- **Processes and signals:** process descriptors (`pidfd_*`,
-  `CLONE_PIDFD`, `waitid(P_PIDFD)`); real-time signals, queued and across
-  processes; the parent-death signal; core dumps; resource limits;
-  `CLONE_VM` processes; priorities, scheduling policies and CPU-time
-  clocks; POSIX timers; ptrace of processes and threads; robust futexes
-  released as their owner ends, and `get_robust_list` of any thread;
-  zombies in `/proc`; process accounting (`acct`); I/O priorities;
-  `process_vm_readv` and `process_vm_writev`; Landlock.
-- **Memory:** `mremap`, `madvise` and `msync` as Linux has them; the
-  `mlock` family with accounting; `mincore`; `mseal`; `remap_file_pages`;
-  `/proc/<pid>/maps`, `smaps` with `PROCMAP_QUERY`, `/proc/self/mem` and
-  `pagemap`.
-- **Files:** `preadv2`/`pwritev2`; `openat2`; `O_TMPFILE`; file handles;
-  `ETXTBSY`; `fcntl` owners, signals, OFD locks, leases and pipe sizes;
-  `splice`, `tee`, `vmsplice`; inotify and dnotify; native AIO;
-  `sync`/`syncfs`; `file_getattr`/`file_setattr`; `cachestat`; owners and
-  Linux's permission checks for a guest that is not root; loop devices.
-- **Mounts and namespaces:** the new mount API (`fsopen` to `listmount`);
-  propagation and mount flags acted on; `pivot_root` of a chroot;
-  namespace descriptors with `setns` and the `NS_GET_*` requests.
-- **IPC and sockets:** System V IPC and POSIX message queues per IPC
-  namespace; keys and keyrings; socket arguments, options and requests as
-  Linux checks them; `sendmmsg`/`recvmmsg`; eBPF maps and socket filters,
-  their map accesses checked as they load; the IPC ids `kernel.*_next_id`
-  chooses.
-- **Waiting and time:** sleeps, timeouts, `poll`, `select` and timerfd as
-  Linux reports them; `epoll_pwait2`; `futex_waitv`, requeue, bitsets and
-  shared futexes.
-- **Containers, further:** a thread's own root, working directory, mounts
-  and namespaces (`unshare` and `setns` on one thread); namespace files
-  bound to paths (`nsfs`); `CLONE_PARENT` children waited for by their
-  parent; the host's interfaces described over netlink.
-- **Other calls:** `personality`, `getcpu`, `syslog`, `membarrier`,
-  `readahead`, `sync_file_range`, `vhangup`, `reboot`, strict seccomp, the
-  LSM calls, protection keys as on a CPU without them, and the clock
-  refused as Linux refuses it without `CAP_SYS_TIME`.
+*Each is tested end to end in CI.* Beyond M3 it brought process
+descriptors, real-time and cross-process signals, ptrace, POSIX timers,
+resource limits and scheduling; Linux's memory calls; the file calls
+(`openat2`, `O_TMPFILE`, file handles, leases, OFD locks, splice, inotify,
+AIO); the new mount API and propagation; System V IPC, message queues,
+keyrings, eBPF maps and socket filters; and the rest of Linux's call
+table that macOS can carry. What each Linux mechanism becomes under fwe
+is in
+[linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces).
 
 ## Left to 1.0
 
@@ -164,6 +136,11 @@ natively wherever fwe can make them fit the Mac.
     (compiler, C library).
   - **Everything else** keeps its budget against native macOS on the same
     runner.
+  - Each row names the backend fwe ran its programs in (from fwe's own
+    `backend:` marks), and the table adds native Linux on arm64 (another
+    machine), and, from `tools/bench/vm.sh` on a Mac, a Linux VM on that
+    Mac and fwe's VM backend (`fwe --vm`), the alternatives fwe competes
+    with.
 
   | Benchmark | Budget |
   |---|---|

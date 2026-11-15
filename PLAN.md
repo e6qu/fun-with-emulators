@@ -108,7 +108,9 @@ must outlive every process of a network.
   with their output checked.
 - **Conformance:** LTP's system-call tests run in CI against a baseline of
   those that pass (`tools/ltp`); a test that stops passing fails CI.
-- **Performance:** benchmarks in CI against native macOS and Linux on
-  arm64, with budgets fwe is held to (M6).
+- **Performance:** benchmarks against native macOS (on the same runner),
+  native Linux on arm64, a Linux VM on the same Mac and fwe's own VM
+  backend, each row naming the backend fwe ran it in; CI holds fwe to
+  budgets (M6), and `tools/bench/vm.sh` adds the VM columns on a Mac.
 
 [AGENTS.md](AGENTS.md) describes how work is delivered.
