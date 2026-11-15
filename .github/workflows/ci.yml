@@ -293,6 +293,7 @@ jobs:
           path: |
             macos.json
             bench-*.sample
+            bench-*.vmmap
       - if: failure()
         run: |
           mkdir -p crash-reports

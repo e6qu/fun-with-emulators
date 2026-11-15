@@ -509,7 +509,14 @@ def sampled(name, cmd):
     kept beside the results."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.sample")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["sample", str(proc.pid), "5", "1", "-file", out], capture_output=True)
+    sampler = subprocess.Popen(["sample", str(proc.pid), "5", "1", "-file", out],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # What is mapped where (the guest's libraries are files the host
+    # maps), to name the guest's code in the sample: taken as it runs.
+    time.sleep(0.2)
+    with open(out[: -len(".sample")] + ".vmmap", "w") as f:
+        subprocess.run(["vmmap", "-wide", str(proc.pid)], stdout=f, stderr=subprocess.DEVNULL)
+    sampler.wait()
     proc.wait()
     tops = collections.Counter()
     with open(out, errors="replace") as f:
@@ -558,6 +565,10 @@ def profile(name, cmd, theirs, fresh):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     sampled(name, cmd)
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    sampled(f"{name} natively", theirs)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
