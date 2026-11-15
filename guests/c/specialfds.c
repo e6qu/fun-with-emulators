@@ -22,6 +22,10 @@ struct sigaction {
     void (*restorer)(void);
 };
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
+int signalfd(int fd, const void *mask, int flags);
+int sigprocmask(int how, const void *set, void *old);
+int kill(int pid, int sig);
+int getpid(void);
 int eventfd(unsigned initval, int flags);
 int *__errno_location(void);
 int strcmp(const char *a, const char *b);
@@ -73,9 +77,29 @@ static int overflow(void) {
     return 0;
 }
 
+/* A signal two signalfds watch is read once; a standard signal sent twice
+ * before it is read is pending once. */
+static int once(void) {
+    unsigned long long set = 1ULL << (10 - 1);
+    sigprocmask(0, &set, 0);
+    int a = signalfd(-1, &set, 04000);
+    int b = signalfd(-1, &set, 04000);
+    kill(getpid(), 10);
+    kill(getpid(), 10);
+    unsigned char info[128];
+    long first = read(a, info, sizeof info);
+    long second = read(b, info, sizeof info);
+    int e = errno;
+    long third = read(a, info, sizeof info);
+    printf("first %ld, other signalfd %ld errno %d, again %ld\n", first, second, e, third);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "once"))
+        return once();
     if (!strcmp(argv[1], "overflow"))
         return overflow();
     if (!strcmp(argv[1], "flags"))

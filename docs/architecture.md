@@ -1264,8 +1264,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   completing) may or may not reach the child.
 - A fork child: an epoll or timerfd descriptor duplicated with `dup` is
   gone (only the original number is rebuilt); a timerfd's expiries are
-  counted for parent and child apart; signalfd queues are the child's own
-  copies while their readiness pipes are shared.
+  counted for parent and child apart; the signals moved onto signalfds
+  are the child's own copy while the signalfds' readiness pipes are
+  shared.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
 - `clone3` chooses no pid in the initial pid namespace (`EPERM`) nor a

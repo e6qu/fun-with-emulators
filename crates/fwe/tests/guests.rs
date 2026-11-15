@@ -1155,6 +1155,17 @@ fn an_overflowing_eventfd_write_waits() {
     );
 }
 
+/// A signal two signalfds watch is read once, by the first to read it,
+/// and a standard signal sent twice before it is read is pending once.
+#[test]
+fn a_signal_is_read_once_across_signalfds() {
+    c_guest_prints(
+        "specialfds",
+        &["once"],
+        "first 128, other signalfd -1 errno 11, again -1\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]

@@ -1,13 +1,16 @@
 //! `signalfd`: read pending signals through a file descriptor.
 //!
 //! The host has no `signalfd`, so it is emulated here: each signalfd is a pipe
-//! (for readiness, so it is pollable by `epoll`) plus a queue of
-//! `signalfd_siginfo` records and the set of signals it watches. The host
-//! never blocks a watched signal, so it always reaches the backend's handler
-//! and is recorded pending; a pending signal that the thread blocks and some
-//! signalfd watches is then moved onto that signalfd
-//! ([`crate::signal::drain_to_signalfd`]), and `read` returns the queued
-//! records.
+//! (for readiness, so it is pollable by `epoll`) and the set of signals it
+//! watches. The host never blocks a watched signal, so it always reaches the
+//! backend's handler and is recorded pending; a pending signal that the
+//! thread blocks and some signalfd watches is then moved onto the process's
+//! queue of `signalfd_siginfo` records
+//! ([`crate::signal::drain_to_signalfd`]), where it stays pending once, as on
+//! Linux: a standard signal is queued once however often it is sent, and a
+//! record is taken by the first `read` of any signalfd that watches it. A
+//! signalfd's pipe holds a byte exactly while the queue holds a record it
+//! watches.
 
 use fwe_abi::{err, errno};
 use std::collections::{HashMap, VecDeque};
@@ -16,22 +19,71 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Size of `struct signalfd_siginfo`.
 pub const SIGINFO_SIZE: usize = 128;
 
+/// The first real-time signal: signals below it are standard ones, pending
+/// at most once.
+const SIGRTMIN: u32 = 32;
+
 struct SignalFd {
     rfd: i32,
     wfd: i32,
     mask: u64,
+    /// Whether its pipe holds the readiness byte.
+    ready: bool,
+}
+
+/// The signalfds, and the signals moved onto them, in the order they came.
+#[derive(Default)]
+struct Reg {
+    fds: HashMap<i32, SignalFd>,
     queue: VecDeque<[u8; SIGINFO_SIZE]>,
 }
 
-static REG: crate::kept::Kept<Option<HashMap<i32, SignalFd>>> = crate::kept::Kept::new(None);
+impl crate::kept::Table for Reg {
+    fn is_empty(&self) -> bool {
+        self.fds.is_empty() && self.queue.is_empty()
+    }
+}
+
+impl Reg {
+    /// Give each signalfd its readiness byte while the queue holds a
+    /// record it watches, and take it away otherwise.
+    fn settle(&mut self) {
+        let pending = self.queue.iter().fold(0u64, |m, r| m | bit(signo(r)));
+        for s in self.fds.values_mut() {
+            let want = s.mask & pending != 0;
+            if want && !s.ready {
+                let b = [0u8];
+                // SAFETY: the pipe holds at most one readiness byte.
+                unsafe { libc::write(s.wfd, b.as_ptr().cast(), 1) };
+            } else if !want && s.ready {
+                let mut b = 0u8;
+                // SAFETY: the readiness byte is there to take.
+                unsafe { libc::read(s.rfd, (&mut b as *mut u8).cast(), 1) };
+            }
+            s.ready = want;
+        }
+    }
+}
+
+/// The signal a record is of.
+fn signo(r: &[u8; SIGINFO_SIZE]) -> u32 {
+    u32::from_ne_bytes(r[0..4].try_into().unwrap())
+}
+
+/// Signal `sig`'s bit in a Linux set (none for 0 or past 64).
+fn bit(sig: u32) -> u64 {
+    if (1..=64).contains(&sig) { 1 << (sig - 1) } else { 0 }
+}
+
+static REG: crate::kept::Kept<Option<Reg>> = crate::kept::Kept::new(None);
 /// The union of every signalfd's mask, readable without the lock.
 static WATCHED: AtomicU64 = AtomicU64::new(0);
 
-fn with<R>(f: impl FnOnce(&mut HashMap<i32, SignalFd>) -> R) -> R {
+fn with<R>(f: impl FnOnce(&mut Reg) -> R) -> R {
     let mut g = REG.lock();
-    let reg = g.get_or_insert_with(HashMap::new);
+    let reg = g.get_or_insert_with(Reg::default);
     let r = f(reg);
-    WATCHED.store(reg.values().fold(0, |m, s| m | s.mask), Ordering::Release);
+    WATCHED.store(reg.fds.values().fold(0, |m, s| m | s.mask), Ordering::Release);
     r
 }
 
@@ -44,28 +96,31 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 /// Write the registry into a fork snapshot.
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     let mut g = REG.lock();
-    crate::snapshot::fd_map(e, g.get_or_insert_with(HashMap::new), |e, s| {
+    let reg = g.get_or_insert_with(Reg::default);
+    crate::snapshot::fd_map(e, &reg.fds, |e, s| {
         e.i32(s.rfd);
         e.i32(s.wfd);
         e.u64(s.mask);
-        crate::snapshot::queue(e, &s.queue);
-    })
+        e.bool(s.ready);
+    });
+    crate::snapshot::queue(e, &reg.queue);
 }
 
 /// Rebuild the registry in a fork child (its pipes are inherited).
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
-    let reg = crate::snapshot::read_fd_map(d, |d| SignalFd {
+    let fds = crate::snapshot::read_fd_map(d, |d| SignalFd {
         rfd: d.i32(),
         wfd: d.i32(),
         mask: d.u64(),
-        queue: crate::snapshot::read_queue(d),
+        ready: d.bool(),
     });
-    with(|m| *m = reg);
+    let queue = crate::snapshot::read_queue(d);
+    with(|m| *m = Reg { fds, queue });
 }
 
 /// Whether `fd` is a signalfd.
 pub fn is_signalfd(fd: i32) -> bool {
-    with(|m| m.contains_key(&fd))
+    with(|m| m.fds.contains_key(&fd))
 }
 
 /// The signals some signalfd watches (a Linux set).
@@ -103,9 +158,10 @@ pub fn signalfd4(fd: i32, mask: u64, flags: u64) -> i64 {
         return err(errno::EINVAL);
     }
     if fd != -1 {
-        return with(|m| match m.get_mut(&fd) {
+        return with(|m| match m.fds.get_mut(&fd) {
             Some(s) => {
                 s.mask = mask;
+                m.settle();
                 fd as i64
             }
             // An open descriptor of another kind (`EINVAL`), or none.
@@ -147,8 +203,10 @@ fn make(mask: u64, cloexec: bool, nonblock: bool) -> Result<i32, i32> {
         // SAFETY: plain host call on a fresh descriptor.
         unsafe { libc::fcntl(rfd, libc::F_SETFL, libc::O_NONBLOCK) };
     }
-    let s = SignalFd { rfd, wfd, mask, queue: VecDeque::new() };
-    with(|m| m.insert(rfd, s));
+    with(|m| {
+        m.fds.insert(rfd, SignalFd { rfd, wfd, mask, ready: false });
+        m.settle();
+    });
     Ok(rfd)
 }
 
@@ -157,7 +215,7 @@ fn make(mask: u64, cloexec: bool, nonblock: bool) -> Result<i32, i32> {
 /// reader's signals, so the receiver makes its own.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
-    let mask = with(|m| m.get(&fd).map(|s| s.mask))?;
+    let mask = with(|m| m.fds.get(&fd).map(|s| s.mask))?;
     let mut e = crate::snapshot::Enc::new();
     e.u64(mask);
     // SAFETY: F_GETFL only queries the descriptor.
@@ -176,7 +234,7 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
 pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
     let (mask, nonblock) = (d.u64(), d.bool());
     let Ok(rfd) = make(mask, false, nonblock) else { return false };
-    let s = with(|m| m.remove(&rfd));
+    let s = with(|m| m.fds.remove(&rfd));
     if !crate::scm::replace(fd, rfd) {
         if let Some(s) = s {
             // SAFETY: the write end made above.
@@ -186,33 +244,28 @@ pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
     }
     if let Some(mut s) = s {
         s.rfd = fd;
-        with(|m| m.insert(fd, s));
+        with(|m| m.fds.insert(fd, s));
     }
     true
 }
 
-/// Queue `info` on every signalfd that watches signal `sig` (bit `sig-1`).
-/// Returns true if at least one took it.
+/// Queue `info` for signal `sig` (1 to 64) on the process's signalfds, if
+/// any watches it: a standard signal already queued is not queued again.
+/// Returns whether one watches it.
 pub fn deliver(sig: u64, info: [u8; SIGINFO_SIZE]) -> bool {
-    if sig == 0 || sig > 64 {
+    let sig = sig as u32;
+    if bit(sig) == 0 {
         return false;
     }
-    let bit = 1u64 << (sig - 1);
     with(|m| {
-        let mut took = false;
-        for s in m.values_mut() {
-            if s.mask & bit != 0 {
-                let was_empty = s.queue.is_empty();
-                s.queue.push_back(info);
-                if was_empty {
-                    let b = [0u8];
-                    // SAFETY: the pipe holds at most one readiness byte.
-                    unsafe { libc::write(s.wfd, b.as_ptr() as *const _, 1) };
-                }
-                took = true;
-            }
+        if !m.fds.values().any(|s| s.mask & bit(sig) != 0) {
+            return false;
         }
-        took
+        if sig >= SIGRTMIN || !m.queue.iter().any(|r| signo(r) == sig) {
+            m.queue.push_back(info);
+        }
+        m.settle();
+        true
     })
 }
 
@@ -221,35 +274,36 @@ pub fn deliver(sig: u64, info: [u8; SIGINFO_SIZE]) -> bool {
 /// # Safety
 /// `buf` must span `len` writable bytes.
 pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
-    let rfd = with(|m| m.get(&fd).map(|s| s.rfd))?;
+    let rfd = with(|m| m.fds.get(&fd).map(|s| s.rfd))?;
     if (len as usize) < SIGINFO_SIZE {
         return Some(err(errno::EINVAL));
     }
     let max = (len as usize) / SIGINFO_SIZE;
     loop {
         let got = with(|m| {
-            let s = m.get_mut(&fd)?;
-            if s.queue.is_empty() {
-                return None;
-            }
+            let mask = m.fds.get(&fd)?.mask;
             let mut n = 0;
-            while n < max {
-                let Some(rec) = s.queue.pop_front() else { break };
+            let mut at = 0;
+            while n < max && at < m.queue.len() {
+                if bit(signo(&m.queue[at])) & mask == 0 {
+                    at += 1;
+                    continue;
+                }
+                let rec = m.queue[at];
                 if crate::uaccess::write_from(buf + (n * SIGINFO_SIZE) as u64, &rec).is_err() {
-                    // Keep the record for a later read.
-                    s.queue.push_front(rec);
+                    // Kept for a later read.
                     if n == 0 {
                         return Some(err(errno::EFAULT));
                     }
                     break;
                 }
+                m.queue.remove(at);
                 n += 1;
             }
-            if s.queue.is_empty() {
-                let mut b = 0u8;
-                // SAFETY: a readiness byte is present when the queue drains.
-                unsafe { libc::read(s.rfd, &mut b as *mut _ as *mut _, 1) };
+            if n == 0 {
+                return None;
             }
+            m.settle();
             Some((n * SIGINFO_SIZE) as i64)
         });
         match got {
@@ -258,7 +312,11 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
                 // A signal that interrupted the wait below is pending against
                 // this thread; queue it if it is one of ours.
                 crate::signal::drain_to_signalfd();
-                if with(|m| m.get(&fd).is_some_and(|s| !s.queue.is_empty())) {
+                let ready = with(|m| {
+                    let mask = m.fds.get(&fd).map_or(0, |s| s.mask);
+                    m.queue.iter().any(|r| bit(signo(r)) & mask != 0)
+                });
+                if ready {
                     continue;
                 }
                 // As `signalfd4` or `F_SETFL` last set it.
@@ -280,9 +338,18 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
     }
 }
 
-/// Release a signalfd on `close`. `Some(0)` if it was ours.
+/// Release a signalfd on `close`. `Some(0)` if it was ours. The records
+/// no signalfd left watches go with it.
 pub fn try_close(fd: i32) -> Option<i64> {
-    let s = REG.if_used()?.as_mut()?.remove(&fd)?;
+    let s = {
+        let mut g = REG.if_used()?;
+        let reg = g.as_mut()?;
+        let s = reg.fds.remove(&fd)?;
+        let watched = reg.fds.values().fold(0, |m, s| m | s.mask);
+        reg.queue.retain(|r| bit(signo(r)) & watched != 0);
+        WATCHED.store(watched, Ordering::Release);
+        s
+    };
     // SAFETY: both ends were opened by this module.
     unsafe {
         libc::close(s.rfd);
@@ -331,6 +398,29 @@ mod tests {
         // Drained again.
         assert_eq!(empty_read(fd), Some(err(errno::EAGAIN)));
         assert_eq!(try_close(fd), Some(0));
+    }
+
+    /// A signal two signalfds watch is read once, by whichever reads
+    /// first; a standard signal sent twice before it is read is pending
+    /// once, a real-time one twice.
+    #[test]
+    fn a_signal_is_taken_once() {
+        // SIGUSR2 (12) and SIGRTMIN+5 (37).
+        let mask = (1u64 << 11) | (1u64 << 36);
+        let a = signalfd4(-1, mask, fwe_abi::fcntl::O_NONBLOCK) as i32;
+        let b = signalfd4(-1, mask, fwe_abi::fcntl::O_NONBLOCK) as i32;
+        assert!(deliver(12, siginfo_full(12, 0, 1, 0, 0, 0)));
+        assert!(deliver(12, siginfo_full(12, 0, 1, 0, 0, 0)));
+        assert!(read_one(b).is_some());
+        assert_eq!(empty_read(a), Some(err(errno::EAGAIN)));
+        assert_eq!(empty_read(b), Some(err(errno::EAGAIN)));
+        assert!(deliver(37, siginfo_full(37, 0, 1, 0, 0, 0)));
+        assert!(deliver(37, siginfo_full(37, 0, 1, 0, 0, 0)));
+        assert!(read_one(a).is_some());
+        assert!(read_one(b).is_some());
+        assert_eq!(empty_read(a), Some(err(errno::EAGAIN)));
+        assert_eq!(try_close(a), Some(0));
+        assert_eq!(try_close(b), Some(0));
     }
 
     #[test]
