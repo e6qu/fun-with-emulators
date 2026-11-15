@@ -21,6 +21,10 @@
 //! carries what the kernel itself sends it: a message queue's
 //! notification ([`crate::mqueue`]), for which [`bind_for_notify`] gives
 //! the socket a host address another process can send to.
+//!
+//! A socket's own options (`SOL_NETLINK`) are Linux's, checked as Linux
+//! checks them and kept, its groups too ([`setsockopt`], [`getsockopt`]);
+//! no group is sent to.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::{err, errno};
@@ -29,8 +33,22 @@ use std::sync::Mutex;
 
 pub const AF_NETLINK: u64 = 16;
 const NETLINK_ROUTE: u64 = 0;
-/// `SOL_NETLINK`, whose options are accepted and change nothing.
+/// `SOL_NETLINK`, the level of a netlink socket's own options.
 pub const SOL_NETLINK: u64 = 270;
+
+/// `SOL_NETLINK` options.
+const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+const NETLINK_DROP_MEMBERSHIP: u64 = 2;
+const NETLINK_LISTEN_ALL_NSID: u64 = 8;
+const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
+const NETLINK_CAP_ACK: u64 = 10;
+/// The options Linux keeps as a socket's flags, on or off:
+/// `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`,
+/// `NETLINK_LISTEN_ALL_NSID`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
+/// `NETLINK_GET_STRICT_CHK`.
+const FLAG_OPTIONS: [u64; 7] = [3, 4, 5, 8, 10, 11, 12];
+/// The multicast groups of `NETLINK_ROUTE` (`RTNLGRP_MAX` of Linux 6.12).
+const ROUTE_GROUPS: u32 = 36;
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -83,6 +101,37 @@ pub(crate) struct Sock {
     /// process that bound it (which alone removes it: a fork child that
     /// closes its copy leaves it).
     bound: Option<(Vec<u8>, i32)>,
+    /// Its `SOL_NETLINK` options.
+    opts: Opts,
+}
+
+/// A netlink socket's own options, as Linux keeps them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Opts {
+    /// The flag options set: bit `n` for option `n` ([`FLAG_OPTIONS`]).
+    flags: u32,
+    /// The multicast groups joined, bit `n` for group `n + 1`; `None`
+    /// until the socket first names a group (by `bind` or
+    /// `NETLINK_ADD_MEMBERSHIP`), as Linux has no groups for it till then.
+    groups: Option<u64>,
+}
+
+impl Opts {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.u32(self.flags);
+        e.bool(self.groups.is_some());
+        e.u64(self.groups.unwrap_or(0));
+    }
+
+    fn decode(d: &mut crate::snapshot::Dec) -> Opts {
+        let flags = d.u32();
+        let (some, groups) = (d.bool(), d.u64());
+        Opts { flags, groups: some.then_some(groups) }
+    }
+
+    fn has(&self, opt: u64) -> bool {
+        self.flags & (1 << opt) != 0
+    }
 }
 
 /// The most a socket's queue holds, and the largest request: Linux's
@@ -154,7 +203,12 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     fdmarks::mark(fd, Mark::Netlink);
     crate::net::fresh(fd);
-    socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin, net, bound: None }));
+    socks(|m| {
+        m.insert(
+            ino,
+            Sock { peer, port: 0, ty: base, admin, net, bound: None, opts: Opts::default() },
+        )
+    });
     fd as i64
 }
 
@@ -312,11 +366,128 @@ pub fn bind(fd: i32, addr: u64, len: u64) -> i64 {
             Some(s) if s.port != 0 && s.port != port => err(errno::EINVAL),
             Some(s) => {
                 s.port = port;
+                // The groups named, the first 32 (those the family has),
+                // replace the socket's first 32.
+                let groups = u64::from(a[2]) & ((1 << ROUTE_GROUPS) - 1);
+                if groups != 0 || s.opts.groups.is_some_and(|g| g as u32 != 0) {
+                    let had = s.opts.groups.unwrap_or(0);
+                    s.opts.groups = Some(had & !0xffff_ffff | groups);
+                }
                 0
             }
             None => err(errno::EBADF),
         }
     })
+}
+
+/// `setsockopt(fd, level, name, optval, optlen)` of a level other than
+/// `SOL_SOCKET`, as Linux's `netlink_setsockopt` takes it: only
+/// `SOL_NETLINK`, and of it the options Linux has (`ENOPROTOOPT` for
+/// others, `NETLINK_RX_RING` and `NETLINK_TX_RING` among them). A flag
+/// option is kept on or off; a group is joined or left (one past the
+/// family's is `EINVAL`); `NETLINK_LISTEN_ALL_NSID` needs
+/// `CAP_NET_BROADCAST` (`broadcast`). Of what they change, fwe acts on
+/// `NETLINK_CAP_ACK` (an error's acknowledgement carries the request's
+/// header only); the kernel sends nothing to the groups fwe answers for.
+pub fn setsockopt(
+    fd: i32,
+    level: u64,
+    name: u64,
+    optval: u64,
+    optlen: u64,
+    broadcast: bool,
+) -> i64 {
+    if level != SOL_NETLINK {
+        return err(errno::ENOPROTOOPT);
+    }
+    let val = if optlen as u32 >= 4 {
+        match crate::uaccess::read::<u32>(optval) {
+            Ok(v) => v,
+            Err(_) => return err(errno::EFAULT),
+        }
+    } else {
+        0
+    };
+    let Some(ino) = inode(fd) else { return err(errno::EBADF) };
+    let change = |f: &mut dyn FnMut(&mut Opts)| {
+        socks(|m| match m.get_mut(&ino) {
+            Some(s) => {
+                f(&mut s.opts);
+                0
+            }
+            None => err(errno::EBADF),
+        })
+    };
+    match name {
+        NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+            if val == 0 || val > ROUTE_GROUPS {
+                return err(errno::EINVAL);
+            }
+            change(&mut |o| {
+                let g = o.groups.unwrap_or(0);
+                let bit = 1u64 << (val - 1);
+                o.groups = Some(if name == NETLINK_ADD_MEMBERSHIP { g | bit } else { g & !bit });
+            })
+        }
+        NETLINK_LISTEN_ALL_NSID if !broadcast => err(errno::EPERM),
+        n if FLAG_OPTIONS.contains(&n) => {
+            if (optlen as u32) < 4 {
+                return err(errno::EINVAL);
+            }
+            change(&mut |o| {
+                if val != 0 {
+                    o.flags |= 1 << n;
+                } else {
+                    o.flags &= !(1 << n);
+                }
+            })
+        }
+        _ => err(errno::ENOPROTOOPT),
+    }
+}
+
+/// `getsockopt(fd, level, name, optval, optlen)` of a level other than
+/// `SOL_SOCKET`, as Linux's `netlink_getsockopt` gives it: a flag option
+/// as 0 or 1; `NETLINK_LIST_MEMBERSHIPS` the groups joined, as many
+/// 32-bit words of them as there is room for, and the room they take
+/// (none before the socket first names a group).
+pub fn getsockopt(fd: i32, level: u64, name: u64, optval: u64, optlen: u64) -> i64 {
+    if level != SOL_NETLINK {
+        return err(errno::ENOPROTOOPT);
+    }
+    let Ok(len) = crate::uaccess::read::<i32>(optlen) else { return err(errno::EFAULT) };
+    if len < 0 {
+        return err(errno::EINVAL);
+    }
+    let Some(ino) = inode(fd) else { return err(errno::EBADF) };
+    let Some(opts) = socks(|m| m.get(&ino).map(|s| s.opts)) else { return err(errno::EBADF) };
+    let put = |at: u64, v: u32| crate::uaccess::write(at, v).map_err(|_| err(errno::EFAULT));
+    let r = match name {
+        n if FLAG_OPTIONS.contains(&n) => {
+            if len < 4 {
+                return err(errno::EINVAL);
+            }
+            put(optlen, 4).and_then(|()| put(optval, u32::from(opts.has(n))))
+        }
+        NETLINK_LIST_MEMBERSHIPS => {
+            let groups = opts.groups.map_or(0, |_| ROUTE_GROUPS);
+            let words = groups.div_ceil(32);
+            let g = opts.groups.unwrap_or(0);
+            let mut r = Ok(());
+            for w in 0..words {
+                if (len as u32) < (w + 1) * 4 {
+                    break;
+                }
+                r = r.and_then(|()| put(optval + u64::from(w) * 4, (g >> (32 * w)) as u32));
+            }
+            r.and_then(|()| put(optlen, groups.div_ceil(8).next_multiple_of(4)))
+        }
+        _ => return err(errno::ENOPROTOOPT),
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// `getsockname` (or `getpeername`, `peer`: the kernel, port 0) into the
@@ -407,6 +578,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
             let (path, by) = s.bound.clone().unwrap_or_default();
             e.bytes(&path);
             e.i32(by);
+            s.opts.encode(e);
         }
     });
 }
@@ -419,14 +591,15 @@ pub(crate) fn load(d: &mut crate::snapshot::Dec) {
     for _ in 0..n {
         let (ino, peer, port, ty, admin) = (d.u64(), d.i32(), d.u32(), d.i32(), d.bool());
         let (some, path, by) = (d.bool(), d.bytes(), d.i32());
-        read.push((ino, peer, port, ty, admin, some.then_some((path, by))));
+        let opts = Opts::decode(d);
+        read.push((ino, peer, port, ty, admin, some.then_some((path, by)), opts));
     }
     let net = crate::netns::current();
     socks(|m| {
-        for (ino, peer, port, ty, admin, bound) in read {
+        for (ino, peer, port, ty, admin, bound, opts) in read {
             // SAFETY: plain host call on fwe's own descriptor.
             if unsafe { libc::fcntl(peer, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
-                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone(), bound });
+                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone(), bound, opts });
             }
         }
     });
@@ -452,6 +625,7 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
         e.bool(s.bound.is_some());
         e.bytes(&path);
         e.i32(by);
+        s.opts.encode(&mut e);
         Some(crate::scm::Export {
             kind: crate::scm::kind::NETLINK,
             state: e.into_bytes(),
@@ -476,6 +650,7 @@ pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec, companions: Vec<i32>
     let (port, ty, admin) = (d.u32(), d.i32(), d.bool());
     let net = crate::shared::load_opt(d).ok().flatten();
     let (some, path, by) = (d.bool(), d.bytes(), d.i32());
+    let opts = Opts::decode(d);
     let Some(ino) = inode(fd) else {
         // SAFETY: fwe's end, received above.
         unsafe { libc::close(peer) };
@@ -483,7 +658,7 @@ pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec, companions: Vec<i32>
     };
     fdmarks::mark(fd, Mark::Netlink);
     let bound = some.then_some((path, by));
-    socks(|m| m.insert(ino, Sock { peer, port, ty, admin, net, bound }));
+    socks(|m| m.insert(ino, Sock { peer, port, ty, admin, net, bound, opts }));
     true
 }
 
@@ -657,7 +832,8 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
     }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     let port = port_of(fd);
-    let Some((peer, admin, net)) = socks(|m| m.get(&ino).map(|s| (s.peer, s.admin, s.net.clone())))
+    let Some((peer, admin, net, opts)) =
+        socks(|m| m.get(&ino).map(|s| (s.peer, s.admin, s.net.clone(), s.opts)))
     else {
         return err(errno::EBADF);
     };
@@ -674,11 +850,12 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
         let head = &data[at..at + HEADER];
         let body = &data[at + HEADER..at + len];
         // An acknowledgement (the request's header, capped) or an error
-        // (the whole request), as Linux sends them.
+        // (the whole request, unless `NETLINK_CAP_ACK` caps it too), as
+        // Linux sends them.
         let whole = &data[at..at + len];
         let ack = |code: i32| {
             let mut b = (-code).to_ne_bytes().to_vec();
-            let flags = if code == 0 {
+            let flags = if code == 0 || opts.has(NETLINK_CAP_ACK) {
                 b.extend_from_slice(head);
                 NLM_F_CAPPED
             } else {
@@ -819,5 +996,47 @@ mod tests {
         let v4: usize = links.iter().map(|f| addr_bodies(f, 2).len()).sum();
         let want = host.iter().flat_map(|f| &f.addrs).filter(|a| a.addr.len() == 4).count();
         assert_eq!(v4, want);
+    }
+
+    /// A netlink socket's own options are Linux's: others are
+    /// `ENOPROTOOPT`, a flag is kept on or off, a group must be one the
+    /// family has, `NETLINK_LISTEN_ALL_NSID` needs `CAP_NET_BROADCAST`, and
+    /// the groups joined read back as Linux lists them.
+    #[test]
+    fn options_are_linuxs() {
+        let fd = socket(3, 0, true) as i32;
+        assert!(fd >= 0);
+        let set = |name: u64, v: u32, len: u64, broadcast: bool| {
+            setsockopt(fd, SOL_NETLINK, name, (&raw const v) as u64, len, broadcast)
+        };
+        let get = |name: u64, room: u32| {
+            let mut v = [0u32; 4];
+            let mut len = room;
+            let r = getsockopt(fd, SOL_NETLINK, name, v.as_mut_ptr() as u64, (&raw mut len) as u64);
+            (r, len, v)
+        };
+        assert_eq!(set(6, 1, 4, true), err(errno::ENOPROTOOPT));
+        assert_eq!(setsockopt(fd, 0, 1, 0, 0, true), err(errno::ENOPROTOOPT));
+        assert_eq!(get(13, 4).0, err(errno::ENOPROTOOPT));
+        assert_eq!(set(11, 1, 2, true), err(errno::EINVAL));
+        assert_eq!(set(8, 1, 4, false), err(errno::EPERM));
+        assert_eq!(get(9, 16), (0, 0, [0; 4]));
+        assert_eq!(set(11, 1, 4, true), 0);
+        assert_eq!(get(11, 4), (0, 4, [1, 0, 0, 0]));
+        assert_eq!(get(11, 2).0, err(errno::EINVAL));
+        assert_eq!(set(11, 0, 4, true), 0);
+        assert_eq!(get(11, 4).2[0], 0);
+        assert_eq!(set(1, 0, 4, true), err(errno::EINVAL));
+        assert_eq!(set(1, ROUTE_GROUPS + 1, 4, true), err(errno::EINVAL));
+        assert_eq!(set(1, ROUTE_GROUPS, 4, true), 0);
+        assert_eq!(set(1, 2, 4, true), 0);
+        assert_eq!(get(9, 16), (0, 8, [2, 1 << (ROUTE_GROUPS - 33), 0, 0]));
+        // Room for one word: the first, and the room all of them take.
+        assert_eq!(get(9, 4), (0, 8, [2, 0, 0, 0]));
+        assert_eq!(set(2, 2, 4, true), 0);
+        assert_eq!(get(9, 16).2[0], 0);
+        closed(fd);
+        // SAFETY: the socket made here.
+        unsafe { libc::close(fd) };
     }
 }

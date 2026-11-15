@@ -480,11 +480,20 @@ impl<P: Platform> Kernel<P> {
             nr::GETPEERNAME => crate::netns::as_socket(a[0] as i32, || unsafe {
                 crate::net::getname(a[0], a[1], a[2], true)
             }),
-            // A netlink socket's own options change nothing fwe does.
+            // A netlink socket's options of a level of its own.
             nr::SETSOCKOPT
-                if a[1] == crate::netlink::SOL_NETLINK && crate::netlink::is(a[0] as i32) =>
+                if a[1] != fwe_abi::socket::SOL_SOCKET
+                    && (a[4] as i32) >= 0
+                    && crate::netlink::is(a[0] as i32) =>
             {
-                0
+                let broadcast =
+                    self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_BROADCAST);
+                crate::netlink::setsockopt(a[0] as i32, a[1], a[2], a[3], a[4], broadcast)
+            }
+            nr::GETSOCKOPT
+                if a[1] != fwe_abi::socket::SOL_SOCKET && crate::netlink::is(a[0] as i32) =>
+            {
+                crate::netlink::getsockopt(a[0] as i32, a[1], a[2], a[3], a[4])
             }
             // SAFETY: the option buffer is validated by the host/impl.
             nr::SETSOCKOPT => unsafe {
