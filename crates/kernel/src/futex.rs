@@ -13,33 +13,103 @@
 
 use fwe_abi::{Timespec, err, errno, futex};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// One waiter on a private futex: what it waits for, and whether a wake
-/// has claimed it.
+/// One waiter on a private futex: what it waits for, whether a wake has
+/// claimed it, and where its thread sleeps.
 struct Waiter {
     bits: u32,
     woken: AtomicBool,
-    /// Its thread's wake pipe, written as it is woken, to end a wait close
-    /// to its deadline at once ([`crate::thread::nap_ns`]); -1 for none.
+    park: Arc<Park>,
+}
+
+/// Where one wait's thread sleeps (for `futex_waitv`, its every futex's
+/// waiter): a word of its own, which a wake sets and wakes the thread on,
+/// and no other.
+struct Park {
+    /// 0 until a wake.
+    word: AtomicU32,
+    /// Its thread's wake pipe, written as it is woken while it naps close
+    /// to its deadline ([`crate::thread::nap_ns`]), to end the nap at once;
+    /// -1 for none.
     poke: i32,
+    napping: AtomicBool,
+}
+
+impl Park {
+    fn new() -> Arc<Park> {
+        Arc::new(Park {
+            word: AtomicU32::new(0),
+            poke: crate::thread::poke_fd(),
+            napping: AtomicBool::new(false),
+        })
+    }
+
+    /// Sleep until woken, `most` at most (or a host signal).
+    fn sleep(&self, most: Duration) {
+        let ns = most.as_nanos().min(u64::MAX as u128) as u64;
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn __ulock_wait2(op: u32, a: *mut libc::c_void, v: u64, t: u64, v2: u64) -> i32;
+            }
+            // `UL_COMPARE_AND_WAIT | ULF_NO_ERRNO`: this process's own word.
+            // SAFETY: waits on the park's word while it holds 0.
+            unsafe { __ulock_wait2(1 | 0x0100_0000, self.word.as_ptr().cast(), 0, ns, 0) };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let t = libc::timespec {
+                tv_sec: (ns / 1_000_000_000) as libc::time_t,
+                tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+            };
+            // SAFETY: a private futex wait on the park's word while it is 0.
+            unsafe {
+                libc::syscall(libc::SYS_futex, self.word.as_ptr(), libc::FUTEX_WAIT_PRIVATE, 0, &t);
+            }
+        }
+    }
+
+    /// Wake its thread. Called with the queues locked: a thread napping
+    /// cannot have left its wait (nor ended) meanwhile, so its wake pipe is
+    /// still its own.
+    fn wake(&self) {
+        self.word.store(1, Ordering::SeqCst);
+        if self.napping.load(Ordering::SeqCst) && self.poke >= 0 {
+            // SAFETY: one byte to the waiting thread's own non-blocking
+            // pipe; a full pipe is woken already.
+            unsafe { libc::write(self.poke, b"f".as_ptr().cast(), 1) };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn __ulock_wake(op: u32, a: *mut libc::c_void, v: u64) -> i32;
+            }
+            // `UL_COMPARE_AND_WAIT | ULF_NO_ERRNO`.
+            // SAFETY: wakes the thread waiting on the park's word.
+            unsafe { __ulock_wake(1 | 0x0100_0000, self.word.as_ptr().cast(), 0) };
+        }
+        #[cfg(not(target_os = "macos"))]
+        // SAFETY: a private futex wake on the park's word.
+        unsafe {
+            libc::syscall(libc::SYS_futex, self.word.as_ptr(), libc::FUTEX_WAKE_PRIVATE, 1);
+        }
+    }
 }
 
 /// The private futexes' wait queues, keyed by the guest address of the
 /// futex word, oldest waiter first. A wake takes its waiters off the queue
 /// and marks them woken, as Linux does (it reports how many, and wakes
-/// them whatever the word holds); one global condvar backs them, on which
-/// each waiter looks for its own mark.
+/// them whatever the word holds), and wakes each one's thread alone.
 struct Table {
     queues: Mutex<HashMap<u64, VecDeque<Arc<Waiter>>>>,
-    cv: Condvar,
 }
 
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
-    TABLE.get_or_init(|| Table { queues: Mutex::new(HashMap::new()), cv: Condvar::new() })
+    TABLE.get_or_init(|| Table { queues: Mutex::new(HashMap::new()) })
 }
 
 /// Read the futex word from guest memory (an aligned single load).
@@ -228,6 +298,7 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
         }
         woken.unwrap_or(err(e))
     };
+    let park = Park::new();
     let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     for &(uaddr, val, private) in &list {
         if let Err(e) = load(uaddr) {
@@ -242,18 +313,15 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
             continue;
         }
         let _ = (private, val);
-        let me = Arc::new(Waiter {
-            bits: u32::MAX,
-            woken: AtomicBool::new(false),
-            poke: crate::thread::poke_fd(),
-        });
+        let me =
+            Arc::new(Waiter { bits: u32::MAX, woken: AtomicBool::new(false), park: park.clone() });
         queues.entry(key(uaddr)).or_default().push_back(me.clone());
         held.push(Held::Queued(me));
     }
     if list.iter().any(|&(uaddr, val, _)| load(uaddr) != Ok(val)) {
         return done(held, &mut queues, errno::EAGAIN);
     }
-    // Shared slots are looked at between slices; a private wake notifies.
+    // Shared slots are looked at between slices; a private wake wakes.
     let slice_most = if held.iter().any(|h| matches!(h, Held::Slot(_))) {
         Duration::from_millis(1)
     } else {
@@ -278,7 +346,9 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
             queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
-        queues = table.cv.wait_timeout(queues, slice).unwrap_or_else(|e| e.into_inner()).0;
+        drop(queues);
+        park.sleep(slice);
+        queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -443,8 +513,8 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
         Ok(_) => return err(errno::EAGAIN),
         Err(e) => return err(e),
     }
-    let me =
-        Arc::new(Waiter { bits, woken: AtomicBool::new(false), poke: crate::thread::poke_fd() });
+    let park = Park::new();
+    let me = Arc::new(Waiter { bits, woken: AtomicBool::new(false), park: park.clone() });
     queues.entry(key(uaddr)).or_default().push_back(me.clone());
     loop {
         if me.woken.load(Ordering::SeqCst) {
@@ -479,14 +549,18 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
             Some(d) => (d - now).min(SIGNAL_CHECK),
             None => SIGNAL_CHECK,
         };
-        if let Some(d) = deadline.filter(|&d| near(d, now).is_some() && me.poke >= 0) {
+        if let Some(d) = deadline.filter(|&d| near(d, now).is_some() && park.poke >= 0) {
             // Close to the deadline: on time, a wake ending it at once.
+            park.napping.store(true, Ordering::SeqCst);
             drop(queues);
             crate::thread::nap_ns(d.saturating_duration_since(now).as_nanos() as i64);
+            park.napping.store(false, Ordering::SeqCst);
             queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
-        queues = table.cv.wait_timeout(queues, slice).unwrap_or_else(|e| e.into_inner()).0;
+        drop(queues);
+        park.sleep(slice);
+        queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -553,20 +627,12 @@ pub fn forked_child() {
     table().queues.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
-/// Mark `woken` woken and let them see it. Called with the queues locked:
-/// a woken waiter cannot have left (nor its thread ended) meanwhile, so its
-/// wake pipe is still its own.
-fn wake_all_of(table: &Table, woken: &[Arc<Waiter>]) {
+/// Mark `woken` woken and wake their threads. Called with the queues
+/// locked ([`Park::wake`]).
+fn wake_all_of(woken: &[Arc<Waiter>]) {
     for w in woken {
         w.woken.store(true, Ordering::SeqCst);
-        if w.poke >= 0 {
-            // SAFETY: one byte to the waiting thread's own non-blocking
-            // pipe; a full pipe is woken already.
-            unsafe { libc::write(w.poke, b"f".as_ptr().cast(), 1) };
-        }
-    }
-    if !woken.is_empty() {
-        table.cv.notify_all();
+        w.park.wake();
     }
 }
 
@@ -581,7 +647,7 @@ pub(crate) fn wake_private_bits(uaddr: u64, count: u32, bits: u32) -> i64 {
     let table = table();
     let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
     let woken = take(&mut queues, key(uaddr), count, bits);
-    wake_all_of(table, &woken);
+    wake_all_of(&woken);
     woken.len() as i64
 }
 
@@ -608,7 +674,7 @@ pub(crate) fn requeue_private(
     }
     let (uaddr, uaddr2) = (key(uaddr), key(uaddr2));
     let woken = take(&mut queues, uaddr, wake, u32::MAX);
-    wake_all_of(table, &woken);
+    wake_all_of(&woken);
     let moved = take(&mut queues, uaddr, requeue, u32::MAX);
     let n = moved.len();
     queues.entry(uaddr2).or_default().extend(moved);

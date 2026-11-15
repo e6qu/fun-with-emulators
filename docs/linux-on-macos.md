@@ -1159,7 +1159,10 @@ it. `waitid` reports no resource usage. See [wait](#wait) and
 [Children ending](#children-ending).
 
 **`futex`**: a private futex waits in a per-process queue keyed by
-address, which a wake marks woken, so it reports exactly how many it woke.
+address, which a wake marks woken, so it reports exactly how many it woke;
+each waiting thread sleeps on a word of its own
+(`__ulock_wait2(UL_COMPARE_AND_WAIT)`), which a wake sets and wakes that
+thread alone on.
 A shared futex takes a slot in a table every fwe process maps, keyed by
 the Mach memory object and offset of the word, and sleeps on the slot's
 word with `__ulock_wait2(UL_COMPARE_AND_WAIT_SHARED)`

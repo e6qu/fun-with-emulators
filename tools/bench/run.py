@@ -546,11 +546,20 @@ def pcs(name, cmd):
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.05)  # (Past its exec, as for `sample`.)
     script = "profile-997 /pid == $target/ { @[arg1] = count(); }"
-    tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p", str(proc.pid),
-                               "-n", script, "-o", out],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              errors="replace")
+
+    def trace():
+        return subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p",
+                                 str(proc.pid), "-n", script, "-o", out],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                errors="replace")
+
+    tracer = trace()
     time.sleep(0.2)
+    # Grabbed mid-`exec` (the host's own loading of fwe), DTrace lets go at
+    # once: once more, the process past it.
+    if tracer.poll() is not None and proc.poll() is None:
+        tracer = trace()
+        time.sleep(0.1)
     regions = []
     vm = subprocess.run(["vmmap", "-wide", str(proc.pid)], capture_output=True, text=True,
                         errors="replace").stdout
@@ -577,6 +586,8 @@ def pcs(name, cmd):
             base[what] = min(base.get(what, lo), lo)
 
     def where(pc):
+        if pc == 0:
+            return "kernel"  # (No user program counter: in a system call.)
         for lo, hi, what in regions:
             if lo <= pc < hi:
                 return f"{os.path.basename(what)}+{pc - base[what]:#x}" if what else f"anonymous {lo:#x}+{pc - lo:#x}"
