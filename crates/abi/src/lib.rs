@@ -593,6 +593,11 @@ pub mod ioctl {
     pub const FIDEDUPERANGE: u64 = 0xc018_9436;
     pub const FS_IOC_GETFSUUID: u64 = 0x8011_1500;
     pub const FS_IOC_GETFSSYSFSPATH: u64 = 0x8081_1501;
+    /// A file's inode flags, and as XFS's extended flags (`struct fsxattr`).
+    pub const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    pub const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    pub const FS_IOC_FSGETXATTR: u64 = 0x801c_581f;
+    pub const FS_IOC_FSSETXATTR: u64 = 0x401c_5820;
     /// Network interface requests on a socket (`struct ifreq`).
     pub const SIOCGIFNAME: u64 = 0x8910;
     pub const SIOCGIFCONF: u64 = 0x8912;

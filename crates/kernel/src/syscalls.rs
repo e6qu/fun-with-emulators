@@ -1612,9 +1612,16 @@ impl<P: Platform> Kernel<P> {
         // `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`: the immutable and
         // append-only flags, which the host has (and enforces) too.
         #[cfg(target_os = "macos")]
-        if req == 0x8008_6601 || req == 0x4008_6602 {
-            return self.inode_flags(fd, req == 0x4008_6602, arg);
+        if req == ioctl::FS_IOC_GETFLAGS || req == ioctl::FS_IOC_SETFLAGS {
+            return self.inode_flags(fd, req == ioctl::FS_IOC_SETFLAGS, arg);
         }
+        // `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR`: the same, as XFS's
+        // extended flags.
+        #[cfg(target_os = "macos")]
+        if req == ioctl::FS_IOC_FSGETXATTR || req == ioctl::FS_IOC_FSSETXATTR {
+            return self.fs_xattr(fd, req == ioctl::FS_IOC_FSSETXATTR, arg);
+        }
+
         // `RNDGETENTCNT` on `/dev/random` or `/dev/urandom`: the entropy
         // count, full as Linux's is (`kernel.random.entropy_avail`).
         if req == 0x8004_5200 && is_random_device(fd) {
@@ -2833,9 +2840,10 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     }
 }
 
-/// Linux's inode flags fwe keeps: immutable and append-only, as the
-/// host's user flags; `noatime` and `nodump`, which tmpfs takes, are
-/// accepted and not kept.
+/// Linux's inode flags fwe keeps, those tmpfs takes: immutable and
+/// append-only, as the host's user flags; `nodump` and `noatime` recorded
+/// beside the file ([`crate::modes::Flag`]), the file of `noatime` read
+/// as through `O_NOATIME`.
 #[cfg(target_os = "macos")]
 const FS_IMMUTABLE_FL: u32 = 0x10;
 #[cfg(target_os = "macos")]
@@ -2865,25 +2873,51 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = self.fd_change(fd) {
             return err(e);
         }
-        match self.set_inode_flags(fd, f) {
+        match self.set_flags_of(FlagFile::Fd(fd), f, false) {
             Ok(()) => 0,
             Err(e) => err(e),
         }
     }
 
-    /// Set the inode flags `f` of the file open as `fd` (`ENOTTY` for one
-    /// that has none).
-    fn set_inode_flags(&mut self, fd: i32, f: u32) -> Result<(), i32> {
-        self.set_flags_of(FlagFile::Fd(fd), f)
+    /// `FS_IOC_FSGETXATTR` (`set` false) or `FS_IOC_FSSETXATTR` of the
+    /// file open as `fd`, a `struct fsxattr` at `arg`: the inode flags as
+    /// `fsx_xflags`, as `file_getattr` and `file_setattr` have them; what
+    /// only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set, as
+    /// on tmpfs.
+    fn fs_xattr(&mut self, fd: i32, set: bool, arg: u64) -> i64 {
+        if !set {
+            let f = match get_inode_flags(fd) {
+                Ok(f) => f,
+                Err(e) => return err(e),
+            };
+            let mut out = [0u8; FSXATTR_SIZE];
+            out[..4].copy_from_slice(&(flags_to_xflags(f) as u32).to_ne_bytes());
+            guest!(uaccess::write_from(arg, &out));
+            return 0;
+        }
+        let given = guest!(uaccess::read_bytes(arg, FSXATTR_SIZE));
+        let word = |at: usize| u32::from_ne_bytes(given[at..at + 4].try_into().unwrap());
+        let xflags = u64::from(word(0));
+        if let Err(e) = self.fd_change(fd) {
+            return err(e);
+        }
+        // `fsx_nextents` (8) is only reported; the extent sizes (4, 16)
+        // and the project (12) are XFS's.
+        let extra = xflags_unsupported(xflags) || word(4) != 0 || word(12) != 0 || word(16) != 0;
+        match self.set_flags_of(FlagFile::Fd(fd), xflags_to_flags(xflags), extra) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
     }
 
-    /// Set the inode flags `f` of `file` (`ENOTTY` for one that has none).
-    fn set_flags_of(&mut self, file: FlagFile<'_>, f: u32) -> Result<(), i32> {
+    /// Set the inode flags `f` of `file` (`ENOTTY` for one that has none),
+    /// with Linux's checks in its order: the owner (or `CAP_FOWNER`), then
+    /// `CAP_LINUX_IMMUTABLE` to change the immutable or append-only flag,
+    /// then what the file system keeps (`EOPNOTSUPP`, as `extra`, more
+    /// than inode flags, is too).
+    fn set_flags_of(&mut self, file: FlagFile<'_>, f: u32, extra: bool) -> Result<(), i32> {
         let st = file.stat()?;
         let host = st.st_flags;
-        if f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
-            return Err(errno::EOPNOTSUPP);
-        }
         // The file's owner's to change, and the immutable and append-only
         // flags only with `CAP_LINUX_IMMUTABLE`.
         let (owner, group) = file.owner(&st);
@@ -2902,20 +2936,31 @@ impl<P: Platform> Kernel<P> {
         if (want_fixed ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
             return Err(errno::EPERM);
         }
-        // The guest's no-dump is recorded apart from the host's flag, which
-        // also marks a kept mode or owner ([`crate::modes::set_nodump_fd`]).
-        let nodump = f & FS_NODUMP_FL != 0;
-        if nodump != file.nodump_set() {
+        if extra || f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
+            return Err(errno::EOPNOTSUPP);
+        }
+        // The guest's no-dump and no-access-time are recorded apart from
+        // the host's flag, which also marks a kept mode or owner
+        // ([`crate::modes::set_flag_fd`]).
+        use crate::modes::Flag;
+        let kept = [(Flag::NoDump, FS_NODUMP_FL), (Flag::NoAtime, FS_NOATIME_FL)];
+        let mut released = false;
+        for (flag, bit) in kept {
+            let on = f & bit != 0;
+            if on == file.flag_set(flag) {
+                continue;
+            }
             // The record is an attribute, which the host refuses to change
             // on a file it holds immutable or append-only: those are let go
             // of while it is written.
-            if host & fixed != 0 {
+            if host & fixed != 0 && !released {
                 file.chflags(host & !fixed)?;
+                released = true;
             }
-            let r = match file.set_nodump(nodump) {
+            let r = match file.set_flag(flag, on) {
                 // A mode that denies the owner writing attributes: kept
                 // apart first.
-                Err(errno::EACCES) => file.own().and_then(|()| file.set_nodump(nodump)),
+                Err(errno::EACCES) => file.own().and_then(|()| file.set_flag(flag, on)),
                 r => r,
             };
             if let Err(e) = r {
@@ -2926,8 +2971,14 @@ impl<P: Platform> Kernel<P> {
         // As the attribute step left them (a mode kept apart is marked).
         let now = file.stat()?.st_flags;
         let mut want = now & !(fixed | libc::UF_NODUMP) | want_fixed;
-        if nodump || file.kept() {
+        if f & (FS_NODUMP_FL | FS_NOATIME_FL) != 0 || file.kept() {
             want |= libc::UF_NODUMP;
+        }
+        if let FlagFile::Fd(fd) = file
+            && f & FS_NOATIME_FL != 0
+        {
+            // Read from now on as the flag has it.
+            crate::atime::opened_noatime(fd);
         }
         if want != now {
             file.chflags(want)?;
@@ -2965,17 +3016,10 @@ impl<P: Platform> Kernel<P> {
             if xflags & !0x1_ffff != 0 {
                 return err(errno::EINVAL);
             }
-            // Beyond what every file system with flags has (immutable,
-            // append-only, sync, no-atime, no-dump, DAX), XFS's.
-            if xflags & !(0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x8000) != 0
-                || word(8) != 0
-                || word(16) != 0
-                || word(20) != 0
-            {
-                Some(Err(errno::EOPNOTSUPP))
-            } else {
-                Some(Ok(xflags))
-            }
+            // The extent sizes (8, 20) and the project (16) are XFS's.
+            let extra =
+                xflags_unsupported(xflags) || word(8) != 0 || word(16) != 0 || word(20) != 0;
+            Some((xflags, extra))
         } else {
             None
         };
@@ -3013,29 +3057,10 @@ impl<P: Platform> Kernel<P> {
             FlagFile::At(std::os::fd::AsRawFd::as_raw_fd(&resolved.dir), &cname)
         };
         let r = (|| {
-            if let Some(w) = wanted {
-                let x = w?;
-                let mut f = 0;
-                for (xf, fl) in [
-                    (0x8, FS_IMMUTABLE_FL),
-                    (0x10, FS_APPEND_FL),
-                    (0x20, 0x8),
-                    (0x40, FS_NOATIME_FL),
-                    (0x80, FS_NODUMP_FL),
-                ] {
-                    if x & xf != 0 {
-                        f |= fl;
-                    }
-                }
-                return self.set_flags_of(file, f).map(|()| 0);
+            if let Some((x, extra)) = wanted {
+                return self.set_flags_of(file, xflags_to_flags(x), extra).map(|()| 0);
             }
-            let f = flags_of(file)?;
-            let mut x = 0u64;
-            for (fl, xf) in [(FS_IMMUTABLE_FL, 0x8), (FS_APPEND_FL, 0x10), (FS_NODUMP_FL, 0x80)] {
-                if f & fl != 0 {
-                    x |= xf;
-                }
-            }
+            let x = flags_to_xflags(flags_of(file)?);
             let mut out = vec![0u8; size as usize];
             out[..8].copy_from_slice(&x.to_ne_bytes());
             uaccess::write_from(attr, &out)?;
@@ -3048,6 +3073,41 @@ impl<P: Platform> Kernel<P> {
             Err(e) => err(e),
         }
     }
+}
+
+/// `struct fsxattr`'s size.
+#[cfg(target_os = "macos")]
+const FSXATTR_SIZE: usize = 28;
+
+/// `FS_XFLAG_*` and the `FS_*_FL` inode flags they stand for, as Linux's
+/// `fileattr_fill_xflags` pairs them (sync, `FS_SYNC_FL`, is refused).
+#[cfg(target_os = "macos")]
+const XFLAGS: [(u64, u32); 5] = [
+    (0x8, FS_IMMUTABLE_FL),
+    (0x10, FS_APPEND_FL),
+    (0x20, 0x8),
+    (0x40, FS_NOATIME_FL),
+    (0x80, FS_NODUMP_FL),
+];
+
+/// The inode flags `FS_XFLAG_*` set `x` asks for.
+#[cfg(target_os = "macos")]
+fn xflags_to_flags(x: u64) -> u32 {
+    XFLAGS.iter().filter(|(xf, _)| x & xf != 0).fold(0, |f, (_, fl)| f | fl)
+}
+
+/// The `FS_XFLAG_*` set of inode flags `f`.
+#[cfg(target_os = "macos")]
+fn flags_to_xflags(f: u32) -> u64 {
+    XFLAGS.iter().filter(|(_, fl)| f & fl != 0).fold(0, |x, (xf, _)| x | xf)
+}
+
+/// Whether `FS_XFLAG_*` set `x` asks for more than every file system with
+/// flags has (immutable, append-only, sync, no-atime, no-dump, DAX:
+/// `FS_XFLAG_COMMON`): XFS's.
+#[cfg(target_os = "macos")]
+fn xflags_unsupported(x: u64) -> bool {
+    x & !(0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x8000) != 0
 }
 
 /// The file an inode-flags call acts on: open as a descriptor, or a name
@@ -3101,22 +3161,30 @@ impl FlagFile<'_> {
         }
     }
 
-    /// Whether the guest gave it the no-dump flag.
-    fn nodump_set(self) -> bool {
+    /// Whether it has the guest's no-access-time flag (host status `st`).
+    fn noatime(self, st: &libc::stat) -> bool {
         match self {
-            FlagFile::Fd(fd) => crate::modes::nodump_set_fd(fd),
+            FlagFile::Fd(fd) => crate::modes::marked(st) && crate::modes::noatime_fd(fd),
+            FlagFile::At(dir, name) => crate::modes::noatime_at(dir, name, st),
+        }
+    }
+
+    /// Whether the guest gave it the kept flag `flag`.
+    fn flag_set(self, flag: crate::modes::Flag) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::flag_set_fd(fd, flag),
             FlagFile::At(dir, name) => {
-                host::at_path(dir, name, crate::modes::nodump_set_path).unwrap_or(false)
+                host::at_path(dir, name, |p| crate::modes::flag_set_path(p, flag)).unwrap_or(false)
             }
         }
     }
 
-    /// Record the guest's no-dump flag (`on`) or take it away.
-    fn set_nodump(self, on: bool) -> Result<(), i32> {
+    /// Record the guest's kept flag `flag` (`on`) or take it away.
+    fn set_flag(self, flag: crate::modes::Flag, on: bool) -> Result<(), i32> {
         match self {
-            FlagFile::Fd(fd) => crate::modes::set_nodump_fd(fd, on),
+            FlagFile::Fd(fd) => crate::modes::set_flag_fd(fd, flag, on),
             FlagFile::At(dir, name) => {
-                host::at_path(dir, name, |p| crate::modes::set_nodump_path(p, on))?
+                host::at_path(dir, name, |p| crate::modes::set_flag_path(p, flag, on))?
             }
         }
     }
@@ -3175,6 +3243,10 @@ fn flags_of(file: FlagFile<'_>) -> Result<u32, i32> {
     if file.nodump(&st) {
         f |= FS_NODUMP_FL;
     }
+    if file.noatime(&st) {
+        f |= FS_NOATIME_FL;
+    }
+
     Ok(f)
 }
 
@@ -5039,6 +5111,49 @@ mod tests {
         flags(Some(0));
         assert_eq!(flags(None), 0);
         assert!(!crate::modes::marked(&super::FlagFile::Fd(fd).stat().unwrap()));
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The no-access-time flag is kept, apart from no-dump and a kept
+    /// owner, and read back through `FS_IOC_GETFLAGS` and as
+    /// `FS_XFLAG_NOATIME` through `FS_IOC_FSGETXATTR`; `FS_IOC_FSSETXATTR`
+    /// sets the flags `FS_IOC_SETFLAGS` does, and refuses XFS's
+    /// (`EOPNOTSUPP`); a file of the flag reads as `O_NOATIME`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn noatime_is_kept_and_seen_through_both_requests() {
+        use fwe_abi::ioctl::*;
+        const FS_NODUMP_FL: u32 = 0x40;
+        const FS_NOATIME_FL: u32 = 0x80;
+        const XFLAG_NOATIME: u32 = 0x40;
+        const XFLAG_NODUMP: u32 = 0x80;
+        let path = std::env::temp_dir().join(format!("fwe-noatime-{}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+        let mut k = kernel();
+        let mut ioctl =
+            |req: u64, arg: *mut u8| k.syscall(nr::IOCTL, [fd as u64, req, arg as u64, 0, 0, 0]);
+        let mut v = FS_NOATIME_FL;
+        assert_eq!(ioctl(FS_IOC_SETFLAGS, (&raw mut v).cast()), 0);
+        v = 0;
+        assert_eq!(ioctl(FS_IOC_GETFLAGS, (&raw mut v).cast()), 0);
+        assert_eq!(v, FS_NOATIME_FL, "no-access-time, and not no-dump");
+        assert!(crate::modes::noatime_fd(fd));
+        crate::owners::keep_fd(fd, (1000, 100)).unwrap();
+        assert_eq!(ioctl(FS_IOC_GETFLAGS, (&raw mut v).cast()), 0);
+        assert_eq!(v, FS_NOATIME_FL, "a kept owner is still not no-dump");
+        let mut fsx = [0u8; 28];
+        assert_eq!(ioctl(FS_IOC_FSGETXATTR, fsx.as_mut_ptr()), 0);
+        assert_eq!(u32::from_ne_bytes(fsx[..4].try_into().unwrap()), XFLAG_NOATIME);
+        fsx[..4].copy_from_slice(&XFLAG_NODUMP.to_ne_bytes());
+        assert_eq!(ioctl(FS_IOC_FSSETXATTR, fsx.as_mut_ptr()), 0);
+        assert_eq!(ioctl(FS_IOC_GETFLAGS, (&raw mut v).cast()), 0);
+        assert_eq!(v, FS_NODUMP_FL);
+        assert!(!crate::modes::noatime_fd(fd));
+        // An extent size, XFS's.
+        fsx[4..8].copy_from_slice(&4096u32.to_ne_bytes());
+        assert_eq!(ioctl(FS_IOC_FSSETXATTR, fsx.as_mut_ptr()), err(errno::EOPNOTSUPP));
         drop(f);
         let _ = std::fs::remove_file(&path);
     }

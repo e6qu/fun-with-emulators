@@ -221,7 +221,7 @@ fn mark_fd(fd: i32, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<(), i3
             None if crate::modes::marked(st)
                 && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0
                 && !crate::modes::kept_fd(fd)
-                && !crate::modes::nodump_set_fd(fd) =>
+                && !crate::modes::flags_set_fd(fd) =>
             {
                 crate::modes::set_mark_fd(fd, st, false);
             }
@@ -255,7 +255,7 @@ fn mark_path(path: &CStr, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<
             None if crate::modes::marked(st)
                 && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0
                 && !crate::modes::kept_path(path)
-                && !crate::modes::nodump_set_path(path) =>
+                && !crate::modes::flags_set_path(path) =>
             {
                 crate::modes::set_mark_path(path, st, false);
             }

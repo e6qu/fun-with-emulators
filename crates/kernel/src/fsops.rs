@@ -573,7 +573,20 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = self.open_direct(dirfd as i32, &path, flags) {
             return r;
         }
+        let r = self.open_found(dirfd, path, flags, mode);
+        // A file of the no-access-time flag (`FS_NOATIME_FL`) is read as
+        // through `O_NOATIME` (the one-call open above takes no file whose
+        // host flag marks something kept, as this one's does).
+        if r >= 0 && flags & fcntl::O_NOATIME == 0 && crate::modes::noatime_fd(r as i32) {
+            crate::atime::opened_noatime(r as i32);
+        }
+        r
+    }
+
+    /// [`Self::open_path_once`] of what the one-call open does not take.
+    fn open_found(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
         // Synthetic /proc and /sys files take priority over the host rootfs.
+
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
                 // A namespace's file bound to a path.
