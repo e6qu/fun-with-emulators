@@ -73,6 +73,9 @@ unsafe extern "C" {
     #[link_name = "bind"]
     fn bind_socket(fd: i32, a: *const u8, l: u32) -> i32;
     fn connect(fd: i32, a: *const u8, l: u32) -> i32;
+    fn listen(fd: i32, n: i32) -> i32;
+    fn umask(m: u32) -> u32;
+    fn sendto(fd: i32, b: *const u8, n: usize, f: i32, a: *const u8, l: u32) -> isize;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -661,9 +664,72 @@ fn opath_scenario() {
     println!("target: {uid}");
 }
 
+/// A Unix socket address of path `p`.
+fn unix_addr(p: &str) -> [u8; 110] {
+    let mut addr = [0u8; 110];
+    addr[0] = 1;
+    addr[2..2 + p.len()].copy_from_slice(p.as_bytes());
+    addr
+}
+
+/// Connecting or sending to a Unix socket's node needs write permission
+/// on it, by the caller's ids against its owner and mode, as `open`
+/// checks; making one needs write permission on its directory.
+fn unix_permissions_scenario() {
+    const SOCK_STREAM: i32 = 1;
+    const SOCK_DGRAM: i32 = 2;
+    // SAFETY: plain calls; socket addresses of their length.
+    let (s, d) = unsafe {
+        umask(0o022);
+        let s = socket(1, SOCK_STREAM, 0);
+        bind_socket(s, unix_addr("/tmp/s").as_ptr(), 110);
+        listen(s, 4);
+        let d = socket(1, SOCK_DGRAM, 0);
+        bind_socket(d, unix_addr("/tmp/d").as_ptr(), 110);
+        mkdir(c("/tmp/closed").as_ptr(), 0o755);
+        (s, d)
+    };
+    let try_all = || {
+        in_child(|| {
+            // SAFETY: plain id changes.
+            unsafe {
+                setgroups(0, std::ptr::null());
+                setgid(1000);
+                setuid(1000);
+            }
+            // SAFETY: plain calls; socket addresses of their length.
+            let (conn, sent, made) = unsafe {
+                let c = socket(1, SOCK_STREAM, 0);
+                let conn = connect(c, unix_addr("/tmp/s").as_ptr(), 110);
+                let u = socket(1, SOCK_DGRAM, 0);
+                let sent = sendto(u, b"x".as_ptr(), 1, 0, unix_addr("/tmp/d").as_ptr(), 110);
+                let b = socket(1, SOCK_DGRAM, 0);
+                let made = bind_socket(b, unix_addr("/tmp/closed/b").as_ptr(), 110);
+                (conn, sent as i32, made)
+            };
+            println!(
+                "connect {} sendto {} bind {}",
+                res(conn.into()),
+                res(sent.into()),
+                res(made.into())
+            );
+        });
+    };
+    try_all();
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        chmod(c("/tmp/s").as_ptr(), 0o777);
+        chmod(c("/tmp/d").as_ptr(), 0o777);
+        chmod(c("/tmp/closed").as_ptr(), 0o777);
+    }
+    try_all();
+    let _ = (s, d);
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "unixperm" => unix_permissions_scenario(),
         "opath" => opath_scenario(),
         "getlk" => getlk_scenario(),
         "chattr" => chattr_scenario(),

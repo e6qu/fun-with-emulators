@@ -333,12 +333,23 @@ impl Resolved {
     /// Get ready for a `bind` to make a socket's node at what was
     /// resolved: in an overlay, the directory copied up, and a whiteout in
     /// the way removed (the host makes the node where `bind` says, so it
-    /// cannot be made aside and moved over the whiteout).
-    pub fn prepare_bind(&mut self) -> Result<(), i32> {
-        // A read-only mount takes no new node (`EROFS`); a name there
-        // already is an address in use, which Linux finds first.
-        if self.writable().is_err() && self.lstat().is_none() {
-            return Err(errno::EROFS);
+    /// cannot be made aside and moved over the whiteout). With `host_root`
+    /// (no root filesystem), the host's own directories are left to its
+    /// checks.
+    pub fn prepare_bind(&mut self, host_root: bool) -> Result<(), i32> {
+        // A name there already is an address in use, which Linux finds
+        // first; then a read-only mount takes no new node (`EROFS`), and a
+        // caller needs to write and search the directory (`EACCES`), as for
+        // any file it makes.
+        if self.lstat().is_none() {
+            self.writable()?;
+            let a = crate::creds::access();
+            if let Some(st) = guest_stat(self.dir.as_raw_fd())
+                && !(st.st_uid == 0 && st.st_gid == 0 && host_root)
+                && !a.permits(&st, 2 | 1)
+            {
+                return Err(errno::EACCES);
+            }
         }
         let Some(o) = &self.ovl else { return Ok(()) };
         if !matches!(o.found, overlay::Found::Missing) {
@@ -2900,6 +2911,12 @@ fn published() -> std::sync::MutexGuard<'static, Option<Published>> {
     PUBLISHED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether the published view's root is the host's own (no root
+/// filesystem), whose files the host's checks are left to.
+pub(crate) fn root_is_host() -> bool {
+    published().as_ref().is_none_or(|p| p.root_host == b"/")
+}
+
 /// Forget the published view (for tests whose [`Fs`] goes away).
 #[cfg(test)]
 pub(crate) fn unpublish() {
@@ -2921,7 +2938,7 @@ pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i
     let mut r = resolve_in(&v.view(), fcntl::AT_FDCWD as i32, path, follow_final)?;
     if !follow_final {
         // A bind, which makes the socket's node there.
-        r.prepare_bind()?;
+        r.prepare_bind(v.root_host == b"/")?;
     }
     let mut host = fd_path(r.dir.as_raw_fd()).ok_or(errno::ENOENT)?;
     if r.name != b"." {

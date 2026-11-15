@@ -118,11 +118,6 @@ pub fn access() -> Access {
     })
 }
 
-/// Whether the process passes files' permission bits.
-pub fn dac_override() -> bool {
-    ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|a| a.dac_override)
-}
-
 /// The process's real user id (an initial-namespace id), as last
 /// published: what the signals it sends carry as their sender's
 /// (`si_uid`, which each receiver sees in its own user namespace).

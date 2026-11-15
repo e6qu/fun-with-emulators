@@ -7092,6 +7092,17 @@ fn o_path_descriptors_change_the_file_they_name() {
     );
 }
 
+/// A Unix socket's node is held to its owner and mode as a file is:
+/// connecting or sending to it needs write permission by the caller's ids,
+/// making one needs write permission on its directory.
+#[test]
+fn unix_socket_nodes_are_held_to_their_modes() {
+    assert_eq!(
+        fsrules("unixperm"),
+        "connect EACCES sendto EACCES bind EACCES\nconnect ok sendto ok bind ok\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

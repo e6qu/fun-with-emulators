@@ -779,7 +779,8 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   bit) and `O_NOATIME` (owner only), by the owner's, group's or others'
   bits against the caller's file-system ids, `CAP_DAC_OVERRIDE` and
   `CAP_DAC_READ_SEARCH` passing them. Checks outside the kernel lock (the
-  path walk, a connect to a Unix socket's node) use the credentials
+  path walk, a connect or send to a Unix socket's node, the directory a
+  `bind` makes one in) use the credentials
   published after each system call (`creds::access`).
   `fs.protected_symlinks` and `fs.protected_hardlinks` act as on Linux
   (off by default, as in Linux's kernel; read again only when a sysctl
@@ -1067,11 +1068,13 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   joined, the options fwe keeps, and which IPv6 sockets `IPV6_ADDRFORM`
   made IPv4.
 - The socket calls run without the kernel lock, so the process's root,
-  working directory and whether it passes permission bits
-  (`creds::dac_override`, needed to connect to a Unix socket's node) are
+  working directory and its file access
+  (`creds::access`, which a connect, send or bind to a Unix socket's node
+  is checked by, as an open of a file is) are
   published after each system call. `AF_UNIX` paths resolve like file
   paths (`fs::resolve_host`). `bind` follows no final symlink and takes an
-  existing name as in use (`EADDRINUSE`). A socket's node has the socket's
+  existing name as in use (`EADDRINUSE`), then refuses a read-only mount
+  (`EROFS`). A socket's node has the socket's
   mode less the umask.
 - `SOCK_SEQPACKET` (`crates/kernel/src/seqpacket.rs`): a receive takes one
   whole message, cut to the buffer (`MSG_TRUNC`); a send is whole or

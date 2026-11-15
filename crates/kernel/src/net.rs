@@ -94,11 +94,17 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
 }
 
 /// Whether the caller may write to the Unix socket file host address `hb`
-/// names (`a`'s), which connecting or sending to it needs: `EACCES` if the
-/// mode fwe keeps for it denies its owner that, to a caller without
-/// `CAP_DAC_OVERRIDE` ([`crate::modes`]; the host checks any other mode).
+/// names (`a`'s), which connecting or sending to it needs: as `open`
+/// checks, the caller's file-system ids against the node's guest owner
+/// and mode ([`crate::owners`], [`crate::modes`]), `EACCES` where they
+/// deny it. Without a root filesystem, the host's own nodes (root's, no
+/// owner kept) are left to the host's checks.
 fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
-    if family(hb) != libc::AF_UNIX || hb[2] == 0 || crate::creds::dac_override() {
+    if family(hb) != libc::AF_UNIX || hb[2] == 0 {
+        return Ok(());
+    }
+    let access = crate::creds::access();
+    if access.dac_override {
         return Ok(());
     }
     use std::os::fd::AsRawFd;
@@ -108,11 +114,17 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
     // SAFETY: an all-zero `stat` is a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a NUL-terminated name, relative to a live directory.
-    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, 0) } != 0 || !crate::modes::marked(&st) {
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Ok(());
     }
     let perm = crate::modes::guest_perm_at(dir, &name, &st);
-    if crate::modes::owner_allows(perm, 2) { Ok(()) } else { Err(errno::EACCES) }
+    let owner = crate::owners::of_at(dir, &name, &st);
+    crate::modes::apply(&mut st, perm);
+    crate::owners::apply(&mut st, owner);
+    if owner == (0, 0) && crate::fs::root_is_host() {
+        return Ok(());
+    }
+    if access.permits(&st, 2) { Ok(()) } else { Err(errno::EACCES) }
 }
 
 /// The file abstract name `name` (without its leading NUL) stands as.
@@ -1152,6 +1164,10 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         match unsafe { to_host(addr, addrlen, &mut hb, true) } {
             Ok(a) => {
                 if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
+                    return err(e);
+                }
+                // Sending to a Unix socket's node needs write permission on it.
+                if let Err(e) = may_write_socket(&hb, &a) {
                     return err(e);
                 }
                 dir = a.dir;
@@ -2413,6 +2429,10 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         match unsafe { to_host(name, namelen as u64, &mut hb, true) } {
             Ok(a) => {
                 if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
+                    return err(e);
+                }
+                // Sending to a Unix socket's node needs write permission on it.
+                if let Err(e) = may_write_socket(&hb, &a) {
                     return err(e);
                 }
                 dir = a.dir;

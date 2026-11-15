@@ -450,13 +450,6 @@ fn read_at(dir: i32, name: &CStr) -> Option<u32> {
     crate::host::at_path(dir, name, read_path).ok().flatten()
 }
 
-/// Whether a caller without the capabilities may do `want` (`R_OK`,
-/// `W_OK`, `X_OK` bits) to a file whose guest permission bits are `perm`:
-/// what its owner may do (every file is the caller's own).
-pub fn owner_allows(perm: u32, want: u32) -> bool {
-    (perm >> 6) & want == want
-}
-
 fn last() -> i32 {
     crate::host::errno_to_linux(crate::host::last_errno())
 }
@@ -654,7 +647,6 @@ mod tests {
         let st = fstatat(dir.as_raw_fd(), name).unwrap();
         assert!(!marked(&st));
         assert_eq!(guest_perm_at(dir.as_raw_fd(), name, &st), 0o750);
-        assert!(owner_allows(0o555, 4 | 1) && !owner_allows(0o555, 2));
         let _ = std::fs::remove_dir_all(&base);
     }
 }
