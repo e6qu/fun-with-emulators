@@ -10,8 +10,9 @@
 //!
 //! - `mkdir` makes a cgroup with the files of the controllers its parent
 //!   enables, within `cgroup.max.depth` and `cgroup.max.descendants` up
-//!   the tree; `rmdir` removes an empty one (`EBUSY` while it has
-//!   processes or children).
+//!   the tree, its files its creator's (a controller's files are whoever
+//!   enables the controller); `rmdir` removes an empty one (`EBUSY`
+//!   while it has processes or children).
 //! - Writing a pid to `cgroup.procs` moves the process, by Linux's
 //!   delegation rules (write access to the common ancestor's
 //!   `cgroup.procs`, within the writer's cgroup namespace); the file lists
@@ -21,14 +22,17 @@
 //!   `threaded`.
 //! - `cgroup.subtree_control` enables controllers for the children, with
 //!   Linux's rule that a cgroup with processes has none enabled for
-//!   children (the root aside).
+//!   children (the root aside), and its parsing: a controller Linux lacks
+//!   is `EINVAL`, one the cgroup may not use `ENOENT`.
 //! - `cgroup.freeze` stops and continues the members of the cgroup and
 //!   those below it, and whoever joins or is forked into a frozen one;
 //!   `cgroup.kill` kills them; `pids.max` limits `fork` and new threads
 //!   (counted in `pids.events`); and device programs attached to a cgroup
 //!   ([`crate::bpf`]) decide every device access of its members.
 //! - The other limits are kept and read back but not enforced: the host has
-//!   no way to hold a process to a memory or CPU budget.
+//!   no way to hold a process to a memory or CPU budget. Each is parsed as
+//!   Linux parses it (`pids.max` a whole number, a memory limit a size
+//!   kept in whole pages).
 
 use crate::procreg;
 use fwe_abi::{err, errno};
@@ -117,10 +121,21 @@ fn os(p: &[u8]) -> &OsStr {
     OsStr::from_bytes(p)
 }
 
+/// Make interface file `name` of the cgroup at host directory `dir`, if it
+/// is not there, with `content`, owned by the caller (its filesystem ids),
+/// as Linux's `cgroup_kn_set_ugid` gives a cgroup's files to whoever makes
+/// them: the cgroup's creator, or for a controller's files whoever enables
+/// the controller.
 fn put(dir: &[u8], name: &str, content: &str, writable: bool) {
     let p = [dir, b"/", name.as_bytes()].concat();
-    if std::fs::symlink_metadata(os(&p)).is_err() {
-        let _ = std::fs::write(os(&p), content);
+    if std::fs::symlink_metadata(os(&p)).is_err() && std::fs::write(os(&p), content).is_ok() {
+        let a = crate::creds::access();
+        if (a.fsuid, a.fsgid) != (0, 0)
+            && let Ok(f) = std::fs::File::open(os(&p))
+        {
+            use std::os::fd::AsRawFd;
+            let _ = crate::owners::keep_fd(f.as_raw_fd(), (a.fsuid, a.fsgid));
+        }
     }
     let mode = if writable { 0o644 } else { 0o444 };
     use std::os::unix::fs::PermissionsExt;
@@ -421,20 +436,9 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
         }
         b"cgroup.subtree_control" => {
             let mut enabled = read_words(&[dir, b"/cgroup.subtree_control"].concat());
-            let available = controllers(cg);
-            for word in text.split_whitespace() {
-                let (on, ctl) = match word.as_bytes().first() {
-                    Some(b'+') => (true, &word[1..]),
-                    Some(b'-') => (false, &word[1..]),
-                    _ => return Err(errno::EINVAL),
-                };
-                if !available.iter().any(|c| c == ctl) {
-                    return Err(errno::ENOENT);
-                }
-                if on && cg != b"/" && !members(cg, false).is_empty() {
-                    return Err(errno::EBUSY);
-                }
-                let kids = children(dir);
+            let changes = subtree_changes(text, &enabled, &controllers(cg))?;
+            let kids = children(dir);
+            for &(on, ctl) in &changes {
                 if !on
                     && kids.iter().any(|k| {
                         read_words(&[dir, b"/", k, b"/cgroup.subtree_control"].concat())
@@ -444,15 +448,19 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 {
                     return Err(errno::EBUSY);
                 }
-                if on && !enabled.iter().any(|c| c == ctl) {
+            }
+            if changes.iter().any(|&(on, _)| on) && cg != b"/" && !members(cg, false).is_empty() {
+                return Err(errno::EBUSY);
+            }
+            for (on, ctl) in changes {
+                if on {
                     enabled.push(ctl.to_string());
-                }
-                if !on {
+                } else {
                     enabled.retain(|c| c != ctl);
                 }
                 // The children's files for it come and go.
-                for k in kids {
-                    let child = [dir, b"/", &k].concat();
+                for k in &kids {
+                    let child = [dir, b"/", &k[..]].concat();
                     for (c, file, content, writable) in CONTROLLER_FILES {
                         if *c != ctl {
                             continue;
@@ -513,16 +521,13 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
             }
             Ok(())
         }
-        b"pids.max" | b"memory.max" | b"memory.high" | b"memory.low" | b"memory.min"
-        | b"memory.swap.max" => {
-            let v = text.trim();
-            let parsed =
-                if v == "max" { Some(v.to_string()) } else { parse_size(v).map(|n| n.to_string()) };
-            store(parsed.ok_or(errno::EINVAL)? + "\n")?;
-            if name == b"pids.max" {
-                changed();
-            }
+        b"pids.max" => {
+            store(pids_max(text.trim())? + "\n")?;
+            changed();
             Ok(())
+        }
+        b"memory.max" | b"memory.high" | b"memory.low" | b"memory.min" | b"memory.swap.max" => {
+            store(memory_limit(text.trim())? + "\n")
         }
         b"cpu.max" => {
             let mut w = text.split_whitespace();
@@ -544,16 +549,121 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
     }
 }
 
-/// A size with an optional `K`, `M`, `G` or `T` suffix.
-fn parse_size(v: &str) -> Option<u64> {
-    let (num, mul) = match v.as_bytes().last()? {
-        b'K' | b'k' => (&v[..v.len() - 1], 1u64 << 10),
-        b'M' | b'm' => (&v[..v.len() - 1], 1 << 20),
-        b'G' | b'g' => (&v[..v.len() - 1], 1 << 30),
-        b'T' | b't' => (&v[..v.len() - 1], 1 << 40),
-        _ => (v, 1),
+/// The changes a write of `text` to `cgroup.subtree_control` asks, as
+/// Linux's `cgroup_subtree_control_write` reads them: every word `+name`
+/// or `-name` of a controller Linux has (`EINVAL` otherwise, before
+/// anything changes), the last word for a controller winning; enabling
+/// one the cgroup may not use (not in `available`) is `ENOENT`; enabling
+/// what is `enabled` already, or disabling what is not, is nothing.
+fn subtree_changes<'a>(
+    text: &'a str,
+    enabled: &[String],
+    available: &[String],
+) -> Result<Vec<(bool, &'a str)>, i32> {
+    let mut asked: Vec<(bool, &str)> = Vec::new();
+    for word in text.split_whitespace() {
+        let (on, ctl) = match word.as_bytes().first() {
+            Some(b'+') => (true, &word[1..]),
+            Some(b'-') => (false, &word[1..]),
+            _ => return Err(errno::EINVAL),
+        };
+        if !CONTROLLERS.contains(&ctl) {
+            return Err(errno::EINVAL);
+        }
+        asked.retain(|&(_, c)| c != ctl);
+        asked.push((on, ctl));
+    }
+    let mut changes = Vec::new();
+    for c in CONTROLLERS {
+        let Some(&(on, ctl)) = asked.iter().find(|(_, a)| a == c) else { continue };
+        let is_on = enabled.iter().any(|e| e == ctl);
+        if on == is_on {
+            continue;
+        }
+        if on && !available.iter().any(|a| a == ctl) {
+            return Err(errno::ENOENT);
+        }
+        changes.push((on, ctl));
+    }
+    Ok(changes)
+}
+
+/// A number as the kernel's `simple_strtoull` and `kstrtoull` read one in
+/// base 0: hexadecimal after `0x`, octal after `0`, else decimal; the
+/// number (`None` past 64 bits) and what follows it.
+fn parse_number(v: &str) -> Option<(Option<u64>, &str)> {
+    let (digits, radix) = if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        (h, 16)
+    } else if v.len() > 1 && v.starts_with('0') {
+        (&v[1..], 8)
+    } else {
+        (v, 10)
     };
-    num.parse::<u64>().ok()?.checked_mul(mul)
+    let end = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    Some((u64::from_str_radix(&digits[..end], radix).ok(), &digits[end..]))
+}
+
+/// The most `pids.max` may be: Linux's `PIDS_MAX` (`PID_MAX_LIMIT` + 1)
+/// less one.
+const PIDS_MAX: u64 = 4 * 1024 * 1024;
+
+/// A value written to `pids.max`, as Linux's `pids_max_write` takes it:
+/// `max`, or a whole number (an optional sign, then base 0, nothing
+/// after) from 0 to `PIDS_MAX`; `EINVAL` otherwise (`ERANGE` past 64
+/// bits). The value as the file keeps it.
+fn pids_max(v: &str) -> Result<String, i32> {
+    if v == "max" {
+        return Ok(v.to_string());
+    }
+    let (neg, digits) = match v.as_bytes().first() {
+        Some(b'-') => (true, &v[1..]),
+        Some(b'+') => (false, &v[1..]),
+        _ => (false, v),
+    };
+    let (n, rest) = parse_number(digits).ok_or(errno::EINVAL)?;
+    if !rest.is_empty() {
+        return Err(errno::EINVAL);
+    }
+    let n = n.ok_or(errno::ERANGE)?;
+    if neg && n != 0 || n > PIDS_MAX {
+        return Err(errno::EINVAL);
+    }
+    Ok(n.to_string())
+}
+
+/// A value written to a memory limit (`memory.max` and the like), as
+/// Linux's `page_counter_memparse` takes it: `max`, or a size (base 0,
+/// then an optional `K`, `M`, `G`, `T`, `P` or `E`, in either case, and
+/// nothing after; `EINVAL` otherwise), kept in whole pages, so the file
+/// reads it rounded down to a page.
+fn memory_limit(v: &str) -> Result<String, i32> {
+    if v == "max" {
+        return Ok(v.to_string());
+    }
+    let (n, rest) = parse_number(v).ok_or(errno::EINVAL)?;
+    // Too large for 64 bits: no limit.
+    let n = n.unwrap_or(u64::MAX);
+    let shift = match rest {
+        "" => 0,
+        "K" | "k" => 10,
+        "M" | "m" => 20,
+        "G" | "g" => 30,
+        "T" | "t" => 40,
+        "P" | "p" => 50,
+        "E" | "e" => 60,
+        _ => return Err(errno::EINVAL),
+    };
+    // Bits shifted out are lost, as `memparse` loses them.
+    let bytes = n.wrapping_shl(shift);
+    // `PAGE_COUNTER_MAX`: anything larger reads as `max`.
+    let pages = bytes / 4096;
+    if pages >= i64::MAX as u64 / 4096 {
+        return Ok("max".to_string());
+    }
+    Ok((pages * 4096).to_string())
 }
 
 /// Whether a process may join cgroup `cg`: not one that enables
@@ -910,6 +1020,77 @@ pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pids.max` takes `max` or a whole number up to `PIDS_MAX`, with no
+    /// suffix; memory limits take a size with one, in whole pages.
+    #[test]
+    fn limits_parse_as_linux_parses_them() {
+        assert_eq!(pids_max("max"), Ok("max".to_string()));
+        assert_eq!(pids_max("10"), Ok("10".to_string()));
+        assert_eq!(pids_max("0x10"), Ok("16".to_string()));
+        assert_eq!(pids_max("+5"), Ok("5".to_string()));
+        assert_eq!(pids_max("4194304"), Ok("4194304".to_string()));
+        assert_eq!(pids_max("4194305"), Err(errno::EINVAL));
+        assert_eq!(pids_max("1K"), Err(errno::EINVAL));
+        assert_eq!(pids_max("-1"), Err(errno::EINVAL));
+        assert_eq!(pids_max(""), Err(errno::EINVAL));
+        assert_eq!(pids_max("99999999999999999999"), Err(errno::ERANGE));
+        assert_eq!(memory_limit("max"), Ok("max".to_string()));
+        assert_eq!(memory_limit("1K"), Ok("0".to_string()));
+        assert_eq!(memory_limit("8k"), Ok("8192".to_string()));
+        assert_eq!(memory_limit("1M"), Ok("1048576".to_string()));
+        assert_eq!(memory_limit("5000"), Ok("4096".to_string()));
+        assert_eq!(memory_limit("1Q"), Err(errno::EINVAL));
+        assert_eq!(memory_limit("1KB"), Err(errno::EINVAL));
+        assert_eq!(memory_limit("8E"), Ok("max".to_string()));
+    }
+
+    /// A new cgroup's interface files are its creator's (kept in an
+    /// attribute only macOS's fwe writes).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_cgroups_files_are_its_creators() {
+        let cg = format!("/fwe-unit-owner-{}", std::process::id()).into_bytes();
+        let dir = host_dir(&cg).unwrap();
+        std::fs::create_dir(os(&dir)).unwrap();
+        let creator = crate::creds::Access {
+            fsuid: 1000,
+            fsgid: 1001,
+            groups: Vec::new(),
+            dac_override: false,
+            dac_read_search: false,
+            scoped: false,
+        };
+        crate::creds::walking_as(creator, || made(&dir));
+        for name in ["cgroup.procs", "cgroup.controllers", "cgroup.stat"] {
+            let p = std::ffi::CString::new([&dir[..], b"/", name.as_bytes()].concat()).unwrap();
+            // SAFETY: zeroed bytes are a valid `stat`, which the call fills.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a `stat` to fill.
+            assert_eq!(unsafe { libc::stat(p.as_ptr(), &mut st) }, 0, "{name}");
+            assert_eq!(crate::owners::of_path(&p, &st), (1000, 1001), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(os(&dir));
+    }
+
+    /// `cgroup.subtree_control` refuses an unknown controller (`EINVAL`)
+    /// and enabling one the cgroup may not use (`ENOENT`) before changing
+    /// anything; disabling what is not enabled is nothing.
+    #[test]
+    fn subtree_control_words() {
+        let all: Vec<String> = CONTROLLERS.iter().map(|c| c.to_string()).collect();
+        let some = vec!["pids".to_string()];
+        assert_eq!(subtree_changes("+pids +bogus", &[], &all), Err(errno::EINVAL));
+        assert_eq!(subtree_changes("pids", &[], &all), Err(errno::EINVAL));
+        assert_eq!(subtree_changes("+memory", &[], &some), Err(errno::ENOENT));
+        assert_eq!(subtree_changes("-memory", &[], &some), Ok(vec![]));
+        assert_eq!(subtree_changes("+pids", &some, &some), Ok(vec![]));
+        assert_eq!(subtree_changes("+pids -pids", &[], &some), Ok(vec![]));
+        assert_eq!(
+            subtree_changes("+pids +memory", &[], &all),
+            Ok(vec![(true, "memory"), (true, "pids")])
+        );
+    }
 
     /// A cgroup is shown from the reader's namespace root, through `..`
     /// for one outside it.

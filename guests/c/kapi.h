@@ -1,5 +1,6 @@
 /* What the kernel-interface guests (sysctls.c, cgroups.c, nsprocs.c,
-^ * procfiles.c, newcalls.c, restore.c) declare of the C library and Linux's ABI: they
+ * procfiles.c, newcalls.c, memlimits.c, restore.c) declare of the C library
+ * and Linux's ABI: they
  * are built freestanding with no system headers, as the other dynamic
  * guests, and linked against glibc's shared library. */
 

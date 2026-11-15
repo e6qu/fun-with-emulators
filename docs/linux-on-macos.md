@@ -2114,15 +2114,15 @@ is a host process, native or running the VM alike.
 
 | File | What fwe does | On the host |
 |---|---|---|
-| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree; lists read as they are when opened (`cgroup.threads` lists every thread) | the directories, the process records |
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree, a write to `cgroup.subtree_control` naming a controller Linux lacks `EINVAL` (one the cgroup may not use `ENOENT`) before anything changes; a new cgroup's files are its creator's, a controller's whoever enables it; lists read as they are when opened (`cgroup.threads` lists every thread) | the directories, the process records |
 | moving a process (`cgroup.procs`, `CLONE_INTO_CGROUP`) | Linux's delegation: write access to `cgroup.procs` of the cgroup the source and destination are both in (`EACCES`), both inside the writer's cgroup namespace (`ENOENT`; the hierarchy is mounted `nsdelegate`) | none |
 | `cgroup.type`, `cgroup.threads` | only domain cgroups: `threaded` is `EOPNOTSUPP`, and a thread moves only to the cgroup it is in | none |
 | `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
-| `pids.max` | enforced on `fork` and on a new thread natively, not on a VM thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
+| `pids.max` | `max` or a whole number up to Linux's 4194304, with no suffix (`EINVAL`); enforced on `fork` and on a new thread natively, not on a VM thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
 | `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too; a frozen member is a stopped process, so a `SIGCONT` thaws it and its parent sees the stop | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
 | `cgroup.kill` | kills the members | `SIGKILL`, relayed so a process running the VM takes it down first |
 | device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`) | none |
-| `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back, not enforced | none: macOS has no such limit for a process |
+| `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back (a memory limit in whole pages, as Linux keeps it), not enforced | none: macOS has no such limit for a process |
 
 ### Mounts
 
@@ -2557,13 +2557,13 @@ where fwe falls short of Linux in detail is in
 | `NS_GET_*` requests, `/proc/<pid>/ns`, nsfs binds | **emulated** | `NSTYPE`, `OWNER_UID`, `PARENT`, `USERNS`, `MNTNS_ID`; others `ENOTTY` |
 | cgroup v2 tree | **emulated** | one per host user, all of their fwe processes, `nsdelegate` ([cgroups](#cgroups)) |
 | cgroup v1 | **refused** | `ENODEV` |
-| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.controllers`, `cgroup.max.*` | **enforced** | Linux's delegation and no-internal-process rules |
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.controllers`, `cgroup.max.*` | **enforced** | Linux's delegation and no-internal-process rules; a new cgroup's files are its creator's, a controller's files whoever enabled it; an unknown controller `EINVAL` |
 | `cgroup.type`, `cgroup.threads` | **refused** | `threaded` `EOPNOTSUPP`; a thread moves only where it is |
 | `cgroup.events`, `cgroup.stat` | **emulated** | |
 | `cgroup.freeze`, `cgroup.kill` | **emulated** | host `SIGSTOP`, `SIGCONT`, `SIGKILL` to the members |
-| `pids.max` | **enforced** | at `fork` and a native thread's creation, up the tree (`EAGAIN`), not for a VM thread |
+| `pids.max` | **enforced** | at `fork` and a native thread's creation, up the tree (`EAGAIN`), not for a VM thread; `max` or a whole number up to 4194304 (`EINVAL` otherwise, a suffix too) |
 | `pids.current`, `memory.current`, `cpu.stat` | **host** | the members' threads, resident memory and times |
-| `memory.max`, `high`, `low`, `min`, `swap.max`, `oom.group`, `cpu.max`, `cpu.weight`, `cpuset.*`, `io.*`, `hugetlb.*`, `rdma.*`, `misc.*` | **kept** | macOS bounds no process's memory or CPU; `memory.stat`, `memory.events`, `io.stat` read zeros |
+| `memory.max`, `high`, `low`, `min`, `swap.max`, `oom.group`, `cpu.max`, `cpu.weight`, `cpuset.*`, `io.*`, `hugetlb.*`, `rdma.*`, `misc.*` | **kept** | macOS bounds no process's memory or CPU; a memory limit is parsed as Linux parses it (suffixes `K` to `E`) and kept in whole pages; `memory.stat`, `memory.events`, `io.stat` read zeros |
 | Pressure (`*.pressure`, `/proc/pressure`) | **refused** | `ENOENT`, as without `CONFIG_PSI` |
 | `perf_event` controller | **refused** | not offered |
 | Device programs | **enforced** | see Security |

@@ -7391,3 +7391,36 @@ fn checkpoint_restore_interfaces() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// Huge pages come from an empty pool (`ENOMEM` for `MAP_HUGETLB` and
+/// `SHM_HUGETLB`, `vm.nr_hugepages` staying 0, none in `/proc/meminfo`);
+/// `SHM_LOCK` charges a segment to its locker's `RLIMIT_MEMLOCK`;
+/// `MADV_COLD` and `MADV_PAGEOUT` refuse locked memory; a cgroup's files
+/// are its creator's, `pids.max` takes no suffix, a memory limit is kept
+/// in whole pages and `cgroup.subtree_control` refuses a controller Linux
+/// lacks.
+#[test]
+fn memory_limits_huge_pages_and_cgroup_files() {
+    let out = run_c_guest("memlimits", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "MAP_HUGETLB: 12\n\
+         MAP_HUGETLB|MAP_NORESERVE: 0\n\
+         SHM_HUGETLB: 12\n\
+         nr_hugepages: 0\n\
+         nr_hugepages = 8: 0\n\
+         nr_hugepages: 0\n\
+         meminfo: total 0, reserved 0\n\
+         SHM_LOCK by root: 0, shown locked: 1, SHM_UNLOCK: 0, shown locked: 0\n\
+         user: 3 pages past RLIMIT_MEMLOCK: 12, 2 pages: 0, again: 0, 1 more: 12, \
+         after unlocking 2: 0\n\
+         user: with RLIMIT_MEMLOCK 0: 1\n\
+         MADV_COLD: 0, locked: 22, MADV_PAGEOUT locked: 22, unlocked: 0\n\
+         pids.max 1K: -22, 10: 0, reads 10\n\
+         memory.max 5000 reads 4096\n\
+         subtree_control +bogus: -22, +pids +bogus: -22, +pids: 0, -cpu: 0\n\
+         mkdir as 1000: 0\n\
+         d/cgroup.procs: 1000:1000, d/pids.max: 1000:1000\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
