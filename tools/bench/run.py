@@ -19,7 +19,8 @@ macOS and natively on Linux.
         (guests/alpine/fetch/workloads.txt) and natively with Homebrew's
         builds of them, each side's output checked against the other's.
         `--linux-vm` adds the same benchmarks run in a Linux VM on the
-        same Mac (tools/bench/vm.sh), with fwe's ratio to them.
+        same Mac (tools/bench/vm.sh), with fwe's ratio to them; `--fwe-vm`
+        those of a run under fwe's VM backend (`fwe --vm`).
         With the Linux results, a table of all three is printed (and
         appended to $GITHUB_STEP_SUMMARY). `--no-build` leaves the build and
         the workloads out (Alpine's programs run only in CI). It fails when
@@ -158,6 +159,8 @@ BACKEND = "fwe's backend"
 # The results of the same benchmarks in a Linux VM on the same Mac
 # (tools/bench/vm.sh): what fwe competes with.
 VM = "Linux VM"
+# The same benchmarks under fwe with its VM backend (`fwe --vm`, vm.sh).
+FWE_VM = "fwe VM"
 SHARE_BUDGETS = {
     "Lua script (s)": 1.2,
     "Python script (s)": 1.2,
@@ -371,6 +374,9 @@ def macos(a):
     if a.linux_vm:
         with open(a.linux_vm) as f:
             results[VM] = json.load(f)
+    if a.fwe_vm:
+        with open(a.fwe_vm) as f:
+            results[FWE_VM] = json.load(f)["fwe"]
     write(a.out, results)
     table = render(results)
     over = over_budget(results)
@@ -928,7 +934,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
 
 
 def render(results):
-    cols = [c for c in ("fwe", "macOS", "Linux", VM) if c in results]
+    cols = [c for c in ("fwe", FWE_VM, "macOS", "Linux", VM) if c in results]
     against = [c for c in ("macOS", VM) if c in results]
     rows = list(results["fwe"].keys())
     shares = results.get(SHARE, {})
@@ -970,6 +976,7 @@ def main():
     mc.add_argument("--cache", required=True)
     mc.add_argument("--linux")
     mc.add_argument("--linux-vm", help="results of `linux` in a Linux VM on this Mac (vm.sh)")
+    mc.add_argument("--fwe-vm", help="results of `macos` with fwe's VM backend (vm.sh)")
     mc.add_argument("--no-build", action="store_true")
     mc.add_argument("--brew", required=True, help="Homebrew's prefix: the native programs")
     mc.add_argument("--out", required=True)
