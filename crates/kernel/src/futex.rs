@@ -67,7 +67,13 @@ impl Park {
             };
             // SAFETY: a private futex wait on the park's word while it is 0.
             unsafe {
-                libc::syscall(libc::SYS_futex, self.word.as_ptr(), libc::FUTEX_WAIT_PRIVATE, 0, &t);
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.word.as_ptr(),
+                    libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                    0,
+                    &t,
+                );
             }
         }
     }
@@ -94,7 +100,12 @@ impl Park {
         #[cfg(not(target_os = "macos"))]
         // SAFETY: a private futex wake on the park's word.
         unsafe {
-            libc::syscall(libc::SYS_futex, self.word.as_ptr(), libc::FUTEX_WAKE_PRIVATE, 1);
+            libc::syscall(
+                libc::SYS_futex,
+                self.word.as_ptr(),
+                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+                1,
+            );
         }
     }
 }
