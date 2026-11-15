@@ -1491,8 +1491,10 @@ mod tests {
         // The next is an interval after the first.
         assert_eq!(again, fwe_abi::err(fwe_abi::errno::EAGAIN));
         assert_eq!(cur[1], 400_000_000);
+        // (A millisecond's slack: the host times the timer on a clock of
+        // its own.)
         assert!(
-            cur[3] >= 430_000_000 - passed && cur[3] <= 350_000_000,
+            cur[3] >= 429_000_000 - passed && cur[3] <= 350_000_000,
             "{cur:?} after {passed} ns"
         );
         assert_eq!(close_fd(fd), 0);
