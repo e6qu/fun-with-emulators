@@ -783,6 +783,8 @@ def workloads(a, fwe, guest_env, lua_src, results):
         subprocess.run(cmd, capture_output=True, check=True)
         print(f"git status {side}: {(time.perf_counter() - t) * 10:.2f} ms each", file=sys.stderr)
     pcs("git status", statuses["fwe"])
+    # Its history with patches, one process: where git's own code goes.
+    pcs("git log -p", under("/usr/bin/git", "-C", "/tmp/w", "log", "-p"))
     # One git process's start, where the workload's seventy go.
     one = under("/usr/bin/git", "--version")
     timed = one[:2] + ["FWE_TIMING=1"] + one[2:]
