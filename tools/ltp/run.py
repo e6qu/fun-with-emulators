@@ -364,6 +364,12 @@ def main():
     )
     args = ap.parse_args()
 
+    # The tests start at nice 0, as on a Linux test machine (their nice
+    # checks assume it): a runner started higher in priority (GitHub's
+    # macOS runners start jobs at -10) gives it up, which any process may.
+    if os.getpriority(os.PRIO_PROCESS, 0) < 0:
+        os.setpriority(os.PRIO_PROCESS, 0, 0)
+
     fwe = os.path.abspath(args.fwe)
     root = os.path.abspath(args.root)
     tests = entries(os.path.join(root, "opt", "ltp"))

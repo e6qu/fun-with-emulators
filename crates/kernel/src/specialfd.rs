@@ -1477,6 +1477,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(80));
         let mut v = 0u64;
         assert_eq!(read_into(fd, &mut v), 8);
+        let again = read_u64(fd);
         let mut cur = [0i64; 4];
         // SAFETY: `cur` is a writable itimerspec.
         assert_eq!(unsafe { timerfd_gettime(fd as u64, cur.as_mut_ptr() as u64) }, 0);
@@ -1488,9 +1489,12 @@ mod tests {
         }
         assert_eq!(v, 1);
         // The next is an interval after the first.
-        assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        assert_eq!(again, fwe_abi::err(fwe_abi::errno::EAGAIN));
         assert_eq!(cur[1], 400_000_000);
-        assert!(cur[3] >= 430_000_000 - passed && cur[3] <= 350_000_000, "{cur:?} after {passed} ns");
+        assert!(
+            cur[3] >= 430_000_000 - passed && cur[3] <= 350_000_000,
+            "{cur:?} after {passed} ns"
+        );
         assert_eq!(close_fd(fd), 0);
     }
 
