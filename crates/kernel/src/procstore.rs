@@ -750,13 +750,22 @@ pub fn forget_unwritten(pid: i32) {
     }
 }
 
-/// Forget host pid `pid`'s record, under its lock (`_held`).
+/// Forget host pid `pid`'s record, under its lock (`_held`), and every
+/// other entry of the process (its thread list, mappings, view...): it is
+/// gone, and they would hold their blocks until another process had its
+/// pid.
 pub fn remove(_held: &Held, pid: i32) {
     let s = store();
     let Some(e) = s.entry(pid) else { return };
     let (old, old_len) = replace(e, 0, 0);
     s.used(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
     s.free_chain(old, old_len as usize);
+    for kind in [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View] {
+        if let Some(e) = s.entry_of(kind, pid) {
+            let (old, old_len) = replace(e, 0, 0);
+            s.free_chain(old, old_len as usize);
+        }
+    }
 }
 
 /// Write `bytes` as this process's entry of `kind` (one it alone writes,
@@ -969,6 +978,34 @@ mod tests {
             assert_eq!(st.st_size, 1 << 20);
             libc::close(fd);
             libc::shm_unlink(name.as_ptr());
+        }
+    }
+
+    /// A pid forgotten (its process gone) keeps no entry of any kind, so
+    /// no block of the store stays taken for it.
+    #[test]
+    fn a_forgotten_pid_keeps_no_entry_of_any_kind() {
+        let me = crate::host::pid();
+        let s = store();
+        let kinds = [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View];
+        let saved: Vec<Option<Vec<u8>>> = kinds.iter().map(|&k| get_of(k, me)).collect();
+        for &k in &kinds {
+            put_own(k, Some(&[1u8; 5000]));
+        }
+        let held = lock(me).unwrap();
+        let record = get_of(Kind::Record, me);
+        remove(&held, me);
+        for &k in &kinds {
+            let e = s.entry_of(k, me).unwrap();
+            assert_eq!((e.head.load(SeqCst), e.len.load(SeqCst)), (0, 0));
+        }
+        // This process's own entries as they were.
+        if let Some(r) = record {
+            put(&held, me, &r);
+        }
+        drop(held);
+        for (&k, b) in kinds.iter().zip(saved) {
+            put_own(k, b.as_deref());
         }
     }
 
