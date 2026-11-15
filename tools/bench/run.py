@@ -537,6 +537,62 @@ def git_commands(ours, theirs, fresh, root):
               file=sys.stderr)
 
 
+def pcs(name, cmd):
+    """Where `cmd` (one fwe process) runs, by the exact program counter of
+    each of DTrace's samples, named by the file mapped there (as `vmmap`
+    lists it while the program runs) and the offset into it: `sample` walks
+    frames, which guest code without frame records leaves it short of."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.05)  # (Past its exec, as for `sample`.)
+    script = "profile-997 /pid == $target/ { @[arg1] = count(); }"
+    tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p", str(proc.pid),
+                               "-n", script, "-o", out],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              errors="replace")
+    time.sleep(0.2)
+    regions = []
+    vm = subprocess.run(["vmmap", "-wide", str(proc.pid)], capture_output=True, text=True,
+                        errors="replace").stdout
+    for line in vm.splitlines():
+        m = re.search(r"([0-9a-f]+)-([0-9a-f]+)\s+\[.*?\]\s+\S+\s+SM=\S+\s*(.*)$", line)
+        if m:
+            regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip()))
+    said = tracer.communicate()[0]
+    proc.wait()
+    counts = []
+    if os.path.exists(out):
+        with open(out, errors="replace") as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 2 and p[1].isdigit():
+                    counts.append((int(p[0], 0), int(p[1])))
+    if not counts:
+        print(f"{name}: no program counters: {said.strip()[-500:]}", file=sys.stderr)
+        return
+    # A file's offset from the lowest address it is mapped at.
+    base = {}
+    for lo, _, what in regions:
+        if what:
+            base[what] = min(base.get(what, lo), lo)
+
+    def where(pc):
+        for lo, hi, what in regions:
+            if lo <= pc < hi:
+                return f"{os.path.basename(what)}+{pc - base[what]:#x}" if what else f"anonymous {lo:#x}+{pc - lo:#x}"
+        return "unmapped"
+
+    total = sum(n for _, n in counts)
+    by = collections.Counter()
+    for pc, n in counts:
+        by[where(pc).split("+")[0]] += n
+    files = ", ".join(f"{w} {n * 100 // total}%" for w, n in by.most_common(8))
+    top = ", ".join(f"{where(pc)} {n * 100 / total:.1f}%"
+                    for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
+    print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
+          file=sys.stderr)
+
+
 def sampled(name, cmd):
     """Run `cmd` (one fwe process) under macOS's `sample`, and log where
     its time went by the top of the stack: the guest's own code (no
@@ -611,6 +667,10 @@ def profile(name, cmd, theirs, fresh):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     sampled(f"{name} natively", theirs)
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    pcs(name, cmd)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
