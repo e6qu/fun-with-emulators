@@ -173,6 +173,14 @@ impl<P: Platform> Kernel<P> {
         // Mappings changed by memory calls are published before any other
         // call ([`crate::maps::publish`]).
         crate::maps::flush_before(n);
+        // A memory call that names no descriptor or path makes no
+        // descriptor, reads or writes no file and changes no credentials:
+        // none of the checks and notes around the other calls applies.
+        if matches!(n, nr::MUNMAP | nr::MPROTECT | nr::MADVISE | nr::BRK | nr::MREMAP)
+            || n == nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS != 0
+        {
+            return self.dispatch_call(n, a);
+        }
         if let Err(e) = crate::fdtable::check_args(n, &a) {
             return e;
         }

@@ -127,6 +127,24 @@ impl<V: Mapping> Vmas<V> {
         if start >= end {
             return;
         }
+        // Most often the range is free, or inside one mapping: one look,
+        // at the last mapping that starts before its end.
+        let Some((&s, &(e, _))) = self.map.range(..end).next_back() else { return };
+        if e <= start {
+            return;
+        }
+        if s <= start {
+            if e > end {
+                let rest = self.map[&s].1.at(end - s);
+                self.map.insert(end, (e, rest));
+            }
+            if s < start {
+                self.map.get_mut(&s).expect("looked at").0 = start;
+            } else {
+                self.map.remove(&s);
+            }
+            return;
+        }
         self.cut(start);
         self.cut(end);
         while let Some((&k, _)) = self.map.range(start..end).next() {
@@ -137,10 +155,35 @@ impl<V: Mapping> Vmas<V> {
     /// Map `[start, end)` to `value`, replacing what was there (as
     /// `MAP_FIXED` does).
     pub fn insert(&mut self, start: u64, end: u64, value: V) {
-        if start < end {
-            self.clear(start, end);
-            self.map.insert(start, (end, value));
-            self.merge_around(start, end);
+        if start >= end {
+            return;
+        }
+        self.clear(start, end);
+        // Merged with its neighbours where they continue each other.
+        let before = self
+            .map
+            .range(..start)
+            .next_back()
+            .filter(|&(&ps, (pe, pv))| *pe == start && pv.continues(start - ps, &value))
+            .map(|(&ps, _)| ps);
+        let after = self
+            .map
+            .range(end..)
+            .next()
+            .filter(|&(&ns, (_, nv))| ns == end && value.continues(end - start, nv))
+            .map(|(_, (ne, _))| *ne);
+        let last = match after {
+            Some(ne) => {
+                self.map.remove(&end);
+                ne
+            }
+            None => end,
+        };
+        match before {
+            Some(ps) => self.map.get_mut(&ps).expect("looked at").0 = last,
+            None => {
+                self.map.insert(start, (last, value));
+            }
         }
     }
 
@@ -254,6 +297,63 @@ mod tests {
 
     fn m(prot: u8, off: u64) -> M {
         M { prot, off }
+    }
+
+    /// Random mappings, unmappings and changes keep what a page-by-page
+    /// model keeps, with no two neighbours that continue each other left
+    /// apart.
+    #[test]
+    fn random_calls_keep_pages_and_merges() {
+        const PAGES: u64 = 48;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut v: Vmas<M> = Vmas::default();
+        let mut model: Vec<Option<(u8, u64)>> = vec![None; PAGES as usize];
+        for _ in 0..20_000 {
+            let start = next(PAGES);
+            let end = start + 1 + next(PAGES - start);
+            match next(3) {
+                0 => {
+                    let (prot, off) = (next(3) as u8, next(4) * 100);
+                    v.insert(start, end, m(prot, off));
+                    for p in start..end {
+                        model[p as usize] = Some((prot, off + (p - start)));
+                    }
+                }
+                1 => {
+                    v.clear(start, end);
+                    for p in start..end {
+                        model[p as usize] = None;
+                    }
+                }
+                _ => {
+                    let prot = next(3) as u8;
+                    v.update(start, end, |x| m(prot, x.off));
+                    for p in start..end {
+                        if let Some(x) = &mut model[p as usize] {
+                            x.0 = prot;
+                        }
+                    }
+                }
+            }
+            let mut pages: Vec<Option<(u8, u64)>> = vec![None; PAGES as usize];
+            let mut prev: Option<(u64, M)> = None;
+            for p in v.iter() {
+                for q in p.start..p.end {
+                    pages[q as usize] = Some((p.value.prot, p.value.off + (q - p.start)));
+                }
+                if let Some((pe, pv)) = &prev {
+                    assert!(!(*pe == p.start && *pv == *p.value), "left apart at {}", p.start);
+                }
+                prev = Some((p.end, p.value.at(p.end - p.start)));
+            }
+            assert_eq!(pages, model);
+        }
     }
 
     fn list(v: &Vmas<M>) -> Vec<(u64, u64, u8, u64)> {
