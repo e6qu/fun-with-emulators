@@ -1413,8 +1413,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 
 **Files and descriptors**
 - A root on a case-insensitive volume (macOS's default) holds one file
-  for names that differ only in case; `fwe --pull` keeps the first and
-  lists the others.
+  for names that differ only in case: a lookup of `FOO` finds `foo`, an
+  `O_CREAT|O_EXCL` open or `mkdir` of `Foo` beside `foo` is `EEXIST`, a
+  `rename` of `foo` to `Foo` renames the one file, and a listing shows the
+  case each name was made with. fwe checks no name's case (on every
+  lookup it would cost more than the call); `fwe --pull` keeps the first
+  of an image's names that differ only in case and lists the others, and
+  a case-sensitive APFS volume (or disk image) for the root avoids all of
+  this.
 - A process's record locks on a file are dropped, as macOS drops them on
   any close of the file, where fwe reads it through a descriptor of its
   own: the program `execve` runs, a file mapping grown by `mremap` or
