@@ -4275,6 +4275,16 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// `RLIMIT_NPROC` counts a user's threads at `fork`, as Linux counts its
+/// tasks.
+#[test]
+fn fork_counts_threads_against_rlimit_nproc() {
+    assert_eq!(
+        identity(&["nproc-threads"]),
+        "two more threads: fork at the least limit refused true, two more allowed true\n"
+    );
+}
+
 /// `prlimit` of another process reads its limits, and a limit set takes
 /// effect in it at once.
 #[test]

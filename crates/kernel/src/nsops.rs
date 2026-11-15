@@ -292,20 +292,18 @@ impl<P: Platform> Kernel<P> {
         // Limits left for this process are its own before its child
         // inherits them.
         self.take_pending_limits();
-        // RLIMIT_NPROC: a user with as many processes as it allows has no
-        // more but as root or with CAP_SYS_RESOURCE or CAP_SYS_ADMIN, as on
-        // Linux (the host's limit, the user's on the host, applies too).
+        // RLIMIT_NPROC: a user with as many tasks (threads, in all its
+        // processes) as it allows has no more but as root or with
+        // CAP_SYS_RESOURCE or CAP_SYS_ADMIN, as on Linux (the host's limit,
+        // the user's on the host, applies too).
         let (nproc, _) = crate::rlimits::get(fwe_abi::resource::RLIMIT_NPROC);
         if nproc != fwe_abi::resource::RLIM_INFINITY
             && self.creds.uid != 0
             && !self.creds.has(crate::caps::CAP_SYS_RESOURCE)
             && !self.creds.has_admin()
+            && crate::cgroupfs::user_tasks(self.creds.uid) >= nproc
         {
-            let uid = self.creds.uid;
-            let mine = crate::procreg::all().iter().filter(|(_, r)| r.ids[0] == uid).count();
-            if mine as u64 >= nproc {
-                return Err(errno::EAGAIN);
-            }
+            return Err(errno::EAGAIN);
         }
         // And so are its keyrings.
         crate::keys::before_fork();

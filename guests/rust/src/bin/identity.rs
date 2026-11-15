@@ -39,6 +39,7 @@ const SYS_SCHED_GETAFFINITY: i64 = 123;
 const SYS_GETCPU: i64 = 168;
 const SYS_PRLIMIT64: i64 = 261;
 const RLIMIT_NOFILE: i32 = 7;
+const RLIMIT_NPROC: i32 = 6;
 const MAP_SHARED: i32 = 0x01;
 const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
 const MAP_PRIVATE: i32 = 0x02;
@@ -351,6 +352,57 @@ fn map_anon(len: usize, flags: i32) -> String {
     // SAFETY: a fresh mapping, left mapped.
     let r = unsafe { syscall(SYS_MMAP, 0i64, len, PROT_RW, MAP_PRIVATE_ANON | flags, -1i64, 0i64) };
     outcome(r)
+}
+
+/// `RLIMIT_NPROC` counts a user's tasks, threads included, at `fork`: as
+/// a user no other process has, the least limit that lets this process
+/// fork is passed once it runs two more threads.
+fn nproc_threads() {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let child = fork();
+        if child == 0 {
+            setuid(43210);
+            let hard = limit_of(0, RLIMIT_NPROC).1;
+            let forks = |n: u64| {
+                setrlimit(RLIMIT_NPROC, &Rlimit { cur: n, max: hard });
+                let pid = fork();
+                if pid == 0 {
+                    _exit(0);
+                }
+                if pid > 0 {
+                    reap(pid);
+                }
+                pid > 0
+            };
+            let Some(least) = (1..200).find(|&n| forks(n)) else {
+                println!("no limit lets it fork");
+                _exit(1);
+            };
+            setrlimit(RLIMIT_NPROC, &Rlimit { cur: least + 10, max: hard });
+            let mut stop = [0i32; 2];
+            pipe(stop.as_mut_ptr());
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let r = stop[0];
+                    std::thread::spawn(move || {
+                        let mut b = 0u8;
+                        read(r, (&mut b as *mut u8).cast(), 1);
+                    })
+                })
+                .collect();
+            usleep(100_000);
+            let refused = !forks(least);
+            let again = forks(least + 2);
+            close(stop[1]);
+            for t in threads {
+                let _ = t.join();
+            }
+            println!("two more threads: fork at the least limit refused {refused}, two more allowed {again}");
+            _exit(0);
+        }
+        reap(child);
+    }
 }
 
 /// `prlimit(pid, res)`: its soft and hard limit.
@@ -781,6 +833,7 @@ fn main() {
         "madvise" => madvise_controls(),
         "affinity" => affinity(),
         "prlimit-other" => prlimit_other(),
+        "nproc-threads" => nproc_threads(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

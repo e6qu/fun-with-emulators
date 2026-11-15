@@ -450,8 +450,8 @@ and replace processes, and the per-process state it keeps:
   the others are the host's. `RLIMIT_NOFILE` is virtual (see
   [Descriptors](#descriptors)). Past the CPU soft limit the host's
   `SIGXCPU` comes each second, and past the hard one fwe ends the process
-  with `SIGKILL`; `RLIMIT_NPROC` is checked at `fork` against the user's
-  fwe processes.
+  with `SIGKILL`; `RLIMIT_NPROC` is checked at `fork` and thread creation against the
+  tasks (threads) of the user's fwe processes.
 - **Core dumps** (`crates/kernel/src/coredump.rs`): a signal whose default
   dumps core leaves an ELF core (the thread's registers, the process, and
   the mappings Linux's default `coredump_filter` dumps, less memory given

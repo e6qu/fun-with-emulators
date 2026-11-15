@@ -672,17 +672,18 @@ pub fn task_allowed() -> Result<(), i32> {
     let (nproc, _) = crate::rlimits::get(RLIMIT_NPROC);
     if nproc != RLIM_INFINITY
         && let Some(uid) = crate::creds::nproc_user()
+        && user_tasks(uid) >= nproc
     {
-        let tasks: u64 = procreg::all()
-            .into_iter()
-            .filter(|(_, r)| r.ids[0] == uid)
-            .map(|(p, _)| usage(p).0)
-            .sum();
-        if tasks >= nproc {
-            return Err(errno::EAGAIN);
-        }
+        return Err(errno::EAGAIN);
     }
     thread_allowed()
+}
+
+/// How many tasks (threads, in every process) of fwe's processes have
+/// real user `uid`: what `RLIMIT_NPROC` counts, as Linux counts a user's
+/// tasks.
+pub fn user_tasks(uid: u32) -> u64 {
+    procreg::all().into_iter().filter(|(_, r)| r.ids[0] == uid).map(|(p, _)| usage(p).0).sum()
 }
 
 /// The host process of pid `pid` (0: this one) of the caller's pid
