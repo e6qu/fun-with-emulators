@@ -126,7 +126,8 @@ natively wherever fwe can make them fit the Mac.
   natively as Homebrew builds the same projects (the C build with
   Homebrew's clang of the release Alpine's root has); both sides' output
   must match.
-  - **Programs that compute** (the Lua script, the Python script, xz):
+  - **Programs that compute** (building Lua, sampled by one compile; the
+    Lua script, the Python script, xz):
     the budget applies to fwe's share, from CPU sampling (DTrace) in the
     same run: all samples ÷ samples in the program's own code. fwe's are
     those in fwe, the macOS libraries it calls, its stubs (which carry a
@@ -149,9 +150,8 @@ natively wherever fwe can make them fit the Mac.
   | `fork` + exit + wait | 3× macOS |
   | `fork` + `exec` + wait | 3× macOS |
   | start-up | 3× macOS |
-  | building a C project (Lua) | 1.5× macOS |
   | SQLite on disk, git | 1.5× macOS |
-  | a Lua script, a Python script, xz | fwe's share 1.2× |
+  | building a C project (Lua), a Lua script, a Python script, xz | fwe's share 1.2× |
 - [ ] **Prepared images kept:** the code fwe prepares in a program (its
   system calls, thread-pointer accesses and `x18` uses rewritten, and
   relocated where the next item needs it) is kept on disk by the file's

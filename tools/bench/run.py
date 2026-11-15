@@ -132,7 +132,7 @@ MICRO = [
 
 # How many times native macOS's figure fwe's may be, on the same runner
 # (PLAN.md, "Native speed"): system calls 1.5x, the process and thread
-# calls and start-up 3x, a C build 1.5x.
+# calls and start-up 3x.
 BUDGETS = {
     "startup (ms)": 3.0,
     "getpid (ns)": 1.5,
@@ -146,7 +146,6 @@ BUDGETS = {
     "thread create+join (us)": 3.0,
     "fork+exit+wait (us)": 3.0,
     "fork+exec+wait (us)": 3.0,
-    "build Lua (s)": 1.5,
     # Programs at work that are mostly system calls (a database on disk, a
     # repository), as a call is.
     "SQLite (s)": 1.5,
@@ -167,6 +166,9 @@ VM = "Linux VM"
 # The same benchmarks under fwe with its VM backend (`fwe --vm`, vm.sh).
 FWE_VM = "fwe VM"
 SHARE_BUDGETS = {
+    # A C build's, by one compile of it (one process; its starts and forks
+    # keep their own budgets above).
+    "build Lua (s)": 1.2,
     "Lua script (s)": 1.2,
     "Python script (s)": 1.2,
     "xz (s)": 1.2,
@@ -481,6 +483,10 @@ def build(a, fwe, results):
     rusage("clang -c lvm.c", "fwe", clang, ())
     rusage("clang -c lvm.c", "macOS", native_one, ())
     sampled("clang -c lvm.c", clang)
+    # fwe's share of one compile: the build's budget.
+    mine = pcs("clang -c lvm.c", clang, True)
+    if mine:
+        results.setdefault(SHARE, {})["build Lua (s)"] = mine[1] / max(mine[0], 1)
     # Its memory as it compiles, by kind of region.
     proc = subprocess.Popen(clang, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.25)
