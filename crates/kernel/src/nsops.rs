@@ -65,6 +65,8 @@ pub struct ForkNs {
     cgroup: Option<Vec<u8>>,
     /// Its handlers are reset (`CLONE_CLEAR_SIGHAND`).
     clear_sighand: bool,
+    /// It starts in a frozen cgroup: it stops itself before it runs.
+    frozen: bool,
     /// It shares its parent's descriptor table (`CLONE_FILES`).
     files: bool,
     /// The signal its end is told with.
@@ -339,6 +341,7 @@ impl<P: Platform> Kernel<P> {
                 let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
                 match crate::cgroupfs::locate(&host) {
                     Some((cg, None)) => {
+                        crate::cgroupfs::may_move(&crate::cgroupfs::current(), &cg)?;
                         crate::cgroupfs::may_join(&cg)?;
                         Some(cg)
                     }
@@ -346,8 +349,10 @@ impl<P: Platform> Kernel<P> {
                 }
             }
         };
-        // Within the cgroup's `pids.max`.
-        crate::cgroupfs::fork_allowed(&cgroup.clone().unwrap_or_else(crate::cgroupfs::current))?;
+        // Within the cgroup's `pids.max`; frozen with it.
+        let start = cgroup.clone().unwrap_or_else(crate::cgroupfs::current);
+        crate::cgroupfs::fork_allowed(&start)?;
+        let frozen = crate::cgroupfs::frozen(&start);
         CLEAR_SIGHAND.store(
             flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
             std::sync::atomic::Ordering::SeqCst,
@@ -404,6 +409,7 @@ impl<P: Platform> Kernel<P> {
             inherit,
             cgroup,
             clear_sighand,
+            frozen,
             files: flags & fwe_abi::clone::CLONE_FILES != 0,
             exit_signal,
             pidfd: None,
@@ -519,6 +525,12 @@ impl<P: Platform> Kernel<P> {
         }
         if t.clear_sighand {
             self.clear_handlers();
+        }
+        crate::cgroupfs::forked();
+        if t.frozen {
+            // As a task forked into a frozen cgroup, it runs only once
+            // the cgroup thaws.
+            crate::host::kill_process(crate::host::pid(), libc::SIGSTOP);
         }
         FILES_SHARED.store(t.files, std::sync::atomic::Ordering::SeqCst);
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);

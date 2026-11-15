@@ -1399,10 +1399,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `mem`; `/proc` in the initial pid namespace lists only fwe's processes
   (another host process is reached by its number, with only its `stat`).
 - cgroups: memory, CPU, I/O and other limits are kept and read back but
-  not enforced (only `pids.max`, for `fork` and not for a new thread, and
-  device programs are); a threaded
-  cgroup cannot be made (`cgroup.threads` refuses writes); the tree is the
-  user's, not the machine's.
+  not enforced (only `pids.max` and device programs are); a threaded
+  cgroup cannot be made (`cgroup.type` refuses `threaded`); there is no
+  cgroup v1; the tree is the user's, not the machine's. A new thread in
+  the VM backend is not held to `pids.max` or `RLIMIT_NPROC`.
 - seccomp filters apply to every thread (as with
   `SECCOMP_FILTER_FLAG_TSYNC`); there is no user-notification listener
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`).

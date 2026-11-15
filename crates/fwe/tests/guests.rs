@@ -6445,3 +6445,43 @@ fn namespaces_owners_unshare_and_cgroup_paths() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// cgroups: `cgroup.max.depth` and `cgroup.max.descendants` hold `mkdir`
+/// (`EAGAIN`); no threaded cgroups (`EOPNOTSUPP`); `pids.max` holds
+/// threads as well as forks, `pids.events` counting the refusals;
+/// `cgroup.threads` lists threads; a freeze holds the cgroups below and
+/// whoever joins or is forked into one; moves need write access to the
+/// common ancestor's `cgroup.procs` and stay in the cgroup namespace; and
+/// there is no cgroup v1 (`ENODEV`).
+#[test]
+fn cgroups_limits_freeze_and_delegation() {
+    let out = run_c_guest("cgroups", &[]);
+    assert_eq!(
+        stdout(&out),
+        "max.depth x: -22\n\
+         mkdir depth 1: 0\n\
+         mkdir depth 2: 11\n\
+         mkdir past descendants: 11\n\
+         cgroup.type: domain\n\
+         type threaded: -95, type junk: -22\n\
+         cgroup.threads lists the threads: 2\n\
+         thread past pids.max: 11\n\
+         fork past pids.max: 11\n\
+         p/pids.events: max 2\n\
+         thread within pids.max: 0\n\
+         thread past RLIMIT_NPROC: 11\n\
+         thread within RLIMIT_NPROC: 0\n\
+         member frozen: T\n\
+         f/k/cgroup.events: populated 1\nfrozen 1\n\
+         f/k/cgroup.events: populated 1\nfrozen 1\n\
+         still frozen under a frozen parent: T\n\
+         joined a frozen cgroup: T\n\
+         forked into a frozen cgroup: T\n\
+         thawed: 1\n\
+         unprivileged, common ancestor not writable: 13\n\
+         common ancestor writable: 0\n\
+         out of the cgroup namespace: 2\n\
+         cgroup v1 mount: 19\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

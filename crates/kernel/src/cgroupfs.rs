@@ -9,17 +9,24 @@
 //! fwe does what the files say where it can:
 //!
 //! - `mkdir` makes a cgroup with the files of the controllers its parent
-//!   enables; `rmdir` removes an empty one (`EBUSY` while it has processes
-//!   or children).
-//! - Writing a pid to `cgroup.procs` moves the process; the file lists the
-//!   members when opened, as do `cgroup.events`, `pids.current`,
-//!   `memory.current` and `cpu.stat` what they report.
+//!   enables, within `cgroup.max.depth` and `cgroup.max.descendants` up
+//!   the tree; `rmdir` removes an empty one (`EBUSY` while it has
+//!   processes or children).
+//! - Writing a pid to `cgroup.procs` moves the process, by Linux's
+//!   delegation rules (write access to the common ancestor's
+//!   `cgroup.procs`, within the writer's cgroup namespace); the file lists
+//!   the members when opened, as `cgroup.threads` their threads, and
+//!   `cgroup.events`, `pids.current`, `memory.current` and `cpu.stat`
+//!   what they report. Only domain cgroups are made: `cgroup.type` refuses
+//!   `threaded`.
 //! - `cgroup.subtree_control` enables controllers for the children, with
 //!   Linux's rule that a cgroup with processes has none enabled for
 //!   children (the root aside).
-//! - `cgroup.freeze` stops and continues the members, `cgroup.kill` kills
-//!   them, `pids.max` limits `fork`, and device programs attached to a
-//!   cgroup ([`crate::bpf`]) decide every device access of its members.
+//! - `cgroup.freeze` stops and continues the members of the cgroup and
+//!   those below it, and whoever joins or is forked into a frozen one;
+//!   `cgroup.kill` kills them; `pids.max` limits `fork` and new threads
+//!   (counted in `pids.events`); and device programs attached to a cgroup
+//!   ([`crate::bpf`]) decide every device access of its members.
 //! - The other limits are kept and read back but not enforced: the host has
 //!   no way to hold a process to a memory or CPU budget.
 
@@ -283,18 +290,7 @@ fn usage(pid: i32) -> (u64, u64, u64, u64) {
 /// Bring the file `name` of cgroup `cg` (host directory `dir`) up to date
 /// before it is opened, for the files whose content is what is so now.
 pub fn refresh(dir: &[u8], cg: &[u8], name: &[u8]) {
-    let write = |content: String| {
-        let p = [dir, b"/", name].concat();
-        // Through a fresh file: the guest's descriptor of the old one, if
-        // it holds one, keeps what it read.
-        let tmp = [&p[..], b".fwe-new"].concat();
-        if std::fs::write(os(&tmp), content).is_ok() {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(os(&p)).map(|m| m.permissions().mode()).unwrap_or(0o444);
-            let _ = std::fs::set_permissions(os(&tmp), std::fs::Permissions::from_mode(mode));
-            let _ = std::fs::rename(os(&tmp), os(&p));
-        }
-    };
+    let write = |content: String| replace(&[dir, b"/", name].concat(), content);
     let lines = |pids: Vec<i32>| {
         let mut v: Vec<i32> =
             pids.into_iter().map(crate::pidns::to_guest).filter(|&p| p != 0).collect();
@@ -302,12 +298,31 @@ pub fn refresh(dir: &[u8], cg: &[u8], name: &[u8]) {
         v.iter().map(|p| format!("{p}\n")).collect::<String>()
     };
     match name {
-        b"cgroup.procs" | b"cgroup.threads" => write(lines(members(cg, false))),
+        b"cgroup.procs" => write(lines(members(cg, false))),
+        // Every thread of each member, its main thread by its pid.
+        b"cgroup.threads" => {
+            let mut v: Vec<i32> = Vec::new();
+            for p in members(cg, false) {
+                let pid = crate::pidns::to_guest(p);
+                if pid == 0 {
+                    continue;
+                }
+                v.push(pid);
+                let tids = if p == crate::host::pid() {
+                    crate::thread::tids()
+                } else {
+                    crate::thread::published_tids(p)
+                };
+                v.extend(tids.into_iter().filter(|&t| t != pid && t > 0));
+            }
+            v.sort_unstable();
+            v.dedup();
+            write(v.iter().map(|t| format!("{t}\n")).collect());
+        }
         b"cgroup.events" => {
             let populated = !members(cg, true).is_empty();
-            let frozen =
-                read_words(&[dir, b"/cgroup.freeze"].concat()).first().is_some_and(|w| w == "1");
-            write(format!("populated {}\nfrozen {}\n", u8::from(populated), u8::from(frozen)));
+            let f = frozen(cg);
+            write(format!("populated {}\nfrozen {}\n", u8::from(populated), u8::from(f)));
         }
         b"cgroup.stat" => {
             let n = count_descendants(dir);
@@ -332,6 +347,26 @@ pub fn refresh(dir: &[u8], cg: &[u8], name: &[u8]) {
     }
 }
 
+/// Make `content` what the interface file at host path `p` holds,
+/// through a fresh file: the guest's descriptor of the old one, if it
+/// holds one, keeps what it read. The file keeps the owner and mode the
+/// guest gave it (a runtime delegates a cgroup by giving its files away).
+fn replace(p: &[u8], content: String) {
+    let tmp = [p, b".fwe-new"].concat();
+    let old = guest_stat(p);
+    if std::fs::write(os(&tmp), content).is_err() {
+        return;
+    }
+    if let Ok(f) = std::fs::File::open(os(&tmp)) {
+        use std::os::fd::AsRawFd;
+        let (owner, perm) = old
+            .map_or(((0, 0), 0o444), |st| ((st.st_uid, st.st_gid), crate::modes::perm_of(&st)));
+        let _ = crate::owners::keep_fd(f.as_raw_fd(), owner);
+        let _ = crate::modes::keep_fd(f.as_raw_fd(), perm);
+    }
+    let _ = std::fs::rename(os(&tmp), os(p));
+}
+
 fn count_descendants(dir: &[u8]) -> usize {
     children(dir).iter().map(|c| 1 + count_descendants(&[dir, b"/", c].concat())).sum()
 }
@@ -345,18 +380,45 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
             .map_err(|e| e.raw_os_error().map_or(errno::EIO, crate::host::errno_to_linux))
     };
     match name {
-        b"cgroup.procs" => {
+        b"cgroup.procs" | b"cgroup.threads" => {
+            let threads = name == b"cgroup.threads";
             for word in text.split_whitespace() {
-                let pid: i32 = word.parse().map_err(|_| errno::EINVAL)?;
-                let host = if pid == 0 { crate::host::pid() } else { crate::pidns::host_arg(pid)? };
+                let id: i32 = word.parse().map_err(|_| errno::EINVAL)?;
+                let host = if threads { thread_process(id)? } else { process(id)? };
+                let from = procreg::cgroup_of(host);
+                may_move(&from, cg)?;
+                if threads {
+                    // One thread apart from its process takes a threaded
+                    // cgroup, which fwe does not make: only where it is.
+                    if from != cg {
+                        return Err(errno::EOPNOTSUPP);
+                    }
+                    continue;
+                }
                 may_join(cg)?;
                 procreg::set_cgroup(host, cg)?;
+                changed();
+                // A process moved into a frozen cgroup is frozen, out of
+                // one thawed.
+                let (was, is) = (frozen(&from), frozen(cg));
+                if was != is {
+                    crate::host::kill_process(host, if is { libc::SIGSTOP } else { libc::SIGCONT });
+                }
             }
             Ok(())
         }
-        // Moving single threads needs a threaded cgroup, which fwe does not
-        // make.
-        b"cgroup.threads" => Err(errno::EOPNOTSUPP),
+        // Only a domain: a threaded cgroup fwe does not make.
+        b"cgroup.type" => match text.trim() {
+            "threaded" => Err(errno::EOPNOTSUPP),
+            _ => Err(errno::EINVAL),
+        },
+        b"cgroup.max.depth" | b"cgroup.max.descendants" => {
+            let v = text.trim();
+            if v != "max" && v.parse::<u32>().is_err() {
+                return Err(errno::EINVAL);
+            }
+            store(format!("{v}\n"))
+        }
         b"cgroup.subtree_control" => {
             let mut enabled = read_words(&[dir, b"/cgroup.subtree_control"].concat());
             let available = controllers(cg);
@@ -428,10 +490,18 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 "0" => false,
                 _ => return Err(errno::EINVAL),
             };
-            for pid in members(cg, true) {
-                crate::host::kill_process(pid, if on { libc::SIGSTOP } else { libc::SIGCONT });
+            store(format!("{}\n", u8::from(on)))?;
+            // Each process below takes the state its cgroup now has: one
+            // in a cgroup a cgroup above it freezes stays frozen.
+            let mut known: std::collections::HashMap<Vec<u8>, bool> = Default::default();
+            for (pid, r) in procreg::all() {
+                if r.cgroup != cg && crate::mounts::under(&r.cgroup, cg).is_none() {
+                    continue;
+                }
+                let f = *known.entry(r.cgroup.clone()).or_insert_with(|| frozen(&r.cgroup));
+                crate::host::kill_process(pid, if f { libc::SIGSTOP } else { libc::SIGCONT });
             }
-            store(format!("{}\n", u8::from(on)))
+            Ok(())
         }
         b"cgroup.kill" => {
             if text.trim() != "1" {
@@ -448,7 +518,11 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
             let v = text.trim();
             let parsed =
                 if v == "max" { Some(v.to_string()) } else { parse_size(v).map(|n| n.to_string()) };
-            store(parsed.ok_or(errno::EINVAL)? + "\n")
+            store(parsed.ok_or(errno::EINVAL)? + "\n")?;
+            if name == b"pids.max" {
+                changed();
+            }
+            Ok(())
         }
         b"cpu.max" => {
             let mut w = text.split_whitespace();
@@ -492,25 +566,222 @@ pub fn may_join(cg: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 
-/// Whether a `fork` in cgroup `cg` stays within the `pids.max` of it and
-/// every cgroup above it (`EAGAIN` otherwise).
+/// Cgroup `cg` and each cgroup above it, up to the root.
+fn ancestors(cg: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = vec![cg.to_vec()];
+    while out.last().is_some_and(|c| c != b"/") {
+        let up = crate::fs::normalize(out.last().unwrap_or(&b"/".to_vec()), b"..");
+        out.push(up);
+    }
+    out
+}
+
+/// Whether cgroup `cg` is frozen: its own `cgroup.freeze`, or one above
+/// it, says so.
+pub fn frozen(cg: &[u8]) -> bool {
+    ancestors(cg).iter().any(|c| {
+        host_dir(c).is_ok_and(|d| {
+            read_words(&[&d[..], b"/cgroup.freeze"].concat()).first().is_some_and(|w| w == "1")
+        })
+    })
+}
+
+/// Whether one more task in cgroup `cg` stays within the `pids.max` of
+/// it and every cgroup above it (`EAGAIN` otherwise, counted in the
+/// `pids.events` of the cgroup whose limit it is).
 pub fn fork_allowed(cg: &[u8]) -> Result<(), i32> {
-    let mut at = cg.to_vec();
-    loop {
-        if let Ok(dir) = host_dir(&at)
-            && let Some(max) = read_words(&[&dir[..], b"/pids.max"].concat()).first()
+    for at in ancestors(cg) {
+        let Ok(dir) = host_dir(&at) else { continue };
+        if let Some(max) = read_words(&[&dir[..], b"/pids.max"].concat()).first()
             && let Ok(max) = max.parse::<u64>()
         {
             let n: u64 = members(&at, true).into_iter().map(|p| usage(p).0).sum();
             if n >= max {
+                count_max_event(&dir);
                 return Err(errno::EAGAIN);
             }
         }
-        if at == b"/" {
-            return Ok(());
-        }
-        at = crate::fs::normalize(&at, b"..");
     }
+    Ok(())
+}
+
+/// One more task refused for the `pids.max` of the cgroup at `dir`.
+fn count_max_event(dir: &[u8]) {
+    let p = [dir, b"/pids.events"].concat();
+    let words = read_words(&p);
+    let n: u64 = words.get(1).and_then(|w| w.parse().ok()).unwrap_or(0);
+    replace(&p, format!("max {}\n", n + 1));
+}
+
+/// A record whose generation moves whenever a process changes cgroup or
+/// a `pids.max` changes: what [`thread_allowed`] knows of the process's
+/// cgroups is good until it moves.
+fn moves() -> Option<&'static crate::shared::Record<crate::sysctl::Globals>> {
+    static R: std::sync::OnceLock<Option<crate::shared::Record<crate::sysctl::Globals>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        crate::shared::Record::named("cgroupmoves", 0, crate::sysctl::Globals::default).ok()
+    })
+    .as_ref()
+}
+
+/// A process changed cgroup, or a `pids.max` changed.
+fn changed() {
+    if let Some(r) = moves() {
+        let _ = r.update(|_| Ok(()));
+    }
+}
+
+/// [`moves`]'s generation when this process last looked at its cgroups
+/// (`u64::MAX`: never), and whether a `pids.max` was set in one of them.
+static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static LIMITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process was just forked: it may be in another cgroup than its
+/// parent (`CLONE_INTO_CGROUP`), so it looks again.
+pub fn forked() {
+    SEEN.store(u64::MAX, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a new thread of this process stays within the `pids.max` of
+/// its cgroups (`EAGAIN` otherwise). Most cgroups set none: whether one
+/// does is looked at again only after a process moved or a limit changed.
+pub fn thread_allowed() -> Result<(), i32> {
+    use std::sync::atomic::Ordering;
+    let Some(r) = moves() else { return Ok(()) };
+    let now = r.generation();
+    if SEEN.load(Ordering::Acquire) != now {
+        let limited = ancestors(&current()).iter().any(|c| {
+            host_dir(c).is_ok_and(|d| {
+                read_words(&[&d[..], b"/pids.max"].concat())
+                    .first()
+                    .is_some_and(|w| w.parse::<u64>().is_ok())
+            })
+        });
+        LIMITED.store(limited, Ordering::Release);
+        SEEN.store(now, Ordering::Release);
+    }
+    if LIMITED.load(Ordering::Acquire) { fork_allowed(&current()) } else { Ok(()) }
+}
+
+/// Whether this process may have one more thread: within `RLIMIT_NPROC`
+/// (the tasks of its real user, unless it is exempt) and the `pids.max`
+/// of its cgroups ([`thread_allowed`]); `EAGAIN` otherwise.
+pub fn task_allowed() -> Result<(), i32> {
+    use fwe_abi::resource::{RLIM_INFINITY, RLIMIT_NPROC};
+    let (nproc, _) = crate::rlimits::get(RLIMIT_NPROC);
+    if nproc != RLIM_INFINITY
+        && let Some(uid) = crate::creds::nproc_user()
+    {
+        let tasks: u64 = procreg::all()
+            .into_iter()
+            .filter(|(_, r)| r.ids[0] == uid)
+            .map(|(p, _)| usage(p).0)
+            .sum();
+        if tasks >= nproc {
+            return Err(errno::EAGAIN);
+        }
+    }
+    thread_allowed()
+}
+
+/// The host process of pid `pid` (0: this one) of the caller's pid
+/// namespace.
+fn process(pid: i32) -> Result<i32, i32> {
+    if pid < 0 {
+        return Err(errno::EINVAL);
+    }
+    if pid == 0 { Ok(crate::host::pid()) } else { crate::pidns::host_arg(pid) }
+}
+
+/// The host process thread `tid` (0: the caller) is in.
+fn thread_process(tid: i32) -> Result<i32, i32> {
+    if tid == 0 || crate::thread::tids().contains(&tid) {
+        return Ok(crate::host::pid());
+    }
+    match crate::thread::owner_of_tid(tid) {
+        Some(p) => Ok(p),
+        None => process(tid),
+    }
+}
+
+/// The root of the cgroup namespace of the process (or of the thread
+/// that runs a call), which a move must stay inside (`nsdelegate`).
+static NS_ROOT: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// The process's cgroup namespace's root is cgroup `root`.
+pub fn set_ns_root(root: &[u8]) {
+    *NS_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = root.to_vec();
+}
+
+fn ns_root() -> Vec<u8> {
+    let r = NS_ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if r.is_empty() { b"/".to_vec() } else { r }
+}
+
+/// Whether the caller may move a process from cgroup `from` to `to`, as
+/// Linux's delegation has it: both inside its cgroup namespace (the
+/// hierarchy is mounted `nsdelegate`; `ENOENT` otherwise), and write
+/// access to `cgroup.procs` of the cgroup both are in (`EACCES`).
+pub fn may_move(from: &[u8], to: &[u8]) -> Result<(), i32> {
+    let root = ns_root();
+    let inside = |c: &[u8]| c == root.as_slice() || crate::mounts::under(c, &root).is_some();
+    if !inside(from) || !inside(to) {
+        return Err(errno::ENOENT);
+    }
+    let a = ancestors(from);
+    let common = ancestors(to).into_iter().find(|c| a.contains(c)).unwrap_or(b"/".to_vec());
+    let file = [&host_dir(&common)?[..], b"/cgroup.procs"].concat();
+    match guest_stat(&file) {
+        Some(st) if crate::creds::access().permits(&st, 2) => Ok(()),
+        _ => Err(errno::EACCES),
+    }
+}
+
+/// The metadata the guest sees of the host file at `path`: its owner and
+/// mode as fwe keeps them.
+fn guest_stat(path: &[u8]) -> Option<libc::stat> {
+    let c = std::ffi::CString::new(path).ok()?;
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: zeroed bytes are a valid `stat`, which the call fills.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter for the descriptor just opened.
+    let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+    if ok {
+        let owner = crate::owners::of_fd(fd, &st);
+        let perm = crate::modes::guest_perm_fd(fd, &st);
+        crate::owners::apply(&mut st, owner);
+        crate::modes::apply(&mut st, perm);
+    }
+    // SAFETY: closing the descriptor opened above.
+    unsafe { libc::close(fd) };
+    ok.then_some(st)
+}
+
+/// Whether a cgroup may be made in the cgroup at host directory `parent`:
+/// within the `cgroup.max.descendants` and `cgroup.max.depth` of it and
+/// every cgroup above it (`EAGAIN` otherwise).
+pub fn may_make(parent: &[u8]) -> Result<(), i32> {
+    let Some((cg, None)) = locate(parent) else { return Ok(()) };
+    for (level, at) in ancestors(&cg).iter().enumerate() {
+        let dir = host_dir(at)?;
+        let limit = |name: &[u8]| {
+            read_words(&[&dir[..], b"/", name].concat())
+                .first()
+                .and_then(|w| w.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        };
+        if count_descendants(&dir) >= limit(b"cgroup.max.descendants")
+            || level + 1 > limit(b"cgroup.max.depth")
+        {
+            return Err(errno::EAGAIN);
+        }
+    }
+    Ok(())
 }
 
 /// This process's cgroup, a path from the hierarchy's root.
@@ -648,5 +919,59 @@ mod tests {
         assert_eq!(proc_cgroup(b"/a", b"/a"), b"0::/\n");
         assert_eq!(proc_cgroup(b"/a/c", b"/a/b"), b"0::/../c\n");
         assert_eq!(proc_cgroup(b"/", b"/a/b"), b"0::/../..\n");
+    }
+
+    /// A cgroup of the test's own, with `children` below it: its path and
+    /// host directory, and theirs.
+    fn made_tree(tag: &str, children: &[&str]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let cg = format!("/fwe-unit-{tag}-{}", std::process::id()).into_bytes();
+        let mut out = vec![cg.clone()];
+        out.extend(children.iter().map(|c| [&cg[..], b"/", c.as_bytes()].concat()));
+        out.into_iter()
+            .map(|c| {
+                let dir = host_dir(&c).unwrap();
+                std::fs::create_dir(os(&dir)).unwrap();
+                made(&dir);
+                (c, dir)
+            })
+            .collect()
+    }
+
+    /// `cgroup.max.depth` and `cgroup.max.descendants` hold a new cgroup
+    /// (`EAGAIN`), and take only `max` or a count; `cgroup.type` takes no
+    /// threaded cgroup.
+    #[test]
+    fn hierarchy_limits_and_type() {
+        let t = made_tree("limits", &["a"]);
+        let ((cg, dir), (_, a)) = (&t[0], &t[1]);
+        assert_eq!(write(dir, cg, b"cgroup.type", b"threaded"), Err(errno::EOPNOTSUPP));
+        assert_eq!(write(dir, cg, b"cgroup.type", b"domain"), Err(errno::EINVAL));
+        assert_eq!(write(dir, cg, b"cgroup.max.depth", b"-1"), Err(errno::EINVAL));
+        assert_eq!(may_make(a), Ok(()));
+        write(dir, cg, b"cgroup.max.depth", b"1").unwrap();
+        assert_eq!(may_make(dir), Ok(()));
+        assert_eq!(may_make(a), Err(errno::EAGAIN));
+        write(dir, cg, b"cgroup.max.depth", b"max").unwrap();
+        write(dir, cg, b"cgroup.max.descendants", b"1").unwrap();
+        assert_eq!(may_make(dir), Err(errno::EAGAIN));
+        let _ = std::fs::remove_dir_all(os(dir));
+    }
+
+    /// A cgroup is frozen while it or one above it freezes it, which its
+    /// `cgroup.events` shows.
+    #[test]
+    fn freezing_is_hierarchical() {
+        let t = made_tree("freeze", &["k"]);
+        let ((cg, dir), (k, kdir)) = (&t[0], &t[1]);
+        write(dir, cg, b"cgroup.freeze", b"1").unwrap();
+        assert!(frozen(k));
+        write(kdir, k, b"cgroup.freeze", b"0").unwrap();
+        assert!(frozen(k));
+        refresh(kdir, k, b"cgroup.events");
+        let events = std::fs::read(os(&[&kdir[..], b"/cgroup.events"].concat())).unwrap();
+        assert_eq!(events, b"populated 0\nfrozen 1\n");
+        write(dir, cg, b"cgroup.freeze", b"0").unwrap();
+        assert!(!frozen(k));
+        let _ = std::fs::remove_dir_all(os(dir));
     }
 }

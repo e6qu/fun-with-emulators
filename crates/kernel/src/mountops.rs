@@ -350,9 +350,9 @@ impl<P: Platform> Kernel<P> {
             if fstype_ptr == 0 {
                 return err(errno::EINVAL);
             }
-            // `cgroup` names the v2 hierarchy when that is the one there is.
-            let name: &[u8] = if fstype == b"cgroup" { b"cgroup2" } else { &fstype };
-            let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
+            // Only the v2 hierarchy: `cgroup` (v1) is no type fwe knows, as
+            // on a kernel built without it.
+            let Some(kind) = FsType::from_name(&fstype) else { return err(errno::ENODEV) };
             let (src, root, more) = match self.new_filesystem(kind, &data) {
                 Ok(v) => v,
                 Err(e) => return err(e),

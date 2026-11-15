@@ -63,6 +63,10 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     if child_stack == 0 {
         return err(errno::EINVAL);
     }
+    // Within `RLIMIT_NPROC` and the cgroups' `pids.max`.
+    if let Err(e) = fwe_kernel::cgroupfs::task_allowed() {
+        return err(e);
+    }
 
     let tid = thread::alloc_tid();
     // Traced from its start if the tracer follows new threads.

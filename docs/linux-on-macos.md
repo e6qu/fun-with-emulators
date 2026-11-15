@@ -879,7 +879,7 @@ checked by fwe.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2` (`cgroup` too), `devpts`, `mqueue` and `overlay`; bind, move, remount and propagation changes. Other types `ENODEV`. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
+| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind, move, remount and propagation changes. Other types `ENODEV`. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
 | `umount2` | `MNT_DETACH`, `MNT_FORCE`, `MNT_EXPIRE`, `UMOUNT_NOFOLLOW`; a mount in use is `EBUSY` unless detached or forced. | none |
 | `pivot_root`, `chroot` | The root becomes a path in the namespace's view; the working directory follows `pivot_root` as Linux's. | none |
 | `fsopen`, `fspick`, `fsconfig`, `fsmount` | A filesystem context is the process's, kept against an anonymous file's descriptor; `FSCONFIG_CMD_CREATE` makes the filesystem as `mount` does; reading the descriptor gives its messages. | an anonymous file |
@@ -1986,10 +1986,12 @@ is a host process, native or running the VM alike.
 
 | File | What fwe does | On the host |
 |---|---|---|
-| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat` | Linux's rules; `cgroup.threads` refuses writes (no threaded cgroups) (no controllers for children of a cgroup with processes, `EBUSY` removing one in use); lists read as they are when opened | the directories, the process records |
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree; lists read as they are when opened (`cgroup.threads` lists every thread) | the directories, the process records |
+| moving a process (`cgroup.procs`, `CLONE_INTO_CGROUP`) | Linux's delegation: write access to `cgroup.procs` of the cgroup the source and destination are both in (`EACCES`), both inside the writer's cgroup namespace (`ENOENT`; the hierarchy is mounted `nsdelegate`) | none |
+| `cgroup.type`, `cgroup.threads` | only domain cgroups: `threaded` is `EOPNOTSUPP`, and a thread moves only to the cgroup it is in | none |
 | `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
-| `pids.max` | enforced on `fork` (`EAGAIN` past it, counting threads, up the tree); a new thread is not refused | none |
-| `cgroup.freeze` | stops and continues the members | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
+| `pids.max` | enforced on `fork` and on a new thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
+| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
 | `cgroup.kill` | kills the members | `SIGKILL`, relayed so a process running the VM takes it down first |
 | device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`) | none |
 | `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back, not enforced | none: macOS has no such limit for a process |

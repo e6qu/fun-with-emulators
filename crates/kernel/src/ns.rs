@@ -363,6 +363,9 @@ impl Namespaces {
         crate::netns::set_current(self.net.clone());
         crate::userns::set_current(self.user.clone());
         crate::sysvipc::activate(self.ipc.clone());
+        crate::cgroupfs::set_ns_root(
+            &self.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone()),
+        );
     }
 
     /// Make `own` the calling thread's own namespaces for its sockets and

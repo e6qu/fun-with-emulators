@@ -1887,6 +1887,14 @@ impl<P: Platform> Kernel<P> {
         let mode = self.fs().apply_umask(mode as u32);
         let host_mode = crate::modes::host_perm(mode, true);
         let dir = r.dir.as_raw_fd();
+        // A new cgroup, within the limits of those above it.
+        if r.fstype == crate::mounts::FsType::Cgroup2
+            && stat_at(dir, &name).is_err()
+            && let Some(parent) = crate::fs::host_path_in(dir, b".")
+            && let Err(e) = crate::cgroupfs::may_make(&parent)
+        {
+            return err(e);
+        }
         let made = self.change_in(dir, || {
             // SAFETY: `name` NUL-terminated; `dir` live.
             ret(unsafe { libc::mkdirat(dir, name.as_ptr(), host_mode as libc::mode_t) })

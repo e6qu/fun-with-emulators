@@ -453,8 +453,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let name = guest!(user_string(name, 4096));
-        let name: &[u8] = if name == b"cgroup" { b"cgroup2" } else { &name };
-        let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
+        let Some(kind) = FsType::from_name(&name) else { return err(errno::ENODEV) };
         let c = Context {
             kind,
             phase: Phase::Create,

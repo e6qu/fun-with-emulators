@@ -119,6 +119,22 @@ pub fn publish(c: &Creds) {
     if !same {
         *ACCESS.write().unwrap_or_else(|e| e.into_inner()) = Some(Access::of(c));
     }
+    // Root, or `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`, is not held to
+    // `RLIMIT_NPROC`.
+    let exempt = c.uid == 0 || c.has(crate::caps::CAP_SYS_RESOURCE) || c.has_admin();
+    NPROC_USER
+        .store(u64::from(c.uid) | u64::from(exempt) << 32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The real uid (low half) and whether `RLIMIT_NPROC` binds it (bit 32
+/// clear), as of the process's last system call ([`publish`]).
+static NPROC_USER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+
+/// The real uid whose tasks `RLIMIT_NPROC` counts, if it binds the
+/// process: for a thread made outside a system call's kernel.
+pub fn nproc_user() -> Option<u32> {
+    let v = NPROC_USER.load(std::sync::atomic::Ordering::Relaxed);
+    (v >> 32 == 0).then_some(v as u32)
 }
 
 /// `(uid_t)-1`: "leave unchanged" in the `setre*`/`setres*` calls.
