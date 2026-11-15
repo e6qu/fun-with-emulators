@@ -1042,7 +1042,9 @@ fn a_thread_after_another_ended_starts_afresh() {
 /// `want`.
 fn c_guest_prints(name: &str, args: &[&str], want: &str) {
     let prog = build_c_dynamic(name, Libc::Glibc, true);
-    let root = libc_rootfs(Libc::Glibc, name);
+    // A root of the case's own: tests of one guest run side by side.
+    let root =
+        libc_rootfs(Libc::Glibc, &[name].iter().chain(args).copied().collect::<Vec<_>>().join("-"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg(&prog).args(args);
     let out = run_bounded(cmd);
