@@ -87,8 +87,10 @@ fn statx_from(s: &libc::stat) -> Statx {
         tv_nsec: nsec as u32,
         __reserved: 0,
     };
+    let btime = birth_time(s);
     Statx {
-        stx_mask: statx_mask::STATX_BASIC_STATS,
+        stx_mask: statx_mask::STATX_BASIC_STATS
+            | if btime.is_some() { statx_mask::STATX_BTIME } else { 0 },
         stx_blksize: s.st_blksize as u32,
         stx_attributes: statx_attributes(s, false),
         stx_nlink: s.st_nlink as u32,
@@ -101,7 +103,7 @@ fn statx_from(s: &libc::stat) -> Statx {
         stx_blocks: s.st_blocks as u64,
         stx_attributes_mask: STATX_ATTRS_KNOWN,
         stx_atime: ts(s.st_atime as i64, s.st_atime_nsec as i64),
-        stx_btime: fwe_abi::StatxTimestamp::default(),
+        stx_btime: btime.unwrap_or_default(),
         stx_ctime: ts(s.st_ctime as i64, s.st_ctime_nsec as i64),
         stx_mtime: ts(s.st_mtime as i64, s.st_mtime_nsec as i64),
         stx_rdev_major: crate::devnodes::major(rdev),
@@ -113,6 +115,37 @@ fn statx_from(s: &libc::stat) -> Statx {
         stx_dio_offset_align: 0,
         __spare3: [0; 12],
     }
+}
+
+/// What `statx` reports of a file beyond `stat`'s: its attributes and,
+/// where the host keeps one, its birth time.
+#[derive(Default)]
+struct Extra {
+    attrs: u64,
+    btime: Option<fwe_abi::StatxTimestamp>,
+}
+
+impl Extra {
+    /// Those of the file of host status `s`, no-dump if `nodump`.
+    fn of(s: &libc::stat, nodump: bool) -> Extra {
+        Extra { attrs: statx_attributes(s, nodump), btime: birth_time(s) }
+    }
+}
+
+/// The birth time of the file of host status `s` (APFS keeps one).
+#[cfg(target_os = "macos")]
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+fn birth_time(s: &libc::stat) -> Option<fwe_abi::StatxTimestamp> {
+    Some(fwe_abi::StatxTimestamp {
+        tv_sec: s.st_birthtime as i64,
+        tv_nsec: s.st_birthtime_nsec as u32,
+        __reserved: 0,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn birth_time(_: &libc::stat) -> Option<fwe_abi::StatxTimestamp> {
+    None
 }
 
 /// `statx` of what Linux's `stat` reports as `s`.
@@ -236,14 +269,14 @@ fn stat_result(
     s: &libc::stat,
     fstype: crate::mounts::FsType,
     mount_id: u32,
-) -> (Stat, u64) {
+) -> (Stat, Extra) {
     let node = crate::devnodes::marked(s).then(|| crate::devnodes::node_at(dir, name)).flatten();
     let mut out = as_node(stat_to_linux(s), node);
     if fstype == crate::mounts::FsType::Tmpfs {
         on_tmpfs(&mut out, mount_id);
     }
     let nodump = crate::modes::nodump_at(dir, name, s);
-    (out, statx_attributes(s, nodump))
+    (out, Extra::of(s, nodump))
 }
 
 /// The host device and inode of the file open as `fd`.
@@ -1418,7 +1451,7 @@ impl<P: Platform> Kernel<P> {
         path: &[u8],
         follow: bool,
         depth: u32,
-    ) -> Result<(Stat, u64), i32> {
+    ) -> Result<(Stat, Extra), i32> {
         match self.stat_once(dirfd, path, follow, depth) {
             // A link of the host's to a file of fwe's, which the host cannot
             // follow: that file.
@@ -1458,7 +1491,7 @@ impl<P: Platform> Kernel<P> {
         path: &[u8],
         follow: bool,
         depth: u32,
-    ) -> Result<(Stat, u64), i32> {
+    ) -> Result<(Stat, Extra), i32> {
         // In one host call where it finds what the walk would: on a way
         // with no mount but the root's, none of fwe's own files, and no
         // link.
@@ -1482,7 +1515,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                 Entry::Symlink(t) if follow => {
                     if let Some(ino) = namespace_inode(&t) {
-                        return Ok((ns_stat(ino), 0));
+                        return Ok((ns_stat(ino), Extra::default()));
                     }
                     if depth >= 40 {
                         return Err(errno::ELOOP);
@@ -1494,19 +1527,19 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
                 Entry::Fd { fd, .. } if follow => {
                     if crate::synthdir::fstat_is_dir(fd) {
-                        return Ok((synth_stat(st::S_IFDIR | 0o555, 0), 0));
+                        return Ok((synth_stat(st::S_IFDIR | 0o555, 0), Extra::default()));
                     }
                     let s = stat_fd(fd)?;
                     let node =
                         crate::devnodes::marked(&s).then(|| crate::devnodes::node_of(fd)).flatten();
-                    let attrs = statx_attributes(&s, crate::modes::nodump_fd(fd, &s));
-                    return Ok((as_node(stat_to_linux(&s), node), attrs));
+                    let extra = Extra::of(&s, crate::modes::nodump_fd(fd, &s));
+                    return Ok((as_node(stat_to_linux(&s), node), extra));
                 }
                 Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
                 Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
                 Entry::Missing => return Err(errno::ENOENT),
             };
-            return Ok((self.proc_owned(dirfd, path, st), 0));
+            return Ok((self.proc_owned(dirfd, path, st), Extra::default()));
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
         let name = r.name_c()?;
@@ -1649,9 +1682,13 @@ impl<P: Platform> Kernel<P> {
             (out, node)
         } else {
             return match self.linux_stat_attrs(dirfd as i32, &path, follow, 0) {
-                Ok((st, attrs)) => {
+                Ok((st, extra)) => {
                     let mut x = statx_of(&st);
-                    x.stx_attributes = attrs;
+                    x.stx_attributes = extra.attrs;
+                    if let Some(b) = extra.btime {
+                        x.stx_btime = b;
+                        x.stx_mask |= statx_mask::STATX_BTIME;
+                    }
                     if self.mount_root(dirfd as i32, &path, false) {
                         x.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
                     }
@@ -4674,6 +4711,33 @@ mod tests {
         );
         assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
         assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
+    }
+
+    /// `statx` reports the host's birth time (`STATX_BTIME`), by path and
+    /// by descriptor.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn statx_reports_the_birth_time() {
+        use fwe_abi::fcntl::{AT_EMPTY_PATH, O_CREAT, O_RDWR};
+        let (mut k, _d) = rooted();
+        let p = cstr("/born");
+        let fd = open(&mut k, &p, O_CREAT | O_RDWR, 0o644);
+        assert!(fd >= 0);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        for (dirfd, path, flags) in [(AT_FDCWD, &p, 0), (fd as u64, &cstr(""), AT_EMPTY_PATH)] {
+            let mut x = Statx::default();
+            let r = k.syscall(
+                nr::STATX,
+                [dirfd, path.as_ptr() as u64, flags, 0xfff, &mut x as *mut _ as u64, 0],
+            );
+            assert_eq!(r, 0);
+            assert_ne!(x.stx_mask & statx_mask::STATX_BTIME, 0);
+            let born = x.stx_btime.tv_sec as u64;
+            assert!(born > 0 && born <= now.as_secs() + 1, "{born}");
+            assert!(x.stx_btime.tv_sec <= x.stx_mtime.tv_sec);
+        }
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
     }
 
     /// A device node outside `/dev`, opened only to read by a path the host

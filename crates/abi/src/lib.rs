@@ -430,6 +430,7 @@ pub mod statx_mask {
     pub const STATX_SIZE: u32 = 0x0200;
     pub const STATX_BLOCKS: u32 = 0x0400;
     pub const STATX_BASIC_STATS: u32 = 0x07ff;
+    pub const STATX_BTIME: u32 = 0x0800;
     pub const STATX_MNT_ID: u32 = 0x1000;
     pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 }

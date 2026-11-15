@@ -746,7 +746,7 @@ keeping fwe's own descriptors apart and Linux's limits exact:
 
 - `stat`/`statx` are translated to the arm64 Linux layout; `statx`
   reports the immutable, append-only and no-dump attributes from the
-  host's file flags. A tmpfs file is on the device
+  host's file flags, and the birth time APFS keeps. A tmpfs file is on the device
   `/proc/<pid>/mountinfo` gives its mount, in page-sized blocks.
   `getdents64` is built from `getdirentries`, re-reading from the
   directory position when translated entries outgrow the guest's buffer.
