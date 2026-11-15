@@ -11,9 +11,13 @@
 //! action where that is ignoring it or continuing. A default action that
 //! ends or stops the process is fwe's to take. The host never blocks a
 //! caught signal ([`caught`]): fwe keeps it pending while the guest blocks
-//! it. Signals with no host equivalent (the real-time signals), and caught
-//! ones sent with `tgkill`, are recorded here directly; the real-time ones
-//! only travel within the process.
+//! it. Signals with no host equivalent (`SIGSTKFLT`, `SIGPWR`, the
+//! real-time signals), and caught ones sent with `tgkill`, are recorded
+//! here directly within the process; to another fwe process they travel
+//! through its mailbox ([`crate::signote::queue`]), with the sender, code
+//! and value, and the process is woken with [`host::WAKE_SIGNAL`] to take
+//! them ([`send_unhosted`]). A process that is not fwe's has no mailbox and
+//! is never sent the wake signal.
 //!
 //! A frame carries the general-purpose registers and the floating-point and
 //! SIMD state (an `fpsimd_context` record), as on Linux.
@@ -758,8 +762,10 @@ impl<P: Platform> Kernel<P> {
     /// or `-pgid`); the host delivers it, to this process too. `-1` is every
     /// other process of the caller's pid namespace, or outside one, of the
     /// caller's run of fwe ([`Kernel::kill_every`]): never the host's other
-    /// processes. A signal with no host equivalent can only be sent within
-    /// this process.
+    /// processes. A signal with no host equivalent is posted within this
+    /// process, or to another fwe process queued in its mailbox
+    /// ([`send_unhosted`]); a process that is not fwe's cannot take one
+    /// (`EINVAL`).
     pub(crate) fn sys_kill(&mut self, pid: i64, sig: u64) -> i64 {
         if sig > signal::NSIG {
             return err(errno::EINVAL);
