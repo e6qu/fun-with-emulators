@@ -11,7 +11,6 @@
 
 use fwe_abi::{err, errno};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Size of `struct signalfd_siginfo`.
@@ -24,12 +23,12 @@ struct SignalFd {
     queue: VecDeque<[u8; SIGINFO_SIZE]>,
 }
 
-static REG: Mutex<Option<HashMap<i32, SignalFd>>> = Mutex::new(None);
+static REG: crate::kept::Kept<Option<HashMap<i32, SignalFd>>> = crate::kept::Kept::new(None);
 /// The union of every signalfd's mask, readable without the lock.
 static WATCHED: AtomicU64 = AtomicU64::new(0);
 
 fn with<R>(f: impl FnOnce(&mut HashMap<i32, SignalFd>) -> R) -> R {
-    let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = REG.lock();
     let reg = g.get_or_insert_with(HashMap::new);
     let r = f(reg);
     WATCHED.store(reg.values().fold(0, |m, s| m | s.mask), Ordering::Release);
@@ -38,19 +37,18 @@ fn with<R>(f: impl FnOnce(&mut HashMap<i32, SignalFd>) -> R) -> R {
 
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = REG.lock();
     f()
 }
 
 /// Write the registry into a fork snapshot.
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
-    with(|m| {
-        crate::snapshot::fd_map(e, m, |e, s| {
-            e.i32(s.rfd);
-            e.i32(s.wfd);
-            e.u64(s.mask);
-            crate::snapshot::queue(e, &s.queue);
-        })
+    let mut g = REG.lock();
+    crate::snapshot::fd_map(e, g.get_or_insert_with(HashMap::new), |e, s| {
+        e.i32(s.rfd);
+        e.i32(s.wfd);
+        e.u64(s.mask);
+        crate::snapshot::queue(e, &s.queue);
     })
 }
 
@@ -236,7 +234,7 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
 
 /// Release a signalfd on `close`. `Some(0)` if it was ours.
 pub fn try_close(fd: i32) -> Option<i64> {
-    let s = with(|m| m.remove(&fd))?;
+    let s = REG.if_used()?.as_mut()?.remove(&fd)?;
     // SAFETY: both ends were opened by this module.
     unsafe {
         libc::close(s.rfd);

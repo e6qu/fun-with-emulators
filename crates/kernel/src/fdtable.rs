@@ -334,11 +334,14 @@ pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
 /// `F_DUPFD` from one with `EINVAL`.
 pub fn check_limit(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
     use fwe_abi::{errno, fcntl, nr as n};
-    let soft = limit().0;
-    if nr == n::DUP3 && a[1] >= soft {
+    // (The limit's lock taken only for the calls it is checked for.)
+    if nr == n::DUP3 && a[1] >= limit().0 {
         return Err(fwe_abi::err(errno::EBADF));
     }
-    if nr == n::FCNTL && matches!(a[1], fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC) && a[2] >= soft {
+    if nr == n::FCNTL
+        && matches!(a[1], fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC)
+        && a[2] >= limit().0
+    {
         return Err(fwe_abi::err(errno::EINVAL));
     }
     Ok(())

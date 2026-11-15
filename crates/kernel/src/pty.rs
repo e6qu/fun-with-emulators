@@ -18,7 +18,6 @@ use crate::host::last_error;
 use fwe_abi::{err, errno};
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::sync::Mutex;
 
 struct Ptys {
     /// Master fd → (guest slave number, host slave path).
@@ -28,16 +27,22 @@ struct Ptys {
     next: u32,
 }
 
-static PTYS: Mutex<Option<Ptys>> = Mutex::new(None);
+impl crate::kept::Table for Ptys {
+    fn is_empty(&self) -> bool {
+        self.masters.is_empty() && self.slaves.is_empty()
+    }
+}
+
+static PTYS: crate::kept::Kept<Option<Ptys>> = crate::kept::Kept::new(None);
 
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = PTYS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = PTYS.lock();
     f()
 }
 
 fn with<R>(f: impl FnOnce(&mut Ptys) -> R) -> R {
-    let mut g = PTYS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PTYS.lock();
     let p =
         g.get_or_insert_with(|| Ptys { masters: HashMap::new(), slaves: HashMap::new(), next: 0 });
     f(p)
@@ -143,7 +148,7 @@ pub fn ptsnum(master_fd: i32) -> Option<u32> {
 /// reference to the master is. Guest numbers are never reused, and once the
 /// last master is closed the host itself refuses to open its slave.
 pub fn try_close(fd: i32) -> Option<i64> {
-    with(|p| p.masters.remove(&fd))?;
+    PTYS.if_used()?.as_mut()?.masters.remove(&fd)?;
     // SAFETY: `fd` is a master we allocated.
     unsafe { libc::close(fd) };
     Some(0)

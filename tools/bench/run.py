@@ -502,6 +502,41 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False):
         profile(name, ours, theirs, fresh)
 
 
+def git_commands(ours, theirs, fresh, root):
+    """Where the git workload's time goes, by git command, on both sides:
+    each git process's run time (`t_abs` at its exit, git's own clock) as
+    git's trace2 event log records it, summed by command."""
+    guest_log = "/tmp/git-trace2.json"
+    logs = {"fwe": os.path.join(root, guest_log.lstrip("/")),
+            "macOS": os.path.abspath("bench-git-trace2.json")}
+    runs = {"fwe": ours[:2] + [f"GIT_TRACE2_EVENT={guest_log}"] + ours[2:],
+            "macOS": ["env", f"GIT_TRACE2_EVENT={logs['macOS']}"] + theirs}
+    for side, cmd in runs.items():
+        for d in fresh:
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+        if os.path.exists(logs[side]):
+            os.remove(logs[side])
+        subprocess.run(cmd, capture_output=True)
+        names, took = {}, collections.Counter()
+        count = collections.Counter()
+        with open(logs[side], errors="replace") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("event") == "cmd_name":
+                    names[ev["sid"]] = ev["name"]
+                elif ev.get("event") == "exit":
+                    n = names.get(ev["sid"], "?")
+                    took[n] += ev["t_abs"]
+                    count[n] += 1
+        top = ", ".join(f"{n} {count[n]}x {t * 1e3:.0f} ms" for n, t in took.most_common(10))
+        print(f"git (s) {side}, by command: {sum(took.values()) * 1e3:.0f} ms in git: {top}",
+              file=sys.stderr)
+
+
 def sampled(name, cmd):
     """Run `cmd` (one fwe process) under macOS's `sample`, and log where
     its time went by the top of the stack: the guest's own code (no
@@ -633,6 +668,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
         profiled=True,
     )
     workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh, at)
+    git_commands(*script("git.sh", "/usr/bin/git", brew["git"]), fresh, root)
     # One git process's start, where the workload's seventy go.
     one = under("/usr/bin/git", "--version")
     timed = one[:2] + ["FWE_TIMING=1"] + one[2:]

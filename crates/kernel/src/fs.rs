@@ -116,18 +116,19 @@ fn direct_in(v: &View, dirfd: i32, path: &[u8]) -> Option<Direct> {
     }
     let (m, rest) = table.locate(v.proc_root);
     let rootfs = matches!(&m.source, Source::Host(base) if base == v.root_host);
-    if !rest.is_empty() || !components(&m.root).is_empty() || !rootfs {
+    let whole = m.root.split(|&b| b == b'/').all(|c| c.is_empty() || c == b".");
+    if !rest.is_empty() || !whole || !rootfs {
         return None;
     }
     // No mount under the way's top directory but the root.
     let clear = |top: &[u8]| {
-        let top = mounts::join(v.proc_root, top);
-        !table.mounts.iter().any(|o| o.id != m.id && mounts::under(&o.point, &top).is_some())
+        !table.mounts.iter().any(|o| o.id != m.id && at_or_under_joined(&o.point, v.proc_root, top))
     };
     if !clear(first) {
         return None;
     }
-    let mut name = Vec::with_capacity(path.len() + 9);
+    // (With room for "private/" and the NUL.)
+    let mut name = Vec::with_capacity(path.len() + 10);
     // On the host's own root, the links of its sealed system volume
     // into `/private`, which never change, followed here: the host
     // follows no link in the call.
@@ -142,13 +143,25 @@ fn direct_in(v: &View, dirfd: i32, path: &[u8]) -> Option<Direct> {
         name.push(b'/');
         name.extend_from_slice(c);
     }
+    name.push(0);
     Some(Direct {
         dir: v.root,
-        name: cstr(&name).ok()?,
+        name: CString::from_vec_with_nul(name).ok()?,
         mount_id: m.id,
         mount_flags: m.flags,
         fstype: m.fstype,
     })
+}
+
+/// Whether the normalized absolute path `path` is at or under
+/// `mounts::join(dir, name)`, for a non-empty `name`, made without joining
+/// them.
+fn at_or_under_joined(path: &[u8], dir: &[u8], name: &[u8]) -> bool {
+    let name = name.strip_prefix(b"/").unwrap_or(name);
+    let Some(rest) = path.strip_prefix(dir) else { return false };
+    let rest = if dir.last() == Some(&b'/') { Some(rest) } else { rest.strip_prefix(b"/") };
+    rest.and_then(|r| r.strip_prefix(name))
+        .is_some_and(|r| r.is_empty() || r.first() == Some(&b'/'))
 }
 
 fn components(path: &[u8]) -> Vec<Vec<u8>> {
@@ -1492,7 +1505,8 @@ impl Fs {
     /// host not to follow any link on the way (`AT_SYMLINK_NOFOLLOW_ANY`),
     /// and walks after all when the host meets one.
     pub fn direct(&self, dirfd: i32, path: &[u8]) -> Option<Direct> {
-        direct_in(&self.view(), dirfd, path)
+        let v = self.view();
+        ahead::take_direct(&v, dirfd, path).or_else(|| direct_in(&v, dirfd, path))
     }
 
     /// Whether the guest's root is the host's own (no root filesystem).
@@ -1641,7 +1655,9 @@ impl Fs {
     /// Make this the view the socket calls resolve `AF_UNIX` paths in (see
     /// [`resolve_host`]). Called once the process's filesystem is set up.
     pub fn publish(&self) {
-        *published() = Some(Published {
+        let mut view = published();
+        VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        *view = Some(Published {
             root: self.root.as_raw_fd(),
             root_host: self.root_host.clone(),
             ns: self.mnt.clone(),
@@ -1654,6 +1670,7 @@ impl Fs {
     /// the published view.
     fn republish(&self) {
         if let Some(v) = published().as_mut().filter(|v| v.root == self.root.as_raw_fd()) {
+            VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
             v.cwd = self.cwd.clone();
             v.ns = self.mnt.clone();
             v.proc_root = self.proc_root.clone();
@@ -2771,6 +2788,10 @@ impl Published {
 
 static PUBLISHED: std::sync::Mutex<Option<Published>> = std::sync::Mutex::new(None);
 
+/// Moved on whenever the published view changes, under its lock: a lookup
+/// made in it ([`ahead::put_direct`]) holds while this has not moved.
+static VIEW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn published() -> std::sync::MutexGuard<'static, Option<Published>> {
     PUBLISHED.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -2904,6 +2925,39 @@ pub(crate) mod ahead {
 
     thread_local! {
         static AHEAD: RefCell<Option<(Key, Resolved)>> = const { RefCell::new(None) };
+        /// A one-call lookup made ahead ([`put_direct`]).
+        static DIRECT: RefCell<Option<DirectAhead>> = const { RefCell::new(None) };
+    }
+
+    /// A one-call lookup ([`super::direct_in`]) made in the published view
+    /// at a generation of it, for the locked call that follows.
+    struct DirectAhead {
+        generation: u64,
+        table: std::sync::Arc<crate::mounts::Table>,
+        path: Vec<u8>,
+        direct: super::Direct,
+    }
+
+    /// Keep the one-call lookup of `path` (absolute, or from the working
+    /// directory) made in view `v` for the locked call that follows.
+    #[cfg(target_os = "macos")]
+    pub(super) fn put_direct(v: &View, path: Vec<u8>, direct: super::Direct) {
+        let generation = super::VIEW_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        let table = v.ns.table();
+        DIRECT.with(|d| *d.borrow_mut() = Some(DirectAhead { generation, table, path, direct }));
+    }
+
+    /// The one-call lookup made ahead, if it is of this lookup and the view
+    /// has not changed since.
+    pub(super) fn take_direct(v: &View, dirfd: i32, path: &[u8]) -> Option<super::Direct> {
+        let a = DIRECT.with(|d| d.borrow_mut().take())?;
+        let placed = path.first() == Some(&b'/') || dirfd as i64 == fwe_abi::fcntl::AT_FDCWD;
+        (placed
+            && a.path == path
+            && a.direct.dir == v.root
+            && a.generation == super::VIEW_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+            && std::sync::Arc::ptr_eq(&a.table, &v.ns.table()))
+        .then_some(a.direct)
     }
 
     pub(super) fn put(key: Key, r: Resolved) {
@@ -2921,6 +2975,7 @@ pub(crate) mod ahead {
     /// Forget any resolution made ahead: the open it was made for is done.
     pub fn clear() {
         let _ = AHEAD.try_with(|a| a.borrow_mut().take());
+        let _ = DIRECT.try_with(|d| d.borrow_mut().take());
     }
 }
 
@@ -2962,6 +3017,8 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
             let r =
                 unsafe { libc::fstatat(d.dir, d.name.as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW_ANY) };
             if r == 0 && !matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFLNK) {
+                // The locked open looks it up no more.
+                ahead::put_direct(&v, path, d);
                 return Ok(());
             }
             if r != 0 && matches!(e(), errno::ENOENT | errno::ENOTDIR) {
@@ -3515,6 +3572,36 @@ pub(crate) fn fd_path(fd: i32) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checking a path against a joined one, unjoined, as joining does.
+    #[test]
+    fn at_or_under_joined_is_under_the_join() {
+        let paths: [&[u8]; 9] = [
+            b"/",
+            b"/tmp",
+            b"/tmp/x",
+            b"/tmpx",
+            b"/r",
+            b"/r/tmp",
+            b"/r/tmp/a",
+            b"/r/tmpx",
+            b"/rr/tmp",
+        ];
+        for dir in [&b"/"[..], b"/r", b"/r/"] {
+            for name in [&b"tmp"[..], b"/tmp", b"private"] {
+                for path in paths {
+                    assert_eq!(
+                        at_or_under_joined(path, dir, name),
+                        mounts::under(path, &mounts::join(dir, name)).is_some(),
+                        "{:?} under {:?} + {:?}",
+                        String::from_utf8_lossy(path),
+                        String::from_utf8_lossy(dir),
+                        String::from_utf8_lossy(name)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn normalize_clamps_dotdot_at_root() {

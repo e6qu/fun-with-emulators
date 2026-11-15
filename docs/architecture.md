@@ -703,7 +703,8 @@ the guest's reach, and translates what comes back.
   before the look for fwe's own files, which it never reaches (it takes
   no way through a mount or a link). An `openat` resolves its path once:
   the look for a FIFO to wait for, without the kernel lock, hands its
-  resolution to the open.
+  resolution to the open, a one-call lookup too while the view it was
+  made in (its root, working directory and mount table) is unchanged.
 - Every open file remembers the mount it came through
   (`crates/kernel/src/fdmarks.rs`), followed through `dup`, `close`,
   `fork` and `execve` and dropped once the descriptor names another file:

@@ -39,6 +39,7 @@ mod handles;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
+mod kept;
 pub mod keycrypto;
 pub mod keys;
 mod keytypes;

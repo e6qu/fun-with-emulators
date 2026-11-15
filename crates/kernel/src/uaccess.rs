@@ -479,20 +479,24 @@ pub fn zero(addr: u64, len: usize) -> Result<()> {
 /// from guest address `addr`. Reads a page at most at a time, never past
 /// the page holding the terminator. Fails with `ENAMETOOLONG` past `max`.
 pub fn read_cstr(addr: u64, max: usize) -> Result<Vec<u8>> {
-    const CHUNK: u64 = 4096;
+    const PAGE: u64 = 4096;
+    // Copied a piece at a time, most strings (a path, an argument) in one:
+    // as far as the NUL, not the rest of the page.
+    const PIECE: u64 = 256;
+    let mut piece = [0u8; PIECE as usize];
     let mut out = Vec::new();
     let mut at = addr;
     loop {
         // Never cross into the next page in one copy: it may be unmapped
         // although the string ends before it.
-        let n = (CHUNK - at % CHUNK) as usize;
-        let mut chunk = vec![0u8; n];
-        read_into(at, &mut chunk)?;
-        if let Some(end) = chunk.iter().position(|&b| b == 0) {
-            out.extend_from_slice(&chunk[..end]);
+        let n = PIECE.min(PAGE - at % PAGE) as usize;
+        let piece = &mut piece[..n];
+        read_into(at, piece)?;
+        if let Some(end) = piece.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&piece[..end]);
             return if out.len() > max { Err(errno::ENAMETOOLONG) } else { Ok(out) };
         }
-        out.extend_from_slice(&chunk);
+        out.extend_from_slice(piece);
         if out.len() > max {
             return Err(errno::ENAMETOOLONG);
         }

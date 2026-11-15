@@ -1094,17 +1094,17 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
     stat_fd(fd).ok().map(|st| (st.st_dev as u64, st.st_ino as u64))
 }
 
-static CURSORS: std::sync::Mutex<Option<std::collections::HashMap<i32, Cursor>>> =
-    std::sync::Mutex::new(None);
+static CURSORS: crate::kept::Kept<Option<std::collections::HashMap<i32, Cursor>>> =
+    crate::kept::Kept::new(None);
 
 fn cursors<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Cursor>) -> R) -> R {
-    let mut g = CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = CURSORS.lock();
     f(g.get_or_insert_with(Default::default))
 }
 
 /// Run `f` holding the cursors' lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = CURSORS.lock();
     f()
 }
 
@@ -1211,10 +1211,11 @@ pub fn moved(fd: i32) {
 
 /// `fd` was closed (or replaced): its listing goes.
 pub fn closed(fd: i32) {
-    if CURSORS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.is_empty()) {
-        return;
+    if let Some(mut g) = CURSORS.if_used()
+        && let Some(m) = g.as_mut()
+    {
+        m.remove(&fd);
     }
-    cursors(|m| m.remove(&fd));
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -1185,8 +1185,8 @@ fn take_corked(fd: i32) -> Option<Vec<u8>> {
 
 /// The multicast groups TCP sockets joined: (socket, group and
 /// interface as the host lays them out).
-pub(crate) static MEMBERSHIPS: std::sync::Mutex<Vec<(i32, Vec<u8>)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static MEMBERSHIPS: crate::kept::Kept<Vec<(i32, Vec<u8>)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// A multicast group joined or left on a TCP socket, which Linux allows
 /// (no multicast reaches one) and the host refuses: kept by fwe. Joining
@@ -1207,7 +1207,7 @@ fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) ->
     // MCAST_JOIN_SOURCE_GROUP; the leaves; the rest need the group joined.
     let join = matches!(name, 35 | 39 | 42 | 46);
     let leave = matches!(name, 36 | 40 | 45 | 47);
-    let mut m = MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = MEMBERSHIPS.lock();
     let at = m.iter().position(|(f, g)| *f == fd && *g == group);
     Some(match (at, join, leave) {
         (Some(_), true, _) => err(errno::EADDRINUSE),
@@ -1227,9 +1227,15 @@ fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) ->
 /// Socket `fd` was closed: what it held back goes out, as Linux sends it,
 /// and the groups it joined are left.
 pub fn closed(fd: i32) {
-    MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(f, _)| *f != fd);
-    KEPT_VALUES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd);
-    V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+    if let Some(mut m) = MEMBERSHIPS.if_used() {
+        m.retain(|(f, _)| *f != fd);
+    }
+    if let Some(mut k) = KEPT_VALUES.if_used() {
+        k.retain(|k| k.0 != fd);
+    }
+    if let Some(mut v) = V4_VIEW.if_used() {
+        v.retain(|&f| f != fd);
+    }
     if let Some(held) = take_corked(fd) {
         // SAFETY: a local buffer of its length; the send does not wait.
         unsafe { libc::send(fd, held.as_ptr().cast(), held.len(), libc::MSG_DONTWAIT) };
@@ -1475,11 +1481,7 @@ fn disconnect(fd: i32) -> Option<i64> {
         return None;
     }
     // One IPv6 socket that `IPV6_ADDRFORM` made IPv4 is IPv4 from now on.
-    let fam = if V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd) {
-        libc::AF_INET
-    } else {
-        fam
-    };
+    let fam = if V4_VIEW.lock().contains(&fd) { libc::AF_INET } else { fam };
     // SAFETY: plain host calls; `new` is a fresh socket this owns until it
     // takes `fd`'s place.
     unsafe {
@@ -1508,9 +1510,9 @@ fn disconnect(fd: i32) -> Option<i64> {
         libc::fcntl(fd, libc::F_SETFD, fdfl);
         libc::close(new);
     }
-    V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+    V4_VIEW.lock().retain(|&f| f != fd);
     take_corked(fd);
-    MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(f, _)| *f != fd);
+    MEMBERSHIPS.lock().retain(|(f, _)| *f != fd);
     Some(0)
 }
 
@@ -1539,12 +1541,12 @@ fn kept_key(level: u64, optname: u64) -> Option<u64> {
 }
 
 /// The values of kept options set: (socket, [`kept_key`], value).
-pub(crate) static KEPT_VALUES: std::sync::Mutex<Vec<(i32, u64, i32)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static KEPT_VALUES: crate::kept::Kept<Vec<(i32, u64, i32)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// IPv6 sockets `IPV6_ADDRFORM` made IPv4: the host's socket stays IPv6,
 /// its names are reported as the IPv4 ones they map.
-static V4_VIEW: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+static V4_VIEW: crate::kept::Kept<Vec<i32>> = crate::kept::Kept::new(Vec::new());
 
 /// `IPV6_ADDRFORM` (`optval` `AF_INET`) of socket `fd`, as Linux allows
 /// it: a TCP or UDP IPv6 socket whose peer is IPv4 (an IPv4-mapped address)
@@ -1577,16 +1579,14 @@ fn addrform(fd: i32, optval: u64, optlen: u64) -> i64 {
     if hb[8..18] != [0; 10] || hb[18..20] != [0xff, 0xff] {
         return err(errno::EADDRNOTAVAIL);
     }
-    V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+    V4_VIEW.lock().push(fd);
     0
 }
 
 /// The host name `hb` (of `hl` bytes) of an IPv6 socket `IPV6_ADDRFORM`
 /// made IPv4, as that: the IPv4 address its IPv4-mapped one stands for.
 fn v4_view(fd: i32, hb: &mut [u8; SOCKADDR_MAX], hl: &mut libc::socklen_t) {
-    if family(hb) != libc::AF_INET6
-        || !V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)
-    {
+    if family(hb) != libc::AF_INET6 || !V4_VIEW.lock().contains(&fd) {
         return;
     }
     let mut v4 = empty_sockaddr();
@@ -1718,7 +1718,7 @@ pub unsafe fn setsockopt(
         if let Err(e) = socket_fd(fd as i32) {
             return e;
         }
-        let mut k = KEPT_VALUES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut k = KEPT_VALUES.lock();
         k.retain(|&(f, o, _)| (f, o) != (fd as i32, key));
         k.push((fd as i32, key, v));
         0
@@ -1805,7 +1805,6 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
             },
             _ => KEPT_VALUES
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|&&(f, o, _)| Some((f, o)) == kept.map(|k| (fd as i32, k)))
                 .map_or(0, |k| k.2),

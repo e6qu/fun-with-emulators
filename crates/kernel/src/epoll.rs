@@ -25,12 +25,12 @@
 type Interest = std::collections::BTreeMap<i32, (u32, u64)>;
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) static INTEREST: std::sync::Mutex<Option<std::collections::HashMap<i32, Interest>>> =
-    std::sync::Mutex::new(None);
+pub(crate) static INTEREST: crate::kept::Kept<Option<std::collections::HashMap<i32, Interest>>> =
+    crate::kept::Kept::new(None);
 
 #[cfg(not(target_os = "linux"))]
 fn interest<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Interest>) -> R) -> R {
-    let mut g = INTEREST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = INTEREST.lock();
     f(g.get_or_insert_with(Default::default))
 }
 
@@ -41,16 +41,26 @@ pub fn closed(fd: i32) {
     let _ = fd;
     #[cfg(not(target_os = "linux"))]
     {
-        interest(|m| {
+        if let Some(mut g) = INTEREST.if_used()
+            && let Some(m) = g.as_mut()
+        {
             m.remove(&fd);
             for list in m.values_mut() {
                 list.remove(&fd);
             }
-        });
-        EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
-        HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
-        BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
-        WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut e) = EDGES.if_used() {
+            e.retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut h) = HELD.if_used() {
+            h.retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut w) = BPF_WATCHED.if_used() {
+            w.retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut w) = WRITES.if_used() {
+            w.retain(|k| k.0 != fd && k.1 != fd);
+        }
     }
 }
 
@@ -59,7 +69,9 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     #[cfg(target_os = "linux")]
     e.u64(0);
     #[cfg(not(target_os = "linux"))]
-    interest(|m| {
+    {
+        let mut g = INTEREST.lock();
+        let m = g.get_or_insert_with(Default::default);
         let mut eps: Vec<&i32> = m.keys().collect();
         eps.sort();
         let ce: Vec<bool> = eps.iter().map(|&&fd| crate::snapshot::cloexec(fd)).collect();
@@ -75,7 +87,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 e.u64(data);
             }
         })
-    })
+    }
 }
 
 /// Rebuild every epoll descriptor in a fork child: a fresh kqueue at its
@@ -236,7 +248,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         }
         // A mounts file or a bpf object is fwe's to watch, not the host's.
         if bpf {
-            let mut w = BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = BPF_WATCHED.lock();
             w.retain(|&(e, f)| (e, f) != (epfd as i32, fd as i32));
             if entry.is_some() {
                 w.push((epfd as i32, fd as i32));
@@ -277,13 +289,13 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
 /// The bpf objects each set watches (set, descriptor): always in error, as
 /// Linux polls a map without events of its own.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static BPF_WATCHED: std::sync::Mutex<Vec<(i32, i32)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static BPF_WATCHED: crate::kept::Kept<Vec<(i32, i32)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// Whether set `ep` watches bpf object `fd`.
 #[cfg(not(target_os = "linux"))]
 fn bpf_watched(ep: i32, fd: i32) -> bool {
-    BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(ep, fd))
+    BPF_WATCHED.lock().contains(&(ep, fd))
 }
 
 /// Whether `fd` is an epoll descriptor.
@@ -711,12 +723,13 @@ fn write_events(events: u64, ready: &[(i32, u32, u64)]) -> i64 {
 /// report on (its writers' end, bytes a probe kept), by epoll descriptor and
 /// descriptor.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static EDGES: std::sync::Mutex<Vec<(i32, i32, u32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static EDGES: crate::kept::Kept<Vec<(i32, i32, u32)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// Whether `bits` of `fd` are news to epoll set `epfd` (and note them).
 #[cfg(not(target_os = "linux"))]
 fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
-    let mut e = EDGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut e = EDGES.lock();
     match e.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
         Some(k) if k.2 == bits => false,
         Some(k) => {
@@ -732,21 +745,22 @@ fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn edge_clear(epfd: i32, fd: i32) {
-    EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
-    HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
-    WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
+    EDGES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
+    HELD.lock().retain(|k| (k.0, k.1) != (epfd, fd));
+    WRITES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
 }
 
 /// What edge-triggered pipe read ends in epoll sets held when last
 /// reported: (set, descriptor, bytes).
 #[cfg(not(target_os = "linux"))]
-pub(crate) static HELD: std::sync::Mutex<Vec<(i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static HELD: crate::kept::Kept<Vec<(i32, i32, i64)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// The writes each set saw counted of each pipe watched exclusively it
 /// watches: `(epfd, fd, writes)`.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static WRITES: std::sync::Mutex<Vec<(i32, i32, u64)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static WRITES: crate::kept::Kept<Vec<(i32, i32, u64)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// Whether a pipe read end `fd` holding `bytes` has had data written since
 /// set `epfd` last saw it, which is an edge to Linux (the host's
@@ -756,7 +770,7 @@ fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
     // A pipe whose writes are counted (one watched exclusively): written
     // to since, whatever it holds now.
     if let Some(w) = crate::exclusive::writes(fd) {
-        let mut seen = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = WRITES.lock();
         return match seen.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
             Some(k) => {
                 let grew = w > k.2;
@@ -769,7 +783,7 @@ fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
             }
         };
     }
-    let mut h = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = HELD.lock();
     match h.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
         Some(k) => {
             let grew = bytes > k.2;

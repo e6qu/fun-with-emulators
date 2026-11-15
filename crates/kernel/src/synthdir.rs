@@ -9,7 +9,6 @@
 use crate::host::last_error;
 use fwe_abi::{err, errno};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 struct Dir {
     /// Its guest path, for paths relative to it.
@@ -20,20 +19,20 @@ struct Dir {
     offset: usize,
 }
 
-static REG: Mutex<Option<HashMap<i32, Dir>>> = Mutex::new(None);
+static REG: crate::kept::Kept<Option<HashMap<i32, Dir>>> = crate::kept::Kept::new(None);
 
 /// Whether a synthetic directory was ever opened: until one is, a call
 /// asking about a descriptor takes no lock.
 static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn with<R>(f: impl FnOnce(&mut HashMap<i32, Dir>) -> R) -> R {
-    let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = REG.lock();
     f(g.get_or_insert_with(HashMap::new))
 }
 
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = REG.lock();
     f()
 }
 
@@ -165,7 +164,7 @@ pub fn fstat_is_dir(fd: i32) -> bool {
 
 /// Release a synthetic directory on `close`. `Some(0)` if it was ours.
 pub fn try_close(fd: i32) -> Option<i64> {
-    with(|m| m.remove(&fd))?;
+    REG.if_used()?.as_mut()?.remove(&fd)?;
     // SAFETY: `fd` is the /dev/null descriptor we reserved.
     unsafe { libc::close(fd) };
     Some(0)

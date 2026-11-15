@@ -254,8 +254,6 @@ mod imp {
     use crate::{guest, uaccess};
     use fwe_abi::{err, errno};
     use std::collections::HashMap;
-    use std::sync::Mutex;
-
     enum Special {
         Event(EventFd),
         Timer(TimerFd),
@@ -352,7 +350,9 @@ mod imp {
     }
 
     pub(super) fn save(e: &mut crate::snapshot::Enc) {
-        with_reg(|m| {
+        let mut g = REG.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        {
             crate::snapshot::fd_map(e, m, |e, s| match s {
                 Special::Event(ev) => {
                     e.u8(0);
@@ -377,7 +377,7 @@ mod imp {
                     e.i64(t.first_at_ns);
                 }
             })
-        })
+        }
     }
 
     pub(super) fn restore(d: &mut crate::snapshot::Dec) {
@@ -436,13 +436,13 @@ mod imp {
             // SAFETY: single-change kevent with no event list.
             unsafe { libc::kevent(t.kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         }
-        *REG.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
+        *REG.lock() = Some(reg);
     }
 
-    static REG: Mutex<Option<HashMap<i32, Special>>> = Mutex::new(None);
+    static REG: crate::kept::Kept<Option<HashMap<i32, Special>>> = crate::kept::Kept::new(None);
 
     fn with_reg<R>(f: impl FnOnce(&mut HashMap<i32, Special>) -> R) -> R {
-        let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = REG.lock();
         f(g.get_or_insert_with(HashMap::new))
     }
 
@@ -462,7 +462,7 @@ mod imp {
     }
 
     pub(super) fn hold<R>(f: impl FnOnce() -> R) -> R {
-        let _g = REG.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REG.lock();
         f()
     }
 
@@ -874,8 +874,7 @@ mod imp {
     }
 
     pub fn close(fd: i32) -> Option<i64> {
-        let removed = with_reg(|m| m.remove(&fd));
-        let s = removed?;
+        let s = REG.if_used()?.as_mut()?.remove(&fd)?;
         // SAFETY: these descriptors were opened by this module and are ours.
         unsafe {
             match s {
