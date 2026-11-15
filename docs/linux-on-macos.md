@@ -2579,7 +2579,7 @@ where fwe falls short of Linux in detail is in
 | `coredump_filter` | **emulated** | constant; writes `EACCES` |
 | `wchan`, `stack`, `syscall`, `sched`, `attr`, `loginuid`, `numa_maps`, `smaps_rollup`, `clear_refs`, `autogroup` | **refused** | `ENOENT` |
 | `meminfo`, `cpuinfo`, `stat`, `uptime`, `loadavg` | **host** | the host's figures; counters the host lacks read 0 |
-| `version`, `filesystems`, `config.gz`, `cmdline` | **emulated** | constant |
+| `version`, `filesystems`, `config.gz`, `cmdline` | **emulated** | constant; `config.gz` sets the options of what fwe implements (cgroup controllers, message queues, `kcmp`, checkpoint/restore...) and says the rest is not set |
 | `mounts`, `partitions`, `keys`, `sysvipc`, `net` | **emulated** | from fwe's records, per namespace |
 | `modules`, `kallsyms`, `swaps`, `kmsg`, `vmstat`, `zoneinfo`, `interrupts`, `diskstats`, `locks`, `pressure` | **refused** | `ENOENT` |
 | `/proc/sys` | **enforced** | network, IPC, `user.max_*`, UTS names and the global sysctls fwe acts on (`fs`, `kernel.keys`, `core_pattern`, `printk`, `yama`, `unprivileged_bpf_disabled`, `pid_max`, `vm.max_map_count`); `vm.drop_caches` **kept**; others constant (writes `EACCES`) or absent (`ENOENT`) |
@@ -2602,7 +2602,7 @@ and fail with `ENOSYS`, noted under `--strace`, in both backends:
   `move_pages`), `rseq`, `rseq_slice_yield`, `memfd_secret`,
   `map_shadow_stack`: as on a kernel built without them, which
   `/proc/config.gz` says fwe's is for io_uring, perf events, fanotify,
-  userfaultfd and modules;
+  userfaultfd, modules, rseq and time namespaces;
 - `lookup_dcookie`, `nfsservctl`: `ENOSYS` on every Linux;
 - `process_mrelease`, `open_tree_attr`, `listns`, `restart_syscall`:
   Linux has them in every configuration (`restart_syscall` called

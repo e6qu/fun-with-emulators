@@ -73,6 +73,17 @@ CONFIG_HZ_250=y
 CONFIG_HZ=250
 CONFIG_HIGH_RES_TIMERS=y
 CONFIG_POSIX_TIMERS=y
+CONFIG_SYSCTL=y
+CONFIG_PROC_SYSCTL=y
+CONFIG_FILE_LOCKING=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_MEMBARRIER=y
+CONFIG_FHANDLE=y
+CONFIG_KCMP=y
+CONFIG_CROSS_MEMORY_ATTACH=y
+CONFIG_CACHESTAT_SYSCALL=y
+CONFIG_POSIX_MQUEUE=y
+CONFIG_POSIX_MQUEUE_SYSCTL=y
 CONFIG_MULTIUSER=y
 CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
@@ -86,9 +97,12 @@ CONFIG_EVENTFD=y
 CONFIG_AIO=y
 CONFIG_DNOTIFY=y
 CONFIG_INOTIFY_USER=y
+CONFIG_FSNOTIFY=y
 CONFIG_SHMEM=y
 CONFIG_TMPFS=y
 CONFIG_TMPFS_XATTR=y
+CONFIG_HUGETLBFS=y
+CONFIG_HUGETLB_PAGE=y
 CONFIG_BLOCK=y
 CONFIG_BLK_DEV=y
 CONFIG_BLK_DEV_LOOP=y
@@ -108,6 +122,15 @@ CONFIG_NET_NS=y
 CONFIG_CGROUPS=y
 CONFIG_CGROUP_BPF=y
 CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CPUSETS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_FAIR_GROUP_SCHED=y
+CONFIG_BLK_CGROUP=y
+CONFIG_MEMCG=y
+CONFIG_CGROUP_HUGETLB=y
+CONFIG_CGROUP_RDMA=y
+CONFIG_CGROUP_MISC=y
 CONFIG_SECURITY=y
 CONFIG_SECURITYFS=y
 CONFIG_SECURITY_LANDLOCK=y
@@ -148,6 +171,8 @@ CONFIG_CRYPTO_HMAC=y
 # CONFIG_PERF_EVENTS is not set
 # CONFIG_FANOTIFY is not set
 # CONFIG_USERFAULTFD is not set
+# CONFIG_TIME_NS is not set
+# CONFIG_RSEQ is not set
 ";
 
 /// [`CONFIG`], gzipped as `/proc/config.gz` is (in stored blocks: the
@@ -675,6 +700,40 @@ mod tests {
             exe_fd: None,
             auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0],
         }
+    }
+
+    /// The configuration names what fwe has: each cgroup controller it
+    /// offers, and the calls whose options programs look for.
+    #[test]
+    fn config_names_what_fwe_has() {
+        let set = |o: &str| CONFIG.contains(&format!("\nCONFIG_{o}=y\n"));
+        for c in crate::cgroupfs::CONTROLLERS {
+            let option = match *c {
+                "cpuset" => "CPUSETS",
+                "cpu" => "CGROUP_SCHED",
+                "io" => "BLK_CGROUP",
+                "memory" => "MEMCG",
+                "hugetlb" => "CGROUP_HUGETLB",
+                "pids" => "CGROUP_PIDS",
+                "rdma" => "CGROUP_RDMA",
+                "misc" => "CGROUP_MISC",
+                other => panic!("no option for controller {other}"),
+            };
+            assert!(set(option), "{option}");
+        }
+        for o in [
+            "POSIX_MQUEUE",
+            "FHANDLE",
+            "MEMBARRIER",
+            "CROSS_MEMORY_ATTACH",
+            "KCMP",
+            "SYSCTL",
+            "FILE_LOCKING",
+            "CHECKPOINT_RESTORE",
+        ] {
+            assert!(set(o), "{o}");
+        }
+        assert!(CONFIG.contains("\n# CONFIG_TIME_NS is not set\n"));
     }
 
     /// `/proc/config.gz` is a gzip stream of the configuration: framed as
