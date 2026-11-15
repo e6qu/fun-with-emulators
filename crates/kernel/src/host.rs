@@ -1705,6 +1705,33 @@ const ARPHRD_NONE: u16 = 0xfffe;
 /// `IFF_LOWER_UP`, Linux's alone: an interface whose carrier is up.
 const IFF_LOWER_UP: u32 = 0x1_0000;
 
+/// Linux's interface flags for the host's `flags`: those the two number
+/// alike (up to `IFF_ALLMULTI`, 0x200), `IFF_MULTICAST` moved from the
+/// BSD's 0x8000 to Linux's 0x1000 (where the BSD's is Linux's
+/// `IFF_DYNAMIC`), and `IFF_LOWER_UP` while the interface runs. A loopback
+/// interface is Linux's `lo`, which takes no multicast. The BSD's own
+/// (`IFF_OACTIVE`, `IFF_SIMPLEX`, `IFF_LINK*`) have no Linux meaning.
+#[cfg(target_os = "macos")]
+pub fn iface_flags_to_linux(flags: u32) -> u32 {
+    const LINUX_MULTICAST: u32 = 0x1000;
+    let mut out = flags & 0x3ff;
+    let loopback = flags & libc::IFF_LOOPBACK as u32 != 0;
+    if flags & libc::IFF_MULTICAST as u32 != 0 && !loopback {
+        out |= LINUX_MULTICAST;
+    }
+    if flags & libc::IFF_RUNNING as u32 != 0 {
+        out |= IFF_LOWER_UP;
+    }
+    out
+}
+
+/// On a Linux host the flags are Linux's already, but for the carrier,
+/// which `getifaddrs` leaves out.
+#[cfg(not(target_os = "macos"))]
+pub fn iface_flags_to_linux(flags: u32) -> u32 {
+    if flags & libc::IFF_RUNNING as u32 != 0 { flags | IFF_LOWER_UP } else { flags }
+}
+
 /// The prefix length of netmask `mask`.
 fn prefix_of(mask: &[u8]) -> u8 {
     mask.iter().map(|b| b.count_ones() as u8).sum()
@@ -1734,12 +1761,7 @@ pub fn interfaces() -> Vec<Interface> {
             let pos = match out.iter().position(|f| f.name == name) {
                 Some(p) => p,
                 None => {
-                    // Flags the two share by number; the carrier is up
-                    // while the interface runs.
-                    let mut flags = i.ifa_flags & 0xffff;
-                    if flags & libc::IFF_RUNNING as u32 != 0 {
-                        flags |= IFF_LOWER_UP;
-                    }
+                    let flags = iface_flags_to_linux(i.ifa_flags);
                     let loopback = flags & libc::IFF_LOOPBACK as u32 != 0;
                     out.push(Interface {
                         name,
@@ -1957,6 +1979,17 @@ pub fn at_path<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BSD's interface flags as Linux's: the loopback `lo` with its
+    /// carrier up and no multicast; another interface's multicast moved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_flags_are_linuxs() {
+        // lo0: UP, LOOPBACK, RUNNING, MULTICAST (0x8049).
+        assert_eq!(iface_flags_to_linux(0x8049), 0x10049);
+        // en0: UP, BROADCAST, SMART, RUNNING, SIMPLEX, MULTICAST (0x8863).
+        assert_eq!(iface_flags_to_linux(0x8863), 0x11063);
+    }
 
     /// Linux's write events reach the host by its numbers, never as
     /// others (`POLLWRBAND` 0x200 is macOS's `POLLEXTEND`, `POLLMSG` its
