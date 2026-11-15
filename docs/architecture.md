@@ -1327,6 +1327,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `MADV_DONTNEED` on a private file mapping keeps modified pages where
   Linux restores the file's.
 - VM: a program's main stack is 8 MiB whatever its `RLIMIT_STACK`.
+- Native: `PR_PAC_RESET_KEYS` fails with `EINVAL`: guest code runs with
+  the host process's pointer-authentication keys, which macOS sets and no
+  process may change.
 - Native: a program's main stack is mapped as large as its
   `RLIMIT_STACK` from the start (the host committing pages as they are
   used), so `/proc/<pid>/maps` shows all of it where Linux shows what it

@@ -4759,6 +4759,16 @@ fn hv_more_calls() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// `MADV_DONTNEED_LOCKED` discards locked memory in the VM as natively.
+#[test]
+fn hv_discards_locked_memory() {
+    let want = "locked 0: dontneed EINVAL, dontneed_locked 0, reads 0\n";
+    assert_eq!(identity(&["dontneed-locked"]), want);
+    let Some(out) = fwe_hv(&rust_low_guest("identity"), &["dontneed-locked"]) else { return };
+    assert_eq!(stdout(&out), want, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// What the `keys` guest prints.
 const KEYS: &str = "session true, key read true, described true\n\
     child shares the session true, its key here true\n\

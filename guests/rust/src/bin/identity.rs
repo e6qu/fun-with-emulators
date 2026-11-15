@@ -656,6 +656,22 @@ fn madvise_controls() {
     }
 }
 
+/// `MADV_DONTNEED_LOCKED` discards locked private memory, which then
+/// reads as zero; `MADV_DONTNEED` refuses it.
+fn dontneed_locked() {
+    // SAFETY: plain calls into the C library on a mapping made here.
+    unsafe {
+        let k = 16 << 10;
+        let p = mmap(std::ptr::null_mut(), k, PROT_RW, MAP_PRIVATE_ANON, -1, 0) as *mut u8;
+        *p = 3;
+        let locked = mlock(p.cast(), k);
+        let plain = madvise(p.cast(), k, MADV_DONTNEED);
+        let plain = if plain == -1 && errno() == 22 { "EINVAL".to_string() } else { plain.to_string() };
+        let r = madvise(p.cast(), k, MADV_DONTNEED_LOCKED);
+        println!("locked {locked}: dontneed {plain}, dontneed_locked {r}, reads {}", *p);
+    }
+}
+
 /// `RLIMIT_MEMLOCK` for a process without `CAP_IPC_LOCK` (uid 1000): a
 /// `MAP_LOCKED` mapping is refused with a limit of 0 (`EPERM`) and past
 /// the limit (`EAGAIN`), as is any mapping after `mlockall(MCL_FUTURE)`;
@@ -891,6 +907,7 @@ fn main() {
         "priorities" => priorities(),
         "memlock" => memlock(),
         "madvise" => madvise_controls(),
+        "dontneed-locked" => dontneed_locked(),
         "affinity" => affinity(),
         "prlimit-other" => prlimit_other(),
         "nproc-threads" => nproc_threads(),

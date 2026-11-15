@@ -788,7 +788,9 @@ impl Mem {
             return err(errno::EINVAL);
         }
         let Some(end) = addr.checked_add(page_up(len)) else { return err(errno::EINVAL) };
-        if advice == mman::MADV_DONTNEED {
+        // MADV_DONTNEED_LOCKED discards locked memory too (the kernel
+        // checked the rest).
+        if matches!(advice, mman::MADV_DONTNEED | mman::MADV_DONTNEED_LOCKED) {
             if !self.vmas.covered(addr, end) {
                 return err(errno::ENOMEM);
             }
