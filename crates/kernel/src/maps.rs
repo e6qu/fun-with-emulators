@@ -668,7 +668,9 @@ pub fn mapped_plain(start: u64, len: u64, prot: u64, shared: bool) -> bool {
 pub fn unmapped(start: u64, len: u64) {
     let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
     if h.0.pending.is_some_and(|(s, l, _, _)| (s, l) == (start, len)) {
+        // What it replaced goes too (one look where nothing was).
         h.0.pending = None;
+        h.unmapped(start, len);
         return;
     }
     h.0.settle();
@@ -1038,6 +1040,15 @@ mod tests {
         assert_eq!(record().span_at(b), Some((b, b + len)));
         unmapped(b, len);
         assert_eq!(record().span_at(b), None);
+        // One made over another (`MAP_FIXED`) and unmapped at once takes
+        // the one it replaced with it.
+        record().mapped(a, 4 * len, 1, false, None);
+        mapped_plain(a + len, len, 3, false);
+        unmapped(a + len, len);
+        assert_eq!(record().span_at(a + len), None);
+        assert_eq!(record().span_at(a), Some((a, a + len)));
+        unmapped(a, 4 * len);
+        assert_eq!(record().count(), before);
     }
 
     fn file(path: &str, offset: u64) -> Option<Object> {
