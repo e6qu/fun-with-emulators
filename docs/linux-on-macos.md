@@ -1005,7 +1005,7 @@ and the frame are under [Numbers](#numbers) and
 | `rt_sigreturn` | restores registers, FP/SIMD state, mask and alternate stack from the frame; an unreadable frame kills the process with `SIGSEGV` | none |
 | `rt_sigsuspend` | replaces the mask; waits for a deliverable signal; `EINTR` | `pthread_sigmask`, `sigsuspend` |
 | `rt_sigtimedwait` | has the host catch the awaited signals while it waits; takes one from the pending set | `sigaction`, `pselect` with no descriptors |
-| `kill` | pid mapped out of the pid namespace, permission checked as on Linux, a sender note left in an fwe target's mailbox | `kill`; `SIGINFO` (the kill relay) for `SIGKILL` to an fwe process |
+| `kill` | pid mapped out of the pid namespace, permission checked as on Linux, a sender note left in an fwe target's mailbox; a signal the process sends itself while the calling thread blocks it is made pending by fwe, so it is pending when `kill` returns (the host would give it to another thread, later) | `kill`; `SIGINFO` (the kill relay) for `SIGKILL` to an fwe process |
 | `tkill`, `tgkill` | a thread of this process: host signal to the thread, or posted to it directly; a thread of another process: queued in that process's mailbox | `pthread_kill`; `kill` with `SIGEMT` |
 | `rt_sigqueueinfo`, `rt_tgsigqueueinfo` | the caller's `siginfo` (code, value) posted, or sent with a note; real-time signals queue, each with its own `siginfo` | `kill`, or `SIGEMT` for a signal the host lacks |
 | `pidfd_send_signal` | `kill`, `tgkill`, `rt_sigqueueinfo` or a group `kill` of what the descriptor names (also a `/proc/<pid>` directory) | as those calls |

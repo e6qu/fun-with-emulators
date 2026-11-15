@@ -907,6 +907,14 @@ impl<P: Platform> Kernel<P> {
         if sig == signal::SIGTRAP && !to_self && host::is_fwe(target) {
             return send_unhosted(target, sig, signal::SI_USER, 0);
         }
+        // One this thread sends itself and blocks is pending when `kill`
+        // returns, as on Linux: the host would hand a signal for the
+        // process to a thread that does not block it, which records it
+        // only once it runs (another thread that does not block it is
+        // woken to take it).
+        if to_self && thread::mask() & bit(sig) != 0 {
+            return post_own(sig);
+        }
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
             // A namespace's init takes its namespace with it.
             let led = (sig == signal::SIGKILL).then(|| crate::pidns::led_by(target)).flatten();
@@ -1437,6 +1445,19 @@ mod tests {
         assert_eq!(regs.pc, 0x1000); // not delivered
         assert_eq!(thread::pending(), 1 << (signal::SIGUSR1 - 1)); // still pending
         thread::take_pending(signal::SIGUSR1);
+        thread::set_mask(0);
+    }
+
+    /// A signal the process sends itself while the thread blocks it is
+    /// pending when `kill` returns, as on Linux.
+    #[test]
+    fn a_blocked_signal_sent_to_oneself_is_pending_at_once() {
+        let mut k = kernel();
+        let urg = 1u64 << (signal::SIGURG - 1);
+        thread::set_mask(urg);
+        assert_eq!(k.sys_kill(thread::tgid() as i64, signal::SIGURG), 0);
+        assert_eq!(thread::pending() & urg, urg);
+        thread::take_pending(signal::SIGURG);
         thread::set_mask(0);
     }
 
