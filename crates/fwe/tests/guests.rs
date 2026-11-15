@@ -1180,7 +1180,8 @@ fn a_signal_is_read_once_across_signalfds() {
 }
 
 /// `SO_PROTOCOL` reports the protocol a socket was made with (ICMP for a
-/// ping socket), and a Unix socket's error queue reads as empty.
+/// ping socket, made where `net.ipv4.ping_group_range` lets every group),
+/// and a Unix socket's error queue reads as empty.
 #[test]
 fn socket_protocol_and_error_queue_are_linuxs() {
     c_guest_prints("sockopts", &["protocol"], "ping protocol 1, unix error queue -1 errno 11\n");

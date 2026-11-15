@@ -26,6 +26,8 @@ int listen(int fd, int backlog);
 int accept(int fd, void *addr, socklen_t *len);
 long read(int fd, void *buf, size_t n);
 int close(int fd);
+int open(const char *path, int flags, ...);
+int unshare(int flags);
 int socketpair(int domain, int type, int protocol, int sv[2]);
 int pipe(int fds[2]);
 long write(int fd, const void *buf, size_t n);
@@ -130,8 +132,14 @@ static int fastopen(void) {
 }
 
 /* SO_PROTOCOL is the protocol a socket was made with (ICMP for a ping
- * socket); a Unix socket's error queue is empty (EAGAIN). */
+ * socket, which takes a group in net.ipv4.ping_group_range: set in a
+ * network namespace of its own); a Unix socket's error queue is empty
+ * (EAGAIN). */
 static int protocol(void) {
+    unshare(0x40000000);
+    int range = open("/proc/sys/net/ipv4/ping_group_range", 1);
+    write(range, "0 2147483647", 12);
+    close(range);
     int ping = socket(AF_INET, SOCK_DGRAM, 1);
     int p = -1;
     socklen_t len = sizeof p;
