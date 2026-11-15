@@ -537,6 +537,8 @@ impl<P: Platform> Kernel<P> {
                 &auxv,
             ),
         }
+        // Its limits, its parent's, for other processes to read.
+        crate::syscalls::publish_limits();
         if t.inherit.foster {
             crate::reaper::foster_started(&t.line.0);
         }

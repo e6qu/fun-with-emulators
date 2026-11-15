@@ -37,6 +37,8 @@ const SYS_MMAP: i64 = 222;
 const SYS_SCHED_SETAFFINITY: i64 = 122;
 const SYS_SCHED_GETAFFINITY: i64 = 123;
 const SYS_GETCPU: i64 = 168;
+const SYS_PRLIMIT64: i64 = 261;
+const RLIMIT_NOFILE: i32 = 7;
 const MAP_SHARED: i32 = 0x01;
 const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
 const MAP_PRIVATE: i32 = 0x02;
@@ -95,6 +97,7 @@ unsafe extern "C" {
     fn mlock(addr: *const c_void, len: usize) -> i32;
     fn mlockall(flags: i32) -> i32;
     fn munlockall() -> i32;
+    fn dup(fd: i32) -> i32;
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn memfd_create(name: *const c_char, flags: u32) -> i32;
@@ -348,6 +351,55 @@ fn map_anon(len: usize, flags: i32) -> String {
     // SAFETY: a fresh mapping, left mapped.
     let r = unsafe { syscall(SYS_MMAP, 0i64, len, PROT_RW, MAP_PRIVATE_ANON | flags, -1i64, 0i64) };
     outcome(r)
+}
+
+/// `prlimit(pid, res)`: its soft and hard limit.
+fn limit_of(pid: i32, res: i32) -> (u64, u64) {
+    let mut old = Rlimit { cur: 0, max: 0 };
+    // SAFETY: a valid out-parameter.
+    unsafe { syscall(SYS_PRLIMIT64, i64::from(pid), i64::from(res), 0i64, &mut old as *mut Rlimit) };
+    (old.cur, old.max)
+}
+
+/// `prlimit` of another process: it reads that process's limits, not the
+/// caller's, and a limit set takes effect in it at once, without its
+/// asking for its limits (its descriptors stop at the new limit).
+fn prlimit_other() {
+    // SAFETY: plain calls into the C library and the kernel.
+    unsafe {
+        let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+        pipe(ready.as_mut_ptr());
+        pipe(go.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            close(go[1]);
+            write(ready[1], b"r".as_ptr().cast(), 1);
+            let mut b = 0u8;
+            read(go[0], (&mut b as *mut u8).cast(), 1);
+            let mut highest = 0;
+            for _ in 0..2000 {
+                match dup(0) {
+                    -1 => break,
+                    fd => highest = fd,
+                }
+            }
+            _exit(highest);
+        }
+        close(go[0]);
+        let mut b = 0u8;
+        read(ready[0], (&mut b as *mut u8).cast(), 1);
+        let new = Rlimit { cur: 64, max: 64 };
+        let set = syscall(SYS_PRLIMIT64, i64::from(child), i64::from(RLIMIT_NOFILE), &new as *const Rlimit, 0i64);
+        let own = Rlimit { cur: 128, max: limit_of(0, RLIMIT_NOFILE).1 };
+        setrlimit(RLIMIT_NOFILE, &own);
+        println!(
+            "set {set}: it reads {:?}, the caller's own {:?}",
+            limit_of(child, RLIMIT_NOFILE),
+            limit_of(0, RLIMIT_NOFILE).0
+        );
+        close(go[1]);
+        println!("its highest descriptor {}", reap(child));
+    }
 }
 
 /// `sched_getaffinity(pid)`'s first word (0 on failure).
@@ -728,6 +780,7 @@ fn main() {
         "memlock" => memlock(),
         "madvise" => madvise_controls(),
         "affinity" => affinity(),
+        "prlimit-other" => prlimit_other(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

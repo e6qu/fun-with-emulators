@@ -4275,6 +4275,16 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// `prlimit` of another process reads its limits, and a limit set takes
+/// effect in it at once.
+#[test]
+fn prlimit_reaches_another_process_at_once() {
+    assert_eq!(
+        identity(&["prlimit-other"]),
+        "set 0: it reads (64, 64), the caller's own 128\nits highest descriptor 63\n"
+    );
+}
+
 /// CPU affinity is per process and reaches across processes: one set on
 /// another process is what it reads; a fork child inherits it.
 #[test]

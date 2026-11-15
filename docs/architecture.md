@@ -1299,9 +1299,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),
   and the CPU and process-count limits fwe keeps on top of the host's,
   cannot be raised past the host's hard limit, even by root.
-- Limits set on another process with `prlimit` take effect at its next
-  limit call, `fork` or `execve`; reading another's reports what was set
-  for it, else the caller's own.
+- A limit set on another process with `prlimit` takes effect at its next
+  system call, which it is woken to make if it waits in one: one running
+  guest code without calls (a loop) takes it up only once it makes one.
 - A process's nice value (its main thread's) is given to the host
   process, which lets a user raise it but not lower it: a guest's
   lowering stands in fwe's record and in what it reads back, while the

@@ -173,6 +173,10 @@ pub(crate) fn plain_memory(n: u64, a: &[u64; 6]) -> bool {
 
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        // Limits another process set for this one take effect now.
+        if crate::procreg::take_limits_left() {
+            self.take_pending_limits();
+        }
         // Told of a foster child: the watcher that follows it starts here,
         // under the kernel lock.
         if crate::reaper::watcher_wanted() {
@@ -2212,6 +2216,7 @@ impl<P: Platform> Kernel<P> {
                 if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
                     return err(e);
                 }
+                publish_limits();
             }
             return 0;
         }
@@ -2222,6 +2227,7 @@ impl<P: Platform> Kernel<P> {
                 if let Err(e) = crate::rlimits::set(res, n.rlim_cur, n.rlim_max, privileged) {
                     return err(e);
                 }
+                publish_limits();
             }
             return 0;
         }
@@ -2238,15 +2244,16 @@ impl<P: Platform> Kernel<P> {
             if unsafe { libc::setrlimit(hres as _, &r) } != 0 {
                 return last_error();
             }
+            publish_limits();
         }
         0
     }
 
-    /// `prlimit` of another process, host process `target`: the limit it
-    /// was left (or, none left, the caller's own, which a child inherits:
-    /// fwe cannot read another's), and a new one left for it to take up
-    /// ([`crate::procreg::push_limit`]), for a caller of its ids or with
-    /// `CAP_SYS_RESOURCE`.
+    /// `prlimit` of another process, host process `target`, for a caller of
+    /// its ids or with `CAP_SYS_RESOURCE`: its limit as its record has it
+    /// (one left for it, else the one it published), and a new one left
+    /// there ([`crate::procreg::push_limit`]), the target woken to take it
+    /// up at once ([`crate::signote::limits_set`]).
     fn prlimit_other(&mut self, target: i32, res: u64, new: u64, old: u64) -> i64 {
         if crate::procreg::read(target).is_none() {
             return err(errno::ESRCH);
@@ -2270,16 +2277,16 @@ impl<P: Platform> Kernel<P> {
         }
         // Raising the hard limit takes CAP_SYS_RESOURCE (the other's limit
         // as fwe knows it: what was set for it, else the caller's own).
+        // Its limit, as it published it (from its start, or its parent's
+        // at its fork) or was left it.
+        let Some(Some(had)) = crate::procreg::limit_of(target, res as u32) else {
+            return err(errno::ESRCH);
+        };
         if let Some(n) = &n
             && !privileged
+            && n.rlim_max > had.1
         {
-            let hard = match crate::procreg::pending_limit(target, res as u32) {
-                Some((_, max)) => max,
-                None => own_limit(res).map_or(resource::RLIM_INFINITY, |(_, max)| max),
-            };
-            if n.rlim_max > hard {
-                return err(errno::EPERM);
-            }
+            return err(errno::EPERM);
         }
         // A descriptor limit past what fwe leaves the guest (every fwe
         // process the same range): refused now, as Linux refuses one past
@@ -2300,26 +2307,28 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         if old != 0 {
-            let had = match crate::procreg::pending_limit(target, res as u32) {
-                Some(l) => l,
-                None => match own_limit(res) {
-                    Ok(l) => l,
-                    Err(e) => return err(e),
-                },
-            };
             guest!(uaccess::write(old, Rlimit { rlim_cur: had.0, rlim_max: had.1 }));
         }
-        if let Some(n) = n
-            && let Err(e) = crate::procreg::push_limit(target, res as u32, n.rlim_cur, n.rlim_max)
-        {
-            return err(e);
+        if let Some(n) = n {
+            if let Err(e) = crate::procreg::push_limit(target, res as u32, n.rlim_cur, n.rlim_max) {
+                return err(e);
+            }
+            // Woken to take it up now (it has a mailbox, being fwe's).
+            if crate::signote::limits_set(target).is_ok() {
+                host::kill_process(target, host::WAKE_SIGNAL);
+            }
         }
         0
     }
 
-    /// Take up the resource limits another process set for this one.
+    /// Take up the resource limits another process set for this one, and
+    /// publish them.
     pub(crate) fn take_pending_limits(&mut self) {
-        for (res, soft, hard) in crate::procreg::take_limits() {
+        let taken = crate::procreg::take_limits();
+        if taken.is_empty() {
+            return;
+        }
+        for (res, soft, hard) in taken {
             let value = Rlimit { rlim_cur: soft, rlim_max: hard };
             if u64::from(res) == resource::RLIMIT_NOFILE {
                 let _ = crate::fdtable::set_limit(soft, hard);
@@ -2335,6 +2344,7 @@ impl<P: Platform> Kernel<P> {
                 unsafe { libc::setrlimit(hres as _, &r) };
             }
         }
+        publish_limits();
     }
 
     fn sys_clock_gettime(&self, id: u64, tp: u64) -> i64 {
@@ -3398,6 +3408,16 @@ mod itimer {
             assert_eq!(set(0, bad), Err(errno::EINVAL));
         }
     }
+}
+
+/// Publish this process's resource limits in its record, where another
+/// process's `prlimit` reads them: as its program starts, as a fork child
+/// starts, and when they change.
+pub(crate) fn publish_limits() {
+    let all = (0..resource::RLIM_NLIMITS)
+        .filter_map(|res| own_limit(res).ok().map(|(soft, hard)| (res as u32, soft, hard)))
+        .collect();
+    crate::procreg::set_own_rlimits(all);
 }
 
 /// The caller's soft limit of resource `res`.

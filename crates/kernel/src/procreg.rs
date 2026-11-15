@@ -59,9 +59,12 @@ pub struct ProcRecord {
     /// files in `/proc` are owned by.
     pub ids: [u32; 8],
     /// Resource limits another process set for it with `prlimit`
-    /// (resource, soft, hard), which it takes up at its next limit call,
-    /// `fork` or `execve`.
+    /// (resource, soft, hard), which it takes up at its next system call
+    /// (it is woken to, [`crate::signote::limits_set`]).
     pub limits: Vec<(u32, u64, u64)>,
+    /// Its resource limits as it last published them (resource, soft,
+    /// hard): what another process's `prlimit` reads.
+    pub rlimits: Vec<(u32, u64, u64)>,
     /// Its nice value (-20 to 19, `setpriority`), which its children
     /// inherit.
     pub nice: i32,
@@ -238,6 +241,12 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     for &w in &r.affinity {
         e.u64(w);
     }
+    e.u64(r.rlimits.len() as u64);
+    for &(res, soft, hard) in &r.rlimits {
+        e.u32(res);
+        e.u64(soft);
+        e.u64(hard);
+    }
     e.into_bytes()
 }
 
@@ -341,6 +350,8 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     let foster = d.bool();
     let n = d.count(8);
     let affinity = (0..n).map(|_| d.u64()).collect();
+    let n = d.count(20);
+    let rlimits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -369,6 +380,7 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
         held,
         foster,
         affinity,
+        rlimits,
     })
 }
 
@@ -599,6 +611,7 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
         held: Vec::new(),
         foster: false,
         affinity: Vec::new(),
+        rlimits: Vec::new(),
     }
 }
 
@@ -735,6 +748,8 @@ pub struct Inherit {
     pub foster: bool,
     /// The CPU affinity ([`ProcRecord::affinity`]).
     affinity: Vec<u64>,
+    /// The resource limits ([`ProcRecord::rlimits`]).
+    rlimits: Vec<(u32, u64, u64)>,
 }
 
 /// What a child forked now inherits ([`Inherit`]): a child of a process
@@ -764,6 +779,7 @@ pub fn inherit() -> Inherit {
         slack,
         foster: false,
         affinity: r.affinity,
+        rlimits: r.rlimits,
     }
 }
 
@@ -782,6 +798,12 @@ pub fn save_inherit(e: &mut Enc, i: &Inherit) {
     for &w in &i.affinity {
         e.u64(w);
     }
+    e.u64(i.rlimits.len() as u64);
+    for &(res, soft, hard) in &i.rlimits {
+        e.u32(res);
+        e.u64(soft);
+        e.u64(hard);
+    }
 }
 
 /// What [`save_inherit`] wrote.
@@ -797,7 +819,9 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let foster = d.bool();
     let n = d.count(8);
     let affinity = (0..n).map(|_| d.u64()).collect();
-    Inherit { ids, oom, nice, sched, slack, foster, affinity }
+    let n = d.count(20);
+    let rlimits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
+    Inherit { ids, oom, nice, sched, slack, foster, affinity, rlimits }
 }
 
 /// Set `r`'s inherited part.
@@ -817,6 +841,7 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
     }
     r.foster = i.foster;
     r.affinity = i.affinity.clone();
+    r.rlimits = i.rlimits.clone();
 }
 
 /// A child `child` of this process starts in this process's cgroup (or in
@@ -957,6 +982,37 @@ pub fn push_limit(pid: i32, res: u32, soft: u64, hard: u64) -> Result<(), i32> {
     })
 }
 
+/// Another process left limits for this one and woke it to take them
+/// up ([`crate::signote::limits_set`]).
+static LIMITS_LEFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// In the wake handler: another process left limits for this one, to be
+/// taken up at its next system call. Async-signal-safe.
+pub fn limits_left() {
+    LIMITS_LEFT.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether limits were left for this process since it last looked:
+/// what each system call asks first, cheaply.
+pub fn take_limits_left() -> bool {
+    LIMITS_LEFT.load(std::sync::atomic::Ordering::Relaxed)
+        && LIMITS_LEFT.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// This process's resource limits are now `limits` (resource, soft,
+/// hard), for other processes to read ([`limit_of`]).
+pub fn set_own_rlimits(limits: Vec<(u32, u64, u64)>) {
+    let _ = change(me(), |r| r.rlimits = limits);
+}
+
+/// Host process `pid`'s limit `res` (soft, hard): one left for it to take
+/// up, else what it published. `None` for a process fwe has no record of.
+pub fn limit_of(pid: i32, res: u32) -> Option<Option<(u64, u64)>> {
+    let r = read(pid)?;
+    let left = r.limits.iter().find(|l| l.0 == res);
+    Some(left.or_else(|| r.rlimits.iter().find(|l| l.0 == res)).map(|l| (l.1, l.2)))
+}
+
 /// The limits another process left for this one, taken.
 pub fn take_limits() -> Vec<(u32, u64, u64)> {
     let me = me();
@@ -966,11 +1022,6 @@ pub fn take_limits() -> Vec<(u32, u64, u64)> {
     let mut out = Vec::new();
     let _ = change(me, |r| out = std::mem::take(&mut r.limits));
     out
-}
-
-/// The limit `res` left for host process `pid`, if any.
-pub fn pending_limit(pid: i32, res: u32) -> Option<(u64, u64)> {
-    read(pid)?.limits.iter().find(|l| l.0 == res).map(|l| (l.1, l.2))
 }
 
 /// Host process `pid`'s ids ([`ProcRecord::ids`]; root's for one fwe has

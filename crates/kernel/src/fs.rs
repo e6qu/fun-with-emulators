@@ -570,6 +570,7 @@ impl Fs {
         let exe_fd = self.proc.exe_fd;
         let auxv = std::mem::take(&mut self.proc.auxv);
         crate::procreg::own_program(&exe, &cmdline);
+        crate::syscalls::publish_limits();
         // The program's file, for `/proc/self/maps`: through the descriptor
         // it was run by, if it has no path.
         let id = match exe_fd {

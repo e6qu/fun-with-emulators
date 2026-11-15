@@ -264,6 +264,16 @@ pub fn foster(target: i32) -> Result<(), i32> {
     put(target, 0, FOSTER_NOTE, 0, 0)
 }
 
+/// What a queue entry holds for the note that another process left the
+/// receiver resource limits ([`limits_set`]).
+const LIMITS_NOTE: u64 = 0x1_0003;
+
+/// Tell host process `target` (woken by the caller) that limits were left
+/// in its record for it ([`crate::procreg::limits_left`]).
+pub fn limits_set(target: i32) -> Result<(), i32> {
+    put(target, 0, LIMITS_NOTE, 0, 0)
+}
+
 /// Ask process `target` to copy between its memory and the request file
 /// of reply socket `token` ([`answer_mem`]).
 pub fn request_mem(target: i32, token: u64) -> Result<(), i32> {
@@ -486,6 +496,8 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
         let pid = ids as u32 as i32;
         if sig == FOSTER_NOTE {
             crate::reaper::fostered();
+        } else if sig == LIMITS_NOTE {
+            crate::procreg::limits_left();
         } else if sig == MEM_REQUEST {
             answer_mem(pid, value);
         } else if sig == FD_REQUEST {
