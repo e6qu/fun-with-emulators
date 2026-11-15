@@ -82,7 +82,7 @@ The [user guide](docs/user-guide.md) covers the rest.
 | `guests/musl`, `guests/glibc`, `guests/debian`, `guests/alpine` | Vendored or fetched binaries the tests run, with their provenance |
 | `tools/gen-abi.py` | Generates the ABI tables from Linux's UAPI headers |
 | `tools/ltp` | Builds LTP and runs its system-call tests against the baseline |
-| `tools/bench` | The benchmarks and their budgets |
+| `tools/bench` | The benchmarks and their budgets (`run.py`, run in CI), and `vm.sh`, which runs them beside a Linux VM on your Mac |
 | `docs/` | The user guide, Linux on macOS, the architecture, comparisons and the hypervisor backend |
 
 ## Testing
