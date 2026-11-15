@@ -825,9 +825,10 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   for `security.capability`, whose value must be revision 2 or 3 of its
   size (`EINVAL`), is kept as revision 3 for the root of a writer's user
   namespace of fwe's and read back as the reader's namespace sees it, and
-  goes with a change of owner and with the first write or truncation
-  through a descriptor opened to write the file (watched as a set-ID
-  file's are).
+  goes with a change of owner and with the first write to the file
+  (any write call, a truncation, a copy or splice into it, a shared
+  writable mapping) once this process opened it to write, by its host
+  identity as a set-ID file is watched (`modes::CAPS_FILES`).
 - **memfd** (`crates/kernel/src/memfd.rs`): `/proc/self/fd` names it
   `/memfd:<name> (deleted)`; `F_SEAL_SHRINK`/`GROW` are checked by
   `ftruncate` and `fallocate`, `F_SEAL_EXEC` by `fchmod`; after
@@ -1526,10 +1527,6 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   65534. Without a root filesystem, the host's own files are not held to
   their bits for a guest that is not root. Access control lists are not
   kept, nor `fs.protected_fifos` and `fs.protected_regular`.
-- A file's set-ID bits and file capabilities go with `write`, `writev`,
-  `pwrite64`, `pwritev`, `pwritev2` and truncation, not with a copy into
-  it (`copy_file_range`, `sendfile`, `splice`) or a write through a
-  shared mapping.
 - The working directory follows a rename of its directory (or one above
   it) by the process itself, not by another process.
 - A `sendto` to an `AF_UNIX` path longer than the host's 103 bytes once
