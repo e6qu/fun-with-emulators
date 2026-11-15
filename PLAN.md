@@ -7,7 +7,8 @@ A practical, performant and fully compatible Linux environment on macOS
 run on it: command-line programs and toolchains, container engines
 (Docker, Podman, containerd) and their images, graphical Linux programs,
 Windows programs (console and graphical) through Linux's Wine, and
-sandboxes such as gVisor. fwe is written in Rust.
+sandboxes such as gVisor, faster than in a Linux VM on the same Mac, the
+alternative fwe competes with. fwe is written in Rust.
 
 ## Approach
 
