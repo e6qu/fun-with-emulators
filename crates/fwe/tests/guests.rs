@@ -1996,7 +1996,7 @@ fn in_debugger_root(args: &[&str], prog: Option<&Path>, keep: Option<&str>) -> (
         args[0].replace('/', "-")
     ));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("ptrace")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("ptrace")).arg(&root));
     if let Some(p) = prog {
         std::fs::copy(p, root.join("prog")).unwrap();
     }
@@ -2110,7 +2110,7 @@ const IN_CONTAINER: &str = "echo pid $$ host $(hostname); cat /proc/self/cgroup;
 fn alpine_crun_runs_an_image() {
     let root = std::env::temp_dir().join(format!("fwe-crun-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("crun")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("crun")).arg(&root));
     let bundle = root.join("bundle");
     std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
     run_checked(
@@ -2277,7 +2277,7 @@ const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
 fn alpine_podman_runs_an_image() {
     let root = std::env::temp_dir().join(format!("fwe-podman-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("podman")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("podman")).arg(&root));
     let etc = root.join("etc/containers");
     std::fs::write(
         etc.join("storage.conf"),
@@ -2351,7 +2351,7 @@ const IN_CONTAINERD: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
 fn alpine_containerd_runs_an_image() {
     let root = std::env::temp_dir().join(format!("fwe-containerd-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("containerd")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("containerd")).arg(&root));
     std::fs::create_dir_all(root.join("etc/containerd")).unwrap();
     std::fs::write(
         root.join("etc/containerd/config.toml"),
@@ -2504,7 +2504,7 @@ fn alpine_docker_runs_and_builds_images() {
     }
     let root = std::env::temp_dir().join(format!("fwe-docker-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("docker")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("docker")).arg(&root));
     alpine_oci_archive("docker", &root.join("tmp/alpine.tar"), true);
     let context = root.join("tmp/context");
     std::fs::create_dir_all(&context).unwrap();
@@ -2661,7 +2661,7 @@ fn alpine_podman_builds_pulls_and_runs_rootless() {
     }
     let root = std::env::temp_dir().join(format!("fwe-podman2-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("podman-further")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("podman-further")).arg(&root));
     let etc = root.join("etc/containers");
     std::fs::write(
         etc.join("storage.conf"),
@@ -2844,7 +2844,7 @@ fn debian_podman_runs_in_the_vm() {
     let cached = fetched_root("podman");
     let root = std::env::temp_dir().join(format!("fwe-debpodman-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
     let etc = root.join("etc/containers");
     std::fs::create_dir_all(&etc).unwrap();
     std::fs::write(
@@ -2939,7 +2939,7 @@ fn alpine_wine_runs_windows_programs() {
     let cached = alpine_root("wine");
     let root = std::env::temp_dir().join(format!("fwe-wine-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
     for d in ["root", "tmp"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
@@ -3227,7 +3227,7 @@ fn debian_apt_installs_and_removes_a_package() {
     // changes it.
     let root = std::env::temp_dir().join(format!("fwe-apt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(fetched_root("apt")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(fetched_root("apt")).arg(&root));
     let _workload = workload();
     let dir = |d: &str| std::fs::create_dir_all(root.join(d)).unwrap();
     for d in [
