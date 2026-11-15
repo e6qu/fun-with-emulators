@@ -1902,8 +1902,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // A socket holding bytes back for `MSG_MORE`: they go first.
             if net::corked(fd) {
-                // SAFETY: the guest buffer spans the length.
-                return Some(unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) });
+                return Some(netns::as_socket(fd, || {
+                    // SAFETY: the guest buffer spans the length.
+                    unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) }
+                }));
             }
             if memfd::grow_refused(fd, None, len) {
                 return Some(fwe_abi::err(fwe_abi::errno::EPERM));

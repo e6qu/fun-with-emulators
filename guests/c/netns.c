@@ -22,6 +22,8 @@ int socket(int domain, int type, int protocol);
 int bind(int fd, const void *addr, socklen_t len);
 int connect(int fd, const void *addr, socklen_t len);
 int getsockname(int fd, void *addr, socklen_t *len);
+int getpeername(int fd, void *addr, socklen_t *len);
+long recvfrom(int fd, void *buf, size_t n, int flags, void *addr, socklen_t *len);
 long sendto(int fd, const void *buf, size_t n, int flags, const void *addr, socklen_t len);
 long send(int fd, const void *buf, size_t n, int flags);
 long recv(int fd, void *buf, size_t n, int flags);
@@ -91,10 +93,68 @@ static int pinned(void) {
     return 0;
 }
 
+/* In a namespace, a datagram to a loopback port nobody bound there goes
+ * nowhere: not to the host's port of that number (which a socket of the
+ * initial namespace holds here), and a connected sender is told the port
+ * is unreachable. A reply to a socket that never bound reaches it. */
+static int unbound(void) {
+    int host = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = loopback(0);
+    bind(host, &a, sizeof a);
+    socklen_t len = sizeof a;
+    getsockname(host, &a, &len);
+    if (unshare(CLONE_NEWNET) != 0)
+        return printf("unshare: %d\n", errno), 1;
+    int ctl = socket(AF_INET, SOCK_DGRAM, 0);
+    struct {
+        char name[16];
+        short flags;
+        char pad[22];
+    } ifr;
+    memset(&ifr, 0, sizeof ifr);
+    ifr.name[0] = 'l';
+    ifr.name[1] = 'o';
+    ifr.flags = IFF_UP;
+    if (ioctl(ctl, SIOCSIFFLAGS, &ifr) != 0)
+        return printf("lo up: %d\n", errno), 1;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    long sent = sendto(u, "leak", 4, 0, &a, sizeof a);
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    int conn = connect(c, &a, sizeof a);
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof peer;
+    getpeername(c, &peer, &plen);
+    int named = peer.sin_port == a.sin_port;
+    long first = send(c, "leak", 4, 0);
+    usleep(50000);
+    char b[8];
+    long refused = recv(c, b, sizeof b, MSG_DONTWAIT);
+    int refused_errno = errno;
+    long leaked = recv(host, b, sizeof b, MSG_DONTWAIT);
+    printf("sent %ld, connected %d named %d, sent %ld, then %ld errno %d, host got %ld\n", sent,
+           conn, named, first, refused, refused_errno, leaked);
+
+    /* A server bound in the namespace answers a client that never bound. */
+    int server = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in s = loopback(5353);
+    bind(server, &s, sizeof s);
+    int client = socket(AF_INET, SOCK_DGRAM, 0);
+    sendto(client, "ping", 4, 0, &s, sizeof s);
+    struct sockaddr_in from;
+    socklen_t flen = sizeof from;
+    long got = recvfrom(server, b, sizeof b, 0, &from, &flen);
+    sendto(server, "pong", 4, 0, &from, flen);
+    long back = recv(client, b, sizeof b, 0);
+    printf("served %ld, answered %ld\n", got, back);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
     if (!strcmp(argv[1], "pinned"))
         return pinned();
+    if (!strcmp(argv[1], "unbound"))
+        return unbound();
     return 2;
 }

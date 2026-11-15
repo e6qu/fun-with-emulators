@@ -944,6 +944,9 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, false, &a.guest);
     }
+    if r == 0 {
+        crate::netns::used(fd as i32);
+    }
     r
 }
 
@@ -1162,6 +1165,9 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         r = unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) };
         0
     });
+    if r >= 0 {
+        crate::netns::used(fd as i32);
+    }
     r
 }
 
@@ -2121,6 +2127,9 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         && let Some(p) = prepared
     {
         p.unsent();
+    }
+    if r >= 0 {
+        crate::netns::used(fd as i32);
     }
     r
 }

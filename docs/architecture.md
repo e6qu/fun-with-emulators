@@ -1449,10 +1449,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   listing position.
 
 **Namespaces and cgroups**
-- A network namespace has only loopback (no `veth`); a datagram to one of
-  its ports nobody bound by number goes to the host loopback port of that
-  number; a port is freed when the last descriptor of its socket in the
-  binding process closes; the initial namespace's sysctls cannot change.
+- A network namespace has only loopback (no `veth`); a port is freed when
+  the last descriptor of its socket in the binding process closes; a
+  datagram socket connected to a port nobody had bound stays connected to
+  nobody when the port is bound later (Linux's reaches the new socket);
+  the initial namespace's sysctls cannot change.
 - A port below 1024 bound on a loopback address of the initial namespace,
   when fwe is not root, is reached by its number only from fwe's
   processes: the host keeps it for root, so it is an ephemeral port there.

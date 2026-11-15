@@ -1088,6 +1088,19 @@ fn a_socket_stays_in_its_network_namespace() {
     );
 }
 
+/// In a network namespace, a datagram to a loopback port nobody bound
+/// there never reaches the host's port of that number; a connected sender
+/// gets `ECONNREFUSED`; a reply reaches a client that never bound.
+#[test]
+fn a_datagram_to_an_unbound_namespace_port_goes_nowhere() {
+    c_guest_prints(
+        "netns",
+        &["unbound"],
+        "sent 4, connected 0 named 1, sent 4, then -1 errno 111, host got -1\n\
+         served 4, answered 4\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
