@@ -232,9 +232,15 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
 
 - [ ] **A display for Linux programs:** X11 clients drawn by an X server
   on the Mac (XQuartz), reached through the socket `DISPLAY` names, with
-  shared memory (`MIT-SHM`) where the server offers it; OpenGL and Vulkan
-  rendered in software by Mesa (llvmpipe, lavapipe); Wayland clients
+  shared memory (`MIT-SHM`) where the server offers it; Wayland clients
   through a compositor that speaks to the Mac, if one proves practical.
+- [ ] **GPU acceleration:** a Linux GPU device (`/dev/dri/renderD128`)
+  that fwe provides, speaking virtio-gpu's interface to Mesa's Venus
+  Vulkan driver, whose commands fwe runs on the Mac's GPU through
+  virglrenderer and MoltenVK (Vulkan on Metal), in-process, as libkrun
+  does for its VMs; OpenGL through Mesa's Zink (OpenGL on Vulkan), and
+  Direct3D under Wine through DXVK and VKD3D-Proton (Direct3D on
+  Vulkan). Frames reach the X server as images in shared memory.
 - [ ] **Demo programs:** `xterm`, `xeyes`, `xclock`, `glxgears`, `vkcube`,
   GTK's and Qt's demo programs.
 - [ ] **Browsers:** Chrome (Google's Linux arm64 build, or Chromium where
@@ -246,7 +252,7 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
   WebKitGTK); a Wails app (Go, WebKitGTK); a tkinter app (Python, Tk).
 - [ ] **Graphical Wine:** Windows programs with windows through Wine's
   X11 driver, natively (M6's Wine item): Wine's own (Notepad,
-  Minesweeper, `regedit`) and a Direct3D demo through WineD3D on OpenGL.
+  Minesweeper, `regedit`) and a Direct3D demo.
 - [ ] **gVisor on fwe:** `runsc` running a Linux program on its `systrap`
   platform (`seccomp`'s `SECCOMP_RET_TRAP`, `SIGSYS` and memory shared
   between its sentry and stub processes) or its `ptrace` platform, as
@@ -258,8 +264,11 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
 
 **Done when:** CI starts an X server and runs every program above under
 fwe, each driven by synthetic input (keys, clicks, a page loaded, a file
-edited) and checked by what it draws (the server's screenshot compared);
-and runs the JDK workload through `runsc` on fwe, its benchmark beside
+edited) and checked by what it draws (the server's screenshot compared),
+the GPU programs (`glxgears`, `vkcube`, the browsers, Zed, the Direct3D
+demo) drawing on the GPU, as their renderer names it, with `vkcube`'s
+frame rate within 1.5× of MoltenVK's natively on the same runner; and
+runs the JDK workload through `runsc` on fwe, its benchmark beside
 `runsc` on Linux.
 
 ## After 1.0

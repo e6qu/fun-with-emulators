@@ -39,7 +39,8 @@ In scope:
 - container engines and standard images;
 - gVisor's sandbox (`runsc`) running on fwe;
 - Wine, for ARM64 Windows programs, console and graphical;
-- graphical Linux programs, drawn by an X server on the Mac.
+- graphical Linux programs, drawn by an X server on the Mac, with
+  OpenGL and Vulkan on the Mac's GPU.
 
 Out of scope:
 - kernel modules and private kernel interfaces;
@@ -63,7 +64,7 @@ defines them:
   (executables linked below 4 GiB and programs that need 4 KiB pages,
   Wine among them);
 - graphical Linux programs, and Windows console and graphical programs
-  through Wine, run and draw on the Mac's screen;
+  through Wine, run and draw on the Mac's screen, on its GPU;
 - a JDK workload runs inside gVisor (`runsc`) on fwe;
 - a signed release installs and runs all of this, with user
   documentation.
