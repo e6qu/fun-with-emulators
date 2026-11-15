@@ -797,10 +797,10 @@ pub fn unprivileged_allows(cmd: u64, attr: u64) -> bool {
 /// `bpf(cmd, attr, size)`: maps and their elements ([`crate::bpfmap`]);
 /// the device controller's programs: load, attach, detach, query, and a
 /// descriptor by identity; socket filters, loaded with the maps they use
-/// and attached with `SO_ATTACH_BPF`. A program of another type is
-/// refused (`EINVAL`), as a kernel without it refuses it, so a program
-/// probing for one learns it is not there; other commands fail as on a
-/// kernel without them.
+/// and attached with `SO_ATTACH_BPF`. A program of another type Linux has
+/// loads (libraries such as cilium/ebpf, which runc uses, probe for what
+/// the kernel supports by loading one) but is never attached nor run
+/// (`EINVAL`); other commands fail as on a kernel without them.
 pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     use fwe_abi::err;
     let size = size.min(256) as usize;
@@ -820,8 +820,7 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
             }
             let bytes = crate::uaccess::read_bytes(dword(&a, 8), n * 8)?;
             // A device program or a socket filter is checked as fwe will
-            // run it; another type is one fwe cannot run (`EINVAL`, as a
-            // kernel built without it answers).
+            // run it; another type is kept, never attached nor run.
             let maps = match ty {
                 BPF_PROG_TYPE_CGROUP_DEVICE => load(&bytes).map(|_| Vec::new())?,
                 BPF_PROG_TYPE_SOCKET_FILTER => {
@@ -843,7 +842,7 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                     }
                     resolve_maps(&bytes)?
                 }
-                _ => return Err(errno::EINVAL),
+                _ => Vec::new(),
             };
             #[cfg(target_os = "macos")]
             return prog_fd(&bytes, fresh_id(), ty).map(|fd| {

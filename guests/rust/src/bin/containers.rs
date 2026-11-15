@@ -1553,8 +1553,8 @@ fn main() {
                 let f = open(c("/tmp/linked").as_ptr(), O_WRONLY | O_CREAT, 0o644);
                 println!("linkat AT_EMPTY_PATH: {}", r(linkat(f, c("").as_ptr(), -100, c("/tmp/again").as_ptr(), 0x1000) as i64));
                 println!("fchownat AT_EMPTY_PATH: {}", r(fchownat(f, c("").as_ptr(), 0, 0, 0x1000) as i64));
-                // BPF: a program of a type fwe cannot run is refused, as a
-                // kernel without it refuses it.
+                // BPF: a program of another type loads, as programs
+                // probe for one, but is not attached.
                 let insns: [u64; 2] = [0x0000_0000_0000_00b7, 0x0000_0000_0000_0095];
                 let mut attr = [0u8; 128];
                 attr[0..4].copy_from_slice(&8u32.to_ne_bytes()); // CGROUP_SKB
@@ -1562,7 +1562,15 @@ fn main() {
                 attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
                 let lic = c("MIT");
                 attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
-                println!("skb program: {}", r(syscall(280, 5, attr.as_ptr(), 128)));
+                let prog = syscall(280, 5, attr.as_ptr(), 128) as i32;
+                let finfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{prog}")).unwrap_or_default();
+                println!("skb program loads: {} type 8: {}", prog >= 0, finfo.contains("prog_type:\t8"));
+                let cg = open(c("/sys/fs/cgroup").as_ptr(), O_RDONLY | O_DIRECTORY);
+                let mut at = [0u8; 32];
+                at[0..4].copy_from_slice(&cg.to_ne_bytes());
+                at[4..8].copy_from_slice(&prog.to_ne_bytes());
+                at[8..12].copy_from_slice(&6u32.to_ne_bytes()); // BPF_CGROUP_DEVICE
+                println!("attached as a device program: {}", r(syscall(280, 8, at.as_ptr(), 32)));
                 // Netlink: in the host's namespace a socket that describes
                 // no interface; lo in one's own.
                 let link = |nl: i32, up: Option<bool>| -> u32 {
