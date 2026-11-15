@@ -691,8 +691,12 @@ guest's reach, and translates what comes back.
   `fstatfs` reports that mount, `/proc/self/fd` its path, and a
   `/proc/self/fd/N` link reaches the file after the mount or path is gone.
 - Read-only mounts fail writes with `EROFS` (devices, FIFOs and sockets
-  still open for writing), a rename or link across mounts fails with
-  `EXDEV`, removing a mount's root with `EBUSY`.
+  still open for writing; a socket's node is not made; fwe's `/proc` and
+  `/sys` files are not written through one); a bind mount keeps its
+  source's per-mount flags (read-only, `nosuid` and the rest; an
+  unbindable submount stays behind), which a remount changes; a rename
+  or link across mounts fails with `EXDEV`, removing a mount's root with
+  `EBUSY`.
 - `openat2` (`crates/kernel/src/openat2.rs`) walks the path itself for its
   `resolve` rules (no symlinks, no `/proc` magic links, no mount crossed,
   nothing above the directory, the directory as the root), then opens

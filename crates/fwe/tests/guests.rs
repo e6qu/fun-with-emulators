@@ -7037,6 +7037,18 @@ fn file_handles_open_within_the_guests_view() {
     );
 }
 
+/// A bind mount keeps its source's read-only flag until a remount clears
+/// it; a Unix socket's node is not made on a read-only mount (`EROFS`); a
+/// read-only `/proc/sys` refuses writes to sysctls, as `faccessat` says.
+#[test]
+fn bind_mounts_keep_read_only() {
+    assert_eq!(
+        fsrules("romounts"),
+        "ro: ok\ncopy: ok\ncreate in the copy: EROFS\nremount rw: ok create: ok\n\
+         socket bind: EROFS\nro /proc/sys: ok\nsysctl write: EROFS\nsysctl W_OK: EROFS\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

@@ -587,6 +587,11 @@ impl<P: Platform> Kernel<P> {
                     if pagemap && flags & fcntl::O_ACCMODE != fcntl::O_RDONLY {
                         return err(errno::EACCES);
                     }
+                    if flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
+                        && self.synthetic_read_only(dirfd as i32, &path)
+                    {
+                        return err(errno::EROFS);
+                    }
                     let fd = self.synthetic_fd(anon_fd(&[], flags), dirfd as i32, &path);
                     if fd >= 0 {
                         crate::procmem::opened(fd as i32, pagemap);
@@ -612,6 +617,15 @@ impl<P: Platform> Kernel<P> {
                             None => sysctl().unwrap_or(Err(errno::EACCES)),
                         },
                     };
+                    // Permitted, through a read-only mount (a container's
+                    // `/proc/sys`): `EROFS`, as Linux checks after.
+                    let mark = mark.and_then(|m| {
+                        if self.synthetic_read_only(dirfd as i32, &path) {
+                            Err(errno::EROFS)
+                        } else {
+                            Ok(m)
+                        }
+                    });
                     match mark {
                         Ok(mark) => {
                             let fd = anon_fd(&content, flags);
@@ -1237,11 +1251,13 @@ impl<P: Platform> Kernel<P> {
             // A symbolic link's own bits are all set.
             return 0;
         }
+        let read_only = self.synthetic_read_only(dirfd, path);
         if mode & W_OK != 0
             && let Some(open) = self.oom_file(dirfd, path)
         {
             return match (open, mode & !W_OK) {
                 (Err(e), _) => err(e),
+                (Ok(_), _) if read_only => err(errno::EROFS),
                 (Ok(_), 0) => 0,
                 (Ok(_), rest) => self.access_synthetic(dirfd, path, rest, follow, eaccess),
             };
@@ -1251,7 +1267,7 @@ impl<P: Platform> Kernel<P> {
         host.st_mode = kind | (st.st_mode & 0o7777) as libc::mode_t;
         host.st_uid = st.st_uid;
         host.st_gid = st.st_gid;
-        self.access_result(&host, mode, &self.access_creds(eaccess), false, false)
+        self.access_result(&host, mode, &self.access_creds(eaccess), false, read_only)
     }
 
     /// `faccessat2(fd, "", mode, AT_EMPTY_PATH)`: the access the caller has
@@ -2734,6 +2750,14 @@ impl<P: Platform> Kernel<P> {
     /// `fd` (or an error), just opened on a file of fwe's `/proc` or `/sys`
     /// at `path`: recorded as of that mount, so `fstatfs` reports `proc`
     /// or `sysfs` as runtimes check, not what stands in for it on the host.
+    /// Whether the file of fwe's `/proc` or `/sys` at `path` (from `dirfd`)
+    /// is reached through a read-only mount.
+    fn synthetic_read_only(&self, dirfd: i32, path: &[u8]) -> bool {
+        self.fs()
+            .absolute_path(dirfd, path)
+            .is_some_and(|a| self.fs().mount_of(&a).0.flags & crate::mounts::ms::RDONLY != 0)
+    }
+
     fn synthetic_fd(&self, fd: i64, dirfd: i32, path: &[u8]) -> i64 {
         if fd >= 0
             && let Some(absolute) = self.fs().absolute_path(dirfd, path)

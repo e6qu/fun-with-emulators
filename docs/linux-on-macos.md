@@ -879,7 +879,7 @@ checked by fwe.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind, move, remount and propagation changes. Other types `ENODEV`. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
+| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind (keeping the source's per-mount flags, read-only too, and leaving unbindable submounts behind), move, remount and propagation changes. Other types `ENODEV`. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
 | `umount2` | `MNT_DETACH`, `MNT_FORCE`, `MNT_EXPIRE`, `UMOUNT_NOFOLLOW`; a mount in use is `EBUSY` unless detached or forced. | none |
 | `pivot_root`, `chroot` | The root becomes a path in the namespace's view; the working directory follows `pivot_root` as Linux's. | none |
 | `fsopen`, `fspick`, `fsconfig`, `fsmount` | A filesystem context is the process's, kept against an anonymous file's descriptor; `FSCONFIG_CMD_CREATE` makes the filesystem as `mount` does; reading the descriptor gives its messages. | an anonymous file |

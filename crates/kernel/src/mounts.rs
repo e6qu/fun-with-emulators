@@ -556,14 +556,11 @@ impl Table {
     }
 
     /// A bind mount of `from` (a path in the namespace's view) at `to`;
-    /// with `recursive`, the mounts under `from` come along.
-    pub fn bind(
-        &mut self,
-        from: &[u8],
-        to: &[u8],
-        recursive: bool,
-        flags: u64,
-    ) -> Result<u32, i32> {
+    /// with `recursive`, the mounts under `from` come along, but for an
+    /// unbindable one and what is under it. Each copy keeps its source's
+    /// per-mount flags (read-only, `nosuid` and the rest), as Linux's
+    /// clone of a mount does; a remount changes them.
+    pub fn bind(&mut self, from: &[u8], to: &[u8], recursive: bool) -> Result<u32, i32> {
         let (src, rest) = self.locate(from);
         let src = src.clone();
         if src.propagation & ms::UNBINDABLE != 0 {
@@ -574,7 +571,7 @@ impl Table {
             src.fstype,
             src.source.clone(),
             src.fs_path(&rest),
-            (src.flags & !ms::RDONLY) | (flags & ms::RDONLY),
+            src.flags,
             src.device.clone(),
             src.options.clone(),
         );
@@ -588,6 +585,8 @@ impl Table {
                 .iter()
                 .filter(|m| m.id != id && under(&m.point, from).is_some_and(|r| !r.is_empty()))
                 .filter(|m| self.is_below(m.id, src.id))
+                // (What is under an unbindable one finds no parent copy.)
+                .filter(|m| m.propagation & ms::UNBINDABLE == 0)
                 .cloned()
                 .collect();
             for m in parent_first(src.id, below) {
@@ -1660,7 +1659,7 @@ mod tests {
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
         let group = t.get(a).unwrap().peer;
         assert_ne!(group, 0);
-        let b = t.bind(b"/a", b"/b", false, 0).unwrap();
+        let b = t.bind(b"/a", b"/b", false).unwrap();
         assert_eq!(t.get(b).unwrap().peer, group);
         t.set_propagation(b"/b", ms::SLAVE, false).unwrap();
         let bm = t.get(b).unwrap();
@@ -1731,7 +1730,7 @@ mod tests {
         let mut t = table();
         let a = tmpfs(&mut t, b"/a");
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
-        let b = t.bind(b"/a", b"/b", false, 0).unwrap();
+        let b = t.bind(b"/a", b"/b", false).unwrap();
         t.set_propagation(b"/b", ms::SLAVE, false).unwrap();
         assert_ne!(t.get(b).unwrap().master, 0);
         t.set_propagation(b"/a", ms::PRIVATE, false).unwrap();
@@ -1748,8 +1747,8 @@ mod tests {
         let mut t = table();
         tmpfs(&mut t, b"/a");
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
-        t.bind(b"/a", b"/b", false, 0).unwrap();
-        t.bind(b"/a", b"/s", false, 0).unwrap();
+        t.bind(b"/a", b"/b", false).unwrap();
+        t.bind(b"/a", b"/s", false).unwrap();
         t.set_propagation(b"/s", ms::SLAVE, false).unwrap();
         tmpfs(&mut t, b"/a/x");
         let x = t.locate(b"/a/x/f").0.clone();
@@ -1796,10 +1795,10 @@ mod tests {
         let mut a = table();
         tmpfs(&mut a, b"/m");
         a.set_propagation(b"/m", ms::SHARED, false).unwrap();
-        a.bind(b"/m", b"/n", false, 0).unwrap();
+        a.bind(b"/m", b"/n", false).unwrap();
         a.set_propagation(b"/n", ms::SLAVE, false).unwrap();
         a.set_propagation(b"/n", ms::SHARED, false).unwrap();
-        a.bind(b"/n", b"/o", false, 0).unwrap();
+        a.bind(b"/n", b"/o", false).unwrap();
         let mut b = a.clone();
         a.outbox.clear();
         tmpfs(&mut a, b"/m/x");
@@ -1825,7 +1824,7 @@ mod tests {
         let mut t = table();
         tmpfs(&mut t, b"/a");
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
-        t.bind(b"/a", b"/b", false, 0).unwrap();
+        t.bind(b"/a", b"/b", false).unwrap();
         tmpfs(&mut t, b"/a/x");
         tmpfs(&mut t, b"/a/x/y");
         assert_eq!(t.locate(b"/b/x/y/f").0.point, b"/b/x/y");
@@ -1869,7 +1868,7 @@ mod tests {
         tmpfs(&mut t, b"/r");
         t.set_propagation(b"/r", ms::SHARED, false).unwrap();
         for _ in 0..3 {
-            t.bind(b"/r", b"/r", false, 0).unwrap();
+            t.bind(b"/r", b"/r", false).unwrap();
         }
         assert_eq!(t.mounts.iter().filter(|m| m.point == b"/r").count(), 8);
     }
@@ -1908,17 +1907,29 @@ mod tests {
     fn bind_mounts() {
         let mut t = table();
         tmpfs(&mut t, b"/srv/data");
-        t.bind(b"/srv", b"/mnt", false, 0).unwrap();
+        t.bind(b"/srv", b"/mnt", false).unwrap();
         let (m, rest) = t.locate(b"/mnt/data/f");
         assert_eq!(m.host_path(&rest).unwrap(), b"/host/root/srv/data/f");
-        t.bind(b"/srv", b"/rec", true, ms::RDONLY).unwrap();
+        t.bind(b"/srv", b"/rec", true).unwrap();
         let (m, rest) = t.locate(b"/rec/data/f");
         assert_eq!(
             (m.fstype, m.host_path(&rest).unwrap()),
             (FsType::Tmpfs, b"/srv/data/f".to_vec())
         );
-        assert!(t.locate(b"/rec").0.read_only());
-        t.bind(b"/proc/sys", b"/proc/sys", false, 0).unwrap();
+        // A copy keeps its source's flags; a remount sets them.
+        assert!(!t.locate(b"/rec").0.read_only());
+        t.remount(b"/rec", ms::RDONLY | ms::NOSUID, None).unwrap();
+        t.bind(b"/rec", b"/again", true).unwrap();
+        assert_eq!(
+            t.locate(b"/again").0.flags & (ms::RDONLY | ms::NOSUID),
+            ms::RDONLY | ms::NOSUID
+        );
+        assert!(!t.locate(b"/again/data").0.read_only(), "a submount keeps its own");
+        // An unbindable submount stays behind.
+        t.set_propagation(b"/srv/data", ms::UNBINDABLE, false).unwrap();
+        t.bind(b"/srv", b"/norec", true).unwrap();
+        assert_eq!(t.locate(b"/norec/data/f").0.fstype, FsType::Ext4);
+        t.bind(b"/proc/sys", b"/proc/sys", false).unwrap();
         t.remount(b"/proc/sys", ms::RDONLY, None).unwrap();
         let (m, rest) = t.locate(b"/proc/sys/kernel");
         assert!(m.read_only() && m.fstype == FsType::Proc);
@@ -1931,7 +1942,7 @@ mod tests {
     #[test]
     fn pivot_root_into_a_container() {
         let mut t = table();
-        t.bind(b"/bundle/rootfs", b"/bundle/rootfs", false, 0).unwrap();
+        t.bind(b"/bundle/rootfs", b"/bundle/rootfs", false).unwrap();
         t.mount(
             b"/bundle/rootfs/proc",
             FsType::Proc,

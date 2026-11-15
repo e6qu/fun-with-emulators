@@ -279,12 +279,6 @@ impl Resolved {
         if self.mount_flags & mounts::ms::RDONLY != 0 { Err(errno::EROFS) } else { Ok(()) }
     }
 
-    /// Get ready for a call that is about to change what was resolved, as
-    /// `how` says: `EROFS` on a read-only mount; in an overlay, the copy-up
-    /// that puts it (or, to make it, its directory) in the upper layer,
-    /// after which [`dir`](Self::dir) and [`name`](Self::name) are where the
-    /// call acts. A call that makes a file calls [`finish`](Self::finish)
-    /// once it has.
     /// The host's `lstat` of the name: as the lookup saw it, or looked at
     /// now.
     pub(crate) fn lstat(&self) -> Option<libc::stat> {
@@ -302,6 +296,12 @@ impl Resolved {
         (r == 0).then_some(st)
     }
 
+    /// Get ready for a call that is about to change what was resolved, as
+    /// `how` says: `EROFS` on a read-only mount; in an overlay, the copy-up
+    /// that puts it (or, to make it, its directory) in the upper layer,
+    /// after which [`dir`](Self::dir) and [`name`](Self::name) are where the
+    /// call acts. A call that makes a file calls [`finish`](Self::finish)
+    /// once it has.
     pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
         self.writable()?;
         // What it sets up is looked at afresh.
@@ -335,6 +335,11 @@ impl Resolved {
     /// the way removed (the host makes the node where `bind` says, so it
     /// cannot be made aside and moved over the whiteout).
     pub fn prepare_bind(&mut self) -> Result<(), i32> {
+        // A read-only mount takes no new node (`EROFS`); a name there
+        // already is an address in use, which Linux finds first.
+        if self.writable().is_err() && self.lstat().is_none() {
+            return Err(errno::EROFS);
+        }
         let Some(o) = &self.ovl else { return Ok(()) };
         if !matches!(o.found, overlay::Found::Missing) {
             return Ok(());

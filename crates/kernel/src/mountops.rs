@@ -311,7 +311,7 @@ impl<P: Platform> Kernel<P> {
             };
             match from {
                 Ok((from, _)) => {
-                    ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0, 0).map(|_| ()))
+                    ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0).map(|_| ()))
                 }
                 Err(errno::EINVAL) => match device.or_else(|| self.host_source(&source)) {
                     Some(host) => ns.update(|t| {

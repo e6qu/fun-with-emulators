@@ -57,6 +57,11 @@ unsafe extern "C" {
         d: *const c_char,
     ) -> i32;
     fn syscall(n: i64, ...) -> i64;
+    fn unshare(f: i32) -> i32;
+    fn socket(d: i32, t: i32, p: i32) -> i32;
+    #[link_name = "bind"]
+    fn bind_socket(fd: i32, a: *const u8, l: u32) -> i32;
+    fn connect(fd: i32, a: *const u8, l: u32) -> i32;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -356,9 +361,69 @@ fn handles_scenario(outside: u64) {
     });
 }
 
+/// Bind `from` at `to`, then, with `flags`, remount it.
+fn bind(from: &str, to: &str, flags: Option<u64>) -> String {
+    const MS_REMOUNT: u64 = 32;
+    const MS_BIND: u64 = 4096;
+    let (from, to) = (c(from), c(to));
+    let none = std::ptr::null();
+    // SAFETY: NUL-terminated paths and no data.
+    let mut r = unsafe { mount(from.as_ptr(), to.as_ptr(), none, MS_BIND, none) };
+    if let Some(f) = flags
+        && r == 0
+    {
+        // SAFETY: as above.
+        r = unsafe { mount(none, to.as_ptr(), none, MS_REMOUNT | MS_BIND | f, none) };
+    }
+    res(r.into())
+}
+
+/// A bind mount of a read-only mount is read-only, until a remount makes
+/// it writable; a Unix socket's node cannot be made on a read-only mount;
+/// a read-only `/proc/sys` takes no write to a sysctl.
+fn read_only_mounts_scenario() {
+    const MS_RDONLY: u64 = 1;
+    const CLONE_NEWNS: i32 = 0x20000;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS) };
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/src").as_ptr(), 0o755);
+        mkdir(c("/tmp/copy").as_ptr(), 0o755);
+    }
+    println!("ro: {}", bind("/tmp/src", "/tmp/src", Some(MS_RDONLY)));
+    println!("copy: {}", bind("/tmp/src", "/tmp/copy", None));
+    let create = |p: &str| {
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { open(c(p).as_ptr(), O_CREAT | O_WRONLY, 0o644) };
+        if fd >= 0 {
+            // SAFETY: the descriptor just opened.
+            unsafe { close(fd) };
+        }
+        res(fd.into())
+    };
+    println!("create in the copy: {}", create("/tmp/copy/f"));
+    let rw = bind("/tmp/copy", "/tmp/copy", Some(0));
+    println!("remount rw: {rw} create: {}", create("/tmp/copy/f"));
+    // SAFETY: a plain call.
+    let s = unsafe { socket(1, 1, 0) };
+    let mut addr = [0u8; 110];
+    addr[0] = 1;
+    addr[2..2 + 13].copy_from_slice(b"/tmp/src/sock");
+    // SAFETY: a socket address of its length.
+    let r = unsafe { bind_socket(s, addr.as_ptr(), 110) };
+    println!("socket bind: {}", res(r.into()));
+    println!("ro /proc/sys: {}", bind("/proc/sys", "/proc/sys", Some(MS_RDONLY)));
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/proc/sys/fs/protected_symlinks").as_ptr(), O_WRONLY) };
+    println!("sysctl write: {}", res(fd.into()));
+    println!("sysctl W_OK: {}", faccessat2("/proc/sys/fs/protected_symlinks", W_OK, 0));
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "romounts" => read_only_mounts_scenario(),
         "handles" => handles_scenario(std::env::args().nth(2).unwrap().parse().unwrap()),
         "devnode" => devnode_scenario(),
         "access" => access_scenario(),
