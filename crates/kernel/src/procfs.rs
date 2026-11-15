@@ -242,6 +242,7 @@ const DIRS: &[DirDef] = &[
             (b"maps", DT_REG),
             (b"smaps", DT_REG),
             (b"personality", DT_REG),
+            (b"auxv", DT_REG),
             (b"environ", DT_REG),
             (b"limits", DT_REG),
             (b"statm", DT_REG),
