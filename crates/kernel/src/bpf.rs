@@ -795,6 +795,28 @@ pub fn unprivileged_allows(cmd: u64, attr: u64) -> bool {
     }
 }
 
+/// The size of Linux 6.12's `union bpf_attr`: what fwe knows of an
+/// attribute.
+const ATTR_SIZE: usize = 152;
+
+/// Linux's `bpf_check_uarg_tail_zero` of an attribute of `size` bytes at
+/// `attr`: one larger than a page is `E2BIG`, and so is one larger than
+/// fwe knows with a byte past the known part that is not zero (a field of
+/// a newer kernel the caller relies on).
+fn tail_zero(attr: u64, size: u64) -> Result<(), i32> {
+    if size > 4096 {
+        return Err(errno::E2BIG);
+    }
+    if size as usize <= ATTR_SIZE {
+        return Ok(());
+    }
+    let tail = crate::uaccess::read_bytes(attr + ATTR_SIZE as u64, size as usize - ATTR_SIZE)?;
+    if tail.iter().any(|&b| b != 0) {
+        return Err(errno::E2BIG);
+    }
+    Ok(())
+}
+
 /// `bpf(cmd, attr, size)`: maps and their elements ([`crate::bpfmap`]);
 /// the device controller's programs: load, attach, detach, query, and a
 /// descriptor by identity; socket filters, loaded with the maps they use
@@ -804,7 +826,10 @@ pub fn unprivileged_allows(cmd: u64, attr: u64) -> bool {
 /// (`EINVAL`); other commands fail as on a kernel without them.
 pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     use fwe_abi::err;
-    let size = size.min(256) as usize;
+    if let Err(e) = tail_zero(attr, size) {
+        return err(e);
+    }
+    let size = size.min(ATTR_SIZE as u64) as usize;
     let mut a = vec![0u8; size];
     if let Err(e) = crate::uaccess::read_into(attr, &mut a) {
         return err(e);
@@ -939,6 +964,22 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An attribute larger than fwe knows is taken if what lies past the
+    /// known part is zero, and is `E2BIG` if not, or if it is larger than
+    /// a page, as Linux's `bpf_check_uarg_tail_zero`.
+    #[test]
+    fn attribute_tails_must_be_zero() {
+        let mut a = vec![0u8; 200];
+        let at = a.as_ptr() as u64;
+        assert_eq!(tail_zero(at, 200), Ok(()));
+        assert_eq!(tail_zero(at, 100), Ok(()));
+        a[ATTR_SIZE + 3] = 1;
+        assert_eq!(tail_zero(a.as_ptr() as u64, 200), Err(errno::E2BIG));
+        assert_eq!(tail_zero(a.as_ptr() as u64, ATTR_SIZE as u64), Ok(()));
+        assert_eq!(tail_zero(a.as_ptr() as u64, 4097), Err(errno::E2BIG));
+        assert_eq!(fwe_abi::err(errno::E2BIG), sys_bpf(0, a.as_ptr() as u64, 200));
+    }
 
     fn ins(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
         let mut b = [0u8; 8];
