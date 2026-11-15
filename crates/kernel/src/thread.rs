@@ -942,6 +942,9 @@ struct Registered {
     host: libc::pthread_t,
     /// Its robust-futex list's head (`set_robust_list`).
     robust: u64,
+    /// Its nice value (`setpriority` of its tid), for a thread other than
+    /// the main one, whose nice value is the process's record's.
+    nice: i32,
 }
 
 /// Every live guest thread's pending set, by tid.
@@ -1064,12 +1067,31 @@ pub fn register(tid: i32) -> Arc<Pending> {
         // Its filesystem view and namespaces are its creator's.
         crate::threadfs::started(tid);
     }
+    // Its creator's nice value, as Linux's thread inherits it.
+    let nice = if tid != tgid() { nice_of(self::tid()) } else { 0 };
     let pending = Arc::new(Pending::new());
-    let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0 };
+    let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0, nice };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
     directed_add(tid, Arc::as_ptr(&pending));
     publish_tids(&tids());
     pending
+}
+
+/// Thread `tid` of this process's nice value: the main thread's is the
+/// process's, in its record ([`crate::procreg::nice`]).
+pub fn nice_of(tid: i32) -> i32 {
+    if tid == tgid() {
+        return crate::procreg::nice(crate::host::pid());
+    }
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter().find(|r| r.tid == tid).map_or(0, |r| r.nice)
+}
+
+/// Set the nice value of thread `tid` of this process, other than the
+/// main one: whether it is one.
+pub fn set_nice_of(tid: i32, nice: i32) -> bool {
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter_mut().find(|r| r.tid == tid).map(|r| r.nice = nice).is_some()
 }
 
 /// Make `pending` (from [`register`]) the calling thread's own set.

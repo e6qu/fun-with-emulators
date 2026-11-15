@@ -16,6 +16,10 @@ const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 const SIGTSTP: i32 = 20;
 const CLONE_NEWPID: i32 = 0x2000_0000;
+const CLONE_NEWUSER: i32 = 0x1000_0000;
+const PRIO_PROCESS: i32 = 0;
+const PRIO_USER: i32 = 2;
+const O_WRONLY: i32 = 1;
 const SIGRT1: i32 = 35;
 const SIGRT2: i32 = 36;
 const SIGCHLD: i32 = 17;
@@ -63,6 +67,9 @@ unsafe extern "C" {
     fn write(fd: i32, buf: *const c_void, len: usize) -> isize;
     fn usleep(us: u32) -> i32;
     fn setrlimit(res: i32, lim: *const Rlimit) -> i32;
+    fn getpriority(which: i32, who: u32) -> i32;
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    fn gettid() -> i32;
     fn waitid(idtype: i32, id: u32, info: *mut [u8; 128], options: i32) -> i32;
     fn __errno_location() -> *mut i32;
 }
@@ -304,6 +311,64 @@ fn sigpending_limit() {
     }
 }
 
+/// Nice values: the process's (its main thread's) and another thread's
+/// own, a thread starting with its creator's; the host process given the
+/// process's as far as the host lets (the test reads it while this waits
+/// on its input); and `PRIO_USER` naming a user as the caller's user
+/// namespace numbers it.
+fn priorities() {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let start = getpriority(PRIO_PROCESS, 0);
+        let raised = setpriority(PRIO_PROCESS, 0, 5);
+        let at5 = getpriority(PRIO_PROCESS, 0);
+        let lowered = setpriority(PRIO_PROCESS, 0, 2);
+        println!(
+            "process: start {start}, set 5 {raised} reads {at5}, lowered to 2 {lowered} reads {}",
+            getpriority(PRIO_PROCESS, 0)
+        );
+        let main = getpid() as u32;
+        let thread = std::thread::spawn(move || {
+            let tid = gettid() as u32;
+            let first = getpriority(PRIO_PROCESS, tid);
+            let set = setpriority(PRIO_PROCESS, tid, 9);
+            (first, set, getpriority(PRIO_PROCESS, 0), getpriority(PRIO_PROCESS, main))
+        })
+        .join()
+        .unwrap();
+        println!(
+            "thread: starts {}, set 9 {}, reads {}, main thread's {}",
+            thread.0, thread.1, thread.2, thread.3
+        );
+        println!("main thread: {}", getpriority(PRIO_PROCESS, 0));
+        println!("pid {}", getpid());
+        let mut b = 0u8;
+        read(0, (&mut b as *mut u8).cast(), 1);
+        let mut report = [0i32; 2];
+        pipe(report.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            setuid(1000);
+            unshare(CLONE_NEWUSER);
+            let map = CString::new("/proc/self/uid_map").unwrap();
+            let fd = open(map.as_ptr(), O_WRONLY);
+            write(fd, b"500 1000 1".as_ptr().cast(), 10);
+            close(fd);
+            let mapped = getpriority(PRIO_USER, 500);
+            let mapped = if mapped == -1 { format!("errno {}", errno()) } else { mapped.to_string() };
+            let unmapped = getpriority(PRIO_USER, 1000);
+            let unmapped = if unmapped == -1 && errno() == 3 { "ESRCH".to_string() } else { unmapped.to_string() };
+            let line = format!("user namespace: user 500 (1000 outside) {mapped}, user 1000 {unmapped}\n");
+            write(report[1], line.as_ptr().cast(), line.len());
+            _exit(0);
+        }
+        reap(child);
+        let mut buf = [0u8; 256];
+        let n = read(report[0], buf.as_mut_ptr().cast(), buf.len());
+        print!("{}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+    }
+}
+
 /// `si_pid` and `si_uid` of a `siginfo`.
 fn sender(info: &[u8; 128]) -> (i32, u32) {
     (
@@ -442,6 +507,7 @@ fn main() {
         "init-signals" => init_signals(),
         "sender-ids" => sender_ids(),
         "sigpending" => sigpending_limit(),
+        "priorities" => priorities(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

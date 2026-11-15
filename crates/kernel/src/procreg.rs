@@ -578,7 +578,8 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
         oom_score_adj_min: 0,
         ids: [0; 8],
         limits: Vec::new(),
-        nice: 0,
+        // As the host started it (`nice fwe ...`).
+        nice: crate::host::nice_of(pid),
         sched: Sched::default(),
         maps: Vec::new(),
         slack: (crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK),
@@ -845,15 +846,7 @@ pub fn forked(
 /// Host process `pid`'s nice value: as `setpriority` set it, or for a
 /// process fwe has no record of, the host's.
 pub fn nice(pid: i32) -> i32 {
-    read(pid).map_or_else(
-        || {
-            // SAFETY: plain host call; -1 is a valid value, so errno is
-            // not consulted (an absent process reads as 0).
-            let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
-            v.clamp(-20, 19)
-        },
-        |r| r.nice,
-    )
+    read(pid).map_or_else(|| crate::host::nice_of(pid), |r| r.nice)
 }
 
 /// Host process `pid`'s scheduling attributes, if fwe has its record.
@@ -869,16 +862,27 @@ pub fn change_sched(
     f: impl FnOnce(&Sched, i32) -> Result<(Sched, i32), i32>,
 ) -> Result<(), i32> {
     let mut out = Ok(());
+    let mut nice = None;
     change(pid, |r| match f(&r.sched, r.nice) {
-        Ok((s, nice)) => (r.sched, r.nice) = (s, nice),
+        Ok((s, n)) => {
+            (r.sched, r.nice) = (s, n);
+            nice = Some(n);
+        }
         Err(e) => out = Err(e),
     })?;
+    if let Some(n) = nice {
+        crate::host::set_nice(pid, n);
+    }
     out
 }
 
-/// Host process `pid`'s nice value is now `nice`.
+/// Host process `pid`'s nice value is now `nice`: kept in its record,
+/// and the host process given it as far as the host lets
+/// ([`crate::host::set_nice`]).
 pub fn set_nice(pid: i32, nice: i32) -> Result<(), i32> {
-    change(pid, |r| r.nice = nice)
+    change(pid, |r| r.nice = nice)?;
+    crate::host::set_nice(pid, nice);
+    Ok(())
 }
 
 /// Host process `pid`'s `oom_score_adj` (0 for one fwe has no record of).

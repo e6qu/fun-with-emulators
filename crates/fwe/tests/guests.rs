@@ -4275,6 +4275,48 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// Nice values: per thread, as Linux keeps them, and the process's given
+/// to the host process (which lets it be raised, not lowered);
+/// `PRIO_USER` names a user of the caller's user namespace.
+#[test]
+fn nice_values_reach_the_host_and_name_threads() {
+    use std::io::{BufRead, Write};
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg(rust_guest("identity")).arg("priorities");
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut text = String::new();
+    let mut host_nice = None;
+    loop {
+        let mut line = String::new();
+        if out.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(pid) = line.strip_prefix("pid ") {
+            let pid: libc::id_t = pid.trim().parse().unwrap();
+            // SAFETY: reading a process's priority; it waits on its input.
+            host_nice = Some(unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) });
+            break;
+        }
+        text.push_str(&line);
+    }
+    child.stdin.take().unwrap().write_all(b"g").unwrap();
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
+    text.push_str(&rest);
+    let status = child.wait().unwrap();
+    assert_eq!(
+        text,
+        "process: start 0, set 5 0 reads 5, lowered to 2 0 reads 2\n\
+         thread: starts 2, set 9 0, reads 9, main thread's 2\n\
+         main thread: 2\n\
+         user namespace: user 500 (1000 outside) 2, user 1000 ESRCH\n"
+    );
+    assert_eq!(host_nice, Some(5), "the host process keeps the highest nice value it was given");
+    assert!(status.success());
+}
+
 /// `RLIMIT_SIGPENDING` bounds the signals queued: a `sigqueue` past it
 /// fails with `EAGAIN`, as does `timer_create`, and none is dropped.
 #[test]

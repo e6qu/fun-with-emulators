@@ -3042,25 +3042,36 @@ fn ifconf(arg: u64, addrs: &[(Vec<u8>, [u8; 4], [u8; 4])]) -> i64 {
 /// the descriptor limit fwe keeps, the host's, or for a limit the host does
 /// not have, Linux's default.
 impl<P: Platform> Kernel<P> {
-    /// The host processes `getpriority`/`setpriority`'s `which` and `who`
-    /// name, among those the caller sees: a process, a process group or a
-    /// user's processes (`who` 0: the caller's own).
-    fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<i32>, i32> {
+    /// What `getpriority`/`setpriority`'s `which` and `who` name, among
+    /// the processes the caller sees: a process or a thread of this one
+    /// (`who` 0: the calling thread, as on Linux), a process group or a
+    /// user's processes (`who` 0: the caller's own; a user as the caller's
+    /// user namespace numbers it).
+    fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<PrioTarget>, i32> {
         use fwe_abi::prio;
         // SAFETY: plain host calls.
         let (me, my_group) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        let processes = |v: Vec<i32>| v.into_iter().map(PrioTarget::Process).collect();
         let seen = || {
             crate::procpid::listed()
                 .into_iter()
                 .filter_map(crate::pidns::to_host)
                 .collect::<Vec<_>>()
         };
+        // The main thread names the process; another of this process's
+        // threads names itself.
+        let own_thread = |tid: i32| {
+            if tid == thread::tgid() { PrioTarget::Process(me) } else { PrioTarget::Thread(tid) }
+        };
         Ok(match which {
-            prio::PROCESS if who == 0 => vec![me],
-            prio::PROCESS => crate::pidns::to_host(who)
-                .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
-                .into_iter()
-                .collect(),
+            prio::PROCESS if who == 0 => vec![own_thread(thread::tid())],
+            prio::PROCESS if thread::host_thread(who).is_some() => vec![own_thread(who)],
+            prio::PROCESS => processes(
+                crate::pidns::to_host(who)
+                    .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
+                    .into_iter()
+                    .collect(),
+            ),
             prio::PGRP => {
                 let group = if who == 0 {
                     my_group
@@ -3072,12 +3083,23 @@ impl<P: Platform> Kernel<P> {
                 };
                 // (A process gone meanwhile has no group: -1, never one's.)
                 // SAFETY: plain host call.
-                seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect()
+                processes(
+                    seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect(),
+                )
             }
             prio::USER => {
-                let uid = if who == 0 { self.creds.uid } else { who as u32 };
+                // The records hold initial-namespace ids; a user the
+                // caller's namespace does not map names none.
+                let uid = if who == 0 {
+                    self.creds.uid
+                } else {
+                    match crate::userns::from_ns(who as u32, false) {
+                        Some(u) => u,
+                        None => return Ok(Vec::new()),
+                    }
+                };
                 let own = |h: i32| if h == me { self.creds.uid } else { crate::procreg::ids(h)[0] };
-                seen().into_iter().filter(|&h| own(h) == uid).collect()
+                processes(seen().into_iter().filter(|&h| own(h) == uid).collect())
             }
             _ => return Err(errno::EINVAL),
         })
@@ -3090,7 +3112,10 @@ impl<P: Platform> Kernel<P> {
         match self.prio_targets(which, who) {
             Ok(t) => t
                 .iter()
-                .map(|&h| crate::procreg::nice(h))
+                .map(|t| match *t {
+                    PrioTarget::Process(h) => crate::procreg::nice(h),
+                    PrioTarget::Thread(tid) => thread::nice_of(tid),
+                })
                 .min()
                 .map_or(err(errno::ESRCH), |n| (20 - n) as i64),
             Err(e) => err(e),
@@ -3114,7 +3139,25 @@ impl<P: Platform> Kernel<P> {
             20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
         let me = crate::host::pid();
         let mut result = err(errno::ESRCH);
-        for h in targets {
+        for t in targets {
+            let h = match t {
+                PrioTarget::Process(h) => h,
+                PrioTarget::Thread(tid) => {
+                    // A thread of this process: its own value, kept for
+                    // it (the host process keeps the process's).
+                    let r = if nice < thread::nice_of(tid) && !privileged && nice < floor {
+                        err(errno::EACCES)
+                    } else if thread::set_nice_of(tid, nice) {
+                        0
+                    } else {
+                        err(errno::ESRCH)
+                    };
+                    if r != 0 || result == err(errno::ESRCH) {
+                        result = r;
+                    }
+                    continue;
+                }
+            };
             let ids = if h == me {
                 [self.creds.uid, self.creds.euid]
             } else {
@@ -3140,6 +3183,14 @@ impl<P: Platform> Kernel<P> {
         }
         result
     }
+}
+
+/// What a `getpriority`/`setpriority` call acts on.
+enum PrioTarget {
+    /// A host process (for this one, its main thread).
+    Process(i32),
+    /// Another thread of this process, by tid.
+    Thread(i32),
 }
 
 /// For a clock id Linux's CPU-time clocks encode (negative: a pid or tid,

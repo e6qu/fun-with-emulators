@@ -960,7 +960,7 @@ and `futex_waitv` run without the kernel lock.
 | `sched_setscheduler`, `sched_setparam`, `sched_getscheduler`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`/`min`, `sched_rr_get_interval` | Kept per process in its record with Linux's checks, inherited; the host schedules as before. | none |
 | `sched_setaffinity`, `sched_getaffinity`, `getcpu` | The mask is checked and remembered; `getcpu` reports its first CPU, node 0. | `sysconf` (online CPUs) |
 | `sched_yield` | The host's. | `sched_yield` |
-| `getpriority`, `setpriority` | Nice values kept in the process records with Linux's checks and `RLIMIT_NICE`; a process fwe did not start gets the host's. | `setpriority` (non-fwe processes) |
+| `getpriority`, `setpriority` | Nice values per thread, as Linux keeps them: the main thread's is the process's, kept in its record and given to the host process (raising it only, as the host lets a user), another thread's kept for it, a new thread starting with its creator's; Linux's checks and `RLIMIT_NICE`; `PRIO_USER`'s user as the caller's user namespace numbers it; a process fwe did not start gets the host's. | `setpriority`, `getpriority` |
 | `ioprio_get`, `ioprio_set` | Linux's checks of class and level (`CAP_SYS_NICE` for the real-time class); the caller's priority kept and reported, another process's accepted, not kept: the host takes no I/O priority from fwe. | none |
 | `prlimit64`, `getrlimit`, `setrlimit` | `NOFILE` virtual, fwe's own limits in `rlimits.rs`, the rest the host's; another process's is left for it to take up. | `getrlimit`, `setrlimit` |
 | `getrusage`, `times` | The host's usage; `RUSAGE_THREAD` reports the process's; `times` in 100 Hz ticks since boot. | `getrusage` |
@@ -2175,7 +2175,7 @@ numbers mean nothing there. fwe keeps its own:
 | Linux | macOS | fwe |
 |---|---|---|
 | sleeps and timeouts (`nanosleep`, `clock_nanosleep`, `poll`, `select`, the `epoll` waits, futex waits, timerfd), woken within the timer slack (50 µs by default) | coalesced: a millisecond or more late | a kqueue timer per thread with `NOTE_CRITICAL`, in nanoseconds, which wakes within tens of microseconds |
-| nice, scheduling policies | own scheduler | kept in the process record with Linux's checks, inherited; the host schedules every process alike |
+| nice, scheduling policies | own scheduler | kept in the process record with Linux's checks, inherited; a process's nice value is the host process's too, as far as the host lets it be raised (never lowered); policies leave the host scheduling every process alike |
 | `RLIMIT_NICE`, `RTPRIO`, `MSGQUEUE`, `MEMLOCK`, `CORE`, `STACK`, `CPU`, `NPROC`, … | absent or different | fwe's own (`crates/kernel/src/rlimits.rs`): `CORE` for fwe's core dumps, `STACK` for the guest's stack, `CPU`'s hard limit and `NPROC` enforced by fwe; `NOFILE` is virtual, below fwe's reserved descriptors; `FSIZE`, `DATA`, `AS` are the host's |
 | `personality` | none | kept per process; `UNAME26` and `STICKY_TIMEOUTS` act |
 

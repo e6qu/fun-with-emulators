@@ -1299,6 +1299,12 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - Limits set on another process with `prlimit` take effect at its next
   limit call, `fork` or `execve`; reading another's reports what was set
   for it, else the caller's own.
+- A process's nice value (its main thread's) is given to the host
+  process, which lets a user raise it but not lower it: a guest's
+  lowering stands in fwe's record and in what it reads back, while the
+  host process keeps the highest value it had. Another thread's nice
+  value is kept for it, and only the process's reaches the host; a thread
+  of another process cannot be named by its tid (`ESRCH`).
 - `sched_setaffinity` is checked and remembered, but threads run on any
   CPU; scheduling policies are per process, not per thread, and do not
   change how the host schedules.

@@ -444,6 +444,28 @@ pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     kill(pid, sig)
 }
 
+/// Host process `pid`'s nice value as the host has it (0 for one that
+/// is not there).
+pub fn nice_of(pid: libc::pid_t) -> i32 {
+    // SAFETY: plain host call; -1 is a valid value, so errno is not
+    // consulted (an absent process reads as 0).
+    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    v.clamp(-20, 19)
+}
+
+/// Give host process `pid` (one of fwe's) nice value `nice`, which the
+/// host scheduler then applies. The host lets a user raise a process's
+/// nice value but not lower it (only its root may), so a guest's lowering
+/// stands in fwe's record while the host process keeps the value it had:
+/// Linux's result is the guest's, the host's limit is the host's.
+pub fn set_nice(pid: libc::pid_t, nice: i32) {
+    if pid <= 0 {
+        return;
+    }
+    // SAFETY: plain host call on one process of this user's.
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
+}
+
 /// Whether host process `pid` is a live fwe process (one with a record):
 /// the only kind that takes fwe's internal signals ([`WAKE_SIGNAL`]) and
 /// serves requests left in its mailbox.
