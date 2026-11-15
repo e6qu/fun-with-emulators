@@ -14,7 +14,7 @@
 //! readers count themselves in one of [`SHARDS`] counters, each on a line
 //! of its own and each thread keeping to one, and look at a flag only a
 //! writer sets. A writer takes the writers' mutex, sets the flag and waits
-//! for every counter to drain; a reader that finds the flag set steps back
+//! for every counter given to a thread to drain; a reader that finds the flag set steps back
 //! and comes in holding the mutex, and a writer lets the readers waiting
 //! so come in first, so that readers are not kept out by a thread making
 //! one exclusive call after another. Shared sections are short (no call on this side
@@ -134,7 +134,11 @@ impl<T> Lock<T> {
         }
         let writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
         self.writing.store(true, SeqCst);
-        for shard in &self.readers {
+        // Only the counters given out may count readers: a thread given one
+        // after this look finds `writing` set, and steps back (the given
+        // count, the counter and the flag are all sequentially consistent).
+        let given = NEXT_SHARD.load(SeqCst).min(SHARDS);
+        for shard in &self.readers[..given] {
             let mut spins = 0u32;
             while shard.0.load(SeqCst) != 0 {
                 spins += 1;
@@ -154,7 +158,7 @@ impl<T> Lock<T> {
     pub fn shared(&self) -> Shared<'_, T> {
         let mut shard = SHARD.with(Cell::get);
         if shard == 0 {
-            shard = NEXT_SHARD.fetch_add(1, Relaxed) % SHARDS + 1;
+            shard = NEXT_SHARD.fetch_add(1, SeqCst) % SHARDS + 1;
             SHARD.with(|s| s.set(shard));
         }
         let shard = shard - 1;
