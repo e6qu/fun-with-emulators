@@ -21,7 +21,8 @@ macOS and natively on Linux.
         With the Linux results, a table of all three is printed (and
         appended to $GITHUB_STEP_SUMMARY). `--no-build` leaves the build and
         the workloads out (Alpine's programs run only in CI). It fails when
-        a figure of fwe's exceeds its budget (BUDGETS) against macOS's.
+        a figure of fwe's exceeds its budget against macOS's (BUDGETS), or
+        a computing program's share of fwe's its own (SHARE_BUDGETS).
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -138,13 +139,22 @@ BUDGETS = {
     "fork+exit+wait (us)": 3.0,
     "fork+exec+wait (us)": 3.0,
     "build Lua (s)": 1.5,
-    # Programs at work: those that compute 1.2x, those that are mostly
-    # system calls (a database on disk, a repository) as a call is, 1.5x.
+    # Programs at work that are mostly system calls (a database on disk, a
+    # repository), as a call is.
+    "SQLite (s)": 1.5,
+    "git (s)": 1.5,
+}
+
+# How much longer than its own code fwe may make a program that computes
+# take: its share ([`pcs`]), all of a run's samples over those in the
+# program's own files. Its time against macOS's stays in the table, but
+# that also measures the builds' differences (Alpine's compiler and C
+# library against Homebrew's), not only fwe.
+SHARE = "fwe's share"
+SHARE_BUDGETS = {
     "Lua script (s)": 1.2,
     "Python script (s)": 1.2,
     "xz (s)": 1.2,
-    "SQLite (s)": 1.5,
-    "git (s)": 1.5,
 }
 
 # The workloads (tools/bench/workloads).
@@ -342,9 +352,19 @@ def macos(a):
 
 
 def over_budget(results):
-    """The benchmarks whose fwe / macOS ratio exceeds its budget. A missing
-    macOS figure is one: the budget is not shown to hold."""
+    """The benchmarks whose fwe / macOS ratio exceeds its budget, or whose
+    share of fwe's exceeds its share budget. A missing figure is one: the
+    budget is not shown to hold."""
     over = []
+    shares = results.get(SHARE, {})
+    for row, budget in SHARE_BUDGETS.items():
+        if row not in results["fwe"]:
+            continue
+        share = shares.get(row)
+        if share is None:
+            over.append(f"{row}: no share of fwe's")
+        elif share > budget:
+            over.append(f"{row} fwe's share {share:.2f}x > {budget}x")
     for row, budget in BUDGETS.items():
         fwe, mac = results["fwe"].get(row), results["macOS"].get(row)
         if fwe is None:
@@ -455,18 +475,21 @@ def build(a, fwe, results):
         [os.path.join(native_src, "src/lua"), os.path.join(WORKLOADS, "bench.lua")],
         (),
         len(guest_env) + 1,
+        profiled=True,
+        own=root,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     shutil.rmtree(native, ignore_errors=True)
 
 
-def workload(results, name, ours, theirs, fresh, at, profiled=False):
+def workload(results, name, ours, theirs, fresh, at, profiled=False, own=None):
     """Time workload `name`: command `ours` under fwe and `theirs` natively,
     in turns, three rounds, the best of each kept. Each round starts with
     the directories `fresh` empty. Both must succeed and print the same.
     Then `ours` once more, traced (fwe's options go in at `at`, after fwe
     itself), its system calls counted in the log: where fwe's time goes;
-    and, `profiled` (a program in one process), once more sampled."""
+    and, `profiled` (a program in one process), once more sampled, its
+    share of fwe's kept with `own` its root ([`pcs`])."""
     times = {"fwe": [], "macOS": []}
     outs = {}
     for _ in range(3):
@@ -500,7 +523,9 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False):
     top = ", ".join(f"{c} {n}" for c, n in ((n, c) for c, n in calls.most_common(14)))
     print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
     if profiled:
-        profile(name, ours, theirs, fresh)
+        mine = profile(name, ours, theirs, fresh, own)
+        if mine:
+            results.setdefault(SHARE, {})[name] = mine[1] / max(mine[0], 1)
 
 
 def git_commands(ours, theirs, fresh, root):
@@ -538,13 +563,21 @@ def git_commands(ours, theirs, fresh, root):
               file=sys.stderr)
 
 
-def pcs(name, cmd):
+def pcs(name, cmd, own=None):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
     there (as `vmmap` lists it in the first process while it runs) and the
     offset into it: `sample` walks frames, which guest code without frame
     records leaves it short of. And the time the processes spend in each
-    host system call."""
+    host system call.
+
+    With `own`, the root the program's files are in, it returns the
+    samples in the program's own code and all of them: a sample is the
+    program's in a file under `own`, or in the kernel (the host's work for
+    its system calls and faults, as Linux's would be); anything else (fwe,
+    its stubs, the host's libraries fwe calls, code mapped after `vmmap`
+    looked) is fwe's. `cmd` is then one process: a forked one's mappings
+    are not the first's."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
@@ -601,7 +634,7 @@ def pcs(name, cmd):
               file=sys.stderr)
     if not counts:
         print(f"{name}: no program counters: {said.strip()[-500:]}", file=sys.stderr)
-        return
+        return None
     # A file's offset from the lowest address it is mapped at.
     base = {}
     for lo, _, what, _ in regions:
@@ -630,6 +663,20 @@ def pcs(name, cmd):
         for lo, _, what, line in regions:
             if not what and w == f"anonymous {lo:#x}":
                 print(f"{name}: {w}: {line}", file=sys.stderr)
+    if own is None:
+        return None
+    roots = tuple({os.path.join(own, ""), os.path.join(os.path.realpath(own), "")})
+
+    def owns(pc):
+        return pc == 0 or any(lo <= pc < hi and what.startswith(roots)
+                              for lo, hi, what, _ in regions)
+
+    mine = sum(n for pc, n in counts if owns(pc))
+    kernel = sum(n for pc, n in counts if pc == 0)
+    print(f"{name}: the program's own code {mine * 100 / total:.1f}% (the kernel "
+          f"{kernel * 100 / total:.1f}%), fwe's {(total - mine) * 100 / total:.1f}%",
+          file=sys.stderr)
+    return mine, total
 
 
 def sampled(name, cmd):
@@ -691,11 +738,11 @@ def rusage(name, side, cmd, fresh):
     print(f"{name} {side}: " + "; ".join(lines), file=sys.stderr)
 
 
-def profile(name, cmd, theirs, fresh):
+def profile(name, cmd, theirs, fresh, own=None):
     """[`sampled`] of `cmd` (one fwe process, after `env -i`), then a run
     with fwe's timing marks: start-up, and the code pages it wrote as they
     first ran; and what it and `theirs` cost the host ([`rusage`]).
-    `fresh` is emptied before each run."""
+    `fresh` is emptied before each run. Returns [`pcs`]'s figures."""
     rusage(name, "fwe", cmd, fresh)
     rusage(name, "macOS", theirs, fresh)
     for d in fresh:
@@ -709,7 +756,7 @@ def profile(name, cmd, theirs, fresh):
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
-    pcs(name, cmd)
+    mine = pcs(name, cmd, own)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
@@ -718,6 +765,7 @@ def profile(name, cmd, theirs, fresh):
     r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
     marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines() if "timing: " in l]
     print(f"{name}: fwe's marks: " + "; ".join(marks), file=sys.stderr)
+    return mine
 
 
 def workloads(a, fwe, guest_env, lua_src, results):
@@ -756,6 +804,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
         (),
         at,
         profiled=True,
+        own=root,
     )
     workload(
         results,
@@ -815,18 +864,23 @@ def workloads(a, fwe, guest_env, lua_src, results):
         os.makedirs(d)
     pcs("xz (s)", script("xz.sh", "/usr/bin/xz", brew["xz"])[0])
     # And xz alone, on the data that left (its code named by its library's
-    # offsets, not its shell's).
-    pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"))
-    pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", "/tmp/w/data.xz"))
+    # offsets, not its shell's): its two runs, each one process, are the
+    # workload's share of fwe's.
+    mine = [pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"), root),
+            pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", "/tmp/w/data.xz"), root)]
+    if all(mine):
+        results.setdefault(SHARE, {})["xz (s)"] = (
+            sum(m[1] for m in mine) / max(sum(m[0] for m in mine), 1))
     shutil.rmtree(native, ignore_errors=True)
 
 
 def render(results):
     cols = [c for c in ("fwe", "macOS", "Linux") if c in results]
     rows = list(results["fwe"].keys())
+    shares = results.get(SHARE, {})
     lines = [
-        "| benchmark | " + " | ".join(cols) + " | fwe / macOS | budget |",
-        "|---" * (len(cols) + 3) + "|",
+        "| benchmark | " + " | ".join(cols) + " | fwe / macOS | fwe's share | budget |",
+        "|---" * (len(cols) + 4) + "|",
     ]
     for row in rows:
         vals = [results[c].get(row) for c in cols]
@@ -836,8 +890,10 @@ def render(results):
             else ""
         )
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
-        budget = f"{BUDGETS[row]}x" if row in BUDGETS else ""
-        lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} | {budget} |")
+        share = f"{shares[row]:.2f}x" if row in shares else ""
+        budget = (f"{BUDGETS[row]}x" if row in BUDGETS
+                  else f"{SHARE_BUDGETS[row]}x of share" if row in SHARE_BUDGETS else "")
+        lines.append(f"| {row} | " + " | ".join(cells) + f" | {ratio} | {share} | {budget} |")
     return "\n".join(lines)
 
 
