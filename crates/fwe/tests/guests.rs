@@ -7172,6 +7172,18 @@ fn o_tmpfile_files_have_no_name_until_linked() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// A tmpfs's size holds for `copy_file_range`, `pwritev` and `splice` into
+/// it as for `write` (`ENOSPC` once full), and a remount gives it a new
+/// size.
+#[test]
+fn tmpfs_size_holds_for_every_write() {
+    assert_eq!(
+        fsrules("tmpfs"),
+        "copy_file_range cut short: true\npwritev past the size: ENOSPC splice: ENOSPC\n\
+         remount: ok then a write of 64k: 65536\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

@@ -1183,9 +1183,10 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
 - **tmpfs size** (`crates/kernel/src/tmpfs.rs`): a tmpfs mount is a
   directory of fwe's, its `size=` kept in a file beside it. Its use is
   what its files take on the host, recounted once the count is a quarter
-  second old; a write past the size writes what fits or fails with
+  second old; a write past the size (any of the write calls, or
+  `copy_file_range`, `sendfile` or `splice` into a file) writes what fits or fails with
   `ENOSPC`, `fallocate` fits whole or fails, and `statfs` reports the size
-  and what is left.
+  and what is left; a remount with `size=` sets a new size.
 - **cgroups** (`crates/kernel/src/cgroupfs.rs`, `bpf.rs`): device programs
   are kept in the cgroup's directory, so they outlive the runtime that
   attached them. The eBPF interpreter checks each access against the
@@ -1466,7 +1467,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 **Mounts**
 - A tmpfs's files are host files: its size counts their host blocks, up
   to a quarter second late, so writes from several processes at once can
-  pass it.
+  pass it, and so can writes through a shared mapping, which fwe does not
+  see.
 - Mountable filesystems are tmpfs, `proc`, `sysfs`, `cgroup2`, `devpts`,
   `mqueue` and overlays, none on a block device (ext4, XFS: `ENODEV`), so
   a loop device holds bytes but no filesystem to mount.

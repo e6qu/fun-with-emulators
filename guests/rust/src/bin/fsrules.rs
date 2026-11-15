@@ -61,6 +61,7 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn pipe(fds: *mut i32) -> i32;
     fn dup(fd: i32) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
     fn fallocate(fd: i32, mode: i32, off: i64, len: i64) -> i32;
@@ -990,9 +991,73 @@ fn tmpfile_scenario() {
     });
 }
 
+/// A tmpfs's size holds for `copy_file_range`, `pwritev` and `splice`
+/// into it as for `write`, and a remount gives it a new one.
+fn tmpfs_size_scenario() {
+    const SYS_COPY_FILE_RANGE: i64 = 285;
+    const SYS_PWRITEV: i64 = 70;
+    const SYS_SPLICE: i64 = 76;
+    const CLONE_NEWNS: i32 = 0x20000;
+    const MS_REMOUNT: u64 = 32;
+    // SAFETY: plain calls; NUL-terminated strings.
+    unsafe {
+        unshare(CLONE_NEWNS);
+        mkdir(c("/tmp/m").as_ptr(), 0o755);
+        let t = c("tmpfs");
+        mount(t.as_ptr(), c("/tmp/m").as_ptr(), t.as_ptr(), 0, c("size=32k").as_ptr());
+    }
+    let big = vec![7u8; 100_000];
+    make("/tmp/src", 0o644);
+    // SAFETY: NUL-terminated paths, buffers of their lengths.
+    let (copied, written, spliced) = unsafe {
+        let src = open(c("/tmp/src").as_ptr(), O_RDWR);
+        write(src, big.as_ptr(), big.len());
+        let a = open(c("/tmp/m/a").as_ptr(), O_CREAT | O_RDWR, 0o644);
+        let mut off = 0i64;
+        let copied =
+            syscall(SYS_COPY_FILE_RANGE, src, &mut off, a, std::ptr::null::<i64>(), 100_000, 0);
+        let b = open(c("/tmp/m/b").as_ptr(), O_CREAT | O_RDWR, 0o644);
+        let iov = [big.as_ptr() as usize, 65_536];
+        let written = res(syscall(SYS_PWRITEV, b, iov.as_ptr(), 1, 0));
+        let mut p = [0i32; 2];
+        pipe(p.as_mut_ptr());
+        write(p[1], big.as_ptr(), 60_000);
+        let s = open(c("/tmp/m/s").as_ptr(), O_CREAT | O_RDWR, 0o644);
+        let spliced = res(syscall(
+            SYS_SPLICE,
+            p[0],
+            std::ptr::null::<i64>(),
+            s,
+            std::ptr::null::<i64>(),
+            60_000,
+            0,
+        ));
+        (copied, written, spliced)
+    };
+    println!("copy_file_range cut short: {}", (0..100_000).contains(&copied));
+    println!("pwritev past the size: {written} splice: {spliced}");
+    // SAFETY: NUL-terminated strings.
+    let r = unsafe {
+        mount(
+            std::ptr::null(),
+            c("/tmp/m").as_ptr(),
+            std::ptr::null(),
+            MS_REMOUNT,
+            c("size=1m").as_ptr(),
+        )
+    };
+    // SAFETY: a NUL-terminated path, a buffer of its length.
+    let n = unsafe {
+        let d = open(c("/tmp/m/d").as_ptr(), O_CREAT | O_RDWR, 0o644);
+        write(d, big.as_ptr(), 65_536)
+    };
+    println!("remount: {} then a write of 64k: {n}", res(r.into()));
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "tmpfs" => tmpfs_size_scenario(),
         "tmpfile" => tmpfile_scenario(),
         "setid" => setid_scenario(),
         "atime" => atime_scenario(),

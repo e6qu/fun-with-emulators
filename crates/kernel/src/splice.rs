@@ -329,6 +329,10 @@ fn splice_inner(
                 return Err(errno::EINVAL);
             }
             let socket_nonblock = flags & SPLICE_F_NONBLOCK != 0 && ko == Kind::Socket;
+            // A file of a tmpfs with a size: as much as fits, asked before
+            // the pipe is taken from.
+            let len =
+                if ko == Kind::File { crate::tmpfs::room(fd_out, pos_out, len)? } else { len };
             let w =
                 from_pipe(fd_in, nonblock_of(fl_in), fd_out, ko, socket_nonblock, pos_out, len)?;
             if let Some(p) = pos_out {

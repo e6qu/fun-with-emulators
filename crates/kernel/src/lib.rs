@@ -1487,6 +1487,19 @@ fn copy_between(
     let mut failure = 0;
     while done < count {
         let want = (count - done).min(buf.len() as u64) as usize;
+        // A file of a tmpfs with a size: as much as fits, asked before it
+        // is read.
+        let want = if out_dev {
+            want
+        } else {
+            match tmpfs::room(output, opos.map(|p| p as u64), want as u64) {
+                Ok(fits) => fits as usize,
+                Err(e) => {
+                    failure = e;
+                    break;
+                }
+            }
+        };
         let n = if in_dev {
             match loopdev::read_into(input, &mut buf[..want], ipos.map(|p| p as u64)) {
                 Some(r) if r < 0 => {
@@ -1637,10 +1650,22 @@ fn vectored_at(
             return err(errno::EAGAIN);
         }
     }
+    // A file of a tmpfs with a size: as much as fits.
+    let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
+    let iov = if write {
+        let total = specialwrite::total(&iov);
+        let at = (offset >= 0 && flags & rwf::APPEND == 0 && !appends).then_some(offset as u64);
+        match tmpfs::room(fd, at, total) {
+            Ok(fits) if fits < total => iovecs_part(&iov, 0, fits),
+            Ok(_) => iov,
+            Err(e) => return err(e),
+        }
+    } else {
+        iov
+    };
     let n = iov.len() as i32;
     // Linux appends to a file opened to append whatever the offset, as
     // its `pwrite` does.
-    let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
     let r = if flags & rwf::APPEND != 0 || appends {
         append_vectored(fd, &iov, offset)
     } else if offset == -1 {

@@ -273,6 +273,16 @@ impl<P: Platform> Kernel<P> {
             // With no access-time mode named the mount keeps its own.
             let named = flags & (ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME);
             let flags = if named == 0 { flags } else { flags | default_atime(flags) };
+            // A tmpfs given a new size holds to it from now on.
+            if flags & ms::BIND == 0
+                && let Some(limit) = crate::tmpfs::size_option(&data)
+                && let (m, _) = ns.table().locate(&point)
+                && m.fstype == FsType::Tmpfs
+                && m.root == b"/"
+                && let Some(dir) = m.host_path(b"")
+            {
+                crate::tmpfs::mounted(&dir, limit);
+            }
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0
             && let Some(found) = self.bound_namespace(&source)
