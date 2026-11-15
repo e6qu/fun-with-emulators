@@ -4186,6 +4186,33 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// A signal to a process group goes to each member the caller may
+    /// signal: one whose only member it may not (a process fwe has no
+    /// record of counts as root's) gives `EPERM` and signals nothing, as
+    /// Linux's `kill_pgrp`.
+    #[test]
+    fn group_kill_checks_each_member() {
+        use std::os::unix::process::CommandExt;
+        let mut k = kernel();
+        let mut child =
+            std::process::Command::new("/bin/sleep").arg("30").process_group(0).spawn().unwrap();
+        let pgid = child.id() as i64;
+        k.creds.uid = 1000;
+        k.creds.euid = 1000;
+        k.creds.suid = 1000;
+        k.creds.caps.effective = 0;
+        assert_eq!(k.syscall(nr::KILL, [-pgid as u64, 15, 0, 0, 0, 0]), err(errno::EPERM));
+        assert_eq!(k.syscall(nr::KILL, [-pgid as u64, 0, 0, 0, 0, 0]), err(errno::EPERM));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "the member it may not signal lives");
+        // With the capability, it takes the signal.
+        k.creds.caps.effective = 1 << crate::caps::CAP_KILL;
+        assert_eq!(k.syscall(nr::KILL, [-pgid as u64, 15, 0, 0, 0, 0]), 0);
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
     /// Code the host placed with no room for its stubs near it is mapped
     /// again where there is, when the guest left the place to fwe; a fixed
     /// mapping cannot move, and fails.

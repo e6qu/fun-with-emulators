@@ -4275,6 +4275,17 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// A signal to a process group reaches each member the sender may
+/// signal and no other, as Linux's `kill_pgrp` sends it.
+#[test]
+fn group_kills_check_each_member() {
+    assert_eq!(
+        identity(&["group-kill"]),
+        "own group: sent true, sender took it true, uid 1000 took it true, root took it false, \
+         parent took it false\nroot's group: EPERM true, its member took it false\n"
+    );
+}
+
 /// What the `ptrace` guest prints.
 const PTRACE: &str = "stop: signal 19\n\
     peek: true\n\

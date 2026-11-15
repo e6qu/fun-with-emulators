@@ -1824,6 +1824,7 @@ recorded by fwe and the target woken with the wake signal:
 | `tgkill`/`tkill` of a thread of another process | queued in its process's mailbox with the tid, and posted to that thread | `SIGEMT` to wake the process |
 | `tgkill` of a signal the host acts on | — | `pthread_kill(<host thread>, <host signal>)` |
 | `kill(-1, sig)` | only the caller's pid namespace or its run of fwe, never other host processes | `kill` of each |
+| `kill(0, sig)`, `kill(-pgid, sig)` | the group's members listed from the host; each the caller may signal is sent the signal as one process would be (this one last), the others passed over; 0 if any took it, `EPERM` if the caller may signal none, as Linux's `kill_pgrp` | `proc_listpids(PROC_PGRP_ONLY)`, then `kill` of each |
 
 - **Permission** follows Linux: `CAP_KILL`, or the caller's real or
   effective uid matching the target's real or saved one, or `SIGCONT`

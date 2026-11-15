@@ -345,16 +345,29 @@ fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
     }
 }
 
-/// The processes of host process group `pgid` that are fwe's.
+/// The pids of process group `pgid`, read from `/proc`.
+#[cfg(not(target_os = "macos"))]
+fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|&p| {
+            // The group is the fifth field, after the name in parentheses.
+            std::fs::read_to_string(format!("/proc/{p}/stat")).ok().is_some_and(|st| {
+                st.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(2)?.parse().ok())
+                    == Some(pgid)
+            })
+        })
+        .collect()
+}
+
+/// The processes of host process group `pgid` (none for a number that is
+/// not one), fwe's and others.
 pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    #[cfg(target_os = "macos")]
-    let all = pids_of(pgid);
-    #[cfg(not(target_os = "macos"))]
-    let all: Vec<libc::pid_t> = {
-        let _ = pgid;
-        Vec::new()
-    };
-    all.into_iter().filter(|&p| crate::procreg::read(p).is_some()).collect()
+    if pgid <= 0 {
+        return Vec::new();
+    }
+    pids_of(pgid)
 }
 
 /// Whether host descriptor `fd` is of a file with no name left (a memfd's,

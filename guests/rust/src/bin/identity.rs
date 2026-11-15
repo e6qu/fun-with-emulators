@@ -11,15 +11,71 @@ const SYS_PROCESS_VM_READV: i64 = 270;
 const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
 const SYS_PIDFD_OPEN: i64 = 434;
 const SYS_PIDFD_GETFD: i64 = 438;
+const SIGUSR1: i32 = 10;
 const SIGRT1: i32 = 35;
 const O_RDONLY: i32 = 0;
+const SIG_BLOCK: i32 = 0;
+
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
 
 unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn kill(pid: i32, sig: i32) -> i32;
     fn open(path: *const c_char, flags: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
+    fn fork() -> i32;
+    fn getpid() -> i32;
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn setuid(uid: u32) -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn read(fd: i32, buf: *mut c_void, len: usize) -> isize;
+    fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
+    fn sigprocmask(how: i32, set: *const u64, old: *mut u64) -> i32;
+    fn sigtimedwait(set: *const u64, info: *mut [u8; 128], timeout: *const Timespec) -> i32;
+    fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
+}
+
+fn sigset(sig: i32) -> u64 {
+    1 << (sig - 1)
+}
+
+/// Wait up to `ms` milliseconds for blocked signal `sig`, with what it
+/// carries.
+fn wait_for(sig: i32, ms: i64) -> Option<[u8; 128]> {
+    let set = sigset(sig);
+    let mut info = [0u8; 128];
+    let t = Timespec { sec: ms / 1000, nsec: ms % 1000 * 1_000_000 };
+    // SAFETY: a valid set, buffer and timeout.
+    (unsafe { sigtimedwait(&set, &mut info, &t) } == sig).then_some(info)
+}
+
+/// Fork a child that waits for pipe `go` to close, runs `f`, and exits
+/// with what it returns.
+fn child(go: [i32; 2], f: impl FnOnce() -> i32) -> i32 {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let pid = fork();
+        if pid == 0 {
+            close(go[1]);
+            let mut b = 0u8;
+            read(go[0], (&mut b as *mut u8).cast(), 1);
+            _exit(f());
+        }
+        pid
+    }
+}
+
+/// A child's exit status.
+fn reap(pid: i32) -> i32 {
+    let mut status = 0;
+    // SAFETY: plain call into the C library.
+    unsafe { waitpid(pid, &mut status, 0) };
+    (status >> 8) & 0xff
 }
 
 fn errno() -> i32 {
@@ -72,11 +128,53 @@ fn host_process(pid: i32) {
     }
 }
 
+/// `kill(0)` and `kill(-pgid)` from a process of uid 1000, in a group
+/// with root's processes and one of uid 1000: each member it may signal
+/// takes the signal, the others do not, and a group of root's only gives
+/// `EPERM`.
+fn group_kill() {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let usr1 = sigset(SIGUSR1);
+        sigprocmask(SIG_BLOCK, &usr1, std::ptr::null_mut());
+        setpgid(0, 0);
+        let mut go = [0i32; 2];
+        pipe(go.as_mut_ptr());
+        let got = || i32::from(wait_for(SIGUSR1, 1500).is_some());
+        let root = child(go, got);
+        let user = child(go, || {
+            setuid(1000);
+            got()
+        });
+        let other = child(go, got);
+        setpgid(other, other);
+        let sender = child(go, || {
+            setuid(1000);
+            let own = kill(0, SIGUSR1) == 0;
+            let r = kill(-other, SIGUSR1);
+            let refused = r == -1 && errno() == 1;
+            i32::from(own) | i32::from(refused) << 1 | i32::from(wait_for(SIGUSR1, 1500).is_some()) << 2
+        });
+        close(go[1]);
+        let s = reap(sender);
+        println!(
+            "own group: sent {}, sender took it {}, uid 1000 took it {}, root took it {}, parent took it {}",
+            s & 1 != 0,
+            s & 4 != 0,
+            reap(user) == 1,
+            reap(root) == 1,
+            wait_for(SIGUSR1, 0).is_some()
+        );
+        println!("root's group: EPERM {}, its member took it {}", s & 2 != 0, reap(other) == 1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
     match arg(1) {
         "host-process" => host_process(arg(2).parse().unwrap()),
+        "group-kill" => group_kill(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);
