@@ -62,6 +62,11 @@ pub fn made_file_perm(perm: u32) -> u32 {
 pub(crate) static SETID_FILES: std::sync::Mutex<Vec<(u64, u64)>> =
     std::sync::Mutex::new(Vec::new());
 static SETID_OPEN: AtomicUsize = AtomicUsize::new(0);
+/// Files with file capabilities (`security.capability`) this process
+/// opened to write, by host identity: the first write to one, by anyone,
+/// removes them, as Linux's `security_inode_killpriv` does ([`wrote`]).
+pub(crate) static CAPS_FILES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static CAPS_OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Whether the caller has `CAP_FSETID`, as of its last system call that
 /// took the kernel's lock ([`note_fsetid`]).
 static FSETID: AtomicBool = AtomicBool::new(true);
@@ -70,9 +75,10 @@ fn setid_files() -> std::sync::MutexGuard<'static, Vec<(u64, u64)>> {
     SETID_FILES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether a set-ID file may be written by this process.
+/// Whether a set-ID file, or one with file capabilities, may be written
+/// by this process.
 pub fn setid_open() -> bool {
-    SETID_OPEN.load(Ordering::Acquire) != 0
+    SETID_OPEN.load(Ordering::Acquire) != 0 || CAPS_OPEN.load(Ordering::Acquire) != 0
 }
 
 /// The caller has `CAP_FSETID` (`has`), while set-ID files are open.
@@ -100,11 +106,21 @@ fn watch_setid(st: &libc::stat, perm: u32) {
 
 /// `fd` was opened to write the file of host metadata `st`.
 pub fn opened_for_writing(fd: i32, st: &libc::stat) {
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return;
+    }
     if marked(st)
-        && st.st_mode & libc::S_IFMT == libc::S_IFREG
         && let Some(perm) = read_fd(fd)
+        && perm & 0o6000 != 0
     {
         watch_setid(st, perm);
+    }
+    if crate::xattr::has_file_caps(&crate::xattr::Target::Fd(fd)) {
+        let mut files = CAPS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        if !files.contains(&identity(st)) {
+            files.push(identity(st));
+            CAPS_OPEN.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -119,10 +135,22 @@ pub fn written_perm(perm: u32) -> u32 {
 }
 
 /// The file open as `fd` was written to (or cut, grown, copied or spliced
-/// into): a set-ID one written by a caller without `CAP_FSETID` loses its
-/// bits ([`written_perm`]).
+/// into): one with file capabilities loses them, whoever writes; a set-ID
+/// one written by a caller without `CAP_FSETID` loses its bits
+/// ([`written_perm`]).
 pub fn wrote(fd: i32) {
-    if !setid_open() || FSETID.load(Ordering::Relaxed) {
+    if CAPS_OPEN.load(Ordering::Acquire) != 0
+        && let Ok(st) = fstat(fd)
+    {
+        let mut files = CAPS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = files.iter().position(|f| *f == identity(&st)) {
+            files.swap_remove(i);
+            CAPS_OPEN.fetch_sub(1, Ordering::AcqRel);
+            drop(files);
+            crate::xattr::kill_file_caps(&crate::xattr::Target::Fd(fd));
+        }
+    }
+    if SETID_OPEN.load(Ordering::Acquire) == 0 || FSETID.load(Ordering::Relaxed) {
         return;
     }
     let Ok(st) = fstat(fd) else { return };

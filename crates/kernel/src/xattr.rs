@@ -12,9 +12,101 @@
 //! - writing a `security.` one needs `CAP_SYS_ADMIN`, or `CAP_SETFCAP` for
 //!   `security.capability`;
 //! - `system.` holds POSIX ACLs, which fwe does not keep (`EOPNOTSUPP`).
+//!
+//! `security.capability` (file capabilities) is checked as it is written,
+//! revision 2 or 3 only, and kept as Linux keeps it: from a user namespace
+//! of fwe's as revision 3, naming the root it is for as the initial
+//! namespace's id; and read back as the reader's namespace sees it
+//! ([`store_file_caps`], [`show_file_caps`]). A change of owner, and a
+//! write, remove it ([`kill_file_caps`]).
 
 use fwe_abi::errno;
 use std::ffi::{CStr, CString};
+
+/// File capabilities' attribute.
+pub const CAPABILITY: &[u8] = b"security.capability";
+
+/// `vfs_cap_data`'s revisions, in its first word, and their sizes.
+const REVISION_MASK: u32 = 0xff00_0000;
+const REVISION_2: u32 = 0x0200_0000;
+const REVISION_3: u32 = 0x0300_0000;
+const SIZE_2: usize = 20;
+const SIZE_3: usize = 24;
+
+fn word(v: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(v[i * 4..i * 4 + 4].try_into().unwrap())
+}
+
+/// A file-capabilities value of `magic`'s flags and `v`'s sets, as
+/// revision 2, or with `rootid` revision 3.
+fn caps_value(v: &[u8], rootid: Option<u32>) -> Vec<u8> {
+    let rev = if rootid.is_some() { REVISION_3 } else { REVISION_2 };
+    let mut out = ((word(v, 0) & !REVISION_MASK) | rev).to_le_bytes().to_vec();
+    out.extend_from_slice(&v[4..SIZE_2]);
+    if let Some(r) = rootid {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    out
+}
+
+/// What a `security.capability` value `v` written by this process is kept
+/// as (Linux's `cap_convert_nscap`): only revision 2 (20 bytes) or 3 (24),
+/// else `EINVAL`. Revision 2 from the initial user namespace is kept as it
+/// is; any other becomes revision 3 for its root, the writer's
+/// namespace's (revision 2) or the one it names (revision 3), as the
+/// initial namespace's id (`EINVAL` if it has none).
+pub fn store_file_caps(v: &[u8]) -> Result<Vec<u8>, i32> {
+    let rev = match v.len() {
+        SIZE_2 | SIZE_3 => word(v, 0) & REVISION_MASK,
+        _ => return Err(errno::EINVAL),
+    };
+    let ns_root = match (v.len(), rev) {
+        (SIZE_2, REVISION_2) if !crate::userns::nested() => return Ok(v.to_vec()),
+        (SIZE_2, REVISION_2) => 0,
+        (SIZE_3, REVISION_3) => word(v, 5),
+        _ => return Err(errno::EINVAL),
+    };
+    let kroot = crate::userns::from_ns(ns_root, false).ok_or(errno::EINVAL)?;
+    Ok(caps_value(v, Some(kroot)))
+}
+
+/// A kept `security.capability` value `v` as this process reads it
+/// (Linux's `cap_inode_getsecurity`): revision 3 for a root mapped in its
+/// user namespace (other than its own root) with that id; revision 2 for
+/// one that is root of its namespace or one above; `EOVERFLOW` for any
+/// other.
+pub fn show_file_caps(v: Vec<u8>) -> Result<Vec<u8>, i32> {
+    if v.len() != SIZE_3 || word(&v, 0) & REVISION_MASK != REVISION_3 {
+        return Ok(v);
+    }
+    let kroot = word(&v, 5);
+    if crate::userns::mapped(kroot, false) {
+        let mapped = crate::userns::to_ns(kroot, false);
+        if mapped != 0 {
+            return Ok(caps_value(&v, Some(mapped)));
+        }
+    }
+    if crate::userns::roots_above().contains(&kroot) {
+        Ok(caps_value(&v, None))
+    } else {
+        Err(errno::EOVERFLOW)
+    }
+}
+
+/// Whether the file `t` names has file capabilities.
+pub fn has_file_caps(t: &Target) -> bool {
+    let Ok(n) = host_name(CAPABILITY) else { return false };
+    raw_get(t, &n, std::ptr::null_mut(), 0) >= 0
+}
+
+/// Remove the file capabilities of the file `t` names, if it has any, as
+/// Linux does on a change of owner and on a write
+/// (`security_inode_killpriv`), whoever makes it.
+pub fn kill_file_caps(t: &Target) {
+    if has_file_caps(t) {
+        let _ = remove(t, CAPABILITY);
+    }
+}
 
 /// The largest value Linux keeps.
 pub const SIZE_MAX: usize = 65536;
@@ -425,6 +517,40 @@ mod tests {
         assert_eq!(names, [&b"trusted.b"[..], b"user.a"]);
         remove(&t, b"user.a").unwrap();
         assert_eq!(get(&t, b"user.a"), Err(errno::ENODATA));
+        // File capabilities go at once.
+        set(&t, CAPABILITY, &[0; 20], 0).unwrap();
+        assert!(has_file_caps(&t));
+        kill_file_caps(&t);
+        assert!(!has_file_caps(&t));
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// File capabilities are written as revision 2 or 3 only, of their
+    /// sizes; revision 2 is kept as it is in the initial namespace, and
+    /// revision 3 names its root as the initial namespace's id, which a
+    /// reader sees as its namespace does.
+    #[test]
+    fn file_capabilities_are_checked_and_kept_as_linux_keeps_them() {
+        let v = |magic: u32, words: &[u32]| {
+            let mut out = magic.to_le_bytes().to_vec();
+            for w in words {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            out
+        };
+        let v1 = v(0x0100_0001, &[1 << 7, 0]);
+        assert_eq!(store_file_caps(&v1), Err(errno::EINVAL));
+        assert_eq!(store_file_caps(&[0; 7]), Err(errno::EINVAL));
+        let v2 = v(0x0200_0001, &[1 << 7, 0, 0, 0]);
+        assert_eq!(store_file_caps(&v2), Ok(v2.clone()));
+        // A revision 3 header on a revision 2 size, and the other way.
+        assert_eq!(store_file_caps(&v(0x0300_0001, &[1 << 7, 0, 0, 0])), Err(errno::EINVAL));
+        assert_eq!(store_file_caps(&v(0x0200_0001, &[1 << 7, 0, 0, 0, 0])), Err(errno::EINVAL));
+        let v3 = v(0x0300_0001, &[1 << 7, 0, 0, 0, 1000]);
+        assert_eq!(store_file_caps(&v3), Ok(v3.clone()));
+        // Read back: for another root as it is; for root, revision 2.
+        assert_eq!(show_file_caps(v3.clone()), Ok(v3));
+        assert_eq!(show_file_caps(v(0x0300_0001, &[1 << 7, 0, 0, 0, 0])), Ok(v2.clone()));
+        assert_eq!(show_file_caps(v2.clone()), Ok(v2));
     }
 }

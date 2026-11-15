@@ -281,6 +281,14 @@ pub fn root_of(dir: &[u8]) -> (u32, u32) {
     }
 }
 
+/// The initial namespace's uids of root of the process's user namespace
+/// and of each above it, the initial one's (0) last.
+pub fn roots_above() -> Vec<u32> {
+    let mut out: Vec<u32> = current().iter().map(|r| root_of(r.dir()).0).collect();
+    out.push(0);
+    out
+}
+
 /// Whether `setgroups` is allowed in the process's namespaces.
 pub fn setgroups_allowed() -> bool {
     current().iter().all(|ns| !ns.get().setgroups_deny && !ns.get().gid_map.is_empty())

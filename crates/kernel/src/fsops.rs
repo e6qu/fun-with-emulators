@@ -2510,6 +2510,14 @@ impl<P: Platform> Kernel<P> {
         {
             return err(e);
         }
+        // A file not a directory loses its file capabilities, as Linux's
+        // `chown` has it (`ATTR_KILL_PRIV`).
+        if st.st_mode & libc::S_IFMT == libc::S_IFREG
+            && let Some(d) = crate::fs::host_path_of(dir)
+            && let Ok(host) = CString::new([&d[..], b"/", name.as_bytes()].concat())
+        {
+            crate::xattr::kill_file_caps(&crate::xattr::Target::Path(&host));
+        }
         0
     }
 
@@ -2635,7 +2643,7 @@ impl<P: Platform> Kernel<P> {
         }
         // SAFETY: plain host call on a guest fd.
         let r = ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) });
-        // A set-ID file cut or grown loses its bits, as one written does.
+        // A truncation takes set-ID bits and file capabilities as a write.
         if r == 0 {
             crate::modes::wrote(fd as i32);
         }
@@ -3151,11 +3159,22 @@ impl<P: Platform> Kernel<P> {
             let (host, plain) = Self::xattr_file(&r.dir, &n)?;
             let space = crate::xattr::space(&name)?;
             self.xattr_who(plain).may_write(&name, space)?;
+            let value = Self::xattr_stored(&name, value)?;
             crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
         });
         match r {
             Ok(()) => 0,
             Err(e) => err(e),
+        }
+    }
+
+    /// The value attribute `name` is kept as, written as `value`: file
+    /// capabilities checked and converted ([`crate::xattr::store_file_caps`]).
+    fn xattr_stored(name: &[u8], value: Vec<u8>) -> Result<Vec<u8>, i32> {
+        if name == crate::xattr::CAPABILITY {
+            crate::xattr::store_file_caps(&value)
+        } else {
+            Ok(value)
         }
     }
 
@@ -3178,6 +3197,7 @@ impl<P: Platform> Kernel<P> {
             let plain = Self::xattr_fd(fd)?;
             let space = crate::xattr::space(&name)?;
             self.xattr_who(plain).may_write(&name, space)?;
+            let value = Self::xattr_stored(&name, value)?;
             crate::xattr::set(&crate::xattr::Target::Fd(fd), &name, &value, flags)
         });
         match r {
@@ -3204,7 +3224,8 @@ impl<P: Platform> Kernel<P> {
         let got = self.xattr_target(dirfd, fd, path, follow, |t, who, layers| {
             Self::overlay_own(layers, &name)?;
             who.may_read(crate::xattr::space(&name)?)?;
-            crate::xattr::get(t, &name)
+            let v = crate::xattr::get(t, &name)?;
+            if name == crate::xattr::CAPABILITY { crate::xattr::show_file_caps(v) } else { Ok(v) }
         });
         self.xattr_out(got, value, size)
     }
@@ -3778,7 +3799,14 @@ impl<P: Platform> Kernel<P> {
                 .and_then(|()| mode.map_or(Ok(()), |m| crate::modes::keep_fd(fd, m))),
         };
         match kept {
-            Ok(()) => 0,
+            Ok(()) => {
+                // A regular file loses its file capabilities, as Linux's
+                // `chown` has it (`ATTR_KILL_PRIV`).
+                if st.st_mode & libc::S_IFMT == libc::S_IFREG && stand_in_at(fd).is_none() {
+                    crate::xattr::kill_file_caps(&crate::xattr::Target::Fd(fd));
+                }
+                0
+            }
             Err(e) => err(e),
         }
     }

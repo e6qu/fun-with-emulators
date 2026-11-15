@@ -6588,6 +6588,21 @@ fn landlock_follows_open_files_signals_mounts_and_datagrams() {
     );
 }
 
+/// File capabilities (`security.capability`): only revisions 2 and 3, of
+/// their sizes, may be written (`EINVAL`); a change of owner and a write
+/// remove them, as Linux's `chown` and `write` do; written in a user
+/// namespace they are kept for its root, revision 2 there and revision 3
+/// naming that root outside.
+#[test]
+fn file_capabilities_are_checked_and_cleared() {
+    assert_eq!(
+        containers("filecaps"),
+        "revision 1: EINVAL\nbad size: EINVAL\nset: ok read: rev 2 size 20\n\
+         after chown: ENODATA\nafter a write: ENODATA\n\
+         in a user namespace: set ok read rev 2 size 20\noutside it: rev 3 size 24\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.

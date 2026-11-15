@@ -646,6 +646,55 @@ fn main() {
                 }
                 waitpid(-1, std::ptr::null_mut(), 0);
             }
+            // File capabilities: checked as they are written, gone with a
+            // change of owner and with a write (whoever makes them), and
+            // kept for the root of the user namespace that wrote them.
+            Some("filecaps") => {
+                let cap = c("security.capability");
+                let v = |magic: u32, words: &[u32]| {
+                    let mut out = magic.to_le_bytes().to_vec();
+                    for w in words {
+                        out.extend_from_slice(&w.to_le_bytes());
+                    }
+                    out
+                };
+                let v2 = v(0x0200_0001, &[1 << 7, 0, 0, 0]);
+                let set = |p: &str, val: &[u8]| res(setxattr(c(p).as_ptr(), cap.as_ptr(), val.as_ptr(), val.len(), 0) as i64);
+                let has = |p: &str| {
+                    let mut buf = [0u8; 32];
+                    let n = getxattr(c(p).as_ptr(), cap.as_ptr(), buf.as_mut_ptr(), buf.len());
+                    if n < 0 {
+                        name(errno()).to_string()
+                    } else {
+                        format!("rev {} size {n}", buf[3])
+                    }
+                };
+                std::fs::write("/tmp/f", "x").unwrap();
+                println!("revision 1: {}", set("/tmp/f", &v(0x0100_0001, &[1 << 7, 0])));
+                println!("bad size: {}", set("/tmp/f", &v2[..16]));
+                println!("set: {} read: {}", set("/tmp/f", &v2), has("/tmp/f"));
+                fchownat(-100, c("/tmp/f").as_ptr(), 1000, 0, 0);
+                println!("after chown: {}", has("/tmp/f"));
+                set("/tmp/f", &v2);
+                let fd = open(c("/tmp/f").as_ptr(), O_WRONLY);
+                write(fd, b"y".as_ptr(), 1);
+                close(fd);
+                println!("after a write: {}", has("/tmp/f"));
+                chmod(c("/tmp").as_ptr(), 0o1777);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    setuid(1000);
+                    unshare(0x1000_0000);
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", "0 1000 1").unwrap();
+                    std::fs::write("/proc/self/gid_map", "0 0 1").unwrap();
+                    std::fs::write("/tmp/u", "x").unwrap();
+                    println!("in a user namespace: set {} read {}", set("/tmp/u", &v2), has("/tmp/u"));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                println!("outside it: {}", has("/tmp/u"));
+            }
             // A program only the VM runs, on a host without one: the exec
 
             // fails and the caller goes on, as podman's pause process does
