@@ -997,6 +997,11 @@ impl<P: Platform> Kernel<P> {
         if crate::landlock::active() && crate::landlock::may_signal(target).is_err() {
             return false;
         }
+        // `CAP_KILL` in the initial user namespace reaches every namespace:
+        // no record to read.
+        if self.creds.has(crate::caps::CAP_KILL) {
+            return true;
+        }
         let ids = crate::procreg::ids(target);
         if [self.creds.uid, self.creds.euid].iter().any(|&u| u == ids[0] || u == ids[2]) {
             return true;
