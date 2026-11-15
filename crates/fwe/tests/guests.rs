@@ -1723,7 +1723,9 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
             .map(|e| e.unwrap().path())
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("data.tar"))
             .unwrap();
-        run_checked(Command::new("tar").arg("xf").arg(&data).arg("-C").arg(&root));
+        // `-p`: the modes as the archive has them (`/tmp`'s 1777), not
+        // narrowed by the umask.
+        run_checked(Command::new("tar").arg("xpf").arg(&data).arg("-C").arg(&root));
     }
     for name in ["ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6"] {
         std::fs::copy(repo().join("guests/glibc/lib").join(name), root.join("lib").join(name))
@@ -1762,6 +1764,9 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest_in("alpine", manifest_name);
+    // How it is unpacked counts too: a root unpacked another way is
+    // unpacked again.
+    let list = format!("{list}\nunpacked with the archive's modes\n");
     let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
     // The mark that it is whole is an extended attribute of its own: a
     // copy that lost them (CI's cache keeps none) is unpacked again, as
@@ -1774,11 +1779,13 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     std::fs::create_dir_all(&root).unwrap();
     for f in &files {
         run_checked(
-            // With the files' extended attributes: a program's file
-            // capabilities (`security.capability`) among them.
+            // With the files' extended attributes (a program's file
+            // capabilities, `security.capability`, among them), and their
+            // modes as the archive has them (`-p`: `/tmp`'s 1777, not
+            // narrowed by the umask).
             Command::new("tar")
                 .arg("--xattrs")
-                .arg("-xzf")
+                .arg("-xpzf")
                 .arg(f)
                 .args(["--exclude", ".PKGINFO", "--exclude", ".SIGN.*", "--exclude", ".pre-*"])
                 .args(["--exclude", ".post-*", "--exclude", ".trigger", "-C"])
@@ -2095,7 +2102,7 @@ fn alpine_crun_runs_an_image() {
     std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
     run_checked(
         Command::new("tar")
-            .arg("xzf")
+            .arg("xpzf")
             .arg(alpine_image("crun"))
             .arg("-C")
             .arg(bundle.join("rootfs")),

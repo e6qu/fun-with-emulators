@@ -100,7 +100,9 @@ def alpine_root(manifest, cache):
         f = fetch("https://dl-cdn.alpinelinux.org/alpine/" + path, sha256, cache)
         excludes = [".PKGINFO", ".SIGN.*", ".pre-*", ".post-*", ".trigger"]
         args = [x for e in excludes for x in ("--exclude", e)]
-        subprocess.run(["tar", "--xattrs", "-xzf", f] + args + ["-C", root], check=True)
+        # `-p`: the modes as the archive has them (`/tmp`'s 1777), not
+        # narrowed by the umask.
+        subprocess.run(["tar", "--xattrs", "-xpzf", f] + args + ["-C", root], check=True)
     with open(done, "w") as f:
         f.write(lines)
     return root
