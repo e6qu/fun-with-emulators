@@ -61,6 +61,10 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn dup(fd: i32) -> i32;
+    fn ftruncate(fd: i32, len: i64) -> i32;
+    fn fallocate(fd: i32, mode: i32, off: i64, len: i64) -> i32;
+    fn mmap(a: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn sleep(s: u32) -> u32;
     fn opendir(p: *const c_char) -> *mut u8;
     fn readdir(d: *mut u8) -> *const u8;
@@ -869,9 +873,84 @@ fn atime_scenario() {
     println!("access time set: {} change time kept: {}", atime > 1_000_000, after == ctime);
 }
 
+/// A set-ID file changed by a user without `CAP_FSETID` loses its set-ID
+/// bits whatever the change: a write through a duplicate of the
+/// descriptor, `ftruncate`, `truncate`, `fallocate`, `copy_file_range` into
+/// it, a shared writable mapping of it.
+fn setid_scenario() {
+    const SYS_COPY_FILE_RANGE: i64 = 285;
+    let names = ["dup", "ftruncate", "truncate", "fallocate", "copy_file_range", "mmap"];
+    for n in names {
+        let p = format!("/tmp/{n}");
+        make(&p, 0o644);
+        // SAFETY: a NUL-terminated path.
+        unsafe {
+            chown(c(&p).as_ptr(), 1000, 1000);
+            chmod(c(&p).as_ptr(), 0o6775);
+        }
+    }
+    make("/tmp/src", 0o644);
+    // SAFETY: a NUL-terminated path; a byte written to the descriptor.
+    unsafe {
+        let fd = open(c("/tmp/src").as_ptr(), O_WRONLY);
+        write(fd, b"x".as_ptr(), 1);
+        close(fd);
+    }
+    in_child(|| {
+        // SAFETY: plain id changes.
+        unsafe {
+            setgroups(0, std::ptr::null());
+            setgid(1000);
+            setuid(1000);
+        }
+        for n in names {
+            let p = format!("/tmp/{n}");
+            // SAFETY: plain calls on a NUL-terminated path and descriptors
+            // of it, valid buffers.
+            unsafe {
+                let fd = open(c(&p).as_ptr(), O_RDWR);
+                match n {
+                    "dup" => {
+                        let d = dup(fd);
+                        write(d, b"x".as_ptr(), 1);
+                    }
+                    "ftruncate" => {
+                        ftruncate(fd, 100);
+                    }
+                    "truncate" => {
+                        truncate(c(&p).as_ptr(), 100);
+                    }
+                    "fallocate" => {
+                        fallocate(fd, 0, 0, 100);
+                    }
+                    "copy_file_range" => {
+                        let src = open(c("/tmp/src").as_ptr(), O_RDONLY);
+                        let mut off = 0i64;
+                        syscall(
+                            SYS_COPY_FILE_RANGE,
+                            src,
+                            &mut off,
+                            fd,
+                            std::ptr::null::<i64>(),
+                            1,
+                            0,
+                        );
+                    }
+                    _ => {
+                        ftruncate(fd, 4096);
+                        mmap(std::ptr::null_mut(), 4096, 3, 1, fd, 0);
+                    }
+                }
+            }
+            println!("{n}: {:o}", stat_of(&p).2 & 0o7777);
+        }
+    });
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "setid" => setid_scenario(),
         "atime" => atime_scenario(),
         "telldir" => telldir_scenario(),
         "slash" => trailing_slash_scenario(),

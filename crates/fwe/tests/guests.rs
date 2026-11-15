@@ -7139,6 +7139,17 @@ fn access_times_set_by_reads_leave_change_times() {
     assert_eq!(fsrules("atime"), "strictatime: ok\naccess time set: true change time kept: true\n");
 }
 
+/// A set-ID file a user without `CAP_FSETID` changes loses its set-ID bits
+/// (set-group-ID as its group may run it) however it is changed.
+#[test]
+fn set_id_bits_go_with_any_change() {
+    assert_eq!(
+        fsrules("setid"),
+        "dup: 775\nftruncate: 775\ntruncate: 775\nfallocate: 775\ncopy_file_range: 775\n\
+         mmap: 775\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

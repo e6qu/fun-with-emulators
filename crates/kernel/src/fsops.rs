@@ -2552,7 +2552,7 @@ impl<P: Platform> Kernel<P> {
             })
             .unwrap_or_else(err)
         };
-        match cut() {
+        let r = match cut() {
             // A mode that denies its owner writing, which fwe let through:
             // kept apart, then again.
             r if r == err(errno::EACCES) => {
@@ -2562,7 +2562,15 @@ impl<P: Platform> Kernel<P> {
                 }
             }
             r => r,
+        };
+        // A set-ID file cut by a caller without `CAP_FSETID` loses its bits,
+        // as one written does.
+        let perm = crate::modes::perm_of(&st);
+        let kept = crate::modes::written_perm(perm);
+        if r == 0 && kept != perm && !self.creds.has(crate::caps::CAP_FSETID) {
+            let _ = crate::modes::keep_at(dir, &name, kept);
         }
+        r
     }
 
     /// `truncate` of a file of fwe's own (`/proc`, `/sys`, a cgroup's):
@@ -2596,7 +2604,12 @@ impl<P: Platform> Kernel<P> {
             return r;
         }
         // SAFETY: plain host call on a guest fd.
-        ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) })
+        let r = ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) });
+        // A set-ID file cut or grown loses its bits, as one written does.
+        if r == 0 {
+            crate::modes::wrote(fd as i32);
+        }
+        r
     }
 
     /// `fadvise64(fd, offset, len, advice)`: checked as Linux checks it;
@@ -2676,6 +2689,8 @@ impl<P: Platform> Kernel<P> {
                 if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0 {
                     crate::tmpfs::freed(fd as i32);
                 }
+                // A set-ID file changed loses its bits, as one written does.
+                crate::modes::wrote(fd as i32);
                 0
             }
             Err(e) => err(e),

@@ -267,7 +267,6 @@ impl<P: Platform> Kernel<P> {
                 crate::atime::closed(fd);
                 crate::memfd::closed(fd);
                 crate::tmpfile::closed(fd);
-                crate::modes::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);

@@ -55,20 +55,22 @@ pub fn made_file_perm(perm: u32) -> u32 {
     if p & 0o7000 == 0 && (p & 0o111 == 0 || p & 0o100 != 0) { p } else { host_perm(perm, false) }
 }
 
-/// Descriptors open to write a file whose kept mode is set-ID: a write
-/// through one by a caller without `CAP_FSETID` takes the bits away, as
-/// Linux's does ([`wrote`]).
-pub(crate) static SETID_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+/// Set-ID files this process may write (opened to write, or made set-ID
+/// while open), by host identity (device, inode): a write to one through
+/// any descriptor, by a caller without `CAP_FSETID`, takes the bits away,
+/// as Linux's does ([`wrote`]).
+pub(crate) static SETID_FILES: std::sync::Mutex<Vec<(u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 static SETID_OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Whether the caller has `CAP_FSETID`, as of its last system call that
 /// took the kernel's lock ([`note_fsetid`]).
 static FSETID: AtomicBool = AtomicBool::new(true);
 
-fn setid_fds() -> std::sync::MutexGuard<'static, Vec<i32>> {
-    SETID_FDS.lock().unwrap_or_else(|e| e.into_inner())
+fn setid_files() -> std::sync::MutexGuard<'static, Vec<(u64, u64)>> {
+    SETID_FILES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether any descriptor is open to write a set-ID file.
+/// Whether a set-ID file may be written by this process.
 pub fn setid_open() -> bool {
     SETID_OPEN.load(Ordering::Acquire) != 0
 }
@@ -78,20 +80,20 @@ pub fn note_fsetid(has: bool) {
     FSETID.store(has, Ordering::Relaxed);
 }
 
-/// `fd` was opened, or its file's kept mode set, as `perm`: it is watched
-/// if it writes a set-ID file.
-fn watch_setid(fd: i32, perm: u32) {
-    if perm & 0o6000 == 0 {
+#[allow(clippy::unnecessary_cast)] // the fields' widths differ by host
+fn identity(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+/// The file of host metadata `st` has the guest mode `perm`: watched if
+/// it is a set-ID regular file.
+fn watch_setid(st: &libc::stat, perm: u32) {
+    if perm & 0o6000 == 0 || st.st_mode & libc::S_IFMT != libc::S_IFREG {
         return;
     }
-    // SAFETY: F_GETFL only queries the descriptor.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
-        return;
-    }
-    let mut fds = setid_fds();
-    if !fds.contains(&fd) {
-        fds.push(fd);
+    let mut files = setid_files();
+    if !files.contains(&identity(st)) {
+        files.push(identity(st));
         SETID_OPEN.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -102,36 +104,43 @@ pub fn opened_for_writing(fd: i32, st: &libc::stat) {
         && st.st_mode & libc::S_IFMT == libc::S_IFREG
         && let Some(perm) = read_fd(fd)
     {
-        watch_setid(fd, perm);
+        watch_setid(st, perm);
     }
 }
 
-/// `fd` was closed.
-pub fn closed(fd: i32) {
-    if !setid_open() {
-        return;
-    }
-    let mut fds = setid_fds();
-    if let Some(i) = fds.iter().position(|&f| f == fd) {
-        fds.swap_remove(i);
-        SETID_OPEN.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// `fd` was written to: a set-ID file written by a caller without
-/// `CAP_FSETID` loses its set-user-ID bit, and its set-group-ID bit if
-/// its group may execute it.
-pub fn wrote(fd: i32) {
-    if !setid_open() || FSETID.load(Ordering::Relaxed) || !setid_fds().contains(&fd) {
-        return;
-    }
-    let Some(perm) = read_fd(fd) else { return };
+/// The mode `perm` loses by a write of a caller without `CAP_FSETID`: the
+/// set-user-ID bit, and the set-group-ID bit if its group may execute it.
+pub fn written_perm(perm: u32) -> u32 {
     let mut kept = perm & !0o4000;
     if kept & 0o2010 == 0o2010 {
         kept &= !0o2000;
     }
+    kept
+}
+
+/// The file open as `fd` was written to (or cut, grown, copied or spliced
+/// into): a set-ID one written by a caller without `CAP_FSETID` loses its
+/// bits ([`written_perm`]).
+pub fn wrote(fd: i32) {
+    if !setid_open() || FSETID.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(st) = fstat(fd) else { return };
+    let id = identity(&st);
+    if !setid_files().contains(&id) {
+        return;
+    }
+    let Some(perm) = read_fd(fd) else { return };
+    let kept = written_perm(perm);
     if kept != perm {
         let _ = keep_fd(fd, kept);
+    }
+    if kept & 0o6000 == 0 {
+        let mut files = setid_files();
+        if let Some(i) = files.iter().position(|f| *f == id) {
+            files.swap_remove(i);
+            SETID_OPEN.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -382,9 +391,7 @@ pub fn keep_fd(fd: i32, perm: u32) -> Result<(), i32> {
         return Err(last());
     }
     mark_fd(fd, &st, (host != perm & 0o7777).then_some(perm & 0o7777))?;
-    if st.st_mode & libc::S_IFMT == libc::S_IFREG {
-        watch_setid(fd, perm);
-    }
+    watch_setid(&st, perm);
     Ok(())
 }
 
@@ -616,6 +623,16 @@ fn mark_path(_path: &CStr, _st: &libc::stat, _perm: Option<u32>) -> Result<(), i
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// A write takes set-user-ID away, and set-group-ID where the group
+    /// may run the file (else it marks mandatory locking, kept).
+    #[test]
+    fn a_write_takes_set_id_bits_away() {
+        assert_eq!(written_perm(0o6775), 0o775);
+        assert_eq!(written_perm(0o4755), 0o755);
+        assert_eq!(written_perm(0o2745), 0o2745);
+        assert_eq!(written_perm(0o644), 0o644);
+    }
 
     #[test]
     fn set_id_bits_of_a_file_are_never_the_hosts() {

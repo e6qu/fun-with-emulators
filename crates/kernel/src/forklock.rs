@@ -141,7 +141,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &nsfd::FDS,
         &memfd::READ_ONLY,
         &atime::NOATIME_FDS,
-        &modes::SETID_FDS,
+        &modes::SETID_FILES,
         &modes::READ,
         &tmpfile::NAMES,
         &tmpfs::HELD,

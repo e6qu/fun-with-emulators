@@ -1345,6 +1345,12 @@ impl<P: Platform> Kernel<P> {
         if nowrite {
             crate::maps::record().no_write(r as u64, len);
         }
+        // Writes through a shared writable mapping are not seen one by one:
+        // a set-ID file mapped so loses its bits as it is mapped, as one
+        // written does.
+        if shared && prot & mman::PROT_WRITE != 0 && flags & mman::MAP_ANONYMOUS == 0 {
+            crate::modes::wrote(fd as i32);
+        }
         if flags & mman::MAP_GROWSDOWN != 0 || ANY_GROWS_DOWN.load(Ordering::Relaxed) {
             let mut g = lock_ranges();
             remove_range(&mut g.grows_down, r as u64, len);

@@ -962,6 +962,7 @@ impl<P: Platform> Kernel<P> {
         let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
         let nr = regs.x[8];
         let result = self.dispatch(nr, args);
+        self.note_creds();
         self.finish_syscall(regs, nr, &args, result);
     }
 
@@ -1307,14 +1308,19 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
 }
 
 /// After call `nr` with `a`, which returned `r`: a write to a set-ID
-/// file takes the bits away where Linux's would ([`modes::wrote`]).
+/// file (by any of the write calls, or copied or spliced into) takes the
+/// bits away where Linux's would ([`modes::wrote`]).
 pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
     use fwe_abi::nr as n;
-    if r > 0
-        && modes::setid_open()
-        && matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2)
-    {
-        modes::wrote(a[0] as i32);
+    if r <= 0 || !modes::setid_open() {
+        return;
+    }
+    match nr {
+        n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2 | n::SENDFILE => {
+            modes::wrote(a[0] as i32)
+        }
+        n::COPY_FILE_RANGE | n::SPLICE => modes::wrote(a[2] as i32),
+        _ => {}
     }
 }
 

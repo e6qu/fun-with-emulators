@@ -761,7 +761,10 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `UF_NODUMP`; `stat` reports it. The guest's own no-dump flag
   (`chattr +d`) is recorded apart, in `org.fwe.nodump`, so the inode flags
   and `statx` report only it, and changing them keeps the mark. A write by a caller without
-  `CAP_FSETID` clears a file's set-ID bits, as on Linux. Attributes are read and
+  `CAP_FSETID` (through any descriptor of the file, a `truncate`,
+  `fallocate`, `copy_file_range`, `sendfile` or `splice` into it, or a
+  shared writable mapping of it, as it is made) clears a file's set-ID
+  bits, as on Linux. Attributes are read and
   written by path, from the directory where the path is too long. A
   regular file `open` makes has its mode itself on the host where only
   the owner's read or write bits are denied (a repository's read-only
