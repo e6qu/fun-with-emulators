@@ -1718,7 +1718,9 @@ fwe builds as Linux does in both backends:
   `AT_PLATFORM`, `AT_MINSIGSTKSZ` and `AT_HWCAP`/`AT_HWCAP2`;
 - `AT_HWCAP`/`AT_HWCAP2` come from macOS's `hw.optional.*` sysctls, only
   features a guest can use directly: SVE and SME (kernel-managed state),
-  `CPUID` (trapping ID-register reads) and, natively, PAC are left out;
+  `CPUID` (trapping ID-register reads) and, natively, PAC are left out.
+  The first fwe process after boot asks for them, one call each, and
+  keeps them in the process store every later one reads;
 - there is no vDSO (no `AT_SYSINFO_EHDR`): the C library makes real
   system calls for `clock_gettime` and `gettimeofday`.
 
