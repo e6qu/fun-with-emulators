@@ -2140,7 +2140,14 @@ pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
 /// the guest sees it (an overlay's topmost layer of it), with
 /// `fs.protected_symlinks` on: one in a sticky directory anyone may write
 /// to only if it is the caller's, or the directory's owner's (`EACCES`).
-fn may_follow(dir: i32, name: &std::ffi::CStr, parent: i32, fsuid: u32) -> Result<(), i32> {
+/// Linux asks this of a trailing link only, the last name of the path (or
+/// of a trailing link's target), not of one a walk passes through.
+pub(crate) fn may_follow(
+    dir: i32,
+    name: &std::ffi::CStr,
+    parent: i32,
+    fsuid: u32,
+) -> Result<(), i32> {
     // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
@@ -2690,7 +2697,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     let in_layer = o.dir.fds[layer].as_ref().expect("its layer");
                     // The link as its layer has it, in the directory as the
                     // topmost layer shows it.
-                    if crate::sysctl::protected_links().0 {
+                    if is_last && crate::sysctl::protected_links().0 {
                         let top = here.dir.as_raw_fd();
                         may_follow(in_layer.as_raw_fd(), &comp_c, top, access.fsuid)?;
                     }
@@ -2742,7 +2749,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 if symlinks > MAX_SYMLINKS {
                     return Err(errno::ELOOP);
                 }
-                if here.ovl.is_none() && crate::sysctl::protected_links().0 {
+                if is_last && here.ovl.is_none() && crate::sysctl::protected_links().0 {
                     let d = here.dir.as_raw_fd();
                     may_follow(d, &comp_c, d, access.fsuid)?;
                 }

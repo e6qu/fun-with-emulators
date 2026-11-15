@@ -1821,6 +1821,17 @@ impl<P: Platform> Kernel<P> {
         Ok(LinkKind::Symlink(target))
     }
 
+    /// Whether the caller may follow the symbolic link at `abs` as the
+    /// last name of a path, as the ordinary walk asks
+    /// (`fs.protected_symlinks`, `EACCES`).
+    pub(crate) fn may_follow_trailing(&self, abs: &[u8]) -> Result<(), i32> {
+        if !crate::sysctl::protected_links().0 {
+            return Ok(());
+        }
+        let (dir, name) = self.resolve_c(fcntl::AT_FDCWD as u64, abs, false)?;
+        crate::fs::may_follow(dir.as_raw_fd(), &name, dir.as_raw_fd(), self.creds.fsuid)
+    }
+
     pub(crate) fn sys_readlinkat(&self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
         // A buffer of no size, first (an `int` to Linux).
         if size as i32 <= 0 {
@@ -2285,10 +2296,14 @@ impl<P: Platform> Kernel<P> {
     /// `fs.protected_hardlinks` on: its owner (or `CAP_FOWNER`), or one who
     /// may read and write it, a regular file that is not set-user-ID or
     /// set-group-ID and executable by its group (`EPERM`).
-    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
     fn may_hardlink(&self, old: &crate::fs::Resolved) -> Result<(), i32> {
         let name = old.name_c()?;
-        let st = stat_at(old.dir.as_raw_fd(), &name)?;
+        self.may_hardlink_to(&stat_at(old.dir.as_raw_fd(), &name)?)
+    }
+
+    /// [`Self::may_hardlink`] for the file whose guest status is `st`.
+    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+    fn may_hardlink_to(&self, st: &libc::stat) -> Result<(), i32> {
         let c = &self.creds;
         if c.fsuid == st.st_uid || c.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid) {
             return Ok(());
@@ -2297,7 +2312,7 @@ impl<P: Platform> Kernel<P> {
         let safe = mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
             && mode & 0o4000 == 0
             && mode & 0o2010 != 0o2010;
-        if safe && self.permits(&st, 6) { Ok(()) } else { Err(errno::EPERM) }
+        if safe && self.permits(st, 6) { Ok(()) } else { Err(errno::EPERM) }
     }
 
     pub(crate) fn sys_renameat2(
@@ -3634,7 +3649,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH)`: give the file
-    /// open as `fd` the name `newpath`.
+    /// open as `fd` the name `newpath`, in the same mount (`EXDEV`) and as
+    /// `fs.protected_hardlinks` allows, as for a path.
     fn link_fd(&self, fd: i32, newdirfd: u64, newpath: &[u8]) -> i64 {
         if !self.creds.has(crate::caps::CAP_DAC_READ_SEARCH) {
             return err(errno::ENOENT);
@@ -3645,6 +3661,16 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        let old_mount = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
+        if old_mount != new.mount_id && old_mount != 0 && new.mount_id != 0 {
+            return err(errno::EXDEV);
+        }
+        if crate::sysctl::protected_links().1 {
+            let checked = stat_fd(fd).and_then(|st| self.may_hardlink_to(&st));
+            if let Err(e) = checked {
+                return err(e);
+            }
+        }
         if new.mount_root {
             return err(errno::EEXIST);
         }

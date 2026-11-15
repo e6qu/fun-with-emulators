@@ -16,7 +16,9 @@
 //!
 //! The path is walked here, one component at a time, each link read and
 //! its target walked in its place, and the place it leads to opened as
-//! `openat` would.
+//! `openat` would. The rules of every walk hold on the way: a trailing
+//! link as `fs.protected_symlinks` allows (`EACCES`), and no link on a
+//! `nosymfollow` mount (`ELOOP`).
 
 use crate::fsops::LinkKind;
 use crate::{Kernel, Platform, guest, uaccess};
@@ -169,11 +171,27 @@ impl<P: Platform> Kernel<P> {
                     if last && !follow_last {
                         at = next;
                     } else {
-                        match self.link_kind(&next) {
+                        let kind = self.link_kind(&next);
+                        if let Ok(k @ (LinkKind::Magic | LinkKind::Symlink(_))) = &kind {
+                            // As any walk: a trailing link in a sticky
+                            // directory as `fs.protected_symlinks` allows,
+                            // and none on a `nosymfollow` mount.
+                            if last
+                                && matches!(k, LinkKind::Symlink(_))
+                                && fs.synthetic(fcntl::AT_FDCWD as i32, &next).is_none()
+                            {
+                                self.may_follow_trailing(&next)?;
+                            }
+                            if resolve & RESOLVE_NO_SYMLINKS != 0
+                                || fs.mount_of(&next).0.flags & crate::mounts::ms::NOSYMFOLLOW != 0
+                            {
+                                return Err(errno::ELOOP);
+                            }
+                        }
+                        match kind {
                             Ok(LinkKind::Magic)
                                 if resolve
                                     & (RESOLVE_NO_MAGICLINKS
-                                        | RESOLVE_NO_SYMLINKS
                                         | RESOLVE_BENEATH
                                         | RESOLVE_IN_ROOT)
                                     != 0 =>
@@ -191,9 +209,7 @@ impl<P: Platform> Kernel<P> {
                                     .iter()
                                     .fold(next, |p, c| crate::mounts::join(&p, c)));
                             }
-                            Ok(LinkKind::Symlink(_)) if resolve & RESOLVE_NO_SYMLINKS != 0 => {
-                                return Err(errno::ELOOP);
-                            }
+
                             Ok(LinkKind::Symlink(target)) => {
                                 links += 1;
                                 if links > MAX_LINKS {
