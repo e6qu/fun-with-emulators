@@ -1642,6 +1642,157 @@ fn write_zeros(fd: i32, mut from: i64, to: i64) -> Result<(), i32> {
     Ok(())
 }
 
+/// A host network interface as Linux describes one: its name (the host's
+/// `lo0` is `lo`), index, `IFF_*` flags, MTU, hardware type (`ARPHRD_*`)
+/// and address, and its IP addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Interface {
+    pub name: Vec<u8>,
+    pub index: u32,
+    pub flags: u32,
+    pub mtu: u32,
+    pub hw_type: u16,
+    pub hw_addr: Vec<u8>,
+    pub addrs: Vec<IfAddr>,
+}
+
+/// An IP address of an interface: 4 bytes for IPv4, 16 for IPv6, its
+/// prefix length, and an IPv4 broadcast address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfAddr {
+    pub addr: Vec<u8>,
+    pub prefix: u8,
+    pub broadcast: Option<[u8; 4]>,
+}
+
+/// `ARPHRD_ETHER`, `ARPHRD_LOOPBACK` and `ARPHRD_NONE` (a tunnel or
+/// another kind Linux would name otherwise).
+#[cfg(target_os = "macos")]
+const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_LOOPBACK: u16 = 772;
+const ARPHRD_NONE: u16 = 0xfffe;
+
+/// `IFF_LOWER_UP`, Linux's alone: an interface whose carrier is up.
+const IFF_LOWER_UP: u32 = 0x1_0000;
+
+/// The prefix length of netmask `mask`.
+fn prefix_of(mask: &[u8]) -> u8 {
+    mask.iter().map(|b| b.count_ones() as u8).sum()
+}
+
+/// The host's network interfaces, in index order, as the guest sees the
+/// initial network namespace's (`getifaddrs`).
+pub fn interfaces() -> Vec<Interface> {
+    let mut out: Vec<Interface> = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills the list, freed below; each entry's
+    // pointers are valid until then, and an address is read as its own
+    // family's structure.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let i = &*at;
+            at = i.ifa_next;
+            let host_name = std::ffi::CStr::from_ptr(i.ifa_name);
+            let name = match host_name.to_bytes() {
+                b"lo0" => b"lo".to_vec(),
+                n => n.to_vec(),
+            };
+            let pos = match out.iter().position(|f| f.name == name) {
+                Some(p) => p,
+                None => {
+                    // Flags the two share by number; the carrier is up
+                    // while the interface runs.
+                    let mut flags = i.ifa_flags & 0xffff;
+                    if flags & libc::IFF_RUNNING as u32 != 0 {
+                        flags |= IFF_LOWER_UP;
+                    }
+                    let loopback = flags & libc::IFF_LOOPBACK as u32 != 0;
+                    out.push(Interface {
+                        name,
+                        index: libc::if_nametoindex(host_name.as_ptr()),
+                        flags,
+                        mtu: if loopback { 16384 } else { 1500 },
+                        hw_type: if loopback { ARPHRD_LOOPBACK } else { ARPHRD_NONE },
+                        hw_addr: vec![0; 6],
+                        addrs: Vec::new(),
+                    });
+                    out.len() - 1
+                }
+            };
+            if i.ifa_addr.is_null() {
+                continue;
+            }
+            let f = &mut out[pos];
+            let mask = |len: usize, off: usize| -> Vec<u8> {
+                if i.ifa_netmask.is_null() {
+                    return vec![0xff; len];
+                }
+                std::slice::from_raw_parts((i.ifa_netmask as *const u8).add(off), len).to_vec()
+            };
+            match i32::from((*i.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
+                    // The broadcast address (the destination address's
+                    // field, which the hosts name apart).
+                    #[cfg(target_os = "linux")]
+                    let other = i.ifa_ifu;
+                    #[cfg(not(target_os = "linux"))]
+                    let other = i.ifa_dstaddr;
+                    let broadcast = (f.flags & libc::IFF_BROADCAST as u32 != 0 && !other.is_null())
+                        .then(|| {
+                            (*(other as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes()
+                        });
+                    f.addrs.push(IfAddr {
+                        addr: sin.sin_addr.s_addr.to_ne_bytes().to_vec(),
+                        prefix: prefix_of(&mask(4, 4)),
+                        broadcast,
+                    });
+                }
+                libc::AF_INET6 => {
+                    let sin6 = &*(i.ifa_addr as *const libc::sockaddr_in6);
+                    let mut addr = sin6.sin6_addr.s6_addr;
+                    // The host keeps a link-local address's scope in its
+                    // third and fourth bytes, which Linux shows as zero.
+                    if addr[0] == 0xfe && addr[1] & 0xc0 == 0x80 {
+                        addr[2] = 0;
+                        addr[3] = 0;
+                    }
+                    f.addrs.push(IfAddr {
+                        addr: addr.to_vec(),
+                        prefix: prefix_of(&mask(16, 8)),
+                        broadcast: None,
+                    });
+                }
+                #[cfg(target_os = "macos")]
+                libc::AF_LINK => {
+                    let dl = &*(i.ifa_addr as *const libc::sockaddr_dl);
+                    if !i.ifa_data.is_null() {
+                        let data = &*(i.ifa_data as *const libc::if_data);
+                        f.mtu = data.ifi_mtu;
+                        // IFT_ETHER: an Ethernet (or Wi-Fi) interface.
+                        if data.ifi_type == 6 {
+                            f.hw_type = ARPHRD_ETHER;
+                        }
+                    }
+                    if f.hw_type == ARPHRD_ETHER && dl.sdl_alen == 6 {
+                        let base = dl.sdl_data.as_ptr() as *const u8;
+                        let mac = std::slice::from_raw_parts(base.add(dl.sdl_nlen as usize), 6);
+                        f.hw_addr = mac.to_vec();
+                    }
+                }
+                _ => {}
+            }
+        }
+        libc::freeifaddrs(list);
+    }
+    out.sort_by_key(|f| f.index);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

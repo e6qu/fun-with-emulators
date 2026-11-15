@@ -7,15 +7,17 @@
 //! the guest sends is answered at once: fwe writes each reply message to
 //! the other end, where the guest receives it, as the kernel queues
 //! replies on the socket. The namespace has one interface, `lo` (index
-//! 1), which `RTM_GETLINK` describes, `RTM_NEWLINK` brings up or down
-//! (with `CAP_NET_ADMIN`), and whose addresses `RTM_GETADDR` lists once it
-//! is up; any other request is answered with `EOPNOTSUPP`, as the kernel
-//! answers one it has no handler for.
+//! 1), which `RTM_GETLINK` describes (with the MTU `SIOCSIFMTU` gave it),
+//! `RTM_NEWLINK` brings up or down (with `CAP_NET_ADMIN`), and whose
+//! addresses `RTM_GETADDR` lists once it is up; any other request is
+//! answered with `EOPNOTSUPP`, as the kernel answers one it has no handler
+//! for.
 //!
 //! In the initial network namespace, whose interfaces are the host's, fwe
-//! describes the host's loopback as `lo`, always up, with its addresses:
-//! bringing it up changes nothing, taking it down is refused (`EPERM`).
-//! The host's other interfaces are not described. Such a socket also
+//! describes each of them ([`crate::host::interfaces`], the host's `lo0`
+//! as `lo`) with its addresses, as the interface requests (`SIOCGIFCONF`)
+//! do: bringing `lo` up changes nothing, and any other change is refused
+//! (`EPERM`). Such a socket also
 //! carries what the kernel itself sends it: a message queue's
 //! notification ([`crate::mqueue`]), for which [`bind_for_notify`] gives
 //! the socket a host address another process can send to.
@@ -47,6 +49,10 @@ const IFF_RUNNING: u32 = 0x40;
 const IFF_LOWER_UP: u32 = 0x10000;
 const ARPHRD_LOOPBACK: u16 = 772;
 
+use crate::host::{IfAddr, Interface};
+
+const ARPHRD_ETHER: u16 = 1;
+const IFA_BROADCAST: u16 = 4;
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
@@ -539,46 +545,104 @@ fn attrs(b: &[u8], fixed: usize) -> Vec<(u16, &[u8])> {
     out
 }
 
-/// The `lo` interface's `RTM_NEWLINK` body: up or not.
-fn link_body(up: bool) -> Vec<u8> {
-    let flags = IFF_LOOPBACK | if up { IFF_UP | IFF_RUNNING | IFF_LOWER_UP } else { 0 };
+/// The interfaces a socket of namespace `net` sees: in one of fwe's, `lo`
+/// alone, up or not as the namespace has it, with the MTU `SIOCSIFMTU`
+/// gave it; in the initial one, the host's, as `SIOCGIFCONF` and the
+/// other interface requests see them.
+fn interfaces(
+    net: &Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
+) -> Vec<Interface> {
+    let Some(net) = net else { return crate::host::interfaces() };
+    let n = net.get();
+    vec![lo(n.lo_up, n.lo_mtu)]
+}
+
+/// A namespace's `lo`: up or not, its MTU (0: Linux's 65536).
+fn lo(up: bool, mtu: u32) -> Interface {
+    let addrs = if up {
+        let mut one = vec![0u8; 16];
+        one[15] = 1;
+        vec![
+            IfAddr { addr: vec![127, 0, 0, 1], prefix: 8, broadcast: None },
+            IfAddr { addr: one, prefix: 128, broadcast: None },
+        ]
+    } else {
+        Vec::new()
+    };
+    Interface {
+        name: b"lo".to_vec(),
+        index: 1,
+        flags: IFF_LOOPBACK | if up { IFF_UP | IFF_RUNNING | IFF_LOWER_UP } else { 0 },
+        mtu: if mtu == 0 { 65536 } else { mtu },
+        hw_type: ARPHRD_LOOPBACK,
+        hw_addr: vec![0; 6],
+        addrs,
+    }
+}
+
+/// An interface's `RTM_NEWLINK` body.
+fn link_body(f: &Interface) -> Vec<u8> {
     let mut b = Vec::new();
     b.push(0); // family
     b.push(0);
-    b.extend_from_slice(&ARPHRD_LOOPBACK.to_ne_bytes());
-    b.extend_from_slice(&1i32.to_ne_bytes()); // index
-    b.extend_from_slice(&flags.to_ne_bytes());
+    b.extend_from_slice(&f.hw_type.to_ne_bytes());
+    b.extend_from_slice(&f.index.to_ne_bytes());
+    b.extend_from_slice(&f.flags.to_ne_bytes());
     b.extend_from_slice(&0u32.to_ne_bytes()); // change
-    attr(&mut b, IFLA_IFNAME, b"lo\0");
-    attr(&mut b, IFLA_MTU, &65536u32.to_ne_bytes());
+    let mut name = f.name.clone();
+    name.push(0);
+    attr(&mut b, IFLA_IFNAME, &name);
+    attr(&mut b, IFLA_MTU, &f.mtu.to_ne_bytes());
     attr(&mut b, IFLA_TXQLEN, &1000u32.to_ne_bytes());
-    // IF_OPER_UNKNOWN as Linux reports for an up loopback, else DOWN.
-    attr(&mut b, IFLA_OPERSTATE, &[if up { 0 } else { 2 }]);
-    attr(&mut b, IFLA_ADDRESS, &[0; 6]);
-    attr(&mut b, IFLA_BROADCAST, &[0; 6]);
+    // IF_OPER_UNKNOWN as Linux reports for an up loopback, UP for another
+    // running, else DOWN.
+    let state =
+        match (f.flags & IFF_UP != 0, f.flags & IFF_LOOPBACK != 0, f.flags & IFF_RUNNING != 0) {
+            (true, true, _) => 0,
+            (true, false, true) => 6,
+            _ => 2,
+        };
+    attr(&mut b, IFLA_OPERSTATE, &[state]);
+    attr(&mut b, IFLA_ADDRESS, &f.hw_addr);
+    let ether = f.hw_type == ARPHRD_ETHER;
+    attr(&mut b, IFLA_BROADCAST, &vec![if ether { 0xff } else { 0 }; f.hw_addr.len()]);
     b
 }
 
-/// The `RTM_NEWADDR` bodies of `lo`'s addresses of `family` (0 for
-/// both).
-fn addr_bodies(family: u8) -> Vec<Vec<u8>> {
+/// The `RTM_NEWADDR` bodies of interface `f`'s addresses of `family` (0
+/// for both): an `ifaddrmsg` (family, prefix, `IFA_F_PERMANENT`, scope,
+/// index), then the address, for IPv4 also the local address, any
+/// broadcast address and the interface's name.
+fn addr_bodies(f: &Interface, family: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    // AF_INET: 127.0.0.1/8, host scope.
-    if family == 0 || family == 2 {
-        let mut b = vec![2, 8, 0x80, 254];
-        b.extend_from_slice(&1u32.to_ne_bytes());
-        attr(&mut b, IFA_ADDRESS, &[127, 0, 0, 1]);
-        attr(&mut b, IFA_LOCAL, &[127, 0, 0, 1]);
-        attr(&mut b, IFA_LABEL, b"lo\0");
-        out.push(b);
-    }
-    // AF_INET6: ::1/128.
-    if family == 0 || family == 10 {
-        let mut b = vec![10, 128, 0x80, 254];
-        b.extend_from_slice(&1u32.to_ne_bytes());
-        let mut one = [0u8; 16];
-        one[15] = 1;
-        attr(&mut b, IFA_ADDRESS, &one);
+    for a in &f.addrs {
+        let v4 = a.addr.len() == 4;
+        let fam = if v4 { 2 } else { 10 };
+        if family != 0 && family != fam {
+            continue;
+        }
+        let loopback = if v4 { a.addr[0] == 127 } else { a.addr[..15].iter().all(|&b| b == 0) };
+        let link = !v4 && a.addr[0] == 0xfe && a.addr[1] & 0xc0 == 0x80;
+        // RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE.
+        let scope = if loopback {
+            254
+        } else if link {
+            253
+        } else {
+            0
+        };
+        let mut b = vec![fam, a.prefix, 0x80, scope];
+        b.extend_from_slice(&f.index.to_ne_bytes());
+        attr(&mut b, IFA_ADDRESS, &a.addr);
+        if v4 {
+            attr(&mut b, IFA_LOCAL, &a.addr);
+            if let Some(bc) = a.broadcast {
+                attr(&mut b, IFA_BROADCAST, &bc);
+            }
+            let mut name = f.name.clone();
+            name.push(0);
+            attr(&mut b, IFA_LABEL, &name);
+        }
         out.push(b);
     }
     out
@@ -623,26 +687,35 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             message(NLMSG_ERROR, flags, seq, port, &b)
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-        // The initial namespace's loopback is the host's, always up.
-        let up = net.as_ref().is_none_or(|n| n.get().lo_up);
+        let links = if matches!(ty, RTM_GETLINK | RTM_NEWLINK | RTM_GETADDR) {
+            interfaces(&net)
+        } else {
+            Vec::new()
+        };
+        let done = || message(NLMSG_DONE, NLM_F_MULTI, seq, port, &0i32.to_ne_bytes());
         let result: Result<Vec<Vec<u8>>, i32> = match ty {
-            RTM_GETLINK if flags & NLM_F_DUMP == NLM_F_DUMP => Ok(vec![
-                message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &link_body(up)),
-                message(NLMSG_DONE, NLM_F_MULTI, seq, port, &0i32.to_ne_bytes()),
-            ]),
-            RTM_GETLINK => {
-                if names_lo(body) {
-                    Ok(vec![message(RTM_NEWLINK, 0, seq, port, &link_body(up))])
-                } else {
-                    Err(errno::ENODEV)
-                }
+            RTM_GETLINK if dump => {
+                let mut out: Vec<Vec<u8>> = links
+                    .iter()
+                    .map(|f| message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &link_body(f)))
+                    .collect();
+                out.push(done());
+                Ok(out)
             }
+            RTM_GETLINK => match named(&links, body) {
+                Some(f) => Ok(vec![message(RTM_NEWLINK, 0, seq, port, &link_body(f))]),
+                None => Err(errno::ENODEV),
+            },
             RTM_NEWLINK if body.len() >= 16 => {
                 let change = u32::from_ne_bytes(body[12..16].try_into().unwrap());
                 let want = u32::from_ne_bytes(body[8..12].try_into().unwrap());
-                if !names_lo(body) {
+                let target = named(&links, body);
+                if target.is_none() {
                     Err(errno::ENODEV)
                 } else if !admin {
+                    Err(errno::EPERM)
+                } else if target.is_some_and(|f| f.flags & IFF_LOOPBACK == 0) {
+                    // The host's interfaces are not the guest's to change.
                     Err(errno::EPERM)
                 } else if change & IFF_UP != 0 || change == 0 {
                     match &net {
@@ -662,15 +735,12 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             }
             RTM_GETADDR => {
                 let family = body.first().copied().unwrap_or(0);
-                let mut out: Vec<Vec<u8>> = if up {
-                    addr_bodies(family)
-                        .iter()
-                        .map(|b| message(RTM_NEWADDR, NLM_F_MULTI, seq, port, b))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                out.push(message(NLMSG_DONE, NLM_F_MULTI, seq, port, &0i32.to_ne_bytes()));
+                let mut out: Vec<Vec<u8>> = links
+                    .iter()
+                    .flat_map(|f| addr_bodies(f, family))
+                    .map(|b| message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &b))
+                    .collect();
+                out.push(done());
                 Ok(out)
             }
             _ => Err(errno::EOPNOTSUPP),
@@ -696,18 +766,17 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
 
 /// Whether an `ifinfomsg` request body names `lo`: its index 1, or the
 /// name `lo` with no index.
-fn names_lo(body: &[u8]) -> bool {
+fn named<'a>(links: &'a [Interface], body: &[u8]) -> Option<&'a Interface> {
     if body.len() < 16 {
-        return false;
+        return None;
     }
-    let index = i32::from_ne_bytes(body[4..8].try_into().unwrap());
+    let index = u32::from_ne_bytes(body[4..8].try_into().unwrap());
     if index != 0 {
-        return index == 1;
+        return links.iter().find(|f| f.index == index);
     }
-    attrs(body, 16)
-        .iter()
-        .find(|(t, _)| *t == IFLA_IFNAME)
-        .is_some_and(|(_, v)| v.split(|&b| b == 0).next() == Some(&b"lo"[..]))
+    let name = attrs(body, 16).into_iter().find(|(t, _)| *t == IFLA_IFNAME)?.1;
+    let name = name.split(|&b| b == 0).next()?;
+    links.iter().find(|f| f.name == name)
 }
 
 #[cfg(test)]
@@ -716,22 +785,38 @@ mod tests {
 
     #[test]
     fn finds_lo_by_index_or_name() {
+        let links = [lo(true, 0)];
         let mut body = vec![0u8; 16];
         body[4..8].copy_from_slice(&1i32.to_ne_bytes());
-        assert!(names_lo(&body));
+        assert!(named(&links, &body).is_some());
         let mut body = vec![0u8; 16];
         attr(&mut body, IFLA_IFNAME, b"lo\0");
-        assert!(names_lo(&body));
+        assert!(named(&links, &body).is_some());
         let mut body = vec![0u8; 16];
         attr(&mut body, IFLA_IFNAME, b"eth0\0");
-        assert!(!names_lo(&body));
+        assert!(named(&links, &body).is_none());
     }
 
     #[test]
     fn link_message_parses_back() {
-        let b = link_body(true);
+        let b = link_body(&lo(true, 1280));
         let a = attrs(&b, 16);
         assert!(a.iter().any(|(t, v)| *t == IFLA_IFNAME && *v == b"lo\0"));
+        // The MTU `SIOCSIFMTU` set.
+        assert!(a.iter().any(|(t, v)| *t == IFLA_MTU && *v == 1280u32.to_ne_bytes()));
         assert_eq!(u32::from_ne_bytes(b[8..12].try_into().unwrap()) & IFF_UP, IFF_UP);
+    }
+
+    /// In the initial namespace, the links and addresses netlink lists are
+    /// the host's, as `SIOCGIFCONF` lists them.
+    #[test]
+    fn the_initial_namespace_lists_the_hosts_interfaces() {
+        let links = interfaces(&None);
+        let host = crate::host::interfaces();
+        assert_eq!(links, host);
+        assert!(links.iter().any(|f| f.name == b"lo" && f.flags & IFF_LOOPBACK != 0));
+        let v4: usize = links.iter().map(|f| addr_bodies(f, 2).len()).sum();
+        let want = host.iter().flat_map(|f| &f.addrs).filter(|a| a.addr.len() == 4).count();
+        assert_eq!(v4, want);
     }
 }

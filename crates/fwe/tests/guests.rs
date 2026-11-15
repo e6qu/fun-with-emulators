@@ -1120,6 +1120,18 @@ fn fast_open_connects_and_sends() {
     c_guest_prints("sockopts", &["fastopen"], "fast open: sent 5, read 5, again -1 errno 106\n");
 }
 
+/// Netlink (what `getifaddrs` reads) and `SIOCGIFCONF` list the same
+/// interfaces and addresses, the host's in the initial network namespace
+/// and `lo` in a new one, whose MTU netlink reports as `SIOCSIFMTU` set it.
+#[test]
+fn interface_views_agree() {
+    c_guest_prints(
+        "ifaces",
+        &[],
+        "initial namespace agrees: 1\nnew namespace agrees: 1, lo mtu 1280\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]

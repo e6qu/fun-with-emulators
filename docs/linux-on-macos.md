@@ -1226,9 +1226,12 @@ file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 datagram pair, so `recv`, `poll` and `epoll` are the host's; a request
 written to it is answered at once on the other end. In an fwe network
 namespace, `RTM_GETLINK`, `RTM_NEWLINK` (with `CAP_NET_ADMIN`) and
-`RTM_GETADDR` describe and change `lo`; in the initial namespace they
-describe the host's loopback as `lo`, always up (taking it down is
-`EPERM`), and no other interface. Such a socket also carries a POSIX
+`RTM_GETADDR` describe and change `lo` (its MTU as `SIOCSIFMTU` set it);
+in the initial namespace they describe the host's interfaces and
+addresses (from `getifaddrs`, `lo0` as `lo`), as `SIOCGIFCONF` and the
+other interface requests do, so `getifaddrs` in the guest lists them;
+bringing `lo` up changes nothing, and any other change is `EPERM`. Such
+a socket also carries a POSIX
 message queue's `SIGEV_THREAD` notification.
 
 **`sendmmsg`, `recvmmsg`**: fwe runs `sendmsg` or `recvmsg` for each
@@ -2636,7 +2639,7 @@ for each kind of descriptor:
 | readiness on an `O_ASYNC` descriptor: host `SIGIO` with no sender | the descriptor and its events found with `poll`; sent as the signal `F_SETSIG` chose, to the owner thread if one is set | that signal with `si_fd`, `si_band` and `POLL_IN`/`POLL_OUT`/`POLL_PRI`/`POLL_HUP` |
 | out-of-band data: `SIGURG` (16) | relayed | `SIGURG` (23) |
 | reading an unconnected Unix stream socket: `ENOTCONN` | Linux's answer | `EINVAL` |
-| an interface or route changes | netlink outside an fwe network namespace describes only the host's loopback | nothing |
+| an interface or route changes | netlink outside an fwe network namespace describes the host's interfaces as they are when asked; no change is announced (no `RTNLGRP` messages) | nothing |
 | the host's DNS settings | not read: the resolver reads the rootfs's `/etc/resolv.conf` and `/etc/hosts` | the rootfs's |
 
 ### Clocks and timers

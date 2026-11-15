@@ -3039,30 +3039,12 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
 /// address, its mask): `lo0` is Linux's `lo`.
 fn host_ipv4_addrs() -> Vec<(Vec<u8>, [u8; 4], [u8; 4])> {
     let mut out = Vec::new();
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills the list, freed below; each entry's
-    // pointers are valid until then.
-    unsafe {
-        if libc::getifaddrs(&mut list) != 0 {
-            return out;
+    for f in host::interfaces() {
+        for a in f.addrs.iter().filter(|a| a.addr.len() == 4) {
+            let mask = u32::MAX.checked_shl(32 - u32::from(a.prefix)).unwrap_or(0);
+            let addr = [a.addr[0], a.addr[1], a.addr[2], a.addr[3]];
+            out.push((f.name.clone(), addr, mask.to_be_bytes()));
         }
-        let mut at = list;
-        while !at.is_null() {
-            let i = &*at;
-            if !i.ifa_addr.is_null() && i32::from((*i.ifa_addr).sa_family) == libc::AF_INET {
-                let name = std::ffi::CStr::from_ptr(i.ifa_name).to_bytes();
-                let name = if name == b"lo0" { b"lo".to_vec() } else { name.to_vec() };
-                let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
-                let mask = if i.ifa_netmask.is_null() {
-                    [0; 4]
-                } else {
-                    (*(i.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes()
-                };
-                out.push((name, sin.sin_addr.s_addr.to_ne_bytes(), mask));
-            }
-            at = i.ifa_next;
-        }
-        libc::freeifaddrs(list);
     }
     out
 }
