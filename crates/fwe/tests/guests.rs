@@ -7424,3 +7424,51 @@ fn memory_limits_huge_pages_and_cgroup_files() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// An eventfd watched edge-triggered by `epoll` raises an edge on every
+/// write, whether or not its count was 0, as Linux's wakes its waiters on
+/// each.
+#[test]
+fn eventfd_edges_on_every_write() {
+    c_guest_prints(
+        "sockcases",
+        &["eventfd"],
+        "before: 0\nwrite 0: 1, then 0\nwrite 1: 1, then 0\nwrite 2: 1, then 0\n",
+    );
+}
+
+/// A Unix socket bound with its family alone takes an abstract name of
+/// five hexadecimal digits, as Linux's autobind gives it, and keeps it; one
+/// that passes credentials is given one when it sends or connects unbound,
+/// so its peer can tell who sent.
+#[test]
+fn unix_sockets_autobind_as_linux() {
+    c_guest_prints(
+        "sockcases",
+        &["autobind"],
+        "bind with the family alone: 0, autobound 1\nagain: 0, same name 1\n\
+         sent with credentials: 1 from autobound 1\nsent without: 1 from a name of 0 bytes\n\
+         connected with credentials: 0, autobound 1\n",
+    );
+}
+
+/// A Unix `SOCK_RAW` socket is made, as Linux makes it, a datagram one.
+#[test]
+fn unix_raw_sockets_are_datagram_sockets() {
+    c_guest_prints("sockcases", &["raw"], "raw: socket 1 type 2, pair 0, datagrams 2 3\n");
+}
+
+/// A netlink socket's own options are Linux's: those it lacks, or of
+/// another level, are `ENOPROTOOPT`; flags and groups are kept and read
+/// back; `NETLINK_CAP_ACK` caps an error's acknowledgement.
+#[test]
+fn netlink_options_are_linuxs() {
+    c_guest_prints(
+        "sockcases",
+        &["netlink"],
+        "rx ring: -1 errno 92\nlevel 0: -1 errno 92\next ack, short: -1 errno 22\n\
+         memberships before: 0, 0 bytes\next ack: 1 (4 bytes)\next ack off: 0\n\
+         group 37: -1 errno 22\ngroup 0: -1 errno 22\nmemberships: 8 bytes, 0x1 0x1\n\
+         after leaving 1: 0 0x1\nerror acknowledged in 52 bytes, capped 36\n",
+    );
+}

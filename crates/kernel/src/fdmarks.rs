@@ -111,6 +111,9 @@ pub enum Mark {
     /// `/proc/self/pagemap`: an entry per page of the process's memory
     /// ([`crate::procmem`]).
     Pagemap,
+    /// An ICMP datagram ("ping") socket whose host receives come with the
+    /// IP header, which Linux's do not ([`crate::net`]).
+    Ping,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +199,9 @@ fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
     // a VM fork or a re-execution ([`load`]).
     if rec.mark.is_some() {
         MARKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    if rec.mark == Some(Mark::Ping) {
+        PINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     if rec.net.is_some() {
         NETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -313,6 +319,16 @@ pub fn stand_in(fd: i32) -> Option<Vec<u8>> {
 /// How many marks were ever recorded, so that a call looks for one only
 /// once there have been any.
 static MARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many ping sockets were ever marked ([`Mark::Ping`]), so that a
+/// receive looks for one only once there have been any.
+static PINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether descriptor `fd` is a ping socket whose receives fwe strips of
+/// the IP header ([`Mark::Ping`]).
+pub fn is_ping(fd: i32) -> bool {
+    PINGS.load(std::sync::atomic::Ordering::SeqCst) > 0 && marked(fd) == Some(Mark::Ping)
+}
 
 /// Whether any descriptor was ever marked (so a write need not look).
 pub fn any_marks() -> bool {
@@ -593,6 +609,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::RemoteMem { .. }) => 22,
             Some(Mark::Comm { .. }) => 23,
             Some(Mark::UtsName { .. }) => 24,
+            Some(Mark::Ping) => 25,
         });
         if let Some(Mark::Comm { tid }) = rec.mark {
             e.i32(tid);
@@ -688,6 +705,7 @@ pub fn load(d: &mut Dec) {
             22 => Some(Mark::RemoteMem { id: d.i32() }),
             23 => Some(Mark::Comm { tid: d.i32() }),
             24 => Some(Mark::UtsName { domain: d.bool() }),
+            25 => Some(Mark::Ping),
             _ => None,
         };
         let net = crate::shared::load_opt(d).ok().flatten().map(Net);

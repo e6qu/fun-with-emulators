@@ -760,7 +760,7 @@ mod imp {
         }
         // SAFETY: the descriptor received.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        crate::seqpacket::adopt(fd);
+        crate::net::adopt(fd);
         i64::from(fd)
     }
 }

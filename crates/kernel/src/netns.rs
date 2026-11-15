@@ -289,6 +289,9 @@ fn host_key(fd: i32, a: &Inet) -> u8 {
 /// [`bind_prepare`] in the host's namespace.
 fn host_bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan>, i32> {
     let Some(a) = parse(hb) else { return Ok(None) };
+    if crate::fdmarks::is_ping(fd) {
+        return Ok(None);
+    }
     // SAFETY: plain host call.
     let root = unsafe { libc::geteuid() } == 0;
     if a.port == 0 || a.port >= HOST_LOW || !a.loopback || a.any || !may_low || root {
@@ -322,6 +325,12 @@ pub fn bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan
     let Some(a) = parse(hb) else { return Ok(None) };
     if !(a.loopback || a.any) || a.loopback && !net.get().lo_up {
         return Err(errno::EADDRNOTAVAIL);
+    }
+    // A ping socket's "port" is its ICMP identifier: no port of the
+    // namespace's.
+    if crate::fdmarks::is_ping(fd) {
+        set_loopback(hb, a.v6);
+        return Ok(None);
     }
     let proto = proto(fd);
     if a.port != 0 {
@@ -469,6 +478,7 @@ fn make_sink(v6: bool) -> Result<u16, i32> {
 pub fn used(fd: i32) {
     let Some(net) = current() else { return };
     if proto(fd) != UDP
+        || crate::fdmarks::is_ping(fd)
         || matches!(crate::fdmarks::marked(fd), Some(crate::fdmarks::Mark::NetBound { .. }))
     {
         return;

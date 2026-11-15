@@ -22,7 +22,15 @@
 //!
 //! `AF_UNIX` paths are rooted under the rootfs; abstract-namespace names (a
 //! leading NUL) are mapped to files under a per-host temporary directory, since
-//! macOS has no abstract namespace.
+//! macOS has no abstract namespace. A Unix socket bound with its family
+//! alone, or passing credentials and connecting or sending unbound, is
+//! given an abstract name as Linux's autobind gives one; a Unix `SOCK_RAW`
+//! socket is a datagram one, as Linux makes it.
+//!
+//! A ping socket (ICMP datagrams) receives on macOS with the IP header
+//! first, which Linux's does not give: fwe marks one as it is made
+//! ([`crate::fdmarks::Mark::Ping`]) and strips the header from what it
+//! receives.
 //!
 //! The calls that can block — `connect`, `accept`, `recvfrom`, `recvmsg`,
 //! `sendto`, `sendmsg` — run outside the kernel lock via `blocking_syscall`.
@@ -724,6 +732,11 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
         Err(e) => return e,
     };
     let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    // A Unix `SOCK_RAW` socket is a datagram one, as Linux's `unix_create`
+    // makes it.
+    if dom == libc::AF_UNIX && base == SOCK_RAW as i32 {
+        base = libc::SOCK_DGRAM;
+    }
     // macOS has no SOCK_SEQPACKET Unix sockets: a stream socket with its
     // messages framed (see `seqpacket`).
     let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
@@ -740,9 +753,94 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     if seqpacket {
         crate::seqpacket::make(fd);
     }
+    #[cfg(target_os = "macos")]
+    if dom == libc::AF_INET && base == libc::SOCK_DGRAM && protocol == 1 {
+        crate::fdmarks::mark(fd, crate::fdmarks::Mark::Ping);
+    }
     crate::netns::made(fd);
     fresh(fd);
     fd as i64
+}
+
+/// A descriptor received from another process (`SCM_RIGHTS`,
+/// `pidfd_getfd`): a socket standing in for a kind the host lacks is
+/// marked as one here too.
+pub fn adopt(fd: i32) {
+    // A SOCK_SEQPACKET socket of fwe's.
+    crate::seqpacket::adopt(fd);
+    // A ping socket, whose receives come with the IP header on macOS.
+    #[cfg(target_os = "macos")]
+    if kind(fd) == Some((libc::AF_INET, libc::SOCK_DGRAM))
+        && crate::host::socket_protocol(fd) == Some(1)
+    {
+        crate::fdmarks::mark(fd, crate::fdmarks::Mark::Ping);
+    }
+}
+
+/// The length of the IP header ICMP datagram `d` received on a macOS ping
+/// socket starts with (0 if it has none: an IPv4 header's version and
+/// length, in its first byte, say).
+fn ip_header_len(d: &[u8]) -> usize {
+    match d.first() {
+        Some(&b) if b >> 4 == 4 && usize::from(b & 0xf) * 4 >= 20 => {
+            (usize::from(b & 0xf) * 4).min(d.len())
+        }
+        _ => 0,
+    }
+}
+
+/// A receive on ping socket `fd` into the host message `hmsg` (the host
+/// flags `hflags`), as Linux delivers it: the ICMP message, without the IP
+/// header macOS puts before it, cut to the buffers (`MSG_TRUNC` set when
+/// it is), its whole length returned when the guest asked with `MSG_TRUNC`
+/// (`whole`). Received whole into a buffer of fwe's, then copied to the
+/// message's buffers (translated guest buffers: a fault there is `EFAULT`).
+///
+/// # Safety
+/// `hmsg`'s name and control buffers must be valid for writing, and its
+/// `msg_iov` must point to `msg_iovlen` iovecs.
+unsafe fn ping_recvmsg(fd: i32, hmsg: &mut libc::msghdr, hflags: i32, whole: bool) -> i64 {
+    // The largest IP datagram.
+    let mut d = vec![0u8; 65536];
+    let mut iov = libc::iovec { iov_base: d.as_mut_ptr().cast(), iov_len: d.len() };
+    let (to, count) = (hmsg.msg_iov, hmsg.msg_iovlen);
+    hmsg.msg_iov = &mut iov;
+    hmsg.msg_iovlen = 1;
+    // SAFETY: the caller's guarantee for name and control; a local buffer.
+    let n = unsafe { libc::recvmsg(fd, hmsg, hflags & !libc::MSG_TRUNC) };
+    hmsg.msg_iov = to;
+    hmsg.msg_iovlen = count;
+    if n < 0 {
+        return last_error();
+    }
+    let got = &d[..n as usize];
+    let icmp = &got[ip_header_len(got)..];
+    #[allow(clippy::unnecessary_cast)] // `msg_iovlen` is an `int` on macOS
+    // SAFETY: the caller's guarantee: `count` iovecs at `to`.
+    let bufs = unsafe { std::slice::from_raw_parts(to, count as usize) };
+    let mut done = 0;
+    for b in bufs {
+        let k = b.iov_len.min(icmp.len() - done);
+        if let Err(e) = uaccess::write_host(b.iov_base as u64, &icmp[done..done + k]) {
+            return err(e);
+        }
+        done += k;
+    }
+    if done < icmp.len() {
+        hmsg.msg_flags |= libc::MSG_TRUNC;
+    }
+    if whole { icmp.len() as i64 } else { done as i64 }
+}
+
+/// `read` or `readv` of ping socket `fd` ([`crate::fdmarks::is_ping`])
+/// into translated guest buffers `iov` ([`ping_recvmsg`]).
+pub fn ping_read(fd: i32, iov: &[libc::iovec]) -> i64 {
+    // SAFETY: an all-zero `msghdr` is valid: no name, no control.
+    let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
+    m.msg_iov = iov.as_ptr().cast_mut();
+    m.msg_iovlen = iov.len() as _;
+    // SAFETY: no name or control; the iovecs given.
+    unsafe { ping_recvmsg(fd, &mut m, 0, false) }
 }
 
 /// `socketpair(domain, type, protocol, sv)`.
@@ -759,6 +857,11 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
         return err(errno::EOPNOTSUPP);
     }
     let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    // A Unix `SOCK_RAW` socket is a datagram one, as Linux's `unix_create`
+    // makes it.
+    if dom == libc::AF_UNIX && base == SOCK_RAW as i32 {
+        base = libc::SOCK_DGRAM;
+    }
     // macOS has no SOCK_SEQPACKET Unix sockets: a stream pair with its
     // messages framed (see `seqpacket`).
     let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
@@ -805,6 +908,74 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
         Ok(s) => s,
         Err(e) => return e,
     };
+    // A Unix socket given its family alone takes a name of the kernel's
+    // choosing, as Linux's `unix_bind` has it.
+    if src.len() == 2 && src[..2] == (AF_UNIX as u16).to_ne_bytes() && is_unix(fd as i32) {
+        return autobind(fd as i32);
+    }
+    bind_name(fd, src, may_low, umask)
+}
+
+/// Unix socket `fd` bound, unless it is bound already, to an abstract name
+/// of five hexadecimal digits, as Linux's `unix_autobind` names one: from a
+/// random start, the next free one; `ENOSPC` when none is.
+fn autobind(fd: i32) -> i64 {
+    if unix_bound(fd) {
+        return 0;
+    }
+    let mut start = [0u8; 4];
+    crate::host::fill_random(&mut start);
+    let mut n = u32::from_ne_bytes(start) & 0xfffff;
+    for _ in 0..=0xfffff {
+        let mut src = (AF_UNIX as u16).to_ne_bytes().to_vec();
+        src.push(0);
+        src.extend_from_slice(autobind_name(n).as_bytes());
+        let r = bind_name(fd as u64, src, false, 0);
+        if r != err(errno::EADDRINUSE) {
+            return r;
+        }
+        n = (n + 1) & 0xfffff;
+    }
+    err(errno::ENOSPC)
+}
+
+/// The abstract name (after its leading NUL) [`autobind`] gives for `n`.
+fn autobind_name(n: u32) -> String {
+    format!("{n:05x}")
+}
+
+/// Whether Unix socket `fd` has a name.
+fn unix_bound(fd: i32) -> bool {
+    let mut hb = empty_sockaddr();
+    let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    let r = unsafe { libc::getsockname(fd, hb.as_mut_ptr().cast(), &mut hl) };
+    r == 0 && hl as usize > 2 && hb[2] != 0
+}
+
+/// A Unix socket that passes credentials (`SO_PASSCRED`) and has no name
+/// is given one before it connects, or before a datagram one sends
+/// (`datagram`), as Linux's `unix_stream_connect`, `unix_dgram_connect`
+/// and `unix_dgram_sendmsg` give it, so that its peer can tell who sent.
+fn autobind_to_pass_creds(fd: i32, datagram: bool) -> Result<(), i64> {
+    if kept_value(fd, SO_PASSCRED) == 0 {
+        return Ok(());
+    }
+    let unix = match kind(fd) {
+        Some((libc::AF_UNIX, ty)) => !datagram || ty == libc::SOCK_DGRAM,
+        _ => false,
+    };
+    if !unix || crate::netlink::is(fd) {
+        return Ok(());
+    }
+    match autobind(fd) {
+        r if r < 0 => Err(r),
+        _ => Ok(()),
+    }
+}
+
+/// [`bind`] of socket `fd` to Linux socket address `src`.
+fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     let mut hb = empty_sockaddr();
     let a = match bytes_to_host(&src, &mut hb, false) {
         Ok(a) => a,
@@ -812,8 +983,10 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     };
     // A port below `net.ipv4.ip_unprivileged_port_start` is the
     // privileged's (the host lets anyone have one on the wildcard address;
-    // on a loopback one, `netns` maps it).
+    // on a loopback one, `netns` maps it); a ping socket's is its ICMP
+    // identifier, anyone's.
     if !may_low
+        && !crate::fdmarks::is_ping(fd as i32)
         && matches!(family(&hb), libc::AF_INET | libc::AF_INET6)
         && (1..crate::sysctl::unprivileged_port_start())
             .contains(&u16::from_be_bytes([hb[2], hb[3]]))
@@ -963,6 +1136,9 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
+    if let Err(e) = autobind_to_pass_creds(fd as i32, false) {
+        return e;
+    }
     if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
         return err(e);
     }
@@ -1161,6 +1337,9 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
             return err(errno::EINVAL);
         }
         guest!(uaccess::read_bytes(addr, l as usize));
+    }
+    if let Err(e) = autobind_to_pass_creds(fd as i32, true) {
+        return e;
     }
     // TCP fast open: connected first, then sent to the peer.
     if let Err(e) = fastopen(fd as i32, flags, addr, addrlen) {
@@ -1604,6 +1783,25 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
         return crate::seqpacket::recv(fd as i32, &[v], (std::ptr::null_mut(), 0), flags, hflags)
             .result;
     }
+    if crate::fdmarks::is_ping(fd as i32) {
+        let mut v = [guest!(uaccess::host_buffer(buf, len, true))];
+        let mut hb = empty_sockaddr();
+        // SAFETY: an all-zero `msghdr` is valid: no name, no control.
+        let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
+        m.msg_iov = v.as_mut_ptr();
+        m.msg_iovlen = 1;
+        if addr != 0 {
+            m.msg_name = hb.as_mut_ptr().cast();
+            m.msg_namelen = SOCKADDR_MAX as libc::socklen_t;
+        }
+        // SAFETY: a local name buffer and the translated guest buffer.
+        let r = unsafe { ping_recvmsg(fd as i32, &mut m, hflags, flags & MSG_TRUNC != 0) };
+        if r >= 0 && addr != 0 && addrlen != 0 {
+            crate::netns::to_guest(fd as i32, &mut hb, false);
+            guest!(name_to_guest(&hb, m.msg_namelen, addr, addrlen));
+        }
+        return r;
+    }
     let whole = match datagram_whole(fd as i32, flags) {
         Ok(w) => w,
         Err(e) => return e,
@@ -1633,6 +1831,14 @@ fn datagram_whole(fd: i32, flags: u64) -> Result<Option<usize>, i64> {
     Ok(crate::netlink::next_len(fd))
 }
 
+/// Whether host address `hb` of `len` bytes, a received datagram's
+/// sender's, is a Unix socket with no name, which Linux reports as no
+/// address at all (a length of 0), not as the family alone.
+fn unnamed_unix(hb: &[u8; SOCKADDR_MAX], len: libc::socklen_t) -> bool {
+    let len = (len as usize).min(SOCKADDR_MAX);
+    family(hb) == libc::AF_UNIX && hb[2..len.max(2)].first().is_none_or(|&b| b == 0)
+}
+
 /// [`recvfrom`] of a host socket: the bytes, the sender's address
 /// translated back.
 fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u64) -> i64 {
@@ -1655,7 +1861,11 @@ fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u
         }
         crate::netns::to_guest(fd as i32, &mut hb, false);
         if addrlen != 0 {
-            guest!(name_to_guest(&hb, hl, addr, addrlen));
+            if unnamed_unix(&hb, hl) {
+                guest!(uaccess::write(addrlen, 0u32));
+            } else {
+                guest!(name_to_guest(&hb, hl, addr, addrlen));
+            }
         }
         r as i64
     } else {
@@ -2428,6 +2638,9 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         }
         return crate::netlink::send(fd as i32, &data);
     }
+    if let Err(e) = autobind_to_pass_creds(fd as i32, true) {
+        return e;
+    }
     // TCP fast open: connected first, then sent to the peer.
     let (name, namelen) = match fastopen(fd as i32, flags, name, namelen as u64) {
         Ok(true) => (0, 0),
@@ -2689,10 +2902,11 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_cap,
         msg_flags: 0,
     };
+    let ping = crate::fdmarks::is_ping(fd as i32);
     // A netlink message's whole length, asked for with MSG_TRUNC.
     let nl_whole = if crate::netlink::is(fd as i32) {
         (flags & MSG_TRUNC != 0).then(|| crate::netlink::next_len(fd as i32)).flatten()
-    } else if crate::seqpacket::is(fd as i32) {
+    } else if crate::seqpacket::is(fd as i32) || ping {
         None
     } else {
         match datagram_whole(fd as i32, flags) {
@@ -2715,6 +2929,15 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         hmsg.msg_controllen = got.controllen as _;
         hmsg.msg_flags = got.flags;
         got.result as isize
+    } else if ping {
+        // SAFETY: `hmsg` references guest iov and local name/control buffers.
+        let r = unsafe {
+            ping_recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags), flags & MSG_TRUNC != 0)
+        };
+        if r < 0 {
+            return r;
+        }
+        r as isize
     } else {
         // SAFETY: `hmsg` references guest iov and local name/control buffers.
         let r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
@@ -2732,6 +2955,8 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         };
         guest!(uaccess::write_from(name, &b[..(namelen as usize).min(12)]));
         guest!(uaccess::write(msg + 8, 12u32));
+    } else if want_name && unnamed_unix(&hb, hmsg.msg_namelen) {
+        guest!(uaccess::write(msg + 8, 0u32));
     } else if want_name {
         crate::netns::to_guest(fd as i32, &mut hb, false);
         let full = guest!(to_guest(&hb, hmsg.msg_namelen, name, namelen));
@@ -3678,6 +3903,108 @@ mod protocol_tests {
         assert_eq!(r, err(errno::EAGAIN));
         // SAFETY: the sockets made above.
         unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
+    }
+
+    /// The IP header before a received ICMP message is measured by its
+    /// first byte; a message with none (an ICMP type) has none measured.
+    #[test]
+    fn ip_header_is_measured() {
+        assert_eq!(ip_header_len(&[0x45; 28]), 20);
+        assert_eq!(ip_header_len(&[0x46; 28]), 24);
+        assert_eq!(ip_header_len(&[0, 0, 0, 0]), 0);
+        assert_eq!(ip_header_len(&[8, 0, 0, 0]), 0);
+        assert_eq!(ip_header_len(&[]), 0);
+    }
+
+    /// A ping socket's datagram is delivered as Linux delivers it, the
+    /// ICMP message alone (a datagram socket marked as one stands in for
+    /// macOS's, which gives the IP header first), cut to the buffer with
+    /// `MSG_TRUNC` giving its whole length.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ping_replies_come_without_the_ip_header() {
+        let mut sv = [0i32; 2];
+        // SAFETY: a valid array.
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(r, 0);
+        crate::fdmarks::mark(sv[1], crate::fdmarks::Mark::Ping);
+        assert!(crate::fdmarks::is_ping(sv[1]));
+        let mut d = vec![0x45u8; 20];
+        d.extend_from_slice(&[0, 0, 0xab, 0xcd, 0x12, 0x34, 0, 1, b'h', b'i']);
+        for _ in 0..3 {
+            // SAFETY: a local buffer of its length.
+            assert_eq!(unsafe { libc::send(sv[0], d.as_ptr().cast(), d.len(), 0) }, 30);
+        }
+        let mut b = [0u8; 64];
+        // SAFETY: a valid buffer of its length.
+        let r = unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 64, 0, 0, 0) };
+        assert_eq!(r, 10);
+        assert_eq!(&b[..10], &d[20..]);
+        // SAFETY: as above.
+        let r = unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 4, MSG_TRUNC, 0, 0) };
+        assert_eq!((r, &b[..4]), (10, &d[20..24]));
+        let iov = [libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: 64 }];
+        assert_eq!(ping_read(sv[1], &iov), 10);
+        crate::fdmarks::closed(sv[1]);
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
+    }
+
+    /// A Unix `SOCK_RAW` socket is a datagram one, as Linux makes it.
+    #[test]
+    fn unix_raw_is_a_datagram_socket() {
+        // SAFETY: no pointers.
+        let fd = unsafe { socket(AF_UNIX, SOCK_RAW, 0) };
+        assert!(fd >= 0, "{fd}");
+        let mut ty = -1i32;
+        let mut len = 4u32;
+        // SAFETY: a 4-byte option buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                fd as u64,
+                SOL_SOCKET,
+                3,
+                &mut ty as *mut i32 as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        assert_eq!((r, ty), (0, SOCK_DGRAM as i32));
+        // SAFETY: the socket made here.
+        unsafe { libc::close(fd as i32) };
+    }
+
+    /// A Unix socket bound with its family alone is named as Linux's
+    /// autobind names one, and binding it so again changes nothing.
+    #[test]
+    fn unix_autobind_names_five_hex_digits() {
+        // SAFETY: no pointers.
+        let fd = unsafe { socket(AF_UNIX, SOCK_DGRAM, 0) };
+        let fam = (AF_UNIX as u16).to_ne_bytes();
+        // SAFETY: a 2-byte address.
+        assert_eq!(unsafe { bind(fd as u64, fam.as_ptr() as u64, 2, false, 0) }, 0);
+        let name = |fd: i64| {
+            let mut b = [0u8; 110];
+            let mut len = b.len() as u32;
+            // SAFETY: a buffer and its length.
+            let r = unsafe {
+                getname(fd as u64, b.as_mut_ptr() as u64, &mut len as *mut u32 as u64, false)
+            };
+            assert_eq!(r, 0);
+            b[..len as usize].to_vec()
+        };
+        let first = name(fd);
+        assert_eq!(first.len(), 8, "{first:?}");
+        assert_eq!(&first[..3], &[fam[0], fam[1], 0]);
+        assert!(
+            first[3..].iter().all(u8::is_ascii_hexdigit)
+                && first[3..] == *first[3..].to_ascii_lowercase()
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { bind(fd as u64, fam.as_ptr() as u64, 2, false, 0) }, 0);
+        assert_eq!(name(fd), first);
+        assert_eq!(autobind_name(0xabc), "00abc");
+        // SAFETY: the socket made here.
+        unsafe { libc::close(fd as i32) };
     }
 }
 

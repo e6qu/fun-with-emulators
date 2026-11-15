@@ -2067,6 +2067,13 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // A ping socket's datagram, without the IP header macOS gives.
+            if fdmarks::is_ping(fd) {
+                return Some(match uaccess::host_buffer(buf, len, true) {
+                    Ok(v) => net::ping_read(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
         }
@@ -2144,6 +2151,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),
+            Ok(iov) if fdmarks::is_ping(a[0] as i32) => net::ping_read(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, false),
             Ok(iov) => {
                 // SAFETY: the iovecs are translated host buffers; the host

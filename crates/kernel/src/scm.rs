@@ -500,8 +500,8 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         close_all(fds.drain(kept..));
         for &fd in &fds {
             crate::net::fresh(fd);
-            // A SOCK_SEQPACKET socket of fwe's is one here too.
-            crate::seqpacket::adopt(fd);
+            // A SOCK_SEQPACKET or ping socket of fwe's is one here too.
+            crate::net::adopt(fd);
         }
         return Incoming { fds, creds: None, dropped };
     };
@@ -520,9 +520,9 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
     close_all(fds.drain(kept..));
     for (i, &fd) in fds.iter().enumerate() {
         crate::net::fresh(fd);
-        // A socket of a namespace may be a SOCK_SEQPACKET one too.
+        // A socket of a namespace may be a SOCK_SEQPACKET or ping one too.
         if !taken[i] || crate::netns::of(fd).is_some() {
-            crate::seqpacket::adopt(fd);
+            crate::net::adopt(fd);
         }
     }
     Incoming { fds, creds: m.creds, dropped }

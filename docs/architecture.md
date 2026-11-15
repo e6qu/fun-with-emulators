@@ -1018,7 +1018,10 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   process-global registry that `read`, `write` and `close` consult first.
   An eventfd's counter is a file of fwe's, mapped, with a lock word, so a
   fork child and its parent, or a process it is passed to, share one
-  counter, as on Linux.
+  counter, as on Linux. The counter counts its writes too: an
+  edge-triggered set sees the eventfd readable anew on each, as Linux
+  wakes its waiters on each, though the pipe holds its one byte
+  throughout.
 - **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
   fwe process maps counts, for each pipe a set watches exclusively, its
   writes and the writes a waiter took. A set a write woke reports it only
@@ -1139,7 +1142,9 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   unreachable while the message is on its way.
 - Netlink (`crates/kernel/src/netlink.rs`): the guest's descriptor is one
   end of a host datagram pair; fwe writes each reply to the other.
-  `RTM_NEWLINK` needs `CAP_NET_ADMIN`.
+  `RTM_NEWLINK` needs `CAP_NET_ADMIN`. A socket's `SOL_NETLINK` options
+  and the groups it joins are kept with it, and travel with it across
+  `fork`, `execve` and `SCM_RIGHTS`.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
   rootfs (`fwe --pull` writes the host's name servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
