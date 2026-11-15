@@ -156,9 +156,10 @@ natively wherever fwe can make them fit the Mac.
   must match.
   - **Programs that compute** (the Lua script, the Python script, xz):
     the budget applies to fwe's share, from CPU sampling (DTrace) in the
-    same run: all samples ÷ samples in the program's own files, time in
-    the macOS kernel counted as the program's own and anything unplaced
-    counted as fwe's. Their time against Homebrew's builds stays in the
+    same run: all samples ÷ samples in the program's own code. fwe's are
+    those in fwe, the macOS libraries it calls, its stubs (which carry a
+    memory tag of fwe's) and anything unplaced; the macOS kernel's time
+    counts as the program's. Their time against Homebrew's builds stays in the
     table as information, since it also measures the builds' differences
     (compiler, C library).
   - **Everything else** keeps its budget against native macOS on the same

@@ -5,6 +5,15 @@
 use crate::rewrite::{self, BRANCH_RANGE, STUB_WORDS, Site};
 use fwe_kernel::host::reserve_fixed;
 
+/// What stands for a file in the `mmap` of a stub region: on macOS, the
+/// memory tag fwe's stubs carry (an application-specific one), so a memory
+/// map (`vmmap`'s "Memory Tag 241") tells them from the program's own code;
+/// the benchmarks count a program's time in them as fwe's.
+#[cfg(target_os = "macos")]
+const STUB_TAG: i32 = 241 << 24;
+#[cfg(not(target_os = "macos"))]
+const STUB_TAG: i32 = -1;
+
 /// Statistics of one preparation.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Prepared {
@@ -391,14 +400,22 @@ unsafe fn redirect(
             .map_err(|last_error| NoStubSpace { near: first, last_error })?,
     };
 
-    // SAFETY: the region was just reserved by us.
-    unsafe {
-        libc::mprotect(
+    // SAFETY: replacing the region just reserved by us with fresh writable
+    // memory, carrying fwe's tag.
+    let p = unsafe {
+        libc::mmap(
             region as *mut libc::c_void,
             size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            STUB_TAG,
+            0,
         )
     };
+    if p == libc::MAP_FAILED {
+        let last_error = std::io::Error::last_os_error().to_string();
+        return Err(NoStubSpace { near: first, last_error });
+    }
     let mut cursor = region;
     for &(offset, site) in group {
         let at = base + offset;

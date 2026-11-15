@@ -149,7 +149,7 @@ BUDGETS = {
 
 # How much longer than its own code fwe may make a program that computes
 # take: its share ([`pcs`]), all of a run's samples over those in the
-# program's own files. Its time against macOS's stays in the table, but
+# program's own code. Its time against macOS's stays in the table, but
 # that also measures the builds' differences (Alpine's compiler and C
 # library against Homebrew's), not only fwe.
 SHARE = "fwe's share"
@@ -513,20 +513,20 @@ def build(a, fwe, results):
         (),
         len(guest_env) + 1,
         profiled=True,
-        own=root,
+        share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     shutil.rmtree(native, ignore_errors=True)
 
 
-def workload(results, name, ours, theirs, fresh, at, profiled=False, own=None):
+def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):
     """Time workload `name`: command `ours` under fwe and `theirs` natively,
     in turns, three rounds, the best of each kept. Each round starts with
     the directories `fresh` empty. Both must succeed and print the same.
     Then `ours` once more, traced (fwe's options go in at `at`, after fwe
     itself), its system calls counted in the log: where fwe's time goes;
     and, `profiled` (a program in one process), once more sampled, its
-    share of fwe's kept with `own` its root ([`pcs`])."""
+    share of fwe's kept with `share` ([`pcs`])."""
     times = {"fwe": [], "macOS": []}
     outs = {}
     for _ in range(3):
@@ -561,7 +561,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, own=None):
     print(f"{name}: {sum(calls.values())} system calls under fwe: {top}", file=sys.stderr)
     results.setdefault(BACKEND, {})[name] = backends(ours, fresh)
     if profiled:
-        mine = profile(name, ours, theirs, fresh, own)
+        mine = profile(name, ours, theirs, fresh, share)
         if mine:
             results.setdefault(SHARE, {})[name] = mine[1] / max(mine[0], 1)
 
@@ -601,7 +601,7 @@ def git_commands(ours, theirs, fresh, root):
               file=sys.stderr)
 
 
-def pcs(name, cmd, own=None):
+def pcs(name, cmd, share=False):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
     there (as `vmmap` lists it in the first process while it runs) and the
@@ -609,13 +609,14 @@ def pcs(name, cmd, own=None):
     records leaves it short of. And the time the processes spend in each
     host system call.
 
-    With `own`, the root the program's files are in, it returns the
-    samples in the program's own code and all of them: a sample is the
-    program's in a file under `own`, or in the kernel (the host's work for
-    its system calls and faults, as Linux's would be); anything else (fwe,
-    its stubs, the host's libraries fwe calls, code mapped after `vmmap`
-    looked) is fwe's. `cmd` is then one process: a forked one's mappings
-    are not the first's."""
+    With `share`, it returns the samples in the program's own code and all
+    of them. A sample is fwe's in fwe itself, the host's libraries fwe
+    calls, fwe's stubs (the regions they carry its memory tag in,
+    "Memory Tag 241") and anything `vmmap` did not see mapped; it is the
+    program's anywhere else: its images and libraries, mapped or loaded
+    into memory, the code it makes, and the kernel (the host's work for its
+    system calls and faults, as Linux's would be). `cmd` is then one
+    process: a forked one's mappings are not the first's."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
@@ -701,13 +702,17 @@ def pcs(name, cmd, own=None):
         for lo, _, what, line in regions:
             if not what and w == f"anonymous {lo:#x}":
                 print(f"{name}: {w}: {line}", file=sys.stderr)
-    if own is None:
+    if not share:
         return None
-    roots = tuple({os.path.join(own, ""), os.path.join(os.path.realpath(own), "")})
+
+    def fwes(what, line):
+        return (line.startswith("Memory Tag 241")
+                or what.startswith(("/usr/lib/", "/System/"))
+                or os.path.basename(what) == "fwe")
 
     def owns(pc):
-        return pc == 0 or any(lo <= pc < hi and what.startswith(roots)
-                              for lo, hi, what, _ in regions)
+        return pc == 0 or any(lo <= pc < hi and not fwes(what, line)
+                              for lo, hi, what, line in regions)
 
     mine = sum(n for pc, n in counts if owns(pc))
     kernel = sum(n for pc, n in counts if pc == 0)
@@ -776,7 +781,7 @@ def rusage(name, side, cmd, fresh):
     print(f"{name} {side}: " + "; ".join(lines), file=sys.stderr)
 
 
-def profile(name, cmd, theirs, fresh, own=None):
+def profile(name, cmd, theirs, fresh, share=False):
     """[`sampled`] of `cmd` (one fwe process, after `env -i`), then a run
     with fwe's timing marks: start-up, and the code pages it wrote as they
     first ran; and what it and `theirs` cost the host ([`rusage`]).
@@ -794,7 +799,7 @@ def profile(name, cmd, theirs, fresh, own=None):
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
-    mine = pcs(name, cmd, own)
+    mine = pcs(name, cmd, share)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
@@ -842,7 +847,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
         (),
         at,
         profiled=True,
-        own=root,
+        share=True,
     )
     workload(
         results,
@@ -908,8 +913,10 @@ def workloads(a, fwe, guest_env, lua_src, results):
     # And xz alone, on the data that left (its code named by its library's
     # offsets, not its shell's): its two runs, each one process, are the
     # workload's share of fwe's.
-    mine = [pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"), root),
-            pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", "/tmp/w/data.xz"), root)]
+    # (Decompressing ten times over: once is over before `vmmap` looks.)
+    mine = [pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"), True),
+            pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", *["/tmp/w/data.xz"] * 10),
+                True)]
     if all(mine):
         results.setdefault(SHARE, {})["xz (s)"] = (
             sum(m[1] for m in mine) / max(sum(m[0] for m in mine), 1))

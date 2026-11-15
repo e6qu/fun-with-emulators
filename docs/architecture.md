@@ -202,9 +202,10 @@ The pieces:
   own (`casp`, writeback onto `sp`, `sp` written from `x18`).
 - `crates/native/src/prepare.rs` groups sites so one stub region reaches
   each group (at most a quarter of the branch range apart), takes the
-  region from the loader's arena or reserves one near the code, writes the
-  stubs, points each site at its stub and invalidates the instruction
-  cache. Placement keeps stub regions reachable:
+  region from the loader's arena or reserves one near the code, maps it
+  with fwe's memory tag (241, "Memory Tag 241" in `vmmap`, which the
+  benchmarks count as fwe's), writes the stubs, points each site at its
+  stub and invalidates the instruction cache. Placement keeps stub regions reachable:
   - a mapping the guest leaves to the host is asked for at 2 TiB, above
     the program, its break and fwe's own memory, so mappings fill upwards
     with free space past the latest (in the gaps below, a library's code
