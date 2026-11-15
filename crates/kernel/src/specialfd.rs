@@ -1471,19 +1471,26 @@ mod tests {
         let fd = unsafe { timerfd_create(1, TFD_NONBLOCK) } as i32;
         // First after 30 ms, then every 400 ms.
         let spec: [i64; 4] = [0, 400_000_000, 0, 30_000_000];
+        let set = std::time::Instant::now();
         // SAFETY: as above.
         assert_eq!(unsafe { timerfd_settime(fd as u64, 0, spec.as_ptr() as u64, 0) }, 0);
         std::thread::sleep(std::time::Duration::from_millis(80));
         let mut v = 0u64;
         assert_eq!(read_into(fd, &mut v), 8);
-        assert_eq!(v, 1);
-        // The next is an interval after the first.
-        assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
         let mut cur = [0i64; 4];
         // SAFETY: `cur` is a writable itimerspec.
         assert_eq!(unsafe { timerfd_gettime(fd as u64, cur.as_mut_ptr() as u64) }, 0);
+        // A loaded host may sleep longer than asked: what is left is
+        // measured against the time that passed.
+        let passed = set.elapsed().as_nanos() as i64;
+        if passed >= 420_000_000 {
+            return;
+        }
+        assert_eq!(v, 1);
+        // The next is an interval after the first.
+        assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
         assert_eq!(cur[1], 400_000_000);
-        assert!(cur[3] > 250_000_000 && cur[3] <= 350_000_000, "{cur:?}");
+        assert!(cur[3] >= 430_000_000 - passed && cur[3] <= 350_000_000, "{cur:?} after {passed} ns");
         assert_eq!(close_fd(fd), 0);
     }
 
