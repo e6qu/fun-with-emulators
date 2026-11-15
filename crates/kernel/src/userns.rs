@@ -328,6 +328,17 @@ pub fn write_map(
     if map.is_empty() || map.len() > MAX_EXTENTS {
         return Err(errno::EINVAL);
     }
+    // Each extent's ids must be the parent namespace's, all within one
+    // extent of its map (Linux's `map_id_range_down` of the parent's map,
+    // for every writer): the initial namespace has them all.
+    if let Some((dir, _)) = &ns.get().parent {
+        let parent = joined(dir).ok_or(errno::EPERM)?;
+        let p = parent.get();
+        let pmap = if gid { &p.gid_map } else { &p.uid_map };
+        if !map.iter().all(|&(_, o, c)| within_one(pmap, o, c)) {
+            return Err(errno::EPERM);
+        }
+    }
     ns.update(|n| {
         let current = if gid { &n.gid_map } else { &n.uid_map };
         if !current.is_empty() {
@@ -345,6 +356,16 @@ pub fn write_map(
             n.uid_map = map;
         }
         Ok(())
+    })
+}
+
+/// Whether ids `first` to `first + count - 1` of a namespace are all inside
+/// one extent of its `map`.
+fn within_one(map: &[Extent], first: u32, count: u32) -> bool {
+    let (first, count) = (u64::from(first), u64::from(count));
+    map.iter().any(|&(i, _, c)| {
+        let (i, c) = (u64::from(i), u64::from(c));
+        first >= i && first + count <= i + c
     })
 }
 
@@ -437,6 +458,41 @@ mod tests {
         assert_eq!(up(&map, 65536), Some(165535));
         assert_eq!(up(&map, 65537), None);
         assert_eq!(show_map(&map[..1]), b"         0       1000          1\n");
+    }
+
+    /// A map written to a namespace inside another names only ids its
+    /// parent has, each extent within one of the parent's (`EPERM`), even
+    /// for a privileged writer; inside the initial namespace, any.
+    #[test]
+    fn a_map_is_checked_against_the_parents() {
+        let parent = Record::fresh(
+            "user",
+            UserNs {
+                owner: 1000,
+                uid_map: vec![(0, 1000, 1), (1, 100000, 10)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let child = || {
+            let parent = Some((parent.dir().to_vec(), 0));
+            Record::fresh("user", UserNs { parent, owner: 1000, ..Default::default() }).unwrap()
+        };
+        // Within one of the parent's extents, or several each within one.
+        assert_eq!(write_map(&child(), false, b"0 0 1\n", true, 0), Ok(()));
+        assert_eq!(write_map(&child(), false, b"0 1 10\n", true, 0), Ok(()));
+        assert_eq!(write_map(&child(), false, b"0 0 1\n1 1 10\n", true, 0), Ok(()));
+        // Across two extents, past the end, or an id the parent lacks.
+        assert_eq!(write_map(&child(), false, b"0 0 2\n", true, 0), Err(errno::EPERM));
+        assert_eq!(write_map(&child(), false, b"0 5 10\n", true, 0), Err(errno::EPERM));
+        assert_eq!(write_map(&child(), false, b"0 1000 1\n", true, 0), Err(errno::EPERM));
+        // The parent has no gid map yet: no group of it can be named.
+        assert_eq!(write_map(&child(), true, b"0 0 1\n", true, 0), Err(errno::EPERM));
+        // Unprivileged, its own id unmapped in the parent's terms: refused.
+        assert_eq!(write_map(&child(), false, b"0 65534 1\n", false, 65534), Err(errno::EPERM));
+        // Inside the initial namespace: any ids.
+        let top = Record::fresh("user", UserNs { owner: 0, ..Default::default() }).unwrap();
+        assert_eq!(write_map(&top, false, b"0 100000 65536\n", true, 0), Ok(()));
     }
 
     #[test]

@@ -15,8 +15,10 @@
 //!   signal again every second, as Linux does, and at the hard limit ends
 //!   the process with `SIGKILL` ([`cpu_signal`]);
 //! - `RLIMIT_NPROC`, which fwe enforces at `fork` by the user's fwe
-//!   processes, so a privileged guest may raise it as Linux lets it (the
-//!   host's, which only the host's root may raise, applies as well).
+//!   processes, and at the `execve` after a `set*uid` made the process a
+//!   user already past it ([`exec_allowed`]), so a privileged guest may
+//!   raise it as Linux lets it (the host's, which only the host's root may
+//!   raise, applies as well).
 //!
 //! Each starts at Linux's default (the core, stack and process limits at
 //! the host's, as the user set them) and is set as Linux sets one: the soft
@@ -104,6 +106,45 @@ pub fn kept(res: u64) -> bool {
 /// Limit `res` (soft, hard).
 pub fn get(res: u64) -> (u64, u64) {
     with(|l| l[res as usize])
+}
+
+/// Linux's `PF_NPROC_EXCEEDED`: a `set*uid` made the process a user's
+/// that had more tasks than `RLIMIT_NPROC` allows. The call itself does
+/// not fail (programs seldom check it); the next `execve` does, while the
+/// user still has too many.
+static NPROC_EXCEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A `set*uid` changed the process's real user to `uid` (an initial
+/// namespace id): flag it if that user, its tasks counted without this
+/// process's, has more than `RLIMIT_NPROC` (root never), as Linux's
+/// `flag_nproc_exceeded`.
+pub fn real_user_changed(uid: u32) {
+    NPROC_EXCEEDED.store(uid != 0 && over_nproc(uid), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether user `uid` has more tasks than the process's `RLIMIT_NPROC`.
+fn over_nproc(uid: u32) -> bool {
+    let (nproc, _) = get(r::RLIMIT_NPROC);
+    nproc != r::RLIM_INFINITY && exceeds(crate::cgroupfs::user_tasks(uid), nproc)
+}
+
+/// Whether `tasks` is past limit `nproc`: more than it, as Linux's
+/// `is_rlimit_overlimit` compares (at `fork` the new task is counted
+/// first, so there as many as the limit is already too many).
+fn exceeds(tasks: u64, nproc: u64) -> bool {
+    nproc != r::RLIM_INFINITY && tasks > nproc
+}
+
+/// At `execve`, by a process of real user `uid` (its tasks now counted):
+/// `EAGAIN` if a `set*uid` flagged it and the user still has too many
+/// tasks; else the flag goes, as Linux's `do_execveat_common` checks it.
+pub fn exec_allowed(uid: u32) -> Result<(), i32> {
+    use std::sync::atomic::Ordering::SeqCst;
+    if NPROC_EXCEEDED.load(SeqCst) && over_nproc(uid) {
+        return Err(errno::EAGAIN);
+    }
+    NPROC_EXCEEDED.store(false, SeqCst);
+    Ok(())
 }
 
 /// Set limit `res` to (`soft`, `hard`), as Linux does: `EINVAL` for a soft
@@ -204,6 +245,16 @@ pub fn load(d: &mut Dec) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user is past `RLIMIT_NPROC` with more tasks than it, never under
+    /// no limit; with the flag clear, an `execve` goes ahead.
+    #[test]
+    fn nproc_counts_past_the_limit() {
+        assert!(!exceeds(1, 1) && exceeds(2, 1) && exceeds(1, 0));
+        assert!(!exceeds(u64::MAX - 1, r::RLIM_INFINITY));
+        real_user_changed(0);
+        assert_eq!(exec_allowed(0), Ok(()));
+    }
 
     #[test]
     fn limits_are_set_as_linux_sets_them() {

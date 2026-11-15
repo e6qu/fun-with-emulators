@@ -822,13 +822,17 @@ impl<P: Platform> Kernel<P> {
             return err(errno::ESRCH);
         }
         let me = thread::tgid() as i64;
-        // Another thread's id names its process, as on Linux.
+        // Another thread's id names its process, as on Linux (whose `kill`
+        // finds the task and signals its thread group): this one's, or
+        // another process's.
         let pid = if pid > 0 && thread::host_thread(pid).is_some() { me } else { pid as i64 };
+        let thread_owner =
+            || if crate::pidns::nested() { None } else { thread::owner_of_tid(pid as i32) };
         // The host process (or group) `pid` names in the guest's pid
-        // namespace.
+        // namespace (a thread's number in one of fwe's names its process).
         let target = match pid {
             0 | -1 => pid,
-            p if p > 0 => match crate::pidns::to_host(p as i32) {
+            p if p > 0 => match thread_owner().or_else(|| crate::pidns::to_host(p as i32)) {
                 Some(h) => h as i64,
                 None => return err(errno::ESRCH),
             },
@@ -1031,7 +1035,10 @@ impl<P: Platform> Kernel<P> {
         }
         match sig {
             0 => 0,
-            signal::SIGKILL => host::kill_process(owner, libc::SIGKILL),
+            signal::SIGKILL => {
+                crate::signote::note(owner, libc::SIGKILL);
+                host::kill_process(owner, libc::SIGKILL)
+            }
             _ => match crate::signote::queue_thread(owner, tid, sig, signal::SI_TKILL, 0) {
                 Ok(()) => host::kill_process(owner, host::WAKE_SIGNAL),
                 Err(e) => err(e),

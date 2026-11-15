@@ -1080,6 +1080,7 @@ pub mod futex {
     pub const FUTEX_WAKE: u64 = 1;
     pub const FUTEX_REQUEUE: u64 = 3;
     pub const FUTEX_CMP_REQUEUE: u64 = 4;
+    pub const FUTEX_WAKE_OP: u64 = 5;
     pub const FUTEX_WAIT_BITSET: u64 = 9;
     pub const FUTEX_WAKE_BITSET: u64 = 10;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
@@ -1092,6 +1093,22 @@ pub mod futex {
     pub const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
     /// The most entries of a robust list released as a thread ends.
     pub const ROBUST_LIST_LIMIT: usize = 2048;
+    /// `FUTEX_WAKE_OP`'s encoded operation: the operation (bits 28-30,
+    /// with `FUTEX_OP_OPARG_SHIFT` at bit 31 making its argument a shift),
+    /// the comparison (bits 24-27), and the operation's and comparison's
+    /// 12-bit signed arguments (bits 12-23, 0-11).
+    pub const FUTEX_OP_SET: u32 = 0;
+    pub const FUTEX_OP_ADD: u32 = 1;
+    pub const FUTEX_OP_OR: u32 = 2;
+    pub const FUTEX_OP_ANDN: u32 = 3;
+    pub const FUTEX_OP_XOR: u32 = 4;
+    pub const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+    pub const FUTEX_OP_CMP_EQ: u32 = 0;
+    pub const FUTEX_OP_CMP_NE: u32 = 1;
+    pub const FUTEX_OP_CMP_LT: u32 = 2;
+    pub const FUTEX_OP_CMP_LE: u32 = 3;
+    pub const FUTEX_OP_CMP_GT: u32 = 4;
+    pub const FUTEX_OP_CMP_GE: u32 = 5;
 }
 
 /// `wait4`/`waitid` options (`linux/wait.h`).

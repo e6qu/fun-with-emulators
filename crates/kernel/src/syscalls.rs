@@ -430,6 +430,17 @@ impl<P: Platform> Kernel<P> {
             nr::TIMER_GETTIME => self.sys_timer_gettime(a[0], a[1]),
             nr::TIMER_GETOVERRUN => self.sys_timer_getoverrun(a[0]),
             nr::TIMER_DELETE => self.sys_timer_delete(a[0]),
+            // An alarm clock's timer (one that would wake a suspended
+            // system) needs `CAP_WAKE_ALARM`, once the clock and flags are
+            // known good, as Linux checks it.
+            nr::TIMERFD_CREATE
+                if matches!(a[0], clock::CLOCK_REALTIME_ALARM | clock::CLOCK_BOOTTIME_ALARM)
+                    && a[1] & !(fwe_abi::timerfd::TFD_NONBLOCK | fwe_abi::timerfd::TFD_CLOEXEC)
+                        == 0
+                    && !self.creds.has(crate::caps::CAP_WAKE_ALARM) =>
+            {
+                err(errno::EPERM)
+            }
             // SAFETY: timerfd_create takes no pointers.
             nr::TIMERFD_CREATE => unsafe { crate::specialfd::timerfd_create(a[0], a[1]) },
             // SAFETY: the itimerspec pointers are validated by the host/impl.
@@ -667,23 +678,26 @@ impl<P: Platform> Kernel<P> {
             // namespace's maps (see `userns`).
             nr::SETUID => match uid_in(a[0], false) {
                 Ok(u) => {
+                    let old = self.creds.uid;
                     let r = self.creds.setuid(u);
-                    self.ids_changed(r)
+                    self.uids_changed(old, r)
                 }
                 Err(e) => err(e),
             },
             nr::SETREUID => match (uid_in(a[0], false), uid_in(a[1], false)) {
                 (Ok(r), Ok(e)) => {
+                    let old = self.creds.uid;
                     let r = self.creds.setreuid(r, e);
-                    self.ids_changed(r)
+                    self.uids_changed(old, r)
                 }
                 (Err(x), _) | (_, Err(x)) => err(x),
             },
             nr::SETRESUID => {
                 match (uid_in(a[0], false), uid_in(a[1], false), uid_in(a[2], false)) {
                     (Ok(r), Ok(e), Ok(s)) => {
+                        let old = self.creds.uid;
                         let r = self.creds.setresuid(r, e, s);
-                        self.ids_changed(r)
+                        self.uids_changed(old, r)
                     }
                     (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
                 }
@@ -808,6 +822,11 @@ impl<P: Platform> Kernel<P> {
             },
             nr::PIDFD_OPEN => self.sys_pidfd_open(a[0], a[1]),
             nr::PIDFD_SEND_SIGNAL => self.sys_pidfd_send_signal(a[0], a[1], a[2], a[3]),
+            nr::PROCESS_MRELEASE => crate::pidfd::process_mrelease(a[0], a[1]),
+            // A call fwe interrupts is restarted (or not) as the signal is
+            // delivered, never left for this: there is nothing to restart,
+            // as on Linux after a handler ran (`do_no_restart_syscall`).
+            nr::RESTART_SYSCALL => err(errno::EINTR),
             // The backends finish it without the lock (it waits for the
             // target); the same, reached here.
             nr::PIDFD_GETFD => crate::pidfd::getfd(self.getfd_request(a[0], a[1], a[2])),
@@ -2250,6 +2269,17 @@ impl<P: Platform> Kernel<P> {
 
     /// A call that may have changed the caller's ids returned `r`: other
     /// processes see the ids it now has ([`crate::procreg::ProcRecord::ids`]).
+    /// [`Kernel::ids_changed`] after a `set*uid` (result `r`) of a process
+    /// whose real user was `old`: a new real user past `RLIMIT_NPROC`
+    /// fails the next `execve` ([`crate::rlimits::real_user_changed`]),
+    /// counted before this process is that user's.
+    fn uids_changed(&self, old: u32, r: i64) -> i64 {
+        if r >= 0 && self.creds.uid != old {
+            crate::rlimits::real_user_changed(self.creds.uid);
+        }
+        self.ids_changed(r)
+    }
+
     pub(crate) fn ids_changed(&self, r: i64) -> i64 {
         if r >= 0 {
             let c = &self.creds;
@@ -4079,6 +4109,26 @@ mod tests {
         assert_eq!(new.creds.resuid(), (1000, 0, 0));
     }
 
+    /// An alarm clock's timerfd needs `CAP_WAKE_ALARM`, once its flags are
+    /// known good.
+    #[test]
+    fn alarm_timerfds_need_cap_wake_alarm() {
+        use fwe_abi::clock::{CLOCK_BOOTTIME_ALARM, CLOCK_REALTIME_ALARM};
+        let mut k = kernel();
+        // (Elsewhere the host's own timerfd needs the host's capability.)
+        #[cfg(target_os = "macos")]
+        {
+            let fd = k.syscall(nr::TIMERFD_CREATE, [CLOCK_REALTIME_ALARM, 0, 0, 0, 0, 0]);
+            assert!(fd >= 0, "{fd}");
+            assert_eq!(k.syscall(nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
+        for clock in [CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM] {
+            assert_eq!(k.syscall(nr::TIMERFD_CREATE, [clock, 0, 0, 0, 0, 0]), err(errno::EPERM));
+            assert_eq!(k.syscall(nr::TIMERFD_CREATE, [clock, 1, 0, 0, 0, 0]), err(errno::EINVAL));
+        }
+    }
+
     #[test]
     fn unknown_syscalls_fail_with_enosys() {
         assert_eq!(kernel().syscall(4000, [0; 6]), err(errno::ENOSYS));
@@ -4653,11 +4703,18 @@ mod tests {
     fn no_guest_pid_signals_the_hosts_processes() {
         let _held = crate::thread::signals_held();
         let mut k = kernel();
-        let info = [0u8; 128];
+        // `SI_QUEUE`: a code a process may send (with the kernel's own,
+        // `SI_USER`, Linux refuses any but the caller itself first).
+        let mut info = [0u8; 128];
+        info[8..12].copy_from_slice(&(-1i32).to_ne_bytes());
         for pid in [-1i64, 0, -5] {
             let r = k.syscall(nr::RT_SIGQUEUEINFO, [pid as u64, 10, info.as_ptr() as u64, 0, 0, 0]);
             assert_eq!(r, err(errno::ESRCH), "rt_sigqueueinfo to {pid}");
         }
+        let kernel_code = [0u8; 128];
+        let r = k
+            .syscall(nr::RT_SIGQUEUEINFO, [-1i64 as u64, 10, kernel_code.as_ptr() as u64, 0, 0, 0]);
+        assert_eq!(r, err(errno::EPERM));
         assert_eq!(host::kill(-1, libc::SIGUSR1), err(errno::ESRCH));
         for pid in [-1, 0, -5] {
             assert_eq!(host::kill_process(pid, libc::SIGUSR1), err(errno::ESRCH));
@@ -4918,8 +4975,15 @@ mod tests {
                 crate::pidfd::wait_target(fd as i32),
                 Ok((std::process::id() as i32, false))
             );
+            // This process is not on its way out; flags are refused first.
+            assert_eq!(call(nr::PROCESS_MRELEASE, [fd as u64, 0, 0, 0]), err(errno::EINVAL));
+            assert_eq!(call(nr::PROCESS_MRELEASE, [fd as u64, 1, 0, 0]), err(errno::EINVAL));
             assert_eq!(call(nr::CLOSE, [fd as u64, 0, 0, 0]), 0);
         }
+        assert_eq!(call(nr::PROCESS_MRELEASE, [0, 1, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call(nr::PROCESS_MRELEASE, [0, 0, 0, 0]), err(errno::EBADF));
+        // Nothing is ever left to restart.
+        assert_eq!(call(nr::RESTART_SYSCALL, [0, 0, 0, 0]), err(errno::EINTR));
         let _ = PIDFD_NONBLOCK;
     }
 

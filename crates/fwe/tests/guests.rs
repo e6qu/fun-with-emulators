@@ -7472,3 +7472,38 @@ fn netlink_options_are_linuxs() {
          after leaving 1: 0 0x1\nerror acknowledged in 52 bytes, capped 36\n",
     );
 }
+
+/// Calls Linux always has, and the signals and limits around processes:
+/// `FUTEX_WAKE_OP` (private and shared), `restart_syscall` with nothing to
+/// restart (`EINTR`), `process_mrelease` of a process only on its way out;
+/// `kill` and `rt_sigqueueinfo` of another process's thread id reach its
+/// process, `rt_tgsigqueueinfo` the thread itself; a `uid_map` names only
+/// ids the parent namespace has; a `setuid` to a user past
+/// `RLIMIT_NPROC` fails the next `execve`; an alarm clock's timerfd needs
+/// `CAP_WAKE_ALARM`.
+#[test]
+fn signals_limits_and_always_there_calls() {
+    let out = run_c_guest("sigcalls", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "wake_op woken: 1\n\
+         wake_op not met: 0, word 7\n\
+         unknown operation: -38, unaligned: -22\n\
+         shared wake_op woken: 1, child 0\n\
+         restart_syscall: -4\n\
+         process_mrelease alive: -22, flags: -22, not a pidfd: -9\n\
+         killed: 0, reaped: -3\n\
+         kill of the thread's id: 0\n  taken: 10 1 0 0\n\
+         rt_sigqueueinfo of the thread's id: 0\n  taken: 12 1 -1 42\n\
+         rt_tgsigqueueinfo to the thread: 0\n  taken: 12 1 -1 43\n\
+         to a thread not the process's: -3\n\
+         as the kernel: -1\n\
+         uid_map inside the initial namespace: 0\n\
+         uid_map of an id the parent lacks: -1, past its extent: -1, its own: 0\n\
+         with another: setuid: 0, execve: -11\n\
+         alone: setuid: 0, execve: -2\n\
+         alarm timerfd as root: 1\n\
+         as a user: -1 -1, bad flags: -22\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

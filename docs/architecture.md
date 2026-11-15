@@ -457,7 +457,8 @@ and replace processes, and the per-process state it keeps:
   [Descriptors](#descriptors)). Past the CPU soft limit the host's
   `SIGXCPU` comes each second, and past the hard one fwe ends the process
   with `SIGKILL`; `RLIMIT_NPROC` is checked at `fork` and thread creation against the
-  tasks (threads) of the user's fwe processes.
+  tasks (threads) of the user's fwe processes, and at the `execve` after a
+  `set*uid` made the process a user already past it.
 - **Core dumps** (`crates/kernel/src/coredump.rs`): a signal whose default
   dumps core leaves an ELF core (the thread's registers, the process, and
   the mappings Linux's default `coredump_filter` dumps, less memory given
@@ -501,7 +502,9 @@ host; fwe adds Linux's thread identity and futexes:
 - Futexes (`crates/kernel/src/futex.rs`) wait outside the kernel lock. A
   wake takes waiters oldest first and marks each woken, so it reports
   exactly how many it woke. `FUTEX_WAIT_BITSET`/`WAKE_BITSET` match by
-  bits; `FUTEX_CMP_REQUEUE` moves waiters. `futex_waitv` waits on up to
+  bits; `FUTEX_CMP_REQUEUE` moves waiters; `FUTEX_WAKE_OP` changes its
+  second word with a compare-and-swap loop and wakes that word's waiters
+  too when the old value meets its comparison. `futex_waitv` waits on up to
   128 at once, private ones in the process's queues and shared ones in the
   shared table, and returns the index of the one woken.
 - A shared futex's waiters are in a slot table every fwe process maps
@@ -1316,7 +1319,10 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   the audit records of logged seccomp actions) and `membarrier` check their arguments
   and permissions as Linux does (`crates/kernel/src/calls.rs`);
   `rt_sigqueueinfo` and `rt_tgsigqueueinfo` send with the caller's
-  `siginfo`.
+  `siginfo` (to another process's other thread through that process's
+  mailbox); `restart_syscall` has nothing to restart (`EINTR`);
+  `process_mrelease` answers for a process on its way out, whose memory
+  the host frees itself.
 - `acct` (`crates/kernel/src/acct.rs`): the accounting file's host path is
   kept in a file of fwe's for the pid namespace, and each ending process
   appends its `struct acct_v3` to the nearest namespace's with accounting

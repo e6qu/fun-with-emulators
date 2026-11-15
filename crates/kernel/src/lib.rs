@@ -803,6 +803,9 @@ impl<P: Platform> Kernel<P> {
         path: Vec<u8>,
         args: Vec<Vec<u8>>,
     ) -> Result<(Vec<u8>, Vec<Vec<u8>>), i32> {
+        // A `set*uid` past `RLIMIT_NPROC` fails here, before the program
+        // is looked at, as Linux's `execve` fails it.
+        crate::rlimits::exec_allowed(self.creds.uid)?;
         let (mut path, mut args) = (path, args);
         EXEC_FILE.with(|f| f.borrow_mut().take());
         for _ in 0..5 {
@@ -1023,7 +1026,8 @@ impl<P: Platform> Kernel<P> {
     /// guest gets `EINTR` once the handler returns.
     pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.tracer.syscall(nr, args, result);
-        if result == fwe_abi::err(fwe_abi::errno::EINTR) {
+        // (`restart_syscall`'s own `EINTR` is its answer, not a host's.)
+        if result == fwe_abi::err(fwe_abi::errno::EINTR) && nr != fwe_abi::nr::RESTART_SYSCALL {
             signal::drain_to_signalfd();
             let rerun = match self.next_handler() {
                 None => true,

@@ -118,6 +118,19 @@ pub fn unnote(target: i32, sig: libc::c_int) {
     }
 }
 
+/// Whether an fwe process sent host process `target` a `SIGKILL`: a note
+/// of one is there, recent (it is never taken: the signal ends the
+/// process before a handler could).
+pub fn kill_noted(target: i32) -> bool {
+    let Some(mb) = crate::procstore::mailbox(target, false) else { return false };
+    let Some(slots) = slots(mb, libc::SIGKILL) else { return false };
+    let now = now_ns();
+    slots.chunks(SLOT).any(|s| {
+        let pid = s[0].load(SeqCst) & 0xffff_ffff;
+        pid != 0 && pid != BUSY && now.saturating_sub(s[2].load(SeqCst)) < FRESH_NS
+    })
+}
+
 /// This process is about to send host signal `sig` to host process
 /// `target`: leave a note of itself there.
 pub fn note(target: i32, sig: libc::c_int) {
@@ -237,6 +250,18 @@ pub fn queue_from(
 /// [`queue`] for thread `tid` of host process `target`.
 pub fn queue_thread(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
     put(target, tid, sig, code, value)
+}
+
+/// [`queue_thread`] with the sender the signal names, as [`queue_from`].
+pub fn queue_thread_from(
+    target: i32,
+    tid: i32,
+    sig: u64,
+    code: i32,
+    value: u64,
+    (pid, uid): (i32, u32),
+) -> Result<(), i32> {
+    put_from(target, tid, sig, code, value, (pid as u32, uid))
 }
 
 /// What a queue entry holds in place of a signal for a request of a

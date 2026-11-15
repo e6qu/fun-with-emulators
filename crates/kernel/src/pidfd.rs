@@ -290,6 +290,33 @@ pub fn wait_target(fd: i32) -> Result<(i32, bool), i32> {
     Ok((t.host, t.nonblock))
 }
 
+/// `process_mrelease(pidfd, flags)`: release the memory of a process being
+/// killed, as Linux's: no flags (`EINVAL`); a process descriptor
+/// (`EBADF`), of a process, not another thread (`ESRCH`), not yet reaped
+/// (`ESRCH`); one that has ended already has no memory left (0); else it
+/// must be on its way out, killed (a `SIGKILL` an fwe process sent it) or
+/// exiting (`EINVAL`). The host frees an ending process's memory itself,
+/// as it ends: nothing is left for fwe to free first.
+pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
+    if flags != 0 {
+        return err(errno::EINVAL);
+    }
+    let fd = fd as i32;
+    let t = match wait_target(fd) {
+        Ok(_) => of(fd).expect("a process descriptor"),
+        Err(e) => return err(e),
+    };
+    if t.tid != 0 {
+        return err(errno::ESRCH);
+    }
+    if ended(fd) {
+        let reaped = exit_status(t.host).is_some() || !crate::host::process_exists(t.host);
+        return if reaped { err(errno::ESRCH) } else { 0 };
+    }
+    let exiting = crate::procreg::kinfo(t.host).is_some_and(|k| k.exiting || k.state == 5);
+    if exiting || crate::signote::kill_noted(t.host) { 0 } else { err(errno::EINVAL) }
+}
+
 /// The host process a `/proc/<pid>` directory descriptor names (which
 /// `pidfd_send_signal` takes as Linux does), if `fd` is one.
 fn proc_dir_target(fd: i32) -> Option<i32> {

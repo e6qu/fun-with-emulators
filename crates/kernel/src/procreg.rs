@@ -1360,12 +1360,15 @@ pub struct Kinfo {
     /// The host's state (`SIDL` 1, `SRUN` 2, `SSLEEP` 3, `SSTOP` 4,
     /// `SZOMB` 5).
     pub state: u8,
+    /// It is working its way through its exit (`P_WEXIT`).
+    pub exiting: bool,
     pub comm: Vec<u8>,
 }
 
 /// Host process `pid`'s `kinfo_proc`, which the libc crate does not
-/// describe (648 bytes: the start time at 0, the state at 36, the command
-/// name at 243, the parent and process group at 560 and 564).
+/// describe (648 bytes: the start time at 0, the flags at 32, the state at
+/// 36, the command name at 243, the parent and process group at 560 and
+/// 564).
 #[cfg(target_os = "macos")]
 pub fn kinfo(pid: i32) -> Option<Kinfo> {
     const SIZE: usize = 648;
@@ -1395,6 +1398,8 @@ pub fn kinfo(pid: i32) -> Option<Kinfo> {
         ppid: i32_at(560),
         pgid: i32_at(564),
         state: buf[36],
+        // `P_WEXIT`.
+        exiting: i32_at(32) & 0x2000 != 0,
         comm: comm[..comm.iter().position(|&b| b == 0).unwrap_or(comm.len())].to_vec(),
     })
 }

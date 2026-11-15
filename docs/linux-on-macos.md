@@ -956,7 +956,7 @@ and `futex_waitv` run without the kernel lock.
 | `getppid` | The parent, or the reaper that adopted the process; 0 for one outside the pid namespace. A process that asks often has a thread of fwe's watch the parent's end (`kqueue`, as for the parent-death signal) and the answer kept while the parent lives. | `getppid`, then `kqueue` |
 | `getpgid`, `getsid`, `setpgid`, `setsid` | The host's, ids mapped through the pid namespace; `setpgid` of a child that has exec'd fails with `EACCES` first, as on Linux. | `getpgid`, `getsid`, `setpgid`, `setsid` |
 | `set_tid_address`, `set_robust_list`, `get_robust_list` | Kept per thread; another process's robust list is read from the record its threads publish, for a caller that may trace it. | none |
-| `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`; other operations (PI, `WAKE_OP`) fail with `ENOSYS`. | `__ulock_wait2`/`__ulock_wake` for shared futexes |
+| `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`, `WAKE_OP` (the second word changed with an atomic compare-and-swap); the PI operations fail with `ENOSYS`. | `__ulock_wait2`/`__ulock_wake` for shared futexes |
 | `futex_waitv` | Up to 128 32-bit futexes, private and shared, on `CLOCK_MONOTONIC` or `CLOCK_REALTIME`. | as `futex` |
 | `futex_wake`, `futex_wait`, `futex_requeue` | As `FUTEX_WAKE_BITSET`, `FUTEX_WAIT_BITSET` (an absolute timeout on the clock given) and `FUTEX_CMP_REQUEUE`, on 32-bit futexes (another size or NUMA `EINVAL`); a requeue's two futexes are both private or both shared (`EINVAL` otherwise). | as `futex` |
 | `kcmp` | Memory, descriptor table, filesystem view, handlers, I/O context and undo list are shared only by a process's threads; two descriptors are one open file if they name the same socket or pipe, or the same file and (in the caller) share their status flags; `KCMP_EPOLL_TFD` for the caller's own epoll descriptors (`ENOENT` for another's); a caller that may not trace either process `EPERM`. | `proc_pidinfo`, `proc_pidfdinfo`, `fcntl` |
@@ -970,6 +970,8 @@ and `futex_waitv` run without the kernel lock.
 | `prlimit64`, `getrlimit`, `setrlimit` | `NOFILE` virtual, fwe's own limits in `rlimits.rs`, the rest the host's; each process publishes its limits in its record (at its start, at its fork from its parent's, and when they change), where another process's `prlimit` reads them; one set on another process is left in its record and the process woken through its mailbox to take it up at its next system call. | `getrlimit`, `setrlimit` |
 | `getrusage`, `times` | The host's usage; `RUSAGE_THREAD` the calling thread's own user and system time (the host's per-thread counts), with the process's largest resident size and no fault, switch or block counts (the host keeps those per process only); `times` in 100 Hz ticks since boot. | `getrusage`, `thread_info` |
 | `pidfd_open`, `pidfd_getfd` | A process descriptor is a kqueue watching the process's exit, of any host process the caller's pid namespace shows; `pidfd_getfd` asks the target for the descriptor through its signal mailbox, so a process fwe did not start gives `EPERM`. | `kqueue`/`kevent`, `sendmsg`/`recvmsg` |
+| `process_mrelease` | 0 for a process on its way out (sent `SIGKILL` by an fwe process, exiting, or ended unreaped), `EINVAL` for one that is not; the host frees an ending process's memory itself. | `sysctl(KERN_PROC_PID)` for `P_WEXIT` |
+| `restart_syscall` | `EINTR`: fwe restarts an interrupted call (or not) as it delivers the signal, so there is never one left to restart, as on Linux once a handler ran. | none |
 | `personality` | Kept per process; `PER_LINUX32` fails with `EINVAL`. | none |
 | `acct` | `CAP_SYS_PACCT`; the file opened as Linux opens it (for appending, a regular file); an ending process appends its `struct acct_v3` to the nearest pid namespace's, its own or one above, with accounting on | `open`, `write` |
 
@@ -1010,9 +1012,9 @@ and the frame are under [Numbers](#numbers) and
 | `rt_sigreturn` | restores registers, FP/SIMD state, mask and alternate stack from the frame; an unreadable frame kills the process with `SIGSEGV` | none |
 | `rt_sigsuspend` | replaces the mask; waits for a deliverable signal; `EINTR` | `pthread_sigmask`, `sigsuspend` |
 | `rt_sigtimedwait` | has the host catch the awaited signals while it waits; takes one from the pending set | `sigaction`, `pselect` with no descriptors |
-| `kill` | pid mapped out of the pid namespace, permission checked as on Linux, a sender note left in an fwe target's mailbox; a signal the process sends itself while the calling thread blocks it is made pending by fwe, so it is pending when `kill` returns (the host would give it to another thread, later) | `kill`; `SIGINFO` (the kill relay) for `SIGKILL` to an fwe process |
+| `kill` | pid mapped out of the pid namespace (another process's thread id names that process, as on Linux), permission checked as on Linux, a sender note left in an fwe target's mailbox; a signal the process sends itself while the calling thread blocks it is made pending by fwe, so it is pending when `kill` returns (the host would give it to another thread, later) | `kill`; `SIGINFO` (the kill relay) for `SIGKILL` to an fwe process |
 | `tkill`, `tgkill` | a thread of this process: host signal to the thread, or posted to it directly; a thread of another process: queued in that process's mailbox | `pthread_kill`; `kill` with `SIGEMT` |
-| `rt_sigqueueinfo`, `rt_tgsigqueueinfo` | the caller's `siginfo` (code, value) posted, or sent with a note; real-time signals queue, each with its own `siginfo` | `kill`, or `SIGEMT` for a signal the host lacks |
+| `rt_sigqueueinfo`, `rt_tgsigqueueinfo` | the caller's `siginfo` (code, value) posted, or sent with a note; real-time signals queue, each with its own `siginfo`; to another process's other thread, queued for that thread in the process's mailbox | `kill`, or `SIGEMT` for a signal the host lacks or a thread of another process |
 | `pidfd_send_signal` | `kill`, `tgkill`, `rt_sigqueueinfo` or a group `kill` of what the descriptor names (also a `/proc/<pid>` directory) | as those calls |
 | `signalfd4` | a readiness pipe plus a queue of `signalfd_siginfo`; watched signals are always caught | `pipe`, `sigaction` |
 
@@ -1077,7 +1079,7 @@ no vDSO, so every clock read is a system call
 | `times` | ticks at 100 Hz from the process's and children's usage; returns the ticks since boot | `getrusage` |
 | `getitimer`, `setitimer` | the host's timers; a value over 100,000,000 s clamped and read back as asked | `getitimer`, `setitimer` |
 | `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | a timer thread of fwe's per process raises each timer's signal (`SI_TIMER`) | `clock_gettime`, `poll`, `nanosleep` in that thread |
-| `timerfd_create`, `timerfd_settime`, `timerfd_gettime` | a kqueue holding one timer; reads return the expiry count; `TFD_IOC_SET_TICKS` sets the count the next read returns, readable at once | `kqueue`, `kevent` (`EVFILT_TIMER`, `NOTE_NSECONDS \| NOTE_CRITICAL`) |
+| `timerfd_create`, `timerfd_settime`, `timerfd_gettime` | a kqueue holding one timer; reads return the expiry count; `TFD_IOC_SET_TICKS` sets the count the next read returns, readable at once; the `*_ALARM` clocks need `CAP_WAKE_ALARM` (`EPERM`) | `kqueue`, `kevent` (`EVFILT_TIMER`, `NOTE_NSECONDS \| NOTE_CRITICAL`) |
 
 **`clock_nanosleep`** (and `nanosleep`, which is `clock_nanosleep` on
 `CLOCK_MONOTONIC`): a `TIMER_ABSTIME` time already past returns 0. The
@@ -2394,7 +2396,7 @@ where fwe falls short of Linux in detail is in
 | `kernel.pid_max` | **enforced** | for fwe's pid namespaces; host pids are macOS's |
 | uids, gids (real, effective, saved, fs), groups | **emulated** | virtual, root by default, Linux's `set*id` and `setgroups` rules and capability changes; per process, not per thread; the host process never changes ([Credential and namespace calls](#credential-and-namespace-calls)) |
 | The host user underneath | **host** | every guest user is the macOS user running fwe, with that user's rights ([Isolation and security](#isolation-and-security)) |
-| User namespaces, `uid_map`, `gid_map`, `setgroups` | **enforced** | no privilege needed; maps written once, 340 lines, an unprivileged writer its own id only, `gid_map` after `setgroups` `deny`; the initial namespace's maps read as identity (writes `EPERM`) |
+| User namespaces, `uid_map`, `gid_map`, `setgroups` | **enforced** | no privilege needed; maps written once, 340 lines, each extent within one of the parent namespace's (`EPERM` for any writer), an unprivileged writer its own id only, `gid_map` after `setgroups` `deny`; the initial namespace's maps read as identity (writes `EPERM`) |
 | Overflow ids | **emulated** | an unmapped id, and a host user other than fwe's, read as 65534 ([Host identity](#host-identity-and-machine-state)) |
 | Signal permission | **enforced** | `CAP_KILL` in the target's user namespace or Linux's uid match, `SIGCONT` within the session, each member of a group; `kill(-1)` reaches the caller's pid namespace, or the processes of its run of fwe, never other host processes |
 | Signals the host lacks (`SIGSTKFLT`, `SIGPWR`, 32–64) | **emulated** | fwe's pending sets, another fwe process's mailbox; to a process fwe did not start `EINVAL` ([Sending a signal](#sending-a-signal)) |
@@ -2406,7 +2408,7 @@ where fwe falls short of Linux in detail is in
 | `RLIMIT_STACK` | **emulated** natively; VM **kept** | natively the main stack's size (128 KiB to 4 GiB); in the VM 8 MiB whatever it says |
 | `RLIMIT_CORE` | **emulated** | fwe writes core files and cuts them at it |
 | `RLIMIT_RSS`, `RLIMIT_LOCKS`, `RLIMIT_RTTIME` | **kept** | Linux ignores the first two too; there is no real-time scheduling to time |
-| `RLIMIT_NPROC` | **enforced** | the user's threads across fwe's processes, at `fork` (`EAGAIN`) and at a native thread's creation, not a VM thread's; not checked at `execve` after `setuid` |
+| `RLIMIT_NPROC` | **enforced** | the user's threads across fwe's processes, at `fork` (`EAGAIN`) and at a native thread's creation, not a VM thread's; a `set*uid` to a user past it fails the next `execve` (`EAGAIN`) while the user still is |
 | `RLIMIT_NOFILE` | **enforced** | virtual, below fwe's reserved descriptors, capped by `fs.nr_open` |
 | `RLIMIT_MEMLOCK` | **enforced** | `mlock*`, `MAP_LOCKED`, `MCL_FUTURE`; `CAP_IPC_LOCK` exempt |
 | `RLIMIT_AS` | **host** | set on the fwe process, so fwe's own reservations count |
@@ -2606,9 +2608,7 @@ and fail with `ENOSYS`, noted under `--strace`, in both backends:
   `/proc/config.gz` says fwe's is for io_uring, perf events, fanotify,
   userfaultfd, modules, rseq and time namespaces;
 - `lookup_dcookie`, `nfsservctl`: `ENOSYS` on every Linux;
-- `process_mrelease`, `open_tree_attr`, `listns`, `restart_syscall`:
-  Linux has them in every configuration (`restart_syscall` called
-  directly gives `EINTR`).
+- `open_tree_attr`, `listns`: Linux has them in every configuration.
 
 These are refused whatever their arguments, once checked:
 
@@ -2618,7 +2618,7 @@ These are refused whatever their arguments, once checked:
 - `pkey_alloc`: `ENOSPC`, as on a CPU without protection keys;
 - `lsm_get_self_attr`, `lsm_set_self_attr`: `EOPNOTSUPP`;
 - `futex`'s PI operations and `FUTEX_FD`: `ENOSYS`, as without
-  `CONFIG_FUTEX_PI`; `FUTEX_WAKE_OP` too, which Linux always has;
+  `CONFIG_FUTEX_PI`;
 - `CLONE_NEWTIME`: `EINVAL`, as without `CONFIG_TIME_NS`;
   `personality(PER_LINUX32)`: `EINVAL`, as without 32-bit support.
 

@@ -1,4 +1,6 @@
-//! Futexes: `FUTEX_WAIT` blocks and `FUTEX_WAKE` wakes.
+//! Futexes: `FUTEX_WAIT` blocks and `FUTEX_WAKE` wakes; `FUTEX_WAKE_OP`
+//! also changes a second word atomically and wakes that one's waiters when
+//! its old value meets a comparison; the requeues move waiters to another.
 //!
 //! A private futex (`FUTEX_PRIVATE_FLAG`, what a process's own locks use)
 //! is the process's: its wait queues live here, outside the kernel lock,
@@ -189,11 +191,32 @@ pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, 
                 shared::wait(uaddr, val, deadline, val3)
             }
         }
-        futex::FUTEX_WAKE if private => wake_private(uaddr, val),
-        futex::FUTEX_WAKE => shared::wake(uaddr, val, u32::MAX),
+        futex::FUTEX_WAKE if private => wake_private(uaddr, wake_count(val)),
+        futex::FUTEX_WAKE => shared::wake(uaddr, wake_count(val), u32::MAX),
         futex::FUTEX_WAKE_BITSET if val3 == 0 => err(errno::EINVAL),
-        futex::FUTEX_WAKE_BITSET if private => wake_private_bits(uaddr, val, val3),
-        futex::FUTEX_WAKE_BITSET => shared::wake(uaddr, val, val3),
+        futex::FUTEX_WAKE_BITSET if private => wake_private_bits(uaddr, wake_count(val), val3),
+        futex::FUTEX_WAKE_BITSET => shared::wake(uaddr, wake_count(val), val3),
+        futex::FUTEX_WAKE_OP => {
+            if !uaddr2.is_multiple_of(4) {
+                return err(errno::EINVAL);
+            }
+            // A shared futex's key is found in its memory.
+            if !private && let Err(e) = load(uaddr) {
+                return err(e);
+            }
+            let hit = match wake_op_apply(uaddr2, val3) {
+                Ok(hit) => hit,
+                Err(e) => return err(e),
+            };
+            let wake = |addr: u64, n: u32| {
+                if private { wake_private(addr, n) } else { shared::wake(addr, n, u32::MAX) }
+            };
+            let mut woken = wake(uaddr, wake_count(val));
+            if hit {
+                woken += wake(uaddr2, wake_count(timeout as u32)).max(0);
+            }
+            woken
+        }
         futex::FUTEX_REQUEUE | futex::FUTEX_CMP_REQUEUE => {
             if !uaddr2.is_multiple_of(4) || (val as i32) < 0 || (timeout as i32) < 0 {
                 return err(errno::EINVAL);
@@ -214,6 +237,60 @@ pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, 
             }
         }
         _ => err(errno::ENOSYS),
+    }
+}
+
+/// How many waiters a wake of `n` wakes: Linux counts it as an `int` and
+/// wakes one before it compares, so 0 or a negative count wakes one.
+fn wake_count(n: u32) -> u32 {
+    (n as i32).max(1) as u32
+}
+
+/// `FUTEX_WAKE_OP`'s operation `encoded` on the word at `uaddr2`, done
+/// atomically as Linux's `futex_atomic_op_inuser`: the word set to the
+/// result of the operation on it, then whether its old value meets the
+/// comparison. An unknown operation changes nothing; an unknown
+/// comparison comes after the change (`ENOSYS` either way).
+fn wake_op_apply(uaddr2: u64, encoded: u32) -> Result<bool, i32> {
+    use futex::*;
+    let op = (encoded >> 28) & 7;
+    let cmp = (encoded >> 24) & 15;
+    // The arguments' 12 bits, sign-extended.
+    let mut oparg = ((encoded << 8) as i32) >> 20;
+    let cmparg = ((encoded << 20) as i32) >> 20;
+    if encoded & (FUTEX_OP_OPARG_SHIFT << 28) != 0 {
+        // Linux takes a shift past 31 modulo 32.
+        oparg = 1i32.wrapping_shl((oparg & 31) as u32);
+    }
+    let apply = |old: u32| -> Option<u32> {
+        let a = oparg as u32;
+        Some(match op {
+            FUTEX_OP_SET => a,
+            FUTEX_OP_ADD => old.wrapping_add(a),
+            FUTEX_OP_OR => old | a,
+            FUTEX_OP_ANDN => old & !a,
+            FUTEX_OP_XOR => old ^ a,
+            _ => return None,
+        })
+    };
+    let mut old = load(uaddr2)?;
+    loop {
+        let new = apply(old).ok_or(errno::ENOSYS)?;
+        let seen = crate::uaccess::cmpxchg_u32(uaddr2, old, new)?;
+        if seen == old {
+            break;
+        }
+        old = seen;
+    }
+    let old = old as i32;
+    match cmp {
+        FUTEX_OP_CMP_EQ => Ok(old == cmparg),
+        FUTEX_OP_CMP_NE => Ok(old != cmparg),
+        FUTEX_OP_CMP_LT => Ok(old < cmparg),
+        FUTEX_OP_CMP_LE => Ok(old <= cmparg),
+        FUTEX_OP_CMP_GT => Ok(old > cmparg),
+        FUTEX_OP_CMP_GE => Ok(old >= cmparg),
+        _ => Err(errno::ENOSYS),
     }
 }
 
@@ -259,7 +336,14 @@ pub unsafe fn wake2(uaddr: u64, mask: u64, nr: u64, flags: u64) -> i64 {
     if mask == 0 || mask > u64::from(u32::MAX) {
         return err(errno::EINVAL);
     }
-    let nr = (nr as i32).max(0) as u32;
+    // Strict, as Linux's: a count of 0 wakes none (the word found first).
+    if nr as i32 == 0 {
+        if !uaddr.is_multiple_of(4) {
+            return err(errno::EINVAL);
+        }
+        return load(uaddr).map_or_else(err, |_| 0);
+    }
+    let nr = nr as u32;
     // SAFETY: the caller's guarantee, passed on.
     unsafe { op_full(uaddr, futex2_op(futex::FUTEX_WAKE_BITSET, private), nr, 0, 0, mask as u32) }
 }
@@ -857,6 +941,74 @@ mod tests {
             assert_eq!(r, err(errno::ETIMEDOUT));
             assert!(start.elapsed() >= Duration::from_millis(30), "returned early");
         }
+    }
+
+    /// `FUTEX_WAKE_OP`'s operation on the second word, and its comparison
+    /// of the old value: each operation, a shift, the sign-extended
+    /// arguments, and an unknown comparison (after the change).
+    #[test]
+    fn wake_op_changes_the_second_word() {
+        use fwe_abi::futex::*;
+        let enc = |op: u32, cmp: u32, oparg: i32, cmparg: i32| {
+            op << 28 | cmp << 24 | (oparg as u32 & 0xfff) << 12 | (cmparg as u32 & 0xfff)
+        };
+        let word = AtomicU32::new(6);
+        let addr = &word as *const _ as u64;
+        let cases = [
+            (enc(FUTEX_OP_SET, FUTEX_OP_CMP_EQ, 9, 6), 9, true),
+            (enc(FUTEX_OP_ADD, FUTEX_OP_CMP_NE, 3, 9), 12, false),
+            (enc(FUTEX_OP_OR, FUTEX_OP_CMP_GT, 1, 11), 13, true),
+            (enc(FUTEX_OP_ANDN, FUTEX_OP_CMP_LE, 4, 13), 9, true),
+            (enc(FUTEX_OP_XOR, FUTEX_OP_CMP_LT, 1, 9), 8, false),
+            (enc(FUTEX_OP_OPARG_SHIFT | FUTEX_OP_OR, FUTEX_OP_CMP_GE, 4, 8), 24, true),
+            (enc(FUTEX_OP_ADD, FUTEX_OP_CMP_LT, -24, -1), 0, false),
+            (enc(FUTEX_OP_ADD, FUTEX_OP_CMP_GT, -1, -2), u32::MAX, true),
+        ];
+        for (encoded, after, hit) in cases {
+            assert_eq!(wake_op_apply(addr, encoded), Ok(hit), "{encoded:#x}");
+            assert_eq!(word.load(Ordering::SeqCst), after, "{encoded:#x}");
+        }
+        word.store(1, Ordering::SeqCst);
+        assert_eq!(wake_op_apply(addr, enc(FUTEX_OP_SET, 9, 5, 0)), Err(errno::ENOSYS));
+        assert_eq!(word.load(Ordering::SeqCst), 5);
+        assert_eq!(wake_op_apply(addr, enc(6, FUTEX_OP_CMP_EQ, 7, 0)), Err(errno::ENOSYS));
+        assert_eq!(word.load(Ordering::SeqCst), 5);
+    }
+
+    /// `FUTEX_WAKE_OP` wakes the first word's waiters, and the second's
+    /// only when the comparison holds; an unaligned second word is
+    /// `EINVAL`.
+    #[test]
+    fn wake_op_wakes_the_second_word_on_a_hit() {
+        use fwe_abi::futex::*;
+        let words: &'static [AtomicU32; 2] =
+            Box::leak(Box::new([AtomicU32::new(0), AtomicU32::new(0)]));
+        let (a, b) = (&words[0] as *const _ as u64, &words[1] as *const _ as u64);
+        let wait_op = FUTEX_WAIT | FUTEX_PRIVATE_FLAG;
+        let wake_op = FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG;
+        // SAFETY: the leaked words live for the process.
+        let waiter = thread::spawn(move || unsafe { op(b, wait_op, 0, 0) });
+        thread::sleep(Duration::from_millis(50));
+        // Old value 0 is not 1: the second word's waiter stays.
+        let set_if_one = (FUTEX_OP_SET << 28) | (FUTEX_OP_CMP_EQ << 24) | (2 << 12) | 1;
+        // SAFETY: as above.
+        assert_eq!(unsafe { op_full(a, wake_op, 1, 1, b, set_if_one) }, 0);
+        assert_eq!(words[1].load(Ordering::SeqCst), 2);
+        // Old value 2: woken.
+        let set_if_two = (FUTEX_OP_SET << 28) | (FUTEX_OP_CMP_EQ << 24) | (3 << 12) | 2;
+        let mut woken = 0;
+        for _ in 0..100 {
+            // SAFETY: as above.
+            woken = unsafe { op_full(a, wake_op, 1, 1, b, set_if_two) };
+            if woken == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(woken, 1);
+        assert_eq!(waiter.join().unwrap(), 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { op_full(a, wake_op, 1, 1, b + 1, 0) }, err(errno::EINVAL));
     }
 
     #[test]

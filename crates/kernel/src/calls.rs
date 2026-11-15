@@ -648,19 +648,27 @@ impl<P: Platform> Kernel<P> {
         let code = word(8);
         let value = u64::from_ne_bytes(raw[24..32].try_into().unwrap());
         let me = thread::tgid();
+        // A code only the kernel or `tkill` gives only to the calling thread
+        // itself, by its own id, as Linux compares it.
+        if (code >= 0 || code == sig::SI_TKILL) && tid.unwrap_or(tgid) != thread::tid() {
+            return err(errno::EPERM);
+        }
         // Only a process: Linux finds none for 0 or a negative number.
         if tgid <= 0 {
             return err(errno::ESRCH);
         }
-        // Another thread's id names its process, as on Linux.
-        let tgid = if tid.is_none() && thread::host_thread(tgid).is_some() { me } else { tgid };
-        if (code >= 0 || code == sig::SI_TKILL) && tgid != me {
-            return err(errno::EPERM);
-        }
         if s > sig::NSIG {
             return err(errno::EINVAL);
         }
-        let Some(host) = crate::pidns::to_host(tgid) else { return err(errno::ESRCH) };
+        // Another thread's id names its process, as on Linux.
+        let tgid = if tid.is_none() && thread::host_thread(tgid).is_some() { me } else { tgid };
+        // Another process's thread, named alone, names its process too.
+        let owner = (tid.is_none() && tgid != me && !crate::pidns::nested())
+            .then(|| thread::owner_of_tid(tgid))
+            .flatten();
+        let Some(host) = owner.or_else(|| crate::pidns::to_host(tgid)) else {
+            return err(errno::ESRCH);
+        };
         // As `kill` is: only a process the caller may signal.
         if tgid != me && !self.may_signal(host, s) {
             return err(errno::EPERM);
@@ -689,9 +697,21 @@ impl<P: Platform> Kernel<P> {
             thread::wake_others(crate::host::WAKE_SIGNAL);
             return 0;
         }
-        if tid.is_some_and(|t| t != tgid) {
-            // Another process's other thread: the host signals processes.
-            return err(errno::ESRCH);
+        if let Some(t) = tid.filter(|&t| t != tgid) {
+            // Another process's other thread: queued for it in the
+            // process's mailbox, the process woken to give it to the
+            // thread (SIGKILL ends the process).
+            if thread::owner_of_tid(t) != Some(host) || !crate::host::is_fwe(host) {
+                return err(errno::ESRCH);
+            }
+            if s == fwe_abi::signal::SIGKILL {
+                crate::signote::note(host, libc::SIGKILL);
+                return crate::host::kill_process(host, libc::SIGKILL);
+            }
+            if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
+                return err(e);
+            }
+            return crate::host::kill_process(host, crate::host::WAKE_SIGNAL);
         }
         // One the host lacks, or SIGTRAP (which the host would merge with
         // the target's next system-call trap): through the mailbox.
