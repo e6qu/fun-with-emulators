@@ -365,9 +365,14 @@ fn wait_timer() -> i32 {
 pub fn forked() {
     PROCESS.clear();
     with_own(Pending::clear);
-    // The parent's other threads' sets are not the child's.
-    for q in &POOL {
-        q.state.store(0, Ordering::Release);
+    // The parent's other threads' sets are not the child's. Only entries
+    // ever taken are looked at, and only those in use written: a write to
+    // each of the pool's pages would copy every one into the child.
+    let high = (POOL_HIGH.load(Ordering::Relaxed) as usize).min(QUEUE_MAX);
+    for q in &POOL[..high] {
+        if q.state.load(Ordering::Relaxed) != 0 {
+            q.state.store(0, Ordering::Release);
+        }
     }
     POOL_USED.store(0, Ordering::Relaxed);
     COUNT.store(0, Ordering::Relaxed);
@@ -716,6 +721,10 @@ static ORDER: AtomicU64 = AtomicU64::new(2);
 /// How many entries of [`POOL`] are in use.
 static POOL_USED: AtomicU64 = AtomicU64::new(0);
 
+/// How many entries of [`POOL`] from its start were ever taken: none past
+/// it was.
+static POOL_HIGH: AtomicU64 = AtomicU64::new(0);
+
 /// How many signals are pending in the process, in all its sets: each
 /// number pending, and each queued behind it. What `RLIMIT_SIGPENDING`
 /// bounds ([`may_queue`]).
@@ -749,8 +758,9 @@ impl Pending {
     /// Queue real-time `sig` with `info` behind the one pending: false
     /// when the pool is full. Async-signal-safe.
     fn enqueue(&self, sig: u64, info: &SigInfo) -> bool {
-        for q in &POOL {
+        for (i, q) in POOL.iter().enumerate() {
             if q.state.compare_exchange(0, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                POOL_HIGH.fetch_max(i as u64 + 1, Ordering::Relaxed);
                 q.owner.store(self.id(), Ordering::Relaxed);
                 q.sig.store(sig, Ordering::Relaxed);
                 store_slot(&q.info, info);
