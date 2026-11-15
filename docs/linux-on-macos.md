@@ -856,7 +856,7 @@ descriptors answer their requests first. Terminal requests (see
 [termios and terminal requests](#termios-and-terminal-requests)), network
 interface requests (`SIOCGIF*`) and `FIONREAD`, `FIONBIO`, `FIOCLEX`,
 `FIONCLEX`, `FIOASYNC` are translated; `FS_IOC_GETFLAGS`/`SETFLAGS` map
-immutable, append-only and no-dump to the host's flags; `FICLONE`,
+immutable and append-only to the host's flags and record no-dump beside the host flag that also marks a kept mode or owner; `FICLONE`,
 `FICLONERANGE` and `FIDEDUPERANGE` are `EOPNOTSUPP`; `RNDGETENTCNT`
 reports 256; `PROCMAP_QUERY` on a `maps` file is fwe's. Any other request
 is `ENOTTY`.

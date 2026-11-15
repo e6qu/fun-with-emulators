@@ -23,24 +23,33 @@ pub fn host_owner(st: &libc::stat) -> (u32, u32) {
 /// The owner, as initial-namespace ids, of the file open as `fd` whose
 /// host metadata is `st`.
 pub fn of_fd(fd: i32, st: &libc::stat) -> (u32, u32) {
+    kept_of_fd(fd, st).unwrap_or_else(|| host_owner(st))
+}
+
+/// The owner kept for the file open as `fd` whose host metadata is `st`,
+/// if one is: by its path where the descriptor reads no attribute (one
+/// opened only to search a directory).
+pub fn kept_of_fd(fd: i32, st: &libc::stat) -> Option<(u32, u32)> {
     if !crate::modes::marked(st) {
-        return host_owner(st);
+        return None;
     }
-    // By its path where the descriptor reads no attribute (one opened only
-    // to search a directory).
     crate::modes::owner_once(st, || {
         read_fd(fd).or_else(|| {
             let p = std::ffi::CString::new(crate::fs::fd_path(fd)?).ok()?;
             read_path(&p)
         })
     })
-    .unwrap_or_else(|| host_owner(st))
 }
 
 /// [`of_fd`] for `name` in directory `dir` (not followed).
 pub fn of_at(dir: i32, name: &CStr, st: &libc::stat) -> (u32, u32) {
+    kept_of_at(dir, name, st).unwrap_or_else(|| host_owner(st))
+}
+
+/// [`kept_of_fd`] for `name` in directory `dir` (not followed).
+pub fn kept_of_at(dir: i32, name: &CStr, st: &libc::stat) -> Option<(u32, u32)> {
     if !crate::modes::marked(st) {
-        return host_owner(st);
+        return None;
     }
     crate::modes::owner_once(st, || match path_of(dir, name) {
         Some(p) => read_path(&p),
@@ -48,7 +57,6 @@ pub fn of_at(dir: i32, name: &CStr, st: &libc::stat) -> (u32, u32) {
         None => crate::modes::open_at(dir, name)
             .and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
     })
-    .unwrap_or_else(|| host_owner(st))
 }
 
 /// [`of_fd`] for the file at host path `path` (not followed).
@@ -242,7 +250,8 @@ fn mark_fd(fd: i32, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<(), i3
             }
             None if crate::modes::marked(st)
                 && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0
-                && !crate::modes::kept_fd(fd) =>
+                && !crate::modes::kept_fd(fd)
+                && !crate::modes::nodump_set_fd(fd) =>
             {
                 crate::modes::set_mark_fd(fd, st, false);
             }
@@ -275,7 +284,8 @@ fn mark_path(path: &CStr, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<
             }
             None if crate::modes::marked(st)
                 && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0
-                && !crate::modes::kept_path(path) =>
+                && !crate::modes::kept_path(path)
+                && !crate::modes::nodump_set_path(path) =>
             {
                 crate::modes::set_mark_path(path, st, false);
             }

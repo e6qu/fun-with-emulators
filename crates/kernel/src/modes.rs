@@ -10,6 +10,9 @@
 //! the file flagged `UF_NODUMP` so that a `stat` shows at once whether to
 //! look for it. `stat` reports the kept mode, and fwe itself refuses a
 //! caller without the capabilities what the kept mode denies the owner.
+//! The flag is also Linux's no-dump flag (`FS_NODUMP_FL`): one the guest
+//! sets is recorded in `org.fwe.nodump` ([`set_nodump_fd`]), and only that
+//! one (or a flag with nothing kept under it) is reported as the guest's.
 //!
 //! A regular file `open` makes is made with its mode itself where the host
 //! enforces it on the owner as Linux does on anyone without root's
@@ -27,6 +30,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const ATTR: &CStr = c"org.fwe.mode";
 #[cfg(target_os = "macos")]
 const MARK: u32 = libc::UF_NODUMP;
+/// Present on a file the guest gave the no-dump flag, whose host flag is
+/// also [`MARK`].
+#[cfg(target_os = "macos")]
+const NODUMP_ATTR: &CStr = c"org.fwe.nodump";
 
 /// What the host's mode must have of guest mode `perm` (its low 12 bits)
 /// for a directory (`dir`) or another file: the owner's read and write,
@@ -144,6 +151,7 @@ pub fn perm_of(st: &libc::stat) -> u32 {
 pub(crate) struct Read {
     mode: Option<Option<u32>>,
     owner: Option<Option<(u32, u32)>>,
+    nodump: Option<Option<()>>,
 }
 
 type Key = (u64, u64, i64, i64);
@@ -204,16 +212,98 @@ pub fn marked(_st: &libc::stat) -> bool {
     false
 }
 
-/// Whether the file open as `fd`, with host metadata `st`, has the host's
-/// no-dump flag of its own (`FS_NODUMP_FL`), not as the mark of a kept
-/// mode.
+/// Whether the file open as `fd`, with host metadata `st`, has the no-dump
+/// flag (`FS_NODUMP_FL`) of its own: the host's flag that is not only the
+/// mark of kept metadata, where a no-dump the guest set is recorded
+/// ([`set_nodump_fd`]).
 pub fn nodump_fd(fd: i32, st: &libc::stat) -> bool {
-    marked(st) && kept_mode_fd(fd, st).is_none()
+    marked(st)
+        && (read_once(st, |r| &mut r.nodump, || nodump_attr_fd(fd)).is_some()
+            || kept_mode_fd(fd, st).is_none() && crate::owners::kept_of_fd(fd, st).is_none())
 }
 
 /// [`nodump_fd`] for `name` in directory `dir`.
 pub fn nodump_at(dir: i32, name: &CStr, st: &libc::stat) -> bool {
-    marked(st) && mode_once(st, || read_at(dir, name)).is_none()
+    marked(st)
+        && (read_once(st, |r| &mut r.nodump, || nodump_attr_at(dir, name)).is_some()
+            || mode_once(st, || read_at(dir, name)).is_none()
+                && crate::owners::kept_of_at(dir, name, st).is_none())
+}
+
+/// Give the file open as `fd` the no-dump flag (`on`) or take it away:
+/// recorded beside the host's flag, which stays while it marks kept
+/// metadata.
+#[cfg(target_os = "macos")]
+pub fn set_nodump_fd(fd: i32, on: bool) -> Result<(), i32> {
+    // SAFETY: plain host calls on an open descriptor with a valid buffer.
+    unsafe {
+        if on {
+            if libc::fsetxattr(fd, NODUMP_ATTR.as_ptr(), [1u8].as_ptr().cast(), 1, 0, 0) != 0 {
+                return Err(last());
+            }
+        } else if libc::fremovexattr(fd, NODUMP_ATTR.as_ptr(), 0) != 0
+            && crate::host::last_errno() != libc::ENOATTR
+        {
+            return Err(last());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the guest gave the file open as `fd` the no-dump flag, which
+/// keeps the host's flag when kept metadata goes.
+#[cfg(target_os = "macos")]
+pub fn nodump_set_fd(fd: i32) -> bool {
+    nodump_attr_fd(fd).is_some()
+}
+
+/// [`nodump_set_fd`] for the file at host path `path` (not followed).
+#[cfg(target_os = "macos")]
+pub fn nodump_set_path(path: &CStr) -> bool {
+    nodump_attr_path(path).is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn nodump_attr_fd(fd: i32) -> Option<()> {
+    // SAFETY: a size query of an attribute, with no buffer.
+    let n = unsafe { libc::fgetxattr(fd, NODUMP_ATTR.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    (n >= 0).then_some(())
+}
+
+#[cfg(target_os = "macos")]
+fn nodump_attr_path(path: &CStr) -> Option<()> {
+    // SAFETY: a size query of an attribute, with no buffer; not followed.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            NODUMP_ATTR.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    (n >= 0).then_some(())
+}
+
+#[cfg(target_os = "macos")]
+fn nodump_attr_at(dir: i32, name: &CStr) -> Option<()> {
+    match path_of(dir, name) {
+        Some(p) => nodump_attr_path(&p),
+        None => {
+            open_at(dir, name).and_then(|f| nodump_attr_fd(std::os::fd::AsRawFd::as_raw_fd(&f)))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nodump_attr_fd(_fd: i32) -> Option<()> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nodump_attr_at(_dir: i32, _name: &CStr) -> Option<()> {
+    None
 }
 
 /// The guest's permission bits of the file whose host metadata is `st`:
@@ -457,7 +547,8 @@ fn mark_fd(fd: i32, st: &libc::stat, perm: Option<u32>) -> Result<(), i32> {
             // owner needs.
             None if marked(st)
                 && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0
-                && !crate::owners::kept_fd(fd) =>
+                && !crate::owners::kept_fd(fd)
+                && !nodump_set_fd(fd) =>
             {
                 libc::fchflags(fd, st.st_flags & !MARK);
             }
@@ -489,7 +580,8 @@ fn mark_path(path: &CStr, st: &libc::stat, perm: Option<u32>) -> Result<(), i32>
             }
             None if marked(st)
                 && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0
-                && !crate::owners::kept_path(path) =>
+                && !crate::owners::kept_path(path)
+                && !nodump_set_path(path) =>
             {
                 libc::lchflags(path.as_ptr(), st.st_flags & !MARK);
             }

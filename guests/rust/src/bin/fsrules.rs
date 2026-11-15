@@ -16,6 +16,7 @@ const X_OK: i32 = 1;
 const AT_FDCWD: i32 = -100;
 const AT_EACCESS: i32 = 0x200;
 const SYS_FACCESSAT2: i64 = 439;
+const SYS_STATX: i64 = 291;
 
 unsafe extern "C" {
     fn open(p: *const c_char, f: i32, ...) -> i32;
@@ -28,6 +29,9 @@ unsafe extern "C" {
     fn setresuid(r: u32, e: u32, s: u32) -> i32;
     fn setgroups(n: usize, g: *const u32) -> i32;
     fn access(p: *const c_char, m: i32) -> i32;
+    fn stat(p: *const c_char, st: *mut u8) -> i32;
+    fn chown(p: *const c_char, u: u32, g: u32) -> i32;
+    fn ioctl(fd: i32, req: u64, ...) -> i32;
     fn syscall(n: i64, ...) -> i64;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
@@ -135,10 +139,67 @@ fn access_scenario() {
     });
 }
 
+/// `stat` of `p`: (uid, gid, mode).
+fn stat_of(p: &str) -> (u32, u32, u32) {
+    let mut st = [0u64; 16];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+    let r = unsafe { stat(c(p).as_ptr(), st.as_mut_ptr().cast()) };
+    assert_eq!(r, 0, "stat {p}: {}", errno());
+    let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
+    // arm64's `struct stat`: dev, ino, then mode, nlink, uid, gid words.
+    (word(6), word(7), word(4))
+}
+
+/// The inode flags of `p` (`FS_IOC_GETFLAGS`), or with `set` given, set
+/// them.
+fn inode_flags(p: &str, set: Option<u32>) -> u32 {
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c(p).as_ptr(), O_RDONLY) };
+    let mut v = set.unwrap_or(0);
+    let req: u64 = if set.is_some() { 0x4008_6602 } else { 0x8008_6601 };
+    // SAFETY: the flags word for the request.
+    let r = unsafe { ioctl(fd, req, &mut v) };
+    assert_eq!(r, 0, "inode flags of {p}: {}", errno());
+    // SAFETY: the descriptor just opened.
+    unsafe { close(fd) };
+    v
+}
+
+/// The `statx` attributes of `p`.
+fn statx_attributes(p: &str) -> u64 {
+    let mut buf = [0u64; 32];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct statx`.
+    let r = unsafe { syscall(SYS_STATX, AT_FDCWD, c(p).as_ptr(), 0, 0xfff, buf.as_mut_ptr()) };
+    assert_eq!(r, 0, "statx {p}: {}", errno());
+    buf[1]
+}
+
+/// A file given another owner is not no-dump, and clearing its inode
+/// flags (`chattr -d`) keeps its owner; the guest's own no-dump is
+/// reported as set.
+fn nodump_scenario() {
+    const FS_NODUMP_FL: u32 = 0x40;
+    const STATX_ATTR_NODUMP: u64 = 0x40;
+    make("/tmp/owned", 0o644);
+    // SAFETY: a NUL-terminated path.
+    unsafe { chown(c("/tmp/owned").as_ptr(), 1000, 100) };
+    let nodump = |p: &str| {
+        (inode_flags(p, None) & FS_NODUMP_FL != 0, statx_attributes(p) & STATX_ATTR_NODUMP != 0)
+    };
+    println!("owned no-dump: {:?}", nodump("/tmp/owned"));
+    inode_flags("/tmp/owned", Some(0));
+    let (uid, gid, _) = stat_of("/tmp/owned");
+    println!("after clearing: {uid}:{gid}");
+    inode_flags("/tmp/owned", Some(FS_NODUMP_FL));
+    let (uid, gid, _) = stat_of("/tmp/owned");
+    println!("set: {:?} owner {uid}:{gid}", nodump("/tmp/owned"));
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
         "access" => access_scenario(),
+        "nodump" => nodump_scenario(),
         s => panic!("unknown scenario {s}"),
     }
 }

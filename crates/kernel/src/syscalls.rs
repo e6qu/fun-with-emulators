@@ -2632,27 +2632,52 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EPERM);
         }
         let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
-        let mut want = host & !(fixed | libc::UF_NODUMP);
+        let mut want_fixed = 0;
         if f & FS_IMMUTABLE_FL != 0 {
-            want |= libc::UF_IMMUTABLE;
+            want_fixed |= libc::UF_IMMUTABLE;
         }
         if f & FS_APPEND_FL != 0 {
-            want |= libc::UF_APPEND;
+            want_fixed |= libc::UF_APPEND;
         }
-        // The flag also marks a kept mode, which stays marked.
-        let kept = crate::modes::marked(&st) && !crate::modes::nodump_fd(fd, &st);
-        if f & FS_NODUMP_FL != 0 || kept {
-            want |= libc::UF_NODUMP;
-        }
-        if (want ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
+        if (want_fixed ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
             return Err(errno::EPERM);
         }
-        if want == host {
-            return Ok(());
+        let fail = || Err(host::errno_to_linux(host::last_errno()));
+        // The guest's no-dump is recorded apart from the host's flag, which
+        // also marks a kept mode or owner ([`crate::modes::set_nodump_fd`]).
+        let nodump = f & FS_NODUMP_FL != 0;
+        if nodump != crate::modes::nodump_set_fd(fd) {
+            // The record is an attribute, which the host refuses to change
+            // on a file it holds immutable or append-only: those are let go
+            // of while it is written.
+            // SAFETY: plain host call on the guest's descriptor.
+            if host & fixed != 0 && unsafe { libc::fchflags(fd, host & !fixed) } != 0 {
+                return fail();
+            }
+            let r = match crate::modes::set_nodump_fd(fd, nodump) {
+                // A mode that denies the owner writing attributes: kept
+                // apart first.
+                Err(errno::EACCES) => {
+                    crate::modes::own_fd(fd).and_then(|()| crate::modes::set_nodump_fd(fd, nodump))
+                }
+                r => r,
+            };
+            if let Err(e) = r {
+                // SAFETY: as above, the flags as they were.
+                unsafe { libc::fchflags(fd, host) };
+                return Err(e);
+            }
+        }
+        // As the attribute step left them (a mode kept apart is marked).
+        let now = file_kind_for_flags(fd)?.st_flags;
+        let kept = crate::modes::kept_fd(fd) || crate::owners::kept_fd(fd);
+        let mut want = now & !(fixed | libc::UF_NODUMP) | want_fixed;
+        if nodump || kept {
+            want |= libc::UF_NODUMP;
         }
         // SAFETY: plain host call on the guest's descriptor.
-        if unsafe { libc::fchflags(fd, want) } != 0 {
-            return Err(host::errno_to_linux(host::last_errno()));
+        if want != now && unsafe { libc::fchflags(fd, want) } != 0 {
+            return fail();
         }
         Ok(())
     }
@@ -4508,5 +4533,41 @@ mod tests {
         assert_eq!(call([PR_GET_SPECULATION_CTRL, 0, 1, 0, 0]), err(errno::EINVAL));
         assert_eq!(call([PR_GET_SPECULATION_CTRL, 9, 0, 0, 0]), err(errno::ENODEV));
         assert_eq!(call([PR_SET_SPECULATION_CTRL, 0, 0, 0, 0]), err(errno::ENXIO));
+    }
+
+    /// The no-dump flag the guest sets is its own, apart from the host flag
+    /// that marks a kept owner: a file with an owner kept does not read as
+    /// no-dump, clearing the flags keeps the owner, and the guest's
+    /// no-dump outlives the owner going back to root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nodump_is_the_guests_apart_from_kept_metadata() {
+        const FS_NODUMP_FL: u32 = 0x40;
+        let path = std::env::temp_dir().join(format!("fwe-nodump-{}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+        let mut k = kernel();
+        let mut flags = |set: Option<u32>| {
+            let mut v = set.unwrap_or(0);
+            let req = if set.is_some() { 0x4008_6602 } else { 0x8008_6601 };
+            let r = k.syscall(nr::IOCTL, [fd as u64, req, &mut v as *mut u32 as u64, 0, 0, 0]);
+            assert_eq!(r, 0);
+            v
+        };
+        let owner = || crate::owners::of_fd(fd, &super::file_kind_for_flags(fd).unwrap());
+        crate::owners::keep_fd(fd, (1000, 100)).unwrap();
+        assert_eq!(flags(None), 0, "a kept owner is not no-dump");
+        flags(Some(0));
+        assert_eq!(owner(), (1000, 100), "clearing the flags keeps the owner");
+        flags(Some(FS_NODUMP_FL));
+        assert_eq!(flags(None), FS_NODUMP_FL);
+        assert_eq!(owner(), (1000, 100));
+        crate::owners::keep_fd(fd, (0, 0)).unwrap();
+        assert_eq!(flags(None), FS_NODUMP_FL, "the guest's no-dump stays");
+        flags(Some(0));
+        assert_eq!(flags(None), 0);
+        assert!(!crate::modes::marked(&super::file_kind_for_flags(fd).unwrap()));
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 }

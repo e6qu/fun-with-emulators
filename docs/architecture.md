@@ -748,7 +748,9 @@ keeping fwe's own descriptors apart and Linux's limits exact:
 - **Modes** (`crates/kernel/src/modes.rs`): a mode that denies its owner,
   or set-ID bits (which the host drops from a file of a group its user is
   not in, and on any write), is kept in `org.fwe.mode`, the file flagged
-  `UF_NODUMP`; `stat` reports it. A write by a caller without
+  `UF_NODUMP`; `stat` reports it. The guest's own no-dump flag
+  (`chattr +d`) is recorded apart, in `org.fwe.nodump`, so the inode flags
+  and `statx` report only it, and changing them keeps the mark. A write by a caller without
   `CAP_FSETID` clears a file's set-ID bits, as on Linux. Where a path is
   too long for the host, its attributes go through a descriptor. A
   regular file `open` makes has its mode itself on the host where only

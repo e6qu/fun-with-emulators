@@ -6997,3 +6997,15 @@ fn access_checks_the_guests_ids() {
          user W_OK: EACCES beyond a closed dir: EACCES\nreal: EACCES effective: ok\n"
     );
 }
+
+/// The no-dump flag is the guest's own: a file given another owner (which
+/// fwe keeps under a host flag of the same name) is not no-dump to
+/// `lsattr` or `statx`, `chattr -d` keeps its owner, and `chattr +d` shows.
+#[test]
+fn nodump_is_apart_from_kept_owners() {
+    assert_eq!(
+        fsrules("nodump"),
+        "owned no-dump: (false, false)\nafter clearing: 1000:100\n\
+         set: (true, true) owner 1000:100\n"
+    );
+}
