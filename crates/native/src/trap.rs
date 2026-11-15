@@ -567,11 +567,17 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, true);
     }
-    let nr = regs.x[8];
-    let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    let mut nr = regs.x[8];
+    let mut args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
-        let action = fwe_kernel::seccomp::check(nr, &args, regs.pc);
+        let mut action = fwe_kernel::seccomp::check(nr, &args, regs.pc);
+        // A tracer's turn (`SECCOMP_RET_TRACE`): the call as it leaves it.
+        if let fwe_kernel::seccomp::Action::Trace(data) = action {
+            action = kernel().as_mut().unwrap().seccomp_trace(&mut regs, data);
+            nr = regs.x[8];
+            args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+        }
         if action == fwe_kernel::seccomp::Action::KillThread
             && fwe_kernel::thread::live_threads() > 1
         {

@@ -201,6 +201,39 @@ fn changes_security(nr: u64) -> bool {
 }
 
 impl<P: Platform> Kernel<P> {
+    /// Whether the caller may make a socket of `domain`, `type_` and
+    /// `protocol` (one the host can make, checked after): a raw IP socket
+    /// takes `CAP_NET_RAW` in the user namespace owning the network
+    /// namespace (`EPERM`); an ICMP datagram ("ping") socket a group in
+    /// `net.ipv4.ping_group_range` (`EACCES`), as Linux's `ping_init_sock`.
+    fn may_open_socket(&self, domain: u64, type_: u64, protocol: u64) -> Result<(), i32> {
+        use fwe_abi::socket::{AF_INET, AF_INET6, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK};
+        if !matches!(domain, AF_INET | AF_INET6)
+            || crate::net::check_socket(domain, type_, protocol).is_err()
+        {
+            return Ok(());
+        }
+        match type_ & SOCK_TYPE_MASK {
+            SOCK_RAW if !self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_RAW) => {
+                Err(errno::EPERM)
+            }
+            SOCK_DGRAM
+                if (domain, protocol) == (AF_INET, 1) || (domain, protocol) == (AF_INET6, 58) =>
+            {
+                let range = crate::sysctl::text(b"net/ipv4/ping_group_range").unwrap_or_default();
+                let mut w = range.split_whitespace().map(|v| v.parse::<u32>().unwrap_or(u32::MAX));
+                let (lo, hi) = (w.next().unwrap_or(1), w.next().unwrap_or(0));
+                let c = &self.creds;
+                let ns = |g| crate::userns::to_ns(g, true);
+                let ok = std::iter::once(c.egid)
+                    .chain(c.groups.iter().copied())
+                    .any(|g| (lo..=hi).contains(&ns(g)));
+                if ok { Ok(()) } else { Err(errno::EACCES) }
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// What of the credentials Linux's `commit_creds` compares: the
     /// effective and filesystem ids, and the permitted capabilities.
     fn cred_marks(&self) -> ([u32; 4], u64) {
@@ -413,6 +446,7 @@ impl<P: Platform> Kernel<P> {
                 a[2],
                 self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_ADMIN),
             ),
+            nr::SOCKET if let Err(e) = self.may_open_socket(a[0], a[1], a[2]) => err(e),
             // SAFETY: socket takes no pointers.
             nr::SOCKET => unsafe { crate::net::socket(a[0], a[1], a[2]) },
             // SAFETY: the sv pointer is validated by the host/impl.
@@ -798,10 +832,13 @@ impl<P: Platform> Kernel<P> {
             nr::SETPRIORITY => self.sys_setpriority(a[0], a[1] as i32, a[2] as i32),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
             nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
-            // `CAP_BPF` or `CAP_SYS_ADMIN`, as Linux's `bpf_capable`.
+            // `CAP_BPF` or `CAP_SYS_ADMIN`, as Linux's `bpf_capable`, unless
+            // `kernel.unprivileged_bpf_disabled` is 0 and the command one
+            // Linux then leaves to anyone.
             nr::BPF
                 if !self.creds.has(crate::caps::CAP_SYS_ADMIN)
-                    && !self.creds.has(crate::caps::CAP_BPF) =>
+                    && !self.creds.has(crate::caps::CAP_BPF)
+                    && !crate::bpf::unprivileged_allows(a[0], a[1]) =>
             {
                 err(errno::EPERM)
             }
@@ -1845,8 +1882,8 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// `capget(hdr, data)`: the caller's capabilities (another process's
-    /// fwe does not hold: `ESRCH`).
+    /// `capget(hdr, data)`: the caller's capabilities, or another
+    /// process's as its record holds them.
     fn sys_capget(&mut self, hdr: u64, data: u64) -> i64 {
         let (words, pid) = match self.cap_words(hdr) {
             Ok(v) => v,
@@ -1855,19 +1892,28 @@ impl<P: Platform> Kernel<P> {
         if pid < 0 {
             return err(errno::EINVAL);
         }
-        if pid != 0 && pid != thread::tgid() {
-            return err(errno::ESRCH);
-        }
+        // Another process's sets are those its record holds (root's for
+        // one fwe has no record of); a thread's are its process's.
+        let own = pid == 0 || pid == thread::tgid() || thread::host_thread(pid).is_some();
+        let sets = if own {
+            let c = &self.creds.caps;
+            [c.effective, c.permitted, c.inheritable]
+        } else {
+            let Some(host) = crate::pidns::to_host(pid).filter(|&h| host::process_exists(h)) else {
+                return err(errno::ESRCH);
+            };
+            let s = crate::procreg::security(host).unwrap_or_default();
+            [s.caps[0], s.caps[1], s.caps[2]]
+        };
         if data == 0 {
             return 0;
         }
-        let c = &self.creds.caps;
         let mut out = [0u32; 6];
         for w in 0..words {
             let shift = 32 * w as u64;
-            out[w * 3] = (c.effective >> shift) as u32;
-            out[w * 3 + 1] = (c.permitted >> shift) as u32;
-            out[w * 3 + 2] = (c.inheritable >> shift) as u32;
+            for (i, set) in sets.iter().enumerate() {
+                out[w * 3 + i] = (set >> shift) as u32;
+            }
         }
         guest!(uaccess::write_from(data, &bytemuck_u32(&out[..words * 3])));
         0
@@ -2100,7 +2146,36 @@ impl<P: Platform> Kernel<P> {
             // kernel lock; the last one takes the process with it.
             Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
             Action::KillStrict => self.terminate_by(signal::SIGKILL),
+            // No tracer took it: the call fails as Linux fails it then.
+            Action::Trace(_) => self.finish_syscall(regs, nr, args, err(errno::ENOSYS)),
+            // The tracer skipped it: what it left in `x0` is the result.
+            Action::Skip => {
+                let x0 = regs.x[0] as i64;
+                self.finish_syscall(regs, nr, args, x0);
+            }
         }
+    }
+
+    /// `SECCOMP_RET_TRACE` with `data` for the call in `regs`: a tracer
+    /// that asked for it (`PTRACE_O_TRACESECCOMP`) stops the call with
+    /// `PTRACE_EVENT_SECCOMP` (its message `data`) and may change it; then
+    /// the filters run again on what it left, a call it set to -1 being
+    /// skipped, as Linux's `__seccomp_filter` has it. Without such a tracer,
+    /// [`crate::seccomp::Action::Trace`] stands (`ENOSYS`).
+    pub fn seccomp_trace(&mut self, regs: &mut crate::Regs, data: u16) -> crate::seccomp::Action {
+        use crate::seccomp::Action;
+        if !crate::ptrace::traced()
+            || crate::ptrace::options() & crate::ptrace::PTRACE_O_TRACESECCOMP == 0
+        {
+            return Action::Trace(data);
+        }
+        self.ptrace_event_stop(regs, crate::ptrace::PTRACE_EVENT_SECCOMP, u64::from(data));
+        let nr = regs.x[8];
+        if nr as i64 == -1 {
+            return Action::Skip;
+        }
+        let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+        crate::seccomp::recheck(nr, &args, regs.pc)
     }
 
     /// `reboot(magic, magic2, cmd)`, checked as Linux checks it: the
@@ -2207,6 +2282,7 @@ impl<P: Platform> Kernel<P> {
             caps: Some(c.caps),
             no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
             seccomp: crate::seccomp::mode(),
+            filters: crate::seccomp::filter_count(),
             umask: self.fs().umask(),
             locked: crate::maps::record().locked_bytes(),
             tracer: match crate::ptrace::tracer_of(host) {

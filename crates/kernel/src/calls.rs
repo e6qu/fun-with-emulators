@@ -126,8 +126,6 @@ const SYSLOG_ACTION_CONSOLE_ON: u64 = 7;
 const SYSLOG_ACTION_CONSOLE_LEVEL: u64 = 8;
 const SYSLOG_ACTION_SIZE_UNREAD: u64 = 9;
 const SYSLOG_ACTION_SIZE_BUFFER: u64 = 10;
-/// The kernel log's size Linux reports (`CONFIG_LOG_BUF_SHIFT` of 17).
-const LOG_BUF_LEN: i64 = 1 << 17;
 
 impl<P: Platform> Kernel<P> {
     /// `getcpu(cpu, node, cache)`: the CPU the caller runs on, as far as
@@ -375,11 +373,19 @@ impl<P: Platform> Kernel<P> {
                 if !uaccess::valid(buf, len as u64, true) {
                     return err(errno::EFAULT);
                 }
-                // An empty log: a read of it waits for none, nothing to
-                // copy.
+                // A destructive read takes what is unread, at once (with
+                // nothing unread, nothing: it does not wait for more).
+                let text = match ty {
+                    SYSLOG_ACTION_READ => crate::klog::read_unread(len as usize),
+                    _ => crate::klog::read_all(len as usize, ty == SYSLOG_ACTION_READ_CLEAR),
+                };
+                guest!(uaccess::write_from(buf, &text));
+                text.len() as i64
+            }
+            SYSLOG_ACTION_CLEAR => {
+                crate::klog::clear();
                 0
             }
-            SYSLOG_ACTION_CLEAR => 0,
             // The console's level (`kernel.printk`'s first): off is the
             // least it may be, the level before kept for on.
             SYSLOG_ACTION_CONSOLE_OFF => {
@@ -408,8 +414,8 @@ impl<P: Platform> Kernel<P> {
                 SAVED_LEVEL.store(-1, SeqCst);
                 set_printk(p)
             }
-            SYSLOG_ACTION_SIZE_UNREAD => 0,
-            _ => LOG_BUF_LEN,
+            SYSLOG_ACTION_SIZE_UNREAD => crate::klog::unread() as i64,
+            _ => crate::klog::LOG_BUF_LEN as i64,
         }
     }
 

@@ -1180,7 +1180,7 @@ control messages ([Sockets](#sockets)). `AF_UNIX`, `AF_INET` and
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `socket`, `socketpair` | family, type and protocol checked; `SOCK_NONBLOCK`/`SOCK_CLOEXEC` applied after; every socket `SO_NOSIGPIPE`; a Unix socket gets Linux's 212,992-byte buffers; `SOCK_SEQPACKET` Unix sockets are framed streams; `socketpair` of a non-Unix family is `EOPNOTSUPP` | `socket`, `socketpair`, `fcntl`, `setsockopt` |
+| `socket`, `socketpair` | family, type and protocol checked; `SOCK_NONBLOCK`/`SOCK_CLOEXEC` applied after; every socket `SO_NOSIGPIPE`; a raw IP socket needs `CAP_NET_RAW` in the user namespace owning the network namespace (`EPERM`; the host may refuse it still), an ICMP datagram (ping) socket a group in `net.ipv4.ping_group_range` (`EACCES`); a Unix socket gets Linux's 212,992-byte buffers; `SOCK_SEQPACKET` Unix sockets are framed streams; `socketpair` of a non-Unix family is `EOPNOTSUPP` | `socket`, `socketpair`, `fcntl`, `setsockopt` |
 | `socket(AF_NETLINK)` and calls on it | `NETLINK_ROUTE` only, `SOCK_RAW` or `SOCK_DGRAM`; fwe answers each request; `bind`, `connect`, `getsockname`, `getpeername` and `SOL_NETLINK` options are fwe's | `socketpair(AF_UNIX, SOCK_DGRAM)`, `send`, `recv` |
 | `bind`, `connect` | address checked against the socket's family and translated; a port below `ip_unprivileged_port_start` needs `CAP_NET_BIND_SERVICE` (`EACCES`); ports mapped in an fwe network namespace, and in the host's a port below 1024 on a loopback address (macOS keeps one for root, but on the wildcard address) mapped to an ephemeral one that fwe's processes reach and see by its number; a bound Unix node gets the socket's mode less the umask, and the guest's owner; `connect` to `AF_UNSPEC` disconnects | `bind`, `connect` (from the path's directory with `pthread_fchdir_np` for a long path), `fchmodat` |
 | `listen` | the host given one more than the backlog, as Linux queues one connection past it (a negative backlog or one past the namespace's `net.core.somaxconn` taken as it) | `listen` |
@@ -1333,7 +1333,7 @@ that the processes in them name ([Namespaces](#namespaces)).
 | `setuid`, `setreuid`, `setresuid`, `setgid`, `setregid`, `setresgid` | Linux's rules on the virtual ids; arguments mapped up (`EINVAL` if unmapped); capabilities adjusted as Linux adjusts them; new ids published to the process record | none |
 | `setfsuid`, `setfsgid` | set if permitted; always the previous id back; an unmapped id changes nothing | none |
 | `setgroups` | `CAP_SETGID`; up to 65536 groups, mapped up; `EPERM` in a user namespace whose `setgroups` is `deny` or whose `gid_map` is unwritten | none |
-| `capget`, `capset` | effective, permitted and inheritable sets, header versions 1 to 3; the caller's process only | none |
+| `capget`, `capset` | effective, permitted and inheritable sets, header versions 1 to 3; `capget` of another process reads the sets its record holds, `capset` is the caller's own only | none |
 | `unshare` | mount, UTS, IPC, network, cgroup, pid and user namespaces as new records, each owned by the caller's user namespace (a new one if it makes one too); `CAP_SYS_ADMIN` in that user namespace except for a user namespace; `CLONE_NEWTIME` is `EINVAL` | none |
 | `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN` in a user namespace it joins, and for another kind in the namespace's owner and in the caller's own (with `CAP_SYS_CHROOT` too for a mount namespace) | none |
 | `clone`, `clone3` with `CLONE_NEW*` | the same namespaces made before the host `fork`, so the child inherits them | `fork` (by the backend) |
@@ -1347,8 +1347,9 @@ process's shared record so that other processes see them in
 
 **`capget`, `capset`**: a version-1 header reads or writes 32 bits of
 each set, versions 2 and 3 64 bits; an unknown version is answered with
-version 3 and `EINVAL`. fwe holds no other process's capabilities:
-`capget` of another pid fails with `ESRCH`, `capset` of one with `EPERM`.
+version 3 and `EINVAL`. Each process publishes its sets in its record
+when a call changes them, which `capget` of another pid reads (`ESRCH`
+for none); `capset` of another fails with `EPERM`.
 
 **`unshare`, `clone`**: a new namespace is a fresh shared record, and
 the process's record lists its namespaces. `CLONE_NEWUSER` needs no
@@ -1386,7 +1387,7 @@ otherwise.
 | `uname` | `Linux`, `6.12.0-fwe` (a 2.6 release under `UNAME26`), `#1 SMP PREEMPT`, `aarch64`; host and domain names from the UTS namespace | `gethostname` in the initial UTS namespace |
 | `sethostname`, `setdomainname` | `CAP_SYS_ADMIN` in the user namespace owning the UTS namespace, at most 64 bytes; set in an fwe UTS namespace; `EPERM` in the initial one, even for root, where Linux would rename the machine: its names are the Mac's | none |
 | `sysinfo` | host uptime, load averages and memory (as `/proc/meminfo`); `procs` the tasks of the processes the caller's pid namespace holds | `clock_gettime(CLOCK_MONOTONIC)`, `getloadavg`, `host_statistics64`, `sysctl` |
-| `syslog` | an empty kernel log; read, clear and console level need `CAP_SYSLOG` or `CAP_SYS_ADMIN`; the console level is `kernel.printk`'s | none |
+| `syslog` | the kernel log, every fwe process's, holding the audit records of logged seccomp actions; read, clear and console level need `CAP_SYSLOG` or `CAP_SYS_ADMIN`; the console level is `kernel.printk`'s | none |
 | `getrandom` | flags checked (`GRND_RANDOM` with `GRND_INSECURE` is `EINVAL`); never waits; at most 32 MiB a call | `arc4random_buf` |
 | `reboot` | `CAP_SYS_BOOT` in the user namespace owning the pid namespace, and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
 | `vhangup` | `CAP_SYS_TTY_CONFIG`, then nothing | none |
@@ -1407,9 +1408,9 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
 | `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Who may trace whom as Linux's `ptrace_may_access`, Yama's `kernel.yama.ptrace_scope` and Landlock decide. Only fwe's processes can be traced. | `__ulock_wait2`/`__ulock_wake` on pages of the process store, `kill` |
-| `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
+| `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; logged actions written to the kernel log; `SECCOMP_RET_TRACE` stopping a tracer that set `PTRACE_O_TRACESECCOMP`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`, see [architecture.md](architecture.md#known-limitations)). | none |
 | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path (truncation and device `ioctl` decided as a file is opened, for every descriptor of it), TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); mounts refused in a domain that restricts files; the domain is the process's, carried by `fork` and `execve` | the open file description's no-`SIGPIPE` flag (`F_SETNOSIGPIPE`) marks a refused truncation or `ioctl` |
-| `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
+| `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`, but for maps and socket filters while `kernel.unprivileged_bpf_disabled` is 0 (2 by default, 1 for good). Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
 
 **`ptrace`**: each traced thread has a mailbox, a page of fwe's shared
 process store that it and its tracer use. At a stop (a signal about to be
@@ -2193,9 +2194,15 @@ macOS has no seccomp. fwe runs each filter, classic BPF over Linux's
 (`crates/kernel/src/seccomp.rs`), so none escapes it; the action of
 highest precedence wins. Filters apply to every thread of the process and
 are kept across `fork` and `execve`. `SECCOMP_RET_TRAP` raises `SIGSYS`
-with Linux's `_sigsys` fields; `SECCOMP_RET_TRACE` and
-`SECCOMP_RET_USER_NOTIF` fail the call with `ENOSYS`, as Linux does with
-no tracer or listener. Strict mode allows `read`, `write`, `exit` and
+with Linux's `_sigsys` fields; `SECCOMP_RET_TRACE` stops a tracer that
+set `PTRACE_O_TRACESECCOMP` (`PTRACE_EVENT_SECCOMP`, the filter's data as
+its message), which may change the call or skip it (number -1), and the
+filters then run again on what it left; without such a tracer it fails
+the call with `ENOSYS`, as `SECCOMP_RET_USER_NOTIF` always does (there is
+no listener). `SECCOMP_RET_LOG`, the kill actions, and the others from a
+filter installed with `SECCOMP_FILTER_FLAG_LOG` write Linux's audit
+record (`type=1326`) to the kernel log, which `dmesg` reads;
+`/proc/<pid>/status` counts the filters (`Seccomp_filters`). Strict mode allows `read`, `write`, `exit` and
 `rt_sigreturn` and ends the process with `SIGKILL` on any other call.
 `PR_SET_SECCOMP` and `PR_GET_SECCOMP` reach the same code.
 

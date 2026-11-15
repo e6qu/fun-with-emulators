@@ -179,6 +179,7 @@ fn name(e: i32) -> &'static str {
         ENXIO => "ENXIO",
         EAFNOSUPPORT => "EAFNOSUPPORT",
         8 => "ENOEXEC",
+        38 => "ENOSYS",
         _ => "?",
     }
 }
@@ -694,6 +695,120 @@ fn main() {
                 }
                 waitpid(-1, std::ptr::null_mut(), 0);
                 println!("outside it: {}", has("/tmp/u"));
+            }
+            // seccomp beyond allowing and refusing: the number of filters
+            // shown, a logged action in the kernel log, a traced action
+            // stopping a tracer that asked for it (and `ENOSYS` without
+            // one); another process's capabilities; who may make ping and
+            // raw sockets; the security sysctls.
+            Some("seccomp-more") => {
+                let prog = |insns: &[(u16, u8, u8, u32)]| {
+                    let raw: Vec<u8> = insns
+                        .iter()
+                        .flat_map(|&(c, t, f, k)| {
+                            let mut b = c.to_le_bytes().to_vec();
+                            b.extend([t, f]);
+                            b.extend(k.to_le_bytes());
+                            b
+                        })
+                        .collect();
+                    raw
+                };
+                let install = |raw: &[u8]| {
+                    let fprog = [(raw.len() / 8) as u64, raw.as_ptr() as u64];
+                    syscall(277, 1, 0, fprog.as_ptr())
+                };
+                let log_ppid = prog(&[(0x20, 0, 0, 0), (0x15, 0, 1, 173), (6, 0, 0, 0x7ffc_0000), (6, 0, 0, 0x7fff_0000)]);
+                let trace_pid = prog(&[(0x20, 0, 0, 0), (0x15, 0, 1, 172), (6, 0, 0, 0x7ff0_0000 | 42), (6, 0, 0, 0x7fff_0000)]);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    prctl(38, 1, 0, 0, 0);
+                    install(&log_ppid);
+                    install(&trace_pid);
+                    let status = text("/proc/self/status");
+                    let line = status.lines().find(|l| l.starts_with("Seccomp_filters:")).unwrap_or("");
+                    println!("{line}");
+                    syscall(173);
+                    let mut buf = vec![0u8; 1 << 17];
+                    let n = syscall(116, 3, buf.as_mut_ptr(), buf.len());
+                    let log = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+                    let logged = log.lines().any(|l| l.contains("type=1326") && l.contains("syscall=173"));
+                    println!("logged in the kernel log: {logged}");
+                    println!("traced, no tracer: {}", res(syscall(172)));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                // A tracer that asked for seccomp's stops.
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                let child = fork();
+                if child == 0 {
+                    syscall(117, 0, 0, 0, 0);
+                    syscall(129, getpid(), 19);
+                    prctl(38, 1, 0, 0, 0);
+                    install(&trace_pid);
+                    let r = syscall(172);
+                    println!("traced call returns: {}", r == getpid() as i64);
+                    _exit(0);
+                }
+                let mut st = 0;
+                waitpid(child, &mut st, 0);
+                syscall(117, 0x4200, child, 0, 0x80);
+                syscall(117, 7, child, 0, 0);
+                waitpid(child, &mut st, 0);
+                let mut msg = 0u64;
+                syscall(117, 0x4201, child, 0, &mut msg as *mut u64);
+                println!("seccomp stop: event {} signal {} data {msg}", (st >> 16) & 0xff, (st >> 8) & 0xff);
+                // On to its end, past any other stop.
+                loop {
+                    syscall(117, 7, child, 0, 0);
+                    waitpid(child, &mut st, 0);
+                    if st & 0x7f != 0x7f {
+                        break;
+                    }
+                }
+                // Another process's capabilities.
+                let mut ready = [0i32; 2];
+                pipe2(ready.as_mut_ptr(), 0);
+                let other = fork();
+                if other == 0 {
+                    let hdr = [0x2008_0522u32, 0];
+                    let data = [0u32; 6];
+                    syscall(91, hdr.as_ptr(), data.as_ptr());
+                    write(ready[1], b"r".as_ptr(), 1);
+                    loop {
+                        usleep(100_000);
+                    }
+                }
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
+                let hdr = [0x2008_0522u32, other as u32];
+                let mut data = [0u32; 6];
+                let r = syscall(90, hdr.as_ptr(), data.as_mut_ptr());
+                println!("capget of another: {} effective {:#x}", res(r), data[0]);
+                syscall(129, other, 9);
+                waitpid(other, std::ptr::null_mut(), 0);
+                // Ping and raw sockets, in a network namespace of its own.
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    unshare(CLONE_NEWNET);
+                    let ping = |label: &str| {
+                        let s = socket(2, 2, 1);
+                        println!("{label}: {}", res(s as i64));
+                        if s >= 0 {
+                            close(s);
+                        }
+                    };
+                    ping("ping socket, default range");
+                    std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 2147483647").unwrap();
+                    ping("ping socket, every group");
+                    setuid(1000);
+                    println!("raw socket without CAP_NET_RAW: {}", res(socket(2, 3, 1) as i64));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                for s in ["kernel/unprivileged_bpf_disabled", "kernel/yama/ptrace_scope", "fs/suid_dumpable"] {
+                    println!("{s}: {}", text(&format!("/proc/sys/{s}")).trim());
+                }
             }
             // A program only the VM runs, on a host without one: the exec
 

@@ -728,6 +728,21 @@ fn dword(a: &[u8], at: usize) -> u64 {
     a.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
+/// Whether `bpf(cmd, attr)` is open to a caller without `CAP_BPF` or
+/// `CAP_SYS_ADMIN`: only with `kernel.unprivileged_bpf_disabled` at 0,
+/// and then, as Linux, a map's making and its elements' commands, and the
+/// loading of a socket filter.
+pub fn unprivileged_allows(cmd: u64, attr: u64) -> bool {
+    if crate::sysctl::number(b"kernel/unprivileged_bpf_disabled") != Some(0) {
+        return false;
+    }
+    match cmd {
+        0..=4 => true,
+        BPF_PROG_LOAD => crate::uaccess::read::<u32>(attr) == Ok(BPF_PROG_TYPE_SOCKET_FILTER),
+        _ => false,
+    }
+}
+
 /// `bpf(cmd, attr, size)`: maps and their elements ([`crate::bpfmap`]);
 /// the device controller's programs: load, attach, detach, query, and a
 /// descriptor by identity; socket filters, loaded with the maps they use

@@ -21,6 +21,7 @@ pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_ADMIN: u32 = 12;
+pub const CAP_NET_RAW: u32 = 13;
 pub const CAP_IPC_LOCK: u32 = 14;
 pub const CAP_IPC_OWNER: u32 = 15;
 pub const CAP_SYS_MODULE: u32 = 16;

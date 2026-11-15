@@ -386,6 +386,8 @@ pub struct Creds {
     pub caps: Option<crate::caps::Caps>,
     pub no_new_privs: bool,
     pub seccomp: u8,
+    /// How many seccomp filters it has.
+    pub filters: u32,
     pub umask: u32,
     /// Bytes of memory locked (`mlock`).
     pub locked: u64,
@@ -433,7 +435,7 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
         h.threads,
         u8::from(c.no_new_privs),
         c.seccomp,
-        u8::from(c.seccomp == 2),
+        c.filters,
         crate::procfs::ncpu_hint().saturating_sub(1),
     )
     .into_bytes()
@@ -540,6 +542,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
                 }),
                 no_new_privs: s.no_new_privs,
                 seccomp: s.seccomp,
+                filters: s.filters,
                 tracer: if tracer == 0 { 0 } else { crate::pidns::to_guest(tracer) },
                 ..Creds::default()
             }

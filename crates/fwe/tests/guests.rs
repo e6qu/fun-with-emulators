@@ -6603,6 +6603,27 @@ fn file_capabilities_are_checked_and_cleared() {
     );
 }
 
+/// seccomp beyond allowing and refusing: `Seccomp_filters` counts the
+/// filters; `SECCOMP_RET_LOG` writes an audit record to the kernel log
+/// (`syslog`); `SECCOMP_RET_TRACE` stops a tracer that set
+/// `PTRACE_O_TRACESECCOMP` with `PTRACE_EVENT_SECCOMP` and the filter's
+/// data, then the call goes on, and fails with `ENOSYS` without one.
+/// `capget` reads another process's sets; a ping socket takes a group in
+/// `net.ipv4.ping_group_range`, a raw one `CAP_NET_RAW`; the security
+/// sysctls are there at Linux's defaults.
+#[test]
+fn seccomp_logs_and_traces_and_security_sysctls() {
+    assert_eq!(
+        containers("seccomp-more"),
+        "Seccomp_filters:\t2\nlogged in the kernel log: true\ntraced, no tracer: ENOSYS\n\
+         seccomp stop: event 7 signal 5 data 42\ntraced call returns: true\n\
+         capget of another: ok effective 0x0\n\
+         ping socket, default range: EACCES\nping socket, every group: ok\n\
+         raw socket without CAP_NET_RAW: EPERM\n\
+         kernel/unprivileged_bpf_disabled: 2\nkernel/yama/ptrace_scope: 1\nfs/suid_dumpable: 0\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.

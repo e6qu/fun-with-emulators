@@ -953,7 +953,12 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `domainname` written as `sethostname` sets them),
   `kernel/random/{entropy_avail,poolsize,uuid,boot_id}`, `fs/{nr_open,
   file-max,pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,
-  lease-break-time,protected_symlinks,protected_hardlinks}`,
+  lease-break-time,protected_symlinks,protected_hardlinks,suid_dumpable}`,
+  `kernel/{yama/ptrace_scope,unprivileged_bpf_disabled}` (the security
+  ones: Yama's scope decides attaching, 3 for good, set with
+  `CAP_SYS_PTRACE`; BPF's opens maps and socket filters to anyone at 0,
+  1 for good; `suid_dumpable` is what a process that changed its ids is
+  left; `net.ipv4.ping_group_range` decides ping sockets),
   `fs/inotify/*`, `fs/mqueue/*`,
   `vm/{overcommit_memory,mmap_min_addr,drop_caches,max_map_count}`,
   `kernel/keys/*`, `user/max_*_namespaces`, the IPC limits and a network
@@ -1293,7 +1298,8 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   Yama's named tracer, parent-death signal, timer slack, transparent huge pages and speculation
   control (reported as not affected); others fail with `EINVAL`.
 - `getcpu`, `vhangup`, `readahead`, `sync_file_range`,
-  `syslog` (an empty kernel log) and `membarrier` check their arguments
+  `syslog` (the kernel log, `crates/kernel/src/klog.rs`, which holds
+  the audit records of logged seccomp actions) and `membarrier` check their arguments
   and permissions as Linux does (`crates/kernel/src/calls.rs`);
   `rt_sigqueueinfo` and `rt_tgsigqueueinfo` send with the caller's
   `siginfo`.
@@ -1585,8 +1591,17 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   cgroup v1; the tree is the user's, not the machine's. A new thread in
   the VM backend is not held to `pids.max` or `RLIMIT_NPROC`.
 - seccomp filters apply to every thread (as with
-  `SECCOMP_FILTER_FLAG_TSYNC`); there is no user-notification listener
-  (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`).
+  `SECCOMP_FILTER_FLAG_TSYNC`). There is no user-notification listener:
+  `SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL` (so libseccomp
+  reports `SCMP_ACT_NOTIFY` unsupported) and `SECCOMP_RET_USER_NOTIF` with
+  `ENOSYS`. A listener needs a descriptor any process may hold (passed
+  over a socket, inherited) whose `poll` wakes when a call waits, a
+  calling thread held in its call until a process it does not know
+  answers through that descriptor, and `SECCOMP_IOCTL_NOTIF_ADDFD`'s
+  placing of the supervisor's descriptor in the caller's table, which on
+  macOS only the caller itself can do; none of that is built.
+  `kernel.seccomp.actions_logged` is fixed at Linux's default, and a
+  destructive `syslog` read takes what is there without waiting for more.
 
 **Signals**
 - `RLIMIT_SIGPENDING` counts the signals pending in each process, not in

@@ -44,6 +44,7 @@ pub mod keycrypto;
 pub mod keys;
 mod keytypes;
 pub mod klock;
+pub mod klog;
 pub mod landlock;
 mod landlockops;
 pub mod lazycode;

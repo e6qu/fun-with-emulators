@@ -681,7 +681,7 @@ fn buffer_size(fd: i32, optname: u64, optval: u64, optlen: u64, admin: bool) -> 
 /// range, the type and its flags, the family, then the type and protocol
 /// the family has (a raw IP socket names its protocol; a Unix socket's is
 /// 0 or `PF_UNIX`).
-fn check_socket(domain: u64, type_: u64, protocol: u64) -> Result<libc::c_int, i64> {
+pub(crate) fn check_socket(domain: u64, type_: u64, protocol: u64) -> Result<libc::c_int, i64> {
     // NPROTO and SOCK_MAX.
     if domain >= 46 {
         return Err(err(errno::EAFNOSUPPORT));

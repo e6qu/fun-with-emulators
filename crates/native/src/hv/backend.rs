@@ -1498,11 +1498,17 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(regs, true);
     }
-    let n = regs.x[8];
-    let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    let mut n = regs.x[8];
+    let mut args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
-        let action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        let mut action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        // A tracer's turn (`SECCOMP_RET_TRACE`): the call as it leaves it.
+        if let fwe_kernel::seccomp::Action::Trace(data) = action {
+            action = kernel().as_mut().unwrap().seccomp_trace(regs, data);
+            n = regs.x[8];
+            args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+        }
         if action == fwe_kernel::seccomp::Action::KillThread && thread::live_threads() > 1 {
             // The thread ends without the kernel lock, as `exit` does.
             let _ = vcpu;

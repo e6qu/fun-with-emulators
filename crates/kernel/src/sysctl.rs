@@ -123,6 +123,8 @@ enum Kind {
 const INT_MAX: i64 = i32::MAX as i64;
 /// Yama's `ptrace_scope`, whose writes are Yama's to check.
 const YAMA_SCOPE: &[u8] = b"kernel/yama/ptrace_scope";
+/// `kernel.unprivileged_bpf_disabled`, likewise BPF's.
+const BPF_DISABLED: &[u8] = b"kernel/unprivileged_bpf_disabled";
 /// `IPCMNI`: the most objects of a kind a namespace may have.
 const IPCMNI: i64 = 32768;
 
@@ -261,6 +263,10 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, 1),
         space: Space::Global,
     },
+    // Whether `bpf` is closed to callers without `CAP_BPF` or
+    // `CAP_SYS_ADMIN`: 0 open (to maps and socket filters), 1 closed for
+    // good, 2 closed (Linux's default).
+    Sysctl { path: BPF_DISABLED, default: "2", kind: Kind::Int(0, 2), space: Space::Global },
     // Whether a process that raised privilege, or changed its credentials,
     // stays dumpable: 0 no, 1 yes, 2 for root only (`PR_GET_DUMPABLE` 2).
     Sysctl { path: b"fs/suid_dumpable", default: "0", kind: Kind::Int(0, 2), space: Space::Global },
@@ -603,7 +609,9 @@ pub fn is_dir(path: &[u8]) -> bool {
 pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result<Mark, i32>> {
     use crate::caps::{CAP_DAC_OVERRIDE, CAP_NET_ADMIN};
     let i = index(path)?;
-    if SYSCTLS[i].path == YAMA_SCOPE && !creds.has(crate::caps::CAP_SYS_PTRACE) {
+    if SYSCTLS[i].path == YAMA_SCOPE && !creds.has(crate::caps::CAP_SYS_PTRACE)
+        || SYSCTLS[i].path == BPF_DISABLED && !creds.has(crate::caps::CAP_SYS_ADMIN)
+    {
         return Some(Err(errno::EPERM));
     }
     let allowed = match SYSCTLS[i].space {
@@ -655,6 +663,12 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
                 if s.path == YAMA_SCOPE && *v != 3 && number(YAMA_SCOPE) == Some(3) =>
             {
                 return Some(fwe_abi::err(errno::EINVAL));
+            }
+            // So is BPF's 1.
+            (Kind::Int(..), [v])
+                if s.path == BPF_DISABLED && *v != 1 && number(BPF_DISABLED) == Some(1) =>
+            {
+                return Some(fwe_abi::err(errno::EPERM));
             }
             (Kind::Int(lo, hi), [v]) if (lo..=hi).contains(v) => v.to_string(),
             // A range of valid ids; a backwards one is taken as none

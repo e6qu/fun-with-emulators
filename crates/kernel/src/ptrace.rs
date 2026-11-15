@@ -58,10 +58,12 @@ pub const PTRACE_O_TRACECLONE: u64 = 0x8;
 pub const PTRACE_O_TRACEEXEC: u64 = 0x10;
 pub const PTRACE_O_TRACEVFORKDONE: u64 = 0x20;
 pub const PTRACE_O_TRACEEXIT: u64 = 0x40;
+pub const PTRACE_O_TRACESECCOMP: u64 = 0x80;
 pub const PTRACE_O_EXITKILL: u64 = 0x10_0000;
-/// The options fwe takes (not `PTRACE_O_TRACESECCOMP` or
-/// `PTRACE_O_SUSPEND_SECCOMP`, which need seccomp's tracer return).
+/// The options fwe takes (not `PTRACE_O_SUSPEND_SECCOMP`, checkpointing's
+/// switch that turns a tracee's seccomp off).
 const KNOWN_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
+    | PTRACE_O_TRACESECCOMP
     | PTRACE_O_TRACEFORK
     | PTRACE_O_TRACEVFORK
     | PTRACE_O_TRACECLONE
@@ -75,6 +77,7 @@ pub const PTRACE_EVENT_CLONE: i32 = 3;
 pub const PTRACE_EVENT_EXEC: i32 = 4;
 pub const PTRACE_EVENT_VFORK_DONE: i32 = 5;
 pub const PTRACE_EVENT_EXIT: i32 = 6;
+pub const PTRACE_EVENT_SECCOMP: i32 = 7;
 /// A seized tracee's stop that no signal or event made: an interrupt, a
 /// group-stop, the end of one.
 pub const PTRACE_EVENT_STOP: i32 = 128;
