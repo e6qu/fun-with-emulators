@@ -305,6 +305,7 @@ jobs:
             bench-*.sample
             bench-*.vmmap
             bench-*.pcs
+            bench-*.trace
       - if: failure()
         run: |
           mkdir -p crash-reports
