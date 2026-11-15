@@ -81,8 +81,18 @@ impl<P: Platform> Kernel<P> {
     /// `unshare(flags)`.
     pub(crate) fn sys_unshare(&mut self, flags: u64) -> i64 {
         // What a single-threaded process does not share anyway.
-        let unshared = CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_VM;
+        let unshared =
+            CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_VM | CLONE_THREAD;
         if flags & !(unshared | SUPPORTED) != 0 {
+            return err(errno::EINVAL);
+        }
+        // Its threads, signal handlers and memory are another thread's too
+        // while it has other threads: they cannot be made its own. (A
+        // process shares memory with no other process past a `vfork`,
+        // whose parent waits.)
+        if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0
+            && crate::thread::live_threads() > 1
+        {
             return err(errno::EINVAL);
         }
         // A descriptor table shared with another process, or with other

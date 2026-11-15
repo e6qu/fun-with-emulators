@@ -1270,8 +1270,12 @@ the process's record lists its namespaces. `CLONE_NEWUSER` needs no
 privilege, gives the caller every capability in the new namespace, and
 is refused (`EINVAL`) to a process with other threads; the other kinds
 need `CAP_SYS_ADMIN`. `CLONE_NEWPID` applies to children, and a second
-one before a child is made fails with `EINVAL`. `CLONE_FILES`, `CLONE_FS`,
-`CLONE_SYSVSEM`, `CLONE_SIGHAND` and `CLONE_VM` are accepted. In a process
+one before a child is made fails with `EINVAL`. `CLONE_FILES`, `CLONE_FS`
+and `CLONE_SYSVSEM` are accepted; `CLONE_THREAD`, `CLONE_SIGHAND` and
+`CLONE_VM` too in a process with one thread, and refused (`EINVAL`) with
+others, as Linux has it. Each namespace records the user namespace it was
+made in (`ns::set_owner`), which `NS_GET_USERNS` gives and the
+`user.max_*_namespaces` limits count it against. In a process
 with other threads, the caller's namespaces change alone, and
 `CLONE_FS` (which `CLONE_NEWNS` implies) gives it a root, working
 directory and umask of its own ([Namespaces](#namespaces)).
@@ -1279,7 +1283,8 @@ directory and umask of its own ([Namespaces](#namespaces)).
 **`setns`**: a namespace descriptor names the namespace's record
 (`crates/kernel/src/nsfd.rs`); `nstype` must be 0 or its kind. A pidfd
 joins each kind named in the flags that its process is in, the user
-namespace first. It changes the calling thread's namespaces only; a
+namespace first, all or none: if one fails, those joined before it are
+undone. It changes the calling thread's namespaces only; a
 mount namespace is refused (`EINVAL`) to a thread that shares its root
 with others.
 
@@ -1293,7 +1298,7 @@ otherwise.
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
 | `uname` | `Linux`, `6.12.0-fwe` (a 2.6 release under `UNAME26`), `#1 SMP PREEMPT`, `aarch64`; host and domain names from the UTS namespace | `gethostname` in the initial UTS namespace |
-| `sethostname`, `setdomainname` | `CAP_SYS_ADMIN`, at most 64 bytes; set in an fwe UTS namespace; `EPERM` in the initial one | none |
+| `sethostname`, `setdomainname` | `CAP_SYS_ADMIN`, at most 64 bytes; set in an fwe UTS namespace; `EPERM` in the initial one, even for root, where Linux would rename the machine: its names are the Mac's | none |
 | `sysinfo` | host uptime and load averages; fixed memory figures (8 GiB total, 4 GiB free), no swap, `procs` 1 | `clock_gettime(CLOCK_MONOTONIC)`, `getloadavg` |
 | `syslog` | an empty kernel log; read, clear and console level need `CAP_SYSLOG` or `CAP_SYS_ADMIN`; the console level is `kernel.printk`'s | none |
 | `getrandom` | flags checked (`GRND_RANDOM` with `GRND_INSECURE` is `EINVAL`); never waits; at most 32 MiB a call | `arc4random_buf` |
@@ -1962,7 +1967,7 @@ thread's.
 | UTS | `uname`, `sethostname`, `setdomainname` use its names; in the initial one the host's name is read and never set (`EPERM`) |
 | network (`netns.rs`) | a loopback interface, down until brought up; sockets reach only loopback; its ports are host loopback ports mapped through its table, so each namespace has its own port 80; its abstract `AF_UNIX` names and sysctls are its own |
 | IPC | its System V objects and POSIX queues |
-| cgroup | `/proc/self/cgroup` and `cgroup2` mounts show the tree from its root |
+| cgroup | `/proc/<pid>/cgroup` of any process and `cgroup2` mounts show the tree from its root (a cgroup outside it through `/..`, as Linux shows it) |
 | time | not made: `CLONE_NEWTIME` is `EINVAL` ([roadmap](../ROADMAP.md), not planned for 1.0) |
 
 Namespaces are fwe's kernel layer's, which both backends share: a program

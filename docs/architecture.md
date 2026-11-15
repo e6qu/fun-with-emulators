@@ -1388,9 +1388,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A port below 1024 bound on a loopback address of the initial namespace,
   when fwe is not root, is reached by its number only from fwe's
   processes: the host keeps it for root, so it is an ephemeral port there.
-- Capabilities are the process's, not qualified by user namespace; the
-  owning user namespace `NS_GET_USERNS` reports for a non-user namespace
-  is the caller's.
+- Capabilities are the process's, not qualified by user namespace.
 - A pid namespace's init killed from outside fwe after its parent ran
   another program ends its namespace only once that parent reaps it or a
   reaper sees it gone.

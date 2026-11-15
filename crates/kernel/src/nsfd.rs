@@ -266,12 +266,13 @@ impl<P: Platform> Kernel<P> {
                 let kind = if req == NS_GET_PARENT { n.kind } else { CLONE_NEWUSER };
                 // What is asked for: the parent (a user namespace's owner
                 // is its parent); for another kind's owner, the user
-                // namespace it was made in, which fwe takes as the
-                // caller's. `None`: there is none (an initial namespace's
-                // parent); `Some(None)`: the initial namespace.
+                // namespace it was made in ([`crate::ns::owner_of`]; the
+                // initial one for an initial namespace). `None`: there is
+                // none (an initial namespace's parent); `Some(None)`: the
+                // initial namespace.
                 let wanted: Option<Option<(Vec<u8>, u64)>> =
                     if req == NS_GET_USERNS && n.kind != CLONE_NEWUSER {
-                        Some(self.fs().ns.user.as_ref().map(|u| (u.dir().to_vec(), u.id())))
+                        Some(n.dir.as_deref().and_then(crate::ns::owner_of))
                     } else {
                         match &n.dir {
                             None => None,

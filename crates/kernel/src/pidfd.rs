@@ -573,12 +573,29 @@ impl<P: Platform> Kernel<P> {
             fds.push(r as i32);
             let _ = kind;
         }
+        // All or nothing: what one joined is undone if a later one fails.
+        let before = match self.fs().copy() {
+            Ok(fs) => fs,
+            Err(e) => {
+                close(&fds);
+                return err(e);
+            }
+        };
+        let caps = self.creds.caps;
         let mut r = 0;
         for (&f, (kind, _)) in fds.iter().zip(kinds.iter().filter(|(k, _)| flags & k != 0)) {
             r = self.sys_setns(f as u64, *kind);
             if r < 0 {
                 break;
             }
+        }
+        if r < 0 {
+            let fs = self.fs_mut();
+            fs.ns = before.ns.clone();
+            fs.set_mount_ns(before.mount_ns().clone());
+            fs.set_view(&before);
+            self.creds.caps = caps;
+            self.namespaces_changed();
         }
         close(&fds);
         r

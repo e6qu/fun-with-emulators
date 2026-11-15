@@ -947,6 +947,12 @@ impl Fs {
                         None => crate::procfs::Entry::Missing,
                     },
                     Some(h) if sub.starts_with(b"/fd/") => self.other_fd(h, &sub[4..]),
+                    Some(h) if sub == b"/cgroup" && crate::procreg::read(h).is_some() => {
+                        crate::procfs::Entry::File(crate::cgroupfs::proc_cgroup(
+                            &crate::procreg::cgroup_of(h),
+                            &self.cgroup_root(),
+                        ))
+                    }
                     Some(h) => crate::procpid::entry(h, pid, &sub),
                     None => crate::procfs::Entry::Missing,
                 });
@@ -1062,8 +1068,10 @@ impl Fs {
                 return Some(crate::procfs::Entry::File(crate::procpid::oom_file(sub, adj)));
             }
             b"/proc/self/cgroup" => {
-                let root = self.ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
-                return Some(crate::procfs::Entry::File(crate::cgroupfs::proc_self_cgroup(&root)));
+                return Some(crate::procfs::Entry::File(crate::cgroupfs::proc_cgroup(
+                    &crate::cgroupfs::current(),
+                    &self.cgroup_root(),
+                )));
             }
             b"/proc/sys/kernel/hostname" => {
                 return Some(crate::procfs::Entry::File([&self.ns.hostname()[..], b"\n"].concat()));
@@ -1108,6 +1116,11 @@ impl Fs {
             });
         }
         crate::procfs::lookup(&absolute, &self.proc)
+    }
+
+    /// The root of the process's cgroup namespace, a cgroup.
+    fn cgroup_root(&self) -> Vec<u8> {
+        self.ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone())
     }
 
     /// What `/proc/self/fd/<fd>` links to: the guest path of the open file,

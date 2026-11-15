@@ -518,15 +518,32 @@ pub fn current() -> Vec<u8> {
     procreg::own_cgroup()
 }
 
-/// `/proc/self/cgroup`: the cgroup from the cgroup namespace's root.
-pub fn proc_self_cgroup(ns_root: &[u8]) -> Vec<u8> {
-    let cg = current();
-    let shown = match crate::mounts::under(&cg, ns_root) {
-        Some(b"") => b"/".to_vec(),
-        Some(r) => r.to_vec(),
-        None => cg,
+/// `/proc/<pid>/cgroup` of a process in cgroup `cg`, for a reader whose
+/// cgroup namespace's root is `ns_root`: the cgroup's path from that
+/// root, through `..` for one outside it, as Linux shows it.
+pub fn proc_cgroup(cg: &[u8], ns_root: &[u8]) -> Vec<u8> {
+    [b"0::", &relative(cg, ns_root)[..], b"\n"].concat()
+}
+
+/// Cgroup `cg` as a path from cgroup `root`.
+fn relative(cg: &[u8], root: &[u8]) -> Vec<u8> {
+    let parts = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|&b| b == b'/').filter(|s| !s.is_empty()).map(<[u8]>::to_vec).collect()
     };
-    [b"0::", &shown[..], b"\n"].concat()
+    let (cg, root) = (parts(cg), parts(root));
+    let common = cg.iter().zip(&root).take_while(|(a, b)| a == b).count();
+    let mut out = Vec::new();
+    for _ in common..root.len() {
+        out.extend_from_slice(b"/..");
+    }
+    for p in &cg[common..] {
+        out.push(b'/');
+        out.extend_from_slice(p);
+    }
+    if out.is_empty() {
+        out.push(b'/');
+    }
+    out
 }
 
 // --- device programs ---------------------------------------------------------
@@ -616,4 +633,20 @@ pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
         Ok(()) => len as i64,
         Err(e) => err(e),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cgroup is shown from the reader's namespace root, through `..`
+    /// for one outside it.
+    #[test]
+    fn cgroups_relative_to_the_namespace_root() {
+        assert_eq!(proc_cgroup(b"/a/b", b"/"), b"0::/a/b\n");
+        assert_eq!(proc_cgroup(b"/a/b", b"/a"), b"0::/b\n");
+        assert_eq!(proc_cgroup(b"/a", b"/a"), b"0::/\n");
+        assert_eq!(proc_cgroup(b"/a/c", b"/a/b"), b"0::/../c\n");
+        assert_eq!(proc_cgroup(b"/", b"/a/b"), b"0::/../..\n");
+    }
 }

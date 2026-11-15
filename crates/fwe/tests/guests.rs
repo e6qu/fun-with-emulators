@@ -6424,3 +6424,24 @@ fn sysctls_limit_namespaces_and_listen() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// Namespaces: a single-threaded process unshares its thread group,
+/// signal handlers and memory (with another thread, `EINVAL`);
+/// `NS_GET_USERNS` of a UTS namespace gives the user namespace it was
+/// made in (and `EPERM` for one out of reach); another process's
+/// `/proc/<pid>/cgroup` is shown from the reader's cgroup namespace.
+#[test]
+fn namespaces_owners_unshare_and_cgroup_paths() {
+    let out = run_c_guest("nsprocs", &[]);
+    assert_eq!(
+        stdout(&out),
+        "single-threaded: thread 0 sighand 0 vm 0\n\
+         with a thread: thread 22 sighand 22 vm 22\n\
+         uts owner is the user namespace it was made in: 1\n\
+         an initial namespace's owner, from below: 1\n\
+         own: 0::/\n\
+         sibling's: 0::/../b\n\
+         the root's: 0::/../..\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

@@ -426,7 +426,8 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),
-        b"/cgroup" => Entry::File([b"0::", &rec.cgroup[..], b"\n"].concat()),
+        // Relative to the reader's cgroup namespace (`Fs::synthetic_entry`).
+        b"/cgroup" => Entry::Missing,
         b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
             Entry::File(oom_file(sub, rec.oom_score_adj))
         }
