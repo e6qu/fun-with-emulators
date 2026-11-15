@@ -14,6 +14,35 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Processes are spawned one at a time. The host has no `pipe2`: a pipe the
+/// standard library makes for a child is close-on-exec only a moment after
+/// it is made, and a child another test spawns in that moment inherits it,
+/// holding that guest's output open past its exit.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+trait Alone {
+    fn spawn_alone(&mut self) -> std::io::Result<std::process::Child>;
+    /// `output`: standard input empty, output and errors captured.
+    fn output_alone(&mut self) -> std::io::Result<Output>;
+    fn status_alone(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl Alone for Command {
+    fn spawn_alone(&mut self) -> std::io::Result<std::process::Child> {
+        let _alone = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        self.spawn()
+    }
+
+    fn output_alone(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.spawn_alone()?.wait_with_output()
+    }
+
+    fn status_alone(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.spawn_alone()?.wait()
+    }
+}
+
 /// How long a guest may run before the harness kills it. A guest should
 /// finish in well under a second; a hang (e.g. a thread that never wakes)
 /// becomes a fast, visible failure instead of hanging CI.
@@ -97,7 +126,7 @@ fn sample_strays(cmd: &Command) {
     let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
         return;
     };
-    let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output() else {
+    let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output_alone() else {
         return;
     };
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("samples");
@@ -120,7 +149,7 @@ fn sample_strays(cmd: &Command) {
             .arg(&file)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status_alone();
         eprintln!("--- {pid} {command}");
         // Each thread, and the innermost fwe frame of its heaviest stack.
         let text = std::fs::read_to_string(&file).unwrap_or_default();
@@ -151,7 +180,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
     if feed {
         cmd.stdin(Stdio::piped());
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_alone().unwrap();
     if feed {
         let mut stdin = child.stdin.take().unwrap();
         let data = input.to_vec();
@@ -185,7 +214,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
             if let Ok(ps) = Command::new("ps")
                 .args(["-o", "pid,ppid,stat,wchan,command", "-g"])
                 .arg(child.id().to_string())
-                .output()
+                .output_alone()
             {
                 eprintln!(
                     "--- the guest's processes at the timeout:\n{}",
@@ -231,7 +260,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                 // Which: every fwe process still running, with its group.
                 if let Ok(ps) = Command::new("ps")
                     .args(["-A", "-o", "pid,ppid,pgid,stat,etime,command"])
-                    .output()
+                    .output_alone()
                 {
                     let all = String::from_utf8_lossy(&ps.stdout);
                     let fwe: Vec<&str> = all.lines().filter(|l| l.contains("fwe")).collect();
@@ -306,7 +335,7 @@ fn out_dir() -> PathBuf {
 }
 
 fn run_checked(cmd: &mut Command) {
-    let out = cmd.output().unwrap_or_else(|e| panic!("running {cmd:?}: {e}"));
+    let out = cmd.output_alone().unwrap_or_else(|e| panic!("running {cmd:?}: {e}"));
     assert!(
         out.status.success(),
         "{cmd:?} failed:\n{}{}",
@@ -317,9 +346,9 @@ fn run_checked(cmd: &mut Command) {
 
 fn rust_lld() -> PathBuf {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().unwrap();
+    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output_alone().unwrap();
     let sysroot = String::from_utf8(sysroot.stdout).unwrap();
-    let host = Command::new(&rustc).args(["--print", "host-tuple"]).output().unwrap();
+    let host = Command::new(&rustc).args(["--print", "host-tuple"]).output_alone().unwrap();
     let host = String::from_utf8(host.stdout).unwrap();
     Path::new(sysroot.trim()).join("lib/rustlib").join(host.trim()).join("bin/rust-lld")
 }
@@ -1393,7 +1422,7 @@ fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
 }
 
 fn sha256(f: &Path) -> String {
-    let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
+    let out = Command::new("shasum").args(["-a", "256"]).arg(f).output_alone().unwrap();
     String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
 }
 
@@ -1417,7 +1446,7 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
             .args(["-fsSL", "--retry", "3", "-o"])
             .arg(&part)
             .arg(url)
-            .status()
+            .status_alone()
             .is_ok_and(|s| s.success())
             && sha256(&part) == sha256_hex
     });
@@ -1912,7 +1941,8 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path, docker: bool) {
         (digest, bytes.len())
     };
     let layer = std::fs::read(alpine_image(manifest_name)).unwrap();
-    let tar = Command::new("gunzip").arg("-c").arg(alpine_image(manifest_name)).output().unwrap();
+    let tar =
+        Command::new("gunzip").arg("-c").arg(alpine_image(manifest_name)).output_alone().unwrap();
     let unpacked = dir.join("layer.tar");
     std::fs::write(&unpacked, &tar.stdout).unwrap();
     let diff_id = sha256(&unpacked);
@@ -2095,7 +2125,7 @@ fn alpine_containerd_runs_an_image() {
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log)
-        .spawn()
+        .spawn_alone()
         .unwrap();
     let socket = root.join("run/containerd/containerd.sock");
     for _ in 0..600 {
@@ -2249,7 +2279,7 @@ fn alpine_docker_runs_and_builds_images() {
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log)
-        .spawn()
+        .spawn_alone()
         .unwrap();
     let socket = root.join("run/docker.sock");
     for _ in 0..1200 {
@@ -2439,7 +2469,7 @@ fn alpine_podman_builds_pulls_and_runs_rootless() {
     .stdin(Stdio::null())
     .stdout(log.try_clone().unwrap())
     .stderr(log)
-    .spawn()
+    .spawn_alone()
     .unwrap();
     let registry_log =
         || std::fs::read_to_string(root.join("tmp/registry.log")).unwrap_or_default();
@@ -2676,7 +2706,8 @@ fn alpine_wine_runs_windows_programs() {
     // room for Wine's (each VM process has a stand-in watcher too).
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    let mine = Command::new("ps").args(["-U", &uid.to_string(), "-o", "pid="]).output().unwrap();
+    let mine =
+        Command::new("ps").args(["-U", &uid.to_string(), "-o", "pid="]).output_alone().unwrap();
     let cap = (stdout(&mine).lines().count() + 300) as libc::rlim_t;
     let mut wine = |command: &str| {
         step += 1;
@@ -2971,10 +3002,10 @@ fn debian_apt_installs_and_removes_a_package() {
         .arg("-c")
         .arg("ar p \"$0\" control.tar.xz | tar xOf - ./control")
         .arg(deb)
-        .output()
+        .output_alone()
         .unwrap();
     assert!(control.status.success());
-    let sha = Command::new("shasum").args(["-a", "256"]).arg(deb).output().unwrap();
+    let sha = Command::new("shasum").args(["-a", "256"]).arg(deb).output_alone().unwrap();
     let sha = String::from_utf8_lossy(&sha.stdout).split_whitespace().next().unwrap().to_string();
     let size = std::fs::metadata(deb).unwrap().len();
     std::fs::write(
@@ -3154,7 +3185,8 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/tmp")
             .stdin(Stdio::null());
-        let mut server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap());
+        let mut server =
+            Server(cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn_alone().unwrap());
         let start = Instant::now();
         // Listening once its log says it started (a connection could reach
         // whoever else holds the port).
@@ -3529,7 +3561,7 @@ fn low_link_address_needs_the_hypervisor() {
 #[test]
 fn rejects_non_elf() {
     let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/guests.rs");
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(this_file).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(this_file).output_alone().unwrap();
     assert_eq!(out.status.code(), Some(126));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an ELF file"));
 }
@@ -4766,7 +4798,7 @@ fn other_hypervisor_client() -> Option<String> {
         "VirtualBoxVM",
         "prl_vm_app",
     ];
-    let ps = Command::new("ps").args(["-axco", "comm="]).output().ok()?;
+    let ps = Command::new("ps").args(["-axco", "comm="]).output_alone().ok()?;
     String::from_utf8_lossy(&ps.stdout)
         .lines()
         .map(str::trim)
@@ -4808,7 +4840,7 @@ fn hv_mode() -> Option<&'static HvMode> {
                 // be unable to create a real VM.
                 let sig = Command::new("codesign")
                     .args(["-d", "--entitlements", "-", env!("CARGO_BIN_EXE_fwe")])
-                    .output()
+                    .output_alone()
                     .unwrap();
                 let sig =
                     String::from_utf8_lossy(&sig.stdout) + String::from_utf8_lossy(&sig.stderr);
@@ -4842,7 +4874,7 @@ fn real_fwe() -> Option<PathBuf> {
         );
         return None;
     }
-    let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
+    let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output_alone().ok()?;
     if String::from_utf8_lossy(&support.stdout).trim() != "1" {
         return None;
     }
@@ -4853,7 +4885,7 @@ fn real_fwe() -> Option<PathBuf> {
         .args(["--sign", "-", "--force", "--entitlements"])
         .arg(repo().join("hypervisor.entitlements"))
         .arg(&signed)
-        .status()
+        .status_alone()
         .is_ok_and(|s| s.success());
     // A host that has the hypervisor but refuses the VM (no
     // entitlement honoured) also counts as unavailable.
