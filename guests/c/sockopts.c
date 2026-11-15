@@ -22,6 +22,9 @@ int getsockopt(int fd, int level, int name, void *val, socklen_t *len);
 long sendto(int fd, const void *buf, size_t n, int flags, const void *addr, socklen_t len);
 long recv(int fd, void *buf, size_t n, int flags);
 int usleep(unsigned usec);
+int listen(int fd, int backlog);
+int accept(int fd, void *addr, socklen_t *len);
+long read(int fd, void *buf, size_t n);
 int close(int fd);
 int *__errno_location(void);
 int strcmp(const char *a, const char *b);
@@ -29,7 +32,9 @@ int printf(const char *format, ...);
 void *memset(void *s, int c, size_t n);
 
 #define AF_INET 2
+#define SOCK_STREAM 1
 #define SOCK_DGRAM 2
+#define MSG_FASTOPEN 0x20000000
 #define SOL_UDP 17
 #define UDP_CORK 1
 #define UDP_ENCAP 100
@@ -83,9 +88,33 @@ static int udp(void) {
     return 0;
 }
 
+/* MSG_FASTOPEN on an unconnected TCP socket connects and sends; on a
+ * connected one it is EISCONN. */
+static int fastopen(void) {
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr = 0x0100007f;
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    bind(srv, &a, sizeof a);
+    socklen_t len = sizeof a;
+    getsockname(srv, &a, &len);
+    listen(srv, 1);
+    int cli = socket(AF_INET, SOCK_STREAM, 0);
+    long sent = sendto(cli, "hello", 5, MSG_FASTOPEN, &a, sizeof a);
+    int conn = accept(srv, 0, 0);
+    char b[8];
+    long got = read(conn, b, sizeof b);
+    long again = sendto(cli, "x", 1, MSG_FASTOPEN, &a, sizeof a);
+    printf("fast open: sent %ld, read %ld, again %ld errno %d\n", sent, got, again, errno);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "fastopen"))
+        return fastopen();
     if (!strcmp(argv[1], "udp"))
         return udp();
     return 2;

@@ -1255,6 +1255,8 @@ pub mod socket {
     pub const MSG_MORE: u64 = 0x8000;
     /// Received descriptors are close-on-exec.
     pub const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+    /// Connect (with TCP fast open) and send.
+    pub const MSG_FASTOPEN: u64 = 0x2000_0000;
 
     // Control messages (`SOL_SOCKET` level): a `cmsghdr` is a 64-bit
     // length, the level and the type, its data 8-aligned after it.

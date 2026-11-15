@@ -1113,6 +1113,13 @@ fn udp_options_are_linuxs() {
     );
 }
 
+/// `MSG_FASTOPEN` on an unconnected TCP socket connects and sends, as
+/// Linux does; on a connected one it is `EISCONN`.
+#[test]
+fn fast_open_connects_and_sends() {
+    c_guest_prints("sockopts", &["fastopen"], "fast open: sent 5, read 5, again -1 errno 106\n");
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]

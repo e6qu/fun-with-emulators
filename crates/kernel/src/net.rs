@@ -1126,6 +1126,10 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         }
         guest!(uaccess::read_bytes(addr, l as usize));
     }
+    // TCP fast open: connected first, then sent to the peer.
+    if let Err(e) = fastopen(fd as i32, flags, addr, addrlen) {
+        return e;
+    }
     // TCP sends to its peer, whatever address it is given.
     let named = addr != 0 && addrlen != 0 && !ip_stream(fd as i32);
     let hflags = msg_flags_to_host(flags);
@@ -1188,6 +1192,31 @@ pub(crate) struct Held {
 
 /// Whether any socket has bytes held back.
 static ANY_CORKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A send with `MSG_FASTOPEN` on TCP socket `fd`: connect to `addr`
+/// (`addrlen` bytes) first, as Linux does when it sends the data with the
+/// connection's opening (the host has no client fast open, so the data
+/// follows the handshake). Whether it connected; `EISCONN` for a socket
+/// connected already, `EINVAL` with no address, and the connection's
+/// error (`EINPROGRESS` for a non-blocking socket, which sends nothing
+/// then, as Linux sends nothing without a fast-open cookie).
+fn fastopen(fd: i32, flags: u64, addr: u64, addrlen: u64) -> Result<bool, i64> {
+    if flags & MSG_FASTOPEN == 0 || !ip_stream(fd) {
+        return Ok(false);
+    }
+    let mut hb = empty_sockaddr();
+    let mut hl = SOCKADDR_MAX as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    if unsafe { libc::getpeername(fd, hb.as_mut_ptr().cast(), &mut hl) } == 0 {
+        return Err(err(errno::EISCONN));
+    }
+    if addr == 0 || addrlen == 0 {
+        return Err(err(errno::EINVAL));
+    }
+    // SAFETY: the caller guarantees the address spans its length.
+    let r = unsafe { connect(fd as u64, addr, addrlen) };
+    if r < 0 { Err(r) } else { Ok(true) }
+}
 
 /// Whether `fd` has bytes `MSG_MORE` held back.
 pub fn corked(fd: i32) -> bool {
@@ -2188,6 +2217,12 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         }
         return crate::netlink::send(fd as i32, &data);
     }
+    // TCP fast open: connected first, then sent to the peer.
+    let (name, namelen) = match fastopen(fd as i32, flags, name, namelen as u64) {
+        Ok(true) => (0, 0),
+        Ok(false) => (name, namelen),
+        Err(e) => return e,
+    };
     let mut hb = empty_sockaddr();
     // A Unix path too long for the host is sent to from its directory.
     let mut dir = None;
@@ -3270,5 +3305,49 @@ mod udp_option_tests {
         assert_eq!(get(tx, SOL_UDPLITE, UDP_GRO), Ok(1));
         // SAFETY: the sockets made above.
         unsafe { (libc::close(rx), libc::close(tx)) };
+    }
+}
+
+#[cfg(test)]
+mod fastopen_tests {
+    use super::*;
+
+    /// `MSG_FASTOPEN` on an unconnected TCP socket connects and sends; on
+    /// a connected one it is `EISCONN`.
+    #[test]
+    fn fast_open_connects_and_sends() {
+        let mut a = [0u8; 16];
+        a[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // SAFETY: no pointers.
+        let (srv, cli) = unsafe {
+            (socket(AF_INET, SOCK_STREAM, 0) as i32, socket(AF_INET, SOCK_STREAM, 0) as i32)
+        };
+        // SAFETY: a valid sockaddr.
+        assert_eq!(unsafe { bind(srv as u64, a.as_ptr() as u64, 16, true, 0o022) }, 0);
+        let mut len: u32 = 16;
+        // SAFETY: a writable sockaddr and length.
+        let r =
+            unsafe { getname(srv as u64, a.as_mut_ptr() as u64, &mut len as *mut _ as u64, false) };
+        assert_eq!(r, 0);
+        // SAFETY: no pointers.
+        assert_eq!(unsafe { listen(srv as u64, 1) }, 0);
+        let data = b"hello";
+        let send = |addr: u64| {
+            // SAFETY: valid buffers.
+            unsafe { sendto(cli as u64, data.as_ptr() as u64, 5, MSG_FASTOPEN, addr, 16) }
+        };
+        assert_eq!(send(a.as_ptr() as u64), 5);
+        // SAFETY: no out pointers.
+        let conn = unsafe { accept4(srv as u64, 0, 0, 0) } as i32;
+        let mut b = [0u8; 8];
+        // SAFETY: a valid buffer.
+        assert_eq!(unsafe { libc::read(conn, b.as_mut_ptr().cast(), 8) }, 5);
+        assert_eq!(&b[..5], data);
+        assert_eq!(send(a.as_ptr() as u64), err(errno::EISCONN));
+        for fd in [srv, cli, conn] {
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd) };
+        }
     }
 }
