@@ -569,10 +569,32 @@ impl<P: Platform> Kernel<P> {
         // A set-ID program's owner and group, then the saved IDs the
         // effective ones, and the capabilities, as Linux's execve sets them.
         let saved = (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid);
-        apply_exec_privs(&mut self.creds, take_exec_privs());
+        let secure = apply_exec_privs(&mut self.creds, take_exec_privs());
         if saved != (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid) {
             self.ids_changed(0);
         }
+        self.exec_secured(secure);
+    }
+
+    /// For the program an `execve` in place is about to load: what its
+    /// auxiliary vector says of its credentials, as [`Kernel::exec_reset`]
+    /// will make them.
+    pub fn exec_aux_ids(&self) -> AuxIds {
+        let mut c = self.creds.clone();
+        let secure = apply_exec_privs(&mut c, EXEC_PRIVS.with(|p| p.get()));
+        AuxIds::of(&c, secure)
+    }
+
+    /// After an exec raised privilege (`secure`): what Linux undoes for
+    /// such a program, the personality flags it must not inherit
+    /// (`PER_CLEAR_ON_SETID`) and the parent-death signal.
+    fn exec_secured(&mut self, secure: bool) {
+        if !secure {
+            return;
+        }
+        const PER_CLEAR_ON_SETID: u32 = 0x0040_0000 | 0x0004_0000 | 0x0020_0000 | 0x0010_0000;
+        syscalls::PERSONALITY.fetch_and(!PER_CLEAR_ON_SETID, std::sync::atomic::Ordering::Relaxed);
+        pdeath::set(0);
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
@@ -800,6 +822,9 @@ impl<P: Platform> Kernel<P> {
             e.u32(g);
         }
         c.caps.encode(&mut e);
+        // What the program it runs grants, with the credentials it acts on
+        // (read early by [`AuxIds::at_start`]).
+        take_exec_privs().save(&mut e);
         let (soft, hard) = fdtable::limit();
         e.u64(soft);
         e.u64(hard);
@@ -827,8 +852,8 @@ impl<P: Platform> Kernel<P> {
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
-        // Kept across execve, as on Linux (whose set-ID exec, which fwe
-        // has none of, would clear some of it).
+        // Kept across execve, as on Linux (less what an exec that raises
+        // privilege clears, [`Kernel::exec_secured`]).
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
         // Traced on, by the same tracer ([`ptrace::restore`]).
@@ -839,8 +864,6 @@ impl<P: Platform> Kernel<P> {
         landlock::save(&mut e);
         // Its foster children, still its own to follow.
         e.bool(reaper::fostering());
-        // What the program it runs grants.
-        take_exec_privs().save(&mut e);
         e.into_bytes()
     }
 
@@ -857,13 +880,8 @@ impl<P: Platform> Kernel<P> {
         if d.bool() {
             fs::Fs::skip_view(&mut d);
         }
-        let mut ids = [0u32; 8];
-        for v in &mut ids {
-            *v = d.u32();
-        }
-        let n = d.count(4);
-        let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
-        let caps = caps::Caps::decode(&mut d);
+        let mut creds = exec_state_creds(&mut d);
+        let privs = ExecPrivs::load(&mut d);
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
         rlimits::load(&mut d);
@@ -881,7 +899,6 @@ impl<P: Platform> Kernel<P> {
         let (tracer, syscalls) = (d.u32() as i32, d.bool());
         landlock::load(&mut d);
         let fostering = d.bool();
-        let privs = ExecPrivs::load(&mut d);
         d.finish()?;
         reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
@@ -890,11 +907,9 @@ impl<P: Platform> Kernel<P> {
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
-        let [uid, euid, suid, fsuid, gid, egid, sgid, fsgid] = ids;
-        let mut creds =
-            creds::Creds { uid, euid, suid, fsuid, gid, egid, sgid, fsgid, groups, caps };
-        apply_exec_privs(&mut creds, privs);
+        let secure = apply_exec_privs(&mut creds, privs);
         self.creds = creds;
+        self.exec_secured(secure);
         creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
@@ -1167,8 +1182,13 @@ fn file_caps(dir: i32, name: &std::ffi::CStr) -> Option<caps::FileCaps> {
 
 /// An exec's change to `c`: a set-ID program's owner and group as the
 /// effective (and filesystem) ids, the saved ids then the effective ones,
-/// and the capabilities as Linux computes them.
-fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
+/// and the capabilities as Linux computes them. Returns whether the exec
+/// raised privilege (Linux's `secureexec`, which `AT_SECURE` reports): the
+/// new effective uid or gid is not the real one, or a caller not root
+/// gained capabilities from the file (its effective bit, or a permitted
+/// set beyond the ambient one).
+fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) -> bool {
+    let (ruid, rgid) = (c.uid, c.gid);
     if let Some(u) = p.uid {
         (c.euid, c.fsuid) = (u, u);
     }
@@ -1182,6 +1202,69 @@ fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
     // initial namespace's).
     let ns = |id| userns::to_ns(id, false);
     c.caps.on_exec_file(ns(c.uid), ns(c.euid), p.caps, setid);
+    let real_root = ns(c.uid) == 0;
+    let file_effective = p.caps.is_some_and(|f| f.effective);
+    c.euid != ruid
+        || c.egid != rgid
+        || (!real_root && (file_effective || c.caps.permitted & !c.caps.ambient != 0))
+}
+
+/// What a program's auxiliary vector says of its credentials: the real
+/// and effective ids as its user namespace shows them, and `AT_SECURE`
+/// (the exec raised privilege, so the C library ignores `LD_PRELOAD`,
+/// `LD_LIBRARY_PATH` and their like).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuxIds {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure: bool,
+}
+
+impl AuxIds {
+    fn of(c: &creds::Creds, secure: bool) -> AuxIds {
+        AuxIds {
+            uid: userns::to_ns(c.uid, false),
+            euid: userns::to_ns(c.euid, false),
+            gid: userns::to_ns(c.gid, true),
+            egid: userns::to_ns(c.egid, true),
+            secure,
+        }
+    }
+
+    /// For the program a process fwe starts runs: the first one (no
+    /// `state`), root's and not raised; or the one an `execve` re-executed
+    /// fwe for, from the exec state ([`Kernel::exec_state`]) its old
+    /// process recorded, once its namespaces are in place
+    /// ([`Fs::adopt_exec_view`]).
+    pub fn at_start(state: Option<&[u8]>) -> Result<AuxIds, String> {
+        let Some(state) = state else { return Ok(AuxIds::of(&creds::Creds::default(), false)) };
+        let mut d = snapshot::Dec::new(state);
+        if d.u64() != EXEC_STATE_MAGIC {
+            return Err("the exec state is not fwe's".into());
+        }
+        if d.bool() {
+            fs::Fs::skip_view(&mut d);
+        }
+        let mut c = exec_state_creds(&mut d);
+        let privs = ExecPrivs::load(&mut d);
+        let secure = apply_exec_privs(&mut c, privs);
+        Ok(AuxIds::of(&c, secure))
+    }
+}
+
+/// The credentials an exec state records, after its view.
+fn exec_state_creds(d: &mut snapshot::Dec) -> creds::Creds {
+    let mut ids = [0u32; 8];
+    for v in &mut ids {
+        *v = d.u32();
+    }
+    let n = d.count(4);
+    let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
+    let caps = caps::Caps::decode(d);
+    let [uid, euid, suid, fsuid, gid, egid, sgid, fsgid] = ids;
+    creds::Creds { uid, euid, suid, fsuid, gid, egid, sgid, fsgid, groups, caps }
 }
 
 /// Host `fork` is refused (see [`forbid_fork`]).
@@ -2148,6 +2231,52 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    fn user() -> creds::Creds {
+        let mut c = creds::Creds::default();
+        assert_eq!(c.setresuid(1000, 1000, 1000), 0);
+        c
+    }
+
+    /// An exec raises privilege (`AT_SECURE`) when it changes the effective
+    /// ids from the real ones, or gives a caller other than root
+    /// capabilities from the file; root running anything does not.
+    #[test]
+    fn privilege_raising_execs_are_secure() {
+        let plain = ExecPrivs::default();
+        let setuid = ExecPrivs { uid: Some(0), ..plain };
+        let setgid = ExecPrivs { gid: Some(50), ..plain };
+        let file = |effective| caps::FileCaps { permitted: 1 << 7, inheritable: 0, effective };
+        let capped = ExecPrivs { caps: Some(file(true)), ..plain };
+        let permitted_only = ExecPrivs { caps: Some(file(false)), ..plain };
+        let secure = |mut c: creds::Creds, p| {
+            let s = apply_exec_privs(&mut c, p);
+            (s, AuxIds::of(&c, s))
+        };
+        assert!(!secure(creds::Creds::default(), plain).0);
+        assert!(!secure(creds::Creds::default(), setuid).0);
+        assert!(!secure(creds::Creds::default(), capped).0);
+        assert!(!secure(user(), plain).0);
+        let (s, ids) = secure(user(), setuid);
+        assert!(s);
+        assert_eq!((ids.uid, ids.euid, ids.gid, ids.egid), (1000, 0, 0, 0));
+        assert!(secure(user(), setgid).0);
+        assert!(secure(user(), capped).0);
+        assert!(secure(user(), permitted_only).0);
+    }
+
+    /// A re-executed fwe's program starts with the auxiliary vector its
+    /// exec state makes, the same as the in-place exec's.
+    #[test]
+    fn a_re_executed_program_is_told_its_credentials() {
+        assert_eq!(AuxIds::at_start(None), Ok(AuxIds::default()));
+        assert!(AuxIds::at_start(Some(b"garbage!")).is_err());
+    }
 }
 
 #[cfg(test)]

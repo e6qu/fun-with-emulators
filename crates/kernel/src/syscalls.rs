@@ -3857,6 +3857,22 @@ mod tests {
         assert_eq!(bad.creds.resuid(), kernel().creds.resuid());
     }
 
+    /// A set-user-ID program run by re-executing fwe: its auxiliary vector,
+    /// read from the exec state before its kernel exists, and its kernel's
+    /// credentials agree, and the exec is a secure one.
+    #[test]
+    fn exec_state_carries_what_the_program_grants() {
+        let mut k = kernel();
+        assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
+        crate::EXEC_PRIVS.with(|p| p.set(crate::ExecPrivs { uid: Some(0), gid: None, caps: None }));
+        let state = k.exec_state();
+        let ids = crate::AuxIds::at_start(Some(&state)).unwrap();
+        assert_eq!((ids.uid, ids.euid, ids.secure), (1000, 0, true));
+        let mut new = kernel();
+        new.restore_exec_state(&state).unwrap();
+        assert_eq!(new.creds.resuid(), (1000, 0, 0));
+    }
+
     #[test]
     fn unknown_syscalls_fail_with_enosys() {
         assert_eq!(kernel().syscall(4000, [0; 6]), err(errno::ENOSYS));

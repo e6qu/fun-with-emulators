@@ -112,6 +112,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     };
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env_refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    // The credentials the program starts with, as `exec_reset` makes them.
+    let ids = k.exec_aux_ids();
     // The point of no return: the old program's memory goes, and a vfork
     // parent may resume. The robust futexes its threads hold are released
     // first.
@@ -133,6 +135,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         page,
         strace,
         fwe_kernel::rlimits::get(fwe_abi::resource::RLIMIT_STACK).0,
+        ids,
     ) {
         Ok(out) => out,
         Err(e) => {

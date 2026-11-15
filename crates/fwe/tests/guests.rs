@@ -6577,6 +6577,32 @@ fn programs_grant_file_capabilities_and_set_ids() {
     );
 }
 
+/// What a program is told of its credentials as it starts (`AT_UID` to
+/// `AT_EGID`, the guest's ids), and `AT_SECURE` after an exec that raised
+/// privilege (a set-user-ID root program, file capabilities, run by a
+/// user): glibc then starts in secure mode and drops `LD_LIBRARY_PATH`.
+#[test]
+fn privilege_raising_programs_start_in_secure_mode() {
+    let root = libc_rootfs(Libc::Glibc, "secure");
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("containers"), root.join("containers")).unwrap();
+    std::fs::copy(build_c_dynamic("secure", Libc::Glibc, true), root.join("secure")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures").arg("--root").arg(&root).arg(root.join("containers"));
+    cmd.arg("secure-exec");
+    let out = run_bounded(cmd);
+    eprintln!("--- secure-exec stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "root: uid 0 euid 0 gid 0 egid 0 secure 0 LD_LIBRARY_PATH /nowhere\n\
+         user: uid 1000 euid 1000 gid 0 egid 0 secure 0 LD_LIBRARY_PATH /nowhere\n\
+         user, set-uid: uid 1000 euid 0 gid 0 egid 0 secure 1 LD_LIBRARY_PATH (removed)\n\
+         user, capped: uid 1000 euid 1000 gid 0 egid 0 secure 1 LD_LIBRARY_PATH (removed)\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Extended attributes by Linux's namespaces: set, created once, read
 /// (and measured), listed, removed; `system.` (ACLs) and a name in no
 /// namespace are not kept; `user.` ones are for files, not links.

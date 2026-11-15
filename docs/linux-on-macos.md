@@ -221,8 +221,10 @@ From the [dynamic linker](#the-dynamic-linker) on, glibc runs as on
 Linux: `ld.so` reads `/etc/ld.so.cache` and the libraries from the
 guest's root, maps them with fwe's `mmap`, applies relocations and RELRO,
 and sets the thread pointer with `msr tpidr_el0` (rewritten natively).
-`AT_SECURE` is 0, so `LD_LIBRARY_PATH`, `LD_PRELOAD` and the rest act as
-on Linux. With no vDSO, `clock_gettime` and `gettimeofday` are real system
+`AT_SECURE` is set as Linux sets it, after an exec that raised privilege
+(a set-ID program, or file capabilities, run by a user other than root),
+so `LD_LIBRARY_PATH`, `LD_PRELOAD` and the rest act as on Linux: ignored
+and removed in such a program, honoured in any other. With no vDSO, `clock_gettime` and `gettimeofday` are real system
 calls. A low-linked glibc program runs the same way in the VM (tested
 with Debian's Python, GCC and clang). C++ adds nothing fwe sees:
 `libstdc++` is one more library, and exceptions unwind in user space.
@@ -1494,6 +1496,13 @@ fwe builds as Linux does in both backends:
 - the auxiliary vector carries `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_BASE`,
   `AT_ENTRY`, `AT_PAGESZ`, the ids, `AT_SECURE`, `AT_RANDOM`, `AT_EXECFN`,
   `AT_PLATFORM`, `AT_MINSIGSTKSZ` and `AT_HWCAP`/`AT_HWCAP2`;
+- the ids are the guest's (`AT_UID` to `AT_EGID`, as its user namespace
+  shows them, after what the exec grants), never the host process's, and
+  `AT_SECURE` is 1 after an exec that raised privilege: the effective uid
+  or gid differs from the real one, or a caller other than root gained
+  capabilities from the file (`crates/kernel/src/lib.rs`,
+  `apply_exec_privs`), which also clears the personality flags Linux
+  clears and the parent-death signal;
 - `AT_HWCAP`/`AT_HWCAP2` come from macOS's `hw.optional.*` sysctls, only
   features a guest can use directly: SVE and SME (kernel-managed state),
   `CPUID` (trapping ID-register reads) and, natively, PAC are left out.

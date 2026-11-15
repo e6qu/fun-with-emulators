@@ -1490,19 +1490,6 @@ pub fn getppid() -> i64 {
     unsafe { libc::getppid() as i64 }
 }
 
-/// (uid, euid, gid, egid) of the host process.
-pub fn ids() -> (i64, i64, i64, i64) {
-    // SAFETY: plain host calls.
-    unsafe {
-        (
-            libc::getuid() as i64,
-            libc::geteuid() as i64,
-            libc::getgid() as i64,
-            libc::getegid() as i64,
-        )
-    }
-}
-
 /// `fallocate(fd, mode, offset, len)` on the host, returning a Linux errno
 /// on failure. Mode 0 reserves the space and extends the file to cover the
 /// range, `FALLOC_FL_KEEP_SIZE` only reserves it, and with

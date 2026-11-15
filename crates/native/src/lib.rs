@@ -238,6 +238,19 @@ fn unhex(text: &[u8]) -> Option<Vec<u8>> {
     text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
 }
 
+/// What the auxiliary vector of the program fwe starts says of its
+/// credentials: from [`Options::exec_state`] for one an `execve` re-executed
+/// fwe for, once the filesystem has its namespaces.
+fn start_aux_ids(options: &Options) -> Result<fwe_kernel::AuxIds, Error> {
+    let state = match &options.exec_state {
+        Some(text) => {
+            Some(unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?)
+        }
+        None => None,
+    };
+    fwe_kernel::AuxIds::at_start(state.as_deref()).map_err(Error::Unsupported)
+}
+
 /// Apply [`Options::exec_state`] to a new kernel. A program fwe was handed
 /// by descriptor (`--exe-fd`), run as `/dev/fd/N`, came through the mount
 /// the guest's descriptor `N` was opened in.
@@ -935,8 +948,9 @@ pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
 }
 
 /// Load an ELF image (and its dynamic linker) and build the initial stack,
-/// returning where to start the guest. Shared by process startup and
-/// `execve`. Does not touch the kernel; the caller installs or updates it.
+/// returning where to start the guest, whose auxiliary vector carries
+/// `ids`. Shared by process startup and `execve`. Does not touch the
+/// kernel; the caller installs or updates it.
 #[allow(clippy::too_many_arguments)]
 pub fn load_image(
     (file, file_id): (&[u8], Option<fwe_kernel::prepcache::FileId>),
@@ -948,6 +962,7 @@ pub fn load_image(
     page: u64,
     tracer: Tracer,
     stack_limit: u64,
+    ids: fwe_kernel::AuxIds,
 ) -> Result<Loadout, Error> {
     let elf = Elf::parse(file).map_err(Error::Elf)?;
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
@@ -1038,7 +1053,6 @@ pub fn load_image(
     fwe_kernel::maps::record().set_heap(brk.start, brk.start, brk.limit);
 
     let (hwcap, hwcap2) = hwcap::detect();
-    let (uid, euid, gid, egid) = fwe_kernel::host::ids();
     let mut aux = vec![
         (auxv::AT_HWCAP, hwcap),
         (auxv::AT_PAGESZ, page),
@@ -1048,11 +1062,11 @@ pub fn load_image(
         (auxv::AT_BASE, interp_base),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, loaded.entry),
-        (auxv::AT_UID, uid as u64),
-        (auxv::AT_EUID, euid as u64),
-        (auxv::AT_GID, gid as u64),
-        (auxv::AT_EGID, egid as u64),
-        (auxv::AT_SECURE, 0),
+        (auxv::AT_UID, u64::from(ids.uid)),
+        (auxv::AT_EUID, u64::from(ids.euid)),
+        (auxv::AT_GID, u64::from(ids.gid)),
+        (auxv::AT_EGID, u64::from(ids.egid)),
+        (auxv::AT_SECURE, u64::from(ids.secure)),
         (auxv::AT_HWCAP2, hwcap2),
         (auxv::AT_MINSIGSTKSZ, fwe_abi::signal::MINSIGSTKSZ),
     ];
@@ -1135,6 +1149,7 @@ fn start(
         page,
         options.strace,
         start_stack_limit(options),
+        start_aux_ids(options)?,
     )?;
     fwe_kernel::timing::mark("load_image");
     // A trampoline used as the return address for signal handlers that have

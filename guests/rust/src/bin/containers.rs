@@ -102,6 +102,11 @@ unsafe extern "C" {
     fn setns(fd: i32, t: i32) -> i32;
     fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn execv(p: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
+    fn execve(
+        p: *const std::ffi::c_char,
+        argv: *const *const std::ffi::c_char,
+        envp: *const *const std::ffi::c_char,
+    ) -> i32;
     fn umask(m: u32) -> u32;
     fn chdir(p: *const std::ffi::c_char) -> i32;
     fn readlink(p: *const std::ffi::c_char, b: *mut u8, n: usize) -> isize;
@@ -368,6 +373,39 @@ fn main() {
                 waitpid(-1, std::ptr::null_mut(), 0);
                 syscall(129, victim, 9);
                 waitpid(victim, std::ptr::null_mut(), 0);
+            }
+            // What a glibc program (`/secure`, guests/c/secure.c) is told
+            // as it starts, run by root and by a user: plainly, set-user-ID
+            // root, and with file capabilities, the last two in secure mode.
+            Some("secure-exec") => {
+                for (to, m) in [("/tmp/plain", 0o755), ("/tmp/suid", 0o4755), ("/tmp/capped", 0o755)] {
+                    std::fs::copy("/secure", to).unwrap();
+                    chmod(c(to).as_ptr(), m);
+                }
+                // Revision 2, effective, CAP_SETUID (7) permitted.
+                let mut v = 0x0200_0001u32.to_le_bytes().to_vec();
+                for w in [1u32 << 7, 0, 0, 0] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                let cap = c("security.capability");
+                setxattr(c("/tmp/capped").as_ptr(), cap.as_ptr(), v.as_ptr(), v.len(), 0);
+                for (prog, label, uid) in [
+                    ("/tmp/plain", "root", 0),
+                    ("/tmp/plain", "user", 1000),
+                    ("/tmp/suid", "user, set-uid", 1000),
+                    ("/tmp/capped", "user, capped", 1000),
+                ] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    if fork() == 0 {
+                        setuid(uid);
+                        let (p, l, e) = (c(prog), c(label), c("LD_LIBRARY_PATH=/nowhere"));
+                        let argv = [p.as_ptr(), l.as_ptr(), std::ptr::null()];
+                        let envp = [e.as_ptr(), std::ptr::null()];
+                        execve(p.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                        _exit(9);
+                    }
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
             }
             // A program only the VM runs, on a host without one: the exec
 

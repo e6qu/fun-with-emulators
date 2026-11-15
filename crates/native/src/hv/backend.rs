@@ -726,7 +726,9 @@ fn start(
     if features.pacg {
         hwcap |= fwe_abi::hwcap::PACG;
     }
-    let (uid, euid, gid, egid) = host::ids();
+    // The credentials the program starts with, as its kernel will have
+    // them.
+    let ids = crate::start_aux_ids(options)?;
     let mut aux = vec![
         (auxv::AT_HWCAP, hwcap),
         (auxv::AT_PAGESZ, page),
@@ -736,11 +738,11 @@ fn start(
         (auxv::AT_BASE, interp.as_ref().map_or(0, |i| i.bias)),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, exe.entry),
-        (auxv::AT_UID, uid as u64),
-        (auxv::AT_EUID, euid as u64),
-        (auxv::AT_GID, gid as u64),
-        (auxv::AT_EGID, egid as u64),
-        (auxv::AT_SECURE, 0),
+        (auxv::AT_UID, u64::from(ids.uid)),
+        (auxv::AT_EUID, u64::from(ids.euid)),
+        (auxv::AT_GID, u64::from(ids.gid)),
+        (auxv::AT_EGID, u64::from(ids.egid)),
+        (auxv::AT_SECURE, u64::from(ids.secure)),
         (auxv::AT_HWCAP2, hwcap2),
         (auxv::AT_MINSIGSTKSZ, fwe_abi::signal::MINSIGSTKSZ),
     ];
