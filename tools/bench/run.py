@@ -545,7 +545,9 @@ def pcs(name, cmd):
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # Started first, on every fwe process (one runs at a time here): DTrace
     # grabbing a running process by its pid fails while it starts.
-    script = 'profile-997 /execname == "fwe"/ { @[arg1] = count(); }'
+    # It ends itself once that process exits, and writes what it gathered.
+    script = ('profile-997 /execname == "fwe"/ { @[arg1] = count(); } '
+              'proc:::exit /execname == "fwe"/ { exit(0); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -560,10 +562,12 @@ def pcs(name, cmd):
         m = re.search(r"([0-9a-f]+)-([0-9a-f]+)\s+\[.*?\]\s+\S+\s+SM=\S+\s*(.*)$", line)
         if m:
             regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip()))
-    proc.wait()
-    # (sudo passes the interrupt on; DTrace then writes what it gathered.)
-    subprocess.run(["sudo", "-n", "kill", "-INT", str(tracer.pid)], capture_output=True)
-    said = tracer.communicate()[0]
+    proc.wait(timeout=300)
+    try:
+        said = tracer.communicate(timeout=60)[0]
+    except subprocess.TimeoutExpired:
+        subprocess.run(["sudo", "-n", "kill", "-KILL", str(tracer.pid)], capture_output=True)
+        sys.exit(f"{name}: DTrace did not end when the program did")
     counts = []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
