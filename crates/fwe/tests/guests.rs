@@ -7103,6 +7103,16 @@ fn unix_socket_nodes_are_held_to_their_modes() {
     );
 }
 
+/// An overlay's sticky directory restricts removal as any does: a user
+/// removes or renames only its own files there.
+#[test]
+fn overlay_sticky_directories_restrict_removal() {
+    assert_eq!(
+        fsrules("ovlsticky"),
+        "overlay: ok\nunlink another's: EPERM rename it: EPERM unlink own: ok\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

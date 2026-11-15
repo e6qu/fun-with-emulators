@@ -2091,10 +2091,11 @@ pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
 }
 
 /// Whether a caller of file-system user `fsuid` may follow the symbolic
-/// link `name` in directory `dir`, with `fs.protected_symlinks` on: one in
-/// a sticky directory anyone may write to only if it is the caller's, or
-/// the directory's owner's (`EACCES`).
-fn may_follow(dir: i32, name: &std::ffi::CStr, fsuid: u32) -> Result<(), i32> {
+/// link `name` in host directory `dir`, the directory open as `parent` as
+/// the guest sees it (an overlay's topmost layer of it), with
+/// `fs.protected_symlinks` on: one in a sticky directory anyone may write
+/// to only if it is the caller's, or the directory's owner's (`EACCES`).
+fn may_follow(dir: i32, name: &std::ffi::CStr, parent: i32, fsuid: u32) -> Result<(), i32> {
     // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a live directory, a NUL-terminated name, a valid out-parameter.
@@ -2105,7 +2106,7 @@ fn may_follow(dir: i32, name: &std::ffi::CStr, fsuid: u32) -> Result<(), i32> {
     if owner == fsuid {
         return Ok(());
     }
-    let Some(parent) = guest_stat(dir) else { return Ok(()) };
+    let Some(parent) = guest_stat(parent) else { return Ok(()) };
     let open = (libc::S_ISVTX | libc::S_IWOTH) as libc::mode_t;
     if parent.st_mode & open != open || parent.st_uid == owner {
         return Ok(());
@@ -2642,6 +2643,12 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 overlay::Found::Dir(d) => Step::OvlDir(d),
                 overlay::Found::Other { layer, link: true } => {
                     let in_layer = o.dir.fds[layer].as_ref().expect("its layer");
+                    // The link as its layer has it, in the directory as the
+                    // topmost layer shows it.
+                    if crate::sysctl::protected_links().0 {
+                        let top = here.dir.as_raw_fd();
+                        may_follow(in_layer.as_raw_fd(), &comp_c, top, access.fsuid)?;
+                    }
                     Step::Link(readlink_at(in_layer.as_raw_fd(), &comp_c)?)
                 }
                 overlay::Found::Other { .. } => Step::Other,
@@ -2691,7 +2698,8 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     return Err(errno::ELOOP);
                 }
                 if here.ovl.is_none() && crate::sysctl::protected_links().0 {
-                    may_follow(here.dir.as_raw_fd(), &comp_c, access.fsuid)?;
+                    let d = here.dir.as_raw_fd();
+                    may_follow(d, &comp_c, d, access.fsuid)?;
                 }
                 // A mount whose links are not followed.
                 let nofollow = here
@@ -3784,6 +3792,30 @@ pub(crate) fn fd_path(fd: i32) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fs.protected_symlinks` judges a link by its own owner, found in the
+    /// directory that holds it (an overlay's layer), against the directory
+    /// the guest sees it in (the topmost layer).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_link_is_followed_by_its_owner_in_a_sticky_directory() {
+        let base = std::env::temp_dir().join(format!("fwe-follow-{}", std::process::id()));
+        let (lower, top) = (base.join("lower"), base.join("top"));
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&top).unwrap();
+        std::os::unix::fs::symlink("/x", lower.join("l")).unwrap();
+        let lower_fd = std::fs::File::open(&lower).unwrap();
+        let top_fd = std::fs::File::open(&top).unwrap();
+        let (l, t) = (lower_fd.as_raw_fd(), top_fd.as_raw_fd());
+        crate::owners::keep_at(l, c"l", (1000, 1000)).unwrap();
+        // The lower layer's directory is not sticky; the one seen is.
+        assert_eq!(may_follow(l, c"l", t, 2000), Ok(()));
+        crate::modes::keep_fd(t, 0o1777).unwrap();
+        assert_eq!(may_follow(l, c"l", t, 2000), Err(errno::EACCES));
+        assert_eq!(may_follow(l, c"l", t, 1000), Ok(()));
+        assert_eq!(may_follow(l, c"l", l, 2000), Ok(()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Checking a path against a joined one, unjoined, as joining does.
     #[test]

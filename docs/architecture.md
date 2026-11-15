@@ -773,8 +773,8 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   under Linux's rules.
 - **Permission checks** are fwe's (`creds::Access::permits`): opening a
   file, `faccessat` (by the real ids unless `AT_EACCESS`, the walk too),
-  changing a directory's entries (with the sticky bit's
-  restriction), searching each directory of a path, `chdir`, `chmod`,
+  changing a directory's entries (with the sticky bit's restriction, in an
+  overlay too), searching each directory of a path, `chdir`, `chmod`,
   `utimensat`, extended attributes, `execve` (root too needs an execute
   bit) and `O_NOATIME` (owner only), by the owner's, group's or others'
   bits against the caller's file-system ids, `CAP_DAC_OVERRIDE` and
@@ -782,7 +782,7 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   path walk, a connect or send to a Unix socket's node, the directory a
   `bind` makes one in) use the credentials
   published after each system call (`creds::access`).
-  `fs.protected_symlinks` and `fs.protected_hardlinks` act as on Linux
+  `fs.protected_symlinks` (an overlay's links too) and `fs.protected_hardlinks` act as on Linux
   (off by default, as in Linux's kernel; read again only when a sysctl
   changes). Without a root filesystem the host's own files and directories
   (root's, no owner kept) are left to the host's checks. fwe's own umask

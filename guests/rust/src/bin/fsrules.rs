@@ -61,6 +61,8 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn unlink(p: *const c_char) -> i32;
+    fn rename(a: *const c_char, b: *const c_char) -> i32;
     fn symlink(t: *const c_char, p: *const c_char) -> i32;
     fn mkfifo(p: *const c_char, m: u32) -> i32;
     fn lstat(p: *const c_char, st: *mut u8) -> i32;
@@ -726,9 +728,57 @@ fn unix_permissions_scenario() {
     let _ = (s, d);
 }
 
+/// In an overlay's sticky directory, as in any, a user may remove or
+/// rename only its own files (or the directory's owner, or root).
+fn overlay_sticky_scenario() {
+    const CLONE_NEWNS: i32 = 0x20000;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS) };
+    for d in ["/tmp/lower", "/tmp/lower/t", "/tmp/upper", "/tmp/work", "/tmp/m"] {
+        // SAFETY: a NUL-terminated path.
+        unsafe { mkdir(c(d).as_ptr(), 0o755) };
+    }
+    make("/tmp/lower/t/root", 0o666);
+    make("/tmp/lower/t/user", 0o666);
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        chmod(c("/tmp/lower/t").as_ptr(), 0o1777);
+        chown(c("/tmp/lower/t/user").as_ptr(), 1000, 1000);
+    }
+    let data = c("lowerdir=/tmp/lower,upperdir=/tmp/upper,workdir=/tmp/work");
+    // SAFETY: NUL-terminated strings.
+    let r = unsafe {
+        mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, data.as_ptr())
+    };
+    println!("overlay: {}", res(r.into()));
+    in_child(|| {
+        // SAFETY: plain id changes.
+        unsafe {
+            setgroups(0, std::ptr::null());
+            setgid(1000);
+            setuid(1000);
+        }
+        // SAFETY: NUL-terminated paths.
+        let (unlinked, renamed, own) = unsafe {
+            (
+                unlink(c("/tmp/m/t/root").as_ptr()),
+                rename(c("/tmp/m/t/root").as_ptr(), c("/tmp/m/t/mine").as_ptr()),
+                unlink(c("/tmp/m/t/user").as_ptr()),
+            )
+        };
+        println!(
+            "unlink another's: {} rename it: {} unlink own: {}",
+            res(unlinked.into()),
+            res(renamed.into()),
+            res(own.into())
+        );
+    });
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "ovlsticky" => overlay_sticky_scenario(),
         "unixperm" => unix_permissions_scenario(),
         "opath" => opath_scenario(),
         "getlk" => getlk_scenario(),

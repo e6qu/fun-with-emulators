@@ -2100,6 +2100,9 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         if let Some(o) = &r.ovl {
+            if let Err(e) = self.may_remove_in_overlay(o, &r.name) {
+                return err(e);
+            }
             // The directory copied up, then the name removed from the
             // upper layer, or covered there.
             let up = match crate::overlay::upper_dir(&o.layers, &o.parent) {
@@ -2331,6 +2334,12 @@ impl<P: Platform> Kernel<P> {
         if let (Some(a), Some(b)) = (&old.ovl, &new.ovl) {
             if flags & RENAME_WHITEOUT != 0 {
                 return err(errno::EINVAL);
+            }
+            if let Err(e) = self
+                .may_remove_in_overlay(a, &old.name)
+                .and_then(|()| self.may_remove_in_overlay(b, &new.name))
+            {
+                return err(e);
             }
             let up = |o: &crate::fs::Ovl| crate::overlay::upper_dir(&o.layers, &o.parent);
             let (ua, ub) = match (up(a), up(b)) {
@@ -3464,11 +3473,46 @@ impl<P: Platform> Kernel<P> {
             return Ok(());
         }
         let Ok(f) = stat_at(dir, name) else { return Ok(()) };
+        self.sticky_allows(&d, &f)
+    }
+
+    /// Whether a caller may remove (or rename away, or replace) the file of
+    /// guest metadata `f` from a directory of guest metadata `d`: the
+    /// sticky bit's restriction ([`Self::may_remove`]).
+    fn sticky_allows(&self, d: &libc::stat, f: &libc::stat) -> Result<(), i32> {
         let c = &self.creds;
-        if c.fsuid == f.st_uid || c.fsuid == d.st_uid || c.has(crate::caps::CAP_FOWNER) {
+        if d.st_mode & 0o1000 == 0
+            || c.fsuid == f.st_uid
+            || c.fsuid == d.st_uid
+            || c.has(crate::caps::CAP_FOWNER)
+        {
             Ok(())
         } else {
             Err(errno::EPERM)
+        }
+    }
+
+    /// [`Self::may_remove`] for what `o` found as `name` in an overlay
+    /// directory: the directory as its topmost layer shows it, the name as
+    /// the layer it is found in has it.
+    fn may_remove_in_overlay(&self, o: &crate::fs::Ovl, name: &[u8]) -> Result<(), i32> {
+        use crate::overlay::Found;
+        let Ok(d) = crate::overlay::open(&o.layers, &o.parent) else { return Ok(()) };
+        let Ok(dir) = stat_fd(d.top().1.as_raw_fd()) else { return Ok(()) };
+        if dir.st_mode & 0o1000 == 0 {
+            return Ok(());
+        }
+        let file = match &o.found {
+            Found::Other { layer, .. } => match (&d.fds[*layer], CString::new(name)) {
+                (Some(l), Ok(n)) => stat_at(l.as_raw_fd(), &n),
+                _ => return Ok(()),
+            },
+            Found::Dir(child) => stat_fd(child.top().1.as_raw_fd()),
+            Found::Missing => return Ok(()),
+        };
+        match file {
+            Ok(f) => self.sticky_allows(&dir, &f),
+            Err(_) => Ok(()),
         }
     }
 
