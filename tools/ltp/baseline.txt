@@ -99,7 +99,6 @@ creat06
 creat07
 creat08
 creat09
-delete_module02
 dirtyc0w
 dirtypipe
 dup01

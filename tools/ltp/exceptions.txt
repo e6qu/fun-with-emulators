@@ -78,6 +78,7 @@ chown05_16 the 16-bit uid and gid calls, which arm64 does not have
 clock_gettime03 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
 clock_nanosleep03 not planned (ROADMAP.md): time namespaces, whose offsets need CAP_SYS_TIME, which fwe's processes lack
 delete_module01 it loads a test kernel module, which the build does not have
+delete_module02 the kernel is built without modules (CONFIG_MODULES), so the call is ENOSYS and the test skips, as on such a Linux
 delete_module03 it loads a test kernel module, which the build does not have
 eventfd06 not built: the build has no libaio
 fanotify01 not planned (ROADMAP.md): fanotify

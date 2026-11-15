@@ -875,7 +875,6 @@ impl<P: Platform> Kernel<P> {
             nr::VHANGUP => self.sys_vhangup(),
             nr::READAHEAD => self.sys_readahead(a[0]),
             nr::SYNC_FILE_RANGE => self.sys_sync_file_range(a[0], a[1], a[2], a[3]),
-            nr::DELETE_MODULE => self.sys_delete_module(a[0]),
             nr::SYSLOG => self.sys_syslog(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0], a[1]),
             nr::IOPRIO_GET => self.sys_ioprio_get(a[0], a[1]),
