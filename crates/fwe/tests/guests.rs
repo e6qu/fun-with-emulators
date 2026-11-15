@@ -583,7 +583,22 @@ fn build_c_debug(name: &str, libc: Libc) -> PathBuf {
     build_c_as(name, libc, true, true, true)
 }
 
+/// [`build_c`] as asked, once per test run: tests of one guest run side by
+/// side, and one would run the program while another links it anew.
 fn build_c_as(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> PathBuf {
+    type Built = std::collections::HashMap<(String, u8, bool, bool, bool), PathBuf>;
+    static BUILT: std::sync::Mutex<Option<Built>> = std::sync::Mutex::new(None);
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (name.to_string(), libc as u8, crt, pie, debug);
+    if let Some(p) = built.get_or_insert_with(Default::default).get(&key) {
+        return p.clone();
+    }
+    let p = build_c_now(name, libc, crt, pie, debug);
+    built.get_or_insert_with(Default::default).insert(key, p.clone());
+    p
+}
+
+fn build_c_now(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> PathBuf {
     let out = out_dir().join("c");
     std::fs::create_dir_all(&out).unwrap();
     let mut tag =
