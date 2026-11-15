@@ -7009,3 +7009,11 @@ fn nodump_is_apart_from_kept_owners() {
          set: (true, true) owner 1000:100\n"
     );
 }
+
+/// A device node made outside `/dev` opens as its device when opened only
+/// to read by an absolute path or from the working directory (which fwe
+/// opens in one host call when the file is a plain one).
+#[test]
+fn device_nodes_open_as_devices_to_read() {
+    assert_eq!(fsrules("devnode"), "mknod: ok\n/tmp/zero: 4 [0, 0, 0, 0]\nzero: 4 [0, 0, 0, 0]\n");
+}

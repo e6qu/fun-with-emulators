@@ -32,6 +32,9 @@ unsafe extern "C" {
     fn stat(p: *const c_char, st: *mut u8) -> i32;
     fn chown(p: *const c_char, u: u32, g: u32) -> i32;
     fn ioctl(fd: i32, req: u64, ...) -> i32;
+    fn mknod(p: *const c_char, m: u32, d: u64) -> i32;
+    fn chdir(p: *const c_char) -> i32;
+    fn read(fd: i32, b: *mut u8, n: usize) -> isize;
     fn syscall(n: i64, ...) -> i64;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
@@ -195,9 +198,30 @@ fn nodump_scenario() {
     println!("set: {:?} owner {uid}:{gid}", nodump("/tmp/owned"));
 }
 
+/// A device node made outside `/dev` opens as the device, also to read by
+/// an absolute path and from the working directory.
+fn devnode_scenario() {
+    // SAFETY: NUL-terminated paths.
+    let r = unsafe { mknod(c("/tmp/zero").as_ptr(), 0o20666, (1 << 8) | 5) };
+    println!("mknod: {}", res(r.into()));
+    for p in ["/tmp/zero", "zero"] {
+        // SAFETY: NUL-terminated paths.
+        unsafe { chdir(c("/tmp").as_ptr()) };
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { open(c(p).as_ptr(), O_RDONLY) };
+        let mut buf = [1u8; 4];
+        // SAFETY: a buffer of 4 bytes.
+        let n = unsafe { read(fd, buf.as_mut_ptr(), 4) };
+        println!("{p}: {n} {buf:?}");
+        // SAFETY: the descriptor just opened.
+        unsafe { close(fd) };
+    }
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "devnode" => devnode_scenario(),
         "access" => access_scenario(),
         "nodump" => nodump_scenario(),
         s => panic!("unknown scenario {s}"),

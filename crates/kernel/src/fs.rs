@@ -3083,6 +3083,27 @@ pub(crate) mod ahead {
     }
 }
 
+/// Whether the file of host metadata `st` is one a read-only open takes in
+/// one host call ([`Direct`]): a regular file or a directory with no mode
+/// or owner kept apart and not one of fwe's device nodes (a whiteout, a
+/// loop device), which the whole way maps to what they stand for.
+#[cfg(target_os = "macos")]
+pub(crate) fn plain_file(st: &libc::stat) -> bool {
+    matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+        && !crate::modes::marked(st)
+        && !crate::devnodes::marked(st)
+}
+
+/// Whether an open by `flags` only reads: no making, truncating or
+/// writing, nor `O_PATH` or `O_NOATIME` (the owner's to ask for), as
+/// [`Direct`]'s one-call open takes.
+#[cfg(target_os = "macos")]
+pub(crate) fn reads_only(flags: u64) -> bool {
+    flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
+        && flags & (fcntl::O_CREAT | fcntl::O_TRUNC | fcntl::O_PATH | fcntl::O_TMPFILE) == 0
+        && flags & 0o1000000 == 0
+}
+
 /// Before an `openat(dirfd, path, flags)` that runs under the kernel lock:
 /// if `path` names a FIFO and the open is one that waits for the other end
 /// (to read or to write, without `O_NONBLOCK`), open it here, where the
@@ -3094,16 +3115,6 @@ pub(crate) mod ahead {
 /// (`O_CREAT|O_EXCL`), of a directory, of a link not to be followed, on a
 /// read-only mount to write, of an overlay's file, or of one whose mode fwe
 /// keeps aside (whose checks are the locked open's).
-/// Whether an open by `flags` only reads: no making, truncating or
-/// writing, nor `O_PATH` or `O_NOATIME` (the owner's to ask for), as
-/// [`Direct`]'s one-call open takes.
-#[cfg(target_os = "macos")]
-pub(crate) fn reads_only(flags: u64) -> bool {
-    flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
-        && flags & (fcntl::O_CREAT | fcntl::O_TRUNC | fcntl::O_PATH | fcntl::O_TMPFILE) == 0
-        && flags & 0o1000000 == 0
-}
-
 pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<(), i32> {
     use fwe_abi::fcntl as f;
     if flags & (f::O_NONBLOCK | f::O_PATH | f::O_DIRECTORY) != 0
@@ -3153,7 +3164,7 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
                 // SAFETY: the descriptor above; a valid out-parameter, and
                 // `FIONBIO`'s `int`.
                 let plain = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0
-                    && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+                    && plain_file(&st)
                     && unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &off) } == 0;
                 if plain {
                     d.opened = Some((fd, st));

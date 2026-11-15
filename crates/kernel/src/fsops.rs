@@ -763,8 +763,7 @@ impl<P: Platform> Kernel<P> {
                 (fd, st)
             }
         };
-        let plain = matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
-            && !crate::modes::marked(&st);
+        let plain = crate::fs::plain_file(&st);
         let mut guest = st;
         crate::owners::apply(&mut guest, crate::owners::host_owner(&st));
         if !plain || !self.permits(&guest, open_wants(flags)) {
@@ -4565,6 +4564,35 @@ mod tests {
         );
         assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
         assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
+    }
+
+    /// A device node outside `/dev`, opened only to read by a path the host
+    /// could look up in one call, is the device, not the empty file that
+    /// stands for it; its `stat` is the device's too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_device_node_opened_to_read_is_the_device() {
+        let (mut k, _d) = rooted();
+        let p = cstr("/zero");
+        let mode = u64::from(libc::S_IFCHR) | 0o666;
+        let dev = (1 << 8) | 5;
+        let r = k.syscall(nr::MKNODAT, [AT_FDCWD, p.as_ptr() as u64, mode, dev, 0, 0]);
+        assert_eq!(r, 0);
+        let fd = open(&mut k, &p, 0, 0);
+        assert!(fd >= 0, "open: {fd}");
+        let mut buf = [1u8; 4];
+        let n = k.syscall(nr::READ, [fd as u64, buf.as_mut_ptr() as u64, 4, 0, 0, 0]);
+        assert_eq!((n, buf), (4, [0; 4]), "read as /dev/zero");
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+        let mut st = Stat::default();
+        let r = k.syscall(
+            nr::NEWFSTATAT,
+            [AT_FDCWD, p.as_ptr() as u64, &mut st as *mut _ as u64, 0, 0, 0],
+        );
+        assert_eq!(r, 0);
+        assert_eq!(st.st_mode & fwe_abi::stat::S_IFMT, fwe_abi::stat::S_IFCHR);
+        assert_eq!(st.st_rdev, dev);
     }
 
     /// `faccessat` checks the guest's ids against the file's guest owner

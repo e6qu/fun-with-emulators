@@ -672,8 +672,9 @@ guest's reach, and translates what comes back.
   - a path under no mount but the root's, needing no search permission
     checked, is found in one host call from the root: a `stat`
     (`AT_SYMLINK_NOFOLLOW_ANY`), or an open only to read of a regular file
-    or directory whose mode and owner are the host's, while no lease is
-    held (`O_NOFOLLOW_ANY`). The host refuses either where a link is on
+    or directory whose mode and owner are the host's and that is not one
+    of fwe's device nodes, while no lease is held (`O_NOFOLLOW_ANY`); a
+    node's `stat` is its device's. The host refuses either where a link is on
     the way, and fwe then walks name by name. That `stat` comes before the
     look for fwe's own files, which it never reaches (it crosses no mount
     or link);
