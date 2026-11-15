@@ -3078,8 +3078,12 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         ),
     )
     .unwrap();
+    // Its calls, for the last of each process should it fail.
+    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node.trace");
+    let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root")
+    cmd.arg(format!("--strace-file={}", trace.display()))
+        .arg("--root")
         .arg(&root)
         .arg(root.join("usr/bin/node"))
         .arg(&script)
@@ -3090,6 +3094,14 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        print_last_calls(&trace);
+        // Each signal, with where it was raised.
+        let text = std::fs::read_to_string(&trace).unwrap_or_default();
+        for l in text.lines().filter(|l| l.contains("--- signal") || l.contains("fault")) {
+            eprintln!("{l}");
+        }
+    }
     // The digests are the host's (`shasum`, `md5`, Python's hashlib).
     assert_eq!(
         stdout(&out),
