@@ -1326,6 +1326,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   part is not shared with processes that share the rest;
   `MADV_DONTNEED` on a private file mapping keeps modified pages where
   Linux restores the file's.
+- VM: a program's main stack is 8 MiB whatever its `RLIMIT_STACK`.
+- Native: a program's main stack is mapped as large as its
+  `RLIMIT_STACK` from the start (the host committing pages as they are
+  used), so `/proc/<pid>/maps` shows all of it where Linux shows what it
+  grew to.
 - VM: a fork child keeps the memory `MADV_WIPEONFORK` and
   `MADV_DONTFORK` were given; a `MAP_GROWSDOWN` mapping does not grow;
   `MADV_HWPOISON` poisons nothing, `MADV_GUARD_INSTALL` guards nothing,

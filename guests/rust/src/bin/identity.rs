@@ -41,6 +41,7 @@ const SYS_PRLIMIT64: i64 = 261;
 const RLIMIT_NOFILE: i32 = 7;
 const RLIMIT_NPROC: i32 = 6;
 const RLIMIT_MSGQUEUE: i32 = 12;
+const RLIMIT_STACK: i32 = 3;
 const MAP_SHARED: i32 = 0x01;
 const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
 const MAP_PRIVATE: i32 = 0x02;
@@ -357,6 +358,42 @@ fn map_anon(len: usize, flags: i32) -> String {
     outcome(r)
 }
 
+/// Use `n` frames of 64 KiB of the stack.
+#[inline(never)]
+fn deep(n: u32) -> u8 {
+    let mut frame = [0u8; 64 << 10];
+    frame[n as usize % frame.len()] = n as u8;
+    std::hint::black_box(&mut frame);
+    if n == 0 { frame[0] } else { deep(n - 1).wrapping_add(frame[n as usize % frame.len()]) }
+}
+
+/// A program run under `RLIMIT_STACK` of `limit_mib` MiB that uses
+/// `use_mib` MiB of its main thread's stack: how it ends.
+fn stack_run(limit_mib: u64, use_mib: u32) -> String {
+    in_child(|| {
+        let mib = 1 << 20;
+        // SAFETY: plain calls into the C library.
+        unsafe {
+            setrlimit(RLIMIT_STACK, &Rlimit { cur: limit_mib * mib, max: limit_mib * mib });
+            let me = CString::new("/proc/self/exe").unwrap();
+            let n = CString::new(use_mib.to_string()).unwrap();
+            let args = [c"identity".as_ptr(), c"deep".as_ptr(), n.as_ptr(), std::ptr::null()];
+            execv(me.as_ptr(), args.as_ptr());
+        }
+        1
+    })
+}
+
+/// `RLIMIT_STACK` sizes the main thread's stack of the program `execve`
+/// runs: past the 8 MiB fwe's stack once had, and no further.
+fn stack_limit() {
+    println!(
+        "limit 32 MiB, 20 MiB used: {}; limit 1 MiB, 4 MiB used: {}",
+        stack_run(32, 20),
+        if stack_run(1, 4).starts_with("killed") { "killed" } else { "not killed" }
+    );
+}
+
 /// `RLIMIT_NPROC` counts a user's tasks, threads included, at `fork`: as
 /// a user no other process has, the least limit that lets this process
 /// fork is passed once it runs two more threads.
@@ -459,7 +496,7 @@ fn prlimit_other() {
         if child == 0 {
             setrlimit(RLIMIT_MSGQUEUE, &Rlimit { cur: 4321, max: 4321 });
             let me = CString::new("/proc/self/exe").unwrap();
-            let args = [me.as_ptr(), c"identity".as_ptr(), c"pause".as_ptr(), std::ptr::null()];
+            let args = [c"identity".as_ptr(), c"pause".as_ptr(), std::ptr::null()];
             execv(me.as_ptr(), args.as_ptr());
             _exit(1);
         }
@@ -857,6 +894,8 @@ fn main() {
         "affinity" => affinity(),
         "prlimit-other" => prlimit_other(),
         "nproc-threads" => nproc_threads(),
+        "stack-limit" => stack_limit(),
+        "deep" => std::process::exit(i32::from(deep(arg(2).parse::<u32>().unwrap() * 16) == 255)),
         // SAFETY: waiting for a signal.
         "pause" => loop {
             unsafe { pause() };

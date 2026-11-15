@@ -777,6 +777,9 @@ impl<P: Platform> Kernel<P> {
     pub fn exec_state(&self) -> Vec<u8> {
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
+        // First, for the new process to size the program's stack by before
+        // it reads the rest ([`exec_state_stack_limit`]).
+        e.u64(rlimits::get(fwe_abi::resource::RLIMIT_STACK).0);
         match self.fs_opt() {
             Some(fs) => {
                 e.bool(true);
@@ -844,6 +847,8 @@ impl<P: Platform> Kernel<P> {
         if d.u64() != EXEC_STATE_MAGIC {
             return Err("the exec state is not fwe's".into());
         }
+        // The stack limit, which the limits carry too.
+        d.u64();
         // The view, which the filesystem took when it was opened.
         if d.bool() {
             fs::Fs::skip_view(&mut d);
@@ -1179,6 +1184,14 @@ fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
 
 /// Host `fork` is refused (see [`forbid_fork`]).
 static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The soft `RLIMIT_STACK` an exec state record ([`Kernel::exec_state`])
+/// carries: what the new process sizes the program's stack by, before it
+/// has a kernel to restore the record into.
+pub fn exec_state_stack_limit(state: &[u8]) -> Option<u64> {
+    let mut d = snapshot::Dec::new(state);
+    (d.u64() == EXEC_STATE_MAGIC).then(|| d.u64())
+}
 
 /// Leads an exec state record ([`Kernel::exec_state`]).
 pub(crate) const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;

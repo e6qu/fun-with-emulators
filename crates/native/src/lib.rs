@@ -77,8 +77,27 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Size of the guest's main thread stack.
+/// Size of the guest's main thread stack in the hypervisor backend.
 pub const STACK_SIZE: u64 = 8 << 20;
+
+/// The size of a program's main thread stack for a soft `RLIMIT_STACK` of
+/// `limit`, in the native backend: the limit, which Linux lets the stack
+/// grow to, mapped at once (the host gives it pages only as they are
+/// used), from 128 KiB (Linux's least) up to 4 GiB for an unlimited one.
+fn stack_size(limit: u64, page: u64) -> u64 {
+    limit.clamp(128 << 10, 4 << 30).next_multiple_of(page)
+}
+
+/// The soft `RLIMIT_STACK` the program is started under: the one an
+/// `execve` carried, else the process's own.
+fn start_stack_limit(options: &Options) -> u64 {
+    options
+        .exec_state
+        .as_deref()
+        .and_then(unhex)
+        .and_then(|s| fwe_kernel::exec_state_stack_limit(&s))
+        .unwrap_or_else(|| fwe_kernel::rlimits::get(fwe_abi::resource::RLIMIT_STACK).0)
+}
 
 /// The kernel of the guest running in this process.
 #[allow(dead_code)]
@@ -928,6 +947,7 @@ pub fn load_image(
     platform: &NativePlatform,
     page: u64,
     tracer: Tracer,
+    stack_limit: u64,
 ) -> Result<Loadout, Error> {
     let elf = Elf::parse(file).map_err(Error::Elf)?;
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
@@ -993,12 +1013,14 @@ pub fn load_image(
     let entry = interp.map_or(loaded.entry, |i| i.entry);
     let interp_base = interp.map_or(0, |i| i.load_base);
 
-    // A fresh thread stack, with an inaccessible guard page below it.
+    // A fresh thread stack, as large as `RLIMIT_STACK` lets it grow, with
+    // an inaccessible guard page below it.
+    let stack = stack_size(stack_limit, page);
     // SAFETY: a fresh mapping owned by the guest.
     let stack_base = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            (STACK_SIZE + page) as usize,
+            (stack + page) as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
@@ -1008,10 +1030,10 @@ pub fn load_image(
     if stack_base == libc::MAP_FAILED {
         return Err(Error::Load(loader::LoadError::Map(std::io::Error::last_os_error())));
     }
-    fwe_kernel::mm::track(stack_base as u64, STACK_SIZE + page);
+    fwe_kernel::mm::track(stack_base as u64, stack + page);
     // SAFETY: protecting the lowest page of the mapping just made.
     unsafe { libc::mprotect(stack_base, page as usize, libc::PROT_NONE) };
-    let stack_top = stack_base as u64 + STACK_SIZE + page;
+    let stack_top = stack_base as u64 + stack + page;
     fwe_kernel::maps::record().set_stack(stack_base as u64 + page, stack_top);
     fwe_kernel::maps::record().set_heap(brk.start, brk.start, brk.limit);
 
@@ -1040,7 +1062,7 @@ pub fn load_image(
 
     let image =
         stack::InitialStack { args, env, execfn, auxv: &aux, random: random16() }.build(stack_top);
-    if stack_top - image.sp > STACK_SIZE / 2 {
+    if stack_top - image.sp > stack / 2 {
         return Err(Error::Unsupported("argument list too long".into()));
     }
     // SAFETY: the image fits in the stack mapping, ending at its top.
@@ -1112,6 +1134,7 @@ fn start(
         &platform,
         page,
         options.strace,
+        start_stack_limit(options),
     )?;
     fwe_kernel::timing::mark("load_image");
     // A trampoline used as the return address for signal handlers that have

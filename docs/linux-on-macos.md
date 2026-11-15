@@ -1410,8 +1410,11 @@ A Linux program learns about its machine from its initial stack, which
 fwe builds as Linux does in both backends:
 
 - strings, `AT_RANDOM` bytes, the auxiliary vector, `envp`, `argv`,
-  `argc`, 16-byte aligned, on a fresh 8 MiB stack with a guard page
-  (`crates/native/src/stack.rs`);
+  `argc`, 16-byte aligned, on a fresh stack with a guard page
+  (`crates/native/src/stack.rs`): natively as large as the soft
+  `RLIMIT_STACK` the program starts under (from 128 KiB, and 4 GiB for
+  an unlimited one), mapped whole at once where Linux grows it to the
+  limit, the host giving it pages as they are used; 8 MiB in the VM;
 - the auxiliary vector carries `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_BASE`,
   `AT_ENTRY`, `AT_PAGESZ`, the ids, `AT_SECURE`, `AT_RANDOM`, `AT_EXECFN`,
   `AT_PLATFORM`, `AT_MINSIGSTKSZ` and `AT_HWCAP`/`AT_HWCAP2`;

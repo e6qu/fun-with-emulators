@@ -4275,6 +4275,16 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// `RLIMIT_STACK` sizes the main thread's stack of a program `execve`
+/// runs, natively.
+#[test]
+fn rlimit_stack_sizes_the_main_stack() {
+    assert_eq!(
+        identity(&["stack-limit"]),
+        "limit 32 MiB, 20 MiB used: exit 0; limit 1 MiB, 4 MiB used: killed\n"
+    );
+}
+
 /// `RLIMIT_NPROC` counts a user's threads at `fork`, as Linux counts its
 /// tasks.
 #[test]

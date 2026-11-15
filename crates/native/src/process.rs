@@ -132,6 +132,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         &platform,
         page,
         strace,
+        fwe_kernel::rlimits::get(fwe_abi::resource::RLIMIT_STACK).0,
     ) {
         Ok(out) => out,
         Err(e) => {

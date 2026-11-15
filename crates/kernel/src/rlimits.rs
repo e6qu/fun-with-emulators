@@ -8,7 +8,8 @@
 //! - `RLIMIT_CORE`, since fwe writes the guest's core dumps (the host's
 //!   limit is kept at 0);
 //! - `RLIMIT_STACK`, since the guest's stack is fwe's, not the host
-//!   thread's (whose limit macOS will not set below the stack it has);
+//!   thread's (whose limit macOS will not set below the stack it has):
+//!   the native backend sizes a program's main stack by it;
 //! - `RLIMIT_CPU`, whose soft limit the host's carries, but whose hard
 //!   limit macOS does not enforce: past the soft limit fwe has the host
 //!   signal again every second, as Linux does, and at the hard limit ends
