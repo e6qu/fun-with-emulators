@@ -143,6 +143,8 @@ pub struct Record {
     /// device and inode.
     exe: Vec<u8>,
     exe_id: (u64, u64),
+    /// Some memory was sealed: until then no call looks for a seal.
+    any_sealed: bool,
 }
 
 impl Default for Record {
@@ -159,6 +161,7 @@ impl Record {
             lock_future: false,
             exe: Vec::new(),
             exe_id: (0, 0),
+            any_sealed: false,
         }
     }
 
@@ -228,6 +231,7 @@ impl Record {
             };
             let object = Object { name, dev, ino, offset };
             let area = Area { prot, shared, locked, noexec, nowrite, sealed, object };
+            r.any_sealed |= sealed;
             r.areas.insert(start, end, area);
         }
         r
@@ -273,24 +277,26 @@ impl Record {
             return Err(fwe_abi::errno::ENOMEM);
         }
         self.areas.update(start, end, |a| Area { sealed: true, ..a.clone() });
+        self.any_sealed = true;
         Ok(())
     }
 
     /// Whether any of `[start, end)` is sealed.
     pub fn any_sealed(&self, start: u64, end: u64) -> bool {
-        self.areas.overlapping(start, end).any(|p| p.value.sealed)
+        self.any_sealed && self.areas.overlapping(start, end).any(|p| p.value.sealed)
     }
 
     /// Whether any of `[start, end)` is sealed, private, anonymous and not
     /// writable: memory `madvise` may not discard.
     pub fn any_sealed_read_only(&self, start: u64, end: u64) -> bool {
-        self.areas.overlapping(start, end).any(|p| {
-            let a = p.value;
-            a.sealed
-                && !a.shared
-                && !matches!(a.object.name, Name::Exe | Name::Path(_))
-                && a.prot & fwe_abi::mman::PROT_WRITE == 0
-        })
+        self.any_sealed
+            && self.areas.overlapping(start, end).any(|p| {
+                let a = p.value;
+                a.sealed
+                    && !a.shared
+                    && !matches!(a.object.name, Name::Exe | Name::Path(_))
+                    && a.prot & fwe_abi::mman::PROT_WRITE == 0
+            })
     }
 
     /// The guest unmapped `[start, start + len)`.

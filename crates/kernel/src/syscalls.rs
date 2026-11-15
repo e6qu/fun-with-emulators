@@ -163,6 +163,14 @@ pub(crate) fn shares(n: u64) -> bool {
     )
 }
 
+/// A memory call that names no descriptor or path: it makes no descriptor,
+/// reads or writes no file, changes no credentials and never waits, so none
+/// of the checks and notes around the other calls applies.
+pub(crate) fn plain_memory(n: u64, a: &[u64; 6]) -> bool {
+    matches!(n, nr::MUNMAP | nr::MPROTECT | nr::MADVISE | nr::BRK | nr::MREMAP)
+        || n == nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS != 0
+}
+
 impl<P: Platform> Kernel<P> {
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
         // Told of a foster child: the watcher that follows it starts here,
@@ -173,12 +181,7 @@ impl<P: Platform> Kernel<P> {
         // Mappings changed by memory calls are published before any other
         // call ([`crate::maps::publish`]).
         crate::maps::flush_before(n);
-        // A memory call that names no descriptor or path makes no
-        // descriptor, reads or writes no file and changes no credentials:
-        // none of the checks and notes around the other calls applies.
-        if matches!(n, nr::MUNMAP | nr::MPROTECT | nr::MADVISE | nr::BRK | nr::MREMAP)
-            || n == nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS != 0
-        {
+        if plain_memory(n, &a) {
             return self.dispatch_call(n, a);
         }
         if let Err(e) = crate::fdtable::check_args(n, &a) {
