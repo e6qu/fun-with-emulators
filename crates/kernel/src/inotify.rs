@@ -145,20 +145,37 @@ fn alive(p: Proc) -> bool {
 
 static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
 
+/// The count of registries made ([`make_registry`]) this process last
+/// looked for one at and found none: it looks again only once the count
+/// moves.
+static MISSED_AT: AtomicU64 = AtomicU64::new(0);
+
+fn registry_dir() -> Option<Vec<u8>> {
+    let mut d = crate::fs::shm::user_dir().ok()?;
+    d.extend_from_slice(format!("/v{}-inotify", crate::shared::FORMAT).as_bytes());
+    Some(d)
+}
+
 /// The registry, every process's, if any process has made it (it lasts,
-/// once made): a count in the process store says so, so a file call costs
-/// a word read while none is.
+/// once made): a count in the process store says how many times one was
+/// made, so a file call costs a word read while none is, and a registry
+/// looked for and not there (the count can outlive it: a store another fwe
+/// build shares) is looked for again only once another is made. It is
+/// joined, not made, so a call made while the registry's lock is held
+/// (a watch being added) never waits for that lock.
 pub fn registry() -> Option<&'static Record<Registry>> {
     use crate::procstore::{Count, count};
     if let Some(r) = REGISTRY.get() {
         return Some(r);
     }
-    if count(Count::Watches).load(Ordering::SeqCst) == 0 {
+    let made = count(Count::Watches).load(Ordering::SeqCst);
+    if made == 0 || MISSED_AT.load(Ordering::Relaxed) == made {
         return None;
     }
-    // Opened, or made if it is not there (the count can outlive it: a
-    // process's store of another fwe build), so it is looked for once.
-    let r = Record::named("inotify", 0, Registry::default).ok()?;
+    let Some(r) = registry_dir().and_then(|d| Record::join(&d, 0).ok()) else {
+        MISSED_AT.store(made, Ordering::Relaxed);
+        return None;
+    };
     let _ = REGISTRY.set(r);
     REGISTRY.get()
 }
@@ -171,8 +188,8 @@ pub(crate) fn make_registry() -> Option<&'static Record<Registry>> {
     }
     let r = Record::named("inotify", 0, Registry::default).ok()?;
     let _ = REGISTRY.set(r);
-    // Every process looks for it from now on.
-    count(Count::Watches).store(1, Ordering::SeqCst);
+    // Every process looks for it from now on, those that missed one too.
+    count(Count::Watches).fetch_add(1, Ordering::SeqCst);
     REGISTRY.get()
 }
 
