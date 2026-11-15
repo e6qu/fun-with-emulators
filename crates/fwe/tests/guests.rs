@@ -6624,6 +6624,21 @@ fn seccomp_logs_and_traces_and_security_sysctls() {
     );
 }
 
+/// An eBPF socket filter reads the packet's bytes (`bpf_skb_load_bytes`)
+/// and decides on each message whichever call sends it: `write`,
+/// `sendto`, `writev` and `sendmsg` each report the whole length sent,
+/// and only what the filter keeps arrives.
+#[test]
+fn socket_filters_read_packets_on_every_send() {
+    assert_eq!(
+        containers("socket-filter"),
+        "loaded: true attached: ok\nwrite of x-write: 7\nwrite of k-write: 7\n\
+         sendto of x-sendto: 8\nsendto of k-sendto: 8\nwritev of x-writev: 8\n\
+         writev of k-writev: 8\nsendmsg of x-sendmsg: 9\nsendmsg of k-sendmsg: 9\n\
+         received: k-write k-sendto k-writev k-sendmsg\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.
@@ -6718,8 +6733,8 @@ fn overlay_mounts() {
 /// `poll`; `/proc` shows namespace links as their namespaces, `fdinfo`,
 /// another process's descriptors, `oom_score_adj` (inherited), and is
 /// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
-/// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
-/// is not attached; limits set with `prlimit` from outside; netlink of a
+/// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of a type fwe cannot
+/// run is refused; limits set with `prlimit` from outside; netlink of a
 /// network namespace's `lo`, and in the host's, the host's loopback, up
 /// and kept so.
 #[test]
@@ -6732,8 +6747,8 @@ fn container_runtime_calls() {
          fdinfo: true\nproc fstatfs: 0x9fa0\noom: 500 child's fd 9: /etc/marker\n\
          prlimit of the child: ok\nchild: oom 500 nofile 100 200\npeer: self true uid 0\n\
          shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
-         linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
-         attached as a device program: EINVAL\nnetlink outside: true lo flags 0x10049, set down -1\n\
+         linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program: EINVAL\n\
+         netlink outside: true lo flags 0x10049, set down -1\n\
          netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
     );
 }

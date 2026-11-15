@@ -107,11 +107,15 @@ pub fn load_filter(bytes: &[u8]) -> Result<Program, i32> {
     check(bytes, true)
 }
 
-/// The map helpers a socket filter may call: `bpf_map_lookup_elem`,
-/// `bpf_map_update_elem`, `bpf_map_delete_elem`.
+/// The helpers a socket filter may call: `bpf_map_lookup_elem`,
+/// `bpf_map_update_elem`, `bpf_map_delete_elem`, and
+/// `bpf_skb_load_bytes` ([`HELPER_SKB_LOAD_BYTES`]).
 const HELPER_LOOKUP: i32 = 1;
 const HELPER_UPDATE: i32 = 2;
 const HELPER_DELETE: i32 = 3;
+/// `bpf_skb_load_bytes(skb, offset, to, len)`: a socket filter reads the
+/// packet's bytes.
+const HELPER_SKB_LOAD_BYTES: i32 = 26;
 /// A 64-bit immediate load of a map's descriptor.
 const PSEUDO_MAP_FD: u8 = 1;
 
@@ -170,7 +174,10 @@ fn check(bytes: &[u8], filter: bool) -> Result<Program, i32> {
                     // A helper call: the map helpers, for a filter.
                     0x80 if filter
                         && class == CLASS_JMP
-                        && matches!(ins.imm, HELPER_LOOKUP | HELPER_UPDATE | HELPER_DELETE) => {}
+                        && matches!(
+                            ins.imm,
+                            HELPER_LOOKUP | HELPER_UPDATE | HELPER_DELETE | HELPER_SKB_LOAD_BYTES
+                        ) => {}
                     0x80 => return Err(errno::EINVAL),
                     0x90 => {} // exit
                     _ if op > 0xd0 => return Err(errno::EINVAL),
@@ -222,13 +229,18 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
     ctx[0..4].copy_from_slice(&((access << 16) | dev_type).to_le_bytes());
     ctx[4..8].copy_from_slice(&major.to_le_bytes());
     ctx[8..12].copy_from_slice(&minor.to_le_bytes());
-    exec(prog, &ctx, &[])
+    exec(prog, &ctx, &[], &[])
 }
 
-/// Run `prog` with context `ctx` (read only) and the maps it loads, by the
-/// index of the instruction that loads each: its return value, or `None`
-/// when it went wrong.
-fn exec(prog: &Program, ctx: &[u8], maps: &[(usize, crate::bpfmap::Map)]) -> Option<u64> {
+/// Run `prog` with context `ctx` (read only), the maps it loads, by the
+/// index of the instruction that loads each, and a socket filter's packet
+/// `packet`: its return value, or `None` when it went wrong.
+fn exec(
+    prog: &Program,
+    ctx: &[u8],
+    maps: &[(usize, crate::bpfmap::Map)],
+    packet: &[u8],
+) -> Option<u64> {
     let mut stack = [0u8; STACK];
     let mut r = [Val::Scalar(0); 11];
     r[1] = Val::Ctx(0);
@@ -280,6 +292,12 @@ fn exec(prog: &Program, ctx: &[u8], maps: &[(usize, crate::bpfmap::Map)]) -> Opt
                         map_write(map, file + rel as u64, bytes)?;
                     }
                     _ => return None,
+                }
+            }
+            CLASS_JMP if ins.code & 0xf0 == 0x80 && ins.imm == HELPER_SKB_LOAD_BYTES => {
+                r[0] = skb_load_bytes(&r, &mut stack, packet)?;
+                for reg in &mut r[1..=5] {
+                    *reg = Val::Scalar(0);
                 }
             }
             CLASS_JMP if ins.code & 0xf0 == 0x80 => {
@@ -490,6 +508,31 @@ fn stack_bytes(stack: &[u8; STACK], p: Val, len: usize) -> Option<Vec<u8>> {
     Some(stack[at as usize..at as usize + len].to_vec())
 }
 
+/// `bpf_skb_load_bytes` with the registers `r`: `len` bytes of `packet`
+/// from `offset` into the stack at `to`, 0; past the packet's end, the
+/// stack's bytes zeroed and `-EFAULT`, as Linux has it. A context other
+/// than the program's, or a destination off the stack, stops the program.
+fn skb_load_bytes(r: &[Val; 11], stack: &mut [u8; STACK], packet: &[u8]) -> Option<Val> {
+    let Val::Ctx(0) = r[1] else { return None };
+    let (off, len) = (r[2].scalar()?, r[4].scalar()? as usize);
+    let Val::Stack(base) = r[3] else { return None };
+    let at = (STACK as i64).checked_add(base)?;
+    if len == 0 || at < 0 || at as usize + len > STACK {
+        return None;
+    }
+    let dest = &mut stack[at as usize..at as usize + len];
+    match usize::try_from(off).ok().and_then(|o| packet.get(o..o.checked_add(len)?)) {
+        Some(src) => {
+            dest.copy_from_slice(src);
+            Some(Val::Scalar(0))
+        }
+        None => {
+            dest.fill(0);
+            Some(Val::Scalar((-(errno::EFAULT as i64)) as u64))
+        }
+    }
+}
+
 /// Call map helper `which` with the registers `r`.
 fn helper(
     which: i32,
@@ -694,12 +737,20 @@ pub fn attach_socket(fd: i32, prog: Option<i32>) -> Result<(), i32> {
     Ok(())
 }
 
-/// What of `len` bytes sent on socket `fd` the filter of the socket they
-/// reach lets in (`None`: no filter; `Some(0)`: none, the data dropped).
-pub fn filter_send(fd: i32, len: u64) -> Option<u64> {
-    if !ANY_FILTER.load(std::sync::atomic::Ordering::Acquire) {
+/// Whether any socket filter is attached (sends look for one only then).
+pub fn filtering() -> bool {
+    ANY_FILTER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// What of the bytes `data` sent on socket `fd` the filter of the socket
+/// they reach lets in (`None`: no filter; `Some(0)`: none, the data
+/// dropped). The program sees their length in `__sk_buff` and reads them
+/// with `bpf_skb_load_bytes`.
+pub fn filter_send(fd: i32, data: &[u8]) -> Option<u64> {
+    if !filtering() {
         return None;
     }
+    let len = data.len() as u64;
     let me = crate::host::pid();
     let peer = crate::procpid::socket_peer(me, fd)?;
     let f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -707,7 +758,7 @@ pub fn filter_send(fd: i32, len: u64) -> Option<u64> {
     // The context: `struct __sk_buff`, its length first.
     let mut ctx = [0u8; 192];
     ctx[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-    let keep = exec(prog, &ctx, maps).unwrap_or(0);
+    let keep = exec(prog, &ctx, maps, data).unwrap_or(0);
     Some(keep.min(len))
 }
 
@@ -746,9 +797,10 @@ pub fn unprivileged_allows(cmd: u64, attr: u64) -> bool {
 /// `bpf(cmd, attr, size)`: maps and their elements ([`crate::bpfmap`]);
 /// the device controller's programs: load, attach, detach, query, and a
 /// descriptor by identity; socket filters, loaded with the maps they use
-/// and attached with `SO_ATTACH_BPF`. A program of another type loads (as
-/// programs probe for features by loading one) but cannot be attached;
-/// other commands fail as on a kernel without them.
+/// and attached with `SO_ATTACH_BPF`. A program of another type is
+/// refused (`EINVAL`), as a kernel without it refuses it, so a program
+/// probing for one learns it is not there; other commands fail as on a
+/// kernel without them.
 pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     use fwe_abi::err;
     let size = size.min(256) as usize;
@@ -768,7 +820,8 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
             }
             let bytes = crate::uaccess::read_bytes(dword(&a, 8), n * 8)?;
             // A device program or a socket filter is checked as fwe will
-            // run it; one of another type is kept but never attached.
+            // run it; another type is one fwe cannot run (`EINVAL`, as a
+            // kernel built without it answers).
             let maps = match ty {
                 BPF_PROG_TYPE_CGROUP_DEVICE => load(&bytes).map(|_| Vec::new())?,
                 BPF_PROG_TYPE_SOCKET_FILTER => {
@@ -790,7 +843,7 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                     }
                     resolve_maps(&bytes)?
                 }
-                _ => Vec::new(),
+                _ => return Err(errno::EINVAL),
             };
             #[cfg(target_os = "macos")]
             return prog_fd(&bytes, fresh_id(), ty).map(|fd| {
@@ -896,6 +949,31 @@ mod tests {
         b
     }
 
+    /// A socket filter reads the packet with `bpf_skb_load_bytes`: the
+    /// byte at 2 is the length kept; past the end the helper fails.
+    #[test]
+    fn socket_filters_read_the_packet() {
+        let bytes: Vec<u8> = [
+            ins(0xb7, 2, 0, 0, 2),   // r2 = 2
+            ins(0xbf, 3, 10, 0, 0),  // r3 = r10
+            ins(0x07, 3, 0, 0, -8),  // r3 -= 8
+            ins(0xb7, 4, 0, 0, 1),   // r4 = 1
+            ins(0x85, 0, 0, 0, 26),  // skb_load_bytes(ctx, 2, fp-8, 1)
+            ins(0x55, 0, 0, 2, 0),   // if r0 != 0 goto fail
+            ins(0x71, 0, 10, -8, 0), // r0 = the byte
+            ins(0x95, 0, 0, 0, 0),
+            ins(0xb7, 0, 0, 0, 99), // fail: r0 = 99
+            ins(0x95, 0, 0, 0, 0),
+        ]
+        .concat();
+        let prog = load_filter(&bytes).unwrap();
+        let ctx = [0u8; 192];
+        assert_eq!(exec(&prog, &ctx, &[], &[9, 9, 5, 9]), Some(5));
+        assert_eq!(exec(&prog, &ctx, &[], &[9]), Some(99));
+        // A device program may call no helper.
+        assert_eq!(load(&bytes).map(|_| ()), Err(errno::EINVAL));
+    }
+
     /// A program of the shape crun generates: deny everything but reads and
     /// writes of the character device 1:3 (`/dev/null`).
     fn allow_null() -> Vec<u8> {
@@ -984,7 +1062,7 @@ mod tests {
         .concat();
         assert_eq!(load(&prog), Err(errno::EINVAL));
         let p = load_filter(&prog).unwrap();
-        assert_eq!(exec(&p, &[0u8; 192], &[(0, m)]), Some(0));
+        assert_eq!(exec(&p, &[0u8; 192], &[(0, m)], &[]), Some(0));
         assert_eq!(m.lookup(&0u32.to_le_bytes()), Ok(1u64.to_le_bytes().to_vec()));
     }
 

@@ -1234,10 +1234,11 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
 - **cgroups** (`crates/kernel/src/cgroupfs.rs`, `bpf.rs`): device programs
   are kept in the cgroup's directory, so they outlive the runtime that
   attached them. The eBPF interpreter checks each access against the
-  context and stack and stops a program that runs too long. Other program
-  types load (libraries probe with them) but do not attach (`EINVAL`),
-  except socket filters; `/proc/self/fdinfo` shows a program's type, id
-  and tag (the first 8 bytes of its instructions' SHA-1).
+  context and stack and stops a program that runs too long. A program of
+  a type fwe does not run (anything but device programs and socket
+  filters) does not load (`EINVAL`, as a kernel without the type answers
+  a library's probe); `/proc/self/fdinfo` shows a program's type, id and
+  tag (the first 8 bytes of its instructions' SHA-1).
 - **eBPF maps and socket filters** (`crates/kernel/src/bpfmap.rs`,
   `bpf.rs`, `bpfcheck.rs`): array and hash maps, each an unlinked file of
   fwe's its descriptors share. A socket filter is checked as it loads:
@@ -1246,9 +1247,14 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   verifier refuses it; one at an offset only the run knows is checked by
   the interpreter. Attached with `SO_ATTACH_BPF`, it runs on what this
   process sends to the socket (by its connected peer, which the host's
-  socket record names), keeping what it returns of the data. A filter
-  attached by another process is not seen, nor one on an unconnected
-  socket; classic filters (`SO_ATTACH_FILTER`) are not taken.
+  socket record names), by `write`, `writev`, `send`, `sendto`,
+  `sendmsg`, `sendmmsg`, `sendfile` and `splice`, keeping what it returns
+  of the data; it reads the data with `bpf_skb_load_bytes`, and of
+  `__sk_buff` only `len` is filled in. A filter attached by another
+  process (or by this one before an `execve`) is not seen, since the
+  filters are kept in the process that attached them, nor one on an
+  unconnected socket; classic filters (`SO_ATTACH_FILTER`), `LD_ABS` and
+  `LD_IND`, and direct packet access are not taken.
 - **Loop devices** (`crates/kernel/src/loopdev.rs`): eight at first. An
   open device is its node's descriptor, marked, whose position the host
   keeps; reads and writes are in whole sectors from the attached file's

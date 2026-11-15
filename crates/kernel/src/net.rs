@@ -1135,7 +1135,13 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     // What the receiving socket's filter lets in: none, the data dropped as
     // if sent, or the first part.
     let sent = len;
-    let len = match crate::bpf::filter_send(fd as i32, len) {
+    let filtered = if crate::bpf::filtering() {
+        let data = guest!(uaccess::read_bytes(buf, len as usize));
+        crate::bpf::filter_send(fd as i32, &data)
+    } else {
+        None
+    };
+    let len = match filtered {
         Some(0) => return sent as i64,
         Some(keep) => keep,
         None => len,
@@ -2428,6 +2434,19 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         Ok(false) => (name, namelen),
         Err(e) => return e,
     };
+    // A socket whose peer filters what arrives: what it lets in is sent,
+    // the rest dropped as if sent.
+    let total: u64 = hiov.iter().map(|v| v.iov_len as u64).sum();
+    let mut dropped = 0;
+    if crate::bpf::filtering()
+        && let Some(keep) = crate::bpf::filter_send(fd as i32, &crate::iovecs_bytes(&hiov))
+    {
+        if keep == 0 {
+            return total as i64;
+        }
+        dropped = total - keep;
+        hiov = crate::iovecs_part(&hiov, 0, keep);
+    }
     let mut hb = empty_sockaddr();
     // A Unix path too long for the host is sent to from its directory.
     let mut dir = None;
@@ -2504,7 +2523,8 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     if r >= 0 {
         crate::netns::used(fd as i32);
     }
-    r
+    // What the filter dropped counts as sent.
+    if r >= 0 && r as u64 + dropped == total { total as i64 } else { r }
 }
 
 /// A `struct mmsghdr`: a `msghdr` and the length sent or received.

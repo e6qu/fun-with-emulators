@@ -810,6 +810,78 @@ fn main() {
                     println!("{s}: {}", text(&format!("/proc/sys/{s}")).trim());
                 }
             }
+            // A socket filter that reads the packet (`bpf_skb_load_bytes`)
+            // and drops what starts with `x`, on every way of sending.
+            Some("socket-filter") => {
+                let ins = |code: u8, dst: u8, src: u8, off: i16, imm: i32| -> u64 {
+                    u64::from(code)
+                        | u64::from(dst | src << 4) << 8
+                        | u64::from(off as u16) << 16
+                        | u64::from(imm as u32) << 32
+                };
+                let insns = [
+                    ins(0xbf, 6, 1, 0, 0),    // r6 = r1
+                    ins(0xb7, 2, 0, 0, 0),    // r2 = 0
+                    ins(0xbf, 3, 10, 0, 0),   // r3 = r10
+                    ins(0x07, 3, 0, 0, -8),   // r3 -= 8
+                    ins(0xb7, 4, 0, 0, 1),    // r4 = 1
+                    ins(0xbf, 1, 6, 0, 0),    // r1 = r6
+                    ins(0x85, 0, 0, 0, 26),   // skb_load_bytes
+                    ins(0x55, 0, 0, 4, 0),    // if r0 != 0 drop
+                    ins(0x71, 1, 10, -8, 0),  // r1 = first byte
+                    ins(0x15, 1, 0, 2, 0x78), // if 'x' drop
+                    ins(0xb7, 0, 0, 0, 0xffff),
+                    ins(0x95, 0, 0, 0, 0),
+                    ins(0xb7, 0, 0, 0, 0),
+                    ins(0x95, 0, 0, 0, 0),
+                ];
+                let lic = c("GPL");
+                let mut attr = [0u8; 128];
+                attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // SOCKET_FILTER
+                attr[4..8].copy_from_slice(&(insns.len() as u32).to_ne_bytes());
+                attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+                attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
+                let prog = syscall(280, 5, attr.as_ptr(), 128) as i32;
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, 2, 0, sv.as_mut_ptr());
+                let r = syscall(208, sv[1], 1, 50, &prog as *const i32, 4);
+                println!("loaded: {} attached: {}", prog >= 0, res(r));
+                let send_iov = |data: &[u8], how: &str| {
+                    let mut iov = Iovec { base: data.as_ptr() as *mut u8, len: data.len() };
+                    let n = match how {
+                        "write" => write(sv[0], data.as_ptr(), data.len()),
+                        "sendto" => syscall(206, sv[0], data.as_ptr(), data.len(), 0, 0, 0) as isize,
+                        "writev" => syscall(66, sv[0], &mut iov as *mut Iovec, 1) as isize,
+                        _ => {
+                            let m = Msghdr {
+                                name: std::ptr::null_mut(),
+                                namelen: 0,
+                                iov: &mut iov,
+                                iovlen: 1,
+                                control: std::ptr::null_mut(),
+                                controllen: 0,
+                                flags: 0,
+                            };
+                            sendmsg(sv[0], &m, 0)
+                        }
+                    };
+                    println!("{how} of {}: {n}", String::from_utf8_lossy(data));
+                };
+                for how in ["write", "sendto", "writev", "sendmsg"] {
+                    send_iov(format!("x-{how}").as_bytes(), how);
+                    send_iov(format!("k-{how}").as_bytes(), how);
+                }
+                let mut got = Vec::new();
+                loop {
+                    let mut buf = [0u8; 64];
+                    let n = recv(sv[1], buf.as_mut_ptr(), 64, MSG_DONTWAIT);
+                    if n <= 0 {
+                        break;
+                    }
+                    got.push(String::from_utf8_lossy(&buf[..n as usize]).into_owned());
+                }
+                println!("received: {}", got.join(" "));
+            }
             // A program only the VM runs, on a host without one: the exec
 
             // fails and the caller goes on, as podman's pause process does
@@ -1481,7 +1553,8 @@ fn main() {
                 let f = open(c("/tmp/linked").as_ptr(), O_WRONLY | O_CREAT, 0o644);
                 println!("linkat AT_EMPTY_PATH: {}", r(linkat(f, c("").as_ptr(), -100, c("/tmp/again").as_ptr(), 0x1000) as i64));
                 println!("fchownat AT_EMPTY_PATH: {}", r(fchownat(f, c("").as_ptr(), 0, 0, 0x1000) as i64));
-                // BPF: a program of another type loads but does not attach.
+                // BPF: a program of a type fwe cannot run is refused, as a
+                // kernel without it refuses it.
                 let insns: [u64; 2] = [0x0000_0000_0000_00b7, 0x0000_0000_0000_0095];
                 let mut attr = [0u8; 128];
                 attr[0..4].copy_from_slice(&8u32.to_ne_bytes()); // CGROUP_SKB
@@ -1489,15 +1562,7 @@ fn main() {
                 attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
                 let lic = c("MIT");
                 attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
-                let prog = syscall(280, 5, attr.as_ptr(), 128) as i32;
-                let finfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{prog}")).unwrap_or_default();
-                println!("skb program loads: {} type 8: {}", prog >= 0, finfo.contains("prog_type:\t8"));
-                let cg = open(c("/sys/fs/cgroup").as_ptr(), O_RDONLY | O_DIRECTORY);
-                let mut at = [0u8; 32];
-                at[0..4].copy_from_slice(&cg.to_ne_bytes());
-                at[4..8].copy_from_slice(&prog.to_ne_bytes());
-                at[8..12].copy_from_slice(&6u32.to_ne_bytes()); // BPF_CGROUP_DEVICE
-                println!("attached as a device program: {}", r(syscall(280, 8, at.as_ptr(), 32)));
+                println!("skb program: {}", r(syscall(280, 5, attr.as_ptr(), 128)));
                 // Netlink: in the host's namespace a socket that describes
                 // no interface; lo in one's own.
                 let link = |nl: i32, up: Option<bool>| -> u32 {

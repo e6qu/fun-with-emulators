@@ -1640,10 +1640,13 @@ fn copy_between(
         if n == 0 {
             break;
         }
+        // A socket whose peer filters what arrives: what it lets in is
+        // written, the rest dropped as if sent.
+        let limit = bpf::filter_send(output, &buf[..n as usize]).map_or(n as usize, |k| k as usize);
         let mut sent = 0usize;
-        while sent < n as usize {
+        while sent < limit {
             if out_dev {
-                match loopdev::write_at_pos(output, &buf[sent..n as usize], None) {
+                match loopdev::write_at_pos(output, &buf[sent..limit], None) {
                     Some(w) if w > 0 => {
                         sent += w as usize;
                         continue;
@@ -1663,10 +1666,10 @@ fn copy_between(
                     Some(p) => libc::pwrite(
                         output,
                         buf[sent..].as_ptr().cast(),
-                        n as usize - sent,
+                        limit - sent,
                         p + sent as i64,
                     ),
-                    None => libc::write(output, buf[sent..].as_ptr().cast(), n as usize - sent),
+                    None => libc::write(output, buf[sent..].as_ptr().cast(), limit - sent),
                 }
             };
             if w <= 0 {
@@ -1674,6 +1677,9 @@ fn copy_between(
                 break;
             }
             sent += w as usize;
+        }
+        if sent == limit {
+            sent = n as usize;
         }
         // What was read and not written goes back to the input.
         if sent < n as usize && ipos.is_none() {
@@ -1812,7 +1818,19 @@ fn vectored_at(
 /// descriptor must be open for it, as on Linux (the host refuses the
 /// call outright).
 /// The `n` bytes from byte `at` of the buffers `iov`.
-fn iovecs_part(iov: &[libc::iovec], at: u64, n: u64) -> Vec<libc::iovec> {
+/// The bytes host buffers `iov` hold, in order.
+pub(crate) fn iovecs_bytes(iov: &[libc::iovec]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in iov {
+        // SAFETY: the iovecs are checked host buffers of their lengths.
+        out.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len)
+        });
+    }
+    out
+}
+
+pub(crate) fn iovecs_part(iov: &[libc::iovec], at: u64, n: u64) -> Vec<libc::iovec> {
     let (mut skip, mut left) = (at as usize, n as usize);
     let mut out = Vec::new();
     for v in iov {
@@ -2057,7 +2075,15 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // A socket whose peer filters what arrives: none of it (dropped
             // as if sent), or its first part.
-            let (sent, len) = match bpf::filter_send(fd, len) {
+            let filtered = if bpf::filtering() {
+                match uaccess::read_bytes(buf, len as usize) {
+                    Ok(data) => bpf::filter_send(fd, &data),
+                    Err(e) => return Some(fwe_abi::err(e)),
+                }
+            } else {
+                None
+            };
+            let (sent, len) = match filtered {
                 Some(0) => return Some(len as i64),
                 Some(keep) => (len, keep),
                 None => (len, len),
@@ -2101,6 +2127,17 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
                 let total = specialwrite::total(&iov);
+                // A socket whose peer filters what arrives: what it lets in.
+                let (iov, total, dropped) = match bpf::filtering()
+                    .then(|| bpf::filter_send(a[0] as i32, &iovecs_bytes(&iov)))
+                    .flatten()
+                {
+                    Some(keep) => (iovecs_part(&iov, 0, keep), keep, total - keep),
+                    None => (iov, total, 0),
+                };
+                if total == 0 && dropped > 0 {
+                    return Some(dropped as i64);
+                }
                 // A file of a tmpfs with a size: as much as fits.
                 let fits = match tmpfs::room(a[0] as i32, None, total) {
                     Ok(n) => n,
@@ -2117,7 +2154,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                             as i64,
                     )
                 };
-                match specialwrite::write(a[0] as i32, special, total)
+                let r = match specialwrite::write(a[0] as i32, special, total)
                     .or_else(|| fdstate::capped_write(a[0] as i32, total, capped))
                 {
                     Some(r) => r,
@@ -2125,7 +2162,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     None => host::ret(unsafe {
                         libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32)
                     } as i64),
-                }
+                };
+                // What the filter dropped counts as sent.
+                if r >= 0 && r as u64 == total { r + dropped as i64 } else { r }
             }
             Err(e) => fwe_abi::err(e),
         },

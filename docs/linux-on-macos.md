@@ -1410,7 +1410,7 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 | `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Who may trace whom as Linux's `ptrace_may_access`, Yama's `kernel.yama.ptrace_scope` and Landlock decide. Only fwe's processes can be traced. | `__ulock_wait2`/`__ulock_wake` on pages of the process store, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; logged actions written to the kernel log; `SECCOMP_RET_TRACE` stopping a tracer that set `PTRACE_O_TRACESECCOMP`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`, see [architecture.md](architecture.md#known-limitations)). | none |
 | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path (truncation and device `ioctl` decided as a file is opened, for every descriptor of it), TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); mounts refused in a domain that restricts files; the domain is the process's, carried by `fork` and `execve` | the open file description's no-`SIGPIPE` flag (`F_SETNOSIGPIPE`) marks a refused truncation or `ioctl` |
-| `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`, but for maps and socket filters while `kernel.unprivileged_bpf_disabled` is 0 (2 by default, 1 for good). Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
+| `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`, but for maps and socket filters while `kernel.unprivileged_bpf_disabled` is 0 (2 by default, 1 for good). Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters (reading the data with `bpf_skb_load_bytes`); other program types `EINVAL`; a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
 
 **`ptrace`**: each traced thread has a mailbox, a page of fwe's shared
 process store that it and its tracer use. At a stop (a signal about to be
@@ -2255,13 +2255,14 @@ socket programs use (`crates/kernel/src/bpf.rs`, `bpfmap.rs`,
 - **Socket filters** (`BPF_PROG_TYPE_SOCKET_FILTER`, `SO_ATTACH_BPF`),
   checked when loaded by a verifier for the subset fwe runs
   (`bpfcheck.rs`, with a verifier log as Linux gives), run on what this
-  process sends to the socket.
+  process sends to the socket by any call, reading the data with
+  `bpf_skb_load_bytes`.
 - **Maps**: array and hash maps, with the lookup, update and delete
   helpers. A loaded program or map is an unlinked file of fwe's that its
   descriptor is open on, so every process holding a descriptor, a fork
   child too, shares it.
-- A program of any other type loads and has an id, but is never
-  attached. Tracing (kprobes, tracepoints, `perf_event_open`), XDP and
+- A program of any other type is refused as it loads (`EINVAL`), as a
+  kernel without the type refuses it. Tracing (kprobes, tracepoints, `perf_event_open`), XDP and
   traffic control, LSM programs, and the BPF filesystem are not there, so
   `bpftrace`, Cilium and the like do not work.
 
