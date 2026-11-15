@@ -486,8 +486,11 @@ impl<P: Platform> Kernel<P> {
     /// In the child after the host `fork`: its pid namespaces are the ones
     /// made for it. Returns its pid, for `thread::init_main`.
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
-        // Its view is the forking thread's.
+        // Its view is the forking thread's, which other processes see.
         self.adopt_thread_view();
+        if let Some(fs) = self.fs_opt() {
+            fs.share();
+        }
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
         pidns::set_host(&t.chain, &t.nums, crate::host::pid());

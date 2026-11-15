@@ -6385,13 +6385,14 @@ fn strace_file_follows_children() {
 }
 
 /// Run C guest `name` (built against glibc) as root in a glibc root
-/// filesystem with `/tmp`, with `args`: its output and status.
-fn run_c_guest(name: &str, args: &[&str]) -> Output {
+/// filesystem with `/tmp`, with `args` and the variables `env` added to
+/// its environment: its output and status.
+fn run_c_guest(name: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let prog = build_c_dynamic(name, Libc::Glibc, true);
     let root = libc_rootfs(Libc::Glibc, name);
     std::fs::create_dir_all(root.join("tmp")).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg(&prog).args(args);
+    cmd.arg("--root").arg(&root).arg(&prog).args(args).envs(env.iter().copied());
     let out = run_bounded(cmd);
     eprintln!("--- {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&root);
@@ -6404,7 +6405,7 @@ fn run_c_guest(name: &str, args: &[&str]) -> Output {
 /// backlog to `net.core.somaxconn`.
 #[test]
 fn sysctls_limit_namespaces_and_listen() {
-    let out = run_c_guest("sysctls", &[]);
+    let out = run_c_guest("sysctls", &[], &[]);
     assert_eq!(
         stdout(&out),
         "/proc/sys/net/core/rmem_max: 212992\n\
@@ -6432,7 +6433,7 @@ fn sysctls_limit_namespaces_and_listen() {
 /// `/proc/<pid>/cgroup` is shown from the reader's cgroup namespace.
 #[test]
 fn namespaces_owners_unshare_and_cgroup_paths() {
-    let out = run_c_guest("nsprocs", &[]);
+    let out = run_c_guest("nsprocs", &[], &[]);
     assert_eq!(
         stdout(&out),
         "single-threaded: thread 0 sighand 0 vm 0\n\
@@ -6455,7 +6456,7 @@ fn namespaces_owners_unshare_and_cgroup_paths() {
 /// there is no cgroup v1 (`ENODEV`).
 #[test]
 fn cgroups_limits_freeze_and_delegation() {
-    let out = run_c_guest("cgroups", &[]);
+    let out = run_c_guest("cgroups", &[], &[]);
     assert_eq!(
         stdout(&out),
         "max.depth x: -22\n\
@@ -6482,6 +6483,52 @@ fn cgroups_limits_freeze_and_delegation() {
          common ancestor writable: 0\n\
          out of the cgroup namespace: 2\n\
          cgroup v1 mount: 19\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// /proc: the host's memory in `/proc/meminfo` and `sysinfo`, `cpuinfo` in
+/// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
+/// `comm` and host name written as Linux writes them, another process's
+/// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
+/// a tracer reads, to one that may not trace it), and `/proc/net`.
+#[test]
+fn proc_files_programs_read() {
+    let out = run_c_guest("procfiles", &[], &[("FWE_PROC", "1")]);
+    let text = stdout(&out);
+    let (head, tail) = text.split_once("if_inet6: ").unwrap_or((&text, ""));
+    assert_eq!(
+        head,
+        "meminfo is sysinfo's: 1, procs counted: 1\n\
+         cpuinfo: cpus 1, BogoMIPS 1, Features fp asimd 1, BHID 0\n\
+         environ has FWE_PROC=1: 1\n\
+         limits: Limit                    | open files 1\n\
+         statm words: 7\n\
+         io read_bytes: 1\n\
+         comm write: 0\n\
+         comm now: renamed\nname: renamed\n\
+         hostname in the initial namespace: 1\n\
+         hostname in a new one: 0\n\
+         uname nodename: inner\n\
+         child's cwd: /tmp\n\
+         child's environ has FWE_PROC=1: 1\n\
+         child's limits: 1\n\
+         child's mountinfo is ours: 1\n\
+         unprivileged environ: 13\n\
+         unprivileged maps: 13\n\
+         unprivileged io: 13\n\
+         unprivileged limits: 0\n\
+         unprivileged cwd: 13\n\
+         /proc/net: self/net\n\
+         listen: 1\n\
+         tcp lists it: 1\n\
+         unix lists it: 1\n\
+         dev: 1\n"
+    );
+    assert_eq!(
+        tail,
+        "00000000000000000000000000000001 01 80 10 80       lo\n\
+         route: Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
     );
     assert_eq!(out.status.code(), Some(0));
 }

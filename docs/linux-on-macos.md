@@ -296,8 +296,8 @@ mechanisms:
   reports for some protection faults into `SIGSEGV`
   ([Faults in guest code](#faults-in-guest-code)).
 - **Memory sizing:** the JVM sizes its heap from `sysinfo`,
-  `/proc/meminfo` and cgroup limits, which under fwe are fixed figures
-  and unenforced limits ([Memory pressure](#memory-pressure),
+  `/proc/meminfo` and cgroup limits: the first two are the Mac's memory,
+  the limits are kept and not enforced ([Memory pressure](#memory-pressure),
   [cgroups](#cgroups)).
 - **Tools:** attach mechanisms that use `ptrace` or
   `process_vm_readv`/`writev` work between fwe processes ([ptrace](#ptrace)).
@@ -1299,7 +1299,7 @@ otherwise.
 |---|---|---|
 | `uname` | `Linux`, `6.12.0-fwe` (a 2.6 release under `UNAME26`), `#1 SMP PREEMPT`, `aarch64`; host and domain names from the UTS namespace | `gethostname` in the initial UTS namespace |
 | `sethostname`, `setdomainname` | `CAP_SYS_ADMIN`, at most 64 bytes; set in an fwe UTS namespace; `EPERM` in the initial one, even for root, where Linux would rename the machine: its names are the Mac's | none |
-| `sysinfo` | host uptime and load averages; fixed memory figures (8 GiB total, 4 GiB free), no swap, `procs` 1 | `clock_gettime(CLOCK_MONOTONIC)`, `getloadavg` |
+| `sysinfo` | host uptime, load averages and memory (as `/proc/meminfo`); `procs` the tasks of the processes the caller's pid namespace holds | `clock_gettime(CLOCK_MONOTONIC)`, `getloadavg`, `host_statistics64`, `sysctl` |
 | `syslog` | an empty kernel log; read, clear and console level need `CAP_SYSLOG` or `CAP_SYS_ADMIN`; the console level is `kernel.printk`'s | none |
 | `getrandom` | flags checked (`GRND_RANDOM` with `GRND_INSECURE` is `EINVAL`); never waits; at most 32 MiB a call | `arc4random_buf` |
 | `reboot` | `CAP_SYS_BOOT` and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
@@ -1867,9 +1867,19 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   reader's pid namespace. Another process's `mem` (and a thread's,
   `task/<tid>/mem`) is read and written as `process_vm_readv` reaches it,
   or through a stopped tracee's mailbox, and its `auxv` is the vector
-  its program started with (a fork child's, its parent's); `pagemap` is
-  the caller's own only. `/proc/sys` writes reach the namespace sysctls fwe
-  keeps (network, IPC) and the few it acts on.
+  its program started with (a fork child's, its parent's), its `environ`
+  the strings that vector's stack holds; `pagemap` is the caller's own
+  only. Another process's `cwd`, `root`, `mountinfo` and `limits` are what
+  it shares in fwe's process store as they change, and its `maps`,
+  `smaps`, `environ`, `io`, `cwd` and `root` are refused (`EACCES`) to a
+  reader that may not trace it, as Linux refuses them. `/proc/sys` writes
+  reach the namespace sysctls fwe keeps (network, IPC), the UTS
+  namespace's names, and the few it acts on.
+- `/proc/net` is the reader's network namespace: a namespace of fwe's
+  has `lo` alone; the initial one shows the host's interfaces
+  (`getifaddrs`, `lo0` as `lo`) and the routes of their own networks.
+  The sockets are fwe's processes' in the namespace, as the host reports
+  each (`PROC_PIDFDSOCKETINFO`), with the namespace's port numbers.
 - `/proc/self/fd/N`, `cwd` and `root` behave as magic links.
 - `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's;
   `full`, `loop-control` and `loopN` are fwe's; `/dev/ptmx` and
@@ -2587,11 +2597,11 @@ one counter, as on Linux.
 
 macOS manages memory its own way (compression, swap files) and has no
 OOM killer Linux programs could observe. fwe does not pass the host's
-memory state through:
+memory state through, but reports it:
 
 | On macOS | What fwe does | What the guest sees |
 |---|---|---|
-| free memory, compression, swap | not read | `/proc/meminfo` and `sysinfo` report fixed values: 8 GiB total, 4 GiB free, 6 GiB available, no swap |
+| total, free, cached and swapped memory | read when asked (`hw.memsize`, `host_statistics64`, `vm.swapusage`) | `/proc/meminfo` and `sysinfo`: the total; free pages; free, inactive and purgeable as available; file-backed pages as cached; the swap files' size and room |
 | a host `mmap` that cannot be satisfied | `ENOMEM` | `ENOMEM` |
 | the guest stack running into its guard page | a fault | `SIGSEGV` |
 | no OOM killer (Linux ranks processes to kill) | `oom_score_adj` kept per process, `oom_score` derived from it | the files, with Linux's rules for writing them |
@@ -2630,7 +2640,8 @@ machine as a Linux machine with the host's CPUs, uptime and load:
 | the macOS kernel | not shown | `uname`: `Linux`, `6.12.0-fwe`, `#1 SMP PREEMPT`, `aarch64` |
 | host pids | used as guest pids in the initial pid namespace | host pids; `/proc` lists only fwe's processes |
 | online CPUs (`sysconf`) | counted | `/proc/cpuinfo`, `/proc/stat`, `sched_getaffinity`, `sysinfo` |
-| CPU features (`hw.optional.*`) | `AT_HWCAP`/`AT_HWCAP2` ([auxv](#auxv-hwcaps-and-the-vdso)) | the hwcaps; `/proc/cpuinfo` lists `fp asimd` |
+| CPU features (`hw.optional.*`) | `AT_HWCAP`/`AT_HWCAP2` ([auxv](#auxv-hwcaps-and-the-vdso)) | the hwcaps; `/proc/cpuinfo`'s `Features` names them |
+| timer frequency, chip (`hw.tbfrequency`, `hw.cpufamily`, `hw.perflevel1.logicalcpu`) | read | `/proc/cpuinfo`'s BogoMIPS, and its CPU part for a chip Linux knows (the efficiency cores first) |
 | boot time, uptime, load averages, per-CPU times | read from the host | `/proc/uptime`, `/proc/loadavg`, `/proc/stat`, `sysinfo` |
 | another process's state, times and memory (`proc_pidinfo`) | read from the host | `/proc/<pid>/stat` and the like |
 | a filesystem's type and sizes (`statfs`) | type reported as ext4 | ext4, the host's sizes |

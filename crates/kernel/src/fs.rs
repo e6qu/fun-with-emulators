@@ -936,6 +936,10 @@ impl Fs {
     /// `/proc` or `/sys`, as that filesystem shows it), whatever is
     /// mounted where.
     fn synthetic_entry(&self, absolute: Vec<u8>) -> Option<crate::procfs::Entry> {
+        // Through the `/proc/net` link, the reader's own.
+        if let Some(rest) = absolute.strip_prefix(b"/proc/net/") {
+            return self.synthetic_entry([b"/proc/self/net/", rest].concat());
+        }
         // /proc/<pid>: the reader's own is /proc/self; another, what fwe
         // knows of it.
         let absolute = match own_or_other(&absolute) {
@@ -953,7 +957,11 @@ impl Fs {
                             &self.cgroup_root(),
                         ))
                     }
-                    Some(h) => crate::procpid::entry(h, pid, &sub),
+                    Some(h) => match crate::procreg::read(h).and_then(|_| self.other_view(h, &sub))
+                    {
+                        Some(e) => e,
+                        None => crate::procpid::entry(h, pid, &sub),
+                    },
                     None => crate::procfs::Entry::Missing,
                 });
             }
@@ -988,6 +996,14 @@ impl Fs {
         }
         if absolute == b"/proc/self/task" {
             return Some(crate::procfs::Entry::Dir);
+        }
+        // The process's network namespace, the thread's own if it has one.
+        if let Some(name) = absolute.strip_prefix(b"/proc/self/net/") {
+            let net = crate::netns::current();
+            return Some(
+                crate::procnet::file(name, net.as_deref(), &|h| self.host_to_guest(h))
+                    .map_or(crate::procfs::Entry::Missing, crate::procfs::Entry::File),
+            );
         }
         if absolute == b"/proc/self/maps" || absolute == b"/proc/self/smaps" {
             return Some(crate::procfs::Entry::File(self.maps(absolute.ends_with(b"/smaps"))));
@@ -1116,6 +1132,49 @@ impl Fs {
             });
         }
         crate::procfs::lookup(&absolute, &self.proc)
+    }
+
+    /// What of another process's `/proc/<pid>` (host process `host`,
+    /// file `sub`) is drawn from its view of the files and its network
+    /// namespace: its working directory and root, as the reader names
+    /// them (a namespace path where the reader is in another mount
+    /// namespace), its mounts, and its network files.
+    fn other_view(&self, host: i32, sub: &[u8]) -> Option<crate::procfs::Entry> {
+        use crate::procfs::Entry;
+        if sub == b"/net" {
+            return Some(Entry::Dir);
+        }
+        if let Some(name) = sub.strip_prefix(b"/net/") {
+            let rec = crate::procreg::read(host)?;
+            let net = crate::nsfd::dir_among(b"net", &rec.ns)
+                .and_then(|d| crate::shared::Record::<crate::ns::Net>::join(&d, 0).ok());
+            return Some(
+                crate::procnet::file(name, net.as_ref(), &|h| self.host_to_guest(h))
+                    .map_or(Entry::Missing, Entry::File),
+            );
+        }
+        if !matches!(sub, b"/cwd" | b"/root" | b"/mountinfo" | b"/mounts") {
+            return None;
+        }
+        let Some(v) = OtherView::of(host) else { return Some(Entry::Missing) };
+        let same = v.mnt == self.mnt.dir();
+        let shown =
+            |ns: &[u8]| if same { self.from_ns(ns).unwrap_or(ns.to_vec()) } else { ns.to_vec() };
+        Some(match sub {
+            b"/cwd" => Entry::Symlink(shown(&v.cwd)),
+            b"/root" => Entry::Symlink(shown(&v.root)),
+            _ => {
+                let Ok(ns) = crate::mounts::store::Ns::join(&v.mnt, 0) else {
+                    return Some(Entry::Missing);
+                };
+                let t = ns.table();
+                Entry::File(if sub == b"/mountinfo" {
+                    t.mountinfo(&v.root)
+                } else {
+                    t.mounts_file(&v.root)
+                })
+            }
+        })
     }
 
     /// The root of the process's cgroup namespace, a cgroup.
@@ -1673,6 +1732,7 @@ impl Fs {
     /// Make this the view the socket calls resolve `AF_UNIX` paths in (see
     /// [`resolve_host`]). Called once the process's filesystem is set up.
     pub fn publish(&self) {
+        self.share();
         let mut view = published();
         VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
         *view = Some(Published {
@@ -1687,12 +1747,32 @@ impl Fs {
     /// Bring the published view's working directory up to date, if this is
     /// the published view.
     fn republish(&self) {
-        if let Some(v) = published().as_mut().filter(|v| v.root == self.root.as_raw_fd()) {
+        let mut published = published();
+        if let Some(v) = published.as_mut().filter(|v| v.root == self.root.as_raw_fd()) {
             VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
             v.cwd = self.cwd.clone();
             v.ns = self.mnt.clone();
             v.proc_root = self.proc_root.clone();
+            drop(published);
+            self.share();
         }
+    }
+
+    /// Let other processes see this view, the process's: its mount
+    /// namespace, root and working directory (namespace paths), and the
+    /// process's resource limits ([`OtherView`]).
+    pub fn share(&self) {
+        let mut e = crate::snapshot::Enc::new();
+        e.bytes(self.mnt.dir());
+        e.bytes(&self.proc_root);
+        let cwd = self.cwd_outside.clone().unwrap_or_else(|| to_ns(&self.proc_root, &self.cwd));
+        e.bytes(&cwd);
+        for res in 0..fwe_abi::resource::RLIM_NLIMITS {
+            let (soft, hard) = crate::syscalls::own_limit(res).unwrap_or((u64::MAX, u64::MAX));
+            e.u64(soft);
+            e.u64(hard);
+        }
+        crate::procstore::put_own(crate::procstore::Kind::View, Some(&e.into_bytes()));
     }
 
     /// Translate a host path to the guest path it is reached by, through
@@ -3237,6 +3317,28 @@ impl Fs {
         }
         let rec = crate::procreg::read(crate::host::pid())?;
         Some(crate::procpid::ns_link_of(kind, &rec.ns)).filter(|l| !l.is_empty())
+    }
+}
+
+/// What another process shares of its view ([`Fs::share`]).
+pub struct OtherView {
+    /// Its mount namespace's record.
+    pub mnt: Vec<u8>,
+    /// Its root and working directory, paths in that namespace.
+    pub root: Vec<u8>,
+    pub cwd: Vec<u8>,
+    /// Its resource limits (soft, hard).
+    pub limits: Vec<(u64, u64)>,
+}
+
+impl OtherView {
+    /// What host process `host` shares, if it does.
+    pub fn of(host: i32) -> Option<OtherView> {
+        let b = crate::procstore::get_of(crate::procstore::Kind::View, host)?;
+        let mut d = crate::snapshot::Dec::new(&b);
+        let (mnt, root, cwd) = (d.bytes(), d.bytes(), d.bytes());
+        let limits = (0..fwe_abi::resource::RLIM_NLIMITS).map(|_| (d.u64(), d.u64())).collect();
+        d.whole().then_some(OtherView { mnt, root, cwd, limits })
     }
 }
 

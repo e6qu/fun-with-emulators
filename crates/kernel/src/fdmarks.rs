@@ -64,6 +64,13 @@ pub enum Mark {
     /// `/proc/<pid>/timerslack_ns` of host process `host`, opened for
     /// writing.
     TimerSlack { host: i32 },
+    /// `/proc/<pid>/comm` (or a thread's), opened for writing: of thread
+    /// `tid` of this process (0: its main thread), or of another process
+    /// (-1), whose name a write may not change.
+    Comm { tid: i32 },
+    /// `/proc/sys/kernel/hostname` (or `domainname`, `domain`), opened for
+    /// writing.
+    UtsName { domain: bool },
     /// An `AF_NETLINK` socket ([`crate::netlink`]).
     Netlink,
     /// Loop device `N`'s node, open as the device ([`crate::loopdev`]).
@@ -530,7 +537,15 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Mem) => 20,
             Some(Mark::Pagemap) => 21,
             Some(Mark::RemoteMem { .. }) => 22,
+            Some(Mark::Comm { .. }) => 23,
+            Some(Mark::UtsName { .. }) => 24,
         });
+        if let Some(Mark::Comm { tid }) = rec.mark {
+            e.i32(tid);
+        }
+        if let Some(Mark::UtsName { domain }) = rec.mark {
+            e.bool(domain);
+        }
         if let Some(Mark::Pid { host, tid, nonblock }) = rec.mark {
             e.i32(host);
             e.i32(tid);
@@ -616,6 +631,8 @@ pub fn load(d: &mut Dec) {
             20 => Some(Mark::Mem),
             21 => Some(Mark::Pagemap),
             22 => Some(Mark::RemoteMem { id: d.i32() }),
+            23 => Some(Mark::Comm { tid: d.i32() }),
+            24 => Some(Mark::UtsName { domain: d.bool() }),
             _ => None,
         };
         insert(&mut r, fd, Record { dev, ino, origin, mark });

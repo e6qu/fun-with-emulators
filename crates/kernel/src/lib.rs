@@ -75,6 +75,7 @@ pub mod posixtimer;
 pub mod prepcache;
 pub mod procfs;
 pub mod procmem;
+pub mod procnet;
 pub mod procpid;
 pub mod procreg;
 pub mod procstore;

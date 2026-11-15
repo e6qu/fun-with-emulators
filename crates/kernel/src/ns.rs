@@ -143,6 +143,17 @@ pub fn owner_of(dir: &[u8]) -> Option<(Vec<u8>, u64)> {
     Some((text[..nl].to_vec(), id))
 }
 
+/// The process's UTS namespace, for a write to `/proc/sys/kernel/hostname`
+/// ([`set_current_name`]).
+static UTS: std::sync::Mutex<Option<Arc<Record<Uts>>>> = std::sync::Mutex::new(None);
+
+/// Set the host (`host`) or domain name of the process's UTS namespace,
+/// as `sethostname` does: `EPERM` in the initial one, the Mac's.
+pub fn set_current_name(host: bool, name: &[u8]) -> Result<(), i32> {
+    let uts = UTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Namespaces { uts, ..Default::default() }.set_name(host, name)
+}
+
 /// The longest host name Linux holds (`__NEW_UTS_LEN`).
 pub const HOST_NAME_MAX: usize = 64;
 
@@ -363,6 +374,7 @@ impl Namespaces {
         crate::netns::set_current(self.net.clone());
         crate::userns::set_current(self.user.clone());
         crate::sysvipc::activate(self.ipc.clone());
+        *UTS.lock().unwrap_or_else(|e| e.into_inner()) = self.uts.clone();
         crate::cgroupfs::set_ns_root(
             &self.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone()),
         );

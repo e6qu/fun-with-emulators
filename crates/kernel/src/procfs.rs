@@ -202,6 +202,7 @@ const DIRS: &[DirDef] = &[
             (b"partitions", DT_REG),
             (b"keys", DT_REG),
             (b"key-users", DT_REG),
+            (b"net", DT_LNK),
         ],
     ),
     (
@@ -234,6 +235,25 @@ const DIRS: &[DirDef] = &[
             (b"maps", DT_REG),
             (b"smaps", DT_REG),
             (b"personality", DT_REG),
+            (b"environ", DT_REG),
+            (b"limits", DT_REG),
+            (b"statm", DT_REG),
+            (b"io", DT_REG),
+            (b"net", DT_DIR),
+        ],
+    ),
+    (
+        b"/proc/self/net",
+        &[
+            (b"dev", DT_REG),
+            (b"if_inet6", DT_REG),
+            (b"route", DT_REG),
+            (b"snmp", DT_REG),
+            (b"tcp", DT_REG),
+            (b"tcp6", DT_REG),
+            (b"udp", DT_REG),
+            (b"udp6", DT_REG),
+            (b"unix", DT_REG),
         ],
     ),
     (
@@ -344,6 +364,20 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
+        // The process's own memory, as it holds the strings now.
+        b"/proc/self/environ" => {
+            Entry::File(crate::procpid::environ(&info.auxv, &info.cmdline, |addr, buf| {
+                crate::uaccess::read_into(addr, buf).is_ok()
+            }))
+        }
+        b"/proc/self/statm" => Entry::File(crate::procpid::statm(crate::host::pid())),
+        b"/proc/self/io" => Entry::File(crate::procpid::io(crate::host::pid())),
+        b"/proc/self/limits" => Entry::File(crate::procpid::limits(
+            &(0..fwe_abi::resource::RLIM_NLIMITS)
+                .map(|r| crate::syscalls::own_limit(r).unwrap_or((u64::MAX, u64::MAX)))
+                .collect::<Vec<_>>(),
+        )),
+        b"/proc/net" => Entry::Symlink(b"self/net".to_vec()),
         b"/proc/self/auxv" => Entry::File(info.auxv.clone()),
         b"/proc/self/personality" => Entry::File(
             format!(
@@ -358,7 +392,7 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
             Entry::File(b"         0          0 4294967295\n".to_vec())
         }
         b"/proc/self/setgroups" => Entry::File(b"allow\n".to_vec()),
-        b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu)),
+        b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu, &info.auxv)),
         // What `mount` takes, and the rootfs's own.
         b"/proc/filesystems" => Entry::File(
             b"nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tcgroup2\nnodev\tdevpts\n\
@@ -429,11 +463,7 @@ fn random_128() -> u128 {
 /// The host's boot, as 128 bits: the same for every read until it
 /// restarts.
 fn boot_id() -> u128 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
-    // To the second: the uptime moves on as it is read.
-    let boot = ((now - crate::host::uptime()).max(0.0) as u64).to_le_bytes();
+    let boot = crate::host::boot_time().to_le_bytes();
     let a = crate::shared::hash(&[&boot[..], b"boot"].concat());
     let b = crate::shared::hash(&[&boot[..], b"id"].concat());
     u128::from(a) << 64 | u128::from(b)
@@ -454,13 +484,98 @@ fn line(bytes: &[u8]) -> Vec<u8> {
     v
 }
 
-fn cpuinfo(ncpu: u32) -> Vec<u8> {
+/// The names Linux gives the `AT_HWCAP` bits, then the `AT_HWCAP2` ones,
+/// in bit order (`arch/arm64/kernel/cpuinfo.c`).
+const HWCAP_NAMES: [&str; 32] = [
+    "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
+    "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
+    "asimddp", "sha512", "sve", "asimdfhm", "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb",
+    "paca", "pacg",
+];
+const HWCAP2_NAMES: [&str; 45] = [
+    "dcpodp",
+    "sve2",
+    "sveaes",
+    "svepmull",
+    "svebitperm",
+    "svesha3",
+    "svesm4",
+    "flagm2",
+    "frint",
+    "svei8mm",
+    "svef32mm",
+    "svef64mm",
+    "svebf16",
+    "i8mm",
+    "bf16",
+    "dgh",
+    "rng",
+    "bti",
+    "mte",
+    "ecv",
+    "afp",
+    "rpres",
+    "mte3",
+    "sme",
+    "smei16i64",
+    "smef64f64",
+    "smei8i32",
+    "smef16f32",
+    "smeb16f32",
+    "smef32f32",
+    "smefa64",
+    "wfxt",
+    "ebf16",
+    "sveebf16",
+    "cssc",
+    "rprfm",
+    "sve2p1",
+    "sme2",
+    "sme2p1",
+    "smei16i32",
+    "smebi32i32",
+    "smeb16b16",
+    "smef16f16",
+    "mops",
+    "hbc",
+];
+
+/// The value of entry `key` of auxiliary vector `auxv` (words), if it is
+/// there.
+pub(crate) fn auxv_value(auxv: &[u8], key: u64) -> Option<u64> {
+    auxv.as_chunks::<16>().0.iter().find_map(|e| {
+        let k = u64::from_ne_bytes(e[..8].try_into().ok()?);
+        (k == key).then(|| u64::from_ne_bytes(e[8..].try_into().unwrap_or([0; 8])))
+    })
+}
+
+/// `/proc/cpuinfo` as Linux writes it on arm64: for each of `ncpu` CPUs,
+/// its BogoMIPS, the features of the hwcaps the program was given in
+/// `auxv`, and the host's identity of the core.
+fn cpuinfo(ncpu: u32, auxv: &[u8]) -> Vec<u8> {
+    let hwcap = auxv_value(auxv, fwe_abi::auxv::AT_HWCAP).unwrap_or(0);
+    let hwcap2 = auxv_value(auxv, fwe_abi::auxv::AT_HWCAP2).unwrap_or(0);
+    let features: Vec<&str> = HWCAP_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| hwcap & (1 << i) != 0)
+        .chain(HWCAP2_NAMES.iter().enumerate().filter(|(i, _)| hwcap2 & (1 << i) != 0))
+        .map(|(_, n)| *n)
+        .collect();
+    let id = crate::host::cpu_identity();
     let mut out = Vec::new();
     for i in 0..ncpu.max(1) {
+        let part = if i < id.efficiency_cores { id.parts.0 } else { id.parts.1 };
         out.extend_from_slice(
             format!(
-                "processor\t: {i}\nBHID\t: 0x0\nCPU implementer\t: 0x61\n\
-                 CPU architecture: 8\nFeatures\t: fp asimd\n\n"
+                "processor\t: {i}\nBogoMIPS\t: {:.2}\nFeatures\t: {}\nCPU implementer\t: {:#x}\n\
+                 CPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {part:#05x}\n\
+                 CPU revision\t: {}\n\n",
+                id.bogomips,
+                features.join(" "),
+                id.implementer,
+                id.variant,
+                id.revision
             )
             .as_bytes(),
         );
@@ -468,21 +583,36 @@ fn cpuinfo(ncpu: u32) -> Vec<u8> {
     out
 }
 
-/// The memory reported to the guest, in kB: plausible fixed values (programs
-/// mostly read the total and what is available). `sysinfo` reports the same.
-pub(crate) const MEM_TOTAL_KB: u64 = 8_388_608;
-pub(crate) const MEM_FREE_KB: u64 = 4_194_304;
-const MEM_AVAILABLE_KB: u64 = 6_291_456;
-const MEM_CACHED_KB: u64 = 1_048_576;
-
+/// `/proc/meminfo`: the host's memory ([`crate::host::memory`]), in kB.
 fn meminfo() -> Vec<u8> {
-    format!(
-        "MemTotal:       {MEM_TOTAL_KB:8} kB\nMemFree:        {MEM_FREE_KB:8} kB\n\
-         MemAvailable:   {MEM_AVAILABLE_KB:8} kB\nBuffers:               0 kB\n\
-         Cached:         {MEM_CACHED_KB:8} kB\nSwapTotal:             0 kB\n\
-         SwapFree:              0 kB\n"
-    )
-    .into_bytes()
+    let m = crate::host::memory();
+    let kb = |b: u64| b / 1024;
+    let lines = [
+        ("MemTotal", kb(m.total)),
+        ("MemFree", kb(m.free)),
+        ("MemAvailable", kb(m.available)),
+        ("Buffers", 0),
+        ("Cached", kb(m.cached)),
+        ("SwapCached", 0),
+        ("Active", kb(m.active)),
+        ("Inactive", kb(m.inactive)),
+        ("Unevictable", kb(m.wired)),
+        ("Mlocked", 0),
+        ("SwapTotal", kb(m.swap_total)),
+        ("SwapFree", kb(m.swap_free)),
+        ("Dirty", 0),
+        ("Writeback", 0),
+        ("Shmem", 0),
+        ("HugePages_Total", 0),
+        ("HugePages_Free", 0),
+    ];
+    let mut out = String::new();
+    for (name, v) in lines {
+        let unit = if name.starts_with("HugePages") { "" } else { " kB" };
+        out.push_str(&format!("{:<16}{v:>8}{unit}\n", format!("{name}:")));
+    }
+    out.push_str("Hugepagesize:       2048 kB\n");
+    out.into_bytes()
 }
 
 /// `/proc/stat`: the host's CPU times (in `USER_HZ` ticks), each of the
@@ -598,6 +728,29 @@ mod tests {
         );
         let fs: Vec<_> = children(b"/proc/sys/fs").unwrap().into_iter().map(|(n, _)| n).collect();
         assert!(fs.contains(&b"pipe-max-size".to_vec()) && fs.contains(&b"file-max".to_vec()));
+    }
+
+    /// `/proc/cpuinfo` names the features of the hwcaps given and nothing
+    /// Linux does not write; `/proc/meminfo` reports the host's memory.
+    #[test]
+    fn cpuinfo_and_meminfo() {
+        let mut auxv = Vec::new();
+        for (k, v) in [(fwe_abi::auxv::AT_HWCAP, 0b11 | 1 << 8), (fwe_abi::auxv::AT_HWCAP2, 1)] {
+            auxv.extend_from_slice(&k.to_ne_bytes());
+            auxv.extend_from_slice(&(v as u64).to_ne_bytes());
+        }
+        let text = String::from_utf8(cpuinfo(2, &auxv)).unwrap();
+        assert_eq!(text.matches("processor\t:").count(), 2);
+        assert!(text.contains("Features\t: fp asimd atomics dcpodp\n"), "{text}");
+        assert!(text.contains("CPU implementer\t: 0x61\n"));
+        assert!(!text.contains("BHID"));
+        let mem = String::from_utf8(meminfo()).unwrap();
+        let total: u64 =
+            mem.lines().next().unwrap()[9..].trim().trim_end_matches(" kB").parse().unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(total, crate::host::sysctl_u64(c"hw.memsize").unwrap() / 1024);
+        let _ = total;
+        assert!(mem.contains("\nMemAvailable:   "));
     }
 
     #[test]

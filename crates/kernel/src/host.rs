@@ -1031,6 +1031,176 @@ pub fn boot_time() -> u64 {
     }
 }
 
+/// The host's memory, in bytes: what `/proc/meminfo` and `sysinfo`
+/// report of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    pub total: u64,
+    /// Not in use at all.
+    pub free: u64,
+    /// What could be had without swapping: free, inactive and purgeable
+    /// pages.
+    pub available: u64,
+    /// File-backed pages (the page cache).
+    pub cached: u64,
+    pub active: u64,
+    pub inactive: u64,
+    /// Wired (Linux's unevictable) pages.
+    pub wired: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+}
+
+/// The integer sysctl `name` (of up to 8 bytes), if the host has it.
+#[cfg(target_os = "macos")]
+pub fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+    let mut v = [0u8; 8];
+    let mut len = v.len();
+    // SAFETY: a valid out-buffer of the size given.
+    let r = unsafe {
+        libc::sysctlbyname(name.as_ptr(), v.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    match (r, len) {
+        (0, 4) => Some(u64::from(u32::from_ne_bytes(v[..4].try_into().ok()?))),
+        (0, 8) => Some(u64::from_ne_bytes(v)),
+        _ => None,
+    }
+}
+
+/// The host's memory now (`hw.memsize`, the VM statistics, `vm.swapusage`).
+pub fn memory() -> Memory {
+    #[cfg(target_os = "macos")]
+    {
+        let total = sysctl_u64(c"hw.memsize").unwrap_or(0);
+        // SAFETY: plain host call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        // SAFETY: zeroed bytes are a valid `vm_statistics64`, which the
+        // call fills up to the count it is given.
+        let mut s: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: a valid out-buffer of `count` words; the host port is
+        // this task's send right, kept for its life.
+        #[allow(deprecated)]
+        let r = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                (&mut s as *mut libc::vm_statistics64).cast(),
+                &mut count,
+            )
+        };
+        let mut m = Memory { total, ..Default::default() };
+        if r == 0 {
+            let p = |n: u32| u64::from(n) * page;
+            m.free = p(s.free_count.saturating_sub(s.speculative_count));
+            m.available = (p(s.free_count) + p(s.inactive_count) + p(s.purgeable_count)).min(total);
+            m.cached = p(s.external_page_count);
+            m.active = p(s.active_count);
+            m.inactive = p(s.inactive_count);
+            m.wired = p(s.wire_count);
+        }
+        // SAFETY: zeroed bytes are a valid `xsw_usage`.
+        let mut sw: libc::xsw_usage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xsw_usage>();
+        // SAFETY: a valid out-parameter of the size given.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"vm.swapusage".as_ptr(),
+                (&mut sw as *mut libc::xsw_usage).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 {
+            m.swap_total = sw.xsu_total;
+            m.swap_free = sw.xsu_avail;
+        }
+        m
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Memory::default()
+    }
+}
+
+/// What `/proc/cpuinfo` says of each CPU: BogoMIPS (twice the timer's
+/// frequency in MHz, as Linux computes it on arm64), and the implementer,
+/// variant, part and revision of the `MIDR_EL1` of the efficiency and
+/// the performance cores, and how many efficiency cores there are (Linux
+/// numbers them first on Apple's chips), where the host's chip is one
+/// Linux knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CpuIdentity {
+    pub bogomips: f64,
+    pub implementer: u32,
+    pub variant: u32,
+    pub parts: (u32, u32),
+    pub revision: u32,
+    pub efficiency_cores: u32,
+}
+
+/// The host CPU's identity ([`CpuIdentity`]).
+pub fn cpu_identity() -> CpuIdentity {
+    #[cfg(target_os = "macos")]
+    {
+        let tb = sysctl_u64(c"hw.tbfrequency").unwrap_or(24_000_000);
+        let family = sysctl_u64(c"hw.cpufamily").unwrap_or(0) as u32;
+        let sub = sysctl_u64(c"hw.cpusubfamily").unwrap_or(0) as u32;
+        // `CPUFAMILY_ARM_*` and `CPUSUBFAMILY_ARM_*` (`mach/machine.h`), and
+        // the parts Linux's `cputype.h` gives Apple's cores.
+        let base = match family {
+            0x1b58_8bb3 => Some(0x022),
+            0xda33_d83d => Some(0x032),
+            _ => None,
+        };
+        let parts = base.map(|b: u32| {
+            let b = match sub {
+                4 => b + 2,
+                5 => b + 6,
+                _ => b,
+            };
+            (b, b + 1)
+        });
+        CpuIdentity {
+            bogomips: tb as f64 * 2.0 / 1e6,
+            implementer: 0x61,
+            variant: 0,
+            parts: parts.unwrap_or((0, 0)),
+            revision: 0,
+            efficiency_cores: sysctl_u64(c"hw.perflevel1.logicalcpu").unwrap_or(0) as u32,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CpuIdentity { bogomips: 48.0, implementer: 0x61, ..Default::default() }
+    }
+}
+
+/// The bytes host process `pid` had read from and written to storage.
+pub fn disk_io(pid: i32) -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: zeroed bytes are a valid `rusage_info_v2`, which the call
+        // fills.
+        let mut r: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-buffer of the flavour's size.
+        let ok = unsafe {
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V2,
+                (&mut r as *mut libc::rusage_info_v2).cast(),
+            )
+        } == 0;
+        if ok { (r.ri_diskio_bytesread, r.ri_diskio_byteswritten) } else { (0, 0) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        (0, 0)
+    }
+}
+
 pub fn uptime() -> f64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is a valid out parameter.

@@ -410,6 +410,10 @@ impl<P: Platform> Kernel<P> {
 
     /// `openat` of guest path `path` (`openat2`'s too, once walked).
     pub(crate) fn open_with(&mut self, dirfd: u64, path: Vec<u8>, flags: u64, mode: u64) -> i64 {
+        if let Some(e) = self.proc_refused(dirfd as i32, &path) {
+            crate::fs::drop_fifo();
+            return err(e);
+        }
         let r = self.open_path(dirfd, path, flags, mode);
         crate::fs::drop_fifo();
         // An `O_PATH` descriptor, whatever kind of file it names (one of
@@ -598,7 +602,10 @@ impl<P: Platform> Kernel<P> {
                     };
                     let mark = match self.map_file(dirfd as i32, &path) {
                         Some(mark) => Ok(mark),
-                        None => match self.oom_file(dirfd as i32, &path) {
+                        None => match self
+                            .oom_file(dirfd as i32, &path)
+                            .or_else(|| self.name_file(dirfd as i32, &path))
+                        {
                             Some(mark) => mark,
                             None => sysctl().unwrap_or(Err(errno::EACCES)),
                         },
@@ -1781,6 +1788,9 @@ impl<P: Platform> Kernel<P> {
             guest!(uaccess::write_from(buf, &target[..n]));
             return n as i64;
         }
+        if let Some(e) = self.proc_refused(dirfd as i32, &path) {
+            return err(e);
+        }
         if let Some(entry) = self.fs().synthetic(dirfd as i32, &path) {
             return match entry {
                 crate::procfs::Entry::Symlink(target) | crate::procfs::Entry::Fd { target, .. } => {
@@ -2743,6 +2753,44 @@ impl<P: Platform> Kernel<P> {
             crate::fdmarks::opened(fd as i32, ns, m.id, m.flags, m.fstype, None);
         }
         fd
+    }
+
+    /// For a `comm` of `/proc` or `/proc/sys/kernel/hostname` or
+    /// `domainname` at `path`, what a write to it acts on: a thread of the
+    /// caller's (another process's refuses the write), the UTS
+    /// namespace's names (with `CAP_SYS_ADMIN`, else `EACCES`).
+    fn name_file(&self, dirfd: i32, path: &[u8]) -> Option<Result<crate::fdmarks::Mark, i32>> {
+        use crate::fdmarks::Mark;
+        let p = self.fs().proc_path(dirfd, path)?;
+        match &p[..] {
+            b"/proc/sys/kernel/hostname" | b"/proc/sys/kernel/domainname" => {
+                let domain = p.ends_with(b"domainname");
+                return Some(if self.creds.has_admin() {
+                    Ok(Mark::UtsName { domain })
+                } else {
+                    Err(errno::EACCES)
+                });
+            }
+            b"/proc/self/comm" => return Some(Ok(Mark::Comm { tid: 0 })),
+            _ => {}
+        }
+        let rest = p.strip_prefix(b"/proc/")?.strip_suffix(b"/comm")?;
+        if let Some(t) = rest.strip_prefix(b"self/task/") {
+            let tid = std::str::from_utf8(t).ok()?.parse().ok()?;
+            return Some(Ok(Mark::Comm { tid }));
+        }
+        Some(Ok(Mark::Comm { tid: -1 }))
+    }
+
+    /// Whether the caller is refused another process's `/proc/<pid>` file
+    /// at `path` that only a reader that may trace it reads
+    /// ([`crate::procpid::TRACER_ONLY`]): `EACCES` then.
+    pub(crate) fn proc_refused(&self, dirfd: i32, path: &[u8]) -> Option<i32> {
+        let (Some(Some(host)), sub) = self.fs().proc_target(dirfd, path)? else { return None };
+        if !crate::procpid::TRACER_ONLY.contains(&&sub[..]) || self.may_trace(host) {
+            return None;
+        }
+        Some(errno::EACCES)
     }
 
     /// For `/proc/<pid>/oom_score_adj` or `oom_adj` at `path`, what a write

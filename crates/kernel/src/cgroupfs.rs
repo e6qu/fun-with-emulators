@@ -359,8 +359,8 @@ fn replace(p: &[u8], content: String) {
     }
     if let Ok(f) = std::fs::File::open(os(&tmp)) {
         use std::os::fd::AsRawFd;
-        let (owner, perm) = old
-            .map_or(((0, 0), 0o444), |st| ((st.st_uid, st.st_gid), crate::modes::perm_of(&st)));
+        let (owner, perm) =
+            old.map_or(((0, 0), 0o444), |st| ((st.st_uid, st.st_gid), crate::modes::perm_of(&st)));
         let _ = crate::owners::keep_fd(f.as_raw_fd(), owner);
         let _ = crate::modes::keep_fd(f.as_raw_fd(), perm);
     }

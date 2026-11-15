@@ -753,9 +753,17 @@ impl<P: Platform> Kernel<P> {
             nr::SCHED_GET_PRIORITY_MIN => crate::sched::priority_bound(a[0], false),
             nr::SCHED_RR_GET_INTERVAL => self.sys_sched_rr_get_interval(a[0], a[1]),
             nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
-            nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
+            nr::PRLIMIT64 | nr::SETRLIMIT => {
+                let (pid, res, new, old) =
+                    if n == nr::SETRLIMIT { (0, a[0], a[1], 0) } else { (a[0], a[1], a[2], a[3]) };
+                let r = self.sys_prlimit(pid, res, new, old);
+                // Other processes see the limits it now has.
+                if r == 0 && new != 0 && (pid == 0 || pid as i32 == thread::tgid()) {
+                    self.fs().share();
+                }
+                r
+            }
             nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
-            nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),
 
             // Time.
             nr::CLOCK_SETTIME => self.sys_clock_settime(a[0], a[1]),
@@ -2056,12 +2064,22 @@ impl<P: Platform> Kernel<P> {
     /// reports.
     fn sys_sysinfo(&self, buf: u64) -> i64 {
         let scale = (1u64 << fwe_abi::SI_LOAD_SHIFT) as f64;
+        let m = host::memory();
+        // The tasks of the processes the caller's pid namespace holds.
+        let procs: u64 = crate::procpid::listed()
+            .into_iter()
+            .filter_map(crate::pidns::to_host)
+            .map(|h| crate::procpid::host_info(h).map_or(1, |i| i.threads.max(1)))
+            .sum();
         let info = fwe_abi::Sysinfo {
             uptime: host::uptime() as i64,
             loads: host::load_averages().map(|l| (l * scale) as u64),
-            totalram: crate::procfs::MEM_TOTAL_KB * 1024,
-            freeram: crate::procfs::MEM_FREE_KB * 1024,
-            procs: 1,
+            totalram: m.total,
+            freeram: m.free,
+            bufferram: 0,
+            totalswap: m.swap_total,
+            freeswap: m.swap_free,
+            procs: procs.min(u64::from(u16::MAX)) as u16,
             mem_unit: 1,
             ..Default::default()
         };
@@ -3303,7 +3321,7 @@ pub(crate) fn own_limit_of(res: u64) -> u64 {
     own_limit(res).map_or(resource::RLIM_INFINITY, |(soft, _)| soft)
 }
 
-fn own_limit(res: u64) -> Result<(u64, u64), i32> {
+pub(crate) fn own_limit(res: u64) -> Result<(u64, u64), i32> {
     if res == resource::RLIMIT_NOFILE {
         // Virtual: the host's limit also covers fwe's own descriptors.
         return Ok(crate::fdtable::limit());
@@ -3953,7 +3971,8 @@ mod tests {
         let p = &mut info as *mut _ as u64;
         assert_eq!(kernel().syscall(nr::SYSINFO, [p, 0, 0, 0, 0, 0]), 0);
         assert!(info.uptime > 0);
-        assert_eq!(info.totalram, crate::procfs::MEM_TOTAL_KB * 1024);
+        assert_eq!(info.totalram, host::memory().total);
+        assert!(info.procs >= 1);
         assert!(info.freeram <= info.totalram);
         assert_eq!(info.mem_unit, 1);
     }

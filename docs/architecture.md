@@ -855,16 +855,29 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `cgroup`, `mountinfo`, `mounts`, `uid_map`, `gid_map`, `setgroups`,
   `maps`, `smaps`, `auxv` (the vector the program started with),
   `personality`, `oom_score`, `oom_adj`, `oom_score_adj`, `fd`, `fdinfo`,
-  `ns`, `task/<tid>/{stat,status,comm}`. The state in `stat` is the main
+  `ns`, `environ` (the environment strings in the initial stack, between
+  the arguments and `AT_EXECFN`'s string, read from memory), `limits`,
+  `statm` and `io` (sizes and storage bytes from the host; the counts it
+  does not keep are 0), `net`, `task/<tid>/{stat,status,comm}`. Writing
+  `comm` names the thread as `PR_SET_NAME` does (another process's:
+  `EINVAL`). The state in `stat` is the main
   thread's: `S` while it waits in a system call, never while it waits for
   one of fwe's own locks (as a Linux task waiting on a kernel lock is not
   asleep).
-- `/proc` globals: `cpuinfo`, `meminfo`, `stat` (host CPU times and boot
+- `/proc` globals: `cpuinfo` (Linux's arm64 format: BogoMIPS from the
+  host's timer, the features of the hwcaps the program was given, the
+  implementer and, for a chip Linux knows, the part from `hw.cpufamily`;
+  variant and revision 0), `meminfo` (the host's memory: `hw.memsize`,
+  the VM statistics, `vm.swapusage`), `stat` (host CPU times and boot
   time), `uptime`, `loadavg`, `cmdline`, `filesystems`, `partitions`,
+  `net` (a link to `self/net`: `dev`, `if_inet6`, `route`, `snmp`, `tcp`,
+  `tcp6`, `udp`, `udp6` and `unix` of the reader's network namespace, in
+  `crates/kernel/src/procnet.rs`),
   `config.gz` (the options of what fwe implements), `keys`, `key-users`,
   `sysvipc/{shm,sem,msg}`, and under `/proc/sys`: `kernel/{ostype,
   osrelease,version,hostname,domainname,pid_max,cap_last_cap,ngroups_max,
-  overflowuid,overflowgid,threads-max,tainted}`,
+  overflowuid,overflowgid,threads-max,tainted}` (`hostname` and
+  `domainname` written as `sethostname` sets them),
   `kernel/random/{entropy_avail,poolsize,uuid,boot_id}`, `fs/{nr_open,
   file-max,pipe-max-size,pipe-user-pages-soft,pipe-user-pages-hard,
   lease-break-time,protected_symlinks,protected_hardlinks}`,
@@ -889,9 +902,15 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `socket:[ino]`, `anon_inode:[eventfd]` and the like; opening one reopens
   the file or, for an object with no path, duplicates the descriptor.
 - `/proc/<pid>` of another process: `stat`, `status`, `cmdline`, `comm`,
-  `exe`, `cgroup`, `ns`, `fd`, `task`, `maps`, `smaps`, the `oom_*`
-  files, `coredump_filter`, `timerslack_ns`, `uid_map`, `gid_map` and
-  `setgroups`, from its records and the host. `oom_score_adj` is inherited
+  `exe`, `cgroup`, `ns`, `fd`, `task`, `maps`, `smaps`, `environ` (its
+  memory, as `process_vm_readv` reaches it), `limits`, `statm`, `io`,
+  `cwd`, `root`, `mountinfo`, `mounts`, `net`, the `oom_*` files,
+  `coredump_filter`, `timerslack_ns`, `uid_map`, `gid_map` and
+  `setgroups`, from its records and the host. A process shares its mount
+  namespace, root, working directory and limits in its entry of the
+  process store as they change. `maps`, `smaps`, `environ`, `io`, `cwd`
+  and `root` take what Linux's `PTRACE_MODE_READ_FSCREDS` takes
+  (`EACCES` otherwise). `oom_score_adj` is inherited
   (going below the last value a privileged process set takes
   `CAP_SYS_RESOURCE`). A host process fwe did not start (outside a pid
   namespace any number names the host's, 1 its `launchd`) is a directory
@@ -1188,8 +1207,9 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
 - `cachestat` counts a file's resident pages with `mincore` of a mapping
   of the range; `ioprio_set` checks and keeps the caller's I/O priority,
   which nothing applies.
-- `sysinfo` reports the host's uptime and load with the fixed memory
-  figures of `/proc/meminfo`.
+- `sysinfo` reports the host's uptime, load and memory (as
+  `/proc/meminfo`), and as `procs` the tasks of the processes the
+  caller's pid namespace holds.
 
 ## Known limitations
 
@@ -1395,9 +1415,12 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A reaper sees an adopted orphan's state after each signal it is sent, so
   a stop and continue sent together before it looks are not reported, and
   unreported stops are forgotten when the reaper runs another program.
-- `/proc/<pid>` of another process has no `cwd`, `root`, `environ` or
-  `mem`; `/proc` in the initial pid namespace lists only fwe's processes
-  (another host process is reached by its number, with only its `stat`).
+- `/proc` in the initial pid namespace lists only fwe's processes
+  (another host process is reached by its number, with only its `stat`);
+  `/proc/net` there shows the host's interfaces but only fwe's processes'
+  sockets, and no route through a gateway; `/proc/<pid>/io` counts only
+  storage bytes and `statm` only the size and resident set; writing
+  another thread's `comm` is refused (`EINVAL`).
 - cgroups: memory, CPU, I/O and other limits are kept and read back but
   not enforced (only `pids.max` and device programs are); a threaded
   cgroup cannot be made (`cgroup.type` refuses `threaded`); there is no

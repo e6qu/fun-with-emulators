@@ -40,8 +40,11 @@ pub enum Kind {
     Robust = 2,
     /// Its mappings, for `/proc/<pid>/maps` ([`crate::maps`]).
     Maps = 3,
+    /// Its mount namespace, root, working directory and resource limits,
+    /// for `/proc/<pid>/{cwd,root,mountinfo,limits}` ([`crate::fs::Fs::share`]).
+    View = 4,
 }
-const KINDS: usize = 4;
+const KINDS: usize = 5;
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).
