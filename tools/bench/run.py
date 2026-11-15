@@ -320,6 +320,7 @@ def macos(a):
     for name, args, _ in MICRO:
         if args[0] == "file":
             sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
+            pcs(f"{name} (micro)", fwe + [a.bench, "file", args[1], "300000"])
     results = {"fwe": ours, "macOS": theirs}
     if not a.no_build:
         build(a, fwe, results)
@@ -538,16 +539,23 @@ def git_commands(ours, theirs, fresh, root):
 
 
 def pcs(name, cmd):
-    """Where `cmd` (one fwe process) runs, by the exact program counter of
-    each of DTrace's samples, named by the file mapped there (as `vmmap`
-    lists it while the program runs) and the offset into it: `sample` walks
-    frames, which guest code without frame records leaves it short of."""
+    """Where `cmd` (an fwe process, and those it forks) runs, by the exact
+    program counter of each of DTrace's samples, named by the file mapped
+    there (as `vmmap` lists it in the first process while it runs) and the
+    offset into it: `sample` walks frames, which guest code without frame
+    records leaves it short of. And the time the processes spend in each
+    host system call."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # Started first, on every fwe process (one runs at a time here): DTrace
     # grabbing a running process by its pid fails while it starts.
-    # It ends itself once that process exits, and writes what it gathered.
-    script = ('profile-997 /execname == "fwe"/ { @[arg1] = count(); } '
-              'proc:::exit /execname == "fwe"/ { exit(0); }')
+    # It ends itself once the process started here exits, and writes what
+    # it gathered.
+    script = ('profile-997 /execname == "fwe"/ { @pc[arg1] = count(); } '
+              'syscall:::entry /execname == "fwe"/ { self->t = timestamp; } '
+              'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
+              '@n[probefunc] = count(); self->t = 0; } '
+              f'proc:::exit /execname == "fwe" && ppid == {os.getpid()}/ {{ exit(0); }} '
+              'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -561,33 +569,41 @@ def pcs(name, cmd):
     for line in vm.splitlines():
         m = re.search(r"([0-9a-f]+)-([0-9a-f]+)\s+\[.*?\]\s+\S+\s+SM=\S+\s*(.*)$", line)
         if m:
-            regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip()))
+            regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip(),
+                            " ".join(line.split())))
     proc.wait(timeout=300)
     try:
         said = tracer.communicate(timeout=60)[0]
     except subprocess.TimeoutExpired:
         subprocess.run(["sudo", "-n", "kill", "-KILL", str(tracer.pid)], capture_output=True)
         sys.exit(f"{name}: DTrace did not end when the program did")
-    counts = []
+    counts, calls = [], []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
             for line in f:
                 p = line.split()
-                if len(p) == 2 and p[1].isdigit():
-                    counts.append((int(p[0], 0), int(p[1])))
+                if len(p) == 3 and p[0] == "pc":
+                    counts.append((int(p[1], 16), int(p[2])))
+                elif len(p) == 4 and p[0] == "sys":
+                    calls.append((p[1], int(p[2]), int(p[3])))
+    if calls:
+        calls.sort(key=lambda c: -c[1])
+        top = ", ".join(f"{c} {n}x {ns / 1e6:.1f} ms ({ns / n:.0f} ns)" for c, ns, n in calls[:12])
+        print(f"{name}: host system calls: {sum(c[1] for c in calls) / 1e6:.1f} ms: {top}",
+              file=sys.stderr)
     if not counts:
         print(f"{name}: no program counters: {said.strip()[-500:]}", file=sys.stderr)
         return
     # A file's offset from the lowest address it is mapped at.
     base = {}
-    for lo, _, what in regions:
+    for lo, _, what, _ in regions:
         if what:
             base[what] = min(base.get(what, lo), lo)
 
     def where(pc):
         if pc == 0:
             return "kernel"  # (No user program counter: in a system call.)
-        for lo, hi, what in regions:
+        for lo, hi, what, _ in regions:
             if lo <= pc < hi:
                 return f"{os.path.basename(what)}+{pc - base[what]:#x}" if what else f"anonymous {lo:#x}+{pc - lo:#x}"
         return "unmapped"
@@ -601,6 +617,11 @@ def pcs(name, cmd):
                     for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
+    # What vmmap says of the unnamed regions most samples are in.
+    for w, _ in by.most_common(8):
+        for lo, _, what, line in regions:
+            if not what and w == f"anonymous {lo:#x}":
+                print(f"{name}: {w}: {line}", file=sys.stderr)
 
 
 def sampled(name, cmd):
@@ -739,6 +760,21 @@ def workloads(a, fwe, guest_env, lua_src, results):
     )
     workload(results, "git (s)", *script("git.sh", "/usr/bin/git", brew["git"]), fresh, at)
     git_commands(*script("git.sh", "/usr/bin/git", brew["git"]), fresh, root)
+    # `git status` in the workload's repository, again and again: the
+    # command whose share differs most.
+    for d in fresh:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    for cmd in script("git.sh", "/usr/bin/git", brew["git"]):
+        subprocess.run(cmd, capture_output=True, check=True)
+    loop = "cd {} && i=0; while [ $i -lt 100 ]; do {} status --porcelain >/dev/null; i=$((i+1)); done"
+    statuses = {"fwe": under("/bin/sh", "-c", loop.format("/tmp/w", "/usr/bin/git")),
+                "macOS": ["/bin/sh", "-c", loop.format(theirs_w, brew["git"])]}
+    for side, cmd in statuses.items():
+        t = time.perf_counter()
+        subprocess.run(cmd, capture_output=True, check=True)
+        print(f"git status {side}: {(time.perf_counter() - t) * 10:.2f} ms each", file=sys.stderr)
+    pcs("git status", statuses["fwe"])
     # One git process's start, where the workload's seventy go.
     one = under("/usr/bin/git", "--version")
     timed = one[:2] + ["FWE_TIMING=1"] + one[2:]
