@@ -4833,7 +4833,11 @@ fn proc_is_read_through_a_detached_mount() {
 const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
     nstype 0x4000000, parent of a UTS namespace refused true\n\
     setns: 0, own name true, back true\n\
-    wrong type refused true\n";
+    wrong type refused true\n\
+    own user namespace: -1 errno 22\n\
+    without CAP_SYS_ADMIN: -1 errno 22, capabilities kept true\n\
+    unshare pid 0, setns into its own active one 0\n\
+    child: the namespace above refused, its own joined true\n";
 
 /// Namespace descriptors: `/proc/self/ns/uts` opened as nsfs shows it,
 /// the `NS_GET_*` requests, and `setns` back into the namespace it names.

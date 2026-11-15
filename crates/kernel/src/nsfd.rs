@@ -358,11 +358,22 @@ impl<P: Platform> Kernel<P> {
         if nstype != 0 && nstype != n.kind {
             return err(errno::EINVAL);
         }
+        // A user namespace is joined, as Linux's `userns_install` has it,
+        // only if it is not the caller's own and the caller is a single
+        // thread (`EINVAL`), before the capability is asked for.
+        if n.kind == CLONE_NEWUSER {
+            let own = self.fs().ns.user.as_ref().map(|r| r.dir().to_vec());
+            if own == n.dir || crate::thread::live_threads() > 1 {
+                return err(errno::EINVAL);
+            }
+        }
         if !self.may_join(&n) {
             return err(errno::EPERM);
         }
-
-        if n.kind == CLONE_NEWUSER && crate::thread::live_threads() > 1 {
+        // A pid namespace (for the caller's children) is its own or one
+        // below it, as Linux's `pidns_install` allows (`EINVAL`).
+        if n.kind == CLONE_NEWPID && !self.reaches(CLONE_NEWPID, &n.dir.clone().map(|d| (d, n.id)))
+        {
             return err(errno::EINVAL);
         }
         // A mount namespace is joined by a thread that shares its root and

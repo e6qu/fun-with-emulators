@@ -4692,6 +4692,27 @@ mod tests {
         k.syscall(nr::OPENAT, [AT_FDCWD, path.as_ptr() as u64, flags, mode, 0, 0])
     }
 
+    /// `setns` into the caller's own user namespace is refused (`EINVAL`),
+    /// with or without `CAP_SYS_ADMIN`, and its capabilities stay as they
+    /// were, as Linux's `userns_install` has it.
+    #[test]
+    fn setns_into_its_own_user_namespace_is_invalid() {
+        use fwe_abi::clone::CLONE_NEWUSER;
+        let (mut k, _d) = rooted();
+        let fd =
+            crate::nsfd::open(crate::nsfd::NsRef { kind: CLONE_NEWUSER, id: 1, dir: None }, true)
+                as i32;
+        assert!(fd >= 0);
+        assert_eq!(k.sys_setns(fd as u64, CLONE_NEWUSER), err(errno::EINVAL));
+        k.creds.caps.effective &= !(1 << crate::caps::CAP_SYS_ADMIN);
+        let before = k.creds.caps.clone();
+        assert_eq!(k.sys_setns(fd as u64, 0), err(errno::EINVAL));
+        assert_eq!(k.creds.caps, before);
+        crate::nsfd::closed(fd);
+        // SAFETY: the descriptor `open` made.
+        unsafe { libc::close(fd) };
+    }
+
     #[test]
     fn open_write_read_stat() {
         use fwe_abi::fcntl::{O_CREAT, O_RDWR};

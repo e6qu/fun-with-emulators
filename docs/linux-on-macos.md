@@ -1338,7 +1338,7 @@ that the processes in them name ([Namespaces](#namespaces)).
 | `setgroups` | `CAP_SETGID`; up to 65536 groups, mapped up; `EPERM` in a user namespace whose `setgroups` is `deny` or whose `gid_map` is unwritten | none |
 | `capget`, `capset` | effective, permitted and inheritable sets, header versions 1 to 3; `capget` of another process reads the sets its record holds, `capset` is the caller's own only | none |
 | `unshare` | mount, UTS, IPC, network, cgroup, pid and user namespaces as new records, each owned by the caller's user namespace (a new one if it makes one too); `CAP_SYS_ADMIN` in that user namespace except for a user namespace; `CLONE_NEWTIME` is `EINVAL` | none |
-| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN` in a user namespace it joins, and for another kind in the namespace's owner and in the caller's own (with `CAP_SYS_CHROOT` too for a mount namespace) | none |
+| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN` in a user namespace it joins, and for another kind in the namespace's owner and in the caller's own (with `CAP_SYS_CHROOT` too for a mount namespace); the caller's own user namespace, or a pid namespace other than its own or one below it, is `EINVAL` | none |
 | `clone`, `clone3` with `CLONE_NEW*` | the same namespaces made before the host `fork`, so the child inherits them | `fork` (by the backend) |
 
 **`setuid` and the rest**: no host privilege is needed, since only fwe's
@@ -2552,7 +2552,7 @@ where fwe falls short of Linux in detail is in
 | Cgroup namespace | **emulated** | `/proc/<pid>/cgroup` and `cgroup2` mounts from its root |
 | Time namespace | **refused** | `EINVAL`, as without `CONFIG_TIME_NS` |
 | `user.max_*_namespaces` | **enforced** | `ENOSPC`; counted over all of fwe's namespaces of the kind, not per user |
-| `clone`, `unshare`, `setns` | **enforced** | Linux's flag rules and capabilities ([Credential and namespace calls](#credential-and-namespace-calls)) |
+| `clone`, `unshare`, `setns` | **enforced** | Linux's flag rules, capabilities and which namespaces may be joined ([Credential and namespace calls](#credential-and-namespace-calls)) |
 | `NS_GET_*` requests, `/proc/<pid>/ns`, nsfs binds | **emulated** | `NSTYPE`, `OWNER_UID`, `PARENT`, `USERNS`, `MNTNS_ID`; others `ENOTTY` |
 | cgroup v2 tree | **emulated** | one per host user, all of their fwe processes, `nsdelegate` ([cgroups](#cgroups)) |
 | cgroup v1 | **refused** | `ENODEV` |
