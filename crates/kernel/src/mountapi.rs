@@ -17,7 +17,7 @@
 //!
 //! Mount ids for `statmount` and `listmount` are the unique ones
 //! ([`crate::mounts::UNIQUE_ID_BASE`]); a mount the caller cannot reach
-//! from its root is refused (`EPERM`) without `CAP_SYS_ADMIN`.
+//! from its root is refused (`EPERM`) without `CAP_SYS_ADMIN` in the initial user namespace.
 
 use crate::fdmarks::{self, Mark};
 use crate::mounts::{FsType, Mount, Source, join, ms, under};
@@ -446,7 +446,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `fsopen(fs_name, flags)`.
     pub(crate) fn sys_fsopen(&mut self, name: u64, flags: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !FSOPEN_CLOEXEC != 0 {
@@ -471,7 +471,7 @@ impl<P: Platform> Kernel<P> {
     /// `fspick(dfd, path, flags)`: a context to reconfigure the filesystem
     /// mounted at `path`.
     pub(crate) fn sys_fspick(&mut self, dfd: u64, path: u64, flags: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let all =
@@ -599,7 +599,7 @@ impl<P: Platform> Kernel<P> {
             FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL => {
                 if c.phase != Phase::Create {
                     Err(errno::EBUSY)
-                } else if !self.creds.has_admin() {
+                } else if !self.may_make_filesystem(c.kind) {
                     Err(errno::EPERM)
                 } else {
                     let data = c.options.join(&b","[..]);
@@ -619,7 +619,7 @@ impl<P: Platform> Kernel<P> {
             FSCONFIG_CMD_RECONFIGURE => {
                 if c.phase != Phase::Reconf {
                     Err(errno::EBUSY)
-                } else if !self.creds.has_admin() {
+                } else if !self.may_mount() {
                     Err(errno::EPERM)
                 } else {
                     self.reconfigure(&c)
@@ -662,7 +662,7 @@ impl<P: Platform> Kernel<P> {
     /// `fsmount(fd, flags, attr_flags)`: a detached mount of the context's
     /// new filesystem.
     pub(crate) fn sys_fsmount(&mut self, fd: u64, flags: u64, attr: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !FSMOUNT_CLOEXEC != 0 {
@@ -713,6 +713,7 @@ impl<P: Platform> Kernel<P> {
             master: 0,
             device,
             options: c.options.join(&b","[..]),
+            locked: 0,
         };
         self.tree_descriptor(vec![m], flags & FSMOUNT_CLOEXEC != 0)
     }
@@ -731,7 +732,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let clone = flags & OPEN_TREE_CLONE != 0;
-        if clone && !self.creds.has_admin() {
+        if clone && !self.may_mount() {
             return err(errno::EPERM);
         }
         let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
@@ -785,6 +786,7 @@ impl<P: Platform> Kernel<P> {
                 master: 0,
                 device: b"devtmpfs".to_vec(),
                 options: Vec::new(),
+                locked: 0,
             };
             return self.tree_descriptor(vec![m], cloexec);
         }
@@ -803,7 +805,7 @@ impl<P: Platform> Kernel<P> {
         to_path: u64,
         flags: u64,
     ) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !MOVE_MOUNT__MASK != 0
@@ -925,7 +927,7 @@ impl<P: Platform> Kernel<P> {
         if size < MOUNT_ATTR_SIZE_VER0 {
             return err(errno::EINVAL);
         }
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let b = guest!(uaccess::read_bytes(attr, size as usize));
@@ -1010,6 +1012,11 @@ impl<P: Platform> Kernel<P> {
             if recursive {
                 ids.extend(t.mounts.iter().filter(|o| t.is_below(o.id, id)).map(|o| o.id));
             }
+            // All or none: not with a locked flag cleared on any.
+            let new = |m: &Mount| (m.flags & !remove) | add;
+            if t.mounts.iter().any(|m| ids.contains(&m.id) && !m.may_set_flags(new(m))) {
+                return Err(errno::EPERM);
+            }
             for m in t.mounts.iter_mut().filter(|m| ids.contains(&m.id)) {
                 apply(m);
             }
@@ -1046,7 +1053,7 @@ impl<P: Platform> Kernel<P> {
         }
         let table = ns.table();
         let Some(m) = table.by_unique(id).cloned() else { return err(errno::ENOENT) };
-        if !self.reachable(&m) && !self.creds.has_admin() {
+        if !self.reachable(&m) && !self.creds.has(crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         let mut sm = vec![0u8; STATMOUNT_SIZE];
@@ -1145,7 +1152,7 @@ impl<P: Platform> Kernel<P> {
         };
         let Some(parent) = parent else { return err(errno::ENOENT) };
         let from_root = id == LSMT_ROOT;
-        if !from_root && !self.reachable(&parent) && !self.creds.has_admin() {
+        if !from_root && !self.reachable(&parent) && !self.creds.has(crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         let mut found: Vec<u64> = table
@@ -1211,6 +1218,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 master: 0,
                 device: Vec::new(),
                 options: Vec::new(),
+                locked: 0,
             };
             as_table(vec![carrier]).encode(e);
             e.bool(c.made.is_some());

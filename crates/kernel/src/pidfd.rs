@@ -446,7 +446,7 @@ impl<P: Platform> Kernel<P> {
     /// `CAP_SYS_PTRACE`, or when its real user and group ids are each of
     /// the target's.
     fn may_attach(&self, target: i32) -> bool {
-        if self.creds.has(crate::caps::CAP_SYS_PTRACE) {
+        if self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_PTRACE) {
             return true;
         }
         let ids = crate::procreg::ids(target);

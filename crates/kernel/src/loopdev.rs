@@ -1167,7 +1167,7 @@ impl<P: Platform> Kernel<P> {
 
     fn device_ioctl(&mut self, fd: i32, n: u32, req: u64, arg: u64) -> Result<i64, i32> {
         let writes = access(fd)?.1;
-        let admin = self.creds.has_admin();
+        let admin = self.creds.has(crate::caps::CAP_SYS_ADMIN);
         // What Linux asks of a request that changes the device.
         let may_change = || if writes || admin { Ok(()) } else { Err(errno::EPERM) };
         let put_u64 = |v: u64| uaccess::write(arg, v).map(|_| 0);

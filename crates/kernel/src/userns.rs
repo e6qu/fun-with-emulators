@@ -7,6 +7,8 @@
 //! the overflow id 65534), and what it sets is mapped back up (`EINVAL` for
 //! one that has none). A new namespace's maps are empty until written,
 //! once, through `/proc/<pid>/uid_map` and `gid_map`, with Linux's rules.
+//! A capability held in a namespace reaches only it and the namespaces
+//! below it ([`capable_in`]).
 
 use crate::shared::{Data, Record};
 use crate::snapshot::{Dec, Enc};
@@ -117,6 +119,13 @@ pub fn nested() -> bool {
     NESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Whether the process may make a user namespace below its own: not from
+/// inside a `chroot` (`chrooted`), which it could leave with the
+/// capabilities the new namespace gives (`EPERM`).
+pub fn may_make(chrooted: bool) -> Result<(), i32> {
+    if chrooted { Err(errno::EPERM) } else { Ok(()) }
+}
+
 fn down(map: &[Extent], outside: u32) -> Option<u32> {
     map.iter()
         .find(|(_, o, c)| outside >= *o && outside - *o < *c)
@@ -160,6 +169,88 @@ pub fn from_ns(id: u32, gid: bool) -> Option<u32> {
         v = up(map, v)?;
     }
     Some(v)
+}
+
+/// Whether the initial namespace's id `id` has a mapping in the
+/// process's namespace (`gid` for a group id): Linux's `kuid_has_mapping`.
+pub fn mapped(id: u32, gid: bool) -> bool {
+    mapped_through(&current(), id, gid)
+}
+
+fn mapped_through(chain: &Chain, id: u32, gid: bool) -> bool {
+    let mut v = id;
+    for ns in chain.iter().rev() {
+        let n = ns.get();
+        match down(if gid { &n.gid_map } else { &n.uid_map }, v) {
+            Some(x) => v = x,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The directory of the process's user namespace's record (empty for the
+/// initial one).
+pub fn own_dir() -> Vec<u8> {
+    current().first().map_or_else(Vec::new, |r| r.dir().to_vec())
+}
+
+/// The user namespace whose record is `dir`, joined once per process (a
+/// joined record stays mapped for as long as the process lives).
+fn joined(dir: &[u8]) -> Option<Arc<Record<UserNs>>> {
+    static JOINED: Mutex<Vec<Arc<Record<UserNs>>>> = Mutex::new(Vec::new());
+    if let Some(r) = current().iter().find(|r| r.dir() == dir) {
+        return Some(r.clone());
+    }
+    let mut j = JOINED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = j.iter().find(|r| r.dir() == dir) {
+        return Some(r.clone());
+    }
+    let r = Arc::new(Record::join(dir, 0).ok()?);
+    j.push(r.clone());
+    Some(r)
+}
+
+/// The parent of the user namespace whose record is `dir` (empty: the
+/// initial one), `None` if there is no such namespace.
+pub fn parent_dir(dir: &[u8]) -> Option<Vec<u8>> {
+    let r = joined(dir)?;
+    Some(r.get().parent.as_ref().map_or_else(Vec::new, |p| p.0.clone()))
+}
+
+/// Whether a process of this one's user namespace, with effective uid
+/// `euid` (the initial namespace's) and `effective` holding the capability
+/// asked about, has it in the user namespace whose record is `target`
+/// (empty: the initial one): Linux's `cap_capable`. In its own namespace
+/// by its effective set; in a namespace below its own made by its
+/// effective user (its owner), every capability, and so in every namespace
+/// below that; in any other (its parents', a sibling's) none.
+pub fn capable_in(target: &[u8], euid: u32, effective: bool) -> bool {
+    capable_from(&own_dir(), target, euid, effective)
+}
+
+/// [`capable_in`] for a process in the user namespace whose record is
+/// `own`.
+fn capable_from(own: &[u8], target: &[u8], euid: u32, effective: bool) -> bool {
+    let mut at = target.to_vec();
+
+    // Namespaces nest at most 32 deep.
+    for _ in 0..40 {
+        if at == own {
+            return effective;
+        }
+        if at.is_empty() {
+            return false;
+        }
+        let Some(r) = joined(&at) else { return false };
+        let ns = r.get();
+        let parent = ns.parent.as_ref().map_or_else(Vec::new, |p| p.0.clone());
+        if parent == own && ns.owner == euid {
+            return true;
+        }
+        at = parent;
+    }
+    false
 }
 
 /// Whether `setgroups` is allowed in the process's namespaces.
@@ -310,5 +401,38 @@ mod tests {
         assert_eq!(up(&map, 65536), Some(165535));
         assert_eq!(up(&map, 65537), None);
         assert_eq!(show_map(&map[..1]), b"         0       1000          1\n");
+    }
+
+    #[test]
+    fn capabilities_reach_own_and_owned_namespaces_only() {
+        let fresh = |parent: &[u8], owner| {
+            let parent = (!parent.is_empty()).then(|| (parent.to_vec(), 0));
+            Record::fresh("user", UserNs { parent, owner, ..Default::default() }).unwrap()
+        };
+        // User 1000's namespace, one it made inside that, and user 2000's.
+        let a = fresh(b"", 1000);
+        let b = fresh(a.dir(), 1000);
+        let c = fresh(b"", 2000);
+        let init: &[u8] = b"";
+        // In the initial namespace: by the effective set there, and in
+        // every namespace below it.
+        assert!(capable_from(init, init, 0, true) && !capable_from(init, init, 0, false));
+        assert!(capable_from(init, c.dir(), 0, true));
+        // A user without the capability has every one in a namespace it
+        // made, and below it; not in another user's.
+        assert!(capable_from(init, a.dir(), 1000, false));
+        assert!(capable_from(init, b.dir(), 1000, false));
+        assert!(!capable_from(init, c.dir(), 1000, false));
+        // Inside its namespace: its effective set there, nothing in the
+        // initial namespace or a sibling, whatever its set holds.
+        assert!(capable_from(a.dir(), a.dir(), 1000, true));
+        assert!(!capable_from(a.dir(), a.dir(), 1000, false));
+        assert!(!capable_from(a.dir(), init, 1000, true));
+        assert!(!capable_from(a.dir(), c.dir(), 1000, true));
+        // A namespace below made by another user: by the set it has in
+        // its own namespace above it.
+        assert!(capable_from(a.dir(), b.dir(), 5000, true));
+        assert!(!capable_from(a.dir(), b.dir(), 5000, false));
+        assert!(capable_from(a.dir(), b.dir(), 1000, false));
     }
 }

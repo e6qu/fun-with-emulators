@@ -318,8 +318,8 @@ fn may(creds: &Creds, q: &Queue, want: u32) -> bool {
         0
     };
     (q.mode >> shift) & want == want
-        || creds.has(crate::caps::CAP_DAC_OVERRIDE)
-        || (want == 4 && creds.has(crate::caps::CAP_DAC_READ_SEARCH))
+        || creds.has_over(crate::caps::CAP_DAC_OVERRIDE, q.uid, q.gid)
+        || (want == 4 && creds.has_over(crate::caps::CAP_DAC_READ_SEARCH, q.uid, q.gid))
 }
 
 /// The guest's access mode of queue descriptor `fd`: (readable,
@@ -873,7 +873,10 @@ impl<P: Platform> Kernel<P> {
             let q = queue_at(&[&ns_dir[..], b"/", dir].concat())?.get();
             // The queues' directory is root's and sticky: only the queue's
             // owner removes it, or one with `CAP_FOWNER`.
-            if creds.fsuid != q.uid && creds.fsuid != 0 && !creds.has(crate::caps::CAP_FOWNER) {
+            if creds.fsuid != q.uid
+                && creds.fsuid != 0
+                && !creds.has_over(crate::caps::CAP_FOWNER, q.uid, q.gid)
+            {
                 return Err(errno::EPERM);
             }
             t.mq_names.remove(&name);

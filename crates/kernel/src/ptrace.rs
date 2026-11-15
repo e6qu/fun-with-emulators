@@ -1637,7 +1637,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// real, effective and saved ids as the target's, and the target
     /// dumpable.
     pub(crate) fn may_trace(&self, target: i32) -> bool {
-        if self.creds.has(crate::caps::CAP_SYS_PTRACE) {
+        if self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_PTRACE) {
             return true;
         }
         let ids = crate::procreg::ids(target);

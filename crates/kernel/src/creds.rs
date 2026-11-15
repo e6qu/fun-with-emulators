@@ -13,13 +13,22 @@
 //! (`chown` records it, [`crate::owners`]) and its kept mode
 //! ([`crate::modes`]), and a virtual root's capabilities pass the
 //! permission bits as Linux root's do.
+//!
+//! Capabilities are held in the process's user namespace and count, as on
+//! Linux, only over what that namespace owns: [`Creds::has`] asks the
+//! initial namespace (what is the whole system's), [`Creds::has_in`] the
+//! namespace owning an object (a process's, a namespace's owner),
+//! [`Creds::has_own`] the caller's own, and [`Creds::has_over`] a file
+//! (its owner and group mapped in the caller's namespace).
 
 use fwe_abi::{err, errno};
 
 /// What a file permission check needs of a caller: its file-system ids
 /// and groups (initial-namespace ids), and whether it passes permission
 /// bits (`CAP_DAC_OVERRIDE`) or reads and searches anything
-/// (`CAP_DAC_READ_SEARCH`).
+/// (`CAP_DAC_READ_SEARCH`) in its own user namespace, and whether that is
+/// one of fwe's (`scoped`), where the capabilities apply only to files
+/// whose owner and group are mapped in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Access {
     pub fsuid: u32,
@@ -27,6 +36,7 @@ pub struct Access {
     pub groups: Vec<u32>,
     pub dac_override: bool,
     pub dac_read_search: bool,
+    pub scoped: bool,
 }
 
 impl Access {
@@ -36,8 +46,9 @@ impl Access {
             fsuid: c.fsuid,
             fsgid: c.fsgid,
             groups: c.groups().to_vec(),
-            dac_override: c.has(crate::caps::CAP_DAC_OVERRIDE),
-            dac_read_search: c.has(crate::caps::CAP_DAC_READ_SEARCH),
+            dac_override: c.has_own(crate::caps::CAP_DAC_OVERRIDE),
+            dac_read_search: c.has_own(crate::caps::CAP_DAC_READ_SEARCH),
+            scoped: crate::userns::nested(),
         }
     }
 
@@ -45,19 +56,32 @@ impl Access {
     /// whose guest metadata (owner and mode) is `st`, as Linux's
     /// permission check has it: `CAP_DAC_OVERRIDE` passes all but running
     /// a file nobody may run, `CAP_DAC_READ_SEARCH` reading and searching;
-    /// else the owner's, the group's or the others' bits.
+    /// else the owner's, the group's or the others' bits. In a user
+    /// namespace of fwe's the capabilities count only for a file whose
+    /// owner and group are mapped there.
     pub fn permits(&self, st: &libc::stat, want: u32) -> bool {
+        self.permits_with(st, want, |uid, gid| {
+            crate::userns::mapped(uid, false) && crate::userns::mapped(gid, true)
+        })
+    }
+
+    /// [`Access::permits`], `mapped` telling whether a file's owner and
+    /// group are mapped in the caller's user namespace.
+    fn permits_with(&self, st: &libc::stat, want: u32, mapped: impl Fn(u32, u32) -> bool) -> bool {
+        let over = (self.dac_override || self.dac_read_search)
+            && (!self.scoped || mapped(st.st_uid, st.st_gid));
         permitted(
             (self.fsuid, self.fsgid, &self.groups),
-            (self.dac_override, self.dac_read_search),
+            (self.dac_override && over, self.dac_read_search && over),
             st,
             want,
         )
     }
 
-    /// Whether it passes every directory's search bits.
+    /// Whether it passes every directory's search bits (in a user
+    /// namespace of fwe's, only those of directories mapped there).
     pub fn searches_any(&self) -> bool {
-        self.dac_override || self.dac_read_search
+        (self.dac_override || self.dac_read_search) && !self.scoped
     }
 }
 
@@ -117,6 +141,7 @@ pub fn access() -> Access {
         groups: Vec::new(),
         dac_override: true,
         dac_read_search: true,
+        scoped: false,
     })
 }
 
@@ -132,8 +157,9 @@ pub fn real_uid() -> u32 {
 
 /// What sending credentials (`SCM_CREDENTIALS`) checks of a caller: its
 /// real, effective and saved user and group ids (initial-namespace ids),
-/// and whether it may claim another's (`CAP_SETUID`, `CAP_SETGID`) or
-/// another process's pid (`CAP_SYS_ADMIN`).
+/// and whether it may claim another's (`CAP_SETUID`, `CAP_SETGID` in its
+/// own user namespace) or another process's pid (`CAP_SYS_ADMIN` in the
+/// user namespace owning its pid namespace), as Linux's `scm_check_creds`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     pub uids: [u32; 3],
@@ -149,9 +175,15 @@ impl Identity {
         Identity {
             uids: [c.uid, c.euid, c.suid],
             gids: [c.gid, c.egid, c.sgid],
-            setuid: c.has(CAP_SETUID),
-            setgid: c.has(CAP_SETGID),
-            admin: c.has(CAP_SYS_ADMIN),
+            setuid: c.has_own(CAP_SETUID),
+            setgid: c.has_own(CAP_SETGID),
+            admin: if crate::userns::nested() {
+                let pid_ns = crate::pidns::current();
+                let owner = pid_ns.first().map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()));
+                c.has_in(&owner, CAP_SYS_ADMIN)
+            } else {
+                c.caps.has(CAP_SYS_ADMIN)
+            },
         }
     }
 }
@@ -185,15 +217,17 @@ pub fn publish(c: &Creds) {
         a.fsuid == c.fsuid
             && a.fsgid == c.fsgid
             && a.groups == c.groups()
-            && a.dac_override == c.has(crate::caps::CAP_DAC_OVERRIDE)
-            && a.dac_read_search == c.has(crate::caps::CAP_DAC_READ_SEARCH)
+            && a.dac_override == c.has_own(crate::caps::CAP_DAC_OVERRIDE)
+            && a.dac_read_search == c.has_own(crate::caps::CAP_DAC_READ_SEARCH)
+            && a.scoped == crate::userns::nested()
     });
     if !same {
         *ACCESS.write().unwrap_or_else(|e| e.into_inner()) = Some(Access::of(c));
     }
     // Root, or `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`, is not held to
     // `RLIMIT_NPROC`.
-    let exempt = c.uid == 0 || c.has(crate::caps::CAP_SYS_RESOURCE) || c.has_admin();
+    let exempt =
+        c.uid == 0 || c.has(crate::caps::CAP_SYS_RESOURCE) || c.has(crate::caps::CAP_SYS_ADMIN);
     NPROC_USER
         .store(u64::from(c.uid) | u64::from(exempt) << 32, std::sync::atomic::Ordering::Relaxed);
 }
@@ -251,30 +285,43 @@ fn pick(arg: u32, cur: u32) -> u32 {
 }
 
 impl Creds {
-    /// May set any user id (`CAP_SETUID`).
+    /// May set any user id (`CAP_SETUID` in its own user namespace; the
+    /// ids it may set are those mapped there).
     fn can_setuid(&self) -> bool {
         self.caps.has(crate::caps::CAP_SETUID)
     }
 
-    /// May set any group id (`CAP_SETGID`).
+    /// May set any group id (`CAP_SETGID` in its own user namespace).
     fn can_setgid(&self) -> bool {
         self.caps.has(crate::caps::CAP_SETGID)
     }
 
-    /// May administer the system: mount, unmount, make namespaces
-    /// (`CAP_SYS_ADMIN`).
-    pub fn has_admin(&self) -> bool {
-        self.caps.has(crate::caps::CAP_SYS_ADMIN)
-    }
-
-    /// May change its root directory (`CAP_SYS_CHROOT`).
-    pub fn has_chroot(&self) -> bool {
-        self.caps.has(crate::caps::CAP_SYS_CHROOT)
-    }
-
-    /// Has capability `cap` in effect.
+    /// Has capability `cap` in the initial user namespace: Linux's
+    /// `capable`, for what is the whole system's (the clock, modules,
+    /// sysctls, BPF, devices). A process in a user namespace of fwe's has
+    /// none there, whatever its sets hold.
     pub fn has(&self, cap: u32) -> bool {
+        !crate::userns::nested() && self.caps.has(cap)
+    }
+
+    /// Has capability `cap` in its own user namespace: its effective set
+    /// (`ns_capable(current_user_ns(), cap)`).
+    pub fn has_own(&self, cap: u32) -> bool {
         self.caps.has(cap)
+    }
+
+    /// Has capability `cap` in the user namespace whose record is `ns`
+    /// (empty: the initial one), the namespace that owns the object at
+    /// hand: Linux's `ns_capable` ([`crate::userns::capable_in`]).
+    pub fn has_in(&self, ns: &[u8], cap: u32) -> bool {
+        crate::userns::capable_in(ns, self.euid, self.caps.has(cap))
+    }
+
+    /// Has capability `cap` over a file owned by `uid` and `gid` (the
+    /// initial namespace's ids): in its own user namespace, with both ids
+    /// mapped there (Linux's `capable_wrt_inode_uidgid`).
+    pub fn has_over(&self, cap: u32, uid: u32, gid: u32) -> bool {
+        self.caps.has(cap) && crate::userns::mapped(uid, false) && crate::userns::mapped(gid, true)
     }
 
     /// The capability changes a change of user ids from `old` makes, root
@@ -514,12 +561,7 @@ impl Creds {
 
     /// [`Access::permits`] for these credentials, as they are now.
     pub fn permits(&self, st: &libc::stat, want: u32) -> bool {
-        permitted(
-            (self.fsuid, self.fsgid, &self.groups),
-            (self.has(crate::caps::CAP_DAC_OVERRIDE), self.has(crate::caps::CAP_DAC_READ_SEARCH)),
-            st,
-            want,
-        )
+        Access::of(self).permits(st, want)
     }
 
     /// `setgroups`: privileged only.
@@ -548,6 +590,7 @@ mod tests {
             groups,
             dac_override: false,
             dac_read_search: false,
+            scoped: false,
         };
         assert!(who(1000, 1, vec![]).permits(&st, 6));
         assert!(who(2, 100, vec![]).permits(&st, 4) && !who(2, 100, vec![]).permits(&st, 2));
@@ -558,6 +601,37 @@ mod tests {
         assert!(root.permits(&st, 6) && !root.permits(&st, 1));
         let reader = Access { dac_read_search: true, ..who(2, 3, vec![]) };
         assert!(reader.permits(&st, 4) && !reader.permits(&st, 2));
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+    fn capabilities_in_a_user_namespace_cover_only_mapped_files() {
+        // SAFETY: zeroed bytes are a valid `stat`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_mode = (libc::S_IFREG as u32 | 0o600) as libc::mode_t;
+        (st.st_uid, st.st_gid) = (0, 0);
+        let root = Access {
+            fsuid: 1000,
+            fsgid: 1000,
+            groups: vec![],
+            dac_override: true,
+            dac_read_search: true,
+            scoped: true,
+        };
+        // Root of a namespace mapping only 1000: the initial root's file
+        // is not its to read; a file of its own user's is.
+        let maps_1000 = |uid: u32, gid: u32| uid == 1000 && gid == 1000;
+        assert!(!root.permits_with(&st, 4, maps_1000));
+        assert!(!root.searches_any());
+        (st.st_uid, st.st_gid) = (1000, 1000);
+        st.st_mode = (libc::S_IFREG as u32) as libc::mode_t;
+        assert!(root.permits_with(&st, 6, maps_1000));
+        // Mapped owner, unmapped group: not covered.
+        st.st_gid = 0;
+        assert!(!root.permits_with(&st, 4, maps_1000));
+        // In the initial namespace every file is.
+        let init = Access { scoped: false, ..root };
+        assert!(init.permits_with(&st, 6, maps_1000) && init.searches_any());
     }
 
     use super::*;

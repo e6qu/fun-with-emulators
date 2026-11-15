@@ -1332,8 +1332,8 @@ that the processes in them name ([Namespaces](#namespaces)).
 | `setfsuid`, `setfsgid` | set if permitted; always the previous id back; an unmapped id changes nothing | none |
 | `setgroups` | `CAP_SETGID`; up to 65536 groups, mapped up; `EPERM` in a user namespace whose `setgroups` is `deny` or whose `gid_map` is unwritten | none |
 | `capget`, `capset` | effective, permitted and inheritable sets, header versions 1 to 3; the caller's process only | none |
-| `unshare` | mount, UTS, IPC, network, cgroup, pid and user namespaces as new records; `CAP_SYS_ADMIN` except for a user namespace; `CLONE_NEWTIME` is `EINVAL` | none |
-| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN`, for a user namespace in that one (a user has it in one it made) | none |
+| `unshare` | mount, UTS, IPC, network, cgroup, pid and user namespaces as new records, each owned by the caller's user namespace (a new one if it makes one too); `CAP_SYS_ADMIN` in that user namespace except for a user namespace; `CLONE_NEWTIME` is `EINVAL` | none |
+| `setns` | joins the namespace a `/proc/<pid>/ns/*` descriptor names, or those of a pidfd's process; `CAP_SYS_ADMIN` in a user namespace it joins, and for another kind in the namespace's owner and in the caller's own (with `CAP_SYS_CHROOT` too for a mount namespace) | none |
 | `clone`, `clone3` with `CLONE_NEW*` | the same namespaces made before the host `fork`, so the child inherits them | `fork` (by the backend) |
 
 **`setuid` and the rest**: no host privilege is needed, since only fwe's
@@ -1351,8 +1351,9 @@ version 3 and `EINVAL`. fwe holds no other process's capabilities:
 **`unshare`, `clone`**: a new namespace is a fresh shared record, and
 the process's record lists its namespaces. `CLONE_NEWUSER` needs no
 privilege, gives the caller every capability in the new namespace, and
-is refused (`EINVAL`) to a process with other threads; the other kinds
-need `CAP_SYS_ADMIN`. `CLONE_NEWPID` applies to children, and a second
+is refused to a process with other threads (`EINVAL`) and in a `chroot`
+(`EPERM`); the other kinds need `CAP_SYS_ADMIN` in the caller's user
+namespace. `CLONE_NEWPID` applies to children, and a second
 one before a child is made fails with `EINVAL`. `CLONE_FILES`, `CLONE_FS`
 and `CLONE_SYSVSEM` are accepted; `CLONE_THREAD`, `CLONE_SIGHAND` and
 `CLONE_VM` too in a process with one thread, and refused (`EINVAL`) with
@@ -1381,11 +1382,11 @@ otherwise.
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
 | `uname` | `Linux`, `6.12.0-fwe` (a 2.6 release under `UNAME26`), `#1 SMP PREEMPT`, `aarch64`; host and domain names from the UTS namespace | `gethostname` in the initial UTS namespace |
-| `sethostname`, `setdomainname` | `CAP_SYS_ADMIN`, at most 64 bytes; set in an fwe UTS namespace; `EPERM` in the initial one, even for root, where Linux would rename the machine: its names are the Mac's | none |
+| `sethostname`, `setdomainname` | `CAP_SYS_ADMIN` in the user namespace owning the UTS namespace, at most 64 bytes; set in an fwe UTS namespace; `EPERM` in the initial one, even for root, where Linux would rename the machine: its names are the Mac's | none |
 | `sysinfo` | host uptime, load averages and memory (as `/proc/meminfo`); `procs` the tasks of the processes the caller's pid namespace holds | `clock_gettime(CLOCK_MONOTONIC)`, `getloadavg`, `host_statistics64`, `sysctl` |
 | `syslog` | an empty kernel log; read, clear and console level need `CAP_SYSLOG` or `CAP_SYS_ADMIN`; the console level is `kernel.printk`'s | none |
 | `getrandom` | flags checked (`GRND_RANDOM` with `GRND_INSECURE` is `EINVAL`); never waits; at most 32 MiB a call | `arc4random_buf` |
-| `reboot` | `CAP_SYS_BOOT` and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
+| `reboot` | `CAP_SYS_BOOT` in the user namespace owning the pid namespace, and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
 | `vhangup` | `CAP_SYS_TTY_CONFIG`, then nothing | none |
 | `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities and Landlock are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`; `/sys/kernel/security/lsm` reads `capability,landlock`); neither keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
 
@@ -2067,7 +2068,7 @@ thread's.
 |---|---|
 | pid (`pidns.rs`) | numbers processes and threads from 1 in a record mapping each to its host pid; `getpid`, `kill`, `wait`, process groups and `siginfo` senders are translated; when its init ends, the rest are killed; init takes only the signals it handles (and `SIGKILL`/`SIGSTOP` from above) |
 | mount (`mounts.rs`) | a mount table per namespace; see [Mounts](#mounts) |
-| user (`userns.rs`) | ids kept as the initial namespace's and seen through `uid_map`/`gid_map`, written once with Linux's rules; the creator has every capability in it |
+| user (`userns.rs`) | ids kept as the initial namespace's and seen through `uid_map`/`gid_map`, written once with Linux's rules; the creator has every capability in it, over what it owns only ([Credentials and capabilities](#credentials-and-capabilities)) |
 | UTS | `uname`, `sethostname`, `setdomainname` use its names; in the initial one the host's name is read and never set (`EPERM`) |
 | network (`netns.rs`) | a loopback interface, down until brought up; sockets reach only loopback; its ports are host loopback ports mapped through its table, so each namespace has its own port 80 (a datagram socket's port the host chose when it first sent too); a stream to a port nobody bound there is refused, and a datagram to one goes to a host port fwe holds unread and connected to itself, so it reaches no host program and a connected sender gets `ECONNREFUSED`, as on Linux; its abstract `AF_UNIX` names and sysctls are its own; a socket stays in the namespace it was made in (recorded with its descriptor, and passed with it over a Unix socket), whichever namespace uses it |
 | IPC | its System V objects and POSIX queues |
@@ -2135,10 +2136,35 @@ guest's identity virtual:
 | Linux | macOS | fwe |
 |---|---|---|
 | real/effective/saved/fs uids and gids, groups | the host process's, changeable only by root | virtual (`crates/kernel/src/creds.rs`), default root (0), Linux's `set*id` rules |
-| capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start |
+| capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start; held in the process's user namespace and checked against the namespace that owns the object, as below |
 | `chown` | changes the owner | kept in an attribute (`org.fwe.owner`, `crates/kernel/src/owners.rs`) under Linux's rules and shown by `stat`; the host file stays fwe's user's |
 | permission bits for a caller that is not root | the host's, for the host user | fwe's check by the guest's owner, mode and file-system ids, and each directory's search bit along a path (in a root filesystem) |
 | file capabilities, set-ID programs | set-ID bits, honoured only for root's files | `execve` acts on a program's `security.capability` attribute and its set-ID bits (the owner and group fwe keeps) with Linux's rules: the new ids and capability sets, the ambient set cleared, and nothing gained under `no_new_privs`, on a `nosuid` mount or while traced |
+
+A capability counts in the user namespace it is held in, as Linux's
+`ns_capable` has it (`userns::capable_in`): in the process's own
+namespace by its effective set, in a namespace below it that its
+effective user made (and every namespace below that) outright, and
+nowhere else. Each check asks the namespace that owns what is acted on:
+
+| What | The namespace asked |
+|---|---|
+| a file (permission bits, owner, mode, times, `chown`, set-ID bits, `security.capability`) | the caller's own, and only for a file whose owner and group are mapped there (`capable_wrt_inode_uidgid`) |
+| a process (`kill`, `ptrace` and `/proc/<pid>` access, `setpriority`, `sched_setaffinity`, `prlimit`, timer slack) | the target's user namespace |
+| mounts (`mount`, `umount2`, `pivot_root`, the mount API) | the owner of the caller's mount namespace; a new `proc`, `sysfs`, `mqueue` or `cgroup2` also the owner of the pid, network, IPC or cgroup namespace it shows |
+| `setns`, `unshare` | the namespace joined (and its owner); the caller's own for a new one |
+| the network (`CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, network sysctls) | the owner of the network namespace |
+| System V and POSIX IPC, IPC sysctls | the owner of the IPC namespace |
+| host and domain names | the owner of the UTS namespace |
+| `reboot` | the owner of the pid namespace |
+| the whole system's (the clock, modules, `bpf`, global sysctls, devices, `mknod`, `acct`, `syslog`, `vhangup`, raising hard limits, real-time scheduling, loop devices, `open_by_handle_at`) | the initial namespace only |
+
+A mount namespace made for a less privileged user namespace locks the
+mounts it copies, as Linux's `lock_mnt_tree`: their `ro`, `nosuid`,
+`nodev` and `noexec` flags cannot be cleared and their access-time mode
+cannot change (`EPERM`), and they cannot be unmounted, moved, or
+uncovered by a bind without the mounts on them (`EINVAL`). Every
+filesystem fwe mounts is one Linux lets a user namespace mount.
 
 How host users and file owners look to the guest is under
 [Host identity](#host-identity-and-machine-state).

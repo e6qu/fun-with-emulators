@@ -458,7 +458,9 @@ impl<P: Platform> Kernel<P> {
                 let creds = self.creds.clone();
                 match r.update(|t| {
                     let o = t.get(Kind::Shm, id)?;
-                    if !creds.has(crate::caps::CAP_IPC_LOCK) && !ipc::owns(&creds, &o.perm) {
+                    if !creds.has_in(&ipc::owner(), crate::caps::CAP_IPC_LOCK)
+                        && !ipc::owns(&creds, &o.perm)
+                    {
                         return Err(errno::EPERM);
                     }
                     if let Body::Shm(s) = &mut o.body {

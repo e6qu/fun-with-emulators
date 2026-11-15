@@ -56,6 +56,33 @@ fn mode_option(data: &[u8]) -> Option<u32> {
 }
 
 impl<P: Platform> Kernel<P> {
+    /// Whether the caller may change its mount namespace's mounts:
+    /// `CAP_SYS_ADMIN` in the user namespace that owns the namespace
+    /// (Linux's `may_mount`).
+    pub(crate) fn may_mount(&self) -> bool {
+        let owner = self.fs().mount_ns().table().owner.clone();
+        self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN)
+    }
+
+    /// Whether the caller may make a new filesystem of `kind`: every kind
+    /// fwe has is one a user namespace may mount (`FS_USERNS_MOUNT`), with
+    /// `CAP_SYS_ADMIN` in the user namespace the filesystem belongs to:
+    /// the one owning the pid namespace for `proc`, the network namespace
+    /// for `sysfs`, the IPC namespace for `mqueue`, the cgroup namespace
+    /// for `cgroup2`, else the caller's own (Linux's `mount_capable`).
+    pub(crate) fn may_make_filesystem(&self, kind: FsType) -> bool {
+        use fwe_abi::clone::{CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWPID};
+        let ns = &self.fs().ns;
+        let owner = match kind {
+            FsType::Proc => ns.owner(CLONE_NEWPID),
+            FsType::Sysfs => ns.owner(CLONE_NEWNET),
+            FsType::Mqueue => ns.owner(CLONE_NEWIPC),
+            FsType::Cgroup2 => ns.owner(CLONE_NEWCGROUP),
+            _ => return self.creds.has_own(crate::caps::CAP_SYS_ADMIN),
+        };
+        self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN)
+    }
+
     /// The namespace path of `path`, which must exist; `follow` as for
     /// resolution, a link in `/proc` included (`/proc/self/exe` names the
     /// program's file, `/proc/self/fd/N` the open file's). Fails with
@@ -251,7 +278,7 @@ impl<P: Platform> Kernel<P> {
         mut flags: u64,
         data: u64,
     ) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let target = guest!(uaccess::read_cstr(target, uaccess::PATH_MAX));
@@ -363,6 +390,9 @@ impl<P: Platform> Kernel<P> {
             // Only the v2 hierarchy: `cgroup` (v1) is no type fwe knows, as
             // on a kernel built without it.
             let Some(kind) = FsType::from_name(&fstype) else { return err(errno::ENODEV) };
+            if !self.may_make_filesystem(kind) {
+                return err(errno::EPERM);
+            }
             let (src, root, more) = match self.new_filesystem(kind, &data) {
                 Ok(v) => v,
                 Err(e) => return err(e),
@@ -386,7 +416,7 @@ impl<P: Platform> Kernel<P> {
     /// `MNT_EXPIRE` an unused one is first marked (`EAGAIN`), and unmounted
     /// by the next such call if nothing used it in between.
     pub(crate) fn sys_umount2(&mut self, target: u64, flags: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0
@@ -515,7 +545,7 @@ impl<P: Platform> Kernel<P> {
     /// whose root was the old one now has the new one; its working
     /// directory, if in the old tree, follows it there.
     pub(crate) fn sys_pivot_root(&mut self, new_root: u64, put_old: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let new_root = guest!(uaccess::read_cstr(new_root, uaccess::PATH_MAX));
@@ -571,7 +601,7 @@ impl<P: Platform> Kernel<P> {
     /// `chroot(path)`.
     pub(crate) fn sys_chroot(&mut self, path: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        if !self.creds.has_chroot() {
+        if !self.creds.has_own(crate::caps::CAP_SYS_CHROOT) {
             // Linux looks the directory up, and checks it may be entered,
             // before the privilege.
             const X_OK: u64 = 1;

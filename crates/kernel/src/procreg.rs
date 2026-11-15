@@ -1024,6 +1024,13 @@ pub fn take_limits() -> Vec<(u32, u64, u64)> {
     out
 }
 
+/// The user namespace host process `pid` is in, as its record's directory
+/// (empty: the initial one, which is also that of a process fwe has no
+/// record of): what a capability over the process is asked in.
+pub fn user_ns(pid: i32) -> Vec<u8> {
+    read(pid).and_then(|r| crate::nsfd::dir_among(b"user", &r.ns)).unwrap_or_default()
+}
+
 /// Host process `pid`'s ids ([`ProcRecord::ids`]; root's for one fwe has
 /// no record of).
 pub fn ids(pid: i32) -> [u32; 8] {

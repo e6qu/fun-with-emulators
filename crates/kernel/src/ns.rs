@@ -170,11 +170,47 @@ pub fn host_name() -> Vec<u8> {
     host[..end].to_vec()
 }
 
+/// The user namespace that owns the namespace whose record is `dir`, as
+/// the directory of its record (empty: the initial one, which owns every
+/// initial namespace, and a record that names none). Read once per
+/// process: it never changes.
+pub fn owner_dir(dir: &[u8]) -> Vec<u8> {
+    static OWNERS: std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, o)) = known.iter().find(|(d, _)| d == dir) {
+        return o.clone();
+    }
+    let owner = owner_of(dir).map(|(d, _)| d).unwrap_or_default();
+    known.push((dir.to_vec(), owner.clone()));
+    owner
+}
+
+/// The owner of namespace record `r` (`None`: an initial namespace).
+fn owner_or_initial<T: Data>(r: &Option<Arc<Record<T>>>) -> Vec<u8> {
+    r.as_ref().map_or_else(Vec::new, |r| owner_dir(r.dir()))
+}
+
 impl Namespaces {
     /// The directory of the user namespace's record (empty for the initial
     /// one).
     pub fn user_dir(&self) -> Vec<u8> {
         self.user.as_ref().map_or_else(Vec::new, |u| u.dir().to_vec())
+    }
+
+    /// The user namespace that owns the process's namespace of
+    /// `CLONE_NEW*` type `kind` (UTS, IPC, network, cgroup or pid; the
+    /// mount namespace's table names its own), as its record's directory
+    /// (empty: the initial one): where a capability over what the
+    /// namespace holds is asked for.
+    pub fn owner(&self, kind: u64) -> Vec<u8> {
+        match kind {
+            CLONE_NEWUTS => owner_or_initial(&self.uts),
+            CLONE_NEWIPC => owner_or_initial(&self.ipc),
+            CLONE_NEWNET => owner_or_initial(&self.net),
+            CLONE_NEWCGROUP => owner_or_initial(&self.cgroup),
+            CLONE_NEWPID => owner_or_initial(&self.pid),
+            _ => Vec::new(),
+        }
     }
 
     /// The host name `uname` and `/proc/sys/kernel/hostname` report.

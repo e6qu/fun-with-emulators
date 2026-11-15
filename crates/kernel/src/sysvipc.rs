@@ -939,11 +939,19 @@ fn apply_undo(s: &mut Sem, adj: &[(u16, i32)]) {
     }
 }
 
+/// The user namespace that owns the IPC namespace the caller is in (its
+/// record's directory; empty: the initial one), where a capability over
+/// its objects is asked for.
+pub fn owner() -> Vec<u8> {
+    current().map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()))
+}
+
 /// Whether `creds` may access an object with permission `perm` for `want`
-/// (`4` read, `2` write, both `6`): with `CAP_IPC_OWNER`, or by the owner's,
-/// the group's or others' bits, as `ipcperms` checks.
+/// (`4` read, `2` write, both `6`): with `CAP_IPC_OWNER` in the user
+/// namespace owning the IPC namespace, or by the owner's, the group's or
+/// others' bits, as `ipcperms` checks.
 pub fn permits(creds: &crate::creds::Creds, perm: &Perm, want: u32) -> bool {
-    if want == 0 || creds.has(crate::caps::CAP_IPC_OWNER) {
+    if want == 0 {
         return true;
     }
     let shift = if creds.euid == perm.uid || creds.euid == perm.cuid {
@@ -953,13 +961,16 @@ pub fn permits(creds: &crate::creds::Creds, perm: &Perm, want: u32) -> bool {
     } else {
         0
     };
-    (perm.mode >> shift) & want == want
+    (perm.mode >> shift) & want == want || creds.has_in(&owner(), crate::caps::CAP_IPC_OWNER)
 }
 
 /// Whether `creds` may change or remove an object (`IPC_SET`,
-/// `IPC_RMID`): its owner or creator, or with `CAP_SYS_ADMIN`.
+/// `IPC_RMID`): its owner or creator, or with `CAP_SYS_ADMIN` in the user
+/// namespace owning the IPC namespace.
 pub fn owns(creds: &crate::creds::Creds, perm: &Perm) -> bool {
-    creds.euid == perm.uid || creds.euid == perm.cuid || creds.has(crate::caps::CAP_SYS_ADMIN)
+    creds.euid == perm.uid
+        || creds.euid == perm.cuid
+        || creds.has_in(&owner(), crate::caps::CAP_SYS_ADMIN)
 }
 
 /// A command with `IPC_64` taken off.

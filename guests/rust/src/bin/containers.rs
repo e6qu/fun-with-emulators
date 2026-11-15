@@ -316,7 +316,61 @@ fn main() {
                 write(go[1], b"g".as_ptr(), 1);
                 waitpid(holder, std::ptr::null_mut(), 0);
             }
+            // A user's own user namespace holds every capability, over what
+            // the namespace owns only: not root's private file, root's
+            // process, the host name, a global sysctl, BPF; its own mount
+            // namespace's mounts, but those it was given stay locked; a
+            // UTS namespace of its own is its to name.
+            Some("userns-scope") => {
+                std::fs::write("/etc/secret", "s").unwrap();
+                chmod(c("/etc/secret").as_ptr(), 0o600);
+                let victim = fork();
+                if victim == 0 {
+                    loop {
+                        usleep(100_000);
+                    }
+                }
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    setuid(1000);
+                    let r = unshare(0x1000_0000 | 0x2_0000);
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", "0 1000 1").unwrap();
+                    std::fs::write("/proc/self/gid_map", "0 0 1").unwrap();
+                    println!("unshare: {} euid {}", res(r as i64), geteuid());
+                    println!("root's file: {}", io(std::fs::read("/etc/secret")));
+                    println!("root's process: {}", res(syscall(129, victim, 0)));
+                    println!("host name: {}", res(syscall(161, b"x".as_ptr(), 1)));
+                    // NS_GET_USERNS: the initial UTS namespace's owner is
+                    // above the caller's, not its to see.
+                    let uts = open(c("/proc/self/ns/uts").as_ptr(), O_RDONLY);
+                    println!("owner of the host's UTS: {}", res(syscall(29, uts, 0xb701)));
+                    close(uts);
+                    let w = std::fs::write("/proc/sys/fs/protected_symlinks", "0");
+                    println!("global sysctl: {}", io(w));
+                    let attr = [2u32, 4, 4, 1, 0, 0, 0, 0];
+                    println!("bpf: {}", res(syscall(280, 0, attr.as_ptr(), 32)));
+                    let tmpfs = c("tmpfs");
+                    let r = mount(tmpfs.as_ptr(), c("/tmp").as_ptr(), tmpfs.as_ptr(), 0, std::ptr::null());
+                    println!("mount: {}", res(r as i64));
+                    let r = mount(std::ptr::null(), c("/proc").as_ptr(), std::ptr::null(), 32, std::ptr::null());
+                    println!("remount clearing nosuid: {}", res(r as i64));
+                    println!("umount a given mount: {}", res(umount2(c("/proc").as_ptr(), 0) as i64));
+                    let r = unshare(0x0400_0000);
+                    println!("own UTS: {} host name: {}", res(r as i64), res(syscall(161, b"x".as_ptr(), 1)));
+                    let uts = open(c("/proc/self/ns/uts").as_ptr(), O_RDONLY);
+                    let owner = syscall(29, uts, 0xb701);
+                    let link = std::fs::read_link(format!("/proc/self/fd/{owner}")).ok();
+                    let own = std::fs::read_link("/proc/self/ns/user").ok();
+                    println!("its owner is its user namespace: {}", link.is_some() && link == own);
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                syscall(129, victim, 9);
+                waitpid(victim, std::ptr::null_mut(), 0);
+            }
             // A program only the VM runs, on a host without one: the exec
+
             // fails and the caller goes on, as podman's pause process does
             // when its catatonit cannot run.
             Some("exec-low") => {

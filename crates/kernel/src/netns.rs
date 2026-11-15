@@ -113,6 +113,14 @@ pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
     true
 }
 
+/// The user namespace that owns the calling thread's network namespace
+/// (its record's directory; empty: the initial one), where a capability
+/// over the network (`CAP_NET_ADMIN`, `CAP_NET_RAW`,
+/// `CAP_NET_BIND_SERVICE`) is asked for.
+pub fn owner() -> Vec<u8> {
+    current().map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()))
+}
+
 /// Make `net` this thread's own (`Some`), or the process's again (`None`).
 pub fn set_thread(net: Option<Option<Arc<Record<Net>>>>) {
     THREAD.with(|t| *t.borrow_mut() = net);

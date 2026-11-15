@@ -104,7 +104,9 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
         return Ok(());
     }
     let access = crate::creds::access();
-    if access.dac_override {
+    // `CAP_DAC_OVERRIDE` passes every node, but in a user namespace of
+    // fwe's only a node mapped there ([`crate::creds::Access::permits`]).
+    if access.dac_override && !access.scoped {
         return Ok(());
     }
     use std::os::fd::AsRawFd;

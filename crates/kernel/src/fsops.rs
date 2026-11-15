@@ -970,7 +970,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(st) = &existing
             && flags & 0o1000000 != 0
             && st.st_uid != self.creds.fsuid
-            && !self.creds.has(crate::caps::CAP_FOWNER)
+            && !self.creds.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid)
         {
             return err(errno::EPERM);
         }
@@ -1062,7 +1062,7 @@ impl<P: Platform> Kernel<P> {
                 let fd = open();
                 if fd < 0
                     && host::last_errno() == libc::EACCES
-                    && self.passes_dac(open_wants(flags))
+                    && self.passes_dac(st, open_wants(flags))
                     && crate::modes::keep_at(dirfd, &name, crate::modes::perm_of(st)).is_ok()
                 {
                     // Root, refused by the host's bits: they are the owner's
@@ -1310,8 +1310,11 @@ impl<P: Platform> Kernel<P> {
         let mut host = zeroed_stat();
         let kind = if kind == fwe_abi::stat::S_IFDIR { libc::S_IFDIR } else { libc::S_IFREG };
         host.st_mode = kind | (st.st_mode & 0o7777) as libc::mode_t;
-        host.st_uid = st.st_uid;
-        host.st_gid = st.st_gid;
+        // The file's ids as the initial namespace has them (`stat` shows
+        // them as the caller's namespace does; one it has no mapping for
+        // is no one's).
+        host.st_uid = crate::userns::from_ns(st.st_uid, false).unwrap_or(u32::MAX);
+        host.st_gid = crate::userns::from_ns(st.st_gid, true).unwrap_or(u32::MAX);
         self.access_result(&host, mode, &self.access_creds(eaccess), false, read_only)
     }
 
@@ -2274,7 +2277,7 @@ impl<P: Platform> Kernel<P> {
         let name = old.name_c()?;
         let st = stat_at(old.dir.as_raw_fd(), &name)?;
         let c = &self.creds;
-        if c.fsuid == st.st_uid || c.has(crate::caps::CAP_FOWNER) {
+        if c.fsuid == st.st_uid || c.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid) {
             return Ok(());
         }
         let mode = st.st_mode as u32;
@@ -2809,7 +2812,10 @@ impl<P: Platform> Kernel<P> {
         let touch = kinds.is_none_or(|k| k.iter().all(|&n| n == libc::UTIME_NOW));
         let may = |st: &libc::stat| -> Result<(), i32> {
             let c = &self.creds;
-            if all_omitted || c.fsuid == st.st_uid || c.has(crate::caps::CAP_FOWNER) {
+            if all_omitted
+                || c.fsuid == st.st_uid
+                || c.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid)
+            {
                 Ok(())
             } else if explicit {
                 Err(errno::EPERM)
@@ -2944,7 +2950,8 @@ impl<P: Platform> Kernel<P> {
         match &p[..] {
             b"/proc/sys/kernel/hostname" | b"/proc/sys/kernel/domainname" => {
                 let domain = p.ends_with(b"domainname");
-                return Some(if self.creds.has_admin() {
+                let owner = self.fs().ns.owner(fwe_abi::clone::CLONE_NEWUTS);
+                return Some(if self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN) {
                     Ok(Mark::UtsName { domain })
                 } else {
                     Err(errno::EACCES)
@@ -2995,7 +3002,9 @@ impl<P: Platform> Kernel<P> {
                 };
                 // Another process's takes CAP_SYS_NICE, as on Linux.
                 let own = host == crate::host::pid();
-                if !own && !self.creds.has(crate::caps::CAP_SYS_NICE) {
+                if !own
+                    && !self.creds.has_in(&crate::procreg::user_ns(host), crate::caps::CAP_SYS_NICE)
+                {
                     return Some(Err(errno::EPERM));
                 }
                 return Some(Ok(crate::fdmarks::Mark::TimerSlack { host }));
@@ -3008,10 +3017,12 @@ impl<P: Platform> Kernel<P> {
             crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
         };
         let own = host == crate::host::pid();
-        // The file is its process's effective user's, mode 0644.
+        // The file is its process's effective user's and group's, mode
+        // 0644.
+        let ids = crate::procreg::ids(host);
         if !own
-            && !self.creds.has(crate::caps::CAP_DAC_OVERRIDE)
-            && crate::procreg::ids(host)[1] != self.creds.fsuid
+            && !self.creds.has_over(crate::caps::CAP_DAC_OVERRIDE, ids[1], ids[5])
+            && ids[1] != self.creds.fsuid
         {
             return Some(Err(errno::EACCES));
         }
@@ -3085,7 +3096,9 @@ impl<P: Platform> Kernel<P> {
                 let gid = which == 1;
                 let cap = if gid { crate::caps::CAP_SETGID } else { crate::caps::CAP_SETUID };
                 let kid = if gid { self.creds.egid } else { self.creds.euid };
-                crate::userns::standing(t, kid, gid, self.creds.has(cap))
+                // The capability counts in the namespace's parent.
+                let parent = t.get().parent.as_ref().map_or_else(Vec::new, |p| p.0.clone());
+                crate::userns::standing(t, kid, gid, self.creds.has_in(&parent, cap))
             }
             None => (false, 0),
         };
@@ -3413,7 +3426,7 @@ impl<P: Platform> Kernel<P> {
         (st.st_uid, st.st_gid) = (kind.meta.1, kind.meta.2);
         crate::xattr::Who {
             admin: self.creds.has(crate::caps::CAP_SYS_ADMIN),
-            setfcap: self.creds.has(crate::caps::CAP_SETFCAP),
+            setfcap: self.creds.has_over(crate::caps::CAP_SETFCAP, st.st_uid, st.st_gid),
             read_any: self.permits(&st, 4),
             write_any: self.permits(&st, 2),
             kind,
@@ -3466,7 +3479,7 @@ impl<P: Platform> Kernel<P> {
             && asked & 0o010 != 0
             && gid != c.fsgid
             && !c.groups().contains(&gid)
-            && !c.has(crate::caps::CAP_FSETID)
+            && !c.has_over(crate::caps::CAP_FSETID, c.fsuid, gid)
         {
             kept &= !0o2000;
         }
@@ -3490,12 +3503,14 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// Whether the caller passes permission bits for access `want` (`R_OK`,
-    /// `W_OK`, `X_OK` bits): `CAP_DAC_OVERRIDE`, or `CAP_DAC_READ_SEARCH`
-    /// to read.
-    fn passes_dac(&self, want: u32) -> bool {
-        self.creds.has(crate::caps::CAP_DAC_OVERRIDE)
-            || want & !4 == 0 && self.creds.has(crate::caps::CAP_DAC_READ_SEARCH)
+    /// Whether the caller passes the permission bits of the file whose
+    /// guest metadata is `st` for access `want` (`R_OK`, `W_OK`, `X_OK`
+    /// bits): `CAP_DAC_OVERRIDE`, or `CAP_DAC_READ_SEARCH` to read, over
+    /// the file ([`crate::creds::Creds::has_over`]).
+    fn passes_dac(&self, st: &libc::stat, want: u32) -> bool {
+        let over = |cap| self.creds.has_over(cap, st.st_uid, st.st_gid);
+        over(crate::caps::CAP_DAC_OVERRIDE)
+            || want & !4 == 0 && over(crate::caps::CAP_DAC_READ_SEARCH)
     }
 
     /// Whether the caller may remove (or rename away, or replace) `name`
@@ -3519,7 +3534,7 @@ impl<P: Platform> Kernel<P> {
         if d.st_mode & 0o1000 == 0
             || c.fsuid == f.st_uid
             || c.fsuid == d.st_uid
-            || c.has(crate::caps::CAP_FOWNER)
+            || c.has_over(crate::caps::CAP_FOWNER, f.st_uid, f.st_gid)
         {
             Ok(())
         } else {
@@ -3568,7 +3583,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EACCES);
         }
         let perm = crate::modes::perm_of(&st);
-        if !self.passes_dac(2) {
+        if !self.passes_dac(&st, 2) {
             if !self.permits(&st, 2 | 1) {
                 return err(errno::EACCES);
             }
@@ -3755,14 +3770,14 @@ impl<P: Platform> Kernel<P> {
     /// file's group, without `CAP_FSETID`, cannot make it set-group-ID.
     pub(crate) fn chmod_to(&self, st: &libc::stat, mode: u32) -> Result<u32, i32> {
         let c = &self.creds;
-        if c.fsuid != st.st_uid && !c.has(crate::caps::CAP_FOWNER) {
+        if c.fsuid != st.st_uid && !c.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid) {
             return Err(errno::EPERM);
         }
         let mut perm = mode & 0o7777;
         if perm & 0o2000 != 0
             && st.st_gid != c.fsgid
             && !c.groups().contains(&st.st_gid)
-            && !c.has(crate::caps::CAP_FSETID)
+            && !c.has_over(crate::caps::CAP_FSETID, st.st_uid, st.st_gid)
         {
             perm &= !0o2000;
         }
@@ -3793,7 +3808,7 @@ impl<P: Platform> Kernel<P> {
         let (new_uid, new_gid) = (to(uid, false)?, to(gid, true)?);
         let c = &self.creds;
         let owns = c.fsuid == st.st_uid;
-        let cap = c.has(crate::caps::CAP_CHOWN);
+        let cap = c.has_over(crate::caps::CAP_CHOWN, st.st_uid, st.st_gid);
         if new_uid.is_some_and(|u| !(owns && u == st.st_uid) && !cap)
             || new_gid.is_some_and(|g| {
                 !(owns && (g == st.st_gid || g == c.fsgid || c.groups().contains(&g))) && !cap

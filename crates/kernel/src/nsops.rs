@@ -126,7 +126,12 @@ impl<P: Platform> Kernel<P> {
         if new_user && crate::thread::live_threads() > 1 {
             return err(errno::EINVAL);
         }
-        if !new_user && !self.creds.has_admin() {
+        if new_user && let Err(e) = crate::userns::may_make(self.fs().proc_root() != b"/") {
+            return err(e);
+        }
+        // The others need CAP_SYS_ADMIN in the caller's user namespace
+        // (which a new one gives it), and are owned by that namespace.
+        if !new_user && !self.creds.has_own(crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         // With other threads, the namespaces become the caller's own.
@@ -244,7 +249,9 @@ impl<P: Platform> Kernel<P> {
 
     /// `sethostname(name, len)`, or `setdomainname` when `!host`.
     pub(crate) fn sys_setname(&mut self, name: u64, len: u64, host: bool) -> i64 {
-        if !self.creds.has_admin() {
+        // CAP_SYS_ADMIN over the UTS namespace: in the user namespace that
+        // owns it.
+        if !self.creds.has_in(&self.fs().ns.owner(CLONE_NEWUTS), crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         if len > 64 {
@@ -300,7 +307,7 @@ impl<P: Platform> Kernel<P> {
         if nproc != fwe_abi::resource::RLIM_INFINITY
             && self.creds.uid != 0
             && !self.creds.has(crate::caps::CAP_SYS_RESOURCE)
-            && !self.creds.has_admin()
+            && !self.creds.has(crate::caps::CAP_SYS_ADMIN)
             && crate::cgroupfs::user_tasks(self.creds.uid) >= nproc
         {
             return Err(errno::EAGAIN);
@@ -312,7 +319,10 @@ impl<P: Platform> Kernel<P> {
         }
         let new = flags & SUPPORTED;
         let new_user = new & CLONE_NEWUSER != 0;
-        if new != 0 && !new_user && !self.creds.has_admin() {
+        if new_user {
+            crate::userns::may_make(self.fs().proc_root() != b"/")?;
+        }
+        if new != 0 && !new_user && !self.creds.has_own(crate::caps::CAP_SYS_ADMIN) {
             return Err(errno::EPERM);
         }
         // Taken while this process's own pid namespaces are current.
@@ -356,8 +366,17 @@ impl<P: Platform> Kernel<P> {
             std::sync::atomic::Ordering::SeqCst,
         );
         let euid = self.creds.euid;
-        // `CAP_CHECKPOINT_RESTORE` (the last) or `CAP_SYS_ADMIN`, for `set_tid`.
-        let restorer = self.creds.has(crate::caps::CAP_LAST_CAP) || self.creds.has_admin();
+        // `CAP_CHECKPOINT_RESTORE` (the last) or `CAP_SYS_ADMIN`, for
+        // `set_tid`, in the user namespace owning the pid namespace the
+        // number is chosen in.
+        let pid_owner = self
+            .fs()
+            .ns
+            .pid_children
+            .as_ref()
+            .map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()));
+        let restorer = self.creds.has_in(&pid_owner, crate::caps::CAP_LAST_CAP)
+            || self.creds.has_in(&pid_owner, crate::caps::CAP_SYS_ADMIN);
         let fs = self.fs_mut();
         let mut ns = fs.ns.clone();
         ns.unshare(new, euid)?;

@@ -504,7 +504,10 @@ impl<P: Platform> Kernel<P> {
         let (class, level) = (prio >> 13, prio & 7);
         let high = prio & 0x1ff8;
         match class {
-            CLASS_RT if !self.creds.has(crate::caps::CAP_SYS_NICE) && !self.creds.has_admin() => {
+            CLASS_RT
+                if !self.creds.has(crate::caps::CAP_SYS_NICE)
+                    && !self.creds.has(crate::caps::CAP_SYS_ADMIN) =>
+            {
                 return err(errno::EPERM);
             }
             CLASS_RT | CLASS_BE if high != 0 => return err(errno::EINVAL),

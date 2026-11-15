@@ -6535,6 +6535,23 @@ fn a_users_namespace_is_its_makers_to_join() {
     assert_eq!(containers("userns-join"), "its maker joins: ok\nanother user joins: EPERM\n");
 }
 
+/// Capabilities are namespaced: a user's own user namespace gives it every
+/// capability over what that namespace owns, and none over root's file,
+/// root's process, the host name, global sysctls or BPF; in its own mount
+/// namespace it mounts, but the mounts it was given keep their flags and
+/// stay attached.
+#[test]
+fn capabilities_in_a_user_namespace_cover_what_it_owns() {
+    assert_eq!(
+        containers("userns-scope"),
+        "unshare: ok euid 0\nroot's file: EACCES\nroot's process: EPERM\nhost name: EPERM\n\
+         owner of the host's UTS: EPERM\nglobal sysctl: EACCES\nbpf: EPERM\nmount: ok\n\
+         remount clearing nosuid: EPERM\n\
+         umount a given mount: EINVAL\nown UTS: ok host name: ok\n\
+         its owner is its user namespace: true\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.

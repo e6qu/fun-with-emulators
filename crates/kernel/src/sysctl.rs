@@ -581,16 +581,22 @@ pub fn is_dir(path: &[u8]) -> bool {
 
 /// Opening sysctl `path` to write, by a caller with `creds`: the mark the
 /// descriptor carries, or the error. A network one takes `CAP_NET_ADMIN`
-/// in a namespace of fwe's (the initial one's are the host's); an IPC one,
-/// root's access to the file (`CAP_DAC_OVERRIDE`).
+/// in the user namespace owning the network namespace; an IPC one, root's
+/// access to the file (`CAP_DAC_OVERRIDE`) in the user namespace owning
+/// the IPC namespace; any other, root's access in the initial user
+/// namespace: a user namespace has no say over the whole system's.
 pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result<Mark, i32>> {
+    use crate::caps::{CAP_DAC_OVERRIDE, CAP_NET_ADMIN};
     let i = index(path)?;
     let allowed = match SYSCTLS[i].space {
-        Space::Net => creds.has(crate::caps::CAP_NET_ADMIN),
-        Space::Ipc | Space::Global => creds.has(crate::caps::CAP_DAC_OVERRIDE),
-        // `CAP_SYS_RESOURCE` (in the namespace, as Linux checks it).
-        Space::User => creds.has(crate::caps::CAP_SYS_RESOURCE),
+        Space::Net => creds.has_in(&crate::netns::owner(), CAP_NET_ADMIN),
+        Space::Ipc => creds.has_in(&crate::sysvipc::owner(), CAP_DAC_OVERRIDE),
+        Space::Global => creds.has(CAP_DAC_OVERRIDE),
+        // `CAP_SYS_RESOURCE` in the caller's own user namespace, whose
+        // limits these are, as Linux checks it.
+        Space::User => creds.has_own(crate::caps::CAP_SYS_RESOURCE),
     };
+
     Some(if allowed { Ok(Mark::Sysctl(i as u8)) } else { Err(errno::EACCES) })
 }
 

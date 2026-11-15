@@ -345,9 +345,11 @@ impl<P: Platform> Kernel<P> {
 
             // Sockets. The blocking calls (connect, accept, send*, recv*) are
             // handled lock-free in `blocking_syscall`; these set up or query.
-            nr::SOCKET if a[0] == crate::netlink::AF_NETLINK => {
-                crate::netlink::socket(a[1], a[2], self.creds.has(crate::caps::CAP_NET_ADMIN))
-            }
+            nr::SOCKET if a[0] == crate::netlink::AF_NETLINK => crate::netlink::socket(
+                a[1],
+                a[2],
+                self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_ADMIN),
+            ),
             // SAFETY: socket takes no pointers.
             nr::SOCKET => unsafe { crate::net::socket(a[0], a[1], a[2]) },
             // SAFETY: the sv pointer is validated by the host/impl.
@@ -356,8 +358,10 @@ impl<P: Platform> Kernel<P> {
                 crate::netlink::bind(a[0] as i32, a[1], a[2])
             }
             nr::BIND => {
-                let (may_low, umask) =
-                    (self.creds.has(crate::caps::CAP_NET_BIND_SERVICE), self.fs().umask());
+                let (may_low, umask) = (
+                    self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_BIND_SERVICE),
+                    self.fs().umask(),
+                );
                 crate::netns::as_socket(a[0] as i32, || {
                     // SAFETY: the sockaddr pointer is validated by the host/impl.
                     unsafe { crate::net::bind(a[0], a[1], a[2], may_low, umask) }
@@ -387,7 +391,7 @@ impl<P: Platform> Kernel<P> {
             }
             // SAFETY: the option buffer is validated by the host/impl.
             nr::SETSOCKOPT => unsafe {
-                let admin = self.creds.has(crate::caps::CAP_NET_ADMIN);
+                let admin = self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_ADMIN);
                 crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4], admin)
             },
             // SAFETY: the out buffers are validated by the host/impl.
@@ -667,7 +671,7 @@ impl<P: Platform> Kernel<P> {
             }
             nr::LANDLOCK_RESTRICT_SELF => {
                 let privileged = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-                    || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+                    || self.creds.has_own(crate::caps::CAP_SYS_ADMIN);
                 crate::landlock::restrict_self(a[0] as i32, a[1], privileged).unwrap_or_else(err)
             }
             nr::PROCESS_VM_READV => self.sys_process_vm(false, a),
@@ -732,7 +736,10 @@ impl<P: Platform> Kernel<P> {
             nr::CAPGET => self.sys_capget(a[0], a[1]),
             nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
             // `CAP_BPF` or `CAP_SYS_ADMIN`, as Linux's `bpf_capable`.
-            nr::BPF if !self.creds.has_admin() && !self.creds.has(crate::caps::CAP_BPF) => {
+            nr::BPF
+                if !self.creds.has(crate::caps::CAP_SYS_ADMIN)
+                    && !self.creds.has(crate::caps::CAP_BPF) =>
+            {
                 err(errno::EPERM)
             }
             nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
@@ -1866,7 +1873,10 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 SIOCSIFFLAGS => {
-                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                    if !self
+                        .creds
+                        .has_in(&crate::ns::owner_dir(net.dir()), crate::caps::CAP_NET_ADMIN)
+                    {
                         return err(errno::EPERM);
                     }
                     let flags = u16::from_ne_bytes(ifr[16..18].try_into().unwrap());
@@ -1888,7 +1898,10 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 SIOCSIFMTU => {
-                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                    if !self
+                        .creds
+                        .has_in(&crate::ns::owner_dir(net.dir()), crate::caps::CAP_NET_ADMIN)
+                    {
                         return err(errno::EPERM);
                     }
                     // At least an Ethernet frame's minimum (ETH_MIN_MTU).
@@ -2016,7 +2029,10 @@ impl<P: Platform> Kernel<P> {
         const CAD_OFF: u32 = 0;
         const STOPS: [u32; 6] =
             [0x0123_4567, 0xcdef_0123, 0x4321_fedc, 0xa1b2_c3d4, 0xd000_fce2, 0x4558_4543];
-        if !self.creds.has(crate::caps::CAP_SYS_BOOT) {
+        // CAP_SYS_BOOT over the pid namespace: in the user namespace that
+        // owns it.
+        let owner = self.fs().ns.owner(fwe_abi::clone::CLONE_NEWPID);
+        if !self.creds.has_in(&owner, crate::caps::CAP_SYS_BOOT) {
             return err(errno::EPERM);
         }
         if magic as u32 != MAGIC1 || !MAGIC2.contains(&(magic2 as u32)) {
@@ -2034,7 +2050,7 @@ impl<P: Platform> Kernel<P> {
     fn sys_seccomp(&mut self, op: u64, flags: u64, args: u64) -> i64 {
         use crate::seccomp::*;
         let allowed = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-            || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+            || self.creds.has_own(crate::caps::CAP_SYS_ADMIN);
         let r = match op {
             SET_MODE_STRICT if flags != 0 || args != 0 => Err(errno::EINVAL),
             SET_MODE_STRICT => set_strict(),
@@ -2207,10 +2223,11 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         if target != host::pid() {
-            // Another user's process, without CAP_SYS_NICE: refused.
+            // Another user's process, without CAP_SYS_NICE in its user
+            // namespace: refused.
             let owner = crate::procreg::ids(target);
-            if !self.creds.has(crate::caps::CAP_SYS_NICE)
-                && ![owner[0], owner[1]].contains(&self.creds.euid)
+            if ![owner[0], owner[1]].contains(&self.creds.euid)
+                && !self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_NICE)
             {
                 return err(errno::EPERM);
             }
@@ -2291,7 +2308,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `prlimit` of another process, host process `target`, for a caller of
-    /// its ids or with `CAP_SYS_RESOURCE`: its limit as its record has it
+    /// its ids or with `CAP_SYS_RESOURCE` in its user namespace (raising a
+    /// hard limit takes it in the initial one): its limit as its record has it
     /// (one left for it, else the one it published), and a new one left
     /// there ([`crate::procreg::push_limit`]), the target woken to take it
     /// up at once ([`crate::signote::limits_set`]).
@@ -2301,12 +2319,12 @@ impl<P: Platform> Kernel<P> {
         }
         // As Linux: another process's limits are the caller's to see and
         // set if its real, effective and saved ids are all the caller's
-        // real ones, or with CAP_SYS_RESOURCE.
+        // real ones, or with CAP_SYS_RESOURCE over it.
         let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
         let ids = crate::procreg::ids(target);
         let (uid, gid) = (self.creds.uid, self.creds.gid);
         if !(ids[..3].iter().all(|&u| u == uid) && ids[4..7].iter().all(|&g| g == gid))
-            && !privileged
+            && !self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_RESOURCE)
         {
             return err(errno::EPERM);
         }
@@ -2654,7 +2672,9 @@ impl<P: Platform> Kernel<P> {
         }
         // The file's owner's to change, and the immutable and append-only
         // flags only with `CAP_LINUX_IMMUTABLE`.
-        if file.owner(&st).0 != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
+        let (owner, group) = file.owner(&st);
+        if owner != self.creds.fsuid && !self.creds.has_over(crate::caps::CAP_FOWNER, owner, group)
+        {
             return Err(errno::EPERM);
         }
         let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
@@ -3338,7 +3358,11 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         let nice = nice.clamp(-20, 19);
+        // Lowering a nice value past the limit takes CAP_SYS_NICE in the
+        // initial user namespace; another user's process, in its own.
         let privileged = self.creds.has(crate::caps::CAP_SYS_NICE);
+        let over =
+            |h: i32| self.creds.has_in(&crate::procreg::user_ns(h), crate::caps::CAP_SYS_NICE);
         // `RLIMIT_NICE` bounds the least nice value as 20 less it.
         let floor =
             20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
@@ -3369,7 +3393,7 @@ impl<P: Platform> Kernel<P> {
                 let i = crate::procreg::ids(h);
                 [i[0], i[1]]
             };
-            let r = if !privileged && !ids.contains(&self.creds.euid) {
+            let r = if !ids.contains(&self.creds.euid) && !over(h) {
                 err(errno::EPERM)
             } else if nice < crate::procreg::nice(h) && !privileged && nice < floor {
                 err(errno::EACCES)

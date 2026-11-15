@@ -1125,6 +1125,14 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
 - **Namespace creation:** the parent makes a child's namespaces before the
   host `fork`, so the child inherits them (a VM fork child from its
   snapshot).
+- **Namespace owners:** a namespace's record names the user namespace
+  that owns it (a file `owner` in the record's directory; the mount
+  table's `owner` for a mount namespace), which `NS_GET_USERNS` reports
+  and every capability check over what the namespace holds asks
+  (`Creds::has_in`, `userns::capable_in`); `Creds::has` is the initial
+  namespace's, `Creds::has_over` a file's (its owner and group mapped in
+  the caller's namespace). A mount copied into a less privileged
+  namespace's table carries its locks (`Mount::locked`).
 - **Namespace descriptors** (`crates/kernel/src/nsfd.rs`): a descriptor
   names a namespace's record; it stats as nsfs shows it (the identity is
   the inode), refuses reads and writes, answers `NS_GET_*` (type, parent,
@@ -1148,7 +1156,8 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   all copies of the unmounted tree's; a mount under a shared mount cannot
   be moved (`EINVAL`). Peer groups span namespaces, numbered across them.
   A namespace copied into a user namespace other than the original's
-  owner (`unshare -Urm`) gets slaves of the original's shared mounts.
+  owner (`unshare -Urm`) gets slaves of the original's shared mounts, and
+  its mounts are locked there (flags, attachment).
 - **Mount flags:** under `nosuid` a program's set-ID bits and file
   capabilities grant nothing; `nodev` refuses device opens (`EACCES`);
   `noexec` refuses running a program or mapping a file executable
@@ -1510,7 +1519,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A port below 1024 bound on a loopback address of the initial namespace,
   when fwe is not root, is reached by its number only from fwe's
   processes: the host keeps it for root, so it is an ephemeral port there.
-- Capabilities are the process's, not qualified by user namespace.
+- A new `proc` or `sysfs` mount in a user namespace is not held to
+  Linux's rule that an unobscured one be mounted already
+  (`mnt_already_visible`), and a filesystem a user namespace mounts can
+  hold device nodes another made (Linux's `SB_I_NODEV`): `mknod` of a
+  device takes `CAP_MKNOD` in the initial namespace anyway.
 - A pid namespace's init killed from outside fwe after its parent ran
   another program ends its namespace only once that parent reaps it or a
   reaper sees it gone.
