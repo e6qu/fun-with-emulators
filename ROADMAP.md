@@ -315,10 +315,9 @@ so programs that probe for them fall back.
   network namespace has loopback only, and other protocols fail with
   `EAFNOSUPPORT` or `ENOPROTOOPT`. Addresses per namespace, bridges and
   container networks come after 1.0 (M8).
-- **`kcmp`:** macOS cannot tell whether two descriptors share an open file
-  description.
-- **Chosen pids** (`clone3`'s `set_tid`, `/proc/sys/kernel/ns_last_pid`):
-  pids are the host's, which macOS assigns.
+- **Chosen pids in the initial pid namespace** (`clone3`'s `set_tid`
+  there, `/proc/sys/kernel/ns_last_pid`): pids are the host's, which
+  macOS assigns; `set_tid` chooses them in fwe's own pid namespaces.
 - **`fanotify`:** its permission events would hold every process's file
   calls on another's answer; programs fall back to inotify.
 - **A shared descriptor table without shared memory** (`CLONE_FILES`
@@ -337,8 +336,8 @@ so programs that probe for them fall back.
   memory; `swapon` fails with `ENOSYS`, as on a kernel without swap.
 - **cgroup resource limits but `pids.max`** (memory, CPU, I/O): accepted,
   not enforced; the host shares its resources alike.
-- **The page cache's figures** (`/proc/meminfo`'s `Cached`,
-  `/proc/<pid>/io`): the host's cache does not report them per process.
+- **Per-process I/O counts** (`/proc/<pid>/io`'s `rchar`, `syscr` and
+  the like): the host counts only storage bytes per process.
 - **perf events:** `perf_event_open` fails with `ENOSYS`.
 - **userfaultfd:** a fault handed to another thread to resolve would have
   fwe block the faulting thread in its signal handler, natively and in the

@@ -1245,7 +1245,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   child's own copies while their readiness pipes are shared.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
-- `clone3` has no chosen tids (`ENOSYS`); `waitid` reports no `rusage`; a
+- `clone3` chooses no pid in the initial pid namespace (`EPERM`) nor a
+  thread's (`EINVAL`); `kcmp` takes two descriptors of the same file in
+  another process for one open file; `waitid` reports no `rusage`; a
   core file holds the dying thread's registers only, and a `core_pattern`
   piping to a program dumps none; a process ended by a signal the host
   lacks exits on the host with status 128 + the signal, which only a
