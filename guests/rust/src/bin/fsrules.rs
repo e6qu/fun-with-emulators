@@ -60,6 +60,7 @@ unsafe extern "C" {
     ) -> i32;
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn getpid() -> i32;
     fn truncate(p: *const c_char, len: i64) -> i32;
     fn utimensat(d: i32, p: *const c_char, t: *const [i64; 4], f: i32) -> i32;
     fn getxattr(p: *const c_char, n: *const c_char, v: *mut u8, s: usize) -> isize;
@@ -592,9 +593,35 @@ fn chattr_scenario() {
     println!("file_setattr on ro: {}", try_file_setattr(fd, "", AT_EMPTY_PATH));
 }
 
+/// `F_GETLK` names the holder of a lock by its pid in the caller's pid
+/// namespace.
+fn getlk_scenario() {
+    const F_GETLK: i32 = 5;
+    const CLONE_NEWPID: i32 = 0x2000_0000;
+    make("/tmp/k", 0o644);
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWPID) };
+    in_child(|| {
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { open(c("/tmp/k").as_ptr(), O_RDWR) };
+        lock(fd);
+        // SAFETY: a plain call.
+        let me = unsafe { getpid() };
+        in_child(|| {
+            // SAFETY: a NUL-terminated path.
+            let fd = unsafe { open(c("/tmp/k").as_ptr(), O_RDWR) };
+            let mut fl = Flock { l_type: 1, l_whence: 0, l_start: 0, l_len: 10, l_pid: 0 };
+            // SAFETY: a valid `struct flock`.
+            unsafe { fcntl(fd, F_GETLK, &mut fl) };
+            println!("holder {me}: type {} pid {}", fl.l_type, fl.l_pid);
+        });
+    });
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "getlk" => getlk_scenario(),
         "chattr" => chattr_scenario(),
         "locks" => locks_scenario(),
         "romounts" => read_only_mounts_scenario(),

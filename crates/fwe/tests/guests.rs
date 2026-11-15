@@ -7072,6 +7072,13 @@ fn inode_flags_change_as_files_do() {
     );
 }
 
+/// `F_GETLK` names a lock's holder by its pid in the caller's pid
+/// namespace, not the host's.
+#[test]
+fn getlk_reports_the_holder_in_the_callers_namespace() {
+    assert_eq!(fsrules("getlk"), "holder 1: type 1 pid 1\n");
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

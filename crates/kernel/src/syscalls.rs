@@ -1269,7 +1269,12 @@ impl<P: Platform> Kernel<P> {
                     }
                     // Nothing in the way: Linux changes only the type (the
                     // host makes the range absolute too).
-                    let found = host::flock_to_linux(&lock);
+                    let mut found = host::flock_to_linux(&lock);
+                    // The holder by its pid in the caller's namespace (0
+                    // where it is outside, as Linux reports one).
+                    if found.l_pid > 0 {
+                        found.l_pid = crate::pidns::guest_ret(i64::from(found.l_pid)) as i32;
+                    }
                     let answer = if found.l_type == fcntl::F_UNLCK {
                         fwe_abi::Flock { l_type: fcntl::F_UNLCK, ..asked }
                     } else {

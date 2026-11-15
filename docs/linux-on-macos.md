@@ -846,7 +846,7 @@ hidden name in the directory. Linux flags the host lacks (`O_DIRECT`,
 
 **`fcntl`**: `F_GETFL`/`F_SETFL` and `F_GETFD`/`F_SETFD` are translated;
 `F_DUPFD` below the guest's limit only. Record locks and `F_OFD_*` locks
-are translated to the host's (macOS's private `F_OFD_*` numbers). Owners
+are translated to the host's (macOS's private `F_OFD_*` numbers), a holder `F_GETLK` reports by its pid in the caller's pid namespace. Owners
 (`F_SETOWN_EX`), the `F_SETSIG` signal, leases, pipe sizes,
 `F_CREATED_QUERY` and seals (`F_ADD_SEALS`, `F_GET_SEALS`) are fwe's own.
 Any other command is `EINVAL`.
