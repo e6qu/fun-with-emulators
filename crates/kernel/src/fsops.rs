@@ -735,14 +735,17 @@ impl<P: Platform> Kernel<P> {
     /// An open only to read, of a file the host finds in one call from the
     /// root where the walk would find it ([`crate::fs::Fs::direct`]): a
     /// regular file or a directory with no mode or owner kept apart from
-    /// the host's, while no lease is taken anywhere. `None` for any other,
-    /// which takes the whole way ([`Self::sys_openat_bytes`]).
+    /// the host's, while no lease is taken anywhere and the process holds
+    /// no record lock (one this opens to look at and closes again would
+    /// lose it: [`crate::reclocks`]). `None` for any other, which takes the
+    /// whole way ([`Self::sys_openat_bytes`]).
     #[cfg(target_os = "macos")]
     fn open_direct(&mut self, dirfd: i32, path: &[u8], flags: u64) -> Option<i64> {
         use crate::procstore::{Count, count};
         // (A FIFO opened already, waiting for its other end, is its.)
         if !crate::fs::reads_only(flags)
             || crate::fs::fifo_preopened()
+            || crate::reclocks::held()
             || count(Count::Leases).load(std::sync::atomic::Ordering::SeqCst) != 0
         {
             return None;
@@ -2417,15 +2420,101 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
+    /// `truncate(path, len)`: Linux's checks in its order (a directory
+    /// `EISDIR`, another file not regular `EINVAL`, a read-only mount
+    /// `EROFS`, write permission `EACCES`, a running program `ETXTBSY`),
+    /// leases broken, an overlay's file copied up; then the host's
+    /// `truncate` of its path. The file is never opened: a close would
+    /// drop the caller's record locks on it ([`crate::reclocks`]).
     pub(crate) fn sys_truncate(&mut self, path: u64, len: u64) -> i64 {
-        let fd = self.sys_openat(fcntl::AT_FDCWD as u64, path, fcntl::O_WRONLY, 0);
+        if (len as i64) < 0 {
+            return err(errno::EINVAL);
+        }
+        let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
+        let at = fcntl::AT_FDCWD as u64;
+        match self.fs().synthetic(at as i32, &path) {
+            // A memfd's `/proc/self/fd` link: its seals hold.
+            Some(crate::procfs::Entry::Fd { fd, .. }) if crate::memfd::name(fd).is_some() => {
+                if let Err(e) = self.permitted_fd(fd, 2) {
+                    return err(e);
+                }
+                return self.sys_ftruncate(fd as u64, len);
+            }
+            Some(crate::procfs::Entry::Fd { .. }) | None => {}
+            // fwe's `/proc` and `/sys` files: as an open to write would.
+            Some(_) => return self.truncate_by_open(&path, len),
+        }
+        let r = match self.fs().resolve(at as i32, &path, true) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        if r.fstype == crate::mounts::FsType::Cgroup2 {
+            return self.truncate_by_open(&path, len);
+        }
+        let Some(st) = resolved_stat(&r) else { return err(errno::ENOENT) };
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => return err(errno::EISDIR),
+            libc::S_IFREG if !crate::devnodes::marked(&st) => {}
+            _ => return err(errno::EINVAL),
+        }
+        if let Err(e) = r.writable() {
+            return err(e);
+        }
+        if !self.permits(&st, 2) {
+            return err(errno::EACCES);
+        }
+        #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+        let dev = st.st_dev as u64;
+        if crate::textbusy::is_running(dev, st.st_ino) {
+            return err(errno::ETXTBSY);
+        }
+        if let Err(e) = crate::leases::break_for(dev, st.st_ino, true, false) {
+            return err(e);
+        }
+        let mut r = r;
+        if let Err(e) = r.prepare(crate::fs::Change::Modify) {
+            return err(e);
+        }
+        let Ok(name) = r.name_c() else { return err(errno::ENOENT) };
+        let dir = r.dir.as_raw_fd();
+        let cut = || {
+            crate::host::at_path(dir, &name, |p| {
+                // SAFETY: a NUL-terminated path, a regular file's.
+                ret(unsafe { libc::truncate(p.as_ptr(), len as libc::off_t) })
+            })
+            .unwrap_or_else(err)
+        };
+        match cut() {
+            // A mode that denies its owner writing, which fwe let through:
+            // kept apart, then again.
+            r if r == err(errno::EACCES) => {
+                match crate::host::at_path(dir, &name, crate::modes::own_path) {
+                    Ok(Ok(())) => cut(),
+                    _ => r,
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// `truncate` of a file of fwe's own (`/proc`, `/sys`, a cgroup's):
+    /// opened to write as `openat` opens it, cut, and closed as the guest's
+    /// `close` closes it.
+    fn truncate_by_open(&mut self, path: &[u8], len: u64) -> i64 {
+        let fd = self.open_with(fcntl::AT_FDCWD as u64, path.to_vec(), fcntl::O_WRONLY, 0);
         if fd < 0 {
             return fd;
         }
         let r = self.sys_ftruncate(fd as u64, len);
-        // SAFETY: closing the fd we just opened.
-        unsafe { libc::close(fd as i32) };
+        let _ = self.syscall(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
         r
+    }
+
+    /// Whether the caller may do `want` to the file open as `fd`, by its
+    /// guest metadata.
+    fn permitted_fd(&self, fd: i32, want: u32) -> Result<(), i32> {
+        let st = stat_fd(fd)?;
+        if self.permits(&st, want) { Ok(()) } else { Err(errno::EACCES) }
     }
 
     pub(crate) fn sys_ftruncate(&mut self, fd: u64, len: u64) -> i64 {
@@ -2715,21 +2804,12 @@ impl<P: Platform> Kernel<P> {
         let host_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         // SAFETY: `name` NUL-terminated; `dir` live; times valid or null.
         let r = unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, host_flags) };
+        #[cfg(target_os = "macos")]
         if r != 0 && host::last_errno() == libc::EPERM && touch {
-            // An append-only file's times set to now (see `set_times_fd`),
-            // through a descriptor that reads nothing.
-            let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
-            // SAFETY: as above.
-            let fd = unsafe {
-                libc::openat(dir.as_raw_fd(), name.as_ptr(), O_EVTONLY | libc::O_CLOEXEC | nofollow)
-            };
-            if fd >= 0 {
-                let r = set_times_fd(fd, times_ptr, true);
-                // SAFETY: the descriptor just opened.
-                unsafe { libc::close(fd) };
-                return r;
-            }
-            return err(errno::EPERM);
+            // An append-only file's times set to now (see `set_times_fd`), by
+            // its path ([`crate::reclocks`]).
+            return host::at_path(dir.as_raw_fd(), &name, |p| touch_append_only(p, times_ptr))
+                .unwrap_or_else(err);
         }
         ret(r)
     }
@@ -2747,9 +2827,6 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// `fd` (or an error), just opened on a file of fwe's `/proc` or `/sys`
-    /// at `path`: recorded as of that mount, so `fstatfs` reports `proc`
-    /// or `sysfs` as runtimes check, not what stands in for it on the host.
     /// Whether the file of fwe's `/proc` or `/sys` at `path` (from `dirfd`)
     /// is reached through a read-only mount.
     fn synthetic_read_only(&self, dirfd: i32, path: &[u8]) -> bool {
@@ -2758,6 +2835,9 @@ impl<P: Platform> Kernel<P> {
             .is_some_and(|a| self.fs().mount_of(&a).0.flags & crate::mounts::ms::RDONLY != 0)
     }
 
+    /// `fd` (or an error), just opened on a file of fwe's `/proc` or `/sys`
+    /// at `path`: recorded as of that mount, so `fstatfs` reports `proc`
+    /// or `sysfs` as runtimes check, not what stands in for it on the host.
     fn synthetic_fd(&self, fd: i64, dirfd: i32, path: &[u8]) -> i64 {
         if fd >= 0
             && let Some(absolute) = self.fs().absolute_path(dirfd, path)
@@ -4066,40 +4146,46 @@ fn drop_cached(fd: i32, offset: u64, len: u64, size: u64) {
         };
         (m != libc::MAP_FAILED).then_some(m)
     };
-    // A write-only descriptor cannot be mapped: the file through a
-    // read-only one of fwe's.
-    let mut own = -1;
-    let m = map(fd).or_else(|| {
-        let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
-        // SAFETY: a buffer of `PATH_MAX` bytes, as `F_GETPATH` needs.
-        if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        // SAFETY: the NUL-terminated path the host just gave.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        // Above the guest's descriptors, so it takes none of their numbers.
-        own = if fd < 0 { -1 } else { crate::fdtable::reserve(fd).unwrap_or(-1) };
-        if own < 0 { None } else { map(own) }
-    });
-    if let Some(m) = m {
+    match map(fd) {
         // SAFETY: the mapping made above, synced, invalidated and unmapped.
-        unsafe {
+        Some(m) => unsafe {
             libc::msync(m, span, libc::MS_SYNC | libc::MS_INVALIDATE);
             libc::munmap(m, span);
-        }
-    }
-    if own >= 0 {
-        // SAFETY: fwe's own descriptor, opened above.
-        unsafe { libc::close(own) };
+        },
+        // A write-only descriptor cannot be mapped, and fwe opens no other
+        // of the file ([`crate::reclocks`]): its changes are written back,
+        // its pages left.
+        // SAFETY: plain host call on the guest's descriptor.
+        None => unsafe {
+            libc::fsync(fd);
+        },
     }
 }
 
-/// macOS's `O_EVTONLY`: a descriptor of a file that reads nothing, which
-/// its permissions do not stand in the way of.
+/// [`set_times_fd`]'s touch of an append-only file, for the file at host
+/// path `path` (the name itself, not followed).
 #[cfg(target_os = "macos")]
-const O_EVTONLY: i32 = 0x8000;
-#[cfg(not(target_os = "macos"))]
-const O_EVTONLY: i32 = libc::O_PATH;
+fn touch_append_only(path: &std::ffi::CStr, times: *const libc::timespec) -> i64 {
+    let mut st = zeroed_stat();
+    // SAFETY: a NUL-terminated path and a valid out-parameter.
+    if unsafe { libc::lstat(path.as_ptr(), &mut st) } != 0 {
+        return err(errno::EPERM);
+    }
+    let fixed = libc::UF_IMMUTABLE | libc::SF_IMMUTABLE | libc::SF_APPEND;
+    if st.st_flags & libc::UF_APPEND == 0 || st.st_flags & fixed != 0 {
+        return err(errno::EPERM);
+    }
+    // SAFETY: plain host calls on a NUL-terminated path; the flags go back.
+    unsafe {
+        if libc::lchflags(path.as_ptr(), st.st_flags & !libc::UF_APPEND) != 0 {
+            return err(errno::EPERM);
+        }
+        let r = libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times, libc::AT_SYMLINK_NOFOLLOW);
+        let e = host::last_errno();
+        libc::lchflags(path.as_ptr(), st.st_flags);
+        if r == 0 { 0 } else { err(host::errno_to_linux(e)) }
+    }
+}
 
 /// Set the times of the file open as `fd` (`times` as `futimens` takes
 /// them). Linux lets an append-only file's times both be set to now

@@ -27,6 +27,7 @@ const SYS_STATX: i64 = 291;
 const SYS_NAME_TO_HANDLE_AT: i64 = 264;
 const SYS_OPEN_BY_HANDLE_AT: i64 = 265;
 const SYS_CAPSET: i64 = 91;
+const SYS_FILE_GETATTR: i64 = 468;
 
 unsafe extern "C" {
     fn open(p: *const c_char, f: i32, ...) -> i32;
@@ -57,6 +58,11 @@ unsafe extern "C" {
         d: *const c_char,
     ) -> i32;
     fn syscall(n: i64, ...) -> i64;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn truncate(p: *const c_char, len: i64) -> i32;
+    fn utimensat(d: i32, p: *const c_char, t: *const [i64; 4], f: i32) -> i32;
+    fn getxattr(p: *const c_char, n: *const c_char, v: *mut u8, s: usize) -> isize;
+    fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
     fn unshare(f: i32) -> i32;
     fn socket(d: i32, t: i32, p: i32) -> i32;
     #[link_name = "bind"]
@@ -420,9 +426,109 @@ fn read_only_mounts_scenario() {
     println!("sysctl W_OK: {}", faccessat2("/proc/sys/fs/protected_symlinks", W_OK, 0));
 }
 
+#[repr(C)]
+struct Flock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+/// A write lock of the first ten bytes of `fd`, set (`F_SETLK`).
+fn lock(fd: i32) -> i32 {
+    const F_SETLK: i32 = 6;
+    let fl = Flock { l_type: 1, l_whence: 0, l_start: 0, l_len: 10, l_pid: 0 };
+    // SAFETY: a valid `struct flock`.
+    unsafe { fcntl(fd, F_SETLK, &fl) }
+}
+
+/// Whether another process finds the first ten bytes of `p` locked.
+fn locked(p: &str) -> bool {
+    // SAFETY: plain fork; the child tries the lock and exits with what it
+    // found.
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { open(c(p).as_ptr(), O_RDWR) };
+        // SAFETY: ends the child.
+        unsafe { _exit(i32::from(lock(fd) != 0)) };
+    }
+    let mut st = 0;
+    // SAFETY: waits for the child just made.
+    unsafe { waitpid(pid, &mut st, 0) };
+    st != 0
+}
+
+/// fwe's own work on a file never drops the record locks the process
+/// holds on it, as a close of a descriptor of it would: `truncate`,
+/// `utimensat`, `stat`, `access`, `chmod`, `chown`, attributes, inode
+/// flags by path, `fadvise` of a write-only descriptor, another open to
+/// read; also for a file of another owner at a path longer than the
+/// host's limit.
+fn locks_scenario() {
+    const POSIX_FADV_DONTNEED: i32 = 4;
+    // A path past macOS's 1024 bytes.
+    let mut deep = String::from("/tmp");
+    for _ in 0..20 {
+        deep.push_str("/directory-with-a-name-of-many-bytes-to-make-a-long-path-of");
+        // SAFETY: a NUL-terminated path.
+        unsafe { mkdir(c(&deep).as_ptr(), 0o755) };
+    }
+    for p in ["/tmp/l".to_string(), format!("{deep}/l")] {
+        make(&p, 0o644);
+        // SAFETY: a NUL-terminated path.
+        unsafe { chown(c(&p).as_ptr(), 1000, 1000) };
+        // SAFETY: as above.
+        let fd = unsafe { open(c(&p).as_ptr(), O_RDWR) };
+        println!("lock: {}", res(lock(fd).into()));
+        let cp = c(&p);
+        let st = [0u8; 128];
+        let buf = [0u8; 8];
+        let attr = [0u8; 24];
+        let ops: [(&str, &dyn Fn() -> i64); 9] = [
+            // SAFETY: (each) a NUL-terminated path, valid buffers.
+            ("truncate", &|| unsafe { truncate(cp.as_ptr(), 20) }.into()),
+            ("utimensat", &|| {
+                unsafe { utimensat(AT_FDCWD, cp.as_ptr(), std::ptr::null(), 0) }.into()
+            }),
+            ("stat", &|| unsafe { stat(cp.as_ptr(), st.as_ptr().cast_mut()) }.into()),
+            ("access", &|| unsafe { access(cp.as_ptr(), R_OK) }.into()),
+            ("chmod", &|| unsafe { chmod(cp.as_ptr(), 0o640) }.into()),
+            ("chown", &|| unsafe { chown(cp.as_ptr(), 1001, 1001) }.into()),
+            ("getxattr", &|| {
+                unsafe {
+                    getxattr(cp.as_ptr(), c"user.x".as_ptr(), buf.as_ptr().cast_mut(), 8) as i64
+                }
+                .max(0)
+            }),
+            ("file_getattr", &|| unsafe {
+                syscall(SYS_FILE_GETATTR, AT_FDCWD, cp.as_ptr(), attr.as_ptr().cast_mut(), 24, 0)
+            }),
+            ("open", &|| unsafe { open(cp.as_ptr(), O_RDONLY) }.into()),
+        ];
+        let mut out = Vec::new();
+        for (name, op) in ops {
+            let r = op();
+            out.push(format!("{name} {} {}", res(r), if locked(&p) { "held" } else { "LOST" }));
+        }
+        // SAFETY: a NUL-terminated path; a descriptor kept open.
+        let w = unsafe { open(cp.as_ptr(), O_WRONLY) };
+        // SAFETY: plain call on the descriptor.
+        let r = unsafe { posix_fadvise(w, 0, 0, POSIX_FADV_DONTNEED) };
+        out.push(format!("fadvise {r} {}", if locked(&p) { "held" } else { "LOST" }));
+        // The guest's own close of one of them lets the locks go, as Linux's.
+        // SAFETY: a descriptor opened above.
+        unsafe { close(w) };
+        out.push(format!("close {}", if locked(&p) { "held" } else { "released" }));
+        println!("{}", out.join(", "));
+    }
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "locks" => locks_scenario(),
         "romounts" => read_only_mounts_scenario(),
         "handles" => handles_scenario(std::env::args().nth(2).unwrap().parse().unwrap()),
         "devnode" => devnode_scenario(),

@@ -250,6 +250,26 @@ pub fn set_nodump_fd(fd: i32, on: bool) -> Result<(), i32> {
     Ok(())
 }
 
+/// [`set_nodump_fd`] for the file at host path `path` (not followed).
+#[cfg(target_os = "macos")]
+pub fn set_nodump_path(path: &CStr, on: bool) -> Result<(), i32> {
+    let nofollow = libc::XATTR_NOFOLLOW;
+    // SAFETY: plain host calls on a NUL-terminated path with a valid buffer.
+    unsafe {
+        if on {
+            let one = [1u8].as_ptr().cast();
+            if libc::setxattr(path.as_ptr(), NODUMP_ATTR.as_ptr(), one, 1, 0, nofollow) != 0 {
+                return Err(last());
+            }
+        } else if libc::removexattr(path.as_ptr(), NODUMP_ATTR.as_ptr(), nofollow) != 0
+            && crate::host::last_errno() != libc::ENOATTR
+        {
+            return Err(last());
+        }
+    }
+    Ok(())
+}
+
 /// Whether the guest gave the file open as `fd` the no-dump flag, which
 /// keeps the host's flag when kept metadata goes.
 #[cfg(target_os = "macos")]
@@ -288,12 +308,7 @@ fn nodump_attr_path(path: &CStr) -> Option<()> {
 
 #[cfg(target_os = "macos")]
 fn nodump_attr_at(dir: i32, name: &CStr) -> Option<()> {
-    match path_of(dir, name) {
-        Some(p) => nodump_attr_path(&p),
-        None => {
-            open_at(dir, name).and_then(|f| nodump_attr_fd(std::os::fd::AsRawFd::as_raw_fd(&f)))
-        }
-    }
+    crate::host::at_path(dir, name, nodump_attr_path).ok().flatten()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -426,37 +441,13 @@ pub fn keep_at(dir: i32, name: &CStr, perm: u32) -> Result<(), i32> {
         return Err(last());
     }
     let kept = (host != perm & 0o7777).then_some(perm & 0o7777);
-    match path_of(dir, name) {
-        Some(path) => mark_path(&path, &st, kept),
-        // A path too long for the host: through a descriptor of the file.
-        None => {
-            let fd = open_at(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
-            mark_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), &st, kept)
-        }
-    }
+    crate::host::at_path(dir, name, |path| mark_path(path, &st, kept))?
 }
 
-/// A descriptor of `name` in directory `dir` (a symbolic link itself)
-/// that reads nothing, for its attributes, where its path is too long
-/// for the host to take.
-pub(crate) fn open_at(dir: i32, name: &CStr) -> Option<std::os::fd::OwnedFd> {
-    #[cfg(target_os = "macos")]
-    const HOW: i32 = 0x8000 | 0x20_0000; // O_EVTONLY | O_SYMLINK
-    #[cfg(not(target_os = "macos"))]
-    const HOW: i32 = libc::O_PATH | libc::O_NOFOLLOW;
-    // SAFETY: `name` NUL-terminated; `dir` live; the result is owned.
-    let fd = unsafe { libc::openat(dir, name.as_ptr(), HOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-    // SAFETY: a descriptor just opened, owned here.
-    (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
-}
-
-/// The kept mode of `name` in directory `dir`, by its path or, where that
-/// is too long for the host, a descriptor of it.
+/// The kept mode of `name` in directory `dir`, by its path
+/// ([`crate::host::at_path`]: never through a descriptor of it).
 fn read_at(dir: i32, name: &CStr) -> Option<u32> {
-    match path_of(dir, name) {
-        Some(p) => read_path(&p),
-        None => open_at(dir, name).and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
-    }
+    crate::host::at_path(dir, name, read_path).ok().flatten()
 }
 
 /// Whether a caller without the capabilities may do `want` (`R_OK`,
@@ -483,18 +474,6 @@ fn fstatat(dir: i32, name: &CStr) -> Result<libc::stat, i32> {
     // SAFETY: `name` NUL-terminated; `dir` live; a valid out-parameter.
     let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
     if r != 0 { Err(last()) } else { Ok(st) }
-}
-
-/// The host path of `name` in directory `dir`, if the host takes one so
-/// long (a longer one is reached through a descriptor instead).
-fn path_of(dir: i32, name: &CStr) -> Option<std::ffi::CString> {
-    let mut p = crate::fs::fd_path(dir)?;
-    p.push(b'/');
-    p.extend_from_slice(name.to_bytes());
-    if p.len() >= libc::PATH_MAX as usize {
-        return None;
-    }
-    std::ffi::CString::new(p).ok()
 }
 
 #[cfg(target_os = "macos")]

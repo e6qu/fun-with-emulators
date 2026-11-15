@@ -7049,6 +7049,17 @@ fn bind_mounts_keep_read_only() {
     );
 }
 
+/// fwe's own work on a guest's file (by its path, at a path past the host's
+/// length limit too) never drops the record locks the process holds on it,
+/// which macOS drops on any close of a descriptor of the file.
+#[test]
+fn record_locks_survive_fwes_own_work_on_the_file() {
+    let line = "truncate ok held, utimensat ok held, stat ok held, access ok held, \
+                chmod ok held, chown ok held, getxattr ok held, file_getattr ok held, \
+                open ok held, fadvise 0 held, close released\n";
+    assert_eq!(fsrules("locks"), format!("lock: ok\n{line}lock: ok\n{line}"));
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

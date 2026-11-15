@@ -69,18 +69,22 @@ pub fn node_at(dir: i32, name: &std::ffi::CStr) -> Option<Node> {
     #[cfg(target_os = "macos")]
     {
         let mut buf = [0u8; 12];
-        // SAFETY: a NUL-terminated name and a valid buffer.
-        let fd = unsafe {
-            libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: as above; the descriptor is closed after.
-        let n =
-            unsafe { libc::fgetxattr(fd, ATTR.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
-        // SAFETY: closing the descriptor just opened.
-        unsafe { libc::close(fd) };
+        // By its path, not a descriptor ([`crate::reclocks`]).
+        let n = crate::host::at_path(dir, name, |path| {
+            // SAFETY: a NUL-terminated path and a valid buffer; the node
+            // itself, not followed.
+            unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    ATTR.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                )
+            }
+        })
+        .ok()?;
         decode(&buf, n)
     }
     #[cfg(not(target_os = "macos"))]

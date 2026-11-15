@@ -622,17 +622,11 @@ impl Fs {
             }
         }
         let Ok(r) = self.resolve(fcntl::AT_FDCWD as i32, &p, true) else { return p };
-        let Ok(name) = r.name_c() else { return p };
-        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
-        let fd = unsafe {
-            libc::openat(r.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
-        };
-        if fd < 0 {
-            return p;
+        // Where its host path is, the file never opened ([`crate::reclocks`]).
+        match host_path_in(r.dir.as_raw_fd(), &r.name) {
+            Some(host) => self.host_to_guest(&host).unwrap_or(host),
+            None => p,
         }
-        // SAFETY: `fd` is a fresh owned descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        self.fd_target(fd.as_raw_fd())
     }
 
     /// Hold `fd` (fwe's, in the reserved range) as the running program's
@@ -2124,20 +2118,21 @@ pub(crate) fn guest_stat(fd: i32) -> Option<libc::stat> {
     Some(st)
 }
 
-/// [`guest_stat`] of `name` in directory `dir`, followed if it is a link.
+/// [`guest_stat`] of `name` in directory `dir` (a link itself), looked at
+/// without opening it ([`crate::reclocks`]).
 pub(crate) fn guest_stat_at(dir: i32, name: &std::ffi::CStr) -> Option<libc::stat> {
-    // SAFETY: a NUL-terminated name in a live directory; the descriptor is
-    // closed below.
-    let fd = unsafe {
-        libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)
-    };
-    if fd < 0 {
+    // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated name in a live directory; a valid
+    // out-parameter.
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return None;
     }
-    let st = guest_stat(fd);
-    // SAFETY: the descriptor opened above.
-    unsafe { libc::close(fd) };
-    st
+    let perm = crate::modes::guest_perm_at(dir, name, &st);
+    let owner = crate::owners::of_at(dir, name, &st);
+    crate::modes::apply(&mut st, perm);
+    crate::owners::apply(&mut st, owner);
+    Some(st)
 }
 
 /// The directory reached from `here` by the plain names `comp` and those
@@ -3148,6 +3143,7 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         // asks whether it is a FIFO first.
         #[cfg(target_os = "macos")]
         if reads_only(flags)
+            && !crate::reclocks::held()
             && let Some(mut d) = direct_in(&v, fcntl::AT_FDCWD as i32, &path)
         {
             let host = crate::host::open_flags_to_host(flags) & !libc::O_NOFOLLOW

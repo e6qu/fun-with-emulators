@@ -83,6 +83,7 @@ pub mod procvm;
 pub mod ptrace;
 pub mod pty;
 pub mod reaper;
+pub mod reclocks;
 pub mod rlimits;
 mod sched;
 #[cfg(not(target_os = "linux"))]
@@ -489,6 +490,7 @@ impl<P: Platform> Kernel<P> {
         ptrace::load_fork(d);
         landlock::load(d);
         acct::forked_child();
+        reclocks::forked_child();
         aio::forget_all();
         // A thread's own view the forking thread had is in the state.
         drop(threadfs::take_for_child());
@@ -1142,22 +1144,19 @@ fn take_exec_privs() -> ExecPrivs {
 /// only for the user namespace whose root it names.
 fn file_caps(dir: i32, name: &std::ffi::CStr) -> Option<caps::FileCaps> {
     let mut buf = [0u8; 24];
-    // SAFETY: a NUL-terminated name in a live directory; the descriptor is
-    // closed below; a buffer of its length.
-    let n = unsafe {
-        let fd =
-            libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK);
-        if fd < 0 {
-            return None;
-        }
-        let name = c"security.capability".as_ptr();
+    // By its path, not a descriptor ([`crate::reclocks`]).
+    let n = host::at_path(dir, name, |path| {
+        let attr = c"security.capability".as_ptr();
+        // SAFETY: a NUL-terminated path and attribute name, a buffer of its
+        // length.
         #[cfg(target_os = "macos")]
-        let n = libc::fgetxattr(fd, name, buf.as_mut_ptr().cast(), buf.len(), 0, 0);
+        let n = unsafe { libc::getxattr(path.as_ptr(), attr, buf.as_mut_ptr().cast(), 24, 0, 0) };
+        // SAFETY: as above.
         #[cfg(not(target_os = "macos"))]
-        let n = libc::fgetxattr(fd, name, buf.as_mut_ptr().cast(), buf.len());
-        libc::close(fd);
+        let n = unsafe { libc::getxattr(path.as_ptr(), attr, buf.as_mut_ptr().cast(), 24) };
         n
-    };
+    })
+    .ok()?;
     let (f, rootid) = caps::parse_file_caps(&buf[..usize::try_from(n).ok()?])?;
     match rootid {
         Some(r) if r != 0 && userns::to_ns(r, false) != 0 => None,

@@ -1876,6 +1876,54 @@ pub fn poll_revents_to_linux(host: i16, asked: i16) -> i16 {
     l & (asked | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
 }
 
+/// Run `call`, a host call that takes only a path (the attribute calls,
+/// `truncate`, `chflags`), on `name` in directory `dir`, without opening
+/// the file: macOS drops every record lock a process holds on a file when
+/// it closes any descriptor of it, so fwe never opens a guest's file for
+/// its own ends. `call` gets the file's full path, or where that is too
+/// long for the host, `name` itself from the thread's working directory
+/// set to `dir` for the call (`pthread_fchdir_np`). Linux hosts (the unit
+/// tests) reach it through `/proc/self/fd`.
+pub fn at_path<T>(
+    dir: i32,
+    name: &std::ffi::CStr,
+    call: impl FnOnce(&std::ffi::CStr) -> T,
+) -> Result<T, i32> {
+    let full = crate::fs::fd_path(dir).and_then(|mut p| {
+        p.push(b'/');
+        p.extend_from_slice(name.to_bytes());
+        (p.len() < libc::PATH_MAX as usize).then(|| std::ffi::CString::new(p).ok()).flatten()
+    });
+    if let Some(full) = full {
+        return Ok(call(&full));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+        }
+        // SAFETY: sets only this thread's working directory, to a live
+        // directory descriptor.
+        if unsafe { pthread_fchdir_np(dir) } != 0 {
+            return Err(errno_to_linux(last_errno()));
+        }
+        let r = call(name);
+        let e = last_errno();
+        // SAFETY: back to the process's working directory.
+        unsafe { pthread_fchdir_np(-1) };
+        // SAFETY: the call's errno, kept for its caller to read.
+        unsafe { *libc::__error() = e };
+        Ok(r)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut p = format!("/proc/self/fd/{dir}/").into_bytes();
+        p.extend_from_slice(name.to_bytes());
+        let p = std::ffi::CString::new(p).map_err(|_| le::EINVAL)?;
+        Ok(call(&p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1898,6 +1946,49 @@ mod tests {
             poll_revents_to_linux(libc::POLLOUT | libc::POLLHUP, libc::POLLIN),
             libc::POLLHUP
         );
+    }
+
+    /// A path call reaches a name in a directory, also where the whole path
+    /// is longer than the host takes, and the thread's working directory
+    /// is the process's again after.
+    #[test]
+    fn a_path_call_reaches_a_name_past_the_hosts_length() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let base = std::env::temp_dir().join(format!("fwe-at-path-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut dir: OwnedFd = std::fs::File::open(&base).unwrap().into();
+        // Made a name at a time: the whole path is past the host's limit.
+        let name = c"directory-with-a-name-of-many-bytes-to-make-a-long-path-of";
+        for _ in 0..20 {
+            // SAFETY: a NUL-terminated name in a live directory; the new
+            // descriptor is owned.
+            dir = unsafe {
+                libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755);
+                let fd = libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY);
+                assert!(fd >= 0);
+                OwnedFd::from_raw_fd(fd)
+            };
+        }
+        let dir = dir.as_raw_fd();
+        assert!(crate::fs::fd_path(dir).is_none_or(|p| p.len() >= 1024));
+        // SAFETY: a NUL-terminated name in a live directory.
+        let fd = unsafe { libc::openat(dir, c"f".as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
+        assert!(fd >= 0);
+        // SAFETY: the descriptor just opened.
+        unsafe { libc::close(fd) };
+        let cut = |p: &std::ffi::CStr| {
+            // SAFETY: a NUL-terminated path.
+            unsafe { libc::truncate(p.as_ptr(), 7) }
+        };
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(at_path(dir, c"f", cut), Ok(0));
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
+        // SAFETY: zeroed bytes are a valid `stat`; a NUL-terminated name.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::fstatat(dir, c"f".as_ptr(), &mut st, 0) }, 0);
+        assert_eq!(st.st_size, 7);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2054,6 +2145,37 @@ pub fn clone_at(src: i32, dst_dir: i32, dst: &std::ffi::CStr) -> Result<(), i32>
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (src, dst_dir, dst);
+        Err(le::EOPNOTSUPP)
+    }
+}
+
+/// [`clone_at`] of the regular file `src` in directory `src_dir` (not
+/// followed), never opened ([`crate::reclocks`]).
+pub fn clone_name_at(
+    src_dir: i32,
+    src: &std::ffi::CStr,
+    dst_dir: i32,
+    dst: &std::ffi::CStr,
+) -> Result<(), i32> {
+    #[cfg(target_os = "macos")]
+    {
+        /// `<sys/clonefile.h>`'s: a link itself, not what it leads to.
+        const CLONE_NOFOLLOW: u32 = 1;
+        // SAFETY: NUL-terminated names in the caller's directories.
+        let r = unsafe {
+            libc::clonefileat(src_dir, src.as_ptr(), dst_dir, dst.as_ptr(), CLONE_NOFOLLOW)
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        match last_errno() {
+            libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
+            e => Err(errno_to_linux(e)),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (src_dir, src, dst_dir, dst);
         Err(le::EOPNOTSUPP)
     }
 }

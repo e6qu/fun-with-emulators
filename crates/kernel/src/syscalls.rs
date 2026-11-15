@@ -56,7 +56,15 @@ pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
     };
     let Some(hcmd) = host::lock_cmd(cmd) else { return err(errno::EINVAL) };
     // SAFETY: `lock` is a valid host `struct flock`.
-    ret(unsafe { libc::fcntl(fd, hcmd, &lock) })
+    let r = ret(unsafe { libc::fcntl(fd, hcmd, &lock) });
+    // A process's lock, which any close of the file drops
+    // ([`crate::reclocks`]); an open file description's is not.
+    #[allow(clippy::unnecessary_cast)] // the field's width differs by host
+    let unlock = lock.l_type as i32 == libc::F_UNLCK as i32;
+    if r == 0 && matches!(cmd, fcntl::F_SETLK | fcntl::F_SETLKW) && !unlock {
+        crate::reclocks::taken();
+    }
+    r
 }
 
 pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> i64 {
@@ -2620,15 +2628,19 @@ impl<P: Platform> Kernel<P> {
     /// Set the inode flags `f` of the file open as `fd` (`ENOTTY` for one
     /// that has none).
     fn set_inode_flags(&mut self, fd: i32, f: u32) -> Result<(), i32> {
-        let st = file_kind_for_flags(fd)?;
+        self.set_flags_of(FlagFile::Fd(fd), f)
+    }
+
+    /// Set the inode flags `f` of `file` (`ENOTTY` for one that has none).
+    fn set_flags_of(&mut self, file: FlagFile<'_>, f: u32) -> Result<(), i32> {
+        let st = file.stat()?;
         let host = st.st_flags;
         if f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
             return Err(errno::EOPNOTSUPP);
         }
         // The file's owner's to change, and the immutable and append-only
         // flags only with `CAP_LINUX_IMMUTABLE`.
-        let owner = crate::owners::of_fd(fd, &st).0;
-        if owner != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
+        if file.owner(&st).0 != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
             return Err(errno::EPERM);
         }
         let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
@@ -2642,42 +2654,35 @@ impl<P: Platform> Kernel<P> {
         if (want_fixed ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
             return Err(errno::EPERM);
         }
-        let fail = || Err(host::errno_to_linux(host::last_errno()));
         // The guest's no-dump is recorded apart from the host's flag, which
         // also marks a kept mode or owner ([`crate::modes::set_nodump_fd`]).
         let nodump = f & FS_NODUMP_FL != 0;
-        if nodump != crate::modes::nodump_set_fd(fd) {
+        if nodump != file.nodump_set() {
             // The record is an attribute, which the host refuses to change
             // on a file it holds immutable or append-only: those are let go
             // of while it is written.
-            // SAFETY: plain host call on the guest's descriptor.
-            if host & fixed != 0 && unsafe { libc::fchflags(fd, host & !fixed) } != 0 {
-                return fail();
+            if host & fixed != 0 {
+                file.chflags(host & !fixed)?;
             }
-            let r = match crate::modes::set_nodump_fd(fd, nodump) {
+            let r = match file.set_nodump(nodump) {
                 // A mode that denies the owner writing attributes: kept
                 // apart first.
-                Err(errno::EACCES) => {
-                    crate::modes::own_fd(fd).and_then(|()| crate::modes::set_nodump_fd(fd, nodump))
-                }
+                Err(errno::EACCES) => file.own().and_then(|()| file.set_nodump(nodump)),
                 r => r,
             };
             if let Err(e) = r {
-                // SAFETY: as above, the flags as they were.
-                unsafe { libc::fchflags(fd, host) };
+                let _ = file.chflags(host);
                 return Err(e);
             }
         }
         // As the attribute step left them (a mode kept apart is marked).
-        let now = file_kind_for_flags(fd)?.st_flags;
-        let kept = crate::modes::kept_fd(fd) || crate::owners::kept_fd(fd);
+        let now = file.stat()?.st_flags;
         let mut want = now & !(fixed | libc::UF_NODUMP) | want_fixed;
-        if nodump || kept {
+        if nodump || file.kept() {
             want |= libc::UF_NODUMP;
         }
-        // SAFETY: plain host call on the guest's descriptor.
-        if want != now && unsafe { libc::fchflags(fd, want) } != 0 {
-            return fail();
+        if want != now {
+            file.chflags(want)?;
         }
         Ok(())
     }
@@ -2685,7 +2690,8 @@ impl<P: Platform> Kernel<P> {
     /// `file_getattr(dfd, path, attr, size, at_flags)` (`set` false) or
     /// `file_setattr`: a file's attributes as `struct file_attr` (24
     /// bytes), the inode flags as `fa_xflags`; what only XFS keeps
-    /// (extent sizes, projects) is `EOPNOTSUPP` to set.
+    /// (extent sizes, projects) is `EOPNOTSUPP` to set. A path's file is
+    /// reached by its path, never opened ([`crate::reclocks`]).
     fn sys_file_attr(&mut self, set: bool, a: [u64; 6]) -> i64 {
         const VER0: u64 = 24;
         let (dfd, path, attr, size, at) = (a[0] as i32, a[1], a[2], a[3], a[4]);
@@ -2732,37 +2738,24 @@ impl<P: Platform> Kernel<P> {
         } else {
             guest!(uaccess::read_cstr(path, uaccess::PATH_MAX))
         };
+        let resolved;
+        let cname;
         let file = if name.is_empty() && at & fcntl::AT_EMPTY_PATH != 0 {
-            // SAFETY: plain host call on a guest descriptor.
-            let fd = unsafe { libc::fcntl(dfd, libc::F_DUPFD_CLOEXEC, 0) };
-            if fd < 0 {
-                return err(errno::EBADF);
-            }
-            fd
+            FlagFile::Fd(dfd)
         } else {
             let follow = at & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-            let r = match self.fs().resolve(dfd, &name, follow) {
+            resolved = match self.fs().resolve(dfd, &name, follow) {
                 Ok(r) => r,
                 Err(e) => return err(e),
             };
-            if set && r.mount_flags & crate::mounts::ms::RDONLY != 0 {
+            if set && resolved.mount_flags & crate::mounts::ms::RDONLY != 0 {
                 return err(errno::EROFS);
             }
-            let Ok(c) = std::ffi::CString::new(r.name.clone()) else {
-                return err(errno::ENOENT);
+            cname = match resolved.name_c() {
+                Ok(c) => c,
+                Err(e) => return err(e),
             };
-            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-            // SAFETY: a NUL-terminated name in a directory descriptor.
-            let fd =
-                unsafe { libc::openat(std::os::fd::AsRawFd::as_raw_fd(&r.dir), c.as_ptr(), flags) };
-            if fd < 0 {
-                // A symbolic link has no attributes.
-                return err(match host::last_errno() {
-                    libc::ELOOP => errno::EOPNOTSUPP,
-                    e => host::errno_to_linux(e),
-                });
-            }
-            fd
+            FlagFile::At(std::os::fd::AsRawFd::as_raw_fd(&resolved.dir), &cname)
         };
         let r = (|| {
             if let Some(w) = wanted {
@@ -2779,9 +2772,9 @@ impl<P: Platform> Kernel<P> {
                         f |= fl;
                     }
                 }
-                return self.set_inode_flags(file, f).map(|()| 0);
+                return self.set_flags_of(file, f).map(|()| 0);
             }
-            let f = get_inode_flags(file)?;
+            let f = flags_of(file)?;
             let mut x = 0u64;
             for (fl, xf) in [(FS_IMMUTABLE_FL, 0x8), (FS_APPEND_FL, 0x10), (FS_NODUMP_FL, 0x80)] {
                 if f & fl != 0 {
@@ -2793,37 +2786,129 @@ impl<P: Platform> Kernel<P> {
             uaccess::write_from(attr, &out)?;
             Ok(0)
         })();
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(file) };
         match r {
             Ok(v) => v,
+            // A file of no flags (a symbolic link, a device).
             Err(errno::ENOTTY) => err(errno::EOPNOTSUPP),
             Err(e) => err(e),
         }
     }
 }
 
-/// The host status of `fd` if its file has inode flags (a regular file or
-/// directory), else `ENOTTY`.
+/// The file an inode-flags call acts on: open as a descriptor, or a name
+/// in a directory, reached by its path ([`crate::host::at_path`]).
 #[cfg(target_os = "macos")]
-fn file_kind_for_flags(fd: i32) -> Result<libc::stat, i32> {
-    // SAFETY: an all-zero `stat` is a valid out-parameter.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return Err(host::errno_to_linux(host::last_errno()));
+#[derive(Clone, Copy)]
+enum FlagFile<'a> {
+    Fd(i32),
+    At(i32, &'a std::ffi::CStr),
+}
+
+#[cfg(target_os = "macos")]
+impl FlagFile<'_> {
+    /// Its host status if it has inode flags (a regular file or a
+    /// directory), else `ENOTTY`.
+    fn stat(self) -> Result<libc::stat, i32> {
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; a NUL-terminated name in a live directory.
+        let r = unsafe {
+            match self {
+                FlagFile::Fd(fd) => libc::fstat(fd, &mut st),
+                FlagFile::At(dir, name) => {
+                    libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                }
+            }
+        };
+        if r != 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+            return Err(errno::ENOTTY);
+        }
+        Ok(st)
     }
-    let kind = st.st_mode & libc::S_IFMT;
-    if kind != libc::S_IFREG && kind != libc::S_IFDIR {
-        return Err(errno::ENOTTY);
+
+    /// Its guest owner (host status `st`).
+    fn owner(self, st: &libc::stat) -> (u32, u32) {
+        match self {
+            FlagFile::Fd(fd) => crate::owners::of_fd(fd, st),
+            FlagFile::At(dir, name) => crate::owners::of_at(dir, name, st),
+        }
     }
-    Ok(st)
+
+    /// Whether it has the guest's no-dump flag (host status `st`).
+    fn nodump(self, st: &libc::stat) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::nodump_fd(fd, st),
+            FlagFile::At(dir, name) => crate::modes::nodump_at(dir, name, st),
+        }
+    }
+
+    /// Whether the guest gave it the no-dump flag.
+    fn nodump_set(self) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::nodump_set_fd(fd),
+            FlagFile::At(dir, name) => {
+                host::at_path(dir, name, crate::modes::nodump_set_path).unwrap_or(false)
+            }
+        }
+    }
+
+    /// Record the guest's no-dump flag (`on`) or take it away.
+    fn set_nodump(self, on: bool) -> Result<(), i32> {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::set_nodump_fd(fd, on),
+            FlagFile::At(dir, name) => {
+                host::at_path(dir, name, |p| crate::modes::set_nodump_path(p, on))?
+            }
+        }
+    }
+
+    /// Keep its mode apart, as the host refused what fwe allowed.
+    fn own(self) -> Result<(), i32> {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::own_fd(fd),
+            FlagFile::At(dir, name) => host::at_path(dir, name, crate::modes::own_path)?,
+        }
+    }
+
+    /// Whether a mode or owner is kept for it.
+    fn kept(self) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::kept_fd(fd) || crate::owners::kept_fd(fd),
+            FlagFile::At(dir, name) => host::at_path(dir, name, |p| {
+                crate::modes::kept_path(p) || crate::owners::kept_path(p)
+            })
+            .unwrap_or(false),
+        }
+    }
+
+    /// Give it the host flags `flags`.
+    fn chflags(self, flags: u32) -> Result<(), i32> {
+        let r = match self {
+            // SAFETY: a plain host call on a descriptor.
+            FlagFile::Fd(fd) => unsafe { libc::fchflags(fd, flags) },
+            FlagFile::At(dir, name) => host::at_path(dir, name, |p| {
+                // SAFETY: a NUL-terminated path, the name itself.
+                unsafe { libc::lchflags(p.as_ptr(), flags) }
+            })?,
+        };
+        if r != 0 { Err(host::errno_to_linux(host::last_errno())) } else { Ok(()) }
+    }
 }
 
 /// The inode flags (`FS_IOC_GETFLAGS`) of the file open as `fd`.
 #[cfg(target_os = "macos")]
 fn get_inode_flags(fd: i32) -> Result<u32, i32> {
-    let st = file_kind_for_flags(fd)?;
+    flags_of(FlagFile::Fd(fd))
+}
+
+/// The inode flags of `file`.
+#[cfg(target_os = "macos")]
+fn flags_of(file: FlagFile<'_>) -> Result<u32, i32> {
+    let st = file.stat()?;
     let host = st.st_flags;
     let mut f = 0u32;
     if host & libc::UF_IMMUTABLE != 0 {
@@ -2832,7 +2917,7 @@ fn get_inode_flags(fd: i32) -> Result<u32, i32> {
     if host & libc::UF_APPEND != 0 {
         f |= FS_APPEND_FL;
     }
-    if crate::modes::nodump_fd(fd, &st) {
+    if file.nodump(&st) {
         f |= FS_NODUMP_FL;
     }
     Ok(f)
@@ -4554,7 +4639,7 @@ mod tests {
             assert_eq!(r, 0);
             v
         };
-        let owner = || crate::owners::of_fd(fd, &super::file_kind_for_flags(fd).unwrap());
+        let owner = || crate::owners::of_fd(fd, &super::FlagFile::Fd(fd).stat().unwrap());
         crate::owners::keep_fd(fd, (1000, 100)).unwrap();
         assert_eq!(flags(None), 0, "a kept owner is not no-dump");
         flags(Some(0));
@@ -4566,7 +4651,7 @@ mod tests {
         assert_eq!(flags(None), FS_NODUMP_FL, "the guest's no-dump stays");
         flags(Some(0));
         assert_eq!(flags(None), 0);
-        assert!(!crate::modes::marked(&super::file_kind_for_flags(fd).unwrap()));
+        assert!(!crate::modes::marked(&super::FlagFile::Fd(fd).stat().unwrap()));
         drop(f);
         let _ = std::fs::remove_file(&path);
     }

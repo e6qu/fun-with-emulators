@@ -51,12 +51,7 @@ pub fn kept_of_at(dir: i32, name: &CStr, st: &libc::stat) -> Option<(u32, u32)> 
     if !crate::modes::marked(st) {
         return None;
     }
-    crate::modes::owner_once(st, || match path_of(dir, name) {
-        Some(p) => read_path(&p),
-        // A path too long for the host: through a descriptor of the file.
-        None => crate::modes::open_at(dir, name)
-            .and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
-    })
+    crate::modes::owner_once(st, || crate::host::at_path(dir, name, read_path).ok().flatten())
 }
 
 /// [`of_fd`] for the file at host path `path` (not followed).
@@ -126,27 +121,14 @@ pub fn keep_at(dir: i32, name: &CStr, owner: (u32, u32)) -> Result<(), i32> {
         st = fstatat(dir, name)?;
     }
     let record = (owner != host_owner(&st)).then_some(owner);
-    match path_of(dir, name) {
-        Some(path) => match mark_path(&path, &st, record) {
-            // As [`keep_fd`]'s.
-            Err(fwe_abi::errno::EACCES) if record.is_some() => {
-                crate::modes::own_path(&path)?;
-                mark_path(&path, &fstatat(dir, name)?, record)
-            }
-            r => r,
-        },
-        None => {
-            let fd = crate::modes::open_at(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&fd);
-            match mark_fd(fd, &st, record) {
-                Err(fwe_abi::errno::EACCES) if record.is_some() => {
-                    crate::modes::own_fd(fd)?;
-                    mark_fd(fd, &fstat(fd)?, record)
-                }
-                r => r,
-            }
+    crate::host::at_path(dir, name, |path| match mark_path(path, &st, record) {
+        // As [`keep_fd`]'s.
+        Err(fwe_abi::errno::EACCES) if record.is_some() => {
+            crate::modes::own_path(path)?;
+            mark_path(path, &fstatat(dir, name)?, record)
         }
-    }
+        r => r,
+    })?
 }
 
 /// Whether the file open as `fd` has an owner kept.
@@ -176,18 +158,6 @@ fn fstatat(dir: i32, name: &CStr) -> Result<libc::stat, i32> {
     // SAFETY: `name` NUL-terminated; `dir` live; a valid out-parameter.
     let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
     if r != 0 { Err(last()) } else { Ok(st) }
-}
-
-/// The host path of `name` in directory `dir`, if the host takes one so
-/// long (a longer one is reached through a descriptor instead).
-fn path_of(dir: i32, name: &CStr) -> Option<std::ffi::CString> {
-    let mut p = crate::fs::fd_path(dir)?;
-    p.push(b'/');
-    p.extend_from_slice(name.to_bytes());
-    if p.len() >= libc::PATH_MAX as usize {
-        return None;
-    }
-    std::ffi::CString::new(p).ok()
 }
 
 #[cfg(target_os = "macos")]

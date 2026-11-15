@@ -285,6 +285,17 @@ pub fn origin_of(fd: i32) -> Option<(u64, u64)> {
     })
 }
 
+/// [`origin_of`] the file at host path `path` (not followed).
+pub fn origin_at(path: &CStr) -> Option<(u64, u64)> {
+    let v = crate::xattr::get(&crate::xattr::Target::Path(path), ORIGIN).ok()?;
+    (v.len() == 16).then(|| {
+        (
+            u64::from_le_bytes(v[..8].try_into().unwrap()),
+            u64::from_le_bytes(v[8..].try_into().unwrap()),
+        )
+    })
+}
+
 /// The path in the overlay `l` of what descriptor `fd` (open on a file of
 /// one of its layers) is: where it is now in its layer, which a rename
 /// moves it with.
@@ -621,8 +632,9 @@ fn copy_one(
             }
         }
         libc::S_IFREG => {
-            let src = open_at(src_dir, name, libc::O_RDONLY | libc::O_NOFOLLOW)?;
-            match crate::host::clone_at(src.as_raw_fd(), w, &tmp) {
+            // By name: a descriptor of the lower file, closed, would drop
+            // the record locks the caller holds on it ([`crate::reclocks`]).
+            match crate::host::clone_name_at(src_dir, name, w, &tmp) {
                 Ok(()) => {
                     // The clone has the attributes; the times are set again
                     // in case the host gave it its own.
@@ -634,7 +646,9 @@ fn copy_one(
                     // SAFETY: a valid times array; an open descriptor.
                     unsafe { libc::futimens(made.as_raw_fd(), times.as_ptr()) };
                 }
+                // Layers on two file systems: the bytes copied.
                 Err(errno::EOPNOTSUPP) => {
+                    let src = open_at(src_dir, name, libc::O_RDONLY | libc::O_NOFOLLOW)?;
                     let made = open_at(
                         w,
                         &tmp,

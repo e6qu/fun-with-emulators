@@ -394,22 +394,22 @@ fn overlay_ident(fd: i32, dev: u64) -> Option<(u64, u64)> {
 
 /// `s`, `name` in host directory `dir`, as seen through overlay `l`.
 fn through_overlay(mut s: Subject, dir: i32, name: &[u8], l: &crate::overlay::Layers) -> Subject {
-    use std::os::fd::{AsRawFd, FromRawFd};
     let dev = overlay_dev(l);
+    // By its path, never opened ([`crate::reclocks`]).
     let file = std::ffi::CString::new(name).ok().and_then(|c| {
-        // SAFETY: a live directory and a NUL-terminated name; the
-        // descriptor is owned below.
-        let fd = unsafe {
-            libc::openat(
-                dir,
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        // SAFETY: a fresh descriptor this owns.
-        (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+        crate::host::at_path(dir, &c, |p| {
+            let ino = crate::overlay::origin_at(p).map(|(_, i)| i).or_else(|| {
+                // SAFETY: zeroed bytes are a valid `stat`; `lstat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: a NUL-terminated path; a valid out-parameter.
+                (unsafe { libc::lstat(p.as_ptr(), &mut st) } == 0).then(|| identity(&st).1)
+            })?;
+            Some((dev, ino))
+        })
+        .ok()
+        .flatten()
     });
-    match file.and_then(|f| overlay_ident(f.as_raw_fd(), dev)) {
+    match file {
         Some((d, i)) => (s.dev, s.ino) = (d, i),
         None => s.dev = dev,
     }

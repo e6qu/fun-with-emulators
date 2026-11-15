@@ -756,8 +756,8 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `UF_NODUMP`; `stat` reports it. The guest's own no-dump flag
   (`chattr +d`) is recorded apart, in `org.fwe.nodump`, so the inode flags
   and `statx` report only it, and changing them keeps the mark. A write by a caller without
-  `CAP_FSETID` clears a file's set-ID bits, as on Linux. Where a path is
-  too long for the host, its attributes go through a descriptor. A
+  `CAP_FSETID` clears a file's set-ID bits, as on Linux. Attributes are read and
+  written by path, from the directory where the path is too long. A
   regular file `open` makes has its mode itself on the host where only
   the owner's read or write bits are denied (a repository's read-only
   objects, which are never written again); such a file, or one made by
@@ -809,7 +809,14 @@ keeping fwe's own descriptors apart and Linux's limits exact:
 - **fcntl:** status and descriptor flags, record locks and the
   open-file-description `F_OFD_*` forms (macOS's private numbers) are
   translated (`struct flock` and lock types differ); `flock` passes
-  through. Owner thread, `F_SETSIG`'s signal, `F_CREATED_QUERY` and pipe
+  through. macOS, as Linux, drops all of a process's record locks on a
+  file when the process closes any descriptor of it, so fwe never opens a
+  guest's file for its own ends (`crates/kernel/src/reclocks.rs`): its
+  attributes, flags, times, `truncate` and an overlay's copy-up go by
+  path (from the directory, `pthread_fchdir_np`, where the path is past
+  the host's 1024 bytes), and a process that has taken a record lock
+  opens to read the whole way, never one host call that opens to look.
+  Owner thread, `F_SETSIG`'s signal, `F_CREATED_QUERY` and pipe
   sizes (`F_SETPIPE_SZ`, `fs.pipe-max-size`) are kept by fwe
   (`crates/kernel/src/fdstate.rs`) and checked as Linux checks them. A
   host `SIGIO` for a descriptor with a chosen signal arrives as that
@@ -1391,6 +1398,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A root on a case-insensitive volume (macOS's default) holds one file
   for names that differ only in case; `fwe --pull` keeps the first and
   lists the others.
+- A process's record locks on a file are dropped, as macOS drops them on
+  any close of the file, where fwe reads it through a descriptor of its
+  own: the program `execve` runs, a file mapping grown by `mremap` or
+  `remap_file_pages`, and a loop device's backing file at each of its
+  reads and writes.
 - What fwe keeps of an open file for `fcntl` (owner thread, `F_SETSIG`'s
   signal) is per descriptor, so a duplicate's changes do not show in the
   original.
@@ -1457,7 +1469,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `redirect_dir=off`); a rename leaving a whiteout, and a `bind` over one,
   are two host steps another process can see between; a lower file that
   another was renamed over, changed through a descriptor of it, fails with
-  `ESTALE`, and one moved onto its copy-up loses its record locks;
+  `ESTALE`, and one moved onto its copy-up (or copied up from another
+  file system) loses its record locks;
   descriptors of one overlay directory (`dup`, `fork`) each keep their own
   listing position.
 
