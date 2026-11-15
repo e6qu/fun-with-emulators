@@ -1037,6 +1037,32 @@ fn a_thread_after_another_ended_starts_afresh() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Run C guest `name` (built against glibc) under `fwe` with `args`, in a
+/// glibc root filesystem of its own, and check it exits 0 having printed
+/// `want`.
+fn c_guest_prints(name: &str, args: &[&str], want: &str) {
+    let prog = build_c_dynamic(name, Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, name);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).args(args);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), want, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A timerfd's absolute time is on its own clock, and a periodic timer
+/// first expires at its value.
+#[test]
+fn timerfd_keeps_its_clock_and_schedule() {
+    c_guest_prints(
+        "timerfd",
+        &[],
+        "clock 1: absolute time kept\nclock 7: absolute time kept\n\
+         clock 0: absolute time kept\nperiodic: first at its value\n",
+    );
+}
+
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
 /// crt objects, using the heap and buffered stdio from the shared libc. Covers
 /// the complete path — `ld-musl` self-relocation, `crt` `_start`,

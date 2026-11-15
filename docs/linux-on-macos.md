@@ -1095,9 +1095,15 @@ passed meanwhile are its overrun. The `*_ALARM` clocks need
 (`EOPNOTSUPP`). A CPU-time timer is checked at least every 10 ms.
 
 **`timerfd_settime`** (`crates/kernel/src/specialfd.rs`): kqueue timers are
-relative, so `TFD_TIMER_ABSTIME` is converted against `CLOCK_REALTIME`
-whatever the timerfd's clock. A periodic timer fires first after its
-interval, not after `it_value`. `TFD_TIMER_CANCEL_ON_SET` is accepted.
+relative, so fwe keeps each timer's schedule itself, on the host's
+monotonic clock: a `TFD_TIMER_ABSTIME` time is measured against the
+timerfd's own clock (`CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, `CLOCK_REALTIME`,
+the `_ALARM` ones) when it is set, one already past expiring at once with
+the intervals since counted; the first expiry is at `it_value`, then one
+every `it_interval`. The kqueue holds a one-shot timer for the next expiry
+not yet read, and a read returns how many fell due since the last read and
+arms the next. A `CLOCK_REALTIME` timer does not follow a later change of
+the host's clock, and `TFD_TIMER_CANCEL_ON_SET` is accepted.
 
 **`setitimer`**: the host refuses values over 100,000,000 s, so fwe gives
 it that maximum and keeps what was asked, for `getitimer` and the old
@@ -1915,7 +1921,7 @@ pipe, or both, so the guest can mix them in one `epoll`:
 |---|---|---|
 | `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR` (a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen), `EPOLLONESHOT` → `EV_ONESHOT`, `EPOLLEXCLUSIVE` → a count of a pipe's writes every fwe process shares, of which each woken set must take one to report it, data in `udata`; `epoll_event` is 16 bytes on arm64; returned events under [Network events](#network-events) |
 | `eventfd` | none | a pipe plus a 64-bit counter in a shared page, so a fork child shares it; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness |
-| `timerfd` | none | a kqueue with one `EVFILT_TIMER`, in nanoseconds and on time (`NOTE_CRITICAL`) |
+| `timerfd` | none | a kqueue with one one-shot `EVFILT_TIMER` for the next expiry, in nanoseconds and on time (`NOTE_CRITICAL`); the schedule is fwe's |
 | `signalfd` | none | a readiness pipe plus a queue of `signalfd_siginfo`; a pending signal the thread blocks and a signalfd watches moves onto it |
 | inotify | `kqueue` vnode events (no names), FSEvents (paths, after the fact); neither reports open, read or close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |
 | pidfd (`pidfd_open`, `CLONE_PIDFD`) | `kqueue`'s `EVFILT_PROC` | a kqueue watching the process's exit, never read, so it stays readable once the process has ended (a zombie, which the host will not report again, gets a user event); a `PIDFD_THREAD` one of another thread of the process gets the user event as the thread exits |

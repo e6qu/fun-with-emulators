@@ -956,8 +956,9 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   if it takes one; the others wait for the next write. An edge-triggered
   set sees such a pipe readable anew when written to.
 - **Fork:** of the epoll and timerfd kqueues a fork child rebuilds (see
-  [linux-on-macos.md](linux-on-macos.md#waiting-and-events)), a one-shot
-  timer that expired unread is readable in the child at once.
+  [linux-on-macos.md](linux-on-macos.md#waiting-and-events)), a timer
+  keeps its schedule, and one with an expiry due and unread is readable in
+  the child at once.
 - **signalfd** (`crates/kernel/src/signalfd.rs`): a call interrupted by a
   signal moved onto a signalfd runs again.
 - **inotify** (`crates/kernel/src/inotify.rs`):
@@ -1253,9 +1254,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   is not stopped, so a write it makes to guest memory then (a `read`
   completing) may or may not reach the child.
 - A fork child: an epoll or timerfd descriptor duplicated with `dup` is
-  gone (only the original number is rebuilt); a periodic timerfd restarts
-  its period and loses unread expirations; signalfd queues are the
-  child's own copies while their readiness pipes are shared.
+  gone (only the original number is rebuilt); a timerfd's expiries are
+  counted for parent and child apart; signalfd queues are the child's own
+  copies while their readiness pipes are shared.
 - A VM fork that fails after spawning its child can have that child reaped
   by another thread's `wait4(-1)`.
 - `clone3` chooses no pid in the initial pid namespace (`EPERM`) nor a
@@ -1497,9 +1498,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - `EPOLLEXCLUSIVE` wakes one waiter only for a pipe, and counts only the
   writes fwe's processes make with `write` and `writev`: a socket or a
   pipe another program writes to wakes every waiter.
-- `timerfd` measures `TFD_TIMER_ABSTIME` against the realtime clock
-  whatever its clock, and a periodic timer's first expiry is its
-  interval.
+- A `CLOCK_REALTIME` timerfd set for an absolute time does not follow a
+  later change of the host's clock, and `TFD_TIMER_CANCEL_ON_SET` never
+  cancels.
 - A `poll`, `select` or `epoll` timeout on an idle host ends a quarter to
   half a millisecond late (the host's timer wake), and on a loaded host
   any sleep, or the gap between two successive calls, can stretch to
