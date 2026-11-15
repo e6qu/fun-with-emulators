@@ -738,7 +738,9 @@ keeping fwe's own descriptors apart and Linux's limits exact:
 - `O_PATH` descriptors are marked and refused what Linux refuses
   (`EBADF`). An `O_PATH` open of a FIFO, a device or socket the host
   cannot open, or a symlink itself is a stand-in that names the file: its
-  `fstat`, `readlinkat`, `faccessat2`, `utimensat` and fdinfo are the
+  `fstat` (kept mode and owner too), `readlinkat`, `faccessat2`,
+  `utimensat`, `fchownat` and `fchmodat2` (`AT_EMPTY_PATH`),
+  `name_to_handle_at` and fdinfo are the
   file's, and its `/proc/self/fd` link reopens it. One of a link in fwe's
   `/proc` or `/sys` names that link.
 

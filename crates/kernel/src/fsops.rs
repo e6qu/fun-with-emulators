@@ -3626,8 +3626,14 @@ impl<P: Platform> Kernel<P> {
             Ok(m) => m,
             Err(e) => return err(e),
         };
-        // A mode that denies the owner is kept apart (see `modes`).
-        match crate::modes::keep_fd(fd, mode) {
+        // A mode that denies the owner is kept apart (see `modes`); an
+        // `O_PATH` stand-in's is its file's.
+        let kept = match stand_in_at(fd) {
+            Some(Ok((dir, name))) => crate::modes::keep_at(dir.as_raw_fd(), &name, mode),
+            Some(Err(e)) => Err(e),
+            None => crate::modes::keep_fd(fd, mode),
+        };
+        match kept {
             Ok(()) => 0,
             Err(e) => err(e),
         }
@@ -3648,15 +3654,20 @@ impl<P: Platform> Kernel<P> {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        if let Err(e) = crate::owners::keep_fd(fd, owner) {
-            return err(e);
+        // An `O_PATH` stand-in's owner is its file's (a link's own).
+        let kept = match stand_in_at(fd) {
+            Some(Ok((dir, name))) => crate::owners::keep_at(dir.as_raw_fd(), &name, owner)
+                .and_then(|()| {
+                    mode.map_or(Ok(()), |m| crate::modes::keep_at(dir.as_raw_fd(), &name, m))
+                }),
+            Some(Err(e)) => Err(e),
+            None => crate::owners::keep_fd(fd, owner)
+                .and_then(|()| mode.map_or(Ok(()), |m| crate::modes::keep_fd(fd, m))),
+        };
+        match kept {
+            Ok(()) => 0,
+            Err(e) => err(e),
         }
-        if let Some(m) = mode
-            && let Err(e) = crate::modes::keep_fd(fd, m)
-        {
-            return err(e);
-        }
-        0
     }
 
     /// The permission bits `chmod` to `mode` gives a file whose guest
@@ -4200,6 +4211,28 @@ fn drop_cached(fd: i32, offset: u64, len: u64, size: u64) {
             libc::fsync(fd);
         },
     }
+}
+
+/// For an `O_PATH` stand-in descriptor (`fd` is host `/dev/null`, see
+/// [`crate::fdmarks::stand_in`]): the directory and name of the file it
+/// names, for a change of that file; `None` for any other descriptor.
+fn stand_in_at(fd: i32) -> Option<Result<(std::os::fd::OwnedFd, CString), i32>> {
+    let host = crate::fdmarks::stand_in(fd)?;
+    let i = host.iter().rposition(|&b| b == b'/')?;
+    let dir = if i == 0 { b"/".to_vec() } else { host[..i].to_vec() };
+    Some((|| {
+        let name = CString::new(&host[i + 1..]).map_err(|_| errno::ENOENT)?;
+        let dir = CString::new(dir).map_err(|_| errno::ENOENT)?;
+        // SAFETY: a NUL-terminated path; the result is checked and owned.
+        let d = unsafe {
+            libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        if d < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        // SAFETY: a descriptor just opened, owned here.
+        Ok((unsafe { std::os::fd::FromRawFd::from_raw_fd(d) }, name))
+    })())
 }
 
 /// [`set_times_fd`]'s touch of an append-only file, for the file at host

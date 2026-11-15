@@ -61,6 +61,9 @@ unsafe extern "C" {
     fn syscall(n: i64, ...) -> i64;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn getpid() -> i32;
+    fn symlink(t: *const c_char, p: *const c_char) -> i32;
+    fn mkfifo(p: *const c_char, m: u32) -> i32;
+    fn lstat(p: *const c_char, st: *mut u8) -> i32;
     fn truncate(p: *const c_char, len: i64) -> i32;
     fn utimensat(d: i32, p: *const c_char, t: *const [i64; 4], f: i32) -> i32;
     fn getxattr(p: *const c_char, n: *const c_char, v: *mut u8, s: usize) -> isize;
@@ -618,9 +621,50 @@ fn getlk_scenario() {
     });
 }
 
+/// `fchownat` and `fchmodat2` with `AT_EMPTY_PATH` on an `O_PATH`
+/// descriptor of a link or a FIFO act on that link or FIFO.
+fn opath_scenario() {
+    const O_NOFOLLOW: i32 = 0o100000;
+    const SYS_FCHOWNAT: i64 = 54;
+    const SYS_FCHMODAT2: i64 = 452;
+    make("/tmp/target", 0o644);
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        symlink(c("/tmp/target").as_ptr(), c("/tmp/link").as_ptr());
+        mkfifo(c("/tmp/fifo").as_ptr(), 0o644);
+    }
+    let empty = c("");
+    for p in ["/tmp/link", "/tmp/fifo"] {
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { open(c(p).as_ptr(), O_PATH | O_NOFOLLOW) };
+        // SAFETY: an empty path with `AT_EMPTY_PATH`.
+        let (own, mode) = unsafe {
+            (
+                syscall(SYS_FCHOWNAT, fd, empty.as_ptr(), 1000, 1000, AT_EMPTY_PATH),
+                syscall(SYS_FCHMODAT2, fd, empty.as_ptr(), 0o600, AT_EMPTY_PATH),
+            )
+        };
+        let mut st = [0u64; 16];
+        // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+        unsafe { lstat(c(p).as_ptr(), st.as_mut_ptr().cast()) };
+        let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
+        println!(
+            "{p}: chown {} chmod {} -> {}:{} {:o}",
+            res(own),
+            res(mode),
+            word(6),
+            word(7),
+            word(4) & 0o7777
+        );
+    }
+    let (uid, _, _) = stat_of("/tmp/target");
+    println!("target: {uid}");
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "opath" => opath_scenario(),
         "getlk" => getlk_scenario(),
         "chattr" => chattr_scenario(),
         "locks" => locks_scenario(),

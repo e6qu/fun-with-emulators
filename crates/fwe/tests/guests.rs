@@ -7079,6 +7079,19 @@ fn getlk_reports_the_holder_in_the_callers_namespace() {
     assert_eq!(fsrules("getlk"), "holder 1: type 1 pid 1\n");
 }
 
+/// `fchownat` and `fchmodat2` with `AT_EMPTY_PATH` on an `O_PATH`
+/// descriptor of a link or a FIFO (which fwe stands in for) act on that
+/// link or FIFO: a link's own owner, never its target's; a link's mode is
+/// not to be changed (`EOPNOTSUPP`).
+#[test]
+fn o_path_descriptors_change_the_file_they_name() {
+    assert_eq!(
+        fsrules("opath"),
+        "/tmp/link: chown ok chmod EOPNOTSUPP -> 1000:1000 777\n\
+         /tmp/fifo: chown ok chmod ok -> 1000:1000 600\ntarget: 0\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).
