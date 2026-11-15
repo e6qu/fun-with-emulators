@@ -118,7 +118,7 @@ Linux code runs at native speed, what fwe adds is held to budgets
 ([PLAN.md](PLAN.md#principles)), and programs that need the VM run
 natively wherever fwe can make them fit the Mac.
 
-- [ ] **Benchmark budgets in CI:** the benchmark job fails when a figure
+- [x] **Benchmark budgets in CI:** the benchmark job fails when a figure
   exceeds its budget; the job summary shows each run's figures. Programs
   run under fwe as Alpine builds them, on realistic workloads (a Lua
   script, a Python script, an SQLite database on disk, a git repository's
