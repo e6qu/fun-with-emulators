@@ -1,5 +1,5 @@
 //! Small system calls with little state of their own: `getcpu`,
-//! `vhangup`, `readahead`, `sync_file_range`, `syslog`,
+//! `vhangup`, `readahead`, `sync_file_range`, `delete_module`, `syslog`,
 //! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, `kcmp`,
 //! `process_madvise`, and the LSM calls (`lsm_list_modules`,
 //! `lsm_get_self_attr`, `lsm_set_self_attr`), each checked as Linux checks
@@ -8,6 +8,9 @@
 use crate::{Kernel, Platform, guest, thread, uaccess};
 use fwe_abi::{err, errno, signal as sig};
 use std::sync::atomic::Ordering::SeqCst;
+
+/// The longest module name (`MODULE_NAME_LEN`).
+const MODULE_NAME_LEN: usize = 56;
 
 /// `kcmp`'s kinds of resource.
 const KCMP_FILE: u64 = 0;
@@ -78,10 +81,13 @@ const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 1;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
 const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 4;
 
-/// The security modules fwe has: Linux's capabilities, Landlock and Yama
-/// (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`, `LSM_ID_YAMA`), which keep no
+/// The security modules fwe has, in the order `/sys/kernel/security/lsm`
+/// names them: Linux's capabilities, Landlock and Yama, which keep no
 /// attributes of a process.
-const LSM_IDS: [u64; 3] = [100, 110, 111];
+const LSM_IDS: [u64; 3] = {
+    use fwe_abi::lsm::*;
+    [LSM_ID_CAPABILITY, LSM_ID_LANDLOCK, LSM_ID_YAMA]
+};
 
 /// `struct lsm_ctx`'s header: `id`, `flags`, `len` and `ctx_len`.
 const LSM_CTX_HEADER: u64 = 32;
@@ -348,6 +354,20 @@ impl<P: Platform> Kernel<P> {
             done += len;
         }
         done as i64
+    }
+
+    /// `delete_module(name, flags)`: no module is loaded, so any name is
+    /// not found (`ENOENT`), once `CAP_SYS_MODULE` is had and the name
+    /// read.
+    pub(crate) fn sys_delete_module(&mut self, name: u64) -> i64 {
+        if !self.creds.has(crate::caps::CAP_SYS_MODULE) {
+            return err(errno::EPERM);
+        }
+        let n = guest!(uaccess::read_cstr(name, MODULE_NAME_LEN + 1));
+        if n.len() >= MODULE_NAME_LEN {
+            return err(errno::ENOENT);
+        }
+        err(errno::ENOENT)
     }
 
     /// `syslog(type, buf, len)` (`klogctl`): the kernel log

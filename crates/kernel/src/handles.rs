@@ -209,7 +209,17 @@ impl<P: Platform> Kernel<P> {
         } else {
             self.fs().fd_ns_path(mfd).map(|ns| (fsid_of(mfd), ns))
         };
-        let Some((Some(fsid), anchor)) = anchor else { return err(errno::EBADF) };
+        // Any open descriptor names a mount; one fwe has no path for (the
+        // host's `/dev/null` as standard input) holds no file a handle
+        // names (`ESTALE`, once the handle is read).
+        // SAFETY: F_GETFD only queries the descriptor.
+        let open =
+            i64::from(mfd) == fcntl::AT_FDCWD || unsafe { libc::fcntl(mfd, libc::F_GETFD) } >= 0;
+        let (fsid, anchor) = match anchor {
+            Some((Some(fsid), anchor)) => (Some(fsid), anchor),
+            _ if open => (None, Vec::new()),
+            _ => return err(errno::EBADF),
+        };
         if !self.creds.has(crate::caps::CAP_DAC_READ_SEARCH) {
             return err(errno::EPERM);
         }
@@ -224,7 +234,7 @@ impl<P: Platform> Kernel<P> {
         let word = |at: usize| i32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
         let of = [word(0), word(4)];
         let ino = u64::from_ne_bytes(data[8..16].try_into().unwrap());
-        if of != fsid {
+        if fsid != Some(of) {
             return err(errno::ESTALE);
         }
         let Some(path) = self.handle_path(&anchor, of, ino) else { return err(errno::ESTALE) };
@@ -248,8 +258,13 @@ impl<P: Platform> Kernel<P> {
     /// that same file (no mount over it, under its root). `None` for a file
     /// the caller cannot reach so.
     fn handle_path(&self, anchor: &[u8], fsid: [i32; 2], ino: u64) -> Option<Vec<u8>> {
-        let host = std::fs::canonicalize(std::ffi::OsStr::from_bytes(&path_of(fsid, ino)?)).ok()?;
-        let host = host.as_os_str().as_bytes();
+        // Its directory's links followed, not the file's own (a handle may
+        // be of a link).
+        let host = path_of(fsid, ino)?;
+        let cut = host.iter().rposition(|&b| b == b'/')?;
+        let dir = std::fs::canonicalize(std::ffi::OsStr::from_bytes(&host[..cut.max(1)])).ok()?;
+        let host = crate::mounts::join(dir.as_os_str().as_bytes(), &host[cut + 1..]);
+        let host = &host[..];
         let table = self.fs().mounts();
         let (m, _) = table.locate(anchor);
         let dirs: Vec<Vec<u8>> = match &m.source {

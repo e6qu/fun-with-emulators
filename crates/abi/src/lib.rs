@@ -1052,6 +1052,13 @@ pub mod term {
 
 /// Resource limits (`asm-generic/resource.h`).
 /// `getpriority`/`setpriority`'s `which`.
+/// Linux security modules' ids (`include/uapi/linux/lsm.h`).
+pub mod lsm {
+    pub const LSM_ID_CAPABILITY: u64 = 100;
+    pub const LSM_ID_YAMA: u64 = 105;
+    pub const LSM_ID_LANDLOCK: u64 = 110;
+}
+
 pub mod prio {
     pub const PROCESS: u64 = 0;
     pub const PGRP: u64 = 1;
