@@ -687,6 +687,9 @@ mod imp {
 
     pub unsafe fn eventfd2(initval: u64, flags: u64) -> i64 {
         use fwe_abi::eventfd::*;
+        if flags & !(EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK) != 0 {
+            return err(errno::EINVAL);
+        }
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -1173,6 +1176,12 @@ mod tests {
         // Drained: EAGAIN again.
         assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
         assert_eq!(close_fd(fd), 0);
+    }
+
+    #[test]
+    fn eventfd_flags_are_checked() {
+        // SAFETY: no pointers.
+        assert_eq!(unsafe { eventfd2(0, 0o10) }, fwe_abi::err(fwe_abi::errno::EINVAL));
     }
 
     #[test]

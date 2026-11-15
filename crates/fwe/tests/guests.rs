@@ -1132,6 +1132,18 @@ fn interface_views_agree() {
     );
 }
 
+/// `pipe2` and `eventfd2` refuse flags Linux does not know (`EINVAL`), and
+/// a notification pipe as a kernel without the watch queue does
+/// (`ENOPKG`).
+#[test]
+fn pipe_and_eventfd_flags_are_checked() {
+    c_guest_prints(
+        "specialfds",
+        &["flags"],
+        "pipe2 -1 errno 22, notification pipe -1 errno 65, eventfd -1 errno 22\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]

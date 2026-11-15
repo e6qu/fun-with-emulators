@@ -3815,6 +3815,15 @@ fn rename(
 }
 
 fn make_pipe(fds: &mut [i32; 2], flags: u64) -> Result<(), i32> {
+    // Linux's flags (`O_NOTIFICATION_PIPE` is `O_EXCL`'s bit); a
+    // notification pipe needs the watch queue, which a kernel without one
+    // refuses with `ENOPKG`.
+    if flags & !(fcntl::O_CLOEXEC | fcntl::O_NONBLOCK | fcntl::O_DIRECT | fcntl::O_EXCL) != 0 {
+        return Err(errno::EINVAL);
+    }
+    if flags & fcntl::O_EXCL != 0 {
+        return Err(errno::ENOPKG);
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let mut host = 0;
@@ -4114,6 +4123,18 @@ mod tests {
     use fwe_abi::{Stat, nr};
     use std::ffi::CString;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `pipe2` takes Linux's flags only (`EINVAL` for others), and a
+    /// notification pipe, which needs the watch queue, is `ENOPKG`.
+    #[test]
+    fn pipe2_flags_are_checked() {
+        let mut fds = [0i32; 2];
+        assert_eq!(make_pipe(&mut fds, 0o1), Err(errno::EINVAL));
+        assert_eq!(make_pipe(&mut fds, fcntl::O_EXCL), Err(errno::ENOPKG));
+        assert_eq!(make_pipe(&mut fds, fcntl::O_CLOEXEC | fcntl::O_DIRECT), Ok(()));
+        // SAFETY: the pipe just made.
+        unsafe { (libc::close(fds[0]), libc::close(fds[1])) };
+    }
 
     struct NoPlatform;
     impl Platform for NoPlatform {
