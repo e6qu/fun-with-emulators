@@ -527,10 +527,7 @@ impl Fs {
     /// process fwe re-executed for a guest `execve`, before anything is
     /// looked up in them. A state with no view leaves the initial one.
     pub fn adopt_exec_view(&mut self, state: &[u8]) -> Result<(), String> {
-        let mut d = crate::snapshot::Dec::new(state);
-        if d.u64() != crate::EXEC_STATE_MAGIC {
-            return Err("the exec state is not fwe's".into());
-        }
+        let mut d = crate::exec_state_body(state)?;
         if !d.bool() {
             return Ok(());
         }

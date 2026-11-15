@@ -894,12 +894,7 @@ impl<P: Platform> Kernel<P> {
     /// Take the state [`Kernel::exec_state`] recorded in the process that
     /// exec'd this one. Fails, changing nothing, on a malformed record.
     pub fn restore_exec_state(&mut self, state: &[u8]) -> Result<(), String> {
-        let mut d = snapshot::Dec::new(state);
-        if d.u64() != EXEC_STATE_MAGIC {
-            return Err("the exec state is not fwe's".into());
-        }
-        // The stack limit, which the limits carry too.
-        d.u64();
+        let mut d = exec_state_body(state)?;
         // The view, which the filesystem took when it was opened.
         if d.bool() {
             fs::Fs::skip_view(&mut d);
@@ -1270,12 +1265,7 @@ impl AuxIds {
     /// ([`Fs::adopt_exec_view`]).
     pub fn at_start(state: Option<&[u8]>) -> Result<AuxIds, String> {
         let Some(state) = state else { return Ok(AuxIds::of(&creds::Creds::default(), false)) };
-        let mut d = snapshot::Dec::new(state);
-        if d.u64() != EXEC_STATE_MAGIC {
-            return Err("the exec state is not fwe's".into());
-        }
-        // The stack limit, then the view.
-        d.u64();
+        let mut d = exec_state_body(state)?;
         if d.bool() {
             fs::Fs::skip_view(&mut d);
         }
@@ -1308,6 +1298,18 @@ static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 pub fn exec_state_stack_limit(state: &[u8]) -> Option<u64> {
     let mut d = snapshot::Dec::new(state);
     (d.u64() == EXEC_STATE_MAGIC).then(|| d.u64())
+}
+
+/// An exec state record ([`Kernel::exec_state`]) past its header (the
+/// magic and the stack limit, [`exec_state_stack_limit`]): where every
+/// reader of the record starts.
+pub(crate) fn exec_state_body(state: &[u8]) -> Result<snapshot::Dec<'_>, String> {
+    let mut d = snapshot::Dec::new(state);
+    if d.u64() != EXEC_STATE_MAGIC {
+        return Err("the exec state is not fwe's".into());
+    }
+    d.u64();
+    Ok(d)
 }
 
 /// Leads an exec state record ([`Kernel::exec_state`]).

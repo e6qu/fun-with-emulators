@@ -1068,6 +1068,28 @@ fn c_guest_prints(name: &str, args: &[&str], want: &str) {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A process keeps its pid in its pid namespace across an `execve` made
+/// while other threads run, which runs a fresh fwe from the exec state.
+#[test]
+fn a_pid_namespace_holds_across_a_threaded_execve() {
+    let prog = build_c_dynamic("pidnsexec", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "pidnsexec");
+    // Inside the root, where `/proc/self/exe` leads back to it.
+    let inside = root.join("pidnsexec");
+    std::fs::copy(&prog, &inside).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&inside);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "before execve: pid 1\nafter execve: pid 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Descriptors received with `MSG_CMSG_CLOEXEC` are close-on-exec.
 #[test]
 fn received_descriptors_close_on_exec_when_asked() {
