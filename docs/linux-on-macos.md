@@ -1180,7 +1180,8 @@ a 64-bit `cmsg_len` and 8-byte alignment, macOS's a 32-bit one and 4-byte
 alignment, so fwe re-encodes the first `SCM_RIGHTS` message into a
 256-byte host buffer (up to 61 descriptors) and back. Other control
 messages, `SCM_CREDENTIALS` among them, are not sent. A receive whose
-control buffer is too small for the descriptors sets `MSG_CTRUNC`. A
+control buffer is too small for the descriptors sets `MSG_CTRUNC`;
+`MSG_CMSG_CLOEXEC` makes the received descriptors close-on-exec. A
 received `SOCK_SEQPACKET` socket is recognised by its buffer size and
 stays one.
 

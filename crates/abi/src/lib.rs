@@ -1253,6 +1253,15 @@ pub mod socket {
     pub const MSG_WAITFORONE: u64 = 0x10000;
     pub const MSG_NOSIGNAL: u64 = 0x4000;
     pub const MSG_MORE: u64 = 0x8000;
+    /// Received descriptors are close-on-exec.
+    pub const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+
+    // Control messages (`SOL_SOCKET` level): a `cmsghdr` is a 64-bit
+    // length, the level and the type, its data 8-aligned after it.
+    pub const SCM_RIGHTS: i32 = 1;
+    /// The most descriptors one message carries (`SCM_MAX_FD`).
+    pub const SCM_MAX_FD: usize = 253;
+    pub const CMSG_HDR: usize = 16;
 }
 
 /// `eventfd2` flags (`sys/eventfd.h`).

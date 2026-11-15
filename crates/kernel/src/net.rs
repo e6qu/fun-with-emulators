@@ -2330,6 +2330,7 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
                 hmsg.msg_controllen as usize,
                 control,
                 controllen as usize,
+                flags & MSG_CMSG_CLOEXEC != 0,
             ))
         } else {
             (0u64, false)
@@ -2386,13 +2387,15 @@ fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Result<us
 /// control buffer; returns `(linux_controllen, truncated)`.
 ///
 /// `host` holds `host_len` bytes; `dst` is the guest's buffer of `dst_cap`
-/// bytes.
+/// bytes. The descriptors are close-on-exec if `cloexec`
+/// (`MSG_CMSG_CLOEXEC`).
 #[cfg(not(target_os = "linux"))]
 fn scm_host_to_linux(
     host: &[u8; 256],
     host_len: usize,
     dst: u64,
     dst_cap: usize,
+    cloexec: bool,
 ) -> uaccess::Result<(u64, bool)> {
     let mut off = 0usize;
     while off + 12 <= host_len {
@@ -2418,8 +2421,13 @@ fn scm_host_to_linux(
             for i in 0..nfds {
                 let fd = &host[off + 12 + i * 4..off + 16 + i * 4];
                 out[16 + i * 4..20 + i * 4].copy_from_slice(fd);
+                let fd = i32::from_ne_bytes(fd.try_into().unwrap());
+                if cloexec {
+                    // SAFETY: plain host call on a descriptor just received.
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                }
                 // A SOCK_SEQPACKET socket of fwe's is one here too.
-                crate::seqpacket::adopt(i32::from_ne_bytes(fd.try_into().unwrap()));
+                crate::seqpacket::adopt(fd);
             }
             uaccess::write_from(dst, &out)?;
             return Ok((linux_len as u64, false));
@@ -2840,5 +2848,105 @@ mod tests {
             libc::close(sv[0]);
             libc::close(sv[1]);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod scm_tests {
+    use super::*;
+
+    /// A connected Unix socket pair of `ty`.
+    pub(crate) fn pair(ty: u64) -> [i32; 2] {
+        let mut sv = [0i32; 2];
+        // SAFETY: valid array.
+        assert_eq!(unsafe { socketpair(AF_UNIX, ty, 0, sv.as_mut_ptr() as u64) }, 0);
+        sv
+    }
+
+    /// Send one byte on `s` with `control` (Linux layout): the result.
+    pub(crate) fn send_control(s: i32, control: &[u8]) -> i64 {
+        let byte = *b"x";
+        let iov = libc::iovec { iov_base: byte.as_ptr() as *mut _, iov_len: 1 };
+        let mut mhdr = [0u64; 7];
+        mhdr[2] = &iov as *const _ as u64;
+        mhdr[3] = 1;
+        mhdr[4] = control.as_ptr() as u64;
+        mhdr[5] = control.len() as u64;
+        // SAFETY: a valid msghdr pointing at a valid iovec and control.
+        unsafe { sendmsg(s as u64, mhdr.as_ptr() as u64, 0) }
+    }
+
+    /// An `SCM_RIGHTS` message (Linux layout) of `fds`.
+    pub(crate) fn rights(fds: &[i32]) -> Vec<u8> {
+        let len = CMSG_HDR + 4 * fds.len();
+        let mut c = vec![0u8; (len + 7) & !7];
+        c[0..8].copy_from_slice(&(len as u64).to_ne_bytes());
+        c[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        c[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        for (i, fd) in fds.iter().enumerate() {
+            c[16 + 4 * i..20 + 4 * i].copy_from_slice(&fd.to_ne_bytes());
+        }
+        c
+    }
+
+    /// Receive one message on `s` into a control buffer of `cap` bytes:
+    /// the result, the control bytes written and the message flags.
+    pub(crate) fn recv_control(s: i32, cap: usize, flags: u64) -> (i64, Vec<u8>, i32) {
+        let mut byte = [0u8; 1];
+        let iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut _, iov_len: 1 };
+        let mut control = vec![0u8; cap];
+        let mut mhdr = [0u64; 7];
+        mhdr[2] = &iov as *const _ as u64;
+        mhdr[3] = 1;
+        mhdr[4] = control.as_mut_ptr() as u64;
+        mhdr[5] = cap as u64;
+        // SAFETY: a valid msghdr with a writable iovec and control.
+        let r = unsafe { recvmsg(s as u64, mhdr.as_mut_ptr() as u64, flags) };
+        control.truncate(mhdr[5] as usize);
+        (r, control, mhdr[6] as i32)
+    }
+
+    /// The descriptors of the `SCM_RIGHTS` messages in `control`.
+    pub(crate) fn fds_in(control: &[u8]) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + CMSG_HDR <= control.len() {
+            let len = u64::from_ne_bytes(control[at..at + 8].try_into().unwrap()) as usize;
+            let ty = i32::from_ne_bytes(control[at + 12..at + 16].try_into().unwrap());
+            if ty == SCM_RIGHTS {
+                for o in (at + CMSG_HDR..(at + len).min(control.len())).step_by(4) {
+                    out.push(i32::from_ne_bytes(control[o..o + 4].try_into().unwrap()));
+                }
+            }
+            at += (len.max(CMSG_HDR) + 7) & !7;
+        }
+        out
+    }
+
+    pub(crate) fn cloexec(fd: i32) -> bool {
+        // SAFETY: F_GETFD only queries.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    pub(crate) fn close_all(fds: &[i32]) {
+        for &fd in fds {
+            // SAFETY: descriptors of this test's.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn cmsg_cloexec_marks_received_descriptors() {
+        let sv = pair(SOCK_STREAM);
+        for (flags, want) in [(0, false), (MSG_CMSG_CLOEXEC, true)] {
+            assert_eq!(send_control(sv[0], &rights(&[0, 1])), 1);
+            let (r, control, _) = recv_control(sv[1], 64, flags);
+            assert_eq!(r, 1);
+            let fds = fds_in(&control);
+            assert_eq!(fds.len(), 2);
+            assert!(fds.iter().all(|&fd| cloexec(fd) == want), "flags {flags:#x}");
+            close_all(&fds);
+        }
+        close_all(&sv);
     }
 }

@@ -1051,6 +1051,12 @@ fn c_guest_prints(name: &str, args: &[&str], want: &str) {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// Descriptors received with `MSG_CMSG_CLOEXEC` are close-on-exec.
+#[test]
+fn received_descriptors_close_on_exec_when_asked() {
+    c_guest_prints("scmrights", &["cloexec"], "close-on-exec as asked\n");
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
