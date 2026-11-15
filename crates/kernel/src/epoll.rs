@@ -8,7 +8,9 @@
 //! `udata`. `EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`.
 //! The host's edge-triggered read filter on a pipe fires after a read too,
 //! which Linux's does not: the read end is reported only once it holds more
-//! than when last seen. A pipe with a capacity smaller than the host's
+//! than when last seen; an eventfd's (whose pipe holds one byte while its
+//! count is not 0) once written to, every write being an edge to Linux,
+//! whatever the count was. A pipe with a capacity smaller than the host's
 //! ([`crate::fdstate::pipe_full`]) is not writable while full, which the
 //! host does not know: its `EVFILT_WRITE` events are dropped then.
 //!
@@ -798,9 +800,10 @@ pub(crate) static WRITES: crate::kept::Kept<Vec<(i32, i32, u64)>> =
 /// edge-triggered read filter fires on reads too).
 #[cfg(not(target_os = "linux"))]
 fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
-    // A pipe whose writes are counted (one watched exclusively): written
-    // to since, whatever it holds now.
-    if let Some(w) = crate::exclusive::writes(fd) {
+    // A pipe whose writes are counted (one watched exclusively, or an
+    // eventfd's, each of whose writes is an edge to Linux even when the
+    // count was not 0): written to since, whatever it holds now.
+    if let Some(w) = crate::exclusive::writes(fd).or_else(|| crate::specialfd::eventfd_writes(fd)) {
         let mut seen = WRITES.lock();
         return match seen.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
             Some(k) => {
@@ -1179,6 +1182,45 @@ mod tests {
             // SAFETY: the descriptors made here.
             unsafe { libc::close(fd) };
         }
+    }
+
+    /// An eventfd watched edge-triggered raises a new edge on every write,
+    /// whether or not its count was 0, as Linux's wakes its waiters on
+    /// each; with nothing written, none.
+    #[test]
+    fn eventfd_edge_on_every_write() {
+        let _turn = turn();
+        // SAFETY: no pointers.
+        let efd = unsafe { crate::specialfd::eventfd2(0, fwe_abi::eventfd::EFD_NONBLOCK) } as i32;
+        assert!(efd >= 0);
+        let write = |v: u64| {
+            // SAFETY: 8 readable bytes; a Linux host's eventfd is its own.
+            unsafe {
+                crate::specialfd::try_write(efd, (&raw const v) as u64, 8)
+                    .unwrap_or_else(|| libc::write(efd, (&raw const v).cast(), 8) as i64)
+            }
+        };
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) };
+        let reg = event(EPOLLIN | EPOLLET, 9);
+        // SAFETY: a valid epoll_event.
+        let r = unsafe { ctl(ep as u64, EPOLL_CTL_ADD, efd as u64, &reg as *const _ as u64) };
+        assert_eq!(r, 0);
+        let mut got = [event(0, 0); 2];
+        let mut wait = |ms: u64| {
+            // SAFETY: room for 2 events.
+            unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, ms, 0, 0) }
+        };
+        assert_eq!(wait(0), 0);
+        for round in 0..3 {
+            assert_eq!(write(1), 8);
+            assert_eq!(wait(1000), 1, "write {round}");
+            assert_eq!(wait(0), 0, "after write {round}");
+        }
+        closed(ep as i32);
+        assert_eq!(crate::specialfd::try_close(efd).unwrap_or(0), 0);
+        // SAFETY: the descriptor made here.
+        unsafe { libc::close(ep as i32) };
     }
 
     /// A pipe whose read end becomes readable once data is written, observed

@@ -41,6 +41,20 @@ pub fn eventfd_writable(fd: i32) -> bool {
     }
 }
 
+/// How many writes emulated eventfd `fd` has had, if it is one: each is a
+/// new edge to an edge-triggered `epoll` watcher ([`crate::epoll`]).
+pub fn eventfd_writes(fd: i32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        imp::writes(fd)
+    }
+}
+
 /// Whether `fd` is a timerfd that does not block, if it is one.
 pub fn timer_nonblock(fd: i32) -> Option<bool> {
     #[cfg(target_os = "linux")]
@@ -325,12 +339,15 @@ mod imp {
 
     /// An eventfd's counter, in a file every process holding the eventfd
     /// maps (a fork child's mapping is its parent's), and the lock its
-    /// changes, with the pipe's, are made under.
+    /// changes, with the pipe's, are made under; and how many writes it
+    /// has had, each a new edge to an edge-triggered `epoll` watcher, as
+    /// each wakes Linux's waiters ([`writes`]).
     #[repr(C)]
     struct Shared {
         magic: std::sync::atomic::AtomicU64,
         lock: std::sync::atomic::AtomicU32,
         count: std::sync::atomic::AtomicU64,
+        writes: std::sync::atomic::AtomicU64,
     }
 
     const MAGIC: u64 = 0x6677_655f_6576_6664;
@@ -703,6 +720,19 @@ mod imp {
         t.arm(now_ns());
         with_reg(|m| m.insert(fd, Special::Timer(t)));
         true
+    }
+
+    /// How many writes eventfd `fd` (its pipe's read end) has had, if it
+    /// is one.
+    pub(super) fn writes(fd: i32) -> Option<u64> {
+        with_reg(|m| match m.get(&fd) {
+            // SAFETY: the eventfd's own mapped `Shared`, mapped while it
+            // is registered (the registry is held).
+            Some(Special::Event(e)) => Some(unsafe {
+                (*(e.shared as *const Shared)).writes.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+            _ => None,
+        })
     }
 
     pub(super) fn writable(fd: i32) -> bool {
@@ -1148,17 +1178,31 @@ mod imp {
             let Some(Special::Event(e)) = m.get_mut(&fd) else {
                 return err(errno::EBADF);
             };
-            let wfd = e.wfd;
-            locked(e.shared, |count| {
+            let (rfd, wfd, shared) = (e.rfd, e.wfd, e.shared);
+            locked(shared, |count| {
                 // The count stops at u64::MAX - 1.
                 if add > u64::MAX - 1 - *count {
                     return err(errno::EAGAIN);
                 }
                 let was_zero = *count == 0;
                 *count += add;
+                // SAFETY: the eventfd's own mapped `Shared`, mapped while
+                // it is registered (the registry is held).
+                let sh = unsafe { &*(shared as *const Shared) };
+                sh.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if was_zero && *count > 0 {
                     // SAFETY: the pipe holds at most one byte.
                     unsafe { poke(wfd) };
+                } else if *count > 0 {
+                    // Readable still, and a new edge to Linux's waiters:
+                    // a byte written fires the host's watchers, and one
+                    // read back leaves the pipe its one byte (the
+                    // counter's lock keeps readers out meanwhile).
+                    // SAFETY: the pipe holds one byte, so neither blocks.
+                    unsafe {
+                        poke(wfd);
+                        drain(rfd);
+                    }
                 }
                 8
             })
