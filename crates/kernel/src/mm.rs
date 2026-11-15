@@ -86,11 +86,8 @@ impl Ranges {
     /// Forget unmapped memory, `len` bytes at host address `host` and guest
     /// address `guest`, in every set.
     fn forget(&mut self, host: u64, guest: u64, len: u64) {
-        for set in
-            [&mut self.guest, &mut self.write_exec, &mut self.file_views, &mut self.wipe_on_fork]
-        {
-            remove_range(set, host, len);
-        }
+        self.forget_host(host, len);
+        remove_range(&mut self.wipe_on_fork, host, len);
         for set in [
             &mut self.grows_down,
             &mut self.poisoned,
@@ -99,6 +96,16 @@ impl Ranges {
             &mut self.guard,
         ] {
             remove_range(set, guest, len);
+        }
+    }
+}
+
+impl Ranges {
+    /// Forget host range `[host, host + len)` of a mapping just made that
+    /// failed (`mmap_call`), as its making added it.
+    fn forget_host(&mut self, host: u64, len: u64) {
+        for set in [&mut self.guest, &mut self.write_exec, &mut self.file_views] {
+            remove_range(set, host, len);
         }
     }
 }
@@ -156,6 +163,14 @@ fn remove_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
         return;
     }
     let end = addr.saturating_add(len);
+    // Most often the range is one of the set, whole (a mapping unmapped as
+    // it was made): no other overlaps it.
+    if let std::collections::btree_map::Entry::Occupied(o) = maps.entry(addr)
+        && *o.get() == end
+    {
+        o.remove();
+        return;
+    }
     // From the last range that overlaps down to the first: what is put
     // back of one is outside the range, and not taken again.
     while let Some((&s, &e)) = maps.range(..end).next_back().filter(|&(_, &e)| e > addr) {
@@ -1309,8 +1324,7 @@ impl<P: Platform> Kernel<P> {
         // fit `RLIMIT_MEMLOCK` with what is locked already (`EAGAIN`);
         // `MAP_LOCKED` with a limit of 0 is refused outright (`EPERM`).
         let map_locked = flags & mman::MAP_LOCKED != 0;
-        if (map_locked || crate::maps::record().locks_future())
-            && !self.creds.has(crate::caps::CAP_IPC_LOCK)
+        if (map_locked || crate::maps::locks_future()) && !self.creds.has(crate::caps::CAP_IPC_LOCK)
         {
             let soft = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
             if map_locked && soft == 0 {
@@ -1415,6 +1429,7 @@ impl<P: Platform> Kernel<P> {
     /// mapping (`mseal`), which most changes may not touch (`EPERM`).
     fn sealed(&self, addr: u64, len: u64) -> bool {
         addr & (self.page_size - 1) == 0
+            && crate::maps::may_be_sealed()
             && crate::maps::record().any_sealed(addr, addr.saturating_add(self.page_up(len)))
     }
 
@@ -1537,18 +1552,18 @@ impl<P: Platform> Kernel<P> {
         // Unmapping the middle of a mapping makes two of it: not past
         // `vm.max_map_count`.
         let end = addr.saturating_add(self.page_up(len));
-        let (splits, sealed) = {
+        let near_max = too_many_maps(1);
+        let maybe_sealed = addr & (self.page_size - 1) == 0 && crate::maps::may_be_sealed();
+        if near_max || maybe_sealed {
             let record = crate::maps::record();
             let splits =
                 record.span_at(addr).is_some_and(|(start, stop)| start < addr && stop > end);
-            let sealed = addr & (self.page_size - 1) == 0 && record.any_sealed(addr, end);
-            (splits, sealed)
-        };
-        if splits && too_many_maps(1) {
-            return err(errno::ENOMEM);
-        }
-        if sealed {
-            return err(errno::EPERM);
+            if near_max && splits {
+                return err(errno::ENOMEM);
+            }
+            if maybe_sealed && record.any_sealed(addr, end) {
+                return err(errno::EPERM);
+            }
         }
         let r = self.munmap_call(addr, len);
         if r == 0 {
@@ -2045,7 +2060,7 @@ impl<P: Platform> Kernel<P> {
             self.platform.unmap_guest(addr, self.page_up(len));
         }
         let mut retried = false;
-        let (p, guest) = 'map: loop {
+        let guest = 'map: loop {
             // SAFETY: guest-requested mapping. MAP_FIXED may replace guest memory,
             // which is the guest's own business, exactly as on Linux.
             let p = unsafe {
@@ -2087,11 +2102,16 @@ impl<P: Platform> Kernel<P> {
                 } else {
                     remove_range(&mut r.file_views, p, self.page_up(len));
                 }
+                if wants_write_exec(prot) {
+                    add_range(&mut r.write_exec, p, self.page_up(len));
+                } else {
+                    remove_range(&mut r.write_exec, p, self.page_up(len));
+                }
             }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
                 // SAFETY: unmapping the mapping just created.
                 self.unmap_host(p, len);
-                untrack(p, self.page_up(len));
+                lock_ranges().forget_host(p, self.page_up(len));
                 return err(e);
             }
             if exec {
@@ -2138,7 +2158,7 @@ impl<P: Platform> Kernel<P> {
                     {
                         // SAFETY: unmapping the mapping just created.
                         self.unmap_host(p, len);
-                        untrack(p, self.page_up(len));
+                        lock_ranges().forget_host(p, self.page_up(len));
                         // Where the guest left the place to fwe, and the host
                         // put the code with no room for its stubs within
                         // reach: once more, where there is.
@@ -2163,19 +2183,14 @@ impl<P: Platform> Kernel<P> {
                     let e = last_error();
                     // SAFETY: unmapping the mapping just created.
                     self.unmap_host(p, len);
-                    untrack(p, self.page_up(len));
+                    lock_ranges().forget_host(p, self.page_up(len));
                     return e;
                 }
                 // Pages whose writes are owed are not to run yet.
                 crate::lazycode::protected(p, self.page_up(len), final_prot(prot));
             }
-            break (p, guest);
+            break guest;
         };
-        if wants_write_exec(prot) {
-            add_range(&mut lock_ranges().write_exec, p, self.page_up(len));
-        } else {
-            remove_range(&mut lock_ranges().write_exec, p, self.page_up(len));
-        }
         guest as i64
     }
 

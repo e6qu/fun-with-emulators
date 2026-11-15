@@ -1643,6 +1643,13 @@ impl Fs {
     /// directories need no search permission checked. The caller asks the
     /// host not to follow any link on the way (`AT_SYMLINK_NOFOLLOW_ANY`),
     /// and walks after all when the host meets one.
+    /// Whether `path` (from `dirfd`) was found ahead in one host call
+    /// ([`direct_in`]): under no mount but the root's, so on no special
+    /// file system.
+    pub fn found_direct(&self, dirfd: i32, path: &[u8]) -> bool {
+        ahead::has_direct(&self.view(), dirfd, path)
+    }
+
     pub fn direct(&self, dirfd: i32, path: &[u8]) -> Option<Direct> {
         let v = self.view();
         ahead::take_direct(&v, dirfd, path).or_else(|| direct_in(&v, dirfd, path))
@@ -3163,6 +3170,22 @@ pub(crate) mod ahead {
             && a.generation == super::VIEW_GENERATION.load(std::sync::atomic::Ordering::Acquire)
             && std::sync::Arc::ptr_eq(&a.table, &v.ns.table()))
         .then_some(a.direct)
+    }
+
+    /// Whether a one-call lookup of this lookup was made ahead and holds
+    /// (left for [`take_direct`]).
+    pub(super) fn has_direct(v: &View, dirfd: i32, path: &[u8]) -> bool {
+        let placed = path.first() == Some(&b'/') || dirfd as i64 == fwe_abi::fcntl::AT_FDCWD;
+        placed
+            && DIRECT.with(|d| {
+                d.borrow().as_ref().is_some_and(|a| {
+                    a.path == path
+                        && a.direct.dir == v.root
+                        && a.generation
+                            == super::VIEW_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                        && std::sync::Arc::ptr_eq(&a.table, &v.ns.table())
+                })
+            })
     }
 
     pub(super) fn put(key: Key, r: Resolved) {

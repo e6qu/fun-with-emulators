@@ -22,7 +22,7 @@
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a mapping is named by in the listing.
@@ -592,7 +592,17 @@ static RECORD: Mutex<Record> = Mutex::new(Record::new());
 /// without the lock by every `mmap` ([`count`]).
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// The record, locked; its count is published as the lock is let go.
+/// Whether mappings made from now on are locked (`mlockall(MCL_FUTURE)`),
+/// as the record's lock was last let go: read without the lock by every
+/// `mmap` ([`locks_future`]).
+static LOCKS_FUTURE: AtomicBool = AtomicBool::new(false);
+
+/// Whether some memory was sealed, as the record's lock was last let go:
+/// until then no call looks for a seal ([`may_be_sealed`]).
+static ANY_SEALED: AtomicBool = AtomicBool::new(false);
+
+/// The record, locked; its count, whether it locks future mappings and
+/// whether any memory was sealed are published as the lock is let go.
 pub struct Held(MutexGuard<'static, Record>);
 
 impl std::ops::Deref for Held {
@@ -612,6 +622,8 @@ impl std::ops::DerefMut for Held {
 impl Drop for Held {
     fn drop(&mut self) {
         COUNT.store(self.0.count(), Relaxed);
+        LOCKS_FUTURE.store(self.0.lock_future, Relaxed);
+        ANY_SEALED.store(self.0.any_sealed, Relaxed);
     }
 }
 
@@ -625,6 +637,20 @@ pub fn record() -> Held {
 /// would with the lock.
 pub fn count() -> usize {
     COUNT.load(Relaxed)
+}
+
+/// Whether mappings made from now on are locked, without the record's
+/// lock: as of the last change, which a call racing with another thread's
+/// `mlockall` may miss as it would with the lock.
+pub fn locks_future() -> bool {
+    LOCKS_FUTURE.load(Relaxed)
+}
+
+/// Whether any memory may be sealed, without the record's lock: false
+/// until some was (a seal is made under the kernel lock, which every call
+/// that looks for one holds).
+pub fn may_be_sealed() -> bool {
+    ANY_SEALED.load(Relaxed)
 }
 
 /// Forget every mapping (the old program's, at `execve`).
