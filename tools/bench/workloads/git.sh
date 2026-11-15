@@ -13,6 +13,9 @@ cp "$1"/*.c "$1"/*.h src/
 # background (git's count of loose objects is an estimate), which would
 # race that one.
 "$git" config gc.auto 0
+# Nor the maintenance a commit can start after itself (git versions differ
+# in whether they do): both sides do the same work.
+"$git" config maintenance.auto false
 "$git" add -A
 "$git" commit -q -m initial
 i=0
