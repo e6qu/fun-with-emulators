@@ -45,6 +45,86 @@ pub enum Entry {
     Missing,
 }
 
+/// `hidepid=` of a `proc` mount: another's `/proc/<pid>` is open to all
+/// (`off`); its directory listed but nothing in it reached (`EPERM`) by
+/// one who may not trace it (`noaccess`); or not there at all to such a
+/// reader (`ENOENT`), whom `ptraceable` names as Linux's own check does
+/// and `invisible` likewise.
+pub const HIDEPID_OFF: u8 = 0;
+pub const HIDEPID_NO_ACCESS: u8 = 1;
+pub const HIDEPID_INVISIBLE: u8 = 2;
+pub const HIDEPID_NOT_PTRACEABLE: u8 = 4;
+
+/// The `hidepid=` value `v` names (a number or a name), if Linux takes it.
+pub fn hidepid(v: &[u8]) -> Option<u8> {
+    Some(match v {
+        b"0" | b"off" => HIDEPID_OFF,
+        b"1" | b"noaccess" => HIDEPID_NO_ACCESS,
+        b"2" | b"invisible" => HIDEPID_INVISIBLE,
+        b"4" | b"ptraceable" => HIDEPID_NOT_PTRACEABLE,
+        _ => return None,
+    })
+}
+
+/// What a `proc` mount's options hide: `hidepid=`, the group `gid=`
+/// exempts from it (an initial-namespace id), and `subset=pid` (only the
+/// processes' directories, `self` and `thread-self`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hiding {
+    pub hidepid: u8,
+    pub gid: Option<u32>,
+    pub pids_only: bool,
+}
+
+impl Hiding {
+    /// What options `options` (as the mount keeps them) hide.
+    pub fn of(options: &[u8]) -> Hiding {
+        let mut h = Hiding::default();
+        for o in options.split(|&b| b == b',') {
+            if let Some(v) = o.strip_prefix(b"hidepid=") {
+                h.hidepid = hidepid(v).unwrap_or(HIDEPID_OFF);
+            } else if let Some(v) = o.strip_prefix(b"gid=") {
+                h.gid = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok());
+            } else if let Some(v) = o.strip_prefix(b"subset=") {
+                h.pids_only = v == b"pid";
+            }
+        }
+        h
+    }
+
+    /// Whether it hides anything.
+    pub fn any(&self) -> bool {
+        self.hidepid != HIDEPID_OFF || self.pids_only
+    }
+
+    /// What it refuses of `fs_path` (a path in the mount, `/123/status`),
+    /// `traceable` telling whether the reader may trace the process a
+    /// number names (its own always): `ENOENT` for what it hides, `EPERM`
+    /// for what `noaccess` keeps out of; `None` for the rest.
+    pub fn refuses(&self, fs_path: &[u8], traceable: impl FnOnce(i32) -> bool) -> Option<i32> {
+        let rel = fs_path.strip_prefix(b"/").unwrap_or(fs_path);
+        let (first, rest) = match rel.iter().position(|&b| b == b'/') {
+            Some(i) => (&rel[..i], &rel[i + 1..]),
+            None => (rel, &b""[..]),
+        };
+        if first.is_empty() {
+            return None;
+        }
+        let pid = std::str::from_utf8(first).ok().and_then(|s| s.parse::<i32>().ok());
+        let Some(pid) = pid.filter(|_| first.iter().all(u8::is_ascii_digit)) else {
+            let own = matches!(first, b"self" | b"thread-self");
+            return (self.pids_only && !own).then_some(fwe_abi::errno::ENOENT);
+        };
+        if self.hidepid == HIDEPID_OFF || traceable(pid) {
+            return None;
+        }
+        if self.hidepid >= HIDEPID_INVISIBLE {
+            return Some(fwe_abi::errno::ENOENT);
+        }
+        (!rest.is_empty()).then_some(fwe_abi::errno::EPERM)
+    }
+}
+
 /// Linux `d_type` values used in directory listings.
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
@@ -841,5 +921,33 @@ mod tests {
         assert!(matches!(lookup(b"/proc/does/not/exist", &info), Some(Entry::Missing)));
         assert!(lookup(b"/etc/passwd", &info).is_none());
         assert!(lookup(b"/home", &info).is_none());
+    }
+
+    /// `hidepid=` and `subset=pid` as Linux's `proc` has them: another's
+    /// directory hidden (`invisible`, `ptraceable`) or kept out of
+    /// (`noaccess`) for a reader that may not trace it; with `subset=pid`
+    /// only the processes' directories and the reader's own links.
+    #[test]
+    fn hidepid_and_subset_hide_as_linux() {
+        assert_eq!(hidepid(b"invisible"), Some(HIDEPID_INVISIBLE));
+        assert_eq!(hidepid(b"3"), None);
+        let none = Hiding::of(b"rw");
+        assert!(!none.any());
+        assert_eq!(none.refuses(b"/42/status", |_| false), None);
+        let invisible = Hiding::of(b"hidepid=invisible,gid=10");
+        assert_eq!(invisible.gid, Some(10));
+        assert_eq!(invisible.refuses(b"/42", |_| false), Some(fwe_abi::errno::ENOENT));
+        assert_eq!(invisible.refuses(b"/42/status", |_| true), None);
+        assert_eq!(invisible.refuses(b"/meminfo", |_| false), None);
+        let noaccess = Hiding::of(b"hidepid=1");
+        assert_eq!(noaccess.refuses(b"/42", |_| false), None);
+        assert_eq!(noaccess.refuses(b"/42/status", |_| false), Some(fwe_abi::errno::EPERM));
+        let pids = Hiding::of(b"subset=pid");
+        assert!(pids.any());
+        assert_eq!(pids.refuses(b"/meminfo", |_| false), Some(fwe_abi::errno::ENOENT));
+        assert_eq!(pids.refuses(b"/sys/kernel", |_| false), Some(fwe_abi::errno::ENOENT));
+        assert_eq!(pids.refuses(b"/self/status", |_| false), None);
+        assert_eq!(pids.refuses(b"/42/status", |_| false), None);
+        assert_eq!(pids.refuses(b"/", |_| false), None);
     }
 }

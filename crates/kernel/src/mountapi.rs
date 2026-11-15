@@ -602,8 +602,16 @@ impl<P: Platform> Kernel<P> {
                 } else if !self.may_make_filesystem(c.kind) {
                     Err(errno::EPERM)
                 } else {
-                    let data = c.options.join(&b","[..]);
-                    match self.new_filesystem(c.kind, &data) {
+                    // The options as the mount keeps them.
+                    let data = Self::fs_data(c.kind, &c.options.join(&b","[..]));
+                    if let Ok(d) = &data {
+                        c.options = d
+                            .split(|&b| b == b',')
+                            .filter(|o| !o.is_empty())
+                            .map(<[u8]>::to_vec)
+                            .collect();
+                    }
+                    match data.and_then(|d| self.new_filesystem(c.kind, &d)) {
                         Ok(made) => {
                             c.made = Some(made);
                             c.phase = Phase::AwaitingMount;
@@ -639,7 +647,11 @@ impl<P: Platform> Kernel<P> {
     fn reconfigure(&mut self, c: &Context) -> Result<(), i32> {
         let id = c.picked.ok_or(errno::EINVAL)?;
         let (set, clear) = (c.set & ms::RDONLY, c.clear & ms::RDONLY);
-        let options = c.options.clone();
+        let mut options = Vec::new();
+        for o in &c.options {
+            options.push(Self::fs_data(c.kind, o)?);
+        }
+
         self.fs().mount_ns().clone().update(|t| {
             let m = t.mounts.iter_mut().find(|m| m.unique_id() == id).ok_or(errno::ENOENT)?;
             m.flags = (m.flags | set) & !clear;

@@ -816,7 +816,7 @@ the host reports differently.
 | `mkdirat`, `mknodat` | Umask applied by fwe; a directory takes the permission and sticky bits of its mode, set-group-ID only from a set-group-ID parent; a mode denying its owner and the maker's ownership kept in attributes. `mknodat` makes a file, FIFO, socket node or one of fwe's device nodes ([Devices](#devices)); a device takes `CAP_MKNOD` but for a whiteout (0:0), as on Linux. | `mkdirat`, `openat(O_CREAT\|O_EXCL)`, `mkfifoat` |
 | `unlinkat` | Overlays get whiteouts; a directory holding only `O_TMPFILE` names is removed with them; the host's `EPERM` for a directory becomes `EISDIR`. | `unlinkat` |
 | `renameat`, `renameat2` | `RENAME_NOREPLACE` and `RENAME_EXCHANGE` atomic, `RENAME_WHITEOUT` leaves a 0:0 node; `EXDEV` across mounts; the working directory follows a rename of it. | `renameatx_np` (`RENAME_EXCL`, `RENAME_SWAP`) |
-| `symlinkat`, `linkat` | `linkat` follows links itself; `AT_EMPTY_PATH` or a `/proc/self/fd` path names the descriptor's file (an `O_TMPFILE` one); `EXDEV` across mounts; `fs.protected_hardlinks` checked. | `symlinkat`, `linkat` (flags 0) |
+| `symlinkat`, `linkat` | `linkat` follows links itself; `AT_EMPTY_PATH` or a `/proc/self/fd` path names the descriptor's file (an `O_TMPFILE` one); `EXDEV` across mounts and `fs.protected_hardlinks` checked either way; a tmpfs's `nr_inodes=` counts the new name. | `symlinkat`, `linkat` (flags 0) |
 | `fchmod`, `fchmodat`, `fchmodat2` | Linux's rules (owner or `CAP_FOWNER`); a symlink's mode `EOPNOTSUPP`; `F_SEAL_EXEC` checked. | `fchmod`, `fchmodat`, `setxattr` (`org.fwe.mode`) |
 | `fchown`, `fchownat` | Linux's rules; the owner is recorded, the host file stays the user's. | `setxattr`, `fsetxattr` (`org.fwe.owner`) |
 | `utimensat` | `UTIME_NOW`/`UTIME_OMIT` mapped; Linux's permission rules; an append-only file may be touched. | `utimensat` |
@@ -832,7 +832,7 @@ the host reports differently.
 | `splice`, `tee`, `vmsplice` | Copied through a buffer of fwe's, without the kernel lock: from a pipe what it holds, into one what room it has. | `read`, `write`, `poll` |
 | `sendfile`, `copy_file_range` | Copied through a buffer of fwe's, without the kernel lock, after Linux's checks. | `read`/`pread`, `write`/`pwrite`, `lseek` |
 | `setxattr`, `getxattr`, `listxattr`, `removexattr`, their `l` and `f` forms, and their `at` forms (`setxattrat` and the rest, with `struct xattr_args`) | Linux's namespaces and rules ([Files and descriptors](#files-and-descriptors)); fwe's `/proc` files have none. | the host's attribute calls on the file's host path or descriptor |
-| `file_getattr`, `file_setattr` | The inode flags (immutable, append-only, no-dump) as `fa_xflags`, Linux's checks of the size and flags; a change `EROFS` through a read-only mount, an overlay file copied up first; what only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set. | `fstatat`, `lchflags` by path (`fstat`, `fchflags` for a descriptor) |
+| `file_getattr`, `file_setattr` | The inode flags (immutable, append-only, no-dump, no-access-time) as `fa_xflags`, Linux's checks of the size and flags, in Linux's order (owner, `CAP_LINUX_IMMUTABLE`, then what the filesystem keeps); a change `EROFS` through a read-only mount, an overlay file copied up first; what only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set. | `fstatat`, `lchflags` by path (`fstat`, `fchflags` for a descriptor) |
 | `name_to_handle_at`, `open_by_handle_at` | A handle is the host file system id and inode; opening needs `CAP_DAC_READ_SEARCH`, then opens as `openat` (permissions, read-only mounts, `O_PATH`) at the path the caller sees the file at in `mount_fd`'s mount, under its root; a file it cannot see so is `ESTALE`. | `fstatfs`, `fsgetpath`, then as `openat` |
 | `memfd_create` | See [Shared memory and memfd](#shared-memory-and-memfd). | `open(O_CREAT\|O_EXCL)`, `unlink` |
 | `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. A run starts in the directory fwe was started in (under `--root`, its path in the root, or `/` where it lies outside). Search permission checked. | `openat` (to check), `fcntl(F_GETPATH)` |
@@ -861,7 +861,7 @@ descriptors answer their requests first. Terminal requests (see
 [termios and terminal requests](#termios-and-terminal-requests)), network
 interface requests (`SIOCGIF*`) and `FIONREAD`, `FIONBIO`, `FIOCLEX`,
 `FIONCLEX`, `FIOASYNC` are translated; `FS_IOC_GETFLAGS`/`SETFLAGS` map
-immutable and append-only to the host's flags and record no-dump beside the host flag that also marks a kept mode or owner (a change `EROFS` through a read-only mount, an overlay file copied up first); `FICLONE`,
+immutable and append-only to the host's flags and record no-dump and no-access-time beside the host flag that also marks a kept mode or owner (a change `EROFS` through a read-only mount, an overlay file copied up first), and `FS_IOC_FSGETXATTR`/`FSSETXATTR` give and take the same flags as XFS's; `FICLONE`,
 `FICLONERANGE` and `FIDEDUPERANGE` are `EOPNOTSUPP`; `RNDGETENTCNT`
 reports 256; `PROCMAP_QUERY` on a `maps` file is fwe's. Any other request
 is `ENOTTY`.
@@ -884,14 +884,16 @@ checked by fwe.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind (keeping the source's per-mount flags, read-only too, and leaving unbindable submounts behind), move, remount and propagation changes. Other types `ENODEV`. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
+| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind (keeping the source's per-mount flags, read-only too, and leaving unbindable submounts behind), move, remount and propagation changes. Other types `ENODEV`. A tmpfs's and a `proc`'s options are checked as Linux checks them (`EINVAL`), a user or group id kept as the initial namespace's. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
+
 | `umount2` | `MNT_DETACH`, `MNT_FORCE`, `MNT_EXPIRE`, `UMOUNT_NOFOLLOW`; a mount in use is `EBUSY` unless detached (`MNT_FORCE` does not pass it, as on Linux's own file systems). | none |
 | `pivot_root`, `chroot` | The root becomes a path in the namespace's view; the working directory follows `pivot_root` as Linux's. | none |
 | `fsopen`, `fspick`, `fsconfig`, `fsmount` | A filesystem context is the process's, kept against an anonymous file's descriptor; `FSCONFIG_CMD_CREATE` makes the filesystem as `mount` does; reading the descriptor gives its messages. | an anonymous file |
 | `open_tree`, `move_mount` | A detached tree (`fsmount`, `OPEN_TREE_CLONE`) is kept against an `O_PATH` descriptor of its root; `move_mount` attaches or moves, `MOVE_MOUNT_BENEATH` included. | none |
 | `mount_setattr` | Sets and clears `ro`, `nosuid`, `nodev`, `noexec`, the access-time modes and `nosymfollow`, and propagation, on a mount or tree (`AT_RECURSIVE`); `MOUNT_ATTR_IDMAP` is `EINVAL`. | none |
 | `statmount`, `listmount` | From the table, by unique mount id; a mount out of the caller's reach is `EPERM` without `CAP_SYS_ADMIN`. | none |
-| `statfs`, `fstatfs` | Sizes and counts the host's; the type is the mount's (ext4 for the rootfs and its binds) with its flags; a sized tmpfs reports its size; a pipe, socket or anonymous descriptor reports Linux's pipefs, sockfs or anon-inode magic. | `fstatfs` |
+| `statfs`, `fstatfs` | Sizes and counts the host's; the type is the mount's (ext4 for the rootfs and its binds) with its flags; a sized tmpfs reports its size, and one of a number of inodes those and how many are free; a pipe, socket or anonymous descriptor reports Linux's pipefs, sockfs or anon-inode magic. | `fstatfs` |
+
 
 **`mount`**: a bind of a directory or file in the guest's tree is a new
 table entry showing it; a bind of a standard device node fwe serves from
@@ -2457,27 +2459,28 @@ where fwe falls short of Linux in detail is in
 | Ownership (`chown`) | **emulated** | Linux's rules; the owner in an attribute, the host file the user's |
 | Set-ID bits | **emulated** | kept by fwe; cleared by a write, truncation or `chown`, as Linux clears them |
 | Sticky directories | **enforced** | `EPERM`, overlays too |
-| `fs.protected_symlinks`, `fs.protected_hardlinks` | **enforced** | off by default, Linux's built-in default |
+| `fs.protected_symlinks`, `fs.protected_hardlinks` | **enforced** | off by default, Linux's built-in default; a link the path ends in, as Linux, by every walk (`openat2`'s too); a link by descriptor (`AT_EMPTY_PATH`) too |
 | `fs.protected_fifos`, `fs.protected_regular` | **refused** | `ENOENT`; not applied, as Linux's built-in default |
 | umask | **emulated** | fwe's; the host umask is 0 |
 | POSIX ACLs (`system.posix_acl_*`) | **refused** | `EOPNOTSUPP`, as a filesystem without ACLs |
-| `user.` attributes | **enforced** | regular files and directories, by the permission bits; stored as host attributes |
+| `user.` attributes | **enforced** | regular files and directories, by the permission bits, a sticky directory's changed by its owner (`EPERM`); stored as host attributes |
 | `trusted.` attributes | **enforced** | `CAP_SYS_ADMIN`; hidden without it |
 | `security.` attributes | **enforced** | `CAP_SYS_ADMIN` to write (`CAP_SETFCAP` for capabilities); kept, read by no module but file capabilities |
 | Immutable, append-only | **host** | the host's `UF_IMMUTABLE`, `UF_APPEND`; `CAP_LINUX_IMMUTABLE`; `EROFS` on read-only mounts |
 | No-dump | **kept** | |
-| `FS_NOATIME_FL` | **ignored** | |
-| Other inode flags (sync, compressed, project, extent sizes) | **refused** | `EOPNOTSUPP`, as tmpfs; `FS_IOC_FSGETXATTR` `ENOTTY` (`file_getattr` answers) |
+| `FS_NOATIME_FL` | **emulated** | kept beside the file; a read of it leaves its access time, as through `O_NOATIME`; a new file does not inherit it |
+| `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR` | **emulated** | the flags above as `fsx_xflags`, as `file_getattr` and `file_setattr` |
+| Other inode flags (sync, compressed, project, extent sizes) | **refused** | `EOPNOTSUPP`, as tmpfs |
 | Symlinks | **emulated** | fwe follows them (40, then `ELOOP`), `..` held at the root; a link's mode 0777 |
-| `O_NOFOLLOW`, `openat2` `RESOLVE_*` | **enforced** | `ELOOP`, `EXDEV`, `EAGAIN` as Linux |
-| Hard links | **enforced** | `EXDEV` across mounts; a directory `EPERM` |
+| `O_NOFOLLOW`, `openat2` `RESOLVE_*` | **enforced** | `ELOOP`, `EXDEV`, `EAGAIN` as Linux; `openat2`'s walk holds to `nosymfollow` and `fs.protected_symlinks` too |
+| Hard links | **enforced** | `EXDEV` across mounts, by path or descriptor; a directory `EPERM` |
 | FIFOs, named pipes | **host** | opens wait without fwe's lock; hang-up in `poll` **emulated** |
 | Device nodes | **emulated** | a marked file with Linux's numbers; `CAP_MKNOD` in the initial namespace, cgroup device programs; opens the host device for 1:3, 1:5, 1:7, 1:8, 1:9 and 5:0, else `ENXIO` ([Devices](#devices)) |
 | Unix socket nodes | **enforced** | connecting or sending needs write permission (`EACCES`) |
 | `O_TMPFILE` | **emulated** | a hidden name, counted as no link, gone with its last descriptor |
 | Case sensitivity | **host** | the volume's: APFS by default folds case ([known limitations](architecture.md#known-limitations)) |
-| tmpfs | **emulated** | a host directory; `size=` enforced (`ENOSPC`), `mode=` applied, `uid=`, `gid=`, `nr_inodes=` **ignored** ([Mounts](#mounts)) |
-| proc, sysfs, cgroup2, devpts, mqueue | **emulated** | fwe's; `hidepid=`, `subset=` **ignored** |
+| tmpfs | **emulated** | a host directory; `size=` and `nr_inodes=` enforced (`ENOSPC`), `mode=`, `uid=`, `gid=` give the root (its maker's by default) ([Mounts](#mounts)) |
+| proc, sysfs, cgroup2, devpts, mqueue | **emulated** | fwe's; `proc`'s `hidepid=` (with `gid=`) and `subset=pid` **enforced** (`ENOENT`, `EPERM`) |
 | overlay, bind, move | **emulated** | Linux's layering and copy-up; binds keep their flags |
 | cgroup v1, ext4, btrfs, XFS, FUSE, NFS and other types | **refused** | `ENODEV`, as without them |
 | `ro`, `nosuid`, `nodev`, `noexec`, `nosymfollow` | **enforced** | `EROFS`, no gain, `EACCES`, `EACCES`/`EPERM`, `ELOOP` |

@@ -789,7 +789,9 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   not in, and on any write), is kept in `org.fwe.mode`, the file flagged
   `UF_NODUMP`; `stat` reports it. The guest's own no-dump flag
   (`chattr +d`) is recorded apart, in `org.fwe.nodump`, so the inode flags
-  and `statx` report only it, and changing them keeps the mark. A write by a caller without
+  and `statx` report only it, and changing them keeps the mark; its
+  no-access-time flag (`chattr +A`) likewise, in `org.fwe.noatime`, and a
+  file of it opened is read as through `O_NOATIME`. A write by a caller without
   `CAP_FSETID` (through any descriptor of the file, a `truncate`,
   `fallocate`, `copy_file_range`, `sendfile` or `splice` into it, or a
   shared writable mapping of it, as it is made) clears a file's set-ID
@@ -817,7 +819,9 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   path walk, a connect or send to a Unix socket's node, the directory a
   `bind` makes one in) use the credentials
   published after each system call (`creds::access`).
-  `fs.protected_symlinks` (an overlay's links too) and `fs.protected_hardlinks` act as on Linux
+  `fs.protected_symlinks` (an overlay's links too, a link the path ends
+  in, in `openat2`'s walk too) and `fs.protected_hardlinks` (a link by
+  descriptor too) act as on Linux
   (off by default, as in Linux's kernel; read again only when a sysctl
   changes). Without a root filesystem the host's own files and directories
   (root's, no owner kept) are left to the host's checks. fwe's own umask
@@ -879,10 +883,11 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   through a lock of that pipe's own in a page every fwe process maps (one
   whose holder has ended is taken over); a non-blocking writer writes
   whole or fails with `EAGAIN`.
-- **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`): immutable,
-  append-only and no-dump are the host's user flags of the same meaning,
-  which it enforces (no-dump also marks a kept mode, so such a file does
-  not show it); setting the first two takes `CAP_LINUX_IMMUTABLE`, and
+- **Inode flags** (`FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`, and as XFS's
+  `FS_IOC_FSGETXATTR`, `FS_IOC_FSSETXATTR`): immutable and append-only
+  are the host's user flags of the same meaning, which it enforces;
+  no-dump and no-access-time are recorded beside the file (see Modes);
+  setting the first two takes `CAP_LINUX_IMMUTABLE`, and
   such a file's extended attributes cannot change. An append-only file's
   times may be set to now (fwe lifts the flag for the change, which the
   host would refuse), not to a given time. `O_NOATIME` (a descriptor's
@@ -1235,13 +1240,23 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   directory is marked `trusted.overlay.opaque` (`user.overlay.opaque` with
   `userxattr`). The overlay's own attributes are hidden; `metacopy=on`,
   `redirect_dir=on` and `index=on` are refused.
-- **tmpfs size** (`crates/kernel/src/tmpfs.rs`): a tmpfs mount is a
-  directory of fwe's, its `size=` kept in a file beside it. Its use is
-  what its files take on the host, recounted once the count is a quarter
-  second old; a write past the size (any of the write calls, or
+- **tmpfs limits and owner** (`crates/kernel/src/tmpfs.rs`): a tmpfs
+  mount is a directory of fwe's, its `size=` and `nr_inodes=` kept in
+  files beside it. Its use is what its files take on the host, and its
+  inodes its root and each name in it, recounted once a count is a
+  quarter second old; a write past the size (any of the write calls, or
   `copy_file_range`, `sendfile` or `splice` into a file) writes what fits or fails with
-  `ENOSPC`, `fallocate` fits whole or fails, and `statfs` reports the size
-  and what is left; a remount with `size=` sets a new size.
+  `ENOSPC`, `fallocate` fits whole or fails, a name made past the inodes
+  fails with `ENOSPC`, and `statfs` reports both and what is left; a
+  remount with `size=` or `nr_inodes=` sets a new one. Its root is its
+  maker's, or `uid=` and `gid=`'s, with `mode=`'s mode.
+- **`proc` options** (`crates/kernel/src/procfs.rs`): `hidepid=` hides
+  another process's `/proc/<pid>` from a reader that may not trace it and
+  is not in the mount's `gid=` (`invisible`, `ptraceable`: not listed,
+  `ENOENT`; `noaccess`: listed, nothing in it reached, `EPERM`), checked
+  at each open, `stat` and listing; `subset=pid` shows only the
+  processes' directories and `self` and `thread-self`.
+
 - **cgroups** (`crates/kernel/src/cgroupfs.rs`, `bpf.rs`): device programs
   are kept in the cgroup's directory, so they outlive the runtime that
   attached them. The eBPF interpreter checks each access against the
@@ -1545,10 +1560,17 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   directory).
 
 **Mounts**
-- A tmpfs's files are host files: its size counts their host blocks, up
-  to a quarter second late, so writes from several processes at once can
-  pass it, and so can writes through a shared mapping, which fwe does not
-  see.
+- A tmpfs's files are host files: its size counts their host blocks, and
+  its inodes their names, up to a quarter second late, so writes or new
+  names from several processes at once can pass them, and so can writes
+  through a shared mapping, which fwe does not see; an unlinked file still
+  open holds no inode. A remount may limit a tmpfs that had no limit, or
+  to less than it uses.
+- `proc`'s `hidepid=noaccess` lets another's `/proc/<pid>` directory
+  itself be opened, not only `stat`ed; what is in it is refused.
+- A new file does not inherit its directory's no-dump and no-access-time
+  flags (`chattr +d`, `+A`), as ext4's and tmpfs's do.
+
 - Mountable filesystems are tmpfs, `proc`, `sysfs`, `cgroup2`, `devpts`,
   `mqueue` and overlays, none on a block device (ext4, XFS: `ENODEV`), so
   a loop device holds bytes but no filesystem to mount.

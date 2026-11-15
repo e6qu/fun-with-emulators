@@ -11,6 +11,8 @@
 use crate::mounts::{FsType, Source, ms};
 use crate::{Kernel, Platform, guest, uaccess};
 use fwe_abi::{err, errno};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 
 /// `umount2` flags.
 const MNT_FORCE: u64 = 1;
@@ -48,14 +50,52 @@ pub(crate) fn default_atime(flags: u64) -> u64 {
     if flags & (ms::NOATIME | ms::STRICTATIME) == 0 { ms::RELATIME } else { 0 }
 }
 
-/// The `mode=` a filesystem's options give (octal), if any.
-fn mode_option(data: &[u8]) -> Option<u32> {
-    data.split(|&b| b == b',')
-        .find_map(|o| o.strip_prefix(b"mode="))
-        .and_then(|m| u32::from_str_radix(std::str::from_utf8(m).ok()?, 8).ok())
+/// The initial namespace's id for id `v` (text) of the caller's user
+/// namespace, as a mount option names it (`EINVAL` for one it does not
+/// map), Linux's `make_kuid` and `make_kgid`.
+fn kernel_id(v: &[u8], gid: bool) -> Result<u32, i32> {
+    let n = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()).ok_or(errno::EINVAL)?;
+    crate::userns::from_ns(n, gid).ok_or(errno::EINVAL)
 }
 
 impl<P: Platform> Kernel<P> {
+    /// Filesystem options `data` of a new `kind` filesystem (or a remount),
+    /// checked as Linux checks them (`EINVAL`), and as the mount keeps
+    /// them: a user or group id as the initial namespace has it, as
+    /// `mountinfo` shows it. A tmpfs's ([`crate::tmpfs::parse`]); a
+    /// `proc`'s `hidepid=` (`0` to `2`, `4`, or their names), `gid=` and
+    /// `subset=` (`pid`, or nothing).
+    pub(crate) fn fs_data(kind: FsType, data: &[u8]) -> Result<Vec<u8>, i32> {
+        if kind == FsType::Tmpfs {
+            crate::tmpfs::parse(data)?;
+        }
+        if !matches!(kind, FsType::Tmpfs | FsType::Proc) {
+            return Ok(data.to_vec());
+        }
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for o in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
+            let (key, value) = match o.iter().position(|&b| b == b'=') {
+                Some(i) => (&o[..i], &o[i + 1..]),
+                None => (o, &b""[..]),
+            };
+            out.push(match (kind, key) {
+                (_, b"uid") if kind == FsType::Tmpfs => {
+                    format!("uid={}", kernel_id(value, false)?).into_bytes()
+                }
+                (_, b"gid") => format!("gid={}", kernel_id(value, true)?).into_bytes(),
+                (FsType::Proc, b"hidepid") => {
+                    crate::procfs::hidepid(value).ok_or(errno::EINVAL)?;
+                    o.to_vec()
+                }
+                (FsType::Proc, b"subset") if !matches!(value, b"pid" | b"") => {
+                    return Err(errno::EINVAL);
+                }
+                _ => o.to_vec(),
+            });
+        }
+        Ok(out.join(&b","[..]))
+    }
+
     /// Whether the caller may change its mount namespace's mounts:
     /// `CAP_SYS_ADMIN` in the user namespace that owns the namespace
     /// (Linux's `may_mount`).
@@ -165,10 +205,25 @@ impl<P: Platform> Kernel<P> {
         let mut flags = 0;
         let src = match kind {
             FsType::Tmpfs => {
-                let dir = tmpfs_dir(mode_option(data).unwrap_or(0o1777))?;
-                // A size asked for is kept beside it ([`crate::tmpfs`]).
-                if let Some(limit) = crate::tmpfs::size_option(data) {
+                // Options as [`Self::fs_data`] keeps them: ids the initial
+                // namespace's.
+                let o = crate::tmpfs::parse(data)?;
+                let dir = tmpfs_dir(o.mode.unwrap_or(0o1777))?;
+                // Its root is its mounter's, or the owner asked for.
+                let owner = (o.uid.unwrap_or(self.creds.fsuid), o.gid.unwrap_or(self.creds.fsgid));
+                let kept = std::fs::File::open(std::ffi::OsStr::from_bytes(&dir))
+                    .map_err(|e| crate::host::errno_to_linux(e.raw_os_error().unwrap_or(0)))
+                    .and_then(|f| crate::owners::keep_fd(f.as_raw_fd(), owner));
+                if let Err(e) = kept {
+                    let _ = std::fs::remove_dir(std::ffi::OsStr::from_bytes(&dir));
+                    return Err(e);
+                }
+                // The limits asked for are kept beside it ([`crate::tmpfs`]).
+                if let Some(limit) = o.size {
                     crate::tmpfs::mounted(&dir, limit);
+                }
+                if let Some(n) = o.inodes {
+                    crate::tmpfs::mounted_inodes(&dir, n);
                 }
                 Source::Host(dir)
             }
@@ -300,15 +355,27 @@ impl<P: Platform> Kernel<P> {
             // With no access-time mode named the mount keeps its own.
             let named = flags & (ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME);
             let flags = if named == 0 { flags } else { flags | default_atime(flags) };
-            // A tmpfs given a new size holds to it from now on.
+            // The options checked as a new filesystem's, of its type.
+            let kind = ns.table().locate(&point).0.fstype;
+            let opts = match opts.map(|d| Self::fs_data(kind, &d)).transpose() {
+                Ok(o) => o,
+                Err(e) => return err(e),
+            };
+            // A tmpfs given a new size or number of inodes holds to it from
+            // now on.
             if flags & ms::BIND == 0
-                && let Some(limit) = crate::tmpfs::size_option(&data)
+                && let Ok(o) = crate::tmpfs::parse(&data)
                 && let (m, _) = ns.table().locate(&point)
                 && m.fstype == FsType::Tmpfs
                 && m.root == b"/"
                 && let Some(dir) = m.host_path(b"")
             {
-                crate::tmpfs::mounted(&dir, limit);
+                if let Some(limit) = o.size {
+                    crate::tmpfs::mounted(&dir, limit);
+                }
+                if let Some(n) = o.inodes {
+                    crate::tmpfs::mounted_inodes(&dir, n);
+                }
             }
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0
@@ -393,10 +460,15 @@ impl<P: Platform> Kernel<P> {
             if !self.may_make_filesystem(kind) {
                 return err(errno::EPERM);
             }
+            let data = match Self::fs_data(kind, &data) {
+                Ok(d) => d,
+                Err(e) => return err(e),
+            };
             let (src, root, more) = match self.new_filesystem(kind, &data) {
                 Ok(v) => v,
                 Err(e) => return err(e),
             };
+
             flags |= more | default_atime(flags);
             let device = if source.is_empty() { kind.name().as_bytes().to_vec() } else { source };
             ns.update(|t| {

@@ -309,6 +309,16 @@ impl Resolved {
     /// once it has.
     pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
         self.writable()?;
+        // A new name in a tmpfs of a number of inodes takes one of them
+        // (`ENOSPC`); one that is there already fails as it would anyway.
+        if matches!(how, Change::Create)
+            && self.ovl.is_none()
+            && crate::tmpfs::any_counted()
+            && self.lstat().is_none()
+        {
+            crate::tmpfs::take_inode(self.dir.as_raw_fd())?;
+        }
+
         // What it sets up is looked at afresh.
         self.seen = None;
         let Some(o) = &self.ovl else { return Ok(()) };
@@ -1384,11 +1394,7 @@ impl Fs {
     /// rest of the path: `None` for the caller (`self` or its own pid),
     /// else its host pid (`None` inside when it has none), with the rest.
     pub fn proc_target(&self, dirfd: i32, path: &[u8]) -> Option<(Option<Option<i32>>, Vec<u8>)> {
-        let p = self.synthetic_path(dirfd, path)?;
-        match own_or_other(&p) {
-            Ok(own) => Some((None, own.strip_prefix(b"/proc/self")?.to_vec())),
-            Err((host, _, sub)) => Some((Some(host), sub)),
-        }
+        proc_target_of(&self.synthetic_path(dirfd, path)?)
     }
 
     /// The path in fwe's synthetic tree (`/proc/...`, `/sys/...`) that
@@ -3515,6 +3521,14 @@ fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)>
         return Ok([&b"/proc/self"[..], sub].concat());
     }
     Err((crate::pidns::to_host(pid), pid, sub.to_vec()))
+}
+
+/// [`Fs::proc_target`] of `p`, a path in fwe's `/proc` (`/proc/42/maps`).
+pub(crate) fn proc_target_of(p: &[u8]) -> Option<(Option<Option<i32>>, Vec<u8>)> {
+    match own_or_other(p) {
+        Ok(own) => Some((None, own.strip_prefix(b"/proc/self")?.to_vec())),
+        Err((host, _, sub)) => Some((Some(host), sub)),
+    }
 }
 
 /// The host path of the file `fd` is open on.

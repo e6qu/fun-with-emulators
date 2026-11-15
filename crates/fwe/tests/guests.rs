@@ -7507,3 +7507,69 @@ fn signals_limits_and_always_there_calls() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// `fs.protected_symlinks` refuses a trailing link in a sticky directory
+/// anyone may write to (not one the path passes through), to `openat2` as
+/// to `open`; a `nosymfollow` mount's links are followed by neither;
+/// `linkat` of a descriptor's file (`AT_EMPTY_PATH`) is `EXDEV` across
+/// mounts and held to `fs.protected_hardlinks`, as a path's is.
+#[test]
+fn link_rules_hold_for_every_walk() {
+    assert_eq!(
+        fsrules("linkrules"),
+        "trailing: open EACCES openat2 EACCES\npassed through: open ok openat2 ok\n\
+         nosymfollow: ok\nfollowed there: open ELOOP openat2 ELOOP, the link itself: ok\n\
+         other: ok\nAT_EMPTY_PATH: across mounts EXDEV within ok\n\
+         protected_hardlinks: by descriptor EPERM by path EPERM\n"
+    );
+}
+
+/// A sticky directory's `user.` attributes are changed by its owner or
+/// root only (`EPERM`), and read by anyone its mode lets.
+#[test]
+fn sticky_directory_user_attributes_are_the_owners() {
+    assert_eq!(
+        fsrules("stickyxattr"),
+        "another's sticky: set EPERM get ENODATA; own sticky: ok; not sticky: ok\nroot: ok\n"
+    );
+}
+
+/// `chattr +A` is kept and acted on: `FS_IOC_GETFLAGS` and
+/// `FS_IOC_FSGETXATTR` report it, a read leaves the file's access time
+/// (where a strict mount sets another's), and `FS_IOC_FSSETXATTR` clears
+/// it.
+#[test]
+fn noatime_flag_is_kept_and_acted_on() {
+    assert_eq!(
+        fsrules("noatimeflag"),
+        "strictatime: ok\nflags: 0x80 xflags: ok 0x40\nflagged kept: true other set: true\n\
+         cleared: ok flags: 0x0\n"
+    );
+}
+
+/// A tmpfs's `uid=`, `gid=` and `mode=` give its root, and `nr_inodes=`
+/// counts its root and each name (`ENOSPC` past it, `statfs`'s count); a
+/// value Linux refuses is `EINVAL`.
+#[test]
+fn tmpfs_owner_and_inode_options_hold() {
+    assert_eq!(
+        fsrules("tmpfsopts"),
+        "mount: ok\nroot: 750 1000:100\nfile: ok dir: ok past the inodes: ENOSPC\n\
+         statfs: files 3 free 0\nbad size: EINVAL bad uid: EINVAL\n"
+    );
+}
+
+/// `proc`'s `hidepid=invisible` hides another user's process from one who
+/// may not trace it, `noaccess` keeps them out of it (`EPERM`), and
+/// `subset=pid` shows the processes alone; `hidepid=3` is `EINVAL`.
+#[test]
+fn proc_hidepid_and_subset_hide_as_linux() {
+    assert_eq!(
+        fsrules("procopts"),
+        "hidepid=invisible: ok\nroot: stat ok listed true status ok\n\
+         another user: stat ENOENT listed false status ENOENT\nown: ok\n\
+         remount noaccess: ok\nanother user: stat ok listed true status EPERM\n\
+         subset=pid: ok\nmeminfo: ENOENT self: ok listed meminfo false pid true\n\
+         hidepid=3: EINVAL\n"
+    );
+}

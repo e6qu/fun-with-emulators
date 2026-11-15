@@ -768,9 +768,21 @@ impl<P: Platform> Kernel<P> {
                     new
                 }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
-                    Some(entries) => {
+                    Some(mut entries) => {
                         let at = self.fs().absolute_path(dirfd as i32, &path).unwrap_or_default();
+                        // A `proc` mount's root lists what its options do
+                        // not hide from the reader.
+                        let (m, fs_path) = self.fs().mount_of(&at);
+                        if m.fstype == crate::mounts::FsType::Proc && fs_path == b"/" {
+                            entries.retain(|(n, _)| {
+                                n == b"."
+                                    || n == b".."
+                                    || self.hidden_in(&m.options, &[b"/", &n[..]].concat())
+                                        != Some(errno::ENOENT)
+                            });
+                        }
                         let fd = crate::synthdir::open(at, entries);
+
                         let fd = self.synthetic_fd(fd, dirfd as i32, &path);
                         if fd >= 0 && self.fs().lists_fds(dirfd as i32, &path) {
                             // Linux lists the listing's own descriptor too.
@@ -1548,6 +1560,9 @@ impl<P: Platform> Kernel<P> {
         use crate::procfs::Entry;
         use fwe_abi::stat as st;
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
+            if let Some(e) = self.proc_hidden(dirfd, path) {
+                return Err(e);
+            }
             let st = match entry {
                 Entry::Ns(n) => ns_stat(n.id),
                 Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
@@ -3022,11 +3037,61 @@ impl<P: Platform> Kernel<P> {
         Some(Ok(Mark::Comm { tid: -1 }))
     }
 
+    /// What the `proc` mount `path` is in hides of it from the caller
+    /// (`hidepid=`, `subset=pid`, [`crate::procfs::Hiding`]): `ENOENT` or
+    /// `EPERM`.
+    pub(crate) fn proc_hidden(&self, dirfd: i32, path: &[u8]) -> Option<i32> {
+        let a = self.fs().absolute_path(dirfd, path)?;
+        let (m, fs_path) = self.fs().mount_of(&a);
+        if m.fstype != crate::mounts::FsType::Proc {
+            return None;
+        }
+        self.hidden_in(&m.options, &fs_path)
+    }
+
+    /// [`Self::proc_hidden`] of `fs_path` in a `proc` mount of options
+    /// `options`: a process is hidden from a reader that may not trace it
+    /// (`PTRACE_MODE_READ_FSCREDS`) and is not in the mount's `gid=`.
+    fn hidden_in(&self, options: &[u8], fs_path: &[u8]) -> Option<i32> {
+        if !options.windows(7).any(|w| w == b"hidepid" || w == b"subset=") {
+            return None;
+        }
+        let h = crate::procfs::Hiding::of(options);
+        if !h.any() {
+            return None;
+        }
+        h.refuses(fs_path, |pid| self.proc_visible(pid, &h))
+    }
+
+    /// Whether process `pid` (a number in the caller's pid namespace) is
+    /// one the `proc` mount hiding `h` shows the caller.
+    fn proc_visible(&self, pid: i32, h: &crate::procfs::Hiding) -> bool {
+        if pid == crate::thread::tgid() {
+            return true;
+        }
+        let c = &self.creds;
+        if h.gid.is_some_and(|g| c.fsgid == g || c.groups().contains(&g)) {
+            return true;
+        }
+        crate::pidns::to_host(pid).is_some_and(|host| self.may_access(host, false, true))
+    }
+
     /// Whether the caller is refused another process's `/proc/<pid>` file
-    /// at `path` that only a reader that may trace it reads
+    /// at `path`: one its `proc` mount hides ([`Self::proc_hidden`]), or
+    /// one that only a reader that may trace it reads
     /// ([`crate::procpid::TRACER_ONLY`]): `EACCES` then.
     pub(crate) fn proc_refused(&self, dirfd: i32, path: &[u8]) -> Option<i32> {
-        let (Some(Some(host)), sub) = self.fs().proc_target(dirfd, path)? else { return None };
+        let a = self.fs().absolute_path(dirfd, path)?;
+        let (m, fs_path) = self.fs().mount_of(&a);
+        if m.fstype != crate::mounts::FsType::Proc {
+            return None;
+        }
+        if let Some(e) = self.hidden_in(&m.options, &fs_path) {
+            return Some(e);
+        }
+        let in_proc = crate::mounts::join(b"/proc", &fs_path);
+        let (Some(Some(host)), sub) = crate::fs::proc_target_of(&in_proc)? else { return None };
+
         // Linux's `PTRACE_MODE_READ_FSCREDS`.
         if !crate::procpid::TRACER_ONLY.contains(&&sub[..]) || self.may_access(host, false, true) {
             return None;
@@ -4079,6 +4144,10 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
     if let Some((size, left)) = crate::fs::fd_path(fd).and_then(|p| crate::tmpfs::space(&p)) {
         let b = out.f_bsize.max(1) as u64;
         (out.f_blocks, out.f_bfree, out.f_bavail) = (size / b, left / b, left / b);
+    }
+    // One with a number of inodes: that, and how many are free.
+    if let Some((files, free)) = crate::fs::fd_path(fd).and_then(|p| crate::tmpfs::inodes(&p)) {
+        (out.f_files, out.f_ffree) = (files, free);
     }
     if let Some((fstype, flags)) = mount {
         use crate::mounts::ms;

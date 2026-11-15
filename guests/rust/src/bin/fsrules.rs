@@ -115,12 +115,14 @@ fn name(e: i32) -> String {
         11 => "EAGAIN",
         13 => "EACCES",
         17 => "EEXIST",
+        18 => "EXDEV",
         20 => "ENOTDIR",
         21 => "EISDIR",
         22 => "EINVAL",
         28 => "ENOSPC",
         30 => "EROFS",
         40 => "ELOOP",
+        61 => "ENODATA",
         95 => "EOPNOTSUPP",
         116 => "ESTALE",
         e => return format!("errno {e}"),
@@ -1147,6 +1149,414 @@ fn main() {
         "devnode" => devnode_scenario(),
         "access" => access_scenario(),
         "nodump" => nodump_scenario(),
+        "linkrules" => link_rules_scenario(),
+        "stickyxattr" => sticky_xattr_scenario(),
+        "noatimeflag" => noatime_flag_scenario(),
+        "tmpfsopts" => tmpfs_options_scenario(),
+        "procopts" => proc_options_scenario(),
         s => panic!("unknown scenario {s}"),
+    }
+}
+
+unsafe extern "C" {
+    fn setxattr(p: *const c_char, n: *const c_char, v: *const u8, s: usize, f: i32) -> i32;
+    fn linkat(od: i32, op: *const c_char, nd: i32, np: *const c_char, f: i32) -> i32;
+    fn statfs(p: *const c_char, buf: *mut u8) -> i32;
+}
+
+const SYS_OPENAT2: i64 = 437;
+const CLONE_NEWNS_FLAG: i32 = 0x20000;
+
+/// Write `v` to the sysctl at `p`.
+fn sysctl(p: &str, v: &str) {
+    // SAFETY: a NUL-terminated path; a buffer of `v`'s length.
+    unsafe {
+        let fd = open(c(p).as_ptr(), O_WRONLY);
+        assert!(fd >= 0, "{p}: {}", errno());
+        write(fd, v.as_ptr(), v.len());
+        close(fd);
+    }
+}
+
+/// Run `f` in a child of user and group `id`, no supplementary groups.
+fn as_user(id: u32, f: impl FnOnce()) {
+    in_child(|| {
+        // SAFETY: plain id changes.
+        unsafe {
+            setgroups(0, std::ptr::null());
+            setgid(id);
+            setuid(id);
+        }
+        f();
+    });
+}
+
+/// `open(p, flags)`, closed again: "ok" or the error.
+fn try_open(p: &str, flags: i32) -> String {
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c(p).as_ptr(), flags) };
+    let out = res(fd.into());
+    if fd >= 0 {
+        // SAFETY: the descriptor just opened.
+        unsafe { close(fd) };
+    }
+    out
+}
+
+/// `openat2(AT_FDCWD, p, {flags, 0, resolve})`, closed again.
+fn try_openat2(p: &str, flags: u64, resolve: u64) -> String {
+    let how = [flags, 0, resolve];
+    // SAFETY: a NUL-terminated path and a `struct open_how`.
+    let fd = unsafe { syscall(SYS_OPENAT2, AT_FDCWD, c(p).as_ptr(), how.as_ptr(), 24) };
+    let out = res(fd);
+    if fd >= 0 {
+        // SAFETY: the descriptor just opened.
+        unsafe { close(fd as i32) };
+    }
+    out
+}
+
+/// Mount a new `kind` filesystem at `at` with `flags` and options `data`.
+fn mount_new(kind: &str, at: &str, flags: u64, data: &str) -> String {
+    // SAFETY: NUL-terminated strings.
+    res(unsafe {
+        mount(c(kind).as_ptr(), c(at).as_ptr(), c(kind).as_ptr(), flags, c(data).as_ptr())
+    }
+    .into())
+}
+
+/// `fs.protected_symlinks` refuses a trailing link in a sticky directory
+/// anyone may write to, to one who neither owns it nor the directory, and
+/// passes a link the path goes through, to `open` and `openat2` alike; a
+/// `nosymfollow` mount's links are followed by neither; `linkat` of a
+/// descriptor's file (`AT_EMPTY_PATH`) stays within its mount and is held
+/// to `fs.protected_hardlinks`, as a path's is.
+fn link_rules_scenario() {
+    const RESOLVE_NO_MAGICLINKS: u64 = 2;
+    const MS_NOSYMFOLLOW: u64 = 256;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS_FLAG) };
+    sysctl("/proc/sys/fs/protected_symlinks", "1");
+    sysctl("/proc/sys/fs/protected_hardlinks", "1");
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/s").as_ptr(), 0o777);
+        chmod(c("/tmp/s").as_ptr(), 0o1777);
+        mkdir(c("/tmp/d").as_ptr(), 0o755);
+    }
+    make("/tmp/d/f", 0o644);
+    make("/tmp/t", 0o644);
+    as_user(1000, || {
+        // SAFETY: NUL-terminated paths.
+        unsafe {
+            symlink(c("/tmp/t").as_ptr(), c("/tmp/s/l").as_ptr());
+            symlink(c("/tmp/d").as_ptr(), c("/tmp/s/dl").as_ptr());
+        }
+    });
+    as_user(2000, || {
+        println!(
+            "trailing: open {} openat2 {}",
+            try_open("/tmp/s/l", O_RDONLY),
+            try_openat2("/tmp/s/l", 0, RESOLVE_NO_MAGICLINKS)
+        );
+        println!(
+            "passed through: open {} openat2 {}",
+            try_open("/tmp/s/dl/f", O_RDONLY),
+            try_openat2("/tmp/s/dl/f", 0, RESOLVE_NO_MAGICLINKS)
+        );
+    });
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/nf").as_ptr(), 0o755) };
+    println!("nosymfollow: {}", mount_new("tmpfs", "/tmp/nf", MS_NOSYMFOLLOW, ""));
+    // SAFETY: NUL-terminated paths.
+    unsafe { symlink(c("/tmp/t").as_ptr(), c("/tmp/nf/l").as_ptr()) };
+    println!(
+        "followed there: open {} openat2 {}, the link itself: {}",
+        try_open("/tmp/nf/l", O_RDONLY),
+        try_openat2("/tmp/nf/l", 0, RESOLVE_NO_MAGICLINKS),
+        try_openat2("/tmp/nf/l", (O_PATH | 0o100000) as u64, RESOLVE_NO_MAGICLINKS)
+    );
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/other").as_ptr(), 0o755) };
+    println!("other: {}", mount_new("tmpfs", "/tmp/other", 0, ""));
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/t").as_ptr(), O_RDONLY) };
+    let link_fd = |fd: i32, to: &str| {
+        // SAFETY: an empty path and a NUL-terminated one.
+        res(unsafe { linkat(fd, c("").as_ptr(), AT_FDCWD, c(to).as_ptr(), AT_EMPTY_PATH) }.into())
+    };
+    println!(
+        "AT_EMPTY_PATH: across mounts {} within {}",
+        link_fd(fd, "/tmp/other/x"),
+        link_fd(fd, "/tmp/x")
+    );
+    make("/tmp/theirs", 0o600);
+    // SAFETY: a NUL-terminated path.
+    unsafe { chown(c("/tmp/theirs").as_ptr(), 1000, 1000) };
+    in_child(|| {
+        // Only `CAP_DAC_READ_SEARCH` (2) left: it may read the file, and
+        // name it by its descriptor, but neither owns it nor may write it.
+        let head = [0x2008_0522u32, 0];
+        let data = [4u32, 4, 0, 0, 0, 0];
+        // SAFETY: a capability header and two data words.
+        unsafe { syscall(SYS_CAPSET, head.as_ptr(), data.as_ptr()) };
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { open(c("/tmp/theirs").as_ptr(), O_RDONLY) };
+        // SAFETY: NUL-terminated paths.
+        let by_path = unsafe {
+            linkat(AT_FDCWD, c("/tmp/theirs").as_ptr(), AT_FDCWD, c("/tmp/y").as_ptr(), 0)
+        };
+        println!(
+            "protected_hardlinks: by descriptor {} by path {}",
+            link_fd(fd, "/tmp/z"),
+            res(by_path.into())
+        );
+    });
+}
+
+/// A sticky directory's `user.` attributes are its owner's to change
+/// (`EPERM` to another, whatever its mode allows), and root's.
+fn sticky_xattr_scenario() {
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/st").as_ptr(), 0o777);
+        chmod(c("/tmp/st").as_ptr(), 0o1777);
+        mkdir(c("/tmp/mine").as_ptr(), 0o777);
+        chmod(c("/tmp/mine").as_ptr(), 0o1777);
+        chown(c("/tmp/mine").as_ptr(), 1000, 1000);
+        mkdir(c("/tmp/plain").as_ptr(), 0o777);
+        chmod(c("/tmp/plain").as_ptr(), 0o777);
+    }
+    let set = |p: &str| {
+        // SAFETY: NUL-terminated strings and a value of one byte.
+        res(unsafe { setxattr(c(p).as_ptr(), c("user.x").as_ptr(), b"1".as_ptr(), 1, 0) }.into())
+    };
+    as_user(1000, || {
+        let mut v = [0u8; 4];
+        // SAFETY: NUL-terminated strings and a buffer of 4 bytes.
+        let got =
+            res(
+                unsafe { getxattr(c("/tmp/st").as_ptr(), c("user.y").as_ptr(), v.as_mut_ptr(), 4) }
+                    as i64,
+            );
+        println!(
+            "another's sticky: set {} get {}; own sticky: {}; not sticky: {}",
+            set("/tmp/st"),
+            got,
+            set("/tmp/mine"),
+            set("/tmp/plain")
+        );
+    });
+    println!("root: {}", set("/tmp/st"));
+}
+
+/// The no-access-time flag (`chattr +A`) is kept: read back through both
+/// requests, and a read of the file leaves its access time where a read
+/// of another sets it.
+fn noatime_flag_scenario() {
+    const MS_STRICTATIME: u64 = 1 << 24;
+    const FS_NOATIME_FL: u32 = 0x80;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS_FLAG) };
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/s").as_ptr(), 0o755) };
+    make("/tmp/s/a", 0o644);
+    make("/tmp/s/b", 0o644);
+    println!("strictatime: {}", bind("/tmp/s", "/tmp/s", Some(MS_STRICTATIME)));
+    let old = [1_000_000i64, 0, 1_000_000, 0];
+    // SAFETY: NUL-terminated paths and two timespecs.
+    unsafe {
+        utimensat(AT_FDCWD, c("/tmp/s/a").as_ptr(), &old, 0);
+        utimensat(AT_FDCWD, c("/tmp/s/b").as_ptr(), &old, 0);
+    }
+    inode_flags("/tmp/s/a", Some(FS_NOATIME_FL));
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/s/a").as_ptr(), O_RDONLY) };
+    let mut fsx = [0u8; 28];
+    // SAFETY: a `struct fsxattr`.
+    let r = unsafe { ioctl(fd, 0x801c_581f, fsx.as_mut_ptr()) };
+    // SAFETY: the descriptor just opened.
+    unsafe { close(fd) };
+    println!(
+        "flags: {:#x} xflags: {} {:#x}",
+        inode_flags("/tmp/s/a", None),
+        res(r.into()),
+        u32::from_ne_bytes(fsx[..4].try_into().unwrap())
+    );
+    for p in ["/tmp/s/a", "/tmp/s/b"] {
+        // SAFETY: plain calls; a buffer of one byte.
+        unsafe {
+            let fd = open(c(p).as_ptr(), O_RDONLY);
+            let mut b = [0u8; 1];
+            read(fd, b.as_mut_ptr(), 1);
+            close(fd);
+        }
+    }
+    println!(
+        "flagged kept: {} other set: {}",
+        times_of("/tmp/s/a").0 == 1_000_000,
+        times_of("/tmp/s/b").0 > 1_000_000
+    );
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/s/a").as_ptr(), O_RDONLY) };
+    let clear = [0u8; 28];
+    // SAFETY: a `struct fsxattr`.
+    let r = unsafe { ioctl(fd, 0x401c_5820, clear.as_ptr()) };
+    // SAFETY: the descriptor just opened.
+    unsafe { close(fd) };
+    println!("cleared: {} flags: {:#x}", res(r.into()), inode_flags("/tmp/s/a", None));
+}
+
+/// A tmpfs's `uid=`, `gid=` and `mode=` make its root's owner and mode,
+/// and `nr_inodes=` holds its root and the names in it (`ENOSPC` past it,
+/// which `statfs` counts); a value Linux refuses is `EINVAL`.
+fn tmpfs_options_scenario() {
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS_FLAG) };
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/m").as_ptr(), 0o755) };
+    println!(
+        "mount: {}",
+        mount_new("tmpfs", "/tmp/m", 0, "nr_inodes=3,uid=1000,gid=100,mode=0750")
+    );
+    let mut st = [0u32; 32];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+    unsafe { stat(c("/tmp/m").as_ptr(), st.as_mut_ptr().cast()) };
+    // arm64's `struct stat`: st_mode at word 4, st_uid 6, st_gid 7.
+    println!("root: {:o} {}:{}", st[4] & 0o7777, st[6], st[7]);
+    // SAFETY: NUL-terminated paths.
+    let (a, b) = unsafe {
+        let a = open(c("/tmp/m/a").as_ptr(), O_CREAT | O_RDWR, 0o644);
+        (a, mkdir(c("/tmp/m/b").as_ptr(), 0o755))
+    };
+    // SAFETY: NUL-terminated paths.
+    let full = unsafe { mkdir(c("/tmp/m/c").as_ptr(), 0o755) };
+    println!(
+        "file: {} dir: {} past the inodes: {}",
+        res(a.into()),
+        res(b.into()),
+        res(full.into())
+    );
+    let mut fs = [0u64; 15];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct statfs`.
+    unsafe { statfs(c("/tmp/m").as_ptr(), fs.as_mut_ptr().cast()) };
+    println!("statfs: files {} free {}", fs[5], fs[6]);
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/tmp/n").as_ptr(), 0o755) };
+    println!(
+        "bad size: {} bad uid: {}",
+        mount_new("tmpfs", "/tmp/n", 0, "size=lots"),
+        mount_new("tmpfs", "/tmp/n", 0, "uid=-1")
+    );
+}
+
+/// The names in directory `p`.
+fn names_in(p: &str) -> Vec<String> {
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c(p).as_ptr(), O_RDONLY | O_DIRECTORY) };
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        // SAFETY: a buffer of its length.
+        let n = unsafe { syscall(61, fd, buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        let mut at = 0;
+        while at < n as usize {
+            let len = u16::from_ne_bytes([buf[at + 16], buf[at + 17]]) as usize;
+            // SAFETY: a NUL-terminated name within the entry.
+            let name = unsafe { std::ffi::CStr::from_ptr(buf[at + 19..].as_ptr().cast()) };
+            out.push(name.to_string_lossy().into_owned());
+            at += len;
+        }
+    }
+    // SAFETY: the descriptor just opened.
+    unsafe { close(fd) };
+    out
+}
+
+/// A `proc` mount's `hidepid=invisible` hides another user's process from
+/// one who may not trace it (root sees it); `noaccess`, after a remount,
+/// lists it and keeps the reader out of it (`EPERM`); `subset=pid` shows
+/// only the processes; a value Linux refuses is `EINVAL`.
+fn proc_options_scenario() {
+    const MS_REMOUNT: u64 = 32;
+    // SAFETY: a plain call.
+    unsafe { unshare(CLONE_NEWNS_FLAG) };
+    let mut ready = [0i32; 2];
+    let mut hold = [0i32; 2];
+    // SAFETY: two pipes.
+    unsafe {
+        pipe(ready.as_mut_ptr());
+        pipe(hold.as_mut_ptr());
+    }
+    // SAFETY: plain fork; the child changes user, says so and waits.
+    let other = unsafe { fork() };
+    if other == 0 {
+        // SAFETY: plain calls on the pipes above; a byte buffer.
+        unsafe {
+            setuid(1000);
+            write(ready[1], b"1".as_ptr(), 1);
+            let mut b = [0u8; 1];
+            close(hold[1]);
+            read(hold[0], b.as_mut_ptr(), 1);
+            _exit(0);
+        }
+    }
+    let mut b = [0u8; 1];
+    // SAFETY: the pipe above; a byte buffer.
+    unsafe { read(ready[0], b.as_mut_ptr(), 1) };
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/p").as_ptr(), 0o755);
+        mkdir(c("/tmp/q").as_ptr(), 0o755);
+    }
+    println!("hidepid=invisible: {}", mount_new("proc", "/tmp/p", 0, "hidepid=invisible"));
+    let pid = other.to_string();
+    let theirs = format!("/tmp/p/{pid}/status");
+    let seen = |label: &str| {
+        let mut st = [0u64; 16];
+        // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+        let r = unsafe { stat(c(&format!("/tmp/p/{pid}")).as_ptr(), st.as_mut_ptr().cast()) };
+        println!(
+            "{label}: stat {} listed {} status {}",
+            res(r.into()),
+            names_in("/tmp/p").contains(&pid),
+            try_open(&theirs, O_RDONLY)
+        );
+    };
+    seen("root");
+    as_user(2000, || {
+        seen("another user");
+        println!("own: {}", try_open("/tmp/p/self/status", O_RDONLY));
+    });
+    // SAFETY: NUL-terminated strings.
+    let r = unsafe {
+        mount(
+            std::ptr::null(),
+            c("/tmp/p").as_ptr(),
+            std::ptr::null(),
+            MS_REMOUNT,
+            c("hidepid=noaccess").as_ptr(),
+        )
+    };
+    println!("remount noaccess: {}", res(r.into()));
+    as_user(2000, || seen("another user"));
+    println!("subset=pid: {}", mount_new("proc", "/tmp/q", 0, "subset=pid"));
+    let names = names_in("/tmp/q");
+    println!(
+        "meminfo: {} self: {} listed meminfo {} pid {}",
+        try_open("/tmp/q/meminfo", O_RDONLY),
+        try_open("/tmp/q/self/status", O_RDONLY),
+        names.iter().any(|n| n == "meminfo"),
+        names.contains(&pid)
+    );
+    println!("hidepid=3: {}", mount_new("proc", "/tmp/q", 0, "hidepid=3"));
+    // SAFETY: the pipe the child waits on; then the child itself.
+    unsafe {
+        close(hold[1]);
+        let mut st = 0;
+        waitpid(other, &mut st, 0);
     }
 }
