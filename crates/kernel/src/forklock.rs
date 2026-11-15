@@ -136,7 +136,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &net::KEPT_VALUES,
         &net::MEMBERSHIPS,
         &net::NAMES,
-        &net::SOCKET_MODES,
+        &net::SOCKETS,
         &netlink::SOCKS,
         &nsfd::FDS,
         &memfd::READ_ONLY,

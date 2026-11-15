@@ -759,6 +759,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     }
     crate::netns::made(fd);
     fresh(fd);
+    socket_made(fd, Some(own_ids()));
     fd as i64
 }
 
@@ -766,6 +767,9 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
 /// `pidfd_getfd`): a socket standing in for a kind the host lacks is
 /// marked as one here too.
 pub fn adopt(fd: i32) {
+    if kind(fd).is_some() {
+        socket_made(fd, None);
+    }
     // A SOCK_SEQPACKET socket of fwe's.
     crate::seqpacket::adopt(fd);
     // A ping socket, whose receives come with the IP header on macOS.
@@ -886,6 +890,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     crate::netns::made(fds[1]);
     fresh(fds[0]);
     fresh(fds[1]);
+    socket_made(fds[0], Some(own_ids()));
+    socket_made(fds[1], Some(own_ids()));
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -1027,7 +1033,7 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     if r == 0 && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
         // The node takes the socket's mode (its `fchmod`, or every bit),
         // less the umask, as on Linux.
-        let mode = take_socket_mode(fd as i32).unwrap_or(0o777) & !umask;
+        let mode = socket_inode(fd as i32).map_or(0o777, |s| s.perm) & !umask;
         let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
         if let Ok(name) = std::ffi::CString::new(&hb[2..end]) {
             use std::os::fd::AsRawFd;
@@ -1067,9 +1073,22 @@ fn family(hb: &[u8]) -> i32 {
     }
 }
 
-/// Modes given unbound sockets with `fchmod`, by descriptor and the
-/// socket's inode: what a node bound for one is made with.
-pub(crate) static SOCKET_MODES: std::sync::Mutex<Vec<(i32, u64, u32)>> =
+/// What Linux keeps on a socket's own inode that the host keeps nowhere:
+/// its owner and its mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketInode {
+    /// The file-system ids of the process that made it (initial-namespace
+    /// ids), or none for one this process did not make (received).
+    pub owner: Option<(u32, u32)>,
+    /// Its permission bits: every one until an `fchmod`, which a node
+    /// bound for it is made with (less the umask).
+    pub perm: u32,
+}
+
+/// [`SocketInode`]s by the host socket's inode number, which every
+/// descriptor of the socket shares; a socket made, accepted or received
+/// with a number another had starts afresh.
+pub(crate) static SOCKETS: std::sync::Mutex<Vec<(u64, SocketInode)>> =
     std::sync::Mutex::new(Vec::new());
 
 fn inode(fd: i32) -> Option<u64> {
@@ -1079,20 +1098,44 @@ fn inode(fd: i32) -> Option<u64> {
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino as u64)
 }
 
-/// `fchmod` of socket `fd` to `perm`: the mode a node bound for it gets
-/// (the host has no mode for a socket itself).
-pub fn set_socket_mode(fd: i32, perm: u32) {
+/// Socket `fd` was made or accepted by this process, as its file-system
+/// ids are now: its owner. A received one (`owner` none) has the host's.
+fn socket_made(fd: i32, owner: Option<(u32, u32)>) {
     let Some(ino) = inode(fd) else { return };
-    let mut m = SOCKET_MODES.lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|&(f, _, _)| f != fd);
-    m.push((fd, ino, perm & 0o7777));
+    let mut m = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    // Those of sockets gone: none is open here with its number now.
+    if m.len() >= 64 && m.len().is_power_of_two() {
+        let open: std::collections::HashSet<u64> =
+            crate::fdtable::open_fds().into_iter().filter_map(inode).collect();
+        m.retain(|(n, _)| open.contains(n));
+    }
+    m.retain(|&(n, _)| n != ino);
+    m.push((ino, SocketInode { owner, perm: 0o777 }));
 }
 
-fn take_socket_mode(fd: i32) -> Option<u32> {
+/// The owner and mode Linux would show for socket `fd`, if this process
+/// knows them.
+pub fn socket_inode(fd: i32) -> Option<SocketInode> {
     let ino = inode(fd)?;
-    let mut m = SOCKET_MODES.lock().unwrap_or_else(|e| e.into_inner());
-    let i = m.iter().position(|&(f, n, _)| f == fd && n == ino)?;
-    Some(m.swap_remove(i).2)
+    let m = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    m.iter().find(|&&(n, _)| n == ino).map(|&(_, s)| s)
+}
+
+/// The caller's file-system ids, as a socket it makes is owned by.
+fn own_ids() -> (u32, u32) {
+    let a = crate::creds::access();
+    (a.fsuid, a.fsgid)
+}
+
+/// `fchmod` of socket `fd` to `perm` (the host has no mode for a socket
+/// itself).
+pub fn set_socket_mode(fd: i32, perm: u32) {
+    let Some(ino) = inode(fd) else { return };
+    let mut m = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    match m.iter_mut().find(|(n, _)| *n == ino) {
+        Some((_, s)) => s.perm = perm & 0o7777,
+        None => m.push((ino, SocketInode { owner: None, perm: perm & 0o7777 })),
+    }
 }
 
 /// `listen(fd, backlog)`. Linux queues one connection more than the
@@ -1202,6 +1245,7 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     // A connection is in its listener's namespace.
     crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
     fresh(r);
+    socket_made(r, Some(own_ids()));
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.
@@ -1885,7 +1929,6 @@ fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u
 
 // --- options --------------------------------------------------------------
 
-/// Map a Linux `(level, optname)` to the host pair.
 /// Socket `fd`'s host family and type (`None` if it is not a socket).
 fn kind(fd: i32) -> Option<(i32, i32)> {
     let mut hb = empty_sockaddr();

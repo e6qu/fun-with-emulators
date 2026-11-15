@@ -807,7 +807,15 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   root (fwe's user) keeps it in `org.fwe.owner`, under the same flag;
   `stat` reports it. A new file is its maker's (its file-system user, and
   group or a set-group-ID directory's), and `chown` changes the record
-  under Linux's rules.
+  under Linux's rules. A Unix socket node takes no extended attribute on
+  macOS: its owner is a file in fwe's directory for the user, named by
+  the node's device, inode and birth time (`socketowners.rs`), removed
+  with the leftovers once the node is gone.
+- **Sockets themselves** (`net.rs`): a socket is its maker's (the
+  file-system ids that made or accepted it), every permission bit set
+  until its owner's `fchmod`; `fstat` reports both, and a node `bind`
+  makes takes that mode less the umask. They are kept by the host
+  socket's inode number, in the process.
 - **Permission checks** are fwe's (`creds::Access::permits`): opening a
   file, `faccessat` (by the real ids unless `AT_EACCESS`, the walk too),
   changing a directory's entries (with the sticky bit's restriction, in an

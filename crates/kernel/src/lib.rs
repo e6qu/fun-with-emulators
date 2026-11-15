@@ -99,6 +99,8 @@ pub mod signal;
 pub mod signalfd;
 pub mod signote;
 pub mod snapshot;
+#[cfg(target_os = "macos")]
+pub mod socketowners;
 pub mod sockopt;
 pub mod specialfd;
 pub mod specialwrite;

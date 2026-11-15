@@ -360,6 +360,15 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
         crate::owners::apply(&mut out, owner);
         return Ok(out);
     }
+    // A socket's own inode: its maker's, every bit allowed until an
+    // `fchmod` (the host keeps neither).
+    if out.st_mode & libc::S_IFMT == libc::S_IFSOCK {
+        let s = crate::net::socket_inode(fd);
+        let owner = s.and_then(|s| s.owner).unwrap_or_else(|| crate::owners::host_owner(&out));
+        crate::modes::apply(&mut out, s.map_or(0o777, |s| s.perm));
+        crate::owners::apply(&mut out, owner);
+        return Ok(out);
+    }
     let perm = crate::modes::guest_perm_fd(fd, &out);
     let owner = crate::owners::of_fd(fd, &out);
     crate::modes::apply(&mut out, perm);
@@ -3081,6 +3090,10 @@ impl<P: Platform> Kernel<P> {
     /// one that only a reader that may trace it reads
     /// ([`crate::procpid::TRACER_ONLY`]): `EACCES` then.
     pub(crate) fn proc_refused(&self, dirfd: i32, path: &[u8]) -> Option<i32> {
+        // A path found ahead under no mount but the root's is not in /proc.
+        if self.fs().found_direct(dirfd, path) {
+            return None;
+        }
         let a = self.fs().absolute_path(dirfd, path)?;
         let (m, fs_path) = self.fs().mount_of(&a);
         if m.fstype != crate::mounts::FsType::Proc {

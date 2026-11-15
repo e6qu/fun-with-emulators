@@ -7229,7 +7229,9 @@ fn nodump_is_apart_from_kept_owners() {
 /// read through a handle, `O_PATH` for naming only, `EROFS` to write
 /// through a read-only mount, the file's mode for a caller without
 /// `CAP_DAC_OVERRIDE`, `EPERM` without `CAP_DAC_READ_SEARCH`; a handle
-/// forged for a host file outside the root is stale.
+/// forged for a host file outside the root is stale, as is one used with
+/// a descriptor of another file system; a link's own handle opens as
+/// `O_NOFOLLOW` opens it (`ELOOP`).
 #[test]
 fn file_handles_open_within_the_guests_view() {
     use std::os::unix::fs::MetadataExt;
@@ -7241,7 +7243,8 @@ fn file_handles_open_within_the_guests_view() {
     assert_eq!(
         out,
         "read: hello\nO_PATH read: EBADF\nread-only mount: write EROFS read ok\n\
-         outside the root: ESTALE\nwithout CAP_DAC_OVERRIDE: write EACCES read ok\n\
+         outside the root: ESTALE\nlink: ELOOP other file system: ESTALE\n\
+         without CAP_DAC_OVERRIDE: write EACCES read ok\n\
          without CAP_DAC_READ_SEARCH: EPERM\n"
     );
 }
@@ -7310,6 +7313,14 @@ fn unix_socket_nodes_are_held_to_their_modes() {
         fsrules("unixperm"),
         "connect EACCES sendto EACCES bind EACCES\nconnect ok sendto ok bind ok\n"
     );
+}
+
+/// A socket is its maker's: a user who is not root may `fchmod` the one
+/// it made, which `fstat` shows and the node bound for it takes (less the
+/// umask).
+#[test]
+fn a_socket_is_its_makers_and_takes_its_mode_to_its_node() {
+    assert_eq!(fsrules("sockmode"), "made 777 1000 fchmod ok now 700 1000 bind ok node 700 1000\n");
 }
 
 /// An overlay's sticky directory restricts removal as any does: a user

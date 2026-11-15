@@ -1967,13 +1967,18 @@ pub fn poll_revents_to_linux(host: i16, asked: i16) -> i16 {
 /// it closes any descriptor of it, so fwe never opens a guest's file for
 /// its own ends. `call` gets the file's full path, or where that is too
 /// long for the host, `name` itself from the thread's working directory
-/// set to `dir` for the call (`pthread_fchdir_np`). Linux hosts (the unit
-/// tests) reach it through `/proc/self/fd`.
+/// set to `dir` for the call (`pthread_fchdir_np`); with `dir` the working
+/// directory (`AT_FDCWD`), `name` itself. Linux hosts (the unit tests)
+/// reach it through `/proc/self/fd`.
 pub fn at_path<T>(
     dir: i32,
     name: &std::ffi::CStr,
     call: impl FnOnce(&std::ffi::CStr) -> T,
 ) -> Result<T, i32> {
+    // From the working directory, or absolute: the name is the path.
+    if dir == libc::AT_FDCWD {
+        return Ok(call(name));
+    }
     let full = crate::fs::fd_path(dir).and_then(|mut p| {
         p.push(b'/');
         p.extend_from_slice(name.to_bytes());

@@ -622,7 +622,8 @@ const YOUNG: std::time::Duration = std::time::Duration::from_secs(60);
 /// when its last process leaves: namespaces nobody is in, tmpfs directories
 /// and rootfs `/dev/shm` directories no live mount table shows, records
 /// another fwe build wrote, the initial mount table of a rootfs that is
-/// gone, and the tracing mailboxes of processes that are gone.
+/// gone, the tracing mailboxes of processes that are gone, and the owners
+/// kept for socket nodes that are gone.
 ///
 /// It runs at most once a minute ([`YOUNG`], within which nothing would be
 /// removed anyway), as a fresh fwe starts, in a process of its own: a
@@ -707,6 +708,9 @@ fn collect_in(base: &[u8]) {
     crate::procreg::collect_leftovers(YOUNG);
     // Prepared code no start has made for a month.
     crate::prepcache::collect(std::time::Duration::from_secs(30 * 24 * 3600));
+    // The owners of socket nodes that are gone.
+    #[cfg(target_os = "macos")]
+    crate::socketowners::collect();
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
         live.extend(r.ns);

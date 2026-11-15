@@ -46,6 +46,7 @@ unsafe extern "C" {
     fn fstat(fd: i32, st: *mut u8) -> i32;
     fn chown(p: *const c_char, u: u32, g: u32) -> i32;
     fn chmod(p: *const c_char, m: u32) -> i32;
+    fn fchmod(fd: i32, m: u32) -> i32;
     fn ioctl(fd: i32, req: u64, ...) -> i32;
     fn mknod(p: *const c_char, m: u32, d: u64) -> i32;
     fn chdir(p: *const c_char) -> i32;
@@ -374,6 +375,19 @@ fn handles_scenario(outside: u64) {
     let mut forged = h;
     forged[16..24].copy_from_slice(&outside.to_ne_bytes());
     println!("outside the root: {}", res(open_handle("/tmp", &forged, O_RDONLY)));
+    // A link's own handle opens as `O_NOFOLLOW` opens it; a descriptor of
+    // another file system (`/dev/null`) holds no file the handle names.
+    // SAFETY: NUL-terminated paths.
+    unsafe { symlink(c("h").as_ptr(), c("/tmp/hl").as_ptr()) };
+    let link = handle_of("/tmp/hl");
+    // SAFETY: a NUL-terminated path; a handle as `name_to_handle_at` wrote it.
+    let other = unsafe {
+        let null = open(c("/dev/null").as_ptr(), O_RDONLY);
+        let r = res(syscall(SYS_OPEN_BY_HANDLE_AT, null, h.as_ptr(), O_RDONLY));
+        close(null);
+        r
+    };
+    println!("link: {} other file system: {other}", res(open_handle("/tmp", &link, O_RDWR)));
     let locked = handle_of("/tmp/locked");
     in_child(|| {
         // Only `CAP_DAC_READ_SEARCH` (2) left.
@@ -739,6 +753,50 @@ fn unix_permissions_scenario() {
     }
     try_all();
     let _ = (s, d);
+}
+
+/// A socket is its maker's, every bit allowed: its maker may `fchmod` it,
+/// as conmon does before binding its attach socket, and the node bound
+/// for it takes that mode, less the umask.
+fn socket_mode_scenario() {
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/open").as_ptr(), 0o777);
+        chmod(c("/tmp/open").as_ptr(), 0o777);
+    }
+    in_child(|| {
+        // SAFETY: plain id changes.
+        unsafe {
+            setgroups(0, std::ptr::null());
+            setgid(1000);
+            setuid(1000);
+        }
+        let fstat_of = |fd: i32| {
+            let mut st = [0u64; 16];
+            // SAFETY: a buffer as big as a `struct stat`.
+            assert_eq!(unsafe { fstat(fd, st.as_mut_ptr().cast()) }, 0);
+            let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
+            format!("{:o} {}", word(4) & 0o7777, word(6))
+        };
+        // SAFETY: plain calls; a socket address of its length.
+        unsafe {
+            umask(0o022);
+            let s = socket(1, 1, 0);
+            let fresh = fstat_of(s);
+            let changed = res(fchmod(s, 0o700).into());
+            let after = fstat_of(s);
+            let bound = res(bind_socket(s, unix_addr("/tmp/open/sm").as_ptr(), 110).into());
+            if bound != "ok" {
+                println!("made {fresh} fchmod {changed} now {after} bind {bound}");
+                return;
+            }
+            let (uid, _, mode) = stat_of("/tmp/open/sm");
+            println!(
+                "made {fresh} fchmod {changed} now {after} bind {bound} node {:o} {uid}",
+                mode & 0o7777
+            );
+        }
+    });
 }
 
 /// In an overlay's sticky directory, as in any, a user may remove or
@@ -1140,6 +1198,7 @@ fn main() {
         "slash" => trailing_slash_scenario(),
         "ovlsticky" => overlay_sticky_scenario(),
         "unixperm" => unix_permissions_scenario(),
+        "sockmode" => socket_mode_scenario(),
         "opath" => opath_scenario(),
         "getlk" => getlk_scenario(),
         "chattr" => chattr_scenario(),

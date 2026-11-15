@@ -7,7 +7,9 @@
 //! attribute: a user id and a group id, little-endian. The file is flagged
 //! as [`crate::modes`] flags a kept mode (the same host flag marks either),
 //! so that a `stat` shows at once whether to look. A file whose owner is
-//! root again loses the attribute.
+//! root again loses the attribute. A Unix socket node, which takes no
+//! extended attribute on macOS, keeps its owner in
+//! [`crate::socketowners`].
 
 use std::ffi::CStr;
 
@@ -200,7 +202,23 @@ fn read_path(path: &CStr) -> Option<(u32, u32)> {
             libc::XATTR_NOFOLLOW,
         )
     };
+    // A socket node takes no attribute (it has none): its owner is kept
+    // apart.
+    if n < 0 && crate::host::last_errno() == libc::ENOATTR {
+        return socket_node(path).and_then(|st| crate::socketowners::read(&st));
+    }
     decode(&buf, n)
+}
+
+/// The host metadata of the socket node at `path` (not followed), if it is
+/// one.
+#[cfg(target_os = "macos")]
+fn socket_node(path: &CStr) -> Option<libc::stat> {
+    // SAFETY: zeroed bytes are a valid `stat`; `lstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid out-parameter.
+    let r = unsafe { libc::lstat(path.as_ptr(), &mut st) };
+    (r == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK).then_some(st)
 }
 
 /// Keep `owner` for the file open as `fd` (or forget a kept one, for
@@ -239,18 +257,28 @@ fn mark_path(path: &CStr, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<
         match owner {
             Some(o) => {
                 let v = encode(o);
-                let set = libc::setxattr(
+                let socket = st.st_mode & libc::S_IFMT == libc::S_IFSOCK;
+                if socket {
+                    // A socket node takes no attribute.
+                    crate::socketowners::write(st, Some(o))?;
+                } else if libc::setxattr(
                     path.as_ptr(),
                     ATTR.as_ptr(),
                     v.as_ptr().cast(),
                     8,
                     0,
                     libc::XATTR_NOFOLLOW,
-                );
-                if set != 0 {
+                ) != 0
+                {
                     return Err(last());
                 }
                 crate::modes::set_mark_path(path, st, true);
+            }
+            None if crate::modes::marked(st) && st.st_mode & libc::S_IFMT == libc::S_IFSOCK => {
+                crate::socketowners::write(st, None)?;
+                if !crate::modes::kept_path(path) && !crate::modes::flags_set_path(path) {
+                    crate::modes::set_mark_path(path, st, false);
+                }
             }
             None if crate::modes::marked(st)
                 && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0
