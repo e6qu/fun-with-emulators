@@ -144,11 +144,6 @@ fn alive(p: Proc) -> bool {
 }
 
 static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
-fn registry_dir() -> Option<Vec<u8>> {
-    let mut d = crate::fs::shm::user_dir().ok()?;
-    d.extend_from_slice(format!("/v{}-inotify", crate::shared::FORMAT).as_bytes());
-    Some(d)
-}
 
 /// The registry, every process's, if any process has made it (it lasts,
 /// once made): a count in the process store says so, so a file call costs
@@ -161,7 +156,9 @@ pub fn registry() -> Option<&'static Record<Registry>> {
     if count(Count::Watches).load(Ordering::SeqCst) == 0 {
         return None;
     }
-    let r = registry_dir().and_then(|d| Record::join(&d, 0).ok())?;
+    // Opened, or made if it is not there (the count can outlive it: a
+    // process's store of another fwe build), so it is looked for once.
+    let r = Record::named("inotify", 0, Registry::default).ok()?;
     let _ = REGISTRY.set(r);
     REGISTRY.get()
 }
