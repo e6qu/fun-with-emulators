@@ -1965,15 +1965,20 @@ fn empty_dir() -> Result<OwnedFd, i32> {
 }
 
 /// Whether host metadata `st` is of [`empty_dir`], which nothing may
-/// be made in.
+/// be made in. Its identity is learnt once a process: every change of a
+/// directory asks.
 pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
-    empty_dir().is_ok_and(|d| {
+    static ID: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+    let id = |s: &libc::stat| (s.st_dev as u64, s.st_ino as u64);
+    let empty = ID.get_or_init(|| {
+        let d = empty_dir().ok()?;
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
         let mut e: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out-parameter.
-        let ok = unsafe { libc::fstat(d.as_raw_fd(), &mut e) } == 0;
-        ok && e.st_dev == st.st_dev && e.st_ino == st.st_ino
-    })
+        (unsafe { libc::fstat(d.as_raw_fd(), &mut e) } == 0).then(|| id(&e))
+    });
+    empty.is_some_and(|e| e == id(st))
 }
 
 /// Whether a caller of file-system user `fsuid` may follow the symbolic

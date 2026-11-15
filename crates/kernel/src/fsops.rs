@@ -897,7 +897,7 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EPERM);
         }
-        let host_mode = crate::modes::host_perm(mode, false);
+        let host_mode = crate::modes::made_file_perm(mode);
         if resolved.fstype == crate::mounts::FsType::Cgroup2
             && let Some(host) = crate::fs::host_path_in(resolved.dir.as_raw_fd(), &resolved.name)
             && let Some((cg, Some(file))) = crate::cgroupfs::locate(&host)

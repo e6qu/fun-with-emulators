@@ -737,9 +737,13 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   not in, and on any write), is kept in `org.fwe.mode`, the file flagged
   `UF_NODUMP`; `stat` reports it. A write by a caller without
   `CAP_FSETID` clears a file's set-ID bits, as on Linux. Where a path is
-  too long for the host, its attributes go through a descriptor. A file
-  made by something else that the host refuses root is converted the first
-  time.
+  too long for the host, its attributes go through a descriptor. A
+  regular file `open` makes has its mode itself on the host where only
+  the owner's read or write bits are denied (a repository's read-only
+  objects, which are never written again); such a file, or one made by
+  something else, is converted the first time the host refuses what fwe
+  allowed (an open, an attribute, a kept owner). The kept mode and owner
+  are read once a process per file and change time.
 - **Owners** (`crates/kernel/src/owners.rs`): a file whose owner is not
   root (fwe's user) keeps it in `org.fwe.owner`, under the same flag;
   `stat` reports it. A new file is its maker's (its file-system user, and

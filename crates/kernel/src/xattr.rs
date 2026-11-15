@@ -208,7 +208,7 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
     let n = host_name(name)?;
     let (v, len) = (value.as_ptr().cast(), value.len());
     // SAFETY: valid name and value buffers.
-    let r = unsafe {
+    let raw = || unsafe {
         match t {
             #[cfg(target_os = "macos")]
             Target::Path(p) => {
@@ -222,7 +222,29 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
             Target::Fd(fd) => libc::fsetxattr(*fd, n.as_ptr(), v, len, host_flags),
         }
     };
-    if r != 0 { fail() } else { Ok(()) }
+    owned(t, raw)
+}
+
+/// Run `raw`, a host call that changes `t`'s attributes, which fwe has
+/// allowed: refused by host bits that deny the owner (a file made with
+/// such a mode, [`crate::modes::made_file_perm`]), the mode is kept apart
+/// and `raw` run again.
+fn owned(t: &Target, raw: impl Fn() -> i32) -> Result<(), i32> {
+    if raw() == 0 {
+        return Ok(());
+    }
+    let e = fail();
+    if e != Err(errno::EACCES) {
+        return e;
+    }
+    let kept = match t {
+        Target::Path(p) => crate::modes::own_path(p),
+        Target::Fd(fd) => crate::modes::own_fd(*fd),
+    };
+    if kept.is_err() {
+        return e;
+    }
+    if raw() != 0 { fail() } else { Ok(()) }
 }
 
 /// Remove attribute `name` of `t`.
@@ -232,7 +254,7 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
     }
     let n = host_name(name)?;
     // SAFETY: a valid name.
-    let r = unsafe {
+    let raw = || unsafe {
         match t {
             #[cfg(target_os = "macos")]
             Target::Path(p) => libc::removexattr(p.as_ptr(), n.as_ptr(), libc::XATTR_NOFOLLOW),
@@ -244,7 +266,7 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
             Target::Fd(fd) => libc::fremovexattr(*fd, n.as_ptr()),
         }
     };
-    if r != 0 { fail() } else { Ok(()) }
+    owned(t, raw)
 }
 
 /// The names of `t`'s attributes `who` sees, each NUL-terminated, as

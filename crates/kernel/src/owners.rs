@@ -28,12 +28,13 @@ pub fn of_fd(fd: i32, st: &libc::stat) -> (u32, u32) {
     }
     // By its path where the descriptor reads no attribute (one opened only
     // to search a directory).
-    read_fd(fd)
-        .or_else(|| {
+    crate::modes::owner_once(st, || {
+        read_fd(fd).or_else(|| {
             let p = std::ffi::CString::new(crate::fs::fd_path(fd)?).ok()?;
             read_path(&p)
         })
-        .unwrap_or_else(|| host_owner(st))
+    })
+    .unwrap_or_else(|| host_owner(st))
 }
 
 /// [`of_fd`] for `name` in directory `dir` (not followed).
@@ -41,12 +42,12 @@ pub fn of_at(dir: i32, name: &CStr, st: &libc::stat) -> (u32, u32) {
     if !crate::modes::marked(st) {
         return host_owner(st);
     }
-    match path_of(dir, name) {
+    crate::modes::owner_once(st, || match path_of(dir, name) {
         Some(p) => read_path(&p),
         // A path too long for the host: through a descriptor of the file.
         None => crate::modes::open_at(dir, name)
             .and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
-    }
+    })
     .unwrap_or_else(|| host_owner(st))
 }
 
@@ -55,7 +56,7 @@ pub fn of_path(path: &CStr, st: &libc::stat) -> (u32, u32) {
     if !crate::modes::marked(st) {
         return host_owner(st);
     }
-    read_path(path).unwrap_or_else(|| host_owner(st))
+    crate::modes::owner_once(st, || read_path(path)).unwrap_or_else(|| host_owner(st))
 }
 
 /// Put the owner `(uid, gid)` in `st`, in place of the host's ids.
@@ -75,7 +76,15 @@ pub fn keep_fd(fd: i32, owner: (u32, u32)) -> Result<(), i32> {
         st = fstat(fd)?;
     }
     let record = (owner != host_owner(&st)).then_some(owner);
-    mark_fd(fd, &st, record)
+    match mark_fd(fd, &st, record) {
+        // A mode that denies the owner writing the attribute: kept apart
+        // first ([`crate::modes::own_fd`]).
+        Err(fwe_abi::errno::EACCES) if record.is_some() => {
+            crate::modes::own_fd(fd)?;
+            mark_fd(fd, &fstat(fd)?, record)
+        }
+        r => r,
+    }
 }
 
 /// Whether the host gives the file whose metadata is `st` another group
@@ -110,10 +119,24 @@ pub fn keep_at(dir: i32, name: &CStr, owner: (u32, u32)) -> Result<(), i32> {
     }
     let record = (owner != host_owner(&st)).then_some(owner);
     match path_of(dir, name) {
-        Some(path) => mark_path(&path, &st, record),
+        Some(path) => match mark_path(&path, &st, record) {
+            // As [`keep_fd`]'s.
+            Err(fwe_abi::errno::EACCES) if record.is_some() => {
+                crate::modes::own_path(&path)?;
+                mark_path(&path, &fstatat(dir, name)?, record)
+            }
+            r => r,
+        },
         None => {
             let fd = crate::modes::open_at(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
-            mark_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), &st, record)
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&fd);
+            match mark_fd(fd, &st, record) {
+                Err(fwe_abi::errno::EACCES) if record.is_some() => {
+                    crate::modes::own_fd(fd)?;
+                    mark_fd(fd, &fstat(fd)?, record)
+                }
+                r => r,
+            }
         }
     }
 }
