@@ -1076,7 +1076,10 @@ memory only, and refuses `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`).
 
 **`madvise(MADV_DONTNEED)`**: macOS's own keeps the contents, so natively
 each private anonymous piece of the range is replaced by a fresh mapping of
-the same protection; shared and file memory is left alone. In the VM the
+the same protection, which gives the memory back as Linux does; shared and
+file memory is left alone. Which pieces those are, and their protection,
+comes from fwe's record of the mappings; only code and poisoned memory,
+whose host protection differs from the guest's, ask the host for it. In the VM the
 slab pages are zeroed, or refilled from the file for a private file mapping.
 `MADV_WIPEONFORK`, `MAP_GROWSDOWN` growth and `MADV_HWPOISON` act natively
 only.

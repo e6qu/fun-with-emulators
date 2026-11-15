@@ -16,6 +16,13 @@ use std::collections::BTreeMap;
 /// seen from its end.
 pub trait Mapping: Clone + PartialEq + std::fmt::Debug {
     fn at(&self, offset: u64) -> Self;
+
+    /// Whether `next` is this mapping seen from `offset` bytes into it
+    /// (`self.at(offset) == *next`), which a mapping may tell without
+    /// making the copy.
+    fn continues(&self, offset: u64, next: &Self) -> bool {
+        self.at(offset) == *next
+    }
 }
 
 /// A range `[start, end)` and what it maps.
@@ -200,16 +207,27 @@ impl<V: Mapping> Vmas<V> {
     /// Merge the mappings in and next to `[start, end)` that continue each
     /// other.
     fn merge_around(&mut self, start: u64, end: u64) {
-        use std::ops::Bound::{Excluded, Included};
-        let from = self.map.range(..start).next_back().map_or(start, |(&s, _)| s);
-        let Some((&first, _)) = self.map.range(from..=end).next() else { return };
-        let mut cur = first;
-        while let Some((&next, (ne, nv))) = self.map.range((Excluded(cur), Included(end))).next() {
-            let (ce, cv) = &self.map[&cur];
-            if *ce == next && cv.at(next - cur) == *nv {
+        let Some(mut cur) = self
+            .map
+            .range(..start)
+            .next_back()
+            .or_else(|| self.map.range(start..).next())
+            .map(|(&s, _)| s)
+        else {
+            return;
+        };
+        loop {
+            // The mapping at `cur` and the one after it, if that starts by `end`.
+            let mut pair = self.map.range(cur..=end.max(cur));
+            let (Some((_, (ce, cv))), Some((&next, (ne, nv)))) = (pair.next(), pair.next()) else {
+                return;
+            };
+            if *ce == next && cv.continues(next - cur, nv) {
                 let ne = *ne;
                 self.map.remove(&next);
-                self.map.get_mut(&cur).unwrap().0 = ne;
+                if let Some((e, _)) = self.map.get_mut(&cur) {
+                    *e = ne;
+                }
             } else {
                 cur = next;
             }

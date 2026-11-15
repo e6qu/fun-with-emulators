@@ -83,6 +83,21 @@ impl Mapping for Area {
         }
         a
     }
+
+    fn continues(&self, offset: u64, next: &Self) -> bool {
+        let (a, b) = (&self.object, &next.object);
+        let moved = if matches!(a.name, Name::Exe | Name::Path(_)) { offset } else { 0 };
+        self.prot == next.prot
+            && self.shared == next.shared
+            && self.locked == next.locked
+            && self.noexec == next.noexec
+            && self.nowrite == next.nowrite
+            && self.sealed == next.sealed
+            && a.dev == b.dev
+            && a.ino == b.ino
+            && a.offset.wrapping_add(moved) == b.offset
+            && a.name == b.name
+    }
 }
 
 impl Area {
@@ -93,6 +108,13 @@ impl Area {
             Name::Exe | Name::Path(_) => self.object.offset,
             _ => 0,
         }
+    }
+
+    /// Private anonymous memory (the break and the stack too): what
+    /// `MADV_DONTNEED` zero-fills, and `MADV_FREE` and `MADV_WIPEONFORK`
+    /// take.
+    pub fn private_anonymous(&self) -> bool {
+        !self.shared && matches!(self.object.name, Name::Anonymous | Name::Heap | Name::Stack)
     }
 
     fn anonymous(prot: u64, name: Name) -> Area {
@@ -849,6 +871,54 @@ mod tests {
 
     fn file(path: &str, offset: u64) -> Option<Object> {
         Some(Object { name: Name::Path(path.as_bytes().into()), dev: 0x803, ino: 42, offset })
+    }
+
+    /// `continues` tells what comparing with `at` tells, for every field
+    /// that can differ.
+    #[test]
+    fn continuing_is_comparing_the_moved_mapping() {
+        use crate::vmas::Mapping;
+        let base = Area {
+            prot: mman::PROT_READ,
+            shared: false,
+            locked: false,
+            noexec: false,
+            nowrite: false,
+            sealed: false,
+            object: file("/lib/x.so", 0x1000).unwrap(),
+        };
+        let anon = Area {
+            object: Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 },
+            ..base.clone()
+        };
+        let mut others = vec![base.at(0x4000), base.at(0x8000), anon.clone(), anon.at(0x4000)];
+        for change in [
+            |a: &mut Area| a.prot = mman::PROT_READ | mman::PROT_WRITE,
+            |a: &mut Area| a.shared = true,
+            |a: &mut Area| a.locked = true,
+            |a: &mut Area| a.noexec = true,
+            |a: &mut Area| a.nowrite = true,
+            |a: &mut Area| a.sealed = true,
+            |a: &mut Area| a.object.dev += 1,
+            |a: &mut Area| a.object.ino += 1,
+            |a: &mut Area| a.object.name = Name::Path(b"/lib/y.so"[..].into()),
+            |a: &mut Area| a.object.name = Name::Heap,
+        ] {
+            let mut a = base.at(0x4000);
+            change(&mut a);
+            others.push(a);
+        }
+        for first in [&base, &anon] {
+            for next in &others {
+                for offset in [0, 0x4000, 0x8000] {
+                    assert_eq!(
+                        first.continues(offset, next),
+                        first.at(offset) == *next,
+                        "{first:?} at {offset:#x} against {next:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
