@@ -25,6 +25,20 @@ pub struct CloneArgs {
     pub set_tid_size: usize,
 }
 
+/// The flags a thread (`CLONE_THREAD`) may be made with in fwe: the set
+/// the C libraries' thread creation uses.
+pub const THREAD_FLAGS: u64 = CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_CHILD_SETTID
+    | CLONE_DETACHED;
+
 /// The most pid namespaces nested, and so the most pids `set_tid` names.
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -66,6 +80,26 @@ impl CloneArgs {
             return Err(errno::EINVAL);
         }
         Ok(())
+    }
+
+    /// What a new thread needs beyond [`check`](Self::check), in either
+    /// backend: no flag outside [`THREAD_FLAGS`] (`ENOSYS`: fwe does not
+    /// make such a thread) and a stack of its own (`EINVAL`).
+    pub fn thread_flags_check(&self) -> Result<(), i32> {
+        if self.flags & !THREAD_FLAGS & !CSIGNAL != 0 {
+            return Err(errno::ENOSYS);
+        }
+        if self.stack == 0 {
+            return Err(errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// [`thread_flags_check`](Self::thread_flags_check), then room for
+    /// one more task within `RLIMIT_NPROC` and the cgroups' `pids.max`.
+    pub fn thread_check(&self) -> Result<(), i32> {
+        self.thread_flags_check()?;
+        crate::cgroupfs::task_allowed()
     }
 
     /// `clone3(args, size)`: read the guest's `struct clone_args`, and the
@@ -149,6 +183,29 @@ mod tests {
         let mut v = vec![0u64; 11];
         v[..words.len()].copy_from_slice(words);
         v
+    }
+
+    /// A thread is made with the flags the C libraries use and a stack of
+    /// its own, in either backend; another flag is `ENOSYS`, no stack
+    /// `EINVAL`.
+    #[test]
+    fn threads_take_the_known_flags_and_a_stack() {
+        let pthread = CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_SYSVSEM
+            | CLONE_SETTLS
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_CLEARTID;
+        let t = |flags, stack| CloneArgs { flags, stack, ..CloneArgs::from_clone(&[0; 6]) };
+        assert_eq!(t(pthread, 0x1000).thread_flags_check(), Ok(()));
+        assert_eq!(t(pthread | 17, 0x1000).thread_flags_check(), Ok(()));
+        assert_eq!(t(pthread, 0).thread_flags_check(), Err(errno::EINVAL));
+        for other in [CLONE_PARENT, CLONE_IO, CLONE_NEWNS, CLONE_VFORK, CLONE_INTO_CGROUP] {
+            assert_eq!(t(pthread | other, 0x1000).thread_flags_check(), Err(errno::ENOSYS));
+        }
     }
 
     #[test]

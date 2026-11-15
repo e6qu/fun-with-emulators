@@ -448,7 +448,9 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/config.gz" => Entry::File(config_gz()),
         b"/proc/sys/fs/file-max" => Entry::File(b"9223372036854775807\n".to_vec()),
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),
-        b"/proc/sys/vm/mmap_min_addr" => Entry::File(b"65536\n".to_vec()),
+        b"/proc/sys/vm/mmap_min_addr" => {
+            Entry::File(format!("{}\n", crate::mm::MMAP_MIN_ADDR).into_bytes())
+        }
         // No newline, as Linux writes it.
         b"/sys/kernel/security/lsm" => Entry::File(b"capability,landlock,yama".to_vec()),
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {

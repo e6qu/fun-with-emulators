@@ -4002,6 +4002,28 @@ mod tests {
         )
     }
 
+    /// A fixed mapping below `vm.mmap_min_addr` is refused (`EPERM`) to a
+    /// caller without `CAP_SYS_RAWIO`, as is a move there; a hint there is
+    /// only a hint.
+    #[test]
+    fn fixed_mappings_below_mmap_min_addr_need_rawio() {
+        use fwe_abi::mman::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
+        let _g = mapping_lock();
+        let mut k = kernel();
+        k.creds.caps.effective &= !(1 << crate::caps::CAP_SYS_RAWIO);
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        for fixed in [MAP_FIXED, MAP_FIXED_NOREPLACE] {
+            let r = k.syscall(nr::MMAP, [0x8000, 0x4000, 3, anon | fixed, u64::MAX, 0]);
+            assert_eq!(r, err(errno::EPERM));
+        }
+        let p = k.syscall(nr::MMAP, [0, 0x4000, 3, anon, u64::MAX, 0]);
+        assert!(p > 0);
+        // MREMAP_MAYMOVE | MREMAP_FIXED.
+        let r = k.syscall(nr::MREMAP, [p as u64, 0x4000, 0x4000, 3, 0x8000, 0]);
+        assert_eq!(r, err(errno::EPERM));
+        assert_eq!(k.syscall(nr::MUNMAP, [p as u64, 0x4000, 0, 0, 0, 0]), 0);
+    }
+
     /// The credentials survive an `execve` that re-executes fwe, with the
     /// saved IDs becoming the effective ones, and a bad record is refused.
     #[test]

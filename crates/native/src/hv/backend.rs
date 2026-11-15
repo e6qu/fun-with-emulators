@@ -1364,8 +1364,10 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         }
         return fork::fork(parent, a, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
     }
-    if flags & cl::CLONE_VM == 0 || stack == 0 {
-        return err(errno::EINVAL);
+    // The flags a thread may have, its stack and the task limits, as a
+    // native thread's.
+    if let Err(e) = a.thread_check() {
+        return err(e);
     }
     let tid = thread::alloc_tid();
     // Traced from its start if the tracer follows new threads.

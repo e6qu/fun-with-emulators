@@ -29,19 +29,6 @@ struct Spawn {
     pending: std::sync::Arc<thread::Pending>,
 }
 
-/// Flags fwe supports for `clone`: the thread-creation set used by pthreads.
-const SUPPORTED: u64 = cl::CLONE_VM
-    | cl::CLONE_FS
-    | cl::CLONE_FILES
-    | cl::CLONE_SIGHAND
-    | cl::CLONE_THREAD
-    | cl::CLONE_SYSVSEM
-    | cl::CLONE_SETTLS
-    | cl::CLONE_PARENT_SETTID
-    | cl::CLONE_CHILD_CLEARTID
-    | cl::CLONE_CHILD_SETTID
-    | cl::CLONE_DETACHED;
-
 /// Handle a guest `clone` or `clone3` asking for `a`, from the thread whose
 /// registers are `parent`. Returns the child tid to the parent, or a
 /// negative errno.
@@ -56,15 +43,10 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         return crate::process::do_fork(parent, a, share, wait);
     }
     // A thread shares the memory: `CloneArgs::check` refused `CLONE_THREAD`
-    // without `CLONE_SIGHAND` and `CLONE_VM` (`EINVAL`), as Linux does.
-    if flags & !SUPPORTED & !cl::CSIGNAL != 0 {
-        return err(errno::ENOSYS);
-    }
-    if child_stack == 0 {
-        return err(errno::EINVAL);
-    }
-    // Within `RLIMIT_NPROC` and the cgroups' `pids.max`.
-    if let Err(e) = fwe_kernel::cgroupfs::task_allowed() {
+    // without `CLONE_SIGHAND` and `CLONE_VM` (`EINVAL`), as Linux does;
+    // the flags a thread may have, its stack and the task limits are the
+    // VM's checks too.
+    if let Err(e) = a.thread_check() {
         return err(e);
     }
 

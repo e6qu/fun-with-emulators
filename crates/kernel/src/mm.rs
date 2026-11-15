@@ -225,6 +225,10 @@ fn zero_guest(start: u64, len: u64) {
     }
 }
 
+/// `vm.mmap_min_addr`: the lowest address a mapping may be made at
+/// without `CAP_SYS_RAWIO` (Linux's arm64 default).
+pub const MMAP_MIN_ADDR: u64 = 65536;
+
 impl<P: Platform> Kernel<P> {
     /// In a fork child (not one sharing the memory): the ranges given
     /// `MADV_DONTFORK` are not its, as Linux maps nothing there in the
@@ -1221,6 +1225,13 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    /// Whether the caller may map at fixed address `addr`: at or above
+    /// `vm.mmap_min_addr`, or with `CAP_SYS_RAWIO` in the initial user
+    /// namespace, as Linux's `cap_mmap_addr` (`EPERM` otherwise).
+    fn may_map_at(&self, addr: u64) -> bool {
+        addr >= MMAP_MIN_ADDR || self.creds.has(crate::caps::CAP_SYS_RAWIO)
+    }
+
     pub(crate) fn sys_mmap(
         &mut self,
         addr: u64,
@@ -1266,6 +1277,10 @@ impl<P: Platform> Kernel<P> {
         // No more mappings than `vm.max_map_count` allows.
         if too_many_maps(0) {
             return err(errno::ENOMEM);
+        }
+        // Not below `vm.mmap_min_addr`, in either backend.
+        if flags & (mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE) != 0 && !self.may_map_at(addr) {
+            return err(errno::EPERM);
         }
         // A mapping made locked (`MAP_LOCKED`, or after `MCL_FUTURE`) must
         // fit `RLIMIT_MEMLOCK` with what is locked already (`EAGAIN`);
@@ -1572,6 +1587,7 @@ impl<P: Platform> Kernel<P> {
         }
         if self.sealed(old, old_len)
             || (flags & mman::MREMAP_FIXED != 0 && self.sealed(new_addr, new_len))
+            || (flags & mman::MREMAP_FIXED != 0 && !self.may_map_at(new_addr))
         {
             return err(errno::EPERM);
         }

@@ -970,7 +970,7 @@ mod tests {
     /// a page, as Linux's `bpf_check_uarg_tail_zero`.
     #[test]
     fn attribute_tails_must_be_zero() {
-        let mut a = vec![0u8; 200];
+        let mut a = [0u8; 200];
         let at = a.as_ptr() as u64;
         assert_eq!(tail_zero(at, 200), Ok(()));
         assert_eq!(tail_zero(at, 100), Ok(()));

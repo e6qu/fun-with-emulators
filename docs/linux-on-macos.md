@@ -1787,7 +1787,7 @@ macOS counterpart:
 | | Linux | macOS | fwe |
 |---|---|---|---|
 | Thread | a task sharing `mm`, files, handlers | a pthread | a host pthread running guest code (native; one an ended thread left runs the next) or a host thread with its own vCPU (VM) |
-| `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either); natively `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID` and `DETACHED` are accepted and others fail with `ENOSYS` |
+| `clone` flags | any combination | — | a thread needs `CLONE_VM` and a stack (`EINVAL` without either); in both backends `CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`, `SYSVSEM`, `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID` and `DETACHED` are accepted and others fail with `ENOSYS` |
 | `clone3` | `struct clone_args` | — | treated as the `clone` it describes; `CLONE_INTO_CGROUP` starts the child in that cgroup, `CLONE_CLEAR_SIGHAND` resets its handlers, `CLONE_PIDFD` returns a process descriptor; `set_tid` chooses the child's pids in fwe's pid namespaces (`EPERM` in the initial one) |
 | Per-thread state | in the task | — | in host thread-locals: tid, `set_tid_address` word, robust list, signal mask, alternate stack, pending set |
 | Robust futex list | walked as a thread ends: words it owns marked `FUTEX_OWNER_DIED`, a waiter woken | — | the same, as a thread ends and for every thread as the process ends or calls `execve`; not for a native process ended by `SIGKILL`, nor one ended by a signal from outside fwe |
@@ -2381,7 +2381,7 @@ where fwe falls short of Linux in detail is in
 | Kernel modules, `kexec` | **refused** | `ENOSYS`, as without `CONFIG_MODULES`, `CONFIG_KEXEC` ([Not available](#not-available)) |
 | Lockdown | **refused** | no `/sys/kernel/security/lockdown` (`ENOENT`), as without the lockdown module |
 | Address-space randomisation | **host** | natively where macOS's `mmap` places things; in the VM none: first fit, the same every run; `kernel.randomize_va_space` `ENOENT`, `ADDR_NO_RANDOMIZE` **kept** |
-| `vm.mmap_min_addr` | **kept** | reads 65536; natively macOS refuses everything below 4 GiB, the VM does not check it |
+| `vm.mmap_min_addr` | **enforced** | 65536: a fixed `mmap` or `mremap` below it is `EPERM` without `CAP_SYS_RAWIO`, in both backends |
 
 ### Identity and processes
 

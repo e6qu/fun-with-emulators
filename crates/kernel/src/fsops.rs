@@ -4705,7 +4705,7 @@ mod tests {
         assert!(fd >= 0);
         assert_eq!(k.sys_setns(fd as u64, CLONE_NEWUSER), err(errno::EINVAL));
         k.creds.caps.effective &= !(1 << crate::caps::CAP_SYS_ADMIN);
-        let before = k.creds.caps.clone();
+        let before = k.creds.caps;
         assert_eq!(k.sys_setns(fd as u64, 0), err(errno::EINVAL));
         assert_eq!(k.creds.caps, before);
         crate::nsfd::closed(fd);
